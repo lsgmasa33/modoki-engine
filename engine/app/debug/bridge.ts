@@ -920,6 +920,19 @@ async function initNativeBridge() {
   try {
     const result = await GameDebug.startServer();
     _log('[debug-bridge] Native TCP server listening on port', result.port);
+    // A fallback port is a SILENT unreachability, so it is warned rather than logged (#283). The
+    // start SUCCEEDED — nothing throws, nothing looks wrong — but every device_* tool connects on
+    // the default port and this app is not on it, for the rest of its life. `_log` would not do:
+    // the console ring keeps warn/error, so a log-level line is invisible to `device_console_logs`
+    // and the one trace left is a single logcat line nobody greps for. The measured case is
+    // launching a game while another Modoki app is still releasing 9095 (#283).
+    if (result.fallbackPort) {
+      console.warn(
+        `[debug-bridge] listening on FALLBACK port ${result.port}, not the default 9095 — another `
+        + 'Modoki app still held it. Every device_* tool assumes 9095, so connect with '
+        + `device_connect {useAdb:true, port:${result.port}}, or close the other app and relaunch.`,
+      );
+    }
   } catch (e) {
     _err('[debug-bridge] GameDebug.startServer failed:', (e as Error).message);
     throw e;

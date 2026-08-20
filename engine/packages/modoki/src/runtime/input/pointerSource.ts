@@ -61,6 +61,8 @@
  *  a claim, a registration can never "leak" — there is no claim state to strand. */
 
 import type { InputSource } from './inputSources';
+import { noteUserInput } from '../core/userActivity';
+import { rawNow } from '../core/clock';
 import type { InputFrame } from '../core/inputActions';
 import { getPlayState, onPlayStateChange } from '../core/playState';
 import { isPointerBlocked } from '../core/pointerBlockers';
@@ -151,6 +153,7 @@ function pushTransition(t: PointerTransition): void {
 }
 
 function onPointerDown(e: PointerEvent): void {
+  noteUserInput(rawNow()); // see core/userActivity.ts — tier calibration must not judge an idle device
   if (activeId !== null) return;           // a gesture already owns the pointer
   if (isPointerBlocked(e.target)) {
     // Never latch `activeId` for a blocked press — the whole gesture (its later
@@ -184,6 +187,7 @@ function onPointerDown(e: PointerEvent): void {
 }
 
 function onPointerMove(e: PointerEvent): void {
+  noteUserInput(rawNow()); // see core/userActivity.ts — tier calibration must not judge an idle device
   if (e.pointerId !== activeId) return;
   const dt = e.timeStamp - lastMoveT;
   if (dt > VEL_MIN_DT_MS && dt < VEL_MAX_DT_MS) {
@@ -223,6 +227,7 @@ function onPointerUp(e: PointerEvent): void {
  *  free-spinning vs clicky wheel behave the same). Passive listener, no
  *  `preventDefault`, so it never fights editor-panel scrolling. */
 function onWheel(e: WheelEvent): void {
+  noteUserInput(rawNow()); // see core/userActivity.ts — tier calibration must not judge an idle device
   if (e.deltaY === 0) return;
   // Unlike pointerdown, this check is correct PER EVENT: a wheel notch is not a
   // gesture, so there is no "hold for the whole gesture" argument here — a

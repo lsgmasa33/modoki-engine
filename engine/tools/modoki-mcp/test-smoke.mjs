@@ -708,6 +708,24 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     const stray = await client.callTool({ name: 'modoki_profiler', arguments: { action: 'reset', markers: 5 } });
     if (!/UNKNOWN_PARAM/.test(text(stray))) throw new Error('profiler must refuse a read-side filter on action:reset');
     console.log(`profiler capture round-trip ✓ (frames captured: ${frames.frameCount})`);
+
+    // action:boot (#238) — the boot-phase read. Only a LIVE call can prove it: the timeline is
+    // written during the real boot path, so a unit test would be asserting against spans it
+    // opened itself. The editor has by definition already loaded a scene, so a zero-span answer
+    // here means the instrumentation never ran.
+    const boot = JSON.parse(text(await client.callTool({ name: 'modoki_profiler', arguments: { action: 'boot', limit: 4 } })));
+    if (typeof boot.spanCount !== 'number') throw new Error(`profiler boot returned no spanCount: ${JSON.stringify(boot)}`);
+    if (boot.spanCount === 0) throw new Error('profiler boot recorded ZERO spans — the boot path is not instrumented on this build');
+    if (!Array.isArray(boot.top)) throw new Error('profiler boot returned no `top` array');
+    if (boot.top.length > 4) throw new Error(`profiler boot ignored limit:4 — got ${boot.top.length} rows, so the query param never reached the op`);
+    // Longest first: the ranking is the point, exactly as with capture-read.
+    for (let i = 1; i < boot.top.length; i++) {
+      if (boot.top[i].durMs > boot.top[i - 1].durMs) throw new Error('profiler boot `top` is not sorted longest-first');
+    }
+    // `all` is a boot-only filter and must be refused elsewhere by name, not dropped.
+    const strayAll = await client.callTool({ name: 'modoki_profiler', arguments: { action: 'read', all: true } });
+    if (!/UNKNOWN_PARAM/.test(text(strayAll))) throw new Error('profiler must refuse `all` on action:read');
+    console.log(`profiler boot read ✓ (${boot.spanCount} spans, longest ${boot.top[0]?.name} ${boot.top[0]?.durMs}ms)`);
   }, async () => {
     await client.callTool({ name: 'modoki_profiler', arguments: { action: 'capture-clear' } });
   });

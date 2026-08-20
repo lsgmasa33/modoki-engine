@@ -19,7 +19,8 @@ const log: string[] = [];
 let sceneDirty = false;
 let sessionHeld = false;
 let authoredEdits = false;
-let handler: { owner: 'animation'; suspend: () => Promise<void>; resume: () => void } | null = null;
+type TestHandler = { owner: 'animation'; suspend: () => Promise<void>; resume: () => void; isLive?: () => boolean };
+let handler: TestHandler | null = null;
 
 vi.mock('../../packages/modoki/src/editor/scene/serialize', () => ({
   saveAll: vi.fn(async () => { log.push('saveScene'); return { saved: true, path: '/s.json', reason: 'ok' }; }),
@@ -36,18 +37,30 @@ vi.mock('../../packages/modoki/src/editor/scene/playMode', () => ({ getModeOwner
 vi.mock('../../packages/modoki/src/runtime/core/playState', () => ({
   getRunMode: () => 'scrub', canEdit: () => false,
 }));
-vi.mock('../../packages/modoki/src/editor/scene/timelinePreview', () => ({
-  hasTimelinePreviewSession: () => sessionHeld,
-  getPreviewSaveHandler: () => handler,
-  previewHasAuthoredEdits: () => authoredEdits,
-  currentPreviewSaveHandlerFor: (o: string) => (handler?.owner === o ? handler : null),
-}));
+vi.mock('../../packages/modoki/src/editor/scene/timelinePreview', async (importOriginal) => {
+  // `resumeHandlerFor` is the REAL one: it is the rule under test here (which handler a finished
+  // cycle resumes through), not a collaborator to stub out. Everything else stays mocked so this
+  // suite keeps pinning branch + order rather than the preview machinery.
+  const actual = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/timelinePreview')>();
+  const currentFor = (o: string) => (handler?.owner === o ? handler : null);
+  return {
+    hasTimelinePreviewSession: () => sessionHeld,
+    getPreviewSaveHandler: () => handler,
+    previewHasAuthoredEdits: () => authoredEdits,
+    currentPreviewSaveHandlerFor: currentFor,
+    resumeHandlerFor: (o: string, started: TestHandler) => {
+      void actual;                       // the real rule, re-expressed against this suite's registry stand-in
+      return currentFor(o) ?? (started.isLive?.() === false ? null : started);
+    },
+  };
+});
 
 const { runSaveAll } = await import('../../packages/modoki/src/editor/scene/saveCommand');
 
-function makeHandler(tag = 'A') {
+function makeHandler(tag = 'A', live = true) {
   const h = {
     owner: 'animation' as const,
+    isLive: () => live,
     suspend: vi.fn(async () => { log.push(`suspend:${tag}`); }),
     resume: vi.fn(() => { log.push(`resume:${tag}`); }),
   };
@@ -95,14 +108,31 @@ describe('runSaveAll inside a preview envelope', () => {
   });
 
   it('reports the preview as NOT resumed when the panel closed mid-save', async () => {
-    const h = makeHandler();
+    const h = makeHandler('A', /* live */ false);
     sessionHeld = true; sceneDirty = true; handler = h;
-    h.suspend.mockImplementation(async () => { log.push('suspend:A'); handler = null; }); // panel closed
+    h.suspend.mockImplementation(async () => { log.push('suspend:A'); handler = null; }); // panel unmounted
 
     const out = await runSaveAll();
 
     expect(out.previewResumed).toBe(false);
     expect(log).not.toContain('resume:A'); // resuming a dead panel would wedge run-mode at 'scrub'
+  });
+
+  it('STILL resumes when the panel only deregistered itself — it is alive and owes a frame', async () => {
+    // The Timeline panel's normal path, and the bug. Its registration effect is guarded on being
+    // inside the envelope and `suspend()` is what leaves it, so the suspend deletes the
+    // registration it is about to need. That is indistinguishable from the case above unless the
+    // handler is asked whether its panel is still mounted — which is why `isLive` exists.
+    // Measured on games/timeline-demo: runMode left 'stopped', the world un-posed, the panel still
+    // reading t 4.00s (bug `tSv0EWjWICpEl9HSjRe9`, QA-TIMELINE-0007).
+    const h = makeHandler('A', /* live */ true);
+    sessionHeld = true; sceneDirty = true; handler = h;
+    h.suspend.mockImplementation(async () => { log.push('suspend:A'); handler = null; }); // deregistered, still mounted
+
+    const out = await runSaveAll();
+
+    expect(log).toEqual(['suspend:A', 'saveScene', 'resume:A']);
+    expect(out.previewResumed).toBe(true);
   });
 
   it('does NOT cycle when the envelope holds authored scene edits — exiting would revert them', async () => {

@@ -1643,6 +1643,54 @@ get backwards:
   forest-camp (so `auto`) and it authors both `mid` and `low`, so neither the pinned-tier nor the
   one-config gate can account for the quiet run.
 
+- ⭐ **AN IDLE WINDOW IS NOT EVIDENCE EITHER** (owner, 2026-08-20, `core/userActivity.ts`). The
+  arming rule above says a LOAD window does not describe the device the player plays on. The second
+  window that does not is an IDLE one: mobile CPU governors drop clocks when nothing is being
+  touched, so an idle sample measures a throttled phone rather than a slow one.
+
+  **Measured on a Galaxy S22** — the most powerful Android handset in the lab — sitting idle on
+  Court's tutorial (Testboard `lvROp0yDYPSzS0VZM6LH`):
+
+  ```
+  {"tick":204,"tier":"mid","prev":"high","reason":"median frame 41.6ms over the 20.0ms budget for 2s"}
+  {"tick":270,"tier":"low","prev":"mid","reason":"median frame 41.7ms over the 20.0ms budget for 2s"}
+  ```
+
+  Two tiers in ~66 ticks, while GPU identity had deterministically resolved `high` on that same
+  phone at boot (`Adreno (TM) 730`, byte-identical across three cold launches) — so the boot answer
+  and the calibrated answer disagreed by two whole rungs on one device. And the demotion is sticky
+  in the direction that hurts: the player taps, the CPU unthrottles, and the game is now running at
+  `low` (pixelRatioCap 1, shadows off, IBL off, `textureMaxSize` 512) on a flagship. Not
+  lab-specific either — reading a tutorial, taking a call, or looking away is the same window.
+
+  The rules:
+  - **Both directions**, for the same reason arming suppresses both: letting one through would make
+    the window's meaning depend on which way the sample happened to point. Three alternatives were
+    offered to the owner (idle blocks demotion only; floor the demotion at a `gpu-benchmark` boot
+    verdict; both) and this is the call.
+  - **The signal is stamped by the input SOURCES, not by `inputSystem`.** A game with no `Input`
+    resource never runs that system, and gating calibration on a signal such a project cannot emit
+    would suppress it forever for a whole class of game. A game registering its OWN `InputSource`
+    should call `noteUserInput()` — it is exported from the runtime barrel for that, and the
+    suppression logs itself once after the arm backstop rather than going quiet.
+  - ⚠️ **The window is dropped on the way BACK from idle, not on the way out**, and this is the half
+    that is easy to get wrong. The frame profiler keeps filling its ring throughout the idle stretch
+    and the sustain clocks keep whatever they held, so without the reset the first interacting tick
+    judges a ring full of throttled frames against a clock that ran the whole time — and demotes
+    instantly, which is the same bug in slow motion.
+  - **`IDLE_EVIDENCE_MS` is 5 s**, sized off the longer of the two sustain windows
+    (`PROMOTION_HOLD_MS`), so the frames that voted were plausibly measured while somebody was
+    playing. Shorter would let a governor that has not yet dropped clocks vote; much longer would
+    let one that already has.
+  - **Stated cost**: a device that genuinely cannot render gets no relief while nobody is touching
+    it. Cheap for the same reason the load-window cost is — the knobs a demotion turns change how a
+    game LOOKS to a player who, by construction, is not looking.
+
+  ⚠️ **Not verified on hardware yet.** The unit tests pin the rule (including a mutation check that
+  the window-drop test fails without the reset), but the S22 repro itself has not been re-run
+  post-fix. `qa/cases/rendering/tier-calibration-idle-window.md` (QA-RENDER-0007) is the case for
+  it, targeted at that phone specifically — a device that does not throttle passes it vacuously.
+
   ✅ **The overlay spinner survives the stall — measured, not inferred.** The mid-play promotion
   path covers a shader recompile with `LoadingOverlay`'s spinner, which only works if a
   compositor-driven `transform` animation keeps running while the main thread is blocked. On the

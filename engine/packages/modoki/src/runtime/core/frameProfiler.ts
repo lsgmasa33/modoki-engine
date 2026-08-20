@@ -102,6 +102,12 @@ let filled = 0;
 let prevFrameStart = 0;
 let discontinuities = 0;
 let worstStallMs = 0;
+// WHEN the worst stall was, in raw clock terms. Kept out of `FrameProfile` deliberately: it is
+// not a statistic about the window, it is a coordinate used to intersect the stall with the boot
+// timeline (#238) — "1,814 ms" is unattributable on its own, "1,814 ms, and these spans were open
+// across it" is the answer. `-1` when nothing has been dropped.
+let worstStallStart = -1;
+let worstStallEnd = -1;
 
 /** Record one frame. Called by `frameDriver` — two `rawNow()` reads and a ring write, so it is
  *  ALWAYS ON: the faults worth profiling (a boot-time context loss, an intermittent hitch) are
@@ -118,7 +124,11 @@ export function recordFrame(frameStart: number, callbacksEnd: number): { frameMs
       if (filled < PROFILE_WINDOW_FRAMES) filled++;
     } else {
       discontinuities++;
-      if (frameMs > worstStallMs) worstStallMs = frameMs;
+      if (frameMs > worstStallMs) {
+        worstStallMs = frameMs;
+        worstStallStart = prevFrameStart;
+        worstStallEnd = frameStart;
+      }
     }
   }
   prevFrameStart = frameStart;
@@ -237,6 +247,15 @@ export function resetFrameProfile(): void {
   prevFrameStart = 0;
   discontinuities = 0;
   worstStallMs = 0;
+  worstStallStart = -1;
+  worstStallEnd = -1;
+}
+
+/** The raw-clock window the worst stall occupied, or null when no frame has been dropped. The
+ *  boot-timeline read subtracts `getBootOrigin()` from these to ask what was open at the time. */
+export function getWorstStallWindow(): { startMs: number; endMs: number } | null {
+  if (worstStallStart < 0) return null;
+  return { startMs: worstStallStart, endMs: worstStallEnd };
 }
 
 /** Timestamp source, shared with `frameDriver` so both agree under an injected manual clock. */

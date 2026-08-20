@@ -15,6 +15,7 @@ import { addDirtyListener } from '../core/ecs/entityUtils';
 import { isSimRunning } from '../core/playState';
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { markUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
+import { spriteEpoch } from '../core/textureRefs';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
 import type { World } from 'koota';
 import type { UIActionBinding } from './bindings';
@@ -53,6 +54,8 @@ export interface UINodeData {
   textOverflow: string; maxLines: number;
   // ── Image ──
   imageSrc: string; imageMode: string;
+  /** Cache-busting epoch for `imageSrc` — see where it is built, and `spriteEpoch`. */
+  imageEpoch: number;
   /** This UI entity also carries a `VideoPlayer` — UINode mounts the clip into its box
    *  (`UIVideoMount`), cropped by `imageMode`. Video as SCENERY, distinct from the
    *  fullscreen `VideoOverlay` cutscene, which sits above everything. */
@@ -70,6 +73,11 @@ export interface UINodeData {
   // unpositioned element.
   anchor?: { anchor: AnchorMode; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean; zIndex: number };
   canvas2D?: { referenceWidth: number; referenceHeight: number; scaleMode: string };
+  /** UIToggle trait — this entity renders as an on/off switch (a track with a knob)
+   *  rather than a plain box. Optional nested block, not scalars: a toggle is rare,
+   *  and its absence has to survive `_scalarKeys` being derived from whichever node
+   *  happens to be built first. */
+  toggle?: { value: boolean; trackOnColor: number; trackOffColor: number; trackOpacity: number; knobColor: number; knobOpacity: number; knobInset: number; trackRadius: number; knobRadius: number; disabled: boolean };
   /** TextAnimation trait — whole-element CSS text animation (fade/wave/bounce/jitter/
    *  rainbow/typewriter) realized by UINode. Shared trait with the 2D/3D geometry paths. */
   textAnim?: { effect: string; speed: number; amplitude: number; frequency: number; loop: boolean; fadeIn: boolean };
@@ -128,7 +136,7 @@ const _sortMap = new Map<number, number>();
 let _prevById = new Map<number, UINodeData>();
 
 // Node keys that aren't plain scalars — compared specially in nodesEqual.
-const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim']);
+const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim', 'toggle']);
 // Derived ONCE from a real node, so every scalar field is covered automatically:
 // add a field to UINodeData and it's compared without editing this file.
 let _scalarKeys: string[] | null = null;
@@ -158,6 +166,7 @@ export function nodesEqual(a: UINodeData, b: UINodeData): boolean {
   if (!shallowOptEqual(a.binding as Record<string, unknown> | undefined, b.binding as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.canvas2D as Record<string, unknown> | undefined, b.canvas2D as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.textAnim as Record<string, unknown> | undefined, b.textAnim as Record<string, unknown> | undefined)) return false;
+  if (!shallowOptEqual(a.toggle as Record<string, unknown> | undefined, b.toggle as Record<string, unknown> | undefined)) return false;
   // action.bindings is an array — ref-compare, but treat two empties as equal
   // (the builder allocates a fresh [] when the trait carries none).
   if (a.action || b.action) {
@@ -185,7 +194,7 @@ function reconcileNode(node: UINodeData, nextPrev: Map<number, UINodeData>): UIN
 
 // Cache trait lookups (resolve once, reuse across frames)
 let _traitsCached = false;
-let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any;
+let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any, _toggleMeta: any;
 
 function cacheTraits() {
   const allTraits = getAllTraits();
@@ -198,6 +207,7 @@ function cacheTraits() {
   _canvas2dMeta = allTraits.find(m => m.name === 'Canvas2D');
   _textAnimMeta = allTraits.find(m => m.name === 'TextAnimation');
   _videoMeta = allTraits.find(m => m.name === 'VideoPlayer');
+  _toggleMeta = allTraits.find(m => m.name === 'UIToggle');
   _traitsCached = !!(_renderUIMeta && _uiElMeta);
 }
 
@@ -285,6 +295,14 @@ function buildTree(world: World): UINodeData[] | null {
         textStrokeColor: ui.textStrokeColor || 0, textStrokeOpacity: ui.textStrokeOpacity ?? 1, textStrokeWidth: ui.textStrokeWidth || 0,
         textOverflow: ui.textOverflow || 'clip', maxLines: ui.maxLines || 0,
         imageSrc: ui.imageSrc || '', imageMode: ui.imageMode || 'cover',
+        // The RESOLUTION epoch of whatever imageSrc points at. It is in the node data — not read
+        // inside UINode — because this tree's reconciler hands back the PREVIOUS node object when
+        // the data is equal, so `React.memo(UINode)` bails and the inline `resolveDomImageUrl`
+        // never re-runs. A texture re-import changes the URL without changing the ref, so without
+        // this the DOM kept the pre-import image until the trait was touched or the scene
+        // reloaded (bug `udpbnC6DHswvCj115B7M`, QA-ASSET-0007). Only nodes that HAVE an image
+        // carry it, so an unrelated re-import cannot churn the rest of the tree.
+        imageEpoch: ui.imageSrc ? spriteEpoch(ui.imageSrc) : 0,
         elementType: ui.elementType || 'div', placeholder: ui.placeholder || '',
         rangeMin: ui.rangeMin ?? 0, rangeMax: ui.rangeMax ?? 100, rangeStep: ui.rangeStep ?? 1,
         // A PLAIN SCALAR, always written, never an optional nested block: `_scalarKeys`
@@ -330,6 +348,18 @@ function buildTree(world: World): UINodeData[] | null {
       if (_canvas2dMeta && entity.has(_canvas2dMeta.trait)) {
         const c = entity.get(_canvas2dMeta.trait) as any;
         node.canvas2D = { referenceWidth: c.referenceWidth, referenceHeight: c.referenceHeight, scaleMode: c.scaleMode };
+      }
+      if (_toggleMeta && entity.has(_toggleMeta.trait)) {
+        const t = entity.get(_toggleMeta.trait) as any;
+        node.toggle = {
+          value: t.value === true,
+          trackOnColor: t.trackOnColor ?? 0x4aa3ff, trackOffColor: t.trackOffColor ?? 0x767676,
+          trackOpacity: t.trackOpacity ?? 1,
+          knobColor: t.knobColor ?? 0xffffff, knobOpacity: t.knobOpacity ?? 1,
+          knobInset: t.knobInset ?? 2,
+          trackRadius: t.trackRadius ?? 999, knobRadius: t.knobRadius ?? 999,
+          disabled: t.disabled === true,
+        };
       }
       // Play-GATE the animation here in the projection (not in UINode) so it toggles
       // on the node itself: UIRenderer marks the UI dirty on play-state change, and a

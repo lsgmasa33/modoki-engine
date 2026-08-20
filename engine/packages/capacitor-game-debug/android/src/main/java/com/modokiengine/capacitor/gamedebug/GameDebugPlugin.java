@@ -31,8 +31,22 @@ public class GameDebugPlugin extends Plugin {
 
     private static final String TAG = "GameDebug";
     private static final int DEFAULT_PORT = 9095;
+    /** How long to keep retrying the PREFERRED port before accepting an OS-assigned one (#283).
+     *
+     *  Sized from a measured handover, not a guess. On a Galaxy A23, launching a Modoki game while
+     *  another one is foregrounded: the outgoing app released 9095 at 18:48:21.245 and the incoming
+     *  app had already given up at 18:48:20.796 — it lost by 449 ms. `startServer` runs off the
+     *  webview boot while the release runs off Android's `onPause`, and nothing orders the two, so
+     *  a single bind attempt decides the port by a race. 2 s covers that gap with room to spare
+     *  while still bounding a genuinely occupied port (a second Modoki app deliberately left in the
+     *  foreground) to a short wait. */
+    private static final int BIND_RETRY_WINDOW_MS = 2000;
+    private static final int BIND_RETRY_INTERVAL_MS = 150;
 
     private ServerSocket serverSocket;
+    /** True when the listener ended up on an OS-assigned port instead of {@link #DEFAULT_PORT} —
+     *  i.e. the host cannot reach it without being told the number (#283). */
+    private boolean onFallbackPort = false;
     // volatile + guarded by synchronized(this): the read thread's finally, handleNewClient, and the
     // sendResponse/writeControlReply writers all touch these across threads — without a happens-before
     // edge a reconnecting owner could be spuriously refused or a check-then-write could NPE (L13).
@@ -115,7 +129,17 @@ public class GameDebugPlugin extends Plugin {
      *  listener-state callback to wait for — the try/catch below IS the bind outcome, and
      *  `call.resolve`/`call.reject` only fires once it is known. (Capacitor invokes plugin methods
      *  off the main thread, so this synchronous bind cannot trip `NetworkOnMainThreadException` —
-     *  the accept LOOP still runs on its own daemon thread since it blocks indefinitely.) */
+     *  the accept LOOP still runs on its own daemon thread since it blocks indefinitely. The same
+     *  fact is what makes the retry sleep below safe.)
+     *
+     *  ── WHY IT RETRIES BEFORE FALLING BACK (#283) ────────────────────────────────────────────
+     *  The fallback is a LAST resort, not a first response. A host connects on the default port;
+     *  an app that quietly lands on an OS-assigned one is unreachable by every `device_*` tool for
+     *  its entire lifetime — `startListener` binds once and never comes back to reclaim the port,
+     *  so the app stays unreachable even after the port frees up seconds later. That was measured,
+     *  not theorised: skin-test sat on 33111 while 9095 was free. Retrying across the handover
+     *  window makes "the foreground app is on 9095" true once the handover settles, instead of
+     *  decided by which process got there first. */
     private void startListener(int port, boolean allowFallback, PluginCall call) {
         ServerSocket socket;
         try {
@@ -129,12 +153,15 @@ public class GameDebugPlugin extends Plugin {
             // re-binding on resume (#95): a just-closed listener leaves the port in TIME_WAIT, and
             // without SO_REUSEADDR the re-bind fails, falls back to an OS-assigned port, and
             // recreates the very unreachability that change exists to remove.
-            socket = new ServerSocket();
-            socket.setReuseAddress(true);
-            socket.bind(new java.net.InetSocketAddress(port));
+            //
+            // SO_REUSEADDR handles a TIME_WAIT remnant of OUR OWN previous listener; it
+            // deliberately does NOT let us take a port from a LIVE listener, which is the #283
+            // case — another Modoki app that has not finished pausing yet. Only waiting fixes that.
+            socket = bindWithRetry(port, allowFallback);
         } catch (java.net.BindException e) {
             if (allowFallback) {
-                Log.w(TAG, "port " + port + " in use (previous instance?) — retrying on an OS-assigned port");
+                Log.w(TAG, "port " + port + " still in use after " + BIND_RETRY_WINDOW_MS
+                        + "ms — falling back to an OS-assigned port. Pass the port explicitly to device_connect.");
                 startListener(0, false, call);
                 return;
             }
@@ -150,6 +177,12 @@ public class GameDebugPlugin extends Plugin {
         serverSocket = socket;
         int actualPort = socket.getLocalPort();
         serverPort = actualPort;
+        // Keyed on `allowFallback`, NOT on `actualPort != DEFAULT_PORT`: only the port-0 retry
+        // passes false, so this says "we did not get the port we asked for" rather than "we are
+        // not on 9095". The difference shows when a caller REQUESTS a non-default port and gets
+        // exactly it — that is a success, and flagging it as a fallback would be a false alarm in
+        // the one field whose entire job is to be trusted (#283).
+        onFallbackPort = !allowFallback;
         running = true;
         Log.i(TAG, "TCP server listening on port " + actualPort);
 
@@ -168,7 +201,56 @@ public class GameDebugPlugin extends Plugin {
 
         JSObject result = new JSObject();
         result.put("port", actualPort);
+        // Announced rather than left to be inferred from the number: a host that assumes the
+        // default port needs to know it is NOT on it, and "port: 33111" only says so to a reader
+        // who already knows what the default is (#283).
+        result.put("fallbackPort", onFallbackPort);
         call.resolve(result);
+    }
+
+    /** Bind `port`, retrying across {@link #BIND_RETRY_WINDOW_MS} while it is held by a LIVE
+     *  listener. Throws {@link java.net.BindException} once the window is spent, so the caller
+     *  owns the fallback decision. No retry when `allowFallback` is false — that call IS the
+     *  fallback (port 0), and port 0 cannot be in use. */
+    private ServerSocket bindWithRetry(int port, boolean allowFallback) throws Exception {
+        long deadline = System.currentTimeMillis() + BIND_RETRY_WINDOW_MS;
+        int attempts = 0;
+        while (true) {
+            // SO_REUSEADDR must be set BEFORE the bind, so the socket is created UNBOUND and bound
+            // explicitly (see the caller's note) — which means a fresh socket per attempt: a
+            // ServerSocket whose bind threw cannot be re-bound.
+            ServerSocket socket = new ServerSocket();
+            try {
+                socket.setReuseAddress(true);
+                socket.bind(new java.net.InetSocketAddress(port));
+                if (attempts > 0) {
+                    Log.i(TAG, "port " + port + " acquired after " + attempts + " retr"
+                            + (attempts == 1 ? "y" : "ies") + " — the previous owner had not released it yet");
+                }
+                return socket;
+            } catch (java.net.BindException e) {
+                try { socket.close(); } catch (Exception ignored) { /* nothing bound to leak */ }
+                if (!allowFallback || System.currentTimeMillis() >= deadline) throw e;
+                if (attempts == 0) {
+                    // Announce the WAIT, not just its outcome. The whole reason #283 went
+                    // undiagnosed is that the port handover left no trace anyone would grep for;
+                    // a line here means logcat tells the story whichever way the retry ends.
+                    Log.i(TAG, "port " + port + " busy — retrying for up to " + BIND_RETRY_WINDOW_MS + "ms");
+                }
+                attempts++;
+                try {
+                    Thread.sleep(BIND_RETRY_INTERVAL_MS);
+                } catch (InterruptedException ie) {
+                    // Restore the flag and give up retrying rather than swallowing the interrupt —
+                    // the caller's fallback still runs, so the bridge starts either way.
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            } catch (Exception e) {
+                try { socket.close(); } catch (Exception ignored) { /* nothing bound to leak */ }
+                throw e;
+            }
+        }
     }
 
     @PluginMethod
@@ -185,6 +267,7 @@ public class GameDebugPlugin extends Plugin {
         result.put("running", running);
         result.put("clientConnected", clientSocket != null && clientSocket.isConnected() && !clientSocket.isClosed());
         result.put("port", serverPort);
+        result.put("fallbackPort", onFallbackPort);
         call.resolve(result);
     }
 
@@ -614,6 +697,9 @@ public class GameDebugPlugin extends Plugin {
 
     private void stopAll() {
         running = false;
+        // Cleared with the listener it describes: a stale `true` here would have `getStatus`
+        // reporting a fallback port on a server that is not running (#283).
+        onFallbackPort = false;
         if (clientSocket != null) { try { clientSocket.close(); } catch (Exception ignored) {} clientSocket = null; }
         if (serverSocket != null) { try { serverSocket.close(); } catch (Exception ignored) {} serverSocket = null; }
         clientOutput = null;

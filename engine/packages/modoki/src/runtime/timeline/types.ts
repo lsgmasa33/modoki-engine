@@ -299,9 +299,13 @@ function normalizeTrack(tr: Partial<TrackDef> & { type?: string }): TrackDef | n
 }
 
 /** Fill any missing fields so partial/older JSON loads safely, and normalize every
- *  track (sort entries by time, drop malformed). Mirrors `normalizeAnimationClip`. */
+ *  track (sort entries by time, drop malformed). Mirrors `normalizeAnimationClip` —
+ *  including its `...json` spread, which is load-bearing rather than tidy: the Timeline
+ *  Editor parks and writes THIS object, so an unnamed key would be dropped from the
+ *  `.timeline.json` on the first save (`xukhAP0gWNnD9MFRHb0P`). */
 export function normalizeTimeline(json: Partial<TimelineDef>): TimelineDef {
   return {
+    ...json,
     id: str(json.id),
     name: str(json.name, 'Timeline'),
     duration: Math.max(0, num(json.duration, 5)),

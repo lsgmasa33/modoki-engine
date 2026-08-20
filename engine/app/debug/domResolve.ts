@@ -229,11 +229,27 @@ export function resolveDomPointReport(spec: DomPointSpec): DomPointResolution {
   if ('error' in r) {
     return { ok: false, error: r.error, ...(r.matched ? { matched: describeElement(r.matched) } : {}) };
   }
-  // A coordinate spec matched nothing by name, so there is nothing to be occluded
-  // relative to — report only what sits under the point.
-  if (!spec.selector) return { ok: true, x: r.x, y: r.y, hitTarget: describeElement(r.el) };
-  const top = document.elementFromPoint(r.x, r.y);
-  const occluded = isOccluded(r.el, top);
+  return { ok: true, x: r.x, y: r.y, ...aimProvenance(r.el, r.x, r.y, !!spec.selector) };
+}
+
+/** The PROVENANCE half of a resolution: what the aim matched, and what is actually on top of it.
+ *
+ *  Split out of `resolveDomPointReport` for `domDnd`, which needs the same three fields but
+ *  cannot use that resolver — it needs the live Element to dispatch DnD events on, and the
+ *  report is deliberately serializable. Duplicating the recipe there is precisely the drift this
+ *  module's header warns about (the zero-rect guard that existed on one of two resolvers, and the
+ *  one without it dropped a DnD at the window's top-left corner). So: one recipe, two callers.
+ *
+ *  `bySelector` is the whole reason this takes a flag rather than a spec. A COORDINATE aim matched
+ *  nothing by name, so there is nothing for it to be occluded RELATIVE TO — whatever sits under
+ *  the point simply is the target. Reporting `occluded` there would be a category error, not a
+ *  stricter check. */
+export function aimProvenance(
+  el: Element, x: number, y: number, bySelector: boolean,
+): Pick<DomPointResolution, 'matched' | 'hitTarget' | 'occluded' | 'clipped'> {
+  if (!bySelector) return { hitTarget: describeElement(el) };
+  const top = document.elementFromPoint(x, y);
+  const occluded = isOccluded(el, top);
   // SCROLLED OUT is a different diagnosis from COVERED, and until now the selector path could only
   // say the latter. `getBoundingClientRect()` on a row scrolled past its list's `overflow` clip
   // still reports its laid-out position, so the centre lands on whatever chrome occupies those
@@ -242,10 +258,9 @@ export function resolveDomPointReport(spec: DomPointSpec): DomPointResolution {
   // set on 2026-08-19: 12 of the 22 occluded hits were this class, led by Hierarchy rows below the
   // fold. Same clip test the HANDLE path already uses, so the two aims agree about what "off the
   // panel" means instead of each having its own idea.
-  const clippedAway = occluded && !withinClip(r.el, r.x, r.y);
+  const clippedAway = occluded && !withinClip(el, x, y);
   return {
-    ok: true, x: r.x, y: r.y,
-    matched: describeElement(r.el),
+    matched: describeElement(el),
     // When something COVERS the target, name it well enough to act on — the covering element is
     // usually anonymous panel chrome, and "div" is not a thing a caller can move out of the way.
     // Only when occluded: on a clean aim `top` IS the target, which describeElement already names.

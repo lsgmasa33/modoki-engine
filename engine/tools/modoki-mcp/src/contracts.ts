@@ -253,11 +253,14 @@ const DECLS: Record<string, Decl> = {
     kind: 'input', method: 'POST', route: '/api/editor-action', op: 'dom-dnd',
     mutating: true, requires: ['editor', 'electron'], aim: 'selector',
     minimalArgs: { from: { selector: '#a' }, to: { selector: '#b' } },
-    notes: 'INCONSISTENT (documented, not fixable): the only input tool that goes through the action '
-      + 'relay rather than /api/input/*, so it carries none of the shared matched/hitTarget/occluded '
-      + 'provenance — and the ONLY input tool that cannot be aimed by entity, because HTML5 DnD is a '
+    notes: 'The ONLY input tool that cannot be aimed by entity, because HTML5 DnD is a '
       + "DOM-element protocol (the source element's own dragstart handler fills the DataTransfer). "
-      + 'Its endpoints are strict + refined instead of the shared pointSpec for that reason (S3.6).',
+      + 'Its endpoints are strict + refined instead of the shared pointSpec for that reason (S3.6). '
+      + 'It goes through the action relay rather than /api/input/*, but that no longer costs it the '
+      + 'shared matched/hitTarget/occluded provenance — both endpoints carry it (#260). It is still '
+      + 'the one aimed input tool that does NOT refuse a covered aim: dispatchEvent bypasses '
+      + 'hit-testing so the drop genuinely lands, and it warns instead — a covered drop is one no '
+      + 'human could perform, which is a fidelity problem, not a delivery one.',
   },
   modoki_handles: {
     kind: 'read', method: 'GET', route: '/api/enact-handles', requires: ['editor'],
@@ -529,7 +532,7 @@ const DECLS: Record<string, Decl> = {
     mutating: true, persists: 'session', requires: ['editor', 'renderer'],
     filters: ['markers'],
     minimalArgs: {},
-    notes: 'Read actions (read / capture-read) are GET; the state-changing ones (capture-*, gpu-*, reset) are POST, so §4 holds per action. A read-side filter passed to a mutating action is REFUSED, not dropped (the `watch` S3.19 hazard).',
+    notes: 'Read actions (read / capture-read / boot) are GET; the state-changing ones (capture-*, gpu-*, reset, boot-reset) are POST, so §4 holds per action. A read-side filter passed to a mutating action is REFUSED, not dropped (the `watch` S3.19 hazard). action:boot reads the always-on boot-phase timeline (#238) intersected with the worst dropped frame — the only read that can attribute a cold-boot stall, which the frame aggregate drops from its percentiles by design.',
   },
   modoki_watch: {
     kind: 'control', method: 'GET', route: '/api/watch/list', varies: 'both',

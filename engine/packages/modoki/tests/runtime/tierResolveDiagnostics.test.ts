@@ -53,6 +53,10 @@ beforeEach(() => {
   write = vi.fn<(verdict: CachedProbeVerdict | null) => void>();
   probeVerdictStore.provide({ read: () => null, write });
   vi.spyOn(console, 'warn').mockImplementation(() => {});
+  // …and `log` too, since the probe's ordinary-path evidence moved there when
+  // console.warn became a Crashlytics issue (2026-08-20). Silencing only `warn` would
+  // leave this suite printing a probe report per pass.
+  vi.spyOn(console, 'log').mockImplementation(() => {});
 });
 
 afterEach(() => {

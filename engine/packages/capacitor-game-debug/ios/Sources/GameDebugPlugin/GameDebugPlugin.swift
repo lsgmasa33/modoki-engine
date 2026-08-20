@@ -23,6 +23,16 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
     private var listener: NWListener?
     private var clientConnection: NWConnection?
     private var serverPort: UInt16 = 9095
+    /// True when the listener ended up on an OS-assigned port instead of 9095 — i.e. no host can
+    /// reach it without being told the number (#283).
+    private var onFallbackPort = false
+    /// How long to keep retrying the PREFERRED port before accepting an OS-assigned one (#283).
+    /// Mirrors the Android plugin, and is sized from the same measured handover: launching a
+    /// Modoki game while another is foregrounded, the incoming app lost the 9095 bind by 449 ms
+    /// because `startServer` runs off the webview boot while the release runs off the lifecycle
+    /// callback, and nothing orders the two.
+    private static let bindRetryWindowMs = 2000
+    private static let bindRetryIntervalMs = 150
     private var running = false
     private var receiveBuffer = Data()
 
@@ -58,17 +68,26 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
         let preferred = UInt16(call.getInt("port") ?? 9095)
-        startListener(on: preferred, allowFallback: true, call: call)
+        let deadline = Date().addingTimeInterval(Double(Self.bindRetryWindowMs) / 1000.0)
+        startListener(on: preferred, allowFallback: true, retryUntil: deadline, call: call)
     }
 
     /// Bind the TCP server + resolve JS with the ACTUAL port — only once the listener is
     /// `.ready`, never before (a fixed port can't be assumed bound: a lingering previous app
-    /// instance holds it → "Address already in use"). On that conflict, retry on an OS-assigned
-    /// free port (port 0). No Bonjour advertisement: connection is by MANUAL IP through Modoki's
+    /// instance holds it → "Address already in use"). On that conflict it RETRIES the same port
+    /// until `retryUntil`, and only then falls back to an OS-assigned free port (port 0).
+    ///
+    /// The fallback is a last resort, not a first response (#283): a host connects on the default
+    /// port, so an app that quietly lands elsewhere is unreachable by every `device_*` tool for
+    /// its whole lifetime — nothing ever comes back to reclaim the port once it frees up. Retrying
+    /// across the handover window makes "the foreground app is on 9095" true once the handover
+    /// settles, instead of decided by which process bound first.
+    ///
+    /// No Bonjour advertisement: connection is by MANUAL IP through Modoki's
     /// lease (see docs/debug-tools-mcp.md), so nothing broadcasts on the LAN — this
     /// removes the auto-discovery attack surface that let idle Claude sessions storm the device.
     /// Resolves/rejects the call exactly once (`settled`).
-    private func startListener(on port: UInt16, allowFallback: Bool, call: CAPPluginCall) {
+    private func startListener(on port: UInt16, allowFallback: Bool, retryUntil: Date, call: CAPPluginCall) {
         let newListener: NWListener
         do {
             let params = NWParameters.tcp
@@ -92,9 +111,13 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
                 settled = true
                 let actual = newListener.port?.rawValue ?? port
                 self.serverPort = actual
+                // Keyed on `allowFallback`, not on `actual != 9095` — only the port-0 retry passes
+                // false, so this means "we did not get the port we asked for". A caller that
+                // REQUESTS a non-default port and gets it is a success, not a fallback (#283).
+                self.onFallbackPort = !allowFallback
                 self.running = true
                 print("[GameDebug] TCP server listening on port \(actual)")
-                call.resolve(["port": Int(actual)])
+                call.resolve(["port": Int(actual), "fallbackPort": self.onFallbackPort])
             case .failed(let err):
                 if settled { return }
                 settled = true
@@ -103,8 +126,18 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
                 newListener.cancel()
                 self.listener = nil
                 if allowFallback, case .posix(let code) = err, code == .EADDRINUSE {
-                    print("[GameDebug] port \(port) in use (previous instance?) — retrying on an OS-assigned port")
-                    self.startListener(on: 0, allowFallback: false, call: call)
+                    if Date() < retryUntil {
+                        // Same port, after a beat — the previous owner is most likely mid-release.
+                        // Async rather than a sleep: this runs on the listener's state-update
+                        // handler, and blocking it would stall the very callback the retry needs.
+                        let delay = DispatchTimeInterval.milliseconds(Self.bindRetryIntervalMs)
+                        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) {
+                            self.startListener(on: port, allowFallback: true, retryUntil: retryUntil, call: call)
+                        }
+                        return
+                    }
+                    print("[GameDebug] port \(port) still in use after \(Self.bindRetryWindowMs)ms — falling back to an OS-assigned port. Pass the port explicitly to device_connect.")
+                    self.startListener(on: 0, allowFallback: false, retryUntil: retryUntil, call: call)
                 } else {
                     call.reject("TCP server failed: \(err)")
                 }
@@ -131,6 +164,7 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
             "running": running,
             "clientConnected": connected,
             "port": Int(serverPort),
+            "fallbackPort": onFallbackPort,
         ])
     }
 
@@ -610,6 +644,9 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
         listener?.cancel()
         listener = nil
         running = false
+        // Cleared with the listener it describes — a stale `true` would have `getStatus` report a
+        // fallback port on a server that is not running (#283).
+        onFallbackPort = false
         print("[GameDebug] Server stopped")
     }
 

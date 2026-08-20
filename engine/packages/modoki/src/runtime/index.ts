@@ -82,7 +82,7 @@ export { HapticSettings } from './traits/HapticSettings';
 export {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
   PrefabInstance, ModelSource, Paused, Persistent, markPersistent, Transient, Time, Input,
-  UIElement, type UILengthUnit, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh, BlobShadow,
+  UIElement, type UILengthUnit, UIBinding, UIAction, UIFocusable, UIToggle, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh, BlobShadow,
   Animator, SpriteAnimator, defaultSpriteClip, clampAngle,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
@@ -222,9 +222,17 @@ export {
 // Frame TIME, not fps: fps saturates at the vsync ceiling and reports 3ms and 16ms frames
 // identically as 60.
 export {
-  getFrameProfile, resetFrameProfile, BUDGET_30FPS_MS, PROFILE_WINDOW_FRAMES,
+  getFrameProfile, resetFrameProfile, getWorstStallWindow, BUDGET_30FPS_MS, PROFILE_WINDOW_FRAMES,
   type FrameProfile, type FrameStat,
 } from './core/frameProfiler';
+// Boot-phase timeline (#238) — always-on, absolutely-timestamped spans across the boot path.
+// The frame profiler can say a boot froze for 1.8 s; only this can say what was open across it.
+// `bootSpanAsync` is public API: a game's own async boot work names its own spans.
+export {
+  beginBootSpan, endBootSpan, bootSpan, bootSpanAsync, recordBootSpan, getBootTimeline, getBootOrigin,
+  bootSpansOverlapping, resetBootTimeline, MAX_BOOT_SPANS,
+  type BootSpan, type BootTimeline,
+} from './core/bootTimeline';
 export { readPerfProfile } from './debug/perfSources';
 // Profiler markers — the data model the Profiler panel and the MCP surface are both views of.
 // `profileScope` is public API: game code can name its own spans and they rank alongside the
@@ -436,6 +444,7 @@ export {
 } from './rendering/renderSettings';
 export {
   tickTierCalibration, applyPendingTierPromotion, resetTierCalibration, setTierFrameCapEnabled, setTierCalibrationEnabled,
+  IDLE_EVIDENCE_MS,
   getPendingTierPromotion, CALIBRATION_INTERVAL_MS, onTierSwitchOverlay, getTierSwitchOverlayMessage,
   armTierCalibration, isTierCalibrationArmed, ARM_BACKSTOP_MS, PROMOTION_BOUNDARY_GRACE_MS,
 } from './rendering/tierCalibration';
@@ -687,6 +696,9 @@ export {
   shouldFireActions, shouldRunSimTier, isPoseOnly, isLiveRender, canEdit, inPreviewSession,
 } from './core/playState';
 export { uiTreeProjection, markUIDirty, setEditorDirtyCallback, onEditorDirty } from './ui/uiTreeStore';
+// A game that registers its OWN InputSource should call `noteUserInput` from it — see
+// `core/userActivity.ts`. Without it, quality-tier calibration reads that game as idle.
+export { noteUserInput, msSinceUserInput, hasRecentUserInput } from './core/userActivity';
 // UI focus / navigation (Part B of the input-and-ui-focus plan).
 export { uiFocusSystem } from './ui/uiFocusSystem';
 export {

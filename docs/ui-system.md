@@ -21,9 +21,10 @@ Related: [Architecture](./architecture.md) · [Scene Loading](./scene-loading.md
 All UI traits live in `packages/modoki/src/runtime/traits/`. An entity becomes a UI
 node when it has the `RenderableUI` tag plus `UIElement`; the rest — `UIBinding`,
 `UIAction`, `UIAnchor`, plus `UIFocusable` (marks an element reachable by directional
-controller/keyboard focus nav — opt-in, resolved per active scope by `uiFocusSystem`)
-and `Canvas2D` (marks a `UIElement` as hosting a 2D PixiJS canvas; child `Renderable2D`
-entities render into it) — are optional add-ons.
+controller/keyboard focus nav — opt-in, resolved per active scope by `uiFocusSystem`),
+`UIToggle` (renders the element as an on/off switch) and `Canvas2D` (marks a `UIElement`
+as hosting a 2D PixiJS canvas; child `Renderable2D` entities render into it) — are
+optional add-ons.
 
 ### `UIElement` — the consolidated element trait
 
@@ -188,6 +189,47 @@ Four stateless lifecycle/animator handlers are registered once at startup by
 Scene navigation (`engine.loadScene` / `engine.navigateBack`) is **not** here — it lives
 in `NavigationManager`, which owns the history stack (see
 [Managers & Systems](./managers-and-systems.md)).
+
+### `UIToggle` — an on/off switch
+
+Add it beside `UIElement` and the entity renders as a switch: a track with a knob at one
+end or the other. Fields: `value`, `trackOnColor`/`trackOffColor`/`trackOpacity`,
+`knobColor`/`knobOpacity`/`knobInset`, `trackRadius`/`knobRadius`, `disabled`.
+
+**It does not write its own `value`.** A click fires the `change`-event bindings with
+`eventValue` set to the NEGATION of the current value, and the canonical authoring is a
+`set` binding onto its own `UIToggle.value` with `'$value'` (leave `target` empty to mean
+"my own entity"). Pair it with a `call` binding when the game must also *do* something —
+persist the preference, retune a service — and both fire from the one click.
+
+⚠️ **The reason it does not self-write is not tidiness.** `applyBindings` early-returns
+when the sim is not running, so a control that wrote its own trait field would mutate the
+scene from a **Stopped editor**, which that early return exists to prevent. It also keeps
+one writer for one value instead of two that can disagree.
+
+The cost is that a toggle authored with no binding renders perfectly and is inert — the
+silent-authoring-failure class this repo keeps paying for. So `UINode` **warns once per
+entity in dev** when a `UIToggle` carries no `change`/`click` binding. It warns rather
+than throws: an authoring mistake must not blank the screen mid-render.
+
+⚠️ **A `UIToggle` OWNS its inner layout**, so `UIElement`'s flex and padding fields are
+overridden on that entity and do nothing. Everything else on `UIElement` — size, border,
+opacity, visibility, anchoring — still applies normally, because the rendered ROOT element
+is the track and it carries the standard style object. That is also what gives a toggle
+the focus ring and the pointer-events rules for free.
+
+The knob is positioned by flex (`justifyContent` flips between the two ends) and sized off
+the track's own height via `aspectRatio`, so a switch works at any authored size with no
+measurement and no second render pass.
+
+⚠️ **Keyboard support is the DOM's, not `UIFocusable`'s.** The track is focusable
+(`tabIndex`) and Space/Enter flip it. Routing a toggle through the controller-nav focus
+manager is a **follow-up**: that path activates by firing `click` bindings with no event
+value, and a switch has to carry the new value with it. Deliberately not half-wired.
+
+It is the first control in the engine to render more than one DOM node from one entity —
+`input` and `range` both delegate to a native element — so it is the template for the next
+one.
 
 ### `UIAnchor` — screen positioning + safe area
 

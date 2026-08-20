@@ -353,6 +353,38 @@ describe('healNativeConfig — iOS Crashlytics dSYMs', () => {
     }));
   }
 
+  /**
+   * ⚠️ REGRESSION (close-out, 2026-08-20). The dSYM phase and the archive-time "Debug build is ON"
+   * phase both spliced themselves in immediately after the `PBXShellScriptBuildPhase` section-open
+   * line, so each put ITSELF first and shoved the other to second. On every project open the two
+   * objects swapped places, each heal rewrote the pbxproj, and each returned a "synced …" note for
+   * work that netted to nothing — measured on games/court: two writes of equal length and opposite
+   * content, with the file byte-identical before and after the pass.
+   *
+   * A heal note is the editor's report to the human that something was repaired. One that fires
+   * every single time is a false success, and it hides the real ones. Deterministic slots (warning
+   * first, dSYM last) make both heals fixed points, so a note now means a real change.
+   */
+  it('a second pass over an already-healed project reports nothing and rewrites nothing', () => {
+    writeDsymPbx(); writeConfig('TEAMID1234', true);
+    // BOTH deps in ONE package.json — the two helpers each write the whole file, so calling them
+    // in sequence silently drops the first one's dependency and turns the gate off.
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+      dependencies: { '@capacitor-firebase/crashlytics': '^7.0.0', 'capacitor-game-debug': 'file:plugins/x.tgz' },
+    }));
+    healNativeConfig(root);                       // installs BOTH shell-script phases
+
+    const before = readPbx();
+    expect(before, 'both phases are present, so the interaction is live')
+      .toContain('Upload Crashlytics dSYMs');
+    expect(before).toContain("Warn: Modoki 'Debug build' is ON");
+
+    const notes = healNativeConfig(root).notes.join(' | ');
+    expect(readPbx(), 'the second pass leaves the pbxproj byte-identical').toBe(before);
+    expect(notes, 'and claims no dSYM work').not.toContain('dSYM upload phase');
+    expect(notes, 'and claims no archive-warning work').not.toContain('archive-time');
+  });
+
   it('sets dwarf-with-dsym in EVERY configuration — including the one that omitted the key', () => {
     writeDsymPbx();
     writeConfig('');
@@ -422,6 +454,269 @@ describe('healNativeConfig — iOS Crashlytics dSYMs', () => {
     const before = readPbx();
     healNativeConfig(root);
     expect(readPbx()).toBe(before);
+  });
+});
+
+describe('healNativeConfig — Android Crashlytics gradle wiring (#282)', () => {
+  const TOP_GRADLE = ['android', 'build.gradle'];
+  const APP_GRADLE = ['android', 'app', 'build.gradle'];
+  const readTop = () => fs.readFileSync(path.join(root, ...TOP_GRADLE), 'utf8');
+  const readApp = () => fs.readFileSync(path.join(root, ...APP_GRADLE), 'utf8');
+
+  /** Crashlytics is the gate — a project without it has nothing to report. */
+  function writeCrashlyticsDep(withCrashlytics = true) {
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+      dependencies: withCrashlytics ? { '@capacitor-firebase/crashlytics': '^7.0.0' } : {},
+    }));
+  }
+
+  /** A bare `android/build.gradle` with no Crashlytics wiring yet — the fresh-project shape. */
+  function writeTopGradle() {
+    fs.mkdirSync(path.join(root, 'android'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...TOP_GRADLE), [
+      'buildscript {',
+      '    dependencies {',
+      "        classpath 'com.android.tools.build:gradle:8.13.0'",
+      "        classpath 'com.google.gms:google-services:4.4.4'",
+      '    }',
+      '}',
+      '',
+    ].join('\n'));
+  }
+
+  /** A bare `android/app/build.gradle` with the servicesJSON guard but no Crashlytics wiring —
+   *  the fresh-project shape. */
+  function writeAppGradle() {
+    fs.mkdirSync(path.join(root, 'android', 'app'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...APP_GRADLE), [
+      "apply plugin: 'com.android.application'",
+      '',
+      'dependencies {',
+      "    implementation fileTree(include: ['*.jar'], dir: 'libs')",
+      '}',
+      '',
+      "try {",
+      "    def servicesJSON = file('google-services.json')",
+      '    if (servicesJSON.text) {',
+      "        apply plugin: 'com.google.gms.google-services'",
+      '    }',
+      '} catch(Exception e) {',
+      '    logger.info("google-services.json not found")',
+      '}',
+      '',
+    ].join('\n'));
+  }
+
+  /**
+   * ⚠️ REGRESSION (close-out, 2026-08-20). An inline comment on the guard line made the anchor
+   * INVISIBLE — `[ \t]*$` demanded the line end in whitespace — so the apply-plugin edit was
+   * skipped while the classpath and the NDK artifact still landed AND the heal still returned a
+   * success note. Measured against Court's real `app/build.gradle` with one comment added:
+   * `["synced Android Crashlytics gradle wiring — Gradle plugin classpath, NDK artifact (#282)"]`
+   * with `apply plugin: 'com.google.firebase.crashlytics'` nowhere in the file. Without that
+   * apply, the classpath and NDK artifact do nothing — the half-wired shape #282 exists to end.
+   */
+  it('still finds the guard when the anchor line carries a trailing comment', () => {
+    writeTopGradle(); writeCrashlyticsDep();
+    fs.mkdirSync(path.join(root, 'android', 'app'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...APP_GRADLE), [
+      "apply plugin: 'com.android.application'",
+      '',
+      'dependencies { // top-level',
+      "    implementation fileTree(include: ['*.jar'], dir: 'libs')",
+      '}',
+      '',
+      'try {',
+      "    def servicesJSON = file('google-services.json')",
+      '    if (servicesJSON.text) {',
+      "        apply plugin: 'com.google.gms.google-services' // keep with crashlytics",
+      '    }',
+      '} catch(Exception e) { }',
+      '',
+    ].join('\n'));
+    healNativeConfig(root);
+
+    const app = readApp();
+    expect(app, 'the plugin apply landed despite the comment')
+      .toContain("apply plugin: 'com.google.firebase.crashlytics'");
+    // and INSIDE the guard, not merely somewhere in the file
+    const guardOpen = app.indexOf('if (servicesJSON.text) {');
+    const applyIdx = app.indexOf("apply plugin: 'com.google.firebase.crashlytics'");
+    expect(applyIdx).toBeGreaterThan(guardOpen);
+    expect(applyIdx).toBeLessThan(app.indexOf('} catch(Exception e)'));
+    // the commented `dependencies {` anchor survived too
+    expect(app).toContain('firebase-crashlytics-ndk');
+  });
+
+  /** The other half of the same defect: when the apply genuinely cannot be placed, SAY SO rather
+   *  than returning the two cosmetic edits as a success. */
+  it('reports a warning instead of success when there is no guard to anchor the apply on', () => {
+    writeTopGradle(); writeCrashlyticsDep();
+    fs.mkdirSync(path.join(root, 'android', 'app'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...APP_GRADLE), [
+      "apply plugin: 'com.android.application'",
+      '',
+      'dependencies {',
+      '}',
+      '',
+    ].join('\n'));
+    const notes = healNativeConfig(root).notes.join(' | ');
+
+    expect(readApp(), 'no apply to anchor on, so none was invented')
+      .not.toContain("apply plugin: 'com.google.firebase.crashlytics'");
+    expect(notes, 'and the note says the wiring is inert rather than claiming success')
+      .toContain('apply-plugin NOT wired');
+  });
+
+  /** CRLF must not defeat the fence strip: a `\r` left attached to the previous line makes the
+   *  heal rewrite the file on the next two passes and permanently mixes line endings.
+   *  `.gitattributes` pins `*.gradle text eol=lf`, so this needs a non-git write path — but the
+   *  repo has a documented history of Windows-only path/EOL bugs, and the cost here is one regex. */
+  it('keeps CRLF gradle files on CRLF when it edits them, and settles in one pass', () => {
+    // ⚠️ The file must NEED an edit for this to test anything. An already-wired CRLF file is left
+    // alone by normalization alone — the first version of this test did exactly that and stayed
+    // GREEN with the line-ending restore mutated to the identity function, which is a test that
+    // cannot see the bug it guards.
+    writeTopGradle(); writeAppGradle(); writeCrashlyticsDep();
+    for (const parts of [TOP_GRADLE, APP_GRADLE]) {
+      const f = path.join(root, ...parts);
+      fs.writeFileSync(f, fs.readFileSync(f, 'utf8').replace(/\n/g, '\r\n'));
+    }
+
+    healNativeConfig(root);                       // this pass WRITES — the wiring is absent
+
+    for (const [label, text] of [['top-level', readTop()], ['app', readApp()]] as const) {
+      expect(text, `${label} gradle actually got the wiring`).toContain('modoki:crashlytics-');
+      expect(/[^\r]\n/.test(text), `${label} gradle stayed CRLF — no bare-LF line was inserted`)
+        .toBe(false);
+    }
+    const afterFirst = [readTop(), readApp()];
+    healNativeConfig(root);
+    expect([readTop(), readApp()], 'and the next pass is a no-op').toEqual(afterFirst);
+  });
+
+  it('adds all three edits, each in the right place, for a project with none of them', () => {
+    writeTopGradle(); writeAppGradle(); writeCrashlyticsDep();
+    healNativeConfig(root);
+
+    const top = readTop();
+    expect(top).toContain('modoki:crashlytics-classpath-begin');
+    expect(top).toContain(`classpath 'com.google.firebase:firebase-crashlytics-gradle:3.0.3'`);
+    // anchored after the google-services classpath, not the AGP one
+    expect(top.indexOf("google-services:4.4.4'")).toBeLessThan(top.indexOf('firebase-crashlytics-gradle'));
+
+    const app = readApp();
+    expect(app).toContain('modoki:crashlytics-ndk-begin');
+    // The version is an EXPRESSION, not a literal: the NDK artifact and the one
+    // `@capacitor-firebase/crashlytics` resolves are a matched pair, and a mismatch fails at
+    // RUNTIME (no NDK reporting) rather than at resolution. Freezing a number here would drift
+    // silently the moment the plugin bumps.
+    expect(app).toContain("implementation \"com.google.firebase:firebase-crashlytics-ndk:"
+      + "${project.hasProperty('firebaseCrashlyticsVersion') ? rootProject.ext.firebaseCrashlyticsVersion : '20.0.3'}\"");
+    // right after `dependencies {`
+    const depIdx = app.indexOf('dependencies {');
+    const ndkIdx = app.indexOf('firebase-crashlytics-ndk');
+    const fileTreeIdx = app.indexOf('fileTree');
+    expect(depIdx).toBeGreaterThanOrEqual(0);
+    expect(ndkIdx).toBeGreaterThan(depIdx);
+    expect(ndkIdx).toBeLessThan(fileTreeIdx);
+
+    // the apply-plugin line lands INSIDE the servicesJSON guard, not merely somewhere in the file
+    expect(app).toContain('modoki:crashlytics-apply-begin');
+    const guardOpen = app.indexOf("if (servicesJSON.text) {");
+    const guardClose = app.indexOf('\n    }', guardOpen);
+    const applyIdx = app.indexOf("apply plugin: 'com.google.firebase.crashlytics'");
+    expect(applyIdx).toBeGreaterThan(guardOpen);
+    expect(applyIdx).toBeLessThan(guardClose);
+  });
+
+  it('does nothing for a project without the crashlytics dependency', () => {
+    writeTopGradle(); writeAppGradle(); writeCrashlyticsDep(false);
+    const beforeTop = readTop(); const beforeApp = readApp();
+    healNativeConfig(root);
+    expect(readTop()).toBe(beforeTop);
+    expect(readApp()).toBe(beforeApp);
+  });
+
+  it('migrates 3d-test\'s shape (classpath + apply-plugin hand-edited, NDK absent) to exactly one of each, no duplicates', () => {
+    fs.mkdirSync(path.join(root, 'android'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...TOP_GRADLE), [
+      'buildscript {',
+      '    dependencies {',
+      "        classpath 'com.android.tools.build:gradle:8.13.0'",
+      "        classpath 'com.google.gms:google-services:4.4.4'",
+      "        classpath 'com.google.firebase:firebase-crashlytics-gradle:3.0.3'",
+      '    }',
+      '}',
+      '',
+    ].join('\n'));
+    fs.mkdirSync(path.join(root, 'android', 'app'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...APP_GRADLE), [
+      "apply plugin: 'com.android.application'",
+      '',
+      'dependencies {',
+      "    implementation fileTree(include: ['*.jar'], dir: 'libs')",
+      '}',
+      '',
+      "try {",
+      "    def servicesJSON = file('google-services.json')",
+      '    if (servicesJSON.text) {',
+      "        apply plugin: 'com.google.gms.google-services'",
+      "        apply plugin: 'com.google.firebase.crashlytics'",
+      '    }',
+      '} catch(Exception e) {',
+      '    logger.info("google-services.json not found")',
+      '}',
+      '',
+    ].join('\n'));
+    writeCrashlyticsDep();
+
+    healNativeConfig(root);
+
+    const top = readTop();
+    expect((top.match(/firebase-crashlytics-gradle/g) || []).length).toBe(1);
+    expect((top.match(/classpath 'com\.google\.firebase:firebase-crashlytics-gradle:/g) || []).length).toBe(1);
+
+    const app = readApp();
+    expect((app.match(/implementation "com\.google\.firebase:firebase-crashlytics-ndk:/g) || []).length).toBe(1);
+    expect((app.match(/apply plugin: 'com\.google\.firebase\.crashlytics'/g) || []).length).toBe(1);
+  });
+
+  it('is idempotent — a second run returns undefined and the files are byte-identical', () => {
+    writeTopGradle(); writeAppGradle(); writeCrashlyticsDep();
+    healNativeConfig(root);
+    const top1 = readTop(); const app1 = readApp();
+    healNativeConfig(root);
+    expect(readTop()).toBe(top1);
+    expect(readApp()).toBe(app1);
+  });
+
+  it('migrates an older unmarked pinned version to the current pin', () => {
+    fs.mkdirSync(path.join(root, 'android'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...TOP_GRADLE), [
+      'buildscript {',
+      '    dependencies {',
+      "        classpath 'com.android.tools.build:gradle:8.13.0'",
+      "        classpath 'com.google.gms:google-services:4.4.4'",
+      "        classpath 'com.google.firebase:firebase-crashlytics-gradle:2.9.9'",
+      '    }',
+      '}',
+      '',
+    ].join('\n'));
+    writeAppGradle();
+    writeCrashlyticsDep();
+
+    healNativeConfig(root);
+    const top = readTop();
+    expect(top).not.toContain('2.9.9');
+    expect(top).toContain(`classpath 'com.google.firebase:firebase-crashlytics-gradle:3.0.3'`);
+    expect((top.match(/classpath 'com\.google\.firebase:firebase-crashlytics-gradle:/g) || []).length).toBe(1);
+  });
+
+  it('returns undefined and does not throw when android/ is missing', () => {
+    writeCrashlyticsDep();
+    expect(() => healNativeConfig(root)).not.toThrow();
+    expect(fs.existsSync(path.join(root, 'android'))).toBe(false);
   });
 });
 

@@ -116,4 +116,22 @@ describe('UI traits', () => {
       expect(schema.zIndex).toBe(0);
     });
   });
+
+  describe('UIToggle', () => {
+    it('is defined with the authored defaults', async () => {
+      const { UIToggle } = await getUITraits();
+      expect(UIToggle).toBeDefined();
+      const schema = (UIToggle as any).schema;
+      expect(schema.value).toBe(false);
+      expect(schema.trackOnColor).toBe(0x4aa3ff);
+      expect(schema.trackOffColor).toBe(0x767676);
+      expect(schema.trackOpacity).toBe(1);
+      expect(schema.knobColor).toBe(0xffffff);
+      expect(schema.knobOpacity).toBe(1);
+      expect(schema.knobInset).toBe(2);
+      expect(schema.trackRadius).toBe(999);
+      expect(schema.knobRadius).toBe(999);
+      expect(schema.disabled).toBe(false);
+    });
+  });
 });

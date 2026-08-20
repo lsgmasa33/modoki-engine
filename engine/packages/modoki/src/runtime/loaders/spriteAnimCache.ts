@@ -60,13 +60,17 @@ function normalizeClip(raw: unknown): SpriteClip {
   };
 }
 
+/** `...json` FIRST, then the normalized fields on top. The Sprite Anim Editor parks and writes
+ *  THIS object, so a key this function does not name would be deleted from the
+ *  `.spriteanim.json` on the first save (`xukhAP0gWNnD9MFRHb0P`). Mirrors
+ *  `normalizeAnimationClip` / `normalizeTimeline`. */
 export function normalizeSpriteAnim(json: Partial<SpriteAnimDef> | undefined): SpriteAnimDef {
   const clips: Record<string, SpriteClip> = {};
   const src = json?.clips;
   if (src && typeof src === 'object') {
     for (const [name, clip] of Object.entries(src)) clips[name] = normalizeClip(clip);
   }
-  return { id: json?.id, clips };
+  return { ...json, id: json?.id, clips };
 }
 
 /** Resolve a sprite-anim ref to its parsed definition, or null if not yet loaded.

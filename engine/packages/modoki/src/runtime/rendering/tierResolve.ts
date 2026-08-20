@@ -115,10 +115,21 @@ function publishActiveTier(res: TierResolution): void {
   // log their decisions ungated, and the cheap paths (player pin, single-config, iOS model id, GPU
   // table hit) were the one gap in that convention.
   //
-  // Declined alternatives, so they are not re-proposed: `console.info` instead of `warn` (would
-  // stop it looking like a warning in browser devtools on a public demo — offered, not taken);
-  // gating to `areDebugHandlesEnabled()`; gating out of playable ads.
-  console.warn(`[qualityTier] ${res.tier} via ${res.source} — ${res.reason}`);
+  // ⚠️ `console.log`, NOT `console.warn` — and the reason CHANGED, which is why the old note is
+  // rewritten rather than kept. Demoting this used to be a declined alternative (`console.info`
+  // was "offered, not taken", to stop it looking like a warning in browser devtools on a public
+  // demo). Then `console.warn` became a Crashlytics ISSUE (owner, 2026-08-20), so this line — which
+  // fires ungated on EVERY launch, reporting a decision that succeeded — would file an alerting
+  // issue per session and sit at the top of the console ahead of real crashes. Under the owner's
+  // own rule (a warning is something to look at; one that fires on an ordinary path should be
+  // removed) a per-launch result was mislabelled all along.
+  //
+  // Still ungated and still logged: the visibility this convention wanted is intact, only the
+  // SEVERITY changed. Genuine anomalies below — no usable reading, a throw, an over-budget stop —
+  // stay `warn` deliberately.
+  // Other declined alternatives, so they are not re-proposed: gating to `areDebugHandlesEnabled()`;
+  // gating out of playable ads.
+  console.log(`[qualityTier] ${res.tier} via ${res.source} — ${res.reason}`);
 }
 
 async function resolveActiveTierOnce(setting: QualityTierSetting, only2D: boolean): Promise<void> {
@@ -424,7 +435,10 @@ async function resolveProbeClass(
       // were always worth paying for: see the `coldReading` write below.
       final = refined.final && perPass.length >= PROBE_SAMPLE_TARGET
         && perPass.every((c) => c === perPass[0]);
-      console.warn(
+      // `log`, not `warn`: this is the probe REPORTING A READING on the ordinary path, up to three
+      // times per launch — evidence, not a warning. See the qualityTier line above for why that
+      // distinction became load-bearing on 2026-08-20.
+      console.log(
         `${tag} ${refined.deviceClass} — ${refined.reason} `
         + `(pass ${passes} this launch, alone: ${oneRun.deviceClass}; ${describeProbe(measurement)})`,
       );
@@ -556,18 +570,18 @@ export async function runProbeForDiagnostics(only2D = false): Promise<string> {
       () => runBootRampProbe((stage) => { lastStage = stage; }, only2D));
     if (!measurement) {
       const msg = `produced no measurement — last stage '${lastStage}'`;
-      console.warn(`[rampProbe] DIAGNOSTIC (idle) ${msg}`);
+      console.log(`[rampProbe] DIAGNOSTIC (idle) ${msg}`);
       return msg;
     }
     // The one-pass verdict, NOT a refined one: a refinement medians across stored samples, and this
     // run is not stored. Reporting `oneRun` is the honest answer for a single hand-triggered pass.
     const oneRun = classifyDevice(measurement);
     const summary = `${oneRun.deviceClass} — ${describeProbe(measurement)}`;
-    console.warn(`[rampProbe] DIAGNOSTIC (idle) ${summary}`);
+    console.log(`[rampProbe] DIAGNOSTIC (idle) ${summary}`);
     return summary;
   } catch (e) {
     const msg = `threw at stage '${lastStage}' — ${String(e).slice(0, 200)}`;
-    console.warn(`[rampProbe] DIAGNOSTIC (idle) ${msg}`);
+    console.log(`[rampProbe] DIAGNOSTIC (idle) ${msg}`);
     return msg;
   }
 }

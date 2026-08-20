@@ -71,6 +71,19 @@ export function resolveSprite(ref: string): ResolvedSprite | undefined {
   return textureProvider.get()?.resolveSprite(ref);
 }
 
+/** The monotonic epoch of whatever backs `ref` — bumped by a re-slice, an atlas re-pack, and a
+ *  texture RE-IMPORT that changes what its URL resolves to.
+ *
+ *  A consumer that caches a resolved URL must fold this into its cache key, or it keeps showing
+ *  the pre-edit image with no way to notice. Scene2D keys its sprite slots on it; the DOM UI tree
+ *  carries it per node with an `imageSrc` (`imageEpoch`), because its reconciler preserves node
+ *  references for equal data and React.memo would otherwise never re-run the resolve
+ *  (bug `udpbnC6DHswvCj115B7M`). 0 for a non-GUID ref, a primitive keyword, or a plain URL. */
+export function spriteEpoch(ref: string): number {
+  if (!ref) return 0;
+  return textureProvider.get()?.getSpriteEpoch(ref) ?? 0;
+}
+
 /** Resolve 2D primitive shape type from sprite keyword. Used by both Scene2D (PixiJS)
  *  and the editor SceneView's inline Canvas2DLayer to keep shape logic consistent. */
 export type PrimitiveShape = 'square' | 'triangle' | 'circle';

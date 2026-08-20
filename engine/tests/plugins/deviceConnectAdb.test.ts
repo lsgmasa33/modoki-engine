@@ -23,6 +23,7 @@ import { deviceCdpAdb, discoverDeviceCdpTarget, resetDeviceCdpSession } from '..
 const realForward = adbRunner.forward;
 const realRemove = adbRunner.removeForward;
 const realListForwards = adbRunner.listForwards;
+const realLogcatDump = adbRunner.logcatDump;
 const realList = androidDevicesExec.list;
 const realDeviceName = androidDevicesExec.deviceName;
 /** One attached, usable phone — the unambiguous case, so these tests exercise the adb branch rather
@@ -43,6 +44,9 @@ beforeEach(() => {
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
   adbRunner.forward = vi.fn(); adbRunner.removeForward = vi.fn();
+  // A failed adb connect now mines logcat for a fallback port before phrasing its error.
+  // Stubbed for the same reason the forwards are: the real binary must never be invoked here.
+  adbRunner.logcatDump = vi.fn(async () => '');
   androidDevicesExec.list = () => ONE_DEVICE;
   // The friendly-name lookup is a second adb shell — stubbed for the same reason as the listing:
   // un-stubbed it asks the machine's REAL attached phones for their names (#149).
@@ -71,6 +75,7 @@ afterEach(() => {
   if (prevBackendPort === undefined) delete process.env.MODOKI_BACKEND_PORT;
   else process.env.MODOKI_BACKEND_PORT = prevBackendPort;
   adbRunner.forward = realForward; adbRunner.removeForward = realRemove; adbRunner.listForwards = realListForwards;
+  adbRunner.logcatDump = realLogcatDump;
   androidDevicesExec.list = realList;
   androidDevicesExec.deviceName = realDeviceName;
   _clearFriendlyNameCache();

@@ -1209,20 +1209,23 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     const markers = query.get('markers');
     const limit = query.get('limit');
     const action = query.get('action') ?? 'read';
-    const MUTATING = ['capture-start', 'capture-stop', 'capture-clear', 'gpu-on', 'gpu-off', 'reset'];
-    if (action !== 'read' && action !== 'capture-read') {
+    const MUTATING = ['capture-start', 'capture-stop', 'capture-clear', 'gpu-on', 'gpu-off', 'reset', 'boot-reset'];
+    if (action !== 'read' && action !== 'capture-read' && action !== 'boot') {
       // A mutating action arriving by GET is refused rather than served: obeying it here is exactly
       // the unchecked-failure hole §4 describes. An UNKNOWN action is a DIFFERENT error and must not
       // be told it "mutates" — `?action=Read` (wrong case) used to get that sentence, which is
       // simply false and sends the reader looking for the wrong fix.
       return MUTATING.includes(action)
-        ? json({ error: `profiler action "${action}" MUTATES profiler state, so it must be POSTed to /api/profiler — GET serves only read / capture-read.` }, 405)
-        : json({ error: `unknown profiler action "${action}". GET serves read / capture-read; POST /api/profiler takes ${MUTATING.join(' / ')}.` }, 400);
+        ? json({ error: `profiler action "${action}" MUTATES profiler state, so it must be POSTed to /api/profiler — GET serves only read / capture-read / boot.` }, 405)
+        : json({ error: `unknown profiler action "${action}". GET serves read / capture-read / boot; POST /api/profiler takes ${MUTATING.join(' / ')}.` }, 400);
     }
     const params = {
       action,
       ...(markers != null && markers !== '' && !Number.isNaN(Number(markers)) ? { markers: Number(markers) } : {}),
       ...(limit != null && limit !== '' && !Number.isNaN(Number(limit)) ? { limit: Number(limit) } : {}),
+      // action:boot — the full-timeline escape hatch. Only `true` turns it on; anything else is
+      // the default, so a stray `?all=0` cannot flip it on by being truthy-as-a-string.
+      ...(query.get('all') === 'true' ? { all: true } : {}),
     };
     try { return json(await ctx.requestBrowser('profiler', params)); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
@@ -1286,11 +1289,14 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   if (urlPath === '/api/render-scene' && method === 'POST') {
     pruneOldTempFiles('modoki-render-'); // drop stale frames from prior sessions
     try {
-      const result = await ctx.requestBrowser('render-scene', body ?? {}, 15000) as { width: number; height: number; quality?: number; dataUrl: string };
+      const result = await ctx.requestBrowser('render-scene', body ?? {}, 15000) as { width: number; height: number; quality?: number; surface?: string; dataUrl: string };
       // Echo the EFFECTIVE quality (1–100) the renderer actually used, so an out-of-unit value is
       // visibly converted rather than silently ignored (S3.13).
+      // Echo `surface` too — the tool description promises it and used to be alone in doing so
+      // (bug `XBayncnNfJj3RtjVZiBX`); it names which surface actually served the frame.
       return json({ path: writeDataUrlToTemp(result.dataUrl), width: result.width, height: result.height,
-        ...(result.quality !== undefined ? { quality: result.quality } : {}) });
+        ...(result.quality !== undefined ? { quality: result.quality } : {}),
+        ...(result.surface !== undefined ? { surface: result.surface } : {}) });
     } catch (e) {
       return json({ error: String(e instanceof Error ? e.message : e) }, 504);
     }

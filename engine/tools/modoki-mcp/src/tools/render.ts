@@ -61,7 +61,9 @@ export function registerRenderTools(tool: ToolDef, ctx: ToolContext): void {
       'orbiting. Only the runtime Scene3D (mounted by the Game panel) registers an offscreen ' +
       'renderer, so the framing you get is the GAME camera unless you override `camera`, and a ' +
       'closed Game panel means there is nothing to render. Check `surfaces` in ' +
-      'modoki_get_editor_state. The reply echoes `surface`.\n\n' +
+      'modoki_get_editor_state. The reply echoes `surface` — the label of the surface that ' +
+      'actually served the frame, read off the mounted registrant, so it confirms rather than ' +
+      'assumes (`game-3d` today, always).\n\n' +
       'This FORCES a fresh render, so it CANNOT reveal a stale or render-on-demand frame — the broken frame heals in the capture. For the TRUE framebuffer use CDP Page.captureScreenshot (see CLAUDE.md). ',
     {
       width: z.number().int().positive().max(4096).optional().describe('Output width px (default: live viewport; ≤4096).'),

@@ -42,7 +42,10 @@ Grouped:
   explains a death that already happened).
 - **Percept (read-by-data):** `device_get_scene_state` · `device_diagnose` · `device_journal` ·
   `device_resolve_refs` · `device_introspect` · `device_layout_bounds` · `device_watch` ·
-  `device_profiler` (where did the frame go — the phone is the only place that question is real) ·
+  `device_profiler` (where did the frame go — the phone is the only place that question is real;
+  `action:'boot'` answers the different question "where did the BOOT go", reading the always-on
+  boot-phase timeline against the worst dropped frame — see
+  [profiler.md](plans/profiler.md) § Phase 2) ·
   `device_handles`.
 - **Authoring (live-world WRITES, #166):** `device_mutate_scene` (set trait fields over a
   `where` filter / `guid[]` / `name` / `id` — `dryRun` first if the selector is broad) ·
@@ -141,8 +144,11 @@ package/bundle id the socket is actually held by (`App: <name> (<id>) [<platform
 the device holding the socket`, via `@capacitor/app`'s `getInfo()` read in the SAME page context as
 the TCP server — so the answer can't be a locally-derived guess) whenever a lease is connected: the
 one-call check for this that used to take a logcat hunt. **If a device answer looks impossible,
-`device_status` first; failing that, check `adb shell ps -A | grep modoki` and force-stop the
-others.**
+`device_status` first; failing that, find the holder by its SOCKET rather than its name —
+`adb shell 'cat /proc/net/tcp /proc/net/tcp6' | awk '$4=="0A"'` lists every listener with its uid,
+which `dumpsys package <pkg> | grep userId` maps back to a package. A `grep modoki` MISSES a Modoki
+game whose package is not named that: `games/court` ships as `com.apiary.court`, and it held 9095
+through an entire investigation on 2026-08-20 for exactly this reason (#283).**
 
 `device_status` also names **which HANDSET** the lease is holding, on its own line —
 `Device: iPhone18,4 / 26.5.2 — the hardware this lease is holding` — from
@@ -176,6 +182,22 @@ Two limits on that check, both measured on the Samsung 2026-08-02 — know them 
   the other app's pause), and an app built before #95 still squats — so when a connect fails on
   9095, closing the other Modoki apps remains the fix, and `device_connect` accepts an explicit
   `port` for the case where you can read the real one from the log or the in-game debug menu.
+- ⭐ **#283 narrowed that race further: the bridge now RETRIES the default port for 2 s before
+  accepting a fallback** (`bindWithRetry` in `GameDebugPlugin.java`; the iOS `startListener` mirrors
+  it with a scheduled re-attempt). Sized from the measured handover on a Galaxy A23 — launching a
+  game while another was foregrounded, the incoming app gave up **449 ms** before the outgoing one
+  released, because `startServer` runs off the webview boot while the release runs off the lifecycle
+  callback and nothing orders the two. Verified on device both ways: port freed mid-window →
+  `port 9095 acquired after 1 retry`; port held throughout → falls back after exactly 2,000 ms with
+  a message naming the fix. A fallback is now also **announced** — `startServer`/`getStatus` return
+  `fallbackPort: true`, and the JS side `console.warn`s it (a `_log` would be invisible, since the
+  console ring keeps only warn/error).
+- ⚠️ **The retry is not a closure, because the outgoing app does not always release at all.**
+  Measured in the same session: Court held 9095 through a full skin-test launch with no
+  `Server stopped` line ever logged, so no retry window could have helped. Closing it properly needs
+  the host to DISCOVER the port (`adb logcat -d | grep "TCP server listening"`, or the `/proc` scan
+  above) **and verify which app answered** — `device_status`'s package id exists precisely because
+  connecting to the wrong app is worse than a clean refusal. Not built; tracked in #283.
 
 **How the Percept/Enact tools work — one delegation, zero duplication.** The device runs the SAME game
 ECS + renderer + DOM as the editor, and the Percept/Enact op registry (`engine/app/debug/agentBridge.ts`

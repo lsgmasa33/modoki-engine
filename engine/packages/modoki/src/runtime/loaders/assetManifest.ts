@@ -21,6 +21,7 @@
  */
 
 import { assetUrl } from './assetUrl';
+import { markUIDirty } from '../core/uiDirty';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import type { TextureImportSettings, TextureType } from './textureSettings';
 import type { AudioImportSettings, AudioCacheInfo } from './audioSettings';
@@ -254,6 +255,17 @@ export function registerAsset(
   if (prior && prior.path !== path) {
     pathToGuid.delete(prior.path);
   }
+  // A RE-IMPORT that changes what this texture's URL resolves to must invalidate every cached
+  // resolution of it, exactly as a re-slice does. `_spriteEpochByTexture` was bumped only by
+  // `registerSprite`, so a retype+reimport left the epoch untouched and every consumer that
+  // caches on it kept the pre-fix URL. Measured on `games/anim-bug` (bug `udpbnC6DHswvCj115B7M`,
+  // QA-ASSET-0007): retyping a texture 3d→ui and reimporting fixed the sidecar, the manifest and
+  // `resolveBrowserImageUrl` — and the live `UIElement.imageSrc` DOM kept `…/foo.png` with no
+  // `~webp` until the trait was touched. That is the narrow residue of `ZRFuilq9GcTBksO4HmAs`:
+  // the resolution was already correct at that moment, nothing had re-asked for it.
+  const bumpTextureEpoch = type === 'texture' && !!prior && textureResolutionChanged(prior, {
+    path, textureType: modelBlocks?.textureType, format: texture?.format, hash,
+  });
   // A font whose mode (baked↔dynamic) or content hash (re-bake) changed must evict
   // its live provider so the next render re-acquires with the new settings — else a
   // Font-Inspector mode flip or re-bake has no effect until a full editor restart.
@@ -309,8 +321,34 @@ export function registerAsset(
     guidToEntry.delete(priorGuidForPath);
   }
   pathToGuid.set(path, guid);
+  if (bumpTextureEpoch) {
+    _spriteEpochByTexture.set(guid, (_spriteEpochByTexture.get(guid) ?? 0) + 1);
+    // Bumping the epoch is only half of it: the DOM UI tree rebuilds only when something marks
+    // it dirty, and an asset re-import never did. Scene2D re-keys its slots off the epoch on its
+    // own frame, and the editor SceneView re-resolves every frame — the DOM UI path is the one
+    // surface with neither, which is why the reimport landed everywhere except there.
+    markUIDirty();
+  }
   // Fire AFTER the entry is committed so a listener re-acquiring reads the new block.
   if (fontChanged) for (const fn of fontInvalidationListeners) { try { fn(guid); } catch { /* ignore */ } }
+}
+
+/** Would this re-registration change what a URL for this texture resolves to?
+ *
+ *  Deliberately NOT "did anything re-register": the manifest is re-broadcast wholesale by the
+ *  watcher, so bumping on every re-register would invalidate every cached resolution in the
+ *  editor on any unrelated asset change. These four inputs are what `resolveBrowserImageUrl` /
+ *  `resolveTextureVariantUrl` actually read — the served path, the AUTHORED usage type (which
+ *  decides whether a WebP sibling is even looked for), the encoded format, and the content hash
+ *  (a re-encode of the same settings). */
+export function textureResolutionChanged(
+  prior: { path: string; textureType?: string; texture?: { format?: string }; hash?: string },
+  next: { path: string; textureType?: string; format?: string; hash?: string },
+): boolean {
+  return prior.path !== next.path
+    || (next.textureType !== undefined && prior.textureType !== next.textureType)
+    || (next.format !== undefined && prior.texture?.format !== next.format)
+    || (next.hash !== undefined && prior.hash !== next.hash);
 }
 
 type FontInvalidationListener = (guid: string) => void;

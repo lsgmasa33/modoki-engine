@@ -69,7 +69,7 @@ import { useEditorStore } from '../store/editorStore';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { isTextEditable } from '../input/focusScope';
-import { worldToLocalTransform, clampScaleCrossingPivot, scaleCrossedPivot, type ScaleSigns } from '../scene/gizmoTransform';
+import { worldToLocalTransform, clampScaleCrossingPivot, scaleCrossedPivot, scaleFromGizmoRatio, type ScaleSigns } from '../scene/gizmoTransform';
 import { boneRelToProxyLocal, proxyLocalToBoneLocal } from '../scene/billboardBonePose';
 import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, canFrameSelected, setViewportController, setEcsObjectsRegistry } from '../scene/sceneViewBus';
 import { withWarnFilter } from '../scene/warnFilter';
@@ -2664,6 +2664,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // Track which entity the gizmo is attached to (for ECS sync skip)
     let gizmoEntityId: number | null = null;
     let gizmoDragStart: { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number } | null = null;
+    /** The ATTACHED OBJECT's scale at pointer-down — the basis TransformControls multiplies.
+     *  For a mesh-less entity that object is an editor icon whose scale nothing syncs from the
+     *  entity, so only the RATIO against this snapshot is meaningful. See `scaleFromGizmoRatio`. */
+    let gizmoProxyScaleStart: { x: number; y: number; z: number } | null = null;
     /** Sign of the gizmo'd object's scale when a scale drag STARTED — so a drag that crosses the
      *  pivot stops at 0 instead of mirroring the entity (clampScaleCrossingPivot). */
     let gizmoScaleStartSign: ScaleSigns | null = null;
@@ -2740,6 +2744,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       gizmoDragStart = { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz };
       const o = gizmo.object;
       gizmoScaleStartSign = o ? { x: Math.sign(o.scale.x), y: Math.sign(o.scale.y), z: Math.sign(o.scale.z) } : null;
+      gizmoProxyScaleStart = o ? { x: o.scale.x, y: o.scale.y, z: o.scale.z } : null;
     };
     gizmo.addEventListener('mouseDown', onGizmoMouseDown);
 
@@ -2755,6 +2760,15 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       if (!(gizmo as any).dragging) return;
       const obj = gizmo.object;
       if (!obj) return;
+      // WAIT FOR THE SNAPSHOT. TransformControls dispatches `change` from the SETTER of its
+      // `dragging` property (`defineProperty` in TransformControls.js), and `this.dragging = true`
+      // runs one line BEFORE `dispatchEvent(_mouseDownEvent)` — so the first change of every drag
+      // arrives before `onGizmoMouseDown` has captured anything, carrying the object's PRE-drag
+      // pose. Acting on it writes the proxy's own pose onto the entity, and `mouseDown` then
+      // records THAT as the undo `before`. Harmless for a mesh (its object already holds the
+      // entity's pose); for a mesh-less entity it is how a Light's authored scale was destroyed
+      // and its undo poisoned in the same tick (bug `euf2YDw0bXcPZ6CziuSU`).
+      if (!gizmoDragStart && !groupDrag) return;
 
       // Group (multi-select) drag: apply the proxy's world delta to every member via the pure
       // cluster math, then convert each new world matrix back to that member's LOCAL Transform.
@@ -2838,7 +2852,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       } else if (mode === 'rotate') {
         entity.set(Transform, { ...current, rx: clampAngle(local.rx), ry: clampAngle(local.ry), rz: clampAngle(local.rz) });
       } else if (mode === 'scale') {
-        const s = clampScaleCrossingPivot(local, obj.scale, gizmoScaleStartSign);
+        // Scale from the RATIO the gizmo applied to its proxy, not from the proxy's absolute
+        // scale — the two agree for a mesh and diverge without bound for an icon gizmo. The
+        // decomposed `local` stays the fallback for an axis whose proxy started at 0.
+        const scaled = gizmoDragStart && gizmoProxyScaleStart
+          ? scaleFromGizmoRatio(gizmoDragStart, gizmoProxyScaleStart, obj.scale, local)
+          : local;
+        const s = clampScaleCrossingPivot({ ...local, ...scaled }, obj.scale, gizmoScaleStartSign);
         entity.set(Transform, { ...current, sx: s.sx, sy: s.sy, sz: s.sz });
       }
       // Bulk entity.set bypasses writeTraitField, which is what normally
@@ -2910,6 +2930,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         markOverrideIfInstance(eid, 'Transform', k);
       }
       gizmoDragStart = null;
+      gizmoProxyScaleStart = null;
     };
     gizmo.addEventListener('mouseUp', onGizmoMouseUp);
 
@@ -3320,7 +3341,16 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       const wt = worldTransforms.get(id);
       if (!wt) return;
       g.position.set(wt.x, wt.y, wt.z);
-      if (!gizmoDragging) g.rotation.set(wt.rx, wt.ry, wt.rz);
+      if (!gizmoDragging) {
+        g.rotation.set(wt.rx, wt.ry, wt.rz);
+        // These icons are FIXED-SIZE affordances — a light has no extent, so the octahedron is
+        // not showing you the entity's scale and must not drift. TransformControls mutates the
+        // attached object's scale during a scale drag, and nothing used to put it back, so the
+        // icon kept every drag's growth (and, before `scaleFromGizmoRatio`, that drift WAS the
+        // drag's basis). Restoring it here is now cosmetic — the write-back no longer reads this
+        // value absolutely — but an icon that quietly grows to 800x is its own lie.
+        g.scale.set(1, 1, 1);
+      }
     };
 
     const GIZMO_SHAPES = {
@@ -4096,10 +4126,17 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             // marker size — inheriting it would blow the "small empty marker" up to the full
             // frame box (the very box showGizmo=off is meant to hide). Keep it fixed-small so
             // the entity stays selectable without drawing a second frame-sized box.
-            if (entity.has(CameraFrame)) {
-              g.scale.set(1, 1, 1);
-            } else {
-              g.scale.set(Math.abs(wt.sx) || 1, Math.abs(wt.sy) || 1, Math.abs(wt.sz) || 1);
+            // Not while THIS entity is mid-drag: TransformControls owns the object's scale then,
+            // and the sign it leaves there is what `clampScaleCrossingPivot` reads to detect a
+            // drag past the pivot — `Math.abs` below would erase that signal every frame. (The
+            // magnitude no longer matters to the write-back, which goes through
+            // `scaleFromGizmoRatio`; the sign still does.)
+            if (!(gizmoEntityId === id && (gizmo as { dragging?: boolean }).dragging)) {
+              if (entity.has(CameraFrame)) {
+                g.scale.set(1, 1, 1);
+              } else {
+                g.scale.set(Math.abs(wt.sx) || 1, Math.abs(wt.sy) || 1, Math.abs(wt.sz) || 1);
+              }
             }
           }
         });

@@ -71,6 +71,10 @@ beforeEach(() => {
     three: { ...BASE.three, qualityTier: 'auto', tiers: TWO_CONFIGS as never },
   });
   vi.spyOn(console, 'warn').mockImplementation(() => {});
+  // …and `log` too, since the probe's ordinary-path evidence moved there when
+  // console.warn became a Crashlytics issue (2026-08-20). Silencing only `warn` would
+  // leave this suite printing a probe report per pass.
+  vi.spyOn(console, 'log').mockImplementation(() => {});
 });
 
 afterEach(() => {

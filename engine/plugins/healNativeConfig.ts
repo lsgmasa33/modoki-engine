@@ -827,14 +827,196 @@ function insertDsymPhase(pbx: string): string | undefined {
   lines.splice(at, 0, `\t\t\t\t${GD_UUID.dsymUploadPhase} /* ${DSYM_PHASE_NAME} */,`);
   const text = lines.join('\n');
 
+  // ⚠️ Insert at the END of an existing section, where {@link insertArchiveWarnPhase} inserts at
+  // the START — and that asymmetry is the fix for a measured defect, not an accident. Both used to
+  // splice in right after the section-open line, so each put ITSELF first and shoved the other to
+  // second: on every project open the two phase objects swapped places, each heal rewrote the
+  // pbxproj, and each returned a "synced …" note for work that netted to nothing. Measured on
+  // games/court 2026-08-20 — two writes of equal length and opposite content, with the file
+  // identical before and after the pass. Deterministic slots (warning first, dSYM last) make both
+  // heals fixed points on an already-correct file, so a note now means a real change.
   const sectionOpen = '/* Begin PBXShellScriptBuildPhase section */';
-  if (text.includes(sectionOpen)) {
-    return text.replace(sectionOpen,
-      sectionOpen + '\n' + DSYM_PHASE_BLOCK.split('\n').slice(1, -2).join('\n'));
+  const sectionEnd = '/* End PBXShellScriptBuildPhase section */';
+  if (text.includes(sectionOpen) && text.includes(sectionEnd)) {
+    return text.replace(sectionEnd,
+      DSYM_PHASE_BLOCK.split('\n').slice(1, -2).join('\n') + '\n' + sectionEnd);
   }
   const anchor = '/* Begin PBXSourcesBuildPhase section */';
   if (!text.includes(anchor)) return undefined;
   return text.replace(anchor, DSYM_PHASE_BLOCK + '\n' + anchor);
+}
+
+/** Crashlytics Gradle plugin version (#282, generalized out of Court's hand-edited
+ *  `android/build.gradle`, #275). Needed for the mapping.txt / NDK symbol upload that makes a
+ *  native or minified stack readable — without it the SDK still reports, but the frames come
+ *  back obfuscated on any build with minifyEnabled on. */
+const CRASHLYTICS_GRADLE_PLUGIN_VERSION = '3.0.3';
+
+/** FALLBACK Crashlytics NDK artifact version (#282, generalized out of Court's hand-edited
+ *  `android/app/build.gradle`, #279) — used only when the project does not expose
+ *  `firebaseCrashlyticsVersion`.
+ *
+ *  ⚠️ **The emitted line PREFERS the project's own resolved version, and that is deliberate.**
+ *  `firebase-crashlytics-ndk` and the `firebase-crashlytics` artifact `@capacitor-firebase/crashlytics`
+ *  pulls in are a MATCHED PAIR: a mismatch is a RUNTIME failure — silently absent NDK crash
+ *  reporting — not a resolution error, so nothing in a build log would catch it. Court's hand
+ *  edit read `rootProject.ext.firebaseCrashlyticsVersion` for exactly that reason, so the
+ *  generated block keeps the expression rather than freezing a number that drifts the moment the
+ *  plugin bumps. This constant is the no-property fallback only, and matches the plugin's current
+ *  default. */
+const CRASHLYTICS_NDK_VERSION = '20.0.3';
+
+/** The NDK dependency's version expression — the project's own `firebaseCrashlyticsVersion` when
+ *  it has one, else {@link CRASHLYTICS_NDK_VERSION}. See that constant for why this is an
+ *  expression and not a literal. */
+const CRASHLYTICS_NDK_VERSION_EXPR =
+  `\${project.hasProperty('firebaseCrashlyticsVersion') ? rootProject.ext.firebaseCrashlyticsVersion : '${CRASHLYTICS_NDK_VERSION}'}`;
+
+const CRASHLYTICS_CLASSPATH_BEGIN = '// modoki:crashlytics-classpath-begin (#282)';
+const CRASHLYTICS_CLASSPATH_END = '// modoki:crashlytics-classpath-end';
+const CRASHLYTICS_NDK_BEGIN = '// modoki:crashlytics-ndk-begin (#282)';
+const CRASHLYTICS_NDK_END = '// modoki:crashlytics-ndk-end';
+const CRASHLYTICS_APPLY_BEGIN = '// modoki:crashlytics-apply-begin (#282)';
+const CRASHLYTICS_APPLY_END = '// modoki:crashlytics-apply-end';
+
+/** Normalize a file's line endings for editing, and put them back on the way out.
+ *
+ *  Every gradle edit below is written as LF-only text — fences, anchors, inserted blocks. Handed a
+ *  CRLF file those edits produce a MIXED-ending file that differs from its input, so the heal
+ *  rewrites it, and rewrites it again on the next pass: measured drift of one extra blank line per
+ *  run before it settled, with the inserted block left bare-LF inside a CRLF file. `.gitattributes`
+ *  pins `*.gradle text eol=lf`, so this needs a non-git write path to happen at all — but this repo
+ *  has a documented history of Windows-only EOL bugs (docs/windows.md) and the guard is one regex.
+ *  Edit in LF, restore whatever the file had. */
+function eolSafe(orig: string): { lf: string; restore: (edited: string) => string } {
+  const crlf = orig.includes('\r\n');
+  return {
+    lf: crlf ? orig.replace(/\r\n/g, '\n') : orig,
+    restore: (edited: string) => (crlf ? edited.replace(/\n/g, '\r\n') : edited),
+  };
+}
+
+/** Add the Crashlytics Gradle plugin classpath to `android/build.gradle`'s
+ *  `buildscript { dependencies { … } }` block — generalized out of Court's hand edit (#275).
+ *  Anchored after the `com.google.gms:google-services` classpath when present (Crashlytics rides
+ *  the same `google-services.json`), otherwise after the AGP classpath every project has.
+ *  Strip-then-reinsert, like {@link healIosCrashlyticsDsyms} — see its doc comment for why a
+ *  presence check is the wrong shape here too: a version bump to the constant above must reach
+ *  every project that already has the block, not just fresh ones. Also migrates a pre-existing
+ *  HAND-EDITED (unmarked) classpath line — any pinned version — to the fenced form, so a
+ *  hand-edited project (Court, 3d-test) ends up with exactly one copy. */
+function healAndroidCrashlyticsClasspath(projectRoot: string): string | undefined {
+  const gradle = path.join(projectRoot, 'android', 'build.gradle');
+  if (!fs.existsSync(gradle)) return undefined;
+  const raw = fs.readFileSync(gradle, 'utf8');
+  const { lf: orig, restore } = eolSafe(raw);
+
+  const fenceRe = new RegExp(`\\n*[ \\t]*${escapeRe(CRASHLYTICS_CLASSPATH_BEGIN)}[\\s\\S]*?${escapeRe(CRASHLYTICS_CLASSPATH_END)}\\n?`);
+  let text = orig.replace(fenceRe, '\n');
+  text = text.replace(/^[ \t]*classpath[^\n]*firebase-crashlytics-gradle[^\n]*\r?\n?/gm, '');
+
+  const gmsAnchor = /^([ \t]*classpath\s+['"]com\.google\.gms:google-services:[^'"]*['"])[ \t]*(?:\/\/[^\n]*)?$/m;
+  const agpAnchor = /^([ \t]*classpath\s+['"]com\.android\.tools\.build:gradle:[^'"]*['"])[ \t]*(?:\/\/[^\n]*)?$/m;
+  const block = `        ${CRASHLYTICS_CLASSPATH_BEGIN}\n`
+    + `        classpath 'com.google.firebase:firebase-crashlytics-gradle:${CRASHLYTICS_GRADLE_PLUGIN_VERSION}'\n`
+    + `        ${CRASHLYTICS_CLASSPATH_END}`;
+  if (gmsAnchor.test(text)) text = text.replace(gmsAnchor, `$1\n${block}`);
+  else if (agpAnchor.test(text)) text = text.replace(agpAnchor, `$1\n${block}`);
+  else return undefined; // neither anchor found — bail without a partial edit
+
+  if (text === orig) return undefined;
+  fs.writeFileSync(gradle, restore(text));
+  return 'Gradle plugin classpath';
+}
+
+/** Add the Crashlytics NDK artifact to `android/app/build.gradle`'s top-level
+ *  `dependencies { … }` block — generalized out of Court's hand edit (#279); see
+ *  {@link CRASHLYTICS_NDK_VERSION}'s comment for why the version is pinned. Inserted immediately
+ *  after the `dependencies {` line — Gradle does not care about order. Strip-then-reinsert +
+ *  hand-edit migration, like its sibling above. */
+function healAndroidCrashlyticsNdk(projectRoot: string): string | undefined {
+  const gradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  if (!fs.existsSync(gradle)) return undefined;
+  const raw = fs.readFileSync(gradle, 'utf8');
+  const { lf: orig, restore } = eolSafe(raw);
+
+  const fenceRe = new RegExp(`\\n*[ \\t]*${escapeRe(CRASHLYTICS_NDK_BEGIN)}[\\s\\S]*?${escapeRe(CRASHLYTICS_NDK_END)}\\n?`);
+  let text = orig.replace(fenceRe, '\n');
+  text = text.replace(/^[ \t]*implementation[^\n]*firebase-crashlytics-ndk[^\n]*\r?\n?/gm, '');
+
+  // Only a trailing COMMENT is tolerated here, never arbitrary text: `dependencies { impl 'x' }`
+  // is a one-line block, and inserting "after" it would put the artifact OUTSIDE the block.
+  const anchor = /^(dependencies \{)[ \t]*(?:\/\/[^\n]*)?$/m;
+  if (!anchor.test(text)) return undefined;
+  const block = `    ${CRASHLYTICS_NDK_BEGIN}\n`
+    + `    implementation "com.google.firebase:firebase-crashlytics-ndk:${CRASHLYTICS_NDK_VERSION_EXPR}"\n`
+    + `    ${CRASHLYTICS_NDK_END}`;
+  text = text.replace(anchor, `$1\n${block}`);
+
+  if (text === orig) return undefined;
+  fs.writeFileSync(gradle, restore(text));
+  return 'NDK artifact';
+}
+
+/** Add `apply plugin: 'com.google.firebase.crashlytics'` inside the SAME `servicesJSON` guard as
+ *  `com.google.gms.google-services` — generalized out of Court's hand edit (#275/#279).
+ *  ⚠️ Placement is load-bearing: Crashlytics rides the same `google-services.json` as
+ *  google-services, and applying it OUTSIDE the guard fails the build for a project that has none.
+ *  If the guard is absent (no `com.google.gms.google-services` apply-plugin line to anchor on),
+ *  this edit is skipped — never invented — while its two siblings above still run. */
+function healAndroidCrashlyticsApplyPlugin(projectRoot: string): string | undefined {
+  const gradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  if (!fs.existsSync(gradle)) return undefined;
+  const raw = fs.readFileSync(gradle, 'utf8');
+  const { lf: orig, restore } = eolSafe(raw);
+
+  const fenceRe = new RegExp(`\\n*[ \\t]*${escapeRe(CRASHLYTICS_APPLY_BEGIN)}[\\s\\S]*?${escapeRe(CRASHLYTICS_APPLY_END)}\\n?`);
+  let text = orig.replace(fenceRe, '\n');
+  text = text.replace(/^[ \t]*apply plugin:\s*['"]com\.google\.firebase\.crashlytics['"][ \t]*\r?\n?/gm, '');
+
+  const anchor = /^([ \t]*apply plugin:\s*['"]com\.google\.gms\.google-services['"])[ \t]*(?:\/\/[^\n]*)?$/m;
+  if (!anchor.test(text)) return undefined; // guard absent — don't invent it, just skip this edit
+  const block = `        ${CRASHLYTICS_APPLY_BEGIN}\n`
+    + `        apply plugin: 'com.google.firebase.crashlytics'\n`
+    + `        ${CRASHLYTICS_APPLY_END}`;
+  text = text.replace(anchor, `$1\n${block}`);
+
+  if (text === orig) return undefined;
+  fs.writeFileSync(gradle, restore(text));
+  return 'apply plugin';
+}
+
+/** Generalizes Court's hand-edited Android Crashlytics gradle wiring (#275, #279) the way
+ *  {@link healIosCrashlyticsDsyms} generalizes the iOS symbol-upload phase — any project
+ *  depending on `@capacitor-firebase/crashlytics` gets it automatically. Same gate
+ *  ({@link usesCrashlytics}), same strip-then-reinsert reasoning, three fenced edits across two
+ *  files: the Gradle-plugin classpath, the NDK artifact, and the apply-plugin line (skipped, not
+ *  invented, when its guard is absent). */
+function healAndroidCrashlytics(projectRoot: string): string | undefined {
+  if (!usesCrashlytics(projectRoot)) return undefined;
+  // Each sub-heal returns its own label, or undefined when it changed nothing. Taking the label
+  // from the return value rather than repeating it here keeps the two from drifting apart.
+  const changed = [
+    healAndroidCrashlyticsClasspath(projectRoot),
+    healAndroidCrashlyticsNdk(projectRoot),
+    healAndroidCrashlyticsApplyPlugin(projectRoot),
+  ].filter((c): c is string => c !== undefined);
+
+  // ⚠️ SAY SO when the load-bearing step is missing, instead of reporting the other two as a
+  // success. Without `apply plugin: 'com.google.firebase.crashlytics'` the classpath and the NDK
+  // artifact do nothing — no mapping upload, no native symbolication — and that is precisely the
+  // half-wired shape #282 exists to end (3d-test carried a classpath with no NDK artifact for
+  // weeks and looked configured). The apply step is skipped only when there is no
+  // `com.google.gms.google-services` apply to anchor on, which also means the project has no
+  // Firebase config at all; silence there reads as "done".
+  const appGradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  if (changed.length > 0 && fs.existsSync(appGradle)
+      && !fs.readFileSync(appGradle, 'utf8').includes("apply plugin: 'com.google.firebase.crashlytics'")) {
+    changed.push('⚠️ apply-plugin NOT wired — no `com.google.gms.google-services` apply to anchor on,'
+      + ' so Crashlytics symbol upload is inert');
+  }
+  if (changed.length === 0) return undefined;
+  return `synced Android Crashlytics gradle wiring — ${changed.join(', ')} (#282)`;
 }
 
 /** The Gradle sibling of {@link healIosArchiveWarning}. Appends (flag on) or removes
@@ -1687,6 +1869,9 @@ export function healNativeConfig(projectRoot: string): HealResult {
     // and a Release build needs it more, not less. It gates itself on Crashlytics being installed.
     const ds = healIosCrashlyticsDsyms(projectRoot);
     if (ds) notes.push(ds);
+    // Android half of the same concern (#282) — likewise independent of build.debugBuild.
+    const dsa = healAndroidCrashlytics(projectRoot);
+    if (dsa) notes.push(dsa);
     // game-debug heals — only for a project that depends on the bridge. Every one of
     // these keys on build.debugBuild and NOTHING else (#112): the Xcode/Gradle
     // configuration means optimization + symbols, never "is this a debug build".

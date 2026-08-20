@@ -19,7 +19,7 @@ import { isEditingPrefab, savePrefabEdit } from './prefabEdit';
 import { getRunMode, canEdit, type RunMode } from '../../runtime/core/playState';
 import {
   hasTimelinePreviewSession, getPreviewSaveHandler, previewHasAuthoredEdits,
-  currentPreviewSaveHandlerFor,
+  resumeHandlerFor,
 } from './timelinePreview';
 import { getModeOwner } from './playMode';
 
@@ -121,11 +121,23 @@ async function runSaveAllOnce(): Promise<SaveOutcome> {
       // a `.then()` with no `.catch()`, so nothing is reported at all.
       await preview.suspend();
       const out = await runSaveTargets();
-      const resumed = currentPreviewSaveHandlerFor(owner);
+      // Resume through the CURRENT registration when there is one (see
+      // `currentPreviewSaveHandlerFor` — a rebind REPLACES the handler mid-cycle), and fall back to
+      // the one we started with when the owner panel DEREGISTERED instead.
+      //
+      // ⚠️ That second case is not hypothetical, it was the normal path for the Timeline panel:
+      // its registration effect bails while the run-mode is 'stopped', and `suspend()` is what
+      // sets the run-mode to 'stopped'. So the suspend deleted the registration it was about to
+      // need, `resumed` was always null, and every Cmd+S ended the human's scrub session while
+      // reporting a clean save (bug `tSv0EWjWICpEl9HSjRe9`). The fallback is only safe because
+      // both panels' handlers now dispatch through a ref, so the captured object calls the
+      // FRESHLY-REBOUND closures rather than the dead ones this comment's sibling warns about
+      // (`poseRef` in AnimationEditor, `previewHooks` in TimelineEditor).
+      const resumed = resumeHandlerFor(owner, preview);
       resumed?.resume();
       return { ...out, previewCycled: true, previewResumed: !!resumed };
     } catch (e) {
-      currentPreviewSaveHandlerFor(owner)?.resume();
+      resumeHandlerFor(owner, preview)?.resume();
       throw e;
     }
   }

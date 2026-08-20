@@ -126,9 +126,18 @@ function normTangent(x: number): number {
   return Number.isFinite(x) || x === STEPPED ? x : 0;
 }
 
-/** Fill any missing optional fields so partial/older JSON loads safely. */
+/** Fill any missing optional fields so partial/older JSON loads safely.
+ *
+ *  `...json` FIRST, then the normalized fields on top. The spread is not cosmetic: the
+ *  Animation Editor parks and writes THIS object (`useParkedAssetDoc` → `replace:true`), so a
+ *  key this function does not name would be deleted from the `.anim.json` on the first save —
+ *  silently, with no error and nothing in the journal. That is the AtlasAssetView failure
+ *  (`EDnpmBkOOLbeqgDCaQC1`) one subsystem over, filed as `xukhAP0gWNnD9MFRHb0P` before any file
+ *  had been damaged. Spreading first also keeps each key's original position, so an edit makes a
+ *  minimal diff. See `normalizeTimeline` and `normalizeSpriteAnim` for the same shape. */
 export function normalizeAnimationClip(json: Partial<AnimationClipDef>): AnimationClipDef {
   return {
+    ...json,
     id: json.id ?? '',
     name: json.name ?? 'Clip',
     duration: typeof json.duration === 'number' ? json.duration : 1,

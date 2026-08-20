@@ -5,6 +5,7 @@
 import { rawNow } from '../core/clock';
 import { recordFrame, setProfilerFrameCap } from '../core/frameProfiler';
 import { beginProfilerFrame, endProfilerFrame, profileScope } from '../core/profilerMarkers';
+import { beginBootSpan, endBootSpan, recordBootSpan } from '../core/bootTimeline';
 import { recordMarkerFrame } from '../core/profilerAggregate';
 import { captureFrame } from '../core/profilerCapture';
 import { recordCounterFrame } from '../core/profilerCounters';
@@ -32,6 +33,21 @@ const callbacks = new Map<string, { cb: FrameCallback; priority: number }>();
 let sorted: { key: string; cb: FrameCallback }[] = [];
 let dirty = false;
 let rafId = 0;
+/** Frames still to be recorded into the boot timeline (#238). A FIXED prefix — enough to show
+ *  when rendering started relative to the load phases — deliberately short, because the prefix
+ *  is the part that runs out at the wrong moment: measured on a Galaxy A23 cold boot of
+ *  `games/3d-test`, 180 frames were consumed BEFORE the scene finished loading, so the 1,806 ms
+ *  stall that followed had no frame span anywhere near it. The long-frame budget below is what
+ *  actually covers the stall; this prefix is only context. */
+let bootFramesLeft = 60;
+let frameCounter = 0;
+/** A frame this slow is recorded into the boot timeline whatever its index — the stall being
+ *  hunted is 1.2-1.8 s, and the profiler's own discontinuity threshold is 1000 ms, so this sits
+ *  well below both and still cannot fire on an ordinary frame (a 30 fps budget is 33 ms). */
+const LONG_FRAME_MS = 120;
+/** Long frames still recordable. Bounded so a permanently slow device cannot fill the timeline
+ *  with them and push the phase spans off the cap; a boot has a handful, not hundreds. */
+let longFramesLeft = 48;
 let refCount = 0;
 let lastFrameTime = 0;
 
@@ -134,6 +150,12 @@ function runFrame(now: DOMHighResTimeStamp, gen: number, self: FrameRequestCallb
   // turns "48ms of an 83ms frame was CPU" into "31ms ECS, 12ms 3D, 5ms 2D" for one wrapper call.
   // No-ops to a single branch when markers are disabled.
   beginProfilerFrame();
+  // Boot timeline (#238): a short PREFIX of frames, for context the phase spans cannot give —
+  // when rendering actually started relative to scene load, and how fast frames were before the
+  // interesting moment. The stall itself is caught by the retroactive long-frame spans below,
+  // not here; a prefix long enough to reach a stall is a prefix that crowds out the phase rows.
+  const frameSpan = bootFramesLeft > 0 ? (bootFramesLeft--, beginBootSpan('frame', String(frameCounter))) : -1;
+  frameCounter++;
   for (const entry of sorted) {
     try {
       // profileScope is exception-safe (try/finally), so a callback that throws — which the
@@ -157,6 +179,7 @@ function runFrame(now: DOMHighResTimeStamp, gen: number, self: FrameRequestCallb
   // is not reproducible on demand after flipping a flag. A throwing callback is already caught
   // above, so its cost is still counted rather than skipping the frame entirely.
   endProfilerFrame();
+  endBootSpan(frameSpan);
   // Fold this frame's tree into the aggregation window (P3). No-ops when markers are off.
   recordMarkerFrame();
   // Counters share the marker frame boundary so a counter and a timing read on the same
@@ -167,6 +190,25 @@ function runFrame(now: DOMHighResTimeStamp, gen: number, self: FrameRequestCallb
   // discontinuity handling, and a capture would then silently disagree with the live profile.
   const { frameMs, cpuMs } = recordFrame(lastFrameAt, rawNow());
   captureFrame(frameMs, cpuMs); // no-ops unless someone pressed record
+  // #238 — record a LONG frame into the boot timeline retroactively. Two DISTINCT spans, and the
+  // distinction is the whole point: `frame-slow` is time inside our own callbacks, while
+  // `frame-interval` is rAF-start to rAF-start and therefore ALSO covers time our callbacks were
+  // not running — browser, GPU, compositor, or a promise continuation nothing here owns. Measured
+  // on a Galaxy A23 cold boot of `games/3d-test`: the 1,755 ms stall is a `frame-interval` with
+  // NO `frame-slow` inside it, which is what establishes it is not engine code — and the same
+  // boot recorded one `frame-slow` (frame 234, 805 ms), so that absence is evidence, not silence.
+  // One span could not have told those apart. `frameMs` is 0 on the first frame (no previous), and
+  // recordFrame has already applied the discontinuity rules to the number.
+  if (longFramesLeft > 0 && (cpuMs >= LONG_FRAME_MS || frameMs >= LONG_FRAME_MS)) {
+    longFramesLeft--;
+    // `frame-interval` is rAF-start to rAF-start — the SAME quantity `worstStallMs` reports, so
+    // the stall itself becomes a row on the timeline instead of a number beside it. It contains
+    // the PREVIOUS frame's callbacks, which is exactly why the second span is separate.
+    if (frameMs >= LONG_FRAME_MS) recordBootSpan('frame-interval', lastFrameAt - frameMs, lastFrameAt, `before frame ${frameCounter - 1}`);
+    // `frame-slow` is THIS frame's own callbacks. Read together: an interval of 1.8 s with no
+    // `frame-slow` inside it means the time was not spent in engine code at all.
+    if (cpuMs >= LONG_FRAME_MS) recordBootSpan('frame-slow', lastFrameAt, lastFrameAt + cpuMs, `frame ${frameCounter - 1}`);
+  }
   // P7 — kick a GPU timestamp resolve. Placed AFTER the frame's work and deliberately never
   // awaited: the results are asynchronous by nature (a buffer map), and awaiting one on the frame
   // loop would introduce exactly the stall this instrument was built to find. No-ops to one

@@ -224,3 +224,29 @@ export async function readAndroidSystemLog(opts: { serial?: string; limit?: numb
   const limit = Math.min(asked, MAX_RETURNED_LINES);
   return { lines: lines.slice(-limit), clamped: asked > limit };   // the TAIL: the most recent matching lines
 }
+
+/** The port the debug bridge ACTUALLY bound, mined out of a logcat dump. Pure.
+ *
+ *  Every Modoki app shares the fixed 9095, so when a second one still holds it the app you just
+ *  launched falls back to an OS-assigned port and SAYS SO:
+ *
+ *      [debug-bridge] Native TCP server listening on port 44975
+ *
+ *  Nothing read that line, so `device_connect` only ever tried 9095 and reported a refusal whose
+ *  two stated causes ("the debug gate is off — rebuild", "another Modoki owns the lease") were
+ *  both false. Measured on a Galaxy A23 with 20 Modoki apps installed (bug `OikQcN8V5NMH0xUr9UnK`):
+ *  a backgrounded `com.apiary.court` released 9095 0.3s AFTER the app under test had already
+ *  fallen back, and diagnosing it cost a full pass through gradle, node_modules, capacitor config
+ *  and module DCE before logcat gave the answer.
+ *
+ *  Returns the LAST non-9095 port mentioned (the most recent bind wins — the buffer holds every
+ *  launch since boot), or null. `defaultPort` is excluded because a line naming it tells you
+ *  nothing you did not already try. */
+export function parseBoundBridgePort(logcat: string, defaultPort = 9095): number | null {
+  let found: number | null = null;
+  for (const m of logcat.matchAll(/listening on port (\d{2,5})\b/g)) {
+    const port = Number(m[1]);
+    if (Number.isFinite(port) && port !== defaultPort) found = port;
+  }
+  return found;
+}

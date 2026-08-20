@@ -20,6 +20,7 @@ const UIVideoMount = __MODOKI_MODULE_VIDEO__
   : null;
 import { resolveDomImageUrl, resolveSprite } from '../core/textureRefs';
 import { isGuid } from '../core/assetRefRules';
+import { onWorldSwap } from '../core/ecs/world';
 import { applyAnchorStyle, applyRotationStyle } from './anchorCss';
 import { NineSliceImage } from './NineSliceImage';
 import { uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
@@ -87,6 +88,24 @@ export function cssVal(value: number, unit: string): string | number | undefined
     case 'vmax': return `calc(${value} * var(--ui-vmax, 1vmax))`;
     default:     return value; // px
   }
+}
+
+/** Warn ONCE per entity that a UIToggle can never move: it carries no binding on an
+ *  event the switch fires. A toggle does not write its own `value`, so an unbound one
+ *  renders perfectly and is inert — the silent-authoring-failure class that has cost
+ *  this repo real time. Warn, never throw: an authoring mistake must not blank the
+ *  screen mid-render. */
+const _deadToggles = new Set<string>();
+// ⚠️ Cleared on world swap, because the fallback key is an ENTITY ID and runtime ids are reassigned
+// on every scene reload — so a stale entry could swallow a DIFFERENT dead toggle's warning after a
+// reload, which is the one moment an author is most likely to be looking for it. (A guid-bearing
+// entity is unaffected; guid-less ones are the runtime-spawned case.)
+onWorldSwap(() => _deadToggles.clear());
+
+function warnDeadToggle(key: string): void {
+  if (_deadToggles.has(key)) return;
+  _deadToggles.add(key);
+  console.warn(`[UIToggle] ${key} has no 'change' binding, so tapping it does nothing. A toggle does not write its own value — add a UIAction binding on event 'change' that sets UIToggle.value to '$value'. NOTE a 'click' binding will NOT work here (the Inspector defaults to 'click'): the switch dispatches 'change', and applyBindings skips rows whose event differs.`);
 }
 
 export function hexToRgba(hex: number, opacity: number): string {
@@ -391,6 +410,17 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       `[UINode] entity ${node.entityId}: elementType '${node.elementType}' takes precedence over its Canvas2D — the 2D canvas will NOT mount. Put the Canvas2D on its own child entity.`,
     );
   }
+  // ⚠️ Same class, second door. `UIToggle` returns its own subtree BEFORE the Canvas2D block and
+  // before the children walk, and it does it WITHOUT touching `elementType` — so the check above
+  // (which keys off `elementType !== 'div'`) is blind to it and both cases were silent. A toggle
+  // draws exactly a track and a knob; anything else authored on that entity is dropped.
+  if (import.meta.env?.DEV && node.toggle && (node.canvas2D || node.children.length > 0)) {
+    const dropped = [node.canvas2D && 'its Canvas2D', node.children.length > 0 && `${node.children.length} child entity/entities`]
+      .filter(Boolean).join(' and ');
+    console.warn(
+      `[UINode] entity ${node.entityId}: UIToggle draws only a track and a knob, so ${dropped} will NOT render. Move that content to a sibling entity.`,
+    );
+  }
 
   // Same class, same silence: `videoLayer` is injected into the returns that render a
   // <div>, and an <input>/<range> is a VOID element that cannot carry it. So a
@@ -498,6 +528,99 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
           : undefined}
         data-entity-id={node.entityId}
       />
+    );
+  }
+
+  // Toggle: an on/off switch — a track with a knob that sits at one end or the other.
+  // The FIRST control in the engine that draws more than one DOM node from one entity
+  // (the `input`/`range` branches above delegate to a native element), so a couple of
+  // things are deliberate rather than incidental:
+  //
+  //  • The ROOT element is the TRACK, carrying the standard `style` object built above.
+  //    That is what makes the focus ring, anchoring, visibility and the pointer-events
+  //    rules apply to a toggle for free. Wrapping it in a bespoke element instead would
+  //    have re-implemented all four, badly.
+  //  • The knob is laid out by FLEX, not by measuring anything. `justifyContent` flips
+  //    between the two ends and the knob is a square sized off the track's own height
+  //    (`aspectRatio`), so the switch works at any authored size with no JS measurement
+  //    and no second render pass.
+  //  • ⚠️ The toggle OWNS its inner layout, so `UIElement`'s flex + padding fields are
+  //    overridden here and have no effect on a UIToggle entity. Everything else on
+  //    UIElement (size, border, opacity, anchoring) still applies normally.
+  //
+  // It does NOT write `value` itself — see the UIToggle trait header for why (a self-write
+  // would mutate the scene from a Stopped editor, which `applyBindings` exists to prevent).
+  if (node.toggle) {
+    const t = node.toggle;
+    const inset = Math.max(0, t.knobInset);
+    // ⚠️ `'change'` ONLY, and the narrowness is the whole point. `fire()` dispatches `'change'`,
+    // and `applyBindings` skips every row whose own `event` differs — so a toggle carrying only a
+    // `'click'` binding can never move. This test used to accept `'click'` too, which made the
+    // control interactive AND silent: worse than having no binding at all, because the dead-toggle
+    // warning below was suppressed by the very binding that could not work.
+    //
+    // It is also the LIKELIEST authoring mistake, not a hypothetical: the Inspector's "add binding"
+    // button defaults to `event: 'click'` (`UIActionBindingsField.tsx`), so an author who adds a
+    // binding and does not change the dropdown lands exactly here — and now gets told.
+    const canFire = !!node.action?.bindings?.some(b => (b.event || 'click') === 'change');
+    if (import.meta.env?.DEV && !onSelectEntity && !canFire) warnDeadToggle(node.guid || String(node.entityId));
+
+    const fire = () => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: !t.value });
+    const interactive = canFire && !t.disabled && !onSelectEntity;
+
+    const trackStyle: React.CSSProperties = {
+      ...style,
+      display: 'flex',
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: t.value ? 'flex-end' : 'flex-start',
+      padding: inset,
+      boxSizing: 'border-box',
+      backgroundColor: hexToRgba(t.value ? t.trackOnColor : t.trackOffColor, t.trackOpacity),
+      borderRadius: t.trackRadius,
+      // Multiplied, not assigned: a toggle inside a fading panel must keep fading with it.
+      opacity: (style.opacity as number ?? 1) * (t.disabled ? 0.5 : 1),
+    };
+    // Editor mode wins over `pointerThrough`/interactivity alike, exactly as the branches
+    // above do: an authored element must stay pickable in the viewport.
+    if (onSelectEntity) { trackStyle.pointerEvents = 'auto'; trackStyle.cursor = 'pointer'; }
+    else if (interactive && !node.pointerThrough) { trackStyle.pointerEvents = 'auto'; trackStyle.cursor = 'pointer'; }
+    else if (!node.pointerThrough) { trackStyle.pointerEvents = 'auto'; trackStyle.cursor = 'default'; }
+
+    const knobStyle: React.CSSProperties = {
+      height: '100%',
+      aspectRatio: '1 / 1',
+      flexShrink: 0,
+      backgroundColor: hexToRgba(t.knobColor, t.knobOpacity),
+      borderRadius: t.knobRadius,
+    };
+
+    return (
+      <div
+        style={trackStyle}
+        role="switch"
+        aria-checked={t.value}
+        aria-disabled={t.disabled || undefined}
+        // Native focus + Space/Enter, so a toggle is keyboard-operable wherever it is
+        // rendered. NOTE this is the DOM's own focus, not `UIFocusable`'s controller
+        // navigation — routing a toggle through that is a follow-up, because the focus
+        // manager activates by firing 'click' bindings with no event value, and a switch
+        // has to carry the NEW value with it. Deliberately not half-wired.
+        tabIndex={interactive ? 0 : -1}
+        onClick={onSelectEntity
+          ? (e: React.MouseEvent) => { e.stopPropagation(); onSelectEntity(node.entityId); }
+          : interactive
+            ? (e: React.MouseEvent) => { e.stopPropagation(); fire(); }
+            : undefined}
+        onKeyDown={interactive
+          ? (e: React.KeyboardEvent) => {
+            if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); fire(); }
+          }
+          : undefined}
+        data-entity-id={node.entityId}
+      >
+        <div style={knobStyle} />
+      </div>
     );
   }
 

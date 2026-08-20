@@ -7,7 +7,7 @@
  *  the live manifest (`getAssetEntry(guid).atlas`) for the page preview + stats — it
  *  refreshes after a Re-pack via the watcher's manifest broadcast. */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { backendFetch } from '../../backend/editorBackend';
 import { writeAssetFile } from '../assetOps';
 import { useEditorStore } from '../../store/editorStore';
@@ -32,8 +32,33 @@ interface AtlasSourceDoc {
 
 const DEFAULT_DOC: AtlasSourceDoc = { members: [], pageSize: 1024, padding: 2, extrude: 1 };
 
+/** Serialize an edit WITHOUT dropping anything the file already carried.
+ *
+ *  This view only understands the fields it renders, and it used to write only those — so any
+ *  other key in the `.atlas.json` was deleted on the first edit, silently. Measured on
+ *  `games/skin-test/…/dark-assassin.atlas.json` (bug `EDnpmBkOOLbeqgDCaQC1`, QA-ASSET-0013): an
+ *  add-member/remove-member round-trip that left `members[]` byte-identical still deleted the
+ *  whole top-level `texture` block — `{format:'ktx2-uastc', maxSize, mipmaps, wrapS, wrapT,
+ *  colorspace}`, the settings that decide how the packed page is actually ENCODED. Nothing
+ *  errored and the members list looked right, so only `git diff` could see it.
+ *
+ *  `raw` is the document as parsed from disk. Spreading it FIRST both preserves the unknown keys
+ *  and keeps their original position (object spread takes each key's first-seen order), so an
+ *  edit produces a minimal diff instead of a reshuffled file. The trailing newline is restored
+ *  for the same reason — its loss was the other half of that diff. */
+export function serializeAtlasDoc(raw: Record<string, unknown>, next: AtlasSourceDoc): string {
+  const merged: Record<string, unknown> = { ...raw, ...next };
+  // `maxPages: undefined` is how the Max-pages field says "unset"; JSON.stringify drops an
+  // undefined value, but only if the key is genuinely absent from the object it walks.
+  for (const k of Object.keys(merged)) if (merged[k] === undefined) delete merged[k];
+  return `${JSON.stringify(merged, null, 2)}\n`;
+}
+
 export function AtlasAssetView({ path, name }: { path: string; name: string }) {
   const [doc, setDoc] = useState<AtlasSourceDoc>(DEFAULT_DOC);
+  /** The document exactly as parsed from disk, so a write can carry forward every field this
+   *  view does not render. See {@link serializeAtlasDoc}. */
+  const rawDoc = useRef<Record<string, unknown>>({});
   const [packing, setPacking] = useState(false);
   const [blockVersion, setBlockVersion] = useState(0); // bump to re-read the manifest block
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
@@ -49,10 +74,15 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
   // Load the authored `.atlas.json` (served as a normal project asset file).
   useEffect(() => {
     const ac = new AbortController();
+    // Drop the previous atlas's document before loading this one — the ref is passthrough data
+    // keyed to a specific FILE, and carrying it across a selection change would write one
+    // atlas's fields into another's.
+    rawDoc.current = {};
     backendFetch(path, { signal: ac.signal })
       .then((r) => (r.ok ? r.json() : null))
       .then((d: Partial<AtlasSourceDoc> | null) => {
         if (!d) return;
+        rawDoc.current = d as Record<string, unknown>;
         setDoc({
           id: d.id, version: d.version,
           members: Array.isArray(d.members) ? d.members.filter((m): m is string => typeof m === 'string') : [],
@@ -71,7 +101,7 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
   const update = useCallback((patch: Partial<AtlasSourceDoc>) => {
     setDoc((prev) => {
       const next = { ...prev, ...patch, version: 1 as const };
-      void writeAssetFile(path, JSON.stringify(next, null, 2));
+      void writeAssetFile(path, serializeAtlasDoc(rawDoc.current, next));
       return next;
     });
   }, [path]);

@@ -738,10 +738,15 @@ async function clearFocusedField(wc: Electron.WebContents): Promise<string | und
 /** Read the focused element's current text — the MEASUREMENT `typed` is derived from (S3.18).
  *
  *  `typed: text.length` was a restatement of the request, not an observation: `sendInputEvent`
- *  cannot fail, and Chromium's synthetic `char` path only inserts characters it can express as a
- *  `keyCode`, so non-ASCII (CJK, emoji, accented) input was reported as typed under ok:true while
- *  the field was unchanged. Same false-success class `enact.md` records for the readOnly case,
- *  which was only closed for "nothing typable is focused". */
+ *  cannot fail, so a field that silently rejected or reformatted the input was reported as typed
+ *  under ok:true while it was unchanged. Same false-success class `enact.md` records for the
+ *  readOnly case, which was only closed for "nothing typable is focused".
+ *
+ *  ⚠️ This comment used to name non-ASCII input as the example, and that example is FALSE
+ *  (bug `xaewBYMBYXoeuiTllsI8`): Japanese, accented letters and emoji all insert cleanly through
+ *  the `char` path on Electron 43. Keeping the MEASUREMENT is still right — it is what makes any
+ *  such rejection visible — but the stated cause was steering agents away from a path that
+ *  works. */
 const FOCUSED_VALUE_PROBE = `(() => {
   const a = document.activeElement;
   if (!a) return null;
@@ -833,12 +838,16 @@ export async function typeText(
     activeElement: active.descriptor,
     valueAfter: after,
     ...(landed ? {} : {
+      // Describe the OBSERVATION and leave the cause open. This string used to blame non-ASCII
+      // input and recommend modoki_eval; both halves were wrong (bug `xaewBYMBYXoeuiTllsI8`) —
+      // non-ASCII types fine, and modoki_eval is a non-input write a controlled input never sees,
+      // so the "workaround" was more fragile than the path it replaced.
       error: `the requested text is NOT in the field after typing — ${inserted} of ${text.length} `
         + `character(s) appear to have reached it (before: ${JSON.stringify(before)}, after: `
-        + `${JSON.stringify(after)}). The usual cause is that Chromium's synthetic char path can `
-        + `only insert what it can express as a keyCode, so non-ASCII text (CJK, emoji, accented `
-        + `letters) is dropped; a field that reformats or rejects input as you type does the same. `
-        + `Set the value through the app's own UI, or use modoki_eval for a non-input-driven write.`,
+        + `${JSON.stringify(after)}). The usual cause is a field that reformats, truncates or `
+        + `rejects input as you type (a numeric field, a max-length, an input mask), so `
+        + `\`valueAfter\` above is what it actually accepted. Retype in the shape the field wants, `
+        + `or drive the value through the control the app gives it.`,
     }),
   };
 }

@@ -509,12 +509,20 @@ supposedly already hardened against.
   Inspector's readOnly name input, whose value was provably unchanged (`"пальма_1"` before and
   after, read via CDP). `typed` was only ever `text.length` — the op never reads back.
   **Fully closed by S3.18:** `typed` is now the MEASURED value delta of the focused element and
-  `valueAfter` echoes the field, so a short insert is `ok:false` naming what landed. This matters
-  beyond `readOnly`: Chromium's synthetic `char` path can only insert what it expresses as a
-  `keyCode`, so **non-ASCII text (CJK, emoji, accented letters) is silently dropped** — set such a
-  value through the app's own UI instead. Pinned by
+  `valueAfter` echoes the field, so a short insert is `ok:false` naming what landed. Pinned by
   `engine/tests/electron/typeTextMeasured.test.ts` (mutation-tested: replacing the delta with
   `text.length` fails it).
+
+  ⚠️ **This entry used to add that non-ASCII text "is silently dropped" and to send the reader to
+  the app's own UI. That is FALSE and has been removed** (bug `xaewBYMBYXoeuiTllsI8`,
+  QA-INPUT-0003). Measured on Electron 43.2.0: `太陽ランプ`, `café` and `A🚀B` all insert cleanly
+  through the `char` path, `typed` counts them correctly, and the world matches `valueAfter` every
+  time. The advice was worse than the behaviour it described — the recommended detour,
+  `modoki_eval`, is a NON-input write that a React controlled input never sees, so it is strictly
+  more fragile than the path that works; and the repo owner writes Japanese, which makes this the
+  common path rather than a corner. The MEASUREMENT is still the point: when text really does not
+  land, the live cause is a field that reformats, truncates or rejects input as you type, and
+  `valueAfter` names what it actually accepted.
 - **`press_key`'s warning over-claimed.** It said a focused field "will swallow this key" on a
   press where `f` demonstrably framed the selection (camera `[12,15,20]` → `[-0.1,1.4,1.8]`).
 
@@ -614,10 +622,17 @@ enumerated. The warning says exactly what is known and no more.
 DOM-element protocol — the source element's own `dragstart` handler fills the `DataTransfer`, which is
 the whole reason this tool exists rather than a synthesized payload — so an endpoint is a DOM
 `selector` or raw viewport `{x,y}`, and there is no scene-entity endpoint to resolve. It is also the
-only input tool that carries none of the shared `matched`/`hitTarget`/`occluded` provenance, because it
-runs through the editor-action relay rather than `/api/input/*`. Both facts are now in the tool
+only input tool that cannot be aimed by `entity`. Both facts are now in the tool
 description instead of being discoverable only by trying. Its endpoints are strict + refined, so `to:{}`
 and a misspelled `selecter` are refused rather than reaching the relay as "no aim at all".
+
+It DOES carry the shared `matched`/`hitTarget`/`occluded` provenance now, per endpoint, matching the
+shape `/api/input/drag` returns (#260) — that it ran through the editor-action relay rather than
+`/api/input/*` was never a reason for the report to be thinner, only for it to be assembled
+separately. `aimProvenance` (`domResolve.ts`) is that shared assembly: `resolveDomPointReport` cannot
+serve the DnD path (it is serializable by design and DnD needs the live `Element` to dispatch on), so
+the recipe is factored out rather than copied — this module's header records what a second copy of a
+resolver cost last time.
 
 **And it does not occlusion-check either endpoint — deliberately, for a reason the other aims do not
 have.** §3's rule refuses a covered aim because *the input would land on the covering element*; that
@@ -628,11 +643,22 @@ refusing would reject a call that works.
 
 The trap is the other way round, and it is a FIDELITY one: a covered drop **succeeds here where a
 human's would fail**, hit-tested into the covering element. So a QA case that drops onto something
-behind a modal passes, and the product could still be broken for a user. Nothing in the response
-says so — `modoki_dnd` reports no `occluded` field to say so with. If that bites, the fix is to
-report occlusion as a WARNING (not a refusal, which would be wrong), and it is worth measuring
-before building. Recorded here rather than left as an unexplained gap, per §9's "either closed or
-recorded as deliberate with a reason".
+behind a modal passed, and the product could still be broken for a user — with nothing in the
+response to say so.
+
+**Closed as a WARNING, never a refusal (#260).** Both endpoints are hit-tested BEFORE any event
+fires, and a covered one still gets the full sequence and still reports `ok:true`, because it
+genuinely lands. What it also reports now is `occluded:true` on the offending endpoint, `hitTarget`
+naming the cover, and a warning that opens `THIS DROP IS NOT ONE A HUMAN COULD PERFORM` and says
+what to do about it. Both endpoints are checked: a covered SOURCE gets `dragstart` dispatched onto
+something a human could not even grab.
+
+Two things fix the shape of this and are worth keeping in mind before anyone tries to tighten it
+into a gate. First, a refusal would reject calls that work — see the paragraph above. Second, the
+endpoints are resolved before the gesture starts, so a cover that appears only MID-drag (the
+Hierarchy drop indicator, the Assets drop overlay) is invisible from here; gating on a check that
+cannot see those would be a false positive on legitimate flows. The warning composes with the
+`accepted ≠ committed` one above — both can fire on one drop, joined by ` ALSO: `.
 
 **Device-surface asymmetries (§9), both deliberate, neither previously written down:**
 `allowOccluded` exists only on the editor — `resolveAim` (`bridge.ts`) refuses a covered selector

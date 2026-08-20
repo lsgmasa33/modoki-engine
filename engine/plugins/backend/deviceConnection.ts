@@ -16,7 +16,8 @@ import net from 'net';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { execFileSync } from 'child_process';
+import { execFileSync, execFile as execFileDevice } from 'child_process';
+import { promisify } from 'node:util';
 import {
   adbArgs, adbBinary, describeAndroidDevice, forwardOwner, listAndroidDevices, resolveAndroidSerial,
   withFriendlyNames,
@@ -24,6 +25,10 @@ import {
 import { adbDeviceId, claimDevice, releaseDevice, releaseAllForThisProcess, sweepStaleClaims, wifiDeviceId } from './deviceClaims';
 import { DeviceLeaseClient, type LeaseTransport, type LeaseRequest, type LeaseReply, type LeaseState } from './deviceLease';
 import { resetDeviceCdpSession, resolveDeviceCdpPort } from './deviceCdp';
+import { parseBoundBridgePort } from './deviceAndroidDiag';
+
+/** Async exec for the one adb call whose caller can await it — see `adbRunner.logcatDump`. */
+const execFileAsyncDevice = promisify(execFileDevice);
 
 /** The device plugin's TCP port (matches `GameDebugPlugin` default). This is the port ON THE PHONE
  *  — it is a property of the app, shared by every Modoki game, and deliberately NOT per-clone. */
@@ -101,7 +106,26 @@ export function resolveDeviceHostPort(env: NodeJS.ProcessEnv = process.env): num
  *  confidently and wrongly. */
 export function explainConnectFailure(
   detail: string | undefined, port: number, useAdb = false, debugBuild?: boolean,
+  fallbackPort?: number | null,
 ): string | undefined {
+  // ⭐ A KNOWN FALLBACK PORT OUTRANKS EVERY GUESS BELOW, because it is not a guess: the app
+  // PRINTED the port it bound. 9095 is shared by every Modoki game, so when a second one still
+  // holds it the app under test takes an OS-assigned port exactly as designed — and this message
+  // used to describe that state as "the native debug gate is off … rebuild", which is an
+  // expensive wrong turn and, on a device case, reads as a product defect in the project under
+  // test. Measured on a Galaxy A23 carrying 20 Modoki apps (bug `OikQcN8V5NMH0xUr9UnK`): a
+  // backgrounded `com.apiary.court` released 9095 0.3s after the app under test had already
+  // fallen back, and the diagnosis cost a pass through gradle, node_modules, capacitor config and
+  // module DCE before logcat gave it away.
+  if (fallbackPort && fallbackPort !== port) {
+    return `refused on port ${port} — but the app is RUNNING and listening on ${fallbackPort}. `
+      + `${port} is shared by every Modoki game, so when another one still holds it the app you `
+      + `just launched falls back to an OS-assigned port (#88) and logs which. Nothing is wrong `
+      + `with the build, the debug gate, or the lease. Fix, either way round: reconnect with `
+      + `\`device_connect {..., port: ${fallbackPort}}\`, or force-stop the app squatting `
+      + `${port} (\`adb shell ps -A | grep modoki\`, then \`adb shell am force-stop <pkg>\`) and `
+      + `relaunch, after which it binds ${port} first try.`;
+  }
   // ⭐ A KNOWN-OFF FLAG IS THE LEADING SUSPECT (#239) — but only ECONNREFUSED lets it be the
   // ONLY one, and that asymmetry is the whole of this branch.
   //
@@ -138,8 +162,11 @@ export function explainConnectFailure(
       + `is off.\n  It is NOT the only cause, because something accepted the connection: over adb `
       + `the forward accepts on this clone's end even when the device port is dead, and over WiFi `
       + `an accepted socket means some app IS listening on ${port} — a backgrounded sibling Modoki `
-      + `game squatting the shared port answers exactly like this. Check with `
-      + `\`adb shell ps -A | grep modoki\` and force-stop the others, or relaunch the app.`;
+      + `game squatting the shared port answers exactly like this. Find the REAL holder by its `
+      + `socket, not by its name — \`adb shell 'cat /proc/net/tcp /proc/net/tcp6' | awk '$4=="0A"'\` `
+      + `lists every listener with its uid — then force-stop that app, or relaunch this one. `
+      + `Grepping for "modoki" misses games whose package is not named that (com.apiary.court is `
+      + `one, and it cost a session an hour — #283).`;
   }
   // `refused` is the sentinel `DeviceLeaseClient.connect` sets when the socket opened but the
   // handshake produced nothing (deviceLease.ts). A GENUINE busy reply from the device always names
@@ -155,15 +182,29 @@ export function explainConnectFailure(
       + `(hex, uppercase or lower) — no row means nothing is bound. Then reopen the project in the `
       + `editor (heal-on-open) and rebuild.\n`
       + `  2. Another Modoki genuinely owns the lease — it refuses an extra client by dropping the `
-      + `socket, which looks identical from here. Disconnect it there, or relaunch the app.`;
+      + `socket, which looks identical from here. Disconnect it there, or relaunch the app.\n`
+      + `  3. The app IS running, but listening on a DIFFERENT port — check this one FIRST on `
+      + `a phone with several Modoki apps installed, because causes 1 and 2 both send you `
+      + `somewhere expensive and wrong while the bridge is perfectly healthy. ${port} is shared by `
+      + `every Modoki game, so launching this app while another was still releasing the port makes `
+      + `it fall back to an OS-assigned one and never reclaim ${port} afterwards (#88/#283). `
+      + `\`adb logcat -d | grep "Native TCP server listening on port"\` names the real port `
+      + `— the "Native" is load-bearing, since a \`foregrounded — TCP server listening on port `
+      + `${port}\` line is the HOLDER announcing itself, not this app. Pass it as `
+      + `\`device_connect {useAdb:true, port:<actual>}\` — or force-stop the other apps and `
+      + `relaunch. Builds carrying the #283 retry only fall back when the other app holds the `
+      + `port for over 2s.`;
   }
   if (!detail || !/ECONNREFUSED/i.test(detail) || port !== DEVICE_PORT) return detail;
   return `${detail} — nothing is listening on the default port ${DEVICE_PORT}. The app may be `
     + 'running FINE on another port: 9095 is shared by every Modoki game, so if a second one still '
-    + 'holds it, the app you just launched falls back to an OS-assigned port (#88). Close the other '
-    + 'Modoki apps (`adb shell ps -A | grep modoki`, or swipe them away on iOS) and relaunch — or, '
-    + 'if you can see the real port in the device log or the in-game debug menu, pass it directly: '
-    + 'device_connect {ip:"…", port:<actual>}.';
+    + 'holds it, the app you just launched falls back to an OS-assigned port (#88/#283). Close the '
+    + 'other Modoki app and relaunch — but find it by its SOCKET, not its name: '
+    + '`adb shell \'cat /proc/net/tcp /proc/net/tcp6\' | awk \'$4=="0A"\'` lists every listener with '
+    + 'its uid, and a grep for "modoki" misses games whose package is not named that '
+    + '(com.apiary.court is one). Or read the real port off the device — '
+    + '`adb logcat -d | grep "TCP server listening"`, or the in-game debug menu — and pass it '
+    + 'directly: device_connect {ip:"…", port:<actual>}.';
 }
 
 // `adbBinary()` moved to `androidDevices.ts` (#149) — one module now owns "how to talk to adb",
@@ -186,6 +227,23 @@ export const adbRunner = {
    *  {@link resolveDeviceHostPort}. */
   forward(hostPort: number, serial?: string, devicePort: number = DEVICE_PORT): void {
     execFileSync(adbBinary(), adbArgs(serial, ['forward', `tcp:${hostPort}`, `tcp:${devicePort}`]), { timeout: 4000, stdio: 'pipe' });
+  },
+  /** A logcat dump, for mining the port the debug bridge actually bound (see the sniff at the
+   *  failed-connect site). Behind this seam like every other adb call, so the unit tests never
+   *  reach the real binary — and it returns '' rather than throwing, because this only ever
+   *  IMPROVES an error message and must not become a second failure on top of the first. */
+  async logcatDump(serial?: string): Promise<string> {
+    // ⚠️ ASYNC, unlike its `execFileSync` siblings above, and that is deliberate rather than
+    // inconsistent. This backend runs INSIDE the Electron main process, so a sync spawn blocks the
+    // whole editor's input for as long as the command takes — the exact regression #168 fixed by
+    // moving the device LISTINGS off `execFileSync` (measured 1.3-1.4 s per call, freezing drags
+    // mid-gesture). A `logcat -d` dump is bounded at 6 s here, and 6 s of frozen editor on a
+    // failed connect would be a worse bug than the confusing error message this exists to improve.
+    // The siblings stay sync because their callers are sync; this one's caller already awaits.
+    try {
+      const { stdout } = await execFileAsyncDevice(adbBinary(), adbArgs(serial, ['logcat', '-d', '-t', '4000']), { timeout: 6000, encoding: 'utf8', maxBuffer: 32 << 20 });
+      return stdout;
+    } catch { return ''; }
   },
   /** Every forward rule adb currently holds, across ALL devices — `--list` is daemon-wide and takes
    *  no `-s`, which is precisely why {@link forwardOwner} can answer "whose rule is this?". */
@@ -637,6 +695,16 @@ export class DeviceConnectionManager {
     // guard costs one integer compare and makes the question moot, which is the right trade for a
     // failure whose blast radius is "two clones drive one phone".
     if (landed !== 'connected' && generation === this.connectGeneration) this.releaseClaim();
+    // The app may be alive on a FALLBACK port. Ask the phone before leaving the caller with a
+    // message that guesses — this is the one cause `explainConnectFailure` cannot infer from a
+    // socket outcome, and the app prints it (bug `OikQcN8V5NMH0xUr9UnK`). Done HERE rather than in
+    // `onState` because it needs an await, and only on a failed adb connect so the happy path pays
+    // nothing. Best-effort: the sniffer swallows its own errors, so a wedged adb leaves the
+    // original message rather than replacing one failure with two.
+    if (landed !== 'connected' && useAdb && this.state !== 'connected') {
+      const sniffed = parseBoundBridgePort(await adbRunner.logcatDump(serial), devicePort);
+      if (sniffed) this.detail = explainConnectFailure(this.detail, devicePort, useAdb, debugBuild, sniffed);
+    }
     // Learn the platform NOW, while the lease is healthy, rather than on first use. The WDA
     // screenshot path is reached precisely when the app has been SUSPENDED (lease 'reconnecting',
     // native capture 502s) — asking then would fail and refuse the feature in its motivating case.

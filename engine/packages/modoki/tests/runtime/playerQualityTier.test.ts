@@ -27,6 +27,7 @@ import {
   tickTierCalibration, resetTierCalibration, getPendingTierPromotion, CALIBRATION_INTERVAL_MS,
   armTierCalibration,
 } from '../../src/runtime/rendering/tierCalibration';
+import { noteUserInput, __resetUserActivityForTest } from '../../src/runtime/core/userActivity';
 import { PROMOTION_HOLD_MS, TIER_SETTINGS, promotionCeiling } from '../../src/runtime/rendering/qualityTier';
 import { probeFingerprint } from '../../src/runtime/rendering/rampProbe';
 import type { DeviceCaps } from '../../src/runtime/rendering/deviceCaps';
@@ -49,6 +50,7 @@ beforeEach(() => {
   probeVerdictStore.reset();
   resetRenderSettings();
   resetTierCalibration();
+  __resetUserActivityForTest();
   // Since #227 the loop ignores the profile until a scene has loaded — see tierCalibration.test.ts.
   // This suite is about the PLAYER-choice gate, so it arms and asks its own question.
   armTierCalibration();
@@ -210,7 +212,10 @@ describe('calibration must not argue with the player', () => {
     setActiveQualityTier({ tier: 'low', source: 'player', reason: 'player selected this tier' });
     setPlayerQualityTier('low');
 
-    for (let t = 0; t <= PROMOTION_HOLD_MS * 4; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    // `noteUserInput` because calibration refuses to judge an IDLE window (owner, 2026-08-20 —
+    // an idle S22 throttles and demotes itself two tiers, bug `lvROp0yDYPSzS0VZM6LH`). These
+    // cases are about the PLAYER gate, so they have to say that somebody is playing.
+    for (let t = 0; t <= PROMOTION_HOLD_MS * 4; t += CALIBRATION_INTERVAL_MS) { noteUserInput(t); tickTierCalibration(t); }
 
     expect(getPendingTierPromotion()).toBeNull();
     expect(getActiveQualityTier()?.tier).toBe('low');
@@ -225,6 +230,7 @@ describe('calibration must not argue with the player', () => {
     setPlayerQualityTier(null);
 
     for (let t = 0; t <= PROMOTION_HOLD_MS + CALIBRATION_INTERVAL_MS; t += CALIBRATION_INTERVAL_MS) {
+      noteUserInput(t);      // see above — an idle window is not evidence
       tickTierCalibration(t);
     }
     // ONE STEP UP THE LADDER, so `low` promotes to `mid` and not to `high` (#188). Before `mid`

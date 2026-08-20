@@ -1621,18 +1621,24 @@ export function registerTools(server: McpServer) {
       'cost (not the most recent), so a hitch is findable after the fact. gpu-on/gpu-off enable GPU ' +
       'timestamp queries, which have a real cost and so must be deliberate; on a backend without ' +
       'timer-query support the status comes back "unsupported" with a reason and NO number is ' +
-      'fabricated. This is the tool for a phone-only perf question — the editor runs on a desktop ' +
-      'GPU where the frame is fast regardless.',
+      'fabricated. boot reads the BOOT-PHASE timeline (#238): always-on spans across scene load, ' +
+      'asset acquire, shader prewarm and renderer init, intersected with the worst dropped frame — ' +
+      'the read that attributes a cold-boot freeze, which the frame aggregate cannot see because a ' +
+      'stall is dropped from its percentiles by design. This is the tool for a phone-only perf ' +
+      'question — the editor runs on a desktop GPU where the frame is fast regardless, and the boot ' +
+      'stall this exists for is a low-end-device fault.',
     {
-      action: z.enum(['read', 'capture-start', 'capture-stop', 'capture-read', 'capture-clear', 'gpu-on', 'gpu-off', 'reset'])
-        .optional().describe('Default "read" (the live aggregate). capture-* records/reads frames; gpu-* toggles GPU timestamps; reset clears markers + captures.'),
+      action: z.enum(['read', 'capture-start', 'capture-stop', 'capture-read', 'capture-clear', 'gpu-on', 'gpu-off', 'reset', 'boot', 'boot-reset'])
+        .optional().describe('Default "read" (the live aggregate). capture-* records/reads frames; gpu-* toggles GPU timestamps; reset clears markers + captures; boot reads the boot-phase timeline; boot-reset re-arms it.'),
       markers: z.number().optional().describe('action:read — how many marker rows to return (default 12).'),
-      limit: z.number().optional().describe('action:capture-read — how many of the WORST frames to return (default 5, max 20).'),
+      limit: z.number().optional().describe('action:capture-read (worst frames, default 5, max 20) or action:boot (rows per section, default 15, max 200).'),
+      all: z.boolean().optional().describe('action:boot only — return EVERY recorded span, not just the stall overlap and the costliest. Large.'),
     },
-    async ({ action, markers, limit }) => perceptCall('device_profiler', 'profiler', {
+    async ({ action, markers, limit, all }) => perceptCall('device_profiler', 'profiler', {
       ...(action !== undefined ? { action } : {}),
       ...(markers !== undefined ? { markers } : {}),
       ...(limit !== undefined ? { limit } : {}),
+      ...(all !== undefined ? { all } : {}),
     }),
   );
 

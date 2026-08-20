@@ -135,3 +135,48 @@ export function scaleCrossedPivot(objScale: { x: number; y: number; z: number },
     || (startSign.y !== 0 && Math.sign(objScale.y) !== startSign.y)
     || (startSign.z !== 0 && Math.sign(objScale.z) !== startSign.z);
 }
+
+/** Derive an entity's new LOCAL scale from the RATIO the gizmo applied to its proxy, rather than
+ *  from the proxy's absolute scale.
+ *
+ *  three's `TransformControls` scales by `object.scale = _scaleStart × factor`, where `_scaleStart`
+ *  is whatever the attached object's scale happened to be at pointer-down. For a MESH entity that
+ *  object IS the entity's rendered Object3D — `scene3DSync` writes its scale every frame — so
+ *  reading the result back absolutely (through {@link worldToLocalTransform}) is correct, and was
+ *  the only path this code had.
+ *
+ *  A mesh-LESS entity has no such object. The gizmo attaches to an editor ICON (a light
+ *  octahedron, a particle cone, an environment sphere, an empty marker), and nothing keeps that
+ *  icon's scale in sync with the entity — so the absolute read-back is a number the entity never
+ *  held, and every drag compounds the previous one. Measured on `games/anim-bug`'s `Sun`
+ *  (bug `euf2YDw0bXcPZ6CziuSU`): scale 1 → 8959.28 → 87721.01 → 858883.50 across three identical
+ *  drags, each drag's undo `before` recording the PREVIOUS drag's result, so Cmd+Z restored a
+ *  value the entity had never had and the authored scale was unrecoverable short of reloading the
+ *  scene.
+ *
+ *  The RATIO is the part that is true whatever the proxy's basis is: `now / start` is the factor
+ *  the user dragged. It is also parent-invariant — a parent's scale does not change during the
+ *  drag, so the LOCAL ratio and the WORLD ratio are the same number — which is why this can be
+ *  applied to the entity's own local `before` scale without re-deriving anything about the parent.
+ *
+ *  An axis whose proxy started at exactly 0 (or a non-finite value) has no ratio to take. That
+ *  axis falls back to the decomposed absolute value — i.e. to precisely the behaviour the mesh
+ *  path always had — rather than silently pinning it to 0 or 1.
+ */
+export function scaleFromGizmoRatio(
+  before: { sx: number; sy: number; sz: number },
+  proxyStart: { x: number; y: number; z: number },
+  proxyNow: { x: number; y: number; z: number },
+  fallback: { sx: number; sy: number; sz: number },
+): { sx: number; sy: number; sz: number } {
+  const axis = (b: number, start: number, now: number, fb: number): number => {
+    if (!Number.isFinite(start) || start === 0 || !Number.isFinite(now)) return fb;
+    const next = b * (now / start);
+    return Number.isFinite(next) ? next : fb;
+  };
+  return {
+    sx: axis(before.sx, proxyStart.x, proxyNow.x, fallback.sx),
+    sy: axis(before.sy, proxyStart.y, proxyNow.y, fallback.sy),
+    sz: axis(before.sz, proxyStart.z, proxyNow.z, fallback.sz),
+  };
+}

@@ -89,7 +89,7 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0, letterSpacingUnit: 'px',
     textShadowColor: 0, textShadowOpacity: 1, textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0,
     textStrokeColor: 0, textStrokeOpacity: 1, textStrokeWidth: 0, textOverflow: 'clip', maxLines: 0,
-    imageSrc: '', imageMode: 'cover', hasVideo: false, elementType: 'div', placeholder: '',
+    imageSrc: '', imageMode: 'cover', imageEpoch: 0, hasVideo: false, elementType: 'div', placeholder: '',
     rangeMin: 0, rangeMax: 100, rangeStep: 1,
     children: [],
     ...over,
@@ -665,6 +665,179 @@ describe('UINode range branch', () => {
   });
 });
 
+// ── toggle branch ──
+// The FIRST control that draws more than one DOM node from one entity — root is the
+// track (carrying the standard `style`), the single child is the knob. See the UIToggle
+// trait header + the branch's own comment in UINode.tsx for the design.
+describe('UINode toggle branch', () => {
+  it('renders a track containing exactly one child (the knob)', () => {
+    const el = renderNode(makeNode({ toggle: toggle() }));
+    expect(el.children).toHaveLength(1);
+  });
+
+  it('role=switch, aria-checked follows value (both states)', () => {
+    const off = renderNode(makeNode({ guid: 'tg-1', toggle: toggle({ value: false }) }));
+    expect(off.getAttribute('role')).toBe('switch');
+    expect(off.getAttribute('aria-checked')).toBe('false');
+    cleanup();
+    const on = renderNode(makeNode({ guid: 'tg-2', toggle: toggle({ value: true }) }));
+    expect(on.getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('justifyContent flips with value: flex-end when on, flex-start when off', () => {
+    const off = renderNode(makeNode({ guid: 'tg-3', toggle: toggle({ value: false }) }));
+    expect(off.style.justifyContent).toBe('flex-start');
+    cleanup();
+    const on = renderNode(makeNode({ guid: 'tg-4', toggle: toggle({ value: true }) }));
+    expect(on.style.justifyContent).toBe('flex-end');
+  });
+
+  it('track background uses trackOnColor when on, trackOffColor when off', () => {
+    // jsdom's CSSOM drops alpha 1 down to rgb(...), so match channels rather than the
+    // exact rgba() string hexToRgba produces (same idiom as the box-rendering test above).
+    const off = renderNode(makeNode({
+      guid: 'tg-5', toggle: toggle({ value: false, trackOnColor: 0x00ff00, trackOffColor: 0xff0000, trackOpacity: 1 }),
+    }));
+    expect(off.style.backgroundColor).toMatch(/255,\s*0,\s*0/);
+    cleanup();
+    const on = renderNode(makeNode({
+      guid: 'tg-6', toggle: toggle({ value: true, trackOnColor: 0x00ff00, trackOffColor: 0xff0000, trackOpacity: 1 }),
+    }));
+    expect(on.style.backgroundColor).toMatch(/0,\s*255,\s*0/);
+  });
+
+  it('clicking with a change binding calls applyBindings with the NEGATED value — both starting states', () => {
+    const offNode = makeNode({
+      guid: 'tg-7', toggle: toggle({ value: false }),
+      action: { bindings: [{ event: 'change', kind: 'set' } as never] },
+    });
+    const offEl = renderNode(offNode);
+    fireEvent.click(offEl);
+    expect(h.applyBindings).toHaveBeenCalledWith(offNode.action!.bindings, 'change', { selfGuid: 'tg-7', eventValue: true });
+    cleanup();
+
+    const onNode = makeNode({
+      guid: 'tg-8', toggle: toggle({ value: true }),
+      action: { bindings: [{ event: 'change', kind: 'set' } as never] },
+    });
+    const onEl = renderNode(onNode);
+    fireEvent.click(onEl);
+    expect(h.applyBindings).toHaveBeenCalledWith(onNode.action!.bindings, 'change', { selfGuid: 'tg-8', eventValue: false });
+  });
+
+  // ⚠️ This test asserted the OPPOSITE until 2026-08-20, under the name "a click binding (not just
+  // change) also fires the toggle" — and it passed, because `applyBindings` is mocked in this file,
+  // so it only ever proved that UINode CALLED the mock with 'change'. The real `applyBindings`
+  // skips every row whose own `event` differs from the dispatched one (pinned independently by
+  // `bindings.test.ts` § "only runs bindings whose event matches"), so a 'click'-only toggle could
+  // never move — while the mocked test vouched for it. A reinstated "click works" expectation here
+  // is a regression, not a fix.
+  it('a click-ONLY binding cannot move the toggle: it is inert and warns as dead', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const node = makeNode({
+      guid: 'tg-9', toggle: toggle({ value: false }),
+      action: { bindings: [{ event: 'click', kind: 'set' } as never] },
+    });
+    // try/finally, not a trailing `mockRestore()`: this file's other warn tests restore at the END
+    // OF THE BODY, so a failing assertion leaks the console.warn spy into every later test in the
+    // file. Measured while mutation-testing this very block — one real failure cascaded into three
+    // unrelated warning tests and made the signal unreadable twice.
+    try {
+      const el = renderNode(node);
+      fireEvent.click(el);
+      // Not interactive, so nothing is dispatched at all — the click cannot silently half-work.
+      expect(h.applyBindings).not.toHaveBeenCalled();
+      // And the author is TOLD, naming the event mistake the Inspector's 'click' default leads to.
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain("'click' binding will NOT work");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a toggle drops a Canvas2D and any children — and says so', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const node = makeNode({
+      guid: 'tg-drop', toggle: toggle({ value: false }),
+      action: { bindings: [{ event: 'change', kind: 'set' } as never] },
+      canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain' },
+      children: [makeNode({ guid: 'tg-drop-kid' })],
+    });
+    try {
+      const el = renderNode(node);
+      // Only the knob renders — the child never mounts.
+      expect(el.querySelectorAll('[data-entity-id]').length).toBe(0);
+      const msgs = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(msgs).toContain('UIToggle draws only a track and a knob');
+      expect(msgs).toContain('its Canvas2D');
+      expect(msgs).toContain('child');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('disabled: no applyBindings call on click, and aria-disabled is set', () => {
+    const node = makeNode({
+      guid: 'tg-10', toggle: toggle({ value: false, disabled: true }),
+      action: { bindings: [{ event: 'change', kind: 'set' } as never] },
+    });
+    const el = renderNode(node);
+    expect(el.getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(el);
+    expect(h.applyBindings).not.toHaveBeenCalled();
+  });
+
+  it('no bindings at all: no applyBindings call on click', () => {
+    const el = renderNode(makeNode({ guid: 'tg-11', toggle: toggle({ value: false }) }));
+    fireEvent.click(el);
+    expect(h.applyBindings).not.toHaveBeenCalled();
+  });
+
+  it('keyboard: Space and Enter fire the same applyBindings call; another key does not', () => {
+    const node = makeNode({
+      guid: 'tg-12', toggle: toggle({ value: false }),
+      action: { bindings: [{ event: 'change', kind: 'set' } as never] },
+    });
+    const el = renderNode(node);
+    fireEvent.keyDown(el, { key: ' ' });
+    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'change', { selfGuid: 'tg-12', eventValue: true });
+    h.applyBindings.mockClear();
+
+    fireEvent.keyDown(el, { key: 'Enter' });
+    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'change', { selfGuid: 'tg-12', eventValue: true });
+    h.applyBindings.mockClear();
+
+    fireEvent.keyDown(el, { key: 'a' });
+    expect(h.applyBindings).not.toHaveBeenCalled();
+  });
+
+  it('editor mode: clicking selects the entity and does NOT call applyBindings', () => {
+    const onSelect = vi.fn();
+    const node = makeNode({
+      entityId: 30, guid: 'tg-13', toggle: toggle({ value: false }),
+      action: { bindings: [{ event: 'change', kind: 'set' } as never] },
+    });
+    const el = renderNode(node, { onSelectEntity: onSelect });
+    fireEvent.click(el);
+    expect(onSelect).toHaveBeenCalledWith(30);
+    expect(h.applyBindings).not.toHaveBeenCalled();
+  });
+
+  it('dev-warns once when a toggle has no change/click binding, and dedupes per guid', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const node = makeNode({ guid: 'tg-dead-1', toggle: toggle({ value: false }) });
+    render(<UINode node={node} storeState={{}} />);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('UIToggle');
+    cleanup();
+
+    // Same guid again → dedupe suppresses the second warning.
+    render(<UINode node={node} storeState={{}} />);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+});
+
 // ── canvas2D branch ──
 describe('UINode canvas2D branch', () => {
   it('runtime mounts the pooled Canvas2DMount with the entityId', async () => {
@@ -817,6 +990,15 @@ function anchor(over: Partial<NonNullable<UINodeData['anchor']>> = {}): NonNulla
     anchor: 'center', top: 0, topUnit: 'px', right: 0, rightUnit: 'px',
     bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px',
     pivotX: 0, pivotY: 0, safeArea: false, zIndex: 0, ...over,
+  };
+}
+
+/** Toggle block with the trait's own defaults; override per test. */
+function toggle(over: Partial<NonNullable<UINodeData['toggle']>> = {}): NonNullable<UINodeData['toggle']> {
+  return {
+    value: false, trackOnColor: 0x4aa3ff, trackOffColor: 0x767676, trackOpacity: 1,
+    knobColor: 0xffffff, knobOpacity: 1, knobInset: 2, trackRadius: 999, knobRadius: 999,
+    disabled: false, ...over,
   };
 }
 

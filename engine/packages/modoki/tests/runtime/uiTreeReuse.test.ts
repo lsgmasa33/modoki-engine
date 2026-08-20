@@ -22,6 +22,7 @@ const ACT = { id: 'UIAction' };
 const ANC = { id: 'UIAnchor' };
 const CV2 = { id: 'Canvas2D' };
 const VID = { id: 'VideoPlayer' };
+const TGL = { id: 'UIToggle' };
 
 const UI_DEFAULTS = {
   width: 100, height: 40, widthUnit: 'px', heightUnit: 'px',
@@ -51,6 +52,7 @@ interface Spec {
    *  modelled: `hasVideo` is presence-only, so a spec that carried values would imply
    *  buildTree reads them. */
   video?: true;
+  toggle?: { value: boolean };
 }
 
 /** A koota-like world whose entity set is read fresh from `getSpecs()` on every
@@ -68,6 +70,7 @@ function makeWorld(getSpecs: () => Spec[]) {
           if (s.binding) data.set(BIND, s.binding);
           if (s.canvas2D) data.set(CV2, s.canvas2D);
           if (s.video) data.set(VID, {});
+          if (s.toggle) data.set(TGL, s.toggle);
           const entity = { id: () => s.id, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t) };
           cb([data.get(UIEL)], entity);
         }
@@ -89,6 +92,7 @@ function mockDeps() {
       { name: 'UIAnchor', trait: ANC, category: 'component', fields: {} },
       { name: 'Canvas2D', trait: CV2, category: 'component', fields: {} },
       { name: 'VideoPlayer', trait: VID, category: 'component', fields: {} },
+      { name: 'UIToggle', trait: TGL, category: 'component', fields: {} },
     ],
   }));
 }
@@ -281,5 +285,28 @@ describe('uiTreeStore hasVideo', () => {
     const removed = useUITreeStore.getState().tree[0];
     expect(removed).not.toBe(added);
     expect(removed.hasVideo).toBe(false);
+  });
+});
+
+/** `toggle` — the reconciliation guard for the on/off control (#280). `toggle` sits in
+ *  `_nestedKeys`, so `nodesEqual` must compare it structurally rather than by reference;
+ *  without this, flipping ONLY `UIToggle.value` (the common case — the game writes it via
+ *  a binding every click) would keep the node's old object reference and the switch would
+ *  never visibly move. */
+describe('uiTreeStore toggle', () => {
+  it('two nodes differing ONLY in toggle.value are NOT nodesEqual', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, toggle: { value: false } }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await load();
+    const world = makeWorld(() => specs);
+
+    uiTreeProjection(world);
+    const before = useUITreeStore.getState().tree[0];
+    expect(before.toggle?.value).toBe(false);
+
+    specs[0].toggle = { value: true };
+    markUIDirty(); uiTreeProjection(world);
+    const after = useUITreeStore.getState().tree[0];
+    expect(after).not.toBe(before);          // a reused ref here = a switch that never animates
+    expect(after.toggle?.value).toBe(true);
   });
 });

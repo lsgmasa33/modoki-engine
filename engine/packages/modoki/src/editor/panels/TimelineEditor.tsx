@@ -397,6 +397,44 @@ export default function TimelineEditor() {
   // Registered only while a session is actually held, so the save never calls a panel that already
   // exited — and the Animation panel's handler wins whenever IT owns the envelope, since whichever
   // panel opened one registered last.
+  //
+  // ⚠️ THE HANDLER OBJECT IS STABLE, and its methods go through a ref. This is not a
+  // micro-optimisation — it is what makes the resume reachable at all.
+  //
+  // The save cycle is `suspend()` → save → `resume()`. `suspend()` is `exitPreview()`, which sets
+  // the run-mode to 'stopped' — the very condition this effect's guard bails on. So the state
+  // change the suspend itself causes tore down this effect, `clearPreviewSaveHandler` dropped the
+  // registration, the guard then refused to re-register, and by the time the (async) save
+  // finished there was no handler left to resume through. The scene was written correctly and the
+  // human's scrub session silently ended on EVERY save, with the panel still displaying a playhead
+  // for an envelope that no longer existed (bug `tSv0EWjWICpEl9HSjRe9`, QA-TIMELINE-0007).
+  //
+  // Keeping one object alive is what lets `saveCommand` fall back to it. Reading the callbacks
+  // out of a ref is what makes that fallback CORRECT: `suspend()` rebuilds the world and
+  // re-resolves the Director root, so `poseAt` is a different closure afterwards — resuming
+  // through the captured one would pose a dead root, which is the trap
+  // `currentPreviewSaveHandlerFor` was written for.
+  const previewHooks = useRef({ exitPreview, poseAt });
+  previewHooks.current = { exitPreview, poseAt };
+  // Is this panel still mounted? A save cycle that finds no registration must tell "the panel
+  // closed" (do not resume — it would wedge the run-mode at 'scrub' with nobody driving it) from
+  // "the suspend deregistered us" (resume: the human is still here). Nothing else can.
+  const mountedRef = useRef(true);
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
+  const saveHandlerRef = useRef<PreviewSaveHandler | null>(null);
+  if (!saveHandlerRef.current) {
+    saveHandlerRef.current = {
+      owner: 'timeline',
+      isLive: () => mountedRef.current,
+      suspend: () => previewHooks.current.exitPreview(),
+      resume: () => {
+        const st = useEditorStore.getState();
+        enterScrubMode('timeline');
+        const pose = previewHooks.current.poseAt;
+        void beginTimelinePreviewSession().then(() => pose(st.playheadTime));
+      },
+    };
+  }
   useEffect(() => {
     // ⚠️ `runMode` here is the REACTIVE one (subscribed above), not `getRunMode()`. Reading it
     // imperatively meant this effect had no dep that changed when a plain ruler scrub opened the
@@ -405,18 +443,10 @@ export default function TimelineEditor() {
     // assets-only branch exists to remove. The Animation panel worked only because its own dep
     // happens to be a `useState` that the scrub sets.
     if (!playing && runMode === 'stopped') return;
-    const mine: PreviewSaveHandler = {
-      owner: 'timeline',
-      suspend: () => exitPreview(),
-      resume: () => {
-        const st = useEditorStore.getState();
-        enterScrubMode('timeline');
-        void beginTimelinePreviewSession().then(() => poseAt(st.playheadTime));
-      },
-    };
+    const mine = saveHandlerRef.current!;
     setPreviewSaveHandler(mine);
     return () => clearPreviewSaveHandler(mine);
-  }, [playing, runMode, exitPreview, poseAt]);
+  }, [playing, runMode]);
 
   // ── Preview playback loop ──
   // ── ▶ Preview: a real FORWARD playthrough — poses (keyframe + skeletal seek + activation) AND

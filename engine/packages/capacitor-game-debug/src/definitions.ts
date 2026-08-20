@@ -24,13 +24,16 @@ export type FaultKind = 'crash' | 'anr' | 'uncaught';
 
 export interface GameDebugPlugin {
   /** Start the TCP server + UDP beacon */
-  startServer(options?: { port?: number }): Promise<{ port: number }>;
+  /** Start the TCP bridge. Binds the default port (9095), retrying briefly while another Modoki
+   *  app is still releasing it, and only then accepting an OS-assigned one — `fallbackPort` is
+   *  true in that case, which means no host can reach this app without being told `port` (#283). */
+  startServer(options?: { port?: number }): Promise<{ port: number; fallbackPort?: boolean }>;
 
   /** Stop the server */
   stopServer(): Promise<{ ok: boolean }>;
 
   /** Check if server is running and has a connected client */
-  getStatus(): Promise<{ running: boolean; clientConnected: boolean; port: number }>;
+  getStatus(): Promise<{ running: boolean; clientConnected: boolean; port: number; fallbackPort?: boolean }>;
 
   /** Send a response back to the connected MCP client */
   sendResponse(options: { id: string; result?: string; error?: string }): Promise<{ ok: boolean }>;

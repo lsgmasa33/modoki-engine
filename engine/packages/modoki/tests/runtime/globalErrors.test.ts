@@ -53,15 +53,23 @@ afterEach(() => {
 });
 
 describe('globalErrors — the console split', () => {
-  it('routes console.error to recordError and console.warn to a breadcrumb', async () => {
+  /**
+   * ⚠️ This test used to assert `console.warn` became a BREADCRUMB, and that expectation was
+   * reversed by the OWNER on 2026-08-20, not by a refactor. The old rule reasoned that a game
+   * warns on ordinary paths and that alerting on those would bury a real crash; the owner's rule
+   * is that a warning is something to look at, and a warn on an ordinary path should be removed
+   * rather than routed somewhere nobody reads. Breadcrumbs now carry GAME EVENTS instead, fed
+   * from Court's `track()` seam — see `games/court/packages/app-services/src/track.ts`.
+   */
+  it('routes BOTH console.error and console.warn to recordError, and neither to a breadcrumb', async () => {
     const m = await load();
     m.registerAppServices({ crashlytics: svc });
 
     console.error('boom', 42);
     console.warn('careful');
 
-    expect(sink.errors).toEqual(['[console.error] boom 42']);
-    expect(sink.logs).toEqual(['[console.warn] careful']);
+    expect(sink.errors).toEqual(['[console.error] boom 42', '[console.warn] careful']);
+    expect(sink.logs, 'console no longer produces breadcrumbs at all').toEqual([]);
   });
 
   it('still passes the line through to the real console — capture must not swallow logging', async () => {
@@ -190,9 +198,10 @@ describe('globalErrors — the boot queue', () => {
     m.registerAppServices({ crashlytics: svc });
 
     // Burst cap bites first (30 per window), so the queue never fills — what matters is that the
-    // flush delivered what it held and nothing threw.
-    expect(sink.logs.length).toBeGreaterThan(0);
-    expect(sink.logs.length).toBeLessThanOrEqual(51);
+    // flush delivered what it held and nothing threw. `errors`, not `logs`: `console.warn` is an
+    // ISSUE since the owner's 2026-08-20 call (see the console-split test).
+    expect(sink.errors.length).toBeGreaterThan(0);
+    expect(sink.errors.length).toBeLessThanOrEqual(51);
   });
 });
 
@@ -293,7 +302,9 @@ describe('globalErrors — the async bounce', () => {
 
     expect(delivered).toHaveLength(2);
     expect(delivered[0]).toContain('the original warning');
-    expect(delivered[1]).toContain('[Crashlytics] log failed');
+    // `recordError`, not `log`: a warn is an ISSUE now, so the rejecting call it bounces off — and
+    // therefore the wrapper's own failure warning — is the recordError one.
+    expect(delivered[1]).toContain('[Crashlytics] recordError failed');
   });
 });
 

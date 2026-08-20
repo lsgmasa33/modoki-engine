@@ -16,6 +16,18 @@ vi.mock('../../src/runtime/core/frameProfiler', async (orig) => {
 vi.mock('../../src/runtime/core/activeRenderer', () => ({
   getActiveRenderer: () => mockRenderer,
 }));
+// ⭐ EVERY TEST BELOW ASSUMES SOMEBODY IS PLAYING, and that assumption is now explicit rather
+// than accidental. Calibration refuses to judge an IDLE window (owner, 2026-08-20): a phone
+// nobody is touching has its clocks dropped by the governor, so the frames it produces describe
+// a throttled device rather than a slow one — an idle Galaxy S22 walked itself high → mid → low
+// on ~41.6 ms medians (bug `lvROp0yDYPSzS0VZM6LH`). Default `true` keeps these cases testing what
+// they were written to test; the `idle window` block at the bottom flips it.
+let playerIsInteracting = true;
+vi.mock('../../src/runtime/core/userActivity', () => ({
+  hasRecentUserInput: () => playerIsInteracting,
+  msSinceUserInput: () => (playerIsInteracting ? 0 : Infinity),
+  noteUserInput: () => {},
+}));
 vi.mock('../../src/runtime/rendering/resizeBus', () => ({
   forceResizeAllSurfaces: () => { resizeCalls++; },
 }));
@@ -53,6 +65,7 @@ const ROOMY = () => profileOf(10, 4);
 const DROWNING = () => profileOf(80, 60);
 
 beforeEach(() => {
+  playerIsInteracting = true;
   resetRenderSettings();
   resetTierCalibration();
   mockRenderer = { shadowMap: { enabled: true } };
@@ -695,5 +708,88 @@ describe('#227 — a queued promotion that never gets a scene boundary', () => {
     // promotion hides inside a load the player already accepted and needs no explanation.
     expect(getPendingTierPromotion()).toBeNull();
     expect(getTierSwitchOverlayMessage()).toBeNull();
+  });
+});
+
+describe('an IDLE window is not evidence (bug lvROp0yDYPSzS0VZM6LH)', () => {
+  // Mobile CPU governors drop clocks when nothing is being touched, so the frames measured
+  // during an idle window describe a THROTTLED device, not a slow one. Measured on a Galaxy S22
+  // — the most powerful Android handset in the lab — sitting idle on Court's tutorial:
+  //   {"tick":204,"tier":"mid","prev":"high","reason":"median frame 41.6ms over the 20.0ms budget for 2s"}
+  //   {"tick":270,"tier":"low","prev":"mid","reason":"median frame 41.7ms over the 20.0ms budget for 2s"}
+  // — two tiers in ~66 ticks, while the GPU identity table had deterministically resolved `high`
+  // on that same phone at boot. The demotion is sticky in the direction that hurts: the player
+  // taps, the CPU unthrottles, and the game runs at `low` on a flagship.
+  //
+  // The owner's rule (2026-08-20): idle is not evidence in EITHER direction — the same rule the
+  // `armed` gate already applies to scene-load frames, rather than a demotion-only guard whose
+  // meaning would depend on which way the sample happened to point.
+  beforeEach(() => {
+    setRenderSettings({ three: { qualityTier: 'auto', tiers: { low: { shadows: false }, high: {} } } } as never);
+    setActiveQualityTier({ tier: 'high', source: 'gpu-benchmark', reason: 'Adreno (TM) 730 is a known GPU' });
+    armTierCalibration();
+  });
+
+  it('does NOT demote on over-budget frames measured while nobody is playing', () => {
+    playerIsInteracting = false;
+    mockProfile = DROWNING();
+    for (let t = 0; t <= DEMOTION_HOLD_MS * 4; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getActiveQualityTier()?.tier).toBe('high');
+  });
+
+  it('does NOT promote on roomy frames measured while nobody is playing', () => {
+    // Both directions, deliberately. A promotion decided off an idle window is reading the same
+    // uninformative sample, and letting one direction through would make the window mean
+    // different things depending on its sign.
+    setActiveQualityTier({ tier: 'low', source: 'measured', reason: 'seed' });
+    playerIsInteracting = false;
+    mockProfile = ROOMY();
+    for (let t = 0; t <= PROMOTION_HOLD_MS * 4; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getPendingTierPromotion()).toBeNull();
+    expect(getActiveQualityTier()?.tier).toBe('low');
+  });
+
+  it('DOES demote once the player is interacting again — the device is still judged, just not idle', () => {
+    // The guard must not become "never demote". A phone that misses the budget while somebody is
+    // actually playing is the case calibration exists for.
+    playerIsInteracting = false;
+    mockProfile = DROWNING();
+    for (let t = 0; t <= DEMOTION_HOLD_MS * 4; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getActiveQualityTier()?.tier).toBe('high');
+
+    playerIsInteracting = true;
+    const base = DEMOTION_HOLD_MS * 8;
+    for (let t = base; t <= base + DEMOTION_HOLD_MS * 4; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getActiveQualityTier()?.tier).toBe('low');
+  });
+
+  it('does not let an idle stretch COUNT toward the sustain window it interrupts', () => {
+    // The over-budget clock must not keep running through the idle gap and then fire the instant
+    // input returns — that would demote on evidence that was almost entirely idle frames, which
+    // is the reported bug in slow motion. The frame profiler fills its ring throughout the idle
+    // stretch too, so the window is dropped on the way BACK, not on the way out.
+    mockProfile = DROWNING();
+    // Run long enough while interacting to genuinely arm the sustain clock. (The first tick alone
+    // does not: `lastCheck` starts at 0, so tick(0) is swallowed by the throttle — an earlier
+    // version of this test passed for exactly that reason and proved nothing.)
+    for (let t = 0; t <= DEMOTION_HOLD_MS; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getActiveQualityTier()?.tier).toBe('high');    // not yet — the clock is running
+
+    playerIsInteracting = false;
+    const idleEnd = DEMOTION_HOLD_MS * 6;
+    for (let t = DEMOTION_HOLD_MS + CALIBRATION_INTERVAL_MS; t <= idleEnd; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+
+    // One interacting tick must NOT be enough, even though the clock had nearly elapsed before
+    // the gap and the gap itself was long.
+    playerIsInteracting = true;
+    tickTierCalibration(idleEnd + CALIBRATION_INTERVAL_MS);
+    expect(getActiveQualityTier()?.tier).toBe('high');
+
+    // ...and a full fresh sustain window of interacting frames still demotes, so the reset drops
+    // evidence rather than disabling the mechanism.
+    for (let t = idleEnd + CALIBRATION_INTERVAL_MS * 2; t <= idleEnd + DEMOTION_HOLD_MS * 3; t += CALIBRATION_INTERVAL_MS) {
+      tickTierCalibration(t);
+    }
+    expect(getActiveQualityTier()?.tier).toBe('low');
   });
 });

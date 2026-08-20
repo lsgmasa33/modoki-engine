@@ -62,16 +62,25 @@ describe('typeText measures the insert', () => {
     expect(r.error).toBeUndefined();
   });
 
-  it('a field the char path cannot write is reported as a SHORT insert, with a cause', async () => {
-    // `accepts: 0` stands in for the real failure mode: the keyCode carries no insertable
-    // character, so nothing lands and sendInputEvent still cannot fail.
+  it('a field that rejects the input is reported as a SHORT insert, with a cause', async () => {
+    // `accepts: 0` stands in for a field that refuses what you type — a numeric input, a max
+    // length, an input mask. `sendInputEvent` still cannot fail, so the MEASUREMENT is the only
+    // thing that can notice.
     const { win, read } = fakeWindow({ before: '', accepts: 0 });
-    const r = await typeText(win, 'あいう');
+    const r = await typeText(win, 'abc');
     expect(read()).toBe('');                     // nothing actually landed…
     expect(r.typed).toBe(0);                     // …and that is what is reported
     expect(r.valueAfter).toBe('');
     expect(r.error).toMatch(/0 of 3 character\(s\) appear to have reached it/);
-    expect(r.error).toMatch(/non-ASCII/);
+    expect(r.error).toMatch(/reformats, truncates or rejects input as you type/);
+    // ⚠️ The message must NOT blame non-ASCII input. It did, and the claim is false: Japanese,
+    // accented letters and emoji all insert cleanly through the char path (measured on Electron
+    // 43.2.0 — bug `xaewBYMBYXoeuiTllsI8`, QA-INPUT-0003). The old wording sent agents to
+    // modoki_eval, a NON-input write that a React controlled input never sees, so the
+    // recommended workaround was strictly more fragile than the path that works. The owner
+    // writes Japanese, which makes this the common path rather than a corner.
+    expect(r.error).not.toMatch(/non-ASCII/);
+    expect(r.error).not.toMatch(/modoki_eval/);
   });
 
   it('a PARTIAL insert is short too — not rounded up to success', async () => {

@@ -19,7 +19,11 @@ import type { Entity, World } from 'koota';
 
 // Payload is a string for text inputs (submit/change) and a number for range
 // sliders (change) — handlers narrow with `typeof` as needed.
-export type UIActionPayload = string | number;
+/** The value an event carries into a binding (the `$value` token).
+ *  `boolean` joined `string | number` for `UIToggle` (#280): a switch's event value
+ *  IS a boolean, and coercing it to 0/1 or "true" would make every consumer parse it
+ *  back — and would write a number into a boolean trait field through a `set` binding. */
+export type UIActionPayload = string | number | boolean;
 
 /** Context passed to every action handler. */
 export interface UIActionContext {

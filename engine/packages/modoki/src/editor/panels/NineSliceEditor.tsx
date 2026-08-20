@@ -17,7 +17,7 @@ import { BufferedNumberInput } from './fields';
 import { registerSprite, isGuid, deriveGuid, type SpriteAssetRef } from '../../runtime/loaders/assetManifest';
 import { captureSpriteSnapshot, revertSpritePreview } from './nineSliceRevert';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
-import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
+import { registerHandleProvider, clampHandleToOwner, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 
 export interface NineSliceBorder { l: number; r: number; t: number; b: number; }
 
@@ -150,12 +150,23 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       return EDGES.map((e) => {
         const g = coordOf(e) * st.scale;
         const vertical = e === 'l' || e === 'r';
+        // Same sub-pixel trap as the Sprite Editor (bug `XVkE46RE8ZQMm3cOwC8q`), reachable here
+        // whenever an inset is 0 on the RIGHT or BOTTOM edge — an ordinary authoring state, not a
+        // corner. `coordOf` then returns the image's full width/height, so `g` is the UNROUNDED
+        // `imgDims.w * scale` while the canvas element is `Math.round` of the same product (see
+        // `canvasW`/`canvasH` above); the guide lands outside its own canvas and Enact refuses to
+        // drag it. Tolerance-limited, so a genuinely scrolled-away guide stays refused.
+        const p = clampHandleToOwner(
+          rect.left + (vertical ? g : rect.width / 2),
+          rect.top + (vertical ? rect.height / 2 : g),
+          rect,
+        );
         return {
           id: `nineslice:guide:${e}`,
           kind: 'nineslice-guide',
           editor: 'nineslice',
-          x: rect.left + (vertical ? g : rect.width / 2),
-          y: rect.top + (vertical ? rect.height / 2 : g),
+          x: p.x,
+          y: p.y,
           label: EDGE_LABEL[e],
           meta: { edge: e, inset: e === 'l' ? st.border.l : e === 'r' ? st.border.r : e === 't' ? st.border.t : st.border.b },
           owner: canvas,

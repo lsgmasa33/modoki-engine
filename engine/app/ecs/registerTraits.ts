@@ -4,7 +4,7 @@
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
-  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
+  UIElement, UIBinding, UIAction, UIFocusable, UIToggle, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
   AudioSource, AudioListener, VideoPlayer,
@@ -1050,6 +1050,33 @@ export function registerAllTraits() {
       navDown: { type: 'entityRef', tooltip: 'Explicit down-nav target (UI entity); empty → spatial nearest' },
       navLeft: { type: 'entityRef', tooltip: 'Explicit left-nav target (UI entity); empty → spatial nearest' },
       navRight: { type: 'entityRef', tooltip: 'Explicit right-nav target (UI entity); empty → spatial nearest' },
+    },
+  });
+
+  // Sits between UIFocusable (63.5) and Canvas2D (64) so a toggle's fields read just
+  // below the interaction traits it pairs with.
+  registerTrait({
+    name: 'UIToggle', trait: UIToggle, category: 'component', componentCategory: 'UI',
+    priority: 63.7,
+    fields: {
+      value: { type: 'boolean', tooltip: 'The live on/off state. Drawn from here — the control does NOT write it; a UIAction binding does (set UIToggle.value to \'$value\').' },
+      disabled: { type: 'boolean', tooltip: 'Dim and refuse the click. Still draws its current value rather than going blank.' },
+      // ⚠️ The two track colours do NOT fold `trackOpacity` as an `alphaField`, though the obvious
+      // authoring would. There is ONE track opacity shared by both states, and `alphaField` folds
+      // an opacity row INTO a colour row — so two colours claiming one sibling would draw that row
+      // twice and make "which one owns it" ambiguous. `colorAlphaFieldWiring.test.ts` refuses it.
+      // Splitting into on/off opacities was the alternative and buys nothing: a track is in one
+      // state or the other, never both. So the shared opacity gets its own plain row below.
+      trackOnColor: { type: 'color', tooltip: 'Track fill while ON' },
+      trackOffColor: { type: 'color', tooltip: 'Track fill while OFF' },
+      trackOpacity: { type: 'number', min: 0, max: 1, step: 0.01, tooltip: 'Track fill opacity, both states' },
+      // One colour, one alpha — a legal 1:1 fold, unlike the pair above.
+      knobColor: { type: 'color', alphaField: 'knobOpacity', tooltip: 'The sliding knob' },
+      knobInset: { type: 'number', min: 0, step: 1, tooltip: 'Gap in CSS px between knob and track edge. The knob is square and sized off the track height minus twice this.' },
+      trackRadius: { type: 'number', min: 0, step: 1, tooltip: 'Track corner radius. 999 = capsule at any height.' },
+      knobRadius: { type: 'number', min: 0, step: 1, tooltip: 'Knob corner radius. 999 = circle.' },
+      // Folded into `knobColor`'s row, so it needs no row of its own.
+      knobOpacity: { type: 'number', min: 0, max: 1, step: 0.01, hidden: true },
     },
   });
 

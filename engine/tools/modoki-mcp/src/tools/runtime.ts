@@ -183,16 +183,22 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'deliberately opt-in because enabling costs real time (two timestamps per pass) and the ' +
       'profiler must not change what it measures; where the backend cannot support them the status ' +
       'comes back "unsupported" with a reason and NO number is invented. reset clears markers and ' +
-      'captures. ⚠️ A desktop editor frame is fast almost regardless — for a REAL perf question use ' +
+      'captures. boot reads the BOOT-PHASE timeline (#238) — always-on spans across scene load, ' +
+      'asset acquire, shader prewarm and renderer init — and intersects them with the worst dropped ' +
+      'frame, so a cold-boot freeze is attributed by measurement instead of guessed from the frame ' +
+      'aggregate (which cannot see it: a stall is DROPPED from the percentiles by design). ' +
+      'boot-reset re-arms that timeline; plain reset deliberately does NOT touch it. ' +
+      '⚠️ A desktop editor frame is fast almost regardless — for a REAL perf question use ' +
       'device_profiler on the target phone; this is for finding which marker owns the frame, and for ' +
       'editor-side regressions. Read actions are GET, state-changing ones POST.',
     {
-      action: z.enum(['read', 'capture-start', 'capture-stop', 'capture-read', 'capture-clear', 'gpu-on', 'gpu-off', 'reset'])
-        .optional().describe('Default "read" (the live aggregate). capture-* record/read frames; gpu-* toggle GPU timestamps; reset clears markers + captures.'),
+      action: z.enum(['read', 'capture-start', 'capture-stop', 'capture-read', 'capture-clear', 'gpu-on', 'gpu-off', 'reset', 'boot', 'boot-reset'])
+        .optional().describe('Default "read" (the live aggregate). capture-* record/read frames; gpu-* toggle GPU timestamps; reset clears markers + captures; boot reads the boot-phase timeline; boot-reset re-arms it.'),
       markers: z.number().optional().describe('action:read only — how many marker rows to return (default 12).'),
-      limit: z.number().optional().describe('action:capture-read only — how many of the WORST frames to return (default 5, max 20).'),
+      limit: z.number().optional().describe('action:capture-read (worst frames, default 5, max 20) or action:boot (rows per section, default 15, max 200).'),
+      all: z.boolean().optional().describe('action:boot only — return EVERY recorded span, not just the stall overlap and the costliest. Large.'),
     },
-    async ({ action, markers, limit }) => {
+    async ({ action, markers, limit, all }) => {
       const act = action ?? 'read';
       // A read-only filter passed to a state-changing action is REFUSED, not silently dropped —
       // the cross-action hazard the conventions doc closed for `watch` (S3.19) rather than splitting
@@ -202,7 +208,8 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       // refusal for the other. A refusal's job is to be the caller's next move, once.
       const stray = [
         ...(act !== 'read' && markers !== undefined ? [{ param: 'markers', belongsTo: 'read' }] : []),
-        ...(act !== 'capture-read' && limit !== undefined ? [{ param: 'limit', belongsTo: 'capture-read' }] : []),
+        ...(act !== 'capture-read' && act !== 'boot' && limit !== undefined ? [{ param: 'limit', belongsTo: 'capture-read' }] : []),
+        ...(act !== 'boot' && all !== undefined ? [{ param: 'all', belongsTo: 'boot' }] : []),
       ];
       if (stray.length) {
         const names = stray.map((s) => `\`${s.param}\``).join(' and ');
@@ -215,10 +222,11 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
           options: stray.map((s) => `${s.param} applies only to action:'${s.belongsTo}'`),
         });
       }
-      if (act === 'read' || act === 'capture-read') {
+      if (act === 'read' || act === 'capture-read' || act === 'boot') {
         const qs = new URLSearchParams({ action: act });
         if (markers !== undefined) qs.set('markers', String(markers));
         if (limit !== undefined) qs.set('limit', String(limit));
+        if (all !== undefined) qs.set('all', String(all));
         return getJson(`/api/profiler?${qs.toString()}`);
       }
       return postJson('/api/profiler', { action: act });

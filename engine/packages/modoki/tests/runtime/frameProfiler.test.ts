@@ -11,7 +11,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
-  recordFrame, getFrameProfile, resetFrameProfile, setProfilerFrameCap,
+  recordFrame, getFrameProfile, resetFrameProfile, setProfilerFrameCap, getWorstStallWindow,
   BUDGET_30FPS_MS, PROFILE_WINDOW_FRAMES,
 } from '../../src/runtime/core/frameProfiler';
 
@@ -165,6 +165,31 @@ describe('frameProfiler — discontinuities', () => {
     expect(p.discontinuities).toBe(2);
     expect(p.worstStallMs).toBe(3926);   // the WORST, not the latest
     expect(p.frameMs.max).toBe(16);      // and still kept out of the percentiles
+  });
+
+  it('records WHEN the worst stall was, so it can be intersected with the boot timeline', () => {
+    // #238: "1,814 ms" is unattributable on its own. The window is the coordinate that lets the
+    // boot timeline answer what was open across it — which is the difference between a
+    // measurement and the three wrong guesses this workstream has already published.
+    feed([
+      { frameMs: 16, cpuMs: 4 },
+      { frameMs: 1290, cpuMs: 5 },
+      { frameMs: 16, cpuMs: 4 },
+      { frameMs: 3926, cpuMs: 5 },
+    ], 1000);
+    // Frame starts: 1000, 1016, 2306, 2322, 6248 — the worst stall spans the last interval.
+    expect(getWorstStallWindow()).toEqual({ startMs: 2322, endMs: 6248 });
+    expect(getFrameProfile().worstStallMs).toBe(3926);
+  });
+
+  it('has no stall window before any frame is dropped, and clears it on reset', () => {
+    feed([{ frameMs: 16, cpuMs: 4 }, { frameMs: 17, cpuMs: 4 }]);
+    expect(getWorstStallWindow()).toBeNull();
+    feed([{ frameMs: 2000, cpuMs: 4 }], 50_000);
+    expect(getWorstStallWindow()).not.toBeNull();
+    resetFrameProfile();
+    // A stale window would attribute the NEXT measurement to spans from the previous one.
+    expect(getWorstStallWindow()).toBeNull();
   });
 
   it('reports no stall as 0 rather than a stale high-water mark', () => {

@@ -77,10 +77,51 @@ other drift. `add-native-target` (`engine/plugins/addNativeTarget.ts`) and the v
 wire in per-game native plugins. Restart the editor after pulling build-pipeline changes — the
 Vite plugin loads once at dev-server start.
 
+**Crash reporting is one of the things it repairs, on BOTH platforms, for any project that depends
+on `@capacitor-firebase/crashlytics`** — gated on that dependency alone (`usesCrashlytics`), and
+deliberately independent of `build.debugBuild`: whether a crash report is readable has nothing to
+do with the debug bridge, and a Release build needs it more, not less. iOS gets
+`dwarf-with-dsym` in every configuration plus the `Upload Crashlytics dSYMs` phase (#279); Android
+gets the `firebase-crashlytics-gradle` classpath, the `firebase-crashlytics-ndk` artifact, and
+`apply plugin: 'com.google.firebase.crashlytics'` **inside** the `google-services.json` guard
+(#282) — outside it, a project with no such file fails to build. Both were hand edits in
+`games/court` first; generalizing them is what gave `games/3d-test` native crash reporting it had
+silently never had. ⚠️ **The NDK version is emitted as an EXPRESSION**
+(`rootProject.ext.firebaseCrashlyticsVersion` with a fallback), not a frozen number: it and the
+artifact the Capacitor plugin resolves are a matched pair, and a mismatch is a RUNTIME failure —
+no NDK reporting at all — rather than a resolution error, so no build log would catch it.
+
+**Four rules the heal follows here, each of them a bug that was found and fixed rather than a
+principle someone thought of first** (close-out, 2026-08-20):
+
+- **A note means a real change.** The dSYM phase and the archive-time "Debug build is ON" phase
+  both used to splice in right after the `PBXShellScriptBuildPhase` section-open line, so each put
+  ITSELF first and shoved the other second: the two objects swapped on every project open, each
+  heal rewrote the pbxproj, and each reported "synced …" for work that netted to nothing. Measured
+  on `games/court` — two writes of equal length and opposite content, file byte-identical before
+  and after. They now take deterministic slots (warning first, dSYM **last**), so both are fixed
+  points and both projects heal to ZERO notes. A heal note is the editor's report to the human
+  that something was repaired; one that fires every time is a false success that hides the real ones.
+- **An inline comment must not make an anchor invisible.** The anchors matched `[ \t]*$`, so
+  `apply plugin: 'com.google.gms.google-services' // keep with crashlytics` read as "no guard
+  present" — the plugin apply was skipped while the classpath and NDK artifact still landed, and
+  the heal still returned a success note. That is the half-wired shape this whole section exists to
+  end. Anchors now tolerate a trailing `//` comment (and only a comment — `dependencies { impl 'x' }`
+  is a one-line block, and inserting "after" it would put the artifact outside the block).
+- **A skipped apply-plugin says so.** When there genuinely is no `com.google.gms.google-services`
+  apply to anchor on, the note now carries `⚠️ apply-plugin NOT wired … Crashlytics symbol upload
+  is inert` instead of listing the two cosmetic edits as success.
+- **CRLF in, CRLF out.** Every edit here is written as LF text, so a CRLF gradle file came back
+  with mixed endings, differing from its input — the heal then rewrote it on the next pass too,
+  drifting a blank line each time. `.gitattributes` pins `*.gradle text eol=lf` so this needs a
+  non-git write path, but Windows-only EOL bugs are a documented recurring class here
+  ([windows.md](./windows.md)) and the guard is one regex: edit in LF, restore what the file had.
+
 ⚠️ **`healNativeConfig` mints pbxproj objects from HARDCODED id spaces, and there are TWO of
-them.** `GD_UUID` owns `DD0000000000000000000001` … `DD0000000000000000000006` (the
-MainViewController + GameDebug plugin file/build-file pairs, the retired Release strip phase, and
-the archive-time "Debug build is ON" warning phase), and `WRAPPER_UUID` separately owns
+them.** `GD_UUID` owns `DD0000000000000000000001` … `DD0000000000000000000007` (the
+MainViewController + GameDebug plugin file/build-file pairs, the retired Release strip phase, the
+archive-time "Debug build is ON" warning phase, and — since #279 — the `Upload Crashlytics dSYMs`
+phase at `…0007`), and `WRAPPER_UUID` separately owns
 `D0D0D0D0D0D0D0D0D0D0D0D0` (the `modoki.xcconfig` file reference). Fixed ids rather than random
 ones are what keep the heal idempotent and its diff stable — so **anything else that hand-writes
 an object id into a pbxproj must avoid BOTH ranges.** (This entry named only the first until the
@@ -866,7 +907,7 @@ device and not iOS 16:
 
 ⚠️ **So go-ios is NOT broken generally, and this is the correction that matters.** An earlier
 version of this section said the installs isolated the fault "to go-ios, not to the bundle" — the
-`court` control disproves that. `com.modokiengine.court` carries 2 frameworks (Capacitor, Cordova)
+`court` control disproves that. `com.apiary.court` carries 2 frameworks (Capacitor, Cordova)
 and installs first try; `com.modokiengine.tropicalisland` carries 6 (those two plus
 FirebaseAnalytics, GoogleAppMeasurement, GoogleAppMeasurementIdentitySupport,
 GoogleAdsOnDeviceConversion) and fails **4/4**. Both pass `codesign --verify --deep --strict` and

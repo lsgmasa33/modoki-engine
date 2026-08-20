@@ -27,6 +27,7 @@ import { getAllTraits } from '../core/ecs/traitRegistry';
 import { resolveKootaSchema } from './sceneSchema';
 import { resolveSceneChain, type SceneRef, type FetchSceneMeta } from './sceneChain';
 import { emit } from '../core/journal';
+import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { clearAllOverrideMarks, getOverrideMarkSet, markOverride } from '../loaders/overrideMarks';
 import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
 import { SCENE_FORMAT_VERSION } from '../core/version';
@@ -260,6 +261,9 @@ class SceneManagerImpl implements SceneManager {
    *  complete and the new scene is active. Rejects if the load fails or is
    *  aborted (the current scene remains untouched on failure). */
   async loadScene(path: string, opts: LoadOptions = {}): Promise<void> {
+    // Boot timeline (#238): the whole load, plus a span per phase below. Always on — a cold boot
+    // has nobody there to switch a profiler on, and the boot stall is only reproducible cold.
+    const loadSpan = beginBootSpan('scene-load', path);
     // 1. Cancel in-flight load
     if (this.nextLoad) {
       this.nextLoad.controller.abort();
@@ -300,8 +304,9 @@ class SceneManagerImpl implements SceneManager {
       } else {
         // assetUrl() is a no-op in dev/native (BASE_URL '/'), prefixes for sub-path web
         // hosting, and resolves to the inlined blob: URL in a playable single-file build.
+        const fetchSpan = beginBootSpan('scene-fetch-json', path);
         const res = await fetch(assetUrl(path), { signal: controller.signal, ...ASSET_FETCH_INIT });
-        if (!res.ok) throw new Error(`Failed to fetch scene "${path}": HTTP ${res.status}`);
+        if (!res.ok) { endBootSpan(fetchSpan); throw new Error(`Failed to fetch scene "${path}": HTTP ${res.status}`); }
         // parseAssetJson, not res.json(): the dev server answers an unknown path with a 200 OK
         // `index.html` (its SPA fallback), so `res.ok` is true, there is no 404, and `.json()`
         // throws `Unexpected token '<', "<!doctype "…` — which reads as a CORRUPT scene when the
@@ -310,6 +315,7 @@ class SceneManagerImpl implements SceneManager {
         // path, and the resulting red console error is indistinguishable from a real failure to
         // `smoke-packaged.sh` / `assert-app-renders.sh`, both of which fail on ANY console error.
         data = await parseAssetJson(res, path) as SceneData;
+        endBootSpan(fetchSpan);
       }
       // Register scene id in the manifest so the editor can recover it on save
       const sceneGuid = (data as { id?: string }).id;
@@ -358,7 +364,8 @@ class SceneManagerImpl implements SceneManager {
         if (g && isGuid(g)) registerAsset(g, basePath, 'scene');
         return { guid: g && isGuid(g) ? g : `path:${basePath}`, path: basePath, baseScene: cached!.baseScene };
       };
-      const { chain: newChain, warnings: chainWarnings } = await resolveSceneChain(path, fetchSceneMeta);
+      const { chain: newChain, warnings: chainWarnings } = await bootSpanAsync(
+        'scene-resolve-chain', () => resolveSceneChain(path, fetchSceneMeta), path);
       for (const w of chainWarnings) console.warn(w);
 
       if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -425,7 +432,8 @@ class SceneManagerImpl implements SceneManager {
       for (const ref of toLoadRefs) {
         const sceneData = ref === primaryRef ? data : rawSceneCache.get(ref.path)!;
         const sid = sceneIdByPath.get(ref.path)!;
-        const refs = await this.collectSceneResourceRefs(sid, sceneData, controller);
+        const refs = await bootSpanAsync(
+          'scene-collect-refs', () => this.collectSceneResourceRefs(sid, sceneData, controller), ref.path);
         perSceneRefs.set(ref.path, refs);
         preparedSceneData.set(ref.path, sceneData);
       }
@@ -439,6 +447,7 @@ class SceneManagerImpl implements SceneManager {
       // no-op via the cache but ensures the refcount is set. Remaining resources
       // (models, meshes, materials, environments, fonts) fetch here in parallel,
       // one scene at a time (parallel WITHIN a scene, same as today).
+      const acquireSpan = beginBootSpan('scene-acquire-resources', `${totalResources} refs`);
       for (const ref of toLoadRefs) {
         const sid = sceneIdByPath.get(ref.path)!;
         await Promise.all(perSceneRefs.get(ref.path)!.map(async (r) => {
@@ -447,6 +456,7 @@ class SceneManagerImpl implements SceneManager {
           opts.onProgress?.(loadedCount, totalResources);
         }));
       }
+      endBootSpan(acquireSpan);
 
       if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
@@ -526,6 +536,7 @@ class SceneManagerImpl implements SceneManager {
         const beforeIds = new Set<number>();
         for (const e of stagingWorld.entities) beforeIds.add((e as unknown as { id(): number }).id());
 
+        const spawnSpan = beginBootSpan('scene-spawn-entities', ref.path);
         await loadSceneFile(sceneData, {
           world: stagingWorld,
           clearMarks: false, // once-per-world clear above owns this (A9 defect 1)
@@ -623,6 +634,7 @@ class SceneManagerImpl implements SceneManager {
           },
           loadModels: false, // already preloaded above
         });
+        endBootSpan(spawnSpan);
 
         if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
@@ -761,7 +773,10 @@ class SceneManagerImpl implements SceneManager {
       // we flip setCurrentWorld. This eliminates the first-frame shader-compile
       // stutter after swap. Hooks are best-effort — failures are logged and the
       // swap proceeds anyway.
-      await this.fireBeforeSwapHooks(nextWorld);
+      // This is where shader PREWARM happens (a renderer hook compiling against the staging
+      // world) — one of the three boot phases #238 names, and the reason this span is separate.
+      const swapWorld = nextWorld;
+      await bootSpanAsync('scene-before-swap-hooks', () => this.fireBeforeSwapHooks(swapWorld));
 
       if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
@@ -854,8 +869,8 @@ class SceneManagerImpl implements SceneManager {
       // an in-game swap keeps them running), then the new scene's scene-scoped
       // managers. Awaited so async init (e.g. entity spawning) completes before
       // loadScene resolves.
-      if (gameChanged) await initGameManagersFor(nextGameId, path);
-      await initSceneManagersFor(path);
+      if (gameChanged) await bootSpanAsync('game-managers-init', () => initGameManagersFor(nextGameId, path));
+      await bootSpanAsync('scene-managers-init', () => initSceneManagersFor(path), path);
 
       // 12. Done
     } catch (err) {
@@ -868,6 +883,7 @@ class SceneManagerImpl implements SceneManager {
       if (this.nextLoad?.id === id) this.nextLoad = null;
       throw err;
     } finally {
+      endBootSpan(loadSpan);
       opts.signal?.removeEventListener('abort', externalAbort);
     }
   }
@@ -1320,7 +1336,24 @@ function snapshotPersistentEntities(world: World, keptBaseGuids: Set<string> = n
 }
 
 /** Dispatch to the right typed acquire function based on resource type. */
+/** Resource kinds that actually FETCH or DECODE something. The rest are manifest-only entries
+ *  (listed so the build tree-shaker keeps the file; the runtime lazy-loads them elsewhere), so
+ *  spanning them would spend the boot timeline's cap on hundreds of zero-length rows and push
+ *  the real work off the end of it. */
+const LOADING_RESOURCE_TYPES: ReadonlySet<string> = new Set([
+  'model', 'riggedModel', 'mesh', 'material', 'prefab', 'font', 'environment', 'audio',
+]);
+
+/** Per-resource boot spans (#238). The stall being hunted is per-project and bimodal, and the
+ *  hypothesis-driven attributions from frame markers were wrong three times — so this records
+ *  WHICH asset was open when, and lets the read intersect that with the stall window rather
+ *  than inferring a cause from the aggregate. */
 async function acquireResource(sceneId: SceneId, ref: SceneResourceRef): Promise<void> {
+  if (!LOADING_RESOURCE_TYPES.has(ref.type)) return acquireResourceInner(sceneId, ref);
+  return bootSpanAsync(`acquire:${ref.type}`, () => acquireResourceInner(sceneId, ref), ref.path);
+}
+
+async function acquireResourceInner(sceneId: SceneId, ref: SceneResourceRef): Promise<void> {
   switch (ref.type) {
     case 'model':    return acquireModel(sceneId, ref.path, ref.postprocessor);
     case 'riggedModel': return acquireRiggedModel(sceneId, ref.path);

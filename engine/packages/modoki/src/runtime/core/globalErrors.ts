@@ -31,12 +31,22 @@
 import { appServices, onAppServicesRegistered } from './appServices';
 import { rawNow } from './clock';
 
-/** `console.error` → a non-fatal Crashlytics ISSUE (grouped, alerted on).
- *  `console.warn`  → a Crashlytics BREADCRUMB (context inside somebody else's report).
+/** `console.error` AND `console.warn` → a non-fatal Crashlytics ISSUE (grouped, alerted on).
  *
- * That split is the decision this file encodes, and conflating the two is what makes a crash
- * console useless: a game warns on ordinary paths (a missing sprite, a skipped hint), and turning
- * those into alerting issues buries the one report that is a real crash. */
+ * ⚠️ **`warn` used to be a breadcrumb, and the OWNER reversed that (2026-08-20).** The original
+ * argument was that a game warns on ordinary paths (a missing sprite, a skipped hint) and that
+ * turning those into alerting issues would bury a real crash. The owner's call is that a warning
+ * IS something to look at — if it fires on an ordinary path, the fix is to stop warning there,
+ * not to route it somewhere nobody reads.
+ *
+ * Breadcrumbs are not unused by that change; they carry GAME EVENTS instead. Court feeds them
+ * from the `track()` analytics seam, so a crash report shows the run that led to it
+ * (`level_start` → `hint_opened` → `level_failed` → crash) rather than console chatter. That is
+ * the shape a breadcrumb trail is for, and it is one seam rather than a second hand-maintained
+ * list — see `games/court/packages/app-services/src/track.ts`.
+ *
+ * The caps below matter MORE under this decision, not less: they are what stops a warn inside a
+ * per-frame system from becoming 60 issues a second. */
 export type CaptureKind = 'error' | 'breadcrumb';
 
 /** Caps. A warn inside a per-frame system is 60 calls/second; unbounded, that is a flooded
@@ -304,7 +314,8 @@ export function installGlobalErrorHandlers(): void {
       };
       console.warn = (...args: unknown[]) => {
         try {
-          captureToCrashlytics('breadcrumb', `[console.warn] ${describeArgs(args)}`);
+          // 'error', not 'breadcrumb' — owner's call, see the CaptureKind doc above.
+          captureToCrashlytics('error', `[console.warn] ${describeArgs(args)}`);
         } catch { /* ignore */ }
         realWarn(...args);
       };

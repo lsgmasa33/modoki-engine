@@ -64,6 +64,17 @@ export interface PreviewSaveHandler {
   suspend(): Promise<void>;
   /** Re-open the envelope and re-pose at the panel's current playhead. */
   resume(): void;
+  /** Is the owner panel STILL MOUNTED?
+   *
+   *  This exists to separate two states that both leave nothing registered when a save finishes,
+   *  and that need opposite answers. A panel that UNMOUNTED must not be resumed — re-entering
+   *  scrub mode with nobody to drive it wedges the run-mode. A panel that merely DEREGISTERED,
+   *  because the suspend flipped the run-mode its registration effect is guarded on, is still
+   *  there and still owes the human their frame. See {@link resumeHandlerFor}.
+   *
+   *  Optional: a handler that does not answer is assumed live, which is the pre-existing
+   *  behaviour for the replaced-handler path. */
+  isLive?(): boolean;
 }
 
 let _saveHandler: PreviewSaveHandler | null = null;
@@ -96,6 +107,49 @@ export function getPreviewSaveHandler(): PreviewSaveHandler | null { return _sav
  *  freshly-rebound root rather than the dead one. */
 export function currentPreviewSaveHandlerFor(owner: PreviewSaveHandler['owner']): PreviewSaveHandler | null {
   return _saveHandler?.owner === owner ? _saveHandler : null;
+}
+
+/** Which handler a finished save cycle should RESUME through — or null when it must not resume.
+ *
+ *  THREE things can happen to a registration across `suspend()` → save → `resume()`, and only two
+ *  of them were handled:
+ *
+ *  - **Replaced.** The restore reassigns entity ids, the owner panel re-resolves its root, and its
+ *    effect re-registers a handler bound to the NEW root. The current registration wins — resuming
+ *    through the captured object would pose a dead root. That is what
+ *    {@link currentPreviewSaveHandlerFor} is for.
+ *  - **Gone, because the panel CLOSED.** Nothing should be resumed: re-entering scrub mode with no
+ *    panel to drive it wedges the run-mode at 'scrub' with the world posed. Null is right here.
+ *  - **Gone, because the panel DEREGISTERED ITSELF.** The registration effect is guarded on being
+ *    inside the envelope, and `suspend()` is precisely what leaves it — so the suspend deletes the
+ *    registration it is about to need, while the panel is still perfectly alive. This case was
+ *    read as the previous one, and it is the Timeline panel's NORMAL path: `previewResumed` came
+ *    back false on every cycle, the human's scrub session ended on every Cmd+S, and the panel went
+ *    on showing a playhead for an envelope that no longer existed (bug `tSv0EWjWICpEl9HSjRe9`,
+ *    QA-TIMELINE-0007). The save itself was correct throughout, which is why nothing else caught
+ *    it.
+ *
+ *  `isLive()` is what tells the last two apart. Without it there is no observable difference: both
+ *  present as "the owner has no registration".
+ *
+ *  ⚠️ Falling back to the CAPTURED handler is only sound because both panels' handlers dispatch
+ *  through a ref, so it still calls the freshly-rebound closures. Do not reintroduce a handler
+ *  that closes over a root directly. */
+export function resumeHandlerFor(
+  owner: PreviewSaveHandler['owner'],
+  started: PreviewSaveHandler,
+): PreviewSaveHandler | null {
+  const current = currentPreviewSaveHandlerFor(owner);
+  if (current) return current;
+  // FAIL OPEN. `isLive` is an optional method on a public interface, so a future implementation
+  // could be more than a ref read — and this runs AFTER the scene has already been written. A
+  // throw here would escape `runSaveAllOnce`'s try, hit its catch, be re-thrown by the SECOND
+  // call there, and surface as a failed save that actually succeeded, with the envelope left
+  // suspended forever: exactly the bug this function exists to fix, reopened through its own
+  // guard. Unreachable with today's two implementations; the contract is what invites it.
+  let live = true;
+  try { live = started.isLive?.() !== false; } catch { /* an unanswerable panel is treated as live */ }
+  return live ? started : null;
 }
 
 /** Has the authored world been EDITED since this envelope opened?

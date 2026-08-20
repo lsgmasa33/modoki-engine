@@ -284,9 +284,14 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'drop). AIM: this is the ONE input tool that cannot be aimed by `entity` — HTML5 DnD is a ' +
       'DOM-element protocol (the source element\'s own dragstart handler fills the DataTransfer), ' +
       'so an endpoint is a DOM `selector` or raw viewport {x,y}; there is no scene-entity endpoint ' +
-      'to resolve, and inside modoki_batch a raw {x,y} endpoint is refused (use selectors). It also ' +
-      'does NOT report the shared `matched`/`hitTarget`/`occluded` provenance the /api/input/* ' +
-      'routes carry — it runs through the editor-action relay instead. Works in dev AND the DMG.',
+      'to resolve, and inside modoki_batch a raw {x,y} endpoint is refused (use selectors). ' +
+      'OCCLUSION: `from`/`to` each carry the shared `matched`/`hitTarget`/`occluded` provenance, but ' +
+      'a covered endpoint is a WARNING, not a refusal (unlike every other aimed input tool): the ' +
+      'events are dispatched straight at the element, bypassing hit-testing, so the drop really ' +
+      'does land and refusing would reject a call that works. What it CANNOT be is a gesture a ' +
+      'human could perform — their drag is hit-tested into the cover — so `occluded:true` comes ' +
+      'with a warning saying exactly that. Do not rest a verdict on a covered drop. Works in dev ' +
+      'AND the DMG.',
     {
       // STRICT + refined, unlike the shared `pointSpec` (which carries an `entity` this route
       // cannot honour — see the description). An all-optional inline object accepted `{}` and a
@@ -388,9 +393,12 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       "terminal key: 'Tab'/'Escape' BLUR the field (use to verify commit-on-blur), " +
       "'Enter' submits. `typed` is MEASURED (the focused element's value delta), not the length of " +
       'what you asked for, and `valueAfter` echoes the field — so a short insert is a FAILURE naming ' +
-      'what landed. NON-ASCII (CJK, emoji, accented) text often cannot be inserted at all: ' +
-      "Chromium's synthetic char path can only type what it expresses as a keyCode, so set such a " +
-      'value through the app\'s own UI. Requires the Electron editor.',
+      'what landed. NON-ASCII (Japanese, emoji, accented) text DOES insert — measured on Electron ' +
+      '43. This used to say it could not, and steered agents to modoki_eval, which is a ' +
+      'NON-input write a controlled input never sees, so the advice was worse than the path it ' +
+      'replaced. When text really does not land, the live cause is a field that reformats or ' +
+      'rejects input as you type — read `valueAfter`, it names what is actually there. ' +
+      'Requires the Electron editor.',
     {
       text: z.string().describe('Text to type into the focused input.'),
       clearFirst: z.boolean().optional().describe('Empty the field before typing (replace vs append). A field it could not empty is reported as an ERROR naming what is still in it, never a silent append.'),

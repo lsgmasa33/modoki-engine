@@ -34,6 +34,7 @@
  *  of the clamp instead of a second copy here that could drift. */
 
 import { rawNow } from '../core/clock';
+import { hasRecentUserInput, msSinceUserInput } from '../core/userActivity';
 import { getFrameProfile, resetFrameProfile } from '../core/frameProfiler';
 import { onWorldSwap } from '../core/ecs/world';
 import { getActiveRenderer } from '../core/activeRenderer';
@@ -79,10 +80,24 @@ export const PROMOTION_BOUNDARY_GRACE_MS = 15_000;
  *  is postfx-demo's 16.5 s on a Huawei Y6 (`scene3DSync.ts`), and 30 s clears it. */
 export const ARM_BACKSTOP_MS = 30_000;
 
+/** How recently a human must have touched the device for the frame profile to count as evidence.
+ *
+ *  Sized off the LONGER of the two sustain windows the policy uses (`PROMOTION_HOLD_MS` 5 s,
+ *  `DEMOTION_HOLD_MS` 2 s): a decision needs at most that much evidence, so requiring input inside
+ *  the same span means the frames that voted were plausibly measured while somebody was playing.
+ *  Shorter would let a governor that has not yet dropped clocks vote; much longer would let one
+ *  that already has. */
+export const IDLE_EVIDENCE_MS = 5_000;
+
 let state: TierChangeState = freshTierChangeState();
 let lastCheck = 0;
 /** Whether the "held at the assessed ceiling" explanation has already been printed this session. */
 let loggedHold = false;
+/** Whether the "calibration is idle" explanation has already been printed this session. */
+let loggedIdle = false;
+/** Was the previous tick inside an idle window? Drives the one-shot window drop on the way OUT —
+ *  see the idle gate in {@link tickTierCalibration}. */
+let wasIdle = false;
 /** A promotion waiting for a scene boundary. Promotions are NOT applied where they are decided —
  *  see `applyPendingPromotion`. `since` is when it was queued, for {@link PROMOTION_BOUNDARY_GRACE_MS}. */
 let pendingPromotion: { tier: QualityTier; reason: string; since: number } | null = null;
@@ -107,6 +122,8 @@ export function resetTierCalibration(): void {
   lastCheck = 0;
   pendingPromotion = null;
   loggedHold = false;
+  loggedIdle = false;
+  wasIdle = false;
   armed = false;
   firstTickAt = -1;
   switchInFlight = false;
@@ -392,6 +409,56 @@ export function tickTierCalibration(now: number = rawNow()): void {
     }
     // Return either way: `armTierCalibration` just dropped the profile window, so there is nothing
     // to judge on this tick regardless of which branch armed it.
+    return;
+  }
+
+  // ⭐ AN IDLE WINDOW IS NOT EVIDENCE EITHER (owner, 2026-08-20). Exactly the rule the `armed`
+  // gate above applies to load frames, applied to the other window that does not describe the
+  // device the player plays on: mobile CPU governors drop clocks when nothing is being touched,
+  // so an idle sample measures a THROTTLED phone, not a slow one.
+  //
+  // Measured on a Galaxy S22 — the most powerful Android handset in the lab — idle on Court's
+  // tutorial (bug `lvROp0yDYPSzS0VZM6LH`): ~41.6 ms medians against a 20 ms budget walked it
+  // `high → mid → low` in ~66 ticks, while the GPU identity table had deterministically resolved
+  // `high` on the same phone at boot. The demotion is sticky in the direction that hurts — the
+  // player taps, the CPU unthrottles, and the game is now on `low` (pixelRatioCap 1, shadows off,
+  // ibl off, textureMaxSize 512) on a flagship. It is not lab-specific either: reading a tutorial,
+  // taking a call, or looking away is the same window.
+  //
+  // BOTH DIRECTIONS, for the reason the `armed` gate gives: letting one through would make the
+  // window's meaning depend on which way it happened to point. The cost, stated: a device that
+  // genuinely cannot render gets no relief while nobody is touching it — cheap, because the knobs
+  // a demotion turns (DPR, shadows, frame cap) change how a game LOOKS to a player who, by
+  // construction, is not interacting with it.
+  if (!hasRecentUserInput(now, IDLE_EVIDENCE_MS)) {
+    // Not silent. A project whose input never reaches `noteUserInput` (a custom InputSource that
+    // does not call it) would otherwise have calibration disabled forever with nothing to say so —
+    // the same no-silent-caps rule the listings follow. Once per session, and only after the
+    // backstop, so an ordinary pause never prints.
+    if (!loggedIdle && msSinceUserInput(now) >= ARM_BACKSTOP_MS) {
+      loggedIdle = true;
+      console.warn(
+        `[qualityTier] calibration idle for ${Math.round(msSinceUserInput(now) / 1000)}s — the `
+        + 'frame profile is not being judged, because a device nobody is touching is throttled '
+        + 'rather than slow. If this game DOES take input, its InputSource should call '
+        + 'noteUserInput() (runtime/core/userActivity.ts).',
+      );
+    }
+    wasIdle = true;
+    return;
+  }
+  if (wasIdle) {
+    // COMING BACK is where the window has to be dropped, not going away. The frame profiler keeps
+    // filling its ring throughout the idle stretch, and the sustain clocks
+    // (`overBudgetSince`/`headroomSince`) keep whatever they held when input stopped — so without
+    // this, the first interacting tick judges a ring full of throttled frames against a clock that
+    // has been running the whole time, and demotes instantly on evidence that was almost entirely
+    // idle. That is the reported bug in slow motion. Same shape as `armTierCalibration`, and the
+    // same consequence: there is nothing to judge on THIS tick, by construction.
+    wasIdle = false;
+    state = freshTierChangeState();
+    resetFrameProfile();
+    lastCheck = now;
     return;
   }
 

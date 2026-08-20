@@ -25,7 +25,7 @@ import {
   registerSprite, unregisterAsset, isGuid,
 } from '../../runtime/loaders/assetManifest';
 import { markScene2DDirty } from '../../runtime/rendering/Scene2D';
-import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
+import { registerHandleProvider, clampHandleToOwner, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 import { createCoalescedEdit, type CoalescedEdit } from './coalescedEdit';
 import { BufferedNumberInput } from './fields';
 
@@ -155,23 +155,34 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
       if (!rect.width || !rect.height) return [];
       const out: InteractionHandle[] = HANDLES.map((h) => {
         const hp = handlePos(s.rect, h);
+        // The canvas ELEMENT is `Math.round(imgDims.h * scale)` px tall while this is the
+        // unrounded product, so a handle on the sheet's far edge lands up to half a pixel
+        // outside its own canvas and Enact refuses it. See `clampHandleToOwner` — the clamp is
+        // tolerance-limited on purpose, so a genuinely scrolled-away handle stays refused.
+        const p = clampHandleToOwner(rect.left + hp.x * st.scale, rect.top + hp.y * st.scale, rect);
         return {
           id: `sprite:handle:${s.guid}:${h}`,
           kind: 'slice-handle',
           editor: 'sprite',
-          x: rect.left + hp.x * st.scale,
-          y: rect.top + hp.y * st.scale,
+          x: p.x,
+          y: p.y,
           label: `${s.name} ${h}`,
           meta: { guid: s.guid, name: s.name, handle: h, rect: s.rect },
           owner: canvas,
         };
       });
+      // Same edge case: a pivot at 1.0 on a slice that reaches the sheet's edge.
+      const pv = clampHandleToOwner(
+        rect.left + (s.rect.x + s.rect.w * s.pivot.x) * st.scale,
+        rect.top + (s.rect.y + s.rect.h * s.pivot.y) * st.scale,
+        rect,
+      );
       out.push({
         id: `sprite:pivot:${s.guid}`,
         kind: 'slice-pivot',
         editor: 'sprite',
-        x: rect.left + (s.rect.x + s.rect.w * s.pivot.x) * st.scale,
-        y: rect.top + (s.rect.y + s.rect.h * s.pivot.y) * st.scale,
+        x: pv.x,
+        y: pv.y,
         label: `${s.name} pivot`,
         meta: { guid: s.guid, name: s.name, pivot: s.pivot },
         owner: canvas,

@@ -2,6 +2,7 @@
 
 import * as THREE from 'three';
 import { decomposeTrs } from '../core/ecs/decomposeTrs';
+import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import type { World } from 'koota';
 // See SceneView.tsx for the rationale on the published-entry import.
 import type { WebGPURenderer } from 'three/webgpu';
@@ -3207,6 +3208,11 @@ export async function prewarmShadersForWorld(
   renderer: WebGPURenderer | THREE.WebGLRenderer,
   camera: THREE.PerspectiveCamera,
 ): Promise<void> {
+  // Boot timeline (#238): shader prewarm is one of the three boot phases the stall could be
+  // hiding in, and the only one whose cost was ever attributed (wrongly, twice) from frame
+  // markers. Two spans, not one — the scene BUILD and the actual `compileAsync` are different
+  // costs and the earlier guesses could not tell them apart.
+  const prewarmSpan = beginBootSpan('shader-prewarm');
   const prewarmScene = new THREE.Scene();
   let count = 0;
 
@@ -3296,12 +3302,14 @@ export async function prewarmShadersForWorld(
 
   // compileAsync is available on both WebGLRenderer (r152+) and WebGPURenderer.
   const compile = (renderer as THREE.WebGLRenderer).compileAsync;
+  const compileSpan = beginBootSpan('shader-compile', `${count} pairs`);
   if (typeof compile === 'function') {
     await (renderer as THREE.WebGLRenderer).compileAsync(prewarmScene, camera);
   } else {
     // Fallback: synchronous compile (still better than first-frame-stutter)
     (renderer as THREE.WebGLRenderer).compile?.(prewarmScene, camera);
   }
+  endBootSpan(compileSpan);
 
   // Dispose prewarm-owned objects but leave GLB template geometries/materials
   // (and the shared envCache-owned environment) alone.
@@ -3316,6 +3324,7 @@ export async function prewarmShadersForWorld(
   }
   prewarmScene.environment = null; // detach shared env before clear
   prewarmScene.clear();
+  endBootSpan(prewarmSpan);
 }
 
 // ── Renderer creation ───────────────────────────────────
@@ -3438,7 +3447,9 @@ export async function makeWebGPURenderer(
   let r = make(startForceWebGL);
   container.appendChild(r.domElement);
   try {
-    await r.init();
+    // Device/adapter acquisition + backend init — the one boot cost that happens before any
+    // asset exists, and therefore the one a scene-shaped hypothesis can never explain (#238).
+    await bootSpanAsync('renderer-init', () => r.init(), startForceWebGL ? 'webgl2' : 'webgpu');
   } catch (e) {
     // If we already started on WebGL2 there's nothing left to fall back to.
     if (startForceWebGL) throw e;

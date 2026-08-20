@@ -39,6 +39,7 @@ export { UIElement, type UILengthUnit } from './UIElement';
 export { UIBinding } from './UIBinding';
 export { UIAction } from './UIAction';
 export { UIFocusable } from './UIFocusable';
+export { UIToggle } from './UIToggle';
 export { UIAnchor } from './UIAnchor';
 export { Canvas2D, type Canvas2DScaleMode } from './Canvas2D';
 export { NPRPostFX } from './NPRPostFX';

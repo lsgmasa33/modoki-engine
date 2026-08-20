@@ -804,7 +804,7 @@ export default function Scene3D() {
           capturing = false;
         }
       };
-      registerSceneRenderer(offscreenRender);
+      registerSceneRenderer(offscreenRender, 'game-3d');
 
       // ── Screen-bounds provider (layout-bounds agent op) ── project each entity's
       // live world AABB through the GAME camera to a viewport CSS rect, so an agent

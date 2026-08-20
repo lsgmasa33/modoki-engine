@@ -435,23 +435,41 @@ export default function AnimationEditor() {
   // ── Cmd+S inside the envelope: hand the save a way to put the preview down and back up ──
   // Registered only while WE are previewing, so the save never calls into a panel that has since
   // exited. `resume` re-poses at the current playhead, and `pose` re-opens the session for it.
-  useEffect(() => {
-    if (!inPreview) return;
-    const mine: PreviewSaveHandler = {
+  // `pose` is read through a ref so the handler OBJECT can be stable: `suspend()` rebuilds the
+  // world and re-resolves the Animator root, so the `pose` closure captured at registration time
+  // is dead by the time `resume()` runs. This panel's registration happens to survive a save cycle
+  // (`endAnimationPreview` does not touch `inPreview`, so the effect below is not torn down) —
+  // unlike the Timeline panel's, which the suspend deregistered and which is why `saveCommand`
+  // now falls back to the handler it started with (bug `tSv0EWjWICpEl9HSjRe9`). That fallback is
+  // only safe if a captured handler still calls the CURRENT closures, so both panels dispatch
+  // through a ref rather than only the one that needed it.
+  const poseRef = useRef(pose);
+  poseRef.current = pose;
+  // See TimelineEditor: a finished save cycle uses this to tell a CLOSED panel (do not resume)
+  // from one that merely deregistered itself (resume).
+  const mountedRef = useRef(true);
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
+  const saveHandlerRef = useRef<PreviewSaveHandler | null>(null);
+  if (!saveHandlerRef.current) {
+    saveHandlerRef.current = {
       owner: 'animation',
+      isLive: () => mountedRef.current,
       suspend: () => endAnimationPreview(true),
       resume: () => {
         const st = useEditorStore.getState();
         setInPreview(true);
-        pose(st.editingAnimationClip, st.playheadTime);
+        poseRef.current(st.editingAnimationClip, st.playheadTime);
       },
     };
+  }
+  useEffect(() => {
+    if (!inPreview) return;
+    const mine = saveHandlerRef.current!;
     setPreviewSaveHandler(mine);
-    // Guarded: this effect re-runs whenever `pose` changes (a rebind does that), and the OTHER
-    // panel registers from its own effect — an unconditional clear deletes whichever registration
-    // happens to be current, including one we do not own.
+    // Guarded: the OTHER panel registers from its own effect — an unconditional clear deletes
+    // whichever registration happens to be current, including one we do not own.
     return () => clearPreviewSaveHandler(mine);
-  }, [inPreview, pose]);
+  }, [inPreview]);
 
   // ── Preview playback loop ──
   // Also inside the preview envelope: it poses authored traits every frame exactly like a scrub,

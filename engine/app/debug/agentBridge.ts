@@ -100,6 +100,8 @@ import { computeDiagnostics } from './diagnose';
 import {
   startCapture, stopCapture, clearCapture, getCapture, readPerfProfile,
   resetProfilerMarkers, resetMarkerAggregate, resetFrameProfile, type MarkerSample,
+  getBootTimeline, getBootOrigin, bootSpansOverlapping, resetBootTimeline, getWorstStallWindow,
+  getFrameProfile,
   setGpuTimingEnabled, resetGpuTimings,
   collectHitRegions, hitRegionProviders, isHitRegionOverlayVisible, setHitRegionOverlayVisible,
   regionsAt, nearestRegionTo,
@@ -896,12 +898,60 @@ registerAgentOp('profiler', (raw: unknown) => {
     }
     case 'gpu-off':
       return { gpuTiming: setGpuTimingEnabled(false) };
+    // #238 — the boot-phase read. The frame profiler can say a cold boot froze for 1,814 ms; it
+    // cannot say what was open across it, and three attributions guessed from frame markers were
+    // all wrong. This intersects the recorded stall window with the boot timeline, so the answer
+    // is a measurement rather than a hypothesis. Summary-first like every read here: the stall
+    // overlap and the costliest spans, with the full timeline behind `all:true`.
+    case 'boot': {
+      const tl = getBootTimeline();
+      const stall = getWorstStallWindow();
+      const origin = getBootOrigin();
+      const round = (v: number) => +v.toFixed(1);
+      const row = (sp: { name: string; startMs: number; endMs: number; detail?: string }) => ({
+        name: sp.name, ...(sp.detail !== undefined ? { detail: sp.detail } : {}),
+        startMs: round(sp.startMs),
+        // An open span reports `durMs: -1` rather than a plausible number. A span that never
+        // closed is the most interesting row on the page (it may BE the stall) and must not be
+        // disguised as a finished one.
+        durMs: sp.endMs < 0 ? -1 : round(sp.endMs - sp.startMs),
+      });
+      // Relative to the boot origin, so every number in this response is on one axis.
+      const stallRel = stall ? { startMs: round(stall.startMs - origin), endMs: round(stall.endMs - origin) } : null;
+      const closed = tl.spans.filter((sp) => sp.endMs >= 0);
+      const limit = Math.max(1, Math.min(200, Number(params.limit ?? 15)));
+      const out: Record<string, unknown> = {
+        spanCount: tl.spans.length,
+        dropped: tl.dropped,
+        // Announced rather than implied: a full timeline is TRUNCATED AT THE TAIL, so a missing
+        // phase may simply be past the cap.
+        recordingStopped: tl.full,
+        worstStallMs: round(getFrameProfile().worstStallMs),
+        stall: stallRel,
+        duringStall: stallRel
+          ? bootSpansOverlapping(stallRel.startMs, stallRel.endMs).slice(0, limit)
+              .map((sp) => ({ ...row(sp), overlapMs: round(sp.overlapMs) }))
+          : [],
+        top: [...closed].sort((a2, b2) => (b2.endMs - b2.startMs) - (a2.endMs - a2.startMs)).slice(0, limit).map(row),
+        open: tl.spans.filter((sp) => sp.endMs < 0).slice(0, limit).map(row),
+      };
+      if (!stallRel) out.note = 'No frame has been dropped yet — nothing to attribute. Cold-boot the app and read again.';
+      if (params.all) out.timeline = tl.spans.map(row);
+      return out;
+    }
+    case 'boot-reset':
+      resetBootTimeline();
+      return { reset: true };
     case 'reset':
       resetProfilerMarkers();
       resetMarkerAggregate();
       resetFrameProfile();
       resetGpuTimings();
       clearCapture();
+      // NOT the boot timeline: `reset` is for starting a clean measurement of the LIVE window,
+      // and boot is over by then. Wiping it here would mean the one read that answers #238 is
+      // destroyed by the routine call an agent makes before measuring anything. `boot-reset`
+      // exists for the deliberate case (re-arming across a scene swap).
       return { reset: true };
     case 'read':
     default:
