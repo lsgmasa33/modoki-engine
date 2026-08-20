@@ -12,10 +12,21 @@
  *  This is the repo's recurring Windows-only path class (CLAUDE.md: five such fixes in six months,
  *  every one invisible to a Mac clone), and the reason `targets: editor-win` exists in the QA
  *  suite. A Mac cannot reproduce it — so `toPosix` splits on BOTH separators instead of
- *  `path.sep`, which is what makes the assertions below non-vacuous here. A `path.sep`
- *  implementation would return a Windows path unchanged on this machine and these tests would
- *  fail, which is exactly the guard behaviour wanted: the fix cannot silently regress to the
- *  platform-dependent form. */
+ *  `path.sep`, which is what lets the literal-input tests below run the Windows shape from here.
+ *
+ *  ⚠️ BE PRECISE ABOUT WHICH TESTS CARRY THE REGRESSION, because it is not all of them.
+ *  Measured by reverting `toPosix` to `p.split(path.sep).join('/')` and running this file:
+ *  **2 of the 5 fail — only the two that hand `toPosix` a hardcoded backslash literal**
+ *  ("converts a Windows-separated path" and "normalizes a mixed-separator path"). The other
+ *  three — idempotence, and the two that walk the REAL tree — pass either way on macOS/Linux,
+ *  because `path.relative` emits no backslash here regardless of how `toPosix` splits. They are
+ *  worth keeping (they pin the property at the seam `walkClosure`'s callers actually consume,
+ *  and would catch a normalization dropped from one of the three seams) but they carry ZERO
+ *  coverage of the Windows bug on a POSIX machine.
+ *
+ *  So: the two literal-input tests ARE the regression guard. Do not "deduplicate" them against
+ *  the tree-walk tests as redundant special cases — that would leave the whole file green on
+ *  ubuntu and macOS with the bug fully restored. */
 
 import { describe, expect, it } from 'vitest';
 import path from 'node:path';

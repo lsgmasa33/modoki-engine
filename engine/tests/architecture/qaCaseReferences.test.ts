@@ -575,7 +575,22 @@ describeCases('QA case references', () => {
         // and is never run; one that loses it and keeps the tag sends a Windows session chasing a
         // case it cannot run. Both are the false-pass/never-run hazard the target split exists to
         // prevent, so the tag is derived here rather than trusted.
-        const title = (f.title as string) ?? '';
+        // ⚠️ `f.title` is NOT guaranteed to be a string. `parseFrontmatter` treats any value that
+        // starts with `[` and ends with `]` as an inline LIST — and this tag convention makes every
+        // Windows case's title start with `[`, so one that also ends with `]` (a title closing on a
+        // bracketed term, e.g. "… gated by the [OTA] flag") parses to an array. Calling a string
+        // method on that throws and takes the WHOLE guard file down instead of reporting a scoped
+        // problem — the "fails in the worst possible way" outcome this suite's header exists to
+        // prevent. Report it as a problem rather than crashing on it.
+        const rawTitle = f.title;
+        if (rawTitle !== undefined && typeof rawTitle !== 'string') {
+          problems.push(
+            `${c.rel}: title parsed as ${Array.isArray(rawTitle) ? 'a list' : typeof rawTitle}, not a string — ` +
+              `a title that starts with "[" and ends with "]" is read as inline YAML. Reword it so it ` +
+              `does not end with "]".`,
+          );
+        }
+        const title = typeof rawTitle === 'string' ? rawTitle : '';
         const hasWin = targets.includes('editor-win') || targets.includes('packaged-win');
         const hasMac = targets.includes('editor') || targets.includes('packaged-mac');
         const want = hasWin ? (hasMac ? '[mac+win] ' : '[win] ') : '';

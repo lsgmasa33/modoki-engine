@@ -40,7 +40,11 @@ for (const proj of process.argv.slice(2)) {
   const dir = path.join(ROOT, proj, 'runtime/assets/scenes');
   if (!fs.existsSync(dir)) { console.log(`${proj}: no scenes dir`); continue; }
   for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.scene.json'))) {
-    const rel = path.relative(ROOT, path.join(dir, f));
+    // POSIX-normalized: git addresses tree objects with FORWARD SLASHES on every OS, so a
+    // `path.relative` result would make `git show HEAD:"<rel>"` throw on Windows for every
+    // committed file — and the catch below reports that as "NEW FILE (untracked)", so the
+    // whole review gate silently stops diffing. Same class as the importClosure fix (30c84cdc0).
+    const rel = path.relative(ROOT, path.join(dir, f)).split(path.sep).join('/');
     totalScenes++;
     let old;
     try { old = execSync(`git show HEAD:"${rel}"`, { cwd: ROOT, encoding: 'utf8' }); }
