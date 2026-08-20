@@ -154,6 +154,96 @@ journal, which `setJournalEnabled` switches off in a release build.
   report-the-report bounce is the game wrapper's own once-per-message latch. Measured at two
   messages and pinned by a test.
 
+### Deliberate native fault triggers (#278)
+
+The sibling of the above, for everything that does **not** originate in JavaScript.
+`GameDebug.triggerFault({ kind })` (`capacitor-game-debug`) raises a real `SIGSEGV` /
+`EXC_BAD_ACCESS`, an uncaught Java exception, or a 15 s block of Android's main looper, exposed as
+the **Faults** section of the debug menu's Device tab. The reasoning, the platform asymmetry, and
+the three ways a run can report nothing while working correctly are in
+[debug-menu.md](debug-menu.md) § "Faults".
+
+Two facts belong here rather than there, because they are about the native plugin:
+
+- **iOS had no native gate before this.** Android refuses every `GameDebugPlugin` method unless the
+  manifest meta-data is on; the Swift half checked nothing, and stayed out of shipped games only
+  because JS never called `startServer`. Harmless for a server nobody starts, not harmless for a
+  method that kills the app — hence the `ModokiDebugBuild` Info.plist key, written both ways by
+  `healNativeConfig` and read by `isDebugBuildEnabled()`.
+- **The gate is deliberately NOT retrofitted onto `startServer`** in the same change. It fails
+  closed, so every project would lose the iOS bridge at once, on a heal nobody has run yet.
+
+### Android native crashes — the NDK artifact (#279)
+
+The Android sibling of the dSYM gap, and it has the same shape: the report arrives, and it is
+useless. `firebase-crashlytics` alone installs a JAVA handler, which never sees a signal — so a
+genuine `SIGSEGV` produced only the `ApplicationExitInfo reason=5 (APP CRASH(NATIVE))` row
+Crashlytics reconstructs on the next launch, with no stack.
+
+`games/court/android/app/build.gradle` now carries
+`com.google.firebase:firebase-crashlytics-ndk`, pinned to the same version
+`@capacitor-firebase/crashlytics` resolves (they are a matched pair, and a mismatch fails at
+runtime rather than at resolution — i.e. silently). Verified with #278's `crash` probe on an S22:
+`libcrashlytics-handler.so` ships in the APK, and logcat goes from `convertApplicationExitInfo` to
+`Minidump file exists` → `Finalizing native report for session …`. The full before/after is in
+[debug-menu.md](debug-menu.md) § Faults.
+
+Deliberately NOT enabled: `nativeSymbolUploadEnabled`. It uploads symbols for the app's own
+unstripped `.so` files, and Court ships none — a crash in libc or libart is symbolicated by neither
+setting. The artifact is what makes the crash REPORTED at all; symbol upload would only sharpen a
+stack we do not have. Turn it on if a project ever ships its own native code.
+
+### iOS symbolication — dSYMs (#279)
+
+An iOS crash report without a dSYM is a list of raw addresses. Court's dashboard read **"This app
+has 8 unprocessed crashes. Upload 1 dSYM file to process them."** — while a build phase named
+`Upload Crashlytics dSYMs` had been sitting in its pbxproj since #275, doing nothing.
+
+**Why it did nothing, and why that is the interesting part.** The phase gated itself on
+`DEBUG_INFORMATION_FORMAT = dwarf-with-dsym` and said, in a comment, that a skip was *"expected in
+Debug"*. It was — Xcode's Debug default is plain `dwarf`, which produces no dSYM at all. But **Debug
+is the configuration every device build we test with uses**, including the crash probes, so the
+phase was armed only in the configuration nobody debugs with. It reported its own skip correctly on
+every build and nobody read the line.
+
+`healNativeConfig` now owns both halves, for any project depending on
+`@capacitor-firebase/crashlytics`:
+
+- `DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"` in **every** configuration — rewriting the ones
+  that name `dwarf` and adding the key to the ones that omit it.
+- The upload phase itself, generalized out of Court's hand-edited pbxproj (deferred from #275,
+  which is why `games/3d-test` never had it). Strip-and-reinsert on every heal, so editing the
+  script text updates existing projects instead of pinning them to whatever they were healed with.
+
+**The manual tool** — `npm run upload:dsyms -- <projectDir> [--upload] [--dsym <path>]` — covers
+what a build phase cannot: crashes already in the console, an `.xcarchive` from TestFlight, a dSYM
+that arrived some other way.
+
+⚠️ **It LISTS by default and uploads only on `--upload`, and that asymmetry is deliberate.** The
+first version had it the other way round, with `--dry-run` to preview — and
+`npm run upload:dsyms games/court --dry-run` **silently loses the flag**, because `--dry-run` is one
+of npm's own options. Measured: npm echoed `node engine/scripts/upload-dsyms.mjs games/court` and
+the tool uploaded for real. A safety flag the runner can swallow is worse than none, so the
+destructive direction carries the word.
+
+⚠️ **Its load-bearing detail is picking the right DerivedData.** Every Capacitor project's Xcode
+project is literally named `App`, so `~/Library/Developer/Xcode/DerivedData/App-*` matches every
+game on the machine — and with several clones of this repo it matches the same game several times
+(measured: three `App-*` dirs whose workspace is `<clone>/games/court/ios/App/App.xcodeproj`). The
+tool matches the absolute `WorkspacePath` in each candidate's `info.plist`. A newest-wins or
+substring heuristic would upload a sibling clone's symbols and **fail silently**: Crashlytics
+accepts them, and the crash stays unsymbolicated because the UUIDs do not match.
+
+Two limits worth knowing:
+
+- **The 8 already-unprocessed crashes are probably unrecoverable.** They came from builds whose
+  dSYM never existed, so there is nothing to upload for those UUIDs. This fixes everything from the
+  next build onward.
+- **Crashlytics does not record a crash while a debugger is attached** — and on iOS ≤16 the only
+  automatable launch is `idevicedebug run`, which attaches one. So verifying an iOS crash REPORT on
+  the iPhone 8 needs the app started by tapping its icon; the crash TRIGGER can be verified either
+  way (the plugin call and the process death are both visible over the bridge).
+
 A worked example of a game filling the slot — including the Firebase wrapper, the Proxy-thenable
 trap, the gradle/dSYM wiring and the on-device verification — is
 [games/court/attribution.md](../games/court/attribution.md) § "Phase 7 — Crashlytics".

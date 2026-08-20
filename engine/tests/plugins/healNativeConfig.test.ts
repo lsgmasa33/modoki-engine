@@ -291,6 +291,184 @@ describe('healNativeConfig — iOS DEVELOPMENT_TEAM', () => {
   });
 });
 
+/** #278 — the iOS MIRROR of the Android `DEBUG_BUILD` meta-data, and the gate
+ *  `GameDebugPlugin.triggerFault` reads. Before it, the iOS plugin checked nothing at all: a
+ *  shipped binary would have carried a callable "kill the app" method. The key name is a contract
+ *  with `GameDebugPlugin.swift`'s `debugBuildPlistKey`. */
+/** #279 — iOS crash reports were arriving UNSYMBOLICATED. Court's pbxproj had carried an
+ *  "Upload Crashlytics dSYMs" phase since #275 and it exited early on every build, because
+ *  `DEBUG_INFORMATION_FORMAT` was plain `dwarf` in Debug — which is the configuration every device
+ *  build we test crash reporting with uses. The console accumulated 8 unprocessed crashes while
+ *  every signal said the phase was installed.
+ *
+ *  So the two halves are tested together, because either alone is inert: the SETTING (no dSYM
+ *  without it) and the PHASE (nothing uploads it). */
+describe('healNativeConfig — iOS Crashlytics dSYMs', () => {
+  const PBX = ['ios', 'App', 'App.xcodeproj', 'project.pbxproj'];
+  const readPbx = () => fs.readFileSync(path.join(root, ...PBX), 'utf8');
+
+  /** A pbxproj with the App target's buildPhases list + two build configurations: one naming
+   *  `dwarf` (Xcode's Debug default, spelled out) and one omitting the key entirely — the two
+   *  shapes the heal has to handle differently. */
+  function writeDsymPbx() {
+    const dir = path.join(root, 'ios', 'App', 'App.xcodeproj');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'project.pbxproj'), [
+      '// !$*UTF8*$!',
+      '{',
+      '/* Begin PBXNativeTarget section */',
+      '\t\t504EC3031FED79650016851F /* App */ = {',
+      '\t\t\tbuildPhases = (',
+      '\t\t\t\t504EC3001FED79650016851F /* Sources */,',
+      '\t\t\t\t504EC3021FED79650016851F /* Resources */,',
+      '\t\t\t);',
+      '\t\t};',
+      '/* End PBXNativeTarget section */',
+      '/* Begin PBXSourcesBuildPhase section */',
+      '/* End PBXSourcesBuildPhase section */',
+      '/* Begin XCBuildConfiguration section */',
+      '\t\t1111111111111111111111AA /* Debug */ = {',
+      '\t\t\tisa = XCBuildConfiguration;',
+      '\t\t\tbuildSettings = {',
+      '\t\t\t\tDEBUG_INFORMATION_FORMAT = dwarf;',
+      '\t\t\t};',
+      '\t\t\tname = Debug;',
+      '\t\t};',
+      '\t\t1111111111111111111111BB /* Release */ = {',
+      '\t\t\tisa = XCBuildConfiguration;',
+      '\t\t\tbuildSettings = {',
+      '\t\t\t\tPRODUCT_NAME = "$(TARGET_NAME)";',
+      '\t\t\t};',
+      '\t\t\tname = Release;',
+      '\t\t};',
+      '/* End XCBuildConfiguration section */',
+      '}',
+    ].join('\n'));
+  }
+
+  /** Crashlytics is the gate — a project without it has nothing to symbolicate. */
+  function writeCrashlyticsDep(withCrashlytics = true) {
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+      dependencies: withCrashlytics ? { '@capacitor-firebase/crashlytics': '^7.0.0' } : {},
+    }));
+  }
+
+  it('sets dwarf-with-dsym in EVERY configuration — including the one that omitted the key', () => {
+    writeDsymPbx();
+    writeConfig('');
+    writeCrashlyticsDep();
+    healNativeConfig(root);
+    const out = readPbx();
+    expect(out).not.toContain('DEBUG_INFORMATION_FORMAT = dwarf;');
+    // Two configs, so two occurrences — the rewritten one AND the one that had no key at all.
+    expect((out.match(/DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";/g) || []).length).toBe(2);
+  });
+
+  it('adds the upload phase — both the buildPhases reference and the object', () => {
+    writeDsymPbx();
+    writeConfig('');
+    writeCrashlyticsDep();
+    healNativeConfig(root);
+    const out = readPbx();
+    expect(out).toContain('DD0000000000000000000007 /* Upload Crashlytics dSYMs */,');
+    expect(out).toContain('isa = PBXShellScriptBuildPhase;');
+    expect(out).toContain('/* Begin PBXShellScriptBuildPhase section */');
+  });
+
+  // The failure this guards is a SECOND phase beside the first, which would upload twice and, worse,
+  // make the pbxproj's phase list disagree with what anyone reading it expects.
+  it('is idempotent — a second pass leaves the pbxproj byte-identical and adds no second phase', () => {
+    writeDsymPbx();
+    writeConfig('');
+    writeCrashlyticsDep();
+    healNativeConfig(root);
+    const once = readPbx();
+    healNativeConfig(root);
+    expect(readPbx()).toBe(once);
+    expect((readPbx().match(/Upload Crashlytics dSYMs/g) || []).length).toBe(3);
+  });
+
+  /** The property strip-and-reinsert exists FOR, and the one idempotence cannot see: a project
+   *  healed by an OLDER version of the engine carries that version's script text, and the next
+   *  heal must REPLACE it. A "skip if the phase is already there" implementation passes every
+   *  other test in this describe — measured, by mutating the heal to do exactly that: 101/101
+   *  green. So this test drives the distinguishing case, an existing phase whose body is stale. */
+  it('REPLACES a stale phase body rather than leaving the project on the old script', () => {
+    writeDsymPbx();
+    writeConfig('');
+    writeCrashlyticsDep();
+    healNativeConfig(root);
+    // Simulate a project healed by an older engine: same phase, same UUID, obsolete body.
+    // Line-wise, not a quoted-string regex: the real script body contains escaped quotes, so
+    // `"[^"]*"` stops inside it and silently matches nothing — which made the first version of this
+    // test fail on its own fixture rather than on the behaviour.
+    const aged = readPbx().split('\n')
+      .map((l) => (l.trimStart().startsWith('shellScript = ') ? '\t\t\tshellScript = "echo OLD-SCRIPT";' : l))
+      .join('\n');
+    fs.writeFileSync(path.join(root, ...PBX), aged);
+    expect(readPbx()).toContain('OLD-SCRIPT'); // the fixture is what we think it is
+
+    healNativeConfig(root);
+    expect(readPbx()).not.toContain('OLD-SCRIPT');
+    expect(readPbx()).toContain('Crashlytics symbol upload');
+    // and still exactly one phase, not the old one plus a new one
+    expect((readPbx().match(/Upload Crashlytics dSYMs/g) || []).length).toBe(3);
+  });
+
+  it('does nothing for a project without Crashlytics', () => {
+    writeDsymPbx();
+    writeConfig('');
+    writeCrashlyticsDep(false);
+    const before = readPbx();
+    healNativeConfig(root);
+    expect(readPbx()).toBe(before);
+  });
+});
+
+describe('healNativeConfig — iOS ModokiDebugBuild flag', () => {
+  const PLIST = ['ios', 'App', 'App', 'Info.plist'];
+  function writePlist(body: string) {
+    const dir = path.join(root, 'ios', 'App', 'App');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(root, ...PLIST),
+      `<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n${body}\n</dict>\n</plist>\n`);
+  }
+  const readPlist = () => fs.readFileSync(path.join(root, ...PLIST), 'utf8');
+
+  it('writes <true/> when build.debugBuild is on', () => {
+    writePlist('\t<key>CFBundleName</key>\n\t<string>x</string>');
+    writeConfig('', true);
+    writeGameDebugDep();
+    healNativeConfig(root);
+    expect(readPlist()).toContain('<key>ModokiDebugBuild</key>');
+    expect(readPlist()).toMatch(/<key>ModokiDebugBuild<\/key>\s*<true\/>/);
+  });
+
+  // The load-bearing direction. A write-once flag would leave the capability behind on a project
+  // that turned debugBuild off — which is precisely the state that must NOT be able to crash on
+  // demand.
+  it('flips to <false/> when build.debugBuild is turned off', () => {
+    writePlist('\t<key>CFBundleName</key>\n\t<string>x</string>');
+    writeConfig('', true);
+    writeGameDebugDep();
+    healNativeConfig(root);
+    writeConfig('', false);
+    healNativeConfig(root);
+    expect(readPlist()).toMatch(/<key>ModokiDebugBuild<\/key>\s*<false\/>/);
+    expect((readPlist().match(/ModokiDebugBuild/g) || []).length).toBe(1);
+  });
+
+  it('is idempotent — a second pass leaves the plist byte-identical', () => {
+    writePlist('\t<key>CFBundleName</key>\n\t<string>x</string>');
+    writeConfig('', true);
+    writeGameDebugDep();
+    healNativeConfig(root);
+    const once = readPlist();
+    healNativeConfig(root);
+    expect(readPlist()).toBe(once);
+  });
+});
+
 describe('healNativeConfig — iOS Local Network / Bonjour keys', () => {
   const PLIST = ['ios', 'App', 'App', 'Info.plist'];
   function writePlist(body: string) {

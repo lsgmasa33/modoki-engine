@@ -109,6 +109,10 @@ const GD_UUID = {
   stripPhase: 'DD0000000000000000000005',
   /** The archive-time "Debug build is ON" warning phase (#112 Phase 2). */
   archiveWarnPhase: 'DD0000000000000000000006',
+  /** The Crashlytics dSYM upload phase (#279). The value matches the UUID Court's pbxproj was
+   *  hand-edited with in #275, so healing that project REPLACES its phase rather than adding a
+   *  second one beside it. */
+  dsymUploadPhase: 'DD0000000000000000000007',
 } as const;
 
 /** RETIRED (#112) — the Release Info.plist-strip build phase. It deleted the two
@@ -178,6 +182,60 @@ const ARCHIVE_WARN_PHASE_BLOCK = [
   '/* End PBXShellScriptBuildPhase section */',
   '',
 ].join('\n');
+
+/** Name of the Crashlytics dSYM upload phase (#279) — matches the hand-edited phase #275 put in
+ *  Court's pbxproj, which is what lets the heal replace it in place. */
+const DSYM_PHASE_NAME = 'Upload Crashlytics dSYMs';
+
+/** The dSYM upload phase, as pbxproj text.
+ *
+ *  Apple's `run` script ships INSIDE the firebase-ios-sdk SPM checkout, under the derived-data
+ *  SourcePackages dir — hence the `${BUILD_DIR%/Build/*}` trim. A Capacitor project using
+ *  CocoaPods has a Pods copy, so both are tried before giving up.
+ *
+ *  It narrates every skip. A dSYM upload that quietly does nothing is indistinguishable from one
+ *  that worked until the day somebody reads a crash report and finds raw addresses — which is
+ *  exactly what happened here: this phase existed in Court for weeks, exited early on every build,
+ *  and the console accumulated 8 unprocessed crashes (#279). */
+const DSYM_PHASE_BLOCK = [
+  '/* Begin PBXShellScriptBuildPhase section */',
+  `\t\t${GD_UUID.dsymUploadPhase} /* ${DSYM_PHASE_NAME} */ = {`,
+  '\t\t\tisa = PBXShellScriptBuildPhase;',
+  '\t\t\tbuildActionMask = 2147483647;',
+  '\t\t\talwaysOutOfDate = 1;',
+  '\t\t\tfiles = (',
+  '\t\t\t);',
+  '\t\t\tinputPaths = (',
+  '\t\t\t\t"${DWARF_DSYM_FOLDER_PATH}/${DWARF_DSYM_FILE_NAME}/Contents/Resources/DWARF/${TARGET_NAME}",',
+  '\t\t\t\t"$(SRCROOT)/$(BUILT_PRODUCTS_DIR)/$(INFOPLIST_PATH)",',
+  '\t\t\t);',
+  `\t\t\tname = "${DSYM_PHASE_NAME}";`,
+  '\t\t\toutputPaths = (',
+  '\t\t\t);',
+  '\t\t\trunOnlyForDeploymentPostprocessing = 0;',
+  '\t\t\tshellPath = /bin/sh;',
+  '\t\t\tshellScript = "set -e\\n'
+    + '# Crashlytics symbol upload (#275, generalized in #279). Without it an iOS crash report comes\\n'
+    + '# back as raw addresses, which is the difference between a report and a puzzle.\\n'
+    + 'RUN=\\"${BUILD_DIR%/Build/*}/SourcePackages/checkouts/firebase-ios-sdk/Crashlytics/run\\"\\n'
+    + '[ -f \\"$RUN\\" ] || RUN=\\"${SRCROOT}/Pods/FirebaseCrashlytics/run\\"\\n'
+    + 'if [ ! -f \\"$RUN\\" ]; then\\n'
+    + '  echo \\"warning: Crashlytics dSYM upload SKIPPED - no run script found. Run \'npx cap sync ios\' and let Xcode resolve packages, or crash reports will not be symbolicated.\\"\\n'
+    + '  exit 0\\n'
+    + 'fi\\n'
+    + '# Modoki sets dwarf-with-dsym in EVERY configuration (#279), Debug included, because Debug is\\n'
+    + '# where the crash probes run. So a skip here is a defect in either configuration now, not the\\n'
+    + '# expected Debug behaviour it used to be.\\n'
+    + 'if [ \\"${DEBUG_INFORMATION_FORMAT}\\" != \\"dwarf-with-dsym\\" ]; then\\n'
+    + '  echo \\"warning: Crashlytics dSYM upload skipped - DEBUG_INFORMATION_FORMAT is \'${DEBUG_INFORMATION_FORMAT}\', so no dSYM exists. Reopen the project so healNativeConfig can fix it.\\"\\n'
+    + '  exit 0\\n'
+    + 'fi\\n'
+    + '\\"$RUN\\"\\n";',
+  '\t\t};',
+  '/* End PBXShellScriptBuildPhase section */',
+  '',
+].join('\n');
+
 
 /** The Gradle sibling of the iOS archive warning, fenced so the heal owns only its own
  *  lines in the hand-editable `android/app/build.gradle`. Warns when the task graph
@@ -656,6 +714,129 @@ function insertArchiveWarnPhase(pbx: string): string | undefined {
   return text.replace(anchor, ARCHIVE_WARN_PHASE_BLOCK + '\n' + anchor);
 }
 
+
+/** Does this project report to Crashlytics? Gate for {@link healIosCrashlyticsDsyms} — the dSYM
+ *  phase is meaningless without it, and adding one to every project would put a confusing
+ *  "no run script found" warning in builds that never wanted symbol upload. */
+function usesCrashlytics(projectRoot: string): boolean {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')) as
+      { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+    return Boolean(deps['@capacitor-firebase/crashlytics']);
+  } catch {
+    return false;
+  }
+}
+
+/** Make iOS crash reports SYMBOLICATED (#279) — two halves that only work together.
+ *
+ *  1. `DEBUG_INFORMATION_FORMAT = dwarf-with-dsym` in EVERY configuration, Debug included.
+ *  2. The `Upload Crashlytics dSYMs` build phase, generalized out of Court's hand-edited pbxproj
+ *     (#275) so any Crashlytics project gets it.
+ *
+ *  **Why Debug too, when Xcode's default is plain `dwarf` there.** Debug is where the crash probes
+ *  run (#278) and where every device build we test with comes from. Court had the phase for weeks
+ *  and it exited early on every single build — correctly, by its own rule — so the console
+ *  accumulated 8 crashes it could not process. A symbolication pipeline that is only armed in the
+ *  configuration nobody debugs with is not a pipeline. The cost is `dsymutil` on the app binary
+ *  per build, which is small next to the frameworks that already produce dSYMs.
+ *
+ *  Strip-then-reinsert, like the archive warning: a presence check would pin whatever script text
+ *  the project was first healed with, so editing {@link DSYM_PHASE_BLOCK} later would leave every
+ *  existing project on the old one. Re-deriving is still idempotent — identical output means
+ *  nothing is written. */
+function healIosCrashlyticsDsyms(projectRoot: string): string | undefined {
+  if (!usesCrashlytics(projectRoot)) return undefined;
+  const pbxPath = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  if (!fs.existsSync(pbxPath)) return undefined;
+  const orig = fs.readFileSync(pbxPath, 'utf8');
+
+  // `dwarf` may be absent entirely (Xcode omits the key and defaults to it), so set it on every
+  // XCBuildConfiguration rather than only rewriting the ones that spell it out.
+  let text = setDsymFormatEverywhere(orig);
+  const inserted = insertDsymPhase(removeDsymPhase(text));
+  if (inserted === undefined) return undefined; // anchor missing — bail without a partial edit
+  text = inserted;
+
+  if (text === orig) return undefined;
+  fs.writeFileSync(pbxPath, text);
+  return 'synced the Crashlytics dSYM upload phase + dwarf-with-dsym in every configuration (#279)';
+}
+
+/** Force `DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"` in every build configuration — rewriting
+ *  the ones that name it, and ADDING it to the ones that leave it to Xcode's default (which is
+ *  `dwarf` for Debug, i.e. no dSYM at all). Pure. */
+function setDsymFormatEverywhere(pbx: string): string {
+  const want = 'DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";';
+  return insertMissingDsymFormat(pbx.replace(/DEBUG_INFORMATION_FORMAT = [^;]+;/g, want), want);
+}
+
+/** Add the key to any `buildSettings` dict that lacks it. Split out so the regex walk is readable:
+ *  it scans dict-by-dict rather than globally, because "does this config already have the key" is
+ *  a per-dict question and a global `includes` would answer for the whole file. Pure. */
+function insertMissingDsymFormat(pbx: string, want: string): string {
+  const lines = pbx.split('\n');
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    out.push(lines[i]);
+    const open = /^(\t+)buildSettings = \{$/.exec(lines[i]);
+    if (!open) continue;
+    // Find this dict's extent to decide whether the key is already inside it.
+    let depth = 1;
+    let j = i + 1;
+    let has = false;
+    for (; j < lines.length && depth > 0; j++) {
+      if (/\{\s*$/.test(lines[j])) depth++;
+      if (/^\s*\};?\s*$/.test(lines[j])) depth--;
+      if (depth > 0 && lines[j].includes('DEBUG_INFORMATION_FORMAT')) has = true;
+    }
+    if (!has) out.push(`${open[1]}\t${want}`);
+  }
+  return out.join('\n');
+}
+
+/** Drop the dSYM phase's `buildPhases` reference AND its object. Mirrors
+ *  {@link removeArchiveWarnPhase}; see its comment for the line shapes. Pure. */
+function removeDsymPhase(pbx: string): string {
+  if (!pbx.includes(DSYM_PHASE_NAME)) return pbx;
+  const lines = pbx.split('\n');
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].includes(DSYM_PHASE_NAME)) { out.push(lines[i]); continue; }
+    if (/,\s*$/.test(lines[i])) continue;
+    if (/= \{\s*$/.test(lines[i])) {
+      while (i < lines.length && !/^\s*\};\s*$/.test(lines[i])) i++;
+      continue;
+    }
+    out.push(lines[i]);
+  }
+  return out.join('\n').replace(
+    /\/\* Begin PBXShellScriptBuildPhase section \*\/\n\/\* End PBXShellScriptBuildPhase section \*\/\n\n?/, '');
+}
+
+/** Add the dSYM phase's reference + object. LAST in `buildPhases` — it needs the dSYM the build
+ *  just produced. Returns undefined (bail, no partial edit) when the anchor is missing. Pure. */
+function insertDsymPhase(pbx: string): string | undefined {
+  const lines = pbx.split('\n');
+  const resIdx = lines.findIndex((l) => /^\s*[0-9A-Fa-f]{6,} \/\* Resources \*\/,$/.test(l));
+  if (resIdx < 0) return undefined;
+  // After Resources, skip any phases already listed (e.g. the archive warning) so this one is last.
+  let at = resIdx + 1;
+  while (at < lines.length && /^\s*[0-9A-Fa-f]{6,} \/\* .* \*\/,$/.test(lines[at])) at++;
+  lines.splice(at, 0, `\t\t\t\t${GD_UUID.dsymUploadPhase} /* ${DSYM_PHASE_NAME} */,`);
+  const text = lines.join('\n');
+
+  const sectionOpen = '/* Begin PBXShellScriptBuildPhase section */';
+  if (text.includes(sectionOpen)) {
+    return text.replace(sectionOpen,
+      sectionOpen + '\n' + DSYM_PHASE_BLOCK.split('\n').slice(1, -2).join('\n'));
+  }
+  const anchor = '/* Begin PBXSourcesBuildPhase section */';
+  if (!text.includes(anchor)) return undefined;
+  return text.replace(anchor, DSYM_PHASE_BLOCK + '\n' + anchor);
+}
+
 /** The Gradle sibling of {@link healIosArchiveWarning}. Appends (flag on) or removes
  *  (flag off) a fenced `taskGraph.whenReady` warning in `android/app/build.gradle`. */
 function healAndroidArchiveWarning(projectRoot: string, debugBuild: boolean): string | undefined {
@@ -1013,6 +1194,10 @@ const ANDROID_DEBUG_META_END = '        <!-- modoki:debug-build-end -->';
 /** Must match `GameDebugPlugin.META_DEBUG_BUILD`. */
 const ANDROID_DEBUG_META_NAME = 'com.modokiengine.gamedebug.DEBUG_BUILD';
 
+/** iOS Info.plist mirror of {@link ANDROID_DEBUG_META_NAME}. Read by
+ *  `GameDebugPlugin.swift`'s `isDebugBuildEnabled()` (#278). */
+const IOS_DEBUG_BUILD_PLIST_KEY = 'ModokiDebugBuild';
+
 /** Sync `build.debugBuild` into the Android app as an AndroidManifest `<meta-data>`
  *  the game-debug plugin reads (#112).
  *
@@ -1051,6 +1236,30 @@ function healAndroidDebugBuildMetaData(projectRoot: string, debugBuild: boolean)
   if (text === orig) return undefined;
   fs.writeFileSync(manifest, text);
   return `synced Android ${ANDROID_DEBUG_META_NAME}=${debugBuild} (from build.debugBuild)`;
+}
+
+/** Sync the iOS Info.plist's `ModokiDebugBuild` flag from `build.debugBuild` — the iOS MIRROR of
+ *  {@link healAndroidDebugBuildMetaData}, and the gate the plugin's fault triggers read (#278).
+ *
+ *  Until this existed, `GameDebugPlugin.swift` checked NOTHING: Android refuses every plugin
+ *  method unless its manifest meta-data is on, while iOS kept the bridge out of shipped games only
+ *  because JS never called `startServer`. That asymmetry was harmless for a server nobody starts
+ *  and is not harmless for `triggerFault`, which kills the app on demand — a release binary must
+ *  not carry a reachable way to do that.
+ *
+ *  Written BOTH ways (true and false), like the Local Network keys and unlike a
+ *  write-once flag: a project that turns `debugBuild` off must lose the capability on the next
+ *  heal, not keep it because the key was already there.
+ *
+ *  The KEY NAME is the contract with `GameDebugPlugin.debugBuildPlistKey` — keep them in sync. */
+function healIosDebugBuildInfoPlist(projectRoot: string, debugBuild: boolean): string | undefined {
+  const plist = path.join(projectRoot, 'ios', 'App', 'App', 'Info.plist');
+  if (!fs.existsSync(plist)) return undefined;
+  const orig = fs.readFileSync(plist, 'utf8');
+  const text = setPlistKey(orig, IOS_DEBUG_BUILD_PLIST_KEY, debugBuild ? '<true/>' : '<false/>');
+  if (text === orig) return undefined;
+  fs.writeFileSync(plist, text);
+  return `synced iOS ${IOS_DEBUG_BUILD_PLIST_KEY}=${debugBuild} (from build.debugBuild)`;
 }
 
 /** Sync the iOS deployment target from `build.iosMinVersion`.
@@ -1473,6 +1682,11 @@ export function healNativeConfig(projectRoot: string): HealResult {
     // Declare the app a game to the platform (#228) — unconditional, every Modoki output is one.
     const agm = healAndroidGameMode(projectRoot);
     if (agm) notes.push(agm);
+    // Symbolication (#279). Deliberately OUTSIDE the usesGameDebug block below and independent of
+    // build.debugBuild: whether crash reports are readable has nothing to do with the debug bridge,
+    // and a Release build needs it more, not less. It gates itself on Crashlytics being installed.
+    const ds = healIosCrashlyticsDsyms(projectRoot);
+    if (ds) notes.push(ds);
     // game-debug heals — only for a project that depends on the bridge. Every one of
     // these keys on build.debugBuild and NOTHING else (#112): the Xcode/Gradle
     // configuration means optimization + symbols, never "is this a debug build".
@@ -1489,6 +1703,8 @@ export function healNativeConfig(projectRoot: string): HealResult {
       if (s) notes.push(s);
       const am = healAndroidDebugBuildMetaData(projectRoot, debugBuild);
       if (am) notes.push(am);
+      const ip = healIosDebugBuildInfoPlist(projectRoot, debugBuild);
+      if (ip) notes.push(ip);
       // Phase 2 — a WARNING, never a refusal (TestFlight ships with the flag on).
       const iw = healIosArchiveWarning(projectRoot, debugBuild);
       if (iw) notes.push(iw);

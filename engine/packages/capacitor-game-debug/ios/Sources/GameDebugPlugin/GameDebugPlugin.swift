@@ -17,6 +17,7 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "getNativeLogs", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getDeviceIp", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getDeviceHardware", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "triggerFault", returnType: CAPPluginReturnPromise),
     ]
 
     private var listener: NWListener?
@@ -535,6 +536,65 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
                     "params": params,
                 ])
             }
+        }
+    }
+
+    // MARK: - Fault triggers (#278)
+
+    /// `Info.plist` key carrying the project's `build.debugBuild` — the iOS mirror of Android's
+    /// `com.modokiengine.gamedebug.DEBUG_BUILD` manifest meta-data. Written by
+    /// `healIosDebugBuildInfoPlist` (engine/plugins/healNativeConfig.ts); the NAME is the contract
+    /// between the two, so keep them in sync.
+    private static let debugBuildPlistKey = "ModokiDebugBuild"
+
+    /// Is `build.debugBuild` on for this app?
+    ///
+    /// Absent key → FALSE. Fail closed, exactly as Android does: a project that has not been
+    /// reopened since this landed loses the fault triggers rather than shipping a reachable way to
+    /// kill the app, and the reject message says how to turn them back on.
+    ///
+    /// ⚠️ This gate is deliberately NOT applied to `startServer` in the same change. That method
+    /// has been ungated on iOS since it was written, so failing it closed would take the debug
+    /// bridge away from every project at once, on a heal nobody has run yet. Retrofitting it is a
+    /// separate decision with a separate rollout — see #278.
+    private func isDebugBuildEnabled() -> Bool {
+        return Bundle.main.object(forInfoDictionaryKey: GameDebugPlugin.debugBuildPlistKey) as? Bool ?? false
+    }
+
+    /// Small delay between resolving the JS call and raising the fault, so the resolve marshals
+    /// back across the bridge before the process dies. Best effort, not a guarantee.
+    private static let faultDelaySeconds: TimeInterval = 0.25
+
+    /// Raise a deliberate native fault so the crash pipeline can be proven (#278).
+    ///
+    /// iOS supports `crash` ONLY. `anr` and `uncaught` are rejected rather than approximated:
+    /// iOS has no ANR — the watchdog (0x8badf00d) kills only during launch/suspend transitions,
+    /// not steady-state foreground, and Crashlytics does not report hangs at all. An approximation
+    /// here would produce a probe that appears to test something and tests nothing.
+    @objc func triggerFault(_ call: CAPPluginCall) {
+        guard isDebugBuildEnabled() else {
+            call.reject("Fault triggers disabled: build.debugBuild is off for this project "
+                        + "(Project Settings → Developer → \"Debug build\"). Rebuild after enabling it.")
+            return
+        }
+
+        let kind = call.getString("kind") ?? ""
+        switch kind {
+        case "crash":
+            NSLog("[GameDebug] triggerFault: dereferencing a bad pointer on purpose (#278)")
+            call.resolve(["ok": true])
+            DispatchQueue.main.asyncAfter(deadline: .now() + GameDebugPlugin.faultDelaySeconds) {
+                // A real EXC_BAD_ACCESS — the segfault shape — rather than `fatalError()`, which
+                // traps as SIGILL and reports as a different kind of fault.
+                let bad = UnsafeMutablePointer<Int>(bitPattern: 0x1)!
+                bad.pointee = 0
+            }
+        case "anr", "uncaught":
+            call.reject("Fault kind \"\(kind)\" is Android-only. iOS has no ANR (the watchdog fires "
+                        + "on launch/suspend transitions, not a foreground hang) and Crashlytics does not "
+                        + "report hangs — MetricKit MXHangDiagnostic is the oracle for those. Use \"crash\".")
+        default:
+            call.reject("Unknown fault kind \"\(kind)\" — iOS supports: crash.")
         }
     }
 

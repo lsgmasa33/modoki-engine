@@ -85,6 +85,11 @@ if (__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__) {
 // Side-effect import registers the tab; gated so a release build never bundles it.
 if (__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__) {
   import('./debug/GamesTab');
+  // Deliberate NATIVE fault triggers behind the Device tab's Faults section (#278) — an ANR, an
+  // uncaught Java exception, a real signal crash. Same gate for the same reason as the bridge: it
+  // kills the app on demand, so a release build must not carry a reachable way to do it. The
+  // module registers nothing off-device, and the native half refuses unless build.debugBuild is on.
+  import('./debug/nativeFaults');
 }
 
 // Native SDK init (Adjust/AppLovin) is no longer wired here — it moved into the

@@ -37,6 +37,11 @@ export {
 export {
   installGlobalErrorHandlers, captureToCrashlytics, reportReactError, type CaptureKind,
 } from './core/globalErrors';
+// Deliberate NATIVE fault triggers (#278) — the half of the crash pipeline JS cannot reach.
+// The app shell installs the implementation over capacitor-game-debug; the engine only owns the seam.
+export {
+  faultProvider, FAULT_LABELS, type FaultProvider, type FaultKind,
+} from './core/faultProvider';
 export {
   PlayerPrefs, InMemoryBackend, LocalStorageBackend, PreferencesBackend, selectDefaultBackend,
   type JsonValue, type PlayerPrefsInitOptions, type PrefsBackend,

@@ -102,7 +102,87 @@ the input-source guard.
 | **Prefs** | `PlayerPrefs` viewer — the engine-owned per-key JSON store (per-game namespace). |
 | **Cheats** | Auto-listed UIActions (`getUIActionNames` → `dispatchUIAction`) **plus** game `registerDebugCommand` buttons. |
 | **Console** | Ring-buffer view of captured `console.*` with a level filter + Clear. |
-| **Device** | Platform / viewport / screen / DPR / cores / memory / safe-area (refreshes on rotation), plus the **Backing resolution** A/B and the **`Re-run probe (idle)`** button below. The safe-area row reports the insets the LAYOUT is using, not a bare `env()` — in an editor device preview that is the simulated inset, because the probe reads `var(--ui-sa-*, env(…))` from inside the preview's cascade. Both halves are needed: the same expression probed off `document.body` still reads 0. |
+| **Device** | Platform / viewport / screen / DPR / cores / memory / safe-area (refreshes on rotation), plus the **Backing resolution** A/B, the **`Re-run probe (idle)`** button, and the **Faults** crash probes below. The safe-area row reports the insets the LAYOUT is using, not a bare `env()` — in an editor device preview that is the simulated inset, because the probe reads `var(--ui-sa-*, env(…))` from inside the preview's cascade. Both halves are needed: the same expression probed off `document.body` still reads 0. |
+
+### Faults — the deliberate native crash probes (Device tab, #278)
+
+The bottom section of the Device tab raises a **real native fault on purpose**, so the crash
+pipeline can be proven against the shapes JavaScript cannot reach.
+
+| Button | Android | iOS |
+|---|---|---|
+| **Native crash** | `SIGSEGV` (`Process.sendSignal(myPid(), 11)`) | bad-pointer deref → `EXC_BAD_ACCESS` |
+| **ANR (block main thread)** | blocks the real main looper 15 s | — |
+| **Uncaught Java exception** | `RuntimeException` on the UI thread | — |
+
+Why native at all: #275 proved the JS half end to end and could not reach any of this. Android's
+WebView renderer is a **separate sandboxed process**, so blocking the JS thread raises no ANR
+(measured at 8002 ms — nothing reported). A signal crash and an uncaught Java exception each take a
+different route into the crash reporter than `globalErrors.ts` can produce. Three pipelines; proving
+one says nothing about the other two.
+
+Things that will otherwise cost you a wrong verdict:
+
+- ⚠️ **Raising an ANR and REPORTING one are two different things, and each has its own step.**
+  The system raises an ANR on an INPUT/broadcast timeout, not on idle blocking, so you must **tap
+  the screen** during the block. The report then exists only if the process **dies** of it — so
+  choose **“Close app”** in the system dialog rather than waiting it out. Measured on an S22
+  (2026-08-20): a 15 s block that ended on its own produced a system-confirmed ANR
+  (`ANR in Window{…}. Reason: Input dispatching timed out … Waited 10011ms for MotionEvent`), no
+  `ApplicationExitInfo` record, and **no report at all**. Pressing “Close app” produced
+  `reason=6 (ANR)` and a report Crashlytics uploaded on the next launch. The default block is 45 s
+  so the dialog stays up long enough to press; pressing it kills the process, so the rest costs
+  nothing.
+- ⚠️ **A native crash uploads on the NEXT LAUNCH**, not at the moment it happens. Relaunch the app
+  before deciding a report is missing.
+- ⚠️ **Android REPORTING of a signal crash needs `firebase-crashlytics-ndk`** on the classpath —
+  the Java handler never sees a signal. Court has it as of #279; a project that does not will raise
+  a real SIGSEGV and produce only an `ApplicationExitInfo reason=5` row with no stack. Triggering
+  and reporting are separate questions, and the button only answers the first.
+- **iOS has no ANR** and is not given a fake one. The watchdog (`0x8badf00d`) fires on launch/suspend
+  transitions, not on a steady-state foreground hang, and Crashlytics does not report hangs at all —
+  MetricKit's `MXHangDiagnostic` is that oracle, a different subsystem. `anr`/`uncaught` are
+  **rejected with that reason** rather than approximated.
+- Each button is a **two-tap arm**, never a `confirm()` — a native modal blocks the whole renderer,
+  which would freeze the very thing an ANR probe is about to measure.
+
+**Verified on hardware, per shape** — Galaxy S22 (SM-S901U1, Android 14), Court `com.apiary.court`,
+2026-08-20. Each was driven through these buttons, not through the plugin directly:
+
+| Shape | System evidence | Reported |
+|---|---|---|
+| Uncaught Java exception | `FATAL EXCEPTION: main … java.lang.RuntimeException: [modoki] deliberate fault probe`, `ApplicationExitInfo reason=4 (APP CRASH(EXCEPTION))` | yes — `Handling uncaught exception … from thread main` |
+| ANR | `ANR in Window{…}. Reason: Input dispatching timed out … Waited 10011ms for MotionEvent`; after “Close app”, `reason=6 (ANR)` with a trace | yes, **only after “Close app”** — `collect_anrs: true` proven for the first time |
+| Native crash | `Fatal signal 11 (SIGSEGV) … in tid`, tombstone naming `GameDebugPlugin.lambda$triggerFault$5`, `reason=5 (APP CRASH(NATIVE)) status=11` | a report was enqueued for that session — from the `ApplicationExitInfo` record, **not** from an NDK handler |
+
+The native-crash row was initially weaker than it looks: without `firebase-crashlytics-ndk` on the
+classpath the Java handler never sees a signal, so what reached Crashlytics was the
+`ApplicationExitInfo` record Crashlytics reconstructs on the next launch — a row with no stack.
+Court gained the artifact in the #279 close-out, and the same probe on the same device then
+produced a genuine native report. The difference is visible in logcat, which is the cheap way to
+tell the two apart on any project:
+
+| | without the NDK artifact | with it |
+|---|---|---|
+| handler | — | `Crashlytics native component now available` |
+| capture | `convertApplicationExitInfo` (reconstructed after the fact) | `Minidump file exists` |
+| report | `Finalizing report for session …` | `Finalizing **native** report for session …` |
+
+Symbol upload for the app's OWN `.so` files (`nativeSymbolUploadEnabled`) is deliberately NOT
+turned on: Court ships no native code of its own, so there is nothing unstripped to upload, and a
+crash inside libc/libart is symbolicated by neither setting. The artifact is what makes the crash
+REPORTED; symbol upload would only sharpen a stack we do not have.
+
+**Gating.** Two independent gates, both keyed on `build.debugBuild`: the JS half is a side-effect
+import in `main.tsx` behind `__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__`, and the native half
+refuses unless the flag reached the native project — Android's manifest meta-data
+`com.modokiengine.gamedebug.DEBUG_BUILD`, iOS's Info.plist `ModokiDebugBuild` key, both written by
+`healNativeConfig`. A release build carries no reachable way to kill itself.
+
+**Wiring.** The engine owns only the seam: `runtime/core/faultProvider.ts` is a provider slot,
+because `@modoki/engine` does not depend on `capacitor-game-debug` (the app shell does). The
+implementation is installed by `engine/app/debug/nativeFaults.ts`. Off-device nothing provides it
+and the section says so, rather than offering buttons that resolve cheerfully and do nothing.
 
 ### Backing resolution — the live `pixelRatioCap` A/B (Device tab)
 

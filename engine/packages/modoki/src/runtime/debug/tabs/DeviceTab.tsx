@@ -14,6 +14,7 @@ import { runProbeForDiagnostics } from '../../rendering/tierResolve';
 import { TIER_ORDER, type QualityTier } from '../../rendering/qualityTier';
 import { forceResizeAllSurfaces } from '../../rendering/resizeBus';
 import { asCeiling, pickedCap, capButtonMarks, capRowCaption, type CapRowState } from './capRowMarks';
+import { FaultsSection } from './FaultsSection';
 
 interface Insets { top: string; right: string; bottom: string; left: string }
 
@@ -491,6 +492,9 @@ export function DeviceTab() {
           <span style={valStyle}>{v}</span>
         </div>
       ))}
+      {/* Deliberate native crash probes (#278). Last, and visually separated: everything above is
+          read-only diagnostics, and these kill the app. */}
+      <FaultsSection />
       <div style={{ ...rowStyle, marginTop: 4 }}>
         <span style={keyStyle}>User agent</span>
       </div>
