@@ -512,7 +512,20 @@ describe('UINode anchor CSS', () => {
   it('safeArea: stretch → all four insets', () => {
     const s = safeAreaStyle('stretch');
     for (const e of ['top', 'bottom', 'left', 'right']) expect(s).toContain(`env(safe-area-inset-${e})`);
-    expect(s).toMatch(/max\(0px,\s*env\(safe-area-inset-top\)\)/);
+    expect(s).toMatch(/max\(0px,\s*var\(--ui-sa-top,\s*env\(safe-area-inset-top\)\)\)/);
+  });
+
+  // The inset is emitted as `var(--ui-sa-*, env(...))`, not a bare `env()`. Both halves
+  // are load-bearing and this pins BOTH: the var is what lets an editor device preview
+  // simulate a notch (desktop `env()` is always 0, which is why a notched-phone layout
+  // was structurally invisible in the editor — #271), and the `env()` fallback is what
+  // every shipped build actually runs, since nothing sets the var there. Dropping the
+  // fallback would silently zero the safe area on real hardware.
+  it('safeArea: each edge is an overridable var with the real env() as its fallback', () => {
+    const s = safeAreaStyle('stretch');
+    for (const e of ['top', 'bottom', 'left', 'right']) {
+      expect(s).toContain(`var(--ui-sa-${e}, env(safe-area-inset-${e}))`);
+    }
   });
   it('safeArea: v-stretch (full height) → top + bottom only', () => {
     const s = safeAreaStyle('v-stretch');
@@ -535,11 +548,60 @@ describe('UINode anchor CSS', () => {
     expect(s).toContain('env(safe-area-inset-right)');
     expect(s).not.toContain('env(safe-area-inset-bottom)');
   });
-  it('safeArea: center (non-stretch) → NO safe-area padding (the button footgun)', () => {
+  it('safeArea: center reaches no edge → a genuine no-op, padding AND offset', () => {
     expect(safeAreaStyle('center')).not.toContain('env(safe-area-inset');
   });
-  it('safeArea: top-left (non-stretch corner) → NO safe-area padding', () => {
-    expect(safeAreaStyle('top-left')).not.toContain('env(safe-area-inset');
+
+  // A POINT anchor takes the inset as an OFFSET, never as padding (#272). Padding would
+  // inflate the element — a 44pt gear anchored top-right renders 106pt tall on a notched
+  // iPhone with its glyph shoved to the bottom — which is why the padding arm is
+  // stretch-gated. This used to assert "no safe area AT ALL" on a corner, and that was
+  // the defect wearing a test: a corner-anchored badge then had no way to clear the
+  // camera, and the Inspector greyed the checkbox out to say so.
+  const parsed = (a: string) => {
+    const s = safeAreaStyle(a);
+    return { style: s, hasPadding: /padding[^;]*safe-area-inset/.test(s) };
+  };
+  it('safeArea: top-left corner → offsets top and left, and pads NOTHING', () => {
+    const { style, hasPadding } = parsed('top-left');
+    expect(hasPadding).toBe(false);
+    expect(style).toContain('var(--ui-sa-top, env(safe-area-inset-top))');
+    expect(style).toContain('var(--ui-sa-left, env(safe-area-inset-left))');
+    expect(style).not.toContain('safe-area-inset-bottom');
+    expect(style).not.toContain('safe-area-inset-right');
+  });
+  it('safeArea: bottom-right corner → offsets bottom and right only', () => {
+    const { style, hasPadding } = parsed('bottom-right');
+    expect(hasPadding).toBe(false);
+    expect(style).toContain('var(--ui-sa-bottom, env(safe-area-inset-bottom))');
+    expect(style).toContain('var(--ui-sa-right, env(safe-area-inset-right))');
+    expect(style).not.toContain('safe-area-inset-top');
+    expect(style).not.toContain('safe-area-inset-left');
+  });
+
+  // The exclusivity is the anti-double-inset guarantee: every anchor takes exactly one
+  // arm. A stretched anchor pads (its CHILDREN move, its own box does not), a point
+  // anchor offsets (its box moves, its size does not), and none does both.
+  it('no anchor takes BOTH arms — padding and offset are mutually exclusive', () => {
+    const MODES = ['stretch', 'top', 'bottom', 'left', 'right', 'top-left', 'top-right',
+      'bottom-left', 'bottom-right', 'center', 'top-stretch', 'bottom-stretch',
+      'left-stretch', 'right-stretch', 'h-stretch', 'v-stretch'];
+    for (const m of MODES) {
+      const s = safeAreaStyle(m);
+      const pads = /padding[^;]*safe-area-inset/.test(s);
+      // An offset is a safe-area term reached through top/left rather than a padding.
+      const offsets = /(^|;)\s*(top|left):[^;]*safe-area-inset/.test(s);
+      expect(pads && offsets, `${m} took both arms`).toBe(false);
+    }
+  });
+
+  // The authored offset is composed with, not replaced: `top: 4vmin` on a notched phone
+  // must mean "4vmin BELOW the notch", which is what whoever wrote 4vmin meant.
+  it('safeArea composes with an authored offset instead of overwriting it', () => {
+    const s = styleAttr(renderNode(makeNode({
+      anchor: anchor({ anchor: 'top-right', safeArea: true, top: 4, topUnit: 'vmin' }),
+    })));
+    expect(s).toMatch(/top:\s*calc\([^;]*--ui-vmin[^;]*\+\s*var\(--ui-sa-top/);
   });
 });
 

@@ -14,7 +14,7 @@ import type { CSSProperties } from 'react';
 // modes stretch — that membership now decides offset semantics, not just pivot.
 import { STRETCH_X, STRETCH_Y, type AnchorData } from './anchorLayout';
 
-export type AnchorCssData = AnchorData & { safeArea?: boolean; zIndex?: number };
+export type AnchorCssData = AnchorData & { zIndex?: number };
 
 /** Compose a UIElement's tilt onto whatever transform the anchor already wrote (#234).
  *
@@ -40,6 +40,24 @@ export function applyRotationStyle(style: CSSProperties, degrees: number, a?: An
     style.transformOrigin = `${ox}% ${oy}%`;
   }
   style.transform = style.transform ? `${style.transform} rotate(${degrees}deg)` : `rotate(${degrees}deg)`;
+}
+
+/** The CSS expression for ONE safe-area edge: the editor's simulated inset if a device
+ *  preview set it, otherwise the real `env()`.
+ *
+ *  `env(safe-area-inset-*)` resolves to **0** on every desktop browser, so the editor
+ *  structurally could not show a notched-phone layout — which is not a cosmetic gap: it
+ *  is why a previous safe-area fix shipped unverified and had to be reverted (#271/#272).
+ *  The editor's device frame publishes `--ui-sa-*` from the preset
+ *  (`editor/scene/devicePresets.ts` → `safeAreaCssVars`) and the cascade applies it to
+ *  everything inside that preview.
+ *
+ *  The var is UNSET in every shipped build, so the fallback is what runs on device. That
+ *  is deliberate: no `isEditor` branch reaches the runtime, and the two paths cannot drift
+ *  because there is only one expression. It also stays LIVE — both a var and `env()`
+ *  re-resolve on orientation change with no runtime code. */
+function safeAreaInset(edge: 'top' | 'bottom' | 'left' | 'right'): string {
+  return `var(--ui-sa-${edge}, env(safe-area-inset-${edge}))`;
 }
 
 /** Mutate `style` in place with the absolute-positioning CSS for anchor `a`.
@@ -145,16 +163,56 @@ export function applyAnchorStyle(style: CSSProperties, a: AnchorCssData): void {
   // centered button rendered tall on a notched iPhone — the classic footgun), so gate
   // it on stretch. Emit env(safe-area-inset-*) only for the edges the element actually
   // reaches: a stretched axis spans BOTH its edges; a stretch-pinned bar (top-stretch,
-  // …) also reaches its pinned edge. env() is a LIVE CSS var, so the browser
-  // re-resolves these on orientation change — no runtime code needed. The editor
+  // …) also reaches its pinned edge. The inset expression is a LIVE CSS value (see
+  // safeAreaInset above), so the browser re-resolves it on orientation change — and in
+  // an editor device preview on a preset change — with no runtime code. The editor
   // disables the Safe Area checkbox for non-stretch anchors to match this. */
+  //
+  // ⚠️ The two arms below are MUTUALLY EXCLUSIVE BY CONSTRUCTION — a stretched anchor
+  // takes the padding arm, a point anchor takes the offset arm, and nothing can take
+  // both. That is what makes double-insetting unrepresentable rather than merely
+  // avoided.
   if (a.safeArea && (stretchX || stretchY)) {
     const fmtPad = (v: string | number | undefined) => typeof v === 'string' ? v : `${v || 0}px`;
     const inset = (edge: 'top' | 'bottom' | 'left' | 'right') =>
-      `max(${fmtPad(style[`padding${edge[0].toUpperCase()}${edge.slice(1)}` as 'paddingTop'])}, env(safe-area-inset-${edge}))`;
+      `max(${fmtPad(style[`padding${edge[0].toUpperCase()}${edge.slice(1)}` as 'paddingTop'])}, ${safeAreaInset(edge)})`;
     if (stretchY || a.anchor.startsWith('top')) style.paddingTop = inset('top');
     if (stretchY || a.anchor.startsWith('bottom')) style.paddingBottom = inset('bottom');
     if (stretchX || a.anchor.includes('left')) style.paddingLeft = inset('left');
     if (stretchX || a.anchor.includes('right')) style.paddingRight = inset('right');
+  } else if (a.safeArea && a.anchor !== 'center') {
+    // A POINT anchor takes the inset as a positional OFFSET: the anchor point moves
+    // inward, the box keeps its size.
+    //
+    // Padding would be wrong here and the reason is worth keeping — it INFLATES the
+    // element. A 44pt settings gear anchored top-right on a notched iPhone would render
+    // 44 + 62 = 106pt tall, sitting in the same place with its glyph pushed to the
+    // bottom: the classic tall-button-on-a-notch bug. That is why the padding arm is
+    // stretch-gated. But "padding is wrong" was previously implemented as "nothing at
+    // all", so a corner-anchored badge — a coin balance, a settings gear, Court's `?`
+    // button — had NO way to clear the camera, and the Inspector greyed the checkbox out
+    // to say so. Both halves of that were only half right.
+    //
+    // Composes with the authored offsets (it runs after them) instead of replacing them,
+    // so `top: 4vmin` on a notched phone means "4vmin below the notch", which is what an
+    // author who wrote 4vmin meant. `center` reaches no edge and stays a genuine no-op —
+    // the one anchor the Inspector still greys the checkbox out for.
+    //
+    // Only the edges the anchor actually TOUCHES: `top-right` clears the notch and the
+    // right edge, and is untouched by the home indicator below it.
+    const shift = (base: string | number | undefined, op: '+' | '-', edge: 'top' | 'bottom' | 'left' | 'right'): string => {
+      const term = safeAreaInset(edge);
+      if (!base || base === '0') return op === '+' ? `calc(${term})` : `calc(-1 * ${term})`;
+      const b = typeof base === 'number' ? `${base}px` : base;
+      // FLATTEN rather than nest: the authored-offset step may already have produced a
+      // `calc(...)`, and `calc(calc(...) - x)` — while valid CSS — is needlessly opaque
+      // to anything that has to read these back (the parity oracle among them).
+      const inner = b.startsWith('calc(') ? b.slice(5, -1).trim() : b;
+      return `calc(${inner} ${op} ${term})`;
+    };
+    if (a.anchor.startsWith('top')) style.top = shift(style.top, '+', 'top');
+    else if (a.anchor.startsWith('bottom')) style.top = shift(style.top, '-', 'bottom');
+    if (a.anchor.includes('left')) style.left = shift(style.left, '+', 'left');
+    else if (a.anchor.includes('right')) style.left = shift(style.left, '-', 'right');
   }
 }

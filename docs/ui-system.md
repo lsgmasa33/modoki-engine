@@ -199,11 +199,69 @@ parent (`UIAnchor.ts`):
   (`top-stretch`, `h-stretch`, `v-stretch`, etc.).
 - `top`/`left`/`right`/`bottom` (+ units), `pivotX`/`pivotY` (0..1 pivot relative to the
   element's own box), `zIndex`.
-- `safeArea` — when true, padding is `max(<padding>, env(safe-area-inset-*))` so content
-  clears notches and home indicators.
+- `safeArea` — clear the notch / home indicator. **Defaults to TRUE** — an absent field
+  in a scene JSON is ON, not off. It takes ONE OF TWO ARMS, decided by the anchor, and
+  they are mutually exclusive by construction so nothing can be inset twice:
+  - **A STRETCHED anchor PADS**: `max(<padding>, var(--ui-sa-*, env(safe-area-inset-*)))`
+    on the edges the anchor reaches. Its *children* move away from the edge; its own box
+    does not move.
+  - **A POINT anchor OFFSETS**: the anchor point moves inward, the box keeps its size,
+    composed onto (not replacing) any authored offset — so `top: 4vmin` on a notched
+    phone means "4vmin below the notch". Padding would be wrong here because it INFLATES
+    the element: a 44pt gear anchored top-right would render 106pt tall with its glyph
+    shoved to the bottom.
+  - **`center` is a genuine no-op** — it reaches no edge. It is the only anchor for which
+    the Inspector greys the checkbox out.
+
+  ⚠️ **The anchor MODE is a proxy for "which edges this element reaches", and an authored
+  or runtime-driven offset can falsify it.** An element anchored `top-stretch` but pushed
+  to the bottom of the screen still takes a top inset — the inset is static CSS and cannot
+  see where the element ended up. That is an authoring call, not an engine bug: opt such
+  an element out.
 
 An anchored element is rendered with `position: absolute`; pivot is applied as a CSS
 `translate(-pivotX%, -pivotY%)`. Stretched axes ignore pivot (both edges are pinned).
+
+⚠️ **The app root is FULL-BLEED and must stay that way** (`engine/app/App.css`). It
+carried a blanket `padding: env(safe-area-inset-top/bottom)` from the initial commit,
+which inset everything the app drew — black bands on a notched iPhone, no art able to
+bleed to the edge, and an element that opted in inset twice. Per-element is the whole
+mechanism; a second blunt one is strictly worse than either alone (#272).
+
+#### The editor simulates the safe area (#271)
+
+`env(safe-area-inset-*)` resolves to **0** on every desktop browser, so an editor preview
+structurally could not show what a notched phone does — a class of layout bug that was
+invisible until a build reached hardware, and the reason a previous safe-area fix shipped
+unverified and had to be reverted (`c6e570f6` → `6f495a0d9`).
+
+So the inset is emitted as `var(--ui-sa-<edge>, env(safe-area-inset-<edge>))`
+(`runtime/ui/anchorCss.ts`), and the editor's device preview publishes `--ui-sa-*` from
+the selected device preset. Three things about that shape are load-bearing:
+
+- **A shipped build never sets the var** and falls through to the real `env()`. There is
+  no `isEditor` branch in the runtime and only one expression, so the two cannot drift.
+- **Both viewports publish the same insets.** GameView owns the device picker and writes
+  them to `gameViewSafeArea` in the editor store; SceneView's UI preview frame reads them
+  back. The same UI tree is mounted in both, so insetting one and not the other would put
+  an element in two places and make the authoring view the liar.
+- **The insets are per-orientation DATA, not a rotation.** `DevicePreset.safeArea` carries
+  a portrait and a landscape quartet because they are genuinely different: an iPhone in
+  portrait is inset at the top by the notch (62) and the bottom by the home indicator
+  (34); rotated, it has **no top inset at all** (0 top, 21 bottom, 62 on both sides).
+  Deriving one from the other by swapping w/h — which `resolveLogicalSize` legitimately
+  does for the screen box — invents a top inset the device does not have.
+
+The bands are drawn over the preview (`editor/rendering/SafeAreaOverlay.tsx`), always on
+with a device preset: simulating an inset without showing it trades one invisible failure
+for another.
+
+⚠️ **The preset numbers are mostly PUBLISHED, not measured**, and they model the
+**physical** insets — the notch/Dynamic Island and the home indicator, i.e. what a
+full-screen game sees with the status bar hidden. A device with no notch reports 0 there
+(measured on the iPhone 8; that fact is what disproved the first attempt at the fix). See
+the header of `editor/scene/devicePresets.ts` for what is verified, what is not, and the
+Android caveat (real Android insets move with the OEM and with gesture vs 3-button nav).
 
 ### Rotation (`UIElement.rotation`)
 
@@ -620,7 +678,61 @@ since both use the browser's font system. `loadAllFonts()` bulk-loads every `typ
 asset from the scan; concurrent loads of the same path share one in-flight
 `FontFace.load()`, and a failed load is evicted so it can retry. Family/weight/style come
 from the filename (`parseFontFilename`); a (weight, style) collision within a family warns
-(last-added wins). `getLoadedFontFamilies()` backs the Inspector's font dropdown.
+(last-added wins). The Inspector authors the field by DRAG-DROP — `AssetRefField` special-cases
+`fontFamily`, calling `loadFont(path)` on the dropped font and writing back the resolved family
+NAME (every other `accept:`-typed field writes a GUID; making this one match is issue #231).
+`getLoadedFontFamilies()` / `getLoadedFonts()` expose the registry to game code; nothing in the
+engine or editor consumes them today (verified 2026-08-20).
+
+#### Who registers a scene's fonts — and the bug that answer used to have (#253)
+
+**A scene's own fonts are registered by the SCENE-LOAD path**, not by whoever happens to
+have called `loadAllFonts`. `collectResourceRefsFromEntities` emits each authored
+`UIElement.fontFamily` as a `{type:'font', path:'<CSS family name>'}` scene resource, and
+`SceneManager`'s `acquireResource` hands it to **`loadFontFamily(family)`** — which finds
+every manifest `font` asset whose `parseFontFilename(path).family` matches and FontFace-loads
+them all (all variants: a UI authoring `fontWeight: 700` needs the real Bold file, or the
+browser synthesizes a fake bold). It is awaited with the scene's other resources, so the
+first frame has the face. The walk covers referenced PREFABS too — the same collector runs
+over each prefab's entities.
+
+⚠️ **Matching is `parseFontFilename(path).family`, deliberately the same rule the build's
+`resolveFontsByFamily` (`asset-tree-shaker.ts`) uses** to decide whether a font's source
+`.ttf` is worth shipping. The two must agree: a family the runtime resolves but the build
+does not is a font that works in the editor and is absent from the shipped game.
+
+That acquire used to be a **no-op**, on the reasoning that `loadAllFonts` had already
+registered everything globally. It has exactly two callers — the game runtime's
+`initWorldSync` (`engine/app/ecs/init.ts`) and **the editor's Assets PANEL**. The editor
+route mounts `EditorApp`, not `GameShell`, so `initWorldSync` never runs there and the only
+registrar left was a panel: with the Assets tab unmounted, `document.fonts.size` was **0**
+and every DOM string in the Game panel rendered in the browser's default **serif**.
+
+**Why that was worth more than a cosmetic bug: it silently corrupts MEASUREMENT.** Nothing
+errors, and a serif page still looks like a page — so a capture judged against reference art
+can be wrong about weight, tracking, wrap, line count and therefore panel fit, with nothing
+to indicate it. It was found while re-capturing Court's menu for an art evaluation. Measured
+A/B on the live editor with the panel's registration disabled (2026-08-20, `games/court`):
+
+| | `document.fonts.size` | `measureText('COURT')` @ `700 73px` |
+|---|---|---|
+| before | 0 | `Varela Round` 261.096 = `NoSuchFontXyz123` 261.096 = `serif` 261.096 |
+| after | 1 (`Varela Round`) | `Varela Round` **260.318** ≠ `serif` 261.096 |
+
+**The cheap guard that came with it**: a family matching no manifest font asset warns once
+(naming the filename→family rule, since that is usually the mistake), and a family whose
+source the build dropped (`sourceShipped:false`) gets a *different* message — those need
+different fixes, and the second reads as the first otherwise. Generic CSS keywords
+(`sans-serif`, `system-ui`, …) name no asset by design and are silent. Before this, the
+failure produced no console output at all.
+
+⚠️ This is the dev-editor half of a class the production build has too: **the tree-shaker
+cannot see a family NAME reached from anywhere but a scene/prefab field** (a stylesheet, a
+code constant), so the font is dropped and every string falls back — see
+[Build](./build.md) § "Converted assets: the manifest points at the SOURCE, the build ships the
+VARIANT". `UIElement.fontFamily` being a
+CSS name rather than a GUID is the root of both halves; making it a font-asset GUID ref is
+tracked as issue #231.
 
 ### MSDF world-text atlases (`Text2D`/`Text3D`)
 

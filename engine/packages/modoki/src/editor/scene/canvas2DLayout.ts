@@ -13,7 +13,7 @@
  */
 
 import { computeDeviceLetterbox } from './sceneViewMath';
-import { resolveAnchorRect, resolveLengthPx, type AnchorData } from '../../runtime/ui/anchorLayout';
+import { resolveAnchorRect, resolveLengthPx, ZERO_INSETS, type AnchorData, type SafeAreaPx } from '../../runtime/ui/anchorLayout';
 import { computeCanvasScale } from '../../runtime/rendering/canvas2DScaler';
 import type { Canvas2DScaleMode } from '../../runtime/traits/Canvas2D';
 
@@ -79,6 +79,11 @@ export function resolveCanvasSize(ui: UISizeSpec, deviceW: number, deviceH: numb
  * @param ui       The canvas UIElement's size spec.
  * @param anchor   The canvas UIAnchor (null → top-left, unanchored).
  * @param canvas   The Canvas2D reference resolution + scale mode.
+ * @param insets   Simulated safe-area insets for the selected device preset. Only moves
+ *                 a canvas whose anchor opts in AND is a point anchor; zero by default,
+ *                 which is what a caller with no device simulation wants. Threaded
+ *                 through rather than left to default so a canvas anchored to a corner
+ *                 cannot silently disagree with where the DOM actually drew it.
  */
 export function computeCanvas2DLayout(
   deviceW: number,
@@ -88,6 +93,7 @@ export function computeCanvas2DLayout(
   ui: UISizeSpec,
   anchor: AnchorData | null,
   canvas: Canvas2DSpec,
+  insets: SafeAreaPx = ZERO_INSETS,
 ): Canvas2DLayout {
   // 1) Device frame on screen + uniform device→screen scale.
   //    Free mode (deviceW/H = 0): the canvas viewport IS the panel, scale 1.
@@ -105,7 +111,7 @@ export function computeCanvas2DLayout(
   // 2) Canvas UIElement size + anchor placement, in LOGICAL px within the viewport.
   const { w: logW, h: logH } = resolveCanvasSize(ui, vpW, vpH);
   const anchored = anchor
-    ? resolveAnchorRect(logW, logH, vpW, vpH, anchor)
+    ? resolveAnchorRect(logW, logH, vpW, vpH, anchor, insets)
     : { x: 0, y: 0, w: logW, h: logH };
 
   // 3) Map the div to screen px (device origin + logical × deviceScale).

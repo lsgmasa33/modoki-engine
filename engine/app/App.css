@@ -12,13 +12,19 @@ body {
   -webkit-touch-callout: none;
 }
 
+/* FULL-BLEED ON PURPOSE — do not re-add a safe-area padding here (#272).
+   This carried `padding-top/bottom: env(safe-area-inset-*)` from the initial commit,
+   which insets EVERYTHING the app draws. On a notched iPhone that shows up as black
+   bands across the top and bottom (body's #0f0f23 through the gap) with the layout
+   squeezed into what is left — reported on an iPhone Air with Court, and on an iPhone 8
+   before that. It predates `UIAnchor.safeArea`, the engine's real mechanism, and the two
+   together were strictly worse than either: no art could ever bleed to the edge, and an
+   element that DID opt in was inset twice.
+   Safe area is now per element and per edge — see docs/ui-system.md § UIAnchor. */
 #root {
   width: 100vw;
   height: 100vh;
   height: 100dvh;
-  padding-top: env(safe-area-inset-top);
-  padding-bottom: env(safe-area-inset-bottom);
-  box-sizing: border-box;
   overflow: hidden;
 }
 

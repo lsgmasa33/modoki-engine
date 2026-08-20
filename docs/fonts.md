@@ -21,8 +21,14 @@ is a bug rather than a setting.
 |---|---|---|
 | Trait field | `UIElement.fontFamily` (a CSS family **name**) | `Text2D.font` / `Text3D.font` (an asset **GUID**) |
 | Loader | browser `FontFace` (`runtime/loaders/fontLoader.ts`) | MSDF atlas (`runtime/loaders/fontAtlasLoader.ts`) |
+| Registered by | `loadFontFamily`, from the scene-load path | `acquireFont`, scene-scoped + refcounted |
 | Needs the `.ttf` shipped | yes | no — the atlas alone renders |
 | Honours the Font Inspector | no | yes |
+
+Both are driven by the scene's `resources` — a `font` entry holding a GUID takes the SDF path,
+one holding a family name takes the DOM path. Who registers a DOM family, and the #253 bug where
+that answer depended on the editor's dock layout, is in
+[UI System](./ui-system.md) § "Who registers a scene's fonts".
 
 The Font Inspector settings below apply **only** to SDF world text. CSS text instances a
 variable font natively via `font-weight`, so it ignores `variationAxes` entirely — which is

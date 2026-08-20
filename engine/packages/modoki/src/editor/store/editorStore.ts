@@ -103,6 +103,12 @@ interface EditorState {
   /** Opt-in: simulate + render ParticleEmitter effects live in the 3D SceneView */
   particlePreview: boolean;
   gameViewSize: { width: number; height: number };
+  /** Safe-area insets (logical px) of the Game panel's selected device preset. Written by
+   *  GameView, which owns the device picker; read by SceneView's UI preview frame so BOTH
+   *  viewports inset UI the same way. Zeros for `Free` and the abstract aspect presets —
+   *  and zeros are also what a desktop `env(safe-area-inset-*)` reports, so an unset value
+   *  degrades to today's behaviour rather than to something wrong. See #271. */
+  gameViewSafeArea: { top: number; right: number; bottom: number; left: number };
   /** Valid game rendering area within the Game panel (excludes letterbox strips) */
   gameRect: { left: number; top: number; width: number; height: number };
   /** Incremented to trigger Assets panel refresh */
@@ -264,6 +270,7 @@ interface EditorState {
   setUnlockedGhostSelKey: (key: string | null) => void;
   setParticlePreview: (on: boolean) => void;
   setGameViewSize: (width: number, height: number) => void;
+  setGameViewSafeArea: (insets: EditorState['gameViewSafeArea']) => void;
   setGameRect: (rect: EditorState['gameRect']) => void;
   refreshAssets: () => void;
   setImportStatus: (active: boolean, message?: string, step?: number, totalSteps?: number) => void;
@@ -429,6 +436,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   focusedPanel: null,
   particlePreview: false,
   gameViewSize: { width: 800, height: 450 },
+  gameViewSafeArea: { top: 0, right: 0, bottom: 0, left: 0 },
   gameRect: { left: 0, top: 0, width: 800, height: 450 },
   assetsVersion: 0,
   importStatus: { active: false, message: '', step: 0, totalSteps: 0 },
@@ -586,6 +594,15 @@ export const useEditorStore = create<EditorState>((set, get) => {
   setUnlockedGhostSelKey: (key: string | null) => set({ unlockedGhostSelKey: key }),
   setParticlePreview: (on: boolean) => set({ particlePreview: on }),
   setGameViewSize: (width, height) => set({ gameViewSize: { width, height } }),
+  // Identity-compared before writing: this is set from a render-time value in GameView, and
+  // a fresh object every render would re-notify every subscriber (SceneView's preview frame
+  // among them) on frames where the device did not change.
+  setGameViewSafeArea: (insets) => {
+    const cur = get().gameViewSafeArea;
+    if (cur.top === insets.top && cur.right === insets.right
+      && cur.bottom === insets.bottom && cur.left === insets.left) return;
+    set({ gameViewSafeArea: { ...insets } });
+  },
   setGameRect: (rect) => set({ gameRect: rect }),
   refreshAssets: () => set((s) => ({ assetsVersion: s.assetsVersion + 1 })),
   setImportStatus: (active, message = '', step = 0, totalSteps = 0) =>

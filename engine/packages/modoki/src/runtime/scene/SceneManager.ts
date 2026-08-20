@@ -43,6 +43,7 @@ import {
 import { acquireRiggedModel } from '../loaders/riggedModelCache';
 import { acquireAudio } from '../loaders/audioBufferCache';
 import { acquireFont } from '../loaders/fontAtlasLoader';
+import { loadFontFamily } from '../loaders/fontLoader';
 import { registerAsset, isGuid, resolveGuidToPath, getAudioLoadType } from '../loaders/assetManifest';
 import { loadTimelineNow } from '../loaders/timelineCache';
 import { collectTimelineAudioRefs, collectTimelineControlRefs, collectTimelineVideoRefs } from '../timeline/types';
@@ -1385,9 +1386,19 @@ async function acquireResource(sceneId: SceneId, ref: SceneResourceRef): Promise
       // Two kinds share this resource type. A GUID ref is an SDF font (Text3D/
       // Text2D.font) — acquire it scene-scoped so it's loaded BEFORE the old scene
       // is released (cross-swap survival) and refcounted via releaseFontsForScene.
-      // A non-GUID ref is a CSS family NAME (UIElement.fontFamily), loaded globally
-      // via the FontFace loader (loadAllFonts) — no scene-scoped hold needed.
-      if (isGuid(ref.path)) { await acquireFont(sceneId, ref.path); }
+      if (isGuid(ref.path)) { await acquireFont(sceneId, ref.path); return; }
+      // A non-GUID ref is a CSS family NAME (UIElement.fontFamily), registered globally
+      // with the browser via the FontFace loader — no scene-scoped hold needed (a face added
+      // to `document.fonts` costs nothing to keep and the browser owns it).
+      //
+      // ⚠️ This used to `return` here, on the reasoning that the global `loadAllFonts` had
+      // already registered every font. Its only editor-side caller is the ASSETS PANEL, so a
+      // scene's typeface depended on the editor's dock layout: with that tab unmounted every
+      // DOM string in the Game panel rendered in the default serif, silently. Registering from
+      // the SCENE-load path is what makes a scene's fonts a property of the scene (#253 —
+      // mechanism, the measured A/B and the guard: docs/ui-system.md § "Who registers a
+      // scene's fonts").
+      await loadFontFamily(ref.path);
       return;
     case 'environment':
       // Preload the HDR so the first frame of the new scene has correct PBR

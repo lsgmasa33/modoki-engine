@@ -3,6 +3,7 @@
  *  resolve relative to this container, not the browser window. */
 
 import { useRef, useCallback, useState, useEffect } from 'react';
+import { measureSafeAreaInsets } from './safeArea';
 import type { ReactNode } from 'react';
 import { useUIEntities } from './useUIEntities';
 import { UINode } from './UINode';
@@ -88,6 +89,14 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
           '--ui-vmax': `${Math.max(vw, vh)}px`,
         });
       }
+      // Safe-area insets for GAME CODE (`runtime/ui/safeArea.ts`) — measured from THIS
+      // container's cascade, so it reads the editor preview's simulated inset and the
+      // device's real `env()` through one path. Measured here rather than on its own
+      // observer because every event that can change an inset (orientation, an editor
+      // device-preset change, a panel resize) already resizes this container. Outside
+      // the w/h > 0 guard on purpose: a container can be measurable for insets before it
+      // has a non-zero box, and a stale inset is worse than an early-but-correct one.
+      measureSafeAreaInsets(el);
     };
     update(); // first paint: sync so vmin units resolve immediately
     // Observer updates are deferred to the next frame: measuring + setState

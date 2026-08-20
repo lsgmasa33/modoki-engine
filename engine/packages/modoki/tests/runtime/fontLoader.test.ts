@@ -352,4 +352,167 @@ describe('fontLoader', () => {
       warn.mockRestore();
     });
   });
+
+  /** #253 — a scene's `{type:'font', path:'<CSS family name>'}` resource (from
+   *  `UIElement.fontFamily`) used to be a NO-OP in SceneManager's acquire, on the assumption
+   *  that `loadAllFonts` had already registered everything. Its only editor-side caller is the
+   *  Assets PANEL, so with that tab unmounted no face was registered and every DOM string in
+   *  the Game panel rendered in the browser's default serif — silently. `loadFontFamily` is
+   *  what the scene-load path calls instead. */
+  describe('loadFontFamily (#253 — a scene resource that names a CSS family)', () => {
+    let loadCalls: Record<string, number>;
+    let resolvers: Record<string, (() => void)[]>;
+    let rejecters: Record<string, ((e: Error) => void)[]>;
+
+    function installFontFaceMock() {
+      loadCalls = {};
+      resolvers = {};
+      rejecters = {};
+      class FakeFontFace {
+        constructor(public family: string, public source: string, public descriptors: { weight: string; style: string }) {}
+        load() {
+          loadCalls[this.source] = (loadCalls[this.source] ?? 0) + 1;
+          return new Promise<this>((resolve, reject) => {
+            (resolvers[this.source] ??= []).push(() => resolve(this));
+            (rejecters[this.source] ??= []).push((e: Error) => reject(e));
+          });
+        }
+      }
+      (globalThis as any).FontFace = FakeFontFace;
+      (globalThis as any).document = { fonts: { add: vi.fn() } };
+    }
+
+    /** Register a manifest the way the real scan does, on the post-resetModules graph. */
+    async function seedManifest(entries: { path: string; type?: string; sourceShipped?: boolean }[]) {
+      const manifest = await import('../../src/runtime/loaders/assetManifest');
+      manifest.clearManifest();
+      entries.forEach((e, i) => {
+        manifest.registerAsset(
+          `30000000-0000-4000-8000-00000000000${i}`,
+          e.path,
+          (e.type ?? 'font') as any,
+          undefined, // texture settings
+          e.sourceShipped === undefined ? undefined : { font: { sourceShipped: e.sourceShipped } },
+        );
+      });
+      return manifest;
+    }
+
+    /** Settle every FontFace.load() the call kicked off, then await it. */
+    async function settle<T>(p: Promise<T>): Promise<T> {
+      await Promise.resolve();
+      Object.keys(loadCalls).forEach(s => (resolvers[s] ?? []).forEach(r => r()));
+      return p;
+    }
+
+    it('registers EVERY variant of the family, and nothing outside it', async () => {
+      installFontFaceMock();
+      await seedManifest([
+        { path: '/assets/fonts/VarelaRound-Regular.ttf' },
+        { path: '/assets/fonts/VarelaRound-Bold.ttf' },
+        { path: '/assets/fonts/Roboto-Regular.ttf' },       // a different family
+        { path: '/assets/textures/sky.png', type: 'texture' }, // not a font at all
+      ]);
+      const { loadFontFamily, getLoadedFonts } = await getLoader();
+
+      const n = await settle(loadFontFamily('Varela Round'));
+
+      expect(n, 'both Varela Round variants').toBe(2);
+      expect(Object.keys(loadCalls).length).toBe(2);
+      expect(Object.keys(loadCalls).every(s => s.includes('VarelaRound'))).toBe(true);
+      // Bold registered too — a UI authoring fontWeight:700 needs the real file, else the
+      // browser synthesizes a fake bold from the regular.
+      const variants = getLoadedFonts().get('Varela Round') ?? [];
+      expect(variants.map(v => v.weight).sort()).toEqual(['400', '700']);
+    });
+
+    it('warns ONCE for a family that matches no font asset, and names the filename rule', async () => {
+      installFontFaceMock();
+      await seedManifest([{ path: '/assets/fonts/Roboto-Regular.ttf' }]);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { loadFontFamily } = await getLoader();
+
+      expect(await loadFontFamily('Varela Round')).toBe(0);
+      expect(await loadFontFamily('Varela Round')).toBe(0);
+
+      const msgs = warn.mock.calls.map(c => String(c[0])).filter(m => m.includes('Varela Round'));
+      expect(msgs.length, 'warn-once, not once per UI string').toBe(1);
+      expect(msgs[0]).toContain('matches no font asset');
+      expect(msgs[0]).toContain('VarelaRound-Regular.ttf');
+      expect(Object.keys(loadCalls).length).toBe(0);
+      warn.mockRestore();
+    });
+
+    it('reports a sourceShipped:false family as DROPPED BY THE BUILD, not as missing', async () => {
+      installFontFaceMock();
+      await seedManifest([{ path: '/assets/fonts/VarelaRound-Regular.ttf', sourceShipped: false }]);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { loadFontFamily } = await getLoader();
+
+      expect(await loadFontFamily('Varela Round')).toBe(0);
+
+      const msg = warn.mock.calls.map(c => String(c[0])).find(m => m.includes('Varela Round'));
+      // The two need different fixes — ship the source vs. name a real font — so they must
+      // not share a message.
+      expect(msg).toContain('did not ship');
+      expect(msg).not.toContain('matches no font asset');
+      expect(Object.keys(loadCalls).length, 'the path would 404').toBe(0);
+      warn.mockRestore();
+    });
+
+    it('treats a generic CSS keyword as nothing to load — silently', async () => {
+      installFontFaceMock();
+      await seedManifest([{ path: '/assets/fonts/Roboto-Regular.ttf' }]);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { loadFontFamily } = await getLoader();
+
+      for (const generic of ['sans-serif', 'serif', 'system-ui', 'MONOSPACE', 'inherit']) {
+        expect(await loadFontFamily(generic), generic).toBe(0);
+      }
+      expect(warn, 'a generic keyword names no asset BY DESIGN').not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('resolves each segment of a hand-typed CSS stack separately', async () => {
+      installFontFaceMock();
+      await seedManifest([{ path: '/assets/fonts/VarelaRound-Regular.ttf' }]);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { loadFontFamily } = await getLoader();
+
+      // The whole string as ONE family would match nothing and warn about a family
+      // nobody authored.
+      const n = await settle(loadFontFamily('"Varela Round", sans-serif'));
+
+      expect(n).toBe(1);
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('is a silent no-op with no DOM — a headless scene load must not warn or throw', async () => {
+      delete (globalThis as any).FontFace;
+      delete (globalThis as any).document;
+      await seedManifest([{ path: '/assets/fonts/VarelaRound-Regular.ttf' }]);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { loadFontFamily } = await getLoader();
+
+      await expect(loadFontFamily('Varela Round')).resolves.toBe(0);
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('a FontFace failure is warned, not thrown — a font must not fail a scene load', async () => {
+      installFontFaceMock();
+      await seedManifest([{ path: '/assets/fonts/VarelaRound-Regular.ttf' }]);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { loadFontFamily } = await getLoader();
+
+      const p = loadFontFamily('Varela Round');
+      await Promise.resolve();
+      Object.keys(loadCalls).forEach(s => (rejecters[s] ?? []).forEach(r => r(new Error('boom'))));
+
+      await expect(p).resolves.toBe(0);
+      expect(warn.mock.calls.map(c => String(c[0])).some(m => m.includes('boom'))).toBe(true);
+      warn.mockRestore();
+    });
+  });
 });

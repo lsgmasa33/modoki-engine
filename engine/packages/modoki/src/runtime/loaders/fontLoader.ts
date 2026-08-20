@@ -4,7 +4,7 @@
 
 import { parseFontFilename, type FontInfo } from './fontNaming';
 import { assetUrl } from './assetUrl';
-import type { FontManifestBlock } from './assetManifest';
+import { getAllAssets, type FontManifestBlock } from './assetManifest';
 
 export { parseFontFilename, type FontInfo };
 
@@ -120,6 +120,109 @@ export async function loadAllFonts(assets: { path: string; type: string; font?: 
       .join('; ');
     console.warn(`[FontLoader] ${failed.length}/${fontAssets.length} fonts failed to load — ${detail}`);
   }
+}
+
+/** CSS families that name no asset BY DESIGN — the generic keywords, the `ui-*` system
+ *  aliases, and the CSS-wide keywords. A scene authoring one of these is asking for
+ *  whatever the browser has, so {@link loadFontFamily} must resolve them to "nothing to
+ *  load" rather than to "this font is missing". Compared case-insensitively (CSS family
+ *  keywords are case-insensitive; a QUOTED family name is a custom family and never a
+ *  keyword, which is why the quote-stripping below happens after this test). */
+const CSS_GENERIC_FAMILIES = new Set([
+  'serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui', 'math', 'emoji', 'fangsong',
+  'ui-serif', 'ui-sans-serif', 'ui-monospace', 'ui-rounded',
+  'inherit', 'initial', 'revert', 'revert-layer', 'unset',
+]);
+
+/** Warn-once per family, so a UI tree with 200 strings in one missing family logs once. */
+const familyWarned = new Set<string>();
+
+/** Split a CSS `font-family` VALUE into its candidate family names. Usually one name
+ *  (`UIElement.fontFamily` is written by the Inspector's font picker as a resolved family),
+ *  but a human can type a stack — `"Varela Round", sans-serif` — and each segment has to be
+ *  looked up separately or the whole string reads as one absent family. */
+function cssFamilyCandidates(value: string): string[] {
+  return value
+    .split(',')
+    .map(part => part.trim())
+    .filter(part => part.length > 0 && !CSS_GENERIC_FAMILIES.has(part.toLowerCase()))
+    // Strip the CSS quoting a family with spaces/punctuation may carry.
+    .map(part => (/^(".*"|'.*')$/.test(part) ? part.slice(1, -1) : part))
+    .filter(part => part.length > 0);
+}
+
+/** FontFace-register every manifest font asset belonging to a CSS family NAME — the
+ *  `UIElement.fontFamily` counterpart to {@link loadFont}'s per-path load, and the reason a
+ *  scene's `{type:'font', path:'<family name>'}` resource is a real acquire rather than a
+ *  no-op (#253). ALL of the family's variants are loaded, not just one: a UI that authors
+ *  `fontWeight: 700` needs the Bold file registered under the same family or the browser
+ *  synthesizes a fake bold from the regular.
+ *
+ *  ⚠️ Matching is `parseFontFilename(path).family`, deliberately the SAME rule the build's
+ *  `resolveFontsByFamily` (asset-tree-shaker.ts) uses to decide whether a font's source
+ *  `.ttf` is worth shipping. The two must agree: a family this resolves but the build does
+ *  not is a font that works in the editor and is absent from the shipped game.
+ *
+ *  Returns the number of variants registered. 0 means nothing was loaded — either the family
+ *  names no asset (warned once) or there is no DOM at all (headless: silently 0, so a scene
+ *  load in the verification harness neither warns nor throws). Never rejects: a failed
+ *  FontFace load is warned and counted out, because a font is not worth failing a scene load
+ *  over. */
+export async function loadFontFamily(value: string): Promise<number> {
+  if (!value) return 0;
+  // Headless (verification harness, node-env tests): no FontFace API and no document to add
+  // a face to. Nothing renders there, so this is "nothing to do", not a failure.
+  if (typeof FontFace === 'undefined' || typeof document === 'undefined') return 0;
+
+  const candidates = cssFamilyCandidates(value);
+  if (candidates.length === 0) return 0;
+
+  let registered = 0;
+  for (const family of candidates) {
+    const inManifest = getAllAssets().filter(
+      a => a.type === 'font' && parseFontFilename(a.path).family === family,
+    );
+    // `sourceShipped === false` = the shaker dropped the source `.ttf` next to its atlas, so
+    // the path is in the manifest but 404s. Reported separately below: "the build dropped it"
+    // is a different fix from "no such font", and the first reads as the second otherwise.
+    const loadable = inManifest.filter(a => a.font?.sourceShipped !== false);
+
+    if (loadable.length === 0) {
+      if (!familyWarned.has(family)) {
+        familyWarned.add(family);
+        if (inManifest.length > 0) {
+          console.warn(
+            `[FontLoader] font family "${family}" resolves to ${inManifest.map(a => a.path).join(', ')}, ` +
+              `whose source the build did not ship (shipSource:'never', or no DOM usage detected) — ` +
+              `text using it falls back to the browser default.`,
+          );
+        } else {
+          console.warn(
+            `[FontLoader] font family "${family}" matches no font asset — text using it falls back to ` +
+              `the browser default. (Expected if "${family}" is a system font; otherwise check the ` +
+              `filename: the family is derived from it, e.g. VarelaRound-Regular.ttf => "Varela Round".)`,
+          );
+        }
+      }
+      continue;
+    }
+
+    // It resolves now → forget the warning, so a genuine LATER break (an asset deleted
+    // mid-session in the editor) warns again instead of being silenced for the session.
+    // Same shape as fontAtlasLoader's `unknownSeen.delete`.
+    familyWarned.delete(family);
+
+    const results = await Promise.allSettled(loadable.map(a => loadFont(a.path)));
+    const failed = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    registered += results.length - failed.length;
+    if (failed.length > 0) {
+      console.warn(
+        `[FontLoader] ${failed.length}/${results.length} variants of "${family}" failed to load — ` +
+          failed.map(f => (f.reason instanceof Error ? f.reason.message : String(f.reason))).join('; '),
+      );
+    }
+  }
+  return registered;
 }
 
 /** Get list of unique loaded font family names (for Inspector dropdowns). */

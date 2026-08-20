@@ -5,6 +5,7 @@ import { describe, it, expect } from 'vitest';
 import {
   DEVICE_PRESETS, FREE_PRESET, DEVICE_CATEGORY_ORDER, type DevicePreset,
   resolveLogicalSize, resolvePhysicalSize, presetDpr, presetLabel, filterDevices,
+  resolveSafeArea, safeAreaCssVars,
 } from '../../src/editor/scene/devicePresets';
 
 const devices = DEVICE_PRESETS.filter((p) => p.logicalW > 0);
@@ -98,5 +99,98 @@ describe('filterDevices (picker search)', () => {
 
   it('returns empty for no match', () => {
     expect(filterDevices('nokia 3310')).toEqual([]);
+  });
+});
+
+/** Safe-area insets (#271). These are what lets an editor device preview show what a
+ *  notched phone does — `env(safe-area-inset-*)` is 0 on every desktop browser, so
+ *  without them the preview structurally cannot disagree with a wrong layout. */
+describe('devicePresets — safe area', () => {
+  it('every preset carries insets for both orientations', () => {
+    for (const p of DEVICE_PRESETS) {
+      for (const o of ['portrait', 'landscape'] as const) {
+        const i = resolveSafeArea(p, o);
+        for (const edge of ['top', 'right', 'bottom', 'left'] as const) {
+          expect(Number.isFinite(i[edge]), `${p.name} ${o}.${edge}`).toBe(true);
+          expect(i[edge], `${p.name} ${o}.${edge}`).toBeGreaterThanOrEqual(0);
+        }
+      }
+    }
+  });
+
+  it('Free and the abstract aspect presets have no insets — they are not devices', () => {
+    const abstract = [FREE_PRESET, ...DEVICE_PRESETS.filter((p) => p.category === 'Aspect')];
+    for (const p of abstract) {
+      for (const o of ['portrait', 'landscape'] as const) {
+        expect(resolveSafeArea(p, o), p.name).toEqual({ top: 0, right: 0, bottom: 0, left: 0 });
+      }
+    }
+  });
+
+  // The bug this forbids: reusing resolveLogicalSize's w/h swap for the insets. That
+  // gives a landscape iPhone a 62pt TOP inset it does not have, and drops the side
+  // insets it does — every element on the notch side would be authored wrong while the
+  // preview looked confident.
+  it('landscape is NOT a rotation of portrait — the notch moves to the sides', () => {
+    const air = find('iPhone Air');
+    const portrait = resolveSafeArea(air, 'portrait');
+    const landscape = resolveSafeArea(air, 'landscape');
+    expect(portrait.top).toBeGreaterThan(0);
+    expect(portrait.left).toBe(0);
+    expect(portrait.right).toBe(0);
+    expect(landscape.top).toBe(0);
+    expect(landscape.left).toBe(portrait.top);
+    expect(landscape.right).toBe(portrait.top);
+    expect(landscape.bottom).toBeGreaterThan(0);
+    expect(landscape.bottom).not.toBe(portrait.bottom);
+  });
+
+  // MEASURED on the hardware (2026-08-20), which is why it is pinned separately from the
+  // published rows: 68 appears in no published table — the Air is neither the 59 of the
+  // 16/16 Plus nor the 62 of the 16 Pro. A future "cleanup" to 62 would be a regression
+  // against a real device, so it fails here.
+  it('pins the MEASURED iPhone Air quartet (68/34, not the published 59 or 62)', () => {
+    const p = find('iPhone Air');
+    expect(resolveSafeArea(p, 'portrait')).toEqual({ top: 68, right: 0, bottom: 34, left: 0 });
+  });
+
+  it('pins the published iPhone 16 Pro quartet — the row the notched pattern was read off', () => {
+    const p = find('iPhone 16 Pro');
+    expect(resolveSafeArea(p, 'portrait')).toEqual({ top: 62, right: 0, bottom: 34, left: 0 });
+    expect(resolveSafeArea(p, 'landscape')).toEqual({ top: 0, right: 62, bottom: 21, left: 62 });
+  });
+
+  // A home-button iPhone reports 0 with the status bar hidden — measured on the iPhone 8,
+  // and the fact that disproved the first attempt at the #272 fix. If this ever becomes
+  // non-zero, the model in the file header (PHYSICAL insets only) has drifted.
+  it('a device with no notch and no home indicator has no insets', () => {
+    expect(resolveSafeArea(find('iPhone SE'), 'portrait')).toEqual({ top: 0, right: 0, bottom: 0, left: 0 });
+  });
+
+  it('safeAreaCssVars emits the four px vars anchorCss reads', () => {
+    expect(safeAreaCssVars({ top: 62, right: 0, bottom: 34, left: 0 })).toEqual({
+      '--ui-sa-top': '62px',
+      '--ui-sa-right': '0px',
+      '--ui-sa-bottom': '34px',
+      '--ui-sa-left': '0px',
+    });
+  });
+
+  // The var NAMES are a contract with anchorCss's `var(--ui-sa-*, env(...))`. A rename on
+  // one side alone is invisible: the fallback still resolves, so the editor quietly stops
+  // simulating anything and goes back to lying about the device.
+  it('the var names match the ones anchorCss emits', async () => {
+    const { applyAnchorStyle } = await import('../../src/runtime/ui/anchorCss');
+    const style: Record<string, unknown> = {};
+    applyAnchorStyle(style, {
+      anchor: 'stretch', safeArea: true,
+      top: 0, topUnit: 'px', right: 0, rightUnit: 'px',
+      bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px',
+      pivotX: 0, pivotY: 0,
+    });
+    const css = JSON.stringify(style);
+    for (const name of Object.keys(safeAreaCssVars({ top: 1, right: 1, bottom: 1, left: 1 }))) {
+      expect(css, name).toContain(`var(${name},`);
+    }
   });
 });

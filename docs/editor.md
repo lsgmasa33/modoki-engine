@@ -736,6 +736,13 @@ three rendering layers — `3d` (Three.js), `2d` (PixiJS), and `ui` (the DOM
 `UIRenderer`) — exactly as they appear on device. See [Architecture](./architecture.md)
 for the layer model.
 
+A device preset carries its **safe-area insets** as well as its logical and physical
+sizes, and the preview publishes them so UI insets exactly as it would on that phone —
+`env(safe-area-inset-*)` is 0 on a desktop browser, so without this the preview cannot
+show a notch bug at all. Always on, with the bands drawn over the frame. Mechanism, the
+per-orientation data, and what is measured vs published:
+[UI system](./ui-system.md) § "The editor simulates the safe area".
+
 ---
 
 ## Play / Stop / Pause

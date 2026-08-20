@@ -337,7 +337,7 @@ export { isAncestorOf, reparentRefusal, type ReparentRefusal } from './core/ecs/
 /** LOCAL↔WORLD Transform authoring (`set_transform {space}`) — the FILE-path conversion.
  *  The live path uses `worldToLocal3D`/`getWorldTransform3D` from core/ecs/worldTransform. */
 export { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './scene/transformSpace';
-export { loadFont, loadAllFonts, getLoadedFontFamilies, getLoadedFonts, fontFamilyFromPath, fontPathFromFamily, parseFontFilename, type FontInfo } from './loaders/fontLoader';
+export { loadFont, loadAllFonts, loadFontFamily, getLoadedFontFamilies, getLoadedFonts, fontFamilyFromPath, fontPathFromFamily, parseFontFilename, type FontInfo } from './loaders/fontLoader';
 // Text MEASUREMENT, exported because fitting text into a box is a game-level concern, not just a
 // renderer-internal one: a game that generates its own copy (Court's hint narration) has to be
 // able to prove the result still fits the panel it draws it in, and a game may only reach the
@@ -352,6 +352,10 @@ export {
 } from './loaders/assetManifest';
 export { assetUrl, withCacheBust } from './loaders/assetUrl';
 export { UIRenderer } from './ui/UIRenderer';
+// Safe-area insets for GAME LAYOUT ARITHMETIC. Chrome that only needs to CLEAR the notch
+// should use `UIAnchor.safeArea` and never touch this — it exists for a game that has to
+// compute WITH the inset (a reserved bottom band, a board fitted into what is left).
+export { getSafeAreaInsets, resetSafeAreaInsets, type SafeAreaInsets } from './ui/safeArea';
 export { registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams } from './core/actionRegistry';
 export type { UIActionContext, UIActionHandler, UIActionDef, UIActionPayload, DispatchOptions } from './core/actionRegistry';
 export { registerEngineActions } from './actions/engineActions';

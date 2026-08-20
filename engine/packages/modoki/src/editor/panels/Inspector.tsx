@@ -1040,18 +1040,20 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
       return <div key={key} style={{ ...(ov ? overrideStyle : {}), ...(enumDisabled ? { opacity: 0.35 } : {}) }}><DropdownField label={key} value={val as string} options={opts} onChange={(v) => write(key, v)} hint={hint} mixed={mx} disabled={enumDisabled} /></div>;
     }
     if (hint.type === 'boolean') {
-      // UIAnchor.safeArea only takes effect on a STRETCHED anchor: safe-area padding
-      // insets a stretched container's children from the notch/home-indicator; on a
-      // non-stretched element it does nothing (the runtime gates it — see anchorCss).
-      // Disable the checkbox there so the UI doesn't imply an effect it won't have.
-      const safeAreaInert = meta.name === 'UIAnchor' && key === 'safeArea' && (() => {
-        const anc = data.anchor as string;
-        return !(STRETCH_X.includes(anc) || STRETCH_Y.includes(anc));
-      })();
+      // UIAnchor.safeArea is inert on exactly ONE anchor: `center`, which reaches no
+      // screen edge and so has no notch or home indicator to clear. Every other anchor
+      // takes one of the two arms — a stretched anchor PADS (its children move away from
+      // the edge), a point anchor OFFSETS (its own box moves inward) — see anchorCss.
+      // ⚠️ This used to disable the checkbox for every non-stretched anchor, back when
+      // the runtime really did nothing there. That was the defect, not the explanation
+      // for it: a corner-anchored badge could not clear the camera at all, and the greyed
+      // box told authors it was working as intended (#272).
+      const safeAreaInert = meta.name === 'UIAnchor' && key === 'safeArea'
+        && (data.anchor as string) === 'center';
       // The reason moved off `title=` and onto the label's Tooltip: native tooltips
       // never render in this Electron build, so this explanation was unreadable.
       const safeAreaHint = safeAreaInert
-        ? { ...hint, tooltip: 'Safe Area only applies to a stretched anchor — it insets a container’s children from the notch/home-indicator. No effect on a non-stretched element.' }
+        ? { ...hint, tooltip: 'Safe Area has no effect on a centered anchor — it reaches no screen edge, so there is no notch or home indicator to clear.' }
         : hint;
       return (
         <label key={key}

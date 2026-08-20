@@ -948,6 +948,13 @@ scan only reaches scene/prefab `fontFamily`. A game that styles DOM text from a 
 `shipSource: 'always'` in the font's `.meta.json`, or its text silently falls back to a system face.
 This is the one known blind spot in the rule.
 
+The DEV-EDITOR half of the same class — a scene's fonts registered by whichever editor panel
+happened to be mounted, so the Game panel rendered serif with the Assets tab closed — is #253,
+written up in [UI System](./ui-system.md) § "Who registers a scene's fonts". The runtime's
+family→asset match (`loadFontFamily`) deliberately uses the SAME `parseFontFilename(path).family`
+rule as `resolveFontsByFamily` here; if they ever diverge, a font works in the editor and is
+absent from the shipped game.
+
 ## The shipped platform floors (`build.iosMinVersion` / `build.androidMinSdk`)
 
 **Never let the bundler pick this.** Vite 8's default `build.target` is

@@ -114,6 +114,8 @@ function text2DGizmoBox(entity: { has: (t: unknown) => boolean; get: (t: unknown
   return { halfW: layout.width / 2, halfH: layout.height / 2, pivotX: (t.anchorX as number) ?? 0.5, pivotY: (t.anchorY as number) ?? 0.5 };
 }
 import { pick2D, pick3D, type Pick2DCandidate, type Pick3DEntry } from './picking';
+import { safeAreaCssVars } from '../scene/devicePresets';
+import SafeAreaOverlay from '../rendering/SafeAreaOverlay';
 import { UIResizeOverlay } from './UIResizeOverlay';
 import { UIFocusGraphOverlay } from './UIFocusGraphOverlay';
 import { SceneViewGizmo } from './SceneViewGizmo';
@@ -2198,6 +2200,7 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
   const selectEntity = useEditorStore((s) => s.selectEntity);
   const selectedId = useEditorStore((s) => s.selectedEntityId);
   const gameViewSize = useEditorStore((s) => s.gameViewSize);
+  const gameViewSafeArea = useEditorStore((s) => s.gameViewSafeArea);
   const showFocusGraph = useEditorStore((s) => s.showFocusGraph);
   const bounds = useLetterboxBounds();
   // Render the UI at the LOGICAL device resolution and visually fit it with
@@ -2237,6 +2240,11 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
       zIndex: 10,
       overflow: 'hidden',
       pointerEvents: 'none',
+      // Same simulated safe area as the Game panel (published to the store by GameView,
+      // which owns the device picker). Both viewports mount the SAME UI tree, so an inset
+      // applied in one and not the other would put an element in two different places and
+      // make the authoring preview the liar instead of the game preview (#271).
+      ...safeAreaCssVars(gameViewSafeArea),
     }}>
       <UIRenderer
         onSelectEntity={(id) => selectEntity(id)}
@@ -2244,6 +2252,9 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
         uiVisualsHidden={!showUI}
       />
       {showUI && showFocusGraph && <UIFocusGraphOverlay />}
+      {/* The bands the vars above inset by — same overlay the Game panel draws, so the
+          authoring view and the game view explain themselves identically. */}
+      {showUI && <SafeAreaOverlay insets={gameViewSafeArea} />}
       {selectedId !== null && (
         <div style={{ position: 'absolute', inset: 0, zIndex: 100000, pointerEvents: 'none' }}>
           <UIResizeOverlay entityId={selectedId} />
