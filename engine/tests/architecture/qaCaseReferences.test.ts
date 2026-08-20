@@ -817,6 +817,29 @@ describeCases('QA case references', () => {
     expect(problems).toEqual([]);
   });
 
+  // The target enum lives in THREE places across TWO repos: this list, qa/README.md's `targets`
+  // sentence, and `TARGETS` in `src/github/cases.ts` of the modoki-testboard repo. The third
+  // cannot be reached from here, and its drift is the SILENT one — the board does not merely
+  // ignore a target it does not know, it records `Unknown target` in the case's `problems` AND
+  // filters it out of the parsed `targets`, so an un-deployed target makes a case look mis-tagged
+  // and drops it from /api/next. That was measured on 2026-08-20 adding `ios-ipad`. This guard
+  // closes the two halves that ARE local, so at least a case can never name a target the spec
+  // does not document, nor the spec promise one no case may use.
+  it('the target enum in this guard matches the one qa/README.md documents', () => {
+    const readme = readFileSync(join(REPO_ROOT, 'qa', 'README.md'), 'utf8');
+    const sentence = /^\*\*`targets`\*\* —([\s\S]*?)\./m.exec(readme)?.[1] ?? '';
+    const documented = [...sentence.matchAll(/`([a-z][\w-]*)`/g)].map((m) => m[1]);
+    // A reformat that stops the parser matching must fail loudly, not vacuously pass.
+    expect(documented.length).toBeGreaterThan(5);
+
+    const missingFromReadme = TARGETS.filter((t) => !documented.includes(t));
+    const missingFromGuard = documented.filter((t) => !TARGETS.includes(t));
+    expect({ missingFromReadme, missingFromGuard }).toEqual({
+      missingFromReadme: [],
+      missingFromGuard: [],
+    });
+  });
+
   it('every MCP tool named in a case exists on the tool surface', () => {
     const unknown: string[] = [];
     for (const c of cases) {

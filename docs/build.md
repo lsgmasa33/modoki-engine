@@ -824,20 +824,36 @@ Designated Requirement*; zero extended attributes; no AppleDouble, `.DS_Store`, 
 directories; six nested framework seals all validating; and the `embedded.mobileprovision` is the
 wildcard team profile **containing the target device's UDID**.
 
-Four controlled installs isolate it to go-ios, not to the bundle and not to iOS 16:
+Five controlled installs isolate it — and the discriminator is **nested frameworks**, not the
+device and not iOS 16:
 
-| installer | device | result |
-|---|---|---|
-| go-ios 1.3.2 | iPhone 8 (16.7.16) | FAIL `0xe8008017` @ VerifyingApplication 40% — debug-dylib build |
-| go-ios 1.3.2 | iPhone 8 (16.7.16) | FAIL `0xe8008017` @ 40% — rebuilt `ENABLE_DEBUG_DYLIB=NO`, monolithic |
-| go-ios 1.3.2 | iPad mini (18.7.8) | FAIL `0xe8008017` @ 40% — same bundle |
-| **ideviceinstaller 1.2.0** | **iPhone 8 (16.7.16)** | **SUCCESS — InstallComplete (100%)**, same bundle |
+| installer | bundle | frameworks | device | result |
+|---|---|---|---|---|
+| go-ios 1.3.2 | 3d-test | 6 | iPhone 8 (16.7.16) | FAIL `0xe8008017` @ VerifyingApplication 40% — debug-dylib build |
+| go-ios 1.3.2 | 3d-test | 6 | iPhone 8 (16.7.16) | FAIL `0xe8008017` @ 40% — rebuilt `ENABLE_DEBUG_DYLIB=NO`, monolithic |
+| go-ios 1.3.2 | 3d-test | 6 | iPad mini (18.7.8) | FAIL `0xe8008017` @ 40% — same bundle |
+| go-ios 1.3.2 | 3d-test | 6 | iPhone 8 (16.7.16) | FAIL — 4th attempt, *after* ideviceinstaller had installed it |
+| **go-ios 1.3.2** | **court** | **2** | **iPhone 8 (16.7.16)** | **SUCCESS — InstallComplete (100%)** |
+| **ideviceinstaller 1.2.0** | 3d-test | 6 | iPhone 8 (16.7.16) | **SUCCESS — InstallComplete (100%)** |
+
+⚠️ **So go-ios is NOT broken generally, and this is the correction that matters.** An earlier
+version of this section said the installs isolated the fault "to go-ios, not to the bundle" — the
+`court` control disproves that. `com.modokiengine.court` carries 2 frameworks (Capacitor, Cordova)
+and installs first try; `com.modokiengine.tropicalisland` carries 6 (those two plus
+FirebaseAnalytics, GoogleAppMeasurement, GoogleAppMeasurementIdentitySupport,
+GoogleAdsOnDeviceConversion) and fails **4/4**. Both pass `codesign --verify --deep --strict` and
+both embed a profile containing the device UDID. **It is deterministic per bundle**, which is why
+it reads as "works sometimes": nearly every project here has 2 frameworks, and only `3d-test`
+carries the Firebase/Google set.
 
 `ios install` zips the `.app` and lets `installd` extract it (note the `.ipa.app` in the error
-path); that round-trip is what breaks the signature's resource seal. libimobiledevice does not use
-that path. Two dead ends already ruled out, so nobody repeats them: it is **not** the Xcode 16
-debug-dylib layout (rebuilding monolithic changed nothing) and **not** an iOS-16 limitation (the
-iPadOS 18.7.8 control failed identically).
+path); that round-trip is what breaks the signature's resource seal, and more nested signed code
+means more seal to preserve. libimobiledevice does not use that path. Three dead ends already ruled
+out, so nobody repeats them: it is **not** the Xcode 16 debug-dylib layout (rebuilding monolithic
+changed nothing), **not** an iOS-16 limitation (the iPadOS 18.7.8 control failed identically), and
+**not fixable by updating go-ios** — v1.3.2 (2026-08-11) is already the newest release, main's
+commits since are dtx/instruments work, and the alternative install path is open and unmerged
+upstream (danielpaulus/go-ios #810 AFC staging, #400 InstallProxy).
 
 **So: when `Build → iOS Device` fails this way, install with `ideviceinstaller` rather than
 debugging the certificate.** On 1.2.0 it takes the `.app` folder directly — no `Payload`/zip step:
