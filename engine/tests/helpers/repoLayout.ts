@@ -62,6 +62,18 @@ export function hasPublishScripts(): boolean {
   return fs.existsSync(path.join(REPO_ROOT, 'scripts', 'publish-engine-oss.sh'));
 }
 
+/** True when this checkout carries the Claude skill runbooks (`.claude/skills/`).
+ *
+ *  Separate from `hasPrivateTooling()` DELIBERATELY, for the reason `hasPublishScripts()`
+ *  gives: `.mcp.json` is a proxy for "this is a developer clone", not the thing a skill
+ *  guard reads. They coincide today (the snapshot ships neither `.claude/` nor `.mcp.json`
+ *  — see scripts/publish-engine-oss.sh), and #159's recipe guard is the standing proof that
+ *  a guard pinned on `.claude/skills/**` goes red on the public gate if it does not gate at
+ *  all. Naming the real dependency keeps that honest. */
+export function hasSkills(): boolean {
+  return fs.existsSync(path.join(REPO_ROOT, '.claude', 'skills'));
+}
+
 /** True when the `oss/` publish overlay (the workflows rewritten onto the public repo by
  *  `scripts/publish-engine-oss.sh`) is present in this checkout. */
 export function hasOssOverlay(): boolean {
