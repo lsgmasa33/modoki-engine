@@ -31,6 +31,14 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
+/**
+ * `node:path` yields `\` on Windows, but every path in this file's vocabulary — the `area`
+ * directory, the cited repo paths, the failure messages — is repo-relative POSIX. Without this the
+ * area check compared "animation" against "animation\some-case.md" and ALL 187 cases failed on
+ * the `win` clone while a Mac clone stayed green. Normalise where paths enter.
+ */
+const toPosix = (p: string) => p.replace(/\\/g, '/');
+
 const REPO_ROOT = join(__dirname, '..', '..', '..');
 const CASES_DIR = join(REPO_ROOT, 'qa', 'cases');
 const HAS_CASES = existsSync(CASES_DIR);
@@ -194,10 +202,10 @@ function loadCases(): CaseFile[] {
     .filter((f) => f.endsWith('.md') && !f.endsWith('README.md'))
     .map((f) => {
       const raw = readFileSync(f, 'utf8');
-      const rel = relative(REPO_ROOT, f);
+      const rel = toPosix(relative(REPO_ROOT, f));
       return {
         rel,
-        dir: relative(CASES_DIR, f).split('/')[0],
+        dir: toPosix(relative(CASES_DIR, f)).split('/')[0],
         fm: parseFrontmatter(raw),
         body: raw,
       };
@@ -557,6 +565,27 @@ describeCases('QA case references', () => {
       } else {
         for (const t of targets) {
           if (!TARGETS.includes(t)) problems.push(`${c.rel}: unknown target "${t}"`);
+        }
+
+        // The `[win]` / `[mac+win]` TITLE TAG must agree with `targets` (qa/README.md § "Windows
+        // cases carry a TITLE TAG"). `targets` is the machine-readable truth, but only the TITLE
+        // is visible in a board listing or a grep — which is the whole reason the tag exists, and
+        // also why it silently rots: nothing about editing `targets` makes you re-read the title.
+        // A case that gains a Windows target and keeps a bare title drops out of the Windows queue
+        // and is never run; one that loses it and keeps the tag sends a Windows session chasing a
+        // case it cannot run. Both are the false-pass/never-run hazard the target split exists to
+        // prevent, so the tag is derived here rather than trusted.
+        const title = (f.title as string) ?? '';
+        const hasWin = targets.includes('editor-win') || targets.includes('packaged-win');
+        const hasMac = targets.includes('editor') || targets.includes('packaged-mac');
+        const want = hasWin ? (hasMac ? '[mac+win] ' : '[win] ') : '';
+        const got = title.startsWith('[mac+win] ') ? '[mac+win] ' : title.startsWith('[win] ') ? '[win] ' : '';
+        if (want !== got) {
+          problems.push(
+            `${c.rel}: title tag ${got ? `"${got.trim()}"` : '(none)'} disagrees with targets ` +
+              `[${targets.join(', ')}] — expected ${want ? `"${want.trim()}"` : 'no tag'}. ` +
+              `See qa/README.md § "Windows cases carry a TITLE TAG".`,
+          );
         }
       }
 

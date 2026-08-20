@@ -14,6 +14,28 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+/** Repo-relative paths this walker EMITS and MATCHES ON are always POSIX-separated.
+ *
+ *  Why this exists: `path.relative` returns `runtime\loaders\x.ts` on Windows, while every
+ *  allowlist that consumes this walker is written with forward slashes (an `ImportEdge.file` is
+ *  source text, not a filesystem path). Without normalizing, `skipEdges` matched NOTHING on
+ *  Windows — so each guard followed the very edges its allowlist exempts, reported them as
+ *  offenders, and failed. It was invisible on macOS and Linux, and it is why
+ *  `render3dBoundary.test.ts` was red on `check (windows-latest)` while ubuntu passed.
+ *  It broke both directions at once: the skip lookup missed, AND the caller's
+ *  `offenders.some(o => o.includes(file))` could not match a backslash chain against a
+ *  forward-slash entry.
+ *
+ *  Normalize at the ONE seam where a filesystem path becomes a comparable identity, so a caller
+ *  can never reintroduce it by forgetting.
+ *
+ *  ⚠️ It splits on BOTH separators rather than on `path.sep`, and that is the difference between
+ *  a fix and a fix nobody can check. A `path.sep` version is a no-op on macOS/Linux, so its test
+ *  would pass on every machine that cannot reproduce the bug — vacuous exactly where the defect
+ *  lives. Splitting on `[\\/]` makes the behaviour platform-independent and lets the unit test
+ *  below feed it a Windows path from any OS. */
+export const toPosix = (p: string): string => p.split(/[\\/]/).join('/');
+
 /** Resolve a relative import specifier to an on-disk .ts/.tsx file (or null). */
 export function resolveRelative(fromFile: string, spec: string): string | null {
   const base = path.resolve(path.dirname(fromFile), spec);
@@ -32,17 +54,22 @@ export function importsOf(file: string): { relatives: string[]; bare: string[] }
   const src = fs.readFileSync(file, 'utf8');
   const relatives: string[] = [];
   const bare: string[] = [];
+  const add = (spec: string, isTypeOnly: boolean) => {
+    if (isTypeOnly) return;
+    if (spec.startsWith('.')) relatives.push(spec);
+    else bare.push(spec);
+  };
   const re = /(?:^|\n)\s*(import\s+type\s+)?[^\n;]*?(?:from|import\()\s*['"]([^'"]+)['"]/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(src)) !== null) {
-    const isTypeOnly = Boolean(m[1]);
-    const spec = m[2];
-    if (spec.startsWith('.')) {
-      if (!isTypeOnly) relatives.push(spec);
-    } else if (!isTypeOnly) {
-      bare.push(spec);
-    }
-  }
+  while ((m = re.exec(src)) !== null) add(m[2], Boolean(m[1]));
+  // Side-effect imports (`import 'x'` — no bindings, so no `from`) need their own pass: the regex
+  // above is anchored on `from`/`import(` and cannot see them. It is a SEPARATE pass rather than
+  // another alternation so it cannot perturb the matching above. This shape is exactly how a
+  // polyfill or a registration module gets pulled in, and missing it made the walker answer
+  // "nothing reaches three/webgpu" about a file that imports it outright — silently, which is the
+  // failure mode these guards exist to prevent.
+  const sideEffect = /(?:^|\n)\s*import\s+['"]([^'"]+)['"]\s*;?/g;
+  while ((m = sideEffect.exec(src)) !== null) add(m[1], false);
   return { relatives, bare };
 }
 
@@ -94,7 +121,7 @@ export function walkClosure(opts: {
     const file = queue.shift()!;
     if (seen.has(file)) continue;
     seen.add(file);
-    const rel = path.relative(srcDir, file);
+    const rel = toPosix(path.relative(srcDir, file));
     const { relatives, bare } = importsOf(file);
     for (const b of bare) {
       if (forbidden.includes(b)) offenders.push(`${b}\n     via ${chainTo(rel)}`);
@@ -103,10 +130,10 @@ export function walkClosure(opts: {
       if (skip.has(`${rel}::${r}`)) continue;
       const resolved = resolveRelative(file, r);
       if (!resolved) continue;
-      const resolvedRel = path.relative(srcDir, resolved);
+      const resolvedRel = toPosix(path.relative(srcDir, resolved));
       if (!cameFrom.has(resolvedRel)) cameFrom.set(resolvedRel, rel);
       queue.push(resolved);
     }
   }
-  return { visited: [...seen].map((f) => path.relative(srcDir, f)), offenders };
+  return { visited: [...seen].map((f) => toPosix(path.relative(srcDir, f))), offenders };
 }
