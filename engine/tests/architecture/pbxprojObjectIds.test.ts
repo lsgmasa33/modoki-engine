@@ -31,8 +31,19 @@ import { hasInternalGames } from '../helpers/repoLayout';
 
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
 
-/** `\t\t<24-hex-ish id> /* comment *\/ = {` — how every pbxproj object definition is written. */
-const DEFINITION = /^\t\t([0-9A-F]{24}) \/\* .* \*\/ = \{/gm;
+/**
+ * `\t\t<24-hex id> [/* comment *\/] = {` — a pbxproj object definition.
+ *
+ * ⚠️ The comment is OPTIONAL and the case is not fixed, and both halves of that were learned
+ * the hard way. The first version of this required `/* … *\/` and uppercase, because that is
+ * the shape the object that actually collided happened to have — matching the SYMPTOM instead
+ * of the pattern. It silently missed the root `PBXProject` object (which carries no comment) in
+ * all 20 committed projects, so a collision on the one id every project shares would have
+ * sailed through the guard written to catch collisions. Xcode writes ids uppercase, but
+ * `healNativeConfig`'s own regexes accept either, and a hand-written id is exactly the kind
+ * that collides.
+ */
+const DEFINITION = /^\t\t([0-9A-Fa-f]{24})(?: \/\* .* \*\/)? = \{/gm;
 
 function definedIds(source: string): string[] {
   return [...source.matchAll(DEFINITION)].map((m) => m[1]);
@@ -62,8 +73,9 @@ describe.skipIf(!hasInternalGames())('committed pbxproj object ids', () => {
       duplicates,
       `${rel} defines ${duplicates.join(', ')} more than once. A duplicate id makes Xcode refuse the `
       + 'whole project ("The project is damaged and cannot be opened") because references resolve to '
-      + 'an object of the wrong class. Renumber the newer object to an id nothing else uses — and note '
-      + "that healNativeConfig.ts's GD_UUID reserves DD0000000000000000000001-0006.",
+      + 'an object of the wrong class. Renumber the newer object to an id nothing else uses. '
+      + 'healNativeConfig.ts reserves TWO ranges, not one: GD_UUID takes '
+      + 'DD0000000000000000000001-0006, and WRAPPER_UUID takes D0D0D0D0D0D0D0D0D0D0D0D0.',
     ).toEqual([]);
   });
 });

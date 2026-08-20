@@ -627,6 +627,27 @@ describeCases('QA case references', () => {
               `does not end with "]".`,
           );
         }
+        // ⚠️ A TAGGED TITLE MUST BE QUOTED, and this is the one check that keeps this guard
+        // honest about its own limits. `parseFrontmatter` is a hand-rolled YAML SUBSET (see its
+        // header) and is more permissive than real YAML: it happily accepted
+        // `title: [win] Opening a project …`, while a real parser rejects it outright — `[`
+        // opens a flow sequence that never closes, so the WHOLE frontmatter fails and every
+        // required field reads as missing.
+        //
+        // That is not hypothetical. The Testboard parses with real YAML, and on 2026-08-20 it
+        // was silently dropping ELEVEN cases — every `[win]` and `[mac+win]` one — reporting
+        // them as `UNKNOWN:<path>` with no id, while `npm test` stayed green. The board and
+        // this guard disagreed about what a case file says, and the lenient one was here.
+        // Quoting makes both parsers agree, which is why it is required rather than advised.
+        const titleLine = c.body.match(/^title:[ \t]*(.*)$/m)?.[1]?.trim() ?? '';
+        if (/^\[/.test(titleLine)) {
+          problems.push(
+            `${c.rel}: a tagged title must be QUOTED — write \`title: "${titleLine}"\`. ` +
+              `Unquoted, "[" opens a YAML flow sequence and a real parser rejects the entire ` +
+              `frontmatter, so the case silently vanishes from the Testboard while this guard ` +
+              `(a permissive YAML subset) still passes it.`,
+          );
+        }
         const title = typeof rawTitle === 'string' ? rawTitle : '';
         const hasWin = targets.includes('editor-win') || targets.includes('packaged-win');
         const hasMac = targets.includes('editor') || targets.includes('packaged-mac');

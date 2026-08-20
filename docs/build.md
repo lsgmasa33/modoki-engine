@@ -77,12 +77,14 @@ other drift. `add-native-target` (`engine/plugins/addNativeTarget.ts`) and the v
 wire in per-game native plugins. Restart the editor after pulling build-pipeline changes — the
 Vite plugin loads once at dev-server start.
 
-⚠️ **`healNativeConfig` mints pbxproj objects from a HARDCODED id space, and it is reserved.**
-`GD_UUID` in that file owns `DD0000000000000000000001` … `DD0000000000000000000006` (the
+⚠️ **`healNativeConfig` mints pbxproj objects from HARDCODED id spaces, and there are TWO of
+them.** `GD_UUID` owns `DD0000000000000000000001` … `DD0000000000000000000006` (the
 MainViewController + GameDebug plugin file/build-file pairs, the retired Release strip phase, and
-the archive-time "Debug build is ON" warning phase). Reusing them deliberately is what keeps the
-heal idempotent and its diff stable — so **anything else that hand-writes a `DD…` object id into a
-pbxproj must start above that range.**
+the archive-time "Debug build is ON" warning phase), and `WRAPPER_UUID` separately owns
+`D0D0D0D0D0D0D0D0D0D0D0D0` (the `modoki.xcconfig` file reference). Fixed ids rather than random
+ones are what keep the heal idempotent and its diff stable — so **anything else that hand-writes
+an object id into a pbxproj must avoid BOTH ranges.** (This entry named only the first until the
+close-out that followed it; a reader taking it at its word would have thought `D0D0…` was free.)
 
 Getting this wrong produces a failure that looks nothing like its cause. A pbxproj is an object
 graph keyed by 24-char ids; defining one id twice is not a syntax error (`plutil -lint` says the
