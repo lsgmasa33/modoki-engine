@@ -12,7 +12,11 @@ type Toggle = 'auto' | boolean;
 /** The five modules, in display order, with a short "what it costs" hint drawn
  *  from the measured bundle table (gzipped) so the choice is informed. */
 const MODULES: { key: string; label: string; hint: string }[] = [
-  { key: 'render3d', label: '3D rendering', hint: 'Three.js / WebGPU (~173 KB)' },
+  // ~430 KB, not the ~173 KB this said until #254: that figure was the `three.webgpu` chunk
+  // alone, not what turning the module OFF gives back. Measured end-to-end on
+  // `games/space-invader --target native`, render3d true vs false: 1128.7 → 701.8 KB gzip
+  // (3715.9 → 2216.2 KB raw). See docs/playable-export.md § Gotchas.
+  { key: 'render3d', label: '3D rendering', hint: 'Three.js / WebGPU (~430 KB)' },
   { key: 'render2d', label: '2D rendering', hint: 'PixiJS (~21 KB)' },
   { key: 'physics2d', label: '2D physics', hint: 'Rapier2D (~635 KB)' },
   { key: 'physics3d', label: '3D physics', hint: 'Rapier3D (~841 KB)' },

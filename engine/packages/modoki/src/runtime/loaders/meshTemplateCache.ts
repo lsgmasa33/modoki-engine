@@ -3,10 +3,9 @@
 
 import * as THREE from 'three';
 import { decomposeTrs } from '../core/ecs/decomposeTrs';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
-import { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
-import { UltraHDRLoader } from 'three/examples/jsm/loaders/UltraHDRLoader.js';
+import type { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
+import type { UltraHDRLoader } from 'three/examples/jsm/loaders/UltraHDRLoader.js';
+import { hdrLoaderCtor, makeGltfLoader, ultraHdrLoaderCtor } from './threeLoaderModules';
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
 import { getMaterialBuilder } from './materialTypes';
 import { registerBuiltinMaterialTypes } from './materialPresets';
@@ -703,12 +702,16 @@ export function loadModelTemplates(
     const handoff = takeParsedGltf(path);
     if (handoff) { void onGltf({ scene: handoff.scene }); return; }
 
-    const gltfLoader = new GLTFLoader();
-    // gltfpack-produced LODs use EXT_meshopt_compression — decode them in
-    // the browser via three's bundled meshopt decoder.
-    gltfLoader.setMeshoptDecoder(MeshoptDecoder);
-    gltfLoader.load(modelGlbUrl(path), onGltf, undefined, (error) => {
-      console.error(`[MeshCache] Failed to load ${path}:`, error);
+    // gltfpack-produced LODs use EXT_meshopt_compression, so the loader is built with
+    // three's bundled meshopt decoder already wired. Both modules are imported on demand
+    // behind the `render3d` gate (#254) — a rejection means a 2D-only bundle reached a GLB.
+    makeGltfLoader().then((gltfLoader) => {
+      gltfLoader.load(modelGlbUrl(path), onGltf, undefined, (error) => {
+        console.error(`[MeshCache] Failed to load ${path}:`, error);
+        reject(error);
+      });
+    }, (error) => {
+      console.error(`[MeshCache] GLTF loader unavailable for ${path}:`, error);
       reject(error);
     });
   });
@@ -1460,15 +1463,26 @@ export async function acquirePrefab(sceneId: SceneId, prefabRef: string): Promis
 const envCache = new Map<string, THREE.DataTexture>();
 const envLoadPromises = new Map<string, Promise<void>>();
 const envOwners = new Map<string, Set<SceneId>>();
-const hdrLoader = new HDRLoader();
+// Both memoise the PROMISE rather than the loader: construction is async since #254, and a
+// field assigned after an await is observable half-done by a concurrent caller. Nothing is
+// configured after construction here, so the worst case would only be a wasted second loader
+// — but the shape is the same one that IS a defect in `riggedModelCache.getLoader`, so keep
+// them identical rather than leaving one instance of the class alive.
+let hdrLoader: Promise<HDRLoader> | null = null;
 // Lazily-built loader for the UltraHDR (gainmap JPEG) format — only constructed if a
 // scene actually uses an `ultrahdr` env, so the WASM/loader isn't pulled otherwise.
-let ultraHdrLoader: UltraHDRLoader | null = null;
-function loaderForEnv(hdrPath: string) {
+let ultraHdrLoader: Promise<UltraHDRLoader> | null = null;
+/** Resolve the HDR loader for `hdrPath`, importing three's loader module on first use via
+ *  `threeLoaderModules` — which owns the `render3d` gate and the reasoning (#254). Both
+ *  loaders stay memoised here rather than there because what is cached is a *constructed*
+ *  loader, and only this file knows which format a given env path resolves to. */
+async function loaderForEnv(hdrPath: string): Promise<HDRLoader | UltraHDRLoader> {
   if (getEnvFormat(hdrPath) === 'ultrahdr') {
-    return ultraHdrLoader ?? (ultraHdrLoader = new UltraHDRLoader());
+    return (ultraHdrLoader ??= ultraHdrLoaderCtor()
+      .then((Ctor) => new Ctor()).catch((e) => { ultraHdrLoader = null; throw e; }));
   }
-  return hdrLoader;
+  return (hdrLoader ??= hdrLoaderCtor()
+    .then((Ctor) => new Ctor()).catch((e) => { hdrLoader = null; throw e; }));
 }
 
 /** Look up a cached HDR environment texture. Accepts guid or path. Returns undefined if not preloaded. */
@@ -1527,37 +1541,47 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
   // full disposeAllCachedResources) is observable when the texture arrives.
   const gen = cacheGeneration;
 
-  const promise = new Promise<void>((resolve) => {
+  const promise = (async () => {
     // Load the converted variant (`~env.hdr` downscaled Radiance, or `~ultrahdr.jpg`
     // gainmap) when the HDR has been converted, else the raw source. The loader is
-    // picked by the resolved format (UltraHDRLoader for ultrahdr, else HDRLoader).
-    loaderForEnv(hdrPath).load(
-      resolveEnvVariantUrl(hdrPath) ?? assetUrl(hdrPath),
-      (texture) => {
-        // If the cache was disposed or the owner released this HDR mid-load,
-        // dispose the just-loaded texture instead of leaving it owner-less in
-        // the cache forever.
-        if (gen !== cacheGeneration || !envOwners.has(hdrPath)) {
-          texture.dispose();
+    // picked by the resolved format (UltraHDRLoader for ultrahdr, else HDRLoader) and
+    // imported on first use (#254), so resolving it is a step that can itself fail.
+    let loader;
+    try {
+      loader = await loaderForEnv(hdrPath);
+    } catch (err) {
+      console.warn(`[MeshCache] HDR loader unavailable for ${hdrPath}:`, err);
+      return; // syncEnvironment falls back to no env — same degrade as a failed load
+    }
+    await new Promise<void>((resolve) => {
+      loader.load(
+        resolveEnvVariantUrl(hdrPath) ?? assetUrl(hdrPath),
+        (texture) => {
+          // If the cache was disposed or the owner released this HDR mid-load,
+          // dispose the just-loaded texture instead of leaving it owner-less in
+          // the cache forever.
+          if (gen !== cacheGeneration || !envOwners.has(hdrPath)) {
+            texture.dispose();
+            resolve();
+            return;
+          }
+          texture.mapping = THREE.EquirectangularReflectionMapping;
+          envCache.set(hdrPath, texture);
+          // Wake the render-on-demand viewport so syncEnvironment applies this IBL.
+          // Like the material refetch above, an HDR that finishes loading after the
+          // Inspector's dirty grace window (editor live-edit / re-import) would otherwise
+          // leave the scene idle and unlit until the next redraw (camera move) or reload.
+          fireDirtyListeners();
           resolve();
-          return;
-        }
-        texture.mapping = THREE.EquirectangularReflectionMapping;
-        envCache.set(hdrPath, texture);
-        // Wake the render-on-demand viewport so syncEnvironment applies this IBL.
-        // Like the material refetch above, an HDR that finishes loading after the
-        // Inspector's dirty grace window (editor live-edit / re-import) would otherwise
-        // leave the scene idle and unlit until the next redraw (camera move) or reload.
-        fireDirtyListeners();
-        resolve();
-      },
-      undefined,
-      (err) => {
-        console.warn(`[MeshCache] HDR load failed for ${hdrPath}:`, err);
-        resolve(); // resolve anyway — syncEnvironment will fall back to no env
-      },
-    );
-  }).finally(() => {
+        },
+        undefined,
+        (err) => {
+          console.warn(`[MeshCache] HDR load failed for ${hdrPath}:`, err);
+          resolve(); // resolve anyway — syncEnvironment will fall back to no env
+        },
+      );
+    });
+  })().finally(() => {
     envLoadPromises.delete(hdrPath);
   });
 

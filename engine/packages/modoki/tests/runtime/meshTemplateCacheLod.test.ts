@@ -4,6 +4,7 @@
  *  by integration tests against the dev server. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { flushLoaderImport } from '../helpers/flushLoaderImport';
 import * as THREE from 'three';
 
 beforeEach(() => {
@@ -285,6 +286,10 @@ describe('invalidateModel — loading-map key matching', () => {
 
       expect(fooAfter).not.toBe(fooPromise);     // foo's load was cleared
       expect(foobarAfter).toBe(foobarPromise);   // foobar's load survived
+      // The loader module is imported on demand (#254), so `.load` lands a few microtasks
+      // after the call. Flush inside the try so these hanging loads hit THIS spy — left
+      // pending they land on the NEXT test's spy instead (measured: loadCount 8, not 1).
+      await flushLoaderImport();
     } finally {
       loadSpy.mockRestore();
     }
@@ -311,6 +316,10 @@ describe('invalidateModel — loading-map key matching', () => {
 
       expect(noneAfter).not.toBe(noneBefore);
       expect(islandAfter).not.toBe(islandBefore);
+      // The loader module is imported on demand (#254), so `.load` lands a few microtasks
+      // after the call. Flush inside the try so these hanging loads hit THIS spy — left
+      // pending they land on the NEXT test's spy instead (measured: loadCount 8, not 1).
+      await flushLoaderImport();
     } finally {
       loadSpy.mockRestore();
     }

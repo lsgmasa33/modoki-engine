@@ -2672,7 +2672,8 @@ async function loadBillboardPage(url: string): Promise<THREE.Texture> {
   // gate; now that scene load no longer waits on a viewport, this is the one KTX2-touching site
   // that must gate itself explicitly (see docs/textures.md, "Runtime resolution").
   if (isKtx) await ensureKtx2Caps();
-  const loader = isKtx ? getKTX2Loader() : new THREE.TextureLoader();
+  // The KTX2 loader module is imported on demand (#254) — hence the await.
+  const loader = isKtx ? await getKTX2Loader() : new THREE.TextureLoader();
   return (loader.loadAsync(url) as Promise<THREE.Texture>).then((tex) => {
     tex.colorSpace = THREE.SRGBColorSpace;
     if (!isKtx) { tex.flipY = false; tex.needsUpdate = true; }
@@ -3469,6 +3470,8 @@ export async function createRenderer(
   // buffer honours `rendering.web.sizeMode` — the editor's own viewports call
   // makeWebGPURenderer directly and stay unclamped.
   const r = await makeWebGPURenderer(container, { applyWebSizeMode: true });
-  setActiveRenderer(r); // KTX2Loader format detection (needs an initialized renderer)
+  // Awaited: registering now imports three's KTX2Loader on demand (#254), and the caps it
+  // detects must be in place before anything this renderer draws asks for a KTX2 texture.
+  await setActiveRenderer(r); // KTX2Loader format detection (needs an initialized renderer)
   return r;
 }

@@ -3,8 +3,7 @@
  *  hierarchy — no second GLB parse, and fixupMesh is guaranteed to be applied. */
 
 import * as THREE from 'three';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
+import { makeGltfLoader } from './threeLoaderModules';
 import { getCurrentWorld, spawnEntity } from '../core/ecs/world';
 import { Transform, Renderable3D, EntityAttributes } from '../traits';
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
@@ -67,10 +66,10 @@ export function loadGLB(
     return Promise.resolve(spawnFromHierarchy(hierarchy, prefix, options));
   }
 
-  // Fallback: parse GLB directly (only hit if loadModelTemplates wasn't called first)
-  return new Promise((resolve, reject) => {
-    const loader = new GLTFLoader();
-    loader.setMeshoptDecoder(MeshoptDecoder);
+  // Fallback: parse GLB directly (only hit if loadModelTemplates wasn't called first).
+  // The loader module is imported on demand behind the `render3d` gate (#254), so getting
+  // one is itself async — a rejection here means a 2D-only bundle reached a GLB.
+  return makeGltfLoader().then((loader) => new Promise<Map<number, string>>((resolve, reject) => {
     loader.load(modelGlbUrl(path), (gltf) => {
       const model = gltf.scene;
 
@@ -185,7 +184,7 @@ export function loadGLB(
       console.log(`[ECS] Loaded ${entityMap.size} meshes from ${path}`);
       resolve(entityMap);
     }, undefined, reject);
-  });
+  }));
 }
 
 /** Spawn ECS entities from pre-extracted hierarchy (no GLB re-parse needed). */

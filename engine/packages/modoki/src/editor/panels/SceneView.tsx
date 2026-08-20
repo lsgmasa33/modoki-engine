@@ -2397,7 +2397,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       releaseRenderer(container);
       return;
     }
-    setActiveRenderer(renderer); // KTX2Loader GPU-format detection
+    await setActiveRenderer(renderer); // KTX2Loader GPU-format detection (async since #254)
     noteRendererProgress('renderer registered (setActiveRenderer called)');
     rendererRef.current = renderer;
 

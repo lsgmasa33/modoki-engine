@@ -10,8 +10,8 @@
 
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
+import type { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { makeGltfLoader } from '../../runtime/loaders/threeLoaderModules';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
@@ -189,15 +189,21 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       s.ownedMaterials.clear();
     };
 
-    const loader = new GLTFLoader();
-    loader.setMeshoptDecoder(MeshoptDecoder);
-    // The derived `.processed.glb` variants carry KTX2 (KHR_texture_basisu)
-    // textures — without a KTX2Loader the GLTFLoader throws "setKTX2Loader must
-    // be called before loading KTX2 textures" and the preview shows nothing.
-    // Reuse the shared transcoder singleton (transcoder path + GPU-format
-    // detection already wired by the main editor renderer's setActiveRenderer).
-    try { loader.setKTX2Loader(getKTX2Loader()); }
-    catch (e) { console.warn('[ModelPreview] KTX2Loader unavailable:', e); }
+    // Built on first use, not up front: three's GLTFLoader/meshopt/KTX2 modules are imported
+    // on demand (#254), so every step here is async. Memoised per effect run — the two load
+    // paths below share one loader, as they did when it was a plain `new GLTFLoader()`.
+    let loaderPromise: Promise<GLTFLoader> | null = null;
+    const getLoader = () => (loaderPromise ??= (async () => {
+      const l = await makeGltfLoader();
+      // The derived `.processed.glb` variants carry KTX2 (KHR_texture_basisu)
+      // textures — without a KTX2Loader the GLTFLoader throws "setKTX2Loader must
+      // be called before loading KTX2 textures" and the preview shows nothing.
+      // Reuse the shared transcoder singleton (transcoder path + GPU-format
+      // detection already wired by the main editor renderer's setActiveRenderer).
+      try { l.setKTX2Loader(await getKTX2Loader()); }
+      catch (e) { console.warn('[ModelPreview] KTX2Loader unavailable:', e); }
+      return l;
+    })());
 
     // Make the raw-GLB material read like the engine will render it. The import
     // pipeline (.mat.json) drops the GLB's emissive entirely, so a source GLB
@@ -232,7 +238,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       s.modelRoot.add(lod);
       for (let i = 0; i < lodCount; i++) {
         const url = assetUrl(sourceUrl + lodUrlSuffix(i));
-        const gltf = await loader.loadAsync(url);
+        const gltf = await (await getLoader()).loadAsync(url);
         // Bail between LOD loads on cancellation. Any later LODs that would
         // have run produce wasted bytes; the already-loaded gltf gets disposed
         // by the cleanup-time clearModel() pass via ownedGeometries.
@@ -292,7 +298,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
           // Single-level: load just the chosen GLB (LOD0 fallback when no LODs).
           const level = hasLods ? (lodChoice as number) : 0;
           const url = hasLods ? assetUrl(sourceUrl + lodUrlSuffix(level)) : assetUrl(sourceUrl);
-          const gltf = await loader.loadAsync(url);
+          const gltf = await (await getLoader()).loadAsync(url);
           if (cancelled) return;
           buildSingle(gltf as { scene: THREE.Group });
           frameCamera();

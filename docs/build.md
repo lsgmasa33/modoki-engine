@@ -77,6 +77,32 @@ other drift. `add-native-target` (`engine/plugins/addNativeTarget.ts`) and the v
 wire in per-game native plugins. Restart the editor after pulling build-pipeline changes — the
 Vite plugin loads once at dev-server start.
 
+⚠️ **`healNativeConfig` mints pbxproj objects from a HARDCODED id space, and it is reserved.**
+`GD_UUID` in that file owns `DD0000000000000000000001` … `DD0000000000000000000006` (the
+MainViewController + GameDebug plugin file/build-file pairs, the retired Release strip phase, and
+the archive-time "Debug build is ON" warning phase). Reusing them deliberately is what keeps the
+heal idempotent and its diff stable — so **anything else that hand-writes a `DD…` object id into a
+pbxproj must start above that range.**
+
+Getting this wrong produces a failure that looks nothing like its cause. A pbxproj is an object
+graph keyed by 24-char ids; defining one id twice is not a syntax error (`plutil -lint` says the
+file is fine), the later definition silently wins, and every reference to that id then resolves to
+an object of the WRONG CLASS. Xcode refuses the entire project:
+
+```
+xcodebuild: error: Unable to read project 'App.xcodeproj' …
+  Reason: The project 'App' is damaged and cannot be opened.
+  Exception: -[PBXShellScriptBuildPhase buildPhase]: unrecognized selector sent to instance
+```
+
+`games/ota-test` shipped exactly this and was **unbuildable for iOS on every clone** from
+`7de8607fc` until 2026-08-20: the OTA bring-up had hand-written `OtaCore.swift`'s `PBXBuildFile` at
+`DD…0006`, which the archive-warning phase later claimed. Nobody noticed because that fixture is
+only built when someone runs the OTA device case — which could then never run. Fixed by renumbering
+the OTA side to `DD…000C`, and guarded by
+`engine/tests/architecture/pbxprojObjectIds.test.ts`, which fails `npm test` on any duplicate
+object definition in a committed `games/**` or `demos/**` pbxproj.
+
 ## Committing native folders (SOURCE only)
 
 Each game's `ios/` + `android/` are tracked (pbxproj, gradle scripts, `res/`, `Info.plist`,

@@ -89,3 +89,77 @@ describe('render3d:false boundary — the 2D boot path never reaches three/webgp
     }
   });
 });
+
+/** #254 — the SECOND mechanism with the same symptom, found while fixing #214.
+ *
+ *  three's example loaders (`three/examples/jsm/**`) are 3D-only consumers, but a *static*
+ *  import of one is reachable from the `runtime/index.ts` barrel that every build keeps alive.
+ *  So `games/space-invader` shipped GLTFLoader, both HDR decoders, KTX2Loader and the meshopt
+ *  decoder it can never call. `three/webgpu` was never reached — this is a different edge, and
+ *  #214's gate does not touch it, which is why FORBIDDEN above cannot see it.
+ *
+ *  Measured on that project (raw JS / gzip, whole `dist/assets`): GLTF+meshopt+HDR+UltraHDR
+ *  −125.8 kB / −34.8 kB, KTX2Loader a further −60.2 kB / −24.4 kB. The two together release
+ *  2.9 kB more than the sum of their parts — three core that only they retained.
+ *
+ *  The rule this pins: exactly ONE module may name those specifiers, it must do so with a
+ *  gated `import()`, and nothing else on the 2D path may reach them statically. */
+const LOADER_OWNER = 'runtime/loaders/threeLoaderModules.ts';
+const EXAMPLE_LOADER_RE = /three\/examples\/jsm\//;
+
+describe('render3d:false boundary — three\'s example loaders are imported on demand (#254)', () => {
+  /** Files reachable from the 2D entries, following relative imports only (same closure the
+   *  guard above walks). Reused by both assertions so they cannot disagree about the set. */
+  const reachable = walkClosure({ srcDir, entries: ENTRIES, forbidden: [], skipEdges: GATED_EDGES }).visited;
+
+  it('no module on the 2D path STATICALLY imports a three example loader', () => {
+    expect(reachable.length).toBeGreaterThan(100); // non-vacuity: an empty closure proves nothing
+    // Matched per LINE, not per specifier: the owner module legitimately names every one of
+    // these in an `import type` (erased, no runtime edge) and again in a gated `import()`. Only
+    // a value-carrying `from '…'` — or a bare side-effect import — is the defect.
+    const STATIC_IMPORT = /^\s*import\s+(?!type[\s{])[^;]*?from\s*['"](three\/examples\/jsm\/[^'"]+)['"]/;
+    const SIDE_EFFECT = /^\s*import\s*['"](three\/examples\/jsm\/[^'"]+)['"]/;
+    const offenders: string[] = [];
+    for (const rel of reachable) {
+      const lines = fs.readFileSync(path.join(srcDir, rel), 'utf8').split('\n');
+      lines.forEach((line, i) => {
+        const m = STATIC_IMPORT.exec(line) ?? SIDE_EFFECT.exec(line);
+        if (m) offenders.push(`${rel}:${i + 1} → ${m[1]}`);
+      });
+    }
+    expect(
+      offenders,
+      `A render3d:false build would ship three's example loaders it can never call (#254). ` +
+        `Route the import through ${LOADER_OWNER}, which gates it on __MODOKI_MODULE_RENDER3D__ ` +
+        `so Rolldown can DCE both the import and its chunk:\n  ${offenders.join('\n  ')}`,
+    ).toEqual([]);
+  });
+
+  it(`every ${LOADER_OWNER} import() sits behind the render3d gate`, () => {
+    const abs = path.join(srcDir, LOADER_OWNER);
+    expect(fs.existsSync(abs), `${LOADER_OWNER} no longer exists — this guard is stale`).toBe(true);
+    const src = fs.readFileSync(abs, 'utf8');
+    const dynamic = [...src.matchAll(/import\(\s*['"](three\/examples\/jsm\/[^'"]+)['"]\s*\)/g)];
+    // Non-vacuity: a renamed module or a changed import shape would otherwise pass with zero
+    // matches and vouch for nothing. Every accessor this file exports owns one.
+    expect(dynamic.length).toBeGreaterThanOrEqual(4);
+    // The gate must come BEFORE the import in the same function, or Rolldown keeps the chunk.
+    // Checking per-line is what distinguishes "the flag is mentioned in this file somewhere"
+    // from "this particular import is unreachable when the flag is false".
+    const lines = src.split('\n');
+    const ungated = dynamic
+      .map((m) => lines.findIndex((l) => l.includes(m[0])))
+      .filter((i) => {
+        const fnStart = lines.slice(0, i).map((l, j) => ({ l, j })).reverse()
+          .find(({ l }) => /^(export )?(async )?function /.test(l))?.j ?? 0;
+        return !lines.slice(fnStart, i + 1).some((l) => l.includes('__MODOKI_MODULE_RENDER3D__'));
+      })
+      .map((i) => `${LOADER_OWNER}:${i + 1}`);
+    expect(
+      ungated,
+      `an import() of a three example loader is reachable when render3d is off — Rolldown will ` +
+        `emit its chunk into a 2D-only bundle. Put the __MODOKI_MODULE_RENDER3D__ check FIRST in ` +
+        `the accessor:\n  ${ungated.join('\n  ')}`,
+    ).toEqual([]);
+  });
+});

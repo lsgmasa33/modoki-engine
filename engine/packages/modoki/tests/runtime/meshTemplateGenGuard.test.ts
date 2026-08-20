@@ -10,6 +10,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { flushLoaderImport } from '../helpers/flushLoaderImport';
 import * as THREE from 'three';
 
 // Deferred GLTFLoader: stash onLoad so the test fires it after disposing.
@@ -64,6 +65,7 @@ describe('loadModelTemplates — cacheGeneration guard (F11)', () => {
   it('promotes templates when no teardown raced the load', async () => {
     const cache = await import('../../src/runtime/loaders/meshTemplateCache');
     const p = cache.loadModelTemplates(ISLAND, undefined, 'none');
+    await flushLoaderImport(); // the loader module is imported on demand (#254)
     expect(h.pending).toHaveLength(1);
     h.pending[0].fire(); // load resolves with no intervening dispose
     await p;
@@ -74,6 +76,7 @@ describe('loadModelTemplates — cacheGeneration guard (F11)', () => {
   it('drops + disposes templates when a teardown bumped the generation mid-load', async () => {
     const cache = await import('../../src/runtime/loaders/meshTemplateCache');
     const p = cache.loadModelTemplates(ISLAND, undefined, 'none');
+    await flushLoaderImport(); // the loader module is imported on demand (#254)
     expect(h.pending).toHaveLength(1);
 
     // Scene swap completes while the GLB is still in flight.

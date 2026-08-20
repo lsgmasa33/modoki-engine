@@ -9,7 +9,7 @@
  */
 
 import * as THREE from 'three';
-import { KTX2Loader } from 'three/examples/jsm/loaders/KTX2Loader.js';
+import type { KTX2Loader } from 'three/examples/jsm/loaders/KTX2Loader.js';
 import type { WebGPURenderer } from 'three/webgpu';
 import { assetUrl, withCacheBust } from './assetUrl';
 import { resolveRef, getAssetEntry, isGuid, getAtlasFrame, type AtlasFrameRef } from './assetManifest';
@@ -21,6 +21,7 @@ import { envVariantSuffix, type EnvFormat } from '../core/environmentSettings';
 import {
   setActiveRendererHandle, ktx2CapsReady, areKtx2CapsReady, markKtx2CapsReady,
 } from '../core/activeRenderer';
+import { ktx2LoaderCtor, prewarmGlbLoaders } from './threeLoaderModules';
 import { warnVocabOnce } from '../core/warnVocab';
 import { getActiveTextureSizeCap } from '../core/textureSizeCap';
 export { getActiveRenderer, onRendererReady, rendererReady, getRendererGateHealth } from '../core/activeRenderer';
@@ -38,10 +39,21 @@ let ktx2Loader: KTX2Loader | null = null;
 let texLoader: THREE.TextureLoader | null = null;
 let detectedCaps = { astc: false };
 
-export function getKTX2Loader(): KTX2Loader {
+/** The shared KTX2 transcoder. ASYNC because three's `KTX2Loader` module is imported on
+ *  demand behind the `render3d` gate (#254) — a static import here put 60.2 kB of transcoder
+ *  into every 2D-only bundle, reachable from the runtime barrel. Every caller was already on
+ *  an async path (all of them gate on `ensureKtx2Caps` first — see `ktx2CapsGuard`), so this
+ *  costs no new plumbing; the memo keeps it to one import and one loader. */
+export async function getKTX2Loader(): Promise<KTX2Loader> {
   if (!ktx2Loader) {
-    ktx2Loader = new KTX2Loader();
-    ktx2Loader.setTranscoderPath(assetUrl('/basis/'));
+    const Ctor = await ktx2LoaderCtor();
+    // Re-check: two concurrent callers can both pass the guard above and await in parallel.
+    // Whoever lands second must reuse the first loader, or `detectSupport` gets applied to a
+    // loader nobody else holds and every KTX2 load after it rejects on missing caps.
+    if (!ktx2Loader) {
+      ktx2Loader = new Ctor();
+      ktx2Loader.setTranscoderPath(assetUrl('/basis/'));
+    }
   }
   return ktx2Loader;
 }
@@ -53,9 +65,9 @@ function getTextureLoader(): THREE.TextureLoader {
 /** Register the active renderer so the KTX2Loader can detect which compressed
  *  formats the GPU supports. Must run after `renderer.init()` for WebGPU.
  *  Idempotent + cheap — safe to call from every renderer creation site. */
-export function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer): void {
+export async function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer): Promise<void> {
   try {
-    const loader = getKTX2Loader();
+    const loader = await getKTX2Loader();
     loader.detectSupport(renderer as never);
     const cfg = (loader as unknown as { workerConfig?: { astcSupported?: boolean } }).workerConfig;
     detectedCaps = { astc: !!cfg?.astcSupported };
@@ -63,6 +75,9 @@ export function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer
     console.warn('[textureResolver] detectSupport failed:', e);
   }
   setActiveRendererHandle(renderer);
+  // A 3D renderer exists, so a GLB parse is likely imminent — start fetching the on-demand
+  // loader chunks now rather than on the critical path of the first model load (#254).
+  prewarmGlbLoaders();
 }
 
 /** Default delay before `ensureKtx2Caps` gives up waiting for a real viewport and stands up a
@@ -84,7 +99,7 @@ async function runCapsProbe(
       let probe: WebGPURenderer | THREE.WebGLRenderer | undefined;
       try {
         probe = await probeFactory();
-        getKTX2Loader().detectSupport(probe as never);
+        (await getKTX2Loader()).detectSupport(probe as never);
       } catch (e) {
         // Resolve anyway: a per-texture rejection with a clear cause beats an eternal hang for
         // every future KTX2 load. `detectSupport` copies capability booleans synchronously and
@@ -413,7 +428,6 @@ export async function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Pr
   if (hit) { hit.refCount++; return hit.promise; }
 
   const settings = getTextureSettings(ref);
-  const loader = isKtx ? getKTX2Loader() : getTextureLoader();
   const entry: TexCacheEntry = { promise: undefined as never, texture: null, refCount: 1, url };
   // Gate KTX2 loads on transcoder caps: KTX2Loader.loadAsync throws "Missing
   // initialization with `.detectSupport( renderer )`" if it runs before caps are known.
@@ -429,7 +443,11 @@ export async function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Pr
   const gate = isKtx && !areKtx2CapsReady() ? ensureKtx2Caps() : Promise.resolve();
   // Cast unifies the KTX2Loader/TextureLoader loadAsync union (CompressedTexture
   // extends Texture) so the extra `.then` gate doesn't break inference.
-  entry.promise = gate.then(() => loader.loadAsync(url) as Promise<THREE.Texture>).then((loaded) => {
+  entry.promise = gate
+    // The KTX2 loader module is imported on demand (#254), so pick the loader AFTER the caps
+    // gate rather than before it — the two awaits collapse into the one the gate already cost.
+    .then((): Promise<KTX2Loader | THREE.TextureLoader> => (isKtx ? getKTX2Loader() : Promise.resolve(getTextureLoader())))
+    .then((loader) => loader.loadAsync(url) as Promise<THREE.Texture>).then((loaded) => {
     const tex = loaded as THREE.Texture;
     applyTextureSettings(tex, settings, isKtx, opts?.flipY);
     (tex.userData as Record<string, unknown>)[KEY] = key;

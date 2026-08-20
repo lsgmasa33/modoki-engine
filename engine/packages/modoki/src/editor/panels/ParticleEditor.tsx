@@ -81,7 +81,7 @@ export default function ParticleEditor() {
       try { renderer = await makeWebGPURenderer(container); }
       catch (e) { console.error('[ParticleEditor] renderer init failed', e); return; }
       if (disposed) { renderer.dispose(); renderer.domElement.remove(); return; }
-      setActiveRenderer(renderer);
+      await setActiveRenderer(renderer); // async since #254 — imports three's KTX2Loader
       rendererRef.current = renderer;
 
       const scene = new THREE.Scene();

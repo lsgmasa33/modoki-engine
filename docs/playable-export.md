@@ -88,6 +88,45 @@ removes nothing" below for the two that were not, and why they are gone rather t
     listed explicitly and each is re-checked to still carry its gate. Adding a new one is a
     deliberate line in `GATED_EDGES`, not a silent 546 KB.
 
+- **The SAME symptom had a SECOND mechanism, and #214's gate does not touch it** (#254). Post-#214
+  `space-invader` still carried three's **example loaders** — `GLTFLoader`, `HDRLoader`,
+  `UltraHDRLoader`, `KTX2Loader` and the meshopt decoder — because they were *static* imports in
+  modules the `runtime/index.ts` barrel keeps alive (`loadGLB`, `meshTemplateCache`,
+  `riggedModelCache`, `textureResolver`). Nothing reached `three/webgpu`, so the #214 guard was
+  green and correct; a 2D game simply shipped four loaders it can never call.
+  - **Attribution first, refactor second.** Each group was stubbed out and rebuilt to get a real
+    number before anything was designed: KTX2Loader **−60.2 kB raw / −24.4 kB gzip**, and
+    GLTF+meshopt+HDR+UltraHDR **−126.3 kB / −34.9 kB**, of a 2458 kB / 779 kB baseline. Together
+    they release 2.9 kB *more* than the sum of their parts — the three core only they retained —
+    which is the measurement that says the rest of that chunk is core a 2D build genuinely uses
+    (`Object3D`/`Matrix4`/`BufferGeometry`). **A barrel/registration refactor is therefore NOT
+    justified**; the loaders were the whole recoverable win.
+  - **One module owns all four gates**: `runtime/loaders/threeLoaderModules.ts`. Landed result
+    **2269 kB raw / 719 kB gzip** (−184.2 / −58.7), within 850 bytes of the stub prediction.
+  - **A 3D build pays one round-trip it did not before** — the loader chunk must arrive before the
+    first GLB fetch can start. So `setActiveRenderer` (the one call every 3D viewport makes) fires
+    `prewarmGlbLoaders()`; GLTF+meshopt only, since an HDR or KTX2 chunk is speculative in a way
+    those two are not.
+  - **Making a lazy singleton async opens a window it never had — memoise the PROMISE, not the
+    value.** `riggedModelCache.getLoader()` assigned its loader, *then* awaited `getKTX2Loader()`
+    to attach the transcoder. A second caller arriving in that gap saw a truthy field and got the
+    loader back **unconfigured**, so an optimized `.processed.glb` carrying KTX2 textures throws
+    "setKTX2Loader must be called before loading KTX2 textures" — and concurrent rigged acquires
+    within one scene load are the normal case, not a corner. Found reviewing the #254 diff, not
+    by a failing test. The same shape is in `meshTemplateCache`'s HDR loaders (benign there —
+    nothing is configured post-construction) and was written correctly in `ModelPreview`; they
+    are all `??= (async () => …)()` now, so the class is closed rather than one instance of it.
+  - **And do not memoise the REJECTION.** A failed chunk fetch stored in the memo leaves every
+    later load rejecting for the life of the page, recoverable only by a reload. Each accessor
+    clears its slot in a `.catch` — the rule `textureResolver`'s texture cache already states.
+    ⚠️ Do NOT dry these up into a shared `lazyOnce(() => import(…))`: that captures the
+    `import()` in a module-scope arrow Rolldown can no longer prove unreachable, the gate stops
+    folding, and every chunk comes back. The repetition buys the DCE.
+  - **The knock-on is that `getKTX2Loader()` and `setActiveRenderer()` are async.** That was
+    affordable only because every KTX2 call site was already behind `ensureKtx2Caps()` — a property
+    `ktx2CapsGuard.test.ts` enforces. The ordering inside `setActiveRenderer` is unchanged
+    (detect → register); it is deferred, not reordered.
+
 - **A toggle that removes nothing is worse than no toggle — `npr` and `gpuParticles` were DELETED,
   not wired** (#256, 2026-08-19). Both were resolved by `resolveModules`, given dedicated ride-along
   logic in `detectModules`, emitted as `__MODOKI_MODULE_NPR__` / `__MODOKI_MODULE_GPU_PARTICLES__`

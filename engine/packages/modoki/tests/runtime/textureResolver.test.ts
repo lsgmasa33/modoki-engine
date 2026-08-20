@@ -220,11 +220,11 @@ describe('shared texture cache (F3 — dedup + refcount)', () => {
   // `ktx2CapsReadyFired` is module-monotonic) don't hang waiting on a probe. Stub
   // detectSupport so caps stay the pristine {astc:false} the earlier variant-selection
   // tests assert against.
-  beforeAll(() => {
-    const detect = vi.spyOn(getKTX2Loader(), 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
+  beforeAll(async () => {
+    const detect = vi.spyOn(await getKTX2Loader(), 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
       this.workerConfig = { astcSupported: false }; return this as never;
     });
-    setActiveRenderer({} as never);
+    await setActiveRenderer({} as never);
     detect.mockRestore();
   });
   beforeEach(() => {
@@ -303,7 +303,7 @@ describe('shared texture cache (F3 — dedup + refcount)', () => {
   // to ONE entry.
   it('shares ONE entry for a KTX2 texture regardless of flipY (always bottom-origin)', async () => {
     registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' });
-    const ktxSpy = vi.spyOn(getKTX2Loader(), 'loadAsync')
+    const ktxSpy = vi.spyOn(await getKTX2Loader(), 'loadAsync')
       .mockImplementation(async () => new THREE.Texture() as never);
     const a = await loadTexture3D(GUID, { flipY: true });
     const b = await loadTexture3D(GUID, { flipY: false });
@@ -317,7 +317,7 @@ describe('shared texture cache (F3 — dedup + refcount)', () => {
 
   it('loads a KTX2 variant from the ~uastc.ktx2 URL (not the source PNG)', async () => {
     registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' });
-    const ktxSpy = vi.spyOn(getKTX2Loader(), 'loadAsync')
+    const ktxSpy = vi.spyOn(await getKTX2Loader(), 'loadAsync')
       .mockImplementation(async () => new THREE.Texture() as never);
     await loadTexture3D(GUID);
     const url = ktxSpy.mock.calls[0][0] as string;
@@ -402,7 +402,7 @@ describe('applyTextureSettings branches (via loadTexture3D)', () => {
     // Spy the KTX2Loader instance directly: its real loadAsync needs GPU init
     // (detectSupport), and a prior describe's mockRestore can leave the singleton's
     // own loadAsync = real, shadowing the prototype spy.
-    const ktxSpy = vi.spyOn(getKTX2Loader(), 'loadAsync').mockImplementation(async () => new THREE.Texture() as never);
+    const ktxSpy = vi.spyOn(await getKTX2Loader(), 'loadAsync').mockImplementation(async () => new THREE.Texture() as never);
     const tex = await loadTexture3D(GUID, { flipY: true }); // opt ignored on the KTX branch
     expect(tex.flipY).toBe(false);
     expect(tex.generateMipmaps).toBe(false); // baked mips, never regenerated
@@ -411,7 +411,7 @@ describe('applyTextureSettings branches (via loadTexture3D)', () => {
 
   it('routes a ?v=<hash> cache-busted .ktx2 URL down the KTX branch (regex handles the suffix)', async () => {
     vi.stubEnv('PROD', true); // PROD appends ?v=<hash>
-    const ktxSpy = vi.spyOn(getKTX2Loader(), 'loadAsync').mockImplementation(async () => new THREE.Texture() as never);
+    const ktxSpy = vi.spyOn(await getKTX2Loader(), 'loadAsync').mockImplementation(async () => new THREE.Texture() as never);
     try {
       registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, undefined, 'cafef00d');
       const tex = await loadTexture3D(GUID);
@@ -431,8 +431,8 @@ describe('applyTextureSettings branches (via loadTexture3D)', () => {
 // at the END of the file so earlier "default caps" tests run against the pristine
 // {astc:false} state. The last test restores caps to false for hygiene.
 describe('getKTX2Loader (Missing Test #4)', () => {
-  it('returns the same singleton instance', () => {
-    expect(getKTX2Loader()).toBe(getKTX2Loader());
+  it('returns the same singleton instance', async () => {
+    expect(await getKTX2Loader()).toBe(await getKTX2Loader());
   });
 });
 
@@ -440,12 +440,12 @@ describe('setActiveRenderer caps detection + rendererReady (Missing Test #3)', (
   // A minimal renderer stub; detectSupport is overridden via a spy on the loader.
   const fakeRenderer = {} as never;
 
-  it('reflects astc support from the loader workerConfig into variant selection', () => {
-    const loader = getKTX2Loader();
+  it('reflects astc support from the loader workerConfig into variant selection', async () => {
+    const loader = await getKTX2Loader();
     const detect = vi.spyOn(loader, 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
       this.workerConfig = { astcSupported: true }; return this as never;
     });
-    setActiveRenderer(fakeRenderer);
+    await setActiveRenderer(fakeRenderer);
     detect.mockRestore();
 
     // detectedCaps.astc=true → a ktx2-astc texture now resolves to the native ~astc.ktx2
@@ -460,20 +460,20 @@ describe('setActiveRenderer caps detection + rendererReady (Missing Test #3)', (
     expect(cb).toHaveBeenCalledTimes(1);
   });
 
-  it('swallows a detectSupport throw with a warn (renderer still set)', () => {
+  it('swallows a detectSupport throw with a warn (renderer still set)', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const detect = vi.spyOn(getKTX2Loader(), 'detectSupport').mockImplementation(() => { throw new Error('no gpu'); });
-    expect(() => setActiveRenderer({} as never)).not.toThrow();
+    const detect = vi.spyOn(await getKTX2Loader(), 'detectSupport').mockImplementation(() => { throw new Error('no gpu'); });
+    await expect(setActiveRenderer({} as never)).resolves.toBeUndefined();
     expect(warn).toHaveBeenCalled();
     expect(getActiveRenderer()).toBeDefined();
     detect.mockRestore();
     warn.mockRestore();
 
     // Restore caps to {astc:false} for any later additions to this file.
-    const reset = vi.spyOn(getKTX2Loader(), 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
+    const reset = vi.spyOn(await getKTX2Loader(), 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
       this.workerConfig = { astcSupported: false }; return this as never;
     });
-    setActiveRenderer({} as never);
+    await setActiveRenderer({} as never);
     reset.mockRestore();
   });
 });

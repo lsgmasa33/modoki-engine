@@ -107,11 +107,11 @@ const PATH = '/models/alien.glb';
 // via setActiveRenderer marks KTX2 caps ready too (a real renderer implies caps —
 // see activeRenderer.ts), so the load-path tests here don't hang waiting on a probe.
 // Stub detectSupport so a {} renderer doesn't warn.
-beforeAll(() => {
-  const detect = vi.spyOn(getKTX2Loader(), 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
+beforeAll(async () => {
+  const detect = vi.spyOn(await getKTX2Loader(), 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
     this.workerConfig = { astcSupported: false }; return this as never;
   });
-  setActiveRenderer({} as never);
+  await setActiveRenderer({} as never);
   detect.mockRestore();
 });
 

@@ -40,7 +40,7 @@ describe('ensureKtx2Caps', () => {
   it('resolves synchronously when caps are already ready — no probe attempted', async () => {
     const { setActiveRenderer } = await import('../../src/runtime/loaders/textureResolver');
     const { ensureKtx2Caps } = await import('../../src/runtime/loaders/textureResolver');
-    setActiveRenderer({} as never); // a real viewport already registered
+    await setActiveRenderer({} as never); // a real viewport already registered
     const probeFactory = vi.fn();
     await ensureKtx2Caps({ probeFactory });
     expect(probeFactory).not.toHaveBeenCalled();
@@ -86,7 +86,7 @@ describe('ensureKtx2Caps', () => {
     const probeFactory = vi.fn();
 
     const p = ensureKtx2Caps({ delayMs: 2000, timers: { setTimeout: timers.setTimeout as never, clearTimeout: timers.clearTimeout as never }, probeFactory });
-    setActiveRenderer({} as never); // a real viewport wins the race before the delay fires
+    await setActiveRenderer({} as never); // a real viewport wins the race before the delay fires
     await p;
 
     expect(probeFactory).not.toHaveBeenCalled();
