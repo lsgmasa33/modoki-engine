@@ -342,10 +342,11 @@ kept `x`, dropped the `y`/`z` that made it correct, and left the entity where it
 `changed:1`. Writing all nine instead would land decompose noise on axes nobody mentioned.
 
 A **collapsed** (zero-scale) ancestor is **refused**, naming the axes: it maps every descendant onto
-its own origin, so the request has no solution. This was silent by construction —
-`Matrix4.decompose` hits its `det === 0` branch and substitutes scale `(1,1,1)` with an identity
-quaternion, so a collapsed parent read back as unscaled *and* unrotated and the conversion proceeded
-confidently on a parent that does not exist.
+its own origin, so the request has no solution. There were two independent reasons the old code
+answered anyway, and only one of them has since been fixed — the refusal is **not** obsolete:
+`worldToLocalTrs` inverts the parent's matrix, and a singular matrix inverts to the **zero matrix**.
+No decomposition rescues that; the information is gone from the matrix. (The other reason — that
+`Matrix4.decompose` LIED about the parent — is fixed; see below.)
 
 A **prefab-instance** ancestor contributes its `overrides[localId].Transform`, not `traits.Transform`
 — a captured instance root has no top-level Transform at all. (Narrower remaining gap: an instance
@@ -369,6 +370,72 @@ The corollary, confirmed as the convention on 2026-07-31: **a sheared parent is 
 the way it is not in Unity's `Transform`. An authoring path that is *more* exact than the format is
 not more correct — it just disagrees with the format, the gizmo, and the other path. That is why the
 live path was changed to decompose rather than the file path being changed to invert.
+
+### A zero scale axis: `decomposeTrs`, not `Matrix4.decompose` (#258)
+
+Shear above is a limit the TRS format genuinely has. A **zero scale axis is not** — it is an
+ordinary authored value ("hidden", "not yet grown", and what a keyframe clip keys when something
+grows from nothing) — and three.js answered it with a lie rather than an error:
+
+```js
+// three r184, Matrix4.decompose
+const det = this.determinant();
+if ( det === 0 ) { scale.set( 1, 1, 1 ); quaternion.identity(); return this; }
+```
+
+So an entity scaled to zero anywhere in its parent chain composed to a **singular** world matrix and
+came back at **identity scale and identity rotation** — drawn at FULL size, with the parent chain's
+scale dropped from the other axes and any rotation silently discarded. Measured on `games/court`'s
+guard flag: a child at `sx = 0` under a `0.53` root drew 10.8 CSS px wide against 5.2 px for the same
+child at `sx = 0.907`. The ECS data was perfectly correct throughout (the local trait reads back `0`
+exactly), so only the pixels were wrong.
+
+**Every decomposition of a matrix that can be singular therefore goes through
+`runtime/core/ecs/decomposeTrs.ts`** instead of calling `Matrix4.decompose` directly. It delegates
+to three whenever the matrix is invertible (identical output, no epsilon anywhere — `0.001` must
+keep composing exactly as it does today) and, only on `det === 0`, takes the scale from the basis
+column lengths and rebuilds the rotation from the surviving columns. What a TRS triple still cannot
+carry at a zero — the scale's SIGN, and the roll about a lone surviving axis — is listed in that
+file's header.
+
+The call sites, because "which ones" is the part that rots: both halves of the world-transform
+contract (`transformPropagationSystem`, `worldTransform`), the authoring conversion above
+(`transformSpace`), the editor's gizmo / group-drag / reparent paths (`gizmoTransform`,
+`multiTransform`, `entityActions`, `SceneView`), **GLB import** (`meshTemplateCache`
+— a node authored with a zero scale axis, a common way to hide one, would otherwise import at full
+size), and the **skeletal** paths (`scene3DSync` ×3, `rigBones`). The skeletal write-back is the
+user-reachable one: `Bone` entities are hand-posable, so typing `0` into a bone's scale in the
+Inspector composes a singular matrix, and through three that wrote scale 1 and an identity rotation
+straight onto the `THREE.Bone`.
+
+The invariant that makes this safe to apply broadly: **`decomposeTrs` is byte-identical to
+`Matrix4.decompose` for every invertible matrix**, so converting a site can only change behaviour
+where the old answer was already wrong.
+
+`grep -rn '\.decompose(' engine/packages/modoki/src engine/app games/*/runtime demos/*/runtime`
+should return exactly one live call — `games/sling`'s aim visual, whose two callers both floor the
+length (`1.0 + …` and `|| 0.001`) so its matrix is never singular. A new hit is either a new site
+that needs converting or a deliberate exception that should say why.
+
+**Telling the truth about a zero exposed a trap that had been hiding behind the lie.** The SceneView
+scale gizmo clamps an axis to 0 when its sign FLIPS mid-drag (`clampScaleCrossingPivot`, so dragging
+past the pivot stops instead of mirroring), and it captures the start sign with `Math.sign` off the
+object's *world* scale. `Math.sign(0) === 0`, so an axis that starts collapsed differs from every
+non-zero drag value and gets clamped back to 0 on every tick — the entity appears to grow during the
+drag and snaps back to invisible on mouse-up. That always affected ROOT entities (their world scale
+is their local scale, no decompose involved); fixing the composition made it reachable for CHILDREN
+too, because a collapsed child used to read back as scale 1. An axis whose start sign is 0 is now
+exempt in both `clampScaleCrossingPivot` and `scaleCrossedPivot` — 0 has no side, so there is no
+pivot to cross. Being able to drag back out of "hidden" is the workflow the zero idiom exists for.
+
+**The same class, one API over**: `Matrix4.invert()` and `Matrix3.invert()` return the **zero
+matrix** on `det === 0`, equally silently. That one is not fixable by better math — a singular
+matrix has no inverse — which is why the authoring path *refuses* (`collapsedParentAxes`) rather
+than answering. Treat a new `.invert()` on a parent-chain matrix as needing a refusal, not a
+fallback.
+
+A knock-on worth knowing: guards written `wt.sx ? … : 0` (e.g. `editor/panels/colliderEdit2D.ts`)
+never fired before, because `wt.sx` read back as `1` rather than `0`. They work now.
 
 ## Zustand Bridge
 

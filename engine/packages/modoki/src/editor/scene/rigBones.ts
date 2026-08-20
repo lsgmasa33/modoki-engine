@@ -3,6 +3,7 @@
  *  editor/browser deps. */
 
 import * as THREE from 'three';
+import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 
 /** One bone of a rigged GLB's skeleton. `parent` is the parent BONE name (null =
  *  skeleton root); the transform is the BIND-pose LOCAL transform (what a `Bone`
@@ -76,7 +77,8 @@ export function extractRigBones(
         // Root bone — author its transform relative to sceneRoot so the non-bone
         // armature wrapper (rotation + 100× scale) is baked in (see doc comment).
         bone.updateWorldMatrix(true, false);
-        _rel.multiplyMatrices(invRoot, bone.matrixWorld).decompose(_pos, _quat, _scl);
+        _rel.multiplyMatrices(invRoot, bone.matrixWorld);
+        decomposeTrs(_rel, _pos, _quat, _scl); // singular-safe — #258
         euler.setFromQuaternion(_quat);
         out.set(bone.name, {
           name: bone.name,

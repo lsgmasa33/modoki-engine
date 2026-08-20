@@ -17,6 +17,7 @@ import { setSkeletalPreview } from '../../runtime/core/skeletalPreview';
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/transformPropagationSystem';
+import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { markOverrideIfInstance } from '../undo/entityActions';
 import { Transform, EntityAttributes, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
@@ -2667,7 +2668,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       out.compose(_grpPos.set(t.x, t.y, t.z), _trsQuat.setFromEuler(_trsEuler.set(t.rx, t.ry, t.rz)), _grpScale.set(t.sx, t.sy, t.sz));
     /** Decompose a world Matrix4 → LOCAL TRS relative to a parent's world transform. */
     const worldMatrixToLocal = (m: THREE.Matrix4, parentWorld: WT | null | undefined) => {
-      m.decompose(_grpPos, _grpQuat, _grpScale);
+      decomposeTrs(m, _grpPos, _grpQuat, _grpScale); // singular-safe — see #258
       _grpEuler.setFromQuaternion(_grpQuat);
       return worldToLocalTransform({ position: _grpPos, rotation: _grpEuler, scale: _grpScale }, parentWorld);
     };

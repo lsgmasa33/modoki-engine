@@ -24,6 +24,7 @@
 
 import * as THREE from 'three';
 import type { MutableEntity } from './sceneMutate';
+import { decomposeTrs } from '../core/ecs/decomposeTrs';
 
 /** The nine `Transform` fields. */
 export interface TRS {
@@ -131,7 +132,7 @@ export function matrixToTrs(m: THREE.Matrix4): TRS {
 }
 
 function decompose(m: THREE.Matrix4): TRS {
-  m.decompose(_pos, _quat, _scale);
+  decomposeTrs(m, _pos, _quat, _scale); // singular-safe — see #258
   _euler.setFromQuaternion(_quat);
   return {
     x: _pos.x, y: _pos.y, z: _pos.z,
@@ -192,12 +193,17 @@ export function worldToLocalTrs(world: TRS, parent: TRS | null): TRS {
  *
  *  A zero-scaled ancestor maps every descendant onto its own origin, so a world-space placement
  *  under it has NO solution — and both paths used to answer one anyway (owner decision,
- *  2026-07-31; independent review, 2026-07-30). The failure is silent by construction: three.js's
- *  `Matrix4.decompose` hits its `det === 0` branch and substitutes scale (1,1,1) with an IDENTITY
- *  quaternion, so a collapsed parent reads back as unscaled AND unrotated and the conversion
- *  proceeds confidently on a parent that does not exist. (The exact-inverse path was no better,
- *  differently: inverting a singular matrix yields the zero matrix, so it produced a different
- *  wrong answer.)
+ *  2026-07-31; independent review, 2026-07-30). There were two independent wrong answers, and
+ *  only ONE of them has since been fixed:
+ *   - the DECOMPOSE lie is gone (#258). three.js's `Matrix4.decompose` still substitutes scale
+ *     (1,1,1) with an identity quaternion on its `det === 0` branch, but this file no longer asks
+ *     it to — `matrixToTrs` goes through `decomposeTrs`, so a collapsed parent now reads back
+ *     honestly as scale 0 with its rotation intact.
+ *   - the INVERSION is still unsolvable, and always will be: `worldToLocalTrs` inverts the
+ *     parent's matrix, and a singular matrix inverts to the zero matrix. No decomposition can
+ *     rescue that — the information is gone from the matrix, not from the decomposition.
+ *  So this refusal is NOT obsolete now that the decompose half reads true. It is the only thing
+ *  standing between a caller and a confidently wrong local transform.
  *
  *  Returned as the offending axis names so the refusal can say WHICH, rather than "unrepresentable".
  *  `1e-9`, not `=== 0`: a scale that has been through a decompose round-trip can carry float dust,

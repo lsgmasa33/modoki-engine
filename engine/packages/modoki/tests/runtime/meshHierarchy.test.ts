@@ -117,4 +117,40 @@ describe('decomposeLocalTransform', () => {
     expect(local.scale[1]).toBeCloseTo(1, 5);
     expect(local.scale[2]).toBeCloseTo(1, 5);
   });
+
+  // #258 — found by the close-out sweep, not by the original report. A GLB node authored with a
+  // zero scale axis (a common way to hide one) composes to a SINGULAR matrix, and three's
+  // Matrix4.decompose answers that with scale (1,1,1) + an identity quaternion. The hidden node
+  // was therefore IMPORTED AT FULL SIZE, with its rotation dropped — the same defect as the
+  // runtime one, in the import pipeline, where it bakes into the stored mesh asset.
+  it('imports a node scaled to ZERO as zero, not resurrected to full size', () => {
+    const root = new THREE.Group();
+    const mesh = new THREE.Mesh();
+    mesh.scale.set(0, 1, 1);
+    root.add(mesh);
+    root.updateMatrixWorld(true);
+
+    const local = decomposeLocalTransform(mesh, null);
+    expect(local.scale[0]).toBe(0);
+    expect(local.scale[1]).toBeCloseTo(1, 5);
+    expect(local.scale[2]).toBeCloseTo(1, 5);
+  });
+
+  it('keeps a zero-scaled node ROTATED, and keeps its parent scale out of the surviving axes', () => {
+    const root = new THREE.Group();
+    const parent = new THREE.Mesh();
+    const child = new THREE.Mesh();
+    parent.scale.set(2, 2, 2);
+    child.rotation.set(0, 0, Math.PI / 2);
+    child.scale.set(3, 0, 1); // flattened on Y — still a visible plane, and its pose matters
+    root.add(parent);
+    parent.add(child);
+    root.updateMatrixWorld(true);
+
+    const local = decomposeLocalTransform(child, parent);
+    expect(local.scale[0]).toBeCloseTo(3, 5);
+    expect(local.scale[1]).toBe(0);
+    expect(local.scale[2]).toBeCloseTo(1, 5);
+    expect(local.rotation[2]).toBeCloseTo(Math.PI / 2, 5); // was 0 — silently unrotated
+  });
 });

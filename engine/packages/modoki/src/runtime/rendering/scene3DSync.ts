@@ -1,6 +1,7 @@
 /** Three.js ECS render sync — extracts frame-by-frame sync logic from Scene3D. */
 
 import * as THREE from 'three';
+import { decomposeTrs } from '../core/ecs/decomposeTrs';
 import type { World } from 'koota';
 // See SceneView.tsx for the rationale on the published-entry import.
 import type { WebGPURenderer } from 'three/webgpu';
@@ -2017,7 +2018,10 @@ export function syncBoneAttachments(world: World, _scene: THREE.Scene, state: Re
     // would make any prop microscopic on a heavily-scaled rig. The entity's
     // Transform position is a local offset in world units, rotated into the bone's
     // orientation; its rotation composes onto the bone's.
-    bone.matrixWorld.decompose(_bonePos, _boneQuat, _boneScale);
+    // The scale here is deliberately discarded (see above), but the ROTATION is not: a bone
+    // with a zero scale axis decomposes to an identity quaternion through three, which would
+    // leave the attached prop unrotated (#258).
+    decomposeTrs(bone.matrixWorld, _bonePos, _boneQuat, _boneScale);
     _attLocalQuat.setFromEuler(_attEuler.set(tf.rx, tf.ry, tf.rz));
     obj.quaternion.copy(_boneQuat).multiply(_attLocalQuat);
     obj.position.copy(_attOffset.set(tf.x, tf.y, tf.z).applyQuaternion(_boneQuat)).add(_bonePos);
@@ -2242,8 +2246,8 @@ export function syncBones(world: World, _scene: THREE.Scene, state: RenderState)
     const prefix = entry!.boneWrapperPrefix?.get(b.name);
     if (prefix) {
       // boneLocal → clone-root space: prefix.fwd · compose(bone TRS).
-      _boneBridgeMat.compose(bone.position, bone.quaternion, bone.scale).premultiply(prefix.fwd)
-        .decompose(_bonePrefixPos, _bonePrefixQuat, _bonePrefixScl);
+      _boneBridgeMat.compose(bone.position, bone.quaternion, bone.scale).premultiply(prefix.fwd);
+      decomposeTrs(_boneBridgeMat, _bonePrefixPos, _bonePrefixQuat, _bonePrefixScl); // singular-safe — #258
     } else {
       _bonePrefixPos.copy(bone.position); _bonePrefixQuat.copy(bone.quaternion); _bonePrefixScl.copy(bone.scale);
     }
@@ -2306,8 +2310,11 @@ export function syncBones(world: World, _scene: THREE.Scene, state: RenderState)
       _boneBridgeEuler.set(tf.rx, tf.ry, tf.rz);
       _bonePrefixQuat.setFromEuler(_boneBridgeEuler);
       _boneBridgeMat.compose(_bonePrefixPos.set(tf.x, tf.y, tf.z), _bonePrefixQuat, _bonePrefixScl.set(tf.sx, tf.sy, tf.sz))
-        .premultiply(prefix.inv)
-        .decompose(bone.position, bone.quaternion, bone.scale);
+        .premultiply(prefix.inv);
+      // USER-REACHABLE: Bone entities are hand-posable, so typing 0 into a bone's scale in the
+      // Inspector makes this matrix singular — through three that wrote scale 1 and an identity
+      // rotation straight onto the THREE.Bone, snapping the limb back to full size (#258).
+      decomposeTrs(_boneBridgeMat, bone.position, bone.quaternion, bone.scale);
     } else {
       bone.position.set(tf.x, tf.y, tf.z);
       _boneBridgeEuler.set(tf.rx, tf.ry, tf.rz);

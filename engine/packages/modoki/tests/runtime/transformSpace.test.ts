@@ -224,9 +224,11 @@ describe('collapsedParentAxes — a request with no solution is refused, not gue
     expect(collapsedParentAxes(trs({ sx: 1e-4 }))).toBeNull();
   });
 
-  it('is exactly the case where decompose LIES about the parent', () => {
-    // The mechanism, pinned: a singular parent matrix decomposes to an identity-ish TRS, which is
-    // why the old code produced a plausible number instead of failing.
+  it('survives matrixToTrs no longer lying about the parent (#258)', () => {
+    // This test used to assert the LIE — that a singular parent decomposed to scale 1 with its
+    // rotation dropped — because that is what made the old code produce a plausible number
+    // instead of failing. #258 fixed that half: `matrixToTrs` now goes through `decomposeTrs`
+    // and reads a collapsed parent honestly.
     const collapsed = trs({ sx: 0, rz: Math.PI / 4 });
     const roundTripped = matrixToTrs(
       new THREE.Matrix4().compose(
@@ -234,10 +236,27 @@ describe('collapsedParentAxes — a request with no solution is refused, not gue
         new THREE.Quaternion().setFromEuler(new THREE.Euler(collapsed.rx, collapsed.ry, collapsed.rz)),
         new THREE.Vector3(collapsed.sx, collapsed.sy, collapsed.sz)),
     );
-    expect(roundTripped.sx, 'decompose substitutes scale 1 on a singular matrix').toBeCloseTo(1, 9);
-    expect(roundTripped.rz, '…and drops the rotation entirely').toBeCloseTo(0, 9);
-    // Which is precisely why the guard reads the ORIGINAL parent, not a decomposed copy.
+    expect(roundTripped.sx, 'the collapsed axis now reads as collapsed').toBeCloseTo(0, 9);
+    expect(roundTripped.rz, '…and the rotation survives it').toBeCloseTo(Math.PI / 4, 9);
+
+    // THE REFUSAL STILL STANDS, and this is the point of keeping the test. The decompose lie was
+    // only one of the two wrong answers; the other is that a singular parent cannot be INVERTED,
+    // which no decomposition fixes. A reader who sees the lie fixed must not conclude the guard
+    // is now redundant.
     expect(collapsedParentAxes(collapsed)).toEqual(['x']);
+  });
+
+  it('the reason the refusal cannot be dropped: the parent does not invert', () => {
+    // Inverting a singular matrix yields the ZERO matrix, so world→local under a collapsed parent
+    // produces a confidently wrong local pose rather than an error. Demonstrated directly, so the
+    // guard's justification is pinned by a measurement instead of by a comment.
+    const collapsed = trs({ sx: 0, rz: Math.PI / 4 });
+    const inv = new THREE.Matrix4().compose(
+      new THREE.Vector3(collapsed.x, collapsed.y, collapsed.z),
+      new THREE.Quaternion().setFromEuler(new THREE.Euler(collapsed.rx, collapsed.ry, collapsed.rz)),
+      new THREE.Vector3(collapsed.sx, collapsed.sy, collapsed.sz),
+    ).invert();
+    expect(inv.elements.every((v) => v === 0), 'a singular parent inverts to the zero matrix').toBe(true);
   });
 });
 

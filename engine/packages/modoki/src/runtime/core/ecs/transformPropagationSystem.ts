@@ -31,6 +31,7 @@ import type { World } from 'koota';
 // trait graph into L0 for two traits that now live in core/traits/ anyway.
 import { Transform } from '../traits/Transform';
 import { EntityAttributes } from '../traits/EntityAttributes';
+import { decomposeTrs } from './decomposeTrs';
 
 /** World position / Euler rotation / scale. NOT a matrix — already decomposed.
  *  (`getWorldMatrix3D` in `worldTransform.ts` is the matrix API.) */
@@ -342,7 +343,10 @@ export function transformPropagationSystem(world: World) {
     } else {
       // Child entity — need matrix multiplication
       const mat = getWorldMatrix(e.id);
-      mat.decompose(_pos, _quat, _scale);
+      // decomposeTrs, not mat.decompose: a zero scale ANYWHERE in the chain makes this
+      // matrix singular, and three answers a singular matrix with identity scale+rotation
+      // — so the entity authored invisible would be cached at FULL size (#258).
+      decomposeTrs(mat, _pos, _quat, _scale);
       _euler.setFromQuaternion(_quat);
       x = _pos.x; y = _pos.y; z = _pos.z;
       rx = _euler.x; ry = _euler.y; rz = _euler.z;

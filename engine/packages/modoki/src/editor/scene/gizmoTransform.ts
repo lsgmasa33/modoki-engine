@@ -12,6 +12,7 @@
  * `_svP*` temporaries.
  */
 import * as THREE from 'three';
+import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 
 /** A transform expressed as translation/rotation(Euler XYZ)/scale, matching the `Transform` trait. */
 export interface TransformTRS {
@@ -63,7 +64,7 @@ export function worldToLocalTransform(
     _childWorld.premultiply(_parentInv);
   }
 
-  _childWorld.decompose(_outPos, _outQuat, _outScale);
+  decomposeTrs(_childWorld, _outPos, _outQuat, _outScale); // singular-safe — see #258
   _outEuler.setFromQuaternion(_outQuat);
   return {
     x: _outPos.x, y: _outPos.y, z: _outPos.z,
@@ -91,14 +92,25 @@ export interface ScaleSigns { x: number; y: number; z: number }
  *  suspected.
  *
  *  An entity AUTHORED with a negative scale keeps it: only a sign CHANGE within the drag is caught.
+ *
+ *  ⚠️ **An axis that STARTED at exactly 0 is left alone** (`startSign` component 0), and that
+ *  exemption is load-bearing rather than tidy-up. `Math.sign(0) === 0`, so without it EVERY
+ *  non-zero drag value differs from the start sign and the axis is clamped straight back to 0 on
+ *  every tick — the entity looks like it grows during the drag (TransformControls mutates the
+ *  object directly) and snaps back to invisible on mouse-up. There is no pivot to cross from 0:
+ *  a flip needs two non-zero signs, and 0 has no side. Found in the #258 close-out review: the
+ *  trap always existed for ROOT entities (their world scale is their local scale), and #258 made
+ *  it reachable for CHILDREN too by fixing the world composition that used to report a collapsed
+ *  child's scale as 1. Scaling to zero is a supported authoring idiom for "hidden", so being
+ *  unable to drag back out of it is exactly the workflow that must keep working.
  */
 export function clampScaleCrossingPivot(local: TransformTRS, objScale: { x: number; y: number; z: number }, startSign: ScaleSigns | null): TransformTRS {
   if (!startSign) return local;
   return {
     ...local,
-    sx: Math.sign(objScale.x) !== startSign.x ? 0 : local.sx,
-    sy: Math.sign(objScale.y) !== startSign.y ? 0 : local.sy,
-    sz: Math.sign(objScale.z) !== startSign.z ? 0 : local.sz,
+    sx: startSign.x !== 0 && Math.sign(objScale.x) !== startSign.x ? 0 : local.sx,
+    sy: startSign.y !== 0 && Math.sign(objScale.y) !== startSign.y ? 0 : local.sy,
+    sz: startSign.z !== 0 && Math.sign(objScale.z) !== startSign.z ? 0 : local.sz,
   };
 }
 
@@ -114,7 +126,12 @@ export function clampScaleCrossingPivot(local: TransformTRS, objScale: { x: numb
  *  `Gizmo2D`'s F9 sets for 2D and `clampScaleCrossingPivot` sets for a single entity. */
 export function scaleCrossedPivot(objScale: { x: number; y: number; z: number }, startSign: ScaleSigns | null): boolean {
   if (!startSign) return false;
-  return Math.sign(objScale.x) !== startSign.x
-    || Math.sign(objScale.y) !== startSign.y
-    || Math.sign(objScale.z) !== startSign.z;
+  // Same zero exemption as clampScaleCrossingPivot — see its doc comment. An axis that started at
+  // 0 has no side to cross, and treating `Math.sign(0)` as a real sign would report EVERY drag as
+  // a pivot crossing. The group path currently resets its proxy to (1,1,1) before each attach so
+  // it cannot hit this today; the two helpers must still agree, or a later change that stops
+  // resetting the proxy reintroduces the bug in the half nobody looked at.
+  return (startSign.x !== 0 && Math.sign(objScale.x) !== startSign.x)
+    || (startSign.y !== 0 && Math.sign(objScale.y) !== startSign.y)
+    || (startSign.z !== 0 && Math.sign(objScale.z) !== startSign.z);
 }

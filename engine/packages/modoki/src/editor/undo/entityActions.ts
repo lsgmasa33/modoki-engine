@@ -13,6 +13,7 @@ import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid } from '../../runtime/loaders/assetManifest';
 import { markOverride } from '../../runtime/loaders/overrideMarks';
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
+import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { pushAction, type EditDetail } from './undoManager';
 import { entityRef, ensureGuid, buildGuidIndex, resolveWith, type EntityRef } from './entityRef';
 import { notifyFieldEdited } from '../animation/recording';
@@ -784,7 +785,7 @@ function matrixFromTransform(tf: { x: number; y: number; z: number; rx: number; 
 
 function decomposeMatrix(mat: THREE.Matrix4): { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number } {
   const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scale = new THREE.Vector3();
-  mat.decompose(pos, quat, scale);
+  decomposeTrs(mat, pos, quat, scale); // singular-safe — see #258
   const euler = new THREE.Euler().setFromQuaternion(quat);
   return { x: pos.x, y: pos.y, z: pos.z, rx: euler.x, ry: euler.y, rz: euler.z, sx: scale.x, sy: scale.y, sz: scale.z };
 }

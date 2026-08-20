@@ -141,6 +141,27 @@ describe('clampScaleCrossingPivot', () => {
     expect(out.x).toBe(3);
     expect(out.rx).toBe(0.5);
   });
+
+  // #258 close-out review. `Math.sign(0) === 0`, so an axis that STARTED at 0 differs from every
+  // non-zero drag value and was clamped straight back to 0 on every tick — an entity authored
+  // hidden (scale 0, the idiom #258 exists to support) could never be dragged back into being.
+  // The trap always existed for ROOT entities; #258 widened it to CHILDREN by making the world
+  // composition report a collapsed child's scale honestly as 0 instead of the old identity lie.
+  it('an axis that started at ZERO can be dragged back out — 0 has no pivot to cross', () => {
+    const out = clampScaleCrossingPivot({ ...base, sx: 0.3 }, { x: 0.3, y: 1, z: 1 }, { x: 0, y: 1, z: 1 });
+    expect(out.sx).toBe(0.3);
+  });
+
+  it('…in the negative direction too, and independently per axis', () => {
+    const out = clampScaleCrossingPivot(
+      { ...base, sx: -0.4, sy: 2, sz: 3 },
+      { x: -0.4, y: -2, z: 3 },
+      { x: 0, y: 1, z: 1 },   // x started collapsed; y started positive and has now flipped
+    );
+    expect(out.sx).toBe(-0.4); // exempt — no side to cross
+    expect(out.sy).toBe(0);    // a REAL sign flip is still caught
+    expect(out.sz).toBe(3);
+  });
 });
 
 
@@ -158,6 +179,12 @@ describe('scaleCrossedPivot', () => {
   it('is true the moment ANY axis changes sign — one mirrored axis is a crossed pivot', () => {
     expect(scaleCrossedPivot({ x: -1, y: -1, z: -1 }, positive)).toBe(true);
     expect(scaleCrossedPivot({ x: -1, y: 1, z: 1 }, positive)).toBe(true);
+  });
+
+  // #258 close-out — must agree with clampScaleCrossingPivot's zero exemption. See its doc.
+  it('a zero-start axis is not a crossing', () => {
+    expect(scaleCrossedPivot({ x: 5, y: 1, z: 1 }, { x: 0, y: 1, z: 1 })).toBe(false);
+    expect(scaleCrossedPivot({ x: 5, y: -1, z: 1 }, { x: 0, y: 1, z: 1 })).toBe(true); // y really flipped
   });
 
   it('respects a selection that STARTED mirrored, so an authored flip is not a crossing', () => {

@@ -2,6 +2,7 @@
  *  Cache is keyed by model path + mesh name for proper identity. */
 
 import * as THREE from 'three';
+import { decomposeTrs } from '../core/ecs/decomposeTrs';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
@@ -316,7 +317,10 @@ export function decomposeLocalTransform(
   const p = new THREE.Vector3();
   const q = new THREE.Quaternion();
   const s = new THREE.Vector3();
-  local.decompose(p, q, s);
+  // decomposeTrs, not local.decompose: a GLB node authored with a zero scale axis (a common
+  // way to hide one) composes to a SINGULAR matrix, and three answers that with scale (1,1,1)
+  // — the hidden node would be imported at FULL size, with its rotation dropped (#258).
+  decomposeTrs(local, p, q, s);
   const e = new THREE.Euler().setFromQuaternion(q);
   return { position: [p.x, p.y, p.z], rotation: [e.x, e.y, e.z], scale: [s.x, s.y, s.z] };
 }
