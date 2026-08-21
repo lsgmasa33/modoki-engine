@@ -17,6 +17,7 @@ import type { InputFrame } from '../core/inputActions';
 import { keyboardSource } from './keyboardSource';
 import { gamepadSource } from './gamepadSource';
 import { pointerSource } from './pointerSource';
+import { touchControlSource } from './touchControlSource';
 import { registerInputPromptSources } from './inputPromptSources';
 
 export interface InputSource {
@@ -177,11 +178,13 @@ function drain(s: InputSource): void {
   }
 }
 
-// Built-in sources. Keyboard + gamepad + pointer are always registered (all inert
-// until they see input / a controller connects / the pointer goes down).
+// Built-in sources. All four are always registered and all four are inert until they see
+// input — a controller connects, the pointer goes down, or a scene authors a `TouchControl`
+// (with none authored, `touch-control` matches no element and contributes nothing).
 registerSource(keyboardSource);
 registerSource(gamepadSource);
 registerSource(pointerSource);
+registerSource(touchControlSource);
 
 /** App-scope Manager: attaches all sources on register, detaches on unregister.
  *  Replaces the old keyboard-only `inputManagerDef`. */

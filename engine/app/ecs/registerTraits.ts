@@ -4,7 +4,7 @@
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
-  UIElement, UIBinding, UIAction, UIFocusable, UIToggle, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
+  UIElement, UIBinding, UIAction, UIFocusable, UIToggle, TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
   AudioSource, AudioListener, VideoPlayer,
@@ -1078,6 +1078,25 @@ export function registerAllTraits() {
       knobRadius: { type: 'number', min: 0, step: 1, tooltip: 'Knob corner radius. 999 = circle.' },
       // Folded into `knobColor`'s row, so it needs no row of its own.
       knobOpacity: { type: 'number', min: 0, max: 1, step: 0.01, hidden: true },
+    },
+  });
+
+  registerTrait({
+    name: 'TouchControl', trait: TouchControl, category: 'component', componentCategory: 'UI',
+    priority: 63.8,
+    fields: {
+      action: {
+        type: 'enum', options: [...TOUCH_CONTROL_ACTIONS],
+        tooltip: 'What HOLDING this element means, in the source-agnostic action vocabulary. The four move* values push the locomotion axes AND raise the matching nav* flag, exactly as the keyboard arrows do — so a game reading inputAxis(world,\'moveX\') needs no touch-specific code. A d-pad is four entities, one per direction.',
+      },
+      showOn: {
+        type: 'enum', options: [...TOUCH_CONTROL_SHOW_ON],
+        tooltip: 'When this control is mounted at all. touch = handhelds only (the default — a desktop player never sees a d-pad over their scene). always = everywhere. never = authored but off. NOTE: the Scene panel mounts it whatever this says, so you can still position it; the Game panel obeys it.',
+      },
+      pressedOpacity: {
+        type: 'number', min: 0, max: 1, step: 0.05,
+        tooltip: 'Element opacity while held — the press feedback. 1 disables it. Applied straight to the DOM by the input source, not through the UI projection, so a thumb pressing at 10 Hz does not rebuild the UI tree.',
+      },
     },
   });
 

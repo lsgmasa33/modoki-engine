@@ -79,10 +79,15 @@ export {
   NoopHapticBackend, CapacitorHapticBackend, pickHapticBackend, type HapticBackend,
 } from './haptics/backends';
 export { HapticSettings } from './traits/HapticSettings';
+// Host platform / form factor — the single source of truth for "is this a handheld?", asked
+// by the renderer's quality tier AND by on-screen touch controls.
+export { isTouchDevice, readFormFactor, readPlatform } from './core/formFactor';
 export {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
   PrefabInstance, ModelSource, Paused, Persistent, markPersistent, Transient, Time, Input,
-  UIElement, type UILengthUnit, UIBinding, UIAction, UIFocusable, UIToggle, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh, BlobShadow,
+  UIElement, type UILengthUnit, UIBinding, UIAction, UIFocusable, UIToggle, UIAnchor,
+  TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, TOUCH_ATTR, TOUCH_OPACITY_ATTR, UI_ROOT_ATTR,
+  type TouchControlAction, type TouchControlShowOn, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh, BlobShadow,
   Animator, SpriteAnimator, defaultSpriteClip, clampAngle,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
@@ -634,6 +639,9 @@ export {
   detachAll as detachInputSources, inputSourcesManager, type InputSource,
 } from './input/inputSources';
 export { keyboardSource } from './input/keyboardSource';
+// On-screen touch controls (#297) — the source, plus the DOM attribute names it and the UI
+// layer agree on (`ui/` and `input/` are both L2 and cannot import each other).
+export { touchControlSource } from './input/touchControlSource';
 export { gamepadSource, sampleGamepadInto, type GamepadSnapshot } from './input/gamepadSource';
 // Presentation-invariant input: keep gameplay feel constant under editor/browser/OS zoom.
 export { getPresentationScale, calibratePresentationScale } from './input/presentationScale';

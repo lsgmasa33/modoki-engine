@@ -23,6 +23,7 @@ const ANC = { id: 'UIAnchor' };
 const CV2 = { id: 'Canvas2D' };
 const VID = { id: 'VideoPlayer' };
 const TGL = { id: 'UIToggle' };
+const TCH = { id: 'TouchControl' };
 
 const UI_DEFAULTS = {
   width: 100, height: 40, widthUnit: 'px', heightUnit: 'px',
@@ -53,6 +54,7 @@ interface Spec {
    *  buildTree reads them. */
   video?: true;
   toggle?: { value: boolean };
+  touch?: { action: string; showOn: string; pressedOpacity: number };
 }
 
 /** A koota-like world whose entity set is read fresh from `getSpecs()` on every
@@ -71,6 +73,7 @@ function makeWorld(getSpecs: () => Spec[]) {
           if (s.canvas2D) data.set(CV2, s.canvas2D);
           if (s.video) data.set(VID, {});
           if (s.toggle) data.set(TGL, s.toggle);
+          if (s.touch) data.set(TCH, s.touch);
           const entity = { id: () => s.id, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t) };
           cb([data.get(UIEL)], entity);
         }
@@ -93,6 +96,7 @@ function mockDeps() {
       { name: 'Canvas2D', trait: CV2, category: 'component', fields: {} },
       { name: 'VideoPlayer', trait: VID, category: 'component', fields: {} },
       { name: 'UIToggle', trait: TGL, category: 'component', fields: {} },
+      { name: 'TouchControl', trait: TCH, category: 'component', fields: {} },
     ],
   }));
 }
@@ -365,5 +369,63 @@ describe('uiTreeStore fontFamily resolution', () => {
     const after = useUITreeStore.getState().tree[0];
     expect(after).not.toBe(before);
     expect(after.fontFamily).toBe('"Varela Round"');
+  });
+});
+
+/** `touch` — the reconciliation guard for on-screen controls (#297). Same shape as `toggle`
+ *  above and the same reason: `touch` sits in `_nestedKeys`, so `nodesEqual` must compare it
+ *  STRUCTURALLY. Without that comparison the projection would carry the block correctly and the
+ *  reconciler would still hand back the previous node object, `React.memo(UINode)` would bail,
+ *  and the DOM would keep the OLD `data-modoki-touch` — so re-authoring an arrow from `moveLeft`
+ *  to `moveRight` in the Inspector would leave it walking left, with correct data everywhere and
+ *  a stale attribute in the one place that decides. `showOn` has the same failure with a worse
+ *  face: flipping it to `never` would leave a live control on screen.
+ *
+ *  The exhaustiveness test above cannot cover this — it derives its key list from a fixture node,
+ *  and an OPTIONAL nested block is absent from that node, so the loop skips it silently. */
+describe('uiTreeStore touch', () => {
+  const base = { action: 'moveLeft', showOn: 'touch', pressedOpacity: 0.6 };
+
+  it('two nodes differing ONLY in touch.action are NOT nodesEqual', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, touch: { ...base } }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await load();
+    const world = makeWorld(() => specs);
+
+    uiTreeProjection(world);
+    const before = useUITreeStore.getState().tree[0];
+    expect(before.touch?.action).toBe('moveLeft');
+
+    specs[0].touch = { ...base, action: 'moveRight' };
+    markUIDirty(); uiTreeProjection(world);
+    const after = useUITreeStore.getState().tree[0];
+    expect(after).not.toBe(before);   // a reused ref here = an arrow that still walks the old way
+    expect(after.touch?.action).toBe('moveRight');
+  });
+
+  it('two nodes differing ONLY in touch.showOn are NOT nodesEqual', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, touch: { ...base } }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await load();
+    const world = makeWorld(() => specs);
+
+    uiTreeProjection(world);
+    const before = useUITreeStore.getState().tree[0];
+
+    specs[0].touch = { ...base, showOn: 'never' };
+    markUIDirty(); uiTreeProjection(world);
+    const after = useUITreeStore.getState().tree[0];
+    expect(after).not.toBe(before);   // a reused ref here = a control that refuses to disappear
+    expect(after.touch?.showOn).toBe('never');
+  });
+
+  it('an unchanged touch block still REUSES the node — the comparison must not churn every frame', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, touch: { ...base } }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await load();
+    const world = makeWorld(() => specs);
+
+    uiTreeProjection(world);
+    const before = useUITreeStore.getState().tree[0];
+    specs[0].touch = { ...base };     // a FRESH object with identical values
+    markUIDirty(); uiTreeProjection(world);
+    expect(useUITreeStore.getState().tree[0]).toBe(before);
   });
 });

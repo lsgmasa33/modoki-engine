@@ -12,6 +12,7 @@ import { onPlayStateChange } from '../core/playState';
 import { useFocusStore, consumePendingActivation } from './focusManager';
 import { getCurrentWorld } from '../core/ecs/world';
 import { registerPointerBlocker } from '../core/pointerBlockers';
+import { UI_ROOT_ATTR } from '../traits/TouchControl';
 
 interface UIRendererProps {
   /** Store state object for binding resolution (typically from useGameStore) */
@@ -123,6 +124,12 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
   return (
     <div
       ref={measureRef}
+      // Which UI tree this is. The editor mounts a SECOND copy inside SceneView's authoring
+      // preview, where a press means "select this entity" — `input/touchControlSource.ts`
+      // refuses any control that is not inside a `runtime` root, so an on-screen d-pad in the
+      // Scene panel cannot drive the game. Keyed on the same `!onSelectEntity` structural
+      // property as the pointer-block registration above, for the same reason.
+      {...{ [UI_ROOT_ATTR]: onSelectEntity ? 'editor' : 'runtime' }}
       style={{
         position: 'absolute', inset: 0, zIndex: 2, pointerEvents: 'none', overflow: 'hidden',
         ...vpVars as any,

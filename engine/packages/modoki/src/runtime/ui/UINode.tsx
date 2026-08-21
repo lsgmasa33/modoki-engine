@@ -25,6 +25,8 @@ import { applyAnchorStyle, applyRotationStyle } from './anchorCss';
 import { NineSliceImage } from './NineSliceImage';
 import { uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
 import { useFocusStore } from './focusManager';
+import { isTouchDevice } from '../core/formFactor';
+import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
 
 /** The CSS-animated text span, isolated in React.memo. The game UI re-renders every
  *  frame (fps is in its store selector); re-creating the span each frame RESTARTS its
@@ -309,6 +311,50 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // it. Applies to anchored and flow-laid-out elements alike; the pivot rules live in anchorCss.
   applyRotationStyle(style, node.rotation, node.anchor);
 
+  // ── TouchControl (on-screen d-pad / button, #297) ──
+  //
+  // Mounting is decided by the HOST, not by what was last pressed: the control has to be there
+  // BEFORE the player's first touch, or it is the thing preventing them from producing one.
+  //
+  // ⚠️ In the editor's authoring preview (`onSelectEntity`) a control is ALWAYS mounted, whatever
+  // `showOn` says. The editor is a desktop host, so honouring `showOn:'touch'` there would leave
+  // a d-pad invisible in the very viewport you position it in — un-clickable in the Hierarchy's
+  // click-to-select, un-draggable, un-authorable. `showOn:'never'` still hides it, because that
+  // is an author saying "off", not a host saying "not applicable".
+  const touch = node.touch;
+  if (touch && (touch.showOn === 'never'
+    || (!onSelectEntity && touch.showOn === 'touch' && !isTouchDevice()))) return null;
+
+  // A touch control must RECEIVE the press (its parent HUD panel is usually
+  // `pointer-events:none`), and must not let the browser turn a thumb-hold into a scroll, a
+  // pinch, a text selection or a tap highlight. Done in CSS rather than with `preventDefault`
+  // in the source: passive listeners stay passive, and the suppression is scoped to the
+  // element instead of to the window.
+  //
+  // ⚠️ Only a plain `div` can BE a control. `touchAttrs` is spread into the two `<div>` returns
+  // at the bottom of this function; the `input`/`range`/`UIToggle` branches return earlier and
+  // do not carry it. So the attribute — the only thing `input/touchControlSource.ts` resolves
+  // controls by — would be missing while the touch STYLES below were still applied, leaving an
+  // element that suppresses scrolling and tap highlights and drives nothing. That is the
+  // partially-wired authoring surface CLAUDE.md warns about, and it is the fourth instance of
+  // the same class in this file (see the canvas2D / UIToggle / VideoPlayer warns above). Both
+  // halves are gated on `touchWired` so the element is coherently NOT a control, and DEV says so.
+  const touchWired = !!touch && node.elementType === 'div' && !node.toggle;
+  if (import.meta.env?.DEV && touch && !touchWired) {
+    const why = node.toggle ? 'a UIToggle draws its own switch' : `elementType '${node.elementType}' is not a div`;
+    console.warn(
+      `[UINode] entity ${node.entityId}: TouchControl ('${touch.action}') will NOT drive input here — ${why}, so the control attribute is never stamped. Put the TouchControl on a plain div entity.`,
+    );
+  }
+  const touchAttrs: Record<string, string> = {};
+  // Never stamped in the editor preview: the source refuses a control outside a runtime UI root
+  // anyway, so this is the second of two independent guards, not the only one.
+  if (touchWired && !onSelectEntity) {
+    touchAttrs[TOUCH_ATTR] = touch!.action;
+    touchAttrs[TOUCH_OPACITY_ATTR] = String(touch!.pressedOpacity);
+  }
+
+
   // ── Click handler ──
   // A button is interactive if it dispatches an action OR applies declarative
   // bindings — any click-event binding (set write or call action).
@@ -365,6 +411,23 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   if (node.pointerThrough && !onSelectEntity) {
     style.pointerEvents = 'none';
     style.cursor = undefined;
+  }
+
+  // ⚠️ AFTER every rule above, including `pointerThrough`, and that ordering is the point. A
+  // d-pad arrow is a LEAF, so the leaf default two blocks up would have set `pointer-events:
+  // none` and the pad would have been inert while looking perfect — the exact failure class the
+  // pointer-blocker passthrough bug was. `TouchControl` is the strongest statement of intent
+  // available ("this element IS a control"), so it outranks the inferred defaults and an
+  // author's `pointerThrough` alike.
+  if (touchWired) {
+    style.pointerEvents = 'auto';
+    // Stop the browser turning a thumb-hold into a scroll, a pinch, a text selection or a tap
+    // highlight. In CSS rather than `preventDefault` in the source: the listeners stay passive,
+    // and the suppression is scoped to the element instead of to the window.
+    style.touchAction = 'none';
+    style.userSelect = 'none';
+    (style as unknown as Record<string, string>).WebkitUserSelect = 'none';
+    (style as unknown as Record<string, string>).WebkitTapHighlightColor = 'transparent';
   }
 
   // Editor 2D-only layer: strip UI visuals but keep layout, so nested Canvas2D
@@ -637,7 +700,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // does NOT pass it — the editor viewport sizes itself / uses device presets.
       : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode /></Suspense> : null);
     return (
-      <div style={style} onClick={handleClick} data-entity-id={node.entityId}>
+      <div style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
         {nineSliceLayer}
         {videoLayer}
         {canvas2DContent}
@@ -664,7 +727,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   }
 
   return (
-    <div style={style} onClick={handleClick} data-entity-id={node.entityId}>
+    <div style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
       {nineSliceLayer}
       {videoLayer}
       {textContent}

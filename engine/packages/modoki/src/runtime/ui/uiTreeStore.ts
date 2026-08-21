@@ -83,6 +83,15 @@ export interface UINodeData {
    *  and its absence has to survive `_scalarKeys` being derived from whichever node
    *  happens to be built first. */
   toggle?: { value: boolean; trackOnColor: number; trackOffColor: number; trackOpacity: number; knobColor: number; knobOpacity: number; knobInset: number; trackRadius: number; knobRadius: number; disabled: boolean };
+  /** TouchControl trait — this element is an on-screen input control (a d-pad arrow, a jump
+   *  button). Optional nested block for the same reason `toggle` is one: rare, and `_scalarKeys`
+   *  is derived from whichever node happens to be built first.
+   *
+   *  The projection carries it; it does NOT carry whether the control is currently held. A
+   *  press is applied straight to the DOM by `input/touchControlSource.ts`, because rebuilding
+   *  the whole UI tree on every press and release of a d-pad would be a frame's work for a
+   *  highlight, at thumb frequency. */
+  touch?: { action: string; showOn: string; pressedOpacity: number };
   /** TextAnimation trait — whole-element CSS text animation (fade/wave/bounce/jitter/
    *  rainbow/typewriter) realized by UINode. Shared trait with the 2D/3D geometry paths. */
   textAnim?: { effect: string; speed: number; amplitude: number; frequency: number; loop: boolean; fadeIn: boolean };
@@ -144,7 +153,7 @@ const _sortMap = new Map<number, number>();
 let _prevById = new Map<number, UINodeData>();
 
 // Node keys that aren't plain scalars — compared specially in nodesEqual.
-const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim', 'toggle']);
+const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim', 'toggle', 'touch']);
 // Derived ONCE from a real node, so every scalar field is covered automatically:
 // add a field to UINodeData and it's compared without editing this file.
 let _scalarKeys: string[] | null = null;
@@ -175,6 +184,7 @@ export function nodesEqual(a: UINodeData, b: UINodeData): boolean {
   if (!shallowOptEqual(a.canvas2D as Record<string, unknown> | undefined, b.canvas2D as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.textAnim as Record<string, unknown> | undefined, b.textAnim as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.toggle as Record<string, unknown> | undefined, b.toggle as Record<string, unknown> | undefined)) return false;
+  if (!shallowOptEqual(a.touch as Record<string, unknown> | undefined, b.touch as Record<string, unknown> | undefined)) return false;
   // action.bindings is an array — ref-compare, but treat two empties as equal
   // (the builder allocates a fresh [] when the trait carries none).
   if (a.action || b.action) {
@@ -202,7 +212,7 @@ function reconcileNode(node: UINodeData, nextPrev: Map<number, UINodeData>): UIN
 
 // Cache trait lookups (resolve once, reuse across frames)
 let _traitsCached = false;
-let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any, _toggleMeta: any;
+let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any, _toggleMeta: any, _touchMeta: any;
 
 function cacheTraits() {
   const allTraits = getAllTraits();
@@ -216,6 +226,7 @@ function cacheTraits() {
   _textAnimMeta = allTraits.find(m => m.name === 'TextAnimation');
   _videoMeta = allTraits.find(m => m.name === 'VideoPlayer');
   _toggleMeta = allTraits.find(m => m.name === 'UIToggle');
+  _touchMeta = allTraits.find(m => m.name === 'TouchControl');
   _traitsCached = !!(_renderUIMeta && _uiElMeta);
 }
 
@@ -340,6 +351,14 @@ function buildTree(world: World): UINodeData[] | null {
       if (_actionMeta && entity.has(_actionMeta.trait)) {
         const a = entity.get(_actionMeta.trait) as any;
         node.action = { bindings: a.bindings || [] };
+      }
+      if (_touchMeta && entity.has(_touchMeta.trait)) {
+        const tc = entity.get(_touchMeta.trait) as any;
+        node.touch = {
+          action: tc.action || 'moveLeft',
+          showOn: tc.showOn || 'touch',
+          pressedOpacity: typeof tc.pressedOpacity === 'number' ? tc.pressedOpacity : 0.6,
+        };
       }
       if (_anchorMeta && entity.has(_anchorMeta.trait)) {
         const anc = entity.get(_anchorMeta.trait) as any;

@@ -52,6 +52,15 @@ deterministic sim free of live DOM reads.
   blur/visibility/play reset; maps held keys onto the action vocabulary.
 - `runtime/input/gamepadSource.ts` — browser Gamepad API modality, split into a pure `sampleGamepadInto`
   mapper and a thin `navigator.getGamepads()` polling wrapper.
+- `runtime/traits/TouchControl.ts` — the on-screen-control trait (a d-pad arrow, a jump button) +
+  the `data-modoki-touch` / `data-modoki-ui-root` attribute names that `ui/` and `input/` agree on.
+  The names live at L1 because both subsystems are L2 and may not import each other.
+- `runtime/input/touchControlSource.ts` — the touch-control modality: ONE delegated pointer-listener
+  set over the runtime UI tree, per-`pointerId` so several controls hold at once and a thumb can
+  slide between them. See "On-screen touch controls" below.
+- `runtime/core/formFactor.ts` — L0: `readPlatform`/`readFormFactor`/`isTouchDevice`. The single
+  source of truth for "is this a handheld?", shared by the renderer's quality tier (`deviceCaps`)
+  and by touch-control visibility.
 - `runtime/input/pointerSource.ts` — mouse/primary-touch modality: Pointer Events on `window` with
   `setPointerCapture`, reports the single active pointer as a `PointerFrame` (position + down + drag
   delta). Treats `pointercancel` as a clean release so an Android touch-reclaim can't strand a drag.
@@ -92,8 +101,9 @@ handler. `computeEdges` produces `pressed = now && !was`, `released = !now && wa
 
 **Sources + registry.** An `InputSource` is `{ name, attach(), detach(), sample(out) }`. The registry
 de-dupes by `name` (last wins, so a hot-reload or a game swapping a source doesn't stack duplicates);
-`attachAll`/`detachAll` are guarded by an `attached` flag. Keyboard + gamepad are always registered
-(both inert until they see input / a controller connects). The `inputSourcesManager` is an **app-scope
+`attachAll`/`detachAll` are guarded by an `attached` flag. Keyboard, gamepad, pointer and
+touch-control are all always registered (each inert until it sees input — a controller connects, the
+pointer goes down, or a scene authors a `TouchControl`). The `inputSourcesManager` is an **app-scope
 Manager** — it `attachAll`s on init and `detachAll`s on dispose, and also registers the prompt read
 sources — so sources live app-lifetime and never load headless.
 
@@ -449,6 +459,107 @@ noteInputResolution(dropTarget && { kind: dropTarget.kind, id: … }, 'drop');
 Worked example: `games/court/runtime/systems.ts` (`noteHit`), with the wiring pinned by
 `games/court/tests/inputWatch.test.ts` — a suite that exists because nothing else in Court would
 notice if those three calls were deleted.
+
+## On-screen touch controls — the d-pad
+
+Until #297 the engine had **no touch locomotion of any kind**. Every game here was either
+drag/tap native by design (sling, space-invader, chess, court) or keyboard-only — and
+`demos/forest-camp`, the flagship demo published with real iOS + Android native, told players on
+an A23 "WASD to walk" and gave them no way to walk at all (Testboard `xlbhRT4PjuJaK9tLos49`).
+
+An on-screen control is a **`TouchControl` trait on a UI entity** plus a fourth built-in source,
+`input/touchControlSource.ts`. **The engine draws nothing.** A control is an ordinary `UIElement`
+— the game authors its art (`imageSrc`, a nine-slice sprite, a rounded box), its size and its
+placement (`UIAnchor`, `safeArea: true` for the gesture bar) exactly as it authors the rest of its
+HUD; the trait only says what pressing it *means*. A d-pad is four entities, one per direction. A
+jump button is a fifth. There is no "d-pad widget", because every layer of configuration would be
+a layer of layout the game could not override.
+
+| Field | Meaning |
+|---|---|
+| `action` | What HOLDING it means — `moveLeft`/`moveRight`/`moveForward`/`moveBack` (which push the locomotion axes AND raise the matching `nav*` flag, exactly as the arrow keys do), or a digital action (`jump`, `aim`, `confirm`, `cancel`, `menu`, `pause`) |
+| `showOn` | `touch` (default — handhelds only), `always`, `never` |
+| `pressedOpacity` | Element opacity while held; `1` disables the highlight |
+
+**It is a SOURCE, not synthesized key events.** The obvious implementation dispatches
+`KeyboardEvent`s for W/A/S/D and lets `keyboardSource` pick them up. It is worse in three ways:
+`keyboardSource`'s `editing()` guard swallows them whenever a text field has focus; they are
+`isTrusted:false`; and a key is binary forever, foreclosing the analog stick that shares this
+seam. The engine already has the right abstraction one level up — so this merges `moveX`/`moveY`
+and `held` like every other source, and a game reading `inputAxis(world,'moveX')` needs no
+touch-specific code and cannot tell a thumb from a keyboard.
+
+**The DOM attribute is the seam, and it is load-bearing.** `ui/` and `input/` are both L2 and may
+not import each other (`docs/architecture-layers.md`). `UINode` stamps `data-modoki-touch` from
+the trait; the source reads it back off the live DOM with ONE delegated listener set. That also
+means nothing to re-bind when `markUIDirty` rebuilds the tree, and **sliding works for free** — a
+real d-pad lets the thumb roll from ← to ↑ without lifting, and every move re-resolves the control
+under the finger (`elementFromPoint`), so that is the default rather than a feature. A finger that
+slides off every control stops driving but stays TRACKED, so sliding back on resumes it.
+
+⚠️ **A control OUTRANKS the leaf `pointer-events: none` default and an authored `pointerThrough`.**
+A d-pad arrow is a leaf, so without that it renders perfectly and receives nothing — the same
+shape as the pointer-blocker passthrough bug. Pinned by `tests/ui/touchControlDom.test.tsx`.
+
+⚠️ **A control must be a plain `div`** — not an `input`/`range` `elementType`, not a `UIToggle`.
+`UINode` returns those from earlier branches that do not carry the attribute, so a `TouchControl`
+there would be an authored field that does nothing. It is refused rather than half-applied (the
+touch styles are withheld too, so the element is coherently *not* a control) and DEV warns —
+the fourth instance of the class `UINode` already warns about for `Canvas2D`, `UIToggle` and
+`VideoPlayer`.
+
+⚠️ **The press highlight is refcounted BY ELEMENT, not stored per press.** Two thumbs on one
+arrow made the second press capture the already-dimmed style as its original, so the first
+release restored the dimmed value and left the button rendered permanently pressed, with a later
+press re-capturing the wrong value as its own original. `reset()` iterates presses in insertion
+order, so the input gate's per-frame drain made that certain rather than likely. An element the
+source declines to highlight (`pressedOpacity: 1`) is now never written to at all — the old code
+still restored on release and erased an authored inline opacity it had never set.
+
+⚠️ **Visibility is a HOST question, never `lastInputDevice`.** It is asked at mount time, before
+the player has touched anything, when `lastDevice` is still `'none'` — a device-driven answer
+would hide the very control that lets them produce the first input. `core/formFactor.ts`
+(`isTouchDevice()`) is the single source of truth, shared with the renderer's quality tier so the
+tier a device boots at and the controls it is offered cannot disagree. The EDITOR is a desktop
+host, so a `showOn:'touch'` control is hidden in the Game panel and MOUNTED in the Scene panel
+whatever `showOn` says — you cannot position what you cannot see, and an authoring click must
+never drive the game (the source refuses any control outside a `data-modoki-ui-root="runtime"`
+tree).
+
+### Two thumbs at once — why this works at all
+
+`pointerSource` tracks exactly ONE gesture (`activeId`, first finger wins), so walk-while-you-orbit
+is impossible through it. It works because **a press inside a pointer-block root never latches
+`activeId`**, and `UIRenderer` registers the UI root as one: a thumb on the d-pad is invisible to
+`pointerSource`, leaving the next finger free to become the camera drag. That is why this source
+keeps its own per-`pointerId` map instead of going through the shared single pointer.
+
+Asserted at the DOM level in `packages/modoki/tests/runtime/touchControlSource.test.ts` (a real
+`pointerdown` on a control inside a registered block root, then a second on a canvas, then both
+read at once) rather than trusted from reading the code.
+
+### The diagonal is normalized
+
+Holding ← and ↑ gives (−1, +1) — a vector of length √2 — and every game here reads the axes as a
+velocity, so north-east walks 41% faster than north. On a keyboard that has always been true and
+players exploit it deliberately; on a d-pad the diagonal is a thumb POSITION, so the speed-up reads
+as the control being erratic. Scaled in the source, because only the source knows which
+contributions are its own: `clampAxes` runs after every source has merged and can only clamp.
+
+### Verified
+
+Measured, not reasoned: in the editor, a real press on `PadLeft` drives
+`CharacterController3D.moveX = −1` and releasing returns it to 0; a tap on the AIM button flips
+`Crosshair.isVisible`, i.e. the archery mode the demo previously reached only with the F key. On a
+**Galaxy A23** the four pads and AIM render on screen with `overlapsCount: 0` against the control
+hint, and the hint itself reads "D-pad to walk · Drag to orbit · AIM to draw the bow". The repo
+owner then played it on that phone.
+
+⚠️ **The two-finger case is proven by TESTS and by the owner's hands, not by an agent on device** —
+`device_tap`/`device_pointer` cannot press a DOM element at all (they resolve a `selector` and then
+dispatch at the canvas), and an unbalanced synthetic press additionally strands
+`pointerSource.activeId`, which killed real dragging until a cold relaunch. Both are #299; until
+that is fixed, an on-device pass for anything DOM-shaped is not evidence.
 
 ## Gotchas
 

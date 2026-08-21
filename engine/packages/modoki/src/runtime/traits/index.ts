@@ -40,6 +40,10 @@ export { UIBinding } from './UIBinding';
 export { UIAction } from './UIAction';
 export { UIFocusable } from './UIFocusable';
 export { UIToggle } from './UIToggle';
+export {
+  TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, TOUCH_ATTR, TOUCH_OPACITY_ATTR, UI_ROOT_ATTR,
+  type TouchControlAction, type TouchControlShowOn,
+} from './TouchControl';
 export { UIAnchor } from './UIAnchor';
 export { Canvas2D, type Canvas2DScaleMode } from './Canvas2D';
 export { NPRPostFX } from './NPRPostFX';
