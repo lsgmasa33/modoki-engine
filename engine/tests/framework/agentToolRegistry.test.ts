@@ -78,6 +78,19 @@ describe('registration', () => {
     expect(() => registerAgentTool(def('modoki_not_a_real_tool'))).toThrow(/reserved/);
     expect(listAgentTools()).toEqual([]);
   });
+
+  it('throws on the bare name `wait`, which carries no prefix but is still the engine\'s', () => {
+    // `wait` is `modoki_batch`'s pseudo-step, and the batch matches it BEFORE consulting the
+    // registry (it is the documented spelling and not a registry entry). So a game tool by that
+    // name would register cleanly, appear over MCP, and then be unreachable from every batch —
+    // the step would silently sleep instead. Registration is the only place to make that loud.
+    expect(() => registerAgentTool(def('wait'))).toThrow(/reserved/);
+    expect(listAgentTools()).toEqual([]);
+    // Neighbouring names are NOT reserved — the guard is one exact name, not a prefix.
+    registerAgentTool(def('court_wait'));
+    registerAgentTool(def('waiting_room'));
+    expect(listAgentTools().map((t) => t.name).sort()).toEqual(['court_wait', 'waiting_room']);
+  });
 });
 
 describe('declared facts survive registration', () => {

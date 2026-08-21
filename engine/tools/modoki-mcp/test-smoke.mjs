@@ -102,6 +102,23 @@ if (!cj.ok || cj.ran !== 3) throw new Error(`batch chain did not run 3 steps: ${
 if (cj.steps.map((s) => s.i).join() !== '0,1,2') throw new Error('batch steps came back out of order');
 console.log('batch runs an ordered chain (incl. wait) →', cj.ran, 'steps ✓');
 
+// 2b. The `modoki_` prefix is OPTIONAL on a step's tool name (#295). Read-only, and asserted
+//     LIVE because the resolution happens server-side against the REAL registry — a fake one
+//     proves only that the helper agrees with itself. The distinguishing part is that the
+//     reported names come back RESOLVED: a batch that merely refused more politely would not
+//     produce them.
+const bare = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+  { tool: 'get_editor_state', args: {} },
+  { tool: 'modoki_wait', args: { ms: 1 } },
+  { tool: 'list_scenes', args: {} },
+] } })));
+if (!bare.ok || bare.ran !== 3) throw new Error(`bare-named batch did not run: ${JSON.stringify(bare)}`);
+const bareNames = (bare.steps ?? []).concat(bare.quiet ?? []).sort((a, b) => a.i - b.i).map((s) => s.tool).join();
+if (bareNames !== 'modoki_get_editor_state,wait,modoki_list_scenes') {
+  throw new Error(`bare names did not resolve to full ones: ${bareNames}`);
+}
+console.log('batch accepts a bare tool name and reports it resolved →', bareNames, '✓');
+
 // 3. `resultDefault:'none'` suppresses clean steps into `quiet` — the token saving.
 const quiet = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: {
   steps: [{ tool: 'modoki_get_editor_state', args: {} }, { tool: 'modoki_list_scenes', args: {} }, { tool: 'modoki_list_traits', args: {} }],

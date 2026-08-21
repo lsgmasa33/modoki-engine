@@ -224,15 +224,20 @@ function showDragLine(fromX: number, fromY: number, toX: number, toY: number) {
  *  - `hit`       — `elementFromPoint` landed on a canvas (or inside one). The honest answer.
  *  - `only`      — the point is not over a canvas, but the document has exactly one, so there is
  *                  nothing to disambiguate. (Also the jsdom case: no layout, so every rect is 0x0.)
- *  - `contains`  — several canvases and the point missed them all per hit-testing (an overlay is on
- *                  top), so pick the LAST one whose rect contains the point — DOM order approximates
- *                  paint order, so the last is the topmost.
+ *  - `contains`  — several canvases and the point missed them all per hit-testing (the hit landed on
+ *                  a CONTAINER of them — `<body>`, an app root), so pick the LAST one whose rect
+ *                  contains the point: DOM order approximates paint order, so the last is topmost.
  *  - `ambiguous` — several canvases and none contains the point. Falls back to the first, i.e. the
  *                  OLD behaviour, but now says so instead of reporting a clean hit.
  *
+ *  This is reached only AFTER `pickDomTargetAt` declines (#299): a hit-test landing on genuine DOM
+ *  UI is dispatched THERE, not routed to a canvas underneath it — a real finger on an overlay does
+ *  not reach the canvas either. So `contains`/`ambiguous` now describe a hit on a container or a
+ *  layout miss, not an overlay.
+ *
  *  Note the marker overlay cannot skew the hit test: `ensureMarkerContainer` sets
- *  `pointer-events:none`, which is also why the DOM-button check above already trusts
- *  `elementFromPoint` after drawing a marker. */
+ *  `pointer-events:none`, which is also why `pickDomTargetAt` can trust `elementFromPoint` after a
+ *  marker has been drawn. */
 type CanvasPick = { canvas: HTMLCanvasElement | null; how: 'hit' | 'only' | 'contains' | 'ambiguous' };
 
 function pickCanvasAt(x: number, y: number): CanvasPick {
@@ -316,6 +321,62 @@ export async function handleResolveAim(params: Record<string, unknown>): Promise
   return resolveAim(p, selKey, xKey, yKey);
 }
 
+/** The DOM element a synthetic aim should be dispatched ON, or null to fall through to the game
+ *  canvas (#299).
+ *
+ *  THE DEFECT this closes: `dispatchTapAt`/`handlePointer` only recognised `<button>`/`<a>` as DOM
+ *  targets and sent everything else at the canvas. An on-screen control built from a `div` — the
+ *  engine `UIRenderer`'s output, a game's own touch controls — therefore
+ *  received an event whose `target` was the CANVAS, so every `closest(...)`/`e.target` handler
+ *  missed while the reply said `ok (canvas:only)`. Measured on the Galaxy A23: a `device_pointer`
+ *  down on the d-pad left `CharacterController3D.moveX` at 0, and a `device_tap` on the aim button
+ *  never toggled archery. That is the false-success shape this surface exists to refuse.
+ *
+ *  Dispatching on the element loses nothing the canvas path provided: the events still bubble to
+ *  `window`, which is where `pointerSource` (the source-agnostic Input seam a game reads) listens,
+ *  and `isPointerBlocked` then suppresses the game read for a registered UI root exactly as it does
+ *  for a real finger. What it does NOT reach is a canvas-local listener (Pixi's federated
+ *  EventSystem) — which is correct, because a real finger landing on an overlay does not reach it
+ *  either.
+ *
+ *  The guard is deliberately conservative: an element that CONTAINS a canvas (`<body>`, an app root,
+ *  a wrapper) is not a UI target — the aim is meant for the surface beneath it, so those keep the
+ *  `pickCanvasAt` geometry fallback and its honest `contains`/`ambiguous` labels. jsdom returns
+ *  `null` here by default (tests/setup.ts), so every coordinate-aimed test keeps the canvas path. */
+function pickDomTargetAt(x: number, y: number): HTMLElement | null {
+  const el = document.elementFromPoint(x, y);
+  if (!(el instanceof HTMLElement)) return null;
+  if (el instanceof HTMLCanvasElement || el.closest('canvas')) return null; // the game surface itself
+  if (el === document.body || el === document.documentElement) return null; // never a UI control
+  if (el.querySelector('canvas')) return null;                             // a container OF it, not UI
+  return el;
+}
+
+/** A short, stable description of a dispatch target for the reply line — the agent has to be able to
+ *  tell from the reply WHICH element it actually drove, since that is the fact #299 got wrong.
+ *  `data-entity-id` is what the GAME `UIRenderer` emits (the editor's `data-ui-id` handles are not
+ *  on this surface — see docs/debug-tools-mcp.md), so it is the handle an agent aims a device
+ *  selector at. Nothing here is keyed to a particular game's markup; an element carrying neither
+ *  attribute still names its tag. */
+function describeEl(el: Element): string {
+  const id = el.id ? `#${el.id}` : '';
+  const entity = el.getAttribute('data-entity-id');
+  const uiId = el.getAttribute('data-ui-id');
+  const attr = entity ? `[data-entity-id="${entity}"]` : uiId ? `[data-ui-id="${uiId}"]` : '';
+  return `${el.tagName.toLowerCase()}${id}${attr}`;
+}
+
+/** The full event sequence a real finger produces on a DOM element, in order. Pointer events alone
+ *  are NOT enough and that gap nearly shipped inside the #299 fix: the engine `UIRenderer` binds
+ *  React `onClick`, so a control tapped with only `pointerdown`/`pointerup` still does nothing —
+ *  the exact silence the fix exists to end. `mousedown`/`mouseup` come along for handlers written
+ *  against mouse events. `click` is dispatched AT the aim point rather than via `el.click()` so it
+ *  carries real coordinates and reaches an enclosing `<button>` by bubbling, the way a finger's
+ *  does. */
+function mouseInit(x: number, y: number): MouseEventInit {
+  return { clientX: x, clientY: y, bubbles: true, cancelable: true, button: 0 };
+}
+
 /** A window-bubbling pointer event init at (x,y) — the mouse-pointer shape a real tap/drag carries. */
 function ptrInit(x: number, y: number): PointerEventInit {
   return { clientX: x, clientY: y, bubbles: true, pointerId: 1, pointerType: 'mouse', isPrimary: true };
@@ -334,13 +395,19 @@ function ptrInit(x: number, y: number): PointerEventInit {
 async function dispatchTapAt(x: number, y: number): Promise<string> {
   showMarker(x, y, 'red', `tap(${Math.round(x)},${Math.round(y)})`);
 
-  // Try DOM element first (buttons)
-  const el = document.elementFromPoint(x, y);
-  if (el && (el instanceof HTMLButtonElement || el instanceof HTMLAnchorElement || el.closest('button'))) {
-    const clickTarget = el.closest('button') ?? el;
-    (clickTarget as HTMLElement).click();
-    const msg = `ok (clicked DOM: ${clickTarget.tagName})`;
-    _log(`[debug-bridge] TAP → ${msg}`);
+  // DOM UI first: dispatch ON the element under the aim, so `e.target` is what a real finger would
+  // have hit (#299). A button/anchor additionally gets a real `click()` — a synthetic pointer pair
+  // does not synthesize one, and that is what those elements' handlers listen for.
+  const domTarget = pickDomTargetAt(x, y);
+  if (domTarget) {
+    domTarget.dispatchEvent(new PointerEvent('pointerdown', ptrInit(x, y)));
+    domTarget.dispatchEvent(new MouseEvent('mousedown', mouseInit(x, y)));
+    await new Promise((r) => setTimeout(r, 50)); // same hold as the canvas path — let Input sample the down edge
+    domTarget.dispatchEvent(new PointerEvent('pointerup', ptrInit(x, y)));
+    domTarget.dispatchEvent(new MouseEvent('mouseup', mouseInit(x, y)));
+    domTarget.dispatchEvent(new MouseEvent('click', mouseInit(x, y)));
+    const msg = `ok (dom:${describeEl(domTarget)})`;
+    _log(`[debug-bridge] TAP → ${msg} css(${x.toFixed(1)},${y.toFixed(1)})`);
     return msg;
   }
 
@@ -384,7 +451,9 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   const grabEl = (typeof params.fromSelector === 'string' && params.fromSelector
     ? document.querySelector(params.fromSelector)
     : document.elementFromPoint(from.x, from.y)) as HTMLElement | null;
-  const domMode = explicitDom === true || (explicitDom !== false && !!grabEl && grabEl.tagName !== 'CANVAS' && !grabEl.closest('canvas'));
+  // `!grabEl.querySelector('canvas')` matches `pickDomTargetAt`'s container rule (#299): an element
+  // that CONTAINS the game surface (body, an app root, a wrapper) is not a DOM UI target.
+  const domMode = explicitDom === true || (explicitDom !== false && !!grabEl && grabEl.tagName !== 'CANVAS' && !grabEl.closest('canvas') && !grabEl.querySelector('canvas'));
   if (domMode) {
     if (!grabEl) return `Error: no element to drag at ${typeof params.fromSelector === 'string' ? JSON.stringify(params.fromSelector) : `(${Math.round(from.x)},${Math.round(from.y)})`}`;
     return withMechanismSuffix(await domDrag(grabEl, from, to, steps, delayMs));
@@ -572,7 +641,32 @@ export function createPortLifecycleHandler(deps: {
  *  that owns the gesture", not a workaround. A held press does NOT currently survive a page
  *  navigation/reload on the device (unlike the editor, which explicitly persists across one);
  *  that asymmetry is inherent to there being no separate backend process here. */
-let heldPointer: { button: number; x: number; y: number; canvas: HTMLCanvasElement; how: CanvasPick['how'] } | null = null;
+let heldPointer: { button: number; x: number; y: number; target: HTMLElement; how: HeldHow } | null = null;
+
+/** How the sustained press chose its dispatch target — a `pickCanvasAt` verdict, or `dom` when the
+ *  aim landed on a DOM UI element and the press went there instead (#299). */
+type HeldHow = CanvasPick['how'] | 'dom';
+
+/** Release a press left held, by dispatching its matching `pointerup` at the held point (#299).
+ *
+ *  A sustained press spans calls BY DESIGN, so nothing in `handlePointer` can know a gesture was
+ *  abandoned. The one moment we do know is the lease dropping: from then on the agent cannot send
+ *  the `up` at all. Leaving it held is not inert — `pointerSource` latches `activeId` on the down
+ *  and early-returns for every later pointerdown, so the phone goes DEAF TO THE HUMAN'S FINGER for
+ *  dragging until the app is force-stopped. That is what happened on the A23 while the owner was
+ *  playing, and it read as a product bug in the feature under test.
+ *
+ *  Returns a description of what it released, or null if nothing was held. */
+export function releaseHeldPointer(): string | null {
+  if (!heldPointer) return null;
+  const { target, button, x, y, how } = heldPointer;
+  heldPointer = null; // cleared FIRST — a throwing dispatch must not leave the press held anyway
+  try {
+    target.dispatchEvent(mkButtonedPointerEvent('pointerup', x, y, button));
+  } catch { /* the target may be detached by now; the point is to clear our own held state */ }
+  const where = how === 'dom' ? `dom:${describeEl(target)}` : `canvas:${how}`;
+  return `${POINTER_BUTTON_NAME[button]} at ${x.toFixed(1)},${y.toFixed(1)} on ${where}`;
+}
 
 /** Test-only reset — a held gesture left by one test would otherwise leak into the next
  *  (module state persists for the life of the imported module, and vitest does not re-import
@@ -641,26 +735,42 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
   // Re-picking per call would let a drag that crosses onto another canvas switch mid-gesture and
   // deliver its `up` to an element that never saw the `down` — the same pointer-capture break the
   // held button and held position already exist to avoid.
-  let canvas: HTMLCanvasElement;
-  let how: CanvasPick['how'];
+  let target: HTMLElement;
+  let how: HeldHow;
   if (action === 'down') {
-    const picked = pickCanvasAt(aim.x, aim.y);
-    if (!picked.canvas) return 'Error: No canvas element found';
-    canvas = picked.canvas;
-    how = picked.how;
+    // DOM UI under the aim wins, for the reason in `pickDomTargetAt` (#299): a press sent at the
+    // canvas arrives with the wrong `e.target` and no DOM handler ever sees it.
+    const domTarget = pickDomTargetAt(aim.x, aim.y);
+    if (domTarget) {
+      target = domTarget;
+      how = 'dom';
+    } else {
+      const picked = pickCanvasAt(aim.x, aim.y);
+      if (!picked.canvas) return 'Error: No canvas element found';
+      target = picked.canvas;
+      how = picked.how;
+    }
   } else {
-    canvas = heldPointer!.canvas;
+    target = heldPointer!.target;
     how = heldPointer!.how;
   }
 
   const type = action === 'down' ? 'pointerdown' : action === 'move' ? 'pointermove' : 'pointerup';
-  canvas.dispatchEvent(mkButtonedPointerEvent(type, aim.x, aim.y, button));
+  target.dispatchEvent(mkButtonedPointerEvent(type, aim.x, aim.y, button));
+  if (how === 'dom') {
+    // Mirror the mouse modality for handlers written against it. Deliberately NO synthetic `click`
+    // on `up`: a sustained gesture is often a drag, and a finger that travelled does not produce
+    // one. Use `device_tap` when a click is what you mean.
+    const mouseType = action === 'down' ? 'mousedown' : action === 'move' ? 'mousemove' : 'mouseup';
+    target.dispatchEvent(new MouseEvent(mouseType, { ...mouseInit(aim.x, aim.y), button, buttons: action === 'up' ? 0 : (1 << button) }));
+  }
   showMarker(aim.x, aim.y, action === 'down' ? 'orange' : action === 'move' ? 'yellow' : 'purple', `pointer${action}(${Math.round(aim.x)},${Math.round(aim.y)})`);
-  heldPointer = action === 'up' ? null : { button, x: aim.x, y: aim.y, canvas, how };
+  heldPointer = action === 'up' ? null : { button, x: aim.x, y: aim.y, target, how };
   await new Promise((r) => setTimeout(r, 16)); // let per-frame Input sampling see the edge, same as tap/drag
 
-  _log(`[debug-bridge] POINTER ${action} → canvas:${how} @ ${aim.label}`);
-  return withMechanismSuffix(`ok (${action} canvas:${how}, button ${buttonName}, held:${heldPointer !== null}) @ ${aim.label}`);
+  const where = how === 'dom' ? `dom:${describeEl(target)}` : `canvas:${how}`;
+  _log(`[debug-bridge] POINTER ${action} → ${where} @ ${aim.label}`);
+  return withMechanismSuffix(`ok (${action} ${where}, button ${buttonName}, held:${heldPointer !== null}) @ ${aim.label}`);
 }
 
 // --- Type text into the focused element (#31) ---
@@ -1016,6 +1126,9 @@ async function initNativeBridge() {
       setJournalEnabled(true);
     } else {
       _log('[debug-bridge] MCP client disconnected');
+      // Never leave a press the agent can no longer release (#299) — see `releaseHeldPointer`.
+      const released = releaseHeldPointer();
+      if (released) _log(`[debug-bridge] released a pointer left held by the dropped lease: ${released}`);
     }
   });
 

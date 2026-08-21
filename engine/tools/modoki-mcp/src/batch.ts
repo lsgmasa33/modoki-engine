@@ -145,6 +145,41 @@ const AIM_HINT =
   'instead — those resolve inside the call, so they cannot go stale mid-batch. Run a ' +
   'coordinate-aimed call on its own if you genuinely need one.';
 
+/** Resolve a step's `tool` string to a registered name, treating the `modoki_` prefix as
+ *  OPTIONAL. An EXACT match always wins; only a name nothing answers to is retried prefixed.
+ *
+ *  WHY (#295). Pre-flight validates every step before `runBatch` executes any, so an unresolvable
+ *  name does not fail its own step — it voids the WHOLE batch, including the valid steps ahead of
+ *  it. And a bare name is the natural thing to write: the docs, this file, and the tool
+ *  descriptions all refer to these tools as `tap` / `save_all` / `scroll` in prose, so a batch of
+ *  ten steps had ten chances to spend a turn on a prefix. Accepting the shorthand costs one Map
+ *  lookup and removes the whole failure.
+ *
+ *  Exact-first is what keeps this safe for the DYNAMIC tail: a game registers `<gameId>_<verb>`
+ *  (#270), so `court_load_level` resolves as itself and is never re-read as `modoki_court_...`.
+ *
+ *  `DENIED` is consulted here too, so a shorthand for a denied tool reports the DENIAL — the
+ *  actionable answer ("run it as its own call") — instead of "unknown tool", which would send the
+ *  caller off to fix a name that is spelled fine.
+ *
+ *  PRECEDENCE, exactly. The bare `wait` pseudo-step is the ONE thing that outranks a registered
+ *  tool, because it is the documented spelling and is not a registry entry at all. Everything
+ *  after it is exact-match-first. (A game tool named bare `wait` would therefore be unreachable
+ *  from a batch, so `registerAgentTool` refuses that one name.) */
+export function resolveToolName(name: string, getTool: typeof defaultGetTool): string {
+  if (name === WAIT) return WAIT;
+  // Exact registration beats the `modoki_wait` alias below: if the engine ever ships a real tool
+  // by that name, a step naming it must reach the TOOL, not silently become a sleep — the
+  // wrong-handler substitution `registerTool`'s duplicate-throw exists to prevent.
+  if (getTool(name)) return name;
+  // `modoki_wait` is the mirror-image slip of the one this function exists for — left alone it
+  // would void a batch for the same reason — so it means the pseudo-step too.
+  if (name === `modoki_${WAIT}`) return WAIT;
+  const prefixed = `modoki_${name}`;
+  if (getTool(prefixed) || DENIED.has(prefixed)) return prefixed;
+  return name; // unresolvable — pre-flight reports it under the name as written
+}
+
 function usesRawXY(tool: string, args: Record<string, unknown>): string | null {
   const where = XY_AIMED[tool];
   if (!where) return null;
@@ -185,15 +220,35 @@ const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  *  forfeit all 75 hand-written schemas at exactly the moment the model is authoring ten argument
  *  objects with no per-call feedback. It also means a typo in step 9 cannot leave steps 1–8
  *  applied: the whole class of half-mutated batches simply never happens. */
-function preflight(input: BatchInput, getTool: typeof defaultGetTool): string | null {
+/** Pre-flight's answer: a refusal (nothing ran), or the RESOLVED tool name for every step.
+ *
+ *  Handing the names back is what makes resolution happen exactly ONCE. Resolving again in the
+ *  executor would re-decide it against a registry that MUTATES mid-run — `gameTools.ts` polls and
+ *  re-registers as the human opens and closes a project, and a batch may sit in a `wait` or a slow
+ *  handler for a long time. A name that resolved via the `modoki_` prefix at pre-flight could then
+ *  hit the exact-match branch on the second pass and run a DIFFERENT handler — one whose schema
+ *  never saw these args, silently bypassing the strict re-parse that is the whole reason the
+ *  registry exists. Resolve once, carry the answer. */
+type PreflightResult = { rejected: string } | { tools: string[] };
+
+function preflight(input: BatchInput, getTool: typeof defaultGetTool): PreflightResult {
   const { steps } = input;
-  if (!Array.isArray(steps) || steps.length === 0) return 'batch: `steps` must be a non-empty array.';
-  if (steps.length > MAX_STEPS) return `batch: ${steps.length} steps exceeds the cap of ${MAX_STEPS}.`;
+  if (!Array.isArray(steps) || steps.length === 0) return { rejected: 'batch: `steps` must be a non-empty array.' };
+  if (steps.length > MAX_STEPS) return { rejected: `batch: ${steps.length} steps exceeds the cap of ${MAX_STEPS}.` };
+
+  /** The resolved name PER STEP, handed to the executor — see PreflightResult. */
+  const resolved: string[] = [];
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
+    // `at` names the tool AS WRITTEN, not as resolved — it is there to help the caller find the
+    // step in the array they sent.
     const at = `step ${i} (${step?.tool ?? 'no tool'})`;
-    if (!step || typeof step.tool !== 'string' || !step.tool) return `batch: ${at}: every step needs a \`tool\` name.`;
+    if (!step || typeof step.tool !== 'string' || !step.tool) return { rejected: `batch: ${at}: every step needs a \`tool\` name.` };
+    // Everything below keys off the RESOLVED name, so the `modoki_` prefix is optional for the
+    // denial and raw-{x,y} rules too — a shorthand cannot slip past a refusal (#295).
+    const tool = resolveToolName(step.tool, getTool);
+    resolved[i] = tool;
     // Unknown keys on the STEP WRAPPER, checked here as well as in the tool's zod shape. Belt and
     // braces on purpose: `runBatch` is called directly (tests, and any future caller), and the one
     // key worth protecting most is `args` — a step written `{tool, arg:{…}}` had the singular
@@ -201,29 +256,30 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): string | 
     // as success.
     const unknownStepKeys = Object.keys(step).filter((k) => k !== 'tool' && k !== 'args' && k !== 'result');
     if (unknownStepKeys.length) {
-      return `batch: ${at}: unknown step key(s) ${unknownStepKeys.map((k) => `\`${k}\``).join(', ')} — a step accepts only \`tool\`, \`args\` (PLURAL), \`result\`. Nothing ran.`;
+      return { rejected: `batch: ${at}: unknown step key(s) ${unknownStepKeys.map((k) => `\`${k}\``).join(', ')} — a step accepts only \`tool\`, \`args\` (PLURAL), \`result\`. Nothing ran.` };
     }
     if (step.result && !['none', 'ack', 'full'].includes(step.result)) {
-      return `batch: ${at}: result must be 'none' | 'ack' | 'full'.`;
+      return { rejected: `batch: ${at}: result must be 'none' | 'ack' | 'full'.` };
     }
     const args = (step.args ?? {}) as Record<string, unknown>;
 
-    if (step.tool === WAIT) {
+    if (tool === WAIT) {
       const ms = args.ms;
-      if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return `batch: ${at}: wait needs {ms: <number ≥ 0>}.`;
-      if (ms > MAX_WAIT_MS) return `batch: ${at}: wait ms ${ms} exceeds the cap of ${MAX_WAIT_MS}.`;
+      if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return { rejected: `batch: ${at}: wait needs {ms: <number ≥ 0>}.` };
+      if (ms > MAX_WAIT_MS) return { rejected: `batch: ${at}: wait ms ${ms} exceeds the cap of ${MAX_WAIT_MS}.` };
       continue;
     }
-    if (DENIED.has(step.tool)) {
-      return `batch: ${at}: this tool is not allowed in a batch — run it as its own call.`;
+    if (DENIED.has(tool)) {
+      return { rejected: `batch: ${at}: this tool is not allowed in a batch — run it as its own call.` };
     }
-    const entry = getTool(step.tool);
+    const entry = getTool(tool);
     if (!entry) {
       const known = toolNames().length;
-      return `batch: ${at}: unknown tool. ${known} tools are registered; check the name.`;
+      return { rejected: `batch: ${at}: unknown tool — ${known} tools are registered, and nothing ran. `
+        + `Check the name; the \`modoki_\` prefix is optional, so this is not a prefix problem.` };
     }
-    const rawXY = usesRawXY(step.tool, args);
-    if (rawXY) return `batch: ${at}: raw ${rawXY} aiming is not allowed inside a batch — ${AIM_HINT}`;
+    const rawXY = usesRawXY(tool, args);
+    if (rawXY) return { rejected: `batch: ${at}: raw ${rawXY} aiming is not allowed inside a batch — ${AIM_HINT}` };
 
     // STRICT: an unknown key is an error here, not something to strip.
     //
@@ -243,10 +299,10 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): string | 
       // Name the accepted keys on an unrecognized-key error: the whole failure is "you used a name
       // this tool doesn't have", so the answer is the list of names it does.
       const extra = issue.code === 'unrecognized_keys' ? ` — accepted params: ${known}` : '';
-      return `batch: ${at}: invalid args — ${where}: ${issue.message}${extra}`;
+      return { rejected: `batch: ${at}: invalid args — ${where}: ${issue.message}${extra}` };
     }
   }
-  return null;
+  return { tools: resolved };
 }
 
 /** Which `result` mode a step gets when it did not choose one. The LAST step defaults to `full`
@@ -263,8 +319,10 @@ export async function runBatch(input: BatchInput, deps: BatchDeps = {}): Promise
   const sleep = deps.sleep ?? realSleep;
   const now = deps.now ?? Date.now;
 
-  const rejected = preflight(input, getTool);
-  if (rejected) return { rejected };
+  const pf = preflight(input, getTool);
+  if ('rejected' in pf) return { rejected: pf.rejected };
+  /** Resolved ONCE, at pre-flight. Never re-resolve here — see PreflightResult. */
+  const resolved = pf.tools;
 
   const { steps } = input;
   const stopOnError = input.stopOnError !== false;
@@ -299,13 +357,17 @@ export async function runBatch(input: BatchInput, deps: BatchDeps = {}): Promise
       break;
     }
 
-    if (step.tool === WAIT) {
+    const tool = resolved[i];
+    if (tool === WAIT) {
       await sleep((step.args as { ms: number }).ms);
       out.push({ i, tool: WAIT, ok: true, mode, text: JSON.stringify({ waited: (step.args as { ms: number }).ms }) });
       continue;
     }
 
-    const entry = getTool(step.tool)!; // pre-flight proved it resolves
+    // Pre-flight proved this name resolved THEN; the registry can still lose it (a project close
+    // unregisters game tools mid-run), so the deref stays inside the try below and a vanished tool
+    // becomes a failed STEP rather than an escaped throw. `runBatch` never throws.
+    const entry = getTool(tool)!;
     let res: ToolResult;
     try {
       res = await entry.handler(step.args ?? {});
@@ -315,7 +377,9 @@ export async function runBatch(input: BatchInput, deps: BatchDeps = {}): Promise
       res = { content: [{ type: 'text', text: `threw: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
     }
     const ok = res.isError !== true;
-    out.push({ i, tool: step.tool, ok, mode, text: res.content.map((c) => c.text).join('\n') });
+    // Report the RESOLVED name: the report says what actually ran, and a caller who wrote the
+    // shorthand sees the full name they can re-send as a single call.
+    out.push({ i, tool, ok, mode, text: res.content.map((c) => c.text).join('\n') });
     if (!ok) {
       failed.push(i);
       failedAt ??= i;
@@ -324,7 +388,10 @@ export async function runBatch(input: BatchInput, deps: BatchDeps = {}): Promise
   }
 
   const ranTo = out.length;
-  const notRun = steps.slice(ranTo).map((s, k) => ({ i: ranTo + k, tool: s.tool }));
+  // Resolved names here too. A report that named the ran steps `modoki_save_all` and the skipped
+  // one `save_all` describes one batch in two vocabularies — and `notRun` is precisely the list a
+  // caller re-sends from.
+  const notRun = steps.slice(ranTo).map((_s, k) => ({ i: ranTo + k, tool: resolved[ranTo + k] }));
   // `failedAt` MEANS "the run stopped here". That is only true in fail-fast mode — with
   // stopOnError:false the run continues, so reporting `failedAt:0` alongside a hint reading
   // "steps after failedAt did NOT run" described a batch that had in fact run every step. The

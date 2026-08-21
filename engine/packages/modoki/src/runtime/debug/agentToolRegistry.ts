@@ -91,6 +91,15 @@ function bump(): void {
  *  one would either collide (the MCP registry throws on a duplicate) or, worse, land in the gap
  *  where the engine has not defined that name YET and would silently lose it later. */
 const RESERVED_PREFIX = 'modoki_';
+/** Names the engine's own agent surface already means something by, so a game tool cannot take
+ *  them even though they carry no reserved prefix.
+ *
+ *  `wait` is `modoki_batch`'s pseudo-step (`tools/modoki-mcp/src/batch.ts`), and the batch matches
+ *  it BEFORE consulting the registry — it has to, being the documented spelling and not a registry
+ *  entry. So a game tool named `wait` would register cleanly, appear over MCP, and then be
+ *  unreachable from every batch, with the step silently sleeping instead. Refusing the name at
+ *  registration is the only place that failure can be made loud. */
+const RESERVED_NAMES = new Set(['wait']);
 /** MCP tool names are addressed as bare identifiers by `modoki_batch` and by the client. */
 const NAME_RE = /^[a-z][a-z0-9_]*$/;
 
@@ -105,6 +114,13 @@ export function registerAgentTool(def: AgentToolDef): void {
     throw new Error(
       `registerAgentTool: '${def.name}' is not a valid tool name — use lower_snake_case ` +
         `starting with a letter, and prefix it with your game id (e.g. 'court_load_level').`,
+    );
+  }
+  if (RESERVED_NAMES.has(def.name)) {
+    throw new Error(
+      `registerAgentTool: '${def.name}' is reserved by the engine's agent surface (it is ` +
+        `modoki_batch's pseudo-step, which a batch matches before the registry, so a tool by ` +
+        `this name could never be called from one). Prefix game tools with your game id instead.`,
     );
   }
   if (def.name.startsWith(RESERVED_PREFIX)) {

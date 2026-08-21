@@ -110,6 +110,13 @@ tool is still a defect, and so is this one while the editor **is** playing.
 ### Naming: `<gameId>_<verb>`
 
 - `modoki_` is **reserved** — the registry throws on it.
+- **`wait` is reserved too**, and it is the exception to "reserved means prefixed". It is
+  `modoki_batch`'s pseudo-step, which a batch matches **before** consulting the registry — it has
+  to, being the documented spelling and not a registry entry at all. So a game tool named `wait`
+  would register cleanly, appear over MCP, and then be uncallable from any batch, the step
+  silently sleeping instead. Registration is the only place that can be made loud, so
+  `registerAgentTool` refuses that one exact name (`RESERVED_NAMES`). Neighbouring names
+  (`court_wait`, `waiting_room`) are unaffected — it is a name, not a prefix.
 - A game tool must start with its own game id. This is checked **statically**, by
   `engine/tests/architecture/gameAgentToolNames.test.ts`, and deliberately not at runtime: the
   registry is a pure module with no idea which game is calling, and checking at the bridge would

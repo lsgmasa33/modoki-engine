@@ -1381,7 +1381,11 @@ export function registerTools(server: McpServer) {
       '`entity` addressing on this surface. move/up reuse the button from the down; a move/up with ' +
       'nothing held, or a down while already held, is REFUSED rather than silently re-pressing/re-aiming. ' +
       'Always dispatches synthetic DOM events, never OS-level trusted input — this op is not ' +
-      'routed through the trusted paths on either platform (#32), and says so on every reply.',
+      'routed through the trusted paths on either platform (#32), and says so on every reply. ' +
+      'RELEASE WHAT YOU PRESS: a down left un-released latches the engine pointer source, and until ' +
+      'a real finger presses again (or the lease drops, which now sends the up for you) the game ' +
+      'reads NO dragging at all — including the human\'s (#299). The reply says where the press ' +
+      'landed: `dom:<element>` when it went to DOM UI, `canvas:<how>` when it went to the game surface.',
     {
       action: z.enum(['down', 'move', 'up']).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device; refuses if occluded). Preferred.'),

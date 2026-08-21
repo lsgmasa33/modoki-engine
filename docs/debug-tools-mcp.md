@@ -268,7 +268,25 @@ synthetic pointer isn't an "active pointer" and a React drag hook's `e.currentTa
 would otherwise throw and abort the drag. `device_press_key` dispatches keydown → brief hold → keyup on
 the focused element (bubbles to `window`, where the F12 debug-menu toggle + input sources listen).
 `device_dispatch_action` triggers a game intent directly and flags a `{dispatched:false}` no-op as an
-error, not a phantom success. (`tap_handle`/`drag_handle` aren't ported — the game UIRenderer emits no
+error, not a phantom success.
+
+⚠️ **A resolved `selector` is dispatched ON the element it resolved to — it did not used to be
+(#299).** `device_tap`/`device_pointer` recognised only `<button>`/`<a>` as DOM targets and sent
+everything else at the game canvas, so an on-screen control built from a `div` (the `UIRenderer`'s
+output, a game's touch d-pad) received an event whose `target` was the CANVAS and every
+`e.target`/`closest(...)` handler missed — while the reply said `ok (canvas:only)`. Measured on the
+A23 with `demos/forest-camp`: a press on the d-pad left `moveX` at 0 and a tap on the aim button
+never toggled archery. The reply now names where the press landed — `dom:<element>` or
+`canvas:<how>` — so the aim is checkable from the reply alone. An element that CONTAINS the canvas
+(`<body>`, an app root) is still a container, not UI, and keeps the canvas path.
+
+⚠️ **Release what `device_pointer` presses.** A `down` left un-released latches the engine's
+`pointerSource`, and until then the game reads NO dragging at all — **including the human's finger**,
+until the app is force-stopped. That is what made this bug expensive to find: the d-pad kept working
+(it tracks its own `pointerId`s), so "drag is broken but buttons are fine" read as a product bug.
+Two defences now exist, and neither excuses skipping the `up`: a real finger reclaims a stranded
+synthetic gesture ([input.md](input.md) § "A stranded synthetic press"), and dropping the lease sends
+the `up` for you. (`tap_handle`/`drag_handle` aren't ported — the game UIRenderer emits no
 `data-ui-id`.) Full tool table: [`CONNECTION.md`](../engine/tools/game-debug-mcp/CONNECTION.md).
 
 ### Lease semantics & why it's Modoki-owned
@@ -705,8 +723,14 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
   - **A failure is never hidden by `"none"`**: the failing step is reported in full, AND the steps
     *before* it are un-suppressed — they already applied, and **a batch is not a transaction**
     (nothing is rolled back, since each step is its own call).
+  - **The `modoki_` prefix on a step's `tool` is optional** — `"save_all"` and `"modoki_save_all"`
+    are the same step (an EXACT match wins first, so a game tool keeps its own `<gameId>_<verb>`
+    name). This is not cosmetic: pre-flight validates every step before any of them run, so one
+    unresolvable name used to void the WHOLE batch, valid steps included — and writing the bare
+    name is the natural slip, because that is how these tools are referred to in prose everywhere,
+    this page included (#295).
   - `{"tool":"wait","args":{"ms":100}}` is a pseudo-step for letting the renderer settle before a
-    capture.
+    capture (`"modoki_wait"` is accepted for it too).
   - **Refused at pre-flight, so nothing runs:** unknown tool, args that fail the tool's real schema,
     raw `{x,y}` aiming on `tap`/`hover`/`scroll`/`pointer`/`drag`/`dnd`/`drag_handle` (aim by
     `entity`/`selector`/handle id, or `drag_handle`'s `toId`/`delta`), and

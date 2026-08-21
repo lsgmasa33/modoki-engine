@@ -63,7 +63,9 @@ deterministic sim free of live DOM reads.
   and by touch-control visibility.
 - `runtime/input/pointerSource.ts` — mouse/primary-touch modality: Pointer Events on `window` with
   `setPointerCapture`, reports the single active pointer as a `PointerFrame` (position + down + drag
-  delta). Treats `pointercancel` as a clean release so an Android touch-reclaim can't strand a drag.
+  delta). Treats `pointercancel` as a clean release so an Android touch-reclaim can't strand a drag,
+  and lets a real finger reclaim a stranded SYNTHETIC gesture (see "A stranded synthetic press"
+  below).
 - `runtime/core/pointerBlockers.ts` — the pointer-block-root registry (`registerPointerBlocker`/
   `isPointerBlocked`), consulted by `pointerSource.ts` at ingestion. Lives in `core/` (L0), not
   `input/` or `ui/` (both L2), because both need to reach it and there is no `ui → input` zone edge.
@@ -156,6 +158,28 @@ its own root automatically, but ONLY in runtime mode (`!onSelectEntity`) — the
 UI tree a second time inside SceneView's authoring preview, where a click manipulates gizmos/
 selection, not the running game, and must never claim its pointer. A game's own DOM chrome (like
 `rulesDialog.ts`) registers/unregisters manually around its own mount/unmount.
+
+**A stranded synthetic press, and why a real finger reclaims it (#299).** The primary-touch rule —
+the first pointer down owns the gesture, later pointers are ignored until it lifts — assumes the
+owning press eventually lifts. A press from the **device debug bridge** need not: `device_pointer
+{action:'down'}` holds across calls BY DESIGN, so an agent that never sends the matching `up` leaves
+`activeId` latched with no live pointer behind it, and nothing recovers it (`blur`/`visibilitychange`
+/play-start resets do not fire in a running shipped game). From then on every `pointerdown` — the
+human's finger included — hits the early return. Measured on the Galaxy A23 while the owner was
+playing `demos/forest-camp`: camera orbit was dead for every real touch until a cold `am force-stop`,
+and it presented as a product bug in the feature under test, because the on-screen d-pad tracks its
+own `pointerId`s and never consults this module.
+
+So `onPointerDown` adopts a **trusted** press that arrives while an **untrusted** gesture owns the
+pointer: the two cannot physically coexist, since an `isTrusted` event is a finger on the glass and a
+finger cannot land during a genuinely-in-progress *synthetic* gesture. That makes the takeover exact,
+where a staleness TIMEOUT would also steal a legitimate long hold from a second finger. The reverse
+is not adopted (a synthetic press never displaces a real gesture), and a synthetic-input-only device
+— the iPhone 8, which cannot run WebDriverAgent — is unaffected, since nothing there is ever
+trusted. The stale gesture is closed with a release transition before the new one latches, so the
+`pending` FIFO keeps its down/up alternation. The bridge closes the other half: dropping the lease
+releases a press left held (`releaseHeldPointer`), because that is the moment the agent provably
+cannot send the `up` itself.
 
 ⚠️ **PASSTHROUGH SURFACES — a block root alone over-blocks, and it killed all 2D input for a day.**
 `UIRenderer` registers its WHOLE UI root, but that root is not "chrome": it is a LAYER holding chrome

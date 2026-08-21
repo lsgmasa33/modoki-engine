@@ -79,16 +79,17 @@ describe('synthetic tap targets the canvas UNDER the aim point (#93)', () => {
     expect(reply).toContain('canvas:only');
   });
 
-  it('falls back to GEOMETRY when an overlay wins the hit-test, preferring the topmost container', async () => {
-    // A HUD div over the canvases: the hit-test answers the div, but the aim is still meant for the
-    // canvas beneath it. DOM order approximates paint order, so the LAST containing canvas wins.
+  it('falls back to GEOMETRY when the hit-test answers a CONTAINER, preferring the topmost canvas', async () => {
+    // `<body>` wins the hit-test: no canvas covers the point, so the aim is still meant for a canvas
+    // and we have to guess which. DOM order approximates paint order, so the LAST containing canvas
+    // wins. (This case used to be stated with an overlay DIV as the hit target; #299 moved that to
+    // the DOM path below — a div IS a plausible UI control and a real finger would land on it,
+    // whereas `<body>` never is.)
     const back = canvasAt(0, 0, 400, 800);
     const front = canvasAt(0, 0, 400, 800);   // same rect, later in the document == on top
     const onBack = record(back);
     const onFront = record(front);
-    const overlay = document.createElement('div');
-    document.body.appendChild(overlay);
-    hitTestReturns(overlay);
+    hitTestReturns(document.body);
 
     const reply = await handleTap({ x: 100, y: 100 });
 

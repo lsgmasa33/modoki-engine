@@ -25,7 +25,10 @@ export function registerBatchTool(tool: ToolDef, ctx: ToolContext): void {
       'DO NOT use it when you need a step\'s response to decide a later step. There is no way to ' +
       'branch mid-batch; pre-flight rejects the whole batch if any step is malformed, and ' +
       'execution stops at the first failure.\n\n' +
-      'Each step is {tool, args, result}. `result` controls what comes back: "none" (omit — for ' +
+      'Each step is {tool, args, result}. The `modoki_` prefix on `tool` is OPTIONAL — "save_all" ' +
+      'and "modoki_save_all" are the same step. A game tool keeps its own full name ' +
+      '(e.g. "court_load_level").\n\n' +
+      'Each step\'s `result` controls what comes back: "none" (omit — for ' +
       'steps whose output you will not read), "ack" (default: small payloads verbatim, large ones ' +
       'summarized), "full" (everything; automatic for the LAST step, so a batch ending in a read ' +
       'needs no annotation). `resultDefault` sets the default for all non-terminal steps — pass ' +
@@ -49,7 +52,7 @@ export function registerBatchTool(tool: ToolDef, ctx: ToolContext): void {
       // 136-entity index instead of one entity, `ok:true`. A dropped `args` is the worst possible
       // key to lose silently — the step becomes a different, usually much broader, operation.
       steps: z.array(z.object({
-        tool: z.string().describe('Tool name, e.g. "modoki_set_transform" — or "wait".'),
+        tool: z.string().describe('Tool name, e.g. "modoki_set_transform" or just "set_transform" (the modoki_ prefix is optional) — or "wait".'),
         args: z.record(z.any()).optional().describe("That tool's own arguments, validated against its real schema before ANY step runs."),
         result: z.enum(['none', 'ack', 'full']).optional().describe('How much of this step to return. Default: "ack", or "full" for the last step.'),
       }).strict('a batch step accepts only: tool, args, result (note `args` is PLURAL).')).describe('Steps, executed in array order.'),

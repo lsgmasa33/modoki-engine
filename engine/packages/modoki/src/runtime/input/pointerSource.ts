@@ -88,6 +88,10 @@ let y = 0;
 let startX = 0;
 let startY = 0;
 let activeId: number | null = null;
+/** Whether the gesture owning `activeId` came from a REAL pointer (`isTrusted`). A synthetic press
+ *  — the device debug bridge's `device_pointer`/`device_tap` — sets this false, which is what lets
+ *  a real finger reclaim a stranded one; see `onPointerDown` (#299). */
+let activeTrusted = false;
 let active = false;         // saw activity since last sample → sets lastDevice='pointer'
 // Smoothed pointer position + velocity, published for latency extrapolation
 // (`pointerPredictedPos`). Both come from a 1€ filter per axis rather than a fixed EMA: a fixed
@@ -135,7 +139,7 @@ let wheelAccum = 0;
 const pending: PointerTransition[] = [];
 
 function reset(): void {
-  down = false; activeId = null; wheelAccum = 0; pending.length = 0;
+  down = false; activeId = null; activeTrusted = false; wheelAccum = 0; pending.length = 0;
   vx = 0; vy = 0; lastMoveT = 0;
   filterX.reset(); filterY.reset();
 }
@@ -154,7 +158,28 @@ function pushTransition(t: PointerTransition): void {
 
 function onPointerDown(e: PointerEvent): void {
   noteUserInput(rawNow()); // see core/userActivity.ts — tier calibration must not judge an idle device
-  if (activeId !== null) return;           // a gesture already owns the pointer
+  if (activeId !== null) {
+    // A gesture already owns the pointer — EXCEPT when it is a stranded SYNTHETIC one. A synthetic
+    // press (the device debug bridge) can be left un-released with nothing able to clear it: no
+    // matching `up` ever arrives, and `blur`/`visibilitychange`/play-start resets do not fire in a
+    // running shipped game. From then on this early return swallows EVERY real finger — measured on
+    // an A23, where camera orbit stayed dead until a force-stop (#299).
+    //
+    // A real pointer reclaims it, because the two cannot physically coexist: an `isTrusted` press
+    // is a finger on the glass, and a finger cannot arrive while a *synthetic* gesture is genuinely
+    // in progress. That makes the takeover exact — unlike a staleness TIMEOUT, which would also
+    // steal a legitimate long hold from a second finger, breaking the primary-touch rule below for
+    // real multitouch. The reverse case (a synthetic press during a real gesture) is NOT adopted:
+    // there the finger is real and owns the gesture.
+    if (!e.isTrusted || activeTrusted) return;
+    // Close the stale gesture with a release before latching the new one, so `pending` keeps its
+    // down/up alternation — see `pushTransition`: a down following a down makes `computePointerEdge`
+    // emit neither edge, silently swallowing the finger we are trying to hand control to.
+    down = false;
+    pushTransition({ down: false, x, y, startX, startY });
+    activeId = null;
+    activeTrusted = false;
+  }
   if (isPointerBlocked(e.target)) {
     // Never latch `activeId` for a blocked press — the whole gesture (its later
     // move/up) already falls through the `pointerId !== activeId` checks below
@@ -167,6 +192,7 @@ function onPointerDown(e: PointerEvent): void {
     return;
   }
   activeId = e.pointerId;
+  activeTrusted = e.isTrusted;
   down = true;
   x = e.clientX; y = e.clientY;
   startX = x; startY = y;
@@ -214,6 +240,7 @@ function onPointerUp(e: PointerEvent): void {
   x = e.clientX; y = e.clientY;
   down = false;
   activeId = null;
+  activeTrusted = false;
   active = true;
   // Kill the velocity on release so the extrapolated point collapses onto the true one. A
   // flick-and-lift would otherwise leave the picture coasting past the finger on the very
