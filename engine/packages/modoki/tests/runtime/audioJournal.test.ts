@@ -12,12 +12,13 @@
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { createWorld, type World } from 'koota';
 import { AudioSource } from '../../src/runtime/traits/AudioSource';
+import { AudioSettings } from '../../src/runtime/traits/AudioSettings';
 import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { audioSystem, stopEntityAudio, stopWorldAudio } from '../../src/runtime/audio/audioSystem';
 import {
   getAudioLog, clearAudioLog, setAudioRecordMode, play,
 } from '../../src/runtime/audio/audioService';
-import { cueClip } from '../../src/runtime/audio/audioCues';
+import { cueClip, cueSound } from '../../src/runtime/audio/audioCues';
 import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
 import { getPlayState, setPlayState } from '../../src/runtime/core/playState';
 import { journalEvents, clearJournal } from '../../src/runtime/core/journal';
@@ -52,7 +53,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  if (world) stopWorldAudio(world);
+  // destroy(), not just drop the reference: koota hard-caps at 16 live worlds, so a file
+  // with more than 16 cases dies at `createWorld` with a confusing "too many worlds"
+  // rather than a test failure.
+  if (world) { stopWorldAudio(world); world.destroy(); }
   world = undefined;
   clearManifest();
   setPlayState(prevState);
@@ -136,6 +140,7 @@ describe('@audio — the lifecycle is traceable end to end', () => {
     const other = createWorld();
     expect(journalEvents({ type: '@audio' }, other)).toHaveLength(0);
     expect(phases()).toEqual(['start']);
+    other.destroy();
   });
 });
 
@@ -167,6 +172,98 @@ describe('the gaps close-out review found — a voice that is invisible to the t
   // The `unresolved` and `retry-overflow` phases can only be reached with a real decoder
   // present (record mode's resolveSpec never returns null), so they live in
   // audioCueRetry.test.ts, which already mocks hasAudioSupport → true.
+});
+
+describe('the sfx voice cap — oldest-first stealing (owner policy, 2026-08-21)', () => {
+  /** Fire `n` distinct one-shot cues and run one frame. Record mode never ends a voice on
+   *  its own, so every shot stays "live" and the cap engages deterministically. */
+  function fire(n: number, bus: 'sfx' | 'ui' | 'music' = 'sfx'): string[] {
+    const clips = Array.from({ length: n }, () => mintClip());
+    for (const c of clips) cueClip(c, { bus }, world!);
+    audioSystem(world!);
+    return clips;
+  }
+  const stolen = () => audioEvents().filter((p) => p.phase === 'stolen');
+
+  it('holds at the authored limit, stealing the OLDEST first', () => {
+    world!.spawn(AudioSettings({ sfxVoiceLimit: 4 }));
+    const clips = fire(6);
+
+    // Six fired, four may sound: the two stolen are the two OLDEST, in age order.
+    expect(stolen().map((p) => p.clip)).toEqual([clips[0], clips[1]]);
+    expect(stolen()[0].reason).toBe('voice-cap');
+    // Every shot still reports `start` — a stolen voice DID play, it was cut short.
+    expect(audioEvents().filter((p) => p.phase === 'start')).toHaveLength(6);
+  });
+
+  it('reads the limit from the SCENE, not from a constant — 2 steals sooner than 4', () => {
+    world!.spawn(AudioSettings({ sfxVoiceLimit: 2 }));
+    const clips = fire(3);
+    expect(stolen().map((p) => p.clip)).toEqual([clips[0]]);
+  });
+
+  it('treats a limit of 0 as UNCAPPED, not as silence', () => {
+    world!.spawn(AudioSettings({ sfxVoiceLimit: 0 }));
+    fire(10);
+    expect(stolen()).toHaveLength(0);
+    expect(audioEvents().filter((p) => p.phase === 'start')).toHaveLength(10);
+  });
+
+  it('never caps MUSIC or the ui bus — only sfx', () => {
+    world!.spawn(AudioSettings({ sfxVoiceLimit: 2 }));
+    fire(6, 'music');
+    fire(6, 'ui');
+    expect(stolen()).toHaveLength(0);
+  });
+
+  it('never steals an entity-owned AudioSource, even a looping one on the sfx bus', () => {
+    world!.spawn(AudioSettings({ sfxVoiceLimit: 2 }));
+    const ambience = mintClip();
+    world!.spawn(
+      AudioSource({ clip: ambience, autoplay: true, loop: true, bus: 'sfx' }),
+      EntityAttributes({ guid: newGuid() }),
+    );
+    audioSystem(world!);              // the loop starts, and is now the OLDEST voice
+    fire(6);                          // plenty to blow past the cap
+
+    // Under naive oldest-first the campfire would be the first thing killed. It must not be.
+    expect(stolen().map((p) => p.clip)).not.toContain(ambience);
+    // and it is still playing
+    expect(phases().filter((p) => p === 'stop' || p === 'end')).toHaveLength(0);
+  });
+
+  it('counts a NAMED cue fan-out against the cap — those are one-shots too', () => {
+    world!.spawn(AudioSettings({ sfxVoiceLimit: 2 }));
+    const clip = mintClip();
+    for (let i = 0; i < 4; i++) {
+      world!.spawn(
+        AudioSource({ clip, playOnCue: 'hit', bus: 'sfx' }),
+        EntityAttributes({ guid: newGuid() }),
+      );
+    }
+    cueSound('hit', world!);
+    audioSystem(world!);
+
+    // Four sources match one cue → four one-shots → two stolen at a limit of 2.
+    expect(stolen()).toHaveLength(2);
+  });
+
+  it('a finished one-shot frees its slot instead of holding it against the cap', () => {
+    world!.spawn(AudioSettings({ sfxVoiceLimit: 2 }));
+    fire(2);
+    expect(stolen()).toHaveLength(0);
+    // End both voices the way a real non-looping source self-reaps, then fire two more.
+    for (const l of getAudioLog()) void l;
+    stopWorldAudio(world!);           // ends the tracked one-shots
+    clearJournal(world!);
+    fire(2);
+    expect(stolen()).toHaveLength(0); // the freed slots were reused, nothing stolen
+  });
+
+  it('falls back to the trait default when no scene entity authors AudioSettings', () => {
+    const clips = fire(5);            // default is 4
+    expect(stolen().map((p) => p.clip)).toEqual([clips[0]]);
+  });
 });
 
 describe('record mode returns a handle PER PLAY, not a shared singleton', () => {

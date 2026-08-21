@@ -30,6 +30,7 @@
 import type { World, Entity, ExtractSchema, TraitValue } from 'koota';
 import { Transform } from '../core/traits/Transform';
 import { AudioSource } from '../traits/AudioSource';
+import { AudioSettings, AUDIO_SETTINGS_DEFAULT_LIMIT } from '../traits/AudioSettings';
 import { AudioListener } from '../traits/AudioListener';
 import { getPlayState } from '../core/playState';
 import { isTimelinePreviewActive } from '../core/timelinePreview';
@@ -66,7 +67,9 @@ export type AudioPhase =
   | 'dropped'
   /** An entity source whose clip will not resolve. Emitted ONCE per (entity, clip), at `warn`,
    *  because that retry is unbounded — see `startOrSwap`. */
-  | 'unresolved';
+  | 'unresolved'
+  /** A one-shot cut short to stay under `AudioSettings.sfxVoiceLimit`. */
+  | 'stolen';
 
 interface AudioEventDetail {
   clip?: string;
@@ -108,6 +111,12 @@ interface AudioState {
    *  the trace made `start`/`swap` and `stop`/`end` unbalanced by exactly one per
    *  crossfade, which is precisely the arithmetic the deferred voice cap needs. */
   fadingOut: { handle: AudioHandle; clip: string }[];
+  /** Live fire-and-forget one-shots, OLDEST FIRST — insertion order IS age order, which is
+   *  what makes oldest-first stealing a `shift()` rather than a search. Only `sfx`-bus
+   *  one-shots are tracked, because only they are subject to the cap. Before this the
+   *  handle from a one-shot `play()` was discarded outright, so nothing in the engine knew
+   *  how many were sounding. */
+  oneShots: { handle: AudioHandle; clip: string }[];
   /** Entities already warned about an unresolvable clip, keyed by entity id → the clip
    *  warned about. `startOrSwap` retries a missing clip EVERY frame forever, so the warn
    *  has to fire once per (entity, clip) or it would be 60 events/sec. */
@@ -130,7 +139,7 @@ function stateFor(world: World): AudioState {
   let s = states.get(world);
   if (!s) {
     s = {
-      sources: new Map(), autoplayed: new Set(), fadingOut: [],
+      sources: new Map(), autoplayed: new Set(), fadingOut: [], oneShots: [],
       warnedUnresolved: new Map(), pendingCues: [],
     };
     states.set(world, s);
@@ -155,6 +164,8 @@ export function stopWorldAudio(world: World): void {
       journalAudio(world, 'stop', undefined, { clip: t.clip, reason: 'world-teardown' });
     }
     s.fadingOut = [];
+    for (const o of s.oneShots) o.handle.stop();
+    s.oneShots = [];
     s.warnedUnresolved.clear();
     s.pendingCues = [];
   }
@@ -207,7 +218,7 @@ export function audioSystem(world: World): void {
 
   if (!playing) {
     // Silence: stop everything, forget autoplay, discard pending cues.
-    if (state.sources.size || state.fadingOut.length) {
+    if (state.sources.size || state.fadingOut.length || state.oneShots.length) {
       for (const src of state.sources.values()) {
         src.handle.stop();
         journalAudio(world, 'stop', undefined, { clip: src.clip, reason: 'not-playing' });
@@ -218,6 +229,8 @@ export function audioSystem(world: World): void {
         journalAudio(world, 'stop', undefined, { clip: t.clip, reason: 'not-playing' });
       }
       state.fadingOut = [];
+      for (const o of state.oneShots) o.handle.stop();
+      state.oneShots = [];
     }
     state.autoplayed.clear();
     state.warnedUnresolved.clear();
@@ -226,6 +239,11 @@ export function audioSystem(world: World): void {
     world.query(AudioSource).updateEach(([a]) => { if (a.playing) a.playing = false; });
     return;
   }
+
+  // Sweep finished one-shots so a dead voice cannot hold a slot against the cap. In live
+  // mode a non-looping source self-reaps via `onended`; in record mode nothing ends on its
+  // own, which is what lets a headless test drive the cap deterministically.
+  if (state.oneShots.length) state.oneShots = state.oneShots.filter((o) => !o.handle.ended);
 
   // Sweep crossfade tails that have self-stopped (via their audio-clock stopAfter).
   if (state.fadingOut.length) {
@@ -353,7 +371,46 @@ function startOrSwap(world: World, state: AudioState, entity: Entity, a: TraitVa
   });
 }
 
+/** How long a stolen one-shot takes to ramp to silence before it is stopped.
+ *
+ *  A bare `stop()` is an instant amplitude discontinuity — an audible click on EVERY steal,
+ *  which would make a cap meant to protect the mix contribute its own artifact. 10 ms is
+ *  below the threshold where a fade reads as a fade, so the sound still stops abruptly to
+ *  the ear; it just stops without a click. Scheduled on the AUDIO clock, so it completes
+ *  even while gameplay is time-stopped. */
+const STEAL_FADE_SEC = 0.01;
+
+/** Play a fire-and-forget one-shot, enforcing `AudioSettings.sfxVoiceLimit`.
+ *
+ *  Only `sfx`-bus one-shots are counted or stolen — music is on its own bus, `ui` is
+ *  deliberately uncapped, and entity-owned `AudioSource` voices are never stolen at all
+ *  (a looping ambience is the oldest voice forever, so oldest-first would kill it the
+ *  instant the cap engaged). See `AudioSettings` for the reasoning behind each exemption. */
+function playOneShot(world: World, state: AudioState, spec: AudioPlaySpec, limit: number): void {
+  const bus = spec.bus ?? 'sfx';
+  if (bus !== 'sfx' || limit <= 0) { play(spec); return; }
+  // Oldest first: insertion order is age order, so the victim is always at the head.
+  while (state.oneShots.length >= limit) {
+    const victim = state.oneShots.shift();
+    if (!victim) break;
+    victim.handle.fade(0, STEAL_FADE_SEC);
+    victim.handle.stopAfter(STEAL_FADE_SEC);
+    journalAudio(world, 'stolen', undefined, { clip: victim.clip, bus, reason: 'voice-cap' });
+  }
+  const handle = play(spec);
+  // An INERT handle (no graph / play threw) reports ended:true and would be swept next
+  // frame anyway, but tracking it would let a dead voice hold a slot for a frame.
+  if (!handle.ended) state.oneShots.push({ handle, clip: spec.clip ?? '' });
+}
+
+/** The authored sfx voice limit, or the trait default when no scene entity carries it. */
+function sfxVoiceLimit(world: World): number {
+  return world.queryFirst(AudioSettings)?.get(AudioSettings)?.sfxVoiceLimit
+    ?? AUDIO_SETTINGS_DEFAULT_LIMIT;
+}
+
 function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
+  const limit = sfxVoiceLimit(world);
   // Retry one-shots deferred on a previous frame — their buffer may have finished decoding (e.g.
   // after the iOS first-gesture resume). Play the ready ones; age out the rest, dropping at 0.
   if (state.pendingCues.length) {
@@ -361,7 +418,7 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
     for (const p of state.pendingCues) {
       const spec = resolveSpec(p.cue.clip ?? '', { bus: p.cue.bus, volume: p.cue.volume, pitch: p.cue.pitch });
       if (spec) {
-        play(spec);
+        playOneShot(world, state, spec, limit);
         journalAudio(world, 'start', undefined, { clip: p.cue.clip, bus: p.cue.bus });
         continue;
       }
@@ -376,7 +433,7 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
     if (cue.clip) {
       const spec = resolveSpec(cue.clip, { bus: cue.bus, volume: cue.volume, pitch: cue.pitch });
       if (spec) {
-        play(spec);
+        playOneShot(world, state, spec, limit);
         journalAudio(world, 'start', undefined, { clip: cue.clip, bus: cue.bus });
         continue;
       }
@@ -407,7 +464,11 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
         maxDistance: a.maxDistance, rolloff: a.rolloff, position: pos,
       });
       if (spec) {
-        play(spec);
+        // A named cue fans out to matching AudioSources, but each shot is still a
+        // fire-and-forget one-shot (no handle is retained on the entity), so it counts
+        // against the cap like any other. What is exempt is a source's OWN declarative
+        // playback via `startOrSwap`, which the cap never touches.
+        playOneShot(world, state, spec, limit);
         journalAudio(world, 'start', entity, { clip: a.clip, bus: cue.bus ?? a.bus, spatial: a.spatial });
       }
     });

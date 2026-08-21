@@ -3,7 +3,7 @@
 
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
-  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
+  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, AudioSettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
   UIElement, UIBinding, UIAction, UIFocusable, UIToggle, TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
@@ -793,6 +793,13 @@ export function registerAllTraits() {
     fields: {
       enabled: { type: 'boolean', tooltip: 'Device haptic feedback. A PLAYER preference — a game exposing an on/off control should persist it through PlayerPrefs and write it back here. Authored here so a game can ship with haptics off by default without a code change. No effect off-device (editor, web, headless).' },
       masterIntensity: { type: 'number', min: 0, max: 1, step: 0.05, tooltip: 'Currently a GATE, not a scale: below 0.05 nothing plays. Presets carry fixed strengths and no platform in range lets us scale one, so anything in between would be a lie. Here so a strength slider does not need a trait migration later.' },
+    },
+  });
+
+  registerTrait({
+    name: 'AudioSettings', trait: AudioSettings, category: 'resource',
+    fields: {
+      sfxVoiceLimit: { type: 'number', min: 0, max: 64, step: 1, tooltip: 'Max concurrent fire-and-forget one-shots on the sfx bus; past it the OLDEST is stolen. Music is never capped, entity AudioSource voices are never stolen (a looping ambience would be the oldest voice forever), and the ui bus is uncapped. 0 or less = uncapped.' },
     },
   });
 

@@ -1526,6 +1526,25 @@ Three things about it are worth knowing before touching it:
   low-tier scene looks wrong, compare frames from ONE camera — testboard `q4UxFVVeioEQqT5sqymu`
   reported a "near-black" hero from two frames shot minutes and several metres apart, whose
   measured torso luminance was in fact 44.3 vs 44.2.
+
+  **Confirmed on hardware that actually lands on `low`** — the numbers above are an editor A/B with
+  the tier pinned, which is the weaker instrument. The A23 stopped reaching `low` once forest-camp
+  capped its mid tier, so the device is the **Huawei Y6 2019** (API 28, PowerVR GE8300 — below the
+  shipping floor, so this needs the temporary-floor recipe in
+  [build.md](./build.md) § "Testing on hardware BELOW the shipping floor"). It resolves `low` for
+  real (`scene.environment` false, exposure 1.375, DPR 1, shadows off, `AmbientLight` 0.48 = the
+  authored 0.06 × 8), and two builds differing in that ONE field, same boot pose and crop, read:
+
+  | | character body | grass | tent (shadowed) |
+  |---|---|---|---|
+  | `iblOffAmbientBoost: 4` | 63.3 | 125.4 | 27.1 |
+  | `iblOffAmbientBoost: 8` | 69.6 | 139.3 | 35.7 |
+
+  The shaded tent stays well below the sunlit terrain at 8, which is the flattening check passing on
+  the device rather than in the editor. ⚠️ These absolutes are NOT comparable with the editor
+  figures above — different pose, different framing, the campfire in shot. Only the delta within one
+  device means anything, which is the same "compare frames from ONE camera" rule applied to the
+  instrument itself.
 - **The compensation is gated on ACTUAL suppression, not on the tier** — `isIblSuppressed()`, set
   by `syncEnvironment` each frame, is true only when the tier says no IBL *and* the scene owns a
   loaded HDR `Environment` to lose. Keying it on the tier alone (as it first shipped) brightened

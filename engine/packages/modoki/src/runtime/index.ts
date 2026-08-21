@@ -81,6 +81,7 @@ export {
   NoopHapticBackend, CapacitorHapticBackend, pickHapticBackend, type HapticBackend,
 } from './haptics/backends';
 export { HapticSettings } from './traits/HapticSettings';
+export { AudioSettings, AUDIO_SETTINGS_DEFAULT_LIMIT } from './traits/AudioSettings';
 // Host platform / form factor — the single source of truth for "is this a handheld?", asked
 // by the renderer's quality tier AND by on-screen touch controls.
 export { isTouchDevice, readFormFactor, readPlatform } from './core/formFactor';

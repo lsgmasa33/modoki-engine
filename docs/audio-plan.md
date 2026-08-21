@@ -333,18 +333,65 @@ source it was asked about — two handles could not differ. It is now one
 (teardown) instead of after `seconds`. Noted at the call site so a headless test does
 not read the surviving tail as a leak.
 
-**Still open — the voice cap.** The mixer remains **uncapped**: every `cueSound`/
-`cueClip` mints an independent `AudioBufferSourceNode` with no limit or stealing
-policy, and the graph has no `DynamicsCompressorNode`, so stacked voices hard-clip
-rather than growing louder. The stacking shape that matters is `cueSound(name)`
-fanning out to every matching `AudioSource`: identical clips started on the same frame
-are phase-coherent and sum **linearly**, not by √N. It is bounded rather than a leak
-(non-looping sources self-reap via `onended`, so the count settles at cue-rate ×
-clip-length), and the cost that would bite first is CPU — every spatial voice builds
-an HRTF `PannerNode`. Deferred on purpose: sizing a cap and picking a stealing policy
-needs a **measured** voice count, which `@audio` is what finally makes possible, and a
-cap guessed blind trades a rare distortion for a permanently silent cut. Tracked in
-#289.
+## The sfx voice cap (owner policy, 2026-08-21)
+
+The mixer used to be **uncapped**: every `cueSound`/`cueClip` minted an independent
+`AudioBufferSourceNode` with no limit and no stealing policy. That was an accident
+rather than a choice, and it had teeth — the graph has no `DynamicsCompressorNode`, so
+stacked voices do not get louder, they **hard-clip**. The stacking shape that bites is
+`cueSound(name)` fanning out to every matching `AudioSource`: identical clips started
+on the same frame are phase-coherent and sum **linearly**, ~+20 dB at ten copies, not
+by √N. Separately, every spatial voice builds an HRTF `PannerNode`, so a hundred
+concurrent one-shots is a CPU problem before it is a loudness one.
+
+**The policy, and the four decisions in it:**
+
+| | |
+|---|---|
+| **Limit** | `AudioSettings.sfxVoiceLimit`, **default 4** |
+| **Stealing** | **oldest first** — insertion order is age order, so the victim is `shift()`, not a search |
+| **Scope** | fire-and-forget one-shots on the **`sfx` bus only** |
+| **Exempt** | music · the `ui` bus · every entity-owned `AudioSource` |
+
+**The number is AUTHORED, not a constant.** It lives on the `AudioSettings` resource
+trait, live-editable in the Inspector, because its right value is only knowable after
+hearing it — too low and a busy moment eats sounds the designer wanted, too high and
+the mix clips. `AUDIO_SETTINGS_DEFAULT_LIMIT` is the trait's own default re-exported
+for the no-`AudioSettings`-in-scene fallback, so there is exactly one copy of the
+number. **`<= 0` means uncapped**, not "silence the sfx bus" — the escape hatch for a
+game that would rather have the old behaviour than lose a shot.
+
+**Why each exemption exists** — these are the policy, not omissions:
+
+- **Music is never capped.** It is on its own bus and sustained by design.
+- **Entity-owned `AudioSource` voices are never stolen, even on the `sfx` bus.** This
+  is the one that is easy to get wrong: a looping campfire crackle is the OLDEST voice
+  essentially forever, so naive oldest-first would kill it the instant four one-shots
+  fired, permanently. The cap is for *disposable* sounds; an entity source is something
+  the game deliberately keeps alive. A source's declarative playback through
+  `startOrSwap` is untouched by the cap.
+- **The `ui` bus is uncapped.** UI sounds are user-triggered and inherently low-rate; a
+  click going silent because gameplay is busy is a bug, not mix protection.
+- **A NAMED cue fan-out is still capped.** `cueSound` plays each matching source as a
+  fire-and-forget one-shot with no handle retained on the entity, so it counts like any
+  other shot — and it is the single most likely way to blow the cap.
+
+**A steal is a 10 ms fade, not a hard cut** (`STEAL_FADE_SEC`). A bare `stop()` is an
+instant amplitude discontinuity — an audible click on *every* steal, which would have a
+cap meant to protect the mix contributing its own artifact. 10 ms is below the
+threshold where a fade reads as a fade, so the sound still stops abruptly to the ear; it
+just stops cleanly. Scheduled on the AUDIO clock, so it completes under `timeScale: 0`.
+
+**A stolen voice emits `@audio {phase:'stolen', reason:'voice-cap'}`** — so the cap is
+observable rather than a silent disappearance, which is exactly the failure mode a cap
+introduces. Note a stolen shot still emits `start` first: it *did* play, it was cut
+short.
+
+**Implementation note:** enforcing this required tracking one-shots at all. Before, the
+handle from a one-shot `play()` was discarded outright, so nothing in the engine knew
+how many were sounding. `AudioState.oneShots` now holds them oldest-first, swept each
+frame by `handle.ended`. In record mode nothing ends on its own, which is what lets a
+headless test drive the cap deterministically.
 
 Covered by `packages/modoki/tests/runtime/audioJournal.test.ts`.
 
