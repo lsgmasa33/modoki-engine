@@ -269,15 +269,64 @@ describe('entriesSystem', () => {
     // A jump: the exact case that produces a huge one-off travel reading.
     view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 120 * 2000 });
     const seen: string[] = [];
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 16; i++) {
       sys.entriesSystem(testWorld);
       const en = view.get(UIEntries) as any;
       seen.push(`${en.firstY}/${en.poolSize}`);
     }
     // Everything after the first settling tick must be identical — no oscillation, and the
     // system must report no work to do.
-    const tail = seen.slice(3);
+    const tail = seen.slice(-5);
     expect(new Set(tail).size).toBe(1);
+  });
+
+  it('the pipeline tick does not shrink the window the scroll event just grew', async () => {
+    // Two drives land per frame: `driveEntriesFromScroll` (decay:false) when the DOM scrolls,
+    // then the pipeline tick. If travel is consumed by whichever ran first, the second reads
+    // zero and shrinks the band back in the same frame — and the frame paints the SMALLER one,
+    // because the pipeline always runs second. Measured in the editor 2026-08-21: the band
+    // pinned at 17 rows for every speed from 8 to 30 entries per frame, and the viewport went
+    // black. The baseline for travel therefore advances on the pipeline tick only.
+    const { sys, src, view } = await setup({ countX: 1, countY: 5000 }, 0);
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    const base = (view.get(UIEntries) as any).poolSize;
+
+    // One frame of fast scrolling: the scroll-event drive, then the pipeline tick.
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 120 * 12 });
+    sys.entriesSystem(testWorld, { fromScroll: true });
+    const afterScroll = (view.get(UIEntries) as any).poolSize;
+    sys.entriesSystem(testWorld);
+    const afterTick = (view.get(UIEntries) as any).poolSize;
+
+    expect(afterScroll).toBeGreaterThan(base);      // the raise fired at all
+    expect(afterTick).toBeGreaterThanOrEqual(afterScroll);
+  });
+
+  it('the pool comes back DOWN at the top of the list, where the origin cannot move', async () => {
+    // At scroll 0 the window origin is clamped to 0, so a travel spike that raises the overscan
+    // and then decays changes `pooled` while `first` never moves. Tracking only the X pooled
+    // count left `moved`/`invalidated`/`poolChanged` all false and skipped the re-drive:
+    // measured live 2026-08-21 at the top of the 5,000-entry strip, the pool went 8 -> 29 rows
+    // and STAYED at 29 through 60 idle frames.
+    const { sys, src, view } = await setup({ countX: 1, countY: 5000 }, 0);
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    const settled = (view.get(UIEntries) as any).poolSize;
+
+    // A fast burst away from the top, then straight back to it.
+    for (let y = 1; y <= 6; y++) {
+      view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: y * 120 * 15 });
+      sys.entriesSystem(testWorld);
+    }
+    const raised = (view.get(UIEntries) as any).poolSize;
+    expect(raised).toBeGreaterThan(settled);
+
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 0 });
+    for (let i = 0; i < 8; i++) sys.entriesSystem(testWorld);
+    const en = view.get(UIEntries) as any;
+    expect(en.firstY).toBe(0);
+    expect(en.poolSize).toBe(settled);     // back to the floor, not stuck at the raised count
   });
 
   it('does no work when nothing moved — the cheap path a scroll frame takes', async () => {

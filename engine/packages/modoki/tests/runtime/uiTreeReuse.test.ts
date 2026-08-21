@@ -229,6 +229,11 @@ describe('uiTreeStore node reuse', () => {
     const nested = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'entityId']);
     const scalarKeys = Object.keys(base).filter((k) => !nested.has(k));
     expect(scalarKeys.length).toBeGreaterThan(40); // guard: we really are iterating the full shape
+    // ⚠️ This fixture has no UIEntry, so `isEntry` is only in `base` at all if the builder writes
+    // it UNCONDITIONALLY. A field written only when its trait is present can be missing from the
+    // first node of the session, and `_scalarKeys` is derived once — so it would be excluded from
+    // every comparison thereafter, silently, and this exhaustiveness loop could not see it either.
+    expect(scalarKeys).toContain('isEntry');
     for (const k of scalarKeys) {
       const m = cloneOf(base);
       const cur = (m as any)[k];

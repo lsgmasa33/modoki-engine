@@ -639,9 +639,41 @@ The engine decides WHICH pooled instance shows entry (x, y); the game answers WH
   A23 a hard fling traverses up to **4.56 entries per pool update**, and `overscan: 1` blanked
   12/1787 frames.
 
-The raise is **capped** at roughly a viewport's worth. A jump (a `scrollToEntry`, a scrollbar
-drag) reports thousands of entries of travel, and an uncapped raise pools every one of them —
-measured live, a 5,000-entry list went from a 9-entity pool to 5,000.
+The raise is **capped at three viewports' worth**. A jump (a `scrollToEntry`, a scrollbar drag)
+reports thousands of entries of travel, and an uncapped raise pools every one of them — measured
+live, a 5,000-entry list went from a 9-entity pool to 5,000.
+
+⚠️ **The third viewport is not slack — it absorbs a dropped frame.** The window reaches the DOM
+through event → ECS → projection → React commit, and that chain misses a frame about one time in
+six: measured in the editor 2026-08-21, **7 of 40 frames** of a steady 8-entries-per-frame scroll
+left the padding exactly where it was, and those frames were 13 ms like every other — not a
+budget problem, a scroll event landing after the pipeline had already run. A one-viewport cap
+cannot absorb that miss and the viewport goes **black**, which is how this was reported (a
+trackpad flick on the strip). Three viewports was measured, not picked: five costs 45 rows where
+three costs 29, buys five more entries per frame, and still blanks on a 30-per-frame flick.
+
+**A `scroll` event also drives the pool immediately** (`driveEntriesFromScroll`), before the frame
+paints, instead of waiting for the next pipeline tick. It opens a system tick deliberately — the
+pool spawns, and `spawnEntity` tags `Transient` only inside one, without which a pooled entity
+reaches the saved scene file.
+
+⚠️ **Travel is measured against the last PIPELINE tick, on both paths.** Two drives now land per
+frame, and an accumulator reset by whichever ran first leaves the other reading zero travel and
+shrinking the band that was just grown — the pipeline always runs second, so its smaller window
+is the one that paints. Measured: the band pinned at 17 rows for every speed from 8 to 30 entries
+per frame, and the view went black anyway.
+
+Where that leaves the strip (5,000 entries, 120px rows, 440px viewport):
+
+| scroll speed | before | after |
+|---|---|---|
+| 5 / frame | clean | clean |
+| 8 / frame | 4 black frames in 20 | **clean, zero gap** |
+| 12 / frame | black | **clean, zero gap** |
+| 15 / frame | black | clean (200px partial) |
+| 20 / frame | black | still blacks — the honest ceiling |
+
+The band grows to 29 rows while scrolling that fast and returns to 9 at rest.
 
 ⚠️ **Travel is measured from the SCROLL, never from `first`, and that is the whole reason the
 pool settles.** `first` is `floor(scroll / stride) − overscan`, so a travel taken from `first`
@@ -654,14 +686,18 @@ in.
 
 ### Measured on the low-end target
 
-Galaxy A23 (Mali-G57 MC2), the shipped web build of `demos/scroll-demo`, driven by real touch
+Galaxy A23 (Mali-G57 MC2), the shipped web build of `games/scroll-demo`, driven by real touch
 (`adb input swipe`) with frame times and viewport coverage sampled per rAF:
 
 | Scene | Fling p50 / p95 | Blank frames | Max travel | Entities at rest → peak | At rest |
 |---|---|---|---|---|---|
 | strip (1 × 5,000, 120px) | 16.7 / 33.4 ms | **0** of 688 | 40 entries | 34 → 52 | 57 fps, 0 pool updates |
 | pager (40 × 1, viewport-sized) | 16.7 / 16.7 ms | **0** of 1,010 | 1 entry | 53 → 53 | 53 fps, 0 pool updates |
-| grid (20 × 250, stride 128) | 16.7 / 66.6 ms | **0** of 409 | 14 entries | 229 → 407 | 61 fps, 0 pool updates |
+| grid (20 × 250, stride 128) | 16.7 / 66.6 ms | **0** of 409 | 14 entries | 229 → 407 |
+
+⚠️ The **peak** column predates the three-viewport cap and will now read higher on a fast fling;
+the at-rest figures and the frame times are unaffected (touch travel never exceeded ~2 entries
+per frame on that device, so the raise rarely fires there at all). 61 fps, 0 pool updates |
 
 Read it as three separate facts. **Recycling keeps up**: no fling on any shape ever exposed a
 gap, at travel up to 40 entries between two pool updates. **Snapping bounds the pager to exactly
@@ -715,7 +751,7 @@ coordinates (the system converts, since it is what resolves entry size); the dec
 The scroll offset is carried as **padding**, and CSS padding eats the box it sits on. A single
 content child at `width: 100%` with `padding-right: 23040px` has a content box of **zero**: every
 entry in it shrinks to nothing and `flex-wrap` has no line to wrap into. Measured on
-`demos/scroll-demo` (2026-08-21): pager pages came back **0px wide**, and grid tiles authored at
+`games/scroll-demo` (2026-08-21): pager pages came back **0px wide**, and grid tiles authored at
 120px rendered at **36px stacked in one column**. The vertical strip survived only because
 vertical padding does not touch the *horizontal* content box — which is precisely why one axis
 shipped looking correct while both others were broken.
@@ -742,9 +778,13 @@ of the authored value — it *is* the authored value resolved (`%` against the l
 read back from the prefab root), and a definite box is what a `%`-sized prefab root needs once
 its parent is an auto-width row.
 
-⚠️ **A viewport RESIZE moves no window origin.** `first` stays put while every padding value
-changes, so entry size and pooled-column count are part of the system's invalidation test, not
-just the window origin. Without that the pager kept a 640px page inside a 395px panel — for good.
+⚠️ **Two things change the window without moving its origin, and both are in the invalidation
+test.** A viewport RESIZE leaves `first` put while every padding value changes — without that the
+pager kept a 640px page inside a 395px panel, for good. And at `scroll = 0` the origin is
+CLAMPED to 0, so a travel spike that raises the overscan and then decays changes `pooled` while
+`first` cannot move: with only the X pooled count tracked, the top of the 5,000-entry strip went
+from 8 rows to 29 on a fast scroll and stayed at 29 through 60 idle frames. Entry size AND the
+pooled count on BOTH axes therefore invalidate, not just the origin.
 
 **Snapping is declared on the box and honoured on the TARGET**, and those are different
 elements. The tree build stamps `scroll-snap-align`/`scroll-snap-stop` onto the pooled entries

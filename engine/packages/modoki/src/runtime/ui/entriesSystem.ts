@@ -22,10 +22,15 @@
  *  here — in a system — and never in a DOM handler or a React effect. This repo has already had
  *  a stray runtime entity persisted into a committed scene; the pool spawns entities by
  *  construction, so this is not a hypothetical.
+ *
+ *  `driveEntriesFromScroll` is the one DOM-handler entry point, and it does not weaken that
+ *  rule — it OPENS a system tick around the same system, the way `runPipeline` does, so a pool
+ *  grown from a scroll event is tagged `Transient` exactly as one grown from the pipeline is.
  */
 import type { World } from 'koota';
 import { getTraitByName } from '../core/ecs/traitRegistry';
-import { spawnEntity, onWorldSwap } from '../core/ecs/world';
+import { spawnEntity, onWorldSwap, getCurrentWorld } from '../core/ecs/world';
+import { beginSystemTick, endSystemTick } from '../core/systemTick';
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { buildChildIndex } from '../core/ecs/memberPath';
 import { getEntrySource, planEntryWrites, type EntryContent } from './entrySource';
@@ -69,7 +74,7 @@ export const ENTRIES_CONTENT_NAME = '__uiEntriesContent';
  *  The offset is carried as padding, and CSS padding eats the box it sits on: a content child
  *  `width: 100%` with `padding-right: 23040px` has a content box of ZERO, so every entry in it
  *  shrinks to nothing and `flex-wrap` has no line to wrap into. Measured live on the pager and
- *  grid scenes of `demos/scroll-demo` (2026-08-21): pages came back 0px wide, and grid tiles
+ *  grid scenes of `games/scroll-demo` (2026-08-21): pages came back 0px wide, and grid tiles
  *  authored at 120px rendered at 36px stacked in a single column. The vertical strip survived
  *  only because vertical padding does not touch the horizontal content box — which is exactly
  *  why one axis shipped looking correct.
@@ -97,7 +102,7 @@ interface ViewState {
   lastEpoch: number;
   lastCountX: number;
   lastCountY: number;
-  /** Entries the SCROLL has traversed since the last pool update — feeds `effectiveOverscan`.
+  /** Entries the SCROLL has traversed since the last PIPELINE tick — feeds `effectiveOverscan`.
    *
    *  ⚠️ Measured from `scrollX/Y`, never from `first`, and that is not a detail. `first` is
    *  `floor(scroll / stride) - overscan`, so a travel measured on `first` includes the change
@@ -106,12 +111,15 @@ interface ViewState {
    *  between a 9x8 and a 13x10 pool forever, re-driving on 102 of 154 frames and holding the
    *  device at ~30fps with no input at all. Scroll is exogenous; `first` is the response.
    *
-   *  It ACCUMULATES rather than being a per-frame delta, because the quantity that matters is
-   *  the distance the pool has to cover between two updates — which folds in dropped frames. */
-  travel: number;
-  /** Last observed scroll offset in px, for the accumulator above. */
-  lastScrollX: number;
-  lastScrollY: number;
+   *  The baseline moves only on the PIPELINE tick, never on the scroll-event drive. Both paths
+   *  then measure the same thing — entries per frame — where an accumulator reset by whichever
+   *  drive ran first left the OTHER one reading zero travel and shrinking the window that had
+   *  just been grown. Measured in the editor 2026-08-21: the band pinned at 17 rows for every
+   *  scroll speed from 8 to 30 entries per frame, because the pipeline tick always ran second.
+   *  It is also naturally miss-tolerant: a frame whose update never landed leaves two frames of
+   *  travel in the next reading. */
+  frameScrollX: number;
+  frameScrollY: number;
   /** Last resolved entry size and pooled column count.
    *
    *  ⚠️ These are in the invalidation test, not just here for reading. A `%`-sized entry
@@ -122,7 +130,14 @@ interface ViewState {
    *  same reason one step further on — a resize changes which ROW a slot belongs to. */
   lastEntryW: number;
   lastEntryH: number;
+  /** Pooled counts per axis. BOTH are in the invalidation test, and the Y one is not symmetry
+   *  for its own sake: at `scroll = 0` the origin is CLAMPED to 0, so a travel spike that
+   *  raises the overscan and then decays changes `yw.pooled` while `first` never moves. With
+   *  only the X count tracked, `moved`/`invalidated`/`poolChanged` are all false and the whole
+   *  re-drive is skipped — measured live 2026-08-21 at the top of the 5,000-entry strip, where
+   *  the pool went 8 -> 29 rows on a fast scroll and STAYED at 29 through 60 idle frames. */
   lastCols: number;
+  lastRows: number;
 }
 const viewStates = new Map<string, ViewState>();
 onWorldSwap(() => { viewStates.clear(); });
@@ -166,7 +181,7 @@ export function prefabRootSize(prefabGuid: string): { width: number; height: num
   return provider?.rootSize(prefabGuid) ?? { width: 0, height: 0 };
 }
 
-export function entriesSystem(world: World): void {
+export function entriesSystem(world: World, opts?: { fromScroll?: boolean }): void {
   const svMeta = getTraitByName('UIScrollView');
   const enMeta = getTraitByName('UIEntries');
   const entryMeta = getTraitByName('UIEntry');
@@ -184,7 +199,7 @@ export function entriesSystem(world: World): void {
 
   let dirtied = false;
   for (const view of views) {
-    if (driveView(world, view.handle, { svMeta, enMeta, entryMeta, uiMeta, attrMeta, renderMeta })) {
+    if (driveView(world, view.handle, { svMeta, enMeta, entryMeta, uiMeta, attrMeta, renderMeta }, opts?.fromScroll !== true)) {
       dirtied = true;
     }
   }
@@ -192,6 +207,37 @@ export function entriesSystem(world: World): void {
   // scrollViewDom); this does, because content genuinely changed and the projection must
   // re-run — but only when something actually moved.
   if (dirtied) markUIDirty();
+}
+
+/** Drive the pool from the DOM scroll event, before the frame paints.
+ *
+ *  ⚠️ **This exists to remove one frame of latency, and that frame is the difference between
+ *  a fast scroll working and going black.** The pipeline path is: DOM scrolls → `scroll` event
+ *  writes `scrollX/Y` → the NEXT pipeline tick reads it → the projection rebuilds → paint. So
+ *  the pooled band has to cover TWICE the per-frame travel, and the raise is capped at about a
+ *  viewport (uncapped, a jump pools the whole data set — see `effectiveOverscan`). Measured in
+ *  the editor 2026-08-21 on the 5,000-entry strip: a 13-row / 1560px band survived 600px per
+ *  frame and went fully black at 1320px, i.e. at half its own band.
+ *
+ *  A `scroll` event is dispatched before `requestAnimationFrame` in the same frame, so driving
+ *  here lands the new window in the tree the projection is about to rebuild — the same frame
+ *  the browser is already painting the new scroll offset in.
+ *
+ *  It opens a system tick deliberately: the pool SPAWNS, and `spawnEntity` tags `Transient`
+ *  only inside one. Without that a pooled entity reaches the saved scene file — the #18 hazard,
+ *  and the reason the banner above forbids the naive version of this call.
+ *
+ *  Cheap when nothing moved: `driveView` early-outs on an unmoved window, which is the common
+ *  case for a scroll event that lands inside the current band. */
+export function driveEntriesFromScroll(): void {
+  const world = getCurrentWorld();
+  if (!world) return;
+  beginSystemTick();
+  try {
+    entriesSystem(world, { fromScroll: true });
+  } finally {
+    endSystemTick();
+  }
 }
 
 interface EntityLike {
@@ -219,6 +265,9 @@ function driveView(
   world: World,
   view: EntityLike,
   m: Metas,
+  /** True on the once-per-frame pipeline tick, false on the scroll-event drive. It gates ONE
+   *  thing: advancing the travel baseline — see ViewState.frameScrollX. */
+  isFrameTick: boolean,
 ): boolean {
   const sv = view.get(m.svMeta.trait) as Record<string, number>;
   const en = view.get(m.enMeta.trait) as Record<string, unknown>;
@@ -245,27 +294,41 @@ function driveView(
 
   const st = viewStates.get(viewGuid)
     ?? { seeded: false, lastFirstX: 0, lastFirstY: 0, lastEpoch: -1, lastCountX: -1, lastCountY: -1, travel: 0,
-         lastScrollX: 0, lastScrollY: 0, lastEntryW: -1, lastEntryH: -1, lastCols: -1 };
+         frameScrollX: 0, frameScrollY: 0,
+         lastEntryW: -1, lastEntryH: -1, lastCols: -1, lastRows: -1 };
   const floor = (en.overscan as number) ?? 2;
 
-  // How far the SCROLL has moved since the last pool update, in entries. Accumulated here,
-  // before the window is computed, and reset only when the pool actually re-drives — see
-  // ViewState.travel for why this must not be derived from `first`.
+  // How far the SCROLL has moved since the last pipeline tick, in entries — see
+  // ViewState.frameScrollX for why the baseline is per-FRAME and why it must not come from
+  // `first`.
   const strideXpx = Math.max(1, entryW + ((en.gapX as number) ?? 0));
   const strideYpx = Math.max(1, entryH + ((en.gapY as number) ?? 0));
   const travel = st.seeded
-    ? st.travel + Math.max(
-      Math.abs(sv.scrollX - st.lastScrollX) / strideXpx,
-      Math.abs(sv.scrollY - st.lastScrollY) / strideYpx,
+    ? Math.max(
+      Math.abs(sv.scrollX - st.frameScrollX) / strideXpx,
+      Math.abs(sv.scrollY - st.frameScrollY) / strideYpx,
     )
     : 0;
 
-  // Cap the travel-driven raise at roughly a viewport's worth of entries. Without a cap a JUMP
-  // (scrollToEntry, a scrollbar drag, a view opened deep in the list) reports thousands of
-  // entries of travel and pools every one of them — measured live: a 5,000-entry list went from
-  // a 9-entity pool to 5,000. See effectiveOverscan's banner.
-  const capX = Math.max(1, Math.ceil(sv.viewportWidth / Math.max(1, entryW + (en.gapX as number))));
-  const capY = Math.max(1, Math.ceil(sv.viewportHeight / Math.max(1, entryH + (en.gapY as number))));
+  // Cap the travel-driven raise. Without a cap a JUMP (scrollToEntry, a scrollbar drag, a view
+  // opened deep in the list) reports thousands of entries of travel and pools every one of them
+  // — measured live: a 5,000-entry list went from a 9-entity pool to 5,000.
+  //
+  // ⚠️ **The cap is three viewports, not one, and the third viewport is not slack.** The window
+  // reaches the DOM through event → ECS → projection → React commit, and that chain misses a
+  // frame about one time in six: measured in the editor 2026-08-21, 7 of 40 frames of a steady
+  // 8-entries-per-frame scroll left the padding exactly where it was, and those frames were
+  // 13ms like every other — not a budget problem, a scroll event landing after the pipeline had
+  // already run. A one-viewport cap cannot absorb that miss, and the viewport goes BLACK; the
+  // owner hit it with a trackpad flick. Driving the pool from the scroll event
+  // (`driveEntriesFromScroll`) removed the systematic frame of lag but cannot remove this one.
+  // Three, measured rather than picked: on the 5,000-entry strip it clears a steady 15 entries
+  // per frame (~108k px/s) with a 29-row band. Five was tried and rejected — 45 rows to buy
+  // five more entries per frame, and a 30-per-frame flick still blanked. Covering an unbounded
+  // scroll speed with pool size is a losing game; this covers normal wheel and trackpad use.
+  const VIEWPORTS_OF_RAISE = 3;
+  const capX = Math.max(1, VIEWPORTS_OF_RAISE * Math.ceil(sv.viewportWidth / Math.max(1, entryW + (en.gapX as number))));
+  const capY = Math.max(1, VIEWPORTS_OF_RAISE * Math.ceil(sv.viewportHeight / Math.max(1, entryH + (en.gapY as number))));
   const overscanX = effectiveOverscan(floor, travel, capX);
   const overscanY = effectiveOverscan(floor, travel, capY);
 
@@ -281,19 +344,20 @@ function driveView(
   // ⚠️ Entry size and pooled-column count belong in the invalidation test. A resize moves no
   // window origin, so `moved` stays false and the cheap early-out below would keep a stale
   // padding forever — see ViewState.lastEntryW.
-  const resized = entryW !== st.lastEntryW || entryH !== st.lastEntryH || xw.pooled !== st.lastCols;
+  const resized = entryW !== st.lastEntryW || entryH !== st.lastEntryH
+    || xw.pooled !== st.lastCols || yw.pooled !== st.lastRows;
   const invalidated = epoch !== st.lastEpoch || countX !== st.lastCountX || countY !== st.lastCountY || resized;
 
-  const redriving = moved || invalidated;
-  const setState = (t: number, cols: number) => viewStates.set(viewGuid, {
+  viewStates.set(viewGuid, {
     seeded: true,
     lastFirstX: xw.first, lastFirstY: yw.first, lastEpoch: epoch,
-    lastCountX: countX, lastCountY: countY, travel: t,
-    lastScrollX: sv.scrollX, lastScrollY: sv.scrollY,
-    lastEntryW: entryW, lastEntryH: entryH, lastCols: cols,
+    lastCountX: countX, lastCountY: countY,
+    // ⚠️ Only the pipeline tick advances the baseline. The scroll-event drive leaves it alone so
+    // the tick that follows it in the same frame still sees the frame's real travel.
+    frameScrollX: isFrameTick ? sv.scrollX : st.frameScrollX,
+    frameScrollY: isFrameTick ? sv.scrollY : st.frameScrollY,
+    lastEntryW: entryW, lastEntryH: entryH, lastCols: xw.pooled, lastRows: yw.pooled,
   });
-  // The accumulator resets only on a real re-drive: the pool has just covered that distance.
-  setState(redriving ? 0 : travel, xw.pooled);
 
   const content = ensureContentChild(world, view, m);
   if (!content) return false;

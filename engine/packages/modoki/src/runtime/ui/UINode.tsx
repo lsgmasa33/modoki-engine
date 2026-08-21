@@ -28,6 +28,7 @@ import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
 import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo } from './scrollViewDom';
+import { driveEntriesFromScroll } from './entriesSystem';
 
 /** The CSS-animated text span, isolated in React.memo. The game UI re-renders every
  *  frame (fps is in its store selector); re-creating the span each frame RESTARTS its
@@ -769,11 +770,19 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
     const el = ref.current;
     if (!el || !scroll || !guid) return;
     const push = () => {
-      writeScrollState(guid, {
+      const changed = writeScrollState(guid, {
         scrollX: Math.round(el.scrollLeft), scrollY: Math.round(el.scrollTop),
         viewportWidth: el.clientWidth, viewportHeight: el.clientHeight,
         contentWidth: el.scrollWidth, contentHeight: el.scrollHeight,
       });
+      // Re-drive the pool NOW, in the same frame the browser is painting this offset in — a
+      // `scroll` event lands before rAF, so the projection still picks it up this frame. Waiting
+      // for the next pipeline tick costs a frame, and that frame is what makes a fast scroll go
+      // black: the band has to cover twice the per-frame travel instead of once. Guarded on
+      // `changed` so a scroll event landing on the same rounded pixel still costs nothing, and
+      // routed through `driveEntriesFromScroll` (never `entriesSystem` directly) because the
+      // pool spawns and needs the system-tick flag for `Transient`.
+      if (changed) driveEntriesFromScroll();
     };
     push();                                   // seed, so a system sees real numbers on frame 1
     el.addEventListener('scroll', push, { passive: true });

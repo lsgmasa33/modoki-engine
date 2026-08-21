@@ -442,7 +442,12 @@ function buildTree(world: World): UINodeData[] | null {
           disabled: t.disabled === true,
         };
       }
-      if (_entryMeta && entity.has(_entryMeta.trait)) node.isEntry = true;
+      // ⚠️ ALWAYS written, never conditionally. `_scalarKeys` is derived ONCE from whichever
+      // node is reconciled first in the session, so a key that is only sometimes present can be
+      // permanently excluded from `nodesEqual` — the exact trap `hasVideo` above is written this
+      // way to avoid. Inert today (UIEntry is added once and never removed), and a landmine the
+      // moment it is not.
+      node.isEntry = !!(_entryMeta && entity.has(_entryMeta.trait));
       if (_scrollMeta && entity.has(_scrollMeta.trait)) {
         const sv = entity.get(_scrollMeta.trait) as any;
         node.scroll = {
