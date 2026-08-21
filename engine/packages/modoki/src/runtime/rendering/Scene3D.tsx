@@ -873,12 +873,12 @@ export default function Scene3D() {
         disposeParticleSyncState(particleState, scene);
         disposeFlameMeshSyncState(flameState, scene);
         disposeBlobShadowSyncState(blobShadowState, scene);
-        // clearOwnedMaterials MUST run after disposeRenderState (which consults
-        // _ownedMaterials). The SHARED inline-texture/tint material caches are
-        // freed by the module-level onWorldSwap listener in scene3DSync.ts, not
-        // here — so they're disposed exactly once per swap regardless of how many
-        // loops are mounted.
-        clearOwnedMaterials();
+        // clearOwnedMaterials MUST run after disposeRenderState, which consults
+        // `renderState.ownedMaterials` to decide what it may free. The SHARED
+        // inline-texture/tint material caches are freed by the module-level onWorldSwap
+        // listener in scene3DSync.ts, not here — so they're disposed exactly once per
+        // swap regardless of how many loops are mounted.
+        clearOwnedMaterials(renderState);
         for (const l of ecsLights.values()) { scene.remove(l); l.dispose(); }
         ecsLights.clear();
         framingCache = null;   // new scene → drop the stale fit
@@ -985,12 +985,14 @@ export default function Scene3D() {
         scene.environment = null;
         step('scene.clear', () => scene.clear());
         // SHARED module-level material caches (_defaultMaterial, inline-texture
-        // mats, tint clones, and the _ownedMaterials tracking set) are
-        // intentionally NOT disposed on a single panel's unmount. The editor
-        // mounts two Scene3D loops at once (GameView + SceneView); freeing a
-        // shared cache here destroys materials the other panel still renders with
-        // (and _defaultMaterial, a const, would never be recreated) — the F2
-        // use-after-free. These caches are freed on world swap (the module-level
+        // mats, tint clones) are intentionally NOT disposed on a single panel's
+        // unmount. The editor mounts two Scene3D loops at once (GameView +
+        // SceneView); freeing a shared cache here destroys materials the other
+        // panel still renders with (and _defaultMaterial, a const, would never be
+        // recreated) — the F2 use-after-free. This surface's OWN inline materials
+        // are a different matter and disposeRenderState above frees them: ownership
+        // is tracked per RenderState precisely so one panel's unmount cannot reach
+        // another's. These caches are freed on world swap (the module-level
         // onWorldSwap listener in scene3DSync.ts), when all loops rebuild
         // together, or reclaimed with the GPU context on final teardown. See
         // engine-review/runtime-rendering-3d.md F2.

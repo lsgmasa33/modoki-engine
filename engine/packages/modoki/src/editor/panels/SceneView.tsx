@@ -3594,7 +3594,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // detach the shared bone proxy first so it isn't left dangling under a disposed
       // group across the swap (mirrors the effect-cleanup detach at teardown).
       if (boneProxy.parent) boneProxy.parent.remove(boneProxy);
-      disposeRenderState(renderState, scene, true);
+      disposeRenderState(renderState, scene);
       for (const [, outline] of outlineMeshes) { scene.remove(outline); outline.geometry.dispose(); (outline.material as THREE.Material).dispose(); }
       outlineMeshes.clear();
       for (const [id] of colliderWires) disposeColliderWire(id);
@@ -4651,7 +4651,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       scene.remove(groupProxy); // multi-select group-gizmo pivot proxy
       scene.remove(gizmoHelper); // F5: explicit detach, independent of scene.clear() below
       gizmo.dispose();
-      disposeRenderState(renderState, scene, true);
+      disposeRenderState(renderState, scene);
       disposeParticleSyncState(particleState, scene);
       disposeFlameMeshSyncState(flameState, scene);
       disposeBlobShadowSyncState(blobShadowState, scene);

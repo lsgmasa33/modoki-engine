@@ -514,9 +514,29 @@ silently drop the shader's draws. `games/space-console`'s `stripes`/`matcap`/`pl
 `syncMaterial(obj, id, curMat, state)` (`scene3DSync.ts`) binds a mesh renderer's material each frame. A renderer references a MATERIAL only (a `.mat.json` GUID) — never a texture directly (textures live on the material; resolution + the KTX2 variant pick are in [Materials & Textures](./textures.md)):
 
 - An empty ref falls back to a shared engine default (`MeshStandardMaterial`, grey, `roughness 0.5`, `metalness 0`).
-- A material created inline for one entity is tracked in `_ownedMaterials` and disposed when reassigned; shared cache materials are NEVER disposed here (the scene refcount owns them).
+- A material created inline for one entity is tracked in `RenderState.ownedMaterials` and disposed when reassigned; shared cache materials are NEVER disposed here (the scene refcount owns them).
 - When the ref is UNCHANGED but the async `.mat.json` load only just finished, `syncMaterial` re-checks `resolveMaterial` and swaps the resolved material in — retrying each frame until it lands.
 - A `THREE.LOD` fans the material out to every LOD child mesh (`materialTargetsOf`).
+
+### Ownership is per RENDER SURFACE, and teardown obeys it
+
+`ownedMaterials` lives on the `RenderState`, not in module scope, because **the editor runs two 3D
+surfaces on one world** (SceneView and the Game panel's `Scene3D`) and each mints its own inline
+materials. With one shared set, either surface's teardown cleared the other's ownership record and
+that surface's materials were then untracked — which is why the editor teardown used to skip the
+gate and dispose unconditionally instead.
+
+⚠️ **`disposeRenderState` disposes only what that surface owns**, exactly like the per-entity
+removal path in `syncRenderables`. It used to take a `disposeMeshMaterials` flag the editor passed
+`true` for — on every world swap and on unmount — disposing the material of every owned-geometry
+mesh regardless of origin. A primitive owns its geometry whatever its material is, so that reached
+three things no surface may dispose: the **shared cached `.mat.json` material** (still held by the
+cache, still bound by the other surface, and deliberately kept ALIVE across a scene swap that both
+scenes share it through — see [Scene loading](./scene-loading.md)); **`_placeholderMaterial`**, the
+module-level sentinel a primitive holds while its authored material loads, or forever if the ref
+never resolves; and `_defaultMaterial`, the fallback for an empty ref. All three are process-wide,
+so one panel unmounting broke them for every panel. Pinned by
+`tests/runtime/disposeRenderStateOwnership.test.ts`.
 
 **Tint** — the `Tint` trait renders a per-`(material,color,amount)` CLONE of the shared base material (`.color` set to the tint, `nprColorPreserve` set to the strength). Clones are cached (every ally ship shares ONE blue clone) and freed only on world swap (`disposeTintMaterials`, wired to `onWorldSwap`); a continuously-varying tint (an animated colour) would grow the cache unbounded and warns past 64 entries. The NPR composite then blends the grayscale fill toward that colour per-draw (see [Color preservation](#color-preservation)).
 
@@ -2938,6 +2958,23 @@ those pipelines itself, which is the stall. `liveCompileGate.ts` owns that hold:
 swap, holds the submit while the compile is in flight, drops the hold if the compile rejects, and
 releases the frame at a 5 s ceiling if it never settles. A stale compile landing after a SECOND
 swap cannot release the newer hold (generation token).
+
+⚠️ **The stand-ins are REAL, VISIBLE meshes in the live scene while the compile runs**, because
+that is the only way `compileAsync` will walk them. Two consequences, both bounded and neither
+worth more machinery than they cost:
+
+- If the compile outruns the hold's 5 s ceiling, the frame is released while the stand-ins are
+  still in the scene — so a MOVING side-pinned object draws frozen at its compile-time transform
+  (the real mesh is hidden) until the compile settles. Measured live compiles are 300 ms-1 s, so
+  this needs something pathological.
+- A capture taken during the compile window (`modoki_capture_viewport`, `modoki_render_scene`)
+  includes them. They are exact copies at the same transform, so the picture is close to right —
+  but do not rest a pixel verdict on a capture taken between a swap and the first drawn frame.
+
+An ABANDONED compile no longer leaks them: the next live compile clears whatever the previous one
+left parented before it adds its own (`clearPreviousLiveStandIns`). That matters because
+`Scene3D` reuses ONE `THREE.Scene` across every swap and `disposeRenderState` removes only what it
+tracks, so a straggler would otherwise stand inside the next scene.
 
 ⚠️ **The hold is a real behaviour change and worth stating.** Between the swap and the first drawn
 frame the surface shows the previous content — usually a loading screen — while the ECS keeps

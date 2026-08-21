@@ -867,6 +867,89 @@ describe('compileLiveScene — prepares the live scene and restores every mutati
     expect(scene.children).toEqual([mesh]);
   });
 
+  // A mesh can land in BOTH restore lists, and the two disagree about what "restored" means.
+  it('leaves a side-pinned NON-ACTIVE LOD level invisible — it is in both restore lists', async () => {
+    const { sync } = await setup();
+    const stub = liveStub();
+    const scene = new THREE.Scene();
+    const lod = new THREE.LOD();
+    const near = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial());
+    // The FAR level is the one LOD.update hides, and its material is side-pinned — so the reveal
+    // makes it visible, and the side-pinned branch then hides it and stands it in.
+    const far = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshStandardMaterial({ transparent: true, side: THREE.DoubleSide }),
+    );
+    lod.addLevel(near, 0);
+    lod.addLevel(far, 100);
+    scene.add(lod);
+    lod.updateMatrixWorld(true);
+    lod.update(camera);
+    expect(far.visible).toBe(false);
+
+    await sync.compileLiveScene(stub.renderer as never, scene, camera);
+
+    // Restoring it to VISIBLE would draw the far level on top of the near one for the rest of the
+    // scene's life — N draws per model, from a one-off compile.
+    expect(far.visible).toBe(false);
+    expect(near.visible).toBe(true);
+    expect(scene.children).toEqual([lod]);
+  });
+
+  // The two defects the close-out review turned up, both invisible until they bite.
+  it('a THROW inside the traverse still restores visibility — otherwise a mesh is hidden forever', async () => {
+    const { sync } = await setup();
+    const stub = liveStub();
+    const scene = new THREE.Scene();
+    const ok = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshStandardMaterial({ transparent: true, side: THREE.DoubleSide }),
+    );
+    const boom = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshStandardMaterial({ transparent: true, side: THREE.DoubleSide }),
+    );
+    // Minting a clone is work the traverse callback did not used to do, so it can now throw.
+    (boom.material as unknown as { clone: () => never }).clone = () => { throw new Error('clone exploded'); };
+    scene.add(ok, boom);
+
+    await expect(sync.compileLiveScene(stub.renderer as never, scene, camera)).rejects.toThrow('clone exploded');
+
+    // Without the restore, `ok` stays invisible for the rest of the scene's life: every later
+    // compile skips it, because the side-pinned branch only fires on a mesh that is still visible.
+    expect(ok.visible).toBe(true);
+    expect(boom.visible).toBe(true);
+    expect(scene.children).toEqual([ok, boom]);
+  });
+
+  it('an ABANDONED compile stops leaving stand-ins in the shared scene', async () => {
+    const { sync } = await setup();
+    const scene = new THREE.Scene();
+    const mesh = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshStandardMaterial({ transparent: true, side: THREE.DoubleSide }),
+    );
+    scene.add(mesh);
+
+    // Call A hangs — a swap can land while a live compile is still in flight, and the gate kicks
+    // the next one regardless (`liveCompileGate` arms on every swap).
+    let releaseA!: () => void;
+    const hangingRenderer = { compileAsync: vi.fn(() => new Promise<void>((res) => { releaseA = res; })) };
+    const pending = sync.compileLiveScene(hangingRenderer as never, scene, camera);
+    // A's stand-ins are live children of the shared scene right now.
+    expect(scene.children.length).toBe(3);
+
+    // Call B — the next scene's compile. It must clear A's leftovers, or a transparent object from
+    // the OLD scene stands inside the NEW one until A finally settles.
+    const stubB = liveStub();
+    await sync.compileLiveScene(stubB.renderer as never, scene, camera);
+    expect(scene.children).toEqual([mesh]);
+
+    releaseA();
+    await pending;
+    expect(scene.children).toEqual([mesh]);
+  });
+
   it('restores the scene even when the compile REJECTS', async () => {
     const { sync } = await setup();
     const stub = liveStub(true);

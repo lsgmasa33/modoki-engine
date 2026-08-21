@@ -80,9 +80,15 @@ const _maskedLights: MaskedLight[] = [];
 const _activeRenderIds = new Set<number>();
 const _defaultMaterial = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.5, metalness: 0 });
 
-// Track materials created inline for specific entities (not from caches).
-// Only these are safe to dispose when reassigned — shared cache materials must not be disposed.
-const _ownedMaterials = new Set<THREE.Material>();
+// Materials created inline for specific entities (not from caches) are tracked PER RENDER STATE,
+// as `RenderState.ownedMaterials` — only those are safe to dispose when reassigned or at teardown;
+// shared cache materials, the primitive placeholder sentinel and `_defaultMaterial` must not be.
+//
+// ⚠️ Per-state, not module-global, because THE EDITOR RUNS TWO OF THESE on one world (SceneView +
+// the Game panel's Scene3D) and each mints its OWN inline materials. A shared set let one loop's
+// teardown clear the other's ownership record out from under it — after which that loop's
+// materials were untracked and simply leaked — and it is the reason the editor teardown used to
+// dispose unconditionally instead. Ownership is per-surface; so is the set.
 
 // Per-(material,color,amount) tinted clones for the Tint trait. Keyed so all
 // entities sharing a base material + tint reuse ONE clone (e.g. every ally ship
@@ -152,7 +158,7 @@ export function disposeTintMaterials() {
 // (that was the F2 use-after-free); world swap is the right boundary because
 // every loop rebuilds from the new world together.
 // (clearOwnedMaterials is intentionally NOT wired here: it must run AFTER each
-// loop's disposeRenderState, which consults _ownedMaterials to decide what to
+// loop's disposeRenderState, which consults state.ownedMaterials to decide what to
 // dispose — so it stays in the per-instance swap handler.)
 onWorldSwap(() => { disposeTintMaterials(); });
 
@@ -1234,6 +1240,9 @@ export interface RenderState {
    *  which is exactly the cost this cache exists to avoid. */
   skinnedShadowFlags: Map<number, string>;
   ownsGeometry: Set<number>;
+  /** Materials THIS surface minted inline (a primitive's default material) — the only ones it may
+   *  dispose. See the note at the top of this module for why it is not module-global. */
+  ownedMaterials: Set<THREE.Material>;
   /** SkinnedModel entities — clone + mixer per entity id. */
   skinned: Map<number, SkinnedEntry>;
   /** SkinnedSprite2D + Billboard3D entities — camera-facing mesh per entity id. */
@@ -1261,6 +1270,7 @@ export function createRenderState(emitLifecycle = false): RenderState {
     ecsShadowFlags: new Map(),
     skinnedShadowFlags: new Map(),
     ownsGeometry: new Set(),
+    ownedMaterials: new Set(),
     skinned: new Map(),
     billboards: new Map(),
     textMeshes: new Map(),
@@ -1332,20 +1342,35 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
 }
 
 /** Dispose all tracked objects, remove from scene, and clear collections.
- *  @param disposeMeshMaterials — if true, dispose material on each owned-geometry mesh
- *    (editor does this; runtime uses clearOwnedMaterials instead). */
-export function disposeRenderState(
-  state: RenderState,
-  scene: THREE.Scene,
-  disposeMeshMaterials = false,
-) {
+ *
+ *  ⚠️ **Only materials this render state OWNS are disposed** — the same `ownedMaterials` gate the
+ *  per-entity removal in `syncRenderables` uses, and for the same reason. This used to take a
+ *  `disposeMeshMaterials` flag that the editor SceneView passed `true` for, disposing the material
+ *  on every owned-geometry mesh UNCONDITIONALLY. A primitive owns its geometry whatever its
+ *  material is, so that reached three things nothing here may dispose:
+ *    - the **shared cached `.mat.json` material** (`resolveMaterial`), still held by the material
+ *      cache and still bound by the other render loop — the editor runs two of these, and a
+ *      material shared across a scene swap deliberately SURVIVES the swap's release (see
+ *      docs/scene-loading.md), so the swap-time teardown tore down a material about to be reused;
+ *    - **`primitives._placeholderMaterial`**, the module-level sentinel a primitive holds while its
+ *      authored material is still loading (or forever, if the ref does not resolve) — documented
+ *      at its definition as "must never be disposed";
+ *    - **`_defaultMaterial`**, the module-level fallback `syncMaterial` binds for an empty ref.
+ *  All three are process-wide singletons or cache entries, so one panel unmounting broke them for
+ *  every panel. Ownership is the only safe discriminator, and it is already tracked. */
+export function disposeRenderState(state: RenderState, scene: THREE.Scene) {
   for (const [id, obj] of state.ecsObjects) {
     scene.remove(obj);
     if (state.ownsGeometry.has(id) && (obj as THREE.Mesh).geometry) {
       (obj as THREE.Mesh).geometry.dispose();
-      if (disposeMeshMaterials) {
-        // materialTargetsOf so a LOD's child-mesh materials dispose too (F11).
-        for (const target of materialTargetsOf(obj)) (target.material as THREE.Material)?.dispose();
+    }
+    // materialTargetsOf so a LOD's child-mesh materials are reaped too (F11) — mirrors the
+    // per-entity removal path in syncRenderables, gate included.
+    for (const target of materialTargetsOf(obj)) {
+      const mat = target.material as THREE.Material | undefined;
+      if (mat && state.ownedMaterials.has(mat)) {
+        state.ownedMaterials.delete(mat);
+        mat.dispose();
       }
     }
   }
@@ -1363,6 +1388,7 @@ export function disposeRenderState(
   state.ecsShadowFlags.clear();
   state.skinnedShadowFlags.clear();
   state.ownsGeometry.clear();
+  state.ownedMaterials.clear();
 }
 
 export interface SyncCallbacks {
@@ -1430,8 +1456,8 @@ function syncMaterial(
       : _defaultMaterial;
     for (const t of targets) {
       const oldMat = t.material as THREE.Material;
-      if (oldMat && _ownedMaterials.has(oldMat)) {
-        _ownedMaterials.delete(oldMat);
+      if (oldMat && state.ownedMaterials.has(oldMat)) {
+        state.ownedMaterials.delete(oldMat);
         oldMat.dispose();
       }
       // Only 'auto' re-derives cast from the new material's transparency — an explicit
@@ -2691,7 +2717,7 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       obj = createPrimitiveMesh(rend.mesh, rend.size, rend.color, hasOverride)!;
       if (!hasOverride) {
         // Track the primitive's default material as owned (safe to dispose)
-        _ownedMaterials.add((obj as THREE.Mesh).material as THREE.Material);
+        state.ownedMaterials.add((obj as THREE.Mesh).material as THREE.Material);
       } else if (rend.material) {
         const resolved = resolveMaterial(rend.material);
         if (resolved) (obj as THREE.Mesh).material = resolved;
@@ -2754,8 +2780,8 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       // LOD.material which is undefined) are reaped too — mirrors syncMaterial. (F11)
       for (const target of materialTargetsOf(obj)) {
         const mat = target.material as THREE.Material;
-        if (mat && _ownedMaterials.has(mat)) {
-          _ownedMaterials.delete(mat);
+        if (mat && state.ownedMaterials.has(mat)) {
+          state.ownedMaterials.delete(mat);
           mat.dispose();
         }
       }
@@ -3359,10 +3385,10 @@ export function syncSceneRenderables3D(
   sweepRetiredMaterials();
 }
 
-/** Clear all owned-material tracking. Call on world swap alongside clearing
- *  ecsObjects so stale references don't accumulate. */
-export function clearOwnedMaterials() {
-  _ownedMaterials.clear();
+/** Clear this surface's owned-material tracking. `disposeRenderState` already disposes and clears
+ *  it; this stays as the explicit belt-and-braces call on world swap. */
+export function clearOwnedMaterials(state: RenderState) {
+  state.ownedMaterials.clear();
 }
 
 // ── Shader prewarm ──────────────────────────────────────
@@ -3973,6 +3999,34 @@ async function prewarmShadersForWorldInner(
  *
  *  `compile` overrides the compile call for a post-FX stack, whose scene pass owns a different
  *  render context (see `PostFXStack.compileSceneAsync`). */
+/** Stand-ins and clone materials from the LAST live compile, freed at the start of the next one.
+ *
+ *  ⚠️ Deliberately NOT `_prewarmRetained`, which is what this used first. That list is emptied at
+ *  the top of every PREWARM — which runs in the before-swap hook, i.e. potentially while a live
+ *  compile from the previous swap is still in flight. It would then dispose that compile's clone
+ *  materials out from under it, defeating the warm silently, while the stand-in meshes were still
+ *  parented in the shared live `THREE.Scene` (`Scene3D` reuses one across every swap, and
+ *  `disposeRenderState` removes only what it tracks in `ecsObjects` — never an untracked child).
+ *  The visible half of that was worse than the wasted warm: a transparent object from the OLD
+ *  scene left standing inside the NEW one until the abandoned compile finally settled.
+ *
+ *  Freeing them here instead ties the lifetime to the thing that owns it. A second swap still
+ *  abandons the first compile — but now the abandonment is what CLEANS UP, rather than something
+ *  unrelated disposing its materials behind its back. */
+const _liveStandIns: THREE.Mesh[] = [];
+const _liveRetained: Array<{ dispose(): void }> = [];
+
+function clearPreviousLiveStandIns(): void {
+  // Removal first and unconditionally: a straggler still parented is a duplicate draw, and it
+  // costs nothing to detach one that its own `finally` already removed.
+  for (const s of _liveStandIns) s.parent?.remove(s);
+  _liveStandIns.length = 0;
+  // Disposal is the half that must wait a generation — see `_prewarmRetained`: freeing a clone
+  // releases the pipeline it was minted to warm, so it has to outlive the first real frame.
+  for (const m of _liveRetained) m.dispose();
+  _liveRetained.length = 0;
+}
+
 export async function compileLiveScene(
   renderer: WebGPURenderer | THREE.WebGLRenderer,
   scene: THREE.Scene,
@@ -3980,6 +4034,8 @@ export async function compileLiveScene(
   compile?: () => Promise<void>,
 ): Promise<void> {
   return bootSpanAsync('live-scene-compile', async () => {
+    // Whatever the previous compile left behind, before adding more.
+    clearPreviousLiveStandIns();
     // three reads `matrixWorld` for the pipeline key (the mirrored-entity variant) and for
     // culling, and `compileAsync` updates neither.
     scene.updateMatrixWorld(true);
@@ -3988,7 +4044,8 @@ export async function compileLiveScene(
     const lods: THREE.LOD[] = [];
     const hidden: THREE.Object3D[] = [];
     const standIns: THREE.Mesh[] = [];
-    scene.traverse((o) => {
+    try {
+      scene.traverse((o) => {
       const lod = o as THREE.LOD;
       if (lod.isLOD) {
         // `_projectObject` calls `LOD.update(camera)` while building the compile render list,
@@ -4018,7 +4075,7 @@ export async function compileLiveScene(
           && sidePinnedVariants(mesh.material as THREE.Material).length > 0 && mesh.visible) {
         mesh.visible = false;
         hidden.push(mesh);
-        for (const stand of pinnedStandIns(mesh, _prewarmRetained)) standIns.push(stand);
+        for (const stand of pinnedStandIns(mesh, _liveRetained)) { standIns.push(stand); _liveStandIns.push(stand); }
         return;
       }
       // Same reason as the prewarm's placeholders: `compileAsync` frustum-culls its render list
@@ -4026,11 +4083,14 @@ export async function compileLiveScene(
       // scene's camera. Without this, what gets compiled depends on where the previous scene was
       // looking — and on the first swap after boot, on a camera that has never framed anything.
       if (mesh.isMesh && mesh.frustumCulled) { mesh.frustumCulled = false; unculled.push(mesh); }
-    });
-    // Added AFTER the traverse — mutating a tree mid-`traverse` is undefined behaviour, and these
-    // must not be walked by the loop that created them.
-    for (const stand of standIns) scene.add(stand);
-    try {
+      });
+      // Added AFTER the traverse — mutating a tree mid-`traverse` is undefined behaviour, and
+      // these must not be walked by the loop that created them.
+      for (const stand of standIns) scene.add(stand);
+      // ⚠️ The traverse is INSIDE the try, and that is not tidiness. It mints clones and meshes
+      // now, so it can throw where it used to only flip booleans — and a throw that escaped the
+      // `finally` would leave every already-hidden mesh invisible FOREVER: the next call's guard
+      // only re-hides a mesh that is still `visible`, so nothing ever restores it.
       if (compile) await compile();
       else await (renderer as THREE.WebGLRenderer).compileAsync?.(scene, camera);
     } finally {
@@ -4038,8 +4098,13 @@ export async function compileLiveScene(
       // culling off (every object drawn every frame) or every LOD level visible (N draws per
       // model) — a failed prewarm would otherwise become a permanent framerate bug.
       for (const o of unculled) o.frustumCulled = true;
-      for (const o of revealed) o.visible = false;
+      // ⚠️ `hidden` BEFORE `revealed`, and the order is load-bearing: a non-active LOD level whose
+      // material is side-pinned lands in BOTH lists. `traverse` visits the LOD first, so the level
+      // is already revealed (visible) by the time the side-pinned branch sees it, and it hides it
+      // again. Restoring `revealed` last is what puts it back to invisible; the other order left a
+      // far LOD level drawing on top of the near one for the rest of the scene's life.
       for (const o of hidden) o.visible = true;
+      for (const o of revealed) o.visible = false;
       for (const lod of lods) lod.autoUpdate = true;
       // Removed from the scene, but the clone materials are NOT disposed — disposing one tears
       // down its render object and releases the very pipeline it was minted to warm (see

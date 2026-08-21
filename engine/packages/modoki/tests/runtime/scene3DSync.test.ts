@@ -157,11 +157,13 @@ describe('scene3DSync', () => {
       state.ecsMaterials.set(1, 'mat.json');
       state.ecsColors.set(1, 0xff0000);
 
-      disposeRenderState(state, mockScene, true);
+      disposeRenderState(state, mockScene);
 
       expect(mockScene.remove).toHaveBeenCalledWith(mockObj);
       expect(mockGeometry.dispose).toHaveBeenCalled();
-      expect(mockMaterial.dispose).toHaveBeenCalled();
+      // The material is NOT owned by this surface (it came from the material cache), so teardown
+      // must leave it alone — see the ⚠️ on disposeRenderState.
+      expect(mockMaterial.dispose).not.toHaveBeenCalled();
       expect(state.ecsObjects.size).toBe(0);
       expect(state.ecsSprites.size).toBe(0);
       expect(state.ecsMaterials.size).toBe(0);
@@ -209,7 +211,7 @@ describe('scene3DSync', () => {
       expect(mockGeometry.dispose).not.toHaveBeenCalled();
     });
 
-    it('skips material dispose when disposeMeshMaterials is false', async () => {
+    it('disposes a material this surface OWNS, and leaves a shared one alone', async () => {
       vi.doMock('../../src/runtime/traits', () => ({
         Transform: {}, Renderable3D: {}, Renderable3DPrimitive: {}, Camera: {},
       }));
@@ -236,16 +238,23 @@ describe('scene3DSync', () => {
       const { createRenderState, disposeRenderState } = await import('../../src/runtime/rendering/scene3DSync');
       const state = createRenderState();
 
-      const mockMaterial = { dispose: vi.fn() };
-      const mockObj = { geometry: { dispose: vi.fn() }, material: mockMaterial } as any;
+      const ownedMaterial = { dispose: vi.fn() };
+      const sharedMaterial = { dispose: vi.fn() };
+      const ownedObj = { geometry: { dispose: vi.fn() }, material: ownedMaterial } as any;
+      // No owned geometry either — ownership of the MATERIAL is what decides, independently.
+      const sharedObj = { material: sharedMaterial } as any;
       const mockScene = { remove: vi.fn() } as any;
 
-      state.ecsObjects.set(1, mockObj);
+      state.ecsObjects.set(1, ownedObj);
       state.ownsGeometry.add(1);
+      state.ownedMaterials.add(ownedMaterial as any);
+      state.ecsObjects.set(2, sharedObj);
 
-      disposeRenderState(state, mockScene, false);
+      disposeRenderState(state, mockScene);
 
-      expect(mockMaterial.dispose).not.toHaveBeenCalled();
+      expect(ownedMaterial.dispose, 'this surface minted it — it must free it').toHaveBeenCalled();
+      expect(sharedMaterial.dispose, 'the cache/sentinel owns it — hands off').not.toHaveBeenCalled();
+      expect(state.ownedMaterials.size, 'and the tracking is cleared').toBe(0);
     });
   });
 
@@ -321,7 +330,8 @@ describe('scene3DSync', () => {
       }));
 
       const { clearOwnedMaterials } = await import('../../src/runtime/rendering/scene3DSync');
-      expect(() => clearOwnedMaterials()).not.toThrow();
+      const { createRenderState } = await import('../../src/runtime/rendering/scene3DSync');
+      expect(() => clearOwnedMaterials(createRenderState())).not.toThrow();
     });
   });
 
