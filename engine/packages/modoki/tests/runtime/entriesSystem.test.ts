@@ -405,6 +405,54 @@ describe('entriesSystem', () => {
     expect(en.scrollToEntryY).toBe(-1);
   });
 
+  it('builds the window from the REQUESTED entry, not from the scroll it can still observe', async () => {
+    // ⚠️ The fix for "a jump lands on the wrong page" (Court's level selector, 2026-08-21).
+    //
+    // The offset is carried as PADDING, so the window and the scroll position are two halves of
+    // one statement. Building this frame's window from the OBSERVED `scrollY` writes the padding
+    // for where the view IS, the DOM then scrolls to where it was ASKED to go with the wrong
+    // content underneath, and `scroll-snap` drags it back to the nearest entry that actually
+    // exists. Measured live: asking for page 12 landed on 4, page 23 on 6 — converging a few
+    // pages per attempt, because each round could only move the window by its own extent.
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+
+    const before = (view.get(UIEntries) as any).firstY;
+    expect(before, 'precondition: the view starts at the top').toBe(0);
+
+    api.scrollToEntry('view-guid', { y: 40 });
+    sys.entriesSystem(testWorld);
+
+    // ONE tick, and the window is already at the target — not walking toward it.
+    const en = view.get(UIEntries) as any;
+    expect(en.firstY).toBeGreaterThan(30);
+    expect((view.get(UIScrollView) as any).scrollToY).toBe(40 * ENTRY_H);
+  });
+
+  it('a converted jump reports NO travel, so it does not inflate the pool', async () => {
+    // Travel sizes the band against how fast the scroll is MOVING, and a teleport is not motion:
+    // its destination is known exactly. Feeding a jump's distance in is what made a
+    // `scrollToEntry` pool thousands of entries (the reason the three-viewport cap exists).
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    const restingPool = (view.get(UIEntries) as any).poolSize;
+
+    api.scrollToEntry('view-guid', { y: 400 });
+    sys.entriesSystem(testWorld);
+    // ⚠️ The DOM landing the scroll is part of the mechanism, not scenery: `UINode` applies the
+    // converted px request and writes the new offset back through `writeScrollState`. Without
+    // modelling that, the next tick compares a baseline that MOVED against a scroll that never
+    // did, and measures the whole teleport as travel — a state production never reaches.
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 400 * ENTRY_H });
+    sys.entriesSystem(testWorld);   // the tick AFTER, where a stale baseline would bite
+
+    expect((view.get(UIEntries) as any).poolSize).toBe(restingPool);
+  });
+
   it('refuses a scrollToEntry at a guid that is not a scroll view', async () => {
     await setup();
     const api = await import('../../src/runtime/ui/scrollApi');

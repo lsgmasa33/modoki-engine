@@ -1099,6 +1099,7 @@ export function registerAllTraits() {
       snap: { type: 'enum', options: ['none', 'start', 'center', 'end'], tooltip: 'Where an entry comes to rest when snapping. \'none\' disables snapping.' },
       snapStop: { type: 'enum', options: ['normal', 'always'], tooltip: '\'always\' makes a fling stop at snap points it passes. It CONSTRAINS a fling but does not cap it at one entry — measured on a Galaxy A23, one hard fling advanced 11 entries at \'normal\' and 3 at \'always\'; a slow drag advances exactly 1.' },
       overscroll: { type: 'enum', options: ['auto', 'contain', 'none'], tooltip: 'overscroll-behavior — whether scrolling past the end chains to the parent.' },
+      scrollbar: { type: 'enum', options: ['auto', 'hidden'], tooltip: 'Whether the platform\'s classic scrollbar is shown. A classic scrollbar steals cross-axis space from the content box — measured: 15px, which clipped Court\'s level grid. Mobile overlay scrollbars steal nothing, so this only matters on desktop/Electron.' },
       scrollBehavior: { type: 'enum', options: ['instant', 'smooth'], tooltip: 'How a scrollTo request moves. \'smooth\' duration is browser-defined and not tunable.' },
       // ⚠️ Engine-written state and the game-written scrollTo request. HIDDEN rather than shown
       // read-only: an author editing scrollY would have it overwritten on the next scroll event,

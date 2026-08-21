@@ -765,11 +765,67 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
 function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | null>) {
   const scroll = node.scroll;
   const guid = node.guid;
+  // ⚠️ **Snap is SUSPENDED while the view is moving, and this is what makes snapping and
+  // recycling able to coexist at all.** Measured live in Court's level selector (2026-08-21).
+  //
+  // The offset is carried as PADDING on the content, so every pool re-drive rewrites it while the
+  // user is mid-scroll. With `scroll-snap-type: mandatory` the browser responds to that layout
+  // change by re-snapping to the previously-snapped ELEMENT — which recycling has just repointed
+  // at different data. That moves the scroll, which re-drives the pool, which rewrites the
+  // padding, which re-snaps: a closed positive-feedback loop. Both of the symptoms it produced
+  // have one cause:
+  //   - **It lands on the wrong page.** Asking for page 2 landed on 16, page 4 on 18, page 8 on 0
+  //     — wild and non-repeatable. With snap suspended, every one lands exactly on target.
+  //   - **It costs ~3x the frame time AT REST**, with no input and no pool churn: p50 39ms / p95
+  //     52ms against 13/18 with snap off. Same loop, spinning in place.
+  // `scroll-snap-type: proximity` fixes NEITHER (measured: page 2 -> 22, p50 23ms).
+  //
+  // `docs/plans/ui-scroll-view-plan.md` predicted this exact interaction and never resolved it.
+  //
+  // Restoring on SETTLE rather than never is what keeps the feel: the browser snaps from wherever
+  // the gesture stopped, so a pager still lands on a page — it just stops fighting the pool while
+  // the pool is still moving.
+  const snapTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const snapHeld = React.useRef(false);
+  const authoredSnap = scroll && scroll.snap !== 'none'
+    ? (scroll.axis === 'both' ? 'both' : scroll.axis === 'x' ? 'x' : 'y') + ' mandatory'
+    : '';
+
+  const holdSnap = React.useCallback((el: HTMLDivElement) => {
+    if (!authoredSnap) return;   // snap:'none' authored — nothing to suspend, nothing to restore
+    snapHeld.current = true;
+    el.style.scrollSnapType = 'none';
+    if (snapTimer.current) clearTimeout(snapTimer.current);
+    // 150ms after the LAST scroll event. Long enough that a fling's own event stream keeps it
+    // held throughout, short enough that the landing does not read as a delayed correction.
+    snapTimer.current = setTimeout(() => {
+      snapHeld.current = false;
+      // ⚠️ **Restore the AUTHORED value, never `''`.** `scrollViewStyle` emits `scrollSnapType`
+      // through React's inline style, so clearing the property removes React's own value — and
+      // React will not re-apply it, because its style diff compares against the props it last
+      // rendered and sees no change. Measured: after the first gesture the computed style read
+      // `none` for good, i.e. the pager silently stopped snapping at all while every position
+      // assertion still passed.
+      el.style.scrollSnapType = authoredSnap;
+    }, 150);
+  }, [authoredSnap]);
+
+  // ⚠️ React reasserts the inline style on EVERY render, and a pool re-drive dirties the tree —
+  // so without this the suppression is undone mid-fling by the very re-drive it exists to
+  // survive. Layout effect, so it lands before the browser can act on the reasserted value.
+  React.useLayoutEffect(() => {
+    const el = ref.current;
+    if (el && snapHeld.current) el.style.scrollSnapType = 'none';
+  });
+
+  React.useEffect(() => () => { if (snapTimer.current) clearTimeout(snapTimer.current); }, []);
+
   // A ref, not state: the handler must not re-render the component it is attached to.
   React.useEffect(() => {
     const el = ref.current;
     if (!el || !scroll || !guid) return;
     const push = () => {
+      holdSnap(el);
       const changed = writeScrollState(guid, {
         scrollX: Math.round(el.scrollLeft), scrollY: Math.round(el.scrollTop),
         viewportWidth: el.clientWidth, viewportHeight: el.clientHeight,
@@ -800,9 +856,15 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
     if (!el || !scroll || !guid) return;
     const req = pendingScrollTo(scroll);
     if (!req) return;
+    // ⚠️ **Suspend snap BEFORE the jump, not from the resulting scroll event.** A `scroll` event
+    // fires AFTER the browser has already applied — and already re-snapped — the new offset, so
+    // holding from inside the listener is one step too late for a programmatic move: measured,
+    // a `scrollTo(page 0)` under mandatory snap never reached 0 at all. The listener's hold is
+    // what covers a user gesture; this is what covers `scrollToEntry`.
+    holdSnap(el);
     el.scrollTo(req as ScrollToOptions);
-    clearScrollRequest(guid, scroll.axis === 'both' ? 'both' : scroll.axis === 'x' ? 'x' : 'y');
-  }, [ref, guid, scroll?.scrollToX, scroll?.scrollToY, scroll?.scrollBehavior]); // eslint-disable-line react-hooks/exhaustive-deps
+    clearScrollRequest(guid);
+  }, [ref, guid, holdSnap, scroll?.scrollToX, scroll?.scrollToY, scroll?.scrollBehavior]); // eslint-disable-line react-hooks/exhaustive-deps
 }
 
 export const UINode = React.memo(UINodeInner);

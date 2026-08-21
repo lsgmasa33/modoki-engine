@@ -24,7 +24,7 @@ import { clearManifest, registerAsset } from '../../src/runtime/loaders/assetMan
 import {
   resolveMaterial, invalidateMaterial, retiredMaterials3D, disposeAllCachedResources,
 } from '../../src/runtime/loaders/meshTemplateCache';
-import { syncSceneRenderables3D, createRenderState } from '../../src/runtime/rendering/scene3DSync';
+import { syncSceneRenderables3D, createRenderState, retiredMaterialSweepTraversals } from '../../src/runtime/rendering/scene3DSync';
 
 const MAT_GUID = '55555555-6666-4777-8888-999999999999';
 const MAT_PATH = '/games/g/assets/mat/rock.mat.json';
@@ -39,8 +39,13 @@ function surfaceBinding(mat: THREE.Material): THREE.Scene {
 }
 
 /** Run the real sweep for `scene`. An empty world is enough: the sweep is at the tail of
- *  syncSceneRenderables3D and runs whatever the world contains. */
-const renderFrame = (scene: THREE.Scene) => syncSceneRenderables3D(createWorld(), scene, createRenderState());
+ *  syncSceneRenderables3D and runs whatever the world contains. ONE shared world for the whole
+ *  file — koota caps a process at 16, and the backoff test alone renders 20 frames. */
+let frameWorld: ReturnType<typeof createWorld> | null = null;
+const renderFrame = (scene: THREE.Scene) => {
+  frameWorld ??= createWorld();
+  return syncSceneRenderables3D(frameWorld, scene, createRenderState());
+};
 
 beforeEach(() => {
   clearManifest();
@@ -135,6 +140,51 @@ describe('invalidateMaterial retires instead of destroying', () => {
     (scene.children[0] as THREE.Mesh).material = [new THREE.MeshBasicMaterial()];
     renderFrame(scene);
     expect(disp).toHaveBeenCalledTimes(1);
+  });
+
+  it('an invalidate mid-flight retires the losing load instead of orphaning it', async () => {
+    // `fetchMaterial` dedupes on `materialLoadPromises` alone, and `invalidateMaterial` clears
+    // that entry — so an in-flight fetch stops deduping a second one and BOTH reach
+    // `materialCache.set`. Orphaned, the loser is unreachable to the cache, to the sweep and to
+    // `disposeAllCachedResources`, leaking the material AND every shared-texture ref it holds.
+    // Twin of the same defect in `fetchEnvironment` (#315).
+    resolveMaterial(MAT_GUID);              // fetch #1, deliberately NOT awaited
+    invalidateMaterial(MAT_PATH);           // clears the in-flight promise
+    resolveMaterial(MAT_GUID);              // fetch #2 starts alongside it
+    await settle();
+
+    const cached = resolveMaterial(MAT_GUID)!;
+    expect(cached, 'one of the two loads must occupy the cache').toBeTruthy();
+    const retired = [...retiredMaterials3D()];
+    expect(retired.length, 'the loser is retired, not orphaned').toBe(1);
+    expect(retired[0]).not.toBe(cached);
+  });
+
+  it('backs off once a retiree is legitimately PINNED, instead of traversing every surface forever', async () => {
+    // A retiree can be pinned for good: if the refetch after an invalidation fails,
+    // `fetchMaterial` caches MATERIAL_FAILED, `resolveMaterial` returns undefined for that path
+    // permanently, and `syncMaterial` can never rebind — so the mesh keeps drawing the retiree
+    // and keeping it alive is CORRECT. Without a backoff, `retired.size` never returns to 0 and
+    // every surface pays a full scene.traverse() on every frame for the rest of the session.
+    resolveMaterial(MAT_GUID);
+    await settle();
+    const first = resolveMaterial(MAT_GUID)!;
+    const scene = surfaceBinding(first);      // this mesh never rebinds — the pinned case
+    // One frame with nothing retired first: the sweep's counters are module state, and its
+    // empty-set branch is what resets them. Without this the test inherits whatever backoff a
+    // previous test left behind. (Self-healing in production for the same reason.)
+    renderFrame(scene);
+    invalidateMaterial(MAT_PATH);
+
+    const before = retiredMaterialSweepTraversals();
+    for (let i = 0; i < 20; i++) renderFrame(scene);
+    const traversals = retiredMaterialSweepTraversals() - before;
+
+    // The grace lets a few real sweeps run — that is what keeps an ordinary free immediate —
+    // and then it must stop. One traverse per frame forever is the cost being avoided.
+    expect(traversals, 'the grace sweeps must actually run').toBeGreaterThan(0);
+    expect(traversals, '20 frames must not cost 20 traversals').toBeLessThanOrEqual(5);
+    expect(retiredMaterials3D().size, 'and it is still correctly alive').toBe(1);
   });
 
   it('drains retirees on disposeAllCachedResources, so a surface that stops rendering cannot strand one', async () => {

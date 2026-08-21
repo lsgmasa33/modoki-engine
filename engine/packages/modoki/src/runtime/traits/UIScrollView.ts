@@ -62,6 +62,15 @@ export const UIScrollView = trait({
   snapStop: 'normal' as UIScrollSnapStop,
   /** `overscroll-behavior` — governs whether a scroll at the end chains to the parent. */
   overscroll: 'auto' as UIScrollOverscroll,
+  /** Whether the platform's classic scrollbar is shown. A classic (non-overlay) scrollbar
+   *  STEALS cross-axis space from the content box — measured live in Court's level selector
+   *  (2026-08-21): a scroll box authored at 28.6vh (border-box 197.6px) had `clientHeight` 183
+   *  after a 15px horizontal scrollbar appeared, clipping the 197.6px-tall 5x5 grid inside it
+   *  7px at top and bottom. Mobile (Court's shipping target) uses OVERLAY scrollbars and steals
+   *  nothing, so authoring the box 15px taller to compensate would leave a 15px gap on the
+   *  platform that actually ships — the author has to be able to say whether this view shows a
+   *  scrollbar. Default `'auto'` (platform default) so no existing view changes behaviour. */
+  scrollbar: 'auto' as UIScrollScrollbar,
 
   // ── Engine-written state (read freely; do not write) ──
   scrollX: 0,
@@ -87,6 +96,7 @@ export type UIScrollAxis = 'x' | 'y' | 'both';
 export type UIScrollSnap = 'none' | 'start' | 'center' | 'end';
 export type UIScrollSnapStop = 'normal' | 'always';
 export type UIScrollOverscroll = 'auto' | 'contain' | 'none';
+export type UIScrollScrollbar = 'auto' | 'hidden';
 export type UIScrollBehavior = 'instant' | 'smooth';
 
 /** Sentinel for "no scroll request pending" on `scrollToX`/`scrollToY`. */

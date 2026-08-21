@@ -11,7 +11,7 @@ import { getTraitByName } from '../core/ecs/traitRegistry';
 import { NO_SCROLL_REQUEST } from '../traits/UIScrollView';
 
 export interface ScrollViewNodeData {
-  axis: string; snap: string; snapStop: string; overscroll: string;
+  axis: string; snap: string; snapStop: string; overscroll: string; scrollbar: string;
   scrollToX: number; scrollToY: number; scrollBehavior: string;
 }
 
@@ -22,9 +22,28 @@ export interface ScrollViewNodeData {
 export function scrollViewStyle(s: ScrollViewNodeData): Record<string, string> {
   const css: Record<string, string> = {};
   css.overscrollBehavior = s.overscroll === 'auto' ? 'auto' : s.overscroll;
+  // `scrollbar-width: none` is the standards property (Chromium 121+, Safari 18.2+); older
+  // WebKit uses overlay scrollbars, which steal no space, so there is nothing to hide there.
+  // Do NOT attempt `::-webkit-scrollbar` — these are inline styles and cannot carry a
+  // pseudo-element.
+  if (s.scrollbar === 'hidden') css.scrollbarWidth = 'none';
   if (s.snap !== 'none') {
     css.scrollSnapType = (s.axis === 'both' ? 'both' : s.axis === 'x' ? 'x' : 'y') + ' mandatory';
   }
+  // ⚠️ **The CROSS axis is pinned, or `axis` is decoration.** `UIElement.overflow: 'scroll'` is a
+  // both-axes CSS property, so a single-axis view scrolled the other way too — and on any platform
+  // with CLASSIC scrollbars (desktop web, the Electron editor) that shows a second scrollbar which
+  // then STEALS cross-axis space from the content box. Measured in Court's level selector
+  // (2026-08-21): a 31.6vh page inside a 31.6vh box came back 203px against the grid's 218px,
+  // because a 15.34px vertical scrollbar had appeared on an `axis: 'x'` view — so the 5-across grid
+  // hung 15px outside its own page. The engine's window arithmetic only tracks the scrolling axis
+  // as well, so an off-axis scroll moves content it cannot account for.
+  //
+  // This does NOT contradict "the author's `overflow` wins" above: that rule is about whether the
+  // box scrolls AT ALL, which is still the author's call. `axis` is this trait's own field, and
+  // saying which axis is the only thing it can mean.
+  if (s.axis === 'x') css.overflowY = 'hidden';
+  else if (s.axis === 'y') css.overflowX = 'hidden';
   return css;
 }
 
@@ -63,8 +82,25 @@ export function writeScrollState(guid: string, state: Partial<{
   return true;
 }
 
-/** Clear a consumed `scrollTo*` request back to the sentinel. Same no-dirty write. */
-export function clearScrollRequest(guid: string, axis: 'x' | 'y' | 'both'): void {
+/**
+ * Clear a consumed `scrollTo*` request back to the sentinel. Same no-dirty write.
+ *
+ * ⚠️ **Clears BOTH axes, and it must — it used to take the VIEW's axis and clear only that one.**
+ * `pendingScrollTo` builds ONE `Element.scrollTo` call carrying whatever is set on either axis, so
+ * both are consumed together and clearing one is not "clearing what was applied". The failure that
+ * exposed it (Court's level selector, 2026-08-21): the game asked for `{x: page, y: 0}` on an
+ * `axis: 'x'` view — `y: 0` is a REAL request for row 0, which converted to `scrollToY: 0` and
+ * could then never be cleared, because the view's axis is `'x'`. `pendingScrollTo` therefore
+ * returned a request on EVERY subsequent rebuild, and each one fired `scrollTo({top: 0})` with no
+ * `left`: per spec that keeps the CURRENT left, so it cancelled the in-flight smooth scroll ~20 ms
+ * in and re-targeted it to where it had got to — about 0. The arrows moved nothing, the trait read
+ * a clean `scrollToX: -1`, and every unit test stayed green.
+ *
+ * `scrollToEntry`'s own banner already says to omit the axis a view does not scroll. That rule is
+ * right and Court now follows it — but a rule whose violation is UNRECOVERABLE and silent is a
+ * trap, so the clear no longer depends on the caller having got it right.
+ */
+export function clearScrollRequest(guid: string): void {
   const meta = getTraitByName('UIScrollView');
   if (!meta || !guid) return;
   const world = getCurrentWorld();
@@ -73,8 +109,8 @@ export function clearScrollRequest(guid: string, axis: 'x' | 'y' | 'both'): void
   if (!entity || !entity.has(meta.trait)) return;
   const cur = entity.get(meta.trait) as Record<string, unknown>;
   const patch: Record<string, unknown> = {};
-  if (axis !== 'y' && cur.scrollToX !== NO_SCROLL_REQUEST) patch.scrollToX = NO_SCROLL_REQUEST;
-  if (axis !== 'x' && cur.scrollToY !== NO_SCROLL_REQUEST) patch.scrollToY = NO_SCROLL_REQUEST;
+  if (cur.scrollToX !== NO_SCROLL_REQUEST) patch.scrollToX = NO_SCROLL_REQUEST;
+  if (cur.scrollToY !== NO_SCROLL_REQUEST) patch.scrollToY = NO_SCROLL_REQUEST;
   if (Object.keys(patch).length === 0) return;
   entity.set(meta.trait, { ...cur, ...patch });
   // ⚠️ This one DOES dirty, unlike its siblings in this file, and the asymmetry is the point.

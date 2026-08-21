@@ -50,14 +50,15 @@ function makeRigPrototype(): THREE.Object3D {
 }
 
 const disposeRetiredEnvironment = vi.fn();
+const disposeRetiredMaterial = vi.fn();
 
-async function setup(opts: { primitives?: boolean; env?: unknown; rig?: THREE.Object3D; overrideMaterial?: THREE.Material; retiredEnvs?: Set<unknown>; primitiveMaterial?: THREE.Material } = {}) {
+async function setup(opts: { primitives?: boolean; env?: unknown; rig?: THREE.Object3D; overrideMaterial?: THREE.Material; retiredEnvs?: Set<unknown>; retiredMats?: Set<unknown>; primitiveMaterial?: THREE.Material } = {}) {
   vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms, deactivatedEntities, transformPropagationSystem: {},
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
     resolveMeshTemplate: vi.fn(() => null), resolveMeshLodInfo: vi.fn(() => null),
-    resolveMaterialForMesh: vi.fn(() => null),
+    resolveMaterialForMesh: vi.fn(() => opts.primitiveMaterial ?? null),
     // A rig's SkinnedMeshRenderer override resolves through THIS function, so a test that
     // supplies `overrideMaterial` is the only one that can tell "override applied" from
     // "override silently dropped because the guid did not resolve".
@@ -67,6 +68,9 @@ async function setup(opts: { primitives?: boolean; env?: unknown; rig?: THREE.Ob
     // retiree so it can assert the prewarm's own env binding is visible to that sweep.
     retiredEnvironments: () => opts.retiredEnvs ?? new Set(),
     disposeRetiredEnvironment,
+    // The retired-MATERIAL sweep syncSceneRenderables3D runs (#317) — same idea, other kind.
+    retiredMaterials3D: () => opts.retiredMats ?? new Set(),
+    disposeRetiredMaterial,
   }));
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
     getRiggedModel: vi.fn((ref: string) => (opts.rig && ref === RIG_REF ? { prototype: opts.rig, animations: [] } : undefined)),
@@ -285,6 +289,42 @@ describe('prewarmShadersForWorld — the environment mirror follows the TIER', (
 
     expect(sweptDuringCompile, 'the compile hook must have run').toBe(true);
     expect(disposeRetiredEnvironment).not.toHaveBeenCalled();
+  });
+
+  /** #317 — the same hazard one resource kind over, and the reason registration moved to where
+   *  the surface is BORN. The prewarm binds cached MATERIALS to its compile scene
+   *  unconditionally, but the first cut registered the scene inside the env mirror's
+   *  `if (cached)` branch — so a world with NO Environment (or a tier with IBL off) never
+   *  registered at all, and every material binding sat unguarded across `await compileAsync`.
+   *
+   *  This test deliberately spawns NO Environment: under the old placement nothing registers, and
+   *  the material sweep frees a material the compile is still using. */
+  it('registers its compile scene even with NO Environment, so a material cannot be freed mid-compile', async () => {
+    const mat = new THREE.MeshStandardMaterial();
+    const { world, sync, Renderable3DPrimitive, EntityAttributes } = await setup({
+      primitives: true, overrideMaterial: mat, primitiveMaterial: mat, retiredMats: new Set([mat]),
+    });
+    const { createWorld } = await import('koota');
+    const { Transform } = await import('../../src/runtime/traits');
+    world.spawn(
+      Transform({}),
+      Renderable3DPrimitive({ mesh: 'cube', material: 'mat-guid', isVisible: true }),
+      EntityAttributes({ isActive: true, layer: '3d' }),
+    );
+
+    let sweptDuringCompile = false;
+    const renderer = {
+      compileAsync: vi.fn(async () => {
+        // Another surface renders a frame while this compile is in flight.
+        sync.syncSceneRenderables3D(createWorld(), new THREE.Scene(), sync.createRenderState());
+        sweptDuringCompile = true;
+      }),
+      getContext: () => ({}), backend: {}, info: { render: {} },
+    };
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+
+    expect(sweptDuringCompile, 'the compile hook must have run').toBe(true);
+    expect(disposeRetiredMaterial, 'the compile scene must be visible to the material sweep').not.toHaveBeenCalled();
   });
 });
 

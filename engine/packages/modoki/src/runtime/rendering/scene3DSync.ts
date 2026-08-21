@@ -459,9 +459,42 @@ function registerRenderSurface(scene: THREE.Scene): void {
  *  share its texture references) is freed. That matches the pre-#317 behaviour — where it was
  *  freed immediately — so it is not a regression, but it is why this fix is only half of the
  *  problem. */
+/** Frames to skip after a sweep that freed nothing and saw no new retiree.
+ *
+ *  ⚠️ WHY A BACKOFF EXISTS AT ALL: a retiree can be pinned FOREVER, legitimately. If the refetch
+ *  after an invalidation fails (asset deleted mid-session, malformed JSON), `fetchMaterial`
+ *  caches `MATERIAL_FAILED`, `resolveMaterial` returns undefined for that path permanently, and
+ *  `syncMaterial`'s rebind branch can never run — so the mesh keeps drawing the retiree and
+ *  keeping it alive is CORRECT. Without a backoff, `retired.size` never returns to 0 and every
+ *  surface pays a full `scene.traverse()` on every frame for the rest of the session. The common
+ *  case is unaffected: a retiree is normally freed within a frame or two, and the counter resets
+ *  the moment the set changes. */
+const SWEEP_IDLE_BACKOFF_FRAMES = 30;
+/** Consecutive fruitless sweeps before the backoff engages. It is NOT 1, and the tests caught
+ *  why: a retiree is still bound on the sweep right after its invalidation almost by definition,
+ *  so backing off on the first fruitless sweep skipped the very frame the mesh rebound on and
+ *  delayed every ordinary free by up to `SWEEP_IDLE_BACKOFF_FRAMES`. The grace keeps the normal
+ *  path exact and still bounds the permanent case. */
+const SWEEP_IDLE_GRACE = 3;
+let sweepSkipFrames = 0;
+let sweepIdleRuns = 0;
+let lastRetiredSize = 0;
+/** How many times the sweep has actually TRAVERSED (as opposed to returning on the empty-set
+ *  guard or the backoff). Test/diagnostic read, like {@link isIblSuppressed} — the backoff is a
+ *  cost property, and counting the work it avoids is the only direct way to assert it. */
+let sweepTraversals = 0;
+export function retiredMaterialSweepTraversals(): number {
+  return sweepTraversals;
+}
+
 function sweepRetiredMaterials(): void {
   const retired = retiredMaterials3D();
-  if (retired.size === 0) return; // the ordinary frame — no traverse
+  if (retired.size === 0) { sweepSkipFrames = 0; sweepIdleRuns = 0; lastRetiredSize = 0; return; }
+  // A set that just grew always sweeps immediately — the backoff only throttles one standing
+  // still, never one with a new retiree in it.
+  if (retired.size !== lastRetiredSize) { sweepSkipFrames = 0; sweepIdleRuns = 0; }
+  else if (sweepSkipFrames > 0) { sweepSkipFrames--; return; }
+  sweepTraversals++;
   const bound = new Set<THREE.Material>();
   for (const ref of envSurfaceRefs) {
     const surface = ref.deref();
@@ -473,7 +506,13 @@ function sweepRetiredMaterials(): void {
       else bound.add(m);
     });
   }
-  for (const mat of [...retired]) if (!bound.has(mat)) disposeRetiredMaterial(mat);
+  let freed = 0;
+  for (const mat of [...retired]) if (!bound.has(mat)) { disposeRetiredMaterial(mat); freed++; }
+  // Fruitless for SWEEP_IDLE_GRACE runs in a row → what is left is genuinely still bound, and
+  // may be pinned for good. Back off rather than re-traversing every surface every frame.
+  sweepIdleRuns = freed === 0 ? sweepIdleRuns + 1 : 0;
+  sweepSkipFrames = sweepIdleRuns >= SWEEP_IDLE_GRACE ? SWEEP_IDLE_BACKOFF_FRAMES : 0;
+  lastRetiredSize = retired.size;
 }
 
 function sweepRetiredEnvironments(): void {
@@ -3399,6 +3438,15 @@ async function prewarmShadersForWorldInner(
   disposeRetainedPrewarmObjects();
 
   const prewarmScene = new THREE.Scene();
+  // Register AT CREATION, not at each binding site (#315, #317). This scene binds cached envs
+  // AND cached materials, and holds both across the `await compileAsync` below — so a re-import
+  // during that await would let a sweep free something this compile is still sampling. The first
+  // cut registered inside the env mirror's `if (cached)` branch, which left every material
+  // binding unguarded and skipped registration entirely for a scene with no Environment or a
+  // tier with IBL off. Registering where the surface is BORN makes the resource kind irrelevant
+  // and cannot go stale when a future mirror binds something new. The ref is weak, so the
+  // throwaway scene still dies.
+  registerRenderSurface(prewarmScene);
   let count = 0;
 
   // Lights are disposed at the end of this call; everything else the prewarm mints outlives it
@@ -3508,12 +3556,6 @@ async function prewarmShadersForWorldInner(
       if (!env.hdrPath) return;
       const cached = getCachedEnvironment(env.hdrPath);
       if (cached) {
-        // Register it like a real surface (#315): this is the ONE other place a cached env
-        // texture gets bound to a THREE.Scene, and the binding outlives an `await compileAsync`
-        // below. Unregistered, a re-import during that await would let the retired-env sweep
-        // free the texture this compile is still sampling — the very use-after-free the
-        // retirement exists to prevent. The ref is weak, so the throwaway scene still dies.
-        registerRenderSurface(prewarmScene);
         prewarmScene.environment = cached;
         prewarmScene.environmentIntensity = env.intensity;
       }

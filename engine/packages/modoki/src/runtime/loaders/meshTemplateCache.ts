@@ -1210,6 +1210,15 @@ function fetchMaterial(matPath: string): Promise<void> {
 
       // If cache was disposed while we were loading, discard this material
       if (gen !== cacheGeneration) { disposeMaterial(mat); return; }
+      // An invalidate mid-flight clears `materialLoadPromises`, so a SECOND fetch for this path
+      // can already have landed here — `fetchMaterial` dedupes on that map alone. Retire the
+      // incumbent instead of letting `set` silently orphan it: orphaned, it is unreachable to
+      // `materialCache`, to the sweep AND to `disposeAllCachedResources`, so it leaks along with
+      // every shared-texture ref it holds. Retiring is also the only safe move — a mesh may be
+      // binding it right now, so disposing here would be #317 again. (Twin of the same defect in
+      // `fetchEnvironment`, fixed under #315.)
+      const prevMat = materialCache.get(matPath);
+      if (prevMat && prevMat !== MATERIAL_FAILED && prevMat !== mat) retiredMaterials.add(prevMat);
       materialCache.set(matPath, mat);
       // Wake the render loop so syncMaterial re-binds this freshly-built instance.
       // Critical for a LIVE material edit: invalidateMaterial() drops the old
@@ -1542,7 +1551,9 @@ function releaseMaterialByPath(sceneId: SceneId, matPath: string): void {
   if (!matPath.endsWith('.mat.json')) return;
   const wasLast = removeOwner(materialOwners, matPath, sceneId);
   if (wasLast) {
-    invalidateMaterial(matPath); // disposes the THREE.Material + texture
+    // Retires it (#317) — the sweep frees it once no live mesh binds it. NOT a synchronous
+    // dispose: the outgoing scene may still be on screen for a frame or two after the swap.
+    invalidateMaterial(matPath);
   }
 }
 

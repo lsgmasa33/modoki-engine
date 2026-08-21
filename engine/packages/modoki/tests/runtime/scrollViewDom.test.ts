@@ -25,7 +25,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
 import { scrollViewStyle, scrollSnapChildStyle, pendingScrollTo, clearScrollRequest, type ScrollViewNodeData } from '../../src/runtime/ui/scrollViewDom';
 
 const base = (over: Partial<ScrollViewNodeData> = {}): ScrollViewNodeData => ({
-  axis: 'y', snap: 'none', snapStop: 'normal', overscroll: 'auto',
+  axis: 'y', snap: 'none', snapStop: 'normal', overscroll: 'auto', scrollbar: 'auto',
   scrollToX: NO_SCROLL_REQUEST, scrollToY: NO_SCROLL_REQUEST, scrollBehavior: 'instant', ...over,
 });
 
@@ -47,6 +47,14 @@ describe('scrollViewStyle', () => {
   it('always carries overscroll-behavior', () => {
     expect(scrollViewStyle(base({ overscroll: 'contain' })).overscrollBehavior).toBe('contain');
     expect(scrollViewStyle(base({ overscroll: 'none' })).overscrollBehavior).toBe('none');
+  });
+
+  it('hides the classic scrollbar when scrollbar is hidden', () => {
+    expect(scrollViewStyle(base({ scrollbar: 'hidden' })).scrollbarWidth).toBe('none');
+  });
+
+  it('emits no scrollbar-width at all under the "auto" default — a classic scrollbar is left alone', () => {
+    expect(scrollViewStyle(base())).not.toHaveProperty('scrollbarWidth');
   });
 });
 
@@ -92,7 +100,7 @@ describe('clearScrollRequest', () => {
     // declarative `ui.scrollTo` path hides this (bindings.ts dirties for its own reasons); a
     // game calling scrollToEntry() directly gets no such rescue.
     testWorld.spawn(UIScrollView({ scrollToY: 4800 }));
-    clearScrollRequest('view-guid', 'y');
+    clearScrollRequest('view-guid');
     let sv: any;
     testWorld.query(UIScrollView).updateEach(([v]: any[]) => { sv = v; });
     expect(sv.scrollToY).toBe(NO_SCROLL_REQUEST);
@@ -101,16 +109,24 @@ describe('clearScrollRequest', () => {
 
   it('does nothing — and does NOT dirty — when there is no request pending', () => {
     testWorld.spawn(UIScrollView({}));
-    clearScrollRequest('view-guid', 'both');
+    clearScrollRequest('view-guid');
     expect(dirtySpy).not.toHaveBeenCalled();   // a scroll frame with no request stays free
   });
 
-  it('clears only the axis asked for', () => {
-    testWorld.spawn(UIScrollView({ scrollToX: 120, scrollToY: 4800 }));
-    clearScrollRequest('view-guid', 'y');
+  // ⚠️ This REVERSES an older assertion ("clears only the axis asked for"), which pinned a real
+  // defect. `pendingScrollTo` builds ONE `Element.scrollTo` call from whatever is set on either
+  // axis, so both are consumed together — clearing one leaves a request that is applied on every
+  // subsequent rebuild and can never be cleared. Court hit it: `{x: page, y: 0}` on an `axis:'x'`
+  // view left `scrollToY: 0` stuck, and the resulting per-rebuild `scrollTo({top: 0})` (no `left`,
+  // so the CURRENT left is kept) cancelled the in-flight smooth scroll ~20ms in. The arrows moved
+  // nothing while the trait read a clean `scrollToX: -1`.
+  it('clears BOTH axes — a request the view does not scroll must not survive', () => {
+    testWorld.spawn(UIScrollView({ axis: 'x', scrollToX: 120, scrollToY: 0 }));
+    clearScrollRequest('view-guid');
     let sv: any;
     testWorld.query(UIScrollView).updateEach(([v]: any[]) => { sv = v; });
-    expect(sv.scrollToX).toBe(120);
+    expect(sv.scrollToX).toBe(NO_SCROLL_REQUEST);
+    // 0 is a REAL request (scroll to the top), not the sentinel — which is what made it stick.
     expect(sv.scrollToY).toBe(NO_SCROLL_REQUEST);
   });
 });

@@ -504,10 +504,26 @@ registered surface, and it reads `mesh.material` arrays as well as the single-ma
 It runs at the tail of `syncSceneRenderables3D`, guarded on `retiredMaterials3D().size`, so an
 ordinary frame does no traverse at all.
 
+`fetchMaterial`'s load callback retires an occupied slot for the same reason
+`fetchEnvironment` does: `invalidateMaterial` clears `materialLoadPromises`, which is the ONLY
+thing `fetchMaterial` dedupes on, so an in-flight fetch stops deduping a second one and both
+reach `materialCache.set`. Orphaned, the loser is unreachable to the cache, to the sweep *and* to
+`disposeAllCachedResources` — leaking the material and every shared-texture ref it holds.
+
 **One consequence worth knowing: a retired texture's release is now deferred behind its
 material's sweep.** `disposeMaterial` is what releases the material's texture refs, and it no
 longer runs at invalidation time — in production that is a few frames, and freeing earlier would
 be the same use-after-free one level down.
+
+**The sweep backs off when a retiree is legitimately PINNED.** A retiree can be held forever and
+correctly so: if the refetch after an invalidation fails, `fetchMaterial` caches
+`MATERIAL_FAILED`, `resolveMaterial` returns undefined for that path permanently, and
+`syncMaterial` can never rebind — so the mesh keeps drawing the retiree. Without a backoff
+`retired.size` never returns to 0 and every surface pays a full `scene.traverse()` on every frame
+for the rest of the session. ⚠️ The grace before backing off is **3 fruitless sweeps, not 1**, and
+the tests caught why: a retiree is still bound on the sweep right after its invalidation almost by
+definition, so backing off immediately skipped the very frame the mesh rebound on and delayed
+every ordinary free.
 
 ⚠️ **This fix is HALF the problem.** Three caches hold `base.clone()` — tint
 (`scene3DSync.tintedMaterial`), MaterialInstance (`materialInstanceClones.ts`) and light-mask

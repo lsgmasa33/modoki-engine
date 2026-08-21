@@ -733,7 +733,17 @@ buy a feel promise.
 `scrollToEntry(viewGuid, {x, y}, {behavior})` and `snapToNearest` request in **entry**
 coordinates (the system converts, since it is what resolves entry size); the declarative
 `ui.scrollTo` action does the same from a button with no game code. Both are exercised by
-`games/scroll-demo`'s strip scene — two authored buttons, one `instant` and one `smooth`.
+`games/scroll-demo`'s strip scene — two authored buttons, one `instant` and one `smooth` — and,
+since #316, by Court's level-selector arrows, which is the first caller in a SHIPPING game.
+
+⚠️ **OMIT the axis the view does not scroll — `0` is a REAL request, not "no request".** The
+sentinel is `-1`. Court asked for `{x: page, y: 0}` on an `axis: 'x'` view; that converted to
+`scrollToY: 0`, and because `clearScrollRequest` used to clear only the VIEW's axis it could never
+be cleared. `pendingScrollTo` then returned a request on every rebuild, each firing
+`scrollTo({top: 0})` with no `left` — which per spec keeps the CURRENT left, so it cancelled the
+in-flight smooth scroll about 20 ms in and re-targeted it to roughly where it started. **The
+arrows moved nothing, the trait read a clean `scrollToX: -1`, and every unit test was green.** The
+clear now clears BOTH axes so the mistake is recoverable, but the call site should still be right.
 
 ⚠️ **A converted request must DIRTY the tree.** The px request lands on `UIScrollView` through
 the same raw no-dirty `entity.set` the scroll read-back uses, so when the window has not also
@@ -769,6 +779,30 @@ rebuild and is never per-frame.
   `__uiEntriesRow` per pooled row. See "the DOM shape" below for why the row layer exists.
 - **The entry prefab root needs `RenderableUI`**, or the entry renders nothing while looking
   perfect in `get_scene_state`.
+- ⚠️ **`axis` PINS the cross axis, and it has to.** `UIElement.overflow: 'scroll'` is a both-axes
+  CSS property, so an `axis: 'x'` view scrolled vertically too — and on any platform with CLASSIC
+  scrollbars (desktop web, the Electron editor) the second scrollbar STEALS cross-axis space from
+  the content box. Measured in Court's selector (2026-08-21): a 31.6vh page inside a 31.6vh box
+  came back **203px against the grid's 218px**, so the 5-across grid hung 15px outside its own
+  page. `axis: 'x'` now emits `overflow-y: hidden`, and `'y'` the mirror.
+- ⚠️ **Snap is SUSPENDED while the view moves, and snapping + recycling cannot coexist without
+  it.** The offset is carried as padding, so every pool re-drive rewrites it mid-scroll — and
+  under `scroll-snap-type: mandatory` the browser answers that layout change by re-snapping to
+  the previously-snapped ELEMENT, which recycling has just repointed at different data. That
+  moves the scroll, which re-drives the pool, which rewrites the padding: a closed loop. Both of
+  its symptoms have this one cause — **landing on the wrong page** (asking for page 12 landed on
+  4, page 23 on 6) and **~3x the frame time AT REST** with no input and no pool churn (p50 39ms /
+  p95 52ms against 13/18). `proximity` fixes neither. `UINode` holds `scroll-snap-type: none`
+  from the first scroll event until 150 ms after the last, and restores the AUTHORED value — not
+  `''`, which would strip React's own inline style and silently end snapping for good.
+- ⚠️ **A converted `scrollToEntry` builds that frame's window from the TARGET, not from the
+  scroll still observable** (`entriesSystem`), and moves the travel baseline with it. Padding for
+  where the view IS, plus a DOM scroll to where it was ASKED to go, is the mismatch snap corrects
+  — suspending snap alone only buys time for a walk that should never have been a walk.
+- ⚠️ **`scrollbar: 'hidden'` when the box is sized to fit its content exactly.** A classic
+  scrollbar takes ~15px off the CROSS axis, and mobile's overlay scrollbars take none — so
+  authoring the box bigger to compensate leaves a gap on the platform that ships. Court's page
+  grid was clipped 7px top and bottom until this was authored. Default is `'auto'`.
 
 ### The DOM shape — a column of auto-width rows, and why a flat box cannot work
 

@@ -297,6 +297,26 @@ function driveView(
   // the first real caller of `ui.scrollTo`: `scrollToY` read 480000 while `scrollY` stayed 0.
   const requested = consumeEntryRequest(view, m, en, entryW, entryH);
 
+  // ⚠️ **A JUMP builds this frame's window from the TARGET, not from the scroll we can still
+  // observe — and that is the whole fix for "it lands on the wrong page".**
+  //
+  // The offset is carried as PADDING, so the window and the scroll position are two halves of one
+  // statement. Building the window from `sv.scrollX` on the frame a request is converted writes
+  // the padding for where the view IS, and the DOM then scrolls to where it was ASKED to go with
+  // the wrong content underneath — whereupon `scroll-snap` re-snaps to the nearest entry that
+  // actually exists and drags it back. Measured live in Court's level selector (2026-08-21):
+  // asking for page 12 landed on 4, page 23 on 6, converging a few pages per attempt because each
+  // round could only move the window by its own extent. Suppressing snap in `UINode` while the
+  // view moves is the other half of the fix, and on its own it is not enough — it buys time for a
+  // walk that should never have been a walk.
+  //
+  // Writing the padding for the target FIRST means the content is already there when the scroll
+  // lands, so there is no mismatch for snap to correct.
+  const jumpX = requested?.x;
+  const jumpY = requested?.y;
+  const windowScrollX = jumpX ?? sv.scrollX;
+  const windowScrollY = jumpY ?? sv.scrollY;
+
   const st = viewStates.get(viewGuid)
     ?? { seeded: false, lastFirstX: 0, lastFirstY: 0, lastEpoch: -1, lastCountX: -1, lastCountY: -1, travel: 0,
          frameScrollX: 0, frameScrollY: 0,
@@ -308,6 +328,11 @@ function driveView(
   // `first`.
   const strideXpx = Math.max(1, entryW + ((en.gapX as number) ?? 0));
   const strideYpx = Math.max(1, entryH + ((en.gapY as number) ?? 0));
+  // ⚠️ A jump needs no special case HERE, and one was tried and removed. On the frame a request
+  // is converted the scroll has not moved yet, so this is already ~0; the thing that stops a
+  // teleport being measured as travel is the BASELINE moving with it (see `frameScrollX` below),
+  // which is what a mutation test actually pins. Skipping the measurement on `requested` would
+  // additionally suppress a REAL gesture that happened in the same frame as a jump.
   const travel = st.seeded
     ? Math.max(
       Math.abs(sv.scrollX - st.frameScrollX) / strideXpx,
@@ -338,10 +363,10 @@ function driveView(
   const overscanY = effectiveOverscan(floor, travel, capY);
 
   const xw: AxisWindow = countX > 0
-    ? computeAxisWindow({ scroll: sv.scrollX, viewport: sv.viewportWidth, entrySize: entryW, gap: en.gapX as number, count: countX, overscan: overscanX })
+    ? computeAxisWindow({ scroll: windowScrollX, viewport: sv.viewportWidth, entrySize: entryW, gap: en.gapX as number, count: countX, overscan: overscanX })
     : EMPTY_WINDOW;
   const yw: AxisWindow = countY > 0
-    ? computeAxisWindow({ scroll: sv.scrollY, viewport: sv.viewportHeight, entrySize: entryH, gap: en.gapY as number, count: countY, overscan: overscanY })
+    ? computeAxisWindow({ scroll: windowScrollY, viewport: sv.viewportHeight, entrySize: entryH, gap: en.gapY as number, count: countY, overscan: overscanY })
     : EMPTY_WINDOW;
 
   const epoch = (en.epoch as number) ?? 0;
@@ -359,8 +384,11 @@ function driveView(
     lastCountX: countX, lastCountY: countY,
     // ⚠️ Only the pipeline tick advances the baseline. The scroll-event drive leaves it alone so
     // the tick that follows it in the same frame still sees the frame's real travel.
-    frameScrollX: isFrameTick ? sv.scrollX : st.frameScrollX,
-    frameScrollY: isFrameTick ? sv.scrollY : st.frameScrollY,
+    // ⚠️ A jump also moves the BASELINE to its target. Leaving it behind makes the very next
+    // tick measure the whole teleport as travel and raise the band to its cap for nothing —
+    // the same wrong number, one frame later.
+    frameScrollX: jumpX ?? (isFrameTick ? sv.scrollX : st.frameScrollX),
+    frameScrollY: jumpY ?? (isFrameTick ? sv.scrollY : st.frameScrollY),
     lastEntryW: entryW, lastEntryH: entryH, lastCols: xw.pooled, lastRows: yw.pooled,
   });
 
@@ -376,7 +404,9 @@ function driveView(
   // Nothing to re-drive: the window did not move, the data did not change, and the pool is
   // already the right size. This is the cheap path a scroll frame normally takes.
   const poolChanged = pool.grew;
-  if (!moved && !invalidated && !poolChanged) return requested;
+  // A converted request still counts as "this view did something", so the caller dirties the
+  // tree — that is what makes `UINode`'s one-shot scrollTo effect re-run at all.
+  if (!moved && !invalidated && !poolChanged) return requested !== null;
 
   // ⚠️ The child index is built HERE — after `ensurePool`, never before. A pool that just grew
   // has brand-new member entities, and an index captured earlier does not contain them: every
@@ -398,10 +428,10 @@ function driveView(
  *  hand-off happens once, here, rather than either side learning the other's units. */
 function consumeEntryRequest(
   view: EntityLike, m: Metas, en: Record<string, unknown>, entryW: number, entryH: number,
-): boolean {
+): { x?: number; y?: number } | null {
   const reqX = (en.scrollToEntryX as number) ?? -1;
   const reqY = (en.scrollToEntryY as number) ?? -1;
-  if (reqX < 0 && reqY < 0) return false;
+  if (reqX < 0 && reqY < 0) return null;
 
   // ⚠️ An axis whose entry size is not known YET must stay pending, not be consumed as 0.
   //
@@ -414,7 +444,7 @@ function consumeEntryRequest(
   const strideY = entryH + ((en.gapY as number) ?? 0);
   const canX = reqX < 0 || strideX > 0;
   const canY = reqY < 0 || strideY > 0;
-  if (!canX || !canY) return false;   // retry next frame, once the prefab is cached
+  if (!canX || !canY) return null;    // retry next frame, once the prefab is cached
 
   const sv = view.get(m.svMeta.trait) as Record<string, unknown>;
   const next: Record<string, unknown> = { ...sv };
@@ -424,7 +454,12 @@ function consumeEntryRequest(
   // Clear the entry-space request only now that it HAS been handed to the px surface. Leaving
   // it set would re-issue the same scroll every frame and pin the view in place.
   view.set(m.enMeta.trait, { ...en, scrollToEntryX: -1, scrollToEntryY: -1 });
-  return true;
+  // ⚠️ **Return the TARGET, because this frame's window must be built for where the view is
+  // GOING, not where it still is.** See `driveView`'s use of it.
+  return {
+    x: reqX >= 0 ? reqX * strideX : undefined,
+    y: reqY >= 0 ? reqY * strideY : undefined,
+  };
 }
 
 /** Find (or spawn) the engine-owned content child. The pooled entries are ITS children, and it
