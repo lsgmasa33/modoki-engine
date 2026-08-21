@@ -232,6 +232,19 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
   for that property before optimising a query away — an equivalence you can state beats a guess that
   usually holds. The Mac gate cannot see any of this: the whole path is behind `platform === 'win32'`,
   which is why the guard is platform-injectable and unit-tested from any host.
+  - **Measured on the `win` clone** (2026-08-21), which is the only place these numbers exist:
+    the sweep costs **398–1079 ms per call**, and `rmSync`'s retry budget on a freshly-created empty
+    dir costs **0 ms, three times out of three**. The second number is the load-bearing one — it
+    confirms the retries never fire for an empty dir, so the sweep really was the whole cost and the
+    guard removes exactly it. Until that was measured it was only *inferred from reading the code*,
+    which is not the same thing.
+  - **What is still inference: how 1 s becomes 20 s.** No one has observed a 20 s sweep; the CI
+    timeout is explained by cold start, not by the steady-state cost. `uninstall('java')` is the
+    FIRST test in its describe block, so it alone pays PowerShell startup *plus* WMI service
+    spin-up. The corroboration is the neighbour: `uninstall('cocoapods')` removes TWO dirs and so
+    sweeps **twice**, and it did not time out — which fits "the first sweep in a process is the
+    expensive one" and rules out "every sweep costs ~20 s". One failure sample, so treat that as the
+    best-supported reading rather than a settled fact.
 - **Size time budgets from the slowest machine.** A budget tuned on a Mac is not a budget. An
   isolated timing is worth roughly a quarter of the real under-load cost. Worked example
   (2026-08-20): `rampProbeRunner.test.ts`'s `expect(performance.now() - started).toBeLessThan(5)`
