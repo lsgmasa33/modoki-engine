@@ -43,6 +43,7 @@ import * as THREE from 'three/webgpu';
 import type { World } from 'koota';
 import { VideoPlayer } from '../traits/VideoPlayer';
 import { videoElementFor } from '../video/videoSystem';
+import { markDerived } from './derivedMaterials';
 
 /** What we hold per (surface, entity). */
 interface Bound {
@@ -197,7 +198,14 @@ export function syncVideoTextures(
     const texture = makeTexture(el);
     // A private clone, never the shared material we found — see the header and
     // docs/video.md § Gotchas (#192).
-    const clone = target.material.clone() as MapMaterial;
+    //
+    // `markDerived` is what keeps the base alive while this clone is bound (#318). Only `.map` is
+    // replaced below; every other slot the base carries (normal/roughness/emissive…) is still a
+    // SHARED reference, so a `.mat.json` re-import that retires the base would otherwise let the
+    // sweep free it — releasing textures this clone is drawing with. Staleness needs no fix here:
+    // `syncMaterial` re-binds a video entity's resolved material (it is neither tinted, instanced
+    // nor masked), so the `current !== existing.original` branch above already rebuilds.
+    const clone = markDerived(target.material.clone(), target.material) as MapMaterial;
     clone.map = texture;
     clone.needsUpdate = true;
     const bound: Bound = {

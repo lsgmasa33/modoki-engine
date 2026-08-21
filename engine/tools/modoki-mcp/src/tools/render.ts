@@ -100,10 +100,11 @@ export function registerRenderTools(tool: ToolDef, ctx: ToolContext): void {
       height: z.number().int().positive().max(4096).optional().describe('Output height px (default: live viewport; ≤4096). Per frame.'),
       quality: z.number().int().min(1).max(100).optional().describe('JPEG quality 1-100 (default 85), per frame — the SAME unit as capture_viewport/render_scene.'),
       camera: z.object({
-        position: z.array(z.number()).length(3).optional(),
-        target: z.array(z.number()).length(3).optional(),
-        fov: z.number().optional(),
-      }).optional(),
+        position: z.array(z.number()).length(3).optional().describe('World camera position [x,y,z].'),
+        target: z.array(z.number()).length(3).optional().describe('Look-at target [x,y,z].'),
+        fov: z.number().optional().describe('Vertical FOV degrees.'),
+      }).optional()
+        .describe('Override the render camera: position [x,y,z], target [x,y,z] to look at, fov in degrees. Omit to use the live viewport camera. Same shape as modoki_render_scene.'),
     },
     async (args) => {
       // Allow enough wall-clock for the whole sequence: frames sampled at fps, each

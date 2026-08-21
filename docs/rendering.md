@@ -281,6 +281,23 @@ Note the confound that produced the second wrong fix — **toggling `castShadow`
 shadow rebuild**, so "changing X lit it" may only mean "rebuilding lit it". Isolate with
 `shadow.intensity`, which changes no build state.
 
+**A re-imported base has to reach the variant, and only one route does (#318).** `syncMaterial`
+deliberately skips its per-frame re-bind for a masked entity — otherwise it would fight the variant
+every frame, which is the churn the feature exists to remove — so nothing ever hands that mesh the
+re-imported material. `applyLightMask` recovers the base from the bound variant's `userData`, i.e.
+the **retired** instance, and re-derives under an unchanged `${uuid}|${sel}` key: the mesh showed
+the pre-reimport bytes for the rest of the session. The fix routes that recovered base through
+`refreshedMaterial` (the retired-base → successor pointer in `meshTemplateCache`) and calls
+`retireVariantsOf` on the dead one. An "your base was invalidated" event would NOT have fixed this
+— the holder has no path from the dead instance back to the material ref, so it re-derives from the
+same dead pointer either way. Full account: `docs/textures.md` § "The CLONES are the other half".
+
+Variants also carry a second `userData` stamp, `__derivedBase` (`rendering/derivedMaterials.ts`),
+which answers a different question from `__lightMaskBase`: that one means "re-derive a variant from
+THIS" — which a tint clone must answer with *itself*, or a masked+tinted mesh loses its tint — while
+`__derivedBase` means "my texture references belong to that", so the retired-material sweep can see
+that a mesh binding a variant is still holding the base.
+
 Not yet masked: skinned meshes, billboards and text have no mask field, and multi-material meshes
 are skipped.
 
@@ -2891,6 +2908,19 @@ dozen distinct materials freezes the app for 1–2 s at boot. Everything below e
 work off the first frame; the measurements and the wrong turns are in
 [plans/profiler.md](./plans/profiler.md) § Phase 2.
 
+⚠️ **There are TWO caches to warm, they have DIFFERENT keys, and they cost on different threads.**
+Warming one and missing the other looks like a fix that half-worked, and that is exactly how the
+last instance was found:
+
+| cache | keyed by | what a miss costs | how a miss shows up |
+|---|---|---|---|
+| **GPU render pipeline** (`Pipelines`) | `WebGPUBackend.getRenderCacheKey()` — cull mode, `frontFace`, colour-target formats + COUNT, sample count, depth format, vertex layout | ~130 ms per pipeline on the A23, **off the main thread** | an rAF gap with **no longtask inside it** |
+| **Node-builder state** (`NodeManager.nodeBuilderCache`) — the built TSL graph, i.e. the generated WGSL | `RenderObject.initialCacheKey` = `getMaterialCacheKey()` + `getDynamicCacheKey()`, which fold in **`this.context.id`**, the material's own properties, the lights node, the environment/fog nodes and `receiveShadow` | ~5 ms per material here, ~40 ms on the A23, **synchronously on the main thread** | an rAF gap a **longtask spans** |
+
+The distinction is not academic: `Renderer.compile()` builds node state through `buildAsync()`,
+which yields between shader stages, so a warmed graph is paid in chunks that do not drop a frame.
+The same graph built by a draw is one unbroken block.
+
 ### Two halves, and they cover different failures
 
 | | when | what it compiles | what it cannot cover |
@@ -2929,6 +2959,17 @@ variant nobody draws AND the first frame builds the real one synchronously — t
 | environment (IBL) | tier-gated `scene.environment` mirror |
 | fog | the real `syncFog(world, prewarmScene)` |
 
+**Render context** — folded into `getMaterialCacheKey()` as a bare `context.id`, so it keys the
+NODE-BUILDER cache as well as the pipeline one. three caches contexts by
+`(attachmentState, mrt, callDepth)`, which makes **the nesting depth of the draw** a cache-key
+input — the one that is invisible from the material and the scene:
+
+| input | how the compile gets it right |
+|---|---|
+| colour format, colour-target **COUNT**, sample count, depth/stencil buffers | `PostFXStack.compileSceneAsync()` compiles through the pass (and stamps `samples` + texture type first) |
+| MRT node identity | same call — the pass owns its `_mrt` |
+| **call depth** — 0 for a top-level `renderer.render()`, 1 for the scene pass a post-FX stack draws from inside its terminal quad | `pinPassCallDepth()`, because `Renderer.compile()` hardcodes the default (see sharp edge 3) |
+
 **Per-object** — `WebGPUBackend.getRenderCacheKey()`, and this half is where the later bugs were:
 
 | input | how the prewarm gets it right |
@@ -2940,7 +2981,7 @@ variant nobody draws AND the first frame builds the real one synchronously — t
 | vertex attribute layout (`getGeometryCacheKey`) | the real geometry template |
 | clipping context | not varied by the engine today |
 
-### Three sharp edges in three.js that this code exists to work around
+### Four sharp edges in three.js that this code exists to work around
 
 1. **`compileAsync` compiles the WRONG pipeline for a transparent double-sided material.**
    `Renderer.renderObject` draws it in two passes, setting `material.side` to `BackSide` then
@@ -2955,10 +2996,31 @@ variant nobody draws AND the first frame builds the real one synchronously — t
    never updates world matrices. `_projectObject` culls exactly as a render does, using the
    module-level `_frustum` the last RENDERED frame left behind — the OUTGOING scene's camera. Both
    halves therefore set `frustumCulled = false` on what they compile, and update matrices first.
-3. **Disposing a material RELEASES the pipeline it just warmed.** three refcounts a pipeline by the
+3. **`Renderer.compile()` always warms the CALL-DEPTH-0 render context, whatever depth the render
+   will be at.** `render()` asks for its context with `this._callDepth` (−1 at rest, so 0 for a
+   top-level draw and 1 for one nested inside another); `compile()` asks with no depth at all, i.e.
+   always 0. Without a post-FX stack the two agree and nothing is wrong. With one, the scene is
+   drawn from inside the terminal pipeline's quad — depth 1 — so the compile and the render use
+   two DIFFERENT `RenderContext` instances, `context.id` differs, and **every** node-builder cache
+   key differs. `pinPassCallDepth()` (`postfx/passCompileContext.ts`) wraps the lookup for the
+   duration of the compile so it returns the depth the pass really draws at, and `PostFXStack`
+   re-reads that depth off the live pass's first `updateBefore` so a stack that nests deeper
+   corrects itself instead of guessing forever. Measured on `demos/postfx-demo`: the compile warmed
+   context #4 and the first frame drew through #5 with every other key input byte-identical, so it
+   rebuilt all of them synchronously — 513 ms of an 807 ms main-thread block on the A23, worst rAF
+   gap 800–856 ms → **515–518 ms**.
+   ⚠️ The wrap is scoped to the pass's OWN render target: a compile spans seconds of awaits, other
+   surfaces keep drawing, and handing a genuine top-level render a nested context would trade a
+   boot win for a live rendering bug.
+4. **Disposing a material RELEASES the pipeline it just warmed.** three refcounts a pipeline by the
    render objects referencing it (`Pipelines.delete` → `usedTimes--` → `_releasePipeline` at zero).
    Anything the prewarm mints (primitive geometry/material, side-pinned clones, the F4 placeholder)
    is therefore freed at the START of the next prewarm, not at the end of its own call.
+4. **The side-pinned clones are stamped `markDerived`** (#318). The prewarm scene IS a registered
+   render surface — deliberately, so the retirement sweeps can see what it binds — and its clones
+   share the base's texture references, so an `invalidateMaterial` landing during the async
+   `compileAsync` would otherwise let the sweep free the base out from under them. After
+   `prewarmScene.clear()` nothing binds them, so the stamp pins nothing.
 
 ### Why light-mask variants can only be covered AFTER the swap
 
@@ -2976,7 +3038,9 @@ Same shape for the **post-FX render context**: with a stack up, the scene is dra
 scene pass, whose MRT layout can be three colour targets (`output` + `normal` + `lineColor`) where
 the canvas context has one. `PostFXStack.compileSceneAsync()` compiles through that pass — and
 stamps the target's sample count and texture type first, because `PassNode.setup()` normally does
-that during the first `render()`, i.e. the frame this call exists to get ahead of.
+that during the first `render()`, i.e. the frame this call exists to get ahead of. It also **pins
+the call depth** (sharp edge 3): compiling through the right target with the wrong nesting warms a
+node-builder cache nothing reads.
 
 ### How to measure a change here
 
@@ -2987,9 +3051,18 @@ three's incrementing material id, which differs between two runs of the same bui
   pipelines the prewarm built vs how many the first frames built, with the descriptor state that
   decides each key. Which pipelines get built is decided by data that is identical on a Mac; only
   the price per pipeline is device-specific.
+- **For the OTHER cache**, `tools-scratch/boot-stall/nodeprobe.mjs <url>` — every
+  `NodeManager.getForRender` call split into hit / cache hit / BUILD, with each key input beside it
+  (material key, dynamic key, lights, environment, fog, context id, call depth). A material that
+  builds in BOTH the compile phase and a frame is printed with both rows side by side, so the input
+  that differs names itself.
 - **On the phone, for the player-visible number**: `tools-scratch/boot-stall/coldprobe.sh <pkg>` —
   worst rAF gap across a cold boot, with a `longtask` observer. A gap with **no longtask inside it**
   is off-main-thread work (pipeline creation); a gap a longtask spans is ordinary JS.
+- **On the phone, when a longtask DOES span the gap**: `tools-scratch/boot-stall/coldmain.sh <pkg>`
+  — the same cold boot with a sampling CPU profile attached, printing a top-down tree for each
+  longtask and each rAF gap. It is what turned "a ~800 ms main-thread event" into a named call
+  chain in one run.
 
 ### Known gaps
 
@@ -2999,6 +3072,20 @@ three's incrementing material id, which differs between two runs of the same bui
   `Text3D` and video screens are still first-frame compiles. Rigs do not get side-pinning.
 - The mirror reads AUTHORED scale, so a determinant sign flipped at runtime is invisible to it.
 - Objects hidden at swap time and revealed later (a Director beat) compile when revealed.
+- ⚠️ **Under a post-FX stack the PRE-SWAP half warms nothing the render reads, and is not free.**
+  It compiles against the canvas context at call depth 0; the scene is drawn through the pass
+  context at depth 1, and on top of that the render binds light-mask variants the copy cannot
+  produce. Measured on `demos/postfx-demo` with `nodeprobe.mjs`: the prewarm builds 9 node-builder
+  states, **every** later hit on one of them is another call inside the prewarm itself, and no
+  frame ever reuses one — for 166 ms of main-thread build time here and a 359 ms longtask on the
+  A23 (the second-worst gap of that boot). It is still load-bearing for the TSL first-compile race
+  below, so it cannot simply be dropped; retargeting it at the incoming scene's pass is not
+  possible either, because at before-swap time the stack still belongs to the OUTGOING scene.
+- **The post-FX STAGE quads are not compiled at all.** `compileSceneAsync` covers the scene pass;
+  bloom's mip pyramid, DOF's six targets, GTAO and the terminal colour transform each build their
+  own pipelines on their first draw, and `RenderPipeline` exposes no compile entry point. After the
+  call-depth pin landed, `demos/postfx-demo`'s worst remaining boot gap is 516 ms with the main
+  thread **95% idle** — off-thread pipeline creation, the shape this points at.
 
 ## Gotcha: TSL first-compile race (prewarm)
 

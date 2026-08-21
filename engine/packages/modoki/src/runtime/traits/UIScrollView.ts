@@ -62,6 +62,26 @@ export const UIScrollView = trait({
   snapStop: 'normal' as UIScrollSnapStop,
   /** `overscroll-behavior` — governs whether a scroll at the end chains to the parent. */
   overscroll: 'auto' as UIScrollOverscroll,
+  /**
+   * What a MOUSE WHEEL / trackpad gesture does. Touch is unaffected either way.
+   *
+   * - `'native'` (default) — the browser scrolls by the raw wheel delta.
+   * - `'entry'` — one wheel gesture moves exactly ONE entry, and a gesture is only over once the
+   *   wheel has been quiet for a moment.
+   *
+   * ⚠️ **`'entry'` exists because a multiplier CANNOT work under `snap: mandatory`.** The browser
+   * quantises any offset to a whole entry, so shrinking the delta changes nothing; the only thing
+   * left to control is how many entries one gesture is allowed to cross. And it does need
+   * controlling: a single wheel NOTCH (~100-120px against a 218px page) is under half an entry and
+   * snaps back to where it started, while a trackpad swipe emits a rapid stream whose deltas
+   * accumulate into hundreds of pixels before the browser resolves them — so one flick crossed
+   * several pages. Owner on Court's level selector, 2026-08-22: *"with the mouse wheel, scroll is
+   * too sensitive."*
+   *
+   * Default `'native'` because a long LIST wants the raw delta — capping a 5,000-row strip to one
+   * row per gesture would be unusable. This is a PAGER's setting.
+   */
+  wheel: 'native' as UIScrollWheel,
   /** Whether the platform's classic scrollbar is shown. A classic (non-overlay) scrollbar
    *  STEALS cross-axis space from the content box — measured live in Court's level selector
    *  (2026-08-21): a scroll box authored at 28.6vh (border-box 197.6px) had `clientHeight` 183
@@ -93,6 +113,7 @@ export const UIScrollView = trait({
 });
 
 export type UIScrollAxis = 'x' | 'y' | 'both';
+export type UIScrollWheel = 'native' | 'entry';
 export type UIScrollSnap = 'none' | 'start' | 'center' | 'end';
 export type UIScrollSnapStop = 'normal' | 'always';
 export type UIScrollOverscroll = 'auto' | 'contain' | 'none';

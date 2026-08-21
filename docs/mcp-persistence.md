@@ -14,9 +14,13 @@ asking. One predictable behaviour is worth more than the convenience of the othe
 is now a **read**; passing `mode` returns a 400 rather than being silently ignored, because a caller
 who believes it re-enabled auto-save would lose work when nothing saved.
 
-**The per-call `save?: boolean` param is IGNORED.** It survives on every mutating tool's schema so
-existing callers don't break. It was documented for two years as "reserved… NOT YET HONORED", which
-is worse than either honouring or removing it; treat it as removed.
+**The per-call `save?: boolean` param is GONE** (2026-08-22). It survived on 13 mutating tools'
+schemas reading "IGNORED… Do not pass it", reserved for a phase that was never built — the mode knob
+it waited for was deleted instead. Keeping it was justified as not breaking existing callers, which
+does not apply on an agent surface: there are no legacy callers, only a model reading the schema
+fresh each session. And with `.strict()` armed, removing it is strictly BETTER than keeping it — a
+passed `save` is now a refusal naming the tool's real parameters instead of being silently accepted
+and ignored.
 
 ## The contract
 

@@ -1028,7 +1028,7 @@ export function invalidateMaterial(matPath: string) {
   // measurement on `games/3d-test`: a texture re-import left the rotating cube drawing a
   // DISPOSED material for 4 rendered frames. `disposeMaterial` also releases the material's
   // shared textures, so disposing here freed those out from under the same live mesh.
-  if (mat && mat !== MATERIAL_FAILED) retiredMaterials.add(mat);
+  if (mat && mat !== MATERIAL_FAILED) { retiredMaterials.add(mat); retiredMaterialPaths.set(mat, matPath); }
   materialCache.delete(matPath);
   materialLoadPromises.delete(matPath);
 }
@@ -1039,12 +1039,42 @@ export function invalidateMaterial(matPath: string) {
  *  shape as the retired-env sweep, and for the same reason there is no refcount to use:
  *  `materialOwners` is a per-scene owner SET, and the binding lives in `scene3DSync`.
  *
- *  ⚠️ A base whose only remaining holders are DERIVED CLONES (tint / MaterialInstance /
- *  light-mask variants all hold `base.clone()`, which shares the base's texture references) is
- *  still freed — those caches are invisible to a mesh-based sweep. That is unchanged from the
- *  pre-#317 behaviour, where the base was freed IMMEDIATELY, so this is not a regression; it is
- *  the remaining half of the problem, tracked separately. */
+ *  A base whose only remaining holders are DERIVED CLONES (tint / MaterialInstance / light-mask
+ *  variants all hold `base.clone()`, which shares the base's texture references) is kept alive
+ *  too: each clone carries a `__derivedBase` stamp and the sweep walks that chain from every
+ *  bound material, so the base counts as bound (#318, `rendering/derivedMaterials.ts`). Before
+ *  that, a mesh-based sweep could not see those caches at all and freed the base — releasing
+ *  textures the clones were still sampling. */
 const retiredMaterials = new Set<THREE.Material>();
+
+/** Retired base → the `.mat.json` path it was evicted FROM, so a holder that only has the dead
+ *  instance can find its successor (#318).
+ *
+ *  WHY A POINTER AND NOT AN EVENT: a light-mask variant is bound to a mesh and recovers its base
+ *  from `userData`, i.e. from the retired INSTANCE — there is no path from there back to the
+ *  material ref, so an "your base was invalidated" announcement leaves the holder re-deriving
+ *  from the same dead pointer. `syncMaterial` cannot help either: it deliberately skips its
+ *  per-frame re-bind for tinted / instanced / masked entities, so those meshes are never handed
+ *  the fresh instance. This table is what closes that loop.
+ *
+ *  Entries die with the retiree — {@link disposeRetiredMaterial} and
+ *  {@link disposeAllCachedResources} both clear it, so it never pins a material. */
+const retiredMaterialPaths = new Map<THREE.Material, string>();
+
+/** The instance that REPLACED a retired material, or `undefined`.
+ *
+ *  `undefined` covers three different states on purpose, and every caller wants the same thing
+ *  from all three — keep using what you have: `mat` was never retired; it was retired and the
+ *  async refetch has not landed yet; or the refetch FAILED (`MATERIAL_FAILED`) and nothing will
+ *  ever replace it. Falling back to the retiree is correct in each — the sweep keeps it alive
+ *  precisely because something still binds it. */
+export function refreshedMaterial(mat: THREE.Material): THREE.Material | undefined {
+  const path = retiredMaterialPaths.get(mat);
+  if (path === undefined) return undefined;
+  const next = materialCache.get(path);
+  if (!next || next === MATERIAL_FAILED || next === mat) return undefined;
+  return next as THREE.Material;
+}
 
 /** The retired-material set, for `scene3DSync`'s sweep. Empty in the common case — callers
  *  check `.size` before doing any per-surface work. */
@@ -1057,6 +1087,7 @@ export function retiredMaterials3D(): ReadonlySet<THREE.Material> {
  *  material's shared textures. Never call `disposeMaterial` on a retiree directly. */
 export function disposeRetiredMaterial(mat: THREE.Material): void {
   if (!retiredMaterials.delete(mat)) return; // not retired (or already freed)
+  retiredMaterialPaths.delete(mat);
   disposeMaterial(mat);
 }
 
@@ -1218,7 +1249,10 @@ function fetchMaterial(matPath: string): Promise<void> {
       // binding it right now, so disposing here would be #317 again. (Twin of the same defect in
       // `fetchEnvironment`, fixed under #315.)
       const prevMat = materialCache.get(matPath);
-      if (prevMat && prevMat !== MATERIAL_FAILED && prevMat !== mat) retiredMaterials.add(prevMat);
+      if (prevMat && prevMat !== MATERIAL_FAILED && prevMat !== mat) {
+        retiredMaterials.add(prevMat);
+        retiredMaterialPaths.set(prevMat, matPath);
+      }
       materialCache.set(matPath, mat);
       // Wake the render loop so syncMaterial re-binds this freshly-built instance.
       // Critical for a LIVE material edit: invalidateMaterial() drops the old
@@ -1243,7 +1277,25 @@ function fetchMaterial(matPath: string): Promise<void> {
 }
 
 /** Dispose all cached GPU resources (geometries, materials, textures).
- *  Call before loading a new scene to free VRAM. */
+ *  Call before loading a new scene to free VRAM.
+ *
+ *  ⚠️ **IT DOES NOT KNOW ABOUT MATERIAL CLONES, AND IT CANNOT.** Tint, MaterialInstance,
+ *  light-mask, video and prewarm clones all hold this cache's materials as their base and share
+ *  their texture references (#318, `rendering/derivedMaterials.ts`), and this function releases
+ *  every one of those textures unconditionally. It cannot drain them itself: those caches live in
+ *  `rendering/` (L2) and this module is `loaders/` (L3), so reaching them would invert the layer
+ *  contract.
+ *
+ *  Today that is harmless because **nothing in production calls this** — `releaseAllForScene` is
+ *  the release entry point app/editor code uses (see CLAUDE.md § Resource Management), and the
+ *  clone caches are drained on their own `onWorldSwap` handlers. It is only reachable from tests,
+ *  which is why `materialCloneInvalidation.test.ts` pairs it with `resetDerivedMaterials()` +
+ *  `resetMaterialInstanceClones()` by hand.
+ *
+ *  So: **a future caller must tear the rendering-side caches down in the same breath** — the
+ *  "unload unused assets" action anticipated by the `releaseAllForScene` INVARIANT note further
+ *  down this file is exactly the caller that would otherwise free textures out from under a live
+ *  clone. */
 export function disposeAllCachedResources() {
   cacheGeneration++; // invalidate in-flight async material fetches
 
@@ -1291,6 +1343,7 @@ export function disposeAllCachedResources() {
     if (!disposedMat.has(mat.uuid)) { disposeMaterial(mat, disposedTex); disposedMat.add(mat.uuid); }
   }
   retiredMaterials.clear();
+  retiredMaterialPaths.clear();
 
   // Dispose any cached HDR environments and clear env owners — they're tied
   // to the same cacheGeneration / scene lifetime as everything else here.

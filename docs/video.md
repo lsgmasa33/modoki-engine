@@ -330,6 +330,11 @@ per-entity clones. Two consequences worth knowing:
 - If the slot **shape** changes under a live binding (single ⇄ material array) the binding is dropped
   and re-derived, never re-asserted — writing into a slot that no longer exists would clobber a
   freshly-assigned array, or strand a binding nothing could restore.
+- The clone is stamped `markDerived` (#318). Only `.map` is replaced, so every other slot the base
+  carries — normal, roughness, emissive — is still a **shared** texture reference; without the stamp
+  a `.mat.json` re-import lets `sweepRetiredMaterials` free the base (no *mesh* binds it any more —
+  the clone does) and release textures this clone is drawing with. Mechanism:
+  `docs/textures.md` § "The CLONES are the other half".
 
 The 2D twin is unaffected: PixiJS has no such observer, and it swaps `sprite.texture` rather than a
 material property.

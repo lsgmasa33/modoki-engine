@@ -8,10 +8,10 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { SAVE_PARAM } from '../shapes.js';
+import { flatEntityAlias, foldEntityRef } from '../shapes.js';
 
 export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
-  const { getJson, postJson, editorAction } = ctx;
+  const { getJson, postJson, editorAction, fail } = ctx;
 
   // ── get_editor_state — "see everything a human sees" ──
   tool(
@@ -291,7 +291,6 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       shape: z.string().optional().describe('For kind=2d. One of: circle, square, triangle (default square). An unknown name is REFUSED. For an image sprite, create the entity then set Renderable2D.sprite to a texture GUID.'),
       preset: z.enum(['view', 'text', 'image', 'button', 'input', 'slider']).optional().describe('For kind=ui.'),
       light: z.enum(['ambient', 'directional', 'point', 'spot']).optional().describe('For kind=light.'),
-      save: SAVE_PARAM,
     },
     async ({ kind, parentId, parentGuid, mesh, shape, preset, light }) => {
       // Build the discriminated CreateEntitySpec the renderer op expects.
@@ -313,8 +312,16 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Duplicate an entity and its subtree (undoable, like Cmd+D). Address it by `guid` (PREFER — ' +
       'stable) or `id`. Returns {id, guid} of the new copy — carry the guid. LIVE-world only: NOT ' +
       'saved to disk (run modoki_save_all to persist).',
-    { id: z.number().optional().describe('Runtime id — reassigned on hot-reload. Prefer guid.'), guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.'), save: SAVE_PARAM },
-    async ({ id, guid }) => editorAction('duplicate-entity', { id, guid }),
+    {
+      id: z.number().optional().describe('Runtime id — reassigned on hot-reload. Prefer guid.'),
+      guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.'),
+      entity: flatEntityAlias,
+    },
+    async ({ id, guid, entity }) => {
+      const ref = foldEntityRef({ id, guid }, entity);
+      if ('conflict' in ref) return fail({ code: 'AMBIGUOUS', what: 'duplicate an entity', why: ref.conflict, expected: 'either `guid`/`id`, or `entity:{guid|name|id}` — not both' });
+      return editorAction('duplicate-entity', ref);
+    },
   );
   tool(
     'modoki_delete_entities',
@@ -326,7 +333,6 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       id: z.number().optional().describe('Singular form of `ids`, for deleting one entity.'),
       guids: z.array(z.string()).optional().describe('Stable entity guids (preferred).'),
       guid: z.string().optional().describe('Singular form of `guids` — the preferred way to delete ONE entity.'),
-      save: SAVE_PARAM,
     },
     async ({ ids, id, guids, guid }) => editorAction('delete-entities', { ids, id, guids, guid }),
   );
@@ -340,8 +346,10 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       guid: z.string().optional().describe('Stable guid of the entity to move (preferred). Wins over id.'),
       parentId: z.number().optional().describe('New parent runtime id (0 or omitted = root). Prefer parentGuid.'),
       parentGuid: z.string().optional().describe('New parent guid (preferred). Wins over parentId.'),
-      sortOrder: z.number().optional(),
-      save: SAVE_PARAM,
+      sortOrder: z.number().optional().describe(
+        'Index among the NEW parent\'s children, 0-based — where the entity lands in Hierarchy '
+        + 'order. Omit to append LAST. This is sibling order only; it has no effect on '
+        + 'rendering or transform.'),
     },
     async ({ id, guid, parentId, parentGuid, sortOrder }) => editorAction('reparent-entity', { id, guid, parentId, parentGuid, sortOrder }),
   );
@@ -385,7 +393,6 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       entityId: z.number().optional().describe('create/detach/overrides/apply/revert: the entity id. Prefer entityGuid.'),
       entityGuid: z.string().optional().describe('create/detach/overrides/apply/revert: the entity guid (preferred; wins over entityId).'),
       keys: z.array(z.string()).optional().describe("apply/revert: the override keys to act on — exact strings from a prior `overrides` call's `keys.all`. ALL-or-nothing: one unrecognized key refuses the whole call rather than quietly acting on the rest. OMIT to act on ALL current overrides; an explicit empty array is REFUSED, because a filter that matched nothing means 'act on nothing' and must not fall through to 'act on everything'."),
-      save: SAVE_PARAM,
     },
     // `prefabAction`, NOT `action`: /api/editor-action spends `action` on the op name and strips it
     // before relaying, so a param called `action` cannot reach the op. The MCP-facing parameter stays
@@ -456,7 +463,15 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Frame an entity in the SceneView orbit camera (the F-key / "Focus" action). Address it by ' +
       '`guid` (PREFER — stable) or `id`. Fails if the entity does not resolve, or if no SceneView ' +
       'is mounted to frame it in (so a "framed it" report always means the camera moved).',
-    { id: z.number().optional().describe('Runtime id. Prefer guid.'), guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.') },
-    async ({ id, guid }) => editorAction('focus-entity', { id, guid }),
+    {
+      id: z.number().optional().describe('Runtime id. Prefer guid.'),
+      guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.'),
+      entity: flatEntityAlias,
+    },
+    async ({ id, guid, entity }) => {
+      const ref = foldEntityRef({ id, guid }, entity);
+      if ('conflict' in ref) return fail({ code: 'AMBIGUOUS', what: 'frame an entity in the SceneView', why: ref.conflict, expected: 'either `guid`/`id`, or `entity:{guid|name|id}` — not both' });
+      return editorAction('focus-entity', ref);
+    },
   );
 }

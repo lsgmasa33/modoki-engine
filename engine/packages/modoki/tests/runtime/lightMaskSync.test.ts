@@ -41,6 +41,9 @@ async function setup() {
     return m;
   };
   const renderer = stubRenderer();
+  /** retired base → its successor, the answer `refreshedMaterial` gives (#318). Empty by
+   *  default: nothing here is retired, so every masked target falls back to the base it had. */
+  const successors = new Map<THREE.Material, THREE.Material>();
 
   vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms, deactivatedEntities, transformPropagationSystem: {},
@@ -50,6 +53,9 @@ async function setup() {
     resolveMeshLodInfo: vi.fn(() => null),
     resolveMaterialForMesh: vi.fn((ref: string) => materialFor(ref)),
     resolveMaterial: vi.fn((ref: string) => materialFor(ref)),
+    // #318 — `applyLightMask` asks this on every masked target so a variant bound to a RETIRED
+    // base can find the re-imported one. `successors` is empty unless a test stages a re-import.
+    refreshedMaterial: vi.fn((m: THREE.Material) => successors.get(m)),
     getCachedEnvironment: vi.fn(),
     acquireEnvironment: vi.fn(),
   }));
@@ -66,7 +72,7 @@ async function setup() {
   variants.resetLightMaskVariants();
 
   const scene = new THREE.Scene();
-  return { world: createWorld(), traits, Light, sync, variants, scene, sharedMaterial, renderer, materialFor };
+  return { world: createWorld(), traits, Light, sync, variants, scene, sharedMaterial, renderer, materialFor, successors };
 }
 
 /** One frame: lights then renderables, the order Scene3D uses. */
@@ -269,5 +275,71 @@ describe('light-set changes invalidate', () => {
 
     expect(renderer.calls[1]).toHaveLength(2);
     expect((state.ecsObjects.get(e.id()) as THREE.Mesh).material).toBeDefined();
+  });
+});
+
+describe('a re-imported base (#318)', () => {
+  it('re-derives the variant from the successor instead of the retired instance', async () => {
+    // THE DEFECT: `syncMaterial` skips its per-frame re-bind for a masked entity (so it does not
+    // fight the variant), which means nothing ever hands that mesh the re-imported material.
+    // `applyLightMask` then recovers the base from the bound variant's `userData` — the RETIRED
+    // instance — and re-derives under the unchanged `${uuid}|${sel}` key. Left alone the mesh
+    // shows the pre-reimport bytes for the rest of the session.
+    const { world, traits, Light, sync, variants, scene, materialFor, successors } = await setup();
+    const { Transform, Renderable3D } = traits;
+    world.spawn(Transform(), Light({ lightType: 'point', renderingLayerMask: 0b01 }));
+    world.spawn(Transform(), Light({ lightType: 'point', renderingLayerMask: 0b10 }));
+    const e = world.spawn(Transform(), Renderable3D({ mesh: 'm', material: 'mat', isVisible: true, renderingLayerMask: 0b01 }));
+    const state = sync.createRenderState();
+    // ONE lights map for every frame. A fresh one rebuilds the THREE.Lights, and the variant key
+    // is the light IDENTITIES (see `lightId`) — so a per-frame map changes the key on its own and
+    // would make this test pass for the wrong reason.
+    const ecsLights = new Map<number, THREE.Light>();
+
+    frame(sync, world, scene, ecsLights, state);
+    const oldBase = materialFor('mat');
+    const meshOf = () => state.ecsObjects.get(e.id()) as THREE.Mesh;
+    const staleVariant = meshOf().material as THREE.Material;
+    expect(staleVariant).not.toBe(oldBase);
+    expect(variants.getLightMaskStats().variants).toBe(1);
+
+    // Frames while the refetch is still in flight: no successor yet, so the mesh keeps the
+    // variant it has. Rendering the old bytes beats rendering nothing, and the retired base is
+    // held alive by the sweep meanwhile.
+    frame(sync, world, scene, ecsLights, state);
+    expect(meshOf().material).toBe(staleVariant);
+
+    // The refetch lands.
+    const newBase = new THREE.MeshStandardMaterial();
+    successors.set(oldBase, newBase);
+    frame(sync, world, scene, ecsLights, state);
+
+    const fresh = meshOf().material as THREE.Material;
+    expect(fresh, 'the mesh must move off the variant of the dead base').not.toBe(staleVariant);
+    expect(variants.baseOf(fresh), 'and onto one derived from the successor').toBe(newBase);
+    // The stale entry is evicted, not merely shadowed — one variant, not two.
+    expect(variants.getLightMaskStats().variants).toBe(1);
+  });
+
+  it('settles — it does not re-derive a new variant every frame once refreshed', async () => {
+    // `refreshedMaterial` keeps answering for as long as the old base is retired, so the guard
+    // that matters is that `retireVariantsOf` is idempotent and the second frame is a no-op.
+    const { world, traits, Light, sync, variants, scene, materialFor, successors } = await setup();
+    const { Transform, Renderable3D } = traits;
+    world.spawn(Transform(), Light({ lightType: 'point', renderingLayerMask: 0b01 }));
+    world.spawn(Transform(), Light({ lightType: 'point', renderingLayerMask: 0b10 }));
+    const e = world.spawn(Transform(), Renderable3D({ mesh: 'm', material: 'mat', isVisible: true, renderingLayerMask: 0b01 }));
+    const state = sync.createRenderState();
+    const ecsLights = new Map<number, THREE.Light>();
+    frame(sync, world, scene, ecsLights, state);
+
+    successors.set(materialFor('mat'), new THREE.MeshStandardMaterial());
+    frame(sync, world, scene, ecsLights, state);
+    const settled = (state.ecsObjects.get(e.id()) as THREE.Mesh).material;
+    frame(sync, world, scene, ecsLights, state);
+    frame(sync, world, scene, ecsLights, state);
+
+    expect((state.ecsObjects.get(e.id()) as THREE.Mesh).material).toBe(settled);
+    expect(variants.getLightMaskStats().variants).toBe(1);
   });
 });

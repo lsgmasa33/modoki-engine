@@ -154,6 +154,239 @@ describe('the real registered surface', () => {
       'these are documented now — delete them from UNDOCUMENTED_PARAMS').toEqual([]);
   });
 
+  it("an unknown key is refused with a message NAMING the tool's real parameters", () => {
+    // §1 is not just "reject the key" — it is "reject it and say what the parameters ARE", because
+    // a refusal that lists the options is what turns a dead end into the caller's next move (§5).
+    // `registerAll.ts` builds that message; nothing asserted it until now, because the harness used
+    // to re-derive its own message-less `.strict()` and every test saw zod's default instead.
+    //
+    // Asserted on the schema the tool was REGISTERED with — the one the MCP transport validates
+    // against — so this cannot pass on a schema only the test builds.
+    for (const name of s.names) {
+      const schema = s.schemaFor(name) as z.ZodType | undefined;
+      expect(schema, `${name} was registered with no inputSchema`).toBeDefined();
+      const r = (schema as z.ZodType).safeParse({ definitely__not__a__param: 1 });
+      expect(r.success, `${name} accepted an unknown key`).toBe(false);
+      const message = r.success ? '' : r.error.issues.map((i) => i.message).join(' ');
+      expect(message, `${name}'s refusal must name the tool`).toContain(name);
+      const params = Object.keys(getTool(name)!.shape);
+      // A no-parameter tool says so explicitly rather than trailing an empty list.
+      if (!params.length) {
+        expect(message, `${name} takes no params and must say so`).toContain('(no parameters)');
+      } else {
+        for (const p of params) {
+          expect(message, `${name}'s refusal must offer '${p}'`).toContain(p);
+        }
+      }
+    }
+  });
+
+  it('…and THAT check can fail (mutation-tested against the message-less form)', () => {
+    // The exact schema the harness used to build. A guard never seen to fail is not known to work.
+    const bare = z.object({ guid: z.string().optional() }).strict();
+    const r = bare.safeParse({ nope: 1 });
+    const message = r.success ? '' : r.error.issues.map((i) => i.message).join(' ');
+    expect(message).not.toContain('modoki_');
+  });
+
+  /** Params whose meaning is inherently PER TOOL, so one shared wording would be wrong rather than
+   *  tidy. Each entry is a claim that the name is a category, not a contract.
+   *
+   *  The bar is real: `path` on `validate_scene` is a scene, on `reimport_asset` an asset or a
+   *  folder, on `anim_add_key` a name-path inside an Animator — the same word for three different
+   *  addressing schemes, which §2 tolerates only because the TYPE of thing is stated every time.
+   *  A param that means one thing everywhere does NOT belong here; it belongs in `shapes.ts`. */
+  const PER_TOOL_MEANING = new Set([
+    'path', 'action', 'type', 'name', 'kind', 'id', 'ids', 'key', 'keys', 'limit', 'all',
+    'from', 'to', 'value', 'target', 'mode', 'force', 'clear', 'since', 'guid', 'guids',
+    'width', 'height', 'quality', 'selector', 'button', 'steps', 'entity', 'panel',
+    'timeoutMs', 'parentId', 'parentGuid', 'source', 'level', 'platform', 'provider', 'fields',
+  ]);
+
+  it('a param used by 3+ tools means ONE thing, or is declared per-tool', () => {
+    // §2 ("a field or parameter name means the same thing in every tool that uses it") had a
+    // testable half for RESPONSE field names and none at all for parameter descriptions — and the
+    // audit measured the result: `precision` said the same thing four ways across seven tools, and
+    // `allowOccluded` had five wordings despite `shapes.ts` exporting it as ONE constant expressly
+    // so that could not happen. Nothing was individually wrong; the cost is that an agent must
+    // re-read a param per tool to check it still means what it meant.
+    //
+    // Scoped to 3+ tools deliberately. Two tools sharing a word is a coincidence; three is a
+    // convention, and a convention that drifts is the thing worth catching.
+    const byParam = new Map<string, Map<string, string[]>>();
+    for (const name of s.names) {
+      for (const [param, field] of Object.entries(getTool(name)!.shape)) {
+        const desc = (field as { description?: string }).description ?? '';
+        const forParam = byParam.get(param) ?? new Map<string, string[]>();
+        forParam.set(desc, [...(forParam.get(desc) ?? []), name]);
+        byParam.set(param, forParam);
+      }
+    }
+    // The rule is CONTAINMENT, not identity: the shortest wording is the shared base, and every
+    // longer variant must contain it verbatim. That permits the thing good descriptions actually
+    // do — state the shared rule, then add the tool-specific nuance after it (`modifiers` on
+    // `modoki_drag` really does need to say the key is held for the whole gesture) — while still
+    // failing when two tools state the SAME rule two ways, which is the drift §2 is about.
+    // Mechanically it also forces the base into `shapes.ts`, since that is the only way to repeat
+    // a long string verbatim without copying it.
+    const drifted: string[] = [];
+    for (const [param, byDesc] of byParam) {
+      if (PER_TOOL_MEANING.has(param)) continue;
+      const users = [...byDesc.values()].flat();
+      if (users.length < 3 || byDesc.size === 1) continue;
+      const descs = [...byDesc.keys()];
+      const base = descs.reduce((a, b) => (a.length <= b.length ? a : b));
+      const strayed = descs.filter((d) => !d.includes(base.replace(/\.$/, '')));
+      if (strayed.length) {
+        drifted.push(`${param}: ${strayed.length} of ${descs.length} wordings do not extend the shared base across ${users.length} tools (${users.join(', ')})`);
+      }
+    }
+    expect(
+      drifted,
+      'these params state the same rule different ways. Put the shared wording in shapes.ts, and '
+      + 'have a tool that needs more CONCATENATE onto it rather than replace it — or, if the '
+      + 'meanings really differ, add the name to PER_TOOL_MEANING with that judgement.',
+    ).toEqual([]);
+  });
+
+  it('PER_TOOL_MEANING names no param that has left the surface', () => {
+    // Same rule as every other ledger here: a stale entry rots into a blanket exemption, and the
+    // next genuine drift on that name lands on it unnoticed.
+    const live = new Set(s.names.flatMap((n) => Object.keys(getTool(n)!.shape)));
+    expect([...PER_TOOL_MEANING].filter((p) => !live.has(p)).sort(),
+      'delete these — no tool takes them any more').toEqual([]);
+  });
+
+  it('every NON-ENUM param carries its own .describe()', () => {
+    // The stricter half of §11. The check above accepts a param as documented when its NAME appears
+    // anywhere in the tool description, and that word-boundary heuristic produces real false passes:
+    // `modoki_reparent_entity.sortOrder` was "documented" by the phrase "optionally setting
+    // sortOrder" and said nothing about basis, unit, or what omitting it does.
+    //
+    // Enums are exempt because they genuinely self-document — the allowed values reach the client
+    // in the advertised JSON Schema, so `mode: z.enum(['3d','ui'])` tells an agent everything the
+    // type can. Nothing else does.
+    const missing: string[] = [];
+    for (const name of s.names) {
+      for (const [param, field] of Object.entries(getTool(name)!.shape)) {
+        if ((field as { description?: string }).description) continue;
+        let def = (field as { _def?: Record<string, unknown> })._def;
+        while (def && (def.typeName === 'ZodOptional' || def.typeName === 'ZodNullable' || def.typeName === 'ZodDefault')) {
+          def = (def.innerType as { _def?: Record<string, unknown> } | undefined)?._def;
+        }
+        if (def?.typeName === 'ZodEnum' || def?.typeName === 'ZodNativeEnum') continue;
+        missing.push(`${name}.${param}`);
+      }
+    }
+    expect(missing, 'these need their own .describe() — only an enum self-documents').toEqual([]);
+  });
+
+  /** The tools that accept BOTH entity-addressing shapes (owner decision, 2026-08-22).
+   *
+   *  Scoped to the SINGULAR-AIM tools — the ones whose operation is "address one entity". The
+   *  array/filter tools (`get_scene_state`, `get_layout_bounds`, `watch`, `delete_entities`,
+   *  `set_selection`) take SETS, not an aim, so a singular `entity:{…}` would not fit and adding it
+   *  would invent a third shape rather than remove the second. */
+  const DUAL_ADDRESSED = ['modoki_duplicate_entity', 'modoki_focus_entity', 'modoki_play_clip'];
+
+  it('a singular-aim tool accepts the nested `entity` ref as well as the flat one', async () => {
+    // `qa/knowledge.md` records the flat-vs-nested mix-up as a recurring trap: five tools nest and
+    // ten are flat, with a latent rule that holds only loosely. Post-§1 the wrong shape is a loud
+    // refusal rather than a wrong answer, but it costs a round-trip EVERY time — so §0's "an
+    // inconsistency costs a guess" says remove the guess, not document it.
+    for (const name of DUAL_ADDRESSED) {
+      const shape = getTool(name)!.shape as Record<string, unknown>;
+      expect(shape.entity, `${name} must accept a nested entity ref`).toBeDefined();
+      expect(Object.keys(shape), `${name} must keep its flat form too`).toContain('guid');
+    }
+  });
+
+  it('…and REFUSES both at once rather than picking one', async () => {
+    // A caller who sent two addresses does not know which the tool uses, and choosing for them is
+    // the silent-wrong-target class §0 ranks first.
+    const s2 = loadSurface();
+    try {
+      const r = await s2.call('modoki_focus_entity', { guid: 'g-1', entity: { guid: 'g-2' } });
+      expect(r.isError, 'two addresses must be refused').toBe(true);
+      expect(s2.text(r)).toMatch(/both `entity` and the flat/);
+      expect(s2.text(r)).toMatch(/AMBIGUOUS/);
+      // …and nothing was dispatched.
+      expect(s2.requests.some((q) => q.path.startsWith('/api/editor-action')), 'must refuse BEFORE acting').toBe(false);
+    } finally { s2.restore(); }
+  });
+
+  it('the nested `entity` alias is STRICT and carries no `name`', async () => {
+    // Close-out finding, confirmed against the ops. `duplicate-entity`/`focus-entity` resolve
+    // through `requireLiveId({id?, guid?})` and have no name resolver, so advertising `name` here
+    // would be a capability that does not exist — and because a nested `z.object` is NOT strict
+    // just because its parent is, zod would STRIP the key: `entity:{name:'Crate'}` arrives as `{}`,
+    // folds to the empty flat ref, and comes back as "entity ref matched no live entity — it may be
+    // stale". A §0 rank-4 unclear failure pointing at the wrong cause, which is the §1 silent-strip
+    // bug one level down.
+    for (const name of DUAL_ADDRESSED) {
+      const s2 = loadSurface();
+      try {
+        await expect(s2.call(name, { entity: { name: 'Crate' } })).rejects.toThrow(/accepts only: guid, id/);
+        // …and nothing was dispatched on the way to that refusal.
+        expect(s2.requests.some((q) => q.path.startsWith('/api/editor-action'))).toBe(false);
+      } finally { s2.restore(); }
+    }
+  });
+
+  it('the alias folds `id: 0` — the ROOT entity — rather than reading it as "no address"', async () => {
+    // `foldEntityRef` filters the flat side on `!== undefined`, not truthiness. Under a truthiness
+    // test `{id: 0}` reads as absent, so a caller passing BOTH `id:0` and an `entity` would get the
+    // entity silently instead of the conflict refusal — picking a target for them, which is the
+    // class §0 ranks first.
+    const s2 = loadSurface();
+    try {
+      const r = await s2.call('modoki_focus_entity', { id: 0, entity: { guid: 'g-1' } });
+      expect(r.isError, 'id:0 is a real address and must still conflict').toBe(true);
+      expect(s2.text(r)).toMatch(/both `entity` and the flat id/);
+    } finally { s2.restore(); }
+  });
+
+  /** The definition surface's own size, PINNED (owner decision: pin, do not cap).
+   *
+   *  §6 budgets RESPONSES and nothing budgets the definitions, which are what an agent pays for
+   *  before it makes a single call. Measured at the time of writing: ~123 KB of `modoki_*`
+   *  descriptions + param descriptions, ~31k tokens, resident every session.
+   *
+   *  This is deliberately NOT a cap. A description that earns its length should never be blocked —
+   *  §11 is right that it is read far more often than the conventions doc, and the long ones here
+   *  have demonstrably prevented wrong answers. What it does is make growth a DELIBERATE, reviewable
+   *  act: exceed the headroom and the build fails until someone raises the number knowingly, the
+   *  same shape as every other ledger in this suite. */
+  //
+  // MEASURED, not estimated. The first version of this pin was 134_000 against an actual 124_262 —
+  // 18% of slack, which would have let ~8 new tools land without ever firing, i.e. exactly the
+  // growth it claims to catch. A pin set above the real number is not a pin. Re-measure when you
+  // raise it: `bytes` below is the number to use.
+  const DEFINITION_BYTES = 124_262;
+  const DEFINITION_HEADROOM = 4_000;
+
+  it(`the tool definitions stay near their recorded size (~${Math.round(DEFINITION_BYTES / 1000)} KB)`, () => {
+    let bytes = 0;
+    for (const name of s.names) {
+      const entry = getTool(name)!;
+      bytes += entry.description.length;
+      for (const [param, field] of Object.entries(entry.shape)) {
+        bytes += param.length + ((field as { description?: string }).description?.length ?? 0);
+      }
+    }
+    const ceiling = DEFINITION_BYTES + DEFINITION_HEADROOM;
+    expect(
+      bytes,
+      `the tool surface is now ${bytes} bytes (~${Math.round(bytes / 4000)}k tokens), past the recorded `
+      + `${DEFINITION_BYTES} + ${DEFINITION_HEADROOM} headroom. This is not a cap — if the growth is `
+      + 'earned, raise DEFINITION_BYTES and say so. It exists so the surface cannot grow a few '
+      + 'hundred bytes per change without anyone deciding to spend it.',
+    ).toBeLessThanOrEqual(ceiling);
+    // A floor too: a refactor that accidentally strips descriptions would otherwise pass silently,
+    // and losing them is the more damaging direction.
+    expect(bytes, 'the surface SHRANK sharply — descriptions lost?').toBeGreaterThan(DEFINITION_BYTES - 8_000);
+  });
+
   it('every tool validates its args against its own real schema', () => {
     // This is what `modoki_batch` relies on: a step is re-parsed against `z.object(shape)`
     // server-side. A shape that is not zod-parseable would make that validation silently

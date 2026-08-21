@@ -69,15 +69,62 @@ export function scrollToEntry(
 export function snapToNearest(viewGuid: string, opts: { behavior?: UIScrollBehavior } = {}): boolean {
   const v = viewOf(viewGuid);
   if (!v) return false;
-  const sv = v.entity.get(v.svMeta.trait) as Record<string, number>;
+  // Not `Record<string, number>`: `axis` is a string, and reading it through a number-typed record
+  // silently compares as one — the compiler catches it, which is how this cast got widened.
+  const sv = v.entity.get(v.svMeta.trait) as Record<string, number | string>;
   const en = v.entity.get(v.enMeta.trait) as Record<string, number>;
-  const strideY = entryStride(sv.viewportHeight, en.visibleY);
-  const strideX = entryStride(sv.viewportWidth, en.visibleX);
-  const y = strideY > 0 ? Math.round(sv.scrollY / strideY) : NO_ENTRY_REQUEST;
-  const x = strideX > 0 ? Math.round(sv.scrollX / strideX) : NO_ENTRY_REQUEST;
+  // ⚠️ **Gated on the view's AXIS, not only on whether a stride could be computed.** This used to
+  // ask both axes whenever both had a usable stride — and an `axis: 'x'` view with more than one
+  // ROW has a perfectly usable Y stride, so it armed a request on an axis that does not scroll.
+  // `0` is a REAL request for entry 0, not "no request", which is how such a request became
+  // unclearable and cancelled every smooth scroll (see `clearScrollRequest`'s banner). Court's
+  // selector escaped it only by coincidence — `countY: 1` makes `visibleY` 1, and `entryStride`
+  // returns 0 below 2 — which is exactly the kind of accident that stops being true later.
+  const wantsX = sv.axis !== 'y';
+  const wantsY = sv.axis !== 'x';
+  const strideY = wantsY ? entryStride(sv.viewportHeight as number, en.visibleY) : 0;
+  const strideX = wantsX ? entryStride(sv.viewportWidth as number, en.visibleX) : 0;
+  const y = strideY > 0 ? Math.round((sv.scrollY as number) / strideY) : NO_ENTRY_REQUEST;
+  const x = strideX > 0 ? Math.round((sv.scrollX as number) / strideX) : NO_ENTRY_REQUEST;
   return scrollToEntry(viewGuid, {
     x: x === NO_ENTRY_REQUEST ? undefined : x,
     y: y === NO_ENTRY_REQUEST ? undefined : y,
+  }, opts);
+}
+
+/**
+ * Move by whole ENTRIES from wherever the view currently sits.
+ *
+ * The same "which entry am I on" arithmetic `snapToNearest` does, plus a delta — which is what a
+ * pager's wheel/keyboard handling wants, and what a caller cannot compute itself: the engine
+ * publishes no resolved entry stride, and `UIEntries.firstX` is the first POOLED entry, which
+ * overscan puts an entry BEFORE the visible one (legitimately -1 at the start of a list).
+ *
+ * Returns false when the view has no usable window yet, rather than requesting entry 0 — a caller
+ * asking to move ONE would otherwise teleport to the top the first time it fires.
+ */
+export function scrollByEntry(
+  viewGuid: string,
+  by: { x?: number; y?: number },
+  opts: { behavior?: UIScrollBehavior } = {},
+): boolean {
+  const v = viewOf(viewGuid);
+  if (!v) return false;
+  const sv = v.entity.get(v.svMeta.trait) as Record<string, number>;
+  const en = v.entity.get(v.enMeta.trait) as Record<string, number>;
+  const strideX = entryStride(sv.viewportWidth, en.visibleX);
+  const strideY = entryStride(sv.viewportHeight, en.visibleY);
+  const wantX = Number.isFinite(by.x) && (by.x as number) !== 0;
+  const wantY = Number.isFinite(by.y) && (by.y as number) !== 0;
+  const canX = wantX && strideX > 0;
+  const canY = wantY && strideY > 0;
+  if (!canX && !canY) return false;
+  return scrollToEntry(viewGuid, {
+    // ⚠️ Only the axis actually being moved is requested. Passing the other as a number would
+    // arm a real request on an axis the view may not scroll — `0` is a request for entry 0, not
+    // "no request" — which is the trap `scrollToEntry`'s own banner records.
+    x: canX ? Math.max(0, Math.round(sv.scrollX / strideX) + (by.x as number)) : undefined,
+    y: canY ? Math.max(0, Math.round(sv.scrollY / strideY) + (by.y as number)) : undefined,
   }, opts);
 }
 

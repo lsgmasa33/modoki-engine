@@ -1100,6 +1100,8 @@ export function registerAllTraits() {
       snapStop: { type: 'enum', options: ['normal', 'always'], tooltip: '\'always\' makes a fling stop at snap points it passes. It CONSTRAINS a fling but does not cap it at one entry — measured on a Galaxy A23, one hard fling advanced 11 entries at \'normal\' and 3 at \'always\'; a slow drag advances exactly 1.' },
       overscroll: { type: 'enum', options: ['auto', 'contain', 'none'], tooltip: 'overscroll-behavior — whether scrolling past the end chains to the parent.' },
       scrollbar: { type: 'enum', options: ['auto', 'hidden'], tooltip: 'Whether the platform\'s classic scrollbar is shown. A classic scrollbar steals cross-axis space from the content box — measured: 15px, which clipped Court\'s level grid. Mobile overlay scrollbars steal nothing, so this only matters on desktop/Electron.' },
+
+      wheel: { type: 'enum', options: ['native', 'entry'], tooltip: 'What a mouse wheel / trackpad gesture does; touch is unaffected. \'entry\' moves exactly ONE entry per gesture — a pager\'s setting. A delta multiplier cannot do this job: under mandatory snap the browser quantises any offset to a whole entry, so the only thing left to control is how many entries one gesture may cross. A trackpad swipe emits a rapid stream whose deltas accumulate, which is how one flick crossed several pages.' },
       scrollBehavior: { type: 'enum', options: ['instant', 'smooth'], tooltip: 'How a scrollTo request moves. \'smooth\' duration is browser-defined and not tunable.' },
       // ⚠️ Engine-written state and the game-written scrollTo request. HIDDEN rather than shown
       // read-only: an author editing scrollY would have it overwritten on the next scroll event,

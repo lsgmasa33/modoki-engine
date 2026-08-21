@@ -1,9 +1,14 @@
-/** Phase 8, device half — T2 across ALL 20 `device_*` tools, table-driven.
+/** Phase 8, device half — T2 across every `device_*` tool, table-driven.
+ *
+ *  ⚠️ Counts are deliberately NOT stated here. This header said "ALL 20" and "all 77" long after the
+ *  surfaces were 43 and 93 — the exact stale-prose failure `docs/mcp-tool-conventions.md` §4 warns
+ *  about, in a file whose whole job is keeping a split total. The tables below derive from the live
+ *  registry, so they are right whatever the count is.
  *
  *  The editor surface got a contract table (`contracts.ts`) and therefore per-tool conformance for
- *  all 77 tools. The device surface had neither: `deviceToolSurface.test.ts` asserts a dozen
+ *  every tool. The device surface had neither: `deviceToolSurface.test.ts` asserts a dozen
  *  specific behaviours (identity banner, lease refusal, unscaled-tap refusal, reply decoding) but
- *  NOTHING per tool — so 14 of the 20 had no test that called them at all, and the one failure mode
+ *  NOTHING per tool — so most had no test that called them at all, and the one failure mode
  *  this whole audit is about (a tool that is dead, or that swallows a failure) was unobservable for
  *  them.
  *

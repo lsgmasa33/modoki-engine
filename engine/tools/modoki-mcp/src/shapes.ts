@@ -9,15 +9,18 @@
 
 import { z } from 'zod';
 
-/** Reserved for the persistence-mode Phase 2/3 per-call override (mcp-persistence-
- *  unification.md) — NOT YET HONORED. Every mutating tool accepts it now so its schema
- *  doesn't need to change again once Phase 2/3 wire it up; every tool's `saved` field in its
- *  result reflects what it ACTUALLY did today, regardless of this param. */
-export const SAVE_PARAM = z.boolean().optional().describe(
-  'IGNORED. Persistence is manual-only: a live edit stays in the live world (undoable) and ' +
-  'reaches disk only via modoki_save_all. Accepted so existing callers do not break; every ' +
-  "tool's `saved` field reflects what actually happened. Do not pass it.",
-);
+/* `SAVE_PARAM` was here. REMOVED 2026-08-22 (owner decision).
+ *
+ *  It sat on 13 mutating tools reading "IGNORED… Do not pass it", reserved for a
+ *  `mcp-persistence-unification.md` Phase 2/3 that no longer exists — the mode knob it was waiting
+ *  for was DELETED instead, and `docs/mcp-persistence.md` has said "treat it as removed" since.
+ *  Two sources, two statuses, and an advertised parameter that did nothing.
+ *
+ *  The kept-for-compatibility argument does not apply on an agent surface: there are no legacy
+ *  callers, only a model reading the schema fresh each session. And with `.strict()` armed,
+ *  REMOVING it is strictly better than keeping it — a passed `save` is now a refusal naming the
+ *  tool's real parameters (§1/§5) instead of being silently accepted and ignored. Persistence is
+ *  manual-only: `modoki_save_all` is the one route to disk. */
 
 // Chromium input modifiers, shared by the trusted-input tools below.
 export const modifierEnum = z.enum(['shift', 'control', 'alt', 'meta', 'cmd', 'command']);
@@ -72,11 +75,109 @@ export const entitySpec = z.object({
 
 /** The one description of the occlusion escape hatch, shared by every aimed input tool — a rule
  *  worded differently per tool is a rule an agent reads as two rules (mcp-tool-conventions.md §2). */
-export const allowOccludedParam = z.boolean().optional().describe(
+export const ALLOW_OCCLUDED_BASE =
   'Aim there even though something covers the target (default false = REFUSED, naming the cover). '
   + 'A covered press lands on the covering element, so reporting ok would be a false success — the '
   + 'worst outcome on this surface. Applies to `entity` and `selector` aims; raw {x,y} is never '
-  + 'refused, because a coordinate is exactly what you asked for.',
+  + 'refused, because a coordinate is exactly what you asked for';
+export const allowOccludedParam = z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`);
+
+/** The shared half of every `modifiers` description. A tool that needs to say more CONCATENATES —
+ *  `${MODIFIERS_BASE}, e.g. …` — rather than replacing, so the rule reads identically everywhere
+ *  and the tool-specific nuance sits after it. Enforced: `mcpRegistry.test.ts` requires every
+ *  variant of a 3+-tool param to CONTAIN the shortest one. */
+export const MODIFIERS_BASE = 'Held modifier keys';
+
+/** The FLAT half of entity addressing, shared by the tools that take `guid`/`id` at top level.
+ *
+ *  Two shapes coexist on this surface: aimed-input tools nest (`entity:{guid|name|id}`, because
+ *  they also accept a selector or a raw point and the aim modes must stay distinguishable), while
+ *  the editor-op tools take a flat `guid`. There IS a latent rule there, but it was written nowhere
+ *  and it does not hold cleanly — `set_transform` nests without being an input tool, `play_clip` is
+ *  flat despite declaring `aim:'entity'` — so `qa/knowledge.md` records the mix-up as a recurring
+ *  trap. Post-§1 it costs a refusal and a retry rather than a wrong answer, but it costs it EVERY
+ *  time.
+ *
+ *  Owner decision (2026-08-22): ACCEPT BOTH everywhere rather than document the rule or unify on
+ *  one shape. It is purely additive, breaks no existing call, and REMOVES the failure mode instead
+ *  of explaining it — which is what §0 says an inconsistency deserves, since the cost of an
+ *  inconsistency is the guess it forces.
+ *
+ *  `entity` is resolved server-side to the same `{guid|id}` the flat params carry, so there is one
+ *  meaning and two spellings — not two behaviours. */
+export const flatEntityAlias = z.object({
+  guid: z.string().optional(),
+  id: z.number().optional(),
+}).strict('an entity ref here accepts only: guid, id')
+  .optional().describe(
+    'Alternative to this tool\'s flat `guid`/`id`: the same nested ref shape the aimed-input tools '
+    + 'take, accepted here so one addressing form works across the surface. Prefer guid — runtime '
+    + 'ids are reassigned on every scene reload. NO `name` HERE, unlike the aimed-input tools: the '
+    + 'ops behind these tools address by guid/id and have no name resolver, so accepting one would '
+    + 'advertise a capability that does not exist (it reaches the op as an empty ref and comes back '
+    + 'as a misleading "this ref is stale"). Look the guid up with modoki_get_scene_state {name} '
+    + 'first. Passing both this and a flat `guid`/`id` is refused rather than silently preferring '
+    + 'one.',
+  );
+
+/** Fold a nested `entity` ref into the flat `{guid, id}` a tool's handler already passes on.
+ *
+ *  Refuses BOTH-at-once rather than picking: a caller who sent two addresses does not know which
+ *  one this tool uses, and choosing for them is exactly the silent-wrong-target class §0 ranks
+ *  first. Returns the flat pair, or a message for the caller to refuse with.
+ *
+ *  ⚠️ `flatEntityAlias` is `.strict()` and carries no `name` ON PURPOSE — both halves matter.
+ *  Without `name` but not strict, zod STRIPS the key (a nested `z.object` is not strict just
+ *  because its parent is), so `entity:{name:'Crate'}` would arrive here as `{}`, fold to the empty
+ *  flat ref, and surface as "entity ref matched no live entity — it may be stale": a §0 rank-4
+ *  unclear failure pointing at the wrong cause. That is the §1 silent-key-strip bug one level down,
+ *  and it is why `mutateOpSchema`'s entity ref is strict too. */
+export function foldEntityRef(
+  flat: { guid?: string; id?: number },
+  entity: { guid?: string; id?: number } | undefined,
+): { guid?: string; id?: number } | { conflict: string } {
+  if (!entity || Object.keys(entity).length === 0) return flat;
+  // `!== undefined`, not truthiness: `id: 0` is the ROOT entity, and a truthiness test would read
+  // it as "no address given" and silently fall through to the other branch.
+  const flatKeys = Object.entries(flat).filter(([, v]) => v !== undefined).map(([k]) => k);
+  if (flatKeys.length) {
+    return { conflict: `both \`entity\` and the flat ${flatKeys.join('/')} were given — they are two ways to say the same thing, and sending both leaves it ambiguous which target you meant. Pass exactly one.` };
+  }
+  return entity;
+}
+
+
+/** `precision`, in ONE wording (§2).
+ *
+ *  It said the same thing four ways across seven tools — the long form, a terse "(read)" form, a
+ *  per-tool field list, and a scene-query variant. Nothing was wrong with any of them, which is the
+ *  point: a param an agent has to re-read per tool to check it still means what it meant is the
+ *  cost §2 is about, and every one of these drifted by being restated rather than shared.
+ *
+ *  `fields` keeps the one genuinely per-tool part — WHICH floats get rounded — without forking the
+ *  rule that governs them. */
+export const PRECISION_BASE =
+  'Significant digits for the returned floats. Default 9 — trims float64 mantissa noise '
+  + '(247.13061935179246 -> 247.130619), saving ~17-29% of the response with a max error of '
+  + '3.5e-7. Verify a value with a TOLERANCE, never string/=== equality. Pass 0 for exact float64';
+export const precisionParam = (fields?: string) => z.number().int().nonnegative().optional()
+  .describe(`${PRECISION_BASE}.${fields ? ` Rounded fields: ${fields}.` : ''}`);
+
+/** The "proceed even though the editor has unsaved work" escape hatch, in ONE wording.
+ *
+ *  Shared by the three tools that build an artifact FROM THE FILES while the live world holds
+ *  edits the files do not have (§8's REQUIRES_SAVE rule). They said it three ways — "Build even
+ *  with…", "Scaffold even with…", "Publish even with…" — around one identical, and load-bearing,
+ *  consequence: the thing you ship does not contain your work.
+ *
+ *  Deliberately NOT shared with `modoki_load_scene`'s `force`, which DESTROYS the unsaved work
+ *  rather than ignoring it, nor with `modoki_render_sequence`'s, which is a different word for a
+ *  different idea entirely (render despite a degenerate condition). §2 says two meanings want two
+ *  names; those two are recorded in the audit plan rather than renamed here. */
+export const unsavedForceParam = (verb: string) => z.boolean().optional().describe(
+  `${verb} even though the editor has unsaved live-world changes. The artifact is built from the `
+  + 'FILES, so it will NOT contain them — this proceeds anyway rather than refusing. Prefer '
+  + 'modoki_save_all first; use this only when you mean to ship the last saved state.',
 );
 
 export const pointSpec = z.object({

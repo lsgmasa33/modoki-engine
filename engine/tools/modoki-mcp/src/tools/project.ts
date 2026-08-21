@@ -8,6 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
+import { unsavedForceParam } from '../shapes.js';
 
 export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
   const { fail, getJson, postJson, unsavedChangesWarning, consumeBuildStream } = ctx;
@@ -114,7 +115,7 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
     {
       platform: z.enum(['web', 'ios', 'android', 'playable'])
         .describe("Build target. 'web' → dist/; 'ios'/'android' → the native app (auto-scaffolds the platform on first build); 'playable' → a single self-contained MRAID ad HTML."),
-      force: z.boolean().optional().describe('Build even with unsaved editor changes (the artifact will NOT contain them).'),
+      force: unsavedForceParam('Build'),
     },
     async ({ platform, force }) => {
       // A build reads the scene FILE. The live-world tools (create_entity / duplicate / prefab)
@@ -145,7 +146,7 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
       'Target…". Consumes the stream to completion.',
     {
       platform: z.enum(['ios', 'android']).describe('Which native platform to scaffold into the project (creates games/<id>/ios or /android).'),
-      force: z.boolean().optional().describe('Scaffold even with unsaved editor changes (the web build it runs will NOT contain them).'),
+      force: unsavedForceParam('Scaffold'),
     },
     async ({ platform, force }) => {
       // The third build-family tool, and the last one without the stale-scene gate: it runs a web
@@ -190,7 +191,7 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
       bundleName: z.string().optional().describe('Must equal (or be omitted, defaulting to) this project\'s own project.config.json ota.bundleName — the server refuses any other value. This route always builds the CURRENTLY OPEN project as a normal web build and publishes it as itself; it does NOT build/publish a Phase 4 sub-game module bundle (that needs build-subgame.mjs + a manual publish, not this tool). To publish a sub-game, open ITS OWN project and call this tool there.'),
       key: z.string().optional().describe('Signing key name under build/ota-keys/<key>.json (default "default").'),
       bucket: z.string().optional().describe('gs://bucket[/prefix] override — only needed when ota.baseUrl is a custom CDN domain that cannot be reverse-derived to its gs:// form.'),
-      force: z.boolean().optional().describe('Publish even with unsaved editor changes (the shipped bundle will NOT contain them).'),
+      force: unsavedForceParam('Publish'),
     },
     async ({ version, mandatory, bundleName, key, bucket, force }) => {
       // Same gate as modoki_build, and it belongs here MORE: a build produces a local artifact you

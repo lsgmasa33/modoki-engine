@@ -1,6 +1,6 @@
 /** Phase 9 — the generated tool catalog in `docs/debug-tools-mcp.md` must match `contracts.ts`.
  *
- *  WHY A TEST AND NOT A CONVENTION. The catalog is 77 rows of per-tool fact — endpoint, mutating,
+ *  WHY A TEST AND NOT A CONVENTION. The catalog is one row per tool of fact — endpoint, mutating,
  *  undoable, requirements, aim, smallest valid call. Restated by hand, every one of those is a fact
  *  that can go stale silently, and a stale doc on THIS surface is not cosmetic: an agent reads it and
  *  calls the wrong thing. `docs/doc-conventions.md` already says a fact lives in ONE place; this is

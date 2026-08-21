@@ -8,6 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
+import { flatEntityAlias, foldEntityRef, precisionParam } from '../shapes.js';
 
 export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, editorAction, fail } = ctx;
@@ -105,10 +106,29 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'names from the `clipNames` field on the animator trait in modoki_get_scene_state; verify the ' +
       'switch with get_scene_state (the trait\'s activeClip / clip).',
     {
-      guid: z.string().describe('GUID of the animator entity.'),
+      guid: z.string().optional().describe('GUID of the animator entity. Required unless `entity` is given.'),
+      entity: flatEntityAlias,
       clip: z.string().describe('Clip NAME to play (one of the target\'s clipNames).'),
     },
-    async ({ guid, clip }) => editorAction('dispatch-action', { name: 'engine.playClip', targetGuid: guid, params: { clip } }),
+    async ({ guid, entity, clip }) => {
+      const ref = foldEntityRef({ guid }, entity);
+      if ('conflict' in ref) return fail({ code: 'AMBIGUOUS', what: 'play a clip on an entity', why: ref.conflict, expected: 'either `guid`, or `entity:{guid|name|id}` — not both' });
+      // This op addresses the animator by GUID specifically — unlike duplicate/focus, an `id` does
+      // not work either, so both the missing case and the id-only case are refused HERE rather than
+      // sent on to fail less clearly downstream.
+      if (!ref.guid) {
+        return fail({
+          code: 'NOT_FOUND',
+          what: ref.id != null ? `play a clip on entity id ${ref.id}` : 'play a clip',
+          why: ref.id != null
+            ? 'engine.playClip addresses the animator by GUID, and only an id was given.'
+            : 'no entity was addressed.',
+          expected: 'guid:"…", or entity:{guid}',
+          options: ['look the guid up with modoki_get_scene_state (name= or id=), then pass it here'],
+        });
+      }
+      return editorAction('dispatch-action', { name: 'engine.playClip', targetGuid: ref.guid, params: { clip } });
+    },
   );
 
   // ── Phase B: numeric layout/bounds ──
@@ -130,7 +150,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       entities: z.boolean().optional().describe('Force the per-entity rect list on an untargeted call. Large — prefer ids/layer.'),
       overlaps: z.boolean().optional().describe('Materialize the overlapping-pair list. Default false (only overlapsCount is reported) because it is O(n²) and dominated the response.'),
       limit: z.number().int().positive().optional().describe('Cap the returned per-entity rects; sets truncated + totalCount. Useful with layer= on a big scene.'),
-      precision: z.number().int().nonnegative().optional().describe('Significant digits for float values. Default 9 — trims float64 mantissa noise (247.13061935179246 -> 247.130619), saving ~17-29% of the response with a max error of 3.5e-7. Verify edits with a TOLERANCE, not string/=== equality. Pass precision=0 for exact float64.'),
+      precision: precisionParam(),
     },
     async ({ layer, ids, guids, name, entities, overlaps, limit, precision }) => {
       const q = new URLSearchParams();
@@ -195,8 +215,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
         .describe('raycast only. Default true (the engine default): a ray starting INSIDE a collider hits it at distance 0. Pass false to ignore the collider you start inside.'),
       exclude: z.string().optional()
         .describe("raycast only — a guid or an exact entity NAME (never a raw id) whose body is never reported as a hit. The self-hit case: a ground probe from a character's own position. An ambiguous name is REFUSED, not first-matched. Refused outright for kind:shapecast, whose engine function takes no exclusion filter — rather than accepted and silently ignored."),
-      precision: z.number().optional()
-        .describe('Significant digits for the returned floats. Default 9 — verify a position with a TOLERANCE, never ===.'),
+      precision: precisionParam(),
     },
     async (args) => postJson('/api/scene-query', args, undefined, `${args.dim} ${args.kind} scene query`),
   );
@@ -383,7 +402,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       limit: z.number().int().nonnegative().optional().describe('(read) Cap the number of series returned (sets seriesTruncated when it drops some). Pair with name=/guids= on a broad watch so the response does not blow the cap.'),
       clear: z.boolean().optional().describe('(read) Clear the series THIS CALL RETURNED (not the whole watch — a read is capped/filterable, so the ones you did not see keep their samples). The reply echoes `cleared` + `clearedScope`.'),
       samples: z.boolean().optional().describe('(read) Include the RAW time-series per field. Default false — read returns stats only. A full read is ~40 chars/sample and the caps allow 512 series x 5000 samples, so ask for samples only when the stats are not enough (e.g. plotting the curve shape).'),
-      precision: z.number().int().nonnegative().optional().describe('Significant digits for float values. Default 9 — trims float64 mantissa noise (247.13061935179246 -> 247.130619), saving ~17-29% of the response with a max error of 3.5e-7. Verify edits with a TOLERANCE, not string/=== equality. Pass precision=0 for exact float64.'),
+      precision: precisionParam(),
     },
     async (args) => {
       const { action, component, guids, names, fields, epsilon, everyNFrames, maxSamples, maxSeries, expireFrames, id, name, limit, clear, samples, precision } = args;
@@ -476,7 +495,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       max: z.number().int().positive().optional().describe('(start) Ring capacity — most recent N presses kept (default 40, ceiling 500).'),
       limit: z.number().int().positive().optional().describe('(read) Most-recent N presses to return (default 20).'),
       unresolvedOnly: z.boolean().optional().describe("(read) Keep only presses whose resolved.by is 'none' or 'unknown' — presses NOTHING could explain. THE diagnostic filter: this is the one question this tool exists to answer, so start here when a reported gesture apparently did nothing."),
-      precision: z.number().int().nonnegative().optional().describe('(read) Significant digits for float fields (x/y/upX/upY/maxD/heldMs). Default 9; 0 = exact.'),
+      precision: precisionParam('x/y/upX/upY/maxD/heldMs'),
     },
     async (args) => {
       const { action, max, limit, unresolvedOnly, precision } = args;
@@ -545,7 +564,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       ids: z.array(z.string()).optional().describe('(read) Only these region ids.'),
       at: z.object({ x: z.number(), y: z.number() }).optional().describe('(read) A viewport CSS point to test. Returns hitsAt (regions containing it) and, when empty, nearest {id, kind, label, distancePx}. Feed a press coordinate straight from modoki_input_watch.'),
       limit: z.number().int().positive().optional().describe('(read) Max regions returned (default 60). A full board is many cells; filter by kind= first.'),
-      precision: z.number().int().nonnegative().optional().describe('(read) Significant digits for float fields. Default 9; 0 = exact.'),
+      precision: precisionParam(),
     },
     async (args) => {
       const { action = 'read', provider, kind, ids, at, limit, precision } = args;
@@ -573,7 +592,17 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       if (at) { q.set('atX', String(at.x)); q.set('atY', String(at.y)); }
       if (limit != null) q.set('limit', String(limit));
       if (precision != null) q.set('precision', String(precision));
-      return getJson(`/api/hit-regions?${q.toString()}`);
+      // `show`/`hide` MUTATE (they flip the on-screen overlay), and this route is GET-only —
+      // there is no POST branch to fall into (editorBackendRouter.ts, one `method === 'GET'` arm).
+      // So `ok` is a SUCCESS FLAG for them, not an answer, and it has to be checked: without this
+      // a refused toggle came back `200 {ok:false}` on a SUCCESSFUL tool call — the §0 rank-1 false
+      // success — while both sibling mutating GETs (`journal`, `editor_journal`) already checked
+      // theirs. It hid behind a `varies:'both'` declaration that was simply untrue, which exempted
+      // this tool from all three of `mcpToolContracts.test.ts`'s mutating-GET guards.
+      //
+      // `action:'read'` keeps the default (no check): it is a plain read, where `ok` may be the
+      // answer, and flipping that would break the C7 convention for it.
+      return getJson(`/api/hit-regions?${q.toString()}`, undefined, action !== 'read');
     },
   );
 }

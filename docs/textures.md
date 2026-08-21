@@ -525,14 +525,63 @@ the tests caught why: a retiree is still bound on the sweep right after its inva
 definition, so backing off immediately skipped the very frame the mesh rebound on and delayed
 every ordinary free.
 
-⚠️ **This fix is HALF the problem.** Three caches hold `base.clone()` — tint
-(`scene3DSync.tintedMaterial`), MaterialInstance (`materialInstanceClones.ts`) and light-mask
-variants (`lightMaskVariants.ts`) — and a THREE clone copies **texture references**, so freeing
-the base still releases textures the clones sample. None of them is keyed to notice a base
-invalidation either (the tint cache keys on `basePath|color|amount`, so it keeps serving a clone
-of the dead base forever). A mesh-based sweep cannot see any of it. That is unchanged from the
-pre-#317 behaviour, where the base was freed *immediately* — so it is not a regression, but it is
-the other half, tracked separately.
+#### The CLONES are the other half (#318)
+
+Three caches bind a `base.clone()` to a mesh rather than the shared cached material — tint
+(`scene3DSync.tintedMaterial`), per-entity MaterialInstance prop clones
+(`materialInstanceClones.ts`) and light-mask variants (`lightMaskVariants.ts`) — and a THREE clone
+copies **texture references**. That gave two defects with one root cause: nothing told a clone its
+base had been replaced.
+
+**Defect 1 — staleness.** A re-import keeps the GUID, so the tint key `basePath|color|amount` never
+moves and the cache kept serving a clone of the dead base for the rest of the session, while an
+untinted mesh on the same `.mat.json` updated correctly. Light-mask variants had it worse:
+`syncMaterial` deliberately skips its per-frame re-bind for a masked entity, so nothing ever hands
+that mesh the fresh instance, and `applyLightMask` re-derives from the base it recovers out of the
+bound variant's `userData` — the **retired** one — landing on the same `${uuid}|${sel}` key.
+
+**Defect 2 — textures freed under a live clone.** `sweepRetiredMaterials` only sees what a MESH
+binds, and none of those caches is reachable from a `scene.traverse`: the clone is what the mesh
+binds, the base is in a module Map or in `userData`. So a base whose sole remaining holders were
+clones was swept, and `disposeMaterial` released the textures the clones were still sampling. The
+reproducible trigger is *deactivate an entity carrying a prop override → re-import the `.mat.json`
+→ reactivate*: `materialInstanceSystem` returns early for an entity with no live 3D objects, so
+the base stops being refreshed while the clone stays in the Map.
+
+The fix is two mechanisms, and it takes **both** — announce-and-evict alone does not fix the
+light-mask half, because the eviction leaves the holder re-deriving from the same dead pointer:
+
+- **`rendering/derivedMaterials.ts`** — every clone site stamps `userData.__derivedBase`, and the
+  sweep walks that chain up from each bound material, so a base held only *through* a clone counts
+  as bound. That is defect 2, for all three caches at once. It also owns a separate retirement
+  queue for **clones**, because a clone must never go through `disposeMaterial`: that walks the
+  texture slots and `releaseTexture3D`s each one, which for a clone means releasing the base's refs
+  a second time.
+- **`refreshedMaterial(mat)`** in `meshTemplateCache` — `invalidateMaterial` records
+  `retired base → the path it was evicted from`, so a holder that only has the dead instance can
+  find its successor once the async refetch lands. `applyLightMask` routes through it; the tint
+  cache does not need it, because it re-resolves by ref every frame and simply compares the
+  resolved base to the one it cloned.
+
+**The close-out sweep found two more clone sites the fix itself had missed**, and both are now
+stamped: the prewarm's side-pinned variants (`scene3DSync`) and the per-entity video-surface clone
+(`videoTextureSync`). Only the video one is a live-mesh binding, and only the lifetime half applied
+to it — `syncMaterial` does re-bind a video entity's resolved material, so its rebuild path already
+handled staleness. `engine/tests/architecture/materialCloneStamp.test.ts` now fails on an
+unstamped one.
+
+⚠️ **Any further clone site must `markDerived` at the clone.** This is the same discipline
+`registerRenderSurface` needed in #315/#317 and for the same reason: a stamp written anywhere but
+the clone site is one a later site will forget, and the failure is silent — textures released under
+a live material, which WebGPU-on-Metal tolerates for several frames before anything looks wrong.
+
+⚠️ **A superseded clone is RETIRED, not disposed** — a mesh is binding it right now, and the caller
+rebinds only after the cache hands back the new one. Same rule as the base: never `dispose()` a
+retiree, use `disposeRetiredDerivedMaterial`.
+
+Not fixed here, deliberately: `invalidateMaterial` still announces nothing on the
+`assetInvalidation` channel. With the forwarding pointer nothing needs the push, and a new kind
+with no subscriber is a [mechanism that cannot fire](../CLAUDE.md).
 
 ### The env cache retires too — but it is freed by a SWEEP, not a refcount (#315)
 
@@ -715,3 +764,5 @@ scraping the log.
 - `asset-tree-shaker.ts` — drops source PNGs from the production build.
 - `runtime/loaders/textureResolver.ts` — variant selection + KTX2 loading.
 - `runtime/loaders/textureSettings.ts` — settings schema + `selectVariant`.
+- `runtime/rendering/derivedMaterials.ts` — the `__derivedBase` stamp + the retirement queue for
+  material CLONES (#318). Read it before adding a fourth clone site.

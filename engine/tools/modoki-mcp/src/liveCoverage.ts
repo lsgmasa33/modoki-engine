@@ -98,4 +98,13 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   modoki_eval: 'arbitrary code in the renderer',
   modoki_watch: "start leaves a standing watcher on the human's editor",
   modoki_input_watch: "start leaves a standing pointer-capture window open on the human's editor",
+  // The four asset-tree writes added 2026-08-22. Each writes a real file into the human's open
+  // project, which is the bar for an entry here — but unlike most of this list they are all
+  // SMOKE-COVERABLE (create -> verify -> clean up, exactly what create_asset/delete_asset already
+  // do), so these belong in COVERED_BY_SMOKE once a case exists. Listed rather than claimed,
+  // because an entry in COVERED_BY_SMOKE asserts that a real case is there and none is yet.
+  modoki_write_asset_meta: "REPLACES an asset's .meta.json import settings in the human's project; a wrong sidecar changes how the asset converts. SMOKE-COVERABLE — read the sidecar, write it back unchanged, verify",
+  modoki_duplicate_asset: 'writes a new asset file into the project. SMOKE-COVERABLE — duplicate, verify via list_assets, delete_asset',
+  modoki_move_asset: "renames a file in the human's project. SMOKE-COVERABLE — move to a probe path, verify, move back",
+  modoki_create_folder: 'creates a folder in the project. SMOKE-COVERABLE — create, verify, remove',
 };

@@ -29,7 +29,7 @@
  */
 import type { World } from 'koota';
 import { getTraitByName } from '../core/ecs/traitRegistry';
-import { spawnEntity, onWorldSwap, getCurrentWorld } from '../core/ecs/world';
+import { spawnEntity, destroyEntity, onWorldSwap, getCurrentWorld } from '../core/ecs/world';
 import { beginSystemTick, endSystemTick } from '../core/systemTick';
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { buildChildIndex } from '../core/ecs/memberPath';
@@ -197,9 +197,24 @@ export function entriesSystem(world: World, opts?: { fromScroll?: boolean }): vo
   });
   if (views.length === 0) return;
 
+  const metas: Metas = { svMeta, enMeta, entryMeta, uiMeta, attrMeta, renderMeta };
   let dirtied = false;
   for (const view of views) {
-    if (driveView(world, view.handle, { svMeta, enMeta, entryMeta, uiMeta, attrMeta, renderMeta }, opts?.fromScroll !== true)) {
+    // ⚠️ A view nothing can SEE releases its pool instead of being driven. Court's selector took
+    // the world from 668 to 1,477 entities on an A23 and gave none of them back on close — see
+    // `releaseViewPool`. Checked before `driveView` so a hidden view costs one parent-chain walk
+    // per frame rather than a full re-drive, and so the release happens on the frame it is hidden.
+    if (!isViewShown(world, view.handle, metas)) {
+      if (releaseViewPool(world, view.handle, metas)) {
+        // Drop the cached window too, or the rebuilt pool is compared against a `first`/`epoch`
+        // from a pool that no longer exists and the first frame back renders un-driven entries.
+        const g = (view.handle.get(attrMeta.trait) as { guid?: string } | undefined)?.guid;
+        if (g) viewStates.delete(g);
+        dirtied = true;
+      }
+      continue;
+    }
+    if (driveView(world, view.handle, metas, opts?.fromScroll !== true)) {
       dirtied = true;
     }
   }
@@ -468,7 +483,75 @@ function consumeEntryRequest(
  *  Why a child rather than padding the scroll box itself: padding-bottom on a scroll container
  *  has a long history of being dropped from the scrollable area, and the device spike validated
  *  the inner-child shape specifically. */
-function ensureContentChild(world: World, view: EntityLike, m: Metas): EntityLike | null {
+/**
+ * Is this view actually being SHOWN — itself and every ancestor?
+ *
+ * Two different flags, because the engine has two ways to take something off screen and a pooled
+ * view must answer to both: `EntityAttributes.isActive` (which cascades) and `UIElement.isVisible`
+ * (a per-element hide that keeps the node in the tree). Court's level selector uses the SECOND —
+ * `syncLevelSelect` writes `isVisible` on the `LevelSelect` root, an ANCESTOR of the scroll view —
+ * so a check on the view's own flags alone would call a closed selector "shown" and never release.
+ */
+function isViewShown(world: World, view: EntityLike, m: Metas): boolean {
+  const byId = new Map<number, EntityLike>();
+  world.query(m.attrMeta.trait).updateEach((_t: unknown[], entity: unknown) => {
+    const e = entity as EntityLike;
+    byId.set(e.id(), e);
+  });
+  let cur: EntityLike | undefined = view;
+  for (let depth = 0; cur && depth < 64; depth++) {
+    const a = cur.get(m.attrMeta.trait) as { parentId?: number; isActive?: boolean } | undefined;
+    if (a?.isActive === false) return false;
+    const ui = cur.has(m.uiMeta.trait)
+      ? cur.get(m.uiMeta.trait) as { isVisible?: boolean } | undefined
+      : undefined;
+    if (ui?.isVisible === false) return false;
+    cur = typeof a?.parentId === 'number' && a.parentId ? byId.get(a.parentId) : undefined;
+  }
+  return true;
+}
+
+/**
+ * Destroy this view's whole engine-owned subtree — the content column, its rows, every pooled
+ * entry and every member those entries instantiated.
+ *
+ * ⚠️ **"The pool never shrinks" was never a promise to hold it after the view is HIDDEN.** That
+ * rule is about not churning entities mid-scroll, when the device is busiest. Keeping them once
+ * nothing can see the view is a different thing, and it was costing real memory during play:
+ * measured on a Galaxy A23 (2026-08-22), opening Court's level selector once took the world from
+ * 668 entities to 1,477, and CLOSING it released none of them — 809 entities, 55% of the total,
+ * carried for the rest of the session behind a screen the player had left. The owner found it by
+ * asking why the number was so large.
+ *
+ * ⚠️ Recursive by hand, because `destroyEntity` destroys exactly ONE entity — it does not cascade.
+ * Missing that leaves the pooled members alive with a dead parent, which is worse than not
+ * releasing at all: they are unreachable AND still counted.
+ */
+function releaseViewPool(world: World, view: EntityLike, m: Metas): boolean {
+  const content = findContentChild(world, view, m);
+  if (!content) return false;
+  const childrenOf = new Map<number, EntityLike[]>();
+  world.query(m.attrMeta.trait).updateEach((_t: unknown[], entity: unknown) => {
+    const e = entity as EntityLike;
+    const a = e.get(m.attrMeta.trait) as { parentId?: number } | undefined;
+    const p = a?.parentId ?? 0;
+    const bucket = childrenOf.get(p);
+    if (bucket) bucket.push(e); else childrenOf.set(p, [e]);
+  });
+  const doomed: EntityLike[] = [];
+  const walk = (e: EntityLike) => {
+    doomed.push(e);
+    for (const child of childrenOf.get(e.id()) ?? []) walk(child);
+  };
+  walk(content);
+  // Deepest first, so a parent is never destroyed while this loop still holds live children.
+  for (let i = doomed.length - 1; i >= 0; i--) destroyEntity(doomed[i], world);
+  return true;
+}
+
+/** The content child if it already exists — the read half of `ensureContentChild`, so the release
+ *  path can ask without creating one for a view it is about to tear down. */
+function findContentChild(world: World, view: EntityLike, m: Metas): EntityLike | null {
   const viewId = view.id();
   let found: EntityLike | null = null;
   world.query(m.attrMeta.trait, m.uiMeta.trait).updateEach((_t: unknown[], entity: unknown) => {
@@ -477,6 +560,12 @@ function ensureContentChild(world: World, view: EntityLike, m: Metas): EntityLik
     const a = e.get(m.attrMeta.trait) as { name?: string; parentId?: number };
     if (a.parentId === viewId && a.name === ENTRIES_CONTENT_NAME) found = e as EntityLike;
   });
+  return found;
+}
+
+function ensureContentChild(world: World, view: EntityLike, m: Metas): EntityLike | null {
+  const viewId = view.id();
+  const found = findContentChild(world, view, m);
   if (found) return found;
 
   // Spawned HERE, inside the system tick, so `spawnEntity` tags it Transient and it can never

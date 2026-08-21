@@ -21,6 +21,9 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => idIndex.set(e.id(), e),
   spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); idIndex.set(e.id(), e); return e; },
+  // Mirrors the real one: destroys exactly ONE entity and does NOT cascade — which is precisely
+  // what `releaseViewPool` has to compensate for by walking the subtree itself.
+  destroyEntity: (e: any) => { idIndex.delete(e.id()); e.destroy(); },
   onWorldSwap: () => {},
   findEntityById: (id: number) => idIndex.get(id),
   findEntityByGuid: (guid: string) => {
@@ -451,6 +454,116 @@ describe('entriesSystem', () => {
     sys.entriesSystem(testWorld);   // the tick AFTER, where a stale baseline would bite
 
     expect((view.get(UIEntries) as any).poolSize).toBe(restingPool);
+  });
+
+  it('scrollByEntry moves ONE entry from wherever the view sits, not to entry N', async () => {
+    // Backs `UIScrollView.wheel: 'entry'`. A delta multiplier cannot bound a wheel gesture under
+    // mandatory snap — the browser quantises any offset to a whole entry — so what gets bounded
+    // is how many entries one gesture crosses, which needs "where am I + 1".
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 7 * ENTRY_H });
+    sys.entriesSystem(testWorld);
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(8);
+
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 7 * ENTRY_H });
+    expect(api.scrollByEntry('view-guid', { y: -1 })).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(6);
+  });
+
+  it('scrollByEntry does not arm a request on the axis it was not asked to move', async () => {
+    // ⚠️ `0` is a REAL request for entry 0, not "no request" — the trap that once left an
+    // uncleárable scrollToY on an x-axis view and cancelled every smooth scroll.
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    api.scrollByEntry('view-guid', { y: 1 });
+    expect((view.get(UIEntries) as any).scrollToEntryX).toBe(-1);
+  });
+
+  it('scrollByEntry refuses before the view has a usable window', async () => {
+    // Returning "moved" here would teleport a wheel gesture to entry 0 the first time it fired.
+    const { view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), viewportHeight: 0 });
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(false);
+  });
+
+  it('snapToNearest does not arm a request on an axis the view does not scroll', async () => {
+    // ⚠️ Sibling of the `{x, y: 0}` trap, found by sweeping the pattern rather than the symptom.
+    // This used to ask both axes whenever both had a usable STRIDE — and an `axis: 'x'` view with
+    // more than one ROW has a perfectly usable Y stride. Court escaped it only by coincidence
+    // (`countY: 1` makes `visibleY` 1, and `entryStride` returns 0 below 2), which is exactly the
+    // kind of accident that stops being true when someone authors a second row.
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+
+    // An x-axis view whose Y window is genuinely measurable — the shape that used to bite.
+    view.set(UIScrollView, {
+      ...(view.get(UIScrollView) as any), axis: 'x', scrollX: 0, scrollY: 0,
+    });
+    view.set(UIEntries, { ...(view.get(UIEntries) as any), visibleY: 4, visibleX: 2 });
+
+    expect(api.snapToNearest('view-guid')).toBe(true);
+    // 0 is a REAL request for entry 0, not "no request" — the sentinel is -1.
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(-1);
+  });
+
+  it('RELEASES the pool when the view is hidden, and rebuilds it when shown again', async () => {
+    // ⚠️ "The pool never shrinks" is about not churning entities mid-SCROLL. It was never a
+    // promise to hold them once nothing can see the view — and holding them cost real memory
+    // during play: measured on a Galaxy A23 (2026-08-22), opening Court's level selector took the
+    // world from 668 entities to 1,477 and closing it released NONE of them.
+    const { sys, src, provider, view } = await setup();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+
+    const pooled = () => {
+      let n = 0;
+      testWorld.query(EntityAttributes).updateEach(([a]: any[]) => {
+        if (a.name === 'Entry' || a.name === 'Label') n++;
+      });
+      return n;
+    };
+    expect(pooled(), 'precondition: a shown view has a pool').toBeGreaterThan(0);
+
+    view.set(UIElement, { ...(view.get(UIElement) as any), isVisible: false });
+    sys.entriesSystem(testWorld);
+    expect(pooled(), 'a hidden view releases every pooled entity AND its members').toBe(0);
+
+    view.set(UIElement, { ...(view.get(UIElement) as any), isVisible: true });
+    provider.spawned.length = 0;
+    sys.entriesSystem(testWorld);
+    expect(pooled(), 'showing it again rebuilds the pool').toBeGreaterThan(0);
+    expect(provider.spawned.length, 'and rebuilds by re-instantiating, not by resurrecting').toBeGreaterThan(0);
+  });
+
+  it('releases when an ANCESTOR is hidden, not only the view itself', async () => {
+    // ⚠️ The case that actually ships: Court hides the `LevelSelect` ROOT, an ancestor of the
+    // scroll view, so a check on the view's own flags would call a closed selector "shown".
+    const { sys, src, view } = await setup();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    const parent = testWorld.spawn(UIElement({}), RenderableUI(), EntityAttributes({ name: 'Card' }));
+    view.set(EntityAttributes, { ...(view.get(EntityAttributes) as any), parentId: parent.id() });
+    idIndex.set(parent.id(), parent);
+    sys.entriesSystem(testWorld);
+
+    const pooled = () => {
+      let n = 0;
+      testWorld.query(EntityAttributes).updateEach(([a]: any[]) => { if (a.name === 'Entry') n++; });
+      return n;
+    };
+    expect(pooled()).toBeGreaterThan(0);
+    parent.set(UIElement, { ...(parent.get(UIElement) as any), isVisible: false });
+    sys.entriesSystem(testWorld);
+    expect(pooled()).toBe(0);
   });
 
   it('refuses a scrollToEntry at a guid that is not a scroll view', async () => {

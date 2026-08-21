@@ -39,7 +39,7 @@ import {
   resolveMeshTemplate, resolveMeshLodInfo, resolveMaterialForMesh, resolveMaterial,
   getCachedEnvironment, acquireEnvironment, onModelInvalidated, getMeshAsset,
   retiredEnvironments, disposeRetiredEnvironment,
-  retiredMaterials3D, disposeRetiredMaterial,
+  retiredMaterials3D, disposeRetiredMaterial, refreshedMaterial,
 } from '../loaders/meshTemplateCache';
 import { getRiggedModel, ensureRiggedModelLoaded } from '../loaders/riggedModelCache';
 import {
@@ -63,9 +63,10 @@ import { isSkeletalPreviewing, skeletalPreviewDelta } from '../core/skeletalPrev
 import { getSkeletalSeek, hasSkeletalSeeks, clearSkeletalSeeks } from '../core/skeletalSeek';
 import { createPrimitiveMesh } from '../loaders/primitives';
 import {
-  beginLightMaskFrame, getMaskedMaterial, isLightMaskingActive, maskNeedsVariant, baseOf,
+  beginLightMaskFrame, getMaskedMaterial, isLightMaskingActive, maskNeedsVariant, baseOf, retireVariantsOf,
   DEFAULT_RENDERING_LAYER_MASK, type MaskedLight, type LightingFactory,
 } from './lightMaskVariants';
+import { markDerived, collectDerivedChain, retireDerivedMaterial, retiredDerivedMaterials, retiredDerivedCount, disposeRetiredDerivedMaterial } from './derivedMaterials';
 import { getActiveRenderer } from '../core/activeRenderer';
 import { setActiveRenderer } from '../loaders/textureResolver';
 import { PARTICLE_LAYER } from './layers';
@@ -93,31 +94,51 @@ const _ownedMaterials = new Set<THREE.Material>();
 // states). Clones are only freed on scene swap (disposeTintMaterials), so a
 // continuously-varying tint (e.g. an animated color) would grow this unbounded.
 // The dev warning below surfaces that case.
-const _tintMaterials = new Map<string, THREE.Material>();
+const _tintMaterials = new Map<string, { clone: THREE.Material; base: THREE.Material }>();
 let _tintCacheWarned = false;
 
+/** The tinted clone of `basePath` at (`color`, `amount`), or undefined while the base is still
+ *  loading.
+ *
+ *  ⚠️ THE ENTRY RECORDS ITS BASE, and a changed base REBUILDS the clone (#318). None of the three
+ *  key components moves across a re-import — the ref, the colour and the strength are all
+ *  authored — so a cache keyed on them alone kept serving a clone of the PRE-reimport bytes for
+ *  the rest of the session, while an untinted mesh on the same `.mat.json` updated correctly.
+ *  Identity of the resolved base is the only signal that a re-import happened, and checking it is
+ *  free here because this function already re-resolves every frame. It also covers a base that
+ *  changed for any OTHER reason (a mid-flight refetch loser, a swapped ref) — which an
+ *  invalidation event, keyed on the path, would not have.
+ *
+ *  The superseded clone is RETIRED, not disposed: a mesh is binding it right now and the caller
+ *  rebinds only after this returns. `sweepRetiredMaterials` frees it once nothing binds it. */
 function tintedMaterial(basePath: string, color: number, amount: number): THREE.Material | undefined {
   if (!basePath) return undefined;
   const base = resolveMaterial(basePath);
   if (!base) return undefined; // async load not finished yet — try next frame
   const key = `${basePath}|${color}|${amount}`;
-  let clone = _tintMaterials.get(key);
-  if (!clone) {
-    clone = base.clone();
-    (clone as unknown as { color?: THREE.Color }).color?.setHex(color);
-    (clone as unknown as { nprColorPreserve: number }).nprColorPreserve = amount;
-    _tintMaterials.set(key, clone);
-    if (import.meta.env?.DEV && !_tintCacheWarned && _tintMaterials.size > 64) {
-      _tintCacheWarned = true;
-      console.warn('[Tint] tinted-material cache exceeded 64 entries — Tint.color/amount appear to vary continuously (animated?). Clones are cached per distinct (material,color,amount) and only freed on scene swap, so an animated tint leaks. Prefer a fixed palette.');
-    }
+  const entry = _tintMaterials.get(key);
+  if (entry) {
+    if (entry.base === base) return entry.clone;
+    // The base was re-imported (or otherwise replaced) — this clone is stale for good.
+    const stale = entry.clone;
+    retireVariantsOf(stale); // a light-mask variant derived from it is stale too
+    retireDerivedMaterial(stale, () => stale.dispose());
+    _tintMaterials.delete(key);
+  }
+  const clone = markDerived(base.clone(), base);
+  (clone as unknown as { color?: THREE.Color }).color?.setHex(color);
+  (clone as unknown as { nprColorPreserve: number }).nprColorPreserve = amount;
+  _tintMaterials.set(key, { clone, base });
+  if (import.meta.env?.DEV && !_tintCacheWarned && _tintMaterials.size > 64) {
+    _tintCacheWarned = true;
+    console.warn('[Tint] tinted-material cache exceeded 64 entries — Tint.color/amount appear to vary continuously (animated?). Clones are cached per distinct (material,color,amount) and only freed on scene swap, so an animated tint leaks. Prefer a fixed palette.');
   }
   return clone;
 }
 
 /** Dispose all tinted-clone materials. Call on scene cleanup / world swap. */
 export function disposeTintMaterials() {
-  for (const m of _tintMaterials.values()) m.dispose();
+  for (const { clone } of _tintMaterials.values()) clone.dispose();
   _tintMaterials.clear();
   _tintCacheWarned = false;
 }
@@ -489,10 +510,11 @@ export function retiredMaterialSweepTraversals(): number {
 
 function sweepRetiredMaterials(): void {
   const retired = retiredMaterials3D();
-  if (retired.size === 0) { sweepSkipFrames = 0; sweepIdleRuns = 0; lastRetiredSize = 0; return; }
+  const pending = retired.size + retiredDerivedCount();
+  if (pending === 0) { sweepSkipFrames = 0; sweepIdleRuns = 0; lastRetiredSize = 0; return; }
   // A set that just grew always sweeps immediately — the backoff only throttles one standing
   // still, never one with a new retiree in it.
-  if (retired.size !== lastRetiredSize) { sweepSkipFrames = 0; sweepIdleRuns = 0; }
+  if (pending !== lastRetiredSize) { sweepSkipFrames = 0; sweepIdleRuns = 0; }
   else if (sweepSkipFrames > 0) { sweepSkipFrames--; return; }
   sweepTraversals++;
   const bound = new Set<THREE.Material>();
@@ -502,17 +524,26 @@ function sweepRetiredMaterials(): void {
     surface.traverse((o) => {
       const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
       if (!m) return;
-      if (Array.isArray(m)) { for (const one of m) bound.add(one); }
-      else bound.add(m);
+      // The CHAIN, not just the bound material (#318): a mesh binding a tint / MaterialInstance /
+      // light-mask clone is holding that clone's base — and the base's textures — every bit as
+      // firmly as if it bound the base itself. Those caches are unreachable from a traverse, so
+      // without this the base reads as unbound and `disposeMaterial` releases textures the live
+      // clone is still sampling.
+      if (Array.isArray(m)) { for (const one of m) collectDerivedChain(one, bound); }
+      else collectDerivedChain(m, bound);
     });
   }
   let freed = 0;
   for (const mat of [...retired]) if (!bound.has(mat)) { disposeRetiredMaterial(mat); freed++; }
+  // Retired CLONES are freed by the same unbound test but through their own dispose step —
+  // never `disposeRetiredMaterial`, which would release the base's shared textures a second
+  // time. See `derivedMaterials.ts`.
+  for (const clone of retiredDerivedMaterials()) if (!bound.has(clone)) { disposeRetiredDerivedMaterial(clone); freed++; }
   // Fruitless for SWEEP_IDLE_GRACE runs in a row → what is left is genuinely still bound, and
   // may be pinned for good. Back off rather than re-traversing every surface every frame.
   sweepIdleRuns = freed === 0 ? sweepIdleRuns + 1 : 0;
   sweepSkipFrames = sweepIdleRuns >= SWEEP_IDLE_GRACE ? SWEEP_IDLE_BACKOFF_FRAMES : 0;
-  lastRetiredSize = retired.size;
+  lastRetiredSize = retired.size + retiredDerivedCount();
 }
 
 function sweepRetiredEnvironments(): void {
@@ -1468,7 +1499,20 @@ function applyLightMask(obj: THREE.Object3D, mask: number): void {
     if (Array.isArray(cur) || !cur) continue;
     // `baseOf` — by frame 2 `t.material` IS last frame's variant, and cloning that would clone
     // the clone every frame (measured: variants growing 1, 2, 3, … with nothing looking wrong).
-    const variant = getMaskedMaterial(baseOf(cur), mask, factory);
+    let base = baseOf(cur);
+    // …and that recovered base can be a RETIRED instance (#318). `syncMaterial` deliberately
+    // skips its per-frame re-bind for a masked entity, so nothing else ever hands this mesh the
+    // re-imported material: left alone, the variant is re-derived from the dead pointer under an
+    // unchanged `${uuid}|${sel}` key and the mesh shows the pre-reimport bytes for the rest of
+    // the session. `refreshedMaterial` is the one route from the dead instance back to its
+    // successor; it returns undefined until the async refetch lands, and the sweep keeps the
+    // retiree alive in the meantime, so the gap renders the old bytes rather than nothing.
+    const fresh = refreshedMaterial(base);
+    if (fresh) {
+      retireVariantsOf(base); // the variants of the dead base are stale for good
+      base = fresh;
+    }
+    const variant = getMaskedMaterial(base, mask, factory);
     if (variant && t.material !== variant) t.material = variant;
   }
 }
@@ -3500,7 +3544,12 @@ async function prewarmShadersForWorldInner(
     const materials: THREE.Material[] = [];
     if (sides.length === 0) materials.push(material);
     else for (const side of sides) {
-      const clone = material.clone();
+      // Stamped so the retired-material sweep counts the prewarm scene's binding (#318): this
+      // surface IS registered (see `registerRenderSurface(prewarmScene)`) precisely so the sweeps
+      // can see it, and an `invalidateMaterial` landing during the async `compileAsync` would
+      // otherwise free the base out from under this clone. After `prewarmScene.clear()` nothing
+      // binds it, so it pins nothing.
+      const clone = markDerived(material.clone(), material);
       clone.side = side;
       _prewarmRetained.push(clone);
       materials.push(clone);

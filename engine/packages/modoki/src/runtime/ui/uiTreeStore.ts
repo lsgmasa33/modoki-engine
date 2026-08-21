@@ -100,7 +100,7 @@ export interface UINodeData {
    *  `UINode` writes it into the trait on every DOM scroll event without dirtying the tree. If it
    *  rode down in the projection, every scroll event would change this node, `nodesEqual` would
    *  fail, and the whole "a scroll frame costs nothing" property would be gone. */
-  scroll?: { axis: string; snap: string; snapStop: string; overscroll: string; scrollbar: string; scrollToX: number; scrollToY: number; scrollBehavior: string };
+  scroll?: { axis: string; snap: string; snapStop: string; overscroll: string; scrollbar: string; wheel: string; scrollToX: number; scrollToY: number; scrollBehavior: string };
   /** True when this node is a pooled `UIEntries` entry. Its only job here is to name the SNAP
    *  TARGETS of an enclosing scroll view — see `stampSnapTargets`. */
   isEntry?: boolean;
@@ -452,7 +452,7 @@ function buildTree(world: World): UINodeData[] | null {
         const sv = entity.get(_scrollMeta.trait) as any;
         node.scroll = {
           axis: sv.axis ?? 'y', snap: sv.snap ?? 'none', snapStop: sv.snapStop ?? 'normal',
-          overscroll: sv.overscroll ?? 'auto', scrollbar: sv.scrollbar ?? 'auto',
+          overscroll: sv.overscroll ?? 'auto', scrollbar: sv.scrollbar ?? 'auto', wheel: sv.wheel ?? 'native',
           scrollToX: sv.scrollToX ?? -1, scrollToY: sv.scrollToY ?? -1,
           scrollBehavior: sv.scrollBehavior ?? 'instant',
         };

@@ -53,6 +53,7 @@ import {
   planStages, requiredMrtTargets, needsRebuild,
   type PostFXRequest, type StageKind,
 } from './stackPlan';
+import { pinPassCallDepth, observePassCallDepth, getPassCallDepth } from './passCompileContext';
 
 /** One assembled stage.
  *  - `applyConfig` pushes this stage's own config into live uniforms (a no-op
@@ -94,6 +95,10 @@ interface ScenePassLike {
   dispose?(): void;
   renderTarget: THREE.RenderTarget;
   compileAsync(renderer: unknown): Promise<void>;
+  /** three calls this from inside the terminal pipeline's quad draw, and it is where the pass
+   *  renders the scene. Wrapped once per app to read the renderer's call depth AT that moment —
+   *  see `observePassCallDepth` in `passCompileContext`. */
+  updateBefore(frame: unknown): void;
 }
 
 /** Everything a stage may need beyond the incoming color node. */
@@ -193,6 +198,9 @@ export class PostFXStack {
     // outputColorTransform stays default `true` — see the class doc's I1 note.
 
     this.scenePass = scenePass as unknown as ScenePassLike;
+    // Read the pass's real call depth off the first frame it draws — what `compileSceneAsync`
+    // pins depends on it. See `passCompileContext`.
+    observePassCallDepth(this.scenePass, renderer);
   }
 
   private buildStage(
@@ -536,7 +544,15 @@ export class PostFXStack {
     const rt = this.scenePass.renderTarget;
     rt.samples = this.renderer.samples;
     if (this.renderer.getOutputBufferType) rt.texture.type = this.renderer.getOutputBufferType();
-    await this.scenePass.compileAsync(this.rawRenderer);
+    // ⚠️ The pin is the difference between this call warming the render's cache and warming a
+    // parallel one nothing reads. `Renderer.compile()` takes the depth-0 render context; the pass
+    // draws at depth 1, and `context.id` is part of every material's node-builder cache key — so
+    // without it the first frame rebuilds every shader graph synchronously (513 ms of an 807 ms
+    // block on the A23). Full mechanism + measurement: `passCompileContext.ts`.
+    await pinPassCallDepth(
+      this.rawRenderer, rt, getPassCallDepth(),
+      () => this.scenePass.compileAsync(this.rawRenderer),
+    );
   }
 
   /** Push live config into every stage's uniforms, OR report that the

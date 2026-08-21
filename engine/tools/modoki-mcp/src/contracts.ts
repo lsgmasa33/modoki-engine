@@ -277,8 +277,11 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_handles: {
     kind: 'read', method: 'GET', route: '/api/enact-handles', requires: ['editor'],
-    // All THREE filters, not just `kind` — the over-cap hint and the docs catalog are both built
-    // from this list, so a missing one is a filter the agent is never told about (S3.10).
+    // All THREE filters, not just `kind` — the over-cap hint is built from this list, so a missing
+    // one is a filter the agent is never told about (S3.10). (This comment used to claim the docs
+    // catalog reads `filters` too. It does not — `renderCatalog` emits Tool/Endpoint/Effect/Needs/
+    // Aim/Smallest-call and no filters column. Naming a consumer that does not exist is how a
+    // declaration gets trusted for a job nothing is doing.)
     filters: ['editor', 'kind', 'ids'],
   },
   modoki_tap_handle: {
@@ -557,7 +560,11 @@ const DECLS: Record<string, Decl> = {
     notes: 'C7: `ok:false` is an ANSWER (your scene is unhealthy), not a failed call. The `video` param is deliberately NOT declared in `filters`: §6 filters are params that NARROW a response, and this one EXPANDS it (an opt-in video-cache index) — which is what the boolean heuristic already expects, so listing it would be the exact misuse `narrowingFlags` warns against, "a way to bless an expanding flag". Opt-in matters anyway, because diagnose is a swept read: a per-clip index would grow every caller\'s payload to answer a question almost none of them asked. It is the only surface that can read the downloaded-video cache (#288 Phase 6) — the singleton sits behind the __MODOKI_MODULE_VIDEO__ flag, and an /@fs import in modoki_eval yields a second module instance whose slot is null.',
   },
   modoki_profiler: {
-    kind: 'control', method: 'GET', route: '/api/profiler', varies: 'both',
+    // `varies:'method'`, not 'both': every action uses the SAME route (`/api/profiler`) and only
+    // the method moves. Over-declaring the route as varying is harmless today, but `varies` is
+    // what the mutating-GET guards exclude on, so it is a field that must say exactly what is
+    // true — see modoki_hit_regions above for what an untrue one costs.
+    kind: 'control', method: 'GET', route: '/api/profiler', varies: 'method',
     mutating: true, persists: 'session', requires: ['editor', 'renderer'],
     filters: ['markers'],
     minimalArgs: {},
@@ -592,7 +599,14 @@ const DECLS: Record<string, Decl> = {
   },
 
   modoki_hit_regions: {
-    kind: 'control', method: 'GET', route: '/api/hit-regions', varies: 'both',
+    kind: 'control', method: 'GET', route: '/api/hit-regions',
+    // NO `varies` — and its absence is the point. This tool declared `varies:'both'` while
+    // varying in NEITHER: `/api/hit-regions` has exactly one arm (`method === 'GET'`) and all
+    // three actions were OBSERVED going `GET /api/hit-regions?action=…`. That untrue word was
+    // load-bearing in the worst way: every mutating-GET guard filters on `!c.varies`, so one
+    // declaration exempted this tool from the violator list, the mutating-args fixture, AND the
+    // behavioural "a 200 ok:false is a FAILURE" assertion — and a refused show/hide reached the
+    // agent as a successful call. Declaring the truth puts it back in all three.
     mutating: true, persists: 'session', requires: ['editor', 'renderer'],
     filters: ['provider', 'kind', 'ids', 'limit', 'precision'],
     minimalArgs: { action: 'read' },
@@ -665,30 +679,78 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_particle_set: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'particle-set',
-    mutating: true, persists: 'live', requires: ['editor'], aim: 'asset',
+    // undoable:true — asserted against the op, not just declared. All five call `pushAssetUndo`
+    // (agentEditorOps.ts § "Make an agent asset-def edit UNDOABLE"), a deliberate owner decision
+    // from 2026-07-30 (audit S2.27) that closed the asymmetry with the panels, which already
+    // pushed to the same global undoManager for the identical edit.
+    //
+    // They were declared `false` here — by omission, which is how a contract field goes wrong
+    // quietly — for as long as that fix has existed. The cost landed on the AGENT: the generated
+    // catalog said "not undoable" for all five, and none of their descriptions mentioned undo, so
+    // the recovery path from a bad write was invisible and the obvious next reach is
+    // `modoki_discard_asset_edits` — which drops the parked WRITE and leaves the applied def live,
+    // i.e. not the thing you wanted.
+    mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
     minimalArgs: { path: '/assets/particles/probe.particle.json', def: {} },
     notes: 'Requires a FULL def — read it back with modoki_read_asset_def first.',
   },
   modoki_anim_set_clip: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'anim-set-clip',
-    mutating: true, persists: 'live', requires: ['editor'], aim: 'asset',
+    mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
     minimalArgs: { clipPath: '/assets/anim/probe.anim.json', clip: {} },
   },
   modoki_anim_add_key: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'anim-add-key',
-    mutating: true, persists: 'live', requires: ['editor'], aim: 'asset',
+    mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
     minimalArgs: { clipPath: '/assets/anim/probe.anim.json', trait: 'Transform', field: 'x', time: 0, value: 1 },
   },
   modoki_timeline_set: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'timeline-set',
-    mutating: true, persists: 'live', requires: ['editor'], aim: 'asset',
+    mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
     minimalArgs: { timelinePath: '/assets/timelines/probe.timeline.json', timeline: {} },
   },
   modoki_timeline_add_clip: {
     kind: 'asset', method: 'POST', route: '/api/editor-action', op: 'timeline-add-clip',
-    mutating: true, persists: 'live', requires: ['editor'], aim: 'asset',
+    mutating: true, undoable: true, persists: 'live', requires: ['editor'], aim: 'asset',
     minimalArgs: { timelinePath: '/assets/timelines/probe.timeline.json', trackType: 'animation', item: {} },
   },
+  // ── the six routes that had no tool (2026-08-21 audit F6, owner: expose all six) ──
+  // Each was reachable only through modoki_eval + modoki.api(). Two of them were DOCUMENTED as
+  // existing for the agent, which is how a route ends up promised and unreachable at the same time.
+  modoki_validate_prefab: {
+    kind: 'read', method: 'GET', route: '/api/validate-prefab', requires: ['project'], aim: 'asset',
+    minimalArgs: { path: '/assets/prefabs/probe.prefab.json' },
+    notes: "The prefab twin of modoki_validate_scene. C7: `ok:false` is an ANSWER (this prefab has problems), not a failed call. Consults NO trait schema — hence no schemaAvailable, unlike its scene sibling, and no renderer requirement.",
+  },
+  modoki_unused_assets: {
+    kind: 'read', method: 'GET', route: '/api/unused-assets', requires: ['project'],
+    notes: "The single owner of 'what would the build DROP?' — it runs the real tree-shaker from the scene seeds, so it answers about what SHIPS. A `?unreferenced=1` mode on find_references was measured against it and DELETED (docs/build.md): its answer was a strict subset on every committed project, and weaker where they differed. Scoped to the project's own assets; the engine's shared /modoki/assets root is excluded as engine-owned.",
+  },
+  modoki_write_asset_meta: {
+    kind: 'asset', method: 'POST', route: '/api/write-meta',
+    mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
+    minimalArgs: { path: '/assets/textures/probe.png', meta: {} },
+    notes: "The write half of modoki_get_asset_meta, which is its verification read (§8). REPLACES the sidecar rather than merging, so a partial post drops every omitted setting. Writing settings does not re-convert — modoki_reimport_asset does.",
+  },
+  modoki_duplicate_asset: {
+    kind: 'asset', method: 'POST', route: '/api/duplicate-asset',
+    mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
+    minimalArgs: { from: '/assets/particles/probe.particle.json', to: '/assets/particles/probe-copy.particle.json' },
+    notes: 'Not a file copy: it MINTS a fresh guid for the duplicate, because two assets sharing one guid breaks every ref that resolves through the manifest. Refuses an existing destination (409) rather than clobbering.',
+  },
+  modoki_move_asset: {
+    kind: 'asset', method: 'POST', route: '/api/move-file',
+    mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
+    minimalArgs: { from: '/assets/particles/probe.particle.json', to: '/assets/particles/moved.particle.json' },
+    notes: "Refs survive the move — they are GUIDs resolved through the manifest and the guid travels with the file. Refuses an existing destination (409) and a missing source (404). A CASE-ONLY rename is allowed: on a case-insensitive FS the two paths are the same inode, which is not a collision.",
+  },
+  modoki_create_folder: {
+    kind: 'asset', method: 'POST', route: '/api/create-folder',
+    mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
+    minimalArgs: { path: '/assets/probe-folder' },
+    notes: 'The prerequisite for modoki_import_file `destFolder` and modoki_create_asset `path`, neither of which creates its destination. Not recursive; refuses an existing folder (409).',
+  },
+
   modoki_capture_gesture: {
     kind: 'input', mutating: true, method: 'POST', route: '/api/capture-gesture', requires: ['editor', 'electron'], aim: 'point',
     minimalArgs: { from: { x: 0, y: 0 }, to: { x: 10, y: 10 } },

@@ -28,7 +28,7 @@ export {
   type EntryCoord, type EntryContent, type EntryResolver,
 } from './ui/entrySource';
 export { parseEntryPrefabs } from './traits/UIEntries';
-export { scrollToEntry, snapToNearest, NO_ENTRY_REQUEST } from './ui/scrollApi';
+export { scrollToEntry, snapToNearest, scrollByEntry, NO_ENTRY_REQUEST } from './ui/scrollApi';
 export { entriesSystem, resetEntriesSystem, ENTRIES_CONTENT_NAME, setEntryPrefabProvider, getEntryPrefabProvider, type EntryPrefabProvider } from './ui/entriesSystem';
 export { installEntryPrefabProvider, entryPrefabProvider } from './loaders/entryPrefabProvider';
 export { onAssetInvalidated, emitAssetInvalidated } from './core/assetInvalidation';

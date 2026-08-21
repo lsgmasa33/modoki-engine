@@ -785,20 +785,61 @@ rebuild and is never per-frame.
   the content box. Measured in Court's selector (2026-08-21): a 31.6vh page inside a 31.6vh box
   came back **203px against the grid's 218px**, so the 5-across grid hung 15px outside its own
   page. `axis: 'x'` now emits `overflow-y: hidden`, and `'y'` the mirror.
-- ⚠️ **Snap is SUSPENDED while the view moves, and snapping + recycling cannot coexist without
-  it.** The offset is carried as padding, so every pool re-drive rewrites it mid-scroll — and
-  under `scroll-snap-type: mandatory` the browser answers that layout change by re-snapping to
-  the previously-snapped ELEMENT, which recycling has just repointed at different data. That
-  moves the scroll, which re-drives the pool, which rewrites the padding: a closed loop. Both of
-  its symptoms have this one cause — **landing on the wrong page** (asking for page 12 landed on
-  4, page 23 on 6) and **~3x the frame time AT REST** with no input and no pool churn (p50 39ms /
-  p95 52ms against 13/18). `proximity` fixes neither. `UINode` holds `scroll-snap-type: none`
-  from the first scroll event until 150 ms after the last, and restores the AUTHORED value — not
-  `''`, which would strip React's own inline style and silently end snapping for good.
 - ⚠️ **A converted `scrollToEntry` builds that frame's window from the TARGET, not from the
-  scroll still observable** (`entriesSystem`), and moves the travel baseline with it. Padding for
-  where the view IS, plus a DOM scroll to where it was ASKED to go, is the mismatch snap corrects
-  — suspending snap alone only buys time for a walk that should never have been a walk.
+  scroll still observable** (`entriesSystem`), and moves the travel baseline with it. This is the
+  fix for a snap/recycling failure that had two faces and one cause: the offset is carried as
+  PADDING, so a window built from the observable scroll described where the view WAS while the
+  DOM moved to where it had been ASKED to go — and `scroll-snap-type: mandatory` answered that
+  mismatch by re-snapping to the previously-snapped ELEMENT, which recycling had just repointed at
+  different data. That moved the scroll, re-drove the pool, rewrote the padding, and re-snapped.
+  Measured before the fix: asking for page 12 landed on 4 and page 23 on 6 (converging a few pages
+  per attempt), and frame time at REST — no input, no pool churn — was **p50 39ms / p95 52ms**
+  against 13/18. `scroll-snap-type: proximity` fixed neither.
+✅ **Judged good on real touch hardware** (owner, 2026-08-22): Court's level selector, the shipped
+iOS build on an iPhone Air — *"Scroll feels good on Air."* That is the verdict the CSS-motion
+decision below rests on for touch, taken on a second device and a second platform after the S22
+Android run, and it is what closes out the snap question: snapping stays ON throughout, with no
+suspension. A perf number for the LOW-end target (Galaxy A23) is still owed — see #320; feel and
+frame budget are different questions and the Air answers only the first.
+
+- ⚠️ **Do NOT fix a snap/recycle symptom by suspending snap while the view moves.** It was tried,
+  it worked, and the owner felt what it cost within minutes: with snap off during momentum the
+  browser cannot decelerate INTO a snap point, so the view coasts to a full stop mid-entry and
+  then jerks into line — *"the scroll stops completely once, then it snaps"* — and past the
+  halfway mark that jerk reads as an extra entry. Fix the window instead; snap then has nothing to
+  correct and stays on throughout. Verified with snap mandatory the whole time: swipe +1, +1,
+  fling +3, swipe -2 all land exactly, a programmatic jump to entry 19 lands on 19, and frame time
+  is p50 13ms at entry 3 AND at entry 21.
+- ⚠️ **A HIDDEN view releases its pool, and "the pool never shrinks" never meant otherwise.** That
+  rule is about not churning entities mid-scroll, when the device is busiest; holding them once
+  nothing can see the view is a different thing and it cost real memory during play. Measured on a
+  Galaxy A23 (2026-08-22): opening Court's level selector took the world from **668 to 1,477**
+  entities, and closing it released **none** — 809 entities, 55% of the total, carried for the rest
+  of the session behind a screen the player had left. The release checks BOTH ways the engine takes
+  something off screen — `EntityAttributes.isActive` (cascading) and `UIElement.isVisible` (a
+  per-element hide) — and walks the ANCESTOR chain, because the shipping case hides a ROOT above
+  the scroll view, not the view itself. Re-showing rebuilds by re-instantiating.
+- ⚠️ **`overscan` is NOT "how many extra you can see" — a pager needs 1 even though only 2 entries
+  are ever visible.** Tried at `0` on Court's pager: the pool halved to 2 and never blanked at any
+  speed (0 blank frames at ⅓, 1 and even 3 pages per frame) — and *landings broke*, a jump to page
+  4 arriving at 0 and a fling to 4 arriving at 21. With no spare, a re-drive can remove the entry
+  the scroll offset is standing on, and snap then grabs whatever does exist. **A blank-frame test
+  does not cover this**; that is how `0` looked safe. The margin is what keeps the current entry in
+  the pool across a re-drive, not what fills the viewport.
+- ⚠️ **`wheel: 'entry'` on a PAGER, or a trackpad flies through pages.** A wheel delta MULTIPLIER
+  cannot help: under `snap: mandatory` the browser quantises any offset to a whole entry, so
+  scaling the delta changes nothing on screen. What needs bounding is how many entries one gesture
+  may cross. A single mouse NOTCH (~100-120px against a 218px page) is under half an entry and
+  snaps back to where it started; a trackpad swipe emits a rapid stream whose deltas accumulate
+  into hundreds of px before the browser resolves them, so one flick crossed several pages (owner,
+  2026-08-22: *"with the mouse wheel, scroll is too sensitive"*). `'entry'` moves exactly one entry
+  per gesture, where a gesture ends after 140 ms of wheel silence — a fixed cooldown instead would
+  let a trackpad's continuous stream re-fire and reintroduce the runaway. Default is `'native'`
+  because a long LIST wants the raw delta; capping a 5,000-row strip to one row per gesture would
+  be unusable. **Touch is unaffected either way** — a swipe is not a wheel event.
+- `scrollByEntry(viewGuid, {x|y}, {behavior})` is what backs it: "move one entry from wherever I
+  am", the same window arithmetic `snapToNearest` does plus a delta. A caller cannot compute it
+  itself — the engine publishes no resolved entry stride, and `firstX` is the first POOLED entry.
 - ⚠️ **`scrollbar: 'hidden'` when the box is sized to fit its content exactly.** A classic
   scrollbar takes ~15px off the CROSS axis, and mobile's overlay scrollbars take none — so
   authoring the box bigger to compensate leaves a gap on the platform that ships. Court's page

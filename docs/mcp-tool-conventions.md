@@ -102,6 +102,25 @@ legitimate exception: it *measures* a path).
 - **Any id-shaped argument is validated.** `parentGuid` is validated today while `parentId` is
   passed through raw, so a stale numeric id produces an orphan entity — parented to nothing,
   invisible in the Hierarchy — reported as success (S1 `create_entity`/`reparent_entity`/`prefab`).
+- **Both addressing SHAPES are accepted, so the choice is not a guess.** Aimed-input tools nest
+  (`entity:{guid|name|id}`) because they also take a selector or a raw point and the aim modes must
+  stay distinguishable; the editor-op tools take a flat `guid`. That rule was written nowhere and
+  held only loosely — `set_transform` nests without being an input tool, `play_clip` was flat while
+  declaring `aim:'entity'` — and `qa/knowledge.md` records the mix-up as a recurring trap. Since
+  2026-08-22 the singular-aim tools accept **either**, so one shape works across the surface.
+  Sending BOTH is refused (`AMBIGUOUS`) rather than resolved by precedence: a caller who gave two
+  addresses does not know which one the tool used, and picking for them is the §0 rank-1 class.
+  The SET-shaped params (`guids`, `entityIds`, `get_scene_state`'s filters) are deliberately
+  untouched — they take a set, not an aim, and a singular `entity` there would be a third shape
+  rather than one fewer.
+  ⚠️ **The flat-side alias takes `{guid|id}` only — no `name` — and is `.strict()`.** Both halves
+  are load-bearing, and the first version of it had neither. The ops behind these tools resolve
+  through `requireLiveId({id?, guid?})` and have no name resolver, so accepting a `name` advertises
+  a capability that does not exist; and because a nested `z.object` is **not** strict just because
+  its parent is, zod silently STRIPS the key, so `entity:{name:'Crate'}` arrives as `{}` and
+  surfaces as *"entity ref matched no live entity — it may be stale"* — an unclear failure pointing
+  at the wrong cause. That is §1's silent-key-strip one level down. Resolve the name with
+  `modoki_get_scene_state` and pass the guid.
 
 ## 4. Method, and the C7 convention
 
@@ -119,18 +138,28 @@ Therefore:
 
 > **No mutating operation is reachable by GET.**
 
-Because such an operation's failure is structurally unchecked. **Six** tools violate this today —
+Because such an operation's failure is structurally unchecked. Six tools reach a mutating op by GET:
 `modoki_build`, `add_native_target`, `ota_publish`, and (found only by reading query params, not
 routes) `modoki_journal`, `editor_journal` — which mutate via `?action=start` and `?clear=1` (F3) —
 and **`modoki_hit_regions`**, whose `action:'show'|'hide'` flips the overlay through a GET-only
-route (`setHitRegionOverlayVisible`, `agentBridge.ts:1011`; the route has exactly one branch,
-`editorBackendRouter.ts:1050`). A failed clear of the 10,000-event ring reports success.
+route. All six now run their `ok:false` through the failure check at the call site, so a refusal
+cannot arrive as a success; the remaining violation is the METHOD, and the fix pattern below.
 
-⚠️ `hit_regions` was added AFTER the audit that produced this list, and the list said "five" until
-the #166 close-out re-derived it from the contract table instead of re-reading this sentence. **A
-count in prose goes stale silently; the re-runnable query does not** — every violator is
-`mutating:true && method:'GET'` in `contracts.ts`, minus the ones that genuinely split by method
-(`modoki_profiler`, `modoki_watch`, `modoki_input_watch`, `modoki_project_settings`).
+⚠️ **The re-runnable query is only as trustworthy as the field it filters on — this sentence used
+to say otherwise, and the tool it was written about is what disproved it.** The query is
+`mutating:true && method:'GET'`, minus the tools that genuinely split by method (`modoki_profiler`,
+`modoki_watch`, `modoki_input_watch`, `modoki_project_settings`). `modoki_hit_regions` declared
+`varies:'both'` on a route with exactly ONE arm, so the query silently excluded it — while the prose
+above named it correctly. Every guard that filters on `!varies` was disarmed by that one untrue
+word, and a refused `action:'show'` reached the agent as a SUCCESSFUL call for as long as the
+declaration stood (fixed 2026-08-21).
+
+The lesson is not "trust prose after all". It is that **a declared field must be OBSERVED before a
+guard may rely on it** — the same rule §10 already applies to `method`/`route`/`op`. `varies` is now
+observed too: `mcpToolContracts.test.ts` drives every action of every multi-action tool, records the
+method and route each one really uses, and asserts the declaration matches, with a totality check so
+a new multi-action tool cannot skip the table. Re-derive the list from the query, not from this
+paragraph — but only because the query's inputs are now checked.
 
 **The fix pattern, if you close one:** `modoki_profiler` (#166 P6) is the worked example — the read
 actions stay GET, the state-changing ones move to POST on the same route, and a mutating action
@@ -278,8 +307,19 @@ An op registered in `agentEditorOps.ts` whose handler reaches nothing from `edit
 ## 10. Every tool declares its contract, and is covered three ways
 
 - **Contract**: one entry in `contracts.ts`, asserted both directions (no tool without a contract,
-  no contract without a tool). `method`/`route`/`op` are declared **and verified against
-  observation** — a declaration alone can lie, which is how a tool ends up documented but dead.
+  no contract without a tool). `method`/`route`/`op`/`varies`/`undoable`/`minimalArgsMutates` are
+  declared **and verified against observation** — a declaration alone can lie, which is how a tool
+  ends up documented but dead.
+  ⚠️ **A field a guard FILTERS on must be observed before the guard can be trusted.** The table
+  splits into an observed half and a declared-only half, and every drift the 2026-08-21 audit found
+  lived in the declared-only half — because a wrong declaration there does not merely mislead a
+  reader, it *disarms the check*. `varies` was declared `'both'` on a single-arm route and silently
+  exempted `modoki_hit_regions` from all three mutating-GET guards; `undoable` was `false` on five
+  tools whose ops push an undo entry, so the generated catalog stated the opposite of the truth;
+  `minimalArgsMutates` decides what the live sweep fires at the human's open editor and was only
+  ever checked against itself. All three are observed now. The ones still declared-only —
+  `mutating`, `persists`, `requires`, `aim`, `filters` — are cross-checked against each other but
+  not against behaviour, so treat a guard that filters on one as provisional until it is.
 - **Coverage** — a tool is not "covered" until all three exist. Each tier can prove something the
   others structurally cannot, which is why none of them substitutes for another:
   1. **T1 unit** (`engine/tests/tools/mcpRegistry`, `mcpToolContracts`) — the tool exists, its schema

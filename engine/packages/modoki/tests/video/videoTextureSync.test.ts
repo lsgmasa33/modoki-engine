@@ -45,6 +45,7 @@ vi.mock('three/webgpu', () => ({
 
 const { syncVideoTextures, disposeVideoTextures, videoTextureCount } =
   await import('../../src/runtime/rendering/videoTextureSync');
+const { derivedBaseOf } = await import('../../src/runtime/rendering/derivedMaterials');
 
 // videoSystem owns the elements; this suite is about what the RENDERER does with one.
 const elements = new Map<number, HTMLVideoElement>();
@@ -330,5 +331,43 @@ describe('syncVideoTextures — multi-material meshes', () => {
     expect((mesh.material as FakeMaterial[])[0]).toBe(slot0);
     expect((mesh.material as FakeMaterial[])[1]).toBe(slot1);
     expect(slot0.map ?? null).toBeNull();
+  });
+});
+
+describe('syncVideoTextures — the clone keeps its base alive (#318)', () => {
+  it('stamps the bound clone with the material it was cloned from', () => {
+    // Only `.map` is replaced; every other slot the base carries — normalMap, roughnessMap,
+    // emissiveMap — is still a SHARED texture reference. `sweepRetiredMaterials` frees a retired
+    // base once no MESH binds it, and after this swap no mesh binds the base: the clone does. The
+    // stamp is what makes the sweep count that as holding the base, so a `.mat.json` re-import
+    // cannot release textures this clone is drawing with.
+    //
+    // Asserted here rather than through the sweep because that needs a real THREE.Scene, which
+    // this suite's fakes deliberately do not build; `materialCloneInvalidation.test.ts` drives the
+    // sweep against the stamp itself.
+    const original = new FakeMaterial();
+    const mesh = fakeMesh(original);
+    spawnVideo(mesh);
+
+    sync(world, state);
+
+    expect(matOf(mesh)).not.toBe(original);
+    expect(derivedBaseOf(matOf(mesh) as never)).toBe(original);
+  });
+
+  it('re-stamps against the NEW base when the material ref changes underneath', () => {
+    // The rebuild path (`current !== existing.original`) makes a second clone; a stamp applied
+    // only on the first bind would leave that one pointing at a base nothing uses any more.
+    const original = new FakeMaterial();
+    const mesh = fakeMesh(original);
+    spawnVideo(mesh);
+    sync(world, state);
+
+    const replacement = new FakeMaterial();
+    replacement.roughness = 0.25;
+    mesh.material = replacement;
+    sync(world, state);
+
+    expect(derivedBaseOf(matOf(mesh) as never)).toBe(replacement);
   });
 });

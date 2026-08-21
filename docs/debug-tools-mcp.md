@@ -1063,7 +1063,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*93 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*99 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -1096,6 +1096,8 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_render_sequence` | POST `/api/render-sequence` | read-only | editor + renderer + scene | — | *(no args)* |
 | `modoki_resolve_refs` | GET `/api/resolve-refs` | read-only | project | — | `{"refs":["00000000-0000-0000-0000-000000000000"]}` |
 | `modoki_scene_query` | POST `/api/scene-query` | read-only | editor + scene | point | `{"kind":"point","dim":"3d","point":[0,0,0]}` |
+| `modoki_unused_assets` | GET `/api/unused-assets` | read-only | project | — | *(no args)* |
+| `modoki_validate_prefab` | GET `/api/validate-prefab` | read-only | project | asset | `{"path":"/assets/prefabs/probe.prefab.json"}` |
 | `modoki_validate_scene` | GET `/api/validate-scene` | read-only | project | asset | `{"path":"/assets/scenes/main.scene.json"}` |
 | `modoki_wait_for_edit` | GET `/api/wait-for-edit` | read-only | editor | — | `{"timeoutMs":50}` |
 
@@ -1120,15 +1122,19 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
-| `modoki_anim_add_key` | POST `/api/editor-action` `anim-add-key` | live | editor | asset | `{"clipPath":"/assets/anim/probe.anim.json","trait":"Transform","field":"x","time":0,"value":1}` |
-| `modoki_anim_set_clip` | POST `/api/editor-action` `anim-set-clip` | live | editor | asset | `{"clipPath":"/assets/anim/probe.anim.json","clip":{}}` |
+| `modoki_anim_add_key` | POST `/api/editor-action` `anim-add-key` | live · undoable | editor | asset | `{"clipPath":"/assets/anim/probe.anim.json","trait":"Transform","field":"x","time":0,"value":1}` |
+| `modoki_anim_set_clip` | POST `/api/editor-action` `anim-set-clip` | live · undoable | editor | asset | `{"clipPath":"/assets/anim/probe.anim.json","clip":{}}` |
 | `modoki_create_asset` | POST `/api/create-asset` | file | project | asset | `{"type":"particle","path":"/assets/particles/probe.particle.json"}` |
+| `modoki_create_folder` | POST `/api/create-folder` | file | project | asset | `{"path":"/assets/probe-folder"}` |
+| `modoki_duplicate_asset` | POST `/api/duplicate-asset` | file | project | asset | `{"from":"/assets/particles/probe.particle.json","to":"/assets/particles/probe-copy.particle.json"}` |
 | `modoki_import_file` | POST `/api/import-file` | file | project | — | `{"srcPath":"/tmp/probe.png","destFolder":"/assets/textures"}` |
-| `modoki_particle_set` | POST `/api/editor-action` `particle-set` | live | editor | asset | `{"path":"/assets/particles/probe.particle.json","def":{}}` |
+| `modoki_move_asset` | POST `/api/move-file` | file | project | asset | `{"from":"/assets/particles/probe.particle.json","to":"/assets/particles/moved.particle.json"}` |
+| `modoki_particle_set` | POST `/api/editor-action` `particle-set` | live · undoable | editor | asset | `{"path":"/assets/particles/probe.particle.json","def":{}}` |
 | `modoki_reimport_asset` | POST `/api/reimport` | file | project | asset | `{"path":"/assets/textures/probe.png"}` |
-| `modoki_timeline_add_clip` | POST `/api/editor-action` `timeline-add-clip` | live | editor | asset | `{"timelinePath":"/assets/timelines/probe.timeline.json","trackType":"animation","item":{}}` |
-| `modoki_timeline_set` | POST `/api/editor-action` `timeline-set` | live | editor | asset | `{"timelinePath":"/assets/timelines/probe.timeline.json","timeline":{}}` |
+| `modoki_timeline_add_clip` | POST `/api/editor-action` `timeline-add-clip` | live · undoable | editor | asset | `{"timelinePath":"/assets/timelines/probe.timeline.json","trackType":"animation","item":{}}` |
+| `modoki_timeline_set` | POST `/api/editor-action` `timeline-set` | live · undoable | editor | asset | `{"timelinePath":"/assets/timelines/probe.timeline.json","timeline":{}}` |
 | `modoki_write_asset` | POST `/api/asset-write` | file | project | asset | `{"path":"/assets/particles/probe.particle.json","type":"particle","data":{}}` |
+| `modoki_write_asset_meta` | POST `/api/write-meta` | file | project | asset | `{"path":"/assets/textures/probe.png","meta":{}}` |
 
 #### Input (Enact) — trusted input injection
 
@@ -1158,7 +1164,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_focus_entity` | POST `/api/editor-action` `focus-entity` | no persistence | editor + scene | entity | *(no args)* |
 | `modoki_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
 | `modoki_history` | POST `/api/editor-action` *(op = your `action`)* | live | editor | — | `{"action":"undo"}` |
-| `modoki_hit_regions` | GET `/api/hit-regions` *(both varies)* | session | editor + renderer | — | `{"action":"read"}` |
+| `modoki_hit_regions` | GET `/api/hit-regions` | session | editor + renderer | — | `{"action":"read"}` |
 | `modoki_input_watch` | GET `/api/input-watch/read` *(both varies)* | session | editor + renderer | — | `{"action":"read"}` |
 | `modoki_load_scene` | POST `/api/editor-action` `load-scene` | live | editor + project | asset | `{"path":"/assets/scenes/main.scene.json"}` |
 | `modoki_menu` | POST `/api/menu` | session | editor + electron | — | *(no args)* |
@@ -1171,7 +1177,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_play_clip` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | entity | `{"guid":"00000000-0000-0000-0000-000000000000","clip":"Idle"}` |
 | `modoki_play_control` | POST `/api/editor-action` *(op = your `action`)* | session | editor | — | `{"action":"stop"}` |
 | `modoki_pose_clip` | POST `/api/editor-action` `pose-clip` | live | editor + scene | — | `{"t":0}` |
-| `modoki_profiler` | GET `/api/profiler` *(both varies)* | session | editor + renderer | — | *(no args)* |
+| `modoki_profiler` | GET `/api/profiler` *(method varies)* | session | editor + renderer | — | *(no args)* |
 | `modoki_project_settings` | GET `/api/project-settings` *(method varies)* | file | project | — | `{"action":"get"}` |
 | `modoki_scene_view_mode` | POST `/api/editor-action` `set-scene-view-mode` | session | editor | — | `{"mode":"3d"}` |
 | `modoki_set_playhead` | POST `/api/editor-action` `set-playhead` | session | editor | — | `{"t":0}` |

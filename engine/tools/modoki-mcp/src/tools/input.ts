@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { modifierEnum, entitySpec, pointSpec, allowOccludedParam } from '../shapes.js';
+import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, allowOccludedParam, entitySpec, modifierEnum, pointSpec } from '../shapes.js';
 
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, evalRenderer, editorAction } = ctx;
@@ -45,7 +45,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       entity: entitySpec.optional(),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button (default 'left')."),
       clickCount: z.number().optional().describe('1 = single (default), 2 = double-click.'),
-      modifiers: z.array(modifierEnum).optional().describe('Held modifier keys.'),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
       allowOccluded: allowOccludedParam,
     },
     async ({ x, y, selector, entity, button, clickCount, modifiers, allowOccluded }) => postJson('/api/input/tap', { x, y, selector, entity, button, clickCount, modifiers, allowOccluded }),
@@ -69,8 +69,8 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       to: pointSpec.describe('Drag destination: {entity} | {selector} | {x,y}.'),
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button (default 'left')."),
-      modifiers: z.array(modifierEnum).optional().describe('Modifier keys held for the whole drag (real keyDown/keyUp around the gesture).'),
-      allowOccluded: allowOccludedParam.describe('Allow a covered endpoint on BOTH ends (default false = refused, naming the cover). Set it on `from`/`to` individually to allow just one — e.g. a covered destination while keeping the press honest.'),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, held for the WHOLE drag as a real keyDown/keyUp around the gesture — so a listener tracking the modifier's LEVEL (the 3D gizmo's snap) sees it down for every intermediate move.`),
+      allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Applies to BOTH endpoints; set it on \`from\`/\`to\` individually to allow just one — e.g. a covered destination while keeping the press honest.`),
     },
     async ({ from, to, steps, button, modifiers, allowOccluded }) => postJson('/api/input/drag', { from, to, steps, button, modifiers, allowOccluded }),
   );
@@ -101,8 +101,8 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       selector: z.string().optional().describe('CSS selector to aim at (resolved server-side). Overrides x/y.'),
       entity: entitySpec.optional(),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
-      modifiers: z.array(modifierEnum).optional().describe('Held modifier keys.'),
-      allowOccluded: allowOccludedParam.describe("Allow a covered target on `action:'down'` (default false = refused). Ignored on move/up: those are delivered to whatever captured the press, so what sits under the destination cannot stop them."),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
+      allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Applies to \`action:'down'\` only — a move/up is delivered to whatever captured the press, so what sits under the destination cannot stop it.`),
     },
     async ({ action, x, y, selector, entity, button, modifiers, allowOccluded }) =>
       postJson('/api/input/pointer', { action, x, y, selector, entity, button, modifiers, allowOccluded }),
@@ -119,7 +119,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
       selector: z.string().optional().describe('CSS selector to aim at. Overrides x/y.'),
       entity: entitySpec.optional(),
-      modifiers: z.array(modifierEnum).optional().describe('Held modifier keys.'),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
       allowOccluded: allowOccludedParam,
     },
     async ({ x, y, selector, entity, modifiers, allowOccluded }) => postJson('/api/input/hover', { x, y, selector, entity, modifiers, allowOccluded }),
@@ -144,8 +144,8 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       entity: entitySpec.optional(),
       deltaX: z.number().optional().describe('Horizontal wheel delta (default 0). At least ONE of deltaX/deltaY must be non-zero — a zero-delta scroll is REFUSED, not dispatched as a silent no-op.'),
       deltaY: z.number().optional().describe('Vertical wheel delta; positive = content down. Default 0, but a call with neither delta non-zero is REFUSED (~120 ≈ one wheel tick).'),
-      modifiers: z.array(z.enum(['shift', 'control', 'alt', 'meta', 'cmd', 'command']))
-        .optional().describe('Held modifier keys set on the wheel event (e.g. ["control"] or ["meta"] for Ctrl/Cmd+wheel zoom).'),
+      modifiers: z.array(modifierEnum)
+        .optional().describe(`${MODIFIERS_BASE}, set on the wheel event (e.g. ["control"] or ["meta"] for Ctrl/Cmd+wheel zoom).`),
       allowOccluded: allowOccludedParam,
     },
     async ({ x, y, selector, entity, deltaX, deltaY, modifiers, allowOccluded }) => postJson('/api/input/scroll', { x, y, selector, entity, deltaX, deltaY, modifiers, allowOccluded }),
@@ -236,7 +236,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'Requires the Electron editor.',
     {
       key: z.string().describe("Electron keyCode, e.g. 'Escape', 'Delete', 'ArrowLeft', 'w', 'z'."),
-      modifiers: z.array(modifierEnum).optional().describe("Held modifiers, e.g. ['meta'] for Cmd+key."),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, e.g. ['meta'] for Cmd+key.`),
       panel: z.string().optional().describe(
         'Focus this panel BEFORE pressing, so a panel-scoped chord resolves there. Ids (CASE-'
         + 'SENSITIVE — "Game" is not "game"): ' + IDS + '. A game may also register custom '
@@ -367,10 +367,10 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       '`allowOccluded:true` to press anyway and see what happens. Requires the Electron editor.',
     {
       id: z.string().describe('Handle id from modoki_handles.'),
-      button: z.enum(['left', 'right', 'middle']).optional().describe('Mouse button held during the drag (default left).'),
-      clickCount: z.number().optional(),
-      modifiers: z.array(modifierEnum).optional(),
-      allowOccluded: z.boolean().optional().describe('Press even though something covers the handle (default false = refuse, naming the cover).'),
+      button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button to click with (default 'left'). This tool CLICKS — the 'held during the drag' wording here was copy-pasted from modoki_drag_handle."),
+      clickCount: z.number().optional().describe('1 = single (default), 2 = double-click — same meaning as modoki_tap.'),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, e.g. ["shift"] to add to a marquee selection — same meaning as modoki_tap.`),
+      allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Here the target is a HANDLE, and a covered one reads as an inert one — which is how a working gizmo handle under the SceneView toolbar got filed as a high-severity bug.`),
     },
     async ({ id, button, clickCount, modifiers, allowOccluded }) => postJson('/api/input/tap-handle', { id, button, clickCount, modifiers, allowOccluded }),
   );
@@ -397,8 +397,8 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       delta: z.object({ dx: z.number(), dy: z.number() }).optional().describe('Offset from the handle\'s current position.'),
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button held for the drag (default 'left')."),
-      modifiers: z.array(modifierEnum).optional().describe('Modifier keys held for the whole drag (real keyDown/keyUp around the gesture).'),
-      allowOccluded: z.boolean().optional().describe('Drag even though something covers an endpoint (default false = refuse, naming the cover).'),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, held for the WHOLE drag as a real keyDown/keyUp around the gesture — so a listener tracking the modifier's LEVEL (the 3D gizmo's snap) sees it down for every intermediate move.`),
+      allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Reported PER ENDPOINT — \`fromTarget\`/\`toTarget\` each carry their own \`occluded\`, since a covered source and a covered destination need different fixes.`),
     },
     async ({ id, to, toId, delta, steps, button, modifiers, allowOccluded }) => postJson('/api/input/drag-handle', { id, to, toId, delta, steps, button, modifiers, allowOccluded }),
   );
