@@ -14,7 +14,7 @@
  *  we dispatch on given a hit-test result — the hit-test itself is the browser's. */
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { handleTap, handlePointer, releaseHeldPointer, _resetHeldPointerForTests } from '../../app/debug/bridge';
+import { handleTap, handleDrag, handlePointer, releaseHeldPointer, _resetHeldPointerForTests } from '../../app/debug/bridge';
 
 const baselineElementFromPoint = document.elementFromPoint;
 
@@ -183,6 +183,67 @@ describe('device_tap aims at DOM UI, not through it (#299)', () => {
   });
 });
 
+describe('what counts as DOM UI — the edges close-out review turned up (#299)', () => {
+  it('an inline <svg> icon inside a button IS a UI target — SVGElement is not an HTMLElement', () => {
+    // The narrowing bug: `el instanceof HTMLElement` is FALSE for every SVG node, so an icon button
+    // — one of the most common UI shapes there is — fell straight back to the canvas path and
+    // reported a clean `ok (canvas:…)`. That is the #299 defect again, wearing an icon.
+    canvas();
+    const btn = document.createElement('button');
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    btn.appendChild(svg);
+    document.body.appendChild(btn);
+    let clicked = 0;
+    btn.addEventListener('click', () => { clicked++; });
+    hitTestReturns(svg);
+
+    return handleTap({ x: 10, y: 10 }).then((reply) => {
+      expect(clicked).toBe(1);            // reached the button by bubbling, as a finger's click does
+      expect(reply).toContain('dom:svg');
+      expect(reply).not.toContain('canvas:');
+    });
+  });
+
+  it('a HIDDEN utility canvas does not turn a UI panel into a "container"', async () => {
+    // `querySelector('canvas')` finds a canvas however invisible it is, so a panel holding an
+    // offscreen scratch canvas (a text-metrics surface is the usual one) was misread as a container
+    // OF the game surface, and its whole subtree went back to the canvas path.
+    const gameCanvas = canvas();
+    const panel = document.createElement('div');
+    const scratch = document.createElement('canvas');
+    scratch.style.display = 'none';
+    scratch.checkVisibility = () => false;   // jsdom implements no layout, so state the fact directly
+    panel.appendChild(scratch);
+    document.body.appendChild(panel);
+    const onPanel = record(panel);
+    const onGame = record(gameCanvas);
+    hitTestReturns(panel);
+
+    const reply = await handleTap({ x: 10, y: 10 });
+
+    expect(onPanel.some((e) => e.type === 'pointerdown' && e.target === 'DIV')).toBe(true);
+    expect(onGame).toEqual([]);
+    expect(reply).toContain('dom:div');
+  });
+
+  it('handleDrag applies the SAME container rule — a wrapper around the canvas is not a drag handle', async () => {
+    // `handleDrag` re-implements the container rule independently of `pickDomTargetAt`, so it needs
+    // its own case: without it, dropping the clause would leave every drag test green.
+    const wrapper = document.createElement('div');
+    document.body.appendChild(wrapper);
+    const c = document.createElement('canvas');
+    wrapper.appendChild(c);
+    const onWrapper: string[] = [];
+    wrapper.addEventListener('pointerdown', (e) => onWrapper.push((e.target as Element).tagName));
+    hitTestReturns(wrapper);
+
+    const reply = await handleDrag({ fromX: 10, fromY: 10, toX: 50, toY: 50, steps: 1, delayMs: 0 });
+
+    expect(reply).toContain('canvas:');           // world-drag path, not a DOM drag on the wrapper
+    expect(onWrapper).toEqual(['CANVAS']);        // it only SAW them, by bubbling from the canvas
+  });
+});
+
 describe('device_pointer holds its gesture on the DOM element it pressed (#299)', () => {
   it('down on a touch control presses the DIV, and move/up reuse it across calls', async () => {
     const c = canvas();
@@ -206,6 +267,46 @@ describe('device_pointer holds its gesture on the DOM element it pressed (#299)'
     expect(onDpad.map((e) => e.type)).toEqual(['pointerdown', 'pointermove', 'pointerup']);
     expect(onCanvas).toEqual([]);
     expect(up).toMatch(/held:false/);
+  });
+
+  it('mirrors the MOUSE modality on a DOM target, with the held-button mask', async () => {
+    // Same reason the tap path sends mouse events: a handler written against mousedown/mouseup
+    // would otherwise never see the press. The `buttons` mask has to say the button is still down
+    // mid-gesture, or a held move reads as a hover rather than a drag.
+    canvas();
+    const el = uiControl('slider');
+    hitTestReturns(el);
+    const seen: Array<{ type: string; buttons: number }> = [];
+    for (const t of ['mousedown', 'mousemove', 'mouseup']) {
+      el.addEventListener(t, (e) => seen.push({ type: t, buttons: (e as MouseEvent).buttons }));
+    }
+
+    await handlePointer({ action: 'down', x: 5, y: 5 });
+    await handlePointer({ action: 'move', x: 9, y: 5 });
+    await handlePointer({ action: 'up', x: 9, y: 5 });
+
+    expect(seen).toEqual([
+      { type: 'mousedown', buttons: 1 },
+      { type: 'mousemove', buttons: 1 },   // still held — a drag, not a hover
+      { type: 'mouseup', buttons: 0 },
+    ]);
+  });
+
+  it('a press whose LEASE dies mid-call is released, not left held', async () => {
+    // The race the disconnect defence did not cover: the aim is resolved across an await, so a
+    // disconnect landing in that window ran its release before `heldPointer` was set — and nothing
+    // would ever run again. The reply has to say so rather than claim a held press.
+    canvas();
+    hitTestReturns(document.body);
+    const inFlight = handlePointer({ action: 'down', x: 10, y: 20 });
+    releaseHeldPointer();                 // the lease drops while the aim is still resolving
+
+    const reply = await inFlight;
+
+    expect(reply).toMatch(/held:false/);
+    expect(reply).toContain('the lease dropped during this call');
+    // and nothing is left held: a follow-up move is refused as a stray
+    expect(await handlePointer({ action: 'move', x: 11, y: 21 })).toMatch(/no pointer is held/);
   });
 });
 
@@ -242,6 +343,37 @@ describe('a press the agent can no longer release is released for it (#299)', ()
     expect(released).toContain('dom:div[data-entity-id="held-control"]');
     expect(onEl.map((e) => e.type)).toEqual(['pointerdown', 'pointerup']);
     expect(onCanvas).toEqual([]);
+  });
+
+  it('the forced release mirrors MOUSEUP too, matching the live up path', async () => {
+    // Asymmetry caught in review: the live `up` mirrors the mouse modality for a DOM target and the
+    // forced release did not, so a handler tracking the press via mousedown/mouseup saw it begin and
+    // never end — the stranded-press shape, one modality over.
+    canvas();
+    const el = uiControl('mouse-tracked');
+    hitTestReturns(el);
+    const seen: string[] = [];
+    for (const t of ['mousedown', 'mouseup']) el.addEventListener(t, (e) => seen.push(e.type));
+    await handlePointer({ action: 'down', x: 5, y: 5 });
+
+    releaseHeldPointer();
+
+    expect(seen).toEqual(['mousedown', 'mouseup']);
+  });
+
+  it('a target that leaves the DOM mid-press is REPORTED, not reported as a clean ok', async () => {
+    // A control that unmounts itself on its own press is an ordinary React pattern. Dispatching at a
+    // detached node neither throws nor bubbles, so the click reaches nothing — and a bare `ok` there
+    // would be the false success this whole fix exists to remove.
+    canvas();
+    const el = uiControl('self-removing');
+    hitTestReturns(el);
+    el.addEventListener('pointerdown', () => { el.remove(); });
+
+    const reply = await handleTap({ x: 5, y: 5 });
+
+    expect(reply).toContain('left the DOM during the press');
+    expect(reply).toContain('the click reached nothing');
   });
 
   it('is a no-op when nothing is held', async () => {

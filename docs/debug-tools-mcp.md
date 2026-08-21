@@ -277,8 +277,18 @@ output, a game's touch d-pad) received an event whose `target` was the CANVAS an
 `e.target`/`closest(...)` handler missed — while the reply said `ok (canvas:only)`. Measured on the
 A23 with `demos/forest-camp`: a press on the d-pad left `moveX` at 0 and a tap on the aim button
 never toggled archery. The reply now names where the press landed — `dom:<element>` or
-`canvas:<how>` — so the aim is checkable from the reply alone. An element that CONTAINS the canvas
-(`<body>`, an app root) is still a container, not UI, and keeps the canvas path.
+`canvas:<how>` — so the aim is checkable from the reply alone. An element that CONTAINS a VISIBLE
+canvas (`<body>`, an app root) is still a container, not UI, and keeps the canvas path; a hidden
+utility canvas inside a UI panel does not make that panel a container. "UI" means any `Element`, not
+just an `HTMLElement` — an inline `<svg>` icon inside a button is an `SVGElement`, and narrowing to
+`HTMLElement` sent every icon-button tap back down the canvas path with a clean `ok`.
+
+Two replies say more than `ok`, and both are cases where a bare `ok` would over-claim:
+- **`— the target left the DOM during the press`**: the element unmounted itself between the down
+  and the up (an ordinary React pattern). Dispatching at a detached node neither throws nor bubbles,
+  so the trailing `click` reached nothing and only the down half was delivered.
+- **`— the lease dropped during this call`** (`device_pointer`): the connection died while the aim
+  was still resolving, so the press was released immediately rather than left held.
 
 ⚠️ **Release what `device_pointer` presses.** A `down` left un-released latches the engine's
 `pointerSource`, and until then the game reads NO dragging at all — **including the human's finger**,

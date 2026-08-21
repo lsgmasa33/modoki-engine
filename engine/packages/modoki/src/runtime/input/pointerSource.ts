@@ -172,13 +172,13 @@ function onPointerDown(e: PointerEvent): void {
     // real multitouch. The reverse case (a synthetic press during a real gesture) is NOT adopted:
     // there the finger is real and owns the gesture.
     if (!e.isTrusted || activeTrusted) return;
-    // Close the stale gesture with a release before latching the new one, so `pending` keeps its
-    // down/up alternation — see `pushTransition`: a down following a down makes `computePointerEdge`
-    // emit neither edge, silently swallowing the finger we are trying to hand control to.
-    down = false;
-    pushTransition({ down: false, x, y, startX, startY });
-    activeId = null;
-    activeTrusted = false;
+    // Close the stale gesture with a real release before latching the new one, so `pending` keeps
+    // its down/up alternation — see `pushTransition`: a down following a down makes
+    // `computePointerEdge` emit neither edge, silently swallowing the finger we are trying to hand
+    // control to. It must be `endGesture()` and not a hand-rolled clear: the blocked-root check
+    // below can `return` between here and the new latch, so this is the LAST thing that touches the
+    // velocity, and leaving it non-zero would publish a moving pointer that is up.
+    endGesture();
   }
   if (isPointerBlocked(e.target)) {
     // Never latch `activeId` for a blocked press — the whole gesture (its later
@@ -232,22 +232,35 @@ function onPointerMove(e: PointerEvent): void {
   active = true;
 }
 
-/** Up OR cancel: end the gesture. `pointercancel` is treated identically to `up`
- *  (a plain release) rather than as an abort, so a browser-reclaimed touch doesn't
- *  strand `down=true` forever — the consumer sees a clean released edge. */
-function onPointerUp(e: PointerEvent): void {
-  if (e.pointerId !== activeId) return;
-  x = e.clientX; y = e.clientY;
+/** End the active gesture at the current `x`/`y` and queue its release transition.
+ *
+ *  Shared by the two paths that can end one — a real `pointerup`/`pointercancel`, and the
+ *  stale-synthetic takeover in `onPointerDown` — because they MUST leave identical state and a
+ *  hand-copied second version already drifted: the takeover's first draft cleared `activeId`/`down`
+ *  but not the velocity or the 1€ filters, so a takeover that then hit the pointer-block check
+ *  returned with `down:false` and a NON-ZERO `vx/vy`. That breaks this module's published contract
+ *  (velocity is zero whenever the pointer is up — see `pointerPredictedPos`) and leaves the
+ *  predicted point extrapolating from a gesture that has ended. */
+function endGesture(): void {
   down = false;
   activeId = null;
   activeTrusted = false;
-  active = true;
   // Kill the velocity on release so the extrapolated point collapses onto the true one. A
   // flick-and-lift would otherwise leave the picture coasting past the finger on the very
   // frame the gesture is being resolved.
   vx = 0; vy = 0;
   filterX.reset(); filterY.reset();
   pushTransition({ down: false, x, y, startX, startY });
+}
+
+/** Up OR cancel: end the gesture. `pointercancel` is treated identically to `up`
+ *  (a plain release) rather than as an abort, so a browser-reclaimed touch doesn't
+ *  strand `down=true` forever — the consumer sees a clean released edge. */
+function onPointerUp(e: PointerEvent): void {
+  if (e.pointerId !== activeId) return;
+  x = e.clientX; y = e.clientY;
+  active = true;
+  endGesture();
 }
 
 /** Wheel/scroll — accumulate one signed notch per event (magnitude-agnostic, so a

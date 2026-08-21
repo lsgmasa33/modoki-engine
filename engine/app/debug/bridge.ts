@@ -343,12 +343,21 @@ export async function handleResolveAim(params: Record<string, unknown>): Promise
  *  a wrapper) is not a UI target — the aim is meant for the surface beneath it, so those keep the
  *  `pickCanvasAt` geometry fallback and its honest `contains`/`ambiguous` labels. jsdom returns
  *  `null` here by default (tests/setup.ts), so every coordinate-aimed test keeps the canvas path. */
-function pickDomTargetAt(x: number, y: number): HTMLElement | null {
+function pickDomTargetAt(x: number, y: number): Element | null {
   const el = document.elementFromPoint(x, y);
-  if (!(el instanceof HTMLElement)) return null;
+  // `Element`, NOT `HTMLElement`: an inline `<svg>` icon inside a button is an SVGElement, which is
+  // not an HTMLElement — narrowing to HTMLElement sent every icon-button tap back down the canvas
+  // path with a clean `ok`, i.e. the #299 defect again, scoped to SVG-rooted UI.
+  if (!(el instanceof Element)) return null;
   if (el instanceof HTMLCanvasElement || el.closest('canvas')) return null; // the game surface itself
   if (el === document.body || el === document.documentElement) return null; // never a UI control
-  if (el.querySelector('canvas')) return null;                             // a container OF it, not UI
+  // A container OF the game surface, not UI. Only a VISIBLE canvas counts: a UI panel that happens
+  // to hold a hidden utility canvas (an offscreen text-metrics scratch surface is the usual one) is
+  // ordinary UI, and treating it as a container would route its whole subtree back to the canvas.
+  // `checkVisibility` is Chromium 105+; where it is absent (jsdom) fall back to "any canvas counts",
+  // which is the conservative reading.
+  const canvases = Array.from(el.querySelectorAll('canvas'));
+  if (canvases.some((c) => (typeof c.checkVisibility === 'function' ? c.checkVisibility() : true))) return null;
   return el;
 }
 
@@ -403,10 +412,17 @@ async function dispatchTapAt(x: number, y: number): Promise<string> {
     domTarget.dispatchEvent(new PointerEvent('pointerdown', ptrInit(x, y)));
     domTarget.dispatchEvent(new MouseEvent('mousedown', mouseInit(x, y)));
     await new Promise((r) => setTimeout(r, 50)); // same hold as the canvas path — let Input sample the down edge
+    // The element can be GONE by now — a control that unmounts itself on its own press is an
+    // ordinary React pattern. `dispatchEvent` on a detached node neither throws nor fails, but the
+    // events cannot bubble to React's delegated root listener, so the `click` (what most controls
+    // actually listen for) reaches nothing. Saying `ok` alone there would be a false success of
+    // exactly the kind this fix exists to remove, so the reply states it instead.
+    const detached = !domTarget.isConnected;
     domTarget.dispatchEvent(new PointerEvent('pointerup', ptrInit(x, y)));
     domTarget.dispatchEvent(new MouseEvent('mouseup', mouseInit(x, y)));
     domTarget.dispatchEvent(new MouseEvent('click', mouseInit(x, y)));
-    const msg = `ok (dom:${describeEl(domTarget)})`;
+    const msg = `ok (dom:${describeEl(domTarget)})`
+      + (detached ? ' — the target left the DOM during the press, so only the down half was delivered; the click reached nothing' : '');
     _log(`[debug-bridge] TAP → ${msg} css(${x.toFixed(1)},${y.toFixed(1)})`);
     return msg;
   }
@@ -641,11 +657,22 @@ export function createPortLifecycleHandler(deps: {
  *  that owns the gesture", not a workaround. A held press does NOT currently survive a page
  *  navigation/reload on the device (unlike the editor, which explicitly persists across one);
  *  that asymmetry is inherent to there being no separate backend process here. */
-let heldPointer: { button: number; x: number; y: number; target: HTMLElement; how: HeldHow } | null = null;
+let heldPointer: { button: number; x: number; y: number; target: Element; how: HeldHow } | null = null;
 
 /** How the sustained press chose its dispatch target — a `pickCanvasAt` verdict, or `dom` when the
  *  aim landed on a DOM UI element and the press went there instead (#299). */
 type HeldHow = CanvasPick['how'] | 'dom';
+
+/** Bumped by every `releaseHeldPointer` call, i.e. every point at which a held press was supposed
+ *  to end. `handlePointer` samples it on entry and re-checks after its awaits, because a `down`
+ *  whose lease died WHILE it was resolving its aim would otherwise set `heldPointer` AFTER the
+ *  disconnect handler's release had already run and found nothing to release — leaving a press
+ *  nothing can ever lift, which is exactly the state these defences exist to make unreachable.
+ *  The window is one async hop (`resolveSelectorPoint`'s dynamic import), and the consequence is
+ *  the unrecoverable one, so it is worth a counter. Counting releases rather than disconnects
+ *  keeps the whole mechanism reachable from `releaseHeldPointer` alone — nothing needs a
+ *  test-only seam to exercise it. */
+let leaseEpoch = 0;
 
 /** Release a press left held, by dispatching its matching `pointerup` at the held point (#299).
  *
@@ -658,11 +685,16 @@ type HeldHow = CanvasPick['how'] | 'dom';
  *
  *  Returns a description of what it released, or null if nothing was held. */
 export function releaseHeldPointer(): string | null {
+  leaseEpoch++; // counted even with nothing held — that is the case `handlePointer` must notice
   if (!heldPointer) return null;
   const { target, button, x, y, how } = heldPointer;
   heldPointer = null; // cleared FIRST — a throwing dispatch must not leave the press held anyway
   try {
     target.dispatchEvent(mkButtonedPointerEvent('pointerup', x, y, button));
+    // Mirror the mouse modality exactly as the live `up` path does — otherwise a handler that
+    // tracks the press via `mousedown`/`mouseup` sees the press begin and never end, which is the
+    // stranded-press shape this function exists to prevent, one modality over.
+    if (how === 'dom') target.dispatchEvent(new MouseEvent('mouseup', { clientX: x, clientY: y, bubbles: true, cancelable: true, button, buttons: 0 }));
   } catch { /* the target may be detached by now; the point is to clear our own held state */ }
   const where = how === 'dom' ? `dom:${describeEl(target)}` : `canvas:${how}`;
   return `${POINTER_BUTTON_NAME[button]} at ${x.toFixed(1)},${y.toFixed(1)} on ${where}`;
@@ -699,6 +731,7 @@ function mkButtonedPointerEvent(type: string, x: number, y: number, button: numb
 // backend and asserts on the MCP tool's relayed payload cannot exercise them; jsdom lets this
 // module import cleanly (measured), so a direct call is the honest way to cover them.
 export async function handlePointer(params: Record<string, unknown>): Promise<string> {
+  const epochOnEntry = leaseEpoch;
   const action = params.action as string;
   if (action !== 'down' && action !== 'move' && action !== 'up') {
     return `Error: pointer action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`;
@@ -735,7 +768,7 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
   // Re-picking per call would let a drag that crosses onto another canvas switch mid-gesture and
   // deliver its `up` to an element that never saw the `down` — the same pointer-capture break the
   // held button and held position already exist to avoid.
-  let target: HTMLElement;
+  let target: Element;
   let how: HeldHow;
   if (action === 'down') {
     // DOM UI under the aim wins, for the reason in `pickDomTargetAt` (#299): a press sent at the
@@ -769,6 +802,14 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
   await new Promise((r) => setTimeout(r, 16)); // let per-frame Input sampling see the edge, same as tap/drag
 
   const where = how === 'dom' ? `dom:${describeEl(target)}` : `canvas:${how}`;
+  // The lease died while this call was resolving its aim, so the disconnect handler's release ran
+  // before there was anything to release. Release it here instead of returning a held press nobody
+  // can ever lift.
+  if (heldPointer && leaseEpoch !== epochOnEntry) {
+    releaseHeldPointer();
+    _log(`[debug-bridge] POINTER ${action} → ${where}, then released: the lease dropped mid-call`);
+    return withMechanismSuffix(`ok (${action} ${where}, button ${buttonName}, held:false) @ ${aim.label} — the lease dropped during this call, so the press was released rather than left held`);
+  }
   _log(`[debug-bridge] POINTER ${action} → ${where} @ ${aim.label}`);
   return withMechanismSuffix(`ok (${action} ${where}, button ${buttonName}, held:${heldPointer !== null}) @ ${aim.label}`);
 }
@@ -1127,7 +1168,7 @@ async function initNativeBridge() {
     } else {
       _log('[debug-bridge] MCP client disconnected');
       // Never leave a press the agent can no longer release (#299) — see `releaseHeldPointer`.
-      const released = releaseHeldPointer();
+      const released = releaseHeldPointer(); // bumps `leaseEpoch` — see there
       if (released) _log(`[debug-bridge] released a pointer left held by the dropped lease: ${released}`);
     }
   });

@@ -176,8 +176,13 @@ finger cannot land during a genuinely-in-progress *synthetic* gesture. That make
 where a staleness TIMEOUT would also steal a legitimate long hold from a second finger. The reverse
 is not adopted (a synthetic press never displaces a real gesture), and a synthetic-input-only device
 — the iPhone 8, which cannot run WebDriverAgent — is unaffected, since nothing there is ever
-trusted. The stale gesture is closed with a release transition before the new one latches, so the
-`pending` FIFO keeps its down/up alternation. The bridge closes the other half: dropping the lease
+trusted. The stale gesture is closed by the same `endGesture()` a real `pointerup` uses before the new one
+latches — so the `pending` FIFO keeps its down/up alternation, AND the velocity and 1€ filters are
+reset. Sharing that function is load-bearing rather than tidiness: the takeover's first draft
+hand-rolled the clear and skipped the velocity reset, and because the pointer-block check can
+`return` between the takeover and the new latch, a takeover onto a blocked root then published
+`down:false` with a non-zero `vx/vy` — a pointer that is up and still moving, which
+`pointerPredictedPos` extrapolates from. The bridge closes the other half: dropping the lease
 releases a press left held (`releaseHeldPointer`), because that is the moment the agent provably
 cannot send the `up` itself.
 

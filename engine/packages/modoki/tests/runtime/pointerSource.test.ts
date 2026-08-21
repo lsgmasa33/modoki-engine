@@ -26,6 +26,20 @@ function firePointer(type: string, x: number, y: number, pointerId = 1, target: 
   target.dispatchEvent(ev);
 }
 
+/** Like `firePointer`, but with a chosen `timeStamp` (ms). Needed to make VELOCITY happen at all:
+ *  `onPointerMove` only trusts a dt inside 1-64 ms, and two events constructed back to back in
+ *  jsdom carry near-identical timestamps, so the derivative is (correctly) discarded and every
+ *  velocity assertion would read 0 for a reason that has nothing to do with the code under test.
+ *  Same jsdom-internals route as `fireRealPointer`, and verified for the same reason. */
+function firePointerAtTime(type: string, x: number, y: number, pointerId: number, timeStamp: number): void {
+  const ev = new MouseEvent(type, { clientX: x, clientY: y, bubbles: true }) as MouseEvent & { pointerId: number };
+  (ev as { pointerId: number }).pointerId = pointerId;
+  const impl = Object.getOwnPropertySymbols(ev).find((sym) => sym.description === 'impl');
+  if (impl) (ev as unknown as Record<symbol, { timeStamp: number }>)[impl].timeStamp = timeStamp;
+  if (ev.timeStamp !== timeStamp) throw new Error('cannot set a timeStamp in this jsdom — the velocity assertions below would be vacuous');
+  window.dispatchEvent(ev);
+}
+
 /** A REAL finger/mouse: the same event, but `isTrusted` true at the moment `pointerSource` sees it.
  *  Every event a test — or the device debug bridge — dispatches is untrusted, and that asymmetry is
  *  exactly what `onPointerDown` keys the stale-gesture takeover on (#299), so a test of it has to be
@@ -601,6 +615,34 @@ describe('a stranded SYNTHETIC gesture yields to a real finger (#299)', () => {
     const f = sampleFrame(prev);
     expect(f.pointer.x).toBe(100);
     expect(f.pointer.released).toBe(false);
+  });
+
+  it('a takeover that is then BLOCKED still leaves velocity at zero, as a release must', () => {
+    // The drifted-copy bug: the takeover used to clear activeId/down by hand and skip the velocity
+    // and filter reset `onPointerUp` does. The blocked-root check `return`s between the takeover and
+    // the new latch, so nothing downstream cleaned up — the frame then published `down:false` with a
+    // NON-ZERO vx/vy, which `pointerPredictedPos` extrapolates from. Both paths now share
+    // `endGesture()`, so this can only regress by editing that one function.
+    pointerSource.attach();
+    const blocked = document.createElement('div');
+    document.body.appendChild(blocked);
+    registerPointerBlocker(blocked);
+    const prev = { down: false };
+
+    firePointerAtTime('pointerdown', 10, 10, 1, 1000);  // stranded synthetic press
+    sampleFrame(prev);
+    firePointerAtTime('pointermove', 90, 90, 1, 1016);  // +16 ms — inside the usable dt band
+    const moved = sampleFrame(prev);
+    expect(Math.hypot(moved.pointer.vx, moved.pointer.vy)).toBeGreaterThan(0);
+
+    fireRealPointer('pointerdown', 300, 400, 7, blocked); // a real finger, on a blocked root
+
+    const f = sampleFrame(prev);
+    expect(f.pointer.down).toBe(false);             // the stale gesture was released
+    expect(f.pointer.released).toBe(true);
+    expect(f.pointer.vx).toBe(0);                   // …and released means NOT moving
+    expect(f.pointer.vy).toBe(0);
+    document.body.removeChild(blocked);
   });
 
   it('a synthetic gesture that IS released needs no takeover — the next press is ordinary', () => {
