@@ -15,6 +15,7 @@ export {
   CLAIM_TTL_MS,
   CLI_CLAIM_TTL_MS,
   adbDeviceId,
+  adbSerialOf,
   iosDeviceId,
   wifiDeviceId,
   isPidAlive,
@@ -26,6 +27,7 @@ export {
   sweepStaleClaims,
   describeConflict,
   foreignClaimFor,
+  ownAdbClaim,
 } from '../../scripts/deviceClaimsStore.mjs';
 
 export type {

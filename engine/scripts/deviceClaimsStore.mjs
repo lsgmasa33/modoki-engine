@@ -149,7 +149,18 @@ export function clampTtlMs(ttlMs) {
  *                        it. Namespaced so nobody mistakes it for a hardware id, and so the same
  *                        phone reached two ways yields two claims rather than one false match. */
 
-export function adbDeviceId(serial) { return `adb:${serial}`; }
+const ADB_PREFIX = 'adb:';
+export function adbDeviceId(serial) { return `${ADB_PREFIX}${serial}`; }
+
+/** The inverse of `adbDeviceId` — the serial inside an `adb:` id, or `undefined` for any other kind.
+ *  Exists so no caller re-derives the prefix by hand: a `deviceId.slice('adb:'.length)` at a call
+ *  site is a second copy of the encoding that a change here would leave behind, silently yielding a
+ *  MANGLED serial (`adb -s dbRFCT… install`) rather than a clean miss. */
+export function adbSerialOf(deviceId) {
+  return typeof deviceId === 'string' && deviceId.startsWith(ADB_PREFIX)
+    ? deviceId.slice(ADB_PREFIX.length)
+    : undefined;
+}
 export function iosDeviceId(udid) { return `ios:${udid}`; }
 export function wifiDeviceId(host) { return `ip:${host}`; }
 
@@ -510,6 +521,41 @@ export function foreignClaimFor(deviceId, opts = {}) {
   const held = listClaims(opts).find((c) => c.deviceId === deviceId);
   if (!held) return null;
   return path.resolve(held.clone) === clone ? null : held;
+}
+
+/** (#235 cross-process) The adb serial THIS clone currently holds a claim on, or `null`.
+ *
+ *  Exists because the build path's lease check was reading the WRONG COPY of the lease. The router
+ *  that owns `deviceConnection` is mounted in TWO processes — the Electron backend
+ *  (`electron/backendServer.ts`) and the Vite dev server (`plugins/vite-asset-scanner.ts`) — and
+ *  `deviceConnection` is a module singleton, so each process holds its own in-memory lease state.
+ *  `device_connect` opens the lease in the ELECTRON one; `Build -> Android` resolves its serial in
+ *  the VITE one, where the lease is forever `disconnected`. So #235's fix never fired: the build
+ *  refused with a message offering `device_connect {useAdb:true, serial}` and the AI panel's
+ *  picker, both of which the caller had ALREADY done. Same class of dishonest refusal #235 set out
+ *  to remove, one layer down.
+ *
+ *  The claims FILE is the cross-process state that in-memory singleton is not — the lease writes a
+ *  claim here at connect and drops it at disconnect, and this is already how the sibling-clone
+ *  check (`foreignClaimFor`, called from that same build path) works. So the fix is to read the
+ *  lease from the place both processes can see, not to dedupe the singleton.
+ *
+ *  Deliberately covers CLI (`npm run device:claim`) and WDA claims too, not just the socket lease:
+ *  the question the build asks is "which phone has this clone taken", and a clone that claimed a
+ *  handset from a terminal means it just as much as one that opened a lease.
+ *
+ *  AMBIGUITY IS NOT RESOLVED HERE. Holding claims on two handsets returns `null` rather than a
+ *  guess, so the caller falls through to the ordinary rule and refuses with both candidates named
+ *  — the #149 contract. A silent first-match is the exact bug that rule exists to prevent.
+ *
+ *  Applied as a PREFERENCE by the caller, never a pin: `resolveBuildAndroidSerial` drops a claimed
+ *  serial that is no longer attached, because a claim outlives a cable. */
+export function ownAdbClaim(opts = {}) {
+  const clone = path.resolve(opts.clone ?? process.cwd());
+  const mine = listClaims(opts).filter(
+    (c) => adbSerialOf(c.deviceId) !== undefined && path.resolve(c.clone) === clone,
+  );
+  return mine.length === 1 ? mine[0] : null;
 }
 
 /** This clone's branch, for the claim record. Read from `.git/HEAD` rather than by spawning git:

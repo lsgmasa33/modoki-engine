@@ -478,6 +478,27 @@ build-and-refuse cycle later. The lease is a **preference, not a pin** (same rul
 target follows): a leased phone that has since been unplugged is ignored rather than hard-failing a
 build with a serial the human never typed.
 
+⚠️ **That lease leg did not actually fire until 2026-08-21, and the reason is a trap worth keeping:
+`deviceConnection` is a module singleton, and the backend router is mounted in TWO PROCESSES** —
+Electron's `backendServer.ts` and the Vite dev server's `vite-asset-scanner.ts`. `device_connect`
+opens the lease in the **Electron** process; the build resolves its serial in the **Vite** one, where
+that singleton had never connected. Measured directly, one lease, one moment, two ports:
+`:5183/api/device/status` → `state:"connected", serial:"<the leased handset>"`, while
+`:5177/api/device/status` → `state:"disconnected", target:null`. So #235 shipped a correct resolver
+fed a value that was structurally always `undefined`, and the build kept advertising the two remedies
+it ignored — the very dishonesty #235 set out to remove. The fix is to read the lease from the
+**machine-wide claims file** (`ownAdbClaim`), which is the state both processes share and which the
+sibling-clone check on that same code path already used; it is NOT to dedupe the singleton. Guarded
+by `engine/tests/plugins/buildLeaseSourceWireShape.test.ts`, a source-text guard, because the defect
+is *which source is read* — every behavioural test passed `leaseSerial` in as an argument, which pins
+how the resolver USES a lease and can say nothing about whether the caller can SEE one.
+
+⚠️ **The #286 measurement below is real but was NOT discriminating, so don't cite it as proof of
+precedence.** With the lease invisible to the build, "the pin wins over the lease" and "the lease was
+never consulted at all" predict the *same* observation — an APK on the pinned S22. The conclusion
+still holds (the code genuinely prefers the pin, and now demonstrably consults the lease when there
+is no pin), but it holds because of the code, not because that experiment separated the two.
+
 ⚠️ **Read that order the other way round too: a held lease does NOT redirect a build away from the
 project's pin.** Claiming phone A and then running `Build → Android` on a project pinned to phone B
 installs on **B**, correctly and silently — the two mechanisms answer different questions ("which

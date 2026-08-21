@@ -467,7 +467,12 @@ export function loadLastTarget(dir: string = path.join(process.cwd(), '.modoki')
   try {
     const t = JSON.parse(fs.readFileSync(lastTargetFile(dir), 'utf8'));
     if (typeof t?.ip === 'string' || typeof t?.useAdb === 'boolean') {
-      return { ip: String(t.ip ?? ''), useAdb: Boolean(t.useAdb) };
+      // `serial` round-trips too, or the picker's remembered phone is written and never read back
+      // (#149): `saveLastTarget` persists it, so dropping it here made the memory die with the
+      // process. Blank normalises to absent so the field is either a real serial or missing —
+      // a cosmetic tidy, not load-bearing (every consumer already tests it for truthiness).
+      const serial = typeof t?.serial === 'string' && t.serial ? t.serial : undefined;
+      return { ip: String(t.ip ?? ''), useAdb: Boolean(t.useAdb), ...(serial ? { serial } : {}) };
     }
   } catch { /* not created yet */ }
   return null;

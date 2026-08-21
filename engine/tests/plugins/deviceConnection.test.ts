@@ -303,6 +303,21 @@ describe('device persistence helpers', () => {
     expect(loadLastTarget(dir)).toEqual({ ip: '192.168.1.54', useAdb: true });
   });
 
+  // The round-trip above passed for months while `serial` was write-only: it asserts on a target
+  // that never had one, so it could not tell a dropped field from an absent one. #149's whole point
+  // is that the picked phone survives a restart, and `loadLastTarget` was where it died.
+  it('round-trips a remembered adb serial — the picked phone survives a restart', () => {
+    saveLastTarget({ ip: '', useAdb: true, serial: 'RFTESTSERIAL1' }, dir);
+    expect(loadLastTarget(dir)).toEqual({ ip: '', useAdb: true, serial: 'RFTESTSERIAL1' });
+  });
+
+  it('normalises a blank or non-string remembered serial to absent', () => {
+    fs.writeFileSync(path.join(dir, 'device-target.json'), JSON.stringify({ ip: '', useAdb: true, serial: '' }));
+    expect(loadLastTarget(dir)).toEqual({ ip: '', useAdb: true });
+    fs.writeFileSync(path.join(dir, 'device-target.json'), JSON.stringify({ ip: '', useAdb: true, serial: 42 }));
+    expect(loadLastTarget(dir)).toEqual({ ip: '', useAdb: true });
+  });
+
   it('returns null (not a throw) for a corrupt device-target.json', () => {
     fs.writeFileSync(path.join(dir, 'device-target.json'), '{not valid json');
     expect(loadLastTarget(dir)).toBeNull();

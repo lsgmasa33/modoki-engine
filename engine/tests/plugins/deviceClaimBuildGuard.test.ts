@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  claimsDir, listClaims, claimDevice, foreignClaimFor, adbDeviceId,
+  claimsDir, listClaims, claimDevice, foreignClaimFor, adbDeviceId, adbSerialOf, wifiDeviceId, ownAdbClaim,
 } from '../../scripts/deviceClaimsStore.mjs';
 import type { DeviceClaim } from '../../scripts/deviceClaimsStore.d.mts';
 
@@ -108,5 +108,77 @@ describe('foreignClaimFor', () => {
     claimDevice({ deviceId: adbDeviceId('RFTESTSERIAL1'), clone: '/clones/sibling', branch: 'work-ai2' });
     expect(listClaims()).toHaveLength(1);
     expect(foreignClaimFor(adbDeviceId('RFTESTSERIAL1'), { clone: '/clones/mine' })).not.toBeNull();
+  });
+});
+
+/** `ownAdbClaim` (#235 cross-process) — the build path's replacement for reading the per-process
+ *  `deviceConnection` singleton. The bug it fixes was invisible to every existing test because they
+ *  all passed `leaseSerial` INTO `resolveBuildAndroidSerial` as an argument: that pins how the
+ *  resolver treats a lease, and says nothing about whether the caller can actually SEE one. The
+ *  lease lived in the Electron process and the build ran in the Vite process, so the real answer was
+ *  always `undefined`. These tests pin the SOURCE, which is where the defect was. */
+describe('ownAdbClaim', () => {
+  const mine = (deviceId: string, clone = '/clones/mine'): DeviceClaim => ({
+    deviceId, clone, branch: 'work-qa', pid: process.pid, at: Date.now(),
+  });
+
+  it('returns THIS clone\'s adb claim — the lease the build must honour', () => {
+    writeClaims([mine(adbDeviceId('RFTESTSERIAL1'))]);
+    expect(ownAdbClaim({ clone: '/clones/mine' })?.deviceId).toBe(adbDeviceId('RFTESTSERIAL1'));
+  });
+
+  it('ignores a SIBLING clone\'s claim — that phone is not ours to build onto', () => {
+    writeClaims([mine(adbDeviceId('RFTESTSERIAL1'), '/clones/sibling')]);
+    expect(ownAdbClaim({ clone: '/clones/mine' })).toBeNull();
+  });
+
+  it('ignores a WiFi lease — an `ip:` claim carries no serial to build with', () => {
+    writeClaims([mine(wifiDeviceId('192.168.1.54'))]);
+    expect(ownAdbClaim({ clone: '/clones/mine' })).toBeNull();
+  });
+
+  it('returns null when this clone holds TWO handsets, so the caller refuses with both named', () => {
+    writeClaims([mine(adbDeviceId('RFTESTSERIAL1')), mine(adbDeviceId('RFTESTSERIAL2'))]);
+    expect(ownAdbClaim({ clone: '/clones/mine' })).toBeNull();
+  });
+
+  it('applies staleness — a dead-pid claim holds nothing and must not steer a build', () => {
+    writeClaims([{ ...mine(adbDeviceId('RFTESTSERIAL1')), pid: 999_999_999 }]);
+    expect(ownAdbClaim({ clone: '/clones/mine', alive: () => false })).toBeNull();
+  });
+
+  it('compares RESOLVED paths, like foreignClaimFor', () => {
+    writeClaims([mine(adbDeviceId('RFTESTSERIAL1'), '/clones/mine/')]);
+    expect(ownAdbClaim({ clone: '/clones/mine' })?.deviceId).toBe(adbDeviceId('RFTESTSERIAL1'));
+  });
+
+  it('returns null when nothing is claimed at all', () => {
+    expect(ownAdbClaim({ clone: '/clones/mine' })).toBeNull();
+  });
+
+  it('sees a claim written by ANOTHER process — the whole point of using the file', () => {
+    // `claimDevice` here stands in for the Electron backend opening the lease; the read below
+    // stands in for the Vite dev server resolving the build serial. Separate module instances in
+    // production, and the file is what makes them agree.
+    claimDevice({ deviceId: adbDeviceId('RFTESTSERIAL1'), clone: '/clones/mine', branch: 'work-qa' });
+    expect(ownAdbClaim({ clone: '/clones/mine' })?.deviceId).toBe(adbDeviceId('RFTESTSERIAL1'));
+  });
+});
+
+/** `adbSerialOf` — the inverse of `adbDeviceId`, so the build call site does not carry a second copy
+ *  of the `adb:` prefix. A hand-rolled `.slice('adb:'.length)` there would survive a prefix change
+ *  and yield a MANGLED serial rather than a clean miss. */
+describe('adbSerialOf', () => {
+  it('round-trips adbDeviceId', () => {
+    expect(adbSerialOf(adbDeviceId('RFTESTSERIAL1'))).toBe('RFTESTSERIAL1');
+  });
+
+  it('returns undefined for a WiFi id — not a truncated string', () => {
+    expect(adbSerialOf(wifiDeviceId('192.168.1.54'))).toBeUndefined();
+  });
+
+  it('returns undefined for an iOS id and for junk', () => {
+    expect(adbSerialOf('ios:00008150-TESTTESTTESTTEST')).toBeUndefined();
+    expect(adbSerialOf('')).toBeUndefined();
   });
 });

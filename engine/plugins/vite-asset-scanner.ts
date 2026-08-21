@@ -20,7 +20,7 @@ import { projectAssetRoots } from '../scripts/projectRoots.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
 // Through the typed shell, not the .mjs directly: TypeScript consumers all enter the claim store
 // by one door, so a future caller cannot pick up a differently-typed view of the same rules.
-import { foreignClaimFor, describeConflict, adbDeviceId, iosDeviceId } from './backend/deviceClaims';
+import { foreignClaimFor, describeConflict, adbDeviceId, adbSerialOf, iosDeviceId, ownAdbClaim } from './backend/deviceClaims';
 import { acquireBuild, releasePolicy } from './backend/buildLock';
 import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
@@ -64,7 +64,7 @@ import { type SpriteSlice, type SpriteAssetRef } from '../packages/modoki/src/ru
 import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { handleBackendRequest, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
-import { reclaimStaleDeviceStateAtStartup, deviceConnection } from './backend/deviceConnection';
+import { reclaimStaleDeviceStateAtStartup } from './backend/deviceConnection';
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
@@ -1930,9 +1930,17 @@ export function assetScannerPlugin(): Plugin {
             // got the identical refusal on the next build. The lease is read HERE rather than
             // inside resolveBuildAndroidSerial because androidDevices.ts must not import the
             // lease manager (deviceConnection.ts imports IT; see that module's header).
-            // Only an adb lease carries a serial — a WiFi/IP lease has none, and reports undefined.
-            const lease = deviceConnection.status();
-            const leaseSerial = lease.state === 'connected' && lease.target?.useAdb ? lease.target.serial : undefined;
+            //
+            // ⚠️ Read from the CLAIMS FILE, never `deviceConnection.status()`. That singleton is
+            // per-PROCESS, and this router is mounted in two of them (here, and Electron's
+            // `backendServer.ts`). `device_connect` opens the lease in the ELECTRON process, so the
+            // copy visible HERE is permanently `disconnected` and #235's fix never fired at all —
+            // the build kept advertising the two remedies it ignored. The claims file is the state
+            // both processes share; `foreignClaimFor` below already reads it for the sibling-clone
+            // check. Only an adb claim carries a serial — a WiFi/IP lease has none (`ip:`), and
+            // two claimed handsets report null so the ordinary rule refuses with both named.
+            const ownClaim = ownAdbClaim();
+            const leaseSerial = ownClaim ? adbSerialOf(ownClaim.deviceId) : undefined;
             const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: user.device.androidDeviceId, leaseSerial });
             if ('error' in picked) androidSerialError = picked.error;
             else {

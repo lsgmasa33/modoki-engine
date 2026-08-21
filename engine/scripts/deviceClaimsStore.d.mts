@@ -119,3 +119,14 @@ export interface ForeignClaimOpts extends StaleOpts {
  *  implementation of "is this someone else's phone", used by the build path (`vite-asset-scanner.ts`)
  *  and safe for any future caller to reuse rather than re-deriving the comparison. */
 export declare function foreignClaimFor(deviceId: DeviceId, opts?: ForeignClaimOpts): DeviceClaim | null;
+
+/** (#235 cross-process) The single live `adb:` claim held by `opts.clone` (default `process.cwd()`),
+ *  or `null` when this clone holds none — or holds several, which is left for the caller's ordinary
+ *  ambiguity refusal rather than guessed at. The cross-process replacement for reading the
+ *  `deviceConnection` singleton, which is per-process and so is blind to a lease opened by the other
+ *  backend host. See the `.mjs` for the full reasoning. */
+export declare function ownAdbClaim(opts?: ForeignClaimOpts): DeviceClaim | null;
+
+/** The serial inside an `adb:` device id, or `undefined` for any other kind — the inverse of
+ *  `adbDeviceId`, so no call site re-derives the prefix by hand. */
+export declare function adbSerialOf(deviceId: string): string | undefined;
