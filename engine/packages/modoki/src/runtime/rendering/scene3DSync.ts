@@ -39,6 +39,7 @@ import {
   resolveMeshTemplate, resolveMeshLodInfo, resolveMaterialForMesh, resolveMaterial,
   getCachedEnvironment, acquireEnvironment, onModelInvalidated, getMeshAsset,
   retiredEnvironments, disposeRetiredEnvironment,
+  retiredMaterials3D, disposeRetiredMaterial,
 } from '../loaders/meshTemplateCache';
 import { getRiggedModel, ensureRiggedModelLoaded } from '../loaders/riggedModelCache';
 import {
@@ -407,18 +408,22 @@ export function isIblSuppressed(): boolean {
   return iblSuppressed;
 }
 
-/** Every THREE.Scene that could be binding an HDR env right now. Registered from the two places
- *  that bind one — {@link syncEnvironment} (every render surface, every frame) and
- *  `prewarmShadersForWorld`'s throwaway compile scene — rather than at renderer setup, so a
- *  surface cannot hold an env without registering. ⚠️ **Any new site that assigns a
- *  `getCachedEnvironment` result to a `THREE.Scene` MUST call `registerEnvSurface` first**, or
- *  the sweep below cannot see its binding and will free a texture it is still sampling. Held
- *  weakly: a torn-down panel's scene must not be kept alive by this set, and a dead ref just
- *  drops out of the sweep. */
+/** Every live render surface — the THREE.Scenes that could be binding a shared cached resource
+ *  (an HDR env, a `.mat.json` material) right now. It backs BOTH retire-and-sweep passes below:
+ *  a resource evicted while something still binds it is freed only once no surface here holds
+ *  it (#315 for envs, #317 for materials).
+ *
+ *  Registered from the per-frame syncs themselves — {@link syncEnvironment} and
+ *  {@link syncSceneRenderables3D}, which every surface calls every frame — plus
+ *  `prewarmShadersForWorld`'s throwaway compile scene, whose bindings outlive an `await`.
+ *  ⚠️ **Any new site that binds a cached material or env to a `THREE.Scene` MUST call
+ *  `registerRenderSurface` first**, or the sweeps cannot see its binding and will free
+ *  something it is still sampling. Held weakly: a torn-down panel's scene must not be kept
+ *  alive by this set, and a dead ref just drops out. */
 const envSurfaceRefs = new Set<WeakRef<THREE.Scene>>();
 const envSurfaceSeen = new WeakSet<THREE.Scene>();
 
-function registerEnvSurface(scene: THREE.Scene): void {
+function registerRenderSurface(scene: THREE.Scene): void {
   if (envSurfaceSeen.has(scene)) return;
   // Prune dead refs HERE, not only in the sweep: the sweep early-returns whenever nothing is
   // retired (the overwhelmingly common case), so it cannot be the only reaper. Without this the
@@ -442,6 +447,35 @@ function registerEnvSurface(scene: THREE.Scene): void {
  *  The failure mode this trades INTO is a leak, never a use-after-free: a surface that stops
  *  rendering while still bound keeps its texture alive — which is correct — and
  *  `disposeAllCachedResources` drains whatever is left. */
+/** Free the materials an `invalidateMaterial` (a texture re-import, or an Inspector material
+ *  edit) evicted, once no live surface binds them any more (#317).
+ *
+ *  Same shape as {@link sweepRetiredEnvironments}, one level deeper: a material is bound to a
+ *  MESH, not to the scene, so this traverses. Guarded on `retired.size` — the traverse only
+ *  ever runs in the few frames after an invalidation, never on an ordinary frame.
+ *
+ *  ⚠️ It sees only what a MESH binds. A base material whose sole remaining holders are derived
+ *  clones (tint / MaterialInstance / light-mask variants, which all hold `base.clone()` and
+ *  share its texture references) is freed. That matches the pre-#317 behaviour — where it was
+ *  freed immediately — so it is not a regression, but it is why this fix is only half of the
+ *  problem. */
+function sweepRetiredMaterials(): void {
+  const retired = retiredMaterials3D();
+  if (retired.size === 0) return; // the ordinary frame — no traverse
+  const bound = new Set<THREE.Material>();
+  for (const ref of envSurfaceRefs) {
+    const surface = ref.deref();
+    if (!surface) { envSurfaceRefs.delete(ref); continue; }
+    surface.traverse((o) => {
+      const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
+      if (!m) return;
+      if (Array.isArray(m)) { for (const one of m) bound.add(one); }
+      else bound.add(m);
+    });
+  }
+  for (const mat of [...retired]) if (!bound.has(mat)) disposeRetiredMaterial(mat);
+}
+
 function sweepRetiredEnvironments(): void {
   const retired = retiredEnvironments();
   if (retired.size === 0) return; // the overwhelmingly common case — no per-surface work
@@ -474,7 +508,7 @@ function clearTextureBackground(scene: THREE.Scene): void {
 }
 
 export function syncEnvironment(world: World, scene: THREE.Scene) {
-  registerEnvSurface(scene);
+  registerRenderSurface(scene);
   let envActive = false;
   let suppressed = false;
   world.query(Environment).updateEach(([env], entity) => {
@@ -3209,6 +3243,7 @@ export function syncSceneRenderables3D(
     batchDrawCalls?: boolean;
   },
 ) {
+  registerRenderSurface(scene);
   syncRenderables(world, scene, state, callbacks?.renderables);
   syncSkinnedModels(world, scene, state, callbacks?.skinned);
   syncBones(world, scene, state);
@@ -3236,6 +3271,9 @@ export function syncSceneRenderables3D(
   // silently corrupts exactly the A/B a caller flips this flag to run.
   if (callbacks?.batchDrawCalls) applyInstancedBatching(scene, state.ecsObjects.values());
   else clearInstancedBatches(scene);
+
+  // Last, so this surface's re-binds above are already visible to the sweep.
+  sweepRetiredMaterials();
 }
 
 /** Clear all owned-material tracking. Call on world swap alongside clearing
@@ -3475,7 +3513,7 @@ async function prewarmShadersForWorldInner(
         // below. Unregistered, a re-import during that await would let the retired-env sweep
         // free the texture this compile is still sampling — the very use-after-free the
         // retirement exists to prevent. The ref is weak, so the throwaway scene still dies.
-        registerEnvSurface(prewarmScene);
+        registerRenderSurface(prewarmScene);
         prewarmScene.environment = cached;
         prewarmScene.environmentIntensity = env.intensity;
       }
@@ -3733,6 +3771,89 @@ async function prewarmShadersForWorldInner(
   }
   prewarmScene.environment = null; // detach shared env before clear
   prewarmScene.clear();
+}
+
+/** Compile the pipelines the LIVE scene needs, before the first frame draws it (#238).
+ *
+ *  The companion to `prewarmShadersForWorld`, and the half that cannot drift. The prewarm builds a
+ *  COPY of the incoming scene before the swap, and six separate times that copy has differed from
+ *  what the renderer then drew — shadows, fog, rigs, mirrored transforms, side-pinned transparency,
+ *  and light-mask variants. This runs AFTER the swap, on the objects the sync just placed, so
+ *  there is no copy to be wrong: the materials are the ones the render will bind, including the
+ *  per-(material, light-selection) variant clones that `applyLightMask` mints.
+ *
+ *  ⚠️ **A pre-swap prewarm cannot cover those variants, and this is a fact about the mechanism
+ *  rather than an effort question.** A variant is keyed by the `THREE.Light` INSTANCES it selects
+ *  (`lightMaskVariants.lightId`, a per-object counter, deliberately — two render surfaces build
+ *  their own lights for the same ECS entities), and the whole variant cache is disposed on world
+ *  swap. So a variant minted before the swap is both keyed wrongly and thrown away by the swap.
+ *  Measured on `demos/postfx-demo`, comparing material `uuid`s inside ONE process: the prewarm
+ *  compiled 13 materials, the render drew 21, and the overlap was zero.
+ *
+ *  Self-limiting by construction: everything the prewarm got right is already in three's pipeline
+ *  cache, so this walks the scene and finds hits. It costs what the prewarm MISSED, which is the
+ *  property that makes it safe to run on every swap.
+ *
+ *  `compile` overrides the compile call for a post-FX stack, whose scene pass owns a different
+ *  render context (see `PostFXStack.compileSceneAsync`). */
+export async function compileLiveScene(
+  renderer: WebGPURenderer | THREE.WebGLRenderer,
+  scene: THREE.Scene,
+  camera: THREE.Camera,
+  compile?: () => Promise<void>,
+): Promise<void> {
+  return bootSpanAsync('live-scene-compile', async () => {
+    // three reads `matrixWorld` for the pipeline key (the mirrored-entity variant) and for
+    // culling, and `compileAsync` updates neither.
+    scene.updateMatrixWorld(true);
+    const unculled: THREE.Object3D[] = [];
+    const revealed: THREE.Object3D[] = [];
+    const lods: THREE.LOD[] = [];
+    const hidden: THREE.Object3D[] = [];
+    scene.traverse((o) => {
+      const lod = o as THREE.LOD;
+      if (lod.isLOD) {
+        // `_projectObject` calls `LOD.update(camera)` while building the compile render list,
+        // which re-hides every level but the one at the current distance — undoing the reveal
+        // below. Pinning autoUpdate off for the compile is what makes the reveal stick.
+        if (lod.autoUpdate) { lod.autoUpdate = false; lods.push(lod); }
+        for (const level of lod.levels) if (!level.object.visible) { level.object.visible = true; revealed.push(level.object); }
+      }
+      const mesh = o as THREE.Mesh;
+      // ⚠️ A material three draws SIDE-PINNED is hidden from this compile and stood in for below.
+      //
+      // Compiling it here is worse than not compiling it, which is the opposite of what it looks
+      // like. `compileAsync` walks three's own two-pass branch but its queue is drained after
+      // `material.side` is restored (see `sidePinnedVariants`), so it compiles the DoubleSide
+      // program — and the first frame's pinned draw then builds fresh pipelines over THAT program
+      // instead of finding the pinned ones. Measured on `games/3d-test`: including these meshes in
+      // the live compile put six synchronous first-frame builds BACK that the prewarm's pinned
+      // clones had already removed; hiding them returned it to zero.
+      if (mesh.isMesh && !Array.isArray(mesh.material) && mesh.material
+          && sidePinnedVariants(mesh.material as THREE.Material).length > 0 && mesh.visible) {
+        mesh.visible = false;
+        hidden.push(mesh);
+        return;
+      }
+      // Same reason as the prewarm's placeholders: `compileAsync` frustum-culls its render list
+      // against the frustum the LAST RENDERED FRAME left behind, which here is the OUTGOING
+      // scene's camera. Without this, what gets compiled depends on where the previous scene was
+      // looking — and on the first swap after boot, on a camera that has never framed anything.
+      if (mesh.isMesh && mesh.frustumCulled) { mesh.frustumCulled = false; unculled.push(mesh); }
+    });
+    try {
+      if (compile) await compile();
+      else await (renderer as THREE.WebGLRenderer).compileAsync?.(scene, camera);
+    } finally {
+      // Restored in a `finally` because a rejected compile must not leave the live scene with
+      // culling off (every object drawn every frame) or every LOD level visible (N draws per
+      // model) — a failed prewarm would otherwise become a permanent framerate bug.
+      for (const o of unculled) o.frustumCulled = true;
+      for (const o of revealed) o.visible = false;
+      for (const o of hidden) o.visible = true;
+      for (const lod of lods) lod.autoUpdate = true;
+    }
+  });
 }
 
 // ── Renderer creation ───────────────────────────────────

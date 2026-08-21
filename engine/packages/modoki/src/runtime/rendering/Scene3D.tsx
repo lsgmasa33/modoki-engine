@@ -18,13 +18,17 @@ import { registerSceneRenderer, unregisterSceneRenderer, normalizeJpegQuality, t
 import { registerBoundsProvider } from '../core/screenBounds';
 import { computeEntityScreenBounds } from './entityScreenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
-import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
+import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, compileLiveScene, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { registerRenderSurface } from './materialBroker';
 import { onRendererLost } from '../core/activeRenderer';
 import { createRendererRecovery } from './rendererRecovery';
 import { tickTierCalibration, applyPendingTierPromotion } from './tierCalibration';
 import { beginProfilerSample, endProfilerSample } from '../core/profilerMarkers';
 import { gpuPassScope } from '../core/gpuTimings';
+// The sanctioned wall-clock wrapper — a direct performance.now() in runtime/** fails the
+// determinism guard, and the live-compile hold is a real-time deadline, not sim time.
+import { rawNow } from '../core/clock';
+import { createLiveCompileGate } from './liveCompileGate';
 import { getRenderSettings, getEffectiveThreeSettings, getActiveTierOverrides } from './renderSettings';
 import { maskPostFXRequest } from './qualityTier';
 import { onForceResize } from './resizeBus';
@@ -88,6 +92,15 @@ import { nprConfigFromTrait, type NprTraitSnapshot } from './npr/nprConfigFromTr
  *  behind a before/after `renderer.calls` AND frame-time reading on the target device.
  *  Full write-up: docs/rendering.md § "Draw-Call Cost & Instanced Batching". */
 const BATCH_DRAW_CALLS = false;
+
+/** How long a swap may hold the first frame while the live scene's pipelines compile (#238).
+ *
+ *  A CEILING, not a budget — the hold normally ends when the compile resolves, which on a scene
+ *  the prewarm already covered is a few milliseconds of cache hits. This exists so a compile that
+ *  never settles (a lost device, a rejected promise we somehow do not see) degrades to the OLD
+ *  behaviour — a stalling first frame — instead of a viewport that never draws again. */
+const LIVE_COMPILE_MAX_HOLD_MS = 5000;
+
 
 /** Runtime override for the on-device A/B this flag's own comment demands (#212).
  *
@@ -389,6 +402,19 @@ export default function Scene3D() {
       const DIRTY_GRACE = 60; // ~1s @60fps
       let dirtyFrames = DIRTY_GRACE; // draw the first second (initial load + texture settle)
       const markRenderDirty = () => { dirtyFrames = DIRTY_GRACE; };
+
+      // Post-swap live-scene compile (#238). The pre-swap prewarm models a COPY of the incoming
+      // scene; this compiles the objects the sync ACTUALLY placed, before the first frame draws
+      // them. See `compileLiveScene` for why the copy can never cover light-mask variants, and
+      // `liveCompileGate` for what the hold costs.
+      const liveCompile = createLiveCompileGate({
+        maxHoldMs: LIVE_COMPILE_MAX_HOLD_MS,
+        now: rawNow,
+        // The surface may be idle-gated (Stopped, nothing dirty), so releasing the hold is not
+        // enough on its own — the scene we just compiled still has to get drawn once.
+        onSettled: () => markRenderDirty(),
+        onError: (e) => console.warn('[Scene3D] live-scene compile failed:', e),
+      });
       const dirtyUnsubs = [
         addDirtyListener(markRenderDirty),  // trait writes through the helper API
         onStructureDirty(markRenderDirty),  // entity create / delete / reparent
@@ -641,6 +667,12 @@ export default function Scene3D() {
               if (cfgScale === liveSs) lastStackSig = sig;
             }
           }
+          // Kicked HERE, not in the swap listener: the compile must see the objects this frame's
+          // sync placed (materials, light-mask variants, LOD levels) and the post-FX stack this
+          // frame settled on — both of which exist only now. Holding the submit until it resolves
+          // is the point: the pipelines it builds are exactly the ones the first draw would
+          // otherwise build SYNCHRONOUSLY, and that is the stall.
+          if (liveCompile.tick(() => compileLiveScene(renderer, scene, activeCamera, () => postfxStack!.compileSceneAsync()))) return;
           // The CPU span and the GPU span are separate measurements of the same call and both are
           // wanted: `submit-postfx` is how long the main thread spent HERE (on postfx-demo that
           // was a median 37 ms — CPU blocking on GPU backpressure), while `gpuPassScope` claims
@@ -651,6 +683,7 @@ export default function Scene3D() {
           gpuPassScope('postfx', () => postfxStack!.render());
           endProfilerSample();
         } else {
+          if (liveCompile.tick(() => compileLiveScene(renderer, scene, activeCamera))) return;
           beginProfilerSample('submit');
           gpuPassScope('scene', () => renderer.render(scene, activeCamera));
           endProfilerSample();
@@ -853,6 +886,7 @@ export default function Scene3D() {
         blendActive = false;   // never resume an old scene's blend into the new one
         blendOriginId = -1;
         lastApplied.valid = false;
+        liveCompile.arm(); // compile the NEW scene's pipelines before its first frame (#238)
         markRenderDirty(); // render the freshly-swapped scene even while stopped
       });
 

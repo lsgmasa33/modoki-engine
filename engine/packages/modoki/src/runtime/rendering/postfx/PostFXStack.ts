@@ -83,6 +83,17 @@ interface RendererLike {
   getPixelRatio(): number;
   getRenderTarget(): THREE.RenderTarget | null;
   setRenderTarget(rt: THREE.RenderTarget | null): void;
+  samples: number;
+  getOutputBufferType?(): THREE.TextureDataType;
+}
+
+/** The part of three's `PassNode` this class drives directly. `compileAsync` is three's own
+ *  precompile entry point (r184): it points the renderer at the pass's render target + MRT,
+ *  compiles the pass's scene, and restores both. */
+interface ScenePassLike {
+  dispose?(): void;
+  renderTarget: THREE.RenderTarget;
+  compileAsync(renderer: unknown): Promise<void>;
 }
 
 /** Everything a stage may need beyond the incoming color node. */
@@ -106,7 +117,7 @@ export class PostFXStack {
   private readonly pipeline: RenderPipeline;
   private readonly renderer: RendererLike;
   private readonly rawRenderer: unknown;
-  private readonly scenePass: { dispose?(): void };
+  private readonly scenePass: ScenePassLike;
   private readonly stages: StageHandle[];
   private req: PostFXRequest;
 
@@ -181,7 +192,7 @@ export class PostFXStack {
     this.pipeline.outputNode = color as never;
     // outputColorTransform stays default `true` — see the class doc's I1 note.
 
-    this.scenePass = scenePass as { dispose?(): void };
+    this.scenePass = scenePass as unknown as ScenePassLike;
   }
 
   private buildStage(
@@ -502,6 +513,30 @@ export class PostFXStack {
   render(): void {
     for (const stage of this.stages) stage.prepare?.();
     this.pipeline.render();
+  }
+
+  /** Compile the pipelines the SCENE PASS will need, without drawing a frame (#238).
+   *
+   *  This is the half of the boot stall no prewarm can reach. A material's pipeline key includes
+   *  the render context it is drawn into, and with a stack up the scene is drawn into this pass's
+   *  target — a different colour-target COUNT (up to three, with the NPR/AO MRT layout) from the
+   *  canvas context `renderer.compileAsync(scene, camera)` would compile against. Measured on
+   *  `demos/postfx-demo`: prewarm `targets: ["rgba16float"]`, render
+   *  `targets: ["rgba16float","rgba16float","rgba16float"]`, so not one prewarmed pipeline was
+   *  reusable. Delegates to three's `PassNode.compileAsync`, which does the render-target/MRT
+   *  swap and restores it.
+   *
+   *  ⚠️ The two lines before it are NOT optional and NOT tidiness. `PassNode.setup()` is what
+   *  normally stamps the target's sample count and texture type onto it, and `setup()` runs when
+   *  the node graph is first BUILT — i.e. during the first `render()`, which is precisely the
+   *  frame this call exists to get ahead of. Compiling before that leaves `samples` at the
+   *  RenderTarget default, and a sample-count mismatch is a different pipeline key: the compile
+   *  would succeed, warm the wrong set, and look exactly like a fix that did not work. */
+  async compileSceneAsync(): Promise<void> {
+    const rt = this.scenePass.renderTarget;
+    rt.samples = this.renderer.samples;
+    if (this.renderer.getOutputBufferType) rt.texture.type = this.renderer.getOutputBufferType();
+    await this.scenePass.compileAsync(this.rawRenderer);
   }
 
   /** Push live config into every stage's uniforms, OR report that the

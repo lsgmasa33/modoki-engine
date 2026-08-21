@@ -54,6 +54,7 @@ async function setup() {
     getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
     // syncEnvironment sweeps retired envs (#315) — a mock without these throws on every call.
     retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
+    retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
   }));
   vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
   vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));
@@ -296,6 +297,7 @@ describe('syncSkinnedModels — lifecycle', () => {
       getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
       // syncEnvironment sweeps retired envs (#315) — a mock without these throws on every call.
       retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
+      retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
       onModelInvalidated: vi.fn(() => () => {}), getMeshAsset: vi.fn(),
     }));
     vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
@@ -413,6 +415,7 @@ describe('attachInvalidationListener — re-import eviction', () => {
       getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
       // syncEnvironment sweeps retired envs (#315) — a mock without these throws on every call.
       retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
+      retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
       onModelInvalidated: (cb: (p: string, t: Set<string>) => void) => { inval.listener = cb; return () => { inval.listener = undefined; }; },
       getMeshAsset: (ref: string) => inval.assets.get(ref),
     }));
@@ -494,6 +497,7 @@ describe('syncEnvironment — cached branch is change-gated', () => {
       getCachedEnvironment: vi.fn(() => cachedTex), acquireEnvironment,
       // syncEnvironment sweeps retired envs (#315) — a mock without these throws on every call.
       retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
+      retiredMaterials3D: () => new Set(), disposeRetiredMaterial: vi.fn(),
     }));
     vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
     vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: () => false }));

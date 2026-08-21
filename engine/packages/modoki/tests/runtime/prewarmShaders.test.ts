@@ -730,3 +730,125 @@ describe('prewarmShadersForWorld — placeholders opt out of frustum culling (#2
     expect(stub.compiledMeshes[0].every((m) => m.frustumCulled === false)).toBe(true);
   });
 });
+
+/** `compileLiveScene` (#238) — the post-swap half, which compiles the objects the sync actually
+ *  placed rather than a copy of them. Everything here is about what it must put BACK: it mutates
+ *  the live scene (culling, LOD visibility, side-pinned meshes) to make one compile see the right
+ *  set, and a mutation left behind is a permanent framerate bug rather than a visible failure. */
+describe('compileLiveScene — prepares the live scene and restores every mutation (#238)', () => {
+  /** A renderer stub that snapshots the scene AT compile time, since everything is restored by
+   *  the time the call returns — the same reason the prewarm stub does it. */
+  function liveStub(fail = false) {
+    const seen: { culled: boolean[]; visible: boolean[]; lodAutoUpdate: boolean[] }[] = [];
+    const renderer = {
+      compileAsync: vi.fn(async (scene: THREE.Scene) => {
+        const culled: boolean[] = []; const visible: boolean[] = []; const lodAutoUpdate: boolean[] = [];
+        scene.traverse((o) => {
+          if ((o as THREE.LOD).isLOD) lodAutoUpdate.push((o as THREE.LOD).autoUpdate);
+          if ((o as THREE.Mesh).isMesh) { culled.push(o.frustumCulled); visible.push(o.visible); }
+        });
+        seen.push({ culled, visible, lodAutoUpdate });
+        if (fail) throw new Error('device lost');
+      }),
+    };
+    return { renderer, seen };
+  }
+
+  it('un-culls every mesh for the compile and restores culling afterwards', async () => {
+    const { sync } = await setup();
+    const stub = liveStub();
+    const scene = new THREE.Scene();
+    const mesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial());
+    scene.add(mesh);
+
+    await sync.compileLiveScene(stub.renderer as never, scene, camera);
+
+    // `compileAsync` culls its render list against the OUTGOING scene's frustum, so an
+    // unmodified live scene compiles whatever the previous camera happened to be looking at.
+    expect(stub.seen[0].culled).toEqual([false]);
+    expect(mesh.frustumCulled).toBe(true);
+  });
+
+  it('reveals every LOD level with autoUpdate pinned off, and restores both', async () => {
+    const { sync } = await setup();
+    const stub = liveStub();
+    const scene = new THREE.Scene();
+    const lod = new THREE.LOD();
+    const near = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial());
+    const far = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial());
+    lod.addLevel(near, 0);
+    lod.addLevel(far, 100);
+    scene.add(lod);
+    lod.updateMatrixWorld(true);
+    lod.update(camera); // three hides every level but the one at the current distance
+    expect(far.visible).toBe(false);
+
+    await sync.compileLiveScene(stub.renderer as never, scene, camera);
+
+    // Pinning autoUpdate off is what makes the reveal stick: `_projectObject` calls
+    // `LOD.update(camera)` while building the compile list, which re-hides the other levels.
+    expect(stub.seen[0].lodAutoUpdate).toEqual([false]);
+    expect(stub.seen[0].visible).toEqual([true, true]);
+    expect(lod.autoUpdate).toBe(true);
+    expect(far.visible).toBe(false);
+  });
+
+  it('HIDES a mesh whose material three draws side-pinned, and restores it', async () => {
+    const { sync } = await setup();
+    const stub = liveStub();
+    const scene = new THREE.Scene();
+    const mesh = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshStandardMaterial({ transparent: true, side: THREE.DoubleSide }),
+    );
+    scene.add(mesh);
+
+    await sync.compileLiveScene(stub.renderer as never, scene, camera);
+
+    // Compiling it here is WORSE than skipping it: `compileAsync` drains its queue after three
+    // restores `material.side`, so it builds the DoubleSide program and the first frame's pinned
+    // draw then compiles fresh pipelines over that instead of finding the prewarm's pinned ones.
+    // Measured on games/3d-test: six synchronous first-frame builds came back when this was not
+    // hidden, and went to zero when it was.
+    expect(stub.seen[0].visible).toEqual([false]);
+    expect(mesh.visible).toBe(true);
+  });
+
+  it('restores the scene even when the compile REJECTS', async () => {
+    const { sync } = await setup();
+    const stub = liveStub(true);
+    const scene = new THREE.Scene();
+    const mesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial());
+    const lod = new THREE.LOD();
+    const far = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial());
+    lod.addLevel(new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial()), 0);
+    lod.addLevel(far, 100);
+    scene.add(mesh, lod);
+    lod.updateMatrixWorld(true);
+    lod.update(camera);
+
+    await expect(sync.compileLiveScene(stub.renderer as never, scene, camera)).rejects.toThrow('device lost');
+
+    // A failed compile that left culling off would draw every object every frame forever, and one
+    // that left every LOD level visible would multiply the draw count — a permanent framerate bug
+    // from a one-off failure.
+    expect(mesh.frustumCulled).toBe(true);
+    expect(far.visible).toBe(false);
+    expect(lod.autoUpdate).toBe(true);
+  });
+
+  it('uses the caller-supplied compile when given — the post-FX scene pass owns its own context', async () => {
+    const { sync } = await setup();
+    const stub = liveStub();
+    const scene = new THREE.Scene();
+    scene.add(new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial()));
+    const viaPass = vi.fn(async () => {});
+
+    await sync.compileLiveScene(stub.renderer as never, scene, camera, viaPass);
+
+    // Under a stack the scene is drawn into the pass's render target — a different colour-target
+    // count — so compiling against the canvas context would warm pipelines nothing draws.
+    expect(viaPass).toHaveBeenCalledTimes(1);
+    expect(stub.renderer.compileAsync).not.toHaveBeenCalled();
+  });
+});

@@ -1021,9 +1021,43 @@ onAssetInvalidated((kind) => {
 
 export function invalidateMaterial(matPath: string) {
   const mat = materialCache.get(matPath);
-  if (mat && mat !== MATERIAL_FAILED) disposeMaterial(mat);
+  // RETIRE, don't dispose (#317) — the same rule as textures (`invalidateTexture`) and HDR envs
+  // (#315), and for the same reason: this instance is on `mesh.material` right now. Nothing
+  // rebinds it here — `syncMaterial` cannot, because the ref is unchanged and `resolveMaterial`
+  // returns undefined until the async refetch lands, so its re-bind branch does nothing. Live
+  // measurement on `games/3d-test`: a texture re-import left the rotating cube drawing a
+  // DISPOSED material for 4 rendered frames. `disposeMaterial` also releases the material's
+  // shared textures, so disposing here freed those out from under the same live mesh.
+  if (mat && mat !== MATERIAL_FAILED) retiredMaterials.add(mat);
   materialCache.delete(matPath);
   materialLoadPromises.delete(matPath);
+}
+
+/** Materials evicted while a live mesh still bound them (see {@link invalidateMaterial}).
+ *
+ *  Freed by `syncSceneRenderables3D`'s sweep once no live surface binds one — the same
+ *  shape as the retired-env sweep, and for the same reason there is no refcount to use:
+ *  `materialOwners` is a per-scene owner SET, and the binding lives in `scene3DSync`.
+ *
+ *  ⚠️ A base whose only remaining holders are DERIVED CLONES (tint / MaterialInstance /
+ *  light-mask variants all hold `base.clone()`, which shares the base's texture references) is
+ *  still freed — those caches are invisible to a mesh-based sweep. That is unchanged from the
+ *  pre-#317 behaviour, where the base was freed IMMEDIATELY, so this is not a regression; it is
+ *  the remaining half of the problem, tracked separately. */
+const retiredMaterials = new Set<THREE.Material>();
+
+/** The retired-material set, for `scene3DSync`'s sweep. Empty in the common case — callers
+ *  check `.size` before doing any per-surface work. */
+export function retiredMaterials3D(): ReadonlySet<THREE.Material> {
+  return retiredMaterials;
+}
+
+/** Free one retired material once the sweep has established that nothing binds it. This is
+ *  where the deferred `disposeMaterial` finally runs, so it is also what releases the
+ *  material's shared textures. Never call `disposeMaterial` on a retiree directly. */
+export function disposeRetiredMaterial(mat: THREE.Material): void {
+  if (!retiredMaterials.delete(mat)) return; // not retired (or already freed)
+  disposeMaterial(mat);
 }
 
 /** Resolve material for a mesh: checks Renderable.material, then mesh asset's material field.
@@ -1241,6 +1275,13 @@ export function disposeAllCachedResources() {
   }
   materialCache.clear();
   materialLoadPromises.clear();
+  // Retired materials too: their sweep runs from `syncSceneRenderables3D`, so a surface that
+  // stops rendering (or a build with no 3D surface) would otherwise strand them. Everything
+  // binding them is torn down with this generation anyway.
+  for (const mat of retiredMaterials) {
+    if (!disposedMat.has(mat.uuid)) { disposeMaterial(mat, disposedTex); disposedMat.add(mat.uuid); }
+  }
+  retiredMaterials.clear();
 
   // Dispose any cached HDR environments and clear env owners — they're tied
   // to the same cacheGeneration / scene lifetime as everything else here.

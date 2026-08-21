@@ -2883,11 +2883,128 @@ There is **one** post-FX code path; NPR has no branch of its own.
 - Resizing needs no post-FX call: every resolution-derived uniform (NPR + FXAA texel size, the
   stylized RT size) is recomputed from the live drawing buffer in each stage's per-frame prologue.
 
+## Shader prewarm and the first-frame compile (#238)
+
+**The first draw of a scene builds every GPU render pipeline it needs, synchronously, on the
+render thread.** On an Android mid-tier device that is ~130 ms per pipeline, so a scene with a
+dozen distinct materials freezes the app for 1–2 s at boot. Everything below exists to move that
+work off the first frame; the measurements and the wrong turns are in
+[plans/profiler.md](./plans/profiler.md) § Phase 2.
+
+### Two halves, and they cover different failures
+
+| | when | what it compiles | what it cannot cover |
+|---|---|---|---|
+| `prewarmShadersForWorld` (`scene3DSync.ts`) | in `SceneManager`'s awaited **before-swap** hook | a throwaway COPY of the incoming scene — one placeholder per distinct (mesh, material, shadow-flags, mirror) key | anything created by the sync itself, because the sync has not run |
+| `compileLiveScene` (`scene3DSync.ts`) | on the first frame **after** the swap, before the submit | the objects the sync actually placed, in the render context they will be drawn in | objects that arrive later (a Director beat revealing content) |
+
+The pre-swap half runs during the load, where there is time. The post-swap half is what catches
+everything the copy could not model — and it is **self-limiting**: whatever the prewarm got right
+is already in three's pipeline cache, so it walks the scene and finds hits. It costs what the
+prewarm missed.
+
+**The post-swap compile only helps if the first draw WAITS for it** — otherwise the draw builds
+those pipelines itself, which is the stall. `liveCompileGate.ts` owns that hold: it kicks once per
+swap, holds the submit while the compile is in flight, drops the hold if the compile rejects, and
+releases the frame at a 5 s ceiling if it never settles. A stale compile landing after a SECOND
+swap cannot release the newer hold (generation token).
+
+⚠️ **The hold is a real behaviour change and worth stating.** Between the swap and the first drawn
+frame the surface shows the previous content — usually a loading screen — while the ECS keeps
+ticking. Before it, the surface drew one frame and then froze mid-draw for the same duration.
+Neither is free; the hold keeps rAF alive, so loading UI, input and audio keep running instead of
+the app appearing hung.
+
+### The checklist: what actually goes into a pipeline key
+
+This is the list to check a prewarm change against. Miss an entry and the prewarm compiles a
+variant nobody draws AND the first frame builds the real one synchronously — the failure is
+*silent and doubly expensive*. Six instances have been found and fixed this way.
+
+**Scene-global** — `NodeManager.getCacheKey()` names exactly three, and all three are mirrored:
+
+| input | mirrored by |
+|---|---|
+| lights (incl. which cast shadows, under the tier's caster cap) | `createLightFromTrait` + `keptShadowCasters` in the prewarm |
+| environment (IBL) | tier-gated `scene.environment` mirror |
+| fog | the real `syncFog(world, prewarmScene)` |
+
+**Per-object** — `WebGPUBackend.getRenderCacheKey()`, and this half is where the later bugs were:
+
+| input | how the prewarm gets it right |
+|---|---|
+| `material.side` → cull mode, **incl. three's two-pass side pinning for a transparent double-sided material** | `sidePinnedVariants()` places two side-pinned CLONES |
+| `object.matrixWorld.determinant() < 0` → `frontFace` CW | the mirror flag joins the dedupe key; the placeholder gets a negative scale; `updateMatrixWorld` before the compile |
+| blending / depth / stencil state | inherited from the real material object |
+| render-context colour format, **colour-target COUNT**, sample count, depth format | only the post-swap half can (see below) |
+| vertex attribute layout (`getGeometryCacheKey`) | the real geometry template |
+| clipping context | not varied by the engine today |
+
+### Three sharp edges in three.js that this code exists to work around
+
+1. **`compileAsync` compiles the WRONG pipeline for a transparent double-sided material.**
+   `Renderer.renderObject` draws it in two passes, setting `material.side` to `BackSide` then
+   `FrontSide` around each. `compileAsync` walks the same branch, but its handler
+   (`_createObjectPipeline`) only QUEUES the work, and the queue is drained after `side` has been
+   restored to `DoubleSide`. So it warms one `cullMode: 'none'` pipeline where the render needs two
+   `cullMode: 'back'` ones. The prewarm places side-pinned clones instead; `compileLiveScene`
+   **hides** such meshes, because compiling them there is worse than skipping them — it builds the
+   DoubleSide program and the first frame's pinned draw then compiles fresh pipelines over it
+   (measured: six synchronous builds came back, and went to zero when hidden).
+2. **`compileAsync` frustum-culls its render list, against the previous frame's frustum**, and
+   never updates world matrices. `_projectObject` culls exactly as a render does, using the
+   module-level `_frustum` the last RENDERED frame left behind — the OUTGOING scene's camera. Both
+   halves therefore set `frustumCulled = false` on what they compile, and update matrices first.
+3. **Disposing a material RELEASES the pipeline it just warmed.** three refcounts a pipeline by the
+   render objects referencing it (`Pipelines.delete` → `usedTimes--` → `_releasePipeline` at zero).
+   Anything the prewarm mints (primitive geometry/material, side-pinned clones, the F4 placeholder)
+   is therefore freed at the START of the next prewarm, not at the end of its own call.
+
+### Why light-mask variants can only be covered AFTER the swap
+
+`applyLightMask` binds a per-(material, light-selection) CLONE with its own
+`customProgramCacheKey` (see § Rendering-layer light masks). A pre-swap prewarm cannot produce
+those, and this is a fact about the mechanism rather than an effort question: a variant is keyed by
+the `THREE.Light` **instances** it selects (`lightId`, a per-object counter — two render surfaces
+build their own lights for the same ECS entities), and the whole variant cache is disposed on world
+swap. Measured on `demos/postfx-demo`, comparing material `uuid`s inside one process: the prewarm
+compiled 13 materials, the render drew 21, overlap **zero** — the demo authors a
+`renderingLayerMask` on all 33 renderables, and on `mid` the automatic light cap re-masks per
+object anyway.
+
+Same shape for the **post-FX render context**: with a stack up, the scene is drawn into the stack's
+scene pass, whose MRT layout can be three colour targets (`output` + `normal` + `lineColor`) where
+the canvas context has one. `PostFXStack.compileSceneAsync()` compiles through that pass — and
+stamps the target's sample count and texture type first, because `PassNode.setup()` normally does
+that during the first `render()`, i.e. the frame this call exists to get ahead of.
+
+### How to measure a change here
+
+**Counts, not milliseconds, and never pipeline labels.** `renderPipeline_<type>_<n>` carries
+three's incrementing material id, which differs between two runs of the same build.
+
+- **Locally, per arm in ~30 s**: `tools-scratch/boot-stall/pipeprobe.mjs <url>` — how many
+  pipelines the prewarm built vs how many the first frames built, with the descriptor state that
+  decides each key. Which pipelines get built is decided by data that is identical on a Mac; only
+  the price per pipeline is device-specific.
+- **On the phone, for the player-visible number**: `tools-scratch/boot-stall/coldprobe.sh <pkg>` —
+  worst rAF gap across a cold boot, with a `longtask` observer. A gap with **no longtask inside it**
+  is off-main-thread work (pipeline creation); a gap a longtask spans is ordinary JS.
+
+### Known gaps
+
+- `compileLiveScene` skips transparent double-sided materials (edge 1 above), so under a post-FX
+  stack their pinned pipelines are compiled in the canvas context by the prewarm and rebuilt once.
+- The prewarm places `Renderable3D`, `Renderable3DPrimitive` and `SkinnedModel`; billboards,
+  `Text3D` and video screens are still first-frame compiles. Rigs do not get side-pinning.
+- The mirror reads AUTHORED scale, so a determinant sign flipped at runtime is invisible to it.
+- Objects hidden at swap time and revealed later (a Director beat) compile when revealed.
+
 ## Gotcha: TSL first-compile race (prewarm)
 
 TSL node builders have a racy lazy initialization on the **first** compile a renderer ever performs. If an MRT/NPR pass happens to be that first compile — e.g. in the lazily-mounted editor Game panel, which mounts *after* the initial scene swap so the normal pre-swap prewarm hook never fired — WGSL generation can intermittently fail with `unresolved type 'OutputType'` and the mesh is dropped.
 
-**Fix:** `Scene3D.tsx` calls `prewarmShadersForWorld(getCurrentWorld(), renderer, camera)` on mount, **before** registering the render loop, so a normal material compiles first and primes the node builder. (`prewarmShadersForWorld` also mirrors the world's lights and environment so it compiles the correct PBR shader variants, eliminating first-frame stutter on scene swap. The mirror is TIER-SHAPED on both counts — IBL and shadow arming each follow what the resolved tier will actually draw, because compiling a variant the render never uses leaves the real one to the first frame, which IS the stutter. See [plans/profiler.md](./plans/profiler.md) § Phase 2 for the measurement that established this, #238.)
+**Fix:** `Scene3D.tsx` calls `prewarmShadersForWorld(getCurrentWorld(), renderer, camera)` on mount, **before** registering the render loop, so a normal material compiles first and primes the node builder. (That call is also the first half of the boot-stall machinery — what it must mirror, and the post-swap half that catches what it cannot, are in § Shader prewarm and the first-frame compile above. It mirrors the world's lights and environment so it compiles the correct PBR shader variants, eliminating first-frame stutter on scene swap. The mirror is TIER-SHAPED on both counts — IBL and shadow arming each follow what the resolved tier will actually draw, because compiling a variant the render never uses leaves the real one to the first frame, which IS the stutter. See [plans/profiler.md](./plans/profiler.md) § Phase 2 for the measurement that established this, #238.)
 
 **Related HMR caveat — editing a shader module forces a RELOAD, automatically.** TSL node (and `wgslFn`) instances get baked into compiled WGSL pipelines; hot-reloading a module creates new node identities that the old cached pipeline still references, raising the same `unresolved type 'OutputType'` error — or, worse, silently keeps rendering the PREVIOUSLY compiled graph so a correct fix looks like it did nothing. A full page reload is the correct (and cheap) price for a stable cache.
 

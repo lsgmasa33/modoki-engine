@@ -478,6 +478,46 @@ subscribes to `kind: 'texture'` and invalidates any cached material holding a re
 evicts (so path-keyed panels see the event), so a synchronous listener would read the
 pre-retirement state and match nothing.
 
+### The MATERIAL cache too — and this one was measured live (#317)
+
+`invalidateMaterial` disposed the cached `THREE.Material` synchronously, and `disposeMaterial`
+also **releases the material's shared textures** — while `mesh.material` still pointed at that
+instance. `syncMaterial` cannot save it: a re-import keeps the same GUID, so it takes the
+unchanged-ref branch, where `resolveMaterial` returns `undefined` until the async refetch lands
+and the re-bind body is skipped entirely.
+
+**Two of the four callers reach it with no eviction guard**: the material-side texture consumer
+above, and the Inspector's live material edit (`persist.ts` → `invalidateMaterialFile`).
+`modelImport` is safe only because it calls `invalidateModel` first, which evicts the meshes.
+
+⚠️ **Unlike the env case, this one reproduces.** Probing the rotating cube in `games/3d-test`
+across a texture re-import: the bound material was disposed and **4 rendered frames** drew the
+destroyed instance before the rebuild landed (recorded per-rAF, 1199 frames sampled). After the
+fix, the same probe reports **0** — and the material is still eventually freed, so no leak was
+traded in. If you need to re-measure this class, that probe (wrap `mat.dispose`, count rAFs where
+`mesh.material` is still the wrapped instance) is the instrument; an uncaptured-GPU-error watch is
+not — WebGPU-on-Metal here tolerated all four frames silently.
+
+The fix is the #315 shape — retire, then free once no live surface binds it — with the sweep one
+level deeper: a material binds to a **mesh**, so `sweepRetiredMaterials` traverses each
+registered surface, and it reads `mesh.material` arrays as well as the single-material case.
+It runs at the tail of `syncSceneRenderables3D`, guarded on `retiredMaterials3D().size`, so an
+ordinary frame does no traverse at all.
+
+**One consequence worth knowing: a retired texture's release is now deferred behind its
+material's sweep.** `disposeMaterial` is what releases the material's texture refs, and it no
+longer runs at invalidation time — in production that is a few frames, and freeing earlier would
+be the same use-after-free one level down.
+
+⚠️ **This fix is HALF the problem.** Three caches hold `base.clone()` — tint
+(`scene3DSync.tintedMaterial`), MaterialInstance (`materialInstanceClones.ts`) and light-mask
+variants (`lightMaskVariants.ts`) — and a THREE clone copies **texture references**, so freeing
+the base still releases textures the clones sample. None of them is keyed to notice a base
+invalidation either (the tint cache keys on `basePath|color|amount`, so it keeps serving a clone
+of the dead base forever). A mesh-based sweep cannot see any of it. That is unchanged from the
+pre-#317 behaviour, where the base was freed *immediately* — so it is not a regression, but it is
+the other half, tracked separately.
+
 ### The env cache retires too — but it is freed by a SWEEP, not a refcount (#315)
 
 `invalidateEnvironment` had the same defect: it disposed the cached HDR unconditionally while

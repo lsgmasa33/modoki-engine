@@ -24,7 +24,7 @@ import { clearManifest, registerAsset } from '../../src/runtime/loaders/assetMan
 import {
   invalidateTexture, releaseTexture3D, getSharedTextureStats, disposeAllSharedTextures,
 } from '../../src/runtime/loaders/textureResolver';
-import { resolveMaterial, invalidateMaterial } from '../../src/runtime/loaders/meshTemplateCache';
+import { resolveMaterial, invalidateMaterial, disposeRetiredMaterial } from '../../src/runtime/loaders/meshTemplateCache';
 
 const TEX_GUID = '22222222-2222-4222-8222-222222222222';
 const TEX_PATH = '/games/g/assets/tex/grass.png';
@@ -89,8 +89,15 @@ describe('invalidateTexture → materials rebind', () => {
     invalidateTexture(TEX_GUID);
     await settle();
 
-    // disposeMaterial released the material's ref; that was the last one, so it is freed.
-    // Without the material-side consumer this stayed retired-and-referenced forever.
+    // TWO steps since #317, and the order matters. `invalidateMaterial` no longer disposes the
+    // material — it RETIRES it, because a live mesh is still binding that instance — so the
+    // material's texture refs are still held here. Freeing the texture at this point would be
+    // exactly the use-after-free #317 fixes, one level down.
+    expect(disp, 'the retired material still holds this ref').not.toHaveBeenCalled();
+
+    // The release arrives when the material itself is freed — in production that is
+    // `syncSceneRenderables3D`'s sweep, once no live mesh binds it.
+    disposeRetiredMaterial(mat!);
     expect(disp).toHaveBeenCalledTimes(1);
     expect(getSharedTextureStats().refs).toBe(0);
   });
