@@ -67,6 +67,29 @@ Violations that produced this rule:
 - **`position`** — documented as "World position" on `set_transform` while writing `Transform.x/y/z`,
   which is **local**. Every parented entity silently lands somewhere else, reported as success (S1).
 
+Worked example, and the sharpest one on this surface — **`force` used to mean two things**
+(closed 2026-08-22). On `build` / `add_native_target` / `ota_publish` it is harmless: your unsaved
+work is left alone and merely not included in the artifact. On the world-swapping tools it
+DESTROYED that work — from the world, the file *and* the undo stack — and the tool's own name gave
+no clue which flavour you were getting. The failure that made it worth a breaking rename: an agent
+uses `force` on a build (safe, nothing lost), learns *"force = proceed despite unsaved work"*, then
+meets `load_scene`'s `REQUIRES_SAVE` refusal and passes it on the same understanding. The
+destructive half is now **`discardUnsaved`** — named for the consequence, so the habit cannot
+transfer — and §1's strict schema turns the old spelling into a refusal rather than the destructive
+act.
+
+Two lessons outlast the rename:
+- **An exemption silences the guard, so each one must earn its place in writing.** `force` sat on
+  `PER_TOOL_MEANING` (the "this name genuinely means different things per tool" list) and the
+  containment check below was therefore blind to it — which is how the same violation on
+  `modoki_render_sequence` survived until it was found by hand. The list is a holding pen, not a
+  home; `force` has left it.
+- **A shared param helper APPENDS, never prepends.** Getting `force` off the list needed its three
+  surviving uses to read identically, so `unsavedForceParam` dropped its per-tool verb
+  ("Build"/"Scaffold"/"Publish"): three strings differing in their FIRST word contain none of each
+  other, so a pretty variation was costing the surface its guard. `precisionParam` is the shape to
+  copy — the per-tool part is a SUFFIX, so the shared text stays a verbatim prefix of every variant.
+
 Rules:
 - A count of **returned rows** is `returnedCount`; a count of **everything that exists** is
   `totalCount`. Never `entityCount` for either. When a filter or limit applied, **both** are present
@@ -99,6 +122,20 @@ legitimate exception: it *measures* a path).
   *relative to*. One carve-out, because it is about delivery rather than aim: a held gesture's
   `move`/`up` is delivered to whatever captured the press, so occlusion at the destination cannot
   stop it and is not checked.
+- **A refusal that may be TRANSIENT says so** (#261). An aim refusal can be true at the instant it
+  is asked and gone a frame later, because the dock has just changed and the target has not reached
+  its final position — the verdict is accurate and the advice ("dismiss what covers it") is useless.
+  Every aim refusal, on all three paths (`entity`, `selector`, and the handle route), now checks
+  whether the layout MOVED across one frame and appends a warning when it did — including the
+  DID-NOT-RESOLVE refusals, which is the branch that actually reproduces: an unsettled panel reports
+  a ZERO RECT, so the resolver refuses with "zero-size"/"no element" rather than with a cover, and
+  a hint on the covered case alone would stay silent on the one transient that is easy to trigger. It is a **hint, not
+  a retry**: the call still refuses and nothing is dispatched. Settle-and-retry was the option
+  weighed and DECLINED, on measurement — a React commit settles in 0 frames, a FlexLayout tab
+  reveal in 1, a tab add/remove in 0-1, and none produced a false cover (the unsettled state is a
+  zero rect, i.e. a clean "cannot resolve"). A caller who re-aims at all has already waited longer
+  than the layout needs, so what was missing was never the retry — it was being able to tell the
+  two cases apart. Measured in [enact.md](enact.md) § "A refusal that may be TRANSIENT says so".
 - **Any id-shaped argument is validated.** `parentGuid` is validated today while `parentId` is
   passed through raw, so a stale numeric id produces an orphan entity — parented to nothing,
   invisible in the Hierarchy — reported as success (S1 `create_entity`/`reparent_entity`/`prefab`).
@@ -254,7 +291,10 @@ variance is machine-readable while it lasts.
 - **Persistence is manual and the response says so**: a live edit reports `saved:false` plus the
   hint naming `modoki_save_all`. A tool that writes the file reports `saved:true`. Never guess.
 - **A world-swapping or file-reading operation refuses when unsaved live work would be lost or
-  omitted**, with `REQUIRES_SAVE` and a `force` escape hatch. `load_scene`/`new_scene`/`build` do
+  omitted**, with `REQUIRES_SAVE` and an escape hatch — `discardUnsaved` where the work is
+  DESTROYED (`load_scene`/`new_scene`/`prefab edit-open`), `force` where it merely goes
+  un-included (`build`/`add_native_target`/`ota_publish`). Two consequences, two names: one word
+  for both is how an agent carries a harmless habit into an irreversible one. `load_scene`/`new_scene`/`build` do
   this; **`ota_publish` does not** — it builds from the scene file and ships over the air, so an
   agent that just edited the live world publishes an artifact missing its own work and is told
   "✅ Published" (S1).
@@ -347,6 +387,16 @@ An op registered in `agentEditorOps.ts` whose handler reaches nothing from `edit
   with the reason it is correct). Without that, the sweep either flags three correct refusals every
   run — and gets ignored — or blanket-accepts `REFUSED_BY_OP` and stops seeing a real one. A stale
   expectation that no longer fires also fails the run.
+- **Every backend ROUTE is tool-reachable, or declared as not-for-the-agent.** The same
+  totality discipline one level up from the coverage ledger: `routeCoverage.test.ts` asserts each
+  `/api/*` route either has a `modoki_*` tool, or an entry in `NO_TOOL_BY_DESIGN` **with the reason
+  the agent loses nothing**, or one in `AGENT_GAPS`. The two buckets stay separate on purpose —
+  collapsing a gap into "by design" is exactly how it becomes a permanent exemption, so a route with
+  no tool has somewhere honest to go and the next one cannot quietly be filed as intentional.
+  Keep `AGENT_GAPS` even when it is empty, for that reason. It runs in reverse too: a contract route
+  no router defines is a DEAD TOOL, which is the `modoki_prefab`-400ing-for-months failure.
+  It was worth building — 41 of 104 routes had no tool, and six of those turned out to be
+  capabilities we meant to expose, two of them documented as existing *for the agent*.
 - **Docs are generated from the contract** where they can be — the tool catalog in
   `docs/debug-tools-mcp.md` is rendered by `src/toolCatalog.ts` and guarded by
   `toolCatalogSync.test.ts`, so a drifted doc is a red build rather than a discovery. The guard

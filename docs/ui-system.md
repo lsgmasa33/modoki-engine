@@ -1205,6 +1205,28 @@ asset manifest (`FontManifestBlock`) so the runtime picks its provider without a
 fetch; the derived files are served/copied at the `~atlas.png` / `~metrics.json` variant
 URLs, mirroring the texture-variant convention (see [Materials & Textures](./textures.md)).
 
+#### Invalidating an SDF font: a late cleanup must run, not queue
+
+`invalidateFont(guid)` (the SDF sibling of the DOM eviction above) disposes the live provider and
+re-acquires a fresh one **under the same guid**, so the Three/Pixi atlas-texture caches — keyed
+`${provider.id}:image` — are what carry the old atlas across the swap. Those entries are freed
+through `provider.addDisposable`, and the Pixi image path registers its cleanup **inside the
+`.then()` of an async `loadPixiTexture`**. Disposing the provider mid-flight therefore left the
+registration landing on an already-disposed provider, where it was pushed onto a `disposables`
+array nothing would ever drain again: the entry survived, the re-acquired provider hit it as a
+cache hit, and the **re-baked font kept drawing the old atlas until a page reload** — permanently,
+since a provider taking the cache-hit early-return registers no disposable of its own to clean it
+up later either.
+
+The fix is on the contract, not the call site: **`addDisposable` after `dispose()` runs `fn`
+immediately** (both `BakedFontProvider` and `DynamicFontProvider`). A late registration is the
+normal case for an async load, not a misuse, so dropping it silently was the defect. The Three
+twin never showed the symptom — `TextureLoader.load` returns synchronously and registers before
+any dispose can interleave — which is exactly why the shared contract, rather than a patch to the
+Pixi `.then()`, is where this belongs. Pinned by `fontTexturePixi.test.ts` § "a provider disposed
+mid-load must not leave its texture in the cache", which asserts the cache entry, the
+`Assets.unload`, and the contract on both provider classes.
+
 ---
 
 ## Image-ref gotcha (production builds drop source PNGs)

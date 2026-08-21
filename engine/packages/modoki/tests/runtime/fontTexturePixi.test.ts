@@ -35,6 +35,8 @@ const loadPixiTexture = vi.fn(() => {
 vi.mock('../../src/runtime/rendering/pixiTextureLoad', () => ({ loadPixiTexture }));
 
 const { getFontTexturePixi } = await import('../../src/runtime/rendering/text/fontTexturePixi');
+const { BakedFontProvider } = await import('../../src/runtime/rendering/text/fontProvider');
+const { DynamicFontProvider } = await import('../../src/runtime/rendering/text/dynamicFontProvider');
 
 /** A baked (image-URL) provider. `atlasCanvasAt` absent → the baked path, not the dynamic one. */
 function provider(id: string) {
@@ -140,5 +142,66 @@ describe('the baked page-0 image is cached independently of atlasVersion', () =>
     p.atlasVersion = 7;
     expect(getFontTexturePixi(p as never, 0), 'the baked image must still be cached').toBe(tex);
     expect(loadCalls, 'a version bump must not re-fetch the immutable baked atlas').toBe(1);
+  });
+});
+
+/** A font INVALIDATED mid-load must not pin the superseded atlas forever.
+ *
+ *  `invalidateFont(guid)` disposes the live provider and re-acquires a fresh one under the SAME
+ *  guid (a Font-Inspector mode flip or a re-bake). The cache key is `${provider.id}:image`, so the
+ *  new provider looks the old one up — which is fine only while the disposal actually cleared the
+ *  entry. It does not when the load was still in flight: `addDisposable` is registered inside the
+ *  `.then()`, and a provider that has already run `dispose()` pushes it onto an array nothing will
+ *  ever drain. The entry then survives every release, and the re-baked font keeps drawing the old
+ *  atlas until a page reload. */
+describe('a provider disposed mid-load must not leave its texture in the cache', () => {
+  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); unload.mockClear(); });
+
+  /** The REAL provider, not a stub: `addDisposable`/`dispose` are exactly what is under test here,
+   *  so a hand-rolled pair would only assert the fixture. The glyph atlas is never read (no layout
+   *  happens in this test) — only the id and the image URL matter. */
+  const liveProvider = (id: string) =>
+    new BakedFontProvider(id, {} as never, `/fonts/${id}~atlas.png`);
+
+  it('drops the entry when the load lands after invalidateFont disposed the provider', async () => {
+    const p1 = liveProvider('font-invalidated');
+    expect(getFontTexturePixi(p1 as never, 0), 'load in flight').toBeNull();
+
+    // The human re-bakes the font: invalidateFont disposes p1 and re-acquires under the same guid.
+    p1.dispose();
+    const stale = fakeTexture();
+    resolveLoad(stale);
+    await vi.waitFor(() => expect(loadPixiTexture).toHaveBeenCalled());
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The cleanup ran late instead of never: the entry is gone and the atlas is unloaded.
+    expect(unload, 'the superseded atlas is released, not leaked').toHaveBeenCalledTimes(1);
+
+    const p2 = liveProvider('font-invalidated');
+    expect(getFontTexturePixi(p2 as never, 0), 'the DEAD provider’s atlas must not be served')
+      .not.toBe(stale);
+    expect(loadCalls, 'the re-acquired provider fetches the re-baked atlas itself').toBe(2);
+  });
+
+  it('runs a post-dispose registration immediately on BOTH provider kinds', () => {
+    // The contract the fix above rests on, asserted directly rather than through the cache.
+    const baked = new BakedFontProvider('contract-baked', {} as never, '/fonts/x~atlas.png');
+    baked.dispose();
+    const bakedCleanup = vi.fn();
+    baked.addDisposable(bakedCleanup);
+    expect(bakedCleanup, 'baked: a late cleanup runs now, not never').toHaveBeenCalledTimes(1);
+
+    // `DynamicFontProvider.create` needs real font bytes + a canvas, so the instance is built on
+    // the prototype with only the fields `dispose` touches. The METHODS under test are the real
+    // ones — that is what the assertion rests on.
+    const dyn = Object.create(DynamicFontProvider.prototype) as typeof DynamicFontProvider.prototype;
+    Object.assign(dyn, {
+      disposables: [], glyphMap: new Map(), kern: new Map(), pages: [], ctxs: [],
+    });
+    dyn.dispose();
+    const dynCleanup = vi.fn();
+    dyn.addDisposable(dynCleanup);
+    expect(dynCleanup, 'dynamic: same contract').toHaveBeenCalledTimes(1);
   });
 });

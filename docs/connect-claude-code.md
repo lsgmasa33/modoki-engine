@@ -444,7 +444,7 @@ required step obvious and one call away.
 3. **`save_all`** — returned void, swallowing cancel AND write-failure behind `{ok:true}`. Now
    `SaveResult`; takes `path` (the panel needs a human); **actually blocked during Play**, as
    its description always claimed.
-4. **`load_scene`/`new_scene`** refuse to destroy unsaved live work (`force:true` to discard).
+4. **`load_scene`/`new_scene`** refuse to destroy unsaved live work (`discardUnsaved:true` to discard).
 5. **`build`** refuses on unsaved changes; `dispatch_action`/`play_clip`/`capture_gesture`
    reject phantom guids; `delete_entities`/`reparent_entity` report what happened;
    `list_traits` distinguishes "registry empty" from "unknown trait".

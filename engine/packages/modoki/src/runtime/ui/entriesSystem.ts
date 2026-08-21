@@ -29,7 +29,7 @@
  */
 import type { World } from 'koota';
 import { getTraitByName } from '../core/ecs/traitRegistry';
-import { spawnEntity, destroyEntity, onWorldSwap, getCurrentWorld } from '../core/ecs/world';
+import { spawnEntity, destroyEntity, findEntityById, onWorldSwap, getCurrentWorld } from '../core/ecs/world';
 import { beginSystemTick, endSystemTick } from '../core/systemTick';
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { buildChildIndex } from '../core/ecs/memberPath';
@@ -493,11 +493,12 @@ function consumeEntryRequest(
  * so a check on the view's own flags alone would call a closed selector "shown" and never release.
  */
 function isViewShown(world: World, view: EntityLike, m: Metas): boolean {
-  const byId = new Map<number, EntityLike>();
-  world.query(m.attrMeta.trait).updateEach((_t: unknown[], entity: unknown) => {
-    const e = entity as EntityLike;
-    byId.set(e.id(), e);
-  });
+  // ⚠️ **`findEntityById` (O(1) via the world's id index), never a world scan.** This runs for
+  // every scroll view on every pipeline tick, BEFORE the moved/invalidated early-out — so it is
+  // the one thing here that is unconditionally per-frame. The first cut built a
+  // `Map<id, entity>` of every `EntityAttributes` entity per call: on Court's A23 that is 1,477
+  // insertions per view per frame to answer a question whose answer is a walk of about four
+  // links. Caught in close-out review, not by a test — nothing here would have gone red.
   let cur: EntityLike | undefined = view;
   for (let depth = 0; cur && depth < 64; depth++) {
     const a = cur.get(m.attrMeta.trait) as { parentId?: number; isActive?: boolean } | undefined;
@@ -506,8 +507,13 @@ function isViewShown(world: World, view: EntityLike, m: Metas): boolean {
       ? cur.get(m.uiMeta.trait) as { isVisible?: boolean } | undefined
       : undefined;
     if (ui?.isVisible === false) return false;
-    cur = typeof a?.parentId === 'number' && a.parentId ? byId.get(a.parentId) : undefined;
+    cur = typeof a?.parentId === 'number' && a.parentId
+      ? findEntityById(a.parentId, world) as EntityLike | undefined
+      : undefined;
   }
+  // ⚠️ Falls through to SHOWN, and that is the safe direction: an undecidable hierarchy (a chain
+  // deeper than the bound, or a corrupt one) keeps the pool alive rather than destroying entities
+  // the view may still be rendering. Releasing on uncertainty is the expensive mistake.
   return true;
 }
 
@@ -538,6 +544,15 @@ function releaseViewPool(world: World, view: EntityLike, m: Metas): boolean {
     const bucket = childrenOf.get(p);
     if (bucket) bucket.push(e); else childrenOf.set(p, [e]);
   });
+  // ⚠️ **No dedup guard, unlike `core/ecs/entityUtils.ts`'s subtree deleter — and the difference
+  // is the number of ROOTS, not an oversight.** That one dedups "in case of overlapping subtrees"
+  // because it deletes a LIST of ids, and two of them can be ancestor and descendant of each
+  // other. This walk has exactly one root. Since every entity has exactly one `parentId`, the
+  // parent graph is a FOREST: a cycle would form a component disconnected from `content`, so a
+  // downward walk rooted there can never enter one. A guard was added during close-out by
+  // pattern-matching to that sibling, and removed again when a mutation check showed the test for
+  // it could not fail — an unreachable guard with a passing test reads as a live hazard to the
+  // next reader.
   const doomed: EntityLike[] = [];
   const walk = (e: EntityLike) => {
     doomed.push(e);

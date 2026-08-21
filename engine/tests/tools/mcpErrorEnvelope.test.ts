@@ -454,11 +454,26 @@ describe('S2 batch 6 — render/preview tools that claimed more than they did', 
     expect(e.why).toMatch(/IDENTICAL/);
   });
 
-  it('render_sequence forwards force:true so identical frames can be rendered deliberately', async () => {
+  it('render_sequence forwards forceRender:true so identical frames can be rendered deliberately', async () => {
+    // RENAMED from `force` (2026-08-22, owner). The old expectation was not wrong when it was
+    // written — it was defending a param name that §2 says cannot stand: `force` means "proceed
+    // even though there is unsaved work" on build / add_native_target / ota_publish / load_scene /
+    // prefab, and meant "render even though every frame will be identical" here. One word, two
+    // unrelated meanings, on a surface whose whole thesis is that a name means one thing.
     const s = (surface = loadSurface((req) =>
       req.path.startsWith('/api/render-sequence') ? { body: { paths: ['/tmp/a.jpg'], frames: 1, requestedFps: 10, actualFps: 9.7, spanMs: 103, tMs: [0] } } : undefined));
-    await s.call('modoki_render_sequence', { frames: 1, force: true });
-    expect(JSON.stringify(s.last()!.body)).toContain('"force":true');
+    await s.call('modoki_render_sequence', { frames: 1, forceRender: true });
+    expect(JSON.stringify(s.last()!.body)).toContain('"forceRender":true');
+  });
+
+  it('…and the OLD `force` is now refused by name, not silently ignored', async () => {
+    // The reason renaming is safe here: `.strict()` (§1) turns the stale spelling into a refusal
+    // that lists the tool's real parameters, so a caller carrying the old name is TOLD. Silently
+    // accepting it under the wrong mental model — "I forced past my unsaved work" — was the
+    // outcome worth avoiding.
+    const s = (surface = loadSurface());
+    await expect(s.call('modoki_render_sequence', { frames: 1, force: true }))
+      .rejects.toThrow(/unrecognized parameter.*forceRender/s);
   });
 
   it('render_sequence reports the ACHIEVED rate, not just the requested one', async () => {

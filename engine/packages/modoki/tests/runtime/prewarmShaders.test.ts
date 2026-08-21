@@ -779,15 +779,20 @@ describe('compileLiveScene — prepares the live scene and restores every mutati
   /** A renderer stub that snapshots the scene AT compile time, since everything is restored by
    *  the time the call returns — the same reason the prewarm stub does it. */
   function liveStub(fail = false) {
-    const seen: { culled: boolean[]; visible: boolean[]; lodAutoUpdate: boolean[] }[] = [];
+    const seen: { culled: boolean[]; visible: boolean[]; lodAutoUpdate: boolean[]; sides: THREE.Side[] }[] = [];
     const renderer = {
       compileAsync: vi.fn(async (scene: THREE.Scene) => {
         const culled: boolean[] = []; const visible: boolean[] = []; const lodAutoUpdate: boolean[] = [];
+        const sides: THREE.Side[] = [];
         scene.traverse((o) => {
           if ((o as THREE.LOD).isLOD) lodAutoUpdate.push((o as THREE.LOD).autoUpdate);
-          if ((o as THREE.Mesh).isMesh) { culled.push(o.frustumCulled); visible.push(o.visible); }
+          if ((o as THREE.Mesh).isMesh) {
+            culled.push(o.frustumCulled); visible.push(o.visible);
+            const m = (o as THREE.Mesh).material as THREE.Material | undefined;
+            if (m && !Array.isArray(m)) sides.push(m.side);
+          }
         });
-        seen.push({ culled, visible, lodAutoUpdate });
+        seen.push({ culled, visible, lodAutoUpdate, sides });
         if (fail) throw new Error('device lost');
       }),
     };
@@ -833,7 +838,7 @@ describe('compileLiveScene — prepares the live scene and restores every mutati
     expect(far.visible).toBe(false);
   });
 
-  it('HIDES a mesh whose material three draws side-pinned, and restores it', async () => {
+  it('hides a side-pinned mesh and STANDS IT IN with one pinned clone per pass, then cleans up', async () => {
     const { sync } = await setup();
     const stub = liveStub();
     const scene = new THREE.Scene();
@@ -845,13 +850,21 @@ describe('compileLiveScene — prepares the live scene and restores every mutati
 
     await sync.compileLiveScene(stub.renderer as never, scene, camera);
 
-    // Compiling it here is WORSE than skipping it: `compileAsync` drains its queue after three
+    // Compiling the MESH is WORSE than skipping it: `compileAsync` drains its queue after three
     // restores `material.side`, so it builds the DoubleSide program and the first frame's pinned
-    // draw then compiles fresh pipelines over that instead of finding the prewarm's pinned ones.
-    // Measured on games/3d-test: six synchronous first-frame builds came back when this was not
-    // hidden, and went to zero when it was.
-    expect(stub.seen[0].visible).toEqual([false]);
+    // draw then compiles fresh pipelines over that. Measured on games/3d-test: six synchronous
+    // first-frame builds came back when this was not hidden, and went to zero when it was.
+    //
+    // But hiding ALONE leaves it covered by NOTHING under a post-FX stack, because the prewarm's
+    // clones compile in the canvas context while the pass draws through its own. Priced on an A23
+    // (`demos/postfx-demo`): one such material, compiled twice, was 358 ms — 48% of the pipeline
+    // burst the last remaining boot gap waited on. So the compile must SEE two pinned stand-ins.
+    expect(stub.seen[0].visible).toEqual([false, true, true]);
+    expect(stub.seen[0].sides).toEqual([THREE.DoubleSide, THREE.BackSide, THREE.FrontSide]);
+
+    // …and the scene must be exactly as it was afterwards: the original visible, the stand-ins gone.
     expect(mesh.visible).toBe(true);
+    expect(scene.children).toEqual([mesh]);
   });
 
   it('restores the scene even when the compile REJECTS', async () => {
@@ -863,7 +876,11 @@ describe('compileLiveScene — prepares the live scene and restores every mutati
     const far = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial());
     lod.addLevel(new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial()), 0);
     lod.addLevel(far, 100);
-    scene.add(mesh, lod);
+    const pinned = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshStandardMaterial({ transparent: true, side: THREE.DoubleSide }),
+    );
+    scene.add(mesh, lod, pinned);
     lod.updateMatrixWorld(true);
     lod.update(camera);
 
@@ -875,6 +892,10 @@ describe('compileLiveScene — prepares the live scene and restores every mutati
     expect(mesh.frustumCulled).toBe(true);
     expect(far.visible).toBe(false);
     expect(lod.autoUpdate).toBe(true);
+    // Same class, newer: a stand-in left behind is a duplicate draw of a transparent object for
+    // the rest of the scene's life, and the original would stay invisible.
+    expect(pinned.visible).toBe(true);
+    expect(scene.children).toEqual([mesh, lod, pinned]);
   });
 
   it('uses the caller-supplied compile when given — the post-FX scene pass owns its own context', async () => {

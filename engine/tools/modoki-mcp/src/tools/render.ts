@@ -87,7 +87,7 @@ export function registerRenderTools(tool: ToolDef, ctx: ToolContext): void {
       'Read a few of the returned frames in order to see the temporal progression.\n\n' +
       'REFUSED (409) when the editor is STOPPED: time does not advance there, so every frame ' +
       'would be identical and a sequence cannot show motion. Press Play first, or use ' +
-      'render_scene for a static frame — or pass force:true to render identical frames anyway.\n\n' +
+      'render_scene for a static frame — or pass forceRender:true to render identical frames anyway.\n\n' +
       'TIMING: use the returned `tMs[]` (ms from the first frame), never frameIndex × 1/fps. Each ' +
       'frame costs a synchronous render + IPC round-trip that the requested rate does not account ' +
       'for, so the reply reports `requestedFps` AND the achieved `actualFps`/`spanMs`.\n\n' +
@@ -95,7 +95,13 @@ export function registerRenderTools(tool: ToolDef, ctx: ToolContext): void {
     {
       frames: z.number().int().min(1).max(120).optional().describe('Frame count (default 8, ≤120).'),
       fps: z.number().min(1).max(60).optional().describe('REQUESTED sampling rate (default 10, ≤60). The achieved rate comes back as `actualFps`; frame times as `tMs[]`.'),
-      force: z.boolean().optional().describe('Render even when the editor is STOPPED and every frame will be identical.'),
+      // RENAMED from `force` (2026-08-22). §2: "if two tools need different meanings, they need
+      // different names" — `force` means "proceed even though there is unsaved work" on
+      // build/add_native_target/ota_publish/load_scene/prefab, and meant something entirely
+      // unrelated here. One word, two meanings, on one surface. With .strict() armed a caller who
+      // passes the old `force` now gets a refusal naming the real params, which is the loud
+      // outcome; silently accepting it under the wrong mental model was the quiet one.
+      forceRender: z.boolean().optional().describe('Render even when the editor is STOPPED and every frame will be identical. Nothing to do with unsaved work — unlike `force` on modoki_build / modoki_load_scene, which is about that.'),
       width: z.number().int().positive().max(4096).optional().describe('Output width px (default: live viewport; ≤4096). Per FRAME — forwarded to the same render op as modoki_render_scene.'),
       height: z.number().int().positive().max(4096).optional().describe('Output height px (default: live viewport; ≤4096). Per frame.'),
       quality: z.number().int().min(1).max(100).optional().describe('JPEG quality 1-100 (default 85), per frame — the SAME unit as capture_viewport/render_scene.'),

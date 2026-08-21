@@ -103,6 +103,7 @@ import { tailWithCounts, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } 
 import { roundFloats, resolvePrecision } from './roundFloats';
 import { computeHandles, type HandlesDumpParams } from './handlesDump';
 import { resolveDomPointReport, type DomPointSpec } from './domResolve';
+import { layoutSettleReport } from './layoutSettle';
 import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve';
 import { readConsoleSource } from './consoleSource';
 import { chromeHandles } from './chromeHandles';
@@ -894,6 +895,11 @@ import.meta.hot?.dispose(() => unregisterChromeHandles());
 // actually on top of it) so the trusted-input host routes can aim without a round-trip
 // race. Renderer-side because only the renderer has the DOM. ──
 registerAgentOp('resolve-dom-point', (params) => resolveDomPointReport((params ?? {}) as DomPointSpec));
+// #261 — consulted ONLY when an aim is about to be refused, to tell a transient (the dock is
+// mid-move) from a real one. Registered here rather than in agentEditorOps.ts because it needs
+// nothing from `editor/`: §9's rule is that an op reaching only the DOM belongs where BOTH
+// surfaces can get it.
+registerAgentOp('layout-settling', () => layoutSettleReport());
 
 // ── Entity-aware input: the same idea one layer in — resolve {guid}/{name}/{id} to the
 // entity's LIVE screen rect so a viewport tap never has to be aimed from coordinates read in

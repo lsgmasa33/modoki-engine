@@ -2988,10 +2988,21 @@ input — the one that is invisible from the material and the scene:
    `FrontSide` around each. `compileAsync` walks the same branch, but its handler
    (`_createObjectPipeline`) only QUEUES the work, and the queue is drained after `side` has been
    restored to `DoubleSide`. So it warms one `cullMode: 'none'` pipeline where the render needs two
-   `cullMode: 'back'` ones. The prewarm places side-pinned clones instead; `compileLiveScene`
-   **hides** such meshes, because compiling them there is worse than skipping them — it builds the
-   DoubleSide program and the first frame's pinned draw then compiles fresh pipelines over it
-   (measured: six synchronous builds came back, and went to zero when hidden).
+   `cullMode: 'back'` ones. **Both halves place side-pinned CLONES** (`pinnedSideClone` /
+   `pinnedStandIns`) and keep the mesh itself hidden from the compile, because compiling it is
+   worse than skipping it — it builds the DoubleSide program and the first frame's pinned draw then
+   compiles fresh pipelines over it (measured: six synchronous builds came back, and went to zero
+   when hidden).
+   ⚠️ **The CLONE is where this bites twice, and both are silent.** `Material.copy()` is a
+   hand-written property list, so a plain `.clone()` drops any OWN property added afterwards —
+   including the two that DECIDE the key for a light-mask variant (`lightsNode`, and the
+   `customProgramCacheKey` that exists to make it visible), which would warm a pipeline nothing
+   reads. And `copy()` deep-copies `userData` through `JSON.parse(JSON.stringify(...))` while #136
+   parks the BASE MATERIAL object in there — so a naive clone serialises a whole material graph,
+   textures included, during the phase this code exists to make cheap (measured: 18
+   `Unable to serialize Texture` warnings the first time the live-compile clone shipped).
+   `pinnedSideClone` carries own properties across generically and gives the clone an empty
+   `userData`, which is free because `getMaterialCacheKey()` skips `userData` outright.
 2. **`compileAsync` frustum-culls its render list, against the previous frame's frustum**, and
    never updates world matrices. `_projectObject` culls exactly as a render does, using the
    module-level `_frustum` the last RENDERED frame left behind — the OUTGOING scene's camera. Both
@@ -3084,8 +3095,10 @@ three's incrementing material id, which differs between two runs of the same bui
 - **The post-FX STAGE quads are not compiled at all.** `compileSceneAsync` covers the scene pass;
   bloom's mip pyramid, DOF's six targets, GTAO and the terminal colour transform each build their
   own pipelines on their first draw, and `RenderPipeline` exposes no compile entry point. After the
-  call-depth pin landed, `demos/postfx-demo`'s worst remaining boot gap is 516 ms with the main
-  thread **95% idle** — off-thread pipeline creation, the shape this points at.
+  call-depth pin landed, `demos/postfx-demo`'s worst remaining boot gap is ~500 ms with the main
+  thread **95% idle** — off-thread pipeline creation. Priced from a Dawn trace on the A23
+  (2026-08-22): the quads are 8 of the 12 pipelines in that burst but only **329 ms of its
+  751 ms** — the side-pinned pair above is the bigger half, so fix that first.
 
 ## Gotcha: TSL first-compile race (prewarm)
 

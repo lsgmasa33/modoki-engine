@@ -178,6 +178,51 @@ otherwise win and refuse a move the press had already captured. The carve-out is
 delivery, not a preference, so it overrides; `??` stays the right precedence everywhere the flag
 really is the caller's intent.
 
+### A refusal that may be TRANSIENT says so — and the retry was DECLINED (#261, 2026-08-22)
+
+An aim refusal can be true at the instant it is asked and gone a frame later: the dock has just
+changed and the target has not reached its final position. The verdict is accurate; the advice it
+offers ("dismiss what covers it") is useless, because nothing needs dismissing and the caller's next
+move is simply to re-aim. #261 asked whether `resolvePoint` should therefore **settle-and-retry**.
+
+**Measured first, three ways, before deciding** — editor on a live clone, restored and re-verified
+after each probe:
+
+| path | settle | false `OCCLUDED`? |
+|---|---|---|
+| steady state (resolver vs. a same-instant `getBoundingClientRect` + `elementFromPoint`) | n/a — identical, 6/6 frames | no |
+| a React commit (filtering the Hierarchy moved a row 206 → 104 px) | **0 frames** — the first sample after the commit already has the new position | no |
+| a FlexLayout tab reveal | **1 frame** | no |
+| a FlexLayout tab add/remove (panel open, then closed) | **0–1 frames** | no |
+
+Two conclusions, and the second is the one that decided it:
+
+1. **The window is 0–1 frames**, not the ~50 ms a fixed sleep would have waited — roughly three
+   times longer than the thing it waits for.
+2. **None of the paths produced a false cover.** The unsettled state is a **zero rect**, so the
+   resolver returns *no point at all* — a clean "cannot resolve", which is already an honest
+   refusal rather than the confident wrong verdict #261 is about.
+
+So the retry is **declined**: a caller who re-aims at all has already waited longer than the layout
+needs. What was missing was never the retry — it was the caller being able to tell the two cases
+apart. Every aim refusal now measures whether the layout MOVED across one frame
+(`engine/app/debug/layoutSettle.ts`, agent op `layout-settling`) and appends a warning when it did,
+on all three paths: `entity`, `selector`, and the handle route's `blockedReason`.
+
+⚠️ **The hint covers the DID-NOT-RESOLVE refusals too, and that is the branch that reproduces.**
+The first cut instrumented only `OCCLUDED` — the shape the issue *reported* — while the shape the
+measurements *produce* is the other one. Without it the refusal reads as "your selector is wrong",
+sending the caller after a better address instead of a re-aim.
+
+**Not implemented as a `dockChangedAt` timestamp**, which the issue sketched. That needs the editor
+to publish "the dock changed at T", and the only seam from the package's editor to this layer is
+`window.__editorStore` — which is **DEV-ONLY**. Enact runs in the packaged DMG too, so a hint
+plumbed that way would work in dev and silently do nothing in the thing that ships. Measuring the
+movement is the fact itself rather than a proxy for it, and stays correct if the dock ever animates.
+
+**Still unmeasured:** a dock change that *splits* the layout. `openPanel` only ever docked into an
+existing tabset, so reproducing one needs a tab dragged to an edge by hand.
+
 ### The aim point must be ON the surface, and INSIDE the panel (2026-08-19)
 
 Two aims, one mistake, found one after the other: a coordinate is judged against the WINDOW when

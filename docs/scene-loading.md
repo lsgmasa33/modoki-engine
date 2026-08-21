@@ -388,7 +388,7 @@ UI (double-click a prefab → Cmd+S), so there was no scripted equivalent of the
 `exitPrefabEditing` (`editor/scene/prefabEdit.ts`) are exposed through the `prefab` agent op /
 `modoki_prefab` MCP tool as `prefabAction: 'edit-open' | 'edit-save' | 'edit-exit'` (tool
 catalog: [debug-tools-mcp.md](./debug-tools-mcp.md)). `edit-open` swaps the world exactly as
-`load-scene` does — it refuses on unsaved work and takes `force` — and additionally **saves the
+`load-scene` does — it refuses on unsaved work and takes `discardUnsaved` — and additionally **saves the
 current scene** on the way in; that is pre-existing `prefabEdit.ts` behaviour, kept deliberately,
 because it is what makes the return trip's reload-from-disk non-destructive.
 `modoki_save_all` refuses outright while the editor is in prefab-edit mode; `edit-save` is the

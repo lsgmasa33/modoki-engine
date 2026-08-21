@@ -357,7 +357,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'load-scene',
     mutating: true, persists: 'live', requires: ['editor', 'project'], aim: 'asset',
     minimalArgs: { path: '/assets/scenes/main.scene.json' },
-    notes: 'SWAPS THE WORLD: refuses while unsaved live changes exist (they would be destroyed). force to discard.',
+    notes: 'SWAPS THE WORLD: refuses while unsaved live changes exist (they would be destroyed). `discardUnsaved` to discard them deliberately — NOT `force`, which is the non-destructive escape hatch on the build family and was renamed here for exactly that reason (§2).',
   },
   modoki_new_scene: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'new-scene',
@@ -418,7 +418,7 @@ const DECLS: Record<string, Decl> = {
       + 'field (EntityAttributes.editorFolder) is revertable but is skipped by a template write, '
       + 'so apply refuses it when named and reports it as `skippedKeys` when not. '
       + "The edit-* actions drive PREFAB-EDIT MODE: 'edit-open' swaps the world for a synthetic "
-      + 'prefab scene (world-destructive, so it takes `force` like load-scene, and it saves the '
+      + 'prefab scene (world-destructive, so it takes `discardUnsaved` like load-scene, and it saves the '
       + "current scene on the way in), 'edit-save' re-serializes the .prefab.json, 'edit-exit' "
       + 'reloads the return scene. None of the three is undoable — they are scene swaps and a '
       + 'file write, matching load-scene and create respectively.',

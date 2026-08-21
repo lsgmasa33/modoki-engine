@@ -1153,13 +1153,24 @@ export function registerEditorAgentOps(): void {
   // load-scene / new-scene SWAP THE WORLD, so anything created live and not saved is gone —
   // from the world, the file, AND the undo stack (swapHistory rebinds). They used to report
   // {ok:true, entityCount:12}, which looks perfectly healthy while the entity you just made
-  // no longer exists anywhere. Refuse by default; `force` discards deliberately. (C7)
-  const guardUnsaved = (op: string, force: boolean | undefined) => {
-    if (force || !hasUnsavedChanges()) return;
+  // no longer exists anywhere. Refuse by default; `discardUnsaved` discards deliberately. (C7)
+  //
+  // RENAMED from `force` (2026-08-22, owner). §2: one name, one meaning. `force` still means
+  // "proceed even though there is unsaved work" on build / add_native_target / ota_publish, where
+  // NOTHING is destroyed and the work is merely left out of the artifact. Here it DESTROYED that
+  // work — and the tool's own name (`load_scene`, `new_scene`) does not tell you which flavour you
+  // are getting, so an agent that learned the harmless one from a build could lose the human's
+  // work with it. The new name states the consequence instead of inviting the habit.
+  //
+  // The OLD name is still honoured on the wire: these ops are reachable by modoki_eval and the
+  // curl API, where there is no strict schema to turn a stale spelling into a refusal. At the TOOL
+  // boundary it IS refused by name (§1), which is where a caller actually learns.
+  const guardUnsaved = (op: string, discardUnsaved: boolean | undefined) => {
+    if (discardUnsaved || !hasUnsavedChanges()) return;
     // S3.11 — name the ACTUAL cause. `hasUnsavedChanges()` has two independent ones, and the
     // fixed string blamed only the first: an agent whose pending work was a dirty
     // particle/anim/timeline doc was sent looking for live entities it had never created. Both
-    // clear with save_all; the difference is what `force:true` would discard.
+    // clear with save_all; the difference is what `discardUnsaved:true` would discard.
     const { sceneDirty, dirtyAssetPaths, dirtyScenes } = unsavedChangeCauses();
     const causes: string[] = [];
     if (sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
@@ -1170,20 +1181,21 @@ export function registerEditorAgentOps(): void {
     throw new Error(
       `${op}: the editor has UNSAVED work — ${causes.join(' AND ')}. ${op} swaps the world, so ` +
       `${sceneDirty ? 'the scene edits would be destroyed (gone from the world, the file, and the undo stack)' : 'the pending asset writes would be lost'}` +
-      `. Run modoki_save_all first, or pass force:true to discard ${causes.length > 1 ? 'them' : 'it'} deliberately.`,
+      `. Run modoki_save_all first, or pass discardUnsaved:true to discard ${causes.length > 1 ? 'them' : 'it'} deliberately.`,
     );
   };
   registerAgentOp('load-scene', async (params) => {
-    const { path, force } = (params ?? {}) as { path: string; force?: boolean };
+    const p = (params ?? {}) as { path: string; discardUnsaved?: boolean; force?: boolean };
+    const { path } = p;
     if (!path) throw new Error('load-scene requires { path }');
-    guardUnsaved('load-scene', force);
+    guardUnsaved('load-scene', p.discardUnsaved ?? p.force);
     const ok = await loadScene(path);
     if (!ok) throw new Error(`load-scene FAILED for ${path} — the scene was not loaded (does the path exist?).`);
     return { ok, ...readEditorState() };
   });
   registerAgentOp('new-scene', (params) => {
-    const { force } = (params ?? {}) as { force?: boolean };
-    guardUnsaved('new-scene', force);
+    const p = (params ?? {}) as { discardUnsaved?: boolean; force?: boolean };
+    guardUnsaved('new-scene', p.discardUnsaved ?? p.force);
     newScene();
     setSelectionRaw(null, []);
     return readEditorState();
@@ -1674,7 +1686,7 @@ export function registerEditorAgentOps(): void {
       // same way and must refuse for the same reason. It additionally SAVES the current scene on
       // the way in (prefabEdit.ts does this deliberately, so the return trip's reload-from-disk
       // is non-destructive) — which is a write the caller should not discover afterwards.
-      guardUnsaved('prefab edit-open', p.force);
+      guardUnsaved('prefab edit-open', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
       const scenePathBefore = getCurrentScenePath();
       const name = p.path.split('/').pop()?.replace(/\.prefab\.json$/, '') ?? p.path;
       await openPrefabForEditing({ path: p.path, name });

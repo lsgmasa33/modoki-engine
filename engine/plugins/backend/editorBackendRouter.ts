@@ -1406,14 +1406,20 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         const st = await ctx.requestBrowser('editor-state', {}, 2000) as { runMode?: string; playState?: string };
         runMode = st?.runMode ?? st?.playState;
       } catch { /* headless / no renderer — the render call below reports it */ }
-      if (runMode === 'stopped' && !(b as { force?: boolean }).force) {
+      // `forceRender`, with `force` still accepted. The TOOL param was renamed (§2: `force` means
+      // "proceed despite unsaved work" on build/load_scene/ota_publish, and meant something
+      // unrelated here). The old name stays valid on the WIRE because the dev-server curl API has
+      // human callers, unlike the tool surface, where there are none to protect.
+      const forceIdentical = (b as { forceRender?: boolean; force?: boolean }).forceRender
+        ?? (b as { force?: boolean }).force;
+      if (runMode === 'stopped' && !forceIdentical) {
         return json({
           ok: false,
           error:
             'REFUSED: the editor is STOPPED, so time does not advance and every frame would be ' +
             'IDENTICAL — a sequence cannot show motion from here. Nothing was rendered.',
           runMode,
-          hint: 'Press Play first (modoki_play_control {action:"play"}), or use modoki_render_scene for a single static frame. Pass force:true to render identical frames deliberately. NOTE a Timeline/Animation PREVIEW or SCRUB is not "stopped" — those advance and are captured normally.',
+          hint: 'Press Play first (modoki_play_control {action:"play"}), or use modoki_render_scene for a single static frame. Pass forceRender:true to render identical frames deliberately. NOTE a Timeline/Animation PREVIEW or SCRUB is not "stopped" — those advance and are captured normally.',
         }, 409);
       }
       // Per-frame timestamps. The returned `fps` was the REQUESTED rate, and the sleep happened

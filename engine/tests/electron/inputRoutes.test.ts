@@ -230,6 +230,75 @@ describe('tap', () => {
    *  i.e. §9's "a rule implemented twice diverges". The harmless-overlay case is real but rare, and
    *  it now has an explicit name: `allowOccluded:true`. `pointer-events:none` never needed it —
    *  `elementFromPoint` skips such elements, so they never read as occluders. */
+  /** #261 — a refusal that is TRUE right now and gone a frame later.
+   *
+   *  The trade the issue weighed was whether `resolvePoint` should settle-and-retry. Measured three
+   *  ways first (React commit 0 frames, FlexLayout tab reveal 1, tab add/remove 0-1; none producing
+   *  a false cover), which argued against the retry: a caller who re-aims at all has already waited
+   *  longer than the layout needs. What was missing was never the retry — it was the caller being
+   *  able to TELL a transient cover from a real one. So the refusal stands and gains a hint.
+   *
+   *  The input must STILL not be dispatched: this is a diagnosis, not a licence. */
+  it('#261 — a covered selector refusal SAYS SO when the dock is still moving', async () => {
+    requestRenderer = makeRenderer({ 'layout-settling': { settling: true, moved: 3, sampled: 15 } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { selector: '#covered' }) as { status?: number; body: { error: string; code: string } };
+    expect(res.body.code).toBe('OCCLUDED');
+    expect(res.body.error).toMatch(/covered by div\.menu/);      // the real diagnosis survives
+    expect(res.body.error).toMatch(/LAYOUT IS STILL MOVING/);     // …and is qualified
+    expect(res.body.error).toMatch(/Re-aim once/);
+    expect(ops.tap, 'a hint is a diagnosis, not a licence to dispatch').not.toHaveBeenCalled();
+  });
+
+  it('#261 — and stays SILENT when the layout is settled, so the hint means something', async () => {
+    // A hint on every refusal is noise a reader learns to skip, which is the same as not having it.
+    //
+    // The renderer must answer a REAL settled report here, not `null`. Asserting silence against an
+    // ABSENT answer passed vacuously: an "always fire" mutation then threw reaching `r.moved` and
+    // the best-effort catch swallowed it, so the test went green against the exact regression it
+    // was written for. Caught by mutation-checking this test rather than by reading it.
+    requestRenderer = makeRenderer({ 'layout-settling': { settling: false, moved: 0, sampled: 15 } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { selector: '#covered' }) as { body: { error: string } };
+    expect(res.body.error).toMatch(/covered by div\.menu/);
+    expect(res.body.error).not.toMatch(/LAYOUT IS STILL MOVING/);
+  });
+
+  it('#261 — a DID-NOT-RESOLVE refusal gets the hint too, which is the branch that reproduces', async () => {
+    // Close-out finding against my own change. The first version instrumented only the OCCLUDED
+    // refusal — the shape the ISSUE reported — and left this one silent. But the shape the
+    // MEASUREMENTS actually produce is this one: an unsettled panel reports a ZERO RECT, so the
+    // resolver refuses with "zero-size"/"no element", not with a cover. Without the hint here the
+    // refusal reads as "your selector is wrong" and the caller goes looking for a better address
+    // instead of simply re-aiming — the exact wrong-cause failure #261 is about, in the branch most
+    // likely to hit it.
+    requestRenderer = makeRenderer({ 'layout-settling': { settling: true, moved: 4, sampled: 15 } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { selector: '#missing' }) as { body: { error: string } };
+    expect(res.body.error).toMatch(/LAYOUT IS STILL MOVING/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('#261 — an ENTITY aim gets the same hint (§9: one rule, not one per path)', async () => {
+    requestRenderer = makeRenderer({ 'layout-settling': { settling: true, moved: 1, sampled: 15 } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { entity: { name: 'StartButton' }, surface: 'game-ui' }) as { body: { error: string; code: string } };
+    expect(res.body.code).toBe('OCCLUDED');
+    expect(res.body.error).toMatch(/LAYOUT IS STILL MOVING/);
+  });
+
+  it('#261 — a renderer that cannot answer costs the refusal nothing', async () => {
+    // The hint is best-effort by construction: a throwing/absent `layout-settling` must not turn a
+    // clean 400 refusal into a 500 or a hang. It is the refusal path — the worst possible place to
+    // introduce a new way to fail.
+    requestRenderer = makeRenderer({ 'layout-settling': undefined });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { selector: '#covered' }) as { status?: number; body: { error: string; code: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('OCCLUDED');
+    expect(res.body.error).toMatch(/covered by div\.menu/);
+  });
+
   it('REFUSES a covered selector, naming the cover and the escape hatch, and dispatches nothing', async () => {
     const res = await post('/api/input/tap', { selector: '#covered' }) as { status?: number; body: { error: string; code: string } };
     expect(res.status).toBe(400);
@@ -1095,7 +1164,13 @@ describe('entity-aimed input (the third target surface)', () => {
     const res = await post('/api/input/tap', { entity: { name: 'Enemy' } });
     expect((res as { status: number }).status).toBe(400);
     expect((res as { body: { error: string } }).body.error).toContain('address by guid');
-    expect(calls).toEqual(['renderer:resolve-entity-point']);
+    // Was `toEqual(['renderer:resolve-entity-point'])`. The old form encoded "no input was
+    // dispatched" as an EXACT renderer call list, so it also pinned how many READS the route makes
+    // — and #261's settle hint adds one (`layout-settling`) on the refusal path. The intent (this
+    // comment's own words, and the reason the assertion exists) is unchanged and now asserted
+    // directly: no input op ran. That is also stricter, since a stray dispatch of ANY input op
+    // fails it, not just one that changes the list length.
+    expect(calls.filter((c) => !c.startsWith('renderer:')), 'no INPUT was dispatched').toEqual([]);
   });
 
   it('takes precedence over selector and {x,y}', async () => {
@@ -1138,7 +1213,13 @@ describe('entity-aimed input (the third target surface)', () => {
     expect((res as { status: number }).status).toBe(400);
     expect((res as { body: { error: string } }).body.error).toContain('Wall');
     expect((res as { body: { error: string } }).body.error).toContain('allowOccluded');
-    expect(calls).toEqual(['renderer:resolve-entity-point']); // the tap op was never called
+    // Was `toEqual(['renderer:resolve-entity-point'])`. The old form encoded "no input was
+    // dispatched" as an EXACT renderer call list, so it also pinned how many READS the route makes
+    // — and #261's settle hint adds one (`layout-settling`) on the refusal path. The intent (this
+    // comment's own words, and the reason the assertion exists) is unchanged and now asserted
+    // directly: no input op ran. That is also stricter, since a stray dispatch of ANY input op
+    // fails it, not just one that changes the list length.
+    expect(calls.filter((c) => !c.startsWith('renderer:')), 'no INPUT was dispatched').toEqual([]);
   });
 
   it('threads `allowOccluded` through to the resolver, and reports what was actually hit', async () => {

@@ -105,7 +105,7 @@ const NO_TOOL_BY_DESIGN: Record<string, string> = {
  *  `validate-prefab`, `unused-assets`, `write-meta`, `duplicate-asset`, `move-file`,
  *  `create-folder`. Keep the bucket. Its value is not the entries it happens to hold; it is that a
  *  route with no tool has somewhere honest to go that is NOT "by design", so the next one cannot
- *  quietly be filed as intentional. docs/plans/mcp-surface-audit-plan.md F6. */
+ *  quietly be filed as intentional. `docs/mcp-tool-conventions.md` §10. */
 const AGENT_GAPS: Record<string, string> = {};
 
 function declaredRoutes(): Set<string> {

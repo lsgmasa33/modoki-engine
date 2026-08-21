@@ -196,9 +196,14 @@ describe('the real registered surface', () => {
    *  folder, on `anim_add_key` a name-path inside an Animator — the same word for three different
    *  addressing schemes, which §2 tolerates only because the TYPE of thing is stated every time.
    *  A param that means one thing everywhere does NOT belong here; it belongs in `shapes.ts`. */
+  //
+  // `force` was on this list as a recorded residual and is now GONE from it — the destructive half
+  // was renamed to `discardUnsaved` (2026-08-22, owner), so the word means exactly one thing
+  // everywhere it appears and the containment check polices it instead of an exemption. That is the
+  // outcome an entry here should always be aiming at: the list is a holding pen, not a home.
   const PER_TOOL_MEANING = new Set([
     'path', 'action', 'type', 'name', 'kind', 'id', 'ids', 'key', 'keys', 'limit', 'all',
-    'from', 'to', 'value', 'target', 'mode', 'force', 'clear', 'since', 'guid', 'guids',
+    'from', 'to', 'value', 'target', 'mode', 'clear', 'since', 'guid', 'guids',
     'width', 'height', 'quality', 'selector', 'button', 'steps', 'entity', 'panel',
     'timeoutMs', 'parentId', 'parentGuid', 'source', 'level', 'platform', 'provider', 'fields',
   ]);
@@ -249,12 +254,75 @@ describe('the real registered surface', () => {
     ).toEqual([]);
   });
 
+  it('the two halves are now two NAMES, and each still points at the other', () => {
+    // The §2 fix, landed rather than mitigated. `force` used to mean "proceed, nothing is lost" on
+    // the build family and "DESTROY the unsaved world" on the world-swapping tools, with the tool's
+    // own name giving no clue which — so an agent that learned the harmless one from a build could
+    // lose the human's work with it. Two meanings, two names now.
+    //
+    // The cross-references stay asserted even after the rename: a caller arriving with the old
+    // habit has to be able to find where it went, and §1's strict refusal tells them the param is
+    // unknown without telling them what to use instead.
+    const destructive = ['modoki_load_scene', 'modoki_new_scene', 'modoki_prefab'];
+    const harmless = ['modoki_build', 'modoki_add_native_target', 'modoki_ota_publish'];
+    for (const name of destructive) {
+      const shape = getTool(name)!.shape as Record<string, { description?: string }>;
+      expect(shape.force, `${name} must no longer take \`force\``).toBeUndefined();
+      const d = shape.discardUnsaved?.description ?? '';
+      expect(d, `${name}.discardUnsaved must say it DESTROYS`).toMatch(/DESTRUCTIVE and IRREVERSIBLE/);
+      expect(d, `${name} must name the old spelling, so the habit has somewhere to land`).toMatch(/used to be called `force`/);
+    }
+    for (const name of harmless) {
+      const shape = getTool(name)!.shape as Record<string, { description?: string }>;
+      expect(shape.discardUnsaved, `${name} destroys nothing and must NOT take discardUnsaved`).toBeUndefined();
+      const d = shape.force?.description ?? '';
+      expect(d, `${name}.force must say it is NOT destructive`).toMatch(/NON-DESTRUCTIVE/);
+      expect(d, `${name}.force must name the other param`).toMatch(/discardUnsaved/);
+    }
+  });
+
+  it('…and `force` now means ONE thing, so it needs no exemption', () => {
+    // The durable win. While `force` sat in PER_TOOL_MEANING the guard was blind to it — which is
+    // how the render_sequence violation survived to be found by hand. Assert the exemption is gone,
+    // so re-adding it is a deliberate act rather than a quiet one.
+    const descs = new Set(['modoki_build', 'modoki_add_native_target', 'modoki_ota_publish']
+      .map((n) => (getTool(n)!.shape as Record<string, { description?: string }>).force?.description));
+    expect(descs.size, '`force` must read identically wherever it survives').toBe(1);
+  });
+
   it('PER_TOOL_MEANING names no param that has left the surface', () => {
     // Same rule as every other ledger here: a stale entry rots into a blanket exemption, and the
     // next genuine drift on that name lands on it unnoticed.
     const live = new Set(s.names.flatMap((n) => Object.keys(getTool(n)!.shape)));
     expect([...PER_TOOL_MEANING].filter((p) => !live.has(p)).sort(),
       'delete these — no tool takes them any more').toEqual([]);
+  });
+
+  it("a description never tells the caller to pass a param the tool does not have", () => {
+    // Born from a real miss. Renaming `force` -> `discardUnsaved` left `modoki_load_scene` and
+    // `modoki_new_scene` still saying "pass force:true" in their own descriptions — an instruction
+    // that, post-§1, is now a REFUSAL. The tool tells the agent to do the one thing it will reject.
+    //
+    // That is worse than a stale doc: the description is what the model reads immediately before
+    // choosing arguments, so it is the most load-bearing prose on the surface, and the refusal it
+    // provokes reads as the agent's mistake. §11 already requires a documented DEFAULT to match the
+    // code; this is the same rule for a documented PARAM.
+    //
+    // Deliberately narrow — the literal "pass X:true" instruction, not every mention of a word.
+    // A description legitimately names other tools' params ("call modoki_save_all first"), so a
+    // broad scan would drown in false positives and get relaxed into uselessness. One precise
+    // pattern that cannot be argued with beats a fuzzy one nobody trusts.
+    const offenders: string[] = [];
+    for (const name of s.names) {
+      const entry = getTool(name)!;
+      const params = new Set(Object.keys(entry.shape));
+      for (const m of entry.description.matchAll(/pass\s+`?(\w+)`?\s*:\s*true/gi)) {
+        if (!params.has(m[1])) {
+          offenders.push(`${name}: says "pass ${m[1]}:true" but accepts [${[...params].join(', ')}]`);
+        }
+      }
+    }
+    expect(offenders, 'a description instructs the caller to pass a param that would be REFUSED').toEqual([]);
   });
 
   it('every NON-ENUM param carries its own .describe()', () => {

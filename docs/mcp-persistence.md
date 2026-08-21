@@ -229,7 +229,7 @@ function has **two independent causes** — a dirty scene edit-version and a pen
 refusal used to blame only the first, naming `create_entity`/`duplicate_entity`/`prefab`. An agent whose
 only unsaved work was a parked particle edit went looking for live entities it had never created. The
 message is now built from `unsavedChangeCauses()` and lists `getDirtyAssetPaths()` when non-empty, so
-`force:true` tells you what it would discard. Both causes still clear with one `save_all`.
+`discardUnsaved:true` tells you what it would discard. Both causes still clear with one `save_all`.
 
 ## 6. Prior fix this generalizes
 

@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { flatEntityAlias, foldEntityRef } from '../shapes.js';
+import { DISCARD_UNSAVED_BASE, discardUnsavedParam, flatEntityAlias, foldEntityRef } from '../shapes.js';
 
 export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, editorAction, fail } = ctx;
@@ -215,20 +215,20 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Switch the editor to a scene (returns to Stopped first, like opening a scene). Verify ' +
       'with modoki_get_editor_state / modoki_get_scene_state afterwards. REFUSES when the ' +
       'editor has unsaved live-world changes (it swaps the world, destroying them) — save_all ' +
-      'first, or pass force:true.',
+      'first, or pass discardUnsaved:true.',
     {
-      force: z.boolean().optional().describe('Discard unsaved live-world changes (they are destroyed — from the world, the file, AND the undo stack).'),
+      discardUnsaved: discardUnsavedParam,
       path: z.string().describe('Asset-root URL of the scene file.') },
-    async ({ path, force }) => editorAction('load-scene', { path, ...(force ? { force } : {}) }),
+    async ({ path, discardUnsaved }) => editorAction('load-scene', { path, ...(discardUnsaved ? { discardUnsaved } : {}) }),
   );
   tool(
     'modoki_new_scene',
     'Start a fresh untitled scene (clears all entities, spawns a default Camera). Unsaved ' +
       'until you modoki_save_all({path}) — it has no path yet, so save_all REQUIRES one. ' +
       'WARNING: this DISCARDS the live world; anything created and not saved is gone (it ' +
-      'refuses if there are unsaved changes — pass force:true to discard them deliberately).',
-    { force: z.boolean().optional().describe('Discard unsaved live-world changes deliberately.') },
-    async ({ force }) => editorAction('new-scene', force ? { force } : {}),
+      'refuses if there are unsaved changes — pass discardUnsaved:true to discard them deliberately).',
+    { discardUnsaved: discardUnsavedParam },
+    async ({ discardUnsaved }) => editorAction('new-scene', discardUnsaved ? { discardUnsaved } : {}),
   );
   tool(
     'modoki_save_all',
@@ -387,7 +387,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       action: z.enum(['instantiate', 'create', 'detach', 'overrides', 'apply', 'revert', 'edit-open', 'edit-save', 'edit-exit'])
         .describe("instantiate: spawn a prefab into the scene. create: turn an existing entity INTO a prefab asset. detach: break an instance's link to its prefab. overrides: list an instance's current overrides as key strings (read-only — the discovery step for apply/revert). apply: write selected overrides into the .prefab.json. revert: reset selected overrides on this instance back to the prefab base. edit-open/edit-save/edit-exit: enter, write, and leave prefab-edit mode on the template itself. Sent on the wire as `prefabAction` — the relay strips a param named `action`."),
       path: z.string().optional().describe('instantiate / edit-open: prefab asset path. create: destination .prefab.json path.'),
-      force: z.boolean().optional().describe('edit-open: discard unsaved live work instead of refusing (edit-open swaps the world, like load_scene).'),
+      // EXTENDS the shared base rather than replacing it (§2 containment): the scope note is real
+      // per-tool information, and it sits after the rule instead of forking it.
+      discardUnsaved: discardUnsavedParam.describe(`${DISCARD_UNSAVED_BASE}. edit-open ONLY — that action swaps the world like modoki_load_scene; the other prefab actions ignore this.`),
       parentId: z.number().optional().describe('instantiate: parent entity id (default root). Prefer parentGuid.'),
       parentGuid: z.string().optional().describe('instantiate: parent entity guid (preferred; wins over parentId).'),
       entityId: z.number().optional().describe('create/detach/overrides/apply/revert: the entity id. Prefer entityGuid.'),

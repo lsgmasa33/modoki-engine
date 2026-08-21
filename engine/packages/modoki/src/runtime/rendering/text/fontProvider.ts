@@ -36,7 +36,13 @@ export interface FontProvider extends LayoutFont {
   /** Register a cleanup run when the font is released ({@link dispose}). The
    *  renderers use this to tie the GPU texture they build from the atlas image to
    *  the font's scene-scoped lifetime — WITHOUT the (renderer-agnostic) provider
-   *  importing THREE/Pixi. Idempotent across dispose. */
+   *  importing THREE/Pixi. Idempotent across dispose.
+   *
+   *  ⚠️ **Registering AFTER dispose runs `fn` immediately** rather than queueing it onto an
+   *  array nothing will drain again. The renderers' atlas loads are ASYNC and the provider can be
+   *  disposed mid-flight (`invalidateFont` on a re-bake/mode flip), so a late registration is the
+   *  normal case, not a misuse — and dropping it silently pinned the dead font's texture in a
+   *  module-level cache keyed by `${id}`, where the freshly re-acquired provider then found it. */
   addDisposable(fn: () => void): void;
   dispose(): void;
 }
@@ -57,6 +63,7 @@ export class BakedFontProvider implements FontProvider {
   }
 
   private disposables: Array<() => void> = [];
+  private disposed = false;
 
   get metrics() { return this.glyphAtlas.metrics; }
   get atlas() { return this.glyphAtlas.atlas; }
@@ -66,9 +73,15 @@ export class BakedFontProvider implements FontProvider {
 
   ensureGlyphs() { /* baked: nothing to generate */ }
 
-  addDisposable(fn: () => void) { this.disposables.push(fn); }
+  // A late registration (an atlas load that landed after invalidateFont disposed us) runs NOW —
+  // see the interface doc; queueing it would strand the cleanup forever.
+  addDisposable(fn: () => void) {
+    if (this.disposed) { try { fn(); } catch { /* ignore */ } return; }
+    this.disposables.push(fn);
+  }
 
   dispose() {
+    this.disposed = true;
     // Renderer-attached GPU resources (the Three/Pixi atlas texture) clean up here.
     for (const fn of this.disposables) { try { fn(); } catch { /* ignore */ } }
     this.disposables = [];

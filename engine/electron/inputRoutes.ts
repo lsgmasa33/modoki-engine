@@ -155,6 +155,31 @@ const bad = (error: string, code?: ErrorCode) => json({ error, ...(code ? { code
 
 /** Resolve a `{selector}` in the renderer, or pass `{x,y}` through. Returns the point or
  *  a prefixed error string — never throws, so a bad selector is a 400, not a 500. */
+/** The one sentence a refusal adds when the DOCK IS MID-MOVE (#261).
+ *
+ *  An aim refusal can be TRUE at the instant it is asked and gone a frame later: the layout has
+ *  just changed and the target has not reached its final position. The refusal is accurate; the
+ *  advice it offers ("dismiss what covers it") is not, because nothing needs dismissing and the
+ *  caller's next move is simply to re-aim.
+ *
+ *  This is a HINT, not a retry. The call still refuses and the input is still not dispatched. The
+ *  trade #261 weighed was whether to re-resolve and press on, and the measurements argued against
+ *  it: the settle window is 0-1 frames, so a caller who re-aims at all has already waited longer
+ *  than the layout needs. What was missing was never the retry — it was the caller being able to
+ *  TELL the two cases apart.
+ *
+ *  Costs one frame, on the refusal path ONLY. Never throws: a renderer that cannot answer yields
+ *  no hint rather than a failed refusal. */
+async function settlingHint(requestRenderer: InputRouteDeps['requestRenderer']): Promise<string> {
+  try {
+    const r = (await requestRenderer('layout-settling', {})) as { settling?: boolean; moved?: number } | null;
+    if (!r?.settling) return '';
+    return ` ⚠️ THE LAYOUT IS STILL MOVING as this was measured (${r.moved} element(s) shifted within `
+      + 'one frame) — a dock/panel change has not settled, so this refusal may describe a position '
+      + 'the target is about to leave. Re-aim once before treating it as real.';
+  } catch { return ''; }
+}
+
 export async function resolvePoint(
   spec: PointSpec | undefined,
   which: string,
@@ -175,7 +200,15 @@ export async function resolvePoint(
       return { error: `${which}: renderer could not resolve entity (${e instanceof Error ? e.message : String(e)})` };
     }
     if (!res || !res.ok || typeof res.x !== 'number' || typeof res.y !== 'number') {
-      return { error: `${which}: ${res?.error ?? 'entity did not resolve'}`, ...(res?.code ? { code: res.code } : {}) };
+      // The hint belongs HERE too — and this is the branch the #261 measurements actually hit.
+      // An unsettled panel reports a ZERO RECT, so the resolver refuses with "zero-size"/"off-screen"
+      // rather than OCCLUDED; instrumenting only the covered case would have left the hint silent on
+      // the one transient that reproduces. Without it the refusal reads as "your entity/selector is
+      // wrong" and the caller goes hunting for a better address instead of re-aiming.
+      return {
+        error: `${which}: ${res?.error ?? 'entity did not resolve'}${await settlingHint(requestRenderer)}`,
+        ...(res?.code ? { code: res.code } : {}),
+      };
     }
     // §3: "a resolvable aim that something COVERS is refused ... this binds `entity` and
     // `selector` alike". Only the MESH-level half of that was implemented — entityResolve refuses
@@ -203,8 +236,9 @@ export async function resolvePoint(
       // case: `centreIsInWindow` admits `x === innerWidth` while `elementFromPoint` is exclusive at
       // that same edge, so a rect flush against the window's right/bottom lands here.
       const nothingThere = !res.hitTarget || res.hitTarget === NOTHING_AT_POINT;
+      const settling = await settlingHint(requestRenderer);
       return {
-        error: nothingThere
+        error: (nothingThere
           ? `${which}: ${res.matched ?? 'the entity'} resolves to a point with NOTHING at it — `
             + `(${Math.round(res.x)}, ${Math.round(res.y)}) is clipped away or past the window edge, so the `
             + `input would go nowhere${scope}. Move the camera (or the entity) so it is framed well `
@@ -212,7 +246,7 @@ export async function resolvePoint(
           : `${which}: ${res.matched ?? 'the entity'} resolves to a point covered by `
             + `${res.hitTarget} — the input would land on THAT, not on your target${scope}. `
             + 'Dismiss/move what covers it, or pass allowOccluded:true to aim there anyway and see '
-            + 'what happens.',
+            + 'what happens.') + settling,
         code: 'OCCLUDED',
       };
     }
@@ -233,7 +267,7 @@ export async function resolvePoint(
       return { error: `${which}: renderer could not resolve selector (${e instanceof Error ? e.message : String(e)})` };
     }
     if (!res || !res.ok || typeof res.x !== 'number' || typeof res.y !== 'number') {
-      return { error: `${which}: ${res?.error ?? 'selector did not resolve'}` };
+      return { error: `${which}: ${res?.error ?? 'selector did not resolve'}${await settlingHint(requestRenderer)}` };
     }
     if (res.occluded && !spec.allowOccluded) {
       // Two different diagnoses, because they want different actions and the covering element's
@@ -241,8 +275,9 @@ export async function resolvePoint(
       // modal is over your target or your target is scrolled out of its own list. `clipped` says
       // which (a sweep of this editor's live selectors found 12 of 22 occluded hits were the
       // scroll case), so the fix named is the fix that works.
+      const settling = await settlingHint(requestRenderer);
       return {
-        error: res.clipped
+        error: (res.clipped
           ? `${which}: ${JSON.stringify(spec.selector)} is SCROLLED OUT of its own container — its `
             + `rect is real but nothing is drawn there, so the point lands on ${res.hitTarget ?? 'other chrome'} `
             + 'instead. Scroll it into view (modoki_scroll over that panel) or enlarge the panel, then '
@@ -250,7 +285,7 @@ export async function resolvePoint(
           : `${which}: ${JSON.stringify(spec.selector)} resolves to a point covered by `
             + `${res.hitTarget ?? 'something else'} — the input would land on THAT, not on your target. `
             + 'Dismiss/move what covers it (an open menu, a modal, a panel that overlaps), scroll the '
-            + 'target clear, or pass allowOccluded:true to aim there anyway and see what happens.',
+            + 'target clear, or pass allowOccluded:true to aim there anyway and see what happens.') + settling,
         code: 'OCCLUDED',
       };
     }
@@ -901,7 +936,13 @@ export function createInputRoutes(deps: InputRouteDeps) {
       const from = await resolve(h.id);
       if (!from) return json({ error: `no live handle with id '${h.id}' (query /api/enact-handles to list current handles)` }, 404);
       const fromBlocked = blockedReason(from, h.allowOccluded);
-      if (fromBlocked) return json({ ok: false, error: `handle '${h.id}' is ${fromBlocked}`, handle: { id: h.id, x: from.x, y: from.y, onScreen: from.onScreen ?? true } });
+      // §9 parity: the handle path is the THIRD place this refusal is written, and #261's hint has
+      // to reach it too or the rule diverges again — a handle sitting under a panel that has not
+      // finished moving reads exactly as "this handle is inert", which is how a working 2D gizmo
+      // handle got filed at severity high.
+      if (fromBlocked) {
+        return json({ ok: false, error: `handle '${h.id}' is ${fromBlocked}${await settlingHint(requestRenderer)}`, handle: { id: h.id, x: from.x, y: from.y, onScreen: from.onScreen ?? true } });
+      }
       // S3.17 — `occluded` means the SAME thing here as on every other aimed route: a BOOLEAN,
       // always present, with the covering element's identity in `occludedBy`. The handle routes
       // used to emit `occluded` as a STRING naming the cover and omit it when clean, so a caller
@@ -936,7 +977,9 @@ export function createInputRoutes(deps: InputRouteDeps) {
         const t = await resolve(h.toId);
         if (!t) return json({ error: `no live handle with toId '${h.toId}'` }, 404);
         const tBlocked = blockedReason(t, h.allowOccluded);
-        if (tBlocked) return json({ ok: false, error: `toId handle '${h.toId}' is ${tBlocked}`, handle: { id: h.toId, x: t.x, y: t.y, onScreen: t.onScreen ?? true } });
+        if (tBlocked) {
+          return json({ ok: false, error: `toId handle '${h.toId}' is ${tBlocked}${await settlingHint(requestRenderer)}`, handle: { id: h.toId, x: t.x, y: t.y, onScreen: t.onScreen ?? true } });
+        }
         to = { x: t.x, y: t.y };
         toHandle = t;
       }

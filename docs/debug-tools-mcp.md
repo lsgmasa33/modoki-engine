@@ -946,7 +946,9 @@ so existing callers don't break; don't pass it.
   over `id`), as `mutate_scene`/`set_transform`/`get_scene_state {guid}` already did.
 - **`load_scene`/`new_scene` REFUSE when there is unsaved live work** (a scene edit OR a
   pending dirty asset) — both would replace/discard it. `save_all` first, then the reload is
-  lossless. (`force: true` discards deliberately.) `mutate_scene`/`set_transform` used to carry
+  lossless. (`discardUnsaved: true` discards deliberately — renamed from `force` in #261's
+  close-out, because `force` on the BUILD family destroys nothing and one word cannot mean both.)
+  `mutate_scene`/`set_transform` used to carry
   the SAME refusal for the mirror-image reason (their file write would hot-reload the scene and
   destroy unsaved live-only entities) — that guard is now unreachable in practice: whenever a
   renderer is connected on the targeted scene, the call goes through the LIVE world first (see

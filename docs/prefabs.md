@@ -405,7 +405,7 @@ shows there in normal mode too.
 exposed as the `prefab` agent op / `modoki_prefab` MCP tool's `prefabAction: 'edit-open' |
 'edit-save' | 'edit-exit'` — full tool contract (params, refusals, minimal call) in
 [debug-tools-mcp.md](./debug-tools-mcp.md)'s generated tool catalog. `edit-open` swaps the world
-exactly as `load-scene` does (refuses on unsaved work, takes `force`) and additionally saves the
+exactly as `load-scene` does (refuses on unsaved work, takes `discardUnsaved`) and additionally saves the
 current scene on the way in, deliberately, so the return trip's reload-from-disk is
 non-destructive; `modoki_save_all` refuses outright while in prefab-edit mode. This is what
 `engine/scripts/resave-prefabs.sh` drives to bulk-migrate prefabs to the current serializer

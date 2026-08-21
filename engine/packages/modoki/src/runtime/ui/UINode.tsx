@@ -822,8 +822,16 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
     const el = ref.current;
     if (!el || !guid || wheelMode !== 'entry') return;
     const onWheel = (e: WheelEvent) => {
-      // Non-passive so this can preventDefault: without it the browser ALSO applies the raw delta
-      // and the view fights the request we are about to make.
+      // ⚠️ **Only swallow the wheel when this box can actually scroll on its axis.** Non-passive
+      // so it CAN preventDefault — without that the browser also applies the raw delta and fights
+      // the request below — but doing it unconditionally is the classic wheel trap: a view with
+      // nothing to scroll (content fits, or it is nested inside another scroller) would capture
+      // every wheel event over it and drop it, so the ancestor scrollable never moves while the
+      // pointer is there. Input captured and discarded is worse than input not handled.
+      const canScroll = axis === 'y'
+        ? el.scrollHeight > el.clientHeight
+        : el.scrollWidth > el.clientWidth;
+      if (!canScroll) return;
       e.preventDefault();
       if (wheelTimer.current) clearTimeout(wheelTimer.current);
       wheelTimer.current = setTimeout(() => { wheelBusy.current = false; }, WHEEL_GESTURE_GAP_MS);

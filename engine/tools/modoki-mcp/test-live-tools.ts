@@ -159,7 +159,7 @@ const observedRunMode = editorStateForGate.runMode ?? editorStateForGate.playSta
 const EXPECTED_REFUSALS: Record<string, { match: RegExp; why: string; when?: () => boolean }> = {
   modoki_render_sequence: {
     match: /editor is STOPPED/i,
-    why: 'S2.33 by design — with time not advancing every frame would be identical, so a sequence is refused unless Playing (or force:true). The refusal IS the correct behaviour here.',
+    why: 'S2.33 by design — with time not advancing every frame would be identical, so a sequence is refused unless Playing (or forceRender:true). The refusal IS the correct behaviour here.',
     when: () => observedRunMode === 'stopped',
   },
   modoki_ota_status: {

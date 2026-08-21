@@ -3423,6 +3423,93 @@ function sidePinnedVariants(material: THREE.Material): THREE.Side[] {
     : [];
 }
 
+/** Clone a material with `side` pinned, WITHOUT losing what makes it distinct to the cache.
+ *
+ *  ⚠️ `Material.copy()` is a hand-written property list, so a clone silently drops any OWN
+ *  property added after construction — and #136's light-mask variants add exactly the two that
+ *  DECIDE the cache key: `lightsNode` (which three's key cannot see) and the
+ *  `customProgramCacheKey` that exists to make it visible. A clone missing them hashes to a
+ *  different key, so it would warm a pipeline nothing reads: this issue's defect, one layer down.
+ *
+ *  Carried GENERICALLY rather than by name — anything the source owns that the clone did not
+ *  receive is copied across, so the next mechanism to hang a property off a material is covered
+ *  without anyone remembering to update a list. The one exclusion is the `_`/`is`-prefixed set,
+ *  which is exactly what `RenderObject.getMaterialCacheKey()` itself skips, so it cannot affect
+ *  the key — and `_listeners` in particular MUST NOT be shared, or a dispose on either material
+ *  would fire the other's handlers. */
+export function pinnedSideClone(material: THREE.Material, side: THREE.Side): THREE.Material {
+  // ⚠️ `Material.copy()` deep-copies `userData` with `JSON.parse(JSON.stringify(...))`, and #136's
+  // light-mask variants park the BASE MATERIAL object in there (`baseOf`). So a naive
+  // `material.clone()` serialises an entire material graph — textures included — during the exact
+  // phase this code exists to make cheap, and a compressed texture cannot be serialised at all, so
+  // it logs `THREE.Texture: Unable to serialize Texture.` per clone and yields garbage. Measured
+  // on `demos/postfx-demo`: 18 such warnings the first time this shipped. `userData` is one of the
+  // properties `getMaterialCacheKey()` explicitly SKIPS, so an empty one on the clone is free.
+  const savedUserData = material.userData;
+  let clone: THREE.Material;
+  material.userData = {};
+  // Stamped HERE, at the clone site (#318) — `pinnedSideClone` has two callers (the live
+  // compile's stand-ins and the prewarm's side-pinned variants) and the sweep learns a clone
+  // holds its base only from this stamp. Same line, as `materialCloneStamp.test.ts` requires.
+  try { clone = markDerived(material.clone(), material); } finally { material.userData = savedUserData; }
+  const src = material as unknown as Record<string, unknown>;
+  const dst = clone as unknown as Record<string, unknown>;
+  for (const key of Object.keys(src)) {
+    if (/^(is[A-Z]|_)/.test(key)) continue;
+    if (Object.prototype.hasOwnProperty.call(dst, key)) continue;
+    dst[key] = src[key];
+  }
+  clone.side = side;
+  return clone;
+}
+
+/** Meshes that stand in for one side-pinned mesh during the live compile — one per pinned pass.
+ *
+ *  Returns `[]` when a stand-in provably CANNOT match: `getMaterialCacheKey()` folds
+ *  `object.uuid` in for an instanced / batched / morph-target mesh, so a different object is a
+ *  different key by construction and the stand-in would warm a pipeline nothing reads. Those keep
+ *  the hide-only behaviour and pay their first draw, which is honest rather than silent. */
+export function pinnedStandIns(mesh: THREE.Mesh, retain: Array<{ dispose(): void }>): THREE.Mesh[] {
+  const material = mesh.material as THREE.Material;
+  const obj = mesh as unknown as {
+    isInstancedMesh?: boolean; isBatchedMesh?: boolean; count?: number;
+    morphTargetInfluences?: number[]; isSkinnedMesh?: boolean;
+    skeleton?: THREE.Skeleton; bindMatrix?: THREE.Matrix4;
+  };
+  if (obj.isInstancedMesh || obj.isBatchedMesh || (obj.count ?? 0) > 1
+      || Array.isArray(obj.morphTargetInfluences)) return [];
+
+  const out: THREE.Mesh[] = [];
+  for (const side of sidePinnedVariants(material)) {
+    const clone = pinnedSideClone(material, side);
+    retain.push(clone);
+    let stand: THREE.Mesh;
+    if (obj.isSkinnedMesh && obj.skeleton) {
+      // A skeleton reaches the key as `object.skeleton.bones.length`, and skinning changes the
+      // node graph — so a plain Mesh would be a different program, not a stand-in. Sharing one
+      // skeleton across two meshes is what three itself does for LOD levels.
+      const skinned = new THREE.SkinnedMesh(mesh.geometry, clone);
+      skinned.bind(obj.skeleton, obj.bindMatrix ?? new THREE.Matrix4());
+      stand = skinned;
+    } else {
+      stand = new THREE.Mesh(mesh.geometry, clone);
+    }
+    // Only the SIGN of the world determinant reaches the pipeline key (three flips `frontFace` for
+    // a mirrored object), so copying the source's world matrix onto a scene-level child is enough
+    // — it does not have to land in the same place, and it never draws.
+    stand.matrixAutoUpdate = false;
+    stand.matrix.copy(mesh.matrixWorld);
+    stand.matrixWorld.copy(mesh.matrixWorld);
+    stand.castShadow = mesh.castShadow;
+    stand.receiveShadow = mesh.receiveShadow;
+    stand.layers.mask = mesh.layers.mask;
+    stand.renderOrder = mesh.renderOrder;
+    prepPrewarmMesh(stand);
+    out.push(stand);
+  }
+  return out;
+}
+
 
 /** Build a throwaway THREE.Scene containing placeholder meshes for every DISTINCT
  *  (mesh, material) pair among the world's Renderable3D + Renderable3DPrimitive
@@ -3544,13 +3631,12 @@ async function prewarmShadersForWorldInner(
     const materials: THREE.Material[] = [];
     if (sides.length === 0) materials.push(material);
     else for (const side of sides) {
-      // Stamped so the retired-material sweep counts the prewarm scene's binding (#318): this
-      // surface IS registered (see `registerRenderSurface(prewarmScene)`) precisely so the sweeps
-      // can see it, and an `invalidateMaterial` landing during the async `compileAsync` would
-      // otherwise free the base out from under this clone. After `prewarmScene.clear()` nothing
-      // binds it, so it pins nothing.
-      const clone = markDerived(material.clone(), material);
-      clone.side = side;
+      // `pinnedSideClone` stamps the clone for the retired-material sweep (#318): this surface IS
+      // registered (see `registerRenderSurface(prewarmScene)`) precisely so the sweeps can see it,
+      // and an `invalidateMaterial` landing during the async `compileAsync` would otherwise free
+      // the base out from under this clone. After `prewarmScene.clear()` nothing binds it, so it
+      // pins nothing.
+      const clone = pinnedSideClone(material, side);
       _prewarmRetained.push(clone);
       materials.push(clone);
     }
@@ -3901,6 +3987,7 @@ export async function compileLiveScene(
     const revealed: THREE.Object3D[] = [];
     const lods: THREE.LOD[] = [];
     const hidden: THREE.Object3D[] = [];
+    const standIns: THREE.Mesh[] = [];
     scene.traverse((o) => {
       const lod = o as THREE.LOD;
       if (lod.isLOD) {
@@ -3911,19 +3998,27 @@ export async function compileLiveScene(
         for (const level of lod.levels) if (!level.object.visible) { level.object.visible = true; revealed.push(level.object); }
       }
       const mesh = o as THREE.Mesh;
-      // ⚠️ A material three draws SIDE-PINNED is hidden from this compile and stood in for below.
+      // ⚠️ A material three draws SIDE-PINNED is hidden from this compile and STOOD IN FOR by one
+      // pinned clone per pass — the same trick the pre-swap prewarm uses.
       //
-      // Compiling it here is worse than not compiling it, which is the opposite of what it looks
-      // like. `compileAsync` walks three's own two-pass branch but its queue is drained after
-      // `material.side` is restored (see `sidePinnedVariants`), so it compiles the DoubleSide
-      // program — and the first frame's pinned draw then builds fresh pipelines over THAT program
-      // instead of finding the pinned ones. Measured on `games/3d-test`: including these meshes in
-      // the live compile put six synchronous first-frame builds BACK that the prewarm's pinned
-      // clones had already removed; hiding them returned it to zero.
+      // Compiling the mesh itself is worse than not compiling it, which is the opposite of what it
+      // looks like. `compileAsync` walks three's own two-pass branch but its queue is drained
+      // after `material.side` is restored (see `sidePinnedVariants`), so it compiles the
+      // DoubleSide program — and the first frame's pinned draw then builds fresh pipelines over
+      // THAT program instead of finding the pinned ones. Measured on `games/3d-test`: including
+      // these meshes in the live compile put six synchronous first-frame builds BACK that the
+      // prewarm's pinned clones had already removed; hiding them returned it to zero.
+      //
+      // Hiding ALONE, which is what this did until 2026-08-22, leaves them covered by nothing
+      // under a post-FX stack: the prewarm's clones compile in the CANVAS context, and the pass
+      // draws through its own. Priced from a Dawn trace on an A23 (`demos/postfx-demo`): one such
+      // material, compiled twice, was 187 ms + 171 ms = 358 ms — 48% of the 751 ms pipeline burst
+      // the last remaining boot gap waits on, and the single most expensive thing in the boot.
       if (mesh.isMesh && !Array.isArray(mesh.material) && mesh.material
           && sidePinnedVariants(mesh.material as THREE.Material).length > 0 && mesh.visible) {
         mesh.visible = false;
         hidden.push(mesh);
+        for (const stand of pinnedStandIns(mesh, _prewarmRetained)) standIns.push(stand);
         return;
       }
       // Same reason as the prewarm's placeholders: `compileAsync` frustum-culls its render list
@@ -3932,6 +4027,9 @@ export async function compileLiveScene(
       // looking — and on the first swap after boot, on a camera that has never framed anything.
       if (mesh.isMesh && mesh.frustumCulled) { mesh.frustumCulled = false; unculled.push(mesh); }
     });
+    // Added AFTER the traverse — mutating a tree mid-`traverse` is undefined behaviour, and these
+    // must not be walked by the loop that created them.
+    for (const stand of standIns) scene.add(stand);
     try {
       if (compile) await compile();
       else await (renderer as THREE.WebGLRenderer).compileAsync?.(scene, camera);
@@ -3943,6 +4041,10 @@ export async function compileLiveScene(
       for (const o of revealed) o.visible = false;
       for (const o of hidden) o.visible = true;
       for (const lod of lods) lod.autoUpdate = true;
+      // Removed from the scene, but the clone materials are NOT disposed — disposing one tears
+      // down its render object and releases the very pipeline it was minted to warm (see
+      // `_prewarmRetained`). They are held until the next prewarm frees them.
+      for (const stand of standIns) scene.remove(stand);
     }
   });
 }
