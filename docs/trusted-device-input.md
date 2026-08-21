@@ -322,8 +322,10 @@ build, the per-machine signing, and the expiry rule.
   (`IPHONEOS_DEPLOYMENT_TARGET = 15.0`). The one measurement that settled it was a CONTROL: the
   same xctestrun launches WDA on the iPhone Air first try, isolating the variable to the OS.
 
-  Consequence for testing: **the iPhone 8 is a synthetic-input-only device.** Use the Air for any
-  trusted-input verification. The only avenue that could change this is a third-party XCUITest
+  Consequence for testing: **the iPhone 8 is a synthetic-input-only device.** Use the iPad mini for
+  any trusted-input verification — it replaced the Air as the default on 2026-08-21; the Air is in
+  the same profile and still works. (Device ids live in `docs/devices.md`, which is private — this
+  doc publishes, so it names hardware and never identifies it.) The only avenue that could change this is a third-party XCUITest
   launcher (e.g. `go-ios`) that bypasses Xcode's test machinery — a new toolchain dependency, so
   an owner decision rather than an agent one.
 
