@@ -268,7 +268,7 @@ export default function DeviceConnectSection(): React.ReactElement {
       {/* adb toggle */}
       <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#9a9ac0', marginBottom: 8, cursor: 'pointer' }}
         title="Tunnel over USB via `adb forward` (Android). The IP field is not needed.">
-        <input type="checkbox" checked={useAdb} disabled={busy || summary.connected} onChange={(e) => onAdbChange(e.target.checked)} />
+        <input data-ui-id="ai.device.useAdb" data-ui-kind="toggle" data-ui-label="use adb (USB)" type="checkbox" checked={useAdb} disabled={busy || summary.connected} onChange={(e) => onAdbChange(e.target.checked)} />
         Use adb (USB)
       </label>
 
@@ -292,6 +292,7 @@ export default function DeviceConnectSection(): React.ReactElement {
       {/* IP + Connect */}
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         <input
+          data-ui-id="ai.device.ip" data-ui-kind="field" data-ui-label="device IP"
           type="text"
           value={ip}
           placeholder="192.168.1.42"
@@ -304,7 +305,7 @@ export default function DeviceConnectSection(): React.ReactElement {
             color: useAdb ? '#666' : '#ddd', fontVariantNumeric: 'tabular-nums',
           }}
         />
-        <button onClick={() => void onConnect()} disabled={busy} style={{
+        <button data-ui-id="ai.device.connect" data-ui-kind="button" data-ui-label="connect device" data-ui-state={deviceButtonLabel(status, busy)} onClick={() => void onConnect()} disabled={busy} style={{
           padding: '4px 14px', border: '1px solid', borderRadius: 3, fontSize: 11, minWidth: 90,
           borderColor: summary.connected ? '#6a3a3a' : '#3a6a3a',
           background: busy ? '#2a2a3a' : summary.connected ? '#4a2a2a' : '#2a4a2a',

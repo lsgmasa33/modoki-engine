@@ -205,12 +205,12 @@ export default function SpriteAnimEditor() {
           ? <FlipbookPreview clip={clip} />
           : <div style={{ color: '#555' }}>{asset ? 'No frames in this clip yet' : 'Double-click a .spriteanim.json in Assets to edit'}</div>}
         {!asset && (
-          <button onClick={newSpriteAnim} style={{ ...btn, position: 'absolute', bottom: 40, padding: '6px 14px' }}>+ New Sprite Animation</button>
+          <button data-ui-id="spriteAnim.preview.new" data-ui-kind="button" data-ui-label="New Sprite Animation" onClick={newSpriteAnim} style={{ ...btn, position: 'absolute', bottom: 40, padding: '6px 14px' }}>+ New Sprite Animation</button>
         )}
         {def && (
           <div style={{ position: 'absolute', left: 8, bottom: 8, display: 'flex', gap: 6 }}>
-            <button onClick={() => gUndo()} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
-            <button onClick={() => gRedo()} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
+            <button data-ui-id="spriteAnim.preview.undo" data-ui-kind="button" data-ui-label="Undo" onClick={() => gUndo()} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
+            <button data-ui-id="spriteAnim.preview.redo" data-ui-kind="button" data-ui-label="Redo" onClick={() => gRedo()} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
           </div>
         )}
       </div>
@@ -226,12 +226,12 @@ export default function SpriteAnimEditor() {
           {/* Track picker */}
           <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>Clips</div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 4 }}>
-            <select value={activeName} onChange={(e) => setActive(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 0 }} disabled={names.length === 0}>
+            <select data-ui-id="spriteAnim.clips.select" data-ui-kind="field" data-ui-label="clip" value={activeName} onChange={(e) => setActive(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 0 }} disabled={names.length === 0}>
               {names.length === 0 && <option value="">(no clips)</option>}
               {names.map((n) => <option key={n} value={n}>{n}</option>)}
             </select>
-            <button onClick={addTrack} title="Add clip" style={iconBtn(false)}>＋</button>
-            <button onClick={deleteTrack} disabled={!activeName} title="Delete clip" style={iconBtn(!activeName)}>🗑</button>
+            <button data-ui-id="spriteAnim.clips.add" data-ui-kind="button" data-ui-label="Add clip" onClick={addTrack} title="Add clip" style={iconBtn(false)}>＋</button>
+            <button data-ui-id="spriteAnim.clips.delete" data-ui-kind="button" data-ui-label="Delete clip" onClick={deleteTrack} disabled={!activeName} title="Delete clip" style={iconBtn(!activeName)}>🗑</button>
           </div>
 
           {!activeName ? (
@@ -246,7 +246,7 @@ export default function SpriteAnimEditor() {
                 <span style={labelStyle}>fps</span>
                 <BufferedNumberInput value={clip!.fps} step={1} onChange={(v) => writeClip(activeName, `fps:${activeName}`, (c) => ({ ...c, fps: v }))} style={{ ...inputStyle, width: 56 }} />
                 <span style={labelStyle}>mode</span>
-                <select value={clip!.mode} onChange={(e) => writeClip(activeName, `mode:${activeName}`, (c) => ({ ...c, mode: e.target.value as SpriteClip['mode'] }))} style={{ ...inputStyle, flex: 1, minWidth: 0 }}>
+                <select data-ui-id="spriteAnim.clip.mode" data-ui-kind="field" data-ui-label="mode" value={clip!.mode} onChange={(e) => writeClip(activeName, `mode:${activeName}`, (c) => ({ ...c, mode: e.target.value as SpriteClip['mode'] }))} style={{ ...inputStyle, flex: 1, minWidth: 0 }}>
                   <option value="once">once</option>
                   <option value="loop">loop</option>
                   <option value="pingpong">pingpong</option>
@@ -268,9 +268,9 @@ export default function SpriteAnimEditor() {
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <AssetRefField label="" value={ref} onChange={(v) => setFrameAt(i, v)} accept={['sprite']} />
                   </div>
-                  <button onClick={() => moveFrame(i, -1)} disabled={i === 0} title="Move up" style={iconBtn(i === 0)}>↑</button>
-                  <button onClick={() => moveFrame(i, 1)} disabled={i === frames.length - 1} title="Move down" style={iconBtn(i === frames.length - 1)}>↓</button>
-                  <button onClick={() => removeFrame(i)} title="Remove frame" style={iconBtn(false)}>✕</button>
+                  <button data-ui-id={`spriteAnim.frames.${i}.up`} data-ui-kind="button" data-ui-label="Move up" onClick={() => moveFrame(i, -1)} disabled={i === 0} title="Move up" style={iconBtn(i === 0)}>↑</button>
+                  <button data-ui-id={`spriteAnim.frames.${i}.down`} data-ui-kind="button" data-ui-label="Move down" onClick={() => moveFrame(i, 1)} disabled={i === frames.length - 1} title="Move down" style={iconBtn(i === frames.length - 1)}>↓</button>
+                  <button data-ui-id={`spriteAnim.frames.${i}.remove`} data-ui-kind="button" data-ui-label="Remove frame" onClick={() => removeFrame(i)} title="Remove frame" style={iconBtn(false)}>✕</button>
                 </div>
               ))}
               <div style={{ marginTop: 2 }}>

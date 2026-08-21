@@ -115,7 +115,7 @@ async function resolveSpriteDomain(spriteGuid: string | undefined, fallbackVerts
  *  the inspector call site keeps this field mounted across a rename — same `key` — so a
  *  lock that only clears `onFocus` would silently brick every edit after the first in an
  *  unfocused window, where refocusing never fires that event either). */
-function InlineNameField({ initial, onCommit, onDone, autoFocus, style }: {
+function InlineNameField({ initial, onCommit, onDone, autoFocus, style, uiId }: {
   initial: string;
   onCommit: (name: string) => void;
   /** Called after either commit or cancel — the inline list-row editor uses this to close
@@ -123,6 +123,7 @@ function InlineNameField({ initial, onCommit, onDone, autoFocus, style }: {
   onDone?: () => void;
   autoFocus?: boolean;
   style?: React.CSSProperties;
+  uiId?: string;
 }) {
   const lastCommittedRef = useRef<string | null>(null);
   // Clear the latch whenever the value changes from OUTSIDE (undo, another panel, a
@@ -141,6 +142,7 @@ function InlineNameField({ initial, onCommit, onDone, autoFocus, style }: {
   };
   return (
     <input
+      data-ui-id={uiId} data-ui-kind="field" data-ui-label="name"
       autoFocus={autoFocus}
       defaultValue={initial}
       onClick={onDone ? (e) => e.stopPropagation() : undefined}
@@ -657,14 +659,14 @@ export default function SkinEditor() {
               focused, re-running setBoneName with the same (now-committed) value — harmless,
               since setBoneName reads the LIVE store and no-ops when the name already
               matches (no double undo entry). */}
-          <input key={`b${selBone}`} defaultValue={b.name} onBlur={(e) => setBoneName(e.target.value)}
+          <input data-ui-id="skin.inspector.boneName" data-ui-kind="field" data-ui-label="bone name" key={`b${selBone}`} defaultValue={b.name} onBlur={(e) => setBoneName(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); setBoneName(e.currentTarget.value); e.currentTarget.blur(); } else if (e.key === 'Escape') { e.currentTarget.value = b.name; e.currentTarget.blur(); } }}
             style={nameInputStyle} />
         </div>
         {poseActive && (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
             <span style={{ color: '#9c6', fontSize: 10 }}>Test pose{testPose[selBone] ? ' *' : ''} (preview)</span>
-            <button onClick={() => setTestPose(() => ({}))} title="Reset the test pose to bind" style={{ background: '#2a2a40', color: '#bbb', border: '1px solid #444', borderRadius: 3, padding: '1px 6px', cursor: 'pointer', fontFamily: 'monospace', fontSize: 10 }}>reset</button>
+            <button data-ui-id="skin.inspector.pose.reset" data-ui-kind="button" data-ui-label="reset test pose" onClick={() => setTestPose(() => ({}))} title="Reset the test pose to bind" style={{ background: '#2a2a40', color: '#bbb', border: '1px solid #444', borderRadius: 3, padding: '1px 6px', cursor: 'pointer', fontFamily: 'monospace', fontSize: 10 }}>reset</button>
           </div>
         )}
         <div style={{ ...inspectorBox, border: `1px solid ${paintMode ? '#3a5a2a' : '#2a2a3a'}` }}>
@@ -688,14 +690,14 @@ export default function SkinEditor() {
       {bones.length === 0 ? <div style={{ color: '#777', fontSize: 10, marginBottom: 4 }}>No bones yet — add bones in Rig mode.</div> : (
         <>
           <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 3 }}><span style={{ ...lbl, width: 40 }}>radius</span>
-            <input type="range" min={0} max={awRadiusMax} step={2} value={awRadius} onChange={(e) => setAwRadius(+e.target.value)} style={{ flex: 1, minWidth: 0, accentColor: '#4a9eff' }} />
+            <input data-ui-id="skin.autoWeight.radius" data-ui-kind="slider" data-ui-label="auto-weight radius" type="range" min={0} max={awRadiusMax} step={2} value={awRadius} onChange={(e) => setAwRadius(+e.target.value)} style={{ flex: 1, minWidth: 0, accentColor: '#4a9eff' }} />
             <span style={{ color: '#999', width: 30, textAlign: 'right', fontSize: 10 }}>{awRadius > 0 ? Math.round(awRadius) : 'auto'}</span></div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 4 }}><span style={{ ...lbl, width: 40 }}>falloff</span>
-            <input type="range" min={0.5} max={4} step={0.1} value={awFalloff} onChange={(e) => setAwFalloff(+e.target.value)} style={{ flex: 1, minWidth: 0, accentColor: '#4a9eff' }} />
+            <input data-ui-id="skin.autoWeight.falloff" data-ui-kind="slider" data-ui-label="auto-weight falloff" type="range" min={0.5} max={4} step={0.1} value={awFalloff} onChange={(e) => setAwFalloff(+e.target.value)} style={{ flex: 1, minWidth: 0, accentColor: '#4a9eff' }} />
             <span style={{ color: '#999', width: 30, textAlign: 'right', fontSize: 10 }}>{awFalloff.toFixed(1)}</span></div>
         </>
       )}
-      <button onClick={reWeight} disabled={!verts.length || !bones.length} title="Recompute per-vertex weights for the current mesh + bones" style={{ ...btn, width: '100%', marginTop: 2, opacity: (!verts.length || !bones.length) ? 0.5 : 1 }}>Auto-weight</button>
+      <button data-ui-id="skin.autoWeight.run" data-ui-kind="button" data-ui-label="auto-weight" onClick={reWeight} disabled={!verts.length || !bones.length} title="Recompute per-vertex weights for the current mesh + bones" style={{ ...btn, width: '100%', marginTop: 2, opacity: (!verts.length || !bones.length) ? 0.5 : 1 }}>Auto-weight</button>
     </div>
   );
 
@@ -706,13 +708,13 @@ export default function SkinEditor() {
         <div style={{ margin: 'auto', textAlign: 'center', color: '#555' }}>
           {spriteSel && (
             <div style={{ marginBottom: 16 }}>
-              <button onClick={autoRigSelected} style={{ ...btn, padding: '7px 16px', background: '#20361f', borderColor: '#3a7a44', color: '#cfe' }}>⚙ Auto-rig “{spriteSel.name}”</button>
+              <button data-ui-id="skin.empty.autoRig" data-ui-kind="button" data-ui-label="auto-rig selected sprite" onClick={autoRigSelected} style={{ ...btn, padding: '7px 16px', background: '#20361f', borderColor: '#3a7a44', color: '#cfe' }}>⚙ Auto-rig “{spriteSel.name}”</button>
               <div style={{ fontSize: 10, color: '#666', marginTop: 5 }}>generate a mesh + bones + weights from this sprite</div>
             </div>
           )}
           <div>Double-click a .rig2d.json in Assets to edit its rig,</div>
           <div style={{ marginTop: 6 }}>or</div>
-          <button onClick={newRig} style={{ ...btn, marginTop: 8, padding: '6px 14px' }}>+ New Rig</button>
+          <button data-ui-id="skin.empty.newRig" data-ui-kind="button" data-ui-label="new rig" onClick={newRig} style={{ ...btn, marginTop: 8, padding: '6px 14px' }}>+ New Rig</button>
         </div>
       </div>
     );
@@ -721,7 +723,7 @@ export default function SkinEditor() {
   return (
     <div style={panelStyle}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, flexShrink: 0 }}>
-        <button onClick={() => useEditorStore.getState().closeSkinEditor()} title="Close rig (back to the picker)" style={{ ...btn, padding: '1px 7px' }}>✕</button>
+        <button data-ui-id="skin.header.close" data-ui-kind="button" data-ui-label="close rig" onClick={() => useEditorStore.getState().closeSkinEditor()} title="Close rig (back to the picker)" style={{ ...btn, padding: '1px 7px' }}>✕</button>
         <span style={{ fontWeight: 'bold', color: '#ddd', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{asset.name}</span>
         {saveMsg && <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#8a8a96' }}>{saveMsg}</span>}
         <span style={{ fontSize: 10, color: dirty ? '#f1c40f' : '#2ecc71' }}>{saveStatusLabel(dirty)}</span>
@@ -729,10 +731,10 @@ export default function SkinEditor() {
 
       {/* Toolbar: one-click auto-rig + undo/redo. */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, flexShrink: 0 }}>
-        <button onClick={autoRigActive} title="One click: auto-place a bone chain + tessellate + auto-weight the active part from its sprite" style={{ ...btn, background: '#20361f', borderColor: '#3a7a44', color: '#cfe' }}>⚙ Auto-rig</button>
+        <button data-ui-id="skin.toolbar.autoRig" data-ui-kind="button" data-ui-label="auto-rig active part" onClick={autoRigActive} title="One click: auto-place a bone chain + tessellate + auto-weight the active part from its sprite" style={{ ...btn, background: '#20361f', borderColor: '#3a7a44', color: '#cfe' }}>⚙ Auto-rig</button>
         <div style={{ flex: 1 }} />
-        <button onClick={() => gUndo()} title="Undo (⌘Z)" style={btn}>↶</button>
-        <button onClick={() => gRedo()} title="Redo (⇧⌘Z)" style={btn}>↷</button>
+        <button data-ui-id="skin.toolbar.undo" data-ui-kind="button" data-ui-label="undo" onClick={() => gUndo()} title="Undo (⌘Z)" style={btn}>↶</button>
+        <button data-ui-id="skin.toolbar.redo" data-ui-kind="button" data-ui-label="redo" onClick={() => gRedo()} title="Redo (⇧⌘Z)" style={btn}>↷</button>
       </div>
 
       {/* Top row — two columns: Parts group (part list) | Bones group (bone list). */}
@@ -741,13 +743,13 @@ export default function SkinEditor() {
         <div style={groupColStyle}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', minWidth: 0 }} title={allPartsVisible ? 'Hide all parts in the canvas preview' : 'Show all parts in the canvas preview'}>
-              <input type="checkbox" checked={allPartsVisible} ref={(el) => { if (el) el.indeterminate = somePartsHidden; }}
+              <input data-ui-id="skin.parts.visibleAll" data-ui-kind="toggle" data-ui-label="show all parts" type="checkbox" checked={allPartsVisible} ref={(el) => { if (el) el.indeterminate = somePartsHidden; }}
                 onChange={() => useEditorStore.getState().setSkinPreviewHidden(allPartsVisible ? parts.map((_, i) => i) : [])}
                 style={{ accentColor: '#4a9eff', cursor: 'pointer' }} />
               <span style={sectionLabel}>Parts ({parts.length})</span>
               <InfoDot tip="Each part is a sprite + its own mesh; all parts share one skeleton. Click a part to make it active (mesh/weights ops target it). The checkbox hides a part in THIS canvas only — it never affects the game or scene view." />
             </label>
-            <button onClick={addPartAction} title="Add a new empty part" style={{ ...btn, padding: '0px 7px', fontSize: 12 }}>＋</button>
+            <button data-ui-id="skin.parts.add" data-ui-kind="button" data-ui-label="add part" onClick={addPartAction} title="Add a new empty part" style={{ ...btn, padding: '0px 7px', fontSize: 12 }}>＋</button>
           </div>
           <div style={{ ...columnListStyle, outline: dropOverPart === -1 ? '2px solid #3498db' : 'none' }}
             onDragOver={(e) => {
@@ -792,16 +794,23 @@ export default function SkinEditor() {
                   setDropOverPart(null); onPartDrop(e, i);
                 }}
                 style={{ display: 'flex', alignItems: 'center', gap: 3, padding: '1px 3px', cursor: 'pointer', outline: i === dropOverPart ? '2px solid #3498db' : 'none', boxShadow: reorderOverPart === i && dragPart !== null && dragPart !== i ? 'inset 0 2px 0 #2ecc71' : 'none', opacity: dragPart === i ? 0.4 : 1, background: i === activePart ? '#20303f' : 'transparent' }}>
-                <input type="checkbox" checked={!previewHidden.includes(i)} onClick={(e) => e.stopPropagation()}
+                <input data-ui-id={`skin.parts.row.${i}.visible`} data-ui-kind="toggle" data-ui-label={`show part ${p.name}`} type="checkbox" checked={!previewHidden.includes(i)} onClick={(e) => e.stopPropagation()}
                   onChange={(e) => { e.stopPropagation(); useEditorStore.getState().toggleSkinPreviewPart(i); }}
                   title={previewHidden.includes(i) ? 'Show in canvas preview' : 'Hide in canvas preview'} style={{ accentColor: '#4a9eff', cursor: 'pointer', margin: '0 2px' }} />
                 {editingPart === i ? (
                   <InlineNameField autoFocus initial={p.name}
                     onCommit={(n) => partAction(renamePart(def!, i, n), 'rename part')}
                     onDone={() => setEditingPart(null)}
+                    uiId={`skin.parts.row.${i}.name`}
                     style={{ flex: 1, minWidth: 0, background: '#0e0e16', color: '#ccc', border: '1px solid #3a6a8a', borderRadius: 3, padding: '1px 4px', fontFamily: 'monospace', fontSize: 11 }} />
                 ) : (
+                  /* The GATE for `skin.parts.row.${i}.name`: that field only exists while
+                     `editingPart === i`, and this span is the only thing that sets it. Untagged,
+                     it made the rename field a dead id — the third instance of that pattern in
+                     this pass (see SubSection and FindReferencesDialog). `clickCount:2` here is
+                     how an agent opens it. */
                   <span onDoubleClick={(e) => { e.stopPropagation(); setEditingPart(i); }}
+                    data-ui-id={`skin.parts.row.${i}.rename`} data-ui-kind="button" data-ui-label={`rename ${p.name}`}
                     style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: i === activePart ? '#cde' : (previewHidden.includes(i) ? '#666' : '#bbb') }} title={`${p.name} — double-click to rename`}>{p.name}</span>
                 )}
                 {/* ↑/↓ go through `reorderParts`, the SAME entry point as drag-reorder, because it is
@@ -812,9 +821,9 @@ export default function SkinEditor() {
                     `withActivePart(def, activeSkinPart)`, the next edit landed on the wrong part's
                     mesh. A move by one IS `reorderPart(i, i±1)`, so there is nothing left for a
                     separate helper to do. */}
-                <button onClick={(e) => { e.stopPropagation(); reorderParts(i, i - 1); }} title="Move back" disabled={i === 0} style={{ ...eyeBtn, opacity: i === 0 ? 0.3 : 1 }}>↑</button>
-                <button onClick={(e) => { e.stopPropagation(); reorderParts(i, i + 1); }} title="Move front" disabled={i === parts.length - 1} style={{ ...eyeBtn, opacity: i === parts.length - 1 ? 0.3 : 1 }}>↓</button>
-                <button onClick={(e) => { e.stopPropagation(); if (parts.length > 1) { partAction(removePart(def!, i), 'remove part'); const na = i < activePart ? activePart - 1 : activePart; useEditorStore.getState().setActiveSkinPart(Math.min(na, parts.length - 2)); } }} title="Remove part" disabled={parts.length <= 1} style={{ ...eyeBtn, color: '#c66', opacity: parts.length <= 1 ? 0.3 : 1 }}>✕</button>
+                <button data-ui-id={`skin.parts.row.${i}.up`} data-ui-kind="button" data-ui-label={`move part ${p.name} back`} onClick={(e) => { e.stopPropagation(); reorderParts(i, i - 1); }} title="Move back" disabled={i === 0} style={{ ...eyeBtn, opacity: i === 0 ? 0.3 : 1 }}>↑</button>
+                <button data-ui-id={`skin.parts.row.${i}.down`} data-ui-kind="button" data-ui-label={`move part ${p.name} front`} onClick={(e) => { e.stopPropagation(); reorderParts(i, i + 1); }} title="Move front" disabled={i === parts.length - 1} style={{ ...eyeBtn, opacity: i === parts.length - 1 ? 0.3 : 1 }}>↓</button>
+                <button data-ui-id={`skin.parts.row.${i}.remove`} data-ui-kind="button" data-ui-label={`remove part ${p.name}`} onClick={(e) => { e.stopPropagation(); if (parts.length > 1) { partAction(removePart(def!, i), 'remove part'); const na = i < activePart ? activePart - 1 : activePart; useEditorStore.getState().setActiveSkinPart(Math.min(na, parts.length - 2)); } }} title="Remove part" disabled={parts.length <= 1} style={{ ...eyeBtn, color: '#c66', opacity: parts.length <= 1 ? 0.3 : 1 }}>✕</button>
               </div>
             ))}
           </div>
@@ -830,9 +839,9 @@ export default function SkinEditor() {
       </div>
       {/* Mode selector — full-width row (Parts / Rig / Weights). */}
       <div style={modeRowStyle}>
-        <button onClick={() => useEditorStore.getState().setSkinMode('parts')} style={mbtn(skinMode === 'parts')} title="Parts — drag to reposition the active part's mesh">✥ Parts</button>
-        <button onClick={() => useEditorStore.getState().setSkinMode('rig')} style={mbtn(skinMode === 'rig')} title="Rig — add / select / move / rotate bones">🦴 Rig</button>
-        <button onClick={() => useEditorStore.getState().setSkinMode('weights')} style={mbtn(skinMode === 'weights')} title="Weights — paint the selected bone's per-vertex influence">🖌 Weights</button>
+        <button data-ui-id="skin.mode.parts" data-ui-kind="toggle" data-ui-label="parts mode" onClick={() => useEditorStore.getState().setSkinMode('parts')} style={mbtn(skinMode === 'parts')} title="Parts — drag to reposition the active part's mesh">✥ Parts</button>
+        <button data-ui-id="skin.mode.rig" data-ui-kind="toggle" data-ui-label="rig mode" onClick={() => useEditorStore.getState().setSkinMode('rig')} style={mbtn(skinMode === 'rig')} title="Rig — add / select / move / rotate bones">🦴 Rig</button>
+        <button data-ui-id="skin.mode.weights" data-ui-kind="toggle" data-ui-label="weights mode" onClick={() => useEditorStore.getState().setSkinMode('weights')} style={mbtn(skinMode === 'weights')} title="Weights — paint the selected bone's per-vertex influence">🖌 Weights</button>
       </div>
 
       {/* Tool parameters — full-width row; contents depend on the active mode. */}
@@ -842,34 +851,34 @@ export default function SkinEditor() {
         )}
         {skinMode === 'rig' && (
           <>
-            <button onClick={() => useEditorStore.getState().setSkinBoneTool('select')} style={tbtn(skinBoneTool === 'select')} title="Select / move + rotate joints (gizmo)">Select</button>
-            <button onClick={() => useEditorStore.getState().setSkinBoneTool('add')} style={tbtn(skinBoneTool === 'add')} title="Click to add a bone — chains as a child of the selected one">＋ Bone</button>
-            <button onClick={deleteBone} disabled={selBone < 0} style={{ ...tbtn(false), opacity: selBone < 0 ? 0.5 : 1 }} title="Delete the selected bone">Del</button>
+            <button data-ui-id="skin.boneTool.select" data-ui-kind="toggle" data-ui-label="select bone tool" onClick={() => useEditorStore.getState().setSkinBoneTool('select')} style={tbtn(skinBoneTool === 'select')} title="Select / move + rotate joints (gizmo)">Select</button>
+            <button data-ui-id="skin.boneTool.add" data-ui-kind="toggle" data-ui-label="add bone tool" onClick={() => useEditorStore.getState().setSkinBoneTool('add')} style={tbtn(skinBoneTool === 'add')} title="Click to add a bone — chains as a child of the selected one">＋ Bone</button>
+            <button data-ui-id="skin.boneTool.delete" data-ui-kind="button" data-ui-label="delete selected bone" onClick={deleteBone} disabled={selBone < 0} style={{ ...tbtn(false), opacity: selBone < 0 ? 0.5 : 1 }} title="Delete the selected bone">Del</button>
           </>
         )}
         {skinMode === 'weights' && (
           <>
-            <button onClick={() => useEditorStore.getState().setSkinWeightTool('paint')} style={tbtn(skinWeightTool === 'paint')} title="Brush — paint the selected bone's weights (B)">🖌 Paint</button>
-            <button onClick={() => useEditorStore.getState().setSkinWeightTool('transform')} style={tbtn(skinWeightTool === 'transform')} title="Test-pose the bone to preview the deform — does not change the rig (W)">✥ Pose</button>
-            <button onClick={() => useEditorStore.getState().setSkinHideTexture(!skinHideTexture)} style={tbtn(skinHideTexture)} title="Hide the sprite — show only the weight heatmap (grayscale)">{skinHideTexture ? '◼ Weights only' : '◻ Weights only'}</button>
+            <button data-ui-id="skin.weightTool.paint" data-ui-kind="toggle" data-ui-label="paint weight tool" onClick={() => useEditorStore.getState().setSkinWeightTool('paint')} style={tbtn(skinWeightTool === 'paint')} title="Brush — paint the selected bone's weights (B)">🖌 Paint</button>
+            <button data-ui-id="skin.weightTool.pose" data-ui-kind="toggle" data-ui-label="pose weight tool" onClick={() => useEditorStore.getState().setSkinWeightTool('transform')} style={tbtn(skinWeightTool === 'transform')} title="Test-pose the bone to preview the deform — does not change the rig (W)">✥ Pose</button>
+            <button data-ui-id="skin.weightTool.weightsOnly" data-ui-kind="toggle" data-ui-label="weights only" onClick={() => useEditorStore.getState().setSkinHideTexture(!skinHideTexture)} style={tbtn(skinHideTexture)} title="Hide the sprite — show only the weight heatmap (grayscale)">{skinHideTexture ? '◼ Weights only' : '◻ Weights only'}</button>
             {skinWeightTool === 'paint' && (
               <>
                 <label style={ovRow}><span style={ovLbl}>size</span>
-                  <input type="range" min={1} max={256} step={1} value={skinPaint.radius} onChange={(e) => useEditorStore.getState().setSkinPaint({ radius: +e.target.value })} style={ovRange} />
+                  <input data-ui-id="skin.paint.radius" data-ui-kind="slider" data-ui-label="brush radius" type="range" min={1} max={256} step={1} value={skinPaint.radius} onChange={(e) => useEditorStore.getState().setSkinPaint({ radius: +e.target.value })} style={ovRange} />
                   <span style={ovVal}>{Math.round(skinPaint.radius)}</span></label>
                 <label style={ovRow}><span style={ovLbl} title={skinPaint.brush === 'set' ? 'target weight' : 'brush strength'}>{skinPaint.brush === 'set' ? 'wt' : 'str'}</span>
-                  <input type="range" min={0} max={1} step={0.01} value={skinPaint.strength} onChange={(e) => useEditorStore.getState().setSkinPaint({ strength: +e.target.value })} style={ovRange} />
+                  <input data-ui-id="skin.paint.strength" data-ui-kind="slider" data-ui-label="brush strength" type="range" min={0} max={1} step={0.01} value={skinPaint.strength} onChange={(e) => useEditorStore.getState().setSkinPaint({ strength: +e.target.value })} style={ovRange} />
                   <span style={ovVal}>{skinPaint.strength.toFixed(2)}</span></label>
                 <div style={{ display: 'flex', gap: 3 }}>
                   {(([['add', 'Add', '#20361f', '#3a7a44'], ['subtract', 'Sub', '#3a2020', '#7a3a3a'], ['set', 'Set', '#1f2c3a', '#3a6a8a']]) as [('add' | 'subtract' | 'set'), string, string, string][]).map(([m, label, bg, bd]) => (
-                    <button key={m} onClick={() => useEditorStore.getState().setSkinPaint({ brush: m })} style={{ ...tbtn(false), background: skinPaint.brush === m ? bg : '#2a2a40', border: `1px solid ${skinPaint.brush === m ? bd : '#444'}` }}>{label}</button>
+                    <button key={m} data-ui-id={`skin.paint.brush.${m}`} data-ui-kind="toggle" data-ui-label={`brush mode ${m}`} onClick={() => useEditorStore.getState().setSkinPaint({ brush: m })} style={{ ...tbtn(false), background: skinPaint.brush === m ? bg : '#2a2a40', border: `1px solid ${skinPaint.brush === m ? bd : '#444'}` }}>{label}</button>
                   ))}
                 </div>
               </>
             )}
             {skinWeightTool === 'transform' && (
               <>
-                <button onClick={() => setTestPose({})} disabled={Object.keys(testPose).length === 0} style={{ ...tbtn(false), opacity: Object.keys(testPose).length === 0 ? 0.5 : 1 }} title="Clear the test pose — snap all bones back to bind">↺ Reset pose</button>
+                <button data-ui-id="skin.weightTool.resetPose" data-ui-kind="button" data-ui-label="reset test pose" onClick={() => setTestPose({})} disabled={Object.keys(testPose).length === 0} style={{ ...tbtn(false), opacity: Object.keys(testPose).length === 0 ? 0.5 : 1 }} title="Clear the test pose — snap all bones back to bind">↺ Reset pose</button>
                 <span style={{ fontSize: 10, color: '#d8b45a', lineHeight: 1.3 }}><b>Preview only</b> — poses to test the deform; doesn’t move the bone or change the rig.</span>
               </>
             )}
@@ -900,6 +909,7 @@ export default function SkinEditor() {
                   <span style={inspectorKind}>Part</span>
                   <InlineNameField key={`p${activePart}`} initial={partName}
                     onCommit={(n) => partAction(renamePart(def!, activePart, n), 'rename part')}
+                    uiId="skin.inspector.partName"
                     style={nameInputStyle} />
                 </div>
                 {/* Source art */}
@@ -923,7 +933,7 @@ export default function SkinEditor() {
                     <div style={{ ...trowStyle, marginBottom: 0 }}><span style={{ ...lbl, width: 26 }}>size</span>
                       <span style={lbl}>w</span><BufferedNumberInput value={wPx} step={1} onChange={(v) => setPartSize('x', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
                       <span style={lbl}>h</span><BufferedNumberInput value={hPx} step={1} onChange={(v) => setPartSize('y', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
-                      <button onClick={() => setSizeLocked((l) => !l)} title={sizeLocked ? 'Aspect ratio locked — w/h scale together. Click to unlock.' : 'Aspect ratio unlocked — w/h scale independently. Click to lock.'}
+                      <button data-ui-id="skin.part.sizeLock" data-ui-kind="toggle" data-ui-label="aspect ratio lock" onClick={() => setSizeLocked((l) => !l)} title={sizeLocked ? 'Aspect ratio locked — w/h scale together. Click to unlock.' : 'Aspect ratio unlocked — w/h scale independently. Click to lock.'}
                         style={{ ...eyeBtn, color: sizeLocked ? '#4a9eff' : '#777', fontSize: 12 }}>{sizeLocked ? '🔒' : '🔓'}</button></div>
                   </div>
                 ) : (
@@ -937,13 +947,13 @@ export default function SkinEditor() {
                     <BufferedNumberInput value={cols} step={1} onChange={(v) => setCols(Math.max(1, Math.min(24, Math.round(v))))} style={{ ...inputStyle, width: 44 }} />
                     <span style={{ ...lbl, marginLeft: 4 }}>rows</span><BufferedNumberInput value={rows} step={1} onChange={(v) => setRows(Math.max(1, Math.min(24, Math.round(v))))} style={{ ...inputStyle, width: 44 }} /></div>
                   <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', color: '#aaa', fontSize: 11, marginBottom: trimAlpha ? 3 : 4 }}>
-                    <input type="checkbox" checked={trimAlpha} onChange={(e) => setTrimAlpha(e.target.checked)} style={{ accentColor: '#4a9eff' }} /> Trim to alpha</label>
+                    <input data-ui-id="skin.part.trimAlpha" data-ui-kind="toggle" data-ui-label="trim to alpha" type="checkbox" checked={trimAlpha} onChange={(e) => setTrimAlpha(e.target.checked)} style={{ accentColor: '#4a9eff' }} /> Trim to alpha</label>
                   {trimAlpha && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 4 }}><span style={lbl}>α</span>
-                      <input type="range" min={0} max={128} step={1} value={alphaThreshold} onChange={(e) => setAlphaThreshold(+e.target.value)} style={{ flex: 1, minWidth: 0, accentColor: '#4a9eff' }} />
+                      <input data-ui-id="skin.part.alphaThreshold" data-ui-kind="slider" data-ui-label="alpha threshold" type="range" min={0} max={128} step={1} value={alphaThreshold} onChange={(e) => setAlphaThreshold(+e.target.value)} style={{ flex: 1, minWidth: 0, accentColor: '#4a9eff' }} />
                       <span style={{ color: '#999', width: 22, textAlign: 'right', fontSize: 10 }}>{alphaThreshold}</span></div>
                   )}
-                  <button onClick={reTessellate} disabled={!ap.sprite} title="Regenerate the deformable grid mesh + weights (keeps the part's current position)" style={{ ...btn, width: '100%', opacity: ap.sprite ? 1 : 0.5 }}>Re-tessellate</button>
+                  <button data-ui-id="skin.part.retessellate" data-ui-kind="button" data-ui-label="re-tessellate" onClick={reTessellate} disabled={!ap.sprite} title="Regenerate the deformable grid mesh + weights (keeps the part's current position)" style={{ ...btn, width: '100%', opacity: ap.sprite ? 1 : 0.5 }}>Re-tessellate</button>
                 </div>
               </>
             );
@@ -964,7 +974,7 @@ export default function SkinEditor() {
         {/* ── Export: prefab (collapsible) ── */}
         <Section title="Export">
           <div style={{ color: '#aaa', fontSize: 11, marginBottom: 8, lineHeight: 1.5 }}>{parts.length} part{parts.length === 1 ? '' : 's'} · {bones.length} bones · {verts.length} verts</div>
-          <button onClick={makePrefab} disabled={!bones.length}
+          <button data-ui-id="skin.actions.makePrefab" data-ui-kind="button" data-ui-label="make prefab" onClick={makePrefab} disabled={!bones.length}
             title={prefabExists
               ? 'Update the existing .prefab.json in place — its GUID is preserved, so instances already placed in scenes stay linked and refresh'
               : 'Generate a reusable .prefab.json (SkinnedSprite2D + Bone2D) from this rig — then drag it from Assets into a Canvas2D'}

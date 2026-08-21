@@ -23,6 +23,8 @@ export {
   type TraitMeta, type FieldHint, type FieldType,
 } from './core/ecs/traitRegistry';
 export { traitFieldOrDefault } from './core/ecs/traitSchema';
+export { onAssetInvalidated, emitAssetInvalidated } from './core/assetInvalidation';
+export type { InvalidatedAssetKind, AssetInvalidationListener } from './core/assetInvalidation';
 export {
   type GameConfig, setGameConfig, getGameConfig,
 } from './core/config';
@@ -188,6 +190,7 @@ export {
   resolveMaterial, resolveMaterialForMesh,
   getTemplatesForModel,
   invalidateModel, invalidateMaterial, disposeAllCachedResources,
+  invalidateEnvironment,
   onModelInvalidated,
   // Refcount API for SceneManager
   acquireModel, releaseModel,

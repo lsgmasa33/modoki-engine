@@ -941,8 +941,31 @@ case: it authors `pixi.pixelRatioCap: 3`. And `targetFps` reached the frame driv
   takes a seeded project on weak hardware from uncapped to capped. It was chosen over the inert
   `0` because it is the largest single saving in the table — halving per-second GPU *and* CPU work
   and cutting thermal throttling — and because it buys **feel**: a device that cannot hold 60
-  judders between 40 and 55, where a 30 cap is a stable 30. `mid` stays uncapped; no mid-band
-  device has been measured missing 60, and inventing a cap is what this table exists to avoid.
+  judders between 40 and 55, where a 30 cap is a stable 30. `mid` stays uncapped **as the engine
+  default**, because inventing a fleet-wide cap is what this table exists to avoid.
+
+  ⚠️ **"No mid-band device has been measured missing 60" was true until 2026-08-21 and is not any
+  more** — this bullet said so, and the editor's own tooltip repeated it, which is exactly the
+  shape that argues a reader out of a measurement. A **Galaxy A23** (Mali-G57 MC2, assessed `mid`
+  by the GPU benchmark) runs `demos/forest-camp` at a **20.5 ms median against mid's 20.0 ms
+  budget** — half a millisecond over, sustained — so live calibration demoted it `mid → low` about
+  six seconds into play, costing a 619 ms + 268 ms switch stall and pulling shadows, IBL and the
+  texture cap out from under the player (testboard `kR2G1q5BzRPskMi1fhrm`). The fix is a
+  **per-project** override, `tiers.mid.targetFps: 30` in forest-camp's `project.config.json`, which
+  moves the budget to 40 ms (`frameCapInterval * 1.2`); re-measured on the same phone after ~30 s
+  of traversal it reads frame median 33.6 / p95 36.2 / max 38.1 ms (`overBudget: false`) with cpu
+  median 19.9 ms against the 28.0 ms `frameIsFull` bar — clear of BOTH demotion conditions rather
+  than sitting on one. **The engine default stays `0`**: one measurement on the heaviest 3D demo
+  is a reason to cap THAT project, not the fleet, and no other project has been measured in this
+  shape. What it does change is the honest reason for the default — "nobody has measured it" is no
+  longer available.
+
+  A second-order effect worth knowing, because nothing in the diff says it: `mid.targetFps` is also
+  the `promoteTargetMs` for a **low → mid promotion** (`hasHeadroom` asks whether our work fits in
+  half the frame the tier above targets). Capping mid at 30 moves that bar from 8.3 ms to 16.7 ms,
+  so a low-tier device promotes into forest-camp's mid more readily than before — which is correct,
+  since mid now genuinely asks for less, and it stays clear of the 28.0 ms demotion bar, so the pair
+  cannot oscillate.
 - ⚠️ **`0` MEANS "NO CAP" ON ALL THREE NUMERIC FIELDS, so none of them may clamp with a bare
   `Math.min`.** `min(60, 0)` is 0 — which would silently *remove* a project's own cap on every
   tier that sets none; `min(0, 30)` is also 0 — so the field would read as wired and do nothing on
@@ -1485,6 +1508,24 @@ Three things about it are worth knowing before touching it:
 - **The compensation exists because IBL is fill light.** Without it the scene renders visibly dark
   and flat. Both multipliers are 1 whenever `ibl` is true, so a tier that keeps IBL passes the
   authored lighting through untouched and cannot double-light the scene.
+
+  ⚠️ **`iblOffAmbientBoost` is MULTIPLICATIVE on the authored `AmbientLight`, and that makes it
+  structurally weak in exactly the scenes that need it most.** A scene that leans on an
+  environment for fill authors a near-zero ambient *because* the environment is doing the work —
+  `demos/forest-camp` authors `0.06` against an `Environment` at intensity `0.3` — so the default
+  ×4 returns `0.24` and cannot come close to replacing what was taken away. Measured with the tier
+  pinned in the editor, one fixed camera, mid vs low (sRGB mean over a fixed crop): character body
+  **51.8 → 36.3**, grass **127.5 → 101.5**. The character loses more than the terrain for a
+  geometric reason, not a material one — both are `metalness: 0` — its visible surfaces face away
+  from the sun and were taking most of their light from the environment, while the terrain faces up
+  into the directional light. forest-camp now authors **8** (body 44.1, grass 109.7); the owner
+  chose that over full parity at 12 (body 50.4) because ambient is UNIFORM, so past a point it
+  lifts shadowed surfaces above where IBL had them and the scene flattens — the tent's dark side
+  reads 36.1 at mid, 43.4 at boost 8, 48.5 at boost 12. Two consequences: **tune this per project
+  against the scene's authored ambient**, not by carrying a number between projects; and when a
+  low-tier scene looks wrong, compare frames from ONE camera — testboard `q4UxFVVeioEQqT5sqymu`
+  reported a "near-black" hero from two frames shot minutes and several metres apart, whose
+  measured torso luminance was in fact 44.3 vs 44.2.
 - **The compensation is gated on ACTUAL suppression, not on the tier** — `isIblSuppressed()`, set
   by `syncEnvironment` each frame, is true only when the tier says no IBL *and* the scene owns a
   loaded HDR `Environment` to lose. Keying it on the tier alone (as it first shipped) brightened

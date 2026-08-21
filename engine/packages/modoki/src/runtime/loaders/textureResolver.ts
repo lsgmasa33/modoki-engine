@@ -24,6 +24,7 @@ import {
 import { ktx2LoaderCtor, prewarmGlbLoaders } from './threeLoaderModules';
 import { warnVocabOnce } from '../core/warnVocab';
 import { getActiveTextureSizeCap } from '../core/textureSizeCap';
+import { emitAssetInvalidated } from '../core/assetInvalidation';
 export { getActiveRenderer, onRendererReady, rendererReady, getRendererGateHealth } from '../core/activeRenderer';
 export type { RendererGateHealth } from '../core/activeRenderer';
 export type { ResolvedSprite } from '../core/textureProvider';
@@ -506,8 +507,7 @@ export function disposeAllSharedTextures(): void {
 
 /** Drop the shared cache's textures for a ref's variants so a subsequent load
  *  re-fetches + re-transcodes the freshly-converted files. Called by the editor's
- *  texture re-import + model re-import, both of which then reload the active scene —
- *  materials rebuild and re-acquire fresh bytes. The old THREE.Texture instances are
+ *  texture re-import + model re-import. The old THREE.Texture instances are
  *  force-disposed here regardless of refcount; any outstanding `releaseTexture3D` on
  *  them becomes a safe no-op (the entry is already gone), so there's no double dispose. */
 export function invalidateTexture(ref: string): void {
@@ -517,6 +517,12 @@ export function invalidateTexture(ref: string): void {
   // as-is — this is just a cache key, so the literal source is what we want.
   const sourcePath = isGuid(ref) ? resolveRef(ref) : ref;
   if (!sourcePath) return;
+  // Announce BEFORE evicting, matching invalidateModel (#304). Panels keyed on the
+  // asset PATH are the reason this event exists — a re-import rewrites the bytes
+  // behind a path without changing it, so nothing else tells a Texture Inspector
+  // that its sidecar-derived stats just went stale. Callers may pass a GUID; the
+  // resolved source path is what a subscriber can match itself against.
+  emitAssetInvalidated('texture', sourcePath);
   // The set of variant URLs this ref could have been loaded under — built with the
   // SAME key construction loadTexture3D uses, including the ?v=<hash> suffix in prod.
   const hash = getAssetEntry(ref)?.hash;

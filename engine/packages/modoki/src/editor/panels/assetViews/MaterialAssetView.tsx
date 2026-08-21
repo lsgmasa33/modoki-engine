@@ -28,7 +28,7 @@ export function ParamField({ name, param, value, onChange, mixed = false }: {
       return (
         <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
           <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>{label}</span>
-          <input type="checkbox" checked={mixed ? false : !!value} ref={(el) => { if (el) el.indeterminate = mixed; }} onChange={e => onChange(e.target.checked)} />
+          <input data-ui-id={`assetView.material.param.${name}`} data-ui-kind="toggle" data-ui-label={label} data-ui-state={mixed ? 'mixed' : value ? 'checked' : 'unchecked'} type="checkbox" checked={mixed ? false : !!value} ref={(el) => { if (el) el.indeterminate = mixed; }} onChange={e => onChange(e.target.checked)} />
         </div>
       );
     case 'float':
@@ -155,7 +155,7 @@ export function MaterialAssetView({ path }: { path: string }) {
   const boolField = (field: string, label: string, dflt = false) => (
     <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
       <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>{label}</span>
-      <input type="checkbox" checked={(d[field] as boolean) ?? dflt} onChange={(e) => writeField(field, e.target.checked)} />
+      <input data-ui-id={`assetView.material.${field}`} data-ui-kind="toggle" data-ui-label={label} data-ui-state={((d[field] as boolean) ?? dflt) ? 'checked' : 'unchecked'} type="checkbox" checked={(d[field] as boolean) ?? dflt} onChange={(e) => writeField(field, e.target.checked)} />
     </div>
   );
   const sectionHeader = (label: string) => (
@@ -168,7 +168,7 @@ export function MaterialAssetView({ path }: { path: string }) {
       {/* Shader picker */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 6 }}>
         <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>Shader</span>
-        <select value={shaderValue} onChange={e => changeShader(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
+        <select data-ui-id="assetView.material.shader" data-ui-kind="field" data-ui-label="Shader" value={shaderValue} onChange={e => changeShader(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
           {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
       </div>
@@ -184,7 +184,7 @@ export function MaterialAssetView({ path }: { path: string }) {
           {!isUnlit && <NumberField label="Metalness" value={(data.metalness as number) ?? 0} step={0.01} onChange={v => writeField('metalness', v)} wide />}
           <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
             <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>Transparent</span>
-            <input type="checkbox" checked={!!data.transparent} onChange={e => writeField('transparent', e.target.checked)} />
+            <input data-ui-id="assetView.material.transparent" data-ui-kind="toggle" data-ui-label="Transparent" data-ui-state={data.transparent ? 'checked' : 'unchecked'} type="checkbox" checked={!!data.transparent} onChange={e => writeField('transparent', e.target.checked)} />
           </div>
           <NumberField label="Opacity" value={(data.opacity as number) ?? 1} step={0.01} onChange={v => writeField('opacity', v)} wide />
           <DropdownField label="Side" value={(data.side as string) ?? 'front'} options={['front', 'double', 'back']} onChange={v => writeField('side', v)} />
@@ -252,7 +252,7 @@ export function MaterialAssetView({ path }: { path: string }) {
                 typeof v === 'boolean' ? (
                   <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
                     <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>{key}</span>
-                    <input type="checkbox" checked={v} onChange={e => writeParam(key, e.target.checked)} />
+                    <input data-ui-id={`assetView.material.param.${key}`} data-ui-kind="toggle" data-ui-label={key} data-ui-state={v ? 'checked' : 'unchecked'} type="checkbox" checked={v} onChange={e => writeParam(key, e.target.checked)} />
                   </div>
                 ) : typeof v === 'number' ? (
                   <NumberField key={key} label={key} value={v} step={0.01} onChange={nv => writeParam(key, nv)} wide />

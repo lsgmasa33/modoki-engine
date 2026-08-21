@@ -23,6 +23,7 @@ import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { applyWheelStep, useWheelStep } from './fields';
 import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
+import { SectionIdContext, particleFieldSlug, useFieldId } from './particle/fieldIds';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
@@ -358,19 +359,19 @@ export default function ParticleEditor() {
         {/* Timeline toolbar */}
         {def && (
           <div style={{ position: 'absolute', left: 8, right: 8, bottom: 8, display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(0,0,0,0.55)', border: '1px solid #333', borderRadius: 4, padding: '6px 8px' }}>
-            <button onClick={togglePlay} style={btn}>{playing ? '⏸' : '▶'}</button>
-            <button onClick={restart} style={btn}>⟲</button>
-            <button onClick={() => gUndo()} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
-            <button onClick={() => gRedo()} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
-            <button onClick={() => setShowFloor((v) => !v)} title="Toggle opaque ground plane (occludes particles behind it; use for soft particles / ground reference)" style={{ ...btn, background: showFloor ? '#2d6cdf' : '#2a2a40' }}>▦</button>
-            <input type="range" min={0} max={def.duration} step={0.01} value={displayElapsed(elapsed, def.duration, def.looping)} onChange={(e) => scrub(+e.target.value)} style={{ flex: 1 }} />
+            <button data-ui-id="particle.transport.play" data-ui-kind="button" data-ui-label="play/pause" data-ui-state={playing ? 'playing' : 'paused'} onClick={togglePlay} style={btn}>{playing ? '⏸' : '▶'}</button>
+            <button data-ui-id="particle.transport.restart" data-ui-kind="button" data-ui-label="restart" onClick={restart} style={btn}>⟲</button>
+            <button data-ui-id="particle.transport.undo" data-ui-kind="button" data-ui-label="undo" onClick={() => gUndo()} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
+            <button data-ui-id="particle.transport.redo" data-ui-kind="button" data-ui-label="redo" onClick={() => gRedo()} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
+            <button data-ui-id="particle.transport.floor" data-ui-kind="toggle" data-ui-label="ground plane" data-ui-state={showFloor ? 'on' : 'off'} onClick={() => setShowFloor((v) => !v)} title="Toggle opaque ground plane (occludes particles behind it; use for soft particles / ground reference)" style={{ ...btn, background: showFloor ? '#2d6cdf' : '#2a2a40' }}>▦</button>
+            <input data-ui-id="particle.transport.scrub" data-ui-kind="field" data-ui-label="scrub" type="range" min={0} max={def.duration} step={0.01} value={displayElapsed(elapsed, def.duration, def.looping)} onChange={(e) => scrub(+e.target.value)} style={{ flex: 1 }} />
             <span style={{ width: 56, textAlign: 'right', color: '#888' }}>{displayElapsed(elapsed, def.duration, def.looping).toFixed(2)}s</span>
           </div>
         )}
         {!asset && (
           <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center', justifyContent: 'center', color: '#555' }}>
             <div>Double-click a .particle.json in Assets to edit</div>
-            <button onClick={newParticle} style={{ ...btn, padding: '6px 14px' }}>+ New Particle</button>
+            <button data-ui-id="particle.empty.new" data-ui-kind="button" onClick={newParticle} style={{ ...btn, padding: '6px 14px' }}>+ New Particle</button>
           </div>
         )}
       </div>
@@ -379,7 +380,7 @@ export default function ParticleEditor() {
       {def && (
         <div style={{ width: 290, flexShrink: 0, borderLeft: '1px solid #333', overflowY: 'auto', padding: 10 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-            <input value={def.name ?? ''} onChange={(e) => patch({ name: e.target.value })} style={{ ...input, fontWeight: 'bold', width: 150 }} />
+            <input data-ui-id="particle.header.name" data-ui-kind="field" data-ui-label="effect name" value={def.name ?? ''} onChange={(e) => patch({ name: e.target.value })} style={{ ...input, fontWeight: 'bold', width: 150 }} />
             {/* No Save button on purpose: Cmd+S (Save All) is the one save in this editor, and a
                 per-panel button would be a second one that saved less. This says whether THIS
                 asset is on disk. */}
@@ -401,13 +402,13 @@ export default function ParticleEditor() {
             <Num label="Rate / sec" hint="Continuous particles spawned per second. Disabled when Fill pool is on." v={def.emission.rateOverTime} min={0} step={5} disabled={!!def.emission.fillPool} on={(v) => patch({ emission: { ...def.emission, rateOverTime: v } })} />
             <div style={row}>
               <Label text="Bursts" hint="One-shot emissions at a specific time (seconds into Duration). Each row: time, then particle count. Fires every loop." />
-              <button style={miniBtn} onClick={() => patch({ emission: { ...def.emission, bursts: [...(def.emission.bursts ?? []), { time: 0, count: 20 }] } })}>+ add</button>
+              <button data-ui-id="particle.bursts.add" data-ui-kind="button" data-ui-label="add burst" style={miniBtn} onClick={() => patch({ emission: { ...def.emission, bursts: [...(def.emission.bursts ?? []), { time: 0, count: 20 }] } })}>+ add</button>
             </div>
             {(def.emission.bursts ?? []).map((b, i) => (
               <div key={i} style={{ display: 'flex', gap: 4, marginBottom: 4, alignItems: 'center', paddingLeft: 8 }}>
                 <NumInput title="time (s)" value={b.time} min={0} step={0.1} on={(n) => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).map((x, k) => k === i ? { ...x, time: n } : x) } })} width={54} />
                 <NumInput title="count" value={b.count} min={0} step={1} on={(n) => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).map((x, k) => k === i ? { ...x, count: Math.round(n) } : x) } })} width={54} />
-                <button style={miniBtn} onClick={() => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).filter((_, k) => k !== i) } })}>×</button>
+                <button data-ui-id={`particle.bursts.row.${i}.remove`} data-ui-kind="button" data-ui-label="remove burst" style={miniBtn} onClick={() => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).filter((_, k) => k !== i) } })}>×</button>
               </div>
             ))}
           </Section>
@@ -456,17 +457,17 @@ export default function ParticleEditor() {
           <Section title="Forces" hint="Continuous external forces applied every frame (GPU sim supports up to 8).">
             <div style={row}>
               <Label text="Fields" hint="Directional = constant wind along (x,y,z). Point = attract (+strength) or repel (−strength) toward the (x,y,z) position. Strength scales the effect." />
-              <button style={miniBtn} onClick={() => patch({ forces: [...(def.forces ?? []), { type: 'directional', x: 1, y: 0, z: 0, strength: 2 }] })}>+ add</button>
+              <button data-ui-id="particle.forces.add" data-ui-kind="button" data-ui-label="add force" style={miniBtn} onClick={() => patch({ forces: [...(def.forces ?? []), { type: 'directional', x: 1, y: 0, z: 0, strength: 2 }] })}>+ add</button>
             </div>
             {(def.forces ?? []).map((f, i) => (
               <div key={i} style={{ marginBottom: 6, paddingLeft: 8, borderLeft: '2px solid #2a2a40' }}>
                 <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginBottom: 3 }}>
-                  <select value={f.type} onChange={(e) => updForce(i, { type: e.target.value as ForceField['type'] })} style={{ ...input, width: 100 }}>
+                  <select data-ui-id={`particle.forces.row.${i}.type`} data-ui-kind="field" data-ui-label="force type" data-ui-state={f.type} value={f.type} onChange={(e) => updForce(i, { type: e.target.value as ForceField['type'] })} style={{ ...input, width: 100 }}>
                     <option value="directional">directional</option>
                     <option value="point">point</option>
                   </select>
                   <span style={{ color: '#666', fontSize: 9 }}>{f.type === 'point' ? 'pos' : 'dir'}</span>
-                  <button style={{ ...miniBtn, marginLeft: 'auto' }} onClick={() => patch({ forces: (def.forces ?? []).filter((_, k) => k !== i) })}>×</button>
+                  <button data-ui-id={`particle.forces.row.${i}.remove`} data-ui-kind="button" data-ui-label="remove force" style={{ ...miniBtn, marginLeft: 'auto' }} onClick={() => patch({ forces: (def.forces ?? []).filter((_, k) => k !== i) })}>×</button>
                 </div>
                 <div style={{ display: 'flex', gap: 4 }}>
                   <NumInput title="x" value={f.x} step={0.1} on={(n) => updForce(i, { x: n })} width={44} />
@@ -563,17 +564,17 @@ export default function ParticleEditor() {
           <Section title="Sub-emitters" hint="Nested effects spawned in response to a parent particle's lifecycle (depth-1). CPU sim only — a GPU effect with sub-emitters falls back to CPU.">
             <div style={row}>
               <Label text="On birth/death" hint="Each row fires a burst of a child .particle.json effect when a parent particle is born or dies. Count = particles per trigger; probability = 0..1 chance per parent; inherit-v = fraction of the parent's velocity passed on." />
-              <button style={miniBtn} onClick={() => patch({ subEmitters: [...(def.subEmitters ?? []), { trigger: 'death', effect: '', count: 8, probability: 1, inheritVelocity: 0 }] })}>+ add</button>
+              <button data-ui-id="particle.subEmitters.add" data-ui-kind="button" data-ui-label="add sub-emitter" style={miniBtn} onClick={() => patch({ subEmitters: [...(def.subEmitters ?? []), { trigger: 'death', effect: '', count: 8, probability: 1, inheritVelocity: 0 }] })}>+ add</button>
             </div>
             {(def.subEmitters ?? []).map((s, i) => (
               <div key={i} style={{ marginBottom: 6, paddingLeft: 8, borderLeft: '2px solid #2a2a40' }}>
                 <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginBottom: 3 }}>
-                  <select value={s.trigger} onChange={(e) => updSub(i, { trigger: e.target.value as SubEmitter['trigger'] })} style={{ ...input, width: 70 }}>
+                  <select data-ui-id={`particle.subEmitters.row.${i}.trigger`} data-ui-kind="field" data-ui-label="sub-emitter trigger" data-ui-state={s.trigger} value={s.trigger} onChange={(e) => updSub(i, { trigger: e.target.value as SubEmitter['trigger'] })} style={{ ...input, width: 70 }}>
                     <option value="birth">birth</option>
                     <option value="death">death</option>
                   </select>
                   <NumInput title="count per trigger" value={s.count ?? 8} min={1} step={1} on={(n) => updSub(i, { count: Math.max(1, Math.round(n)) })} width={44} />
-                  <button style={{ ...miniBtn, marginLeft: 'auto' }} onClick={() => patch({ subEmitters: (def.subEmitters ?? []).filter((_, k) => k !== i) })}>×</button>
+                  <button data-ui-id={`particle.subEmitters.row.${i}.remove`} data-ui-kind="button" data-ui-label="remove sub-emitter" style={{ ...miniBtn, marginLeft: 'auto' }} onClick={() => patch({ subEmitters: (def.subEmitters ?? []).filter((_, k) => k !== i) })}>×</button>
                 </div>
                 <AssetRefField label="effect" hint="Child .particle.json fired by this sub-emitter. Drag a particle effect from the Assets panel, or use the locate button." accept={['.particle.json']} placeholder="drop a particle effect, or paste a GUID" value={s.effect} onChange={(val) => updSub(i, { effect: val })} />
                 <div style={{ display: 'flex', gap: 4 }}>
@@ -599,12 +600,15 @@ const lbl: React.CSSProperties = { color: '#999', fontSize: 11 };
 
 function Section({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
   return (
-    <div style={{ marginBottom: 10 }}>
-      <div style={{ color: '#7aa2f7', fontSize: 11, fontWeight: 'bold', borderBottom: '1px solid #2a2a40', paddingBottom: 3, marginBottom: 6, display: 'flex', alignItems: 'center' }}>
-        {title}{hint && <Hint text={hint} />}
+    <SectionIdContext.Provider value={particleFieldSlug(title)}>
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ color: '#7aa2f7', fontSize: 11, fontWeight: 'bold', borderBottom: '1px solid #2a2a40', paddingBottom: 3, marginBottom: 6, display: 'flex', alignItems: 'center' }}
+          data-ui-id={`particle.section.${particleFieldSlug(title)}`} data-ui-kind="section" data-ui-label={title}>
+          {title}{hint && <Hint text={hint} />}
+        </div>
+        {children}
       </div>
-      {children}
-    </div>
+    </SectionIdContext.Provider>
   );
 }
 
@@ -653,7 +657,7 @@ function committedValueOf(raw: string, min?: number, max?: number): number | nul
  *  the digit first and prepending `-`. We buffer the raw string locally while focused
  *  (preserving in-progress `-`, `.`, `-.5`, …) and only push a value upstream when the
  *  text parses to a finite number; on blur we resync to the committed value. */
-function NumInput({ value, on, title, min, max, step, disabled, width }: { value: number; on: (v: number) => void; title?: string; min?: number; max?: number; step?: number; disabled?: boolean; width: number }) {
+function NumInput({ uiId, uiLabel, value, on, title, min, max, step, disabled, width }: { uiId?: string; uiLabel?: string; value: number; on: (v: number) => void; title?: string; min?: number; max?: number; step?: number; disabled?: boolean; width: number }) {
   const [local, setLocal] = useState(String(value));
   const focused = useRef(false);
   const ref = useRef<HTMLInputElement>(null);
@@ -695,6 +699,7 @@ function NumInput({ value, on, title, min, max, step, disabled, width }: { value
   return (
     <input
       ref={ref}
+      data-ui-id={uiId} data-ui-kind="field" data-ui-label={uiLabel}
       type="text" inputMode="decimal" title={title} value={local} disabled={disabled}
       onFocus={() => { focused.current = true; }}
       onBlur={() => { focused.current = false; setLocal(String(value)); }}
@@ -705,50 +710,56 @@ function NumInput({ value, on, title, min, max, step, disabled, width }: { value
 }
 
 function Num({ label, hint, v, on, min, max, step, disabled }: { label: string; hint?: string; v: number; on: (v: number) => void; min?: number; max?: number; step?: number; disabled?: boolean }) {
+  const uiId = useFieldId(label);
   return (
     <div style={{ ...row, opacity: disabled ? 0.4 : 1 }}><Label text={label} hint={hint} />
-      <NumInput value={v} min={min} max={max} step={step} disabled={disabled} on={on} width={80} />
+      <NumInput uiId={uiId} uiLabel={label} value={v} min={min} max={max} step={step} disabled={disabled} on={on} width={80} />
     </div>
   );
 }
 function MinMax({ label, hint, v, on, step }: { label: string; hint?: string; v: { min: number; max: number }; on: (v: { min: number; max: number }) => void; step?: number }) {
+  const uiId = useFieldId(label);
   return (
     <div style={row}><Label text={label} hint={hint} />
       <span style={{ display: 'flex', gap: 4 }}>
-        <NumInput title="min" value={v.min} step={step} on={(n) => on({ ...v, min: n })} width={56} />
-        <NumInput title="max" value={v.max} step={step} on={(n) => on({ ...v, max: n })} width={56} />
+        <NumInput uiId={uiId && `${uiId}.min`} uiLabel={`${label} min`} title="min" value={v.min} step={step} on={(n) => on({ ...v, min: n })} width={56} />
+        <NumInput uiId={uiId && `${uiId}.max`} uiLabel={`${label} max`} title="max" value={v.max} step={step} on={(n) => on({ ...v, max: n })} width={56} />
       </span>
     </div>
   );
 }
 function Vec3Row({ label, hint, v, on, step }: { label: string; hint?: string; v: [number, number, number]; on: (v: [number, number, number]) => void; step?: number }) {
+  const uiId = useFieldId(label);
   return (
     <div style={row}><Label text={label} hint={hint} />
       <span style={{ display: 'flex', gap: 4 }}>
-        <NumInput title="x" value={v[0]} step={step} on={(n) => on([n, v[1], v[2]])} width={50} />
-        <NumInput title="y" value={v[1]} step={step} on={(n) => on([v[0], n, v[2]])} width={50} />
-        <NumInput title="z" value={v[2]} step={step} on={(n) => on([v[0], v[1], n])} width={50} />
+        <NumInput uiId={uiId && `${uiId}.x`} uiLabel={`${label} x`} title="x" value={v[0]} step={step} on={(n) => on([n, v[1], v[2]])} width={50} />
+        <NumInput uiId={uiId && `${uiId}.y`} uiLabel={`${label} y`} title="y" value={v[1]} step={step} on={(n) => on([v[0], n, v[2]])} width={50} />
+        <NumInput uiId={uiId && `${uiId}.z`} uiLabel={`${label} z`} title="z" value={v[2]} step={step} on={(n) => on([v[0], v[1], n])} width={50} />
       </span>
     </div>
   );
 }
 function Check({ label, hint, v, on }: { label: string; hint?: string; v: boolean; on: (v: boolean) => void }) {
-  return <div style={row}><Label text={label} hint={hint} /><input type="checkbox" checked={v} onChange={(e) => on(e.target.checked)} /></div>;
+  const uiId = useFieldId(label);
+  return <div style={row}><Label text={label} hint={hint} /><input data-ui-id={uiId} data-ui-kind="toggle" data-ui-label={label} data-ui-state={v ? 'on' : 'off'} type="checkbox" checked={v} onChange={(e) => on(e.target.checked)} /></div>;
 }
 function Enum({ label, hint, v, options, on }: { label: string; hint?: string; v: string; options: string[]; on: (v: string) => void }) {
+  const uiId = useFieldId(label);
   return (
     <div style={row}><Label text={label} hint={hint} />
-      <select value={v} onChange={(e) => on(e.target.value)} style={{ ...input, width: 90 }}>
+      <select data-ui-id={uiId} data-ui-kind="field" data-ui-label={label} data-ui-state={v} value={v} onChange={(e) => on(e.target.value)} style={{ ...input, width: 90 }}>
         {options.map((o) => <option key={o} value={o}>{o}</option>)}
       </select>
     </div>
   );
 }
 function Color({ label, hint, v, on }: { label: string; hint?: string; v: { r: number; g: number; b: number }; on: (v: { r: number; g: number; b: number }) => void }) {
+  const uiId = useFieldId(label);
   const hex = `#${[v.r, v.g, v.b].map((n) => Math.max(0, Math.min(255, Math.round(n * 255))).toString(16).padStart(2, '0')).join('')}`;
   return (
     <div style={row}><Label text={label} hint={hint} />
-      <input type="color" value={hex} onChange={(e) => { const n = parseInt(e.target.value.slice(1), 16); on({ r: ((n >> 16) & 255) / 255, g: ((n >> 8) & 255) / 255, b: (n & 255) / 255 }); }} />
+      <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={label} data-ui-state={hex} type="color" value={hex} onChange={(e) => { const n = parseInt(e.target.value.slice(1), 16); on({ r: ((n >> 16) & 255) / 255, g: ((n >> 8) & 255) / 255, b: (n & 255) / 255 }); }} />
     </div>
   );
 }

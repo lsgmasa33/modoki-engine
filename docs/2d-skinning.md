@@ -255,6 +255,14 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   its `◍ Weights` toggle, the full-strength weight view) but has no brush (see the Gotcha
   below). That asymmetry is deliberate: the toggle survived the #180 cull that removed the
   SceneView brush precisely because it is read-only.
+  ⚠️ **A brush press on a bone JOINT is resolved on RELEASE, not on press** (#287,
+  `panels/skinPaintGesture.ts`): a click there switches which bone you are painting, a drag
+  paints the bone already selected. Until #287 the joint hit-test ran first and `return`ed, so
+  any stroke that happened to start over a joint was silently swallowed — it switched bones
+  instead of painting, which reads as "the brush didn't work" mid-drag. It also meant an agent
+  could not paint at ALL: `skin:bone:N` joints are the only handles `SkinCanvas` registers, so
+  every `modoki_drag_handle` started on one and every stroke died. The promotion threshold is
+  3 CSS px (`PAINT_DRAG_SLOP`), measured in screen px so it does not drift as you zoom.
   Once a rig exists, open a scene with a `SkinnedSprite2D` + `Bone2D` children; select a
   bone in the Hierarchy or by clicking its joint in SceneView; pose it with the gizmo
   (works while stopped) and the mesh deforms live in both viewports.

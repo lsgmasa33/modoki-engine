@@ -2077,7 +2077,13 @@ async function describeUnresolvedAgainstLiveWorld(
         if (!abs) { summary.skipped++; unresolved.push(a.path); continue; }
         try {
           await handler(a.path, abs, reCtx); summary.converted++;
-          if (a.type === 'model' || a.type === 'texture') invalidate.push({ path: a.path, type: a.type });
+          // EVERY baked type is announced, and the renderer op decides which ones hold a
+          // cache worth evicting (#304 close-out). This used to filter to model|texture
+          // here AND branch on the same two in the op — so widening one without the other
+          // changed nothing, which is exactly how audio and HDR stayed stale after the op
+          // itself learned about them. One list, in `invalidate-assets`; a type it does
+          // not know costs an ignored array entry.
+          invalidate.push({ path: a.path, type: a.type });
         }
         catch (e) { summary.errors.push(`${a.path}: ${e instanceof Error ? e.message : String(e)}`); }
       }

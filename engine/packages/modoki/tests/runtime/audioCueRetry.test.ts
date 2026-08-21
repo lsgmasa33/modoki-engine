@@ -42,6 +42,10 @@ import { cueClip } from '../../src/runtime/audio/audioCues';
 import { getAudioLog, clearAudioLog, setAudioRecordMode } from '../../src/runtime/audio/audioService';
 import { setPlayState } from '../../src/runtime/core/playState';
 import { registerAsset, newGuid, clearManifest } from '../../src/runtime/loaders/assetManifest';
+import { AudioSource } from '../../src/runtime/traits/AudioSource';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
+import { journalEvents, clearJournal } from '../../src/runtime/core/journal';
 
 function mintClip(): string {
   const guid = newGuid();
@@ -84,6 +88,65 @@ describe('audioSystem — one-shot cue retry (undecoded buffer)', () => {
 
     decoded.add(clip);                  // decoding AFTER the window → the cue is already gone
     audioSystem(world);
+    expect(plays()).toHaveLength(0);
+  });
+});
+
+/** The two `@audio` warn phases (#289 close-out review). Both are UNREACHABLE from the
+ *  record-mode journal tests for the reason this file's header gives — `resolveSpec` never
+ *  returns null in node — so they need this file's real-decoder mock, not that file's. */
+describe('audioSystem — the failures that used to leave no trace at all', () => {
+  it('warns ONCE for an AudioSource clip that will never resolve, not never and not per-frame', () => {
+    const clip = mintClip();            // minted but never added to `decoded` → never resolves
+    world = createWorld();
+    setCurrentWorld(world);
+    clearJournal(world);
+    world.spawn(AudioSource({ clip, autoplay: true }), EntityAttributes({ guid: newGuid() }));
+
+    // startOrSwap retries an unresolvable clip EVERY frame, forever, with no bound.
+    for (let i = 0; i < 10; i++) audioSystem(world);
+
+    const warns = journalEvents({ type: '@audio', level: 'warn' }, world);
+    expect(warns).toHaveLength(1);      // once per (entity, clip) — not 10, and not 0
+    const p = warns[0].payload as { phase: string; clip?: string; entity?: unknown };
+    expect(p.phase).toBe('unresolved');
+    expect(p.clip).toBe(clip);
+    expect(p.entity).toBeDefined();
+    // The source never actually started, and the trace now says so rather than staying blank.
+    expect(plays()).toHaveLength(0);
+  });
+
+  it('re-arms that warn when the clip CHANGES, so a second bad ref is not swallowed', () => {
+    const first = mintClip(); const second = mintClip();
+    world = createWorld();
+    setCurrentWorld(world);
+    clearJournal(world);
+    const e = world.spawn(AudioSource({ clip: first, autoplay: true }), EntityAttributes({ guid: newGuid() }));
+    audioSystem(world);
+    e.set(AudioSource, { ...e.get(AudioSource)!, clip: second });
+    audioSystem(world);
+
+    const clips = journalEvents({ type: '@audio', level: 'warn' }, world)
+      .map((ev) => (ev.payload as { clip?: string }).clip);
+    expect(clips).toEqual([first, second]);
+  });
+
+  it('emits `dropped` for a cue discarded by the retry-list CAP, not just for one that ages out', () => {
+    world = createWorld();
+    setCurrentWorld(world);
+    clearJournal(world);
+    // 33 distinct undecoded cues in ONE frame: the first 32 fill pendingCues, the 33rd is
+    // discarded outright. That overflow was the last silent drop left in the subsystem.
+    const clips = Array.from({ length: 33 }, () => mintClip());
+    for (const c of clips) cueClip(c, { bus: 'sfx' }, world);
+    audioSystem(world);
+
+    const dropped = journalEvents({ type: '@audio', level: 'warn' }, world)
+      .map((ev) => ev.payload as { phase: string; reason?: string; clip?: string })
+      .filter((p) => p.phase === 'dropped');
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0].reason).toBe('retry-overflow');
+    expect(dropped[0].clip).toBe(clips[32]);
     expect(plays()).toHaveLength(0);
   });
 });

@@ -36,7 +36,7 @@ describe('invalidate-assets op', () => {
       ],
     }) as { ok: boolean; models: number; textures: number };
 
-    expect(r).toEqual({ ok: true, models: 2, textures: 1 });
+    expect(r).toEqual({ ok: true, models: 2, textures: 1, audio: 0, environments: 0 });
     // Only the model paths fire model-invalidation — the texture path must not.
     expect(invalidated).toEqual(['/assets/models/a.glb', '/assets/models/b.glb']);
   });
@@ -50,12 +50,35 @@ describe('invalidate-assets op', () => {
       ],
     }) as { models: number; textures: number };
 
-    expect(r).toEqual({ ok: true, models: 1, textures: 0 });
+    expect(r).toEqual({ ok: true, models: 1, textures: 0, audio: 0, environments: 0 });
     expect(invalidated).toEqual(['/assets/models/c.glb']);
   });
 
   it('tolerates missing/empty params', async () => {
-    expect(await runAgentOp('invalidate-assets', {})).toEqual({ ok: true, models: 0, textures: 0 });
-    expect(await runAgentOp('invalidate-assets')).toEqual({ ok: true, models: 0, textures: 0 });
+    const empty = { ok: true, models: 0, textures: 0, audio: 0, environments: 0 };
+    expect(await runAgentOp('invalidate-assets', {})).toEqual(empty);
+    expect(await runAgentOp('invalidate-assets')).toEqual(empty);
+  });
+
+  it('routes audio + environment items too (#304 close-out)', async () => {
+    // This op exists so an MCP/curl reimport refreshes IDENTICALLY to the Assets-panel
+    // button. Both dropped audio and HDR on the floor, so a re-imported clip kept
+    // playing its old decoded buffer and a re-imported .hdr kept lighting the scene.
+    const { onAssetInvalidated } = await import('@modoki/engine/runtime');
+    const fired: Array<[string, string]> = [];
+    const off = onAssetInvalidated((kind, path) => { fired.push([kind, path]); });
+    try {
+      const r = await runAgentOp('invalidate-assets', {
+        items: [
+          { path: '/assets/audio/hit.wav', type: 'audio' },
+          { path: '/assets/env/studio.hdr', type: 'environment' },
+        ],
+      }) as { audio: number; environments: number };
+      expect(r).toMatchObject({ audio: 1, environments: 1 });
+      expect(fired).toEqual([
+        ['audio', '/assets/audio/hit.wav'],
+        ['environment', '/assets/env/studio.hdr'],
+      ]);
+    } finally { off(); }
   });
 });

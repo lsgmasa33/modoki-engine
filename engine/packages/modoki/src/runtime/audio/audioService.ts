@@ -95,19 +95,43 @@ const INERT: AudioHandle = {
   ended: true,
 };
 
-// Returned in record mode: `ended: false` so the system tracks it as an active
-// source (headless has no real 'ended' callback). Cleared wholesale on stop.
-const RECORDING_HANDLE: AudioHandle = {
-  stop() { /* no-op */ },
-  setVolume() { /* no-op */ },
-  setPitch() { /* no-op */ },
-  fade() { /* no-op */ },
-  stopAfter() { /* no-op */ },
-  pause() { /* no-op */ },
-  resume() { /* no-op */ },
-  setPosition() { /* no-op */ },
-  ended: false,
-};
+// Returned in record mode, ONE PER `play()` — not a shared singleton.
+//
+// It used to be a single frozen object with `ended: false` hardcoded and a no-op
+// `stop()`, which made teardown unobservable in two distinct ways (#289). The
+// obvious one: `getAudioLog()` could prove a voice STARTED and never that one was
+// torn down, so any lifetime assertion silently passed. The subtler one: because
+// every headless source shared the object, `audioSystem`'s per-source reap check
+// (`if (src.handle.ended)`) was answered by a process-wide constant rather than by
+// the source it was asked about — one handle could not differ from another.
+//
+// So each play mints its own, flipping its OWN `ended` and appending a `stop` entry.
+// `ended` still starts false so the system tracks it as live (headless has no real
+// 'ended' callback, and nothing ends a record-mode voice on its own).
+class RecordingHandle implements AudioHandle {
+  ended = false;
+  // Declared + assigned rather than a `private readonly` constructor parameter:
+  // the ROOT tsconfig sets `erasableSyntaxOnly`, under which a parameter property
+  // is a hard error (TS1294) — and the package's own tsconfig.check.json does not,
+  // so this only fails at `npm run typecheck`, not at the package typecheck.
+  private readonly clip?: string;
+  constructor(clip?: string) { this.clip = clip; }
+  stop(): void {
+    if (this.ended) return;
+    this.ended = true;
+    log.push({ op: 'stop', clip: this.clip });
+  }
+  setVolume(): void { /* no-op */ }
+  setPitch(): void { /* no-op */ }
+  fade(): void { /* no-op */ }
+  // No audio clock in record mode, so a scheduled stop cannot fire on its own. The
+  // callers that care (a crossfade tail) also force-stop via `stopWorldAudio`, so the
+  // tail is still reaped — just at teardown rather than after `seconds`.
+  stopAfter(): void { /* no-op — see above */ }
+  pause(): void { /* no-op */ }
+  resume(): void { /* no-op */ }
+  setPosition(): void { /* no-op */ }
+}
 
 // ── Live Web Audio graph (lazy) ───────────────────────────────────
 interface Graph {
@@ -303,7 +327,7 @@ export function play(spec: AudioPlaySpec): AudioHandle {
       volume: spec.volume ?? 1, spatial: !!spec.spatial, loop: !!spec.loop,
       ...(spec.spatial && spec.position ? { position: { ...spec.position } } : {}),
     });
-    return RECORDING_HANDLE;
+    return new RecordingHandle(spec.clip);
   }
   const g = graphOrNull();
   if (!g) return INERT;

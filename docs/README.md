@@ -41,7 +41,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [physics-2d.md](./physics-2d.md) | Rapier physics (2D **and** 3D) — traits, reconciler systems, coordinate conversion, collision layers, joints, character controllers, scene queries |
 | [zones.md](./zones.md) | Zone triggers — physics-free `Zone2D`/`Zone3D` enter/exit volumes over `ZoneOccupant` containment; journal + event bus + declarative `OnZone` action |
 | [timeline.md](./timeline.md) | Timeline / cutscene sequencer — reusable `.timeline.json` asset + `Director` trait; animation/signal/audio/activation tracks; deterministic sim-delta playhead; journal + event bus + declarative `OnSequence` |
-| [audio-plan.md](./audio-plan.md) | The engine-native Web Audio subsystem — `AudioSource`/`AudioListener` traits, cue bus, converter, declarative `audio.*` actions |
+| [audio-plan.md](./audio-plan.md) | The engine-native Web Audio subsystem — `AudioSource`/`AudioListener` traits, cue bus, converter, declarative `audio.*` actions, the `@audio` journal event, and the deliberately-uncapped mixer |
 | [input.md](./input.md) | The input system — `Input` trait + action vocabulary, keyboard/gamepad/pointer(tap+drag) sources, `inputSystem` frame bridge, character-controller bridges, device prompts |
 | [ui-system.md](./ui-system.md) | The ECS-driven UI system — `UIElement`/binding/action/anchor traits, the DOM `UIRenderer`, focus nav, text animation, nine-slice, per-game custom React UI |
 | [haptics.md](./haptics.md) | Device haptics — named preset patterns (engine defaults + game-registered), `HapticSettings`, declarative `haptics.*` actions, journal event; why presets rather than a custom-waveform plugin |

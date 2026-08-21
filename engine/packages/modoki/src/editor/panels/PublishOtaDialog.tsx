@@ -186,17 +186,17 @@ export default function PublishOtaDialog() {
             <div style={{ color: '#aaa', fontSize: 11, marginBottom: 3 }}>
               Version {liveVersion && <span style={{ color: '#666' }}>(live: {liveVersion})</span>}
             </div>
-            <input type="text" style={inputStyle} value={version} disabled={publishing}
+            <input data-ui-id="ota.publish.version" data-ui-kind="field" data-ui-label="Version" type="text" style={inputStyle} value={version} disabled={publishing}
               onChange={(e) => setVersion(e.target.value)} placeholder="v18" />
           </div>
           <div>
             <div style={{ color: '#aaa', fontSize: 11, marginBottom: 3 }}>Signing key name</div>
-            <input type="text" style={inputStyle} value={key} disabled={publishing}
+            <input data-ui-id="ota.publish.signingKey" data-ui-kind="field" data-ui-label="Signing key name" type="text" style={inputStyle} value={key} disabled={publishing}
               onChange={(e) => setKey(e.target.value)} placeholder="default" />
           </div>
           <div style={{ display: 'flex', alignItems: 'flex-end' }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#ddd', fontSize: 12 }}>
-              <input type="checkbox" checked={mandatory} disabled={publishing} onChange={(e) => setMandatory(e.target.checked)} />
+              <input data-ui-id="ota.publish.mandatory" data-ui-kind="toggle" data-ui-label="Mandatory" data-ui-state={mandatory ? 'checked' : 'unchecked'} type="checkbox" checked={mandatory} disabled={publishing} onChange={(e) => setMandatory(e.target.checked)} />
               Mandatory (blocks with a restart gate)
             </label>
           </div>
@@ -217,11 +217,12 @@ export default function PublishOtaDialog() {
         )}
 
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 6 }}>
-          <button onClick={close} disabled={publishing} style={btn({ opacity: publishing ? 0.5 : 1 })}>
+          <button data-ui-id="ota.publish.cancel" data-ui-kind="button" data-ui-label={done || failed ? 'Close' : 'Cancel'} onClick={close} disabled={publishing} style={btn({ opacity: publishing ? 0.5 : 1 })}>
             {done || failed ? 'Close' : 'Cancel'}
           </button>
           {!done && (
             <button
+              data-ui-id="ota.publish.publish" data-ui-kind="button" data-ui-label={failed ? 'Retry' : 'Publish'}
               onClick={publish}
               disabled={publishing || !version.trim() || !bundleName.trim()}
               style={btn({

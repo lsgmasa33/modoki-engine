@@ -5,6 +5,7 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useEditorStore } from '../store/editorStore';
+import { paintPressIntent, promotesToStroke } from './skinPaintGesture';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { activePartOf, withActivePart, partCount, bboxCenter } from './skinParts';
@@ -178,6 +179,20 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
   // active weight-paint stroke (pre-stroke snapshot for a single undo) + brush cursor.
   const paintRef = useRef<{ before: Rig2DFile } | null>(null);
   const cursorRef = useRef<{ x: number; y: number } | null>(null);
+  // A pointer-down on a JOINT while the brush is active is ambiguous: it could be a click
+  // (switch which bone you're painting) or the head of a stroke that happens to start over
+  // a joint. Resolving it eagerly to "select" — which is what this did until #287 — silently
+  // ate every such stroke, for a human mid-drag as much as for an agent's `drag_handle`,
+  // whose only aimable affordance here IS a `skin:bone:N` joint. So park the decision until
+  // the pointer either moves (→ stroke) or lifts (→ select). `tx/ty` are texture units (what
+  // paintAt takes); `px/py` are content-box CSS px, so the slop is zoom-independent.
+  //  Single-pointer, like every other gesture ref in this file (panDragRef, paintRef,
+  //  gizmoRef, movePartRef, partGizmoRef): none of them is keyed by pointerId, so a genuine
+  //  second pointer (stylus + touch, or two concurrent agent-driven sequences) overwrites the
+  //  in-flight gesture rather than running beside it. That is the file's existing convention,
+  //  not something this ref changes — noted here because this is the newest one and the next
+  //  reader will ask.
+  const paintPendingRef = useRef<{ joint: number; tx: number; ty: number; px: number; py: number } | null>(null);
   // Weights sub-tool (brush vs test-pose) — from the store; reset to brush on entering Weights.
   const paintSubTool = useEditorStore((s) => s.skinWeightTool);
   useEffect(() => { useEditorStore.getState().setSkinWeightTool('paint'); }, [paintMode]);
@@ -694,8 +709,17 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
     // 2. Paint brush (paint mode, Paint sub-tool).
     if (paintMode) {
       const hit = hitJoint(x, y);
-      if (hit >= 0) { setSelBone(hit); return; }
-      if (selBone < 0) return;
+      // A joint press is UNDECIDED while the brush is active (see skinPaintGesture.ts):
+      // onPointerMove promotes it to a stroke, onPointerUp settles it as a selection.
+      const intent = paintPressIntent({ paintSubTool, jointHit: hit, selBone });
+      if (intent === 'park') {
+        paintPendingRef.current = { joint: hit, tx: x, ty: y, px, py };
+        (e.target as Element).setPointerCapture?.(e.pointerId);
+        cursorRef.current = { x, y };
+        return;
+      }
+      if (intent === 'select') { setSelBone(hit); return; }
+      if (intent !== 'paint') return; // empty space with no bone selected — nothing to stroke
       const before = useEditorStore.getState().editingSkinDef;
       if (before) { paintRef.current = { before }; (e.target as Element).setPointerCapture?.(e.pointerId); cursorRef.current = { x, y }; paintAt(x, y, e.altKey); }
       return;
@@ -715,7 +739,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
     // 4. Select tool with nothing selected → pick a bone (the gizmo appears on it).
     const hit = hitJoint(x, y);
     setSelBone(hit);
-  }, [showGizmo, gizmoLocal, displayOrigin, paintMode, skinMode, partGizmoCenter, tool, selBone, hitJoint, hitPart, commitDef, paintAt]);
+  }, [showGizmo, gizmoLocal, displayOrigin, paintMode, paintSubTool, skinMode, partGizmoCenter, tool, selBone, hitJoint, hitPart, commitDef, paintAt, setSelBone]);
 
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const pan = panDragRef.current;
@@ -798,6 +822,22 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
     }
     if (paintMode && paintSubTool === 'paint') {
       const { x, y } = toTex(e);
+      // Settle a parked joint press (see paintPendingRef): under the slop it is still a
+      // possible click, so only track the cursor. Past it, open the stroke at the press
+      // point — not here — so the stroke keeps its head instead of starting a few px in.
+      const pend = paintPendingRef.current;
+      if (pend) {
+        if (!promotesToStroke(e.nativeEvent.offsetX - pend.px, e.nativeEvent.offsetY - pend.py)) {
+          cursorRef.current = { x, y };
+          draw();
+          return;
+        }
+        paintPendingRef.current = null;
+        const before = useEditorStore.getState().editingSkinDef;
+        // A drag paints the bone you have SELECTED, never the one you happened to press —
+        // same as a drag starting anywhere else on the mesh.
+        if (before) { paintRef.current = { before }; paintAt(pend.tx, pend.ty, e.altKey); }
+      }
       cursorRef.current = { x, y };
       if (paintRef.current) paintAt(x, y, e.altKey);
       draw(); // redraw heatmap + brush cursor
@@ -852,6 +892,10 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       }
       return;
     }
+    // A parked joint press that never travelled: it was a click → switch bones (the
+    // pre-#287 behaviour, now reached only when the gesture really was a click).
+    const pend = paintPendingRef.current;
+    if (pend) { paintPendingRef.current = null; setSelBone(pend.joint); return; }
     if (paintRef.current) {
       const before = paintRef.current.before;
       paintRef.current = null;
@@ -864,7 +908,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
         pushAction({ _isFileDirect: true, label: 'rig2d paint weights', undo: () => useEditorStore.getState().applySkinDef(path, before), redo: () => useEditorStore.getState().applySkinDef(path, after) });
       }
     }
-  }, [draw]);
+  }, [draw, setSelBone]);
 
   if (!def) return null;
   const bones = coerceBones(def.bones);

@@ -134,8 +134,8 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
   const labelStyle: React.CSSProperties = { flex: 1, color: '#888', fontSize: '11px' };
   const rowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 4, marginBottom: 3 };
   const sectionStyle: React.CSSProperties = { color: '#f1c40f', fontSize: '10px', textTransform: 'uppercase', margin: '8px 0 3px' };
-  const num = (v: number, on: (n: number) => void, min = 0) => (
-    <input type="number" min={min} value={v} onChange={(e) => on(Math.max(min, Number(e.target.value) || 0))} style={{ ...inputStyle, width: 70 }} />
+  const num = (v: number, on: (n: number) => void, min = 0, uiId?: string, uiLabel?: string) => (
+    <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={uiLabel} type="number" min={min} value={v} onChange={(e) => on(Math.max(min, Number(e.target.value) || 0))} style={{ ...inputStyle, width: 70 }} />
   );
 
   return (
@@ -146,26 +146,27 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
           <div style={{ flex: 1 }}>
             <AssetRefField label="" value={m} accept={['sprite']} onChange={(v) => setMember(i, v)} placeholder="drop / pick a sprite" />
           </div>
-          <button onClick={() => removeMember(i)} title="Remove" style={{ ...reimportBtnStyle, width: 24, padding: 0 }}>✕</button>
+          <button data-ui-id={`assetView.atlas.member.${i}.remove`} data-ui-kind="button" data-ui-label="Remove" onClick={() => removeMember(i)} title="Remove" style={{ ...reimportBtnStyle, width: 24, padding: 0 }}>✕</button>
         </div>
       ))}
-      <button onClick={addMember} style={{ ...reimportBtnStyle, marginTop: 2 }}>+ Add member</button>
+      <button data-ui-id="assetView.atlas.addMember" data-ui-kind="button" data-ui-label="Add member" onClick={addMember} style={{ ...reimportBtnStyle, marginTop: 2 }}>+ Add member</button>
 
       <div style={sectionStyle}>Pack options</div>
       <div style={rowStyle}>
         <span style={labelStyle}>Page size</span>
-        <select value={String(doc.pageSize)} onChange={(e) => update({ pageSize: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
+        <select data-ui-id="assetView.atlas.pageSize" data-ui-kind="field" data-ui-label="Page size" value={String(doc.pageSize)} onChange={(e) => update({ pageSize: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
           {withCurrentValue(TEXTURE_MAX_SIZES, doc.pageSize).map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
       </div>
-      <div style={rowStyle}><span style={labelStyle}>Padding</span>{num(doc.padding, (n) => update({ padding: n }))}</div>
-      <div style={rowStyle}><span style={labelStyle}>Extrude (bleed)</span>{num(doc.extrude, (n) => update({ extrude: n }))}</div>
+      <div style={rowStyle}><span style={labelStyle}>Padding</span>{num(doc.padding, (n) => update({ padding: n }), 0, 'assetView.atlas.padding', 'Padding')}</div>
+      <div style={rowStyle}><span style={labelStyle}>Extrude (bleed)</span>{num(doc.extrude, (n) => update({ extrude: n }), 0, 'assetView.atlas.extrude', 'Extrude')}</div>
       <div style={rowStyle}>
         <span style={labelStyle}>Max pages</span>
-        {num(doc.maxPages ?? 0, (n) => update(n > 0 ? { maxPages: n } : { maxPages: undefined }))}
+        {num(doc.maxPages ?? 0, (n) => update(n > 0 ? { maxPages: n } : { maxPages: undefined }), 0, 'assetView.atlas.maxPages', 'Max pages')}
       </div>
 
       <button
+        data-ui-id="assetView.atlas.repack" data-ui-kind="button" data-ui-label={block ? 'Re-pack' : 'Pack'}
         disabled={packing}
         onClick={repack}
         style={{ ...reimportBtnStyle, marginTop: 8, background: packing ? '#555' : '#2ecc71', color: '#fff', border: `1px solid ${packing ? '#444' : '#27ae60'}`, cursor: packing ? 'wait' : 'pointer' }}

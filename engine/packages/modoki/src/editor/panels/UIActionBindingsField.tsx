@@ -26,13 +26,13 @@ const KIND_OPTS: UIActionKind[] = ['set', 'call'];
 const KIND_LABEL: Record<UIActionKind, string> = { set: 'Set value', call: 'Call method' };
 
 /** Compact labelled <select> for the event/kind pickers (smaller than DropdownField). */
-function MiniSelect({ label, value, options, labels, onChange, mixed = false }: {
-  label: string; value: string; options: string[]; labels: Record<string, string>; onChange: (v: string) => void; mixed?: boolean;
+function MiniSelect({ label, value, options, labels, onChange, mixed = false, uiId }: {
+  label: string; value: string; options: string[]; labels: Record<string, string>; onChange: (v: string) => void; mixed?: boolean; uiId?: string;
 }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
       <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>{label}</span>
-      <select value={mixed ? '' : value} onChange={(e) => { if (e.target.value !== '') onChange(e.target.value); }}
+      <select data-ui-id={uiId} data-ui-kind="field" data-ui-label={label} value={mixed ? '' : value} onChange={(e) => { if (e.target.value !== '') onChange(e.target.value); }}
         style={{ flex: 1, background: '#111', color: '#ddd', border: '1px solid #444', borderRadius: 3, padding: '2px 4px', fontSize: '12px', cursor: 'pointer' }}>
         {mixed && <option value="">{MIXED_PLACEHOLDER}</option>}
         {options.map((o) => <option key={o} value={o}>{labels[o] ?? o}</option>)}
@@ -130,14 +130,14 @@ export function UIActionBindingsField({ entityIds, meta, field }: { entityIds: n
           <div key={i} style={{ border: '1px solid #333', borderRadius: 3, padding: 4, marginBottom: 4 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 2 }}>
               <span style={{ color: '#666', fontSize: '10px' }}>binding {i + 1}</span>
-              <span onClick={() => remove(i)} title="Remove" style={{ cursor: 'pointer', color: '#888', padding: '0 2px' }}>×</span>
+              <span data-ui-id={`uiActions.binding.${i}.remove`} data-ui-kind="button" data-ui-label="Remove" onClick={() => remove(i)} title="Remove" style={{ cursor: 'pointer', color: '#888', padding: '0 2px' }}>×</span>
             </div>
             <MiniSelect label="event" value={event} options={EVENT_OPTS} labels={EVENT_LABEL} mixed={subMixed(i, 'event')}
-              onChange={(v) => update(i, { event: v as UIActionEvent })} />
+              onChange={(v) => update(i, { event: v as UIActionEvent })} uiId={`uiActions.binding.${i}.event`} />
             <MiniSelect label="kind" value={kind} options={KIND_OPTS} labels={KIND_LABEL} mixed={subMixed(i, 'kind')}
               onChange={(v) => update(i, (row) => v === 'set'
                 ? { kind: 'set', component: row.component || 'UIElement', property: row.property || '', value: row.value ?? '' }
-                : { kind: 'call', action: row.action || '' })} />
+                : { kind: 'call', action: row.action || '' })} uiId={`uiActions.binding.${i}.kind`} />
 
             {kind === 'set' ? (() => {
               const ent = b.target ? guidToEntity.get(b.target) : undefined;
@@ -158,7 +158,7 @@ export function UIActionBindingsField({ entityIds, meta, field }: { entityIds: n
                     onChange={(v) => update(i, { property: v, value: defaultForHint(fields[v]) })} />
                   {canUseEventValue && (
                     <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: '11px', marginBottom: 2, color: '#bbb' }}>
-                      <input type="checkbox" checked={usingEventValue}
+                      <input data-ui-id={`uiActions.binding.${i}.useEventValue`} data-ui-kind="toggle" data-ui-label="use event value" data-ui-state={usingEventValue ? 'checked' : 'unchecked'} type="checkbox" checked={usingEventValue}
                         onChange={(e) => update(i, { value: e.target.checked ? VALUE_TOKEN : defaultForHint(valueHint) })} />
                       use event value ($value)
                     </label>
@@ -198,7 +198,7 @@ export function UIActionBindingsField({ entityIds, meta, field }: { entityIds: n
                         </div>
                         {canUseEventValue && (
                           <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: '10px', color: '#888' }}>
-                            <input type="checkbox" checked={usingEventValue}
+                            <input data-ui-id={`uiActions.binding.${i}.param.${k}.useEventValue`} data-ui-kind="toggle" data-ui-label="use event value" data-ui-state={usingEventValue ? 'checked' : 'unchecked'} type="checkbox" checked={usingEventValue}
                               onChange={(e) => setParam(k, e.target.checked ? VALUE_TOKEN : defaultForHint(hint))} />
                             use event value
                           </label>
@@ -220,7 +220,7 @@ export function UIActionBindingsField({ entityIds, meta, field }: { entityIds: n
           </div>
         );
       })}
-      <button onClick={add} style={{ fontSize: '11px', background: '#2a2a40', color: '#ccc', border: '1px solid #444', borderRadius: 3, padding: '2px 8px', cursor: 'pointer' }}>+ Add binding</button>
+      <button data-ui-id="uiActions.footer.addBinding" data-ui-kind="button" data-ui-label="Add binding" onClick={add} style={{ fontSize: '11px', background: '#2a2a40', color: '#ccc', border: '1px solid #444', borderRadius: 3, padding: '2px 8px', cursor: 'pointer' }}>+ Add binding</button>
     </div>
   );
 }

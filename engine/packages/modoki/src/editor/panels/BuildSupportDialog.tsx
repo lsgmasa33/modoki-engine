@@ -233,7 +233,7 @@ export default function BuildSupportDialog() {
           <span style={{ flex: 1, color: '#ddd' }}>{label(t.id)}</span>
           <StatusPill present={t.present} version={t.version} stale={t.stale} />
           {showInstall && (
-            <button onClick={() => installTool(t.id)} disabled={busy} style={btn({
+            <button data-ui-id={`buildSupport.tool.${t.id}.install`} data-ui-kind="button" data-ui-label={t.stale ? `Update ${label(t.id)}` : `Install ${label(t.id)}`} onClick={() => installTool(t.id)} disabled={busy} style={btn({
               background: busy ? '#2a2a3a' : '#2a4a2a', borderColor: '#3a6a3a',
               color: busy ? '#888' : '#fff', cursor: busy ? 'default' : 'pointer', minWidth: 84,
             })}>
@@ -241,12 +241,12 @@ export default function BuildSupportDialog() {
             </button>
           )}
           {showGuide && (
-            <button onClick={() => toggleGuide(t.id)} style={btn({ minWidth: 84 })}>
+            <button data-ui-id={`buildSupport.tool.${t.id}.guide`} data-ui-kind="button" data-ui-label={expanded.has(t.id) ? 'Hide guide' : 'How to'} onClick={() => toggleGuide(t.id)} style={btn({ minWidth: 84 })}>
               {expanded.has(t.id) ? 'Hide guide' : 'How to…'}
             </button>
           )}
           {removable ? (
-            <button onClick={() => uninstallTool(t.id)} disabled={busy} title={`Remove ${label(t.id)} from the editor toolchain`} style={btn({
+            <button data-ui-id={`buildSupport.tool.${t.id}.remove`} data-ui-kind="button" data-ui-label={`Remove ${label(t.id)}`} onClick={() => uninstallTool(t.id)} disabled={busy} title={`Remove ${label(t.id)} from the editor toolchain`} style={btn({
               minWidth: 84, borderColor: '#5a3a3a', background: busy ? '#2a2a3a' : '#3a2020',
               color: busy ? '#888' : '#e0a0a0', cursor: busy ? 'default' : 'pointer',
             })}>
@@ -301,7 +301,7 @@ export default function BuildSupportDialog() {
         )}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
           <div style={{ color: '#fff', fontSize: 13 }}>Build Support</div>
-          <button onClick={refresh} disabled={loading} style={btn({ padding: '2px 10px' })}>{loading ? 'Checking…' : 'Re-check'}</button>
+          <button data-ui-id="buildSupport.header.recheck" data-ui-kind="button" data-ui-label="Re-check" onClick={refresh} disabled={loading} style={btn({ padding: '2px 10px' })}>{loading ? 'Checking…' : 'Re-check'}</button>
         </div>
         <div style={{ color: '#888', fontSize: 11, marginBottom: 8 }}>
           Toolchain the editor uses to build native apps. Missing tools install on demand
@@ -310,7 +310,7 @@ export default function BuildSupportDialog() {
         {data?.toolchainDir && (
           <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 12, color: '#9a9ac0', fontSize: 11, cursor: 'pointer' }}
             title="Off (default): build ONLY with the tools the editor installs here — a tool already on your machine (PATH, JAVA_HOME, ANDROID_HOME, Android Studio's SDK) is ignored, so builds don't depend on what happens to be installed. On: fall back to those system installs when the editor doesn't have its own. Xcode is always taken from the system (it can't be bundled).">
-            <input type="checkbox" checked={!!data.allowSystemToolchain} onChange={(e) => setSystemToolchain(e.target.checked)} />
+            <input data-ui-id="buildSupport.settings.allowSystemToolchain" data-ui-kind="toggle" data-ui-label="Use system-installed tools when available" data-ui-state={data.allowSystemToolchain ? 'checked' : 'unchecked'} type="checkbox" checked={!!data.allowSystemToolchain} onChange={(e) => setSystemToolchain(e.target.checked)} />
             Use system-installed tools when available
             <span style={{ color: '#666' }}>— off = the editor&apos;s own installs only</span>
           </label>
@@ -390,6 +390,7 @@ export default function BuildSupportDialog() {
           )}
           {data?.toolchainDir && (
             <button
+              data-ui-id="buildSupport.footer.removeAll" data-ui-kind="button" data-ui-label="Remove all tools"
               onClick={() => {
                 if (busy) return;
                 if (!confirmRemoveAll) { setConfirmRemoveAll(true); return; }
@@ -405,7 +406,7 @@ export default function BuildSupportDialog() {
               {removing === 'all' ? 'Removing…' : confirmRemoveAll ? 'Click again to confirm' : '✕ Remove all tools'}
             </button>
           )}
-          <button onClick={close} style={btn()}>Close</button>
+          <button data-ui-id="buildSupport.footer.close" data-ui-kind="button" data-ui-label="Close" onClick={close} style={btn()}>Close</button>
         </div>
       </div>
     </div>

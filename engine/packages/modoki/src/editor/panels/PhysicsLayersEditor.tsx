@@ -102,18 +102,18 @@ export default function PhysicsLayersEditor({ value, onChange }: { value: unknow
               <tr key={i}>
                 <td style={{ padding: '1px 4px 1px 0', whiteSpace: 'nowrap' }}>
                   <span style={{ color: '#8a8aa8', fontSize: 10, marginRight: 4 }}>{i}</span>
-                  <input style={nameInput} value={name} onChange={(e) => rename(i, e.target.value)}
+                  <input data-ui-id={`physicsLayers.row.${i}.name`} data-ui-kind="field" data-ui-label={`layer ${i} name`} style={nameInput} value={name} onChange={(e) => rename(i, e.target.value)}
                     disabled={i === 0} title={i === 0 ? "The 'Default' layer can't be renamed" : ''} />
                 </td>
                 {layers.map((_, j) => (
                   <td key={j} style={cell}>
-                    <input type="checkbox" checked={checked(i, j)} onChange={() => toggle(i, j)}
+                    <input data-ui-id={`physicsLayers.cell.${i}.${j}`} data-ui-kind="toggle" data-ui-label={`${layers[i]} vs ${layers[j]}`} data-ui-state={checked(i, j) ? 'checked' : 'unchecked'} type="checkbox" checked={checked(i, j)} onChange={() => toggle(i, j)}
                       title={`${layers[i]} ↔ ${layers[j]}`} />
                   </td>
                 ))}
                 <td style={cell}>
                   {i !== 0 && (
-                    <button style={{ ...smallBtn, padding: '0 5px', color: '#c66' }} title="Remove layer"
+                    <button data-ui-id={`physicsLayers.row.${i}.remove`} data-ui-kind="button" data-ui-label="Remove layer" style={{ ...smallBtn, padding: '0 5px', color: '#c66' }} title="Remove layer"
                       onClick={() => removeLayer(i)}>×</button>
                   )}
                 </td>
@@ -124,7 +124,7 @@ export default function PhysicsLayersEditor({ value, onChange }: { value: unknow
       </div>
 
       <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
-        <button style={smallBtn} onClick={addLayer} disabled={layers.length >= MAX_LAYERS}>+ Add layer</button>
+        <button data-ui-id="physicsLayers.footer.add" data-ui-kind="button" data-ui-label="Add layer" style={smallBtn} onClick={addLayer} disabled={layers.length >= MAX_LAYERS}>+ Add layer</button>
         <span style={{ color: '#666', fontSize: 10 }}>{layers.length}/{MAX_LAYERS}</span>
       </div>
     </div>

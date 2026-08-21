@@ -985,10 +985,11 @@ export three times believing it did not take. `MeshPreview` shipped that way; `M
 happened to escape it only because it is keyed on serialized `data` it receives as a prop, not
 because anyone reasoned about re-imports.
 
-The signal a path cannot carry is **`useModelInvalidationEpoch()`**
-(`editor/panels/useModelInvalidationEpoch.ts`), a counter over the existing
-`onModelInvalidated` event that `invalidateModel` already fires. Fold it into the `resetKey`
-(`MeshPreview`) or the effect deps (`MeshAssetView`). Two things about it are load-bearing:
+The signal a path cannot carry is **`useAssetInvalidationEpoch(kind, matches?)`**
+(`editor/panels/useAssetInvalidationEpoch.ts`), a counter over the re-import event the asset
+caches fire; `useModelInvalidationEpoch()` is the model-only spelling of it. Fold it into the
+`resetKey` (`MeshPreview`) or the effect deps (`MeshAssetView`). Two things about it are
+load-bearing:
 
 - **Cache-busting is a separate problem from re-rendering, and `ModelPreview` needs both.** It
   fetches the baked `.glb` over HTTP, so even a re-run effect would replay the browser's cached
@@ -1009,16 +1010,60 @@ consumer knows its own model path, so an unrelated re-import does not refetch a 
 the very `meshAssetCache` entry the invalidation is about to delete, so it bumps unfiltered and
 pays one cheap clone-from-cache rebuild.
 
-Still uncovered, deliberately: a re-import fired from **another** panel (the Assets panel's
-"Re-import all", `assetViews/reimport.ts`) leaves a selected inspector's *sidecar-derived stats*
-stale — `ModelAssetView`/`TextureAssetView` re-read `/api/read-meta` only after their OWN import
-button. Neither is a preview, so neither is #294, and they are split because only one of them
-has a mechanism: the model half can subscribe to this same epoch (#303), while the texture half
-cannot, because `invalidateTexture` fires **no event at all** (#304) — verified, `textureResolver.ts`
-has no listener registry, unlike its `onModelInvalidated` twin. #304 also asks whether the two
-should collapse into one asset-invalidation event rather than a second parallel mechanism;
-`audioBufferCache` already describes itself as mirroring `invalidateTexture`, so a third case
-is waiting.
+**4. The same staleness in the sidecar-derived STATS (#303 + #304).** #294 fixed the previews;
+the numbers beside them had the identical bug with a different trigger. `ModelAssetView` and
+`TextureAssetView` re-read `/api/read-meta` on mount and after their OWN import button only, so
+a re-import fired from the Assets panel's "Re-import all", a batch view, or the agent bridge
+left every sidecar-sourced value showing pre-reimport data — source tris, LOD byte sizes, the
+LOD count, texture variant sizes, and the `converted` / `hasCache` flags, which gate UI rather
+than merely display it. Once #294 landed, the Model Inspector actively disagreed with itself:
+fresh geometry in the preview, stale numbers beside it.
+
+Fixed by **one shared event** rather than a second mechanism: `runtime/core/assetInvalidation.ts`
+(L0, imports nothing, so any L3 cache can emit through it without a cycle) carries
+`emitAssetInvalidated(kind, path, targets)` / `onAssetInvalidated(fn)`, and `invalidateModel`,
+`invalidateTexture` and `invalidateAudio` all fire it **before** evicting. `onModelInvalidated`
+survives as a `kind: 'model'` filter over it, so its renderer subscribers
+(`scene3DSync`, `SceneView`) are untouched. The alternative — mirroring a texture-only listener
+onto `invalidateTexture` — was rejected because `audioBufferCache` already documented itself as
+mirroring `invalidateTexture`, making a third parallel one-off the default outcome.
+
+The panel side is deliberately NOT a bare effect dep. The epoch cache-busts the `/api/read-meta`
+URL through `cacheBustReimport`, so it is a value `loadMeta` genuinely reads: the sidecar is
+rewritten **in place at an unchanged URL**, which is exactly the request a browser may replay
+from cache. That also sidesteps the `exhaustive-deps` "unnecessary dependency" warning honestly,
+instead of suppressing it or poking it with a tautology. The self-initiated import path reads
+the sidecar twice as a result (once explicitly, once via the epoch) — one coalesced call
+returning the same bytes.
+
+Also corrected here: `invalidateTexture`'s doc comment claimed its callers "then reload the
+active scene", which is why a listener was never thought necessary. None of its four call sites
+reloads anything.
+
+**5. The same sweep found the chain broken for AUDIO and HDR entirely, in three places.** The
+server registers re-import handlers for **seven** types (texture, model, atlas, audio, video,
+font, environment) and only two of them were ever evicted browser-side. Three independent gates
+each hard-coded `model | texture`, so widening any ONE of them would have changed nothing:
+
+1. `assetViews/reimport.ts` — the client path (Assets panel "Re-import all", batch views).
+2. `/api/reimport` in `editorBackendRouter.ts` — filtered the items before pushing them to the
+   renderer, so the MCP/curl path never even reported an audio or HDR bake.
+3. the `invalidate-assets` agent op — branched on the same two types again.
+
+And underneath all three, `invalidateAudio` was a **silent no-op for its only production
+caller**: it resolved every ref through the manifest, and `resolveRef` rejects an internal asset
+path, so the Audio Inspector's Apply button (which passes the path) evicted nothing. Re-encoding
+a clip left the game playing the OLD decoded buffer, and re-importing an `.hdr` left the viewport
+lit by the old environment, until an editor restart.
+
+Now: the route forwards **every** baked type and the op is the single place that decides which
+kinds hold a cache, so a new kind is one branch in one file. `font` is deliberately not one of
+them — it refreshes through `onFontInvalidated` in `assetManifest`, a manifest-hash channel both
+font caches already subscribe to — and `atlas`/`video` hold no engine-side cache at all (atlas
+frames are read off the manifest; a video streams from its URL). A test in
+`tests/plugins/reimportNotify.test.ts` asserted the OLD filter, on the stated grounds that a clip
+is "not a GPU cache the renderer keys by path"; `audioBufferCache` is keyed by path, so that
+premise was simply false and the test was defending the bug.
 
 ### Animation Editor
 

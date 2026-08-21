@@ -239,7 +239,15 @@ export default function FindReferencesDialog() {
         ) : null}
 
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 14 }}>
-          <button onClick={close} data-testid="find-references-close" style={btn()}>Close</button>
+          {/* The modal EXIT, and load-bearing for exactly the reason ApplyPrefabDialog's is
+              (#287). This overlay is `position:fixed; inset:0; zIndex:9999`, so while it is
+              open EVERY other tagged handle in the editor reports occluded and Enact refuses
+              the aim. With no `data-ui-id` here and no Escape handling in this component, an
+              agent that opened Find References was trapped: the only way out was a raw {x,y}
+              tap, which is the documented last resort and which modoki_batch refuses outright.
+              `data-testid` does not help — nothing in the Enact path reads it. */}
+          <button data-ui-id="findReferences.footer.close" data-ui-kind="button" data-ui-label="close"
+            onClick={close} data-testid="find-references-close" style={btn()}>Close</button>
         </div>
       </div>
     </div>

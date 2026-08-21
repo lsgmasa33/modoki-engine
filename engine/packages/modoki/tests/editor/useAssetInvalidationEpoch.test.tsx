@@ -13,11 +13,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, renderHook, act } from '@testing-library/react';
 
-const { useModelInvalidationEpoch, cacheBustReimport } = await import('../../src/editor/panels/useModelInvalidationEpoch');
+const { useModelInvalidationEpoch, useAssetInvalidationEpoch, cacheBustReimport } =
+  await import('../../src/editor/panels/useAssetInvalidationEpoch');
 const { invalidateModel } = await import('../../src/runtime/loaders/meshTemplateCache');
+const { invalidateTexture } = await import('../../src/runtime/loaders/textureResolver');
 
 const MODEL = '/games/fixture/assets/models/thing.glb';
 const OTHER = '/games/fixture/assets/models/other.glb';
+const TEX = '/games/fixture/assets/textures/brick.png';
 
 // The hook coalesces on a trailing timer (one Import click fires invalidateModel
 // three times), so every assertion below has to flush it.
@@ -93,6 +96,38 @@ describe('useModelInvalidationEpoch', () => {
     invalidate(MODEL);
     invalidate(MODEL);
     expect(result.current).toBe(2);
+  });
+
+  // #304 — the hook now watches ONE kind, over a registry all three caches emit
+  // through. The kind is the only thing separating a Model Inspector from a
+  // Texture Inspector, so a leak either way refreshes the wrong panel and leaves
+  // the right one showing pre-reimport numbers.
+  it('ignores a re-import of a different asset kind', () => {
+    const { result } = renderHook(() => useModelInvalidationEpoch());
+    act(() => { invalidateTexture(TEX); });
+    settle();
+    expect(result.current).toBe(0);
+  });
+});
+
+describe('useAssetInvalidationEpoch(kind)', () => {
+  it('bumps on a texture re-import and not on a model one', () => {
+    const { result } = renderHook(() => useAssetInvalidationEpoch('texture'));
+    invalidate(MODEL);
+    expect(result.current).toBe(0);
+    act(() => { invalidateTexture(TEX); });
+    settle();
+    expect(result.current).toBe(1);
+  });
+
+  it('narrows within the kind via the filter — the shape a Texture Inspector uses', () => {
+    const { result } = renderHook(() => useAssetInvalidationEpoch('texture', (p) => p === TEX));
+    act(() => { invalidateTexture('/games/fixture/assets/textures/other.png'); });
+    settle();
+    expect(result.current).toBe(0);
+    act(() => { invalidateTexture(TEX); });
+    settle();
+    expect(result.current).toBe(1);
   });
 });
 

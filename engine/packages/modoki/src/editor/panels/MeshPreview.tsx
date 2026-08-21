@@ -6,7 +6,7 @@
 import { useCallback } from 'react';
 import * as THREE from 'three';
 import { whenMeshTemplate } from '../../runtime/loaders/meshTemplateCache';
-import { useModelInvalidationEpoch } from './useModelInvalidationEpoch';
+import { useModelInvalidationEpoch } from './useAssetInvalidationEpoch';
 import { Preview3DShell } from './Preview3DShell';
 import type { PreviewSceneHandle } from './previewScene';
 

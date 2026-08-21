@@ -6,7 +6,7 @@ import { useState, useEffect } from 'react';
 import { whenMeshTemplate, meshStatsFromTemplate } from '../../../runtime/loaders/meshTemplateCache';
 import { InfoRow, Section } from './widgets';
 import { MeshPreview } from '../MeshPreview';
-import { useModelInvalidationEpoch, cacheBustReimport } from '../useModelInvalidationEpoch';
+import { useModelInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
 
 export function MeshAssetView({ path }: { path: string }) {
   const [data, setData] = useState<Record<string, unknown> | null>(null);

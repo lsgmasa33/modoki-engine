@@ -1,7 +1,7 @@
 /** /api/reimport → renderer notification (the fix for "reimport needs an editor
  *  restart"). The endpoint re-bakes files on disk but had no channel to the live
  *  renderer, so the path-keyed GPU cache kept serving stale geometry. It now pushes
- *  the freshly-baked model/texture paths to the renderer via
+ *  every freshly-baked path to the renderer via
  *  requestBrowser('invalidate-assets', {items}) so the live viewport rebinds without
  *  a restart. These tests lock that wiring at the router seam. */
 
@@ -55,13 +55,23 @@ describe('/api/reimport → invalidate-assets notification', () => {
     });
   });
 
-  it('includes ONLY model/texture items — a baked audio asset is excluded', async () => {
+  /** This used to assert the OPPOSITE — that an audio item was filtered out here, on the
+   *  stated grounds that a clip is "not a GPU cache the renderer keys by path". That
+   *  premise was false: `audioBufferCache` is keyed by path and holds a decoded
+   *  AudioBuffer, so the filter meant an MCP/curl re-import of a `.wav` re-encoded the
+   *  file while the game kept playing the OLD audio until an editor restart (#304
+   *  close-out). Worse, the same two-type list existed in the renderer op, so teaching
+   *  either side about a new kind alone changed nothing.
+   *
+   *  The contract now: the route forwards EVERY baked type and `invalidate-assets`
+   *  decides which hold a cache. A type it does not know costs one ignored array entry. */
+  it('forwards every baked type and lets the renderer op decide what holds a cache', async () => {
     const manifest: Manifest = {
       version: 2,
       assets: [
         { path: '/assets/a/m.glb', type: 'model' },
         { path: '/assets/a/t.png', type: 'texture' },
-        { path: '/assets/a/s.wav', type: 'audio' },   // converts, but not a GPU cache the renderer keys by path
+        { path: '/assets/a/s.wav', type: 'audio' },
       ],
     };
     const requestBrowser = vi.fn().mockResolvedValue({ ok: true });
@@ -76,6 +86,7 @@ describe('/api/reimport → invalidate-assets notification', () => {
       items: [
         { path: '/assets/a/m.glb', type: 'model' },
         { path: '/assets/a/t.png', type: 'texture' },
+        { path: '/assets/a/s.wav', type: 'audio' },
       ],
     });
   });

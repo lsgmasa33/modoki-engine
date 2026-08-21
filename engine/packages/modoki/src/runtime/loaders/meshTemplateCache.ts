@@ -19,6 +19,7 @@ import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
 import { loadTexture3D, releaseTexture3D, isSharedTexture, resolveEnvVariantUrl, getEnvFormat } from './textureResolver';
 import { clearParticleCache } from './particleCache';
 import { fireDirtyListeners } from '../core/ecs/entityUtils';
+import { emitAssetInvalidated, onAssetInvalidated } from '../core/assetInvalidation';
 import { clearAnimationClipCache } from './animationClipCache';
 import { clearTimelineCache } from './timelineCache';
 import { clearControlSpawns } from '../timeline/controlSpawnRegistry';
@@ -389,16 +390,20 @@ function disposeMaterial(mat: THREE.Material, disposedTex?: Set<string>) {
  *  "setIndexBuffer parameter 1 is not of type 'GPUBuffer'" because the
  *  in-scene meshes still hold pointers to the just-disposed buffers. */
 type ModelInvalidationListener = (modelPath: string, targets: ReadonlySet<string>) => void;
-const modelInvalidationListeners = new Set<ModelInvalidationListener>();
 
 /** Subscribe to model-invalidation events. Returns an unsubscribe function.
  *  Renderers should remove any scene objects rendered from `modelPath` (or any
  *  of its baked LOD siblings, surfaced as `targets`) before this returns —
  *  the cache entries are dropped *after* every listener has run, then GPU
- *  geometry is disposed. */
+ *  geometry is disposed.
+ *
+ *  A `kind: 'model'` filter over the shared `onAssetInvalidated` registry (#304)
+ *  — kept as its own export because "models only" is what every one of its
+ *  callers means, and because it predates the shared event. */
 export function onModelInvalidated(fn: ModelInvalidationListener): () => void {
-  modelInvalidationListeners.add(fn);
-  return () => { modelInvalidationListeners.delete(fn); };
+  return onAssetInvalidated((kind, path, targets) => {
+    if (kind === 'model') fn(path, targets);
+  });
 }
 
 
@@ -424,10 +429,7 @@ export function invalidateModel(modelPath: string) {
 
   // Notify renderers BEFORE we touch the cache so they can drop any live
   // THREE.Mesh references to soon-disposed GPU geometry.
-  for (const fn of modelInvalidationListeners) {
-    try { fn(modelPath, targets); }
-    catch (e) { console.warn('[MeshCache] invalidation listener threw:', e); }
-  }
+  emitAssetInvalidated('model', modelPath, targets);
 
   const disposedGeo = new Set<string>();
   for (const target of targets) {
@@ -1542,6 +1544,9 @@ export function invalidateEnvironment(hdrRef: string): void {
   // through it and accept a path as-is — it's just the cache key. (Mirrors invalidateTexture.)
   const hdrPath = isGuid(hdrRef) ? refToPath(hdrRef) : hdrRef;
   if (!hdrPath) return;
+  // Announce before evicting, like every other kind (#304) — the Environment
+  // Inspector's stats are sidecar-derived and path-keyed, same as the rest.
+  emitAssetInvalidated('environment', hdrPath);
   const tex = envCache.get(hdrPath);
   if (tex) tex.dispose();
   envCache.delete(hdrPath);

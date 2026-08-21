@@ -64,6 +64,8 @@ import {
   registerHandleProvider,
   invalidateModel,
   invalidateTexture,
+  invalidateAudio,
+  invalidateEnvironment,
   switchableClipNames,
   ANIMATOR_CLIP_TRAITS,
   type OffscreenRenderOpts,
@@ -833,13 +835,20 @@ registerAgentOp('clear-journal', () => { clearJournal(); return { ok: true }; })
 // entries and notifies onModelInvalidated listeners, which drop the live meshes for re-sync.
 registerAgentOp('invalidate-assets', (params) => {
   const p = (params ?? {}) as { items?: Array<{ path?: string; type?: string }> };
-  let models = 0, textures = 0;
+  let models = 0, textures = 0, audio = 0, environments = 0;
   for (const it of p.items ?? []) {
     if (!it?.path) continue;
+    // THE list of cache-holding kinds for the server-driven path — the /api/reimport
+    // route now forwards every baked type and lets this decide (#304 close-out). A type
+    // with no branch here is ignored on purpose: `font` refreshes through the
+    // manifest-hash channel, and atlas/video hold no engine-side cache. Keep in step
+    // with assetViews/reimport.ts, which is the same decision for the client-side path.
     if (it.type === 'model') { invalidateModel(it.path); models++; }
     else if (it.type === 'texture') { invalidateTexture(it.path); textures++; }
+    else if (it.type === 'audio') { invalidateAudio(it.path); audio++; }
+    else if (it.type === 'environment') { invalidateEnvironment(it.path); environments++; }
   }
-  return { ok: true, models, textures };
+  return { ok: true, models, textures, audio, environments };
 });
 
 // ── Phase B: numeric screen-space layout/bounds (turn "is it laid out right?" into data) ──

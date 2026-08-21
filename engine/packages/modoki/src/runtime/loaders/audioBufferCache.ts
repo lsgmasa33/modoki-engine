@@ -17,8 +17,9 @@
 import { assetUrl, withCacheBust } from './assetUrl';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
-import { getAssetEntry, getAudioLoadType } from './assetManifest';
+import { getAssetEntry, getAudioLoadType, isGuid } from './assetManifest';
 import { getAudioContext } from '../audio/audioContext';
+import { emitAssetInvalidated } from '../core/assetInvalidation';
 
 type SceneId = number;
 
@@ -101,10 +102,23 @@ export function releaseAudioForScene(sceneId: SceneId): void {
 /** Drop the decoded buffer for one clip (guid or path) so the next acquire
  *  re-fetches + re-decodes. Owners are kept — this is a content invalidation
  *  (e.g. the editor re-converted the clip via the Audio Inspector), not a
- *  release. Mirrors `invalidateTexture`. */
+ *  release. Mirrors `invalidateTexture`.
+ *
+ *  ⚠️ **Accepts a PATH as well as a guid, and that is not cosmetic (#304 close-out).**
+ *  It used to resolve through `refToPath` unconditionally, and `resolveRef` rejects an
+ *  internal asset path loudly and returns undefined — so this returned at the guard
+ *  above. Its ONE production caller, the Audio Inspector's Apply button, passes the
+ *  PATH, which made every audio re-import a silent no-op: the file on disk was
+ *  re-encoded and the game kept playing the OLD decoded buffer until an editor
+ *  restart. `invalidateTexture` and `invalidateEnvironment` already carve the path
+ *  form out for exactly this reason; this one claimed to mirror them and did not. */
 export function invalidateAudio(ref: string): void {
-  const path = refToPath(ref);
+  const path = isGuid(ref) ? refToPath(ref) : ref;
   if (!path) return;
+  // Same shared event, same before-eviction ordering as the model + texture
+  // halves (#304) — an Audio Inspector reading the sidecar has the same
+  // path-keyed staleness the other two had.
+  emitAssetInvalidated('audio', path);
   // Bump the generation so an in-flight fetch/decode of the OLD bytes is discarded
   // by fetchAudioBuffer's `gen !== audioGeneration` guard instead of racing the
   // stale buffer back into the cache after we clear it (same reason

@@ -259,11 +259,36 @@ export function ColorField({ label, value, onChange, mixed = false, alpha, onAlp
 }
 
 /** Collapsible sub-section within a trait section (lighter styling than main Section). */
+/** `Advanced` -> `advanced`, `LOD levels` -> `lod-levels`. Titles are unique within one
+ *  asset view, and only one asset is inspected at a time, so the title alone is a stable
+ *  address — but only ACCIDENTALLY: the id carries no owning-trait segment, so nothing in
+ *  the type system stops two traits picking one section name. `engine/tests/editor/
+ *  subSectionUiIds.test.ts` is what pins it. (This comment previously cited that test before
+ *  it existed — a close-out review caught the false citation, and writing the test was the
+ *  honest fix.) */
+function subSectionSlug(title: string): string {
+  return title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
 export function SubSection({ title, children, defaultOpen = true }: { title: string; children: React.ReactNode; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
+  // Tagged as of #287, reversing the "deliberately not tagged" call in docs/enact.md.
+  // That call was correct while nothing BEHIND these toggles was addressable. It stopped
+  // being correct the moment the asset views were tagged: TextureAssetView's Advanced
+  // subsection is `defaultOpen={false}` and holds seven tagged controls (format, maxSize,
+  // mipmaps, colorspace, flipY, flipGreen, uastcLevel), so with the toggle un-addressable
+  // those seven ids were unreachable — present in the DOM contract and impossible to click.
+  // Measured, not reasoned: a live editor reported 4 assetView.texture.* handles where the
+  // source has 11. A tag behind a door an agent cannot open is not a tag.
+  // `data-ui-state` carries open/closed so the agent can tell "already open" from "needs a
+  // click" instead of toggling blind and closing it.
   return (
     <div style={{ marginTop: 4, marginBottom: 2 }}>
       <div onClick={() => setOpen(!open)}
+        data-ui-id={`inspector.subsection.${subSectionSlug(title)}`}
+        data-ui-kind="toggle"
+        data-ui-label={title}
+        data-ui-state={open ? 'open' : 'closed'}
         style={{ padding: '2px 0', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
         <span style={{ color: '#666', fontSize: '9px' }}>{open ? '▼' : '▶'}</span>
         <span style={{ color: '#999', fontSize: '10px', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{title}</span>

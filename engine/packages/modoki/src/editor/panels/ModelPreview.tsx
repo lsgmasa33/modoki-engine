@@ -20,7 +20,7 @@ import { getKTX2Loader } from '../../runtime/loaders/textureResolver';
 import { needsGLBConversion, loadSourceModel } from '../scene/convertToGLB';
 import { frameCameraToBoxFixed } from '../scene/sceneViewMath';
 import { applyRendererColorConfig } from '../../runtime/rendering/scene3DSync';
-import { useModelInvalidationEpoch, cacheBustReimport } from './useModelInvalidationEpoch';
+import { useModelInvalidationEpoch, cacheBustReimport } from './useAssetInvalidationEpoch';
 
 interface Props {
   /** Source GLB URL — e.g. `/games/.../island.glb`. Suffixes are computed

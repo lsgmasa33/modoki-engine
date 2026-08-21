@@ -197,7 +197,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
         <>
           <div style={rowStyle}>
             <span style={labelStyle}>Field type</span>
-            <select value={settings.fieldType} onChange={(e) => update({ fieldType: e.target.value as FontFieldType })} style={{ ...inputStyle, flex: 1 }}>
+            <select data-ui-id="assetView.font.fieldType" data-ui-kind="field" data-ui-label="Field type" value={settings.fieldType} onChange={(e) => update({ fieldType: e.target.value as FontFieldType })} style={{ ...inputStyle, flex: 1 }}>
               {FIELD_TYPE_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
           </div>
@@ -216,13 +216,13 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       )}
       <div style={rowStyle}>
         <span style={labelStyle}>Glyph size (px/em)</span>
-        <select value={String(settings.size)} onChange={(e) => update({ size: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
+        <select data-ui-id="assetView.font.size" data-ui-kind="field" data-ui-label="Glyph size" value={String(settings.size)} onChange={(e) => update({ size: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
           {withCurrentValue(FONT_SIZES, settings.size).map((s) => <option key={s} value={s}>{s}{s >= 96 ? ' (sharp corners)' : ''}</option>)}
         </select>
       </div>
       <div style={rowStyle}>
         <span style={labelStyle}>Distance range (px)</span>
-        <select value={String(settings.pxRange)} onChange={(e) => update({ pxRange: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
+        <select data-ui-id="assetView.font.pxRange" data-ui-kind="field" data-ui-label="Distance range" value={String(settings.pxRange)} onChange={(e) => update({ pxRange: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
           {withCurrentValue(FONT_PX_RANGES, settings.pxRange).map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
       </div>
@@ -317,6 +317,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       )}
 
       <button
+        data-ui-id="assetView.font.apply" data-ui-kind="button" data-ui-label={converted ? 'Re-bake' : 'Apply'}
         disabled={importing}
         onClick={apply}
         style={{ ...reimportBtnStyle, marginTop: 8, background: importing ? '#555' : '#2ecc71', color: '#fff', border: `1px solid ${importing ? '#444' : '#27ae60'}`, cursor: importing ? 'wait' : 'pointer' }}

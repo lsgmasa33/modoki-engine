@@ -123,14 +123,14 @@ export default function CleanupAssetsDialog() {
         ) : (
           <>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, fontSize: 11, color: '#aaa' }}>
-              <button onClick={selectAll} style={btn({ padding: '3px 10px' })}>
+              <button data-ui-id="assets.cleanup.selectAll" data-ui-kind="button" data-ui-label={allSelected ? 'Select none' : 'Select all'} onClick={selectAll} style={btn({ padding: '3px 10px' })}>
                 {allSelected ? 'Select none' : 'Select all'}
               </button>
               <span>{orphans.length} unused · {formatBytes(data?.totalBytes ?? 0)} total</span>
             </div>
 
             <div style={{ flex: 1, overflowY: 'auto', border: '1px solid #333', borderRadius: 4, minHeight: 120 }}>
-              {orphans.map((o) => {
+              {orphans.map((o, i) => {
                 const slash = o.path.lastIndexOf('/');
                 const name = slash >= 0 ? o.path.slice(slash + 1) : o.path;
                 const dir = slash >= 0 ? o.path.slice(0, slash + 1) : '';
@@ -141,7 +141,7 @@ export default function CleanupAssetsDialog() {
                     borderBottom: '1px solid #2a2a3a', cursor: 'pointer', fontSize: 11,
                     background: checked ? '#26263c' : 'transparent',
                   }}>
-                    <input type="checkbox" checked={checked} onChange={() => toggle(o.path)} />
+                    <input data-ui-id={`assets.cleanup.orphan.${i}`} data-ui-kind="toggle" data-ui-label={name} data-ui-state={checked ? 'checked' : 'unchecked'} type="checkbox" checked={checked} onChange={() => toggle(o.path)} />
                     <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       <span style={{ color: '#666' }}>{dir}</span>
                       <span style={{ color: '#ddd' }}>{name}</span>
@@ -169,9 +169,10 @@ export default function CleanupAssetsDialog() {
         )}
 
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 14 }}>
-          <button onClick={close} style={btn()}>Close</button>
+          <button data-ui-id="assets.cleanup.close" data-ui-kind="button" data-ui-label="Close" onClick={close} style={btn()}>Close</button>
           {orphans.length > 0 && (
             <button
+              data-ui-id="assets.cleanup.delete" data-ui-kind="button" data-ui-label="Delete selected"
               onClick={deleteSelected}
               disabled={deleting || selected.size === 0}
               style={btn({

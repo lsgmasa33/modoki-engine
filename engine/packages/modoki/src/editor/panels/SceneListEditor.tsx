@@ -114,14 +114,14 @@ export default function SceneListEditor({ value, options, onChange }: {
       </div>
       {entries.map((e, i) => (
         <div key={e.guid} style={row}>
-          <input type="checkbox" checked={e.include} onChange={() => toggle(i)} title="Include in build" />
+          <input data-ui-id={`sceneList.row.${i}.include`} data-ui-kind="toggle" data-ui-label="Include in build" data-ui-state={e.include ? 'checked' : 'unchecked'} type="checkbox" checked={e.include} onChange={() => toggle(i)} title="Include in build" />
           <span style={{ flex: 1, color: e.include ? '#ddd' : '#666', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
             title={labelFor.get(e.guid) ?? e.guid}>
             {labelFor.get(e.guid) ?? e.guid}
           </span>
           {i === firstIncluded && <span style={bootBadge}>BOOT</span>}
-          <button style={{ ...smallBtn, opacity: i === 0 ? 0.4 : 1 }} disabled={i === 0} title="Move up" onClick={() => move(i, -1)}>↑</button>
-          <button style={{ ...smallBtn, opacity: i === entries.length - 1 ? 0.4 : 1 }} disabled={i === entries.length - 1} title="Move down" onClick={() => move(i, 1)}>↓</button>
+          <button data-ui-id={`sceneList.row.${i}.up`} data-ui-kind="button" data-ui-label="Move up" style={{ ...smallBtn, opacity: i === 0 ? 0.4 : 1 }} disabled={i === 0} title="Move up" onClick={() => move(i, -1)}>↑</button>
+          <button data-ui-id={`sceneList.row.${i}.down`} data-ui-kind="button" data-ui-label="Move down" style={{ ...smallBtn, opacity: i === entries.length - 1 ? 0.4 : 1 }} disabled={i === entries.length - 1} title="Move down" onClick={() => move(i, 1)}>↓</button>
         </div>
       ))}
     </div>

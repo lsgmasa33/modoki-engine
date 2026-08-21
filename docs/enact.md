@@ -385,15 +385,66 @@ plus per-trait `⋮`/header plus Add Component, the SceneView toolbar (gizmo mod
 collider points), the Hierarchy toolbar, the Assets toolbar, the Console toolbar, and the prefab
 dialog confirm/cancel.
 
+The **asset editors** were tagged next (#287), because QA started driving them: SkinEditor and
+ParticleEditor were the two worst files in the editor (36 and 20 controls, zero tags), so every
+case against them fell back to `modoki_eval` plus a text match — brittle against any copy
+change, and unable to tell two same-labelled controls apart at all.
+
+ParticleEditor is worth reading as a pattern rather than a list. Its ~58 property fields all
+route through six shared widgets, so the ids come from a **React context** that `<Section>`
+provides (`panels/particle/fieldIds.ts`) instead of a `uiId` prop threaded through every call
+site: tag the widgets once and the whole panel is tagged, including fields added later. The
+section half of `particle.<section>.<field>` is load-bearing, not tidiness — "Mode" and "Shape"
+each name a field in BOTH the Collision and Render sections, and "Size"/"Opacity" in both Start
+values and Over life; those sections mount together, so a bare `particle.mode` would resolve to
+whichever the DOM happened to order first. That is measured, not asserted:
+`particleFieldIds.test.tsx` renders the mechanism and proves no two co-mounted fields collide.
+
+**Same-labelled controls are the ambiguity worth hunting for.** Two buttons in the AI panel both
+read "Connect" — Claude Code (`ai.connect.claudeCode`) and the device (`ai.device.connect`) —
+and both mount together, so whenever neither is connected, a text search or a blind aim for
+"Connect" there had no way to pick one.
+
+⚠️ **`SubSection` collapse toggles used to be on the deliberately-untagged list, and #287
+moved them off it — because tagging their CONTENTS changed the calculus.** Leaving a
+disclosure un-addressable is free while nothing behind it is addressable. It stops being free
+the moment it isn't: `TextureAssetView`'s Advanced subsection is `defaultOpen={false}` and
+holds seven tagged controls, so those seven ids existed in the DOM contract and no agent could
+ever click them. A live editor reported **4** `assetView.texture.*` handles where the source
+has 11; tagging the toggle and clicking it by id took that to 10 (the 11th, `uastcLevel`, is
+correctly gated on a UASTC variant being emitted). **A tag behind a door an agent cannot open
+is not a tag** — so when you tag a panel, check what gates it, and tag the gate too. The
+toggle carries `data-ui-state` open/closed so the agent can tell "already open" from "needs a
+click" instead of toggling blind and closing it.
+
+**The same rule caught a worse case one level up: a MODAL an agent could not leave.**
+`FindReferencesDialog` is `position:fixed; inset:0; zIndex:9999`, has no Escape handling, and
+its only Close button carried a `data-testid` and no `data-ui-id` — and nothing in the Enact
+path reads `data-testid`. While that overlay is open every other tagged handle in the editor
+reports occluded and Enact refuses the aim, so an agent that opened Find References was
+trapped, with a raw `{x,y}` tap (the documented last resort, and refused outright by
+`modoki_batch`) as its only way out. Swept every full-screen overlay in the editor for a
+tagged exit; it was the ONLY one with no `data-ui-id` at all. **A modal's exit is load-bearing
+tagging, not optional** — the `ApplyPrefabDialog` entry in `chromeTagging.test.ts` already said
+so, and this was the second instance of the same rule.
+
 Some surfaces are **deliberately not tagged** yet — the boundary is a choice, not an oversight.
-Untagged: Assets/Hierarchy *folder rows* (`assets.folder.${path}`), `SubSection` collapse
-toggles, per-override checkboxes in `ApplyPrefabDialog`, ProjectSettings tabs and per-field
-Browse, and the GameView transport (already covered by `modoki_play_control`) and its
-DevicePicker. Tag one when a task needs it — the convention is the whole cost.
+Untagged: Assets/Hierarchy *folder rows* (`assets.folder.${path}`), per-override checkboxes in
+`ApplyPrefabDialog`, and the GameView transport (already covered by `modoki_play_control`) and
+its DevicePicker. Tag one when a task needs it — the convention is the whole cost. Apply the
+gate rule above before adding to this list: none of these currently hide a tagged control.
 
 Tagging is guarded by an existence test so it can't silently rot: the load-bearing
 `data-ui-id`s are asserted present, so deleting one fails a test rather than quietly removing an
 agent's only handle on a button.
+
+⚠️ **That guard reads SOURCE, and a source guard has a specific blind spot: a widget can keep
+computing an id and stop rendering it.** Verified by mutation — dropping `data-ui-id` from
+ParticleEditor's `Check` widget (leaving the `useFieldId` call in place) un-tagged every
+checkbox in the panel while both suites stayed green. `chromeTagging.test.ts` now asserts each
+shared field widget's OUTPUT, not just the wiring once. Neither guard can tell you a tag reaches
+the LIVE DOM; `modoki_handles {editor:'chrome'}` against a running editor is the only thing that
+can, and it is the check to run after a tagging pass.
 
 ## Capture reports its own scale
 

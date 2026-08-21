@@ -43,6 +43,47 @@ function getCachedAudioBuffer(ref: string) { return audioAssetProvider.get()?.ge
 function resolveAudioUrl(ref: string) { return audioAssetProvider.get()?.resolveAudioUrl(ref); }
 function getAudioLoadType(ref: string): 'buffer' | 'stream' { return audioAssetProvider.get()?.getAudioLoadType(ref) ?? 'buffer'; }
 import { hasAudioSupport } from './audioContext';
+import { emit, entityRef } from '../core/journal';
+
+/** The audio subsystem's semantic journal event — the assertion surface every other
+ *  subsystem already has (`@zone`, `@sequence`, `@collision`) and audio did not (#289).
+ *
+ *  Emitted HERE rather than in `audioService` on purpose. The service is a Web Audio
+ *  backend that knows nothing about entities and is fully no-op'd in record mode; the
+ *  system is where playback intent is decided, so this is the only layer that can name
+ *  the ENTITY a voice belongs to and that fires identically headless and live. That
+ *  matters because the harness runs with no AudioContext at all — an event emitted from
+ *  the backend would be describing the mock, not the game.
+ *
+ *  `entity` is the stable GUID via `entityRef` (surviving a scene hot-reload) and is
+ *  omitted for a fire-and-forget cue one-shot, which has no owning entity by design.
+ *  Deliberately NOT routed through the cue bus: `audioCues.ts`'s header explains why
+ *  playback must not depend on the journal, and this is the reverse direction — an
+ *  observation of playback that has already been decided. */
+export type AudioPhase =
+  | 'start' | 'swap' | 'pause' | 'resume' | 'stop' | 'end'
+  /** A one-shot cue given up on — `reason` says whether it aged out or overflowed the retry list. */
+  | 'dropped'
+  /** An entity source whose clip will not resolve. Emitted ONCE per (entity, clip), at `warn`,
+   *  because that retry is unbounded — see `startOrSwap`. */
+  | 'unresolved';
+
+interface AudioEventDetail {
+  clip?: string;
+  bus?: string;
+  loop?: boolean;
+  spatial?: boolean;
+  /** Crossfade duration on a `swap`, when one was applied. */
+  crossfadeSec?: number;
+  /** Why a `stop` happened — teardown paths a caller can otherwise not tell apart. */
+  reason?: string;
+}
+
+function journalAudio(
+  world: World, phase: AudioPhase, entity: Entity | undefined, detail: AudioEventDetail = {},
+): void {
+  emit('@audio', { phase, ...(entity ? { entity: entityRef(entity) } : {}), ...detail }, world);
+}
 
 /** A live entity-owned source: its handle, the clip it's playing (to detect a
  *  swap), and whether it's currently paused (playing=false, handle retained). */
@@ -61,7 +102,16 @@ interface AudioState {
    *  `handle.stopAfter(...)` (robust to timeScale/frame rate); this list only exists
    *  so a game Stop / scene swap can force-stop a tail mid-fade, and to sweep ended
    *  handles. */
-  fadingOut: AudioHandle[];
+  /** Kept as `{handle, clip}` rather than a bare handle so a tail's teardown can name
+   *  the clip it belonged to. A tail IS a voice — it is audible, and it is one of the
+   *  concurrent sources a voice-count measurement has to include — so leaving it out of
+   *  the trace made `start`/`swap` and `stop`/`end` unbalanced by exactly one per
+   *  crossfade, which is precisely the arithmetic the deferred voice cap needs. */
+  fadingOut: { handle: AudioHandle; clip: string }[];
+  /** Entities already warned about an unresolvable clip, keyed by entity id → the clip
+   *  warned about. `startOrSwap` retries a missing clip EVERY frame forever, so the warn
+   *  has to fire once per (entity, clip) or it would be 60 events/sec. */
+  warnedUnresolved: Map<number, string>;
   /** One-shot clip cues whose buffer wasn't decoded yet — retried for a bounded number of frames.
    *  On iOS the eager scene-load decode is REJECTED while the AudioContext is suspended and only
    *  completes after the first-gesture resume; the first shot's cue fires on that same gesture,
@@ -78,7 +128,13 @@ const MAX_PENDING_CUES = 32;
 const states = new WeakMap<World, AudioState>();
 function stateFor(world: World): AudioState {
   let s = states.get(world);
-  if (!s) { s = { sources: new Map(), autoplayed: new Set(), fadingOut: [], pendingCues: [] }; states.set(world, s); }
+  if (!s) {
+    s = {
+      sources: new Map(), autoplayed: new Set(), fadingOut: [],
+      warnedUnresolved: new Map(), pendingCues: [],
+    };
+    states.set(world, s);
+  }
   return s;
 }
 
@@ -88,11 +144,18 @@ function stateFor(world: World): AudioState {
 export function stopWorldAudio(world: World): void {
   const s = states.get(world);
   if (s) {
-    for (const src of s.sources.values()) src.handle.stop();
+    for (const src of s.sources.values()) {
+      src.handle.stop();
+      journalAudio(world, 'stop', undefined, { clip: src.clip, reason: 'world-teardown' });
+    }
     s.sources.clear();
     s.autoplayed.clear();
-    for (const h of s.fadingOut) h.stop();
+    for (const t of s.fadingOut) {
+      t.handle.stop();
+      journalAudio(world, 'stop', undefined, { clip: t.clip, reason: 'world-teardown' });
+    }
     s.fadingOut = [];
+    s.warnedUnresolved.clear();
     s.pendingCues = [];
   }
   clearAudioCues(world);
@@ -110,7 +173,11 @@ export function stopEntityAudio(world: World, entity: Entity): void {
   if (!s) return;
   const id = entity.id();
   const src = s.sources.get(id);
-  if (src) { src.handle.stop(); s.sources.delete(id); }
+  if (src) {
+    src.handle.stop();
+    s.sources.delete(id);
+    journalAudio(world, 'stop', entity, { clip: src.clip, reason: 'entity-stop' });
+  }
 }
 
 // Each scene load creates a NEW koota world; stop the departing world's audio so
@@ -141,12 +208,19 @@ export function audioSystem(world: World): void {
   if (!playing) {
     // Silence: stop everything, forget autoplay, discard pending cues.
     if (state.sources.size || state.fadingOut.length) {
-      for (const src of state.sources.values()) src.handle.stop();
+      for (const src of state.sources.values()) {
+        src.handle.stop();
+        journalAudio(world, 'stop', undefined, { clip: src.clip, reason: 'not-playing' });
+      }
       state.sources.clear();
-      for (const h of state.fadingOut) h.stop();
+      for (const t of state.fadingOut) {
+        t.handle.stop();
+        journalAudio(world, 'stop', undefined, { clip: t.clip, reason: 'not-playing' });
+      }
       state.fadingOut = [];
     }
     state.autoplayed.clear();
+    state.warnedUnresolved.clear();
     state.pendingCues = [];
     drainAudioCues(world);
     world.query(AudioSource).updateEach(([a]) => { if (a.playing) a.playing = false; });
@@ -154,7 +228,13 @@ export function audioSystem(world: World): void {
   }
 
   // Sweep crossfade tails that have self-stopped (via their audio-clock stopAfter).
-  if (state.fadingOut.length) state.fadingOut = state.fadingOut.filter((h) => !h.ended);
+  if (state.fadingOut.length) {
+    state.fadingOut = state.fadingOut.filter((t) => {
+      if (!t.handle.ended) return true;
+      journalAudio(world, 'end', undefined, { clip: t.clip });
+      return false;
+    });
+  }
 
   // 1. Listener pose — first enabled AudioListener's WORLD position (falls back to local).
   let listenerSet = false;
@@ -181,6 +261,7 @@ export function audioSystem(world: World): void {
 
     // Drop a finished (non-looping) source.
     if (src && src.handle.ended) {
+      journalAudio(world, 'end', entity, { clip: src.clip });
       state.sources.delete(id);
       src = undefined;
       a.playing = false;
@@ -189,18 +270,23 @@ export function audioSystem(world: World): void {
     if (a.playing) {
       if (src && src.clip === a.clip) {
         // Same clip: resume if paused, then apply live params.
-        if (src.paused) { src.handle.resume(); src.paused = false; }
+        if (src.paused) {
+          src.handle.resume();
+          src.paused = false;
+          journalAudio(world, 'resume', entity, { clip: src.clip });
+        }
         src.handle.setVolume(a.volume);
         src.handle.setPitch(a.pitch);
         if (a.spatial) { const p = positionOf(entity); src.handle.setPosition(p.x, p.y, p.z); }
       } else {
         // No handle, or the clip changed → start the (new) clip.
-        startOrSwap(state, entity, a, src);
+        startOrSwap(world, state, entity, a, src);
       }
     } else if (src && !src.paused) {
       // playing=false → pause (keep the handle + position).
       src.handle.pause();
       src.paused = true;
+      journalAudio(world, 'pause', entity, { clip: src.clip });
     }
   });
 
@@ -210,6 +296,7 @@ export function audioSystem(world: World): void {
       src.handle.stop();
       state.sources.delete(id);
       state.autoplayed.delete(id);
+      journalAudio(world, 'stop', undefined, { clip: src.clip, reason: 'entity-gone' });
     }
   }
 
@@ -222,7 +309,7 @@ export function audioSystem(world: World): void {
 /** Start `a.clip` on `entity`, replacing `prev` (a handle for a now-stale clip, or
  *  none). Crossfades when `crossfadeSec > 0` and there's a live prior handle; else
  *  a hard cut. No-op when the clip isn't loaded yet (retried next frame). */
-function startOrSwap(state: AudioState, entity: Entity, a: TraitValue<ExtractSchema<typeof AudioSource>>, prev: SourceState | undefined): void {
+function startOrSwap(world: World, state: AudioState, entity: Entity, a: TraitValue<ExtractSchema<typeof AudioSource>>, prev: SourceState | undefined): void {
   // TraitValue types default-bearing fields as optional; coerce to their runtime defaults.
   const clip = a.clip ?? '';
   const crossfadeSec = a.crossfadeSec ?? 0;
@@ -233,19 +320,37 @@ function startOrSwap(state: AudioState, entity: Entity, a: TraitValue<ExtractSch
     spatial: a.spatial, refDistance: a.refDistance, maxDistance: a.maxDistance,
     rolloff: a.rolloff, position: pos,
   });
-  if (!spec) return; // not decoded yet — keep the current source, retry next frame
+  if (!spec) {
+    // Not decoded yet — keep the current source and retry next frame. Unlike the cue
+    // path this retry is UNBOUNDED, so a clip that can never resolve (a broken ref, a
+    // stream URL the manifest cannot resolve) leaves `a.playing` true forever while the
+    // trace shows nothing at all for the entity — indistinguishable from one that never
+    // tried to play, and exactly the failure a QA case most wants to catch. Warn ONCE
+    // per (entity, clip): every frame would be 60 events/sec, which would flush the ring.
+    const id = entity.id();
+    if (state.warnedUnresolved.get(id) !== clip) {
+      state.warnedUnresolved.set(id, clip);
+      emit('@audio', { phase: 'unresolved', entity: entityRef(entity), clip }, world, 'warn');
+    }
+    return;
+  }
+  state.warnedUnresolved.delete(entity.id()); // it resolved — re-arm the warn
   const next = play(spec);
   if (cross && prev) {
     crossfade(prev.handle, next, a.volume, crossfadeSec);
     // Reap the outgoing tail on the audio clock (survives time-stop), and track it
     // so a game Stop / scene swap can force-stop it mid-fade.
     prev.handle.stopAfter(crossfadeSec + 0.1);
-    state.fadingOut.push(prev.handle);
+    state.fadingOut.push({ handle: prev.handle, clip: prev.clip });
   } else {
     prev?.handle.stop();
   }
   state.sources.set(entity.id(), { handle: next, clip, paused: false });
   a.playing = true;
+  journalAudio(world, prev ? 'swap' : 'start', entity, {
+    clip, bus: a.bus, loop: a.loop, spatial: a.spatial,
+    ...(cross ? { crossfadeSec } : {}),
+  });
 }
 
 function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
@@ -255,20 +360,39 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
     const still: { cue: AudioCue; frames: number }[] = [];
     for (const p of state.pendingCues) {
       const spec = resolveSpec(p.cue.clip ?? '', { bus: p.cue.bus, volume: p.cue.volume, pitch: p.cue.pitch });
-      if (spec) { play(spec); continue; }
-      if (--p.frames > 0) still.push(p);
+      if (spec) {
+        play(spec);
+        journalAudio(world, 'start', undefined, { clip: p.cue.clip, bus: p.cue.bus });
+        continue;
+      }
+      if (--p.frames > 0) { still.push(p); continue; }
+      // Aged out — the clip never decoded. Previously a completely silent drop, which is
+      // the one audio failure a player DOES notice and no trace recorded.
+      emit('@audio', { phase: 'dropped', clip: p.cue.clip, reason: 'decode-timeout' }, world, 'warn');
     }
     state.pendingCues = still;
   }
   for (const cue of cues) {
     if (cue.clip) {
       const spec = resolveSpec(cue.clip, { bus: cue.bus, volume: cue.volume, pitch: cue.pitch });
-      if (spec) { play(spec); continue; }
+      if (spec) {
+        play(spec);
+        journalAudio(world, 'start', undefined, { clip: cue.clip, bus: cue.bus });
+        continue;
+      }
       // Buffer clip not decoded yet (iOS: decode lands only after the first-gesture resume) → defer
       // and retry for a bounded window instead of dropping the shot. Stream clips + record mode
       // resolve immediately, so a null there is a genuine miss, not a decode wait — don't queue.
-      if (getAudioLoadType(cue.clip) !== 'stream' && hasAudioSupport() && state.pendingCues.length < MAX_PENDING_CUES) {
-        state.pendingCues.push({ cue, frames: ONE_SHOT_RETRY_FRAMES });
+      if (getAudioLoadType(cue.clip) !== 'stream' && hasAudioSupport()) {
+        if (state.pendingCues.length < MAX_PENDING_CUES) {
+          state.pendingCues.push({ cue, frames: ONE_SHOT_RETRY_FRAMES });
+        } else {
+          // The retry list is full, so this shot is discarded outright. The age-out path
+          // below already emits `dropped`; this branch did not, which left the WORST case
+          // (a cold-boot burst of >32 undecoded cues — the exact scenario pendingCues
+          // exists for) as the one silent drop remaining.
+          emit('@audio', { phase: 'dropped', clip: cue.clip, reason: 'retry-overflow' }, world, 'warn');
+        }
       }
       continue;
     }
@@ -282,7 +406,10 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
         pitch: cue.pitch ?? a.pitch, spatial: a.spatial, refDistance: a.refDistance,
         maxDistance: a.maxDistance, rolloff: a.rolloff, position: pos,
       });
-      if (spec) play(spec);
+      if (spec) {
+        play(spec);
+        journalAudio(world, 'start', entity, { clip: a.clip, bus: cue.bus ?? a.bus, spatial: a.spatial });
+      }
     });
   }
 }

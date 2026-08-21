@@ -15,6 +15,7 @@ import { withCurrentValue } from './importSettingOptions';
 import { DropdownField, SubSection, formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
 import { SpriteEditor } from '../SpriteEditor';
 import { NineSliceEditor } from '../NineSliceEditor';
+import { useAssetInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
 
 const TEXTURE_TYPE_OPTIONS: { value: TextureType; label: string }[] = [
   { value: '3d', label: '3D — model / material (mipmapped, KTX2)' },
@@ -47,10 +48,10 @@ export type TextureSettingKey = 'type' | keyof TextureImportSettings;
 
 /** Tri-state checkbox: renders indeterminate when `mixed`, clearing to a definite
  *  value on the user's click. */
-function MixedCheckbox({ checked, mixed, onChange }: { checked: boolean; mixed?: boolean; onChange: (v: boolean) => void }) {
+function MixedCheckbox({ checked, mixed, onChange, uiId, uiLabel }: { checked: boolean; mixed?: boolean; onChange: (v: boolean) => void; uiId?: string; uiLabel?: string }) {
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => { if (ref.current) ref.current.indeterminate = !!mixed; }, [mixed]);
-  return <input ref={ref} type="checkbox" checked={mixed ? false : checked} onChange={(e) => onChange(e.target.checked)} />;
+  return <input ref={ref} data-ui-id={uiId} data-ui-kind="toggle" data-ui-label={uiLabel} data-ui-state={mixed ? 'mixed' : checked ? 'checked' : 'unchecked'} type="checkbox" checked={mixed ? false : checked} onChange={(e) => onChange(e.target.checked)} />;
 }
 
 /** Presentational texture Type + Advanced settings block, shared by the single-asset
@@ -79,7 +80,7 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
       <div style={sectionStyle}>Type</div>
       <div style={rowStyle}>
         <span style={labelStyle}>Texture Type</span>
-        <select value={isMixed('type') ? '' : type} onChange={(e) => { if (e.target.value) onChangeType(e.target.value as TextureType); }} style={{ ...inputStyle, flex: 1 }}>
+        <select data-ui-id="assetView.texture.type" data-ui-kind="field" data-ui-label="Texture Type" value={isMixed('type') ? '' : type} onChange={(e) => { if (e.target.value) onChangeType(e.target.value as TextureType); }} style={{ ...inputStyle, flex: 1 }}>
           {isMixed('type') && <option value="">{MIXED_PLACEHOLDER}</option>}
           {TEXTURE_TYPE_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
@@ -88,14 +89,14 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
       <SubSection title="Advanced" defaultOpen={advancedOpen}>
         <div style={rowStyle}>
           <span style={labelStyle}>Format</span>
-          <select value={isMixed('format') ? '' : settings.format} disabled={type === 'ui' && FORMAT_OPTIONS_BY_TYPE.ui.length === 1} onChange={(e) => { if (e.target.value) onChange({ format: e.target.value as TextureFormat }); }} style={{ ...inputStyle, flex: 1 }}>
+          <select data-ui-id="assetView.texture.format" data-ui-kind="field" data-ui-label="Format" value={isMixed('format') ? '' : settings.format} disabled={type === 'ui' && FORMAT_OPTIONS_BY_TYPE.ui.length === 1} onChange={(e) => { if (e.target.value) onChange({ format: e.target.value as TextureFormat }); }} style={{ ...inputStyle, flex: 1 }}>
             {isMixed('format') && <option value="">{MIXED_PLACEHOLDER}</option>}
             {FORMAT_OPTIONS_BY_TYPE[type].map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>Max Size</span>
-          <select value={isMixed('maxSize') ? '' : String(settings.maxSize)} onChange={(e) => { if (e.target.value) onChange({ maxSize: Number(e.target.value) as TextureImportSettings['maxSize'] }); }} style={{ ...inputStyle, flex: 1 }}>
+          <select data-ui-id="assetView.texture.maxSize" data-ui-kind="field" data-ui-label="Max Size" value={isMixed('maxSize') ? '' : String(settings.maxSize)} onChange={(e) => { if (e.target.value) onChange({ maxSize: Number(e.target.value) as TextureImportSettings['maxSize'] }); }} style={{ ...inputStyle, flex: 1 }}>
             {isMixed('maxSize') && <option value="">{MIXED_PLACEHOLDER}</option>}
             {/* Splice a hand-authored off-list size in, or the select would display its
                 FIRST option (256) and misreport the texture's actual max size (#131). Skipped
@@ -107,13 +108,13 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>Generate Mipmaps</span>
-          <MixedCheckbox checked={settings.mipmaps} mixed={isMixed('mipmaps')} onChange={(v) => onChange({ mipmaps: v })} />
+          <MixedCheckbox checked={settings.mipmaps} mixed={isMixed('mipmaps')} onChange={(v) => onChange({ mipmaps: v })} uiId="assetView.texture.mipmaps" uiLabel="Generate Mipmaps" />
         </div>
         <DropdownField label="Wrap S" value={settings.wrapS} mixed={isMixed('wrapS')} options={['repeat', 'clamp', 'mirror']} onChange={(v) => onChange({ wrapS: v as TextureImportSettings['wrapS'] })} />
         <DropdownField label="Wrap T" value={settings.wrapT} mixed={isMixed('wrapT')} options={['repeat', 'clamp', 'mirror']} onChange={(v) => onChange({ wrapT: v as TextureImportSettings['wrapT'] })} />
         <div style={rowStyle}>
           <span style={labelStyle}>Colorspace</span>
-          <select value={isMixed('colorspace') ? '' : settings.colorspace} onChange={(e) => { if (e.target.value) onChange({ colorspace: e.target.value as TextureImportSettings['colorspace'] }); }} style={{ ...inputStyle, flex: 1 }}>
+          <select data-ui-id="assetView.texture.colorspace" data-ui-kind="field" data-ui-label="Colorspace" value={isMixed('colorspace') ? '' : settings.colorspace} onChange={(e) => { if (e.target.value) onChange({ colorspace: e.target.value as TextureImportSettings['colorspace'] }); }} style={{ ...inputStyle, flex: 1 }}>
             {isMixed('colorspace') && <option value="">{MIXED_PLACEHOLDER}</option>}
             <option value="srgb">sRGB (color)</option>
             <option value="linear">Linear (data / normal)</option>
@@ -121,11 +122,11 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>Flip Y</span>
-          <MixedCheckbox checked={settings.flipY ?? false} mixed={isMixed('flipY')} onChange={(v) => onChange({ flipY: v })} />
+          <MixedCheckbox checked={settings.flipY ?? false} mixed={isMixed('flipY')} onChange={(v) => onChange({ flipY: v })} uiId="assetView.texture.flipY" uiLabel="Flip Y" />
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>Flip Green (normal)</span>
-          <MixedCheckbox checked={settings.flipGreen ?? false} mixed={isMixed('flipGreen')} onChange={(v) => onChange({ flipGreen: v })} />
+          <MixedCheckbox checked={settings.flipGreen ?? false} mixed={isMixed('flipGreen')} onChange={(v) => onChange({ flipGreen: v })} uiId="assetView.texture.flipGreen" uiLabel="Flip Green" />
         </div>
         {webpEmitted && (
           <div style={rowStyle}>
@@ -147,6 +148,7 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
             <div style={rowStyle}>
               <span style={labelStyle}>UASTC Level</span>
               <select
+                data-ui-id="assetView.texture.uastcLevel" data-ui-kind="field" data-ui-label="UASTC Level"
                 value={isMixed('uastcLevel') ? '' : String(settings.uastcLevel ?? DEFAULT_UASTC_LEVEL)}
                 onChange={(e) => { if (e.target.value) onChange({ uastcLevel: Number(e.target.value) }); }}
                 style={{ ...inputStyle, flex: 1 }}
@@ -202,8 +204,17 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
   const setImportStatus = useEditorStore((s) => s.setImportStatus);
 
+  // Refresh the sidecar-derived stats when a re-import fires from ANYWHERE — the
+  // Assets panel's "Re-import all", TextureBatchView, the agent bridge (#304).
+  // Note this is stats-only: the source <img> preview below points at the source
+  // PNG, which a re-import does not rewrite. What DOES go stale is the
+  // `textureCache` variant list + byte counts and the `converted` flag, and
+  // `converted` gates UI (the Apply/Re-import label, the stats block), not just a
+  // readout. Same dep placement + double-read note as ModelAssetView (#303).
+  const reimportEpoch = useAssetInvalidationEpoch('texture', (p) => p === path);
+
   const loadMeta = useCallback((signal?: AbortSignal) => {
-    return backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`, signal ? { signal } : undefined)
+    return backendFetch(cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, reimportEpoch), signal ? { signal } : undefined)
       .then((r) => (r.ok ? r.json() : {}))
       .then((m: Record<string, unknown>) => {
         setMeta(m);
@@ -212,7 +223,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
         setConverted(!!m.textureCache);
       })
       .catch(() => { /* keep defaults */ });
-  }, [path]);
+  }, [path, reimportEpoch]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -326,7 +337,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
                 style={{ ...inputStyle, width: 56 }} />
             </div>
           </div>
-          <button onClick={() => setNineSliceOpen(true)} style={{ ...reimportBtnStyle, marginTop: 4 }}>Edit visually…</button>
+          <button data-ui-id="assetView.texture.editNineSlice" data-ui-kind="button" data-ui-label="Edit visually" onClick={() => setNineSliceOpen(true)} style={{ ...reimportBtnStyle, marginTop: 4 }}>Edit visually…</button>
           <div style={{ color: '#666', fontSize: 10, marginTop: 2 }}>Corners stay fixed; edges + center stretch (CSS border-image). Re-import to apply to the whole-image sprite.</div>
         </>
       )}
@@ -335,6 +346,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
       )}
 
       <button
+        data-ui-id="assetView.texture.apply" data-ui-kind="button" data-ui-label={converted ? 'Re-import' : 'Apply'}
         disabled={importing}
         onClick={apply}
         style={{ ...reimportBtnStyle, marginTop: 8, background: importing ? '#555' : '#2ecc71', color: '#fff', border: `1px solid ${importing ? '#444' : '#27ae60'}`, cursor: importing ? 'wait' : 'pointer' }}
@@ -345,6 +357,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
 
       <div style={sectionStyle}>Sprites</div>
       <button
+        data-ui-id="assetView.texture.spriteEditor" data-ui-kind="button" data-ui-label="Sprite Editor"
         onClick={() => setSpriteEditorOpen(true)}
         style={{ ...reimportBtnStyle, marginTop: 2 }}
       >

@@ -884,6 +884,32 @@ describe('an IDLE window is not evidence (bug lvROp0yDYPSzS0VZM6LH)', () => {
     expect(getPendingTierPromotion()).toBeNull();
   });
 
+  it("applies the tier ABOVE's OWN authored targetFps to the promotion bar, not just the project's", () => {
+    // The branch `demos/forest-camp` turned on (2026-08-21, testboard kR2G1q5BzRPskMi1fhrm) and the
+    // one hole left in this seam's cover. The three tests around it all leave `mid` unauthored, so
+    // every one of them exercises `applyTierToTargetFps(60, <mid overrides>)` where the tier
+    // contributes NOTHING — drop the `resolveTierOverrides(up, ...)` argument from
+    // `promotionTargetFrameMs` and they stay green, because 60 is the answer either way.
+    //
+    // Same fixture as the seam test above, same 12ms of engine CPU, ONE field different:
+    //   mid unauthored     → inherits the project's 60 → frame 16.67ms → bar 8.33ms  → no promote
+    //   mid.targetFps = 30 → the TIER's own cap wins   → frame 33.3ms  → bar 16.67ms → promote
+    // So this test and the seam test disagree by construction, which is what makes either one
+    // evidence. A project capping its mid tier is asking for less work up there, and the promotion
+    // bar has to follow or a device stays at `low` under a ceiling that would now hold it.
+    resetRenderSettings();
+    resetTierCalibration();
+    setRenderSettings({
+      three: { qualityTier: 'auto', tiers: { mid: { targetFps: 30 }, low: { targetFps: 30 } } },
+    } as never);
+    setActiveQualityTier({ tier: 'low', source: 'calibrating', reason: 'unrecognised device' });
+    armTierCalibration();
+    playerIsInteracting = true;
+    mockProfile = { ...profileOf(20, 12), overBudget: false, budgetMs: 40 };
+    for (let t = 0; t <= PROMOTION_HOLD_MS * 3; t += CALIBRATION_INTERVAL_MS) tickTierCalibration(t);
+    expect(getPendingTierPromotion()).toMatchObject({ tier: 'mid' });
+  });
+
   it('promotes when the tier above\'s target genuinely fits — the control for the seam test', () => {
     // Same wiring, same `low` start, only the CPU changes: 6ms clears the 8.33ms bar that `mid`'s
     // inherited 60fps target sets. Without this, the test above would pass just as happily against
