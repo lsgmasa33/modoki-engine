@@ -23,8 +23,13 @@ import {
   deletionPathsFor, planRename,
 } from './assetOps';
 import { resolveClickSelection, dragPathsFor } from './assetSelection';
-import { isTextAsset, makeDeleteUndo, makeDuplicateUndo, type Snapshot, type DeleteResult, type DupResult } from './assetUndo';
-import { unbindDeletedAssetEditors, applyAssetPathMoves, type PathMove } from './assetEditorBindings';
+import {
+  isTextAsset, makeDeleteUndo, makeDuplicateUndo, logBindingChanges,
+  makeRenameUndo, makeEmptyFolderDeleteUndo, makeNewFolderUndo, makeFolderRenameUndo,
+  makePasteUndo, makeFilesDropUndo, makeModelImportUndo, makeFileImportUndo,
+  type Snapshot, type DeleteResult, type DupResult, type PasteMove, type DropMove,
+} from './assetUndo';
+import { unbindDeletedAssetEditors, applyAssetPathMoves } from './assetEditorBindings';
 import { newGuid, registerAsset, type AssetType } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
 import { reimportPaths } from './assetViews/reimport';
@@ -188,14 +193,18 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
       const baseName = assetPath.substring(assetPath.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
       const prefabPath = `${dir}/${baseName}.prefab.json`;
       const content = JSON.stringify(prefab, null, 2);
-      await writeFile(prefabPath, content);
-      console.log(`[Assets] Created prefab: ${prefabPath}`);
-
-      pushAction({
-        label: `Import Model "${assetName}"`,
-        undo: async () => { await deleteAsset(prefabPath); onDone?.(); },
-        redo: async () => { await writeFile(prefabPath, content); onDone?.(); },
-      });
+      // #308 follow-up A: the forward write was unchecked too (not just undo/redo) —
+      // pushing an undo entry for a prefab that was never actually written would make
+      // the resulting Cmd+Z trash a file that isn't there.
+      const wrote = await writeFile(prefabPath, content);
+      if (!wrote) {
+        console.error(`[Assets] Failed to create prefab ${prefabPath}`);
+      } else {
+        console.log(`[Assets] Created prefab: ${prefabPath}`);
+        // Builder in assetUndo.ts (#308) — both directions now check the write/delete
+        // and report a failure instead of discarding it silently.
+        pushAction(makeModelImportUndo({ assetName, prefabPath, content, onDone }));
+      }
     }
 
     refreshAssets();
@@ -214,12 +223,8 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
 // ─── Asset row (shared between views) ────────────────────────────────
 
 // Folder-relative move (computes the destination path from a target folder).
-/** Report what an asset move/delete did to the open asset editors (#186). Silent when it
- *  touched none, which is almost always — but a binding that silently repoints or closes is
- *  how the original bug stayed invisible, so the one case that matters says so. */
-function logBindingChanges(notes: string[]): void {
-  for (const n of notes) console.log(`[Assets] ${n}`);
-}
+// `logBindingChanges` moved to assetUndo.ts (#308) so the undo/redo builders there can share
+// it without importing this file.
 
 // Distinct from assetOps.moveFileTo, which takes an explicit full target path.
 async function moveFile(fromPath: string, toFolder: string): Promise<boolean> {
@@ -1129,25 +1134,10 @@ export default function Assets() {
     logBindingChanges(applyAssetPathMoves([{ from: asset.path, to: toPath, name: safe }]));
     refresh();
 
-    pushAction({
-      label: `Rename ${asset.name}`,
-      // Each direction gates the remap on the move actually happening. Repointing a binding
-      // at a path the file is NOT at is the forking bug itself: /api/move-file 409s when the
-      // destination exists, so an undo after something else took the old name would
-      // otherwise aim the next autosave at a file that isn't there.
-      undo: async () => {
-        if (await moveFileTo(toPath, asset.path)) {
-          logBindingChanges(applyAssetPathMoves([{ from: toPath, to: asset.path, name: asset.name }]));
-        }
-        refresh();
-      },
-      redo: async () => {
-        if (await moveFileTo(asset.path, toPath)) {
-          logBindingChanges(applyAssetPathMoves([{ from: asset.path, to: toPath, name: safe }]));
-        }
-        refresh();
-      },
-    });
+    // Undo/redo builder in assetUndo.ts (#308) — each direction gates the remap on the move
+    // actually happening AND reports a failure (toast only on a 409 collision) instead of
+    // discarding it silently.
+    pushAction(makeRenameUndo({ originalPath: asset.path, originalName: asset.name, toPath, newName: safe, refresh }));
   }, [assets, selected, selectAsset, refresh]);
 
   const commitRename = useCallback((asset: AssetEntry, newBase: string) => {
@@ -1198,11 +1188,9 @@ export default function Assets() {
     if (results.length > 0) {
       pushDeleteUndo(results); // restoring the files recreates the folder
     } else {
-      pushAction({
-        label: `Delete folder ${folderName}`,
-        undo: async () => { await createFolderApi(folderPath); refresh(); },
-        redo: async () => { await deleteAsset(folderPath); refresh(); },
-      });
+      // Builder in assetUndo.ts (#308) — reports a failed recreate/re-delete instead of
+      // discarding it silently.
+      pushAction(makeEmptyFolderDeleteUndo({ folderPath, folderName, refresh }));
     }
   }, [assets, collectDeletion, pushDeleteUndo, clearSelection, refresh]);
 
@@ -1257,32 +1245,11 @@ export default function Assets() {
     // NEW file and leaves the original where it is, so nothing bound has moved.
     if (op === 'cut') logBindingChanges(applyAssetPathMoves(done.map(({ from, to }) => ({ from, to }))));
     refresh();
-    pushAction({
-      label: `${op === 'cut' ? 'Move' : 'Paste'} ${done.length} item(s)`,
-      // As in handleRename: only the moves that actually landed may repoint a binding.
-      undo: async () => {
-        const back: PathMove[] = [];
-        for (const { from, to } of done) {
-          if (op === 'cut') { if (await moveFileTo(to, from)) back.push({ from: to, to: from }); }
-          // Both sidecar halves — the committed `.meta.json` AND the gitignored
-          // `.meta.local.json` — or undoing a paste leaves the local one behind
-          // forever (QA-CTX-0005). deleteAsset no-ops on a path that isn't there.
-          else { await deleteAsset(to); if (!isTextAsset(to)) { await deleteAsset(to + '.meta.json'); await deleteAsset(to + '.meta.local.json'); } }
-        }
-        if (op === 'cut') logBindingChanges(applyAssetPathMoves(back));
-        else logBindingChanges(unbindDeletedAssetEditors(done.map(({ to }) => to)));
-        refresh();
-      },
-      redo: async () => {
-        const fwd: PathMove[] = [];
-        for (const { from, to } of done) {
-          if (op === 'cut') { if (await moveFileTo(from, to)) fwd.push({ from, to }); }
-          else await duplicateAsset(from, to);
-        }
-        if (op === 'cut') logBindingChanges(applyAssetPathMoves(fwd));
-        refresh();
-      },
-    });
+    // Builder in assetUndo.ts (#308) — as in handleRename, only the moves that actually
+    // landed may repoint a binding, and every skipped item is now reported as one message
+    // (was silently dropped one at a time).
+    const doneMoves: PasteMove[] = done.map(({ from, to }) => ({ from, to }));
+    pushAction(makePasteUndo({ op, done: doneMoves, refresh }));
   }, [clipboard, selected, assets, refresh]);
 
   // ── New Folder + folder rename ──────────────────────────────────────
@@ -1309,19 +1276,9 @@ export default function Assets() {
     });
     setViewMode('folder');
     setRenamingFolderPath(path); // immediately editable, Finder-style
-    pushAction({
-      label: 'New Folder',
-      undo: async () => {
-        await deleteAsset(path);
-        setPendingFolders((p) => { const n2 = new Set(p); n2.delete(path); return n2; });
-        refresh();
-      },
-      redo: async () => {
-        await createFolderApi(path);
-        setPendingFolders((p) => new Set(p).add(path));
-        refresh();
-      },
-    });
+    // Builder in assetUndo.ts (#308) — setPendingFolders now only updates on success, and a
+    // failure is reported instead of discarded.
+    pushAction(makeNewFolderUndo({ path, refresh, setPendingFolders }));
   }, [assets, pendingFolders, diskFolders, refresh]);
 
   const commitFolderRename = useCallback(async (node: FolderNode, newName: string) => {
@@ -1344,21 +1301,12 @@ export default function Assets() {
     logBindingChanges(applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]));
     clearSelection();
     refresh();
-    pushAction({
-      label: `Rename folder ${node.name}`,
-      undo: async () => {
-        const ok2 = await moveFileTo(newPath, oldPath);
-        setPendingFolders((p) => remapPrefix(p, newPath, oldPath));
-        if (ok2) logBindingChanges(applyAssetPathMoves([{ from: newPath, to: oldPath, prefix: true }]));
-        refresh();
-      },
-      redo: async () => {
-        const ok2 = await moveFileTo(oldPath, newPath);
-        setPendingFolders((p) => remapPrefix(p, oldPath, newPath));
-        if (ok2) logBindingChanges(applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]));
-        refresh();
-      },
-    });
+    // Builder in assetUndo.ts (#308) — was the worst site: setPendingFolders ran
+    // UNCONDITIONALLY here, so a failed undo/redo desynced the client folder tree from disk
+    // (an active desync, not a no-op). Now gated on the move landing, `setExpanded` is
+    // remapped too (previously never remapped by undo/redo at all), and a failure is
+    // reported (toast only on a 409 collision).
+    pushAction(makeFolderRenameUndo({ oldPath, newPath, folderName: node.name, refresh, setPendingFolders, setExpanded }));
   }, [assets, pendingFolders, diskFolders, clearSelection, refresh]);
 
   // Smooth-scroll a path's row into view (after the tree commits).
@@ -1511,17 +1459,11 @@ export default function Assets() {
       }
     }
     refresh();
-    pushAction({
-      label: imported.length > 1 ? `Import ${imported.length} files` : `Import "${imported[0].path.split('/').pop()}"`,
-      // Undoing an import DELETES the files, and you can have opened one in the meantime
-      // (import a .particle.json → double-click it → ⌘Z), so it unbinds like any delete.
-      undo: async () => {
-        for (const f of imported) await deleteAsset(f.path);
-        logBindingChanges(unbindDeletedAssetEditors(imported.map((f) => f.path)));
-        refresh();
-      },
-      redo: async () => { for (const f of imported) await writeFile(f.path, f.content, 'base64'); refresh(); },
-    });
+    // Builder in assetUndo.ts (#308) — every result in both loops used to be discarded,
+    // and undo unbound ALL N files regardless of which deletes actually landed; only the
+    // files that were really trashed are unbound now, and every failure in either
+    // direction is batch-reported as one message (like makePasteUndo/makeFilesDropUndo).
+    pushAction(makeFileImportUndo({ imported, refresh }));
   }, [assets, refresh, setImportStatus]);
 
   const handleDrop = useCallback(async (e: React.DragEvent, targetFolder?: string) => {
@@ -1564,38 +1506,28 @@ export default function Assets() {
   // bundled into a single undo entry.
   const handleFilesDrop = useCallback(async (filePaths: string[], targetFolder: string) => {
     const normalizedTarget = targetFolder === '/' ? '' : targetFolder;
-    const moves: { from: string; to: string; originalFolder: string }[] = [];
+    const moves: DropMove[] = [];
     for (const filePath of filePaths) {
       const originalFolder = filePath.substring(0, filePath.lastIndexOf('/')) || '/';
       if (targetFolder === originalFolder || targetFolder === filePath || targetFolder.startsWith(filePath + '/')) continue;
       const ok = await moveFile(filePath, targetFolder);
       if (!ok) { console.warn(`[Assets] Could not move ${filePath} → ${targetFolder}`); continue; }
       const fileName = filePath.substring(filePath.lastIndexOf('/') + 1);
-      moves.push({ from: filePath, to: `${normalizedTarget}/${fileName}`, originalFolder });
+      moves.push({ from: filePath, to: `${normalizedTarget}/${fileName}` });
     }
     if (moves.length === 0) return;
     console.log(`[Assets] Moved ${moves.length} item(s) → ${targetFolder}`);
     // Drag-drop into a folder is a MOVE like any other, so a bound editor must follow it
     // (#186). This site uses `moveFile` (folder-target) rather than `moveFileTo`
     // (explicit-path) — which is exactly why the first sweep for this bug missed it.
-    logBindingChanges(applyAssetPathMoves(moves.map(({ from, to }) => ({ from, to }))));
+    logBindingChanges(applyAssetPathMoves(moves));
     refresh();
 
-    pushAction({
-      label: moves.length > 1 ? `Move ${moves.length} items` : `Move "${moves[0].from.split('/').pop()}"`,
-      undo: async () => {
-        const back: PathMove[] = [];
-        for (const m of moves) if (await moveFile(m.to, m.originalFolder)) back.push({ from: m.to, to: m.from });
-        logBindingChanges(applyAssetPathMoves(back));
-        refresh();
-      },
-      redo: async () => {
-        const fwd: PathMove[] = [];
-        for (const m of moves) if (await moveFile(m.from, targetFolder)) fwd.push({ from: m.from, to: m.to });
-        logBindingChanges(applyAssetPathMoves(fwd));
-        refresh();
-      },
-    });
+    // Builder in assetUndo.ts (#308) — same skip-every-item shape as pasteClipboard's cut
+    // branch, now reported as one message instead of dropped per-item. Explicit full paths
+    // (from/to) are already known, so the builder calls moveFileToStatus directly rather than
+    // re-deriving a destination from a folder.
+    pushAction(makeFilesDropUndo({ moves, refresh }));
   }, [refresh]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {

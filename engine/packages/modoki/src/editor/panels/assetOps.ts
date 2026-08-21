@@ -15,6 +15,7 @@
 import { backendFetch } from '../backend/editorBackend';
 import { serializePrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, setPrefabCache, warnInertPrefabSizes, type PrefabFile } from '../scene/prefab';
 import { entityRef } from '../undo/entityRef';
+import { reportUndoFailure } from '../undo/undoFailure';
 import type { UndoAction } from '../undo/undoManager';
 import { registerAsset } from '../../runtime/loaders/assetManifest';
 import { firstAssetRoot } from './assetRoots';
@@ -245,13 +246,30 @@ export async function createFolderApi(folderPath: string): Promise<boolean> {
  *  the asset's .meta.json sidecar). The caller controls the full target path,
  *  not just the destination folder. */
 export async function moveFileTo(from: string, to: string): Promise<boolean> {
+  return (await moveFileToStatus(from, to)).ok;
+}
+
+/** `moveFileTo` with the HTTP status preserved, so a caller can tell a COLLISION
+ *  from a backend failure. `/api/move-file` never clobbers: it answers **409
+ *  "Destination exists"** when something already occupies the destination, and
+ *  403/404/5xx for everything else. That distinction is what an undo/redo needs
+ *  in order to report honestly (#308) — a 409 is user-caused and user-fixable
+ *  (they recreated something at the old path, so undoing a rename can't move it
+ *  back), while a 5xx is neither. `status` is 0 when the request itself threw.
+ *
+ *  `moveFileTo` deliberately stays a bare boolean rather than being widened to
+ *  this shape: every existing call site uses it directly in boolean context
+ *  (`if (await moveFileTo(a, b))`), and an object return is ALWAYS truthy — so
+ *  widening it in place would silently disarm each of those guards while
+ *  typechecking cleanly. */
+export async function moveFileToStatus(from: string, to: string): Promise<{ ok: boolean; status: number }> {
   try {
     const res = await backendFetch('/api/move-file', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from, to }),
     });
-    return res.ok;
-  } catch { return false; }
+    return { ok: res.ok, status: res.status };
+  } catch { return { ok: false, status: 0 }; }
 }
 
 /** Resolve the first real (writable) asset root by scanning the live manifest.
@@ -314,13 +332,41 @@ export async function createPrefabFromEntity(
   const ref = entityRef(entityId);
   const action: UndoAction = {
     label,
+    // Both directions are ALL-OR-NOTHING: the file write/delete is gated, and the
+    // cache + the live tree's instance tagging only follow if it landed (#308).
+    //
+    // That differs from makeDeleteUndo, which deliberately restores what it can and
+    // reports the shortfall — and the difference is the unit of work, not a
+    // disagreement. There, undo covers N INDEPENDENT files and partial progress is
+    // genuinely useful. Here it is ONE coupled operation: the .prefab.json and the
+    // entities linked to it. Half-applying that leaves the user in a state that is
+    // neither before nor after — entities un-linked from a prefab still on disk, or
+    // linked to one that is not. Refusing cleanly and saying so is the honest answer.
     undo: async () => {
-      await deleteAssetFile(savePath);
+      if (!(await deleteAssetFile(savePath))) {
+        reportUndoFailure({
+          direction: 'Undo', label,
+          detail: `the prefab file was not trashed and is still on disk: ${savePath}. The entities were left linked to it rather than half-undone.`,
+        });
+        return;
+      }
       setPrefabCache(cacheKey, null);
       const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id);
     },
     redo: async () => {
-      await writeAssetFile(savePath, content);
+      // Why gating matters MORE than logging on this side: caching the prefab (and
+      // tagging the live tree as an instance of it) after a failed write leaves the
+      // editor believing in a .prefab.json that is not on disk. It reads correctly
+      // from cache for the rest of the session and comes back missing on the next
+      // scene load or a fresh editor launch, which read the FILE. That delay is what
+      // makes the desync expensive — the failure surfaces far from its cause.
+      if (!(await writeAssetFile(savePath, content))) {
+        reportUndoFailure({
+          direction: 'Redo', label,
+          detail: `the prefab file was not written: ${savePath}. The entities were left un-linked rather than pointed at a file that is not there.`,
+        });
+        return;
+      }
       if (prefab.id) registerAsset(prefab.id, savePath, 'prefab');
       setPrefabCache(cacheKey, prefab);
       const id = ref.resolve(); if (id != null) tagEntityTreeAsInstance(id, savePath);

@@ -17,6 +17,7 @@
  *  captured guids are stamped back over the respawned subtree below. */
 import type { UndoAction } from './undoManager';
 import { entityRef, type EntityRef } from './entityRef';
+import { reportUndoFailure } from './undoFailure';
 import { getAllEntities, readTraitData, writeTraitField, findEntity, type EntityInfo }
   from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
@@ -114,7 +115,20 @@ export function makePrefabInstantiateAction(opts: {
     undo: () => { opts.remove(currentRef.resolve() ?? currentRef.rawId); },
     redo: async () => {
       const id = await opts.respawn();
-      if (id == null) return;
+      // Leaving the live id unchanged is the deliberate contract (see `respawn`
+      // above) and stays that way — but the SILENCE was not deliberate (#308).
+      // The documented cause is that the prefab file was deleted between the undo
+      // and the redo, so redo reported success while no instance came back and
+      // nothing said why. No toast: the entry is on the redo stack, which means
+      // the user pressed Cmd+Shift+Z and is looking, and the file being gone is
+      // not something they can fix from here.
+      if (id == null) {
+        reportUndoFailure({
+          direction: 'Redo', label: opts.label,
+          detail: 'the prefab could not be instantiated — its file was most likely deleted since the undo. No instance was created.',
+        });
+        return;
+      }
       restoreSubtreeGuids(id, capturedGuids);
       capturedGuids = captureSubtreeGuids(id);
       currentRef = entityRef(id);

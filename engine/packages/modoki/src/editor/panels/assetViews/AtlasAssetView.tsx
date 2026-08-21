@@ -8,8 +8,8 @@
  *  refreshes after a Re-pack via the watcher's manifest broadcast. */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { persistAtlasDoc } from './atlasPersist';
 import { backendFetch } from '../../backend/editorBackend';
-import { writeAssetFile } from '../assetOps';
 import { useEditorStore } from '../../store/editorStore';
 import { getAssetEntry, getGuidForPath, type AtlasCacheBlock } from '../../../runtime/loaders/assetManifest';
 import { resolveAtlasPageUrl } from '../../../runtime/loaders/textureResolver';
@@ -101,7 +101,15 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
   const update = useCallback((patch: Partial<AtlasSourceDoc>) => {
     setDoc((prev) => {
       const next = { ...prev, ...patch, version: 1 as const };
-      void writeAssetFile(path, serializeAtlasDoc(rawDoc.current, next));
+      // Report a write that did not land, instead of discarding the boolean (#308 sweep).
+      // The panel updates optimistically either way — same order as persistAssetEdit, which
+      // every SIBLING asset view uses; without the failure path that optimism is a LIE: the
+      // atlas shows the edited member list while the .atlas.json on disk still holds the old
+      // one, and nothing anywhere says so. Not an undo/redo site (this view pushes no undo
+      // entry), so it reports through the write-failure reporter rather than reportUndoFailure.
+      // The write+report itself lives in atlasPersist.ts (#308 close-out) so it's unit-testable
+      // without mounting this component.
+      void persistAtlasDoc(path, serializeAtlasDoc(rawDoc.current, next));
       return next;
     });
   }, [path]);

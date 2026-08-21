@@ -1680,12 +1680,89 @@ OS trash; the partial case was not reported at all. `makeDeleteUndo` now restore
 - **`redo` checks its re-delete too.** A failed re-trash left the files on disk while `refresh()`
   re-listed them, so redo read as a no-op — the same false success on the other half of the pair.
 
-⚠️ **This class is NOT confined to asset delete.** A sweep of all ~103 `undo`/`redo` bodies found
-**7 more handlers** that discard a failed filesystem op the same way (folder rename desyncs the
-client tree outright) — tracked in **#308**, which must settle the reporting bar (log vs throw vs
-toast) before any of them are fixed. The helpers are the trap: `writeAssetFile`,
-`deleteAssetFile`, `moveFileTo`, `createFolderApi` and `mutateScene` **never throw** — they catch
-and resolve `false`, so ignoring the return value is silent by construction.
+### An undo/redo that discards a failed filesystem op — the whole class (#308)
+
+⚠️ **This class was never confined to asset delete.** The helpers are the trap: `writeAssetFile`,
+`deleteAssetFile`, `moveFileTo`, `createFolderApi` and `duplicateAssetFile`
+**never throw** — they catch and resolve `false`. (`SceneAssetView`'s `mutateScene` was the one
+exception: it resolved `{ok:false}` for an HTTP error but let a network-level rejection escape,
+straight out of an undo closure and into the both-stacks-lost path below. It now catches too.) So ignoring the return value is silent *by
+construction*, and `undoManager` pops the entry and reports success either way: Cmd+Z reads as
+working while nothing happened. The forward path of the same function usually checks the return;
+it was only ever the undo/redo closures that didn't.
+
+**The reporting bar, and why it is not a throw.** A throw looks like the stronger answer — leave
+the entry on the stack so the user can retry — and it is measurably worse. `undo()`
+(`undo/undoManager.ts`) pops the action **before** awaiting `action.undo()`, so on a throw the
+`redoStack.push`, `notifyEdited`, `markAffectedScenesDirty` and the `!undo` journal event are all
+skipped and the action is lost from **BOTH** stacks; `serialize` then hands the rejection to a
+caller that does not catch it. Making a throw safe means fixing undoManager's bookkeeping first.
+So the bar is #291's — report, let the stack pop, keep editor state consistent with disk:
+
+- **`reportUndoFailure`** (`undo/undoFailure.ts`) is the one reporter. `console.error` naming the
+  direction, the action's label and the paths, always. That log is the user's only hand-recovery
+  path, which is why it names paths rather than saying "the operation failed".
+- **A toast on top, for a collision only.** `/api/move-file` never clobbers: it answers **409
+  "Destination exists"** when something now occupies the path we were moving back to, and
+  403/404/5xx otherwise. A 409 is user-CAUSED and user-FIXABLE (they recreated something at the old
+  name), so it is worth interrupting them for — the console is not a place anyone is looking. A
+  backend failure is not actionable, so it stays console-only.
+- **`moveFileToStatus`** (`panels/assetOps.ts`) exists so that distinction is *measured* rather than
+  guessed. `moveFileTo` deliberately stays a bare boolean: every existing call site uses it as
+  `if (await moveFileTo(…))`, and an object return is always truthy — widening it in place would
+  silently disarm each of those guards while typechecking cleanly.
+- **Gate the dependent state, don't just log it.** The log is for the user; the gate is what keeps
+  the editor honest. Folder rename was an ACTIVE DESYNC rather than a no-op — `setPendingFolders`
+  ran unconditionally while only the binding remap was gated, so a failed undo remapped the client
+  tree to `/Old` while the folder was still physically at `/New`.
+
+**Partial-progress vs all-or-nothing is decided by the UNIT OF WORK, not by taste** — the two
+shapes in this codebase are not a disagreement:
+
+- `makeDeleteUndo` / `makePasteUndo` / `makeFilesDropUndo` cover **N independent files**, so they
+  do what they can, batch the shortfall into ONE message naming every skipped path, and always
+  `refresh()` — whatever *did* change must appear.
+- `createPrefabFromEntity` / `makeRigPrefabAsset` cover **ONE coupled operation** — a
+  `.prefab.json` plus the entities linked to it — so they are all-or-nothing. Half-applying that
+  leaves the user in a state which is neither before nor after (entities un-linked from a prefab
+  still on disk, or linked to one that is not).
+
+**A batch undo must track what it actually MOVED, not replay its list.** This is the trap the
+first fix walked into, and it is the same lie pointed the other way. After a partial failure the
+two directions are out of step: undo moves A and B back but C's move fails, so C is still at its
+forward location. Replaying the whole list on the next redo then asks the backend to move C from
+a path nothing is at — `/api/move-file` answers 404 "Source not found", `/api/duplicate-asset`
+answers 409 "Destination exists" — and that gets folded into the failure report as though C had
+been lost. It has not: C is sitting exactly where redo wanted to put it, and the user is sent
+hunting for a file that was never in danger. So each batch builder remembers which items are
+currently in the undone state and acts only on those. A skip happens ONLY when the item is
+already in the state that direction wants, so a genuine retry still retries.
+
+⚠️ Two things make that state safe to keep in the closure, and both were checked rather than
+assumed: `undoManager` puts an action on `redoStack` *only* via `undo()`, so `redo`-before-`undo`
+is a sequence production cannot produce; and undo actions are never serialized or cloned
+(`swapHistory` stores the same live objects, and the only `structuredClone` touches
+`journalPayload`). If either ever changes, this state is what breaks.
+
+**The delayed-desync case is why gating beats logging.** A `setPrefabCache` after a failed write
+leaves the editor believing in a file that is not on disk: it reads correctly from cache for the
+rest of the session and comes back missing on the next scene load or a fresh editor launch, which
+read the FILE. The failure surfaces far from its cause.
+
+**Every fixed site is now a framework-free FACTORY, and that is a testability constraint rather
+than tidiness.** Six of these lived inside `Assets.tsx` and one inside `SceneAssetView.tsx`, and a
+panel may not be mounted in jsdom to test it (§ Panels — that asserts the mock). So each undo
+builder moved to a plain `.ts` module beside its panel — `panels/assetUndo.ts`,
+`panels/assetViews/baseSceneUndo.ts` — taking `refresh`, the narrow React setters, or the
+component's own `write` as explicit parameters. The panel keeps a one-line
+`pushAction(makeXUndo({…}))`. `assetUndo.ts` already existed for exactly this reason (F6); this
+extended it rather than inventing a second home.
+
+**Deliberately left alone:** the ~15 closures in `undo/entityActions.ts` that no-op when
+`ref.resolve()` returns null. That is an entity which is genuinely gone, not a discarded
+filesystem boolean — and stack ordering means the entity is present in the normal case (deleting
+it pushed its own undo entry, which unwinds first). The abnormal case is a world-rebuild
+guid-index gap, a different bug to chase; fifteen speculative warnings would be noise.
 
 ---
 

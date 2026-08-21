@@ -27,8 +27,9 @@ export const clampNum = (v: number, min?: number, max?: number) => {
 
 const _assetViewSetters = new Map<string, (data: any) => void>();
 
-/** A write that did not land must SAY SO. The Inspector's asset edits are the last place in the
- *  editor where a rejected write was silent: the response was never inspected and a rejection was
+/** A write that did not land must SAY SO. The Inspector's asset edits were the last place in the
+ *  editor where a rejected write was silent (the #308 sweep later found one more, AtlasAssetView,
+ *  which now reports through this same function): the response was never inspected and a rejection was
  *  never caught, while the cache invalidation and the panel refresh ran regardless — so a failed
  *  write left the editor confidently showing a value the file does not have, and the only trace
  *  was an unhandled promise rejection nobody reads. Same class as the save toasts that were fixed
@@ -39,7 +40,7 @@ const _assetViewSetters = new Map<string, (data: any) => void>();
  *  resolve a failure that is usually transient (permissions, a full disk, the backend restarting),
  *  and the next edit to the same asset rewrites the whole file — so editing again IS the retry.
  *  Same reasoning as `discardDirtyAssets`'s scope note: dropping the write is not dropping the edit. */
-function reportWriteFailed(path: string, detail: string): void {
+export function reportWriteFailed(path: string, detail: string): void {
   console.error(
     `[Inspector] FAILED to write ${path} — ${detail}. The editor is showing the edited value, but ` +
     'the file on disk still holds the previous one. Edit the asset again to retry the write.',
