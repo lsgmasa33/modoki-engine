@@ -139,6 +139,34 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   (the envelope has no timestamp/nonce), so it's safe for the verification harness — tests run
   against `InMemoryBackend` with `resetPlayerPrefsForTest()` in `afterEach`.
 
+## Agent surface
+
+`modoki_player_prefs` (read, `GET /api/player-prefs`) and `modoki_write_player_prefs` (write, `POST
+/api/player-prefs`) expose the store to an agent; `device_player_prefs` / `device_write_player_prefs`
+are the on-device twins. Split in two per `docs/mcp-tool-conventions.md` §7 ("if one argument value
+changes whether it writes to disk, it is more than one tool") — verified in the code: `get`/`keys`/
+`has`/`hasPendingWrite` are pure cache reads with no lazy hydration and no `scheduleFlush`, while
+`set`/`delete`/`clear` all dirty a key and schedule a durable write.
+
+Every reply names its `namespace`, and it must be read, not assumed: the editor deliberately
+hydrates `<gameId>@editor` (`engine/app/editor/setup.ts`) so a playtest save can't reach a shipped
+build's store, so prefs read through the editor are NOT the store a web/native build sees. An
+un-hydrated store REFUSES (`NOT_AVAILABLE_HERE`) rather than answering with an empty key list — the
+cache fills only in `init()`, and before that "no keys" and "nobody looked" are the same empty
+array. It gates writes too, and that half is sharper: a `set()` before `init()` lands in a throwaway
+cache under the `'default'` namespace that `init()` then clears — every signal says success and
+nothing survives.
+
+`set`/`delete` flush before replying, so `saved:true` means the backend accepted the durable write;
+a rejected write (quota, native I/O error) keeps its value in the cache, so a read-back structurally
+cannot see the failure (see `hasPendingWrite` above) — such a write reports PARTIAL, never success.
+`action` is required on the WRITE tool (the read takes only an optional `key`), and
+`action:'clear'` additionally requires `confirm:true` — one rule on both surfaces, and on the device
+the target is a real player's save data on an installed app.
+
+`PlayerPrefs` gained a `namespace()` getter for this (`runtime/storage/playerPrefs.ts`) — a key list
+is meaningless without knowing which store it came from.
+
 ## Related
 
 - [engine-concepts.md](./engine-concepts.md) — service/singleton vocabulary.

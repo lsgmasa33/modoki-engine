@@ -776,7 +776,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
 
   // ── GET /api/diagnose (M→R) ── structured render/scene health report (Phase F). ──
   if (urlPath === '/api/diagnose' && method === 'GET') {
-    try { return json(await ctx.requestBrowser('diagnose', {})); }
+    // `?video=1` opts INTO the downloaded-video cache index (#288 Phase 6). Opt-in because this is
+    // a swept read tool and §6 is summary-first — a per-clip index would grow every caller's
+    // payload to answer a question almost none of them asked.
+    const wantVideo = query.get('video') === '1' || query.get('video') === 'true';
+    try { return json(await ctx.requestBrowser('diagnose', wantVideo ? { video: true } : {})); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
   }
 
@@ -1789,7 +1793,28 @@ async function describeUnresolvedAgainstLiveWorld(
       // Single-path back-compat: a lone non-existent target is still a 404.
       if (resolved.length === 0 && !Array.isArray(paths)) return json({ error: 'File not found' }, 404);
       if (resolved.length > 0) moveToTrash(resolved);
-      return json({ ok: true, trashed: resolved.length, missing });
+      // Rebuild the asset manifest INLINE, like the other asset routes that mint or
+      // retire a path↔GUID mapping already do — /api/reimport, /api/create-asset and
+      // /api/import-file. (NOT duplicate-asset or move-file: both change the mapping
+      // and neither rebuilds, but both are panel-only and the panel calls refresh().
+      // An earlier draft of this comment named duplicate-asset as a sibling that
+      // rebuilds; it does not. Verified by attributing every ctx.rebuildManifest()
+      // call site to its route.) Both backends DO
+      // watch `unlink` and rebuild on their own, but on a 150ms debounce — so a
+      // reply sent now is AHEAD of the state a caller would verify with, and a
+      // /api/scan-assets issued straight after (or a modoki_list_assets in the same
+      // modoki_batch) can still see the asset it was just told was trashed. NOT
+      // resolve-refs — that resolves ENTITY refs and never answers about an asset
+      // guid at all, which is a mistake this comment made once.
+      // A rebuild failure is NOT a delete failure: the trash already happened,
+      // so it downgrades to `manifestRebuilt:false` — which tells the caller to
+      // wait for the debounce — rather than a 500 that would read as
+      // "nothing was deleted" and invite a retry against files already gone.
+      let manifestRebuilt = false;
+      if (resolved.length > 0) {
+        try { ctx.rebuildManifest(); manifestRebuilt = true; } catch { manifestRebuilt = false; }
+      }
+      return json({ ok: true, trashed: resolved.length, missing, manifestRebuilt });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -2857,6 +2882,99 @@ async function describeUnresolvedAgainstLiveWorld(
     }
   }
 
+  // ── POST /api/scene-query {kind, dim, ...} (M→R) ── raycast / shapecast / point-pick against
+  // the live PHYSICS world (#288 gap 1). POST rather than GET despite being a pure read: the
+  // payload is nested vectors, and a GET would mean serializing arrays through query params for
+  // no gain. `capture_viewport` / `render_scene` are the same shape — read tools on POST because
+  // their input is structured, not because they mutate.
+  if (urlPath === '/api/scene-query' && method === 'POST') {
+    try {
+      const result = await ctx.requestBrowser('scene-query', body ?? {});
+      // The op distinguishes "there is no physics world" and "the direction was degenerate" from a
+      // genuine miss, and those refusals must NOT arrive as a 200 the way a miss does — a miss is
+      // `{ok:true, hit:null}`, which is a real answer. `postJson` runs isFailureBody, so
+      // 200-with-{ok:false} already becomes a failed tool call carrying the op's `code`.
+      return json(result);
+    } catch (e) {
+      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
+    }
+  }
+
+  // ── GET /api/creatable-assets (M→R) ── the Assets panel's "New X" registry as it stands in the
+  // OPEN project (#288 gap 5). GET, per the C7 convention: it tells you something.
+  //
+  // Its own route rather than the editor-action relay, and that is the circularity guard in
+  // `liveCoverage.test.ts` doing its job: a tool declaring `mutating:false` while POSTing to
+  // /api/editor-action is flagged, because that combination is exactly how an under-declared write
+  // used to be swept as "safe" AND exempted from the coverage ledger. This op really is a pure
+  // read, so the honest fix is the method, not the declaration.
+  if (urlPath === '/api/creatable-assets' && method === 'GET') {
+    try {
+      const result = await ctx.requestBrowser('list-creatable-assets', {});
+      // `getJson` does NOT run isFailureBody (on a GET, `ok` may be the ANSWER — diagnose,
+      // validate_scene), so a 200 carrying {ok:false} would reach the agent as a successful read
+      // of an empty registry. The op cannot fail today; this matches what the /api/player-prefs
+      // GET sibling does, so the two do not diverge the moment one of them grows a refusal.
+      if (result && typeof result === 'object' && (result as { ok?: unknown }).ok === false) return json(result, 409);
+      return json(result);
+    }
+    catch (e) {
+      const msg = String(e instanceof Error ? e.message : e);
+      return json({ error: msg }, relayFailureStatus(e));
+    }
+  }
+
+  // ── GET /api/player-prefs[?key=] (M→R) ── read the engine's PlayerPrefs store (#288 gap 4).
+  // GET, per the C7 convention: this tells you something, it does not do something. The WRITE half
+  // is a separate op behind POST /api/editor-action (`player-prefs-write`) — one tool, one job
+  // (docs/mcp-tool-conventions.md §7), and it keeps §4's "no mutating operation is reachable by
+  // GET" true by construction rather than by an allowlist check.
+  if (urlPath === '/api/player-prefs' && method === 'GET') {
+    // Inventory the QUERY PARAMS, not just the route and the method (§4): a scan of route methods
+    // was blind to three of the six mutating-GET violators because they mutate via `?action=` /
+    // `?clear=`. Anything but `key` here is refused by name rather than silently ignored, so a
+    // caller reaching for a write through this route learns where the write actually lives.
+    const stray = [...query.keys()].filter((k) => k !== 'key');
+    if (stray.length > 0) {
+      return json({
+        error: `unknown query param(s) on /api/player-prefs: ${stray.join(', ')}. This route READS only; the write half is POST /api/editor-action {action:'player-prefs-write'}.`,
+        code: 'UNKNOWN_PARAM',
+        expected: 'key',
+      }, 400);
+    }
+    const key = query.get('key');
+    try {
+      const result = await ctx.requestBrowser('player-prefs-read', key != null ? { key } : {});
+      // The op's refusal must arrive as a non-2xx: `getJson` does NOT run `isFailureBody` (that is
+      // deliberate — on a GET, `ok` may be the ANSWER, as it is for diagnose/validate_scene), so a
+      // 200 carrying {ok:false} would reach the agent as a successful read of an empty store. That
+      // is exactly the "could not look" → "nothing is there" collapse this op refuses to make.
+      // The body is passed through whole so its `code` survives into the §5 envelope.
+      if (result && typeof result === 'object' && (result as { ok?: unknown }).ok === false) return json(result, 409);
+      return json(result);
+    } catch (e) {
+      const msg = String(e instanceof Error ? e.message : e);
+      return json({ error: msg }, relayFailureStatus(e));
+    }
+  }
+
+  // ── POST /api/player-prefs {action, key?, value?, confirm?} (M→R) ── the WRITE half.
+  // Its OWN route rather than the /api/editor-action relay, and that is not a style choice: the
+  // relay's routing key is literally `action`, and it strips it before relaying — so an op with an
+  // `action` param of its own receives `undefined` and runs the wrong branch while every layer
+  // reports success. Measured on this very op (#288 Phase 2). `editorAction()` now REFUSES that
+  // shape outright; this route is where the op moved to.
+  if (urlPath === '/api/player-prefs' && method === 'POST') {
+    try {
+      const result = await ctx.requestBrowser('player-prefs-write', body ?? {});
+      // 200-with-{ok:false} is fine on a POST — `postJson` runs `isFailureBody` and turns it into a
+      // failed tool call, carrying the op's own `code` (§4's C7 convention). No status mapping here.
+      return json(result);
+    } catch (e) {
+      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
+    }
+  }
+
   // ── POST /api/editor-action {action, ...} (M→R) ── perform one editor action
   // a human can do: selection, gizmo, focus, play/stop/pause/resume/step,
   // undo/redo, scene load/new/save-all, entity create/duplicate/delete/reparent,
@@ -3167,7 +3285,8 @@ function relayFailureStatus(e: unknown): number {
  *  can't invoke arbitrary renderer ops. Keep in sync with registerEditorAgentOps. */
 const EDITOR_ACTIONS = new Set<string>([
   'set-selection', 'set-gizmo', 'set-scene-view-mode', 'set-collider-edit',
-  'open-particle-editor', 'open-sprite-editor', 'open-nine-slice-editor', 'focus-entity',
+  'open-particle-editor', 'open-sprite-editor', 'open-nine-slice-editor',
+  'open-animation-editor', 'focus-entity',
   'play', 'resume', 'stop', 'pause', 'step',
   'undo', 'redo',
   'load-scene', 'new-scene', 'save-all',
@@ -3180,6 +3299,9 @@ const EDITOR_ACTIONS = new Set<string>([
   'dispatch-action', 'clear-journal', 'set-timescale',
   // Phase D (particle/animation first-pass editing).
   'anim-add-key', 'set-playhead', 'particle-set', 'anim-set-clip',
+  // The pose `set-playhead` deliberately does not do (#288 gap 2).
+  'pose-clip', 'exit-pose-envelope',
+  'create-registered-asset',
   'timeline-set', 'timeline-add-clip',
   // Enact Phase 1 (HTML5 drag-and-drop synthesis) — a renderer-DOM op (needs a live
   // DataTransfer), so it rides the browser relay and works in dev AND the DMG.

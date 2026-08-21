@@ -412,6 +412,26 @@ priority (< PHYSICS) so an impulse this frame is integrated by this frame's step
   world units (scaled by `pixelsPerMeter`/`unitsPerMeter`); torque + angular impulse carry length²
   so they scale by that factor squared. Angular velocity is radians/s and is NOT length-scaled.
 
+## Agent surface (scene queries)
+
+`modoki_scene_query` / `device_scene_query` expose all six scene-query exports behind one tool
+(`kind: 'raycast'|'shapecast'|'point'` × `dim: '2d'|'3d'`). The durable fact: the raw functions
+collapse three distinguishable outcomes onto the same `null` — no physics world, a zero-length
+direction, and a genuine miss. That's harmless in game code (the next line is `if (hit)`), but
+through an agent tool it's "could not look" reported as "nothing is there". The tool rules out the
+first two BEFORE casting, so `ok:true` with `hit:null` genuinely means the query ran and found
+nothing. That required a new exported predicate per dimension, `hasPhysics2D`/`hasPhysics3D`
+(`physics2DSystem.ts`/`physics3DSystem.ts`) — nothing exported could previously answer "does a
+Rapier world exist at all." A world exists only once the physics system has ticked, i.e. while the
+sim is Playing; a stopped editor has none, and a scene with no colliders never builds one.
+
+Hits report `guid`/`name` beside the raw `entityId` (runtime ids are reassigned on every scene
+reload). `pointQuery` results are not padded with a zeroed distance/normal — same field, same
+meaning, or absent; a `distance:0` on a raycast means "started inside a collider", a different fact.
+`exclude` takes a guid or an exact name, never a raw id, and is refused outright for
+`kind:'shapecast'` — `castShape` takes no exclusion filter, and accepting-then-ignoring it would
+answer a different question than the one asked (the caster's own body is the likeliest hit).
+
 ## Joints & constraints (2D + 3D)
 
 `Joint2D` / `Joint3D` are **link records**, not bodies — attach one to any entity (typically a

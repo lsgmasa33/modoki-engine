@@ -353,6 +353,36 @@ swapped-away scene is dropped.
   is remembered in `failed` and stays broken until an invalidate/clear (or scene swap). It won't
   self-heal by waiting.
 
+## Agent surface (posing)
+
+`modoki_set_playhead` writes the editor's playhead NUMBER and nothing else — a render taken right
+after shows the unchanged pose. `modoki_pose_clip` is the tool that actually poses the rig;
+`modoki_open_animation_editor` / `modoki_exit_pose_envelope` make it usable and reversible.
+
+**The pose write is SHARED, not re-derived.** It was extracted out of `AnimationEditor.tsx` into
+`engine/packages/modoki/src/editor/animation/poseClip.ts`, and the panel calls it too, so the agent
+path and the human scrub gesture are the same code. That matters because a pose writes authored
+trait values into the live world: the preview envelope's snapshot is what "⏹ Exit Preview" reverts
+to, and its run-mode is what stops a scene save baking the pose into the scene FILE. Re-deriving it
+would have recreated the measured bug (owner, 2026-08-19) where one Cmd+S after a keyframe edit
+silently rewrote a scene file to the clip's t=0 values.
+
+**Exiting is not optional scope.** The envelope pins the run-mode at `scrub`, which is exactly what
+blocks the human's Cmd+S — an agent that posed and never un-posed would wedge the editor.
+`poseClip.ts` publishes `onPoseEnvelopeExited` and `AnimationEditor` subscribes, so an agent-driven
+exit cannot leave the panel's Cmd+S save handler pointed at a closed envelope; that handler's
+`resume()` re-poses, so the human's next save would serialize and then re-pose the world the agent
+had just reverted.
+
+A real limit: POSING needs no Animation panel mounted, but OPENING a clip does — the clip document
+is fetched by the panel's own effect and FlexLayout mounts only the selected tab, so
+`modoki_open_animation_editor` waits for it and refuses with that as the reason rather than
+reporting a clip it has not got.
+
+⚠️ **Verify a pose by PERTURBING** — read a trait back at two different `t` values and assert they
+DIFFER. A single read can coincide with the authored value, and then it cannot tell "posed" from
+"ignored".
+
 ## Related
 
 - [2d-skinning.md](./2d-skinning.md) — **2D sprite skinning** (bones deforming a mesh:

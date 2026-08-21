@@ -243,6 +243,18 @@ function isHydrated(): boolean {
   return hydrated;
 }
 
+/** The namespace these keys live under — the sanitized `init({namespace})`, or `'default'`
+ *  before init.
+ *
+ *  Exposed because a key list is meaningless without it. The same game has SEPARATE stores
+ *  depending on where it runs: a real build uses the game's own namespace, while the editor
+ *  deliberately hydrates `<gameId>@editor` so playtest experiments cannot write into the save a
+ *  shipped build reads (`app/editor/setup.ts`). Anything reporting prefs back to a human or an
+ *  agent has to say WHICH store it looked in, or "the key is not there" is unanswerable. */
+function getNamespace(): string {
+  return namespace;
+}
+
 /**
  * Does this key still have a write the backend has NOT accepted?
  *
@@ -282,6 +294,7 @@ export const PlayerPrefs = {
   clear,
   flush,
   isHydrated,
+  namespace: getNamespace,
   hasPendingWrite,
 } as const;
 

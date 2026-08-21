@@ -1063,7 +1063,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*84 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*93 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -1086,13 +1086,16 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_journal` | GET `/api/journal` | session · **IMPURE READ** (an optional arg destroys state) | editor + renderer | — | *(no args)* |
 | `modoki_list_actions` | GET `/api/game-introspect` | read-only | editor + renderer | — | *(no args)* |
 | `modoki_list_assets` | GET `/api/scan-assets` | read-only | project | — | *(no args)* |
+| `modoki_list_creatable_assets` | GET `/api/creatable-assets` | read-only | editor | — | *(no args)* |
 | `modoki_list_scenes` | GET `/api/scenes` | read-only | project | — | *(no args)* |
 | `modoki_list_traits` | GET `/api/trait-schema` | read-only | editor | — | *(no args)* |
 | `modoki_ota_status` | GET `/api/ota/status` | read-only | project | — | *(no args)* |
+| `modoki_player_prefs` | GET `/api/player-prefs` | read-only | editor | — | *(no args)* |
 | `modoki_read_asset_def` | GET `/api/asset-def` | read-only | editor | asset | `{"path":"/assets/particles/probe.particle.json"}` |
 | `modoki_render_scene` | POST `/api/render-scene` | read-only | editor + renderer + scene | — | *(no args)* |
 | `modoki_render_sequence` | POST `/api/render-sequence` | read-only | editor + renderer + scene | — | *(no args)* |
 | `modoki_resolve_refs` | GET `/api/resolve-refs` | read-only | project | — | `{"refs":["00000000-0000-0000-0000-000000000000"]}` |
+| `modoki_scene_query` | POST `/api/scene-query` | read-only | editor + scene | point | `{"kind":"point","dim":"3d","point":[0,0,0]}` |
 | `modoki_validate_scene` | GET `/api/validate-scene` | read-only | project | asset | `{"path":"/assets/scenes/main.scene.json"}` |
 | `modoki_wait_for_edit` | GET `/api/wait-for-edit` | read-only | editor | — | `{"timeoutMs":50}` |
 
@@ -1101,6 +1104,8 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
 | `modoki_create_entity` | POST `/api/editor-action` `create-entity` | live · undoable | editor + scene | — | `{"kind":"empty"}` |
+| `modoki_create_registered_asset` | POST `/api/editor-action` `create-registered-asset` | file | editor + project | asset | `{"kind":"material","path":"/assets/materials/probe.mat.json"}` |
+| `modoki_delete_asset` | POST `/api/delete-asset` | file | project | asset | `{"paths":["/assets/particles/probe.particle.json"]}` |
 | `modoki_delete_entities` | POST `/api/editor-action` `delete-entities` | live · undoable | editor + scene | entity | *(no args)* |
 | `modoki_discard_asset_edits` | POST `/api/editor-action` `discard-asset-edits` | session | editor | — | `{"all":true}` |
 | `modoki_duplicate_entity` | POST `/api/editor-action` `duplicate-entity` | live · undoable | editor + scene | entity | *(no args)* |
@@ -1109,6 +1114,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_reparent_entity` | POST `/api/editor-action` `reparent-entity` | live · undoable | editor + scene | entity | *(no args)* |
 | `modoki_save_all` | POST `/api/editor-action` `save-all` | file | editor | — | *(no args)* |
 | `modoki_set_transform` | POST `/api/scene-mutate` | live · undoable | editor + scene | entity | `{"entity":{"name":"ContractProbe"},"space":"local","position":[1,2,3]}` |
+| `modoki_write_player_prefs` | POST `/api/player-prefs` | file | editor | — | `{"action":"flush"}` |
 
 #### Asset — read or write an asset definition
 
@@ -1148,6 +1154,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_collider_edit` | POST `/api/editor-action` `set-collider-edit` | session | editor | — | `{"on":true}` |
 | `modoki_dispatch_action` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | — | `{"name":"probe"}` |
 | `modoki_eval` | POST `/api/eval` | no persistence | editor + renderer | — | `{"code":"return 1 + 1;"}` |
+| `modoki_exit_pose_envelope` | POST `/api/editor-action` `exit-pose-envelope` | live | editor + scene | — | *(no args)* |
 | `modoki_focus_entity` | POST `/api/editor-action` `focus-entity` | no persistence | editor + scene | entity | *(no args)* |
 | `modoki_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
 | `modoki_history` | POST `/api/editor-action` *(op = your `action`)* | live | editor | — | `{"action":"undo"}` |
@@ -1156,12 +1163,14 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_load_scene` | POST `/api/editor-action` `load-scene` | live | editor + project | asset | `{"path":"/assets/scenes/main.scene.json"}` |
 | `modoki_menu` | POST `/api/menu` | session | editor + electron | — | *(no args)* |
 | `modoki_new_scene` | POST `/api/editor-action` `new-scene` | live | editor + project | — | *(no args)* |
+| `modoki_open_animation_editor` | POST `/api/editor-action` `open-animation-editor` | session | editor + scene | asset | `{"path":"/assets/animations/probe.anim.json"}` |
 | `modoki_open_nine_slice_editor` | POST `/api/editor-action` `open-nine-slice-editor` | no persistence | editor | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_open_particle_editor` | POST `/api/editor-action` `open-particle-editor` | no persistence | editor | asset | `{"path":"/assets/particles/probe.particle.json"}` |
 | `modoki_open_sprite_editor` | POST `/api/editor-action` `open-sprite-editor` | no persistence | editor | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_persistence` | POST `/api/persistence` | no persistence | editor | — | *(no args)* |
 | `modoki_play_clip` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | entity | `{"guid":"00000000-0000-0000-0000-000000000000","clip":"Idle"}` |
 | `modoki_play_control` | POST `/api/editor-action` *(op = your `action`)* | session | editor | — | `{"action":"stop"}` |
+| `modoki_pose_clip` | POST `/api/editor-action` `pose-clip` | live | editor + scene | — | `{"t":0}` |
 | `modoki_profiler` | GET `/api/profiler` *(both varies)* | session | editor + renderer | — | *(no args)* |
 | `modoki_project_settings` | GET `/api/project-settings` *(method varies)* | file | project | — | `{"action":"get"}` |
 | `modoki_scene_view_mode` | POST `/api/editor-action` `set-scene-view-mode` | session | editor | — | `{"mode":"3d"}` |
@@ -1200,7 +1209,30 @@ existing agent call for a cosmetic win. Read across:
 | what can I dispatch? | `modoki_list_actions` | `device_introspect` |
 | the GAME's own tools | they appear as tools (`court_load_level`) | `device_game_tools` + `device_game_tool_call` — deliberately NOT a dynamic tail; see [agent-tools.md](agent-tools.md) |
 
-**Editor-only BY NATURE, recorded rather than filed as a gap: `modoki_find_references`.** It answers
+**Editor-only BY NATURE, recorded rather than filed as a gap — the §9 ledger.** A capability on one
+surface and not the other is a *finding*: either closed, or written down here with the reason.
+
+| Editor-only tool | Why there is nothing for a device counterpart to do |
+|---|---|
+| `modoki_find_references` | see below |
+| `modoki_delete_asset` | trashes files in the PROJECT CHECKOUT. A device carries a built bundle, not a checkout, and its assets are baked into the app package. |
+| `modoki_create_registered_asset` · `modoki_list_creatable_assets` | the "New X" registry is an EDITOR panel surface writing into the project on disk. Same reason. |
+| `modoki_pose_clip` · `modoki_open_animation_editor` · `modoki_exit_pose_envelope` | all three turn on the editor's **preview envelope** — a snapshot of the authored world that ⏹ Exit reverts to, plus a run-mode that blocks a scene save. A device build has no Animation panel, no envelope, and nothing to revert a pose *to*. |
+
+**Closed rather than recorded (#288 Phase 6):** `device_player_prefs`,
+`device_write_player_prefs` and `device_scene_query` ship alongside their `modoki_*` twins, because
+both ops register in `agentBridge.ts` (runtime) and the device runtime therefore already had them.
+Prefs in particular matter *more* here: on a device the store is a real player's save data,
+namespaced by appId, which is why `action:'clear'` requires `confirm:true` on **both** surfaces —
+one rule, not a device-only precaution.
+
+**Still asymmetric the other way, and it is a real gap rather than a deliberate one:**
+`device_invalidate_assets` exists and there is no `modoki_invalidate_assets`, even though the
+`invalidate-assets` op is registered in `agentBridge.ts` and the editor drives it internally from
+`/api/reimport`. Recorded here so it is not rediscovered as a surprise; it is not part of #288's
+five gaps.
+
+**`modoki_find_references`.** It answers
 "what references this?" by walking the PROJECT ON DISK — the tree-shaker's own forward walk,
 inverted (#284). A device has no project checkout, only a built bundle whose reference graph has
 already been resolved and shaken, so there is nothing on that side for a device counterpart to read.

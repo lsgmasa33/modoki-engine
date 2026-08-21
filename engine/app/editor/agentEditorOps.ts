@@ -42,6 +42,8 @@ import {
   pushAction, makePrefabInstantiateAction, entityRef,
   getEditorViewportCamera, focusEntityInSceneView,
   upsertKey, findTrack, encodeValue,
+  poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
+  getCreatableAssets, createRegisteredAsset,
   readEditorJournal, clearEditorJournal, withEditorActor, openActorLease, closeActorLease,
   waitForEditorJournal,
   getResolvedRender3d,
@@ -1012,6 +1014,77 @@ export function registerEditorAgentOps(): void {
     return readEditorState();
   });
 
+  // Open a .anim.json in the Animation editor and BIND it to an entity, exactly as a
+  // double-click in the Assets panel does (`openAssetInEditor`'s `animation` branch).
+  //
+  // WHY THIS EXISTS (#288 Phase 4): without it `modoki_pose_clip` and `modoki_set_playhead` are
+  // tools that can never be driven. Both need `editingAnimationClip` set, and nothing on the agent
+  // surface could set it — `set-selection {asset}` selects the asset in the Assets panel and does
+  // NOT open its editor (measured). So the clip-authoring loop was reachable only if the human
+  // happened to have opened the clip by hand. This is the one call the panel path already uses,
+  // including its bind-root resolution, rather than a second way of opening a clip.
+  registerAgentOp('open-animation-editor', async (params) => {
+    const p = (params ?? {}) as { path?: string; name?: string };
+    requireAssetPath(p.path, 'animation', 'open-animation-editor');
+    const name = p.name ?? p.path!.split('/').pop()?.replace(/\.anim\.json$/, '') ?? p.path!;
+    useEditorStore.getState().openAnimationEditor({ path: p.path!, type: 'animation', name }, resolveAnimatorRootForClip(p.path!));
+
+    // ⚠️ `openAnimationEditor` sets the open ASSET; it does not load the clip DOCUMENT. That is
+    // done by the Animation panel's own effect, which reconciles a parked unsaved write against a
+    // `fetch` of the file — a path carrying two separately-fixed bugs in its comments, so this op
+    // WAITS for it rather than growing a second copy of it.
+    //
+    // Waiting is also the only way to be honest. Returning as soon as the store's asset field is
+    // set reported `openedClip` + `bound:true` while `editingAnimationClip` was still null, so a
+    // `pose-clip` issued immediately after — the documented next step — failed with "no animation
+    // clip is open". Measured, and it is the readiness lie §0 ranks worst: everything said ready.
+    const deadline = Date.now() + 3000;
+    while (useEditorStore.getState().editingAnimationClip == null && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const st = useEditorStore.getState();
+    const clip = st.editingAnimationClip as { name?: string } | null;
+    // ⚠️ The poll reads a GLOBAL, so a clip appearing is not proof it is OURS. Both the store
+    // fields and the panel's load effect are single-slot: if a human double-clicks a different
+    // clip (or a second call lands) while this one is polling, the other open wins and BOTH
+    // callers see a non-null clip at the same instant. Without this check the call for A returns
+    // ok:true describing B, and a `pose-clip` issued next poses the wrong rig believing it
+    // addressed A. Compare the ASSET path, which is what the caller actually named.
+    const openPath = st.editingAnimationAsset?.path;
+    if (clip && openPath !== p.path) {
+      return {
+        ok: false, code: 'REFUSED_BY_OP', path: p.path, openPath,
+        error: `another clip (${openPath}) was opened while this call was waiting for ${p.path}, so the editor is not showing what was asked for.`,
+        hint: 'Something else re-pointed the Animation editor mid-call — the human double-clicking an asset, or a concurrent agent call. Retry; the editor holds ONE open clip, so two openers cannot both win.',
+      };
+    }
+    if (!clip) {
+      // The realistic cause, and it is worth naming precisely: FlexLayout mounts only the SELECTED
+      // tab, so a docked-but-unselected Animation panel never runs the load effect.
+      return {
+        ok: false, code: 'NOT_AVAILABLE_HERE', path: p.path,
+        error: `the Animation editor was pointed at ${p.path} but no clip document loaded within 3s.`,
+        hint: 'The clip DOCUMENT is fetched by the Animation panel, so that panel has to be mounted '
+          + '— and FlexLayout mounts only the SELECTED tab. Open/select the Animation tab (or check '
+          + 'modoki_get_editor_state.openPanels) and retry. The pose itself needs no panel; only '
+          + 'this load step does.',
+      };
+    }
+    // Report the BIND separately from the open. They fail independently — a clip can load
+    // perfectly and bind to nothing (no entity in the scene carries a matching Animator), and a
+    // caller told only "opened" would then get a NOT_FOUND from pose_clip with no idea why.
+    return {
+      ...readEditorState(),
+      ok: true,
+      openedClip: clip.name ?? name,
+      animatorRootEntityId: st.animatorRootEntityId,
+      bound: st.animatorRootEntityId != null,
+      ...(st.animatorRootEntityId == null
+        ? { hint: 'The clip is open but bound to NO entity, so modoki_pose_clip has nothing to pose. Binding resolves by matching the clip against entities carrying an Animator trait — check one exists in the OPEN scene and lists this clip.' }
+        : {}),
+    };
+  });
+
   registerAgentOp('focus-entity', (params) => {
     // Accept guid (stable) or id; validate it resolves before claiming success. Report whether a
     // SceneView was actually mounted to frame it — the op used to return {ok:true} for a
@@ -1684,6 +1757,154 @@ export function registerEditorAgentOps(): void {
       note: clip
         ? `Playhead moved to ${clamped}s for clip "${clip.name ?? '(unnamed)'}". This does NOT pose the rig — the value moved, the viewport did not. A render/capture taken now shows the UNCHANGED pose.`
         : 'Playhead moved, but NO clip is bound to the Animation/Timeline editor — so this value currently drives nothing at all. Open a clip first (modoki_open_particle_editor / the Animation panel).',
+    };
+  });
+
+  // ── pose-clip (#288 gap 2) — the pose `set-playhead` deliberately does NOT do ──
+  //
+  // Registered HERE and not in agentBridge, correctly under §9: the handler reaches the editor
+  // store for the bound clip/root and the editor's preview envelope. There is no device analogue,
+  // and that absence is deliberate rather than a gap — a device build has no Animation panel, no
+  // preview session, and nothing to revert a pose to.
+  registerAgentOp('pose-clip', async (params) => {
+    const { t } = (params ?? {}) as { t?: number };
+    if (typeof t !== 'number' || !Number.isFinite(t)) {
+      return { ok: false, code: 'REFUSED_BY_OP', error: `pose-clip requires a finite t (seconds); got ${JSON.stringify(t)}` };
+    }
+    const st = useEditorStore.getState();
+    const clip = st.editingAnimationClip as (AnimationClipDef & { name?: string }) | null | undefined;
+    const rootId = st.animatorRootEntityId;
+    // Two DIFFERENT missing preconditions, and collapsing them would send the caller to the wrong
+    // fix — "open a clip" versus "bind it to an entity".
+    if (!clip) {
+      return {
+        ok: false, code: 'NOT_FOUND',
+        error: 'no animation clip is open in the editor, so there is nothing to sample a pose from.',
+        options: ['open a .anim.json (the Animation panel, or the Assets panel) and retry'],
+      };
+    }
+    if (rootId == null) {
+      return {
+        ok: false, code: 'NOT_FOUND', boundClip: clip.name ?? null,
+        error: `the clip "${clip.name ?? '(unnamed)'}" is open but is not BOUND to an entity, so there is nothing to pose.`,
+        options: ['bind it to an entity with an Animator trait (the Animation panel\'s bind picker)'],
+      };
+    }
+    const duration = clip.duration;
+    const clamped = duration != null ? Math.max(0, Math.min(duration, t)) : Math.max(0, t);
+    st.setPlayhead(clamped);
+    // Await it: the session begin serializes the authored world, so a first pose lands a tick
+    // later. Replying before that would report a pose the caller's next read cannot see — and the
+    // natural next call after posing is exactly such a read.
+    const { applied, openedSession } = await poseClipAtTime(clip, rootId, clamped, 'animation');
+    if (applied === 0) {
+      // The pose ran and moved NOTHING. §5: a no-op is a failure when the caller asked for a
+      // change. Reporting ok here would be the false success the whole envelope exists to avoid —
+      // and the likeliest causes are both actionable.
+      return {
+        ok: false, code: 'REFUSED_BY_OP', playhead: clamped, boundClip: clip.name ?? null,
+        // The clamp is reported on the FAILURE path too. The caller asked for a `t` and the
+        // playhead now holds a different number; leaving that unexplained on the one path where
+        // they are already debugging is the worst place to drop it.
+        ...(clamped !== t ? { clampedFrom: t, duration } : {}),
+        error: `the pose applied 0 channels at t=${clamped}s — nothing in the live world moved.`,
+        options: [
+          'the clip may have no tracks that resolve against the bound entity (check the track paths)',
+          'the bound root may have been destroyed by a scene reload — re-bind it',
+        ],
+      };
+    }
+    return {
+      ok: true, posed: true, applied, playhead: clamped, openedSession,
+      boundClip: clip.name ?? null,
+      ...(clamped !== t ? { clampedFrom: t, duration } : {}),
+      saved: false,
+      note: 'The rig is posed INSIDE the preview envelope, so this is revertible (⏹ Exit Preview) '
+        + 'and a scene save cannot bake it. It is NOT an undo-stack entry — Cmd-Z does not reach it.',
+    };
+  });
+
+  // The way OUT of the envelope `pose-clip` opens. Not optional scope: the envelope pins the
+  // run-mode at `scrub`, which is exactly what blocks the human's Cmd+S — so an agent that could
+  // pose and not un-pose would wedge the editor with no way back but the ⏹ button it cannot press.
+  //
+  // ⚠️ IT ALWAYS RESTORES, and there is deliberately no `restore:false`. An earlier cut of this op
+  // exposed one, mirroring `endTimelinePreviewSession`'s parameter. But EVERY human path passes
+  // `restore:true` — verified, all five call sites in AnimationEditor plus all three in
+  // TimelineEditor — so the flag would have handed an agent a capability the editor's own UI has
+  // no way to reach, and the only thing that capability does is BAKE a preview pose into the
+  // authored world. That is the exact damage the envelope exists to prevent, and the damage that
+  // actually cost the owner data (2026-08-19). An agent that genuinely wants those values authored
+  // has the ordinary, undoable route: read them back and write them with modoki_set_transform /
+  // modoki_mutate_scene. Adding a second, weaker way to do a dangerous thing is the §2/§7 failure
+  // this workstream already refused once, for `create_registered_asset {kind:'scene'}`.
+  registerAgentOp('exit-pose-envelope', async () => {
+    const { exited, rebound } = await exitPoseEnvelope(true);
+    if (!exited) {
+      // Ownership-guarded: the session and the run-mode are globals shared with the Timeline
+      // panel, and ending ITS session here would revert its world mid-run. Say which it is rather
+      // than reporting a cheerful no-op.
+      return {
+        ok: false, code: 'NOT_AVAILABLE_HERE',
+        error: 'no ANIMATION preview envelope is open, so there was nothing to exit.',
+        hint: 'Either nothing is posed, or the Timeline panel owns the preview envelope — this op '
+          + 'deliberately will not end that one, because reverting its world mid-run is worse than '
+          + 'refusing.',
+      };
+    }
+    return {
+      ok: true, exited: true, restored: true,
+      ...(rebound != null ? { reboundRootEntityId: rebound } : {}),
+      note: 'Envelope closed and the authored world restored. The run-mode is back to stopped, so a scene save works again.',
+    };
+  });
+
+  // ── creatable assets (#288 gap 5) — the Assets panel's "New X" surface ──
+  //
+  // Two ops, not one mode-switched op. §7 forbids a `list` MODE on a mutating tool; it does not
+  // forbid a SIBLING read, and this surface already has four (list_traits/actions/assets/scenes).
+  // The case for discovery being its own read is stronger than usual here: the registry is
+  // dynamic, game-extensible, and COMES AND GOES WITH THE OPEN PROJECT, so it is precisely what
+  // an agent cannot know a priori — and discovery-by-refusal would mean the only way to learn the
+  // kinds is to deliberately issue a failing mutating call.
+  registerAgentOp('list-creatable-assets', () => {
+    const defs = getCreatableAssets();
+    return {
+      ok: true,
+      totalCount: defs.length,
+      kinds: defs.map((d) => ({
+        kind: d.id,
+        label: d.label,
+        ext: d.ext,
+        assetType: d.assetType,
+        defaultFolder: d.defaultFolder ?? null,
+        // Say WHICH ones the create op refuses, here, rather than only in the refusal. A caller
+        // planning a batch needs to know before it runs, not after a step fails.
+        agentCreatable: !d.create,
+        ...(d.create ? { refusedBecause: 'a full create OVERRIDE that runs editor code (for scene: it DISCARDS the live world). Use modoki_new_scene, or the Assets panel.' } : {}),
+      })),
+    };
+  });
+
+  registerAgentOp('create-registered-asset', async (params) => {
+    const p = (params ?? {}) as { kind?: string; path?: string };
+    if (!p.kind || typeof p.kind !== 'string') {
+      return { ok: false, code: 'REFUSED_BY_OP', error: 'create-registered-asset requires { kind, path }', options: getCreatableAssets().map((d) => d.id) };
+    }
+    if (!p.path || typeof p.path !== 'string') {
+      return { ok: false, code: 'REFUSED_BY_OP', error: 'create-registered-asset requires a `path` (an asset-root URL, e.g. /assets/materials/new.mat.json). This op deliberately takes an explicit path instead of opening the native save dialog, which is a BLOCKING osascript panel on macOS.' };
+    }
+    const r = await createRegisteredAsset(p.kind, p.path);
+    if (!r.ok) return r;
+    // Run the def's own post-create hook, exactly as the panel does — it is what opens the new
+    // asset in its editor / selects it. Skipping it would make the agent path quietly different
+    // from the human one, which is the divergence sharing `createRegisteredAsset` exists to avoid.
+    try { r.def.onCreated?.({ path: r.path, name: r.name, guid: r.guid }); }
+    catch (e) { console.debug('[create-registered-asset] onCreated hook failed', e); }
+    return {
+      ok: true, saved: true, kind: p.kind, path: r.path, name: r.name, guid: r.guid,
+      manifestRebuilt: r.manifestRebuilt,
+      note: 'The file is written and its GUID registered. Verify with modoki_list_assets (filter by name) — the backend manifest is rebuilt BEFORE this reply, so a check issued straight after sees it. NOT modoki_resolve_refs, which resolves ENTITY refs and never answers about an asset guid.',
     };
   });
 

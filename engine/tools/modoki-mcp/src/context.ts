@@ -388,11 +388,35 @@ export function createToolContext(config: { backend: string; token?: string }): 
    *  rest of the body. Editor actions can touch scenes/resources, so allow generous
    *  time. */
   async function editorAction(action: string, params: Record<string, unknown> = {}, timeoutMs = 65_000): Promise<ToolResult> {
-    // `action` LAST, so a params key of the same name can never clobber the routing key. It did:
-    // `modoki_prefab` spread its own args (which include `action: 'instantiate'`) over this, so every
-    // prefab call sent 'instantiate' as the OP NAME and came back as a 400 listing the valid ops.
-    // The route also strips `action` before relaying, so a param by that name is unreachable through
-    // it regardless — a tool needing one must pick another name (see `prefabAction`).
+    // `action` is the ROUTING key of this relay, and the route strips it before relaying — so a
+    // param of the same name is UNREACHABLE through here, whichever way the spread is ordered.
+    //
+    // This has now caught two tools. `modoki_prefab` spread its own args (which include
+    // `action:'instantiate'`) over the routing key, so every prefab call sent 'instantiate' as the
+    // OP NAME and came back as a 400 listing the valid ops — loud, and fixed by renaming the param
+    // to `prefabAction`. The comment left behind ("a tool needing one must pick another name") was
+    // a convention with nothing enforcing it, and `modoki_write_player_prefs` walked into the
+    // OTHER, quieter half of the same trap: putting `action` LAST protects the routing key, and by
+    // doing so it silently DROPS the tool's own param. The op then ran with `action: undefined`.
+    // Caught live (#288 Phase 2); T1/T2 could not see it, because the request the tool built was
+    // exactly the request the contract declared.
+    //
+    // So: refuse, rather than document. A dropped argument is a call that does something other
+    // than what was asked and reports it as fine — §0's rank-1 false success. A tool that genuinely
+    // needs an `action` param belongs on its OWN route (see `/api/player-prefs`), not here.
+    if (Object.prototype.hasOwnProperty.call(params, 'action')) {
+      return fail({
+        code: 'REFUSED_BY_OP',
+        what: `run the editor action "${action}"`,
+        why: '`action` is this relay\'s routing key and is stripped before the op sees it, so a param '
+          + 'of that name is silently dropped rather than delivered. This is a TOOL DEFECT, not a caller mistake.',
+        got: { action: params.action },
+        options: [
+          'rename the tool\'s param (modoki_prefab uses `prefabAction`)',
+          'or give the tool its own POST route instead of the /api/editor-action relay',
+        ],
+      });
+    }
     return postJson('/api/editor-action', { ...params, action }, timeoutMs, `run the editor action "${action}"`);
   }
 

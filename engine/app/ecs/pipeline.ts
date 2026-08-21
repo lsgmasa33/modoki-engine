@@ -7,7 +7,7 @@ import {
   physics2DSystem, physics3DSystem, zone2DSystem, zone3DSystem, inputSystem, characterInputSystem, characterInput3DSystem, characterAnimationSystem, uiFocusSystem, hapticsSystem, skin2DSystem, audioSystem, setAudioWorldPositionResolver, materialInstanceSystem, SYSTEM_PRIORITY,
   videoSystem, setVideoUrlResolver, resolveVideoUrl,
   setVideoSourceResolver, setVideoDownloader, resolveVideoSource,
-  VideoCache, CacheApiBackend, hasCacheStorage,
+  VideoCache, CacheApiBackend, hasCacheStorage, setActiveVideoCache,
 } from '@modoki/engine/runtime';
 import { transformPropagationSystem, worldTransforms } from '@modoki/engine/runtime';
 
@@ -114,6 +114,7 @@ if (__MODOKI_MODULE_VIDEO__) {
     void videoCache.reconcile();
     setVideoDownloader((key, url, onProgress) =>
       videoCache.fetchAndStore(key, url, onProgress && ((p) => onProgress(p.receivedBytes, p.totalBytes))));
+    setActiveVideoCache(videoCache);
   }
   registerSystem('video', videoSystem, SYSTEM_PRIORITY.AUDIO);
 }

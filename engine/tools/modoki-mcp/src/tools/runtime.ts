@@ -156,6 +156,112 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
     async ({ scale }) => editorAction('set-timescale', { scale }),
   );
 
+  // ── scene queries (#288 gap 1) ──
+  tool(
+    'modoki_scene_query',
+    'Cast a ray, sweep a sphere/circle, or pick a point against the LIVE PHYSICS world — the ' +
+      '"what is over there / would this fit / what is under this point" question, answered as ' +
+      'DATA instead of from a screenshot. All six engine queries (raycast/shapecast/point, in 2D ' +
+      'and 3D) behind one tool; every one is a pure read that writes nothing.\n\n' +
+      'REQUIRES A RUNNING SIM. A Rapier world is built by the physics system on its first tick and ' +
+      'freed on Stop, so a STOPPED editor has none and every query REFUSES with ' +
+      'NOT_AVAILABLE_HERE — deliberately, because answering "nothing was hit" there would say the ' +
+      'ray passed through empty space. Call modoki_play_control action:"play" first.\n\n' +
+      'A MISS AND A REFUSAL ARE DIFFERENT ANSWERS, which the engine functions themselves cannot ' +
+      'express — they return the same null for a clean miss, an absent physics world, and a ' +
+      'zero-length direction. This tool rules the last two out BEFORE casting, so `ok:true` with ' +
+      '`hit:null` genuinely means the query ran and found nothing.\n\n' +
+      'Every hit reports `guid` and `name` alongside `entityId`. Use the GUID: runtime ids are ' +
+      'reassigned on every scene reload, and a mutate triggers one. `entityId:-1` with a null guid ' +
+      'means a collider with no ECS owner.\n\n' +
+      'The coordinates here are a MEASUREMENT, not an aim — this is the one place raw numbers are ' +
+      'the input, the same carve-out modoki_capture_gesture has.',
+    {
+      kind: z.enum(['raycast', 'shapecast', 'point'])
+        .describe("REQUIRED. raycast: first collider along a ray. shapecast: same but sweeping a sphere/circle of `radius` — the \"would this fit\" query. point: which collider CONTAINS a point (the pick/hit-test)."),
+      dim: z.enum(['2d', '3d'])
+        .describe("REQUIRED. Which physics world to query. They are separate worlds — a 2d query never sees 3d colliders, and asking for a dimension the scene has no world for REFUSES rather than reporting a miss."),
+      origin: z.array(z.number()).optional()
+        .describe('Ray/sweep start, in ECS world coords. [x,y] for dim:2d, [x,y,z] for dim:3d. Required for raycast/shapecast.'),
+      direction: z.array(z.number()).optional()
+        .describe('Ray/sweep direction, same arity as origin. Need NOT be normalized, but must be non-zero — a zero vector describes no ray and is refused rather than reported as a miss. Required for raycast/shapecast.'),
+      point: z.array(z.number()).optional()
+        .describe('The point to test containment at, same arity as origin. Required for kind:point.'),
+      radius: z.number().optional()
+        .describe('Sphere/circle radius in world units. Required for kind:shapecast, and must be > 0.'),
+      maxDistance: z.number().optional()
+        .describe('Cap the cast length in world units. Default: unbounded (Infinity), matching the engine functions.'),
+      solid: z.boolean().optional()
+        .describe('raycast only. Default true (the engine default): a ray starting INSIDE a collider hits it at distance 0. Pass false to ignore the collider you start inside.'),
+      exclude: z.string().optional()
+        .describe("raycast only — a guid or an exact entity NAME (never a raw id) whose body is never reported as a hit. The self-hit case: a ground probe from a character's own position. An ambiguous name is REFUSED, not first-matched. Refused outright for kind:shapecast, whose engine function takes no exclusion filter — rather than accepted and silently ignored."),
+      precision: z.number().optional()
+        .describe('Significant digits for the returned floats. Default 9 — verify a position with a TOLERANCE, never ===.'),
+    },
+    async (args) => postJson('/api/scene-query', args, undefined, `${args.dim} ${args.kind} scene query`),
+  );
+
+  // ── PlayerPrefs (#288 gap 4) — split read/write per §7 ──
+  tool(
+    'modoki_player_prefs',
+    'READ the engine\'s PlayerPrefs store — the durable per-key JSON save data a game writes ' +
+      '(progress, settings, unlocks). Until now this was reachable only through modoki_eval + a ' +
+      'dynamic import.\n\n' +
+      'NOT modoki_persistence, which is the EDITOR\'s scene/asset save mode and is unrelated — ' +
+      'that name collision is the confusion this description exists to stop.\n\n' +
+      'CALLED BARE it returns the KEY INDEX (`keys`, `totalCount`) plus `pendingWrites`; pass ' +
+      '`key` to get that key\'s `value`. Every reply names the `namespace` it read, and you should ' +
+      'check it: the same game has SEPARATE stores depending on where it runs. The editor ' +
+      'deliberately hydrates `<gameId>@editor` so playtest saves cannot reach a shipped build\'s ' +
+      'store, so prefs read here are NOT the ones a web/native build sees.\n\n' +
+      'An un-hydrated store REFUSES (NOT_AVAILABLE_HERE) instead of answering with an empty list. ' +
+      'The cache is filled only by PlayerPrefs.init(), which runs during editor boot once a ' +
+      'project is open — before that, "no keys" and "nobody looked" are the same empty array, and ' +
+      'reporting the second as the first is not recoverable.\n\n' +
+      'THIS IS A PURE READ — it hydrates nothing and schedules no write. Use ' +
+      'modoki_write_player_prefs to change anything.',
+    {
+      key: z.string().optional()
+        .describe('Read ONE key\'s value instead of the index. An absent key is an ANSWER (`present:false`), not an error — it also returns `keys` so a typo is obvious. `present` is explicit because a key holding JSON null is indistinguishable from a missing one otherwise.'),
+    },
+    async ({ key }) => getJson(`/api/player-prefs${key !== undefined ? `?key=${encodeURIComponent(key)}` : ''}`),
+  );
+  tool(
+    'modoki_write_player_prefs',
+    'WRITE the engine\'s PlayerPrefs store. The mutating twin of modoki_player_prefs, which is ' +
+      'the read that VERIFIES anything done here.\n\n' +
+      'Named `write` rather than `set` on purpose: three of its four actions are not a set, and ' +
+      '`clear` wipes the whole namespace — a name that lies for most of its range costs an agent a ' +
+      'wrong guess.\n\n' +
+      'NOT UNDOABLE — a human\'s Cmd-Z does not reach it, because this is not scene data. ' +
+      '`clear` therefore additionally requires confirm:true. Take that seriously on the device ' +
+      'surface (device_write_player_prefs), where the target is a real installed app holding a ' +
+      'real player\'s save data.\n\n' +
+      '`set` and `delete` FLUSH before replying, so `saved:true` means the backend accepted the ' +
+      'durable write — not merely that the in-memory cache changed. That distinction is real: a ' +
+      'rejected write (quota, a native I/O error) keeps its value in the cache, so a read-back ' +
+      'still shows it while nothing survives a restart. Such a write is reported as PARTIAL, never ' +
+      'as success.\n\n' +
+      'An un-hydrated store refuses every action, writes included: a set before PlayerPrefs.init() ' +
+      'lands in a throwaway in-memory cache that init() then CLEARS.',
+    {
+      action: z.enum(['set', 'delete', 'clear', 'flush'])
+        .describe('REQUIRED. set = write one key (needs key + value). delete = remove one key (needs key; a key that is not there is REFUSED with the real key list, not a silent no-op). clear = remove EVERY key in the namespace (needs confirm:true). flush = force pending debounced writes out and report any the backend rejected.'),
+      key: z.string().optional().describe('The key, for action set/delete. Ignored by clear/flush.'),
+      value: z.any().optional().describe('The JSON document to store, for action:"set". Any JSON value including null. Omitting it is REFUSED rather than treated as a delete — PlayerPrefs reads undefined as a delete, and that is a different operation here.'),
+      confirm: z.boolean().optional().describe('Required (true) for action:"clear" only — it removes every key in the namespace and is not undoable. The refusal lists the keys it would have removed.'),
+    },
+    // Its OWN route, not the /api/editor-action relay: that relay's routing key is `action`, so a
+    // tool with an `action` param has it silently dropped (measured — the op then ran with
+    // `action: undefined`). editorAction() refuses that shape now; this is where the op lives.
+    async ({ action, key, value, confirm }) => postJson('/api/player-prefs', {
+      action,
+      ...(key !== undefined ? { key } : {}),
+      ...(value !== undefined ? { value } : {}),
+      ...(confirm !== undefined ? { confirm } : {}),
+    }, undefined, `player prefs: ${action}`),
+  );
+
   // ── Phase F: render/scene health diagnose ──
   tool(
     'modoki_diagnose',
@@ -167,9 +273,17 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'inside `errorWindowMs` (the ones that gate `ok`, so a fixed error stops failing the verdict). ' +
       'Everything older is COUNTED in `olderErrors {count, oldestTs, newestTs}` — read those with ' +
       'modoki_get_console_logs level=error. So an empty `consoleErrors` means "none recently", and ' +
-      'the summary never claims "No issues detected" while older errors exist.',
-    {},
-    async () => getJson('/api/diagnose'),
+      'the summary never claims "No issues detected" while older errors exist.\n\n' +
+      'Pass video:true to ALSO get the downloaded-video cache index (used/budget bytes + per-clip ' +
+      'entries). Opt-in because it answers a question most callers did not ask. When no cache is ' +
+      'wired the reply says WHY — the video module compiled out (a playable-ad build) versus no ' +
+      'Cache API (clips STREAM instead) — rather than reporting an empty cache, which those two ' +
+      'are not.',
+    {
+      video: z.boolean().optional()
+        .describe('Include the downloaded-video cache index. Default false. This is the only surface that can read it: the singleton lives behind the __MODOKI_MODULE_VIDEO__ flag, and reaching it through modoki_eval + an /@fs import yields a SECOND module instance whose slot is null — i.e. a confident "no cache" for a live one.'),
+    },
+    async ({ video }) => getJson(`/api/diagnose${video ? '?video=1' : ''}`),
   );
 
   // ── Profiler (#166 P6) — the editor half of a gap that existed on BOTH surfaces ──

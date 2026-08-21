@@ -410,6 +410,23 @@ requirement rather than a size decision: every `ffmpeg-static` build is `--enabl
 darwin-arm64 build is additionally `--enable-nonfree`, which is not redistributable under any
 licence. Compliance depends on the binary being provisioned onto the user's own machine.
 
+## Agent surface (cache introspection)
+
+The downloaded-video cache is readable through `modoki_diagnose` with `video:true` (opt-in) —
+usedBytes/budgetBytes/count plus per-clip entries. Opt-in because `diagnose` is a swept read tool
+whose response budget is summary-first; a per-clip index would grow every caller's payload to
+answer a question almost none of them asked. Before this the `VideoCache` singleton was a local
+`const` inside the `__MODOKI_MODULE_VIDEO__`-gated block in `engine/app/ecs/pipeline.ts` and was
+never exported, so cache state couldn't be observed at all — a QA case had to patch `window.fetch`
+to infer a refetch, which measures the network rather than the cache and can't distinguish a cache
+MISS from a cache never wired up. An accessor alone wasn't enough either: `modoki_eval` runs in the
+renderer and could import the pipeline through `/@fs`, but that yields a second module instance
+whose slot is null — a confident "no cache" for a live one. It's reached instead through a one-slot
+registry, `engine/packages/modoki/src/runtime/video/videoCacheSlot.ts`, typed structurally so no
+video code is pulled into builds that compile video out. `available:false` carries a REASON, since
+the two causes want opposite next moves — the video module compiled out (a playable-ad build) versus
+no Cache API (clips stream instead of caching) — and neither means "the cache is empty".
+
 ## Related
 
 - [textures.md](./textures.md) — the import-settings/variant/content-cache pattern video mirrors

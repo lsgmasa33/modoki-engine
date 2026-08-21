@@ -576,13 +576,13 @@ export {
 } from './animation/deform2DBuffers';
 export { applyClipDeform } from './animation/deform2DSystem';
 export {
-  physics2DSystem, raycast2D, shapeCast2D, pointQuery2D, disposePhysics2D, disposeAllPhysics2D,
+  physics2DSystem, raycast2D, shapeCast2D, pointQuery2D, hasPhysics2D, disposePhysics2D, disposeAllPhysics2D,
   applyImpulse2D, applyTorqueImpulse2D, addForce2D, addTorque2D,
   setLinvel2D, setAngvel2D, resetForces2D, wakeBody2D,
 } from './physics/physics2DSystem';
 export { initRapier2D, isRapierReady } from './physics/rapierLoader';
 export {
-  physics3DSystem, raycast3D, shapeCast3D, pointQuery3D, disposePhysics3D, disposeAllPhysics3D,
+  physics3DSystem, raycast3D, shapeCast3D, pointQuery3D, hasPhysics3D, disposePhysics3D, disposeAllPhysics3D,
   applyImpulse3D, applyTorqueImpulse3D, addForce3D, addTorque3D,
   setLinvel3D, setAngvel3D, setBodyTranslation3D, resetForces3D, wakeBody3D,
 } from './physics/physics3DSystem';
@@ -627,6 +627,9 @@ export {
   VideoCache, CacheApiBackend, hasCacheStorage,
   type CacheBackend, type VideoCacheOptions, type DownloadProgress,
 } from './video/videoCache';
+// The one-slot registry for the LIVE cache, so `diagnose` can introspect it without importing the
+// app pipeline that builds it (#288 Phase 6). Structural type — no video code is pulled in.
+export { setActiveVideoCache, getActiveVideoCache, type ActiveVideoCache } from './video/videoCacheSlot';
 export {
   planAdmission, explainRefusal, totalBytes as videoCacheTotalBytes,
   type CacheEntry, type AdmissionResult,

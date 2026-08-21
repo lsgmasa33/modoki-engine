@@ -892,6 +892,87 @@ export function registerTools(server: McpServer) {
     async () => perceptCall('device_introspect', 'game-introspect'),
   );
 
+  // ── PlayerPrefs + scene queries (#288 Phase 6) ──────────────────────────────
+  //
+  // §9 makes this parity a FINDING, not optional scope: both ops register in `agentBridge.ts`
+  // (runtime), so the device runtime already has them — shipping no `device_*` tools would leave
+  // exactly the asymmetry that rule names. And prefs matter MORE here than in the editor: on a
+  // device the store is a real player's save data, namespaced by appId, not a playtest fixture.
+  tool('device_player_prefs',
+    'READ the game\'s PlayerPrefs store on the connected device — the durable per-key JSON save ' +
+      'data (progress, settings, unlocks) as the INSTALLED app actually holds it.\n\n' +
+      'CALLED BARE it returns the key INDEX plus `pendingWrites`; pass `key` for that key\'s ' +
+      'value. Every reply names its `namespace` — on a device that is the game\'s own (typically ' +
+      'the appId), NOT the editor\'s `<gameId>@editor` sandbox, so this is the only place you can ' +
+      'read what a player would see.\n\n' +
+      'An un-hydrated store REFUSES (NOT_AVAILABLE_HERE) rather than answering with an empty list: ' +
+      'the cache is filled only by PlayerPrefs.init() during boot, and before that "no keys" and ' +
+      '"nobody looked" are the same empty array. THIS IS A PURE READ — use ' +
+      'device_write_player_prefs to change anything.',
+    {
+      key: z.string().optional().describe("Read ONE key's value instead of the index. An absent key is an ANSWER (`present:false`), not an error — `present` is explicit because a key holding JSON null is otherwise indistinguishable from a missing one."),
+    },
+    async (args) => perceptCall('device_player_prefs', 'player-prefs-read',
+      Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
+      "read the game's PlayerPrefs store on the device"),
+  );
+
+  tool('device_write_player_prefs',
+    'WRITE the game\'s PlayerPrefs store on the connected device. device_player_prefs is the read ' +
+      'that VERIFIES anything done here.\n\n' +
+      '⚠️ THIS IS A REAL PLAYER\'S SAVE DATA. Not a fixture, not undoable, and not journaled as a ' +
+      'scene edit — the target is an INSTALLED app on a phone somebody uses. `action:"clear"` ' +
+      'wipes the whole namespace and therefore additionally requires confirm:true; a required ' +
+      '`action` stops a typo becoming a destructive default, but only the acknowledgement stops a ' +
+      'deliberate clear aimed at the wrong lease. Check device_status first if you are unsure ' +
+      'which phone you hold.\n\n' +
+      '`set` and `delete` FLUSH before replying, so `saved:true` means the backend accepted the ' +
+      'durable write rather than merely that the in-memory cache changed — a rejected write keeps ' +
+      'its value in the cache, so a read-back still shows it while nothing survives a restart. ' +
+      'Such a write is reported PARTIAL, never as success.',
+    {
+      action: z.enum(['set', 'delete', 'clear', 'flush'])
+        .describe('REQUIRED. set = write one key (needs key + value). delete = remove one key (needs key; a key that is not there is REFUSED with the real key list, not a silent no-op). clear = remove EVERY key in the namespace (needs confirm:true). flush = force pending debounced writes out and report any the backend rejected.'),
+      key: z.string().optional().describe('The key, for action set/delete. Ignored by clear/flush.'),
+      value: z.any().optional().describe('The JSON document to store, for action:"set". Any JSON value including null. Omitting it is REFUSED rather than treated as a delete.'),
+      confirm: z.boolean().optional().describe('Required (true) for action:"clear" only — it removes every key in the namespace, on a real installed app, and is not undoable. The refusal lists the keys it would have removed.'),
+    },
+    async (args) => perceptCall('device_write_player_prefs', 'player-prefs-write',
+      Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
+      "write the game's PlayerPrefs store on the device"),
+  );
+
+  tool('device_scene_query',
+    'Cast a ray, sweep a sphere/circle, or pick a point against the LIVE PHYSICS world on the ' +
+      'device — "what is over there / would this fit / what is under this point", answered as DATA ' +
+      'instead of from a screenshot. All six engine queries (raycast/shapecast/point, 2D and 3D) ' +
+      'behind one tool; every one is a pure read.\n\n' +
+      'A MISS AND A REFUSAL ARE DIFFERENT ANSWERS. The engine functions return the same null for a ' +
+      'clean miss, an absent physics world, and a zero-length direction; the last two are ruled out ' +
+      'BEFORE casting, so `ok:true` with `hit:null` genuinely means the query ran and found ' +
+      'nothing. A scene with no colliders has no Rapier world at all and REFUSES.\n\n' +
+      'Every hit reports `guid` and `name` beside `entityId` — use the GUID, since runtime ids are ' +
+      'reassigned on every scene reload. `entityId:-1` with a null guid means a collider with no ' +
+      'ECS owner.',
+    {
+      kind: z.enum(['raycast', 'shapecast', 'point'])
+        .describe('REQUIRED. raycast: first collider along a ray. shapecast: same but sweeping a sphere/circle of `radius`. point: which collider CONTAINS a point.'),
+      dim: z.enum(['2d', '3d'])
+        .describe('REQUIRED. Which physics world to query — they are separate, and asking for a dimension the scene has no world for REFUSES rather than reporting a miss.'),
+      origin: z.array(z.number()).optional().describe('Ray/sweep start in ECS world coords. [x,y] for dim:2d, [x,y,z] for dim:3d. Required for raycast/shapecast.'),
+      direction: z.array(z.number()).optional().describe('Ray/sweep direction, same arity as origin. Need NOT be normalized, but must be non-zero — a zero vector is refused rather than reported as a miss. Required for raycast/shapecast.'),
+      point: z.array(z.number()).optional().describe('The point to test containment at, same arity as origin. Required for kind:point.'),
+      radius: z.number().optional().describe('Sphere/circle radius in world units. Required for kind:shapecast, and must be > 0.'),
+      maxDistance: z.number().optional().describe('Cap the cast length in world units. Default: unbounded, matching the engine functions.'),
+      solid: z.boolean().optional().describe('raycast only. Default true: a ray starting INSIDE a collider hits it at distance 0. Pass false to ignore the collider you start inside.'),
+      exclude: z.string().optional().describe("raycast only — a guid or exact entity NAME (never a raw id) whose body is never reported as a hit. An ambiguous name is REFUSED. Refused outright for kind:shapecast, whose engine function takes no exclusion filter."),
+      precision: z.number().optional().describe('Significant digits for the returned floats. Default 9 — verify a position with a TOLERANCE, never ===.'),
+    },
+    async (args) => perceptCall('device_scene_query', 'scene-query',
+      Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
+      'run a physics scene query on the device'),
+  );
+
   // ── Game-registered tools (#286) ────────────────────────────────────────────
   //
   // The GAME's own tools, reached over the lease. Two STATIC relays, deliberately — not the

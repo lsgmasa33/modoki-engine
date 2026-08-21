@@ -78,6 +78,12 @@ import {
   findEntityByGuid,
   getCachedPrefab,
   getAllAssets,
+  PlayerPrefs,
+  type JsonValue,
+  raycast2D, shapeCast2D, pointQuery2D, hasPhysics2D,
+  raycast3D, shapeCast3D, pointQuery3D, hasPhysics3D,
+  findEntityById,
+  EntityAttributes,
   makeAssetRefResolver,
   getParticleEffect,
   getAnimationClip,
@@ -116,7 +122,14 @@ import {
 import { startWatch, readWatch, listWatches, clearWatch, type StartWatchParams } from './watch';
 // Percept S3: resolved world transforms + hierarchy-deactivation set, both computed
 // each frame by transformPropagationSystem. Same module instance the renderers read.
-import { worldTransforms, deactivatedEntities } from '@modoki/engine/runtime';
+import {
+  worldTransforms, deactivatedEntities,
+  // The LIVE downloaded-video cache, read through a one-slot registry rather than by importing
+  // `app/ecs/pipeline` (which builds it): that import drags the whole pipeline — registerSystem
+  // calls and all — into every module that imports this one, and it broke five headless tests
+  // on the first attempt. See videoCacheSlot.ts.
+  getActiveVideoCache,
+} from '@modoki/engine/runtime';
 
 /** Minimal transport the bridge needs — implemented over the Electron preload
  *  IPC channel (window.__modokiElectron.bridge) under Electron. */
@@ -917,11 +930,50 @@ registerAgentOp('input-deliverability', () => ({
 // everything older as `olderErrors` and names the window as `errorWindowMs`, so widening it trades
 // "how long a fixed error keeps failing ok" against nothing — the older ones are visible either way.
 const DIAGNOSE_ERROR_WINDOW_MS = 300_000;
-registerAgentOp('diagnose', () => computeDiagnostics({
-  consoleErrors: dumpConsoleLogs({ level: 'error' }).logs,
-  now: Date.now(),
-  errorWindowMs: DIAGNOSE_ERROR_WINDOW_MS,
-}));
+registerAgentOp('diagnose', (params) => {
+  const p = (params ?? {}) as { video?: boolean };
+  const base = computeDiagnostics({
+    consoleErrors: dumpConsoleLogs({ level: 'error' }).logs,
+    now: Date.now(),
+    errorWindowMs: DIAGNOSE_ERROR_WINDOW_MS,
+  });
+  if (!p.video) return base;
+  // ── The downloaded-video cache, behind an OPT-IN filter (#288 Phase 6) ──
+  //
+  // Behind a filter rather than added unconditionally because `diagnose` is a SWEPT read tool and
+  // §6 is summary-first: a per-clip index would grow every caller's payload to answer a question
+  // almost none of them asked.
+  //
+  // It needs a surface at all because the accessor alone is not reachable. `modoki_eval` runs in
+  // the renderer and could import `pipeline.ts` through `/@fs` — but that yields a SECOND module
+  // instance whose slot is null, so it would report "no cache" for a perfectly live one. Before
+  // this, QA-VIDEO-0002 patched `window.fetch` to infer a refetch, which measures the network
+  // rather than the cache and cannot tell a MISS from a cache that was never wired.
+  //
+  // `available:false` carries WHY, because the two causes want opposite next moves: the video
+  // module compiled out (a playable-ad build) versus no Cache API (video streams, uncached).
+  const cache = getActiveVideoCache();
+  if (!cache) {
+    return {
+      ...base,
+      video: {
+        available: false,
+        reason: 'no downloaded-video cache is wired on this surface — either the __MODOKI_MODULE_VIDEO__ module flag is off (video compiled out, e.g. a playable-ad build) or the Cache API is unavailable, in which case `download` clips STREAM instead. This is NOT "the cache is empty".',
+      },
+    };
+  }
+  const entries = cache.entries();
+  return {
+    ...base,
+    video: {
+      available: true,
+      usedBytes: cache.usedBytes(),
+      budgetBytes: cache.budgetBytes(),
+      count: entries.length,
+      entries,
+    },
+  };
+});
 
 // ── profiler (profiler plan P4/P6) ────────────────────────────────────────────────────────
 // The capture was HUMAN-ONLY until this: the Profiler panel has a Record button and an agent
@@ -1198,6 +1250,344 @@ registerAgentOp('hit-regions', (raw: unknown) => {
   return roundFloats(result, resolvePrecision(p.precision));
 });
 
+
+// ── Scene queries (#288 gap 1) — raycast / shapecast / point-pick against the PHYSICS world.
+//
+// All six exported query functions were unreachable from any tool, and `modoki_eval` could not
+// substitute: `makeEvalApi()` builds its object from `listAgentOps()`, so eval adds composition
+// and zero capability (§9), and there was no /api route for its `api()` escape hatch to reach
+// either. QA-PHYS-0004 substituted the `contacts:true` enricher on get_scene_state.
+//
+// SIX, not the four #288 lists: `shapeCast2D` and `pointQuery2D` are exported and barrel-exposed
+// too, and shipping 3D-has-three / 2D-has-one would be an arbitrary asymmetry.
+//
+// ONE tool is §7-legal here: no argument changes the method, the route, or whether anything is
+// written — every kind is a pure read. This is the `play_control` shape, where the op varies and
+// the job does not.
+//
+// ⚠️ THE REFUSAL TAXONOMY IS THE SUBSTANCE OF THIS OP. Every underlying function collapses three
+// distinguishable outcomes onto the same `null` — no physics world, a zero-length direction, and
+// a genuine miss. In game code that is harmless (the next line is `if (hit)`); through a tool it
+// is §0's rank-2 failure, "could not look" reported authoritatively as "nothing is there". So the
+// causes it CAN rule out are ruled out BEFORE the call, and only what is left is reported as a
+// miss.
+type QueryKind = 'raycast' | 'shapecast' | 'point';
+
+/** Resolve a raw runtime entity id to the address an agent is allowed to hold onto.
+ *
+ *  The query functions return a bare `entityId`, and §3 forbids handing that back as an
+ *  address — runtime ids are reassigned on every scene reload, and a mutate triggers one. The
+ *  guid is the only address that always works, so it rides along with every hit. `-1` is the
+ *  functions' own "hit a collider with no ECS owner" sentinel and is passed through as such
+ *  rather than being dressed up as an entity. */
+function queryHitRef(entityId: number): { entityId: number; guid: string | null; name: string | null } {
+  if (entityId < 0) return { entityId, guid: null, name: null };
+  const e = findEntityById(entityId);
+  const ea = e && e.has(EntityAttributes) ? e.get(EntityAttributes) : undefined;
+  return { entityId, guid: (ea?.guid as string) || null, name: (ea?.name as string) ?? null };
+}
+
+/** Resolve the `exclude` argument — a name or guid, never a raw id — to a runtime id.
+ *  An ambiguous NAME is REFUSED rather than first-matched (§3, on every path). */
+function resolveExclude(spec: string): { id: number } | { error: string; options?: string[] } {
+  const byGuid = findEntityByGuid(spec);
+  if (byGuid) return { id: byGuid.id() };
+  const matches = getAllEntities().filter((e) => e.name === spec);
+  if (matches.length === 0) return { error: `exclude: no entity named or guid'd '${spec}' in the live world` };
+  if (matches.length > 1) {
+    return {
+      error: `exclude: '${spec}' matches ${matches.length} entities — an ambiguous name is refused everywhere, never first-matched`,
+      options: matches.map((m) => m.guid || `id:${m.id}`),
+    };
+  }
+  return { id: matches[0].id };
+}
+
+registerAgentOp('scene-query', (params) => {
+  const p = (params ?? {}) as {
+    kind?: QueryKind; dim?: '2d' | '3d';
+    origin?: number[]; direction?: number[]; point?: number[];
+    radius?: number; maxDistance?: number; solid?: boolean; exclude?: string;
+    precision?: number;
+  };
+  const KINDS: QueryKind[] = ['raycast', 'shapecast', 'point'];
+  if (!p.kind || !KINDS.includes(p.kind)) {
+    return { ok: false, code: 'REFUSED_BY_OP', error: `scene-query requires kind (one of ${KINDS.join(', ')}); got ${JSON.stringify(p.kind)}`, options: KINDS };
+  }
+  if (p.dim !== '2d' && p.dim !== '3d') {
+    return { ok: false, code: 'REFUSED_BY_OP', error: `scene-query requires dim '2d' or '3d'; got ${JSON.stringify(p.dim)}`, options: ['2d', '3d'] };
+  }
+  const world = getCurrentWorld();
+  const is2d = p.dim === '2d';
+  const n = is2d ? 2 : 3;
+
+  // 1. "There is no physics world" — NOT a miss. A world exists only once the physics system has
+  //    run, i.e. while the sim is PLAYING, so a stopped editor legitimately has none. Answering
+  //    `hit:null` here would tell the agent the ray passed through empty space.
+  if (!(is2d ? hasPhysics2D(world) : hasPhysics3D(world))) {
+    return {
+      ok: false, code: 'NOT_AVAILABLE_HERE', kind: p.kind, dim: p.dim,
+      error: `no ${p.dim.toUpperCase()} physics world exists on this surface, so nothing could be queried — this is NOT "the query missed".`,
+      hint: 'A Rapier world is built by the physics system on its first tick and freed on Stop, so '
+        + 'a STOPPED editor has none. Start the sim (modoki_play_control action:"play"), or check '
+        + `the scene actually has ${p.dim.toUpperCase()} colliders.`,
+    };
+  }
+
+  const vec = (v: unknown, what: string): number[] | string => {
+    if (!Array.isArray(v) || v.length !== n || v.some((c) => typeof c !== 'number' || !Number.isFinite(c))) {
+      return `${what} must be an array of ${n} finite numbers for dim:'${p.dim}' (got ${JSON.stringify(v)})`;
+    }
+    return v as number[];
+  };
+
+  // ── point: the pick/hit-test query. Its result shape is deliberately DIFFERENT ──
+  if (p.kind === 'point') {
+    const pt = vec(p.point, 'point');
+    if (typeof pt === 'string') return { ok: false, code: 'REFUSED_BY_OP', error: pt };
+    const id = is2d ? pointQuery2D(world, pt[0], pt[1]) : pointQuery3D(world, pt[0], pt[1], pt[2]);
+    // §2 — same field name, same meaning, or ABSENT. pointQuery returns containment, which has no
+    // impact point, no surface normal and no distance; padding those with zeros would make a
+    // `distance:0` here mean something different from a `distance:0` on a raycast, which is
+    // exactly the drift that rule exists to stop.
+    return { ok: true, kind: 'point', dim: p.dim, point: pt, hit: id == null ? null : queryHitRef(id) };
+  }
+
+  const origin = vec(p.origin, 'origin');
+  if (typeof origin === 'string') return { ok: false, code: 'REFUSED_BY_OP', error: origin };
+  const dir = vec(p.direction, 'direction');
+  if (typeof dir === 'string') return { ok: false, code: 'REFUSED_BY_OP', error: dir };
+
+  // 2. "The direction was degenerate" — also NOT a miss. A zero-length direction describes no ray
+  //    at all, and the query functions return the same `null` a clean miss returns. An agent that
+  //    normalized a delta between two coincident points lands here, and "nothing was hit" would
+  //    send it looking for a missing collider instead of at its own arithmetic.
+  if (dir.every((c) => c === 0)) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP', kind: p.kind, dim: p.dim,
+      error: 'direction has zero length, which describes no ray — nothing was cast. This is NOT a miss.',
+      hint: 'A direction need not be normalized, but it must be non-zero. A zero vector usually '
+        + 'means the two points it was derived from are the same.',
+    };
+  }
+
+  let excludeId: number | undefined;
+  if (p.exclude !== undefined) {
+    if (p.kind === 'shapecast') {
+      // Say so rather than accepting and ignoring it: a silently dropped filter is a query that
+      // answers a different question than the one asked, and the caster's own body is the single
+      // most likely hit.
+      return { ok: false, code: 'REFUSED_BY_OP', error: "exclude is not supported for kind:'shapecast' — the underlying castShape takes no exclusion filter. Use kind:'raycast', or offset the origin past your own collider." };
+    }
+    const r = resolveExclude(p.exclude);
+    if ('error' in r) return { ok: false, code: 'AMBIGUOUS', error: r.error, options: r.options };
+    excludeId = r.id;
+  }
+
+  const opts = {
+    ...(p.maxDistance !== undefined ? { maxDistance: p.maxDistance } : {}),
+    ...(p.solid !== undefined ? { solid: p.solid } : {}),
+    ...(excludeId !== undefined ? { exclude: excludeId } : {}),
+  };
+
+  let raw: { entityId: number; x: number; y: number; z?: number; nx: number; ny: number; nz?: number; distance: number } | null;
+  if (p.kind === 'raycast') {
+    raw = is2d
+      ? raycast2D(world, origin[0], origin[1], dir[0], dir[1], opts)
+      : raycast3D(world, origin[0], origin[1], origin[2], dir[0], dir[1], dir[2], opts);
+  } else {
+    if (typeof p.radius !== 'number' || !Number.isFinite(p.radius) || p.radius <= 0) {
+      return { ok: false, code: 'REFUSED_BY_OP', error: `kind:'shapecast' requires a positive finite radius; got ${JSON.stringify(p.radius)}` };
+    }
+    const { exclude: _drop, solid: _drop2, ...castOpts } = opts as Record<string, unknown>;
+    raw = is2d
+      ? shapeCast2D(world, origin[0], origin[1], dir[0], dir[1], p.radius, castOpts)
+      : shapeCast3D(world, origin[0], origin[1], origin[2], dir[0], dir[1], dir[2], p.radius, castOpts);
+  }
+
+  // 3. Everything that could have produced a false `null` is ruled out, so THIS null is a real
+  //    miss and can be reported as one.
+  const base = { ok: true as const, kind: p.kind, dim: p.dim, origin, direction: dir };
+  if (!raw) return { ...base, hit: null };
+  const point = is2d ? [raw.x, raw.y] : [raw.x, raw.y, raw.z as number];
+  const normal = is2d ? [raw.nx, raw.ny] : [raw.nx, raw.ny, raw.nz as number];
+  return roundFloats({
+    ...base,
+    hit: {
+      ...queryHitRef(raw.entityId),
+      // shapecast's `point` is the swept sphere's CENTRE at impact, not the surface contact —
+      // named in the tool description, because reading it as a contact point puts it one radius
+      // inside the geometry.
+      point, normal, distance: raw.distance,
+    },
+  }, resolvePrecision(p.precision));
+});
+
+// ── PlayerPrefs (#288 gap 4) — the engine's durable per-key store, previously reachable only
+// through `modoki_eval` + a dynamic import. Registered HERE (runtime) and not in agentEditorOps,
+// per docs/mcp-tool-conventions.md §9: nothing about it touches editor chrome, the undo stack, or
+// the project on disk, so the DEVICE surface gets the same ops for free — which is the surface
+// where prefs matter most, since that is where a real player's save data lives.
+//
+// SPLIT IN TWO, per §7 ("if one argument value changes whether it writes to disk, it is more than
+// one tool"). The split's premise is not a guess: `get`/`keys`/`has`/`hasPendingWrite` are pure
+// cache reads with no lazy hydration and no scheduleFlush (playerPrefs.ts), while
+// `set`/`delete`/`clear` all dirty a key and schedule a durable write.
+
+/** Refuse rather than answer when the cache was never hydrated.
+ *
+ *  `cache` is populated ONLY by `PlayerPrefs.init()`, so before a game boots `keys()` returns `[]`
+ *  for a store that may have plenty on disk. Answering `[]` there is §5's worst shape — "could not
+ *  look" reported as "nothing is there" — and it is not recoverable, because an empty list is
+ *  exactly what a genuinely empty store returns.
+ *
+ *  It gates WRITES too, and that half is the sharper one: `set()` on an un-hydrated store writes
+ *  into a throwaway in-memory cache under the `'default'` namespace, and the next `init()` CLEARS
+ *  it. Every signal the caller has says the write succeeded; nothing of it survives. */
+function prefsUnhydrated(): { ok: false; code: string; error: string; hint: string } | null {
+  if (PlayerPrefs.isHydrated()) return null;
+  return {
+    ok: false,
+    code: 'NOT_AVAILABLE_HERE',
+    error: 'PlayerPrefs has not been hydrated on this surface — PlayerPrefs.init() has not run yet.',
+    hint: 'This is NOT "the store is empty": nothing has read the backend, so nothing can be said '
+      + 'about what it holds. The editor hydrates during boot once a game is chosen, and a game '
+      + 'build hydrates in its shell — so open a project / launch the game and retry.',
+  };
+}
+
+registerAgentOp('player-prefs-read', (params) => {
+  const p = (params ?? {}) as { key?: string };
+  const refusal = prefsUnhydrated();
+  if (refusal) return refusal;
+  // ALWAYS reported, on both shapes: the same game has separate stores depending on where it runs
+  // (the editor hydrates `<gameId>@editor` on purpose so playtest saves cannot reach a shipped
+  // build's), so a key list that does not say which store it came from is unanswerable.
+  const namespace = PlayerPrefs.namespace();
+  const keys = [...PlayerPrefs.keys()].sort();
+  if (p.key === undefined) {
+    // Summary-first (§6): the INDEX by default, a value only when a key is named.
+    return {
+      ok: true, namespace, totalCount: keys.length, keys,
+      pendingWrites: keys.filter((k) => PlayerPrefs.hasPendingWrite(k)),
+    };
+  }
+  // A key that is genuinely absent is an ANSWER, not a refusal — we looked, and it is not there.
+  // `present` carries that explicitly rather than leaving it to be inferred from a missing
+  // `value`, which is indistinguishable from a key holding JSON `null`.
+  if (!PlayerPrefs.has(p.key)) {
+    return { ok: true, namespace, key: p.key, present: false, totalCount: keys.length, keys };
+  }
+  return {
+    ok: true, namespace, key: p.key, present: true,
+    value: PlayerPrefs.get(p.key),
+    // The one signal that separates "the backend rejected this write" from "the backend took it"
+    // — see hasPendingWrite's header. `get()` alone cannot fail, because it re-reads the
+    // optimistic cache.
+    pendingWrite: PlayerPrefs.hasPendingWrite(p.key),
+  };
+});
+
+registerAgentOp('player-prefs-write', async (params) => {
+  const p = (params ?? {}) as { action?: string; key?: string; value?: unknown; confirm?: boolean };
+  const ACTIONS = ['set', 'delete', 'clear', 'flush'];
+  if (!p.action || !ACTIONS.includes(p.action)) {
+    return { ok: false, code: 'REFUSED_BY_OP', error: `player-prefs-write requires action (one of ${ACTIONS.join(', ')}); got ${JSON.stringify(p.action)}`, options: ACTIONS };
+  }
+  const refusal = prefsUnhydrated();
+  if (refusal) return refusal;
+  const namespace = PlayerPrefs.namespace();
+
+  if (p.action === 'flush') {
+    await PlayerPrefs.flush();
+    // A flush that RESOLVES is not a flush that landed: `drain()` catches a rejected backend write,
+    // re-queues the key into `dirty`, and settles fulfilled so later writes are not poisoned —
+    // while `cache` keeps the value, so `get()` still returns it. Re-reading the pending set is the
+    // only way to see it, so reporting a clean `ok:true` here would be a false success by
+    // construction.
+    const stillPending = PlayerPrefs.keys().filter((k) => PlayerPrefs.hasPendingWrite(k));
+    if (stillPending.length > 0) {
+      return {
+        ok: false, code: 'PARTIAL', namespace, pendingWrites: stillPending,
+        error: `the flush resolved but ${stillPending.length} key(s) were REJECTED by the backend and re-queued: ${stillPending.join(', ')}`,
+        hint: 'A rejected write (quota exceeded, a native I/O error) keeps its value in the cache, '
+          + 'so a read-back through player_prefs still shows it. The value is NOT durable.',
+      };
+    }
+    return { ok: true, namespace, flushed: true, pendingWrites: [] };
+  }
+
+  if (p.action === 'clear') {
+    // §8's force pattern. The device surface makes this non-negotiable: there the target is a real
+    // installed app holding a real player's save data, namespaced by appId, and this is neither
+    // undoable nor journaled as a scene edit. A REQUIRED `action` stops the `{}`-typo hazard; only
+    // an explicit acknowledgement stops a deliberate clear aimed at the wrong lease.
+    const keys = PlayerPrefs.keys();
+    if (p.confirm !== true) {
+      return {
+        // REFUSED_BY_OP, not REQUIRES_SAVE. §5 documents REQUIRES_SAVE for a world-swapping or
+        // file-reading op refusing because unsaved LIVE WORK would be lost (load_scene, new_scene,
+        // build). A prefs clear is neither, and nothing about the scene is at stake — sending a
+        // reader to go save their scene is a wrong answer stated authoritatively. This is an
+        // ordinary deliberate refusal awaiting an acknowledgement.
+        ok: false, code: 'REFUSED_BY_OP', namespace, totalCount: keys.length, keys,
+        error: `clear would remove all ${keys.length} key(s) in namespace '${namespace}' and is NOT undoable — pass confirm:true to proceed.`,
+        options: ['confirm:true to clear the whole namespace', "action:'delete' with a key to remove exactly one"],
+      };
+    }
+    PlayerPrefs.clear();
+    await PlayerPrefs.flush();
+    return { ok: true, namespace, cleared: keys.length, keys };
+  }
+
+  if (typeof p.key !== 'string' || p.key === '') {
+    return { ok: false, code: 'REFUSED_BY_OP', error: `action:'${p.action}' requires a non-empty string key` };
+  }
+
+  if (p.action === 'delete') {
+    // A no-op is a failure when the caller asked for a change (§5) — and the refusal is more
+    // useful than the no-op would have been, because a delete that hits nothing is almost always
+    // a mistyped key and the real ones are right here.
+    if (!PlayerPrefs.has(p.key)) {
+      const keys = [...PlayerPrefs.keys()].sort();
+      return {
+        ok: false, code: 'NOT_FOUND', namespace, key: p.key, keys,
+        error: `no key '${p.key}' in namespace '${namespace}' — nothing was deleted`,
+        options: keys,
+      };
+    }
+    PlayerPrefs.delete(p.key);
+    await PlayerPrefs.flush();
+    return { ok: true, namespace, key: p.key, deleted: true, saved: true };
+  }
+
+  // action:'set'
+  if (p.value === undefined) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP', error: "action:'set' requires a `value`. PlayerPrefs treats an undefined value as a DELETE, which is a different operation here.",
+      options: ["action:'delete' to remove the key"],
+    };
+  }
+  PlayerPrefs.set(p.key, p.value as JsonValue);
+  // `set()` SKIPS a value it cannot serialize (it warns and returns), so a bare ok:true would be a
+  // false success for exactly the inputs most likely to be wrong. The wire is JSON so this should
+  // be unreachable — assert it rather than assume it.
+  if (!PlayerPrefs.has(p.key)) {
+    return { ok: false, code: 'REFUSED_BY_OP', namespace, key: p.key, error: `the value for '${p.key}' was rejected as non-JSON-serializable and NOT stored` };
+  }
+  // Flush rather than leaving the 150ms debounce running: an agent's next act is usually to verify
+  // or to move on, and a debounced write that a reload or a scene swap eats would look like the
+  // set never happened. The flush also surfaces a backend rejection, which the debounce would hide.
+  await PlayerPrefs.flush();
+  const pending = PlayerPrefs.hasPendingWrite(p.key);
+  if (pending) {
+    return {
+      ok: false, code: 'PARTIAL', namespace, key: p.key, saved: false,
+      error: `'${p.key}' is set in the live cache but the backend REJECTED the durable write (quota, or a native I/O error) — it will not survive a restart`,
+    };
+  }
+  return { ok: true, namespace, key: p.key, saved: true, value: PlayerPrefs.get(p.key) };
+});
 
 // ── Phase E: time-scale control (0=pause, 0.3=slow-mo, 2=fast) — inspect fast motion ──
 registerAgentOp('set-timescale', (params) => {

@@ -531,6 +531,22 @@ const DECLS: Record<string, Decl> = {
     requires: ['editor', 'renderer'], filters: ['guids', 'name', 'ids', 'layer', 'limit', 'precision'],
     notes: 'One row PER PROVIDER: an entity on screen in both Scene and Game panels reports twice.',
   },
+  modoki_scene_query: {
+    kind: 'read', method: 'POST', route: '/api/scene-query', requires: ['editor', 'scene'], aim: 'point',
+    minimalArgs: { kind: 'point', dim: '3d', point: [0, 0, 0] },
+    notes: "All six engine scene queries (#288 gap 1) behind one tool — §7-legal because no argument changes the method, the route, or whether anything is written; every kind is a pure read. POST despite being a read for the same reason capture_viewport/render_scene are: the input is nested vectors. Its substance is the REFUSAL taxonomy — the engine functions collapse 'no physics world', 'zero-length direction' and a genuine miss onto one null, so the first two are ruled out BEFORE casting and only what is left is reported as hit:null. The raw coordinates are a MEASUREMENT, not an aim (the capture_gesture carve-out), so this must never be added to batch.ts's XY_AIMED map.",
+  },
+  modoki_player_prefs: {
+    kind: 'read', method: 'GET', route: '/api/player-prefs', requires: ['editor'],
+    filters: ['key'],
+    notes: "The READ half of PlayerPrefs (#288 gap 4); the write half is a separate tool on a separate route+op, so the §7 'a read never mutates' promise holds structurally rather than by review. Unrelated to modoki_persistence (the editor's scene/asset save mode) despite the name. Refuses NOT_AVAILABLE_HERE when the cache is un-hydrated rather than answering with an empty key list.",
+  },
+  modoki_write_player_prefs: {
+    kind: 'mutate', method: 'POST', route: '/api/player-prefs',
+    mutating: true, persists: 'file', requires: ['editor'],
+    minimalArgs: { action: 'flush' },
+    notes: "persists:'file' means the PLATFORM prefs store (localStorage / @capacitor/preferences), not a project file — it is the only Persists value that says 'survives the session', which is the fact that matters. set/delete flush before replying, so saved:true means the backend ACCEPTED the write; a rejected one is reported PARTIAL rather than ok, because the value stays in the cache and a read-back cannot see the failure. action is REQUIRED (§1) and action:'clear' additionally requires confirm:true (§8). On its OWN route rather than the /api/editor-action relay: that relay's routing key is `action`, and it strips it before relaying, so a tool with an `action` param has it silently DROPPED — measured here, and now refused outright by editorAction().",
+  },
   modoki_set_timescale: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-timescale',
     mutating: true, requires: ['editor', 'renderer'],
@@ -538,7 +554,7 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_diagnose: {
     kind: 'read', method: 'GET', route: '/api/diagnose', requires: ['editor', 'scene'],
-    notes: 'C7: `ok:false` is an ANSWER (your scene is unhealthy), not a failed call.',
+    notes: 'C7: `ok:false` is an ANSWER (your scene is unhealthy), not a failed call. The `video` param is deliberately NOT declared in `filters`: §6 filters are params that NARROW a response, and this one EXPANDS it (an opt-in video-cache index) — which is what the boolean heuristic already expects, so listing it would be the exact misuse `narrowingFlags` warns against, "a way to bless an expanding flag". Opt-in matters anyway, because diagnose is a swept read: a per-clip index would grow every caller\'s payload to answer a question almost none of them asked. It is the only surface that can read the downloaded-video cache (#288 Phase 6) — the singleton sits behind the __MODOKI_MODULE_VIDEO__ flag, and an /@fs import in modoki_eval yields a second module instance whose slot is null.',
   },
   modoki_profiler: {
     kind: 'control', method: 'GET', route: '/api/profiler', varies: 'both',
@@ -604,6 +620,39 @@ const DECLS: Record<string, Decl> = {
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/particles/probe.particle.json', type: 'particle', data: {} },
     notes: 'F1: `path` and `type` — its two primary args — are undocumented. Can RE-MINT the asset id.',
+  },
+  modoki_delete_asset: {
+    kind: 'mutate', method: 'POST', route: '/api/delete-asset',
+    mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
+    minimalArgs: { paths: ['/assets/particles/probe.particle.json'] },
+    notes: 'NOT undoable and deliberately narrower than the Assets panel\'s Delete, which also sweeps a model\'s generated meshes/materials/sidecars and records a restore snapshot. Trashes exactly the paths named. The route rebuilds the asset manifest INLINE (`manifestRebuilt`) so modoki_list_assets verifies it immediately, rather than racing the watcher\'s 150ms debounce. NOT resolve_refs, which resolves ENTITY refs and never answers about an asset guid — measured, and it was named here in error at first.',
+  },
+  modoki_list_creatable_assets: {
+    kind: 'read', method: 'GET', route: '/api/creatable-assets',
+    notes: "Discovery for modoki_create_registered_asset. A SIBLING read, not a list mode on the mutating tool — §7 forbids the latter and this surface already has four such siblings. Justified more strongly than usual: the registry is dynamic, game-extensible, and comes and goes with the OPEN PROJECT, so no static catalog can carry it, and discovery-by-refusal would mean issuing a deliberately failing mutating call to learn the kinds. On its OWN GET route rather than the editor-action relay: the circularity guard flags mutating:false + a POST to a write route, and it is right to — that combination is how an under-declared write gets swept as safe AND exempted from the ledger. The honest fix was the method.",
+  },
+  modoki_create_registered_asset: {
+    kind: 'mutate', method: 'POST', route: '/api/editor-action', op: 'create-registered-asset',
+    mutating: true, persists: 'file', requires: ['editor', 'project'], aim: 'asset',
+    minimalArgs: { kind: 'material', path: '/assets/materials/probe.mat.json' },
+    notes: "Routes around the panel's native save dialog (a BLOCKING osascript panel on darwin) by taking an explicit path, which is what made the whole 'New X' surface agent-unreachable (#288 gap 5). Separate from modoki_create_asset, whose `type` is a fixed enum while this registry is dynamic and game-extensible. REFUSES create-override kinds: `scene`'s override discards the live world, and the dialog it normally goes through IS the guard an explicit path removes — modoki_new_scene has the REQUIRES_SAVE check instead.",
+  },
+  modoki_open_animation_editor: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'open-animation-editor',
+    mutating: true, persists: 'session', requires: ['editor', 'scene'], aim: 'asset',
+    minimalArgs: { path: '/assets/animations/probe.anim.json' },
+    notes: 'The PREREQUISITE the clip-authoring tools were missing (#288 Phase 4): pose_clip / set_playhead / anim_add_key all read the editor\'s open clip, and nothing could set it — set_selection {asset} selects in the Assets panel without opening the editor (measured). Mirrors open-particle-editor. Reports `bound` separately from the open, because a clip can open and bind to nothing.',
+  },
+  modoki_pose_clip: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'pose-clip',
+    mutating: true, persists: 'live', requires: ['editor', 'scene'],
+    minimalArgs: { t: 0 },
+    notes: "The pose modoki_set_playhead deliberately does NOT do (#288 gap 2). undoable:false with persists:'live' is a deliberate deviation from §8's one-call-one-undo-entry: the pose lives inside the editor's preview envelope and reverts on exit rather than through the undo stack, because a preview pose is not a scene edit. Editor-only by construction — a device build has no preview session and nothing to revert a pose to — which is the 'recorded as deliberate' half of §9, not a parity gap.",
+  },
+  modoki_exit_pose_envelope: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'exit-pose-envelope',
+    mutating: true, persists: 'live', requires: ['editor', 'scene'],
+    notes: "The way OUT of the envelope modoki_pose_clip opens — not optional scope, since the envelope pins the run-mode at 'scrub' and that is exactly what blocks the human's Cmd+S. Refuses when the TIMELINE panel owns the envelope: ending its session would revert its world mid-run.",
   },
   modoki_read_asset_def: {
     kind: 'read', method: 'GET', route: '/api/asset-def', requires: ['editor'], aim: 'asset',

@@ -76,6 +76,15 @@ export { importModel } from './scene/modelImport';
 export { useEditorStore } from './store/editorStore';
 export type { SelectedAsset } from './store/editorStore';
 export { upsertKey, findTrack, encodeValue, relativeEntityPath } from './animation/recording';
+// The pose path, extracted out of AnimationEditor.tsx so the `pose-clip` agent op drives the SAME
+// code the human scrub gesture does — and so it works with no Animation panel mounted (#288 gap 2).
+export { applyPoseAtTime, poseClipAtTime, exitPoseEnvelope, onPoseEnvelopeExited } from './animation/poseClip';
+// The Assets-panel double-click path's clip-binding resolver, so the `open-animation-editor` agent
+// op opens a clip the SAME way rather than re-deriving which entity a clip belongs to (#288).
+export { resolveAnimatorRootForClip } from './panels/openAssetInEditor';
+// The create path the Assets panel's "New X" flow and the `create-registered-asset` agent op BOTH
+// run, so a kind that works for the human cannot silently differ for a tool (#288 gap 5).
+export { createRegisteredAsset, ensureExt } from './panels/createRegisteredAsset';
 export {
   registerCreatableAsset, unregisterCreatableAsset, getCreatableAssets, type CreatableAssetDef,
 } from './panels/creatableAssets';

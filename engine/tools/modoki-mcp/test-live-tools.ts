@@ -117,7 +117,18 @@ console.log(`[live] backend ${BACKEND}`);
 console.log(`[live] sweeping ${sweep.length} non-mutating tools in their ERGONOMIC form (minimalArgs)`);
 console.log(`[live] ${COVERED_BY_SMOKE.size} mutating tools covered by test-smoke.mjs · ${Object.keys(LIVE_UNCOVERED).length} declared un-sweepable\n`);
 
-type Row = { tool: string; verdict: 'ok' | 'env' | 'DEFECT'; detail: string };
+type Row = {
+  tool: string; verdict: 'ok' | 'env' | 'DEFECT'; detail: string;
+  /** Did an EXPECTED_REFUSALS entry actually MATCH this row? Recorded as a fact at the moment the
+   *  branch fires, rather than re-derived from `detail` afterwards.
+   *
+   *  It used to be re-derived — `detail.startsWith('REFUSED_BY_OP (expected')` — which quietly
+   *  assumed every expected refusal carries that one code. The first entry that did not
+   *  (`modoki_scene_query`, NOT_AVAILABLE_HERE) was reported as STALE in the same run whose own
+   *  output line said `(expected: …)` two lines above. A staleness guard that reads a rendered
+   *  string instead of the fact it is about will keep finding new ways to be wrong; this cannot. */
+  expectationFired?: boolean;
+};
 const rows: Row[] = [];
 
 /** Structural codes that describe the EDITOR'S STATE rather than the tool's health. A NOT_FOUND for
@@ -155,6 +166,10 @@ const EXPECTED_REFUSALS: Record<string, { match: RegExp; why: string; when?: () 
     match: /could not derive a gs:\/\/ bucket|gcloud not found/i,
     why: 'the swept project has no OTA bucket configured; the route refuses rather than answering "nothing is published", which is the §5 could-not-look-vs-nothing-there rule working.',
   },
+  modoki_scene_query: {
+    match: /no (2D|3D) physics world exists on this surface/i,
+    why: 'the swept scene has no physics colliders, so no Rapier world is ever built — measured on tropical-island, which has ZERO Collider3D entities whether playing or stopped. The op refuses rather than answering hit:null, which is §5 working: a query that could not run is not a query that found nothing. The MATCH here is the discriminator that keeps this honest — a genuinely dead route also answers NOT_AVAILABLE_HERE, but with the route-is-absent text, not this one. Smoke UC12 builds a real world and casts against it, because this entry proves the route is alive and nothing about the casting.',
+  },
   modoki_read_asset_def: {
     match: /not in the live .* cache/i,
     why: 'minimalArgs names a plausible particle path, and the op reads the LIVE cache — an asset the open scene has not loaded is a state answer, and the message names the fix.',
@@ -168,6 +183,7 @@ for (const name of [...sweep, ...gameSweep]) {
   const args = CONTRACTS[name]?.minimalArgs ?? {};
   let verdict: Row['verdict'] = 'ok';
   let detail: string;
+  let expectationFired = false;
   try {
     const r = await client.callTool({ name, arguments: args as Record<string, unknown> });
     const body = r.content.map((c) => (c as { text?: string }).text ?? '').join('');
@@ -186,7 +202,7 @@ for (const name of [...sweep, ...gameSweep]) {
         && observedRunMode !== 'playing' && code === 'REFUSED_BY_OP';
       if (!code) { verdict = 'DEFECT'; detail = `failed WITHOUT a §5 envelope: ${body.slice(0, 160)}`; }
       else if (ENV_CODES.has(code)) { verdict = 'env'; detail = code; }
-      else if (expectedActive && expected.match.test(why)) { verdict = 'env'; detail = `${code} (expected: ${why.slice(0, 70)}…)`; }
+      else if (expectedActive && expected.match.test(why)) { verdict = 'env'; expectationFired = true; detail = `${code} (expected: ${why.slice(0, 70)}…)`; }
       else if (gameStateRefusal) { verdict = 'env'; detail = `${code} (declares requiresPlaying; editor is ${observedRunMode})`; }
       else { verdict = 'DEFECT'; detail = `${code}: ${body.slice(0, 200)}`; }
     } else {
@@ -203,7 +219,7 @@ for (const name of [...sweep, ...gameSweep]) {
     verdict = 'DEFECT';
     detail = `threw: ${e instanceof Error ? e.message : String(e)}`;
   }
-  rows.push({ tool: name, verdict, detail });
+  rows.push({ tool: name, verdict, detail, expectationFired });
   const mark = verdict === 'ok' ? '✓' : verdict === 'env' ? '·' : '✗';
   console.log(`  ${mark} ${name.padEnd(34)} ${detail.slice(0, 110)}`);
 }
@@ -216,7 +232,7 @@ const unusedExpectations = Object.keys(EXPECTED_REFUSALS).filter((n) => {
   const entry = EXPECTED_REFUSALS[n];
   if (entry.when && !entry.when()) return false; // not expected to fire THIS run — see `when` above
   const row = rows.find((r) => r.tool === n);
-  return row && !row.detail.startsWith('REFUSED_BY_OP (expected');
+  return row && !row.expectationFired;
 });
 if (unusedExpectations.length) {
   console.error(`\nEXPECTED_REFUSALS entries that did NOT fire: ${unusedExpectations.join(', ')} — the tool stopped refusing, so delete the entry (it would silence a real refusal later).`);

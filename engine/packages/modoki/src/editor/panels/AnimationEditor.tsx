@@ -15,15 +15,10 @@ import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
-import { getCurrentWorld } from '../../runtime/core/ecs/world';
-import { findEntity, getStructureVersion, fireDirtyListeners } from '../../runtime/core/ecs/entityUtils';
+import { findEntity, getStructureVersion } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newGuid, registerAsset, getGuidForPath } from '../../runtime/loaders/assetManifest';
-import {
-  applyClipAtTime, advanceClipTime,
-} from '../../runtime/animation/sampleClip';
-import { applyClipDeform } from '../../runtime/animation/deform2DSystem';
-import { beginDeform2DFrame } from '../../runtime/animation/deform2DBuffers';
+import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import {
   defaultAnimationClip, normalizeAnimationClip,
   type AnimationClipDef, type AnimationTrack, type TrackValueType,
@@ -48,12 +43,13 @@ import CurvesView from './animation/CurvesView';
 import AddPropertyPicker, { type PropertyCandidate } from './animation/AddPropertyPicker';
 import BindAnimatorPicker from './animation/BindAnimatorPicker';
 import { bindClipToEntity } from '../animation/bindAnimator';
+import { applyPoseAtTime, poseClipAtTime, exitPoseEnvelope, onPoseEnvelopeExited } from '../animation/poseClip';
 import { resolveAnimatorRootForClip } from './openAssetInEditor';
 import { frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { enterScrubMode, enterPreviewMode, exitPreviewMode, getModeOwner } from '../scene/playMode';
+import { enterScrubMode, enterPreviewMode } from '../scene/playMode';
 import {
-  beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession,
+  beginTimelinePreviewSession, hasTimelinePreviewSession,
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
 
@@ -81,19 +77,11 @@ type ClipAction = UndoAction & { _after: AnimationClipDef };
  *  serializes immediately afterwards, so a fire-and-forget restore would let the save write the
  *  POSED world, which is the whole thing the envelope exists to prevent. */
 function endAnimationPreview(restore: boolean): Promise<void> {
-  if (getModeOwner() !== 'animation') return Promise.resolve();
-  const store = useEditorStore.getState();
-  store.setPreviewPlaying(false);
-  let done: Promise<void> = Promise.resolve();
-  if (hasTimelinePreviewSession()) {
-    const path = store.editingAnimationAsset?.path;
-    done = endTimelinePreviewSession({
-      restore,
-      rebind: () => (path ? resolveAnimatorRootForClip(path, { fallbackToSelection: false }) : null),
-    }).then((newRoot) => { if (newRoot != null) useEditorStore.getState().setAnimatorRoot(newRoot); });
-  }
-  exitPreviewMode('animation');
-  return done;
+  // The body lives in `editor/animation/poseClip.ts` alongside the pose it undoes, so the
+  // `exit-pose-envelope` agent op closes the envelope exactly the way ⏹ does (#288 gap 2). An
+  // agent able to OPEN the envelope and not close it would wedge the editor: the envelope holds
+  // the run-mode at `scrub`, which is what blocks the human's Cmd+S.
+  return exitPoseEnvelope(restore).then(() => undefined);
 }
 
 export default function AnimationEditor() {
@@ -229,43 +217,11 @@ export default function AnimationEditor() {
   }, [rootId, asset, nonce, structureVersion]);
 
   // ── Pose the bound entities at a given time (shared runtime sampler) ──
-  /** Write the clip's sampled values into the bound entities. **Never call this directly** — go
-   *  through `pose`, which guarantees the preview envelope is open first. */
-  const applyPose = useCallback((c: AnimationClipDef | null, t: number) => {
-    if (!c || rootId == null) return;
-    // The invariant, asserted where the damage would happen: a pose with no session held is
-    // unrevertible (⏹ Exit has nothing to restore) AND unguarded (run-mode reads 'stopped', so a
-    // save writes it to the scene file). Refuse rather than warn — a rig that visibly fails to pose
-    // is a bug report; a scene silently rewritten to a preview frame is what actually cost the
-    // owner data. Nothing legitimately poses outside the envelope: `pose` opens it first and
-    // `endAnimationPreview` does not re-pose after ending it.
-    if (!hasTimelinePreviewSession()) {
-      console.error(
-        '[AnimationEditor] refused to pose with no preview session held — the pose would be ' +
-        'unrevertible and a scene save would bake it. Every pose must go through `pose`.',
-      );
-      return;
-    }
-    try {
-      // applyClipAtTime writes trait values via bulk entity.set (bypassing
-      // writeTraitField), so nothing marks the viewport/Inspector dirty. Signal
-      // it ourselves — same as a gizmo drag — or the SceneView won't redraw and
-      // preview playback looks frozen.
-      const w = getCurrentWorld();
-      // New deform epoch, then pose scalar tracks + deform channels — so a scrubbed
-      // clip previews cloth/cape deformation exactly as it plays at runtime. (No-op
-      // fast path for scalar-only clips.)
-      beginDeform2DFrame();
-      const applied = applyClipAtTime(w, rootId, c, t) + applyClipDeform(w, rootId, c, t);
-      if (applied > 0) fireDirtyListeners();
-    } catch (e) {
-      // Most failures here are transient: a scene swap can leave `rootId` pointing at a
-      // not-yet-resolvable entity for a frame. Don't crash the preview rAF — but DON'T
-      // blanket-swallow either, or a genuine sampler regression manifests as a silently
-      // frozen preview with no diagnostic. Log at debug so it's visible when looked for.
-      console.debug('[AnimationEditor] pose failed (world not ready or sampler error)', e);
-    }
-  }, [rootId]);
+  //
+  // The pose WRITE itself now lives in `editor/animation/poseClip.ts`, so `modoki_pose_clip`
+  // drives the SAME code rather than a second copy of it (#288 gap 2). Re-deriving it there would
+  // have recreated the measured bake-in bug described below; sharing it cannot. What stays here is
+  // the component-local half: `setInPreview`, and the fast path the ▶ rAF loop needs.
 
   /** Pose INSIDE the preview envelope, opening it first if it is not already held.
    *
@@ -287,11 +243,17 @@ export default function AnimationEditor() {
    *  and what keeps the snapshot free of the pose it is meant to revert. */
   const pose = useCallback((c: AnimationClipDef | null, t: number) => {
     if (!c || rootId == null) return;
-    if (hasTimelinePreviewSession()) { applyPose(c, t); return; }
-    enterScrubMode('animation');
+    // `setInPreview` is the only piece that stays here — a `useState` driving the ⏹ Exit button,
+    // i.e. the one genuinely component-local dependency. Everything else moved into `poseClip.ts`,
+    // which is why an agent can pose with NO Animation panel mounted.
+    //
+    // The already-held branch stays SYNCHRONOUS and skips `setInPreview`, matching what this
+    // function did before the extraction: it is driven once per frame by the ▶ preview rAF below,
+    // where a promise and a setState per frame would both be new work for no gain.
+    if (hasTimelinePreviewSession()) { applyPoseAtTime(c, rootId, t); return; }
     setInPreview(true);
-    void beginTimelinePreviewSession().then(() => applyPose(c, t));
-  }, [rootId, applyPose]);
+    void poseClipAtTime(c, rootId, t, 'animation');
+  }, [rootId]);
 
   // ── Load the clip when the open target changes ──
   useEffect(() => {
@@ -462,6 +424,20 @@ export default function AnimationEditor() {
       },
     };
   }
+  // An exit can now come from OUTSIDE this component (the `exit-pose-envelope` agent op). Without
+  // observing it, `inPreview` would stay true against a closed envelope — leaving the save handler
+  // below registered, so the human's next Cmd+S would suspend (a no-op), serialize, and then
+  // `resume()` by RE-POSING a world the agent had just reverted.
+  //
+  // ⚠️ KEYED ON `hmrEpoch`, not `[]`. React Fast Refresh does not re-run a `[]`-deps effect
+  // (measured — see hmrEpoch.ts), and `poseClip.ts` holds its listeners in a module-level Set that
+  // a hot update REPLACES. Unlike the keymap registries, that module does not force a full reload
+  // when it changes, so a `[]` effect would stay subscribed to the dead Set: the next exit — the
+  // agent's OR the human's ⏹, both of which go through `exitPoseEnvelope` — would close the
+  // envelope without notifying this panel, and the very Cmd+S re-pose above would be back. The
+  // epoch is a frozen 0 with no hot context, so this is byte-for-byte `[]` in a shipped build.
+  useEffect(() => onPoseEnvelopeExited(() => setInPreview(false)), [hmrEpoch]);
+
   useEffect(() => {
     if (!inPreview) return;
     const mine = saveHandlerRef.current!;

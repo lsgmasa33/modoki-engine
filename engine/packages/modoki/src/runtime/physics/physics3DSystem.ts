@@ -120,6 +120,21 @@ export const disposePhysics3D = registry.dispose;
 /** Free ALL Rapier3D worlds (called on Play→Stop so the next Play rebuilds fresh). */
 export const disposeAllPhysics3D = registry.disposeAll;
 
+/** Is there a live Rapier3D world for this koota world?
+ *
+ *  Exists so a caller can tell "there is nothing here to hit" from "there is no 3D physics on
+ *  this surface at all". Every query below answers BOTH with `null` — a clean miss, an absent
+ *  world, and a zero-length direction are one value — and for a human reading code that collapse
+ *  is harmless, because the next line is usually `if (hit)`. For an agent tool it is §0's rank-2
+ *  failure: "could not look" reported as "nothing is there", stated authoritatively and
+ *  unrecoverable. `modoki_scene_query` calls this FIRST and refuses instead of answering a miss.
+ *
+ *  Note a world only exists once `physics3DSystem` has run, i.e. while the sim is PLAYING — a
+ *  stopped editor has no physics world, which is a real answer and not a defect. */
+export function hasPhysics3D(world: World): boolean {
+  return worlds.has(world);
+}
+
 // Scratch reused across the synchronous tick — one world runs at a time.
 const _seenBodies = new Set<number>();
 const _seenSolo = new Set<number>();

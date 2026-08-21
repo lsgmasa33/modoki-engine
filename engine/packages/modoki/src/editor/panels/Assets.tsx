@@ -30,11 +30,12 @@ import {
   type Snapshot, type DeleteResult, type DupResult, type PasteMove, type DropMove,
 } from './assetUndo';
 import { unbindDeletedAssetEditors, applyAssetPathMoves } from './assetEditorBindings';
-import { newGuid, registerAsset, type AssetType } from '../../runtime/loaders/assetManifest';
+import { newGuid } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
 import { reimportPaths } from './assetViews/reimport';
 import { openAssetInEditor } from './openAssetInEditor';
 import { saveAssetDialog } from '../utils/saveDialog';
+import { createRegisteredAsset } from './createRegisteredAsset';
 
 /** Display name from an asset path: last segment minus a known double/single extension. */
 function assetDisplayName(p: string, ext: string): string {
@@ -964,18 +965,22 @@ export default function Assets() {
       defaultFolder: folder ?? def.defaultFolder, prompt: def.prompt ?? def.label,
     });
     if (!path) return;
-    const guid = newGuid();
-    const name = assetDisplayName(path, def.ext);
+    // The `create`-OVERRIDE kinds (Scene) stay HERE and are not routed through
+    // `createRegisteredAsset`, which refuses them. That is not an inconsistency: the override
+    // discards the live world, and the dialog above is what makes a cancel safe — which is exactly
+    // the guard an explicit-path call would remove. See createRegisteredAsset.ts's header.
     if (def.create) {
       await def.create(path);
-    } else {
-      const body = def.body ? def.body(guid, name) : { id: guid };
-      const ok = await writeFile(path, JSON.stringify(body, null, 2));
-      if (!ok) { console.error(`[Assets] Failed to write ${path}`); return; }
-      registerAsset(guid, path, def.assetType as AssetType);
+      refresh();
+      def.onCreated?.({ path, name: assetDisplayName(path, def.ext), guid: newGuid() });
+      return;
     }
+    // Everything else shares ONE create path with the agent op (#288 gap 5), so a kind that works
+    // for the human cannot silently differ for a tool.
+    const r = await createRegisteredAsset(def.id, path);
+    if (!r.ok) { console.error(`[Assets] ${r.error}`); return; }
     refresh();
-    def.onCreated?.({ path, name, guid });
+    def.onCreated?.({ path: r.path, name: r.name, guid: r.guid });
   }, [refresh]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent, asset: AssetEntry) => {

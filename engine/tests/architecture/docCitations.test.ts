@@ -282,19 +282,6 @@ const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ cited: string; reason: string; in?
   { cited: 'electron/toolchainHost.ts', reason: 'editor-toolchain-layer plan: proposed, unbuilt' },
   { cited: 'scripts/stage-node.cjs', reason: 'editor-toolchain-layer plan: proposed, unbuilt' },
   { cited: 'tests/sling-trait-hygiene.test.ts', reason: 'entity-id-guard plan: proposed, unbuilt' },
-  // #288 (mcp-five-capability-gaps plan). Scoped with `in` so the exemption cannot silently
-  // cover a second doc later. DELETE BOTH once the phases land — the plan says so in its
-  // handoff, because an exemption that outlives its file is how this guard goes blind.
-  {
-    cited: 'editor/animation/poseClip.ts',
-    in: 'docs/plans/mcp-five-capability-gaps-plan.md',
-    reason: '#288 Phase 4: the pose path extracted out of AnimationEditor.tsx — proposed, unbuilt',
-  },
-  {
-    cited: 'editor/panels/createRegisteredAsset.ts',
-    in: 'docs/plans/mcp-five-capability-gaps-plan.md',
-    reason: "#288 Phase 5: runCreate's body extracted out of Assets.tsx — proposed, unbuilt",
-  },
 
   // --- A worked example, not a pointer.
   { cited: 'scripts/stage-foo.cjs', reason: 'bundle-new-tools.md: placeholder name in a how-to template' },
