@@ -7,6 +7,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import {
   pickInDirection, pushScope, popScope, activeScope, setFocus, focusedGuid, resetFocus,
+  requestActivate, retargetFocusedGuid, useFocusStore,
 } from '../../src/runtime/ui/focusManager';
 import type { ScreenRect } from '../../src/runtime/core/screenBounds';
 
@@ -76,5 +77,54 @@ describe('scope stack', () => {
   it('never pops the base scope', () => {
     expect(popScope()).toBe(false);
     expect(activeScope()).toBe('');
+  });
+});
+
+/** A pooled scroll-view entry's guid is stable at the SLOT, so when the pool recycles the
+ *  entries system re-points focus at whichever slot now holds the same ENTRY (#319). */
+describe('retargetFocusedGuid', () => {
+  const pending = () => useFocusStore.getState().pendingActivateGuid;
+
+  it('moves focus from one guid to another', () => {
+    setFocus('slot-3');
+    retargetFocusedGuid('slot-3', 'slot-1');
+    expect(focusedGuid()).toBe('slot-1');
+  });
+
+  it('carries a QUEUED activation with it — the half that fires the wrong element', () => {
+    // A "confirm" is deferred on purpose: uiFocusSystem queues it inside the pipeline tick and
+    // UIRenderer drains it from a React effect after commit. A scroll-event pool re-drive lands
+    // inside that gap, so a queued guid left behind would activate whatever the slot recycled to.
+    setFocus('slot-3');
+    requestActivate('slot-3');
+    expect(pending()).toBe('slot-3');
+
+    retargetFocusedGuid('slot-3', 'slot-1');
+    expect(pending()).toBe('slot-1');
+    expect(focusedGuid()).toBe('slot-1');
+  });
+
+  it('leaves a queued activation for a DIFFERENT element alone', () => {
+    setFocus('slot-3');
+    requestActivate('elsewhere');
+    retargetFocusedGuid('slot-3', 'slot-1');
+    expect(focusedGuid()).toBe('slot-1');
+    expect(pending()).toBe('elsewhere');
+  });
+
+  it('is a no-op on an empty or unchanged move rather than clobbering state', () => {
+    setFocus('slot-3');
+    requestActivate('slot-3');
+    retargetFocusedGuid('', 'slot-1');
+    retargetFocusedGuid('slot-3', '');
+    retargetFocusedGuid('slot-3', 'slot-3');
+    expect(focusedGuid()).toBe('slot-3');
+    expect(pending()).toBe('slot-3');
+  });
+
+  it('does not move focus that is somewhere else entirely', () => {
+    setFocus('a-button');
+    retargetFocusedGuid('slot-3', 'slot-1');
+    expect(focusedGuid()).toBe('a-button');
   });
 });

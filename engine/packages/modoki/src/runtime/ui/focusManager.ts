@@ -56,6 +56,33 @@ export function setFocus(guid: string): void {
   if (useFocusStore.getState().focusedGuid !== guid) useFocusStore.setState({ focusedGuid: guid });
 }
 
+/** Move focus from one guid to another — and carry a QUEUED ACTIVATION with it.
+ *
+ *  ⚠️ **The pending activation is the half that is easy to miss, and it fires the wrong
+ *  thing.** A "confirm" is deliberately deferred: `uiFocusSystem` sets `pendingActivateGuid`
+ *  inside the pipeline tick and `UIRenderer` drains it from a React effect after commit
+ *  (`applyBindings`' `call` path throws from a tick). A scroll-view pool re-drive can land in
+ *  that gap — `driveEntriesFromScroll` runs straight off the DOM `scroll` event — and a pooled
+ *  entry's guid is stable at the SLOT, so the queued guid would then activate whatever entry
+ *  that slot recycled to. Confirm on level 5 launching level 12, from one fling.
+ *
+ *  So the entries system's re-target (`entriesFocus.ts`) calls THIS, not `setFocus`: focus and
+ *  the activation queued for that same element move together or not at all.
+ *
+ *  Deliberately NOT re-exported from `runtime/index.ts` while every other focusManager mutator
+ *  is: no game pools its own entries, so a public one would be an API with no caller — the shape
+ *  #321 exists to stop. Export it the day a game needs it. */
+export function retargetFocusedGuid(from: string, to: string): void {
+  if (!from || !to || from === to) return;
+  const s = useFocusStore.getState();
+  const next: Partial<FocusState> = {};
+  if (s.focusedGuid === from) next.focusedGuid = to;
+  if (s.pendingActivateGuid === from) next.pendingActivateGuid = to;
+  if (next.focusedGuid !== undefined || next.pendingActivateGuid !== undefined) {
+    useFocusStore.setState(next);
+  }
+}
+
 /** Push a new focus scope (e.g. a modal opens). Focus is cleared so the scope's
  *  autofocus lands on the next `uiFocusSystem` tick. */
 export function pushScope(scope: string): void {

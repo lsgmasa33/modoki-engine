@@ -595,14 +595,23 @@ stale GUIDs never linger.
 ## Scroll views and recycled entries (`UIScrollView` + `UIEntries`)
 
 A scroll box with a **pooled** content set: a handful of prefab instances re-driven as you
-scroll, so a view over N entries costs `visible + overscan` entities instead of N. Design
-rationale and the open work: [plans/ui-scroll-view-plan.md](./plans/ui-scroll-view-plan.md).
+scroll, so a view over N entries costs `visible + overscan` entities instead of N. Landed as
+#250 + #316 (Court's level selector); the design tracker is deleted per `doc-conventions.md` and
+its durable rationale folded in below.
 
 **An entry is not a row.** The content is a `countX × countY` index space of **entries**, and one
 entry is whatever the prefab says — a list row, a card, or a whole authored grid (a *page*). The
 three shapes differ only in authored numbers, not in code paths: a vertical strip is `countX: 1`,
 a horizontal one `countY: 1`, a pager is a strip whose entry fills the viewport (`100%`), and a
 2-D grid has both above 1.
+
+**The first draft modelled this as a vertical list of rows instead** — `rowPrefab`, `rowHeight`,
+`firstIndex` — which is one of the three shapes dressed as the general one, and the mistake is
+worth keeping rather than erasing. It would have made Court the EXPENSIVE case instead of the
+cheap one: virtualizing 589 tiles needs per-tile recycling and a per-tile identity story, where
+Court-as-One-case pools ~3 whole *page* entries it already authors. And the naming would have
+leaked into the scene format, where it is costly to correct — `rowPrefab` on a horizontally-
+scrolling shop strip is a lie an author reads past forever.
 
 | Trait | Owns |
 |---|---|
@@ -627,6 +636,18 @@ The engine decides WHICH pooled instance shows entry (x, y); the game answers WH
   resolver returning a `UIToggle.value` would then silently write nothing.
 - Bump **`epoch`** when content changes but the window does not (a level gets solved; an async
   manifest arrives). Without it the resolver is only called when the window moves.
+- The member-path walker is **new engine code over the `parentId`/`localId` chain**, not a
+  promotion of Court's `findAllInInstance`. `rootInstanceId` is stamped on a prefab's OWN
+  members only — never inner members — so `findAllInInstance`'s flat `rootInstanceId ===
+  rootEcsId` scan reaches zero of a page prefab's 25 nested tile instances.
+- The scene's generated `resources` manifest only seeds what it is told is a ref:
+  `UIEntries.prefabs[].prefab` must be registered in `REF_FIELDS_BY_TRAIT`
+  (`loaders/sceneValidation.ts`) and in `SCALAR_RESOURCE_TYPE_BY_FIELD` as a `prefab`-typed ref,
+  or the entry prefab is invisible to the manifest — the #53 "assets the build cannot see"
+  class, silent in dev (which serves everything off disk) and broken only once shipped. Once
+  registered, the entry prefab's own assets need nothing further: `SceneManager`'s transitive
+  worklist walks its entities with the same collector used for scene entities, so a textured
+  entry prefab, a font, or a prefab nested inside it are all acquired and scene-refcounted.
 
 ### Sizing, and why the two terms are separate
 
@@ -655,7 +676,12 @@ three costs 29, buys five more entries per frame, and still blanks on a 30-per-f
 **A `scroll` event also drives the pool immediately** (`driveEntriesFromScroll`), before the frame
 paints, instead of waiting for the next pipeline tick. It opens a system tick deliberately — the
 pool spawns, and `spawnEntity` tags `Transient` only inside one, without which a pooled entity
-reaches the saved scene file.
+reaches the saved scene file. That is the specific reason pool growth is NOT driven from the DOM
+`scroll` handler or a React effect directly: `spawnEntity` tags `Transient` only when
+`inSystemTick()`, and `spawnPrefabInstance` tags it only when the run mode is not `stopped` — a
+handler or effect spawning outside a tick would evade both checks silently, and CLAUDE.md's #18
+incident (a stray runtime entity persisted into `tropical-island.json` via a plain save) is
+exactly what an untagged pooled entity would repeat.
 
 ⚠️ **Travel is measured against the last PIPELINE tick, on both paths.** Two drives now land per
 frame, and an accumulator reset by whichever ran first leaves the other reading zero travel and
@@ -774,6 +800,15 @@ rebuild and is never per-frame.
   frequency.
 - **A parked entry reads as DESTROYED to Percept and Enact** — not listed, not aimable, subtree
   included. This is NOT the same as `isVisible: false`, which stays addressable.
+- **Every pooled instance shares the prefab's authored `sortOrder`**, so ties fall to koota
+  archetype order fixed at pool-creation time — nothing to do with an entry's data position after
+  the first recycle. Entries can render in the wrong visual order while every trait value reads
+  correctly, the worst shape of "data-correct ≠ pixels-correct" — fixed by writing `sortOrder` to
+  the data index on every recycle.
+- **`UIElement`'s padding units default to `'%'`, and CSS percentage padding resolves against the
+  containing block's WIDTH on both axes** — so a `%` vertical padding is silently wrong. The
+  offset write therefore pins the UNIT alongside every padding value it writes; the value on its
+  own would be read as a percentage of the WIDTH, on the vertical axis too.
 - **Two engine-owned layers sit under the box**, both spawned inside a system tick so they are
   `Transient` and never reach a saved scene: a `__uiEntriesContent` column, and one
   `__uiEntriesRow` per pooled row. See "the DOM shape" below for why the row layer exists.
@@ -845,6 +880,86 @@ frame budget are different questions and the Air answers only the first.
   authoring the box bigger to compensate leaves a gap on the platform that ships. Court's page
   grid was clipped 7px top and bottom until this was authored. Default is `'auto'`.
 
+### Addressing a live entry — data coordinate, not identity
+
+A parked entry (above) is the easy case. The one that produces a wrong answer SILENTLY is a
+*visible* entry whose data coordinate changed underneath it: same entity, same guid, different
+row of data. An agent that reads a guid while the view shows entry 5 and aims at it two calls
+later — after a fling — drives entry 12 and gets a clean `ok:true`. That is a **false success**
+([enact.md](./enact.md)) wearing a new hat: the standing advice is "address by `{guid}`, never
+`{id}`", and here even the guid is not a stable address.
+
+⚠️ **There is no address that survives this yet.** `entityResolve` accepts `{guid} | {name} |
+{id}` and nothing else, so today the only safe protocol is to **re-read the guid immediately
+before acting on it** — the same "re-read bounds immediately before acting" rule, one level up.
+The plan proposed a data-coordinate address resolved server-side inside the call, refused when
+the coordinate is not currently realized (scrolled out, or past `countX`/`countY`), the way
+`selector`/`tap_handle` already work:
+
+```
+entity: { entry: { view: '<scroll-view guid>', x: 3, y: 0 }, surface: 'game-ui' }   // NOT BUILT
+```
+
+That is a **proposal, not a surface**. Nothing parses it; do not write it into a call.
+
+⚠️ **A pooled instance's guid is random unless made otherwise.** `spawnPrefabInstance` mints a
+fresh `newGuid()` root unless given a `guidSeed`, and members derive off that root. The pool
+passes a deterministic `guidSeed` built from the view guid + slot (which the determinism guard
+wants anyway) — but that makes the guid stable at the **slot**, not the entry.
+`{entity:{name:'Tile3'}}` means "whatever is in slot 3 right now", and its meaning changes as you
+scroll; addressing by `{name}` is worse still, since every pooled instance of one prefab collides
+and CLAUDE.md says that is refused rather than first-matched.
+
+### Focus follows the ENTRY, not the slot
+
+The same hazard, one layer up, and it bites the PLAYER rather than an agent. Focus is addressed
+by guid (`focusManager`), a pooled instance's guid is stable at the **slot**, and the window
+moves data under the slots — so a recycle leaves the focused guid resolving to a live, visible
+element that is now showing different data. A gamepad cursor on level 5 is silently on level 12,
+and the next Confirm launches the wrong one. Nothing errors, which is why this stayed latent as
+long as it did: neither Court's selector nor `games/scroll-demo` uses focus nav, so nothing on
+the surface could show it (#319).
+
+So `entriesSystem` captures where focus sits — the entry coordinate plus the member path inside
+that entry — before it re-drives the slots, and re-points focus at whichever slot holds that
+entry afterwards (`entriesFocus.ts`).
+
+- **It runs at `UI_ENTRIES` (270), inside the drive that caused the recycle**, not in
+  `uiFocusSystem`. That system is GAME-tier and therefore dead while paused — the same reason the
+  pool itself runs at 270.
+- ⚠️ **When the entry has left the pool entirely, focus CLAMPS to the nearest resident entry**
+  (owner, 2026-08-22). Clearing focus is the simpler rule and was rejected on feel: with a
+  gamepad, focus vanishing mid-fling reads as a dropped input, and autofocus would then drop the
+  cursor at the list's lowest `focusOrder` rather than where the player was looking. Clamping
+  makes focus ride the leading edge in the direction of travel.
+- **The member path is a `stepId` chain, and both obvious alternatives are wrong.** It cannot be
+  `resolveMemberPathIn`'s name path: that walker calls an ambiguous segment an ERROR by design,
+  which is right for an authored resolver key and wrong here — this path is DERIVED from an
+  entity that provably exists, so refusing it would mean declining to re-target focus that is
+  demonstrably sitting somewhere (`level-tile.prefab.json` alone carries three `Num`s). And it
+  must not be **name + ordinal among siblings**, which is the tempting fix and is unsound: that
+  order comes from `buildChildIndex` iterating `world.entities`, which is koota's `dense` array,
+  which `releaseEntity` maintains by **swap-pop** — destroying any entity moves the world's LAST
+  alive one into the freed slot. `releaseViewPool` destroys hundreds at once when an unrelated
+  view is hidden (809 on Court's selector close), so a destroy elsewhere can reorder two siblings
+  of a live instance relative to the same two in every other instance, and the ordinal would then
+  name a different member per slot with no error anywhere. A segment is therefore
+  `PrefabInstance.parentLocalId || localId` — authored, identical across instances, unique among
+  siblings by construction. That is not a new claim: `deriveInstanceMemberGuids` already builds
+  every member guid from exactly this chain, for exactly this reason.
+- ⚠️ **A QUEUED ACTIVATION moves with the focus, and forgetting that half fires the wrong
+  element.** A "confirm" is deferred on purpose: `uiFocusSystem` sets `pendingActivateGuid`
+  inside the pipeline tick and `UIRenderer` drains it from a React effect after commit, because
+  `applyBindings`' `call` path throws from a tick. `driveEntriesFromScroll` runs straight off the
+  DOM `scroll` event, so a re-drive lands *inside* that gap — and a queued guid left on the old
+  slot would activate whatever entry the slot recycled to. Confirm on level 5 launching level 12,
+  from one fling. `retargetFocusedGuid` moves both or neither; never call `setFocus` here.
+- **Zero cost when nothing is focused** — one `focusedGuid()` read, which returns the empty
+  string in every game today.
+- `focusOrder` is authored once in the prefab and is therefore identical across the whole pool,
+  so nav ORDER between entries still falls entirely to the DOM-rect spatial path. That is a
+  separate gap and this does not close it.
+
 ### The DOM shape — a column of auto-width rows, and why a flat box cannot work
 
 The scroll offset is carried as **padding**, and CSS padding eats the box it sits on. A single
@@ -891,6 +1006,23 @@ elements. The tree build stamps `scroll-snap-align`/`scroll-snap-stop` onto the 
 than the row serves both axes at once. `scrollSnapChildStyle` shipped with a unit test and no
 caller, so `snap` styled the container and nothing ever snapped — found by measuring the pager's
 DOM, and the reason this paragraph exists.
+
+### Degenerate shapes
+
+`countX`/`countY: 0` is undefined — nothing renders, and whether the view still scrolls to
+nowhere is unspecified. More sharply: a scroll container needs a **definite** cross-axis size,
+and `UIElement.height` defaults to `0` = auto — so an un-anchored scroll view in flex flow grows
+forever and never scrolls, with **no error at all**. Author an explicit height (or anchor the
+view); there is no diagnostic for this yet. Nested scroll views get `overscroll` (which only
+governs chaining) and have no inner-viewport measurement story.
+
+### Open questions
+
+- Does the padding-offset approach interact cleanly with `UIAnchor` when the scroll view is
+  itself anchored? Believed yes — the padding lives on an inner child, not the anchored root —
+  but unverified.
+- Should scroll position be journalled? Leaning no: it is DOM-driven presentation state, and
+  journalling at fling frequency would drown the journal. Revisit if a test ever needs it.
 
 ## Text animation (`TextAnimation` → CSS)
 

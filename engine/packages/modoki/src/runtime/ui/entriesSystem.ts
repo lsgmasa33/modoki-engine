@@ -29,11 +29,16 @@
  */
 import type { World } from 'koota';
 import { getTraitByName } from '../core/ecs/traitRegistry';
-import { spawnEntity, destroyEntity, findEntityById, onWorldSwap, getCurrentWorld } from '../core/ecs/world';
+import { spawnEntity, destroyEntity, findEntityById, findEntityByGuid, onWorldSwap, getCurrentWorld } from '../core/ecs/world';
 import { beginSystemTick, endSystemTick } from '../core/systemTick';
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { buildChildIndex } from '../core/ecs/memberPath';
 import { getEntrySource, planEntryWrites, type EntryContent } from './entrySource';
+import { focusedGuid, retargetFocusedGuid } from './focusManager';
+import {
+  describeMemberPath, resolveMemberPathSegs, pickRetargetEntry,
+  type MemberPathSeg, type ResidentEntry, type StepIdOf,
+} from './entriesFocus';
 import {
   computeAxisWindow, effectiveOverscan, planSlots, resolveEntrySize, EMPTY_WINDOW,
   type AxisWindow,
@@ -429,11 +434,133 @@ function driveView(
   // frame they appeared. Caught by this system's integration test.
   const childIndex = buildChildIndex(world);
 
+  // WHERE FOCUS IS SITTING, read BEFORE the slots are re-driven — `applySlots` is what
+  // overwrites `UIEntry.x/y`, so afterwards there is no way left to ask which entry the player
+  // was on. Costs one `focusedGuid()` read (empty string, an immediate return) in every game
+  // that does not use focus nav, which is all of them today.
+  const stepIdOf = makeStepIdOf();
+  const focusRef = captureFocusedEntry(world, pool.ids, m, childIndex, stepIdOf);
+
   writeLayout(content, rows, m, xw, yw, en);
   writeWindowState(view, m, xw, yw, plan.length);
   applySlots(world, plan, pool.ids, viewGuid, kinds[0].name, en.source as string, m, childIndex,
     { rows, cols: Math.max(1, xw.pooled), entryW, entryH });
+  // ⚠️ The SAME `childIndex` serves both halves, and it is not stale for either. `applySlots`
+  // reparents the pooled ROOTS between rows, which changes only the rows' own child buckets —
+  // both walks here start AT an entry root and go down, so neither can see that edit. Rebuilding
+  // it would be a world scan per re-drive for nothing.
+  if (focusRef) retargetFocus(pool.ids, m, childIndex, stepIdOf, focusRef);
   return true;
+}
+
+/** Where focus sits inside this view's pool: the ENTRY coordinate, plus the member path within
+ *  that entry. Captured before a re-drive so it can be re-pointed after one — see
+ *  `entriesFocus.ts` for why focus follows the entry rather than the slot. */
+interface FocusRef {
+  x: number;
+  y: number;
+  segs: MemberPathSeg[];
+  /** The guid focus was on, so an unchanged target costs no store write. */
+  guid: string;
+}
+
+/** `PrefabInstance.parentLocalId || localId` for an entity id — the authored, order-independent
+ *  key `entriesFocus` addresses members by. 0 when the entity has no `PrefabInstance`. */
+function makeStepIdOf(): StepIdOf {
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!piMeta) return () => 0;
+  return (id: number) => {
+    const e = findEntityById(id) as EntityLike | undefined;
+    if (!e || !e.has(piMeta.trait)) return 0;
+    const pi = e.get(piMeta.trait) as { localId?: number; parentLocalId?: number };
+    return (pi.parentLocalId || pi.localId || 0) as number;
+  };
+}
+
+/** Read focus back to an entry coordinate, or `null` if focus is not inside THIS view's pool.
+ *
+ *  Returns null for a focused entry that is already PARKED (`live: false`): a parked entry is
+ *  hidden, so `uiFocusSystem` has already dropped it as a candidate and re-targeting it would be
+ *  answering a question nobody asked. ⚠️ It is therefore NOT repaired while the sim is paused,
+ *  when `uiFocusSystem` is not running either — focus set onto parked data by an agent stays
+ *  there until play resumes. Deliberate: a parked slot is not a place to put focus, and inventing
+ *  a target for a cursor nobody moved is worse than leaving it.
+ *
+ *  ⚠️ **Walks the parent chain by handle, NOT by inverting the child index.** The index covers
+ *  every `EntityAttributes` entity in the world (1,477 in Court's selector), so inverting it
+ *  would be a second whole-scene pass on every re-drive of a focused view; the walk is O(depth).
+ *  This runs inside the once-per-re-drive path, past `driveView`'s early-out — never per frame. */
+function captureFocusedEntry(
+  world: World, pool: Map<number, EntityLike>, m: Metas,
+  childIndex: Map<number, { id: number; name: string }[]>,
+  stepIdOf: StepIdOf,
+): FocusRef | null {
+  const guid = focusedGuid();
+  if (!guid) return null;                       // nothing focused — the universal case today
+  const focused = findEntityByGuid(guid, world) as EntityLike | undefined;
+  if (!focused || !focused.has(m.attrMeta.trait)) return null;
+
+  const rootsById = new Map<number, EntityLike>();
+  for (const [, e] of pool) rootsById.set(e.id(), e);
+  if (rootsById.size === 0) return null;
+
+  // Up to the pooled root, collecting the chain on the way. Cycle-guarded on the pool-relative
+  // depth rather than the world size — an entry subtree is shallow, and a corrupt `parentId`
+  // graph must not spin here.
+  const chain: number[] = [];
+  let cur: EntityLike | undefined = focused;
+  let root: EntityLike | undefined;
+  for (let guard = 0; cur && guard < MAX_ENTRY_DEPTH; guard++) {
+    const hit = rootsById.get(cur.id());
+    if (hit) { root = hit; break; }
+    chain.push(cur.id());
+    const parentId = (cur.get(m.attrMeta.trait) as { parentId?: number }).parentId ?? 0;
+    if (!parentId) break;                       // ran off the top — focus is elsewhere entirely
+    cur = findEntityById(parentId) as EntityLike | undefined;
+  }
+  if (!root || !root.has(m.entryMeta.trait)) return null;
+
+  const entry = root.get(m.entryMeta.trait) as { x: number; y: number; live: boolean };
+  if (!entry.live) return null;
+  chain.reverse();                              // the walk collected target-first
+  const segs = describeMemberPath(childIndex, stepIdOf, root.id(), chain);
+  if (!segs) return null;
+  return { x: entry.x, y: entry.y, segs, guid };
+}
+
+/** How deep inside one pooled entry focus may sit before the walk gives up. An entry is a prefab
+ *  a designer authored — Court's page (page > grid > tile > face > label) is five — so this is a
+ *  corrupt-graph backstop, not a limit anyone should reach. */
+const MAX_ENTRY_DEPTH = 64;
+
+/** Re-point focus at whichever slot now holds the captured entry — or, when that entry is no
+ *  longer resident, at the nearest one that is (`pickRetargetEntry`). */
+function retargetFocus(
+  pool: Map<number, EntityLike>, m: Metas,
+  childIndex: Map<number, { id: number; name: string }[]>,
+  stepIdOf: StepIdOf,
+  ref: FocusRef,
+): void {
+  const resident: ResidentEntry[] = [];
+  for (const [, e] of pool) {
+    if (!e.has(m.entryMeta.trait)) continue;
+    const en = e.get(m.entryMeta.trait) as { x: number; y: number; live: boolean };
+    if (!en.live) continue;                     // a parked slot is not a place to put focus
+    resident.push({ x: en.x, y: en.y, rootId: e.id() });
+  }
+  const pick = pickRetargetEntry({ x: ref.x, y: ref.y }, resident);
+  if (!pick) return;                            // nothing resident — leave focus where it is
+
+  const targetId = resolveMemberPathSegs(childIndex, stepIdOf, pick.rootId, ref.segs);
+  if (!targetId) return;
+  const target = findEntityById(targetId) as EntityLike | undefined;
+  if (!target || !target.has(m.attrMeta.trait)) return;
+  const guid = (target.get(m.attrMeta.trait) as { guid?: string }).guid;
+  // `retargetFocusedGuid`, never `setFocus`: a "confirm" queued for this element is drained by
+  // `UIRenderer` AFTER the React commit, and a scroll-event re-drive lands inside that gap — so
+  // the queued activation has to move with the focus or it fires on whatever the slot recycled
+  // to. See the banner on that function.
+  if (guid) retargetFocusedGuid(ref.guid, guid);
 }
 
 /** Turn a pending `scrollToEntry*` request into a px `UIScrollView.scrollTo*`, then clear it.

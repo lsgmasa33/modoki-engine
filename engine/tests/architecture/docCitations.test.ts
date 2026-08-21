@@ -132,6 +132,7 @@ const RETIRED_DOCS_NAMED_ON_PURPOSE: ReadonlyArray<{ cited: string; absorbedBy: 
   { cited: 'docs/plans/asset-inspector-plan.md', absorbedBy: 'docs/textures.md + docs/model-pipeline.md — landed (all 5 phases); tracker deleted per doc-conventions.md' },
   { cited: 'docs/profiler.md', absorbedBy: 'nothing: docs/plans/profiler.md proposes creating it as its own fold-in target' },
   { cited: 'docs/percept-plan.md', absorbedBy: 'nothing — never existed. docs/todo.md § Deferred decisions names it as the provenance of the build-mode-enum entry, whose pointer in engine/app/main.tsx aimed here (#194)' },
+  { cited: 'docs/plans/ui-scroll-view-plan.md', absorbedBy: 'docs/ui-system.md § "Scroll views and recycled entries" — all 11 steps landed (#250 + #316); tracker deleted per doc-conventions.md (#319). Named as provenance in games/court/menu.md, games/court/runtime/levelSelect.ts, games/court/runtime/systems.ts (predictions the plan got wrong) and entriesLayout.test.ts (the step-0 spike history)' },
 ];
 
 /** Directories whose mentions are not citations by this repo's own rules. */

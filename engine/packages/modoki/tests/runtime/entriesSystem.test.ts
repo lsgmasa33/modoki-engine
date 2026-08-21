@@ -13,6 +13,7 @@ import { UIEntry } from '../../src/runtime/traits/UIEntry';
 import { UIElement } from '../../src/runtime/traits/UIElement';
 import { RenderableUI } from '../../src/runtime/traits/RenderableUI';
 import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { PrefabInstance } from '../../src/runtime/traits/PrefabInstance';
 
 let testWorld: ReturnType<typeof createWorld>;
 const idIndex = new Map<number, any>();
@@ -32,6 +33,9 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
     return found;
   },
   indexEntityGuid: () => {},
+  // Pulled in transitively since the system began re-targeting focus on recycle: focusManager
+  // -> bindings -> uiTreeStore -> entityUtils calls this at module scope.
+  setStructureCallback: () => {},
 }));
 
 const markUIDirtySpy = vi.fn();
@@ -46,6 +50,10 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
     { name: 'UIScrollView', trait: UIScrollView }, { name: 'UIEntries', trait: UIEntries },
     { name: 'UIEntry', trait: UIEntry }, { name: 'UIElement', trait: UIElement },
     { name: 'RenderableUI', trait: RenderableUI }, { name: 'EntityAttributes', trait: EntityAttributes },
+    // Real pooled entries come from a prefab, so every member carries PrefabInstance — and the
+    // focus re-target addresses members by its `parentLocalId || localId`. Without this the
+    // fixture would exercise only the no-prefab FALLBACK key and vouch for the wrong path.
+    { name: 'PrefabInstance', trait: PrefabInstance },
   ];
   return { getAllTraits: () => traits, getTraitByName: (n: string) => traits.find(t => t.name === n) };
 });
@@ -62,9 +70,11 @@ function makeProvider() {
     rootSize: () => ({ width: 0, height: ENTRY_H }),
     spawnInstance: (world: any, _guid: string, opts: { parentId: number; guidSeed: string }) => {
       const root = world.spawn(UIElement({ height: ENTRY_H }), RenderableUI(),
+        PrefabInstance({ source: PREFAB, localId: 1 }),
         EntityAttributes({ name: 'Entry', parentId: opts.parentId, guid: opts.guidSeed }));
       idIndex.set(root.id(), root);
       const label = world.spawn(UIElement({ text: '' }), RenderableUI(),
+        PrefabInstance({ source: PREFAB, localId: 2 }),
         EntityAttributes({ name: 'Label', parentId: root.id(), guid: `${opts.guidSeed}|Label` }));
       idIndex.set(label.id(), label);
       spawned.push(root.id());
@@ -630,5 +640,143 @@ describe('entriesSystem', () => {
     const { sys } = await setup();
     sys.setEntryPrefabProvider(null);
     expect(() => sys.entriesSystem(testWorld)).not.toThrow();
+  });
+});
+
+/** Focus follows the ENTRY, not the slot (#319).
+ *
+ *  The guid of a pooled instance is deterministic at the SLOT — deliberately, so an agent can
+ *  address "the third pooled instance" across a re-drive. Focus is addressed by guid. So without
+ *  a re-target the focused guid keeps resolving to a live, visible element that is now showing
+ *  DIFFERENT DATA: a gamepad cursor on level 5 is silently on level 12, and Confirm launches the
+ *  wrong one. Nothing errors, which is why this needed a test rather than a bug report.
+ *
+ *  It runs inside `entriesSystem` (priority 270) rather than in `uiFocusSystem`, which is
+ *  GAME-tier and therefore dead while paused — and a level select is exactly what you scroll
+ *  while paused. */
+describe('entriesSystem — focus on recycle', () => {
+  /** The pooled entry root's guid, from the guid of a member inside it (the fake provider names
+   *  a Label `${rootGuid}|Label`). */
+  const rootGuidOf = (guid: string) => guid.replace(/\|Label$/, '');
+
+  /** The DATA index the currently-focused element is sitting on. */
+  function focusedEntryIndex(focus: { focusedGuid: () => string }): number {
+    const root = rootGuidOf(focus.focusedGuid());
+    let index = -1;
+    testWorld.query(EntityAttributes, UIEntry).updateEach(([a, e]: any[]) => {
+      if (a.guid === root) index = e.index;
+    });
+    return index;
+  }
+
+  /** Focus the Label inside whichever slot currently shows entry `dataIndex`. */
+  function focusLabelOfEntry(focus: { setFocus: (g: string) => void }, dataIndex: number): string {
+    let rootGuid = '';
+    testWorld.query(EntityAttributes, UIEntry).updateEach(([a, e]: any[]) => {
+      if (e.index === dataIndex && e.live) rootGuid = a.guid;
+    });
+    expect(rootGuid).not.toBe('');
+    focus.setFocus(`${rootGuid}|Label`);
+    return `${rootGuid}|Label`;
+  }
+
+  it('re-points focus at the slot that now holds the same entry', async () => {
+    const { sys, src, view } = await setup();
+    const focus = await import('../../src/runtime/ui/focusManager');
+    focus.resetFocus();
+    src.registerEntrySource('test.rows', ({ index }) => ({ members: { 'Label': { UIElement: { text: `row ${index}` } } } }));
+    sys.entriesSystem(testWorld);
+
+    const before = focusLabelOfEntry(focus, 3);
+    expect(focusedEntryIndex(focus)).toBe(3);
+
+    // Scroll ONE ENTRY AT A TIME, driving between each. A single big jump reports a large travel
+    // and raises the overscan to cover it, which widens the band instead of moving `first` — so a
+    // teleport is exactly the wrong way to make the pool recycle, and the first cut of this test
+    // asserted against a window that had not moved at all.
+    for (let i = 1; i <= 2; i++) {
+      view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: i * ENTRY_H });
+      sys.entriesSystem(testWorld);
+    }
+
+    expect(focus.focusedGuid()).not.toBe(before);      // it moved to a different SLOT...
+    expect(focusedEntryIndex(focus)).toBe(3);          // ...to stay on the same ENTRY
+  });
+
+  it('clamps to the nearest resident entry when the focused one has left the pool', async () => {
+    // Owner's call, 2026-08-22: clearing focus reads as a dropped input on a gamepad, and
+    // autofocus would then drop the cursor at the list's lowest focusOrder rather than where the
+    // player was looking. Clamping makes focus ride the leading edge of the fling.
+    const { sys, src, view } = await setup();
+    const focus = await import('../../src/runtime/ui/focusManager');
+    focus.resetFocus();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    focusLabelOfEntry(focus, 3);
+
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 100 * ENTRY_H });
+    sys.entriesSystem(testWorld);
+
+    // Against the LIVE resident set, not a hardcoded index: a jump raises the travel-driven
+    // overscan, so where the band starts is an engine decision this test has no business
+    // predicting. The claim is only that focus landed on the resident entry NEAREST to 3.
+    const resident: number[] = [];
+    testWorld.query(UIEntry).updateEach(([e]: any[]) => { if (e.live) resident.push(e.index); });
+    const nearest = Math.min(...resident);
+    expect(nearest).toBeGreaterThan(3);                // entry 3 really is out of the pool
+    expect(focusedEntryIndex(focus)).toBe(nearest);
+    expect(focus.focusedGuid()).toMatch(/\|Label$/);   // still the same MEMBER, not the root
+  });
+
+  it('carries a QUEUED activation with the focus, so Confirm cannot fire on the wrong entry', async () => {
+    // The sibling of the same defect, found by the close-out sweep. A "confirm" is deferred:
+    // uiFocusSystem queues `pendingActivateGuid` inside the pipeline tick and UIRenderer drains
+    // it from a React effect AFTER commit. `driveEntriesFromScroll` runs straight off the DOM
+    // scroll event and can land in that gap — so a queued guid left on the old slot would
+    // activate whatever entry that slot recycled to.
+    const { sys, src, view } = await setup();
+    const focus = await import('../../src/runtime/ui/focusManager');
+    focus.resetFocus();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+
+    const before = focusLabelOfEntry(focus, 3);
+    focus.requestActivate(before);
+    for (let i = 1; i <= 2; i++) {
+      view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: i * ENTRY_H });
+      sys.entriesSystem(testWorld);
+    }
+
+    const pending = focus.useFocusStore.getState().pendingActivateGuid;
+    expect(pending).not.toBe(before);                  // it did not stay on the old slot...
+    expect(pending).toBe(focus.focusedGuid());         // ...it followed the focus
+    expect(focusedEntryIndex(focus)).toBe(3);          // which is still entry 3
+  });
+
+  it('leaves focus alone when it is not inside this view pool', async () => {
+    const { sys, src, view } = await setup();
+    const focus = await import('../../src/runtime/ui/focusManager');
+    focus.resetFocus();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+
+    focus.setFocus('view-guid');                       // the scroll view itself, not an entry
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 40 * ENTRY_H });
+    sys.entriesSystem(testWorld);
+
+    expect(focus.focusedGuid()).toBe('view-guid');
+  });
+
+  it('does not touch focus when nothing is focused', async () => {
+    const { sys, src, view } = await setup();
+    const focus = await import('../../src/runtime/ui/focusManager');
+    focus.resetFocus();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 40 * ENTRY_H });
+    sys.entriesSystem(testWorld);
+
+    expect(focus.focusedGuid()).toBe('');
   });
 });
