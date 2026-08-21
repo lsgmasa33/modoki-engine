@@ -412,13 +412,18 @@ describe('refcount cache — environment (HDR)', () => {
     expect(getCachedEnvironment(G('/env/sky.hdr'))).toBeDefined();
   });
 
-  it('release from last owner disposes the HDR texture', async () => {
-    const { acquireEnvironment, releaseEnvironment, getCachedEnvironment } = await getCache();
+  it('release from last owner evicts + RETIRES the HDR texture (it does not dispose it)', async () => {
+    // #315: "last OWNER" is not "nothing binds it". A render-on-demand SceneView that has not
+    // redrawn since the swap still has this instance on `scene.environment`, so disposing here
+    // is a use-after-free — the same defect `invalidateEnvironment` had. The texture is retired
+    // instead, and `syncEnvironment`'s sweep frees it once no surface binds it.
+    const { acquireEnvironment, releaseEnvironment, getCachedEnvironment, retiredEnvironments } = await getCache();
     await acquireEnvironment(1, G('/env/sky.hdr'));
     const tex = getCachedEnvironment(G('/env/sky.hdr'))!;
     releaseEnvironment(1, G('/env/sky.hdr'));
     expect(getCachedEnvironment(G('/env/sky.hdr'))).toBeUndefined();
-    expect(tex.dispose).toHaveBeenCalled();
+    expect(tex.dispose).not.toHaveBeenCalled();
+    expect(retiredEnvironments().has(tex as never)).toBe(true);
   });
 
   it('release with remaining owner keeps the texture alive', async () => {

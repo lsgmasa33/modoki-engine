@@ -478,13 +478,78 @@ subscribes to `kind: 'texture'` and invalidates any cached material holding a re
 evicts (so path-keyed panels see the event), so a synchronous listener would read the
 pre-retirement state and match nothing.
 
-⚠️ **`invalidateEnvironment` still has this defect** (`meshTemplateCache.ts`). It disposes the
-cached HDR unconditionally while its own doc comment says it "KEEPS the scene owners", and
-`scene3DSync` binds that texture as `scene.environment` — so re-importing an HDR that a scene is
-using reproduces the same crash. The env cache uses owner-sets rather than the `loadTexture3D`
-refcount, and the safe dispose point is where `scene.environment` is swapped, so the fix is not
-a copy of the one above. Tracked in **#315** — do not "fix" it by simply deleting the `dispose()`,
-which leaks one HDR per re-import.
+### The env cache retires too — but it is freed by a SWEEP, not a refcount (#315)
+
+`invalidateEnvironment` had the same defect: it disposed the cached HDR unconditionally while
+its own contract "KEEPS the scene owners", and `scene3DSync` binds that instance as
+`scene.environment` (and, with `showAsBackground`, `scene.background`). Re-importing an HDR a
+scene was using reproduced the same `Destroyed texture used in a submit`.
+
+**The fix is deliberately NOT a copy of the one above.** The env cache has owner-*sets*
+(`envOwners`) and no per-holder release, so there is no refcount for the last releaser to drop.
+So `invalidateEnvironment` retires into `retiredEnvs`, and `syncEnvironment` — the only function
+that *binds* an env texture, and therefore the only one every 3D surface must call to hold one —
+runs a sweep at the end of each frame: it asks every registered live `THREE.Scene` what it is
+**actually** binding right now, and frees a retiree that nobody binds.
+
+⚠️ **The sweep reads the live property instead of tracking bind/unbind calls, on purpose.** Five
+sites outside `syncEnvironment` clear `scene.environment`/`scene.background` (`Scene3D`'s
+teardown, `SceneView`'s UI-mode and unmount paths). An explicit acquire/release would have to be
+threaded through every one of them and would go silently wrong the moment a sixth appeared —
+the partially-wired-mechanism failure this repo keeps hitting. Reading the property cannot go
+stale.
+
+**The multi-surface case is what forces the design**: the editor renders SceneView and the Game
+panel from two different `THREE.Scene`s off one env cache, so freeing when the *first* surface
+rebinds would still destroy a texture the second one binds.
+
+**Two more paths were routed through the retirement in the same pass**, because the sweep is the
+only thing that can answer "does anything still bind this?":
+
+- **`releaseEnvironmentByPath`** (the scene swap). "Last OWNER" is not "nothing binds it" — a
+  render-on-demand SceneView that has not redrawn since the swap still has the instance on
+  `scene.environment`, so the frames between the release and its next sync drew a destroyed
+  texture. It retires now; the sweep frees it on that surface's very next `syncEnvironment`.
+- **`fetchEnvironment`'s load callback.** `invalidateEnvironment` clears `envLoadPromises`, so a
+  fetch already in flight stops deduping a second one and BOTH callbacks reach
+  `envCache.set(path, …)`. The loser used to be overwritten silently — unreachable to every
+  lookup *and* to the sweep, i.e. an HDR-sized leak. It is retired instead. Disposing it there
+  would not have been safe either: a surface may be binding it.
+
+⚠️ **Every site that binds a `getCachedEnvironment` result to a `THREE.Scene` must call
+`registerEnvSurface` first.** There are exactly two: `syncEnvironment`, and
+`prewarmShadersForWorld`'s throwaway compile scene — which was missed in the first cut of this
+fix and is the reason the warning is here. That binding outlives an `await compileAsync`, so an
+unregistered prewarm let a re-import during the compile free the texture the compile was still
+sampling. Pinned by `prewarmShaders.test.ts` § "registers its compile scene with the
+retired-env sweep".
+
+⚠️ **`showAsBackground` used to be wired in ONE direction, and that pinned retirees.**
+`syncEnvironment` set `scene.background` to the HDR but nothing ever took it back — not when the
+box was unticked, not when the Environment was removed. `syncCamera` could not undo it either: it
+deliberately "leaves a TEXTURE background alone" *because this sync owns it*, which is exactly
+what made the stale one permanent. Observed live on `games/3d-test`: unticking the box left the
+sky on screen across frames. Two failures in one — the visible authoring bug (an
+[exposed field nothing reads](../CLAUDE.md)), and a live surface holding a retired texture the
+sweep could then never free. `clearTextureBackground` closes both. It clears to `null` rather
+than to the camera's clearColor, because `syncCamera` owns that value and re-applies it on
+`bg == null`; in `Scene3D` it runs first, so the authored colour lands one frame later.
+
+The residual failure mode is a **leak, never a use-after-free**: a surface that stops rendering
+while still bound keeps its texture alive (which is correct), and `disposeAllCachedResources`
+drains whatever is left with the cache generation. Do not "fix" this by deleting the retirement
+and disposing directly — and never call `dispose()` on a retiree; use `disposeRetiredEnvironment`.
+
+⚠️ **The live editor path does NOT discriminate here, and a green run through it proves nothing.**
+Driving the Inspector's Environment **Re-import** on `games/3d-test` (WebGPU/Metal, this Mac)
+raised no uncaptured error and rebound to fresh bytes **with the fix reverted** as well as with it
+in place — measured both ways, including with `showAsBackground` forced on so the HDR was sampled
+directly as `scene.background` rather than only through PMREM. The window between the dispose and
+the rebind is short (the bake is awaited first, and `fireDirtyListeners` wakes the surface), and
+three's WebGPU backend frees lazily, so the fault does not surface on this hardware. **The unit
+tests are the proof** (`environmentInvalidationRetires.test.ts` — all three fail against the
+pre-fix code); the live run is a non-regression check only. Do not read "I could not reproduce
+it in the editor" as evidence the defect is not there.
 
 **Verifying a fix here needs the right path.** `modoki_reimport_asset` drives the backend bake
 only and never runs the browser-side `importModel` that calls `invalidateTexture` — it cannot

@@ -38,6 +38,8 @@ async function setup() {
     resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(() => null),
     resolveMaterialForMesh: vi.fn(() => null), resolveMaterial: vi.fn(),
     getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
+    // syncEnvironment sweeps retired envs (#315) — a mock without these throws on every call.
+    retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
   }));
   vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
   vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: vi.fn(() => false) }));
@@ -373,6 +375,8 @@ describe('syncLights — IBL-off ambient compensation', () => {
       resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(() => null),
       resolveMaterialForMesh: vi.fn(() => null), resolveMaterial: vi.fn(),
       getCachedEnvironment: vi.fn(() => ({ isTexture: true })), acquireEnvironment: vi.fn(),
+      // syncEnvironment sweeps retired envs (#315) — a mock without these throws on every call.
+      retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
     }));
     vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
     vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: vi.fn(() => false) }));

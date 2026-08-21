@@ -1248,6 +1248,11 @@ export function disposeAllCachedResources() {
   envCache.clear();
   envLoadPromises.clear();
   envOwners.clear();
+  // Retired envs too: their sweep runs from `syncEnvironment`, so a surface that stops
+  // rendering (or a build with no 3D surface at all) would otherwise strand them forever.
+  // Everything binding them is being torn down with this generation anyway.
+  for (const tex of retiredEnvs) tex.dispose();
+  retiredEnvs.clear();
 
   // Clear refcount tracking
   modelOwners.clear();
@@ -1565,7 +1570,12 @@ function releaseEnvironmentByPath(sceneId: SceneId, hdrPath: string): void {
   const wasLast = removeOwner(envOwners, hdrPath, sceneId);
   if (wasLast) {
     const tex = envCache.get(hdrPath);
-    if (tex) tex.dispose();
+    // Retire rather than dispose, for the same reason `invalidateEnvironment` does (#315).
+    // "Last OWNER" is not "nothing binds it": a render-on-demand SceneView that has not redrawn
+    // since the swap still has this instance on `scene.environment`, and would draw a destroyed
+    // texture on its next frame. The sweep frees it once no surface binds it — which, on a swap
+    // where the new scene has no env, is that surface's very next `syncEnvironment`.
+    if (tex) retiredEnvs.add(tex);
     envCache.delete(hdrPath);
     envLoadPromises.delete(hdrPath);
   }
@@ -1586,9 +1596,36 @@ export function invalidateEnvironment(hdrRef: string): void {
   // Inspector's stats are sidecar-derived and path-keyed, same as the rest.
   emitAssetInvalidated('environment', hdrPath);
   const tex = envCache.get(hdrPath);
-  if (tex) tex.dispose();
+  // RETIRE, don't dispose (#315). This call KEEPS the scene owners, so the render surfaces are
+  // still binding this instance to `scene.environment`/`scene.background` right now — disposing
+  // it here made the next submit bind a destroyed texture. It stays alive, unreachable to new
+  // lookups, until `sweepRetiredEnvironments` observes that no live surface binds it any more.
+  if (tex) retiredEnvs.add(tex);
   envCache.delete(hdrPath);
   envLoadPromises.delete(hdrPath);
+}
+
+/** HDR envs evicted by {@link invalidateEnvironment} while a render surface still bound them.
+ *
+ *  ⚠️ The env cache has no per-holder release to hang the free off — owners are SETS
+ *  (`envOwners`), and the binding lives in another module (`scene3DSync`). So unlike the shared
+ *  texture cache's `retired` map, this cannot be refcounted: it is freed by a sweep that reads
+ *  the live `scene.environment`/`scene.background` of every surface. Reading the real property
+ *  rather than a shadow record is deliberate — five sites outside `syncEnvironment` clear those
+ *  bindings, and a hand-maintained list of them would go stale invisibly. */
+const retiredEnvs = new Set<THREE.DataTexture>();
+
+/** The retired-env set, for `scene3DSync`'s sweep. Empty in the overwhelmingly common case —
+ *  callers check `.size` before doing any per-surface work. */
+export function retiredEnvironments(): ReadonlySet<THREE.DataTexture> {
+  return retiredEnvs;
+}
+
+/** Free one retired env once the sweep has established that nothing binds it. Never call
+ *  `dispose()` on a retired env directly — that is the bug this exists to prevent. */
+export function disposeRetiredEnvironment(tex: THREE.DataTexture): void {
+  if (!retiredEnvs.delete(tex)) return; // not retired (or already freed) — nothing to do
+  tex.dispose();
 }
 
 function fetchEnvironment(hdrPath: string): Promise<void> {
@@ -1624,6 +1661,13 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
             return;
           }
           texture.mapping = THREE.EquirectangularReflectionMapping;
+          // An invalidate mid-flight clears `envLoadPromises`, so a SECOND fetch for this path
+          // can already have landed here. Retire the incumbent instead of letting `set`
+          // silently orphan it — orphaned, it is unreachable to every lookup AND to the sweep,
+          // i.e. an HDR-sized leak. Retiring is also the only safe move: a surface may be
+          // binding it right now, so disposing here would be #315 again.
+          const prev = envCache.get(hdrPath);
+          if (prev && prev !== texture) retiredEnvs.add(prev);
           envCache.set(hdrPath, texture);
           // Wake the render-on-demand viewport so syncEnvironment applies this IBL.
           // Like the material refetch above, an HDR that finishes loading after the

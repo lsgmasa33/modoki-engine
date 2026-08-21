@@ -49,7 +49,9 @@ function makeRigPrototype(): THREE.Object3D {
   return group;
 }
 
-async function setup(opts: { primitives?: boolean; env?: unknown; rig?: THREE.Object3D; overrideMaterial?: THREE.Material } = {}) {
+const disposeRetiredEnvironment = vi.fn();
+
+async function setup(opts: { primitives?: boolean; env?: unknown; rig?: THREE.Object3D; overrideMaterial?: THREE.Material; retiredEnvs?: Set<unknown>; primitiveMaterial?: THREE.Material } = {}) {
   vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms, deactivatedEntities, transformPropagationSystem: {},
   }));
@@ -61,6 +63,10 @@ async function setup(opts: { primitives?: boolean; env?: unknown; rig?: THREE.Ob
     // "override silently dropped because the guid did not resolve".
     resolveMaterial: vi.fn(() => opts.overrideMaterial ?? null),
     getCachedEnvironment: vi.fn(() => opts.env ?? null), acquireEnvironment: vi.fn(),
+    // The retired-env sweep syncEnvironment runs (#315). `retiredEnvs` lets a test park a
+    // retiree so it can assert the prewarm's own env binding is visible to that sweep.
+    retiredEnvironments: () => opts.retiredEnvs ?? new Set(),
+    disposeRetiredEnvironment,
   }));
   vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
     getRiggedModel: vi.fn((ref: string) => (opts.rig && ref === RIG_REF ? { prototype: opts.rig, animations: [] } : undefined)),
@@ -71,7 +77,9 @@ async function setup(opts: { primitives?: boolean; env?: unknown; rig?: THREE.Ob
   // mirroring the real factory (which mints geometry + material per call — the very
   // per-entity cost the dedupe exists to avoid).
   const createPrimitiveMesh = vi.fn(() =>
-    opts.primitives ? new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial()) : null,
+    opts.primitives
+      ? new THREE.Mesh(new THREE.BufferGeometry(), opts.primitiveMaterial ?? new THREE.MeshStandardMaterial())
+      : null,
   );
   vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh }));
   vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: vi.fn(() => false) }));
@@ -102,6 +110,10 @@ function makeRendererStub() {
    *  must traverse rather than filter `scene.children`. Same reason as the rest for capturing
    *  here: `prewarmScene.clear()` runs after the compile, so a post-call read finds nothing. */
   const compiledSkinned: { material: THREE.Material | THREE.Material[] }[][] = [];
+  /** Per-mesh pipeline-key inputs AT compile time (#238): the world-transform determinant sign,
+   *  `frustumCulled`, and the material's `side`. All three decide WHICH pipeline three builds, and
+   *  all three are cleared or restored by the time the prewarm returns. */
+  const compiledMeshes: { det: number; frustumCulled: boolean; side: THREE.Side; transparent: boolean; material: THREE.Material }[][] = [];
   const renderer = {
     compileAsync: vi.fn(async (scene: THREE.Scene) => {
       compiledScenes.push(scene);
@@ -120,6 +132,14 @@ function makeRendererStub() {
         if ((o as THREE.SkinnedMesh).isSkinnedMesh) rigs.push({ material: (o as THREE.SkinnedMesh).material });
       });
       compiledSkinned.push(rigs);
+      compiledMeshes.push(
+        scene.children
+          .filter((o) => (o as THREE.Mesh).isMesh)
+          .map((o) => {
+            const m = (o as THREE.Mesh).material as THREE.Material;
+            return { det: o.matrixWorld.determinant(), frustumCulled: o.frustumCulled, side: m.side, transparent: m.transparent, material: m };
+          }),
+      );
       standardMeshCounts.push(
         scene.children.filter(
           (o) => (o as THREE.Mesh).isMesh && (o as THREE.Mesh).material instanceof THREE.MeshStandardMaterial,
@@ -127,7 +147,7 @@ function makeRendererStub() {
       );
     }),
   };
-  return { renderer, compiledScenes, standardMeshCounts, compiledEnvironments, compiledLightShadows, compiledMeshShadows, compiledFog, compiledSkinned };
+  return { renderer, compiledScenes, standardMeshCounts, compiledEnvironments, compiledLightShadows, compiledMeshShadows, compiledFog, compiledSkinned, compiledMeshes };
 }
 
 const camera = new THREE.PerspectiveCamera();
@@ -229,6 +249,42 @@ describe('prewarmShadersForWorld — the environment mirror follows the TIER', (
   it('does NOT mirror it on LOW, where syncEnvironment suppresses IBL', async () => {
     const { compiledEnv } = await prewarmWithEnv(LOW);
     expect(compiledEnv).toBeNull();
+  });
+
+  /** #315 — the prewarm's throwaway scene is the ONE other place a cached env texture is bound
+   *  to a THREE.Scene, and the binding outlives an `await compileAsync`. If it does not register
+   *  with the retired-env sweep, a re-import during that await lets the sweep free the texture
+   *  the compile is still sampling — the exact use-after-free the retirement exists to prevent.
+   *
+   *  Driven through the sweep itself: park the env in the retired set, prewarm, then run
+   *  `syncEnvironment` on an UNRELATED scene (a second surface that binds nothing). Unregistered,
+   *  that sweep sees no holder and frees the texture. */
+  it("registers its compile scene with the retired-env sweep, so a re-import can't free the texture mid-compile", async () => {
+    const envTexture = { isTexture: true, name: 'fake-hdr' } as unknown as THREE.Texture;
+    const retiredEnvs = new Set([envTexture]);
+    const { world, sync } = await setup({ env: envTexture, retiredEnvs });
+    const { Environment } = await import('../../src/three/traits/Environment');
+    const { createWorld } = await import('koota');
+    world.spawn(Environment({ hdrPath: 'hdr-guid', intensity: 0.4 }));
+
+    // The sweep has to run WHILE the compile is in flight — that is the whole window. Prewarm
+    // detaches the env immediately after `compileAsync` resolves, so a sweep fired after the
+    // call has nothing left to observe and would pass for the wrong reason.
+    let sweptDuringCompile = false;
+    const renderer = {
+      compileAsync: vi.fn(async (scene: THREE.Scene) => {
+        expect(scene.environment, 'the prewarm must actually mirror the env, or this proves nothing').toBe(envTexture);
+        // A different surface renders a frame. Its world has no Environment of its own, so the
+        // ONLY holder of the retiree is the prewarm scene currently being compiled.
+        sync.syncEnvironment(createWorld(), new THREE.Scene());
+        sweptDuringCompile = true;
+      }),
+      getContext: () => ({}), backend: {}, info: { render: {} },
+    };
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+
+    expect(sweptDuringCompile, 'the compile hook must have run').toBe(true);
+    expect(disposeRetiredEnvironment).not.toHaveBeenCalled();
   });
 });
 
@@ -494,5 +550,183 @@ describe('prewarmShadersForWorld — the unresolved-ref tally (#238)', () => {
       await sync.prewarmShadersForWorld(world, renderer as never, camera);
       expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('[prewarm]'))).toEqual([]);
     } finally { warn.mockRestore(); }
+  });
+});
+
+/** #238, fourth and fifth instances of the one defect this function keeps having: the prewarm's
+ *  copy differs from what the renderer draws, so it compiles pipelines nobody uses and the first
+ *  real frame builds the real set synchronously.
+ *
+ *  These two inputs are PIPELINE KEY, not uniforms — three folds both into the render pipeline
+ *  descriptor (`WebGPUPipelineUtils._getPrimitiveState`):
+ *    - `object.matrixWorld.determinant() < 0` flips `frontFace` to CW;
+ *    - a transparent DOUBLE-SIDED material is drawn in two side-pinned passes, so its pipelines
+ *      carry `cullMode: 'back'`, never the `'none'` a DoubleSide material implies.
+ *  Measured on `games/3d-test` (desktop Chrome, one process, `tools-scratch/boot-stall/`): those
+ *  two accounted for all 8 of its synchronous post-swap `MeshStandardMaterial` builds — 2 mirrored
+ *  and 6 side-pinned — and mirroring them here took that count to 0. */
+describe('prewarmShadersForWorld — mirrored transforms compile the CW variant (#238)', () => {
+  it('places a NEGATIVE-determinant placeholder for an entity with a mirrored scale', async () => {
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true });
+    const { Transform } = await import('../../src/runtime/traits');
+    const stub = makeRendererStub();
+
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: '' }),
+      Transform({ sx: -1, sy: 1, sz: 1 }));
+
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+
+    // Read at compile time: `compileAsync` is where three reads the determinant, and the prewarm
+    // updates world matrices immediately before the call for exactly this reason.
+    expect(stub.compiledMeshes[0].map((m) => Math.sign(m.det))).toEqual([-1]);
+  });
+
+  it('compiles BOTH variants when one mesh+material is drawn mirrored and unmirrored', async () => {
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true });
+    const { Transform } = await import('../../src/runtime/traits');
+    const stub = makeRendererStub();
+
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: '' }),
+      Transform({ sx: 1, sy: 1, sz: 1 }));
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: '' }),
+      Transform({ sx: -1, sy: 1, sz: 1 }));
+
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+
+    // The mirror flag is part of the dedupe key — without it the second entity collapses into the
+    // first and the CW pipeline is left for the first real frame.
+    expect(stub.compiledMeshes[0].map((m) => Math.sign(m.det)).sort()).toEqual([-1, 1]);
+  });
+
+  it('inherits the mirror from a PARENT, since the determinant is a world-transform fact', async () => {
+    const { world, sync, Renderable3DPrimitive, EntityAttributes } = await setup({ primitives: true });
+    const { Transform } = await import('../../src/runtime/traits');
+    const stub = makeRendererStub();
+
+    const parent = world.spawn(Transform({ sx: -1, sy: 1, sz: 1 }));
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: '' }),
+      Transform({ sx: 1, sy: 1, sz: 1 }), EntityAttributes({ parentId: parent.id() }));
+
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+
+    expect(stub.compiledMeshes[0].map((m) => Math.sign(m.det))).toEqual([-1]);
+  });
+
+  it('treats an EVEN number of negative scales as unmirrored', async () => {
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true });
+    const { Transform } = await import('../../src/runtime/traits');
+    const stub = makeRendererStub();
+
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: '' }),
+      Transform({ sx: -1, sy: -1, sz: 1 }));
+
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+
+    expect(stub.compiledMeshes[0].map((m) => Math.sign(m.det))).toEqual([1]);
+  });
+});
+
+describe('prewarmShadersForWorld — transparent double-sided materials compile SIDE-PINNED (#238)', () => {
+  it('places one BackSide and one FrontSide placeholder, and no DoubleSide one', async () => {
+    const transparentDouble = new THREE.MeshStandardMaterial({ transparent: true, side: THREE.DoubleSide });
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true, primitiveMaterial: transparentDouble });
+    const stub = makeRendererStub();
+
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: '' }));
+
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+
+    // three renders this material twice — BackSide then FrontSide — so those are the two pipelines
+    // the first frame needs. Compiling the DoubleSide variant instead is what it used to do.
+    expect(stub.compiledMeshes[0].map((m) => m.side).sort()).toEqual([THREE.BackSide, THREE.FrontSide].sort());
+    expect(stub.compiledMeshes[0].some((m) => m.side === THREE.DoubleSide)).toBe(false);
+  });
+
+  it('leaves the AUTHORED material untouched — the pins are clones', async () => {
+    const transparentDouble = new THREE.MeshStandardMaterial({ transparent: true, side: THREE.DoubleSide });
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true, primitiveMaterial: transparentDouble });
+    const stub = makeRendererStub();
+
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: '' }));
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+
+    // Pinning the shared material in place would have the live scene render one frame single-sided
+    // — the prewarm runs while the OUTGOING scene is still drawing.
+    expect(transparentDouble.side).toBe(THREE.DoubleSide);
+    expect(stub.compiledMeshes[0].every((m) => m.material !== transparentDouble)).toBe(true);
+  });
+
+  it('does NOT split an opaque double-sided material — three draws that in one pass', async () => {
+    const opaqueDouble = new THREE.MeshStandardMaterial({ transparent: false, side: THREE.DoubleSide });
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true, primitiveMaterial: opaqueDouble });
+    const stub = makeRendererStub();
+
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: '' }));
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+
+    expect(stub.compiledMeshes[0].map((m) => m.side)).toEqual([THREE.DoubleSide]);
+  });
+});
+
+describe('prewarmShadersForWorld — what the prewarm mints outlives the compile (#238)', () => {
+  it('does not dispose the material it minted, which would release the pipeline it just warmed', async () => {
+    const minted = new THREE.MeshStandardMaterial();
+    const dispose = vi.spyOn(minted, 'dispose');
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true, primitiveMaterial: minted });
+    const stub = makeRendererStub();
+
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: '' }));
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+
+    // three refcounts a render pipeline by the render objects referencing it, so disposing the
+    // material here drops it back to zero and frees the compiled pipeline (measured: the cache
+    // shrank by one at the exact millisecond the old dispose block ran).
+    expect(dispose).not.toHaveBeenCalled();
+  });
+
+  it('still owns the minted material when an AUTHORED override fails to resolve', async () => {
+    const minted = new THREE.MeshStandardMaterial();
+    const dispose = vi.spyOn(minted, 'dispose');
+    // `overrideMaterial` unset → the harness's resolveMaterial returns null, so the authored ref
+    // does not resolve and the primitive keeps wearing `minted`.
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true, primitiveMaterial: minted });
+    const stub = makeRendererStub();
+
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: 'guid-that-never-resolves' }));
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+
+    // Ownership follows whether the swap ACTUALLY happened, not whether a ref was authored:
+    // keying off `rend.material` leaks one material per scene swap on exactly the failure path
+    // the unresolved-ref tally exists to report.
+    expect(dispose).toHaveBeenCalled();
+  });
+
+  it('frees the PREVIOUS prewarm mint on the next call, so the deferral is not a leak', async () => {
+    const minted = new THREE.MeshStandardMaterial();
+    const dispose = vi.spyOn(minted, 'dispose');
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true, primitiveMaterial: minted });
+    const stub = makeRendererStub();
+
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: '' }));
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+
+    expect(dispose).toHaveBeenCalled();
+  });
+});
+
+describe('prewarmShadersForWorld — placeholders opt out of frustum culling (#238)', () => {
+  it('marks every placeholder frustumCulled:false', async () => {
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true });
+    const stub = makeRendererStub();
+
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: '' }));
+    await sync.prewarmShadersForWorld(world, stub.renderer as never, camera);
+
+    // `compileAsync` frustum-culls its render list against the frustum LEFT BEHIND by the last
+    // rendered frame — the OUTGOING scene's camera. Leaving that in the loop makes what the
+    // prewarm compiles depend on where the previous scene happened to be looking.
+    expect(stub.compiledMeshes[0].every((m) => m.frustumCulled === false)).toBe(true);
   });
 });

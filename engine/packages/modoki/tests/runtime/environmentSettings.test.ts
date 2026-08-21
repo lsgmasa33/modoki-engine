@@ -99,7 +99,7 @@ describe('invalidateEnvironment', () => {
     spy.mockRestore();
   });
 
-  it('disposes + evicts a live cached HDR but KEEPS owners so the next acquire reloads', async () => {
+  it('retires + evicts a live cached HDR but KEEPS owners so the next acquire reloads', async () => {
     // The re-import path: after the Environment Inspector re-bakes a downscaled ~env.hdr,
     // it calls invalidateEnvironment to drop the stale live texture. Ownership must be
     // retained so the scene's next syncEnvironment/re-acquire re-fetches the fresh bytes
@@ -116,7 +116,11 @@ describe('invalidateEnvironment', () => {
 
       // Evict via the SOURCE PATH form (what the editor re-import call passes).
       invalidateEnvironment(PATH);
-      expect(cached.dispose).toHaveBeenCalled();           // live texture disposed
+      // NOT disposed (#315): keeping the owners means a render surface is still binding this
+      // very instance to `scene.environment`, so destroying it here made the next submit bind a
+      // destroyed texture. It is retired instead and freed by `syncEnvironment`'s sweep — see
+      // `environmentInvalidationRetires.test.ts`, which drives that seam.
+      expect(cached.dispose).not.toHaveBeenCalled();
       expect(getCachedEnvironment(GUID)).toBeUndefined();  // cache entry gone
       expect(getResourceStats().environments[PATH]).toBe(1); // ...but the owner survives
 

@@ -38,6 +38,7 @@ import type { AnimationClipDef } from '../animation/types';
 import {
   resolveMeshTemplate, resolveMeshLodInfo, resolveMaterialForMesh, resolveMaterial,
   getCachedEnvironment, acquireEnvironment, onModelInvalidated, getMeshAsset,
+  retiredEnvironments, disposeRetiredEnvironment,
 } from '../loaders/meshTemplateCache';
 import { getRiggedModel, ensureRiggedModelLoaded } from '../loaders/riggedModelCache';
 import {
@@ -406,7 +407,74 @@ export function isIblSuppressed(): boolean {
   return iblSuppressed;
 }
 
+/** Every THREE.Scene that could be binding an HDR env right now. Registered from the two places
+ *  that bind one — {@link syncEnvironment} (every render surface, every frame) and
+ *  `prewarmShadersForWorld`'s throwaway compile scene — rather than at renderer setup, so a
+ *  surface cannot hold an env without registering. ⚠️ **Any new site that assigns a
+ *  `getCachedEnvironment` result to a `THREE.Scene` MUST call `registerEnvSurface` first**, or
+ *  the sweep below cannot see its binding and will free a texture it is still sampling. Held
+ *  weakly: a torn-down panel's scene must not be kept alive by this set, and a dead ref just
+ *  drops out of the sweep. */
+const envSurfaceRefs = new Set<WeakRef<THREE.Scene>>();
+const envSurfaceSeen = new WeakSet<THREE.Scene>();
+
+function registerEnvSurface(scene: THREE.Scene): void {
+  if (envSurfaceSeen.has(scene)) return;
+  // Prune dead refs HERE, not only in the sweep: the sweep early-returns whenever nothing is
+  // retired (the overwhelmingly common case), so it cannot be the only reaper. Without this the
+  // set grows by one wrapper per distinct scene for the life of the page — and since the prewarm
+  // registers a THROWAWAY scene per compile, that is one per scene swap, not one per panel.
+  // Amortised: this runs once per NEW scene, and the set holds roughly the live surfaces.
+  for (const ref of envSurfaceRefs) if (!ref.deref()) envSurfaceRefs.delete(ref);
+  envSurfaceSeen.add(scene);
+  envSurfaceRefs.add(new WeakRef(scene));
+}
+
+/** Free the HDR envs that an `invalidateEnvironment` (re-import) evicted, once no live surface
+ *  binds them any more (#315).
+ *
+ *  ⚠️ It asks each scene what it is ACTUALLY binding instead of tracking bind/unbind calls. Five
+ *  sites outside this function clear `scene.environment`/`scene.background` (`Scene3D`'s teardown,
+ *  `SceneView`'s UI-mode and unmount paths); a bind/unbind refcount would have to be threaded
+ *  through every one of them and would go silently wrong the moment a sixth appears. Reading the
+ *  property cannot go stale.
+ *
+ *  The failure mode this trades INTO is a leak, never a use-after-free: a surface that stops
+ *  rendering while still bound keeps its texture alive — which is correct — and
+ *  `disposeAllCachedResources` drains whatever is left. */
+function sweepRetiredEnvironments(): void {
+  const retired = retiredEnvironments();
+  if (retired.size === 0) return; // the overwhelmingly common case — no per-surface work
+  const bound = new Set<THREE.Texture>();
+  for (const ref of envSurfaceRefs) {
+    const surface = ref.deref();
+    if (!surface) { envSurfaceRefs.delete(ref); continue; }
+    if (surface.environment) bound.add(surface.environment);
+    const bg = surface.background as THREE.Texture | THREE.Color | null;
+    if (bg && (bg as THREE.Texture).isTexture) bound.add(bg as THREE.Texture);
+  }
+  for (const tex of [...retired]) if (!bound.has(tex)) disposeRetiredEnvironment(tex);
+}
+
+/** Take back a background this sync put there, when it should no longer be shown — the
+ *  Environment was removed/deactivated, or `showAsBackground` was turned OFF.
+ *
+ *  ⚠️ Nothing else did this, so the field was WIRED IN ONE DIRECTION: unticking
+ *  `showAsBackground` in the Inspector left the sky on screen forever. `syncCamera` cannot
+ *  undo it either — it deliberately "leaves a TEXTURE background alone" because this sync owns
+ *  it, which is exactly what made the stale one permanent. That ownership is also why testing
+ *  `isTexture` is enough: a `THREE.Color` background belongs to `syncCamera` and is left alone.
+ *
+ *  It clears to null rather than to the camera's clearColor: `syncCamera` owns that value and
+ *  re-applies it (its guard fires on `bg == null`). In `Scene3D` it runs BEFORE this, so the
+ *  authored colour lands one frame later — a one-frame renderer-clear on an authoring toggle,
+ *  which is the cheap side of the trade against duplicating the clearColor decision here. */
+function clearTextureBackground(scene: THREE.Scene): void {
+  if (scene.background && (scene.background as THREE.Texture).isTexture) scene.background = null;
+}
+
 export function syncEnvironment(world: World, scene: THREE.Scene) {
+  registerEnvSurface(scene);
   let envActive = false;
   let suppressed = false;
   world.query(Environment).updateEach(([env], entity) => {
@@ -439,6 +507,8 @@ export function syncEnvironment(world: World, scene: THREE.Scene) {
         if (scene.background !== cached) scene.background = cached;
         if (scene.backgroundIntensity !== bgIntensity) scene.backgroundIntensity = bgIntensity;
         if (scene.backgroundBlurriness !== env.backgroundBlurriness) scene.backgroundBlurriness = env.backgroundBlurriness;
+      } else {
+        clearTextureBackground(scene);
       }
     } else {
       // Fallback: an Environment entity was spawned at runtime without going
@@ -449,14 +519,19 @@ export function syncEnvironment(world: World, scene: THREE.Scene) {
       acquireEnvironment(-1, env.hdrPath);
     }
   });
-  if (!envActive && scene.environment) {
-    // Don't dispose — the texture is owned by envCache, not this scene.
-    scene.environment = null;
-    scene.environmentIntensity = 1;
+  if (!envActive) {
+    if (scene.environment) {
+      // Don't dispose — the texture is owned by envCache, not this scene.
+      scene.environment = null;
+      scene.environmentIntensity = 1;
+    }
+    clearTextureBackground(scene);
   }
   // Recomputed from scratch each frame, so a scene swap into a no-environment scene (or a tier
   // promotion) drops the compensation on the very next frame rather than leaving it stuck on.
   iblSuppressed = suppressed;
+  // Last, so this surface's rebind above is already visible to the sweep.
+  sweepRetiredEnvironments();
 }
 
 /** Force a NodeMaterialObserver refresh across the scene so a change to
@@ -3171,6 +3246,63 @@ export function clearOwnedMaterials() {
 
 // ── Shader prewarm ──────────────────────────────────────
 
+/** Objects the prewarm MINTED itself (primitive geometries/materials, side-pinned clones, the F4
+ *  placeholder) — disposed at the START of the next prewarm rather than at the end of this one.
+ *
+ *  ⚠️ **Disposing them immediately RELEASES the pipeline they just warmed** (#238). three refcounts
+ *  a render pipeline by the render objects that reference it (`Pipelines.delete` → `usedTimes--` →
+ *  `_releasePipeline` at zero), and disposing a material tears down its render object. Measured on
+ *  `games/3d-test`: `renderer._pipelines.caches` dropped by one at the exact millisecond the old
+ *  dispose block ran — prewarm work undone by the prewarm's own cleanup. Holding them until the
+ *  next swap costs a handful of small buffers and keeps the warm pipeline alive long enough for
+ *  the first real frame to take a reference to it. */
+const _prewarmRetained: Array<{ dispose(): void }> = [];
+
+function disposeRetainedPrewarmObjects(): void {
+  for (const o of _prewarmRetained) o.dispose();
+  _prewarmRetained.length = 0;
+}
+
+/** Common preparation for every placeholder this prewarm places.
+ *
+ *  ⚠️ `frustumCulled = false` is load-bearing, not tidiness. `Renderer.compileAsync` builds its
+ *  render list through `_projectObject`, which frustum-culls exactly as a render does — against
+ *  the module-level `_frustum` LEFT BEHIND BY THE LAST RENDERED FRAME, since compile never updates
+ *  it. The prewarm runs while the OUTGOING scene is still rendering, so what the prewarm compiles
+ *  would otherwise depend on where the previous scene's camera happened to be pointing: a
+ *  correctness lottery, and the kind of input that makes a boot stall INTERMITTENT. The prewarm
+ *  scene is never drawn, so opting every placeholder out of culling costs nothing. */
+function prepPrewarmMesh(mesh: THREE.Mesh): void {
+  mesh.frustumCulled = false;
+}
+
+/** Whether three will draw this material in TWO side-pinned passes rather than one double-sided
+ *  pass. Mirrors the condition in three's `Renderer.renderObject` EXACTLY — the prewarm has to
+ *  make the same decision three does, and a paraphrase of it would be the drift this whole
+ *  function exists to prevent (r184, Renderer.js:3452):
+ *
+ *  ```js
+ *  if ( material.transparent === true && material.side === DoubleSide && material.forceSinglePass === false ) {
+ *      material.side = BackSide;  handleObject(..., 'backSide');
+ *      material.side = FrontSide; handleObject(..., passId);
+ *      material.side = DoubleSide;
+ *  }
+ *  ```
+ *
+ *  ⚠️ **`compileAsync` walks that same branch and still compiles the WRONG pipeline**, which is
+ *  why this exists at all. Its handler (`Renderer._createObjectPipeline`) only QUEUES the work
+ *  while compiling, and the queue is drained after the block above has restored
+ *  `material.side = DoubleSide` — so the prewarm builds one `cullMode: 'none'` pipeline where the
+ *  render needs two `cullMode: 'back'` ones (three flips `frontFace` for the BackSide pass rather
+ *  than the cull mode). Measured on `games/3d-test`: 6 of its 8 synchronous post-swap
+ *  `MeshStandardMaterial` builds were exactly these variants, ~130 ms each on the A23. */
+function sidePinnedVariants(material: THREE.Material): THREE.Side[] {
+  return material.transparent === true && material.side === THREE.DoubleSide && material.forceSinglePass === false
+    ? [THREE.BackSide, THREE.FrontSide]
+    : [];
+}
+
+
 /** Build a throwaway THREE.Scene containing placeholder meshes for every DISTINCT
  *  (mesh, material) pair among the world's Renderable3D + Renderable3DPrimitive
  *  entities, and run renderer.compileAsync against it. This compiles all shader
@@ -3224,13 +3356,80 @@ async function prewarmShadersForWorldInner(
   renderer: WebGPURenderer | THREE.WebGLRenderer,
   camera: THREE.PerspectiveCamera,
 ): Promise<void> {
+  // Free what the PREVIOUS prewarm minted before building this one — see
+  // `_prewarmRetained` for why it is not freed at the end of its own call.
+  disposeRetainedPrewarmObjects();
+
   const prewarmScene = new THREE.Scene();
   let count = 0;
 
-  // Track primitive geometries and lights so we can dispose them at the end.
-  // GLB template geometries/materials are shared and must NOT be disposed.
-  const primitiveMeshes: THREE.Mesh[] = [];
+  // Lights are disposed at the end of this call; everything else the prewarm mints outlives it
+  // (see `_prewarmRetained`). GLB template geometries/materials are SHARED and never disposed here.
   const prewarmLights: THREE.Light[] = [];
+
+  // Which entities are MIRRORED — an odd number of negative scale factors along their parent
+  // chain (#238). three folds `object.matrixWorld.determinant() < 0` into the render pipeline key
+  // (`WebGPUPipelineUtils._getPrimitiveState` flips `frontFace` to CW for it), so a mirrored
+  // entity needs a DIFFERENT pipeline from the same mesh+material drawn unmirrored. Every
+  // placeholder below used to sit at identity, so only the CCW variant was ever compiled and the
+  // first real frame built the CW one synchronously — measured on `games/3d-test`, 2 of its 8
+  // post-swap synchronous builds.
+  //
+  // Derived HERE from the staging world rather than read out of `worldTransforms`: that map holds
+  // the world that is still RENDERING, and this function runs before the swap — the same reason
+  // the shadow-caster mirror above computes the pure rule instead of arming the live one. Only the
+  // SIGN is needed, and sign(det) is the product of the sign of each ancestor's local scale, so no
+  // matrices are composed.
+  const localScaleSign = new Map<number, number>();
+  const parentOf = new Map<number, number>();
+  world.query(Transform).updateEach(([tf]: [{ sx: number; sy: number; sz: number }], entity) => {
+    localScaleSign.set(entity.id(), tf.sx * tf.sy * tf.sz < 0 ? -1 : 1);
+  });
+  world.query(EntityAttributes).updateEach(([ea]: [{ parentId: number }], entity) => {
+    if (ea.parentId) parentOf.set(entity.id(), ea.parentId);
+  });
+  const isMirrored = (id: number): boolean => {
+    let sign = 1;
+    let cur: number | undefined = id;
+    // Depth-bounded, like `transformPropagationSystem`'s own walk: a parentId CYCLE in authored
+    // data must degrade to a wrong-but-terminating answer, never hang the boot.
+    for (let depth = 0; cur && depth < 64; depth++) {
+      sign *= localScaleSign.get(cur) ?? 1;
+      cur = parentOf.get(cur);
+    }
+    return sign < 0;
+  };
+
+  /** Add the placeholder(s) one (geometry, material) pair needs, and return how many were added.
+   *  One mesh normally; TWO side-pinned clones when three would draw the material in two passes
+   *  (see `sidePinnedVariants`). The clones are retained, not disposed here — disposing them would
+   *  release the pipelines they exist to warm. */
+  const place = (
+    geometry: THREE.BufferGeometry,
+    material: THREE.Material,
+    mirrored: boolean,
+    applyFlags: (obj: THREE.Object3D) => void,
+  ): number => {
+    const sides = sidePinnedVariants(material);
+    const materials: THREE.Material[] = [];
+    if (sides.length === 0) materials.push(material);
+    else for (const side of sides) {
+      const clone = material.clone();
+      clone.side = side;
+      _prewarmRetained.push(clone);
+      materials.push(clone);
+    }
+    for (const m of materials) {
+      const mesh = new THREE.Mesh(geometry, m);
+      // Mirrored entities compile the CW variant; the axis is arbitrary, only the SIGN of the
+      // determinant reaches the pipeline key.
+      if (mirrored) mesh.scale.x = -1;
+      prepPrewarmMesh(mesh);
+      applyFlags(mesh);
+      prewarmScene.add(mesh);
+    }
+    return materials.length;
+  };
 
   // Unresolved-ref tally (#238). The prewarm can only compile what it can RESOLVE, and every
   // resolution here fails SILENTLY into a still-plausible object: a missing mesh template skips
@@ -3271,6 +3470,12 @@ async function prewarmShadersForWorldInner(
       if (!env.hdrPath) return;
       const cached = getCachedEnvironment(env.hdrPath);
       if (cached) {
+        // Register it like a real surface (#315): this is the ONE other place a cached env
+        // texture gets bound to a THREE.Scene, and the binding outlives an `await compileAsync`
+        // below. Unregistered, a re-import during that await would let the retired-env sweep
+        // free the texture this compile is still sampling — the very use-after-free the
+        // retirement exists to prevent. The ref is weak, so the throwaway scene still dies.
+        registerEnvSurface(prewarmScene);
         prewarmScene.environment = cached;
         prewarmScene.environmentIntensity = env.intensity;
       }
@@ -3329,13 +3534,16 @@ async function prewarmShadersForWorldInner(
     }
   });
 
-  world.query(Renderable3D).updateEach(([rend]: [{ isVisible: boolean; mesh: string; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }]) => {
+  world.query(Renderable3D).updateEach(([rend]: [{ isVisible: boolean; mesh: string; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
     if (!rend.isVisible || !rend.mesh) return;
     // Shadow flags join the dedupe key (#238): they are part of the pipeline key, not a uniform,
     // so two entities sharing a (mesh, material) pair but differing in what they cast or receive
     // need BOTH variants compiled. Keying without them compiles whichever the first entity had
     // and leaves the other for the first real frame — the stall this prewarm exists to prevent.
-    if (skip(`g|${rend.mesh}|${rend.material}|${shadowFlagsKey(rend.castShadow, rend.receiveShadow)}`)) return;
+    // The mirror flag joins the dedupe key for the same reason the shadow flags do: it is
+    // pipeline key, not a uniform, so a mesh+material drawn both ways needs both variants.
+    const mirrored = isMirrored(entity.id());
+    if (skip(`g|${rend.mesh}|${rend.material}|${shadowFlagsKey(rend.castShadow, rend.receiveShadow)}|${mirrored ? 'm' : ''}`)) return;
     const template = resolveMeshTemplate(rend.mesh);
     if (!template) { unresolvedMesh++; return; }
     const authored = resolveMaterialForMesh(rend.material, rend.mesh);
@@ -3343,29 +3551,36 @@ async function prewarmShadersForWorldInner(
     // AUTHORED and did not resolve is a miss.
     if (rend.material && !authored) unresolvedMaterial++;
     const material = authored || template.material;
-    const mesh = new THREE.Mesh(template.geometry, material);
-    applyShadowFlags(mesh, rend.castShadow, rend.receiveShadow);
-    prewarmScene.add(mesh);
-    count++;
+    count += place(template.geometry, material, mirrored, (o) => applyShadowFlags(o, rend.castShadow, rend.receiveShadow));
   });
 
-  world.query(Renderable3DPrimitive).updateEach(([rend]: [{ isVisible: boolean; mesh: string; size: number; color: number; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }]) => {
+  world.query(Renderable3DPrimitive).updateEach(([rend]: [{ isVisible: boolean; mesh: string; size: number; color: number; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
     if (!rend.isVisible) return;
-    if (skip(`p|${rend.mesh}|${rend.material}|${shadowFlagsKey(rend.castShadow, rend.receiveShadow)}`)) return;
+    const mirrored = isMirrored(entity.id());
+    if (skip(`p|${rend.mesh}|${rend.material}|${shadowFlagsKey(rend.castShadow, rend.receiveShadow)}|${mirrored ? 'm' : ''}`)) return;
     const obj = createPrimitiveMesh(rend.mesh, rend.size, rend.color);
     if (obj) {
+      const mesh = obj as THREE.Mesh;
       // Apply .mat.json override if set (mirrors runtime sync behaviour)
+      const mintedMaterial = mesh.material as THREE.Material;
       if (rend.material) {
         const resolved = resolveMaterial(rend.material);
-        if (resolved) (obj as THREE.Mesh).material = resolved;
+        if (resolved) mesh.material = resolved;
         else unresolvedMaterial++;
       }
-      // AFTER the material override: `castShadow: 'auto'` derives from `material.transparent`,
-      // so applying it first would read the primitive's default material, not the authored one.
-      applyShadowFlags(obj, rend.castShadow, rend.receiveShadow);
-      prewarmScene.add(obj);
-      primitiveMeshes.push(obj as THREE.Mesh);
-      count++;
+      // Whatever `createPrimitiveMesh` minted is ours to free — but at the NEXT prewarm, not here
+      // (see `_prewarmRetained`). The geometry always; the material only while it is still the
+      // minted one, since a RESOLVED `.mat.json` override replaced it with a SHARED material the
+      // mesh cache owns. Keyed off whether the swap actually happened, NOT off whether a ref was
+      // authored: an authored ref that fails to resolve leaves the minted material in place, and
+      // testing `rend.material` there leaks it once per scene swap on exactly the failure path the
+      // unresolved tally exists to report.
+      _prewarmRetained.push(mesh.geometry);
+      const minted = mesh.material as THREE.Material;
+      // `place` re-homes the pair onto its own mesh (and may pin sides), so this object is only a
+      // carrier for what `createPrimitiveMesh` resolved.
+      count += place(mesh.geometry, minted, mirrored, (o) => applyShadowFlags(o, rend.castShadow, rend.receiveShadow));
+      if (minted === mintedMaterial) _prewarmRetained.push(minted);
     }
   });
 
@@ -3409,10 +3624,14 @@ async function prewarmShadersForWorldInner(
     const ovKey = ov
       .map((o) => `${o.node}:${o.visible ? 1 : 0}:${Object.entries(o.materials ?? {}).sort().map(([k, v]) => `${k}=${v}`).join(',')}`)
       .sort().join('|');
-    if (skip(`k|${sm.model}|${ovKey}|${shadowFlagsKey(sm.castShadow, sm.receiveShadow)}`)) return;
+    if (skip(`k|${sm.model}|${ovKey}|${shadowFlagsKey(sm.castShadow, sm.receiveShadow)}|${isMirrored(entity.id()) ? 'm' : ''}`)) return;
     const rigged = getRiggedModel(sm.model);
     if (!rigged) { unresolvedRig++; return; } // not cached — the real frame will build it
     const root = cloneSkeleton(rigged.prototype);
+    // Same mirror rule as the two loops above — a rigged character mirrored by a negative parent
+    // scale needs the CW pipeline variant, and `isMesh` is true for a SkinnedMesh.
+    if (isMirrored(entity.id())) root.scale.x = -1;
+    root.traverse((o) => { if ((o as THREE.Mesh).isMesh) prepPrewarmMesh(o as THREE.Mesh); });
     // Overrides BEFORE the shadow flags, matching the primitive path above and for the same
     // reason: `castShadow: 'auto'` derives from `material.transparent`, so applying the flags
     // first would read the baked material rather than the one the render will draw.
@@ -3422,6 +3641,12 @@ async function prewarmShadersForWorldInner(
       if (node) syncNodeMaterials(node, o.materials, o.visible);
     }
     applyShadowFlags(root, sm.castShadow, sm.receiveShadow);
+    // ⚠️ A rig does NOT go through `place()`, so the side-pinning above does not reach it: a rigged
+    // model wearing a transparent DOUBLE-SIDED material still compiles the un-pinned variant and
+    // leaves both real ones to the first frame (#238). Unmeasured — no project in the fleet
+    // authors one — and listed with the prewarm's other known gaps in docs/plans/profiler.md
+    // rather than fixed blind, since the whole point of this pass is to compile what the render
+    // will actually draw and nothing has yet shown that it would.
     prewarmScene.add(root);
     prewarmRigRoots.push(root);
     // Deliberately NOT `count++`: `count` gates the F4 placeholder below, whose guarantee is that
@@ -3447,6 +3672,7 @@ async function prewarmShadersForWorldInner(
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
     geo.computeVertexNormals();
     placeholderMesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.5, metalness: 0 }));
+    prepPrewarmMesh(placeholderMesh);
     prewarmScene.add(placeholderMesh);
   }
 
@@ -3470,7 +3696,14 @@ async function prewarmShadersForWorldInner(
       'those compile their real pipelines on the first frame instead. See #238.',
     );
   }
-  const compileSpan = beginBootSpan('shader-compile', `${count} pairs${rigCount ? ` + ${rigCount} rigs` : ''}${unresolvedDetail}`);
+  // ⚠️ Before compiling, not for tidiness: three reads `object.matrixWorld.determinant()` when it
+  // builds the pipeline key (the mirrored-entity variant above), and `compileAsync` never updates
+  // world matrices itself — an un-updated placeholder reports the identity determinant and every
+  // mirror placed above would compile the variant it was placed to avoid.
+  prewarmScene.updateMatrixWorld(true);
+  // "placeholders", not "pairs": a transparent double-sided material contributes TWO (the
+  // side-pinned clones), so the two numbers stopped being the same thing (#238).
+  const compileSpan = beginBootSpan('shader-compile', `${count} placeholders${rigCount ? ` + ${rigCount} rigs` : ''}${unresolvedDetail}`);
   try {
     if (typeof compile === 'function') {
       await (renderer as THREE.WebGLRenderer).compileAsync(prewarmScene, camera);
@@ -3480,12 +3713,10 @@ async function prewarmShadersForWorldInner(
     }
   } finally { endBootSpan(compileSpan); }
 
-  // Dispose prewarm-owned objects but leave GLB template geometries/materials
-  // (and the shared envCache-owned environment) alone.
-  for (const m of primitiveMeshes) {
-    m.geometry.dispose();
-    (m.material as THREE.Material).dispose();
-  }
+  // Release prewarm-owned objects but leave GLB template geometries/materials (and the shared
+  // envCache-owned environment) alone. Anything whose disposal would RELEASE A WARMED PIPELINE —
+  // primitive geometries/materials, the side-pinned clones, the F4 placeholder — went into
+  // `_prewarmRetained` and is freed at the start of the next prewarm instead; see its header.
   for (const l of prewarmLights) l.dispose();
   // Rig clones share the prototype's geometry + materials (SkeletonUtils.clone does not copy
   // them), so dispose ONLY what the clone minted: its Skeleton. Same split `disposeSkinnedEntry`
@@ -3498,8 +3729,7 @@ async function prewarmShadersForWorldInner(
     });
   }
   if (placeholderMesh) {
-    placeholderMesh.geometry.dispose();
-    (placeholderMesh.material as THREE.Material).dispose();
+    _prewarmRetained.push(placeholderMesh.geometry, placeholderMesh.material as THREE.Material);
   }
   prewarmScene.environment = null; // detach shared env before clear
   prewarmScene.clear();
