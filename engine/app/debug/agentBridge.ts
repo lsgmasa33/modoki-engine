@@ -68,7 +68,6 @@ import {
   ANIMATOR_CLIP_TRAITS,
   type OffscreenRenderOpts,
   type SceneData,
-  type AssetRefVerdict,
   invalidateAnimationClip,
   invalidateTimeline,
   invalidateParticleEffect,
@@ -76,8 +75,8 @@ import {
   invalidateRig2D,
   findEntityByGuid,
   getCachedPrefab,
-  getAssetEntry,
   getAllAssets,
+  makeAssetRefResolver,
   getParticleEffect,
   getAnimationClip,
   getTimeline,
@@ -1509,24 +1508,15 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
           // fetch: an unloaded prefab (not yet acquired by any scene) resolves to undefined,
           // which is the documented conservative "stay silent" behaviour, not a bug.
           // #292 — the manifest is loaded by the time a scene hot-reloads, so this consumer
-          // can answer "does that GUID name a real asset?" too, and a ref to a deleted asset
-          // is worth a warning HERE (right before the load that will silently drop it) more
-          // than anywhere else. Guarded exactly like the backend's `makeAssetResolver`: an
-          // EMPTY manifest means "cannot check", never "every asset is gone" — passing a
-          // resolver then would report a healthy scene as entirely dangling.
-          const allAssets = getAllAssets();
-          // Case-SENSITIVE `ok`, exactly like `resolveRef` — `getAssetEntry` is the same
-          // verbatim `guidToEntry` lookup, so this predicts loading rather than merely
-          // approximating it. The folded-case set only separates a casing slip from a
-          // genuinely deleted asset; see `AssetRefVerdict`.
-          const foldedCase = new Set(allAssets.map((a) => a.guid.toLowerCase()));
-          const assetExists = allAssets.length > 0
-            ? (ref: string): AssetRefVerdict => (
-                getAssetEntry(ref) !== undefined
-                  ? 'ok'
-                  : foldedCase.has(ref.toLowerCase()) ? 'case-mismatch' : 'missing'
-              )
-            : undefined;
+          // can answer "does that GUID name a real asset?" too, and a dead ref is worth a
+          // warning HERE, right before the load that will silently drop it. The RULE (and
+          // the "no guids ⇒ no resolver ⇒ could-not-check" guard) lives in
+          // `makeAssetRefResolver` — building it here by hand is what once let this consumer
+          // disagree with the dev-server one about letter case. Passing guids rather than a
+          // lookup is exact, not an approximation: `registerAsset` stores `{ guid, ... }`
+          // UNDER that same guid, so this set is `guidToEntry`'s key set, which is what
+          // `resolveRef` consults.
+          const assetExists = makeAssetRefResolver(getAllAssets().map((a) => a.guid));
           const { warnings } = validateSceneData(preloaded, buildSceneSchema(), getCachedPrefab, assetExists);
           if (warnings.length) {
             console.warn(`[agentBridge] ${warnings.length} validation warning(s) in ${current}:`);

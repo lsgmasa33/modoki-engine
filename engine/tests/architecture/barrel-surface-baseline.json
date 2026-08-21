@@ -572,6 +572,7 @@
   "loadTexture3D",
   "loadTimelineNow",
   "localToWorldTrs",
+  "makeAssetRefResolver",
   "makeAxes",
   "makeFlags",
   "makePointer",

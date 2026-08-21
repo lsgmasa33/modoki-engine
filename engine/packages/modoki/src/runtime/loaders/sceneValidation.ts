@@ -155,6 +155,38 @@ export type AssetRefResolver = (ref: string) => AssetRefVerdict;
  *  it is the casing, not a deleted asset. */
 export type AssetRefVerdict = 'ok' | 'missing' | 'case-mismatch';
 
+/** Build an `AssetRefResolver` from the project's asset guids — ONE implementation of the
+ *  three-state rule, shared by every consumer.
+ *
+ *  It exists because the rule was written twice and the two copies had ALREADY diverged
+ *  inside the commit that introduced them: the dev-server resolver folded letter case while
+ *  the hot-reload one did not, so the same scene and the same manifest produced different
+ *  verdicts depending on which surface asked. Duplicating a predicate is how that happens,
+ *  and a second reader changing "the" resolver would have found only the tested copy.
+ *
+ *  Returns `undefined` — NOT a resolver that answers `'missing'` — when there are no guids
+ *  to check against, so an empty or unreadable manifest degrades to "could not check" and
+ *  leaves the shape-only pass. A false "this asset was deleted" sends a caller hunting a ref
+ *  that is fine, which is worse than the gap the check closes.
+ *
+ *  Non-string / empty guids are skipped rather than thrown on: a malformed manifest entry
+ *  must not turn a validation that always answered into a failed call. */
+export function makeAssetRefResolver(guids: Iterable<unknown>): AssetRefResolver | undefined {
+  const exact = new Set<string>();
+  const foldedCase = new Set<string>();
+  for (const g of guids) {
+    if (typeof g === 'string' && g) {
+      exact.add(g);
+      foldedCase.add(g.toLowerCase());
+    }
+  }
+  if (exact.size === 0) return undefined;
+  return (ref: string): AssetRefVerdict => {
+    if (exact.has(ref)) return 'ok';
+    return foldedCase.has(ref.toLowerCase()) ? 'case-mismatch' : 'missing';
+  };
+}
+
 /** Is an authored `UIElement.${axis}` value a NEUTRAL "unset"/"agrees with stretch"
  *  claim, not a real trap? Shared by the direct-trait path and the prefab-override
  *  path so they cannot drift on the noise budget:
@@ -363,6 +395,14 @@ export function validateSceneData(
       // Asset-reference rule — delegated to `refFieldWarnings` so the identical rule serves
       // the prefab-instance OVERRIDE groups in the structural pass below (#292). It is a
       // per-TRAIT-BAG predicate, so it is invoked once per entity outside this loop.
+      //
+      // NOT a pure extraction, in one respect worth knowing: the ref check used to run
+      // INSIDE this loop, so an entity's warnings interleaved per trait
+      // ([A-schema, A-ref, B-schema, B-ref]); they now group ([A-schema, B-schema,
+      // A-ref, B-ref]). Nothing observes that — every `warnings[N]` assertion in the
+      // suites is a single-warning scenario, and all three consumers pass or print the
+      // array wholesale rather than indexing it — but the order IS different, so do not
+      // build an order-dependent assertion on top of it.
     }
 
     warnings.push(...refFieldWarnings(entity.traits, label, assetExists));

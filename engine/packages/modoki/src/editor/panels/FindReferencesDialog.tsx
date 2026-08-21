@@ -106,6 +106,13 @@ export default function FindReferencesDialog() {
     // Entity — address by guid (runtime ids are reassigned on every scene reload),
     // and only if it's actually resolvable in the CURRENTLY LOADED world; a hit
     // found on disk may belong to a scene that isn't open right now.
+    // UNREACHABLE by construction, kept because the TYPE allows it: `RefNode.guid` is
+    // optional (an asset node has none), while `buildRefGraph` skips any entity without
+    // a guid outright (`if (!e.guid) continue`), so every entity node that can reach a
+    // result row is guid-bearing. Do not read this branch as evidence that guid-less
+    // entity hits exist — they do not. It stays as a type-level guard rather than a
+    // non-null assertion, so a future change that DOES admit them degrades to an
+    // explanation instead of selecting the wrong entity.
     if (!node.guid) {
       setNavNote(`"${node.name}" has no GUID of its own, so there is nothing to select — it is authored inside ${node.path}.`);
       return;
@@ -173,7 +180,7 @@ export default function FindReferencesDialog() {
         {loading ? (
           <div style={{ color: '#888', fontSize: 12, padding: '20px 0' }}>Scanning…</div>
         ) : error && !data ? (
-          <div style={{ color: '#e74c3c', fontSize: 12, padding: '12px 0', whiteSpace: 'pre-wrap' }}>{error}</div>
+          <div data-testid="find-references-error" style={{ color: '#e74c3c', fontSize: 12, padding: '12px 0', whiteSpace: 'pre-wrap' }}>{error}</div>
         ) : data ? (
           <div style={{ overflowY: 'auto', flex: 1 }}>
             {data.unreferenced ? (

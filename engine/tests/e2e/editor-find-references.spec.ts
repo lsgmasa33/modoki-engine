@@ -101,9 +101,14 @@ test('Hierarchy → Find References is enabled on a guid-bearing entity, and an 
 
   const dialog = page.locator('[data-testid="find-references-dialog"]');
   await expect(dialog).toBeVisible();
-  await expect(dialog).toContainText('no asset or entity matches');
+
+  // Asserted STRUCTURALLY, on the error element, not by matching the route's refusal
+  // text: that string lives in editorBackendRouter.ts, and a spec matching it across
+  // files is two copies of one sentence that must stay equal. The marker cannot drift.
+  await expect(dialog.locator('[data-testid="find-references-error"]')).toBeVisible();
 
   // The load-bearing half: a refusal, NOT a green "nothing references this" banner.
+  // Getting this wrong is the §5 false success — a reader deletes something.
   await expect(dialog.locator('[data-testid="find-references-unreferenced"]')).toHaveCount(0);
   await expect(dialog.locator('[data-testid="find-references-hit"]')).toHaveCount(0);
 

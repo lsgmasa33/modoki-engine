@@ -1015,10 +1015,20 @@ Findings come from four passes:
 
    The check is now **`assetExists`, an optional injected `AssetRefResolver`** —
    the same shape as `getPrefab` below, and for the same reason: this module does
-   no I/O and has no manifest of its own. The Node-only glue is
-   `makeAssetResolver` in `editorBackendRouter.ts`, which indexes
-   `ctx.getManifest().assets[].guid` once per request (a scene with 400 refs must
-   not re-scan the array 400 times). **All three consumers** above inject one: both
+   no I/O and has no manifest of its own. **The rule itself lives in ONE place,
+   `makeAssetRefResolver`** (exported from `sceneValidation.ts`): give it the
+   project's guids, get back a resolver, or `undefined` when there is nothing to
+   check against. Each consumer supplies only the glue that reaches its own
+   manifest — `makeAssetResolver` in `editorBackendRouter.ts` for `ctx.getManifest()`,
+   and `getAllAssets()` in `agentBridge.ts`. The index is built once per call (a
+   scene with 400 refs must not re-scan the asset array 400 times).
+
+   *(The rule was hand-written twice at first, and the two copies had already
+   diverged on letter case **inside the same commit** — the dev-server one folded
+   case, the hot-reload one did not, so the same scene and manifest produced
+   different verdicts depending on which surface asked. The hot-reload copy sat in a
+   private, unexported function that no test could reach, so only the wrong one was
+   pinned. That is why there is one factory and why it is tested directly.)* **All three consumers** above inject one: both
    dev-server endpoints from `makeAssetResolver`, and the hot-reload handler from
    the browser's own loaded manifest (`getAssetEntry`, guarded on
    `getAllAssets().length`) — which is the most useful place for it, since it fires
@@ -1031,8 +1041,9 @@ Findings come from four passes:
    project as dangling.
 
    **Absent resolver ⇒ the pre-#292 shape-only pass, NOT "everything is
-   dangling".** `makeAssetResolver` returns `null` — and the caller then passes
-   nothing — when the manifest is empty, guid-less, or throws. A false "this asset
+   dangling".** `makeAssetRefResolver` returns `undefined` — and the caller then
+   passes nothing — when the manifest is empty, guid-less, or throws; malformed
+   entries are skipped rather than thrown on. A false "this asset
    was deleted" sends a caller hunting a ref that is fine, which would be worse
    than the gap #292 closes, so *cannot-check* and *dead* are deliberately
    different states. `engine/tests/plugins/validateSceneAssetResolver.test.ts`

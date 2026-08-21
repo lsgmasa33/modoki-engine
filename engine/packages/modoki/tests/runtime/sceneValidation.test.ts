@@ -2,7 +2,7 @@
  *  the GUID asset-reference rule. Pure module, no world needed. */
 
 import { describe, it, expect } from 'vitest';
-import { validateSceneData, type SceneSchema, type PrefabResolver, type AssetRefResolver, type AssetRefVerdict } from '../../src/runtime/loaders/sceneValidation';
+import { validateSceneData, type SceneSchema, type PrefabResolver, type AssetRefResolver, type AssetRefVerdict, makeAssetRefResolver } from '../../src/runtime/loaders/sceneValidation';
 
 const GUID = 'a1b2c3d4-1111-2222-3333-444455556666';
 
@@ -282,6 +282,55 @@ describe('validateSceneData — schema checks', () => {
     // texture branch must `continue` past the source validation instead of flagging it.
     const res = validateSceneData(mi([{ target: 'uReveal', kind: 'texture', ref: GUID, source: { type: 'bogus' } }]), schema);
     expect(res.warnings).toEqual([]);
+  });
+});
+
+/** The ONE implementation of the three-state rule, shared by the dev-server routes and the
+ *  scene hot-reload handler. It exists because the rule was hand-written twice and the copies
+ *  had already diverged on letter case inside the very commit that added them — the
+ *  hot-reload copy lived in a private, untestable function, so only the wrong one was pinned.
+ *  Tested here directly so the shared rule cannot drift again unnoticed. */
+describe('makeAssetRefResolver', () => {
+  const A = 'a1b2c3d4-1111-2222-3333-444455556666';
+  const B = 'b1b2c3d4-1111-2222-3333-444455556666';
+
+  it('answers ok for an exact-case guid', () => {
+    expect(makeAssetRefResolver([A, B])!(A)).toBe('ok');
+  });
+
+  /** Case-SENSITIVE on purpose: `resolveRef` is `guidToEntry.get(ref)` over guids stored
+   *  verbatim, so folding case would vouch for a ref that fails to load. */
+  it('answers case-mismatch for a folded-case-only hit, never ok', () => {
+    expect(makeAssetRefResolver([A])!(A.toUpperCase())).toBe('case-mismatch');
+  });
+
+  it('answers missing for a guid absent at any casing', () => {
+    expect(makeAssetRefResolver([A])!(B)).toBe('missing');
+  });
+
+  /** The load-bearing guard: no guids means "could not check", so the caller must get
+   *  NO resolver — not one that calls every ref in a healthy scene dead. */
+  it('returns undefined when there is nothing to check against', () => {
+    expect(makeAssetRefResolver([])).toBeUndefined();
+    expect(makeAssetRefResolver([null, undefined, '', 7])).toBeUndefined();
+  });
+
+  /** A malformed manifest entry must not turn a validation that always answered into a
+   *  failed call — skip the bad ones, keep indexing the good ones. */
+  it('skips non-string / empty guids without throwing, and still indexes the rest', () => {
+    const r = makeAssetRefResolver([null, A, 7, '', undefined, B]);
+    expect(r).toBeDefined();
+    expect(r!(A)).toBe('ok');
+    expect(r!(B)).toBe('ok');
+    expect(r!('c1b2c3d4-1111-2222-3333-444455556666')).toBe('missing');
+  });
+
+  it('is usable directly as the validator\'s resolver', () => {
+    const res = validateSceneData(
+      scene([{ id: 1, name: 'X', traits: { Renderable3D: { mesh: B } } }]),
+      undefined, undefined, makeAssetRefResolver([A]),
+    );
+    expect(res.warnings.join('\n')).toMatch(/no asset in the manifest has it/);
   });
 });
 

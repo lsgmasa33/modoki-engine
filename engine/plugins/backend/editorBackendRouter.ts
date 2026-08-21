@@ -165,7 +165,7 @@ import {
   PROJECT_CONFIG_FILENAME, PRIVATE_BUILD_FIELDS,
   findNullPatchPaths, DEFAULT_PROJECT_CONFIG, DEFAULT_PROJECT_USER_CONFIG, type RawProjectConfig,
 } from '../../project-config';
-import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, type PrefabResolver, type AssetRefResolver, type AssetRefVerdict } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
+import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, type PrefabResolver, type AssetRefResolver, makeAssetRefResolver } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
@@ -483,27 +483,20 @@ function makePrefabResolver(ctx: BackendContext): PrefabResolver {
  *  both sides here would vouch for a ref that resolves to `undefined` at load. The
  *  second, lowercased index exists only to tell that case apart from a genuinely absent
  *  asset, because the two have different fixes. See `AssetRefVerdict`. */
-function makeAssetResolver(ctx: BackendContext): AssetRefResolver | null {
+function makeAssetResolver(ctx: BackendContext): AssetRefResolver | undefined {
   let assets: ManifestEntry[];
   try {
     assets = ctx.getManifest().assets;
   } catch {
-    return null;
+    return undefined;
   }
-  if (!Array.isArray(assets) || assets.length === 0) return null;
-  const exact = new Set<string>();
-  const foldedCase = new Set<string>();
-  for (const a of assets) {
-    if (a && typeof a.guid === 'string' && a.guid) {
-      exact.add(a.guid);
-      foldedCase.add(a.guid.toLowerCase());
-    }
-  }
-  if (exact.size === 0) return null;
-  return (ref: string): AssetRefVerdict => {
-    if (exact.has(ref)) return 'ok';
-    return foldedCase.has(ref.toLowerCase()) ? 'case-mismatch' : 'missing';
-  };
+  if (!Array.isArray(assets)) return undefined;
+  // The RULE lives in `makeAssetRefResolver` (one implementation, shared with the
+  // hot-reload consumer — the two hand-written copies had already diverged on case).
+  // This function is only the ctx glue: reach the manifest without throwing, and hand
+  // over its guids. `a?.guid` tolerates a null/malformed entry, which used to throw out
+  // of here and turn a 200 validation into a 500.
+  return makeAssetRefResolver(assets.map((a) => a?.guid));
 }
 
 /**
@@ -1480,7 +1473,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       if (!absPath || !fs.existsSync(absPath)) return json({ error: `scene not found: ${scenePath}` }, 404);
       const data = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
       const schema = ctx.getSchema();
-      const result = validateSceneData(data, schema, makePrefabResolver(ctx), makeAssetResolver(ctx) ?? undefined);
+      const result = validateSceneData(data, schema, makePrefabResolver(ctx), makeAssetResolver(ctx));
       return json({ path: scenePath, schemaApplied: result.schemaApplied, schemaAvailable: !!schema, warnings: result.warnings });
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : String(e) }, 500);
@@ -1702,7 +1695,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // Surface BOTH the op-level warnings (dangling refs / orphaned parents from F5)
       // and the post-apply schema validation warnings.
       const schema = ctx.getSchema();
-      const { warnings: schemaWarnings } = validateSceneData(scene, schema, makePrefabResolver(ctx), makeAssetResolver(ctx) ?? undefined);
+      const { warnings: schemaWarnings } = validateSceneData(scene, schema, makePrefabResolver(ctx), makeAssetResolver(ctx));
       const warnings = [...opWarnings, ...schemaWarnings, ...preflightWarnings];
       // The probe never answered, so NEITHER guard above could run. Say so: the write proceeds
       // (a genuinely headless edit is the normal case and must keep working), but the caller must

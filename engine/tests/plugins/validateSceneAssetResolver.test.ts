@@ -79,18 +79,23 @@ describe('GET /api/validate-scene — real asset resolver (#292)', () => {
     expect(dangling(r.body.warnings)).toEqual([]);
   });
 
-  it('matches the manifest guid case-insensitively, both directions', async () => {
-    writeJson(SCENE_REL, sceneWith({ Renderable3D: { mesh: LIVE_GUID.toUpperCase() } }));
-    const upperInManifest = (await validate(
-      makeCtx([{ ...MESH_ENTRY, guid: LIVE_GUID }]),
-    )) as { body: { warnings: string[] } };
-    expect(dangling(upperInManifest.body.warnings)).toEqual([]);
-
+  /** The OTHER direction: the scene is lowercase and the MANIFEST entry is uppercase.
+   *  Distinct from the sibling below, and it is the direction a hand-edited `.meta.json`
+   *  produces. Both must be `case-mismatch`, never silence.
+   *
+   *  This case previously read "matches the manifest guid case-insensitively, both
+   *  directions" and asserted only that no *dangling* warning appeared — which the
+   *  case-mismatch message does not match either, so it passed whether the resolver was
+   *  correct OR folded case. Proven by mutation: folding case in `makeAssetRefResolver`
+   *  left it green while its sibling went red. A test whose name asserts the design you
+   *  disproved is worse than no test. */
+  it('flags a manifest-side casing difference too, not just a scene-side one', async () => {
     writeJson(SCENE_REL, sceneWith({ Renderable3D: { mesh: LIVE_GUID } }));
-    const upperInScene = (await validate(
+    const r = (await validate(
       makeCtx([{ ...MESH_ENTRY, guid: LIVE_GUID.toUpperCase() }]),
     )) as { body: { warnings: string[] } };
-    expect(dangling(upperInScene.body.warnings)).toEqual([]);
+    expect(r.body.warnings.join('\n')).toMatch(/matches a manifest asset only when letter case is ignored/);
+    expect(dangling(r.body.warnings)).toEqual([]);
   });
 
   /** THE load-bearing case. An empty manifest means "I cannot check", not "every asset
