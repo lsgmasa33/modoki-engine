@@ -349,6 +349,7 @@ concurrent one-shots is a CPU problem before it is a loudness one.
 | | |
 |---|---|
 | **Limit** | `AudioSettings.sfxVoiceLimit`, **default 4** |
+| **Steal ramp** | `AudioSettings.sfxStealFadeSec`, **default 10 ms** (`0` = hard cut) |
 | **Stealing** | **oldest first** — insertion order is age order, so the victim is `shift()`, not a search |
 | **Scope** | fire-and-forget one-shots on the **`sfx` bus only** |
 | **Exempt** | music · the `ui` bus · every entity-owned `AudioSource` |
@@ -368,24 +369,60 @@ game that would rather have the old behaviour than lose a shot.
   is the one that is easy to get wrong: a looping campfire crackle is the OLDEST voice
   essentially forever, so naive oldest-first would kill it the instant four one-shots
   fired, permanently. The cap is for *disposable* sounds; an entity source is something
-  the game deliberately keeps alive. A source's declarative playback through
-  `startOrSwap` is untouched by the cap.
+  the game deliberately keeps alive.
+  ⚠️ **This exemption is STRUCTURAL, not a guard** — there is no `if (entity-owned) skip`
+  to delete. `state.oneShots` is written in exactly one place (`playOneShot`), and the
+  declarative path (`startOrSwap`) simply never touches it; the two are disjoint call
+  paths. So the test covering it is a design-invariant check, not a guard-toggle check,
+  and only a structural change — routing `startOrSwap` through `playOneShot` — could
+  break it. Worth knowing before trusting a mutation run to have "proved" the exemption.
 - **The `ui` bus is uncapped.** UI sounds are user-triggered and inherently low-rate; a
-  click going silent because gameplay is busy is a bug, not mix protection.
+  click going silent because gameplay is busy reads as a broken button — worse than the
+  stacking it would prevent. This one extends "keep the music" a level further than the
+  owner's words did, so it was put back to them explicitly and **confirmed, 2026-08-21**.
+  Unlike the limit it is STRUCTURAL, not an authored field: capping `ui` is a code change.
 - **A NAMED cue fan-out is still capped.** `cueSound` plays each matching source as a
   fire-and-forget one-shot with no handle retained on the entity, so it counts like any
   other shot — and it is the single most likely way to blow the cap.
 
-**A steal is a 10 ms fade, not a hard cut** (`STEAL_FADE_SEC`). A bare `stop()` is an
-instant amplitude discontinuity — an audible click on *every* steal, which would have a
-cap meant to protect the mix contributing its own artifact. 10 ms is below the
-threshold where a fade reads as a fade, so the sound still stops abruptly to the ear; it
-just stops cleanly. Scheduled on the AUDIO clock, so it completes under `timeScale: 0`.
+**A steal is a fade, not a hard cut — and its length is AUTHORED too**
+(`AudioSettings.sfxStealFadeSec`, default 10 ms). A bare `stop()` is an instant
+amplitude discontinuity — an audible click on *every* steal, which would have a cap
+meant to protect the mix contributing its own artifact. 10 ms is below the threshold
+where a fade reads as a fade, so the sound still stops abruptly to the ear; it just
+stops cleanly. Scheduled on the AUDIO clock, so it completes under `timeScale: 0`.
+**`0` is a legitimate authored value meaning hard cut**, and schedules no ramp at all
+rather than a zero-length one. This started life as a code constant and was moved onto
+the trait during close-out for exactly the reason `sfxVoiceLimit` is on it: it is a feel
+value, and "one constant to revert if it feels wrong" is the definition of something the
+owner should be able to reach without an engine change. **The 10 ms default is
+owner-confirmed (2026-08-21)**, not an assumption left standing — the alternatives were
+put to them as 0 (audibly clicky) and ~50-100 ms (an audible duck you would hear on every
+steal at a limit of 4).
+
+**Record mode logs the ramp** (`op: 'fade'`, carrying the target and `durationSec`).
+Without it a steal and a crossfade are both invisible headlessly — the ramp *is* the
+behaviour, and a no-op `fade()` cannot tell an authored 250 ms from the 10 ms default,
+so a test asserting on the authored value would pass vacuously.
 
 **A stolen voice emits `@audio {phase:'stolen', reason:'voice-cap'}`** — so the cap is
 observable rather than a silent disappearance, which is exactly the failure mode a cap
-introduces. Note a stolen shot still emits `start` first: it *did* play, it was cut
-short.
+introduces. A stolen shot still emits `start` first: it *did* play, it was cut short.
+
+**`stolen` is that voice's TERMINAL event — it does not also emit `end`.** Every voice
+emits exactly one of `stop` / `end` / `stolen`, so `start`+`swap` balances against
+`stop`+`end`+`stolen` and a voice count never drifts. The ramping handle is still handed
+to `fadingOut` (marked `silent`) rather than orphaned, because dropping the last
+reference would remove teardown's ability to force-stop it mid-ramp — the whole reason
+`fadingOut` exists — and in record mode, where `stopAfter` cannot fire, nothing would
+ever call `stop()` on it. `reapTail` is the single place that decides whether a reaped
+tail emits, deliberately shared across all three reap sites: record mode can only reach
+one of them, so an inlined copy of that guard was untested and a mutation removing it
+stayed green.
+
+**The limit is FLOORED when read.** The Inspector's number box accepts a typed fraction
+(`step: 1` only constrains the spinner), and `while (length >= 2.5)` settles at 3 — an
+off-by-one effective cap that nothing would report. A voice count is an integer.
 
 **Implementation note:** enforcing this required tracking one-shots at all. Before, the
 handle from a one-shot `play()` was discarded outright, so nothing in the engine knew

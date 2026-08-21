@@ -131,6 +131,13 @@ describe('performDomDnd', () => {
   // the target entity byte-identical, unsavedChanges:false, and canUndo:false (not one undo
   // entry pushed). The row preventDefaults dragover for ANY asset, then its drop handler
   // returns early unless the asset is a prefab. `accepted` can only ever see the first half.
+  //
+  // ⚠️ THAT ORIGINATING CASE IS NOW CLOSED (#306): the Hierarchy refuses a non-prefab asset on
+  // dragover, so it comes back accepted:false and never reaches this heuristic. The shape is
+  // still worth covering — any target that accepts a type and then declines to act on it lands
+  // here — so the scene below stays SYNTHETIC on purpose rather than being re-pinned to a real
+  // panel that might close the same way. Do not re-add an assertion naming a concrete target:
+  // that is what made this test defend the bug, failing only once the bug was fixed.
   describe('accepted vs committed', () => {
     /** A source that writes a payload onto a target that accepts the TYPE — the shape of the
      *  measured bug. `commit` decides whether the "handler" records an edit. */
@@ -151,7 +158,7 @@ describe('performDomDnd', () => {
       expect(res.accepted).toBe(true);      // the target WAS willing to take this type
       expect(res.committed).toBe(false);    // ...and then did nothing with it
       expect(res.warning).toMatch(/no editor edit was recorded/i);
-      expect(res.warning).toMatch(/prefab/i); // names the concrete case a caller will hit
+      expect(res.warning).toMatch(/verify with get_scene_state/i); // tells the caller what to do next
     });
 
     it('leaves ok:true on an uncommitted drop rather than inventing a failure', async () => {

@@ -26,7 +26,8 @@ import { useExpandedSet } from './useExpandedSet';
 import { remapPrefix } from '../utils/assetPaths';
 import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, groupRootsBySourceScene, resolveDropFolderSync, type HierarchyFolder } from './hierarchyFolders';
 import { isSceneDirty } from '../scene/sceneDirty';
-import { startDragGhost, endDragGhost, armGrabCursor } from '../utils/dragGhost';
+import { startDragGhost, endDragGhost, armGrabCursor, getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
+import { decideHierarchyAssetDrop } from './assetDropPolicy';
 import { PRIMITIVE_NAMES } from '../../runtime/loaders/primitives';
 import { type UiPreset } from '../../runtime/ui/uiAuthoring';
 import {
@@ -135,12 +136,18 @@ function HierarchyFolderRow({ node, depth, open, count, selected, renaming, onTo
         const isAsset = e.dataTransfer.types.includes('application/editor-asset');
         const isFolder = e.dataTransfer.types.includes('application/editor-folder');
         if (!isEntity && !isAsset && !isFolder) return;
+        // A non-prefab asset is REFUSED here rather than accepted-then-discarded (#306):
+        // returning without preventDefault leaves the browser's no-drop cursor up, keeps
+        // the row un-highlighted, and stops `drop` firing at all.
+        const { accept, refusal } = decideHierarchyAssetDrop(isAsset, getAssetDragInfo());
+        setDragGhostRefusal(refusal);
+        if (!accept) { setOver(false); return; }
         e.preventDefault();
         e.stopPropagation();
         e.dataTransfer.dropEffect = isAsset ? 'copy' : 'move';
         setOver(true);
       }}
-      onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setOver(false); }}
+      onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) { setOver(false); setDragGhostRefusal(null); } }}
       onDrop={(e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -322,13 +329,17 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
           const isEntity = e.dataTransfer.types.includes('application/editor-entity');
           const isAsset = e.dataTransfer.types.includes('application/editor-asset');
           if (!isEntity && !isAsset) return;
+          // Refuse a non-prefab asset outright — see the folder row above and #306.
+          const { accept, refusal } = decideHierarchyAssetDrop(isAsset, getAssetDragInfo());
+          setDragGhostRefusal(refusal);
+          if (!accept) { setDropZone(null); return; }
           e.preventDefault();
           e.stopPropagation();
           e.dataTransfer.dropEffect = isAsset ? 'copy' : 'move';
           setDropZone(isAsset ? 'child' : detectZone(e));
         }}
         onDragLeave={(e) => {
-          if (!e.currentTarget.contains(e.relatedTarget as Node)) setDropZone(null);
+          if (!e.currentTarget.contains(e.relatedTarget as Node)) { setDropZone(null); setDragGhostRefusal(null); }
         }}
         onDrop={(e) => {
           e.preventDefault();
@@ -1454,6 +1465,11 @@ export default function Hierarchy() {
     const raw = e.dataTransfer.getData('application/editor-asset');
     if (!raw) return;
     const { type, path } = JSON.parse(raw) as { type: string; path: string; name: string };
+    // Still load-bearing after #306, even though a human can no longer reach it: dragover
+    // now refuses a non-prefab so `drop` never fires for one, BUT `modoki_dnd` dispatches
+    // `drop` unconditionally (domDnd.ts fires the whole sequence and only REPORTS what
+    // `accepted` was), so an agent's drag still arrives here. Bail quietly — the refusal
+    // the agent needs is the `accepted:false` domDnd already returns.
     if (type !== 'prefab') return;
 
     try {
@@ -1623,12 +1639,17 @@ export default function Hierarchy() {
         onDragOver={(e) => {
           const t = e.dataTransfer.types;
           if (t.includes('application/editor-asset') || t.includes('application/editor-entity') || t.includes('application/editor-folder')) {
+            // Refuse a non-prefab asset outright — see the folder row above and #306.
+            const isAsset = t.includes('application/editor-asset');
+            const { accept, refusal } = decideHierarchyAssetDrop(isAsset, getAssetDragInfo());
+            setDragGhostRefusal(refusal);
+            if (!accept) { setDropActive(false); return; }
             e.preventDefault();
-            e.dataTransfer.dropEffect = t.includes('application/editor-asset') ? 'copy' : 'move';
+            e.dataTransfer.dropEffect = isAsset ? 'copy' : 'move';
             setDropActive(true);
           }
         }}
-        onDragLeave={() => setDropActive(false)}
+        onDragLeave={() => { setDropActive(false); setDragGhostRefusal(null); }}
         onDrop={(e) => {
           setDropActive(false);
           // Prefab drop from Assets

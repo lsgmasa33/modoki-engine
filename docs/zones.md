@@ -41,6 +41,13 @@ rotation is undone first), so a rotated box/plane/cylinder contains correctly.
 - `box` — full size = scale (half-extents `sx/2`, `sy/2`)
 - `capsule` — vertical pill along local Y, radius = `sx`, total height = `sy`
 
+**Containment tests the occupant's POSITION — a point, not its volume.** `zoneTriggerCore`
+resolves each occupant to a world position and asks the zone `contains(x, y, z)`; the occupant's
+own collider/renderable extent is never consulted (it may not have one — that is the point). So an
+object reads as inside strictly later, and outside strictly earlier, than the same object crossing
+an identically sized Rapier sensor, by roughly its own radius at each face. Size a zone for where
+you want the CENTRE to be, not by matching a sensor you are replacing.
+
 ## The three sinks (per crossing)
 
 For every enter and exit, `zone2DSystem` / `zone3DSystem` fan out to:
@@ -91,6 +98,31 @@ For every enter and exit, `zone2DSystem` / `zone3DSystem` fan out to:
 3. Tag the player with `ZoneOccupant`.
 4. Register a `level.checkpoint` UIAction. Walking the player in dispatches it with the player as
    `ctx.target`.
+
+## Worked example in a shipped project
+
+**`demos/3d-physics-demo` and `demos/2d-physics-demo` each carry the chain end to end**, in both
+cases deliberately parked next to the physics sensor doing the same job, so the two mechanisms are
+comparable in one scene:
+
+| | **Sensor Zone** | **Trigger Zone** |
+|---|---|---|
+| Traits | `RigidBody` + `Collider{isSensor}` + `OnCollision` | `Zone` + `OnZone` |
+| Rapier body | yes | **none** |
+| Detects | anything with a collider | anything tagged `ZoneOccupant` |
+
+Each tints its own primitive and journals its own event from a registered UIAction, so a crossing
+is verifiable as data (`modoki_journal`) rather than by eye. The demo's `tests/zone-station.test.ts`
+pins that wiring (and its 2D twin does the same): each reads the action names out of the scene JSON
+and asserts the demo's real handlers run, which is the failure this system is prone to — an authored
+action name that no longer resolves is a warning, not a crash, so an unwired zone keeps looking
+healthy in the Inspector.
+
+⚠️ **In 2D, size the visual by the zone's SCALE, not by `Renderable2D.width/height`.** A `Zone2D`
+box takes its full size from the Transform scale, and `Renderable2D` is *also* multiplied by that
+scale — so the drawn shape matches the tested area only when the sprite is authored `1x1` under the
+zone's scale (measured: `sx 260` x `width 1` renders 260 design px). Authoring both at 260 draws a
+bar 260x too large over a correctly sized zone, and only the wrong one is visible.
 
 ## Code map
 

@@ -8,30 +8,39 @@ self-contained and free of third-party assets. The public-facing doc is
 
 A near-content-only project exercising the engine's Rapier3D layer: gravity,
 restitution, rolling, a stacked tower, every primitive collider, three joint types, a
-character controller, a sensor trigger, and a trimesh terrain collider. Almost
-everything is authored in the scenes — **the scene is the source of truth**
-(`config.ts` does no `initWorld` spawning).
+character controller, a sensor trigger, a physics-free `Zone3D` trigger, and a trimesh
+terrain collider. Almost everything is authored in the scenes — **the scene is the
+source of truth** (`config.ts` does no `initWorld` spawning).
 
 ## This project
-- **Mechanics / systems** — the ONLY game code is two `UIAction`s registered in
-  `game.ts` (`sensorZone3D/enter` / `sensorZone3D/exit`), wired declaratively to the
-  *Sensor Zone* entity via its `OnCollision3D` trait. On enter/exit they tint the
-  zone's `Renderable3DPrimitive` (teal `0x1abc9c` → green `0x2ecc71`) and
-  `ctx.emit('zone', {phase, body})` a journal event (body as a hot-reload-stable GUID
-  via `entityRef()`) so the reaction is verifiable by data (`modoki_journal`), not by
-  eye. `unregisterSystems` tears both down. No custom traits, no config knobs, no
-  custom UI.
+- **Mechanics / systems** — the ONLY game code is TWO PAIRS of `UIAction`s registered
+  in `game.ts`, one per trigger station, each wired declaratively to its entity. Both
+  tint the station's `Renderable3DPrimitive` and `ctx.emit(...)` a journal event (body
+  as a hot-reload-stable GUID via `entityRef()`) so the reaction is verifiable by data
+  (`modoki_journal`), not by eye. `unregisterSystems` tears all four down. No custom
+  traits, no config knobs, no custom UI.
+  - `sensorZone3D/enter|exit` — the *Sensor Zone*, via `OnCollision3D`. Rapier sensor;
+    teal `0x1abc9c` → green `0x2ecc71`; journals `zone`.
+  - `triggerZone3D/enter|exit` — the *Trigger Zone*, via `OnZone3D`. **No physics body
+    at all**; purple `0x9b59b6` → violet `0xd980fa`; journals `zoneTrigger`.
+- **This demo is the engine's ONLY real usage of the declarative zone chain** (#296) —
+  `Zone3D` + `ZoneOccupant` + the `@zone` journal event + `OnZone3D`. Before it, the
+  chain shipped in nothing, so a regression in it was caught by no project we ship and a
+  QA pass had to rig a scene by hand to test it at all. `tests/zone-station.test.ts` is
+  the pinned fixture that replaced that: it reads the action names OUT of the scene and
+  asserts the registered handlers actually tint, so a rename on either side goes red.
 - **Config** — `physics3DDemoConfig` (`runtime/config.ts`) is a bare `GameConfig`:
   `sceneSetup`/`initWorld` are no-ops; it just points `scenePath` at
   `physics-showcase.scene.json`. World gravity (`-9.81` Y) lives on the scene's `Physics3D`
   resource entity, live-editable in the Inspector.
 - **Scenes** (`runtime/assets/scenes/`) — two:
-  - **physics-showcase.scene.json** (default, 39 entities) — organised with `editorFolder`
+  - **physics-showcase.scene.json** (default, 41 entities) — organised with `editorFolder`
     tags: `Setup` · `Level` · `Bodies` · `Joints/{Pendulum,Chain,Slider Test}` ·
     `Interaction` · `manual_test`. The 4 static walls are parented under an empty
     `Walls` transform group. Joints cover **revolute** (Pendulum), **spherical**
     (3-link Chain + the `manual_test` pendulum) and **prismatic** with travel limits
-    (Slider Test).
+    (Slider Test). `Interaction` holds BOTH trigger stations: the *Sensor Zone* + its
+    *Probe* at `x 8, z 0`, and the *Trigger Zone* + its *Zone Probe* at `x -9, z -8`.
   - **terrain-demo.scene.json** (55 entities) — a Terrain GLB with a trimesh
     (`.colmesh.glb`) collider and 49 balls raining onto it. No joints, no folders.
 - **Assets** — the terrain model under `runtime/assets/models/terrain/` and nothing
@@ -59,6 +68,21 @@ everything is authored in the scenes — **the scene is the source of truth**
   edge-on, N·L ≈ 0) while walls stay lit, and `castShadow` looks broken because the
   shadow map is cast edge-on. Both scenes here now carry an explicit rotation aiming
   the sun at the origin. Full detail: `docs/rendering.md` → Lights & Shadows.
+- **A zone tests the occupant's POSITION — a point — not its volume.** `zoneTriggerCore`
+  calls `contains(o.x, o.y, o.z)` on the occupant's world pose, so an occupant's own
+  radius buys it nothing: it reads as inside strictly later, and outside strictly
+  earlier, than the same object crossing an identically sized Rapier sensor. Measured in
+  one run here: sensor occupied for ticks 63→74, zone for 64→71. Don't size a zone by
+  eye against a sensor and expect the same window.
+- **`ZoneOccupant` is opt-in, and a zone with no tagged occupant is silently inert.**
+  Nothing errors — the Inspector shows a perfectly healthy `Zone3D` + `OnZone3D` that
+  reacts to nothing. In this scene the tagged ones are the *Zone Probe* and the *Player*.
+- **The Trigger Zone must NOT gain a `RigidBody3D`/`Collider3D`.** Its whole point is the
+  station next to it doing the same job WITH one; adding a body makes the pair
+  meaningless. `tests/zone-station.test.ts` fails if one appears.
+- **`x -8` is the RAMP, not free floor.** The obvious mirror of the Sensor Zone's `x 8`
+  drops a probe onto the tilted ramp, which rolls it to the far side of the arena — that
+  is why the Trigger Zone sits at `x -9, z -8` instead of the symmetric spot.
 - **`canSleep`** will freeze an undamped pendulum mid-swing. Set it false for a
   perpetual swing (the `manual_test` bob does).
 - Parenting: a child with its own `RigidBody3D` stays independent, but a
@@ -101,7 +125,8 @@ GUID from `modoki_list_assets`, not a literal path.
 
 Modoki names its two tool families:
 - **Percept** — verify by data, not vibes: `modoki_get_scene_state`, `modoki_journal`
-  (tick-stamped events — here the `zone` enter/exit reaction), `modoki_diagnose` (NaN
+  (tick-stamped events — here `zone` / `zoneTrigger` for the two stations' reactions, and
+  the engine's own `@sensor` / `@zone` crossings), `modoki_diagnose` (NaN
   transforms, broken refs, orphaned entities in one call), `modoki_watch` (a live
   time-series on chosen entities/traits — e.g. contacts/velocities to confirm physics is
   actually stepping, not just `playState`).

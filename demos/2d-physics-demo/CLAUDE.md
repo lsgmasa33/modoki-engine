@@ -6,24 +6,47 @@ colliders, and a tiny platformer. Almost everything is **authored in scene JSON*
 source of truth) — `initWorld`/`sceneSetup` are empty and there are no custom systems or traits.
 
 ## This project
-- **Mechanics / systems** — the *only* game code is two `UIAction`s registered in `game.ts`:
-  `sensorZone/enter` and `sensorZone/exit`, wired to the Sensor Zone's `OnCollision2D` trait
-  (declarative). On enter/exit they tint the zone's `Renderable2D` (idle translucent yellow
-  `0xf1c40f`/0.25 → occupied green `0x2ecc71`/0.5) and `ctx.emit('zone', {phase, body})` so the
-  reaction is verifiable from the event journal (body as a stable GUID via `entityRef`, not `id()`).
-  Everything else — falling bodies, bouncing, pendulum, spring, sensor detection, player movement —
-  is stock engine traits (`RigidBody2D`, `Collider2D`, joints, `CharacterController2D`).
+- **Mechanics / systems** — the *only* game code is TWO PAIRS of `UIAction`s registered in
+  `game.ts`, one per trigger station, each wired declaratively to its entity. Both tint the
+  station's `Renderable2D` and `ctx.emit(...)` a journal event, so the reaction is verifiable
+  from the event journal (body as a stable GUID via `entityRef`, not `id()`).
+  - `sensorZone/enter|exit` — the *Sensor Zone*, via `OnCollision2D`. Rapier sensor; idle
+    translucent yellow `0xf1c40f`/0.25 → occupied green `0x2ecc71`/0.5; journals `zone`.
+  - `triggerZone/enter|exit` — the *Trigger Zone*, via `OnZone2D`. **No physics body at all**;
+    idle purple `0x9b59b6`/0.25 → violet `0xd980fa`/0.5; journals `zoneTrigger`.
+  Everything else — falling bodies, bouncing, pendulum, spring, trigger detection, player movement
+  — is stock engine traits (`RigidBody2D`, `Collider2D`, joints, `CharacterController2D`).
+- **This demo is the engine's ONLY real usage of the 2D declarative zone chain** (#296) —
+  `Zone2D` + `ZoneOccupant` + the `@zone` journal event + `OnZone2D` (`demos/3d-physics-demo`
+  carries the 3D half). Before it, the chain shipped in nothing, so a regression in it was caught
+  by no project we ship. `tests/zone-station.test.ts` is the pinned fixture: it reads the action
+  names OUT of the scene and asserts the registered handlers actually tint, so a rename on either
+  side goes red.
 - **Config knobs** — none. `runtime/config.ts` (`physicsDemoConfig`) just points `scenePath` at
   `physics-playground.scene.json` with empty `sceneSetup`/`initWorld`; there is no config resource trait.
 - **Custom traits / UI / services** — none. No `runtime/setup.ts`, `systems.ts`, `traits.ts`, or
   `ui/`. The platformer's Credits dialog is plain ECS UI entities.
 - **Scenes** — the starting scene is **`physics-playground.scene.json`** (floor + walls, three boxes,
-  ghost/bouncy balls, pendulum anchor+bob+revolute joint, spring anchor+bob+joint, the Sensor Zone).
+  ghost/bouncy balls, pendulum anchor+bob+revolute joint, spring anchor+bob+joint, the Sensor Zone,
+  and the Trigger Zone + its Zone Probe at `x 830`, right of the spring column).
   The others demonstrate one feature each: `ccd-tunneling` (CCD on vs off), `collider-mesh`
   (editable polygon ramp + polyline terrain), `compound-colliders` (table/cross/dumbbell),
   `concave-shapes` (bowl + dynamic boomerang), `platformer` (A/D move · Space jump). Gravity and
   layers (`Default`/`Ground`/`Ghost`, collision matrix `[3,7,2]`) come from the `Physics2D`
   singleton entity + `project.config.json`.
+
+## Gotchas
+- **A `Zone2D` takes its area from the Transform SCALE, and `Renderable2D` is scaled by that
+  same Transform.** So the two are only identical if the sprite is authored `1x1`: the Trigger
+  Zone is `sx 260, sy 30` with a `1x1` square, which renders 260x30 design px (measured via
+  `get_scene_state?bounds=1`) and tests exactly that area. Authoring `width 260` under `sx 260`
+  would draw a 67600px bar over a correctly-sized zone — the drawn area and the tested area
+  desync silently, and only the drawn one is visible.
+- **`ZoneOccupant` is opt-in, and a zone with no tagged occupant is silently inert.** Nothing
+  errors — the Inspector shows a healthy `Zone2D` + `OnZone2D` reacting to nothing. Here the
+  only tagged entity is the *Zone Probe*.
+- **The Trigger Zone must NOT gain a `RigidBody2D`/`Collider2D`.** Its whole point is the
+  station beside it doing the same job WITH one. `tests/zone-station.test.ts` fails if one appears.
 
 ## The character sprite — constraints worth knowing before you touch it
 `runtime/assets/sprites/player.png` is a CC0 sheet (see `ATTRIBUTION.md`) packed into a uniform

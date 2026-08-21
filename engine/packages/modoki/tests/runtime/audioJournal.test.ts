@@ -16,7 +16,7 @@ import { AudioSettings } from '../../src/runtime/traits/AudioSettings';
 import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { audioSystem, stopEntityAudio, stopWorldAudio } from '../../src/runtime/audio/audioSystem';
 import {
-  getAudioLog, clearAudioLog, setAudioRecordMode, play,
+  getAudioLog, clearAudioLog, setAudioRecordMode, play, endRecordedVoices,
 } from '../../src/runtime/audio/audioService';
 import { cueClip, cueSound } from '../../src/runtime/audio/audioCues';
 import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
@@ -248,16 +248,84 @@ describe('the sfx voice cap — oldest-first stealing (owner policy, 2026-08-21)
     expect(stolen()).toHaveLength(2);
   });
 
-  it('a finished one-shot frees its slot instead of holding it against the cap', () => {
+  it('a finished one-shot frees its slot, and says so, instead of holding it', () => {
+    // This must drive the per-frame reap sweep specifically. An earlier version of this
+    // test used `stopWorldAudio` to "end" the voices — which empties `oneShots` wholesale
+    // and therefore passed identically with the sweep DELETED. `endRecordedVoices` ends the
+    // handles the way a real non-looping source self-reaps, leaving the sweep as the only
+    // thing that can free the slots.
     world!.spawn(AudioSettings({ sfxVoiceLimit: 2 }));
-    fire(2);
+    const first = fire(2);
     expect(stolen()).toHaveLength(0);
-    // End both voices the way a real non-looping source self-reaps, then fire two more.
-    for (const l of getAudioLog()) void l;
-    stopWorldAudio(world!);           // ends the tracked one-shots
-    clearJournal(world!);
-    fire(2);
+
+    endRecordedVoices();              // both voices finish naturally
+    audioSystem(world!);              // the sweep reaps them
+    expect(audioEvents().filter((p) => p.phase === 'end').map((p) => p.clip)).toEqual(first);
+
+    const second = fire(2);
     expect(stolen()).toHaveLength(0); // the freed slots were reused, nothing stolen
+    expect(second).toHaveLength(2);
+  });
+
+  it('ramps a stolen voice over the AUTHORED fade, not a hardcoded one', () => {
+    // The fade length is a feel value, so like the limit it has to come from the scene.
+    // Record mode logs the ramp (op:'fade'), which is the only way to tell an authored
+    // 250 ms from the 10 ms default — a no-op fade() cannot distinguish them.
+    world!.spawn(AudioSettings({ sfxVoiceLimit: 1, sfxStealFadeSec: 0.25 }));
+    const clips = fire(2);
+
+    expect(stolen().map((p) => p.clip)).toEqual([clips[0]]);
+    const fades = getAudioLog().filter((l) => l.op === 'fade');
+    expect(fades).toHaveLength(1);
+    expect(fades[0].clip).toBe(clips[0]);   // the stolen voice, not the new one
+    expect(fades[0].volume).toBe(0);        // ramped to silence
+    expect(fades[0].durationSec).toBe(0.25);
+  });
+
+  it('honours an authored fade of 0 as a HARD CUT — no ramp scheduled at all', () => {
+    world!.spawn(AudioSettings({ sfxVoiceLimit: 1, sfxStealFadeSec: 0 }));
+    const clips = fire(2);
+
+    expect(stolen().map((p) => p.clip)).toEqual([clips[0]]);
+    // 0 must mean "cut", not "ramp over 0s" — scheduling a zero-length ramp would be a
+    // pointless AudioParam event, and the guard for that is that none is scheduled.
+    expect(getAudioLog().filter((l) => l.op === 'fade')).toHaveLength(0);
+  });
+
+  it('balances a STOLEN voice too — one terminal event each, never zero and never two', () => {
+    // The crossfade-tail fix established this invariant; the steal path has to hold it as
+    // well, or a voice count drifts by one per steal in the opposite direction.
+    world!.spawn(AudioSettings({ sfxVoiceLimit: 1, sfxStealFadeSec: 0.25 }));
+    fire(3);
+    stopWorldAudio(world!);   // force-stop anything still ramping
+
+    const started = phases().filter((p) => p === 'start' || p === 'swap').length;
+    const terminal = phases().filter((p) => p === 'stop' || p === 'end' || p === 'stolen').length;
+    expect(started).toBe(3);
+    expect(terminal).toBe(3);
+    // and specifically NOT double-counted: a stolen voice must not also report end/stop.
+    expect(phases().filter((p) => p === 'stolen')).toHaveLength(2);
+  });
+
+  it('keeps a ramping stolen voice force-stoppable instead of orphaning it', () => {
+    world!.spawn(AudioSettings({ sfxVoiceLimit: 1, sfxStealFadeSec: 0.25 }));
+    const clips = fire(2);    // clips[0] is stolen and is now ramping down
+
+    // Record mode cannot fire the audio-clock stopAfter, so if the steal dropped its last
+    // reference the handle would sit ended:false forever with a play and no stop. Teardown
+    // must still be able to reach it.
+    expect(getAudioLog().filter((l) => l.op === 'stop')).toHaveLength(0);
+    stopWorldAudio(world!);
+    const stops = getAudioLog().filter((l) => l.op === 'stop');
+    expect(stops.map((l) => l.clip)).toContain(clips[0]);
+  });
+
+  it('floors a fractional authored limit instead of silently capping one higher', () => {
+    // The Inspector's number box accepts a typed fraction; `while (n >= 2.5)` settles at 3.
+    world!.spawn(AudioSettings({ sfxVoiceLimit: 2.5 }));
+    const clips = fire(4);
+    // Floored to 2 → the two oldest of four are stolen. Unfloored it would steal only one.
+    expect(stolen().map((p) => p.clip)).toEqual([clips[0], clips[1]]);
   });
 
   it('falls back to the trait default when no scene entity authors AudioSettings', () => {

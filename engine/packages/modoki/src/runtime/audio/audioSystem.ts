@@ -30,7 +30,9 @@
 import type { World, Entity, ExtractSchema, TraitValue } from 'koota';
 import { Transform } from '../core/traits/Transform';
 import { AudioSource } from '../traits/AudioSource';
-import { AudioSettings, AUDIO_SETTINGS_DEFAULT_LIMIT } from '../traits/AudioSettings';
+import {
+  AudioSettings, AUDIO_SETTINGS_DEFAULT_LIMIT, AUDIO_SETTINGS_DEFAULT_STEAL_FADE,
+} from '../traits/AudioSettings';
 import { AudioListener } from '../traits/AudioListener';
 import { getPlayState } from '../core/playState';
 import { isTimelinePreviewActive } from '../core/timelinePreview';
@@ -82,6 +84,22 @@ interface AudioEventDetail {
   reason?: string;
 }
 
+/** Terminal event for a `fadingOut` entry, wherever it is reaped from.
+ *
+ *  ONE helper rather than the guard inlined at each of the three reap sites, because the
+ *  decision it makes — "a `silent` entry already emitted its terminal event, so emitting
+ *  another would double-count it against `start`" — is only REACHABLE from one of those
+ *  sites headlessly: record mode has no audio clock, so a stolen tail never self-ends and
+ *  the per-frame sweep never sees one. Inlined, the sweep's copy of the guard was untested
+ *  and a mutation that removed it stayed green. Shared, testing any reap site tests the
+ *  decision. */
+function reapTail(
+  world: World, t: { handle: AudioHandle; clip: string; silent?: boolean }, reason?: string,
+): void {
+  if (t.silent) return; // its terminal event was the `stolen` emitted when it was cut
+  journalAudio(world, reason ? 'stop' : 'end', undefined, { clip: t.clip, ...(reason ? { reason } : {}) });
+}
+
 function journalAudio(
   world: World, phase: AudioPhase, entity: Entity | undefined, detail: AudioEventDetail = {},
 ): void {
@@ -110,7 +128,7 @@ interface AudioState {
    *  concurrent sources a voice-count measurement has to include — so leaving it out of
    *  the trace made `start`/`swap` and `stop`/`end` unbalanced by exactly one per
    *  crossfade, which is precisely the arithmetic the deferred voice cap needs. */
-  fadingOut: { handle: AudioHandle; clip: string }[];
+  fadingOut: { handle: AudioHandle; clip: string; silent?: boolean }[];
   /** Live fire-and-forget one-shots, OLDEST FIRST — insertion order IS age order, which is
    *  what makes oldest-first stealing a `shift()` rather than a search. Only `sfx`-bus
    *  one-shots are tracked, because only they are subject to the cap. Before this the
@@ -161,10 +179,13 @@ export function stopWorldAudio(world: World): void {
     s.autoplayed.clear();
     for (const t of s.fadingOut) {
       t.handle.stop();
-      journalAudio(world, 'stop', undefined, { clip: t.clip, reason: 'world-teardown' });
+      reapTail(world, t, 'world-teardown');
     }
     s.fadingOut = [];
-    for (const o of s.oneShots) o.handle.stop();
+    for (const o of s.oneShots) {
+      o.handle.stop();
+      journalAudio(world, 'stop', undefined, { clip: o.clip, reason: 'world-teardown' });
+    }
     s.oneShots = [];
     s.warnedUnresolved.clear();
     s.pendingCues = [];
@@ -226,10 +247,13 @@ export function audioSystem(world: World): void {
       state.sources.clear();
       for (const t of state.fadingOut) {
         t.handle.stop();
-        journalAudio(world, 'stop', undefined, { clip: t.clip, reason: 'not-playing' });
+        reapTail(world, t, 'not-playing');
       }
       state.fadingOut = [];
-      for (const o of state.oneShots) o.handle.stop();
+      for (const o of state.oneShots) {
+        o.handle.stop();
+        journalAudio(world, 'stop', undefined, { clip: o.clip, reason: 'not-playing' });
+      }
       state.oneShots = [];
     }
     state.autoplayed.clear();
@@ -243,13 +267,22 @@ export function audioSystem(world: World): void {
   // Sweep finished one-shots so a dead voice cannot hold a slot against the cap. In live
   // mode a non-looping source self-reaps via `onended`; in record mode nothing ends on its
   // own, which is what lets a headless test drive the cap deterministically.
-  if (state.oneShots.length) state.oneShots = state.oneShots.filter((o) => !o.handle.ended);
+  if (state.oneShots.length) {
+    state.oneShots = state.oneShots.filter((o) => {
+      if (!o.handle.ended) return true;
+      journalAudio(world, 'end', undefined, { clip: o.clip });
+      return false;
+    });
+  }
 
   // Sweep crossfade tails that have self-stopped (via their audio-clock stopAfter).
   if (state.fadingOut.length) {
     state.fadingOut = state.fadingOut.filter((t) => {
       if (!t.handle.ended) return true;
-      journalAudio(world, 'end', undefined, { clip: t.clip });
+      // `silent` = a stolen voice, whose terminal event (`stolen`) was already emitted when
+      // it was cut. It rides here only so teardown can force-stop it mid-ramp; emitting
+      // `end` as well would double-count it against `start`.
+      reapTail(world, t);
       return false;
     });
   }
@@ -371,30 +404,37 @@ function startOrSwap(world: World, state: AudioState, entity: Entity, a: TraitVa
   });
 }
 
-/** How long a stolen one-shot takes to ramp to silence before it is stopped.
- *
- *  A bare `stop()` is an instant amplitude discontinuity — an audible click on EVERY steal,
- *  which would make a cap meant to protect the mix contribute its own artifact. 10 ms is
- *  below the threshold where a fade reads as a fade, so the sound still stops abruptly to
- *  the ear; it just stops without a click. Scheduled on the AUDIO clock, so it completes
- *  even while gameplay is time-stopped. */
-const STEAL_FADE_SEC = 0.01;
-
 /** Play a fire-and-forget one-shot, enforcing `AudioSettings.sfxVoiceLimit`.
  *
  *  Only `sfx`-bus one-shots are counted or stolen — music is on its own bus, `ui` is
  *  deliberately uncapped, and entity-owned `AudioSource` voices are never stolen at all
  *  (a looping ambience is the oldest voice forever, so oldest-first would kill it the
  *  instant the cap engaged). See `AudioSettings` for the reasoning behind each exemption. */
-function playOneShot(world: World, state: AudioState, spec: AudioPlaySpec, limit: number): void {
+function playOneShot(
+  world: World, state: AudioState, spec: AudioPlaySpec, limit: number, stealFadeSec: number,
+): void {
   const bus = spec.bus ?? 'sfx';
   if (bus !== 'sfx' || limit <= 0) { play(spec); return; }
   // Oldest first: insertion order is age order, so the victim is always at the head.
   while (state.oneShots.length >= limit) {
     const victim = state.oneShots.shift();
     if (!victim) break;
-    victim.handle.fade(0, STEAL_FADE_SEC);
-    victim.handle.stopAfter(STEAL_FADE_SEC);
+    // Ramp to silence rather than cutting: a bare stop is an amplitude discontinuity, i.e.
+    // an audible click on EVERY steal. Duration is AUTHORED (`sfxStealFadeSec`) because it
+    // is a feel value; 0 is a legitimate authored choice meaning "hard cut".
+    if (stealFadeSec > 0) {
+      victim.handle.fade(0, stealFadeSec);
+      victim.handle.stopAfter(stealFadeSec);
+      // Hand the ramping handle to `fadingOut` rather than orphaning it. Dropping the last
+      // reference would mean teardown could no longer force-stop it mid-ramp — the exact
+      // capability `fadingOut` exists to provide — and in record mode, where `stopAfter` is
+      // a no-op, nothing would ever call `stop()` on it, so it would sit `ended:false`
+      // forever with a `play` in the log and no matching `stop`. `silent` because its
+      // terminal event is the `stolen` below, not a second `end`.
+      state.fadingOut.push({ handle: victim.handle, clip: victim.clip, silent: true });
+    } else {
+      victim.handle.stop(); // hard cut — no ramp to outlive us, so reap it here
+    }
     journalAudio(world, 'stolen', undefined, { clip: victim.clip, bus, reason: 'voice-cap' });
   }
   const handle = play(spec);
@@ -403,14 +443,21 @@ function playOneShot(world: World, state: AudioState, spec: AudioPlaySpec, limit
   if (!handle.ended) state.oneShots.push({ handle, clip: spec.clip ?? '' });
 }
 
-/** The authored sfx voice limit, or the trait default when no scene entity carries it. */
-function sfxVoiceLimit(world: World): number {
-  return world.queryFirst(AudioSettings)?.get(AudioSettings)?.sfxVoiceLimit
-    ?? AUDIO_SETTINGS_DEFAULT_LIMIT;
+/** The authored voice-cap settings, falling back to the trait's own defaults when no scene
+ *  entity carries `AudioSettings`. Read once per frame rather than per shot. */
+function audioSettings(world: World): { limit: number; stealFadeSec: number } {
+  const a = world.queryFirst(AudioSettings)?.get(AudioSettings);
+  return {
+    // FLOORED: the Inspector's number box accepts a typed fraction (step:1 only constrains
+    // the spinner), and `while (length >= 2.5)` settles at 3 rather than 2 — an off-by-one
+    // effective cap that no error would report. A voice count is an integer by nature.
+    limit: Math.floor(a?.sfxVoiceLimit ?? AUDIO_SETTINGS_DEFAULT_LIMIT),
+    stealFadeSec: a?.sfxStealFadeSec ?? AUDIO_SETTINGS_DEFAULT_STEAL_FADE,
+  };
 }
 
 function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
-  const limit = sfxVoiceLimit(world);
+  const { limit, stealFadeSec } = audioSettings(world);
   // Retry one-shots deferred on a previous frame — their buffer may have finished decoding (e.g.
   // after the iOS first-gesture resume). Play the ready ones; age out the rest, dropping at 0.
   if (state.pendingCues.length) {
@@ -418,7 +465,7 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
     for (const p of state.pendingCues) {
       const spec = resolveSpec(p.cue.clip ?? '', { bus: p.cue.bus, volume: p.cue.volume, pitch: p.cue.pitch });
       if (spec) {
-        playOneShot(world, state, spec, limit);
+        playOneShot(world, state, spec, limit, stealFadeSec);
         journalAudio(world, 'start', undefined, { clip: p.cue.clip, bus: p.cue.bus });
         continue;
       }
@@ -433,7 +480,7 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
     if (cue.clip) {
       const spec = resolveSpec(cue.clip, { bus: cue.bus, volume: cue.volume, pitch: cue.pitch });
       if (spec) {
-        playOneShot(world, state, spec, limit);
+        playOneShot(world, state, spec, limit, stealFadeSec);
         journalAudio(world, 'start', undefined, { clip: cue.clip, bus: cue.bus });
         continue;
       }
@@ -468,7 +515,7 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
         // fire-and-forget one-shot (no handle is retained on the entity), so it counts
         // against the cap like any other. What is exempt is a source's OWN declarative
         // playback via `startOrSwap`, which the cap never touches.
-        playOneShot(world, state, spec, limit);
+        playOneShot(world, state, spec, limit, stealFadeSec);
         journalAudio(world, 'start', entity, { clip: a.clip, bus: cue.bus ?? a.bus, spatial: a.spatial });
       }
     });

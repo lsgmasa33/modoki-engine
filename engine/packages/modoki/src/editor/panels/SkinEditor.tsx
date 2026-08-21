@@ -38,6 +38,8 @@ import { removeBone } from '../../runtime/skinning/rig2dEdit';
 import { activePartOf, withActivePart, partsOf, partCount, addPart, removePart, reorderPart, reorderActiveIndex, renamePart, uvToPosAffine, partAngle, bboxCenter } from './skinParts';
 import { pushAction, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
 import { BufferedNumberInput, inputStyle } from './fields';
+import { getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
+import { decideSkinPartAssetDrop, skinPartAcceptsAsset } from './assetDropPolicy';
 
 
 /** Derive width/height/pivot in texture space from the current mesh's vertex bounds,
@@ -359,7 +361,9 @@ export default function SkinEditor() {
   // (all selected paths, any view mode); a single drag also carries 'application/editor-asset'
   // {type,path,name,guid}. Keep only image assets and resolve each to a GUID (refs must be GUIDs).
   const resolveDroppedSprites = useCallback((e: React.DragEvent): string[] => {
-    const isImage = (p: string, type?: string) => type === 'sprite' || type === 'texture' || /\.(png|jpe?g|webp)$/i.test(p);
+    // The SAME predicate the dragover handlers below refuse with — a second, hand-copied
+    // copy here is exactly how the affordance and the action drift apart (#306).
+    const isImage = (p: string, type?: string) => skinPartAcceptsAsset({ type: type ?? null, path: p });
     // A part.sprite ref must be a SPRITE guid, never a raw texture guid — a dropped texture
     // resolves to its derived whole-image sprite; an explicit sprite slice passes through
     // unchanged. (assetRefIntegrity guards this invariant.)
@@ -755,9 +759,17 @@ export default function SkinEditor() {
             onDragOver={(e) => {
               const t = e.dataTransfer.types;
               if (t.includes('application/skin-part')) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; if (reorderOverPart !== parts.length - 1) setReorderOverPart(parts.length - 1); }
-              else if (t.includes('application/editor-asset')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; if (dropOverPart !== -1) setDropOverPart(-1); }
+              else if (t.includes('application/editor-asset')) {
+                // A non-image asset is REFUSED rather than accepted-then-discarded (#306):
+                // returning without preventDefault leaves the browser's no-drop cursor up and
+                // keeps the list un-outlined, and the ghost says which kinds would work.
+                const { accept, refusal } = decideSkinPartAssetDrop(true, getAssetDragInfo());
+                setDragGhostRefusal(refusal);
+                if (!accept) { if (dropOverPart !== null) setDropOverPart(null); return; }
+                e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; if (dropOverPart !== -1) setDropOverPart(-1);
+              }
             }}
-            onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) { setDropOverPart(null); setReorderOverPart(null); } }}
+            onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) { setDropOverPart(null); setReorderOverPart(null); setDragGhostRefusal(null); } }}
             onDrop={(e) => {
               if (e.dataTransfer.types.includes('application/skin-part')) {
                 e.preventDefault();
@@ -778,7 +790,13 @@ export default function SkinEditor() {
                 onDragOver={(e) => {
                   const t = e.dataTransfer.types;
                   if (t.includes('application/skin-part')) { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'move'; if (reorderOverPart !== i) setReorderOverPart(i); }
-                  else if (t.includes('application/editor-asset')) { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'copy'; if (dropOverPart !== i) setDropOverPart(i); }
+                  else if (t.includes('application/editor-asset')) {
+                    // Refuse a non-image asset outright — see the list container above and #306.
+                    const { accept, refusal } = decideSkinPartAssetDrop(true, getAssetDragInfo());
+                    setDragGhostRefusal(refusal);
+                    if (!accept) { if (dropOverPart !== null) setDropOverPart(null); return; }
+                    e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'copy'; if (dropOverPart !== i) setDropOverPart(i);
+                  }
                 }}
                 onDrop={(e) => {
                   if (e.dataTransfer.types.includes('application/skin-part')) {

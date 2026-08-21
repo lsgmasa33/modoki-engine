@@ -848,6 +848,7 @@
           "y": 3,
           "z": 7
         },
+        "ZoneOccupant": {},
         "Renderable3DPrimitive": {
           "mesh": "capsule",
           "color": 16769126,
@@ -1029,6 +1030,71 @@
           "parentId": "",
           "guid": "e3f9c507-00c0-4fbf-a40d-721124e12e30",
           "editorFolder": "manual_test"
+        }
+      }
+    },
+    {
+      "name": "Trigger Zone",
+      "traits": {
+        "Transform": {
+          "x": -9,
+          "y": 4,
+          "z": -8,
+          "sx": 3,
+          "sz": 3
+        },
+        "Zone3D": {
+          "shape": "box",
+          "color": 10181046
+        },
+        "OnZone3D": {
+          "onEnter": "triggerZone3D/enter",
+          "onExit": "triggerZone3D/exit"
+        },
+        "Renderable3DPrimitive": {
+          "mesh": "box",
+          "color": 10181046
+        },
+        "EntityAttributes": {
+          "name": "Trigger Zone",
+          "sortOrder": 40,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "fdbd3f22-9ef9-4ce5-9fc2-71f7dfe263a6",
+          "editorFolder": "Interaction"
+        }
+      }
+    },
+    {
+      "name": "Zone Probe",
+      "traits": {
+        "Transform": {
+          "x": -9,
+          "y": 9.5,
+          "z": -8
+        },
+        "ZoneOccupant": {},
+        "Renderable3DPrimitive": {
+          "mesh": "sphere",
+          "color": 15528177,
+          "size": 0.8
+        },
+        "RigidBody3D": {
+          "linearDamping": 0.15,
+          "angularDamping": 0.4
+        },
+        "Collider3D": {
+          "shape": "sphere",
+          "radius": 0.4,
+          "restitution": 0.3
+        },
+        "EntityAttributes": {
+          "name": "Zone Probe",
+          "sortOrder": 41,
+          "parentId": "",
+          "layer": "3d",
+          "guid": "1bb50382-2d9c-48b4-a778-3ccf8b76f785",
+          "editorFolder": "Interaction"
         }
       }
     }

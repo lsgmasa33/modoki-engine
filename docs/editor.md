@@ -353,6 +353,58 @@ texture-to-derived-sprite edge that makes an ad-hoc search for "who uses this te
 than merely incomplete. Mechanism, the measured numbers, and the traps:
 [build.md](build.md) § "Find References — the same walk, inverted".
 
+### Dropping an asset into a panel — accept what you act on, and refuse the rest VISIBLY
+
+Two panels take an asset dragged out of the Assets panel, and each takes one kind:
+
+| Target | Accepts | Because |
+|---|---|---|
+| **Hierarchy** | prefabs | It instantiates entities. Every other kind is a *reference* (mesh, material, texture, clip) with no entity shape of its own, so a drop has nothing to create. |
+| **Skin editor parts list** | sprites + textures (or any `.png`/`.jpg`/`.webp`) | A part's source art is a sprite; a dropped texture is resolved to its derived whole-image sprite. |
+
+Dropping onto the **SceneView viewport** does nothing at all, and that is a decision rather than a
+gap — see `todo.md` § Deferred decisions.
+
+⚠️ **A refusal has two halves, and shipping only one is its own bug** (#306). Until 2026-08-21 both
+panels called `preventDefault()` on `dragover` for any `application/editor-asset` — because the MIME
+type says nothing about the KIND — and then filtered on the real rule in the drop handler and bailed.
+A texture got the copy cursor *and* the row highlight from the Hierarchy; a prefab got the copy
+cursor *and* the blue outline from the parts list; both then did nothing, with no explanation. The
+two halves now are:
+
+1. **dragover does not `preventDefault()`** for a kind the panel will not act on. That is what
+   paints the browser's no-drop cursor, suppresses the highlight, stops `drop` firing at all, and —
+   the part that matters for QA — makes `modoki_dnd` fail with an honest `accepted:false` instead of
+   returning `accepted:true, committed:false`, a shape `engine/app/debug/domDnd.ts` had to carry a
+   heuristic warning about because it is indistinguishable from a drop that legitimately makes no
+   edit. (`qa/cases/assets/assets-drag-drop-into-hierarchy.md` asserted the OLD result and was
+   inverted in the same change.)
+2. **the drag ghost says why** — `setDragGhostRefusal` in `editor/utils/dragGhost.ts` repaints the
+   label already following the cursor (🚫, red, *"only prefabs can be dropped here"*). A bare
+   no-drop cursor says "not here" without saying whether you missed the target or picked the wrong
+   file, so each refusal names what WOULD work. That half is invisible to the agent tier — the
+   ghost is torn down by `dragend` before a tool call returns — so it is pinned by unit tests, and
+   a *silent* refusal would pass QA and still be a defect.
+
+**The browser constraint that made this non-obvious**, and the reason a drop target cannot simply
+apply its rule: **`dataTransfer.getData()` returns `''` during `dragover`** — the drag data store is
+in *protected mode* until `drop`, exposing only `types`. Both panels accepted everything because at
+decision time they genuinely had nothing to decide with. The answer is `getAssetDragInfo()`, reading
+the payload the Assets panel stores module-side at dragstart (`setAssetDragPayload`, single
+producer — verified by grep). A null result during an asset drag means a foreign or stale drag and
+is refused, not waved through.
+
+**Each rule has exactly one copy**, in `editor/panels/assetDropPolicy.ts`, called by both the
+dragover handler and the drop handler. That matters more than the refusal text: the Skin editor's
+drop handler had its own hand-written `isImage`, and a second copy of an accept test is precisely
+how the affordance and the action drift apart again — invisibly, since the panel keeps working and
+merely accepts a little more or less than it acts on. (`dragGhost.acceptMatchesAsset` makes the same
+point for `data-accept` targets.) The panels only wire the policy in; it is pure and unit-tested,
+per the editor `.ts`-carries-tests rule below.
+
+`handlePrefabDrop`'s `type !== 'prefab'` bail is still load-bearing even though no human can reach
+it, because `modoki_dnd` dispatches `drop` unconditionally and only *reports* what `accepted` was.
+
 ### A panel that reads `getAllAssets()` must subscribe to `assetsVersion`
 
 `getAllAssets()` reads the module-level manifest map, and React has no idea when that map

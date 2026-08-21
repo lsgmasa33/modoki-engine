@@ -171,9 +171,13 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
       `THIS DROP IS NOT ONE A HUMAN COULD PERFORM: ${covered.join(' and ')}. The events were dispatched straight at the element, which bypasses the browser's hit-testing, so the handler ran anyway — a real drag would have been delivered to the covering element and the intended handler would never have fired. Do not rest a QA verdict on this gesture: move the cover out of the way (close the menu/modal, scroll the row into view) and repeat it.`,
     );
   }
+  // NOTE: this used to cite "a non-prefab asset dropped on a Hierarchy entity row" as the
+  // classic case. It no longer is — #306 made the Hierarchy refuse a non-prefab asset on
+  // dragover, so that gesture now comes back `accepted:false` with the honest error below
+  // instead of arriving here. The heuristic stays for the cases nothing has closed.
   if (types.length > 0 && accepted && committed === false) {
     warnings.push(
-      'the target accepted the payload TYPE but no editor edit was recorded, so the drop probably did nothing — the classic case is a non-prefab asset dropped on a Hierarchy entity row, which accepts any asset on dragover and then ignores everything but a prefab. Verify with get_scene_state/history before building on this. (A drop that legitimately makes no undoable edit, e.g. a file move, also lands here.)',
+      'the target accepted the payload TYPE but no editor edit was recorded, so the drop probably did nothing. Verify with get_scene_state/history before building on this. (A drop that legitimately makes no undoable edit, e.g. a file move, also lands here.)',
     );
   }
   // `ok` must reflect what ACTUALLY happened, not just "we fired the sequence". An empty

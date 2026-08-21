@@ -7,7 +7,8 @@ above it](screenshot.png)
 A showcase of the [Modoki](https://modoki-engine.com) engine's **Rapier3D** physics
 layer, built almost entirely as scene data. Gravity, restitution, stacking, every
 primitive collider shape, three kinds of joint, a character controller, a sensor
-trigger, and a trimesh terrain collider — with **55 lines of game code** in total.
+trigger, a physics-free `Zone3D` trigger volume, and a trimesh terrain collider — with
+**69 lines of game code** in total.
 
 That is the point of the demo: the physics is the *engine's*, not the game's. If you
 want to see what Modoki gives you before you write anything, start here.
@@ -42,7 +43,7 @@ Two scenes, switchable from the Assets panel.
 | **Joints / Chain** | Three `spherical` ball-joints in series, hanging and swaying |
 | **Joints / Slider Test** | A `prismatic` slider with travel limits — the body slides along one axis only and stops mid-air at its limit |
 | **manual_test** | A second `spherical` pendulum, free to swing in any direction |
-| **Interaction** | A kinematic `CharacterController3D` player, and a sensor volume that reacts when a probe passes through it |
+| **Interaction** | A kinematic `CharacterController3D` player, a Rapier **sensor** volume that reacts when a probe passes through it, and a **Trigger Zone** — the same reaction with no physics body at all |
 
 ### `terrain-demo.json`
 
@@ -52,16 +53,36 @@ where a primitive collider would be a poor fit.
 
 ## The only game code
 
-Two `UIAction`s registered in `game.ts`, wired declaratively to the sensor volume's
-`OnCollision3D` trait. On enter/exit they tint the zone and emit a `zone` event to the
-engine's journal, so the reaction can be verified as **data** rather than by eye:
+Two pairs of `UIAction`s registered in `game.ts`, wired declaratively to the two
+trigger stations. On enter/exit they tint the station and emit a journal event, so the
+reaction can be verified as **data** rather than by eye:
 
 ```ts
 ctx.emit('zone', { phase, body })   // body is a stable GUID, not a runtime id
 ```
 
-Everything else — falling, bouncing, stacking, joints, character movement, sensor
+Everything else — falling, bouncing, stacking, joints, character movement, trigger
 detection — is stock engine traits driven by the scene file.
+
+### Two ways to detect "something is in here", side by side
+
+The arena carries both, so you can pick by what you actually need:
+
+| | **Sensor Zone** (teal, right) | **Trigger Zone** (violet, left) |
+|---|---|---|
+| Traits | `RigidBody3D` + `Collider3D{isSensor}` + `OnCollision3D` | `Zone3D` + `OnZone3D` |
+| Costs a Rapier body | yes | **no** |
+| Detects | anything with a collider | anything tagged `ZoneOccupant` (opt-in) |
+| Tests against | the other body's **collider volume** | the occupant's **position** — a point |
+
+A zone is the cheaper answer for the "is X inside this region" questions that don't
+need a solver — checkpoints, spawn and kill regions, camera triggers, cutscene starts.
+Because it tests a point, an occupant registers as inside slightly later and leaves
+slightly earlier than the same object would through a sensor — the difference being
+roughly the occupant's own radius at each face. Both probes fall the same distance into
+identically sized volumes here, and one measured run has the sensor occupied for 11
+ticks against the zone's 7. (Treat that as an illustration, not a constant: the exact
+tick counts move a little between runs.)
 
 ## Concepts worth stealing
 
@@ -77,8 +98,9 @@ detection — is stock engine traits driven by the scene file.
 - **Parent groups are for organisation, not physics.** The `Walls` group is a bare
   transform. A child carrying its own `RigidBody3D` stays an independent body, but a
   *collider-only* child under a body is silently absorbed as a compound child.
-- **Verify by data.** `zone` journal events and body contacts make the demo assertable
-  in a headless test — no screenshots required.
+- **Verify by data.** The `zone` / `zoneTrigger` journal events — and the engine's own
+  `@zone` crossings — make the demo assertable in a headless test, no screenshots
+  required. `tests/zone-station.test.ts` does exactly that.
 
 ## Assets
 

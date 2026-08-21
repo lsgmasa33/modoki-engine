@@ -800,6 +800,7 @@ export function registerAllTraits() {
     name: 'AudioSettings', trait: AudioSettings, category: 'resource',
     fields: {
       sfxVoiceLimit: { type: 'number', min: 0, max: 64, step: 1, tooltip: 'Max concurrent fire-and-forget one-shots on the sfx bus; past it the OLDEST is stolen. Music is never capped, entity AudioSource voices are never stolen (a looping ambience would be the oldest voice forever), and the ui bus is uncapped. 0 or less = uncapped.' },
+      sfxStealFadeSec: { type: 'number', min: 0, max: 1, step: 0.005, tooltip: 'Seconds a STOLEN one-shot ramps to silence before stopping. 0 = a hard cut, which clicks — an instant stop is an amplitude discontinuity on every steal. The 10ms default is below the threshold where a fade reads AS a fade, so it still stops abruptly, just cleanly.' },
     },
   });
 

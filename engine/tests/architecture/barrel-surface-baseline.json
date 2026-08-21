@@ -3,6 +3,7 @@
   "ANIMSET_DEFAULTS",
   "ARM_BACKSTOP_MS",
   "AUDIO_SETTINGS_DEFAULT_LIMIT",
+  "AUDIO_SETTINGS_DEFAULT_STEAL_FADE",
   "AXES",
   "AmbientOcclusionPostFX",
   "AnimationLibrary",

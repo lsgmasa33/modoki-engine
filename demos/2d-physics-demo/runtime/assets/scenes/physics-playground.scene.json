@@ -475,6 +475,70 @@
       }
     },
     {
+      "name": "Trigger Zone",
+      "traits": {
+        "Transform": {
+          "x": 830,
+          "y": 700,
+          "sx": 260,
+          "sy": 30
+        },
+        "Zone2D": {
+          "shape": "box",
+          "color": 10181046
+        },
+        "OnZone2D": {
+          "onEnter": "triggerZone/enter",
+          "onExit": "triggerZone/exit"
+        },
+        "Renderable2D": {
+          "sprite": "square",
+          "color": 10181046,
+          "opacity": 0.25,
+          "width": 1,
+          "height": 1
+        },
+        "EntityAttributes": {
+          "name": "Trigger Zone",
+          "sortOrder": 1,
+          "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
+          "layer": "2d",
+          "guid": "b7922990-aff2-4311-95b2-28025646c7c6"
+        }
+      }
+    },
+    {
+      "name": "Zone Probe",
+      "traits": {
+        "Transform": {
+          "x": 830,
+          "y": 120
+        },
+        "ZoneOccupant": {},
+        "Renderable2D": {
+          "sprite": "circle",
+          "color": 15528177,
+          "width": 30,
+          "height": 30
+        },
+        "RigidBody2D": {
+          "angularDamping": 0.05
+        },
+        "Collider2D": {
+          "shape": "circle",
+          "radius": 15,
+          "restitution": 0.3
+        },
+        "EntityAttributes": {
+          "name": "Zone Probe",
+          "sortOrder": 2,
+          "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
+          "layer": "2d",
+          "guid": "f50503f2-6fef-4cc1-b1e7-63b9d8fb4f09"
+        }
+      }
+    },
+    {
       "name": "Spring Joint",
       "traits": {
         "Joint2D": {

@@ -34,7 +34,7 @@ Six scenes, switchable from the Assets panel. Each isolates one idea.
 
 | Scene | What it demonstrates |
 |---|---|
-| **`physics-playground.json`** *(default)* | The overview: floor and walls, falling boxes, a bouncy ball (restitution) and a "ghost" ball on a non-colliding layer, a **revolute** pendulum, a **spring** joint, and a sensor zone that changes colour while occupied |
+| **`physics-playground.json`** *(default)* | The overview: floor and walls, falling boxes, a bouncy ball (restitution) and a "ghost" ball on a non-colliding layer, a **revolute** pendulum, a **spring** joint, and two trigger stations that change colour while occupied — a Rapier **sensor** and a physics-free **`Zone2D`** |
 | **`ccd-tunneling.json`** | Two fast bodies fired at a thin wall — one with continuous collision detection, one without. The one without passes straight through |
 | **`collider-mesh.json`** | Hand-authored collider geometry: a **polygon** ramp and a **polyline** terrain, both editable vertex-by-vertex in the editor viewport |
 | **`compound-colliders.json`** | One rigid body owning several child colliders — a table, a cross, a dumbbell. A two-footed body straddles a gap that a single centred box falls through |
@@ -58,16 +58,30 @@ computing bitmasks.
 
 ## The only game code
 
-Two `UIAction`s registered in `game.ts`, wired declaratively to the sensor zone's
-`OnCollision2D` trait. On enter/exit they tint the zone and emit a `zone` event into the
-engine's journal, so the reaction can be verified as **data** rather than by eye:
+Two pairs of `UIAction`s registered in `game.ts`, wired declaratively to the two trigger
+stations. On enter/exit they tint the station and emit a journal event, so the reaction
+can be verified as **data** rather than by eye:
 
 ```ts
 ctx.emit('zone', { phase, body })   // body is a stable GUID, not a runtime id
 ```
 
-Everything else — falling, bouncing, the pendulum, the spring, sensor detection, player
+Everything else — falling, bouncing, the pendulum, the spring, trigger detection, player
 movement and animation — is stock engine traits driven by the scene files.
+
+### Two ways to detect "something is in here", side by side
+
+The playground carries both, so you can pick by what you actually need:
+
+| | **Sensor Zone** (yellow bar) | **Trigger Zone** (violet bar) |
+|---|---|---|
+| Traits | `RigidBody2D` + `Collider2D{isSensor}` + `OnCollision2D` | `Zone2D` + `OnZone2D` |
+| Costs a Rapier body | yes | **no** |
+| Detects | anything with a collider | anything tagged `ZoneOccupant` (opt-in) |
+| Tests against | the other body's **collider volume** | the occupant's **position** — a point |
+
+A zone is the cheaper answer for the "is X inside this region" questions that don't need
+a solver — checkpoints, spawn and kill regions, camera triggers, cutscene starts.
 
 ## Concepts worth stealing
 
@@ -82,8 +96,13 @@ movement and animation — is stock engine traits driven by the scene files.
 - **Sensors are events, not collisions.** A sensor collider produces enter/exit events
   with no solver response — which is why the zone can react without disturbing the bodies
   passing through it.
-- **Verify by data.** `zone` journal events and body contacts make the demo assertable in
-  a headless test — no screenshots required.
+- **A `Zone2D` needs no physics at all.** It is a pure geometric area whose extent *is*
+  the entity's Transform scale, so the Trigger Zone carries no `RigidBody2D` and no
+  `Collider2D` — and the drawn bar is a 1x1 sprite under that same scale, which is what
+  keeps what you see identical to what is tested.
+- **Verify by data.** The `zone` / `zoneTrigger` journal events — and the engine's own
+  `@zone` crossings — make the demo assertable in a headless test, no screenshots
+  required. `tests/zone-station.test.ts` does exactly that.
 
 ## Assets
 
