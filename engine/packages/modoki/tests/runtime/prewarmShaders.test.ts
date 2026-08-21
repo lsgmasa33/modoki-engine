@@ -56,10 +56,24 @@ function makeRendererStub() {
   /** Captured AT compile time for the same reason as the counts: prewarm detaches the shared
    *  environment before clearing, so reading `.environment` after the call always sees null. */
   const compiledEnvironments: (THREE.Texture | null)[] = [];
+  /** Shadow state AT compile time, for the same reason as everything else here — the prewarm
+   *  clears the scene and disposes its lights afterwards, so a post-call read sees nothing. */
+  const compiledLightShadows: boolean[][] = [];
+  const compiledFog: { fog: boolean; fogNode: boolean }[] = [];
+  const compiledMeshShadows: { cast: boolean; receive: boolean }[][] = [];
   const renderer = {
     compileAsync: vi.fn(async (scene: THREE.Scene) => {
       compiledScenes.push(scene);
       compiledEnvironments.push(scene.environment);
+      compiledFog.push({ fog: scene.fog !== null && scene.fog !== undefined, fogNode: !!scene.fogNode });
+      compiledLightShadows.push(
+        scene.children.filter((o) => (o as THREE.Light).isLight).map((o) => o.castShadow),
+      );
+      compiledMeshShadows.push(
+        scene.children
+          .filter((o) => (o as THREE.Mesh).isMesh)
+          .map((o) => ({ cast: o.castShadow, receive: o.receiveShadow })),
+      );
       standardMeshCounts.push(
         scene.children.filter(
           (o) => (o as THREE.Mesh).isMesh && (o as THREE.Mesh).material instanceof THREE.MeshStandardMaterial,
@@ -67,7 +81,7 @@ function makeRendererStub() {
       );
     }),
   };
-  return { renderer, compiledScenes, standardMeshCounts, compiledEnvironments };
+  return { renderer, compiledScenes, standardMeshCounts, compiledEnvironments, compiledLightShadows, compiledMeshShadows, compiledFog };
 }
 
 const camera = new THREE.PerspectiveCamera();
@@ -169,5 +183,120 @@ describe('prewarmShadersForWorld — the environment mirror follows the TIER', (
   it('does NOT mirror it on LOW, where syncEnvironment suppresses IBL', async () => {
     const { compiledEnv } = await prewarmWithEnv(LOW);
     expect(compiledEnv).toBeNull();
+  });
+});
+
+/** #238 — the boot stall. A shadow-casting light puts a `ShadowNode` into every lit material's
+ *  node graph, so a prewarm scene with no armed caster compiles a DIFFERENT pipeline from the one
+ *  the first real frame needs; the first frame then builds the real set SYNCHRONOUSLY and the app
+ *  freezes. Measured on a Galaxy A23 with `demos/forest-camp`, three cold boots per arm: the worst
+ *  rAF gap fell from 1,516 / 1,466 / 1,466 ms to 533 / 650 / 550 ms, and the count of render
+ *  pipelines built after the world swap at ~150 ms each fell from 8 to 3.
+ *
+ *  These assertions are about the prewarm modelling the scene the tier will actually DRAW —
+ *  the same contract the environment mirror above is under, and the reason both exist. */
+describe('prewarmShadersForWorld — the shadow mirror follows the TIER (#238)', () => {
+  async function withCasterCap(max: number, fn: (ctx: Awaited<ReturnType<typeof setup>>) => void) {
+    const ctx = await setup({ primitives: true });
+    const { setActiveQualityTier, setRenderSettings } = await import('../../src/runtime/rendering/renderSettings');
+    setRenderSettings({ three: { tiers: { low: { maxShadowCasters: max } } } } as never);
+    setActiveQualityTier({ tier: 'low', source: 'test', reason: 'test' } as never);
+    fn(ctx);
+    const stub = makeRendererStub();
+    await ctx.sync.prewarmShadersForWorld(ctx.world, stub.renderer as never, camera);
+    setActiveQualityTier(null);
+    return stub;
+  }
+
+  it('arms castShadow on a casting light, so the lit variant matches the real frame', async () => {
+    const { Light } = await import('../../src/three/traits/Light');
+    const { compiledLightShadows } = await withCasterCap(0, ({ world }) => {
+      world.spawn(Light({ lightType: 'directional', intensity: 1, castShadow: true }));
+    });
+    expect(compiledLightShadows[0]).toEqual([true]);
+  });
+
+  it('leaves a non-casting light alone — it must not compile a shadow variant either', async () => {
+    const { Light } = await import('../../src/three/traits/Light');
+    const { compiledLightShadows } = await withCasterCap(0, ({ world }) => {
+      world.spawn(Light({ lightType: 'directional', intensity: 1, castShadow: false }));
+    });
+    expect(compiledLightShadows[0]).toEqual([false]);
+  });
+
+  it('applies the tier caster CAP, so a demoted light is unarmed here exactly as in syncLights', async () => {
+    const { Light } = await import('../../src/three/traits/Light');
+    const { compiledLightShadows } = await withCasterCap(1, ({ world }) => {
+      world.spawn(Light({ lightType: 'directional', intensity: 0.2, castShadow: true }));
+      world.spawn(Light({ lightType: 'directional', intensity: 5, castShadow: true }));
+    });
+    // The cap keeps the brighter one. Arming BOTH would compile a two-caster variant the tier
+    // never draws — the same class of mismatch as mirroring IBL on a tier that suppresses it.
+    expect(compiledLightShadows[0]!.filter(Boolean)).toHaveLength(1);
+  });
+
+  it('mirrors the authored mesh shadow flags onto the placeholder', async () => {
+    const { compiledMeshShadows } = await withCasterCap(0, ({ world, Renderable3DPrimitive }) => {
+      world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', castShadow: 'on', receiveShadow: false }));
+    });
+    expect(compiledMeshShadows[0]).toEqual([{ cast: true, receive: false }]);
+  });
+
+  it('splits the dedupe key on the shadow flags — they are pipeline key, not uniform', async () => {
+    const { standardMeshCounts } = await withCasterCap(0, ({ world, Renderable3DPrimitive }) => {
+      world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', material: '', castShadow: 'on', receiveShadow: true }));
+      world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', material: '', castShadow: 'on', receiveShadow: false }));
+      world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', material: '', castShadow: 'on', receiveShadow: true })); // dup
+    });
+    // Two variants, not one and not three: same (mesh, material) pair, two distinct flag sets.
+    // Collapsing them leaves the second for the first real frame to compile — the stall itself.
+    expect(standardMeshCounts[0]).toBe(2);
+  });
+});
+
+/** #238 close-out. The sweep that looked for SIBLINGS of the shadow defect found one in three's
+ *  own source: `NodeManager.getCacheKey()` names exactly three scene-global inputs to a render
+ *  object's pipeline key — `lightsNode`, `environmentNode`, `fogNode` — and the prewarm mirrored
+ *  two. A fogged scene compiled every lit material without fog, and the first real frame rebuilt
+ *  the lot. `games/3d-test` is the only project that authors Fog, and it is one of the four
+ *  stallers in the #238 table; the magnitude there is NOT measured, only the mechanism. */
+describe('prewarmShadersForWorld — the fog mirror (#238 sibling)', () => {
+  async function prewarmWithFog(spawn: (ctx: Awaited<ReturnType<typeof setup>>) => void) {
+    const ctx = await setup({ primitives: true });
+    spawn(ctx);
+    const stub = makeRendererStub();
+    await ctx.sync.prewarmShadersForWorld(ctx.world, stub.renderer as never, camera);
+    return stub;
+  }
+
+  it('mirrors linear fog, so the compiled variant carries the fog the render will draw', async () => {
+    const { Fog } = await import('../../src/three/traits/Fog');
+    const { compiledFog } = await prewarmWithFog(({ world }) => {
+      world.spawn(Fog({ enabled: true, mode: 'linear', color: 0x223344, near: 1, far: 90 }));
+    });
+    expect(compiledFog[0]).toEqual({ fog: true, fogNode: false });
+  });
+
+  it('mirrors HEIGHT fog through the node path, not the classic one', async () => {
+    const { Fog } = await import('../../src/three/traits/Fog');
+    const { compiledFog } = await prewarmWithFog(({ world }) => {
+      world.spawn(Fog({ enabled: true, mode: 'height', color: 0x223344, density: 0.02, height: 12 }));
+    });
+    // The two are mutually exclusive in syncFog — a height fog must NOT also leave scene.fog set,
+    // or the prewarm compiles a variant with both and the render draws one.
+    expect(compiledFog[0]).toEqual({ fog: false, fogNode: true });
+  });
+
+  it('mirrors NOTHING when the scene authors no fog — the common case must not gain a variant', async () => {
+    const { compiledFog } = await prewarmWithFog(() => {});
+    expect(compiledFog[0]).toEqual({ fog: false, fogNode: false });
+  });
+
+  it('respects a DISABLED fog entity, exactly as the real syncFog does', async () => {
+    const { Fog } = await import('../../src/three/traits/Fog');
+    const { compiledFog } = await prewarmWithFog(({ world }) => {
+      world.spawn(Fog({ enabled: false, mode: 'linear', color: 0x223344, near: 1, far: 90 }));
+    });
+    expect(compiledFog[0]).toEqual({ fog: false, fogNode: false });
   });
 });

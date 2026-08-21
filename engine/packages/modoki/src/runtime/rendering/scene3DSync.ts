@@ -46,7 +46,7 @@ import {
 import { tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, shadowBiasScale } from './qualityTier';
 import { armAutoLightCap, autoCapMaskFor, isAutoLightCapEngaged } from './autoLightCapFrame';
 import { armShadowCasterCap, shadowCasterAllowed } from './shadowCasterCapFrame';
-import { casterTypeOf, type ShadowCaster } from './shadowCasterCap';
+import { casterTypeOf, keptShadowCasters, type ShadowCaster } from './shadowCasterCap';
 import { applyInstancedBatching, clearInstancedBatches } from './instancedBatching';
 import { resolveActiveTier } from './tierResolve';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
@@ -3258,30 +3258,77 @@ async function prewarmShadersForWorldInner(
     });
   }
 
+  // Mirror the world's FOG, for exactly the reason the environment above is mirrored (#238).
+  // three's `NodeManager.getCacheKey()` names the three scene-global inputs to a render object's
+  // pipeline key — `lightsNode`, `environmentNode`, `fogNode` — and this prewarm covered two of
+  // them. A fogged scene therefore compiled every lit material WITHOUT fog and the first real
+  // frame rebuilt the lot, which is the same stall shadows were causing.
+  //
+  // Driven through the REAL `syncFog` rather than re-deriving the node here: it owns a
+  // height-fog TSL graph and a per-scene uniform group, and a hand-rolled second copy would be
+  // one refactor away from compiling a fog variant the render does not use — the failure this
+  // whole function exists to prevent. `heightFogStates` is keyed by scene in a WeakMap, so the
+  // throwaway scene's entry dies with it.
+  syncFog(world, prewarmScene);
+
+  // Which lights will actually RENDER a shadow map once this world is live (#238). Computed
+  // through the pure rule rather than `armShadowCastersFor`, deliberately: that helper writes the
+  // module-global per-frame answer that `syncLights` reads, and the prewarm runs against the
+  // STAGING world while the OLD one is still rendering frames — arming it here would decide the
+  // outgoing scene's shadows from the incoming scene's lights for the length of the load.
+  const prewarmCasters: ShadowCaster[] = [];
+  const maxShadowCasters = getActiveTierOverrides().maxShadowCasters;
+  if (maxShadowCasters > 0) {
+    world.query(Light).forEach((entity) => {
+      if (deactivatedEntities.has(entity.id())) return;
+      const l = entity.get(Light);
+      if (!l || !l.castShadow) return;
+      const type = casterTypeOf(l.lightType);
+      if (type === null) return;
+      prewarmCasters.push({ id: entity.id(), type, intensity: l.intensity, color: l.color });
+    });
+  }
+  const keptCasters = keptShadowCasters(prewarmCasters, maxShadowCasters);
+  const prewarmCasterAllowed = (id: number) => keptCasters === null || keptCasters.has(id);
+
   // Mirror the staging world's lights so compileAsync produces the correct
   // shader variants (otherwise Three.js's LightsNode warns + skips compile).
-  world.query(Light).updateEach(([light]: [{ lightType: string; color: number; intensity: number; distance: number; angle: number; penumbra: number }]) => {
+  //
+  // ⚠️ `castShadow` is mirrored with the SAME tier gate the real render applies (#238). A
+  // shadow-casting light puts a `ShadowNode` in every lit material's node graph, so a prewarm
+  // scene with no caster compiles a DIFFERENT pipeline from the one the first real frame needs —
+  // and the first frame then builds the real set synchronously, which is the stall. Measured on
+  // the A23: 8 of forest-camp's pipelines were built twice, the second time at ~150 ms each.
+  // Same reasoning as the environment mirror above: model the scene the tier will actually draw.
+  world.query(Light).updateEach(([light]: [{ lightType: string; color: number; intensity: number; distance: number; angle: number; penumbra: number; castShadow: boolean }], entity) => {
+    if (deactivatedEntities.has(entity.id())) return;
     const l = createLightFromTrait(light);
     if (l) {
+      l.castShadow = light.castShadow && prewarmCasterAllowed(entity.id());
       prewarmScene.add(l);
       prewarmLights.push(l);
     }
   });
 
-  world.query(Renderable3D).updateEach(([rend]: [{ isVisible: boolean; mesh: string; material: string }]) => {
+  world.query(Renderable3D).updateEach(([rend]: [{ isVisible: boolean; mesh: string; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }]) => {
     if (!rend.isVisible || !rend.mesh) return;
-    if (skip(`g|${rend.mesh}|${rend.material}`)) return;
+    // Shadow flags join the dedupe key (#238): they are part of the pipeline key, not a uniform,
+    // so two entities sharing a (mesh, material) pair but differing in what they cast or receive
+    // need BOTH variants compiled. Keying without them compiles whichever the first entity had
+    // and leaves the other for the first real frame — the stall this prewarm exists to prevent.
+    if (skip(`g|${rend.mesh}|${rend.material}|${shadowFlagsKey(rend.castShadow, rend.receiveShadow)}`)) return;
     const template = resolveMeshTemplate(rend.mesh);
     if (!template) return;
     const material = resolveMaterialForMesh(rend.material, rend.mesh) || template.material;
     const mesh = new THREE.Mesh(template.geometry, material);
+    applyShadowFlags(mesh, rend.castShadow, rend.receiveShadow);
     prewarmScene.add(mesh);
     count++;
   });
 
-  world.query(Renderable3DPrimitive).updateEach(([rend]: [{ isVisible: boolean; mesh: string; size: number; color: number; material: string }]) => {
+  world.query(Renderable3DPrimitive).updateEach(([rend]: [{ isVisible: boolean; mesh: string; size: number; color: number; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }]) => {
     if (!rend.isVisible) return;
-    if (skip(`p|${rend.mesh}|${rend.material}`)) return;
+    if (skip(`p|${rend.mesh}|${rend.material}|${shadowFlagsKey(rend.castShadow, rend.receiveShadow)}`)) return;
     const obj = createPrimitiveMesh(rend.mesh, rend.size, rend.color);
     if (obj) {
       // Apply .mat.json override if set (mirrors runtime sync behaviour)
@@ -3289,6 +3336,9 @@ async function prewarmShadersForWorldInner(
         const resolved = resolveMaterial(rend.material);
         if (resolved) (obj as THREE.Mesh).material = resolved;
       }
+      // AFTER the material override: `castShadow: 'auto'` derives from `material.transparent`,
+      // so applying it first would read the primitive's default material, not the authored one.
+      applyShadowFlags(obj, rend.castShadow, rend.receiveShadow);
       prewarmScene.add(obj);
       primitiveMeshes.push(obj as THREE.Mesh);
       count++;
