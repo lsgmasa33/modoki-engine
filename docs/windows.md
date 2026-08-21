@@ -220,6 +220,18 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
     is empirically nil. `os.cpus().length` cannot answer (it reports LOGICAL cores), and the
     PowerShell `Get-CimInstance Win32_Processor` query that can costs ~1.9s per vitest launch —
     noise inside `verify`, but it would double a single-file run.
+- **A PowerShell CIM query costs SECONDS — never run one you can prove will match nothing.**
+  `Win32_Processor` above is ~1.9s; `Get-CimInstance Win32_Process` is worse, because it is a cold
+  PowerShell start *plus* a full enumeration of every process on the box. Worked example (#313):
+  `forceRemoveDir` (`engine/toolchain/index.ts`) swept for processes running out of the doomed
+  directory before every delete, and that timed out `uninstall('java')` at 20s on a loaded CI runner
+  — against a freshly-created **empty** temp dir, where the sweep could not possibly match anything.
+  The fix is a `shouldSweepProcesses` guard, and the reason it is safe generalises: the sweep's
+  predicate is `ExecutablePath -like '<dir>\*'`, so with no process image under `dir` the query
+  provably returns nothing and skipping it is **semantics-preserving rather than a heuristic**. Look
+  for that property before optimising a query away — an equivalence you can state beats a guess that
+  usually holds. The Mac gate cannot see any of this: the whole path is behind `platform === 'win32'`,
+  which is why the guard is platform-injectable and unit-tested from any host.
 - **Size time budgets from the slowest machine.** A budget tuned on a Mac is not a budget. An
   isolated timing is worth roughly a quarter of the real under-load cost. Worked example
   (2026-08-20): `rampProbeRunner.test.ts`'s `expect(performance.now() - started).toBeLessThan(5)`

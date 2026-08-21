@@ -1331,16 +1331,61 @@ export function isRemovable(id: ToolId): boolean {
   return toolOwnedDirs(id, process.env.MODOKI_TOOLCHAIN_DIR).length > 0
 }
 
+/** Windows process-image extensions — what `Win32_Process.ExecutablePath` can actually point at.
+ *  A `.bat`/`.cmd`/`.ps1` is NOT one: running a script makes the interpreter (cmd.exe/powershell.exe)
+ *  the process, and ITS ExecutablePath is in System32, so such a script can never match the sweep's
+ *  `-like '<dir>\\*'` predicate. */
+const WIN_PROCESS_IMAGE_EXTS = new Set(['.exe', '.com', '.scr'])
+
+/** Does `dir` hold anything that could BE a running process's image? Walks depth-first and bails on
+ *  the first hit, so a real JDK answers in a few entries (`bin/java.exe`) rather than statting the
+ *  whole tree. Deliberately conservative in both failure directions: an unreadable dir and a symlink
+ *  (whose target we don't follow, and whose resolved ExecutablePath we therefore can't reason about)
+ *  both answer `true`, because a needless sweep is merely slow whereas a skipped one risks the
+ *  half-deleted tool this whole function exists to prevent. */
+function containsProcessImage(dir: string): boolean {
+  const stack = [dir]
+  while (stack.length > 0) {
+    const cur = stack.pop()!
+    let entries: fs.Dirent[]
+    try { entries = fs.readdirSync(cur, { withFileTypes: true }) } catch { return true }
+    for (const e of entries) {
+      if (e.isSymbolicLink()) return true
+      if (e.isDirectory()) stack.push(path.join(cur, e.name))
+      else if (e.isFile() && WIN_PROCESS_IMAGE_EXTS.has(path.extname(e.name).toLowerCase())) return true
+    }
+  }
+  return false
+}
+
+/** Whether `forceRemoveDir` should pay for the PowerShell process sweep before deleting `dir`.
+ *
+ *  The sweep's predicate is `ExecutablePath -like '<dir>\\*'`, so it can ONLY ever match a process
+ *  whose image lives under `dir`. With no such image there, the query provably matches nothing —
+ *  skipping it is semantics-preserving, not a heuristic, and the Gradle-daemon protection is kept
+ *  wherever it can actually fire.
+ *
+ *  Why it's worth a scan to avoid: the sweep is a synchronous cold PowerShell start plus a FULL WMI
+ *  process enumeration, seconds of wall-clock on a loaded machine. It timed out `uninstall('java')`
+ *  on a shared CI runner (#313) against a freshly-created EMPTY dir — where the sweep was pure
+ *  overhead by construction. (platform-injectable for tests, so a non-Windows host can exercise it.) */
+export function shouldSweepProcesses(dir: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (platform !== 'win32') return false
+  return containsProcessImage(dir)
+}
+
 /** Remove a directory robustly, tolerating Windows file locks. `force+recursive` clears read-only
  *  files but NOT OPEN HANDLES: a lingering Gradle build daemon (a `java.exe` running from the
  *  provisioned JDK) keeps the dir locked, so a naive rmSync bails half-way → a "half-deleted" tool
  *  the user can't clean up. On Windows we first best-effort kill any process whose executable lives
  *  UNDER `dir` (scoped to the path — our own provisioned binaries, never the user's other apps),
  *  then rmSync WITH retries (Node retries EBUSY/EPERM/ENOTEMPTY on Windows). A persistent lock gets
- *  an actionable error instead of a silent partial delete. No-op on POSIX (no exec, plain retries). */
+ *  an actionable error instead of a silent partial delete. No-op on POSIX (no exec, plain retries).
+ *  The kill sweep is gated by `shouldSweepProcesses` — it is skipped when nothing under `dir` could
+ *  be a process image, which is provably equivalent and avoids a multi-second WMI query (#313). */
 function forceRemoveDir(dir: string): void {
   if (!fs.existsSync(dir)) return
-  if (process.platform === 'win32') {
+  if (shouldSweepProcesses(dir)) {
     try {
       const esc = dir.replace(/'/g, "''")
       const ps = `Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${esc}\\*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`

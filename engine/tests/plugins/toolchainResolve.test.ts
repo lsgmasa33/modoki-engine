@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, uninstall, uninstallAll, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
+import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, uninstall, uninstallAll, shouldSweepProcesses, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
 
 /**
  * Guards the shared toolchain resolver (engine/toolchain) — Phase A of the toolchain-layer plan.
@@ -938,6 +938,52 @@ describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', ()
     fs.writeFileSync(path.join(tc, 'settings.json'), '{}')
     uninstallAll(tc)
     expect(fs.existsSync(tc)).toBe(false)
+  })
+
+  // #313: the PowerShell kill sweep inside forceRemoveDir is a cold-start + full WMI process
+  // enumeration — seconds of wall-clock on a loaded machine, and it timed out uninstall('java') on
+  // a shared CI runner against an EMPTY dir. The sweep's predicate is `ExecutablePath -like
+  // '<dir>\*'`, so skipping it when no process image lives under dir is EQUIVALENT, not a guess.
+  // Platform is injected so this runs on any host — the bug is Windows-only, the logic isn't.
+  describe('shouldSweepProcesses — skip the WMI sweep when it provably cannot match (#313)', () => {
+    it('is false for an empty dir (the case that timed out CI)', () => {
+      expect(shouldSweepProcesses(tc, 'win32')).toBe(false)
+    })
+
+    it('is false when the tree holds only non-image files', () => {
+      fs.mkdirSync(path.join(tc, 'jdk', 'conf'), { recursive: true })
+      fs.writeFileSync(path.join(tc, 'jdk', 'release'), 'JAVA_VERSION="21"')
+      fs.writeFileSync(path.join(tc, 'jdk', 'conf', 'net.properties'), '# x')
+      expect(shouldSweepProcesses(path.join(tc, 'jdk'), 'win32')).toBe(false)
+    })
+
+    it('is TRUE for a real JDK layout — the Gradle-daemon protection still fires', () => {
+      fs.mkdirSync(path.join(tc, 'jdk', '21.0.11+10', 'bin'), { recursive: true })
+      fs.writeFileSync(path.join(tc, 'jdk', '21.0.11+10', 'bin', 'java.exe'), 'MZ')
+      expect(shouldSweepProcesses(path.join(tc, 'jdk'), 'win32')).toBe(true)
+    })
+
+    it('ignores .cmd/.bat/.ps1 — a script is never a Win32_Process ExecutablePath', () => {
+      fs.mkdirSync(path.join(tc, 'npm-tools'), { recursive: true })
+      for (const f of ['gltfpack.cmd', 'gltfpack.bat', 'gltfpack.ps1', 'gltfpack'])
+        fs.writeFileSync(path.join(tc, 'npm-tools', f), '@echo off')
+      expect(shouldSweepProcesses(path.join(tc, 'npm-tools'), 'win32')).toBe(false)
+    })
+
+    it('is conservative: a symlink we do not follow answers true', () => {
+      const target = path.join(root, 'elsewhere')
+      fs.mkdirSync(target, { recursive: true })
+      fs.mkdirSync(path.join(tc, 'ruby'), { recursive: true })
+      fs.symlinkSync(target, path.join(tc, 'ruby', 'link'), 'junction')
+      expect(shouldSweepProcesses(path.join(tc, 'ruby'), 'win32')).toBe(true)
+    })
+
+    it('is always false off Windows, even with an executable present', () => {
+      fs.mkdirSync(path.join(tc, 'jdk', 'bin'), { recursive: true })
+      fs.writeFileSync(path.join(tc, 'jdk', 'bin', 'java.exe'), 'MZ')
+      expect(shouldSweepProcesses(path.join(tc, 'jdk'), 'darwin')).toBe(false)
+      expect(shouldSweepProcesses(path.join(tc, 'jdk'), 'linux')).toBe(false)
+    })
   })
 
   it('uninstallAll REFUSES a path not named "toolchain" (safety guard)', () => {
