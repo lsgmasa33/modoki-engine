@@ -462,3 +462,37 @@ describe('prewarmShadersForWorld — F4 still holds for a skinned-only scene', (
     expect(stub.standardMeshCounts[0]).toBe(1);
   });
 });
+
+/** The unresolved-ref tally (#238). The prewarm can only compile what it can resolve, and every
+ *  resolution failure here degrades into a plausible-looking object rather than an error — so the
+ *  tally is the only thing that can tell "the prewarm modelled the scene" from "the prewarm
+ *  compiled defaults the render will never use". It has to survive its own failure path. */
+describe('prewarmShadersForWorld — the unresolved-ref tally (#238)', () => {
+  it('warns with a count when an authored material ref does not resolve, and does not throw', async () => {
+    // `overrideMaterial` unset → the harness's resolveMaterial returns null, which is exactly the
+    // silent-degradation path: the primitive keeps the default material createPrimitiveMesh minted.
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true });
+    const { renderer } = makeRendererStub();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      world.spawn(Renderable3DPrimitive({ mesh: 'cube', material: 'mat-guid-that-never-resolves', isVisible: true }));
+      await sync.prewarmShadersForWorld(world, renderer as never, camera);
+
+      const line = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes('[prewarm]'));
+      expect(line).toBeDefined();
+      expect(line).toContain('1 material');
+    } finally { warn.mockRestore(); }
+  });
+
+  it('stays silent when everything resolves — the warn must mean something', async () => {
+    const mat = new THREE.MeshStandardMaterial();
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true, overrideMaterial: mat });
+    const { renderer } = makeRendererStub();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      world.spawn(Renderable3DPrimitive({ mesh: 'cube', material: 'mat-guid', isVisible: true }));
+      await sync.prewarmShadersForWorld(world, renderer as never, camera);
+      expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('[prewarm]'))).toEqual([]);
+    } finally { warn.mockRestore(); }
+  });
+});

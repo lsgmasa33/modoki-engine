@@ -97,8 +97,21 @@ interface ViewState {
   lastEpoch: number;
   lastCountX: number;
   lastCountY: number;
-  /** Entries traversed between the last two updates — feeds `effectiveOverscan`. */
+  /** Entries the SCROLL has traversed since the last pool update — feeds `effectiveOverscan`.
+   *
+   *  ⚠️ Measured from `scrollX/Y`, never from `first`, and that is not a detail. `first` is
+   *  `floor(scroll / stride) - overscan`, so a travel measured on `first` includes the change
+   *  in overscan — and overscan is computed FROM travel. The loop that closes is real and was
+   *  measured on a Galaxy A23 (2026-08-21): a 20 x 250 grid left completely alone flipped
+   *  between a 9x8 and a 13x10 pool forever, re-driving on 102 of 154 frames and holding the
+   *  device at ~30fps with no input at all. Scroll is exogenous; `first` is the response.
+   *
+   *  It ACCUMULATES rather than being a per-frame delta, because the quantity that matters is
+   *  the distance the pool has to cover between two updates — which folds in dropped frames. */
   travel: number;
+  /** Last observed scroll offset in px, for the accumulator above. */
+  lastScrollX: number;
+  lastScrollY: number;
   /** Last resolved entry size and pooled column count.
    *
    *  ⚠️ These are in the invalidation test, not just here for reading. A `%`-sized entry
@@ -232,16 +245,29 @@ function driveView(
 
   const st = viewStates.get(viewGuid)
     ?? { seeded: false, lastFirstX: 0, lastFirstY: 0, lastEpoch: -1, lastCountX: -1, lastCountY: -1, travel: 0,
-         lastEntryW: -1, lastEntryH: -1, lastCols: -1 };
+         lastScrollX: 0, lastScrollY: 0, lastEntryW: -1, lastEntryH: -1, lastCols: -1 };
   const floor = (en.overscan as number) ?? 2;
+
+  // How far the SCROLL has moved since the last pool update, in entries. Accumulated here,
+  // before the window is computed, and reset only when the pool actually re-drives — see
+  // ViewState.travel for why this must not be derived from `first`.
+  const strideXpx = Math.max(1, entryW + ((en.gapX as number) ?? 0));
+  const strideYpx = Math.max(1, entryH + ((en.gapY as number) ?? 0));
+  const travel = st.seeded
+    ? st.travel + Math.max(
+      Math.abs(sv.scrollX - st.lastScrollX) / strideXpx,
+      Math.abs(sv.scrollY - st.lastScrollY) / strideYpx,
+    )
+    : 0;
+
   // Cap the travel-driven raise at roughly a viewport's worth of entries. Without a cap a JUMP
   // (scrollToEntry, a scrollbar drag, a view opened deep in the list) reports thousands of
   // entries of travel and pools every one of them — measured live: a 5,000-entry list went from
   // a 9-entity pool to 5,000. See effectiveOverscan's banner.
   const capX = Math.max(1, Math.ceil(sv.viewportWidth / Math.max(1, entryW + (en.gapX as number))));
   const capY = Math.max(1, Math.ceil(sv.viewportHeight / Math.max(1, entryH + (en.gapY as number))));
-  const overscanX = effectiveOverscan(floor, st.travel, capX);
-  const overscanY = effectiveOverscan(floor, st.travel, capY);
+  const overscanX = effectiveOverscan(floor, travel, capX);
+  const overscanY = effectiveOverscan(floor, travel, capY);
 
   const xw: AxisWindow = countX > 0
     ? computeAxisWindow({ scroll: sv.scrollX, viewport: sv.viewportWidth, entrySize: entryW, gap: en.gapX as number, count: countX, overscan: overscanX })
@@ -249,13 +275,6 @@ function driveView(
   const yw: AxisWindow = countY > 0
     ? computeAxisWindow({ scroll: sv.scrollY, viewport: sv.viewportHeight, entrySize: entryH, gap: en.gapY as number, count: countY, overscan: overscanY })
     : EMPTY_WINDOW;
-
-  // Travel is measured in ENTRIES between two pool updates, so it folds in dropped frames as
-  // well as velocity — which is the right quantity, since the pool has to cover the distance
-  // either way. Measured up to 4.56 on a Galaxy A23.
-  const travel = st.seeded
-    ? Math.max(Math.abs(xw.first - st.lastFirstX), Math.abs(yw.first - st.lastFirstY))
-    : 0;
 
   const epoch = (en.epoch as number) ?? 0;
   const moved = !st.seeded || xw.first !== st.lastFirstX || yw.first !== st.lastFirstY;
@@ -265,12 +284,16 @@ function driveView(
   const resized = entryW !== st.lastEntryW || entryH !== st.lastEntryH || xw.pooled !== st.lastCols;
   const invalidated = epoch !== st.lastEpoch || countX !== st.lastCountX || countY !== st.lastCountY || resized;
 
-  viewStates.set(viewGuid, {
+  const redriving = moved || invalidated;
+  const setState = (t: number, cols: number) => viewStates.set(viewGuid, {
     seeded: true,
     lastFirstX: xw.first, lastFirstY: yw.first, lastEpoch: epoch,
-    lastCountX: countX, lastCountY: countY, travel,
-    lastEntryW: entryW, lastEntryH: entryH, lastCols: xw.pooled,
+    lastCountX: countX, lastCountY: countY, travel: t,
+    lastScrollX: sv.scrollX, lastScrollY: sv.scrollY,
+    lastEntryW: entryW, lastEntryH: entryH, lastCols: cols,
   });
+  // The accumulator resets only on a real re-drive: the pool has just covered that distance.
+  setState(redriving ? 0 : travel, xw.pooled);
 
   const content = ensureContentChild(world, view, m);
   if (!content) return false;

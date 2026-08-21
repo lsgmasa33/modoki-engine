@@ -643,6 +643,34 @@ The raise is **capped** at roughly a viewport's worth. A jump (a `scrollToEntry`
 drag) reports thousands of entries of travel, and an uncapped raise pools every one of them —
 measured live, a 5,000-entry list went from a 9-entity pool to 5,000.
 
+⚠️ **Travel is measured from the SCROLL, never from `first`, and that is the whole reason the
+pool settles.** `first` is `floor(scroll / stride) − overscan`, so a travel taken from `first`
+folds in the change in overscan — and overscan is computed *from* travel. That loop closes: on a
+Galaxy A23 (2026-08-21) a 20 × 250 grid **left completely alone** flipped between a 9 × 8 and a
+13 × 10 pool forever, re-driving on 102 of 154 frames and holding the device at ~30 fps with no
+input at all. Scroll is exogenous; `first` is the response. The accumulator resets only when the
+pool actually re-drives, so it stays "the distance the pool has to cover", dropped frames folded
+in.
+
+### Measured on the low-end target
+
+Galaxy A23 (Mali-G57 MC2), the shipped web build of `demos/scroll-demo`, driven by real touch
+(`adb input swipe`) with frame times and viewport coverage sampled per rAF:
+
+| Scene | Fling p50 / p95 | Blank frames | Max travel | Entities at rest → peak | At rest |
+|---|---|---|---|---|---|
+| strip (1 × 5,000, 120px) | 16.7 / 33.4 ms | **0** of 688 | 40 entries | 34 → 52 | 57 fps, 0 pool updates |
+| pager (40 × 1, viewport-sized) | 16.7 / 16.7 ms | **0** of 1,010 | 1 entry | 53 → 53 | 53 fps, 0 pool updates |
+| grid (20 × 250, stride 128) | 16.7 / 66.6 ms | **0** of 409 | 14 entries | 229 → 407 | 61 fps, 0 pool updates |
+
+Read it as three separate facts. **Recycling keeps up**: no fling on any shape ever exposed a
+gap, at travel up to 40 entries between two pool updates. **Snapping bounds the pager to exactly
+one page per fling** when the entry *is* the viewport — which is not a contradiction of the
+`snapStop` note above (a 120px entry crossed 3), just the same rule at a different entry size.
+And **the 2-D grid is genuinely heavy**: 229 DOM entities is ~7× the strip's, and a fling holds
+p95 at 66 ms. That is the cost of a grid on a Mali-G57, not a defect — but it is the number to
+weigh before making Court's page a scrolling grid rather than a pager.
+
 `entryWidth`/`entryHeight` of **`0` means "read it from the prefab root"**, so a fixed-size entry
 is not a second copy of a number the prefab already states; `%` resolves against the viewport,
 which is how a pager is expressed.

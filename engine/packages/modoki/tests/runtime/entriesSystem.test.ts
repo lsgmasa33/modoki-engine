@@ -256,6 +256,30 @@ describe('entriesSystem', () => {
     expect(heightOf()).toBe(300);
   });
 
+  it('CONVERGES at rest after a jump — the overscan raise must not feed itself', async () => {
+    // ⚠️ Overscan is computed from travel, and `first` is `floor(scroll/stride) - overscan`.
+    // Measuring travel on `first` therefore closes a loop: a raised overscan moves `first`,
+    // which reads as travel, which raises overscan. Measured on a Galaxy A23 (2026-08-21) — a
+    // 20 x 250 grid left completely alone flipped between a 9x8 and a 13x10 pool forever,
+    // re-driving on 102 of 154 frames at ~30fps with no input. Travel comes from the SCROLL.
+    const { sys, src, view } = await setup({ countX: 1, countY: 5000 }, 0);
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+
+    // A jump: the exact case that produces a huge one-off travel reading.
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 120 * 2000 });
+    const seen: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      sys.entriesSystem(testWorld);
+      const en = view.get(UIEntries) as any;
+      seen.push(`${en.firstY}/${en.poolSize}`);
+    }
+    // Everything after the first settling tick must be identical — no oscillation, and the
+    // system must report no work to do.
+    const tail = seen.slice(3);
+    expect(new Set(tail).size).toBe(1);
+  });
+
   it('does no work when nothing moved — the cheap path a scroll frame takes', async () => {
     const { sys, src } = await setup({}, 12000);
     let calls = 0;

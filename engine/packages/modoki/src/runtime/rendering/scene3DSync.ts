@@ -3232,6 +3232,25 @@ async function prewarmShadersForWorldInner(
   const primitiveMeshes: THREE.Mesh[] = [];
   const prewarmLights: THREE.Light[] = [];
 
+  // Unresolved-ref tally (#238). The prewarm can only compile what it can RESOLVE, and every
+  // resolution here fails SILENTLY into a still-plausible object: a missing mesh template skips
+  // the entity, and a missing material leaves the primitive wearing the default
+  // `createPrimitiveMesh` minted — which compiles a pipeline the render will never use and looks
+  // exactly like success. That is unfalsifiable from the outside, so the prewarm now says what it
+  // could not resolve instead of leaving the next investigator to infer it from pipeline labels.
+  //
+  // Declared HERE, above every loop that increments them. They lived beside `prewarmRigRoots`
+  // further down for one commit, which put the primitive loop's `unresolvedMaterial++` in the
+  // temporal dead zone — a ReferenceError on the FAILURE path only, so the counter that exists to
+  // report a silent failure would have thrown at the exact moment it had something to say.
+  // Counted per DISTINCT (mesh, material, shadow-flags) key, not per entity — the dedupe `skip()`
+  // runs before resolution, so twenty entities sharing one unresolvable material report as 1.
+  // That matches what the number is FOR (one unresolved key is one uncompiled pipeline) but it is
+  // not a headcount, and the warning says "distinct" so nobody sizes the blast radius from it.
+  let unresolvedMesh = 0;
+  let unresolvedMaterial = 0;
+  let unresolvedRig = 0;
+
   // Distinct (mesh, material) pairs already placed — see the header note. Prefixed
   // per renderer kind so a GLB mesh ref can never collide with a primitive keyword.
   const seenPairs = new Set<string>();
@@ -3318,8 +3337,12 @@ async function prewarmShadersForWorldInner(
     // and leaves the other for the first real frame — the stall this prewarm exists to prevent.
     if (skip(`g|${rend.mesh}|${rend.material}|${shadowFlagsKey(rend.castShadow, rend.receiveShadow)}`)) return;
     const template = resolveMeshTemplate(rend.mesh);
-    if (!template) return;
-    const material = resolveMaterialForMesh(rend.material, rend.mesh) || template.material;
+    if (!template) { unresolvedMesh++; return; }
+    const authored = resolveMaterialForMesh(rend.material, rend.mesh);
+    // An empty `material` is a legitimate "use the mesh's baked material" — only a ref that was
+    // AUTHORED and did not resolve is a miss.
+    if (rend.material && !authored) unresolvedMaterial++;
+    const material = authored || template.material;
     const mesh = new THREE.Mesh(template.geometry, material);
     applyShadowFlags(mesh, rend.castShadow, rend.receiveShadow);
     prewarmScene.add(mesh);
@@ -3335,6 +3358,7 @@ async function prewarmShadersForWorldInner(
       if (rend.material) {
         const resolved = resolveMaterial(rend.material);
         if (resolved) (obj as THREE.Mesh).material = resolved;
+        else unresolvedMaterial++;
       }
       // AFTER the material override: `castShadow: 'auto'` derives from `material.transparent`,
       // so applying it first would read the primitive's default material, not the authored one.
@@ -3387,7 +3411,7 @@ async function prewarmShadersForWorldInner(
       .sort().join('|');
     if (skip(`k|${sm.model}|${ovKey}|${shadowFlagsKey(sm.castShadow, sm.receiveShadow)}`)) return;
     const rigged = getRiggedModel(sm.model);
-    if (!rigged) return; // not cached — the real frame will build it; better quiet than wrong
+    if (!rigged) { unresolvedRig++; return; } // not cached — the real frame will build it
     const root = cloneSkeleton(rigged.prototype);
     // Overrides BEFORE the shadow flags, matching the primitive path above and for the same
     // reason: `castShadow: 'auto'` derives from `material.transparent`, so applying the flags
@@ -3431,7 +3455,22 @@ async function prewarmShadersForWorldInner(
   // try/finally: `compileAsync` can reject (a bad shader graph, a lost device), and a leaked span
   // is worse than a missing one — `bootSpansOverlapping` reads an open span as still running, so it
   // would rank first in a later stall attribution. Same reasoning as SceneManager's spans.
-  const compileSpan = beginBootSpan('shader-compile', `${count} pairs${rigCount ? ` + ${rigCount} rigs` : ''}`);
+  const unresolved = unresolvedMesh + unresolvedMaterial + unresolvedRig;
+  const unresolvedDetail = unresolved
+    ? `, UNRESOLVED ${unresolvedMesh} mesh / ${unresolvedMaterial} material / ${unresolvedRig} rig`
+    : '';
+  // Loud, because the failure it reports is otherwise invisible: the prewarm still "succeeds",
+  // still compiles something, and the cost lands seconds later as a first-frame stall in a
+  // completely different part of the trace. Not dev-gated — this is a production boot cost, and
+  // a release build is exactly where nobody is watching a console for it.
+  if (unresolved) {
+    console.warn(
+      `[prewarm] ${unresolved} DISTINCT asset ref(s) did not resolve at prewarm time ` +
+      `(${unresolvedMesh} mesh, ${unresolvedMaterial} material, ${unresolvedRig} rig) — ` +
+      'those compile their real pipelines on the first frame instead. See #238.',
+    );
+  }
+  const compileSpan = beginBootSpan('shader-compile', `${count} pairs${rigCount ? ` + ${rigCount} rigs` : ''}${unresolvedDetail}`);
   try {
     if (typeof compile === 'function') {
       await (renderer as THREE.WebGLRenderer).compileAsync(prewarmScene, camera);
