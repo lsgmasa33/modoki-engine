@@ -46,6 +46,34 @@ const state = async (ctx: BackendContext) => {
   return (r as { body: Record<string, unknown> }).body;
 };
 
+/** #302 — a sustained `modoki_pointer` press left held latches the renderer's `pointerSource` and
+ *  the Game panel stops reading drags, the HUMAN's own mouse included, with no error anywhere. The
+ *  state lives in the Electron main process (`createInputRoutes`' closure), which this router can
+ *  never see on its own, so it arrives via `ctx.getHeldPointer` — the same host-provided seam
+ *  `persistenceMode` uses. These tests pin the three-way answer, because two of the three states
+ *  are easy to collapse into one. */
+describe('/api/editor-state heldPointer', () => {
+  const held = { button: 'right' as const, x: 800, y: 500, heldMs: 1300 };
+
+  it('reports a held press, so a stranded one is READ rather than inferred', async () => {
+    const body = await state(makeCtx(toFs(SCENE_ABS), { getHeldPointer: () => held }));
+    expect(body.heldPointer).toEqual(held);
+  });
+
+  it('reports null when the host can answer and nothing is held', async () => {
+    const body = await state(makeCtx(toFs(SCENE_ABS), { getHeldPointer: () => null }));
+    expect(body.heldPointer).toBeNull();
+  });
+
+  it('OMITS the field entirely when the host cannot answer — absent is not "nothing is held"', async () => {
+    // The Vite dev-server backend serves no /api/input/* routes, so it has no such state. Reporting
+    // `null` there would assert something it cannot know: a caller diagnosing a dead Game panel
+    // would read "no press is stranded" from a backend that has never tracked one.
+    const body = await state(makeCtx(toFs(SCENE_ABS)));
+    expect('heldPointer' in body).toBe(false);
+  });
+});
+
 describe('/api/editor-state scenePathRef', () => {
   it('converts the renderer /@fs URL into an asset-root path the edit routes accept', async () => {
     const body = await state(makeCtx(toFs(SCENE_ABS)));

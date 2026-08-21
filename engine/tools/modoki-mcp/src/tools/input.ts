@@ -86,6 +86,13 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'with get_scene_state / modoki_eval / a screenshot mid-gesture (the atomic modoki_drag can\'t ' +
       'expose it). Typical loop: down → (read) → move → (read) → up. Aim by `{entity}`, `{selector}`, or `{x,y}`. ' +
       'move/up reuse the held button; a move/up with nothing held is refused (409). ' +
+      'THE HOLD IS NOT INDEFINITE: the backend releases it for you after 120s with no move/up, and ' +
+      'a later modoki_tap/drag/tap_handle/drag_handle releases it immediately (a second mouse ' +
+      'gesture cannot coexist with a held press). Both dispatch the real mouseup, and the next ' +
+      'move/up then tells you it happened. This exists because a press left held latches the ' +
+      "renderer's pointer input and kills dragging for the HUMAN too, with no error anywhere " +
+      '(#302) — so release with `action:"up"` when you are done, and keep a long gesture moving. ' +
+      'modoki_get_editor_state reports `heldPointer` if you need to check. ' +
       'Requires the Electron editor.',
     {
       action: z.enum(['down', 'move', 'up']).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),

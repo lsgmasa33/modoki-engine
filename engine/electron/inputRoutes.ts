@@ -65,10 +65,38 @@ export interface InputRouteDeps {
   requestRenderer(op: string, params: unknown): Promise<unknown>;
 }
 
-/** The `/api/input/*` dispatcher, plus `resetHeldPointer` for the caller to clear the
- *  sustained-pointer state on a renderer reload (see createInputRoutes). */
+/** The `/api/input/*` dispatcher, plus the sustained-pointer lifecycle hooks the host needs
+ *  (see createInputRoutes).
+ *
+ *  Two clears, and they are NOT interchangeable:
+ *   • `resetHeldPointer()` — forget the press without dispatching anything. For a renderer
+ *     RELOAD, where the document that owned the press is already gone, so there is nothing left
+ *     to send a `mouseup` at and the fresh document starts with nothing held anyway.
+ *   • `releaseHeldPointer()` — dispatch the matching `mouseup` into the LIVE document, then
+ *     forget. This is the one that actually unlatches the renderer's `pointerSource` (#302).
+ *  Using the first where the second is meant is the whole defect: the backend forgets the press
+ *  and the renderer stays latched, with the human's own mouse dead in the Game panel. */
 export type InputRoutesHandler =
-  ((req: HostRequest) => Promise<BackendResult | null>) & { resetHeldPointer(): void };
+  ((req: HostRequest) => Promise<BackendResult | null>) & {
+    resetHeldPointer(): void;
+    /** Dispatch the held press's matching `mouseup` at its last point, then clear. For a mouse
+     *  gesture that does NOT flow through this dispatcher and so cannot supersede a hold on its
+     *  own — `/api/capture-gesture` drives its drag straight through `rendererOps`. Idempotent;
+     *  resolves to a description of what was released, or null if nothing was held. */
+    releaseHeldPointer(reason: 'superseded'): Promise<string | null>;
+    /** The live sustained-pointer state, for Percept (`/api/editor-state`). null = nothing held. */
+    getHeldPointer(): { button: MouseButton; x: number; y: number; heldMs: number } | null;
+  };
+
+/** How a held press ended, when it was not the agent's own `action:'up'`. Named rather than
+ *  boolean because the NEXT call's 409 quotes it: an agent whose `move` is refused has to learn
+ *  that its press is gone AND why, or the refusal is the same silent-diagnosis trap in a new
+ *  place — and the three causes call for three different responses.
+ *
+ *  `reload` is the odd one out and must not be folded into the others: nothing was DISPATCHED
+ *  there (see `resetHeldPointer`), the press died with its document. Reporting it as an
+ *  auto-release would describe a mouseup that never happened. */
+export type HeldLossReason = 'idle' | 'superseded' | 'reload';
 
 /** A point the agent wants to act on: an ENTITY, a CSS selector, or explicit coordinates.
  *
@@ -318,6 +346,42 @@ const DISPATCHED_INPUT_ROUTES = new Set([
   '/api/input/tap-handle', '/api/input/drag-handle',
 ]);
 
+/** Routes that dispatch a NEW MOUSE GESTURE, and therefore cannot coexist with a sustained press.
+ *  Each of these sends its own mouseDown; arriving while `/api/input/pointer` still holds a button
+ *  down means the held gesture was abandoned (the agent errored, hit a refusal, or moved on), and
+ *  dispatching a second press underneath the first produces a garbage event stream either way.
+ *  So they release the hold first — see `releaseHeldPointer('superseded')`.
+ *
+ *  Deliberately NOT every route. `key`/`type`/`scroll`/`hover`/`focus` are all legitimate
+ *  MID-gesture: holding a drag while pressing Shift to constrain it, or Escape to cancel it, or
+ *  scrolling a list while dragging an item over it, are real things an agent does — and stealing
+ *  the press there would break the very interaction being tested. The rule is "a second mouse
+ *  gesture", not "any other input". */
+const MOUSE_GESTURE_ROUTES = new Set([
+  '/api/input/tap', '/api/input/drag', '/api/input/tap-handle', '/api/input/drag-handle',
+]);
+
+/** How long a sustained press may sit with NO `move`/`up` before the backend releases it itself.
+ *
+ *  This is the last backstop for #302: a stranded press latches the renderer's `pointerSource`
+ *  (`activeId !== null` early-returns every later `pointerdown`) and the Game panel then reads no
+ *  drags AT ALL — including the human's own mouse. #299's trusted-takeover cannot save the editor
+ *  the way it saves a device: editor input goes through `sendInputEvent`, which is real OS input,
+ *  so the stranded press is itself `isTrusted` and two trusted presses are indistinguishable.
+ *
+ *  A timeout is safe HERE in a way it is not in `pointerSource`. There the code cannot tell a
+ *  synthetic press from a finger, so a staleness rule would steal a legitimate long hold and break
+ *  the primary-touch rule. This state is only ever reachable from `/api/input/pointer`, so it is
+ *  synthetic BY CONSTRUCTION — there is no real finger to steal from.
+ *
+ *  IDLE, not total: every `move` restarts it (see `armIdleRelease`), so a long multi-step drag
+ *  never trips it and only genuine silence does. 120 s because the gap between a `down` and the
+ *  next `move` is a whole agent turn — a capture_viewport, reading the image, thinking — which
+ *  routinely runs tens of seconds. Too SHORT is the worse failure: it breaks a working gesture and
+ *  misdiagnoses as a product bug, which is exactly the round #299 cost. Too long only extends a
+ *  window that `MOUSE_GESTURE_ROUTES` above usually closes first. */
+export const HELD_POINTER_IDLE_MS = 120_000;
+
 /** Build the `/api/input/*` handler. Returns null for any other route so the caller can
  *  fall through to the next set of host routes / the shared router. */
 export function createInputRoutes(deps: InputRouteDeps) {
@@ -360,7 +424,64 @@ export function createInputRoutes(deps: InputRouteDeps) {
    *  `down` in one MCP call, a `move`/`up` in later ones. Tracks the button so a `move`/`up`
    *  reuses the held one (and threads it into the event, making the move a drag-move), and so a
    *  `move`/`up` with nothing held is a clear 409 rather than a silent stray event. */
-  let heldPointer: { button: MouseButton; x: number; y: number } | null = null;
+  let heldPointer: { button: MouseButton; x: number; y: number; since: number } | null = null;
+  /** The pending idle-release timer for `heldPointer` (see HELD_POINTER_IDLE_MS), or null.
+   *  A real timer, not a lazily-evaluated deadline: the case this exists for is the agent going
+   *  COMPLETELY SILENT, so there is no later request to check a deadline on — a lazy check would
+   *  leave the human's mouse dead until they happened to drive the editor through an agent. */
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Set when a press was released by something other than `action:'up'`, and cleared by the next
+   *  `down`. The move/up 409 below quotes it, so an agent that comes back to a gesture the backend
+   *  ended learns WHY instead of reading "no pointer is held" and concluding it never pressed. */
+  let lastHeldLoss: { reason: HeldLossReason; button: MouseButton; x: number; y: number } | null = null;
+
+  function disarmIdleRelease(): void {
+    if (idleTimer !== null) { clearTimeout(idleTimer); idleTimer = null; }
+  }
+
+  /** (Re)start the idle countdown. Called on `down` and on every `move`, which is what makes the
+   *  budget IDLE rather than a cap on total gesture length. */
+  function armIdleRelease(): void {
+    disarmIdleRelease();
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      // The timer fires outside any request, so nothing is awaiting this and nothing would surface
+      // a rejection: a dead/destroyed window makes `ops.pointerUp` throw, and an unhandled
+      // rejection in the Electron main process is a far worse outcome than a press we could not
+      // release. `releaseHeldPointer` has already cleared the state by then either way.
+      void releaseHeldPointer('idle').catch(() => { /* window gone — nothing left to release into */ });
+    }, HELD_POINTER_IDLE_MS);
+    // Never hold the process open for a synthetic press. Irrelevant in Electron (the app is alive
+    // regardless) but load-bearing under vitest, where a live 120 s timer would stall the run.
+    idleTimer.unref?.();
+  }
+
+  /** Dispatch the held press's matching `mouseup` at its last known point, then clear.
+   *
+   *  The dispatch is what distinguishes this from `resetHeldPointer` — the renderer's
+   *  `pointerSource` latches `activeId` on the press and only a real `pointerup` unlatches it, so
+   *  merely forgetting the press here is precisely the #302 defect. */
+  async function releaseHeldPointer(reason: 'idle' | 'superseded'): Promise<string | null> {
+    disarmIdleRelease();
+    if (!heldPointer) return null;
+    const { button, x, y } = heldPointer;
+    // Cleared FIRST: a throwing dispatch (window destroyed mid-release) must not leave the press
+    // recorded as held, or the next `down` 409s forever on a press nothing can now release. Same
+    // discipline as the device bridge's `releaseHeldPointer`.
+    heldPointer = null;
+    lastHeldLoss = { reason, button, x, y };
+    // ATTRIBUTION. This mouseup is real trusted input and the renderer reacts to it — it commits a
+    // gizmo drag, drops a Hierarchy row, finalises a marquee. Dispatched outside the actor lease it
+    // journals as `source:'human'` with the `!` sigil (editorJournal's default actor), i.e. the
+    // editor would record the AGENT's abandoned gesture as something the owner did. CLAUDE.md tells
+    // the next session to read the journal and believe exactly that — "the human probably did it" —
+    // so an unattributed release does not merely mislabel a row, it aims a later session at
+    // undoing work nobody did. Inside `releaseHeldPointer` rather than at its call sites for the
+    // same reason `withAgentAttribution` wraps the dispatcher once: three call sites, one of them
+    // in main.ts, is three chances to forget.
+    await withAgentAttribution(() => ops.pointerUp(x, y, { button }));
+    return `${button} at ${x},${y} (${reason})`;
+  }
 
   /** Attribute everything this dispatch causes to the AGENT.
    *
@@ -410,6 +531,15 @@ export function createInputRoutes(deps: InputRouteDeps) {
     // and a refusal whose stated cause is false is worse than either answer.
     const refusal = urlPath === '/api/input/focus' ? null : hiddenWindowRefusal(live, 'this input');
     if (refusal) return refusal;
+    // A second mouse gesture proves the held one was abandoned — release it into the live document
+    // BEFORE dispatching, so the renderer's `pointerSource` is unlatched and the incoming gesture
+    // is actually read. After the refusal gate, so a call that dispatches nothing steals nothing.
+    if (heldPointer && MOUSE_GESTURE_ROUTES.has(urlPath)) {
+      // Swallowed for the same reason the idle timer's call is: a window destroyed mid-release must
+      // not convert THIS call — whose own dispatch has not run yet — into an opaque 500. The press
+      // is cleared before the dispatch either way, so nothing is left stranded.
+      await releaseHeldPointer('superseded').catch(() => { /* window gone; state already cleared */ });
+    }
     const r = await withAgentAttribution(() => dispatchInput(req));
     // Visible but NOT OS-focused: input arrives, yet Chromium fires no focus/blur/focusin/
     // focusout — so anything the editor does ON a focus event silently does not happen (a
@@ -424,8 +554,39 @@ export function createInputRoutes(deps: InputRouteDeps) {
    *  synthetic press has no real OS button behind it, so a new document starts with nothing
    *  held — but `heldPointer` would otherwise persist and 409 the next `down` as "already
    *  held" (a stranded state machine). Idempotent. */
-  handler.resetHeldPointer = () => { heldPointer = null; };
+  handler.resetHeldPointer = () => {
+    disarmIdleRelease();
+    // Record THIS cause rather than leaving the previous one standing: a press dropped by a reload
+    // must not be reported as the idle timer's doing, and a stale entry from an earlier gesture
+    // would name a press the agent never asked about. Nothing held ⇒ nothing to explain.
+    lastHeldLoss = heldPointer ? { reason: 'reload', button: heldPointer.button, x: heldPointer.x, y: heldPointer.y } : null;
+    heldPointer = null;
+  };
+  handler.releaseHeldPointer = releaseHeldPointer;
+  handler.getHeldPointer = () => (heldPointer
+    ? { button: heldPointer.button, x: heldPointer.x, y: heldPointer.y, heldMs: Date.now() - heldPointer.since }
+    : null);
   return handler;
+
+  /** Explain a `move`/`up` refused because the backend itself ended the gesture. Empty when the
+   *  agent simply never pressed — the two are different mistakes and must not read alike. */
+  function autoReleaseNote(): string {
+    if (!lastHeldLoss) return '';
+    const { reason, button, x, y } = lastHeldLoss;
+    if (reason === 'reload') {
+      // Not an auto-release: no mouseup was dispatched, the document that owned the press is gone.
+      return ` NOTE: your ${button} press at ${x},${y} did not survive an editor page reload — the `
+        + 'document that held it was replaced, so the press is gone and nothing was dispatched. '
+        + 'Send a fresh down.';
+    }
+    const why = reason === 'idle'
+      ? `it sat ${HELD_POINTER_IDLE_MS / 1000}s with no move/up, so the backend released it — a `
+        + 'press left held latches the renderer\'s pointerSource and kills dragging for the human '
+        + 'too (#302). Send a fresh down; keep the gesture moving if it needs to last longer'
+      : 'a later tap/drag dispatched a new mouse gesture, which cannot coexist with a held press, '
+        + 'so the hold was released first. Send a fresh down';
+    return ` NOTE: your ${button} press at ${x},${y} was auto-released — ${why}.`;
+  }
 
   async function dispatchInput({ urlPath, body }: HostRequest): Promise<BackendResult | null> {
 
@@ -481,7 +642,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
         return json({ error: `a pointer is already held (button '${heldPointer.button}' down at ${heldPointer.x},${heldPointer.y}). Release it with action:'up' before pressing again.` }, 409);
       }
       if ((action === 'move' || action === 'up') && !heldPointer) {
-        return json({ error: `no pointer is held — send action:'down' first (this ${action} would be a stray event).` }, 409);
+        return json({ error: `no pointer is held — send action:'down' first (this ${action} would be a stray event).${autoReleaseNote()}` }, 409);
       }
       // Only the PRESS is gated on occlusion. A `move`/`up` mid-gesture is delivered to whatever
       // captured the press, so what happens to sit under the destination says nothing about
@@ -492,6 +653,19 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // already captured. The carve-out is a fact about DELIVERY, not a preference, so it
       // overrides rather than loses. (`??` stays the right precedence everywhere else, where the
       // flag really is the caller's intent.)
+      // Disarm BEFORE the first await. `resolvePoint` yields, and an idle timer firing inside that
+      // window would release the very press this call is servicing: a mouseup dispatched underneath
+      // an in-flight move, and `heldPointer` left null for the `heldPointer!` reads below. Re-armed
+      // on every path that leaves a press still held — including the resolve-failure path, or a
+      // refused move would strand the press with no timer at all, which is the #302 defect again.
+      if (action !== 'down') disarmIdleRelease();
+      // Snapshot the held press SYNCHRONOUSLY, before any await. Disarming above stops the idle
+      // timer nulling it mid-flight, but a CONCURRENT request can too — `tap`/`drag` supersede a
+      // hold, and nothing serialises two in-flight requests. Every `heldPointer!` read below sits
+      // after an await (`resolvePoint` does a renderer round trip; the ops each end in a real
+      // `sleep(16)`), so asserting non-null there is a TypeError → an opaque 500 on a move whose
+      // OS event had already been dispatched. The 409s above have already proved this non-null.
+      const heldAtEntry = heldPointer;
       const held = action !== 'down';
       const r = await resolvePoint(
         {
@@ -501,19 +675,32 @@ export function createInputRoutes(deps: InputRouteDeps) {
         },
         `pointer ${action}`, requestRenderer,
       );
-      if ('error' in r) return bad(r.error, r.code);
+      if ('error' in r) {
+        if (heldPointer) armIdleRelease(); // the press survived a refused move — it must not lose its timer
+        return bad(r.error, r.code);
+      }
       // 'down' takes its button from the request (default left); 'move'/'up' REUSE the held one so
       // the whole gesture is one consistent button and a move reads as a drag-move.
-      const effButton: MouseButton = action === 'down' ? (button ?? 'left') : heldPointer!.button;
+      const effButton: MouseButton = action === 'down' ? (button ?? 'left') : heldAtEntry!.button;
       if (action === 'down') {
         await ops.pointerDown(r.point.x, r.point.y, { button: effButton, modifiers });
-        heldPointer = { button: effButton, x: r.point.x, y: r.point.y };
+        heldPointer = { button: effButton, x: r.point.x, y: r.point.y, since: Date.now() };
+        lastHeldLoss = null; // a fresh press — the previous gesture's fate is no longer the story
+        armIdleRelease();
       } else if (action === 'move') {
         await ops.pointerMove(r.point.x, r.point.y, { button: effButton, modifiers });
-        heldPointer = { button: effButton, x: r.point.x, y: r.point.y };
+        // Re-record only if the press still EXISTS. A concurrent tap/drag can have superseded it
+        // while this move was in flight — and that release already dispatched its mouseup, so
+        // resurrecting the press here would re-strand a gesture the backend has finished with,
+        // which is the very state #302 exists to prevent.
+        if (heldPointer) {
+          heldPointer = { button: effButton, x: r.point.x, y: r.point.y, since: heldAtEntry!.since };
+          armIdleRelease(); // IDLE budget: a moving gesture never expires
+        }
       } else {
         await ops.pointerUp(r.point.x, r.point.y, { button: effButton, modifiers });
         heldPointer = null;
+        disarmIdleRelease();
       }
       return json({ ok: true, pointer: { action, x: r.point.x, y: r.point.y, button: effButton, held: heldPointer !== null }, ...provenance(r.point) });
     }

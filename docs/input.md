@@ -186,6 +186,77 @@ hand-rolled the clear and skipped the velocity reset, and because the pointer-bl
 releases a press left held (`releaseHeldPointer`), because that is the moment the agent provably
 cannot send the `up` itself.
 
+**The EDITOR has the same defect and closes it somewhere else entirely (#302).** `modoki_pointer
+{action:'down'}` strands a press exactly the way `device_pointer` does, and the symptom is the same:
+the Game panel reads no dragging at all, the human's own mouse included. But **#299's takeover
+cannot fire here, and must not be made to.** Editor input goes through `webContents.sendInputEvent`
+(`engine/electron/rendererOps.ts`), which injects real OS-level input — so the stranded press is
+itself `isTrusted`, `activeTrusted` is true, and `!e.isTrusted || activeTrusted` skips it. That is
+correct as written: two trusted presses genuinely cannot be told apart, and relaxing the condition to
+fire trusted-over-trusted would steal a real second finger mid-drag, which is the whole point of the
+primary-touch rule. `pointerSource.test.ts` pins that with *a REAL gesture in progress is never
+stolen*.
+
+Nor does the device's second half transfer. `inputRoutes.ts`'s `resetHeldPointer` runs on
+`did-finish-load` — a renderer RELOAD — which is precisely the moment the document that owned the
+press is already gone, so there is nothing left to dispatch a `pointerup` at. It clears the
+BACKEND's bookkeeping (otherwise the next `down` 409s as "already held" forever); it does not
+unlatch the renderer. Backend forgets, renderer stays latched.
+
+So the editor closes it at the **backend**, with two releases that both dispatch the real `mouseup`
+into the LIVE document — `releaseHeldPointer()`, as distinct from the clear-only `resetHeldPointer()`:
+
+- **A second mouse gesture releases it immediately.** `tap`/`drag`/`tap-handle`/`drag-handle` each
+  dispatch their own mouseDown, which cannot coexist with a held press, so their arrival proves the
+  held gesture was abandoned. Deliberately NOT every route: `key`/`type`/`scroll`/`hover`/`focus` are
+  all legitimate mid-gesture (Shift to constrain a drag, Escape to cancel it, scrolling a list while
+  dragging over it), and stealing the press there would break the interaction under test.
+- **`/api/capture-gesture` has to ask, because it bypasses the dispatcher** — it drives its own
+  drag straight through `rendererOps` and never passes through `createInputRoutes`, so it cannot
+  supersede a hold on its own the way the routes above do. It calls `releaseHeldPointer` explicitly,
+  next to the deliverability gate it already borrows for the same reason. Sampling a trajectory
+  underneath a held button would produce exactly the flat, misleading result that route already
+  guards against twice.
+- **A 120 s IDLE timeout is the backstop** (`HELD_POINTER_IDLE_MS`), for the case nothing else
+  reaches: the agent goes completely silent. It is a real timer, not a deadline checked on the next
+  request — there is no next request, which is the entire scenario. Every `move` restarts it, so a
+  long multi-step gesture never trips it.
+
+**A timeout is safe HERE and not in `pointerSource`, and the difference is not a matter of degree.**
+`pointerSource` cannot tell a synthetic press from a finger, so any staleness rule steals real holds.
+The backend's `heldPointer` is reachable only from `/api/input/pointer`, so it is synthetic *by
+construction* — there is no real finger to steal from. The budget is 120 s because the gap between a
+`down` and the next `move` is a whole agent turn (a capture, reading the image, thinking) and
+routinely runs tens of seconds; too SHORT is the worse failure, since it breaks a working gesture and
+presents as a bug in the feature under test — the exact round #299 cost.
+
+⚠️ **A release is REAL TRUSTED INPUT, so it must carry the actor lease.** The `mouseup` it
+dispatches is `sendInputEvent`, and the renderer acts on it — committing a gizmo drag, dropping a
+Hierarchy row, finalising a marquee. Outside the lease that lands in the editor journal as
+`source:'human'` with the `!` sigil (`editorJournal`'s default actor), so the editor records the
+AGENT's abandoned gesture as something the owner did — and this CLAUDE.md tells the next session to
+read the journal and believe precisely that ("something changed you didn't change? the human
+probably did it"). The mislabel would therefore aim a later session at *undoing work nobody did*.
+The attribution lives INSIDE `releaseHeldPointer`, not at its call sites, for the same reason
+`withAgentAttribution` wraps the dispatcher once rather than per route: there are three call sites,
+one of them in `main.ts`, and that is three chances to forget.
+
+**Both releases are visible, in two places.** The `move`/`up` that follows one is refused with a 409
+that NAMES the auto-release and why, instead of the generic "no pointer is held" (which would be the
+same silent-diagnosis trap in a new place). A press lost to a RELOAD says so in its own words and is
+never folded into the other two — nothing was dispatched there, so calling it an auto-release would
+describe a `mouseup` that never happened; and the recorded cause is replaced at each loss rather than
+left standing, or the refusal names an earlier gesture the agent never asked about. And
+`modoki_get_editor_state` reports `heldPointer`
+(`{button,x,y,heldMs}` or `null`), so a stranded press is read rather than inferred. That field is a
+main-process fact merged into the relayed renderer state via `BackendContext.getHeldPointer`, the
+same seam `persistenceMode` uses; it is **omitted entirely** on the Vite dev-server backend, which
+serves no `/api/input/*` routes — "not applicable here" and "nothing is held" are different answers.
+
+The old recoveries — `pointerSource.reset()` on the transition into `'playing'`, and a full page
+reload re-running the module — still happen, but they are coincidences of an interactive editor
+session, not the guarantee. The guarantee is the two releases above.
+
 ⚠️ **PASSTHROUGH SURFACES — a block root alone over-blocks, and it killed all 2D input for a day.**
 `UIRenderer` registers its WHOLE UI root, but that root is not "chrome": it is a LAYER holding chrome
 AND, for every 2D game in this repo, the game's own render surface. The standard scene shape puts

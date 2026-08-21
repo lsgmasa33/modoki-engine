@@ -532,7 +532,8 @@ Panels live in `editor/panels/`:
 - **ModelPreview** (`ModelPreview.tsx`) — an embeddable mini 3D viewer used by the Model
   inspector. It owns its own `WebGLRenderer`, orbit controls, and lights, with a toolbar
   for LOD-level switch, wireframe toggle, and camera reset; it disposes everything on
-  unmount.
+  unmount. It reloads on a re-import off the invalidation epoch — see "The asset Inspector"
+  below, rule 3.
 
 Dialogs/modals mounted by the shell include `ApplyPrefabDialog`,
 `ProjectSettingsDialog`, and the import/build progress modals. Each panel is wrapped in a
@@ -908,12 +909,12 @@ asset-binding bug above was found. The check is permissive on purpose — any re
 outside `editorStore.ts` counts, including from a test — and it excludes its own file from
 the corpus, since naming an orphan in an allowlist would otherwise launder it.
 
-### The asset Inspector — two rules that have each failed three times
+### The asset Inspector — three rules that have each failed repeatedly
 
 The Inspector's asset view (`Inspector.tsx`) is the door to everything above: it renders a
 per-kind branch, and for any kind it does not recognise it prints "No actions for `<type>`
-assets". Both halves of that sentence have gone wrong repeatedly, in ways nothing failed on,
-so both are now enforced rather than remembered.
+assets". Every one of the rules below went wrong in a way nothing failed on, so each is now
+enforced rather than remembered.
 
 **1. Every `AssetType` gets an action.** The recognised-kinds list used to be a string array
 written inline in the JSX, kept in step with the branches above it by hand. It drifted three
@@ -951,6 +952,49 @@ its call sites, and the call sites are where every instance of this bug has live
 Complementary, not redundant: `tests/assets/importSettingsOptions.test.ts` separately asserts
 every import-setting **default** appears in its own option list. Splicing can never reveal a
 bad default — a spliced default looks perfectly correct in the dropdown.
+
+**3. An asset preview keyed on the PATH cannot see a re-import (#294).** A re-import is
+precisely the gesture that rewrites the bytes behind a path *without changing the path*, so a
+`resetKey={path}` (or a `useEffect` on `[path]`) never fires and the panel keeps showing the
+pre-reimport asset with nothing saying so — the shape of bug that makes someone re-do an
+export three times believing it did not take. `MeshPreview` shipped that way; `MaterialPreview`
+happened to escape it only because it is keyed on serialized `data` it receives as a prop, not
+because anyone reasoned about re-imports.
+
+The signal a path cannot carry is **`useModelInvalidationEpoch()`**
+(`editor/panels/useModelInvalidationEpoch.ts`), a counter over the existing
+`onModelInvalidated` event that `invalidateModel` already fires. Fold it into the `resetKey`
+(`MeshPreview`) or the effect deps (`MeshAssetView`). Two things about it are load-bearing:
+
+- **Cache-busting is a separate problem from re-rendering, and `ModelPreview` needs both.** It
+  fetches the baked `.glb` over HTTP, so even a re-run effect would replay the browser's cached
+  copy of an unchanged URL. `cacheBustReimport(url, epoch)` appends `?reimport=<n>` — with the
+  `blob:`/`data:` carve-out `withCacheBust` makes for the same reason (a blob URL is matched by
+  UUID, so a query suffix 404s the model). The engine's own `withCacheBust` cannot serve here:
+  it is PROD-and-content-hash only, and the editor is neither.
+- **The epoch coalesces on a trailing 250 ms timer, and that is not cosmetic.** ONE Import click
+  fires `invalidateModel` for the same model **three** times — measured on `games/sling`'s
+  `ramp_wedge`, 2 ms apart then 32 ms later (it invalidates before re-deriving templates, again
+  around prefab regeneration, and once at the end). Uncoalesced, each bump costs a subscriber a
+  full GLB refetch and re-parse, so the fix would buy correct pixels at 3x the work on exactly
+  the large models where that hurts. Verified live: three invalidations, one refetch.
+
+Prefer a **filtered** epoch (`targets` names the model plus its baked LOD siblings) wherever the
+consumer knows its own model path, so an unrelated re-import does not refetch a multi-MB GLB.
+`MeshPreview` cannot: mapping a `.mesh.json` back to its source model is only possible through
+the very `meshAssetCache` entry the invalidation is about to delete, so it bumps unfiltered and
+pays one cheap clone-from-cache rebuild.
+
+Still uncovered, deliberately: a re-import fired from **another** panel (the Assets panel's
+"Re-import all", `assetViews/reimport.ts`) leaves a selected inspector's *sidecar-derived stats*
+stale — `ModelAssetView`/`TextureAssetView` re-read `/api/read-meta` only after their OWN import
+button. Neither is a preview, so neither is #294, and they are split because only one of them
+has a mechanism: the model half can subscribe to this same epoch (#303), while the texture half
+cannot, because `invalidateTexture` fires **no event at all** (#304) — verified, `textureResolver.ts`
+has no listener registry, unlike its `onModelInvalidated` twin. #304 also asks whether the two
+should collapse into one asset-invalidation event rather than a second parallel mechanism;
+`audioBufferCache` already describes itself as mirroring `invalidateTexture`, so a third case
+is waiting.
 
 ### Animation Editor
 

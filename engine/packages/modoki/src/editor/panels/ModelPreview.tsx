@@ -20,6 +20,7 @@ import { getKTX2Loader } from '../../runtime/loaders/textureResolver';
 import { needsGLBConversion, loadSourceModel } from '../scene/convertToGLB';
 import { frameCameraToBoxFixed } from '../scene/sceneViewMath';
 import { applyRendererColorConfig } from '../../runtime/rendering/scene3DSync';
+import { useModelInvalidationEpoch, cacheBustReimport } from './useModelInvalidationEpoch';
 
 interface Props {
   /** Source GLB URL — e.g. `/games/.../island.glb`. Suffixes are computed
@@ -74,6 +75,14 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
      *  A static thumbnail then costs 0 GPU submits instead of 60/s. */
     needsRender: boolean;
   } | null>(null);
+
+  // A re-import rewrites the baked `.glb`s in place, so `sourceUrl` — the only thing
+  // the load effect keys on — is exactly what does NOT change (#294, widened from
+  // MeshPreview). Two failures stack here and the epoch fixes both: React never
+  // re-runs the effect, and even if it did, the browser would replay its cached copy
+  // of an unchanged URL. Filtered to THIS model (`targets` also names its baked LOD
+  // siblings) so an unrelated re-import doesn't refetch a multi-MB GLB for nothing.
+  const reimportEpoch = useModelInvalidationEpoch((_modelPath, targets) => targets.has(sourceUrl));
 
   const [lodChoice, setLodChoice] = useState<LodChoice>(hasLods ? 'auto' : 0);
   const [wireframe, setWireframe] = useState(false);
@@ -180,6 +189,13 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     setLoading(true);
     setError(null);
 
+    // Defeat the browser's cached copy of an unchanged URL after a re-import. Applied
+    // to the BAKED artifacts only — the raw source model (OBJ/FBX/DAE below) is an
+    // input to the importer, never rewritten by it, and its sidecar .mtl/texture refs
+    // resolve relative to the URL. `withCacheBust` is not the tool here: it is
+    // PROD-and-content-hash only, and the editor runs neither.
+    const bust = (url: string) => cacheBustReimport(url, reimportEpoch);
+
     // Clear any previously loaded geometry/materials before fetching the next one.
     const clearModel = () => {
       while (s.modelRoot.children.length > 0) s.modelRoot.remove(s.modelRoot.children[0]);
@@ -237,7 +253,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       const lod = new THREE.LOD();
       s.modelRoot.add(lod);
       for (let i = 0; i < lodCount; i++) {
-        const url = assetUrl(sourceUrl + lodUrlSuffix(i));
+        const url = bust(assetUrl(sourceUrl + lodUrlSuffix(i)));
         const gltf = await (await getLoader()).loadAsync(url);
         // Bail between LOD loads on cancellation. Any later LODs that would
         // have run produce wasted bytes; the already-loaded gltf gets disposed
@@ -297,7 +313,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
         } else {
           // Single-level: load just the chosen GLB (LOD0 fallback when no LODs).
           const level = hasLods ? (lodChoice as number) : 0;
-          const url = hasLods ? assetUrl(sourceUrl + lodUrlSuffix(level)) : assetUrl(sourceUrl);
+          const url = bust(hasLods ? assetUrl(sourceUrl + lodUrlSuffix(level)) : assetUrl(sourceUrl));
           const gltf = await (await getLoader()).loadAsync(url);
           if (cancelled) return;
           buildSingle(gltf as { scene: THREE.Group });
@@ -315,7 +331,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     })();
 
     return () => { cancelled = true; };
-  }, [sourceUrl, lodChoice, hasLods, lodCount]);
+  }, [sourceUrl, lodChoice, hasLods, lodCount, reimportEpoch]);
 
   // Toggle wireframe on already-loaded materials in place — no GLB refetch.
   useEffect(() => {

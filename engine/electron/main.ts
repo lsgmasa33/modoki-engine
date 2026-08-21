@@ -1269,6 +1269,10 @@ app.whenReady().then(async () => {
     rebuildManifest: () => state.backend.rebuildManifest(),
     computeUnused: () => state.backend.computeUnused(),
     computeRefEdges: () => state.backend.computeRefEdges(),
+    // Reads the held sustained-pointer out of the input routes' closure for /api/editor-state
+    // (#302). `inputRoutes` is declared below this object, which is fine: the getter runs per
+    // request, long after this block finishes.
+    getHeldPointer: () => inputRoutes.getHeldPointer(),
     requestBrowser: requestRenderer,
     getSchema: () => cachedSchema,
     markEditorWrite: (p, h) => state.backend.markEditorWrite(p, h),
@@ -1406,6 +1410,13 @@ app.whenReady().then(async () => {
       // not pass through createInputRoutes).
       const gestureRefusal = hiddenWindowRefusal(await inputDeliverability(requestRenderer), 'the drag this samples');
       if (gestureRefusal) return gestureRefusal;
+      // …and for the same reason it borrows that gate: this drag is a mouse gesture, so it cannot
+      // coexist with a sustained `/api/input/pointer` press. The routes that DO flow through
+      // `createInputRoutes` supersede a held press themselves (MOUSE_GESTURE_ROUTES); this one
+      // bypasses the dispatcher, so it has to ask. Dispatching a mouseDown underneath a held
+      // button would sample a trajectory the renderer's pointerSource never saw — the flat,
+      // misleading result this route already guards against twice above (#302).
+      await inputRoutes.releaseHeldPointer('superseded');
       const result = await captureGesture(mainWindow, {
         from, to, steps,
         sample: () => requestRenderer('scene-state', sampleParams),

@@ -245,6 +245,18 @@ export interface BackendContext {
    *  same reason `computeUnused` is: it keeps the router free of the tree-shaker →
    *  scanner import cycle. */
   computeRefEdges(): RefEdgeEnumeration;
+  /** The sustained pointer currently held by `/api/input/pointer`, or null (#302).
+   *
+   *  Host-provided because the state lives in the Electron main process — `createInputRoutes`'
+   *  closure — while this router only ever relays to the RENDERER, which cannot see it. Reported
+   *  through `/api/editor-state` so a stranded press is READ rather than inferred: its symptom
+   *  (the Game panel stops reading drags, for the human as well as the agent) has no error
+   *  anywhere and otherwise reads as a bug in whatever feature was under test.
+   *
+   *  Optional: the Vite dev-server backend serves no `/api/input/*` routes, so it has no such
+   *  state and must say nothing rather than claim `null` — "not applicable here" and "nothing is
+   *  held" are different answers. */
+  getHeldPointer?(): { button: string; x: number; y: number; heldMs: number } | null;
 }
 
 /** What a handler returns. The host serializes it onto its response object. */
@@ -2730,7 +2742,16 @@ async function describeUnresolvedAgainstLiveWorld(
       // agents at for placing entities — got it wrong: its documented `path` default 403'd on
       // every call. Answer it here, once, rather than leave each caller to guess.
       const ref = toAssetRef(ctx, typeof obj.scenePath === 'string' ? obj.scenePath : undefined);
-      return json({ ...obj, ...(ref ? { scenePathRef: ref } : {}), persistenceMode: getPersistenceMode() });
+      // `heldPointer` — a MAIN-process fact merged into the relayed renderer state, the same way
+      // `persistenceMode` is. Present only when the host can answer (Electron); omitted entirely
+      // on a backend with no input routes, so its absence never reads as "nothing is held".
+      const held = ctx.getHeldPointer?.();
+      return json({
+        ...obj,
+        ...(ref ? { scenePathRef: ref } : {}),
+        ...(ctx.getHeldPointer ? { heldPointer: held ?? null } : {}),
+        persistenceMode: getPersistenceMode(),
+      });
     } catch (e) {
       return json({ error: String(e instanceof Error ? e.message : e) }, 504);
     }

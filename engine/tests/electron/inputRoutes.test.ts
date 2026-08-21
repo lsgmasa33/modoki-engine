@@ -11,8 +11,8 @@
  *  Both dependencies are injected — no Electron window, no DOM. That is why the routes
  *  were lifted out of `main.ts` in the first place. */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { createInputRoutes, resolvePoint, type InputOps } from '../../electron/inputRoutes';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createInputRoutes, resolvePoint, HELD_POINTER_IDLE_MS, type InputOps } from '../../electron/inputRoutes';
 
 /** Ordered log of everything that happened, so we can assert on sequence.
  *  Actor-lease traffic is recorded SEPARATELY (`leaseCalls`) — it brackets every route, so
@@ -473,6 +473,206 @@ describe('sustained pointer (held across calls)', () => {
     // the hold survived the failed move, so up succeeds and clears it
     const u = await post('/api/input/pointer', { action: 'up', x: 2, y: 2 });
     expect((u as { body: { pointer: { held: boolean } } }).body.pointer.held).toBe(false);
+    expect(ops.pointerUp).toHaveBeenCalledOnce();
+  });
+});
+
+/** #302 — a sustained press that is never released latches the renderer's `pointerSource`
+ *  (`activeId !== null` early-returns every later `pointerdown`), so the Game panel reads NO
+ *  dragging at all, the human's own mouse included. #299's trusted-takeover cannot fire here:
+ *  editor input is `sendInputEvent`, i.e. real OS input, so the stranded press is itself
+ *  `isTrusted` and the takeover's `!e.isTrusted || activeTrusted` guard skips it.
+ *
+ *  These tests assert the release DISPATCHES (`ops.pointerUp`), never merely that the state was
+ *  forgotten — forgetting is exactly the pre-#302 behaviour, and a test that only checked `held`
+ *  would pass against the bug. */
+describe('sustained pointer: the backend releases a stranded press (#302)', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  /** Run the pending idle timer and let its async release settle. */
+  const advance = async (ms: number) => { vi.advanceTimersByTime(ms); await vi.advanceTimersByTimeAsync(0); };
+
+  it('releases the press with a REAL mouseup once it sits idle past the budget', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 40, y: 50, button: 'right' });
+    expect(routes.getHeldPointer()).toMatchObject({ button: 'right', x: 40, y: 50 });
+
+    await advance(HELD_POINTER_IDLE_MS);
+
+    // The dispatch is the whole point — a cleared flag alone leaves pointerSource latched.
+    expect(ops.pointerUp).toHaveBeenCalledWith(40, 50, { button: 'right' });
+    expect(routes.getHeldPointer()).toBeNull();
+  });
+
+  it('does not fire one tick early — the budget is the budget', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    await advance(HELD_POINTER_IDLE_MS - 1);
+    expect(ops.pointerUp).not.toHaveBeenCalled();
+    expect(routes.getHeldPointer()).not.toBeNull();
+  });
+
+  it('is an IDLE budget, not a cap on gesture length — every move restarts it', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    // Three near-budget waits, each broken by a move. A total-duration cap would have fired by now.
+    for (let i = 0; i < 3; i++) {
+      await advance(HELD_POINTER_IDLE_MS - 1);
+      await post('/api/input/pointer', { action: 'move', x: 10 + i, y: 20 });
+      expect(ops.pointerUp).not.toHaveBeenCalled();
+    }
+    // …and it still expires from the LAST move, at that move's point rather than the press's.
+    await advance(HELD_POINTER_IDLE_MS);
+    expect(ops.pointerUp).toHaveBeenCalledWith(12, 20, { button: 'left' });
+  });
+
+  it('an explicit up disarms the timer, so no phantom release follows', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    await post('/api/input/pointer', { action: 'up', x: 2, y: 2 });
+    await advance(HELD_POINTER_IDLE_MS * 2);
+    expect(ops.pointerUp).toHaveBeenCalledOnce(); // the explicit one only
+  });
+
+  it('resetHeldPointer disarms it too — a reloaded document must not be sent a stray mouseup', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    routes.resetHeldPointer(); // the renderer reloaded; that document is gone
+    await advance(HELD_POINTER_IDLE_MS * 2);
+    expect(ops.pointerUp).not.toHaveBeenCalled();
+  });
+
+  it('a reload reports itself as a reload, NOT as an auto-release that never dispatched', async () => {
+    // The bug this pins: `lastHeldLoss` outliving its cause. Idle-release one press, press again,
+    // then reload — the second press is gone for a different reason, and quoting the first one's
+    // story would name the wrong press AND claim a mouseup that was never sent.
+    await post('/api/input/pointer', { action: 'down', x: 11, y: 11 });
+    await advance(HELD_POINTER_IDLE_MS);
+    await post('/api/input/pointer', { action: 'down', x: 77, y: 88 });
+    routes.resetHeldPointer();
+
+    const err = (await post('/api/input/pointer', { action: 'move', x: 1, y: 1 }) as { body: { error: string } }).body.error;
+    expect(err).toContain('77,88');          // the press that was actually lost…
+    expect(err).not.toContain('11,11');      // …not the earlier one
+    expect(err).toContain('reload');
+    expect(err).not.toContain('auto-released'); // nothing was dispatched
+  });
+
+  it('a reset with nothing held explains nothing — there is no press to have a story about', async () => {
+    routes.resetHeldPointer();
+    const err = (await post('/api/input/pointer', { action: 'up', x: 1, y: 1 }) as { body: { error: string } }).body.error;
+    expect(err).not.toContain('NOTE:');
+  });
+
+  it('the refusal that follows an auto-release NAMES it, instead of "you never pressed"', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 40, y: 50 });
+    await advance(HELD_POINTER_IDLE_MS);
+    const res = await post('/api/input/pointer', { action: 'move', x: 60, y: 70 });
+    expect(res).toMatchObject({ status: 409 });
+    const err = (res as { body: { error: string } }).body.error;
+    expect(err).toContain('auto-released');
+    expect(err).toContain('40,50');
+    expect(err).toContain('#302');
+    // …and a fresh press clears the story, so the next honest mistake reads as itself.
+    await post('/api/input/pointer', { action: 'down', x: 5, y: 5 });
+    await post('/api/input/pointer', { action: 'up', x: 5, y: 5 });
+    const plain = await post('/api/input/pointer', { action: 'move', x: 1, y: 1 });
+    expect((plain as { body: { error: string } }).body.error).not.toContain('auto-released');
+  });
+
+  it('a later tap releases the hold FIRST, so the new gesture is actually read', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 40, y: 50 });
+    calls = [];
+    await post('/api/input/tap', { x: 100, y: 200 });
+    // Order is the assertion: a tap dispatched while the button is still down is a mouseDown
+    // underneath a mouseDown, and pointerSource ignores it entirely.
+    expect(calls).toEqual(['pup(40,50,left)', 'tap(100,200)']);
+    expect(routes.getHeldPointer()).toBeNull();
+  });
+
+  it.each(['/api/input/drag', '/api/input/tap-handle', '/api/input/drag-handle'])(
+    '%s supersedes a held press for the same reason a tap does',
+    async (urlPath) => {
+      await post('/api/input/pointer', { action: 'down', x: 40, y: 50 });
+      await post(urlPath, { x: 1, y: 1, from: { x: 1, y: 1 }, to: { x: 9, y: 9 }, handle: 'h1', delta: { dx: 5, dy: 5 } });
+      expect(ops.pointerUp).toHaveBeenCalledWith(40, 50, { button: 'left' });
+      expect(routes.getHeldPointer()).toBeNull();
+    },
+  );
+
+  it.each(['key', 'type', 'scroll', 'hover', 'focus'])(
+    'a mid-gesture %s leaves the hold ALONE — those are legitimate during a drag',
+    async (route) => {
+      await post('/api/input/pointer', { action: 'down', x: 40, y: 50 });
+      await post(`/api/input/${route}`, { key: 'Shift', text: 'x', deltaY: 10, x: 1, y: 1, selector: '#kebab' });
+      // Constraining a drag with Shift, cancelling with Escape, or scrolling a list while dragging
+      // over it are real interactions; stealing the press would break the thing under test.
+      expect(ops.pointerUp).not.toHaveBeenCalled();
+      expect(routes.getHeldPointer()).toMatchObject({ x: 40, y: 50 });
+    },
+  );
+
+  it('getHeldPointer reports nothing held as null, which is what Percept surfaces', async () => {
+    expect(routes.getHeldPointer()).toBeNull();
+  });
+
+  // ── PROVENANCE ──
+  // An auto-released mouseup is REAL trusted input and the renderer acts on it: it commits a gizmo
+  // drag, drops a Hierarchy row, finalises a marquee. Dispatched outside the actor lease it is
+  // journaled `source:'human'` with the `!` sigil — so the editor records the AGENT's abandoned
+  // gesture as something the owner did, and CLAUDE.md tells the next session to believe exactly
+  // that ("read the editor journal first — the human probably did it"). Mislabelling here does not
+  // just misattribute a row; it aims a later session at undoing work nobody did.
+  it('the IDLE release carries the actor lease, so it is not journaled as the human', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    leaseCalls = [];
+    await advance(HELD_POINTER_IDLE_MS);
+    expect(ops.pointerUp).toHaveBeenCalled();
+    expect(leaseCalls.some((c) => c.open === true)).toBe(true);  // opened…
+    expect(leaseCalls.some((c) => c.id !== undefined)).toBe(true); // …and closed
+  });
+
+  it('the SUPERSEDE release carries it too — it fires outside the dispatcher its own wrapper covers', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    leaseCalls = [];
+    calls = [];
+    await post('/api/input/tap', { x: 9, y: 9 });
+    expect(calls).toEqual(['pup(1,1,left)', 'tap(9,9)']);
+    // Two leases: one bracketing the release, one bracketing the tap. Neither dispatch is bare.
+    expect(leaseCalls.filter((c) => c.open === true).length).toBe(2);
+    expect(leaseCalls.filter((c) => c.id !== undefined).length).toBe(2);
+  });
+
+  // ── the move/timer race ──
+  // The handler awaits the deliverability probe and the actor lease BEFORE `dispatchInput` runs,
+  // so the idle timer can still land in that window and release the press out from under an
+  // arriving move. That outcome is CORRECT — the budget really did elapse — but it must present as
+  // the explanatory 409, never as a stray half-gesture or an opaque 500.
+  it('a move that arrives just after the budget elapsed is refused cleanly, dispatching nothing', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    await advance(HELD_POINTER_IDLE_MS);
+    const res = await post('/api/input/pointer', { action: 'move', x: 2, y: 2 });
+    expect(res).toMatchObject({ status: 409 });
+    expect((res as { body: { error: string } }).body.error).toContain('auto-released');
+    expect(ops.pointerMove).not.toHaveBeenCalled(); // no move for a press that no longer exists
+    expect(ops.pointerUp).toHaveBeenCalledOnce();   // exactly one release, not two
+  });
+
+  it('a concurrent tap superseding an IN-FLIGHT move neither crashes it nor resurrects the press', async () => {
+    // The window the snapshot fix exists for: every `heldPointer!` read sits after an await, and
+    // nothing serialises two in-flight requests. Before the fix this dereferenced null and returned
+    // an opaque 500 on a move whose OS event had already been dispatched.
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    let unblock: () => void = () => {};
+    const slow = new Promise<void>((res) => { unblock = res; });
+    (ops.pointerMove as unknown as { mockImplementationOnce(f: () => Promise<void>): void })
+      .mockImplementationOnce(async () => { calls.push('pmove(slow)'); await slow; });
+
+    const inFlight = post('/api/input/pointer', { action: 'move', x: 2, y: 2 });
+    await vi.advanceTimersByTimeAsync(0);          // let the move reach its stuck dispatch
+    await post('/api/input/tap', { x: 9, y: 9 });  // …and supersede it from under there
+    unblock();
+
+    expect(await inFlight).toMatchObject({ kind: 'json', body: { ok: true } }); // not a 500
+    // The supersede released the press and dispatched its mouseup; the move must not undo that by
+    // re-recording a hold the backend has already finished with.
+    expect(routes.getHeldPointer()).toBeNull();
     expect(ops.pointerUp).toHaveBeenCalledOnce();
   });
 });

@@ -6,10 +6,18 @@
 import { useCallback } from 'react';
 import * as THREE from 'three';
 import { whenMeshTemplate } from '../../runtime/loaders/meshTemplateCache';
+import { useModelInvalidationEpoch } from './useModelInvalidationEpoch';
 import { Preview3DShell } from './Preview3DShell';
 import type { PreviewSceneHandle } from './previewScene';
 
 export function MeshPreview({ path }: { path: string }) {
+  // A re-import rewrites the geometry behind `path` without changing `path`, so the
+  // path alone is a resetKey that can never fire (#294). `invalidateModel` drops this
+  // mesh's cache entry, so re-running `populate` genuinely refetches the new geometry.
+  // Unfiltered on purpose: mapping a `.mesh.json` back to its source model is only
+  // possible through the very cache entry the invalidation is about to delete, and
+  // rebuilding one 320x220 preview is far cheaper than getting that mapping wrong.
+  const epoch = useModelInvalidationEpoch();
   const populate = useCallback(async (h: PreviewSceneHandle, signal: AbortSignal) => {
     const template = await whenMeshTemplate(path);
     if (signal.aborted) return;
@@ -20,5 +28,7 @@ export function MeshPreview({ path }: { path: string }) {
     h.contentRoot.add(new THREE.Mesh(geometry, material));
   }, [path]);
 
-  return <Preview3DShell populate={populate} resetKey={path} />;
+  // `populate` is read through a ref inside the shell, so resetKey alone drives the
+  // rebuild — no need to also churn the useCallback identity.
+  return <Preview3DShell populate={populate} resetKey={`${path}#${epoch}`} />;
 }

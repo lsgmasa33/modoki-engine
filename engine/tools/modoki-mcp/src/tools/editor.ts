@@ -23,6 +23,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       + '`openPanels` (the ids that currently have a tab — the only values modoki_focus / '
       + 'modoki_press_key accept for `panel`, case-sensitively), '
       + 'and `persistenceMode` (always \'manual\' — see modoki_persistence). ' +
+      'Also `heldPointer` — the sustained modoki_pointer press currently held ({button,x,y,heldMs}), ' +
+      'or null. Check it when the Game panel has stopped responding to drags: a press left held ' +
+      'latches pointer input for the human as well as the agent, and nothing else reports it (#302). ' +
       'The companion to get_scene_state (which reads the ECS world): this reads the EDITOR. ' +
       'Requires a connected editor renderer.',
     {},
