@@ -18,8 +18,15 @@ import { buildRefGraph, resolveTarget, findReferences } from '../../plugins/asse
 import type { AssetRoot } from '../../plugins/vite-asset-scanner';
 import { deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { readMetaSidecar } from '../../plugins/meta-sidecar';
+import { hasInternalGames } from '../helpers/repoLayout';
 
-describe('assetRefGraph — games/court integration (#284)', () => {
+/** Gated on `hasInternalGames()`: this suite reads REAL files out of `games/court`, and the
+ *  public engine snapshot (lsgmasa33/modoki-engine) ships no `games/` at all — it ships two
+ *  demos, so the loose `hasAnyProject()` would read TRUE and the suite would FAIL there
+ *  rather than skip. That is exactly what happened: it went red on `ci/main` for the
+ *  `506981512` merge with `expected undefined to be truthy` (the `.meta.json` read returns
+ *  nothing when the texture is not on disk). See `engine/tests/helpers/repoLayout.ts`. */
+describe.skipIf(!hasInternalGames())('assetRefGraph — games/court integration (#284)', () => {
   const repo = path.resolve(__dirname, '../..', '..');
   const projectRoot = path.join(repo, 'games/court');
   const roots: AssetRoot[] = [
