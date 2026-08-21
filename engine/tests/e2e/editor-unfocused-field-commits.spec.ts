@@ -132,19 +132,46 @@ async function typeUnfocused(page: Page, label: string, text: string, { clear = 
 
 const undoKey = 'ControlOrMeta+z';
 
+/** Widen the undo-coalescing idle window so a run of keystrokes CANNOT split, whatever the
+ *  machine is doing (#300). `typeUnfocused` spends several CDP round-trips plus two rAF per
+ *  character; in the full suite a gap stretched past the real 500 ms window, the coalescer
+ *  correctly closed the step mid-run, and `⌘Z` then reverted to the intermediate `12` instead
+ *  of `0` — ~1 run in 6, never in isolation. That is the coalescer working as designed (a
+ *  human pausing 600 ms mid-number gets two steps too), so the spec is what had to stop racing
+ *  a wall clock. Measured: with a 600 ms gap forced between characters the failure reproduces
+ *  100%, with 0 ms it never does.
+ *
+ *  Nothing is lost by widening it. The timer's own behaviour — "a fast run stays one entry" —
+ *  is pinned deterministically under `vi.useFakeTimers()` in
+ *  `engine/packages/modoki/tests/editor/coalescedEdit.test.ts`. What only a real browser can
+ *  show is what these specs are for: the unfocused event delivery, and a real ⌘Z flushing the
+ *  pending session before it pops. Both still fail here if a per-keystroke history returns or
+ *  if `undo()` stops flushing.
+ *
+ *  Scoped to the page, so it needs no teardown: each test gets a fresh page, the bridge is
+ *  reinstalled on load, and the override goes with the old one. */
+const coalesce = {
+  widen: (page: Page) => page.evaluate(() => (window as any).__modokiEditorTest.setCoalesceMs(600_000)),
+  /** What the user pausing over the idle window means, without waiting for one. */
+  flush: (page: Page) => page.evaluate(() => (window as any).__modokiEditorTest.flushCoalescedEdits()),
+};
+
 test.describe('Sprite Editor — slicer params are undoable with no focus events (#244)', () => {
   test('⌘Z reverts the param the user just typed, not the step before it', async ({ page }) => {
     await gotoEmptyEditor(page);
     await page.evaluate((u) => (window as any).__modokiEditorTest.store.getState().requestTextureEditor(u, 'sprite'), SHEET_URL);
     await page.waitForSelector('text=Sprite Editor —', { timeout: 15_000 });
+    await coalesce.widen(page);
     await tagField(page, 'Off X');
     await tagField(page, 'Cols');
     expect(await fieldText(page, 'Cols')).toBe('4');
     expect(await fieldText(page, 'Off X')).toBe('0');
 
-    // Step 1: an earlier edit, left idle long enough to commit as its own undo step.
+    // Step 1: an earlier edit, closed as its own undo step. An explicit flush, not a sleep —
+    // it is the same signal the idle timer sends, delivered when the spec means it rather
+    // than whenever a loaded machine gets round to it.
     await typeUnfocused(page, 'Off X', '5');
-    await page.waitForTimeout(900);
+    await coalesce.flush(page);
     expect(await fieldText(page, 'Off X')).toBe('5');
 
     // Step 2: the edit under test, undone WITHOUT ever leaving the field.
@@ -167,6 +194,7 @@ test.describe('Sprite Editor — slicer params are undoable with no focus events
     await gotoEmptyEditor(page);
     await page.evaluate((u) => (window as any).__modokiEditorTest.store.getState().requestTextureEditor(u, 'sprite'), SHEET_URL);
     await page.waitForSelector('text=Sprite Editor —', { timeout: 15_000 });
+    await coalesce.widen(page);
     await tagField(page, 'Pad X');
 
     await typeUnfocused(page, 'Pad X', '123');

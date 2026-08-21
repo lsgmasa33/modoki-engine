@@ -34,6 +34,42 @@
  *  full set.) */
 export const DEFAULT_COALESCE_MS = 500;
 
+/** E2E-only override of the idle window, and a handle on every OPEN session (#300).
+ *
+ *  An E2E cannot type fast enough to be sure a run stays inside the window, so it must not
+ *  race one: it widens the window past any plausible load and closes the session explicitly.
+ *  Why that gives up nothing, and the measurements behind it, are in
+ *  `docs/editor-input.md` § "Testing this class: drive the field with no focus events".
+ *
+ *  ⚠️ The override is read at `note()` time, NOT captured at construction: `SpriteEditor`
+ *  builds its session once into a ref, so a value baked at construction could never be
+ *  changed by a spec that opens the modal afterwards. */
+let overrideMs: number | null = null;
+/** The sessions with something pending — joined in `note()`, left in `flush()`/`cancel()`.
+ *
+ *  ⚠️ Keyed on the SESSION, not on the edit object's lifetime. Registering at construction and
+ *  deregistering in `cancel()` looks equivalent and is not: `<StrictMode>` (engine/app/main.tsx)
+ *  double-invokes mount effects in dev, so the unmount cleanup's `cancel()` fires once while
+ *  the ref — and thus the edit — survives. The session was then unreachable forever and
+ *  `flushCoalescedEdits()` silently saw zero. Measured, not reasoned: it cost a green-looking
+ *  spec that had quietly stopped flushing. `panels/rendererLease.ts` is the same hazard met a
+ *  different way. Following the session also makes the set leak-free by construction: an idle
+ *  edit is not a member, so reopening a panel cannot accumulate. */
+const live = new Set<CoalescedEdit>();
+
+/** Set (or clear, with `null`) the idle window every coalesced session uses. E2E only —
+ *  reached through the DEV-gated editor test bridge, never from editor code. */
+export function setCoalesceOverrideMs(ms: number | null): void { overrideMs = ms; }
+
+/** Commit every open session now — the deterministic stand-in for "the user paused long
+ *  enough for the idle timer". E2E only, same route as `setCoalesceOverrideMs`. */
+export function flushCoalescedEdits(): void { for (const e of [...live]) e.flush(); }
+
+/** How many sessions currently have something pending. Test/diagnostic use — it is the only
+ *  observable of the registry's bookkeeping, since a `flush()` on an already-closed session is
+ *  a no-op whether or not it is still a member. */
+export function pendingCoalescedEditCount(): number { return live.size; }
+
 export interface CoalescedEdit {
   /** Call from `onChange`, BEFORE mutating state. Snapshots on the first change of a
    *  session and (re)arms the idle timer; a no-op snapshot-wise on later changes. */
@@ -57,7 +93,9 @@ export function createCoalescedEdit<S>(opts: {
   idleMs?: number;
 }): CoalescedEdit {
   const { take, same, push } = opts;
-  const idleMs = opts.idleMs ?? DEFAULT_COALESCE_MS;
+  // Resolved per `note()`, not captured here — see `overrideMs` above. An explicit `idleMs`
+  // from the caller still wins, so `idleMs: 0` (flush-only) stays exactly that.
+  const idleWindow = () => opts.idleMs ?? overrideMs ?? DEFAULT_COALESCE_MS;
   let start: S | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -67,16 +105,20 @@ export function createCoalescedEdit<S>(opts: {
     clear(); // tidiness only — a timer left armed here would no-op on `start === null`
     const before = start;
     start = null;
+    live.delete(edit);
     if (before !== null && !same(before, take())) push(before);
   };
 
-  return {
+  const edit: CoalescedEdit = {
     note() {
       if (start === null) start = take();
+      live.add(edit);
+      const idleMs = idleWindow();
       if (idleMs > 0) { clear(); timer = setTimeout(flush, idleMs); }
     },
     flush,
-    cancel() { clear(); start = null; },
+    cancel() { clear(); start = null; live.delete(edit); },
     pending() { return start !== null; },
   };
+  return edit;
 }

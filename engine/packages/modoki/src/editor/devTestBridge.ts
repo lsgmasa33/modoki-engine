@@ -19,6 +19,7 @@ import { worldTransforms } from '../runtime/core/ecs/transformPropagationSystem'
 import { editorScene2DRenderer } from './rendering/editorScene2D';
 import { getInput } from '../runtime/traits/Input';
 import { pickAt } from '../runtime/core/screenPick';
+import { setCoalesceOverrideMs, flushCoalescedEdits } from './panels/coalescedEdit';
 
 export interface EditorTestBridge {
   /** The raw Zustand store (read selectedEntityId, gizmoMode, etc.). */
@@ -77,6 +78,15 @@ export interface EditorTestBridge {
    *  AGREES with the real click: a prediction that names an entity the click will not select is
    *  what made testboard UfbeEfhHmNwd0GVVnESC read as "the tool contradicts itself". */
   predictPickAt(x: number, y: number): number | null | undefined;
+  /** Widen (or restore, with `null`) the undo-coalescing idle window used by fields that
+   *  commit on every keystroke. #300: a spec cannot type fast enough to guarantee a run stays
+   *  inside the real 500 ms window — several CDP round-trips per character stretch past it
+   *  under load, the run splits into two undo steps, and the assertion reads the intermediate
+   *  value. Widen it and the run cannot split, whatever the machine is doing. */
+  setCoalesceMs(ms: number | null): void;
+  /** Commit every open coalescing session now — the deterministic stand-in for "the user
+   *  paused long enough for the idle timer to fire", so a spec never has to sleep for one. */
+  flushCoalescedEdits(): void;
 }
 
 export function installEditorTestBridge(): void {
@@ -129,6 +139,12 @@ export function installEditorTestBridge(): void {
     },
     predictPickAt(x, y) {
       return pickAt('scene-view', x, y);
+    },
+    setCoalesceMs(ms) {
+      setCoalesceOverrideMs(ms);
+    },
+    flushCoalescedEdits() {
+      flushCoalescedEdits();
     },
     getPointerState() {
       const input = getInput(getCurrentWorld());

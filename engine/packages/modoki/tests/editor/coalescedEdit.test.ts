@@ -9,7 +9,10 @@
  *  else that touches the history). */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { createCoalescedEdit, DEFAULT_COALESCE_MS } from '../../src/editor/panels/coalescedEdit';
+import {
+  createCoalescedEdit, DEFAULT_COALESCE_MS, setCoalesceOverrideMs, flushCoalescedEdits,
+  pendingCoalescedEditCount,
+} from '../../src/editor/panels/coalescedEdit';
 
 /** A stand-in for the editor: one number of state, one undo stack. */
 function harness(idleMs?: number) {
@@ -27,7 +30,8 @@ function harness(idleMs?: number) {
 }
 
 beforeEach(() => { vi.useFakeTimers(); });
-afterEach(() => { vi.useRealTimers(); });
+// The override is module state, so a leak would silently retune every later test.
+afterEach(() => { vi.useRealTimers(); setCoalesceOverrideMs(null); });
 
 describe('createCoalescedEdit', () => {
   it('pushes the PRE-edit value once for a run of keystrokes', () => {
@@ -128,5 +132,73 @@ describe('createCoalescedEdit', () => {
     state.v = { cols: 8 };
     edit.flush();
     expect(pushed).toEqual([{ cols: 4 }]);
+  });
+
+  // ── The E2E seam (#300) ──
+  // The flake was the SPEC racing the 500 ms timer, not the coalescer misbehaving: several CDP
+  // round-trips per character stretched a gap past the window, the run correctly became two
+  // undo steps, and the assertion read the intermediate value. These pin the escape hatch the
+  // spec now uses, so a refactor cannot quietly make it a no-op and hand the flake back.
+
+  it('setCoalesceOverrideMs widens the window for sessions ALREADY built', () => {
+    const { pushed, type } = harness();          // built while the default is in force
+    setCoalesceOverrideMs(600_000);
+    type(1);
+    vi.advanceTimersByTime(DEFAULT_COALESCE_MS * 4);
+    expect(pushed).toEqual([]);                  // would have committed at 500 ms without it
+    type(12);
+    vi.advanceTimersByTime(600_000);
+    expect(pushed).toEqual([0]);                 // one entry for the whole run
+  });
+
+  it('an explicit idleMs still wins over the override', () => {
+    setCoalesceOverrideMs(600_000);
+    const { pushed, type } = harness(50);
+    type(1);
+    vi.advanceTimersByTime(50);
+    expect(pushed).toEqual([0]);                 // the caller's window, not the override's
+  });
+
+  it('flushCoalescedEdits commits every live session — the stand-in for "the user paused"', () => {
+    setCoalesceOverrideMs(600_000);
+    const a = harness();
+    const b = harness();
+    a.type(1);
+    b.type(7);
+    flushCoalescedEdits();
+    expect(a.pushed).toEqual([0]);
+    expect(b.pushed).toEqual([0]);
+  });
+
+  it('membership follows the SESSION, not the object — a remount stays flushable', () => {
+    // The trap this pins, measured in a real browser: registering at construction and
+    // deregistering in `cancel()` reads as equivalent, but React StrictMode mounts→unmounts→
+    // remounts in dev, so the unmount cleanup's `cancel()` fires once while the edit itself
+    // survives in a ref. Under the old scheme it was unreachable forever and
+    // `flushCoalescedEdits()` silently saw nothing.
+    setCoalesceOverrideMs(600_000);
+    // Counts are RELATIVE: the registry is module state and a test that walks away from an
+    // open session leaves it there, so an absolute `toBe(1)` would fail on an unrelated test
+    // added above this one — and point at the wrong culprit when it did.
+    const base = pendingCoalescedEditCount();
+    const { pushed, edit, type } = harness();
+    edit.cancel();                               // the StrictMode unmount, before any typing
+    type(1);                                     // the remounted panel's first keystroke
+    expect(pendingCoalescedEditCount()).toBe(base + 1);
+    flushCoalescedEdits();
+    expect(pushed).toEqual([0]);
+  });
+
+  it('a closed session leaves the registry, so reopening a panel cannot accumulate', () => {
+    const base = pendingCoalescedEditCount();
+    const { edit, type } = harness();
+    expect(pendingCoalescedEditCount()).toBe(base);      // idle: not a member
+    type(1);
+    expect(pendingCoalescedEditCount()).toBe(base + 1);
+    edit.flush();
+    expect(pendingCoalescedEditCount()).toBe(base);
+    type(2);
+    edit.cancel();
+    expect(pendingCoalescedEditCount()).toBe(base);
   });
 });

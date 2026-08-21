@@ -358,7 +358,7 @@ Headless Chromium reports `document.hasFocus() === true`, and a second page does
 the EVENTS instead: dispatch `input` on the field through React's own value setter and never
 dispatch `focus`/`blur`. The component sees exactly what an unfocused window gives it.
 
-Two details are load-bearing, and a test that skips them passes against the broken code:
+Three details are load-bearing, and a test that skips them passes against the broken code:
 
 - **Append one character at a time, re-reading the field's value from the DOM each time.** If the
   field's own commit echoes back and rewrites the buffer mid-edit (#242), the next character has to
@@ -366,6 +366,28 @@ Two details are load-bearing, and a test that skips them passes against the brok
   pushing whole strings would hide.
 - **Assert the STORE, not just the field**, wherever the display legitimately holds an
   unreconciled value (a clamped field shows `-3.5` while the store holds the clamp).
+- **Never let the assertion race the coalescing window** (#300). Typing that way costs several CDP
+  round-trips plus two rAF *per character*; in the full suite a gap stretched past the real 500 ms
+  idle window, the coalescer correctly closed the step mid-run, and ⌘Z reverted to the intermediate
+  `12` instead of `0` — about 1 run in 6, never in isolation. Forcing a 600 ms gap reproduces it
+  100%, a 0 ms gap never does. Nothing was wrong with the coalescer: a human pausing 600 ms
+  mid-number gets two undo steps too. So the spec widens the window past any plausible load via
+  `__modokiEditorTest.setCoalesceMs()`, and says "the user paused" with
+  `__modokiEditorTest.flushCoalescedEdits()` rather than sleeping for a timer.
+
+  **Nothing is given up by that**, which is the part worth internalising: the timer's own behaviour
+  ("a fast run stays one entry") is already pinned deterministically under `vi.useFakeTimers()` in
+  `engine/packages/modoki/tests/editor/coalescedEdit.test.ts`. An E2E should only be buying what
+  *only* a real browser can show — here the unfocused event delivery and a real ⌘Z flushing before
+  it pops. Verified by mutation: the spec still fails if `undo()` stops flushing, and if a
+  per-keystroke history returns.
+
+  ⚠️ **The registry behind `flushCoalescedEdits()` is keyed on the SESSION, not on the edit
+  object's lifetime**, and the difference is not cosmetic. Registering at construction and
+  deregistering in `cancel()` reads as equivalent, but React StrictMode mounts → unmounts →
+  remounts in dev: the unmount cleanup's `cancel()` fires once while the edit survives in a ref, so
+  the session became unreachable forever and `flushCoalescedEdits()` silently saw zero. Joining in
+  `note()` and leaving in `flush()`/`cancel()` also makes the set leak-free by construction.
 
 ### Remount a field when its TARGET changes
 
