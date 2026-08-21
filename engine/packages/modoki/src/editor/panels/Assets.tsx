@@ -59,6 +59,10 @@ import { resolveAssetKey } from './assetKeyCommands';
 import ScriptTree from './ScriptTree';
 import { SectionHeader, TreeFolderRow, TreeSearchInput, TypeFilterMenu } from './treeChrome';
 import { useExpandedSet } from './useExpandedSet';
+import {
+  useExpanded, usePendingFolders, useTypeFilter, useViewMode,
+  setExpanded, setPendingFolders, setTypeFilter, setViewMode,
+} from './assetFolderState';
 
 
 async function instantiatePrefabFromPath(prefabPath: string, _name: string) {
@@ -551,38 +555,7 @@ function countAll(node: FolderNode): number {
 
 // ─── Main component ──────────────────────────────────────────────────
 
-const LS_VIEW_MODE = 'editor:assets:viewMode';
-// v2: the top-level tree gained an "Assets" section header (ASSETS_SECTION key),
-// so bump the key to seed it open by default over any older saved set.
-const LS_EXPANDED = 'editor:assets:expanded:v2';
-const LS_PENDING_FOLDERS = 'editor:assets:pendingFolders';
-const LS_TYPE_FILTER = 'editor:assets:typeFilter';
 const LS_CURRENT_FOLDER = 'editor:assets:currentFolder';
-
-function loadStringSet(key: string): Set<string> {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return new Set();
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? new Set(arr.filter((x) => typeof x === 'string')) : new Set();
-  } catch { return new Set(); }
-}
-
-function loadViewMode(): ViewMode {
-  try {
-    const v = localStorage.getItem(LS_VIEW_MODE);
-    return v === 'folder' ? 'folder' : 'category';
-  } catch { return 'category'; }
-}
-
-function loadExpanded(): Set<string> {
-  try {
-    const raw = localStorage.getItem(LS_EXPANDED);
-    if (!raw) return new Set([ASSETS_SECTION]);
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? new Set(arr.filter((x) => typeof x === 'string')) : new Set([ASSETS_SECTION]);
-  } catch { return new Set([ASSETS_SECTION]); }
-}
 
 export default function Assets() {
   const [assets, setAssets] = useState<AssetEntry[]>([]);
@@ -597,7 +570,7 @@ export default function Assets() {
   // subtree) — merged into the tree below so externally-created empty dirs are visible.
   const [diskFolders, setDiskFolders] = useState<string[]>([]);
   const [filter, setFilter] = useState('');
-  const [expanded, setExpanded] = useState<Set<string>>(loadExpanded);
+  const expanded = useExpanded();
   // `selected` = the active/lead item (drives the Inspector, scroll-to, and the
   // shift-range anchor). `selection` = the full multi-select set (highlighting,
   // batch ops). The active item is always a member of the selection.
@@ -609,14 +582,14 @@ export default function Assets() {
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
   const anchorRef = useRef<string | null>(null); // shift-range anchor
-  const [viewMode, setViewMode] = useState<ViewMode>(loadViewMode);
+  const viewMode = useViewMode();
   // Freshly-created empty folders (persisted) — the scanner only reports files,
   // so without this an empty folder vanishes from the tree on the next rescan.
-  const [pendingFolders, setPendingFolders] = useState<Set<string>>(() => loadStringSet(LS_PENDING_FOLDERS));
+  const pendingFolders = usePendingFolders();
   const [renamingFolderPath, setRenamingFolderPath] = useState<string | null>(null);
   // Active type filter — when non-empty, only assets whose `type` is in the set
   // are shown (the chips bar). Empty = show everything.
-  const [typeFilter, setTypeFilter] = useState<Set<string>>(() => loadStringSet(LS_TYPE_FILTER));
+  const typeFilter = useTypeFilter();
   // Cut/copy clipboard + keyboard-nav helpers.
   const [clipboard, setClipboard] = useState<{ paths: string[]; op: 'copy' | 'cut' } | null>(null);
   const visiblePathsRef = useRef<string[]>([]);   // in-render-order asset paths
@@ -656,19 +629,6 @@ export default function Assets() {
     return firstFromEntries(assets) ?? '/';
   }, [assets, selected]);
 
-  // Persist view mode + expanded + pending folders across sessions.
-  useEffect(() => {
-    try { localStorage.setItem(LS_VIEW_MODE, viewMode); } catch { /* ignore */ }
-  }, [viewMode]);
-  useEffect(() => {
-    try { localStorage.setItem(LS_EXPANDED, JSON.stringify([...expanded])); } catch { /* ignore */ }
-  }, [expanded]);
-  useEffect(() => {
-    try { localStorage.setItem(LS_PENDING_FOLDERS, JSON.stringify([...pendingFolders])); } catch { /* ignore */ }
-  }, [pendingFolders]);
-  useEffect(() => {
-    try { localStorage.setItem(LS_TYPE_FILTER, JSON.stringify([...typeFilter])); } catch { /* ignore */ }
-  }, [typeFilter]);
   const selectAsset = useEditorStore((s) => s.selectAsset);
   const setSelectedAssets = useEditorStore((s) => s.setSelectedAssets);
   const selectedAsset = useEditorStore((s) => s.selectedAsset);
@@ -1283,7 +1243,7 @@ export default function Assets() {
     setRenamingFolderPath(path); // immediately editable, Finder-style
     // Builder in assetUndo.ts (#308) — setPendingFolders now only updates on success, and a
     // failure is reported instead of discarded.
-    pushAction(makeNewFolderUndo({ path, refresh, setPendingFolders }));
+    pushAction(makeNewFolderUndo({ path, refresh, setPendingFolders, setExpanded }));
   }, [assets, pendingFolders, diskFolders, refresh]);
 
   const commitFolderRename = useCallback(async (node: FolderNode, newName: string) => {
@@ -1641,7 +1601,7 @@ export default function Assets() {
             types={availableTypes}
             selected={typeFilter}
             onToggle={toggleTypeFilter}
-            onClear={() => setTypeFilter(new Set())}
+            onClear={() => setTypeFilter(() => new Set())}
             uiId="assets.toolbar.typeFilter"
           />
         )}
@@ -1832,7 +1792,7 @@ export default function Assets() {
         </span>
         {typeFilter.size > 0 && (
           <span
-            onClick={() => setTypeFilter(new Set())}
+            onClick={() => setTypeFilter(() => new Set())}
             title="A type filter is active, hiding non-matching assets — click to clear"
             data-ui-id="assets.toolbar.typeFilterBanner" data-ui-kind="button" data-ui-label="clear type filter"
             style={{ color: '#5a8ec5', cursor: 'pointer', textDecoration: 'underline' }}

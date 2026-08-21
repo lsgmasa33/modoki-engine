@@ -381,12 +381,41 @@ describe('makeEmptyFolderDeleteUndo (#308 site 2)', () => {
 describe('makeNewFolderUndo (#308 site 6)', () => {
   it('undo removes the pending folder from client state ONLY when the delete succeeds', async () => {
     const setPendingFolders = vi.fn();
+    const setExpanded = vi.fn();
     const refresh = vi.fn();
-    await makeNewFolderUndo({ path: '/assets/New Folder', refresh, setPendingFolders }).undo();
+    await makeNewFolderUndo({ path: '/assets/New Folder', refresh, setPendingFolders, setExpanded }).undo();
     expect(setPendingFolders).toHaveBeenCalledTimes(1);
     // Apply the updater the callback was given, against a set containing the folder.
     const updater = setPendingFolders.mock.calls[0][0];
     expect(updater(new Set(['/assets/New Folder']))).toEqual(new Set());
+  });
+
+  // #309: undoing a create IS a folder delete, and handleDeleteFolder prunes BOTH sets —
+  // this was the one folder-removal path that left `expanded` behind. The stale key is
+  // inert (buildFolderTree never reads `expanded`) but it is persisted to localStorage,
+  // so it accumulated there forever via create -> rename -> undo -> undo.
+  it('undo prunes the folder AND its subtree out of `expanded` too', async () => {
+    const setPendingFolders = vi.fn();
+    const setExpanded = vi.fn();
+    await makeNewFolderUndo({ path: '/assets/New Folder', refresh: vi.fn(), setPendingFolders, setExpanded }).undo();
+    expect(setExpanded).toHaveBeenCalledTimes(1);
+    const updater = setExpanded.mock.calls[0][0];
+    expect(updater(new Set([
+      '/assets',                        // an ancestor the user expanded — must survive
+      '/assets/New Folder',             // the folder itself
+      '/assets/New Folder/nested',      // anything beneath it
+      '/assets/New Folder Two',         // a SIBLING sharing the prefix — must survive
+    ]))).toEqual(new Set(['/assets', '/assets/New Folder Two']));
+  });
+
+  // Redo must NOT re-add the key: `createFolder` only ever expands the ANCESTOR chain, so
+  // restoring the folder's own key would invent state the forward path never had.
+  it('redo restores the pending folder but does not touch `expanded`', async () => {
+    const setPendingFolders = vi.fn();
+    const setExpanded = vi.fn();
+    await makeNewFolderUndo({ path: '/assets/New Folder', refresh: vi.fn(), setPendingFolders, setExpanded }).redo();
+    expect(setPendingFolders).toHaveBeenCalledTimes(1);
+    expect(setExpanded).not.toHaveBeenCalled();
   });
 
   // #308: setPendingFolders used to run unconditionally — a failed delete left the folder
@@ -395,9 +424,11 @@ describe('makeNewFolderUndo (#308 site 6)', () => {
     const error = spyConsole('error');
     failNext('/api/delete-asset', 500);
     const setPendingFolders = vi.fn();
+    const setExpanded = vi.fn();
     const refresh = vi.fn();
-    await makeNewFolderUndo({ path: '/assets/New Folder', refresh, setPendingFolders }).undo();
+    await makeNewFolderUndo({ path: '/assets/New Folder', refresh, setPendingFolders, setExpanded }).undo();
     expect(setPendingFolders).not.toHaveBeenCalled();
+    expect(setExpanded).not.toHaveBeenCalled();   // #309: the new half gates on success too
     expect(error).toHaveBeenCalledTimes(1);
     expect(String(error.mock.calls[0][0])).toContain('/assets/New Folder');
     expect(refresh).toHaveBeenCalledTimes(1);
@@ -408,7 +439,7 @@ describe('makeNewFolderUndo (#308 site 6)', () => {
     failNext('/api/create-folder', 500);
     const setPendingFolders = vi.fn();
     const refresh = vi.fn();
-    await makeNewFolderUndo({ path: '/assets/New Folder', refresh, setPendingFolders }).redo();
+    await makeNewFolderUndo({ path: '/assets/New Folder', refresh, setPendingFolders, setExpanded: vi.fn() }).redo();
     expect(setPendingFolders).not.toHaveBeenCalled();
     expect(error).toHaveBeenCalledTimes(1);
     expect(refresh).toHaveBeenCalledTimes(1);
@@ -419,7 +450,7 @@ describe('makeNewFolderUndo (#308 site 6)', () => {
   it('redo adds the folder to client state when the recreate succeeds', async () => {
     const setPendingFolders = vi.fn();
     const refresh = vi.fn();
-    await makeNewFolderUndo({ path: '/assets/New Folder', refresh, setPendingFolders }).redo();
+    await makeNewFolderUndo({ path: '/assets/New Folder', refresh, setPendingFolders, setExpanded: vi.fn() }).redo();
     expect(setPendingFolders).toHaveBeenCalledTimes(1);
     const updater = setPendingFolders.mock.calls[0][0];
     expect(updater(new Set())).toEqual(new Set(['/assets/New Folder']));

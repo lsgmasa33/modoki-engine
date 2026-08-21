@@ -327,6 +327,51 @@ build, the per-machine signing, and the expiry rule.
   launcher (e.g. `go-ios`) that bypasses Xcode's test machinery — a new toolchain dependency, so
   an owner decision rather than an agent one.
 
+- **`0xe8008012` on a device is PROFILE MEMBERSHIP, not an OS limit — do not read it as the
+  iPhone 8 case (measured 2026-08-21, iPad mini 5 / iOS 18.7.8).** Two failures present as "WDA
+  does not work on this device" and they need opposite responses, so the discriminator matters:
+
+  ```
+  Failed to install embedded profile for com.modokiengine.WebDriverAgentRunner.xctrunner :
+  0xe8008012 (This provisioning profile cannot be installed on this device.)
+  ```
+
+  That is the runner failing to INSTALL, and it means the device is absent from the profile the
+  cached WDA build was signed with. The iPhone 8's is a different line entirely (`Logic Testing
+  Unavailable`) and fails LATER, at the test-destination stage, permanently. This one is fixed in
+  one rebuild.
+
+  **Why it happens even on a device Xcode can already deploy to:** `ensureWda` CACHES the build —
+  "a present, unexpired build short-circuits with no npm and no xcodebuild" — so the embedded
+  profile is a snapshot of the devices registered *when it was built*. A device added afterwards
+  (an ordinary `-allowProvisioningUpdates` app build registers one implicitly) installs games fine
+  and is still missing from WDA's months-old profile. Measured: the build dated 2026-08-07 listed
+  **6** devices, including the Air — which is precisely why WDA had always worked there — and not
+  the iPad.
+
+  **The fix is two halves and BOTH are needed.** First, force a rebuild, which re-runs
+  `xcodebuild … -allowProvisioningUpdates` and mints a profile covering what is registered now:
+
+  ```js
+  import { install } from './engine/toolchain/index'
+  await install('webdriveragent', { toolchainDir: process.env.MODOKI_TOOLCHAIN_DIR })
+  ```
+  Back the old build up first (`mv .../16.1.1/build .../16.1.1/build.bak`) — it is the one that
+  currently works for every other device, and restoring it is the rollback. Verify the new profile
+  before trusting it, and check the devices you care about are BOTH in it:
+  ```bash
+  P=".../wda/<ver>/build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app/embedded.mobileprovision"
+  security cms -D -i "$P" | plutil -extract ProvisionedDevices raw -o - -   # count
+  security cms -D -i "$P" | grep -c "<the UDID>"                            # membership
+  ```
+  Second — and an agent **cannot** do this half — the owner must trust the developer profile
+  on-device (Settings → General → VPN & Device Management). Until then the runner installs but will
+  not launch, and the symptom is silence rather than an error.
+
+  Result on the iPad: 6 → 7 devices, both the iPad and the Air present, and a real tap returned
+  `[input:trusted-wda]` with a page-level probe recording `isTrusted: true`. `ios-ipad` is a
+  trusted-input target now (QA-INPUT-0001, run `bwlTB0Fg2WDyrFFWyUHW`).
+
 - **macOS-only, to start AND to use** — it is an `xcodebuild` run, matching
   `isInstallable('webdriveragent')`. Off macOS `ensureWdaRunning` refuses immediately, before any
   network, and iOS input from that editor is synthetic with the usual loud banner.

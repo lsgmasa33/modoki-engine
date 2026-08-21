@@ -1766,6 +1766,51 @@ guid-index gap, a different bug to chase; fifteen speculative warnings would be 
 
 ---
 
+### Undoable panel state cannot live in `useState` (#309)
+
+The sibling of the class above, and it survived #308's sweep because it is not a discarded return
+value — the call *succeeds* and still does nothing.
+
+An undo builder's closures outlive the render that created them. So a builder handed a React
+`setState` from the panel is holding a setter bound to a **fiber that may be gone**: rename folder
+`/A` → `/B`, close the Assets panel, press ⌘Z. The file genuinely moves back, and that half reports
+correctly — but `setExpanded`/`setPendingFolders` are bound to an unmounted fiber and
+**silently no-op, with no warning** (React 19 here; the setState-on-unmounted warning was dropped
+in 18 and has not returned). The mounted `useEffect` that mirrored them to `localStorage`
+never re-runs either, so the stale `/B` value survives and the next mount reads it back: a phantom
+`/B` node, or `/A` rendering collapsed when it was expanded.
+
+**The fix is to move the state out of the component, not to make the setter lookup lazier.**
+`panels/assetFolderState.ts` owns `expanded` / `pendingFolders` / `typeFilter` / `viewMode` at
+module scope, persists on every mutation, and is read through `useSyncExternalStore`. An undo
+closure then holds a **stable module function**, so it is unmount-safe by construction rather than
+by discipline.
+
+⚠️ **`assetViews/persist.ts`'s `_assetViewSetters` registry does NOT transfer here**, and the
+difference is the whole reason a second mechanism exists. There the FILE + CACHE are the source of
+truth and the registered setter is only a live refresh for a panel that happens to be mounted — with
+none registered the write still lands and a later re-select re-reads from disk. Folder-tree state has
+no file: **the sets ARE the truth**, so a registry with nothing in it drops the update and leaves
+`localStorage` stale, i.e. the bug unchanged. Pick by asking *what is the source of truth* — a
+setter registry when it is the file, a store when it is the state itself.
+
+**What is NOT affected, and why it is worth knowing.** Every other Assets undo builder receives
+`refresh`, which is also panel-bound and also no-ops after unmount — harmlessly, because
+`Assets.tsx`'s mount effect calls `refresh()` and re-derives the listing from disk. `useExpandedSet`
+(the read-only Engine + Scripts trees) has the same `useState`-plus-mounted-persist shape and is
+also safe: no undo builder touches those trees. **The shape alone is not the defect** — it needs
+state that is its own source of truth AND a closure that outlives the panel.
+
+Undoing a folder *create* is a folder *delete*, so it prunes both sets, matching
+`handleDeleteFolder`. `makeNewFolderUndo` pruned only `pendingFolders` until #309: the forward
+`createFolder` never adds the new folder's own key to `expanded` (only its ancestor chain, so the
+inline rename input can mount), but `commitFolderRename` does (`.add(newPath)`) — so
+create → rename → undo → undo left a key for a folder that no longer exists. Inert, because
+`buildFolderTree` builds nodes from `pendingFolders`/`diskFolders`/assets and never from `expanded`
+— but persisted, so it accumulated forever. Redo deliberately does not re-add it: the forward path
+never put it there.
+
+
 ## Quick reference
 
 | Concern | Where |

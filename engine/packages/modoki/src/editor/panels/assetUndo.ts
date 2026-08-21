@@ -235,19 +235,33 @@ export function makeEmptyFolderDeleteUndo(params: {
  *  re-verification, not in the original issue text). `setPendingFolders` only runs on
  *  success: an unconditional update here would desync the client's folder tree from disk
  *  exactly like `commitFolderRename`'s bug (below) — the folder would appear/vanish in the
- *  panel while the filesystem disagreed. */
+ *  panel while the filesystem disagreed.
+ *
+ *  #309: undo prunes `expanded` as well, because UNDOING A CREATE IS A FOLDER DELETE and
+ *  `handleDeleteFolder` prunes both sets — this was the one folder-removal path that did not.
+ *  Redo deliberately does NOT re-add the key: the forward `createFolder` never put it there.
+ *  Full reasoning: docs/editor.md § "Undoable panel state cannot live in useState". */
 export function makeNewFolderUndo(params: {
   path: string;
   refresh: () => void;
   setPendingFolders: (updater: (prev: Set<string>) => Set<string>) => void;
+  setExpanded: (updater: (prev: Set<string>) => Set<string>) => void;
 }): UndoAction {
-  const { path, refresh, setPendingFolders } = params;
+  const { path, refresh, setPendingFolders, setExpanded } = params;
   const label = 'New Folder';
+  // Drop the folder's own key AND anything beneath it — same shape as handleDeleteFolder's
+  // `prune`. A freshly-created folder is empty, so the subtree case is defensive rather than
+  // reachable today; it costs nothing and stops this diverging from the delete path again.
+  const prune = (set: Set<string>) => {
+    const n = new Set<string>();
+    for (const x of set) if (x !== path && !x.startsWith(path + '/')) n.add(x);
+    return n;
+  };
   return {
     label,
     undo: async () => {
       const ok = await deleteAssetFile(path);
-      if (ok) setPendingFolders((p) => { const n = new Set(p); n.delete(path); return n; });
+      if (ok) { setPendingFolders(prune); setExpanded(prune); }
       else reportUndoFailure({ direction: 'Undo', label, detail: `folder "${path}" still exists on disk` });
       refresh();
     },
