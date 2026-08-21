@@ -130,6 +130,25 @@ removes nothing" below for the two that were not, and why they are gone rather t
   - **And do not memoise the REJECTION.** A failed chunk fetch stored in the memo leaves every
     later load rejecting for the life of the page, recoverable only by a reload. Each accessor
     clears its slot in a `.catch` — the rule `textureResolver`'s texture cache already states.
+  - **It also moved every loader call in the TEST suite behind an await, and a fixed task hop is
+    not a wait.** `.load()` used to run synchronously; it now lands after the on-demand import
+    resolves, so tests grew a `flushLoaderImport()` — one `setTimeout(0)`, which drains microtask
+    chains but NOT a real I/O hop. `vi.resetModules()` per test forces a genuine re-resolve of
+    `GLTFLoader.js`, and on the Windows CI leg that outran the hop: two tests that park hanging
+    loads on a `GLTFLoader.prototype` spy restored the spy early, and their 7 pending `.load`
+    calls landed on the NEXT test's spy — `expected 8 to be 1`, on a docs-only commit
+    (`32458507466`). The tests now `await waitForLoaderImport()`, which waits on
+    `makeGltfLoader()` itself and then flushes. **Deliberately count-free**: waiting for "N calls
+    to land" reintroduces the bug the moment a test grows an N+1th load, and it lets a `toBe(1)`
+    assertion pass with a second load still in flight — both reproduced before choosing this
+    shape. ⚠️ **Wait on `makeGltfLoader()`, not on `gltfLoaderCtor()`** — the first attempt did
+    the latter and went red on the very next `npm run verify`: `makeGltfLoader` is
+    `Promise.all([gltfLoaderCtor(), meshoptDecoder()])`, TWO independent on-demand imports, and
+    the second can land after the first. It hid from a perturbation that delayed every accessor
+    by the SAME amount (symmetric delays resolve in one microtask batch) and only showed up once
+    the meshopt import was delayed *more* than the GLTF one. Wait on exactly what the code
+    awaits. Same caveat one layer up: if that chain ever grows a timer, this needs a real
+    condition again.
     ⚠️ Do NOT dry these up into a shared `lazyOnce(() => import(…))`: that captures the
     `import()` in a module-scope arrow Rolldown can no longer prove unreachable, the gate stops
     folding, and every chunk comes back. The repetition buys the DCE.

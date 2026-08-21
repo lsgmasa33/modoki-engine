@@ -23,7 +23,7 @@ import {
   loadModelTemplates, getTemplatesForModel, getModelHierarchy, disposeAllCachedResources,
 } from '../../src/runtime/loaders/meshTemplateCache';
 import { offerParsedGltf, hasPendingGltf } from '../../src/runtime/loaders/parsedGltfHandoff';
-import { flushLoaderImport } from '../helpers/flushLoaderImport';
+import { waitForLoaderImport } from '../helpers/flushLoaderImport';
 
 function makeStaticScene(meshName: string) {
   const scene = new THREE.Group();
@@ -52,10 +52,11 @@ describe('loadModelTemplates — parsed-GLB handoff (F4)', () => {
 
   it('parses via GLTFLoader when nothing was offered (runtime scene-load path unchanged)', async () => {
     // No offer → the loader is invoked (the mock never resolves, so don't await the load
-    // itself). The loader module is imported on demand (#254), so the `.load` call lands a
-    // microtask later than it used to — flush before asserting, don't assert synchronously.
+    // itself). The loader module is imported on demand (#254), so the `.load` call lands
+    // asynchronously — wait for that import to settle, since a slow one outruns a fixed task
+    // hop. Count-free: a `>= 1` wait would let `toBe(1)` pass with a second load in flight.
     void loadModelTemplates('/models/runtime.glb', undefined, 'none', false);
-    await flushLoaderImport();
+    await waitForLoaderImport();
     expect(loadSpy.count).toBe(1);
     expect(hasPendingGltf('/models/runtime.glb')).toBe(false);
   });
@@ -63,7 +64,7 @@ describe('loadModelTemplates — parsed-GLB handoff (F4)', () => {
   it('an offer for a different path does not satisfy this load', async () => {
     offerParsedGltf('/models/other.glb', { scene: makeStaticScene('X'), animations: [] });
     void loadModelTemplates('/models/wanted.glb', undefined, 'none', false);
-    await flushLoaderImport();
+    await waitForLoaderImport();
     expect(loadSpy.count).toBe(1);                       // mismatched path → real parse
     expect(hasPendingGltf('/models/other.glb')).toBe(true); // the other offer is untouched
   });
