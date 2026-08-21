@@ -63,3 +63,26 @@ describe('discoverScenes', () => {
     ])).toHaveLength(1);
   });
 });
+
+describe('discoverScenes ordering', () => {
+  // getAllAssets() returns the manifest map in INSERTION order, so a scene created during
+  // the session is appended and would render LAST in the picker, then move on the next
+  // reload. Same defect the sprite picker had (spritePickerGroups.sortGroupsByName).
+  it('sorts manifest-discovered scenes by label, not by manifest order', () => {
+    assets.push(
+      { guid: 'g-z', path: '/assets/scenes/zebra.scene.json', type: 'scene' },
+      { guid: 'g-a', path: '/assets/scenes/alpha.scene.json', type: 'scene' },
+      { guid: 'g-m', path: '/assets/scenes/Mid.scene.json', type: 'scene' },
+    );
+    expect(discoverScenes([]).map((o) => o.value)).toEqual(['g-a', 'g-m', 'g-z']);
+  });
+
+  it('leaves the caller-supplied boot options ahead of discovered scenes, in their own order', () => {
+    assets.push({ guid: 'g-a', path: '/assets/scenes/alpha.scene.json', type: 'scene' });
+    const out = discoverScenes([
+      { value: 'g-zzz', label: 'zzz boot' },
+      { value: 'g-aaa', label: 'aaa boot' },
+    ]);
+    expect(out.map((o) => o.value)).toEqual(['g-zzz', 'g-aaa', 'g-a']);
+  });
+});

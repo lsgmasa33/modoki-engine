@@ -15,10 +15,13 @@
  *  (makeTexture2D.ts); anything else spriteless just points at the Inspector.
  *
  *  That section is COLLAPSED by default and, expanded, filtered + capped at 30 rows
- *  (`filterSpriteless`, spritelessTextures.ts) — a 3D-heavy project has 100+ of
- *  these (measured: `demos/forest-camp` 130, `games/court` ~395, `games/3d-test`
- *  ~147), and an always-expanded list at that size would bury the sliced-sprite
- *  groups this popup exists to show. Dev-only (editor). */
+ *  (`filterSpriteless`, spritelessTextures.ts): in a 3D project essentially EVERY
+ *  texture is spriteless, because GLB material maps are `3d` by definition —
+ *  measured off the live manifest, `demos/forest-camp` is 22 of 22 and
+ *  `games/3d-test` 22 of 24, against `games/court` at 1 of 60. ~22 rows already
+ *  overflow this 350px popup and push the sprite groups out of view, which is what
+ *  the collapse is for; the 30-cap is a guard for a bigger project, not a routine
+ *  trim. Dev-only (editor). */
 
 import { useState, useRef } from 'react';
 import { useOverlayEscape } from '../input/useOverlayEscape';
@@ -26,7 +29,7 @@ import type { AssetEntry } from '../../runtime/loaders/assetManifest';
 import { resolveGuidToPath } from '../../runtime/loaders/assetManifest';
 import { assetDisplayName } from './AssetRefField';
 import { inputStyle } from './fields';
-import { groupSpritesByTexture } from './spritePickerGroups';
+import { groupSpritesByTexture, sortGroupsByName } from './spritePickerGroups';
 import { spritelessTextures, filterSpriteless } from './spritelessTextures';
 import { makeTexture2D, textureRefCount } from './makeTexture2D';
 import { useEditorStore } from '../store/editorStore';
@@ -154,47 +157,14 @@ export function SpritePicker({ anchor, assets, onPick, onClear, onClose }: {
           <button onClick={onClear} style={clearBtn} title="Clear the reference">Clear</button>
         </div>
 
-        {/* The slicing hint shows whenever there are no sprite GROUPS — not only when
-            there is nothing at all. A 3D-heavy project has zero groups AND a long
-            spriteless list, and gating on both left that case with only the amber row,
-            dropping the one pointer to the Sprite Editor for the case it was written for. */}
-        {groups.size === 0 ? (
-          <div style={{ color: '#777', padding: '8px 4px', lineHeight: 1.5 }}>
-            No sliced sprites yet. Select a texture in the Assets panel → Inspector → <b>Sprite Editor</b> to slice it.
-          </div>
-        ) : (
-          [...groups.entries()].map(([texGuid, g]) => {
-            const texPath = resolveGuidToPath(texGuid);
-            return (
-            <div key={texGuid} style={{ marginBottom: 6 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#9ad', margin: '2px 0' }}>
-                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {texPath ? assetDisplayName(texPath) : texGuid.slice(0, 8)}
-                </span>
-                {g.wholeGuid && (
-                  <button onClick={() => onPick(g.wholeGuid!)} style={wholeBtn} title="Assign the whole-image sprite">whole</button>
-                )}
-              </div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                {g.sprites.map((s) => (
-                  <div
-                    key={s.guid}
-                    onClick={() => onPick(s.guid!)}
-                    title={`${s.sprite!.name ?? ''}  ${s.sprite!.rect.w}×${s.sprite!.rect.h}`}
-                    style={{ cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1, width: BOX_W }}
-                  >
-                    <div style={spriteThumbStyle(texPath, s.sprite!.rect, s.sprite!.sheetW, s.sprite!.sheetH)} />
-                    <span style={{ width: BOX_W, fontSize: 9, color: '#aaa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'center' }}>{s.sprite!.name ?? '—'}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-            );
-          })
-        )}
-
+        {/* The spriteless section sits ABOVE the groups, and that placement is the point.
+            Collapsed it costs ONE line, while at the bottom it was unreachable in exactly the
+            project a confused user is in: measured on games/court, the popup's content is
+            4174px tall against 348px visible, so the row explaining why a texture has no
+            sprite sat ~4100px below the fold, behind 59 sprite groups. An explanation nobody
+            scrolls to is not an explanation. */}
         {spriteless.length > 0 && (
-          <div style={{ marginTop: groups.size > 0 ? 6 : 0 }}>
+          <div style={{ marginBottom: 6 }}>
             <button
               onClick={() => setShowSpriteless((v) => !v)}
               data-ui-id="spritePicker.spritelessToggle"
@@ -205,7 +175,7 @@ export function SpritePicker({ anchor, assets, onPick, onClear, onClose }: {
                 display: 'block', fontFamily: 'monospace',
               }}
             >
-              {showSpriteless ? '▾' : '▸'} {spriteless.length} texture{spriteless.length === 1 ? '' : 's'} have no sprite
+              {showSpriteless ? '▾' : '▸'} {spriteless.length === 1 ? '1 texture has' : `${spriteless.length} textures have`} no sprite
             </button>
 
             {showSpriteless && (
@@ -270,6 +240,49 @@ export function SpritePicker({ anchor, assets, onPick, onClear, onClose }: {
             )}
           </div>
         )}
+
+        {/* The slicing hint shows whenever there are no sprite GROUPS — not only when
+            there is nothing at all. A 3D-heavy project has zero groups AND a long
+            spriteless list, and gating on both left that case with only the amber row,
+            dropping the one pointer to the Sprite Editor for the case it was written for. */}
+        {groups.size === 0 ? (
+          <div style={{ color: '#777', padding: '8px 4px', lineHeight: 1.5 }}>
+            No sliced sprites yet. Select a texture in the Assets panel → Inspector → <b>Sprite Editor</b> to slice it.
+          </div>
+        ) : (
+          sortGroupsByName(groups, (texGuid) => {
+            const p = resolveGuidToPath(texGuid);
+            return p ? assetDisplayName(p) : undefined;
+          }).map(([texGuid, g]) => {
+            const texPath = resolveGuidToPath(texGuid);
+            return (
+            <div key={texGuid} style={{ marginBottom: 6 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#9ad', margin: '2px 0' }}>
+                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {texPath ? assetDisplayName(texPath) : texGuid.slice(0, 8)}
+                </span>
+                {g.wholeGuid && (
+                  <button onClick={() => onPick(g.wholeGuid!)} style={wholeBtn} title="Assign the whole-image sprite">whole</button>
+                )}
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                {g.sprites.map((s) => (
+                  <div
+                    key={s.guid}
+                    onClick={() => onPick(s.guid!)}
+                    title={`${s.sprite!.name ?? ''}  ${s.sprite!.rect.w}×${s.sprite!.rect.h}`}
+                    style={{ cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1, width: BOX_W }}
+                  >
+                    <div style={spriteThumbStyle(texPath, s.sprite!.rect, s.sprite!.sheetW, s.sprite!.sheetH)} />
+                    <span style={{ width: BOX_W, fontSize: 9, color: '#aaa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'center' }}>{s.sprite!.name ?? '—'}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            );
+          })
+        )}
+
       </div>
     </div>
   );

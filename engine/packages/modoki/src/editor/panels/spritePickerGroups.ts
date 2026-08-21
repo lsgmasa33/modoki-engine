@@ -67,3 +67,36 @@ export function groupSpritesByTexture(assets: AssetEntry[]): Map<string, SpriteT
   }
   return out;
 }
+
+/** Order the picker's texture groups by DISPLAY NAME — pure, so the ordering rule is
+ *  testable without mounting the panel. `nameOf` resolves a texture guid to the label
+ *  the picker shows (guid → path → basename); groups whose name will not resolve sort
+ *  last, in their existing order, rather than jumping the queue with an empty string.
+ *
+ *  ⚠️ Why this is not "already sorted". `groupSpritesByTexture` walks `getAllAssets()`,
+ *  which returns `guidToEntry` in **Map INSERTION order**. On a full editor reload the
+ *  manifest is registered in scan order, which is alphabetical, so the picker LOOKS
+ *  sorted and nothing suggests an ordering rule is missing. But a live manifest update
+ *  re-registers an existing guid in place and APPENDS a new one — so a texture the user
+ *  just imported or converted lands at the very END of a 60-group list, roughly 4000px
+ *  below the fold in a 350px popup. Reported from a live editor as "I see it but it's at
+ *  the end of list", after first reading as the sprite being missing entirely — the
+ *  reload that seemed to "fix" it was really just re-sorting it back into place.
+ *
+ *  So the picker must not inherit map order: where a texture appears cannot depend on
+ *  whether you have reloaded since importing it. */
+export function sortGroupsByName<T>(
+  groups: Map<string, T>,
+  nameOf: (texGuid: string) => string | undefined,
+): Array<[string, T]> {
+  return [...groups.entries()]
+    .map((entry, index) => ({ entry, index, name: nameOf(entry[0]) }))
+    .sort((a, b) => {
+      if (a.name === undefined && b.name === undefined) return a.index - b.index;
+      if (a.name === undefined) return 1;
+      if (b.name === undefined) return -1;
+      const byName = a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+      return byName !== 0 ? byName : a.index - b.index;
+    })
+    .map((x) => x.entry);
+}

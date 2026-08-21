@@ -34,11 +34,19 @@ export function listShaderOptions(): ShaderOption[] {
   for (const name of getRegisteredShaderNames()) {
     opts.push({ label: name, value: name, kind: 'code' });
   }
+  // Sorted by label, NOT left in manifest order. `getAllAssets()` returns `guidToEntry`
+  // in Map INSERTION order, so a shader authored during the session is appended and
+  // renders LAST in this dropdown — then jumps into place on the next reload. Same
+  // defect the sprite picker had (see spritePickerGroups.sortGroupsByName). The two
+  // builtins keep their deliberate lead position; only the file shaders are sorted.
+  const files: ShaderOption[] = [];
   for (const asset of getAllAssets()) {
     if (asset.type === 'shader') {
-      opts.push({ label: labelFromPath(asset.path), value: asset.guid, kind: 'file' });
+      files.push({ label: labelFromPath(asset.path), value: asset.guid, kind: 'file' });
     }
   }
+  files.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }));
+  opts.push(...files);
   return opts;
 }
 

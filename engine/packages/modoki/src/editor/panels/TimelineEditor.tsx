@@ -40,6 +40,13 @@ import ClipTrackView from './timeline/ClipTrackView';
 import ItemInspector from './timeline/ItemInspector';
 import { withAddedItem, withMovedItem, withUpdatedItem, withDeletedItem, itemCount, type TrackItemPatch } from './timeline/itemEdit';
 
+/** Order a picker list by label. `getAllAssets()` returns the manifest map in INSERTION
+ *  order, so an asset imported during the session is appended and shows up LAST in a
+ *  dropdown, then moves on the next reload. Same defect the sprite picker had — see
+ *  `sortGroupsByName` in spritePickerGroups.ts. */
+const byLabel = <T extends { label: string }>(xs: T[]): T[] =>
+  [...xs].sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }));
+
 const COALESCE_MS = 500;
 const TRACK_LIST_W = 190;
 const INSPECTOR_W = 232; // default; user-resizable (persisted) — see inspectorW state
@@ -320,8 +327,10 @@ export default function TimelineEditor() {
   const assetsVersion = useEditorStore((s) => s.assetsVersion);
   const pickers = useMemo(
     () => ({
-      audioAssets: getAllAssets().filter((a) => a.type === 'audio').map((a) => ({ guid: a.guid, label: a.path.split('/').pop() ?? a.guid })),
-      prefabAssets: getAllAssets().filter((a) => a.type === 'prefab').map((a) => ({ guid: a.guid, label: a.path.split('/').pop() ?? a.guid })),
+      // Sorted by label: `getAllAssets()` is Map INSERTION order, so an asset imported
+      // during the session lands last in these dropdowns until the next reload.
+      audioAssets: byLabel(getAllAssets().filter((a) => a.type === 'audio').map((a) => ({ guid: a.guid, label: a.path.split('/').pop() ?? a.guid }))),
+      prefabAssets: byLabel(getAllAssets().filter((a) => a.type === 'prefab').map((a) => ({ guid: a.guid, label: a.path.split('/').pop() ?? a.guid }))),
       actionNames: getUIActionNames(),
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps

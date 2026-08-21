@@ -374,6 +374,30 @@ called fresh on each open (`discoverScenes` in `SceneListEditor.tsx` — deliber
 unmemoized, documented as such) and a one-shot read at boot (`createEditor()`) need
 nothing. The rule bites *memoized* or *render-time* reads inside a long-lived panel.
 
+### A list built from `getAllAssets()` must be SORTED, not left in map order
+
+`getAllAssets()` returns `guidToEntry` in **Map insertion order**, and `registerAsset`
+re-registers an existing guid in place while appending a new one. So anything imported or
+converted *during a session* goes to the END of any list derived from it — and jumps into
+position on the next reload, because a fresh boot registers the manifest in scan order.
+
+That reload is what makes this expensive: the list looks correctly ordered every time you
+go looking, so nothing suggests an ordering rule is missing. It was reported as
+*"I see it but it's at the end of list"* only after first reading as the asset being
+missing from the picker entirely (#293 follow-up), and the reload that appeared to fix it
+was really just re-sorting the entry back into place — which sent one session hunting a
+manifest-propagation bug that did not exist.
+
+Sorted as of that sweep: the **SpritePicker**'s texture groups (`sortGroupsByName` in
+`spritePickerGroups.ts` — pure and unit-tested), the **shader** dropdown
+(`shaderCatalog.ts`, built-ins keep their deliberate lead), the **scene** picker
+(`SceneListEditor.discoverScenes`, with the host's boot options left in caller order), and
+the **Timeline Editor**'s audio/prefab value pickers. `FontPicker` already sorted by family
+— it is the one that shows the rule was known.
+
+The test to apply to a new list: *would an asset created five minutes ago appear where the
+user expects, without reloading?* Position must not depend on when the entry was registered.
+
 ### Where a panel's LOGIC belongs (and what is tested)
 
 A panel `.tsx` holds JSX, hooks and imperative wiring. **Its decisions belong in a

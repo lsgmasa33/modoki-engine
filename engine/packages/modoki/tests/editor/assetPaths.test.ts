@@ -17,9 +17,29 @@ describe('splitAssetPath', () => {
     expect(splitAssetPath('/a/b/tree.glb')).toEqual({ dir: '/a/b', base: 'tree', ext: '.glb' });
   });
 
-  it('keeps compound extensions intact (splits on the FIRST dot)', () => {
+  it('keeps a KNOWN compound extension intact', () => {
     expect(splitAssetPath('/a/weed.prefab.json')).toEqual({ dir: '/a', base: 'weed', ext: '.prefab.json' });
     expect(splitAssetPath('/a/m.mat.json')).toEqual({ dir: '/a', base: 'm', ext: '.mat.json' });
+    expect(splitAssetPath('/a/moge.scene.json')).toEqual({ dir: '/a', base: 'moge', ext: '.scene.json' });
+    // sidecars are not asset kinds, so they are not in the classifier's list — listed separately
+    expect(splitAssetPath('/a/x.png.meta.json')).toEqual({ dir: '/a', base: 'x.png', ext: '.meta.json' });
+  });
+
+  // An ORDINARY dot is part of the name, not the start of the extension. This is the
+  // reported bug: macOS screenshots are named `... 11.35.37 AM.png`, and the first-dot
+  // rule made the rename box offer only `Screenshot 2026-08-20 at 11` — renaming to
+  // "Test" produced `Test.35.37 AM.png`, with the timestamp welded on unremovably.
+  it('splits only the LAST extension when the name merely contains dots', () => {
+    expect(splitAssetPath('/a/Screenshot 2026-08-20 at 11.35.37 AM.png'))
+      .toEqual({ dir: '/a', base: 'Screenshot 2026-08-20 at 11.35.37 AM', ext: '.png' });
+    expect(splitAssetPath('/a/v1.2.glb')).toEqual({ dir: '/a', base: 'v1.2', ext: '.glb' });
+    // a known compound extension still wins, with the extra dots left on the base
+    expect(splitAssetPath('/a/Level.1.court.json')).toEqual({ dir: '/a', base: 'Level.1', ext: '.court.json' });
+  });
+
+  // Duplicate/paste naming shares the split, so the bug reached copy names too.
+  it('names a copy of a dotted file without swallowing the dots', () => {
+    expect(duplicatePathFor('/a/v1.2.glb', new Set(['/a/v1.2.glb']))).toBe('/a/v1.2 copy.glb');
   });
 
   it('handles no extension and no directory', () => {
@@ -36,7 +56,10 @@ describe('splitAssetPath', () => {
   });
 
   it('handles multi-dot and trailing-dot names', () => {
-    expect(splitAssetPath('/a/foo.bar.baz')).toEqual({ dir: '/a', base: 'foo', ext: '.bar.baz' });
+    // Was `base:'foo', ext:'.bar.baz'` under the first-dot rule. That expectation was
+    // wrong, not merely different: `.bar.baz` is not a known compound extension, so
+    // `.bar` is part of the user's filename and must stay editable.
+    expect(splitAssetPath('/a/foo.bar.baz')).toEqual({ dir: '/a', base: 'foo.bar', ext: '.baz' });
     expect(splitAssetPath('/a/foo.')).toEqual({ dir: '/a', base: 'foo', ext: '.' });
   });
 

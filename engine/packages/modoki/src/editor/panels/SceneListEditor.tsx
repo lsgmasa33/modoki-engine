@@ -32,11 +32,18 @@ export function discoverScenes(options: Option[]): Option[] {
   const out: Option[] = [];
   const seen = new Set<string>();
   for (const o of options) { if (!seen.has(o.value)) { seen.add(o.value); out.push(o); } }
+  // Manifest-derived scenes are sorted by label. `getAllAssets()` returns Map INSERTION
+  // order, so a scene created during the session would otherwise land at the END of this
+  // list and move on the next reload. The boot-time `options` keep their caller-supplied
+  // order ahead of these — they are the host's own list, not ours to reorder.
+  const discovered: Option[] = [];
   for (const a of getAllAssets()) {
     if (a.type !== 'scene' || !a.guid || seen.has(a.guid)) continue;
     seen.add(a.guid);
-    out.push({ value: a.guid, label: a.path.split('/').pop() || a.path });
+    discovered.push({ value: a.guid, label: a.path.split('/').pop() || a.path });
   }
+  discovered.sort((x, y) => x.label.localeCompare(y.label, undefined, { sensitivity: 'base' }));
+  out.push(...discovered);
   return out;
 }
 

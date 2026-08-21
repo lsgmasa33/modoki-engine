@@ -47,9 +47,10 @@ export async function makeTexture2D(path: string): Promise<boolean> {
   // Carry the authored knobs that are NOT derived from the type. `changeType` in
   // TextureAssetView resets the whole codec block, and that is right THERE — the user is
   // looking at the texture's own settings in the Inspector and can see what moved. Here the
-  // click comes from a list of every spriteless texture in the project (130 of them in
-  // `demos/forest-camp`), so the same wholesale reset silently destroys authored intent on
-  // whatever was clicked: a normal map's `colorspace:'linear'` forced back to `'srgb'` is
+  // click comes from a list of every spriteless texture in the project — which in a 3D
+  // project is the whole texture set (`demos/forest-camp`: 22 of 22, all GLB material maps)
+  // — so the same wholesale reset silently destroys authored intent on whatever was
+  // clicked: a normal map's `colorspace:'linear'` forced back to `'srgb'` is
   // gamma-decoded data — wrong lighting, no error. `flipY`/`flipGreen`/`maxSize` and the
   // encoder knobs are likewise orthogonal to 2d-vs-3d, so they ride along.
   //
@@ -82,7 +83,8 @@ export async function makeTexture2D(path: string): Promise<boolean> {
  *  Used to qualify the SpritePicker's "Make 2D" confirm: converting a texture a 3D
  *  material samples is what makes the button destructive, and `/api/find-references`
  *  already computes the reverse reference graph the Find References dialog renders. One
- *  call for the ONE armed row — never for the whole list, which routinely runs to 130+.
+ *  call for the ONE armed row — never for the whole list, which in a 3D project is every
+ *  texture the project has.
  *
  *  `null` is deliberately distinct from `0`: "unused" is a claim strong enough to make a
  *  user click through, and a failed lookup must not be able to make it. The caller shows

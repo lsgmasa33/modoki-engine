@@ -8,7 +8,7 @@
  *  it into "never offer the shortcut at all". */
 
 import { describe, it, expect } from 'vitest';
-import { groupSpritesByTexture, wholeImageSpriteGuid, wholeImageSpriteRef } from '../../src/editor/panels/spritePickerGroups';
+import { groupSpritesByTexture, wholeImageSpriteGuid, wholeImageSpriteRef, sortGroupsByName } from '../../src/editor/panels/spritePickerGroups';
 import type { AssetEntry } from '../../src/runtime/loaders/assetManifest';
 
 const TEX = 'aaaaaaaa-1111-4111-8111-111111111111';
@@ -62,5 +62,38 @@ describe('wholeImageSpriteRef', () => {
   it('is undefined for a sliced sheet — the caller must NOT fall back to the texture guid', () => {
     // Returning the texture guid instead would trade a dead ref for a sprites-only violation.
     expect(wholeImageSpriteRef(TEX, () => undefined)).toBeUndefined();
+  });
+});
+
+describe('sortGroupsByName', () => {
+  const g = (n: number) => ({ sprites: [], wholeGuid: undefined, tag: n });
+
+  it('orders groups by display name, not by map insertion order', () => {
+    // Insertion order here is what a LIVE manifest update produces: existing guids keep
+    // their slot and the newly imported one is appended last. Without sorting, "atest"
+    // renders at the bottom of the picker.
+    const groups = new Map([['t-wall', g(1)], ['t-bishop', g(2)], ['t-atest', g(3)]]);
+    const names: Record<string, string> = { 't-wall': 'wall', 't-bishop': 'bishop', 't-atest': 'atest' };
+    expect(sortGroupsByName(groups, (k) => names[k]).map(([k]) => k))
+      .toEqual(['t-atest', 't-bishop', 't-wall']);
+  });
+
+  it('is case-insensitive, so a capitalised import does not sort into its own block', () => {
+    const groups = new Map([['a', g(1)], ['b', g(2)], ['c', g(3)]]);
+    const names: Record<string, string> = { a: 'Zebra', b: 'apple', c: 'Banana' };
+    expect(sortGroupsByName(groups, (k) => names[k]).map(([k]) => k)).toEqual(['b', 'c', 'a']);
+  });
+
+  // An unresolvable name is rendered by the picker as a guid prefix. Sorting it as ''
+  // would float it to the TOP, which is the opposite of what it deserves.
+  it('sorts unresolvable names last, keeping their relative order', () => {
+    const groups = new Map([['x', g(1)], ['named', g(2)], ['y', g(3)]]);
+    const names: Record<string, string | undefined> = { x: undefined, named: 'mid', y: undefined };
+    expect(sortGroupsByName(groups, (k) => names[k]).map(([k]) => k)).toEqual(['named', 'x', 'y']);
+  });
+
+  it('is stable for equal names', () => {
+    const groups = new Map([['first', g(1)], ['second', g(2)]]);
+    expect(sortGroupsByName(groups, () => 'same').map(([k]) => k)).toEqual(['first', 'second']);
   });
 });

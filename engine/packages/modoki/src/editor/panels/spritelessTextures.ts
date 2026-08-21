@@ -12,12 +12,16 @@
  *  surface them instead of staying silent. Kept pure and free of React so it is
  *  testable without mounting a panel — this repo's stated convention.
  *
- *  The list can be LARGE: a 3D-heavy project has 100+ spriteless textures, e.g.
- *  `demos/forest-camp` (130 images, none typed 2d/ui) or `games/court` (~395) —
- *  measured counts, not a guess. That is why the picker's "NO SPRITE YET" section
- *  is collapsed by default and, when expanded, filtered + capped via
- *  `filterSpriteless` below rather than listing every row: an always-expanded list
- *  would bury the sliced-sprite groups the picker exists for. */
+ *  In a 3D project this is essentially the WHOLE texture set, because a GLB's
+ *  material maps import as `3d` by definition. Measured off the live manifest
+ *  (`/api/rescan-assets`): `demos/forest-camp` 22 of 22 textures — it has no sprite
+ *  groups at all — `games/3d-test` 22 of 24, against `games/court` at 1 of 60 (59
+ *  explicitly `ui`). ~22 rows already overflow the picker's 350px popup, which is why
+ *  the section is collapsed and `filterSpriteless` below caps it.
+ *
+ *  ⚠️ Count texture ASSETS, not image FILES. `find`-counting `*.png` gave 130/~395/~147
+ *  for those same three projects and every figure was wrong — Court has 454 image files
+ *  and 60 texture assets. Ask the manifest. */
 
 import type { AssetEntry } from '../../runtime/loaders/assetManifest';
 import type { TextureType } from '../../runtime/loaders/textureSettings';
@@ -54,10 +58,10 @@ export function spritelessTextures(assets: AssetEntry[]): SpritelessTexture[] {
 
 /** Filter + cap a spriteless list for display — pulled out of SpritePicker so the
  *  decision (case-insensitive substring match, how many rows to show) is testable
- *  without mounting the panel. A 3D-heavy project has FAR more spriteless textures
- *  than a picker popup can show a row per: `demos/forest-camp` has 130 images and
- *  ZERO typed 2d/ui (all default to 3d), `games/court` ~395, `games/3d-test` ~147 —
- *  measured counts that are the reason this caps rather than lists everything. */
+ *  without mounting the panel. The cap exists because a 3D project's spriteless set is
+ *  its whole texture set (`demos/forest-camp` 22 of 22, `games/3d-test` 22 of 24), and
+ *  ~22 rows already overflow the 350px popup. At those sizes the cap rarely fires — it
+ *  is a guard for a larger project, and the FILTER is what makes the list usable. */
 export function filterSpriteless(
   list: SpritelessTexture[],
   query: string,

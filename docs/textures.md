@@ -437,8 +437,17 @@ pixels a device downloads and uploads.
   authored knobs that are NOT type-derived (`colorspace`, `flipY`, `flipGreen`, `maxSize`, the
   encoder settings) rather than resetting the whole block the way `changeType` does — forcing a
   normal map's `colorspace:'linear'` back to `'srgb'` is gamma-decoded data, i.e. wrong lighting
-  with nothing to see. The section is collapsed and capped because it is LONG in exactly the
-  projects that hit this: `demos/forest-camp` has 130 image assets and zero typed `2d`/`ui`.
+  with nothing to see.
+  **Measured, per the live manifest** (`/api/rescan-assets`, 2026-08-21) — a 3D project's texture
+  set is essentially ALL spriteless, because GLB-imported material maps are `3d` by definition:
+  `demos/forest-camp` 22 of 22 textures (zero sprite groups at all), `games/3d-test` 22 of 24,
+  against `games/court` at 1 of 60 (59 are explicitly `ui`). That is why the section is collapsed
+  — ~22 rows overflow the 350px popup and push the sprite groups out of view — and why the 30-row
+  cap is a guard for a larger project rather than something that fires routinely.
+  ⚠️ **Count texture ASSETS, not image FILES.** An earlier revision of this bullet claimed 130 /
+  ~395 / ~147 from `find`-counting `*.png`; the scanner registers far fewer as texture assets
+  (Court: 454 files, 60 textures), so those figures were wrong by up to two orders of magnitude.
+  Ask the manifest.
 - **DOM image refs** (`UIElement.imageSrc` in `UINode.tsx`) MUST resolve via
   `resolveDomImageUrl` → `resolveBrowserImageUrl` (the WebP/PNG browser
   sibling), **not** `resolveImageUrl` / `resolveTextureVariantUrl(ref, '2d')`
