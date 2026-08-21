@@ -115,6 +115,38 @@ describe('instantiatePrefabIntoWorld — nested prefabs', () => {
     expect(I1.rootInstanceId).not.toBe(outerRoot);
   });
 
+  // #250: the entry resolver addresses members by NAME PATH, and the One case (Court's page
+  // holding 25 nested tile instances) makes that path cross a prefab boundary. The walker's
+  // premise is that `EntityAttributes.parentId` stays continuous ACROSS that boundary — which
+  // the second remap pass in instantiatePrefabIntoWorld provides deliberately. Asserted here,
+  // against REAL instantiation, because memberPath's own unit tests use a hand-built index and
+  // so could not notice this premise changing.
+  it('resolveMemberPath walks a path THROUGH a nested instance (the #250 entry-member case)', async () => {
+    const { instantiatePrefabIntoWorld } = await getLoader();
+    const { resolveMemberPath, buildChildIndex } = await import('../../src/runtime/core/ecs/memberPath');
+    cachedPrefabs.set('Inner', innerPrefab);
+    const rootId = instantiatePrefabIntoWorld(testWorld, outerPrefab, 0, undefined, 'Outer');
+    expect(rootId).toBeGreaterThan(0);
+
+    // Name every live entity so the assertion names a PATH, not an id.
+    const nameOf = new Map<number, string>();
+    testWorld.query(EntityAttributes).updateEach(([ea]: any[], e: any) => nameOf.set(e.id(), ea.name));
+
+    // The chain the fixture builds: O1 (root) -> O2 -> <inner root> -> <inner child>.
+    const index = buildChildIndex(testWorld);
+    const o2 = index.get(rootId)!.find(c => c.name === 'O2')!;
+    expect(o2).toBeTruthy();
+    const innerRoot = index.get(o2.id)![0];          // the nested instance's root hangs here
+    const innerChild = index.get(innerRoot.id)![0];  // and its own member below that
+
+    const path = `O2/${innerRoot.name}/${innerChild.name}`;
+    expect(resolveMemberPath(testWorld, rootId, path).id).toBe(innerChild.id);
+
+    // And the boundary is genuinely crossed: the deepest hit is NOT one of the outer prefab's
+    // own members, which is precisely what a rootInstanceId scan would have been limited to.
+    expect(['O1', 'O2']).not.toContain(nameOf.get(innerChild.id));
+  });
+
   it('collectResourceRefsFromEntities emits a prefab ref for a nested `prefab` field', async () => {
     const { collectResourceRefsFromEntities } = await getLoader();
     const childGuid = 'aaaaaaaa-0000-4000-8000-0000000000cc';

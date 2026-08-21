@@ -514,6 +514,24 @@ function probeTraitRefs(traits: Record<string, unknown>, state: WalkState, refer
     for (const ref of animLib.animSets) pushRef(state, 'asset', ref, { ...referencedBy, trait: 'AnimationLibrary' }, 'animSets[]');
   }
 
+  // UIEntries (#250) → a scroll view's entry KINDS: an ARRAY of { name, prefab }. The prefab
+  // guid is nested one level down, so the scalar ref registry cannot see it and the keep-walk
+  // needs it explicitly — otherwise every pooled entry's prefab is shaken out of the build and
+  // the view renders nothing in production while dev looks perfect.
+  const uiEntries = traits['UIEntries'] as Record<string, unknown> | undefined;
+  if (uiEntries && typeof uiEntries === 'object' && typeof uiEntries.prefabs === 'string' && uiEntries.prefabs) {
+    // Parsed inline rather than importing the engine's parseEntryPrefabs: this is a BUILD
+    // plugin, and the same shape is already banked as JSON by Animator.clips / AudioSource.clips.
+    let bank: unknown;
+    try { bank = JSON.parse(uiEntries.prefabs); } catch { bank = null; }
+    if (Array.isArray(bank)) {
+      for (const k of bank) {
+        const ref = (k as { prefab?: string } | null)?.prefab;
+        if (typeof ref === 'string' && ref) pushRef(state, 'asset', ref, { ...referencedBy, trait: 'UIEntries' }, 'prefabs[].prefab');
+      }
+    }
+  }
+
   // MaterialInstance overrides with kind:'texture' carry a per-instance `ref` (a
   // sprite/texture guid bound to a 2D shader's extra sampler) — nested in the overrides
   // array, so not a scalar registry field. Follow each or the swapped-in texture is

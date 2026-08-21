@@ -92,6 +92,14 @@ export interface UINodeData {
    *  the whole UI tree on every press and release of a d-pad would be a frame's work for a
    *  highlight, at thumb frequency. */
   touch?: { action: string; showOn: string; pressedOpacity: number };
+  /** UIScrollView trait — this element is a scrolling box. Carries the AUTHORED motion fields
+   *  plus the one-shot `scrollTo*` request, and deliberately **NOT** the live `scrollX`/`scrollY`.
+   *
+   *  ⚠️ That omission is load-bearing, not an oversight. Scroll position flows the OTHER way —
+   *  `UINode` writes it into the trait on every DOM scroll event without dirtying the tree. If it
+   *  rode down in the projection, every scroll event would change this node, `nodesEqual` would
+   *  fail, and the whole "a scroll frame costs nothing" property would be gone. */
+  scroll?: { axis: string; snap: string; snapStop: string; overscroll: string; scrollToX: number; scrollToY: number; scrollBehavior: string };
   /** TextAnimation trait — whole-element CSS text animation (fade/wave/bounce/jitter/
    *  rainbow/typewriter) realized by UINode. Shared trait with the 2D/3D geometry paths. */
   textAnim?: { effect: string; speed: number; amplitude: number; frequency: number; loop: boolean; fadeIn: boolean };
@@ -153,7 +161,7 @@ const _sortMap = new Map<number, number>();
 let _prevById = new Map<number, UINodeData>();
 
 // Node keys that aren't plain scalars — compared specially in nodesEqual.
-const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim', 'toggle', 'touch']);
+const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim', 'toggle', 'touch', 'scroll']);
 // Derived ONCE from a real node, so every scalar field is covered automatically:
 // add a field to UINodeData and it's compared without editing this file.
 let _scalarKeys: string[] | null = null;
@@ -185,6 +193,7 @@ export function nodesEqual(a: UINodeData, b: UINodeData): boolean {
   if (!shallowOptEqual(a.textAnim as Record<string, unknown> | undefined, b.textAnim as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.toggle as Record<string, unknown> | undefined, b.toggle as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.touch as Record<string, unknown> | undefined, b.touch as Record<string, unknown> | undefined)) return false;
+  if (!shallowOptEqual(a.scroll as Record<string, unknown> | undefined, b.scroll as Record<string, unknown> | undefined)) return false;
   // action.bindings is an array — ref-compare, but treat two empties as equal
   // (the builder allocates a fresh [] when the trait carries none).
   if (a.action || b.action) {
@@ -212,7 +221,7 @@ function reconcileNode(node: UINodeData, nextPrev: Map<number, UINodeData>): UIN
 
 // Cache trait lookups (resolve once, reuse across frames)
 let _traitsCached = false;
-let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any, _toggleMeta: any, _touchMeta: any;
+let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any, _toggleMeta: any, _touchMeta: any, _scrollMeta: any;
 
 function cacheTraits() {
   const allTraits = getAllTraits();
@@ -226,6 +235,7 @@ function cacheTraits() {
   _textAnimMeta = allTraits.find(m => m.name === 'TextAnimation');
   _videoMeta = allTraits.find(m => m.name === 'VideoPlayer');
   _toggleMeta = allTraits.find(m => m.name === 'UIToggle');
+  _scrollMeta = allTraits.find(m => m.name === 'UIScrollView');
   _touchMeta = allTraits.find(m => m.name === 'TouchControl');
   _traitsCached = !!(_renderUIMeta && _uiElMeta);
 }
@@ -386,6 +396,15 @@ function buildTree(world: World): UINodeData[] | null {
           knobInset: t.knobInset ?? 2,
           trackRadius: t.trackRadius ?? 999, knobRadius: t.knobRadius ?? 999,
           disabled: t.disabled === true,
+        };
+      }
+      if (_scrollMeta && entity.has(_scrollMeta.trait)) {
+        const sv = entity.get(_scrollMeta.trait) as any;
+        node.scroll = {
+          axis: sv.axis ?? 'y', snap: sv.snap ?? 'none', snapStop: sv.snapStop ?? 'normal',
+          overscroll: sv.overscroll ?? 'auto',
+          scrollToX: sv.scrollToX ?? -1, scrollToY: sv.scrollToY ?? -1,
+          scrollBehavior: sv.scrollBehavior ?? 'instant',
         };
       }
       // Play-GATE the animation here in the projection (not in UINode) so it toggles

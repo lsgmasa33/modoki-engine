@@ -1623,6 +1623,14 @@ function releasePrefabByPath(sceneId: SceneId, prefabPath: string): void {
 }
 
 /** Look up a cached prefab. Accepts guid or path. Returns undefined if not loaded. */
+/** ⚠️ Takes the REF (a GUID), not a resolved path — `refToPath` runs INSIDE. Handing it an
+ *  already-resolved `/assets/…` path re-enters `resolveRef` with an asset path, which is
+ *  rejected ("path reference no longer supported") and returns undefined, so the prefab reads
+ *  as permanently uncached and whatever needed it silently never appears.
+ *
+ *  Worth stating because several callers name their local `prefabPath` while holding a GUID
+ *  (`SceneManager`'s `fetchPrefab` parameter, for one), and that naming is what led one caller
+ *  to resolve first. */
 export function getCachedPrefab(prefabRef: string): unknown | undefined {
   const prefabPath = refToPath(prefabRef);
   if (!prefabPath) return undefined;

@@ -5,6 +5,7 @@ import { getCurrentWorld, spawnEntity, indexEntityGuid, findEntityById, findEnti
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
 import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry, type AssetType } from './assetManifest';
+import { parseEntryPrefabs } from '../traits/UIEntries';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
 import { isPersistentTraitField } from '../core/ecs/traitSchema';
@@ -1211,6 +1212,19 @@ export function collectResourceRefsFromEntities(
       const animSets = animLib.animSets;
       if (Array.isArray(animSets)) {
         for (const ref of animSets) if (looksFetchable(ref as string)) add('animset', ref as string);
+      }
+    }
+    // UIEntries (#250) — a scroll view's entry KINDS: an ARRAY of { name, prefab } where
+    // `prefab` is the GUID. Explicit rather than in REF_FIELDS_BY_TRAIT, which is scalar-only.
+    //
+    // ⚠️ Without this the entry prefab reaches the manifest through NOTHING, and the failure is
+    // invisible in dev — the dev server serves every file off disk, so it only breaks in a
+    // production build (#53, "assets the build cannot see"). Listing the prefab is also what
+    // makes SceneManager's transitive prefab walk acquire what the prefab itself references.
+    const entries = entry.traits['UIEntries'] as Record<string, unknown> | undefined;
+    if (entries && typeof entries !== 'boolean') {
+      for (const k of parseEntryPrefabs(entries.prefabs as string)) {
+        if (looksFetchable(k.prefab)) add('prefab', k.prefab);
       }
     }
     // Per-mesh material overrides (Unity-style SkinnedMeshRenderer) resolve to

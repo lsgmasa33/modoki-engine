@@ -3345,9 +3345,74 @@ async function prewarmShadersForWorldInner(
     }
   });
 
-  // F4: even when the staging world has NO Renderable3D/Primitive — a
-  // particle-only, UI-only, or skinned-only NPR scene (skinned meshes are synced
-  // separately and not counted here) — we must still make a NORMAL material the
+  // Skinned (rigged) meshes (#238). A `THREE.SkinnedMesh` puts a skinning node into the vertex
+  // graph, so its pipeline is genuinely DIFFERENT from the plain `THREE.Mesh` this function builds
+  // for the same material — and until now the prewarm placed zero of them, leaving every rigged
+  // character's material for the first real frame to build synchronously. Third instance of the
+  // one defect the shadow and fog mirrors were: the prewarm must model the scene the tier will
+  // actually draw, and a rig it never places is a scene it never modelled.
+  //
+  // Built through the REAL helpers — `cloneSkeleton` + `buildNodes` + `syncNodeMaterials`, the same
+  // three `syncSkinnedModels`/`syncSkinnedMeshRenderers` use — rather than a hand-rolled stand-in.
+  // The override pass matters as much as the clone: a `SkinnedMeshRenderer` rebinds the node's
+  // material by slot, so mirroring the rig WITHOUT its overrides would compile the baked GLB
+  // material the render is about to replace, and buy a variant nobody draws.
+  //
+  // The prototype is in cache by now, and that is a property of the LOAD ORDER, not luck:
+  // `SkinnedModel.model` is a `riggedModel` ref in `SCALAR_RESOURCE_TYPE_BY_FIELD`, SceneManager's
+  // prefab walk collects it transitively (forest-camp's Ranger arrives via a prefab, and its scene
+  // file authors no `riggedModel` entry at all), and `acquireResource` awaits it before the swap
+  // hook that calls this. If that ever stops being true this pass goes quiet rather than wrong —
+  // an uncached rig is skipped, exactly as `syncSkinnedModels` skips it.
+  const prewarmRigRoots: THREE.Object3D[] = [];
+  /** Rigs placed. Counted separately from `count` on purpose — see the F4 note below. */
+  let rigCount = 0;
+  const overridesByParent = new Map<number, { node: string; materials: Record<string, string> | undefined; visible: boolean }[]>();
+  world.query(SkinnedMeshRenderer).updateEach(([r]: [{ node: string; materials: Record<string, string>; visible: boolean }], entity) => {
+    const parentId = entity.has(EntityAttributes) ? entity.get(EntityAttributes)!.parentId : 0;
+    if (!parentId) return;
+    const list = overridesByParent.get(parentId) ?? [];
+    list.push({ node: r.node, materials: r.materials, visible: r.visible });
+    overridesByParent.set(parentId, list);
+  });
+
+  world.query(SkinnedModel).updateEach(([sm]: [{ isVisible: boolean; model: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
+    if (!sm.isVisible || !sm.model || deactivatedEntities.has(entity.id())) return;
+    // Overrides join the dedupe key alongside the shadow flags, for the same reason they do on
+    // Renderable3D: two entities sharing a rig but rebinding different materials need both
+    // variants. Sorted so two identical override sets in a different authoring order collapse.
+    const ov = overridesByParent.get(entity.id()) ?? [];
+    const ovKey = ov
+      .map((o) => `${o.node}:${o.visible ? 1 : 0}:${Object.entries(o.materials ?? {}).sort().map(([k, v]) => `${k}=${v}`).join(',')}`)
+      .sort().join('|');
+    if (skip(`k|${sm.model}|${ovKey}|${shadowFlagsKey(sm.castShadow, sm.receiveShadow)}`)) return;
+    const rigged = getRiggedModel(sm.model);
+    if (!rigged) return; // not cached — the real frame will build it; better quiet than wrong
+    const root = cloneSkeleton(rigged.prototype);
+    // Overrides BEFORE the shadow flags, matching the primitive path above and for the same
+    // reason: `castShadow: 'auto'` derives from `material.transparent`, so applying the flags
+    // first would read the baked material rather than the one the render will draw.
+    const nodes = buildNodes(root);
+    for (const o of ov) {
+      const node = nodes.get(o.node);
+      if (node) syncNodeMaterials(node, o.materials, o.visible);
+    }
+    applyShadowFlags(root, sm.castShadow, sm.receiveShadow);
+    prewarmScene.add(root);
+    prewarmRigRoots.push(root);
+    // Deliberately NOT `count++`: `count` gates the F4 placeholder below, whose guarantee is that
+    // a PLAIN standard material is the renderer's first compile. A rig's material is a
+    // `MeshStandardMaterial` but its program is the SKINNED variant, and F4 exists because of a
+    // lazy init in three's node builder that a normal compile has to prime — "close enough to
+    // normal" is not a property this can be reasoned into. A skinned-only scene therefore still
+    // gets the throwaway plain mesh, exactly as it did before rigs were mirrored at all; the cost
+    // is one trivial compile on a scene that now has real work to do anyway.
+    rigCount++;
+  });
+
+  // F4: even when the staging world has no PLAIN renderable — a particle-only, UI-only, or
+  // skinned-only NPR scene (a mirrored rig does not count here, and the note on `rigCount` above
+  // says why) — we must still make a NORMAL material the
   // renderer's first compile. Otherwise the NPR MRT pass becomes the first compile
   // and re-triggers the WGSL `unresolved type 'OutputType'` bug this prewarm exists
   // to prevent. Add a throwaway 1-tri standard mesh so a plain material is always
@@ -3366,7 +3431,7 @@ async function prewarmShadersForWorldInner(
   // try/finally: `compileAsync` can reject (a bad shader graph, a lost device), and a leaked span
   // is worse than a missing one — `bootSpansOverlapping` reads an open span as still running, so it
   // would rank first in a later stall attribution. Same reasoning as SceneManager's spans.
-  const compileSpan = beginBootSpan('shader-compile', `${count} pairs`);
+  const compileSpan = beginBootSpan('shader-compile', `${count} pairs${rigCount ? ` + ${rigCount} rigs` : ''}`);
   try {
     if (typeof compile === 'function') {
       await (renderer as THREE.WebGLRenderer).compileAsync(prewarmScene, camera);
@@ -3383,6 +3448,16 @@ async function prewarmShadersForWorldInner(
     (m.material as THREE.Material).dispose();
   }
   for (const l of prewarmLights) l.dispose();
+  // Rig clones share the prototype's geometry + materials (SkeletonUtils.clone does not copy
+  // them), so dispose ONLY what the clone minted: its Skeleton. Same split `disposeSkinnedEntry`
+  // makes — disposing the shared halves here would tear the prototype out from under every
+  // other scene holding it, which is precisely what the scene-scoped refcount exists to prevent.
+  for (const root of prewarmRigRoots) {
+    root.traverse((o) => {
+      const sm = o as THREE.SkinnedMesh;
+      if (sm.isSkinnedMesh) sm.skeleton?.dispose();
+    });
+  }
   if (placeholderMesh) {
     placeholderMesh.geometry.dispose();
     (placeholderMesh.material as THREE.Material).dispose();

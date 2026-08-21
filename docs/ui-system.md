@@ -592,6 +592,95 @@ stale GUIDs never linger.
 
 ---
 
+## Scroll views and recycled entries (`UIScrollView` + `UIEntries`)
+
+A scroll box with a **pooled** content set: a handful of prefab instances re-driven as you
+scroll, so a view over N entries costs `visible + overscan` entities instead of N. Design
+rationale and the open work: [plans/ui-scroll-view-plan.md](./plans/ui-scroll-view-plan.md).
+
+**An entry is not a row.** The content is a `countX × countY` index space of **entries**, and one
+entry is whatever the prefab says — a list row, a card, or a whole authored grid (a *page*). The
+three shapes differ only in authored numbers, not in code paths: a vertical strip is `countX: 1`,
+a horizontal one `countY: 1`, a pager is a strip whose entry fills the viewport (`100%`), and a
+2-D grid has both above 1.
+
+| Trait | Owns |
+|---|---|
+| `UIScrollView` | the box: `axis`, `snap`, `snapStop`, `overscroll`, plus engine-written `scrollX/Y`, viewport + content size |
+| `UIEntries` | what it shows: `prefabs` (a JSON bank of `{name, prefab}`), entry size, `gap`, `overscan`, `countX/countY`, `epoch`, `source` |
+| `UIEntry` | stamped by the engine on each pooled instance: the **data** index, the slot, and `live` |
+
+`UIElement.overflow: 'scroll'` is still what makes the box scroll — `UIScrollView` supplies the
+position and the motion fields, and does not override what the author wrote.
+
+### The contract: the engine asks, the game answers
+
+The engine decides WHICH pooled instance shows entry (x, y); the game answers WHAT it says, via
+`registerEntrySource(name, resolver)`. Keys are **member paths** inside the entry prefab
+(`'Tile3/Solved/Num'`, `''` for the root); values are **trait-keyed** (`{ UIElement: { text } }`).
+
+- A path must be FULL and match exactly one member — **ambiguity is an error, not a fan-out**.
+  `level-tile.prefab.json` carries three entities named `Num`, so a leaf-name match would write
+  all three and look like it worked. This differs deliberately from Court's `patchUIInInstance`,
+  which writes every match by design.
+- Trait-keyed with no shorthand, because a flat field map would have to *guess* a trait — a
+  resolver returning a `UIToggle.value` would then silently write nothing.
+- Bump **`epoch`** when content changes but the window does not (a level gets solved; an async
+  manifest arrives). Without it the resolver is only called when the window moves.
+
+### Sizing, and why the two terms are separate
+
+`poolSize = visible + 1 + 2 × overscan`:
+
+- **`visible + 1`** is GEOMETRY — one entry always straddles the viewport edge at a partial
+  offset. Required even at `overscan: 0`.
+- **`overscan`** is LATENCY — how far the scroll travels between two pool updates. It is a
+  FLOOR, raised at runtime to cover measured travel, because a fixed value blanks: on a Galaxy
+  A23 a hard fling traverses up to **4.56 entries per pool update**, and `overscan: 1` blanked
+  12/1787 frames.
+
+The raise is **capped** at roughly a viewport's worth. A jump (a `scrollToEntry`, a scrollbar
+drag) reports thousands of entries of travel, and an uncapped raise pools every one of them —
+measured live, a 5,000-entry list went from a 9-entity pool to 5,000.
+
+`entryWidth`/`entryHeight` of **`0` means "read it from the prefab root"**, so a fixed-size entry
+is not a second copy of a number the prefab already states; `%` resolves against the viewport,
+which is how a pager is expressed.
+
+### Motion is CSS, and the vocabulary matches
+
+`snap` / `snapStop` / `overscroll` map to `scroll-snap-align`+`scroll-snap-type`,
+`scroll-snap-stop` and `overscroll-behavior`. There is deliberately **no** `deceleration`,
+`elasticity`, `duration` or `easing`: CSS cannot honour them, and an authored field that moves
+nothing is a lie with a tooltip. They arrive together with an owned-physics backend.
+
+⚠️ **`snapStop: 'always'` CONSTRAINS a fling; it does not cap it at one entry.** Measured on an
+A23: one hard fling advanced **11** entries at `'normal'` and **3** at `'always'`, while a slow
+drag advanced exactly 1. The cap is the POOL's extent — a browser can only stop at snap points
+that EXIST in the DOM, and recycling is what removes the further ones. So do not size a pool to
+buy a feel promise.
+
+`scrollToEntry(viewGuid, {x, y}, {behavior})` and `snapToNearest` request in **entry**
+coordinates (the system converts, since it is what resolves entry size); the declarative
+`ui.scrollTo` action does the same from a button with no game code.
+
+### Rules that bite
+
+- **The system runs at `SYSTEM_PRIORITY.UI_ENTRIES` (270), ≥ `TRANSFORM`.** `runPipeline` skips
+  everything below `TRANSFORM` while the sim is stopped, and a settings list or a level select is
+  exactly what you scroll while paused — a sim-gated pool would stop RECYCLING while the native
+  scroll kept moving.
+- **The scroll read-back does NOT dirty the UI tree.** `UINode` writes `scrollX/Y` through a raw
+  `entity.set`, bypassing the `markUIDirty` hook, so a scroll frame that does not move the window
+  costs one field write. Routing it through a dirtying helper rebuilds the whole tree at fling
+  frequency.
+- **A parked entry reads as DESTROYED to Percept and Enact** — not listed, not aimable, subtree
+  included. This is NOT the same as `isVisible: false`, which stays addressable.
+- **The content child is engine-owned** (`__uiEntriesContent`), spawned inside a system tick so
+  it is `Transient` and never reaches a saved scene.
+- **The entry prefab root needs `RenderableUI`**, or the entry renders nothing while looking
+  perfect in `get_scene_state`.
+
 ## Text animation (`TextAnimation` → CSS)
 
 `TextAnimation` (`runtime/traits/TextAnimation.ts`) is a modifier trait: attach it

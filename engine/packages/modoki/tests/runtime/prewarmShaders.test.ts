@@ -13,21 +13,58 @@ import * as THREE from 'three';
 const deactivatedEntities = new Set<number>();
 const worldTransforms = new Map<number, unknown>();
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.resetModules();
   vi.clearAllMocks();
   deactivatedEntities.clear();
   worldTransforms.clear();
+  // Every test builds a fresh world, and koota caps a process at 16. `vi.resetModules()` does
+  // NOT reset that counter — koota lives in node_modules and is not re-evaluated — so the ids
+  // accumulate across the file and test 17 dies with "Too many worlds created", which reads as
+  // a bug in whatever test happened to be added last. Reset the registry instead of budgeting
+  // tests around the ceiling. Imported HERE rather than at the top of the file so it is the same
+  // cached instance the test's own dynamic import receives.
+  const { universe } = await import('koota');
+  universe.reset();
 });
 
-async function setup(opts: { primitives?: boolean; env?: unknown } = {}) {
+const RIG_REF = 'rig-guid-0001';
+
+/** A stand-in rigged prototype: one named `THREE.SkinnedMesh` with a bound skeleton, under a
+ *  named group so `nodeNameOf` resolves the node the way a real GLB import does. Its material
+ *  is NAMED, because `buildNodes` keys a material slot by `material.name` — an unnamed one
+ *  would silently key by mesh name and make an override test pass for the wrong reason. */
+function makeRigPrototype(): THREE.Object3D {
+  const group = new THREE.Group();
+  group.name = 'Ranger';
+  const bone = new THREE.Bone();
+  const skeleton = new THREE.Skeleton([bone]);
+  const material = new THREE.MeshStandardMaterial();
+  material.name = 'Ranger_Texture';
+  const mesh = new THREE.SkinnedMesh(new THREE.BufferGeometry(), material);
+  mesh.name = 'Ranger';
+  mesh.add(bone);
+  mesh.bind(skeleton);
+  group.add(mesh);
+  return group;
+}
+
+async function setup(opts: { primitives?: boolean; env?: unknown; rig?: THREE.Object3D; overrideMaterial?: THREE.Material } = {}) {
   vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms, deactivatedEntities, transformPropagationSystem: {},
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
     resolveMeshTemplate: vi.fn(() => null), resolveMeshLodInfo: vi.fn(() => null),
-    resolveMaterialForMesh: vi.fn(() => null), resolveMaterial: vi.fn(() => null),
+    resolveMaterialForMesh: vi.fn(() => null),
+    // A rig's SkinnedMeshRenderer override resolves through THIS function, so a test that
+    // supplies `overrideMaterial` is the only one that can tell "override applied" from
+    // "override silently dropped because the guid did not resolve".
+    resolveMaterial: vi.fn(() => opts.overrideMaterial ?? null),
     getCachedEnvironment: vi.fn(() => opts.env ?? null), acquireEnvironment: vi.fn(),
+  }));
+  vi.doMock('../../src/runtime/loaders/riggedModelCache', () => ({
+    getRiggedModel: vi.fn((ref: string) => (opts.rig && ref === RIG_REF ? { prototype: opts.rig, animations: [] } : undefined)),
+    ensureRiggedModelLoaded: vi.fn(),
   }));
   // A primitive factory that returns a REAL mesh, so the dedupe test can count the
   // placeholders that actually reached the compile. Each call yields a fresh object,
@@ -44,8 +81,8 @@ async function setup(opts: { primitives?: boolean; env?: unknown } = {}) {
 
   const { createWorld } = await import('koota');
   const sync = await import('../../src/runtime/rendering/scene3DSync');
-  const { Renderable3DPrimitive } = await import('../../src/runtime/traits');
-  return { world: createWorld(), sync, Renderable3DPrimitive, createPrimitiveMesh };
+  const { Renderable3DPrimitive, SkinnedModel, SkinnedMeshRenderer, EntityAttributes } = await import('../../src/runtime/traits');
+  return { world: createWorld(), sync, Renderable3DPrimitive, SkinnedModel, SkinnedMeshRenderer, EntityAttributes, createPrimitiveMesh };
 }
 
 /** A renderer stub that records, AT compile time, a snapshot of the scene it was
@@ -61,6 +98,10 @@ function makeRendererStub() {
   const compiledLightShadows: boolean[][] = [];
   const compiledFog: { fog: boolean; fogNode: boolean }[] = [];
   const compiledMeshShadows: { cast: boolean; receive: boolean }[][] = [];
+  /** Rigs AT compile time — and a rig arrives as a GROUP, so unlike the other captures this one
+   *  must traverse rather than filter `scene.children`. Same reason as the rest for capturing
+   *  here: `prewarmScene.clear()` runs after the compile, so a post-call read finds nothing. */
+  const compiledSkinned: { material: THREE.Material | THREE.Material[] }[][] = [];
   const renderer = {
     compileAsync: vi.fn(async (scene: THREE.Scene) => {
       compiledScenes.push(scene);
@@ -74,6 +115,11 @@ function makeRendererStub() {
           .filter((o) => (o as THREE.Mesh).isMesh)
           .map((o) => ({ cast: o.castShadow, receive: o.receiveShadow })),
       );
+      const rigs: { material: THREE.Material | THREE.Material[] }[] = [];
+      scene.traverse((o) => {
+        if ((o as THREE.SkinnedMesh).isSkinnedMesh) rigs.push({ material: (o as THREE.SkinnedMesh).material });
+      });
+      compiledSkinned.push(rigs);
       standardMeshCounts.push(
         scene.children.filter(
           (o) => (o as THREE.Mesh).isMesh && (o as THREE.Mesh).material instanceof THREE.MeshStandardMaterial,
@@ -81,7 +127,7 @@ function makeRendererStub() {
       );
     }),
   };
-  return { renderer, compiledScenes, standardMeshCounts, compiledEnvironments, compiledLightShadows, compiledMeshShadows, compiledFog };
+  return { renderer, compiledScenes, standardMeshCounts, compiledEnvironments, compiledLightShadows, compiledMeshShadows, compiledFog, compiledSkinned };
 }
 
 const camera = new THREE.PerspectiveCamera();
@@ -298,5 +344,121 @@ describe('prewarmShadersForWorld — the fog mirror (#238 sibling)', () => {
       world.spawn(Fog({ enabled: false, mode: 'linear', color: 0x223344, near: 1, far: 90 }));
     });
     expect(compiledFog[0]).toEqual({ fog: false, fogNode: false });
+  });
+});
+
+/** #238 — a `THREE.SkinnedMesh` puts a skinning node into the vertex graph, so its pipeline
+ *  differs from the plain Mesh the prewarm builds for the same material. The prewarm placed
+ *  ZERO rigs, so every rigged character's material was left for the first real frame to build
+ *  synchronously — the shadow/fog defect a third time, and the one measured residual on
+ *  demos/forest-camp after those two landed. */
+describe('prewarmShadersForWorld — the skinned mirror (#238)', () => {
+  async function prewarmRig(
+    opts: { overrideMaterial?: THREE.Material },
+    spawn: (ctx: Awaited<ReturnType<typeof setup>>) => void,
+  ) {
+    const ctx = await setup({ rig: makeRigPrototype(), ...opts });
+    const stub = makeRendererStub();
+    spawn(ctx);
+    await ctx.sync.prewarmShadersForWorld(ctx.world, stub.renderer as never, camera);
+    return { ...stub, ...ctx };
+  }
+
+  it('places the rig in the compiled scene, so the skinned variant is compiled before the swap', async () => {
+    const { compiledSkinned } = await prewarmRig({}, ({ world, SkinnedModel }) => {
+      world.spawn(SkinnedModel({ model: RIG_REF, isVisible: true }));
+    });
+    // The assertion that fails on the old code: it compiled a scene with no SkinnedMesh at all.
+    expect(compiledSkinned[0]).toHaveLength(1);
+  });
+
+  it('compiles the OVERRIDE material a SkinnedMeshRenderer rebinds, not the baked one', async () => {
+    const override = new THREE.MeshStandardMaterial();
+    override.name = 'override';
+    const { compiledSkinned } = await prewarmRig({ overrideMaterial: override },
+      ({ world, SkinnedModel, SkinnedMeshRenderer, EntityAttributes }) => {
+        const rig = world.spawn(SkinnedModel({ model: RIG_REF, isVisible: true }));
+        world.spawn(
+          SkinnedMeshRenderer({ node: 'Ranger', materials: { Ranger_Texture: 'mat-guid' }, visible: true }),
+          EntityAttributes({ parentId: rig.id() }),
+        );
+      });
+    // Mirroring the rig WITHOUT its overrides compiles the baked GLB material the render is
+    // about to replace — a variant nobody draws, which is the exact failure the mirror exists
+    // to prevent rather than a cosmetic difference.
+    expect(compiledSkinned[0][0].material).toBe(override);
+  });
+
+  it('dedupes two entities sharing a rig, but NOT when their overrides differ', async () => {
+    const override = new THREE.MeshStandardMaterial();
+    const same = await prewarmRig({}, ({ world, SkinnedModel }) => {
+      world.spawn(SkinnedModel({ model: RIG_REF, isVisible: true }));
+      world.spawn(SkinnedModel({ model: RIG_REF, isVisible: true }));
+    });
+    expect(same.compiledSkinned[0]).toHaveLength(1);
+
+    const differing = await prewarmRig({ overrideMaterial: override },
+      ({ world, SkinnedModel, SkinnedMeshRenderer, EntityAttributes }) => {
+        const a = world.spawn(SkinnedModel({ model: RIG_REF, isVisible: true }));
+        const b = world.spawn(SkinnedModel({ model: RIG_REF, isVisible: true }));
+        world.spawn(SkinnedMeshRenderer({ node: 'Ranger', materials: { Ranger_Texture: 'mat-a' }, visible: true }),
+          EntityAttributes({ parentId: a.id() }));
+        world.spawn(SkinnedMeshRenderer({ node: 'Ranger', materials: { Ranger_Texture: 'mat-b' }, visible: true }),
+          EntityAttributes({ parentId: b.id() }));
+      });
+    // Two rigs sharing a model but rebinding different materials are two pipelines, so keying
+    // without the overrides would compile whichever entity came first and leave the other for
+    // the first real frame — the stall, reintroduced through the dedupe.
+    expect(differing.compiledSkinned[0]).toHaveLength(2);
+  });
+
+  it('skips a rig whose prototype is not cached rather than throwing', async () => {
+    const ctx = await setup({ rig: makeRigPrototype() });
+    const stub = makeRendererStub();
+    ctx.world.spawn(ctx.SkinnedModel({ model: 'not-the-cached-rig', isVisible: true }));
+    await ctx.sync.prewarmShadersForWorld(ctx.world, stub.renderer as never, camera);
+    expect(stub.compiledSkinned[0]).toHaveLength(0);
+    expect(stub.renderer.compileAsync).toHaveBeenCalledTimes(1); // still compiled the F4 placeholder
+  });
+
+  it('disposes the clone\'s skeleton but NOT the prototype\'s shared geometry/material', async () => {
+    const proto = makeRigPrototype();
+    const protoMesh = proto.children[0] as THREE.SkinnedMesh;
+    const geoSpy = vi.spyOn(protoMesh.geometry, 'dispose');
+    const matSpy = vi.spyOn(protoMesh.material as THREE.Material, 'dispose');
+    const ctx = await setup({ rig: proto });
+    const stub = makeRendererStub();
+    ctx.world.spawn(ctx.SkinnedModel({ model: RIG_REF, isVisible: true }));
+    await ctx.sync.prewarmShadersForWorld(ctx.world, stub.renderer as never, camera);
+    // SkeletonUtils.clone SHARES geometry + material with the prototype, so disposing them
+    // here would tear the model out from under every other scene holding it — the whole point
+    // of the scene-scoped refcount. Only the Skeleton the clone minted is ours to dispose.
+    expect(geoSpy).not.toHaveBeenCalled();
+    expect(matSpy).not.toHaveBeenCalled();
+  });
+});
+
+/** The F4 guarantee survives the skinned mirror (#238). Mirroring rigs added placeholders to a
+ *  scene that previously had none, and F4's condition is "nothing was placed" — so a skinned-only
+ *  scene came within one `count++` of losing the plain-material-first guarantee that exists to
+ *  stop the NPR MRT pass being the renderer's first compile. */
+describe('prewarmShadersForWorld — F4 still holds for a skinned-only scene', () => {
+  it('compiles a PLAIN standard mesh even when the only renderable is a rig', async () => {
+    const ctx = await setup({ rig: makeRigPrototype() });
+    const stub = makeRendererStub();
+    ctx.world.spawn(ctx.SkinnedModel({ model: RIG_REF, isVisible: true }));
+    await ctx.sync.prewarmShadersForWorld(ctx.world, stub.renderer as never, camera);
+
+    expect(stub.compiledSkinned[0]).toHaveLength(1); // the rig IS mirrored…
+    // …and the throwaway plain mesh is STILL there. A rig's material is a MeshStandardMaterial but
+    // its program is the skinned variant, and F4 exists because of a lazy init in three's node
+    // builder that a NORMAL compile has to prime — so "the rig's material is standard enough"
+    // is not a substitution this may quietly make.
+    // `standardMeshCounts` is captured AT compile time and filters `scene.children` — a rig hangs
+    // its SkinnedMesh under a Group, so this counts exactly the top-level plain meshes, i.e. the
+    // F4 placeholder. (Reading `compiledScenes[0].children` here instead would find nothing: the
+    // prewarm clears the scene after compiling, which is why every capture in this stub is taken
+    // inside `compileAsync`.)
+    expect(stub.standardMeshCounts[0]).toBe(1);
   });
 });

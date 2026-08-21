@@ -4,7 +4,7 @@
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, AudioSettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
-  UIElement, UIBinding, UIAction, UIFocusable, UIToggle, TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
+  UIElement, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
   AudioSource, AudioListener, VideoPlayer,
@@ -1086,6 +1086,72 @@ export function registerAllTraits() {
       knobRadius: { type: 'number', min: 0, step: 1, tooltip: 'Knob corner radius. 999 = circle.' },
       // Folded into `knobColor`'s row, so it needs no row of its own.
       knobOpacity: { type: 'number', min: 0, max: 1, step: 0.01, hidden: true },
+    },
+  });
+
+  // Sits just above Canvas2D (64), beside the other opt-in capabilities that pair with
+  // UIElement. A scroll view is authored ON a container; it does not replace one.
+  registerTrait({
+    name: 'UIScrollView', trait: UIScrollView, category: 'component', componentCategory: 'UI',
+    priority: 63.8,
+    fields: {
+      axis: { type: 'enum', options: ['y', 'x', 'both'], tooltip: 'Which axis scrolls. \'both\' is the 2-D grid case.' },
+      snap: { type: 'enum', options: ['none', 'start', 'center', 'end'], tooltip: 'Where an entry comes to rest when snapping. \'none\' disables snapping.' },
+      snapStop: { type: 'enum', options: ['normal', 'always'], tooltip: '\'always\' makes a fling stop at snap points it passes. It CONSTRAINS a fling but does not cap it at one entry — measured on a Galaxy A23, one hard fling advanced 11 entries at \'normal\' and 3 at \'always\'; a slow drag advances exactly 1.' },
+      overscroll: { type: 'enum', options: ['auto', 'contain', 'none'], tooltip: 'overscroll-behavior — whether scrolling past the end chains to the parent.' },
+      scrollBehavior: { type: 'enum', options: ['instant', 'smooth'], tooltip: 'How a scrollTo request moves. \'smooth\' duration is browser-defined and not tunable.' },
+      // ⚠️ Engine-written state and the game-written scrollTo request. HIDDEN rather than shown
+      // read-only: an author editing scrollY would have it overwritten on the next scroll event,
+      // which is a field that looks authored and is not.
+      scrollX: { type: 'number', hidden: true }, scrollY: { type: 'number', hidden: true },
+      viewportWidth: { type: 'number', hidden: true }, viewportHeight: { type: 'number', hidden: true },
+      contentWidth: { type: 'number', hidden: true }, contentHeight: { type: 'number', hidden: true },
+      scrollToX: { type: 'number', hidden: true }, scrollToY: { type: 'number', hidden: true },
+    },
+  });
+
+  // Pairs with UIScrollView (63.8) — a scroll view is the box, UIEntries is what it shows.
+  registerTrait({
+    name: 'UIEntries', trait: UIEntries, category: 'component', componentCategory: 'UI',
+    priority: 63.9,
+    fields: {
+      // A JSON bank, like Animator.clips — see UIEntries' banner for why it is a string and
+      // not an array field. Editable as text today; a nicer widget can come later without
+      // changing the stored shape.
+      prefabs: { type: 'string', tooltip: 'Entry kinds as JSON: [{"name":"tile","prefab":"<guid>"}]. The name is what game code asks for; the GUID is authored here so the build can see the asset.' },
+      entryWidth: { type: 'number', min: 0, tooltip: 'Entry width. 0 = read it from the prefab root, so a fixed size is not a second copy of what the prefab already says.' },
+      entryWidthUnit: { type: 'enum', options: ['px', '%'], tooltip: '% resolves against the viewport — 100% is how a one-at-a-time pager is expressed.' },
+      entryHeight: { type: 'number', min: 0, tooltip: 'Entry height. 0 = read it from the prefab root.' },
+      entryHeightUnit: { type: 'enum', options: ['px', '%'], tooltip: '% resolves against the viewport.' },
+      gapX: { type: 'number', min: 0, tooltip: 'Gap between entries horizontally, px.' },
+      gapY: { type: 'number', min: 0, tooltip: 'Gap between entries vertically, px.' },
+      overscan: { type: 'number', min: 0, step: 1, tooltip: 'Entries kept beyond the viewport per edge, on top of the visible+1 floor. This is a FLOOR — the engine raises it to cover measured scroll travel, because a fixed value blanks on a fling (measured on a Galaxy A23: a hard fling traverses up to 4.56 entries between pool updates).' },
+      source: { type: 'string', tooltip: 'Name of the registered entry source that fills an entry.' },
+      // Game-written data extent and the invalidation counter — not authored.
+      countX: { type: 'number', hidden: true }, countY: { type: 'number', hidden: true },
+      epoch: { type: 'number', hidden: true },
+      // Game-written scroll request in ENTRY coordinates, consumed and cleared by the system.
+      scrollToEntryX: { type: 'number', hidden: true }, scrollToEntryY: { type: 'number', hidden: true },
+      // Engine-written window state. Hidden rather than read-only for the same reason as
+      // UIScrollView's: an author editing firstY would have it overwritten next frame.
+      firstX: { type: 'number', hidden: true }, firstY: { type: 'number', hidden: true },
+      visibleX: { type: 'number', hidden: true }, visibleY: { type: 'number', hidden: true },
+      poolSize: { type: 'number', hidden: true },
+    },
+  });
+
+  // Stamped by the engine on every pooled entry root — never authored. Registered (rather than
+  // left unregistered) so the trait registry can resolve it by name, so serialization knows
+  // about it, and so Percept can report which DATA index a pooled entity is showing. Every
+  // field is hidden: an author editing `index` would have it overwritten on the next recycle.
+  registerTrait({
+    name: 'UIEntry', trait: UIEntry, category: 'component', componentCategory: 'UI',
+    priority: 63.95,
+    fields: {
+      x: { type: 'number', hidden: true }, y: { type: 'number', hidden: true },
+      index: { type: 'number', hidden: true }, slot: { type: 'number', hidden: true },
+      viewGuid: { type: 'string', hidden: true }, kind: { type: 'string', hidden: true },
+      live: { type: 'boolean', hidden: true },
     },
   });
 

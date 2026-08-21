@@ -27,6 +27,7 @@ import { uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
 import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
+import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo } from './scrollViewDom';
 
 /** The CSS-animated text span, isolated in React.memo. The game UI re-renders every
  *  frame (fps is in its store selector); re-creating the span each frame RESTARTS its
@@ -142,6 +143,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // selector subscribes THIS node to the focus store, so only the entering/leaving
   // node re-renders when focus moves. Hook runs before any early return (React rule).
   const isFocused = useFocusStore((s) => !onSelectEntity && s.focusedGuid !== '' && s.focusedGuid === node.guid);
+
+  // Scroll view (UIScrollView). Like the focus hook above, this must run before ANY early
+  // return — the hook itself no-ops when `node.scroll` is absent, which is the vast majority
+  // of nodes. It writes scroll position back into ECS WITHOUT dirtying the UI tree.
+  const scrollRef = React.useRef<HTMLDivElement | null>(null);
+  useScrollView(node, scrollRef);
 
   // isVisible is authored (or flipped by a button's UIAction `kind:'set'` binding). A
   // state-driven visibility binding (UIBinding.visibleBinding) can additionally hide the element
@@ -310,6 +317,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // AFTER the anchor, because it composes onto the anchor's pivot translate rather than replacing
   // it. Applies to anchored and flow-laid-out elements alike; the pivot rules live in anchorCss.
   applyRotationStyle(style, node.rotation, node.anchor);
+
+  // Scroll-view CSS (snap + overscroll). Deliberately does NOT set `overflow` — that stays
+  // `UIElement.overflow`, which the author already knows, so one visible consequence keeps one
+  // owner. A UIScrollView on an element left at `overflow:'visible'` therefore does not scroll,
+  // which is the honest outcome rather than two fields silently fighting.
+  if (node.scroll) Object.assign(style, scrollViewStyle(node.scroll));
 
   // ── TouchControl (on-screen d-pad / button, #297) ──
   //
@@ -700,7 +713,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // does NOT pass it — the editor viewport sizes itself / uses device presets.
       : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode /></Suspense> : null);
     return (
-      <div style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
+      <div ref={scrollRef} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
         {nineSliceLayer}
         {videoLayer}
         {canvas2DContent}
@@ -727,7 +740,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   }
 
   return (
-    <div style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
+    <div ref={scrollRef} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
       {nineSliceLayer}
       {videoLayer}
       {textContent}
@@ -736,6 +749,48 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       ))}
     </div>
   );
+}
+
+
+/** Wire a `UIScrollView` element to the DOM: read scroll position back into ECS on every scroll
+ *  event, measure the viewport/content, and consume any pending `scrollTo*` request.
+ *
+ *  ⚠️ **None of these writes marks the UI tree dirty.** See `scrollViewDom.writeScrollState` —
+ *  a scroll frame that does not move the entry window must cost a field write and nothing more.
+ *  The consumer that DOES need to react (`UIEntries`) is a system reading the trait, not this. */
+function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | null>) {
+  const scroll = node.scroll;
+  const guid = node.guid;
+  // A ref, not state: the handler must not re-render the component it is attached to.
+  React.useEffect(() => {
+    const el = ref.current;
+    if (!el || !scroll || !guid) return;
+    const push = () => {
+      writeScrollState(guid, {
+        scrollX: Math.round(el.scrollLeft), scrollY: Math.round(el.scrollTop),
+        viewportWidth: el.clientWidth, viewportHeight: el.clientHeight,
+        contentWidth: el.scrollWidth, contentHeight: el.scrollHeight,
+      });
+    };
+    push();                                   // seed, so a system sees real numbers on frame 1
+    el.addEventListener('scroll', push, { passive: true });
+    // The geometry stands on the viewport size, so measure it rather than assuming the authored
+    // width/height resolved to what we think (percentages, flex, safe-area insets).
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(push) : null;
+    ro?.observe(el);
+    return () => { el.removeEventListener('scroll', push); ro?.disconnect(); };
+  }, [ref, guid, scroll ? 1 : 0]);           // eslint-disable-line react-hooks/exhaustive-deps
+
+  // One-shot scrollTo request. Keyed on the request VALUES, so re-requesting the same offset
+  // after the game cleared it fires again rather than being swallowed.
+  React.useEffect(() => {
+    const el = ref.current;
+    if (!el || !scroll || !guid) return;
+    const req = pendingScrollTo(scroll);
+    if (!req) return;
+    el.scrollTo(req as ScrollToOptions);
+    clearScrollRequest(guid, scroll.axis === 'both' ? 'both' : scroll.axis === 'x' ? 'x' : 'y');
+  }, [ref, guid, scroll?.scrollToX, scroll?.scrollToY, scroll?.scrollBehavior]); // eslint-disable-line react-hooks/exhaustive-deps
 }
 
 export const UINode = React.memo(UINodeInner);
