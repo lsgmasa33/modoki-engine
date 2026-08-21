@@ -62,6 +62,29 @@ export function getEntryPrefabProvider(): EntryPrefabProvider | null { return pr
  *  authored entity must not use it. */
 export const ENTRIES_CONTENT_NAME = '__uiEntriesContent';
 
+/** Reserved name for one engine-owned ROW inside the content child.
+ *
+ *  ## Why there is a row layer at all — a flat wrapping content box CANNOT work
+ *
+ *  The offset is carried as padding, and CSS padding eats the box it sits on: a content child
+ *  `width: 100%` with `padding-right: 23040px` has a content box of ZERO, so every entry in it
+ *  shrinks to nothing and `flex-wrap` has no line to wrap into. Measured live on the pager and
+ *  grid scenes of `demos/scroll-demo` (2026-08-21): pages came back 0px wide, and grid tiles
+ *  authored at 120px rendered at 36px stacked in a single column. The vertical strip survived
+ *  only because vertical padding does not touch the horizontal content box — which is exactly
+ *  why one axis shipped looking correct.
+ *
+ *  A column of auto-width rows fixes it because an auto-width box sizes to `padding + children`
+ *  instead of being squeezed by its own padding. Verified in the DOM before it was built:
+ *  padLeft 256 + 9 x 128 + padRight 1408 measured `scrollWidth` 2816 with tiles at their full
+ *  120px. It also makes `UIElement`'s single `gap` field sufficient — the column's gap is the
+ *  Y gap and each row's gap is the X gap — where a wrapping flat box needs two.
+ *
+ *  The row layer is also what makes the 2-D case honest: wrap would have to break every
+ *  `pooled` entries, and the only line width that does that is the POOLED width, which is not
+ *  the width the scrollbar needs. */
+export const ENTRIES_ROW_NAME = '__uiEntriesRow';
+
 interface ViewState {
   /** False until this view has been driven once. ⚠️ Without it the FIRST update measures travel
    *  against a zeroed origin — a view opened scrolled to entry 99 reports 99 entries of travel
@@ -76,6 +99,17 @@ interface ViewState {
   lastCountY: number;
   /** Entries traversed between the last two updates — feeds `effectiveOverscan`. */
   travel: number;
+  /** Last resolved entry size and pooled column count.
+   *
+   *  ⚠️ These are in the invalidation test, not just here for reading. A `%`-sized entry
+   *  resolves against the VIEWPORT, so a window resize (or a device rotation) changes every
+   *  padding value while the window ORIGIN stays put — and the cheap `!moved` early-out then
+   *  keeps the old geometry forever. Measured live: the pager kept a 640px page size after the
+   *  panel settled at 395px, leaving a `contentWidth` 46% too large. `lastCols` matters for the
+   *  same reason one step further on — a resize changes which ROW a slot belongs to. */
+  lastEntryW: number;
+  lastEntryH: number;
+  lastCols: number;
 }
 const viewStates = new Map<string, ViewState>();
 onWorldSwap(() => { viewStates.clear(); });
@@ -197,7 +231,8 @@ function driveView(
   consumeEntryRequest(view, m, en, entryW, entryH);
 
   const st = viewStates.get(viewGuid)
-    ?? { seeded: false, lastFirstX: 0, lastFirstY: 0, lastEpoch: -1, lastCountX: -1, lastCountY: -1, travel: 0 };
+    ?? { seeded: false, lastFirstX: 0, lastFirstY: 0, lastEpoch: -1, lastCountX: -1, lastCountY: -1, travel: 0,
+         lastEntryW: -1, lastEntryH: -1, lastCols: -1 };
   const floor = (en.overscan as number) ?? 2;
   // Cap the travel-driven raise at roughly a viewport's worth of entries. Without a cap a JUMP
   // (scrollToEntry, a scrollbar drag, a view opened deep in the list) reports thousands of
@@ -224,12 +259,17 @@ function driveView(
 
   const epoch = (en.epoch as number) ?? 0;
   const moved = !st.seeded || xw.first !== st.lastFirstX || yw.first !== st.lastFirstY;
-  const invalidated = epoch !== st.lastEpoch || countX !== st.lastCountX || countY !== st.lastCountY;
+  // ⚠️ Entry size and pooled-column count belong in the invalidation test. A resize moves no
+  // window origin, so `moved` stays false and the cheap early-out below would keep a stale
+  // padding forever — see ViewState.lastEntryW.
+  const resized = entryW !== st.lastEntryW || entryH !== st.lastEntryH || xw.pooled !== st.lastCols;
+  const invalidated = epoch !== st.lastEpoch || countX !== st.lastCountX || countY !== st.lastCountY || resized;
 
   viewStates.set(viewGuid, {
     seeded: true,
     lastFirstX: xw.first, lastFirstY: yw.first, lastEpoch: epoch,
     lastCountX: countX, lastCountY: countY, travel,
+    lastEntryW: entryW, lastEntryH: entryH, lastCols: xw.pooled,
   });
 
   const content = ensureContentChild(world, view, m);
@@ -238,6 +278,7 @@ function driveView(
   diagnoseBlankView(viewGuid, countX, countY, (en.source as string) ?? '', !!getEntrySource((en.source as string) ?? ''));
 
   const plan = planSlots(xw, yw, countX, countY);
+  const rows = ensureRows(world, content, yw.pooled, m);
   const pool = ensurePool(world, content, viewGuid, kinds[0], plan.length, m);
 
   // Nothing to re-drive: the window did not move, the data did not change, and the pool is
@@ -251,9 +292,10 @@ function driveView(
   // frame they appeared. Caught by this system's integration test.
   const childIndex = buildChildIndex(world);
 
-  writePadding(content, m, xw, yw);
+  writeLayout(content, rows, m, xw, yw, en);
   writeWindowState(view, m, xw, yw, plan.length);
-  applySlots(world, plan, pool.ids, viewGuid, kinds[0].name, en.source as string, m, childIndex);
+  applySlots(world, plan, pool.ids, viewGuid, kinds[0].name, en.source as string, m, childIndex,
+    { rows, cols: Math.max(1, xw.pooled), entryW, entryH });
   return true;
 }
 
@@ -312,14 +354,46 @@ function ensureContentChild(world: World, view: EntityLike, m: Metas): EntityLik
   // Spawned HERE, inside the system tick, so `spawnEntity` tags it Transient and it can never
   // reach a saved scene file.
   const el = m.uiMeta.trait({
-    // A flex column that wraps: one code path serves a strip and a grid, the difference being
-    // how many entries fit per line.
-    flexDirection: 'row', flexWrap: 'wrap', width: 100, widthUnit: '%',
+    // A flex COLUMN of rows, sized by its content rather than by the viewport. Both halves are
+    // load-bearing: `width: 100%` plus a trailing padding is what collapses the content box to
+    // zero (see ENTRIES_ROW_NAME), and `alignItems: 'flex-start'` keeps a row at its own width
+    // instead of stretching it. The column's own `gap` is the Y gap; each row carries the X gap.
+    flexDirection: 'column', flexWrap: 'nowrap', alignItems: 'flex-start',
   });
   const at = m.attrMeta.trait({ name: ENTRIES_CONTENT_NAME, parentId: viewId });
   const tag = m.renderMeta.trait();
   const spawned = spawnEntity(world, el, at, tag) as unknown as EntityLike;
   return spawned ?? null;
+}
+
+/** Ensure `want` engine-owned rows exist under the content child, in order.
+ *
+ *  Rows are never destroyed, for the same reason the entry pool never shrinks: churning
+ *  entities exactly when the device is busiest. A row past the window is HIDDEN instead —
+ *  an empty row still has padding, so leaving it visible would widen the content box. */
+function ensureRows(world: World, content: EntityLike, want: number, m: Metas): EntityLike[] {
+  const contentId = content.id();
+  const found: { sort: number; e: EntityLike }[] = [];
+  world.query(m.attrMeta.trait, m.uiMeta.trait).updateEach((_t: unknown[], entity: unknown) => {
+    const e = entity as EntityLike;
+    const a = e.get(m.attrMeta.trait) as { name?: string; parentId?: number; sortOrder?: number };
+    if (a.parentId === contentId && a.name === ENTRIES_ROW_NAME) found.push({ sort: a.sortOrder ?? 0, e });
+  });
+  found.sort((a, b) => a.sort - b.sort);
+  const rows = found.map(f => f.e);
+
+  for (let i = rows.length; i < want; i++) {
+    const el = m.uiMeta.trait({
+      // Auto width — a row sizes to `padding + entries`, which is the whole point of the row
+      // layer. `flexShrink: 0` stops the column from squeezing it back down.
+      flexDirection: 'row', flexWrap: 'nowrap', flexShrink: 0, alignItems: 'flex-start',
+    });
+    const at = m.attrMeta.trait({ name: ENTRIES_ROW_NAME, parentId: contentId, sortOrder: i });
+    const spawned = spawnEntity(world, el, at, m.renderMeta.trait()) as unknown as EntityLike;
+    if (!spawned) break;
+    rows.push(spawned);
+  }
+  return rows;
 }
 
 /** Every pooled instance currently belonging to this view, by slot. Derived from the WORLD
@@ -367,24 +441,54 @@ function ensurePool(
   return { ids: bySlot, grew };
 }
 
-/** Carry the scroll offset as padding on the content child.
+/** Carry the scroll offset as padding, and the authored gaps as flex `gap`.
+ *
+ *  The Y half sits on the content child and the X half on every row — which is what lets
+ *  `UIElement`'s single `gap` field serve both axes (see ENTRIES_ROW_NAME).
  *
  *  ⚠️ Written in PX with the unit fields set explicitly. `UIElement`'s padding units default to
  *  `'%'`, and CSS percentage padding resolves against the containing block's WIDTH on both
- *  axes — so a `%` vertical padding is not "a share of the height", it is silently wrong. */
-function writePadding(content: EntityLike, m: Metas, xw: AxisWindow, yw: AxisWindow): void {
+ *  axes — so a `%` vertical padding is not "a share of the height", it is silently wrong.
+ */
+function writeLayout(
+  content: EntityLike, rows: EntityLike[], m: Metas,
+  xw: AxisWindow, yw: AxisWindow, en: Record<string, unknown>,
+): void {
+  const gapX = Math.max(0, (en.gapX as number) ?? 0);
+  const gapY = Math.max(0, (en.gapY as number) ?? 0);
+
   const cur = content.get(m.uiMeta.trait) as Record<string, unknown>;
   const next = {
     ...cur,
     paddingTop: yw.padLeading, paddingTopUnit: 'px',
     paddingBottom: yw.padTrailing, paddingBottomUnit: 'px',
-    paddingLeft: xw.padLeading, paddingLeftUnit: 'px',
-    paddingRight: xw.padTrailing, paddingRightUnit: 'px',
+    paddingLeft: 0, paddingLeftUnit: 'px',
+    paddingRight: 0, paddingRightUnit: 'px',
+    gap: gapY, gapUnit: 'px',
   };
-  if (cur.paddingTop === next.paddingTop && cur.paddingBottom === next.paddingBottom
-    && cur.paddingLeft === next.paddingLeft && cur.paddingRight === next.paddingRight
-    && cur.paddingTopUnit === 'px') return;
-  content.set(m.uiMeta.trait, next);
+  if (cur.paddingTop !== next.paddingTop || cur.paddingBottom !== next.paddingBottom
+    || cur.paddingLeft !== 0 || cur.paddingRight !== 0
+    || cur.paddingTopUnit !== 'px' || cur.gap !== gapY || cur.gapUnit !== 'px') {
+    content.set(m.uiMeta.trait, next);
+  }
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const rc = row.get(m.uiMeta.trait) as Record<string, unknown>;
+    const visible = i < yw.pooled;
+    const rn = {
+      ...rc,
+      paddingLeft: xw.padLeading, paddingLeftUnit: 'px',
+      paddingRight: xw.padTrailing, paddingRightUnit: 'px',
+      gap: gapX, gapUnit: 'px',
+      isVisible: visible,
+    };
+    if (rc.paddingLeft !== rn.paddingLeft || rc.paddingRight !== rn.paddingRight
+      || rc.paddingLeftUnit !== 'px' || rc.gap !== gapX || rc.gapUnit !== 'px'
+      || rc.isVisible !== visible) {
+      row.set(m.uiMeta.trait, rn);
+    }
+  }
 }
 
 /** Publish the window so game code, tests and Percept can verify BY DATA rather than pixels. */
@@ -401,6 +505,7 @@ function applySlots(
   world: World, plan: ReturnType<typeof planSlots>, pool: Map<number, EntityLike>,
   viewGuid: string, kindName: string, sourceName: string, m: Metas,
   childIndex: Map<number, { id: number; name: string }[]>,
+  grid: { rows: EntityLike[]; cols: number; entryW: number; entryH: number },
 ): void {
   const resolver = sourceName ? getEntrySource(sourceName) : undefined;
 
@@ -418,8 +523,19 @@ function applySlots(
     // from EntityAttributes.sortOrder, every pooled instance inherits the SAME authored value
     // from the prefab, and the tie-break is archetype order fixed at pool-creation time. Without
     // this the entries render in the wrong visual order while every trait value reads correctly.
+    // The row a slot belongs to, and its column within that row — `planSlots` numbers slots
+    // across then down, so this is the inverse of the one rule it uses. Reparenting happens on
+    // every re-drive rather than at spawn because a RESIZE changes `cols`, and with it which
+    // row a given slot sits in.
+    const ry = grid.cols > 0 ? Math.floor(slot / grid.cols) : 0;
+    const parent = grid.rows[ry] ?? grid.rows[grid.rows.length - 1];
+    const parentId = parent ? parent.id() : 0;
+    const sortWithinRow = grid.cols > 0 ? slot % grid.cols : slot;
+
     const attr = entity.get(m.attrMeta.trait) as Record<string, unknown>;
-    if (attr.sortOrder !== slot) entity.set(m.attrMeta.trait, { ...attr, sortOrder: slot });
+    if (attr.sortOrder !== sortWithinRow || attr.parentId !== parentId) {
+      entity.set(m.attrMeta.trait, { ...attr, sortOrder: sortWithinRow, parentId });
+    }
 
     const content: EntryContent | null = p.live && resolver
       ? resolver({ x: p.x, y: p.y, index: p.index })
@@ -433,8 +549,26 @@ function applySlots(
 
     // A parked entry is hidden AND flagged not-live. The flag is what makes it read as
     // DESTROYED to Percept/Enact; hiding is only what makes it invisible.
+    //  The RESOLVED entry size is written onto the pooled root, in px.
+    //
+    //  Not a shadow of the authored value — it IS the authored value resolved: `%` against the
+    //  live viewport, `0` read back from the prefab root. Writing it is what makes the box
+    //  definite, and a definite box is what a `%`-sized prefab root needs once its parent is an
+    //  auto-width row (a `%` against an indefinite container silently becomes content-sized).
+    //  `flexShrink: 0` is the other half: without it the row's own trailing padding squeezes
+    //  every entry to nothing, which is exactly how the pager rendered 0px-wide pages.
     const ui = entity.get(m.uiMeta.trait) as Record<string, unknown> | undefined;
-    if (ui && ui.isVisible !== live) entity.set(m.uiMeta.trait, { ...ui, isVisible: live });
+    if (ui) {
+      const wantW = Math.max(0, grid.entryW);
+      const wantH = Math.max(0, grid.entryH);
+      if (ui.isVisible !== live || ui.width !== wantW || ui.height !== wantH
+        || ui.widthUnit !== 'px' || ui.heightUnit !== 'px' || ui.flexShrink !== 0) {
+        entity.set(m.uiMeta.trait, {
+          ...ui, isVisible: live, flexShrink: 0,
+          width: wantW, widthUnit: 'px', height: wantH, heightUnit: 'px',
+        });
+      }
+    }
     if (!live || !content) continue;
 
     const { writes, problems } = planEntryWrites(childIndex, entity.id(), content);

@@ -1692,12 +1692,14 @@ working while nothing happened. The forward path of the same function usually ch
 it was only ever the undo/redo closures that didn't.
 
 **The reporting bar, and why it is not a throw.** A throw looks like the stronger answer — leave
-the entry on the stack so the user can retry — and it is measurably worse. `undo()`
-(`undo/undoManager.ts`) pops the action **before** awaiting `action.undo()`, so on a throw the
-`redoStack.push`, `notifyEdited`, `markAffectedScenesDirty` and the `!undo` journal event are all
-skipped and the action is lost from **BOTH** stacks; `serialize` then hands the rejection to a
-caller that does not catch it. Making a throw safe means fixing undoManager's bookkeeping first.
-So the bar is #291's — report, let the stack pop, keep editor state consistent with disk:
+the entry on the stack so the user can retry — and it is worse. It used to be worse because
+`undo()` popped the action **before** awaiting `action.undo()` with no catch, so a throw skipped
+`redoStack.push`, `notifyEdited`, `markAffectedScenesDirty`, `notifyUndoChanged` and the `!undo`
+event: the action was lost from **BOTH** stacks while the panel still rendered it as completed,
+and `serialize` handed the rejection to a caller that does not catch it. **#310 fixed that
+bookkeeping** (see below), so a throw is now survivable — but the entry is still *dropped*, so a
+throw still costs the user their way back. The bar is unchanged, and is #291's — report, let the
+stack pop, keep editor state consistent with disk:
 
 - **`reportUndoFailure`** (`undo/undoFailure.ts`) is the one reporter. `console.error` naming the
   direction, the action's label and the paths, always. That log is the user's only hand-recovery
@@ -1809,6 +1811,51 @@ create → rename → undo → undo left a key for a folder that no longer exist
 `buildFolderTree` builds nodes from `pendingFolders`/`diskFolders`/assets and never from `expanded`
 — but persisted, so it accumulated forever. Redo deliberately does not re-add it: the forward path
 never put it there.
+
+
+### A throwing undo/redo closure drops the action, loudly (#310)
+
+The sibling of the class above, and the reason its bar is "report, never throw". Split out of #308
+because it needed a policy decision, not a mechanical guard.
+
+**The mechanism.** `undo()` pops the action, then awaits `action.undo()`. Before #310 only
+`_executing` was in a `try/finally`, so a throw skipped every statement after the await —
+`redoStack.push`, `notifyEdited`, `markAffectedScenesDirty`, `notifyUndoChanged` and the `!undo`
+event. The action ended up on **neither** stack: it could not be redone and could not be undone
+again, it vanished from the panel *as though it had completed*, and `serialize` handed the
+rejection to a caller that does not catch it — including the MCP `undo` op, which reported `did`
+for a step that threw. `redo()` was symmetric, and identical, because the two were duplicated.
+
+**The policy (owner, 2026-08-21): drop the action, with a loud report.** It is the same outcome
+as before — the entry is gone — but deliberate and *reported* instead of silent. The alternatives
+and why they lost:
+
+| | Why not |
+|---|---|
+| Put it back on its own stack to retry | A closure that threw PARTWAY has already applied some of its work; ⌘Z again re-applies that half |
+| Push to the other stack as if it succeeded | Keeps the stacks symmetric, but that is the original false success in a nicer costume |
+
+**Three things must still happen on the failure path**, and each was its own bug. Whatever policy
+a future change picks, these do not change:
+
+- **`notifyUndoChanged()` fires.** The stack really did change, so a panel that skips this keeps
+  rendering history that no longer exists — the part the user actually sees.
+- **The journal event still fires, carrying `failed: true`.** Emitting nothing lets an entry
+  disappear with no trace; emitting a bare `!undo` claims an undo that did not happen.
+- **The dirty signals fire.** A closure that threw halfway HAS moved the world and we cannot know
+  how far, so marking dirty is the conservative direction — under-reporting loses the user's work.
+
+`undo()` and `redo()` now share one `runStep` helper, because they had the same bug twice.
+`runStep` returns whether the step applied; `false` reaches the MCP op as `did`. The reporter is
+`reportUndoThrew` (`undo/undoFailure.ts`), which **always** toasts — the two-level rule above
+distinguishes a failure the user can fix from one they cannot, and this is neither: it is history
+loss, worth interrupting for whatever caused it.
+
+⚠️ **This was LATENT when fixed** — #308 closed the last live route (`SceneAssetView`'s
+`mutateScene` let a network-level rejection escape; it catches now), and every filesystem helper
+resolves `false` rather than throwing. It was fixed anyway because "just throw so the entry stays
+on the stack" is the obvious-looking design the next change will reach for, and it did not work
+until this landed.
 
 
 ## Quick reference

@@ -676,10 +676,54 @@ coordinates (the system converts, since it is what resolves entry size); the dec
   frequency.
 - **A parked entry reads as DESTROYED to Percept and Enact** — not listed, not aimable, subtree
   included. This is NOT the same as `isVisible: false`, which stays addressable.
-- **The content child is engine-owned** (`__uiEntriesContent`), spawned inside a system tick so
-  it is `Transient` and never reaches a saved scene.
+- **Two engine-owned layers sit under the box**, both spawned inside a system tick so they are
+  `Transient` and never reach a saved scene: a `__uiEntriesContent` column, and one
+  `__uiEntriesRow` per pooled row. See "the DOM shape" below for why the row layer exists.
 - **The entry prefab root needs `RenderableUI`**, or the entry renders nothing while looking
   perfect in `get_scene_state`.
+
+### The DOM shape — a column of auto-width rows, and why a flat box cannot work
+
+The scroll offset is carried as **padding**, and CSS padding eats the box it sits on. A single
+content child at `width: 100%` with `padding-right: 23040px` has a content box of **zero**: every
+entry in it shrinks to nothing and `flex-wrap` has no line to wrap into. Measured on
+`demos/scroll-demo` (2026-08-21): pager pages came back **0px wide**, and grid tiles authored at
+120px rendered at **36px stacked in one column**. The vertical strip survived only because
+vertical padding does not touch the *horizontal* content box — which is precisely why one axis
+shipped looking correct while both others were broken.
+
+So the content child is a **column of auto-width rows**: an auto-width box sizes to
+`padding + children` instead of being squeezed by its own padding.
+
+| Element | Carries |
+|---|---|
+| the scroll box | `overflow`, `scroll-snap-type`, `overscroll-behavior` |
+| `__uiEntriesContent` (column) | the **Y** offset as `padding-top`/`bottom`, and the **Y** gap as `gap` |
+| `__uiEntriesRow` (row, auto width) | the **X** offset as `padding-left`/`right`, and the **X** gap as `gap` |
+| the pooled entry | the resolved entry size in px, `flex-shrink: 0`, and `scroll-snap-align` |
+
+Three things fall out of the split rather than needing their own rule: `UIElement`'s single `gap`
+field serves both axes (a column's gap is the Y gap, a row's is the X gap); wrap disappears, so
+the 2-D case never has to reconcile "break every `pooled` entries" with the width the scrollbar
+needs; and `padLeading + rendered + padTrailing` lands exactly on `count × stride − gap`
+(verified live: a 20 × 250 grid of 120px tiles at `gap: 8` measured `scrollWidth` 2552 and
+`scrollHeight` 31992).
+
+**The engine writes the resolved entry size onto the pooled root**, in px. That is not a shadow
+of the authored value — it *is* the authored value resolved (`%` against the live viewport, `0`
+read back from the prefab root), and a definite box is what a `%`-sized prefab root needs once
+its parent is an auto-width row.
+
+⚠️ **A viewport RESIZE moves no window origin.** `first` stays put while every padding value
+changes, so entry size and pooled-column count are part of the system's invalidation test, not
+just the window origin. Without that the pager kept a 640px page inside a 395px panel — for good.
+
+**Snapping is declared on the box and honoured on the TARGET**, and those are different
+elements. The tree build stamps `scroll-snap-align`/`scroll-snap-stop` onto the pooled entries
+(or, for a scroll view with no entries, onto its direct children). Stamping the *entry* rather
+than the row serves both axes at once. `scrollSnapChildStyle` shipped with a unit test and no
+caller, so `snap` styled the container and nothing ever snapped — found by measuring the pager's
+DOM, and the reason this paragraph exists.
 
 ## Text animation (`TextAnimation` → CSS)
 

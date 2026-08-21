@@ -300,6 +300,54 @@ authoring for a project whose camera genuinely pulls back (a strategy or fly-ove
 same chain would fire constantly — the point is that "fix the LOD distances" is a **correctness /
 content** job, not a performance one, until a profile shows a GPU-bound vertex cost.
 
+## A failed write ABORTS the import — and nothing is registered before its file exists (#311)
+
+Browser-side import (`editor/scene/modelImport.ts`) generates many files: a `.mat.json` per
+deduped material, a `.mesh.json` per mesh, extracted `.png` textures, `.meta.json` sidecars.
+
+**The defect.** Its local `writeAssetFile` wrapper **never throws** — like its `assetOps`
+siblings it catches and resolves `false` — and three call sites discarded that. Two of them ran
+`registerAsset(...)` **first** and threw the write's result away, so a failed write left the asset
+manifest mapping a GUID to a path with no file behind it. Everything then resolves correctly for
+the rest of the session (the manifest is in memory); the dangling ref surfaces on the next scene
+load or a fresh editor launch, which read the file. Same delayed cache-vs-disk desync as #308,
+and delayed in the same way — the failure surfaces far from its cause.
+
+**Two independent halves, and the ordering one is the load-bearing fix:**
+
+1. **`registerAsset` runs only after a confirmed write.** This is what prevents the dangling ref.
+   A test that only checks the return value passes with the ordering still wrong.
+2. **The first failed write aborts the whole import** (owner's decision, 2026-08-21). Rejected:
+   *skip that asset and continue*, because a partially-imported model's missing pieces are
+   invisible until something renders wrong; and *roll back what was written*, which is more
+   machinery and can itself fail.
+
+**How the abort travels.** `writeAssetFileOrAbort` throws an internal `ImportWriteAborted`;
+`importModel` is a thin boundary around `importModelInner` that catches it, reports, and returns
+`0` — the falsy value both call sites (`Assets.tsx`, `ModelAssetView.tsx`) already check with
+`if (!rootId) return;`. **It must never escape as an exception**: neither caller wraps the call in
+a `try`.
+
+Two consequences worth knowing:
+
+- **No stray entities.** Every guarded write happens before the import spawns anything
+  (`spawnEntity` is the last step), so an abort leaves the scene untouched and the caller's
+  `deleteEntity(rootId)` cleanup is simply unreachable.
+- **Earlier files stay on disk.** That is safe precisely *because* of half 1: they are regenerable
+  outputs a re-import overwrites, and nothing in the manifest points at the file that failed.
+
+⚠️ **Texture extraction's per-texture `catch` re-throws `ImportWriteAborted`.** That catch exists
+for genuine extraction failures (decode, unsupported format), which legitimately skip one texture —
+without the guard it would silently downgrade an abort back into a skip. The texture write itself
+was already checked and never produced a dangling ref (it `continue`d before recording the path);
+it now aborts instead, so the policy is uniform.
+
+**Not covered:** the three `/api/write-meta` sidecar writes are still unchecked. A missing
+`.meta.json` does not dangle a ref — the GUID is simply re-minted on the next import — so making a
+sidecar hiccup fail an otherwise-good import was judged the worse trade. Deliberate, not an
+oversight.
+
+
 ## Known limits (v1)
 
 - **Multiple Nodes sharing the SAME Mesh primitive with divergent fixups** →

@@ -185,7 +185,18 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
 
     // Temporarily spawn entities to serialize as prefab, then clean up
     const rootId = await importModel(assetPath, prefix, postprocessorId, rootTransform);
-    if (!rootId) return;
+    // #311: `importModel` returns 0 when a generated-file write failed and it aborted. This
+    // early return is OLDER than that and used to be dead code — before the abort existed the
+    // import always returned a real spawned entity id — so it returned from inside the `try`
+    // WITHOUT clearing the progress modal, leaving a full-screen blocking spinner with no OK
+    // button until a page reload. Report it the same way the catch below reports a throw: an
+    // abort is an import failure, and `setImportError` is the dismissible modal for one.
+    // (A blanket `finally { setImportStatus(false) }` would be wrong — it resets `failed`,
+    // wiping the very error modal the catch sets.)
+    if (!rootId) {
+      setImportError(`Import of "${assetName}" was aborted — a generated file could not be written (see console).`);
+      return;
+    }
 
     const prefab = serializePrefab(rootId);
 

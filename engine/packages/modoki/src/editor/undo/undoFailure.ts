@@ -7,14 +7,17 @@
  *  working while nothing happened. The forward path of the same function usually
  *  checks the return; only the undo/redo closures didn't.
  *
- *  **Why report rather than throw.** A throw looks like the stronger answer — leave
- *  the entry on the stack so the user can retry — and it is measurably worse here.
- *  `undo()` (undoManager.ts) pops the action BEFORE awaiting `action.undo()`, so on a
- *  throw the `redoStack.push`, `notifyEdited`, `markAffectedScenesDirty` and the
- *  `!undo` journal event are all skipped and the action is lost from BOTH stacks;
- *  `serialize` then hands the rejection to a caller that does not catch it. Making
- *  throwing safe means fixing undoManager's bookkeeping first. So the bar is #291's:
- *  report, let the stack pop, and leave the editor's state consistent with disk.
+ *  **Why report rather than throw — still true, for a different reason now (#310).**
+ *  A throw looks like the stronger answer (leave the entry on the stack so the user can
+ *  retry) and it is worse. It used to be worse because `undo()` popped the action BEFORE
+ *  awaiting it with no catch, so a throw skipped `redoStack.push`, `notifyEdited`,
+ *  `markAffectedScenesDirty`, `notifyUndoChanged` and the `!undo` event, silently losing
+ *  the action from BOTH stacks while the UI showed it as completed; `serialize` then handed
+ *  the rejection to a caller that did not catch it. **#310 fixed that bookkeeping**: a throw
+ *  is now caught, reported via `reportUndoThrew`, and the notify + journal events fire.
+ *  But the entry is still DROPPED — deliberately now, not silently — so a throw still costs
+ *  the user their way back. The bar remains #291's: report, let the stack pop, and leave the
+ *  editor's state consistent with disk.
  *
  *  **Why two levels.** A failure the user CAUSED and can FIX — they recreated
  *  something at the old path, so undoing the rename collides (`/api/move-file` 409s,
@@ -52,4 +55,35 @@ export function reportUndoFailure(opts: {
       'warn',
     );
   }
+}
+
+/** Report an undo/redo closure that THREW, and whose action was therefore dropped (#310).
+ *
+ *  Distinct from `reportUndoFailure` above, which covers the common case: a helper resolved
+ *  `false`, the step did not apply, and the entry moved across the stacks normally. This one
+ *  is worse in a way the user has to be told about — the action is gone from BOTH stacks, so
+ *  there is no way back to that state through the history, and a closure that threw PARTWAY
+ *  may have applied some of its work already.
+ *
+ *  Always toasts, unlike the two-level rule above. That rule distinguishes a failure the user
+ *  can fix from one they cannot; this is neither — it is history loss, and it is worth
+ *  interrupting for whatever caused it. */
+export function reportUndoThrew(opts: {
+  direction: UndoDirection;
+  label: string;
+  error: unknown;
+}): void {
+  const { direction, label, error } = opts;
+  const detail = error instanceof Error ? error.message : String(error);
+  const other = direction === 'Undo' ? 'redone' : 'undone';
+  console.error(
+    `[undo] ${direction} of "${label}" THREW — ${detail}. The entry was DROPPED from the history: ` +
+    `it cannot be ${other}, and part of it may already have been applied. Check the scene/files ` +
+    'before continuing.',
+    error,
+  );
+  useEditorStore.getState().showToast(
+    `${direction} of "${label}" FAILED and was dropped from the history (see console)`,
+    'warn',
+  );
 }

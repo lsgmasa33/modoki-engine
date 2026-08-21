@@ -2,6 +2,7 @@
 
 import { editorEmit } from '../editorJournal';
 import { markSceneDirty } from '../scene/sceneDirty';
+import { reportUndoThrew } from './undoFailure';
 
 /** Structured diff for a trait-field edit — the machine-readable companion to an
  *  action's human `label`, forwarded into the editor journal's `!edit` event so
@@ -315,21 +316,79 @@ export function pushSelectionChange(
   pushAction({ label, undo: undoFn, redo: redoFn, _isSelection: true });
 }
 
+/** Run one half of an already-popped action and do its bookkeeping. Shared by `undo` and
+ *  `redo` so the two can't drift — before #310 they were duplicated, and both had the same bug.
+ *
+ *  ⚠️ **A THROWING closure DROPS the action** (#310, policy set by the owner 2026-08-21). It is
+ *  already off its own stack and it does NOT go onto the other one, so there is no way back to
+ *  that state through the history. That was the behaviour before too — the difference is that it
+ *  is now deliberate and REPORTED, where it used to be silent: every statement after the `await`
+ *  was skipped, so the entry vanished from the panel while the UI showed it as completed, and
+ *  `serialize` handed the rejection to a caller that does not catch it.
+ *
+ *  Rejected alternatives, so nobody re-litigates them from first principles: putting it back on
+ *  its own stack for a retry (a closure that threw PARTWAY has already applied some of its work,
+ *  so ⌘Z again re-applies that half), and pushing it to the other stack as if it succeeded
+ *  (keeps the stacks symmetric, but that is the original false success in a nicer costume).
+ *
+ *  Three things must happen on the failure path regardless of the policy, and each was a bug:
+ *  - `notifyUndoChanged()` — the stack REALLY changed (the entry is gone), so a panel that skips
+ *    this keeps rendering the pre-throw history.
+ *  - The journal event still fires, carrying `failed: true`. Emitting nothing would let an entry
+ *    disappear with no trace; emitting a bare `!undo` would claim an undo that did not happen.
+ *  - The dirty signals fire. A closure that threw halfway HAS moved the world, and we cannot know
+ *    how far, so marking dirty is the conservative direction — under-reporting loses the work.
+ *
+ *  Returns whether the step actually applied. `false` reaches the MCP `undo`/`redo` op as `did`
+ *  (agentEditorOps.ts), which used to report success for a step that threw. */
+async function runStep(
+  direction: 'Undo' | 'Redo',
+  action: UndoAction,
+  run: () => void | Promise<void>,
+  pushTo: UndoAction[],
+  event: '!undo' | '!redo',
+): Promise<boolean> {
+  _executing = true;
+  let ok = false;
+  let error: unknown;
+  // Not `catch { }` + a sentinel: a closure may legitimately throw `undefined`, and testing the
+  // caught value for one would read that as success.
+  try { await run(); ok = true; } catch (e) { error = e; } finally { _executing = false; }
+
+  if (ok) pushTo.push(action);
+
+  if (!action._isSelection && !action._isFileDirect) notifyEdited(); // the world moved relative to disk
+  markAffectedScenesDirty(action);
+  notifyUndoChanged();
+  const payload = buildEditorPayload(action);
+  if (!ok) payload.failed = true;
+  editorEmit(event, payload);
+
+  // Reported LAST, and guarded. `reportUndoThrew` reaches into the editor store to toast, and
+  // this whole function exists because bookkeeping must not be skippable by a throw — leaving
+  // the reporter able to skip it, or to reject out through `serialize`, would reproduce #310
+  // one level up. A reporter that fails costs a message, never the state.
+  if (!ok) {
+    try {
+      reportUndoThrew({ direction, label: action.label, error });
+    } catch (e) {
+      console.error('[undo] failed to report a throwing undo/redo closure', e);
+    }
+  }
+  return ok;
+}
+
 /** Undo the last action. Serialized: if another undo/redo is in flight, this
- *  one waits its turn (it pops the stack only when it actually runs). */
+ *  one waits its turn (it pops the stack only when it actually runs).
+ *
+ *  A THROWING closure drops the action, loudly (#310) — see `runStep` for why that is the
+ *  chosen policy and what still has to happen on the failure path. */
 export function undo(): Promise<boolean> {
   return serialize(async () => {
     _coalesce = null; // any explicit undo ends the current edit chain
     const action = undoStack.pop();
     if (!action) return false;
-    _executing = true;
-    try { await action.undo(); } finally { _executing = false; }
-    redoStack.push(action);
-    if (!action._isSelection && !action._isFileDirect) notifyEdited(); // the world moved relative to disk
-    markAffectedScenesDirty(action);
-    notifyUndoChanged();
-    editorEmit('!undo', buildEditorPayload(action));
-    return true;
+    return runStep('Undo', action, () => action.undo(), redoStack, '!undo');
   });
 }
 
@@ -339,14 +398,7 @@ export function redo(): Promise<boolean> {
     _coalesce = null;
     const action = redoStack.pop();
     if (!action) return false;
-    _executing = true;
-    try { await action.redo(); } finally { _executing = false; }
-    undoStack.push(action);
-    if (!action._isSelection && !action._isFileDirect) notifyEdited(); // the world moved relative to disk
-    markAffectedScenesDirty(action);
-    notifyUndoChanged();
-    editorEmit('!redo', buildEditorPayload(action));
-    return true;
+    return runStep('Redo', action, () => action.redo(), undoStack, '!redo');
   });
 }
 

@@ -169,13 +169,91 @@ describe('entriesSystem', () => {
     expect(parked.every(p => p.index === -1)).toBe(true);
   });
 
-  it('writes sortOrder per slot — child order comes from it and every instance shares the prefab value', async () => {
+  it('orders by ROW then by column — sortOrder is the position within the row, not the slot', async () => {
     const { sys, src } = await setup({}, 12000);
     src.registerEntrySource('test.rows', () => ({ members: {} }));
     sys.entriesSystem(testWorld);
+
+    // A 1-column strip: every entry is alone on its row, so each carries sortOrder 0 and the
+    // visual order comes entirely from the ROWS' own sortOrder. Asserting `sortOrder === slot`
+    // (the pre-row rule) would pass while every entry sat in the same row.
+    const rowIds = new Set<number>();
     const orders: number[] = [];
-    testWorld.query(UIEntry, EntityAttributes).updateEach(([e, a]: any[]) => orders.push(a.sortOrder - e.slot));
-    expect(new Set(orders)).toEqual(new Set([0]));  // sortOrder === slot for every pooled entry
+    testWorld.query(UIEntry, EntityAttributes).updateEach(([, a]: any[]) => {
+      orders.push(a.sortOrder); rowIds.add(a.parentId);
+    });
+    expect(new Set(orders)).toEqual(new Set([0]));
+    expect(rowIds.size).toBe(orders.length);       // one row each, none sharing
+
+    const rows: number[] = [];
+    testWorld.query(EntityAttributes).updateEach(([a]: any[]) => {
+      if (a.name === '__uiEntriesRow') rows.push(a.sortOrder);
+    });
+    expect(rows.sort((x, y) => x - y)).toEqual([...rows.keys()]);
+  });
+
+  it('a 2-D window packs each row with its own entries — the grid case', async () => {
+    const { sys, src, view } = await setup({
+      countX: 20, countY: 250, entryWidth: 100, entryWidthUnit: 'px', overscan: 0,
+    });
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+
+    const en = view.get(UIEntries) as any;
+    const byRow = new Map<number, number[]>();
+    testWorld.query(UIEntry, EntityAttributes).updateEach(([, a]: any[]) => {
+      const b = byRow.get(a.parentId) ?? []; b.push(a.sortOrder); byRow.set(a.parentId, b);
+    });
+    expect(byRow.size).toBe(en.visibleY);
+    for (const cols of byRow.values()) {
+      expect(cols.sort((x, y) => x - y)).toEqual([...Array(en.visibleX).keys()]);
+    }
+  });
+
+  it('splits the offset: Y padding on the content child, X padding on every row', async () => {
+    const { sys, src } = await setup({
+      countX: 20, countY: 250, entryWidth: 100, entryWidthUnit: 'px', gapX: 8, gapY: 4, overscan: 0,
+    }, 0);
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+
+    let content: any; const rows: any[] = [];
+    testWorld.query(EntityAttributes, UIElement).updateEach(([a, ui]: any[]) => {
+      if (a.name === '__uiEntriesContent') content = ui;
+      if (a.name === '__uiEntriesRow') rows.push(ui);
+    });
+    // ⚠️ The content child must carry NO horizontal padding. Padding is what collapses the box
+    // it sits on, and a `width:100%` content child with a trailing X padding is exactly how the
+    // pager rendered 0px-wide pages — see ENTRIES_ROW_NAME.
+    expect(content.paddingLeft).toBe(0);
+    expect(content.paddingRight).toBe(0);
+    expect(content.gap).toBe(4);                  // the column's gap IS the Y gap
+    expect(content.gapUnit).toBe('px');
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every(r => r.gap === 8 && r.gapUnit === 'px')).toBe(true);
+    expect(rows.every(r => r.paddingRight > 0)).toBe(true);
+  });
+
+  it('re-lays-out on a viewport RESIZE, which moves no window origin', async () => {
+    // A `%` entry resolves against the viewport, so a resize changes every padding value while
+    // `first` stays put. The cheap `!moved` early-out used to keep the old geometry forever —
+    // measured live on the pager, which kept a 640px page inside a 395px panel.
+    const { sys, src, view } = await setup({
+      countX: 1, countY: 40, entryHeight: 100, entryHeightUnit: '%',
+    });
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+
+    const heightOf = () => {
+      let h = -1;
+      testWorld.query(UIEntry, UIElement).updateEach(([, ui]: any[]) => { if (h < 0) h = ui.height; });
+      return h;
+    };
+    expect(heightOf()).toBe(VIEWPORT);
+
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), viewportHeight: 300 });
+    sys.entriesSystem(testWorld);
+    expect(heightOf()).toBe(300);
   });
 
   it('does no work when nothing moved — the cheap path a scroll frame takes', async () => {

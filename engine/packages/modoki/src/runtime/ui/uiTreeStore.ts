@@ -17,6 +17,7 @@ import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { markUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
 import { spriteEpoch } from '../core/textureRefs';
 import { resolveUIFontFamily, resetFontRefWarnings } from './fontFamilyRef';
+import { scrollSnapChildStyle } from './scrollViewDom';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
 import type { World } from 'koota';
 import type { UIActionBinding } from './bindings';
@@ -100,6 +101,17 @@ export interface UINodeData {
    *  rode down in the projection, every scroll event would change this node, `nodesEqual` would
    *  fail, and the whole "a scroll frame costs nothing" property would be gone. */
   scroll?: { axis: string; snap: string; snapStop: string; overscroll: string; scrollToX: number; scrollToY: number; scrollBehavior: string };
+  /** True when this node is a pooled `UIEntries` entry. Its only job here is to name the SNAP
+   *  TARGETS of an enclosing scroll view — see `stampSnapTargets`. */
+  isEntry?: boolean;
+  /** `scroll-snap-align` + `scroll-snap-stop`, stamped by the enclosing scroll view.
+   *
+   *  ⚠️ It rides the NODE rather than being applied by the scroll view's own element because
+   *  CSS snapping is declared on the box and honoured on the TARGET, and those are different
+   *  elements. `scrollSnapChildStyle` shipped in #250 with a unit test and NO caller, so
+   *  `UIScrollView.snap` styled the container and nothing ever snapped — the repo's
+   *  unreachable-mechanism defect class, found by measuring the pager's DOM. */
+  snapChild?: Record<string, string>;
   /** TextAnimation trait — whole-element CSS text animation (fade/wave/bounce/jitter/
    *  rainbow/typewriter) realized by UINode. Shared trait with the 2D/3D geometry paths. */
   textAnim?: { effect: string; speed: number; amplitude: number; frequency: number; loop: boolean; fadeIn: boolean };
@@ -161,7 +173,7 @@ const _sortMap = new Map<number, number>();
 let _prevById = new Map<number, UINodeData>();
 
 // Node keys that aren't plain scalars — compared specially in nodesEqual.
-const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim', 'toggle', 'touch', 'scroll']);
+const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim', 'toggle', 'touch', 'scroll', 'snapChild']);
 // Derived ONCE from a real node, so every scalar field is covered automatically:
 // add a field to UINodeData and it's compared without editing this file.
 let _scalarKeys: string[] | null = null;
@@ -194,6 +206,7 @@ export function nodesEqual(a: UINodeData, b: UINodeData): boolean {
   if (!shallowOptEqual(a.toggle as Record<string, unknown> | undefined, b.toggle as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.touch as Record<string, unknown> | undefined, b.touch as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.scroll as Record<string, unknown> | undefined, b.scroll as Record<string, unknown> | undefined)) return false;
+  if (!shallowOptEqual(a.snapChild as Record<string, unknown> | undefined, b.snapChild as Record<string, unknown> | undefined)) return false;
   // action.bindings is an array — ref-compare, but treat two empties as equal
   // (the builder allocates a fresh [] when the trait carries none).
   if (a.action || b.action) {
@@ -221,7 +234,7 @@ function reconcileNode(node: UINodeData, nextPrev: Map<number, UINodeData>): UIN
 
 // Cache trait lookups (resolve once, reuse across frames)
 let _traitsCached = false;
-let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any, _toggleMeta: any, _touchMeta: any, _scrollMeta: any;
+let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any, _toggleMeta: any, _touchMeta: any, _scrollMeta: any, _entryMeta: any;
 
 function cacheTraits() {
   const allTraits = getAllTraits();
@@ -236,6 +249,7 @@ function cacheTraits() {
   _videoMeta = allTraits.find(m => m.name === 'VideoPlayer');
   _toggleMeta = allTraits.find(m => m.name === 'UIToggle');
   _scrollMeta = allTraits.find(m => m.name === 'UIScrollView');
+  _entryMeta = allTraits.find(m => m.name === 'UIEntry');
   _touchMeta = allTraits.find(m => m.name === 'TouchControl');
   _traitsCached = !!(_renderUIMeta && _uiElMeta);
 }
@@ -258,6 +272,36 @@ function sortChildren(n: UINodeData) {
  *  one. `loadSceneFile` fires exactly ONE markUIDirty for the whole batch, so if that is the
  *  signal that lands here too early, no UI is ever rendered: no Canvas2D node means
  *  `Canvas2DMount` never mounts, which means a 2D game draws NOTHING, with no error anywhere. */
+/** Collect the pooled entries under a scroll view, without crossing into a NESTED scroll view
+ *  (its own entries are its own snap targets, not this one's). */
+function collectEntries(node: UINodeData, out: UINodeData[]): void {
+  for (const c of node.children) {
+    if (c.isEntry) out.push(c);
+    if (c.scroll) continue;
+    collectEntries(c, out);
+  }
+}
+
+/** Stamp `scroll-snap-align` onto a scroll view's snap TARGETS.
+ *
+ *  Targets are the pooled ENTRIES when the view has any — an entry is the unit a pager or a
+ *  grid is meant to rest on, and it is two levels below the box now that the offset is carried
+ *  by a content child and a row (see `entriesSystem`'s ENTRIES_ROW_NAME). A view with no
+ *  entries snaps to its direct children instead, which is the plain authored-children case the
+ *  trait's own doc calls out as useful on its own.
+ *
+ *  Stamping an entry rather than a row serves BOTH axes at once: an entry box has an extent on
+ *  each, so `both mandatory` needs no second rule. */
+export function stampSnapTargets(node: UINodeData): void {
+  if (node.scroll && node.scroll.snap !== 'none') {
+    const css = scrollSnapChildStyle(node.scroll);
+    const entries: UINodeData[] = [];
+    collectEntries(node, entries);
+    for (const t of (entries.length ? entries : node.children)) t.snapChild = css;
+  }
+  for (const c of node.children) stampSnapTargets(c);
+}
+
 function buildTree(world: World): UINodeData[] | null {
   if (!_traitsCached) cacheTraits();
   if (!_traitsCached) {
@@ -398,6 +442,7 @@ function buildTree(world: World): UINodeData[] | null {
           disabled: t.disabled === true,
         };
       }
+      if (_entryMeta && entity.has(_entryMeta.trait)) node.isEntry = true;
       if (_scrollMeta && entity.has(_scrollMeta.trait)) {
         const sv = entity.get(_scrollMeta.trait) as any;
         node.scroll = {
@@ -490,6 +535,7 @@ function buildTree(world: World): UINodeData[] | null {
 
   roots.sort(sortBySortOrder);
   for (let i = 0; i < roots.length; i++) sortChildren(roots[i]);
+  for (let i = 0; i < roots.length; i++) stampSnapTargets(roots[i]);
 
   // Reuse unchanged node objects from last frame so React.memo(UINode) skips them.
   const nextPrev = new Map<number, UINodeData>();

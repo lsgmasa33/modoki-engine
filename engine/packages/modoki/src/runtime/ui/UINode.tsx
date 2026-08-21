@@ -323,6 +323,9 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // owner. A UIScrollView on an element left at `overflow:'visible'` therefore does not scroll,
   // which is the honest outcome rather than two fields silently fighting.
   if (node.scroll) Object.assign(style, scrollViewStyle(node.scroll));
+  // The snap TARGET half, stamped by the enclosing scroll view during the tree build — snapping
+  // is declared on the box and honoured on the target, and those are different elements.
+  if (node.snapChild) Object.assign(style, node.snapChild);
 
   // ── TouchControl (on-screen d-pad / button, #297) ──
   //

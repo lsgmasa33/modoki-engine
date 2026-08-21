@@ -472,3 +472,57 @@ describe('uiTreeStore', () => {
     });
   });
 });
+
+describe('stampSnapTargets', () => {
+  /** A minimal node — only the fields the stamper reads. */
+  const node = (over: Record<string, unknown> = {}): any =>
+    ({ entityId: 1, children: [], ...over });
+  const SCROLL = { axis: 'x', snap: 'start', snapStop: 'always', overscroll: 'contain',
+    scrollToX: -1, scrollToY: -1, scrollBehavior: 'instant' };
+
+  it('stamps the ENTRIES, not the engine-owned layers between them', async () => {
+    const { stampSnapTargets } = await getModule();
+    // view > content > row > two entries — the shape entriesSystem actually builds.
+    const e1 = node({ entityId: 4, isEntry: true });
+    const e2 = node({ entityId: 5, isEntry: true });
+    const row = node({ entityId: 3, children: [e1, e2] });
+    const content = node({ entityId: 2, children: [row] });
+    const view = node({ entityId: 1, scroll: SCROLL, children: [content] });
+
+    stampSnapTargets(view);
+    expect(e1.snapChild).toEqual({ scrollSnapAlign: 'start', scrollSnapStop: 'always' });
+    expect(e2.snapChild).toEqual({ scrollSnapAlign: 'start', scrollSnapStop: 'always' });
+    // ⚠️ The row and the content child must NOT be targets: a snap area per layer would add
+    // snap points the design does not have.
+    expect(row.snapChild).toBeUndefined();
+    expect(content.snapChild).toBeUndefined();
+  });
+
+  it('falls back to direct children when the view has no entries', async () => {
+    const { stampSnapTargets } = await getModule();
+    const a = node({ entityId: 2 });
+    const view = node({ scroll: SCROLL, children: [a] });
+    stampSnapTargets(view);
+    expect(a.snapChild).toEqual({ scrollSnapAlign: 'start', scrollSnapStop: 'always' });
+  });
+
+  it("stamps nothing when snap is 'none' — the default", async () => {
+    const { stampSnapTargets } = await getModule();
+    const a = node({ entityId: 2, isEntry: true });
+    const view = node({ scroll: { ...SCROLL, snap: 'none' }, children: [a] });
+    stampSnapTargets(view);
+    expect(a.snapChild).toBeUndefined();
+  });
+
+  it('does not reach into a NESTED scroll view — its entries are its own', async () => {
+    const { stampSnapTargets } = await getModule();
+    const inner = node({ entityId: 5, isEntry: true });
+    const innerView = node({ entityId: 4, scroll: { ...SCROLL, snap: 'center' }, children: [inner] });
+    const outer = node({ entityId: 3, isEntry: true, children: [innerView] });
+    const view = node({ scroll: SCROLL, children: [outer] });
+
+    stampSnapTargets(view);
+    expect(outer.snapChild).toEqual({ scrollSnapAlign: 'start', scrollSnapStop: 'always' });
+    expect(inner.snapChild).toEqual({ scrollSnapAlign: 'center', scrollSnapStop: 'always' });
+  });
+});
