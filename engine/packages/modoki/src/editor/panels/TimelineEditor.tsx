@@ -310,6 +310,14 @@ export default function TimelineEditor() {
   // Value-picker sources, rebuilt when the open target changes (nonce is a manual invalidation
   // key — the getters read module state the linter can't see). Audio cues pick a GUID from the
   // project's audio assets; signal markers autocomplete registered action names.
+  //
+  // `assetsVersion` is the second key, and it is load-bearing: `getAllAssets()` reads the
+  // module-level manifest map, which an import/re-import repopulates via the dev server's
+  // `asset-manifest-updated` HMR event. Keyed on `nonce` alone, a `.mp3` dropped into Assets
+  // while this panel stayed on the same timeline never reached the audio-cue picker — the
+  // memo had no reason to recompute, so the new cue was simply absent until the panel was
+  // retargeted. Same class as the SpritePicker staleness fixed in #293.
+  const assetsVersion = useEditorStore((s) => s.assetsVersion);
   const pickers = useMemo(
     () => ({
       audioAssets: getAllAssets().filter((a) => a.type === 'audio').map((a) => ({ guid: a.guid, label: a.path.split('/').pop() ?? a.guid })),
@@ -317,7 +325,7 @@ export default function TimelineEditor() {
       actionNames: getUIActionNames(),
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [nonce],
+    [nonce, assetsVersion],
   );
 
   // ── Delete / Backspace removes the selected item (Animation-editor convention). Scoped to the

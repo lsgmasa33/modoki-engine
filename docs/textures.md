@@ -418,6 +418,27 @@ pixels a device downloads and uploads.
   dead ref for a different invariant violation. `assetRefIntegrity.test.ts` now models the same
   exclusion; it used to add the derived guid unconditionally, which made the guard vouch for
   precisely the dead ref it exists to catch.
+- **The IMPORT DEFAULT is `3d`, so a freshly imported PNG has no sprite either — and that is
+  the surprising half** (#293). The bullet above is about a *sliced* texture; this one is about
+  doing nothing at all. `DEFAULT_TEXTURE_SETTINGS.format` is `ktx2-uastc`, and
+  `resolveTextureType` infers `'3d'` from any non-`webp`/`png` format when `meta.type` is unset
+  — so import an image, touch nothing, and the whole-image sprite is never emitted. Every
+  surface then failed silently in a different way: the SpritePicker did not list the texture at
+  all *and* told you to slice it (slicing a 3D texture emits nothing), and dropping it on a
+  sprite-accepting field hit a bare `return` in `AssetRefField`. **Setting Type → 2D is only
+  half the fix**: `changeType` writes the sidecar, and the sprite is minted by the *re-import*,
+  so the Inspector's Apply is a required second step. The picker now carries a collapsed
+  "N textures have no sprite" section with a **Make 2D** button that does both
+  (`editor/panels/makeTexture2D.ts`), and the rejected drop warns instead of vanishing.
+  ⚠️ **That button is destructive on 3D content and is deliberately two-click.** `2d` derives
+  `mipmaps:false` + `wrapS/wrapT:'clamp'`, so converting a tiling terrain albedo or a normal map
+  degrades the material that uses it — with no error, and not undoable (it writes the sidecar and
+  re-imports on disk, outside the editor undo stack). `makeTexture2D` therefore carries the
+  authored knobs that are NOT type-derived (`colorspace`, `flipY`, `flipGreen`, `maxSize`, the
+  encoder settings) rather than resetting the whole block the way `changeType` does — forcing a
+  normal map's `colorspace:'linear'` back to `'srgb'` is gamma-decoded data, i.e. wrong lighting
+  with nothing to see. The section is collapsed and capped because it is LONG in exactly the
+  projects that hit this: `demos/forest-camp` has 130 image assets and zero typed `2d`/`ui`.
 - **DOM image refs** (`UIElement.imageSrc` in `UINode.tsx`) MUST resolve via
   `resolveDomImageUrl` → `resolveBrowserImageUrl` (the WebP/PNG browser
   sibling), **not** `resolveImageUrl` / `resolveTextureVariantUrl(ref, '2d')`

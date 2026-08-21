@@ -145,6 +145,9 @@ function readEditorState() {
     // question "which panel would this key go to?" would only be answerable from a screenshot —
     // exactly what docs/debug-tools-mcp.md forbids. (focus-scope refactor P2)
     focusedPanel: s.focusedPanel,
+    // The panel ids that currently have an open tab. Reported so an agent refused by
+    // `set-focus-scope` can see what it may focus instead, without a second round trip (#301).
+    openPanels: s.openPanels,
     // HMR staleness. `staleGameCode: true` means game code changed on disk but the editor
     // could NOT reload (unsaved scene work), so this world is running the OLD build —
     // every measurement taken here is suspect until it reloads. `hmrUpdates` is how many
@@ -924,10 +927,51 @@ export function registerEditorAgentOps(): void {
   // Deliberately separate from `focus-element` (DOM focus): clicking a Hierarchy ROW moves
   // the keyboard scope but NOT document.activeElement, so the two are genuinely different
   // questions. Returns the resulting scope so the caller can confirm rather than assume.
+  //
+  // A named panel is REFUSED unless it currently has an open tab (#301). This op used to
+  // store whatever string it was handed — `setFocusedPanel` is a bare setter, correctly, since
+  // the human paths feed it a live tab component — and echo it straight back. That made the
+  // caller-side guard in `/api/input/key` (`focusedPanel !== panel`) a tautology: it could only
+  // fire if the renderer changed the value, which it never did. So `{panel:"Game"}` answered
+  // ok:true with focusedPanel:"Game", while the input gate (which compares against 'game')
+  // stayed SHUT and every following keypress reached nothing — each also reporting ok. That is
+  // the QA-PHYS-0003 symptom reached by a second route: there the panel was forgotten, here a
+  // wrong value is accepted. Miscasing is not contrived — this repo's prose calls them "the
+  // Game panel" / "the Inspector" and nothing types the ids.
+  //
+  // Refusing on OPEN-NESS rather than on a vocabulary list is deliberate: it subsumes the
+  // typo case, it is what the route's error message already promised, and games can register
+  // custom panels — so any fixed list would be wrong by construction. `null` (clear the scope)
+  // is always allowed; it names no panel.
   registerAgentOp('set-focus-scope', (params) => {
-    const p = (params ?? {}) as { panel?: string | null };
+    const p = (params ?? {}) as { panel?: unknown };
+    const openPanels = useEditorStore.getState().openPanels;
+    // Reject a non-string BEFORE the open-ness test, or it falls straight through to the bare
+    // setter. Reachable, not theoretical: `set-focus-scope` is on the `/api/editor-action`
+    // allowlist, so `{action:'set-focus-scope', panel:12345}` used to answer ok:true and leave
+    // `focusedPanel` holding the NUMBER 12345 — reported by get_editor_state as truth, and
+    // permanently suppressing game input via the gate's `p !== null && p !== 'game'`, with no
+    // panel to blame. Same defect class as the miscased id, one type further out.
+    if (p.panel !== undefined && p.panel !== null && typeof p.panel !== 'string') {
+      return {
+        ok: false,
+        error: `panel must be a string (an open panel's id) or null to clear — got ${typeof p.panel}`,
+        focusedPanel: useEditorStore.getState().focusedPanel,
+        openPanels,
+      };
+    }
+    if (typeof p.panel === 'string' && !openPanels.includes(p.panel)) {
+      // Do NOT move the scope on a refusal — a half-applied focus is worse than none, and
+      // the caller would have no way to tell which it got.
+      return {
+        ok: false,
+        error: `no open panel "${p.panel}" — panel ids are the FlexLayout tab ids and are case-sensitive`,
+        focusedPanel: useEditorStore.getState().focusedPanel,
+        openPanels,
+      };
+    }
     if (p.panel !== undefined) useEditorStore.getState().setFocusedPanel(p.panel);
-    return { ok: true, focusedPanel: useEditorStore.getState().focusedPanel };
+    return { ok: true, focusedPanel: useEditorStore.getState().focusedPanel, openPanels };
   });
   // Would this key reach anything? Read-only twin of set-focus-scope, asked by
   // `/api/input/key` BEFORE it presses — see editor/input/keyReach.ts for why both gates

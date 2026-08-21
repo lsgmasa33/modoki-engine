@@ -13,6 +13,7 @@ import { BufferedTextInput, Tooltip, inputStyle, MIXED_PLACEHOLDER } from './fie
 import { acceptMatchesAsset } from '../utils/dragGhost';
 import { classifyJsonAssetSuffix } from '../../runtime/loaders/assetTypeClassifier';
 import { SpritePicker } from './SpritePicker';
+import { wholeImageSpriteRef } from './spritePickerGroups';
 import { FontPicker } from './FontPicker';
 
 /** Infer asset type from file extension. The JSON asset kinds come from the shared
@@ -85,6 +86,13 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
   acceptRef.current = accept;
   const selectAsset = useEditorStore((s) => s.selectAsset);
   const openPanel = useEditorStore((s) => s.openPanel);
+  // Re-derive `getAllAssets()` for the sprite/font pickers when the manifest
+  // changes — a "Make 2D" conversion (#293) mints a new sprite entry via
+  // `/api/reimport`, and without this subscription this component never
+  // re-renders, so the picker keeps getting the STALE array captured at this
+  // component's last render. Same pattern as AtlasAssetView.tsx.
+  const assetsVersion = useEditorStore((s) => s.assetsVersion);
+  void assetsVersion;
   // Sprite picker: fields that accept sprites get a "▾" button (sliced sprites have
   // no Assets-panel row to drag from, so a picker is the assignment path).
   const acceptsSprite = !!accept?.includes('sprite');
@@ -100,7 +108,28 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
     const onAssetDrop = (e: Event) => {
       const raw = (e as CustomEvent).detail as string;
       const { path, guid, type } = JSON.parse(raw) as { path: string; guid?: string; type?: string };
-      if (!acceptMatchesAsset(acceptRef.current, path, type)) return;
+      if (!acceptMatchesAsset(acceptRef.current, path, type)) {
+        // #293 — this used to be a bare return: dropping a 3D-typed texture (the import
+        // default) onto a sprite-accepting field silently did nothing, with no hint that
+        // the texture needs its type flipped to 2D/UI before it exposes a sprite at all.
+        if (acceptRef.current?.includes('sprite') && type === 'texture') {
+          // Say which of the two situations this actually is. Dropping the TEXTURE row
+          // is rejected either way (2D refs are sprites-only), but the reasons are
+          // opposite: an already-2D texture HAS a sprite and the user simply grabbed the
+          // wrong row, while a 3D-typed one has none to grab. Asserting "typed 3D" for
+          // both was wrong for the first case and sent the user to convert a texture
+          // that needed no conversion.
+          const entry = guid ? getAssetEntry(guid) : undefined;
+          const hasSprite = !!(entry?.guid && wholeImageSpriteRef(entry.guid, getAssetEntry));
+          console.warn(
+            `[AssetRefField] "${path}" is a texture and this field takes a SPRITE. ` +
+            (hasSprite
+              ? `This texture already exposes a whole-image sprite — pick it with the sprite picker (▦), or drag the sprite row nested under the texture in Assets.`
+              : `It exposes no whole-image sprite: only a 2D/UI texture gets one, and the import default is 3D. Open the sprite picker (▦) on this field to convert it.`),
+          );
+        }
+        return;
+      }
       // A dropped FONT registers its face with the browser as well as storing the GUID:
       // `UIElement.fontFamily` is consumed as a DOM `font-family`, so without the
       // FontFace registration the Game panel would keep rendering the default typeface

@@ -353,6 +353,27 @@ texture-to-derived-sprite edge that makes an ad-hoc search for "who uses this te
 than merely incomplete. Mechanism, the measured numbers, and the traps:
 [build.md](build.md) § "Find References — the same walk, inverted".
 
+### A panel that reads `getAllAssets()` must subscribe to `assetsVersion`
+
+`getAllAssets()` reads the module-level manifest map, and React has no idea when that map
+changes. An import or re-import repopulates it out of band — dev server rescans → the
+`asset-manifest-updated` HMR event → `loadManifestJson(…, {prune:true})` in `createEditor()`
+→ `refreshAssets()`, which bumps `assetsVersion` in the editor store. **A component that
+calls `getAllAssets()` during render, or memoizes its result, and does not subscribe to
+`assetsVersion` will keep showing the asset list as it stood at its last render** — and
+nothing about that looks wrong on screen, because a stale list is a perfectly plausible one.
+
+Two sites had it (#293): `AssetRefField`, which builds the SpritePicker's `assets` prop —
+so a texture converted by the picker's own "Make 2D" button minted a new sprite that the
+still-open picker could not see, making the button look broken — and `TimelineEditor`,
+whose value pickers were memoized on the open-target nonce alone, so an audio file dropped
+into Assets never reached the audio-cue picker until the panel was retargeted.
+
+The exceptions are real and worth recognizing so this is not applied blindly: a function
+called fresh on each open (`discoverScenes` in `SceneListEditor.tsx` — deliberately
+unmemoized, documented as such) and a one-shot read at boot (`createEditor()`) need
+nothing. The rule bites *memoized* or *render-time* reads inside a long-lived panel.
+
 ### Where a panel's LOGIC belongs (and what is tested)
 
 A panel `.tsx` holds JSX, hooks and imperative wiring. **Its decisions belong in a

@@ -13,6 +13,12 @@ import { modifierEnum, entitySpec, pointSpec, allowOccludedParam } from '../shap
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, evalRenderer, editorAction } = ctx;
 
+  /** Built-in panel ids, shared by the two `panel` params so they cannot drift. Deliberately
+   *  NOT a z.enum: a game can register custom panels, so the real vocabulary is only knowable
+   *  server-side — which is where the refusal lives (#301). */
+  const IDS = 'scene | game | hierarchy | inspector | console | assets | animation-editor | '
+    + 'timeline-editor | particle-editor | spriteanim-editor | skin-editor | profiler | ai';
+
   // ── tap — trusted input (Electron editor only) ──
   tool(
     'modoki_tap',
@@ -225,8 +231,12 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       key: z.string().describe("Electron keyCode, e.g. 'Escape', 'Delete', 'ArrowLeft', 'w', 'z'."),
       modifiers: z.array(modifierEnum).optional().describe("Held modifiers, e.g. ['meta'] for Cmd+key."),
       panel: z.string().optional().describe(
-        'Focus this panel BEFORE pressing, so a panel-scoped chord resolves there. Ids: ' +
-        'scene | game | hierarchy | inspector | console | assets | animation-editor | timeline-editor | particle-editor | spriteanim-editor | skin-editor | ai. Fails loudly if the panel is not open.',
+        'Focus this panel BEFORE pressing, so a panel-scoped chord resolves there. Ids (CASE-'
+        + 'SENSITIVE — "Game" is not "game"): ' + IDS + '. A game may also register custom '
+        + 'panels, so this is the built-in set, not the whole vocabulary. REFUSED if that panel '
+        + 'has no open tab, naming the ones that do — the press is then NOT sent, so a refusal '
+        + 'never leaves you guessing whether the key landed. `modoki_get_editor_state.openPanels` '
+        + 'lists them.',
       ),
     },
     async ({ key, modifiers, panel }) => postJson('/api/input/key', { key, modifiers, panel }),
@@ -256,8 +266,11 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     {
       selector: z.string().optional().describe('CSS selector to focus. Omit to blur the active element.'),
       panel: z.string().optional().describe(
-        'Set the editor KEYBOARD SCOPE to this panel (independent of DOM focus). Ids: ' +
-        'scene | game | hierarchy | inspector | console | assets | animation-editor | timeline-editor | particle-editor | spriteanim-editor | skin-editor | ai.',
+        'Set the editor KEYBOARD SCOPE to this panel (independent of DOM focus). Ids (CASE-'
+        + 'SENSITIVE — "Game" is not "game"): ' + IDS + '. A game may also register custom '
+        + 'panels, so this is the built-in set, not the whole vocabulary. REFUSED if that panel '
+        + 'has no open tab, naming the ones that do; `selector` is then NOT focused either, so '
+        + 'the call is all-or-nothing. `modoki_get_editor_state.openPanels` lists them.',
       ),
     },
     async ({ selector, panel }) => postJson('/api/input/focus', { selector, panel }),

@@ -24,6 +24,10 @@ let leaseCalls: { open?: boolean; id?: number }[];
  *  keyboard, so the gate lets input through); a test that needs the QA-PHYS-0003 world
  *  reassigns it before posting. */
 let keyReach: { focusedPanel: string | null; editorBinding: string | null; gameInputSuppressed: boolean; simRunning: boolean };
+/** Which panels the fake renderer reports as having an open tab. `set-focus-scope` refuses
+ *  anything outside this list, exactly as the real op does (#301). Case-sensitive on purpose:
+ *  a miscased id is the failure that motivated the guard. */
+let openPanels: string[];
 
 
 function makeOps(): InputOps {
@@ -130,10 +134,21 @@ function makeRenderer(overrides?: Record<string, unknown>) {
       return { ok: true, ...keyReach, chord: String((params as { key: string }).key).toLowerCase() };
     }
     if (op === 'set-focus-scope') {
+      if (overrides?.['set-focus-scope'] !== undefined) return overrides['set-focus-scope'];
       const wanted = (params as { panel: string }).panel;
-      // The real op returns the store's value AFTER the set — a panel that is not open
-      // leaves the scope unchanged, which is how the route detects the failure.
-      return { ok: true, focusedPanel: wanted === 'not-open' ? null : wanted };
+      // Models the REAL op (agentEditorOps.ts `set-focus-scope`): it refuses a panel with no
+      // open tab and leaves the scope alone, reporting the ids that ARE open.
+      //
+      // ⚠️ This fake previously returned `{ok:true, focusedPanel: wanted}` for everything
+      // except a magic 'not-open' string — i.e. it modelled a renderer that rejected by
+      // changing its echoed value. No renderer ever did that: `setFocusedPanel` is a bare
+      // setter, so the echo always equalled the input and the route's `focusedPanel !== panel`
+      // guard was a tautology. The fake was the only thing making that guard look alive, which
+      // is why the FAILS-LOUDLY test below passed for years over a defect (#301).
+      if (!openPanels.includes(wanted)) {
+        return { ok: false, error: `no open panel ${JSON.stringify(wanted)} — panel ids are the FlexLayout tab ids and are case-sensitive`, focusedPanel: null, openPanels };
+      }
+      return { ok: true, focusedPanel: wanted, openPanels };
     }
     if (op === 'enact-handles') {
       const wanted = (params as { ids: string[] }).ids;
@@ -171,6 +186,7 @@ beforeEach(() => {
   calls = [];
   leaseCalls = [];
   keyReach = { focusedPanel: null, editorBinding: null, gameInputSuppressed: false, simRunning: false };
+  openPanels = ['scene', 'game', 'hierarchy', 'inspector', 'console', 'assets'];
   ops = makeOps();
   requestRenderer = makeRenderer();
   routes = createInputRoutes({ ops, requestRenderer });
@@ -978,8 +994,67 @@ describe('panel-targeted input (focus-scope P7)', () => {
     // panel is simply yielded by the dispatcher, so it looks like a successful no-op.
     const r = await post('/api/input/key', { key: 'w', panel: 'not-open' }) as { status: number; body: { error: string } };
     expect(r.status).toBe(400);
-    expect(String(r.body.error)).toContain('could not focus panel "not-open"');
+    // Wording changed with #301: the refusal is now the RENDERER's (it is the only side that
+    // knows which panels have tabs), where this route used to compose it from a comparison
+    // that could never be false.
+    expect(String(r.body.error)).toContain('no open panel "not-open"');
     expect(ops.pressKey).not.toHaveBeenCalled();
+  });
+
+  it('REFUSES a miscased panel id, and does NOT press the key', async () => {
+    // The #301 failure. "Game" is not 'game', so the editor's input gate — which compares
+    // against the lowercase id — stays SHUT. Before the fix this answered
+    // {ok:true, focusedPanel:"Game"} and pressed anyway, so the agent read a confirmation
+    // for a keypress that reached nothing. Every following press did the same: that is
+    // QA-PHYS-0003 (80 presses, all ok, a character controller wrongly declared broken)
+    // reached by a second route.
+    const r = await post('/api/input/key', { key: 'w', panel: 'Game' }) as { status: number; body: { error: string } };
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain('no open panel "Game"');
+    // The message must be ACTIONABLE — a refusal that does not say what IS focusable just
+    // moves the guessing one step later.
+    expect(String(r.body.error)).toContain('case-sensitive');
+    expect(String(r.body.error)).toContain('game');
+    expect(ops.pressKey).not.toHaveBeenCalled();
+  });
+
+  it('REFUSES a valid id whose panel is closed — the case the old guard could never see', async () => {
+    // 'profiler' is a real panel id (PANEL_LABELS) but has no tab here. The old route
+    // compared the renderer's echo to the input, and the renderer echoed whatever it was
+    // handed, so this was indistinguishable from success.
+    const r = await post('/api/input/key', { key: 'w', panel: 'profiler' }) as { status: number; body: { error: string } };
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain('no open panel "profiler"');
+    expect(ops.pressKey).not.toHaveBeenCalled();
+  });
+
+  it('accepts a CUSTOM panel id the renderer reports as open', async () => {
+    // A game can register its own panels, so the vocabulary is not a fixed list — which is
+    // why the refusal is server-side and not a z.enum in the tool schema.
+    openPanels = [...openPanels, 'court-levels'];
+    const r = await post('/api/input/key', { key: 'w', panel: 'court-levels' }) as { body: unknown };
+    expect(r.body).toMatchObject({ ok: true, focusedPanel: 'court-levels' });
+    expect(ops.pressKey).toHaveBeenCalled();
+  });
+
+  it('focus REFUSES a closed panel and does NOT focus the selector either', async () => {
+    // All-or-nothing: the caller asked for scope AND DOM focus, so delivering only the
+    // selector would be the same partial-success this fix exists to remove.
+    const r = await post('/api/input/focus', { panel: 'Inspector', selector: '#kebab' }) as { status: number; body: { error: string } };
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain('no open panel "Inspector"');
+    expect(ops.focusElement).not.toHaveBeenCalled();
+  });
+
+  it('degrades to the old behaviour against a renderer with no `ok` field', async () => {
+    // An editor build predating the op replies with just an echo. Reading that silence as a
+    // refusal would block ALL panel-targeted input against a stale renderer — a worse
+    // failure than the one being fixed.
+    requestRenderer = makeRenderer({ 'set-focus-scope': { focusedPanel: 'scene' } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const r = await post('/api/input/key', { key: 'w', panel: 'scene' }) as { body: unknown };
+    expect(r.body).toMatchObject({ ok: true, focusedPanel: 'scene' });
+    expect(ops.pressKey).toHaveBeenCalled();
   });
 
   it('does NOT set the scope when no panel is given — but still reports where it is', async () => {

@@ -328,6 +328,33 @@ export function createInputRoutes(deps: InputRouteDeps) {
    *  with something else entirely — every field is therefore optional and unchecked here. */
   type KeyReachReply = { focusedPanel?: string | null; editorBinding?: string | null; gameInputSuppressed?: boolean; simRunning?: boolean; chord?: string } | null;
 
+  /** Move the editor's KEYBOARD SCOPE to `panel`, or explain why it could not (#301).
+   *
+   *  Shared by `/api/input/key` and `/api/input/focus` so the two cannot drift — only the
+   *  first ever attempted a check, and the check it attempted could not fire. It compared the
+   *  renderer's echoed `focusedPanel` against the input, but the renderer stored any string it
+   *  was handed, so the echo ALWAYS equalled the input: a tautology. The refusal now comes
+   *  from the renderer, which is the only side that knows which panels have open tabs.
+   *
+   *  An editor build predating the op's `ok` field replies without one; that is read as
+   *  success (a `focusedPanel` echo is all the old contract promised) rather than as a
+   *  refusal, so a stale renderer degrades to the old behaviour instead of blocking input. */
+  async function setFocusScope(panel: string): Promise<{ focusedPanel: string | null; error?: string }> {
+    const f = (await requestRenderer('set-focus-scope', { panel })) as
+      { ok?: boolean; error?: string; focusedPanel?: string | null; openPanels?: string[] } | null;
+    const focusedPanel = f?.focusedPanel ?? null;
+    if (f && f.ok === false) {
+      const open = f.openPanels?.length ? f.openPanels.join(', ') : '(none)';
+      return {
+        focusedPanel,
+        error: `${f.error ?? `could not focus panel "${panel}"`} — scope is still `
+          + `${JSON.stringify(focusedPanel)}. Open panels: ${open}. Pass one of those, or open the `
+          + `panel you want from the Window menu first.`,
+      };
+    }
+    return { focusedPanel };
+  }
+
   /** The currently-HELD sustained pointer (from `/api/input/pointer` action:'down'), or null.
    *  Lives in the factory closure so it persists ACROSS requests — that is the whole point: a
    *  `down` in one MCP call, a `move`/`up` in later ones. Tracks the button so a `move`/`up`
@@ -524,11 +551,9 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // instead of tapping-and-hoping. Reported back so a mismatch is visible. (P7)
       let focusedPanel: string | null | undefined;
       if (typeof panel === 'string' && panel) {
-        const f = (await requestRenderer('set-focus-scope', { panel })) as { focusedPanel?: string | null } | null;
-        focusedPanel = f?.focusedPanel ?? null;
-        if (focusedPanel !== panel) {
-          return bad(`could not focus panel "${panel}" (scope is now ${JSON.stringify(focusedPanel)}) — is that panel open? Panel ids are the FlexLayout tab ids: scene, game, hierarchy, inspector, console, assets, animation-editor, timeline-editor, particle-editor, spriteanim-editor, skin-editor, ai.`);
-        }
+        const f = await setFocusScope(panel);
+        if (f.error) return bad(f.error);
+        focusedPanel = f.focusedPanel;
       }
       // Will this press reach ANYTHING? Probe BEFORE dispatching — the press itself can move
       // both the scope and DOM focus, so asking afterwards would report the wrong world.
@@ -628,8 +653,11 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // <body>. Both may be given — the scope is set first. (P7)
       let focusedPanel: string | null | undefined;
       if (typeof panel === 'string' && panel) {
-        const f = (await requestRenderer('set-focus-scope', { panel })) as { focusedPanel?: string | null } | null;
-        focusedPanel = f?.focusedPanel ?? null;
+        const f = await setFocusScope(panel);
+        // Refuse rather than focus the SELECTOR anyway: the caller asked for both, and
+        // silently delivering half of it is the false success this whole fix is about (#301).
+        if (f.error) return bad(f.error);
+        focusedPanel = f.focusedPanel;
       }
       const r = selector !== undefined || panel === undefined
         ? await ops.focusElement(selector)

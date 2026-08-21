@@ -117,6 +117,31 @@ export default function EditorApp() {
   // (✓ shown / hidden) recomputes when a panel is closed or re-shown.
   const [layoutVersion, setLayoutVersion] = useState(0);
 
+  // ── Publish the open-panel set for the AGENT surface (#301) ──
+  // Same walk as isPanelVisible, but collected once and pushed into the store, because
+  // `set-focus-scope` runs outside React and has no way to reach the FlexLayout model.
+  // Without it that op stored ANY string it was handed and echoed it back, so the
+  // `/api/input/key` guard comparing the echo to the input could never fire: a miscased
+  // `{panel:"Game"}` reported ok:true while the input gate stayed shut, and every following
+  // press reached nothing.
+  //
+  // ⚠️ Called SYNCHRONOUSLY from the two points where the model can change — never from a
+  // `useEffect`. An effect keyed on `layoutVersion` publishes one React commit LATE, and
+  // `set-focus-scope` reads the store with a plain `getState()`, so an agent call landing in
+  // that window would be answered from the pre-change list: the human closes a tab, the agent
+  // focuses it, and the op reports ok for a panel that is already gone. That is the very
+  // failure #301 closes, reopened through a timing gap.
+  const publishOpenPanels = useCallback((model: Model) => {
+    const ids: string[] = [];
+    model.visitNodes((node) => {
+      if (node.getType() === 'tab') {
+        const id = (node as TabNode).getComponent();
+        if (id) ids.push(id);
+      }
+    });
+    useEditorStore.getState().setOpenPanels(ids);
+  }, []);
+
   // Build the initial model (tracked layout → autosave → localStorage → default).
   useEffect(() => {
     let alive = true; // guard against setState after unmount (fast remount / StrictMode)
@@ -139,11 +164,14 @@ export default function EditorApp() {
       }
       if (newlyDocked.length) markAutoDocked(newlyDocked);
       modelRef.current = m;
+      publishOpenPanels(m);
       setLayoutName(currentLayoutName()); // may have been cleared if the layout was missing
       setReady(true);
     });
     return () => { alive = false; };
-  }, []);
+    // publishOpenPanels is a stable useCallback([]) — listed so the mount effect does not
+    // silently close over a stale one if that ever gains dependencies.
+  }, [publishOpenPanels]);
 
   // Show a (possibly hidden) panel from the Window menu: focus its tab if it's
   // already open, else dock it back into the Scene tabset (or the first tabset).
@@ -166,6 +194,7 @@ export default function EditorApp() {
     });
     return visible;
   }, []);
+
 
   // Save Layout — write the current layout to the tracked layout (and mirror to
   // localStorage). Falls back to localStorage-only when no layout is tracked.
@@ -353,6 +382,9 @@ export default function EditorApp() {
     // Refresh the Window menu's visibility checkmarks immediately (a panel was
     // closed/added/moved); the actual save stays debounced below.
     setLayoutVersion((v) => v + 1);
+    // Republish the agent-facing open-panel set in the SAME synchronous turn as the change
+    // that caused it — see publishOpenPanels for why this cannot be deferred to an effect.
+    publishOpenPanels(model);
 
     // ── Focus follows tab selection (focus-scope refactor P3.0) ──
     // FlexLayout's tab BUTTONS live outside PanelFocusHost, so clicking a tab to bring a
@@ -389,7 +421,7 @@ export default function EditorApp() {
       // recovery point — no "Save Layout As" required first.
       void writeLayout(AUTOSAVE_NAME, m);
     }, 1000);
-  }, []);
+  }, [publishOpenPanels]);
 
   // Opening a .particle.json surfaces the Particle Editor: select its tab if it
   // already exists, else dock a new tab next to the Scene viewport.

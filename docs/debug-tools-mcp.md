@@ -816,6 +816,11 @@ same actions + state a person has in the editor. They relay to the renderer over
   "the character controller is broken" — the two gates, and the warning `modoki_press_key` now
   emits, are in
   [editor-input.md → The runtime input gate](./editor-input.md#the-runtime-input-gate--mechanism-vs-policy).
+  ⚠️ **Panel ids are CASE-SENSITIVE** and are the FlexLayout tab ids, not the prose names this doc
+  uses — `"Game"` is not `game`. A panel with no open tab, or a miscased id, is **refused** (400,
+  naming the ids that are open); `modoki_get_editor_state.openPanels` lists them. Until #301 it was
+  neither refused nor applied: the call answered `ok:true` and every following keypress silently
+  reached nothing.
 - **Scenes/assets:** `modoki_list_scenes` / `modoki_load_scene` / `modoki_new_scene` /
   `modoki_save_all`; `modoki_import_file` (drag-from-Finder equivalent); `modoki_project_settings`
   (`action=set` is a PATCH deep-merged onto the on-disk config — a partial is safe, and omitted

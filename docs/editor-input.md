@@ -115,14 +115,67 @@ Other properties worth knowing:
   create a routing feedback loop (undo changes focus → the next ⌘Z routes elsewhere). Focus may
   *follow* undo (reveal the owning panel), but is always derived, never `pushAction`ed.
 - **Not persisted** across launches.
-- **Observable as data** — `focusedPanel` is in `modoki_get_editor_state`, and a scope change
-  journals `!focus {panel, from, to, source}` (on change only, never per keystroke). A focus ring
-  that existed only as CSS would make "which panel owns keys?" a screenshot question, which
-  [debug-tools-mcp.md](./debug-tools-mcp.md) forbids.
+- **Observable as data** — `focusedPanel` is in `modoki_get_editor_state`, alongside `openPanels`
+  (every id with an open tab), and a scope change journals `!focus {panel, from, to, source}` (on
+  change only, never per keystroke). A focus ring that existed only as CSS would make "which panel
+  owns keys?" a screenshot question, which [debug-tools-mcp.md](./debug-tools-mcp.md) forbids.
 - **Drivable** — `modoki_press_key` and `modoki_focus` take a `panel` argument. The route fails
-  loudly (400, naming the valid ids) when that panel isn't open, because a panel-scoped chord aimed
-  at a closed panel is otherwise a silent no-op: the dispatcher just yields. `panel` and `selector`
-  stay separate on `modoki_focus` — keyboard scope and `activeElement` are different questions.
+  loudly (400, naming the ids that ARE open) when that panel isn't open, because a panel-scoped
+  chord aimed at a closed panel is otherwise a silent no-op: the dispatcher just yields. `panel` and
+  `selector` stay separate on `modoki_focus` — keyboard scope and `activeElement` are different
+  questions.
+
+### ⚠️ That "fails loudly" was a TAUTOLOGY until #301 — and this doc asserted it anyway
+
+The guard existed and could not fire. `/api/input/key` compared the renderer's echoed
+`focusedPanel` against the `panel` it sent; the renderer's `set-focus-scope` op handed the string
+straight to `setFocusedPanel`, which is a bare `set()` — so the echo **always** equalled the input.
+The comparison could only fire if the renderer had *changed* the value, which it never did.
+`/api/input/focus` did not attempt the check at all.
+
+What that cost: `modoki_focus {panel:"Game"}` answered `{ok:true, focusedPanel:"Game"}`, but the
+input gate compares against `'game'`, so it stayed **shut** and every following `modoki_press_key`
+reached nothing — each also reporting `ok`. That is the QA-PHYS-0003 failure above reached by a
+second route the incident never closed: there the panel was *forgotten*, here a wrong value is
+*accepted*. Miscasing is not a contrived input — this doc, `CLAUDE.md` and the tool descriptions
+all say "the Game panel" in prose, and nothing types the ids.
+
+The fix refuses on **open-ness**, not on a vocabulary list:
+
+- `editorStore.openPanels` is published by `EditorApp` from the one FlexLayout model walk it
+  already does for the Window menu (keyed on the model being ready + `layoutVersion`).
+- `set-focus-scope` refuses a `panel` outside that set, returns `openPanels`, and **does not move
+  the scope** — a half-applied focus is worse than none, because the caller cannot tell which it got.
+- Both routes share one `setFocusScope` helper, so they cannot drift again. A renderer predating
+  the op's `ok` field degrades to the old echo-only behaviour rather than blocking all input.
+
+Open-ness rather than a `z.enum` of ids, for two reasons: a game can register **custom panels**, so
+no fixed list can be right; and open-ness is a superset of the typo case — it is what the error
+message already promised.
+
+Two things the adversarial pass then caught in that fix itself, both now closed:
+
+- **`openPanels` must be published SYNCHRONOUSLY, never from an effect.** It was first written
+  as a `useEffect` keyed on `layoutVersion`, which publishes one React commit *late* — and
+  `set-focus-scope` reads the store with a plain `getState()`. A call landing in that window is
+  answered from the pre-change list: the human closes a tab, the agent focuses it, and the op
+  reports `ok` for a panel that is already gone — the very failure this fix closes, reopened
+  through a timing gap. `publishOpenPanels` is therefore called from the two points where the
+  model can change (the initial load, and the top of `onModelChange`), in the same synchronous
+  turn as the change. **Do not move it back into an effect.**
+- **A non-string `panel` is refused, not stored.** The open-ness test only guards strings, so
+  anything else fell through to the bare setter. That is reachable, not theoretical:
+  `set-focus-scope` is on the `/api/editor-action` allowlist, so
+  `{action:'set-focus-scope', panel:12345}` bypasses the MCP tool's `z.string()`. Measured on a
+  live editor: `ok:true`, and `get_editor_state.focusedPanel` then reported the **number**
+  12345 — which the gate's `p !== null && p !== 'game'` reads as "some panel owns the
+  keyboard", suppressing all game input permanently with no panel to blame.
+
+**The lesson worth carrying past this bug:** the test suite covered this route and stayed green,
+because the renderer *fake* modelled a rejection by changing its echoed value — behaviour no real
+renderer ever had. A guard whose only evidence is a fake that flatters it is not a guard. Both
+halves are now mutation-checked (neuter the refusal → 4 route tests and 2 op tests fail):
+`engine/tests/electron/inputRoutes.test.ts` and `engine/tests/editor/setFocusScopeOp.test.ts`.
 
 ## The runtime input gate — mechanism vs. policy
 

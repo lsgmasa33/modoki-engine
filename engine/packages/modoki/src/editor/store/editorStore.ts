@@ -100,6 +100,17 @@ interface EditorState {
    *  layout and re-IPCs the native menu, so model-resident focus would rewrite the autosave on
    *  every click. Resets to null on launch. See docs/editor-input.md. */
   focusedPanel: string | null;
+  /** Component ids of every panel with an OPEN TAB in the current layout, custom panels
+   *  included. Written by EditorApp from the one FlexLayout model walk it already does for
+   *  the Window menu; nothing else may set it.
+   *
+   *  It exists so the AGENT surface can refuse a panel it cannot focus. `setFocusedPanel` is
+   *  a bare setter by design (the human paths hand it a live tab component), so the
+   *  `set-focus-scope` op used to store any string it was given and echo it straight back —
+   *  making `/api/input/key`'s "could not focus panel" guard a tautology that could never
+   *  fire. A miscased `"Game"` then reported ok while the input gate stayed shut, and every
+   *  following keypress reached nothing. See #301. */
+  openPanels: string[];
   /** Opt-in: simulate + render ParticleEmitter effects live in the 3D SceneView */
   particlePreview: boolean;
   gameViewSize: { width: number; height: number };
@@ -270,6 +281,7 @@ interface EditorState {
   setShowFocusGraph: (on: boolean) => void;
   setSceneViewMode: (mode: '3d' | 'ui') => void;
   setFocusedPanel: (panel: string | null) => void;
+  setOpenPanels: (ids: string[]) => void;
   setGizmoSpace: (space: 'local' | 'world') => void;
   setGizmoPivot: (pivot: 'pivot' | 'center') => void;
   setUnlockedGhostSelKey: (key: string | null) => void;
@@ -439,6 +451,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   showFocusGraph: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:showFocusGraph') === '1'),
   sceneViewMode: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:sceneViewMode') === 'ui') ? 'ui' : '3d',
   focusedPanel: null,
+  openPanels: [],
   particlePreview: false,
   gameViewSize: { width: 800, height: 450 },
   gameViewSafeArea: { top: 0, right: 0, bottom: 0, left: 0 },
@@ -594,6 +607,18 @@ export const useEditorStore = create<EditorState>((set, get) => {
     if (from === panel) return;
     editorEmit('!focus', { panel, from });
     set({ focusedPanel: panel });
+  },
+  /** Replace the open-panel set. Compares before setting so a layout change that did not
+   *  open/close anything (a resize, a drag within a tabset) does not re-render every
+   *  subscriber. Not journalled: it mirrors the layout, which already journals. */
+  setOpenPanels: (ids: string[]) => {
+    // Sorted + de-duplicated: FlexLayout permits two tabs of the same component, and tab
+    // ORDER is a layout detail. Neither should reach the agent-facing list, where the only
+    // question is "may I focus this id".
+    const next = [...new Set(ids)].sort();
+    const prev = get().openPanels;
+    if (prev.length === next.length && prev.every((id, i) => id === next[i])) return;
+    set({ openPanels: next });
   },
   setGizmoSpace: (space: 'local' | 'world') => { if (get().gizmoSpace !== space) editorEmit('!gizmo', { space }); set({ gizmoSpace: space }); mark2DDirty(); },
   setGizmoPivot: (pivot: 'pivot' | 'center') => { if (get().gizmoPivot !== pivot) editorEmit('!gizmo', { pivot }); set({ gizmoPivot: pivot }); mark2DDirty(); },

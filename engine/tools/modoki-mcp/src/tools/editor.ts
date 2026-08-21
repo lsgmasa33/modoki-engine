@@ -19,7 +19,10 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Read the WHOLE editor UI state in one call: current scene path, play state ' +
       '(stopped/playing/paused), gizmo mode/space, FPS, entity count, current selection ' +
       '(entity ids + selected asset), the editor viewport camera pose, undo/redo ' +
-      'availability + labels, and `persistenceMode` (always \'manual\' — see modoki_persistence). ' +
+      'availability + labels, `focusedPanel` (which panel owns the KEYBOARD SCOPE) with '
+      + '`openPanels` (the ids that currently have a tab — the only values modoki_focus / '
+      + 'modoki_press_key accept for `panel`, case-sensitively), '
+      + 'and `persistenceMode` (always \'manual\' — see modoki_persistence). ' +
       'The companion to get_scene_state (which reads the ECS world): this reads the EDITOR. ' +
       'Requires a connected editor renderer.',
     {},
