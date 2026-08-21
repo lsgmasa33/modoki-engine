@@ -478,9 +478,9 @@
       "name": "Trigger Zone",
       "traits": {
         "Transform": {
-          "x": 830,
+          "x": 815,
           "y": 700,
-          "sx": 260,
+          "sx": 220,
           "sy": 30
         },
         "Zone2D": {
@@ -495,8 +495,8 @@
           "sprite": "square",
           "color": 10181046,
           "opacity": 0.25,
-          "width": 1,
-          "height": 1
+          "width": 0.5,
+          "height": 0.5
         },
         "EntityAttributes": {
           "name": "Trigger Zone",
@@ -511,15 +511,15 @@
       "name": "Zone Probe",
       "traits": {
         "Transform": {
-          "x": 830,
+          "x": 815,
           "y": 120
         },
         "ZoneOccupant": {},
         "Renderable2D": {
           "sprite": "circle",
           "color": 15528177,
-          "width": 30,
-          "height": 30
+          "width": 15,
+          "height": 15
         },
         "RigidBody2D": {
           "angularDamping": 0.05

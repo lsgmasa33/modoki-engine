@@ -1,8 +1,9 @@
 # 3D Physics Demo — Modoki
 
 ![The physics showcase scene: a walled arena with a ramp, a crate stack, assorted
-primitive-collider bodies casting shadows on the floor, and jointed bodies hanging
-above it](screenshot.png)
+primitive-collider bodies casting shadows on the floor, jointed bodies hanging above it,
+and two trigger volumes bracketing the arena — a teal Rapier sensor on the right and a
+violet physics-free Zone3D on the left, lit up with a probe inside it](screenshot.png)
 
 A showcase of the [Modoki](https://modoki-engine.com) engine's **Rapier3D** physics
 layer, built almost entirely as scene data. Gravity, restitution, stacking, every
@@ -98,6 +99,11 @@ tick counts move a little between runs.)
 - **Parent groups are for organisation, not physics.** The `Walls` group is a bare
   transform. A child carrying its own `RigidBody3D` stays an independent body, but a
   *collider-only* child under a body is silently absorbed as a compound child.
+- **A reaction restores what was AUTHORED, not a constant.** Both stations remember the
+  tint the scene holds when the first occupant arrives and put it back when the last one
+  leaves, so re-colouring a station in the editor survives play. Writing a hardcoded idle
+  colour back instead is the quiet way to overwrite someone's edit. (It is refcounted for
+  the same reason: a volume can hold more than one occupant.)
 - **Verify by data.** The `zone` / `zoneTrigger` journal events — and the engine's own
   `@zone` crossings — make the demo assertable in a headless test, no screenshots
   required. `tests/zone-station.test.ts` does exactly that.

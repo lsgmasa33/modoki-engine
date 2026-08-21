@@ -110,9 +110,10 @@ const DOC_CITATION_EXEMPT: ReadonlyArray<{ file: string; reason: string }> = [
  *  instead of silent. If you find yourself adding an entry for a citation that reads as a live
  *  pointer ("see X for the details"), repoint it instead — that is the #194 defect, not history. */
 const RETIRED_DOCS_NAMED_ON_PURPOSE: ReadonlyArray<{ cited: string; absorbedBy: string }> = [
-  { cited: 'docs/cloud-editor.md', absorbedBy: 'docs/plans/cloud-teardown-and-migration-plan.md — the plan IS the deletion record (cloud cancelled 2026-07-01)' },
-  { cited: 'docs/cloud-editor-embedded-claude.md', absorbedBy: 'docs/plans/cloud-teardown-and-migration-plan.md — same' },
-  { cited: 'docs/cloud-editor-typescript-editor-plan.md', absorbedBy: 'docs/plans/cloud-teardown-and-migration-plan.md — same' },
+  { cited: 'docs/cloud-editor.md', absorbedBy: 'nothing — cloud cancelled 2026-07-01, GCP torn down; the teardown plan (docs/plans/cloud-teardown-and-migration-plan.md) was itself the deletion record and is now deleted too, folded rationale living in docs/site-hosting.md' },
+  { cited: 'docs/cloud-editor-embedded-claude.md', absorbedBy: 'nothing — same' },
+  { cited: 'docs/cloud-editor-typescript-editor-plan.md', absorbedBy: 'nothing — same' },
+  { cited: 'docs/plans/cloud-teardown-and-migration-plan.md', absorbedBy: 'docs/site-hosting.md — landed (cloud cancelled, GCP torn down, load balancer retired); tracker deleted per doc-conventions.md' },
   { cited: 'docs/plans/court-art-direction.md', absorbedBy: 'games/court/art.md' },
   { cited: 'docs/plans/court-tray-readability-plan.md', absorbedBy: 'games/court/art.md' },
   { cited: 'games/court/art-direction.md', absorbedBy: 'games/court/art.md' },
@@ -127,7 +128,8 @@ const RETIRED_DOCS_NAMED_ON_PURPOSE: ReadonlyArray<{ cited: string; absorbedBy: 
   // Not retired — NEVER WRITTEN. A plan proposing a doc it did not get to, or a code comment
   // that cited a write-up nobody ever wrote. The latter is its own small hazard: it reads exactly
   // like a live pointer, so an agent spends a search before concluding there is nothing to find.
-  { cited: 'docs/environment-maps.md', absorbedBy: 'nothing: docs/plans/asset-inspector-plan.md § Phase 5 PROPOSES creating it (unchecked)' },
+  { cited: 'docs/environment-maps.md', absorbedBy: 'nothing — never created; Phase 5 folded the HDR/UltraHDR pipeline into docs/textures.md § "Environment maps (HDR / UltraHDR)" instead of a standalone doc' },
+  { cited: 'docs/plans/asset-inspector-plan.md', absorbedBy: 'docs/textures.md + docs/model-pipeline.md — landed (all 5 phases); tracker deleted per doc-conventions.md' },
   { cited: 'docs/profiler.md', absorbedBy: 'nothing: docs/plans/profiler.md proposes creating it as its own fold-in target' },
   { cited: 'docs/percept-plan.md', absorbedBy: 'nothing — never existed. docs/todo.md § Deferred decisions names it as the provenance of the build-mode-enum entry, whose pointer in engine/app/main.tsx aimed here (#194)' },
 ];
@@ -280,6 +282,19 @@ const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ cited: string; reason: string; in?
   { cited: 'electron/toolchainHost.ts', reason: 'editor-toolchain-layer plan: proposed, unbuilt' },
   { cited: 'scripts/stage-node.cjs', reason: 'editor-toolchain-layer plan: proposed, unbuilt' },
   { cited: 'tests/sling-trait-hygiene.test.ts', reason: 'entity-id-guard plan: proposed, unbuilt' },
+  // #288 (mcp-five-capability-gaps plan). Scoped with `in` so the exemption cannot silently
+  // cover a second doc later. DELETE BOTH once the phases land — the plan says so in its
+  // handoff, because an exemption that outlives its file is how this guard goes blind.
+  {
+    cited: 'editor/animation/poseClip.ts',
+    in: 'docs/plans/mcp-five-capability-gaps-plan.md',
+    reason: '#288 Phase 4: the pose path extracted out of AnimationEditor.tsx — proposed, unbuilt',
+  },
+  {
+    cited: 'editor/panels/createRegisteredAsset.ts',
+    in: 'docs/plans/mcp-five-capability-gaps-plan.md',
+    reason: "#288 Phase 5: runCreate's body extracted out of Assets.tsx — proposed, unbuilt",
+  },
 
   // --- A worked example, not a pointer.
   { cited: 'scripts/stage-foo.cjs', reason: 'bundle-new-tools.md: placeholder name in a how-to template' },

@@ -1047,8 +1047,8 @@ export default function Assets() {
 
   // Build + push a single coalesced undo/redo for one or more completed
   // deletes (builder in assetUndo.ts — F6).
-  const pushDeleteUndo = useCallback((results: DeleteResult[]) => {
-    pushAction(makeDeleteUndo(results, refresh));
+  const pushDeleteUndo = useCallback((results: DeleteResult[], trashedMissing: string[] = []) => {
+    pushAction(makeDeleteUndo(results, refresh, trashedMissing));
   }, [refresh]);
 
   // Delete one or more assets in a SINGLE OS-trash call (one trash sound),
@@ -1062,8 +1062,8 @@ export default function Assets() {
     for (const a of targets) { const r = await collectDeletion(a); if (r) results.push(r); }
     if (results.length === 0) return;
     const allPaths = Array.from(new Set(results.flatMap((r) => r.deletePaths)));
-    const ok = await deleteAssets(allPaths);
-    if (!ok) { console.error('[Assets] Delete failed'); return; }
+    const del = await deleteAssets(allPaths);
+    if (!del.ok) { console.error('[Assets] Delete failed'); return; }
     const removed = new Set(results.map((r) => r.asset.path));
     setAssets((prev) => prev.filter((a) => !removed.has(a.path)));
     if (selected && removed.has(selected)) { setSelected(null); selectAsset(null); }
@@ -1074,8 +1074,10 @@ export default function Assets() {
     // see applyAssetPathMoves). Checked against `allPaths`, not `removed`, so a generated file
     // that a model delete drags along also unbinds.
     logBindingChanges(unbindDeletedAssetEditors(allPaths));
-    console.log(`[Assets] Moved ${allPaths.length} file(s) to trash`);
-    pushDeleteUndo(results); // ONE undo entry for the whole gesture
+    console.log(`[Assets] Moved ${del.trashed} file(s) to trash`);
+    // `del.missing` is threaded into the undo so a later restore can tell a sidecar that was
+    // never on disk from a file it failed to bring back (#291).
+    pushDeleteUndo(results, del.missing); // ONE undo entry for the whole gesture
     if (rescan) refresh();   // ONE rescan, not one per file
   }, [collectDeletion, pushDeleteUndo, refresh, selected, selectAsset]);
 

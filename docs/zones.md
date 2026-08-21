@@ -118,11 +118,12 @@ and asserts the demo's real handlers run, which is the failure this system is pr
 action name that no longer resolves is a warning, not a crash, so an unwired zone keeps looking
 healthy in the Inspector.
 
-⚠️ **In 2D, size the visual by the zone's SCALE, not by `Renderable2D.width/height`.** A `Zone2D`
-box takes its full size from the Transform scale, and `Renderable2D` is *also* multiplied by that
-scale — so the drawn shape matches the tested area only when the sprite is authored `1x1` under the
-zone's scale (measured: `sx 260` x `width 1` renders 260 design px). Authoring both at 260 draws a
-bar 260x too large over a correctly sized zone, and only the wrong one is visible.
+⚠️ **In 2D, a matching visual is authored at `0.5`, not `1`.** `Renderable2D.width`/`height` are
+**half-extents** and the Transform scale multiplies them, so a sprite draws `width * 2 * sx` wide —
+while a `Zone2D` box TESTS the scale itself (full size). The two agree only at `0.5 x 0.5`. Measured
+on `demos/2d-physics-demo`: `width: 1` under `sx: 260` draws **520** design px over a zone that tests
+260, and the bar overhangs the arena wall. Only the drawn half is visible, so this desync is found by
+looking at the render, not by reading the scene.
 
 ## Code map
 

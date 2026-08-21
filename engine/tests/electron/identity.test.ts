@@ -49,7 +49,7 @@ describe('isWithin', () => {
     // Windows session run from a subdirectory warned "WRONG EDITOR" against its own
     // editor. It was visible as far back as the Run 1 Windows log, where the MCP's own
     // `npm --prefix engine/tools/modoki-mcp` smoke was written off as a benign
-    // "cwd artifact" — it was this. See docs/plans/modoki-mcp-tools-windows-test.md.
+    // "cwd artifact" — it was this (closed as #30).
     expect(isWithin('E:\\Projects\\modoki\\games\\3d-test', 'E:\\Projects\\modoki')).toBe(true);
     expect(isWithin('E:\\Projects\\modoki\\engine\\tools\\modoki-mcp', 'E:\\Projects\\modoki')).toBe(true);
   });

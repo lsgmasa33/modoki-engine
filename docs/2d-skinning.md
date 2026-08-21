@@ -38,7 +38,7 @@ follow-up).
   "sprite": "<sprite-guid>",           // source texture/sprite, resolved via resolveSprite()
   "bones": [                           // bind-pose hierarchy, local TRS (radians)
     { "name": "root",  "parent": -1, "x": 0, "y": 96, "rot": 0 },
-    { "name": "mid",   "parent": 0,  "x": 0, "y": -96, "rot": 0 }
+    { "name": "mid",   "parent": 0,  "x": 0, "y": -96, "rot": 0, "noScale": true }
   ],
   "mesh": {
     "verts": [[x,y], ...],             // texture-space bind positions
@@ -90,6 +90,63 @@ Bone2D Transforms ──► skin2DSystem ──► skin2DBuffers ──► Scene
   mirroring `spriteAnimCache` (cache/loading/failed/generation maps, lazy fetch,
   self-registering GUID). `normalizeRig2D` coerces + renormalizes weights and derives
   inverse-bind.
+
+## Deform tracks (per-vertex mesh animation)
+
+Bone transforms alone can't reproduce Spine-style cloth/collar flutter — that needs a
+**per-vertex** animation channel, which is a non-scalar shape the keyframe stack's
+`tracks[]` (scalar-field-per-track) can't hold. `AnimationClipDef` therefore carries a
+second, parallel array: `deformTracks[]` `{ path, part, keys: [{ t, offsets[] }] }`,
+where `path` addresses the `SkinnedSprite2D` root (like a normal track), `part` names
+the rig part being deformed, and each key's `offsets` is a dense per-vertex `(dx,dy)`
+array for that part's bind-pose vertex order.
+
+- **`runtime/animation/deformEval.ts`** — linearly interpolates between the two
+  surrounding keys' dense offset arrays (no bezier/tangent support on this channel yet
+  — the one remaining fidelity gap against a Spine source that used curved deform
+  keys).
+- **`runtime/animation/deform2DBuffers.ts`** — a module registry keyed by
+  `(entityId, partName)`, **epoch-stamped** rather than cleared-and-rewritten: the
+  runtime `animationSystem` loop and the editor's Animation-panel scrub both write into
+  it from different call sites with no coordination between them, so a shared "clear
+  first" step would race. Instead each write stamps the buffer with the current global
+  epoch; a part not re-written within an epoch reads back as no-deform (auto-expiry on
+  clip switch), and a global-monotonic `version` lets `skin2DSystem` detect a deform
+  change even when the bone pose itself is static.
+- **`runtime/animation/deform2DSystem.ts`** (`applyClipDeform`) — samples deform tracks
+  from the SAME sites `applyClipAtTime` samples scalar tracks from (the runtime
+  `animationSystem` loop and the editor scrub), so a deform track always sees the same
+  playhead a bone track would. `skin2DSystem` adds each part's interpolated offset to
+  its BIND vertex **before** LBS (`bindVert + offset`, then skin) — so the deform and
+  the bone skin compose, matching how the Spine source authored them.
+
+**Multi-part scale (`noScale`).** A v2 (multi-part) rig's bones may set `noScale:
+true` (see the schema above). `skin2DSystem` composes such a bone against
+`removeScale2D(parentWorld)` instead of the raw parent world matrix — i.e. the bone
+ignores its ancestor's *animated* scale (this is Spine's own "scale" transform-mode
+concept). Without it, an ancestor's breathing/squash scale keyframe balloons every
+descendant part instead of staying localized to the part that's actually supposed to
+breathe. `rig2dMath.removeScale2D` is the pure helper.
+
+**True STEPPED keys.** `+Infinity` (the `STEPPED` tangent sentinel used elsewhere in
+the animation stack — see `docs/animation.md`) cannot survive a JSON round-trip
+(serializes to `null`), so a stepped deform/bone key reconstructs its hold from the
+persistent `tangentMode:'constant'` marker rather than the tangent value itself. A
+Spine `stepped` curve that isn't converted to that marker silently degrades to a
+linear approximation on reload.
+
+**Spine reconstruction dogfood (`tools-scratch/spine-import*.mjs`).** These
+hand-run Node scripts reconstruct a Spine 3.8 character (skeleton + weighted meshes +
+clips) into a `.rig2d.json` + scene + `.anim.json` set. Two gotchas worth knowing if
+you touch or re-run one: **the importer re-mints fresh GUIDs on every run** (rig id,
+clip ids), so re-running it desyncs the already-committed scene/rig/anim trio unless
+all three are re-committed together — worth a consistency check
+(`scene.SkinnedSprite2D.rig === rig.id`) before committing. And **IK is baked at
+import time, not carried as a runtime constraint**: the importer resolves each Spine
+IK chain's target per animation sample and solves it with a pure 2-bone solver
+(`solveIK2`, law of cosines), then bakes the result into ordinary dense rotation keys
+on the chain bones — the engine has no live IK solver; what ships is the baked
+animation.
 
 ## Rendering
 

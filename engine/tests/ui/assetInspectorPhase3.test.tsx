@@ -2,7 +2,7 @@
  *  Covers the UASTC-knob visibility + commit in the pure TextureSettingsControls.
  *  The audio sample-rate/bit-depth controls + both converters' arg/cache behavior
  *  are covered by unit tests (audioConvert/audioCache/textureConvert/textureCache).
- *  See docs/plans/asset-inspector-plan.md Phase 3. */
+ *  See docs/editor.md "The asset Inspector — three rules". */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, cleanup, fireEvent } from '@testing-library/react';

@@ -182,19 +182,40 @@ export async function deleteAssetFile(assetPath: string): Promise<boolean> {
   } catch { return false; }
 }
 
+/** What a batch trash actually did. `missing` are the paths that were not on
+ *  disk, so nothing was trashed for them — the caller MUST NOT treat those as
+ *  recoverable files. `deletionPathsFor` deliberately lists maybe-absent
+ *  sidecars (`.meta.local.json` is gitignored and usually not there), so
+ *  "asked to trash" and "trashed" routinely differ and only the backend knows
+ *  by how much. Discarding that distinction is what let an undo failure name
+ *  files that never existed (#291). */
+export type DeleteFilesResult = { ok: boolean; trashed: number; missing: string[] };
+
 /** Trash MANY paths in a single request → ONE OS-trash invocation → one trash
  *  sound (vs. one chime per file when each path was its own POST). The backend
  *  skips any path that no longer exists, so a list carrying maybe-absent
- *  sidecars is safe. */
-export async function deleteAssetFiles(paths: string[]): Promise<boolean> {
-  if (paths.length === 0) return true;
+ *  sidecars is safe — and it REPORTS those in `missing`, which is the only way
+ *  a caller can tell an absent sidecar from a file it failed to save. */
+export async function deleteAssetFiles(paths: string[]): Promise<DeleteFilesResult> {
+  if (paths.length === 0) return { ok: true, trashed: 0, missing: [] };
   try {
     const res = await backendFetch('/api/delete-asset', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paths }),
     });
-    return res.ok;
-  } catch { return false; }
+    if (!res.ok) return { ok: false, trashed: 0, missing: [] };
+    // A body we cannot parse is not a failed delete — the trash already happened.
+    // Fall back to "everything we asked for was trashed", which is what the old
+    // boolean return assumed for every call.
+    try {
+      const body = await res.json() as Partial<DeleteFilesResult>;
+      return {
+        ok: true,
+        trashed: typeof body?.trashed === 'number' ? body.trashed : paths.length,
+        missing: Array.isArray(body?.missing) ? body.missing : [],
+      };
+    } catch { return { ok: true, trashed: paths.length, missing: [] }; }
+  } catch { return { ok: false, trashed: 0, missing: [] }; }
 }
 
 /** Copy an asset to a new path; the backend regenerates the GUID so the

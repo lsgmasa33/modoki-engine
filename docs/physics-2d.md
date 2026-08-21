@@ -605,3 +605,19 @@ the demo; the CCD-*on* ball stops reliably regardless of framerate.
   handedness. Confirm before Phase 1.
 - **koota add/remove hooks** — if koota exposes `onAdd`/`onRemove` per trait, reconciliation is
   event-driven; otherwise a per-frame diff against a known-set. Both work; events are cheaper.
+
+## Known deferred (won't-fix) — from the 2026-07-02 review
+
+A multi-agent review of the 2D physics subsystem confirmed 22 findings; 19 landed (Batches 1–4).
+Three LOW-severity items were deliberately deferred rather than fixed:
+
+- **P2 — per-frame sig strings for every body.** `bodySig`/`colliderGeomSig`/`childSig` recompute
+  every tick even for a settled scene. Gating this behind change-tracking needs koota
+  change-tracking across compound-child transforms, which doesn't exist — not worth the
+  regression risk for a LOW item.
+- **Mem4 — `resolveColliderBits` allocates an object per body/child per tick** for
+  change-detection. Same reason as P2: inherent to the string-signature change-detection
+  approach: fixing it packs the two 16-bit values into one number, deferred alongside P2.
+- **P1 — the editor's collider debug overlay has no change-gate** (`drawColliderOverlays`
+  re-parses/re-tessellates every frame). Editor-only, off by default — not worth the change-gate
+  plumbing for a debug visualization nobody has it on for.

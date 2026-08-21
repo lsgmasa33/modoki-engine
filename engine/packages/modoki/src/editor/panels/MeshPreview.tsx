@@ -1,7 +1,7 @@
 /** MeshPreview — a 3D preview of a `.mesh.json`'s geometry, on a neutral material.
  *  Loads the shared mesh template (the same geometry the runtime uses), CLONES it
  *  (the cache owns the original — never dispose it), and renders it in the shared
- *  Preview3DShell. See docs/plans/asset-inspector-plan.md Phase 2. */
+ *  Preview3DShell. See docs/editor.md "The asset Inspector — three rules". */
 
 import { useCallback } from 'react';
 import * as THREE from 'three';

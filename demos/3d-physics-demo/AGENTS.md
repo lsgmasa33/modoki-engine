@@ -20,9 +20,24 @@ source of truth** (`config.ts` does no `initWorld` spawning).
   (`modoki_journal`), not by eye. `unregisterSystems` tears all four down. No custom
   traits, no config knobs, no custom UI.
   - `sensorZone3D/enter|exit` — the *Sensor Zone*, via `OnCollision3D`. Rapier sensor;
-    teal `0x1abc9c` → green `0x2ecc71`; journals `zone`.
+    authored teal → green `0x2ecc71` while occupied; journals `zone`.
   - `triggerZone3D/enter|exit` — the *Trigger Zone*, via `OnZone3D`. **No physics body
-    at all**; purple `0x9b59b6` → violet `0xd980fa`; journals `zoneTrigger`.
+    at all**; authored purple → violet `0xd980fa` while occupied; journals `zoneTrigger`.
+  - ⚠️ **The IDLE colour is authored in the scene and is NOT a code constant.** `tintOnEnter`
+    remembers what the station actually holds and `restoreOnExit` puts that back, so
+    re-colouring a station in the Inspector survives — a hardcoded idle would silently
+    overwrite the owner's edit on the very next exit. The `*_FALLBACK` constants are
+    no-scene fallbacks only.
+  - ⚠️ **That stash is PER-SESSION state, and both of its hazards are subtle enough to have
+    shipped once already.** (a) It tracks WHO is inside, not HOW MANY: pressing Stop clears
+    the engine's occupancy *without* firing exits (`clearZoneState`), so a station occupied
+    at Stop gets a second `enter` with no matching `exit` — a counter climbs to 2, never
+    returns to 0, and the station stays lit forever. A set of occupant ids is idempotent
+    under that duplicate and self-heals. (b) It is cleared on `onWorldSwap`, because Stop
+    rebuilds the world and `entity.id()` is a per-world SLOT INDEX that restarts at 0 — the
+    next session hands the same ids to the same entities, so an uncleared stash would skip
+    re-reading the authored colour and later restore the PREVIOUS session's value. Both are
+    pinned by tests in `tests/zone-station.test.ts`.
 - **This demo is the engine's ONLY real usage of the declarative zone chain** (#296) —
   `Zone3D` + `ZoneOccupant` + the `@zone` journal event + `OnZone3D`. Before it, the
   chain shipped in nothing, so a regression in it was caught by no project we ship and a

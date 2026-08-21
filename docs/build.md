@@ -867,6 +867,40 @@ The one thread genuinely shared with #21 — a suspected teardown race on the pa
 Vite dep-cache — is a *hypothesis overlap*, not an established common cause. Worth checking both if
 either recurs.
 
+### Packaged renderer boot + build-chain bugs (fixed)
+
+Four bugs found stress-testing the very first packaged DMG (`dist:dir`), each invisible to
+`npm run dev` because each depends on a packaging-only boundary:
+
+- **Renderer never mounted** — the Vite error overlay reported `Failed to resolve import
+  "@zappar/msdf-generator"` from the pre-bundled `SceneManager` chunk, so React never mounted and
+  the whole `/api/*` backplane was dead. Root cause: `main.ts` relocates Vite's dep cache to
+  `userData/vite-cache`, OUT of the `node_modules` tree (the bundle itself is read-only), so the
+  `optimizeDeps.exclude`d `@zappar` package (WASM + worker, self-resolves via `import.meta.url`)
+  could no longer resolve a bare import from there. Reproduced only packaged — an on-disk
+  `MODOKI_PROD=1` smoke test worked, because that keeps the dep cache in-tree. Fixed with a
+  `resolve.alias['@zappar/msdf-generator']` in `engine/vite.config.ts` pointing at the absolute
+  `<repoRoot>/node_modules/@zappar/msdf-generator` path (guarded with `existsSync`, so it's a no-op
+  in dev).
+- **`npm run build` → "Missing script: build"** — electron-builder strips `scripts` from the
+  packaged app's `package.json` unconditionally, even via `extraMetadata`. Fixed by invoking the
+  script directly at every build-step call site: `node engine/scripts/build-web.mjs`.
+- **`tsc: command not found`** — the packaged app ships no `node_modules/.bin` symlinks, and
+  `typescript` is a pruned devDependency (only `dependencies` + `optionalDependencies` ship — `vite`
+  is a real dep so it's present). Fixed in `build-web.mjs`: run Vite via its resolved JS entry with
+  `process.execPath` (`node node_modules/vite/bin/vite.js`) instead of a `.bin` shim, and **skip the
+  tsc typecheck when `node_modules/typescript/bin/tsc` is absent** — the engine ships pre-built, an
+  external project's game code isn't in the tsc scope anyway, and Vite transpiles TS via esbuild
+  regardless.
+- **Misleading "Connection lost"** — the no-`webBucket` deploy path sent a bare SSE `status` event
+  then closed the stream, so the client's `onerror` fired and reported a generic connection failure
+  instead of the real message. Fixed by sending an explicit `FAILED:` status (matching the
+  missing-tools path), so build/deploy failures now surface cleanly instead of reading as a dropped
+  connection.
+
+All four verified end-to-end on a clean-from-source repackage: renderer mounts, `/api/scene-state`
+returns 200 entities, a "Build → Web" run on a clean packaged install completes and deploys.
+
 ## CLI recipes
 
 The examples use `games/<id>`; substitute the project and its appId. Note the **project-dir cwd**
@@ -949,6 +983,72 @@ Two notes worth carrying:
 - To re-vendor **without** building: `node engine/scripts/vendor-plugins.mjs games/<id>`, then
   `npm install` in the project. `engine/tests/architecture/vendoredPluginFreshness.test.ts` fails
   `npm test` on a project whose pin has gone stale.
+- **Re-vendoring is NOT automatic on an ordinary build** — it only runs on project open/scaffold,
+  or when `ensureCapacitorDeps` detects a missing dep. So editing `engine/packages/capacitor-<x>/**`
+  mid-session and then just re-running a build silently builds against the STALE vendored copy.
+  Re-vendor after **every** plugin source edit, not once per session: `node
+  engine/scripts/vendor-plugins.mjs games/<id>` then `npm install` in that game dir — verify by
+  grepping the new source string into `games/<id>/node_modules/<plugin>/...` before trusting a
+  device build. A `git status` on `games/<id>/plugins/*.tgz`/`package.json` after re-vendoring
+  confirms whether it actually changed.
+
+#### Why the vendored tarball's hash churns, and the fix
+
+The tarball naming (`games/<id>/plugins/<plugin>-<hash>.tgz`) used to re-pin constantly across
+clones/over time with **zero shipped-content changes**, forcing a spurious re-vendor + re-commit
+in every game that depends on the plugin. Root cause: `engine/plugins/vendorPlugins.ts`'s
+`pluginContentHash` hashed the plugin's **built output** (`dist/`, rebuilt on every `npm install`
+and sensitive to the exact tsc/rollup version, plus local uncommitted `android/build/` +
+`android/.gradle/` litter) instead of its source. That output drifts across clones/over time with
+no source change → new hash → new filename → re-vendor churn. An earlier fix ("scope to the
+published fileset") was insufficient — it still hashed `dist/` and assumed `src/` was the volatile
+input, when it's the reverse.
+
+**Fix:** hash the plugin's SOURCE inputs instead — every file EXCEPT derived build/cache dirs
+(`dist`, `build`, `.gradle`, `.build`, `DerivedData`, `Pods`, `.cxx`, at any depth) plus npm junk.
+The tarball identity now answers "did the source change?", not "did the build output shift?". Plus
+`.gitattributes` forces `eol=lf` on the hashed source text types (`.mjs`/`.cjs`/`.mts`/`.cts`/
+`.kt`/`.kts`/`.podspec`) so a Windows CRLF checkout can't drift it on its own. Guard test in
+`engine/tests/plugins/vendorPlugins.test.ts` ("does NOT re-pack when ONLY the built `dist/`
+changes" + a build-litter test). **If it churns again, the hash differing between clones means
+their checked-out SOURCE differs — check line endings or an untracked file leaking into the plugin
+dir, not the build output.**
+
+⚠️ **STILL OPEN: the hash covers non-shipped files.** `pluginHashInputs` hashes everything not
+under `dist`/build dirs, which still includes a plugin's **test** files (`android/src/test/`,
+`ios/Tests/`, `test-vectors/`) — not in the plugin's npm `files` allowlist and not shipped in the
+tarball. Adding/editing plugin tests therefore still re-pins the vendored tarball in every game
+that depends on it, with a byte-identical shipped-content diff. The correct fix is NOT simply
+"scope to the npm `files` allowlist" — that would drop `src/` from the hash and break the
+deliberate, tested contract (`vendorPlugins.test.ts`) that a `src/` edit MUST re-pack (`src/` is
+hashed as a proxy for the excluded, toolchain-volatile `dist/`). The correct input set is
+`(shipped files MINUS dist/) ∪ (dist build-inputs: src/ + tsconfig + rollup + package.json)` —
+keep `src/` + shipped native, exclude only non-shipped/non-build dirs (tests, test-vectors).
+Deferred as medium+delicate, not small — changing the algorithm re-pins every game's tarball once.
+
+#### Web deploy (`gcloud`)
+
+The web deploy step (`gsutil`/`gcloud storage` upload + CDN invalidation to `webBucket`) shells out
+to `gcloud`, which is a **sanctioned system tool like `xcodebuild`** — it carries the user's cloud
+auth, so it can never be provisioned by the toolchain the way Node/JDK/Android SDK are (see
+[editor-toolchain.md](editor-toolchain.md)). A **Finder-launched** packaged editor gets a minimal
+PATH with no Google Cloud SDK on it, so a deploy that works from a full-PATH shell can fail on the
+exact same machine when launched normally, with `gcloud: command not found`.
+
+`resolveGcloudDir(override?)` (`engine/plugins/vite-asset-scanner.ts`) resolves it in order:
+
+1. **Project Settings override** — `user.sdk.gcloudPath` (a binary or bin dir), the per-machine
+   `project.user.json` field surfaced in the editor as Web Deploy → "gcloud path override".
+2. **Well-known dirs** — `/opt/homebrew/bin`, `/usr/local/bin`, `~/google-cloud-sdk/bin`,
+   `/usr/local/google-cloud-sdk/bin`, `~/.local/bin`.
+3. **Login-shell `command -v gcloud`** — a last resort that only works when launched from a shell
+   that sources the user's profile.
+
+The web-deploy step prepends the resolved dir onto every deploy step's PATH (mirroring the
+iOS/CocoaPods PATH block); if `gcloud` is genuinely absent, the step fails fast with an install
+hint instead of the mid-stream "command not found" a bare shell-out would produce. Verified on the
+packaged app under a minimal PATH (no `/opt/homebrew`): the deploy resolves `gcloud` via the
+well-known dirs and completes ("✅ deployed successfully").
 
 ### iOS Simulator
 ```bash

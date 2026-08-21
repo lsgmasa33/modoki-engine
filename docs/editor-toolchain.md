@@ -65,6 +65,30 @@ it falls through to the next candidate, or to "absent," so the dialog offers the
 instead of silently building on the wrong JDK. The per-dir version probe is cached (a JDK's version is
 stable). This is the single guard against a whole class of "works on my machine" Android failures.
 
+### A Finder-launched app gets a minimal PATH — provisioned Node must be prepended, not just set as an env var
+
+A macOS app launched from Finder (as opposed to a Terminal shell) starts with a **minimal PATH**
+(`/usr/bin:/bin:…`, no Homebrew, no nvm). `gltf-transform-cli`/`gltfpack` are `#!/usr/bin/env node`
+shebang scripts, so both **detecting and running** them needs `node` resolvable on PATH — but the
+editor's provisioning only ever set `MODOKI_NODE`/`MODOKI_NPM_CLI` env vars, never PATH itself, so
+the `--version` probe silently failed even right after a successful install and Build Support kept
+reporting "not found." (Native binaries like `ffmpeg`/`ffprobe` were unaffected — no shebang, no
+Node needed to run them.) Fixed two ways:
+
+1. **`main.ts`'s `ensureNodeProvisioned()` prepends the provisioned Node's bin dir to
+   `process.env.PATH`.** The Vite child (spawned afterward) inherits it, so both detection (main
+   process) and reimport/build (Vite child) resolve `node`. Prepending — not appending — means a
+   shebang always resolves to the editor's own Node, never a stray system one.
+2. **In bundled-only mode** (packaged default, `!systemToolchainAllowed`), `detectBinary` does
+   **not** add the system-PATH candidate for `INSTALLABLE` tools at all — it resolves only from our
+   own env/toolchain install, else reports "not found" (prompting an install). This is what makes
+   the "never fall back to system tool versions" promise real rather than aspirational; the "Use
+   system SDKs" toggle (or a dev checkout) restores the PATH candidate.
+
+Verified on the packaged app launched with a genuinely minimal PATH (no system Node on it):
+`gltf-transform-cli` detects present at its pinned version (readable only by running it through the
+provisioned Node), and the dialog no longer says "not found."
+
 ## Provisioning — `install(id)` / `guide(id)`
 
 `install(id, {toolchainDir, onLog})` provisions an `INSTALLABLE` tool into the per-user toolchain dir
@@ -214,6 +238,17 @@ to fix it:
 **Cross-process cache note:** an `install()` runs in the Vite-plugin process and resets *its* cache, but
 `GET /api/toolchain` is served by the Electron main process, whose cache is separate. `toolchainStatus()`
 therefore re-probes on every call, so the dialog's post-install re-check reflects the just-installed tool.
+
+**Testing gotcha: CDP `Page.reload` on a packaged app corrupts the userData Vite dep-cache** — it
+reproduces the same crash class as #21/#110 above (see [build.md](build.md) "Two packaged-boot
+flakes"). To test the packaged app over CDP, always launch **fresh** (no reload):
+```
+MODOKI_NO_AUTOUPDATE=1 MODOKI_TOOLCHAIN_DIR=<tmp> \
+  "…/Modoki Editor.app/Contents/MacOS/Modoki Editor" \
+  --user-data-dir=<tmp> --remote-debugging-port=<port>
+```
+then attach a CDP client (Node's global `WebSocket` works with no extra dependency). To force a
+clean reinstall of one provisioned tool: `rm -rf "~/Library/Application Support/Modoki Editor/toolchain/<sub>"`.
 
 ## How a build consumes the toolchain
 

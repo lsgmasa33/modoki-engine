@@ -224,6 +224,27 @@ the equivalents up itself (`engine/electron/main.ts` + `assetBackend.ts`):
   resolves the postprocessor — otherwise the import fails silently and Stage A passes the
   model through un-fixed. See [build.md](./build.md) and [architecture.md](./architecture.md).
 
+## Rigged-model texture compression
+
+A rigged/skinned model's embedded textures go through a separate optimizer (`rigged-model-
+optimize.ts`), driven by a "Texture Compression" section in the Model Inspector's rigged branch
+(Format `uastc`/`etc1s`/`raw` · Max Size · Mipmaps · UASTC Level + RDO λ), persisted to the same
+`.meta.json`'s `texture` block that `reimport-model.ts` reads via `resolveTextureSettings(meta)` →
+`convertRiggedModel`. `ktxFlags` (exported for tests) reads the SHARED `resolveUastcLevel`/
+`resolveUastcRdoLambda` resolvers from `runtime/loaders/textureSettings.ts` — the same ones a
+standalone texture uses — so a rigged model's UASTC RDO-lambda default is **1.0**, matching
+standalone textures (it used to be hardcoded to `4`, an inconsistency with no reason behind it).
+λ=0 omits `--uastc_rdo_l` (RDO off) the same way the standalone texture converter does. These
+flags feed `ktxSignature` → `riggedHash`, so an existing rigged model's cache auto-regenerates on
+its next reimport when the knobs change — no `MODEL_ENCODER_VERSION` bump needed, since only the
+affected models invalidate.
+
+**Deferred follow-ups** (tracked, not scheduled):
+- **AnimSet playback preview** — the Inspector shows numeric clip params only; a real preview
+  needs an `AnimationMixer`-driven viewer (`ModelPreview.tsx` today only loads GLBs statically).
+- **Draco mesh compression** as an option alongside meshopt — a new codec path, deliberately left
+  out of the LOD/gltfpack flag set above.
+
 ## LOD authoring reference
 
 Practical tooling notes for tuning ratios/errors:

@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 import type { Entity } from 'koota';
 import {
   createTestWorld, SYSTEM_PRIORITY, Transform, Zone2D, ZoneOccupant, OnZone2D,
-  Renderable2D, zone2DSystem,
+  Renderable2D, zone2DSystem, clearZoneState,
 } from '@modoki/engine/runtime';
 import { game } from '../game';
 
@@ -60,14 +60,18 @@ describe('2d-physics-demo — the Zone2D trigger station is authored', () => {
     const station = zoneStations[0];
     const tf = station.traits?.Transform as { sx?: number; sy?: number };
     const r2d = station.traits?.Renderable2D as { width?: number; height?: number };
-    // A Zone2D box takes its full size from the Transform SCALE, while Renderable2D takes its
-    // size from width/height MULTIPLIED by that same scale (measured: sx 260 x width 1 renders
-    // 260 design px). So a 1x1 sprite under the zone's scale is the one authoring that keeps the
-    // drawn bar and the tested area identical — any other width/height silently desyncs them.
+    // A Zone2D box's tested area is its Transform SCALE (full size). Renderable2D's
+    // width/height are HALF-extents, and they are multiplied by that same scale — so the drawn
+    // box is `width * 2 * sx` by `height * 2 * sy`. The two agree only at 0.5.
+    //
+    // Measured, because this is easy to get backwards and I did: `width: 1` under `sx: 260`
+    // draws 520 design px over a zone that tests 260, and the bar visibly overhangs the arena
+    // wall. Asserting the RELATION rather than the literal 0.5 keeps this honest if either
+    // side is re-authored.
     expect(tf.sx).toBeGreaterThan(1);
     expect(tf.sy).toBeGreaterThan(1);
-    expect(r2d.width).toBe(1);
-    expect(r2d.height).toBe(1);
+    expect((r2d.width ?? 0) * 2 * (tf.sx ?? 0)).toBe(tf.sx);
+    expect((r2d.height ?? 0) * 2 * (tf.sy ?? 0)).toBe(tf.sy);
   });
 
   it('wires both phases through OnZone2D, and has occupants to trigger it', () => {
@@ -120,5 +124,140 @@ describe('2d-physics-demo — the authored names resolve to the registered handl
     // ...and the game's reaction to it, which only exists if the action names resolved.
     expect(tw.events({ type: 'zoneTrigger' }).map((e) => (e.payload as { phase: string }).phase))
       .toEqual(['enter', 'exit']);
+  });
+
+  it('restores the AUTHORED tint, not a constant, so an Inspector re-colour survives', () => {
+    const on = zoneStations[0].traits?.OnZone2D as { onEnter: string; onExit: string };
+    // Deliberately NOT the scene's tint and NOT either constant in game.ts — this stands in
+    // for the owner having re-coloured the station live. A handler that writes a hardcoded
+    // idle back on exit passes every other case in this file and fails this one.
+    const RECOLOURED = { color: 0x123456, opacity: 0.8 };
+
+    tw = createTestWorld({ systems: [ZONE] });
+    game.registerSystems?.();
+    const zone = tw.spawn(
+      Transform({ x: 0, y: 0, sx: 100, sy: 40 }),
+      Zone2D({ shape: 'box' }),
+      OnZone2D({ onEnter: on.onEnter, onExit: on.onExit }),
+      Renderable2D({ sprite: 'square', ...RECOLOURED }),
+    );
+    const occupant = tw.spawn(Transform({ x: 500, y: 0 }), ZoneOccupant);
+    const tintOf = () => {
+      const r = zone.get(Renderable2D) as { color: number; opacity: number };
+      return { color: r.color, opacity: r.opacity };
+    };
+    const moveTo = (e: Entity, x: number) => e.set(Transform, { ...(e.get(Transform) as object), x });
+
+    moveTo(occupant, 0); tw.step(1);
+    expect(tintOf()).not.toEqual(RECOLOURED);    // it did light up
+    moveTo(occupant, 500); tw.step(1);
+    expect(tintOf()).toEqual(RECOLOURED);        // ...and came back to what was authored
+  });
+
+  it('stays lit until the LAST occupant leaves, and still restores the authored tint', () => {
+    const on = zoneStations[0].traits?.OnZone2D as { onEnter: string; onExit: string };
+    const AUTHORED = { color: 0x123456, opacity: 0.8 };
+
+    tw = createTestWorld({ systems: [ZONE] });
+    game.registerSystems?.();
+    const zone = tw.spawn(
+      Transform({ x: 0, y: 0, sx: 100, sy: 40 }),
+      Zone2D({ shape: 'box' }),
+      OnZone2D({ onEnter: on.onEnter, onExit: on.onExit }),
+      Renderable2D({ sprite: 'square', ...AUTHORED }),
+    );
+    const a = tw.spawn(Transform({ x: 500, y: 0 }), ZoneOccupant);
+    const b = tw.spawn(Transform({ x: 500, y: 5 }), ZoneOccupant);
+    const tintOf = () => {
+      const r = zone.get(Renderable2D) as { color: number; opacity: number };
+      return { color: r.color, opacity: r.opacity };
+    };
+    const moveTo = (e: Entity, x: number) => e.set(Transform, { ...(e.get(Transform) as object), x });
+
+    moveTo(a, 0); tw.step(1);
+    const hot = tintOf();
+    moveTo(b, 0); tw.step(1);
+    // Un-refcounted, this second enter would remember HOT as the idle tint — and the
+    // station would never come back, which is invisible until someone watches it.
+    expect(tintOf()).toEqual(hot);
+
+    moveTo(a, 500); tw.step(1);
+    expect(tintOf()).toEqual(hot);               // b is still inside
+    moveTo(b, 500); tw.step(1);
+    expect(tintOf()).toEqual(AUTHORED);          // last one out restores what was authored
+  });
+
+  it('survives a Stop taken while occupied — a duplicate enter must not strand the tint', () => {
+    const on = zoneStations[0].traits?.OnZone2D as { onEnter: string; onExit: string };
+    const AUTHORED = { color: 0x123456, opacity: 0.8 };
+
+    tw = createTestWorld({ systems: [ZONE] });
+    game.registerSystems?.();
+    const zone = tw.spawn(
+      Transform({ x: 0, y: 0, sx: 100, sy: 40 }),
+      Zone2D({ shape: 'box' }),
+      OnZone2D({ onEnter: on.onEnter, onExit: on.onExit }),
+      Renderable2D({ sprite: 'square', ...AUTHORED }),
+    );
+    const occupant = tw.spawn(Transform({ x: 500, y: 0 }), ZoneOccupant);
+    const tintOf = () => {
+      const r = zone.get(Renderable2D) as { color: number; opacity: number };
+      return { color: r.color, opacity: r.opacity };
+    };
+    const moveTo = (e: Entity, x: number) => e.set(Transform, { ...(e.get(Transform) as object), x });
+
+    moveTo(occupant, 0); tw.step(1);             // enter
+    expect(tintOf()).not.toEqual(AUTHORED);
+
+    // Stop clears the engine's occupancy WITHOUT firing exits, so the next Play re-fires
+    // `enter` for whoever is still inside — a SECOND enter with no exit in between.
+    // `clearZoneState` is exactly what the editor's Stop does; this reproduces it headlessly.
+    clearZoneState(tw.world);
+    tw.step(1);                                  // the duplicate enter
+    expect(tintOf()).not.toEqual(AUTHORED);
+
+    moveTo(occupant, 500); tw.step(1);           // the ONE exit that follows
+    // A counter would sit at 2 here and never restore — the station would stay lit forever.
+    expect(tintOf()).toEqual(AUTHORED);
+  });
+
+  it('does not carry a session\'s stash into the next world, where ids are reused', () => {
+    const on = zoneStations[0].traits?.OnZone2D as { onEnter: string; onExit: string };
+    const OLD = { color: 0x111111, opacity: 0.3 };
+    const RECOLOURED = { color: 0x222222, opacity: 0.7 };
+    const spawnStation = (tint: { color: number; opacity: number }) => tw!.spawn(
+      Transform({ x: 0, y: 0, sx: 100, sy: 40 }),
+      Zone2D({ shape: 'box' }),
+      OnZone2D({ onEnter: on.onEnter, onExit: on.onExit }),
+      Renderable2D({ sprite: 'square', ...tint }),
+    );
+    const moveTo = (e: Entity, x: number) => e.set(Transform, { ...(e.get(Transform) as object), x });
+
+    // SESSION 1: an occupant walks in and the session ends while it is still inside — exactly
+    // what pressing Stop leaves behind, since Stop clears occupancy without firing exits.
+    tw = createTestWorld({ systems: [ZONE] });
+    game.registerSystems?.();
+    const first = spawnStation(OLD);
+    const occ1 = tw.spawn(Transform({ x: 500, y: 0 }), ZoneOccupant);
+    moveTo(occ1, 0); tw.step(1);
+    tw.dispose();
+
+    // SESSION 2: a fresh world. Stop reverts by rebuilding the world, and koota ids are
+    // per-world slot indices that restart at 0 — so the station is handed the SAME id. The
+    // owner has re-coloured it in the Inspector in the meantime.
+    tw = createTestWorld({ systems: [ZONE] });
+    const second = spawnStation(RECOLOURED);
+    const occ2 = tw.spawn(Transform({ x: 500, y: 0 }), ZoneOccupant);
+
+    // Guard against this test going vacuous: it only proves anything if the id really is
+    // reused. If a future harness change stops reusing ids, fail here rather than pass for
+    // the wrong reason.
+    expect(second.id()).toBe(first.id());
+
+    moveTo(occ2, 0); tw.step(1);
+    moveTo(occ2, 500); tw.step(1);
+    const r = second.get(Renderable2D) as { color: number; opacity: number };
+    // Session 1's stash would restore OLD here — the shadowing bug, laundered through a cache.
+    expect({ color: r.color, opacity: r.opacity }).toEqual(RECOLOURED);
   });
 });

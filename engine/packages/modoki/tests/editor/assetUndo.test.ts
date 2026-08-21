@@ -5,7 +5,7 @@
  *  duplicateAssetFile), which post to /api/* via the editor backendFetch →
  *  global fetch; we stub fetch and assert the requests. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { makeDeleteUndo, makeDuplicateUndo, isTextAsset, type DeleteResult, type DupResult } from '../../src/editor/panels/assetUndo';
 import type { AssetEntry } from '../../src/editor/utils/assetPaths';
 
@@ -21,7 +21,19 @@ vi.stubGlobal('fetch', mockFetch);
 
 const A = (path: string, type = 'model'): AssetEntry => ({ path, name: path.split('/').pop()!, type });
 
+// Console spies are restored in afterEach, NOT at the end of each test: an assertion that
+// fails skips the rest of its body, so an inline `mockRestore()` never runs and console stays
+// mocked for every later test — one real regression then cascades into several misleading
+// failures (measured while mutation-checking the #291 guards).
+let consoleSpies: Array<{ mockRestore: () => void }> = [];
+const spyConsole = (level: 'error' | 'warn') => {
+  const s = vi.spyOn(console, level).mockImplementation(() => {});
+  consoleSpies.push(s);
+  return s;
+};
+
 beforeEach(() => { calls = []; mockFetch.mockClear(); });
+afterEach(() => { for (const s of consoleSpies) s.mockRestore(); consoleSpies = []; });
 
 describe('isTextAsset', () => {
   it('classifies text vs binary by extension', () => {
@@ -86,13 +98,88 @@ describe('makeDeleteUndo', () => {
     expect(deletes[0].body.paths.sort()).toEqual(['/assets/a.glb', '/assets/b.glb', '/assets/shared.tex']);
   });
 
-  it('undo with no restorable snapshots warns and writes nothing', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const action = makeDeleteUndo([{ asset: A('/assets/x.glb'), snapshots: [], deletePaths: ['/assets/x.glb'] }], vi.fn());
+  // #291: an undo that restores only PART of what it trashed is the sharper false success —
+  // the panel refreshes, some files reappear, and the ones whose snapshot read failed stay in
+  // the trash with nothing naming them. The shortfall check covers this and the total case.
+  it('undo reports the SHORTFALL when only some files were restorable', async () => {
+    const error = spyConsole('error');
+    const good: DeleteResult = {
+      asset: A('/assets/good.glb'),
+      snapshots: [{ path: '/assets/good.glb', content: 'QQ==', encoding: 'base64' }],
+      deletePaths: ['/assets/good.glb'],
+    };
+    // Its snapshot read failed, so nothing can bring this one back.
+    const bad: DeleteResult = { asset: A('/assets/bad.glb'), snapshots: [], deletePaths: ['/assets/bad.glb'] };
+    const refresh = vi.fn();
+    await makeDeleteUndo([good, bad], refresh).undo();
+
+    // The restorable half IS restored — a partial failure must not abandon the good files.
+    const writes = calls.filter((c) => c.url === '/api/write-file');
+    expect(writes.map((w) => w.body.path)).toEqual(['/assets/good.glb']);
+    // ...and the panel still refreshes so those files reappear.
+    expect(refresh).toHaveBeenCalledTimes(1);
+    // The error names ONLY the file still in the trash, and says how many of how many.
+    expect(error).toHaveBeenCalledTimes(1);
+    const msg = String(error.mock.calls[0][0]);
+    expect(msg).toContain('restored 1 of 2');
+    expect(msg).toContain('/assets/bad.glb');
+    expect(msg).not.toContain('/assets/good.glb');
+  });
+
+  // #291: deletionPathsFor deliberately lists maybe-absent sidecars (.meta.local.json is
+  // gitignored and usually not on disk). Diffing against deletePaths would send the user
+  // hunting in the trash for a file that never existed — so the backend's `missing` wins.
+  it('undo does NOT name a path the backend reported as never on disk', async () => {
+    const error = spyConsole('error');
+    const r: DeleteResult = {
+      asset: A('/assets/x.glb'),
+      snapshots: [{ path: '/assets/x.glb', content: 'QQ==', encoding: 'base64' }],
+      // The gitignored sidecar was listed for deletion but was never there.
+      deletePaths: ['/assets/x.glb', '/assets/x.glb.meta.local.json'],
+    };
+    await makeDeleteUndo([r], vi.fn(), ['/assets/x.glb.meta.local.json']).undo();
+    // Everything that actually existed came back → no shortfall → no error at all.
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  // #291: the same false-success shape on the other half of the pair — a failed re-delete
+  // left the files on disk while refresh() re-listed them, so redo read as a no-op.
+  it('redo ERRORS when the re-delete fails instead of reporting a silent no-op', async () => {
+    const error = spyConsole('error');
+    mockFetch.mockImplementationOnce(async (url: string, opts?: any) => {
+      calls.push({ url, body: opts?.body ? JSON.parse(opts.body) : undefined });
+      return { ok: false, json: async () => ({}) } as any;
+    });
+    const refresh = vi.fn();
+    await makeDeleteUndo(
+      [{ asset: A('/assets/x.glb'), snapshots: [], deletePaths: ['/assets/x.glb'] }],
+      refresh,
+    ).redo();
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(String(error.mock.calls[0][0])).toContain('/assets/x.glb');
+    expect(refresh).toHaveBeenCalledTimes(1); // still refreshes — the panel must show reality
+  });
+
+  // #291: an undo that restores nothing looks like a working Cmd+Z. It cannot be a silent
+  // console.warn — the files are already in the OS trash, so the log IS the recovery path.
+  it('undo with no restorable snapshots ERRORS with the trashed paths and writes nothing', async () => {
+    const error = spyConsole('error');
+    const warn = spyConsole('warn');
+    const action = makeDeleteUndo(
+      [{ asset: A('/assets/x.glb'), snapshots: [], deletePaths: ['/assets/x.glb', '/assets/x.glb.meta.json'] }],
+      vi.fn(),
+    );
     await action.undo();
     expect(calls.filter((c) => c.url === '/api/write-file')).toHaveLength(0);
-    expect(warn).toHaveBeenCalled();
-    warn.mockRestore();
+    expect(error).toHaveBeenCalledTimes(1);
+    // Error LEVEL, not warn — a warn is filtered out of most console views.
+    expect(warn).not.toHaveBeenCalled();
+    const msg = String(error.mock.calls[0][0]);
+    // Names the action and EVERY trashed path, so hand-recovery does not need the source.
+    expect(msg).toContain('Delete x.glb');
+    expect(msg).toContain('restored 0 of 2');
+    expect(msg).toContain('/assets/x.glb');
+    expect(msg).toContain('/assets/x.glb.meta.json');
   });
 });
 

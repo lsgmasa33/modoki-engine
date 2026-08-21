@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 import type { Entity } from 'koota';
 import {
   createTestWorld, SYSTEM_PRIORITY, Transform, Zone3D, ZoneOccupant, OnZone3D,
-  Renderable3DPrimitive, zone3DSystem,
+  Renderable3DPrimitive, zone3DSystem, clearZoneState,
 } from '@modoki/engine/runtime';
 import { game } from '../game';
 
@@ -104,5 +104,129 @@ describe('3d-physics-demo — the authored names resolve to the registered handl
     // ...and the game's reaction to it, which only exists if the action names resolved.
     expect(tw.events({ type: 'zoneTrigger' }).map((e) => (e.payload as { phase: string }).phase))
       .toEqual(['enter', 'exit']);
+  });
+
+  it('restores the AUTHORED colour, not a constant, so an Inspector re-colour survives', () => {
+    const on = zoneStations[0].traits?.OnZone3D as { onEnter: string; onExit: string };
+    // Deliberately NOT the scene's colour and NOT either constant in game.ts — this stands in
+    // for the owner having re-coloured the station live. A handler that writes a hardcoded
+    // idle back on exit passes every other case in this file and fails this one.
+    const RECOLOURED = 0x123456;
+
+    tw = createTestWorld({ systems: [ZONE] });
+    game.registerSystems?.();
+    const zone = tw.spawn(
+      Transform({ x: 0, y: 0, z: 0, sx: 4, sy: 4, sz: 4 }),
+      Zone3D({ shape: 'box' }),
+      OnZone3D({ onEnter: on.onEnter, onExit: on.onExit }),
+      Renderable3DPrimitive({ mesh: 'box', color: RECOLOURED }),
+    );
+    const occupant = tw.spawn(Transform({ x: 10, y: 0, z: 0 }), ZoneOccupant);
+    const colorOf = () => (zone.get(Renderable3DPrimitive) as { color: number }).color;
+    const moveTo = (e: Entity, x: number) => e.set(Transform, { ...(e.get(Transform) as object), x });
+
+    moveTo(occupant, 0); tw.step(1);
+    expect(colorOf()).not.toBe(RECOLOURED);      // it did light up
+    moveTo(occupant, 10); tw.step(1);
+    expect(colorOf()).toBe(RECOLOURED);          // ...and came back to what was authored
+  });
+
+  it('stays lit until the LAST occupant leaves, and still restores the authored colour', () => {
+    const on = zoneStations[0].traits?.OnZone3D as { onEnter: string; onExit: string };
+    const AUTHORED = 0x123456;
+
+    tw = createTestWorld({ systems: [ZONE] });
+    game.registerSystems?.();
+    const zone = tw.spawn(
+      Transform({ x: 0, y: 0, z: 0, sx: 4, sy: 4, sz: 4 }),
+      Zone3D({ shape: 'box' }),
+      OnZone3D({ onEnter: on.onEnter, onExit: on.onExit }),
+      Renderable3DPrimitive({ mesh: 'box', color: AUTHORED }),
+    );
+    const a = tw.spawn(Transform({ x: 10, y: 0, z: 0 }), ZoneOccupant);
+    const b = tw.spawn(Transform({ x: 10, y: 0, z: 1 }), ZoneOccupant);
+    const colorOf = () => (zone.get(Renderable3DPrimitive) as { color: number }).color;
+    const moveTo = (e: Entity, x: number) => e.set(Transform, { ...(e.get(Transform) as object), x });
+
+    moveTo(a, 0); tw.step(1);
+    const hot = colorOf();
+    moveTo(b, 0); tw.step(1);
+    // Un-refcounted, this second enter would remember HOT as the idle colour — and the
+    // station would never come back, which is invisible until someone watches it.
+    expect(colorOf()).toBe(hot);
+
+    moveTo(a, 10); tw.step(1);
+    expect(colorOf()).toBe(hot);                 // b is still inside
+    moveTo(b, 10); tw.step(1);
+    expect(colorOf()).toBe(AUTHORED);            // last one out restores what was authored
+  });
+
+  it('survives a Stop taken while occupied — a duplicate enter must not strand the tint', () => {
+    const on = zoneStations[0].traits?.OnZone3D as { onEnter: string; onExit: string };
+    const AUTHORED = 0x123456;
+
+    tw = createTestWorld({ systems: [ZONE] });
+    game.registerSystems?.();
+    const zone = tw.spawn(
+      Transform({ x: 0, y: 0, z: 0, sx: 4, sy: 4, sz: 4 }),
+      Zone3D({ shape: 'box' }),
+      OnZone3D({ onEnter: on.onEnter, onExit: on.onExit }),
+      Renderable3DPrimitive({ mesh: 'box', color: AUTHORED }),
+    );
+    const occupant = tw.spawn(Transform({ x: 10, y: 0, z: 0 }), ZoneOccupant);
+    const colorOf = () => (zone.get(Renderable3DPrimitive) as { color: number }).color;
+    const moveTo = (e: Entity, x: number) => e.set(Transform, { ...(e.get(Transform) as object), x });
+
+    moveTo(occupant, 0); tw.step(1);             // enter
+    expect(colorOf()).not.toBe(AUTHORED);
+
+    // Stop clears the engine's occupancy WITHOUT firing exits, so the next Play re-fires
+    // `enter` for whoever is still inside — a SECOND enter with no exit in between.
+    // `clearZoneState` is exactly what the editor's Stop does; this reproduces it headlessly.
+    clearZoneState(tw.world);
+    tw.step(1);                                  // the duplicate enter
+    expect(colorOf()).not.toBe(AUTHORED);
+
+    moveTo(occupant, 10); tw.step(1);            // the ONE exit that follows
+    // A counter would sit at 2 here and never restore — the station would stay lit forever.
+    expect(colorOf()).toBe(AUTHORED);
+  });
+
+  it('does not carry a session\'s stash into the next world, where ids are reused', () => {
+    const on = zoneStations[0].traits?.OnZone3D as { onEnter: string; onExit: string };
+    const OLD = 0x111111, RECOLOURED = 0x222222;
+    const spawnStation = (color: number) => tw!.spawn(
+      Transform({ x: 0, y: 0, z: 0, sx: 4, sy: 4, sz: 4 }),
+      Zone3D({ shape: 'box' }),
+      OnZone3D({ onEnter: on.onEnter, onExit: on.onExit }),
+      Renderable3DPrimitive({ mesh: 'box', color }),
+    );
+    const moveTo = (e: Entity, x: number) => e.set(Transform, { ...(e.get(Transform) as object), x });
+
+    // SESSION 1: an occupant walks in and the session ends while it is still inside — exactly
+    // what pressing Stop leaves behind, since Stop clears occupancy without firing exits.
+    tw = createTestWorld({ systems: [ZONE] });
+    game.registerSystems?.();
+    const first = spawnStation(OLD);
+    const occ1 = tw.spawn(Transform({ x: 10, y: 0, z: 0 }), ZoneOccupant);
+    moveTo(occ1, 0); tw.step(1);
+    tw.dispose();
+
+    // SESSION 2: a fresh world. Stop reverts by rebuilding the world, and koota ids are
+    // per-world slot indices that restart at 0 — so the station is handed the SAME id. The
+    // owner has re-coloured it in the Inspector in the meantime.
+    tw = createTestWorld({ systems: [ZONE] });
+    const second = spawnStation(RECOLOURED);
+    const occ2 = tw.spawn(Transform({ x: 10, y: 0, z: 0 }), ZoneOccupant);
+
+    // Guard against this test going vacuous: it only proves anything if the id really is
+    // reused. If a future harness change stops reusing ids, fail here rather than pass for
+    // the wrong reason.
+    expect(second.id()).toBe(first.id());
+
+    moveTo(occ2, 0); tw.step(1);
+    moveTo(occ2, 10); tw.step(1);
+    // Session 1's stash would restore OLD here — the shadowing bug, laundered through a cache.
+    expect((second.get(Renderable3DPrimitive) as { color: number }).color).toBe(RECOLOURED);
   });
 });

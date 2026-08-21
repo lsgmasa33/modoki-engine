@@ -972,6 +972,24 @@ so existing callers don't break; don't pass it.
   normalization drops a malformed item; `capture_gesture` requires the game Playing; and `diagnose`
   only counts console errors from the last 30s (a stale error no longer pins `ok:false`).
 
+### Three more agent-facing gotchas (base-scene / persistence workstream)
+
+- **`modoki_load_scene` stops Play first, so it CANNOT be used to test a real in-game
+  scene swap** (`Time.elapsed` reverts through the Play-press snapshot instead of
+  carrying forward). To drive a live swap the way a real win-event handler would,
+  call it through `modoki_eval` instead: `window.__sceneManager.loadScene(path)`.
+- **A generic 500/504 from `modoki_load_scene`/`modoki_mutate_scene` can mean the
+  editor's Vite child died, not that the scene file is bad.** Before suspecting the
+  data, check `modoki_get_console_logs` and confirm `vitePort` (from
+  `modoki_identity`) is actually reachable — Electron can stay up while its Vite
+  child process has died underneath it.
+- **`modoki_set_transform` on a ghosted (base-scene-origin) entity is NOT blocked,
+  and that's correct** — ghosting is editor-UI only, so a script/agent write is the
+  "runtime" side of that line by design. What IS refused is a gizmo DRAG (no handles
+  exist to grab on a ghosted entity). Prove the difference by comparing screenshots
+  of a ghosted vs. non-ghosted selection, not by calling `modoki_set_transform` and
+  expecting it to error.
+
 ## Failures: one envelope, one closed code set
 
 **Every failed tool call answers three questions: what was attempted, why it failed, what to do

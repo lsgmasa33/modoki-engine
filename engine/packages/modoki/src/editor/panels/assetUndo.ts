@@ -26,7 +26,9 @@ export function isTextAsset(p: string): boolean {
 export type Snapshot = { path: string; content: string; encoding?: 'base64' };
 
 /** The disk effect of deleting ONE asset: undo snapshots + the flat list of
- *  paths to trash (asset + sidecar + generated files + their sidecars). */
+ *  paths to trash (asset + sidecar + generated files + their sidecars).
+ *  `deletePaths` is what we ASKED to trash, which is deliberately a superset of
+ *  what existed — see DeleteFilesResult. */
 export type DeleteResult = { asset: AssetEntry; snapshots: Snapshot[]; deletePaths: string[] };
 
 export type DupResult = { asset: AssetEntry; toPath: string };
@@ -34,20 +36,43 @@ export type DupResult = { asset: AssetEntry; toPath: string };
 /** Build a single coalesced undo/redo for one or more completed deletes. Undo
  *  restores the FULL snapshot set (not just the GLB) so generated mesh/mat/
  *  texture refs don't dangle; redo re-trashes the whole set in ONE call. */
-export function makeDeleteUndo(results: DeleteResult[], refresh: () => void): UndoAction {
+export function makeDeleteUndo(results: DeleteResult[], refresh: () => void, trashedMissing: string[] = []): UndoAction {
   const label = results.length > 1 ? `Delete ${results.length} items` : `Delete ${results[0].asset.name}`;
   return {
     label,
     undo: async () => {
       const all = results.flatMap((r) => r.snapshots);
-      if (all.length === 0) { console.warn('[Assets] Cannot undo: nothing was restorable'); return; }
       for (const s of all) await writeAssetFile(s.path, s.content, s.encoding);
+      // An undo that restores only SOME of what it trashed is a false success: the panel
+      // refreshes, files reappear, and the ones whose snapshot read failed stay in the OS
+      // trash with nothing naming them (#291). So report the SHORTFALL, which covers the
+      // total case (nothing restorable) and the partial case in one check — the total case
+      // used to be a console.warn and the partial case was not reported at all.
+      //
+      // Measured against what the backend ACTUALLY trashed, not against deletePaths:
+      // deletionPathsFor deliberately lists maybe-absent sidecars (`.meta.local.json` is
+      // gitignored and usually not on disk), so a deletePaths-based diff would name files
+      // that never existed and send the user hunting in the trash for them.
+      const restored = new Set(all.map((s) => s.path));
+      const neverExisted = new Set(trashedMissing);
+      const lost = Array.from(new Set(results.flatMap((r) => r.deletePaths)))
+        .filter((p) => !restored.has(p) && !neverExisted.has(p));
+      if (lost.length > 0) {
+        console.error(
+          `[Assets] Undo of "${label}" restored ${restored.size} of ${restored.size + lost.length} file(s). ` +
+          `Still in the trash, recover by hand: ${lost.join(', ')}`,
+        );
+      }
+      // Refresh even on a partial restore — the files that DID come back must appear.
       refresh();
     },
     redo: async () => {
       // Re-delete the whole set in ONE trash call (same as the original delete).
       const allPaths = Array.from(new Set(results.flatMap((r) => r.deletePaths)));
-      await deleteAssetFiles(allPaths);
+      // Same false-success shape on the other half: a failed re-delete left the files on
+      // disk, refresh() re-listed them, and redo read as a no-op (#291).
+      const res = await deleteAssetFiles(allPaths);
+      if (!res.ok) console.error(`[Assets] Redo of "${label}" failed — the files are still on disk: ${allPaths.join(', ')}`);
       refresh();
     },
   };

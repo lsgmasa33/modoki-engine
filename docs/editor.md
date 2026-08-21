@@ -1546,6 +1546,23 @@ Three things make it worth reading rather than just writing:
 
 Logging is best-effort throughout: it must never take down a launch.
 
+### Verifying a CDP attach is actually YOUR clone
+
+`MODOKI_CDP_PORT=9222` (or any derived CDP port) does not guarantee the resulting page belongs
+to your clone — with several clones running, the port you asked for can already be held by a
+sibling, and a probe against the wrong page silently drives someone else's editor. Verify before
+trusting the attach:
+
+1. `curl http://127.0.0.1:<cdp>/json` and read the page URL back — its Vite port must be your
+   clone's (cross-check with `lsof -nP -iTCP:<vite-port> -sTCP:LISTEN`: the electron process's
+   command path should contain your clone's directory).
+2. `curl http://127.0.0.1:<vite-port>/@fs/<absolute path to a file you just edited>` and grep for
+   your new code, to confirm the CDP page is actually serving your bundle and not a sibling's.
+
+**HMR does NOT re-run `installEditorTestBridge`** — it is captured once at startup, so a newly
+added `devTestBridge` method is not CDP-callable until the page gets a full reload/navigate, not
+just an HMR update.
+
 ### Stopping an editor
 
 `npm run editor:stop` (`engine/scripts/stop-editor.sh`) is the counterpart to the launcher. It
@@ -1629,6 +1646,46 @@ that pressing undo walks back through exactly the steps the user took, including
 selected at each one.
 
 The undo stack is capped at 200 entries (oldest dropped, warned once per session).
+
+### Asset delete IS undoable — it is snapshot-backed, not a filesystem one-way door
+
+`Assets` → **Move to Trash** looks irreversible and is not. `executeDeletion` calls
+`collectDeletion` FIRST, which `fetch`es every path the delete covers and keeps the bytes —
+text as text, **binaries base64-round-tripped** (`fetch().text()` would UTF-8-corrupt a `.glb`) —
+then `makeDeleteUndo` (`panels/assetUndo.ts`) writes the whole set back on undo. The set is
+`deletionPathsFor`'s output, so a model's generated meshes/materials/textures and their
+`.meta.json` sidecars come back too, GUIDs intact. Folder delete has its own undo entry.
+
+**This is written down because its absence caused a wrong bug report.** #291 was filed asserting
+*"Move to Trash is a filesystem operation and undo does not cover it"* and proposed confirmation
+dialogs on the strength of it. Nothing in `docs/` contradicted that. The dialogs were declined —
+see `docs/todo.md` § Deferred decisions for that call and for why the one surviving
+`window.confirm` (cross-scene move) is not an inconsistency.
+
+**What undo does NOT survive is an editor relaunch** — `undoStack`/`redoStack` are module state
+in `undo/undoManager.ts`. That is normal and is deliberately not treated as a defect.
+
+**The rule that came out of it: an undo that restores less than it trashed must SAY SO.** The
+empty case used to `console.warn` and return, so Cmd+Z read as working while the files sat in the
+OS trash; the partial case was not reported at all. `makeDeleteUndo` now restores what it can and
+`console.error`s the **shortfall**, which covers both. Two details are load-bearing:
+
+- **The shortfall is measured against what the backend ACTUALLY trashed, not against
+  `deletePaths`.** `deletionPathsFor` deliberately lists maybe-absent sidecars
+  (`.meta.local.json` is gitignored and usually not on disk), so a `deletePaths` diff would name
+  files that never existed and send the user hunting in the trash for them. `/api/delete-asset`
+  returns `{ok, trashed, missing}`; `deleteAssetFiles` surfaces that as `DeleteFilesResult` and
+  the caller threads `missing` into the undo action. It used to return a bare boolean and throw
+  the rest away.
+- **`redo` checks its re-delete too.** A failed re-trash left the files on disk while `refresh()`
+  re-listed them, so redo read as a no-op — the same false success on the other half of the pair.
+
+⚠️ **This class is NOT confined to asset delete.** A sweep of all ~103 `undo`/`redo` bodies found
+**7 more handlers** that discard a failed filesystem op the same way (folder rename desyncs the
+client tree outright) — tracked in **#308**, which must settle the reporting bar (log vs throw vs
+toast) before any of them are fixed. The helpers are the trap: `writeAssetFile`,
+`deleteAssetFile`, `moveFileTo`, `createFolderApi` and `mutateScene` **never throw** — they catch
+and resolve `false`, so ignoring the return value is silent by construction.
 
 ---
 

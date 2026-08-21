@@ -541,6 +541,37 @@ tightened the guard rather than freezing the effect.
 For how scenes are loaded into a world and how prefabs instantiate, see
 [Scene Loading](./scene-loading.md) and [Prefabs](./prefabs.md).
 
+## Single source of truth — where a value lives is decided by what KIND of value it is
+
+A core Modoki philosophy: never hardcode game data in TS that duplicates the scene/prefab/config;
+a resize/recolor/reposition should be a **one-place** edit. Decision rule for any structural or
+tunable value:
+
+- **Spatial / geometry** (an entity's position, extent, size, colour) → **Scene or prefab**
+  (authored entity data). Game code READS it at bind/spawn time and derives from it — e.g. read
+  wall x / red-line z from the scene, collider radius + primitive colour from the prefab —
+  rather than keeping a parallel constant.
+- **Designer-tunable balance/feel knob** (speeds, damage, HP, timings) → the game's **config
+  resource** — a singleton resource-trait read at bootstrap with code defaults (e.g.
+  `SlingConfig`; registered `category:'resource'`, live-editable in the Inspector, hot-reloads).
+- **Asset reference** (a texture/prefab/mesh/material/particle/audio/font GUID) → a field on a
+  **resource trait authored in the scene**, NOT a code constant. **This AMENDS the rule (#53):
+  "asset GUID" used to sit under *code constant* below, and that was wrong for a reason the rule
+  never considered — a GUID in code is a ref THE BUILD CANNOT SEE**, so the asset is dropped from
+  the production build and it fails only once you ship (dev serves everything off disk). Guarded
+  by `engine/tests/assets/codeAssetRefs.test.ts`. Why, the three passes it broke, and what the
+  guard does/doesn't reach: [build.md](./build.md) § "Assets the build cannot see". Still a code
+  constant: a GUID used *only* as a no-scene fallback for something the scene also authors.
+- **Structural invariant / implementation detail** (fixed dt, a value used ONLY as the
+  no-scene/no-prefab fallback, a sentinel, an epsilon) → a **code constant** — this is mechanism,
+  not config; don't force it into the scene/config.
+
+The failure mode to avoid: a code constant that SHADOWS a scene/prefab/config value and has to be
+kept in sync by hand — it will go stale (e.g. a `WALL_X` const drifting from the authored walls
+after a resize). Read from the one source instead. Worked example: `games/sling/runtime/systems.ts`
+reads field bounds from the scene walls in `bindStaticField` and entity size/colour from the
+prefab via `prefabSphereR`/`prefabColor`; only genuine fallbacks/invariants remain as consts.
+
 ## Editor Backend (Vite / Electron parity)
 
 The editor's `/api/*` command endpoints are served by a **transport-agnostic router**

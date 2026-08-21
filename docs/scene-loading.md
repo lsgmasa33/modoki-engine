@@ -72,6 +72,20 @@ acquires each LOD GLB). All transitive dependencies are tracked under the same
 `releaseAllForScene()` runs **after** the swap so a shared resource's refcount
 only drops to zero once no remaining scene owns it.
 
+**No mid-scene release.** `releaseAllForScene(sceneId)` is the **only** release entry point used
+by app/editor code. Deleting/hiding an entity, swapping its mesh, etc. does **not** release
+anything — a scene's resources stay resident until the scene changes. (Verified: there are no
+per-entity `releaseModel`/`releaseMesh`/`releaseMaterial` calls outside the cache module
+itself.)
+
+**Transitive deps** (a `.mesh.json` → its `.glb` model + `.mat.json` material; a material → its
+textures) are acquired/released under the same `sceneId`, captured in a per-(scene,mesh) snapshot
+at acquire time so a mid-scene editor **re-import** (`invalidateModel`, which evicts cache
+entries) can't strand an owner.
+
+**Editor live-preview caches** (particle defs in `particleCache.ts`) are plain data, cleared via
+`clearParticleCache()` from `disposeAllCachedResources()` on full teardown.
+
 ## Scene manifest format
 
 The current scene file version is **12** (`SceneFile.version`), stamped from

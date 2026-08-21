@@ -177,6 +177,13 @@ Mirrors the Zone stack (`zoneTriggerCore.routeZone`): each start/marker/end fans
    subscribers on scene swap).
 3. **Declarative `OnSequence` trait** — `{ onStart, onEnd }` (UIAction names) on the Director entity;
    fired via pipeline-safe `dispatchGameAction`. Per-marker reactions are the signal track's own actions.
+   Worked example: `games/timeline-demo`'s `main.scene.json` Cutscene, which hides the standing Title
+   card on start and takes the last subtitle line down on end (#307). That end reaction is the one a
+   signal marker CANNOT stand in for — a marker only fires at a tick somebody authored, so the final
+   line would otherwise sit on screen forever; the sequence end is the only edge that knows the
+   cutscene is over. Pinned by `games/timeline-demo/tests/cutscene-onsequence.test.ts`, which reads the
+   action names out of the scene so a rename on either side goes red instead of silently doing nothing
+   (an unresolved action name is a warning, not a crash).
 
 ## Resource wiring
 

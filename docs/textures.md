@@ -395,6 +395,41 @@ pixels a device downloads and uploads.
   "today's behaviour, unchanged". A texture already in flight keeps whatever variant it started
   loading; a live tier change is picked up by the NEXT load, not an in-place swap.
 
+## Environment maps (HDR / UltraHDR)
+
+`.hdr` classifies as asset type `environment`, gets a GUID-only `.meta.json`, and goes through the
+same generic reimport/manifest/cache plumbing as every other asset type (reimport-registry, meta
+sidecar, `/api/reimport` + `/api/reimport-types`, cache-miss bake, its own `EnvironmentAssetView`
+Inspector panel) — the one real gap was the encoder: `toktx` can't read `.hdr` (only 16-bit int,
+clamps HDR), `ktx create` doesn't do ASTC encode and can't read EXR either, and there is no
+`ultrahdr` CLI. GPU-compressed HDR (ASTC-HDR) stays blocked on current tooling.
+
+Two formats ship instead, both selectable per-asset (`EnvImportSettings.format` in
+`runtime/core/environmentSettings.ts`):
+
+- **`hdr` (default) — dependency-free downscale.** `plugins/hdr-codec.ts` decodes via three's
+  `HDRLoader`, area-averages down to `maxSize` in linear radiance space, and re-encodes RGBE —
+  measured **0.10% mean-luminance error**, and the real download win (2K→1K ≈ 3×, →512 ≈ 12×).
+  `env-convert.ts` drives it; `env-cache.ts` content-hashes the result; served as `~env.hdr`.
+- **`ultrahdr` — browser-side gainmap encode.** `@monogrid/gainmap-js` (editor-only, dynamically
+  imported so it never reaches a game bundle) encodes an UltraHDR JPEG with an embedded gainmap
+  (`encodeUltraHDR.ts`: HDRLoader → `findTextureMinMax` → `encodeAndCompress` →
+  `encodeJPEGMetadata`, libultrahdr WASM); the committed `~ultrahdr.jpg` is written via
+  `/api/write-file`. Runtime decode is `UltraHDRLoader` (already vendored). Measured on a real
+  asset: 6.53 MB → 0.53 MB (**~11.7×**), ~183 ms encode, 2048×1024, 14 gainmap/XMP markers
+  confirming a real embedded gainmap. Because the encode needs WebGL +
+  `createImageBitmap`, it isn't auto-testable — it was live-verified via CDP in the running
+  Electron editor rather than in `npm test`. `maxSize` downscale is currently `hdr`-only;
+  `ultrahdr` encodes at source resolution (deferred, see below).
+- The scanner's `detectType` excludes the committed `~ultrahdr.jpg` from re-classification as a
+  fresh texture (it's a derived file, not a source asset) — build-gen copies the committed variant
+  and drops the multi-MB HDR source; the dist verifier checks the per-format variant exists.
+
+**Deferred follow-ups** (tracked, not scheduled):
+- **KTX2 ASTC-HDR** as a second GPU-compressed HDR variant, once tooling exists to produce it.
+- Persist the Environment Inspector's **exposure** slider — currently preview-local UI state, not
+  saved to the asset.
+
 ## Gotchas
 
 - **Multiple-of-4 dimensions are mandatory** for block-compressed KTX2

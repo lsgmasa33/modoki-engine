@@ -112,6 +112,34 @@ its own log said `Node provisioning failed`. When testing an extractor, do not b
 with the same tool — GNU tar's `-a -cf x.zip` writes a *tar* named `.zip` that extracts happily
 and proves nothing. Assert the `PK` magic bytes instead.
 
+## Packaged-app bugs found on real Windows hardware
+
+Four bugs, all invisible to `npm run dev` on macOS, found testing the packaged NSIS installer on
+real Windows hardware:
+
+- **`/tmp` hardcoded** (`devServer.ts`'s Vite log path) → `ENOENT` → the open flow's catch handler
+  → `app.quit()` — read as "crashes on a new folder," but it was every first-open crashing on
+  Windows, where `/tmp` isn't a real path. Fixed with `os.tmpdir()`.
+- **Missing `.exe` suffix** — the `ffmpeg-static`/`@ffprobe-installer` payloads are
+  `ffmpeg.exe`/`ffprobe.exe` on Windows, but the resolver checked for the bare name, so a
+  successfully-installed tool reported "Installed … but its executable is missing."
+- **Launch splash + file logging added** — `splash.ts` (packaged-only, a `data:` URL window with a
+  live status line) replaces what used to be a silent ~1-minute black window on first launch (Node
+  provisioning + Vite's cold dep-optimize); `fileLog.ts` writes to `<userData>/logs/main.log` with
+  timestamps, since a Windows user cannot easily copy text out of a crashed app to report an error.
+- **Android `local.properties` backslash-escaping bug** — a new-project Android build failed with
+  `java.io.IOException: The filename, directory name, or volume label syntax is incorrect`.
+  `local.properties` is a Java `.properties` file, where `\` is an ESCAPE character — but the raw
+  Windows SDK path was written verbatim (`sdk.dir=C:\Users\…\toolchain\android-sdk`), so `\t`
+  (inside `…\toolchain`) became a literal TAB and `\U`/`\A`/`\R` were dropped, handing Gradle a
+  garbage SDK path. `JAVA_HOME`/`ANDROID_HOME` were unaffected — they're passed via env vars, never
+  `.properties`-parsed, and `gradlew.bat` is used on Windows regardless. Fixed by
+  `androidSdkDirValue()` forward-slashing the path (Gradle accepts `/` on Windows). This is a
+  **second, independent path-bug class** from the repo's `\` vs `/` path-sink audits (see "Paths"
+  above): those swept path→URL/import sinks but skipped file writes, so this one went unnoticed
+  until it broke a real build. A follow-up audit for the escaping-sensitive-file class (native
+  path → `.properties`/gradle/script) came back clean otherwise — `sdk.dir` was the only offender.
+
 ## Process control
 
 **`pkill -f` does not work on Windows.** It matches the command *line*, which MSYS/Git-Bash
@@ -142,6 +170,19 @@ it drags `usr\bin` onto every child process's PATH.
 
 `npm run verify:publish` is bash + rsync and is deliberately hub-only — it is not part of the
 Windows gate.
+
+**A launcher shim avoids typing the bash path every time.** Two thin scripts outside the repo
+(so they never dirty the branch), on PATH: `editor.cmd` for PowerShell/cmd — invokes Git Bash via
+its **absolute** path (`%ProgramFiles%\Git\bin\bash.exe`), since `bash` itself is not resolvable
+from those shells — and a plain `editor` script for Git Bash. Both just forward to
+`engine/scripts/launch-editor.sh` with a repo path + optional game id
+(`MODOKI_REPO`/`MODOKI_BACKEND_PORT` override the defaults; a missing repo exits 1 with a clear
+error) — nothing this pair does is more than a convenience wrapper around the existing launcher.
+
+**`engine/packages/capacitor-adjust` and `capacitor-applovin-max` were not deleted — they moved**
+to `games/3d-test/packages/`, and 3d-test still ships both Adjust and AppLovin. Their absence from
+the old `engine/packages/` path is a relocation, not a dropped SDK; only the lockfile's
+`engine/packages/…` path reference is stale.
 
 ## Tests, gates and timings
 

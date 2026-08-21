@@ -1,8 +1,9 @@
 # 2D Physics Demo — Modoki
 
 ![The physics playground scene: a walled arena holding a stack of coloured boxes and a
-resting ball, a translucent sensor zone spanning the middle, and a pendulum bob and
-spring bob hanging from their anchors](screenshot.png)
+resting ball, falling balls above, a translucent yellow sensor zone spanning the middle,
+and a shorter violet Zone2D trigger bar to its lower right with its probe resting on the
+floor beneath it](screenshot.png)
 
 A showcase of the [Modoki](https://modoki-engine.com) engine's **Rapier2D** physics
 layer, built almost entirely as scene data. Gravity, restitution, revolute and spring
@@ -96,10 +97,17 @@ a solver — checkpoints, spawn and kill regions, camera triggers, cutscene star
 - **Sensors are events, not collisions.** A sensor collider produces enter/exit events
   with no solver response — which is why the zone can react without disturbing the bodies
   passing through it.
-- **A `Zone2D` needs no physics at all.** It is a pure geometric area whose extent *is*
-  the entity's Transform scale, so the Trigger Zone carries no `RigidBody2D` and no
-  `Collider2D` — and the drawn bar is a 1x1 sprite under that same scale, which is what
-  keeps what you see identical to what is tested.
+- **A `Zone2D` needs no physics at all.** It is a pure geometric area whose extent *is* the
+  entity's Transform scale, so the Trigger Zone carries no `RigidBody2D` and no `Collider2D`.
+- **`Renderable2D` sizes are HALF-extents, and the Transform scale multiplies them** — a
+  sprite draws `width * 2 * sx` wide. A `Zone2D` tests the scale itself, so the drawn bar
+  matches the tested area only at `0.5`. Get it wrong and the visual silently advertises an
+  area the logic does not test, which is the half you cannot see.
+- **A reaction restores what was AUTHORED, not a constant.** Both stations remember the
+  tint the scene holds when the first occupant arrives and put it back when the last one
+  leaves, so re-colouring a station in the editor survives play. Writing a hardcoded idle
+  colour back instead is the quiet way to overwrite someone's edit. (It is refcounted for
+  the same reason: a volume can hold more than one occupant.)
 - **Verify by data.** The `zone` / `zoneTrigger` journal events — and the engine's own
   `@zone` crossings — make the demo assertable in a headless test, no screenshots
   required. `tests/zone-station.test.ts` does exactly that.

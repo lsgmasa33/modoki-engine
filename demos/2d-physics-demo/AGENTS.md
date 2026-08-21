@@ -12,10 +12,25 @@ source of truth) — `initWorld`/`sceneSetup` are empty and there are no custom 
   `game.ts`, one per trigger station, each wired declaratively to its entity. Both tint the
   station's `Renderable2D` and `ctx.emit(...)` a journal event, so the reaction is verifiable
   from the event journal (body as a stable GUID via `entityRef`, not `id()`).
-  - `sensorZone/enter|exit` — the *Sensor Zone*, via `OnCollision2D`. Rapier sensor; idle
-    translucent yellow `0xf1c40f`/0.25 → occupied green `0x2ecc71`/0.5; journals `zone`.
+  - `sensorZone/enter|exit` — the *Sensor Zone*, via `OnCollision2D`. Rapier sensor; authored
+    translucent yellow → green `0x2ecc71`/0.5 while occupied; journals `zone`.
   - `triggerZone/enter|exit` — the *Trigger Zone*, via `OnZone2D`. **No physics body at all**;
-    idle purple `0x9b59b6`/0.25 → violet `0xd980fa`/0.5; journals `zoneTrigger`.
+    authored translucent purple → violet `0xd980fa`/0.5 while occupied; journals `zoneTrigger`.
+  - ⚠️ **The IDLE tint is authored in the scene and is NOT a code constant.** `tintOnEnter`
+    remembers what the station actually holds and `restoreOnExit` puts that back, so
+    re-colouring a station in the Inspector survives — a hardcoded idle would silently
+    overwrite the owner's edit on the very next exit. The `*_FALLBACK` pairs are no-scene
+    fallbacks only.
+  - ⚠️ **That stash is PER-SESSION state, and both of its hazards are subtle enough to have
+    shipped once already.** (a) It tracks WHO is inside, not HOW MANY: pressing Stop clears
+    the engine's occupancy *without* firing exits (`clearZoneState`), so a station occupied
+    at Stop gets a second `enter` with no matching `exit` — a counter climbs to 2, never
+    returns to 0, and the station stays lit forever. A set of occupant ids is idempotent
+    under that duplicate and self-heals. (b) It is cleared on `onWorldSwap`, because Stop
+    rebuilds the world and `entity.id()` is a per-world SLOT INDEX that restarts at 0 — the
+    next session hands the same ids to the same entities, so an uncleared stash would skip
+    re-reading the authored tint and later restore the PREVIOUS session's value. Both are
+    pinned by tests in `tests/zone-station.test.ts`.
   Everything else — falling bodies, bouncing, pendulum, spring, trigger detection, player movement
   — is stock engine traits (`RigidBody2D`, `Collider2D`, joints, `CharacterController2D`).
 - **This demo is the engine's ONLY real usage of the 2D declarative zone chain** (#296) —
@@ -38,12 +53,20 @@ source of truth) — `initWorld`/`sceneSetup` are empty and there are no custom 
   singleton entity + `project.config.json`.
 
 ## Gotchas
-- **A `Zone2D` takes its area from the Transform SCALE, and `Renderable2D` is scaled by that
-  same Transform.** So the two are only identical if the sprite is authored `1x1`: the Trigger
-  Zone is `sx 260, sy 30` with a `1x1` square, which renders 260x30 design px (measured via
-  `get_scene_state?bounds=1`) and tests exactly that area. Authoring `width 260` under `sx 260`
-  would draw a 67600px bar over a correctly-sized zone — the drawn area and the tested area
-  desync silently, and only the drawn one is visible.
+- **`Renderable2D.width`/`height` are HALF-extents, and the Transform scale multiplies them.**
+  Drawn size is `width * 2 * sx` by `height * 2 * sy`. A `Zone2D` box's TESTED area, by
+  contrast, is the scale itself (full size), so the two agree only when the sprite is `0.5`:
+  the Trigger Zone is `sx 260, sy 30` with a `0.5 x 0.5` square, measured at 171.9 screen px =
+  260 design px via `get_scene_state?bounds=1`. `width: 1` there draws **520** over a zone that
+  tests 260, and the bar overhangs the arena wall — caught only by regenerating the screenshot,
+  because the drawn half is the only half you can see.
+- **The same half-extent rule is why a circle's `width` equals its collider RADIUS, not its
+  diameter.** The Bouncy Ball is `width 45` / `radius 45`; the Zone Probe is `width 15` /
+  `radius 15`. Authoring `width 30` over `radius 15` draws a ball at twice its physical size.
+- ⚠️ **Pre-existing, NOT introduced by the zone work: the Sensor Zone's bar is wider than its
+  sensor.** `width 400` draws 800 design px while `Collider2D.halfW 170` only detects 340 — so
+  the yellow bar advertises more than twice the area that actually triggers. Left alone because
+  changing it changes a published demo's look; worth a decision rather than a silent fix.
 - **`ZoneOccupant` is opt-in, and a zone with no tagged occupant is silently inert.** Nothing
   errors — the Inspector shows a healthy `Zone2D` + `OnZone2D` reacting to nothing. Here the
   only tagged entity is the *Zone Probe*.
