@@ -17,17 +17,18 @@
  *  asserting a reference COUNT here would pin the fixture's contents, not the
  *  feature.
  *
- *  Driven from the ASSETS panel rather than the Hierarchy on purpose. The
+ *  Both entry points are covered, because they have DIFFERENT preconditions: the
  *  Hierarchy item needs the entity's `EntityAttributes.guid` and is disabled
- *  without one — and `fixtures/e2e-smoke.scene.json` has no guids on any entity,
- *  so every row there would correctly render the item greyed out. (That is the
- *  fixture being old, not a real-world shape: measured across all 40 committed
- *  scenes, 80-100% of entities carry a guid, the lone exception per scene being
- *  the resource entity, which has nothing to find references to anyway.) The
- *  Assets item has no such precondition — it falls back to the asset's path. */
+ *  without one, while the Assets item falls back to the asset's path and so can
+ *  never be disabled. `fixtures/e2e-smoke.scene.json` originally had no guids on
+ *  any entity, which made the Hierarchy half untestable and is why guids were
+ *  backfilled into it — that was the fixture being old rather than a real-world
+ *  shape, since across all 40 committed scenes 80-100% of entities carry a guid,
+ *  the lone exception per scene being the resource entity, which has nothing to
+ *  find references to anyway. */
 
 import { test, expect } from '@playwright/test';
-import { gotoEmptyEditor } from './helpers';
+import { gotoEmptyEditor, gotoEditorWithScene } from './helpers';
 
 /** Category groups collapse by default, so seed the expanded set to get rows.
  *  Mirrors `gotoEditorWithAssets` in editor-assets.spec.ts. */
@@ -69,6 +70,42 @@ test('Assets → Find References opens the dialog and it settles on an answer', 
       || d.querySelectorAll('[data-testid="find-references-hit"]').length > 0);
     expect(settled).toBe(true);
   }).toPass({ timeout: 20_000 });
+
+  await page.locator('[data-testid="find-references-close"]').click();
+  await expect(dialog).toHaveCount(0);
+});
+
+/** The Hierarchy half, and the §5 refusal it happens to exercise.
+ *
+ *  `fixtures/e2e-smoke.scene.json` is loaded through the test bridge and lives under
+ *  `engine/tests/e2e/`, NOT under a project's asset roots — so the on-disk graph the
+ *  route walks does not contain its entities. That makes this the ideal place to pin
+ *  the rule that matters most on this surface: an entity the graph cannot find is
+ *  REFUSED, naming what was expected. It must never come back as "nothing references
+ *  this", which a reader acts on by deleting something.
+ *
+ *  So this test proves three things at once — the menu item is enabled when the
+ *  entity has a guid, clicking it reaches the route, and an unresolvable target
+ *  refuses rather than lying. */
+test('Hierarchy → Find References is enabled on a guid-bearing entity, and an unresolvable target refuses', async ({ page }) => {
+  await gotoEditorWithScene(page);
+
+  await page.getByText('CenterCube', { exact: true }).click({ button: 'right' });
+  const item = page.locator('[data-menu-item="Find References"]');
+  await expect(item).toBeVisible();
+  // The precondition that makes this half of the feature reachable at all: the item
+  // is disabled without `EntityAttributes.guid`. This assertion is also what stops
+  // the fixture's backfilled guids being dropped later as noise.
+  await expect(item).not.toHaveCSS('color', 'rgb(85, 85, 85)');
+  await item.click();
+
+  const dialog = page.locator('[data-testid="find-references-dialog"]');
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText('no asset or entity matches');
+
+  // The load-bearing half: a refusal, NOT a green "nothing references this" banner.
+  await expect(dialog.locator('[data-testid="find-references-unreferenced"]')).toHaveCount(0);
+  await expect(dialog.locator('[data-testid="find-references-hit"]')).toHaveCount(0);
 
   await page.locator('[data-testid="find-references-close"]').click();
   await expect(dialog).toHaveCount(0);

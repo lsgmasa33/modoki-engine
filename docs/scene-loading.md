@@ -997,6 +997,109 @@ Findings come from four passes:
    specific "references must be a GUID (use the asset's id / .meta.json sidecar)"
    message; anything else gets "is not a GUID or URL". The primitive sprite
    keywords `circle`/`square`/`triangle` are exempt on `Renderable2D.sprite`.
+
+   ⚠️ **GUID shape was the WHOLE check until #292** — a scene referencing a
+   well-formed GUID for an asset **deleted from the manifest** validated
+   completely clean, and the failure surfaced later, at load/render time. So
+   `validate_scene` answered "is this string GUID-shaped?" while the caller was
+   asking "will this scene load?".
+
+   *(#292's write-up cites #237 as "a real dangling-material-ref bug in
+   `forest-camp` that shipped precisely because nothing checked resolution". It
+   was not — checked against `34ef5260c`: #237 was a **tree-shaker blind spot on a
+   MAP-shaped ref field** (`SkinnedMeshRenderer.materials`, a `Record<slot,guid>`),
+   whose GUIDs were valid and present in the manifest all along; they were DCE'd
+   out of production builds. This check would not have caught it, and its fix was
+   the build-time `unreachableRefs` guard. Recorded because a plausible-sounding
+   wrong precedent is what makes the next reader over-trust the new check.)*
+
+   The check is now **`assetExists`, an optional injected `AssetRefResolver`** —
+   the same shape as `getPrefab` below, and for the same reason: this module does
+   no I/O and has no manifest of its own. The Node-only glue is
+   `makeAssetResolver` in `editorBackendRouter.ts`, which indexes
+   `ctx.getManifest().assets[].guid` once per request (a scene with 400 refs must
+   not re-scan the array 400 times). **All three consumers** above inject one: both
+   dev-server endpoints from `makeAssetResolver`, and the hot-reload handler from
+   the browser's own loaded manifest (`getAssetEntry`, guarded on
+   `getAllAssets().length`) — which is the most useful place for it, since it fires
+   immediately before the load that would otherwise drop the ref in silence.
+   A ref whose GUID no manifest asset carries gets "is a well-formed GUID but no
+   asset in the manifest has it". Sliced sprites and the auto-emitted whole-image
+   sprite are `type:'sprite'` **sub-entries with guids of their own**, so sweeping
+   `assets[]` covers a `Renderable2D.sprite` / `UIElement.imageSrc` ref — a
+   resolver filtered to file-backed assets would report every 2D sprite in the
+   project as dangling.
+
+   **Absent resolver ⇒ the pre-#292 shape-only pass, NOT "everything is
+   dangling".** `makeAssetResolver` returns `null` — and the caller then passes
+   nothing — when the manifest is empty, guid-less, or throws. A false "this asset
+   was deleted" sends a caller hunting a ref that is fine, which would be worse
+   than the gap #292 closes, so *cannot-check* and *dead* are deliberately
+   different states. `engine/tests/plugins/validateSceneAssetResolver.test.ts`
+   pins both the wiring and that silence.
+
+   ⚠️ **The resolver must answer case-SENSITIVELY, and this is the trap.** `isGuid`'s
+   regex carries `/i`, so an uppercase guid is *well-formed*; but `resolveRef` is
+   `guidToEntry.get(ref)` — a plain case-sensitive `Map.get` over guids that
+   `registerAsset` stores verbatim, with no normalisation anywhere on that path. So a
+   resolver that folded case would report "will resolve at load" for a ref that resolves
+   to `undefined` at load — **the exact false negative this check exists to remove**.
+   Both resolvers therefore match exactly, and `AssetRefVerdict` is three-state rather
+   than a boolean: `'ok'` / `'missing'` / `'case-mismatch'`. The third gets its own
+   message, because telling an author their asset was "deleted or never imported" when it
+   is sitting in the manifest under a different casing sends them hunting a file they are
+   looking at. Every minted guid is lowercase (`crypto.randomUUID`, `deriveGuid`), so only
+   a hand-authored or externally-produced ref reaches it — which is precisely the case
+   that needs the accurate message.
+
+   *(The first cut of #292 folded case in the backend resolver and had a unit test
+   asserting that as correct — "case-insensitive, like every other guid comparison". It
+   is not: `makePrefabResolver` folds case, but a prefab lookup is not a prediction about
+   `resolveRef`. Two independent reviewers caught the divergence from opposite ends.)*
+
+   **What it does NOT reach**, both by construction:
+   - **Non-scalar refs.** `REF_FIELDS_BY_TRAIT` is a *scalar*-ref registry, so a
+     map-shaped field (`SkinnedMeshRenderer.materials`) or an array one
+     (`AnimationLibrary.animSets`) is invisible to this pass, exactly as it is to
+     the rest of the ref rule. That is the #237 shape above.
+   - **A ref written through `/api/asset-write` or `/api/write-file` in the last
+     ~150 ms.** Neither route rebuilds the manifest (unlike `/api/create-asset` and
+     `/api/import-file`, which both rebuild synchronously before returning) — they rely on
+     the watcher's 150 ms-debounced rescan. So a brand-new asset written directly and
+     validated immediately can be reported `missing` while being perfectly valid. Known
+     and deliberately not fixed here: forcing a rebuild inside a validation GET would put
+     a full filesystem scan **plus a guid heal that writes to disk** on a read-only route,
+     which is worse than the window it closes. The sanctioned flow (`create_asset` →
+     `write_asset`) is not affected.
+   - **`MaterialInstance` `texture` overrides.** The `ref` (a sprite/texture GUID)
+     is still checked for `typeof === 'string'` only — neither shape nor
+     resolution. It sits in the `materialOverrides` branch of `typeMismatch`,
+     which returns a single first-failure string and has no resolver in scope, so
+     closing it is a different change rather than a line in this one.
+
+   **The rule also covers prefab-instance `overrides`.** Until #292 it walked
+   `entity.traits` **only**, so the 56 ref fields authored inside `overrides` blocks
+   across `games/` + `demos/` (27 `Renderable3D.mesh` + 27 `.material` in
+   `space-console` alone) were checked by *nothing* — not for resolution, not even for
+   GUID shape. A literal asset path in an override was as silent as a deleted one. Both
+   call sites now go through one exported predicate, `refFieldWarnings`, for the reason
+   `inertSizeWarnings` gives right below it: an override group has the identical
+   `{trait: {field: value}}` shape, and restating the rule per call site is how the
+   exemptions (primitive sprite keywords, external URLs) drift apart. It runs **before**
+   the inert-size check's `UIElement` early-continue — most override groups touch no
+   `UIElement` at all, which is exactly the shape a naive placement would skip.
+
+   **Measured before enabling:** the rule was run over every committed scene and
+   prefab in all 23 projects under `games/` + `demos/` — **1171 GUID refs, 0
+   reported**, against **1171 reported** by a deliberately all-missing control resolver
+   (a zero that cannot be made non-zero is not a measurement). The 1171 is 1115 direct
+   trait refs plus exactly the 56 override refs above, which is the cross-check that the
+   override walk is really live. So it currently catches nothing that is already in the repo, and
+   its value is prospective: it is a guard against a ref that goes stale later
+   (an asset deleted out from under a scene, an agent authoring a GUID that was
+   never imported), which is the shape that used to reach load time unannounced.
+   The zero is also the false-positive check — the sprite sub-entry coverage above
+   is what earns it.
 3. **Structural / referential-integrity pass** (schema-independent) — duplicate
    entity ids, self- or dangling `parentId` (matched as a GUID *or* a legacy
    numeric file id; `''`/`0` = root), dangling `UIAction.bindings[].target`

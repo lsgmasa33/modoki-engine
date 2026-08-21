@@ -1276,16 +1276,24 @@ export interface RefEdgeEnumeration {
   guidIndex: Map<string, string>;
   /** guid (lowercase) → how it got into `guidIndex` (implicit-edge provenance). */
   guidOrigin: Map<string, GuidOrigin>;
-  /** Every shippable file on disk with its classified type. The edge list alone
-   *  cannot answer "what does nothing reference?" — a file with no refs IN and none
-   *  OUT never appears in an edge, so it would be invisible to the very query it is
-   *  the answer to.
+  /** Every shippable file on disk, as a virtual path.
+   *
+   *  Needed because the edge list alone cannot tell "this file exists and nothing
+   *  references it" from "there is no such file": a file with no refs IN and none OUT
+   *  never appears in an edge, so it is not a graph node. `resolveTarget` checks
+   *  membership here before answering, so a typo'd or deleted path is a refusal
+   *  rather than a confident `unreferenced: true` — which reads as "safe to delete".
    *
    *  `meta` sidecars are excluded, matching the orphan report's own filter: both
    *  halves of a sidecar (`.meta.json` and the machine-local `.meta.local.json`) are
-   *  metadata ABOUT an asset, not assets, and listing them produced a phantom row per
-   *  imported binary in the Clean Up dialog (QA-DLG-0006). */
-  allFiles: Array<{ virtual: string; type: string }>;
+   *  metadata ABOUT an asset, not assets. That exclusion is also why a sidecar path
+   *  is correctly REFUSED as a find-references target rather than answered.
+   *
+   *  Paths only, no per-entry `type`: the classified type is used to apply the filter
+   *  above and then dropped. It rode along on each entry for one removed consumer
+   *  (`findUnreferenced`), and a field nothing reads is a field that can go wrong
+   *  without anyone noticing. */
+  allFiles: string[];
   /** The files the SHAKE would seed from — scenes on disk plus the keep-list. A file
    *  not transitively reachable from one of these is dropped from a production build,
    *  so "referenced only by something unreachable" is a real and different answer from
@@ -1338,8 +1346,8 @@ export function enumerateRefEdges(projectRoot: string, roots: AssetRoot[]): RefE
     guidIndex,
     guidOrigin,
     allFiles: listAllShippableFiles(roots)
-      .map(f => ({ virtual: f.virtual, type: classify(f.virtual) }))
-      .filter(f => f.type !== 'meta'),
+      .filter(f => classify(f.virtual) !== 'meta')
+      .map(f => f.virtual),
     seeds: [...new Set([...keepList, ...findSceneFiles(roots)])],
     warnings: result.warnings,
   };

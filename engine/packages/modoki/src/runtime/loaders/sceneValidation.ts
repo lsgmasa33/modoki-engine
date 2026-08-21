@@ -121,6 +121,40 @@ interface SceneEntityLike {
  *  anchors are simply not checked (a conservative false negative, never a wrong claim). */
 export type PrefabResolver = (sourceRef: string) => unknown;
 
+/** Does this GUID ref name an asset that actually EXISTS in the project's manifest?
+ *  Injected by the caller for the same reason `PrefabResolver` is — this module does
+ *  no I/O and has no manifest of its own (see module docs).
+ *
+ *  "Nobody could tell me" is expressed by NOT PASSING a resolver at all, rather than by
+ *  a verdict. A caller that cannot answer authoritatively — no manifest loaded, a partial
+ *  scan — must omit this rather than supply one that answers `'missing'`, because that
+ *  reads as "this asset was deleted" and would send a caller hunting a ref that is fine.
+ *
+ *  Absent ⇒ ref fields are checked for GUID *shape* only, which is exactly what this
+ *  validator did before #292: a scene referencing a well-formed GUID for a
+ *  deleted-from-the-manifest asset validated completely clean, and the failure
+ *  surfaced later, at load/render time. */
+export type AssetRefResolver = (ref: string) => AssetRefVerdict;
+
+/** What a resolver found for a ref. Three states, not a boolean, because the third one
+ *  has a completely different fix and a `false` would describe it wrongly:
+ *
+ *  - `'ok'`          — the manifest has this exact guid.
+ *  - `'missing'`     — nothing in the manifest, at any casing. Deleted or never imported.
+ *  - `'case-mismatch'` — an asset carries this guid but with different LETTER CASE.
+ *
+ *  ⚠️ The resolver must answer **case-sensitively**, because that is what decides whether
+ *  the ref loads: `resolveRef` (assetManifest.ts) is `guidToEntry.get(ref)`, a plain
+ *  case-sensitive `Map.get`, and `registerAsset` stores the guid verbatim with no
+ *  normalisation — while `isGuid`'s regex carries `/i` and so ACCEPTS an uppercase guid.
+ *  A resolver that lowercased both sides would report "will resolve at load" for a ref
+ *  that resolves to `undefined` at load, which is the exact false negative this check
+ *  exists to remove. Every generated guid is lowercase (`crypto.randomUUID`, `deriveGuid`),
+ *  so this only bites a hand-authored or externally-produced ref — which is precisely the
+ *  case where the author is staring at a guid that IS in the manifest and needs to be told
+ *  it is the casing, not a deleted asset. */
+export type AssetRefVerdict = 'ok' | 'missing' | 'case-mismatch';
+
 /** Is an authored `UIElement.${axis}` value a NEUTRAL "unset"/"agrees with stretch"
  *  claim, not a real trap? Shared by the direct-trait path and the prefab-override
  *  path so they cannot drift on the noise budget:
@@ -134,6 +168,77 @@ export type PrefabResolver = (sourceRef: string) => unknown;
  *  and would reintroduce the 102. */
 function isNeutralSize(v: unknown, unit: unknown): boolean {
   return v === 0 || (v === 100 && unit === '%');
+}
+
+/**
+ * Asset-reference warnings for ONE entity's trait bag — every field in
+ * `REF_FIELDS_BY_TRAIT` must be a GUID or an external URL, and (when `assetExists` is
+ * injected) that GUID must name an asset the manifest actually has.
+ *
+ * ONE predicate serves every caller, for the reason `inertSizeWarnings` below gives: a
+ * prefab-instance's OVERRIDE group has the identical `{trait: {field: value}}` shape as a
+ * scene entity's `traits`, so restating the rule per call site is how the exemptions
+ * (primitive sprite keywords, external URLs) drift apart. They already had: until #292 this
+ * rule ran over `entity.traits` ONLY, and the 56 ref fields authored inside `overrides`
+ * blocks across `games/` + `demos/` were checked by nothing at all — not for resolution,
+ * not even for GUID shape. A literal asset path in an override was as silent as a deleted one.
+ *
+ * `label` is prefixed to each message; the caller owns what the group is CALLED (a scene
+ * entity by name, an override group by `overrides[localId]`).
+ */
+export function refFieldWarnings(traits: unknown, label: string, assetExists?: AssetRefResolver): string[] {
+  const out: string[] = [];
+  if (!traits || typeof traits !== 'object') return out;
+  for (const [traitName, traitVal] of Object.entries(traits as Record<string, unknown>)) {
+    const refFields = REF_FIELDS_BY_TRAIT[traitName];
+    // A tag trait serializes as `true` and carries no fields; an unknown trait still gets
+    // its refs checked (a typo'd trait name must not also hide a dead asset ref).
+    if (!refFields || !traitVal || typeof traitVal !== 'object') continue;
+    const fields = traitVal as Record<string, unknown>;
+    for (const field of refFields) {
+      const v = fields[field];
+      if (typeof v !== 'string' || v === '') continue;
+      if (traitName === 'Renderable2D' && field === 'sprite' && PRIMITIVE_SPRITES.has(v)) continue;
+      if (isExternalUrl(v)) continue;
+      if (isGuid(v)) {
+        // #292 — GUID SHAPE was the whole check until now, so a ref to an asset that had
+        // been deleted from the manifest validated clean and failed later, at load/render
+        // time. Only reachable when the caller injected a resolver that can answer
+        // authoritatively (see `AssetRefResolver`); without one this stays the shape-only
+        // pass it has always been.
+        if (assetExists) {
+          const verdict = assetExists(v);
+          if (verdict === 'missing') {
+            out.push(
+              `${label}.${traitName}.${field}: '${v}' is a well-formed GUID but no asset in the manifest has it `
+              + `— the asset was deleted or never imported, so this reference will not resolve at load`,
+            );
+          } else if (verdict === 'case-mismatch') {
+            // Deliberately NOT the message above: the asset is right there, and telling
+            // this author it was "deleted or never imported" sends them hunting a file they
+            // are looking at. See `AssetRefVerdict` for why case decides resolution.
+            out.push(
+              `${label}.${traitName}.${field}: '${v}' matches a manifest asset only when letter case is ignored `
+              + `— asset refs resolve through a case-SENSITIVE lookup, so this will not resolve at load. `
+              + `Re-author the ref with the manifest's exact casing (guids are minted lowercase).`,
+            );
+          }
+        }
+        continue;
+      }
+      // Every field in this registry holds a manifest-asset GUID — `Text2D.font` /
+      // `Text3D.font` / `UIElement.fontFamily` included — so a font PATH is a
+      // literal-path violation here like any other (QA-INSP-0004, #231).
+      if (isInternalAssetPath(v)) {
+        out.push(
+          `${label}.${traitName}.${field}: internal asset path '${v}' — references must be a GUID (use the asset's id / .meta.json sidecar)`,
+        );
+      } else {
+        out.push(`${label}.${traitName}.${field}: '${v}' is not a GUID or URL`);
+      }
+    }
+  }
+  return out;
 }
 
 /**
@@ -176,8 +281,15 @@ export function inertSizeWarnings(traits: unknown, label: string): string[] {
 
 /** Validate an on-disk scene object. `schema` is optional (see module docs);
  *  `getPrefab` is optional (see `PrefabResolver` docs) — omitted, prefab-instance
- *  overrides are simply not checked for the inert-size trap. */
-export function validateSceneData(data: unknown, schema?: SceneSchema, getPrefab?: PrefabResolver): ValidationResult {
+ *  overrides are simply not checked for the inert-size trap; `assetExists` is optional
+ *  (see `AssetRefResolver` docs) — omitted, an asset ref is checked for GUID SHAPE only
+ *  and a ref to a deleted asset validates clean. */
+export function validateSceneData(
+  data: unknown,
+  schema?: SceneSchema,
+  getPrefab?: PrefabResolver,
+  assetExists?: AssetRefResolver,
+): ValidationResult {
   const warnings: string[] = [];
   const schemaApplied = !!schema;
 
@@ -248,27 +360,12 @@ export function validateSceneData(data: unknown, schema?: SceneSchema, getPrefab
         }
       }
 
-      // Asset-reference rule: ref fields must be a GUID or external URL.
-      const refFields = REF_FIELDS_BY_TRAIT[traitName];
-      if (refFields) {
-        for (const field of refFields) {
-          const v = fields[field];
-          if (typeof v !== 'string' || v === '') continue;
-          if (traitName === 'Renderable2D' && field === 'sprite' && PRIMITIVE_SPRITES.has(v)) continue;
-          if (isGuid(v) || isExternalUrl(v)) continue;
-          // Every field in this registry holds a manifest-asset GUID — `Text2D.font` /
-          // `Text3D.font` / `UIElement.fontFamily` included — so a font PATH is a
-          // literal-path violation here like any other (QA-INSP-0004, #231).
-          if (isInternalAssetPath(v)) {
-            warnings.push(
-              `${label}.${traitName}.${field}: internal asset path '${v}' — references must be a GUID (use the asset's id / .meta.json sidecar)`,
-            );
-          } else {
-            warnings.push(`${label}.${traitName}.${field}: '${v}' is not a GUID or URL`);
-          }
-        }
-      }
+      // Asset-reference rule — delegated to `refFieldWarnings` so the identical rule serves
+      // the prefab-instance OVERRIDE groups in the structural pass below (#292). It is a
+      // per-TRAIT-BAG predicate, so it is invoked once per entity outside this loop.
     }
+
+    warnings.push(...refFieldWarnings(entity.traits, label, assetExists));
   });
 
   // ── Structural / referential-integrity pass (schema-independent) — catches the
@@ -368,6 +465,14 @@ export function validateSceneData(data: unknown, schema?: SceneSchema, getPrefab
         for (const [localIdKey, traitOverridesRaw] of Object.entries(overrides as Record<string, unknown>)) {
           if (!traitOverridesRaw || typeof traitOverridesRaw !== 'object') continue;
           const traitOverrides = traitOverridesRaw as Record<string, unknown>;
+
+          // #292 — an override group has the same `{trait: {field: value}}` shape as
+          // `traits`, and 56 ref fields across `games/` + `demos/` are authored in one, so
+          // the ref rule belongs here too. Runs BEFORE the UIElement early-continue below:
+          // most override groups touch no UIElement at all, and the ref check must not be
+          // hostage to a size check it has nothing to do with.
+          warnings.push(...refFieldWarnings(traitOverrides, `${label}.overrides[${localIdKey}]`, assetExists));
+
           const ovUel = traitOverrides.UIElement;
           const ovUelObj = ovUel && typeof ovUel === 'object' ? (ovUel as Record<string, unknown>) : undefined;
           if (!ovUelObj) continue; // this group doesn't touch UIElement at all

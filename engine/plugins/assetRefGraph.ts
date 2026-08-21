@@ -218,7 +218,7 @@ export function buildRefGraph(enumeration: RefEdgeEnumeration): RefGraph {
     reachable: computeReachable(enumeration.seeds, nodes, outbound),
     guidIndex: enumeration.guidIndex,
     entityByGuid,
-    files: new Set(enumeration.allFiles.map(f => f.virtual.normalize('NFC'))),
+    files: new Set(enumeration.allFiles.map(f => f.normalize('NFC'))),
     dangling,
     warnings: enumeration.warnings,
   };
@@ -420,27 +420,22 @@ export function findReferences(graph: RefGraph, target: RefNode, opts: FindRefer
   };
 }
 
-/** Every asset node nothing references — the "unreferenced assets" query, which
- *  falls out of the reverse index as "inbound is empty".
+/* REMOVED: `findUnreferenced` — "every asset nothing references".
  *
- *  ⚠️ This is NOT the same question as `/api/unused-assets`, and the difference is
- *  load-bearing. That route asks "would a production build DROP this?", which is
- *  about reachability from a root; this one asks "does anything point at it?". A
- *  root scene is referenced by nothing and is emphatically not unused, so seeds are
- *  excluded here. Reaching for this one when you meant the other reports every
- *  scene in the project as garbage. */
-export function findUnreferenced(graph: RefGraph, enumeration: RefEdgeEnumeration): RefNode[] {
-  const seedIds = new Set(enumeration.seeds.map(s => `asset:${s}`));
-  const out: RefNode[] = [];
-  // Over EVERY file on disk, not over the graph's nodes. A file with no refs in and
-  // none out never appears in an edge, so it is not a node — and it is exactly the
-  // file this query exists to find. Iterating nodes would answer "nothing is
-  // unreferenced" for a project full of orphans.
-  for (const { virtual } of enumeration.allFiles) {
-    const id = `asset:${virtual}`;
-    if (seedIds.has(id)) continue;
-    if ((graph.inbound.get(id) ?? []).length > 0) continue;
-    out.push(graph.nodes.get(id) ?? { kind: 'asset', id, path: virtual, name: virtual.split('/').pop() || virtual });
-  }
-  return out.sort((a, b) => a.path.localeCompare(b.path));
-}
+ * It was built, shipped, then measured and deleted in the same close-out. On every
+ * committed project its result is a strict SUBSET of the tree-shaker's orphan list
+ * (court 17/17, 3d-test 29/31, forest-camp 30/60, sling 38/73, particle-demo 19/21),
+ * and nothing ever appeared in it that was not already an orphan. That is structural,
+ * not luck: a file nothing points at cannot be reachable unless it is a seed, and
+ * seeds were excluded.
+ *
+ * Where the two differed it was strictly WORSE — it reported only the entry points of
+ * a dead subtree while `/api/unused-assets` reports the whole subtree (38 vs 73 on
+ * sling). So "can I delete this?" has exactly one owner, the tree-shaker, and a second
+ * weaker answer to it is the cross-tool inconsistency `docs/mcp-tool-conventions.md`
+ * section 2 exists to prevent.
+ *
+ * Do not re-add it here. If the Clean Up dialog ever wants its orphan list GROUPED by
+ * dead-subtree root, that is a presentation pass over `orphanDetails`, not a second
+ * query. `RefGraph.inbound` is public, so the one-liner is always available inline.
+ */

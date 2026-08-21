@@ -342,9 +342,11 @@ Two things about it that are easy to misread:
 - **It reads files on disk, not the live world.** Unsaved scene edits are invisible to it, so wire
   something up, save, then ask. A "0 references" answer on an unsaved edit is the instrument being
   stale, not the truth.
-- **"Nothing references this" is not "the build would drop this."** For the second question the
-  Assets menu's **Clean Up Unused Assets** is the right tool; a root scene is referenced by nothing
-  and is not unused.
+- **It answers about ONE target — it is not a cleanup tool.** For "what can I delete?" use the
+  Assets menu's **Clean Up Unused Assets**, which is strictly more complete: it reports a whole
+  dead subtree where a per-target "nothing references this" only ever sees that subtree's entry
+  point (measured on `games/sling`: 73 orphans against 38). Find References tells you what breaks
+  if you delete THIS; the cleanup dialog tells you what is already dead.
 
 The graph behind it is the asset tree-shaker's own walk, inverted — including the implicit
 texture-to-derived-sprite edge that makes an ad-hoc search for "who uses this texture?" wrong rather

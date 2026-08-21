@@ -570,11 +570,40 @@ earlier. Measured on Court today, over the DEDUPED graph: **108 of its 233 asset
   `.meta.local.json`) are metadata ABOUT an asset; listing them added a phantom row per imported
   binary, the same defect the Clean Up dialog already fixed once (QA-DLG-0006).
 
-**`unreferenced` is NOT `unused`, and conflating them reports every scene as garbage.**
-`/api/unused-assets` asks *would a production build DROP this?* — reachability from a root.
-`/api/find-references?unreferenced=1` asks *does anything point at it?* A root scene is referenced
-by nothing and is emphatically not unused, so seeds are excluded from that query. The two live on
-separate routes for this reason.
+**"What would the build drop?" has exactly ONE owner: `/api/unused-assets`.** Find References
+briefly shipped an `?unreferenced=1` mode — "list every asset nothing points at" — and it was
+measured and deleted in the same close-out. Its result is a strict SUBSET of the tree-shaker's
+orphan list on every committed project (court 17/17, 3d-test 29/31, forest-camp 30/60, sling 38/73,
+particle-demo 19/21), and nothing ever appeared in it that was not already an orphan. That is
+structural rather than lucky: a file nothing points at cannot be reachable unless it is a seed, and
+seeds were excluded. Where the two differed it was strictly WORSE — it reported only the ENTRY
+POINTS of a dead subtree while the orphan list reports the whole subtree (38 against 73 on sling).
+A second, weaker answer to a question that already has one is the cross-tool inconsistency
+[mcp-tool-conventions.md](mcp-tool-conventions.md) § 2 exists to prevent, so it is gone rather than
+kept "for completeness". If the Clean Up dialog ever wants its orphans GROUPED by dead-subtree
+root, that is a presentation pass over `orphanDetails`, not a second query.
+
+**There are TWO reachability implementations, and a test is what keeps them equal.** The shake
+already computes reachability — its keep-set IS that answer, and it is the one production ships by.
+`computeReachable` in `assetRefGraph.ts` re-derives it from the edge list, because
+`enumerateRefEdges` seeds every walkable file (to see orphans' outbound edges), which makes that
+run's keep-set useless as a reachability answer. That is a real reason for the second walk and not
+a reason to trust it: `reachable` is what tells a reader whether a reference survives the build, so
+a drift shows up as a reference quietly mislabelled and nothing else. Measured, they agree exactly
+— **1168/1168 paths on Court**, zero disagreement either way across court / sling / forest-camp /
+3d-test / particle-demo — and `assetRefGraphCourt.test.ts` asserts that equality over three real
+projects. Real projects rather than a fixture on purpose: the shapes that could diverge (a
+keep-listed prefab, font-family resolution, a shader's sibling `.wgsl`, atlas redirection) exist in
+committed content and not in anything hand-built. Dropping the entity-fold from `computeReachable`
+fails `sling` and NOT `court`, because Court's scenes carry `resources[]` manifests that make the
+file a graph node anyway — which is why one project would not have caught it.
+
+**`dangling` is a superset of the shake's `unresolved GUID ref:` warnings, not a competitor.**
+Every warned guid appears in `dangling`; the reverse does not hold, because the generic entity-ref
+sweep deliberately does not warn (an entity guid is never in the asset index, so warning there
+would flood every build log). Measured across court / 3d-test / sling: nothing warned was missing
+from `dangling`. Don't "reconcile" them — one is unstructured build-log text, the other a
+structured per-node projection that also covers entity refs.
 
 **`dangling` is a lead, not a verdict.** A guid that resolves to neither a tracked asset nor an
 entity is reported as "could not resolve" — never as "broken" — because the guid index only covers

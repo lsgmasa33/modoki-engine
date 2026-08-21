@@ -165,7 +165,7 @@ import {
   PROJECT_CONFIG_FILENAME, PRIVATE_BUILD_FIELDS,
   findNullPatchPaths, DEFAULT_PROJECT_CONFIG, DEFAULT_PROJECT_USER_CONFIG, type RawProjectConfig,
 } from '../../project-config';
-import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, type PrefabResolver } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
+import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, type PrefabResolver, type AssetRefResolver, type AssetRefVerdict } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
@@ -193,7 +193,7 @@ import { resolveModules } from '../detect-modules';
 // Type-only — erased at runtime, so it does NOT pull the tree-shaker (and its
 // vite-asset-scanner import) into this host-agnostic router.
 import type { TreeShakeResult, RefEdgeEnumeration } from '../asset-tree-shaker';
-import { buildRefGraph, resolveTarget, findReferences, findUnreferenced, type FindReferencesResponse } from '../assetRefGraph';
+import { buildRefGraph, resolveTarget, findReferences, type FindReferencesResponse } from '../assetRefGraph';
 
 /** Minimal shape of a manifest entry the router needs (structurally compatible
  *  with the scanner's AssetEntry — avoids an import cycle with the host). */
@@ -458,6 +458,51 @@ function makePrefabResolver(ctx: BackendContext): PrefabResolver {
     }
     cache.set(sourceRef, result);
     return result;
+  };
+}
+
+/** Build an `AssetRefResolver` (#292) over the host's cached manifest, for injecting
+ *  into `validateSceneData` so a GUID naming a DELETED asset is reported instead of
+ *  validating clean. `validateSceneData` itself does no I/O (module docs) — this is the
+ *  Node-only glue that supplies it.
+ *
+ *  Returns `null` when the manifest is empty or unreadable, and the caller then passes
+ *  NO resolver — which is the difference between "this ref is dead" and "I could not
+ *  check". A resolver built over an empty manifest would answer `false` for every ref
+ *  in the scene and report a perfectly healthy file as entirely dangling.
+ *
+ *  The index is built ONCE per request and closed over, not rebuilt per ref: a scene
+ *  with 400 refs would otherwise re-scan the whole asset array 400 times. Sliced-sprite
+ *  and auto-emitted whole-image-sprite guids are `type:'sprite'` sub-entries in
+ *  `manifest.assets` with guids of their own, so sweeping `assets[]` covers them —
+ *  a `Renderable2D.sprite` / `UIElement.imageSrc` guid resolves here like any other.
+ *
+ *  ⚠️ **Matched case-SENSITIVELY, unlike `makePrefabResolver` above.** That is not an
+ *  inconsistency to tidy up: this resolver's answer is a prediction about `resolveRef`,
+ *  which is a plain `guidToEntry.get(ref)` over guids stored verbatim — so lowercasing
+ *  both sides here would vouch for a ref that resolves to `undefined` at load. The
+ *  second, lowercased index exists only to tell that case apart from a genuinely absent
+ *  asset, because the two have different fixes. See `AssetRefVerdict`. */
+function makeAssetResolver(ctx: BackendContext): AssetRefResolver | null {
+  let assets: ManifestEntry[];
+  try {
+    assets = ctx.getManifest().assets;
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(assets) || assets.length === 0) return null;
+  const exact = new Set<string>();
+  const foldedCase = new Set<string>();
+  for (const a of assets) {
+    if (a && typeof a.guid === 'string' && a.guid) {
+      exact.add(a.guid);
+      foldedCase.add(a.guid.toLowerCase());
+    }
+  }
+  if (exact.size === 0) return null;
+  return (ref: string): AssetRefVerdict => {
+    if (exact.has(ref)) return 'ok';
+    return foldedCase.has(ref.toLowerCase()) ? 'case-mismatch' : 'missing';
   };
 }
 
@@ -1435,7 +1480,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       if (!absPath || !fs.existsSync(absPath)) return json({ error: `scene not found: ${scenePath}` }, 404);
       const data = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
       const schema = ctx.getSchema();
-      const result = validateSceneData(data, schema, makePrefabResolver(ctx));
+      const result = validateSceneData(data, schema, makePrefabResolver(ctx), makeAssetResolver(ctx) ?? undefined);
       return json({ path: scenePath, schemaApplied: result.schemaApplied, schemaAvailable: !!schema, warnings: result.warnings });
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : String(e) }, 500);
@@ -1657,7 +1702,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // Surface BOTH the op-level warnings (dangling refs / orphaned parents from F5)
       // and the post-apply schema validation warnings.
       const schema = ctx.getSchema();
-      const { warnings: schemaWarnings } = validateSceneData(scene, schema, makePrefabResolver(ctx));
+      const { warnings: schemaWarnings } = validateSceneData(scene, schema, makePrefabResolver(ctx), makeAssetResolver(ctx) ?? undefined);
       const warnings = [...opWarnings, ...schemaWarnings, ...preflightWarnings];
       // The probe never answered, so NEITHER guard above could run. Say so: the write proceeds
       // (a genuinely headless edit is the normal case and must keep working), but the caller must
@@ -1801,30 +1846,24 @@ async function describeUnresolvedAgainstLiveWorld(
   // MCP tool — one implementation, three consumers, because two reverse walks over the
   // same data would drift and a wrong "0 references" is indistinguishable from a right one.
   //
-  // `?unreferenced=1` lists every asset nothing points at. NOT the same question as
-  // /api/unused-assets, which asks what a production build would DROP: a root scene is
-  // referenced by nothing and is not unused. Kept on this route because it is the same
-  // index inverted, and named differently because it is a different answer.
+  // There is deliberately NO "list everything nothing references" mode here. It was
+  // built, then measured and removed: `unreferenced` is a strict SUBSET of the
+  // tree-shaker's orphan list on every committed project (court 17/17, 3d-test 29/31,
+  // forest-camp 30/60, sling 38/73, particle-demo 19/21 — and nothing appeared in the
+  // unreferenced set that was not already an orphan, which is structural: a file
+  // nothing points at cannot be reachable unless it is a seed). It reported only the
+  // ENTRY POINTS of a dead subtree where /api/unused-assets reports the whole subtree.
+  // A second, weaker answer to a question that already has one is the cross-tool
+  // inconsistency docs/mcp-tool-conventions.md section 2 exists to prevent.
+  // "What would the build drop?" belongs to /api/unused-assets, alone.
   if (urlPath === '/api/find-references' && method === 'GET') {
     try {
       const enumeration = ctx.computeRefEdges();
       const graph = buildRefGraph(enumeration);
 
-      if (query.get('unreferenced') === '1') {
-        const all = findUnreferenced(graph, enumeration);
-        const limit = clampInt(query.get('limit'), 200, 1, 5000);
-        return json({
-          unreferenced: all.slice(0, limit).map(n => ({ path: n.path, name: n.name })),
-          returnedCount: Math.min(all.length, limit),
-          totalCount: all.length,
-          truncated: all.length > limit,
-          warnings: graph.warnings,
-        });
-      }
-
       const target = (query.get('target') || '').trim();
       if (!target) {
-        return json({ error: 'find-references needs a `target`: an asset GUID, an entity GUID, or a virtual asset path (/assets/…). Pass `unreferenced=1` instead to list assets nothing references.' }, 400);
+        return json({ error: 'find-references needs a `target`: an asset GUID, an entity GUID, or a virtual asset path (/assets/…). To list assets a production build would drop, use /api/unused-assets.' }, 400);
       }
       const node = resolveTarget(graph, target);
       if (!node) {

@@ -293,7 +293,7 @@ export function exemptFragments(spans: string[], verifiedWhole: string[]): Set<s
  * vaguer to satisfy a tool.
  */
 export function stripLineRef(path: string): string {
-  return path.replace(/(?::\d+(?:-\d+)?|#L\d+(?:-L?\d+)?)$/, '');
+  return path.replace(/(?::\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*|#L\d+(?:-L?\d+)?)$/, '');
 }
 
 function git(args: string[]): string {
@@ -434,6 +434,17 @@ describe('qa case guard helpers', () => {
         'engine/app/editor/agentEditorOps.ts',
       );
       expect(stripLineRef('docs/editor.md#L12')).toBe('docs/editor.md');
+    });
+
+    it('strips a comma-separated line list, the shape that cites several call sites at once', () => {
+      // Real citation this was added for: qa/knowledge.md names the four tools wiring SAVE_PARAM as
+      // `engine/tools/modoki-mcp/src/tools/editor.ts:288,310,323,338`. Rejecting it would push the
+      // author to drop the line numbers — making the doc vaguer to satisfy the tool, the trade
+      // stripLineRef's own comment already refuses to make.
+      expect(stripLineRef('engine/tools/modoki-mcp/src/tools/editor.ts:288,310,323,338')).toBe(
+        'engine/tools/modoki-mcp/src/tools/editor.ts',
+      );
+      expect(stripLineRef('foo.ts:10,20-30')).toBe('foo.ts');
     });
 
     it('leaves a path with no line reference alone', () => {
@@ -727,7 +738,11 @@ describeCases('QA case references', () => {
         const path = stripLineRef(token.replace(/[.,;:)\]]+$/, '').trim());
         if (!REPO_TOP_LEVEL.test(path)) continue;
         // Placeholders (`games/<id>/…`), globs and shell expansions are not literal paths.
-        if (/[<>{}*$\s]/.test(path)) continue;
+        // `…` is in the class for the same reason `<>` is: an ELIDED path is not a claim about a
+        // file, it is a claim about a family of them. Added 2026-08-21 alongside the qa-docs check
+        // below, so both checkers accept the same citation shapes — this comment's neighbour claims
+        // they cannot drift in precision, and that is only true if additions land in BOTH.
+        if (/[<>{}*$…\s]/.test(path)) continue;
         if (existsSync(join(REPO_ROOT, path))) continue;
         if (isIgnoredBuildOutput(path)) continue;
         // A path the case CREATES is expected to be absent — that is the point of `creates:`.
@@ -736,6 +751,62 @@ describeCases('QA case references', () => {
       }
     }
     expect(missing).toEqual([]);
+  });
+
+  /**
+   * The same check over the SUITE'S OWN DOCS — `qa/knowledge.md` and `qa/README.md`.
+   *
+   * ⚠️ **These were unguarded until 2026-08-21, and the gap was demonstrated rather than theorised.**
+   * `qa/findings-2026-08-13.md` was deleted after its triage while `qa/knowledge.md` still cited it
+   * by path in the "where things live" table. Nothing failed: `CASES_DIR` is `qa/cases`, and the
+   * loader skips `README.md`, so neither doc was ever read by this guard. The dangling citation was
+   * caught by hand, which is exactly the thing this file exists so nobody has to do.
+   *
+   * They deserve the check at least as much as a case does. `knowledge.md` is ~1000 lines of dense
+   * `file:line` citations whose entire purpose is that a runner TRUSTS them mid-run — a stale path
+   * there misleads every future run, whereas a stale path in one case misleads one. And unlike a
+   * case, no `covers:` staleness signal will ever flag it: the Testboard does not track these docs,
+   * so a rename under their feet is silent forever.
+   *
+   * ⚠️ **`qa/README.md` is deliberately NOT checked**, and that is not an oversight to fix later.
+   * It is the format SPEC, so it documents `creates:` by example — `games/qa-scaffold-temp`, a
+   * probe `.anim.json` — and those paths must NOT exist (the residue test below fails if they do).
+   * Checking it would demand the exact opposite of that guard.
+   *
+   * No `creates:` equivalent here — a doc never scaffolds a path — so a cited path must simply
+   * exist. Everything else (space-bearing spans, line refs, placeholders, gitignored build output)
+   * reuses the case checker's extractor, so the two cannot drift apart in precision.
+   */
+  it('every repo path cited in qa/knowledge.md exists', () => {
+    const missing: string[] = [];
+    // Anti-vacuity, same reasoning as 'finds cases to check' above: this guard reads ONE file by
+    // name, so a rename would turn it into a test that inspects nothing and passes forever. Counting
+    // the paths it actually checked makes that failure loud instead of invisible.
+    let checked = 0;
+    for (const rel of ['qa/knowledge.md']) {
+      const abs = join(REPO_ROOT, rel);
+      if (!existsSync(abs)) continue;
+      const body = readFileSync(abs, 'utf8');
+      const spans = codeSpans(body);
+      const verifiedWhole = spans.filter(
+        (sp) => REPO_TOP_LEVEL.test(sp) && existsSync(join(REPO_ROOT, sp)),
+      );
+      const fragments = exemptFragments(spans, verifiedWhole);
+      for (const token of codeTokens(body)) {
+        if (fragments.has(token)) continue;
+        const path = stripLineRef(token.replace(/[.,;:)\]]+$/, '').trim());
+        if (!REPO_TOP_LEVEL.test(path)) continue;
+        if (/[<>{}*$…\s]/.test(path)) continue;
+        checked += 1;
+        if (existsSync(join(REPO_ROOT, path))) continue;
+        if (isIgnoredBuildOutput(path)) continue;
+        missing.push(`${rel}: "${path}"`);
+      }
+    }
+    expect(missing).toEqual([]);
+    // The doc cites well over a hundred repo paths; 20 is a floor that cannot be met by accident
+    // but will not fight ordinary editing.
+    if (HAS_CASES) expect(checked).toBeGreaterThan(20);
   });
 
   /**

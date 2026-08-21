@@ -41,11 +41,16 @@ All of them wrap the **same `HTMLVideoElement`** — one decoder, one audio path
 state. Two viewports showing the same clip get two GPU textures over that one decoder, which is
 what the per-surface binding tables exist to make possible.
 
-⚠️ **The live `<video>` element is never attached to the DOM.** `videoService.ts`'s `playVideo`
-does `document.createElement('video')` and nothing ever `appendChild`s it, so
-`document.querySelector('video')` finds NOTHING however healthy playback is — a texture surface only
-ever copies frames off a detached element. The one reach-in is `videoElementFor(entityId)`
-(`runtime/video/videoSystem.ts`). (The DOM-mounted case below is the exception that IS in the tree.)
+⚠️ **On the TEXTURE surfaces the live `<video>` element is never attached to the DOM.**
+`videoService.ts:135`'s `playVideo` does `document.createElement('video')`, and for a 3D screen or a
+2D sprite nothing ever `appendChild`s it — those surfaces only COPY frames off a detached element.
+So `document.querySelector('video')` finds nothing for them however healthy playback is, and the one
+reach-in is `videoElementFor(entityId)` (`runtime/video/videoSystem.ts`).
+
+**The two DOM surfaces are the exception, and they adopt that same element rather than making
+their own**: `UIVideoMount.tsx:96` and `VideoOverlay.tsx:95` both `host.appendChild(el)`. So while a
+UI-mounted or fullscreen-overlay player is active, `querySelector('video')` DOES find it. Decide
+which surface you are debugging before concluding the element is missing.
 
 ⚠️ **The DOM surfaces are the exception: they cannot be duplicated.** A texture surface COPIES
 frames off the element, so any number of viewports can show the clip; a DOM `<video>` IS the

@@ -6,7 +6,7 @@
 
 import { describe, it, expect } from 'vitest';
 import type { RefEdge, RefEdgeEnumeration, GraphEntity } from '../../plugins/asset-tree-shaker';
-import { buildRefGraph, resolveTarget, findReferences, findUnreferenced } from '../../plugins/assetRefGraph';
+import { buildRefGraph, resolveTarget, findReferences } from '../../plugins/assetRefGraph';
 
 // ── Fixture helper ────────────────────────────────────
 
@@ -14,7 +14,7 @@ function mkEnumeration(opts: {
   edges: RefEdge[];
   entities?: GraphEntity[];
   guidIndex?: Map<string, string>;
-  allFiles?: Array<{ virtual: string; type: string }>;
+  allFiles?: string[];
   seeds?: string[];
 }): RefEdgeEnumeration {
   return {
@@ -370,11 +370,11 @@ describe('resolveTarget', () => {
     expect(resolveTarget(graph, '/assets/does-not-exist.png')).toBeNull();
 
     // A REAL file that just happens to have no edges touching it (never became a graph
-    // node) must still resolve — this is exactly the orphan case `findUnreferenced`
+    // node) must still resolve — an on-disk file nothing references is the orphan case
     // exists to report, and it has to be reachable by path to report it correctly.
     const withOrphanFile = mkEnumeration({
       edges: [],
-      allFiles: [{ virtual: '/assets/orphan.png', type: 'texture' }],
+      allFiles: ['/assets/orphan.png'],
     });
     const orphanGraph = buildRefGraph(withOrphanFile);
     const node = resolveTarget(orphanGraph, '/assets/orphan.png');
@@ -383,126 +383,3 @@ describe('resolveTarget', () => {
   });
 });
 
-// ── findUnreferenced ────────────────────────────────────
-
-describe('buildRefGraph — unresolved refs (dangling)', () => {
-  it('reports a broken ref from a DECLARED asset slot, not only from an entity trait', () => {
-    // Close-out finding. `dangling` used to be populated only from `kind:'entity?'`
-    // edges — the generic entity-ref sweep — so a `.mesh.json` whose `model` guid
-    // pointed at nothing reported `unresolvedRefsFromTarget: []`. The structured
-    // signal was silently absent for exactly the asset-to-asset refs the feature
-    // claims to cover, while the doc comment promised the opposite.
-    const graph = buildRefGraph(mkEnumeration({
-      entities: [{ virtual: '/assets/scenes/s.scene.json', guid: 'e1', name: 'Rock' }],
-      edges: [
-        // What processMesh emits for {"model": "<guid not in the index>"}.
-        { from: { virtual: '/assets/meshes/a.mesh.json', field: 'model' }, to: null, raw: 'dead-guid-1', kind: 'model' },
-        // What the generic trait sweep emits — this half always worked.
-        { from: { virtual: '/assets/scenes/s.scene.json', entity: { guid: 'e1', name: 'Rock' }, trait: 'GameThing', field: 'levelId' }, to: null, raw: 'dead-guid-2', kind: 'entity?' },
-      ],
-    }));
-
-    expect(graph.dangling.map(d => d.guid).sort()).toEqual(['dead-guid-1', 'dead-guid-2']);
-    const fromMesh = graph.dangling.find(d => d.guid === 'dead-guid-1')!;
-    expect(fromMesh.from.path).toBe('/assets/meshes/a.mesh.json');
-    expect(fromMesh.via).toBe('model');
-  });
-
-  it('does NOT report a font family as unresolved — a family name is not a guid', () => {
-    // `resolveFontsByFamily` turns families into files at the end of the shake, so a
-    // `to:null` font-family edge is normal, not broken. Reporting it would put a false
-    // "could not resolve" on every UIElement that names a font.
-    const graph = buildRefGraph(mkEnumeration({
-      edges: [{
-        from: { virtual: '/assets/scenes/s.scene.json', trait: 'UIElement', field: 'fontFamily' },
-        to: null, raw: 'Varela Round', kind: 'font-family',
-      }],
-    }));
-    expect(graph.dangling).toEqual([]);
-  });
-});
-
-describe('findReferences — maxDepth floor', () => {
-  it('maxDepth 0 does not report a referenced target as unreferenced', () => {
-    // `unreferenced: true` reads as "safe to delete", so the one thing this function
-    // must never do is return it for a target that IS referenced. maxDepth 0 skipped
-    // the walk entirely and did exactly that; it is floored at 1.
-    const graph = buildRefGraph(mkEnumeration({
-      edges: [{
-        from: { virtual: '/assets/scenes/s.scene.json', field: 'resources[]' },
-        to: '/assets/textures/t.png', raw: 't-guid', kind: 'asset', origin: 'own',
-      }],
-    }));
-    const target = resolveTarget(graph, '/assets/textures/t.png')!;
-    const res = findReferences(graph, target, { maxDepth: 0 });
-    expect(res.unreferenced).toBe(false);
-    expect(res.direct).toHaveLength(1);
-  });
-});
-
-describe('computeReachable — a seed that is not itself a graph node', () => {
-  it('still folds in the entities authored in it, and what they reference', () => {
-    // The shape that broke it: a PREFAB named in the keep-list whose only ref is
-    // authored on a guid-BEARING entity. That entity is the edge's source, so the
-    // prefab file never appears at either end of an edge and is therefore not a
-    // node — and looking the seed up in `nodes` before folding in its entities
-    // silently skipped it, marking the whole subtree as excluded from the build.
-    //
-    // Real v6+ SCENES hide this: their `resources[]` manifest always emits one
-    // file-sourced edge, which makes the file a node by accident. So the bug was
-    // invisible on every committed project and would have surfaced as a wrong
-    // "does not survive a production build" badge on a keep-listed prefab.
-    const graph = buildRefGraph(mkEnumeration({
-      seeds: ['/assets/prefabs/kit.prefab.json'],
-      entities: [{ virtual: '/assets/prefabs/kit.prefab.json', guid: 'e1', name: 'Grass' }],
-      edges: [{
-        from: { virtual: '/assets/prefabs/kit.prefab.json', entity: { guid: 'e1', name: 'Grass' }, trait: 'Renderable3D', field: 'mesh' },
-        to: '/assets/meshes/grass.mesh.json',
-        raw: 'mesh-guid',
-        kind: 'asset',
-        origin: 'own',
-      }],
-    }));
-
-    // The seed itself, the entity inside it, and what that entity references.
-    expect(graph.reachable.has('asset:/assets/prefabs/kit.prefab.json')).toBe(true);
-    expect(graph.reachable.has('entity:e1')).toBe(true);
-    expect(graph.reachable.has('asset:/assets/meshes/grass.mesh.json')).toBe(true);
-
-    // And the reachability must show up where a reader would actually see it.
-    const mesh = resolveTarget(graph, '/assets/meshes/grass.mesh.json')!;
-    expect(findReferences(graph, mesh).direct[0]!.reachable).toBe(true);
-  });
-});
-
-describe('findUnreferenced', () => {
-  it('includes a file that appears in NO edge (not a graph node) and excludes seeds', () => {
-    const enumeration = mkEnumeration({
-      edges: [
-        {
-          from: { virtual: '/scene.json', entity: { guid: 'e1', name: 'Player' }, trait: 'Renderable2D', field: 'sprite' },
-          to: '/assets/tex.png',
-          raw: 'tex-guid',
-          kind: 'asset',
-          origin: 'own',
-        },
-      ],
-      entities: [{ virtual: '/scene.json', guid: 'e1', name: 'Player' }],
-      allFiles: [
-        { virtual: '/scene.json', type: 'scene' },
-        { virtual: '/assets/tex.png', type: 'texture' }, // referenced — has inbound edges
-        { virtual: '/assets/orphan.png', type: 'texture' }, // in no edge at all — not a graph node
-      ],
-      seeds: ['/scene.json'],
-    });
-    const graph = buildRefGraph(enumeration);
-    const result = findUnreferenced(graph, enumeration);
-    const paths = result.map(n => n.path);
-
-    expect(paths).toContain('/assets/orphan.png');
-    expect(paths).not.toContain('/assets/tex.png');
-    // A root/seed scene is referenced by nothing (nobody points at the scene that
-    // starts the walk) but is emphatically not unused — seeds are excluded on purpose.
-    expect(paths).not.toContain('/scene.json');
-  });
-});

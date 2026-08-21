@@ -208,8 +208,10 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_validate_scene',
     'Validate a scene file against the live trait schema (warn-but-load): unknown ' +
-      'trait/field, type mismatch, and literal-asset-path-instead-of-GUID mistakes. ' +
-      'schemaAvailable:false means no editor renderer is connected (ref checks still run).',
+      'trait/field, type mismatch, literal-asset-path-instead-of-GUID mistakes, and ' +
+      'asset refs whose GUID names nothing in the manifest (a deleted asset — the ref ' +
+      'will not resolve at load). schemaAvailable:false means no editor renderer is ' +
+      'connected (ref checks still run).',
     { path: z.string().describe('Asset-root URL of the scene file.') },
     async ({ path }) => getJson(`/api/validate-scene?path=${encodeURIComponent(path)}`),
   );

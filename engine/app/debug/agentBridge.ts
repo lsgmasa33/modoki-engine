@@ -68,6 +68,7 @@ import {
   ANIMATOR_CLIP_TRAITS,
   type OffscreenRenderOpts,
   type SceneData,
+  type AssetRefVerdict,
   invalidateAnimationClip,
   invalidateTimeline,
   invalidateParticleEffect,
@@ -75,6 +76,8 @@ import {
   invalidateRig2D,
   findEntityByGuid,
   getCachedPrefab,
+  getAssetEntry,
+  getAllAssets,
   getParticleEffect,
   getAnimationClip,
   getTimeline,
@@ -1505,7 +1508,26 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
           // Best-effort resolver over the runtime's already-loaded prefab cache (#35) — no
           // fetch: an unloaded prefab (not yet acquired by any scene) resolves to undefined,
           // which is the documented conservative "stay silent" behaviour, not a bug.
-          const { warnings } = validateSceneData(preloaded, buildSceneSchema(), getCachedPrefab);
+          // #292 — the manifest is loaded by the time a scene hot-reloads, so this consumer
+          // can answer "does that GUID name a real asset?" too, and a ref to a deleted asset
+          // is worth a warning HERE (right before the load that will silently drop it) more
+          // than anywhere else. Guarded exactly like the backend's `makeAssetResolver`: an
+          // EMPTY manifest means "cannot check", never "every asset is gone" — passing a
+          // resolver then would report a healthy scene as entirely dangling.
+          const allAssets = getAllAssets();
+          // Case-SENSITIVE `ok`, exactly like `resolveRef` — `getAssetEntry` is the same
+          // verbatim `guidToEntry` lookup, so this predicts loading rather than merely
+          // approximating it. The folded-case set only separates a casing slip from a
+          // genuinely deleted asset; see `AssetRefVerdict`.
+          const foldedCase = new Set(allAssets.map((a) => a.guid.toLowerCase()));
+          const assetExists = allAssets.length > 0
+            ? (ref: string): AssetRefVerdict => (
+                getAssetEntry(ref) !== undefined
+                  ? 'ok'
+                  : foldedCase.has(ref.toLowerCase()) ? 'case-mismatch' : 'missing'
+              )
+            : undefined;
+          const { warnings } = validateSceneData(preloaded, buildSceneSchema(), getCachedPrefab, assetExists);
           if (warnings.length) {
             console.warn(`[agentBridge] ${warnings.length} validation warning(s) in ${current}:`);
             for (const w of warnings) console.warn(`  • ${w}`);
