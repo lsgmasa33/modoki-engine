@@ -436,11 +436,50 @@ async function dispatchTapAt(x: number, y: number): Promise<string> {
   return `ok (canvas:${how}) css(${Math.round(x)},${Math.round(y)})`;
 }
 
+/** Release a sustained press before dispatching a NEW gesture, and say so in the reply (#305).
+ *
+ *  Two presses cannot coexist, and the failure is silent in both directions. `pointerSource`
+ *  latches `activeId` on the held down and early-returns for every later `pointerdown` — and
+ *  #299's trusted-takeover cannot save this one, because a synthetic tap is not `isTrusted`
+ *  either. So the tap's press reaches nothing while the call still answers `ok`: a false success,
+ *  the outcome `mcp-tool-conventions.md` §0 ranks worst on this surface. Its `pointerup` then
+ *  matches the held `pointerId` and ends the gesture anyway, leaving `heldPointer` and
+ *  `pointerSource` disagreeing about whether anything is down.
+ *
+ *  Called AFTER the aim resolves and BEFORE the dispatch: a call that is refused dispatches
+ *  nothing, so it must steal nothing. Mirrors the editor's `MOUSE_GESTURE_ROUTES`, and stops at
+ *  the same place — `device_hover`/`device_scroll`/`device_press_key` are all legitimate
+ *  mid-gesture and leave the hold alone. */
+function supersedeHeldPress(by: string): string {
+  const dropped = dropHeldPress('superseded');
+  if (!dropped) return '';
+  _log(`[debug-bridge] ${by} released a press left held: ${dropped}`);
+  return ` — released a pointer left held (${dropped}); a new gesture cannot coexist with it`;
+}
+
+/** Drop a held press on behalf of a gesture dispatched from the HOST, not from here (#305).
+ *
+ *  The trusted route (CDP on Android, WebDriverAgent on iOS) resolves its aim in-page and then
+ *  injects the touch host-side, so `handleTap`/`handleDrag` — and the supersede they do for
+ *  themselves — are never reached. Measured on an S22: after a trusted `device_tap`, the bridge
+ *  still reported `held:true` while `pointerSource` had already handed the gesture to the tap via
+ *  #299's takeover. The two then disagree about whether anything is down, so a later `up` sends a
+ *  stray `pointerup`, and a later `down` is refused as "already held" when nothing is.
+ *
+ *  Note the asymmetry with the synthetic path, and that it is not a smaller version of the same
+ *  bug: a TRUSTED tap is not swallowed — the takeover admits it — so nothing is lost here. What is
+ *  wrong is only the bookkeeping, which is why this is a plain release with no reply suffix of its
+ *  own; the host decides what to tell the agent. */
+function handleReleaseHeldPointer(): { released: string | null } {
+  return { released: dropHeldPress('superseded') };
+}
+
 export async function handleTap(params: Record<string, unknown>): Promise<string> {
   const aim = await resolveAim(params, 'selector', 'x', 'y');
   if ('error' in aim) { _log(`[debug-bridge] TAP → ${aim.error}`); return aim.error; }
   _log(`[debug-bridge] TAP @ ${aim.label}`);
-  return withMechanismSuffix(`${await dispatchTapAt(aim.x, aim.y)} @ ${aim.label}`);
+  const superseded = supersedeHeldPress('TAP');
+  return withMechanismSuffix(`${await dispatchTapAt(aim.x, aim.y)} @ ${aim.label}${superseded}`);
 }
 
 export async function handleDrag(params: Record<string, unknown>): Promise<string> {
@@ -452,6 +491,10 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   const to = { x: toAim.x, y: toAim.y };
   const steps = (params.steps as number) || 5;
   const delayMs = (params.delayMs as number) || 20;
+  // Both aims resolved, so this call WILL dispatch — see `supersedeHeldPress` for why it must not
+  // dispatch on top of a held press. Before the markers, so the overlay never shows a drag being
+  // set up while the old press is still down.
+  const superseded = supersedeHeldPress('DRAG');
 
   _log(`[debug-bridge] DRAG ${fromAim.label}→${toAim.label} → css(${from.x.toFixed(1)},${from.y.toFixed(1)})→(${to.x.toFixed(1)},${to.y.toFixed(1)})`);
   showMarker(from.x, from.y, 'lime', `from(${Math.round(from.x)},${Math.round(from.y)})`);
@@ -472,7 +515,7 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   const domMode = explicitDom === true || (explicitDom !== false && !!grabEl && grabEl.tagName !== 'CANVAS' && !grabEl.closest('canvas') && !grabEl.querySelector('canvas'));
   if (domMode) {
     if (!grabEl) return `Error: no element to drag at ${typeof params.fromSelector === 'string' ? JSON.stringify(params.fromSelector) : `(${Math.round(from.x)},${Math.round(from.y)})`}`;
-    return withMechanismSuffix(await domDrag(grabEl, from, to, steps, delayMs));
+    return withMechanismSuffix(`${await domDrag(grabEl, from, to, steps, delayMs)}${superseded}`);
   }
 
   // World-space drag: dispatch a real pointer sequence ON the canvas under the GRAB point so it
@@ -495,7 +538,7 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   }
   canvas.dispatchEvent(new PointerEvent('pointerup', ptrInit(to.x, to.y)));
   _log(`[debug-bridge] DRAG → canvas:${how}`);
-  return withMechanismSuffix(`ok (canvas:${how}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})`);
+  return withMechanismSuffix(`ok (canvas:${how}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})${superseded}`);
 }
 
 function handleConsoleLogs(params: Record<string, unknown>): ReturnType<typeof consoleRing.query> {
@@ -686,8 +729,52 @@ let leaseEpoch = 0;
  *  Returns a description of what it released, or null if nothing was held. */
 export function releaseHeldPointer(): string | null {
   leaseEpoch++; // counted even with nothing held — that is the case `handlePointer` must notice
+  return dropHeldPress('lease');
+}
+
+/** Why a held press ended without the agent's own `action:'up'`. Quoted back to the agent, because
+ *  both causes are otherwise invisible: the press simply stops existing. */
+type HeldLossReason = 'lease' | 'superseded';
+
+/** The last press that ended without an `up`, cleared by the next `down`. A `move`/`up` that
+ *  follows one is refused, and the bare "no pointer is held" would be a lie by omission there —
+ *  the agent DID press, and something else ended it. */
+let lastHeldLoss: { reason: HeldLossReason; button: number; x: number; y: number } | null = null;
+
+/** Explain a refusal that is really "your press was ended for you". Empty when the agent simply
+ *  never pressed — the two are different mistakes and must not read alike. */
+function heldLossNote(): string {
+  if (!lastHeldLoss) return '';
+  const { reason, button, x, y } = lastHeldLoss;
+  const why = reason === 'lease'
+    ? 'the debugger lease dropped, and from that moment you could no longer send the up yourself'
+    : 'a later device_tap/device_drag dispatched a new gesture, which cannot coexist with a held '
+      + 'press, so the hold was released first';
+  return ` NOTE: your ${POINTER_BUTTON_NAME[button]} press at ${x.toFixed(1)},${y.toFixed(1)} was `
+    + `released for you — ${why}. Send a fresh down.`;
+}
+
+/** The DISPATCH half of a release, without the `leaseEpoch` bump.
+ *
+ *  The split keeps `leaseEpoch` meaning exactly one thing: "a release happened because the agent
+ *  can no longer send the `up`". `handlePointer` re-checks it after its awaits to catch a `down`
+ *  whose lease died mid-resolve, and self-releases the press it just latched. A SUPERSEDE is not
+ *  that — the lease is alive and the agent is actively driving — so routing it through the
+ *  exported `releaseHeldPointer` (which bumps the counter even with nothing held, deliberately)
+ *  would overload the signal.
+ *
+ *  ⚠️ The concrete consequence is NOT demonstrated, and this comment is deliberately weaker than
+ *  its first draft. A `down` that entered before such a bump and latched after it would read the
+ *  changed epoch and cancel itself — a stranded-gesture shape invented by the fix for the old one.
+ *  The transport makes that reachable in principle: the `message` listener is async with no queue,
+ *  so two requests genuinely interleave. But a single agent drives the lease sequentially, and no
+ *  test here pins it — every attempt raced the wrong way, because `handleTap`'s own 50 ms hold
+ *  lets the `down` latch first. Treat the split as preserving a signal's meaning, which is
+ *  checkable by reading, rather than as a guard against a failure anyone has measured. */
+function dropHeldPress(reason: HeldLossReason): string | null {
   if (!heldPointer) return null;
   const { target, button, x, y, how } = heldPointer;
+  lastHeldLoss = { reason, button, x, y };
   heldPointer = null; // cleared FIRST — a throwing dispatch must not leave the press held anyway
   try {
     target.dispatchEvent(mkButtonedPointerEvent('pointerup', x, y, button));
@@ -740,7 +827,7 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
     return `Error: a pointer is already held (button ${POINTER_BUTTON_NAME[heldPointer.button]} down at ${heldPointer.x.toFixed(1)},${heldPointer.y.toFixed(1)}). Release it with action:'up' before pressing again.`;
   }
   if ((action === 'move' || action === 'up') && !heldPointer) {
-    return `Error: no pointer is held — send action:'down' first (this ${action} would be a stray event).`;
+    return `Error: no pointer is held — send action:'down' first (this ${action} would be a stray event).${heldLossNote()}`;
   }
   // A 'move'/'up' MAY omit the aim, and an 'up' normally does — releasing happens wherever the
   // gesture got to. Fall back to the HELD position, for the same reason the button is reused
@@ -798,6 +885,7 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
     target.dispatchEvent(new MouseEvent(mouseType, { ...mouseInit(aim.x, aim.y), button, buttons: action === 'up' ? 0 : (1 << button) }));
   }
   showMarker(aim.x, aim.y, action === 'down' ? 'orange' : action === 'move' ? 'yellow' : 'purple', `pointer${action}(${Math.round(aim.x)},${Math.round(aim.y)})`);
+  if (action === 'down') lastHeldLoss = null; // a fresh press — the previous gesture's fate is no longer the story
   heldPointer = action === 'up' ? null : { button, x: aim.x, y: aim.y, target, how };
   await new Promise((r) => setTimeout(r, 16)); // let per-frame Input sampling see the edge, same as tap/drag
 
@@ -1019,6 +1107,10 @@ async function handleMessage(req: Request): Promise<unknown> {
     // Resolve-only twin of the dispatch ops below (#32 Phase 1) — used by the backend's
     // trusted-CDP route, which resolves the aim in-page then dispatches host-side.
     case 'resolve-aim': return await handleResolveAim(p);
+    // Release-only twin of the supersede `handleTap`/`handleDrag` do for themselves — for the
+    // TRUSTED route, which resolves the aim in-page and then dispatches host-side over CDP/WDA,
+    // so it never reaches those handlers at all. See `handleReleaseHeldPointer` (#305).
+    case 'release-held-pointer': return handleReleaseHeldPointer();
     case 'tap': return await handleTap(p);
     case 'drag': return await handleDrag(p);
     case 'pointer': return await handlePointer(p);

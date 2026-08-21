@@ -186,6 +186,46 @@ hand-rolled the clear and skipped the velocity reset, and because the pointer-bl
 releases a press left held (`releaseHeldPointer`), because that is the moment the agent provably
 cannot send the `up` itself.
 
+**…and a later `device_tap`/`device_drag` releases it too (#305).** The takeover above protects the
+HUMAN, whose finger is trusted. It does nothing for the AGENT: a synthetic tap is not `isTrusted`
+either, so a `device_tap` dispatched while a `device_pointer` press is held hits the same early
+return, reaches nothing, and still answers `ok` — a false success, the outcome
+`mcp-tool-conventions.md` §0 ranks worst on this surface. Its `pointerup` then matches the held
+`pointerId` and ends the gesture anyway, leaving `heldPointer` and `pointerSource` disagreeing about
+whether anything is down. So `handleTap`/`handleDrag` drop a held press before dispatching, after
+the aim resolves (a refused call dispatches nothing, so it must steal nothing), and say so in the
+reply; the following `move`/`up` refusal names the cause instead of the bare "no pointer is held".
+`device_hover`/`device_scroll`/`device_press_key` deliberately leave the hold alone — all three are
+legitimate mid-gesture. Same rule as the editor's `MOUSE_GESTURE_ROUTES`, stopping in the same place.
+
+⚠️ **There are TWO branches here, and hardware measurement is what separated them.** Which one a
+`device_tap` takes depends on whether a TRUSTED route exists (CDP on Android, WebDriverAgent on
+iOS) — and the original issue described only the first:
+
+| | synthetic tap (no trusted route — the iPhone 8, or CDP unavailable) | trusted tap (Android+CDP, iOS+WDA) |
+|---|---|---|
+| Reaches `handleTap`? | yes | **no** — the aim resolves in-page, the touch injects host-side |
+| Is the tap swallowed? | **yes** — a false success | no — the press is `isTrusted`, so #299's takeover admits it |
+| What is wrong | the gesture is lost | only the BOOKKEEPING: the bridge still says `held:true` |
+
+So the trusted branch is not a milder version of the same bug — nothing is lost there. What breaks
+is that `heldPointer` and `pointerSource` disagree afterwards: measured on an S22, a trusted
+`device_tap` left the bridge reporting `held:true` while the takeover had already handed the gesture
+away, so the next `device_pointer {down}` was refused as "already held" with nothing actually held.
+That branch is fixed at the host, in `deviceCdp.ts`: it asks the bridge to release
+(`release-held-pointer`) after the aim resolves and before it injects. That call is **best-effort by
+construction** — a device running an older build answers "Unknown method", which must never turn a
+working tap into a failure — and its reply is decoded from a **JSON string**, because a bridge
+handler that returns an object arrives that way over the transport. Reading it as an object is the
+trap that once had `device_status` claiming `trusted-cdp` while every tap came back synthetic.
+
+⚠️ **The supersede path must NOT go through the exported `releaseHeldPointer`**, which bumps
+`leaseEpoch`. That counter means one thing — "released because the agent can no longer send the
+`up`" — and `handlePointer` re-checks it after its awaits to self-release a `down` whose lease died
+mid-resolve. A supersede is not that, so it calls the dispatch half (`dropHeldPress`) and leaves the
+counter alone. The consequence of getting it wrong is not measured, only reasoned; see the comment
+on `dropHeldPress` for exactly how far that claim goes.
+
 **The EDITOR has the same defect and closes it somewhere else entirely (#302).** `modoki_pointer
 {action:'down'}` strands a press exactly the way `device_pointer` does, and the symptom is the same:
 the Game panel reads no dragging at all, the human's own mouse included. But **#299's takeover

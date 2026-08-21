@@ -578,6 +578,35 @@ export interface CdpRouteDeps {
  *  it returns the `Error: …` string directly, NOT `null`, since retrying via synthetic would hit
  *  the identical resolution failure. Only a genuine CDP/transport failure (thrown) resets the
  *  session and returns `null`. */
+/** Drop a sustained `device_pointer` press before dispatching a TRUSTED gesture (#305).
+ *
+ *  The synthetic path supersedes a held press inside `handleTap`/`handleDrag`; this route never
+ *  reaches them — it resolves the aim in-page, then injects host-side — so it has to ask. Without
+ *  it the bridge keeps reporting `held:true` after a trusted tap while `pointerSource` has already
+ *  handed the gesture over via #299's takeover: measured on an S22, where the next `device_pointer`
+ *  `down` was then refused as "already held" with nothing actually held.
+ *
+ *  BEST-EFFORT BY CONSTRUCTION. An app built before this op exists answers with an error, and a
+ *  device running an older build is the normal case — a stale bridge must not turn a working tap
+ *  into a failure. So every outcome except a real release is swallowed and the gesture proceeds:
+ *  the bookkeeping is worth fixing, never worth refusing input over. */
+async function releaseHeldBeforeTrustedGesture(deps: CdpRouteDeps): Promise<string> {
+  try {
+    const raw = await deps.proxy('release-held-pointer', {});
+    // ⚠️ DECODE THE WIRE SHAPE. The bridge answers over a TCP/JSON transport, so a handler that
+    // returns an OBJECT arrives here as a JSON **string** — the exact trap `decodeAimReply` exists
+    // for, and the one that once had `device_status` reporting `trusted-cdp` while every tap came
+    // back synthetic. Reading `.released` off the string would silently yield undefined: the
+    // release would still happen on-device, and the reply would just never mention it. That is a
+    // quiet wrong answer, not a loud one.
+    const obj = (typeof raw === 'string' ? JSON.parse(raw) : raw) as { released?: string | null } | null;
+    const released = obj && typeof obj === 'object' ? obj.released : null;
+    return released ? ` — released a pointer left held (${released}); a new gesture cannot coexist with it` : '';
+  } catch {
+    return ''; // op absent (older app build), unparseable, or a transport hiccup — never fail input
+  }
+}
+
 export async function tryDeviceCdpInput(method: string, params: Record<string, unknown>, deps: CdpRouteDeps): Promise<CdpRouteOutcome> {
   // Not an input op at all (eval, screenshot, journal, …). There is no fidelity claim to make and
   // nothing to warn about — `reason: null` tells the caller to stay silent.
@@ -612,8 +641,10 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
         const r = await resolveAimViaDevice(deps, params, 'selector', 'x', 'y');
         if (r.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
         if (r.kind === 'refusal') return { handled: true, reply: r.error };
+        // After the aim resolves (a refused aim dispatches nothing, so it must steal nothing).
+        const supersededTap = await releaseHeldBeforeTrustedGesture(deps);
         await cdpTap(counting, r.aim.x, r.aim.y);
-        return { handled: true, reply: `ok (cdp touch) css(${Math.round(r.aim.x)},${Math.round(r.aim.y)}) @ ${r.aim.label} [input:${TRUSTED_CDP_MECHANISM}]` };
+        return { handled: true, reply: `ok (cdp touch) css(${Math.round(r.aim.x)},${Math.round(r.aim.y)}) @ ${r.aim.label} [input:${TRUSTED_CDP_MECHANISM}]${supersededTap}` };
       }
       case 'drag': {
         const from = await resolveAimViaDevice(deps, params, 'fromSelector', 'fromX', 'fromY');
@@ -624,8 +655,9 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
         if (to.kind === 'refusal') return { handled: true, reply: to.error };
         const steps = (params.steps as number) || 5;
         const delayMs = (params.delayMs as number) || 20;
+        const supersededDrag = await releaseHeldBeforeTrustedGesture(deps);
         await cdpDrag(counting, from.aim, to.aim, steps, delayMs);
-        return { handled: true, reply: `ok (cdp touch) css(${Math.round(from.aim.x)},${Math.round(from.aim.y)})→(${Math.round(to.aim.x)},${Math.round(to.aim.y)}) [input:${TRUSTED_CDP_MECHANISM}]` };
+        return { handled: true, reply: `ok (cdp touch) css(${Math.round(from.aim.x)},${Math.round(from.aim.y)})→(${Math.round(to.aim.x)},${Math.round(to.aim.y)}) [input:${TRUSTED_CDP_MECHANISM}]${supersededDrag}` };
       }
       case 'press-key': {
         const key = params.key as string;
