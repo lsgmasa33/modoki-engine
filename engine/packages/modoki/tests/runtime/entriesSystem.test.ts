@@ -31,6 +31,13 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   indexEntityGuid: () => {},
 }));
 
+const markUIDirtySpy = vi.fn();
+vi.mock('../../src/runtime/core/uiDirty', () => ({
+  markUIDirty: () => markUIDirtySpy(),
+  isUIDirty: () => false,
+  clearUIDirty: () => {},
+}));
+
 vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
   const traits = [
     { name: 'UIScrollView', trait: UIScrollView }, { name: 'UIEntries', trait: UIEntries },
@@ -327,6 +334,27 @@ describe('entriesSystem', () => {
     const en = view.get(UIEntries) as any;
     expect(en.firstY).toBe(0);
     expect(en.poolSize).toBe(settled);     // back to the floor, not stuck at the raised count
+  });
+
+  it('a converted scrollToEntry request DIRTIES the tree, even when the window did not move', async () => {
+    // ⚠️ The px request lands on UIScrollView through a raw `entity.set` — the no-dirty scroll
+    // path. So if the window did not also move, nothing rebuilds the UI tree, `UINode`'s
+    // one-shot scrollTo effect never re-runs, and the request sits on the trait forever.
+    // Found by wiring the first real caller of `ui.scrollTo` in games/scroll-demo: the trait
+    // read `scrollToY: 480000` while `scrollY` stayed 0 and the view never moved.
+    const { sys, src, view } = await setup({ countX: 1, countY: 5000 }, 0);
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);          // settle, so the window is stable at the origin
+    markUIDirtySpy.mockClear();
+
+    // Request entry 4000 WITHOUT moving the scroll: only the request changes.
+    view.set(UIEntries, { ...(view.get(UIEntries) as any), scrollToEntryY: 4000 });
+    sys.entriesSystem(testWorld);
+
+    const sv = view.get(UIScrollView) as any;
+    expect(sv.scrollToY).toBe(4000 * ENTRY_H);     // converted from entries to px
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(-1);   // and cleared
+    expect(markUIDirtySpy).toHaveBeenCalled();     // ...and the renderer gets told
   });
 
   it('does no work when nothing moved — the cheap path a scroll frame takes', async () => {

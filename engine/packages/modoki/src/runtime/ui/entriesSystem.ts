@@ -290,7 +290,12 @@ function driveView(
   // A pending scrollToEntry request, converted here because THIS is where entry size is
   // resolved — the `%`-of-viewport case and the `0` = "read it from the prefab" case both live
   // above. Converting in the API would be a second copy of that resolution.
-  consumeEntryRequest(view, m, en, entryW, entryH);
+  // ⚠️ Returns whether it CONVERTED a request, and that answer must reach `markUIDirty`.
+  // The px request lands on the trait through a raw `entity.set` (the no-dirty scroll path), so
+  // if the window did not also move, nothing rebuilds the UI tree, `UINode`'s one-shot
+  // `scrollTo` effect never re-runs, and the request sits on the trait forever. Found by wiring
+  // the first real caller of `ui.scrollTo`: `scrollToY` read 480000 while `scrollY` stayed 0.
+  const requested = consumeEntryRequest(view, m, en, entryW, entryH);
 
   const st = viewStates.get(viewGuid)
     ?? { seeded: false, lastFirstX: 0, lastFirstY: 0, lastEpoch: -1, lastCountX: -1, lastCountY: -1, travel: 0,
@@ -371,7 +376,7 @@ function driveView(
   // Nothing to re-drive: the window did not move, the data did not change, and the pool is
   // already the right size. This is the cheap path a scroll frame normally takes.
   const poolChanged = pool.grew;
-  if (!moved && !invalidated && !poolChanged) return false;
+  if (!moved && !invalidated && !poolChanged) return requested;
 
   // ⚠️ The child index is built HERE — after `ensurePool`, never before. A pool that just grew
   // has brand-new member entities, and an index captured earlier does not contain them: every
@@ -393,10 +398,10 @@ function driveView(
  *  hand-off happens once, here, rather than either side learning the other's units. */
 function consumeEntryRequest(
   view: EntityLike, m: Metas, en: Record<string, unknown>, entryW: number, entryH: number,
-): void {
+): boolean {
   const reqX = (en.scrollToEntryX as number) ?? -1;
   const reqY = (en.scrollToEntryY as number) ?? -1;
-  if (reqX < 0 && reqY < 0) return;
+  if (reqX < 0 && reqY < 0) return false;
 
   // ⚠️ An axis whose entry size is not known YET must stay pending, not be consumed as 0.
   //
@@ -409,7 +414,7 @@ function consumeEntryRequest(
   const strideY = entryH + ((en.gapY as number) ?? 0);
   const canX = reqX < 0 || strideX > 0;
   const canY = reqY < 0 || strideY > 0;
-  if (!canX || !canY) return;   // retry next frame, once the prefab is cached
+  if (!canX || !canY) return false;   // retry next frame, once the prefab is cached
 
   const sv = view.get(m.svMeta.trait) as Record<string, unknown>;
   const next: Record<string, unknown> = { ...sv };
@@ -419,6 +424,7 @@ function consumeEntryRequest(
   // Clear the entry-space request only now that it HAS been handed to the px surface. Leaving
   // it set would re-issue the same scroll every frame and pin the view in place.
   view.set(m.enMeta.trait, { ...en, scrollToEntryX: -1, scrollToEntryY: -1 });
+  return true;
 }
 
 /** Find (or spawn) the engine-owned content child. The pooled entries are ITS children, and it

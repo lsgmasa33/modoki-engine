@@ -430,6 +430,70 @@ Two formats ship instead, both selectable per-asset (`EnvImportSettings.format` 
 - Persist the Environment Inspector's **exposure** slider — currently preview-local UI state, not
   saved to the asset.
 
+## ⛔ Invalidation must never DESTROY a texture something still binds
+
+`invalidateTexture` used to `dispose()` every matching cache entry **regardless of
+`refCount`** — so an editor re-import destroyed a shared texture while live materials still
+had `mat.map` pointing at it. The next encoded command buffer bound the destroyed instance and
+WebGPU raised **`Destroyed texture used in a submit`** (owner-reported on a `3d-test` island
+re-import). `releaseTexture3D` even documented the bypass as expected behaviour, and a unit
+test asserted the force-dispose as the contract, so nothing flagged it.
+
+**It is a use-after-free, not a timing race.** Deferring the dispose by a frame does not fix it:
+the material keeps the binding until it re-resolves, so a later frame hits the same fault.
+
+**The rule: freshness comes from RE-RESOLVING, never from freeing memory out from under a
+holder.** Invalidation must do three things and no more:
+
+1. Remove the entry from the lookup map, so the next `loadTexture3D` misses and fetches the
+   re-imported bytes.
+2. Announce via `emitAssetInvalidated`, so holders re-resolve.
+3. **Retire** a still-referenced texture — unreachable to new lookups, still reachable to the
+   refcount — and let the LAST `releaseTexture3D` free it. That release arrives through
+   `meshTemplateCache.disposeMaterial` when the material rebuilds, which is what makes the
+   texture and material invalidations order-independent instead of implicitly coupled.
+
+⚠️ **Retirement is keyed by TEXTURE INSTANCE, never by cache key.** A re-load after
+invalidation builds a new entry under the *same* key — the URL is unchanged in dev, since the
+`?v=` cache-bust only moves when the content hash does — so a key-keyed map lets a stale release
+decrement the NEW entry and destroy a texture that is in use, trading one use-after-free for
+another. `releaseTexture3D` also refuses to decrement an entry whose `texture` is not the
+instance being released, for the same reason.
+
+`getSharedTextureStats` and `disposeAllSharedTextures` both account for retired entries: the
+first would otherwise under-report a re-imported scene (the opposite of what a leak check
+wants), and the second would leak exactly the textures an editing session re-imported.
+
+**The announcement needs a MATERIAL-SIDE CONSUMER, or retirement silently trades one bug for
+another.** Retiring means the texture is freed by the last `releaseTexture3D` — which arrives
+through `disposeMaterial` when a material rebuilds. Nothing consumed
+`emitAssetInvalidated('texture', …)` on the material side, so a **standalone** texture re-import
+(the Inspector's Convert/Re-import, and the batch `reimportPaths`) left the material bound to the
+old instance: the viewport kept sampling the pre-reimport bytes *and* the retired texture was
+never freed. A MODEL re-import hid it, because `modelImport` also calls `invalidateMaterial` per
+deduped material — which is why a model-path check cannot catch this. `meshTemplateCache` now
+subscribes to `kind: 'texture'` and invalidates any cached material holding a retired texture.
+
+⚠️ That consumer runs on a **microtask**, deliberately: `invalidateTexture` announces BEFORE it
+evicts (so path-keyed panels see the event), so a synchronous listener would read the
+pre-retirement state and match nothing.
+
+⚠️ **`invalidateEnvironment` still has this defect** (`meshTemplateCache.ts`). It disposes the
+cached HDR unconditionally while its own doc comment says it "KEEPS the scene owners", and
+`scene3DSync` binds that texture as `scene.environment` — so re-importing an HDR that a scene is
+using reproduces the same crash. The env cache uses owner-sets rather than the `loadTexture3D`
+refcount, and the safe dispose point is where `scene.environment` is swapped, so the fix is not
+a copy of the one above. Tracked in **#315** — do not "fix" it by simply deleting the `dispose()`,
+which leaks one HDR per re-import.
+
+**Verifying a fix here needs the right path.** `modoki_reimport_asset` drives the backend bake
+only and never runs the browser-side `importModel` that calls `invalidateTexture` — it cannot
+reproduce this, and a green run through it is not evidence. Drive the Inspector's **Re-import**
+button and confirm `[Import] Extracted N textures` in the console; `modoki_get_editor_state`
+reports a `gpu.uncapturedErrors` counter (absent when zero) that is a cleaner signal than
+scraping the log.
+
+
 ## Gotchas
 
 - **Multiple-of-4 dimensions are mandatory** for block-compressed KTX2

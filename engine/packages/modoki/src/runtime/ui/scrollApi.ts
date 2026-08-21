@@ -7,10 +7,11 @@
  *
  *  ## Motion vocabulary matches the backend
  *
- *  `behavior` is `'instant' | 'smooth'`, both genuinely wired to the browser's own `scrollTo`.
- *  There is deliberately no `duration`/`easing`: smooth duration is UA-defined and untunable,
- *  and an authored field that moves nothing is a lie with a tooltip. They arrive together with
- *  the owned-physics backend, wired on arrival.
+ *  `behavior` is `'instant' | 'smooth'`, both genuinely wired to the browser's own `scrollTo`
+ *  and both verified on a real tap (2026-08-21): `instant` lands in one frame, `smooth` eases
+ *  over 86 frames. There is deliberately no `duration`/`easing`: smooth duration is UA-defined
+ *  and untunable, and an authored field that moves nothing is a lie with a tooltip. The owned
+ *  backend that would have made them tunable is DECLINED — see UIScrollView's banner.
  */
 import { getTraitByName } from '../core/ecs/traitRegistry';
 import { getCurrentWorld, findEntityByGuid } from '../core/ecs/world';

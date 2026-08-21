@@ -274,17 +274,61 @@ describe('shared texture cache (F3 — dedup + refcount)', () => {
     expect(getSharedTextureStats().count).toBe(1);
   });
 
-  it('invalidateTexture force-disposes shared textures + evicts; a stale release is a no-op', async () => {
+  // ⚠️ THIS TEST'S EXPECTATION WAS INVERTED, deliberately. It used to assert that
+  // invalidateTexture force-disposes "regardless of refcount" — which encoded a
+  // use-after-free as the contract: a live material keeps `mat.map` pointing at the destroyed
+  // instance and the next frame dies with "Destroyed texture used in a submit" (owner-reported
+  // on a 3d-test island re-import). Disposal was never what made a re-import take effect;
+  // re-resolving is. So eviction now retires a still-referenced texture and the LAST release
+  // frees it.
+  it('invalidateTexture evicts WITHOUT disposing while refs are outstanding', async () => {
     registerAsset(GUID, PATH, 'texture');
     const a = await loadTexture3D(GUID);
-    await loadTexture3D(GUID); // refs = 2 — invalidate ignores the count
+    await loadTexture3D(GUID); // refs = 2 — both holders still bind this instance
     const disp = vi.spyOn(a, 'dispose');
     const remove = vi.spyOn(THREE.Cache, 'remove').mockImplementation(() => {});
+
     invalidateTexture(GUID);
-    expect(disp).toHaveBeenCalledTimes(1);
-    expect(getSharedTextureStats().count).toBe(0);
-    releaseTexture3D(a); // entry already gone → must not double-dispose / throw
-    expect(disp).toHaveBeenCalledTimes(1);
+
+    expect(disp).not.toHaveBeenCalled();            // still bound → must NOT be destroyed
+    expect(getSharedTextureStats().refs).toBe(2);   // retired, but still accounted for
+
+    releaseTexture3D(a);
+    expect(disp).not.toHaveBeenCalled();            // one holder left
+    releaseTexture3D(a);
+    expect(disp).toHaveBeenCalledTimes(1);          // last holder → freed, exactly once
+    expect(getSharedTextureStats()).toEqual({ count: 0, refs: 0 });
+    remove.mockRestore();
+  });
+
+  it('a load after invalidation returns a FRESH instance — eviction still makes the re-import take', async () => {
+    registerAsset(GUID, PATH, 'texture');
+    const before = await loadTexture3D(GUID);
+    const remove = vi.spyOn(THREE.Cache, 'remove').mockImplementation(() => {});
+    invalidateTexture(GUID);
+
+    const after = await loadTexture3D(GUID);
+
+    expect(after).not.toBe(before);                 // re-fetched, not the retired instance
+    expect(loadAsyncSpy).toHaveBeenCalledTimes(2);
+    remove.mockRestore();
+  });
+
+  // The retired map MUST be keyed by instance, not by cache key: a re-load after invalidation
+  // occupies the SAME key (the URL is unchanged in dev), so a key-keyed lookup would let this
+  // stale release decrement the NEW entry and destroy a texture that is still in use.
+  it('releasing the OLD instance after a re-load does not touch the new one', async () => {
+    registerAsset(GUID, PATH, 'texture');
+    const before = await loadTexture3D(GUID);
+    const remove = vi.spyOn(THREE.Cache, 'remove').mockImplementation(() => {});
+    invalidateTexture(GUID);
+    const after = await loadTexture3D(GUID);
+    const dispAfter = vi.spyOn(after, 'dispose');
+
+    releaseTexture3D(before);                       // frees the retired one only
+
+    expect(dispAfter).not.toHaveBeenCalled();
+    expect(getSharedTextureStats()).toEqual({ count: 1, refs: 1 });  // the new one, intact
     remove.mockRestore();
   });
 

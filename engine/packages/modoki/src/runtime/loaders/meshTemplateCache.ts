@@ -16,7 +16,7 @@ import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
 import { takeParsedGltf, clearParsedGltfHandoff } from './parsedGltfHandoff';
 import { notifyModelTemplatesLoaded } from './modelLoadNotify';
 import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
-import { loadTexture3D, releaseTexture3D, isSharedTexture, resolveEnvVariantUrl, getEnvFormat } from './textureResolver';
+import { loadTexture3D, releaseTexture3D, isSharedTexture, isRetiredTexture, resolveEnvVariantUrl, getEnvFormat } from './textureResolver';
 import { clearParticleCache } from './particleCache';
 import { fireDirtyListeners } from '../core/ecs/entityUtils';
 import { emitAssetInvalidated, onAssetInvalidated } from '../core/assetInvalidation';
@@ -981,6 +981,44 @@ const materialCache = new Map<string, THREE.Material | typeof MATERIAL_FAILED>()
 const materialLoadPromises = new Map<string, Promise<void>>();
 
 /** Invalidate a cached material so it will be re-fetched on next resolve. */
+/** Every texture a material binds — the same walk `disposeMaterial` uses (enumerable texture
+ *  props + the `userData.textures` convention TSL/NodeMaterial builds use). */
+function materialTextures(mat: THREE.Material): THREE.Texture[] {
+  const out: THREE.Texture[] = [];
+  const props = mat as unknown as Record<string, unknown>;
+  for (const key of Object.keys(props)) {
+    const val = props[key] as THREE.Texture | undefined;
+    if (val && val.isTexture) out.push(val);
+  }
+  const extra = (mat.userData as { textures?: THREE.Texture[] } | undefined)?.textures;
+  if (extra) out.push(...extra);
+  return out;
+}
+
+/** A TEXTURE re-import had no material-side consumer, and that is what made the announcement a
+ *  dead mechanism: `invalidateTexture` evicts + retires the instance, but nothing told a live
+ *  material to re-resolve — so the viewport kept sampling the PRE-reimport bytes, and the
+ *  retired texture was never freed (its releasing call arrives through `disposeMaterial`).
+ *
+ *  A MODEL re-import happened to be fine only because `modelImport` also calls
+ *  `invalidateMaterial` per deduped material. The standalone texture paths — the Inspector's
+ *  Convert/Re-import (`TextureAssetView`) and the batch `reimportPaths` — call
+ *  `invalidateTexture` and nothing else, so both silently did not take.
+ *
+ *  ⚠️ Deferred to a microtask ON PURPOSE. `invalidateTexture` announces BEFORE it evicts (so
+ *  path-keyed panels see the event), which means the retirement has not happened yet when this
+ *  listener runs synchronously. The microtask lands after `invalidateTexture`'s whole
+ *  synchronous body, so `isRetiredTexture` reads the settled state. */
+onAssetInvalidated((kind) => {
+  if (kind !== 'texture') return;
+  queueMicrotask(() => {
+    for (const [path, mat] of [...materialCache]) {
+      if (mat === MATERIAL_FAILED) continue;
+      if (materialTextures(mat).some(isRetiredTexture)) invalidateMaterial(path);
+    }
+  });
+});
+
 export function invalidateMaterial(matPath: string) {
   const mat = materialCache.get(matPath);
   if (mat && mat !== MATERIAL_FAILED) disposeMaterial(mat);

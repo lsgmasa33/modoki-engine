@@ -53,6 +53,22 @@ export async function getSsrLoadModule(projectRoot: string, repoRoot: string): P
           // load by absolute path via fs.allow (covers in-repo games AND an external
           // opened project); @modoki/engine resolves via the alias below.
           root: path.join(repoRoot, 'engine'),
+          // The engine runtime modules this bake pulls in (via the postprocessor's
+          // `@modoki/engine/runtime` import) reference the `__MODOKI_MODULE_*__` flag globals
+          // for build-time DCE. `configFile: false` above means engine/vite.config.ts's `define`
+          // block does NOT apply here, so those globals are undefined → ReferenceError while
+          // evaluating the postprocessor → resolvePostprocessorForId returns null → Stage A
+          // silently bakes a PASSTHROUGH. The symptom is not an error the user sees: it is
+          // untextured geometry, because the postprocessor's generated UVs never happen.
+          // All-on, mirroring the build-time twin in plugins/vite-asset-scanner.ts (keep the two
+          // in step — this is build tooling running a THREE.Mesh fixup, not a shipped bundle).
+          define: {
+            __MODOKI_MODULE_RENDER3D__: 'true',
+            __MODOKI_MODULE_RENDER2D__: 'true',
+            __MODOKI_MODULE_PHYSICS2D__: 'true',
+            __MODOKI_MODULE_PHYSICS3D__: 'true',
+            __MODOKI_MODULE_VIDEO__: 'true',
+          },
           resolve: {
             alias: [
               aliasFor('/runtime/rendering', 'runtime/rendering/index.ts'),

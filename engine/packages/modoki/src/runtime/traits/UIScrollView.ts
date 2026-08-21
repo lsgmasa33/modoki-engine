@@ -29,8 +29,13 @@ import { trait } from 'koota';
  *  `snap`/`snapStop`/`overscroll` map to `scroll-snap-align` + `scroll-snap-type`,
  *  `scroll-snap-stop`, and `overscroll-behavior`. There is deliberately NO `deceleration`,
  *  `elasticity` or fling-velocity curve: CSS cannot honour them, and an authored field that
- *  moves nothing is a lie with a tooltip. They arrive together with an owned-physics
- *  backend, wired on arrival.
+ *  moves nothing is a lie with a tooltip.
+ *
+ *  ⚠️ **The owned-physics backend is DECLINED, not pending** (owner, 2026-08-21). The plan
+ *  shipped CSS first precisely so the question could be answered by feel rather than by
+ *  argument; the owner scrolled the real Android build on a Galaxy S22 and judged it good. So
+ *  those fields are not "coming" — reopen the question only if a concrete case needs a motion
+ *  CSS genuinely cannot express, and say which. See docs/todo.md § Declined.
  *
  *  ## Pool sizing lives on `UIEntries`, but the floor is stated here because it is geometry
  *

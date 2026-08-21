@@ -6,6 +6,7 @@
  *  import.
  */
 import { getCurrentWorld, findEntityByGuid } from '../core/ecs/world';
+import { markUIDirty } from '../core/uiDirty';
 import { getTraitByName } from '../core/ecs/traitRegistry';
 import { NO_SCROLL_REQUEST } from '../traits/UIScrollView';
 
@@ -76,6 +77,21 @@ export function clearScrollRequest(guid: string, axis: 'x' | 'y' | 'both'): void
   if (axis !== 'x' && cur.scrollToY !== NO_SCROLL_REQUEST) patch.scrollToY = NO_SCROLL_REQUEST;
   if (Object.keys(patch).length === 0) return;
   entity.set(meta.trait, { ...cur, ...patch });
+  // ⚠️ This one DOES dirty, unlike its siblings in this file, and the asymmetry is the point.
+  //
+  // `UINode`'s one-shot effect is keyed on the request VALUES, so a second request for the SAME
+  // offset only re-fires if the tree observed the `-1` in between. A raw clear never reaches the
+  // tree, and the stale value then compares equal — the request is swallowed, silently.
+  //
+  // The declarative `ui.scrollTo` path hides this: `bindings.ts` dirties after applying a
+  // binding, so the tree happens to see the cleared value before the system converts the next
+  // request. A game calling `scrollToEntry()` directly has no such binding and gets no such
+  // rescue — so "re-request the same offset" would work from a button and not from code, which
+  // is exactly the kind of difference nobody would think to test.
+  //
+  // Cost is one tree rebuild per CONSUMED request, and a request is user- or game-initiated,
+  // never per-frame. The scroll READ-BACK above must stay dirty-free; this is not that.
+  markUIDirty();
 }
 
 /** What a pending request means for `Element.scrollTo`, or null when nothing is pending.

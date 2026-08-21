@@ -224,6 +224,35 @@ the equivalents up itself (`engine/electron/main.ts` + `assetBackend.ts`):
   resolves the postprocessor — otherwise the import fails silently and Stage A passes the
   model through un-fixed. See [build.md](./build.md) and [architecture.md](./architecture.md).
 
+⚠️ **THE RECURRING BUG: a postprocessor that fails to LOAD degrades to a silent passthrough,
+and the only symptom is untextured geometry.** `resolvePostprocessorForId` returns `null` on any
+load failure, Stage A then bakes the model un-fixed, and nothing surfaces in the editor — the
+generated UVs simply never happen, so a texture samples an absent `uv` and the mesh renders
+flat. Three separate causes have produced this same symptom on `games/3d-test`:
+
+| Cause | Fix |
+|---|---|
+| Flat project root has no `node_modules`; `@modoki/engine` won't resolve | alias engine entry points to absolute editor-tree paths |
+| Packaged app dereferences the `@modoki/engine` symlink, so `/packages/modoki/...` 404s | same alias, by absolute path |
+| **`configFile:false` drops `engine/vite.config.ts`'s `define`, so `__MODOKI_MODULE_*__` are undefined → `ReferenceError`** | declare the flags all-on in the SSR server's own `define` |
+
+**Both SSR loaders must define the `__MODOKI_MODULE_*__` flags, and they are separate files** —
+`electron/ssrLoader.ts` (dev + packaged editor) and `plugins/vite-asset-scanner.ts` (build-time
+bakes). The third row above was fixed in the build one and not the editor one, so every editor
+re-import silently passed through while the shipped build was fine. `ssrLoaderDefines.test.ts`
+now fails if they drift apart again.
+
+**Diagnosing it takes one grep, not a bisect** — the loader logs the reason:
+```bash
+grep -E "reimport-model|SSR module" /tmp/modoki-editor-<port>.log
+#   [reimport-model] postprocessor "island" ready for Stage A bake      ← good
+#   [reimport-model] Failed to load postprocessor "island" ...          ← passthrough
+```
+And the artifact settles it: compare `TEXCOORD_0` coverage between the source GLB and the baked
+`processed.glb` under `<project>/.cache/modoki-models/**`. **Equal counts mean the hook added
+nothing.** ⚠️ The cache key does NOT change when the postprocessor fails to load, so a stale
+passthrough bake is re-served forever — delete that cache dir before re-testing a fix.
+
 ## Rigged-model texture compression
 
 A rigged/skinned model's embedded textures go through a separate optimizer (`rigged-model-

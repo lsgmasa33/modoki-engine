@@ -408,6 +408,21 @@ interface TexCacheEntry {
 }
 const texCache = new Map<string, TexCacheEntry>();
 
+/** Entries evicted by `invalidateTexture` while materials still BIND their texture.
+ *
+ *  Eviction used to `dispose()` unconditionally, ignoring `refCount` — a use-after-free by
+ *  construction: a live material kept `mat.map` pointing at a destroyed GPUTexture, and the
+ *  next frame died with "Destroyed texture used in a submit". Freshness is not what required
+ *  that; freshness comes from holders RE-RESOLVING after `emitAssetInvalidated`. So an evicted
+ *  entry is retired here instead, unreachable to new lookups but still reachable to the
+ *  refcount, and the LAST `releaseTexture3D` frees it exactly as the refcount intended.
+ *
+ *  ⚠️ Keyed by the TEXTURE INSTANCE, never by the cache key. A re-load after invalidation
+ *  builds a new entry under the SAME key (the URL is unchanged in dev — the ?v= cache-bust
+ *  only moves when the content hash does), so a key-keyed map would let a stale release
+ *  decrement the NEW entry and dispose a texture that is very much in use. */
+const retired = new Map<THREE.Texture, TexCacheEntry>();
+
 function texCacheKey(url: string, isKtx: boolean, flipY?: boolean): string {
   // KTX2 is always bottom-origin (applyTextureSettings forces flipY=false), so flipY
   // doesn't differentiate the resulting texture there — keep those calls on ONE entry.
@@ -471,13 +486,35 @@ export async function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Pr
  *  safe no-op. Call this — never `tex.dispose()` — for anything from `loadTexture3D`. */
 export function releaseTexture3D(tex: THREE.Texture | null | undefined): void {
   if (!tex) return;
+  // Retired first: this texture was evicted while still bound, so its entry is no longer in
+  // texCache and the key lookup below would either miss (leak) or hit a NEWER entry (dispose
+  // a live texture). Checked by instance, so neither can happen.
+  const retiredEntry = retired.get(tex);
+  if (retiredEntry) {
+    if (--retiredEntry.refCount > 0) return;
+    tex.dispose();
+    retired.delete(tex);
+    return;
+  }
   const key = (tex.userData as Record<string, unknown> | undefined)?.[KEY] as string | undefined;
   if (!key) { tex.dispose(); return; } // not shared-cache owned → dispose directly
   const entry = texCache.get(key);
-  if (!entry) return; // already force-evicted by invalidateTexture (texture disposed there)
+  if (!entry) return; // no entry and not retired — already fully released
+  // A re-load after an invalidation occupies the same key with a DIFFERENT texture. Releasing
+  // the old instance must not decrement the new entry. (`entry.texture` is null only while the
+  // load is still in flight, where the instance cannot be this one anyway.)
+  if (entry.texture && entry.texture !== tex) return;
   if (--entry.refCount > 0) return;
   entry.texture?.dispose();
   texCache.delete(key);
+}
+
+/** Whether `tex` is an evicted-but-still-referenced texture (see `retired`). Lets the material
+ *  cache find the live materials that a texture re-import just orphaned, so they re-resolve to
+ *  the fresh bytes AND release the retired instance — without that, `invalidateTexture` alone
+ *  leaves the viewport sampling the pre-reimport image forever. */
+export function isRetiredTexture(tex: THREE.Texture | null | undefined): boolean {
+  return !!tex && retired.has(tex);
 }
 
 /** Whether `tex` came from the shared cache (and so must be freed via
@@ -493,7 +530,11 @@ export function isSharedTexture(tex: THREE.Texture | null | undefined): boolean 
 export function getSharedTextureStats(): { count: number; refs: number } {
   let refs = 0;
   for (const e of texCache.values()) refs += e.refCount;
-  return { count: texCache.size, refs };
+  // Retired entries are still ALIVE (a material binds them) and still hold refs — omitting
+  // them would report a re-imported scene as holding fewer textures than it does, which is
+  // the opposite of what a leak check wants to see.
+  for (const e of retired.values()) refs += e.refCount;
+  return { count: texCache.size + retired.size, refs };
 }
 
 /** Hard reset — dispose every shared texture regardless of refcount and clear the
@@ -503,13 +544,24 @@ export function getSharedTextureStats(): { count: number; refs: number } {
 export function disposeAllSharedTextures(): void {
   for (const e of texCache.values()) e.texture?.dispose();
   texCache.clear();
+  // Retired-but-still-referenced entries are part of "every shared texture" — a teardown that
+  // skipped them would leak exactly the textures an editor session re-imported.
+  for (const t of retired.keys()) t.dispose();
+  retired.clear();
 }
 
 /** Drop the shared cache's textures for a ref's variants so a subsequent load
  *  re-fetches + re-transcodes the freshly-converted files. Called by the editor's
- *  texture re-import + model re-import. The old THREE.Texture instances are
- *  force-disposed here regardless of refcount; any outstanding `releaseTexture3D` on
- *  them becomes a safe no-op (the entry is already gone), so there's no double dispose. */
+ *  texture re-import + model re-import.
+ *
+ *  ⚠️ It does NOT dispose a texture that is still referenced. It used to — force-disposing
+ *  regardless of refcount — and that is a use-after-free: a live material keeps `mat.map`
+ *  pointing at the destroyed instance, and the next frame dies with "Destroyed texture used in
+ *  a submit" (owner-reported on a 3d-test island re-import). Disposal was never what made the
+ *  re-import take effect; RE-RESOLVING is, via the `emitAssetInvalidated` above plus the
+ *  material rebuild. Evicted-but-referenced entries are retired (see `retired`) and freed by
+ *  the last `releaseTexture3D`, which arrives through `disposeMaterial` when the material
+ *  re-resolves — so the texture and material invalidations are order-independent. */
 export function invalidateTexture(ref: string): void {
   // `ref` is normally a GUID, but the editor's texture re-import + model import
   // call this with the asset PATH directly. resolveRef rejects internal paths
@@ -540,9 +592,17 @@ export function invalidateTexture(ref: string): void {
     }
   }
   urls.add(withCacheBust(assetUrl(sourcePath), hash));
-  // Force-evict + dispose any shared textures bound to those URLs.
+  // Evict any shared textures bound to those URLs, so the next loadTexture3D misses and
+  // fetches the re-imported bytes. It does NOT dispose: a live material still binds the old
+  // instance, and destroying it under the renderer is the use-after-free described on
+  // `retired`. The last releaseTexture3D frees it — which arrives via disposeMaterial when the
+  // material re-resolves, so the two invalidations are order-independent by construction.
   for (const [key, entry] of texCache) {
-    if (urls.has(entry.url)) { entry.texture?.dispose(); texCache.delete(key); }
+    if (!urls.has(entry.url)) continue;
+    texCache.delete(key);
+    if (entry.texture) retired.set(entry.texture, entry);
+    // Still loading: retire it once it resolves, or its refs could never be freed.
+    else entry.promise.then((t) => { retired.set(t, entry); }).catch(() => { /* load failed — nothing to free */ });
   }
   // THREE.Cache holds decoded image bytes only when Cache.enabled (it isn't, today);
   // evict for parity in case it's ever turned on.

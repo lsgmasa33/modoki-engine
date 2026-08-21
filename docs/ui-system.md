@@ -716,7 +716,13 @@ which is how a pager is expressed.
 `snap` / `snapStop` / `overscroll` map to `scroll-snap-align`+`scroll-snap-type`,
 `scroll-snap-stop` and `overscroll-behavior`. There is deliberately **no** `deceleration`,
 `elasticity`, `duration` or `easing`: CSS cannot honour them, and an authored field that moves
-nothing is a lie with a tooltip. They arrive together with an owned-physics backend.
+nothing is a lie with a tooltip.
+
+⚠️ **The owned-physics backend is DECLINED, not pending** (owner, 2026-08-21). Shipping CSS
+first was what made the question answerable by feel instead of by argument: the owner scrolled
+the real Android build on a Galaxy S22 and judged it good. Reopen only for a concrete motion CSS
+cannot express — and name it. Recorded in [todo.md](./todo.md) § Declined so it is not
+re-litigated.
 
 ⚠️ **`snapStop: 'always'` CONSTRAINS a fling; it does not cap it at one entry.** Measured on an
 A23: one hard fling advanced **11** entries at `'normal'` and **3** at `'always'`, while a slow
@@ -726,7 +732,25 @@ buy a feel promise.
 
 `scrollToEntry(viewGuid, {x, y}, {behavior})` and `snapToNearest` request in **entry**
 coordinates (the system converts, since it is what resolves entry size); the declarative
-`ui.scrollTo` action does the same from a button with no game code.
+`ui.scrollTo` action does the same from a button with no game code. Both are exercised by
+`games/scroll-demo`'s strip scene — two authored buttons, one `instant` and one `smooth`.
+
+⚠️ **A converted request must DIRTY the tree.** The px request lands on `UIScrollView` through
+the same raw no-dirty `entity.set` the scroll read-back uses, so when the window has not also
+moved, nothing rebuilds the UI tree and `UINode`'s one-shot `scrollTo` effect never re-runs —
+the request then sits on the trait forever. The API shipped that way and it took wiring the
+first real caller to see it: the trait read `scrollToY: 480000` while `scrollY` stayed 0.
+Verified live afterwards (2026-08-21): `instant` lands 480,000px in one frame, and `smooth`
+eases over 86 frames with 85 distinct intermediate positions.
+
+⚠️ **Clearing the request dirties too, and that asymmetry is deliberate.** The effect is keyed on
+the request VALUES, so a second request for the SAME offset only re-fires if the tree observed
+the `-1` in between — otherwise the stale value compares equal and the request is swallowed.
+The declarative `ui.scrollTo` path HIDES this, because `bindings.ts` dirties after applying any
+binding, so the tree happens to see the cleared value first. A game calling `scrollToEntry()`
+directly has no binding and no such rescue, so the same call would work from a button and not
+from code. Everything else in `scrollViewDom.ts` stays dirty-free; a consumed request costs one
+rebuild and is never per-frame.
 
 ### Rules that bite
 

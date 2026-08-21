@@ -1,6 +1,28 @@
-import { describe, it, expect } from 'vitest';
-import { scrollViewStyle, scrollSnapChildStyle, pendingScrollTo, type ScrollViewNodeData } from '../../src/runtime/ui/scrollViewDom';
-import { NO_SCROLL_REQUEST } from '../../src/runtime/traits/UIScrollView';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createWorld } from 'koota';
+import { UIScrollView, NO_SCROLL_REQUEST } from '../../src/runtime/traits/UIScrollView';
+
+const dirtySpy = vi.fn();
+let testWorld: ReturnType<typeof createWorld>;
+
+vi.mock('../../src/runtime/core/uiDirty', () => ({
+  markUIDirty: () => dirtySpy(),
+  isUIDirty: () => false,
+  clearUIDirty: () => {},
+}));
+vi.mock('../../src/runtime/core/ecs/world', () => ({
+  getCurrentWorld: () => testWorld,
+  findEntityByGuid: (guid: string) => {
+    let found: any;
+    testWorld.query(UIScrollView).updateEach((_t: any[], e: any) => { if (!found) found = e; });
+    return guid === 'view-guid' ? found : undefined;
+  },
+}));
+vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
+  getTraitByName: (n: string) => (n === 'UIScrollView' ? { name: n, trait: UIScrollView } : undefined),
+}));
+
+import { scrollViewStyle, scrollSnapChildStyle, pendingScrollTo, clearScrollRequest, type ScrollViewNodeData } from '../../src/runtime/ui/scrollViewDom';
 
 const base = (over: Partial<ScrollViewNodeData> = {}): ScrollViewNodeData => ({
   axis: 'y', snap: 'none', snapStop: 'normal', overscroll: 'auto',
@@ -58,5 +80,37 @@ describe('pendingScrollTo', () => {
   it('passes smooth through and defaults anything else to instant', () => {
     expect(pendingScrollTo(base({ scrollToY: 1, scrollBehavior: 'smooth' }))!.behavior).toBe('smooth');
     expect(pendingScrollTo(base({ scrollToY: 1, scrollBehavior: 'nonsense' }))!.behavior).toBe('instant');
+  });
+});
+
+describe('clearScrollRequest', () => {
+  beforeEach(() => { testWorld = createWorld(); dirtySpy.mockClear(); });
+
+  it('DIRTIES the tree, so a second request for the same offset is not swallowed', () => {
+    // `UINode`'s one-shot effect is keyed on the request VALUES. If the tree never observes the
+    // `-1`, a repeat request compares equal to the stale value and never re-fires. The
+    // declarative `ui.scrollTo` path hides this (bindings.ts dirties for its own reasons); a
+    // game calling scrollToEntry() directly gets no such rescue.
+    testWorld.spawn(UIScrollView({ scrollToY: 4800 }));
+    clearScrollRequest('view-guid', 'y');
+    let sv: any;
+    testWorld.query(UIScrollView).updateEach(([v]: any[]) => { sv = v; });
+    expect(sv.scrollToY).toBe(NO_SCROLL_REQUEST);
+    expect(dirtySpy).toHaveBeenCalled();
+  });
+
+  it('does nothing — and does NOT dirty — when there is no request pending', () => {
+    testWorld.spawn(UIScrollView({}));
+    clearScrollRequest('view-guid', 'both');
+    expect(dirtySpy).not.toHaveBeenCalled();   // a scroll frame with no request stays free
+  });
+
+  it('clears only the axis asked for', () => {
+    testWorld.spawn(UIScrollView({ scrollToX: 120, scrollToY: 4800 }));
+    clearScrollRequest('view-guid', 'y');
+    let sv: any;
+    testWorld.query(UIScrollView).updateEach(([v]: any[]) => { sv = v; });
+    expect(sv.scrollToX).toBe(120);
+    expect(sv.scrollToY).toBe(NO_SCROLL_REQUEST);
   });
 });
