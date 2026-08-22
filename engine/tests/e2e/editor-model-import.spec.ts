@@ -24,31 +24,32 @@ import sharp from 'sharp';
 import { gotoEmptyEditor } from './helpers';
 import { makeTestGlb } from '../plugins/fixtures/makeTestGlb';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
+import { pickHostProject, type HostProject } from './hostProject';
 
 // The GLB is GENERATED below, so this spec needs only *a* served project asset root — never
 // 3d-test's content. It used to hardcode `games/3d-test`, which meant it could not run anywhere
 // games/ is absent (the public OSS snapshot), so pick a host project at runtime instead: a
 // `<root>/<name>/runtime/assets` dir maps to the URL `/<root>/<name>/assets` (vite-asset-scanner).
-//
-// games/ is PREFERRED over demos/ deliberately. Both work, but demos/ is the published set — a
-// crash between beforeAll and afterAll would strand `__e2e_model__` inside a project that gets
-// snapshotted to a public repo. Where there is a private project to use, use it.
-const HOST = (() => {
-  const projects = discoverProjects(process.cwd()) as { root: string; name: string; dir: string }[];
-  const host = projects.find((p) => p.root === 'games') ?? projects[0];
-  if (!host) throw new Error('editor-model-import: no project found to host the generated GLB');
-  return host;
-})();
-const ABS_DIR = path.join(HOST.dir, 'runtime/assets/__e2e_model__');
-const URL_GLB = `/${HOST.root}/${HOST.name}/assets/__e2e_model__/test-model.glb`;
+// See hostProject.ts for the pick and why it can't throw.
+const HOST = pickHostProject(discoverProjects(process.cwd()) as HostProject[]);
+test.skip(!HOST, 'editor-model-import: this snapshot ships no project to host the generated GLB');
+const ABS_DIR = HOST ? path.join(HOST.dir, 'runtime/assets/__e2e_model__') : '';
+const URL_GLB = HOST ? `/${HOST.root}/${HOST.name}/assets/__e2e_model__/test-model.glb` : '';
 
 test.beforeAll(async () => {
+  // The file-level test.skip above covers the tests, but whether Playwright still runs a
+  // beforeAll/afterAll when every test in the file is skipped is a semantic this repo cannot
+  // observe from a clone (which always HAS a project). Guard explicitly: with no host,
+  // ABS_DIR is '' and mkdirSync('') throws — which would turn a clean skip into a failure on
+  // exactly the project-less snapshot this change exists for.
+  if (!HOST) return;
   fs.rmSync(ABS_DIR, { recursive: true, force: true });
   fs.mkdirSync(ABS_DIR, { recursive: true });
   await makeTestGlb({ dir: ABS_DIR, fileName: 'test-model.glb', gridSegments: 16 });
 });
 
 test.afterAll(() => {
+  if (!HOST) return;
   fs.rmSync(ABS_DIR, { recursive: true, force: true });
 });
 

@@ -37,7 +37,14 @@ on:
     # `ci/**` is the CI-snapshot branch pushed by the private repo's oss-ci-snapshot.yml on every
     # push to private main (scripts/publish-engine-oss.sh --branch). Without it, a snapshot pushed
     # to a throwaway branch would trigger nothing at all and the whole mechanism would be silent.
-    branches: [main, 'ci/**']
+    #
+    # `rc-*` is the release-candidate branch pushed by step 4b of the release-version skill. It was
+    # NOT here originally, and that gap cost a release: an rc built its artifacts green while the
+    # very same tree failed CI, and nobody found out until the tag was already cut and the failure
+    # showed up on `main`. An rc snapshot is ALSO project-less, so it exercises the same shape the
+    # release publish does — which is precisely why it has to run here, where the answer is still
+    # free to act on. Public-repo Actions are unbilled, so an extra run per rc costs nothing.
+    branches: [main, 'ci/**', 'rc-*']
 
 concurrency:
   group: ci-${{ github.ref }}
