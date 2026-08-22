@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, uninstall, uninstallAll, shouldSweepProcesses, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
+import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, shouldSweepProcesses, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
 
 /**
  * Guards the shared toolchain resolver (engine/toolchain) — Phase A of the toolchain-layer plan.
@@ -20,6 +20,20 @@ const writeExecStub = (binPath: string, versionOut: string) => {
     fs.writeFileSync(binPath, `@echo off\r\necho ${versionOut}\r\n`)
   } else {
     fs.writeFileSync(binPath, `#!/bin/sh\necho "${versionOut}"\n`)
+    fs.chmodSync(binPath, 0o755)
+  }
+}
+
+/** Like writeExecStub, but writes to STDERR and exits 0 — what `toktx --version` actually does
+ *  (confirmed live: "toktx v4.4.2" on stderr, empty stdout). Pins the probeVersion fix: several
+ *  CLIs print their version banner to stderr (java -version is the other well-known one), and
+ *  execFileSync's return value is stdout-only. */
+const writeStderrExecStub = (binPath: string, versionOut: string) => {
+  fs.mkdirSync(path.dirname(binPath), { recursive: true })
+  if (binPath.endsWith('.cmd')) {
+    fs.writeFileSync(binPath, `@echo off\r\necho ${versionOut} 1>&2\r\n`)
+  } else {
+    fs.writeFileSync(binPath, `#!/bin/sh\necho "${versionOut}" >&2\n`)
     fs.chmodSync(binPath, 0o755)
   }
 }
@@ -67,6 +81,18 @@ describe('toolchain resolve() — env override + PATH injection', () => {
     resetToolchainCache()
     expect(detect('toktx').present).toBe(false)
     expect(() => resolve('toktx')).toThrow(/KTX-Software|MODOKI_TOKTX/)
+  })
+
+  it('captures a version banner the tool wrote to STDERR (toktx --version does this, exit 0)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-stderr-ver-'))
+    const bin = path.join(dir, process.platform === 'win32' ? 'toktx.cmd' : 'toktx')
+    writeStderrExecStub(bin, 'toktx v4.4.2')
+    process.env.MODOKI_TOKTX = bin
+    resetToolchainCache()
+    const d = detect('toktx')
+    expect(d.present).toBe(true) // present alone doesn't catch a stdout-only regression — see below
+    expect(d.version).toContain('toktx v4.4.2') // this is the line that fails on the old stdout-only capture
+    fs.rmSync(dir, { recursive: true, force: true })
   })
 })
 
@@ -906,6 +932,56 @@ describe('toolchain — pinned CLI/gem tool versions + staleness (bump → reins
     expect(isToolStale('gltfpack', d)).toBe(false)
   })
 
+  it('flags a PRE-FIX gltf-transform-cli/gltfpack install as stale when npm-tools/package.json exists without the sharp override', () => {
+    // Two conflicting native `sharp`/libvips builds (@gltf-transform/cli's own `~0.34.5` dep and
+    // ndarray-pixels' unconditionally-required `^0.35.0`) crash on Windows when both load into one
+    // process. A real machine that installed before this pin existed has a package.json on disk
+    // missing `overrides.sharp` — that's the evidence this check looks for, so it self-heals on the
+    // next status probe rather than requiring the user to know to click "Reinstall".
+    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-sharp-'))
+    process.env.MODOKI_TOOLCHAIN_DIR = tc
+    const npmToolsDir = path.join(tc, 'npm-tools')
+    fs.mkdirSync(npmToolsDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(npmToolsDir, 'package.json'),
+      JSON.stringify({ name: 'modoki-toolchain-tools', private: true, version: '0.0.0' }, null, 2),
+    )
+    const d: DetectResult = {
+      id: 'gltf-transform-cli', present: true, source: 'probe',
+      version: PINNED_TOOL_VERSIONS['gltf-transform-cli'], // version pin matches — only the sharp tree is broken
+      path: path.join(npmToolsDir, 'node_modules', '.bin', 'gltf-transform'),
+    }
+    expect(isToolStale('gltf-transform-cli', d)).toBe(true)
+  })
+
+  it('does NOT flag stale for a sharp-override reason when npm-tools/package.json is simply ABSENT (nothing installed here yet)', () => {
+    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-nosharp-'))
+    process.env.MODOKI_TOOLCHAIN_DIR = tc
+    const pin = PINNED_TOOL_VERSIONS['gltf-transform-cli']!
+    const d: DetectResult = {
+      id: 'gltf-transform-cli', present: true, source: 'probe', version: pin,
+      path: path.join(tc, 'npm-tools', 'node_modules', '.bin', 'gltf-transform'),
+    }
+    expect(isToolStale('gltf-transform-cli', d)).toBe(false)
+  })
+
+  it('does NOT flag stale once npm-tools/package.json already carries the pinned sharp override', () => {
+    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-sharp-ok-'))
+    process.env.MODOKI_TOOLCHAIN_DIR = tc
+    const npmToolsDir = path.join(tc, 'npm-tools')
+    fs.mkdirSync(npmToolsDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(npmToolsDir, 'package.json'),
+      JSON.stringify({ name: 'modoki-toolchain-tools', private: true, version: '0.0.0', overrides: { sharp: PINNED_SHARP_OVERRIDE } }, null, 2),
+    )
+    const pin = PINNED_TOOL_VERSIONS['gltf-transform-cli']!
+    const d: DetectResult = {
+      id: 'gltf-transform-cli', present: true, source: 'probe', version: pin,
+      path: path.join(npmToolsDir, 'node_modules', '.bin', 'gltf-transform'),
+    }
+    expect(isToolStale('gltf-transform-cli', d)).toBe(false)
+  })
+
   it('never stale for an un-pinned tool, or when absent', () => {
     process.env.MODOKI_TOOLCHAIN_DIR = '/tmp/modoki-tc-y'
     expect(isToolStale('toktx', mk({ id: 'toktx', version: '1.0', path: '/tmp/modoki-tc-y/x' }))).toBe(false)
@@ -1032,3 +1108,45 @@ describe('toolchain — detect(npm) resolves a PROVISIONED Node (Core shows pres
     expect(typeof d.present).toBe('boolean')
   })
 })
+
+/** `planSharpOverride` — the decision behind patching `overrides.sharp` into the shared
+ *  npm-tools package.json. Pure, so the destructive branch is testable without npm.
+ *
+ *  The `unreadable` case is a real defect this pins: the first cut fell back to a minimal default
+ *  object on a JSON parse error, then wrote it back and wiped node_modules — so one corrupt file
+ *  (a truncated write, a full disk) silently dropped gltf-transform-cli, gltfpack and everything
+ *  else from the shared tree, leaving only the package being installed. */
+describe('planSharpOverride', () => {
+  it('absent file → write the minimal package.json carrying the pin', () => {
+    const plan = planSharpOverride(null);
+    expect(plan.action).toBe('absent');
+    expect((plan as { pkg: Record<string, unknown> }).pkg.overrides).toEqual({ sharp: PINNED_SHARP_OVERRIDE });
+  });
+
+  it('already pinned → ok, touch nothing (this is what stops a reinstall loop)', () => {
+    expect(planSharpOverride(JSON.stringify({ overrides: { sharp: PINNED_SHARP_OVERRIDE } })).action).toBe('ok');
+  });
+
+  it('missing//wrong pin → patch, PRESERVING dependencies npm already wrote', () => {
+    const existing = JSON.stringify({
+      name: 'modoki-toolchain-tools',
+      dependencies: { '@gltf-transform/cli': '4.2.0', gltfpack: '1.2.0' },
+      overrides: { somethingElse: '1.0.0' },
+    });
+    const plan = planSharpOverride(existing);
+    expect(plan.action).toBe('patch');
+    const pkg = (plan as { pkg: Record<string, unknown> }).pkg;
+    // The whole point: the caller WIPES node_modules after this write, so anything dropped here is
+    // uninstalled and not reinstalled.
+    expect(pkg.dependencies).toEqual({ '@gltf-transform/cli': '4.2.0', gltfpack: '1.2.0' });
+    expect(pkg.overrides).toEqual({ somethingElse: '1.0.0', sharp: PINNED_SHARP_OVERRIDE });
+  });
+
+  it('CORRUPT file → unreadable, and carries NO pkg to write back', () => {
+    const plan = planSharpOverride('{ "name": "modoki-toolchain-tools", "depend');
+    expect(plan.action).toBe('unreadable');
+    // If a `pkg` ever appears here the caller will write it over the corrupt file and then wipe
+    // node_modules — the silent tool-loss this case exists to prevent.
+    expect((plan as { pkg?: unknown }).pkg).toBeUndefined();
+  });
+});

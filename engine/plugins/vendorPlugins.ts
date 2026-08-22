@@ -520,10 +520,30 @@ export function vendorEnginePlugins(
   engineRoot: string,
   opts: VendorOptions = {},
 ): VendorResult {
-  // Default TRUE: every other caller (Vite plugins, the scaffolder, tests) runs from a
-  // developer checkout where building is both possible and wanted. Only the packaged
-  // editor opts out — see ensurePluginBuilt.
-  const canBuild = opts.canBuild ?? true;
+  // Default: build unless we are demonstrably inside a PACKAGED editor.
+  //
+  // ⚠️ This used to default to a bare `true`, on the premise that "every other caller (Vite
+  // plugins, the scaffolder, tests) runs from a developer checkout". That premise is FALSE for
+  // two of them, and it shipped: `vite-asset-scanner`'s native-build path and `addNativeTarget`'s
+  // auto-scaffold BOTH run inside the packaged editor's own Vite dev-server process. Only
+  // `main.ts` passed `canBuild` explicitly, so the guard in `ensurePluginBuilt` — written for
+  // precisely this case, with a comment saying "the caller knows (app.isPackaged); it must say
+  // so" — was simply never reached from the path that needed it.
+  //
+  // What that cost: the first iOS/Android build in a packaged editor shelled out to
+  // `npm run build` on an engine plugin, which runs `rimraf` — and packaging strips every
+  // binary shim (root `node_modules/.bin/` ships EMPTY), so it exited 127 and killed the Vite
+  // dev server. The editor stayed up (the Electron backend is a different process) and every
+  // subsequent build failed instantly with "Connection lost", which reads as a network fault
+  // rather than a dead server. Found cutting v0.5.0, building demos/forest-camp.
+  //
+  // So the default now derives from the ENVIRONMENT rather than from each call site remembering:
+  // `main.ts` exports MODOKI_PACKAGED=1 into its own process env when `app.isPackaged`, which
+  // every child it spawns (the Vite dev server, and `build-web.mjs` under it) inherits. An
+  // explicit `opts.canBuild` still wins. A dev checkout never sets the var, so it is unaffected.
+  // Fixing the DEFAULT rather than the two call sites is deliberate: a third call site added
+  // later is correct without knowing any of this.
+  const canBuild = opts.canBuild ?? (process.env.MODOKI_PACKAGED !== '1');
   const empty: VendorResult = { changed: false, needsInstall: false, vendored: [], expectedVendor: {} };
   const pkgPath = path.join(projectRoot, 'package.json');
   if (!fs.existsSync(pkgPath)) return empty;

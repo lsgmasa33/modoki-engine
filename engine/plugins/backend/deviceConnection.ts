@@ -16,6 +16,7 @@ import net from 'net';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import os from 'os';
 import { execFileSync, execFile as execFileDevice } from 'child_process';
 import { promisify } from 'node:util';
 import {
@@ -433,10 +434,28 @@ export class TcpLeaseTransport implements LeaseTransport {
 
 // ── GUID persistence (per clone) ──────────────────────────────────────────────
 
+/** Where this backend keeps its small persistent state (device GUID, last connect target).
+ *
+ *  A dev clone gets `<cwd>/.modoki`, so each checkout keeps its own stable token — that is the
+ *  "per clone" property the GUID doc below describes.
+ *
+ *  ⚠️ A PACKAGED editor must not use cwd: it is `REPO_ROOT`, which is
+ *  `<Resources>/app.asar.unpacked` — INSIDE the signed .app. Writing there breaks the bundle's
+ *  code signature, and `codesign --verify` / `spctl --assess` both start failing with "a sealed
+ *  resource is missing or invalid" (measured 2026-08-22: `.modoki/device-guid` was one of the two
+ *  files `codesign` named after a single build). There is also no "clone" to be per, so the
+ *  machine-wide `~/.modoki` is both safe and correct — it is already where `device-claims.json`
+ *  and `editor-launches.log` live. */
+export function modokiStateDir(): string {
+  return process.env.MODOKI_PACKAGED === '1'
+    ? path.join(os.homedir(), '.modoki')
+    : path.join(process.cwd(), '.modoki');
+}
+
 /** Load the clone's persistent device GUID, minting + saving one on first use. Keyed on the
- *  backend process's cwd (the clone root) so each checkout keeps its own stable token. `dir` is
- *  injectable for tests; production uses `<cwd>/.modoki`. */
-export function loadOrCreateGuid(dir: string = path.join(process.cwd(), '.modoki')): string {
+ *  backend process's cwd (the clone root) so each checkout keeps its own stable token — except
+ *  when packaged, see `modokiStateDir`. `dir` is injectable for tests. */
+export function loadOrCreateGuid(dir: string = modokiStateDir()): string {
   const file = path.join(dir, 'device-guid');
   try {
     const existing = fs.readFileSync(file, 'utf8').trim();
@@ -463,7 +482,7 @@ function lastTargetFile(dir: string): string {
   return path.join(dir, 'device-target.json');
 }
 
-export function loadLastTarget(dir: string = path.join(process.cwd(), '.modoki')): LastTarget | null {
+export function loadLastTarget(dir: string = modokiStateDir()): LastTarget | null {
   try {
     const t = JSON.parse(fs.readFileSync(lastTargetFile(dir), 'utf8'));
     if (typeof t?.ip === 'string' || typeof t?.useAdb === 'boolean') {
@@ -478,7 +497,7 @@ export function loadLastTarget(dir: string = path.join(process.cwd(), '.modoki')
   return null;
 }
 
-export function saveLastTarget(t: LastTarget, dir: string = path.join(process.cwd(), '.modoki')): void {
+export function saveLastTarget(t: LastTarget, dir: string = modokiStateDir()): void {
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(lastTargetFile(dir), JSON.stringify(t));
@@ -573,7 +592,7 @@ export class DeviceConnectionManager {
 
   /** `stateDir` is the per-clone `.modoki` dir the last-target file lives in — injectable so tests
    *  isolate their persisted state instead of scribbling on the real repo's `.modoki`. */
-  constructor(guid = loadOrCreateGuid(), stateDir: string = path.join(process.cwd(), '.modoki')) {
+  constructor(guid = loadOrCreateGuid(), stateDir: string = modokiStateDir()) {
     this.guid = guid;
     this.stateDir = stateDir;
     this.lastTarget = loadLastTarget(stateDir);

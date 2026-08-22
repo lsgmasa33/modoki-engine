@@ -360,6 +360,15 @@ let DEV_URL = process.env.MODOKI_DEV_URL || `http://127.0.0.1:${process.env.MODO
 // dev the shell loads from Vite (HMR) and only the backend is main-hosted.
 const PROD = app.isPackaged || process.env.MODOKI_PROD === '1';
 
+// Tell every CHILD process that this is a packaged editor. Set on our own env so it is
+// inherited automatically — the Vite dev server (devServer.ts spawns with `...process.env`)
+// and anything it runs in turn, like build-web.mjs. `vendorEnginePlugins` reads it to decide
+// whether shelling out to an engine plugin's `npm run build` is even possible: a packaged app
+// ships src/ + dist/ but no devDependencies and no `node_modules/.bin` shims, so that build
+// exits 127 and takes the dev server down with it. Deliberately NOT a parameter threaded
+// through three call sites — see the default in vendorPlugins.ts for what that cost.
+if (app.isPackaged) process.env.MODOKI_PACKAGED = '1';
+
 // Repo root (the npm/vite root) — owns the Vite dev-server process (dev AND
 // packaged, per C4c-3b "run Vite in prod") and resolves engine source + node_modules.
 //   • dev: engine/electron/dist/main.cjs → three levels up = the repo.

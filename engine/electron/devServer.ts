@@ -604,7 +604,13 @@ export async function startDevServer(opts: { repoRoot: string; projectRoot: stri
     if (clearState) { child = null; currentRoot = null; }
   });
 
-  await waitForServer(url, 30000, () => earlyExit, { pid: proc.pid });
+  // 60s, not 30s: a cold-start dep-optimize on a first launch (or after a build changed
+  // deps) has been measured taking ~33s here — a few seconds past the old budget was
+  // enough to report "failed to start dev server" for a server that was, in fact, about
+  // to come up. The failure mode is silent too: the child's own vite log (MODOKI_VITE_LOG /
+  // <tmpdir>/modoki-vite-<pid>.log) showed "VITE ... ready" a couple seconds after main.ts
+  // had already given up and logged the timeout.
+  await waitForServer(url, 60000, () => earlyExit, { pid: proc.pid });
   console.log(`[modoki-electron] dev server up at ${url} (project ${projectRoot})`);
 }
 

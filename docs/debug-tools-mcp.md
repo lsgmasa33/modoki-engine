@@ -599,6 +599,36 @@ Two mechanisms now close it, and they are deliberately different in reach:
   `getprop`, `logcat -d`, `devicectl device info`) are always allowed — the claim arbitrates
   interference, not curiosity, and a guard that refused listings would be routed around.
 
+⚠️ **Wireless adb: the TRANSPORT verbs are carved out, because the fail-safe default was
+unsatisfiable for them.** `adb connect` / `disconnect` / `pair` address a device as `HOST:PORT` and
+have **no `-s` form at all** — the address IS the target. They were not in either verb set, so the
+"unrecognised ⇒ destructive" default made them `untargeted`, and the refusal told the caller to
+*"say which one: `adb -s <serial> …`"* — advice the command cannot take. The only ways past a
+refusal like that are to bypass the hook or to abandon wireless debugging, and both are worse than
+the rule. They are daemon management, like `start-server`/`kill-server`, so they are now classified
+the same way (2026-08-22, setting the S22 up for the Windows clone).
+- The carve-out is scoped to the transport verbs. What a connection is USED for is guarded exactly
+  as before: `adb -s 192.0.2.10:5555 install …` parses with the host:port as the serial and is
+  refused unclaimed like any USB one. A test pins that so the carve-out cannot leak.
+- `adb tcpip` is deliberately NOT in the set — it restarts `adbd` on the phone and does take `-s`,
+  so fail-safe-destructive is right for it.
+- ⚠️ **A bare `adb disconnect` drops EVERY wireless device on this machine**, including another
+  clone's in-flight install, and the carve-out allows it. That collateral is accepted rather than
+  overlooked: `kill-server` is strictly worse (it drops USB devices too) and rule 5 has always
+  allowed it, so refusing `disconnect` would be inconsistent — and the refusal would be the
+  unsatisfiable kind this entry exists to remove. Prefer `adb disconnect <host:port>`.
+- The same sweep found three more verbs the fail-safe default was refusing unsatisfiably —
+  `version`, `help`, `keygen` (two print and exit; one writes a LOCAL key file). They are in the
+  read-only set now. The way to find these is to ask the parser, not to read it: enumerate
+  subcommands through `parseDeviceCommand` and look for `untargeted: true` on anything that has
+  no `-s` form.
+- ⚠️ **Wireless breaks the serialisation the claim provides, and the guard cannot fix that.** The
+  same phone is a DIFFERENT claim id over Wi-Fi (`adb:192.0.2.10:5555`) than over USB
+  (`adb:RFTESTSERIAL1`), so one machine can hold "the phone" twice over and not know it. Worse,
+  claims are per-MACHINE: a wirelessly-shared handset is reachable from a second computer whose
+  claims file this one never sees, which is precisely the interleaving #149 exists to prevent.
+  Coordinate by hand whenever a phone is shared over the network.
+
 **Scope, because the hook looks more powerful than it is.** It intercepts the Bash tool of a Claude
 Code session in this repo and nothing else: your own terminal, the editor backend's own spawns, and
 every non-Claude agent CLI bypass it (none has a `PreToolUse` equivalent). It never reaches a Modoki

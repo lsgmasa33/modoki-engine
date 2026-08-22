@@ -21,7 +21,18 @@ const execFileSyncMock = vi.fn((_cmd: string, args: string[], opts: { cwd?: stri
   return Buffer.from('');
 });
 const execFileSyncExport = (...a: unknown[]) => execFileSyncMock(...(a as [string, string[], object]));
-vi.mock('node:child_process', () => ({ execFileSync: execFileSyncExport, default: { execFileSync: execFileSyncExport } }));
+// `npmSpawnSpec()` resolves `npm` via the shared toolchain's `detect('npm')`, whose version probe
+// (`probeVersion`) uses `spawnSync` — reading BOTH stdout and stderr, since several CLIs (toktx,
+// java -version) print their banner to stderr and exit 0. A mock exporting only `execFileSync`
+// left `spawnSync` undefined here, throwing `TypeError: spawnSync is not a function` the moment any
+// test in this file resolved npm. Stub it as an unconditional version-probe success — nothing in
+// this suite asserts on the PROBED version string, only on execFileSyncMock's pack/build calls.
+const spawnSyncMock = vi.fn(() => ({ status: 0, stdout: 'mock-version', stderr: '', error: undefined }));
+vi.mock('node:child_process', () => ({
+  execFileSync: execFileSyncExport,
+  spawnSync: spawnSyncMock,
+  default: { execFileSync: execFileSyncExport, spawnSync: spawnSyncMock },
+}));
 
 // Import AFTER the mock is registered.
 const { vendorEnginePlugins } = await import('../../plugins/vendorPlugins');
@@ -262,6 +273,57 @@ describe('vendorEnginePlugins', () => {
 
       const builds = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'run' && c[1][1] === 'build');
       expect(builds).toHaveLength(1);
+    });
+
+    /** The v0.5.0 blocker: two call sites (vite-asset-scanner's native build, addNativeTarget's
+     *  auto-scaffold) run INSIDE the packaged editor's Vite dev server and passed no `canBuild`,
+     *  so the bare `?? true` default sent them down the doomed build path — `rimraf` is not on
+     *  PATH in a packaged app (every .bin shim is stripped), so `npm run build` exits 127 and
+     *  kills the dev server. These pin the env-derived default that fixes the CLASS. */
+    describe('the packaged-editor default (MODOKI_PACKAGED)', () => {
+      afterEach(() => { delete process.env.MODOKI_PACKAGED; });
+
+      it('does NOT build when MODOKI_PACKAGED=1 and the caller passes no opts', () => {
+        const dir = writeEnginePlugin(); // ships dist/
+        fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const v = 1');
+        writeProjectPkg({ [PLUGIN]: '*' });
+        process.env.MODOKI_PACKAGED = '1';
+
+        const r = vendorEnginePlugins(projectRoot, engineRoot); // no opts — the fixed call sites
+
+        const builds = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'run' && c[1][1] === 'build');
+        expect(builds).toHaveLength(0);
+        // Still vendors: packing writes into the PROJECT, which is writable.
+        expect(r.changed).toBe(true);
+        expect(listTarballs()).toHaveLength(1);
+      });
+
+      it('an EXPLICIT canBuild:true still wins over the env', () => {
+        const dir = writeEnginePlugin(PLUGIN, '1.0.0', /* withDist */ false);
+        fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const v = 1');
+        writeProjectPkg({ [PLUGIN]: '*' });
+        process.env.MODOKI_PACKAGED = '1';
+
+        vendorEnginePlugins(projectRoot, engineRoot, { canBuild: true });
+
+        const builds = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'run' && c[1][1] === 'build');
+        expect(builds).toHaveLength(1);
+      });
+
+      it('a value OTHER than "1" does not disable building — no accidental opt-out', () => {
+        const dir = writeEnginePlugin(PLUGIN, '1.0.0', /* withDist */ false);
+        fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const v = 1');
+        writeProjectPkg({ [PLUGIN]: '*' });
+        process.env.MODOKI_PACKAGED = '0';
+
+        vendorEnginePlugins(projectRoot, engineRoot);
+
+        const builds = execFileSyncMock.mock.calls.filter((c) => c[1][0] === 'run' && c[1][1] === 'build');
+        expect(builds).toHaveLength(1);
+      });
     });
 
     it('throws a NAMED error (not a 120s hang) when unwritable AND no dist ships', () => {

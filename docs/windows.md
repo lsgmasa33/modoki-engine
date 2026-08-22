@@ -51,6 +51,47 @@ probing) and `spawnable()` (decides `{shell}` and quotes accordingly), both in
 ⚠️ Node throws `EINVAL` on spawning a `.cmd`/`.bat` without `shell:true` (the CVE-2024-27980
 fix), so "just add a `.cmd` shim" is not a workaround for an unexecutable stub either.
 
+## A probed tool can be present and still lie about itself
+
+Two more instances of the doc's opening pattern — a probe answering confidently, and wrong —
+found 2026-08-22 checking every toolchain tool through the packaged editor's actual `/api/toolchain`
+route (the same `detect()` calls Build Support makes, in the packaged process's own env).
+
+- **`toktx --version` writes to STDERR, not stdout, and exits 0.** `probeVersion()` in
+  [engine/toolchain/index.ts](../engine/toolchain/index.ts) used to capture only
+  `execFileSync`'s return value (stdout). So `detect('toktx')` reported `present: true,
+  version: ""` — toktx genuinely runs (KTX2 encoding is unaffected; that goes through a
+  separate PATH-injected spawn), but Build Support could never show its version. `java
+  -version` has the same quirk and was already handled (`javaMajorMatches` reads both
+  streams) — `probeVersion` now does too, via `spawnSync` concatenating stdout+stderr. Verified
+  live: `toktx --version` → stderr `"toktx v4.4.2"`, stdout empty; every OTHER tool in the
+  registry (ffmpeg, ffprobe, npm, gltf-transform-cli, gltfpack) already had real content on
+  stdout, confirmed unaffected by an A/B git-stash comparison of the pre- and post-fix probe.
+- **Two versions of the same native N-API addon load into one process and corrupt each
+  other's global state.** `@gltf-transform/cli` depends on `sharp ~0.34.5` directly;
+  `@gltf-transform/functions` unconditionally `require`s `ndarray-pixels` (even when a `sharp`
+  encoder is supplied), which depends on `sharp ^0.35.0` — genuinely non-overlapping ranges, so
+  npm correctly nests TWO native `sharp`/libvips builds in the shared `npm-tools` tree. On
+  Windows, loading both into one process corrupts libvips' shared GObject type registry: any
+  subsequent texture resize crashes —
+  `GLib-GObject-CRITICAL: value "32" of type 'gint' is invalid or out of range for property
+  'space' of type 'VipsInterpretation'` / `colourspace: parameter space not set` — which
+  `rigged-model-optimize.ts` surfaces as "gltf-transform resize failed" and falls back to
+  shipping the raw, unoptimized GLB, failing the build's "no unoptimized production assets"
+  gate. Reproduced on a real rigged model (`char_Ranger.glb`, `demos/forest-camp`) via a full
+  `Build → Android` from the packaged editor; not observed on macOS. Fixed by pinning `sharp`
+  to one version across the whole `npm-tools` tree via an npm `overrides` entry
+  (`npmToolsInstall`), so only one native copy ever loads — and `isToolStale` now also flags an
+  *existing* install that predates the pin (file present, override missing), so a machine that
+  already hit this self-heals the next time Build Support checks status rather than needing a
+  manual "Reinstall".
+- **The general lesson**: a shared npm-installed tool tree is the one place in the toolchain
+  where two independently-versioned native addons can end up loaded together. Everything else
+  provisioned here (Android SDK, JDK, CocoaPods' isolated `GEM_HOME`, go-ios, WebDriverAgent) is
+  either not Node-based or runs as its own separate process — this bug class needs BOTH "shares
+  one `node_modules` tree with another native addon" AND "gets `require()`'d into the SAME
+  running process," which only the `npm-tools` tree satisfies today.
+
 ## Line endings
 
 **`adb` on Windows returns CRLF, and `\r` is a JS line terminator.** So `.` does not match it and
@@ -119,7 +160,7 @@ and proves nothing. Assert the `PK` magic bytes instead.
 
 ## Packaged-app bugs found on real Windows hardware
 
-Four bugs, all invisible to `npm run dev` on macOS, found testing the packaged NSIS installer on
+Five bugs, all invisible to `npm run dev` on macOS, found testing the packaged NSIS installer on
 real Windows hardware:
 
 - **`/tmp` hardcoded** (`devServer.ts`'s Vite log path) → `ENOENT` → the open flow's catch handler
@@ -144,6 +185,73 @@ real Windows hardware:
   above): those swept path→URL/import sinks but skipped file writes, so this one went unnoticed
   until it broke a real build. A follow-up audit for the escaping-sensitive-file class (native
   path → `.properties`/gradle/script) came back clean otherwise — `sdk.dir` was the only offender.
+- **A real Build press from a `Program Files` install EPERM'd TWICE, independently, and both
+  are now fixed — but the two fixes are shaped completely differently, which is the point of
+  recording this.** A packaged install's `engine/` is the app's own install directory —
+  writable only during an admin-elevated install (the NSIS per-machine default, `C:\Program
+  Files\...`), never by the running, unelevated app. A `Program Files` install is common, not
+  an edge case — it's what "Install for all users" produces — and both causes were silent
+  until the first Build press, so a clean-install smoke test that never presses Build
+  (QA-PKG-0001 does not) won't catch either. Confirmed fixed end-to-end: a real Android build
+  from a real `C:\Program Files\Modoki Editor` install now completes (web build → gradle
+  assemble → install → launch on device).
+  1. The scripts wrote `engine/tsconfig.app.scoped.json` unconditionally, before checking
+     whether `tsc` would even run. A packaged app ships no `typescript` (the typecheck is
+     dev-only), so the write was pure waste there. **Fixed by not writing at all**: deferred
+     into the `existsSync(tscBin)` branch that already gates the typecheck, so a packaged
+     build never attempts it. This is the fix to prefer whenever a write genuinely can be
+     avoided — no install-time step, no ongoing exception to maintain.
+  2. Fixing (1) surfaced a second, independent EPERM one step later: the actual `vite build`
+     call used Vite's default `bundle` config loader, which esbuild-bundles `vite.config.ts`
+     and WRITES it to `node_modules/.vite-temp/…mjs` — the same read-only install tree, on
+     every single build (not avoidable the way (1) was — Vite hardcodes this path with no CLI
+     flag or env var override, read straight from `loadConfigFromBundledFile` in
+     `node_modules/vite/dist/node/chunks/node.js`). Two loader-flag alternatives were tried
+     and reverted before landing on the real fix:
+     - `--configLoader runner` (already used by `devServer.ts`'s OWN vite spawn — the dev
+       server the editor UI runs on — which is why the editor launches and renders fine while
+       every Build still crashed: two different `vite` invocations, only one had the flag)
+       DOES stop the `.vite-temp` write, but its module runner is torn down once
+       config-loading finishes, so ANY plugin hook doing a dynamic `import()` LATER in the
+       build (`writeBundle`/`generateBundle` — exactly what `rigged-model-optimize.ts`'s
+       `@gltf-transform/*` imports and the SSR-postprocessor loader in `vite-asset-scanner.ts`
+       both do) throws `Vite module runner has been closed` instead — confirmed with a
+       two-line repro (a plugin doing `await import('node:fs/promises')` from `writeBundle`
+       fails under `runner`, succeeds under the default loader). Worse trade than the bug it
+       fixed: the EPERM only hits an admin-elevated install; the broken dynamic import hits
+       every build, everywhere, the moment a project has a rigged (skinned) model.
+     - `--configLoader native` sidesteps that (no bundle-to-disk step, no runner to close) but
+       requires every relative import under `engine/` to carry a real extension for Node's
+       native ESM resolution — this repo's plugin tree does not, so `native` fails to even
+       load `vite.config.ts`.
+     - **The mitigation that shipped, and is still in place: grant write access to just that
+       one subfolder, from the installer, which runs elevated exactly when it needs to.**
+       `build/installer.nsh` (picked up automatically — `nsis.include` defaults to that path,
+       no config change needed) hooks electron-builder's `customInstall` macro (fires after all
+       files are extracted) to `CreateDirectory` the `.vite-temp` folder and
+       `icacls … /grant *S-1-5-32-545:(OI)(CI)M` (BUILTIN\Users, Modify, inherited to files
+       created inside) on it — nothing else in the install tree is touched. This is the shape
+       to reach for when a write genuinely cannot be avoided (a third-party tool hardcodes the
+       path): a scoped, install-time exception, not a runtime workaround and not a blanket
+       loosening of the whole install directory.
+     - **The write has since been removed at its source, on macOS (#326).** Vite's default
+       `bundle` config loader (`loadConfigFromBundledFile` in
+       `node_modules/vite/dist/node/chunks/node.js`) only takes the disk-write path — bundle,
+       write to `.vite-temp/…mjs`, import, unlink — for an ESM config; a `.cjs` config is
+       hooked into `require.extensions` and compiled in memory, writing nothing at all.
+       `engine/scripts/stage-vite-config.cjs` (invoked from the `beforePack` fan-out
+       `engine/scripts/before-pack.cjs`) esbuild-bundles `engine/vite.config.ts` to a
+       gitignored `engine/vite.config.cjs` at pack time; `engine/scripts/viteConfigChoice.mjs`
+       exports `chooseViteConfig(engineDir)`, which prefers the `.cjs` when present, and
+       `engine/scripts/build-web.mjs` calls it. A packaged editor therefore never hits the ESM
+       branch and never writes `.vite-temp` — verified on a packaged, ad-hoc-resealed macOS
+       `.app`: Build → Web from its own menu, then `codesign --verify --deep --strict` exit 0,
+       zero files added to the bundle, no `.vite-temp` anywhere.
+     - ⚠️ **This is UNVERIFIED ON WINDOWS — measured only on macOS.** The installer grant
+       above STAYS until a session on the `win` clone confirms that an elevated
+       `C:\Program Files` install can complete a build with the grant removed. Pulling it based
+       on the macOS measurement would be exactly the hypothesis-fix-from-a-Mac this repo's
+       Windows rule forbids: the macOS run cannot observe an elevated install tree at all.
 
 ## Process control
 

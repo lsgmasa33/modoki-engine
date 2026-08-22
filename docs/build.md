@@ -942,6 +942,94 @@ Four bugs found stress-testing the very first packaged DMG (`dist:dir`), each in
 All four verified end-to-end on a clean-from-source repackage: renderer mounts, `/api/scene-state`
 returns 200 entities, a "Build → Web" run on a clean packaged install completes and deploys.
 
+### The packaged editor must not write inside its own bundle (#326)
+
+A packaged editor's `REPO_ROOT` is `<Resources>/app.asar.unpacked` — **inside the signed `.app`**.
+Anything the build chain writes relative to it lands in the bundle, where a write is not a
+permission problem but an **integrity seal** problem: nothing errors, and only `codesign --verify`
+and `spctl --assess` ever notice. Three writers were found and closed:
+
+| writer | fix |
+|---|---|
+| `engine/tsconfig.app.scoped.json` | not written at all in a packaged build — deferred into the `existsSync(tscBin)` branch that already gates the typecheck (`3df0e65d4`) |
+| `.modoki/device-guid` +3 backend state defaults | routed through `modokiStateDir()`, which points at `~/.modoki` when `MODOKI_PACKAGED=1` (`ed17ff8a2`) |
+| `node_modules/.vite-temp/…mjs` — Vite's compiled config | the packaged app is handed a **CJS** config, whose loader branch never writes (below) |
+
+**The `.vite-temp` mechanism, and the one asymmetry the fix rests on.** Vite's default `bundle`
+config loader esbuild-bundles the config, then `loadConfigFromBundledFile` branches on
+`isFilePathESM(configPath)` — which is decided by extension first, and only then by the nearest
+`package.json` `type`:
+
+- **ESM** (`engine/vite.config.ts` under this repo's `"type": "module"` root) → writes the compiled
+  config to `<nearest node_modules>/.vite-temp/…mjs`, imports it, unlinks it. The directory is
+  chosen by walking up from the **config file**, not from `root` or `cacheDir`, so no option moves
+  it — which is why every attempt to configure this away failed.
+- **CJS** (`.cjs`) → hooks `require.extensions` and compiles **in memory**. It writes nothing.
+
+So `engine/scripts/stage-vite-config.cjs` (a `beforePack` stager) esbuild-bundles `vite.config.ts`
+into a gitignored `engine/vite.config.cjs` shipped in the bundle, and `chooseViteConfig()`
+(`engine/scripts/viteConfigChoice.mjs`) hands Vite that one when it exists. Regenerated on every
+pack, so it cannot drift; chosen by file existence rather than an env var, so a dev clone (no
+`.cjs`) and a packaged app (always one) cannot disagree.
+
+⚠️ **Bundling to CJS empties `import.meta`, and this plugin graph is full of self-locating modules.**
+Three already branch to `__filename`/`__dirname` when it is absent — and `native-dynamic-import.ts`
+**depends** on the absence, so do NOT "fix" the esbuild warnings with a `--define:import.meta.url=…`;
+that silently takes the wrong branch. The one module that did not branch, `courtAuthored.mjs`, killed
+the entire packaged build at config load with `fileURLToPath(undefined)`.
+⚠️ And **everywhere in this graph `import.meta.url` must appear verbatim.** Vite's own config
+bundler rewrites that exact expression to the defining module's URL; a paraphrase like
+`(import.meta as { url?: string }).url` slips past the define and silently resolves to the **temp
+file** under `node_modules/.vite-temp/` instead. Measured against vite 8.2.0 under the repo's own
+shape — a `.ts` config beneath a `"type": "module"` root — for the entry config *and* for an
+imported module. (Probe it under any other shape and it looks clean: a `.cjs`/non-`type: module`
+config takes the in-memory branch, and with no `node_modules` above it the temp file lands beside
+the original, where the wrong path is indistinguishable from the right one.) In `vite.config.ts`
+the paraphrase killed the build outright — `engine/node_modules/.vite-temp/index.html`; in
+`font-instance.ts` it was silently wrong for months and merely benign, because `require.resolve`
+walks up to the same `node_modules` anyway. Both classes are pinned by
+`engine/tests/plugins/packagedViteConfig.test.ts`.
+
+**Measured 2026-08-22 — two corrections to what was previously believed here.**
+
+1. **`.vite-temp` alone does not persistently break the seal.** On a build that completes, Vite
+   unlinks the temp file and leaves an **empty** directory, and `codesign` does not seal empty
+   directories — `codesign --verify --deep --strict` still exits 0. It does leave a window *during*
+   the build where the bundle is invalid, and a build that dies mid-config-load leaves the file. The
+   persistent breaks measured on the v0.5.1/v0.5.2 rcs were the other two writers in the table.
+   The fix is still worth having (no write at all, and it removes the Windows EPERM at its source —
+   see `docs/windows.md`, where the installer grant STAYS until Windows verifies it) but do not
+   re-derive the causal story from this paragraph: **re-measure**, per QA-PKG-0009 step 7.
+2. **A broken seal does not strand users.** Measured against the real GitHub feed with the published
+   signed `v0.4.0` (feed latest `v0.4.1`): a seal-broken app still launches, its main binary still
+   reports a Developer ID signature so the ad-hoc skip in `autoUpdate.ts` never fires, the check
+   finds the update, downloads it, and **the install succeeds** — replacing the whole bundle, which
+   both applies the fix and restores a valid signature. The update path is self-healing.
+
+**`npm run smoke:packaged` now checks this automatically.** It snapshots the bundle's file list
+after `electron-builder` finishes and re-lists it after both app boots, failing on any added or
+removed path (`engine/scripts/assertBundleUnchanged.mjs`). Directories are deliberately not
+listed — an empty `.vite-temp` is not a seal break, and listing it would report the wrong writer.
+An empty snapshot fails rather than passing vacuously. It does NOT cover a *build*, only startup;
+for the build path the manual protocol below is still the check.
+
+**How to verify a fix in this class — nothing cheaper distinguishes the outcomes.** Build the
+packaged `.app` (`npm run smoke:packaged` leaves one under the temp dir); it is ad-hoc signed by
+`--dir` in a state that already fails `--verify`, so give it a real seal first with
+`codesign --force --deep --sign - <app>` and confirm exit 0. Then launch it with a scaffolded
+throwaway project, run **Build → Web from its own menu**, and re-assess:
+
+```bash
+codesign --verify --deep --strict "<app>"; echo "exit=$?"     # must still be 0
+find "<app>" -type f | sort > after.txt; comm -13 before.txt after.txt   # must be empty
+```
+
+Two traps this class keeps setting. **Never read the exit code through a pipe** — `codesign … | tail`
+reports `tail`'s status, and a broken signature reads as a pass. And **verify on a project that
+exercises the asset pipeline**: `games/anim-bug` has no rigged model, so it builds identically with
+or without the `--configLoader runner` that was wrongly declared good on it; `demos/forest-camp` is
+the distinguishing fixture.
+
 ## CLI recipes
 
 The examples use `games/<id>`; substitute the project and its appId. Note the **project-dir cwd**
@@ -991,6 +1079,22 @@ install condition — rather than re-deriving them:
 - `ensureCapacitorDeps` needs a platform, and `--target native` covers both; the CLI heals
   whichever of `ios/`/`android/` the project already has on disk (a project with neither yet is
   the editor's scaffold-then-build path, which the CLI has no equivalent entry point for).
+- ⚠️ **A PACKAGED editor must never let this chain BUILD a plugin, and that is decided by an env
+  var, not by the call site.** `vendorEnginePlugins`'s `canBuild` defaults to
+  `process.env.MODOKI_PACKAGED !== '1'`; `main.ts` sets `MODOKI_PACKAGED=1` when `app.isPackaged`,
+  and every child inherits it (`devServer.ts` spawns Vite with `...process.env`, and `build-web.mjs`
+  runs under that). A packaged app ships each plugin's `src/` **and** `dist/` but no
+  devDependencies — and packaging strips every binary shim, so its root `node_modules/.bin/` is
+  EMPTY. `npm run build` there runs `rimraf` and exits 127.
+  **Why the default and not the three call sites:** it was the call sites, and it shipped broken.
+  `ensurePluginBuilt` has had the guard all along and `main.ts` passed it correctly, but the two
+  sites that run during a native build — `vite-asset-scanner`'s build path and `addNativeTarget`'s
+  auto-scaffold — live in the Vite dev-server process and passed nothing, so `?? true` won. In the
+  v0.5.0 packaged editor the first iOS/Android build of any project killed its own dev server;
+  the Electron backend survived, so every later build reported **"Connection lost"** and it read
+  as a network fault rather than a dead server. Found building `demos/forest-camp`, fixed in 0.5.1.
+  Pinned from both ends: `tests/electron/packagedEnvSignal.test.ts` (the signal is SET and
+  inherited) and `vendorPlugins.test.ts` § "the packaged-editor default" (it is READ).
 
 #### The engine-required Capacitor plugins must be COMMITTED, not just healed
 

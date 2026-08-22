@@ -7,6 +7,7 @@ import {
   DeviceConnectionManager,
   TcpLeaseTransport,
   loadOrCreateGuid,
+  modokiStateDir,
   loadLastTarget,
   saveLastTarget,
 } from '../../plugins/backend/deviceConnection';
@@ -426,5 +427,26 @@ describe('DeviceConnectionManager.devicePlatform — what latches and what does 
       await mgr.disconnect();
       await device.close();
     }
+  });
+});
+
+/** The packaged editor must not keep its state inside the signed .app. `.modoki/device-guid` was
+ *  one of two files `codesign` named after a single build on the v0.5.2 rc — cwd IS
+ *  `app.asar.unpacked` there, so every default that reached for `process.cwd()` was writing into
+ *  the bundle and invalidating its signature. */
+describe('modokiStateDir', () => {
+  const prev = process.env.MODOKI_PACKAGED;
+  afterEach(() => { if (prev === undefined) delete process.env.MODOKI_PACKAGED; else process.env.MODOKI_PACKAGED = prev; });
+
+  it('a dev clone keeps per-clone state under <cwd>/.modoki', () => {
+    delete process.env.MODOKI_PACKAGED;
+    expect(modokiStateDir()).toBe(path.join(process.cwd(), '.modoki'));
+  });
+
+  it('a PACKAGED editor uses machine-wide ~/.modoki, never cwd (which is the signed bundle)', () => {
+    process.env.MODOKI_PACKAGED = '1';
+    const dir = modokiStateDir();
+    expect(dir).toBe(path.join(os.homedir(), '.modoki'));
+    expect(dir).not.toContain('app.asar.unpacked');
   });
 });

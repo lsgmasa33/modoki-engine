@@ -56,7 +56,16 @@ describe('the committed fleet carries every SEED key on every authored tier (#20
   // anything at all" predicate, deliberately checked explicitly rather than trusted implicitly —
   // the public snapshot ships no `games/`, and a naive sweep over an empty project list would
   // pass every assertion below by scanning nothing, which is a documented repeat failure here.
-  it('finds project configs to check — a vacuous pass is a failure', () => {
+  //
+  // Gated for the layout that comment half-names. There are THREE, not two: a dev clone (games +
+  // demos), `ci/main` (demos only, via `--with-demos`), and the RELEASE snapshot pushed to the
+  // public `main` — which takes no `--with-demos` and ships no projects at all, yet runs the same
+  // `ci.yml`. Ungated, this assertion cannot pass in the third one; it blocked the v0.5.0 publish
+  // inside `publish-engine-oss.sh`'s in-stage guard run, and it is the fourth non-vacuity floor to
+  // trip on that divergence (docs/engine-oss-publishing.md § "`ci/main` and `main` are DIFFERENT
+  // layouts" lists the first three). The floor still bites wherever there IS a fleet to sweep,
+  // which is the only place it ever asserted anything.
+  it.skipIf(!hasAnyProject())('finds project configs to check — a vacuous pass is a failure', () => {
     expect(hasAnyProject()).toBe(true);
   });
 

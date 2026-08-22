@@ -39,7 +39,18 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+// #326: also loaded from an esbuild-bundled CJS copy of `vite.config.ts` in the packaged
+// editor, where `import.meta` is empty — fall back to CJS `__filename`, the same way
+// `font-instance.ts` and `nodeProvision.ts` do. Both point at a file inside `engine/`.
+// ⚠️ The two branches are NOT the same depth, which is the whole reason this is spelled out:
+// as a module this file lives in `engine/scripts/`, but bundled it IS `engine/vite.config.cjs`,
+// so `__dirname` is `engine/` — one level shallower. Both branches name the REPO ROOT.
+const SELF_URL = typeof import.meta !== 'undefined' ? import.meta.url : undefined;
+const REPO = SELF_URL
+  ? join(dirname(fileURLToPath(SELF_URL)), '..', '..')   // engine/scripts → repo root
+  : typeof __dirname === 'string' && __dirname
+    ? join(__dirname, '..')                              // engine/ (bundled) → repo root
+    : process.cwd();
 
 /**
  * The paths a Court test's result actually depends on.

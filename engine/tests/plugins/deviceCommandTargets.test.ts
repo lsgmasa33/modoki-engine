@@ -119,6 +119,65 @@ describe('parseDeviceCommand — adb untargeted', () => {
       tools: ['adb'],
     });
   });
+
+  /** Wireless adb. The verbs address the device as HOST:PORT and have no `-s` form at all, so
+   *  the fail-safe default made them `untargeted` and the refusal demanded a flag they cannot
+   *  accept — unsatisfiable by construction. Hit setting up wireless debugging on the S22. */
+  describe('transport verbs (wireless adb)', () => {
+    for (const cmd of [
+      'adb connect 192.0.2.10:5555',
+      'adb disconnect 192.0.2.10:5555',
+      'adb disconnect',
+      'adb pair 192.0.2.10:37129',
+    ]) {
+      it(`${cmd} → neither destructive nor untargeted`, () => {
+        expect(parseDeviceCommand(cmd)).toEqual({
+          ids: [],
+          destructive: false,
+          untargeted: false,
+          tools: ['adb'],
+        });
+      });
+    }
+
+    it('but what a wireless connection is USED for is still guarded — host:port IS the serial', () => {
+      // The carve-out is scoped to the transport verbs themselves. The install that follows is
+      // parsed by the normal path, with the address as the id, so it is refused unclaimed exactly
+      // like a USB one. If this ever goes green with destructive:false, the carve-out has leaked.
+      expect(parseDeviceCommand('adb -s 192.0.2.10:5555 install app.apk')).toEqual({
+        ids: ['adb:192.0.2.10:5555'],
+        destructive: true,
+        untargeted: false,
+        tools: ['adb'],
+      });
+      expect(parseDeviceCommand('adb -s 192.0.2.10:5555 shell pm clear com.x')).toMatchObject({
+        destructive: true,
+      });
+    });
+
+    /** Siblings of the same defect, found by the close-out sweep: ask the parser which verbs come
+     *  back `untargeted`, then check whether each CAN name a device. These three cannot — two
+     *  print and exit, one writes a local key file — so the refusal was unsatisfiable for them too. */
+    it('version / help / keygen involve no device and are not refused', () => {
+      for (const cmd of ['adb version', 'adb help', 'adb keygen /tmp/adbkey']) {
+        expect(parseDeviceCommand(cmd), cmd).toEqual({
+          ids: [], destructive: false, untargeted: false, tools: ['adb'],
+        });
+      }
+    });
+
+    it('tcpip stays destructive and targeted — it restarts adbd on the phone', () => {
+      // Deliberately NOT in the transport set: `adb tcpip` changes the DEVICE's daemon mode and
+      // does take `-s`, so the fail-safe default is correct for it.
+      expect(parseDeviceCommand('adb -s RFTESTSERIAL1 tcpip 5555')).toEqual({
+        ids: ['adb:RFTESTSERIAL1'],
+        destructive: true,
+        untargeted: false,
+        tools: ['adb'],
+      });
+      expect(parseDeviceCommand('adb tcpip 5555')).toMatchObject({ untargeted: true });
+    });
+  });
 });
 
 describe('parseDeviceCommand — adb read-only surface', () => {

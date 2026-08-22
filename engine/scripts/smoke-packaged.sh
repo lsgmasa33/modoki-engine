@@ -87,6 +87,31 @@ BIN="$(node "$PATHS" "$OUT" bin)"
 # -x is unreliable for a Windows .exe under Git Bash; existence is the portable check.
 [ -f "$BIN" ] || { echo "[smoke] FAIL: app not built (expected $BIN)"; tail -20 "$BUILDLOG"; exit 1; }
 
+# #326: the packaged app must SHIP the CJS Vite config. Without it a real Build press falls back
+# to the ESM config, whose loader writes node_modules/.vite-temp inside the signed bundle. The
+# stager skips gracefully when esbuild is unresolvable, so its absence is otherwise silent — and
+# this smoke never presses Build, so the file-list check below cannot see that regression. This
+# line is what covers it.
+# The resources dir differs per platform (macOS nests it in the .app), so test BOTH layouts
+# rather than branching on `uname` — one of them is always the right one, and a layout change
+# would otherwise turn this into a silent pass on whichever platform it stopped matching.
+if [ -f "$APP/Contents/Resources/app.asar.unpacked/engine/vite.config.cjs" ] \
+  || [ -f "$APP/resources/app.asar.unpacked/engine/vite.config.cjs" ]; then
+  echo "[smoke] ok: packaged Vite config staged (#326)"
+else
+  echo "[smoke] FAIL: engine/vite.config.cjs is missing from the bundle — a Build press would"
+  echo "             write .vite-temp inside the signed app (#326). Check stage-vite-config.cjs."
+  fail_staged=1
+fi
+
+# Snapshot the bundle BEFORE the app runs, so the assertion after teardown can prove the packaged
+# editor wrote nothing inside its own signed application. NOTE what this does and does not cover:
+# it sees writes made at BOOT (the class fixed in 3df0e65d4 / ed17ff8a2), not writes made by a
+# project BUILD — this harness never presses Build. The build path is QA-PKG-0009 step 7.
+BUNDLELIST="$TMPBASE/modoki-pkg-bundle-$CLONE.txt"
+node "$REPO/engine/scripts/assertBundleUnchanged.mjs" snapshot "$APP" "$BUNDLELIST" \
+  || { echo "[smoke] FAIL: could not snapshot the bundle"; exit 1; }
+
 echo "[smoke] launching headless (project: $PROJECT)"
 : > "$VITELOG"; : > "$APPLOG"
 # --user-data-dir ISOLATES THIS LEG. resolveUserDataDir (engine/electron/userDataDir.ts)
@@ -185,5 +210,14 @@ if node "$REPO/engine/scripts/assert-app-csp.mjs" "$APP" "$PROJECT"; then
 else
   echo "[smoke] FAIL: prod CSP regression (see [csp] output above)"; fail=1
 fi
+
+# ── the app must not have written inside its OWN bundle at BOOT (#326) ──
+# Last, so it covers BOTH boots above (the render leg and the CSP leg). A write in here is
+# invisible to every assertion above — the app works perfectly and merely breaks its own code
+# signature, which only `codesign`/`spctl` see, by which point notarization is gone.
+# ⚠️ BOOT only. Nothing here presses Build, so a build-time writer is out of scope for this
+# check — that is what the staged-config assertion above and QA-PKG-0009 step 7 are for.
+if node "$REPO/engine/scripts/assertBundleUnchanged.mjs" assert "$APP" "$BUNDLELIST"; then :; else fail=1; fi
+[ "${fail_staged:-0}" = 0 ] || fail=1
 
 [ "$fail" = 0 ] && { echo "[smoke] PASS ✅"; exit 0; } || { echo "[smoke] FAILED ❌"; exit 1; }

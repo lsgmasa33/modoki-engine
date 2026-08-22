@@ -211,3 +211,7 @@ games/court/art/chrome/out/
 # purpose: a finding is only as good as the ability to re-take it). Nothing ignored it, so the
 # repo's own `git add -A` hazard was the only thing standing between a re-run and a 14 MB commit.
 tools-scratch/boot-stall/trace.json
+
+# Generated at pack time by engine/scripts/stage-vite-config.cjs — the packaged editor's
+# CJS Vite config (#326). Regenerated on every pack; never committed, so it cannot drift.
+engine/vite.config.cjs

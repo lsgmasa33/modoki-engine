@@ -104,7 +104,34 @@ const ADB_TOP_DESTRUCTIVE = new Set(['install', 'uninstall', 'push', 'reboot', '
 // destructive nor untargeted") — they manage the adb daemon, not a device.
 const ADB_TOP_READONLY = new Set([
   'devices', 'pull', 'bugreport', 'get-state', 'wait-for-device', 'start-server', 'kill-server',
+  // No device is involved at all: `version`/`help` print and exit, `keygen` writes a LOCAL adb key
+  // file. Listed for the same reason as ADB_TRANSPORT below — without them the fail-safe default
+  // refuses them as `untargeted` and tells the caller to add `-s <serial>`, which none of the three
+  // accepts. Found by the close-out sweep for the `adb connect` fix, by asking the parser directly
+  // which subcommands come back untargeted.
+  'version', 'help', 'keygen',
 ]);
+
+/** TRANSPORT verbs: they attach/detach the local adb daemon to a device, and address it as
+ *  `HOST:PORT` — `adb connect 192.0.2.10:5555`. Same carve-out as start-server/kill-server:
+ *  daemon management, not device or app state.
+ *
+ *  ⚠️ These MUST be listed, because the fail-safe default cannot be right for them. An
+ *  unrecognised verb is treated as destructive with no id, i.e. `untargeted`, and the refusal
+ *  says "say which one: `adb -s <serial> …`" — advice `connect` STRUCTURALLY CANNOT TAKE. There
+ *  is no `-s` form: the address IS the target. So the guard refused a command that had no way to
+ *  satisfy it, and the only ways past were to bypass the hook or to stop using wireless adb.
+ *  Hit for real setting up wireless debugging on the S22 for the Windows clone (2026-08-22).
+ *
+ *  They are NOT destructive in this guard's sense — nothing on the phone changes — so they do not
+ *  require a claim. What follows a connect does: `adb -s 192.0.2.10:5555 install …` is parsed
+ *  by the normal path, with the host:port as the serial, and is refused exactly like a USB one.
+ *
+ *  ⚠️ A wireless device is claimed under a DIFFERENT id than the same phone on USB
+ *  (`adb:192.0.2.10:5555` vs `adb:RFTESTSERIAL1`), and claims are per-MACHINE anyway — so a
+ *  wirelessly-shared phone is outside what #149/#285 can serialise. That is a real gap in the
+ *  rule, not something this list creates; see docs/devices.md. */
+const ADB_TRANSPORT = new Set(['connect', 'disconnect', 'pair']);
 
 // Sub-verbs of `adb shell <cmd>` that mutate device/app state. Matched with a
 // trailing `\s` (or `\b` for single-word ones) so "am " doesn't also match a
@@ -180,6 +207,7 @@ function analyzeAdb(restTokens, envVars) {
 
   if (ADB_TOP_DESTRUCTIVE.has(sub)) return finalize(ids, true, 'adb');
   if (ADB_TOP_READONLY.has(sub)) return finalize(ids, false, 'adb');
+  if (ADB_TRANSPORT.has(sub)) return finalize(ids, false, 'adb');
 
   // Unrecognised adb subcommand: fail SAFE. A hook that refuses an unknown
   // command is an annoyance; one that silently permits an unknown mutation

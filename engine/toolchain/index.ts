@@ -638,15 +638,19 @@ function systemJavaHomeCandidates(): string[] {
 const cache = new Map<ToolId, DetectResult>()
 
 function probeVersion(cmd: string, versionArgs: string[], env?: NodeJS.ProcessEnv): string | null {
-  try {
-    // A `.cmd`/`.bat` shim (npm .bin on Windows, sdkmanager.bat) needs a shell or execFile throws
-    // EINVAL — which otherwise reads as a just-installed tool being "not found" in Build Support.
-    const { command, args, shell } = spawnable(cmd, versionArgs)
-    const out = execFileSync(command, args, { stdio: ['ignore', 'pipe', 'pipe'], shell, ...(env ? { env } : {}) })
-    return out.toString().trim()
-  } catch {
-    return null
-  }
+  // A `.cmd`/`.bat` shim (npm .bin on Windows, sdkmanager.bat) needs a shell or execFile throws
+  // EINVAL — which otherwise reads as a just-installed tool being "not found" in Build Support.
+  const { command, args, shell } = spawnable(cmd, versionArgs)
+  // spawnSync (not execFileSync), reading BOTH streams: several CLIs print their version banner to
+  // STDERR and exit 0 — `java -version` is the well-known one (see javaMajorMatches), and toktx does
+  // the same (confirmed live: `toktx --version` writes "toktx v4.4.2" to stderr, empty stdout).
+  // execFileSync's return value is stdout-only, so toktx probed as `present:true, version:""` —
+  // functionally fine (KTX2 encoding doesn't go through this probe), but Build Support could never
+  // show its version. Concatenating both, stdout first, fixes toktx without changing any tool that
+  // already prints to stdout (nothing here has meaningful content on BOTH streams at once).
+  const r = spawnSync(command, args, { stdio: ['ignore', 'pipe', 'pipe'], shell, encoding: 'utf8', ...(env ? { env } : {}) })
+  if (r.error || r.status !== 0) return null
+  return `${r.stdout ?? ''}${r.stderr ?? ''}`.trim()
 }
 
 function detectBinary(id: ToolId, d: BinaryDescriptor): DetectResult {
@@ -991,6 +995,75 @@ export const PINNED_TOOL_VERSIONS: Partial<Record<ToolId, string>> = {
   cocoapods: '1.17.0',
 }
 
+/** Pin every `sharp` in the shared `npm-tools` tree to ONE version, via npm `overrides`. Without
+ *  this, `@gltf-transform/cli` (`sharp: ~0.34.5`) and `ndarray-pixels` — a transitive dep of
+ *  `@gltf-transform/functions`, pulled in unconditionally even when a `sharp` encoder is supplied
+ *  (`sharp: ^0.35.0`) — sit on genuinely non-overlapping ranges, so npm correctly nests TWO native
+ *  sharp/libvips builds in one tree. On Windows, loading both into the same process corrupts the
+ *  shared GObject type registry: the SECOND-loaded libvips' colourspace enum no longer matches what
+ *  the FIRST-loaded one compiled against, and any subsequent resize crashes —
+ *  `GLib-GObject-CRITICAL: value "32" of type 'gint' is invalid or out of range for property
+ *  'space' of type 'VipsInterpretation'` / `colourspace: parameter space not set` — which
+ *  `rigged-model-optimize.ts` surfaces as "gltf-transform resize failed" and falls back to shipping
+ *  the raw, unoptimized GLB (failing the build's "no unoptimized production assets" gate). 0.34.5
+ *  satisfies both packages' actual usage (plain `.raw()`/`.resize()`/`.toFormat()` — nothing
+ *  0.35-only) and is what `@gltf-transform/cli` already resolves to, so pinning down to it costs
+ *  nothing. Reproduced + isolated to the double-native-load 2026-08-22; not observed on macOS. */
+export const PINNED_SHARP_OVERRIDE = '0.34.5'
+
+/** What to do with the shared `npm-tools/package.json` to get `overrides.sharp` pinned.
+ *
+ *  A pure decision so it can be tested without npm, a network, or a real toolchain dir — the
+ *  behaviour that matters is entirely in the branching, and one branch is destructive.
+ *
+ *  - `absent`      → no file: write the minimal package.json with the override.
+ *  - `ok`          → already pinned: touch nothing (this is what stops a reinstall loop, since
+ *                    `npm install` rewrites this file on every call).
+ *  - `patch`       → parsed, wrong/missing override: write `pkg` back — it PRESERVES everything
+ *                    npm already wrote, `dependencies` above all, and the caller then wipes
+ *                    node_modules so npm re-resolves the tree with the override in force.
+ *  - `unreadable`  → present but not JSON: **do nothing.** Falling back to the minimal default
+ *                    here would overwrite the corrupt file with one carrying NO `dependencies`,
+ *                    and the caller's wipe would then leave the tree holding only `specPkg` —
+ *                    every other tool silently gone. Let npm fail loudly on the bad file instead.
+ */
+export type SharpOverridePlan =
+  | { action: 'absent' | 'patch'; pkg: Record<string, unknown> }
+  | { action: 'ok' | 'unreadable' }
+
+export function planSharpOverride(existingText: string | null): SharpOverridePlan {
+  const base = { name: 'modoki-toolchain-tools', private: true, version: '0.0.0' }
+  if (existingText === null) {
+    return { action: 'absent', pkg: { ...base, overrides: { sharp: PINNED_SHARP_OVERRIDE } } }
+  }
+  let parsed: Record<string, unknown>
+  try {
+    parsed = JSON.parse(existingText) as Record<string, unknown>
+  } catch {
+    return { action: 'unreadable' }
+  }
+  const overrides = (parsed.overrides ?? {}) as { sharp?: string }
+  if (overrides.sharp === PINNED_SHARP_OVERRIDE) return { action: 'ok' }
+  return { action: 'patch', pkg: { ...parsed, overrides: { ...overrides, sharp: PINNED_SHARP_OVERRIDE } } }
+}
+
+/** True when the shared `npm-tools/package.json` EXISTS (proving `npmToolsInstall` has run before)
+ *  but its `overrides.sharp` is missing or wrong — evidence of a real install from before this pin
+ *  existed, which needs the self-heal reinstall. A toolchain dir where the file is simply ABSENT
+ *  (never installed here at all) is not this case: the next real `npmToolsInstall` writes the pin
+ *  correctly the first time, so there's nothing to flag. Synchronous + cheap, safe to call from
+ *  `isToolStale` on every status probe. */
+function npmToolsSharpOverrideMissing(toolchainDir: string): boolean {
+  const pkgJson = path.join(npmToolsDir(toolchainDir), 'package.json')
+  if (!fs.existsSync(pkgJson)) return false
+  try {
+    const parsed = JSON.parse(fs.readFileSync(pkgJson, 'utf8')) as { overrides?: { sharp?: string } }
+    return parsed.overrides?.sharp !== PINNED_SHARP_OVERRIDE
+  } catch {
+    return false // an unreadable/corrupt file isn't THIS check's problem to flag
+  }
+}
+
 /** Whether `version` (a tool's raw `--version` output) reports the pinned release. Matching is
  *  substring-based but ANCHORED — `1.2` must not match `1.20` — and accepts the pin's trailing-zero-
  *  trimmed forms, because a tool needn't print its npm version verbatim: gltfpack@1.2.0's `-v` prints
@@ -1010,10 +1083,16 @@ export function versionMatchesPin(version: string, pin: string): boolean {
  *  install (resolved path under MODOKI_TOOLCHAIN_DIR); a system/PATH tool a dev installed is left
  *  alone. */
 export function isToolStale(id: ToolId, d: DetectResult): boolean {
-  const pin = PINNED_TOOL_VERSIONS[id]
-  if (!pin || !d.present || !d.version) return false
+  if (!d.present) return false
   const tc = process.env.MODOKI_TOOLCHAIN_DIR
   if (!tc || !d.path || !d.path.startsWith(tc)) return false // not our install → don't touch it
+  // Both share the `npm-tools` tree with `ndarray-pixels`' own `sharp` (see PINNED_SHARP_OVERRIDE) —
+  // an install from BEFORE that pin existed is present and version-correct, yet still broken. Catch
+  // it here rather than only in a fresh install, so an existing broken machine self-heals the next
+  // time Build Support re-checks status, without the user needing to know to click "Reinstall".
+  if ((id === 'gltf-transform-cli' || id === 'gltfpack') && npmToolsSharpOverrideMissing(tc)) return true
+  const pin = PINNED_TOOL_VERSIONS[id]
+  if (!pin || !d.version) return false
   return !versionMatchesPin(d.version, pin)
 }
 
@@ -1458,8 +1537,23 @@ async function npmToolsInstall(toolchainDir: string, specPkg: string, log: (line
   const dir = npmToolsDir(toolchainDir)
   fs.mkdirSync(dir, { recursive: true })
   const pkgJson = path.join(dir, 'package.json')
-  if (!fs.existsSync(pkgJson)) {
-    fs.writeFileSync(pkgJson, JSON.stringify({ name: 'modoki-toolchain-tools', private: true, version: '0.0.0' }, null, 2) + '\n')
+  // `npm install <pkg>` rewrites `dependencies` into this file on every call (npm's default
+  // save-on-install), so comparing the whole file would wipe+reinstall on EVERY tool install,
+  // forever. Only `overrides.sharp` is our concern — read just that, and preserve everything else
+  // npm has already written (including `dependencies`) when patching it in.
+  const plan = planSharpOverride(fs.existsSync(pkgJson) ? fs.readFileSync(pkgJson, 'utf8') : null)
+  if (plan.action === 'unreadable') {
+    log(`WARNING: ${pkgJson} is not valid JSON — leaving it untouched. npm will report the parse `
+      + `error; delete the file to let the toolchain recreate it (this also reinstalls its tools).`)
+  }
+  if (plan.action === 'absent' || plan.action === 'patch') {
+    fs.writeFileSync(pkgJson, JSON.stringify(plan.pkg, null, 2) + '\n')
+    // The override only takes effect on a tree npm re-resolves from scratch — an existing
+    // node_modules already has the conflicting nested sharp copy laid out, and a plain `npm install`
+    // is not guaranteed to restructure it. Force a clean re-resolve, same as the self-heal path
+    // below for a damaged tree.
+    forceRemoveDir(path.join(dir, 'node_modules'))
+    try { fs.rmSync(path.join(dir, 'package-lock.json'), { force: true }) } catch { /* best-effort */ }
   }
   const spec = npmSpawnSpec()
   log(`Installing ${specPkg}…`)

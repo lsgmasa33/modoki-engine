@@ -17,7 +17,26 @@ import { perfCoreWorkers } from './testWorkers'
 // npm root + node_modules stay at the repo root (Capacitor needs them there), so
 // build output goes back to <repo>/dist and the asset scanner's projectRoot is
 // the repo root (engine/'s parent) — see the plugin's configResolved.
-const engineDir = path.dirname(fileURLToPath(import.meta.url))
+// #326: the PACKAGED editor loads an esbuild-bundled CJS copy of this file (see
+// `engine/scripts/build-web.mjs`), because Vite's default `bundle` config loader writes
+// its compiled config to `node_modules/.vite-temp` — which, in a packaged app, is INSIDE
+// the signed `.app` and breaks its code signature. The CJS branch of
+// `loadConfigFromBundledFile` compiles in memory and writes nothing. Under that bundle
+// `import.meta` is empty, so resolve self-location the way `font-instance.ts` and
+// `nodeProvision.ts` already do: prefer `import.meta.url`, fall back to CJS `__filename`.
+// The bundled copy is emitted into THIS directory, so `engineDir` is identical either way.
+// ⚠️ `import.meta.url` must appear here VERBATIM: Vite's own config bundler rewrites that exact
+// expression to a variable holding the ORIGINAL file's URL, and any paraphrase
+// (`(import.meta as {url?: string}).url`) slips past the define — the config then reports the
+// temp file's own location and the build dies on `engine/node_modules/.vite-temp/index.html`.
+const selfUrl: string | undefined =
+  typeof import.meta !== 'undefined' ? import.meta.url : undefined
+const selfPath = selfUrl
+  ? fileURLToPath(selfUrl)
+  : typeof __filename === 'string' && __filename
+    ? __filename
+    : path.join(process.cwd(), 'engine', 'vite.config.ts')
+const engineDir = path.dirname(selfPath)
 const repoRoot = path.resolve(engineDir, '..')
 
 
@@ -108,7 +127,7 @@ const msdfGeneratorDir = (() => {
 // entry reachable via `require.resolve` (peer dep of @capacitor-firebase/*, never
 // imported by bare name from game code) — see the resolution-failure log this emits
 // if that ever changes.
-const nativeSdkRequire = createRequire(import.meta.url)
+const nativeSdkRequire = createRequire(selfPath)
 const projectNativeSdkDeps: { name: string; resolvedPath: string }[] = (() => {
   const pkgPath = path.join(buildProjectRoot, 'packages', 'app-services', 'package.json')
   if (!fs.existsSync(pkgPath)) return []
