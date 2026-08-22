@@ -18,7 +18,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join, relative, sep } from 'node:path';
 
 const RUNTIME = join(__dirname, '../../packages/modoki/src/runtime');
 
@@ -39,6 +39,11 @@ const EXEMPT: Array<{ file: string; contains: string; why: string }> = [
       + 'answer different questions (see the module header). Its own tests cover the stamp.',
   },
 ];
+
+/** POSIX-normalised so the `EXEMPT` keys and the known-sites set below — both hand-authored with
+ *  `/` — still match on Windows, where `relative()` returns backslashes. This guard failed exactly
+ *  that way on `ci/main`; the class is documented in `docs/windows.md` § Paths. */
+const toPosix = (p: string) => p.split(sep).join('/');
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {
@@ -76,7 +81,7 @@ describe('material clones carry the derived-base stamp', () => {
   it('every material .clone() in runtime/ is markDerived-wrapped or allowlisted', () => {
     const unstamped: string[] = [];
     for (const file of walk(RUNTIME)) {
-      const rel = relative(RUNTIME, file);
+      const rel = toPosix(relative(RUNTIME, file));
       for (const { n, text } of codeLines(readFileSync(file, 'utf8'))) {
         if (!CLONE.test(text)) continue;
         if (text.includes('markDerived')) continue;
@@ -94,7 +99,7 @@ describe('material clones carry the derived-base stamp', () => {
     // the distinguishing check: the scan must still SEE the sites it is meant to police.
     const stamped: string[] = [];
     for (const file of walk(RUNTIME)) {
-      const rel = relative(RUNTIME, file);
+      const rel = toPosix(relative(RUNTIME, file));
       for (const { text } of codeLines(readFileSync(file, 'utf8'))) {
         if (CLONE.test(text) && text.includes('markDerived')) stamped.push(rel);
       }

@@ -93,6 +93,11 @@ load-bearing and commented as such).
     non-vacuity (`visited.length > 100`) *and* asserts its own allowlist is load-bearing. Without
     those, a path-keyed guard is simply switched off on Windows and says nothing about it. When you
     write one, pin non-vacuity in the same commit.
+  - A third instance landed 2026-08-21 (`materialCloneStamp`, from the #318 close-out): its
+    `EXEMPT` keys and its known-clone-sites `Set` were both hand-authored POSIX, so both assertions
+    failed on `ci/main` while the Mac gate stayed green. **The prescription above is what caught
+    it** — the negative assertion alone would have gone quietly green on Windows; the companion
+    "the scan is not vacuously passing" test is what made the breakage loud.
 
 ## Never shell out to a platform binary whose shape you assumed
 
