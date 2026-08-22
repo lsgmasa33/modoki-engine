@@ -28,12 +28,11 @@ import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
 import { gotoEmptyEditor } from './helpers';
-import { discoverProjects } from '../../scripts/projectRoots.mjs';
-import { pickHostProject, type HostProject } from './hostProject';
+import { pickHostProject } from './hostProject';
 
 // Host the generated fixtures inside a real project's asset root so the dev server serves
 // them. See hostProject.ts for the pick and why it can't throw.
-const HOST = pickHostProject(discoverProjects(process.cwd()) as HostProject[]);
+const HOST = pickHostProject();
 test.skip(!HOST, 'editor-unfocused-field-commits: this snapshot ships no project to host the fixtures');
 const ABS_DIR = HOST ? path.join(HOST.dir, 'runtime/assets/__e2e_fields__') : '';
 const URL_DIR = HOST ? `/${HOST.root}/${HOST.name}/assets/__e2e_fields__` : '';

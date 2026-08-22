@@ -19,12 +19,20 @@
  *  `test.skip` instead.
  */
 
+import { discoverProjects } from '../../scripts/projectRoots.mjs';
+
 export interface HostProject {
   root: string;
   name: string;
   dir: string;
 }
 
-export function pickHostProject(projects: HostProject[]): HostProject | null {
+/** Call with no arguments from a spec — the default does the discovery, so a spec never touches
+ *  `discoverProjects` itself and cannot reintroduce a module-scope throw. `projectPresencePredicate`
+ *  enforces that. The parameter exists so the project-less case (`[]`) is unit-testable on a clone
+ *  that always HAS projects — the only way to cover the path this file exists for. */
+export function pickHostProject(
+  projects: HostProject[] = discoverProjects(process.cwd()) as HostProject[],
+): HostProject | null {
   return projects.find((p) => p.root === 'games') ?? projects[0] ?? null;
 }

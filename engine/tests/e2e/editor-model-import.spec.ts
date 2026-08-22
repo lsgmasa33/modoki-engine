@@ -23,15 +23,14 @@ import path from 'path';
 import sharp from 'sharp';
 import { gotoEmptyEditor } from './helpers';
 import { makeTestGlb } from '../plugins/fixtures/makeTestGlb';
-import { discoverProjects } from '../../scripts/projectRoots.mjs';
-import { pickHostProject, type HostProject } from './hostProject';
+import { pickHostProject } from './hostProject';
 
 // The GLB is GENERATED below, so this spec needs only *a* served project asset root — never
 // 3d-test's content. It used to hardcode `games/3d-test`, which meant it could not run anywhere
 // games/ is absent (the public OSS snapshot), so pick a host project at runtime instead: a
 // `<root>/<name>/runtime/assets` dir maps to the URL `/<root>/<name>/assets` (vite-asset-scanner).
 // See hostProject.ts for the pick and why it can't throw.
-const HOST = pickHostProject(discoverProjects(process.cwd()) as HostProject[]);
+const HOST = pickHostProject();
 test.skip(!HOST, 'editor-model-import: this snapshot ships no project to host the generated GLB');
 const ABS_DIR = HOST ? path.join(HOST.dir, 'runtime/assets/__e2e_model__') : '';
 const URL_GLB = HOST ? `/${HOST.root}/${HOST.name}/assets/__e2e_model__/test-model.glb` : '';

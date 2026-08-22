@@ -22,8 +22,7 @@ import { test, expect } from '@playwright/test';
 import fs from 'fs';
 import path from 'path';
 import { gotoEditorWithScene, idByName, traitField } from './helpers';
-import { discoverProjects } from '../../scripts/projectRoots.mjs';
-import { pickHostProject, type HostProject } from './hostProject';
+import { pickHostProject } from './hostProject';
 
 const SCENE = '/tests/e2e/fixtures/e2e-particle.scene.json';
 // Minted once for this fixture — NOT the confetti GUID. Kept stable so the scene
@@ -32,7 +31,7 @@ const PARTICLE_GUID = 'e78aaf22-bd6b-4eec-86a1-34fe9863566a';
 
 // A `<root>/<name>/runtime/assets` dir maps to the URL `/<root>/<name>/assets`
 // (vite-asset-scanner). See hostProject.ts for the pick and why it can't throw.
-const HOST = pickHostProject(discoverProjects(process.cwd()) as HostProject[]);
+const HOST = pickHostProject();
 test.skip(!HOST, 'editor-particles: this snapshot ships no project to host the generated particle asset');
 const ABS_DIR = HOST ? path.join(HOST.dir, 'runtime/assets/__e2e_particle__') : '';
 
