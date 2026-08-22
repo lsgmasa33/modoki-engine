@@ -398,9 +398,18 @@ function SceneBreadcrumb({ onExitPrefab }: { onExitPrefab: () => void }) {
 
 export default function SceneView() {
   const hmrEpoch = useHmrEpoch();
-  // Mode lives in the editor store (init from localStorage there) so it's
-  // agent-drivable (set-scene-view-mode) — the <select> below is native and can't
-  // be operated by trusted input. The setter persists to localStorage + marks 2D dirty.
+  // Mode lives in the editor store (init from localStorage there) so it's agent-drivable
+  // (`set-scene-view-mode` / `modoki_scene_view_mode`). The setter persists to localStorage +
+  // marks 2D dirty.
+  //
+  // The <select> below carries `data-ui-id="sceneView.toolbar.mode"` so it can at least be
+  // ADDRESSED — located, and its committed `value` asserted after a mode change. That is the
+  // honest limit of what a hook buys here: a NATIVE select's option list is rendered by the OS,
+  // not the page, so neither a synthetic click nor ArrowDown can open or commit it (verified with
+  // focus confirmed on the element). The id is therefore for verification, not for driving; the
+  // programmatic op above remains the only way to CHANGE the mode. Swapping this for a custom
+  // DOM dropdown is what would make the gesture itself testable, and is deliberately not done
+  // here — see the editor-surface convention in CLAUDE.md before changing it.
   const mode = useEditorStore((s) => s.sceneViewMode);
   const setMode = useEditorStore((s) => s.setSceneViewMode);
   const modeRef = useRef(mode);
@@ -650,7 +659,7 @@ export default function SceneView() {
       }}>
         <SceneBreadcrumb onExitPrefab={exitPrefabEdit} />
         <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
-        <select value={mode} onChange={(e) => setMode(e.target.value as '3d' | 'ui')} style={{
+        <select data-ui-id="sceneView.toolbar.mode" value={mode} onChange={(e) => setMode(e.target.value as '3d' | 'ui')} style={{
           background: '#1e1e30', color: '#ccc', border: '1px solid #555', borderRadius: 3,
           padding: '2px 6px', fontSize: '12px', fontFamily: 'monospace', fontWeight: 'bold', cursor: 'pointer',
         }}>

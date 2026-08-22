@@ -2263,6 +2263,18 @@ async function describeUnresolvedAgainstLiveWorld(
       const id = crypto.randomUUID();
       const data = defaultAssetData(type) as Record<string, unknown>;
       data.id = id;
+      // Fingerprint our own write so the watcher skips it — the same guard /api/asset-write,
+      // /api/write-file and the rename route already carry, and the ONE write route that never
+      // had it. Without this the creation's own change event comes back a debounce later, is read
+      // as an EXTERNAL edit, and `dropParkedWriteFor` (agentBridge.ts) discards whatever was
+      // parked for that path: the live-cache entry AND the `dirtyAssetPaths` entry both vanish, so
+      // a later `save_all` writes nothing and reports no error. Silent data loss in the authoring
+      // path — an edit made in the second after create_asset, gone. Measured ~500ms end-to-end.
+      // Fingerprint the bytes `writeJsonAtomic` will actually write (JSON.stringify(x, null, 2),
+      // no trailing newline); a mismatch here fails OPEN and silently restores the bug.
+      // Unlike a file-direct `write_asset`, suppressing this event is safe: the file is brand new,
+      // so there is no stale cached def the invalidation needs to clear.
+      ctx.markEditorWrite(abs, crypto.createHash('sha1').update(Buffer.from(JSON.stringify(data, null, 2))).digest('hex'));
       writeJsonAtomic(abs, data);
       ctx.rebuildManifest(); // register the new asset's GUID
       return json({ ok: true, saved: true, path: assetPath, id });
@@ -3282,7 +3294,25 @@ function relayFailureStatus(e: unknown): number {
   // fix, in the opposite direction. (`'editor window closed'` was already covered by `window
   // closed`.) A teardown is retryable once the renderer is back; a refusal is not, so telling the
   // two apart changes what the agent does next.
-  const transport = /no (editor )?renderer|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|project changed|window (is )?closed|destroyed|websocket not ready/i.test(msg);
+  // ⚠️ **`destroyed` WAS A BARE ALTERNATIVE, AND IT MATCHED THE REFUSALS THIS FUNCTION EXISTS TO
+  // PROTECT** (bug BHdZZ52JIu4afJmoX7O6). It is here for Electron's own `Object has been
+  // destroyed`, thrown when a BrowserWindow/webContents dies mid-request — a genuine transport
+  // failure. But `load-scene`'s unsaved-work refusal reads "…the scene edits would be DESTROYED
+  // (gone from the world, the file, and the undo stack)", so an op answering clearly and correctly
+  // was reported as `HTTP 504 / NOT_AVAILABLE_HERE`: "this editor cannot do that", when the truth
+  // was "save first, or pass discardUnsaved". That is precisely the could-not-look vs it-said-no
+  // inversion described above, produced BY the fix for it.
+  //
+  // Reproduced 2026-08-22 against a live editor: create_entity, then load_scene with no
+  // discardUnsaved → 504 with the correct message. The wording that tripped it is the WORD
+  // "destroyed" in ordinary prose, so the lesson generalises: every alternative here must name its
+  // SUBJECT. A bare verb will eventually appear in an op's own explanation of what it refuses to
+  // do — that is the vocabulary these messages are written in.
+  // ⚠️ `\b` around the subject group, and it is NOT decoration: without it `view` matches inside
+  // `preview`, `overview` and `review`, so "…the PREVIEW was destroyed…" would be misclassified as
+  // transport — this fix reintroducing its own bug one word smaller. Caught in review, before it
+  // could bite.
+  const transport = /no (editor )?renderer|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|project changed|window (is )?closed|object has been destroyed|\b(renderer|window|webcontents|view)\b (has been |was |is )?destroyed|websocket not ready/i.test(msg);
   return transport ? 504 : 400;
 }
 

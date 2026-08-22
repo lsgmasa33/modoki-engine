@@ -1850,16 +1850,34 @@ get backwards:
   whatever paces the frame — the workload, the engine's own cap, or the display. Only the first is
   something a tier can change.
 
-  **The rule:** demotion additionally requires `cpuMs.median >= budgetMs * DEMOTION_CPU_SHARE`
-  (0.7). If the engine's own work fits comfortably inside the budget there is nothing a lower tier
+  **The rule:** demotion additionally requires `cpuMs.median >= budgetMs * DEMOTION_CPU_SHARE`.
+  If the engine's own work fits comfortably inside the budget there is nothing a lower tier
   could give back — every knob it turns (DPR, shadows, IBL, texture size) buys time the engine is
   not spending.
 
   - **The bar scales with the target fps, because it is a ratio of the BUDGET** and the budget is
-    derived from the frame cap in force (`frameCapIntervalMs * 1.2`). At `targetFps: 60` it asks for
-    14 ms of engine CPU; at `targetFps: 30`, 28 ms. The same 20 ms of CPU is therefore full at 60
-    and not full at 30 — correct, since at 30 that engine still has half its frame left. (owner,
-    2026-08-20: *"if the current target fps is 30, we should increase the threshold"*.)
+    derived from the frame cap in force (`frameCapIntervalMs * BUDGET_SLACK`). The fleet runs
+    exactly two targets, so the bar is **16.67 ms of engine CPU at `targetFps: 60` and 33.3 ms at
+    `targetFps: 30`**. The same 20 ms of CPU is therefore full at 60 and not full at 30 — correct,
+    since at 30 that engine still has half its frame left. (owner, 2026-08-20: *"if the current
+    target fps is 30, we should increase the threshold"*.)
+
+  - ⚠️ **The share was `0.7` until 2026-08-22, which put the bar BELOW the target frame** —
+    `target * 1.2 * 0.7` is `target * 0.84`, so a device comfortably inside the frame it was aiming
+    for could still be judged "full". A Galaxy S22 whose panel had dropped to 24 Hz cleared the
+    14.0 ms bar with 14.3 ms of CPU and demoted itself `high → mid → low` while using a third of
+    the 41.7 ms frame the panel was giving it — the same defect as the table above, one rung
+    further in. It is now `1 / BUDGET_SLACK`, making the bar the target frame time itself: *demote
+    only when our own CPU work alone reaches the frame we are aiming for.* The separating window is
+    wide (any share in 0.73…1.2 keeps the S22 and still demotes a Y6-class device at 48 ms of a
+    33.3 ms target), and both ends are pinned by tests in `qualityTier.test.ts`. The lower bound
+    comes from the WORSE measured S22 sample (14.6 ms of a 16.67 ms target — the value the test
+    uses); the gentler 14.3 ms reading would say 0.715, which no test defends. Bug
+    `IoP332SFwkdFY2PpJzwq`.
+
+  - **Uncapped (`targetFps: 0`) is the exception to "the bar is the target frame":** `budgetMs`
+    falls back to `BUDGET_30FPS_MS` rather than `cap * BUDGET_SLACK`, so the bar lands at 27.8 ms —
+    1/1.2 of the 30 fps floor, not a frame time anyone targeted.
   - **The demotion `reason` now carries the CPU share** — `median frame 41.6ms over the 20.0ms
     budget for 2s (engine cpu 8.4ms of it)`. This is the one surface that explains a surprising
     tier, and for months it asserted "slow device" by omission while the engine idled.

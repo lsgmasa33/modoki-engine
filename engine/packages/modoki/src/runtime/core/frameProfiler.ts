@@ -44,6 +44,20 @@ export const PROFILE_WINDOW_FRAMES = 120;
  *  dropped. Without this one backgrounded tab poisons every percentile in the window. */
 const MAX_PLAUSIBLE_FRAME_MS = 1000;
 
+/** How far past the target frame time a frame may sit before it counts as OVER BUDGET.
+ *
+ *  `budgetMs` is the target frame interval times this, so at `targetFps: 60` the budget is 20 ms
+ *  rather than 16.67 — a little slack, because a frame landing a hair late is not a quality
+ *  problem.
+ *
+ *  Exported because `qualityTier` has to divide it back OUT: the demotion bar is expressed as a
+ *  share of `budgetMs`, but the question it asks is about the TARGET FRAME TIME, and re-deriving
+ *  the target means undoing this slack. A second literal `1.2` over there would be a code
+ *  constant shadowing this one, which is exactly the drift the single-source-of-truth rule
+ *  exists to prevent. NOT the same number as `isVsyncBound`'s 1.2 — that one is a tolerance for
+ *  recognising a refresh interval, and the two are free to move independently. */
+export const BUDGET_SLACK = 1.2;
+
 export interface FrameStat {
   median: number;
   p95: number;
@@ -222,7 +236,7 @@ export function getFrameProfile(): FrameProfile {
   const restMs = summarize(frames.map((f, i) => Math.max(0, f - cpus[i])));
   // ONE expression for the threshold, published as `budgetMs` and compared against below — so
   // "what counts as over budget" and "what we say it was" cannot disagree.
-  const budgetMs = frameCapIntervalMs > 0 ? frameCapIntervalMs * 1.2 : BUDGET_30FPS_MS;
+  const budgetMs = frameCapIntervalMs > 0 ? frameCapIntervalMs * BUDGET_SLACK : BUDGET_30FPS_MS;
   return {
     samples: filled,
     frameMs,

@@ -238,6 +238,47 @@ bundles and calls `engine/toolchain`'s own `detect()` rather than probing for it
 second probe is precisely what this module was consolidated to remove (#159). Full detail:
 [editor-toolchain.md](./editor-toolchain.md).
 
+### From an agent: `modoki_build` IS that menu item
+
+An agent does not need the CLI recipes below. **`modoki_build {platform}`** drives the same
+`/api/build` the menu does — same toolchain resolution, same per-step cwd, same one-at-a-time slot
+— and consumes the SSE stream to completion, returning `{ok, log}` or the failure tail. For a
+native platform it also **installs and launches on the attached device**, so a successful call
+leaves the app running rather than leaving you an artifact to deploy by hand.
+
+```
+modoki_build {platform: 'android'}   // → gradle, install, launch
+modoki_build {platform: 'ios'}       // → xcodebuild, install, launch
+modoki_build {platform: 'web'}       // → games/<id>/dist
+modoki_build {platform: 'playable'}  // → games/<id>/ads/index.html
+```
+
+Prefer it over shelling out. The CLI recipes exist for a human at a terminal and for the cases the
+tool cannot express; reaching for them from an agent means re-deriving cwd, toolchain env, and the
+build slot by hand, which is where the drift starts.
+
+Three things that bite:
+
+- **It is HEAVY** — a native build runs gradle/xcodebuild and installs. Minutes, not seconds. Slow
+  is not hung; do not kill it and retry.
+- **`force` here is the NON-destructive one.** `modoki_build {force:true}` proceeds despite unsaved
+  live-world edits; the artifact is built from the FILES, so your unsaved work is left alone and
+  merely not included. This is why the build family kept the name `force` while the world-swapping
+  tools (`load_scene`, `prefab`, `new_scene`) renamed theirs to `discardUnsaved` — they DESTROY
+  that work. Prefer `modoki_save_all` first and pass nothing.
+- **The project must be OPEN in the editor**, and for a device build that open is load-bearing
+  beyond convenience: `healNativeConfig` runs on open and is what actually registers
+  `GameDebugPlugin` and the local-network keys after a `build.debugBuild` change. Set the flag →
+  reopen → *then* build. Build before the reopen and you get an app with no debug bridge, which
+  presents as a lease handshake failure and reads like a network fault. See
+  [qa/README.md](../qa/README.md) § "Device cases".
+
+⚠️ **Several phones of the same platform attached? The install target is whichever device this
+clone has CLAIMED**, and a raw `adb`/`devicectl` command against an unclaimed one is refused by the
+`PreToolUse` hook (#285) naming the holder. Claim before building (`npm run device:claim <serial>`,
+or connect it in the editor), and release the moment you are done — a claim is machine-wide and
+locks that phone out of every other clone and out of the owner's own hands.
+
 ### One build at a time (#173)
 
 **Three routes compile into the same `<project>/dist`, so they share ONE slot** — not one lock each.

@@ -84,9 +84,20 @@ export default function CleanupAssetsDialog() {
     setDeleting(true);
     setError(null);
     try {
-      // Trash each orphan AND its .meta.json sidecar (missing ones are skipped
-      // server-side, so binaries-with-sidecar and JSON-assets-without both work).
-      const withSidecars = paths.flatMap((p) => [p, `${p}.meta.json`]);
+      // Trash each orphan AND BOTH its sidecars (missing ones are skipped server-side, so
+      // binaries-with-sidecar and JSON-assets-without both work).
+      // ⚠️ `.meta.local.json` is not optional here. It was omitted until 2026-08-22, so every
+      // cleanup left the local sidecar orphaned on disk — the file the scan had just called
+      // unreachable kept a companion nothing would ever collect again. `sidecarsFor()`
+      // (assetOps.ts) has always named both, and `assetUndo.ts` deletes both; this route was the
+      // one that hand-rolled its own list and drifted from them.
+      // Deliberately NOT routed through `deletionPathsFor()` despite it owning this rule: that
+      // helper skips sidecars for text assets (`isTextAsset`), and real `.json` assets DO carry a
+      // `.meta.json` here (games/court/.../levels/index.json, games/skin-test/.../dark-assassin.atlas.json),
+      // so adopting it would strand those instead — trading one orphan class for another.
+      // Asking for a path that is not there is free: the backend skips it and reports it in
+      // `missing` rather than failing.
+      const withSidecars = paths.flatMap((p) => [p, `${p}.meta.json`, `${p}.meta.local.json`]);
       const res = await backendPostJson('/api/delete-asset', { paths: withSidecars });
       const j = (await res.json()) as { ok?: boolean; error?: string };
       if (!res.ok || !j.ok) throw new Error(j.error || `delete failed (${res.status})`);

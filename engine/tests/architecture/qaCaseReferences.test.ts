@@ -325,15 +325,38 @@ export function isUnder(path: string, entry: string): boolean {
 export function knownUiIds(sources: string[]): { ids: Set<string>; prefixes: string[] } {
   const ids = new Set<string>();
   const joined = sources.join('\n');
+  // `\s*` around the `=`/`:` in all four, for the same reason as the prefix regex below: a JSX
+  // prop is written tight (`uiId="a.b"`), but the identical id assigned to a local or a plain
+  // object property is conventionally spaced (`const uiId = "a.b"`). Only the tight spelling was
+  // matched, so the spaced one was invisible and any case citing such an id came back unknown.
+  // Zero editor sources use the spaced LITERAL form today (checked 2026-08-22), so this half is
+  // latent rather than a live fix — but the blind spot was identical in all five regexes and
+  // fixing only the one that happened to bite would leave the same trap for the next id.
   const literal = [
-    /data-ui-id=["']([\w.:-]+)["']/g,
-    /\buiId=["']([\w.:-]+)["']/g,
-    /\bdataUiId=["']([\w.:-]+)["']/g,
-    /\buiId:\s*["']([\w.:-]+)["']/g,
+    /data-ui-id\s*=\s*["']([\w.:-]+)["']/g,
+    /\buiId\s*=\s*["']([\w.:-]+)["']/g,
+    /\bdataUiId\s*=\s*["']([\w.:-]+)["']/g,
+    /\buiId\s*:\s*["']([\w.:-]+)["']/g,
   ];
   for (const re of literal) for (const m of joined.matchAll(re)) ids.add(m[1]);
   // A template-built id (`hierarchy.folder.${name}`) can only be checked to its static prefix.
-  const prefixes = [...joined.matchAll(/(?:data-ui-id|uiId|dataUiId)[=:]\s*\{?`([\w.:-]*)\$/g)]
+  // `\s*` BEFORE the `=` as well as after it: a JSX prop is written `uiId={`a.${b}`}` with no
+  // space, but the same id is often built in a local first — `const uiId = `projectSettings.${
+  // field.key}`;` (ProjectSettingsDialog.tsx:55) — and without the leading `\s*` that whole
+  // family of ids is invisible here. The symptom is a case correctly citing a selector that
+  // demonstrably resolves in the live DOM being reported as unknown, which is the false alarm
+  // qa/README.md warns turns a guard into one people disable. Verified 2026-08-21: every
+  // `projectSettings.<section>.<key>` field id exists at runtime.
+  // ⚠️ KNOWN LIMIT, deliberately not "fixed": an id whose template STARTS with its
+  // interpolation — `uiId={uiId && `${uiId}.min`}` (ParticleEditor.tsx, 5 occurrences) — has no
+  // static prefix at all. Widening this regex to admit the `ident &&` guard does not help: the
+  // capture group then matches the empty string and `.filter(Boolean)` drops it anyway, because
+  // the prefix genuinely comes from a parent prop and is unknowable here. Those ids are covered
+  // only if a PARENT registers the prefix through one of the forms above. No case cites one
+  // today (checked 2026-08-22), so this is latent, not a live false alarm — but if a future
+  // particle-editor case cites e.g. `<prefix>.min` and is reported unknown, this is why, and the
+  // fix is to make the parent's id statically visible rather than to loosen the matcher here.
+  const prefixes = [...joined.matchAll(/(?:data-ui-id|uiId|dataUiId)\s*[=:]\s*\{?`([\w.:-]*)\$/g)]
     .map((m) => m[1])
     .filter(Boolean);
   return { ids, prefixes };
@@ -475,6 +498,19 @@ describe('qa case guard helpers', () => {
     it('exposes the static prefix of a template-built id', () => {
       const { prefixes } = knownUiIds(['<div data-ui-id={`hierarchy.folder.${name}`} />']);
       expect(prefixes).toEqual(['hierarchy.folder.']);
+    });
+
+    it('sees a template id built in a LOCAL first, not only the JSX prop form', () => {
+      // `ProjectSettingsDialog.tsx:55` writes it as a local, with spaces around the `=`:
+      //   const uiId = `projectSettings.${field.key}`;
+      // The prefix regex required no space BEFORE the `=`, so that whole family was invisible
+      // and every `projectSettings.<section>.<key>` a case cited came back unknown — a false
+      // alarm on ids that demonstrably resolve in the live DOM, which is exactly how
+      // qa/README.md says a guard gets disabled. Both spellings must be seen.
+      expect(knownUiIds(['const uiId = `projectSettings.${field.key}`;']).prefixes)
+        .toEqual(['projectSettings.']);
+      expect(knownUiIds(['<Field uiId={`projectSettings.${k}`} />']).prefixes)
+        .toEqual(['projectSettings.']);
     });
   });
 

@@ -845,8 +845,9 @@ describe('evaluateTierChange — demotion', () => {
     // surprising tier. Restore the literal and this fails; nothing else does, which is the point —
     // the DECISION was right all along, only the account of it was wrong.
     // `cpuMs` is 18 rather than the original 12 because a demotion now requires the engine to be
-    // FILLING the frame (`frameIsFull`) — 12 ms is below 70% of this fixture's 20 ms budget, so the
-    // old value stopped reaching the branch whose REASON STRING this test is about.
+    // FILLING the frame (`frameIsFull`) — 12 ms is below the bar for this fixture's 20 ms budget
+    // (16.67 ms since 2026-08-22; it was 14 ms when this comment was written), so the old value
+    // stopped reaching the branch whose REASON STRING this test is about. 18 clears either.
     const capped: FrameProfile = { ...profile({ frameMs: 22, cpuMs: 18 }), overBudget: true, budgetMs: 20 };
     const s = freshTierChangeState();
     const a = evaluateTierChange('high', capped, s, 1000, UNCAPPED, T60);
@@ -1704,5 +1705,76 @@ describe('⭐ the cpu-limited licence, END TO END through the builder (#205)', (
 
     expect(resolved.source).toBe('measured');
     expect(promotionCeiling(resolved)).toBe('high');
+  });
+});
+
+/**
+ * THE DEMOTION BAR IS THE TARGET FRAME, NOT 84% OF IT (bug IoP332SFwkdFY2PpJzwq).
+ *
+ * `frameIsFull` asks whether the engine's OWN work is why a frame ran long — "a frame we are not
+ * filling is not a frame we can relieve" (owner, 2026-08-20). It judges `cpuMs` against
+ * `budgetMs * DEMOTION_CPU_SHARE`, and with the share at 0.7 that bar was `target * 1.2 * 0.7`
+ * = **0.84 of the target frame** — i.e. BELOW the frame we are trying to hit, so a device
+ * comfortably inside its target could still be called full.
+ *
+ * Measured on a Galaxy S22 whose panel had dropped to 24 Hz: target 60 fps → a 14.0 ms bar,
+ * 14.3 ms of CPU, cleared by 0.3 ms — and the fastest phone in the fleet demoted itself
+ * high → mid → low while using a third of the 41.7 ms frame the panel was giving it. The other
+ * 27.4 ms was the panel's, not ours.
+ *
+ * Nothing in this file failed when the share was raised, which is precisely why it shipped: the
+ * demotion bar was not pinned to a device anywhere. These two cases pin it from BOTH sides, so a
+ * future tweak that reopens either failure lands here instead of on a phone.
+ */
+describe('evaluateTierChange — the demotion bar against real measured devices', () => {
+  /** As `profile()` above, but with the real `budgetMs` a given targetFps produces. */
+  const deviceProfile = (o: { frameMs: number; cpuMs: number; budgetMs: number }): FrameProfile => {
+    const stat = (v: number) => ({ median: v, p95: v, min: v, max: v });
+    return {
+      samples: 60,
+      frameMs: stat(o.frameMs), cpuMs: stat(o.cpuMs),
+      restMs: stat(Math.max(0, o.frameMs - o.cpuMs)),
+      fps: 1000 / o.frameMs,
+      vsyncBound: false,
+      overBudget: o.frameMs > o.budgetMs,
+      budgetMs: o.budgetMs,
+      discontinuities: 0, worstStallMs: 0,
+    } as FrameProfile;
+  };
+
+  /** Hold the profile past DEMOTION_HOLD_MS, the way a real interacting stretch would. */
+  const settle = (tier: QualityTier, p: FrameProfile) => {
+    const a = evaluateTierChange(tier, p, freshTierChangeState(), 1000, UNCAPPED, T60);
+    return evaluateTierChange(tier, p, a.state, 1000 + DEMOTION_HOLD_MS * 2, UNCAPPED, T60)
+      .decision.action;
+  };
+
+  it('does NOT demote an S22 whose 24 Hz panel — not its CPU — is pacing the frame', () => {
+    // target 60fps → budgetMs 20. The frame is long (41.7ms) and genuinely over budget, but the
+    // CPU does not reach the 16.67ms frame we are aiming for, so the overage is not ours.
+    // 14.6 is the WORSE of the two samples the device run captured (high→mid fired at 14.6,
+    // mid→low at 14.3) — pin the tighter one, or the test passes a case the phone never hit.
+    // Margin to the bar is 2.07ms.
+    const s22 = deviceProfile({ frameMs: 1000 / 24, cpuMs: 14.6, budgetMs: 20 });
+    expect(s22.overBudget).toBe(true); // the precondition really is met — this is not a vacuous pass
+    expect(settle('high', s22)).not.toBe('demote');
+  });
+
+  it('DOES still demote a Y6-class device whose own CPU overruns the target frame', () => {
+    // target 30fps → budgetMs 40. 48ms of CPU exceeds the 33.3ms target outright: this one is ours,
+    // and it is the device the whole tier system exists for. The fix must not buy the S22's case
+    // by giving up this one.
+    const y6 = deviceProfile({ frameMs: 83, cpuMs: 48, budgetMs: 40 });
+    expect(settle('high', y6)).toBe('demote');
+  });
+
+  it('keeps the promote and demote bars from overlapping at both fleet targets', () => {
+    // The fleet runs exactly two targets, 30 and 60 (verified across every project.config.json).
+    // Raising the demotion bar widens this gap rather than closing it, but assert it rather than
+    // reason about it: an overlap is the worst outcome available, since `demoted` is sticky and a
+    // device would promote, immediately re-qualify to demote, and land BELOW where it started.
+    for (const targetMs of [T60, T30]) {
+      expect(targetMs * PROMOTION_TARGET_SHARE).toBeLessThan((targetMs * 1.2) * DEMOTION_CPU_SHARE);
+    }
   });
 });

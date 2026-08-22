@@ -19,6 +19,9 @@ function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
     firstRootDir: () => null,
     getManifest: () => ({ version: 2, assets: [] }) as Manifest,
     rebuildManifest: () => ({ version: 2, assets: [] }) as Manifest,
+    // Required by BackendContext: every write route fingerprints its own write so the
+    // watcher skips it. Absent here, /api/create-asset threw once its guard was added.
+    markEditorWrite: () => {},
     requestBrowser: async () => ({}),
     getSchema: () => undefined,
     invalidateProjectConfig: () => {},
@@ -382,6 +385,9 @@ describe('/api/import-file (F11: an unrecognized type is not a phantom success)'
       absToAssetUrl: (p: string) => p,      // dest abs → a "url"
       getManifest: () => ({ version: 2, assets: [] }) as Manifest,       // scanner registered nothing
       rebuildManifest: () => ({ version: 2, assets: [] }) as Manifest,
+      // Required by BackendContext: every write route fingerprints its own write so the
+      // watcher skips it. Absent here, /api/create-asset threw once its guard was added.
+      markEditorWrite: () => {},
     });
     const r = (await post('/api/import-file', { srcPath: src, destFolder }, ctx)) as { status?: number; body: { ok: boolean; imported: boolean; error?: string } };
     expect(r.status).toBe(422);
@@ -1267,5 +1273,67 @@ describe('render-sequence refuses a STOPPED editor at the ROUTE (review follow-u
       { status?: number; body: { paths?: unknown[] } };
     expect(r.status ?? 200).toBe(200);
     expect(r.body.paths).toHaveLength(2);
+  });
+});
+
+/**
+ * REFUSAL vs TRANSPORT — the status an agent reads decides what it does next.
+ *
+ * `/api/editor-action` classifies a relay failure: a TRANSPORT failure (the renderer died, the
+ * window closed, the socket was not ready) is a 504 → `NOT_AVAILABLE_HERE`, meaning "this editor
+ * could not be asked". An error the OP raised is the op answering, so it is a 400 →
+ * `REFUSED_BY_OP`, meaning "it said no, and the message tells you what to do". Confusing the two
+ * sends an agent to debug a wedged editor instead of calling `save_all`.
+ *
+ * The classifier matches the error MESSAGE, and it used to carry a bare `destroyed` alternative
+ * for Electron's `Object has been destroyed`. `load-scene`'s unsaved-work refusal explains itself
+ * with "…the scene edits would be DESTROYED (gone from the world, the file, and the undo stack)"
+ * — so a perfectly clear refusal came back as HTTP 504 / NOT_AVAILABLE_HERE. Reproduced against a
+ * live editor on 2026-08-22 (create_entity, then load_scene with no discardUnsaved), which is the
+ * bug BHdZZ52JIu4afJmoX7O6.
+ *
+ * These pin BOTH directions, because tightening the pattern could just as easily have broken
+ * transport detection — and a transport failure reported as a refusal is the same inversion
+ * mirrored.
+ */
+describe('/api/editor-action — a refusal is not a transport failure', () => {
+  const failing = (message: string) =>
+    makeCtx({ requestBrowser: async () => { throw new Error(message); } });
+
+  it('400s a refusal whose own wording contains "destroyed"', async () => {
+    const msg = 'load-scene: the editor has UNSAVED work — LIVE-WORLD scene edits. load-scene swaps '
+      + 'the world, so the scene edits would be destroyed (gone from the world, the file, and the '
+      + 'undo stack). Run modoki_save_all first, or pass discardUnsaved:true.';
+    const r = (await post('/api/editor-action', { action: 'load-scene', path: '/assets/scenes/main.scene.json' }, failing(msg))) as { status?: number };
+    expect(r.status).toBe(400);
+  });
+
+  it('still 504s Electron\'s real "Object has been destroyed"', async () => {
+    const r = (await post('/api/editor-action', { action: 'play' }, failing('Object has been destroyed'))) as { status?: number };
+    expect(r.status).toBe(504);
+  });
+
+  it('does not treat "preview"/"review" as the word "view"', async () => {
+    // `view` is a substring of preview/overview/review, so an unanchored alternative would make
+    // "the preview was destroyed" a transport failure — this fix reintroducing its own bug one
+    // word smaller. Caught in close-out review rather than by a user.
+    for (const msg of ['pose-clip: the preview was destroyed by a scene reload',
+                       'the overview was destroyed', 'the review was destroyed']) {
+      const r = (await post('/api/editor-action', { action: 'play' }, failing(msg))) as { status?: number };
+      expect(r.status, msg).toBe(400);
+    }
+    // ...while the real subject still classifies as transport.
+    for (const msg of ['the editor window has been destroyed', 'the editor webContents has been destroyed']) {
+      const r = (await post('/api/editor-action', { action: 'play' }, failing(msg))) as { status?: number };
+      expect(r.status, msg).toBe(504);
+    }
+  });
+
+  it('still 504s a renderer that went away mid-request', async () => {
+    for (const msg of ['no editor renderer', 'timed out waiting for the renderer', 'renderer went away',
+                       'project changed — renderer reloading', 'editor window closed', 'dev server websocket not ready']) {
+      const r = (await post('/api/editor-action', { action: 'play' }, failing(msg))) as { status?: number };
+      expect(r.status, msg).toBe(504);
+    }
   });
 });

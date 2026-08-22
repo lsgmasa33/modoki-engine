@@ -61,7 +61,7 @@
  *  {@link promotionCeiling}: once the boot probe measures a device, a CPU-only inference does not
  *  get to overrule the measurement. */
 
-import { type FrameProfile } from '../core/frameProfiler';
+import { BUDGET_SLACK, type FrameProfile } from '../core/frameProfiler';
 import { probeVerdictStore } from '../core/probeVerdictStore';
 import { probeFingerprint, classifyMedianOf, type DeviceClass, type ProbeVerdict } from './rampProbe';
 // The GPU-identity layer (#210). Its import back to here is TYPE-ONLY (`QualityTier`), so it is
@@ -1072,8 +1072,39 @@ export const DEMOTION_HOLD_MS = 2_000;
 /** Samples below which a profile is not worth judging. */
 export const MIN_SAMPLES_TO_JUDGE = 30;
 /** Fraction of the BUDGET the engine's own main-thread work must occupy before a long frame
- *  counts as evidence the device needs relief. See {@link frameIsFull}. */
-export const DEMOTION_CPU_SHARE = 0.7;
+ *  counts as evidence the device needs relief. See {@link frameIsFull}.
+ *
+ *  `1 / BUDGET_SLACK` makes the bar exactly the TARGET FRAME TIME whenever a frame cap is set —
+ *  `budgetMs` is that target times the slack, so dividing the slack back out lands on the target
+ *  itself. Read it as: **demote only when our own CPU work alone reaches the frame we are aiming
+ *  for.** The fleet runs exactly two targets, 30 and 60 fps, so in practice the bar is 33.3 ms or
+ *  16.67 ms.
+ *
+ *  ⚠️ UNCAPPED (`targetFps: 0`) is the one case where that reading does not
+ *  hold literally: `budgetMs` falls back to `BUDGET_30FPS_MS` rather than `cap * BUDGET_SLACK`,
+ *  so the bar lands at 27.8 ms — 1/1.2 of the 30 fps floor, not a frame time anybody targeted.
+ *  Still the right direction (it raises the bar from 23.3 ms, so an uncapped device also stops
+ *  demoting while it fits), but do not read the "equals the target frame" sentence as universal.
+ *
+ *  ⚠️ **It was `0.7` until 2026-08-22, and 0.7 of the budget is only 0.84 of the target** — a bar
+ *  BELOW the frame we are trying to hit, so a device comfortably inside its target could still be
+ *  called "full". On a Galaxy S22 whose panel had dropped to 24 Hz that is exactly what happened:
+ *  target 60 fps → 16.67 ms → a 14.0 ms bar, and 14.3 ms of measured CPU cleared it by 0.3 ms, so
+ *  the fastest phone in the fleet demoted itself `high → mid → low` while using a third of the
+ *  41.7 ms frame the panel was actually giving it (bug IoP332SFwkdFY2PpJzwq).
+ *
+ *  The separating window is wide, not a knife edge — anything in **0.73 … 1.2** keeps the S22 and
+ *  still demotes the Y6 2019 (48 ms of a 33.3 ms target, the device this whole system exists for).
+ *  The lower bound is derived from the WORSE measured S22 sample, 14.6 ms of a 16.67 ms target
+ *  (14.6/20), which is the one the regression test pins; the gentler 14.3 ms sample would say
+ *  0.715, and quoting that would claim more headroom than any test defends.
+ *  `1 / BUDGET_SLACK` ≈ 0.833 sits mid-window with **2.07 ms** of margin below and 14.7 ms above,
+ *  and unlike a tuned number it MEANS something.
+ *
+ *  Deliberately still CPU-only: no frame-time term, no display-rate term. `restMs` is GPU +
+ *  present + idle together and cannot be split (see frameProfiler), so CPU is the only per-frame
+ *  cost measured honestly — the accepted cost of that is spelled out on {@link frameIsFull}. */
+export const DEMOTION_CPU_SHARE = 1 / BUDGET_SLACK;
 
 export interface TierChangeState {
   /** When the current qualifying streak began, or 0 if not currently qualifying. */
