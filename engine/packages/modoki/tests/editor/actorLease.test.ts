@@ -16,7 +16,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   editorEmit, readEditorJournal, clearEditorJournal, withEditorActor,
-  openActorLease, closeActorLease, _clearActorLease, ACTOR_LEASE_TTL_MS,
+  openActorLease, closeActorLease, _clearActorLease, ACTOR_LEASE_TTL_MS, ACTOR_LEASE_GRACE_MS,
 } from '../../src/editor/editorJournal';
 
 const sources = () => readEditorJournal().map((e) => e.source);
@@ -25,14 +25,56 @@ beforeEach(() => { clearEditorJournal(); _clearActorLease(); });
 afterEach(() => { vi.useRealTimers(); _clearActorLease(); });
 
 describe('openActorLease / closeActorLease', () => {
-  it('attributes emits to the lease holder until closed', () => {
+  it('attributes emits to the lease holder until closed, then for a trailing grace window', () => {
+    vi.useFakeTimers();
     editorEmit('!select');
     const id = openActorLease('agent');
     editorEmit('!edit');
     editorEmit('!transform');
     closeActorLease(id);
-    editorEmit('!select');
-    expect(sources()).toEqual(['human', 'agent', 'agent', 'human']);
+    editorEmit('!select');                              // inside the grace — still the agent
+    vi.advanceTimersByTime(ACTOR_LEASE_GRACE_MS + 1);
+    editorEmit('!select');                              // past it — back to the human
+    expect(sources()).toEqual(['human', 'agent', 'agent', 'agent', 'human']);
+  });
+
+  /** QA-SVIEW-0001 / QA-TOOL-0005 / QA-GVIEW-0008 — one race, three reports.
+   *
+   *  A close means "I have finished SENDING the input", not "the editor has finished
+   *  REACTING to it". Synthetic input goes through the browser's input pipeline; the close
+   *  arrives as an IPC message on the JS task queue. Nothing orders them, so the journal
+   *  event the input CAUSES can land either side of the close.
+   *
+   *  Measured live (backend 5183, games/anim-bug, 2026-08-18, unattended): two identical
+   *  modoki_drag_handle calls on gizmo3d:translate:x, seconds apart. The first journalled
+   *  its !transform as source:'human' — 184ms after the same gesture's !focus, which was
+   *  correctly 'agent'. The second journalled 'agent'. Same call, opposite answers. */
+  it('an emit landing AFTER the close still belongs to the agent (the input-vs-close race)', () => {
+    vi.useFakeTimers();
+    const id = openActorLease('agent');
+    closeActorLease(id);            // the close IPC wins the race…
+    vi.advanceTimersByTime(184);    // …by the margin actually measured
+    editorEmit('!transform');       // …and the work the input caused lands here
+    expect(sources()).toEqual(['agent']);
+  });
+
+  it('the grace covers the measured latency with real headroom', () => {
+    // Sized off a measurement, not a guess — and equal to undoManager's COALESCE_MS, the
+    // editor's other renderer-side deferral window, so there is ONE number to reason about.
+    expect(ACTOR_LEASE_GRACE_MS).toBeGreaterThanOrEqual(400);
+    // …but far below the TTL backstop, or a failed close would cost as much as no close.
+    expect(ACTOR_LEASE_GRACE_MS).toBeLessThan(ACTOR_LEASE_TTL_MS);
+  });
+
+  it('the grace never EXTENDS a lease that was already expiring sooner', () => {
+    // close() shortens; it must not resurrect. A lease opened with a tiny ttl that has
+    // already lapsed stays lapsed.
+    vi.useFakeTimers();
+    const id = openActorLease('agent', 100);
+    vi.advanceTimersByTime(150);    // already past its own deadline
+    closeActorLease(id);
+    editorEmit('!edit');
+    expect(sources()).toEqual(['human']);
   });
 
   it('EXPIRES on its deadline instead of mis-attributing forever', () => {
@@ -58,7 +100,9 @@ describe('openActorLease / closeActorLease', () => {
     closeActorLease(first); // late close from the superseded op
     editorEmit('!edit');
     expect(sources()).toEqual(['agent']);
+    vi.useFakeTimers();
     closeActorLease(second);
+    vi.advanceTimersByTime(ACTOR_LEASE_GRACE_MS + 1);   // past the trailing grace
     editorEmit('!edit');
     expect(sources()).toEqual(['agent', 'human']);
   });
@@ -83,9 +127,11 @@ describe('openActorLease / closeActorLease', () => {
   });
 
   it('restores the ambient actor after the lease closes, not a hardcoded human', () => {
+    vi.useFakeTimers();
     withEditorActor('agent', () => {
       const id = openActorLease('agent');
       closeActorLease(id);
+      vi.advanceTimersByTime(ACTOR_LEASE_GRACE_MS + 1); // past the grace, so the lease is gone
       editorEmit('!edit'); // still inside the agent wrapper
     });
     expect(sources()).toEqual(['agent']);

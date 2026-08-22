@@ -89,6 +89,16 @@ function routerCtx(): BackendContext {
     requestBrowser: async () => ({ ok: true }),
     getSchema: () => undefined,
     invalidateProjectConfig: () => {},
+    // /api/find-references calls this before it ever reads a query param (see
+    // engine/tests/plugins/reimportNotify.test.ts for the same empty-enumeration stub). The
+    // generic sweep below synthesizes `target: 'probe'` from the tool's own zod shape, and the
+    // route 404s (never reaching `limit`/`maxDepth`/`reachableOnly`) unless "probe" actually
+    // resolves — so seed the guid index with it, mirroring an asset manifest entry.
+    computeRefEdges: () => ({
+      edges: [], entities: [], allFiles: [], seeds: [], warnings: [],
+      guidIndex: new Map([['probe', '/assets/probe.png']]),
+      guidOrigin: new Map(),
+    }) as ReturnType<BackendContext['computeRefEdges']>,
   } as unknown as BackendContext;
 }
 

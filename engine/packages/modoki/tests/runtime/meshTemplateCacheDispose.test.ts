@@ -93,8 +93,16 @@ describe('F4 — disposeMaterial disposes non-standard texture slots', () => {
       (mat as unknown as Record<string, unknown>)[slot] = tex;
     }
 
-    // Last release → invalidateMaterial → disposeMaterial.
+    // Last release → invalidateMaterial, which RETIRES rather than disposes since #317 (a live
+    // mesh may still bind this instance). The slot walk this test is about runs when the retiree
+    // is freed — in production, `syncSceneRenderables3D`'s sweep once nothing binds it.
+    const { disposeRetiredMaterial, retiredMaterials3D } = await getCache();
     releaseMaterial(1, G('/clearcoat.mat.json'));
+    for (const slot of extraSlots) {
+      expect(spies[slot].dispose, `${slot} must NOT be disposed while the material is only retired`).not.toHaveBeenCalled();
+    }
+    expect(retiredMaterials3D().has(mat as never)).toBe(true);
+    disposeRetiredMaterial(mat as never);
 
     for (const slot of extraSlots) {
       expect(spies[slot].dispose, `${slot} should be disposed`).toHaveBeenCalledTimes(1);
@@ -111,7 +119,9 @@ describe('F4 — disposeMaterial disposes non-standard texture slots', () => {
     (mat as unknown as Record<string, unknown>).map = shared;
     (mat as unknown as Record<string, unknown>).emissiveMap = shared; // same instance in two slots
 
+    const { disposeRetiredMaterial } = await getCache();
     releaseMaterial(1, G('/clearcoat.mat.json'));
+    disposeRetiredMaterial(mat as never);   // the release only retires it now (#317)
 
     // Disposed exactly once thanks to the per-uuid dedupe set in disposeMaterial
     // (which runs via disposeAllCachedResources). Here release goes through

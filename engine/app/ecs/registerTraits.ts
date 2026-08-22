@@ -3,8 +3,8 @@
 
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
-  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
-  UIElement, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
+  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, AudioSettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
+  UIElement, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
   AudioSource, AudioListener, VideoPlayer,
@@ -164,6 +164,14 @@ export function registerAllTraits() {
   });
 
   registerTrait({
+    name: 'GroupAlpha', trait: GroupAlpha, category: 'component', componentCategory: 'Rendering',
+    priority: 33.4,
+    fields: {
+      alpha: { type: 'number', min: 0, max: 1, step: 0.01, tooltip: 'Fades this entity AND every descendant in the 2D layer (#211). Multiplies with Renderable2D.opacity rather than replacing it, and nested groups multiply together — same model as Unity CanvasGroup. Put it on a bare hierarchy node to fade a whole subtree that the node itself does not draw.' },
+    },
+  });
+
+  registerTrait({
     name: 'Billboard3D', trait: Billboard3D, category: 'component', componentCategory: 'Rendering',
     priority: 33.5,
     fields: {
@@ -267,6 +275,10 @@ export function registerAllTraits() {
   registerTrait({
     name: 'BlobShadow', trait: BlobShadow, category: 'component', componentCategory: 'Rendering', priority: 37,
     fields: {
+      // FIRST in the list on purpose: it decides whether any of the fields below ever run. The
+      // gate short-circuits before the ground raycast, so a blob left at the default costs nothing
+      // on a tier that renders real shadows — which is every tier above `low`.
+      onlyWhenShadowsOff: { type: 'boolean', tooltip: 'Tick to draw this blob ONLY while the quality tier has real shadows off — the low-tier substitute case. It then costs nothing on higher tiers (the gate skips the ground raycast). Leave OFF (the default) for a blob that should always draw: an entity that can never cast a real shadow anyway, e.g. an alpha-blended material, or a deliberate stylistic blob' },
       radius: { type: 'number', min: 0, step: 0.05, tooltip: 'World-space radius of the blob' },
       opacity: { type: 'number', min: 0, max: 1, step: 0.05, tooltip: 'Peak darkness at ground contact' },
       groundOffset: { type: 'number', min: 0, step: 0.01, tooltip: 'Lift above the found surface, along its normal, to avoid z-fighting' },
@@ -784,6 +796,14 @@ export function registerAllTraits() {
     },
   });
 
+  registerTrait({
+    name: 'AudioSettings', trait: AudioSettings, category: 'resource',
+    fields: {
+      sfxVoiceLimit: { type: 'number', min: 0, max: 64, step: 1, tooltip: 'Max concurrent fire-and-forget one-shots on the sfx bus; past it the OLDEST is stolen. Music is never capped, entity AudioSource voices are never stolen (a looping ambience would be the oldest voice forever), and the ui bus is uncapped. 0 or less = uncapped.' },
+      sfxStealFadeSec: { type: 'number', min: 0, max: 1, step: 0.005, tooltip: 'Seconds a STOLEN one-shot ramps to silence before stopping. 0 = a hard cut, which clicks — an instant stop is an amplitude discontinuity on every steal. The 10ms default is below the threshold where a fade reads AS a fade, so it still stops abruptly, just cleanly.' },
+    },
+  });
+
   registerTrait({ name: 'Paused', trait: Paused, category: 'tag', fields: {} });
 
   registerTrait({
@@ -908,6 +928,7 @@ export function registerAllTraits() {
       alignSelf: { type: 'enum', options: ['auto', 'flex-start', 'center', 'flex-end', 'stretch'], tooltip: 'Override parent alignItems for this element', ...S('Layout') },
       overflow: { type: 'enum', options: ['visible', 'hidden', 'scroll'], tooltip: 'What happens when children exceed bounds.\nvisible = no clipping, hidden = clip, scroll = scrollbar', ...S('Layout') },
       zIndex: { type: 'number', step: 1, tooltip: 'Stacking order among siblings', ...S('Layout') },
+      rotation: { type: 'number', step: 1, tooltip: 'Tilt in degrees, clockwise. 0 = square.\nRotates about the ANCHOR PIVOT (the point that sits on the anchor point), so the anchor stays put as the angle changes; an unanchored or stretched element turns about its centre.\n\u26a0\ufe0f A non-zero rotation creates a stacking context, which traps the zIndex of everything inside it \u2014 tilt the card, not the layer holding it.\n\u26a0\ufe0f The editor selection overlay stays axis-aligned; the render is still correct.', ...S('Layout') },
       pointerThrough: { type: 'boolean', tooltip: 'Never take the pointer — taps fall through to whatever is BEHIND this element.\nChildren keep their own (a button inside stays clickable).\nFor a decorative container drawn over something that must stay tappable.\nNOTE: on an overflow:scroll box this gives up scrolling it.', ...S('Layout') },
 
       // ── Child Layout section (Unity LayoutGroup — arranges THIS element's children) ──
@@ -940,15 +961,18 @@ export function registerAllTraits() {
 
       // ── Text section ──
       text: { type: 'string', tooltip: 'Text content. Supports {storeField} templates', ...S('Text'), sectionDivider: true },
-      fontSize: { type: 'number', step: 1, tooltip: 'Text size (px)', ...S('Text') },
+      fontSize: { type: 'number', step: 1, tooltip: 'Text size, in fontSizeUnit (px by default).', ...S('Text') },
+      fontSizeUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for fontSize. Default px.\nSet it to vh when the element\u2019s HEIGHT comes from its text and its parent is sized in %/vh \u2014 vh, NOT vmin, which is min(vw,vh) and so follows WIDTH on any viewport taller than wide (every phone in portrait), leaving the text fixed while the parent shrinks \u2014 otherwise the parent scales and the text does not, and there is a viewport size below which the content overflows its container. lineHeight is still px-only, so leave it 0 (auto) with a scaling fontSize.', ...S('Text') },
       fontWeight: { type: 'enum', options: ['normal', 'bold'], tooltip: 'Text weight', ...S('Text') },
       fontStyle: { type: 'enum', options: ['normal', 'italic'], tooltip: 'Text style', ...S('Text') },
       textColor: { type: 'color', alphaField: 'textOpacity', tooltip: 'Text color', ...S('Text') },
       textOpacity: { type: 'number', step: 0.01, min: 0, max: 1, tooltip: 'Text color alpha', ...S('Text') },
       textAlign: { type: 'enum', options: ['left', 'center', 'right'], tooltip: 'Horizontal text alignment', ...S('Text') },
-      fontFamily: { type: 'string', tooltip: 'Font family name or drag a font asset. Empty = system default', accept: ['.ttf', '.otf', '.woff', '.woff2'], ...S('Text') },
+      fontFamily: { type: 'string', tooltip: 'The typeface for this element\u2019s text \u2014 a FONT ASSET (drag one in, or use the Aa picker). Stored as a GUID like every other asset reference, so the build can see it and ship the font. Inherited by descendants, exactly as CSS font-family is: author it once on a UI root.\nEmpty \u21d2 falls back to systemFont, then to the browser default. When both are set the ASSET wins.', accept: ['.ttf', '.otf', '.woff', '.woff2'], ...S('Text') },
+      systemFont: { type: 'string', tooltip: 'A plain CSS family name (system-ui, Helvetica, or a stack) \u2014 for a typeface no asset can express. Used only when fontFamily is empty or unresolvable. Leave it empty unless you specifically want the device\u2019s own font.', ...S('Text') },
       lineHeight: { type: 'number', step: 0.1, tooltip: 'Line height multiplier. 0 = auto', ...S('Text') },
-      letterSpacing: { type: 'number', step: 0.5, tooltip: 'Letter spacing (px)', ...S('Text') },
+      letterSpacing: { type: 'number', step: 0.5, tooltip: 'Letter spacing, in letterSpacingUnit (px by default).', ...S('Text') },
+      letterSpacingUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for letterSpacing. Default px.\nMatch it to fontSizeUnit: tracking is only meaningful as a RATIO of the glyph size, so px tracking under a scaling font says something different at every viewport.', ...S('Text') },
       textOverflow: { type: 'enum', options: ['clip', 'ellipsis'], tooltip: 'How to handle text overflow', ...S('Text') },
       maxLines: { type: 'number', step: 1, tooltip: 'Max visible lines. 0 = unlimited', ...S('Text') },
 
@@ -1035,6 +1059,121 @@ export function registerAllTraits() {
       navDown: { type: 'entityRef', tooltip: 'Explicit down-nav target (UI entity); empty → spatial nearest' },
       navLeft: { type: 'entityRef', tooltip: 'Explicit left-nav target (UI entity); empty → spatial nearest' },
       navRight: { type: 'entityRef', tooltip: 'Explicit right-nav target (UI entity); empty → spatial nearest' },
+    },
+  });
+
+  // Sits between UIFocusable (63.5) and Canvas2D (64) so a toggle's fields read just
+  // below the interaction traits it pairs with.
+  registerTrait({
+    name: 'UIToggle', trait: UIToggle, category: 'component', componentCategory: 'UI',
+    priority: 63.7,
+    fields: {
+      value: { type: 'boolean', tooltip: 'The live on/off state. Drawn from here — the control does NOT write it; a UIAction binding does (set UIToggle.value to \'$value\').' },
+      disabled: { type: 'boolean', tooltip: 'Dim and refuse the click. Still draws its current value rather than going blank.' },
+      // ⚠️ The two track colours do NOT fold `trackOpacity` as an `alphaField`, though the obvious
+      // authoring would. There is ONE track opacity shared by both states, and `alphaField` folds
+      // an opacity row INTO a colour row — so two colours claiming one sibling would draw that row
+      // twice and make "which one owns it" ambiguous. `colorAlphaFieldWiring.test.ts` refuses it.
+      // Splitting into on/off opacities was the alternative and buys nothing: a track is in one
+      // state or the other, never both. So the shared opacity gets its own plain row below.
+      trackOnColor: { type: 'color', tooltip: 'Track fill while ON' },
+      trackOffColor: { type: 'color', tooltip: 'Track fill while OFF' },
+      trackOpacity: { type: 'number', min: 0, max: 1, step: 0.01, tooltip: 'Track fill opacity, both states' },
+      // One colour, one alpha — a legal 1:1 fold, unlike the pair above.
+      knobColor: { type: 'color', alphaField: 'knobOpacity', tooltip: 'The sliding knob' },
+      knobInset: { type: 'number', min: 0, step: 1, tooltip: 'Gap in CSS px between knob and track edge. The knob is square and sized off the track height minus twice this.' },
+      trackRadius: { type: 'number', min: 0, step: 1, tooltip: 'Track corner radius. 999 = capsule at any height.' },
+      knobRadius: { type: 'number', min: 0, step: 1, tooltip: 'Knob corner radius. 999 = circle.' },
+      // Folded into `knobColor`'s row, so it needs no row of its own.
+      knobOpacity: { type: 'number', min: 0, max: 1, step: 0.01, hidden: true },
+    },
+  });
+
+  // Sits just above Canvas2D (64), beside the other opt-in capabilities that pair with
+  // UIElement. A scroll view is authored ON a container; it does not replace one.
+  registerTrait({
+    name: 'UIScrollView', trait: UIScrollView, category: 'component', componentCategory: 'UI',
+    priority: 63.8,
+    fields: {
+      axis: { type: 'enum', options: ['y', 'x', 'both'], tooltip: 'Which axis scrolls. \'both\' is the 2-D grid case.' },
+      snap: { type: 'enum', options: ['none', 'start', 'center', 'end'], tooltip: 'Where an entry comes to rest when snapping. \'none\' disables snapping.' },
+      snapStop: { type: 'enum', options: ['normal', 'always'], tooltip: '\'always\' makes a fling stop at snap points it passes. It CONSTRAINS a fling but does not cap it at one entry — measured on a Galaxy A23, one hard fling advanced 11 entries at \'normal\' and 3 at \'always\'; a slow drag advances exactly 1.' },
+      overscroll: { type: 'enum', options: ['auto', 'contain', 'none'], tooltip: 'overscroll-behavior — whether scrolling past the end chains to the parent.' },
+      scrollbar: { type: 'enum', options: ['auto', 'hidden'], tooltip: 'Whether the platform\'s classic scrollbar is shown. A classic scrollbar steals cross-axis space from the content box — measured: 15px, which clipped Court\'s level grid. Mobile overlay scrollbars steal nothing, so this only matters on desktop/Electron.' },
+
+      wheel: { type: 'enum', options: ['native', 'entry'], tooltip: 'What a mouse wheel / trackpad gesture does; touch is unaffected. \'entry\' moves exactly ONE entry per gesture — a pager\'s setting. A delta multiplier cannot do this job: under mandatory snap the browser quantises any offset to a whole entry, so the only thing left to control is how many entries one gesture may cross. A trackpad swipe emits a rapid stream whose deltas accumulate, which is how one flick crossed several pages.' },
+      scrollBehavior: { type: 'enum', options: ['instant', 'smooth'], tooltip: 'How a scrollTo request moves. \'smooth\' duration is browser-defined and not tunable.' },
+      // ⚠️ Engine-written state and the game-written scrollTo request. HIDDEN rather than shown
+      // read-only: an author editing scrollY would have it overwritten on the next scroll event,
+      // which is a field that looks authored and is not.
+      scrollX: { type: 'number', hidden: true }, scrollY: { type: 'number', hidden: true },
+      viewportWidth: { type: 'number', hidden: true }, viewportHeight: { type: 'number', hidden: true },
+      contentWidth: { type: 'number', hidden: true }, contentHeight: { type: 'number', hidden: true },
+      scrollToX: { type: 'number', hidden: true }, scrollToY: { type: 'number', hidden: true },
+    },
+  });
+
+  // Pairs with UIScrollView (63.8) — a scroll view is the box, UIEntries is what it shows.
+  registerTrait({
+    name: 'UIEntries', trait: UIEntries, category: 'component', componentCategory: 'UI',
+    priority: 63.9,
+    fields: {
+      // A JSON bank, like Animator.clips — see UIEntries' banner for why it is a string and
+      // not an array field. Editable as text today; a nicer widget can come later without
+      // changing the stored shape.
+      prefabs: { type: 'string', tooltip: 'Entry kinds as JSON: [{"name":"tile","prefab":"<guid>"}]. The name is what game code asks for; the GUID is authored here so the build can see the asset.' },
+      entryWidth: { type: 'number', min: 0, tooltip: 'Entry width. 0 = read it from the prefab root, so a fixed size is not a second copy of what the prefab already says.' },
+      entryWidthUnit: { type: 'enum', options: ['px', '%'], tooltip: '% resolves against the viewport — 100% is how a one-at-a-time pager is expressed.' },
+      entryHeight: { type: 'number', min: 0, tooltip: 'Entry height. 0 = read it from the prefab root.' },
+      entryHeightUnit: { type: 'enum', options: ['px', '%'], tooltip: '% resolves against the viewport.' },
+      gapX: { type: 'number', min: 0, tooltip: 'Gap between entries horizontally, px.' },
+      gapY: { type: 'number', min: 0, tooltip: 'Gap between entries vertically, px.' },
+      overscan: { type: 'number', min: 0, step: 1, tooltip: 'Entries kept beyond the viewport per edge, on top of the visible+1 floor. This is a FLOOR — the engine raises it to cover measured scroll travel, because a fixed value blanks on a fling (measured on a Galaxy A23: a hard fling traverses up to 4.56 entries between pool updates).' },
+      source: { type: 'string', tooltip: 'Name of the registered entry source that fills an entry.' },
+      // Game-written data extent and the invalidation counter — not authored.
+      countX: { type: 'number', hidden: true }, countY: { type: 'number', hidden: true },
+      epoch: { type: 'number', hidden: true },
+      // Game-written scroll request in ENTRY coordinates, consumed and cleared by the system.
+      scrollToEntryX: { type: 'number', hidden: true }, scrollToEntryY: { type: 'number', hidden: true },
+      // Engine-written window state. Hidden rather than read-only for the same reason as
+      // UIScrollView's: an author editing firstY would have it overwritten next frame.
+      firstX: { type: 'number', hidden: true }, firstY: { type: 'number', hidden: true },
+      visibleX: { type: 'number', hidden: true }, visibleY: { type: 'number', hidden: true },
+      poolSize: { type: 'number', hidden: true },
+    },
+  });
+
+  // Stamped by the engine on every pooled entry root — never authored. Registered (rather than
+  // left unregistered) so the trait registry can resolve it by name, so serialization knows
+  // about it, and so Percept can report which DATA index a pooled entity is showing. Every
+  // field is hidden: an author editing `index` would have it overwritten on the next recycle.
+  registerTrait({
+    name: 'UIEntry', trait: UIEntry, category: 'component', componentCategory: 'UI',
+    priority: 63.95,
+    fields: {
+      x: { type: 'number', hidden: true }, y: { type: 'number', hidden: true },
+      index: { type: 'number', hidden: true }, slot: { type: 'number', hidden: true },
+      viewGuid: { type: 'string', hidden: true }, kind: { type: 'string', hidden: true },
+      live: { type: 'boolean', hidden: true },
+    },
+  });
+
+  registerTrait({
+    name: 'TouchControl', trait: TouchControl, category: 'component', componentCategory: 'UI',
+    priority: 63.8,
+    fields: {
+      action: {
+        type: 'enum', options: [...TOUCH_CONTROL_ACTIONS],
+        tooltip: 'What HOLDING this element means, in the source-agnostic action vocabulary. The four move* values push the locomotion axes AND raise the matching nav* flag, exactly as the keyboard arrows do — so a game reading inputAxis(world,\'moveX\') needs no touch-specific code. A d-pad is four entities, one per direction.',
+      },
+      showOn: {
+        type: 'enum', options: [...TOUCH_CONTROL_SHOW_ON],
+        tooltip: 'When this control is mounted at all. touch = handhelds only (the default — a desktop player never sees a d-pad over their scene). always = everywhere. never = authored but off. NOTE: the Scene panel mounts it whatever this says, so you can still position it; the Game panel obeys it.',
+      },
+      pressedOpacity: {
+        type: 'number', min: 0, max: 1, step: 0.05,
+        tooltip: 'Element opacity while held — the press feedback. 1 disables it. Applied straight to the DOM by the input source, not through the UI projection, so a thumb pressing at 10 Hz does not rebuild the UI tree.',
+      },
     },
   });
 

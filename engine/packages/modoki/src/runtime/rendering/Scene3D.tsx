@@ -15,17 +15,22 @@ import { isSkeletalPreviewing } from '../core/skeletalPreview';
 import { sceneManager } from '../scene/SceneManager';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_3D } from './frameDriver';
 import { registerSceneRenderer, unregisterSceneRenderer, normalizeJpegQuality, type SceneRenderer } from './offscreenCapture';
-import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } from '../core/screenBounds';
+import { registerBoundsProvider } from '../core/screenBounds';
+import { computeEntityScreenBounds } from './entityScreenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
-import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
+import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, compileLiveScene, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { registerRenderSurface } from './materialBroker';
 import { onRendererLost } from '../core/activeRenderer';
 import { createRendererRecovery } from './rendererRecovery';
 import { tickTierCalibration, applyPendingTierPromotion } from './tierCalibration';
 import { beginProfilerSample, endProfilerSample } from '../core/profilerMarkers';
 import { gpuPassScope } from '../core/gpuTimings';
-import { getRenderSettings, getEffectiveThreeSettings, getActiveTierOrDefault } from './renderSettings';
-import { tierAllowsPostFX } from './qualityTier';
+// The sanctioned wall-clock wrapper — a direct performance.now() in runtime/** fails the
+// determinism guard, and the live-compile hold is a real-time deadline, not sim time.
+import { rawNow } from '../core/clock';
+import { createLiveCompileGate } from './liveCompileGate';
+import { getRenderSettings, getEffectiveThreeSettings, getActiveTierOverrides } from './renderSettings';
+import { maskPostFXRequest } from './qualityTier';
 import { onForceResize } from './resizeBus';
 import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from './particleSync';
@@ -56,12 +61,60 @@ import { nprConfigFromTrait, type NprTraitSnapshot } from './npr/nprConfigFromTr
  *  per-call driver overhead was never the cost, and the P4b premise was wrong. Worse, the batching
  *  pass itself adds ~2.6 ms to `renderables`.
  *
- *  Kept rather than reverted because the mechanism is sound and the census says other projects are
- *  far more repeated (forest-camp 554 entities on repeated pairs, 3d-test 456) — but it must not
+ *  ⚠️ THAT FLAT SLOPE IS REGIME-SPECIFIC, NOT A PROPERTY OF `submit` (#224, 2026-08-14). The same
+ *  measurement on `demos/forest-camp` / Galaxy A23 — a 17.5 ms frame rather than an 85 ms one —
+ *  gives `submit ~= 2.5 ms + 0.063 ms per draw call`, from two independent perturbations that
+ *  agree: dropping the shadow pass (57 calls, 0.065 ms/call) and hiding half the visible meshes
+ *  (19 calls, 0.063 ms/call). Both readings are right. Sling at 85 ms is GPU-bound, so its
+ *  `submit` was a CPU-side wait on a GPU that was already the limiter and call count could not
+ *  matter (§9 of the plan says exactly this); forest-camp at 17 ms is CPU-bound, and there
+ *  per-call cost is precisely what is being paid. Read "per-call overhead was never the cost" as
+ *  scoped to the GPU-bound regime it was measured in — it does not generalize.
+ *
+ *  ⛔ AND THE CENSUS THAT KEPT IT ALIVE IS WRONG (#212, 2026-08-18). "forest-camp 554 entities on
+ *  repeated pairs" does not survive contact with the running scene: measured live on a Galaxy A23,
+ *  forest-camp has 88 batchable meshes resolving to 59 distinct geometries, and its LARGEST repeat
+ *  group is 5 — one short of MIN_INSTANCES, so `batched: 0 of 80 considered` with 51 buckets
+ *  `below-threshold`. Turning the flag on there changed draw calls 94 -> 94 and cost +0.4 ms in
+ *  `renderables` for a pass that batched nothing. The census counted AUTHORED mesh refs; the batch
+ *  key is RESOLVED geometry+material identity, and the two are not the same number.
+ *  (Not a material-forking artifact — pairBuckets 59 == geoBuckets 59, so nothing forked; the
+ *  geometry simply is not repeated. Ruled out explicitly because it is the plausible wrong answer.)
+ *
+ *  So the flag now needs BOTH conditions and no project has shown both: repeated geometry (sling
+ *  has it; forest-camp does not) AND a CPU-bound submit (forest-camp has it at 8.2 of 15.7 ms CPU;
+ *  sling did not, being GPU-bound at 85 ms). Before flipping it on for a project, read
+ *  `getBatchStats()` FIRST — `batched`/`drawCallsSaved` say in one call whether there is anything
+ *  to win, without a build.
+ *
+ *  Kept rather than reverted because the mechanism is sound — but it must not
  *  ship enabled on the strength of a hypothesis its own measurement refuted. Flip this ON only
  *  behind a before/after `renderer.calls` AND frame-time reading on the target device.
- *  Full write-up: docs/plans/draw-call-instancing-plan.md. */
+ *  Full write-up: docs/rendering.md § "Draw-Call Cost & Instanced Batching". */
 const BATCH_DRAW_CALLS = false;
+
+/** How long a swap may hold the first frame while the live scene's pipelines compile (#238).
+ *
+ *  A CEILING, not a budget — the hold normally ends when the compile resolves, which on a scene
+ *  the prewarm already covered is a few milliseconds of cache hits. This exists so a compile that
+ *  never settles (a lost device, a rejected promise we somehow do not see) degrades to the OLD
+ *  behaviour — a stalling first frame — instead of a viewport that never draws again. */
+const LIVE_COMPILE_MAX_HOLD_MS = 5000;
+
+
+/** Runtime override for the on-device A/B this flag's own comment demands (#212).
+ *
+ *  Rebuilding and reinstalling per arm makes the install path itself a variable, and on a phone
+ *  whose `cpuMs` swings 13-18 ms on its own that confound is larger than the effect being
+ *  measured. So the arm is switchable in place: `__modokiBatchDrawCalls = true|false` through
+ *  `device_eval`, read per sync, `undefined` meaning "whatever the build ships". Toggling ON
+ *  costs a one-off pipeline compile for the instanced variant (an InstancedMesh is a different
+ *  shader), so discard the first samples after a flip and read steady state — the same trap that
+ *  made a runtime shadow-caster swap unshippable at ~200 ms per swap (#229). */
+function batchDrawCallsEnabled(): boolean {
+  const override = (globalThis as { __modokiBatchDrawCalls?: boolean }).__modokiBatchDrawCalls;
+  return typeof override === 'boolean' ? override : BATCH_DRAW_CALLS;
+}
 
 let nextInstanceId = 0;
 
@@ -236,8 +289,16 @@ export default function Scene3D() {
 
       // TODO: config is captured once at mount. If a future game needs a non-trivial
       // sceneSetup (lighting presets, fog, etc.), Scene3D will need to subscribe to
-      // gameConfig changes and re-run sceneSetup on game switch. Today both games'
-      // sceneSetup hooks are no-ops so this is safe.
+      // gameConfig changes and re-run sceneSetup on game switch.
+      //
+      // ⚠️ THIS IS NOT A ONCE-PER-LAUNCH CALL, and this comment claimed otherwise until
+      // 2026-08-20 ("today both games' sceneSetup hooks are no-ops so this is safe"). Two
+      // things falsify it: `bringUp()` reaches here, and `rebuild` is `teardown(); await
+      // bringUp()`, which runs on GPU context-loss recovery — routine in a mobile webview;
+      // and React `<StrictMode>` double-invokes the mount effect in dev. Nor are the hooks
+      // no-ops any more: `games/court` starts its install-retention milestones here.
+      // **A `sceneSetup` hook must therefore be IDEMPOTENT** — Court's carries its own latch
+      // for exactly this reason (games/court/packages/app-services/src/milestones.ts).
       config.sceneSetup(scene);
 
       const ecsLights = new Map<number, THREE.Light>();
@@ -341,6 +402,19 @@ export default function Scene3D() {
       const DIRTY_GRACE = 60; // ~1s @60fps
       let dirtyFrames = DIRTY_GRACE; // draw the first second (initial load + texture settle)
       const markRenderDirty = () => { dirtyFrames = DIRTY_GRACE; };
+
+      // Post-swap live-scene compile (#238). The pre-swap prewarm models a COPY of the incoming
+      // scene; this compiles the objects the sync ACTUALLY placed, before the first frame draws
+      // them. See `compileLiveScene` for why the copy can never cover light-mask variants, and
+      // `liveCompileGate` for what the hold costs.
+      const liveCompile = createLiveCompileGate({
+        maxHoldMs: LIVE_COMPILE_MAX_HOLD_MS,
+        now: rawNow,
+        // The surface may be idle-gated (Stopped, nothing dirty), so releasing the hold is not
+        // enough on its own — the scene we just compiled still has to get drawn once.
+        onSettled: () => markRenderDirty(),
+        onError: (e) => console.warn('[Scene3D] live-scene compile failed:', e),
+      });
       const dirtyUnsubs = [
         addDirtyListener(markRenderDirty),  // trait writes through the helper API
         onStructureDirty(markRenderDirty),  // entity create / delete / reparent
@@ -379,7 +453,7 @@ export default function Scene3D() {
         syncLights(world, scene, ecsLights, shadowFocusFor(activeCamera));
         endProfilerSample();
         beginProfilerSample('renderables');
-        syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: BATCH_DRAW_CALLS });
+        syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: batchDrawCallsEnabled() });
         endProfilerSample();
         orientBillboards(renderState, activeCamera); // face billboards toward the live camera
         // Inside the editor PREVIEW envelope the SceneView owns particle preview (it supplies its
@@ -517,7 +591,14 @@ export default function Scene3D() {
           if (dofEnabled) req.dof = dofCfg;
           if (bloomEnabled) req.bloom = bloomCfg;
           if (vignetteEnabled) req.vignette = vignetteCfg;
-          return req;
+          // ⚠️ MASK AT THE SOURCE, not at the call site. The active tier drops effects per
+          // effect, and `buildReq` is called TWICE — once for `liveReq`, and again below for
+          // `effectiveReq` while an SS-scale change is still settling. Masking only the first
+          // left the second one unmasked, so a dragged supersample slider handed `setConfig`
+          // (and a rebuilt `PostFXStack`) a request with the tier-dropped effect back in it,
+          // until the scale settled. Every request is now born masked, so there is no second
+          // call site to remember.
+          return maskPostFXRequest(req, getActiveTierOverrides());
         };
 
         // Clamp HERE, at the single source, so the planner and the stage both see
@@ -529,23 +610,27 @@ export default function Scene3D() {
         // scenes / MCP writes only.)
         const liveSs = nprSnap ? Math.max(1, nprSnap.superSampleScale) : 1;
         const liveReq = buildReq(liveSs);
-        // The `low` tier drops the post-process stack outright (#121 P3c). It is the dominant
-        // remaining cost on a weak device and it is SCREEN-SPACE, so it is paid per pixel however
-        // simple the scene is — on an iPhone 8 a 27ms baseline became 56ms with NPR alone.
-        //
+        // The active tier MASKS the request per effect (owner, 2026-08-11) rather than gating the
+        // whole stack — see `PostFXEffect`'s header in qualityTier.ts. The effects are not remotely
+        // comparable in cost (an iPhone 8: NPR ~+29ms, vignette ~6ms, bloom ~4ms), so an
+        // all-or-nothing switch was blunter than the measurements require: postfx-demo's degraded
+        // config could drop NPR and GTAO and stay recognisably itself, but couldn't say so.
+        // The mask itself is applied inside `buildReq` — see the warning there for why it cannot
+        // live here.
+        const hasStages = planStages(liveReq).length > 0;
         // Tearing down an EXISTING stack matters as much as not building one: a live demotion
         // happens on a device that is already struggling, and a retained stack would keep its
         // render targets (several full-resolution buffers) resident for nothing. This is the one
-        // place a tier change frees memory rather than just doing less work.
-        const postfxAllowed = tierAllowsPostFX(getActiveTierOrDefault());
-        if (!postfxAllowed && postfxStack) {
+        // place a tier change frees memory rather than just doing less work. Fires whenever the
+        // MASKED request has nothing left, not just when a whole-stack switch used to say so.
+        if (!hasStages && postfxStack) {
           postfxStack.dispose();
           postfxStack = null;
           postfxCamera = null;
           ssRebuild = null;
           lastStackSig = null;
         }
-        if (postfxAllowed && planStages(liveReq).length > 0 && isWebGPU) {
+        if (hasStages && isWebGPU) {
           // Rebuild on camera-object swap (perspective <-> ortho): the stack
           // baked the old camera object, incl. its depth-reconstruction path.
           const cameraChanged = postfxStack != null && postfxCamera !== activeCamera;
@@ -582,6 +667,12 @@ export default function Scene3D() {
               if (cfgScale === liveSs) lastStackSig = sig;
             }
           }
+          // Kicked HERE, not in the swap listener: the compile must see the objects this frame's
+          // sync placed (materials, light-mask variants, LOD levels) and the post-FX stack this
+          // frame settled on — both of which exist only now. Holding the submit until it resolves
+          // is the point: the pipelines it builds are exactly the ones the first draw would
+          // otherwise build SYNCHRONOUSLY, and that is the stall.
+          if (liveCompile.tick(() => compileLiveScene(renderer, scene, activeCamera, () => postfxStack!.compileSceneAsync()))) return;
           // The CPU span and the GPU span are separate measurements of the same call and both are
           // wanted: `submit-postfx` is how long the main thread spent HERE (on postfx-demo that
           // was a median 37 ms — CPU blocking on GPU backpressure), while `gpuPassScope` claims
@@ -592,6 +683,7 @@ export default function Scene3D() {
           gpuPassScope('postfx', () => postfxStack!.render());
           endProfilerSample();
         } else {
+          if (liveCompile.tick(() => compileLiveScene(renderer, scene, activeCamera))) return;
           beginProfilerSample('submit');
           gpuPassScope('scene', () => renderer.render(scene, activeCamera));
           endProfilerSample();
@@ -658,7 +750,7 @@ export default function Scene3D() {
           // syncBoneAttachments a skeletal scene captured absent or frozen at a
           // stale pose, breaking the "same ECS state ⇒ same framing" contract of
           // the agent-verification path (modoki_render_scene).
-          syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: BATCH_DRAW_CALLS });
+          syncSceneRenderables3D(world, scene, renderState, { batchDrawCalls: batchDrawCallsEnabled() });
           syncParticles(world, scene, particleState);
           syncFlameMeshes(world, scene, flameState);
           syncBlobShadows(world, scene, blobShadowState);
@@ -745,37 +837,33 @@ export default function Scene3D() {
           capturing = false;
         }
       };
-      registerSceneRenderer(offscreenRender);
+      registerSceneRenderer(offscreenRender, 'game-3d');
 
       // ── Screen-bounds provider (layout-bounds agent op) ── project each entity's
       // live world AABB through the GAME camera to a viewport CSS rect, so an agent
       // can reason about on-screen position/size/overlap numerically. Works at any
       // hierarchy depth (Box3.setFromObject + updateWorldMatrix walk the full chain).
-      const _boundsBox = new THREE.Box3();
       const unregBounds = registerBoundsProvider((ids) => {
-        const out: EntityScreenBounds[] = [];
         const r = renderer.domElement.getBoundingClientRect();
-        const vp = { left: r.left, top: r.top, width: r.width, height: r.height };
-        for (const [id, obj] of renderState.ecsObjects) {
-          if (ids && !ids.has(id)) continue;
-          obj.updateWorldMatrix(true, true);
-          _boundsBox.setFromObject(obj);
-          // Project through the ACTIVE camera (ortho or perspective) so the
-          // reported rects match what's actually rendered — an ortho scene
-          // projected through the perspective frustum gives wrong CSS rects +
-          // onScreen flags.
-          const { screen, onScreen } = projectAABBToScreen(_boundsBox, activeCamera, vp);
-          // V5: also surface the raw world-space AABB size/center (previously computed
-          // then discarded) so scene-state?bounds carries true geometric extent.
-          let worldAABB: EntityScreenBounds['worldAABB'];
-          if (!_boundsBox.isEmpty()) {
-            const s = _boundsBox.getSize(new THREE.Vector3());
-            const c = _boundsBox.getCenter(new THREE.Vector3());
-            worldAABB = { size: [s.x, s.y, s.z], center: [c.x, c.y, c.z] };
-          }
-          out.push({ id, layer: '3d', surface: 'game-3d', screen, onScreen, ...(worldAABB ? { worldAABB } : {}) });
-        }
-        return out;
+        // Shared with SceneView's provider (`runtime/rendering/entityScreenBounds.ts`) so the
+        // two cannot measure different sets of entities — which they did: this one covered
+        // ONLY `ecsObjects`, so a skinned character had no bounds in the GAME view and an
+        // entity aim at `surface:'game-3d'` was refused for something plainly on screen.
+        // Projected through the ACTIVE camera (ortho or perspective) so the rects match what is
+        // actually rendered — an ortho scene through the perspective frustum gives wrong CSS
+        // rects and onScreen flags. No gizmos here: icon affordances are editor-only.
+        return computeEntityScreenBounds(
+          {
+            ecsObjects: renderState.ecsObjects,
+            skinned: renderState.skinned,
+            billboards: renderState.billboards,
+            textMeshes: renderState.textMeshes,
+          },
+          activeCamera,
+          { left: r.left, top: r.top, width: r.width, height: r.height },
+          'game-3d',
+          ids,
+        );
       }, 'game-3d');
 
       // On world swap, drop all cached Three.js objects (entity IDs are world-scoped).
@@ -785,12 +873,12 @@ export default function Scene3D() {
         disposeParticleSyncState(particleState, scene);
         disposeFlameMeshSyncState(flameState, scene);
         disposeBlobShadowSyncState(blobShadowState, scene);
-        // clearOwnedMaterials MUST run after disposeRenderState (which consults
-        // _ownedMaterials). The SHARED inline-texture/tint material caches are
-        // freed by the module-level onWorldSwap listener in scene3DSync.ts, not
-        // here — so they're disposed exactly once per swap regardless of how many
-        // loops are mounted.
-        clearOwnedMaterials();
+        // clearOwnedMaterials MUST run after disposeRenderState, which consults
+        // `renderState.ownedMaterials` to decide what it may free. The SHARED
+        // inline-texture/tint material caches are freed by the module-level onWorldSwap
+        // listener in scene3DSync.ts, not here — so they're disposed exactly once per
+        // swap regardless of how many loops are mounted.
+        clearOwnedMaterials(renderState);
         for (const l of ecsLights.values()) { scene.remove(l); l.dispose(); }
         ecsLights.clear();
         framingCache = null;   // new scene → drop the stale fit
@@ -798,6 +886,7 @@ export default function Scene3D() {
         blendActive = false;   // never resume an old scene's blend into the new one
         blendOriginId = -1;
         lastApplied.valid = false;
+        liveCompile.arm(); // compile the NEW scene's pipelines before its first frame (#238)
         markRenderDirty(); // render the freshly-swapped scene even while stopped
       });
 
@@ -896,12 +985,14 @@ export default function Scene3D() {
         scene.environment = null;
         step('scene.clear', () => scene.clear());
         // SHARED module-level material caches (_defaultMaterial, inline-texture
-        // mats, tint clones, and the _ownedMaterials tracking set) are
-        // intentionally NOT disposed on a single panel's unmount. The editor
-        // mounts two Scene3D loops at once (GameView + SceneView); freeing a
-        // shared cache here destroys materials the other panel still renders with
-        // (and _defaultMaterial, a const, would never be recreated) — the F2
-        // use-after-free. These caches are freed on world swap (the module-level
+        // mats, tint clones) are intentionally NOT disposed on a single panel's
+        // unmount. The editor mounts two Scene3D loops at once (GameView +
+        // SceneView); freeing a shared cache here destroys materials the other
+        // panel still renders with (and _defaultMaterial, a const, would never be
+        // recreated) — the F2 use-after-free. This surface's OWN inline materials
+        // are a different matter and disposeRenderState above frees them: ownership
+        // is tracked per RenderState precisely so one panel's unmount cannot reach
+        // another's. These caches are freed on world swap (the module-level
         // onWorldSwap listener in scene3DSync.ts), when all loops rebuild
         // together, or reclaimed with the GPU context on final teardown. See
         // engine-review/runtime-rendering-3d.md F2.

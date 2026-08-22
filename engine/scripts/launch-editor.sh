@@ -94,8 +94,21 @@ fi
 # port is auto-picked (MULTI mode). Without this every editor writes the same
 # /tmp/modoki-editor.log and you read the wrong instance's output.
 LOG_TAG="${BACKEND_PORT:-$$}"
-VITE_LOG="/tmp/modoki-vite-${LOG_TAG}.log"
 EDITOR_LOG="/tmp/modoki-editor-${LOG_TAG}.log"
+# The VITE log is the app's to open, not this shell's — main spawns Vite and redirects it
+# to MODOKI_VITE_LOG (engine/electron/devServer.ts). So two things differ from EDITOR_LOG
+# above, and BOTH were wrong here until 2026-08-13:
+#   1. It must be EXPORTED. This variable was computed and then never used, so every clone
+#      fell through to devServer.ts's default and appended into ONE shared file — while
+#      `dev server exited unexpectedly … see <path>` pointed all of them at it. The
+#      per-port editor log was clone-safe and the Vite log silently was not.
+#   2. It must be a NATIVE path, never a Git-Bash "/tmp/…". MSYS rewrites POSIX-looking
+#      ARGUMENTS to a native program but never ENV VARS, and this crosses into a native
+#      Electron process as an env var — the same trap smoke-packaged.sh documents, which
+#      is why that script resolves the temp dir through packagedAppPaths.mjs. Do the same.
+# An explicit MODOKI_VITE_LOG always wins, like every other override in this script.
+VITE_LOG="${MODOKI_VITE_LOG:-$(node "$REPO/engine/scripts/packagedAppPaths.mjs" tmpdir)/modoki-vite-${LOG_TAG}.log}"
+export MODOKI_VITE_LOG="$VITE_LOG"
 
 # 1. Stop ONLY this repo's prior editor + the Vite it owns — matched by this
 #    repo's ABSOLUTE paths so a sibling git worktree's editor (a DIFFERENT path,
@@ -289,6 +302,16 @@ done
 if [ -n "$VITE_ACTUAL" ]; then
   if [ -n "${MODOKI_VITE_PORT:-}" ] && [ "$VITE_ACTUAL" != "$MODOKI_VITE_PORT" ]; then
     echo "[launch-editor]   Editor page:  http://127.0.0.1:${VITE_ACTUAL}/#/editor  (wanted ${MODOKI_VITE_PORT} — it was taken)"
+    # Say what the drift COSTS, not just that it happened. localStorage is keyed by ORIGIN
+    # (scheme://host:PORT), so a bumped Vite port silently hands the editor an empty store:
+    # a different saved layout, different panel state, and a different PlayerPrefs partition
+    # for the same game. It reads as "my data vanished", and the editor then writes its own
+    # boot keys into the new partition — so "other keys are still there" looks like proof the
+    # storage persisted when it is the opposite. That misread cost a QA session and a
+    # wrong high-severity bug report against PlayerPrefs.flush().
+    echo "[launch-editor]   ⚠️  DIFFERENT ORIGIN → different localStorage: this editor has its own saved"
+    echo "[launch-editor]       layout, panel state and PlayerPrefs store, separate from port ${MODOKI_VITE_PORT}."
+    echo "[launch-editor]       Data written on the other port is not lost — it is on the other port."
   else
     echo "[launch-editor]   Editor page:  http://127.0.0.1:${VITE_ACTUAL}/#/editor"
   fi
@@ -299,6 +322,7 @@ else
   echo "[launch-editor]   CDP:          off (auto backend port; set MODOKI_CDP_PORT to enable)"
 fi
 echo "[launch-editor]   Log:          $EDITOR_LOG"
+echo "[launch-editor]   Vite log:     $VITE_LOG"
 
 # The editor is up and its ports are RESOLVED — record what it actually bound, which is
 # what a later "who is on this port?" needs. Vite in particular may differ from `want:`

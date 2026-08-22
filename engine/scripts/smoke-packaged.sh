@@ -32,15 +32,29 @@ PROJECT="$(cd "${1:-games/3d-test}" && { pwd -W 2>/dev/null || pwd; })"
 # (MODOKI_VITE_LOG in particular is opened by the app, not by this shell).
 PATHS="$REPO/engine/scripts/packagedAppPaths.mjs"
 TMPBASE="$(node "$PATHS" tmpdir)"
-OUT="$TMPBASE/modoki-pkg-test"
-VITELOG="$TMPBASE/modoki-smoke-vite.log"; APPLOG="$TMPBASE/modoki-smoke-app.log"
-BUILDLOG="$TMPBASE/modoki-smoke-build.log"
+# PER CLONE, for the same reason test-packaged.sh is (#69): the temp dir is machine-wide,
+# so these bare names were shared by every clone — and this script `rm -rf`s OUT and
+# USERDATA before building into them. Two clones running `verify:packaged` at once would
+# delete each other's build mid-run, and the smoke would report on whichever .app won the
+# race. The PORT below and the throwaway profile were already per-clone; the PATHS were the
+# gap. `$(basename "$REPO")` is the same discriminator test-packaged.sh uses.
+#
+# …and a distinct BASENAME from test-packaged.sh, which builds at
+# `modoki-pkg-test-<clone>`. Sharing the per-clone name would be a WITHIN-clone collision
+# in place of the cross-clone one: `editor:main:packaged` is test-packaged.sh `exec`ing a
+# long-lived interactive editor out of that dir, and this script reaps packaged apps and
+# `rm -rf "$OUT"`s before it builds — so a smoke run would delete the app the owner is
+# sitting in front of. Different job, different dir.
+CLONE="$(basename "$REPO")"
+OUT="$TMPBASE/modoki-pkg-smoke-$CLONE"
+VITELOG="$TMPBASE/modoki-smoke-vite-$CLONE.log"; APPLOG="$TMPBASE/modoki-smoke-app-$CLONE.log"
+BUILDLOG="$TMPBASE/modoki-smoke-build-$CLONE.log"
 # A THROWAWAY Chromium profile for the launch leg — see the --user-data-dir note at the
 # launch below. Not under the packaged product name: `killPackaged`'s no-appDir fallback
 # reaps on `Modoki Editor.app/Contents/`, and Electron repeats --user-data-dir in every
 # helper's command line, so a profile path containing that substring would make our own
 # helpers reapable by a machine-wide clean (the #69 signature, in reverse).
-USERDATA="$TMPBASE/modoki-smoke-userdata"
+USERDATA="$TMPBASE/modoki-smoke-userdata-$CLONE"
 # Dedicated port OUTSIDE the human-editor range (5179 main / 5180 ai / 5181 ai2) so a
 # throwaway smoke build (e.g. from `npm run verify:packaged`) can't collide with a
 # sibling clone's live dev editor — the packaged app pins MODOKI_BACKEND_PORT and
@@ -72,6 +86,31 @@ APP="$(node "$PATHS" "$OUT" appDir)"
 BIN="$(node "$PATHS" "$OUT" bin)"
 # -x is unreliable for a Windows .exe under Git Bash; existence is the portable check.
 [ -f "$BIN" ] || { echo "[smoke] FAIL: app not built (expected $BIN)"; tail -20 "$BUILDLOG"; exit 1; }
+
+# #326: the packaged app must SHIP the CJS Vite config. Without it a real Build press falls back
+# to the ESM config, whose loader writes node_modules/.vite-temp inside the signed bundle. The
+# stager skips gracefully when esbuild is unresolvable, so its absence is otherwise silent — and
+# this smoke never presses Build, so the file-list check below cannot see that regression. This
+# line is what covers it.
+# The resources dir differs per platform (macOS nests it in the .app), so test BOTH layouts
+# rather than branching on `uname` — one of them is always the right one, and a layout change
+# would otherwise turn this into a silent pass on whichever platform it stopped matching.
+if [ -f "$APP/Contents/Resources/app.asar.unpacked/engine/vite.config.cjs" ] \
+  || [ -f "$APP/resources/app.asar.unpacked/engine/vite.config.cjs" ]; then
+  echo "[smoke] ok: packaged Vite config staged (#326)"
+else
+  echo "[smoke] FAIL: engine/vite.config.cjs is missing from the bundle — a Build press would"
+  echo "             write .vite-temp inside the signed app (#326). Check stage-vite-config.cjs."
+  fail_staged=1
+fi
+
+# Snapshot the bundle BEFORE the app runs, so the assertion after teardown can prove the packaged
+# editor wrote nothing inside its own signed application. NOTE what this does and does not cover:
+# it sees writes made at BOOT (the class fixed in 3df0e65d4 / ed17ff8a2), not writes made by a
+# project BUILD — this harness never presses Build. The build path is QA-PKG-0009 step 7.
+BUNDLELIST="$TMPBASE/modoki-pkg-bundle-$CLONE.txt"
+node "$REPO/engine/scripts/assertBundleUnchanged.mjs" snapshot "$APP" "$BUNDLELIST" \
+  || { echo "[smoke] FAIL: could not snapshot the bundle"; exit 1; }
 
 echo "[smoke] launching headless (project: $PROJECT)"
 : > "$VITELOG"; : > "$APPLOG"
@@ -171,5 +210,14 @@ if node "$REPO/engine/scripts/assert-app-csp.mjs" "$APP" "$PROJECT"; then
 else
   echo "[smoke] FAIL: prod CSP regression (see [csp] output above)"; fail=1
 fi
+
+# ── the app must not have written inside its OWN bundle at BOOT (#326) ──
+# Last, so it covers BOTH boots above (the render leg and the CSP leg). A write in here is
+# invisible to every assertion above — the app works perfectly and merely breaks its own code
+# signature, which only `codesign`/`spctl` see, by which point notarization is gone.
+# ⚠️ BOOT only. Nothing here presses Build, so a build-time writer is out of scope for this
+# check — that is what the staged-config assertion above and QA-PKG-0009 step 7 are for.
+if node "$REPO/engine/scripts/assertBundleUnchanged.mjs" assert "$APP" "$BUNDLELIST"; then :; else fail=1; fi
+[ "${fail_staged:-0}" = 0 ] || fail=1
 
 [ "$fail" = 0 ] && { echo "[smoke] PASS ✅"; exit 0; } || { echo "[smoke] FAILED ❌"; exit 1; }

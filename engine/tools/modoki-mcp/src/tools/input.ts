@@ -8,10 +8,16 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { modifierEnum, entitySpec, pointSpec } from '../shapes.js';
+import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, allowOccludedParam, entitySpec, modifierEnum, pointSpec } from '../shapes.js';
 
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, evalRenderer, editorAction } = ctx;
+
+  /** Built-in panel ids, shared by the two `panel` params so they cannot drift. Deliberately
+   *  NOT a z.enum: a game can register custom panels, so the real vocabulary is only knowable
+   *  server-side — which is where the refusal lives (#301). */
+  const IDS = 'scene | game | hierarchy | inspector | console | assets | animation-editor | '
+    + 'timeline-editor | particle-editor | spriteanim-editor | skin-editor | profiler | ai';
 
   // ── tap — trusted input (Electron editor only) ──
   tool(
@@ -22,8 +28,9 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'resort. The first two resolve to a live point INSIDE this call — no read-then-tap race — ' +
       'so prefer them; `x,y` read from an earlier get_scene_state call is aiming at where the ' +
       'target WAS. The response reports `matched` (what resolved), `hitTarget` (the topmost ' +
-      'element at that point) and `occluded` — if occluded is true something covered your ' +
-      'target and the click went elsewhere. An entity aim also reports `occlusionScope`: read ' +
+      'element at that point). A target something COVERS is REFUSED, naming the cover — the click ' +
+      'would land on that instead, and reporting ok for it would be a false success; pass ' +
+      '`allowOccluded:true` to click anyway. An entity aim also reports `occlusionScope`: read ' +
       '`occluded:false` as trustworthy for "element" (UI) but NOT for "canvas" (2D/3D), where a ' +
       'mesh in front of the target is not detected. Then verify with get_scene_state. ' +
       "`button:'right'` opens a context menu; `clickCount:2` double-clicks; " +
@@ -31,13 +38,17 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     {
       x: z.number().optional().describe('Page CSS x. Required unless `selector` is given.'),
       y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
-      selector: z.string().optional().describe("CSS selector to aim at, e.g. '[data-ui-id=\"inspector.header.kebab\"]'. Overrides x/y."),
+      // The example must name a selector that EXISTS: `inspector.header.kebab` did not (the
+      // Inspector has no kebab menu at all), and being the docstring example is exactly how a
+      // wrong selector propagates — it was copied into a QA case brief before anyone checked.
+      selector: z.string().optional().describe("CSS selector to aim at, e.g. '[data-ui-id=\"inspector.header.delete\"]'. Overrides x/y."),
       entity: entitySpec.optional(),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button (default 'left')."),
       clickCount: z.number().optional().describe('1 = single (default), 2 = double-click.'),
-      modifiers: z.array(modifierEnum).optional().describe('Held modifier keys.'),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
+      allowOccluded: allowOccludedParam,
     },
-    async ({ x, y, selector, entity, button, clickCount, modifiers }) => postJson('/api/input/tap', { x, y, selector, entity, button, clickCount, modifiers }),
+    async ({ x, y, selector, entity, button, clickCount, modifiers, allowOccluded }) => postJson('/api/input/tap', { x, y, selector, entity, button, clickCount, modifiers, allowOccluded }),
   );
 
   // ── drag — trusted gesture (Electron editor only) ──
@@ -47,16 +58,21 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'swaps / gizmo drags need them). Each endpoint is `{entity}` ({guid|name|id}), ' +
       '`{selector}`, or page CSS `{x,y}` — the first two resolved to a live point in the ' +
       "same call). `button:'middle'`/'right' = " +
-      "orbit-pan the 3D viewport; `modifiers:['shift']` = gizmo snap. For HTML5 drag-and-drop " +
+      "orbit-pan the 3D viewport; `modifiers:['shift']` = gizmo snap. A modifier is genuinely " +
+      'HELD for the gesture — pressed as a real key after the mousedown and released after the ' +
+      'mouseup, not just set as a bit on the mouse events — so a listener that tracks the ' +
+      "modifier's LEVEL (the SceneView 3D gizmo's snap does) sees it down for every intermediate " +
+      'move. For HTML5 drag-and-drop ' +
       '(asset→slot, reparent) use modoki_dnd, NOT this. Requires the Electron editor.',
     {
       from: pointSpec.describe('Drag origin: {entity} | {selector} | {x,y}.'),
       to: pointSpec.describe('Drag destination: {entity} | {selector} | {x,y}.'),
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button (default 'left')."),
-      modifiers: z.array(modifierEnum).optional().describe('Held modifier keys.'),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, held for the WHOLE drag as a real keyDown/keyUp around the gesture — so a listener tracking the modifier's LEVEL (the 3D gizmo's snap) sees it down for every intermediate move.`),
+      allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Applies to BOTH endpoints; set it on \`from\`/\`to\` individually to allow just one — e.g. a covered destination while keeping the press honest.`),
     },
-    async ({ from, to, steps, button, modifiers }) => postJson('/api/input/drag', { from, to, steps, button, modifiers }),
+    async ({ from, to, steps, button, modifiers, allowOccluded }) => postJson('/api/input/drag', { from, to, steps, button, modifiers, allowOccluded }),
   );
 
   // ── pointer — SUSTAINED (held-across-calls) trusted press (Electron editor only) ──
@@ -70,6 +86,13 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'with get_scene_state / modoki_eval / a screenshot mid-gesture (the atomic modoki_drag can\'t ' +
       'expose it). Typical loop: down → (read) → move → (read) → up. Aim by `{entity}`, `{selector}`, or `{x,y}`. ' +
       'move/up reuse the held button; a move/up with nothing held is refused (409). ' +
+      'THE HOLD IS NOT INDEFINITE: the backend releases it for you after 120s with no move/up, and ' +
+      'a later modoki_tap/drag/tap_handle/drag_handle releases it immediately (a second mouse ' +
+      'gesture cannot coexist with a held press). Both dispatch the real mouseup, and the next ' +
+      'move/up then tells you it happened. This exists because a press left held latches the ' +
+      "renderer's pointer input and kills dragging for the HUMAN too, with no error anywhere " +
+      '(#302) — so release with `action:"up"` when you are done, and keep a long gesture moving. ' +
+      'modoki_get_editor_state reports `heldPointer` if you need to check. ' +
       'Requires the Electron editor.',
     {
       action: z.enum(['down', 'move', 'up']).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
@@ -78,10 +101,11 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       selector: z.string().optional().describe('CSS selector to aim at (resolved server-side). Overrides x/y.'),
       entity: entitySpec.optional(),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
-      modifiers: z.array(modifierEnum).optional().describe('Held modifier keys.'),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
+      allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Applies to \`action:'down'\` only — a move/up is delivered to whatever captured the press, so what sits under the destination cannot stop it.`),
     },
-    async ({ action, x, y, selector, entity, button, modifiers }) =>
-      postJson('/api/input/pointer', { action, x, y, selector, entity, button, modifiers }),
+    async ({ action, x, y, selector, entity, button, modifiers, allowOccluded }) =>
+      postJson('/api/input/pointer', { action, x, y, selector, entity, button, modifiers, allowOccluded }),
   );
 
   // ── hover — trusted bare mouse-move (Electron editor only) ──
@@ -95,9 +119,10 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
       selector: z.string().optional().describe('CSS selector to aim at. Overrides x/y.'),
       entity: entitySpec.optional(),
-      modifiers: z.array(modifierEnum).optional().describe('Held modifier keys.'),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
+      allowOccluded: allowOccludedParam,
     },
-    async ({ x, y, selector, entity, modifiers }) => postJson('/api/input/hover', { x, y, selector, entity, modifiers }),
+    async ({ x, y, selector, entity, modifiers, allowOccluded }) => postJson('/api/input/hover', { x, y, selector, entity, modifiers, allowOccluded }),
   );
 
   // ── scroll — trusted mouse-wheel (Electron editor only) ──
@@ -119,10 +144,11 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       entity: entitySpec.optional(),
       deltaX: z.number().optional().describe('Horizontal wheel delta (default 0). At least ONE of deltaX/deltaY must be non-zero — a zero-delta scroll is REFUSED, not dispatched as a silent no-op.'),
       deltaY: z.number().optional().describe('Vertical wheel delta; positive = content down. Default 0, but a call with neither delta non-zero is REFUSED (~120 ≈ one wheel tick).'),
-      modifiers: z.array(z.enum(['shift', 'control', 'alt', 'meta', 'cmd', 'command']))
-        .optional().describe('Held modifier keys set on the wheel event (e.g. ["control"] or ["meta"] for Ctrl/Cmd+wheel zoom).'),
+      modifiers: z.array(modifierEnum)
+        .optional().describe(`${MODIFIERS_BASE}, set on the wheel event (e.g. ["control"] or ["meta"] for Ctrl/Cmd+wheel zoom).`),
+      allowOccluded: allowOccludedParam,
     },
-    async ({ x, y, selector, entity, deltaX, deltaY, modifiers }) => postJson('/api/input/scroll', { x, y, selector, entity, deltaX, deltaY, modifiers }),
+    async ({ x, y, selector, entity, deltaX, deltaY, modifiers, allowOccluded }) => postJson('/api/input/scroll', { x, y, selector, entity, deltaX, deltaY, modifiers, allowOccluded }),
   );
 
   // ── eval — evaluate JS in the editor renderer (Electron editor only) ──
@@ -197,16 +223,27 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'sent while the wrong panel is focused does NOTHING — silently, because the dispatcher ' +
       'yields rather than erroring. Pass `panel` to set the keyboard scope first instead of ' +
       'tapping-and-hoping; the response echoes `focusedPanel`. ' +
-      'CAVEAT: this is renderer-level input — it does NOT trigger native Electron MENU ' +
+      'TWO GATES STOP A KEY REACHING THE GAME, and naming only the first cost a QA run a '
+      + 'false "the character controller is broken" (QA-PHYS-0003): (1) a focused text field, '
+      + 'which modoki_focus with no selector clears, and (2) the KEYBOARD SCOPE — while any '
+      + 'panel other than the Game panel owns it, the editor gate suppresses input to the '
+      + 'running game entirely. A bare modoki_focus {} fixes only the first. Pass panel:"game" '
+      + 'to drive the game. The response now echoes `focusedPanel` on every press, and warns '
+      + 'when a press reached NOTHING (no editor binding claimed it and the gate blocked it). '
+      + 'CAVEAT: this is renderer-level input — it does NOT trigger native Electron MENU ' +
       'accelerators, so a chord the OS menu claims (Cmd+R reload, Cmd+Alt+I devtools, and on ' +
       'Windows/Linux F12) reaches page handlers here but behaves differently for a human. ' +
       'Requires the Electron editor.',
     {
       key: z.string().describe("Electron keyCode, e.g. 'Escape', 'Delete', 'ArrowLeft', 'w', 'z'."),
-      modifiers: z.array(modifierEnum).optional().describe("Held modifiers, e.g. ['meta'] for Cmd+key."),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, e.g. ['meta'] for Cmd+key.`),
       panel: z.string().optional().describe(
-        'Focus this panel BEFORE pressing, so a panel-scoped chord resolves there. Ids: ' +
-        'scene | game | hierarchy | inspector | console | assets | animation-editor | timeline-editor | particle-editor | spriteanim-editor | skin-editor | ai. Fails loudly if the panel is not open.',
+        'Focus this panel BEFORE pressing, so a panel-scoped chord resolves there. Ids (CASE-'
+        + 'SENSITIVE — "Game" is not "game"): ' + IDS + '. A game may also register custom '
+        + 'panels, so this is the built-in set, not the whole vocabulary. REFUSED if that panel '
+        + 'has no open tab, naming the ones that do — the press is then NOT sent, so a refusal '
+        + 'never leaves you guessing whether the key landed. `modoki_get_editor_state.openPanels` '
+        + 'lists them.',
       ),
     },
     async ({ key, modifiers, panel }) => postJson('/api/input/key', { key, modifiers, panel }),
@@ -217,11 +254,15 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_focus',
     'Move keyboard focus in the editor window: focus the element matching `selector`, or — ' +
       'with NO selector — blur the currently-focused element (focus falls back to <body>). ' +
-      'General-purpose (focus any panel/canvas/input, or defocus a text field). The common ' +
+      'General-purpose (focus any panel/canvas/input, or defocus a text field). One common ' +
       "use is unblocking trusted key input for the GAME: the game's input sampler drops keys " +
       'while a DOM text field (Console filter, inspector) holds focus, and a viewport click ' +
-      'does NOT blur it — so call this (no selector) before modoki_press_key to drive ' +
-      'nav/jump/confirm. A non-focusable target (canvas/div) is given tabindex=-1 so it can ' +
+      'does NOT blur it — so call this (no selector) before modoki_press_key. ⚠️ THAT IS ONLY ' +
+      'HALF THE STORY: blurring does NOT move the keyboard scope, and while a panel other ' +
+      'than the Game panel owns the scope the editor gate suppresses game input outright — so ' +
+      'to DRIVE THE GAME pass panel:"game" (here or on modoki_press_key). A bare {} that is ' +
+      'expected to do that instead reports success and changes nothing, which is exactly the ' +
+      'false negative QA-PHYS-0003 measured. A non-focusable target (canvas/div) is given tabindex=-1 so it can ' +
       'take focus. Returns {focused, blurred, ok, activeElement} — a MISS is a named failure ' +
       '(invalid selector / no element matched / element refused focus), never a bare ok:false. ' +
       'KEYBOARD SCOPE vs DOM FOCUS are different things: `panel` sets which panel the editor ' +
@@ -232,8 +273,11 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     {
       selector: z.string().optional().describe('CSS selector to focus. Omit to blur the active element.'),
       panel: z.string().optional().describe(
-        'Set the editor KEYBOARD SCOPE to this panel (independent of DOM focus). Ids: ' +
-        'scene | game | hierarchy | inspector | console | assets | animation-editor | timeline-editor | particle-editor | spriteanim-editor | skin-editor | ai.',
+        'Set the editor KEYBOARD SCOPE to this panel (independent of DOM focus). Ids (CASE-'
+        + 'SENSITIVE — "Game" is not "game"): ' + IDS + '. A game may also register custom '
+        + 'panels, so this is the built-in set, not the whole vocabulary. REFUSED if that panel '
+        + 'has no open tab, naming the ones that do; `selector` is then NOT focused either, so '
+        + 'the call is all-or-nothing. `modoki_get_editor_state.openPanels` lists them.',
       ),
     },
     async ({ selector, panel }) => postJson('/api/input/focus', { selector, panel }),
@@ -260,9 +304,14 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'drop). AIM: this is the ONE input tool that cannot be aimed by `entity` — HTML5 DnD is a ' +
       'DOM-element protocol (the source element\'s own dragstart handler fills the DataTransfer), ' +
       'so an endpoint is a DOM `selector` or raw viewport {x,y}; there is no scene-entity endpoint ' +
-      'to resolve, and inside modoki_batch a raw {x,y} endpoint is refused (use selectors). It also ' +
-      'does NOT report the shared `matched`/`hitTarget`/`occluded` provenance the /api/input/* ' +
-      'routes carry — it runs through the editor-action relay instead. Works in dev AND the DMG.',
+      'to resolve, and inside modoki_batch a raw {x,y} endpoint is refused (use selectors). ' +
+      'OCCLUSION: `from`/`to` each carry the shared `matched`/`hitTarget`/`occluded` provenance, but ' +
+      'a covered endpoint is a WARNING, not a refusal (unlike every other aimed input tool): the ' +
+      'events are dispatched straight at the element, bypassing hit-testing, so the drop really ' +
+      'does land and refusing would reject a call that works. What it CANNOT be is a gesture a ' +
+      'human could perform — their drag is hit-tested into the cover — so `occluded:true` comes ' +
+      'with a warning saying exactly that. Do not rest a verdict on a covered drop. Works in dev ' +
+      'AND the DMG.',
     {
       // STRICT + refined, unlike the shared `pointSpec` (which carries an `entity` this route
       // cannot honour — see the description). An all-optional inline object accepted `{}` and a
@@ -312,15 +361,18 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'vertex/bone without eyeballing pixels. `button`/`clickCount`/`modifiers` as in ' +
       'modoki_tap (e.g. clickCount:2 to insert/rename, modifiers:["shift"] to add to a ' +
       'marquee selection). Reports `occluded` (BOOLEAN — same meaning as modoki_tap) plus ' +
-      '`occludedBy` naming the covering element; an off-screen or disabled handle is REFUSED ' +
-      'rather than tapped. Requires the Electron editor.',
+      '`occludedBy` naming the covering element. An off-screen, disabled, or OCCLUDED handle is ' +
+      'REFUSED rather than tapped: a press that provably lands on the covering element is a miss, ' +
+      'and reporting one as ok:true is how a covered handle reads as an inert one. Pass ' +
+      '`allowOccluded:true` to press anyway and see what happens. Requires the Electron editor.',
     {
       id: z.string().describe('Handle id from modoki_handles.'),
-      button: z.enum(['left', 'right', 'middle']).optional().describe('Mouse button held during the drag (default left).'),
-      clickCount: z.number().optional(),
-      modifiers: z.array(modifierEnum).optional(),
+      button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button to click with (default 'left'). This tool CLICKS — the 'held during the drag' wording here was copy-pasted from modoki_drag_handle."),
+      clickCount: z.number().optional().describe('1 = single (default), 2 = double-click — same meaning as modoki_tap.'),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, e.g. ["shift"] to add to a marquee selection — same meaning as modoki_tap.`),
+      allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Here the target is a HANDLE, and a covered one reads as an inert one — which is how a working gizmo handle under the SceneView toolbar got filed as a high-severity bug.`),
     },
-    async ({ id, button, clickCount, modifiers }) => postJson('/api/input/tap-handle', { id, button, clickCount, modifiers }),
+    async ({ id, button, clickCount, modifiers, allowOccluded }) => postJson('/api/input/tap-handle', { id, button, clickCount, modifiers, allowOccluded }),
   );
 
   // ── drag_handle — trusted drag of a named handle (Electron editor only) ──
@@ -331,10 +383,13 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'time, pose a bone). Destination is ONE of: `to:{x,y}` (absolute CSS px), `toId` ' +
       '(another handle\'s position — e.g. snap one vertex onto another), or `delta:{dx,dy}` ' +
       '(offset from the handle\'s current position). Resolves live coords server-side so ' +
-      'there is no query→drag race. `modifiers:["shift"]` = gizmo/snap. Occlusion is reported PER ' +
+      'there is no query→drag race. `modifiers:["shift"]` = gizmo/snap, and is HELD as a real ' +
+      'key for the whole drag (see modoki_drag). Occlusion is reported PER ' +
       'ENDPOINT — `fromTarget`/`toTarget` each carry `occluded` (boolean) + `occludedBy` — so a ' +
       'covered source and a covered destination are distinguishable (they need different fixes); ' +
-      '`toTarget` appears only for a `toId` destination. Requires the Electron editor.',
+      '`toTarget` appears only for a `toId` destination. An off-screen, disabled, or OCCLUDED ' +
+      'endpoint is REFUSED rather than dragged (the press would land on the cover, which reads as ' +
+      '"this handle does nothing"); `allowOccluded:true` forces it. Requires the Electron editor.',
     {
       id: z.string().describe('Handle id to drag (from modoki_handles).'),
       to: z.object({ x: z.number(), y: z.number() }).optional().describe('Absolute destination in viewport CSS px.'),
@@ -342,9 +397,10 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       delta: z.object({ dx: z.number(), dy: z.number() }).optional().describe('Offset from the handle\'s current position.'),
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button held for the drag (default 'left')."),
-      modifiers: z.array(modifierEnum).optional(),
+      modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, held for the WHOLE drag as a real keyDown/keyUp around the gesture — so a listener tracking the modifier's LEVEL (the 3D gizmo's snap) sees it down for every intermediate move.`),
+      allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Reported PER ENDPOINT — \`fromTarget\`/\`toTarget\` each carry their own \`occluded\`, since a covered source and a covered destination need different fixes.`),
     },
-    async ({ id, to, toId, delta, steps, button, modifiers }) => postJson('/api/input/drag-handle', { id, to, toId, delta, steps, button, modifiers }),
+    async ({ id, to, toId, delta, steps, button, modifiers, allowOccluded }) => postJson('/api/input/drag-handle', { id, to, toId, delta, steps, button, modifiers, allowOccluded }),
   );
 
   // ── type — trusted keyboard input into the focused element (Electron editor only) ──
@@ -357,12 +413,15 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       "terminal key: 'Tab'/'Escape' BLUR the field (use to verify commit-on-blur), " +
       "'Enter' submits. `typed` is MEASURED (the focused element's value delta), not the length of " +
       'what you asked for, and `valueAfter` echoes the field — so a short insert is a FAILURE naming ' +
-      'what landed. NON-ASCII (CJK, emoji, accented) text often cannot be inserted at all: ' +
-      "Chromium's synthetic char path can only type what it expresses as a keyCode, so set such a " +
-      'value through the app\'s own UI. Requires the Electron editor.',
+      'what landed. NON-ASCII (Japanese, emoji, accented) text DOES insert — measured on Electron ' +
+      '43. This used to say it could not, and steered agents to modoki_eval, which is a ' +
+      'NON-input write a controlled input never sees, so the advice was worse than the path it ' +
+      'replaced. When text really does not land, the live cause is a field that reformats or ' +
+      'rejects input as you type — read `valueAfter`, it names what is actually there. ' +
+      'Requires the Electron editor.',
     {
       text: z.string().describe('Text to type into the focused input.'),
-      clearFirst: z.boolean().optional().describe('Select-all + delete before typing (replace vs append).'),
+      clearFirst: z.boolean().optional().describe('Empty the field before typing (replace vs append). A field it could not empty is reported as an ERROR naming what is still in it, never a silent append.'),
       submitKey: z.string().optional().describe("Terminal key after typing: 'Enter', 'Tab', or 'Escape'."),
     },
     async ({ text, clearFirst, submitKey }) => postJson('/api/input/type', { text, clearFirst, submitKey }),

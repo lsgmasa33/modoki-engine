@@ -79,6 +79,50 @@ Rapier2D is compatible with the harness and does **not** trip the determinism gu
 - Collisions/sensors become **journal events** (`emit('@collision'|'@sensor', …)`) you assert on in
   `createTestWorld` — no screenshots. This is the payoff that justifies Rapier over Matter.js.
 
+### A frame cap must not change how the game behaves — substepping (2026-08-12)
+
+`frameDriver`'s cap skips the whole callback pass, `PRIORITY_ECS` included, so a frame cap is not
+a render setting: it changes the rate the **simulation** ticks at. Both systems used to step Rapier
+once per tick at `getSimDelta(world)`, so a quality tier's `low.targetFps: 30` doubled the solver
+timestep on exactly the devices nobody can inspect — stacks settle differently, joints soften, and
+a fast body travels twice as far per step (halving the effective CCD margin). Worse, a live
+demotion changed it *mid-play*.
+
+**Physics now simulates at 1/60 whatever the render rate** (owner, 2026-08-12). The frame's delta is
+divided into equal steps, none coarser than `MAX_PHYSICS_STEP_S` — a *ceiling* on the step, not a
+fixed-dt accumulator, because without a render-interpolation layer an accumulator makes a 60 Hz
+display do 0 steps on one frame and 2 on the next whenever rAF jitters. At 60 fps `count` is 1 and
+nothing changes. Detail and the rejected alternatives: `runtime/physics/physicsSubstep.ts`.
+
+Three consequences worth knowing, each one earned:
+
+- **Contact events are drained INSIDE the step loop, and ROUTED after it.** Rapier's auto-draining
+  `EventQueue` is cleared by every `world.step()`, so one drain after the loop would discard every
+  substep's contacts but the last — a contact that began and ended inside one frame would go
+  unreported at 30 fps and report fine at 60. The narrow-phase MANIFOLD is equally perishable, so
+  it is snapshotted at drain time too. But the fan-out to subscribers is **deferred to after the
+  Rapier→ECS pull** (`collectContactEvents` → `routeContactEvents`), because a subscriber must read
+  the pose and velocity the frame ENDS with. ⚠️ Routing inside the loop as well — which is what
+  landed first — silently handed every collision callback the PREVIOUS frame's `Transform` and
+  `RigidBody`. It is invisible in a unit test that only counts events, and it changed real
+  gameplay: `games/sling`'s bumper reads both the puck's velocity and its world position, so it
+  kicked the puck at its un-bounced APPROACH speed and the puck gained energy on every hit
+  (owner-reported, "the puck accelerates when it collides with a bumper"). Pinned in both
+  dimensions by the "a collision callback reads the POST-step world" test.
+- ⭐ **A kinematic target is re-issued PER SUBSTEP** (`retargetKinematics`). Rapier derives a
+  position-based kinematic body's implicit velocity as `(next − current) / timestep` inside the
+  step that consumes it, so a target set once per frame moves the body at `count`× speed in
+  substep 1 and not at all in substep 2. Measured against raw Rapier over 1 s: a **carried box
+  kept 4% of its 60 fps velocity** and slid 1.5 m off the back of the platform, and a box in the
+  platform's path was shoved ~2× as fast. Interpolating the target per substep reproduces the
+  60 fps sequence identically. Pinned by `physicsSubstepKinematic.test.ts`, which compares the two
+  rates rather than asserting fixed numbers — a fixture would pass a build where both rates are
+  equally wrong.
+- **Character controllers are not substepped**, deliberately: `stepCharacters` compares the body
+  against a teleport baseline rewritten only in the post-step pull-back, so a second call would
+  read the first substep's own motion as an external teleport. Its kinematic *target* still goes
+  through the per-substep re-issue above, since the solver consuming it is substepped.
+
 ## Traits (3 core + 1 singleton)
 
 Defined with koota `trait()` under `runtime/traits/`, registered with editor metadata in
@@ -150,7 +194,7 @@ propagation** (so children follow post-physics positions).
 4. **Rapier → ECS (pull).** Dynamic bodies: write body position/angle → `Transform` (`x,y,rz`) and
    live velocity → `RigidBody2D` (inverse conversion).
 5. **Events → 3 sinks.** Drain Rapier collision/sensor event queues and fan each enter/exit to:
-   (a) the **journal** — `emit('@collision', {a,b})` / `emit('@sensor', {sensor, other, phase})`
+   (a) the **journal** — `emit('@collision', {a, b, phase})` / `emit('@sensor', {sensor, other, phase})`
    (observability; assertable in tests), (b) the **Physics2DEvents manager** (code subscribers),
    and (c) any **OnCollision2D** trait on either collider (declarative action dispatch). See below.
 
@@ -166,7 +210,7 @@ The physics system is the single **producer** of contact/sensor events; game cod
 so reactions stay deterministic):
 
 **C — `Physics2DEvents` manager (imperative, the substrate).** A scene-scoped manager
-(`runtime/managers/Physics2DEvents.ts`, registered in `app/ecs/register.ts`) exposing a
+(`runtime/physics/Physics2DEvents.ts`, registered in `app/ecs/register.ts`) exposing a
 subscribe API to code:
 ```ts
 import { physics2DEvents } from '@modoki/engine/runtime';
@@ -190,11 +234,12 @@ green on enter, reverts on exit, and logs a `zone` journal event).
 ### The shared producer + the rich `@contact` event
 
 The enter/exit fan-out is dimension-agnostic and lives in ONE module,
-`runtime/physics/physicsContactEvents.ts` (`drainContactEvents` / `routePair` /
+`runtime/physics/physicsContactEvents.ts` (`collectContactEvents` / `routeContactEvents` /
+`routePair` /
 `synthesizeContactExits` / `makeFireOnCollision`), used by BOTH `physics2DSystem` and
 `physics3DSystem` — only the injected event bus + `OnCollision` trait differ, so a fix to the
 correctness-critical enter/exit balance can't silently miss a dimension. The bus itself comes from
-`runtime/managers/physicsEventBus.ts` (`createPhysicsEventBus` → two instances, `Physics2DEvents`
+`runtime/physics/physicsEventBus.ts` (`createPhysicsEventBus` → two instances, `Physics2DEvents`
 / `Physics3DEvents`, because one koota world can carry both 2D and 3D bodies and their subscriber
 sets must not conflate).
 
@@ -205,7 +250,9 @@ fans a rich **`@contact`** event, `{ a, b, point, normal, speed }` — the world
 once per contact begin (sensors carry no manifold, so they're skipped). Code subscribes via
 `physics2DEvents.onContact((a, b, detail) => …)`; the journal event is GUID-addressed (Percept).
 `emitContactDetail` is per-dimension (manifold reading is Rapier-2D-vs-3D-specific) and is the
-optional `onPair` hook `drainContactEvents` invokes.
+optional `onPair` hook `routeContactEvents` invokes. It is split in two on purpose: the manifold is
+read by `captureManifold*` at DRAIN time (it is gone after the next `world.step`), while `speed`
+comes from the ECS velocities AFTER the pull — see the substep note above.
 
 Two removal subtleties: Rapier emits **no stop event** when a collider is freed/rebuilt, so
 `synthesizeContactExits` walks the still-overlapping pairs and fires the missing `exit` **before**
@@ -306,7 +353,7 @@ Pair it with a **kinematic** `RigidBody2D` + a `Collider2D` (box/capsule).
   (GAME priority, so sim-gated) bridges that resource's axis/jump onto every `CharacterController2D`
   each frame. Because it reads plain trait data, `characterInputSystem` is deterministic and runs in
   the harness too — a test spawns `Input`, sets its fields, and asserts on `moveX`/`jump`.
-- **Controls (demo):** A/D or ←/→ to move, W/↑/Space to jump. See `2d-physics-demo/platformer.json`.
+- **Controls (demo):** A/D or ←/→ to move, W/↑/Space to jump. See `2d-physics-demo/platformer.scene.json`.
 
 ## Character sprite animation (Phase 4.6)
 
@@ -335,7 +382,7 @@ driver tying motion state to a clip. `CharacterAnimator2D` (`runtime/traits/Char
 - **Demo asset:** `2d-physics-demo/…/sprites/player.png` — a **CC0** character sheet
   (bevouliin.com via OpenGameArt), cropped to alpha bounds and packed into a uniform 6×2 grid of
   192×320 cells, sliced via its `.meta.json`; attribution in `2d-physics-demo/ATTRIBUTION.md`.
-  The `platformer.json` Player uses it: `idle` 2 frames, `walk` 6, `jump` 2 (`mode:"once"`, so it
+  The `platformer.scene.json` Player uses it: `idle` 2 frames, `walk` 6, `jump` 2 (`mode:"once"`, so it
   holds the falling frame while airborne).
 
 ## Scene queries & runtime forces (both dimensions)
@@ -364,6 +411,26 @@ priority (< PHYSICS) so an impulse this frame is integrated by this frame's step
   `applyTorqueImpulse` / `addTorque` / `setAngvel`, plus `wakeBody{2,3}D`. Linear quantities are
   world units (scaled by `pixelsPerMeter`/`unitsPerMeter`); torque + angular impulse carry length²
   so they scale by that factor squared. Angular velocity is radians/s and is NOT length-scaled.
+
+## Agent surface (scene queries)
+
+`modoki_scene_query` / `device_scene_query` expose all six scene-query exports behind one tool
+(`kind: 'raycast'|'shapecast'|'point'` × `dim: '2d'|'3d'`). The durable fact: the raw functions
+collapse three distinguishable outcomes onto the same `null` — no physics world, a zero-length
+direction, and a genuine miss. That's harmless in game code (the next line is `if (hit)`), but
+through an agent tool it's "could not look" reported as "nothing is there". The tool rules out the
+first two BEFORE casting, so `ok:true` with `hit:null` genuinely means the query ran and found
+nothing. That required a new exported predicate per dimension, `hasPhysics2D`/`hasPhysics3D`
+(`physics2DSystem.ts`/`physics3DSystem.ts`) — nothing exported could previously answer "does a
+Rapier world exist at all." A world exists only once the physics system has ticked, i.e. while the
+sim is Playing; a stopped editor has none, and a scene with no colliders never builds one.
+
+Hits report `guid`/`name` beside the raw `entityId` (runtime ids are reassigned on every scene
+reload). `pointQuery` results are not padded with a zeroed distance/normal — same field, same
+meaning, or absent; a `distance:0` on a raycast means "started inside a collider", a different fact.
+`exclude` takes a guid or an exact name, never a raw id, and is refused outright for
+`kind:'shapecast'` — `castShape` takes no exclusion filter, and accepting-then-ignoring it would
+answer a different question than the one asked (the caster's own body is the likeliest hit).
 
 ## Joints & constraints (2D + 3D)
 
@@ -494,7 +561,7 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
   preventDefaulted), **Alt/Cmd-click** a handle to delete (never below the shape minimum —
   3 for polygon/concave, 2 for polyline). Every edit is one undo entry and writes the `points` field (GUID-safe
   — points are inline coordinates, not an asset ref). The gizmo is hidden while editing. Pure list
-  ops live in `runtime/scene/colliderPoints.ts`; the world↔local point math + vertex picking in
+  ops live in `runtime/core/colliderPoints.ts`; the world↔local point math + vertex picking in
   `editor/panels/colliderEdit2D.ts`.
 - **`sprite: 'collider'` render mode** (DONE): a polygon/polyline/concave collider has no primitive
   equivalent, so give its entity a `Renderable2D` with `sprite: 'collider'` and it draws the
@@ -538,12 +605,12 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
 
 | Sub-phase | Scope | Status | Verification |
 |---|---|---|---|
-| **4.1 — CCD** | Already wired via `RigidBody2D.ccd` → `setCcdEnabled`; add proof + demo. | ✅ done | `tests/runtime/physics2DCcd.test.ts` — fast ball tunnels a thin wall with `ccd:false`, is stopped with `ccd:true`. Demo scene `2d-physics-demo/…/ccd-tunneling.json` (two gravity-launched balls, CCD on/off). |
-| **4.2 — Compound colliders** | One `RigidBody2D` adopts DIRECT child entities that have `Collider2D` but no own `RigidBody2D`, attaching each as a collider at the child's local Transform offset. Single-level only (grandchildren not chained). `physics2DSystem`: `collectCompoundChildren` groups by numeric `parentId`; `BodyRec.colliderHandles` tracks own+child handles; child edits change `bodySig` → rebuild. | ✅ done | `tests/runtime/physics2DCompound.test.ts` — two-footed body straddles a gap a single centered box falls through; a child collider's collision resolves to the child entity. Demo `2d-physics-demo/…/compound-colliders.json` (table, cross, dumbbell). |
-| **4.3 — Collision-mesh authoring** | SceneView "collider edit mode" (⬟ Points toolbar toggle): draggable vertex handles for `polygon`/`polyline`/`concave` colliders — drag to move, double-click an edge to insert, Alt/Cmd-click a handle to delete; writes the `points` field (undoable). Pure logic in `runtime/scene/colliderPoints.ts`; world↔local + picking in `editor/panels/colliderEdit2D.ts`. | ✅ done | `tests/runtime/colliderPoints.test.ts` (parse/serialize/move/insert/remove/nearest-edge) + `tests/editor/colliderEdit2D.test.ts` (world↔local round-trip, pickVertex). Demo `2d-physics-demo/…/collider-mesh.json` (editable polygon ramp + polyline terrain). |
-| **4.4 — Convex decomposition** | New `concave` shape: `poly-decomp-es` decomposes the point list into convex pieces → multiple `convexHull` colliders on ONE body (so a DYNAMIC concave solid works; a lone hull would fill the concavity). `makeColliderDesc` now returns a desc ARRAY; `attachCollider` returns handle[]. Falls back to a single hull if the list isn't decomposable. Editable via ⬟ Points. | ✅ done | `tests/runtime/physics2DConcave.test.ts` — a U-cup catches a ball inside (y>0) where the same points as a `polygon` hull leave it on top (y<0); decomposition splits a U into >1 piece. Demo `2d-physics-demo/…/concave-shapes.json` (bowl collecting balls + a dynamic boomerang). |
-| **4.5 — Character controller** | `CharacterController2D` trait (kinematic body) driven inside `physics2DSystem` via Rapier's `KinematicCharacterController` (collide-and-slide, autostep, slope limits, snap-to-ground, grounded + velY readback). Passive window keys (`keyboardSource`) feed the `Input` resource via `inputSystem`; `characterInputSystem` bridges that resource's moveX/jump onto the trait each frame (sim-gated; harness-safe — reads trait data, not the DOM). | ✅ done | `tests/runtime/physics2DCharacter.test.ts` — walks + grounded, falls unsupported, blocked by a wall, auto-steps a ledge only when enabled (driven by trait fields). Demo `2d-physics-demo/…/platformer.json` (A/D move · Space jump · stairs · platform · wall). |
-| **4.6 — Character sprite animation** | `CharacterAnimator2D` trait + `characterAnimationSystem` (GAME priority) map `CharacterController2D` motion state → active `SpriteAnimator` clip (jump/walk/idle) and flip facing via `Renderable2D.flipX`. Reuses the existing flipbook stack (`SpriteAnimator` + grid slicing + `resolveSprite` sub-rects). Registered in the Inspector **Add Component** menu. | ✅ done | `tests/runtime/characterAnimation.test.ts` — clip selection (idle/walk/jump, threshold), facing flip + magnitude preserved, `flip:false` opt-out. Demo `2d-physics-demo/…/platformer.json` Player uses `sprites/player.png` (CC0, 6×2 sheet of 192×320 cells). |
+| **4.1 — CCD** | Already wired via `RigidBody2D.ccd` → `setCcdEnabled`; add proof + demo. | ✅ done | `tests/runtime/physics2DCcd.test.ts` — fast ball tunnels a thin wall with `ccd:false`, is stopped with `ccd:true`. Demo scene `2d-physics-demo/…/ccd-tunneling.scene.json` (two gravity-launched balls, CCD on/off). |
+| **4.2 — Compound colliders** | One `RigidBody2D` adopts DIRECT child entities that have `Collider2D` but no own `RigidBody2D`, attaching each as a collider at the child's local Transform offset. Single-level only (grandchildren not chained). `physics2DSystem`: `collectCompoundChildren` groups by numeric `parentId`; `BodyRec.colliderHandles` tracks own+child handles; child edits change `bodySig` → rebuild. | ✅ done | `tests/runtime/physics2DCompound.test.ts` — two-footed body straddles a gap a single centered box falls through; a child collider's collision resolves to the child entity. Demo `2d-physics-demo/…/compound-colliders.scene.json` (table, cross, dumbbell). |
+| **4.3 — Collision-mesh authoring** | SceneView "collider edit mode" (⬟ Points toolbar toggle): draggable vertex handles for `polygon`/`polyline`/`concave` colliders — drag to move, double-click an edge to insert, Alt/Cmd-click a handle to delete; writes the `points` field (undoable). Pure logic in `runtime/core/colliderPoints.ts`; world↔local + picking in `editor/panels/colliderEdit2D.ts`. | ✅ done | `tests/runtime/colliderPoints.test.ts` (parse/serialize/move/insert/remove/nearest-edge) + `tests/editor/colliderEdit2D.test.ts` (world↔local round-trip, pickVertex). Demo `2d-physics-demo/…/collider-mesh.scene.json` (editable polygon ramp + polyline terrain). |
+| **4.4 — Convex decomposition** | New `concave` shape: `poly-decomp-es` decomposes the point list into convex pieces → multiple `convexHull` colliders on ONE body (so a DYNAMIC concave solid works; a lone hull would fill the concavity). `makeColliderDesc` now returns a desc ARRAY; `attachCollider` returns handle[]. Falls back to a single hull if the list isn't decomposable. Editable via ⬟ Points. | ✅ done | `tests/runtime/physics2DConcave.test.ts` — a U-cup catches a ball inside (y>0) where the same points as a `polygon` hull leave it on top (y<0); decomposition splits a U into >1 piece. Demo `2d-physics-demo/…/concave-shapes.scene.json` (bowl collecting balls + a dynamic boomerang). |
+| **4.5 — Character controller** | `CharacterController2D` trait (kinematic body) driven inside `physics2DSystem` via Rapier's `KinematicCharacterController` (collide-and-slide, autostep, slope limits, snap-to-ground, grounded + velY readback). Passive window keys (`keyboardSource`) feed the `Input` resource via `inputSystem`; `characterInputSystem` bridges that resource's moveX/jump onto the trait each frame (sim-gated; harness-safe — reads trait data, not the DOM). | ✅ done | `tests/runtime/physics2DCharacter.test.ts` — walks + grounded, falls unsupported, blocked by a wall, auto-steps a ledge only when enabled (driven by trait fields). Demo `2d-physics-demo/…/platformer.scene.json` (A/D move · Space jump · stairs · platform · wall). |
+| **4.6 — Character sprite animation** | `CharacterAnimator2D` trait + `characterAnimationSystem` (GAME priority) map `CharacterController2D` motion state → active `SpriteAnimator` clip (jump/walk/idle) and flip facing via `Renderable2D.flipX`. Reuses the existing flipbook stack (`SpriteAnimator` + grid slicing + `resolveSprite` sub-rects). Registered in the Inspector **Add Component** menu. | ✅ done | `tests/runtime/characterAnimation.test.ts` — clip selection (idle/walk/jump, threshold), facing flip + magnitude preserved, `flip:false` opt-out. Demo `2d-physics-demo/…/platformer.scene.json` Player uses `sprites/player.png` (CC0, 6×2 sheet of 192×320 cells). |
 
 **Note on the CCD demo (4.1):** CCD-*off* tunneling is inherently framerate-dependent (a discrete
 step tunnels only when no sub-step sample lands inside the obstacle), so the demo drives the balls
@@ -558,3 +625,19 @@ the demo; the CCD-*on* ball stops reliably regardless of framerate.
   handedness. Confirm before Phase 1.
 - **koota add/remove hooks** — if koota exposes `onAdd`/`onRemove` per trait, reconciliation is
   event-driven; otherwise a per-frame diff against a known-set. Both work; events are cheaper.
+
+## Known deferred (won't-fix) — from the 2026-07-02 review
+
+A multi-agent review of the 2D physics subsystem confirmed 22 findings; 19 landed (Batches 1–4).
+Three LOW-severity items were deliberately deferred rather than fixed:
+
+- **P2 — per-frame sig strings for every body.** `bodySig`/`colliderGeomSig`/`childSig` recompute
+  every tick even for a settled scene. Gating this behind change-tracking needs koota
+  change-tracking across compound-child transforms, which doesn't exist — not worth the
+  regression risk for a LOW item.
+- **Mem4 — `resolveColliderBits` allocates an object per body/child per tick** for
+  change-detection. Same reason as P2: inherent to the string-signature change-detection
+  approach: fixing it packs the two 16-bit values into one number, deferred alongside P2.
+- **P1 — the editor's collider debug overlay has no change-gate** (`drawColliderOverlays`
+  re-parses/re-tessellates every frame). Editor-only, off by default — not worth the change-gate
+  plumbing for a debug visualization nobody has it on for.

@@ -9,9 +9,9 @@
  *  profiler confidently wrong rather than merely absent, which is worse than having no profiler
  *  at all — the plan exists because a previous fix was shipped against the wrong bottleneck. */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
-  recordFrame, getFrameProfile, resetFrameProfile,
+  recordFrame, getFrameProfile, resetFrameProfile, setProfilerFrameCap, getWorstStallWindow,
   BUDGET_30FPS_MS, PROFILE_WINDOW_FRAMES,
 } from '../../src/runtime/core/frameProfiler';
 
@@ -151,10 +151,82 @@ describe('frameProfiler — discontinuities', () => {
     expect(getFrameProfile().discontinuities).toBe(2);
   });
 
+  it('SIZES the worst stall, not just counts it — 1.1s and 7s are not the same fault', () => {
+    // The count alone was the whole instrument for the boot stall (#212 item 3), and it reads
+    // identically for a hitch and a freeze — which is why a 3,926 ms figure could sit unverified.
+    feed([
+      { frameMs: 16, cpuMs: 4 },
+      { frameMs: 1290, cpuMs: 5 },
+      { frameMs: 16, cpuMs: 4 },
+      { frameMs: 3926, cpuMs: 5 },
+      { frameMs: 16, cpuMs: 4 },
+    ]);
+    const p = getFrameProfile();
+    expect(p.discontinuities).toBe(2);
+    expect(p.worstStallMs).toBe(3926);   // the WORST, not the latest
+    expect(p.frameMs.max).toBe(16);      // and still kept out of the percentiles
+  });
+
+  it('records WHEN the worst stall was, so it can be intersected with the boot timeline', () => {
+    // #238: "1,814 ms" is unattributable on its own. The window is the coordinate that lets the
+    // boot timeline answer what was open across it — which is the difference between a
+    // measurement and the three wrong guesses this workstream has already published.
+    feed([
+      { frameMs: 16, cpuMs: 4 },
+      { frameMs: 1290, cpuMs: 5 },
+      { frameMs: 16, cpuMs: 4 },
+      { frameMs: 3926, cpuMs: 5 },
+    ], 1000);
+    // Frame starts: 1000, 1016, 2306, 2322, 6248 — the worst stall spans the last interval.
+    expect(getWorstStallWindow()).toEqual({ startMs: 2322, endMs: 6248 });
+    expect(getFrameProfile().worstStallMs).toBe(3926);
+  });
+
+  it('has no stall window before any frame is dropped, and clears it on reset', () => {
+    feed([{ frameMs: 16, cpuMs: 4 }, { frameMs: 17, cpuMs: 4 }]);
+    expect(getWorstStallWindow()).toBeNull();
+    feed([{ frameMs: 2000, cpuMs: 4 }], 50_000);
+    expect(getWorstStallWindow()).not.toBeNull();
+    resetFrameProfile();
+    // A stale window would attribute the NEXT measurement to spans from the previous one.
+    expect(getWorstStallWindow()).toBeNull();
+  });
+
+  it('reports no stall as 0 rather than a stale high-water mark', () => {
+    feed([{ frameMs: 16, cpuMs: 4 }, { frameMs: 17, cpuMs: 4 }]);
+    expect(getFrameProfile().worstStallMs).toBe(0);
+  });
+
   it('ignores a zero or negative interval', () => {
     recordFrame(1000, 1002);
     recordFrame(1000, 1002); // same timestamp — no elapsed interval
     expect(getFrameProfile().samples).toBe(0);
+  });
+});
+
+describe('frameProfiler — setProfilerFrameCap (#202 close-out: the cap must be judged against itself)', () => {
+  // ⚠️ `low`'s seeded `targetFps: 30` produces a ~33.3ms median, which is not within 1.2x of ANY
+  // display interval in VSYNC_INTERVALS_MS (the largest accepted median there is 20ms). Without
+  // `setProfilerFrameCap`, a device obeying its own 30fps cap read `vsyncBound: false` and
+  // `overBudget` against the fixed 30fps budget — which made live promotion out of `low`
+  // mathematically impossible fleet-wide. This is the regression that fix exists to close.
+  afterEach(() => setProfilerFrameCap(0)); // module state — must not leak into other test files
+
+  it('a device pacing to a 30fps cap reads vsyncBound + NOT overBudget, capped at 30', () => {
+    setProfilerFrameCap(30);
+    feed(Array.from({ length: 20 }, () => ({ frameMs: 1000 / 30, cpuMs: 5 })));
+    const p = getFrameProfile();
+    expect(p.vsyncBound).toBe(true);
+    expect(p.overBudget).toBe(false);
+  });
+
+  it('the SAME frames read NOT vsyncBound with no cap in force (0 = uncapped)', () => {
+    // Distinguishing control: same frame times, only the cap differs. ~33.3ms clears none of the
+    // display intervals (largest accepted median there is 20ms), so with no cap this must flip.
+    setProfilerFrameCap(0);
+    feed(Array.from({ length: 20 }, () => ({ frameMs: 1000 / 30, cpuMs: 5 })));
+    const p = getFrameProfile();
+    expect(p.vsyncBound).toBe(false);
   });
 });
 
@@ -181,6 +253,7 @@ describe('frameProfiler — the ring', () => {
     const p = getFrameProfile();
     expect(p.samples).toBe(0);
     expect(p.discontinuities).toBe(0);
+    expect(p.worstStallMs).toBe(0);
     // The baseline is cleared too, so the next single frame produces no phantom interval
     // measured against a timestamp from before the reset.
     recordFrame(50000, 50004);

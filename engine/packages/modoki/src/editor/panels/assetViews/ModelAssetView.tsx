@@ -24,6 +24,7 @@ import { inputStyle, BufferedNumberInput } from '../fields';
 import { ModelPreview } from '../ModelPreview';
 import { formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
 import { withCurrentValue } from './importSettingOptions';
+import { useAssetInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
 
 /** Cheap rigged-detection: does this GLB declare a skin? Fetches the file and reads
  *  only its glTF JSON chunk (glbDeclaresSkin), so the Model inspector shows
@@ -73,8 +74,24 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
     return `${dir}/${baseName}.prefab.json`;
   }, [path]);
 
+  // Refresh the sidecar-derived stats when a re-import fires from ANYWHERE — the
+  // Assets panel's "Re-import all", a batch view, the agent bridge (#303). Before
+  // this, `loadMeta` ran on mount and after our OWN Import button only, so a
+  // foreign re-import left every sidecar-sourced number (source tris, LOD bytes,
+  // LOD count, hasCache — which decides whether the LOD switcher is offered at
+  // all) showing pre-reimport values while the preview beside them updated.
+  //
+  // It lives in `loadMeta`'s deps rather than the mount effect's, and it is a REAL
+  // dep, not a poke: the epoch cache-busts the read-meta URL. The sidecar is
+  // rewritten in place at a URL that does not change, which is exactly the shape
+  // of request a browser is entitled to replay from cache.
+  //
+  // The self-initiated path therefore reads the sidecar twice — once explicitly,
+  // once via this epoch. Harmless: one coalesced call returning the same bytes.
+  const reimportEpoch = useAssetInvalidationEpoch('model', (_p, targets) => targets.has(path));
+
   const loadMeta = useCallback((signal?: AbortSignal) => {
-    return backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`, signal ? { signal } : undefined)
+    return backendFetch(cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, reimportEpoch), signal ? { signal } : undefined)
       .then((r) => (r.ok ? r.json() : {}))
       .then((m: Record<string, unknown>) => {
         setMeta(m);
@@ -82,7 +99,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
         setTexSettings(resolveTextureSettings(m as Parameters<typeof resolveTextureSettings>[0]));
       })
       .catch(() => { /* keep defaults */ });
-  }, [path]);
+  }, [path, reimportEpoch]);
 
   // Probe whether the model's prefab exists on disk — drives the button label
   // (Import when missing, Re-import when present). Re-runs after import so the
@@ -316,7 +333,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
         <div style={sectionStyle}>Texture Compression</div>
         <div style={rowStyle}>
           <span style={labelStyle}>Format</span>
-          <select value={texSettings.format} onChange={(e) => updateTex({ format: e.target.value as TextureFormat })} style={{ ...inputStyle, flex: 1 }}>
+          <select data-ui-id="assetView.model.rig.textureFormat" data-ui-kind="field" data-ui-label="Texture Format" value={texSettings.format} onChange={(e) => updateTex({ format: e.target.value as TextureFormat })} style={{ ...inputStyle, flex: 1 }}>
             <option value="ktx2-uastc">KTX2 UASTC (default)</option>
             <option value="ktx2-etc1s">KTX2 ETC1S (small)</option>
             <option value="png">Raw (no KTX2)</option>
@@ -324,18 +341,18 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>Max Size</span>
-          <select value={String(texSettings.maxSize)} onChange={(e) => updateTex({ maxSize: Number(e.target.value) as TextureImportSettings['maxSize'] })} style={{ ...inputStyle, flex: 1 }}>
+          <select data-ui-id="assetView.model.rig.maxSize" data-ui-kind="field" data-ui-label="Max Size" value={String(texSettings.maxSize)} onChange={(e) => updateTex({ maxSize: Number(e.target.value) as TextureImportSettings['maxSize'] })} style={{ ...inputStyle, flex: 1 }}>
             {withCurrentValue(TEXTURE_MAX_SIZES, texSettings.maxSize).map((s) => <option key={s} value={s}>{s}</option>)}
           </select>
         </div>
         <label style={{ ...rowStyle, cursor: 'pointer' }}>
-          <input type="checkbox" checked={texSettings.mipmaps} onChange={(e) => updateTex({ mipmaps: e.target.checked })} />
+          <input data-ui-id="assetView.model.rig.mipmaps" data-ui-kind="toggle" data-ui-label="Generate Mipmaps" data-ui-state={texSettings.mipmaps ? 'checked' : 'unchecked'} type="checkbox" checked={texSettings.mipmaps} onChange={(e) => updateTex({ mipmaps: e.target.checked })} />
           <span style={labelStyle}>Generate Mipmaps</span>
         </label>
         {texSettings.format === 'ktx2-uastc' && (<>
           <div style={rowStyle}>
             <span style={labelStyle}>UASTC Level</span>
-            <select value={String(texSettings.uastcLevel ?? DEFAULT_UASTC_LEVEL)} onChange={(e) => updateTex({ uastcLevel: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
+            <select data-ui-id="assetView.model.rig.uastcLevel" data-ui-kind="field" data-ui-label="UASTC Level" value={String(texSettings.uastcLevel ?? DEFAULT_UASTC_LEVEL)} onChange={(e) => updateTex({ uastcLevel: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
               {withCurrentValue(UASTC_LEVELS, texSettings.uastcLevel ?? DEFAULT_UASTC_LEVEL).map((l) => <option key={l} value={l}>{l}{l === DEFAULT_UASTC_LEVEL ? ' (default)' : ''}</option>)}
             </select>
           </div>
@@ -354,7 +371,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
 
         <div style={sectionStyle}>Skeleton</div>
         <label style={{ ...rowStyle, cursor: 'pointer' }} title="Expand the skeleton into Bone entities under the prefab root (Unity-style), so you can drive bones from code and parent props to them. Off keeps the skeleton internal to the root. Takes effect on Re-import.">
-          <input type="checkbox" checked={expandSkeleton} onChange={(e) => setExpandSkeleton(e.target.checked)} />
+          <input data-ui-id="assetView.model.rig.expandSkeleton" data-ui-kind="toggle" data-ui-label="Expand skeleton into bone entities" data-ui-state={expandSkeleton ? 'checked' : 'unchecked'} type="checkbox" checked={expandSkeleton} onChange={(e) => setExpandSkeleton(e.target.checked)} />
           <span style={labelStyle}>Expand skeleton into bone entities</span>
         </label>
         <div style={{ color: '#666', fontSize: '10px', margin: '0 0 6px', lineHeight: 1.4 }}>
@@ -366,7 +383,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       <div style={sectionStyle}>LOD</div>
       <div style={rowStyle}>
         <span style={labelStyle}>Levels</span>
-        <select value={String(settings.lodCount)} onChange={(e) => update({ lodCount: Number(e.target.value) as LodCount })} style={{ ...inputStyle, flex: 1 }}>
+        <select data-ui-id="assetView.model.lod.levels" data-ui-kind="field" data-ui-label="Levels" value={String(settings.lodCount)} onChange={(e) => update({ lodCount: Number(e.target.value) as LodCount })} style={{ ...inputStyle, flex: 1 }}>
           <option value="1">1 (no LOD)</option>
           <option value="2">2 levels</option>
           <option value="3">3 levels</option>
@@ -403,6 +420,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
             <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 4, flexWrap: 'wrap' }}>
               <span style={{ color: '#777', fontSize: '10px' }}>ratio</span>
               <input
+                data-ui-id={`assetView.model.lod.${i}.ratio`} data-ui-kind="field" data-ui-label={`LOD${i} ratio`}
                 type="number" step={0.05} min={0} max={1}
                 value={settings.lodRatios[i] ?? 1}
                 onChange={(e) => { const n = Number(e.target.value); if (Number.isFinite(n)) updateLodLevel(i, 'ratio', n); }}
@@ -410,12 +428,14 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
               />
               <span style={{ color: '#777', fontSize: '10px' }}>dist</span>
               <input
+                data-ui-id={`assetView.model.lod.${i}.distance`} data-ui-kind="field" data-ui-label={`LOD${i} distance`}
                 type="number" step={1} min={0}
                 value={settings.lodDistances[i] ?? 0}
                 onChange={(e) => { const n = Number(e.target.value); if (Number.isFinite(n)) updateLodLevel(i, 'distance', n); }}
                 style={{ ...inputStyle, width: 50 }}
               />
               <select
+                data-ui-id={`assetView.model.lod.${i}.encoder`} data-ui-kind="field" data-ui-label={`LOD${i} encoder`}
                 value={lodEnc}
                 onChange={(e) => updateLodEncoder(i, e.target.value as ModelEncoder)}
                 title="Encoder used for this LOD. gltf-transform preserves mesh names + quality; gltfpack hits the ratio more aggressively but renames meshes."
@@ -430,6 +450,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
               title={meshoptHint}
             >
               <input
+                data-ui-id={`assetView.model.lod.${i}.meshopt`} data-ui-kind="toggle" data-ui-label={`LOD${i} meshopt compress`} data-ui-state={lodMeshopt ? 'checked' : 'unchecked'}
                 type="checkbox"
                 checked={lodMeshopt}
                 onChange={(e) => updateLodFlag(i, 'meshopt', e.target.checked)}
@@ -445,6 +466,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
               title={aggressiveHint}
             >
               <input
+                data-ui-id={`assetView.model.lod.${i}.aggressive`} data-ui-kind="toggle" data-ui-label={`LOD${i} aggressive simplify`} data-ui-state={lodAggressive ? 'checked' : 'unchecked'}
                 type="checkbox"
                 checked={lodAggressive}
                 onChange={(e) => updateLodFlag(i, 'aggressive', e.target.checked)}
@@ -461,6 +483,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       <div style={rowStyle} title="Caps how far ratio can simplify. The encoder quits once this error budget is hit, even if the target ratio isn't reached. 0.01 = strict (hero meshes), 0.5 = loose (let ratio drive), 1.0 = unconstrained.">
         <span style={labelStyle}>Error tolerance</span>
         <input
+          data-ui-id="assetView.model.lod.errorTolerance" data-ui-kind="field" data-ui-label="Error tolerance"
           type="number" step={0.005} min={0} max={1}
           value={settings.simplifyError}
           onChange={(e) => { const n = Number(e.target.value); if (Number.isFinite(n)) update({ simplifyError: n }); }}
@@ -477,7 +500,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
             <div style={sectionStyle}>Encoder options</div>
             <div style={rowStyle} title="One-time pre-simplify weld pass for gltf-transform LODs. Coincident vertices get merged so simplify can collapse across former UV/normal splits.">
               <span style={labelStyle}>Weld verts</span>
-              <input type="checkbox" checked={settings.weld} onChange={(e) => update({ weld: e.target.checked })} />
+              <input data-ui-id="assetView.model.lod.weld" data-ui-kind="toggle" data-ui-label="Weld verts" data-ui-state={settings.weld ? 'checked' : 'unchecked'} type="checkbox" checked={settings.weld} onChange={(e) => update({ weld: e.target.checked })} />
             </div>
           </>
         );
@@ -485,6 +508,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       </>)}
 
       <button
+        data-ui-id="assetView.model.apply" data-ui-kind="button" data-ui-label={(hasCache && hasPrefab) ? 'Re-import' : 'Import'}
         disabled={importing}
         onClick={apply}
         style={{ ...reimportBtnStyle, marginTop: 8, background: importing ? '#555' : '#2ecc71', color: '#fff', border: `1px solid ${importing ? '#444' : '#27ae60'}`, cursor: importing ? 'wait' : 'pointer' }}

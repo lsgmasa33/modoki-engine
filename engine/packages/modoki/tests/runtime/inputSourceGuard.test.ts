@@ -42,7 +42,7 @@ const ALLOW = new Set<string>([
   'games/3d-test/runtime/ui/DebugMenu.tsx',
   // Engine in-game debug menu, toggled by F12 / 3-finger tap — a debug-overlay UI
   // gesture (build-flag-gated, tree-shaken out when off), not gameplay input feeding
-  // traits, so it stays a direct window listener. See docs/debug-menu-plan.md.
+  // traits, so it stays a direct window listener. See docs/debug-menu.md.
   'engine/packages/modoki/src/runtime/debug/DebugMenu.tsx',
 ]);
 

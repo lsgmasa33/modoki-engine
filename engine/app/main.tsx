@@ -5,21 +5,28 @@ import './sharedRegistry'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
+// Global JS error capture -> the game's `crashlytics` app-service (#275). A SIDE-EFFECT import,
+// and it must stay ABOVE `./App.tsx`: imports are hoisted and evaluated in source order before any
+// statement below runs, so calling the installer as main.tsx's first statement would still let
+// App.tsx's whole module graph execute uncovered. See ./installErrorCapture.ts.
+import './installErrorCapture'
 import App from './App.tsx'
 import { Capacitor } from '@capacitor/core'
-import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, readPerfProfile, setProfilerEnabled } from '@modoki/engine/runtime'
+import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, setTierFrameCapEnabled, setTierCalibrationEnabled, setBootProbeAllowed, readPerfProfile, setProfilerEnabled } from '@modoki/engine/runtime'
+
 
 // Debug build — event-journal recording gate. ON in the editor (dev + the packaged
 // Electron editor, __MODOKI_EDITOR__) and in a game build that opts in via
 // project.config.json `build.debugBuild`; OFF in a normal shipped game build so
 // `emit()` adds no per-event allocation on hot paths (physics contacts, etc.).
-// (Deferred: a debug|profile|release mode enum — see docs/percept-plan.md.)
+// (Deferred: a debug|profile|release mode enum in place of these two booleans — four surfaces
+// below gate on the same pair. Why it is not obviously right: docs/todo.md § Deferred decisions.)
 setJournalEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 
 // In-game debug menu — ON in the editor (dev + packaged Electron editor) and in a
 // game build that opts in via project.config.json `build.debugBuild`. The App.tsx
 // lazy import is gated on the same OR, so a release build with the flag off
-// tree-shakes the whole debug-menu chunk out. See docs/debug-menu-plan.md.
+// tree-shakes the whole debug-menu chunk out. See docs/debug-menu.md.
 setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 
 // Live-inspection handles (`window.__3d` — camera/scene/renderer) — same gate again. Without
@@ -27,6 +34,37 @@ setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 // one `device_eval`; a release build with the flag off publishes nothing. Deliberately its own
 // switch rather than riding the journal's, so a game can drop journal cost without going blind.
 setDebugHandlesEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
+
+// The boot ramp probe — refused in a PLAYABLE AD and nowhere else (#221 W2 item 5). It is the
+// only build where a launch-blocking measurement is unaffordable: an ad network measures
+// time-to-interaction, and since the probe learned to settle within one launch its bill on real
+// phones is 1.6-1.8 s. Every cheaper layer still answers (player pin, project pin, single-config,
+// the iOS model table, GPU identity), so a playable on recognised hardware is unaffected — it was
+// never reaching the probe. On unrecognised hardware it starts `calibrating` and the live loop
+// corrects within seconds.
+// ⚠️ SET SYNCHRONOUSLY HERE, not from `bootPlayable` — that arrives via a dynamic import, and the
+// tier is resolved by App.tsx's boot effect, which does not wait for it.
+setBootProbeAllowed(!__MODOKI_PLAYABLE__)
+
+// A quality tier's FRAME CAP — off in the editor, on everywhere else. Unlike the three gates
+// above this is not a debug switch: `targetFPS` is one global in the frame driver gating EVERY
+// callback, the editor's own viewport and gizmo passes included. The editor mounts Scene3D (so it
+// runs tier calibration) and does roughly double the work of a shipped game (two viewports), which
+// is exactly what trips a demotion — so without this an author's whole session gets throttled to a
+// phone's cap for a symptom their build never had. The cost: GameView does not preview the cap.
+// Note the gate is __MODOKI_EDITOR__ ALONE, not OR'd with __MODOKI_DEBUG_BUILD__ — a debug GAME
+// build is still a game, and must run at the cap it will ship with.
+setTierFrameCapEnabled(!__MODOKI_EDITOR__)
+
+// And the broader half: the editor does not AUTO-CALIBRATE its tier at all (owner, 2026-08-12).
+// The carve-out above was too narrow — its own rationale claimed the other knobs only change how
+// the preview looks, but `applyActiveTierToRuntime` ends in an ungated `forceResizeAllSurfaces()`
+// and the SceneView is on that bus, so a demotion silently dropped IBL, ambient, exposure, the
+// shadow-map ceiling and the 2D backing buffer on the AUTHORING viewport — sticky for the session,
+// triggered by the editor's own double-viewport load. Setting a tier by hand still works, which is
+// the honest way to preview `low`. Same `__MODOKI_EDITOR__`-alone rule as above: a debug GAME build
+// is still a game and must calibrate the way it will ship.
+setTierCalibrationEnabled(!__MODOKI_EDITOR__)
 
 // Profiler reachable on a DEVICE build. `readPerfProfile()` already separates main-thread
 // engine work (`cpuMs`) from everything else (`restMs` = GPU + present + idle), and names the
@@ -47,6 +85,11 @@ if (__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__) {
 // Side-effect import registers the tab; gated so a release build never bundles it.
 if (__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__) {
   import('./debug/GamesTab');
+  // Deliberate NATIVE fault triggers behind the Device tab's Faults section (#278) — an ANR, an
+  // uncaught Java exception, a real signal crash. Same gate for the same reason as the bridge: it
+  // kills the app on demand, so a release build must not carry a reachable way to do it. The
+  // module registers nothing off-device, and the native half refuses unless build.debugBuild is on.
+  import('./debug/nativeFaults');
 }
 
 // Native SDK init (Adjust/AppLovin) is no longer wired here — it moved into the

@@ -1,9 +1,12 @@
-// HMR: `_customPanels`/`_gameView`/`_extraMenus`/`_projectSettings` below are written ONLY
-// by createEditor(), which app/editor/setup.ts calls once at bootstrap. A module swap
-// resets them to empty with nothing to repopulate them, and EditorApp reads
-// getGameViewComponent() at MODULE scope — so the Game panel silently falls back to a stub.
-// The returned component's identity also can't be swapped into the mounted tree (App.tsx
-// resolved it through React.lazy). Reload instead; see input/keymap.ts for the pattern.
+// HMR: the host registries (panels / Game View / extra menus / Project Settings) are written
+// ONLY by createEditor(), which app/editor/setup.ts calls once at bootstrap — so a module
+// re-evaluation has nothing to repopulate them. They therefore live in `_reg`, a globalThis
+// slot that survives re-evaluation; see the comment on `EditorRegistries` below for the
+// measured failure this closes (a DOWNSTREAM panel's Fast Refresh re-evaluates this module
+// without firing the reload guard here).
+// The reload below still earns its place for an edit to THIS file: createEditor() will not
+// re-run, and the returned component's identity can't be swapped into the mounted tree
+// (App.tsx resolved it through React.lazy). See input/keymap.ts for the pattern.
 if (import.meta.hot) import.meta.hot.accept(() => { window.location.reload(); });
 
 /** createEditor — factory that returns a configured React editor component.
@@ -95,7 +98,10 @@ export function resolveBootSceneOverride(override: string | null | undefined, sc
   if (override.includes('/') || override.toLowerCase().endsWith('.json')) return override;
   const target = override.toLowerCase();
   const matches = sceneList.filter((p) => {
-    const base = (p.split('/').pop() ?? p).replace(/\.json$/i, '');
+    // Strip the `.scene.json` DOUBLE extension before the plain `.json`: every real
+    // project uses `<name>.scene.json`, so stripping only the last `.json` left the base
+    // as `<name>.scene` and a bare-name override could never match (QA-PROJECT-0003).
+    const base = (p.split('/').pop() ?? p).replace(/\.scene\.json$/i, '').replace(/\.json$/i, '');
     return base.toLowerCase() === target;
   });
   if (matches.length === 1) return matches[0];
@@ -414,7 +420,7 @@ export async function awaitRendererReady(
 export interface ProjectSettingsField {
   key: string;
   label: string;
-  type: 'text' | 'number' | 'checkbox' | 'select' | 'combo' | 'string-list' | 'physics-layers' | 'path' | 'scene-list' | 'module-toggles' | 'readonly-text';
+  type: 'text' | 'number' | 'checkbox' | 'select' | 'combo' | 'string-list' | 'physics-layers' | 'path' | 'scene-list' | 'module-toggles' | 'quality-tiers' | 'readonly-text';
   /** Options for `select` fields, and suggestions for a `combo` (free-text +
    *  datalist) field — the stored value is the option's `value`. */
   options?: { value: string; label: string }[];
@@ -496,40 +502,69 @@ export interface ExtraMenuItem {
   submenu?: ExtraMenuItem[];
 }
 
-/** Registry of custom panels added by the game */
-let _customPanels: EditorPanelDef[] = [];
-let _gameView: React.ComponentType | null = null;
-let _extraMenus: EditorOptions['extraMenus'] = {};
-let _projectSettings: ProjectSettingsSchema | null = null;
+/** Registry of what the host game handed `createEditor` — panels, Game View, extra menus,
+ *  Project Settings — plus the extra-menu subscription bookkeeping.
+ *
+ *  Held on `globalThis`, NOT in module-level `let`s, because this module can be RE-EVALUATED
+ *  by HMR without `createEditor()` ever running again, and there is nothing to repopulate it
+ *  (app/editor/setup.ts calls createEditor once, at bootstrap). The self-accept guard at the
+ *  top of this file only covers an edit to THIS file; it does NOT fire when the update
+ *  boundary is a downstream panel. Measured 2026-08-18 on games/3d-test: appending a newline
+ *  to `panels/SceneListEditor.tsx` (which exports a non-component, so Fast Refresh invalidates
+ *  and the update propagates up through this module) re-evaluated createEditor.tsx and left
+ *  every registry null — File → Project Settings then flipped its store flag and rendered
+ *  NOTHING, with no console error, and the Game panel fell back to its stub. A durable slot
+ *  survives re-evaluation whatever the boundary turns out to be, which a reload guard on any
+ *  one path cannot promise. */
+interface EditorRegistries {
+  customPanels: EditorPanelDef[];
+  gameView: React.ComponentType | null;
+  extraMenus: EditorOptions['extraMenus'];
+  projectSettings: ProjectSettingsSchema | null;
+  extraMenusVersion: number;
+  extraMenuListeners: Set<() => void>;
+}
 
-export function getCustomPanels() { return _customPanels; }
-export function getGameViewComponent() { return _gameView; }
-export function getExtraMenus() { return _extraMenus; }
+const REGISTRY_KEY = '__modokiEditorRegistries';
+
+const _reg: EditorRegistries =
+  ((globalThis as unknown as Record<string, EditorRegistries | undefined>)[REGISTRY_KEY] ??= {
+    customPanels: [],
+    gameView: null,
+    extraMenus: {},
+    projectSettings: null,
+    extraMenusVersion: 0,
+    extraMenuListeners: new Set<() => void>(),
+  });
+
+export function getCustomPanels() { return _reg.customPanels; }
+export function getGameViewComponent() { return _reg.gameView; }
+export function getExtraMenus() { return _reg.extraMenus; }
 
 // ── Updatable extra menus ────────────────────────────────────────────────────────────────────
 // `createEditor` runs ONCE, so anything a menu label depends on that is not known at setup time
 // (the Build menu's device listing — two `xcrun` shell-outs we must not block boot on) can never
 // reach the menu without a way to replace the registry afterwards. A version counter + external
 // store, rather than React state, because the producer is the app-level setup module, which is
-// outside the component tree entirely.
-let _extraMenusVersion = 0;
-const _extraMenuListeners = new Set<() => void>();
+// outside the component tree entirely. (Version + listeners live in `_reg` for the same
+// HMR-durability reason as the registries themselves: a re-evaluated module with a fresh, empty
+// listener Set would leave the mounted menu bar subscribed to nothing.)
 
 /** Replace the host's extra menus and notify the menu bar. Whole-registry, not a patch: the caller
  *  owns the shape it registered, and a merge here would make "remove an item" unexpressible. */
 export function setExtraMenus(menus: NonNullable<EditorOptions['extraMenus']>): void {
-  _extraMenus = menus;
-  _extraMenusVersion++;
-  for (const l of _extraMenuListeners) l();
+  _reg.extraMenus = menus;
+  _reg.extraMenusVersion++;
+  for (const l of _reg.extraMenuListeners) l();
 }
 
 export function subscribeExtraMenus(cb: () => void): () => void {
-  _extraMenuListeners.add(cb);
-  return () => { _extraMenuListeners.delete(cb); };
+  _reg.extraMenuListeners.add(cb);
+  return () => { _reg.extraMenuListeners.delete(cb); };
 }
 
-export function getExtraMenusVersion(): number { return _extraMenusVersion; }
-export function getProjectSettings() { return _projectSettings; }
+export function getExtraMenusVersion(): number { return _reg.extraMenusVersion; }
+export function getProjectSettings() { return _reg.projectSettings; }
 
 export function createEditor(options: EditorOptions): React.ComponentType {
   // Capture console output + uncaught errors/rejections at the VERY START of
@@ -557,10 +592,10 @@ export function createEditor(options: EditorOptions): React.ComponentType {
   }
 
   // Store custom panels, game view, and extra menus for EditorApp to pick up
-  _customPanels = options.panels || [];
-  _gameView = options.gameView || null;
-  _extraMenus = options.extraMenus || {};
-  _projectSettings = options.projectSettings || null;
+  _reg.customPanels = options.panels || [];
+  _reg.gameView = options.gameView || null;
+  _reg.extraMenus = options.extraMenus || {};
+  _reg.projectSettings = options.projectSettings || null;
 
   // Register the Assets panel's built-in "Create X" menu entries (Scene, Material,
   // Animation, …). Idempotent — safe if createEditor() ever runs twice in a session.
@@ -583,7 +618,11 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     import.meta.hot.on('asset-manifest-updated', (data: unknown) => {
       try {
         const manifest = data as Parameters<typeof loadManifestJson>[0];
-        loadManifestJson(manifest);
+        // `prune: true` — this payload is the dev server's COMPLETE rescan, so a guid missing
+        // from it is a file that no longer exists. Without it the client's guid map only ever
+        // grew and a deleted texture kept showing up in the SpritePicker until a full reload
+        // (QA-DLG-0009).
+        loadManifestJson(manifest, { prune: true });
         // Auto-refresh the Assets panel when the set of files on disk changes
         // (Finder drops, Create Prefab, external edits, deletes/renames) so the
         // user never has to hit Refresh. assetSetSignature dedupes the watcher's

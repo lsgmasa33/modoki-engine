@@ -135,10 +135,13 @@ describe('isInternalAssetPath', () => {
     expect(isInternalAssetPath('/games/x/model.glb')).toBe(true);
   });
 
-  it('does NOT flag external URLs, fonts, guids, or keywords', () => {
+  it('flags font paths too (#231 — fontFamily is a GUID ref now)', () => {
+    expect(isInternalAssetPath('/games/x/font.ttf')).toBe(true);
+    expect(isInternalAssetPath('/games/x/font.woff2')).toBe(true);
+  });
+
+  it('does NOT flag external URLs, guids, or keywords', () => {
     expect(isInternalAssetPath('https://cdn.example.com/a.png')).toBe(false);
-    expect(isInternalAssetPath('/games/x/font.ttf')).toBe(false); // fonts excluded
-    expect(isInternalAssetPath('/games/x/font.woff2')).toBe(false);
     expect(isInternalAssetPath(newGuid())).toBe(false);
     expect(isInternalAssetPath('circle')).toBe(false);
     expect(isInternalAssetPath('Inter')).toBe(false);
@@ -160,6 +163,26 @@ describe('resolveRef', () => {
     // de-duped: the same offending ref only logs once
     expect(resolveRef('/games/x.mesh.json')).toBeUndefined();
     expect(err).toHaveBeenCalledOnce();
+    err.mockRestore();
+  });
+
+  /** QA-INSP-0004 — a literal FONT path used to pass through here silently. Every other
+   *  asset-ref field was rejected loudly; `Text2D.font` / `Text3D.font` were not, because
+   *  isInternalAssetPath excluded font extensions for `UIElement.fontFamily`'s sake — and
+   *  fontFamily never reached resolveRef at all (it was read straight into a CSS style). A
+   *  ref the build cannot see fails only once you ship, since dev serves off disk. #231 made
+   *  fontFamily a GUID too, so the exclusion is gone and this holds for every font field. */
+  it('rejects an internal FONT path too (every font field is a manifest GUID)', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    for (const p of [
+      '/games/x/assets/fonts/Inter.ttf',
+      '/games/x/assets/fonts/Inter.otf',
+      '/games/x/assets/fonts/Inter.woff',
+      '/games/x/assets/fonts/Inter.woff2',
+    ]) {
+      expect(resolveRef(p), p).toBeUndefined();
+    }
+    expect(err).toHaveBeenCalledTimes(4);
     err.mockRestore();
   });
 
@@ -224,6 +247,75 @@ describe('loadManifestJson', () => {
 
   it('tolerates a non-array assets field without throwing', () => {
     expect(() => loadManifestJson({ version: 2, assets: undefined as unknown as [] })).not.toThrow();
+  });
+});
+
+/** QA-DLG-0009: the client's guid map was ADD-ONLY, so a deleted texture survived every dev-server
+ *  rescan and the SpritePicker (backed by `getAllAssets()`) kept offering phantom sprites until a
+ *  full editor reload. */
+describe('loadManifestJson — prune', () => {
+  const A = 'aaaaaaaa-0000-4000-8000-000000000001';
+  const B = 'bbbbbbbb-0000-4000-8000-000000000002';
+  const file = (guids: string[]): AssetManifestFile => ({
+    version: 2,
+    assets: guids.map((g) => ({ guid: g, path: `/tex/${g}.png`, type: 'texture' })),
+  });
+
+  it('drops a guid the new manifest no longer carries', () => {
+    loadManifestJson(file([A, B]), { prune: true });
+    expect(getAllAssets().map((e) => e.guid).sort()).toEqual([A, B]);
+
+    loadManifestJson(file([A]), { prune: true }); // B deleted on disk
+    expect(getAllAssets().map((e) => e.guid)).toEqual([A]);
+    expect(resolveGuidToPath(B)).toBeUndefined();
+    expect(getGuidForPath(`/tex/${B}.png`)).toBeUndefined();
+  });
+
+  it('is OPT-IN — a plain merge still keeps everything (the OTA fragment path)', () => {
+    loadManifestJson(file([A, B]));
+    loadManifestJson(file([A]));
+    expect(getAllAssets().map((e) => e.guid).sort()).toEqual([A, B]);
+  });
+
+  it('never prunes a guid the client registered itself', () => {
+    // A scene guid stamped by SceneManager at load, and an editor-side sprite registration —
+    // neither appears in any scanner payload, so pruning by "absent from this payload" alone
+    // would delete them.
+    const SCENE = 'cccccccc-0000-4000-8000-000000000003';
+    const SLICE = 'dddddddd-0000-4000-8000-000000000004';
+    loadManifestJson(file([A]), { prune: true });
+    registerAsset(SCENE, '/scenes/main.scene.json', 'scene');
+    registerSprite(SLICE, A, `/tex/${A}.png`, {
+      texture: A, rect: { x: 0, y: 0, w: 8, h: 8 }, pivot: { x: 0.5, y: 0.5 },
+    });
+
+    loadManifestJson(file([A]), { prune: true });
+    const guids = getAllAssets().map((e) => e.guid);
+    expect(guids).toContain(SCENE);
+    expect(guids).toContain(SLICE);
+  });
+
+  it('an EMPTY payload prunes NOTHING — a failed scan must not blank the editor', () => {
+    // vite-asset-scanner broadcasts whatever the scan returns, unchecked, so a moment where the
+    // asset root is unreadable publishes `assets: []`. Pruning on that would wipe every live
+    // texture/mesh/material at once. Found by the close-out review of the prune itself.
+    loadManifestJson(file([A, B]), { prune: true });
+    loadManifestJson({ version: 2, assets: [] }, { prune: true });
+    expect(getAllAssets().map((e) => e.guid).sort()).toEqual([A, B]);
+  });
+
+  it('a payload whose entries all lack guids also prunes nothing', () => {
+    loadManifestJson(file([A, B]), { prune: true });
+    loadManifestJson({ version: 2, assets: [{ path: '/legacy/font.ttf', type: 'font' }] }, { prune: true });
+    expect(getAllAssets().map((e) => e.guid).sort()).toEqual([A, B]);
+  });
+
+  it('a pruned guid can come back (re-import) without a stale reverse index', () => {
+    loadManifestJson(file([A, B]), { prune: true });
+    loadManifestJson(file([A]), { prune: true });
+    loadManifestJson(file([A, B]), { prune: true });
+    expect(resolveGuidToPath(B)).toBe(`/tex/${B}.png`);
+    expect(getGuidForPath(`/tex/${B}.png`)).toBe(B);
   });
 });
 

@@ -72,10 +72,24 @@ acquires each LOD GLB). All transitive dependencies are tracked under the same
 `releaseAllForScene()` runs **after** the swap so a shared resource's refcount
 only drops to zero once no remaining scene owns it.
 
+**No mid-scene release.** `releaseAllForScene(sceneId)` is the **only** release entry point used
+by app/editor code. Deleting/hiding an entity, swapping its mesh, etc. does **not** release
+anything — a scene's resources stay resident until the scene changes. (Verified: there are no
+per-entity `releaseModel`/`releaseMesh`/`releaseMaterial` calls outside the cache module
+itself.)
+
+**Transitive deps** (a `.mesh.json` → its `.glb` model + `.mat.json` material; a material → its
+textures) are acquired/released under the same `sceneId`, captured in a per-(scene,mesh) snapshot
+at acquire time so a mid-scene editor **re-import** (`invalidateModel`, which evicts cache
+entries) can't strand an owner.
+
+**Editor live-preview caches** (particle defs in `particleCache.ts`) are plain data, cleared via
+`clearParticleCache()` from `disposeAllCachedResources()` on full teardown.
+
 ## Scene manifest format
 
 The current scene file version is **12** (`SceneFile.version`), stamped from
-`SCENE_FORMAT_VERSION` in `runtime/version.ts`; the `SceneFile` interface is
+`SCENE_FORMAT_VERSION` in `runtime/core/version.ts`; the `SceneFile` interface is
 defined in `editor/scene/serialize.ts`:
 
 ```ts
@@ -93,6 +107,35 @@ interface SceneFile {
 
 `SerializedEntity.id` is now optional and, since v12, never written — see "Entity-id
 stability on disk" below.
+
+### The `entities` ARRAY ORDER is the Hierarchy's display order
+
+`serializeScene` writes parents before their children, siblings by `sortOrder`, with the
+**GUID** as the tiebreak and the name as a last resort (`orderedInfos` in `serialize.ts`).
+It used to follow live ECS-id order, which made a save churn: a delete+undo respawns the
+entity at a new id, so the next save emitted byte-identical data in a different array order
+(`3d2372741`). Nothing loads order-sensitively — `sortOrder` carries the authored intent —
+so this is purely about making a scene diff readable, and about letting "`git status` is
+clean" mean something after a save.
+
+**The committed files have now been re-saved to match (`957fd9d7e`, #268), so a save no
+longer reorders anything.** They used to predate the fix, which made the FIRST save of any
+project rewrite its scene with a one-time contentless reorder; every project was opened and
+every scene loaded and saved through this serializer, and the 48 files that moved were
+verified against HEAD as parsed data keyed by guid — same entity set, no entity whose content
+differs, identical top-level fields, order only.
+
+⚠️ **So a reorder diff is now a FINDING.** Nothing routine produces one any more, which
+inverts the old advice: don't read such a diff as expected churn, report it. Still true, and
+the reason the guid-keyed comparison is worth keeping in hand: don't treat a post-save
+`git status` as evidence of a *content* change without comparing as parsed data first.
+
+**Three files were deliberately left un-normalized**, because their re-save is not order-only
+— `games/3d-test/…/skinned-test.scene.json` (a prefab-instance `added` child gains
+`castShadow`/`receiveShadow`, trait fields the engine grew after the file was written),
+`games/chess/…/chess.scene.json` (format `version` 9 → 12), and
+`games/iap-test/…/main.scene.json` (drops an orphan legacy top-level `id`). A save of one of
+those still produces a diff, and it is a content diff rather than a reorder.
 
 ### Only NON-DEFAULT trait fields are written
 
@@ -127,16 +170,45 @@ the `modoki_list_traits` MCP tool.
 
 Note this is a *serializer* rule, not a format version: it changes what a save writes, not
 what a load accepts, so no migration is involved and older fully-populated files keep
-loading unchanged. It applies to scene files only — prefab files go through a separate
-path in `prefab.ts` and still write every field.
+loading unchanged.
+
+**Where it applies, and the one boundary between the two conventions:**
+
+- **Scene entities** — compacted, as above.
+- **A prefab instance's `added` children** (structural overrides, `snapshotAddedTraits` in
+  `prefab.ts`) — **also compacted**, and for the same reason: an added child has no prefab base
+  to diff against, it is a whole new entity, and `spawnNode` rebuilds it with `meta.trait(d)`
+  so koota refills every absent key. It used to be written FULL while its own comment claimed
+  to mirror `serialize.ts`, which made every added subtree track whatever fields the schema
+  happened to have on the day it was saved — `skinned-test.scene.json` grew
+  `castShadow`/`receiveShadow` on a re-save years later (bug `kxcE2EBsVmrbbHpBzXMb`).
+- **Prefab FILES** — still write every field, and that is deliberate rather than an oversight.
+  `serializePrefab` drops only blank asset refs (`REF_FIELDS_BY_TRAIT`, #53). Full omission
+  would break a real consumer: Court's `layoutFromPrefabDoc` reads prefab fields **by name**
+  and its `num()` helper returns `null` for a missing one, so the caller silently falls back to
+  code constants — an authored value that merely *happens* to equal its default would read as
+  "not authored".
+- ⚠️ **`insertAddedSubtree` is where those two meet and must CONVERT.** Applying an added child
+  to its prefab promotes it into a prefab member, so the compacted bag is re-expanded to the
+  full schema on the way in (minus template-excluded fields and blank refs, exactly as
+  `serializePrefab` does). Without that step a promoted row lands compacted beside members
+  written full — one prefab file in two shapes, with only the promoted rows misread.
+
+**Not the same thing as an OVERRIDE.** A member override is diffed against the *prefab's*
+value (`getOverrideValues`), not against the schema, so setting a field back to the koota
+default is still a real, written override whenever the base holds a non-default. And a field
+**absent** from a prefab base reads as the schema default rather than as `undefined` — which
+is what lets a compacted child be promoted without every instance reporting a spurious
+override.
 
 **Which fields persist is decided by the koota `.schema`, never by `meta.fields`.**
 `meta.fields` is the *Inspector's* curated list: a persistent field owned by a custom
 Inspector section is deliberately absent from it (`Animator.clips`/`clip`,
 `SpriteAnimator.clip`, `AudioSource.clips`, `UIElement.flexWrap`,
 `EntityAttributes.editorFolder`, `Time.timeScale`, …). Every persistence path therefore
-reads through `readTraitDataFull` and gates stored fields with `traitDefinesField`
-(both in `runtime/core/ecs/entityUtils.ts`) — the scene serializer, `serializePrefab`,
+reads through `readTraitDataFull` (`runtime/core/ecs/entityUtils.ts`) and gates stored
+fields with `isPersistentTraitField` (`runtime/core/ecs/traitSchema.ts`) — the scene
+serializer, `serializePrefab`,
 `captureInstanceOverrides`, and both override-apply paths. `meta.fields` is consulted
 only for the `runtimeOnly` flag (which fields to *drop*). Getting this wrong is silent
 data loss, not a warning: the prefab paths once used `meta.fields` and a load→save
@@ -178,7 +250,7 @@ It follows that **a save REGENERATES `resources` rather than preserving it** —
 `serializeScene` discards the loaded array and rebuilds from the entities. So a file
 whose array was written by an older, less complete walk gets *upgraded* on its first
 save, and the array can grow without anything being wrong (issue #17 saw 2 → 3+ on
-`material-instance-demo.json`). The walk is deterministic — same entities, same array,
+`material-instance-demo.scene.json`). The walk is deterministic — same entities, same array,
 same order (`resourceRefsStability.test.ts` pins this, including dedupe of a ref two
 entities share) — so the second save produces the same bytes as the first.
 
@@ -316,7 +388,7 @@ UI (double-click a prefab → Cmd+S), so there was no scripted equivalent of the
 `exitPrefabEditing` (`editor/scene/prefabEdit.ts`) are exposed through the `prefab` agent op /
 `modoki_prefab` MCP tool as `prefabAction: 'edit-open' | 'edit-save' | 'edit-exit'` (tool
 catalog: [debug-tools-mcp.md](./debug-tools-mcp.md)). `edit-open` swaps the world exactly as
-`load-scene` does — it refuses on unsaved work and takes `force` — and additionally **saves the
+`load-scene` does — it refuses on unsaved work and takes `discardUnsaved` — and additionally **saves the
 current scene** on the way in; that is pre-existing `prefabEdit.ts` behaviour, kept deliberately,
 because it is what makes the return trip's reload-from-disk non-destructive.
 `modoki_save_all` refuses outright while the editor is in prefab-edit mode; `edit-save` is the
@@ -480,7 +552,7 @@ that:
   (`getGuidForPath(path) ?? newGuid()`). That misses whenever `registerAsset` re-registers
   the same guid under a different path string, since it evicts the stale `pathToGuid` entry
   — an ordinary manifest rescan is enough. A miss **mints**, which silently dangles every
-  reference to the scene: measured on `tropical-island.json`, whose `project.config.json`
+  reference to the scene: measured on `tropical-island.scene.json`, whose `project.config.json`
   entry and a unit test both named the old guid (2026-07-30). The manifest lookup survives
   only as a fallback for a serialize with no live load behind it.
 
@@ -512,7 +584,7 @@ another scene that shares it**. Shared rig and session state (Time, camera, ligh
 UI, physics config) is authored **once** in the base; a level file becomes only what is
 actually per-level.
 
-The problem it solves is concrete: sling's `Lvl-0001.json` and `Lvl-0002.json` were
+The problem it solves is concrete: sling's `Lvl-0001.scene.json` and `Lvl-0002.scene.json` were
 byte-identical except `FieldSource.level`/`.wave` — ~38 duplicated entities per file,
 and no state (not even `Time.elapsed`) carried across the swap. Base scenes dissolve
 that identity problem rather than papering over it: there is exactly one Time entity,
@@ -619,6 +691,29 @@ Two consumers:
   it**. This is a transitional safety net for bases extracted by copy-and-thin (sling's
   two levels shared all 38 guids), not a statement about precedence.
 
+### Guid uniqueness is a PER-FILE rule, not a repo-wide one
+
+Worth stating explicitly, because the obvious reading of the guard above is the wrong one and
+it has already sent one sweep in the wrong direction (2026-08-18):
+
+- **Within one scene file, a guid must be unique.** Two entries answering to the same guid mean
+  an arbitrary winner for every `findEntityByGuid`, and an ambiguous parent for any child naming
+  that guid as its `parentId`. Nothing in the load path catches it — both `filterPersistentDuplicates`
+  and `filterDuplicateChainGuids` compare a scene against something ELSE already loaded (a carried
+  entity, an earlier chain scene), so a collision *inside* one file passes straight through and
+  both entities spawn. Guarded by `engine/tests/assets/sceneGuidUniqueness.test.ts`.
+- **Across scene files, sharing a guid is NORMAL and is sometimes required.** A sweep of the 54
+  committed scenes found ~80 shared guids and only two same-file collisions. `games/sling`'s
+  `Lvl-0001`/`Lvl-0002` are variants of the same authored entities; `games/space-console`'s three
+  scenes share one UI shell; and the `Persistent` carry-across-swap mechanism **depends** on both
+  scene files naming the entity by the same guid — that is precisely how `filterPersistentDuplicates`
+  recognises the carried entity and drops the scene's copy.
+
+So a repo-wide uniqueness check would fail on the architecture rather than find a bug. The honest
+cross-file signal is "same guid, *different* entity name", which is too weak to gate a build on: an
+entity legitimately renamed in one scene is indistinguishable from a copy-paste collision. The guard
+is therefore scoped to same-file collisions deliberately, and says so in its own header.
+
 ### Gotchas
 
 - **A carried prefab instance loses its EDITOR bookkeeping** (Apply-to-Prefab,
@@ -640,7 +735,7 @@ Two consumers:
 - **The materialized Time singleton is tagged `Transient`, so it is never saved.** It has
   to exist in the world (systems reading delta are no-ops without it) but it was never
   authored, so writing it back would GROW whatever scene is saved next by one entity —
-  measured on `ui-focus-demo.json`, 9 → 10, a direct counter-example to "a no-op save is a
+  measured on `ui-focus-demo.scene.json`, 9 → 10, a direct counter-example to "a no-op save is a
   no-op". It was not even confined to the primary: serialize's foreign-entity filter skips
   any entity without `EntityAttributes`, and this one has none, so it landed in a shared
   **base** just as readily.
@@ -916,6 +1011,120 @@ Findings come from four passes:
    specific "references must be a GUID (use the asset's id / .meta.json sidecar)"
    message; anything else gets "is not a GUID or URL". The primitive sprite
    keywords `circle`/`square`/`triangle` are exempt on `Renderable2D.sprite`.
+
+   ⚠️ **GUID shape was the WHOLE check until #292** — a scene referencing a
+   well-formed GUID for an asset **deleted from the manifest** validated
+   completely clean, and the failure surfaced later, at load/render time. So
+   `validate_scene` answered "is this string GUID-shaped?" while the caller was
+   asking "will this scene load?".
+
+   *(#292's write-up cites #237 as "a real dangling-material-ref bug in
+   `forest-camp` that shipped precisely because nothing checked resolution". It
+   was not — checked against `34ef5260c`: #237 was a **tree-shaker blind spot on a
+   MAP-shaped ref field** (`SkinnedMeshRenderer.materials`, a `Record<slot,guid>`),
+   whose GUIDs were valid and present in the manifest all along; they were DCE'd
+   out of production builds. This check would not have caught it, and its fix was
+   the build-time `unreachableRefs` guard. Recorded because a plausible-sounding
+   wrong precedent is what makes the next reader over-trust the new check.)*
+
+   The check is now **`assetExists`, an optional injected `AssetRefResolver`** —
+   the same shape as `getPrefab` below, and for the same reason: this module does
+   no I/O and has no manifest of its own. **The rule itself lives in ONE place,
+   `makeAssetRefResolver`** (exported from `sceneValidation.ts`): give it the
+   project's guids, get back a resolver, or `undefined` when there is nothing to
+   check against. Each consumer supplies only the glue that reaches its own
+   manifest — `makeAssetResolver` in `editorBackendRouter.ts` for `ctx.getManifest()`,
+   and `getAllAssets()` in `agentBridge.ts`. The index is built once per call (a
+   scene with 400 refs must not re-scan the asset array 400 times).
+
+   *(The rule was hand-written twice at first, and the two copies had already
+   diverged on letter case **inside the same commit** — the dev-server one folded
+   case, the hot-reload one did not, so the same scene and manifest produced
+   different verdicts depending on which surface asked. The hot-reload copy sat in a
+   private, unexported function that no test could reach, so only the wrong one was
+   pinned. That is why there is one factory and why it is tested directly.)* **All three consumers** above inject one: both
+   dev-server endpoints from `makeAssetResolver`, and the hot-reload handler from
+   the browser's own loaded manifest (`getAssetEntry`, guarded on
+   `getAllAssets().length`) — which is the most useful place for it, since it fires
+   immediately before the load that would otherwise drop the ref in silence.
+   A ref whose GUID no manifest asset carries gets "is a well-formed GUID but no
+   asset in the manifest has it". Sliced sprites and the auto-emitted whole-image
+   sprite are `type:'sprite'` **sub-entries with guids of their own**, so sweeping
+   `assets[]` covers a `Renderable2D.sprite` / `UIElement.imageSrc` ref — a
+   resolver filtered to file-backed assets would report every 2D sprite in the
+   project as dangling.
+
+   **Absent resolver ⇒ the pre-#292 shape-only pass, NOT "everything is
+   dangling".** `makeAssetRefResolver` returns `undefined` — and the caller then
+   passes nothing — when the manifest is empty, guid-less, or throws; malformed
+   entries are skipped rather than thrown on. A false "this asset
+   was deleted" sends a caller hunting a ref that is fine, which would be worse
+   than the gap #292 closes, so *cannot-check* and *dead* are deliberately
+   different states. `engine/tests/plugins/validateSceneAssetResolver.test.ts`
+   pins both the wiring and that silence.
+
+   ⚠️ **The resolver must answer case-SENSITIVELY, and this is the trap.** `isGuid`'s
+   regex carries `/i`, so an uppercase guid is *well-formed*; but `resolveRef` is
+   `guidToEntry.get(ref)` — a plain case-sensitive `Map.get` over guids that
+   `registerAsset` stores verbatim, with no normalisation anywhere on that path. So a
+   resolver that folded case would report "will resolve at load" for a ref that resolves
+   to `undefined` at load — **the exact false negative this check exists to remove**.
+   Both resolvers therefore match exactly, and `AssetRefVerdict` is three-state rather
+   than a boolean: `'ok'` / `'missing'` / `'case-mismatch'`. The third gets its own
+   message, because telling an author their asset was "deleted or never imported" when it
+   is sitting in the manifest under a different casing sends them hunting a file they are
+   looking at. Every minted guid is lowercase (`crypto.randomUUID`, `deriveGuid`), so only
+   a hand-authored or externally-produced ref reaches it — which is precisely the case
+   that needs the accurate message.
+
+   *(The first cut of #292 folded case in the backend resolver and had a unit test
+   asserting that as correct — "case-insensitive, like every other guid comparison". It
+   is not: `makePrefabResolver` folds case, but a prefab lookup is not a prediction about
+   `resolveRef`. Two independent reviewers caught the divergence from opposite ends.)*
+
+   **What it does NOT reach**, both by construction:
+   - **Non-scalar refs.** `REF_FIELDS_BY_TRAIT` is a *scalar*-ref registry, so a
+     map-shaped field (`SkinnedMeshRenderer.materials`) or an array one
+     (`AnimationLibrary.animSets`) is invisible to this pass, exactly as it is to
+     the rest of the ref rule. That is the #237 shape above.
+   - **A ref written through `/api/asset-write` or `/api/write-file` in the last
+     ~150 ms.** Neither route rebuilds the manifest (unlike `/api/create-asset` and
+     `/api/import-file`, which both rebuild synchronously before returning) — they rely on
+     the watcher's 150 ms-debounced rescan. So a brand-new asset written directly and
+     validated immediately can be reported `missing` while being perfectly valid. Known
+     and deliberately not fixed here: forcing a rebuild inside a validation GET would put
+     a full filesystem scan **plus a guid heal that writes to disk** on a read-only route,
+     which is worse than the window it closes. The sanctioned flow (`create_asset` →
+     `write_asset`) is not affected.
+   - **`MaterialInstance` `texture` overrides.** The `ref` (a sprite/texture GUID)
+     is still checked for `typeof === 'string'` only — neither shape nor
+     resolution. It sits in the `materialOverrides` branch of `typeMismatch`,
+     which returns a single first-failure string and has no resolver in scope, so
+     closing it is a different change rather than a line in this one.
+
+   **The rule also covers prefab-instance `overrides`.** Until #292 it walked
+   `entity.traits` **only**, so the 56 ref fields authored inside `overrides` blocks
+   across `games/` + `demos/` (27 `Renderable3D.mesh` + 27 `.material` in
+   `space-console` alone) were checked by *nothing* — not for resolution, not even for
+   GUID shape. A literal asset path in an override was as silent as a deleted one. Both
+   call sites now go through one exported predicate, `refFieldWarnings`, for the reason
+   `inertSizeWarnings` gives right below it: an override group has the identical
+   `{trait: {field: value}}` shape, and restating the rule per call site is how the
+   exemptions (primitive sprite keywords, external URLs) drift apart. It runs **before**
+   the inert-size check's `UIElement` early-continue — most override groups touch no
+   `UIElement` at all, which is exactly the shape a naive placement would skip.
+
+   **Measured before enabling:** the rule was run over every committed scene and
+   prefab in all 23 projects under `games/` + `demos/` — **1171 GUID refs, 0
+   reported**, against **1171 reported** by a deliberately all-missing control resolver
+   (a zero that cannot be made non-zero is not a measurement). The 1171 is 1115 direct
+   trait refs plus exactly the 56 override refs above, which is the cross-check that the
+   override walk is really live. So it currently catches nothing that is already in the repo, and
+   its value is prospective: it is a guard against a ref that goes stale later
+   (an asset deleted out from under a scene, an agent authoring a GUID that was
+   never imported), which is the shape that used to reach load time unannounced.
+   The zero is also the false-positive check — the sprite sub-entry coverage above
+   is what earns it.
 3. **Structural / referential-integrity pass** (schema-independent) — duplicate
    entity ids, self- or dangling `parentId` (matched as a GUID *or* a legacy
    numeric file id; `''`/`0` = root), dangling `UIAction.bindings[].target`
@@ -978,10 +1187,10 @@ Findings come from four passes:
 `REF_FIELDS_BY_TRAIT` is the **single source of truth for scalar ref fields** —
 `editor/scene/serialize.ts` imports it for its save-time guard and the build
 tree-shaker's keep-walk (`plugins/asset-tree-shaker.ts`) walks it, so a new ref
-field added there is covered everywhere. Non-scalar refs (`UIElement.fontFamily`
-= a CSS family name; `AnimationLibrary.animSets` = a guid array) are intentionally
-excluded and handled explicitly. The predicates themselves live in
-`runtime/loaders/assetRefRules.ts`: `isGuid` (UUID-v4 shape), `isExternalUrl`
+field added there is covered everywhere — `UIElement.fontFamily` joined it in #231, which is
+what finally made a UI font ref visible to the validator and the build. Non-scalar refs
+(`AnimationLibrary.animSets` = a guid array) are intentionally excluded and handled explicitly. The predicates themselves live in
+`runtime/core/assetRefRules.ts`: `isGuid` (UUID-v4 shape), `isExternalUrl`
 (`http(s):`/`data:`/`blob:`), `isInternalAssetPath` (leading `/` + a managed
 asset extension).
 

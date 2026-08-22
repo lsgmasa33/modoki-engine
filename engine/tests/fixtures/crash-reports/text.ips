@@ -1,0 +1,14 @@
+{"app_name":"App","timestamp":"2026-08-13 10:27:20.00 +0900","app_version":"1.0","slice_uuid":"DEADBEEF-0000-0000-0000-000000000000","build_version":"1","bundleID":"com.modokiengine.court","duration_ms":"201550","share_with_app_devs":0,"is_first_party":0,"bug_type":"142","os_version":"iPhone OS 16.7.16 (20H392)","roots_installed":0,"incident_id":"DEADBEEF-0000-0000-0000-000000000000","name":"App"}
+Date/Time:        2026-08-13 10:23:57.917 +0900
+End time:         2026-08-13 10:27:19.467 +0900
+OS Version:       iPhone OS 16.7.16 (Build 20H392)
+Architecture:     arm64
+Report Version:   40
+Incident Identifier: DEADBEEF-0000-0000-0000-000000000000
+
+Data Source:      Microstackshots
+Shared Cache:     DEADBEEF-0000-0000-0000-000000000000 slid base address 0x180410000, slide 0x410000
+
+Command:          App
+Path:             /private/var/containers/Bundle/Application/DEADBEEF-0000-0000-0000-000000000000/App.app/App
+Identifier:       com.modokiengine.court

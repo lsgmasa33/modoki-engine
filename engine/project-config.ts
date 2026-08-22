@@ -72,8 +72,7 @@ export type ModuleToggle = 'auto' | boolean;
 /** Per-project include/exclude of the heavy engine SDKs. Drives build-time
  *  tree-shaking for every target (web / native / playable) and is surfaced as
  *  Auto | On | Off checkboxes in Project Settings → Engine Modules. Each field
- *  defaults to `'auto'` (detect from the included scenes). `npr` and
- *  `gpuParticles` are sub-features of `render3d`. */
+ *  defaults to `'auto'` (detect from the included scenes). */
 export interface BuildModules {
   /** Three.js 3D renderer (Scene3D + the three.webgpu / TSL node pipeline). */
   render3d: ModuleToggle;
@@ -83,10 +82,6 @@ export interface BuildModules {
   physics2d: ModuleToggle;
   /** Rapier 3D physics. */
   physics3d: ModuleToggle;
-  /** NPR post-processing (requires render3d). */
-  npr: ModuleToggle;
-  /** GPU-compute particle backend (requires render3d + native WebGPU). */
-  gpuParticles: ModuleToggle;
   /** Video playback (HTMLVideoElement decode, video textures, the remote-clip cache).
    *  `'auto'` detects a `VideoPlayer` trait, EXCEPT on a `--target playable` build, where
    *  'auto' resolves OFF: a ≤5 MB MRAID bundle and a video file are close to mutually
@@ -98,6 +93,55 @@ export interface BuildModules {
 /** One engine-module key (a field of {@link BuildModules}). */
 export type ModuleKey = keyof BuildModules;
 
+/** A project's authored degradation for one tier below the default
+ *  (docs/rendering.md § "Quality tiers") — every field a tier may clamp, seeded
+ *  from the engine's measured `TIER_SETTINGS` when a project adds one. Mirrors
+ *  `TierRenderOverrides` (runtime/rendering/qualityTier.ts) field-for-field; restated rather than
+ *  imported because this file is deliberately import-free (see the header). */
+export interface TierOverridesConfig {
+  pixelRatioCap: number;
+  antialias: boolean;
+  shadows: boolean;
+  shadowMapCeiling: number;
+  /** Per-effect post-FX gate (§3 "Post-FX is PER EFFECT, not one switch") — the same five keys
+   *  as the engine's `PostFXEffect`. */
+  postFX: {
+    npr: boolean;
+    ao: boolean;
+    dof: boolean;
+    bloom: boolean;
+    vignette: boolean;
+  };
+  maxDirectional: number;
+  maxLocal: number;
+  /** Most lights that may render a shadow map this frame. **0 = unlimited** (#229). Mirrors
+   *  `TierRenderOverrides.maxShadowCasters` (runtime/rendering/qualityTier.ts) — separate from
+   *  `maxDirectional`/`maxLocal` (those cap how many lights SHADE a fragment; this caps how many
+   *  RENDER a shadow map, a whole extra scene submit each) and from `shadowMapCeiling` (that caps
+   *  a map's size, not how many are rendered). */
+  maxShadowCasters: number;
+  ibl: boolean;
+  iblOffAmbientBoost: number;
+  iblOffExposure: number;
+  /** Frame cap this tier imposes, in fps. **0 = no tier cap** — the same sentinel as
+   *  `rendering.targetFps` above, which is why the engine clamps it through
+   *  `applyTierToTargetFps` and not a `Math.min` (#202). */
+  targetFps: number;
+  /** The 2D analogue of `pixelRatioCap`, applied to the PixiJS backing buffer. **0 = uncapped**
+   *  (matching `rendering.pixi.pixelRatioCap`'s own convention). `pixi.resolution` is deliberately
+   *  NOT tiered — it is a pin, and capping a pin would make the pin a lie. */
+  pixiPixelRatioCap: number;
+  /** The 2D analogue of `antialias`. Baked into the Pixi `Application` at slot creation, so a live
+   *  tier change catches up on the next slot rather than applying immediately. */
+  pixiAntialias: boolean;
+  /** Longest-edge cap for a TEXTURE on this tier, in pixels (texture LOD by quality tier, #212).
+   *  **0 = no cap** (ship the source size). Mirrors `TierRenderOverrides.textureMaxSize`
+   *  (runtime/rendering/qualityTier.ts) — this file restates rather than imports it (see the
+   *  header). Read by the build emitter (`vite-asset-scanner.ts`) to decide which extra
+   *  downscaled variants to convert; never touches format/codec selection. */
+  textureMaxSize: number;
+}
+
 export interface ProjectConfig {
   app: {
     /** Capacitor appId / native bundle identifier. */
@@ -108,6 +152,35 @@ export interface ProjectConfig {
      *  ideally 1024×1024). The build generates all iOS AppIcon + Android mipmap
      *  sizes from it. Empty = use the bundled Modoki icon. */
     iconSource: string;
+    /** Marketing version — what a player sees in the store listing ("1.0", "2.3.1").
+     *  Synced by `healAndroidVersion` into `versionName` and by `healIosVersion` into
+     *  `MARKETING_VERSION` (which `Info.plist` reads as `CFBundleShortVersionString`
+     *  via `$(MARKETING_VERSION)`). Free-form: the stores accept anything dotted, and
+     *  it carries no ordering requirement of its own. */
+    version: string;
+    /** Build number — the MONOTONIC integer both stores dedupe uploads by
+     *  (`versionCode` on Android, `CFBundleVersion`/`CURRENT_PROJECT_VERSION` on iOS).
+     *  ONE field for both platforms: their counters are independent, but a single value
+     *  that only ever moves up satisfies both, and two fields is one more thing to
+     *  forget.
+     *
+     *  ⚠️ **This exists because a duplicate is refused SILENTLY** (#199). Play does not
+     *  say "that versionCode is taken" — the bundle simply never attaches, and the
+     *  release page then reports three errors that all mean "this release is empty"
+     *  and none of which mention versions. It reads as a broken upload rather than a
+     *  refused one, so the first instinct is to re-upload, re-export, or re-check
+     *  signing. App Store Connect behaves the same way, with a different but equally
+     *  indirect message. Before this field, every project shipped the scaffolder's
+     *  hardcoded `1` and nothing ever changed it.
+     *
+     *  ⚠️ **The heal never LOWERS a native value** — see `healAndroidVersion`. Lowering
+     *  is the one direction that is always a mistake, and it is exactly what a stale or
+     *  fresh-clone config would do to a project that has already uploaded.
+     *
+     *  NOT auto-incremented, on purpose: a build number that changes itself makes builds
+     *  non-reproducible and churns a committed file on every build (the #18
+     *  write-behind-your-back hazard). The owner bumps it. */
+    buildNumber: number;
   };
   content: {
     /** Ordered build scene list (see {@link SceneEntry}). The first INCLUDED
@@ -184,7 +257,13 @@ export interface ProjectConfig {
      *  tree-shakes out — a release build has no eval-capable server to connect to.
      *  Set true for a QA/playtest/profiling game build that needs any of this on
      *  device. (Previously the debug bridge was ungated on native, so every native
-     *  build shipped it; this flag closes that exposure.) */
+     *  build shipped it; this flag closes that exposure.)
+     *
+     *  NOTE the LOADER default below stays `false` — a config that omits the key
+     *  is off — but the scaffolder template sets `"debugBuild": true`, so a NEWLY
+     *  created project is debuggable/profilable out of the box and must be turned
+     *  OFF before it ships (#239: six of twenty projects were unreachable by every
+     *  `device_*` tool, each costing a config flip + rebuild to measure). */
     debugBuild: boolean;
     /** Build-time engine-module include/exclude toggles — tree-shakes unused
      *  SDKs (three.js / pixi.js / Rapier) out of the bundle. Each defaults to
@@ -206,6 +285,14 @@ export interface ProjectConfig {
     /** Ad network the playable targets (Phase 5/8) — reserved for per-network CTA/
      *  MRAID quirks. Default 'applovin'. */
     playableNetwork: (typeof PLAYABLE_NETWORKS)[number];
+    /** Per-tier texture LOD variants (#212): every size ships INSIDE the package, so it's a
+     *  real cost for a native install (measured: +19% dist) that only pays off when the
+     *  device actually fetches just the variant it needs — i.e. when the payload travels over
+     *  the wire (a web build, or a native build shipped via OTA). 'auto' (default) emits under
+     *  exactly that condition; 'always' is the native opt-IN for a project whose textures are
+     *  huge enough that the boot-time/GPU-memory win is worth the install size; 'never' opts a
+     *  web project out. See `plugins/textureTierEmit.ts`. */
+    textureTierVariants: (typeof TEXTURE_TIER_VARIANTS_MODES)[number];
   };
   /** Native Capacitor shell settings, synthesized into `capacitor.config.json`
    *  (previously hardcoded in the generator) plus native-project patches applied
@@ -240,6 +327,17 @@ export interface ProjectConfig {
     /** Target frame rate for the rAF loop. 0 = uncapped (display refresh). A
      *  positive value throttles the loop (e.g. 30/60) to save battery/heat. */
     targetFps: number;
+    /** Message shown over the brief overlay while a LIVE quality-tier promotion is applied
+     *  (#227). Authored per project because it is player-facing copy: it needs each game's
+     *  voice and its language, and the engine cannot supply either. Empty string = fall back
+     *  to the engine default.
+     *
+     *  Why a message exists at all: a tier switch recompiles shaders — ~1.2 s per distinct
+     *  program, measured 2.9 s on a Galaxy A23 and 16.5 s on a Huawei Y6 for postfx-demo's 14
+     *  pairs (runtime/rendering/scene3DSync.ts). A promotion normally hides that inside a scene
+     *  load, but a single-scene game never reaches one, so the stall lands mid-play and the
+     *  player is owed an explanation rather than a freeze. */
+    tierSwitchMessage: string;
     three: {
       /** GPU API: 'auto' (detect, prefer WebGPU) | 'webgpu' | 'webgl'. */
       backend: 'auto' | 'webgpu' | 'webgl';
@@ -248,17 +346,27 @@ export interface ProjectConfig {
       pixelRatioCap: number;
       shadows: boolean;
       /** Quality tier (#121): 'auto' delegates to the device allowlist + on-device calibration;
-       *  'low'/'high' pin it. A tier CLAMPS the settings above — it never raises them — so
+       *  'low'/'mid'/'high' pin it. A tier CLAMPS the settings above — it never raises them — so
        *  'high' is exactly today's behaviour and the fields beside it stay authoritative.
        *
        *  **Defaults to 'auto' since #155**, which resolves LOW on anything not allowlisted (a
        *  desktop excepted). Pin 'high' to opt a project out — but note what that opts into: a
        *  Y6 2019 booting 'high' took a 6388 ms post-FX submit, lost its GPU context and stayed
        *  blank, where 'auto' holds 27-33 fps on the same phone. */
-      qualityTier: 'auto' | 'low' | 'high';
+      qualityTier: 'auto' | 'low' | 'mid' | 'high';
       /** Tone-mapping operator ('ACESFilmic' | 'AgX' | 'Neutral' | 'Linear' | 'None'). */
       toneMapping: (typeof TONE_MAPPINGS)[number];
       exposure: number;
+      /** A project's authored `mid`/`low` degradation configs
+       *  (docs/rendering.md § "Quality tiers") — ABSENT, not an empty object, when
+       *  the project has authored neither. **Presence is the signal**: no `tiers` means one
+       *  config (the default, i.e. no clamping at all) means nothing to choose between means
+       *  the boot probe does not need to run (§2.2, A2). A project adds `mid`/`low` only to opt
+       *  into degradation; `rendering.three` above gains nothing from this field existing. */
+      tiers?: {
+        mid?: TierOverridesConfig;
+        low?: TierOverridesConfig;
+      };
     };
     pixi: {
       /** GPU API: 'auto' (detect, prefer WebGPU) | 'webgpu' | 'webgl'. */
@@ -405,6 +513,14 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     appId: 'com.modokiengine.prototype',
     appName: 'Puzzle Prototype',
     iconSource: '',
+    // '1.0' / 1 are exactly what `cap add` scaffolds into versionName/versionCode and
+    // MARKETING_VERSION/CURRENT_PROJECT_VERSION, so adopting these fields rewrites NOTHING
+    // in any existing project (measured across all 20: every one is 1.0/1 bar iap-test,
+    // which has uploaded and carries its own). Deliberately unlike `androidMinSdk`, whose
+    // default overrides the scaffold because the scaffold's 24 is wrong; there is nothing
+    // wrong with starting at 1.0/1 — it was just unmanaged.
+    version: '1.0',
+    buildNumber: 1,
   },
   content: {
     scenes: [],
@@ -429,11 +545,12 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     debugBuild: false,
     modules: {
       render3d: 'auto', render2d: 'auto', physics2d: 'auto',
-      physics3d: 'auto', npr: 'auto', gpuParticles: 'auto', video: 'auto',
+      physics3d: 'auto', video: 'auto',
     },
     playableMaxBytes: 5_242_880, // 5 MB (AppLovin)
     playableClickUrl: '',
     playableNetwork: 'applovin',
+    textureTierVariants: 'auto',
   },
   capacitor: {
     webDir: 'dist',
@@ -447,6 +564,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   },
   rendering: {
     targetFps: 60, // matches the frame driver's historical default cap
+    tierSwitchMessage: '', // empty = the engine's own default copy
     three: { backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true, qualityTier: 'auto', toneMapping: 'ACESFilmic', exposure: 1.2 },
     pixi: { backend: 'auto', antialias: true, resolution: 0, pixelRatioCap: 2 },
     web: { sizeMode: 'free', width: 1280, height: 720 },
@@ -569,12 +687,19 @@ export function projectConfigIssues(partial: Partial<ProjectConfig> | null | und
  *  a guard test instead of by an import. */
 export const WEB_SIZE_MODES = ['free', 'fixed', 'max'] as const;
 export const GPU_BACKENDS = ['auto', 'webgpu', 'webgl'] as const;
-/** Quality tiers a project may select (#121 P3). 'auto' delegates to the device allowlist +
- *  on-device calibration; 'low'/'high' pin it. */
-export const QUALITY_TIERS = ['auto', 'low', 'high'] as const;
+/** Quality tiers a project may select (#121 P3, `mid` added by #188). 'auto' delegates to the
+ *  device allowlist + the boot ramp probe + on-device calibration; 'low'/'mid'/'high' pin it.
+ *  Kept in the same weakest-first order as the package's `TIER_ORDER`, which is what a pinning UI
+ *  reads as a ladder. */
+export const QUALITY_TIERS = ['auto', 'low', 'mid', 'high'] as const;
 export const WEB_DEPLOY_MODES = ['none', 'gcs', 'custom'] as const;
 /** Ad-network MRAID/CTA conventions for the playable export. */
 export const PLAYABLE_NETWORKS = ['applovin', 'unity', 'ironsource', 'facebook', 'mintegral', 'generic'] as const;
+/** Whether a build emits per-tier texture LOD variants (#212) — 'auto' emits only when the
+ *  payload is delivered OVER THE WIRE (a web build, or a native build that's actually an OTA
+ *  publish); 'always'/'never' override that in either direction. See
+ *  `plugins/textureTierEmit.ts` for the predicate this drives. */
+export const TEXTURE_TIER_VARIANTS_MODES = ['auto', 'always', 'never'] as const;
 export const CAPACITOR_ORIENTATIONS = ['auto', 'portrait', 'landscape'] as const;
 export const STATUS_BAR_STYLES = ['default', 'light', 'dark'] as const;
 /** Capacitor `ios.preferredContentMode` (see addNativeTarget.ts). */
@@ -605,8 +730,26 @@ export const TONE_MAPPINGS = ['None', 'Linear', 'ACESFilmic', 'AgX', 'Neutral'] 
  *  erased the only evidence of intent and left a file that merely looked correct.
  *  Reading coerces (so the engine renders something a consumer handles); writing
  *  round-trips (so the file keeps saying what its author said). */
+/** What `mergeProjectConfig` actually accepts. `Partial<ProjectConfig>` was too strict and did
+ *  not describe the implementation: every section below is applied with a SPREAD
+ *  (`{...d.app, ...p.app}`), so a partial section has always worked — the type just demanded a
+ *  complete one. Nothing noticed while the input came off disk as arbitrary JSON, but it meant a
+ *  test fixture overriding one field had to name every sibling, so every field added to a section
+ *  broke unrelated fixtures (adding `app.version` broke addNativeTarget.test.ts). One level deep
+ *  is exactly what the implementation does; `build.modules` is the one nested case and it gets
+ *  its own spread below.
+ *
+ *  `postprocessors` is excluded because it is MAP-LIKE (keyed by postprocessor id, see the
+ *  deep-merge notes further down) rather than fixed-shape: a `Record` is already
+ *  "any subset of keys", and wrapping it in `Partial` would only widen its VALUES to
+ *  `ModelPostprocessorDecl | undefined`, which is a different and wrong claim. */
+type MapLikeSection = 'postprocessors';
+type PartialProjectConfig = {
+  [K in keyof ProjectConfig]?: K extends MapLikeSection ? ProjectConfig[K] : Partial<ProjectConfig[K]>;
+};
+
 export function mergeProjectConfig(
-  partial: Partial<ProjectConfig> | null | undefined,
+  partial: PartialProjectConfig | null | undefined,
   opts?: { coerceUnions?: boolean; issues?: ProjectConfigIssue[] },
 ): ProjectConfig {
   const p = partial ?? {};
@@ -625,6 +768,7 @@ export function mergeProjectConfig(
       // deploy/playable step silently picked a branch for it.
       webDeployMode: pick(p.build?.webDeployMode, WEB_DEPLOY_MODES, d.build.webDeployMode, 'build.webDeployMode'),
       playableNetwork: pick(p.build?.playableNetwork, PLAYABLE_NETWORKS, d.build.playableNetwork, 'build.playableNetwork'),
+      textureTierVariants: pick(p.build?.textureTierVariants, TEXTURE_TIER_VARIANTS_MODES, d.build.textureTierVariants, 'build.textureTierVariants'),
     },
     capacitor: {
       ...d.capacitor, ...p.capacitor,
@@ -645,6 +789,7 @@ export function mergeProjectConfig(
         ...d.rendering.three, ...p.rendering?.three,
         backend: pick(p.rendering?.three?.backend, GPU_BACKENDS, d.rendering.three.backend, 'rendering.three.backend'),
         toneMapping: pick(p.rendering?.three?.toneMapping, TONE_MAPPINGS, d.rendering.three.toneMapping, 'rendering.three.toneMapping'),
+        qualityTier: pick(p.rendering?.three?.qualityTier, QUALITY_TIERS, d.rendering.three.qualityTier, 'rendering.three.qualityTier'),
       },
       pixi: {
         ...d.rendering.pixi, ...p.rendering?.pixi,
@@ -752,13 +897,38 @@ const FORBIDDEN_PATCH_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
  *     is keyed by postprocessor id, and since objects merge recursively there is no way
  *     to express "delete this entry" through a patch. Removing one means editing
  *     project.config.json directly. Fixed-shape sections are unaffected, and arrays
- *     (content.scenes, physics.layers) do support removal because they replace. */
-export function deepMergeConfigPatch(base: RawProjectConfig, patch: RawProjectConfig): RawProjectConfig {
+ *     (content.scenes, physics.layers) do support removal because they replace.
+ *   - ...EXCEPT the paths in {@link REPLACE_WHOLESALE}, which behave like arrays. See there. */
+/** Dot-paths merged as LEAVES — replaced wholesale — because for them the ABSENCE of a key is
+ *  meaningful data rather than "leave it alone".
+ *
+ *  ⚠️ **`rendering.three.tiers` is here because without it the Project Settings "Remove" button
+ *  is a lie.** The dialog posts the whole draft and the backend deep-merges it, so a removed
+ *  `low` is simply an absent key — which every other map-like section reads as "don't touch". The
+ *  dialog would close cleanly, report success, and the tier would still be in the file on the next
+ *  load. Found by testing the real merge rather than the component (`deepMergeConfigPatch` with a
+ *  `low`-omitting patch demonstrably returned the `low` unchanged), which is the only way to see
+ *  it — the component's own object is correct, and every unit test of it passes.
+ *
+ *  It is also the ONE map here whose emptiness is semantic: no `tiers` (or an empty one) means the
+ *  project authored a single quality config, which is what tells the boot probe not to run at all
+ *  (docs/rendering.md § "Quality tiers"). A section that cannot express removal cannot
+ *  express that. */
+const REPLACE_WHOLESALE = new Set(['rendering.three.tiers']);
+
+export function deepMergeConfigPatch(
+  base: RawProjectConfig,
+  patch: RawProjectConfig,
+  path = '',
+): RawProjectConfig {
   const out: RawProjectConfig = { ...base };
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined || FORBIDDEN_PATCH_KEYS.has(k)) continue;
+    const here = path ? `${path}.${k}` : k;
     const prev = out[k];
-    out[k] = isPlainObject(v) && isPlainObject(prev) ? deepMergeConfigPatch(prev, v) : v;
+    out[k] = isPlainObject(v) && isPlainObject(prev) && !REPLACE_WHOLESALE.has(here)
+      ? deepMergeConfigPatch(prev, v, here)
+      : v;
   }
   return out;
 }

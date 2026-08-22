@@ -93,3 +93,27 @@ describe('getWorldTransform3D', () => {
     expect(local.z).toBeCloseTo(0);
   });
 });
+
+describe('getWorldTransform3D — a zero scale axis (#258)', () => {
+  // The ON-DEMAND half of the world-transform contract had the identical identity fallback as
+  // the cached half, so physics/audio/game systems that read this API saw the same lie. Both
+  // halves need their own regression: fixing one says nothing about the other.
+
+  it('keeps the parent chain scale instead of falling back to identity', () => {
+    const root = spawn('Flag', 0, { sx: 0.53, sy: 0.53, sz: 0.53 });
+    const cloth = spawn('Cloth', root.id(), { sx: 0 });
+    const wt = getWorldTransform3D(cloth.id(), w);
+    expect(wt.sx).toBe(0);          // was 1
+    expect(wt.sy).toBeCloseTo(0.53, 9); // was 1 — the parent's scale vanished too
+    expect(wt.sz).toBeCloseTo(0.53, 9);
+  });
+
+  it('keeps the ROTATION of an entity flattened on one axis', () => {
+    const root = spawn('Group', 0, { sx: 2, sy: 2, sz: 2 });
+    const flat = spawn('Flat', root.id(), { ry: Math.PI / 2, sy: 0 });
+    const wt = getWorldTransform3D(flat.id(), w);
+    expect(wt.ry).toBeCloseTo(Math.PI / 2, 9); // was 0
+    expect(wt.sy).toBe(0);
+    expect(wt.sx).toBeCloseTo(2, 9);
+  });
+});

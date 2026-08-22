@@ -17,6 +17,8 @@
 
 import type { InputSource } from './inputSources';
 import { applyDeadzone, type InputFrame } from '../core/inputActions';
+import { noteUserInput } from '../core/userActivity';
+import { rawNow } from '../core/clock';
 
 /** W3C "standard gamepad" button indices (https://w3c.github.io/gamepad/#remapping). */
 const BTN = {
@@ -113,7 +115,10 @@ export const gamepadSource: InputSource = {
     for (const pad of nav.getGamepads()) {
       // First connected pad wins (single-player). Multi-pad merge is a later concern.
       if (pad && pad.connected) {
-        if (sampleGamepadInto(pad, out)) out.lastDevice = 'gamepad';
+        if (sampleGamepadInto(pad, out)) {
+          out.lastDevice = 'gamepad';
+          noteUserInput(rawNow()); // see core/userActivity.ts
+        }
         break;
       }
     }

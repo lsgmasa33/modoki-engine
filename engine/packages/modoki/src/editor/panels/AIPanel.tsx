@@ -188,14 +188,14 @@ export default function AIPanel(): React.ReactElement {
       {/* Actions */}
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
         {summary.action && (
-          <button onClick={connect} disabled={busy} style={btn({
+          <button data-ui-id="ai.connect.claudeCode" data-ui-kind="button" data-ui-label="connect Claude Code" data-ui-state={busy ? 'busy' : summary.action} onClick={connect} disabled={busy} style={btn({
             background: busy ? '#2a2a3a' : '#2a4a2a', borderColor: '#3a6a3a',
             color: busy ? '#888' : '#fff', cursor: busy ? 'default' : 'pointer', minWidth: 90,
           })}>{busy ? 'Working…' : summary.action}</button>
         )}
         <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#9a9ac0', cursor: status.isPackaged ? 'pointer' : 'not-allowed' }}
           title={status.isPackaged ? 'Chrome DevTools Protocol lets Claude inspect the live renderer. On by default; uncheck to close the 127.0.0.1 debug port (relaunches the editor).' : 'In dev, CDP is set via MODOKI_CDP_PORT in launch-editor.sh.'}>
-          <input type="checkbox" checked={status.cdpEnabled} disabled={busy || !status.isPackaged}
+          <input data-ui-id="ai.connect.cdp" data-ui-kind="toggle" data-ui-label="renderer debugging (CDP)" type="checkbox" checked={status.cdpEnabled} disabled={busy || !status.isPackaged}
             onChange={(e) => void toggleCdp(e.target.checked)} />
           Renderer debugging (CDP)
         </label>
@@ -207,7 +207,7 @@ export default function AIPanel(): React.ReactElement {
           <div style={{ color: '#888', marginBottom: 6 }}>Then, in a terminal:</div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <code style={{ flex: 1, color: '#cdd', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{instruction}</code>
-            <button onClick={() => void copy(instruction, 'cmd')} style={btn({ padding: '2px 8px' })}>{copied === 'cmd' ? 'Copied' : 'Copy'}</button>
+            <button data-ui-id="ai.connect.copyCommand" data-ui-kind="button" data-ui-label="copy connect command" onClick={() => void copy(instruction, 'cmd')} style={btn({ padding: '2px 8px' })}>{copied === 'cmd' ? 'Copied' : 'Copy'}</button>
           </div>
           <div style={{ color: '#666', marginTop: 6 }}>Approve the “modoki”{status.cdpEnabled ? ' and “chrome-devtools”' : ''} MCP server when prompted.</div>
         </div>

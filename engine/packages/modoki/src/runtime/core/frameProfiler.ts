@@ -44,6 +44,20 @@ export const PROFILE_WINDOW_FRAMES = 120;
  *  dropped. Without this one backgrounded tab poisons every percentile in the window. */
 const MAX_PLAUSIBLE_FRAME_MS = 1000;
 
+/** How far past the target frame time a frame may sit before it counts as OVER BUDGET.
+ *
+ *  `budgetMs` is the target frame interval times this, so at `targetFps: 60` the budget is 20 ms
+ *  rather than 16.67 — a little slack, because a frame landing a hair late is not a quality
+ *  problem.
+ *
+ *  Exported because `qualityTier` has to divide it back OUT: the demotion bar is expressed as a
+ *  share of `budgetMs`, but the question it asks is about the TARGET FRAME TIME, and re-deriving
+ *  the target means undoing this slack. A second literal `1.2` over there would be a code
+ *  constant shadowing this one, which is exactly the drift the single-source-of-truth rule
+ *  exists to prevent. NOT the same number as `isVsyncBound`'s 1.2 — that one is a tolerance for
+ *  recognising a refresh interval, and the two are free to move independently. */
+export const BUDGET_SLACK = 1.2;
+
 export interface FrameStat {
   median: number;
   p95: number;
@@ -65,11 +79,31 @@ export interface FrameProfile {
   /** Median frameMs is within 20% of a plausible vsync interval, i.e. the frame is finishing
    *  early and `restMs` is mostly idle rather than GPU cost. */
   vsyncBound: boolean;
-  /** Median frameMs exceeds the 30 fps budget — the phase-5 pass/fail. */
+  /** Median frameMs exceeds {@link FrameProfile.budgetMs} — the phase-5 pass/fail. */
   overBudget: boolean;
+  /** The threshold {@link FrameProfile.overBudget} was judged against, ms.
+   *
+   *  ⚠️ **REPORTED BECAUSE A CONSUMER GUESSED IT AND GUESSED WRONG** (close-out 2026-08-12).
+   *  `overBudget` stopped meaning "slower than 30 fps" the moment it started reading the frame
+   *  cap in force (see {@link frameCapIntervalMs}) — at the fleet's `targetFps: 60` the real
+   *  threshold is **20 ms**, not 33.3. `evaluateTierChange` still built its demotion reason from
+   *  `BUDGET_30FPS_MS`, so a device demoting at a 22 ms median logged *"median frame 22.0ms over
+   *  the 33.3ms budget"* — a sentence that contradicts itself, on the one surface that exists to
+   *  explain a surprising tier. A judgement that carries its own threshold cannot be misquoted. */
+  budgetMs: number;
   /** Frames dropped from the window as discontinuities (see MAX_PLAUSIBLE_FRAME_MS). A
    *  non-zero count next to a healthy profile usually means stalls, not smooth rendering. */
   discontinuities: number;
+  /** The LONGEST dropped interval, in ms, since the last reset — 0 when none was dropped.
+   *
+   *  Counting stalls without sizing them is what made the boot stall un-re-measurable (#212 item
+   *  3): a 3,926 ms figure sat unverified in an issue for weeks because the only instrument that
+   *  saw the stall deliberately threw the number away, and `discontinuities: 1` reads identically
+   *  for a 1.1 s hitch and a 7 s freeze. Dropping it from the PERCENTILES is right — one stall
+   *  would poison every one of them — but dropping it from the RECORD was not. Recorded here so
+   *  "did the compileAsync change kill the boot stall" is one profiler read rather than a
+   *  bespoke instrumentation pass. */
+  worstStallMs: number;
 }
 
 // Two parallel ring buffers rather than an array of objects: this writes every frame, and a
@@ -81,6 +115,13 @@ let writeIndex = 0;
 let filled = 0;
 let prevFrameStart = 0;
 let discontinuities = 0;
+let worstStallMs = 0;
+// WHEN the worst stall was, in raw clock terms. Kept out of `FrameProfile` deliberately: it is
+// not a statistic about the window, it is a coordinate used to intersect the stall with the boot
+// timeline (#238) — "1,814 ms" is unattributable on its own, "1,814 ms, and these spans were open
+// across it" is the answer. `-1` when nothing has been dropped.
+let worstStallStart = -1;
+let worstStallEnd = -1;
 
 /** Record one frame. Called by `frameDriver` — two `rawNow()` reads and a ring write, so it is
  *  ALWAYS ON: the faults worth profiling (a boot-time context loss, an intermittent hitch) are
@@ -97,6 +138,11 @@ export function recordFrame(frameStart: number, callbacksEnd: number): { frameMs
       if (filled < PROFILE_WINDOW_FRAMES) filled++;
     } else {
       discontinuities++;
+      if (frameMs > worstStallMs) {
+        worstStallMs = frameMs;
+        worstStallStart = prevFrameStart;
+        worstStallEnd = frameStart;
+      }
     }
   }
   prevFrameStart = frameStart;
@@ -136,8 +182,40 @@ const summarize = summarizeStat;
  *  means the renderer is finishing early and waiting — not that it is GPU-bound. */
 const VSYNC_INTERVALS_MS = [1000 / 60, 1000 / 120, 1000 / 90, 1000 / 144];
 
+/** The interval the ENGINE'S OWN frame cap is pacing to, ms; 0 when uncapped.
+ *
+ *  ⚠️ **THIS FIELD EXISTS BECAUSE ITS ABSENCE DISABLED TIER PROMOTION ON EVERY PROJECT IN THE
+ *  REPO** (review 2026-08-12). `frameDriver` skips the whole callback pass before `recordFrame`
+ *  runs, so a capped loop's `frameMs` is the CAP's interval, not the display's — and the list
+ *  above knows only display intervals. #202 seeded `low.targetFps: 30` into all 23 projects, so
+ *  every `low` device read `frameMs.median ≈ 33.3 ms`, which is not within 1.2x of ANY entry
+ *  above (the largest accepted median is 20 ms). `vsyncBound` therefore went false, `hasHeadroom`
+ *  fell to its `<= BUDGET_30FPS_MS * 0.5` branch — 16.67 ms, unreachable under a 30 fps cap — and
+ *  the single promotion step `promotionCeiling` grants a `calibrating` device could never fire.
+ *
+ *  ⚠️ **THAT BRANCH IS GONE (2026-08-20) — the history above is why the field exists, not how the
+ *  decision works now.** `hasHeadroom` no longer reads `frameMs` or `vsyncBound` at all; it asks
+ *  whether the engine's CPU fits the frame the NEXT tier targets. The cap still has to be pushed
+ *  in, because `budgetMs`/`overBudget` are derived from it and promotion is floored on
+ *  `!overBudget`. See `docs/rendering.md` § "an idle window is not evidence".
+ *
+ *  A cap is a FRAME-DRIVER fact, not a display fact, so it is PUSHED IN rather than imported:
+ *  `frameProfiler` is L0 core and the cap's owner (`frameDriver`, L2) may import downward but not
+ *  the reverse. It is set from `setTargetFPS` — the single point every source of the cap goes
+ *  through (project config AND a tier) — so a new source cannot bypass it. */
+let frameCapIntervalMs = 0;
+
+/** Tell the profiler what interval the frame driver is pacing to. `fps <= 0` means uncapped.
+ *  Called only from {@link setTargetFPS}; see {@link frameCapIntervalMs} for why it is a push. */
+export function setProfilerFrameCap(fps: number): void {
+  frameCapIntervalMs = fps > 0 ? 1000 / fps : 0;
+}
+
 function isVsyncBound(medianFrameMs: number): boolean {
   if (medianFrameMs <= 0) return false;
+  // The engine's own cap first: a loop pacing to 33.3 ms because it was TOLD to is finishing
+  // early and waiting, which is exactly what this flag means — the same regime as vsync.
+  if (frameCapIntervalMs > 0 && medianFrameMs <= frameCapIntervalMs * 1.2) return true;
   return VSYNC_INTERVALS_MS.some((iv) => medianFrameMs <= iv * 1.2);
 }
 
@@ -156,6 +234,9 @@ export function getFrameProfile(): FrameProfile {
   // difference of two order statistics from different frames and need not correspond to any
   // frame that actually happened.
   const restMs = summarize(frames.map((f, i) => Math.max(0, f - cpus[i])));
+  // ONE expression for the threshold, published as `budgetMs` and compared against below — so
+  // "what counts as over budget" and "what we say it was" cannot disagree.
+  const budgetMs = frameCapIntervalMs > 0 ? frameCapIntervalMs * BUDGET_SLACK : BUDGET_30FPS_MS;
   return {
     samples: filled,
     frameMs,
@@ -163,8 +244,15 @@ export function getFrameProfile(): FrameProfile {
     restMs,
     fps: frameMs.median > 0 ? 1000 / frameMs.median : 0,
     vsyncBound: isVsyncBound(frameMs.median),
-    overBudget: frameMs.median > BUDGET_30FPS_MS,
+    // Judged against the cap in force, not a fixed 30 fps. A project that ASKED for 30 is not
+    // "over budget" for delivering it — and at `targetFps: 30` the nominal interval is
+    // BUDGET_30FPS_MS to the decimal, so a bare `>` made obeying the cap a jitter-decided coin
+    // flip. The 1.2x matches `isVsyncBound`'s tolerance so the two cannot disagree about the
+    // same reading.
+    overBudget: frameMs.median > budgetMs,
+    budgetMs,
     discontinuities,
+    worstStallMs,
   };
 }
 
@@ -178,6 +266,16 @@ export function resetFrameProfile(): void {
   filled = 0;
   prevFrameStart = 0;
   discontinuities = 0;
+  worstStallMs = 0;
+  worstStallStart = -1;
+  worstStallEnd = -1;
+}
+
+/** The raw-clock window the worst stall occupied, or null when no frame has been dropped. The
+ *  boot-timeline read subtracts `getBootOrigin()` from these to ask what was open at the time. */
+export function getWorstStallWindow(): { startMs: number; endMs: number } | null {
+  if (worstStallStart < 0) return null;
+  return { startMs: worstStallStart, endMs: worstStallEnd };
 }
 
 /** Timestamp source, shared with `frameDriver` so both agree under an injected manual clock. */

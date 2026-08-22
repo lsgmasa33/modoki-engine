@@ -38,6 +38,12 @@ export interface ParticleSync2DCtx {
   markDirty(canvasId: number): void;
   /** Non-uniform-stretch scale compensation for a canvas (`{x:1,y:1}` default). */
   compensate(canvasId: number): { x: number; y: number };
+  /** The emitter's `GroupAlpha` ancestry product, or 1 when no ancestor fades it (#211).
+   *  Emitters attach their wrapper straight onto the Canvas2D slot container, exactly like every
+   *  other 2D display object, so they need the product applied here for the same reason: the Pixi
+   *  tree is flat and inherits nothing. Without it a faded group would dim its sprites and leave
+   *  its particles at full brightness — the trait claims the whole subtree. */
+  groupAlphaOf(entityId: number): number;
 }
 
 interface Rec {
@@ -127,6 +133,10 @@ export function syncParticles2D(
       if (rec.canvasId !== canvasId) ctx.markDirty(rec.canvasId);
       rec.canvasId = canvasId;
     }
+
+    // Group fade (#211) — same product the sprite/mesh/text paths apply. Written every frame like
+    // the transform below: particles animate continuously, so there is no snapshot to invalidate.
+    wrapper.alpha = ctx.groupAlphaOf(id);
 
     // Position from the propagated 2D world transform (ref-pixel space, Y-down) so a parented emitter
     // follows a moving ancestor and lines up with sprites; comp keeps scale un-stretched under `fill`.

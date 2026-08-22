@@ -100,9 +100,26 @@ interface EditorState {
    *  layout and re-IPCs the native menu, so model-resident focus would rewrite the autosave on
    *  every click. Resets to null on launch. See docs/editor-input.md. */
   focusedPanel: string | null;
+  /** Component ids of every panel with an OPEN TAB in the current layout, custom panels
+   *  included. Written by EditorApp from the one FlexLayout model walk it already does for
+   *  the Window menu; nothing else may set it.
+   *
+   *  It exists so the AGENT surface can refuse a panel it cannot focus. `setFocusedPanel` is
+   *  a bare setter by design (the human paths hand it a live tab component), so the
+   *  `set-focus-scope` op used to store any string it was given and echo it straight back —
+   *  making `/api/input/key`'s "could not focus panel" guard a tautology that could never
+   *  fire. A miscased `"Game"` then reported ok while the input gate stayed shut, and every
+   *  following keypress reached nothing. See #301. */
+  openPanels: string[];
   /** Opt-in: simulate + render ParticleEmitter effects live in the 3D SceneView */
   particlePreview: boolean;
   gameViewSize: { width: number; height: number };
+  /** Safe-area insets (logical px) of the Game panel's selected device preset. Written by
+   *  GameView, which owns the device picker; read by SceneView's UI preview frame so BOTH
+   *  viewports inset UI the same way. Zeros for `Free` and the abstract aspect presets —
+   *  and zeros are also what a desktop `env(safe-area-inset-*)` reports, so an unset value
+   *  degrades to today's behaviour rather than to something wrong. See #271. */
+  gameViewSafeArea: { top: number; right: number; bottom: number; left: number };
   /** Valid game rendering area within the Game panel (excludes letterbox strips) */
   gameRect: { left: number; top: number; width: number; height: number };
   /** Incremented to trigger Assets panel refresh */
@@ -128,6 +145,9 @@ interface EditorState {
   projectSettingsOpen: boolean;
   /** "Clean Up Unused Assets" dialog open state */
   cleanupAssetsOpen: boolean;
+  /** "Find References" dialog target (#284) — an asset GUID/path or entity GUID plus
+   *  a display label. null = dialog closed. */
+  findReferencesTarget: { target: string; label: string } | null;
   /** "Build Support" dialog open state (toolchain detection + install/guide). */
   buildSupportOpen: boolean;
   /** "Publish OTA Update…" dialog open state (docs/plans/mobile-ota-updates-plan.md Phase 5a). */
@@ -248,6 +268,8 @@ interface EditorState {
   closeProjectSettings: () => void;
   openCleanupAssets: () => void;
   closeCleanupAssets: () => void;
+  openFindReferences: (target: string, label: string) => void;
+  closeFindReferences: () => void;
   openBuildSupport: () => void;
   closeBuildSupport: () => void;
   openOtaPublish: () => void;
@@ -259,11 +281,13 @@ interface EditorState {
   setShowFocusGraph: (on: boolean) => void;
   setSceneViewMode: (mode: '3d' | 'ui') => void;
   setFocusedPanel: (panel: string | null) => void;
+  setOpenPanels: (ids: string[]) => void;
   setGizmoSpace: (space: 'local' | 'world') => void;
   setGizmoPivot: (pivot: 'pivot' | 'center') => void;
   setUnlockedGhostSelKey: (key: string | null) => void;
   setParticlePreview: (on: boolean) => void;
   setGameViewSize: (width: number, height: number) => void;
+  setGameViewSafeArea: (insets: EditorState['gameViewSafeArea']) => void;
   setGameRect: (rect: EditorState['gameRect']) => void;
   refreshAssets: () => void;
   setImportStatus: (active: boolean, message?: string, step?: number, totalSteps?: number) => void;
@@ -427,8 +451,10 @@ export const useEditorStore = create<EditorState>((set, get) => {
   showFocusGraph: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:showFocusGraph') === '1'),
   sceneViewMode: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:sceneViewMode') === 'ui') ? 'ui' : '3d',
   focusedPanel: null,
+  openPanels: [],
   particlePreview: false,
   gameViewSize: { width: 800, height: 450 },
+  gameViewSafeArea: { top: 0, right: 0, bottom: 0, left: 0 },
   gameRect: { left: 0, top: 0, width: 800, height: 450 },
   assetsVersion: 0,
   importStatus: { active: false, message: '', step: 0, totalSteps: 0 },
@@ -439,6 +465,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   revertPrefabDialog: { active: false, rootInstanceId: null },
   projectSettingsOpen: false,
   cleanupAssetsOpen: false,
+  findReferencesTarget: null,
   buildSupportOpen: false,
   otaPublishOpen: false,
   otaKeysOpen: false,
@@ -581,11 +608,32 @@ export const useEditorStore = create<EditorState>((set, get) => {
     editorEmit('!focus', { panel, from });
     set({ focusedPanel: panel });
   },
+  /** Replace the open-panel set. Compares before setting so a layout change that did not
+   *  open/close anything (a resize, a drag within a tabset) does not re-render every
+   *  subscriber. Not journalled: it mirrors the layout, which already journals. */
+  setOpenPanels: (ids: string[]) => {
+    // Sorted + de-duplicated: FlexLayout permits two tabs of the same component, and tab
+    // ORDER is a layout detail. Neither should reach the agent-facing list, where the only
+    // question is "may I focus this id".
+    const next = [...new Set(ids)].sort();
+    const prev = get().openPanels;
+    if (prev.length === next.length && prev.every((id, i) => id === next[i])) return;
+    set({ openPanels: next });
+  },
   setGizmoSpace: (space: 'local' | 'world') => { if (get().gizmoSpace !== space) editorEmit('!gizmo', { space }); set({ gizmoSpace: space }); mark2DDirty(); },
   setGizmoPivot: (pivot: 'pivot' | 'center') => { if (get().gizmoPivot !== pivot) editorEmit('!gizmo', { pivot }); set({ gizmoPivot: pivot }); mark2DDirty(); },
   setUnlockedGhostSelKey: (key: string | null) => set({ unlockedGhostSelKey: key }),
   setParticlePreview: (on: boolean) => set({ particlePreview: on }),
   setGameViewSize: (width, height) => set({ gameViewSize: { width, height } }),
+  // Identity-compared before writing: this is set from a render-time value in GameView, and
+  // a fresh object every render would re-notify every subscriber (SceneView's preview frame
+  // among them) on frames where the device did not change.
+  setGameViewSafeArea: (insets) => {
+    const cur = get().gameViewSafeArea;
+    if (cur.top === insets.top && cur.right === insets.right
+      && cur.bottom === insets.bottom && cur.left === insets.left) return;
+    set({ gameViewSafeArea: { ...insets } });
+  },
   setGameRect: (rect) => set({ gameRect: rect }),
   refreshAssets: () => set((s) => ({ assetsVersion: s.assetsVersion + 1 })),
   setImportStatus: (active, message = '', step = 0, totalSteps = 0) =>
@@ -611,6 +659,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
   closeProjectSettings: () => set({ projectSettingsOpen: false }),
   openCleanupAssets: () => set({ cleanupAssetsOpen: true }),
   closeCleanupAssets: () => set({ cleanupAssetsOpen: false }),
+  openFindReferences: (target, label) => set({ findReferencesTarget: { target, label } }),
+  closeFindReferences: () => set({ findReferencesTarget: null }),
   openBuildSupport: () => set({ buildSupportOpen: true }),
   closeBuildSupport: () => set({ buildSupportOpen: false }),
   openOtaPublish: () => set({ otaPublishOpen: true }),

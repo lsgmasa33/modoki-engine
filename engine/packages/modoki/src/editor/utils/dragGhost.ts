@@ -70,6 +70,34 @@ export function setAssetDragPayload(payload: string) {
   installDropTracking();
 }
 
+/** What the in-flight asset drag is, or null when none is in flight.
+ *
+ *  ⚠️ This exists because **`dataTransfer.getData()` returns `''` during `dragover`** —
+ *  the drag data store is in *protected mode* until `drop`, exposing only `types`. So a
+ *  drop target CANNOT decide acceptance from the DataTransfer, which is why the Hierarchy
+ *  and the Skin parts list both accepted every asset on dragover and then discarded the
+ *  ones they could not use (#306): the affordance said yes because it had nothing to say
+ *  no with. The payload is captured module-side at dragstart by `setAssetDragPayload`,
+ *  whose single producer is the Assets panel's row `onDragStart`, so it is readable at
+ *  dragover time.
+ *
+ *  Null while an `application/editor-asset` drag is in flight means the payload came from
+ *  somewhere other than this document (a foreign/stale drag). Callers should treat that as
+ *  "not droppable" rather than as "unknown, allow it" — the drop handler reads the payload
+ *  back through the same JSON and would discard it anyway.
+ *
+ *  The accept RULES live in `editor/panels/assetDropPolicy.ts`; this only reports the facts. */
+export function getAssetDragInfo(): { type: string | null; path: string } | null {
+  if (!_assetPayload) return null;
+  try {
+    const { type, path } = JSON.parse(_assetPayload) as { type?: string; path?: string };
+    // A payload with no `path` is not one the Assets panel wrote — every producer sets it,
+    // and an accept rule keying off the extension would silently see '' and refuse.
+    if (typeof path !== 'string') return null;
+    return { type: typeof type === 'string' ? type : null, path };
+  } catch { return null; }
+}
+
 /** Call from onDragEnd — if cursor is over a drop target, dispatch asset-drop */
 export function completeAssetDrop() {
   if (_hoveredDropTarget && _assetPayload) {
@@ -82,6 +110,41 @@ export function completeAssetDrop() {
 }
 
 // ── Drag ghost (visual feedback) ─────────────────────────────
+
+/** The live ghost element + the label it was started with, so a drop target can
+ *  repaint it as a refusal mid-drag and restore it on leave. */
+let _ghostEl: HTMLElement | null = null;
+let _ghostLabel = '';
+let _ghostRefusal: string | null = null;
+
+const GHOST_BG_OK = '#3a3a5c';
+const GHOST_BG_REFUSED = '#5c2b2b';
+
+function paintGhost() {
+  if (!_ghostEl) return;
+  const refused = _ghostRefusal !== null;
+  _ghostEl.style.background = refused ? GHOST_BG_REFUSED : GHOST_BG_OK;
+  const icon = _ghostEl.querySelector('[data-ghost-icon]');
+  const text = _ghostEl.querySelector('[data-ghost-label]');
+  if (icon) icon.textContent = refused ? '\u{1F6AB}' : '\u270A';
+  if (text) text.textContent = refused ? `${_ghostLabel} — ${_ghostRefusal}` : _ghostLabel;
+}
+
+/** Mark the in-flight drag as refused by the target under the cursor, with the reason
+ *  shown in the ghost that follows the pointer; pass null to clear it.
+ *
+ *  This is the *explanation* half of a refusal — the refusal itself is the target simply
+ *  NOT calling `preventDefault()` on dragover, which is what makes the browser paint the
+ *  no-drop cursor and what makes `modoki_dnd` report `accepted:false`. Both halves are
+ *  needed: the bare no-drop cursor says "not here" without saying why, and a reason with
+ *  an accepting dragover is the accept-then-discard bug this replaces (#306).
+ *
+ *  Idempotent, so a dragover firing every few pixels costs one comparison. */
+export function setDragGhostRefusal(reason: string | null) {
+  if (_ghostRefusal === reason) return;
+  _ghostRefusal = reason;
+  paintGhost();
+}
 
 export function startDragGhost(e: React.DragEvent, label: string) {
   // Clean up any previous ghost
@@ -98,9 +161,20 @@ export function startDragGhost(e: React.DragEvent, label: string) {
   // Floating ghost follows cursor
   const ghost = document.createElement('div');
   ghost.id = 'editor-drag-ghost';
-  ghost.innerHTML = `<span style="font-size:16px">✊</span> <span>${label}</span>`;
-  ghost.style.cssText = 'position:fixed;top:-9999px;left:-9999px;padding:2px 8px;background:#3a3a5c;color:#fff;font:11px monospace;border-radius:3px;white-space:nowrap;pointer-events:none;z-index:99999;display:flex;align-items:center;gap:4px;';
+  // textContent, not an interpolated innerHTML — the label is an asset/entity NAME, which
+  // is user-authored and can legally contain markup characters.
+  const icon = document.createElement('span');
+  icon.setAttribute('data-ghost-icon', '');
+  icon.style.fontSize = '16px';
+  const text = document.createElement('span');
+  text.setAttribute('data-ghost-label', '');
+  ghost.append(icon, text);
+  ghost.style.cssText = `position:fixed;top:-9999px;left:-9999px;padding:2px 8px;background:${GHOST_BG_OK};color:#fff;font:11px monospace;border-radius:3px;white-space:nowrap;pointer-events:none;z-index:99999;display:flex;align-items:center;gap:4px;`;
   document.body.appendChild(ghost);
+  _ghostEl = ghost;
+  _ghostLabel = label;
+  _ghostRefusal = null;
+  paintGhost();
 
   const moveGhost = (ev: MouseEvent) => {
     ghost.style.left = ev.clientX + 8 + 'px';
@@ -118,6 +192,7 @@ export function startDragGhost(e: React.DragEvent, label: string) {
 
   (window as any).__editorDragCleanup = () => {
     ghost.remove();
+    if (_ghostEl === ghost) { _ghostEl = null; _ghostLabel = ''; _ghostRefusal = null; }
     document.removeEventListener('dragover', moveGhost as EventListener);
     document.removeEventListener('dragend', forceEnd, { capture: true } as EventListenerOptions);
     document.removeEventListener('drop', forceEnd, { capture: true } as EventListenerOptions);
@@ -141,6 +216,9 @@ export function endDragGhost() {
   delete (window as any).__editorDragCleanup;
   // Remove any leftover ghost element (safety net)
   document.getElementById('editor-drag-ghost')?.remove();
+  // ...and drop the refusal state with it, so the next drag never starts pre-refused
+  // (the cleanup above only clears it when THIS module created the element).
+  _ghostEl = null; _ghostLabel = ''; _ghostRefusal = null;
   // Clean up any leftover cursor class (onMouseUp doesn't fire during drag)
   document.body.classList.remove('editor-mousedown');
 }

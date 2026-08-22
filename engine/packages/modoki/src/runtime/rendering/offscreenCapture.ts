@@ -16,6 +16,14 @@
  *
  * Single-slot, last-registered-wins: with the editor open, the live game view's
  * Scene3D is the registrant. Throws a clear error if no 3D view is mounted.
+ *
+ * The registrant NAMES its surface, and `renderSceneOffscreen` echoes that name on
+ * every result, because "which surface did I actually render?" is the one question
+ * this tool's own description spends a paragraph on. It promised the echo and did not
+ * deliver it (bug `XBayncnNfJj3RtjVZiBX`): the reply carried only path/width/height,
+ * so a caller who branched on `surface` silently took the `undefined` branch. Deriving
+ * it at the registry rather than in the route is what keeps it honest — the label comes
+ * from whoever is actually mounted, so a second registrant cannot make it lie.
  */
 
 export interface OffscreenCameraOverride {
@@ -64,6 +72,12 @@ export interface OffscreenRenderOpts {
 export interface OffscreenRenderResult {
   width: number;
   height: number;
+  /** Which on-screen surface served this render — the label the mounted registrant gave.
+   *  Today that is always `'game-3d'` (only the runtime `Scene3D` registers), which is
+   *  exactly what the caller needs confirmed: `render_scene` never renders the editor
+   *  SceneView you are orbiting. Attached by {@link renderSceneOffscreen}, not by the
+   *  renderer function itself. */
+  surface?: string;
   /** The EFFECTIVE JPEG quality actually used, 1–100 — echoed so a caller can see that its
    *  out-of-unit value was converted/clamped rather than silently ignored (S3.13). */
   quality?: number;
@@ -75,6 +89,8 @@ export interface OffscreenRenderResult {
 export type SceneRenderer = (opts: OffscreenRenderOpts) => Promise<OffscreenRenderResult>;
 
 let current: SceneRenderer | null = null;
+/** The surface label of the currently registered renderer — see {@link registerSceneRenderer}. */
+let currentSurface: string | null = null;
 
 // Serialize captures: every renderSceneOffscreen() chains onto the previous one
 // so two overlapping callers (e.g. a render-sequence + a manual render-scene, or
@@ -84,15 +100,19 @@ let current: SceneRenderer | null = null;
 // (P1-3). The `.catch` keeps a failed capture from poisoning the chain.
 let queue: Promise<unknown> = Promise.resolve();
 
-/** A mounted 3D view registers its offscreen render function (last wins). */
-export function registerSceneRenderer(fn: SceneRenderer): void {
+/** A mounted 3D view registers its offscreen render function (last wins), NAMING the
+ *  surface it renders (`'game-3d'` for the runtime `Scene3D`). The name is echoed on
+ *  every result so a caller can confirm which surface served the frame instead of
+ *  inferring it. */
+export function registerSceneRenderer(fn: SceneRenderer, surface = 'game-3d'): void {
   current = fn;
+  currentSurface = surface;
 }
 
 /** Unregister on unmount — only if still the active one (avoids clobbering a
  *  newer registrant during React's mount-before-unmount ordering). */
 export function unregisterSceneRenderer(fn: SceneRenderer): void {
-  if (current === fn) current = null;
+  if (current === fn) { current = null; currentSurface = null; }
 }
 
 /** True if a 3D view is mounted and can render offscreen. */
@@ -105,7 +125,10 @@ export function hasSceneRenderer(): boolean {
 export function renderSceneOffscreen(opts: OffscreenRenderOpts = {}): Promise<OffscreenRenderResult> {
   const fn = current;
   if (!fn) return Promise.reject(new Error('no scene renderer registered — is a 3D view (game/scene) mounted?'));
-  const run = queue.then(() => fn(opts));
+  // Read the label at CALL time, not inside the queued continuation: it must describe the
+  // registrant that this call resolved, even if a remount swaps the slot while we wait.
+  const surface = currentSurface ?? undefined;
+  const run = queue.then(() => fn(opts)).then((res) => ({ ...res, ...(surface ? { surface } : {}) }));
   queue = run.catch(() => {}); // next capture waits for this one, success or fail
   return run;
 }

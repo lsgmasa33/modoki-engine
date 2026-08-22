@@ -38,6 +38,7 @@ import { clearControlSpawns } from '../timeline/controlSpawnRegistry';
 import { clearSkeletalSeeks } from '../core/skeletalSeek';
 import { clearParticleControls } from '../core/particleControlRegistry';
 import { clearTimelineWarnings } from '../timeline/timelineSystem';
+import { resetUnresolvedSpriteWarnings } from '../loaders/textureResolver';
 import { setTimelinePreviewActive } from '../core/timelinePreview';
 
 /** A game system to run each frame, with its pipeline priority. */
@@ -159,6 +160,7 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
       clearSkeletalSeeks();
       clearParticleControls();
       clearTimelineWarnings();          // warn-once sets are keyed by world-local entity ids
+      resetUnresolvedSpriteWarnings();  // …as is the 2D dangling-sprite warn-once set
       setTimelinePreviewActive(false);
       setPlayState(prevPlay);
       if (prevWorld) setCurrentWorld(prevWorld);

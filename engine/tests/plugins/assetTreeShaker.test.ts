@@ -565,6 +565,24 @@ describe('asset-tree-shaker', () => {
     expect(result.kept).toContain('/games/test/assets/tex/enemy.png');
   });
 
+  it('keeps an asset referenced through a MAP-shaped field on an UNREGISTERED trait (#237)', () => {
+    // Widened generic sweep: a game trait can carry a slot-NAME → guid Record, same shape as
+    // the engine's SkinnedMeshRenderer.materials. Mirrors the existing array-unwrap test above
+    // but for the object branch — proves a game trait needs no registry entry for this shape
+    // either.
+    const matGuid = 'c0ffee00-0000-4000-8000-000000000003';
+    fx.writeJson('/games/test/assets/mats/skin.mat.json', { id: matGuid, version: 1 });
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6, resources: [],
+      // GameMaterialSlots is NOT in REF_FIELDS_BY_TRAIT — a plain game trait.
+      entities: [{ traits: { GameMaterialSlots: { slots: { Body: matGuid } } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/mats/skin.mat.json');
+  });
+
   it('does NOT keep or warn on a well-formed guid that is NOT an asset (an entity reference)', () => {
     // The sweep must stay silent on a miss: an entity-ref field is ALSO a guid-shaped string,
     // and it is never in the asset index. If the sweep routed misses through pushRef's warning
@@ -781,6 +799,79 @@ describe('asset-tree-shaker', () => {
     expect(result.kept).toContain('/games/test/assets/models/creature.glb');
   });
 
+  it('keeps every clip in an AudioSource bank authored in a PREFAB (#237 close-out sweep)', () => {
+    // Sibling of #237, found by comparing this walker's explicit handlers against the RUNTIME
+    // collector's: `AudioSource.clips` is a JSON-STRING bank `[{key, ref}]`, parsed by
+    // collectResourceRefsFromEntities and — until this fix — by nothing in the build.
+    // REF_FIELDS_BY_TRAIT covers only the scalar `clip`; the generic guid sweep sees one JSON
+    // string, so isGuid() is false and the refs inside are invisible.
+    //
+    // Authored in a PREFAB deliberately. In a SCENE the bank's refs also land in `resources[]`
+    // (same collector), which the walk reads — so a scene fixture would pass either way and prove
+    // nothing. A prefab has no `resources[]`, which is the case that actually shipped broken.
+    const activeGuid = 'aaaa1111-2222-4333-8444-555555555501';
+    const otherGuid = 'bbbb2222-3333-4444-8555-666666666602';
+    for (const [g, n] of [[activeGuid, 'music'], [otherGuid, 'sting']] as const) {
+      fx.writeVirtual(`/games/test/assets/audio/${n}.mp3`, 'fake-mp3');
+      fx.writeJson(`/games/test/assets/audio/${n}.mp3.meta.json`, { id: g, version: 2 });
+    }
+    fx.writeJson('/games/test/assets/prefabs/jukebox.prefab.json', {
+      entities: [{
+        traits: {
+          AudioSource: {
+            clip: activeGuid,
+            clips: JSON.stringify([{ key: 'music', ref: activeGuid }, { key: 'sting', ref: otherGuid }]),
+          },
+        },
+      }],
+    });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', {
+      version: 9,
+      entities: [{ id: 1, traits: { PrefabInstance: { source: '/games/test/assets/prefabs/jukebox.prefab.json' } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    // The ACTIVE clip survived even before the fix (the scalar `clip` is in REF_FIELDS_BY_TRAIT) —
+    // asserted so a regression that breaks only the bank is distinguishable from one that breaks both.
+    expect(result.kept).toContain('/games/test/assets/audio/music.mp3');
+    expect(result.kept).toContain('/games/test/assets/audio/sting.mp3');
+    expect(result.unreachableRefs).toEqual([]);
+  });
+
+  it('keeps a material (and its texture) referenced through SkinnedMeshRenderer.materials (#237)', () => {
+    // Regression for #237: `materials` is a Record<string, string> (slot NAME → .mat.json
+    // guid) — a nested object, reached by NEITHER REF_FIELDS_BY_TRAIT (scalar fields only)
+    // nor the generic sweep (scalar/one-level-array only) before this fix. Measured live on
+    // a device: 11 such refs across 3 committed projects were tree-shaken out of production,
+    // 404ing as "[MeshCache] Unknown asset guid: …".
+    const texGuid = '11111111-2222-4333-8444-555555555556';
+    const matGuid = '22222222-3333-4444-8555-666666666667';
+    fx.writeVirtual('/games/test/assets/tex/eye.png', 'fake-png');
+    fx.writeJson('/games/test/assets/tex/eye.png.meta.json', { id: texGuid, version: 2 });
+    fx.writeJson('/games/test/assets/mats/eye.mat.json', { id: matGuid, version: 1, texture: texGuid });
+    fx.writeJson('/games/test/assets/prefabs/creature.prefab.json', {
+      entities: [
+        { traits: { SkinnedModel: { model: '/games/test/assets/models/creature.glb' } } },
+        { traits: { SkinnedMeshRenderer: { node: 'Eyes', materials: { Eye: matGuid }, visible: true } } },
+      ],
+    });
+    fx.writeVirtual('/games/test/assets/models/creature.glb', 'fake');
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 9,
+      entities: [
+        { id: 1, traits: { PrefabInstance: { source: '/games/test/assets/prefabs/creature.prefab.json' } } },
+      ],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/mats/eye.mat.json');
+    // Transitive: the material's own texture ref must also survive.
+    expect(result.kept).toContain('/games/test/assets/tex/eye.png');
+    expect(result.warnings.filter((w) => /unresolved GUID/i.test(w))).toEqual([]);
+  });
+
   it('resolves fontFamily to matching files by parsed family name', () => {
     // Write a handful of font files across two families.
     fx.writeVirtual('/modoki/assets/fonts/Roboto/Roboto-Regular.ttf', 'fake');
@@ -808,6 +899,94 @@ describe('asset-tree-shaker', () => {
     expect(result.kept).toContain('/modoki/assets/fonts/Roboto/Roboto-Italic.ttf');
     expect(result.kept).not.toContain('/modoki/assets/fonts/Lato/Lato-Regular.ttf');
     expect(result.kept).not.toContain('/modoki/assets/fonts/Lato/Lato-Bold.ttf');
+  });
+
+  /** #231 — `UIElement.fontFamily` holds a font-asset GUID now, and both halves matter:
+   *   1. the referenced FILE is kept (that is what a ref means), and
+   *   2. every other VARIANT of its family is kept too, because the runtime registers all of
+   *      them (`loadFontFamily`) — ship only the referenced Regular and a UI authoring
+   *      `fontWeight:'bold'` gets a browser-synthesized fake bold instead of the real face.
+   *  Neither implies the other, so both are asserted. */
+  it('resolves a fontFamily GUID to its file AND its family’s other variants', () => {
+    const FONT_GUID = '30000000-0000-4000-8000-000000000001';
+    fx.writeVirtual('/modoki/assets/fonts/Roboto/Roboto-Regular.ttf', 'fake');
+    fx.writeJson('/modoki/assets/fonts/Roboto/Roboto-Regular.ttf.meta.json', { id: FONT_GUID });
+    fx.writeVirtual('/modoki/assets/fonts/Roboto/Roboto-Bold.ttf', 'fake');
+    fx.writeVirtual('/modoki/assets/fonts/Lato/Lato-Regular.ttf', 'fake');
+
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      resources: [{ type: 'font-family', path: FONT_GUID }],
+      entities: [{ id: 1, traits: { UIElement: { fontFamily: FONT_GUID } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/modoki/assets/fonts/Roboto/Roboto-Regular.ttf');
+    expect(result.kept, 'sibling variant of the same family').toContain('/modoki/assets/fonts/Roboto/Roboto-Bold.ttf');
+    expect(result.kept).not.toContain('/modoki/assets/fonts/Lato/Lato-Regular.ttf');
+    // A DOM consumer — which is what makes `shipSource:'auto'` ship the source `.ttf`
+    // beside the baked atlas. Without this the font renders from the atlas on canvas and
+    // falls back to the browser default in the DOM, in production only.
+    expect(result.domFontFiles).toContain('/modoki/assets/fonts/Roboto/Roboto-Regular.ttf');
+    expect(result.warnings.filter((w) => /unresolved GUID|no matching files/i.test(w))).toEqual([]);
+  });
+
+  /** A font whose GUID pins it directly must NOT produce the by-name resolver's "has no
+   *  matching files on disk" warning — the file IS kept; it just does not live under a
+   *  `fonts/` dir, which is the only place that resolver looks. A warning here is one the
+   *  author cannot act on. */
+  it('does not warn about a GUID-pinned font outside a fonts/ directory', () => {
+    const FONT_GUID = '30000000-0000-4000-8000-000000000002';
+    fx.writeVirtual('/games/test/assets/ui/Inter-Regular.ttf', 'fake');
+    fx.writeJson('/games/test/assets/ui/Inter-Regular.ttf.meta.json', { id: FONT_GUID });
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      entities: [{ id: 1, traits: { UIElement: { fontFamily: FONT_GUID } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/ui/Inter-Regular.ttf');
+    expect(result.domFontFiles).toContain('/games/test/assets/ui/Inter-Regular.ttf');
+    expect(result.warnings.filter((w) => /no matching files/i.test(w))).toEqual([]);
+  });
+
+  /** A `resources[]` entry of `{type:'font', path:'<guid>'}` is an SDF font asset
+   *  (`Text2D.font`), not a family name. Routing it through the by-name resolver made it a
+   *  "family" that matches nothing and warned about it on every build of a game with SDF
+   *  text — Court's, for one. */
+  it('treats a GUID font resource as an asset ref, not a family name', () => {
+    const FONT_GUID = '30000000-0000-4000-8000-000000000003';
+    fx.writeVirtual('/modoki/assets/fonts/Arimo/Arimo-Regular.ttf', 'fake');
+    fx.writeJson('/modoki/assets/fonts/Arimo/Arimo-Regular.ttf.meta.json', { id: FONT_GUID });
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      resources: [{ type: 'font', path: FONT_GUID }],
+      entities: [{ id: 1, traits: { Text2D: { font: FONT_GUID } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/modoki/assets/fonts/Arimo/Arimo-Regular.ttf');
+    expect(result.warnings.filter((w) => /no matching files/i.test(w))).toEqual([]);
+    // Canvas-only: no DOM consumer named it, so `shipSource:'auto'` may drop the source.
+    expect(result.domFontFiles).not.toContain('/modoki/assets/fonts/Arimo/Arimo-Regular.ttf');
+  });
+
+  /** One ref, one warning. `UIElement.fontFamily` is BOTH a REF_FIELDS_BY_TRAIT entry (so the
+   *  generic loop walks it) and the subject of a dedicated 'font-family' handler, and pushing
+   *  it through both reported a single stale ref as two — which reads as two broken fonts. */
+  it('reports an unresolved fontFamily GUID exactly once', () => {
+    const MISSING = '99999999-9999-4999-8999-999999999999';
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6,
+      entities: [{ id: 1, traits: { UIElement: { fontFamily: MISSING } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.warnings.filter((w) => w.includes(MISSING))).toHaveLength(1);
   });
 
   it('drops all fonts when no scene sets fontFamily', () => {
@@ -961,6 +1140,23 @@ describe('asset-tree-shaker', () => {
 
     expect(result.orphans).toContain('/games/test/assets/extras/unused.glb');
     expect(result.stats.droppedBytes).toBeGreaterThan(0);
+  });
+
+  it('does NOT report either sidecar half as its own orphan (QA-DLG-0006)', () => {
+    // An unreferenced texture is ONE orphan, not three. `.meta.local.json` used to fall
+    // through to 'unknown-json' and became a second row in Clean Up Unused Assets that
+    // could not be bundled away with its parent — so the dialog needed a second
+    // scan+delete pass to reach zero for what is conceptually one unused file.
+    fx.writeVirtual('/games/test/assets/tex/stray.png', 'fake-png');
+    fx.writeJson('/games/test/assets/tex/stray.png.meta.json', { version: 2, id: 'b7cf1a2e-0000-4000-8000-000000000001' });
+    fx.writeJson('/games/test/assets/tex/stray.png.meta.local.json', { textureCache: { bytes: 123 } });
+    fx.writeJson('/games/test/assets/scenes/main.json', { version: 6, entities: [] });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.orphans).toContain('/games/test/assets/tex/stray.png');
+    expect(result.orphans).not.toContain('/games/test/assets/tex/stray.png.meta.json');
+    expect(result.orphans).not.toContain('/games/test/assets/tex/stray.png.meta.local.json');
   });
 
   it('keeps the HDR referenced via Environment trait in a real-world-ish scene', () => {
@@ -1209,6 +1405,150 @@ describe('asset-tree-shaker', () => {
 
     expect(result.kept).toContain('/games/test/assets/anims/wave.anim.json');
     expect(result.warnings.filter((w) => /unresolved GUID/i.test(w))).toEqual([]);
+  });
+
+  // ── unreachableRefs build-time guard (#237) ──────────
+
+  it('unreachableRefs is empty for a normal fixture (no false positives)', () => {
+    // A regular scene/prefab/mesh/material graph, exercising several ref-carrying suffixes
+    // the guard scans (scene, prefab, mesh, mat) — none of it should trip the guard, since
+    // every guid present is either reached by the structured walk or is the file's own id.
+    fx.writeVirtual('/games/test/assets/tex/diffuse.png', 'fake-png');
+    fx.writeJson('/games/test/assets/tex/diffuse.png.meta.json', { id: '11111111-1111-4111-8111-111111111111', version: 2 });
+    fx.writeJson('/games/test/assets/mats/stone.mat.json', {
+      id: '22222222-2222-4222-8222-222222222222', texture: '11111111-1111-4111-8111-111111111111',
+    });
+    fx.writeJson('/games/test/assets/meshes/rock.mesh.json', {
+      id: '33333333-3333-4333-8333-333333333333', material: '22222222-2222-4222-8222-222222222222',
+    });
+    fx.writeJson('/games/test/assets/prefabs/rock.prefab.json', {
+      id: '44444444-4444-4444-8444-444444444444', rootLocalId: 1,
+      entities: [{ localId: 1, traits: { Renderable3D: { mesh: '33333333-3333-4333-8333-333333333333' } } }],
+    });
+    // Named `<name>.scene.json` like every committed scene in the repo. A legacy plain
+    // `/scenes/main.json` is audited too — the guard scans by classify(), not by suffix
+    // (see the legacy-scene test below).
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', {
+      version: 9, resources: [{ type: 'prefab', path: '44444444-4444-4444-8444-444444444444' }], entities: [],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.unreachableRefs).toEqual([]);
+  });
+
+  it('reports a ref the structured walk cannot see: two levels deep on a game trait', () => {
+    // Construct a blind spot the walker genuinely cannot reach — a guid nested TWO object
+    // levels below the trait bag on a game trait. The widened sweep from #237 unwraps exactly
+    // ONE level of object (bag.field -> object -> its values), mirroring the pre-existing
+    // array unwrap — so `outer.middle.inner` (field -> object -> object -> guid) is one level
+    // PAST what it reaches: `outer`'s value is itself an object (`middle`), not a string, so
+    // the sweep's `typeof el === 'string'` check on that inner value never fires. The guid is
+    // still visible to a plain regex scan of the raw JSON, which is exactly what this guard
+    // is for.
+    const matGuid = '55555555-6666-4777-8888-999999999999';
+    fx.writeJson('/games/test/assets/mats/hidden.mat.json', { id: matGuid, version: 1 });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', {
+      version: 6, resources: [],
+      entities: [{
+        traits: {
+          // GameNestedSlots is not in REF_FIELDS_BY_TRAIT.
+          GameNestedSlots: { outer: { middle: { inner: matGuid } } },
+        },
+      }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    // The structured walk missed it, so it's NOT in kept...
+    expect(result.kept).not.toContain('/games/test/assets/mats/hidden.mat.json');
+    // ...but the build-time guard catches it and names guid/target/referencedBy.
+    expect(result.unreachableRefs).toEqual([
+      { guid: matGuid, target: '/games/test/assets/mats/hidden.mat.json', referencedBy: '/games/test/assets/scenes/main.scene.json' },
+    ]);
+  });
+
+  it('keeps refs in nestedOverrides and in an added subtree (#237 close-out review)', () => {
+    // Third instance of #237's pattern, and the one a diff of the two walkers' TRAIT handlers
+    // cannot reach: this gap is STRUCTURAL. collectResourceRefsFromEntities walks `overrides`,
+    // `nestedOverrides` AND `added` subtrees (with their own override maps); extractEntityRefs
+    // walked only the first. Since the unreachable-ref guard, a ref authored in either store
+    // would FAIL THE BUILD rather than silently 404 — a hard stop on legitimate authoring.
+    const nestedGuid = 'dddd4444-5555-4666-8777-888888888804';
+    const addedGuid = 'eeee5555-6666-4777-8888-999999999905';
+    const deepGuid = 'ffff6666-7777-4888-8999-aaaaaaaaaa06';
+    fx.writeJson('/games/test/assets/mats/nested.mat.json', { id: nestedGuid, version: 1 });
+    fx.writeJson('/games/test/assets/mats/added.mat.json', { id: addedGuid, version: 1 });
+    fx.writeJson('/games/test/assets/mats/deep.mat.json', { id: deepGuid, version: 1 });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', {
+      version: 9,
+      entities: [{
+        id: 1,
+        traits: {},
+        // { path: { localId: { Trait: {…} } } } — one level deeper than `overrides`.
+        nestedOverrides: { 'child/path': { '2': { Renderable3DPrimitive: { material: nestedGuid } } } },
+        added: [{
+          traits: { Renderable3DPrimitive: { material: addedGuid } },
+          // an added REFERENCE node carries its own override map, and its own children
+          overrides: { '3': { Renderable3DPrimitive: { material: deepGuid } } },
+          children: [],
+        }],
+      }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/mats/nested.mat.json');
+    expect(result.kept).toContain('/games/test/assets/mats/added.mat.json');
+    expect(result.kept).toContain('/games/test/assets/mats/deep.mat.json');
+    // And therefore the guard has nothing to report — the walker reached them, rather than the
+    // guard catching them and failing the build.
+    expect(result.unreachableRefs).toEqual([]);
+  });
+
+  it('does NOT flag a video the module toggle dropped on purpose (ordering, not luck)', () => {
+    // The guard runs BEFORE the excludeVideo prune for exactly this case. `build.modules.video:false`
+    // removes clips from the keep-set AFTER the walk, so a scene that legitimately references one
+    // would look, to a naively-placed guard, like a ref the walker missed — and would FAIL the build
+    // of every playable export. Asserting the ordering rather than trusting the comment above it.
+    const vidGuid = 'cccc3333-4444-4555-8666-777777777703';
+    fx.writeVirtual('/games/test/assets/video/clip.mp4', 'fake-mp4');
+    fx.writeJson('/games/test/assets/video/clip.mp4.meta.json', { id: vidGuid, version: 2 });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', {
+      version: 9,
+      entities: [{ traits: { VideoPlayer: { clip: vidGuid } } }],
+    });
+
+    const kept = computeKeptAssets(fx.projectRoot, fx.roots);
+    expect(kept.kept).toContain('/games/test/assets/video/clip.mp4');
+    expect(kept.unreachableRefs).toEqual([]);
+
+    const excluded = computeKeptAssets(fx.projectRoot, fx.roots, { excludeVideo: true });
+    // Dropped on purpose...
+    expect(excluded.kept).not.toContain('/games/test/assets/video/clip.mp4');
+    // ...and NOT reported as a blind spot, which is what would break the build.
+    expect(excluded.unreachableRefs).toEqual([]);
+  });
+
+  it('audits a LEGACY scene too — classify(), not a suffix regex, decides what is scanned', () => {
+    // The guard scans exactly the types the queue loop walks, asked via classify(). A legacy
+    // pre-migration scene is a plain `.json` under `/scenes/` with no `.scene.json` suffix
+    // (see the NOTE on the queue loop) — classify types it 'scene' and the walker reads it, so
+    // the guard must audit it too. A suffix regex of the guard's own would have skipped it,
+    // which is the same walker-vs-checker drift #237 itself was.
+    const matGuid = '66666666-7777-4888-8999-aaaaaaaaaaaa';
+    fx.writeJson('/games/test/assets/mats/legacy.mat.json', { id: matGuid, version: 1 });
+    fx.writeJson('/games/test/assets/scenes/main.json', {
+      version: 6, resources: [],
+      entities: [{ traits: { GameNestedSlots: { outer: { middle: { inner: matGuid } } } } }],
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).not.toContain('/games/test/assets/mats/legacy.mat.json');
+    expect(result.unreachableRefs).toEqual([
+      { guid: matGuid, target: '/games/test/assets/mats/legacy.mat.json', referencedBy: '/games/test/assets/scenes/main.json' },
+    ]);
   });
 
   it('warns on an unresolved GUID ref and keeps building', () => {

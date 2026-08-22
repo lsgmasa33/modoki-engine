@@ -9,7 +9,9 @@
  *  move it. Three runs make an outlier visible instead of authoritative. */
 
 import { runBootRampProbe } from '../../packages/modoki/src/runtime/rendering/rampProbeRunner';
-import { classifyDevice, fillMegapixelsPerMs, type ProbeMeasurement } from '../../packages/modoki/src/runtime/rendering/rampProbe';
+import {
+  classifyDevice, fillMegapixelsPerMs, shadeMegaFragmentsPerMs, type ProbeMeasurement,
+} from '../../packages/modoki/src/runtime/rendering/rampProbe';
 import { getRenderSettings, setRenderSettings } from '../../packages/modoki/src/runtime/rendering/renderSettings';
 
 /** Injected by build.mjs. See its comment for why a visible build stamp is load-bearing here. */
@@ -54,16 +56,59 @@ const autoLabel = new URLSearchParams(location.search).get('auto');
  *  (discard one pass, versus require a confidence margin). */
 const RUNS = Math.min(20, Math.max(1, Number(new URLSearchParams(location.search).get('runs')) || 3));
 
+/** Which probe SHAPE to run — `?axes=2d` for the fill+cpu pair, anything else for shade+cpu.
+ *
+ *  ⚠️ **THIS PAGE SILENTLY LOST AN AXIS WHEN THE PROBE GAINED A SHAPE (#203), and the loss was
+ *  invisible because the page still had a column for it.** `runBootRampProbe` grew an `only2D`
+ *  parameter defaulting to false, so this harness kept running the 3D shape — which no longer runs
+ *  the fill ramp at all. Every reading it produced from then on printed `fill=absent` and
+ *  `fillMpx=0.000`, on a page whose entire job is comparing ramp readings across devices. A caller
+ *  that does not pass a new parameter keeps compiling and stops measuring; that is the whole shape
+ *  of the defect and it is why the value is now ANNOUNCED in the header rather than defaulted
+ *  quietly. */
+const ONLY_2D = new URLSearchParams(location.search).get('axes') === '2d';
+
 function line(m: ProbeMeasurement): string {
   const r = (n: number) => Math.round(n);
   const f = (n: number) => n.toFixed(1);
-  return `total=${r(m.totalMs)} renderer=${r(m.rendererMs)} compile=${r(m.compileMs)} `
-    + `interval=${f(m.intervalMs)} buf=${m.bufferPixels} `
-    // Mpx/ms is the comparable figure; the raw quads/ms is kept only so a suspicious reading can
-    // be traced back to the ramp that produced it.
+  // ⚠️ THE CLOCK LEADS. A WebGPU queue-promise reading and a WebGL2 fence reading have different
+  // delivery latencies and noise floors, and on the Android campaign the three phones split across
+  // BOTH (Y6 on webgl2, both Samsungs on webgpu). A cross-device table that does not say which
+  // instrument produced each row is not a comparison.
+  return `clock=${m.clockKind} total=${r(m.totalMs)} renderer=${r(m.rendererMs)} `
+    + `compile=${r(m.compileMs)}+${r(m.shadeCompileMs)} `
+    + `interval=${f(m.intervalMs)} buf=${m.bufferPixels} region=${m.shadeRegionPixels} `
+    // The DERIVED figures first — the raw per-ramp units are not comparable between devices
+    // (see fillMegapixelsPerMs / shadeMegaFragmentsPerMs) and the raw ones are kept only so a
+    // suspicious reading can be traced back to the ramp that produced it.
     + `fillMpx=${fillMegapixelsPerMs(m).toFixed(3)} `
-    + `fill=${m.fill.status}/${m.fill.bound}:${f(m.fill.unitsPerMs)}@${m.fill.peakLoad} `
-    + `draw=${m.draw.status}/${m.draw.bound}:${f(m.draw.unitsPerMs)}@${m.draw.peakLoad}`;
+    + `shadeMfrag=${shadeMegaFragmentsPerMs(m).toFixed(3)} `
+    + `cpuK=${m.cpu ? (m.cpu.unitsPerMs / 1000).toFixed(2) : 'n/a'} `
+    // `fill` is optional since #203 — a 3D probe does not run it, a 2D probe does. Printed as
+    // 'absent' rather than skipped, the same way `shade` already is: a missing line and a zero
+    // reading look identical in a log, and this page exists to compare readings.
+    //
+    // ⛔ `draw` was a second optional GPU ramp printed here until 2026-08-13 (#221 W2 item 4),
+    // when it was removed from `ProbeMeasurement` entirely — see the `RampKind` removal record
+    // in `rampProbe.ts`.
+    + `fill=${m.fill ? `${m.fill.status}/${m.fill.bound}:${f(m.fill.unitsPerMs)}@${m.fill.peakLoad}` : 'absent'} `
+    + `shade=${m.shade ? `${m.shade.status}/${m.shade.bound}:${f(m.shade.unitsPerMs)}@${m.shade.peakLoad}` : 'absent'} `
+    + `cpu=${m.cpu ? `${m.cpu.status}/${m.cpu.bound}:${r(m.cpu.unitsPerMs)}@${m.cpu.peakLoad}` : 'absent'}`;
+}
+
+/** The run whose `totalMs` sits in the middle of the batch — a genuine median (#205 R5.4).
+ *
+ *  ⚠️ This used to be `measurements[Math.floor(measurements.length / 2)]` — the run in the
+ *  MIDDLE POSITION BY ORDER, i.e. whichever run happened to finish second (of three), presented
+ *  to a human as `med`. An unlucky cold first run (this file's own header explains why the first
+ *  pass is not like the others — thermal state, a background app, one unlucky vsync quantum) could
+ *  land in that position and be reported as the representative reading when it was the outlier.
+ *  Sorting by `totalMs` before taking the middle element makes the label true. `totalMs` is the
+ *  headline's own leading figure, so it is the natural key to sort by; `Array.prototype.sort` is
+ *  stable, so equal-`totalMs` runs keep their original order rather than being reordered by noise. */
+export function medianMeasurement(measurements: ProbeMeasurement[]): ProbeMeasurement {
+  const sorted = [...measurements].sort((a, b) => a.totalMs - b.totalMs);
+  return sorted[Math.floor(sorted.length / 2)];
 }
 
 /** Ship one line home immediately.
@@ -100,7 +145,10 @@ async function runProbeSession(): Promise<void> {
   // forcedBackend is recorded because it was NOT, once, and that made a decisive-looking result
   // ("dies on WebGL too") impossible to distinguish from an override that never applied.
   const header = `DEVICE=${deviceSel.value} build=${__BUILD_ID__} dpr=${window.devicePixelRatio} `
-    + `viewport=${window.innerWidth}x${window.innerHeight} forced=${forcedBackend ?? 'none'}`;
+    + `viewport=${window.innerWidth}x${window.innerHeight} forced=${forcedBackend ?? 'none'} `
+    // Named in the header for the same reason `forcedBackend` is: two runs of different SHAPES are
+    // not comparable, and a log that does not say which one it took cannot be read later.
+    + `axes=${ONLY_2D ? '2d (fill+cpu)' : '3d (shade+cpu)'}`;
 
   // Announce BEFORE measuring. If the tab dies mid-probe, this is the only trace that the device
   // ever started — and "it crashed" is itself a finding about that hardware.
@@ -116,7 +164,7 @@ async function runProbeSession(): Promise<void> {
       const m = await runBootRampProbe((stage) => {
         statusEl.textContent = `run ${i + 1}: ${stage}`;
         beacon(`  [run ${i + 1}] ${stage}`);
-      });
+      }, ONLY_2D);
       if (!m) { results.push('run failed (probe returned null)'); await send(`${header}\nrun ${i + 1}: null`); continue; }
       measurements.push(m);
       results.push(line(m));
@@ -140,12 +188,14 @@ async function runProbeSession(): Promise<void> {
     ? 'done — results sent, nothing else needed'
     : 'done — could NOT send; tap the box to copy and paste it back';
   if (measurements.length) {
-    const med = measurements[Math.floor(measurements.length / 2)];
+    const med = medianMeasurement(measurements);
     // Mpx/ms, not the raw quads/ms the ramp works in: the raw figure is not comparable between
     // devices (see fillMegapixelsPerMs), and a headline is exactly where someone reads a number
     // off a screen and compares it to another device's.
-    headlineEl.textContent = `${Math.round(med.totalMs)} ms · fill ${fillMegapixelsPerMs(med).toFixed(2)} Mpx/ms `
-      + `· draw ${med.draw.unitsPerMs.toFixed(0)}/ms · ${med.fill.status}/${med.draw.status}`;
+    headlineEl.textContent = `${Math.round(med.totalMs)} ms · cpu `
+      + `${med.cpu ? (med.cpu.unitsPerMs / 1000).toFixed(1) : '-'}k xform/ms `
+      + `· shade ${shadeMegaFragmentsPerMs(med).toFixed(2)} Mfrag/ms `
+      + `· fill ${fillMegapixelsPerMs(med).toFixed(2)} Mpx/ms · ${med.clockKind}`;
   } else {
     headlineEl.textContent = 'no result';
     headlineEl.className = 'big warn';

@@ -10,6 +10,15 @@ import { Animator } from '../traits/Animator';
 import { SpriteAnimator } from '../traits/SpriteAnimator';
 import { animatorHasClip } from '../animation/animClipBank';
 import { spriteAnimHasClip } from '../loaders/spriteAnimCache';
+import { scrollToEntry } from '../ui/scrollApi';
+import { EntityAttributes } from '../core/traits/EntityAttributes';
+
+/** A UIAction `target` is an entity handle; the scroll API addresses by GUID (the only
+ *  hot-reload-stable address). One hop, in one place. */
+function guidOfEntity(target: { has(t: unknown): boolean; get(t: unknown): unknown }): string {
+  if (!target.has(EntityAttributes)) return '';
+  return ((target.get(EntityAttributes) as { guid?: string }).guid) || '';
+}
 
 let registered = false;
 
@@ -20,6 +29,23 @@ export function registerEngineActions(): void {
   // engine.reload — hard reload of the web view.
   registerUIAction('engine.reload', () => {
     if (typeof window !== 'undefined') window.location.reload();
+  });
+
+  // ui.scrollTo — move a scroll view to an entry, with no game code.
+  //  The binding's `target` is the scroll-view entity; `params.x`/`params.y` are ENTRY
+  //  coordinates (the units an author thinks in — "page 3", not "pixel 1863"), and the system
+  //  converts them using the entry size it already resolves. `params.behavior` is
+  //  'instant' | 'smooth', the only two values the CSS backend can genuinely honour.
+  registerUIAction('ui.scrollTo', ({ target, params }) => {
+    if (!target) {
+      console.warn('[ui.scrollTo] no target entity — point the binding at the scroll view');
+      return;
+    }
+    const guid = guidOfEntity(target);
+    if (!guid) { console.warn('[ui.scrollTo] target has no guid'); return; }
+    const p = (params ?? {}) as { x?: number; y?: number; behavior?: 'instant' | 'smooth' };
+    const ok = scrollToEntry(guid, { x: p.x, y: p.y }, { behavior: p.behavior });
+    if (!ok) console.warn('[ui.scrollTo] target is not a scroll view (needs UIScrollView + UIEntries)');
   });
 
   // engine.quit — native-only. On web there is nothing to quit; the app shell

@@ -38,7 +38,7 @@ follow-up).
   "sprite": "<sprite-guid>",           // source texture/sprite, resolved via resolveSprite()
   "bones": [                           // bind-pose hierarchy, local TRS (radians)
     { "name": "root",  "parent": -1, "x": 0, "y": 96, "rot": 0 },
-    { "name": "mid",   "parent": 0,  "x": 0, "y": -96, "rot": 0 }
+    { "name": "mid",   "parent": 0,  "x": 0, "y": -96, "rot": 0, "noScale": true }
   ],
   "mesh": {
     "verts": [[x,y], ...],             // texture-space bind positions
@@ -91,6 +91,63 @@ Bone2D Transforms ──► skin2DSystem ──► skin2DBuffers ──► Scene
   self-registering GUID). `normalizeRig2D` coerces + renormalizes weights and derives
   inverse-bind.
 
+## Deform tracks (per-vertex mesh animation)
+
+Bone transforms alone can't reproduce Spine-style cloth/collar flutter — that needs a
+**per-vertex** animation channel, which is a non-scalar shape the keyframe stack's
+`tracks[]` (scalar-field-per-track) can't hold. `AnimationClipDef` therefore carries a
+second, parallel array: `deformTracks[]` `{ path, part, keys: [{ t, offsets[] }] }`,
+where `path` addresses the `SkinnedSprite2D` root (like a normal track), `part` names
+the rig part being deformed, and each key's `offsets` is a dense per-vertex `(dx,dy)`
+array for that part's bind-pose vertex order.
+
+- **`runtime/animation/deformEval.ts`** — linearly interpolates between the two
+  surrounding keys' dense offset arrays (no bezier/tangent support on this channel yet
+  — the one remaining fidelity gap against a Spine source that used curved deform
+  keys).
+- **`runtime/animation/deform2DBuffers.ts`** — a module registry keyed by
+  `(entityId, partName)`, **epoch-stamped** rather than cleared-and-rewritten: the
+  runtime `animationSystem` loop and the editor's Animation-panel scrub both write into
+  it from different call sites with no coordination between them, so a shared "clear
+  first" step would race. Instead each write stamps the buffer with the current global
+  epoch; a part not re-written within an epoch reads back as no-deform (auto-expiry on
+  clip switch), and a global-monotonic `version` lets `skin2DSystem` detect a deform
+  change even when the bone pose itself is static.
+- **`runtime/animation/deform2DSystem.ts`** (`applyClipDeform`) — samples deform tracks
+  from the SAME sites `applyClipAtTime` samples scalar tracks from (the runtime
+  `animationSystem` loop and the editor scrub), so a deform track always sees the same
+  playhead a bone track would. `skin2DSystem` adds each part's interpolated offset to
+  its BIND vertex **before** LBS (`bindVert + offset`, then skin) — so the deform and
+  the bone skin compose, matching how the Spine source authored them.
+
+**Multi-part scale (`noScale`).** A v2 (multi-part) rig's bones may set `noScale:
+true` (see the schema above). `skin2DSystem` composes such a bone against
+`removeScale2D(parentWorld)` instead of the raw parent world matrix — i.e. the bone
+ignores its ancestor's *animated* scale (this is Spine's own "scale" transform-mode
+concept). Without it, an ancestor's breathing/squash scale keyframe balloons every
+descendant part instead of staying localized to the part that's actually supposed to
+breathe. `rig2dMath.removeScale2D` is the pure helper.
+
+**True STEPPED keys.** `+Infinity` (the `STEPPED` tangent sentinel used elsewhere in
+the animation stack — see `docs/animation.md`) cannot survive a JSON round-trip
+(serializes to `null`), so a stepped deform/bone key reconstructs its hold from the
+persistent `tangentMode:'constant'` marker rather than the tangent value itself. A
+Spine `stepped` curve that isn't converted to that marker silently degrades to a
+linear approximation on reload.
+
+**Spine reconstruction dogfood (`tools-scratch/spine-import*.mjs`).** These
+hand-run Node scripts reconstruct a Spine 3.8 character (skeleton + weighted meshes +
+clips) into a `.rig2d.json` + scene + `.anim.json` set. Two gotchas worth knowing if
+you touch or re-run one: **the importer re-mints fresh GUIDs on every run** (rig id,
+clip ids), so re-running it desyncs the already-committed scene/rig/anim trio unless
+all three are re-committed together — worth a consistency check
+(`scene.SkinnedSprite2D.rig === rig.id`) before committing. And **IK is baked at
+import time, not carried as a runtime constraint**: the importer resolves each Spine
+IK chain's target per animation sample and solves it with a pure 2-bone solver
+(`solveIK2`, law of cosines), then bakes the result into ordinary dense rotation keys
+on the chain bones — the engine has no live IK solver; what ships is the baked
+animation.
+
 ## Rendering
 
 Two renderers read the same `skin2DBuffers` entry:
@@ -126,6 +183,38 @@ Two renderers read the same `skin2DBuffers` entry:
   click-selectable (dots hit-tested first; skinned bodies by mesh AABB) and gizmo-
   poseable (the 2D gizmo gate was generalized off the Renderable2D-only check to any
   Transform target, with extents from the mesh AABB / a bone point).
+- **Skin panel preview** (`editor/panels/SkinCanvas.tsx` + `texturedMesh.ts`) — a THIRD
+  deformed-mesh renderer, and the only hand-rolled one. SceneView and GameView both draw the
+  rig through a PixiJS `Mesh`, which textures per triangle in hardware and is therefore correct
+  by construction; the Skin panel draws its own preview in **Canvas2D**, which has no textured
+  primitive, so the per-triangle mapping has to be done by hand.
+  **`drawTexturedMesh` does it per TRIANGLE**: clip to the triangle's posed outline, then blit
+  the source rect under that triangle's own UV→vertex affine (`triUvToPosAffine`). Three
+  point-pairs determine an affine uniquely, so per triangle the map is exact.
+  ⚠️ **It used to derive ONE affine for the whole part**, from its first non-degenerate triangle.
+  That is exact while a part moves RIGIDLY — which is all Parts mode does, and where the affine
+  path came from — but a 2x3 affine expresses translation/rotation/scale/shear, i.e. a transform
+  that is the same everywhere, and a skinned BEND gives every triangle a different blend of bone
+  matrices. So in Weights/Pose the wireframe bent and the texture did not, drifting further from
+  the mesh the further a triangle sat from triangle #0 (bug `BHZa4wP22gXZ85p6dpbH`, case
+  QA-ASSET-0029). The preview's whole job is judging weights, and weights are judged on the ART —
+  so it could make correct weights look wrong. `uvToPosAffine` still exists for the one question
+  a single affine genuinely answers, "what is this part's orientation/size" (`partAngle`, the
+  Parts inspector), and says so in its doc comment.
+  Two consequences worth knowing before touching it:
+  - **Clips overlap by design.** Adjacent clips are antialiased, so abutting them exactly leaves
+    a background-coloured hairline on every shared edge — on a 60-triangle part that reads as a
+    wireframe drawn in background colour, worse than the bug. Each clip is pushed out from its
+    centroid, **clamped to a quarter of the triangle's own radius** so the overlap stays a
+    seam-width fix at any zoom; a flat half-pixel is unbounded relative to a triangle and, zoomed
+    far out, lets later triangles overpaint earlier ones.
+  - **A degenerate-UV triangle now leaves a HOLE** rather than being painted approximately by
+    another triangle's affine. That is deliberate — a visible gap beats a silently wrong texture —
+    but it is a behaviour change for any hand-edited rig carrying a collinear-UV sliver.
+  Cost is not the objection it looks like: measured on `zombie.rig2d.json` (16 parts, the
+  heaviest rig here), 952 clipped blits per redraw total **0.63 ms** against a 16 ms frame.
+  ⚠️ Measure it the same way if you change this — timing across two `requestAnimationFrame`
+  waits measures frame LATENCY, not draw cost, and reads ~26 ms for the same work.
 
 ## 2.5D billboards (`Billboard3D`)
 
@@ -223,6 +312,14 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   its `◍ Weights` toggle, the full-strength weight view) but has no brush (see the Gotcha
   below). That asymmetry is deliberate: the toggle survived the #180 cull that removed the
   SceneView brush precisely because it is read-only.
+  ⚠️ **A brush press on a bone JOINT is resolved on RELEASE, not on press** (#287,
+  `panels/skinPaintGesture.ts`): a click there switches which bone you are painting, a drag
+  paints the bone already selected. Until #287 the joint hit-test ran first and `return`ed, so
+  any stroke that happened to start over a joint was silently swallowed — it switched bones
+  instead of painting, which reads as "the brush didn't work" mid-drag. It also meant an agent
+  could not paint at ALL: `skin:bone:N` joints are the only handles `SkinCanvas` registers, so
+  every `modoki_drag_handle` started on one and every stroke died. The promotion threshold is
+  3 CSS px (`PAINT_DRAG_SLOP`), measured in screen px so it does not drift as you zoom.
   Once a rig exists, open a scene with a `SkinnedSprite2D` + `Bone2D` children; select a
   bone in the Hierarchy or by clicking its joint in SceneView; pose it with the gizmo
   (works while stopped) and the mesh deforms live in both viewports.
@@ -276,6 +373,31 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   `normalizeRig2D` ignores those whenever `parts` is present, so writing them is
   inventing data, and it is what made the bug invisible. `addBone` (appends) and
   `reparentBone` (rewrites a parent field only) shift no indices and need none of this.
+- **A structural edit must not touch a vertex the edit does not touch** (QA-ASSET-0015). Deleting a
+  bone NOTHING is weighted to used to rewrite every weight in the file: each surviving vertex was
+  re-accumulated and divided by its own sum, and `w / sum` is **not** the identity in floating
+  point — an authored set sums to 1 ± an ulp (`bar.rig2d.json`'s first vertex sums to 1 + 2.2e-16),
+  so every value came back an ulp lighter. `SkinEditor`'s 400ms autosave then put that on disk: a
+  60-line git diff on a rig nothing semantically changed, on every rig anyone opened and touched.
+  (That autosave is gone — #259, the panel parks its write for Cmd+S now — so the diff needs a save
+  rather than arriving unbidden. The renormalize bug is fixed either way; a churny write you DID ask
+  for is still churn.)
+  `removeBone` now passes an untouched vertex through **verbatim** (only the indices move), and
+  keeps the renormalize for a vertex that actually lost or merged a bucket, or whose weights do
+  not sum to 1 — a genuinely malformed vertex still gets repaired, because the loader would
+  renormalize it out from under the raw-def preview otherwise. Note the reported diagnosis
+  (a float32 round-trip in the live cache) was **wrong**: the float32 numbers came from
+  `read-asset-def`, which reported the runtime-PARSED rig; it reports the authored doc now
+  (`getRig2DSource`), so the two questions no longer share one misleading answer.
+- **`apply2D` writes into its `out` param, and picking `Float32Array` vs `number[]` is a
+  CORRECTNESS decision** — found sweeping for siblings of the above. `Mat2D` is float64
+  throughout, so a `Float32Array` out-buffer truncates the result: right for the per-frame deform
+  buffer the GPU reads, wrong for anything that goes back into the rig JSON. All three authoring
+  call sites had it wrong — `reparentBone` and the Skin canvas's add-bone and gizmo-drag handlers
+  each write their result straight to a bone's local x/y. Reparenting a bone at x=0.1 under an
+  IDENTITY parent — an operation whose whole contract is "preserve the world position" — wrote
+  0.10000000149011612 to disk. This is the float32 truncation QA-ASSET-0015 reported; it was one
+  function away from where the report looked.
 - **A weight that outruns the skeleton now warns at load, once per part** — the clamp
   above still happens (the rig has to render), but `normalizePart` counts the bad indices
   and reports them with the part name and bone count. Nothing legitimately authors a rig

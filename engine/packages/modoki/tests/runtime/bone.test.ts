@@ -346,3 +346,38 @@ describe('keyframe Animator preview on a stopped rig (scene-window preview)', ()
     expect(Math.abs(new THREE.Euler().setFromQuaternion(bone.quaternion).x)).toBeLessThan(1e-6); // …mesh sits at bind (frozen)
   });
 });
+
+describe('syncBones — a bone hand-posed to scale ZERO (#258)', () => {
+  /** Found by the close-out sweep of #258, not by the original report, and it is the
+   *  USER-REACHABLE instance of that bug: `Bone` entities are hand-posable on a stopped rig, so
+   *  typing 0 into a bone's scale in the Inspector makes `compose(tf) · prefix.inv` SINGULAR.
+   *  three's `Matrix4.decompose` answers a singular matrix with scale (1,1,1) and an identity
+   *  quaternion, so the write-back put a FULL-SIZE, UNROTATED bone onto the skeleton — the limb
+   *  snapped back to bind size and the deform went with it, while the Inspector still read 0. */
+  it('writes the zero through to the THREE.Bone instead of resurrecting it to scale 1', () => {
+    setPlayState('stopped');
+    const bone = poseBone();
+    const rig = spawnRig(bone, undefined); // no clip — the hand-posed case
+    // A wrapper prefix with non-uniform scale + rotation, as a real armature-baked root bone has.
+    const fwd = new THREE.Matrix4().compose(
+      new THREE.Vector3(),
+      new THREE.Quaternion().setFromEuler(new THREE.Euler(0.4, 0.2, 0)),
+      new THREE.Vector3(2, 5, 9),
+    );
+    (state.skinned.get(rig.id()) as unknown as SkinnedEntry).boneWrapperPrefix =
+      new Map([['bone1', { fwd, inv: fwd.clone().invert() }]]);
+    const be = world.spawn(Transform(), Bone({ name: 'bone1' }), EntityAttributes({ guid: 'b', parentId: rig.id() }));
+
+    syncBones(world, scene, state);            // read-back captures the baseline
+    const tf = be.get(Transform)!;
+    be.set(Transform, { ...tf, sy: 0 });       // the Inspector edit — diverges from baseline
+    syncBones(world, scene, state);            // write-back: entity Transform → THREE.Bone
+
+    const s = bone.scale;
+    // The composed matrix is singular, so exactly one axis of the result collapses. Which axis
+    // is not (1,1,1) is the whole point: before the fix all three read 1.
+    expect(Math.min(s.x, s.y, s.z)).toBeCloseTo(0, 9);
+    expect([s.x, s.y, s.z], 'not the identity substitution').not.toEqual([1, 1, 1]);
+    expect(Number.isNaN(s.x) || Number.isNaN(s.y) || Number.isNaN(s.z)).toBe(false);
+  });
+});

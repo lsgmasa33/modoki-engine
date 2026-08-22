@@ -76,3 +76,22 @@ describe('resolveShaderSchema', () => {
     expect(await resolveShaderSchema({ kind: 'code', value: CODE_NAME })).toEqual(schema);
   });
 });
+
+describe('listShaderOptions ordering', () => {
+  const A = 'aaaaaaaa-0000-4000-8000-00000000000a';
+  const Z = 'zzzzzzzz'.replace(/z/g, 'b') + '-0000-4000-8000-00000000000b';
+  afterEach(() => { unregisterAsset(A); unregisterAsset(Z); });
+
+  // The manifest map is INSERTION-ordered, so a shader authored during the session lands
+  // last in this dropdown until the next reload (spritePickerGroups.sortGroupsByName).
+  it('sorts FILE shaders by label while the built-ins keep the lead', () => {
+    registerAsset(Z, '/assets/shaders/zebra.shader.json', 'shader');
+    registerAsset(A, '/assets/shaders/alpha.shader.json', 'shader');
+    const files = listShaderOptions().filter((o) => o.kind === 'file').map((o) => o.label);
+    expect(files).toEqual([...files].sort((x, y) => x.localeCompare(y)));
+    expect(files.indexOf('alpha')).toBeLessThan(files.indexOf('zebra'));
+    const opts = listShaderOptions();
+    expect(opts[0].kind).toBe('builtin');
+    expect(opts[1].kind).toBe('builtin');
+  });
+});

@@ -15,6 +15,7 @@ import { newGuid, registerAsset, getGuidForPath, isGuid } from '../../runtime/lo
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { convertSourceToGLB, needsGLBConversion } from './convertToGLB';
 import { extractRigBones, type RigBoneInfo } from './rigBones';
+import { useEditorStore } from '../store/editorStore';
 
 async function writeAssetFile(path: string, content: string): Promise<boolean> {
   try {
@@ -24,6 +25,36 @@ async function writeAssetFile(path: string, content: string): Promise<boolean> {
     });
     return res.ok;
   } catch { return false; }
+}
+
+/** Thrown by `writeAssetFileOrAbort` to unwind a model import whose write did not land (#311).
+ *  Caught only at `importModel`'s boundary, which converts it to the falsy return every caller
+ *  already checks — it must never escape to a caller as an exception. */
+class ImportWriteAborted extends Error {
+  // Declared, not a parameter property — `erasableSyntaxOnly` rejects those.
+  readonly path: string;
+  constructor(path: string) {
+    super(`failed to write ${path}`);
+    this.name = 'ImportWriteAborted';
+    this.path = path;
+  }
+}
+
+/** Write a generated import artifact, or ABORT the whole import (#311, owner's policy
+ *  2026-08-21). `writeAssetFile` above never throws — it resolves `false` — and three call
+ *  sites used to discard that. Two of them registered the asset in the manifest FIRST, so a
+ *  failed write left a GUID pointing at a path with no file: everything resolves for the rest
+ *  of the session and it surfaces on the next scene load or a fresh editor launch, far from
+ *  the cause.
+ *
+ *  Abort rather than skip-and-continue: a partially-imported model's missing pieces are
+ *  invisible until something renders wrong. Rollback of the files already written was
+ *  considered and rejected — more machinery, and the rollback can fail too — so an aborted
+ *  import DOES leave its earlier artifacts on disk. That is safe because they are all
+ *  content-addressed regenerable outputs and a re-import overwrites them; what must not
+ *  happen is registering a ref to a file that is not there. */
+async function writeAssetFileOrAbort(path: string, content: string): Promise<void> {
+  if (!await writeAssetFile(path, content)) throw new ImportWriteAborted(path);
 }
 
 /** SHA-256 hex of a string, via SubtleCrypto. Used to derive stable, content-
@@ -115,7 +146,7 @@ async function resolveMaterialGuid(path: string): Promise<string> {
   if (!id) {
     id = newGuid();
     if (existing) {
-      await writeAssetFile(path, JSON.stringify({ ...existing, id }, null, 2));
+      await writeAssetFileOrAbort(path, JSON.stringify({ ...existing, id }, null, 2));
     } else {
       console.error(`[modelImport] material override not found: ${path} — minting a GUID; the reference will dangle until the file exists.`);
     }
@@ -338,14 +369,18 @@ async function extractTextures(
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: texPath, content: base64, encoding: 'base64' }),
         });
-        if (!writeRes.ok) {
-          console.error(`[Import] /api/write-file failed for ${texPath}: ${writeRes.status}`);
-          continue;
-        }
+        // #311: this used to log and `continue`, which skipped the texture and imported the
+        // model without it — no dangling ref (the `texturePaths.set` below is skipped too, so
+        // registerExtractedTextures never sees it), but exactly the silently-incomplete import
+        // the abort policy exists to prevent.
+        if (!writeRes.ok) throw new ImportWriteAborted(texPath);
         texturePaths.set(tex.uuid, texPath);
         textureFiles.push(texPath);
         textureSettings.set(texPath, seedTextureSettings(tex, suffix));
       } catch (e) {
+        // An abort must not be downgraded to a skipped texture by this catch — it exists for
+        // genuine per-texture extraction failures (decode, unsupported format), which DO skip.
+        if (e instanceof ImportWriteAborted) throw e;
         console.warn(`[Import] Failed to extract texture ${tex.name || tex.uuid}:`, e);
       }
     }
@@ -439,8 +474,10 @@ async function dedupMaterialToFile(mat: THREE.MeshStandardMaterial, ctx: MatDedu
           if (finalAsset[k] === undefined) finalAsset[k] = existingMat[k];
         }
       }
+      // Write BEFORE registering (#311): registering first maps the GUID to a path with no
+      // file behind it, and the dangling ref only surfaces on a later scene load.
+      await writeAssetFileOrAbort(dedupPath, JSON.stringify(finalAsset, null, 2));
       registerAsset(matAsset.id, dedupPath, 'material');
-      await writeAssetFile(dedupPath, JSON.stringify(finalAsset, null, 2));
       // Evict the stale in-memory material so the next scene load re-reads from
       // disk — without this, a same-session scene re-open keeps rendering with
       // the pre-import factors / texture.
@@ -737,7 +774,42 @@ async function importRiggedModel(
   return root.id();
 }
 
+/** Import a model, or ABORT on the first write that does not land (#311).
+ *
+ *  The abort boundary. `importModelInner` unwinds with `ImportWriteAborted` from wherever the
+ *  write failed; this converts it to `0` — the falsy return every caller already checks
+ *  (`if (!rootId) return;`) — so a failed import can never reach a caller as an exception.
+ *
+ *  Nothing is spawned before the last guarded write, so an abort leaves NO stray entities in
+ *  the scene; the caller's `deleteEntity(rootId)` cleanup is unreachable and unneeded. Files
+ *  written before the failure DO stay on disk (rollback was considered and rejected) — they are
+ *  regenerable outputs a re-import overwrites, and crucially nothing in the manifest points at
+ *  the file that failed, because every `registerAsset` now runs only after its write landed. */
 export async function importModel(
+  modelPath: string,
+  prefix: string,
+  postprocessorId: string = 'none',
+  rootTransform?: { position?: [number, number, number]; rotation?: [number, number, number]; scale?: number },
+  importOptions?: ImportOptions,
+): Promise<number> {
+  try {
+    return await importModelInner(modelPath, prefix, postprocessorId, rootTransform, importOptions);
+  } catch (e) {
+    if (!(e instanceof ImportWriteAborted)) throw e;
+    console.error(
+      `[modelImport] Import of "${modelPath}" ABORTED — ${e.message}. No entities were spawned and ` +
+      'nothing was registered for that file. Earlier generated files remain on disk and will be ' +
+      'overwritten by a successful re-import.',
+    );
+    useEditorStore.getState().showToast(
+      `Import FAILED for ${modelPath.split('/').pop() ?? modelPath} — a file could not be written (see console)`,
+      'warn',
+    );
+    return 0;
+  }
+}
+
+async function importModelInner(
   modelPath: string,
   prefix: string,
   postprocessorId: string = 'none',
@@ -869,8 +941,9 @@ export async function importModel(
         postprocessor: postprocessorId,
         material: matRef,
       };
+      // Write BEFORE registering — see the note at the material site above (#311).
+      await writeAssetFileOrAbort(meshPath, JSON.stringify(meshAsset, null, 2));
       registerAsset(meshAsset.id!, meshPath, 'mesh');
-      await writeAssetFile(meshPath, JSON.stringify(meshAsset, null, 2));
       meshFileMap.set(meshName, meshPath);
       meshFiles.push(meshPath);
     }

@@ -225,6 +225,27 @@ describe('applyPropOverride (real THREE materials)', () => {
     expect(disposeSpy).toHaveBeenCalledTimes(1);
   });
 
+  // The RETURN VALUE is a contract, not a convenience: `materialInstanceSystem` uses it to arm the
+  // editor SceneView's render-on-demand gate on a frame where the driven VALUE did not change but
+  // the picture did (a first bind, a base swap, a mesh that is still on the shared material after
+  // a surface remount). Comparing values alone would miss every one of those and leave the
+  // viewport showing the pre-change frame — see runtime/rendering/materialDirty.ts. Verified as a
+  // real gap: hard-coding this to `false` left the whole suite green before these assertions.
+  it('reports a REBIND — first bind, base swap, and an unbound mesh — but not a settled repeat', () => {
+    const baseA = new THREE.MeshStandardMaterial({ opacity: 1 });
+    const baseB = new THREE.MeshStandardMaterial({ opacity: 1 });
+    const m = mesh(baseA);
+    expect(applyPropOverride(90, [m], baseA, 'opacity', 0.5)).toBe(true);   // first bind
+    expect(applyPropOverride(90, [m], baseA, 'opacity', 0.5)).toBe(false);  // settled — no rebind
+    expect(applyPropOverride(90, [m], baseB, 'opacity', 0.5)).toBe(true);   // base swapped
+    expect(applyPropOverride(90, [m], baseB, 'opacity', 0.5)).toBe(false);
+    // A mesh the renderer rebound to the shared base (surface remount / re-sync): same entity,
+    // same base, same value — the clone must be re-applied AND reported, or the viewport keeps
+    // drawing the un-overridden material.
+    m.material = baseB;
+    expect(applyPropOverride(90, [m], baseB, 'opacity', 0.5)).toBe(true);
+  });
+
   it('rebuilds the clone after a reset (registry cleared)', () => {
     const base = new THREE.MeshStandardMaterial();
     const m = mesh(base);

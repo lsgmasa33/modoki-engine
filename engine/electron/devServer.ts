@@ -528,7 +528,15 @@ export async function startDevServer(opts: { repoRoot: string; projectRoot: stri
   // fs.openSync('/tmp/...') throws ENOENT synchronously, which the caller's open
   // flow turns into app.quit() → the packaged editor "crashes" on every Windows
   // launch). os.tmpdir() = /tmp on Unix, %LOCALAPPDATA%\Temp on Windows.
-  const logPath = process.env.MODOKI_VITE_LOG || path.join(os.tmpdir(), 'modoki-vite.log');
+  // …and PER EDITOR, not one shared name. The temp dir is machine-wide, so a bare
+  // `modoki-vite.log` is written by every clone's editor at once (opened 'a', so they
+  // interleave rather than truncate) — and line ~595 below hands that path to whoever is
+  // diagnosing a dead dev server, which is exactly when reading a sibling clone's output
+  // costs the most. Key it on the pinned backend port, the same anchor the launcher's
+  // editor log and the derived Vite/CDP ports use; fall back to the pid when the port is
+  // auto-picked (MULTI mode), which is what the launcher does too.
+  const logTag = process.env.MODOKI_BACKEND_PORT || String(process.pid);
+  const logPath = process.env.MODOKI_VITE_LOG || path.join(os.tmpdir(), `modoki-vite-${logTag}.log`);
 
   // Nothing may be on this port before we spawn — `--strictPort` means a holder doesn't make
   // our Vite pick another port, it makes our Vite DIE, and the holder then keeps serving its
@@ -596,7 +604,13 @@ export async function startDevServer(opts: { repoRoot: string; projectRoot: stri
     if (clearState) { child = null; currentRoot = null; }
   });
 
-  await waitForServer(url, 30000, () => earlyExit, { pid: proc.pid });
+  // 60s, not 30s: a cold-start dep-optimize on a first launch (or after a build changed
+  // deps) has been measured taking ~33s here — a few seconds past the old budget was
+  // enough to report "failed to start dev server" for a server that was, in fact, about
+  // to come up. The failure mode is silent too: the child's own vite log (MODOKI_VITE_LOG /
+  // <tmpdir>/modoki-vite-<pid>.log) showed "VITE ... ready" a couple seconds after main.ts
+  // had already given up and logged the timeout.
+  await waitForServer(url, 60000, () => earlyExit, { pid: proc.pid });
   console.log(`[modoki-electron] dev server up at ${url} (project ${projectRoot})`);
 }
 

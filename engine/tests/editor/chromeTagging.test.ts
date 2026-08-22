@@ -78,9 +78,86 @@ const REQUIRED: Array<{ file: string; ids: string[]; why: string }> = [
     why: 'driving the Console filter, which get_console_logs can read but not operate.',
   },
   {
+    file: 'panels/ModuleTogglesEditor.tsx',
+    ids: ['`module-toggles.row.${m.key}`', '`module-toggles.${m.key}.${o.slug}`'],
+    why: 'the Project Settings → Engine Modules tri-state rows. All three segments of a row '
+      + 'once shared one `title={m.key}`, so the only way to aim at "Off" was a DOM index — '
+      + 'which reorders silently. The `o.slug` half is what keeps the id stable under a reorder.',
+  },
+  {
     file: 'panels/ApplyPrefabDialog.tsx',
     ids: ['prefab.dialog.confirm', 'prefab.dialog.cancel'],
     why: 'the modal EXIT. Inspector tags open this dialog; without these an agent enters a modal it cannot leave.',
+  },
+  {
+    // Same rule, second instance, found by sweeping every full-screen overlay for a tagged
+    // exit (#287): this was the ONLY one with no data-ui-id at all. It is also the only one
+    // with no Escape handling, so the Close button is the single way out.
+    file: 'panels/FindReferencesDialog.tsx',
+    ids: ['findReferences.footer.close'],
+    why: 'the modal EXIT of a fixed/inset-0/z-9999 overlay. While it is open every other handle '
+      + 'reports occluded and Enact refuses the aim, so an untagged Close means a trapped agent.',
+  },
+  {
+    // Two Inspector call sites construct the same-shaped id independently: the generic
+    // `hint.type:'number'` branch (NumberField) and the bounded UI-anchor size branch
+    // (BufferedNumberInput) both key off `meta.name` (the trait); VecField's per-axis
+    // BufferedNumberInput keys off its own `traitName` prop instead, since VecField has
+    // no `meta` in scope. Without a stable id here a QA case has to aim by the stale
+    // `value` DOM attribute, which stops matching the moment the field changes (bug
+    // y9WMNPkT0DivkxZKJDWU — QA-INSP-0010 aimed a `NumberField` selector at a value that
+    // could never render, because the case assumed the OTHER widget backed the field).
+    file: 'panels/Inspector.tsx',
+    ids: ['`inspector.field.${meta.name}.${key}`', '`inspector.field.${traitName}.${f.key}`'],
+    why: 'per-field ids for every Inspector number input (NumberField and BufferedNumberInput alike), so a case can aim by stable id instead of a value-dependent CSS selector.',
+  },
+  {
+    // The two asset editors the 2026-08-20 QA batch drives. Both carried ZERO tags while
+    // every case against them fell back to `modoki_eval` + a text match — fragile against
+    // any copy change, and unable to tell two same-labelled controls apart (#287).
+    file: 'panels/SkinEditor.tsx',
+    ids: [
+      'skin.mode.parts', 'skin.mode.rig', 'skin.mode.weights',
+      'skin.boneTool.select', 'skin.boneTool.add', 'skin.boneTool.delete',
+      'skin.weightTool.paint', 'skin.weightTool.pose',
+      'skin.paint.radius', 'skin.paint.strength',
+      '`skin.parts.row.${i}.remove`',
+      // The GATE for the row rename field: `skin.parts.row.${i}.name` renders only while
+      // editingPart === i, and this double-click span is the only thing that sets it. Third
+      // instance of that pattern in #287 (SubSection, FindReferencesDialog, this).
+      '`skin.parts.row.${i}.rename`',
+    ],
+    why: 'the Skin Editor mode/tool switches and the paint brush — the controls a weight-painting '
+      + 'case has to drive before it can assert anything about the rig.',
+  },
+  {
+    file: 'panels/ParticleEditor.tsx',
+    ids: ['particle.transport.play', 'particle.transport.restart', 'particle.transport.scrub', 'particle.header.name'],
+    why: 'the Particle Editor transport. Its buttons render as bare glyphs (⏸ ⟲ ↶ ▦), so before '
+      + 'this there was no text for a fallback case to match on either.',
+  },
+  {
+    // The Advanced disclosure in TextureAssetView is defaultOpen={false} and hides SEVEN
+    // tagged controls. Untagging this toggle fails no OTHER assertion here — the seven ids
+    // stay present in source — it just makes them permanently unreachable, which is the
+    // failure this file exists to prevent, one level up.
+    file: 'panels/assetViews/widgets.tsx',
+    ids: ['`inspector.subsection.${subSectionSlug(title)}`'],
+    why: 'the collapse toggle that GATES the tagged asset-import settings. A tag behind a door '
+      + 'an agent cannot open is not a tag (measured: 4 live handles against 11 in source).',
+  },
+  {
+    // Two buttons in the AI panel both read "Connect" and both mount together (AIPanel.tsx
+    // renders DeviceConnectSection), so whenever Claude Code and the device are both
+    // disconnected, a text search or a blind aim for "Connect" there is ambiguous (#287).
+    file: 'panels/AIPanel.tsx',
+    ids: ['ai.connect.claudeCode'],
+    why: 'the Connect-Claude-Code button — distinguishable from the device Connect beside it.',
+  },
+  {
+    file: 'panels/DeviceConnectSection.tsx',
+    ids: ['ai.device.connect', 'ai.device.useAdb', 'ai.device.ip'],
+    why: 'the device Connect button and its two inputs — the OTHER "Connect" in the same panel.',
   },
 ];
 
@@ -91,6 +168,43 @@ describe('data-ui-id tagging has not rotted', () => {
       for (const id of ids) expect(src, `missing data-ui-id fragment "${id}"`).toContain(id);
     });
   }
+
+  it('the Particle Editor field-id namespace is still wired', () => {
+    // The per-FIELD ids have no literal to grep for — they come from a Section context, so a
+    // `toContain` on a template fragment would prove nothing about the ~58 ids it generates.
+    // What IS checkable here is the WIRING: the panel provides the context and the widgets
+    // consume it. Deleting either silently un-tags every property field in the panel at once.
+    // The ids themselves are covered properly (rendered, and asserted collision-free) by
+    // packages/modoki/tests/editor/particleFieldIds.test.tsx.
+    const mod = read('panels/particle/fieldIds.ts');
+    for (const decl of ['export const SectionIdContext', 'export function particleFieldSlug', 'export function useFieldId']) {
+      expect(mod, `fieldIds.ts no longer has "${decl}"`).toContain(decl);
+    }
+    const panel = read('panels/ParticleEditor.tsx');
+    expect(panel, 'Section no longer provides the id namespace').toContain('<SectionIdContext.Provider value={particleFieldSlug(title)}>');
+    expect(panel, 'the shared field widgets no longer consume it').toContain('useFieldId(label)');
+  });
+
+  it('every shared Particle field widget still RENDERS the id it computes', () => {
+    // Calling useFieldId is not the same as emitting the attribute, and the difference is
+    // invisible: a widget that keeps the call and drops `data-ui-id` un-tags its whole field
+    // class while every other assertion here stays green (verified by mutation — dropping the
+    // attribute from `Check` passed both this suite and particleFieldIds.test.tsx before this
+    // check existed). So assert the OUTPUT per widget, not just the wiring once.
+    const panel = read('panels/ParticleEditor.tsx');
+    for (const widget of ['Num', 'MinMax', 'Vec3Row', 'Check', 'Enum', 'Color']) {
+      const start = panel.indexOf(`function ${widget}({`);
+      expect(start, `widget ${widget} is gone — rename it here too`).toBeGreaterThan(-1);
+      // Body = up to the next top-level `function` declaration.
+      const next = panel.indexOf('\nfunction ', start + 1);
+      const body = panel.slice(start, next === -1 ? undefined : next);
+      // Either it emits the attribute itself, or it hands the id to NumInput (which does).
+      expect(body.includes('data-ui-id=') || body.includes('uiId={uiId'), `${widget} computes a ui id but never renders one`).toBe(true);
+    }
+    // ...and NumInput, the leaf every numeric field bottoms out in, must emit it.
+    const ni = panel.slice(panel.indexOf('function NumInput({'));
+    expect(ni.slice(0, ni.indexOf('\nfunction ')), 'NumInput no longer renders data-ui-id').toContain('data-ui-id={uiId}');
+  });
 
   it('the shared tree components still forward a caller-owned uiId', () => {
     // TreeSearchInput/TypeFilterMenu render in BOTH Hierarchy and Assets. A hardcoded id

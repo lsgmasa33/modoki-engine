@@ -28,6 +28,7 @@
  * Uniform scale and axis-aligned members are exact.
  */
 import * as THREE from 'three';
+import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale';
 export type PivotMode = 'pivot' | 'center';
@@ -104,7 +105,7 @@ export function applyGroupTransform3D(input: GroupTransform3DInput): THREE.Matri
     const out = new THREE.Matrix4();
     if (mode === 'translate') {
       // Translate every member by the same world delta; keep its own rotation + scale.
-      start.decompose(_mPos, _mQuat, _mScale);
+      decomposeTrs(start, _mPos, _mQuat, _mScale); // singular-safe — see #258
       out.compose(_mPos.clone().add(_dPos), _mQuat.clone(), _mScale.clone());
     } else {
       // rotate + scale: rigid group transform about the pivot (orbit/spread + reorient/resize).

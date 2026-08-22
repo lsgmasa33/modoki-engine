@@ -47,10 +47,26 @@ await client.connect(transport);
 
 const listed = new Set((await client.listTools()).tools.map((t) => t.name));
 
+// ── The DYNAMIC tail (#270): tools the OPEN PROJECT's game registers. They are legitimately on
+// the server and legitimately absent from CONTRACTS — a contract is a static fact about the
+// engine's surface, and these are declared at runtime by whichever project happens to be open.
+//
+// Their names come from the backend, NOT from sniffing the `[game tool]` description prefix: the
+// prefix is presentation, and a guard keyed to presentation breaks the moment the wording changes
+// while still looking like it works.
+const gameTools = new Map<string, { mutates: boolean; requiresPlaying: boolean }>();
+try {
+  const res = await fetch(`${BACKEND}/api/game-tools`);
+  if (res.ok) {
+    const body = await res.json() as { tools?: { name: string; mutates: boolean; requiresPlaying?: boolean }[] };
+    for (const t of body.tools ?? []) gameTools.set(t.name, { mutates: t.mutates, requiresPlaying: t.requiresPlaying === true });
+  }
+} catch { /* no editor / older backend: there is simply no dynamic tail to account for */ }
+
 // ── The split must be TOTAL: every tool is swept, smoke-covered, or listed as uncovered. ──
 const declared = Object.keys(CONTRACTS);
 const missingFromServer = declared.filter((n) => !listed.has(n));
-const missingFromTable = [...listed].filter((n) => !declared.includes(n));
+const missingFromTable = [...listed].filter((n) => !declared.includes(n) && !gameTools.has(n));
 if (missingFromServer.length || missingFromTable.length) {
   console.error(`contract/server mismatch — table-only: ${missingFromServer.join(', ') || '(none)'}; server-only: ${missingFromTable.join(', ') || '(none)'}`);
   process.exit(1);
@@ -85,11 +101,34 @@ if (overclaimed.length) {
   process.exit(1);
 }
 
+// The dynamic tail gets swept too, on the same rule as the static surface: call what is safe,
+// declare what is not. `mutates` is REQUIRED on every game tool precisely so this is answerable
+// without a contract — a read-only game tool takes a bare `{}` (its params are optional by
+// construction unless declared required, and a required param would make the bare call a refusal,
+// which is still a live answer rather than a crash).
+const gameSweep = [...gameTools].filter(([, g]) => !g.mutates).map(([n]) => n);
+const gameSkipped = [...gameTools].filter(([, g]) => g.mutates).map(([n]) => n);
+if (gameTools.size) {
+  console.log(`[live] dynamic tail: ${gameTools.size} game tool(s) — sweeping ${gameSweep.join(', ') || '(none)'}`
+    + `${gameSkipped.length ? `; skipping ${gameSkipped.join(', ')} (declared mutating — would change the human's open project)` : ''}`);
+}
+
 console.log(`[live] backend ${BACKEND}`);
 console.log(`[live] sweeping ${sweep.length} non-mutating tools in their ERGONOMIC form (minimalArgs)`);
 console.log(`[live] ${COVERED_BY_SMOKE.size} mutating tools covered by test-smoke.mjs · ${Object.keys(LIVE_UNCOVERED).length} declared un-sweepable\n`);
 
-type Row = { tool: string; verdict: 'ok' | 'env' | 'DEFECT'; detail: string };
+type Row = {
+  tool: string; verdict: 'ok' | 'env' | 'DEFECT'; detail: string;
+  /** Did an EXPECTED_REFUSALS entry actually MATCH this row? Recorded as a fact at the moment the
+   *  branch fires, rather than re-derived from `detail` afterwards.
+   *
+   *  It used to be re-derived — `detail.startsWith('REFUSED_BY_OP (expected')` — which quietly
+   *  assumed every expected refusal carries that one code. The first entry that did not
+   *  (`modoki_scene_query`, NOT_AVAILABLE_HERE) was reported as STALE in the same run whose own
+   *  output line said `(expected: …)` two lines above. A staleness guard that reads a rendered
+   *  string instead of the fact it is about will keep finding new ways to be wrong; this cannot. */
+  expectationFired?: boolean;
+};
 const rows: Row[] = [];
 
 /** Structural codes that describe the EDITOR'S STATE rather than the tool's health. A NOT_FOUND for
@@ -120,12 +159,16 @@ const observedRunMode = editorStateForGate.runMode ?? editorStateForGate.playSta
 const EXPECTED_REFUSALS: Record<string, { match: RegExp; why: string; when?: () => boolean }> = {
   modoki_render_sequence: {
     match: /editor is STOPPED/i,
-    why: 'S2.33 by design — with time not advancing every frame would be identical, so a sequence is refused unless Playing (or force:true). The refusal IS the correct behaviour here.',
+    why: 'S2.33 by design — with time not advancing every frame would be identical, so a sequence is refused unless Playing (or forceRender:true). The refusal IS the correct behaviour here.',
     when: () => observedRunMode === 'stopped',
   },
   modoki_ota_status: {
     match: /could not derive a gs:\/\/ bucket|gcloud not found/i,
     why: 'the swept project has no OTA bucket configured; the route refuses rather than answering "nothing is published", which is the §5 could-not-look-vs-nothing-there rule working.',
+  },
+  modoki_scene_query: {
+    match: /no (2D|3D) physics world exists on this surface/i,
+    why: 'the swept scene has no physics colliders, so no Rapier world is ever built — measured on tropical-island, which has ZERO Collider3D entities whether playing or stopped. The op refuses rather than answering hit:null, which is §5 working: a query that could not run is not a query that found nothing. The MATCH here is the discriminator that keeps this honest — a genuinely dead route also answers NOT_AVAILABLE_HERE, but with the route-is-absent text, not this one. Smoke UC12 builds a real world and casts against it, because this entry proves the route is alive and nothing about the casting.',
   },
   modoki_read_asset_def: {
     match: /not in the live .* cache/i,
@@ -133,10 +176,14 @@ const EXPECTED_REFUSALS: Record<string, { match: RegExp; why: string; when?: () 
   },
 };
 
-for (const name of sweep) {
-  const args = CONTRACTS[name].minimalArgs ?? {};
+// The static surface first, then the dynamic tail. A game tool has no contract to take
+// `minimalArgs` from — a bare `{}` IS its ergonomic form, since declared params are optional
+// unless marked required.
+for (const name of [...sweep, ...gameSweep]) {
+  const args = CONTRACTS[name]?.minimalArgs ?? {};
   let verdict: Row['verdict'] = 'ok';
   let detail: string;
+  let expectationFired = false;
   try {
     const r = await client.callTool({ name, arguments: args as Record<string, unknown> });
     const body = r.content.map((c) => (c as { text?: string }).text ?? '').join('');
@@ -147,9 +194,16 @@ for (const name of sweep) {
       try { why = (JSON.parse(body) as { error?: { why?: string } }).error?.why ?? ''; } catch { /* handled below */ }
       const expected = EXPECTED_REFUSALS[name];
       const expectedActive = expected && (expected.when ? expected.when() : true);
+      // A game tool that DECLARED it needs Play, refusing while the editor is stopped, is giving a
+      // state answer — the dynamic-tail equivalent of an EXPECTED_REFUSALS entry, which cannot
+      // list a tool this harness has never heard of. Any OTHER refusal from it is still a defect,
+      // and so is this one while the editor IS playing.
+      const gameStateRefusal = gameTools.get(name)?.requiresPlaying === true
+        && observedRunMode !== 'playing' && code === 'REFUSED_BY_OP';
       if (!code) { verdict = 'DEFECT'; detail = `failed WITHOUT a §5 envelope: ${body.slice(0, 160)}`; }
       else if (ENV_CODES.has(code)) { verdict = 'env'; detail = code; }
-      else if (expectedActive && expected.match.test(why)) { verdict = 'env'; detail = `${code} (expected: ${why.slice(0, 70)}…)`; }
+      else if (expectedActive && expected.match.test(why)) { verdict = 'env'; expectationFired = true; detail = `${code} (expected: ${why.slice(0, 70)}…)`; }
+      else if (gameStateRefusal) { verdict = 'env'; detail = `${code} (declares requiresPlaying; editor is ${observedRunMode})`; }
       else { verdict = 'DEFECT'; detail = `${code}: ${body.slice(0, 200)}`; }
     } else {
       // A success still has to be a PARSEABLE payload — a severed blob or raw HTML is a defect the
@@ -165,7 +219,7 @@ for (const name of sweep) {
     verdict = 'DEFECT';
     detail = `threw: ${e instanceof Error ? e.message : String(e)}`;
   }
-  rows.push({ tool: name, verdict, detail });
+  rows.push({ tool: name, verdict, detail, expectationFired });
   const mark = verdict === 'ok' ? '✓' : verdict === 'env' ? '·' : '✗';
   console.log(`  ${mark} ${name.padEnd(34)} ${detail.slice(0, 110)}`);
 }
@@ -178,7 +232,7 @@ const unusedExpectations = Object.keys(EXPECTED_REFUSALS).filter((n) => {
   const entry = EXPECTED_REFUSALS[n];
   if (entry.when && !entry.when()) return false; // not expected to fire THIS run — see `when` above
   const row = rows.find((r) => r.tool === n);
-  return row && !row.detail.startsWith('REFUSED_BY_OP (expected');
+  return row && !row.expectationFired;
 });
 if (unusedExpectations.length) {
   console.error(`\nEXPECTED_REFUSALS entries that did NOT fire: ${unusedExpectations.join(', ')} — the tool stopped refusing, so delete the entry (it would silence a real refusal later).`);

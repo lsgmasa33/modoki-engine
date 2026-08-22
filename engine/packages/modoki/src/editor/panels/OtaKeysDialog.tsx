@@ -132,7 +132,7 @@ export default function OtaKeysDialog() {
 
         <div style={{ marginBottom: 10 }}>
           <div style={{ color: '#aaa', fontSize: 11, marginBottom: 3 }}>Key name</div>
-          <input type="text" style={inputStyle} value={name}
+          <input data-ui-id="ota.keys.name" data-ui-kind="field" data-ui-label="Key name" type="text" style={inputStyle} value={name}
             onChange={(e) => setName(e.target.value)}
             onBlur={() => refresh(name)}
             placeholder="default" />
@@ -149,7 +149,7 @@ export default function OtaKeysDialog() {
                 {mismatch ? (
                   <div style={{ color: '#e0a030' }}>
                     ⚠ Project Settings ota.publicKey does not match this key.{' '}
-                    <button onClick={syncToProjectSettings} disabled={syncing} style={btn({ padding: '2px 8px', fontSize: 10 })}>
+                    <button data-ui-id="ota.keys.sync" data-ui-kind="button" data-ui-label="Sync to Project Settings" onClick={syncToProjectSettings} disabled={syncing} style={btn({ padding: '2px 8px', fontSize: 10 })}>
                       {syncing ? 'Saving…' : 'Sync to Project Settings'}
                     </button>
                   </div>
@@ -167,8 +167,9 @@ export default function OtaKeysDialog() {
         {error && <div style={{ color: '#e74c3c', fontSize: 11, marginBottom: 8, whiteSpace: 'pre-wrap' }}>{error}</div>}
 
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 6 }}>
-          <button onClick={close} style={btn()}>Close</button>
+          <button data-ui-id="ota.keys.close" data-ui-kind="button" data-ui-label="Close" onClick={close} style={btn()}>Close</button>
           <button
+            data-ui-id="ota.keys.generate" data-ui-kind="button" data-ui-label="Generate"
             onClick={generate}
             disabled={generating || !!status?.exists}
             title={status?.exists ? 'Already exists — pick a different name to create a second identity' : undefined}

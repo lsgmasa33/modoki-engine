@@ -12,6 +12,7 @@ import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { invalidatePrefab } from '../../runtime/loaders/meshTemplateCache';
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
+import { isTraitDefault } from './traitDefault';
 import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loadSceneFile';
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, prefabSubtreeLocalIds, deriveInstanceMemberGuids, applyStructureCore } from '../../runtime/loaders/loadSceneFile';
 
@@ -29,7 +30,7 @@ const SCENE_ONLY_TEMPLATE_FIELDS = new Set(['EntityAttributes.editorFolder']);
 /** True when a live field must be kept OUT of a written prefab template: pure
  *  runtime read-back, or a scene-only organizational field. Shared by both paths
  *  that write a template — creating a prefab, and applying overrides back into one. */
-function isTemplateExcludedField(meta: TraitMeta, field: string): boolean {
+export function isTemplateExcludedField(meta: TraitMeta, field: string): boolean {
   return isRuntimeOnlyField(meta, field) || SCENE_ONLY_TEMPLATE_FIELDS.has(`${meta.name}.${field}`);
 }
 
@@ -803,6 +804,36 @@ export function getOverrideValues(
   return result;
 }
 
+/** Build the `currentTraits` bag `getOverrideValues` compares against the prefab base.
+ *
+ *  `readTraitDataFull`, NOT `readTraitData`: the latter returns only the curated Inspector
+ *  subset in `meta.fields`, so every persistent field a custom Inspector section owns
+ *  (`Animator.clips`, `AudioSource.clips`) and every AoS field (`AnimationLibrary.animSets`,
+ *  `SkinnedMeshRenderer.materials`, `UIAction.onClickSet`) would be ABSENT from the
+ *  comparison — reported as "not overridden" whatever its value. Runtime-only read-back
+ *  fields are then stripped, or a live playhead would read as an override on every instance.
+ *
+ *  Shared rather than inlined because the Apply/Revert DIALOG built this bag with the
+ *  curated read while the serializer used the full one, so the dialog under-reported exactly
+ *  those fields and a user could not apply them (found by the QA-CTX-0003 close-out sweep —
+ *  the third site where that same substitution has bitten). One builder, one answer. */
+export function collectComparableTraits(
+  ecsId: number,
+  allTraits: TraitMeta[],
+): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {};
+  for (const meta of allTraits) {
+    if (meta.name === 'PrefabInstance') continue;
+    const data = readTraitDataFull(ecsId, meta);
+    if (!data) continue;
+    for (const field of Object.keys(data)) {
+      if (isRuntimeOnlyField(meta, field)) delete data[field];
+    }
+    out[meta.name] = data;
+  }
+  return out;
+}
+
 /** Get overrides: fields that differ from the prefab source.
  *  Returns a set of "traitName.fieldName" strings for overridden fields. */
 export function getOverrides(
@@ -874,16 +905,7 @@ export function captureInstanceOverrides(
     // excluding it at the READ means no later path can resurrect it. Tags: the read
     // returns {} for a tag the entity has (null if absent), so an added tag shows up
     // as `{name: {}}`. See runtime/core/ecs/traitSchema.ts.
-    const currentTraits: Record<string, Record<string, unknown>> = {};
-    for (const meta of allTraits) {
-      if (meta.name === 'PrefabInstance') continue;
-      const data = readTraitDataFull(entity.id(), meta);
-      if (!data) continue;
-      for (const field of Object.keys(data)) {
-        if (isRuntimeOnlyField(meta, field)) delete data[field];
-      }
-      currentTraits[meta.name] = data;
-    }
+    const currentTraits = collectComparableTraits(entity.id(), allTraits);
 
     const diffs = getOverrideValues(localId, currentTraits, prefab);
     const markSet = getOverrideMarkSet(entity.id());
@@ -1037,9 +1059,34 @@ function snapshotAddedTraits(ecsId: number): { bag: Record<string, Record<string
     // here would silently drop them on a user-ADDED prefab child, breaking the
     // "survives a save" guarantee. data-key fallback keeps full fidelity.
     const schema = (meta.trait as { schema?: Record<string, unknown> }).schema;
-    const keys = schema && typeof schema === 'object' ? Object.keys(schema) : Object.keys(data);
+    const soa = !!schema && typeof schema === 'object';
+    const keys = soa ? Object.keys(schema!) : Object.keys(data);
     const copy: Record<string, unknown> = {};
-    for (const key of keys) copy[key] = data[key];
+    for (const key of keys) {
+      // Skip a field still holding its schema default — the rule serialize.ts applies to a
+      // top-level entity, which the note above has always CLAIMED this mirrors and did not.
+      //
+      // Safe because an added child has NO prefab base to diff against: it is a whole new entity,
+      // and `spawnNode` (loadSceneFile.ts) rebuilds it with `meta.trait(d)`, so koota refills
+      // every absent key from the same schema this compared against. Round-trip identical.
+      //
+      // NOT the same thing as a member OVERRIDE, and the distinction is load-bearing:
+      // `captureInstanceOverrides` diffs against the PREFAB's value, so overriding a prefab's
+      // non-default back to the schema default is still written. Nothing here touches that path.
+      //
+      // Safe through PROMOTION too (`insertAddedSubtree` folds an added child into the prefab as
+      // a member): `getOverrideValues` already reads an absent base field as the schema default
+      // — see its own ⚠️ note — because prefab files already omit fields. So a compacted child
+      // promoted into a prefab does not make every instance report a spurious override.
+      //
+      // Two exclusions carried over verbatim from serialize.ts. AoS traits (function schema) have
+      // no per-key schema to compare against and stay FULL — that is the fidelity case the note
+      // above exists for (AudioSource.clips, SkinnedMeshRenderer.materials,
+      // AnimationLibrary.animSets; the bone-map-lost-on-save bug). And an `entityId` field is
+      // never skipped: a default entity reference is a meaningful value, not an absence.
+      if (soa && !meta.fields[key]?.entityId && isTraitDefault(data[key], schema![key])) continue;
+      copy[key] = data[key];
+    }
     if (meta.name === 'EntityAttributes') guid = (data.guid as string) || '';
     bag[meta.name] = copy;
   }
@@ -1303,6 +1350,19 @@ export function applyStructureByRootInstance(
         if (!child) { console.warn(`[Prefab] added nested instance "${node.prefab}" not cached`); return; }
         const childRoot = instantiatePrefab(child, parentEcsId);
         if (!childRoot) return;
+        // RESTORE the node's own guid — the editor-side twin of the loader fix (QA-PREFAB-0004).
+        // `captureNestedRef` reads the live guid onto the reference node precisely so a rebuild
+        // can put it back, and `rebuildInstance` already does exactly this for the OUTER root
+        // ("refs into the instance survive the rebuild"). Without it a Revert to Prefab, an
+        // Apply, or the undo/redo of a prefab drop re-expands the nested instance with the
+        // TEMPLATE's guid — which prefab templates clear, so it comes back as '' and the entity
+        // is not addressable by guid at all, worse than the loader's fresh-guid churn.
+        const eaMeta = getTraitByName('EntityAttributes');
+        if (eaMeta && node.guid) {
+          writeTraitField(childRoot, eaMeta, 'guid', node.guid);
+          const ent = findEntity(childRoot);
+          if (ent) indexEntityGuid(ent);
+        }
         setPrefabSource(childRoot, node.prefab!);
         if (node.overrides) applyOverridesByRootInstance(childRoot, node.overrides);
         if (node.added?.length || node.removed?.length || node.removedTraits) {
@@ -1436,8 +1496,16 @@ export function setPrefabCache(source: string, prefab: PrefabFile | null): void 
 }
 
 /** Look up an entity's PrefabInstance source + rootInstanceId. Returns null if
- *  the entity is not part of a prefab instance. */
-function resolveInstanceContext(entityId: number): { source: string; rootInstanceId: number } | null {
+ *  the entity is not part of a prefab instance.
+ *
+ *  EXPORTED because the agent ops need the same lookup to turn a `{guid}` into the
+ *  `(source, rootInstanceId)` pair `applyToPrefabWithUndo`/`revertOverridesSelective`
+ *  take. It was briefly copied into `agentEditorOps.ts` instead — the duplicated-private-
+ *  helper trap docs/editor.md warns about, and worse here than usual: the copy would keep
+ *  answering plausibly after this one's rules changed (a nested member's rootInstanceId
+ *  points at ITS OWN prefab's root, not the outermost one), so the two would disagree only
+ *  on nested instances. One lookup, one answer. */
+export function resolveInstanceContext(entityId: number): { source: string; rootInstanceId: number } | null {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return null;
   let source = '';
@@ -1553,7 +1621,32 @@ function insertAddedSubtree(
   const traits: Record<string, Record<string, unknown> | boolean> = {};
   for (const [name, data] of Object.entries(node.traits)) {
     if (name === 'PrefabInstance') continue;
-    traits[name] = data === true ? true : { ...(data as Record<string, unknown>) };
+    if (data === true) { traits[name] = true; continue; }
+    // RE-EXPAND to the full schema on the way INTO a prefab. A scene's `added` bag is COMPACTED
+    // (a field at its schema default is omitted — see snapshotAddedTraits), but a prefab FILE is
+    // deliberately written FULL by serializePrefab, and the reason is a real consumer rather than
+    // taste: Court's `layoutFromPrefabDoc` reads prefab fields BY NAME and its `num()` helper
+    // returns null for a missing one, so the caller silently falls back to code constants. An
+    // authored value that merely HAPPENS to equal its default would read as "not authored".
+    //
+    // Promotion is the one place the two conventions meet, so it is the one place that has to
+    // convert. Without this, a child promoted out of an instance would land compacted beside
+    // members written full — the same prefab file in two shapes, and only the promoted rows
+    // misread. (Before compaction existed this was consistent by accident, which is exactly how a
+    // change like that introduces a bug two subsystems away.)
+    const meta = getTraitByName(name);
+    const schema = (meta?.trait as { schema?: Record<string, unknown> } | undefined)?.schema;
+    const bag: Record<string, unknown> = schema && typeof schema === 'object'
+      ? { ...schema, ...(data as Record<string, unknown>) }   // AoS (function schema) stays as-is
+      : { ...(data as Record<string, unknown>) };
+    // Then the same two subtractions serializePrefab applies, or promotion would smuggle in what
+    // a template must not carry: runtime read-back / scene-only fields, and BLANK asset refs
+    // (`authoredAssetRefs.test.ts` fails the build on those, #53).
+    if (meta) {
+      for (const key of Object.keys(bag)) if (isTemplateExcludedField(meta, key)) delete bag[key];
+      for (const field of REF_FIELDS_BY_TRAIT[name] ?? []) if (bag[field] === '') delete bag[field];
+    }
+    traits[name] = bag;
   }
   let ea = traits['EntityAttributes'];
   if (!ea || ea === true) { ea = {}; traits['EntityAttributes'] = ea; }

@@ -1,9 +1,14 @@
-/** Phase 8, device half — T2 across ALL 20 `device_*` tools, table-driven.
+/** Phase 8, device half — T2 across every `device_*` tool, table-driven.
+ *
+ *  ⚠️ Counts are deliberately NOT stated here. This header said "ALL 20" and "all 77" long after the
+ *  surfaces were 43 and 93 — the exact stale-prose failure `docs/mcp-tool-conventions.md` §4 warns
+ *  about, in a file whose whole job is keeping a split total. The tables below derive from the live
+ *  registry, so they are right whatever the count is.
  *
  *  The editor surface got a contract table (`contracts.ts`) and therefore per-tool conformance for
- *  all 77 tools. The device surface had neither: `deviceToolSurface.test.ts` asserts a dozen
+ *  every tool. The device surface had neither: `deviceToolSurface.test.ts` asserts a dozen
  *  specific behaviours (identity banner, lease refusal, unscaled-tap refusal, reply decoding) but
- *  NOTHING per tool — so 14 of the 20 had no test that called them at all, and the one failure mode
+ *  NOTHING per tool — so most had no test that called them at all, and the one failure mode
  *  this whole audit is about (a tool that is dead, or that swallows a failure) was unobservable for
  *  them.
  *
@@ -55,6 +60,7 @@ const NOT_A_JSON_ENVELOPE: Record<string, string> = {
   device_eval_api: 'returns a discovery document (the injected object\'s op list), not a status envelope',
   device_console_logs: 'returns a log payload; its failures arrive as `Error: …`',
   device_native_logs: 'returns a log payload; its failures arrive as `Error: …`',
+  device_crash_reports: 'returns a report listing / a parsed report summary — the payload IS the answer, not a status envelope',
   device_tap: 'input tools reply with a bare `ok …` / `Error: …` STRING, not JSON',
   device_drag: 'bare-string input reply',
   device_pointer: 'bare-string input reply',
@@ -80,6 +86,17 @@ const MINIMAL: Record<string, Record<string, unknown>> = {
   device_layout_bounds: {},
   device_resolve_refs: { refs: ['g-1'] },
   device_introspect: {},
+  // #288 Phase 6 — the device half of PlayerPrefs + scene queries. Both ops live in
+  // `agentBridge.ts` (runtime), so the device runtime already had them and shipping only the
+  // editor tools would have been the §9 asymmetry that rule calls a finding.
+  device_player_prefs: {},
+  device_write_player_prefs: { action: 'flush' },
+  device_scene_query: { kind: 'point', dim: '3d', point: [0, 0, 0] },
+  device_game_tools: {},
+  // The ergonomic form is a name and nothing else: `args` is optional, and a game tool with no
+  // required params is called bare — which is also the shape the device VALIDATES against the
+  // declaration, so an over-specified fixture here would test a path callers do not take.
+  device_game_tool_call: { name: 'court_load_level' },
   device_dispatch_action: { name: 'engine.playClip' },
   device_mutate_scene: { guid: 'g-1', set: { 'Renderable3D.isVisible': false } },
   device_create_entity: { spec: { kind: 'primitive', mesh: 'sphere' } },
@@ -94,6 +111,9 @@ const MINIMAL: Record<string, Record<string, unknown>> = {
   device_invalidate_assets: { items: [{ path: '/a.glb', type: 'model' }] },
   device_console_logs: {},
   device_native_logs: {},
+  // Bare = list this app's recent reports. Host-side (go-ios), so it needs no lease — but the
+  // MINIMAL form still has to be the ERGONOMIC one, which for a listing is no arguments at all.
+  device_crash_reports: {},
   device_eval: { code: 'return 1' },
   device_eval_api: {},   // discovery for device_eval's injected `modoki` object (#83) — no params
   device_screenshot: {},

@@ -441,19 +441,26 @@ describe('undoManager', () => {
       expect(redoLabel()).toBe('');
     });
 
-    it('a rejecting undo does not wedge the queue', async () => {
+    // #310 CHANGED THIS TEST'S EXPECTATION, deliberately. It used to assert that a throwing
+    // closure makes `undo()` REJECT — which was the bug's visible surface, not a contract:
+    // `undo(): Promise<boolean>` promises a boolean, and the rejection escaped to callers that
+    // do not catch it (the MCP `undo` op among them). The queue-doesn't-wedge intent is what
+    // this test was really for, and it still holds; only the failure signal changed.
+    it('a throwing undo resolves false and does not wedge the queue', async () => {
       const { pushAction, undo } = await getUndoManager();
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
       const order: string[] = [];
       pushAction({ label: 'A', undo: () => { order.push('A'); }, redo: () => {} });
       pushAction({ label: 'B', undo: async () => { order.push('B'); throw new Error('boom'); }, redo: () => {} });
 
-      // First undo (B) rejects; the second (A) must still run.
+      // First undo (B) fails; the second (A) must still run.
       const pB = undo();
       const pA = undo();
-      await expect(pB).rejects.toThrow('boom');
+      expect(await pB).toBe(false);
       expect(await pA).toBe(true);
       expect(order).toEqual(['B', 'A']);
+      errorSpy.mockRestore();
     });
   });
 });

@@ -41,6 +41,17 @@ All of them wrap the **same `HTMLVideoElement`** — one decoder, one audio path
 state. Two viewports showing the same clip get two GPU textures over that one decoder, which is
 what the per-surface binding tables exist to make possible.
 
+⚠️ **On the TEXTURE surfaces the live `<video>` element is never attached to the DOM.**
+`videoService.ts:135`'s `playVideo` does `document.createElement('video')`, and for a 3D screen or a
+2D sprite nothing ever `appendChild`s it — those surfaces only COPY frames off a detached element.
+So `document.querySelector('video')` finds nothing for them however healthy playback is, and the one
+reach-in is `videoElementFor(entityId)` (`runtime/video/videoSystem.ts`).
+
+**The two DOM surfaces are the exception, and they adopt that same element rather than making
+their own**: `UIVideoMount.tsx:96` and `VideoOverlay.tsx:95` both `host.appendChild(el)`. So while a
+UI-mounted or fullscreen-overlay player is active, `querySelector('video')` DOES find it. Decide
+which surface you are debugging before concluding the element is missing.
+
 ⚠️ **The DOM surfaces are the exception: they cannot be duplicated.** A texture surface COPIES
 frames off the element, so any number of viewports can show the clip; a DOM `<video>` IS the
 element, and a DOM node exists in exactly one place. So with the editor's Game and Scene panels
@@ -216,7 +227,21 @@ response**. Measured, because this is easy to get wrong:
 | jsDelivr | yes (206) | `*` | **yes** |
 
 The archive.org row is the trap: a casual `curl -I` follows the redirect and shows a header that
-the response actually serving the bytes does not have.
+the response actually serving the bytes does not have. Re-measured 2026-08-11 and it still holds —
+`/download/…` answers `302` with `access-control-allow-origin: *`, and the
+`dnNNNNNN.us.archive.org` node it redirects to answers `200` with no CORS header at all. A code
+comment claiming archive.org sends `ACAO: *` was corrected against this measurement, not the other
+way round.
+
+⚠️ **The Inspector warns on any `*.archive.org` host, and the subdomains are the point.** Warning
+only on the bare domain leaves it silent on the URL a user is most likely to paste: they use the
+`/download/` link, preview it in a browser, and the address bar then shows the
+`ia<n>`/`dn<n>.us.archive.org` node it redirected to — so the copied URL is the storage node, which
+is exactly the broken case. (`ia801409…` further `301`s to `dn801201…`; both are archive.org
+subdomains, so one subdomain-permitting rule covers the family, while `archive.org.evil.com` and
+`notarchive.org` still correctly do not match.) `web.archive.org` matches the same rule and is
+**not** separately measured — being warned is the safe direction. Pinned by
+`engine/tests/editor/videoAssetLogic.test.ts`.
 
 ## Sequencing a cutscene
 
@@ -270,6 +295,49 @@ entirely (`isVideoRef` in `runtime/core/textureRefs.ts`), leaving an empty Sprit
 **`VideoSource.destroy()` ends with `pause(); src = ''; load()` on its resource.** Called on the
 shared element it blacks out the 3D texture and the fullscreen overlay along with the sprite.
 `release()` detaches the resource first, and that ordering is asserted directly.
+
+**The 3D binding takes a CLONE of the material, and taking the material itself is a crash (#192).**
+The obvious implementation — write the video onto the mesh's `map`, put the old `map` back when the
+clip stops — is wrong twice:
+
+1. Engine materials are **shared and refcounted by GUID** ([scene-loading.md](scene-loading.md)), so
+   writing `map` onto one shows the video on every other mesh using it.
+2. three's `NodeMaterialObserver` is **asymmetric about null**, and the second half is what kills the
+   renderer:
+
+   ```js
+   getMaterialData:  if ( value === null || value === undefined ) continue;   // recording SKIPS null
+   equals:           } else if ( mtlValue.isTexture === true ) {              // comparing does NOT guard it
+   ```
+
+   The snapshot lives in a module-level `_materialCache` **keyed by the material object and written
+   once** — nothing re-records it, and `material.needsUpdate = true` does *not* reset it. So a slot
+   recorded holding a texture that later returns to `null` makes `equals()` dereference null on every
+   subsequent frame: `Cannot read properties of null (reading 'isTexture')`, thrown out of the render
+   loop in **every** viewport, and permanently — that material can never be rendered again. Restoring
+   `map` to its previous value walked into this whenever that value was null, i.e. any screen with no
+   authored map. `demos/video-demo` has no `.mat.json` at all, so *every* surface there was affected
+   and the first clip stop killed the scene.
+
+`videoTextureSync` therefore binds a private clone: the shared original is never mutated, and the
+clone is swapped out whole and disposed rather than having its map cleared. The cost is one extra
+pipeline per video surface — the same trade `Tint` and `MaterialInstance` already make for their own
+per-entity clones. Two consequences worth knowing:
+
+- It runs **last** in the frame, so it re-asserts its clone against `syncMaterial`'s per-frame
+  re-bind of a resolved `.mat.json`; if the material *ref* genuinely changed, it rebuilds the clone
+  from the new base instead of pinning the old look.
+- If the slot **shape** changes under a live binding (single ⇄ material array) the binding is dropped
+  and re-derived, never re-asserted — writing into a slot that no longer exists would clobber a
+  freshly-assigned array, or strand a binding nothing could restore.
+- The clone is stamped `markDerived` (#318). Only `.map` is replaced, so every other slot the base
+  carries — normal, roughness, emissive — is still a **shared** texture reference; without the stamp
+  a `.mat.json` re-import lets `sweepRetiredMaterials` free the base (no *mesh* binds it any more —
+  the clone does) and release textures this clone is drawing with. Mechanism:
+  `docs/textures.md` § "The CLONES are the other half".
+
+The 2D twin is unaffected: PixiJS has no such observer, and it swaps `sprite.texture` rather than a
+material property.
 
 **Neither renderer's default upload cadence is right.** Three's `VideoTexture` marks itself dirty
 every frame — 60 GPU uploads for a 24 fps clip. Pixi's `VideoSource` only self-drives via a `load()`
@@ -346,6 +414,23 @@ Transcoding uses the toolchain's `ffmpeg`/`ffprobe`, auto-provisioned on demand 
 requirement rather than a size decision: every `ffmpeg-static` build is `--enable-gpl`, and the
 darwin-arm64 build is additionally `--enable-nonfree`, which is not redistributable under any
 licence. Compliance depends on the binary being provisioned onto the user's own machine.
+
+## Agent surface (cache introspection)
+
+The downloaded-video cache is readable through `modoki_diagnose` with `video:true` (opt-in) —
+usedBytes/budgetBytes/count plus per-clip entries. Opt-in because `diagnose` is a swept read tool
+whose response budget is summary-first; a per-clip index would grow every caller's payload to
+answer a question almost none of them asked. Before this the `VideoCache` singleton was a local
+`const` inside the `__MODOKI_MODULE_VIDEO__`-gated block in `engine/app/ecs/pipeline.ts` and was
+never exported, so cache state couldn't be observed at all — a QA case had to patch `window.fetch`
+to infer a refetch, which measures the network rather than the cache and can't distinguish a cache
+MISS from a cache never wired up. An accessor alone wasn't enough either: `modoki_eval` runs in the
+renderer and could import the pipeline through `/@fs`, but that yields a second module instance
+whose slot is null — a confident "no cache" for a live one. It's reached instead through a one-slot
+registry, `engine/packages/modoki/src/runtime/video/videoCacheSlot.ts`, typed structurally so no
+video code is pulled into builds that compile video out. `available:false` carries a REASON, since
+the two causes want opposite next moves — the video module compiled out (a playable-ad build) versus
+no Cache API (clips stream instead of caching) — and neither means "the cache is empty".
 
 ## Related
 

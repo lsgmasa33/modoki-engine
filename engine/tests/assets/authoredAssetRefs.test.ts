@@ -73,9 +73,11 @@ const BASELINE: { key: string; why: string }[] = [
   { key: '/games/3d-test/assets/models/skinned-test/capsule.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
   { key: '/games/3d-test/assets/models/skinned-test/cone.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
   { key: '/games/3d-test/assets/models/skinned-test/cylinder.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  // Renderable2D.sprite became a PROVEN ref pair only when games/video-test authored a video
-  // GUID there — the first asset GUID in that field anywhere in the repo (every other 2D entity
-  // uses a primitive keyword or a slice name). This blank pre-dates that and is the 2D analogue
+  // Renderable2D.sprite became a PROVEN ref pair only when the video work authored a video GUID
+  // there — the first asset GUID in that field anywhere in the repo (every other 2D entity
+  // uses a primitive keyword or a slice name). It was `games/video-test` that first proved it;
+  // that fixture is deleted now, and `demos/video-demo`'s 2D video sprite keeps the pair proven.
+  // This blank pre-dates all of it and is the 2D analogue
   // of the Renderable3DPrimitive.material entries below: a coloured quad, not a forgotten image.
   // (The SCENE blanks that came with it are gone for the reason in the 2026-08-04 note above —
   // the re-save compacted them out of the file.)
@@ -206,8 +208,30 @@ const provenPairs = new Set(
     .map((i) => `${i.trait}.${i.field}`),
 );
 
+/** Ref pairs where a BLANK is the field's designed meaning, not an omission — exempted at the
+ *  FIELD level rather than pinned per file in `BASELINE`.
+ *
+ *  The distinction is worth the extra mechanism. `BASELINE` records blanks that already existed
+ *  and should shrink; an entry there is a debt. These are different: blank is what the field
+ *  MEANS, so every future scene/prefab authoring the trait would fail this guard for doing the
+ *  right thing, and the baseline would grow forever while catching nothing. A pair belongs here
+ *  only when the blank has a defined behaviour the engine implements — not merely "it seems to
+ *  work". Keep it short: a wrongly-listed pair silences the guard for that field repo-wide.
+ *
+ *  `UIElement.fontFamily` (#231): CSS `font-family` INHERITS, so a UI tree gets its typeface
+ *  from one authored ancestor and every descendant is legitimately blank — 120 of the 121
+ *  committed instances are, and the one that is not is Court's `Intro` root. Blank also has a
+ *  documented fallback chain of its own (`systemFont`, then the browser default —
+ *  `runtime/ui/fontFamilyRef.ts`). It became a "proven" pair the moment that root was migrated
+ *  from a family NAME to a GUID; nothing about the blanks changed. */
+const OPTIONAL_BLANK_PAIRS = new Set(['UIElement.fontFamily']);
+
 /** Every instance of a proven asset-ref pair whose value is a blank string. */
-const blanks = allInstances.filter((i) => provenPairs.has(`${i.trait}.${i.field}`) && i.value === '');
+const blanks = allInstances.filter(
+  (i) => provenPairs.has(`${i.trait}.${i.field}`)
+    && !OPTIONAL_BLANK_PAIRS.has(`${i.trait}.${i.field}`)
+    && i.value === '',
+);
 
 const key = (i: FieldInstance) => `${i.url}:${i.trait}.${i.field}`;
 

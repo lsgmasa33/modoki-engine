@@ -37,7 +37,8 @@ import { createPhysicsWorldRegistry } from './physicsWorldRegistry';
 import { meshColliderProvider } from './meshColliderProvider';
 import { buildMeshColliderDescs } from './meshColliderGeometry';
 import { physics3DEvents } from './Physics3DEvents';
-import { makeFireOnCollision, drainContactEvents, synthesizeContactExits, refOf, type ColliderInfo } from './physicsContactEvents';
+import { makeFireOnCollision, collectContactEvents, routeContactEvents, synthesizeContactExits, refOf, type ColliderInfo, type DrainedPair } from './physicsContactEvents';
+import { physicsSubsteps, substepFraction, substepLerp } from './physicsSubstep';
 import { dropEntityFromContactIndex } from './physicsContactIndex';
 import { emit, isVerboseCaptureActive } from '../core/journal';
 import { warnVocabOnce } from '../core/warnVocab';
@@ -119,6 +120,21 @@ export const disposePhysics3D = registry.dispose;
 /** Free ALL Rapier3D worlds (called on Play→Stop so the next Play rebuilds fresh). */
 export const disposeAllPhysics3D = registry.disposeAll;
 
+/** Is there a live Rapier3D world for this koota world?
+ *
+ *  Exists so a caller can tell "there is nothing here to hit" from "there is no 3D physics on
+ *  this surface at all". Every query below answers BOTH with `null` — a clean miss, an absent
+ *  world, and a zero-length direction are one value — and for a human reading code that collapse
+ *  is harmless, because the next line is usually `if (hit)`. For an agent tool it is §0's rank-2
+ *  failure: "could not look" reported as "nothing is there", stated authoritatively and
+ *  unrecoverable. `modoki_scene_query` calls this FIRST and refuses instead of answering a miss.
+ *
+ *  Note a world only exists once `physics3DSystem` has run, i.e. while the sim is PLAYING — a
+ *  stopped editor has no physics world, which is a real answer and not a defect. */
+export function hasPhysics3D(world: World): boolean {
+  return worlds.has(world);
+}
+
 // Scratch reused across the synchronous tick — one world runs at a time.
 const _seenBodies = new Set<number>();
 const _seenSolo = new Set<number>();
@@ -129,6 +145,77 @@ const _e: Euler3 = { rx: 0, ry: 0, rz: 0 };
 const _desired: Vec3 = { x: 0, y: 0, z: 0 };   // character move delta (physics meters)
 const _childScratch = new Map<number, Entity[]>();
 const EMPTY_CHILDREN: readonly Entity[] = Object.freeze([]);
+
+// ── Kinematic targets issued THIS TICK, for per-substep re-issue ──────────────────────────────
+// See `substepFraction` in physicsSubstep.ts for the measurement that makes this necessary: a
+// target set once per frame and consumed by a SPLIT frame moves the body at `count`x speed in
+// substep 1 and not at all in substep 2, which breaks friction grip and doubles push impulses.
+//
+// A GROWN-ONCE POOL, not a per-frame array of literals: this runs for every moving kinematic body
+// every tick, and the surrounding code goes to some length (`_v`, `_q`, `_desired`) to keep the
+// physics tick allocation-free. Entries are reused; `_kinCount` is the live length.
+interface KinTarget3D {
+  body: RRigidBody;
+  sx: number; sy: number; sz: number;            // pose the body starts the frame at
+  tx: number; ty: number; tz: number;            // pose the frame asks it to reach
+  rot: boolean;                                  // false for a character (translation only)
+  sqx: number; sqy: number; sqz: number; sqw: number;
+  tqx: number; tqy: number; tqz: number; tqw: number;
+}
+const _kin: KinTarget3D[] = [];
+let _kinCount = 0;
+
+/** Issue a kinematic target AND record it, so a split frame can re-issue it per substep.
+ *  `quat` null = translation only (the character path, which never spins its body). */
+function trackKinematic(body: RRigidBody, tx: number, ty: number, tz: number, quat: Quat | null): void {
+  const t = body.translation();
+  const r = quat ? body.rotation() : _IDENT_Q;
+  let e = _kin[_kinCount];
+  if (!e) {
+    e = { body, sx: 0, sy: 0, sz: 0, tx: 0, ty: 0, tz: 0, rot: false, sqx: 0, sqy: 0, sqz: 0, sqw: 1, tqx: 0, tqy: 0, tqz: 0, tqw: 1 };
+    _kin.push(e);
+  }
+  e.body = body;
+  e.sx = t.x; e.sy = t.y; e.sz = t.z;
+  e.tx = tx; e.ty = ty; e.tz = tz;
+  e.rot = quat !== null;
+  e.sqx = r.x; e.sqy = r.y; e.sqz = r.z; e.sqw = r.w;
+  if (quat) { e.tqx = quat.x; e.tqy = quat.y; e.tqz = quat.z; e.tqw = quat.w; }
+  _kinCount++;
+  // The full-frame target, issued now — so a frame that turns out NOT to be split (the 60 fps
+  // case, and every frame before this mechanism existed) is byte-for-byte unchanged.
+  _v2.x = tx; _v2.y = ty; _v2.z = tz;
+  body.setNextKinematicTranslation(_v2);
+  if (quat) body.setNextKinematicRotation(quat);
+}
+
+/** Re-issue every recorded target at `frac` of the way through the frame. Called before each
+ *  substep of a SPLIT frame only — at `count === 1` the target set by `trackKinematic` already
+ *  is the answer. Rotation is nlerp'd + normalised (shortest arc): the per-substep angle is a
+ *  fraction of one frame's rotation, where nlerp and slerp differ by far less than the f32 the
+ *  solver stores. */
+function retargetKinematics(frac: number): void {
+  for (let i = 0; i < _kinCount; i++) {
+    const e = _kin[i];
+    _v2.x = substepLerp(e.sx, e.tx, frac);
+    _v2.y = substepLerp(e.sy, e.ty, frac);
+    _v2.z = substepLerp(e.sz, e.tz, frac);
+    e.body.setNextKinematicTranslation(_v2);
+    if (!e.rot) continue;
+    const dot = e.sqx * e.tqx + e.sqy * e.tqy + e.sqz * e.tqz + e.sqw * e.tqw;
+    const s = dot < 0 ? -1 : 1;   // shortest arc — a quaternion and its negation are the same rotation
+    const qx = substepLerp(e.sqx, s * e.tqx, frac);
+    const qy = substepLerp(e.sqy, s * e.tqy, frac);
+    const qz = substepLerp(e.sqz, s * e.tqz, frac);
+    const qw = substepLerp(e.sqw, s * e.tqw, frac);
+    const len = Math.hypot(qx, qy, qz, qw) || 1;
+    _q2.x = qx / len; _q2.y = qy / len; _q2.z = qz / len; _q2.w = qw / len;
+    e.body.setNextKinematicRotation(_q2);
+  }
+}
+
+const _v2: Vec3 = { x: 0, y: 0, z: 0 };
+const _q2: Quat = { x: 0, y: 0, z: 0, w: 1 };
 
 /** O(1) parentId read off the entity handle (no world scan). 0 = root / unparented. */
 function parentIdOf(entity: Entity): number {
@@ -732,7 +819,10 @@ function stepCharacters(st: PhysicsWorldState3D, world: World, cfg: PhysicsConfi
 
       const t = body.translation();
       _v.x = t.x + mv.x; _v.y = t.y + mv.y; _v.z = t.z + mv.z;   // reuse scratch (apos no longer needed)
-      body.setNextKinematicTranslation(_v);
+      // Recorded like every other kinematic target: a character is not substepped (see
+      // `physicsSubstep.ts`), but the solver that consumes its target IS, and a character walking
+      // into a dynamic box would otherwise shove it at `count`x speed on a capped frame.
+      trackKinematic(body, _v.x, _v.y, _v.z, null);
 
       if (grounded && velY < 0) velY = 0; // landed — stop the fall
       cc.velY = velY;
@@ -779,6 +869,11 @@ export function physics3DSystem(world: World): void {
 
   const cfg = readConfig(world);
   const st = getOrCreateWorldState(world, cfg);
+  // Forget last tick's kinematic targets BEFORE anything can record new ones — including on a
+  // tick that never steps (`dt <= 0`), or the next split frame would interpolate against a stale
+  // start pose. Two physics worlds in one process share this scratch, which is safe only because
+  // it lives entirely within one synchronous system call.
+  _kinCount = 0;
   // Live gravity edits — cheap to set every tick. No flip (right-handed Y-up both sides).
   st.world.gravity = { x: cfg.gravityX, y: cfg.gravityY, z: cfg.gravityZ };
   st.upm = cfg.upm;   // refresh the cached scale for the query/forces helpers (avoids re-querying)
@@ -814,8 +909,11 @@ export function physics3DSystem(world: World): void {
         if (body) {
           // pos === _v, quat === _q (right-shaped, consumed synchronously) — pass scratch directly.
           if (rec.bodyType === 'kinematic') {
-            body.setNextKinematicTranslation(pos);
-            body.setNextKinematicRotation(quat);
+            // Through the recorder, so a SPLIT frame re-issues this target per substep instead of
+            // handing the solver the whole frame's motion at `count`x speed in substep 1 — see
+            // `substepFraction`'s docblock for the measurement. `count === 1` calls
+            // `setNextKinematic*` with exactly these values and nothing else changes.
+            trackKinematic(body, pos.x, pos.y, pos.z, quat);
           } else {
             body.setTranslation(pos, true);
             body.setRotation(quat, true);
@@ -874,9 +972,27 @@ export function physics3DSystem(world: World): void {
   stepCharacters(st, world, cfg, dt);
 
   // ── Step ──
-  if (dt > 0) {
-    st.world.timestep = dt;
+  // SUBSTEPPED so no solver step is ever coarser than 1/60, whatever the render rate — a frame cap
+  // (a project's `targetFps`, or a quality tier's) must not change how the game behaves. See
+  // `physicsSubstep.ts` for why this is a ceiling on the step rather than a fixed-dt accumulator,
+  // and why character controllers stay outside the loop.
+  const { count: substeps, h: substepDt } = physicsSubsteps(dt);
+  _drained.length = 0;
+  for (let i = 0; i < substeps; i++) {
+    // Move every kinematic target to where it should be at the END of THIS substep. Skipped
+    // entirely when the frame is not split, so the un-capped path does no extra work and issues
+    // no extra Rapier call.
+    if (substeps > 1) retargetKinematics(substepFraction(i, substeps));
+    st.world.timestep = substepDt;
     st.world.step(st.eventQueue);
+    // ⚠️ DRAINED INSIDE THE LOOP. `new R.EventQueue(true)` auto-drains — Rapier CLEARS it at the
+    // start of every `world.step` — so draining once after the loop would silently discard every
+    // substep's contacts but the last. A contact that begins and ends within one frame would then
+    // never be reported at 30 fps while reporting fine at 60. The narrow-phase MANIFOLD is just as
+    // perishable, so it is snapshotted here too — but the fan-out to subscribers is NOT: see
+    // `collectContactEvents` for why routing waits for the pull below.
+    collectContactEvents(st.colliders, st.eventQueue, _drained,
+      (h1, h2, a, b, phase) => captureManifold(st, h1, h2, a, b, phase));
   }
 
   // ── Pull dynamic bodies (Rapier → ECS) — only when a step ran (dt>0), so a paused sim
@@ -933,20 +1049,39 @@ export function physics3DSystem(world: World): void {
     rec.lastX = t.x; rec.lastY = t.y; rec.lastZ = t.z;   // teleport-detection baseline (world/phys units)
   });
 
-  // ── Drain contact + sensor events → journal, Physics3DEvents manager, OnCollision3D. On a
-  //    solid contact BEGIN, also read the manifold for a rich `contact` event (point/normal/
-  //    impact speed) — the impact detail games need for damage / SFX / effect spawning. ──
-  if (dt > 0) drainContactEvents(world, st.colliders, st.eventQueue, physics3DEvents, fireOnCollision,
-    (h1, h2, a, b, phase) => emitContactDetail(st, world, cfg.upm, h1, h2, a, b, phase));
+  // ── Contact + sensor events → journal, Physics3DEvents manager, OnCollision3D. The Rapier
+  //    queue was DRAINED PER SUBSTEP above (it is cleared by each `world.step`); the fan-out
+  //    happens HERE, after the pull, so a subscriber reads the pose and velocity the frame
+  //    actually ends with rather than the one it started with. On a solid contact BEGIN the
+  //    snapshotted manifold becomes a rich `contact` event (point/normal/impact speed) — the
+  //    impact detail games need for damage / SFX / effect spawning. ──
+  if (_drained.length) {
+    routeContactEvents(world, _drained, physics3DEvents, fireOnCollision,
+      (p) => emitContactDetail(world, cfg.upm, p));
+    _drained.length = 0;
+  }
 }
 
-/** On a solid contact BEGIN, read the Rapier manifold (world-space point + normal) + compute the
- *  relative approach speed along the normal, then fan a `contact` event to the journal + bus.
- *  Sensors carry no solver contact, so they're skipped. Fires once per contact begin. */
-function emitContactDetail(st: PhysicsWorldState3D, world: World, upm: number, h1: number, h2: number, a: ColliderInfo, b: ColliderInfo, phase: 'enter' | 'exit'): void {
-  if (phase !== 'enter' || a.isSensor || b.isSensor) return;
+/** Snapshot of the Rapier narrow-phase manifold for one contact BEGIN, in physics units. Taken at
+ *  drain time because the manifold is only valid until the next `world.step`. */
+interface ManifoldHit { px: number; py: number; pz: number; nx: number; ny: number; nz: number }
+
+/** Per-frame scratch for the drained pairs. Module-level (not per-world state) because its whole
+ *  lifetime is inside one `physics3DSystem` call. Two worlds are safe (the calls are sequential and
+ *  this function never awaits); RE-ENTRANCY is the standing bet, not an accident —
+ *  `routeContactEvents` runs game code, and a synchronous re-entry into this system would
+ *  `.length = 0` the array the outer `for…of` is walking and silently drop the rest. Nothing can
+ *  reach it today (the system is reachable only from the pipeline), and the kinematic retarget
+ *  scratch beside it makes the same bet with MORE at stake. Revisit both together if a game action
+ *  ever gains the ability to force a synchronous step. */
+const _drained: DrainedPair<ManifoldHit>[] = [];
+
+/** Read the contact manifold for a solid contact BEGIN. Sensors carry no solver contact, and an
+ *  `exit` has no manifold left to read, so both return null and skip the `@contact` detail. */
+function captureManifold(st: PhysicsWorldState3D, h1: number, h2: number, a: ColliderInfo, b: ColliderInfo, phase: 'enter' | 'exit'): ManifoldHit | null {
+  if (phase !== 'enter' || a.isSensor || b.isSensor) return null;
   const c1 = st.world.getCollider(h1), c2 = st.world.getCollider(h2);
-  if (!c1 || !c2) return;
+  if (!c1 || !c2) return null;
   let px = 0, py = 0, pz = 0, nx = 0, ny = 1, nz = 0, has = false;
   st.world.contactPair(c1, c2, (manifold) => {
     const nrm = manifold.normal(); nx = nrm.x; ny = nrm.y; nz = nrm.z;
@@ -954,16 +1089,25 @@ function emitContactDetail(st: PhysicsWorldState3D, world: World, upm: number, h
     else { const p = c1.translation(); px = p.x; py = p.y; pz = p.z; }  // fallback: collider center
     has = true;
   });
-  if (!has) return;
-  const point = vecPhysToEcs(px, py, pz, upm);   // physics meters → world units
+  return has ? { px, py, pz, nx, ny, nz } : null;
+}
+
+/** Fan the rich `contact` event for a solid contact BEGIN: the manifold point/normal snapshotted
+ *  at drain time, plus the relative approach speed along that normal read from the POST-step ECS
+ *  velocities. Pairs with no manifold (sensors, exits, a contact already separated) are skipped. */
+function emitContactDetail(world: World, upm: number, pair: DrainedPair<ManifoldHit>): void {
+  const m = pair.manifold;
+  if (!m) return;
+  const { a, b } = pair;
+  const point = vecPhysToEcs(m.px, m.py, m.pz, upm);   // physics meters → world units
   const va = a.entity.has(RigidBody3D) ? (a.entity.get(RigidBody3D) as RbData3) : null;
   const vb = b.entity.has(RigidBody3D) ? (b.entity.get(RigidBody3D) as RbData3) : null;
   // relative approach velocity along the (unit) normal — world units/s
   const rvx = (vb ? vb.vx : 0) - (va ? va.vx : 0);
   const rvy = (vb ? vb.vy : 0) - (va ? va.vy : 0);
   const rvz = (vb ? vb.vz : 0) - (va ? va.vz : 0);
-  const speed = Math.abs(rvx * nx + rvy * ny + rvz * nz);
-  const detail = { point: [point.x, point.y, point.z], normal: [nx, ny, nz], speed };
+  const speed = Math.abs(rvx * m.nx + rvy * m.ny + rvz * m.nz);
+  const detail = { point: [point.x, point.y, point.z], normal: [m.nx, m.ny, m.nz], speed };
   // @contact is Tier-2 (watch-gated): skip the ref resolution + payload build entirely unless a
   // capture is open (the default is OFF). The always-on @collision path records these same entities'
   // names in the side-table, so resolvability isn't lost. GUID-addressed (Percept V4) so contacts

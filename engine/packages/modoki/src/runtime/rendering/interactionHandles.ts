@@ -84,6 +84,10 @@ export function registerHandleProvider(fn: HandleProvider): () => void {
  *  every `modoki_handles` poll. */
 const warnedDuplicates = new Set<string>();
 
+/** Providers already reported as throwing, so the error fires once per provider rather than on
+ *  every `modoki_handles` poll. */
+const warnedThrowers = new WeakSet<HandleProvider>();
+
 /** Collect handles from every registered provider, optionally filtered. A provider
  *  that throws is skipped (one bad editor can't break the whole report).
  *
@@ -98,7 +102,17 @@ export function collectHandles(filter?: HandleFilter): InteractionHandle[] {
   const seen = new Set<string>();
   for (const p of providers) {
     let handles: InteractionHandle[];
-    try { handles = p(); } catch { continue; } // skip a failing editor
+    // Skip a failing editor — but SAY SO. A swallowed throw here is indistinguishable from
+    // "that editor has nothing to offer right now", which is the answer `modoki_handles` gives
+    // for a perfectly healthy idle panel: a provider broken by an edit reads as an empty,
+    // plausible report. Once per provider, so a per-frame poll can't flood the console.
+    try { handles = p(); } catch (err) {
+      if (!warnedThrowers.has(p)) {
+        warnedThrowers.add(p);
+        console.error('[interactionHandles] a handle provider threw — its handles are MISSING from this report, not absent:', err);
+      }
+      continue;
+    }
     for (const h of handles) {
       if (filter?.editor && h.editor !== filter.editor) continue;
       if (filter?.kind && h.kind !== filter.kind) continue;
@@ -118,4 +132,40 @@ export function collectHandles(filter?: HandleFilter): InteractionHandle[] {
  *  if no live handle currently has that id. */
 export function resolveHandle(id: string): InteractionHandle | null {
   return collectHandles({ ids: [id] })[0] ?? null;
+}
+
+/** Pull a handle that lands a SUB-PIXEL outside its owner back inside it.
+ *
+ *  A canvas editor sizes its `<canvas>` with a ROUNDED pixel count (`Math.round(imgH * scale)`)
+ *  but computes handle positions from the UNROUNDED product. For a handle on the image's far
+ *  edge those disagree by up to half a pixel, so the handle is published just outside its owner's
+ *  box — and Enact, correctly, refuses to drag a handle that is not inside the thing that owns it.
+ *
+ *  Measured on `games/space-invader`'s `catvader.png` (bug `XVkE46RE8ZQMm3cOwC8q`, QA-ASSET-0025):
+ *  a 1008x392 sheet at fitScale 0.7123 gave `canvasH = round(279.222) = 279` while the `se`/`s`/`sw`
+ *  handles of every full-height slice published at `rect.top + 279.222`. All three came back
+ *  `onScreen:false`, `drag_handle` refused them, and `allowOccluded:true` did not help — so the
+ *  bottom corners of those slices were simply unreachable to an agent. Whether they are reachable
+ *  was a coin flip on the fractional part of `imgH * scale`, which is a property of the sheet.
+ *
+ *  ⚠️ **`tolerance` is the point, not a detail.** Clamping without one would drag ANY out-of-view
+ *  handle to the nearest edge and report success — turning an honest refusal ("scroll it into
+ *  view first") into a gesture at the wrong place. Only a rounding-sized overshoot is corrected;
+ *  anything further out stays outside and stays refused. The inset keeps the clamped point on the
+ *  last addressable pixel rather than exactly on the boundary, where `elementFromPoint` would
+ *  return the neighbour.
+ */
+export function clampHandleToOwner(
+  x: number,
+  y: number,
+  box: { left: number; top: number; width: number; height: number },
+  tolerance = 1,
+): { x: number; y: number } {
+  const axis = (v: number, min: number, size: number): number => {
+    const max = min + size - 0.5;
+    if (v < min) return v >= min - tolerance ? min : v;
+    if (v > max) return v <= max + tolerance ? max : v;
+    return v;
+  };
+  return { x: axis(x, box.left, box.width), y: axis(y, box.top, box.height) };
 }

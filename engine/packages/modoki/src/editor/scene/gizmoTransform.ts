@@ -12,6 +12,7 @@
  * `_svP*` temporaries.
  */
 import * as THREE from 'three';
+import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 
 /** A transform expressed as translation/rotation(Euler XYZ)/scale, matching the `Transform` trait. */
 export interface TransformTRS {
@@ -63,11 +64,119 @@ export function worldToLocalTransform(
     _childWorld.premultiply(_parentInv);
   }
 
-  _childWorld.decompose(_outPos, _outQuat, _outScale);
+  decomposeTrs(_childWorld, _outPos, _outQuat, _outScale); // singular-safe — see #258
   _outEuler.setFromQuaternion(_outQuat);
   return {
     x: _outPos.x, y: _outPos.y, z: _outPos.z,
     rx: _outEuler.x, ry: _outEuler.y, rz: _outEuler.z,
     sx: _outScale.x, sy: _outScale.y, sz: _outScale.z,
+  };
+}
+
+/** Signs of a scale triple at drag start — 0 for an axis that started at 0. */
+export interface ScaleSigns { x: number; y: number; z: number }
+
+/** Drag the scale gizmo far enough and the pointer crosses the pivot; three.js reads that as a
+ *  MIRROR and takes the scale negative (`TransformControls.js`: `if (pointEnd.dot(pointStart) < 0)
+ *  d *= -1`, and the per-axis branch's component divide does the same). The 2D gizmo already ruled
+ *  against that — `Gizmo2D`'s F9 clamps each ratio to >= 0 so crossing the pivot stops at 0 instead
+ *  of silently mirroring the entity — and 2D and 3D should not disagree about what the same gesture
+ *  means. So: an axis whose sign flipped during the drag lands on 0.
+ *
+ *  The signs are read from the OBJECT's scale, not from the decomposed local TRS, and that matters:
+ *  `Matrix4.decompose()` cannot represent a reflection in a TRS triple, so it parks the whole
+ *  negative determinant on X. A uniform mirror therefore decomposes to `(-s, +s, +s)` — which is
+ *  how testboard 1Rg36fFvZBdeNmUrtjs7 came to read as "the CENTER handle produces a NON-uniform,
+ *  sign-flipped scale on one axis". It is one mirror, not a per-axis asymmetry; measured
+ *  2026-08-19, and it reproduces from an ordinary camera, not the near-degenerate one that report
+ *  suspected.
+ *
+ *  An entity AUTHORED with a negative scale keeps it: only a sign CHANGE within the drag is caught.
+ *
+ *  ⚠️ **An axis that STARTED at exactly 0 is left alone** (`startSign` component 0), and that
+ *  exemption is load-bearing rather than tidy-up. `Math.sign(0) === 0`, so without it EVERY
+ *  non-zero drag value differs from the start sign and the axis is clamped straight back to 0 on
+ *  every tick — the entity looks like it grows during the drag (TransformControls mutates the
+ *  object directly) and snaps back to invisible on mouse-up. There is no pivot to cross from 0:
+ *  a flip needs two non-zero signs, and 0 has no side. Found in the #258 close-out review: the
+ *  trap always existed for ROOT entities (their world scale is their local scale), and #258 made
+ *  it reachable for CHILDREN too by fixing the world composition that used to report a collapsed
+ *  child's scale as 1. Scaling to zero is a supported authoring idiom for "hidden", so being
+ *  unable to drag back out of it is exactly the workflow that must keep working.
+ */
+export function clampScaleCrossingPivot(local: TransformTRS, objScale: { x: number; y: number; z: number }, startSign: ScaleSigns | null): TransformTRS {
+  if (!startSign) return local;
+  return {
+    ...local,
+    sx: startSign.x !== 0 && Math.sign(objScale.x) !== startSign.x ? 0 : local.sx,
+    sy: startSign.y !== 0 && Math.sign(objScale.y) !== startSign.y ? 0 : local.sy,
+    sz: startSign.z !== 0 && Math.sign(objScale.z) !== startSign.z ? 0 : local.sz,
+  };
+}
+
+/** Did this frame of a scale drag cross the pivot — i.e. has any axis changed sign since the press?
+ *
+ *  The MULTI-SELECT path needs the question rather than the clamp. There the drag scales every
+ *  member's OFFSET from the group pivot as well as its scale, so a mirrored frame does not merely
+ *  invert a scale: it throws the members through the pivot and out the other side. Measured
+ *  2026-08-19 on games/anim-bug — one 200x150 px drag past the pivot on a two-entity selection left
+ *  `Sun` at `sx:-600, sy:3229, sz:2291` and moved `Sphere` to `(953, 0, -15998)`. Clamping the
+ *  scale alone would leave those positions. The caller drops the whole frame instead, which stops
+ *  the drag at its last valid state — the same "crossing the pivot stops, it does not mirror" rule
+ *  `Gizmo2D`'s F9 sets for 2D and `clampScaleCrossingPivot` sets for a single entity. */
+export function scaleCrossedPivot(objScale: { x: number; y: number; z: number }, startSign: ScaleSigns | null): boolean {
+  if (!startSign) return false;
+  // Same zero exemption as clampScaleCrossingPivot — see its doc comment. An axis that started at
+  // 0 has no side to cross, and treating `Math.sign(0)` as a real sign would report EVERY drag as
+  // a pivot crossing. The group path currently resets its proxy to (1,1,1) before each attach so
+  // it cannot hit this today; the two helpers must still agree, or a later change that stops
+  // resetting the proxy reintroduces the bug in the half nobody looked at.
+  return (startSign.x !== 0 && Math.sign(objScale.x) !== startSign.x)
+    || (startSign.y !== 0 && Math.sign(objScale.y) !== startSign.y)
+    || (startSign.z !== 0 && Math.sign(objScale.z) !== startSign.z);
+}
+
+/** Derive an entity's new LOCAL scale from the RATIO the gizmo applied to its proxy, rather than
+ *  from the proxy's absolute scale.
+ *
+ *  three's `TransformControls` scales by `object.scale = _scaleStart × factor`, where `_scaleStart`
+ *  is whatever the attached object's scale happened to be at pointer-down. For a MESH entity that
+ *  object IS the entity's rendered Object3D — `scene3DSync` writes its scale every frame — so
+ *  reading the result back absolutely (through {@link worldToLocalTransform}) is correct, and was
+ *  the only path this code had.
+ *
+ *  A mesh-LESS entity has no such object. The gizmo attaches to an editor ICON (a light
+ *  octahedron, a particle cone, an environment sphere, an empty marker), and nothing keeps that
+ *  icon's scale in sync with the entity — so the absolute read-back is a number the entity never
+ *  held, and every drag compounds the previous one. Measured on `games/anim-bug`'s `Sun`
+ *  (bug `euf2YDw0bXcPZ6CziuSU`): scale 1 → 8959.28 → 87721.01 → 858883.50 across three identical
+ *  drags, each drag's undo `before` recording the PREVIOUS drag's result, so Cmd+Z restored a
+ *  value the entity had never had and the authored scale was unrecoverable short of reloading the
+ *  scene.
+ *
+ *  The RATIO is the part that is true whatever the proxy's basis is: `now / start` is the factor
+ *  the user dragged. It is also parent-invariant — a parent's scale does not change during the
+ *  drag, so the LOCAL ratio and the WORLD ratio are the same number — which is why this can be
+ *  applied to the entity's own local `before` scale without re-deriving anything about the parent.
+ *
+ *  An axis whose proxy started at exactly 0 (or a non-finite value) has no ratio to take. That
+ *  axis falls back to the decomposed absolute value — i.e. to precisely the behaviour the mesh
+ *  path always had — rather than silently pinning it to 0 or 1.
+ */
+export function scaleFromGizmoRatio(
+  before: { sx: number; sy: number; sz: number },
+  proxyStart: { x: number; y: number; z: number },
+  proxyNow: { x: number; y: number; z: number },
+  fallback: { sx: number; sy: number; sz: number },
+): { sx: number; sy: number; sz: number } {
+  const axis = (b: number, start: number, now: number, fb: number): number => {
+    if (!Number.isFinite(start) || start === 0 || !Number.isFinite(now)) return fb;
+    const next = b * (now / start);
+    return Number.isFinite(next) ? next : fb;
+  };
+  return {
+    sx: axis(before.sx, proxyStart.x, proxyNow.x, fallback.sx),
+    sy: axis(before.sy, proxyStart.y, proxyNow.y, fallback.sy),
+    sz: axis(before.sz, proxyStart.z, proxyNow.z, fallback.sz),
   };
 }

@@ -62,7 +62,10 @@ for (const proj of process.argv.slice(2)) {
   if (!files.length) { console.log(`${proj}: no prefabs`); continue; }
 
   for (const abs of files) {
-    const rel = path.relative(ROOT, abs);
+    // POSIX-normalized — see check-scene-churn.mjs: git tree paths are forward-slash on every
+    // OS, so an un-normalized rel makes every `git show` throw on Windows and every committed
+    // prefab report as "NEW FILE (untracked)".
+    const rel = path.relative(ROOT, abs).split(path.sep).join('/');
     totalPrefabs++;
     let old;
     try { old = execSync(`git show HEAD:"${rel}"`, { cwd: ROOT, encoding: 'utf8' }); }

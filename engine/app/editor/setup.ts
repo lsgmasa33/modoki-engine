@@ -19,6 +19,7 @@ import projectConfig from 'virtual:modoki-project-config';
 import {
   CAPACITOR_ORIENTATIONS, STATUS_BAR_STYLES, KEYBOARD_RESIZE_MODES, WEB_DEPLOY_MODES, WEB_SIZE_MODES,
   PLAYABLE_NETWORKS, IOS_CONTENT_MODES, ANDROID_SCHEMES, GPU_BACKENDS, QUALITY_TIERS, TONE_MAPPINGS,
+  TEXTURE_TIER_VARIANTS_MODES,
 } from '../../project-config';
 import { loadProjectGames } from '../projectGames';
 import { registerAll } from '../ecs/register';
@@ -417,6 +418,8 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
                 { key: 'app.appId', label: 'Bundle ID', type: 'text' },
                 { key: 'app.appName', label: 'App name', type: 'text' },
                 { key: 'app.iconSource', label: 'App icon (source PNG)', type: 'path', pathMode: 'file', placeholder: 'empty = bundled Modoki icon', help: 'square, ≥1024px; all sizes generated on build' },
+                { key: 'app.version', label: 'Version', type: 'text', placeholder: '1.0', help: 'marketing version, what players see in the store listing — synced into Android versionName + iOS MARKETING_VERSION on open and before every build' },
+                { key: 'app.buildNumber', label: 'Build number', type: 'number', placeholder: '1', help: 'BUMP BEFORE EVERY STORE UPLOAD. Both stores refuse a build number they have already seen and do it SILENTLY — Play just reports "this release is empty". Synced into Android versionCode + iOS CURRENT_PROJECT_VERSION on open and before every build (not on save); never lowered — a lower value is reported in the log and ignored.' },
               ],
             },
             {
@@ -445,7 +448,12 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
             {
               title: 'Developer',
               fields: [
-                { key: 'build.debugBuild', label: 'Debug build', type: 'checkbox', help: 'Ships the event journal (emit/modoki_journal), the in-game debug menu (F12 / 3-finger tap: stats, world, journal, device IP), and the debug bridge that device_* AI tools connect to — INCLUDING device_eval (arbitrary JS on the device). Turn ON for a QA/playtest/profiling build; leave OFF for release, where all three are tree-shaken out (nothing to connect to, no journal overhead). Always on in the editor/dev. Rebuild to apply.' },
+                { key: 'build.debugBuild', label: 'Debug build', type: 'checkbox', help: 'Ships the event journal (emit/modoki_journal), the in-game debug menu (F12 / 3-finger tap: stats, world, journal, device IP), and the debug bridge that device_* AI tools connect to — INCLUDING device_eval (arbitrary JS on the device). Turn ON for a QA/playtest/profiling build; leave OFF for release, where the debug menu and the bridge are tree-shaken out entirely (nothing to connect to) and the journal stops recording. Always on in the editor/dev. Rebuild to apply.' },
+                { key: 'build.textureTierVariants', label: 'Texture tier variants', type: 'select', options: labeled(TEXTURE_TIER_VARIANTS_MODES, {
+                  auto: 'Auto (emit only when delivered over the wire)',
+                  always: 'Always (also emit for a plain native package)',
+                  never: 'Never (skip even on web)',
+                }), help: 'Per-tier LOD texture variants (Rendering → Quality Tiers) ship every size INSIDE the package — a real install-size cost that only pays off when the device fetches just the one it needs. "Auto" emits for a web build or an OTA publish and skips a plain iOS/Android package build; "Always" is the opt-in for a native project whose textures are big enough that the boot-time/GPU-memory win outweighs the install size; a playable build never emits regardless (already clamped to 512px).' },
               ],
             },
           ],
@@ -586,12 +594,21 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               title: 'Three.js (3D)',
               fields: [
                 { key: 'rendering.three.backend', label: 'GPU backend', type: 'select', options: GPU_BACKENDS.map((v) => ({ value: v, label: v })), help: 'auto = detect, prefer WebGPU' },
-                { key: 'rendering.three.qualityTier', label: 'Quality tier', type: 'select', options: QUALITY_TIERS.map((v) => ({ value: v, label: v })), help: 'auto = measure the device and pick; low clamps the four fields below. Takes effect on the next renderer bring-up — use the debug menu Device tab to preview it live' },
+                // ⚠️ Ten fields across two consumption paths now (docs/rendering.md § "Quality tiers"),
+                // not four, and there are THREE tiers ('mid' authored separately below) — the old text said
+                // "four fields below" from when this dropdown was the only tier surface. ⚠️ Pinning a tier
+                // this project has NOT authored (via "quality-tiers" below) does NOTHING: every tier resolves
+                // to the unclamped default until a config exists for it (resolveTierOverrides falls back to
+                // the default, never invents clamping). The plan (§2.3) wants this dropdown filtered to only
+                // the tiers actually authored, which needs a new schema capability for dynamic (data-dependent)
+                // select options — out of scope for A3; tracked there, not half-built here.
+                { key: 'rendering.three.qualityTier', label: 'Quality tier', type: 'select', options: QUALITY_TIERS.map((v) => ({ value: v, label: v })), help: "auto = measure the device and pick among the tiers this project authored below. Pinning 'mid'/'low' does NOTHING unless that tier has been added under Quality Tiers — an unauthored tier always resolves the unclamped default. Takes effect on the next renderer bring-up — use the debug menu Device tab to preview it live" },
                 { key: 'rendering.three.antialias', label: 'Antialias', type: 'checkbox' },
                 { key: 'rendering.three.shadows', label: 'Shadows', type: 'checkbox' },
                 { key: 'rendering.three.pixelRatioCap', label: 'Pixel-ratio cap', type: 'number', placeholder: '2 (0 = uncapped)' },
                 { key: 'rendering.three.toneMapping', label: 'Tone mapping', type: 'select', options: TONE_MAPPINGS.map((v) => ({ value: v, label: v })) },
                 { key: 'rendering.three.exposure', label: 'Exposure', type: 'number', placeholder: '1' },
+                { key: 'rendering.three.tiers', label: 'Quality Tiers (mid / low)', type: 'quality-tiers', help: 'add a mid/low degradation on top of the default above — seeded from the engine\'s measured behaviour. No tiers authored = one config = the boot probe never runs.' },
               ],
             },
             {

@@ -3,7 +3,7 @@
 
 import type { Trait, TraitRecord, ExtractSchema, TraitValue } from 'koota';
 import { getCurrentWorld, findEntityById, destroyEntity, setStructureCallback } from './world';
-import { getAllTraits, transformName, type TraitMeta } from './traitRegistry';
+import { getAllTraits, getTraitByName, transformName, type TraitMeta } from './traitRegistry';
 import { EntityAttributes } from '../traits/EntityAttributes';
 import { Transient } from '../traits/Transient';
 import { isSimRunning } from '../playState';
@@ -443,7 +443,59 @@ export function getAllEntities(): EntityInfo[] {
 
     entities.push({ id, name: transformName(name), traits: traitNames, parentId, sortOrder, layer, guid, isResource, editorFolder, sourceScene });
   }
-  return entities;
+  return dropParkedEntries(entities);
+}
+
+/**
+ * Remove PARKED scroll-view entries — and their whole subtrees — from the agent-facing entity
+ * list.
+ *
+ * Owner's ruling (2026-08-21): *an entry sitting in the recycle bin must be treated by Percept
+ * and Enact exactly as if it had been destroyed.* It still exists in ECS — that is the point of
+ * pooling — but it must not be listable, addressable or aimable while parked.
+ *
+ * ⚠️ This is deliberately NOT the same as `isVisible:false`. A hidden entity stays perfectly
+ * addressable today and must keep doing so: hiding something is not a claim that it does not
+ * exist. Only a pooled entry that the data no longer covers reads as destroyed.
+ *
+ * Done HERE rather than in each consumer because `getAllEntities` is the single choke point the
+ * whole agent surface runs through — `get_scene_state`, entity aiming (`entityResolve`),
+ * `diagnose`, layout bounds and live mutate all call it. One rule, one implementation, and no
+ * way for the surfaces to drift apart on what "parked" means. The editor's own Hierarchy does
+ * not read this function, so a pooled entry stays visible to a human debugging the scene.
+ *
+ * The trait is resolved through the REGISTRY, never imported: this is L0 core and `UIEntry` is
+ * an L1 trait, which the layer zone forbids.
+ */
+function dropParkedEntries(entities: EntityInfo[]): EntityInfo[] {
+  const entryMeta = getTraitByName('UIEntry');
+  if (!entryMeta) return entities;
+
+  const parked = new Set<number>();
+  for (const e of entities) {
+    if (!e.traits.includes('UIEntry')) continue;
+    // `readTraitDataFull`, NOT `readTraitData`: the latter returns only keys declared in the
+    // registry's curated `fields` list, so whether this rule works at all would depend on
+    // registration bookkeeping — and `UIEntry`'s fields are all registered `hidden`, which is
+    // exactly the kind of entry a later tidy-up removes. `live` is engine state, so read the
+    // live trait.
+    const data = readTraitDataFull(e.id, entryMeta);
+    if (data && data.live === false) parked.add(e.id);
+  }
+  if (parked.size === 0) return entities;
+
+  // A parked entry's whole SUBTREE goes with it — the members are what an aim would actually
+  // land on, so dropping only the root would leave the interesting half addressable.
+  const byId = new Map(entities.map((e) => [e.id, e]));
+  const hidden = (id: number): boolean => {
+    let cur = id;
+    for (let guard = 0; cur && guard < 64; guard++) {
+      if (parked.has(cur)) return true;
+      cur = byId.get(cur)?.parentId ?? 0;
+    }
+    return false;
+  };
+  return entities.filter((e) => !hidden(e.id));
 }
 
 /** Build a tree from flat entity list. Sorted by sortOrder. */

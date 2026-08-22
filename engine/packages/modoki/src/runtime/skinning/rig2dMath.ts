@@ -74,7 +74,15 @@ export function removeScale2D(m: Mat2D): Mat2D {
 }
 
 /** Apply an affine to a point, writing into `out` (packed [x,y]) at offset `o`. */
-export function apply2D(m: Mat2D, x: number, y: number, out: Float32Array, o: number): void {
+/** `out` is deliberately `Float32Array | number[]`, and which one the CALLER picks is a
+ *  correctness decision, not a style one. `Mat2D` is float64 throughout, so writing the result
+ *  into a `Float32Array` TRUNCATES it — right for a per-frame deform buffer the GPU reads,
+ *  WRONG for a value that goes back into the authored rig JSON. `reparentBone` and the Skin
+ *  canvas's add/drag handlers all write their result straight to a bone's local x/y: with a
+ *  Float32Array, reparenting a bone at x=0.1 under an IDENTITY parent — an operation whose
+ *  whole contract is "preserve the world position" — rewrote it as 0.10000000149011612 on
+ *  disk. Use a plain array when the number is authored data. */
+export function apply2D(m: Mat2D, x: number, y: number, out: Float32Array | number[], o: number): void {
   out[o] = m.a * x + m.c * y + m.e;
   out[o + 1] = m.b * x + m.d * y + m.f;
 }

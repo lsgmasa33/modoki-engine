@@ -22,6 +22,8 @@ const ACT = { id: 'UIAction' };
 const ANC = { id: 'UIAnchor' };
 const CV2 = { id: 'Canvas2D' };
 const VID = { id: 'VideoPlayer' };
+const TGL = { id: 'UIToggle' };
+const TCH = { id: 'TouchControl' };
 
 const UI_DEFAULTS = {
   width: 100, height: 40, widthUnit: 'px', heightUnit: 'px',
@@ -51,6 +53,8 @@ interface Spec {
    *  modelled: `hasVideo` is presence-only, so a spec that carried values would imply
    *  buildTree reads them. */
   video?: true;
+  toggle?: { value: boolean };
+  touch?: { action: string; showOn: string; pressedOpacity: number };
 }
 
 /** A koota-like world whose entity set is read fresh from `getSpecs()` on every
@@ -68,6 +72,8 @@ function makeWorld(getSpecs: () => Spec[]) {
           if (s.binding) data.set(BIND, s.binding);
           if (s.canvas2D) data.set(CV2, s.canvas2D);
           if (s.video) data.set(VID, {});
+          if (s.toggle) data.set(TGL, s.toggle);
+          if (s.touch) data.set(TCH, s.touch);
           const entity = { id: () => s.id, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t) };
           cb([data.get(UIEL)], entity);
         }
@@ -89,6 +95,8 @@ function mockDeps() {
       { name: 'UIAnchor', trait: ANC, category: 'component', fields: {} },
       { name: 'Canvas2D', trait: CV2, category: 'component', fields: {} },
       { name: 'VideoPlayer', trait: VID, category: 'component', fields: {} },
+      { name: 'UIToggle', trait: TGL, category: 'component', fields: {} },
+      { name: 'TouchControl', trait: TCH, category: 'component', fields: {} },
     ],
   }));
 }
@@ -221,6 +229,11 @@ describe('uiTreeStore node reuse', () => {
     const nested = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'entityId']);
     const scalarKeys = Object.keys(base).filter((k) => !nested.has(k));
     expect(scalarKeys.length).toBeGreaterThan(40); // guard: we really are iterating the full shape
+    // ⚠️ This fixture has no UIEntry, so `isEntry` is only in `base` at all if the builder writes
+    // it UNCONDITIONALLY. A field written only when its trait is present can be missing from the
+    // first node of the session, and `_scalarKeys` is derived once — so it would be excluded from
+    // every comparison thereafter, silently, and this exhaustiveness loop could not see it either.
+    expect(scalarKeys).toContain('isEntry');
     for (const k of scalarKeys) {
       const m = cloneOf(base);
       const cur = (m as any)[k];
@@ -281,5 +294,143 @@ describe('uiTreeStore hasVideo', () => {
     const removed = useUITreeStore.getState().tree[0];
     expect(removed).not.toBe(added);
     expect(removed.hasVideo).toBe(false);
+  });
+});
+
+/** `toggle` — the reconciliation guard for the on/off control (#280). `toggle` sits in
+ *  `_nestedKeys`, so `nodesEqual` must compare it structurally rather than by reference;
+ *  without this, flipping ONLY `UIToggle.value` (the common case — the game writes it via
+ *  a binding every click) would keep the node's old object reference and the switch would
+ *  never visibly move. */
+describe('uiTreeStore toggle', () => {
+  it('two nodes differing ONLY in toggle.value are NOT nodesEqual', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, toggle: { value: false } }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await load();
+    const world = makeWorld(() => specs);
+
+    uiTreeProjection(world);
+    const before = useUITreeStore.getState().tree[0];
+    expect(before.toggle?.value).toBe(false);
+
+    specs[0].toggle = { value: true };
+    markUIDirty(); uiTreeProjection(world);
+    const after = useUITreeStore.getState().tree[0];
+    expect(after).not.toBe(before);          // a reused ref here = a switch that never animates
+    expect(after.toggle?.value).toBe(true);
+  });
+});
+
+/** `fontFamily` — the projection is where a font-asset GUID becomes a CSS family (#231), so
+ *  this is the WIRING test for it: a node whose authored `fontFamily` is a GUID must come out
+ *  of `buildTree` carrying the resolved family, because `UINode` writes that value straight
+ *  into `style.fontFamily` and would otherwise put a GUID there (text in the browser default,
+ *  silently — nothing errors when a `font-family` names no font).
+ *
+ *  Asserted through a real projection rather than by spying on `resolveUIFontFamily`: a spy
+ *  passes whether or not the result reaches the node. */
+describe('uiTreeStore fontFamily resolution', () => {
+  const FONT_GUID = '30000000-0000-4000-8000-000000000001';
+
+  async function loadWithFontProvider() {
+    const mod = await load();
+    const { domFontProvider } = await import('../../src/runtime/core/domFontProvider');
+    domFontProvider.provide({ familyForGuid: (g) => (g === FONT_GUID ? 'Varela Round' : undefined) });
+    return mod;
+  }
+
+  it('resolves an authored GUID to the CSS family on the node', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, ui: { fontFamily: FONT_GUID } }];
+    const { uiTreeProjection, useUITreeStore } = await loadWithFontProvider();
+
+    uiTreeProjection(makeWorld(() => specs));
+    expect(useUITreeStore.getState().tree[0].fontFamily).toBe('"Varela Round"');
+  });
+
+  it('falls back to systemFont, and the asset wins when both are authored', async () => {
+    const specs: Spec[] = [
+      { id: 1, parentId: 0, ui: { fontFamily: '', systemFont: 'system-ui' } },
+      { id: 2, parentId: 0, ui: { fontFamily: FONT_GUID, systemFont: 'system-ui' } },
+    ];
+    const { uiTreeProjection, useUITreeStore } = await loadWithFontProvider();
+
+    uiTreeProjection(makeWorld(() => specs));
+    const byId = index(useUITreeStore.getState().tree);
+    expect(byId.get(1).fontFamily).toBe('system-ui');
+    expect(byId.get(2).fontFamily).toBe('"Varela Round"');
+  });
+
+  /** Perturbation, per CLAUDE.md's authoring rule: changing the authored value must change
+   *  the node. A value that coincides with the default cannot tell "read" from "ignored". */
+  it('a changed font ref produces a NEW node with the new family', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, ui: { fontFamily: '', systemFont: 'system-ui' } }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await loadWithFontProvider();
+    const world = makeWorld(() => specs);
+
+    uiTreeProjection(world);
+    const before = useUITreeStore.getState().tree[0];
+
+    specs[0].ui = { fontFamily: FONT_GUID, systemFont: 'system-ui' };
+    markUIDirty(); uiTreeProjection(world);
+    const after = useUITreeStore.getState().tree[0];
+    expect(after).not.toBe(before);
+    expect(after.fontFamily).toBe('"Varela Round"');
+  });
+});
+
+/** `touch` — the reconciliation guard for on-screen controls (#297). Same shape as `toggle`
+ *  above and the same reason: `touch` sits in `_nestedKeys`, so `nodesEqual` must compare it
+ *  STRUCTURALLY. Without that comparison the projection would carry the block correctly and the
+ *  reconciler would still hand back the previous node object, `React.memo(UINode)` would bail,
+ *  and the DOM would keep the OLD `data-modoki-touch` — so re-authoring an arrow from `moveLeft`
+ *  to `moveRight` in the Inspector would leave it walking left, with correct data everywhere and
+ *  a stale attribute in the one place that decides. `showOn` has the same failure with a worse
+ *  face: flipping it to `never` would leave a live control on screen.
+ *
+ *  The exhaustiveness test above cannot cover this — it derives its key list from a fixture node,
+ *  and an OPTIONAL nested block is absent from that node, so the loop skips it silently. */
+describe('uiTreeStore touch', () => {
+  const base = { action: 'moveLeft', showOn: 'touch', pressedOpacity: 0.6 };
+
+  it('two nodes differing ONLY in touch.action are NOT nodesEqual', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, touch: { ...base } }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await load();
+    const world = makeWorld(() => specs);
+
+    uiTreeProjection(world);
+    const before = useUITreeStore.getState().tree[0];
+    expect(before.touch?.action).toBe('moveLeft');
+
+    specs[0].touch = { ...base, action: 'moveRight' };
+    markUIDirty(); uiTreeProjection(world);
+    const after = useUITreeStore.getState().tree[0];
+    expect(after).not.toBe(before);   // a reused ref here = an arrow that still walks the old way
+    expect(after.touch?.action).toBe('moveRight');
+  });
+
+  it('two nodes differing ONLY in touch.showOn are NOT nodesEqual', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, touch: { ...base } }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await load();
+    const world = makeWorld(() => specs);
+
+    uiTreeProjection(world);
+    const before = useUITreeStore.getState().tree[0];
+
+    specs[0].touch = { ...base, showOn: 'never' };
+    markUIDirty(); uiTreeProjection(world);
+    const after = useUITreeStore.getState().tree[0];
+    expect(after).not.toBe(before);   // a reused ref here = a control that refuses to disappear
+    expect(after.touch?.showOn).toBe('never');
+  });
+
+  it('an unchanged touch block still REUSES the node — the comparison must not churn every frame', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, touch: { ...base } }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await load();
+    const world = makeWorld(() => specs);
+
+    uiTreeProjection(world);
+    const before = useUITreeStore.getState().tree[0];
+    specs[0].touch = { ...base };     // a FRESH object with identical values
+    markUIDirty(); uiTreeProjection(world);
+    expect(useUITreeStore.getState().tree[0]).toBe(before);
   });
 });

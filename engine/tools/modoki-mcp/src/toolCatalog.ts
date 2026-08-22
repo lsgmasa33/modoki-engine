@@ -1,6 +1,6 @@
 /** Render the `modoki_*` tool catalog table from the CONTRACT table — the single source of truth.
  *
- *  WHY GENERATED. The catalog is exactly the kind of doc that drifts: 77 rows of per-tool facts
+ *  WHY GENERATED. The catalog is exactly the kind of doc that drifts: one row per tool of facts
  *  (method, route, does-it-mutate, is-it-undoable, what does it need, how is it aimed) that already
  *  live in `contracts.ts` and were previously restated by hand in prose. A restated fact is a fact
  *  that goes stale silently — which is the same failure mode this whole audit chased through the

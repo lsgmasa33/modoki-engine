@@ -20,7 +20,7 @@ it runs identically in the Vite-plugin process, the Electron main backend, and h
 
 `detect(id)` / `resolve(id)` locate a tool without / with throwing. Two kinds:
 
-- **Binary tools** (`toktx`, `msdf-atlas-gen`, `npm`, `xcodebuild`, `cocoapods`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe`) —
+- **Binary tools** (`toktx`, `msdf-atlas-gen`, `npm`, `xcodebuild`, `cocoapods`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe`, `go-ios`) —
   resolved from an **env override** → **extra candidates** (a userData install location) → **PATH**,
   each validated by a `--version` probe. Results are **cached** (the probe spawn is expensive and its
   inputs are fixed at startup).
@@ -65,6 +65,30 @@ it falls through to the next candidate, or to "absent," so the dialog offers the
 instead of silently building on the wrong JDK. The per-dir version probe is cached (a JDK's version is
 stable). This is the single guard against a whole class of "works on my machine" Android failures.
 
+### A Finder-launched app gets a minimal PATH — provisioned Node must be prepended, not just set as an env var
+
+A macOS app launched from Finder (as opposed to a Terminal shell) starts with a **minimal PATH**
+(`/usr/bin:/bin:…`, no Homebrew, no nvm). `gltf-transform-cli`/`gltfpack` are `#!/usr/bin/env node`
+shebang scripts, so both **detecting and running** them needs `node` resolvable on PATH — but the
+editor's provisioning only ever set `MODOKI_NODE`/`MODOKI_NPM_CLI` env vars, never PATH itself, so
+the `--version` probe silently failed even right after a successful install and Build Support kept
+reporting "not found." (Native binaries like `ffmpeg`/`ffprobe` were unaffected — no shebang, no
+Node needed to run them.) Fixed two ways:
+
+1. **`main.ts`'s `ensureNodeProvisioned()` prepends the provisioned Node's bin dir to
+   `process.env.PATH`.** The Vite child (spawned afterward) inherits it, so both detection (main
+   process) and reimport/build (Vite child) resolve `node`. Prepending — not appending — means a
+   shebang always resolves to the editor's own Node, never a stray system one.
+2. **In bundled-only mode** (packaged default, `!systemToolchainAllowed`), `detectBinary` does
+   **not** add the system-PATH candidate for `INSTALLABLE` tools at all — it resolves only from our
+   own env/toolchain install, else reports "not found" (prompting an install). This is what makes
+   the "never fall back to system tool versions" promise real rather than aspirational; the "Use
+   system SDKs" toggle (or a dev checkout) restores the PATH candidate.
+
+Verified on the packaged app launched with a genuinely minimal PATH (no system Node on it):
+`gltf-transform-cli` detects present at its pinned version (readable only by running it through the
+provisioned Node), and the dialog no longer says "not found."
+
 ## Provisioning — `install(id)` / `guide(id)`
 
 `install(id, {toolchainDir, onLog})` provisions an `INSTALLABLE` tool into the per-user toolchain dir
@@ -81,6 +105,7 @@ tool that must be installed by hand. The dialog shows an **Install** button for 
 | **`xcodebuild` (Xcode)** | **Guided only** — multi-GB, App-Store-gated, macOS-only. `guide('xcodebuild')` gives the App Store link + `xcode-select`/license/Apple-ID steps. | — |
 | **`cocoapods`** | **Auto-installed on macOS** (`isInstallable` returns true on `darwin`, guided elsewhere) — `installCocoapods()` provisions an **isolated portable Ruby** into `<toolchainDir>/ruby` (`rubyProvision.ts`), then `gem install cocoapods` into an isolated `GEM_HOME` (`<toolchainDir>/cocoapods-gems`) — no Homebrew, no system Ruby. Native gem extensions compile against Xcode's clang (already required for iOS). `guide('cocoapods')` points at the one-click Install button. Not a `preflight('ios')` blocker — most iOS games are SPM-only and never need it. | `1.17.0` |
 | **`webdriveragent`** | **Auto-installed on macOS** — `wdaProvision.ts` `ensureWda()` fetches the pinned Appium WDA source via `npm pack`, re-namespaces its bundle ids, and `xcodebuild build-for-testing`s it into `<toolchainDir>/wda`. Enables **trusted iOS device input** (#32 Phase 2); absent, `device_*` input falls back to synthetic DOM events and says so. Never a build blocker. See § "WebDriverAgent — the one BUILT tool" below. | `appium-webdriveragent@16.1.1` |
+| **`go-ios`** | **Installable on macOS, but NOT auto-installed** (#217) — `goIosProvision.ts` `ensureGoIos()` downloads the pinned GitHub release zip (a single universal x86_64+arm64 Mach-O, not the npm package, which bundles all 5 platforms' binaries: 16.8 MB vs 60 MB down), **sha256**-verified, extracted to `<toolchainDir>/go-ios/<version>/ios`. Deliberately kept out of `AUTO_INSTALL` — it's only useful for deploying to an iOS ≤16 device (a devicectl-reachable iOS 17+ device never needs it), so most editors would pay its size for nothing; `/api/build` provisions it itself, on demand, the moment a build actually targets such a device, and a provisioning failure there falls back to the Xcode ⌘R handoff rather than failing the build. | `1.3.2` |
 
 ⚠️ **`tar` does NOT mean bsdtar on Windows — never spawn a bare `tar`.** Every provisioner above
 extracts through one shared `extractArchive()`, and that one code path only works because **bsdtar**
@@ -192,7 +217,7 @@ to fix it:
 
 | Tool | Gated when toggle is OFF? |
 |---|---|
-| `java`, `android-sdk`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe` | **Yes** — installable into the toolchain dir |
+| `java`, `android-sdk`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe`, `go-ios` | **Yes** — installable into the toolchain dir |
 | `toktx`, `msdf-atlas-gen` | Yes, **when bundled** (their `MODOKI_*` env var is set by the packaged host); a dev checkout has no bundle, so PATH stays usable |
 | `npm` | Yes, **when the editor provisions Node** (packaged, or `MODOKI_PROVISION_NODE=1`); a plain dev checkout keeps its PATH npm |
 | `xcodebuild` | **No** — Apple-supplied and multi-GB; it can never be bundled, so it always resolves from the system |
@@ -213,6 +238,17 @@ to fix it:
 **Cross-process cache note:** an `install()` runs in the Vite-plugin process and resets *its* cache, but
 `GET /api/toolchain` is served by the Electron main process, whose cache is separate. `toolchainStatus()`
 therefore re-probes on every call, so the dialog's post-install re-check reflects the just-installed tool.
+
+**Testing gotcha: CDP `Page.reload` on a packaged app corrupts the userData Vite dep-cache** — it
+reproduces the same crash class as #21/#110 above (see [build.md](build.md) "Two packaged-boot
+flakes"). To test the packaged app over CDP, always launch **fresh** (no reload):
+```
+MODOKI_NO_AUTOUPDATE=1 MODOKI_TOOLCHAIN_DIR=<tmp> \
+  "…/Modoki Editor.app/Contents/MacOS/Modoki Editor" \
+  --user-data-dir=<tmp> --remote-debugging-port=<port>
+```
+then attach a CDP client (Node's global `WebSocket` works with no extra dependency). To force a
+clean reinstall of one provisioned tool: `rm -rf "~/Library/Application Support/Modoki Editor/toolchain/<sub>"`.
 
 ## How a build consumes the toolchain
 

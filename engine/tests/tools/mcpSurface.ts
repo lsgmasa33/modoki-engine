@@ -126,7 +126,25 @@ export function loadSurface(responder?: Responder): Surface {
     descriptionOf: (name) => need(name).description,
     call: async (name, args = {}) => {
       const entry = need(name);
-      const parsed = z.object(entry.shape).strict().safeParse(args);
+      // Parse against the schema the tool was REGISTERED with, not a rebuilt one.
+      //
+      // This used to be `z.object(entry.shape).strict()` — same shape, same strictness, and a
+      // DIFFERENT schema: `registerAll.ts` passes `.strict(<message naming the tool's real
+      // params>)`, which is the entire §5 payload of §1 ("a refusal that lists the options is what
+      // turns a dead end into the caller's next move"). Rebuilding it dropped that message, so
+      // every test that provoked an unknown key saw zod's default `Unrecognized key(s) in object`
+      // and the parameter list was asserted NOWHERE — on the one surface where the SDK does deliver
+      // it (verified: zod sets it on the `unrecognized_keys` issue, `normalizeObjectSchema` passes
+      // a v3 ZodObject through untouched, and `getParseErrorMessage` returns `i.message` verbatim
+      // for a path-less issue).
+      //
+      // It was also a fidelity bug in exactly the way this file's own header warns about: a harness
+      // that validates with a schema the surface does not use reaches states the surface cannot.
+      // The device harness never had it — `parseDeviceArgs` and its transport share one
+      // `strictSchema()` — which is the shape to copy.
+      const registered = registeredSchemas.get(name) as z.ZodType | undefined;
+      const schema = registered ?? z.object(entry.shape).strict();
+      const parsed = schema.safeParse(args);
       if (!parsed.success) {
         throw new Error(`invalid args for ${name}: ${parsed.error.issues.map((i) => `${i.path.join('.')} ${i.message}`).join('; ')}`);
       }

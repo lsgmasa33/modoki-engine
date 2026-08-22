@@ -24,19 +24,57 @@ export {
 } from './core/ecs/traitRegistry';
 export { traitFieldOrDefault } from './core/ecs/traitSchema';
 export {
+  registerEntrySource, unregisterEntrySource, getEntrySource, getEntrySourceNames,
+  type EntryCoord, type EntryContent, type EntryResolver,
+} from './ui/entrySource';
+export { parseEntryPrefabs } from './traits/UIEntries';
+export { scrollToEntry, snapToNearest, scrollByEntry, NO_ENTRY_REQUEST } from './ui/scrollApi';
+export { entriesSystem, resetEntriesSystem, ENTRIES_CONTENT_NAME, setEntryPrefabProvider, getEntryPrefabProvider, type EntryPrefabProvider } from './ui/entriesSystem';
+export { installEntryPrefabProvider, entryPrefabProvider } from './loaders/entryPrefabProvider';
+export { onAssetInvalidated, emitAssetInvalidated } from './core/assetInvalidation';
+export type { InvalidatedAssetKind, AssetInvalidationListener } from './core/assetInvalidation';
+export {
   type GameConfig, setGameConfig, getGameConfig,
 } from './core/config';
 export type { GameDefinition, EditorPanelDef } from './core/gameDefinition';
 export {
-  registerAppServices, appServices, clearAppServices,
+  registerAppServices, appServices, clearAppServices, onAppServicesRegistered,
   type AppServices, type CrashlyticsService, type AdsService, type AttributionService,
 } from './core/appServices';
+// Global JS error capture -> the `crashlytics` service (#275). The test seam
+// (`__resetGlobalErrorsForTest`) is deliberately NOT here — a test imports the module directly,
+// and the barrel is the public API games and the editor see.
+export {
+  installGlobalErrorHandlers, captureToCrashlytics, reportReactError, type CaptureKind,
+} from './core/globalErrors';
+// Deliberate NATIVE fault triggers (#278) — the half of the crash pipeline JS cannot reach.
+// The app shell installs the implementation over capacitor-game-debug; the engine only owns the seam.
+export {
+  faultProvider, FAULT_LABELS, type FaultProvider, type FaultKind,
+} from './core/faultProvider';
 export {
   PlayerPrefs, InMemoryBackend, LocalStorageBackend, PreferencesBackend, selectDefaultBackend,
   type JsonValue, type PlayerPrefsInitOptions, type PrefsBackend,
 } from './storage';
+export { createPrefsDocStore, type PrefsDocStore } from './storage/prefsDocStore';
+// In-app purchases (#196). `reconcile()` MUST run once per launch before the player can buy
+// anything — it is the recovery pass for a purchase interrupted by a crash or force-close.
+// Generic verbs are prefixed on the way out — the barrel is one flat namespace shared with every
+// other subsystem, and a bare `purchase`/`spend`/`reconcile` there would be ambiguous at the call
+// site. Same reason audio exports `play as audioPlay`.
+export {
+  configureIap, resetIap, restorePurchases, refreshEntitlements, isEntitled,
+  purchase as iapPurchase, reconcile as iapReconcile, spend as iapSpend,
+  balanceOf as iapBalanceOf, productInfo as iapProductInfo,
+  IapLedger, NoopStoreBackend, LocalVerifier, MockStoreBackend, pickStoreBackend,
+  type ConfigureIapOptions, type StoreBackend, type IapLedgerStore, type PurchaseVerifier,
+  type ProductKind, type IapProduct, type IapProductInfo, type StoreTransaction,
+  type PurchaseOutcome, type PurchaseResult,
+} from './iap';
+export { registerIapControls } from './actions/iapControls';
 export { hapticsSystem } from './haptics/hapticsSystem';
 export { registerHapticControls } from './actions/hapticControls';
+export { registerQualityControls } from './actions/qualityControls';
 export {
   playHaptic, configureHaptics, areHapticsEnabled, canDeviceVibrate,
   hapticLatencyMean, hapticLatencySamples, clearHapticLatency,
@@ -52,9 +90,19 @@ export {
 } from './haptics/backends';
 export { HapticSettings } from './traits/HapticSettings';
 export {
-  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
+  AudioSettings, AUDIO_SETTINGS_DEFAULT_LIMIT, AUDIO_SETTINGS_DEFAULT_STEAL_FADE,
+} from './traits/AudioSettings';
+// Host platform / form factor — the single source of truth for "is this a handheld?", asked
+// by the renderer's quality tier AND by on-screen touch controls.
+export { isTouchDevice, readFormFactor, readPlatform } from './core/formFactor';
+export {
+  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
   PrefabInstance, ModelSource, Paused, Persistent, markPersistent, Transient, Time, Input,
-  UIElement, type UILengthUnit, UIBinding, UIAction, UIFocusable, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh, BlobShadow,
+  UIElement, type UILengthUnit, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, NO_SCROLL_REQUEST,
+  type UIEntryPrefab, type UIEntryLengthUnit,
+  type UIScrollAxis, type UIScrollSnap, type UIScrollSnapStop, type UIScrollOverscroll, type UIScrollBehavior, UIAnchor,
+  TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, TOUCH_ATTR, TOUCH_OPACITY_ATTR, UI_ROOT_ATTR,
+  type TouchControlAction, type TouchControlShowOn, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh, BlobShadow,
   Animator, SpriteAnimator, defaultSpriteClip, clampAngle,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
@@ -120,7 +168,7 @@ export {
 } from './loaders/spriteAnimCache';
 // 2D sprite skinning — rig asset loader + pure LBS math.
 export {
-  getRig2D, setRig2D, invalidateRig2D, clearRig2DCache, normalizeRig2D,
+  getRig2D, getRig2DSource, setRig2D, invalidateRig2D, clearRig2DCache, normalizeRig2D,
   type ParsedRig2D, type Rig2DFile, type Rig2DBone,
 } from './loaders/rig2dCache';
 export {
@@ -140,6 +188,7 @@ export {
   type EntityInfo,
 } from './core/ecs/entityUtils';
 export { findEntityById, findEntityByGuid, registerEntity, spawnEntity, unregisterEntity, destroyEntity } from './core/ecs/world';
+export { findUnrenderable2D, type Unrenderable2D } from './rendering/canvas2DRouting';
 export {
   registerModelPostprocessor, getModelPostprocessor, getAllModelPostprocessors, getModelPostprocessorIds,
   type ModelPostprocessor,
@@ -154,6 +203,7 @@ export {
   resolveMaterial, resolveMaterialForMesh,
   getTemplatesForModel,
   invalidateModel, invalidateMaterial, disposeAllCachedResources,
+  invalidateEnvironment,
   onModelInvalidated,
   // Refcount API for SceneManager
   acquireModel, releaseModel,
@@ -193,9 +243,17 @@ export {
 // Frame TIME, not fps: fps saturates at the vsync ceiling and reports 3ms and 16ms frames
 // identically as 60.
 export {
-  getFrameProfile, resetFrameProfile, BUDGET_30FPS_MS, PROFILE_WINDOW_FRAMES,
+  getFrameProfile, resetFrameProfile, getWorstStallWindow, BUDGET_30FPS_MS, PROFILE_WINDOW_FRAMES,
   type FrameProfile, type FrameStat,
 } from './core/frameProfiler';
+// Boot-phase timeline (#238) — always-on, absolutely-timestamped spans across the boot path.
+// The frame profiler can say a boot froze for 1.8 s; only this can say what was open across it.
+// `bootSpanAsync` is public API: a game's own async boot work names its own spans.
+export {
+  beginBootSpan, endBootSpan, bootSpan, bootSpanAsync, recordBootSpan, getBootTimeline, getBootOrigin,
+  bootSpansOverlapping, resetBootTimeline, MAX_BOOT_SPANS,
+  type BootSpan, type BootTimeline,
+} from './core/bootTimeline';
 export { readPerfProfile } from './debug/perfSources';
 // Profiler markers — the data model the Profiler panel and the MCP surface are both views of.
 // `profileScope` is public API: game code can name its own spans and they rank alongside the
@@ -241,24 +299,47 @@ export {
   hitShapeContains, hitShapeDistance, regionsAt, nearestRegionTo,
   type HitRegion, type HitShape, type HitRegionFilter, type HitRegionProvider,
 } from './rendering/hitRegions';
-// Quality tiers (#121 P3) — two tiers, measurement as ground truth, allowlist as a shortcut.
-// The allowlist ships EMPTY and `auto` is NOT the default: see the module header, both are
-// deliberate states pending P5 calibration on real hardware, not unfinished work.
+// Quality tiers (#121 P3) — THREE tiers since #188 (`low`/`mid`/`high`), measurement as ground
+// truth, allowlist as a shortcut. The allowlist still ships EMPTY on purpose; see the module
+// header for why that is a deliberate state and not unfinished work.
 export {
-  resolveTier, evaluateTierChange, freshTierChangeState, tierShadowMapSize, tierAllowsPostFX,
+  resolveTier, evaluateTierChange, freshTierChangeState, promotionCeiling,
+  tierShadowMapSize, tierAllowsEffect,
   TIER_SETTINGS, TIER_ALLOWLIST, DEFAULT_TIER_SETTING,
+  TIER_ORDER, isQualityTier, tierAbove, tierBelow,
+  // On the barrel because `diagnose` needs it and re-deriving `1 + mid? + low?` inline gave the
+  // probe gate a second, hand-synced definition — the shadowing shape this workstream's review
+  // exists to remove, not add.
+  configCount,
   type QualityTier, type QualityTierSetting, type TierResolution, type TierSource,
   type TierRenderOverrides, type TierResolveInput, type TierChangeState, type TierDecision,
-  iosModelTier, parseAppleModel, IOS_HIGH_TIER_MIN_GENERATION,
+  type PostFXEffect,
+  iosModelTier, parseAppleModel, IOS_TIER_MIN_GENERATION,
 } from './rendering/qualityTier';
 // The boot ramp probe (#188). The PURE half only — the runner pulls in three and is imported
 // dynamically at the one call site that needs it, so a headless or DCE'd build never loads it.
 export {
   startRamp, rampNextLoad, recordRampFrame, readRamp, estimateIntervalMs, classifyDevice,
   probeFingerprint, PROBE_THRESHOLDS, PROBE_BUDGET_MS, RAMP_BOUNDS,
-  type DeviceClass, type ProbeMeasurement, type ProbeVerdict, type RampKind, type RampReading,
+  classifyReading, readingOf, refineProbeVerdict,
+  fillMegapixelsPerMs, shadeMegaFragmentsPerMs,
+  PROBE_SAMPLE_TARGET,
+  type ProbeClockKind,
+  type ProbeReading, type ProbeRefinement, type ProbeThreshold, type DeviceClass, type ProbeMeasurement, type ProbeVerdict, type RampKind, type RampReading,
   type RampState, type RampStatus, type RampStep, type ThroughputBound,
 } from './rendering/rampProbe';
+// The automatic light cap (#188 item 7) — the tier's light limits, actually enforced. The stats
+// are exported for `diagnose`: "why is this object dark?" is the question this feature
+// generates, and answering it from data beats answering it from the shader.
+export { getAutoLightCapStats, isAutoLightCapEngaged } from './rendering/autoLightCapFrame';
+// Only the stats accessor — `diagnose` reads it. The cap's arm/reset hooks and its pure rule stay
+// internal, exactly as `autoLightCapFrame`'s do: a test imports those by path, and a name in the
+// barrel is public API for every game and demo.
+export { getShadowCasterCapStats } from './rendering/shadowCasterCapFrame';
+// The mask variants the cap (or an authored scene) actually produced. On the barrel for the same
+// reason: verifying that a light selection REACHED the renderer needs the running instance, and a
+// direct `/@fs/` import from a debug eval can land on a second copy of the module.
+export { getLightMaskStats } from './rendering/lightMaskVariants';
 export { probeVerdictStore, type ProbeVerdictStore, type CachedProbeVerdict } from './core/probeVerdictStore';
 export { registerMaterialType, getMaterialBuilder, getRegisteredMaterialTypes, type MaterialBuilder } from './loaders/materialTypes';
 export { registerCustomShader, unregisterCustomShader, getCustomShader, getCustomShaderSchema, getRegisteredShaderNames, type CustomShaderBuild } from './loaders/customShaders';
@@ -281,13 +362,13 @@ export { PRIMITIVE_SPRITE_NAMES } from './loaders/sceneValidation';
 export { loadSceneFile, collectResourceRefsFromEntities, instantiatePrefabIntoWorld, spawnPrefabInstance, deriveInstanceMemberGuids, type SceneData, type LoadSceneOptions, type SceneResourceRef, type SceneEntityEntry } from './loaders/loadSceneFile';
 export { markOverride, getOverrideMarkSet, clearOverrideMarks, clearAllOverrideMarks } from './loaders/overrideMarks';
 export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type LoadOptions as SceneLoadOptions, type SceneManager, type LoadedSceneEntry } from './scene/SceneManager';
-export { validateSceneData, typeMismatch, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult } from './loaders/sceneValidation';
+export { validateSceneData, typeMismatch, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult, type AssetRefVerdict, type AssetRefResolver, makeAssetRefResolver } from './loaders/sceneValidation';
 export { buildSceneSchema } from './scene/sceneSchema';
 export { applyOps, type MutateOp, type MutableScene, type MutableEntity, type EntityRef as MutateEntityRef, type ApplyResult } from './scene/sceneMutate';
 // Entity-creation spec builders + the anchor-first UI authoring rules. In runtime (not editor)
 // since #166 so the DEVICE create-entity op can build the SAME entities the editor does — the
 // editor half of the package is stripped from a shipped game build. See
-// docs/plans/device-authoring-parity-plan.md.
+// docs/mcp-tool-conventions.md §9.
 export { buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type TraitSpec, type LightKind } from './scene/entityCreateSpecs';
 export { buildUiCreateSpecs, type UiPreset, type UiTraitSpec } from './ui/uiAuthoring';
 // Hierarchy legality (#166 P7) — the ONE self-parent/cycle rule, shared by the editor's undoable
@@ -296,7 +377,7 @@ export { isAncestorOf, reparentRefusal, type ReparentRefusal } from './core/ecs/
 /** LOCAL↔WORLD Transform authoring (`set_transform {space}`) — the FILE-path conversion.
  *  The live path uses `worldToLocal3D`/`getWorldTransform3D` from core/ecs/worldTransform. */
 export { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './scene/transformSpace';
-export { loadFont, loadAllFonts, getLoadedFontFamilies, getLoadedFonts, fontFamilyFromPath, fontPathFromFamily, parseFontFilename, type FontInfo } from './loaders/fontLoader';
+export { loadFont, loadAllFonts, loadFontFamily, getLoadedFontFamilies, getLoadedFonts, fontFamilyFromPath, fontPathFromFamily, parseFontFilename, type FontInfo } from './loaders/fontLoader';
 // Text MEASUREMENT, exported because fitting text into a box is a game-level concern, not just a
 // renderer-internal one: a game that generates its own copy (Court's hint narration) has to be
 // able to prove the result still fits the panel it draws it in, and a game may only reach the
@@ -311,6 +392,10 @@ export {
 } from './loaders/assetManifest';
 export { assetUrl, withCacheBust } from './loaders/assetUrl';
 export { UIRenderer } from './ui/UIRenderer';
+// Safe-area insets for GAME LAYOUT ARITHMETIC. Chrome that only needs to CLEAR the notch
+// should use `UIAnchor.safeArea` and never touch this — it exists for a game that has to
+// compute WITH the inset (a reserved bottom band, a board fitted into what is left).
+export { getSafeAreaInsets, resetSafeAreaInsets, type SafeAreaInsets } from './ui/safeArea';
 export { registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams } from './core/actionRegistry';
 export type { UIActionContext, UIActionHandler, UIActionDef, UIActionPayload, DispatchOptions } from './core/actionRegistry';
 export { registerEngineActions } from './actions/engineActions';
@@ -336,10 +421,30 @@ export {
   setDebugMenuEnabled,
 } from './debug/debugMenuRegistry';
 export {
+  registerAgentTool,
+  unregisterAgentTool,
+  listAgentTools,
+  getAgentTool,
+  subscribeAgentTools,
+  agentToolsVersion,
+  validateAgentToolArgs,
+  clearAgentTools,
+} from './debug/agentToolRegistry';
+export {
   setDebugHandlesEnabled,
   areDebugHandlesEnabled,
 } from './core/debugHandles';
+export {
+  setBootProbeAllowed,
+  isBootProbeAllowed,
+} from './core/bootProbeAllowed';
+export {
+  setActiveTextureSizeCap,
+  getActiveTextureSizeCap,
+  resetActiveTextureSizeCap,
+} from './core/textureSizeCap';
 export type { DebugTabDef, DebugCommandDef } from './debug/debugMenuRegistry';
+export type { AgentToolDef, AgentToolParam } from './debug/agentToolRegistry';
 
 // ── Frame Driver (no heavy deps — safe for all importers) ──
 export {
@@ -353,15 +458,35 @@ export type { FrameLoopHealth } from './rendering/frameDriver';
 // ── Render settings (project-configured renderer knobs) ──
 export {
   setRenderSettings, getRenderSettings, resetRenderSettings, resolveToneMapping,
-  setActiveQualityTier, getActiveQualityTier, getEffectiveThreeSettings, getActiveTierOrDefault,
+  setActiveQualityTier, getActiveQualityTier, getAssessedQualityTier,
+  getEffectiveThreeSettings, getEffectivePixiSettings, getEffectiveTargetFps,
+  // Exported for GAMES, not just the renderer (#241): a game that wants to react to the tier
+  // needs to ask what the tier ALLOWS — `tierAllowsEffect(getActiveTierOverrides(), 'bloom')`
+  // — and the resolved overrides were reachable only from inside the engine.
+  getActiveTierOverrides,
+  getTierSwitchMessage, DEFAULT_TIER_SWITCH_MESSAGE,
+  getActiveTierOrDefault,
+  // The debug menu's backing-resolution override. Exported for the same reason
+  // `getActiveTierOverrides` above is: this list is EXPLICIT, so anything not named here is
+  // unreachable from outside the package — including from a `device_eval`/`modoki_eval`, which
+  // is the only way an agent can check on real hardware what the override is actually doing.
+  // The feature works without this (DeviceTab imports the module directly); what it loses is
+  // the ability to be VERIFIED on the device it exists for.
+  setDebugPixelRatioCapOverride, getDebugPixelRatioCapOverride,
 } from './rendering/renderSettings';
 export {
-  tickTierCalibration, applyPendingTierPromotion, resetTierCalibration,
-  getPendingTierPromotion, CALIBRATION_INTERVAL_MS,
+  tickTierCalibration, applyPendingTierPromotion, resetTierCalibration, setTierFrameCapEnabled, setTierCalibrationEnabled,
+  IDLE_EVIDENCE_MS,
+  getPendingTierPromotion, CALIBRATION_INTERVAL_MS, onTierSwitchOverlay, getTierSwitchOverlayMessage,
+  armTierCalibration, isTierCalibrationArmed, ARM_BACKSTOP_MS, PROMOTION_BOUNDARY_GRACE_MS,
 } from './rendering/tierCalibration';
 export {
   getPlayerQualityTier, setPlayerQualityTier, hasPlayerQualityTier, choosePlayerQualityTier,
 } from './rendering/playerQualityTier';
+// The game-facing tier-change seam (#241) — subscribe to degrade YOUR game by tier; the
+// exports above only ever move the engine's own render knobs.
+export { onQualityTierChange, resetQualityTierChangeListeners } from './rendering/tierChangeNotify';
+export type { QualityTierChangeListener } from './rendering/tierChangeNotify';
 export { playerTierStore, type PlayerTierStore } from './core/playerTierStore';
 export type { RenderSettings, ThreeRenderSettings, PixiRenderSettings, WebRenderSettings } from './rendering/renderSettings';
 export { getWorldTransform3D, getWorldMatrix3D, getParentWorldMatrix3D, worldToLocal3D, hasParent } from './core/ecs/worldTransform';
@@ -369,7 +494,20 @@ export type { WorldTransform3D } from './core/ecs/worldTransform';
 // The CACHED half of the world-transform contract (the on-demand half is worldTransform.ts
 // above). Lived in `src/three/` until P5; `@modoki/engine/three` still re-exports these for
 // back-compat, but this barrel is the canonical import path.
-export { transformPropagationSystem, worldTransforms, deactivatedEntities } from './core/ecs/transformPropagationSystem';
+//
+// ⚠️ **`worldTransforms` HANDS BACK A POOLED RECORD THAT THE NEXT PASS OVERWRITES IN PLACE — do
+// not retain what `.get()` returns.** Hold it across frames and your snapshot silently becomes the
+// current pose (a drag-start reads a zero delta), with no error anywhere. Use
+// `readWorldTransformInto(id, out)` whenever the value outlives the statement that read it; `.get()`
+// is for hot paths that destructure immediately. The warning is repeated HERE, at the export, and
+// not only on the declaration, because that is where a caller meets it — the rule lived solely in a
+// comment on the Map while 76 read sites accumulated against it (review 2026-08-12, R7.1).
+//
+// ⚠️ NOT interchangeable with `getWorldTransform3D` above: this is the per-frame CACHE (O(1)),
+// that one RECOMPUTES on demand and rebuilds two full-world maps per call — right for a one-off,
+// wrong for reading many entities per frame.
+export { transformPropagationSystem, worldTransforms, readWorldTransformInto, deactivatedEntities } from './core/ecs/transformPropagationSystem';
+export type { WorldTransformRecord } from './core/ecs/transformPropagationSystem';
 export { computeContainerBox, clampBufferSize } from './rendering/webCanvasSizing';
 export type { WebSizing, ContainerBox } from './rendering/webCanvasSizing';
 export { useGameLoop } from './rendering/useGameLoop';
@@ -448,13 +586,13 @@ export {
 } from './animation/deform2DBuffers';
 export { applyClipDeform } from './animation/deform2DSystem';
 export {
-  physics2DSystem, raycast2D, shapeCast2D, pointQuery2D, disposePhysics2D, disposeAllPhysics2D,
+  physics2DSystem, raycast2D, shapeCast2D, pointQuery2D, hasPhysics2D, disposePhysics2D, disposeAllPhysics2D,
   applyImpulse2D, applyTorqueImpulse2D, addForce2D, addTorque2D,
   setLinvel2D, setAngvel2D, resetForces2D, wakeBody2D,
 } from './physics/physics2DSystem';
 export { initRapier2D, isRapierReady } from './physics/rapierLoader';
 export {
-  physics3DSystem, raycast3D, shapeCast3D, pointQuery3D, disposePhysics3D, disposeAllPhysics3D,
+  physics3DSystem, raycast3D, shapeCast3D, pointQuery3D, hasPhysics3D, disposePhysics3D, disposeAllPhysics3D,
   applyImpulse3D, applyTorqueImpulse3D, addForce3D, addTorque3D,
   setLinvel3D, setAngvel3D, setBodyTranslation3D, resetForces3D, wakeBody3D,
 } from './physics/physics3DSystem';
@@ -499,6 +637,9 @@ export {
   VideoCache, CacheApiBackend, hasCacheStorage,
   type CacheBackend, type VideoCacheOptions, type DownloadProgress,
 } from './video/videoCache';
+// The one-slot registry for the LIVE cache, so `diagnose` can introspect it without importing the
+// app pipeline that builds it (#288 Phase 6). Structural type — no video code is pulled in.
+export { setActiveVideoCache, getActiveVideoCache, type ActiveVideoCache } from './video/videoCacheSlot';
 export {
   planAdmission, explainRefusal, totalBytes as videoCacheTotalBytes,
   type CacheEntry, type AdmissionResult,
@@ -517,6 +658,9 @@ export {
   detachAll as detachInputSources, inputSourcesManager, type InputSource,
 } from './input/inputSources';
 export { keyboardSource } from './input/keyboardSource';
+// On-screen touch controls (#297) — the source, plus the DOM attribute names it and the UI
+// layer agree on (`ui/` and `input/` are both L2 and cannot import each other).
+export { touchControlSource } from './input/touchControlSource';
 export { gamepadSource, sampleGamepadInto, type GamepadSnapshot } from './input/gamepadSource';
 // Presentation-invariant input: keep gameplay feel constant under editor/browser/OS zoom.
 export { getPresentationScale, calibratePresentationScale } from './input/presentationScale';
@@ -590,6 +734,9 @@ export {
   shouldFireActions, shouldRunSimTier, isPoseOnly, isLiveRender, canEdit, inPreviewSession,
 } from './core/playState';
 export { uiTreeProjection, markUIDirty, setEditorDirtyCallback, onEditorDirty } from './ui/uiTreeStore';
+// A game that registers its OWN InputSource should call `noteUserInput` from it — see
+// `core/userActivity.ts`. Without it, quality-tier calibration reads that game as idle.
+export { noteUserInput, msSinceUserInput, hasRecentUserInput } from './core/userActivity';
 // UI focus / navigation (Part B of the input-and-ui-focus plan).
 export { uiFocusSystem } from './ui/uiFocusSystem';
 export {

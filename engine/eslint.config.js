@@ -31,7 +31,7 @@ const L1_FOLDERS = ['traits'];
 /** L2 subsystems. `physics` + `zones` are new — P6 dissolved the transitional `systems/`
  *  bucket into these (and the other feature folders below); `systems/` no longer exists. */
 const L2_FOLDERS = [
-  'animation', 'audio', 'input', 'particles', 'physics', 'rendering',
+  'animation', 'audio', 'iap', 'input', 'particles', 'physics', 'rendering',
   'skinning', 'storage', 'timeline', 'ui', 'zones',
 ];
 const L3_FOLDERS = ['actions', 'assets', 'debug', 'harness', 'loaders', 'managers', 'ota', 'scene', 'store'];
@@ -226,6 +226,12 @@ export default tseslint.config(
       '**/*.xcframework/**',
       '**/Pods/**',
       '**/DerivedData/**',
+      // Agent scratch — Claude Code's per-session git WORKTREES live here, each a full second
+      // copy of this repo (gitignored). Linting one means linting the whole engine twice, at a
+      // commit that is not the one you are working on: a stale worktree turned `npm run lint`
+      // red with 36 errors in code nobody on this branch had touched, and since lint is a
+      // `verify` leg that is the whole local gate going red for a directory that is not source.
+      '**/.claude/**',
     ],
   },
   // Base JS + TS recommended for every source file.
@@ -393,7 +399,7 @@ export default tseslint.config(
     files: ['engine/plugins/**/*.{ts,js,mjs}', 'engine/tools/**/*.{ts,js,mjs}', 'engine/scripts/**/*.{js,mjs}', 'engine/electron/**/*.ts', 'engine/toolchain/**/*.ts', '*.config.{ts,js}'],
     languageOptions: { globals: globals.node },
     rules: {
-      // Toolchain parity gate (docs/plans/editor-toolchain-layer-plan.md): resolve external CLI
+      // Toolchain parity gate (docs/editor-toolchain.md): resolve external CLI
       // tools through engine/toolchain (which honours env overrides like MODOKI_TOKTX / the
       // packaged bundled binary), NEVER a bare tool name — a bare `toktx` is absent in a dmg.
       // Currently enforced for toktx (the migrated tool); extends to npm/npx/gltfpack/adb/… as

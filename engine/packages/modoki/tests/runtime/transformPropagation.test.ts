@@ -3,7 +3,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createWorld } from 'koota';
 import { Transform, EntityAttributes } from '../../src/runtime/traits';
-import { transformPropagationSystem, worldTransforms, deactivatedEntities } from '../../src/runtime/core/ecs/transformPropagationSystem';
+import { transformPropagationSystem, worldTransforms, readWorldTransformInto, deactivatedEntities } from '../../src/runtime/core/ecs/transformPropagationSystem';
 
 let testWorld: ReturnType<typeof createWorld>;
 
@@ -400,5 +400,38 @@ describe('transformPropagationSystem', () => {
       expect(worldTransforms.size).toBe(1);
       expect(worldTransforms.get(root.id())!.x).toBeCloseTo(5);
     });
+  });
+});
+
+describe('readWorldTransformInto — the retention-safe read (R7.1)', () => {
+  it('copies, so the snapshot SURVIVES the next propagation pass', () => {
+    // ⚠️ THE DISTINGUISHING TEST. `worldTransforms.get()` hands back a POOLED record that the next
+    // pass overwrites IN PLACE, so a retained reference silently becomes the current pose — the
+    // failure that reads as "my drag computed a zero delta", with no error anywhere. Both halves
+    // are asserted in one run: the copy holds its value and the raw reference does not, so this
+    // cannot pass by the pooling having been quietly removed.
+    const e = testWorld.spawn(Transform({ x: 1, y: 2, z: 3 }));
+    transformPropagationSystem(testWorld);
+
+    const snapshot = { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 };
+    expect(readWorldTransformInto(e.id(), snapshot)).toBe(true);
+    const retained = worldTransforms.get(e.id())!;   // the thing a caller must NOT do
+    // Every field, not just x — a copy that missed one would otherwise pass on the field
+    // the rest of this test happens to move.
+    expect(snapshot).toEqual({ x: 1, y: 2, z: 3, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    expect(retained.x).toBe(1);
+
+    e.set(Transform, { x: 99, y: 2, z: 3 });
+    transformPropagationSystem(testWorld);
+
+    expect(snapshot.x).toBe(1);                      // the copy is still the pose we captured
+    expect(retained.x).toBe(99);                     // the pooled record moved under us
+  });
+
+  it('returns false and leaves `out` untouched for an entity with no world transform', () => {
+    transformPropagationSystem(testWorld);
+    const out = { x: 7, y: 7, z: 7, rx: 7, ry: 7, rz: 7, sx: 7, sy: 7, sz: 7 };
+    expect(readWorldTransformInto(123456, out)).toBe(false);
+    expect(out.x).toBe(7);
   });
 });

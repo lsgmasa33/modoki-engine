@@ -8,11 +8,23 @@
  * the deterministic headless pipeline.
  *
  * Actions:
- *  - `haptics.play`   — play a named pattern (payload `{ pattern }`, default `'select'`). The one
+ *  - `haptics.play`   — play a named pattern (`params: { pattern }`, default `'select'`). The one
  *                       a button uses to give itself a tap feel with zero TS.
  *  - `haptics.toggle` — flip `HapticSettings.enabled`, and persist it (see below).
- *  - `haptics.set`    — set it explicitly (payload `{ enabled }`), for a settings screen whose
+ *  - `haptics.set`    — set it explicitly (`params: { enabled }`), for a settings screen whose
  *                       control knows the value it wants rather than "the other one".
+ *
+ * ⚠️ **`play` AND `set` READ `ctx.params`, AND READING `ctx.payload.pattern` MADE THEM DEAD** —
+ * fixed 2026-08-11 while building the neighbouring `quality.set` (#188). `UIActionPayload` is
+ * `string | number`, so an OBJECT can never arrive from authored scene JSON: `ui/bindings.ts`
+ * routes a binding's `params` to `ctx.params` and puts only the live event value (or a single
+ * authored `params.payload`) in `ctx.payload`. Destructuring `{ payload }` and reading
+ * `payload.pattern` therefore yielded `undefined` for every authorable binding — `haptics.play`
+ * silently fell back to `'select'` whatever was authored, and `haptics.set` did nothing at all.
+ * Nothing caught it because no scene, test or caller in the repo dispatched either action with an
+ * argument; the only thing that pointed at it was a comment in `haptics.test.ts` claiming a
+ * pattern name IS reachable from authored data, which was true of the intent and not of the code.
+ * `payload` is kept as a fallback so a control emitting `$value` works without a wrapper param.
  *
  * ⚠️ **The toggle writes the TRAIT, and the trait is the live value** — `hapticsSystem` copies it
  * into the service each frame. Nothing here calls `configureHaptics` directly: a second writer
@@ -46,9 +58,9 @@ function setEnabled(next: boolean): void {
 }
 
 export function registerHapticControls(): void {
-  registerUIAction('haptics.play', ({ payload }) => {
-    const p = (payload ?? {}) as { pattern?: unknown };
-    playHaptic(typeof p.pattern === 'string' && p.pattern ? p.pattern : DEFAULT_PATTERN);
+  registerUIAction('haptics.play', ({ params, payload }) => {
+    const pattern = params?.pattern ?? payload;
+    playHaptic(typeof pattern === 'string' && pattern ? pattern : DEFAULT_PATTERN);
   });
 
   registerUIAction('haptics.toggle', () => {
@@ -58,9 +70,13 @@ export function registerHapticControls(): void {
     setEnabled(!s.enabled);
   });
 
-  registerUIAction('haptics.set', ({ payload }) => {
-    const p = (payload ?? {}) as { enabled?: unknown };
-    if (typeof p.enabled !== 'boolean') return;   // authored scene data — validated, never trusted
-    setEnabled(p.enabled);
+  // ⚠️ NO `payload` FALLBACK HERE, unlike `play` above, and the asymmetry is deliberate:
+  // `UIActionPayload` is `string | number`, so a BOOLEAN cannot ride it and a fallback would be a
+  // branch that can never fire — the same dead-code shape this handler was just rescued from.
+  // `params` is `Record<string, unknown>` and carries a real authored boolean.
+  registerUIAction('haptics.set', ({ params }) => {
+    const enabled = params?.enabled;
+    if (typeof enabled !== 'boolean') return;   // authored scene data — validated, never trusted
+    setEnabled(enabled);
   });
 }

@@ -154,6 +154,135 @@ describe('pre-flight — nothing runs until everything validates', () => {
   });
 });
 
+describe('the `modoki_` prefix is optional on a step\'s tool name (#295)', () => {
+  // WHY this matters more than an ordinary ergonomic nicety: pre-flight validates EVERY step
+  // before `runBatch` executes ANY, so one unresolvable name does not fail its own step — it
+  // voids the whole batch, discarding the valid steps ahead of it too. `scroll` for
+  // `modoki_scroll` is the natural slip, because prose everywhere names these tools bare.
+
+  it('runs a bare name, and reports the RESOLVED name', async () => {
+    const r = await run({ steps: [{ tool: 'set_transform', args: { entity: { guid: 'g1' } } }, { tool: 'save_all' }] });
+    // The load-bearing assertion is that the handlers actually RAN — a rejection would also
+    // leave `ok` unread, and an outcome that merely resolved the name would leave `ran` empty.
+    expect(ran).toEqual(['set_transform(g1)', 'save_all']);
+    expect((r as BatchOutcome).ok).toBe(true);
+    expect((r as BatchOutcome).steps.map((st) => st.tool)).toEqual(['modoki_set_transform', 'modoki_save_all']);
+  });
+
+  it('validates a bare-named step against that tool\'s REAL schema', async () => {
+    // The shorthand must not buy its way past the strict re-parse — that re-parse is the whole
+    // reason the registry exists.
+    const r = await run({ steps: [{ tool: 'set_selection', args: { name: 'Capsule' } }] });
+    expect(isRejection(r)).toBe(true);
+    expect((r as BatchRejection).rejected).toMatch(/invalid args/);
+    expect(ran).toEqual([]);
+  });
+
+  it('still refuses raw {x,y} when the tool is named bare', async () => {
+    const r = await run({ steps: [{ tool: 'tap', args: { x: 10, y: 20 } }] });
+    expect(isRejection(r)).toBe(true);
+    expect((r as BatchRejection).rejected).toMatch(/raw x\/y aiming is not allowed/);
+    expect(ran).toEqual([]);
+  });
+
+  it('reports a DENIED tool named bare as a DENIAL, not as an unknown name', async () => {
+    // "unknown tool" would send the caller off to fix a name that is spelled fine.
+    //
+    // The two cases reach the denial by DIFFERENT branches, which is the point of testing both:
+    // `modoki_build` IS in the fake registry, so `getTool(prefixed)` short-circuits first;
+    // `modoki_batch` is NOT registered here, so only the `DENIED.has(prefixed)` fallback can
+    // resolve it. Without that fallback the second case would read "unknown tool".
+    for (const name of ['build', 'batch']) {
+      ran = [];
+      const r = await run({ steps: [{ tool: name }] });
+      expect(isRejection(r), name).toBe(true);
+      expect((r as BatchRejection).rejected, name).toMatch(/not allowed in a batch/);
+      expect(ran, name).toEqual([]);
+    }
+  });
+
+  it('lets an EXACT match win, so a game tool is never re-read as a modoki_ one', async () => {
+    // The dynamic tail registers `<gameId>_<verb>` (#270). If the prefixed form were tried first,
+    // a game tool that happened to shadow one would silently run the wrong handler.
+    const base = fakeRegistry();
+    getTool = (name: string) => (name === 'court_load_level'
+      ? { name, description: '', shape: {}, handler: async () => { ran.push('court'); return okResult(); } }
+      : name === 'modoki_court_load_level'
+        ? { name, description: '', shape: {}, handler: async () => { ran.push('WRONG'); return okResult(); } }
+        : base(name));
+    const r = await run({ steps: [{ tool: 'court_load_level' }] });
+    expect((r as BatchOutcome).ok).toBe(true);
+    expect(ran).toEqual(['court']);
+  });
+
+  it('accepts `modoki_wait` as the wait pseudo-step — the mirror-image slip', async () => {
+    const r = await run({ steps: [{ tool: 'modoki_wait', args: { ms: 5 } }, { tool: 'save_all' }] });
+    expect((r as BatchOutcome).ok).toBe(true);
+    expect((r as BatchOutcome).steps[0].tool).toBe('wait');
+    expect(ran).toEqual(['save_all']);
+  });
+
+  it('resolves ONCE — a registry that mutates DURING the run cannot swap in another handler', async () => {
+    // The registry is not static: `gameTools.ts` polls and re-registers as the human opens and
+    // closes a project, and a batch can sit in a `wait` or a slow handler meanwhile. The mutation
+    // therefore has to land BETWEEN pre-flight and the step — which is why step 0's handler is
+    // what arms it. If the executor re-resolved, step 1's bare `save_all` would resolve to
+    // `modoki_save_all` at pre-flight (validated against ITS schema) and then hit the exact-match
+    // branch on the second pass, running a tool whose schema never saw these args.
+    const base = fakeRegistry();
+    let impostor: RegisteredTool | undefined;
+    const arm: RegisteredTool = {
+      name: 'modoki_arm', description: '', shape: {},
+      handler: async () => {
+        ran.push('arm');
+        impostor = { name: 'save_all', description: '', shape: {}, handler: async () => { ran.push('IMPOSTOR'); return okResult(); } };
+        return okResult();
+      },
+    };
+    getTool = (name: string) => (name === 'modoki_arm' ? arm : name === 'save_all' ? impostor : base(name));
+
+    const r = await run({ steps: [{ tool: 'arm' }, { tool: 'save_all' }] });
+    expect((r as BatchOutcome).ok).toBe(true);
+    // The distinguishing assertion: the real tool ran, not the one that appeared mid-batch.
+    expect(ran).toEqual(['arm', 'save_all']);
+    expect((r as BatchOutcome).steps[1].tool).toBe('modoki_save_all');
+  });
+
+  it('lets a REGISTERED modoki_wait beat the pseudo-step alias', async () => {
+    // The alias must not outrank an exact registration, or a step naming a real tool would
+    // silently become a sleep. No such tool exists today, which is exactly why the ORDER of the
+    // checks needs pinning rather than trusting.
+    const base = fakeRegistry();
+    getTool = (name: string) => (name === 'modoki_wait'
+      ? { name, description: '', shape: {}, handler: async () => { ran.push('real_wait_tool'); return okResult(); } }
+      : base(name));
+    const r = await run({ steps: [{ tool: 'modoki_wait', args: {} }] });
+    expect((r as BatchOutcome).ok).toBe(true);
+    expect(ran).toEqual(['real_wait_tool']);
+    expect((r as BatchOutcome).steps[0].tool).toBe('modoki_wait');
+  });
+
+  it('reports notRun with RESOLVED names too, so one batch is not described in two vocabularies', async () => {
+    const r = await run({ steps: [
+      { tool: 'save_all' },
+      { tool: 'boom' },
+      { tool: 'set_transform', args: { entity: { guid: 'g1' } } },
+    ] }) as BatchOutcome;
+    expect(r.ok).toBe(false);
+    expect(r.steps.map((st) => st.tool)).toEqual(['modoki_save_all', 'modoki_boom']);
+    // The skipped tail is the list a caller re-sends from — it must speak the same names.
+    expect(r.notRun).toEqual([{ i: 2, tool: 'modoki_set_transform' }]);
+  });
+
+  it('still voids the batch on a genuinely unknown name, and says the prefix is not the problem', async () => {
+    const r = await run({ steps: [{ tool: 'save_all' }, { tool: 'nope' }] });
+    expect(isRejection(r)).toBe(true);
+    expect((r as BatchRejection).rejected).toMatch(/unknown tool/);
+    expect((r as BatchRejection).rejected).toMatch(/prefix is optional/);
+    expect(ran).toEqual([]);
+  });
+});
+
 describe('raw {x,y} aiming is refused inside a batch', () => {
   it('refuses coordinate-aimed input and explains the alternatives', async () => {
     const r = await run({ steps: [{ tool: 'modoki_tap', args: { x: 10, y: 20 } }] });

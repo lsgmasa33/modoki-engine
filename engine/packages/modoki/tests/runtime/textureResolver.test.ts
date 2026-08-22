@@ -1,17 +1,20 @@
 import { describe, it, expect, beforeEach, beforeAll, vi, afterEach } from 'vitest';
 import * as THREE from 'three';
-import { clearManifest, registerAsset, registerSprite } from '../../src/runtime/loaders/assetManifest';
+import { clearManifest, registerAsset, registerSprite, loadManifestJson, serializeManifest } from '../../src/runtime/loaders/assetManifest';
 import {
   resolveTextureVariantUrl, getTextureSettings, invalidateTexture, resolveSprite,
   loadTexture3D, releaseTexture3D, getSharedTextureStats, disposeAllSharedTextures, isSharedTexture,
   getKTX2Loader, setActiveRenderer, onRendererReady, getActiveRenderer,
+  resetUnresolvedSpriteWarnings, resolveBrowserImageUrl,
 } from '../../src/runtime/loaders/textureResolver';
 import { DEFAULT_TEXTURE_SETTINGS } from '../../src/runtime/loaders/textureSettings';
+import { setActiveTextureSizeCap, resetActiveTextureSizeCap } from '../../src/runtime/core/textureSizeCap';
 
 const GUID = '11111111-1111-4111-8111-111111111111';
 const PATH = '/games/g/assets/tex/rock.png';
 
 beforeEach(() => clearManifest());
+afterEach(() => resetActiveTextureSizeCap());
 
 describe('resolveTextureVariantUrl', () => {
   it('falls back to the source URL when the texture is unconverted', () => {
@@ -63,6 +66,32 @@ describe('resolveTextureVariantUrl', () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+
+  // #212 texture LOD by quality tier. The resolver must NEVER guess a capped URL the build
+  // didn't actually emit — a missing asset hangs rather than fails (this repo's own history).
+  describe('with an active tier texture-size cap', () => {
+    it('uses the capped URL when the manifest lists that size as emitted', () => {
+      registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc', sizes: [512, 1024] });
+      setActiveTextureSizeCap(512);
+      expect(resolveTextureVariantUrl(GUID, '3d')).toContain(PATH + '~uastc@512.ktx2');
+    });
+
+    it('falls back to the UNCAPPED URL when the manifest does NOT list that size — no 404 guess', () => {
+      registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }); // no `sizes` at all
+      setActiveTextureSizeCap(512);
+      const url = resolveTextureVariantUrl(GUID, '3d');
+      expect(url).toContain(PATH + '~uastc.ktx2');
+      expect(url).not.toContain('@512');
+    });
+
+    it('a cap of 0 (no tier resolved / uncapped tier) is today\'s URL, unchanged', () => {
+      registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc', sizes: [512] });
+      setActiveTextureSizeCap(0);
+      const url = resolveTextureVariantUrl(GUID, '3d');
+      expect(url).toContain(PATH + '~uastc.ktx2');
+      expect(url).not.toContain('@');
+    });
   });
 });
 
@@ -191,11 +220,11 @@ describe('shared texture cache (F3 — dedup + refcount)', () => {
   // `ktx2CapsReadyFired` is module-monotonic) don't hang waiting on a probe. Stub
   // detectSupport so caps stay the pristine {astc:false} the earlier variant-selection
   // tests assert against.
-  beforeAll(() => {
-    const detect = vi.spyOn(getKTX2Loader(), 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
+  beforeAll(async () => {
+    const detect = vi.spyOn(await getKTX2Loader(), 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
       this.workerConfig = { astcSupported: false }; return this as never;
     });
-    setActiveRenderer({} as never);
+    await setActiveRenderer({} as never);
     detect.mockRestore();
   });
   beforeEach(() => {
@@ -245,17 +274,61 @@ describe('shared texture cache (F3 — dedup + refcount)', () => {
     expect(getSharedTextureStats().count).toBe(1);
   });
 
-  it('invalidateTexture force-disposes shared textures + evicts; a stale release is a no-op', async () => {
+  // ⚠️ THIS TEST'S EXPECTATION WAS INVERTED, deliberately. It used to assert that
+  // invalidateTexture force-disposes "regardless of refcount" — which encoded a
+  // use-after-free as the contract: a live material keeps `mat.map` pointing at the destroyed
+  // instance and the next frame dies with "Destroyed texture used in a submit" (owner-reported
+  // on a 3d-test island re-import). Disposal was never what made a re-import take effect;
+  // re-resolving is. So eviction now retires a still-referenced texture and the LAST release
+  // frees it.
+  it('invalidateTexture evicts WITHOUT disposing while refs are outstanding', async () => {
     registerAsset(GUID, PATH, 'texture');
     const a = await loadTexture3D(GUID);
-    await loadTexture3D(GUID); // refs = 2 — invalidate ignores the count
+    await loadTexture3D(GUID); // refs = 2 — both holders still bind this instance
     const disp = vi.spyOn(a, 'dispose');
     const remove = vi.spyOn(THREE.Cache, 'remove').mockImplementation(() => {});
+
     invalidateTexture(GUID);
-    expect(disp).toHaveBeenCalledTimes(1);
-    expect(getSharedTextureStats().count).toBe(0);
-    releaseTexture3D(a); // entry already gone → must not double-dispose / throw
-    expect(disp).toHaveBeenCalledTimes(1);
+
+    expect(disp).not.toHaveBeenCalled();            // still bound → must NOT be destroyed
+    expect(getSharedTextureStats().refs).toBe(2);   // retired, but still accounted for
+
+    releaseTexture3D(a);
+    expect(disp).not.toHaveBeenCalled();            // one holder left
+    releaseTexture3D(a);
+    expect(disp).toHaveBeenCalledTimes(1);          // last holder → freed, exactly once
+    expect(getSharedTextureStats()).toEqual({ count: 0, refs: 0 });
+    remove.mockRestore();
+  });
+
+  it('a load after invalidation returns a FRESH instance — eviction still makes the re-import take', async () => {
+    registerAsset(GUID, PATH, 'texture');
+    const before = await loadTexture3D(GUID);
+    const remove = vi.spyOn(THREE.Cache, 'remove').mockImplementation(() => {});
+    invalidateTexture(GUID);
+
+    const after = await loadTexture3D(GUID);
+
+    expect(after).not.toBe(before);                 // re-fetched, not the retired instance
+    expect(loadAsyncSpy).toHaveBeenCalledTimes(2);
+    remove.mockRestore();
+  });
+
+  // The retired map MUST be keyed by instance, not by cache key: a re-load after invalidation
+  // occupies the SAME key (the URL is unchanged in dev), so a key-keyed lookup would let this
+  // stale release decrement the NEW entry and destroy a texture that is still in use.
+  it('releasing the OLD instance after a re-load does not touch the new one', async () => {
+    registerAsset(GUID, PATH, 'texture');
+    const before = await loadTexture3D(GUID);
+    const remove = vi.spyOn(THREE.Cache, 'remove').mockImplementation(() => {});
+    invalidateTexture(GUID);
+    const after = await loadTexture3D(GUID);
+    const dispAfter = vi.spyOn(after, 'dispose');
+
+    releaseTexture3D(before);                       // frees the retired one only
+
+    expect(dispAfter).not.toHaveBeenCalled();
+    expect(getSharedTextureStats()).toEqual({ count: 1, refs: 1 });  // the new one, intact
     remove.mockRestore();
   });
 
@@ -274,7 +347,7 @@ describe('shared texture cache (F3 — dedup + refcount)', () => {
   // to ONE entry.
   it('shares ONE entry for a KTX2 texture regardless of flipY (always bottom-origin)', async () => {
     registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' });
-    const ktxSpy = vi.spyOn(getKTX2Loader(), 'loadAsync')
+    const ktxSpy = vi.spyOn(await getKTX2Loader(), 'loadAsync')
       .mockImplementation(async () => new THREE.Texture() as never);
     const a = await loadTexture3D(GUID, { flipY: true });
     const b = await loadTexture3D(GUID, { flipY: false });
@@ -288,7 +361,7 @@ describe('shared texture cache (F3 — dedup + refcount)', () => {
 
   it('loads a KTX2 variant from the ~uastc.ktx2 URL (not the source PNG)', async () => {
     registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' });
-    const ktxSpy = vi.spyOn(getKTX2Loader(), 'loadAsync')
+    const ktxSpy = vi.spyOn(await getKTX2Loader(), 'loadAsync')
       .mockImplementation(async () => new THREE.Texture() as never);
     await loadTexture3D(GUID);
     const url = ktxSpy.mock.calls[0][0] as string;
@@ -373,7 +446,7 @@ describe('applyTextureSettings branches (via loadTexture3D)', () => {
     // Spy the KTX2Loader instance directly: its real loadAsync needs GPU init
     // (detectSupport), and a prior describe's mockRestore can leave the singleton's
     // own loadAsync = real, shadowing the prototype spy.
-    const ktxSpy = vi.spyOn(getKTX2Loader(), 'loadAsync').mockImplementation(async () => new THREE.Texture() as never);
+    const ktxSpy = vi.spyOn(await getKTX2Loader(), 'loadAsync').mockImplementation(async () => new THREE.Texture() as never);
     const tex = await loadTexture3D(GUID, { flipY: true }); // opt ignored on the KTX branch
     expect(tex.flipY).toBe(false);
     expect(tex.generateMipmaps).toBe(false); // baked mips, never regenerated
@@ -382,7 +455,7 @@ describe('applyTextureSettings branches (via loadTexture3D)', () => {
 
   it('routes a ?v=<hash> cache-busted .ktx2 URL down the KTX branch (regex handles the suffix)', async () => {
     vi.stubEnv('PROD', true); // PROD appends ?v=<hash>
-    const ktxSpy = vi.spyOn(getKTX2Loader(), 'loadAsync').mockImplementation(async () => new THREE.Texture() as never);
+    const ktxSpy = vi.spyOn(await getKTX2Loader(), 'loadAsync').mockImplementation(async () => new THREE.Texture() as never);
     try {
       registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, undefined, 'cafef00d');
       const tex = await loadTexture3D(GUID);
@@ -402,8 +475,8 @@ describe('applyTextureSettings branches (via loadTexture3D)', () => {
 // at the END of the file so earlier "default caps" tests run against the pristine
 // {astc:false} state. The last test restores caps to false for hygiene.
 describe('getKTX2Loader (Missing Test #4)', () => {
-  it('returns the same singleton instance', () => {
-    expect(getKTX2Loader()).toBe(getKTX2Loader());
+  it('returns the same singleton instance', async () => {
+    expect(await getKTX2Loader()).toBe(await getKTX2Loader());
   });
 });
 
@@ -411,12 +484,12 @@ describe('setActiveRenderer caps detection + rendererReady (Missing Test #3)', (
   // A minimal renderer stub; detectSupport is overridden via a spy on the loader.
   const fakeRenderer = {} as never;
 
-  it('reflects astc support from the loader workerConfig into variant selection', () => {
-    const loader = getKTX2Loader();
+  it('reflects astc support from the loader workerConfig into variant selection', async () => {
+    const loader = await getKTX2Loader();
     const detect = vi.spyOn(loader, 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
       this.workerConfig = { astcSupported: true }; return this as never;
     });
-    setActiveRenderer(fakeRenderer);
+    await setActiveRenderer(fakeRenderer);
     detect.mockRestore();
 
     // detectedCaps.astc=true → a ktx2-astc texture now resolves to the native ~astc.ktx2
@@ -431,20 +504,155 @@ describe('setActiveRenderer caps detection + rendererReady (Missing Test #3)', (
     expect(cb).toHaveBeenCalledTimes(1);
   });
 
-  it('swallows a detectSupport throw with a warn (renderer still set)', () => {
+  it('swallows a detectSupport throw with a warn (renderer still set)', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const detect = vi.spyOn(getKTX2Loader(), 'detectSupport').mockImplementation(() => { throw new Error('no gpu'); });
-    expect(() => setActiveRenderer({} as never)).not.toThrow();
+    const detect = vi.spyOn(await getKTX2Loader(), 'detectSupport').mockImplementation(() => { throw new Error('no gpu'); });
+    await expect(setActiveRenderer({} as never)).resolves.toBeUndefined();
     expect(warn).toHaveBeenCalled();
     expect(getActiveRenderer()).toBeDefined();
     detect.mockRestore();
     warn.mockRestore();
 
     // Restore caps to {astc:false} for any later additions to this file.
-    const reset = vi.spyOn(getKTX2Loader(), 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
+    const reset = vi.spyOn(await getKTX2Loader(), 'detectSupport').mockImplementation(function (this: { workerConfig?: { astcSupported?: boolean } }) {
       this.workerConfig = { astcSupported: false }; return this as never;
     });
-    setActiveRenderer({} as never);
+    await setActiveRenderer({} as never);
     reset.mockRestore();
+  });
+});
+
+/** A dangling 2D sprite ref must not fail SILENTLY (QA-ASSET-0011).
+ *
+ *  The 3D path has warned once per unresolvable guid for a long time; the 2D path returned
+ *  `undefined` and Scene2D's two call sites bailed with no output, so deleting a texture a
+ *  sprite referenced rendered nothing against a clean console. */
+describe('resolveSprite — dangling refs warn once', () => {
+  const MISSING = '44444444-4444-4444-8444-444444444444';
+  const SPRITE = '55555555-5555-4555-8555-555555555555';
+
+  beforeEach(() => resetUnresolvedSpriteWarnings());
+
+  it('warns exactly once for a guid that is not in the manifest, and stays undefined', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(resolveSprite(MISSING)).toBeUndefined();
+      expect(resolveSprite(MISSING)).toBeUndefined();
+      expect(resolveSprite(MISSING)).toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain(MISSING);
+      expect(String(warn.mock.calls[0][0])).toContain('[Sprite2D]');
+    } finally { warn.mockRestore(); }
+  });
+
+  it('warns for a slice whose parent texture has gone missing', () => {
+    // The slice is registered, but its parent texture guid resolves to nothing.
+    registerSprite(SPRITE, MISSING, PATH, {
+      texture: MISSING, rect: { x: 0, y: 0, w: 8, h: 8 }, pivot: { x: 0.5, y: 0.5 },
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(resolveSprite(SPRITE)).toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain(SPRITE);
+    } finally { warn.mockRestore(); }
+  });
+
+  it('FORGETS a ref that later resolves, so a genuine later break still warns', () => {
+    // The transient window before the manifest loads must not permanently silence a guid — that
+    // is the exact "blank screen, clean console" failure this warning exists to prevent.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(resolveSprite(MISSING)).toBeUndefined();     // transient miss → warns once
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      registerAsset(MISSING, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'webp' });
+      expect(resolveSprite(MISSING)?.url).toContain(PATH); // now resolves → forgotten
+
+      clearManifest();                                    // the asset is genuinely gone
+      expect(resolveSprite(MISSING)).toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(2);              // warns AGAIN, not silently
+    } finally { warn.mockRestore(); }
+  });
+
+  it('does not warn for a non-guid ref (a primitive keyword or external URL)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      resolveSprite('circle');
+      resolveSprite('https://example.com/x.png');
+      expect(warn).not.toHaveBeenCalled();
+    } finally { warn.mockRestore(); }
+  });
+});
+
+describe('resolveBrowserImageUrl — the authored texture TYPE decides the DOM variant (QA-ASSET-0007)', () => {
+  // The regression this locks: `AssetEntry.textureType` was declared, read here, and written by
+  // nobody — `loadManifestJson` dropped the scanner's `textureType` on the floor. With it absent,
+  // `browserVariant` infers the type from the FORMAT, and every `ktx2-*` format infers `3d` ⇒
+  // "no WebP sibling". So a `ui`-typed KTX2 texture (for which the build DOES emit a WebP)
+  // resolved to the raw source PNG — the file production strips. Nothing warned, and re-typing
+  // the texture + re-importing changed nothing in a running editor, because the field never
+  // crossed into the client's map at all.
+  const UI_GUID = '22222222-2222-4222-8222-222222222222';
+
+  it('returns the WebP sibling for a ui-typed KTX2 texture', () => {
+    registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: 'ui' });
+    expect(resolveBrowserImageUrl(UI_GUID)).toContain(PATH + '~webp.webp');
+  });
+
+  it('returns the WebP sibling for a 2d-typed KTX2 texture', () => {
+    registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: '2d' });
+    expect(resolveBrowserImageUrl(UI_GUID)).toContain(PATH + '~webp.webp');
+  });
+
+  it('falls back to the source for a 3d-typed KTX2 texture (no sibling is emitted)', () => {
+    registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: '3d' });
+    const url = resolveBrowserImageUrl(UI_GUID);
+    expect(url).toContain(PATH);
+    expect(url).not.toContain('~');
+  });
+
+  it('carries textureType across a manifest round-trip (load → serialize → load)', () => {
+    loadManifestJson({
+      version: 2,
+      assets: [{ guid: UI_GUID, path: PATH, type: 'texture', texture: { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, textureType: 'ui' }],
+    });
+    expect(resolveBrowserImageUrl(UI_GUID)).toContain(PATH + '~webp.webp');
+
+    const round = serializeManifest();
+    expect(round.assets.find((a) => a.guid === UI_GUID)?.textureType).toBe('ui');
+
+    clearManifest();
+    loadManifestJson(round);
+    expect(resolveBrowserImageUrl(UI_GUID)).toContain(PATH + '~webp.webp');
+  });
+
+  it('forgets its DOM-KTX complaint once the texture gains a browser sibling', () => {
+    // Retype + reimport is the documented repair for the `3d`-typed-KTX2-in-DOM warning, and it
+    // only started taking effect live once textureType reached the runtime manifest — so the
+    // condition genuinely flips mid-session now. A warn-once set that never forgets would let a
+    // retype BACK to `3d` ride on the silence the first warning bought.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: '3d' });
+      resolveBrowserImageUrl(UI_GUID, true);
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: 'ui' });
+      expect(resolveBrowserImageUrl(UI_GUID, true)).toContain('~webp.webp');   // repaired -> forgotten
+
+      registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: '3d' });
+      resolveBrowserImageUrl(UI_GUID, true);
+      expect(warn).toHaveBeenCalledTimes(2);                                   // warns AGAIN
+    } finally { warn.mockRestore(); }
+  });
+
+  it('re-registering without a textureType keeps the one already known', () => {
+    // A loader self-registering on fetch (`registerAsset(id, path, 'texture')`) passes no blocks;
+    // it must not blank the type the scanner established, or the DOM variant would silently
+    // regress to the source URL the first time anything touched the asset.
+    registerAsset(UI_GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, { textureType: 'ui' });
+    registerAsset(UI_GUID, PATH, 'texture');
+    expect(resolveBrowserImageUrl(UI_GUID)).toContain(PATH + '~webp.webp');
   });
 });

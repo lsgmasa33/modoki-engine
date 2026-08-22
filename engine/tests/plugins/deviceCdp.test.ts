@@ -237,6 +237,91 @@ describe('tryDeviceCdpInput — routing choice (#32 Phase 1)', () => {
     expect(sender.calls).toEqual([]);
   });
 
+  // ── #305: the TRUSTED route must release a held device_pointer press too ──
+  // The synthetic path supersedes a hold inside handleTap/handleDrag; this route never reaches
+  // them (it resolves the aim in-page, then injects host-side), so it has to ask the bridge.
+  // Measured on an S22 before this: after a trusted tap the bridge still said `held:true` while
+  // pointerSource had already handed the gesture to the tap via #299's takeover, so the next
+  // `down` was refused as "already held" with nothing actually held.
+  const aimThen = (releaseReply: unknown): CdpRouteDeps['proxy'] =>
+    async (method: string) => (method === 'release-held-pointer'
+      ? releaseReply
+      : JSON.stringify({ x: 1, y: 2, label: 'css(1,2)' }));
+
+  it('asks the bridge to release a held press BEFORE dispatching the trusted tap', async () => {
+    const sender = fakeSender();
+    const seen: string[] = [];
+    const proxy: CdpRouteDeps['proxy'] = async (method: string) => {
+      seen.push(method);
+      return method === 'release-held-pointer'
+        ? JSON.stringify({ released: 'left at 10.0,20.0 on canvas:hit' })
+        : JSON.stringify({ x: 1, y: 2, label: 'css(1,2)' });
+    };
+    const r = await tryDeviceCdpInput('tap', { x: 1, y: 2 }, depsWithSession(sender as unknown as DeviceCdpSession, proxy));
+    // Order is the assertion: released, THEN dispatched.
+    expect(seen).toEqual(['resolve-aim', 'release-held-pointer']);
+    expect(r.handled && r.reply).toContain('released a pointer left held');
+    expect(sender.calls.some((c) => c.method === 'Input.dispatchTouchEvent')).toBe(true);
+  });
+
+  it('WIRE SHAPE: the release reply is a JSON STRING, and reading it as an object loses the note', async () => {
+    // The trap this whole describe block exists for. A bridge handler returning an object arrives
+    // as a JSON string; a cast would read `.released` as undefined, the release would still happen
+    // on-device, and the reply would simply never mention it — a quiet wrong answer.
+    const sender = fakeSender();
+    const r = await tryDeviceCdpInput(
+      'tap', { x: 1, y: 2 },
+      depsWithSession(sender as unknown as DeviceCdpSession, aimThen(JSON.stringify({ released: 'left at 5.0,6.0 on canvas:hit' }))),
+    );
+    expect(r.handled && r.reply).toContain('left at 5.0,6.0');
+  });
+
+  it('says nothing when nothing was held — no phantom note on an ordinary tap', async () => {
+    const sender = fakeSender();
+    const r = await tryDeviceCdpInput(
+      'tap', { x: 1, y: 2 },
+      depsWithSession(sender as unknown as DeviceCdpSession, aimThen(JSON.stringify({ released: null }))),
+    );
+    expect(r.handled && r.reply).not.toContain('released a pointer left held');
+    expect(r.handled && r.reply).toContain(`[input:${TRUSTED_CDP_MECHANISM}]`);
+  });
+
+  it('an app too old to know the op still taps — bookkeeping is never worth refusing input over', async () => {
+    // A device running an older build is the NORMAL case, not an edge one: the bridge answers an
+    // unknown method by returning the string. The gesture must proceed regardless.
+    const sender = fakeSender();
+    const r = await tryDeviceCdpInput(
+      'tap', { x: 1, y: 2 },
+      depsWithSession(sender as unknown as DeviceCdpSession, aimThen('Unknown method: release-held-pointer')),
+    );
+    expect(r.handled && r.reply).toContain(`[input:${TRUSTED_CDP_MECHANISM}]`);
+    expect(r.handled && r.reply).not.toContain('released a pointer left held');
+    expect(sender.calls.some((c) => c.method === 'Input.dispatchTouchEvent')).toBe(true);
+  });
+
+  it('a THROWING release still taps — the same reason, one transport failure over', async () => {
+    const sender = fakeSender();
+    const proxy: CdpRouteDeps['proxy'] = async (method: string) => {
+      if (method === 'release-held-pointer') throw new Error('socket hiccup');
+      return JSON.stringify({ x: 1, y: 2, label: 'css(1,2)' });
+    };
+    const r = await tryDeviceCdpInput('tap', { x: 1, y: 2 }, depsWithSession(sender as unknown as DeviceCdpSession, proxy));
+    expect(r.handled && r.reply).toContain(`[input:${TRUSTED_CDP_MECHANISM}]`);
+    expect(sender.calls.some((c) => c.method === 'Input.dispatchTouchEvent')).toBe(true);
+  });
+
+  it('a REFUSED aim releases nothing — a call that dispatches nothing must steal nothing', async () => {
+    const sender = fakeSender();
+    const seen: string[] = [];
+    const proxy: CdpRouteDeps['proxy'] = async (method: string) => {
+      seen.push(method);
+      return 'Error: selector "#nope" did not resolve';
+    };
+    const r = await tryDeviceCdpInput('tap', { selector: '#nope' }, depsWithSession(sender as unknown as DeviceCdpSession, proxy));
+    expect(r).toEqual({ handled: true, reply: 'Error: selector "#nope" did not resolve' });
+    expect(seen).toEqual(['resolve-aim']); // the release was never asked for
+  });
+
   it('a mid-gesture CDP failure REFUSES rather than falling back — a stuck finger must not be double-tapped', async () => {
     // cdpTap = touchStart → hold → touchEnd. A failure between them leaves a finger DOWN; falling
     // back to synthetic would then deliver a second complete gesture on top of it.
@@ -376,10 +461,10 @@ describe('CDP forward lifecycle — the tunnel is torn down (#160)', () => {
   it('a candidate that fails its probe does not leave its rule behind', async () => {
     const s = stubDiscovery({ sockets: '0000 0002 0001 @webview_devtools_remote_1234\n', fail: true });
     try {
-      expect(await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFCTB0EV83K' })).toBeNull();
+      expect(await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFDEADBEEF1' })).toBeNull();
       // The bug: `forward` ran, discovery declined the candidate, and the rule survived the call.
       expect(s.forward).toHaveBeenCalledTimes(1);
-      expect(s.remove).toHaveBeenCalledWith(9335, 'RFCTB0EV83K');
+      expect(s.remove).toHaveBeenCalledWith(9335, 'RFDEADBEEF1');
     } finally { s.restore(); resetDeviceCdpSession(); }
   });
 
@@ -389,8 +474,8 @@ describe('CDP forward lifecycle — the tunnel is torn down (#160)', () => {
       version: { 'Android-Package': 'com.other.app' }, list: PAGE,
     });
     try {
-      expect(await discoverDeviceCdpTarget({ localPort: 9335, preferPackage: 'com.modokiengine.sling', serial: 'RFCTB0EV83K' })).toBeNull();
-      expect(s.remove).toHaveBeenCalledWith(9335, 'RFCTB0EV83K');
+      expect(await discoverDeviceCdpTarget({ localPort: 9335, preferPackage: 'com.modokiengine.sling', serial: 'RFDEADBEEF1' })).toBeNull();
+      expect(s.remove).toHaveBeenCalledWith(9335, 'RFDEADBEEF1');
     } finally { s.restore(); resetDeviceCdpSession(); }
   });
 
@@ -400,7 +485,7 @@ describe('CDP forward lifecycle — the tunnel is torn down (#160)', () => {
       version: { 'Android-Package': 'com.modokiengine.sling' }, list: PAGE,
     });
     try {
-      const target = await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFCTB0EV83K' });
+      const target = await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFDEADBEEF1' });
       expect(target?.androidPackage).toBe('com.modokiengine.sling');
       expect(s.remove).not.toHaveBeenCalled();
     } finally { s.restore(); resetDeviceCdpSession(); }
@@ -412,9 +497,9 @@ describe('CDP forward lifecycle — the tunnel is torn down (#160)', () => {
       version: { 'Android-Package': 'com.modokiengine.sling' }, list: PAGE,
     });
     try {
-      await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFCTB0EV83K' });
+      await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFDEADBEEF1' });
       resetDeviceCdpSession();
-      expect(s.remove).toHaveBeenCalledWith(9335, 'RFCTB0EV83K');
+      expect(s.remove).toHaveBeenCalledWith(9335, 'RFDEADBEEF1');
       // Latch cleared: a second teardown must not re-issue a removal for a rule already gone —
       // with a sibling clone's rule potentially now on that port, that is the #158 hazard.
       s.remove.mockClear();
@@ -430,7 +515,7 @@ describe('CDP forward lifecycle — the tunnel is torn down (#160)', () => {
     });
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFCTB0EV83K' });
+      await discoverDeviceCdpTarget({ localPort: 9335, serial: 'RFDEADBEEF1' });
       s.remove.mockImplementation(() => { throw new Error('adb: device not found'); });
       expect(() => resetDeviceCdpSession()).not.toThrow();
       expect(warn).toHaveBeenCalled();

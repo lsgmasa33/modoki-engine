@@ -1,7 +1,7 @@
 /**
  * @modoki/toolchain — the single place the editor RESOLVES an external CLI tool.
  *
- * Phase 2 of the editor-shipping plan (docs/plans/editor-toolchain-layer-plan.md). Today "how do I
+ * Phase 2 of the editor-shipping plan (docs/editor-toolchain.md). Today "how do I
  * find/run tool X" is answered inline at ~30 spawn sites, each with its own strategy — including a
  * real bug: rigged-model-optimize.ts spawned bare `toktx`, ignoring the bundled MODOKI_TOKTX path,
  * so KTX2 compression of rigged GLBs silently failed in the packaged editor. This module collapses
@@ -24,9 +24,10 @@ import path from 'node:path'
 import { ensureJdk, discoverJavaHome, jdkVersionDir } from './jdkProvision'
 import { ensureCmdlineTools, runSdkmanager, ANDROID_SDK_PACKAGES } from './androidSdkProvision'
 import { ensureRuby, rubyDirFor } from './rubyProvision'
+import { ensureGoIos, goIosBinFor } from './goIosProvision'
 import { ensureWda, wdaBuildStatus, PINNED_WDA, type CommandRunner as WdaCommandRunner } from './wdaProvision'
 
-export type ToolId = 'toktx' | 'android-sdk' | 'npm' | 'java' | 'xcodebuild' | 'gltf-transform-cli' | 'gltfpack' | 'cocoapods' | 'ffmpeg' | 'ffprobe' | 'msdf-atlas-gen' | 'webdriveragent'
+export type ToolId = 'toktx' | 'android-sdk' | 'npm' | 'java' | 'xcodebuild' | 'gltf-transform-cli' | 'gltfpack' | 'cocoapods' | 'ffmpeg' | 'ffprobe' | 'msdf-atlas-gen' | 'webdriveragent' | 'go-ios'
 
 /** How a resolved tool is located. `env` = an env override; `path` = a bare binary found on PATH;
  *  `probe` = a candidate directory that exists (directory tools like the Android SDK). */
@@ -352,6 +353,26 @@ const REGISTRY: Record<ToolId, ToolDescriptor> = {
       'ffprobe not found — needed for audio import stats. Install it from the Build Support ' +
       "dialog, or run `install('ffprobe')`.",
   },
+  'go-ios': {
+    kind: 'binary',
+    // Hands-free install+launch on an iOS device that `devicectl` cannot reach (it is CoreDevice-
+    // only ⇒ iOS 17+). Without it, `Build → iOS Device` on an older phone builds fine and then
+    // hands off to Xcode for a manual ⌘R. Provisioned as a pinned, sha256-verified universal
+    // binary under <toolchainDir>/go-ios (see goIosProvision.ts for why not the npm package).
+    //
+    // The PATH fallback is deliberate but note what it means: the binary is named plainly `ios`,
+    // so a bare `ios` on PATH is only *probably* this tool. Everything we do with it is
+    // additive — a wrong `ios` fails the install step and the build falls back to the Xcode
+    // handoff it would have taken anyway — so the failure mode is the status quo, not damage.
+    envVar: 'MODOKI_GO_IOS',
+    extraCandidates: () => (process.env.MODOKI_TOOLCHAIN_DIR ? [goIosBinFor(path.join(process.env.MODOKI_TOOLCHAIN_DIR, 'go-ios'))] : []),
+    bin: 'ios',
+    versionArgs: ['version'], // prints {"version":"1.3.2"} on stdout (WARN lines go to stderr)
+    missingMsg:
+      'go-ios not found — without it, deploying to an iOS 16-or-older device stops after the build ' +
+      'and hands off to Xcode for a manual Run (⌘R). Install it from the Build Support dialog, or ' +
+      "run `install('go-ios')`. (iOS 17+ devices use Apple's own devicectl and never need it.)",
+  },
 }
 
 /** A resolved tool command that Windows cannot spawn/execFile without a shell: a `.cmd`/`.bat`
@@ -617,15 +638,19 @@ function systemJavaHomeCandidates(): string[] {
 const cache = new Map<ToolId, DetectResult>()
 
 function probeVersion(cmd: string, versionArgs: string[], env?: NodeJS.ProcessEnv): string | null {
-  try {
-    // A `.cmd`/`.bat` shim (npm .bin on Windows, sdkmanager.bat) needs a shell or execFile throws
-    // EINVAL — which otherwise reads as a just-installed tool being "not found" in Build Support.
-    const { command, args, shell } = spawnable(cmd, versionArgs)
-    const out = execFileSync(command, args, { stdio: ['ignore', 'pipe', 'pipe'], shell, ...(env ? { env } : {}) })
-    return out.toString().trim()
-  } catch {
-    return null
-  }
+  // A `.cmd`/`.bat` shim (npm .bin on Windows, sdkmanager.bat) needs a shell or execFile throws
+  // EINVAL — which otherwise reads as a just-installed tool being "not found" in Build Support.
+  const { command, args, shell } = spawnable(cmd, versionArgs)
+  // spawnSync (not execFileSync), reading BOTH streams: several CLIs print their version banner to
+  // STDERR and exit 0 — `java -version` is the well-known one (see javaMajorMatches), and toktx does
+  // the same (confirmed live: `toktx --version` writes "toktx v4.4.2" to stderr, empty stdout).
+  // execFileSync's return value is stdout-only, so toktx probed as `present:true, version:""` —
+  // functionally fine (KTX2 encoding doesn't go through this probe), but Build Support could never
+  // show its version. Concatenating both, stdout first, fixes toktx without changing any tool that
+  // already prints to stdout (nothing here has meaningful content on BOTH streams at once).
+  const r = spawnSync(command, args, { stdio: ['ignore', 'pipe', 'pipe'], shell, encoding: 'utf8', ...(env ? { env } : {}) })
+  if (r.error || r.status !== 0) return null
+  return `${r.stdout ?? ''}${r.stderr ?? ''}`.trim()
 }
 
 function detectBinary(id: ToolId, d: BinaryDescriptor): DetectResult {
@@ -957,7 +982,7 @@ export const TOOL_IDS = Object.keys(REGISTRY) as ToolId[]
 
 /** Tools that `install()` can provision automatically (vs `guide()`-only, like Xcode). Grows as
  *  more installers land (gltfpack, android-sdk, java/jdk, cocoapods). */
-export const INSTALLABLE: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'java', 'android-sdk', 'ffmpeg', 'ffprobe'])
+export const INSTALLABLE: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'java', 'android-sdk', 'ffmpeg', 'ffprobe', 'go-ios'])
 
 /** PINNED versions for the CLI/gem tools we install by name (unlike Node/JDK/Ruby, whose version is
  *  in the download URL). Pinning makes installs reproducible (dev == packaged) AND lets a pin bump
@@ -968,6 +993,75 @@ export const PINNED_TOOL_VERSIONS: Partial<Record<ToolId, string>> = {
   'gltf-transform-cli': '4.4.1',
   gltfpack: '1.2.0',
   cocoapods: '1.17.0',
+}
+
+/** Pin every `sharp` in the shared `npm-tools` tree to ONE version, via npm `overrides`. Without
+ *  this, `@gltf-transform/cli` (`sharp: ~0.34.5`) and `ndarray-pixels` — a transitive dep of
+ *  `@gltf-transform/functions`, pulled in unconditionally even when a `sharp` encoder is supplied
+ *  (`sharp: ^0.35.0`) — sit on genuinely non-overlapping ranges, so npm correctly nests TWO native
+ *  sharp/libvips builds in one tree. On Windows, loading both into the same process corrupts the
+ *  shared GObject type registry: the SECOND-loaded libvips' colourspace enum no longer matches what
+ *  the FIRST-loaded one compiled against, and any subsequent resize crashes —
+ *  `GLib-GObject-CRITICAL: value "32" of type 'gint' is invalid or out of range for property
+ *  'space' of type 'VipsInterpretation'` / `colourspace: parameter space not set` — which
+ *  `rigged-model-optimize.ts` surfaces as "gltf-transform resize failed" and falls back to shipping
+ *  the raw, unoptimized GLB (failing the build's "no unoptimized production assets" gate). 0.34.5
+ *  satisfies both packages' actual usage (plain `.raw()`/`.resize()`/`.toFormat()` — nothing
+ *  0.35-only) and is what `@gltf-transform/cli` already resolves to, so pinning down to it costs
+ *  nothing. Reproduced + isolated to the double-native-load 2026-08-22; not observed on macOS. */
+export const PINNED_SHARP_OVERRIDE = '0.34.5'
+
+/** What to do with the shared `npm-tools/package.json` to get `overrides.sharp` pinned.
+ *
+ *  A pure decision so it can be tested without npm, a network, or a real toolchain dir — the
+ *  behaviour that matters is entirely in the branching, and one branch is destructive.
+ *
+ *  - `absent`      → no file: write the minimal package.json with the override.
+ *  - `ok`          → already pinned: touch nothing (this is what stops a reinstall loop, since
+ *                    `npm install` rewrites this file on every call).
+ *  - `patch`       → parsed, wrong/missing override: write `pkg` back — it PRESERVES everything
+ *                    npm already wrote, `dependencies` above all, and the caller then wipes
+ *                    node_modules so npm re-resolves the tree with the override in force.
+ *  - `unreadable`  → present but not JSON: **do nothing.** Falling back to the minimal default
+ *                    here would overwrite the corrupt file with one carrying NO `dependencies`,
+ *                    and the caller's wipe would then leave the tree holding only `specPkg` —
+ *                    every other tool silently gone. Let npm fail loudly on the bad file instead.
+ */
+export type SharpOverridePlan =
+  | { action: 'absent' | 'patch'; pkg: Record<string, unknown> }
+  | { action: 'ok' | 'unreadable' }
+
+export function planSharpOverride(existingText: string | null): SharpOverridePlan {
+  const base = { name: 'modoki-toolchain-tools', private: true, version: '0.0.0' }
+  if (existingText === null) {
+    return { action: 'absent', pkg: { ...base, overrides: { sharp: PINNED_SHARP_OVERRIDE } } }
+  }
+  let parsed: Record<string, unknown>
+  try {
+    parsed = JSON.parse(existingText) as Record<string, unknown>
+  } catch {
+    return { action: 'unreadable' }
+  }
+  const overrides = (parsed.overrides ?? {}) as { sharp?: string }
+  if (overrides.sharp === PINNED_SHARP_OVERRIDE) return { action: 'ok' }
+  return { action: 'patch', pkg: { ...parsed, overrides: { ...overrides, sharp: PINNED_SHARP_OVERRIDE } } }
+}
+
+/** True when the shared `npm-tools/package.json` EXISTS (proving `npmToolsInstall` has run before)
+ *  but its `overrides.sharp` is missing or wrong — evidence of a real install from before this pin
+ *  existed, which needs the self-heal reinstall. A toolchain dir where the file is simply ABSENT
+ *  (never installed here at all) is not this case: the next real `npmToolsInstall` writes the pin
+ *  correctly the first time, so there's nothing to flag. Synchronous + cheap, safe to call from
+ *  `isToolStale` on every status probe. */
+function npmToolsSharpOverrideMissing(toolchainDir: string): boolean {
+  const pkgJson = path.join(npmToolsDir(toolchainDir), 'package.json')
+  if (!fs.existsSync(pkgJson)) return false
+  try {
+    const parsed = JSON.parse(fs.readFileSync(pkgJson, 'utf8')) as { overrides?: { sharp?: string } }
+    return parsed.overrides?.sharp !== PINNED_SHARP_OVERRIDE
+  } catch {
+    return false // an unreadable/corrupt file isn't THIS check's problem to flag
+  }
 }
 
 /** Whether `version` (a tool's raw `--version` output) reports the pinned release. Matching is
@@ -989,10 +1083,16 @@ export function versionMatchesPin(version: string, pin: string): boolean {
  *  install (resolved path under MODOKI_TOOLCHAIN_DIR); a system/PATH tool a dev installed is left
  *  alone. */
 export function isToolStale(id: ToolId, d: DetectResult): boolean {
-  const pin = PINNED_TOOL_VERSIONS[id]
-  if (!pin || !d.present || !d.version) return false
+  if (!d.present) return false
   const tc = process.env.MODOKI_TOOLCHAIN_DIR
   if (!tc || !d.path || !d.path.startsWith(tc)) return false // not our install → don't touch it
+  // Both share the `npm-tools` tree with `ndarray-pixels`' own `sharp` (see PINNED_SHARP_OVERRIDE) —
+  // an install from BEFORE that pin existed is present and version-correct, yet still broken. Catch
+  // it here rather than only in a fresh install, so an existing broken machine self-heals the next
+  // time Build Support re-checks status, without the user needing to know to click "Reinstall".
+  if ((id === 'gltf-transform-cli' || id === 'gltfpack') && npmToolsSharpOverrideMissing(tc)) return true
+  const pin = PINNED_TOOL_VERSIONS[id]
+  if (!pin || !d.version) return false
   return !versionMatchesPin(d.version, pin)
 }
 
@@ -1162,6 +1262,9 @@ export interface InstallResult {
  *  iOS/CocoaPods is macOS-only). So it's installable on darwin, guided elsewhere. */
 export function isInstallable(id: ToolId): boolean {
   if (id === 'cocoapods') return process.platform === 'darwin'
+  // go-ios builds for Linux/Windows too, but Modoki's iOS builds are macOS-only (xcodebuild does
+  // the compile + signing; go-ios only replaces the INSTALL), so it could not be used elsewhere.
+  if (id === 'go-ios') return process.platform === 'darwin'
   // WDA is BUILT by xcodebuild, so it is macOS-only for the same reason CocoaPods is — and, unlike
   // every other installable tool, it also needs a signing identity, which install() checks.
   if (id === 'webdriveragent') return process.platform === 'darwin'
@@ -1218,6 +1321,15 @@ export async function install(id: ToolId, opts: { toolchainDir: string; onLog?: 
   if (id === 'ffmpeg') return installNpmBinaryTool('ffmpeg-static', FFMPEG_NPM_VERSION, ffmpegToolBin, opts)
   if (id === 'ffprobe') return installNpmBinaryTool('@ffprobe-installer/ffprobe', FFPROBE_NPM_VERSION, ffprobeToolBin, opts)
   if (id === 'cocoapods') return installCocoapods(opts)
+  if (id === 'go-ios') {
+    // Pinned + sha256-verified universal binary from the GitHub release (see goIosProvision.ts).
+    // NOT in AUTO_INSTALL on purpose: it is 17 MB down / 45 MB on disk and only matters when you
+    // deploy to an iOS ≤16 device, so /api/build provisions it at the exact moment a build needs
+    // it, and the Build Support dialog offers it as a button. Nobody else pays for it.
+    const { bin } = await ensureGoIos(path.join(opts.toolchainDir, 'go-ios'), { onLog: opts.onLog })
+    resetToolchainCache()
+    return { path: bin }
+  }
   if (id === 'webdriveragent') {
     // Fetch the pinned WDA source and build+sign it for THIS machine. Only the build lives here;
     // launching it against a device is a per-lease lifecycle owned by the device code (plan
@@ -1278,6 +1390,7 @@ function toolOwnedDirs(id: ToolId, toolchainDir: string): string[] {
     // Both the fetched source and our DerivedData live under here, which is why the build is kept
     // out of the user's ~/Library DerivedData: "Remove all tools" must actually remove it.
     case 'webdriveragent': return [path.join(toolchainDir, 'wda')]
+    case 'go-ios': return [path.join(toolchainDir, 'go-ios')]
     default: return []
   }
 }
@@ -1289,8 +1402,55 @@ export function isRemovable(id: ToolId): boolean {
   const d = detect(id)
   if (!d.present) return false
   if (id === 'gltf-transform-cli' || id === 'gltfpack' || id === 'ffmpeg' || id === 'ffprobe') return !!d.path?.includes('npm-tools')
+  // go-ios's binary is named plainly `ios`, so a PATH hit is only PROBABLY ours (see its registry
+  // entry). Offering "Remove" for a binary we never provisioned is a UI lie — the same reason
+  // cocoapods checks its source below. Ours lives under the toolchain dir; nothing else counts.
+  if (id === 'go-ios') return !!process.env.MODOKI_TOOLCHAIN_DIR && !!d.path?.startsWith(process.env.MODOKI_TOOLCHAIN_DIR)
   if (id === 'cocoapods') return d.source === 'probe' // our provisioned pod (not a system one)
   return toolOwnedDirs(id, process.env.MODOKI_TOOLCHAIN_DIR).length > 0
+}
+
+/** Windows process-image extensions — what `Win32_Process.ExecutablePath` can actually point at.
+ *  A `.bat`/`.cmd`/`.ps1` is NOT one: running a script makes the interpreter (cmd.exe/powershell.exe)
+ *  the process, and ITS ExecutablePath is in System32, so such a script can never match the sweep's
+ *  `-like '<dir>\\*'` predicate. */
+const WIN_PROCESS_IMAGE_EXTS = new Set(['.exe', '.com', '.scr'])
+
+/** Does `dir` hold anything that could BE a running process's image? Walks depth-first and bails on
+ *  the first hit, so a real JDK answers in a few entries (`bin/java.exe`) rather than statting the
+ *  whole tree. Deliberately conservative in both failure directions: an unreadable dir and a symlink
+ *  (whose target we don't follow, and whose resolved ExecutablePath we therefore can't reason about)
+ *  both answer `true`, because a needless sweep is merely slow whereas a skipped one risks the
+ *  half-deleted tool this whole function exists to prevent. */
+function containsProcessImage(dir: string): boolean {
+  const stack = [dir]
+  while (stack.length > 0) {
+    const cur = stack.pop()!
+    let entries: fs.Dirent[]
+    try { entries = fs.readdirSync(cur, { withFileTypes: true }) } catch { return true }
+    for (const e of entries) {
+      if (e.isSymbolicLink()) return true
+      if (e.isDirectory()) stack.push(path.join(cur, e.name))
+      else if (e.isFile() && WIN_PROCESS_IMAGE_EXTS.has(path.extname(e.name).toLowerCase())) return true
+    }
+  }
+  return false
+}
+
+/** Whether `forceRemoveDir` should pay for the PowerShell process sweep before deleting `dir`.
+ *
+ *  The sweep's predicate is `ExecutablePath -like '<dir>\\*'`, so it can ONLY ever match a process
+ *  whose image lives under `dir`. With no such image there, the query provably matches nothing —
+ *  skipping it is semantics-preserving, not a heuristic, and the Gradle-daemon protection is kept
+ *  wherever it can actually fire.
+ *
+ *  Why it's worth a scan to avoid: the sweep is a synchronous cold PowerShell start plus a FULL WMI
+ *  process enumeration, seconds of wall-clock on a loaded machine. It timed out `uninstall('java')`
+ *  on a shared CI runner (#313) against a freshly-created EMPTY dir — where the sweep was pure
+ *  overhead by construction. (platform-injectable for tests, so a non-Windows host can exercise it.) */
+export function shouldSweepProcesses(dir: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (platform !== 'win32') return false
+  return containsProcessImage(dir)
 }
 
 /** Remove a directory robustly, tolerating Windows file locks. `force+recursive` clears read-only
@@ -1299,10 +1459,12 @@ export function isRemovable(id: ToolId): boolean {
  *  the user can't clean up. On Windows we first best-effort kill any process whose executable lives
  *  UNDER `dir` (scoped to the path — our own provisioned binaries, never the user's other apps),
  *  then rmSync WITH retries (Node retries EBUSY/EPERM/ENOTEMPTY on Windows). A persistent lock gets
- *  an actionable error instead of a silent partial delete. No-op on POSIX (no exec, plain retries). */
+ *  an actionable error instead of a silent partial delete. No-op on POSIX (no exec, plain retries).
+ *  The kill sweep is gated by `shouldSweepProcesses` — it is skipped when nothing under `dir` could
+ *  be a process image, which is provably equivalent and avoids a multi-second WMI query (#313). */
 function forceRemoveDir(dir: string): void {
   if (!fs.existsSync(dir)) return
-  if (process.platform === 'win32') {
+  if (shouldSweepProcesses(dir)) {
     try {
       const esc = dir.replace(/'/g, "''")
       const ps = `Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${esc}\\*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`
@@ -1375,8 +1537,23 @@ async function npmToolsInstall(toolchainDir: string, specPkg: string, log: (line
   const dir = npmToolsDir(toolchainDir)
   fs.mkdirSync(dir, { recursive: true })
   const pkgJson = path.join(dir, 'package.json')
-  if (!fs.existsSync(pkgJson)) {
-    fs.writeFileSync(pkgJson, JSON.stringify({ name: 'modoki-toolchain-tools', private: true, version: '0.0.0' }, null, 2) + '\n')
+  // `npm install <pkg>` rewrites `dependencies` into this file on every call (npm's default
+  // save-on-install), so comparing the whole file would wipe+reinstall on EVERY tool install,
+  // forever. Only `overrides.sharp` is our concern — read just that, and preserve everything else
+  // npm has already written (including `dependencies`) when patching it in.
+  const plan = planSharpOverride(fs.existsSync(pkgJson) ? fs.readFileSync(pkgJson, 'utf8') : null)
+  if (plan.action === 'unreadable') {
+    log(`WARNING: ${pkgJson} is not valid JSON — leaving it untouched. npm will report the parse `
+      + `error; delete the file to let the toolchain recreate it (this also reinstalls its tools).`)
+  }
+  if (plan.action === 'absent' || plan.action === 'patch') {
+    fs.writeFileSync(pkgJson, JSON.stringify(plan.pkg, null, 2) + '\n')
+    // The override only takes effect on a tree npm re-resolves from scratch — an existing
+    // node_modules already has the conflicting nested sharp copy laid out, and a plain `npm install`
+    // is not guaranteed to restructure it. Force a clean re-resolve, same as the self-heal path
+    // below for a damaged tree.
+    forceRemoveDir(path.join(dir, 'node_modules'))
+    try { fs.rmSync(path.join(dir, 'package-lock.json'), { force: true }) } catch { /* best-effort */ }
   }
   const spec = npmSpawnSpec()
   log(`Installing ${specPkg}…`)
@@ -1471,6 +1648,8 @@ export { ensureNode, extractArchive, nodeDistFor, PINNED_NODE, nodeDistKey, type
 export { ensureJdk, discoverJavaHome, javaBinName, jdkVersionDir, PINNED_JDK, jdkDistKey, type ProvisionedJdk } from './jdkProvision'
 // On-demand portable-Ruby provisioning: the brew-free CocoaPods path (gem-installs CocoaPods on it).
 export { ensureRuby, rubyDistKey, rubyDirFor, PINNED_RUBY, type ProvisionedRuby } from './rubyProvision'
+// On-demand go-ios provisioning: hands-free install+launch on an iOS ≤16 device (no ⌘R handoff).
+export { ensureGoIos, goIosBinFor, goIosDirFor, PINNED_GO_IOS, type ProvisionedGoIos } from './goIosProvision'
 // On-demand Android SDK provisioning (E-3): cmdline-tools bootstrap + sdkmanager packages/licenses.
 export {
   ensureCmdlineTools, runSdkmanager, sdkmanagerPath, cmdlineToolsKey,

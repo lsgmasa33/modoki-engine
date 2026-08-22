@@ -14,15 +14,16 @@ import net from 'net';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
-import { DeviceConnectionManager, adbRunner, releaseDeviceResourcesOnExit, reclaimStaleForwardsAtStartup } from '../../plugins/backend/deviceConnection';
+import { DeviceConnectionManager, adbRunner, releaseDeviceResourcesOnExit, reclaimStaleDeviceStateAtStartup } from '../../plugins/backend/deviceConnection';
 import { androidDevicesExec, _clearFriendlyNameCache } from '../../plugins/backend/androidDevices';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
-import { listClaims } from '../../plugins/backend/deviceClaims';
+import { claimsDir, listClaims } from '../../plugins/backend/deviceClaims';
 import { deviceCdpAdb, discoverDeviceCdpTarget, resetDeviceCdpSession } from '../../plugins/backend/deviceCdp';
 
 const realForward = adbRunner.forward;
 const realRemove = adbRunner.removeForward;
 const realListForwards = adbRunner.listForwards;
+const realLogcatDump = adbRunner.logcatDump;
 const realList = androidDevicesExec.list;
 const realDeviceName = androidDevicesExec.deviceName;
 /** One attached, usable phone — the unambiguous case, so these tests exercise the adb branch rather
@@ -37,11 +38,15 @@ let stateDir: string;
 // did not release) — the suite was quietly reproducing the very bug it now guards against.
 let home: string;
 let prevHome: string | undefined;
+let prevBackendPort: string | undefined;
 beforeEach(() => {
   home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
   adbRunner.forward = vi.fn(); adbRunner.removeForward = vi.fn();
+  // A failed adb connect now mines logcat for a fallback port before phrasing its error.
+  // Stubbed for the same reason the forwards are: the real binary must never be invoked here.
+  adbRunner.logcatDump = vi.fn(async () => '');
   androidDevicesExec.list = () => ONE_DEVICE;
   // The friendly-name lookup is a second adb shell — stubbed for the same reason as the listing:
   // un-stubbed it asks the machine's REAL attached phones for their names (#149).
@@ -53,6 +58,13 @@ beforeEach(() => {
   // hold, which would make these tests pass or fail by what else is plugged in. Same hazard as the
   // un-stubbed device listing above. Tests that need a live socket override it.
   process.env.MODOKI_DEVICE_HOST_PORT = '1';
+  // Same hazard as MODOKI_HOME and the device listing above, one variable further out: the
+  // per-clone port DERIVATION reads MODOKI_BACKEND_PORT, so a developer who exports it — which
+  // the Clones table in CLAUDE.md actively encourages — makes these tests derive that clone's
+  // ports instead of the default 9095/9333 the reclaim test pins. The suite then passes or fails
+  // by the shell it was launched from. Cleared here and restored in afterEach.
+  prevBackendPort = process.env.MODOKI_BACKEND_PORT;
+  delete process.env.MODOKI_BACKEND_PORT;
   stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-adb-'));
 });
 afterEach(() => {
@@ -60,7 +72,10 @@ afterEach(() => {
   else process.env.MODOKI_HOME = prevHome;
   fs.rmSync(home, { recursive: true, force: true });
   delete process.env.MODOKI_DEVICE_HOST_PORT;
+  if (prevBackendPort === undefined) delete process.env.MODOKI_BACKEND_PORT;
+  else process.env.MODOKI_BACKEND_PORT = prevBackendPort;
   adbRunner.forward = realForward; adbRunner.removeForward = realRemove; adbRunner.listForwards = realListForwards;
+  adbRunner.logcatDump = realLogcatDump;
   androidDevicesExec.list = realList;
   androidDevicesExec.deviceName = realDeviceName;
   _clearFriendlyNameCache();
@@ -328,7 +343,7 @@ describe('DeviceConnectionManager — useAdb branch', () => {
       ].join('\n');
       (adbRunner.removeForward as ReturnType<typeof vi.fn>).mockClear();
 
-      reclaimStaleForwardsAtStartup();
+      reclaimStaleDeviceStateAtStartup();
 
       const ports = (adbRunner.removeForward as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
       expect(ports.sort()).toEqual([9095, 9333]);
@@ -338,8 +353,32 @@ describe('DeviceConnectionManager — useAdb branch', () => {
     it('reclaims nothing when the ports are clear — the normal startup, and it must stay silent', () => {
       adbRunner.listForwards = () => 'OTHERSERIAL tcp:9334 localabstract:webview_devtools_remote_888';
       (adbRunner.removeForward as ReturnType<typeof vi.fn>).mockClear();
-      reclaimStaleForwardsAtStartup();
+      reclaimStaleDeviceStateAtStartup();
       expect(adbRunner.removeForward).not.toHaveBeenCalled();
+    });
+
+    /** #225 — the claims half of the same startup hook.
+     *
+     *  A dead-pid claim never BLOCKED another clone (every reader applies `isStale`, and
+     *  `deviceClaims.test.ts` measures that directly). What it did was sit in
+     *  `~/.modoki/device-claims.json` naming a clone, a branch and a purpose — a file CLAUDE.md
+     *  tells an agent to read as "did I give the phone back" — so the corpse read as a live hold
+     *  and was hand-deleted twice before it became an issue. Startup is where it gets swept,
+     *  because `stop-editor.sh` sends a SIGTERM that no in-process hook survives. */
+    it('sweeps a dead-pid claim out of the claims FILE at startup, leaving live ones', () => {
+      const file = path.join(claimsDir(), 'device-claims.json');
+      fs.mkdirSync(claimsDir(), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({ claims: [
+        { deviceId: 'adb:THEIRS', clone: '/Users/x/Projects/modoki-ai3', branch: 'work-ai3', pid: 424242, at: Date.now(), purpose: 'holding a device lease over USB' },
+        { deviceId: 'adb:MINE', clone: '/Users/x/Projects/modoki', branch: 'main', pid: process.pid, at: Date.now() },
+      ] }));
+      adbRunner.listForwards = () => '';
+
+      reclaimStaleDeviceStateAtStartup();
+
+      const onDisk = JSON.parse(fs.readFileSync(file, 'utf8')).claims as Array<{ deviceId: string }>;
+      expect(onDisk.map((c) => c.deviceId)).toEqual(['adb:MINE']);
+      fs.rmSync(file, { force: true });
     });
 
     it('is a no-op when nothing is held — a bare import must not touch adb on exit', () => {

@@ -1,14 +1,39 @@
 import type { PluginListenerHandle } from '@capacitor/core';
 
+/** The fault shapes {@link GameDebugPlugin.triggerFault} can raise.
+ *
+ *  - `crash` — a genuine native crash on BOTH platforms: Android sends itself SIGSEGV
+ *    (`Process.sendSignal(myPid(), 11)`), iOS dereferences a bad pointer (`EXC_BAD_ACCESS`).
+ *    ⚠️ Android REPORTING of a signal crash needs `firebase-crashlytics-ndk` on the classpath —
+ *    the Java handler never sees a signal, so without it the fault is real and only an
+ *    `ApplicationExitInfo` row arrives. Triggering and reporting are separate questions and this
+ *    only answers the first; see docs/debug-menu.md § Faults for how to tell them apart in logcat.
+ *  - `anr` — Android only. Blocks the real main looper for `blockMs` (default 45000). TWO steps are
+ *    needed and each closes a different gap: the system raises an ANR on an INPUT/broadcast timeout
+ *    (so tap the screen during the block), and the REPORT exists only if the process then DIES of it
+ *    (so choose "Close app" in the system dialog). Measured on an S22: a 15 s block that ends on its
+ *    own produces a system-confirmed ANR, no ApplicationExitInfo record, and no report.
+ *  - `uncaught` — Android only. An uncaught `RuntimeException` on the UI thread — the canonical
+ *    Android fatal, and a different handler from Firebase's own synthetic `crash()`.
+ *
+ *  iOS rejects `anr` and `uncaught` rather than approximating them. It has no ANR: the watchdog
+ *  (0x8badf00d) only kills during launch/suspend transitions, not steady-state foreground, and
+ *  Crashlytics does not report hangs at all — MetricKit's `MXHangDiagnostic` is the only oracle,
+ *  which is a different subsystem, not a probe. */
+export type FaultKind = 'crash' | 'anr' | 'uncaught';
+
 export interface GameDebugPlugin {
   /** Start the TCP server + UDP beacon */
-  startServer(options?: { port?: number }): Promise<{ port: number }>;
+  /** Start the TCP bridge. Binds the default port (9095), retrying briefly while another Modoki
+   *  app is still releasing it, and only then accepting an OS-assigned one — `fallbackPort` is
+   *  true in that case, which means no host can reach this app without being told `port` (#283). */
+  startServer(options?: { port?: number }): Promise<{ port: number; fallbackPort?: boolean }>;
 
   /** Stop the server */
   stopServer(): Promise<{ ok: boolean }>;
 
   /** Check if server is running and has a connected client */
-  getStatus(): Promise<{ running: boolean; clientConnected: boolean; port: number }>;
+  getStatus(): Promise<{ running: boolean; clientConnected: boolean; port: number; fallbackPort?: boolean }>;
 
   /** Send a response back to the connected MCP client */
   sendResponse(options: { id: string; result?: string; error?: string }): Promise<{ ok: boolean }>;
@@ -44,6 +69,23 @@ export interface GameDebugPlugin {
    *  too. Deliberately NOT `@capacitor/device`: that plugin is optional and no Modoki project
    *  installs it, so reading it made the first version of #146 inert on every real device. */
   getDeviceHardware(): Promise<{ model: string; osVersion: string }>;
+
+  /** Raise a DELIBERATE native fault, so the crash pipeline can be proven against the shapes a
+   *  shipped game actually dies of (#278). Every kind KILLS OR FREEZES the app on purpose.
+   *
+   *  Why native at all: #275 proved the JS half end to end, and JS cannot reach any of this.
+   *  Android's WebView renderer is a separate sandboxed process, so blocking the JS thread for
+   *  8 s raises no ANR (measured 8002 ms, nothing reported); a Java exception and a signal crash
+   *  each take a different route into Crashlytics than anything `globalErrors.ts` can produce.
+   *
+   *  Gated on the SAME `build.debugBuild` flag as the debug bridge — the Android manifest
+   *  meta-data, the iOS Info.plist key — and rejects with that reason when it is off. A release
+   *  build cannot be made to call this.
+   *
+   *  **The promise is not a result.** On `crash` and `uncaught` the process is gone before JS is
+   *  resumed, so the call neither resolves nor rejects; treat a settled promise as "the fault was
+   *  ACCEPTED", never as "the fault happened". The oracle is the crash console, not this return. */
+  triggerFault(options: { kind: FaultKind; blockMs?: number }): Promise<{ ok: boolean }>;
 
   /** Listen for incoming requests from MCP */
   addListener(

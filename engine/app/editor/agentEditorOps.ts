@@ -16,6 +16,7 @@
  *  agent's edits are undoable too. */
 
 import * as THREE from 'three';
+import type { ErrorCode } from '../../tools/shared/mcpResult';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
 import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, inferAssetDefType } from '../debug/agentBridge';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
@@ -32,24 +33,29 @@ import {
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
-  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
+  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets, flushDirtyAssets,
   getPrefabSource, instantiatePrefabAsync, setPrefabSource, serializePrefab, writePrefabFile,
   resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
+  applyToPrefabWithUndo, revertOverridesSelective, rebuildInstance, resolveInstanceContext,
+  collectInstanceOverrideFields, collectInstanceOverrideKeys,
   pushAction, makePrefabInstantiateAction, entityRef,
   getEditorViewportCamera, focusEntityInSceneView,
   upsertKey, findTrack, encodeValue,
+  poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
+  getCreatableAssets, createRegisteredAsset,
   readEditorJournal, clearEditorJournal, withEditorActor, openActorLease, closeActorLease,
   waitForEditorJournal,
   getResolvedRender3d,
+  probeKeyReach,
   type PrefabFile,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
-  getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity,
+  getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity, findUnrenderable2D,
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, getParticleEffect, mountedSurfaces,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetType, getPresentationScale,
-  getSpriteAnim, getRig2D,
+  getSpriteAnim, getRig2D, getRig2DSource,
   getAllTraits, PRIMITIVE_NAMES, PRIMITIVE_SPRITE_NAMES, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
@@ -141,6 +147,9 @@ function readEditorState() {
     // question "which panel would this key go to?" would only be answerable from a screenshot —
     // exactly what docs/debug-tools-mcp.md forbids. (focus-scope refactor P2)
     focusedPanel: s.focusedPanel,
+    // The panel ids that currently have an open tab. Reported so an agent refused by
+    // `set-focus-scope` can see what it may focus instead, without a second round trip (#301).
+    openPanels: s.openPanels,
     // HMR staleness. `staleGameCode: true` means game code changed on disk but the editor
     // could NOT reload (unsaved scene work), so this world is running the OLD build —
     // every measurement taken here is suspect until it reloads. `hmrUpdates` is how many
@@ -181,7 +190,7 @@ function readEditorState() {
     // Percept surface (previously answerable only via a raw CDP eval of window.*). `zoomFactor`
     // is the VS Code–style whole-app UI zoom (getPresentationScale is editor-calibrated to
     // webContents.getZoomFactor); `devicePixelRatio` is the raw backing-store ratio (display
-    // scale × zoom). See docs/todo.md (zoom-session MCP gaps).
+    // scale × zoom). See docs/debug-tools-mcp.md.
     viewport: readViewport(),
     // Which on-screen surfaces have a bounds provider mounted RIGHT NOW. A 2D/3D entity aim
     // REQUIRES a `surface` (docs/enact.md), so without this a caller had to guess at exactly the
@@ -212,7 +221,13 @@ interface CreateEntityParams { spec: CreateEntitySpec; parentId?: number; parent
  *  `.prefab.json` in isolation, saving the edited template back, and returning to the scene
  *  it was opened from. They are the only route that re-serializes a prefab file, which is why
  *  the bulk re-save sweep (#125, engine/scripts/resave-prefabs.sh) is built on them. */
-type PrefabAction = 'instantiate' | 'create' | 'detach' | 'edit-open' | 'edit-save' | 'edit-exit';
+type PrefabAction =
+  | 'instantiate' | 'create' | 'detach'
+  // ── override discovery/apply/revert (#2Tkw8CiWRATmHck2ze7q) — the ONLY route by which
+  // an agent can drive the human "Apply to Prefab" / "Revert Overrides" dialogs, which
+  // previously had no agent path at all despite this contract claiming one existed. ──
+  | 'overrides' | 'apply' | 'revert'
+  | 'edit-open' | 'edit-save' | 'edit-exit';
 
 interface PrefabParams {
   /** Which prefab operation. Callers reaching this op DIRECTLY (`runAgentOp`, `modoki_eval`) may
@@ -233,10 +248,17 @@ interface PrefabParams {
   parentId?: number;
   /** instantiate: parent entity guid (stable; wins over parentId). */
   parentGuid?: string;
-  /** create/detach: the entity to make a prefab from / detach. */
+  /** create/detach/overrides/apply/revert: the entity to make a prefab from / detach /
+   *  inspect-or-mutate overrides on. For overrides/apply/revert this must be a prefab
+   *  INSTANCE ROOT (or any member — resolution walks to the instance the entity belongs to
+   *  the same way the human dialogs do: via the entity's own PrefabInstance trait). */
   entityId?: number;
-  /** create/detach: the entity guid (stable; wins over entityId). */
+  /** create/detach/overrides/apply/revert: the entity guid (stable; wins over entityId). */
   entityGuid?: string;
+  /** apply/revert: the override keys to act on (see `overrides`'s `keys.all` for the exact
+   *  strings — `"localId.trait.field"` / `"+added.<guid>"` / `"-removed.<localId>"` /
+   *  `"-trait.<localId>.<name>"`). Omitted ⇒ ALL current overrides on the instance. */
+  keys?: string[];
 }
 
 /** Raw selection write — no undo entry (the agent shouldn't pollute the human's
@@ -463,21 +485,21 @@ function worldFieldsToLocalLive(id: number, fields: Record<string, unknown>): { 
  *  Inside a batch there is no intermediate response in which to notice, and the entity-aimed input
  *  path already refuses exactly this (see `entityResolve.ts`) — so the two halves of the agent
  *  surface disagreed about whether an ambiguous name is addressable. It is not. */
-function resolveLiveEntityRef(ref: MutateEntityRef | undefined): { id: number } | { error: string } {
+function resolveLiveEntityRef(ref: MutateEntityRef | undefined): { id: number } | { error: string; code?: ErrorCode } {
   if (!ref) return { error: 'no entity ref given — pass {guid} | {name} | {id}' };
   if (ref.guid) {
     const e = findEntityByGuid(ref.guid);
-    return e ? { id: e.id() } : { error: `no LIVE entity with guid ${JSON.stringify(ref.guid)}` };
+    return e ? { id: e.id() } : { error: `no LIVE entity with guid ${JSON.stringify(ref.guid)}`, code: 'NOT_FOUND' };
   }
   if (ref.id != null) {
-    return findEntity(ref.id) ? { id: ref.id } : { error: `no LIVE entity with id ${ref.id}` };
+    return findEntity(ref.id) ? { id: ref.id } : { error: `no LIVE entity with id ${ref.id}`, code: 'NOT_FOUND' };
   }
   if (ref.name) {
     const hits = getAllEntities().filter((en) => en.name === ref.name);
-    if (hits.length === 0) return { error: `no LIVE entity named ${JSON.stringify(ref.name)}` };
+    if (hits.length === 0) return { error: `no LIVE entity named ${JSON.stringify(ref.name)}`, code: 'NOT_FOUND' };
     if (hits.length > 1) {
       const which = hits.map((e) => e.guid || `id:${e.id}`).join(', ');
-      return { error: `${hits.length} LIVE entities are named ${JSON.stringify(ref.name)} (${which}) — address by guid` };
+      return { error: `${hits.length} LIVE entities are named ${JSON.stringify(ref.name)} (${which}) — address by guid`, code: 'AMBIGUOUS' };
     }
     return { id: hits[0].id };
   }
@@ -506,6 +528,7 @@ const LIVE_CORE_TRAITS = new Set(['Transform', 'EntityAttributes']);
 async function applySceneOpsLive(ops: MutateOp[]): Promise<{
   changed: number; errors: string[]; warnings: string[]; unresolved: MutateEntityRef[];
   created: Array<{ op: number; id: number; guid: string; name: string }>;
+  code?: ErrorCode;
 }> {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -515,6 +538,11 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
   // name, which this surface refuses when the name is ambiguous.
   const created: Array<{ op: number; id: number; guid: string; name: string }> = [];
   let changed = 0;
+  // FIRST resolveLiveEntityRef failure's machine code, if it had one (NOT_FOUND/AMBIGUOUS) — a
+  // single-op call (the common case: modoki_set_transform/tap) needs its refusal's code to
+  // survive to the HTTP boundary, and the first one is the one that actually blocked the op the
+  // caller most likely cares about.
+  let code: ErrorCode | undefined;
   const allTraitsList = getAllTraits();
 
   await runAsCompositeAction({ label: `Mutate Scene (${ops.length} op${ops.length === 1 ? '' : 's'})`, kind: '!mutate' }, () => {
@@ -524,7 +552,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
       try {
         if (op.op === 'setTrait') {
           const resolved = resolveLiveEntityRef(op.entity);
-          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); continue; }
+          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) code = resolved.code; continue; }
           const id = resolved.id;
           if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
           const meta = allTraitsList.find((t) => t.name === op.trait);
@@ -563,7 +591,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           }
         } else if (op.op === 'removeTrait') {
           const resolved = resolveLiveEntityRef(op.entity);
-          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); continue; }
+          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) code = resolved.code; continue; }
           const id = resolved.id;
           if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
           if (LIVE_CORE_TRAITS.has(op.trait)) { errors.push(`${where}: cannot remove core trait '${op.trait}'`); continue; }
@@ -606,7 +634,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           created.push({ op: i, id: newId, guid: ensureGuid(newId), name: op.name ?? 'New Entity' });
         } else if (op.op === 'removeEntity') {
           const resolved = resolveLiveEntityRef(op.entity);
-          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); continue; }
+          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) code = resolved.code; continue; }
           const id = resolved.id;
           deleteEntitiesWithUndo([id]);
           changed++;
@@ -619,7 +647,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
     }
   });
 
-  return { changed, errors, warnings, unresolved, created };
+  return { changed, errors, warnings, unresolved, created, ...(code ? { code } : {}) };
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
@@ -901,10 +929,60 @@ export function registerEditorAgentOps(): void {
   // Deliberately separate from `focus-element` (DOM focus): clicking a Hierarchy ROW moves
   // the keyboard scope but NOT document.activeElement, so the two are genuinely different
   // questions. Returns the resulting scope so the caller can confirm rather than assume.
+  //
+  // A named panel is REFUSED unless it currently has an open tab (#301). This op used to
+  // store whatever string it was handed — `setFocusedPanel` is a bare setter, correctly, since
+  // the human paths feed it a live tab component — and echo it straight back. That made the
+  // caller-side guard in `/api/input/key` (`focusedPanel !== panel`) a tautology: it could only
+  // fire if the renderer changed the value, which it never did. So `{panel:"Game"}` answered
+  // ok:true with focusedPanel:"Game", while the input gate (which compares against 'game')
+  // stayed SHUT and every following keypress reached nothing — each also reporting ok. That is
+  // the QA-PHYS-0003 symptom reached by a second route: there the panel was forgotten, here a
+  // wrong value is accepted. Miscasing is not contrived — this repo's prose calls them "the
+  // Game panel" / "the Inspector" and nothing types the ids.
+  //
+  // Refusing on OPEN-NESS rather than on a vocabulary list is deliberate: it subsumes the
+  // typo case, it is what the route's error message already promised, and games can register
+  // custom panels — so any fixed list would be wrong by construction. `null` (clear the scope)
+  // is always allowed; it names no panel.
   registerAgentOp('set-focus-scope', (params) => {
-    const p = (params ?? {}) as { panel?: string | null };
+    const p = (params ?? {}) as { panel?: unknown };
+    const openPanels = useEditorStore.getState().openPanels;
+    // Reject a non-string BEFORE the open-ness test, or it falls straight through to the bare
+    // setter. Reachable, not theoretical: `set-focus-scope` is on the `/api/editor-action`
+    // allowlist, so `{action:'set-focus-scope', panel:12345}` used to answer ok:true and leave
+    // `focusedPanel` holding the NUMBER 12345 — reported by get_editor_state as truth, and
+    // permanently suppressing game input via the gate's `p !== null && p !== 'game'`, with no
+    // panel to blame. Same defect class as the miscased id, one type further out.
+    if (p.panel !== undefined && p.panel !== null && typeof p.panel !== 'string') {
+      return {
+        ok: false,
+        error: `panel must be a string (an open panel's id) or null to clear — got ${typeof p.panel}`,
+        focusedPanel: useEditorStore.getState().focusedPanel,
+        openPanels,
+      };
+    }
+    if (typeof p.panel === 'string' && !openPanels.includes(p.panel)) {
+      // Do NOT move the scope on a refusal — a half-applied focus is worse than none, and
+      // the caller would have no way to tell which it got.
+      return {
+        ok: false,
+        error: `no open panel "${p.panel}" — panel ids are the FlexLayout tab ids and are case-sensitive`,
+        focusedPanel: useEditorStore.getState().focusedPanel,
+        openPanels,
+      };
+    }
     if (p.panel !== undefined) useEditorStore.getState().setFocusedPanel(p.panel);
-    return { ok: true, focusedPanel: useEditorStore.getState().focusedPanel };
+    return { ok: true, focusedPanel: useEditorStore.getState().focusedPanel, openPanels };
+  });
+  // Would this key reach anything? Read-only twin of set-focus-scope, asked by
+  // `/api/input/key` BEFORE it presses — see editor/input/keyReach.ts for why both gates
+  // have to be answered together. Never mutates: a probe that moved the scope it is
+  // reporting on would be the measurement changing the thing measured.
+  registerAgentOp('probe-key-reach', (params) => {
+    const p = (params ?? {}) as { key?: string; modifiers?: string[] };
+    if (typeof p.key !== 'string' || !p.key) return { ok: false, error: 'key is required' };
+    return { ok: true, ...probeKeyReach(p.key, p.modifiers) };
   });
   registerAgentOp('set-collider-edit', (params) => {
     const p = (params ?? {}) as { on?: boolean };
@@ -934,6 +1012,77 @@ export function registerEditorAgentOps(): void {
     requireAssetPath(p.path, 'texture', 'open-nine-slice-editor');
     useEditorStore.getState().requestTextureEditor(p.path!, 'nineslice', p.name);
     return readEditorState();
+  });
+
+  // Open a .anim.json in the Animation editor and BIND it to an entity, exactly as a
+  // double-click in the Assets panel does (`openAssetInEditor`'s `animation` branch).
+  //
+  // WHY THIS EXISTS (#288 Phase 4): without it `modoki_pose_clip` and `modoki_set_playhead` are
+  // tools that can never be driven. Both need `editingAnimationClip` set, and nothing on the agent
+  // surface could set it — `set-selection {asset}` selects the asset in the Assets panel and does
+  // NOT open its editor (measured). So the clip-authoring loop was reachable only if the human
+  // happened to have opened the clip by hand. This is the one call the panel path already uses,
+  // including its bind-root resolution, rather than a second way of opening a clip.
+  registerAgentOp('open-animation-editor', async (params) => {
+    const p = (params ?? {}) as { path?: string; name?: string };
+    requireAssetPath(p.path, 'animation', 'open-animation-editor');
+    const name = p.name ?? p.path!.split('/').pop()?.replace(/\.anim\.json$/, '') ?? p.path!;
+    useEditorStore.getState().openAnimationEditor({ path: p.path!, type: 'animation', name }, resolveAnimatorRootForClip(p.path!));
+
+    // ⚠️ `openAnimationEditor` sets the open ASSET; it does not load the clip DOCUMENT. That is
+    // done by the Animation panel's own effect, which reconciles a parked unsaved write against a
+    // `fetch` of the file — a path carrying two separately-fixed bugs in its comments, so this op
+    // WAITS for it rather than growing a second copy of it.
+    //
+    // Waiting is also the only way to be honest. Returning as soon as the store's asset field is
+    // set reported `openedClip` + `bound:true` while `editingAnimationClip` was still null, so a
+    // `pose-clip` issued immediately after — the documented next step — failed with "no animation
+    // clip is open". Measured, and it is the readiness lie §0 ranks worst: everything said ready.
+    const deadline = Date.now() + 3000;
+    while (useEditorStore.getState().editingAnimationClip == null && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const st = useEditorStore.getState();
+    const clip = st.editingAnimationClip as { name?: string } | null;
+    // ⚠️ The poll reads a GLOBAL, so a clip appearing is not proof it is OURS. Both the store
+    // fields and the panel's load effect are single-slot: if a human double-clicks a different
+    // clip (or a second call lands) while this one is polling, the other open wins and BOTH
+    // callers see a non-null clip at the same instant. Without this check the call for A returns
+    // ok:true describing B, and a `pose-clip` issued next poses the wrong rig believing it
+    // addressed A. Compare the ASSET path, which is what the caller actually named.
+    const openPath = st.editingAnimationAsset?.path;
+    if (clip && openPath !== p.path) {
+      return {
+        ok: false, code: 'REFUSED_BY_OP', path: p.path, openPath,
+        error: `another clip (${openPath}) was opened while this call was waiting for ${p.path}, so the editor is not showing what was asked for.`,
+        hint: 'Something else re-pointed the Animation editor mid-call — the human double-clicking an asset, or a concurrent agent call. Retry; the editor holds ONE open clip, so two openers cannot both win.',
+      };
+    }
+    if (!clip) {
+      // The realistic cause, and it is worth naming precisely: FlexLayout mounts only the SELECTED
+      // tab, so a docked-but-unselected Animation panel never runs the load effect.
+      return {
+        ok: false, code: 'NOT_AVAILABLE_HERE', path: p.path,
+        error: `the Animation editor was pointed at ${p.path} but no clip document loaded within 3s.`,
+        hint: 'The clip DOCUMENT is fetched by the Animation panel, so that panel has to be mounted '
+          + '— and FlexLayout mounts only the SELECTED tab. Open/select the Animation tab (or check '
+          + 'modoki_get_editor_state.openPanels) and retry. The pose itself needs no panel; only '
+          + 'this load step does.',
+      };
+    }
+    // Report the BIND separately from the open. They fail independently — a clip can load
+    // perfectly and bind to nothing (no entity in the scene carries a matching Animator), and a
+    // caller told only "opened" would then get a NOT_FOUND from pose_clip with no idea why.
+    return {
+      ...readEditorState(),
+      ok: true,
+      openedClip: clip.name ?? name,
+      animatorRootEntityId: st.animatorRootEntityId,
+      bound: st.animatorRootEntityId != null,
+      ...(st.animatorRootEntityId == null
+        ? { hint: 'The clip is open but bound to NO entity, so modoki_pose_clip has nothing to pose. Binding resolves by matching the clip against entities carrying an Animator trait — check one exists in the OPEN scene and lists this clip.' }
+        : {}),
+    };
   });
 
   registerAgentOp('focus-entity', (params) => {
@@ -1004,13 +1153,24 @@ export function registerEditorAgentOps(): void {
   // load-scene / new-scene SWAP THE WORLD, so anything created live and not saved is gone —
   // from the world, the file, AND the undo stack (swapHistory rebinds). They used to report
   // {ok:true, entityCount:12}, which looks perfectly healthy while the entity you just made
-  // no longer exists anywhere. Refuse by default; `force` discards deliberately. (C7)
-  const guardUnsaved = (op: string, force: boolean | undefined) => {
-    if (force || !hasUnsavedChanges()) return;
+  // no longer exists anywhere. Refuse by default; `discardUnsaved` discards deliberately. (C7)
+  //
+  // RENAMED from `force` (2026-08-22, owner). §2: one name, one meaning. `force` still means
+  // "proceed even though there is unsaved work" on build / add_native_target / ota_publish, where
+  // NOTHING is destroyed and the work is merely left out of the artifact. Here it DESTROYED that
+  // work — and the tool's own name (`load_scene`, `new_scene`) does not tell you which flavour you
+  // are getting, so an agent that learned the harmless one from a build could lose the human's
+  // work with it. The new name states the consequence instead of inviting the habit.
+  //
+  // The OLD name is still honoured on the wire: these ops are reachable by modoki_eval and the
+  // curl API, where there is no strict schema to turn a stale spelling into a refusal. At the TOOL
+  // boundary it IS refused by name (§1), which is where a caller actually learns.
+  const guardUnsaved = (op: string, discardUnsaved: boolean | undefined) => {
+    if (discardUnsaved || !hasUnsavedChanges()) return;
     // S3.11 — name the ACTUAL cause. `hasUnsavedChanges()` has two independent ones, and the
     // fixed string blamed only the first: an agent whose pending work was a dirty
     // particle/anim/timeline doc was sent looking for live entities it had never created. Both
-    // clear with save_all; the difference is what `force:true` would discard.
+    // clear with save_all; the difference is what `discardUnsaved:true` would discard.
     const { sceneDirty, dirtyAssetPaths, dirtyScenes } = unsavedChangeCauses();
     const causes: string[] = [];
     if (sceneDirty) causes.push('LIVE-WORLD scene edits (e.g. from create_entity / duplicate_entity / prefab / mutate_scene, which do NOT save)');
@@ -1021,20 +1181,21 @@ export function registerEditorAgentOps(): void {
     throw new Error(
       `${op}: the editor has UNSAVED work — ${causes.join(' AND ')}. ${op} swaps the world, so ` +
       `${sceneDirty ? 'the scene edits would be destroyed (gone from the world, the file, and the undo stack)' : 'the pending asset writes would be lost'}` +
-      `. Run modoki_save_all first, or pass force:true to discard ${causes.length > 1 ? 'them' : 'it'} deliberately.`,
+      `. Run modoki_save_all first, or pass discardUnsaved:true to discard ${causes.length > 1 ? 'them' : 'it'} deliberately.`,
     );
   };
   registerAgentOp('load-scene', async (params) => {
-    const { path, force } = (params ?? {}) as { path: string; force?: boolean };
+    const p = (params ?? {}) as { path: string; discardUnsaved?: boolean; force?: boolean };
+    const { path } = p;
     if (!path) throw new Error('load-scene requires { path }');
-    guardUnsaved('load-scene', force);
+    guardUnsaved('load-scene', p.discardUnsaved ?? p.force);
     const ok = await loadScene(path);
     if (!ok) throw new Error(`load-scene FAILED for ${path} — the scene was not loaded (does the path exist?).`);
     return { ok, ...readEditorState() };
   });
   registerAgentOp('new-scene', (params) => {
-    const { force } = (params ?? {}) as { force?: boolean };
-    guardUnsaved('new-scene', force);
+    const p = (params ?? {}) as { discardUnsaved?: boolean; force?: boolean };
+    guardUnsaved('new-scene', p.discardUnsaved ?? p.force);
     newScene();
     setSelectionRaw(null, []);
     return readEditorState();
@@ -1059,10 +1220,20 @@ export function registerEditorAgentOps(): void {
     // needs-path error below actively STEERS an agent into it ("pass an explicit path"), which
     // is exactly what it hits when the human simply happens to be editing a prefab. (C7)
     if (isEditingPrefab()) {
+      // Flush the parked ASSET docs even here (#259). They are documents a panel or an agent op
+      // owns and have nothing to do with which world is loaded — and this branch never reaches
+      // `saveAll`, which is where the flush lives. Then refuse the SCENE half, naming what did
+      // happen: an error that hides completed work is as misleading as a success that hides a
+      // failure.
+      const flushed = await flushDirtyAssets();
+      const note = flushed.saved.length
+        ? ` (${flushed.saved.length} parked asset doc(s) WERE written: ${flushed.saved.join(', ')})`
+        : '';
       throw new Error(
         'save-all: the editor is in PREFAB-EDIT mode — its world is a synthetic prefab scene, ' +
         'not a real one, so saving it to a scene path would overwrite that scene with prefab ' +
-        'scaffolding. Use the prefab editor\'s own save (Save Prefab), or leave prefab-edit mode first.',
+        'scaffolding. Use the prefab editor\'s own save (Save Prefab), or leave prefab-edit mode ' +
+        `first.${note}`,
       );
     }
     const r = await saveAll({ path: savePath, allowDialog: false });
@@ -1085,7 +1256,16 @@ export function registerEditorAgentOps(): void {
         `WITHOUT them. Fix the cause and call save_all again.`,
       );
     }
-    if (r.saved) return { ok: true, scenePath: r.path, ...(r.extraSaved?.length ? { extraSaved: r.extraSaved } : {}) };
+    if (r.saved) {
+      return {
+        ok: true, scenePath: r.path,
+        ...(r.extraSaved?.length ? { extraSaved: r.extraSaved } : {}),
+        // Name the asset docs this save wrote. They are the half a caller cannot otherwise see —
+        // `saved:false` was the answer when the edit was parked, and this is where that promise
+        // is kept.
+        ...(r.assets?.saved.length ? { savedAssets: r.assets.saved } : {}),
+      };
+    }
     if (r.reason === 'needs-path') {
       throw new Error(
         'save-all: this scene has no path yet (new_scene never saved), and the Save-As panel ' +
@@ -1093,7 +1273,12 @@ export function registerEditorAgentOps(): void {
       );
     }
     if (r.reason === 'playing') {
-      throw new Error('save-all: BLOCKED during Play — saving now would bake the runtime world (physics-settled positions, spawned entities) over your authored scene, and Stop would revert the live world anyway. Stop the editor first (modoki_play_control {action:"stop"}).');
+      // The SCENE half only. Parked asset docs already flushed above (#259) — say so, or an agent
+      // reads this as "nothing was saved" and re-parks work that is already on disk.
+      const note = r.assets?.saved.length
+        ? ` The ${r.assets.saved.length} parked asset doc(s) WERE written (${r.assets.saved.join(', ')}) — those are authored documents and are not affected by run mode.`
+        : '';
+      throw new Error(`save-all: the SCENE was NOT saved — blocked while the editor is playing/previewing, because saving now would bake the runtime world (physics-settled positions, spawned entities, a preview pose) over your authored scene, and Stop would revert the live world anyway. Stop the editor first (modoki_play_control {action:"stop"}).${note}`);
     }
     throw new Error(`save-all FAILED (${r.reason}) for ${r.path ?? '(no path)'} — NOTHING was written to disk.`);
   });
@@ -1235,9 +1420,9 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('apply-scene-ops', async (params) => {
     const p = (params ?? {}) as { ops?: MutateOp[] };
     if (!Array.isArray(p.ops) || p.ops.length === 0) throw new Error('apply-scene-ops requires a non-empty { ops } array');
-    const { changed, errors, warnings, unresolved, created } = await applySceneOpsLive(p.ops);
+    const { changed, errors, warnings, unresolved, created, code } = await applySceneOpsLive(p.ops);
     return { ok: errors.length === 0, changed, errors, warnings, unresolved, saved: false,
-      ...(created.length ? { created } : {}) };
+      ...(created.length ? { created } : {}), ...(code ? { code } : {}) };
   });
 
   // ── Prefab ops ──
@@ -1278,7 +1463,19 @@ export function registerEditorAgentOps(): void {
         },
         remove: (id) => { deleteEntity(id); },
       }));
-      return { ok: true, rootId, guid: ensureGuid(rootId), saved: false };
+      // A 2D entity outside every Canvas2D is drawn by nothing, and used to come back as a
+      // bare ok:true — the caller then found screen:null with no idea why (QA-ASSET-0014).
+      // The tool's own default parent (world root) is exactly where that happens, so the
+      // answer belongs in THIS response, not only in the console a frame later.
+      const unrenderable = findUnrenderable2D(getAllEntities(), rootId);
+      const warnings = unrenderable.length === 0 ? [] : [
+        `${unrenderable.map((e) => `"${e.name}" (id ${e.id})`).join(', ')}: 2D entit`
+        + `${unrenderable.length === 1 ? 'y has' : 'ies have'} no Canvas2D ancestor and will not `
+        + 'render. Reparent under the scene\'s Canvas2D host (modoki_reparent_entity), or pass '
+        + 'parentGuid on instantiate.',
+      ];
+      return { ok: true, rootId, guid: ensureGuid(rootId), saved: false,
+        ...(warnings.length ? { warnings } : {}) };
     }
     if (which === 'create') {
       if ((p.entityId == null && !p.entityGuid) || !p.path) throw new Error('prefab create requires { entityId | entityGuid, path }');
@@ -1328,6 +1525,155 @@ export function registerEditorAgentOps(): void {
       });
       return { ok: true, detached: snapshot.length, saved: false };
     }
+    // ── Override discovery/apply/revert (#2Tkw8CiWRATmHck2ze7q) ──
+    // The human "Apply to Prefab" / "Revert Overrides" dialogs (ApplyPrefabDialog.tsx) were
+    // the ONLY caller of applyToPrefabWithUndo/revertOverridesSelective, so an agent had no way
+    // to reach them at all — a checkbox tree isn't something a tool call can click. `overrides`
+    // is the read-only discovery call that stands in for the dialog's tree (built from the SAME
+    // collectInstanceOverrideKeys/collectInstanceOverrideFields walk, so the keys it hands back
+    // are exactly the keys `apply`/`revert` accept); `apply`/`revert` mirror the dialog's confirm
+    // handlers, keys and all.
+    if (which === 'overrides') {
+      if (p.entityId == null && !p.entityGuid) throw new Error('prefab overrides requires { entityId | entityGuid }');
+      const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab overrides');
+      const ctx = resolveInstanceContext(entityId);
+      if (!ctx) {
+        throw new Error(`prefab overrides: entity ${entityId} is not a prefab instance — it carries no PrefabInstance trait, so it has no overrides to discover.`);
+      }
+      const prefab = await getPrefabSource(ctx.source);
+      if (!prefab) throw new Error(`prefab overrides: could not load prefab source "${ctx.source}" for entity ${entityId}.`);
+      const entities = collectInstanceOverrideFields(ctx.rootInstanceId, prefab);
+      const keys = collectInstanceOverrideKeys(ctx.rootInstanceId, prefab);
+      // Flatten the per-entity/trait tree into one list an agent can scan for a key without
+      // guessing the string shape — the whole point of this action existing.
+      const fields = entities.flatMap((e) => e.traits.flatMap((t) => t.fields.map((f) => ({
+        localId: e.localId, entityName: e.name, trait: t.trait, field: f.field,
+        current: f.current, base: f.base, key: f.key,
+      }))));
+      return {
+        ok: true, source: ctx.source, rootInstanceId: ctx.rootInstanceId, guid: ensureGuid(ctx.rootInstanceId),
+        keys, fields,
+        // Say out loud what `keys` deliberately does NOT contain, so the omission is data rather
+        // than a discrepancy the caller only notices by counting. `unaddressableAdded` are added
+        // subtrees whose entity has no guid yet (minted lazily — save the scene and they become
+        // addressable); `applyExcluded` are revertable-but-not-applyable fields.
+        ...(keys.unaddressableAdded > 0
+          ? { note: `${keys.unaddressableAdded} added subtree(s) have no guid yet and are NOT listed in keys.added — save the scene (modoki_save_all) to make them addressable.` }
+          : {}),
+      };
+    }
+    if (which === 'apply' || which === 'revert') {
+      const verb = which; // 'apply' | 'revert'
+      if (p.entityId == null && !p.entityGuid) throw new Error(`prefab ${verb} requires { entityId | entityGuid }`);
+      const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, `prefab ${verb}`);
+      const ctx = resolveInstanceContext(entityId);
+      if (!ctx) {
+        throw new Error(`prefab ${verb}: entity ${entityId} is not a prefab instance — nothing to ${verb}.`);
+      }
+      const prefab = await getPrefabSource(ctx.source);
+      if (!prefab) throw new Error(`prefab ${verb}: could not load prefab source "${ctx.source}" for entity ${entityId}.`);
+      const available = collectInstanceOverrideKeys(ctx.rootInstanceId, prefab);
+      if (available.all.length === 0) {
+        throw new Error(`prefab ${verb}: instance rooted at entity ${ctx.rootInstanceId} has no overrides — nothing to ${verb}.`);
+      }
+      let keySet: Set<string>;
+      // An EXPLICIT empty array is refused, not treated as "omitted". They are opposite
+      // intents and the fallthrough picks the destructive one: a caller that built `keys` by
+      // filtering `overrides.keys.all` and matched nothing means "act on NOTHING", and would
+      // instead have had every override on the instance applied to the shared prefab (or
+      // reverted away). `keys` being absent is the only thing that means "all".
+      if (p.keys && p.keys.length === 0) {
+        throw new Error(
+          `prefab ${verb}: \`keys\` was given as an EMPTY array, which is ambiguous — omit \`keys\` ` +
+          `entirely to ${verb} ALL ${available.all.length} override(s), or pass the ones you mean. ` +
+          'Refusing rather than guessing: an empty selection computed by a filter means "nothing", ' +
+          'while the omitted-keys default means "everything", and acting on the wrong one here is ' +
+          `${verb === 'apply' ? 'a write to the shared prefab every other instance inherits' : 'a teardown of every override on this instance'}.`,
+        );
+      }
+      if (p.keys && p.keys.length > 0) {
+        // EVERY key must match, not merely one of them. A silent no-op is the class of failure
+        // the Percept/Enact contract exists to remove — and the PARTIAL version is the nastier
+        // half: dropping the unmatched keys and applying the rest returns {ok:true} having done
+        // most of what was asked, so the caller has no reason to look. One typo in a list of
+        // five would then leave a field un-applied, and the next reader would conclude the
+        // apply is flaky rather than that they mistyped a key.
+        const unknown = new Set(p.keys.filter((k) => !available.all.includes(k)));
+        if (unknown.size > 0) {
+          const sample = available.all.slice(0, 5).join(', ');
+          throw new Error(
+            `prefab ${verb}: ${unknown.size} of the ${p.keys.length} given key(s) match no override on this ` +
+            `instance — ${[...unknown].slice(0, 5).join(', ')}${unknown.size > 5 ? ', …' : ''}. NOTHING was ` +
+            `${verb === 'apply' ? 'applied' : 'reverted'} (a partial ${verb} would look like a success). Valid ` +
+            `keys (${available.all.length} total) include: ${sample}${available.all.length > 5 ? ', …' : ''}. ` +
+            "Call prefabAction:'overrides' for the exact set.",
+          );
+        }
+        keySet = new Set(p.keys);
+      } else {
+        keySet = new Set(available.all); // omitted ⇒ act on everything
+      }
+
+      if (which === 'apply') {
+        // Some override keys are REVERTABLE but not APPLYABLE: a field kept out of a written
+        // template (a runtime read-back, or the scene-only EntityAttributes.editorFolder)
+        // is `continue`d past by applyToPrefabSelective WITHOUT being counted, so the overall
+        // `applied` flag can be true while a specific requested key was never written.
+        // Echoing the request back as `appliedKeys` would report that key as applied.
+        const excluded = available.applyExcluded.filter((k) => keySet.has(k));
+        if (p.keys && excluded.length > 0) {
+          // Explicitly asked for by name → refuse, rather than do less than was asked.
+          throw new Error(
+            `prefab apply: ${excluded.length} requested key(s) cannot be written into a prefab ` +
+            `template — ${excluded.join(', ')}. These are scene-only or runtime-only fields ` +
+            "(EntityAttributes.editorFolder, runtime read-backs); apply would silently skip them. " +
+            "They ARE revertable — prefabAction:'revert' resets them on this instance. Drop them " +
+            'from `keys` to apply the rest.',
+          );
+        }
+        // applyToPrefabWithUndo pushes its OWN undo entry (before/after prefab + scene
+        // snapshot — see applyPrefabUndo.ts) — do NOT push a second one here.
+        const result = await applyToPrefabWithUndo(ctx.rootInstanceId, keySet);
+        if (!result.applied) {
+          throw new Error(`prefab apply: nothing was written — the apply produced no change for entity ${entityId} (it may have stopped being a prefab instance mid-call).`);
+        }
+        // apply WRITES the .prefab.json — say so honestly, mirroring how `create` reports `saved`.
+        // `appliedKeys` excludes what the template cannot carry; `skippedKeys` names it rather
+        // than leaving the caller to diff a second `overrides` call to notice.
+        const applied = [...keySet].filter((k) => !excluded.includes(k));
+        return {
+          ok: true, source: result.source, appliedKeys: applied,
+          ...(excluded.length > 0 ? { skippedKeys: excluded, skippedReason: 'not representable in a prefab template (scene-only / runtime-only field)' } : {}),
+          promotedAdditions: result.promotedAdditions, saved: true,
+        };
+      }
+
+      // which === 'revert' — mirrors ApplyPrefabDialog.handleRevert EXACTLY: revert itself
+      // pushes NO undo entry (rebuildInstance is a raw teardown+rebuild), so the caller must,
+      // with the same before/after rebuild-from-snapshot undo/redo the dialog wires.
+      const result = await revertOverridesSelective(ctx.rootInstanceId, keySet);
+      if (!result) {
+        throw new Error(`prefab revert: revertOverridesSelective returned nothing for entity ${entityId} — it stopped being a prefab instance, or the prefab source could not be re-loaded for the rebuild (see the editor console for the [Prefab] warning).`);
+      }
+      const ref = entityRef(result.newRootId);
+      useEditorStore.getState().selectEntity(result.newRootId);
+      const { source, prefab: revertedPrefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure } = result;
+      pushAction({
+        label: 'Revert prefab overrides',
+        undo: () => {
+          const cur = ref.resolve(); if (cur == null) return;
+          const id = rebuildInstance(cur, source, revertedPrefab, fullOverrides, fullStructure);
+          useEditorStore.getState().selectEntity(id);
+        },
+        redo: () => {
+          const cur = ref.resolve(); if (cur == null) return;
+          const id = rebuildInstance(cur, source, revertedPrefab, reducedOverrides, reducedStructure);
+          useEditorStore.getState().selectEntity(id);
+        },
+      });
+      // revert is live-only — the prefab FILE is untouched, matching instantiate/detach.
+      return { ok: true, newRootId: result.newRootId, guid: ensureGuid(result.newRootId), revertedKeys: [...keySet], saved: false };
+    }
     // ── Prefab-edit mode (#125) ──
     // The only path that re-SERIALIZES an existing .prefab.json. `create` writes a prefab FROM a
     // scene entity; these open the template itself in an isolated synthetic world, so a save
@@ -1340,7 +1686,7 @@ export function registerEditorAgentOps(): void {
       // same way and must refuse for the same reason. It additionally SAVES the current scene on
       // the way in (prefabEdit.ts does this deliberately, so the return trip's reload-from-disk
       // is non-destructive) — which is a write the caller should not discover afterwards.
-      guardUnsaved('prefab edit-open', p.force);
+      guardUnsaved('prefab edit-open', (p as { discardUnsaved?: boolean }).discardUnsaved ?? p.force);
       const scenePathBefore = getCurrentScenePath();
       const name = p.path.split('/').pop()?.replace(/\.prefab\.json$/, '') ?? p.path;
       await openPrefabForEditing({ path: p.path, name });
@@ -1392,7 +1738,7 @@ export function registerEditorAgentOps(): void {
     }
     throw new Error(
       `unknown prefab action '${which}' — pass prefabAction: 'instantiate' | 'create' | 'detach' ` +
-      "| 'edit-open' | 'edit-save' | 'edit-exit' " +
+      "| 'overrides' | 'apply' | 'revert' | 'edit-open' | 'edit-save' | 'edit-exit' " +
       "(the name is `prefabAction`, not `action`: /api/editor-action spends `action` on the op name).",
     );
   });
@@ -1423,6 +1769,154 @@ export function registerEditorAgentOps(): void {
       note: clip
         ? `Playhead moved to ${clamped}s for clip "${clip.name ?? '(unnamed)'}". This does NOT pose the rig — the value moved, the viewport did not. A render/capture taken now shows the UNCHANGED pose.`
         : 'Playhead moved, but NO clip is bound to the Animation/Timeline editor — so this value currently drives nothing at all. Open a clip first (modoki_open_particle_editor / the Animation panel).',
+    };
+  });
+
+  // ── pose-clip (#288 gap 2) — the pose `set-playhead` deliberately does NOT do ──
+  //
+  // Registered HERE and not in agentBridge, correctly under §9: the handler reaches the editor
+  // store for the bound clip/root and the editor's preview envelope. There is no device analogue,
+  // and that absence is deliberate rather than a gap — a device build has no Animation panel, no
+  // preview session, and nothing to revert a pose to.
+  registerAgentOp('pose-clip', async (params) => {
+    const { t } = (params ?? {}) as { t?: number };
+    if (typeof t !== 'number' || !Number.isFinite(t)) {
+      return { ok: false, code: 'REFUSED_BY_OP', error: `pose-clip requires a finite t (seconds); got ${JSON.stringify(t)}` };
+    }
+    const st = useEditorStore.getState();
+    const clip = st.editingAnimationClip as (AnimationClipDef & { name?: string }) | null | undefined;
+    const rootId = st.animatorRootEntityId;
+    // Two DIFFERENT missing preconditions, and collapsing them would send the caller to the wrong
+    // fix — "open a clip" versus "bind it to an entity".
+    if (!clip) {
+      return {
+        ok: false, code: 'NOT_FOUND',
+        error: 'no animation clip is open in the editor, so there is nothing to sample a pose from.',
+        options: ['open a .anim.json (the Animation panel, or the Assets panel) and retry'],
+      };
+    }
+    if (rootId == null) {
+      return {
+        ok: false, code: 'NOT_FOUND', boundClip: clip.name ?? null,
+        error: `the clip "${clip.name ?? '(unnamed)'}" is open but is not BOUND to an entity, so there is nothing to pose.`,
+        options: ['bind it to an entity with an Animator trait (the Animation panel\'s bind picker)'],
+      };
+    }
+    const duration = clip.duration;
+    const clamped = duration != null ? Math.max(0, Math.min(duration, t)) : Math.max(0, t);
+    st.setPlayhead(clamped);
+    // Await it: the session begin serializes the authored world, so a first pose lands a tick
+    // later. Replying before that would report a pose the caller's next read cannot see — and the
+    // natural next call after posing is exactly such a read.
+    const { applied, openedSession } = await poseClipAtTime(clip, rootId, clamped, 'animation');
+    if (applied === 0) {
+      // The pose ran and moved NOTHING. §5: a no-op is a failure when the caller asked for a
+      // change. Reporting ok here would be the false success the whole envelope exists to avoid —
+      // and the likeliest causes are both actionable.
+      return {
+        ok: false, code: 'REFUSED_BY_OP', playhead: clamped, boundClip: clip.name ?? null,
+        // The clamp is reported on the FAILURE path too. The caller asked for a `t` and the
+        // playhead now holds a different number; leaving that unexplained on the one path where
+        // they are already debugging is the worst place to drop it.
+        ...(clamped !== t ? { clampedFrom: t, duration } : {}),
+        error: `the pose applied 0 channels at t=${clamped}s — nothing in the live world moved.`,
+        options: [
+          'the clip may have no tracks that resolve against the bound entity (check the track paths)',
+          'the bound root may have been destroyed by a scene reload — re-bind it',
+        ],
+      };
+    }
+    return {
+      ok: true, posed: true, applied, playhead: clamped, openedSession,
+      boundClip: clip.name ?? null,
+      ...(clamped !== t ? { clampedFrom: t, duration } : {}),
+      saved: false,
+      note: 'The rig is posed INSIDE the preview envelope, so this is revertible (⏹ Exit Preview) '
+        + 'and a scene save cannot bake it. It is NOT an undo-stack entry — Cmd-Z does not reach it.',
+    };
+  });
+
+  // The way OUT of the envelope `pose-clip` opens. Not optional scope: the envelope pins the
+  // run-mode at `scrub`, which is exactly what blocks the human's Cmd+S — so an agent that could
+  // pose and not un-pose would wedge the editor with no way back but the ⏹ button it cannot press.
+  //
+  // ⚠️ IT ALWAYS RESTORES, and there is deliberately no `restore:false`. An earlier cut of this op
+  // exposed one, mirroring `endTimelinePreviewSession`'s parameter. But EVERY human path passes
+  // `restore:true` — verified, all five call sites in AnimationEditor plus all three in
+  // TimelineEditor — so the flag would have handed an agent a capability the editor's own UI has
+  // no way to reach, and the only thing that capability does is BAKE a preview pose into the
+  // authored world. That is the exact damage the envelope exists to prevent, and the damage that
+  // actually cost the owner data (2026-08-19). An agent that genuinely wants those values authored
+  // has the ordinary, undoable route: read them back and write them with modoki_set_transform /
+  // modoki_mutate_scene. Adding a second, weaker way to do a dangerous thing is the §2/§7 failure
+  // this workstream already refused once, for `create_registered_asset {kind:'scene'}`.
+  registerAgentOp('exit-pose-envelope', async () => {
+    const { exited, rebound } = await exitPoseEnvelope(true);
+    if (!exited) {
+      // Ownership-guarded: the session and the run-mode are globals shared with the Timeline
+      // panel, and ending ITS session here would revert its world mid-run. Say which it is rather
+      // than reporting a cheerful no-op.
+      return {
+        ok: false, code: 'NOT_AVAILABLE_HERE',
+        error: 'no ANIMATION preview envelope is open, so there was nothing to exit.',
+        hint: 'Either nothing is posed, or the Timeline panel owns the preview envelope — this op '
+          + 'deliberately will not end that one, because reverting its world mid-run is worse than '
+          + 'refusing.',
+      };
+    }
+    return {
+      ok: true, exited: true, restored: true,
+      ...(rebound != null ? { reboundRootEntityId: rebound } : {}),
+      note: 'Envelope closed and the authored world restored. The run-mode is back to stopped, so a scene save works again.',
+    };
+  });
+
+  // ── creatable assets (#288 gap 5) — the Assets panel's "New X" surface ──
+  //
+  // Two ops, not one mode-switched op. §7 forbids a `list` MODE on a mutating tool; it does not
+  // forbid a SIBLING read, and this surface already has four (list_traits/actions/assets/scenes).
+  // The case for discovery being its own read is stronger than usual here: the registry is
+  // dynamic, game-extensible, and COMES AND GOES WITH THE OPEN PROJECT, so it is precisely what
+  // an agent cannot know a priori — and discovery-by-refusal would mean the only way to learn the
+  // kinds is to deliberately issue a failing mutating call.
+  registerAgentOp('list-creatable-assets', () => {
+    const defs = getCreatableAssets();
+    return {
+      ok: true,
+      totalCount: defs.length,
+      kinds: defs.map((d) => ({
+        kind: d.id,
+        label: d.label,
+        ext: d.ext,
+        assetType: d.assetType,
+        defaultFolder: d.defaultFolder ?? null,
+        // Say WHICH ones the create op refuses, here, rather than only in the refusal. A caller
+        // planning a batch needs to know before it runs, not after a step fails.
+        agentCreatable: !d.create,
+        ...(d.create ? { refusedBecause: 'a full create OVERRIDE that runs editor code (for scene: it DISCARDS the live world). Use modoki_new_scene, or the Assets panel.' } : {}),
+      })),
+    };
+  });
+
+  registerAgentOp('create-registered-asset', async (params) => {
+    const p = (params ?? {}) as { kind?: string; path?: string };
+    if (!p.kind || typeof p.kind !== 'string') {
+      return { ok: false, code: 'REFUSED_BY_OP', error: 'create-registered-asset requires { kind, path }', options: getCreatableAssets().map((d) => d.id) };
+    }
+    if (!p.path || typeof p.path !== 'string') {
+      return { ok: false, code: 'REFUSED_BY_OP', error: 'create-registered-asset requires a `path` (an asset-root URL, e.g. /assets/materials/new.mat.json). This op deliberately takes an explicit path instead of opening the native save dialog, which is a BLOCKING osascript panel on macOS.' };
+    }
+    const r = await createRegisteredAsset(p.kind, p.path);
+    if (!r.ok) return r;
+    // Run the def's own post-create hook, exactly as the panel does — it is what opens the new
+    // asset in its editor / selects it. Skipping it would make the agent path quietly different
+    // from the human one, which is the divergence sharing `createRegisteredAsset` exists to avoid.
+    try { r.def.onCreated?.({ path: r.path, name: r.name, guid: r.guid }); }
+    catch (e) { console.debug('[create-registered-asset] onCreated hook failed', e); }
+    return {
+      ok: true, saved: true, kind: p.kind, path: r.path, name: r.name, guid: r.guid,
+      manifestRebuilt: r.manifestRebuilt,
+      note: 'The file is written and its GUID registered. Verify with modoki_list_assets (filter by name) — the backend manifest is rebuilt BEFORE this reply, so a check issued straight after sees it. NOT modoki_resolve_refs, which resolves ENTITY refs and never answers about an asset guid.',
     };
   });
 
@@ -1602,7 +2096,14 @@ export function registerEditorAgentOps(): void {
       : kind === 'animation' ? getAnimationClip(path, peek)
       : kind === 'timeline' ? getTimeline(path, peek)
       : kind === 'spriteanim' ? getSpriteAnim(path, peek)
-      : kind === 'rig2d' ? getRig2D(path, peek)
+      // rig2d reports the AUTHORED doc, not the parsed runtime rig. Every other kind's cache
+      // holds the file's own JSON; rig2d's holds packed Float32Arrays with the weights already
+      // renormalized, so this op used to answer a question about the ASSET with the deform
+      // driver's input — float32 weights, v1 rigs silently promoted to v2 parts. A QA run read
+      // those numbers as the editor corrupting the rig on load (QA-ASSET-0015). `?? getRig2D`
+      // keeps the "is it in the live cache at all?" answer identical for a rig seeded by an
+      // older path that never recorded a source.
+      : kind === 'rig2d' ? (getRig2DSource(path) ?? getRig2D(path, peek))
       : undefined;
     if (def === undefined) {
       throw new Error(

@@ -52,7 +52,7 @@ for (const p of PLATFORMS) {
 
 /** Engine test fixtures, not shipped games — excluded from `--all-missing` so a sweep does not
  *  generate native projects nobody will ever run. Name them explicitly to add one anyway. */
-const FIXTURES = new Set(['anim-bug', 'ota-test', 'ota-subgame-test', 'video-test']);
+const FIXTURES = new Set(['anim-bug', 'ota-test', 'ota-subgame-test']);
 
 function discoverMissing() {
   const out = [];

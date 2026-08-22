@@ -1,5 +1,5 @@
 /** Live-world trait mutation — the write half of the agent surface, shared by the DEVICE and the
- *  editor (#166, docs/plans/device-authoring-parity-plan.md).
+ *  editor (#166, docs/mcp-tool-conventions.md §9).
  *
  *  Why this lives here and not in `../editor/agentEditorOps.ts`: setting a trait field is a pure
  *  RUNTIME capability (`writeTraitField`), and the only thing that ever bound it to the editor was

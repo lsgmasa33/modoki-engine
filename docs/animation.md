@@ -39,7 +39,7 @@ clean and hot-reloads.
   `evalColorTrack`/`evalBooleanTrack`/`evalSteppedTrack`, `applyTangentMode`. No THREE, no ECS.
 - `runtime/animation/sampleClip.ts` — `applyClipAtTime` (sample every track, name-path resolve,
   batch-write onto bound entities), `applyClipAtTimeBlended`, `advanceClipTime`. Shared by playback + scrub.
-- `runtime/ecs/entityIndex.ts` — **engine core, not animation**: the per-frame `EntityIndex`
+- `runtime/core/ecs/entityIndex.ts` — **engine core, not animation**: the per-frame `EntityIndex`
   (`buildEntityIndex`), relative name-path resolution (`resolveTrackTarget`) and the
   active-in-hierarchy predicate (`isEntityActiveInHierarchy`). Born here for clip binding, but the
   renderer, the sequencer and 2D deform all build the same index — so it lives in core and the
@@ -106,7 +106,7 @@ the same blend so a bone-targeting clip switch crossfades too.
 
 **Switching clips at runtime (one API for all three animators).** `Animator`, `SpriteAnimator`, and
 `SkeletalAnimator` all model "the active clip is a NAME", so a single engine action drives whichever
-the entity carries: **`engine.playClip`** (`runtime/ui/engineActions.ts`) — the unified twin of
+the entity carries: **`engine.playClip`** (`runtime/actions/engineActions.ts`) — the unified twin of
 `engine.toggleAnimator`. It takes a `clip` NAME param and, per present trait, resets `time` + sets
 `playing` (keyframe/sprite, guarded by `animatorHasClip`/`spriteAnimHasClip`) or writes the name for
 the mixer to crossfade (skeletal — validated at the render layer, no synchronous guard). Bind it to a
@@ -131,12 +131,51 @@ on `px`/`py`/`pz` reads-and-writes once, not three spread-copies. It dirties the
 (`markUIDirty`) when it touches a UI trait — otherwise a UI clip plays in ECS but never repaints
 (the DOM only rebuilds on the dirty flag).
 
+⚠️ **An UNCHANGED value is skipped — both the `entity.set` and the dirty flag.** This matters more
+than it sounds, because a clip is sampled EVERY frame regardless of `playing`: a held pose (before a
+timeline clip block starts, after it ends, or any paused/clamped animator) re-evaluates to the same
+number forever. Writing that unconditionally cost a spread + set per animator per frame, and on a UI
+trait it rebuilt the WHOLE UI projection every frame for the rest of the session — a one-second fade
+buying a permanent per-frame DOM rebuild (found via court's title intro, five UI animators over a
+169-entity tree). A **dotted/nested** field (`overrides.0.source.value`) cannot be compared cheaply,
+so it counts as changed and keeps the old always-write path.
+
 Curve evaluation (`curveEval.ts`) mirrors Unity's `AnimationCurve`: constant clamp outside the key
 range, weighted cubic-bezier Hermite between keys using each key's out/in tangents + weights, and a
 **STEPPED** (`+Infinity`) out-tangent holds the left value until the next key. `evalSegment` solves
 the time→parameter map with Newton + a real bisection fallback (bracketed, can't diverge to the
 wrong root) and clamps the tangent-weight *sum* to keep `x(u)` monotonic. `applyTangentMode`
-implements the right-click tangent menu (auto/linear/constant/free) and records the mode on the key.
+implements the right-click tangent menu and records the mode on the key.
+
+**A key's `tangentMode` decides who OWNS its tangents, and that is the load-bearing distinction:**
+
+| mode | tangents are | on a neighbour edit |
+|---|---|---|
+| `auto` | derived — the secant through the surrounding two keys | re-fitted |
+| `linear` | derived — secants to each neighbour | re-fitted |
+| `constant` | authored — `outTangent` is STEPPED | held |
+| `freeSmooth` | authored by hand, in/out **mirrored** | held |
+| `free` | authored by hand, in/out **independent** (`broken`) | held |
+
+`reapplyTangent` re-applies a key's OWN mode whenever a neighbour's `t`/`v` moves, so the derived
+modes stay correct as the curve is edited and the authored ones survive. **A hand-drag of a tangent
+handle therefore has to RECORD its mode**, or the shape is temporary: `deriveTangentFromHandle`
+writes `freeSmooth` for a unified drag and `free` for a broken one. It did not, so the key stayed
+`auto` and the next neighbour edit re-derived the hand-shaped curve away — and `free` alone could
+not fix it, because preserving the numbers by marking the key broken silently turns one smooth
+handle into two independent ones. `freeSmooth` is the authored-and-still-mirrored case (Unity's
+"Free Smooth" beside its "Broken"). Switching a key INTO `freeSmooth` mirrors its two handles
+onto their average — clearing `broken` alone would leave a key that claims to be unified and
+does not look it.
+
+**The Break/Unify toggle (B, or the toolbar button) decides per key, and the rule is "keep a
+shape the user actually made".** Break is always `free`. Unify is `freeSmooth` when the key's
+handles DIFFER — they can only differ if someone moved one independently — and `auto` when they
+do not. Neither flat answer works: always-`auto` means break→unify silently replaces
+hand-shaping with the derived slope, so the toggle's two directions are not inverses;
+always-`freeSmooth` means a key double-toggled without any dragging goes from derived to
+authored and quietly stops tracking its neighbours, which surfaces much later as an edit that
+fails to propagate. The per-key test removes both.
 
 ### 3D skeletal (`SkinnedModel` + `SkeletalAnimator`)
 
@@ -265,11 +304,23 @@ swapped-away scene is dropped.
   stepped key would reload as linear. The persistent marker is `tangentMode:'constant'`;
   `normalizeAnimationClip` reconstructs `outTangent = STEPPED` from it on load. If you build a clip in
   code, set the mode, not just the raw tangent.
+  ⚠️ **Corollary: anything that RELABELS a stepped key destroys the hold, one reload later.** The
+  mode is not decoration, it is the only surviving record. A key's hold lives on the OUTGOING
+  tangent, so dragging its IN handle leaves it holding and it must stay `'constant'` —
+  `deriveTangentFromHandle` special-cases exactly that. Dragging the OUT handle is the opposite:
+  that replaces the hold with a real slope, so relabelling is then correct.
+- **Every edit that moves a key's `t` or `v` must re-derive the tangents AROUND it** — a derived
+  mode reads its slope off the NEIGHBOURS, so moving one key restales three. There are three such
+  writers (`applyValueNudge`, `moveKeysInTime`, `applyKeyPatch`) and they all call
+  `reapplyTangentsAround`; the runtime does NOT paper over a miss, because `normalizeAnimationClip`
+  trusts the stored number verbatim. A time move additionally restales the keys it LEFT BEHIND —
+  adjacency changes, not just spans — which is why `moveKeysInTime` tags them before it re-sorts.
 - **A missing/NaN tangent means *flat* (0), a genuine `+Infinity` means *hold*** — `normTangent`
   keeps the two distinct. Legacy/partial keys with an absent `outTangent` must read as 0, or
   `evalTrack` (which treats non-finite as STEPPED) and `evalSegment` (which reads 0) would disagree.
 - **Animating a UI trait needs the dirty flag** — `applyClipAtTime` calls `markUIDirty()` when it
-  writes a UI trait; a bare `entity.set` on a UI field won't repaint on its own.
+  writes a UI trait; a bare `entity.set` on a UI field won't repaint on its own. It fires only when
+  a value actually CHANGED, so a held pose is inert rather than a per-frame rebuild (above).
 - **`SkeletalAnimator.speed/loop/fadeDuration` are OVERRIDES, and "equals the trait default" is the
   sentinel for "inherit the animset value."** `ANIMSET_DEFAULTS` in `animSetCache` MUST stay equal to
   the trait defaults (`speed:1, loop:true, fadeDuration:0`) — that equality *is* the inherit switch.
@@ -301,6 +352,36 @@ swapped-away scene is dropped.
 - **A failed asset fetch is not retried** — a typo'd/500'd `.anim.json`/`.animset.json`/`.spriteanim.json`
   is remembered in `failed` and stays broken until an invalidate/clear (or scene swap). It won't
   self-heal by waiting.
+
+## Agent surface (posing)
+
+`modoki_set_playhead` writes the editor's playhead NUMBER and nothing else — a render taken right
+after shows the unchanged pose. `modoki_pose_clip` is the tool that actually poses the rig;
+`modoki_open_animation_editor` / `modoki_exit_pose_envelope` make it usable and reversible.
+
+**The pose write is SHARED, not re-derived.** It was extracted out of `AnimationEditor.tsx` into
+`engine/packages/modoki/src/editor/animation/poseClip.ts`, and the panel calls it too, so the agent
+path and the human scrub gesture are the same code. That matters because a pose writes authored
+trait values into the live world: the preview envelope's snapshot is what "⏹ Exit Preview" reverts
+to, and its run-mode is what stops a scene save baking the pose into the scene FILE. Re-deriving it
+would have recreated the measured bug (owner, 2026-08-19) where one Cmd+S after a keyframe edit
+silently rewrote a scene file to the clip's t=0 values.
+
+**Exiting is not optional scope.** The envelope pins the run-mode at `scrub`, which is exactly what
+blocks the human's Cmd+S — an agent that posed and never un-posed would wedge the editor.
+`poseClip.ts` publishes `onPoseEnvelopeExited` and `AnimationEditor` subscribes, so an agent-driven
+exit cannot leave the panel's Cmd+S save handler pointed at a closed envelope; that handler's
+`resume()` re-poses, so the human's next save would serialize and then re-pose the world the agent
+had just reverted.
+
+A real limit: POSING needs no Animation panel mounted, but OPENING a clip does — the clip document
+is fetched by the panel's own effect and FlexLayout mounts only the selected tab, so
+`modoki_open_animation_editor` waits for it and refuses with that as the reason rather than
+reporting a clip it has not got.
+
+⚠️ **Verify a pose by PERTURBING** — read a trait back at two different `t` values and assert they
+DIFFER. A single read can coincide with the authored value, and then it cannot tell "posed" from
+"ignored".
 
 ## Related
 

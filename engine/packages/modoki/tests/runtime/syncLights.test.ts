@@ -38,6 +38,8 @@ async function setup() {
     resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(() => null),
     resolveMaterialForMesh: vi.fn(() => null), resolveMaterial: vi.fn(),
     getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
+    // syncEnvironment sweeps retired envs (#315) — a mock without these throws on every call.
+    retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
   }));
   vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
   vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: vi.fn(() => false) }));
@@ -373,6 +375,8 @@ describe('syncLights — IBL-off ambient compensation', () => {
       resolveMeshTemplate: vi.fn(), resolveMeshLodInfo: vi.fn(() => null),
       resolveMaterialForMesh: vi.fn(() => null), resolveMaterial: vi.fn(),
       getCachedEnvironment: vi.fn(() => ({ isTexture: true })), acquireEnvironment: vi.fn(),
+      // syncEnvironment sweeps retired envs (#315) — a mock without these throws on every call.
+      retiredEnvironments: () => new Set(), disposeRetiredEnvironment: vi.fn(),
     }));
     vi.doMock('../../src/runtime/loaders/primitives', () => ({ createPrimitiveMesh: vi.fn() }));
     vi.doMock('../../src/runtime/rendering/renderUtils', () => ({ isImagePath: vi.fn(() => false) }));
@@ -387,6 +391,10 @@ describe('syncLights — IBL-off ambient compensation', () => {
     const settings = await import('../../src/runtime/rendering/renderSettings');
     const { TIER_SETTINGS } = await import('../../src/runtime/rendering/qualityTier');
     const sync = await import('../../src/runtime/rendering/scene3DSync');
+    // The DEFAULT is now the ABSENCE of clamping (docs/rendering.md § "Quality tiers") — `low` is a
+    // no-op (IBL stays ON) unless the project authored something to clamp with, so author it from the
+    // seed table to keep exercising the IBL-off compensation this describe block is for.
+    settings.setRenderSettings({ three: { tiers: { low: TIER_SETTINGS.low } } });
     settings.setActiveQualityTier({ tier: 'low', source: 'measured', reason: 'test' });
     return { world: createWorld(), Light, Environment, sync, settings, TIER_SETTINGS, scene: new THREE.Scene() };
   }
@@ -603,5 +611,149 @@ describe('syncLights — shadow follow target', () => {
     expect(followed.x).toBeCloseTo(authored.x, 5);
     expect(followed.y).toBeCloseTo(authored.y, 5);
     expect(followed.z).toBeCloseTo(authored.z, 5);
+  });
+});
+
+describe('syncLights — the tier shadow-caster cap (#229)', () => {
+  /** Author a `mid` tier whose ONLY departure from unclamped is the caster cap, and make it
+   *  active. Isolating the one field matters: `TIER_SETTINGS.mid` also switches AA and DPR, and a
+   *  test that swallowed the whole row could not say which knob produced the result. */
+  async function capAt(max: number) {
+    const rs = await import('../../src/runtime/rendering/renderSettings');
+    const { UNCLAMPED_OVERRIDES } = await import('../../src/runtime/rendering/qualityTier');
+    rs.resetRenderSettings();
+    rs.setRenderSettings({ three: { tiers: { mid: { ...UNCLAMPED_OVERRIDES, maxShadowCasters: max } } } });
+    rs.setActiveQualityTier({ tier: 'mid', source: 'project', reason: 'test' });
+    return rs;
+  }
+
+  /** A casting spot by default; `over` can switch the type or the intensity. `as const` on the
+   *  literal keeps `lightType` a union rather than widening to `string`, which the Light trait's
+   *  schema rejects. */
+  const casting = (over: { intensity: number; lightType?: 'spot' | 'directional' | 'point' }) => ({
+    lightType: 'spot' as const, color: 0xffffff, angle: 0.5, penumbra: 0.1, castShadow: true, ...over,
+  });
+
+  it('lets every caster render its map when no tier clamps — the unchanged default', async () => {
+    const { world, Light, sync, scene } = await setup();
+    const map = new Map<number, THREE.Light>();
+    const ids = [120, 90, 70].map((i) => world.spawn(Light(casting({ intensity: i }))).id());
+    ids.forEach((id) => worldTransforms.set(id, wt(0, 3, 0)));
+
+    sync.syncLights(world, scene, map);
+
+    expect(ids.map((id) => map.get(id)!.castShadow)).toEqual([true, true, true]);
+  });
+
+  it('keeps only the most effective casters, and leaves the AUTHORED intent alone', async () => {
+    const { world, Light, sync, scene } = await setup();
+    await capAt(1);
+    const map = new Map<number, THREE.Light>();
+    const [dim, bright, mid] = [70, 120, 90].map((i) => world.spawn(Light(casting({ intensity: i }))).id());
+    [dim, bright, mid].forEach((id) => worldTransforms.set(id, wt(0, 3, 0)));
+
+    sync.syncLights(world, scene, map);
+
+    expect(map.get(bright)!.castShadow).toBe(true);
+    expect(map.get(mid)!.castShadow).toBe(false);
+    expect(map.get(dim)!.castShadow).toBe(false);
+    // The trait still says what the author asked for — the cap is a frame decision, not an edit.
+    // Anything else would let a device's tier write itself back into the scene file.
+    for (const id of [dim, bright, mid]) {
+      expect(world.query(Light).find((e) => e.id() === id)!.get(Light)!.castShadow).toBe(true);
+    }
+  });
+
+  it('gives the slot to a DIRECTIONAL over brighter spots — the units are not comparable', async () => {
+    const { world, Light, sync, scene } = await setup();
+    await capAt(1);
+    const map = new Map<number, THREE.Light>();
+    const spot = world.spawn(Light(casting({ intensity: 120 }))).id();
+    const sun = world.spawn(Light(casting({ lightType: 'directional', intensity: 2 }))).id();
+    [spot, sun].forEach((id) => worldTransforms.set(id, wt(0, 5, 0)));
+
+    sync.syncLights(world, scene, map);
+
+    expect(map.get(sun)!.castShadow).toBe(true);
+    expect(map.get(spot)!.castShadow).toBe(false);
+  });
+
+  it('does not let a DEACTIVATED light consume a slot', async () => {
+    const { world, Light, sync, scene } = await setup();
+    await capAt(1);
+    const map = new Map<number, THREE.Light>();
+    const off = world.spawn(Light(casting({ intensity: 500 }))).id();
+    const on = world.spawn(Light(casting({ intensity: 10 }))).id();
+    [off, on].forEach((id) => worldTransforms.set(id, wt(0, 3, 0)));
+    deactivatedEntities.add(off);      // brightest, but not in the scene this frame
+
+    sync.syncLights(world, scene, map);
+
+    expect(map.get(on)!.castShadow).toBe(true);
+    expect(map.get(off)).toBeUndefined();   // deactivated lights are skipped entirely
+  });
+
+  it('reports what it dropped, because a missing shadow has no other symptom', async () => {
+    const { world, Light, sync, scene } = await setup();
+    await capAt(2);
+    const { getShadowCasterCapStats } = await import('../../src/runtime/rendering/shadowCasterCapFrame');
+    const map = new Map<number, THREE.Light>();
+    for (const i of [120, 90, 70, 60]) worldTransforms.set(world.spawn(Light(casting({ intensity: i }))).id(), wt(0, 3, 0));
+
+    sync.syncLights(world, scene, map);
+
+    expect(getShadowCasterCapStats()).toEqual({ engaged: true, casters: 4, kept: 2 });
+  });
+
+  it('RE-ARMS every sync: turning the winner off promotes the next light', async () => {
+    // The path a game actually takes — the authored flag changes at runtime and the cap has to
+    // re-decide. Verified on a Galaxy A23 before it was written down: flipping the 120-intensity
+    // spot off moved the shadow to the 90 (see the swap measurement in shadowCasterCap.ts's
+    // header). Nothing covered it, because every other test here arms once and asserts once.
+    const { world, Light, sync, scene } = await setup();
+    await capAt(1);
+    const map = new Map<number, THREE.Light>();
+    const bright = world.spawn(Light(casting({ intensity: 120 })));
+    const next = world.spawn(Light(casting({ intensity: 90 })));
+    [bright.id(), next.id()].forEach((id) => worldTransforms.set(id, wt(0, 3, 0)));
+
+    sync.syncLights(world, scene, map);
+    expect([map.get(bright.id())!.castShadow, map.get(next.id())!.castShadow]).toEqual([true, false]);
+
+    bright.set(Light, { castShadow: false });
+    sync.syncLights(world, scene, map);
+
+    // The demoted-by-the-author light casts nothing, and the slot it freed goes to the 90 —
+    // not to nobody, which is what a cap that armed only once would have left.
+    expect([map.get(bright.id())!.castShadow, map.get(next.id())!.castShadow]).toEqual([false, true]);
+  });
+
+  it('stays disengaged when the scene is already under the cap', async () => {
+    const { world, Light, sync, scene } = await setup();
+    await capAt(2);
+    const { getShadowCasterCapStats } = await import('../../src/runtime/rendering/shadowCasterCapFrame');
+    const map = new Map<number, THREE.Light>();
+    const id = world.spawn(Light(casting({ intensity: 90 }))).id();
+    worldTransforms.set(id, wt(0, 3, 0));
+
+    sync.syncLights(world, scene, map);
+
+    expect(getShadowCasterCapStats()).toEqual({ engaged: false, casters: 1, kept: 1 });
+    expect(map.get(id)!.castShadow).toBe(true);
+  });
+
+  it('reports NO counts on the unlimited path, because it never counted', async () => {
+    // An unlimited cap skips the collection walk, so the counter holds 0 — and reporting that as
+    // "0 casters" from the one function exported to answer "where did my shadow go?" would be a
+    // confident lie on the most common path of all (`high`, every untiered project). Absent, not 0.
+    const { world, Light, sync, scene } = await setup();
+    await capAt(0);
+    const { getShadowCasterCapStats } = await import('../../src/runtime/rendering/shadowCasterCapFrame');
+    const map = new Map<number, THREE.Light>();
+    for (const i of [120, 90, 70]) worldTransforms.set(world.spawn(Light(casting({ intensity: i }))).id(), wt(0, 3, 0));
+
+    sync.syncLights(world, scene, map);
+
+    expect(getShadowCasterCapStats()).toEqual({ engaged: false });
   });
 });

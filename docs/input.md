@@ -33,7 +33,7 @@ deterministic sim free of live DOM reads.
 
 ## Key files
 
-- `runtime/input/actions.ts` — the vocabulary (`AXES`, `DIGITAL`, `InputDevice`, `PointerFrame`) + pure
+- `runtime/core/inputActions.ts` — the vocabulary (`AXES`, `DIGITAL`, `InputDevice`, `PointerFrame`) + pure
   frame helpers (`makeAxes`/`makeFlags`/`makePointer`, `beginSample`, `computeEdges`,
   `computePointerEdge`, `clampAxes`, `applyDeadzone`).
 - `runtime/traits/Input.ts` — the `Input` resource trait + read accessors (`axis`/`held`/`pressed`/
@@ -44,16 +44,28 @@ deterministic sim free of live DOM reads.
 - `runtime/input/inputSources.ts` — the `InputSource` interface + registry (`registerSource`/
   `sampleAll`/`attachAll`) and the app-scope `inputSourcesManager`. Also the **host input gate**
   (`setInputGate`/`isInputSuppressed`): a host may suppress ingestion wholesale, and every source's
-  optional `reset()` runs on the closing edge so held state can't strand. It lives at the registry
+  optional `reset()` runs on EVERY suppressed frame (never on the reopening one — #264) so held
+  state can't strand and a queued backlog can't replay. It lives at the registry
   because all three sources need it and only the keyboard had any guard. A shipped game never
   installs one — see [editor-input.md](./editor-input.md).
 - `runtime/input/keyboardSource.ts` — DOM keyboard modality: passive listeners, editing-guard,
   blur/visibility/play reset; maps held keys onto the action vocabulary.
 - `runtime/input/gamepadSource.ts` — browser Gamepad API modality, split into a pure `sampleGamepadInto`
   mapper and a thin `navigator.getGamepads()` polling wrapper.
+- `runtime/traits/TouchControl.ts` — the on-screen-control trait (a d-pad arrow, a jump button) +
+  the `data-modoki-touch` / `data-modoki-ui-root` attribute names that `ui/` and `input/` agree on.
+  The names live at L1 because both subsystems are L2 and may not import each other.
+- `runtime/input/touchControlSource.ts` — the touch-control modality: ONE delegated pointer-listener
+  set over the runtime UI tree, per-`pointerId` so several controls hold at once and a thumb can
+  slide between them. See "On-screen touch controls" below.
+- `runtime/core/formFactor.ts` — L0: `readPlatform`/`readFormFactor`/`isTouchDevice`. The single
+  source of truth for "is this a handheld?", shared by the renderer's quality tier (`deviceCaps`)
+  and by touch-control visibility.
 - `runtime/input/pointerSource.ts` — mouse/primary-touch modality: Pointer Events on `window` with
   `setPointerCapture`, reports the single active pointer as a `PointerFrame` (position + down + drag
-  delta). Treats `pointercancel` as a clean release so an Android touch-reclaim can't strand a drag.
+  delta). Treats `pointercancel` as a clean release so an Android touch-reclaim can't strand a drag,
+  and lets a real finger reclaim a stranded SYNTHETIC gesture (see "A stranded synthetic press"
+  below).
 - `runtime/core/pointerBlockers.ts` — the pointer-block-root registry (`registerPointerBlocker`/
   `isPointerBlocked`), consulted by `pointerSource.ts` at ingestion. Lives in `core/` (L0), not
   `input/` or `ui/` (both L2), because both need to reach it and there is no `ui → input` zone edge.
@@ -91,8 +103,9 @@ handler. `computeEdges` produces `pressed = now && !was`, `released = !now && wa
 
 **Sources + registry.** An `InputSource` is `{ name, attach(), detach(), sample(out) }`. The registry
 de-dupes by `name` (last wins, so a hot-reload or a game swapping a source doesn't stack duplicates);
-`attachAll`/`detachAll` are guarded by an `attached` flag. Keyboard + gamepad are always registered
-(both inert until they see input / a controller connects). The `inputSourcesManager` is an **app-scope
+`attachAll`/`detachAll` are guarded by an `attached` flag. Keyboard, gamepad, pointer and
+touch-control are all always registered (each inert until it sees input — a controller connects, the
+pointer goes down, or a scene authors a `TouchControl`). The `inputSourcesManager` is an **app-scope
 Manager** — it `attachAll`s on init and `detachAll`s on dispose, and also registers the prompt read
 sources — so sources live app-lifetime and never load headless.
 
@@ -145,6 +158,144 @@ its own root automatically, but ONLY in runtime mode (`!onSelectEntity`) — the
 UI tree a second time inside SceneView's authoring preview, where a click manipulates gizmos/
 selection, not the running game, and must never claim its pointer. A game's own DOM chrome (like
 `rulesDialog.ts`) registers/unregisters manually around its own mount/unmount.
+
+**A stranded synthetic press, and why a real finger reclaims it (#299).** The primary-touch rule —
+the first pointer down owns the gesture, later pointers are ignored until it lifts — assumes the
+owning press eventually lifts. A press from the **device debug bridge** need not: `device_pointer
+{action:'down'}` holds across calls BY DESIGN, so an agent that never sends the matching `up` leaves
+`activeId` latched with no live pointer behind it, and nothing recovers it (`blur`/`visibilitychange`
+/play-start resets do not fire in a running shipped game). From then on every `pointerdown` — the
+human's finger included — hits the early return. Measured on the Galaxy A23 while the owner was
+playing `demos/forest-camp`: camera orbit was dead for every real touch until a cold `am force-stop`,
+and it presented as a product bug in the feature under test, because the on-screen d-pad tracks its
+own `pointerId`s and never consults this module.
+
+So `onPointerDown` adopts a **trusted** press that arrives while an **untrusted** gesture owns the
+pointer: the two cannot physically coexist, since an `isTrusted` event is a finger on the glass and a
+finger cannot land during a genuinely-in-progress *synthetic* gesture. That makes the takeover exact,
+where a staleness TIMEOUT would also steal a legitimate long hold from a second finger. The reverse
+is not adopted (a synthetic press never displaces a real gesture), and a synthetic-input-only device
+— the iPhone 8, which cannot run WebDriverAgent — is unaffected, since nothing there is ever
+trusted. The stale gesture is closed by the same `endGesture()` a real `pointerup` uses before the new one
+latches — so the `pending` FIFO keeps its down/up alternation, AND the velocity and 1€ filters are
+reset. Sharing that function is load-bearing rather than tidiness: the takeover's first draft
+hand-rolled the clear and skipped the velocity reset, and because the pointer-block check can
+`return` between the takeover and the new latch, a takeover onto a blocked root then published
+`down:false` with a non-zero `vx/vy` — a pointer that is up and still moving, which
+`pointerPredictedPos` extrapolates from. The bridge closes the other half: dropping the lease
+releases a press left held (`releaseHeldPointer`), because that is the moment the agent provably
+cannot send the `up` itself.
+
+**…and a later `device_tap`/`device_drag` releases it too (#305).** The takeover above protects the
+HUMAN, whose finger is trusted. It does nothing for the AGENT: a synthetic tap is not `isTrusted`
+either, so a `device_tap` dispatched while a `device_pointer` press is held hits the same early
+return, reaches nothing, and still answers `ok` — a false success, the outcome
+`mcp-tool-conventions.md` §0 ranks worst on this surface. Its `pointerup` then matches the held
+`pointerId` and ends the gesture anyway, leaving `heldPointer` and `pointerSource` disagreeing about
+whether anything is down. So `handleTap`/`handleDrag` drop a held press before dispatching, after
+the aim resolves (a refused call dispatches nothing, so it must steal nothing), and say so in the
+reply; the following `move`/`up` refusal names the cause instead of the bare "no pointer is held".
+`device_hover`/`device_scroll`/`device_press_key` deliberately leave the hold alone — all three are
+legitimate mid-gesture. Same rule as the editor's `MOUSE_GESTURE_ROUTES`, stopping in the same place.
+
+⚠️ **There are TWO branches here, and hardware measurement is what separated them.** Which one a
+`device_tap` takes depends on whether a TRUSTED route exists (CDP on Android, WebDriverAgent on
+iOS) — and the original issue described only the first:
+
+| | synthetic tap (no trusted route — the iPhone 8, or CDP unavailable) | trusted tap (Android+CDP, iOS+WDA) |
+|---|---|---|
+| Reaches `handleTap`? | yes | **no** — the aim resolves in-page, the touch injects host-side |
+| Is the tap swallowed? | **yes** — a false success | no — the press is `isTrusted`, so #299's takeover admits it |
+| What is wrong | the gesture is lost | only the BOOKKEEPING: the bridge still says `held:true` |
+
+So the trusted branch is not a milder version of the same bug — nothing is lost there. What breaks
+is that `heldPointer` and `pointerSource` disagree afterwards: measured on an S22, a trusted
+`device_tap` left the bridge reporting `held:true` while the takeover had already handed the gesture
+away, so the next `device_pointer {down}` was refused as "already held" with nothing actually held.
+That branch is fixed at the host, in `deviceCdp.ts`: it asks the bridge to release
+(`release-held-pointer`) after the aim resolves and before it injects. That call is **best-effort by
+construction** — a device running an older build answers "Unknown method", which must never turn a
+working tap into a failure — and its reply is decoded from a **JSON string**, because a bridge
+handler that returns an object arrives that way over the transport. Reading it as an object is the
+trap that once had `device_status` claiming `trusted-cdp` while every tap came back synthetic.
+
+⚠️ **The supersede path must NOT go through the exported `releaseHeldPointer`**, which bumps
+`leaseEpoch`. That counter means one thing — "released because the agent can no longer send the
+`up`" — and `handlePointer` re-checks it after its awaits to self-release a `down` whose lease died
+mid-resolve. A supersede is not that, so it calls the dispatch half (`dropHeldPress`) and leaves the
+counter alone. The consequence of getting it wrong is not measured, only reasoned; see the comment
+on `dropHeldPress` for exactly how far that claim goes.
+
+**The EDITOR has the same defect and closes it somewhere else entirely (#302).** `modoki_pointer
+{action:'down'}` strands a press exactly the way `device_pointer` does, and the symptom is the same:
+the Game panel reads no dragging at all, the human's own mouse included. But **#299's takeover
+cannot fire here, and must not be made to.** Editor input goes through `webContents.sendInputEvent`
+(`engine/electron/rendererOps.ts`), which injects real OS-level input — so the stranded press is
+itself `isTrusted`, `activeTrusted` is true, and `!e.isTrusted || activeTrusted` skips it. That is
+correct as written: two trusted presses genuinely cannot be told apart, and relaxing the condition to
+fire trusted-over-trusted would steal a real second finger mid-drag, which is the whole point of the
+primary-touch rule. `pointerSource.test.ts` pins that with *a REAL gesture in progress is never
+stolen*.
+
+Nor does the device's second half transfer. `inputRoutes.ts`'s `resetHeldPointer` runs on
+`did-finish-load` — a renderer RELOAD — which is precisely the moment the document that owned the
+press is already gone, so there is nothing left to dispatch a `pointerup` at. It clears the
+BACKEND's bookkeeping (otherwise the next `down` 409s as "already held" forever); it does not
+unlatch the renderer. Backend forgets, renderer stays latched.
+
+So the editor closes it at the **backend**, with two releases that both dispatch the real `mouseup`
+into the LIVE document — `releaseHeldPointer()`, as distinct from the clear-only `resetHeldPointer()`:
+
+- **A second mouse gesture releases it immediately.** `tap`/`drag`/`tap-handle`/`drag-handle` each
+  dispatch their own mouseDown, which cannot coexist with a held press, so their arrival proves the
+  held gesture was abandoned. Deliberately NOT every route: `key`/`type`/`scroll`/`hover`/`focus` are
+  all legitimate mid-gesture (Shift to constrain a drag, Escape to cancel it, scrolling a list while
+  dragging over it), and stealing the press there would break the interaction under test.
+- **`/api/capture-gesture` has to ask, because it bypasses the dispatcher** — it drives its own
+  drag straight through `rendererOps` and never passes through `createInputRoutes`, so it cannot
+  supersede a hold on its own the way the routes above do. It calls `releaseHeldPointer` explicitly,
+  next to the deliverability gate it already borrows for the same reason. Sampling a trajectory
+  underneath a held button would produce exactly the flat, misleading result that route already
+  guards against twice.
+- **A 120 s IDLE timeout is the backstop** (`HELD_POINTER_IDLE_MS`), for the case nothing else
+  reaches: the agent goes completely silent. It is a real timer, not a deadline checked on the next
+  request — there is no next request, which is the entire scenario. Every `move` restarts it, so a
+  long multi-step gesture never trips it.
+
+**A timeout is safe HERE and not in `pointerSource`, and the difference is not a matter of degree.**
+`pointerSource` cannot tell a synthetic press from a finger, so any staleness rule steals real holds.
+The backend's `heldPointer` is reachable only from `/api/input/pointer`, so it is synthetic *by
+construction* — there is no real finger to steal from. The budget is 120 s because the gap between a
+`down` and the next `move` is a whole agent turn (a capture, reading the image, thinking) and
+routinely runs tens of seconds; too SHORT is the worse failure, since it breaks a working gesture and
+presents as a bug in the feature under test — the exact round #299 cost.
+
+⚠️ **A release is REAL TRUSTED INPUT, so it must carry the actor lease.** The `mouseup` it
+dispatches is `sendInputEvent`, and the renderer acts on it — committing a gizmo drag, dropping a
+Hierarchy row, finalising a marquee. Outside the lease that lands in the editor journal as
+`source:'human'` with the `!` sigil (`editorJournal`'s default actor), so the editor records the
+AGENT's abandoned gesture as something the owner did — and this CLAUDE.md tells the next session to
+read the journal and believe precisely that ("something changed you didn't change? the human
+probably did it"). The mislabel would therefore aim a later session at *undoing work nobody did*.
+The attribution lives INSIDE `releaseHeldPointer`, not at its call sites, for the same reason
+`withAgentAttribution` wraps the dispatcher once rather than per route: there are three call sites,
+one of them in `main.ts`, and that is three chances to forget.
+
+**Both releases are visible, in two places.** The `move`/`up` that follows one is refused with a 409
+that NAMES the auto-release and why, instead of the generic "no pointer is held" (which would be the
+same silent-diagnosis trap in a new place). A press lost to a RELOAD says so in its own words and is
+never folded into the other two — nothing was dispatched there, so calling it an auto-release would
+describe a `mouseup` that never happened; and the recorded cause is replaced at each loss rather than
+left standing, or the refusal names an earlier gesture the agent never asked about. And
+`modoki_get_editor_state` reports `heldPointer`
+(`{button,x,y,heldMs}` or `null`), so a stranded press is read rather than inferred. That field is a
+main-process fact merged into the relayed renderer state via `BackendContext.getHeldPointer`, the
+same seam `persistenceMode` uses; it is **omitted entirely** on the Vite dev-server backend, which
+serves no `/api/input/*` routes — "not applicable here" and "nothing is held" are different answers.
+
+The old recoveries — `pointerSource.reset()` on the transition into `'playing'`, and a full page
+reload re-running the module — still happen, but they are coincidences of an interactive editor
+session, not the guarantee. The guarantee is the two releases above.
 
 ⚠️ **PASSTHROUGH SURFACES — a block root alone over-blocks, and it killed all 2D input for a day.**
 `UIRenderer` registers its WHOLE UI root, but that root is not "chrome": it is a LAYER holding chrome
@@ -448,6 +599,107 @@ noteInputResolution(dropTarget && { kind: dropTarget.kind, id: … }, 'drop');
 Worked example: `games/court/runtime/systems.ts` (`noteHit`), with the wiring pinned by
 `games/court/tests/inputWatch.test.ts` — a suite that exists because nothing else in Court would
 notice if those three calls were deleted.
+
+## On-screen touch controls — the d-pad
+
+Until #297 the engine had **no touch locomotion of any kind**. Every game here was either
+drag/tap native by design (sling, space-invader, chess, court) or keyboard-only — and
+`demos/forest-camp`, the flagship demo published with real iOS + Android native, told players on
+an A23 "WASD to walk" and gave them no way to walk at all (Testboard `xlbhRT4PjuJaK9tLos49`).
+
+An on-screen control is a **`TouchControl` trait on a UI entity** plus a fourth built-in source,
+`input/touchControlSource.ts`. **The engine draws nothing.** A control is an ordinary `UIElement`
+— the game authors its art (`imageSrc`, a nine-slice sprite, a rounded box), its size and its
+placement (`UIAnchor`, `safeArea: true` for the gesture bar) exactly as it authors the rest of its
+HUD; the trait only says what pressing it *means*. A d-pad is four entities, one per direction. A
+jump button is a fifth. There is no "d-pad widget", because every layer of configuration would be
+a layer of layout the game could not override.
+
+| Field | Meaning |
+|---|---|
+| `action` | What HOLDING it means — `moveLeft`/`moveRight`/`moveForward`/`moveBack` (which push the locomotion axes AND raise the matching `nav*` flag, exactly as the arrow keys do), or a digital action (`jump`, `aim`, `confirm`, `cancel`, `menu`, `pause`) |
+| `showOn` | `touch` (default — handhelds only), `always`, `never` |
+| `pressedOpacity` | Element opacity while held; `1` disables the highlight |
+
+**It is a SOURCE, not synthesized key events.** The obvious implementation dispatches
+`KeyboardEvent`s for W/A/S/D and lets `keyboardSource` pick them up. It is worse in three ways:
+`keyboardSource`'s `editing()` guard swallows them whenever a text field has focus; they are
+`isTrusted:false`; and a key is binary forever, foreclosing the analog stick that shares this
+seam. The engine already has the right abstraction one level up — so this merges `moveX`/`moveY`
+and `held` like every other source, and a game reading `inputAxis(world,'moveX')` needs no
+touch-specific code and cannot tell a thumb from a keyboard.
+
+**The DOM attribute is the seam, and it is load-bearing.** `ui/` and `input/` are both L2 and may
+not import each other (`docs/architecture-layers.md`). `UINode` stamps `data-modoki-touch` from
+the trait; the source reads it back off the live DOM with ONE delegated listener set. That also
+means nothing to re-bind when `markUIDirty` rebuilds the tree, and **sliding works for free** — a
+real d-pad lets the thumb roll from ← to ↑ without lifting, and every move re-resolves the control
+under the finger (`elementFromPoint`), so that is the default rather than a feature. A finger that
+slides off every control stops driving but stays TRACKED, so sliding back on resumes it.
+
+⚠️ **A control OUTRANKS the leaf `pointer-events: none` default and an authored `pointerThrough`.**
+A d-pad arrow is a leaf, so without that it renders perfectly and receives nothing — the same
+shape as the pointer-blocker passthrough bug. Pinned by `tests/ui/touchControlDom.test.tsx`.
+
+⚠️ **A control must be a plain `div`** — not an `input`/`range` `elementType`, not a `UIToggle`.
+`UINode` returns those from earlier branches that do not carry the attribute, so a `TouchControl`
+there would be an authored field that does nothing. It is refused rather than half-applied (the
+touch styles are withheld too, so the element is coherently *not* a control) and DEV warns —
+the fourth instance of the class `UINode` already warns about for `Canvas2D`, `UIToggle` and
+`VideoPlayer`.
+
+⚠️ **The press highlight is refcounted BY ELEMENT, not stored per press.** Two thumbs on one
+arrow made the second press capture the already-dimmed style as its original, so the first
+release restored the dimmed value and left the button rendered permanently pressed, with a later
+press re-capturing the wrong value as its own original. `reset()` iterates presses in insertion
+order, so the input gate's per-frame drain made that certain rather than likely. An element the
+source declines to highlight (`pressedOpacity: 1`) is now never written to at all — the old code
+still restored on release and erased an authored inline opacity it had never set.
+
+⚠️ **Visibility is a HOST question, never `lastInputDevice`.** It is asked at mount time, before
+the player has touched anything, when `lastDevice` is still `'none'` — a device-driven answer
+would hide the very control that lets them produce the first input. `core/formFactor.ts`
+(`isTouchDevice()`) is the single source of truth, shared with the renderer's quality tier so the
+tier a device boots at and the controls it is offered cannot disagree. The EDITOR is a desktop
+host, so a `showOn:'touch'` control is hidden in the Game panel and MOUNTED in the Scene panel
+whatever `showOn` says — you cannot position what you cannot see, and an authoring click must
+never drive the game (the source refuses any control outside a `data-modoki-ui-root="runtime"`
+tree).
+
+### Two thumbs at once — why this works at all
+
+`pointerSource` tracks exactly ONE gesture (`activeId`, first finger wins), so walk-while-you-orbit
+is impossible through it. It works because **a press inside a pointer-block root never latches
+`activeId`**, and `UIRenderer` registers the UI root as one: a thumb on the d-pad is invisible to
+`pointerSource`, leaving the next finger free to become the camera drag. That is why this source
+keeps its own per-`pointerId` map instead of going through the shared single pointer.
+
+Asserted at the DOM level in `packages/modoki/tests/runtime/touchControlSource.test.ts` (a real
+`pointerdown` on a control inside a registered block root, then a second on a canvas, then both
+read at once) rather than trusted from reading the code.
+
+### The diagonal is normalized
+
+Holding ← and ↑ gives (−1, +1) — a vector of length √2 — and every game here reads the axes as a
+velocity, so north-east walks 41% faster than north. On a keyboard that has always been true and
+players exploit it deliberately; on a d-pad the diagonal is a thumb POSITION, so the speed-up reads
+as the control being erratic. Scaled in the source, because only the source knows which
+contributions are its own: `clampAxes` runs after every source has merged and can only clamp.
+
+### Verified
+
+Measured, not reasoned: in the editor, a real press on `PadLeft` drives
+`CharacterController3D.moveX = −1` and releasing returns it to 0; a tap on the AIM button flips
+`Crosshair.isVisible`, i.e. the archery mode the demo previously reached only with the F key. On a
+**Galaxy A23** the four pads and AIM render on screen with `overlapsCount: 0` against the control
+hint, and the hint itself reads "D-pad to walk · Drag to orbit · AIM to draw the bow". The repo
+owner then played it on that phone.
+
+⚠️ **The two-finger case is proven by TESTS and by the owner's hands, not by an agent on device** —
+`device_tap`/`device_pointer` cannot press a DOM element at all (they resolve a `selector` and then
+dispatch at the canvas), and an unbalanced synthetic press additionally strands
+`pointerSource.activeId`, which killed real dragging until a cold relaunch. Both are #299; until
+that is fixed, an on-device pass for anything DOM-shaped is not evidence.
 
 ## Gotchas
 

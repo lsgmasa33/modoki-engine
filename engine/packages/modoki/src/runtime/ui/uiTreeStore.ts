@@ -15,6 +15,9 @@ import { addDirtyListener } from '../core/ecs/entityUtils';
 import { isSimRunning } from '../core/playState';
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { markUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
+import { spriteEpoch } from '../core/textureRefs';
+import { resolveUIFontFamily, resetFontRefWarnings } from './fontFamilyRef';
+import { scrollSnapChildStyle } from './scrollViewDom';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
 import type { World } from 'koota';
 import type { UIActionBinding } from './bindings';
@@ -37,7 +40,7 @@ export interface UINodeData {
   marginLeft: number; marginLeftUnit: string;
   minWidth: number; minWidthUnit: string; maxWidth: number; maxWidthUnit: string;
   minHeight: number; minHeightUnit: string; maxHeight: number; maxHeightUnit: string;
-  alignSelf: string; zIndex: number;
+  alignSelf: string; zIndex: number; rotation: number;
   overflow: string; isVisible: boolean; pointerThrough: boolean;
   // ── Style ──
   backgroundColor: number; backgroundOpacity: number;
@@ -45,14 +48,20 @@ export interface UINodeData {
   opacity: number;
   // ── Text ──
   text: string;
-  fontFamily: string; fontSize: number; fontWeight: string; fontStyle: string;
+  /** The RESOLVED CSS `font-family` value — `UIElement.fontFamily` (a font-asset GUID) run
+   *  through the manifest, else `UIElement.systemFont`, else '' (#231). Resolved here rather
+   *  than in `UINode` so the DOM layer stays a pure style writer and the precedence lives in
+   *  exactly one place (`ui/fontFamilyRef.ts`). */
+  fontFamily: string; fontSize: number; fontSizeUnit: string; fontWeight: string; fontStyle: string;
   textColor: number; textOpacity: number; textAlign: string;
-  lineHeight: number; letterSpacing: number;
+  lineHeight: number; letterSpacing: number; letterSpacingUnit: string;
   textShadowColor: number; textShadowOpacity: number; textShadowOffsetX: number; textShadowOffsetY: number; textShadowBlur: number;
   textStrokeColor: number; textStrokeOpacity: number; textStrokeWidth: number;
   textOverflow: string; maxLines: number;
   // ── Image ──
   imageSrc: string; imageMode: string;
+  /** Cache-busting epoch for `imageSrc` — see where it is built, and `spriteEpoch`. */
+  imageEpoch: number;
   /** This UI entity also carries a `VideoPlayer` — UINode mounts the clip into its box
    *  (`UIVideoMount`), cropped by `imageMode`. Video as SCENERY, distinct from the
    *  fullscreen `VideoOverlay` cutscene, which sits above everything. */
@@ -70,6 +79,39 @@ export interface UINodeData {
   // unpositioned element.
   anchor?: { anchor: AnchorMode; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean; zIndex: number };
   canvas2D?: { referenceWidth: number; referenceHeight: number; scaleMode: string };
+  /** UIToggle trait — this entity renders as an on/off switch (a track with a knob)
+   *  rather than a plain box. Optional nested block, not scalars: a toggle is rare,
+   *  and its absence has to survive `_scalarKeys` being derived from whichever node
+   *  happens to be built first. */
+  toggle?: { value: boolean; trackOnColor: number; trackOffColor: number; trackOpacity: number; knobColor: number; knobOpacity: number; knobInset: number; trackRadius: number; knobRadius: number; disabled: boolean };
+  /** TouchControl trait — this element is an on-screen input control (a d-pad arrow, a jump
+   *  button). Optional nested block for the same reason `toggle` is one: rare, and `_scalarKeys`
+   *  is derived from whichever node happens to be built first.
+   *
+   *  The projection carries it; it does NOT carry whether the control is currently held. A
+   *  press is applied straight to the DOM by `input/touchControlSource.ts`, because rebuilding
+   *  the whole UI tree on every press and release of a d-pad would be a frame's work for a
+   *  highlight, at thumb frequency. */
+  touch?: { action: string; showOn: string; pressedOpacity: number };
+  /** UIScrollView trait — this element is a scrolling box. Carries the AUTHORED motion fields
+   *  plus the one-shot `scrollTo*` request, and deliberately **NOT** the live `scrollX`/`scrollY`.
+   *
+   *  ⚠️ That omission is load-bearing, not an oversight. Scroll position flows the OTHER way —
+   *  `UINode` writes it into the trait on every DOM scroll event without dirtying the tree. If it
+   *  rode down in the projection, every scroll event would change this node, `nodesEqual` would
+   *  fail, and the whole "a scroll frame costs nothing" property would be gone. */
+  scroll?: { axis: string; snap: string; snapStop: string; overscroll: string; scrollbar: string; wheel: string; scrollToX: number; scrollToY: number; scrollBehavior: string };
+  /** True when this node is a pooled `UIEntries` entry. Its only job here is to name the SNAP
+   *  TARGETS of an enclosing scroll view — see `stampSnapTargets`. */
+  isEntry?: boolean;
+  /** `scroll-snap-align` + `scroll-snap-stop`, stamped by the enclosing scroll view.
+   *
+   *  ⚠️ It rides the NODE rather than being applied by the scroll view's own element because
+   *  CSS snapping is declared on the box and honoured on the TARGET, and those are different
+   *  elements. `scrollSnapChildStyle` shipped in #250 with a unit test and NO caller, so
+   *  `UIScrollView.snap` styled the container and nothing ever snapped — the repo's
+   *  unreachable-mechanism defect class, found by measuring the pager's DOM. */
+  snapChild?: Record<string, string>;
   /** TextAnimation trait — whole-element CSS text animation (fade/wave/bounce/jitter/
    *  rainbow/typewriter) realized by UINode. Shared trait with the 2D/3D geometry paths. */
   textAnim?: { effect: string; speed: number; amplitude: number; frequency: number; loop: boolean; fadeIn: boolean };
@@ -109,6 +151,9 @@ function ensureInitialized() {
   // Force rebuild on world swap (scene change)
   onWorldSwap(() => {
     markUIDirty();
+    // Forget which broken font refs have been warned about: the NEXT scene may author the same
+    // dangling GUID and independently needs the diagnostic (#231).
+    resetFontRefWarnings();
     _prevById = new Map(); // drop old-scene refs so they're never reused
     useUITreeStore.setState({ tree: [] });
   });
@@ -128,7 +173,7 @@ const _sortMap = new Map<number, number>();
 let _prevById = new Map<number, UINodeData>();
 
 // Node keys that aren't plain scalars — compared specially in nodesEqual.
-const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim']);
+const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim', 'toggle', 'touch', 'scroll', 'snapChild']);
 // Derived ONCE from a real node, so every scalar field is covered automatically:
 // add a field to UINodeData and it's compared without editing this file.
 let _scalarKeys: string[] | null = null;
@@ -158,6 +203,10 @@ export function nodesEqual(a: UINodeData, b: UINodeData): boolean {
   if (!shallowOptEqual(a.binding as Record<string, unknown> | undefined, b.binding as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.canvas2D as Record<string, unknown> | undefined, b.canvas2D as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.textAnim as Record<string, unknown> | undefined, b.textAnim as Record<string, unknown> | undefined)) return false;
+  if (!shallowOptEqual(a.toggle as Record<string, unknown> | undefined, b.toggle as Record<string, unknown> | undefined)) return false;
+  if (!shallowOptEqual(a.touch as Record<string, unknown> | undefined, b.touch as Record<string, unknown> | undefined)) return false;
+  if (!shallowOptEqual(a.scroll as Record<string, unknown> | undefined, b.scroll as Record<string, unknown> | undefined)) return false;
+  if (!shallowOptEqual(a.snapChild as Record<string, unknown> | undefined, b.snapChild as Record<string, unknown> | undefined)) return false;
   // action.bindings is an array — ref-compare, but treat two empties as equal
   // (the builder allocates a fresh [] when the trait carries none).
   if (a.action || b.action) {
@@ -185,7 +234,7 @@ function reconcileNode(node: UINodeData, nextPrev: Map<number, UINodeData>): UIN
 
 // Cache trait lookups (resolve once, reuse across frames)
 let _traitsCached = false;
-let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any;
+let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any, _toggleMeta: any, _touchMeta: any, _scrollMeta: any, _entryMeta: any;
 
 function cacheTraits() {
   const allTraits = getAllTraits();
@@ -198,6 +247,10 @@ function cacheTraits() {
   _canvas2dMeta = allTraits.find(m => m.name === 'Canvas2D');
   _textAnimMeta = allTraits.find(m => m.name === 'TextAnimation');
   _videoMeta = allTraits.find(m => m.name === 'VideoPlayer');
+  _toggleMeta = allTraits.find(m => m.name === 'UIToggle');
+  _scrollMeta = allTraits.find(m => m.name === 'UIScrollView');
+  _entryMeta = allTraits.find(m => m.name === 'UIEntry');
+  _touchMeta = allTraits.find(m => m.name === 'TouchControl');
   _traitsCached = !!(_renderUIMeta && _uiElMeta);
 }
 
@@ -210,16 +263,53 @@ function sortChildren(n: UINodeData) {
   for (let i = 0; i < n.children.length; i++) sortChildren(n.children[i]);
 }
 
-function buildTree(world: World): UINodeData[] {
+/** Build the tree, or **`null` when it CANNOT be built yet** (traits not registered).
+ *
+ *  ⚠️ The null is the whole point, and it replaces a `[]` that was a latent bug. The caller
+ *  clears the dirty flag, so returning an empty tree here CONSUMED the rebuild request and left
+ *  the UI permanently empty unless something else happened to dirty it later. The old comment
+ *  said this "self-corrects on the next markUIDirty rebuild" — nothing guarantees there is a next
+ *  one. `loadSceneFile` fires exactly ONE markUIDirty for the whole batch, so if that is the
+ *  signal that lands here too early, no UI is ever rendered: no Canvas2D node means
+ *  `Canvas2DMount` never mounts, which means a 2D game draws NOTHING, with no error anywhere. */
+/** Collect the pooled entries under a scroll view, without crossing into a NESTED scroll view
+ *  (its own entries are its own snap targets, not this one's). */
+function collectEntries(node: UINodeData, out: UINodeData[]): void {
+  for (const c of node.children) {
+    if (c.isEntry) out.push(c);
+    if (c.scroll) continue;
+    collectEntries(c, out);
+  }
+}
+
+/** Stamp `scroll-snap-align` onto a scroll view's snap TARGETS.
+ *
+ *  Targets are the pooled ENTRIES when the view has any — an entry is the unit a pager or a
+ *  grid is meant to rest on, and it is two levels below the box now that the offset is carried
+ *  by a content child and a row (see `entriesSystem`'s ENTRIES_ROW_NAME). A view with no
+ *  entries snaps to its direct children instead, which is the plain authored-children case the
+ *  trait's own doc calls out as useful on its own.
+ *
+ *  Stamping an entry rather than a row serves BOTH axes at once: an entry box has an extent on
+ *  each, so `both mandatory` needs no second rule. */
+export function stampSnapTargets(node: UINodeData): void {
+  if (node.scroll && node.scroll.snap !== 'none') {
+    const css = scrollSnapChildStyle(node.scroll);
+    const entries: UINodeData[] = [];
+    collectEntries(node, entries);
+    for (const t of (entries.length ? entries : node.children)) t.snapChild = css;
+  }
+  for (const c of node.children) stampSnapTargets(c);
+}
+
+function buildTree(world: World): UINodeData[] | null {
   if (!_traitsCached) cacheTraits();
   if (!_traitsCached) {
-    // Traits not registered yet — expected during the initial-dirty build that
-    // runs before game/editor setup registers traits. A UI entity can't exist
-    // without RenderableUI/UIElement being registered first, so this transient
-    // empty tree self-corrects on the next markUIDirty rebuild. (A game that
-    // genuinely forgets to register UI traits surfaces via loadSceneFile's
-    // unknown-trait warnings, not here.)
-    return [];
+    // Traits not registered yet — expected during the initial-dirty build that runs before
+    // game/editor setup registers traits. Signal "not yet" so the caller KEEPS the request
+    // pending rather than swallowing it. (A game that genuinely forgets to register UI traits
+    // surfaces via loadSceneFile's unknown-trait warnings, not here.)
+    return null;
   }
 
   _nodes.clear();
@@ -262,22 +352,30 @@ function buildTree(world: World): UINodeData[] {
         maxWidth: ui.maxWidth || 0, maxWidthUnit: ui.maxWidthUnit || 'px',
         minHeight: ui.minHeight || 0, minHeightUnit: ui.minHeightUnit || 'px',
         maxHeight: ui.maxHeight || 0, maxHeightUnit: ui.maxHeightUnit || 'px',
-        alignSelf: ui.alignSelf || 'auto', zIndex: ui.zIndex || 0,
+        alignSelf: ui.alignSelf || 'auto', zIndex: ui.zIndex || 0, rotation: ui.rotation || 0,
         overflow: ui.overflow, isVisible: ui.isVisible,
         pointerThrough: ui.pointerThrough === true,
         backgroundColor: ui.backgroundColor || 0, backgroundOpacity: ui.backgroundOpacity || 0,
         borderRadius: ui.borderRadius || 0, borderWidth: ui.borderWidth || 0,
         borderColor: ui.borderColor || 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,
-        text: ui.text || '', fontFamily: ui.fontFamily || '',
-        fontSize: ui.fontSize || 16, fontWeight: ui.fontWeight || 'normal',
+        text: ui.text || '', fontFamily: resolveUIFontFamily(ui.fontFamily as string, ui.systemFont as string),
+        fontSize: ui.fontSize || 16, fontSizeUnit: ui.fontSizeUnit || 'px', fontWeight: ui.fontWeight || 'normal',
         fontStyle: ui.fontStyle || 'normal', textColor: ui.textColor ?? 0xffffff, textOpacity: ui.textOpacity ?? 1,
         textAlign: ui.textAlign || 'left',
-        lineHeight: ui.lineHeight || 0, letterSpacing: ui.letterSpacing || 0,
+        lineHeight: ui.lineHeight || 0, letterSpacing: ui.letterSpacing || 0, letterSpacingUnit: ui.letterSpacingUnit || 'px',
         textShadowColor: ui.textShadowColor || 0, textShadowOpacity: ui.textShadowOpacity ?? 1, textShadowOffsetX: ui.textShadowOffsetX || 0,
         textShadowOffsetY: ui.textShadowOffsetY || 0, textShadowBlur: ui.textShadowBlur || 0,
         textStrokeColor: ui.textStrokeColor || 0, textStrokeOpacity: ui.textStrokeOpacity ?? 1, textStrokeWidth: ui.textStrokeWidth || 0,
         textOverflow: ui.textOverflow || 'clip', maxLines: ui.maxLines || 0,
         imageSrc: ui.imageSrc || '', imageMode: ui.imageMode || 'cover',
+        // The RESOLUTION epoch of whatever imageSrc points at. It is in the node data — not read
+        // inside UINode — because this tree's reconciler hands back the PREVIOUS node object when
+        // the data is equal, so `React.memo(UINode)` bails and the inline `resolveDomImageUrl`
+        // never re-runs. A texture re-import changes the URL without changing the ref, so without
+        // this the DOM kept the pre-import image until the trait was touched or the scene
+        // reloaded (bug `udpbnC6DHswvCj115B7M`, QA-ASSET-0007). Only nodes that HAVE an image
+        // carry it, so an unrelated re-import cannot churn the rest of the tree.
+        imageEpoch: ui.imageSrc ? spriteEpoch(ui.imageSrc) : 0,
         elementType: ui.elementType || 'div', placeholder: ui.placeholder || '',
         rangeMin: ui.rangeMin ?? 0, rangeMax: ui.rangeMax ?? 100, rangeStep: ui.rangeStep ?? 1,
         // A PLAIN SCALAR, always written, never an optional nested block: `_scalarKeys`
@@ -308,6 +406,14 @@ function buildTree(world: World): UINodeData[] {
         const a = entity.get(_actionMeta.trait) as any;
         node.action = { bindings: a.bindings || [] };
       }
+      if (_touchMeta && entity.has(_touchMeta.trait)) {
+        const tc = entity.get(_touchMeta.trait) as any;
+        node.touch = {
+          action: tc.action || 'moveLeft',
+          showOn: tc.showOn || 'touch',
+          pressedOpacity: typeof tc.pressedOpacity === 'number' ? tc.pressedOpacity : 0.6,
+        };
+      }
       if (_anchorMeta && entity.has(_anchorMeta.trait)) {
         const anc = entity.get(_anchorMeta.trait) as any;
         node.anchor = {
@@ -323,6 +429,33 @@ function buildTree(world: World): UINodeData[] {
       if (_canvas2dMeta && entity.has(_canvas2dMeta.trait)) {
         const c = entity.get(_canvas2dMeta.trait) as any;
         node.canvas2D = { referenceWidth: c.referenceWidth, referenceHeight: c.referenceHeight, scaleMode: c.scaleMode };
+      }
+      if (_toggleMeta && entity.has(_toggleMeta.trait)) {
+        const t = entity.get(_toggleMeta.trait) as any;
+        node.toggle = {
+          value: t.value === true,
+          trackOnColor: t.trackOnColor ?? 0x4aa3ff, trackOffColor: t.trackOffColor ?? 0x767676,
+          trackOpacity: t.trackOpacity ?? 1,
+          knobColor: t.knobColor ?? 0xffffff, knobOpacity: t.knobOpacity ?? 1,
+          knobInset: t.knobInset ?? 2,
+          trackRadius: t.trackRadius ?? 999, knobRadius: t.knobRadius ?? 999,
+          disabled: t.disabled === true,
+        };
+      }
+      // ⚠️ ALWAYS written, never conditionally. `_scalarKeys` is derived ONCE from whichever
+      // node is reconciled first in the session, so a key that is only sometimes present can be
+      // permanently excluded from `nodesEqual` — the exact trap `hasVideo` above is written this
+      // way to avoid. Inert today (UIEntry is added once and never removed), and a landmine the
+      // moment it is not.
+      node.isEntry = !!(_entryMeta && entity.has(_entryMeta.trait));
+      if (_scrollMeta && entity.has(_scrollMeta.trait)) {
+        const sv = entity.get(_scrollMeta.trait) as any;
+        node.scroll = {
+          axis: sv.axis ?? 'y', snap: sv.snap ?? 'none', snapStop: sv.snapStop ?? 'normal',
+          overscroll: sv.overscroll ?? 'auto', scrollbar: sv.scrollbar ?? 'auto', wheel: sv.wheel ?? 'native',
+          scrollToX: sv.scrollToX ?? -1, scrollToY: sv.scrollToY ?? -1,
+          scrollBehavior: sv.scrollBehavior ?? 'instant',
+        };
       }
       // Play-GATE the animation here in the projection (not in UINode) so it toggles
       // on the node itself: UIRenderer marks the UI dirty on play-state change, and a
@@ -407,6 +540,7 @@ function buildTree(world: World): UINodeData[] {
 
   roots.sort(sortBySortOrder);
   for (let i = 0; i < roots.length; i++) sortChildren(roots[i]);
+  for (let i = 0; i < roots.length; i++) stampSnapTargets(roots[i]);
 
   // Reuse unchanged node objects from last frame so React.memo(UINode) skips them.
   const nextPrev = new Map<number, UINodeData>();
@@ -421,7 +555,14 @@ function buildTree(world: World): UINodeData[] {
 export function uiTreeProjection(world: World) {
   ensureInitialized();
   if (!isUIDirty()) return;
-  clearUIDirty();
+  // ⚠️ Build FIRST, clear the flag only if the build actually produced a tree. The flag used to
+  // be cleared up front, so a build that could not run yet (traits not registered — `buildTree`
+  // returns null) silently ATE the rebuild request: the request is gone, the tree stays empty,
+  // and recovery depends on some unrelated code dirtying the UI again later. Nothing guarantees
+  // that. Keeping the flag set costs one retry per frame until traits exist — which is what
+  // "dirty" already means — and turns a permanent, silent blank UI into a one-frame delay.
   const tree = buildTree(world);
+  if (tree === null) return;
+  clearUIDirty();
   useUITreeStore.setState({ tree });
 }

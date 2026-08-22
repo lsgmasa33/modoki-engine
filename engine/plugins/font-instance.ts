@@ -6,8 +6,8 @@
  *
  *   - **baked** — `msdf-atlas-gen -varfont <file>?wght=700` is a SILENT NO-OP in our
  *     build: the flag is accepted, exit code 0, no warning, and the atlas comes out
- *     BYTE-IDENTICAL to a plain `-font` bake (measured; see docs/plans/font-variation-axes-plan.md
- *     §8). So the bake is fed an already-instanced file via plain `-font`, and
+ *     BYTE-IDENTICAL to a plain `-font` bake (measured; see docs/fonts.md
+ *     §3). So the bake is fed an already-instanced file via plain `-font`, and
  *     `buildAtlasGenArgs` must never grow a `-varfont` (guarded in fontConvert.test.ts).
  *   - **dynamic** — `@zappar/msdf-generator`'s options carry no axis coordinates at all,
  *     and it rasterizes raw font bytes with no CSS/canvas rasterizer to borrow instancing
@@ -132,8 +132,14 @@ let hbPromise: Promise<HbExports> | null = null;
  *  this module, because that pulled it into the CJS bundle. The packaged editor would
  *  have hit the same wall with no import at all. */
 function requireBase(): string {
+  // ⚠️ `import.meta.url` VERBATIM. This module is in `vite.config.ts`'s static import graph, and
+  //  Vite's config bundler rewrites only that exact expression to the defining module's URL — a
+  //  paraphrase like `(import.meta as { url?: string }).url` slips past the define and resolves
+  //  to the TEMP FILE in `node_modules/.vite-temp/` instead. Measured against vite 8.2.0 under
+  //  the repo's own shape (a `.ts` config under a `"type": "module"` root). It was benign here
+  //  only because `require.resolve` walks up and finds the same `node_modules` anyway.
   const metaUrl: string | undefined =
-    typeof import.meta !== 'undefined' ? (import.meta as { url?: string }).url : undefined;
+    typeof import.meta !== 'undefined' ? import.meta.url : undefined;
   if (metaUrl) return metaUrl;
   // CJS bundle: __dirname is real. createRequire wants a FILE path, not a directory.
   if (typeof __dirname === 'string' && __dirname) return path.join(__dirname, 'noop.cjs');

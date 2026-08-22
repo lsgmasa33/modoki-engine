@@ -19,9 +19,33 @@ describe('planIosInstall', () => {
       .toEqual({ ok: false, missing: 'iosDeviceId' });
   });
 
-  it('allows the build with NO devicectl id, handing off to Xcode (the iOS-16 case)', () => {
+  it('allows the build with NO devicectl id, handing off to Xcode when go-ios is unavailable', () => {
     expect(planIosInstall({ iosDeviceId: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', iosDevicectlId: '' }))
       .toEqual({ ok: true, mode: 'xcode-handoff' });
+  });
+
+  it('uses go-ios for a device devicectl cannot reach (#217 — this is what removes the ⌘R)', () => {
+    expect(planIosInstall({ iosDeviceId: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', iosDevicectlId: '', goIos: true }))
+      .toEqual({ ok: true, mode: 'go-ios' });
+  });
+
+  it('prefers devicectl over go-ios when the device supports it', () => {
+    // Not an arbitrary tie-break: go-ios needs a sudo `ios tunnel start` on iOS 17+, and Apple's
+    // own tool needs nothing there. go-ios exists here for the devices devicectl CANNOT see, so
+    // letting it win on a modern phone would trade a working path for one that prompts for a
+    // password. If this ever inverts, that is the cost.
+    expect(planIosInstall({
+      iosDeviceId: 'DEADBEEF-0123456789ABCDEF',
+      iosDevicectlId: 'FACEFEED-0000-0000-0000-000000000000',
+      goIos: true,
+    })).toEqual({ ok: true, mode: 'devicectl' });
+  });
+
+  it('still refuses a missing iosDeviceId even with go-ios available', () => {
+    // go-ios needs the hardware UDID as much as xcodebuild does — availability of a better
+    // installer never substitutes for knowing WHICH phone.
+    expect(planIosInstall({ iosDeviceId: '', iosDevicectlId: '', goIos: true }))
+      .toEqual({ ok: false, missing: 'iosDeviceId' });
   });
 
   it('uses devicectl when both ids are present', () => {

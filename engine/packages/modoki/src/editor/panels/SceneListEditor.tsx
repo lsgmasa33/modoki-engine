@@ -3,14 +3,49 @@
  *  project's scenes. Order + include come from the value; the universe of scenes
  *  is discovered on disk and passed in as `options` ({ value: guid, label }).
  *  The FIRST included scene is the project's boot scene (shown with a BOOT badge).
- *  Scenes found on disk but absent from the value are appended (included). */
+ *  Scenes found on disk but absent from the value are appended (included).
+ *
+ *  `options` is discovered ONCE, at editor setup (`/api/scenes` in
+ *  `engine/app/editor/setup.ts`), and baked into the static Project Settings schema — so on
+ *  its own it can only ever describe the scenes that existed when the app BOOTED. A scene
+ *  authored live (New Scene → Save As) was therefore invisible here until a relaunch, with no
+ *  error: measured on games/anim-bug, where `modoki_list_assets {type:'scene'}` and the file on
+ *  disk both showed the new scene while this dialog listed only the boot-time one (QA-DLG-0005).
+ *  So the universe is taken from the LIVE asset manifest — the same source `list_assets` reads,
+ *  kept current by the editor's own asset refresh — and `options` supplies the labels plus the
+ *  fallback for any environment where the manifest is not populated (tests, a bare host). */
 
 export interface SceneEntry {
   guid: string;
   include: boolean;
 }
 
+import { getAllAssets } from '../../runtime/loaders/assetManifest';
+
 type Option = { value: string; label: string };
+
+/** The scenes that exist RIGHT NOW: the live asset manifest, labelled by file name, with the
+ *  boot-time `options` merged in — its labels win (the host built them from the backend's own
+ *  paths), and it is the whole answer when the manifest is empty. Deliberately not memoized:
+ *  the dialog mounts on open, which is exactly when the answer must be re-read. */
+export function discoverScenes(options: Option[]): Option[] {
+  const out: Option[] = [];
+  const seen = new Set<string>();
+  for (const o of options) { if (!seen.has(o.value)) { seen.add(o.value); out.push(o); } }
+  // Manifest-derived scenes are sorted by label. `getAllAssets()` returns Map INSERTION
+  // order, so a scene created during the session would otherwise land at the END of this
+  // list and move on the next reload. The boot-time `options` keep their caller-supplied
+  // order ahead of these — they are the host's own list, not ours to reorder.
+  const discovered: Option[] = [];
+  for (const a of getAllAssets()) {
+    if (a.type !== 'scene' || !a.guid || seen.has(a.guid)) continue;
+    seen.add(a.guid);
+    discovered.push({ value: a.guid, label: a.path.split('/').pop() || a.path });
+  }
+  discovered.sort((x, y) => x.label.localeCompare(y.label, undefined, { sensitivity: 'base' }));
+  out.push(...discovered);
+  return out;
+}
 
 const row: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 8, padding: '4px 6px',
@@ -49,8 +84,9 @@ export default function SceneListEditor({ value, options, onChange }: {
   options: Option[];
   onChange: (v: SceneEntry[]) => void;
 }) {
-  const entries = merge(value, options);
-  const labelFor = new Map(options.map((o) => [o.value, o.label]));
+  const discovered = discoverScenes(options);
+  const entries = merge(value, discovered);
+  const labelFor = new Map(discovered.map((o) => [o.value, o.label]));
   const firstIncluded = entries.findIndex((e) => e.include);
 
   const move = (i: number, dir: -1 | 1) => {
@@ -78,14 +114,14 @@ export default function SceneListEditor({ value, options, onChange }: {
       </div>
       {entries.map((e, i) => (
         <div key={e.guid} style={row}>
-          <input type="checkbox" checked={e.include} onChange={() => toggle(i)} title="Include in build" />
+          <input data-ui-id={`sceneList.row.${i}.include`} data-ui-kind="toggle" data-ui-label="Include in build" data-ui-state={e.include ? 'checked' : 'unchecked'} type="checkbox" checked={e.include} onChange={() => toggle(i)} title="Include in build" />
           <span style={{ flex: 1, color: e.include ? '#ddd' : '#666', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
             title={labelFor.get(e.guid) ?? e.guid}>
             {labelFor.get(e.guid) ?? e.guid}
           </span>
           {i === firstIncluded && <span style={bootBadge}>BOOT</span>}
-          <button style={{ ...smallBtn, opacity: i === 0 ? 0.4 : 1 }} disabled={i === 0} title="Move up" onClick={() => move(i, -1)}>↑</button>
-          <button style={{ ...smallBtn, opacity: i === entries.length - 1 ? 0.4 : 1 }} disabled={i === entries.length - 1} title="Move down" onClick={() => move(i, 1)}>↓</button>
+          <button data-ui-id={`sceneList.row.${i}.up`} data-ui-kind="button" data-ui-label="Move up" style={{ ...smallBtn, opacity: i === 0 ? 0.4 : 1 }} disabled={i === 0} title="Move up" onClick={() => move(i, -1)}>↑</button>
+          <button data-ui-id={`sceneList.row.${i}.down`} data-ui-kind="button" data-ui-label="Move down" style={{ ...smallBtn, opacity: i === entries.length - 1 ? 0.4 : 1 }} disabled={i === entries.length - 1} title="Move down" onClick={() => move(i, 1)}>↓</button>
         </div>
       ))}
     </div>

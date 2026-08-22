@@ -38,6 +38,17 @@ export interface EntityRef {
   guid?: string;
 }
 
+/** The subset of the shared MCP `ErrorCode` union (`docs/mcp-tool-conventions.md` §5) this
+ *  resolver can name precisely. Spelled out locally rather than imported — this file is
+ *  `@modoki/engine`'s own published runtime (`rootDir: "./src"`), and a relative import
+ *  reaching outside `packages/modoki/src` (into `engine/tools/shared`) would break its build.
+ *  The VALUES still have to match the shared set exactly. That is enforced by the dedicated
+ *  subset check in `engine/tests/tools/mcpErrorCodes.test.ts`, NOT by that file's reachability
+ *  guard — which does not scan this package at all, and passes only because the same literals
+ *  happen to appear in `app/debug/entityResolve.ts`. (This comment claimed the reachability
+ *  guard covered it; the close-out review caught that, and the subset check was added.) */
+export type EntityResolveCode = 'NOT_FOUND' | 'AMBIGUOUS';
+
 export type MutateOp =
   /** `space` applies to `trait:'Transform'` ONLY. Omitted (the default) the fields are written
    *  VERBATIM — `x/y/z` etc. ARE the local fields, which is this op's literal contract. Pass
@@ -81,6 +92,10 @@ export interface ApplyResult {
    *  entity ref after a remove, an addEntity under a non-existent parent). The agent
    *  reads these to self-correct; they do NOT block the write. */
   warnings: string[];
+  /** The FIRST entity-resolution failure's machine code, if any op hit one — see
+   *  `EntityResolveCode`. A single-op call is the common case, so the first failure is the
+   *  one that actually blocked the op the caller cares about. */
+  code?: EntityResolveCode;
 }
 
 /** Apply a list of mutation ops to a scene object. Mutates `scene` in place and
@@ -91,6 +106,8 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
   const unresolved: EntityRef[] = [];
   const created: Array<{ op: number; id: number; guid: string; name: string }> = [];
   let changed = 0;
+  // FIRST resolveEntity failure's code, if any op hit one — see `ApplyResult.code`.
+  const codeOut: { code?: EntityResolveCode } = {};
 
   if (!scene || !Array.isArray(scene.entities)) {
     return { scene, changed: 0, errors: ['scene.entities is missing or not an array'], warnings, unresolved };
@@ -101,7 +118,7 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
     const where = `op[${i}] (${op?.op ?? 'unknown'})`;
     try {
       if (op.op === 'setTrait') {
-        const entity = resolveEntity(scene, op.entity, errors, where, unresolved);
+        const entity = resolveEntity(scene, op.entity, errors, where, unresolved, codeOut);
         if (!entity) continue;
         if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
         const fields = op.fields ?? {};
@@ -137,7 +154,7 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
           changed++;
         }
       } else if (op.op === 'removeTrait') {
-        const entity = resolveEntity(scene, op.entity, errors, where, unresolved);
+        const entity = resolveEntity(scene, op.entity, errors, where, unresolved, codeOut);
         if (!entity) continue;
         if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
         if (CORE_TRAITS.has(op.trait)) { errors.push(`${where}: cannot remove core trait '${op.trait}'`); continue; }
@@ -190,7 +207,7 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
           name: (traits.EntityAttributes as { name: string }).name,
         });
       } else if (op.op === 'removeEntity') {
-        const entity = resolveEntity(scene, op.entity, errors, where, unresolved);
+        const entity = resolveEntity(scene, op.entity, errors, where, unresolved, codeOut);
         if (!entity) continue;
         const toRemove = collectSubtree(scene, entity.id);
         // Collect the removed guids BEFORE filtering so we can flag any surviving
@@ -222,7 +239,7 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
     }
   }
 
-  return { scene, changed, errors, warnings, unresolved, ...(created.length ? { created } : {}) };
+  return { scene, changed, errors, warnings, unresolved, ...(created.length ? { created } : {}), ...(codeOut.code ? { code: codeOut.code } : {}) };
 }
 
 /** Scan surviving entities for entity-ref fields that still point at a removed guid.
@@ -244,8 +261,11 @@ function flagDanglingRefs(scene: MutableScene, removedGuids: Set<string>, warnin
   }
 }
 
-/** Resolve an entity ref to an entity, pushing an error if not found/ambiguous. */
-function resolveEntity(scene: MutableScene, ref: EntityRef, errors: string[], where: string, unresolved?: EntityRef[]): MutableEntity | null {
+/** Resolve an entity ref to an entity, pushing an error if not found/ambiguous. `codeOut`,
+ *  when passed, gets the FIRST failure's machine code written into it (see `ApplyResult.code`) —
+ *  an out-param rather than a return value so every existing `if (!entity) continue;` call site
+ *  stays unchanged. */
+function resolveEntity(scene: MutableScene, ref: EntityRef, errors: string[], where: string, unresolved?: EntityRef[], codeOut?: { code?: EntityResolveCode }): MutableEntity | null {
   if (!ref || (ref.id == null && !ref.name && !ref.guid)) {
     errors.push(`${where}: entity ref needs an id, name, or guid`);
     return null;
@@ -261,10 +281,12 @@ function resolveEntity(scene: MutableScene, ref: EntityRef, errors: string[], wh
   if (matches.length === 0) {
     errors.push(`${where}: no entity matching ${JSON.stringify(ref)} in this scene FILE`);
     unresolved?.push(ref);
+    if (codeOut && codeOut.code === undefined) codeOut.code = 'NOT_FOUND';
     return null;
   }
   if (matches.length > 1) {
     errors.push(`${where}: ${matches.length} entities match ${JSON.stringify(ref)} — use 'id' or 'guid' to disambiguate`);
+    if (codeOut && codeOut.code === undefined) codeOut.code = 'AMBIGUOUS';
     return null;
   }
   return matches[0];
@@ -276,10 +298,21 @@ function entityName(e: MutableEntity): string | undefined {
   return attrs && typeof attrs === 'object' ? (attrs as { name?: string }).name : undefined;
 }
 
-function entityGuid(e: MutableEntity): string | undefined {
+/** Which guid identifies a scene-FILE entity entry — the one rule, for every reader.
+ *
+ *  Exported because it is not obvious and gets re-derived wrong: a plain entity's
+ *  identity is `EntityAttributes.guid`, but a PREFAB INSTANCE has no such trait on
+ *  disk and carries its guid at the node top level instead (the trait comes from the
+ *  expanded prefab). The asset-tree-shaker's reverse-reference walk (#284) read only
+ *  the trait and so treated all 25 of `games/court`'s prefab instances as identity-less,
+ *  which made 26 live entity references look dangling. One helper, so the next reader
+ *  cannot half-learn it.
+ *
+ *  Deliberately takes a structural subset rather than `MutableEntity`: callers outside
+ *  the mutate path (the shaker) have their own entry type and no numeric `id`. */
+export function entityGuid(e: { traits?: Record<string, unknown>; guid?: string }): string | undefined {
   const attrs = e.traits?.EntityAttributes;
   const attrGuid = attrs && typeof attrs === 'object' ? (attrs as { guid?: string }).guid : undefined;
-  // Prefab instances carry their guid at the node top level, not in EntityAttributes.
   return attrGuid ?? e.guid;
 }
 

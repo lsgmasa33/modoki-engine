@@ -1,10 +1,11 @@
 /** Load a scene JSON file into an ECS world. Shared between editor and runtime. */
 
 import { type World } from 'koota';
-import { getCurrentWorld, spawnEntity, indexEntityGuid, findEntityByGuid } from '../core/ecs/world';
+import { getCurrentWorld, spawnEntity, indexEntityGuid, findEntityById, findEntityByGuid } from '../core/ecs/world';
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
 import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry, type AssetType } from './assetManifest';
+import { parseEntryPrefabs } from '../traits/UIEntries';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
 import { isPersistentTraitField } from '../core/ecs/traitSchema';
@@ -72,7 +73,12 @@ export interface SceneEntityEntry {
 }
 
 export interface SceneResourceRef {
-  type: 'model' | 'riggedModel' | 'mesh' | 'material' | 'texture' | 'video' | 'prefab' | 'font' | 'environment' | 'particle' | 'animation' | 'animset' | 'spriteanim' | 'rig2d' | 'audio' | 'shader' | 'timeline';
+  /** `font` = an SDF font ASSET (`Text2D.font`/`Text3D.font`), acquired scene-scoped.
+   *  `font-family` = the same kind of asset consumed by the DOM (`UIElement.fontFamily`):
+   *  registered with the browser via the FontFace API instead, for every VARIANT of its
+   *  family. One asset can be both — Court names the same typeface from a canvas label and
+   *  from DOM text — which is why they are two resource types over one asset, not one (#231). */
+  type: 'model' | 'riggedModel' | 'mesh' | 'material' | 'texture' | 'video' | 'prefab' | 'font' | 'font-family' | 'environment' | 'particle' | 'animation' | 'animset' | 'spriteanim' | 'rig2d' | 'audio' | 'shader' | 'timeline';
   path: string;
   postprocessor?: string;
 }
@@ -661,6 +667,21 @@ export function applyStructureCore(
   ops.onComplete?.();
 }
 
+/** Stamp a scene-authored guid onto a freshly expanded prefab-instance root, and index it.
+ *  No-op when the root already carries that guid. */
+function applyRootGuid(world: World, rootEcsId: number, guid: string): void {
+  const attrMeta = getTraitByName('EntityAttributes');
+  if (!attrMeta) return;
+  // O(1) through the entity index every spawn already populates — NOT a scan of world.entities,
+  // which would make a scene with many nested instances O(instances x entities) at load.
+  const e = findEntityById(rootEcsId, world) as EntityHandle | undefined;
+  if (!e || !e.has(attrMeta.trait)) return;
+  const ea = e.get(attrMeta.trait) as Record<string, unknown>;
+  if (ea.guid === guid) return;
+  e.set(attrMeta.trait, { ...ea, guid });
+  indexEntityGuid(e, world);
+}
+
 /** Apply structural overrides (added entities, removed entities, removed traits)
  *  on top of an instantiated prefab, using a localId → ecsId map. Runtime side —
  *  operates on a koota world directly so the loader stays free of editor deps.
@@ -699,10 +720,22 @@ export function applyStructureByLocalToEcs(
       spawnNestedInstance: (node, parentEcsId) => {
         const child = getCachedPrefab(node.prefab!) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null;
         if (!child) { console.warn(`[loadSceneFile] added nested instance not cached: ${node.prefab}`); return; }
-        instantiatePrefabIntoWorld(
+        const rootEcsId = instantiatePrefabIntoWorld(
           world, child, parentEcsId, undefined, node.prefab, node.overrides,
           { added: node.added, removed: node.removed, removedTraits: node.removedTraits }, undefined, node.nestedOverrides,
         );
+        // RESTORE the node's own guid (QA-PREFAB-0004). A nested instance's root is
+        // serialized with its guid right here in the `added[]` entry — the same way a
+        // TOP-LEVEL instance root carries `SceneEntityEntry.guid`, which the loader hands
+        // to `onInstantiatePrefab` as `rootGuid`. This path had no equivalent, so the
+        // expanded root came out guid-less and `deriveInstanceMemberGuids` minted a fresh
+        // derived one: the entity survived the reload with the right parent, traits and
+        // overrides, under a DIFFERENT guid. Every external reference to it (an agent's
+        // captured address, a cross-entity ref) went stale on the next load with no error,
+        // against the engine's own "guid is the stable anchor" contract. Stamped before
+        // `deriveInstanceMemberGuids` runs, so this instance's MEMBERS also derive off the
+        // stable root guid instead of off a fresh one.
+        if (rootEcsId && node.guid) applyRootGuid(world, rootEcsId, node.guid);
       },
     },
     localToEcs,
@@ -1024,6 +1057,7 @@ const SCALAR_RESOURCE_TYPE_BY_FIELD: Record<string, SceneResourceRef['type']> = 
   'Text3D.font': 'font',
   'Text2D.font': 'font',
   'UIElement.imageSrc': 'texture',
+  'UIElement.fontFamily': 'font-family',   // a font asset consumed by the DOM (#231)
   'PrefabInstance.source': 'prefab',
   'Environment.hdrPath': 'environment',
   'ParticleEmitter.effect': 'particle',
@@ -1067,7 +1101,7 @@ const RESOURCE_TYPE_BY_ASSET_TYPE: Partial<Record<AssetType, SceneResourceRef['t
  *  The SCALAR ref fields are data-driven from REF_FIELDS_BY_TRAIT (via
  *  SCALAR_RESOURCE_TYPE_BY_FIELD); the non-scalar / dynamic / payload-bearing refs
  *  (AnimationLibrary.animSets, SkinnedMeshRenderer.materials, Renderable3DPrimitive.material,
- *  ModelSource.glbPath, UIElement.fontFamily, structural entry.prefab) stay explicit.
+ *  ModelSource.glbPath, structural entry.prefab) stay explicit.
  *  Anything held on a GAME-defined trait is caught by the generic sweep at the end. */
 export function collectResourceRefsFromEntities(
   entities: ReadonlyArray<{
@@ -1090,7 +1124,14 @@ export function collectResourceRefsFromEntities(
   const claimed = new Set<string>();
   const add = (type: SceneResourceRef['type'], ref: string) => {
     if (!ref) return;
-    claimed.add(ref);
+    // `font-family` deliberately does NOT claim: it is the DOM consumer of a font asset
+    // (`UIElement.fontFamily`), and the SAME asset may also be referenced as an SDF `font` by
+    // `Text2D.font` or a game trait — two different loads, both needed. Claiming would let
+    // whichever field is visited first suppress the other, which is not the ambiguity `claimed`
+    // exists to resolve (that one is about a single ref whose declared type differs from its
+    // manifest type). Court authors exactly this: one typeface, named from a canvas label and
+    // from DOM text; the claim silently dropped its atlas preload (#231).
+    if (type !== 'font-family') claimed.add(ref);
     const key = `${type}:${ref}`;
     if (seen.has(key)) return;
     seen.add(key);
@@ -1173,6 +1214,19 @@ export function collectResourceRefsFromEntities(
         for (const ref of animSets) if (looksFetchable(ref as string)) add('animset', ref as string);
       }
     }
+    // UIEntries (#250) — a scroll view's entry KINDS: an ARRAY of { name, prefab } where
+    // `prefab` is the GUID. Explicit rather than in REF_FIELDS_BY_TRAIT, which is scalar-only.
+    //
+    // ⚠️ Without this the entry prefab reaches the manifest through NOTHING, and the failure is
+    // invisible in dev — the dev server serves every file off disk, so it only breaks in a
+    // production build (#53, "assets the build cannot see"). Listing the prefab is also what
+    // makes SceneManager's transitive prefab walk acquire what the prefab itself references.
+    const entries = entry.traits['UIEntries'] as Record<string, unknown> | undefined;
+    if (entries && typeof entries !== 'boolean') {
+      for (const k of parseEntryPrefabs(entries.prefabs as string)) {
+        if (looksFetchable(k.prefab)) add('prefab', k.prefab);
+      }
+    }
     // Per-mesh material overrides (Unity-style SkinnedMeshRenderer) resolve to
     // .mat.json materials — acquire each so the materialCache loads them (else
     // resolveMaterial returns undefined and the node keeps its baked GLB material).
@@ -1222,13 +1276,9 @@ export function collectResourceRefsFromEntities(
         add(t === 'texture' ? 'texture' : 'material', material!);
       }
     }
-    // UIElement.fontFamily — a CSS family NAME (not a guid), acquired as a font.
-    // (UIElement.imageSrc is the scalar 'texture' ref handled by the loop above.)
-    const ui = entry.traits['UIElement'] as Record<string, unknown> | undefined;
-    if (ui && typeof ui !== 'boolean') {
-      const fontFamily = ui.fontFamily as string | undefined;
-      if (fontFamily) add('font', fontFamily);
-    }
+    // (UIElement.imageSrc + .fontFamily are both scalar registry refs now, handled by the
+    //  loop above — fontFamily became a font-asset GUID in #231, so it no longer needs the
+    //  by-NAME special case that used to live here.)
     // ModelSource.glbPath — a 'model' ref that also threads a postprocessor payload,
     // so it can't go through the plain scalar add() (which carries no extra field).
     const ms = entry.traits['ModelSource'] as Record<string, unknown> | undefined;
@@ -1305,9 +1355,20 @@ export function collectResourceRefsFromEntities(
     if (rtype) add(rtype, value);
   };
   for (const entry of flat) {
-    for (const bag of Object.values(entry.traits)) {
+    for (const [traitName, bag] of Object.entries(entry.traits)) {
       if (!bag || typeof bag !== 'object') continue;
-      for (const value of Object.values(bag as Record<string, unknown>)) {
+      // A REGISTRY field is already typed by the loop above, by the field it sits in — the
+      // sweep must not re-type it from the asset's manifest type. `claimed` covers most of
+      // that by VALUE, but value-level suppression cannot express one asset legitimately
+      // acquired as two types: `UIElement.fontFamily` (a DOM `font-family`) and a game trait's
+      // SDF `font` ref can name the SAME typeface, which is Court. Claiming made the second
+      // one disappear; not claiming let the sweep re-derive an SDF `font` acquire FROM THE
+      // fontFamily FIELD ITSELF — a real atlas fetch + GPU upload, on every scene load, for a
+      // game whose font is DOM-only. Skipping by FIELD is what actually holds: the registry
+      // owns those fields, the sweep owns the rest (#231).
+      const registryFields = REF_FIELDS_BY_TRAIT[traitName];
+      for (const [field, value] of Object.entries(bag as Record<string, unknown>)) {
+        if (registryFields?.includes(field)) continue;
         // One level of array unwrap, to also catch an AnimationLibrary-shaped guid
         // array on a game trait (a level list, an enemy-prefab table).
         if (Array.isArray(value)) value.forEach(sweep);

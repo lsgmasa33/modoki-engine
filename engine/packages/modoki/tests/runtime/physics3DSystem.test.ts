@@ -88,6 +88,59 @@ describe('physics3DSystem — falling, resting, determinism', () => {
   });
 });
 
+describe('physics3DSystem — substepping is render-rate independent (#205 R2)', () => {
+  /** A bouncy sphere launched with lateral velocity between two facing walls, dropped onto a
+   *  static floor, run to a fixed total elapsed time via `ticks` frames of `dt` each. High
+   *  restitution off floor + two walls gives many bounces in 4s, and each bounce's exact contact
+   *  timing depends on solver step size — the error compounds bounce over bounce. (A plain
+   *  straight-down drop onto a flat floor was tried first and converges to the SAME resting spot
+   *  regardless of step size — vacuous; this scenario's divergence was measured, see the report.) */
+  function bounceScene(t: TestWorld) {
+    t.spawn(Physics3D({ gravityX: 0, gravityY: -20, gravityZ: 0 }));
+    t.spawn(
+      Transform({ x: 0, y: 0, z: 0 }),
+      RigidBody3D({ bodyType: 'static' }),
+      Collider3D({ shape: 'box', halfW: 100, halfH: 1, halfD: 100 }),
+    );
+    t.spawn(
+      Transform({ x: 5, y: 3, z: 0 }),
+      RigidBody3D({ bodyType: 'static' }),
+      Collider3D({ shape: 'box', halfW: 0.5, halfH: 3, halfD: 100 }),
+    );
+    t.spawn(
+      Transform({ x: -5, y: 3, z: 0 }),
+      RigidBody3D({ bodyType: 'static' }),
+      Collider3D({ shape: 'box', halfW: 0.5, halfH: 3, halfD: 100 }),
+    );
+    return t.spawn(
+      Transform({ x: 0, y: 8, z: 0 }),
+      RigidBody3D({ bodyType: 'dynamic', vx: 12, vz: 5 }),
+      Collider3D({ shape: 'sphere', radius: 0.5, restitution: 0.85, friction: 0.1 }),
+    );
+  }
+
+  function runBounce(ticks: number, dt: number): { x: number; y: number; z: number } {
+    const t = createTestWorld({ systems: [PHYS] });
+    const ball = bounceScene(t);
+    t.step(ticks, dt);
+    const tf = t.trait<{ x: number; y: number; z: number }>(Transform, ball);
+    disposePhysics3D(t.world); t.dispose();
+    return tf;
+  }
+
+  it('the same total elapsed time settles to the same place whether it arrives as 1/60 or 1/30 ticks', () => {
+    // World A: 240 ticks of 1/60 = 4s. World B: 120 ticks of 1/30 = the SAME 4s.
+    const a = runBounce(240, 1 / 60);
+    const b = runBounce(120, 1 / 30);
+    // Measured pre-fix (single un-substepped step at dt=1/30): diff ≈ {x: 1.06, y: 0.016, z:
+    // 0.44} — the ball ends up over a UNIT away in x/z after ~10 bounces off the walls/floor.
+    // Post-fix, x/z agree to within a few mm. See physicsSubstep.ts's docblock for why.
+    expect(b.x).toBeCloseTo(a.x, 1);
+    expect(b.y).toBeCloseTo(a.y, 1);
+    expect(b.z).toBeCloseTo(a.z, 1);
+  });
+});
+
 describe('physics3DSystem — raycast', () => {
   it('a downward ray hits the top of a static box and reports distance + normal', () => {
     tw = createTestWorld({ systems: [PHYS] });

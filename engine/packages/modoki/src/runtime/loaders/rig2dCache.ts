@@ -20,6 +20,26 @@ export {
 } from '../skinning/rig2dTypes';
 
 const cache = new Map<string, ParsedRig2D>();
+/** The AUTHORED doc each cached rig was parsed from, kept beside the parsed form.
+ *
+ *  `ParsedRig2D` is a runtime structure — packed `Float32Array`s, weights renormalized, v1
+ *  promoted to v2 parts — so it is the wrong answer to "what does this asset say?". The agent
+ *  read op (`read-asset-def`) reported it anyway, and every other asset kind's cache hands back
+ *  the authored def, so rig2d was the one type whose answer did not match its file: weights came
+ *  back at float32 precision and a QA run read that as the editor CORRUPTING the rig on load
+ *  (QA-ASSET-0015 — the real disk churn was `removeBone`, elsewhere). Keeping the source makes the
+ *  two questions separately answerable.
+ *
+ *  THE COST, stated rather than discovered: this retains the parsed JSON for every loaded rig, on
+ *  the same lifetime as the parsed form (both are dropped together by `invalidateRig2D` /
+ *  `clearRig2DCache`), in a shipped game as well as the editor. Bounded by the rig files
+ *  themselves — 11 KB for `bar.rig2d.json`, 208 KB for `zombie.rig2d.json`, and a scene's rigs are
+ *  released at the swap. Accepted over gating it on `__MODOKI_EDITOR__`: no `runtime/**` module
+ *  references that global, and it resolves TRUE under vitest AND a plain `npm run dev`, so the
+ *  gate would be wrong exactly where a developer runs their own game (the reasoning
+ *  `tierCalibration.setTierFrameCapEnabled` records for the same trap). If rig memory ever
+ *  matters, the sanctioned shape is an injected flag, not the build-time global. */
+const sourceCache = new Map<string, Rig2DFile>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
 let generation = 0;
@@ -57,6 +77,7 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
         if (cache.has(path)) return;          // editor live-preview seeded it
         const id = (json as Rig2DFile)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'rig2d');
+        sourceCache.set(path, json as Rig2DFile);
         cache.set(path, normalizeRig2D(json as Rig2DFile));
       })
       .catch((e) => {
@@ -69,11 +90,22 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
   return null;
 }
 
+/** The AUTHORED rig doc behind a cached rig — the file's own JSON (or the editor's live,
+ *  unsaved def), NOT the runtime-parsed form {@link getRig2D} returns. PEEKs only: a rig
+ *  nothing has loaded is `null`, never a fetch. For callers reporting what the asset SAYS
+ *  (the `read-asset-def` agent op) rather than what the deform driver consumes. */
+export function getRig2DSource(refOrPath: string): Rig2DFile | null {
+  const path = rig2dCacheKey(refOrPath);
+  if (!path) return null;
+  return sourceCache.get(path) ?? null;
+}
+
 /** Directly seed/override a cached rig by path or GUID (editor live-preview +
  *  post-save + tests). */
 export function setRig2D(refOrPath: string, def: Rig2DFile): void {
   const path = rig2dCacheKey(refOrPath);
   if (!path) return;
+  sourceCache.set(path, def);
   cache.set(path, normalizeRig2D(def));
   failed.delete(path);
 }
@@ -83,6 +115,7 @@ export function invalidateRig2D(refOrPath: string): void {
   const path = rig2dCacheKey(refOrPath);
   if (!path) return;
   cache.delete(path);
+  sourceCache.delete(path);
   failed.delete(path);
   loading.delete(path);
 }
@@ -91,6 +124,7 @@ export function invalidateRig2D(refOrPath: string): void {
 export function clearRig2DCache(): void {
   generation++;
   cache.clear();
+  sourceCache.clear();
   loading.clear();
   failed.clear();
 }

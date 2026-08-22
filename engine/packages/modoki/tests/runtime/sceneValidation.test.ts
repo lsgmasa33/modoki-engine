@@ -2,7 +2,7 @@
  *  the GUID asset-reference rule. Pure module, no world needed. */
 
 import { describe, it, expect } from 'vitest';
-import { validateSceneData, type SceneSchema, type PrefabResolver } from '../../src/runtime/loaders/sceneValidation';
+import { validateSceneData, type SceneSchema, type PrefabResolver, type AssetRefResolver, type AssetRefVerdict, makeAssetRefResolver } from '../../src/runtime/loaders/sceneValidation';
 
 const GUID = 'a1b2c3d4-1111-2222-3333-444455556666';
 
@@ -285,6 +285,55 @@ describe('validateSceneData — schema checks', () => {
   });
 });
 
+/** The ONE implementation of the three-state rule, shared by the dev-server routes and the
+ *  scene hot-reload handler. It exists because the rule was hand-written twice and the copies
+ *  had already diverged on letter case inside the very commit that added them — the
+ *  hot-reload copy lived in a private, untestable function, so only the wrong one was pinned.
+ *  Tested here directly so the shared rule cannot drift again unnoticed. */
+describe('makeAssetRefResolver', () => {
+  const A = 'a1b2c3d4-1111-2222-3333-444455556666';
+  const B = 'b1b2c3d4-1111-2222-3333-444455556666';
+
+  it('answers ok for an exact-case guid', () => {
+    expect(makeAssetRefResolver([A, B])!(A)).toBe('ok');
+  });
+
+  /** Case-SENSITIVE on purpose: `resolveRef` is `guidToEntry.get(ref)` over guids stored
+   *  verbatim, so folding case would vouch for a ref that fails to load. */
+  it('answers case-mismatch for a folded-case-only hit, never ok', () => {
+    expect(makeAssetRefResolver([A])!(A.toUpperCase())).toBe('case-mismatch');
+  });
+
+  it('answers missing for a guid absent at any casing', () => {
+    expect(makeAssetRefResolver([A])!(B)).toBe('missing');
+  });
+
+  /** The load-bearing guard: no guids means "could not check", so the caller must get
+   *  NO resolver — not one that calls every ref in a healthy scene dead. */
+  it('returns undefined when there is nothing to check against', () => {
+    expect(makeAssetRefResolver([])).toBeUndefined();
+    expect(makeAssetRefResolver([null, undefined, '', 7])).toBeUndefined();
+  });
+
+  /** A malformed manifest entry must not turn a validation that always answered into a
+   *  failed call — skip the bad ones, keep indexing the good ones. */
+  it('skips non-string / empty guids without throwing, and still indexes the rest', () => {
+    const r = makeAssetRefResolver([null, A, 7, '', undefined, B]);
+    expect(r).toBeDefined();
+    expect(r!(A)).toBe('ok');
+    expect(r!(B)).toBe('ok');
+    expect(r!('c1b2c3d4-1111-2222-3333-444455556666')).toBe('missing');
+  });
+
+  it('is usable directly as the validator\'s resolver', () => {
+    const res = validateSceneData(
+      scene([{ id: 1, name: 'X', traits: { Renderable3D: { mesh: B } } }]),
+      undefined, undefined, makeAssetRefResolver([A]),
+    );
+    expect(res.warnings.join('\n')).toMatch(/no asset in the manifest has it/);
+  });
+});
+
 describe('validateSceneData — asset reference rule', () => {
   it('accepts a GUID ref', () => {
     const res = validateSceneData(scene([{ id: 1, name: 'X', traits: { Renderable3D: { mesh: GUID } } }]), schema);
@@ -315,6 +364,196 @@ describe('validateSceneData — asset reference rule', () => {
   it('ignores empty-string refs', () => {
     const res = validateSceneData(scene([{ id: 1, name: 'X', traits: { Renderable3D: { mesh: '' } } }]), schema);
     expect(res.warnings).toEqual([]);
+  });
+
+  /** #292 — GUID SHAPE was the whole check, so a ref to an asset DELETED from the
+   *  manifest validated clean and failed later, at load/render time. The resolver is
+   *  injected because this module does no I/O; these cases pin all three of its states. */
+  describe('manifest-resolution rule (#292)', () => {
+    const DEAD = 'deadbeef-0000-1111-2222-333344445555';
+    /** Mirrors the real resolvers: `ok` is a case-SENSITIVE hit, because that is what
+     *  `resolveRef` does; a folded-case hit is reported as its own verdict. */
+    const knows = (...guids: string[]): AssetRefResolver => {
+      const exact = new Set(guids);
+      const folded = new Set(guids.map((g) => g.toLowerCase()));
+      return (ref): AssetRefVerdict => (
+        exact.has(ref) ? 'ok' : folded.has(ref.toLowerCase()) ? 'case-mismatch' : 'missing'
+      );
+    };
+
+    it('flags a well-formed GUID that no manifest asset has', () => {
+      const res = validateSceneData(
+        scene([{ id: 1, name: 'X', traits: { Renderable3D: { mesh: DEAD } } }]),
+        schema, undefined, knows(GUID),
+      );
+      expect(res.warnings.join('\n')).toMatch(/well-formed GUID but no asset in the manifest has it/);
+      expect(res.warnings.join('\n')).toContain(DEAD);
+      // It must say WHICH field, or the caller cannot act on it.
+      expect(res.warnings.join('\n')).toMatch(/Renderable3D\.mesh/);
+    });
+
+    it('accepts a GUID the resolver knows', () => {
+      const res = validateSceneData(
+        scene([{ id: 1, name: 'X', traits: { Renderable3D: { mesh: GUID } } }]),
+        schema, undefined, knows(GUID),
+      );
+      expect(res.warnings).toEqual([]);
+    });
+
+    /** This case used to assert the OPPOSITE — "case-insensitive, like every other guid
+     *  comparison" — and that expectation was wrong, which is why it is called out rather
+     *  than quietly rewritten. `resolveRef` is `guidToEntry.get(ref)`, a case-SENSITIVE
+     *  Map lookup over guids stored verbatim, while `isGuid`'s regex carries `/i`. So an
+     *  uppercase-authored ref is well-formed, is NOT found at load, and a validator that
+     *  passed it would vouch for a ref that silently fails — the exact false negative this
+     *  whole check exists to remove. It gets its own message because "deleted or never
+     *  imported" would send the author hunting a file they are looking at. */
+    it('flags a guid that matches only when case is folded, with its OWN message', () => {
+      const res = validateSceneData(
+        scene([{ id: 1, name: 'X', traits: { Renderable3D: { mesh: GUID.toUpperCase() } } }]),
+        schema, undefined, knows(GUID),
+      );
+      expect(res.warnings.join('\n')).toMatch(/matches a manifest asset only when letter case is ignored/);
+      expect(res.warnings.join('\n')).toMatch(/case-SENSITIVE/);
+      // Must NOT claim the asset is gone — that is a different fix.
+      expect(res.warnings.join('\n')).not.toMatch(/deleted or never imported/);
+    });
+
+    it('accepts an exact-case guid', () => {
+      const res = validateSceneData(
+        scene([{ id: 1, name: 'X', traits: { Renderable3D: { mesh: GUID } } }]),
+        schema, undefined, knows(GUID),
+      );
+      expect(res.warnings).toEqual([]);
+    });
+
+    /** The load-bearing one: absent resolver ⇒ the pre-#292 shape-only pass, NOT
+     *  "everything is dangling". A caller that cannot answer must omit it, and this
+     *  is what makes that safe. */
+    it('checks nothing when no resolver is injected', () => {
+      const res = validateSceneData(scene([{ id: 1, name: 'X', traits: { Renderable3D: { mesh: DEAD } } }]), schema);
+      expect(res.warnings).toEqual([]);
+    });
+
+    it('does not consult the resolver for external URLs or primitive sprite keywords', () => {
+      const asked: string[] = [];
+      const spy: AssetRefResolver = (ref) => { asked.push(ref); return 'missing'; };
+      const s2: SceneSchema = { traits: {
+        UIElement: { category: 'component', fields: { imageSrc: { type: 'string' } } },
+        Renderable2D: { category: 'component', fields: { sprite: { type: 'string' } } },
+      } };
+      const res = validateSceneData(scene([
+        { id: 1, name: 'A', traits: { UIElement: { imageSrc: 'https://x/y.png' } } },
+        { id: 2, name: 'B', traits: { Renderable2D: { sprite: 'circle' } } },
+      ]), s2, undefined, spy);
+      expect(asked).toEqual([]);
+      expect(res.warnings).toEqual([]);
+    });
+
+    /** A malformed ref is still the OLD message, not the new one — the two failures
+     *  have different fixes ("write a GUID" vs "the asset is gone") and collapsing
+     *  them would send the caller after the wrong thing. */
+    it('reports a non-GUID ref with the shape message, not the resolution one', () => {
+      const res = validateSceneData(
+        scene([{ id: 1, name: 'X', traits: { Environment: { hdrPath: 'sky' } } }]),
+        schema, undefined, knows(GUID),
+      );
+      expect(res.warnings.join('\n')).toMatch(/is not a GUID or URL/);
+      expect(res.warnings.join('\n')).not.toMatch(/no asset in the manifest/);
+    });
+
+    /** #292 — the ref rule used to walk `entity.traits` ONLY, so the 56 ref fields
+     *  authored inside prefab-instance `overrides` blocks across `games/` + `demos/`
+     *  (27 `Renderable3D.mesh` + 27 `.material` in space-console alone) were checked by
+     *  NOTHING: not for resolution, not even for GUID shape. `refFieldWarnings` is now
+     *  one predicate serving both, so the exemptions cannot drift apart. */
+    describe('prefab-instance overrides', () => {
+      const instance = (overrides: unknown) => ({
+        version: 8,
+        entities: [{
+          id: 1, name: 'Inst',
+          traits: { PrefabInstance: { source: GUID, localId: 1, rootInstanceId: 1 } },
+          overrides,
+        }],
+      });
+
+      it('flags a dangling ref inside an override group, labelled by localId', () => {
+        const res = validateSceneData(
+          instance({ 3: { Renderable3D: { mesh: DEAD } } }), undefined, undefined, knows(GUID),
+        );
+        expect(res.warnings.join('\n')).toMatch(/overrides\[3\]\.Renderable3D\.mesh/);
+        expect(res.warnings.join('\n')).toMatch(/no asset in the manifest has it/);
+      });
+
+      it('flags a literal asset path inside an override group (shape, no resolver needed)', () => {
+        const res = validateSceneData(instance({ 3: { Renderable3D: { material: '/a/b.mat.json' } } }));
+        expect(res.warnings.join('\n')).toMatch(/overrides\[3\]\.Renderable3D\.material: internal asset path/);
+      });
+
+      it('stays silent for a live ref in an override group', () => {
+        const res = validateSceneData(
+          instance({ 3: { Renderable3D: { mesh: GUID } } }), undefined, undefined, knows(GUID),
+        );
+        expect(res.warnings).toEqual([]);
+      });
+
+      /** The ref check must NOT be hostage to the UIElement early-continue that the
+       *  inert-size check uses — most override groups touch no UIElement at all, which
+       *  is exactly the shape a naive placement would skip. */
+      it('checks a group that touches no UIElement', () => {
+        const res = validateSceneData(
+          instance({ 3: { ParticleEmitter: { effect: DEAD } } }), undefined, undefined, knows(GUID),
+        );
+        expect(res.warnings.join('\n')).toMatch(/overrides\[3\]\.ParticleEmitter\.effect/);
+      });
+
+      it('tolerates a malformed overrides bag without throwing', () => {
+        for (const bad of [null, 7, 'x', [], { 3: null }, { 3: 7 }, { 3: { Renderable3D: 5 } }]) {
+          expect(() => validateSceneData(instance(bad), undefined, undefined, knows(GUID))).not.toThrow();
+        }
+      });
+    });
+
+    it('reports an internal asset path with the path message, not the resolution one', () => {
+      const res = validateSceneData(
+        scene([{ id: 1, name: 'X', traits: { Renderable3D: { material: '/a/b.mat.json' } } }]),
+        schema, undefined, knows(GUID),
+      );
+      expect(res.warnings.join('\n')).toMatch(/internal asset path/);
+      expect(res.warnings.join('\n')).not.toMatch(/no asset in the manifest/);
+    });
+  });
+
+  /** #231 — `UIElement.fontFamily` is a ref field now, which is the point of the whole
+   *  change: the validator, `diagnose` and the build tree-shaker all read the SAME registry,
+   *  so joining it is what makes a UI font ref checkable at all. A pre-#231 family name is
+   *  reported as the non-GUID it is (the runtime still renders it — warn-but-load), and a
+   *  literal font PATH is reported as the literal path it is, which the field-specific
+   *  exclusion used to prevent. */
+  describe('UIElement.fontFamily', () => {
+    const uiSchema: SceneSchema = {
+      traits: { UIElement: { category: 'component', fields: { fontFamily: { type: 'string' }, systemFont: { type: 'string' } } } },
+    };
+
+    it('accepts a font-asset GUID', () => {
+      const res = validateSceneData(scene([{ id: 1, name: 'X', traits: { UIElement: { fontFamily: GUID } } }]), uiSchema);
+      expect(res.warnings).toEqual([]);
+    });
+
+    it('flags a legacy CSS family NAME', () => {
+      const res = validateSceneData(scene([{ id: 1, name: 'X', traits: { UIElement: { fontFamily: 'Varela Round' } } }]), uiSchema);
+      expect(res.warnings.join('\n')).toMatch(/'Varela Round' is not a GUID or URL/);
+    });
+
+    it('flags a literal font path', () => {
+      const res = validateSceneData(scene([{ id: 1, name: 'X', traits: { UIElement: { fontFamily: '/games/x/assets/fonts/Inter.ttf' } } }]), uiSchema);
+      expect(res.warnings.join('\n')).toMatch(/internal asset path .* references must be a GUID/);
+    });
+
+    it('does not flag systemFont — a CSS family name there is the point of the field', () => {
+      const res = validateSceneData(scene([{ id: 1, name: 'X', traits: { UIElement: { systemFont: 'system-ui' } } }]), uiSchema);
+      expect(res.warnings).toEqual([]);
+    });
   });
 
   // Renderable2D.material is a NEW ref field (REF_FIELDS_BY_TRAIT.Renderable2D = ['sprite','material']).

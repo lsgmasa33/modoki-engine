@@ -20,7 +20,7 @@ export { buildUiCreateSpecs, type UiPreset } from '../runtime/ui/uiAuthoring';
 export { enterPlay, stopPlay, pausePlay, resetPlayMode } from './scene/playMode';
 export {
   editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,
-  withEditorActor, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS,
+  withEditorActor, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS, ACTOR_LEASE_GRACE_MS,
   waitForEditorJournal, type EditorEvent, type WaitForEditResult,
 } from './editorJournal';
 export {
@@ -30,7 +30,7 @@ export {
   useBufferedValue, BufferedTextInput, BufferedNumberInput, parseNumber, parseString,
   applyWheelStep, useWheelStep,
 } from './panels/fields';
-export { useDebouncedSave } from './panels/useDebouncedSave';
+export { useParkedAssetDoc, saveStatusLabel } from './panels/useParkedAssetDoc';
 // Device listing — shared by the AI panel's connect picker and the app shell's Build-menu target
 // picker (#170), which is why it leaves the package rather than staying panel-private.
 export {
@@ -46,20 +46,45 @@ export {
   writePrefabFile, resolveExistingPrefabId,
   tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
+  captureInstanceStructure, resolveInstanceContext,
   type PrefabFile, type RevertResult,
 } from './scene/prefab';
+// Shared override-key enumeration for the Apply-to-Prefab / Revert-Overrides surfaces —
+// the dialog (ApplyPrefabDialog.tsx) and the `modoki_prefab {prefabAction:'overrides'}`
+// agent op both build their checkbox/discovery list from this ONE walk, so they cannot
+// silently drift from each other (see prefabOverrideKeys.ts's header comment).
+export {
+  fieldKey, addedKey, removedEntityKey, removedTraitKey,
+  collectInstanceOverrideFields, collectInstanceOverrideKeys,
+  type FieldNode, type TraitNode, type EntityOverrideNode, type InstanceOverrideKeys,
+} from './scene/prefabOverrideKeys';
+// `applyToPrefabWithUndo` is the ONLY way to apply overrides that also records undo —
+// `applyToPrefabSelective` above is the raw mutation the dialog/agent-op undo wrapper
+// calls into, kept exported too for callers that manage their own undo entry.
+export { applyToPrefabWithUndo } from './undo/applyPrefabUndo';
 export {
   saveScene, saveAll, serializeScene, loadScene, newScene,
   getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,
 } from './scene/serialize';
 export {
   markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets,
-  discardDirtyAssets, flushDirtyAssets, type FlushResult,
+  discardDirtyAssets, assetWrittenToDisk, flushDirtyAssets, type FlushResult,
+  subscribeDirtyAssets, getDirtyAssetsVersion, isAssetDirty, getLastFlushedAsset,
+  type AssetWriteOrigin,
 } from './scene/dirtyAssets';
 export { importModel } from './scene/modelImport';
 export { useEditorStore } from './store/editorStore';
 export type { SelectedAsset } from './store/editorStore';
 export { upsertKey, findTrack, encodeValue, relativeEntityPath } from './animation/recording';
+// The pose path, extracted out of AnimationEditor.tsx so the `pose-clip` agent op drives the SAME
+// code the human scrub gesture does — and so it works with no Animation panel mounted (#288 gap 2).
+export { applyPoseAtTime, poseClipAtTime, exitPoseEnvelope, onPoseEnvelopeExited } from './animation/poseClip';
+// The Assets-panel double-click path's clip-binding resolver, so the `open-animation-editor` agent
+// op opens a clip the SAME way rather than re-deriving which entity a clip belongs to (#288).
+export { resolveAnimatorRootForClip } from './panels/openAssetInEditor';
+// The create path the Assets panel's "New X" flow and the `create-registered-asset` agent op BOTH
+// run, so a kind that works for the human cannot silently differ for a tool (#288 gap 5).
+export { createRegisteredAsset, ensureExt } from './panels/createRegisteredAsset';
 export {
   registerCreatableAsset, unregisterCreatableAsset, getCreatableAssets, type CreatableAssetDef,
 } from './panels/creatableAssets';
@@ -76,9 +101,17 @@ export { makePrefabInstantiateAction } from './undo/prefabInstantiateUndo';
 
 // C7: agent ops must refuse to DESTROY unsaved live work (load_scene/new_scene swap the world).
 export { hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, type SaveResult } from './scene/serialize';
+// The ONE Save All command + its message, shared by the Cmd+S keymap and the native File menu.
+export { runSaveAll, toastForSave, sceneNeedsWriting, type SaveOutcome } from './scene/saveCommand';
 
 // C7: the agent save-all path must honour prefab-edit mode like the human paths do —
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.
 // #125: prefab-edit is also the only round-trip that re-serializes a .prefab.json, so the
 // bulk re-save sweep (engine/scripts/resave-prefabs.sh) drives these three as agent ops.
 export { isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing } from './scene/prefabEdit';
+
+// QA-PHYS-0003: `/api/input/key` needs to know whether a key it is about to press will reach
+// ANYTHING — the editor keymap, or the running game past the input gate. Both answers live
+// inside this package (the keymap registry, the installed gate), so the probe does too and
+// the route asks for one measured verdict rather than re-deriving the policy in main.
+export { probeKeyReach, chordFromElectronKey, DOM_KEY_ALIAS, type KeyReach } from './input/keyReach';

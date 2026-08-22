@@ -22,6 +22,18 @@ export const Text2D = trait({
    *  CLAMPED TO 0. For lighter text import a lighter weight. See MtsdfStyle.weight. */
   weight: 0 as number,
   outlineColor: 0x000000 as number,
+  /** Outline thickness in **normalised SDF units — NOT screen pixels, and not a stroke width.**
+   *  It is scaled by `OUTLINE_MAX_SPREAD` and resolved to screen px *through the glyph's own
+   *  rendered size*, so **the same number is a thick halo on a large glyph and nothing on a small
+   *  one.** Measured in Court: `0.3` gives the memo pens a real halo at CELL size, and gives the
+   *  tray counter — about a third of that size — roughly ONE DEVICE PIXEL, a third of a CSS px at
+   *  DPR 3.
+   *
+   *  ⚠️ **So an outline cannot be the thing that makes text legible.** Transferring an
+   *  ink-over-halo pair from one size to another transfers the colours and silently loses the
+   *  width. If text must survive an unknown background, give it its own ground (a disc, a scrim,
+   *  a plate) and treat the outline as refinement. See `games/court/art.md` § "Rules that
+   *  generalise", where this cost a redesign. */
   outlineWidth: 0 as number,
   outlineOpacity: 1 as number,
   /** Glow colour. WHITE, not black: with `glowStrength` also defaulting to 0 the glow

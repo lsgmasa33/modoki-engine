@@ -52,15 +52,15 @@ describe('resolveDeviceHostPort — per-clone derivation (#158)', () => {
 });
 
 describe('parseForwardList / forwardOwner', () => {
-  const LIST = 'RFCTB0EV83K tcp:9095 tcp:9095\n'
-    + 'RFCTA14CMRF tcp:9097 tcp:9095\n'
-    + 'RFCTA14CMRF tcp:9333 localabstract:webview_devtools_remote_12345\n';
+  const LIST = 'RFDEADBEEF1 tcp:9095 tcp:9095\n'
+    + 'RFDEADBEEF2 tcp:9097 tcp:9095\n'
+    + 'RFDEADBEEF2 tcp:9333 localabstract:webview_devtools_remote_12345\n';
 
   it('parses each rule as serial + local + remote', () => {
     expect(parseForwardList(LIST)).toEqual([
-      { serial: 'RFCTB0EV83K', local: 'tcp:9095', remote: 'tcp:9095' },
-      { serial: 'RFCTA14CMRF', local: 'tcp:9097', remote: 'tcp:9095' },
-      { serial: 'RFCTA14CMRF', local: 'tcp:9333', remote: 'localabstract:webview_devtools_remote_12345' },
+      { serial: 'RFDEADBEEF1', local: 'tcp:9095', remote: 'tcp:9095' },
+      { serial: 'RFDEADBEEF2', local: 'tcp:9097', remote: 'tcp:9095' },
+      { serial: 'RFDEADBEEF2', local: 'tcp:9333', remote: 'localabstract:webview_devtools_remote_12345' },
     ]);
   });
 
@@ -77,12 +77,12 @@ describe('parseForwardList / forwardOwner', () => {
     // banner wording staying convenient.
     const hostile = '* daemon tcp:9095 restarting\n' + LIST;
     expect(parseForwardList(hostile)).toHaveLength(3);
-    expect(forwardOwner(hostile, 9095)).toBe('RFCTB0EV83K'); // the real rule, not the banner
+    expect(forwardOwner(hostile, 9095)).toBe('RFDEADBEEF1'); // the real rule, not the banner
   });
 
   it('answers who owns a host port, and undefined when nobody does', () => {
-    expect(forwardOwner(LIST, 9095)).toBe('RFCTB0EV83K');
-    expect(forwardOwner(LIST, 9097)).toBe('RFCTA14CMRF');
+    expect(forwardOwner(LIST, 9095)).toBe('RFDEADBEEF1');
+    expect(forwardOwner(LIST, 9097)).toBe('RFDEADBEEF2');
     expect(forwardOwner(LIST, 9096)).toBeUndefined();
     expect(forwardOwner('', 9095)).toBeUndefined();
   });
@@ -90,7 +90,7 @@ describe('parseForwardList / forwardOwner', () => {
   it('matches the LOCAL side only — the remote port must never decide ownership', () => {
     // Every rule here forwards to tcp:9095 on the device. Asking "who owns host 9095" must answer
     // the one clone listening there, not all three.
-    expect(forwardOwner(LIST, 9095)).toBe('RFCTB0EV83K');
+    expect(forwardOwner(LIST, 9095)).toBe('RFDEADBEEF1');
   });
 });
 
@@ -99,14 +99,14 @@ describe('adbRunner.removeForward — refuses to delete another device\'s rule (
   afterEach(() => { adbRunner.listForwards = realList; vi.restoreAllMocks(); });
 
   it('skips (and says why) when the rule on that port belongs to a different serial', () => {
-    // The measured incident: `adb -s RFCTB0EV83K forward --remove tcp:9095` deleted the rule owned
-    // by RFCTA14CMRF, leaving that clone's live lease with no tunnel and no error.
-    adbRunner.listForwards = () => 'RFCTA14CMRF tcp:9095 tcp:9095\n';
+    // The measured incident: `adb -s RFDEADBEEF1 forward --remove tcp:9095` deleted the rule owned
+    // by RFDEADBEEF2, leaving that clone's live lease with no tunnel and no error.
+    adbRunner.listForwards = () => 'RFDEADBEEF2 tcp:9095 tcp:9095\n';
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     // No throw is the assertion that matters: the early return happens BEFORE the `adb` shell-out,
     // which on a machine without the Android SDK would throw from `adbBinary()`.
-    expect(() => adbRunner.removeForward(9095, 'RFCTB0EV83K')).not.toThrow();
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('RFCTA14CMRF'));
+    expect(() => adbRunner.removeForward(9095, 'RFDEADBEEF1')).not.toThrow();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('RFDEADBEEF2'));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('skipping'));
   });
 
@@ -122,7 +122,7 @@ describe('adbRunner.removeForward — refuses to delete another device\'s rule (
     // live lease from another clone.
     adbRunner.listForwards = () => { throw new Error('adb: device offline'); };
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    expect(() => adbRunner.removeForward(9095, 'RFCTB0EV83K')).not.toThrow();
+    expect(() => adbRunner.removeForward(9095, 'RFDEADBEEF1')).not.toThrow();
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('could not verify'));
   });
 

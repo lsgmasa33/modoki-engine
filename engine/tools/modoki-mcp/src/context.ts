@@ -12,7 +12,7 @@
  *
  *  Keep this module free of side effects. */
 
-import { createFormatter, isFailureBody, type ToolResult, type ToolErrorDetail, type ErrorCode } from './result.js';
+import { createFormatter, isFailureBody, ERROR_CODES, type ToolResult, type ToolErrorDetail, type ErrorCode } from './result.js';
 import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendIdentity } from '../../shared/identity.js';
 
 export type ToolContext = {
@@ -119,9 +119,30 @@ export function createToolContext(config: { backend: string; token?: string }): 
           expected: 'a running editor whose backend port matches MODOKI_BACKEND',
           options: [
             'start the editor: engine/scripts/launch-editor.sh games/<id>',
-            'this clone\'s backend port is 5181 (main=5179, work-ai=5180) — check MODOKI_BACKEND points at YOUR editor',
+            // This used to assert "this clone's backend port is 5181" — hardcoded from whichever
+            // clone the message was written on, and therefore WRONG on every other one. It sent a
+            // reader on modoki-qa (5183) to work-ai2's editor. A hint that confidently names the
+            // wrong port is worse than no hint, so state the convention and point at the one
+            // source that cannot be stale: the launch banner.
+            'per-clone backend ports: main=5179, work-ai=5180, work-ai2=5181, work-ai3=5182, work-qa=5183 — set MODOKI_BACKEND (or env.MODOKI_BACKEND in .claude/settings.local.json) to YOUR clone\'s port',
+            'the launch banner prints the port it actually bound — trust it over any table',
           ],
         });
+  }
+
+  /** A specific code the BACKEND supplied beats one derived from the HTTP status. Three of the
+   *  closed set (`AMBIGUOUS`/`AMBIGUOUS_SURFACE`/`OCCLUDED`) are refusals a route can name
+   *  precisely — measured live: `modoki_set_transform {entity:{name:'DUP_probe'}}` against two
+   *  same-named entities came back as the generic `REFUSED_BY_OP`, indistinguishable from any
+   *  other refusal without string-matching prose. `fallback` is whatever this call site would
+   *  have used anyway, so an ordinary body with no `code` (or a junk value that isn't in the
+   *  closed set) is unaffected. */
+  function codeFromBody(body: unknown, fallback: ErrorCode): ErrorCode {
+    if (body && typeof body === 'object') {
+      const c = (body as { code?: unknown }).code;
+      if (typeof c === 'string' && (ERROR_CODES as readonly string[]).includes(c)) return c as ErrorCode;
+    }
+    return fallback;
   }
 
   /** A backend HTTP failure, as a §5 envelope. One builder so every route reports a 4xx/5xx the
@@ -161,9 +182,10 @@ export function createToolContext(config: { backend: string; token?: string }): 
     // discriminator than a structured flag would be, so both hosts should grow one — but this is
     // the seam that must not be WRONG in the meantime, and both strings are ours.
     const routeMissing = status === 404 && (!detail || /no backend route for|no such API route/i.test(detail));
-    const code: ErrorCode = status === 404
+    const statusCode: ErrorCode = status === 404
       ? (routeMissing ? 'NOT_AVAILABLE_HERE' : 'NOT_FOUND')
       : status >= 500 ? 'NOT_AVAILABLE_HERE' : 'REFUSED_BY_OP';
+    const code = codeFromBody(body, statusCode);
     return fail({
       code,
       what,
@@ -256,7 +278,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
         const failure = isFailureBody(body);
         if (failure) {
           return fail({
-            code: 'REFUSED_BY_OP',
+            code: codeFromBody(body, 'REFUSED_BY_OP'),
             what: `GET ${path} on the editor backend`,
             why: failure.split('\n\nfull response:')[0],
             got: body,
@@ -310,7 +332,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
       const failure = isFailureBody(body);
       return failure
         ? fail({
-            code: 'REFUSED_BY_OP',
+            code: codeFromBody(body, 'REFUSED_BY_OP'),
             what: label,
             why: failure.split('\n\nfull response:')[0],
             got: body,
@@ -366,11 +388,35 @@ export function createToolContext(config: { backend: string; token?: string }): 
    *  rest of the body. Editor actions can touch scenes/resources, so allow generous
    *  time. */
   async function editorAction(action: string, params: Record<string, unknown> = {}, timeoutMs = 65_000): Promise<ToolResult> {
-    // `action` LAST, so a params key of the same name can never clobber the routing key. It did:
-    // `modoki_prefab` spread its own args (which include `action: 'instantiate'`) over this, so every
-    // prefab call sent 'instantiate' as the OP NAME and came back as a 400 listing the valid ops.
-    // The route also strips `action` before relaying, so a param by that name is unreachable through
-    // it regardless — a tool needing one must pick another name (see `prefabAction`).
+    // `action` is the ROUTING key of this relay, and the route strips it before relaying — so a
+    // param of the same name is UNREACHABLE through here, whichever way the spread is ordered.
+    //
+    // This has now caught two tools. `modoki_prefab` spread its own args (which include
+    // `action:'instantiate'`) over the routing key, so every prefab call sent 'instantiate' as the
+    // OP NAME and came back as a 400 listing the valid ops — loud, and fixed by renaming the param
+    // to `prefabAction`. The comment left behind ("a tool needing one must pick another name") was
+    // a convention with nothing enforcing it, and `modoki_write_player_prefs` walked into the
+    // OTHER, quieter half of the same trap: putting `action` LAST protects the routing key, and by
+    // doing so it silently DROPS the tool's own param. The op then ran with `action: undefined`.
+    // Caught live (#288 Phase 2); T1/T2 could not see it, because the request the tool built was
+    // exactly the request the contract declared.
+    //
+    // So: refuse, rather than document. A dropped argument is a call that does something other
+    // than what was asked and reports it as fine — §0's rank-1 false success. A tool that genuinely
+    // needs an `action` param belongs on its OWN route (see `/api/player-prefs`), not here.
+    if (Object.prototype.hasOwnProperty.call(params, 'action')) {
+      return fail({
+        code: 'REFUSED_BY_OP',
+        what: `run the editor action "${action}"`,
+        why: '`action` is this relay\'s routing key and is stripped before the op sees it, so a param '
+          + 'of that name is silently dropped rather than delivered. This is a TOOL DEFECT, not a caller mistake.',
+        got: { action: params.action },
+        options: [
+          'rename the tool\'s param (modoki_prefab uses `prefabAction`)',
+          'or give the tool its own POST route instead of the /api/editor-action relay',
+        ],
+      });
+    }
     return postJson('/api/editor-action', { ...params, action }, timeoutMs, `run the editor action "${action}"`);
   }
 

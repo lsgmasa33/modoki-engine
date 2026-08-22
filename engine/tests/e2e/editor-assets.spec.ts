@@ -196,3 +196,48 @@ test('context-menu Rename → type → Enter posts a move-file', async ({ page }
   await expect.poll(() => moveBody?.from).toBe(fromPath);
   expect(moveBody.to).toContain('e2e_renamed');
 });
+
+/** The toolbar's Refresh button must bump the editor-wide `assetsVersion`, not just
+ *  re-scan this panel — the Script tree subscribes to that version and has no other
+ *  trigger, so a Refresh that only repopulated the Assets panel left a script added
+ *  or deleted on disk invisible until something unrelated happened to bump it
+ *  (QA-EDITOR-0009). Only e2e can prove this wiring: the button, the store and the
+ *  sibling panel are three separate pieces and the bug lived exactly between them.
+ *
+ *  `/api/scripts/tree` is intercepted and answers a DIFFERENT tree on the second
+ *  call, standing in for a file appearing on disk. Nothing touches the repo. */
+test('Refresh re-fetches the Script tree, not just the asset list', async ({ page }) => {
+  const script = (name: string) => ({ rel: name, path: `/@fs/tmp/${name}`, name });
+  // Flipped by hand AFTER mount rather than keyed on the call count: React mounts the
+  // panel more than once in dev, so "the second fetch" is not the click's fetch.
+  let onDisk = ['before.ts'];
+  let calls = 0;
+  await page.route('**/api/scripts/tree', async (route) => {
+    calls += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        roots: [{ label: 'Scripts', rootPath: '/tmp', writable: true, files: onDisk.map(script) }],
+      }),
+    });
+  });
+
+  await page.addInitScript(() => {
+    localStorage.setItem('editor:scripts:expanded:v2', JSON.stringify(['Scripts']));
+  });
+  await gotoEditorWithAssets(page);
+
+  await expect(page.getByText('before.ts', { exact: true })).toBeVisible();
+  await expect(page.getByText('after.ts', { exact: true })).toHaveCount(0);
+
+  // The file "appears on disk" — nothing in the editor knows yet.
+  onDisk = ['before.ts', 'after.ts'];
+  const callsBeforeClick = calls;
+  await expect(page.getByText('after.ts', { exact: true })).toHaveCount(0);
+
+  await page.locator('[data-ui-id="assets.toolbar.refresh"]').click();
+
+  await expect(page.getByText('after.ts', { exact: true })).toBeVisible();
+  expect(calls).toBeGreaterThan(callsBeforeClick);
+});

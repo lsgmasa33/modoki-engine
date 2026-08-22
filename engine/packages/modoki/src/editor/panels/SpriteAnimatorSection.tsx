@@ -31,7 +31,17 @@ export function TrackNameField({ name, onRename }: { name: string; onRename: (ne
       onChange={(e) => setText(e.target.value)}
       onBlur={commit}
       onKeyDown={(e) => {
-        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+        // Enter COMMITS DIRECTLY. Routing it through blur() and relying on onBlur is what
+        // made this rename never land (QA-ASSET-0016): Chromium dispatches focus/blur only
+        // while `document.hasFocus()`, so with the editor window behind another window —
+        // an ordinary state for a human, and the permanent one for an agent session —
+        // `blur()` moves `document.activeElement` and fires NO event, and `commit` never
+        // ran. Same defect and same fix as `components/RenameInput.tsx`.
+        //
+        // The trailing blur is cosmetic and safe to double-fire: after a successful rename
+        // the `name` prop changes and the effect above re-seeds `text`, so `commit`'s
+        // `t !== name` guard makes the later onBlur a no-op.
+        if (e.key === 'Enter') { commit(); (e.target as HTMLInputElement).blur(); }
         else if (e.key === 'Escape') { setText(name); (e.target as HTMLInputElement).blur(); }
       }}
       style={{ ...inputStyle, flex: 1 }}

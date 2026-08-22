@@ -33,6 +33,7 @@ function installLocalStorage() {
 installLocalStorage();
 
 import { AUTOSAVE_NAME } from '../../src/editor/utils/layoutNames';
+import { dockPanel } from '../../src/editor/panelDock';
 import {
   defaultLayout, PANEL_LABELS, panelLabel,
   LAYOUT_KEY, LAYOUT_NAME_KEY, AUTODOCK_KEY,
@@ -40,6 +41,7 @@ import {
   saveLayout, loadLayout, currentLayoutName,
   writeLayoutJson, writeLayout, downloadLayoutJson, readLayout,
   toModel, normalizeTabTitles, loadInitialModel, clearStoredLayout, orderLayoutChoices,
+  takeLayoutResetFlag, LAYOUT_RESET_KEY, _resetLayoutLoadMemoForTests,
 } from '../../src/editor/utils/layoutStore';
 
 const okJson = (body: unknown) => ({ ok: true, json: async () => body }) as unknown as Response;
@@ -54,6 +56,8 @@ const minimalModel = (component = 'scene', name = 'Scene'): IJsonModel => ({
 
 beforeEach(() => {
   localStorage.clear();
+  sessionStorage.clear();
+  _resetLayoutLoadMemoForTests(); // each test is a fresh page load
   backendFetch.mockReset();
 });
 
@@ -186,6 +190,69 @@ describe('normalizeTabTitles', () => {
     let name: string | undefined;
     m.visitNodes((n) => { if (n.getType() === 'tab') name = (n as unknown as { getName(): string }).getName(); });
     expect(name).toBe('My Panel');
+  });
+});
+
+/** `defaultLayout` is a hand-written literal that every new editor and every
+ *  *Reset Layout* renders, and nothing type-checks its `component` strings against
+ *  the panel registry — a typo ships "Unknown panel: <id>" to a first-time user, in
+ *  the one layout nobody's saved state can mask. These pin the literal itself. */
+describe('defaultLayout is a well-formed panel arrangement', () => {
+  const tabs = (): { component: string; name: string }[] => {
+    const out: { component: string; name: string }[] = [];
+    Model.fromJson(defaultLayout).visitNodes((n) => {
+      if (n.getType() !== 'tab') return;
+      const t = n as unknown as { getComponent(): string; getName(): string };
+      out.push({ component: t.getComponent(), name: t.getName() });
+    });
+    return out;
+  };
+
+  it('names only registered built-in panels, with their current labels', () => {
+    // PANEL_LABELS is the built-in panel vocabulary (EditorApp's PANELS mirrors it).
+    // A component outside it has no factory entry → the tab renders "Unknown panel".
+    for (const { component, name } of tabs()) {
+      expect(PANEL_LABELS, `unknown panel id "${component}" in defaultLayout`).toHaveProperty(component);
+      // A stale title is self-healed by normalizeTabTitles at load, but the SOURCE
+      // should not be the thing that needs healing.
+      expect(name).toBe(PANEL_LABELS[component]);
+    }
+  });
+
+  it('docks each panel exactly once', () => {
+    // A duplicate tab makes isPanelVisible/dockPanel ambiguous: the Window menu
+    // would tick the panel, closing one copy would leave the other open.
+    const ids = tabs().map((t) => t.component);
+    expect([...new Set(ids)].sort()).toEqual([...ids].sort());
+  });
+
+  it('keeps a Scene tabset for dockPanel to aim at', () => {
+    // The seam: the Window menu and the openByDefault auto-dock both route through
+    // dockPanel, which targets the tabset CONTAINING `scene` and only falls back to
+    // the first tabset. Restructuring the default must not strand that target — the
+    // first tabset is now Game's, so the fallback would dock panels in the wrong place.
+    const model = Model.fromJson(defaultLayout);
+    expect(dockPanel(model, 'profiler', 'Profiler')).toBe('added');
+    let sceneTabsetHasProfiler = false;
+    model.visitNodes((n) => {
+      if (n.getType() !== 'tabset') return;
+      const kids = (n as unknown as { getChildren(): { getComponent?: () => string }[] }).getChildren();
+      const ids = kids.map((c) => c.getComponent?.());
+      if (ids.includes('scene') && ids.includes('profiler')) sceneTabsetHasProfiler = true;
+    });
+    expect(sceneTabsetHasProfiler).toBe(true);
+  });
+
+  it('re-docking an already-present panel focuses it instead of duplicating it', () => {
+    // Every asset editor is in the default now, so the Window menu's common case is
+    // "already open" — which must take dockPanel's focus branch, not add a second tab.
+    const model = Model.fromJson(defaultLayout);
+    expect(dockPanel(model, 'particle-editor', 'Particle Editor')).toBe('focused');
+    let count = 0;
+    model.visitNodes((n) => {
+      if (n.getType() === 'tab' && (n as unknown as { getComponent(): string }).getComponent() === 'particle-editor') count++;
+    });
+    expect(count).toBe(1);
   });
 });
 
@@ -347,5 +414,64 @@ describe('clearStoredLayout', () => {
     clearStoredLayout();
     expect(localStorage.getItem(LAYOUT_KEY)).toBeNull();
     expect(localStorage.getItem(LAYOUT_NAME_KEY)).toBeNull();
+  });
+
+  /** QA-EDITOR-0004: dropping the two localStorage keys was never enough — the server-side
+   *  autosave outranks both, so Reset Layout handed back the layout being reset. */
+  it('arms the one-shot reset marker so the next load skips every restore tier', () => {
+    clearStoredLayout();
+    expect(sessionStorage.getItem(LAYOUT_RESET_KEY)).toBe('1');
+  });
+
+  it('takeLayoutResetFlag clears the marker on the first read, but keeps ANSWERING for this load', () => {
+    clearStoredLayout();
+    expect(takeLayoutResetFlag()).toBe(true);
+    expect(sessionStorage.getItem(LAYOUT_RESET_KEY)).toBeNull(); // consumed…
+    expect(takeLayoutResetFlag()).toBe(true);                    // …but still true THIS load
+    _resetLayoutLoadMemoForTests();                              // a fresh page load
+    expect(takeLayoutResetFlag()).toBe(false);
+  });
+
+  /** `main.tsx` wraps the app in <StrictMode>, so in dev React runs EditorApp's init effect,
+   *  discards it, and runs it again — two `loadInitialModel()` calls in one page load, the
+   *  SECOND of which is the live one. A read-and-clear marker was consumed by the discarded
+   *  first call, so Reset Layout silently regressed to restoring the autosave every single
+   *  time. Found by the close-out review of the fix itself. */
+  it('survives StrictMode: the SECOND loadInitialModel of the same load is still the default', async () => {
+    saveLayout(Model.fromJson(minimalModel('assets', 'Assets')));
+    backendFetch.mockImplementation(async (url: string) =>
+      (url.includes(`name=${AUTOSAVE_NAME}`) ? okJson(minimalModel('console', 'Console')) : notOk()));
+
+    clearStoredLayout();
+    const first = await loadInitialModel();   // React's discarded invocation
+    const second = await loadInitialModel();  // the one that actually renders
+    expect(first.fromDefault).toBe(true);
+    expect(second.fromDefault).toBe(true);
+
+    _resetLayoutLoadMemoForTests();           // the NEXT real page load
+    expect((await loadInitialModel()).fromDefault).toBe(false);
+  });
+
+  it('after a reset, loadInitialModel returns the DEFAULT even though an autosave exists', async () => {
+    saveLayout(Model.fromJson(minimalModel('assets', 'Assets')));
+    localStorage.setItem(LAYOUT_NAME_KEY, 'my-named-layout');
+    backendFetch.mockImplementation(async (url: string) => {
+      if (url.includes('name=my-named-layout')) return okJson(minimalModel('inspector', 'Inspector'));
+      if (url.includes(`name=${AUTOSAVE_NAME}`)) return okJson(minimalModel('console', 'Console'));
+      return notOk();
+    });
+
+    clearStoredLayout();
+    const { model, fromDefault } = await loadInitialModel();
+    expect(fromDefault).toBe(true);
+    let sawScene = false;
+    model.visitNodes((n) => { if (n.getType() === 'tab' && (n as unknown as { getComponent(): string }).getComponent() === 'scene') sawScene = true; });
+    expect(sawScene).toBe(true);
+
+    // ONE-SHOT PER LOAD: the very next PAGE LOAD restores normally again (the autosave is
+    // still a recovery point, it just no longer defeats the menu item).
+    _resetLayoutLoadMemoForTests();
+    const again = await loadInitialModel();
+    expect(again.fromDefault).toBe(false);
   });
 });

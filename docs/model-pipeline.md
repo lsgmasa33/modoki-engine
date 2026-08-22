@@ -224,6 +224,56 @@ the equivalents up itself (`engine/electron/main.ts` + `assetBackend.ts`):
   resolves the postprocessor — otherwise the import fails silently and Stage A passes the
   model through un-fixed. See [build.md](./build.md) and [architecture.md](./architecture.md).
 
+⚠️ **THE RECURRING BUG: a postprocessor that fails to LOAD degrades to a silent passthrough,
+and the only symptom is untextured geometry.** `resolvePostprocessorForId` returns `null` on any
+load failure, Stage A then bakes the model un-fixed, and nothing surfaces in the editor — the
+generated UVs simply never happen, so a texture samples an absent `uv` and the mesh renders
+flat. Three separate causes have produced this same symptom on `games/3d-test`:
+
+| Cause | Fix |
+|---|---|
+| Flat project root has no `node_modules`; `@modoki/engine` won't resolve | alias engine entry points to absolute editor-tree paths |
+| Packaged app dereferences the `@modoki/engine` symlink, so `/packages/modoki/...` 404s | same alias, by absolute path |
+| **`configFile:false` drops `engine/vite.config.ts`'s `define`, so `__MODOKI_MODULE_*__` are undefined → `ReferenceError`** | declare the flags all-on in the SSR server's own `define` |
+
+**Both SSR loaders must define the `__MODOKI_MODULE_*__` flags, and they are separate files** —
+`electron/ssrLoader.ts` (dev + packaged editor) and `plugins/vite-asset-scanner.ts` (build-time
+bakes). The third row above was fixed in the build one and not the editor one, so every editor
+re-import silently passed through while the shipped build was fine. `ssrLoaderDefines.test.ts`
+now fails if they drift apart again.
+
+**Diagnosing it takes one grep, not a bisect** — the loader logs the reason:
+```bash
+grep -E "reimport-model|SSR module" /tmp/modoki-editor-<port>.log
+#   [reimport-model] postprocessor "island" ready for Stage A bake      ← good
+#   [reimport-model] Failed to load postprocessor "island" ...          ← passthrough
+```
+And the artifact settles it: compare `TEXCOORD_0` coverage between the source GLB and the baked
+`processed.glb` under `<project>/.cache/modoki-models/**`. **Equal counts mean the hook added
+nothing.** ⚠️ The cache key does NOT change when the postprocessor fails to load, so a stale
+passthrough bake is re-served forever — delete that cache dir before re-testing a fix.
+
+## Rigged-model texture compression
+
+A rigged/skinned model's embedded textures go through a separate optimizer (`rigged-model-
+optimize.ts`), driven by a "Texture Compression" section in the Model Inspector's rigged branch
+(Format `uastc`/`etc1s`/`raw` · Max Size · Mipmaps · UASTC Level + RDO λ), persisted to the same
+`.meta.json`'s `texture` block that `reimport-model.ts` reads via `resolveTextureSettings(meta)` →
+`convertRiggedModel`. `ktxFlags` (exported for tests) reads the SHARED `resolveUastcLevel`/
+`resolveUastcRdoLambda` resolvers from `runtime/loaders/textureSettings.ts` — the same ones a
+standalone texture uses — so a rigged model's UASTC RDO-lambda default is **1.0**, matching
+standalone textures (it used to be hardcoded to `4`, an inconsistency with no reason behind it).
+λ=0 omits `--uastc_rdo_l` (RDO off) the same way the standalone texture converter does. These
+flags feed `ktxSignature` → `riggedHash`, so an existing rigged model's cache auto-regenerates on
+its next reimport when the knobs change — no `MODEL_ENCODER_VERSION` bump needed, since only the
+affected models invalidate.
+
+**Deferred follow-ups** (tracked, not scheduled):
+- **AnimSet playback preview** — the Inspector shows numeric clip params only; a real preview
+  needs an `AnimationMixer`-driven viewer (`ModelPreview.tsx` today only loads GLBs statically).
+- **Draco mesh compression** as an option alongside meshopt — a new codec path, deliberately left
+  out of the LOD/gltfpack flag set above.
+
 ## LOD authoring reference
 
 Practical tooling notes for tuning ratios/errors:
@@ -241,6 +291,91 @@ Practical tooling notes for tuning ratios/errors:
 - **Instancing beats LOD for swarms** — many copies of one mesh are cheaper
   instanced than per-instance LOD.
 - **Three levels is enough** for most games — the default `lodCount: 3`.
+
+## ⛔ LOD switch distances are authored for the CONTENT, and the defaults fit nothing (#212)
+
+⚠️ **MEASURED ON HARDWARE 2026-08-14, and it refutes the assumption that LOD chains are the
+triangle lever.** `demos/forest-camp` on a Galaxy A23, live via `device_eval`:
+
+- **80 LOD nodes, every one with 3 levels** — the chains exist and are correctly built
+  (16 of 19 models author `lodCount: 3`, and `lodPaths`/`lod1.glb`/`lod2.glb` are all on disk).
+- **Every one of the 80 renders LOD 0.** Not one has ever switched.
+- The reason is arithmetic: the default `lodDistances` are **`[0, 80, 250]`**, and the scene's
+  farthest object sits **21.3 world units** from the camera (min 4.9, median 10.7). LOD 1 is out
+  of reach by ~4x, LOD 2 by ~12x.
+
+⭐ **So a chain can be complete, shipped, and dead — and nothing says so.** `lodCount: 3` in the
+importer, three GLBs on disk and three levels in the scene graph all report success; only the
+runtime level selection reveals that the chain never fires. Check the SELECTION, not the chain.
+
+⛔ **And fixing the distances would not have bought frame rate — do not spend a session on it for
+performance reasons.** Forcing all 80 nodes to LOD 1 live (same scene, same frame, tier `mid`,
+uncapped at `targetFps: 60`):
+
+| | LOD 0 | LOD 1 forced |
+|---|---|---|
+| visible triangles | 81,974 | **50,488** (−38%) |
+| frame | 17.5 ms | 17.8 ms |
+| `cpuMs` | 15.7 | 15.2 |
+| `restMs` (GPU) | 2.6 | 2.4 |
+
+**A 38% triangle cut moved the frame by 0.3 ms, into the noise.** The frame is **CPU-bound** —
+15.7 ms of CPU against 2.6 ms of GPU — so triangles were never the constraint on this project and
+this device. Same shape as the draw-call batching refutation (197 calls removed, frame unchanged):
+the mechanism works and the bottleneck is elsewhere.
+
+⚠️ Read that as a fact about *this project on this device*, not a general law. Distances still want
+authoring for a project whose camera genuinely pulls back (a strategy or fly-over view), where the
+same chain would fire constantly — the point is that "fix the LOD distances" is a **correctness /
+content** job, not a performance one, until a profile shows a GPU-bound vertex cost.
+
+## A failed write ABORTS the import — and nothing is registered before its file exists (#311)
+
+Browser-side import (`editor/scene/modelImport.ts`) generates many files: a `.mat.json` per
+deduped material, a `.mesh.json` per mesh, extracted `.png` textures, `.meta.json` sidecars.
+
+**The defect.** Its local `writeAssetFile` wrapper **never throws** — like its `assetOps`
+siblings it catches and resolves `false` — and three call sites discarded that. Two of them ran
+`registerAsset(...)` **first** and threw the write's result away, so a failed write left the asset
+manifest mapping a GUID to a path with no file behind it. Everything then resolves correctly for
+the rest of the session (the manifest is in memory); the dangling ref surfaces on the next scene
+load or a fresh editor launch, which read the file. Same delayed cache-vs-disk desync as #308,
+and delayed in the same way — the failure surfaces far from its cause.
+
+**Two independent halves, and the ordering one is the load-bearing fix:**
+
+1. **`registerAsset` runs only after a confirmed write.** This is what prevents the dangling ref.
+   A test that only checks the return value passes with the ordering still wrong.
+2. **The first failed write aborts the whole import** (owner's decision, 2026-08-21). Rejected:
+   *skip that asset and continue*, because a partially-imported model's missing pieces are
+   invisible until something renders wrong; and *roll back what was written*, which is more
+   machinery and can itself fail.
+
+**How the abort travels.** `writeAssetFileOrAbort` throws an internal `ImportWriteAborted`;
+`importModel` is a thin boundary around `importModelInner` that catches it, reports, and returns
+`0` — the falsy value both call sites (`Assets.tsx`, `ModelAssetView.tsx`) already check with
+`if (!rootId) return;`. **It must never escape as an exception**: neither caller wraps the call in
+a `try`.
+
+Two consequences worth knowing:
+
+- **No stray entities.** Every guarded write happens before the import spawns anything
+  (`spawnEntity` is the last step), so an abort leaves the scene untouched and the caller's
+  `deleteEntity(rootId)` cleanup is simply unreachable.
+- **Earlier files stay on disk.** That is safe precisely *because* of half 1: they are regenerable
+  outputs a re-import overwrites, and nothing in the manifest points at the file that failed.
+
+⚠️ **Texture extraction's per-texture `catch` re-throws `ImportWriteAborted`.** That catch exists
+for genuine extraction failures (decode, unsupported format), which legitimately skip one texture —
+without the guard it would silently downgrade an abort back into a skip. The texture write itself
+was already checked and never produced a dangling ref (it `continue`d before recording the path);
+it now aborts instead, so the policy is uniform.
+
+**Not covered:** the three `/api/write-meta` sidecar writes are still unchecked. A missing
+`.meta.json` does not dangle a ref — the GUID is simply re-minted on the next import — so making a
+sidecar hiccup fail an otherwise-good import was judged the worse trade. Deliberate, not an
+oversight.
+
 
 ## Known limits (v1)
 

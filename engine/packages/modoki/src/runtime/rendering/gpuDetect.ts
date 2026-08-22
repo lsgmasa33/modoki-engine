@@ -23,6 +23,15 @@ async function probeWebGPU(): Promise<boolean> {
     gpu?: { requestAdapter(): Promise<{ requestDevice(): Promise<unknown> } | null> };
   }).gpu;
   if (!gpu) return false;
+  // ⚠️ THE TIMER MUST BE CANCELLED WHEN THE RACE SETTLES, or it fires anyway and logs a timeout
+  // that did not happen. It did exactly that on every launch of every device: a probe that
+  // answered in 13-29 ms still printed "did not answer within 8000ms — falling back to WebGL"
+  // eight seconds later, because `resolve(false)` on an already-settled race is a silent no-op.
+  // Nothing downstream was wrong — `getWebGPUSupported()` had long since memoized `true` — but
+  // the log said the opposite of the truth, and a log is the only instrument anyone has on a
+  // phone. It cost a session's worth of wrong conclusions ("native has no WebGPU", "the probe
+  // costs 8 s of every launch"), both drawn from this line and both false.
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     // BOUNDED, like every other await that crosses a process boundary. `requestAdapter` is a
     // call into the GPU process: when that process is unreachable it does not reject, it
@@ -39,13 +48,19 @@ async function probeWebGPU(): Promise<boolean> {
         await adapter.requestDevice();
         return true;
       })(),
-      new Promise<boolean>((resolve) => setTimeout(() => {
-        console.warn(`[gpuDetect] WebGPU probe did not answer within ${PROBE_TIMEOUT_MS}ms — treating it as unsupported and falling back to WebGL.`);
-        resolve(false);
-      }, PROBE_TIMEOUT_MS)),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => {
+          console.warn(`[gpuDetect] WebGPU probe did not answer within ${PROBE_TIMEOUT_MS}ms — treating it as unsupported and falling back to WebGL.`);
+          resolve(false);
+        }, PROBE_TIMEOUT_MS);
+      }),
     ]);
   } catch {
     return false;
+  } finally {
+    // Runs on every exit — resolved, rejected, or timed out. A timeout that already fired is
+    // harmless to clear; one that has not is exactly the phantom this prevents.
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 

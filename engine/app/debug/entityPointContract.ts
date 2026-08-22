@@ -16,6 +16,11 @@
  *  contract closes it — `{guid}`/`{name}` resolves to the entity's live screen rect INSIDE the
  *  same call that dispatches the click. See `docs/enact.md`. */
 
+// Type-only, and DOM-free like the rest of this file — `mcpResult.ts` is dependency-free
+// (`docs/mcp-tool-conventions.md` §9), so pulling just the `ErrorCode` union in does not
+// smuggle any MCP/DOM/node surface into the main-process program that consumes this contract.
+import type { ErrorCode } from '../../tools/shared/mcpResult';
+
 /** Which entity to aim at. Exactly one field is used, in the order guid → name → id.
  *
  *  Prefer `guid`. Runtime `id`s are REASSIGNED on every scene reload (and a scene mutate
@@ -100,6 +105,13 @@ export interface EntityPointResolution {
   ok: boolean;
   /** Present when `ok` is false — why the entity could not be aimed at. */
   error?: string;
+  /** Machine-readable twin of `error`, for the FOUR refusals this resolver can name precisely
+   *  (`docs/mcp-tool-conventions.md` §5): `NOT_FOUND` (guid/id/name matched nothing), `AMBIGUOUS`
+   *  (a `name` matched more than one entity), `AMBIGUOUS_SURFACE` (mounted in several on-screen
+   *  surfaces and `surface` was not given), `OCCLUDED` (a default, non-`allowOccluded` aim was
+   *  refused because something else is in front). Every other refusal here stays uncoded — the
+   *  caller's generic `REFUSED_BY_OP` fallback is the honest answer for those. */
+  code?: ErrorCode;
   x?: number;
   y?: number;
   /** Who resolved. Echoed back so a `{name}` aim can be checked against the entity actually

@@ -33,14 +33,28 @@ function makeBloomNode() {
 // assertable. `isTextureNode` is what the FXAA stage checks to decide whether
 // it must wrap the incoming color in an `rtt()` first.
 function makeScenePass() {
-  return {
+  const p = {
     setMRT: vi.fn(),
     setLayers: vi.fn(),
     setResolutionScale: vi.fn(),
     getTextureNode: vi.fn((name?: string) => ({ __texture: name ?? 'output', isTextureNode: true })),
     dispose: vi.fn(),
+    // #238: the precompile half. `renderTarget` is what `compileSceneAsync` stamps sample count
+    // and texture type onto, and `compileAsync` stands in for three's `PassNode.compileAsync` —
+    // whose only observable act here is asking the renderer for a render context the way
+    // `Renderer.compile()` does: two arguments, so no call depth.
+    renderTarget: { samples: 0, texture: { type: null as unknown } },
+    compileAsync: vi.fn(async (r: { _renderContexts: { get(rt: unknown, mrt: unknown, d?: number): unknown } }) => {
+      r._renderContexts.get(p.renderTarget, null);
+    }),
+    updateBefore: vi.fn(),
   };
+  return p;
 }
+/** Every pass the mocked `pass()` handed out this test, so a case can reach the one its stack
+ *  holds. Declared after the factory: referencing it from inside would make its element type
+ *  circular. */
+const scenePasses: ReturnType<typeof makeScenePass>[] = [];
 
 // `uniform()` with an observable `.value` and a chaining `.setName()` (the NPR
 // + FXAA stages call `uniform(x).setName('...')`).
@@ -99,9 +113,10 @@ beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
   renderPipelines.length = 0;
+  scenePasses.length = 0;
 
   vi.doMock('three/tsl', () => ({
-    pass: vi.fn(() => makeScenePass()),
+    pass: vi.fn(() => { const p = makeScenePass(); scenePasses.push(p); return p; }),
     mrt: vi.fn((o: unknown) => o),
     rtt: rttSpy,
     output: {},
@@ -161,13 +176,25 @@ beforeEach(() => {
 
 afterEach(() => { vi.restoreAllMocks(); });
 
-/** Minimal renderer the stage prologues poke at (800×600 @ DPR 1). */
+/** Minimal renderer the stage prologues poke at (800×600 @ DPR 1).
+ *
+ *  `_callDepth` + `_renderContexts` are three's private fields the #238 precompile pin reaches
+ *  for; `contextLookups` records what the pinned lookup was actually asked for. */
 function makeRenderer() {
+  const contextLookups: Array<{ rt: unknown; depth: number | undefined }> = [];
   return {
     getSize: (v: THREE.Vector2) => v.set(800, 600),
     getPixelRatio: () => 1,
     getRenderTarget: vi.fn(() => null),
     setRenderTarget: vi.fn(),
+    _callDepth: -1,
+    _renderContexts: {
+      get: (rt: unknown, _mrt: unknown, depth?: number) => {
+        contextLookups.push({ rt, depth });
+        return { id: depth ?? 0 };
+      },
+    },
+    contextLookups,
   };
 }
 
@@ -661,4 +688,50 @@ describe('PostFXStack — stage nodes that own GPU resources are freed (leak reg
     expect(bloomNode.dispose).toHaveBeenCalledTimes(1);
     expect(dofNode.dispose).toHaveBeenCalledTimes(1);
   });
+
+  // ── #238: the precompile must warm the context the pass DRAWS through ──────────────────────
+  //
+  // three folds `context.id` into every material's node-builder cache key, and it keys its
+  // contexts by call depth. `Renderer.compile()` always takes the depth-0 one; the scene pass is
+  // drawn from inside the terminal pipeline's quad, one level deeper. Getting this wrong is not
+  // visible — the compile succeeds, warms a cache nothing reads, and the first frame rebuilds
+  // every shader graph synchronously (513 ms of an 807 ms block on an A23). So the wiring is
+  // asserted here rather than left to the render to reveal.
+  describe('scene-pass precompile (#238)', () => {
+    it('pins the pass render target to the depth the pass draws at', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const renderer = makeRenderer();
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      await stack.compileSceneAsync();
+      expect(renderer.contextLookups).toEqual([{ rt: scenePasses[0].renderTarget, depth: 1 }]);
+    });
+
+    it('re-pins to the depth the live pass was observed at', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const renderer = makeRenderer();
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      // A stack shape that nests the pass one level deeper than the default: the first frame
+      // draws it from inside a draw that is itself at depth 1.
+      renderer._callDepth = 1;
+      scenePasses[0].updateBefore({});
+
+      await stack.compileSceneAsync();
+      expect(renderer.contextLookups).toEqual([{ rt: scenePasses[0].renderTarget, depth: 2 }]);
+    });
+
+    it('stamps the pass target sample count before compiling', async () => {
+      // Not tidiness: `PassNode.setup()` normally stamps this during the first render — the very
+      // frame the precompile exists to get ahead of — and a sample-count mismatch is a different
+      // pipeline key, so the compile would warm the wrong set and look like a fix that did not work.
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const renderer = { ...makeRenderer(), samples: 4, getOutputBufferType: () => 1016 as never };
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      await stack.compileSceneAsync();
+      expect(scenePasses[0].renderTarget.samples).toBe(4);
+      expect(scenePasses[0].renderTarget.texture.type).toBe(1016);
+    });
+  });
+
 });

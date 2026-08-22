@@ -5,34 +5,32 @@
  *
  *  Architecture mirrors ParticleEditor: the live clip is the single source of truth in
  *  the editor store, so the GLOBAL undo stack applies edits even when this panel is
- *  unfocused. Edits coalesce per group; persistence is a debounced /api/write-file. */
+ *  unfocused. Edits coalesce per group; the clip document is PARKED in the dirty-asset registry
+ *  and written by Cmd+S (Save All) — see useParkedAssetDoc.ts (#259). */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
+import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
+import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
-import { getCurrentWorld } from '../../runtime/core/ecs/world';
-import { findEntity, getStructureVersion, fireDirtyListeners } from '../../runtime/core/ecs/entityUtils';
+import { findEntity, getStructureVersion } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newGuid, registerAsset, getGuidForPath } from '../../runtime/loaders/assetManifest';
-import {
-  applyClipAtTime, advanceClipTime,
-} from '../../runtime/animation/sampleClip';
-import { applyClipDeform } from '../../runtime/animation/deform2DSystem';
-import { beginDeform2DFrame } from '../../runtime/animation/deform2DBuffers';
+import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import {
   defaultAnimationClip, normalizeAnimationClip,
   type AnimationClipDef, type AnimationTrack, type TrackValueType,
 } from '../../runtime/animation/types';
-import { useDebouncedSave } from './useDebouncedSave';
+import { useParkedAssetDoc } from './useParkedAssetDoc';
 import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
 import {
   setRecordHook, relativeEntityPath, encodeValue, upsertKey, findTrack, moveKeysInTime,
   trackKey, groupSelection, selRefsFromIds, resolveKeySelection, nextKeyTime,
   remapSelectionAfterRemoval, reorderPermutation, remapSelectionAfterReorder, remapSelectionAfterDelete,
 } from '../animation/recording';
-import { extractKeyBlock, planPaste, applyBreakUnify, applyValueNudge, planAddedTracks, type KeyClipboard } from '../animation/clipEdits';
+import { extractKeyBlock, planPaste, applyBreakUnify, applyValueNudge, applyKeyPatch, planAddedTracks, type KeyClipboard } from '../animation/clipEdits';
 import { shouldCoalesce } from '../animation/undoCoalesce';
 import { getAnimEntityIndex, resolvePathToEntityId } from '../animation/entityIndex';
 import { applyTangentMode, evalTrackValue, type TangentMode } from '../../runtime/animation/curveEval';
@@ -45,16 +43,17 @@ import CurvesView from './animation/CurvesView';
 import AddPropertyPicker, { type PropertyCandidate } from './animation/AddPropertyPicker';
 import BindAnimatorPicker from './animation/BindAnimatorPicker';
 import { bindClipToEntity } from '../animation/bindAnimator';
+import { applyPoseAtTime, poseClipAtTime, exitPoseEnvelope, onPoseEnvelopeExited } from '../animation/poseClip';
 import { resolveAnimatorRootForClip } from './openAssetInEditor';
-import { clampKeyTime, frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
+import { frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { enterScrubMode, enterPreviewMode, exitPreviewMode, getModeOwner } from '../scene/playMode';
+import { enterScrubMode, enterPreviewMode } from '../scene/playMode';
 import {
-  beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession,
+  beginTimelinePreviewSession, hasTimelinePreviewSession,
+  setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
 
 const COALESCE_MS = 500;
-const AUTOSAVE_MS = 400;
 const TRACK_LIST_MIN_W = 140;
 const TRACK_LIST_MAX_W = 560;
 /** Minimum gap (in frames) between a copied block and its paste, for tiny/single
@@ -74,18 +73,15 @@ type ClipAction = UndoAction & { _after: AnimationClipDef };
  *  also fire while the Timeline owns a live preview — ending its session there would revert its
  *  world mid-run. (`exitPreviewMode` self-guards on owner; the session end does not, hence the
  *  explicit check.) */
-function endAnimationPreview(restore: boolean): void {
-  if (getModeOwner() !== 'animation') return;
-  const store = useEditorStore.getState();
-  store.setPreviewPlaying(false);
-  if (hasTimelinePreviewSession()) {
-    const path = store.editingAnimationAsset?.path;
-    void endTimelinePreviewSession({
-      restore,
-      rebind: () => (path ? resolveAnimatorRootForClip(path, { fallbackToSelection: false }) : null),
-    }).then((newRoot) => { if (newRoot != null) useEditorStore.getState().setAnimatorRoot(newRoot); });
-  }
-  exitPreviewMode('animation');
+/** Returns a promise that resolves once the world has actually been restored — Cmd+S awaits it and
+ *  serializes immediately afterwards, so a fire-and-forget restore would let the save write the
+ *  POSED world, which is the whole thing the envelope exists to prevent. */
+function endAnimationPreview(restore: boolean): Promise<void> {
+  // The body lives in `editor/animation/poseClip.ts` alongside the pose it undoes, so the
+  // `exit-pose-envelope` agent op closes the envelope exactly the way ⏹ does (#288 gap 2). An
+  // agent able to OPEN the envelope and not close it would wedge the editor: the envelope holds
+  // the run-mode at `scrub`, which is what blocks the human's Cmd+S.
+  return exitPoseEnvelope(restore).then(() => undefined);
 }
 
 export default function AnimationEditor() {
@@ -112,7 +108,6 @@ export default function AnimationEditor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recording, rootId, selectedEntityId, structureVersion]);
 
-  const [saveMsg, setSaveMsg] = useState('');
   const [showPicker, setShowPicker] = useState(false);
   const [showBindPicker, setShowBindPicker] = useState(false);
   // True while THIS panel holds a scrub/preview envelope — drives the ⏹ Exit Preview button.
@@ -176,6 +171,11 @@ export default function AnimationEditor() {
   const clipboardRef = useRef<KeyClipboard | null>(null);
   // Reactive mirror of "clipboard has content" so the Paste button can enable.
   const [hasClipboard, setHasClipboard] = useState(false);
+  /** Transient one-line feedback in the toolbar ("Copied 3 keys", "Bound to …", a warning).
+   *  It was called `saveMsg` and shared the span with the autosave status; with the autosave
+   *  gone that name described nothing it holds, and the save status now has its OWN slot that
+   *  a transient message can never hide. */
+  const [statusMsg, setStatusMsg] = useState('');
 
   const lastGroup = useRef<string | undefined>(undefined);
   const lastTime = useRef(0);
@@ -217,32 +217,47 @@ export default function AnimationEditor() {
   }, [rootId, asset, nonce, structureVersion]);
 
   // ── Pose the bound entities at a given time (shared runtime sampler) ──
+  //
+  // The pose WRITE itself now lives in `editor/animation/poseClip.ts`, so `modoki_pose_clip`
+  // drives the SAME code rather than a second copy of it (#288 gap 2). Re-deriving it there would
+  // have recreated the measured bake-in bug described below; sharing it cannot. What stays here is
+  // the component-local half: `setInPreview`, and the fast path the ▶ rAF loop needs.
+
+  /** Pose INSIDE the preview envelope, opening it first if it is not already held.
+   *
+   *  ⚠️ **A pose writes AUTHORED trait values into the live world**, so every path that poses has to
+   *  be inside the envelope — the session snapshot is what ⏹ Exit reverts to, and the `scrub`
+   *  run-mode is what stops `saveScene` writing the pose into the scene file. Scrub and the preview
+   *  loop opened it; `commit()`'s re-pose and the undo/redo closures did NOT, so editing a keyframe
+   *  posed the world while `getRunMode()` still read `'stopped'` — and a save then baked the pose
+   *  over the authored entities, with the transience guard passing and nothing to revert to.
+   *
+   *  MEASURED, not theoretical (owner, 2026-08-19, `games/3d-test`): one Cmd+S after a keyframe
+   *  edit rewrote `2D Animation.scene.json`'s Circle 2D x/y and Square 2D color to the clip's t=0
+   *  values, silently. It was on `docs/plans/preview-mode-refactor.md` Phase 3's open list as
+   *  "poses OUTSIDE the envelope … neither revertible nor save-blocked" before it happened for real.
+   *
+   *  Opening it here rather than at each call site is the point: this is the ONE place that writes
+   *  a pose, so a future path that poses cannot forget. The session begin is async (it serializes
+   *  the authored world), so a first pose lands a tick later — the same shape `scrub` already had,
+   *  and what keeps the snapshot free of the pose it is meant to revert. */
   const pose = useCallback((c: AnimationClipDef | null, t: number) => {
     if (!c || rootId == null) return;
-    try {
-      // applyClipAtTime writes trait values via bulk entity.set (bypassing
-      // writeTraitField), so nothing marks the viewport/Inspector dirty. Signal
-      // it ourselves — same as a gizmo drag — or the SceneView won't redraw and
-      // preview playback looks frozen.
-      const w = getCurrentWorld();
-      // New deform epoch, then pose scalar tracks + deform channels — so a scrubbed
-      // clip previews cloth/cape deformation exactly as it plays at runtime. (No-op
-      // fast path for scalar-only clips.)
-      beginDeform2DFrame();
-      const applied = applyClipAtTime(w, rootId, c, t) + applyClipDeform(w, rootId, c, t);
-      if (applied > 0) fireDirtyListeners();
-    } catch (e) {
-      // Most failures here are transient: a scene swap can leave `rootId` pointing at a
-      // not-yet-resolvable entity for a frame. Don't crash the preview rAF — but DON'T
-      // blanket-swallow either, or a genuine sampler regression manifests as a silently
-      // frozen preview with no diagnostic. Log at debug so it's visible when looked for.
-      console.debug('[AnimationEditor] pose failed (world not ready or sampler error)', e);
-    }
+    // `setInPreview` is the only piece that stays here — a `useState` driving the ⏹ Exit button,
+    // i.e. the one genuinely component-local dependency. Everything else moved into `poseClip.ts`,
+    // which is why an agent can pose with NO Animation panel mounted.
+    //
+    // The already-held branch stays SYNCHRONOUS and skips `setInPreview`, matching what this
+    // function did before the extraction: it is driven once per frame by the ▶ preview rAF below,
+    // where a promise and a setState per frame would both be new work for no gain.
+    if (hasTimelinePreviewSession()) { applyPoseAtTime(c, rootId, t); return; }
+    setInPreview(true);
+    void poseClipAtTime(c, rootId, t, 'animation');
   }, [rootId]);
 
   // ── Load the clip when the open target changes ──
   useEffect(() => {
-    endAnimationPreview(true); // opening/switching a clip ends our envelope: revert the pose, back to stopped
+    void endAnimationPreview(true); // opening/switching a clip ends our envelope: revert the pose, back to stopped
     setInPreview(false);
     lastAction.current = null;
     lastGroup.current = undefined;
@@ -252,15 +267,46 @@ export default function AnimationEditor() {
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingAnimationClip;
-    if (existing) { savedMarkRef.current?.(existing); return; } // keep unsaved edits on re-mount
+    if (existing) {
+      // ⚠️ "In sync" means EQUAL TO DISK, and a parked write means it is not. This branch marked
+      // `existing` as the saved baseline unconditionally, so re-entering the effect while a write
+      // was pending told the hook the pending doc was already written — and its reconciliation
+      // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
+      // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
+      // it returns HERE and never reaches the pendingAssetDoc branch below.
+      if (!pendingAssetDoc(asset.path, 'animation')) savedMarkRef.current?.(existing);
+      return;   // either way the loaded doc stays — that is what this branch is for
+    }
     const { loadAnimationClip } = useEditorStore.getState();
+    // An UNSAVED write parked for this asset (an agent `anim-set-clip` / `anim-add-key` under manual
+    // persistence) is not on disk yet — fetching the file would open the PRE-edit doc and re-seed
+    // the live cache with it, discarding the edit everywhere except the registry that still holds
+    // it (QA-CTX-0008, measured on the timeline twin of this path). Marked saved because it is
+    // parked, not written: the pending write stays pending until Save All, and the autosave must
+    // not commit it on open.
+    const parked = pendingAssetDoc(asset.path, 'animation');
+    if (parked) {
+      const doc = normalizeAnimationClip(parked as Partial<AnimationClipDef>);
+      // Same id/registration parity as the fetch path below — a legacy def with no in-file guid
+      // must still get one, or the asset stays unaddressable by GUID for as long as it is open.
+      if (!doc.id) doc.id = newGuid();
+      registerAsset(doc.id, asset.path, 'animation');
+      adoptParkedDoc(asset.path, 'animation', doc);
+      loadAnimationClip(doc);
+      return;
+    }
     fetch(asset.path)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((json) => {
         if (cancelled) return;
         const loaded = normalizeAnimationClip(json);
-        if (!loaded.id) { loaded.id = newGuid(); registerAsset(loaded.id, asset.path, 'animation'); savedMarkRef.current?.(normalizeAnimationClip(json)); }
-        else { registerAsset(loaded.id, asset.path, 'animation'); savedMarkRef.current?.(loaded); }
+        // The saved-baseline is the doc WITH the minted id, never an id-less twin: that trick
+        // existed to make the autosave notice the new id and write it, and with the autosave gone
+        // it would park a write merely for OPENING a legacy clip. The asset scanner already heals
+        // missing GUIDs (buildManifest heal=true). See ParticleEditor for the full note.
+        if (!loaded.id) loaded.id = newGuid();
+        registerAsset(loaded.id, asset.path, 'animation');
+        savedMarkRef.current?.(loaded);
         loadAnimationClip(loaded);
       })
       .catch((e) => { if (cancelled) return; console.warn('[AnimationEditor] load failed, using default', e); const fb = defaultAnimationClip(newGuid(), asset.name); savedMarkRef.current?.(fb); loadAnimationClip(fb); });
@@ -291,6 +337,13 @@ export default function AnimationEditor() {
       const a: ClipAction = {
         _after: next,
         label: `animation ${group.split(':')[0]}`,
+        // Asset-document edit: it changes a .anim.json file, NOT any scene entity, so it must not
+        // bump the scene's edit-version. Its unsaved state is tracked by the dirty-asset registry
+        // (hasUnsavedChanges ORs both), and a falsely-dirty SCENE is not cosmetic — it self-blocks
+        // the file-direct agent routes, makes modoki_build refuse, and (since #259) makes Cmd+S
+        // interrupt a preview and rewrite the scene file on every save while authoring. The agent
+        // twins have set this since S2.27; the panels never did.
+        _isFileDirect: true,
         undo: () => { useEditorStore.getState().applyAnimationClip(path, before); poseLatest(before); },
         redo: () => { useEditorStore.getState().applyAnimationClip(path, a._after); poseLatest(a._after); },
       };
@@ -316,14 +369,14 @@ export default function AnimationEditor() {
     const clamped = Math.max(0, Math.min(cur?.duration ?? t, t));
     useEditorStore.getState().setPlayhead(clamped);
     useEditorStore.getState().setPreviewPlaying(false);
+    // Claim the run-mode for THIS panel even when a session is already held, so the "exit to save"
+    // message names the Animation panel rather than whichever one opened the envelope first.
     enterScrubMode('animation'); // clip scrub is a silent pose — carry the global run-mode (shared with the Timeline panel)
     setInPreview(true);
-    // MANDATORY session: snapshot the authored world BEFORE the first pose of the envelope, so
-    // "⏹ Exit Preview" can revert it. Without this the scrub wrote authored traits with nothing
-    // to revert to, which is why saves stayed refused with no way out (plan Phase 3 / M1).
-    // Concurrent begins during a drag collapse to one snapshot (see beginTimelinePreviewSession).
-    if (!hasTimelinePreviewSession()) void beginTimelinePreviewSession().then(() => pose(cur, clamped));
-    else pose(cur, clamped);
+    // The MANDATORY session (snapshot the authored world BEFORE the envelope's first pose, so
+    // "⏹ Exit Preview" can revert it — plan Phase 3 / M1) now lives inside `pose`, which is the one
+    // place that writes a pose and therefore the one place that can guarantee it.
+    pose(cur, clamped);
   }, [pose]);
 
   const stepFrame = useCallback((dir: 1 | -1) => {
@@ -340,6 +393,59 @@ export default function AnimationEditor() {
     const target = nextKeyTime(cur.tracks, useEditorStore.getState().playheadTime, dir);
     if (target !== undefined) scrub(target);
   }, [scrub]);
+
+  // ── Cmd+S inside the envelope: hand the save a way to put the preview down and back up ──
+  // Registered only while WE are previewing, so the save never calls into a panel that has since
+  // exited. `resume` re-poses at the current playhead, and `pose` re-opens the session for it.
+  // `pose` is read through a ref so the handler OBJECT can be stable: `suspend()` rebuilds the
+  // world and re-resolves the Animator root, so the `pose` closure captured at registration time
+  // is dead by the time `resume()` runs. This panel's registration happens to survive a save cycle
+  // (`endAnimationPreview` does not touch `inPreview`, so the effect below is not torn down) —
+  // unlike the Timeline panel's, which the suspend deregistered and which is why `saveCommand`
+  // now falls back to the handler it started with (bug `tSv0EWjWICpEl9HSjRe9`). That fallback is
+  // only safe if a captured handler still calls the CURRENT closures, so both panels dispatch
+  // through a ref rather than only the one that needed it.
+  const poseRef = useRef(pose);
+  poseRef.current = pose;
+  // See TimelineEditor: a finished save cycle uses this to tell a CLOSED panel (do not resume)
+  // from one that merely deregistered itself (resume).
+  const mountedRef = useRef(true);
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
+  const saveHandlerRef = useRef<PreviewSaveHandler | null>(null);
+  if (!saveHandlerRef.current) {
+    saveHandlerRef.current = {
+      owner: 'animation',
+      isLive: () => mountedRef.current,
+      suspend: () => endAnimationPreview(true),
+      resume: () => {
+        const st = useEditorStore.getState();
+        setInPreview(true);
+        poseRef.current(st.editingAnimationClip, st.playheadTime);
+      },
+    };
+  }
+  // An exit can now come from OUTSIDE this component (the `exit-pose-envelope` agent op). Without
+  // observing it, `inPreview` would stay true against a closed envelope — leaving the save handler
+  // below registered, so the human's next Cmd+S would suspend (a no-op), serialize, and then
+  // `resume()` by RE-POSING a world the agent had just reverted.
+  //
+  // ⚠️ KEYED ON `hmrEpoch`, not `[]`. React Fast Refresh does not re-run a `[]`-deps effect
+  // (measured — see hmrEpoch.ts), and `poseClip.ts` holds its listeners in a module-level Set that
+  // a hot update REPLACES. Unlike the keymap registries, that module does not force a full reload
+  // when it changes, so a `[]` effect would stay subscribed to the dead Set: the next exit — the
+  // agent's OR the human's ⏹, both of which go through `exitPoseEnvelope` — would close the
+  // envelope without notifying this panel, and the very Cmd+S re-pose above would be back. The
+  // epoch is a frozen 0 with no hot context, so this is byte-for-byte `[]` in a shipped build.
+  useEffect(() => onPoseEnvelopeExited(() => setInPreview(false)), [hmrEpoch]);
+
+  useEffect(() => {
+    if (!inPreview) return;
+    const mine = saveHandlerRef.current!;
+    setPreviewSaveHandler(mine);
+    // Guarded: the OTHER panel registers from its own effect — an unconditional clear deletes
+    // whichever registration happens to be current, including one we do not own.
+    return () => clearPreviewSaveHandler(mine);
+  }, [inPreview]);
 
   // ── Preview playback loop ──
   // Also inside the preview envelope: it poses authored traits every frame exactly like a scrub,
@@ -395,7 +501,7 @@ export default function AnimationEditor() {
         const who = byId.get(entityId)?.name ?? `#${entityId}`;
         const rootName = byId.get(root)?.name ?? `#${root}`;
         console.warn(`[AnimationEditor] "${who}" is not under the Animator root "${rootName}" — edit not recorded. Move it under the Animator entity, or give it its own Animator, to animate it.`);
-        setSaveMsg(`⚠ "${who}" isn't under "${rootName}" — not keyed`);
+        setStatusMsg(`⚠ "${who}" isn't under "${rootName}" — not keyed`);
         return;
       }
       const existing = findTrack(cur.tracks, path, traitName, field);
@@ -571,18 +677,14 @@ export default function AnimationEditor() {
   }, [setSel]);
   // Curves view: merge a patch into one key (time clamped between neighbors so the
   // dragged index stays stable — no resort mid-drag).
-  const editKey = useCallback((ti: number, ki: number, patch: Partial<Keyframe>) => mutateTrack(ti, (tr) => {
-    const keys = tr.keys.map((kk, i) => {
-      if (i !== ki) return kk;
-      const merged = { ...kk, ...patch };
-      // Clamp to the clip duration too (default max is +Infinity), so the numeric
-      // frame field can't push the last key past the end where it's unreachable in
-      // preview — consistent with the Curves key drag. (A4)
-      if (patch.t !== undefined) merged.t = clampKeyTime(tr.keys, ki, merged.t, useEditorStore.getState().editingAnimationClip?.duration ?? Number.POSITIVE_INFINITY);
-      return merged;
-    });
-    return { ...tr, keys };
-  }, `editkey:${ti}:${ki}`), [mutateTrack]);
+  // Clamped to the clip duration too (default max is +Infinity), so the numeric frame field
+  // can't push the last key past the end where it's unreachable in preview — consistent with
+  // the Curves key drag. (A4) The merge, the clamp and the tangent re-derive live in
+  // `applyKeyPatch` so they are unit-testable; this keeps only the store read.
+  const editKey = useCallback((ti: number, ki: number, patch: Partial<Keyframe>) => mutateTrack(ti, (tr) => ({
+    ...tr,
+    keys: applyKeyPatch(tr.keys, ki, patch, useEditorStore.getState().editingAnimationClip?.duration ?? Number.POSITIVE_INFINITY),
+  }), `editkey:${ti}:${ki}`), [mutateTrack]);
   const setTangentMode = useCallback((ti: number, ki: number, mode: TangentMode) => mutateTrack(ti, (tr) => {
     const keys = tr.keys.map((k) => ({ ...k }));
     applyTangentMode(keys, ki, mode);
@@ -613,7 +715,7 @@ export default function AnimationEditor() {
     clipboardRef.current = cb;
     setHasClipboard(true);
     const n = [...byTrack.values()].reduce((s, kis) => s + kis.size, 0);
-    setSaveMsg(`Copied ${n} key${n > 1 ? 's' : ''}`);
+    setStatusMsg(`Copied ${n} key${n > 1 ? 's' : ''}`);
   }, [selectionByTrack]);
 
   const pasteKeys = useCallback(() => {
@@ -623,7 +725,7 @@ export default function AnimationEditor() {
     const plan = planPaste(cur, cb, { minGapFrames: PASTE_MIN_GAP_FRAMES, gapMarginFrames: PASTE_GAP_MARGIN_FRAMES });
     commit((c) => ({ ...c, duration: Math.max(c.duration, plan.duration), tracks: plan.tracks }), 'paste');
     setSel(new Set(plan.selection));
-    setSaveMsg(`Pasted ${cb.tracks.reduce((s, t) => s + t.keys.length, 0)} key(s) after original`);
+    setStatusMsg(`Pasted ${cb.tracks.reduce((s, t) => s + t.keys.length, 0)} key(s) after original`);
   }, [commit, setSel]);
 
   // ── Duplicate the selected keys in one step (Cmd/Ctrl+D + toolbar button) ──
@@ -639,7 +741,7 @@ export default function AnimationEditor() {
     const plan = planPaste(cur, cb, { minGapFrames: PASTE_MIN_GAP_FRAMES, gapMarginFrames: PASTE_GAP_MARGIN_FRAMES });
     commit((c) => ({ ...c, duration: Math.max(c.duration, plan.duration), tracks: plan.tracks }), 'duplicate');
     setSel(new Set(plan.selection));
-    setSaveMsg(`Duplicated ${cb.tracks.reduce((s, t) => s + t.keys.length, 0)} key(s)`);
+    setStatusMsg(`Duplicated ${cb.tracks.reduce((s, t) => s + t.keys.length, 0)} key(s)`);
   }, [commit, selectionByTrack, setSel]);
 
   // ── Keyboard nudge of the selected keys (arrows) ──
@@ -791,18 +893,10 @@ export default function AnimationEditor() {
       nudgeValueSelected, toggleBreakSelected, removeSelectedTracks, duplicateSelectedKeys,
       selectedTracks, selectedTrack, setViewport, hmrEpoch]);
 
-  // ── Debounced auto-save ──
-  const writeClip = useCallback((c: AnimationClipDef): Promise<boolean> => {
-    const path = asset?.path;
-    if (!path) return Promise.resolve(false);
-    setSaveMsg('Saving…');
-    return backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content: JSON.stringify(c, null, 2) }),
-    }).then((res) => { setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`); return res.ok; })
-      .catch((e) => { console.error('[AnimationEditor] auto-save failed', e); setSaveMsg('Save failed'); return false; });
-  }, [asset?.path]);
-  const { markSaved } = useDebouncedSave(clip, writeClip, AUTOSAVE_MS);
+  // ── Park the edit; Cmd+S writes it (#259) ──
+  // Watching the store's `clip` covers every mutation path — field edits, key drags, AND global
+  // undo/redo, which all rewrite editingAnimationClip.
+  const { markSaved, dirty } = useParkedAssetDoc(clip, asset?.path, 'animation');
   savedMarkRef.current = markSaved;
 
   const existingKeys = useMemo(
@@ -855,6 +949,9 @@ export default function AnimationEditor() {
     const guid = newGuid();
     const name = (path.split('/').pop() || 'Clip').replace(/\.anim\.json$/i, '');
     const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(defaultAnimationClip(guid, name), null, 2) }) }).then((r) => r.ok).catch(() => false);
+    // CREATE writes immediately (the file must exist for registerAsset/the manifest), so the file
+    // is authoritative — drop any parked write for that path.
+    if (ok) assetWrittenToDisk(path);
     if (!ok) return;
     registerAsset(guid, path, 'animation');
     const sel = useEditorStore.getState().selectedEntityId;
@@ -876,8 +973,8 @@ export default function AnimationEditor() {
     if (!path) return;
     const guid = cur?.id || getGuidForPath(path) || '';
     const name = (cur?.name || store.editingAnimationAsset?.name || 'clip').replace(/\.anim\.json$/i, '');
-    if (!bindClipToEntity(entityId, guid, name)) { setSaveMsg('⚠ Bind failed — see console'); return; }
-    setSaveMsg(`Bound to “${getAnimEntityIndex().byId.get(entityId)?.name || `#${entityId}`}”`);
+    if (!bindClipToEntity(entityId, guid, name)) { setStatusMsg('⚠ Bind failed — see console'); return; }
+    setStatusMsg(`Bound to “${getAnimEntityIndex().byId.get(entityId)?.name || `#${entityId}`}”`);
   }, []);
 
   if (!asset) {
@@ -909,7 +1006,7 @@ export default function AnimationEditor() {
           onDuplicateKeys={duplicateSelectedKeys} canDuplicateKeys={selectedKeys.size > 0}
           onUndo={() => gUndo()} onRedo={() => gRedo()}
           inPreview={inPreview} onExitPreview={exitPreview}
-          saveMsg={saveMsg}
+          dirty={dirty} statusMsg={statusMsg}
         />
       )}
       {rootId == null && (

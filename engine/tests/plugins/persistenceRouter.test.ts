@@ -39,6 +39,9 @@ function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
     firstRootDir: () => null,
     getManifest: () => ({ version: 2, assets: [] }) as Manifest,
     rebuildManifest: () => ({ version: 2, assets: [] }) as Manifest,
+    // Required by BackendContext: every write route fingerprints its own write so the
+    // watcher skips it. Absent here, /api/create-asset threw once its guard was added.
+    markEditorWrite: () => {},
     requestBrowser: async () => ({}),
     getSchema: () => undefined,
     invalidateProjectConfig: () => {},

@@ -26,6 +26,50 @@ function firePointer(type: string, x: number, y: number, pointerId = 1, target: 
   target.dispatchEvent(ev);
 }
 
+/** Like `firePointer`, but with a chosen `timeStamp` (ms). Needed to make VELOCITY happen at all:
+ *  `onPointerMove` only trusts a dt inside 1-64 ms, and two events constructed back to back in
+ *  jsdom carry near-identical timestamps, so the derivative is (correctly) discarded and every
+ *  velocity assertion would read 0 for a reason that has nothing to do with the code under test.
+ *  Same jsdom-internals route as `fireRealPointer`, and verified for the same reason. */
+function firePointerAtTime(type: string, x: number, y: number, pointerId: number, timeStamp: number): void {
+  const ev = new MouseEvent(type, { clientX: x, clientY: y, bubbles: true }) as MouseEvent & { pointerId: number };
+  (ev as { pointerId: number }).pointerId = pointerId;
+  const impl = Object.getOwnPropertySymbols(ev).find((sym) => sym.description === 'impl');
+  if (impl) (ev as unknown as Record<symbol, { timeStamp: number }>)[impl].timeStamp = timeStamp;
+  if (ev.timeStamp !== timeStamp) throw new Error('cannot set a timeStamp in this jsdom — the velocity assertions below would be vacuous');
+  window.dispatchEvent(ev);
+}
+
+/** A REAL finger/mouse: the same event, but `isTrusted` true at the moment `pointerSource` sees it.
+ *  Every event a test — or the device debug bridge — dispatches is untrusted, and that asymmetry is
+ *  exactly what `onPointerDown` keys the stale-gesture takeover on (#299), so a test of it has to be
+ *  able to state both sides.
+ *
+ *  Forging one takes two steps, and the second is the non-obvious one:
+ *    1. `isTrusted` is an own, NON-configurable accessor on the jsdom event, so `defineProperty`
+ *       throws — the only way in is jsdom's internal impl object, via its `impl` symbol.
+ *    2. `dispatchEvent` then sets it straight back to false (DOM spec: dispatch marks the event
+ *       untrusted). Setting it before dispatching therefore does NOTHING — measured, and it is why
+ *       the first version of these tests failed. So the event is dispatched on `document.body` and
+ *       re-forged from a CAPTURE listener on `window`, which runs before the source's own
+ *       bubble-phase listener.
+ *
+ *  Both steps are jsdom internals and may move, so the forge is VERIFIED inside the capture
+ *  listener: a jsdom that changes either throws there, rather than quietly delivering an untrusted
+ *  event and turning every takeover assertion below into a tautology that passes for the wrong
+ *  reason. */
+function fireRealPointer(type: string, x: number, y: number, pointerId = 1, target: EventTarget = document.body): void {
+  const ev = new MouseEvent(type, { clientX: x, clientY: y, bubbles: true });
+  (ev as unknown as { pointerId: number }).pointerId = pointerId;
+  const forge = (e: Event) => {
+    const impl = Object.getOwnPropertySymbols(e).find((sym) => sym.description === 'impl');
+    if (impl) (e as unknown as Record<symbol, { isTrusted: boolean }>)[impl].isTrusted = true;
+    if (!e.isTrusted) throw new Error('cannot forge a trusted event in this jsdom — the #299 takeover tests would be vacuous');
+  };
+  window.addEventListener(type, forge, { capture: true });
+  try { target.dispatchEvent(ev); } finally { window.removeEventListener(type, forge, { capture: true }); }
+}
+
 /** Sample the source into a fresh frame and derive the down-edge (as inputSystem does). */
 function sampleFrame(prev: { down: boolean }): InputFrame {
   const frame = createInputFrame();
@@ -122,7 +166,8 @@ describe('pointerSource', () => {
   });
 
   it('a press followed by moves BEFORE the next sample reports the press at its true down point, not the latest move', () => {
-    // Regression for the bug behind docs/todo.md's Court drag/tap-aim entries: level
+    // Regression for the bug behind Court's drag/tap-aim misses (the down/up FIFO —
+    // see this module's own EDGE LATCHING banner, which docs/input.md defers to): level
     // state alone reports the pressed edge at whatever position the LATEST move left
     // it at, corrupting the down point an aim/drag-origin reads. The FIFO must report
     // the down transition's own coordinates on the frame it drains, THEN fall back to
@@ -150,7 +195,8 @@ describe('pointerSource', () => {
   });
 
   it('a press+release that both happen between samples still yields a pressed edge then a released edge, not neither', () => {
-    // The unified root cause of both docs/todo.md bugs: an atomic gesture (down→moves→up)
+    // The unified root cause of both Court aim bugs above (down/up FIFO — pointerSource.ts's
+    // EDGE LATCHING banner): an atomic gesture (down→moves→up)
     // whose down and up land between two `inputSystem` ticks previously vanished — down
     // and up cancelled out, so NEITHER edge fired. The FIFO drains one transition per
     // sample, so a same-gap press+release now reports pressed on frame N and released on
@@ -265,7 +311,7 @@ describe('pointerSource', () => {
       // filtering at ingestion means the gesture never latches `activeId`, so its
       // later move/up already no-op via the existing pointerId!==activeId guard —
       // this is the "drag passes under a DOM HUD mid-gesture" and "board drag that
-      // started elsewhere" cases from docs/todo.md.
+      // started elsewhere" cases from docs/input.md.
       const root = document.createElement('div');
       const outside = document.createElement('div');
       document.body.append(root, outside);
@@ -505,5 +551,115 @@ describe('pointerSource', () => {
       expect(f.pointer.vx).toBe(0);
       expect(f.pointer.vy).toBe(0);
     });
+  });
+});
+
+describe('a stranded SYNTHETIC gesture yields to a real finger (#299)', () => {
+  /** THE FAILURE: the device debug bridge's `device_pointer {action:'down'}` presses and HOLDS by
+   *  design, so an agent that never sends the matching `up` leaves `activeId` latched. Every later
+   *  `pointerdown` — the human's finger included — then hits the `activeId !== null` early return,
+   *  and nothing recovers it: `blur`/`visibilitychange`/play-start resets do not fire in a running
+   *  shipped game. Measured on a Galaxy A23 while the owner was playing forest-camp: camera orbit
+   *  was dead for every real touch until a cold `am force-stop`. It presented as a product bug in
+   *  the feature under test, because the on-screen d-pad (which tracks its own pointerIds and never
+   *  consults this module) kept working. */
+  it('THE REGRESSION: a real press after an un-released synthetic one is NOT swallowed', () => {
+    pointerSource.attach();
+    const prev = { down: false };
+
+    firePointer('pointerdown', 10, 10, 1);      // synthetic press — no `up` ever comes
+    sampleFrame(prev);
+
+    fireRealPointer('pointerdown', 300, 400, 7); // the human's finger, a different pointerId
+    // The stale gesture is closed out first, so down/up alternation holds and no edge is swallowed.
+    let f = sampleFrame(prev);
+    expect(f.pointer.down).toBe(false);
+    expect(f.pointer.released).toBe(true);
+    f = sampleFrame(prev);
+    expect(f.pointer.down).toBe(true);
+    expect(f.pointer.pressed).toBe(true);
+    expect(f.pointer.x).toBe(300);
+    expect(f.pointer.y).toBe(400);
+
+    // And the finger genuinely OWNS the gesture now — its own move/up are tracked.
+    fireRealPointer('pointermove', 300, 460, 7);
+    f = sampleFrame(prev);
+    expect(f.pointer.dragY).toBe(60);
+    fireRealPointer('pointerup', 300, 460, 7);
+    f = sampleFrame(prev);
+    expect(f.pointer.released).toBe(true);
+  });
+
+  it('a REAL gesture in progress is never stolen — the primary-touch rule still holds', () => {
+    // The takeover must not become a general "last pointer wins": a second finger landing mid-drag
+    // is exactly what the primary-touch rule exists to ignore.
+    pointerSource.attach();
+    const prev = { down: false };
+
+    fireRealPointer('pointerdown', 100, 100, 1);
+    sampleFrame(prev);
+    fireRealPointer('pointerdown', 300, 400, 2); // second finger
+    const f = sampleFrame(prev);
+    expect(f.pointer.x).toBe(100);               // still the first finger's gesture
+    expect(f.pointer.down).toBe(true);
+    expect(f.pointer.released).toBe(false);
+  });
+
+  it('a synthetic press does not steal a real one either — the finger owns it', () => {
+    pointerSource.attach();
+    const prev = { down: false };
+
+    fireRealPointer('pointerdown', 100, 100, 1);
+    sampleFrame(prev);
+    firePointer('pointerdown', 300, 400, 9);     // the bridge, arriving mid-gesture
+    const f = sampleFrame(prev);
+    expect(f.pointer.x).toBe(100);
+    expect(f.pointer.released).toBe(false);
+  });
+
+  it('a takeover that is then BLOCKED still leaves velocity at zero, as a release must', () => {
+    // The drifted-copy bug: the takeover used to clear activeId/down by hand and skip the velocity
+    // and filter reset `onPointerUp` does. The blocked-root check `return`s between the takeover and
+    // the new latch, so nothing downstream cleaned up — the frame then published `down:false` with a
+    // NON-ZERO vx/vy, which `pointerPredictedPos` extrapolates from. Both paths now share
+    // `endGesture()`, so this can only regress by editing that one function.
+    pointerSource.attach();
+    const blocked = document.createElement('div');
+    document.body.appendChild(blocked);
+    registerPointerBlocker(blocked);
+    const prev = { down: false };
+
+    firePointerAtTime('pointerdown', 10, 10, 1, 1000);  // stranded synthetic press
+    sampleFrame(prev);
+    firePointerAtTime('pointermove', 90, 90, 1, 1016);  // +16 ms — inside the usable dt band
+    const moved = sampleFrame(prev);
+    expect(Math.hypot(moved.pointer.vx, moved.pointer.vy)).toBeGreaterThan(0);
+
+    fireRealPointer('pointerdown', 300, 400, 7, blocked); // a real finger, on a blocked root
+
+    const f = sampleFrame(prev);
+    expect(f.pointer.down).toBe(false);             // the stale gesture was released
+    expect(f.pointer.released).toBe(true);
+    expect(f.pointer.vx).toBe(0);                   // …and released means NOT moving
+    expect(f.pointer.vy).toBe(0);
+    document.body.removeChild(blocked);
+  });
+
+  it('a synthetic gesture that IS released needs no takeover — the next press is ordinary', () => {
+    // The balanced case, which is the common one: both bridge paths send a matching pointerId, so
+    // `up` clears `activeId` on its own. Pinned so the takeover cannot be mistaken for the mechanism
+    // that makes normal synthetic input work.
+    pointerSource.attach();
+    const prev = { down: false };
+
+    firePointer('pointerdown', 10, 10, 1);
+    sampleFrame(prev);
+    firePointer('pointerup', 10, 10, 1);
+    sampleFrame(prev);
+
+    firePointer('pointerdown', 50, 50, 1);
+    const f = sampleFrame(prev);
+    expect(f.pointer.down).toBe(true);
+    expect(f.pointer.x).toBe(50);
   });
 });

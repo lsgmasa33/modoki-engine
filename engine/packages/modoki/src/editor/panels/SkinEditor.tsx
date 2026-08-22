@@ -3,9 +3,10 @@
  *
  *  Architecture mirrors SpriteAnimEditor/ParticleEditor: the live rig def is the single
  *  source of truth in the editor store, so the GLOBAL undo stack applies edits even when
- *  this panel is unfocused; persistence is a debounced `/api/write-file`, and each edit
- *  re-seeds the shared rig2dCache (setRig2D) so any live SkinnedSprite2D referencing this
- *  asset re-skins next frame (spatial posing stays in the SceneView gizmo).
+ *  this panel is unfocused; the rig document is PARKED in the dirty-asset registry and written
+ *  by Cmd+S (Save All) — see useParkedAssetDoc.ts (#259) — and each edit re-seeds the shared
+ *  rig2dCache (setRig2D) so any live SkinnedSprite2D referencing this asset re-skins next frame
+ *  (spatial posing stays in the SceneView gizmo).
  *
  *  MVP scope: retarget to a selected/opened rig; show its sprite + bones + mesh stats;
  *  regenerate the mesh (Re-tessellate at a chosen grid density) and recompute weights
@@ -15,7 +16,7 @@
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath, getGuidForPath } from '../../runtime/loaders/assetManifest';
-import { deriveGuid } from '../../runtime/core/assetRefRules';
+import { wholeImageSpriteRef } from './spritePickerGroups';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
 import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
@@ -27,7 +28,9 @@ import SkinBoneList from './SkinBoneList';
 import { autoRig2D } from '../../runtime/skinning/rig2dBuild';
 import { spriteThumbStyle } from './SpritePicker';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { useDebouncedSave } from './useDebouncedSave';
+import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
+import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
+import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { AssetRefField, assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { makeRigPrefabAsset } from '../scene/skinPrefab';
@@ -35,8 +38,9 @@ import { removeBone } from '../../runtime/skinning/rig2dEdit';
 import { activePartOf, withActivePart, partsOf, partCount, addPart, removePart, reorderPart, reorderActiveIndex, renamePart, uvToPosAffine, partAngle, bboxCenter } from './skinParts';
 import { pushAction, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
 import { BufferedNumberInput, inputStyle } from './fields';
+import { getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
+import { decideSkinPartAssetDrop, skinPartAcceptsAsset } from './assetDropPolicy';
 
-const AUTOSAVE_MS = 400;
 
 /** Derive width/height/pivot in texture space from the current mesh's vertex bounds,
  *  so Re-tessellate can regenerate a grid over the same region without a texture fetch. */
@@ -97,6 +101,67 @@ async function resolveSpriteDomain(spriteGuid: string | undefined, fallbackVerts
   return { width: b.width, height: b.height, pivotX: b.pivotX, pivotY: b.pivotY };
 }
 
+/** Inline part-name field (list row + inspector). Same class of bug as
+ *  `components/RenameInput.tsx` (#233): Chromium only dispatches focus/blur while
+ *  `document.hasFocus()`, so an agent-driven session (window never OS-focused) would see
+ *  an Enter → `.blur()` → `onBlur`-commits chain silently do nothing. Enter here commits
+ *  DIRECTLY, and Escape closes/reverts directly too — neither depends on a blur event
+ *  reaching this field, matching the qa/knowledge.md §5 rule.
+ *
+ *  Extracted (rather than inlined per call site) because a naive "commit(); blur();" is
+ *  NOT idempotent: when the window IS focused the trailing blur() fires onBlur in the
+ *  SAME synchronous tick as the Enter handler, before React has re-rendered — so a
+ *  re-check against the `initial` PROP would still see the OLD (pre-rename) value and
+ *  push a second, identical rename onto the undo stack. `lastCommittedRef` guards this
+ *  without depending on a focus event to reset it (a `doneRef`-style one-shot lock would:
+ *  the inspector call site keeps this field mounted across a rename — same `key` — so a
+ *  lock that only clears `onFocus` would silently brick every edit after the first in an
+ *  unfocused window, where refocusing never fires that event either). */
+function InlineNameField({ initial, onCommit, onDone, autoFocus, style, uiId }: {
+  initial: string;
+  onCommit: (name: string) => void;
+  /** Called after either commit or cancel — the inline list-row editor uses this to close
+   *  itself (`setEditingPart(null)`); the inspector field has none. */
+  onDone?: () => void;
+  autoFocus?: boolean;
+  style?: React.CSSProperties;
+  uiId?: string;
+}) {
+  const lastCommittedRef = useRef<string | null>(null);
+  // Clear the latch whenever the value changes from OUTSIDE (undo, another panel, a
+  // reselect). It exists only to swallow the trailing blur that Enter fires in the SAME
+  // synchronous tick, and that window closes at the next render — held any longer it
+  // becomes the very bug this fix removes: re-entering a previously-committed value
+  // after an external change would compare equal to the latch and silently do nothing.
+  useEffect(() => { lastCommittedRef.current = null; }, [initial]);
+  const commit = (raw: string) => {
+    const n = raw.trim();
+    if (n && n !== initial && n !== lastCommittedRef.current) {
+      lastCommittedRef.current = n;
+      onCommit(n);
+    }
+    onDone?.();
+  };
+  return (
+    <input
+      data-ui-id={uiId} data-ui-kind="field" data-ui-label="name"
+      autoFocus={autoFocus}
+      defaultValue={initial}
+      onClick={onDone ? (e) => e.stopPropagation() : undefined}
+      onBlur={(e) => commit(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') { e.preventDefault(); commit(e.currentTarget.value); e.currentTarget.blur(); }
+        else if (e.key === 'Escape') {
+          e.preventDefault();
+          e.currentTarget.value = initial;
+          if (onDone) onDone(); else e.currentTarget.blur();
+        }
+      }}
+      style={style}
+    />
+  );
+}
+
 export default function SkinEditor() {
   const asset = useEditorStore((s) => s.editingSkinAsset);
   const nonce = useEditorStore((s) => s.skinEditNonce);
@@ -155,8 +220,29 @@ export default function SkinEditor() {
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingSkinDef;
-    if (existing) { savedMarkRef.current?.(existing); return; } // bare re-mount — keep unsaved edits
+    if (existing) {
+      // ⚠️ "In sync" means EQUAL TO DISK, and a parked write means it is not. This branch marked
+      // `existing` as the saved baseline unconditionally, so re-entering the effect while a write
+      // was pending told the hook the pending doc was already written — and its reconciliation
+      // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
+      // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
+      // it returns HERE and never reaches the pendingAssetDoc branch below.
+      if (!pendingAssetDoc(asset.path, 'rig2d')) savedMarkRef.current?.(existing);
+      return;   // either way the loaded doc stays — that is what this branch is for
+    }
     const { loadSkinDef } = useEditorStore.getState();
+    // An UNSAVED write parked for this rig is not on disk yet, so fetching the file would open the
+    // PRE-edit doc and re-seed the live cache with it (QA-CTX-0008). Since #259 the PANEL parks
+    // too, so without this, closing and reopening the panel silently discards the human's own
+    // unsaved bone/weight/part edits. Marked saved because it is parked, not written.
+    const parked = pendingAssetDoc(asset.path, 'rig2d') as Rig2DFile | null;
+    if (parked) {
+      if (!parked.id) parked.id = newGuid();
+      registerAsset(parked.id, asset.path, 'rig2d');
+      adoptParkedDoc(asset.path, 'rig2d', parked);
+      loadSkinDef(parked);
+      return;
+    }
     fetch(asset.path)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((json: Rig2DFile) => {
@@ -179,6 +265,13 @@ export default function SkinEditor() {
     if (!before || !path) return;
     const a: UndoAction = {
       label: `rig2d ${label}`,
+      // Asset-document edit: it changes a .rig2d.json file, NOT any scene entity, so it must not
+      // bump the scene's edit-version. Its unsaved state is tracked by the dirty-asset registry
+      // (hasUnsavedChanges ORs both), and a falsely-dirty SCENE is not cosmetic — it self-blocks
+      // the file-direct agent routes, makes modoki_build refuse, and (since #259) makes Cmd+S
+      // interrupt a preview and rewrite the scene file on every save while authoring. The agent
+      // twins have set this since S2.27; the panels never did.
+      _isFileDirect: true,
       undo: () => useEditorStore.getState().applySkinDef(path, before),
       redo: () => useEditorStore.getState().applySkinDef(path, next),
     };
@@ -268,16 +361,32 @@ export default function SkinEditor() {
   // (all selected paths, any view mode); a single drag also carries 'application/editor-asset'
   // {type,path,name,guid}. Keep only image assets and resolve each to a GUID (refs must be GUIDs).
   const resolveDroppedSprites = useCallback((e: React.DragEvent): string[] => {
-    const isImage = (p: string, type?: string) => type === 'sprite' || type === 'texture' || /\.(png|jpe?g|webp)$/i.test(p);
+    // The SAME predicate the dragover handlers below refuse with — a second, hand-copied
+    // copy here is exactly how the affordance and the action drift apart (#306).
+    const isImage = (p: string, type?: string) => skinPartAcceptsAsset({ type: type ?? null, path: p });
     // A part.sprite ref must be a SPRITE guid, never a raw texture guid — a dropped texture
-    // resolves to its derived whole-image sprite (matches SpritePicker's "whole" button); an
-    // explicit sprite slice passes through unchanged. (assetRefIntegrity guards this invariant.)
-    const toSpriteGuid = (guid: string): string => (getAssetEntry(guid)?.type === 'texture' ? deriveGuid('sprite:' + guid) : guid);
+    // resolves to its derived whole-image sprite; an explicit sprite slice passes through
+    // unchanged. (assetRefIntegrity guards this invariant.)
+    //
+    // The derived guid is only REAL for a texture with no explicit slices: the scanner emits
+    // the whole-image `#default` sprite in the branch that is mutually exclusive with the
+    // sliced one, so deriving it for a `spriteMode:'multiple'` sheet yields a guid with no
+    // manifest entry — a dead ref that renders nothing and logs nothing. Same defect the
+    // SpritePicker's "whole" button had (QA-INSP-0011); this was its second site. So ask the
+    // manifest whether the sprite exists rather than re-deriving the scanner's emit rule, and
+    // drop the drop with a reason instead of assigning a ref that cannot resolve.
+    const toSpriteGuid = (guid: string): string => {
+      if (getAssetEntry(guid)?.type !== 'texture') return guid;
+      const whole = wholeImageSpriteRef(guid, getAssetEntry);
+      if (whole) return whole;
+      console.warn(`[SkinEditor] "${resolveGuidToPath(guid) ?? guid}" is a SLICED spritesheet — it has no whole-image sprite to assign. Drop one of its slices instead (Assets panel → the texture's slices).`);
+      return '';
+    };
     const pathsRaw = e.dataTransfer.getData('application/editor-asset-paths');
     if (pathsRaw) {
       try {
         const paths = (JSON.parse(pathsRaw) as string[]).filter((p) => isImage(p));
-        if (paths.length > 1) return paths.map((p) => getGuidForPath(p)).filter((g): g is string => !!g).map(toSpriteGuid);
+        if (paths.length > 1) return paths.map((p) => getGuidForPath(p)).filter((g): g is string => !!g).map(toSpriteGuid).filter(Boolean);
       } catch { /* fall through to the single payload */ }
     }
     const raw = e.dataTransfer.getData('application/editor-asset');
@@ -286,7 +395,7 @@ export default function SkinEditor() {
     if (!isImage(path, type)) return [];
     const resolved = guid || getGuidForPath(path);
     if (!resolved) { console.warn(`[SkinEditor] "${path}" has no GUID yet — refresh the Assets panel and drop again.`); return []; }
-    return [toSpriteGuid(resolved)];
+    return [toSpriteGuid(resolved)].filter(Boolean);
   }, []);
 
   // Append a new part per sprite (each named after its asset, auto-tessellated). Sequential so
@@ -443,6 +552,7 @@ export default function SkinEditor() {
     const doc: Rig2DFile = { id: guid, sprite: '', bones: [{ name: 'root', parent: -1, x: 0, y: 0, rot: 0 }], mesh: { verts: [], uvs: [], tris: [] }, skinIndices: [], skinWeights: [] };
     const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(doc, null, 2) }) }).then((r) => r.ok).catch(() => false);
     if (!ok) return;
+    assetWrittenToDisk(path); // CREATE writes the file directly → it is authoritative over any park
     registerAsset(guid, path, 'rig2d');
     const name = (path.split('/').pop() || 'Rig').replace(/\.rig2d\.json$/i, '');
     useEditorStore.getState().openSkinEditor({ path, type: 'rig2d', name });
@@ -477,6 +587,11 @@ export default function SkinEditor() {
     const rigPath = sel.path.replace(/\.(png|jpe?g|webp|gif)$/i, '') + '.rig2d.json';
     const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: rigPath, content: JSON.stringify(rig, null, 2) }) }).then((r) => r.ok).catch(() => false);
     if (!ok) return;
+    // ⚠️ The one path where this REALLY matters: `rigPath` is DERIVED from the sprite, so
+    // auto-rigging the same sprite twice regenerates over a rig that may already have unsaved
+    // edits parked. The freshly generated file is authoritative — drop the park, loudly, or the
+    // next save flushes the old rig straight back over it.
+    assetWrittenToDisk(rigPath);
     registerAsset(rigGuid, rigPath, 'rig2d');
     const name = (rigPath.split('/').pop() || 'Rig').replace(/\.rig2d\.json$/i, '');
     useEditorStore.getState().openSkinEditor({ path: rigPath, type: 'rig2d', name });
@@ -500,18 +615,13 @@ export default function SkinEditor() {
       : 'Prefab created ✓ — drag it from Assets into a Canvas2D');
   }, []);
 
-  // ── Debounced auto-save (watches the store def → covers edits + undo/redo) ──
-  const writeDef = useCallback((d: Rig2DFile): Promise<boolean> => {
-    const path = asset?.path;
-    if (!path) return Promise.resolve(false);
-    setSaveMsg('Saving…');
-    return backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content: JSON.stringify(d, null, 2) }),
-    }).then((res) => { setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`); return res.ok; })
-      .catch((e) => { console.error('[SkinEditor] auto-save failed', e); setSaveMsg('Save failed'); return false; });
-  }, [asset?.path]);
-  const { markSaved } = useDebouncedSave(def, writeDef, AUTOSAVE_MS);
+  // ── Park the edit; Cmd+S writes it (#259) ──
+  // Watches the store def, so it covers edits AND global undo/redo. The flush passes
+  // `replace:true` for a panel-origin write, which this panel specifically needs: the first
+  // structural part edit on a v1 rig runs `ensurePartsArray` (skinParts.ts), moving
+  // sprite/mesh/skinIndices/skinWeights into `parts[]` — a write that DROPS four top-level keys,
+  // which /api/asset-write refuses by default.
+  const { markSaved, dirty } = useParkedAssetDoc(def, asset?.path, 'rig2d');
   savedMarkRef.current = markSaved;
 
   const bones = coerceRigBones(def?.bones);
@@ -546,14 +656,21 @@ export default function SkinEditor() {
       <>
         <div style={inspectorHeadStyle}>
           <span style={{ ...inspectorKind, color: paintMode ? '#7a9c5a' : '#5a7a9a' }}>{paintMode ? 'Bone · pose' : 'Bone'}</span>
-          <input key={`b${selBone}`} defaultValue={b.name} onBlur={(e) => setBoneName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); else if (e.key === 'Escape') { e.currentTarget.value = b.name; e.currentTarget.blur(); } }}
+          {/* Enter commits DIRECTLY rather than routing through blur() — Chromium only
+              dispatches focus/blur while `document.hasFocus()`, so an agent-driven session
+              (window never OS-focused) would otherwise see the commit silently never run
+              (#233). The trailing blur() below still fires onBlur when the window IS
+              focused, re-running setBoneName with the same (now-committed) value — harmless,
+              since setBoneName reads the LIVE store and no-ops when the name already
+              matches (no double undo entry). */}
+          <input data-ui-id="skin.inspector.boneName" data-ui-kind="field" data-ui-label="bone name" key={`b${selBone}`} defaultValue={b.name} onBlur={(e) => setBoneName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); setBoneName(e.currentTarget.value); e.currentTarget.blur(); } else if (e.key === 'Escape') { e.currentTarget.value = b.name; e.currentTarget.blur(); } }}
             style={nameInputStyle} />
         </div>
         {poseActive && (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
             <span style={{ color: '#9c6', fontSize: 10 }}>Test pose{testPose[selBone] ? ' *' : ''} (preview)</span>
-            <button onClick={() => setTestPose(() => ({}))} title="Reset the test pose to bind" style={{ background: '#2a2a40', color: '#bbb', border: '1px solid #444', borderRadius: 3, padding: '1px 6px', cursor: 'pointer', fontFamily: 'monospace', fontSize: 10 }}>reset</button>
+            <button data-ui-id="skin.inspector.pose.reset" data-ui-kind="button" data-ui-label="reset test pose" onClick={() => setTestPose(() => ({}))} title="Reset the test pose to bind" style={{ background: '#2a2a40', color: '#bbb', border: '1px solid #444', borderRadius: 3, padding: '1px 6px', cursor: 'pointer', fontFamily: 'monospace', fontSize: 10 }}>reset</button>
           </div>
         )}
         <div style={{ ...inspectorBox, border: `1px solid ${paintMode ? '#3a5a2a' : '#2a2a3a'}` }}>
@@ -577,14 +694,14 @@ export default function SkinEditor() {
       {bones.length === 0 ? <div style={{ color: '#777', fontSize: 10, marginBottom: 4 }}>No bones yet — add bones in Rig mode.</div> : (
         <>
           <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 3 }}><span style={{ ...lbl, width: 40 }}>radius</span>
-            <input type="range" min={0} max={awRadiusMax} step={2} value={awRadius} onChange={(e) => setAwRadius(+e.target.value)} style={{ flex: 1, minWidth: 0, accentColor: '#4a9eff' }} />
+            <input data-ui-id="skin.autoWeight.radius" data-ui-kind="slider" data-ui-label="auto-weight radius" type="range" min={0} max={awRadiusMax} step={2} value={awRadius} onChange={(e) => setAwRadius(+e.target.value)} style={{ flex: 1, minWidth: 0, accentColor: '#4a9eff' }} />
             <span style={{ color: '#999', width: 30, textAlign: 'right', fontSize: 10 }}>{awRadius > 0 ? Math.round(awRadius) : 'auto'}</span></div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 4 }}><span style={{ ...lbl, width: 40 }}>falloff</span>
-            <input type="range" min={0.5} max={4} step={0.1} value={awFalloff} onChange={(e) => setAwFalloff(+e.target.value)} style={{ flex: 1, minWidth: 0, accentColor: '#4a9eff' }} />
+            <input data-ui-id="skin.autoWeight.falloff" data-ui-kind="slider" data-ui-label="auto-weight falloff" type="range" min={0.5} max={4} step={0.1} value={awFalloff} onChange={(e) => setAwFalloff(+e.target.value)} style={{ flex: 1, minWidth: 0, accentColor: '#4a9eff' }} />
             <span style={{ color: '#999', width: 30, textAlign: 'right', fontSize: 10 }}>{awFalloff.toFixed(1)}</span></div>
         </>
       )}
-      <button onClick={reWeight} disabled={!verts.length || !bones.length} title="Recompute per-vertex weights for the current mesh + bones" style={{ ...btn, width: '100%', marginTop: 2, opacity: (!verts.length || !bones.length) ? 0.5 : 1 }}>Auto-weight</button>
+      <button data-ui-id="skin.autoWeight.run" data-ui-kind="button" data-ui-label="auto-weight" onClick={reWeight} disabled={!verts.length || !bones.length} title="Recompute per-vertex weights for the current mesh + bones" style={{ ...btn, width: '100%', marginTop: 2, opacity: (!verts.length || !bones.length) ? 0.5 : 1 }}>Auto-weight</button>
     </div>
   );
 
@@ -595,13 +712,13 @@ export default function SkinEditor() {
         <div style={{ margin: 'auto', textAlign: 'center', color: '#555' }}>
           {spriteSel && (
             <div style={{ marginBottom: 16 }}>
-              <button onClick={autoRigSelected} style={{ ...btn, padding: '7px 16px', background: '#20361f', borderColor: '#3a7a44', color: '#cfe' }}>⚙ Auto-rig “{spriteSel.name}”</button>
+              <button data-ui-id="skin.empty.autoRig" data-ui-kind="button" data-ui-label="auto-rig selected sprite" onClick={autoRigSelected} style={{ ...btn, padding: '7px 16px', background: '#20361f', borderColor: '#3a7a44', color: '#cfe' }}>⚙ Auto-rig “{spriteSel.name}”</button>
               <div style={{ fontSize: 10, color: '#666', marginTop: 5 }}>generate a mesh + bones + weights from this sprite</div>
             </div>
           )}
           <div>Double-click a .rig2d.json in Assets to edit its rig,</div>
           <div style={{ marginTop: 6 }}>or</div>
-          <button onClick={newRig} style={{ ...btn, marginTop: 8, padding: '6px 14px' }}>+ New Rig</button>
+          <button data-ui-id="skin.empty.newRig" data-ui-kind="button" data-ui-label="new rig" onClick={newRig} style={{ ...btn, marginTop: 8, padding: '6px 14px' }}>+ New Rig</button>
         </div>
       </div>
     );
@@ -610,17 +727,18 @@ export default function SkinEditor() {
   return (
     <div style={panelStyle}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, flexShrink: 0 }}>
-        <button onClick={() => useEditorStore.getState().closeSkinEditor()} title="Close rig (back to the picker)" style={{ ...btn, padding: '1px 7px' }}>✕</button>
+        <button data-ui-id="skin.header.close" data-ui-kind="button" data-ui-label="close rig" onClick={() => useEditorStore.getState().closeSkinEditor()} title="Close rig (back to the picker)" style={{ ...btn, padding: '1px 7px' }}>✕</button>
         <span style={{ fontWeight: 'bold', color: '#ddd', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{asset.name}</span>
-        <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#2ecc71' }}>{saveMsg || 'Auto-save'}</span>
+        {saveMsg && <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#8a8a96' }}>{saveMsg}</span>}
+        <span style={{ fontSize: 10, color: dirty ? '#f1c40f' : '#2ecc71' }}>{saveStatusLabel(dirty)}</span>
       </div>
 
       {/* Toolbar: one-click auto-rig + undo/redo. */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, flexShrink: 0 }}>
-        <button onClick={autoRigActive} title="One click: auto-place a bone chain + tessellate + auto-weight the active part from its sprite" style={{ ...btn, background: '#20361f', borderColor: '#3a7a44', color: '#cfe' }}>⚙ Auto-rig</button>
+        <button data-ui-id="skin.toolbar.autoRig" data-ui-kind="button" data-ui-label="auto-rig active part" onClick={autoRigActive} title="One click: auto-place a bone chain + tessellate + auto-weight the active part from its sprite" style={{ ...btn, background: '#20361f', borderColor: '#3a7a44', color: '#cfe' }}>⚙ Auto-rig</button>
         <div style={{ flex: 1 }} />
-        <button onClick={() => gUndo()} title="Undo (⌘Z)" style={btn}>↶</button>
-        <button onClick={() => gRedo()} title="Redo (⇧⌘Z)" style={btn}>↷</button>
+        <button data-ui-id="skin.toolbar.undo" data-ui-kind="button" data-ui-label="undo" onClick={() => gUndo()} title="Undo (⌘Z)" style={btn}>↶</button>
+        <button data-ui-id="skin.toolbar.redo" data-ui-kind="button" data-ui-label="redo" onClick={() => gRedo()} title="Redo (⇧⌘Z)" style={btn}>↷</button>
       </div>
 
       {/* Top row — two columns: Parts group (part list) | Bones group (bone list). */}
@@ -629,21 +747,29 @@ export default function SkinEditor() {
         <div style={groupColStyle}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', minWidth: 0 }} title={allPartsVisible ? 'Hide all parts in the canvas preview' : 'Show all parts in the canvas preview'}>
-              <input type="checkbox" checked={allPartsVisible} ref={(el) => { if (el) el.indeterminate = somePartsHidden; }}
+              <input data-ui-id="skin.parts.visibleAll" data-ui-kind="toggle" data-ui-label="show all parts" type="checkbox" checked={allPartsVisible} ref={(el) => { if (el) el.indeterminate = somePartsHidden; }}
                 onChange={() => useEditorStore.getState().setSkinPreviewHidden(allPartsVisible ? parts.map((_, i) => i) : [])}
                 style={{ accentColor: '#4a9eff', cursor: 'pointer' }} />
               <span style={sectionLabel}>Parts ({parts.length})</span>
               <InfoDot tip="Each part is a sprite + its own mesh; all parts share one skeleton. Click a part to make it active (mesh/weights ops target it). The checkbox hides a part in THIS canvas only — it never affects the game or scene view." />
             </label>
-            <button onClick={addPartAction} title="Add a new empty part" style={{ ...btn, padding: '0px 7px', fontSize: 12 }}>＋</button>
+            <button data-ui-id="skin.parts.add" data-ui-kind="button" data-ui-label="add part" onClick={addPartAction} title="Add a new empty part" style={{ ...btn, padding: '0px 7px', fontSize: 12 }}>＋</button>
           </div>
           <div style={{ ...columnListStyle, outline: dropOverPart === -1 ? '2px solid #3498db' : 'none' }}
             onDragOver={(e) => {
               const t = e.dataTransfer.types;
               if (t.includes('application/skin-part')) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; if (reorderOverPart !== parts.length - 1) setReorderOverPart(parts.length - 1); }
-              else if (t.includes('application/editor-asset')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; if (dropOverPart !== -1) setDropOverPart(-1); }
+              else if (t.includes('application/editor-asset')) {
+                // A non-image asset is REFUSED rather than accepted-then-discarded (#306):
+                // returning without preventDefault leaves the browser's no-drop cursor up and
+                // keeps the list un-outlined, and the ghost says which kinds would work.
+                const { accept, refusal } = decideSkinPartAssetDrop(true, getAssetDragInfo());
+                setDragGhostRefusal(refusal);
+                if (!accept) { if (dropOverPart !== null) setDropOverPart(null); return; }
+                e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; if (dropOverPart !== -1) setDropOverPart(-1);
+              }
             }}
-            onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) { setDropOverPart(null); setReorderOverPart(null); } }}
+            onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) { setDropOverPart(null); setReorderOverPart(null); setDragGhostRefusal(null); } }}
             onDrop={(e) => {
               if (e.dataTransfer.types.includes('application/skin-part')) {
                 e.preventDefault();
@@ -664,7 +790,13 @@ export default function SkinEditor() {
                 onDragOver={(e) => {
                   const t = e.dataTransfer.types;
                   if (t.includes('application/skin-part')) { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'move'; if (reorderOverPart !== i) setReorderOverPart(i); }
-                  else if (t.includes('application/editor-asset')) { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'copy'; if (dropOverPart !== i) setDropOverPart(i); }
+                  else if (t.includes('application/editor-asset')) {
+                    // Refuse a non-image asset outright — see the list container above and #306.
+                    const { accept, refusal } = decideSkinPartAssetDrop(true, getAssetDragInfo());
+                    setDragGhostRefusal(refusal);
+                    if (!accept) { if (dropOverPart !== null) setDropOverPart(null); return; }
+                    e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'copy'; if (dropOverPart !== i) setDropOverPart(i);
+                  }
                 }}
                 onDrop={(e) => {
                   if (e.dataTransfer.types.includes('application/skin-part')) {
@@ -680,16 +812,23 @@ export default function SkinEditor() {
                   setDropOverPart(null); onPartDrop(e, i);
                 }}
                 style={{ display: 'flex', alignItems: 'center', gap: 3, padding: '1px 3px', cursor: 'pointer', outline: i === dropOverPart ? '2px solid #3498db' : 'none', boxShadow: reorderOverPart === i && dragPart !== null && dragPart !== i ? 'inset 0 2px 0 #2ecc71' : 'none', opacity: dragPart === i ? 0.4 : 1, background: i === activePart ? '#20303f' : 'transparent' }}>
-                <input type="checkbox" checked={!previewHidden.includes(i)} onClick={(e) => e.stopPropagation()}
+                <input data-ui-id={`skin.parts.row.${i}.visible`} data-ui-kind="toggle" data-ui-label={`show part ${p.name}`} type="checkbox" checked={!previewHidden.includes(i)} onClick={(e) => e.stopPropagation()}
                   onChange={(e) => { e.stopPropagation(); useEditorStore.getState().toggleSkinPreviewPart(i); }}
                   title={previewHidden.includes(i) ? 'Show in canvas preview' : 'Hide in canvas preview'} style={{ accentColor: '#4a9eff', cursor: 'pointer', margin: '0 2px' }} />
                 {editingPart === i ? (
-                  <input autoFocus defaultValue={p.name} onClick={(e) => e.stopPropagation()}
-                    onBlur={(e) => { const n = e.target.value.trim(); if (n && n !== p.name) partAction(renamePart(def!, i, n), 'rename part'); setEditingPart(null); }}
-                    onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); else if (e.key === 'Escape') { e.currentTarget.value = p.name; e.currentTarget.blur(); } }}
+                  <InlineNameField autoFocus initial={p.name}
+                    onCommit={(n) => partAction(renamePart(def!, i, n), 'rename part')}
+                    onDone={() => setEditingPart(null)}
+                    uiId={`skin.parts.row.${i}.name`}
                     style={{ flex: 1, minWidth: 0, background: '#0e0e16', color: '#ccc', border: '1px solid #3a6a8a', borderRadius: 3, padding: '1px 4px', fontFamily: 'monospace', fontSize: 11 }} />
                 ) : (
+                  /* The GATE for `skin.parts.row.${i}.name`: that field only exists while
+                     `editingPart === i`, and this span is the only thing that sets it. Untagged,
+                     it made the rename field a dead id — the third instance of that pattern in
+                     this pass (see SubSection and FindReferencesDialog). `clickCount:2` here is
+                     how an agent opens it. */
                   <span onDoubleClick={(e) => { e.stopPropagation(); setEditingPart(i); }}
+                    data-ui-id={`skin.parts.row.${i}.rename`} data-ui-kind="button" data-ui-label={`rename ${p.name}`}
                     style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: i === activePart ? '#cde' : (previewHidden.includes(i) ? '#666' : '#bbb') }} title={`${p.name} — double-click to rename`}>{p.name}</span>
                 )}
                 {/* ↑/↓ go through `reorderParts`, the SAME entry point as drag-reorder, because it is
@@ -700,9 +839,9 @@ export default function SkinEditor() {
                     `withActivePart(def, activeSkinPart)`, the next edit landed on the wrong part's
                     mesh. A move by one IS `reorderPart(i, i±1)`, so there is nothing left for a
                     separate helper to do. */}
-                <button onClick={(e) => { e.stopPropagation(); reorderParts(i, i - 1); }} title="Move back" disabled={i === 0} style={{ ...eyeBtn, opacity: i === 0 ? 0.3 : 1 }}>↑</button>
-                <button onClick={(e) => { e.stopPropagation(); reorderParts(i, i + 1); }} title="Move front" disabled={i === parts.length - 1} style={{ ...eyeBtn, opacity: i === parts.length - 1 ? 0.3 : 1 }}>↓</button>
-                <button onClick={(e) => { e.stopPropagation(); if (parts.length > 1) { partAction(removePart(def!, i), 'remove part'); const na = i < activePart ? activePart - 1 : activePart; useEditorStore.getState().setActiveSkinPart(Math.min(na, parts.length - 2)); } }} title="Remove part" disabled={parts.length <= 1} style={{ ...eyeBtn, color: '#c66', opacity: parts.length <= 1 ? 0.3 : 1 }}>✕</button>
+                <button data-ui-id={`skin.parts.row.${i}.up`} data-ui-kind="button" data-ui-label={`move part ${p.name} back`} onClick={(e) => { e.stopPropagation(); reorderParts(i, i - 1); }} title="Move back" disabled={i === 0} style={{ ...eyeBtn, opacity: i === 0 ? 0.3 : 1 }}>↑</button>
+                <button data-ui-id={`skin.parts.row.${i}.down`} data-ui-kind="button" data-ui-label={`move part ${p.name} front`} onClick={(e) => { e.stopPropagation(); reorderParts(i, i + 1); }} title="Move front" disabled={i === parts.length - 1} style={{ ...eyeBtn, opacity: i === parts.length - 1 ? 0.3 : 1 }}>↓</button>
+                <button data-ui-id={`skin.parts.row.${i}.remove`} data-ui-kind="button" data-ui-label={`remove part ${p.name}`} onClick={(e) => { e.stopPropagation(); if (parts.length > 1) { partAction(removePart(def!, i), 'remove part'); const na = i < activePart ? activePart - 1 : activePart; useEditorStore.getState().setActiveSkinPart(Math.min(na, parts.length - 2)); } }} title="Remove part" disabled={parts.length <= 1} style={{ ...eyeBtn, color: '#c66', opacity: parts.length <= 1 ? 0.3 : 1 }}>✕</button>
               </div>
             ))}
           </div>
@@ -718,9 +857,9 @@ export default function SkinEditor() {
       </div>
       {/* Mode selector — full-width row (Parts / Rig / Weights). */}
       <div style={modeRowStyle}>
-        <button onClick={() => useEditorStore.getState().setSkinMode('parts')} style={mbtn(skinMode === 'parts')} title="Parts — drag to reposition the active part's mesh">✥ Parts</button>
-        <button onClick={() => useEditorStore.getState().setSkinMode('rig')} style={mbtn(skinMode === 'rig')} title="Rig — add / select / move / rotate bones">🦴 Rig</button>
-        <button onClick={() => useEditorStore.getState().setSkinMode('weights')} style={mbtn(skinMode === 'weights')} title="Weights — paint the selected bone's per-vertex influence">🖌 Weights</button>
+        <button data-ui-id="skin.mode.parts" data-ui-kind="toggle" data-ui-label="parts mode" onClick={() => useEditorStore.getState().setSkinMode('parts')} style={mbtn(skinMode === 'parts')} title="Parts — drag to reposition the active part's mesh">✥ Parts</button>
+        <button data-ui-id="skin.mode.rig" data-ui-kind="toggle" data-ui-label="rig mode" onClick={() => useEditorStore.getState().setSkinMode('rig')} style={mbtn(skinMode === 'rig')} title="Rig — add / select / move / rotate bones">🦴 Rig</button>
+        <button data-ui-id="skin.mode.weights" data-ui-kind="toggle" data-ui-label="weights mode" onClick={() => useEditorStore.getState().setSkinMode('weights')} style={mbtn(skinMode === 'weights')} title="Weights — paint the selected bone's per-vertex influence">🖌 Weights</button>
       </div>
 
       {/* Tool parameters — full-width row; contents depend on the active mode. */}
@@ -730,34 +869,34 @@ export default function SkinEditor() {
         )}
         {skinMode === 'rig' && (
           <>
-            <button onClick={() => useEditorStore.getState().setSkinBoneTool('select')} style={tbtn(skinBoneTool === 'select')} title="Select / move + rotate joints (gizmo)">Select</button>
-            <button onClick={() => useEditorStore.getState().setSkinBoneTool('add')} style={tbtn(skinBoneTool === 'add')} title="Click to add a bone — chains as a child of the selected one">＋ Bone</button>
-            <button onClick={deleteBone} disabled={selBone < 0} style={{ ...tbtn(false), opacity: selBone < 0 ? 0.5 : 1 }} title="Delete the selected bone">Del</button>
+            <button data-ui-id="skin.boneTool.select" data-ui-kind="toggle" data-ui-label="select bone tool" onClick={() => useEditorStore.getState().setSkinBoneTool('select')} style={tbtn(skinBoneTool === 'select')} title="Select / move + rotate joints (gizmo)">Select</button>
+            <button data-ui-id="skin.boneTool.add" data-ui-kind="toggle" data-ui-label="add bone tool" onClick={() => useEditorStore.getState().setSkinBoneTool('add')} style={tbtn(skinBoneTool === 'add')} title="Click to add a bone — chains as a child of the selected one">＋ Bone</button>
+            <button data-ui-id="skin.boneTool.delete" data-ui-kind="button" data-ui-label="delete selected bone" onClick={deleteBone} disabled={selBone < 0} style={{ ...tbtn(false), opacity: selBone < 0 ? 0.5 : 1 }} title="Delete the selected bone">Del</button>
           </>
         )}
         {skinMode === 'weights' && (
           <>
-            <button onClick={() => useEditorStore.getState().setSkinWeightTool('paint')} style={tbtn(skinWeightTool === 'paint')} title="Brush — paint the selected bone's weights (B)">🖌 Paint</button>
-            <button onClick={() => useEditorStore.getState().setSkinWeightTool('transform')} style={tbtn(skinWeightTool === 'transform')} title="Test-pose the bone to preview the deform — does not change the rig (W)">✥ Pose</button>
-            <button onClick={() => useEditorStore.getState().setSkinHideTexture(!skinHideTexture)} style={tbtn(skinHideTexture)} title="Hide the sprite — show only the weight heatmap (grayscale)">{skinHideTexture ? '◼ Weights only' : '◻ Weights only'}</button>
+            <button data-ui-id="skin.weightTool.paint" data-ui-kind="toggle" data-ui-label="paint weight tool" onClick={() => useEditorStore.getState().setSkinWeightTool('paint')} style={tbtn(skinWeightTool === 'paint')} title="Brush — paint the selected bone's weights (B)">🖌 Paint</button>
+            <button data-ui-id="skin.weightTool.pose" data-ui-kind="toggle" data-ui-label="pose weight tool" onClick={() => useEditorStore.getState().setSkinWeightTool('transform')} style={tbtn(skinWeightTool === 'transform')} title="Test-pose the bone to preview the deform — does not change the rig (W)">✥ Pose</button>
+            <button data-ui-id="skin.weightTool.weightsOnly" data-ui-kind="toggle" data-ui-label="weights only" onClick={() => useEditorStore.getState().setSkinHideTexture(!skinHideTexture)} style={tbtn(skinHideTexture)} title="Hide the sprite — show only the weight heatmap (grayscale)">{skinHideTexture ? '◼ Weights only' : '◻ Weights only'}</button>
             {skinWeightTool === 'paint' && (
               <>
                 <label style={ovRow}><span style={ovLbl}>size</span>
-                  <input type="range" min={1} max={256} step={1} value={skinPaint.radius} onChange={(e) => useEditorStore.getState().setSkinPaint({ radius: +e.target.value })} style={ovRange} />
+                  <input data-ui-id="skin.paint.radius" data-ui-kind="slider" data-ui-label="brush radius" type="range" min={1} max={256} step={1} value={skinPaint.radius} onChange={(e) => useEditorStore.getState().setSkinPaint({ radius: +e.target.value })} style={ovRange} />
                   <span style={ovVal}>{Math.round(skinPaint.radius)}</span></label>
                 <label style={ovRow}><span style={ovLbl} title={skinPaint.brush === 'set' ? 'target weight' : 'brush strength'}>{skinPaint.brush === 'set' ? 'wt' : 'str'}</span>
-                  <input type="range" min={0} max={1} step={0.01} value={skinPaint.strength} onChange={(e) => useEditorStore.getState().setSkinPaint({ strength: +e.target.value })} style={ovRange} />
+                  <input data-ui-id="skin.paint.strength" data-ui-kind="slider" data-ui-label="brush strength" type="range" min={0} max={1} step={0.01} value={skinPaint.strength} onChange={(e) => useEditorStore.getState().setSkinPaint({ strength: +e.target.value })} style={ovRange} />
                   <span style={ovVal}>{skinPaint.strength.toFixed(2)}</span></label>
                 <div style={{ display: 'flex', gap: 3 }}>
                   {(([['add', 'Add', '#20361f', '#3a7a44'], ['subtract', 'Sub', '#3a2020', '#7a3a3a'], ['set', 'Set', '#1f2c3a', '#3a6a8a']]) as [('add' | 'subtract' | 'set'), string, string, string][]).map(([m, label, bg, bd]) => (
-                    <button key={m} onClick={() => useEditorStore.getState().setSkinPaint({ brush: m })} style={{ ...tbtn(false), background: skinPaint.brush === m ? bg : '#2a2a40', border: `1px solid ${skinPaint.brush === m ? bd : '#444'}` }}>{label}</button>
+                    <button key={m} data-ui-id={`skin.paint.brush.${m}`} data-ui-kind="toggle" data-ui-label={`brush mode ${m}`} onClick={() => useEditorStore.getState().setSkinPaint({ brush: m })} style={{ ...tbtn(false), background: skinPaint.brush === m ? bg : '#2a2a40', border: `1px solid ${skinPaint.brush === m ? bd : '#444'}` }}>{label}</button>
                   ))}
                 </div>
               </>
             )}
             {skinWeightTool === 'transform' && (
               <>
-                <button onClick={() => setTestPose({})} disabled={Object.keys(testPose).length === 0} style={{ ...tbtn(false), opacity: Object.keys(testPose).length === 0 ? 0.5 : 1 }} title="Clear the test pose — snap all bones back to bind">↺ Reset pose</button>
+                <button data-ui-id="skin.weightTool.resetPose" data-ui-kind="button" data-ui-label="reset test pose" onClick={() => setTestPose({})} disabled={Object.keys(testPose).length === 0} style={{ ...tbtn(false), opacity: Object.keys(testPose).length === 0 ? 0.5 : 1 }} title="Clear the test pose — snap all bones back to bind">↺ Reset pose</button>
                 <span style={{ fontSize: 10, color: '#d8b45a', lineHeight: 1.3 }}><b>Preview only</b> — poses to test the deform; doesn’t move the bone or change the rig.</span>
               </>
             )}
@@ -786,9 +925,9 @@ export default function SkinEditor() {
                 {/* Name (generalized — part) */}
                 <div style={inspectorHeadStyle}>
                   <span style={inspectorKind}>Part</span>
-                  <input key={`p${activePart}`} defaultValue={partName}
-                    onBlur={(e) => { const n = e.target.value.trim(); if (n && n !== partName) partAction(renamePart(def!, activePart, n), 'rename part'); }}
-                    onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); else if (e.key === 'Escape') { e.currentTarget.value = partName; e.currentTarget.blur(); } }}
+                  <InlineNameField key={`p${activePart}`} initial={partName}
+                    onCommit={(n) => partAction(renamePart(def!, activePart, n), 'rename part')}
+                    uiId="skin.inspector.partName"
                     style={nameInputStyle} />
                 </div>
                 {/* Source art */}
@@ -812,7 +951,7 @@ export default function SkinEditor() {
                     <div style={{ ...trowStyle, marginBottom: 0 }}><span style={{ ...lbl, width: 26 }}>size</span>
                       <span style={lbl}>w</span><BufferedNumberInput value={wPx} step={1} onChange={(v) => setPartSize('x', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
                       <span style={lbl}>h</span><BufferedNumberInput value={hPx} step={1} onChange={(v) => setPartSize('y', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
-                      <button onClick={() => setSizeLocked((l) => !l)} title={sizeLocked ? 'Aspect ratio locked — w/h scale together. Click to unlock.' : 'Aspect ratio unlocked — w/h scale independently. Click to lock.'}
+                      <button data-ui-id="skin.part.sizeLock" data-ui-kind="toggle" data-ui-label="aspect ratio lock" onClick={() => setSizeLocked((l) => !l)} title={sizeLocked ? 'Aspect ratio locked — w/h scale together. Click to unlock.' : 'Aspect ratio unlocked — w/h scale independently. Click to lock.'}
                         style={{ ...eyeBtn, color: sizeLocked ? '#4a9eff' : '#777', fontSize: 12 }}>{sizeLocked ? '🔒' : '🔓'}</button></div>
                   </div>
                 ) : (
@@ -826,13 +965,13 @@ export default function SkinEditor() {
                     <BufferedNumberInput value={cols} step={1} onChange={(v) => setCols(Math.max(1, Math.min(24, Math.round(v))))} style={{ ...inputStyle, width: 44 }} />
                     <span style={{ ...lbl, marginLeft: 4 }}>rows</span><BufferedNumberInput value={rows} step={1} onChange={(v) => setRows(Math.max(1, Math.min(24, Math.round(v))))} style={{ ...inputStyle, width: 44 }} /></div>
                   <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', color: '#aaa', fontSize: 11, marginBottom: trimAlpha ? 3 : 4 }}>
-                    <input type="checkbox" checked={trimAlpha} onChange={(e) => setTrimAlpha(e.target.checked)} style={{ accentColor: '#4a9eff' }} /> Trim to alpha</label>
+                    <input data-ui-id="skin.part.trimAlpha" data-ui-kind="toggle" data-ui-label="trim to alpha" type="checkbox" checked={trimAlpha} onChange={(e) => setTrimAlpha(e.target.checked)} style={{ accentColor: '#4a9eff' }} /> Trim to alpha</label>
                   {trimAlpha && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 4 }}><span style={lbl}>α</span>
-                      <input type="range" min={0} max={128} step={1} value={alphaThreshold} onChange={(e) => setAlphaThreshold(+e.target.value)} style={{ flex: 1, minWidth: 0, accentColor: '#4a9eff' }} />
+                      <input data-ui-id="skin.part.alphaThreshold" data-ui-kind="slider" data-ui-label="alpha threshold" type="range" min={0} max={128} step={1} value={alphaThreshold} onChange={(e) => setAlphaThreshold(+e.target.value)} style={{ flex: 1, minWidth: 0, accentColor: '#4a9eff' }} />
                       <span style={{ color: '#999', width: 22, textAlign: 'right', fontSize: 10 }}>{alphaThreshold}</span></div>
                   )}
-                  <button onClick={reTessellate} disabled={!ap.sprite} title="Regenerate the deformable grid mesh + weights (keeps the part's current position)" style={{ ...btn, width: '100%', opacity: ap.sprite ? 1 : 0.5 }}>Re-tessellate</button>
+                  <button data-ui-id="skin.part.retessellate" data-ui-kind="button" data-ui-label="re-tessellate" onClick={reTessellate} disabled={!ap.sprite} title="Regenerate the deformable grid mesh + weights (keeps the part's current position)" style={{ ...btn, width: '100%', opacity: ap.sprite ? 1 : 0.5 }}>Re-tessellate</button>
                 </div>
               </>
             );
@@ -853,7 +992,7 @@ export default function SkinEditor() {
         {/* ── Export: prefab (collapsible) ── */}
         <Section title="Export">
           <div style={{ color: '#aaa', fontSize: 11, marginBottom: 8, lineHeight: 1.5 }}>{parts.length} part{parts.length === 1 ? '' : 's'} · {bones.length} bones · {verts.length} verts</div>
-          <button onClick={makePrefab} disabled={!bones.length}
+          <button data-ui-id="skin.actions.makePrefab" data-ui-kind="button" data-ui-label="make prefab" onClick={makePrefab} disabled={!bones.length}
             title={prefabExists
               ? 'Update the existing .prefab.json in place — its GUID is preserved, so instances already placed in scenes stay linked and refresh'
               : 'Generate a reusable .prefab.json (SkinnedSprite2D + Bone2D) from this rig — then drag it from Assets into a Canvas2D'}

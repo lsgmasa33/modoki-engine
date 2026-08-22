@@ -389,3 +389,39 @@ describe('physics2D — solo (parentless) static colliders', () => {
     expect(tw.trait<{ y: number }>(Transform, body).y).toBeGreaterThan(500);  // floor gone → fell through
   });
 });
+
+describe('Physics2DEvents — a collision callback reads the POST-step world', () => {
+  // The 2D mirror of the 3D case: #205 R2's substep loop drained (and routed) contacts BEFORE the
+  // Rapier→ECS pull, so every subscriber saw the previous frame's Transform + velocity. See
+  // `collectContactEvents` in physicsContactEvents.ts.
+  it('sees the same Transform/velocity the frame ends with, not the frame it started with', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    tw.spawn(Physics2D({ gravityX: 0, gravityY: 20, pixelsPerMeter: 100 }));
+    tw.spawn(Transform({ x: 0, y: 300 }), RigidBody2D({ bodyType: 'static' }),
+      Collider2D({ shape: 'box', halfW: 200, halfH: 20 }));
+    const ball = tw.spawn(Transform({ x: 0, y: 0 }),
+      RigidBody2D({ bodyType: 'dynamic' }),
+      Collider2D({ shape: 'circle', radius: 15, restitution: 0.8 }));
+
+    let inCb: { y: number; vy: number } | null = null;
+    physics2DEvents.onCollisionEnter(() => {
+      if (inCb) return;
+      inCb = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody2D)!.vy };
+    }, tw.world);
+
+    let before: { y: number; vy: number } | null = null;
+    let after: { y: number; vy: number } | null = null;
+    for (let i = 0; i < 240 && !inCb; i++) {
+      const pre = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody2D)!.vy };
+      tw.step(1);
+      if (inCb) { before = pre; after = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody2D)!.vy }; }
+    }
+
+    expect(inCb).toBeTruthy();
+    expect(inCb!.y).toBeCloseTo(after!.y, 9);
+    expect(inCb!.vy).toBeCloseTo(after!.vy, 9);
+    // The bounce reverses vy, so pre- and post-step differ by a lot — asserted so the test cannot
+    // pass vacuously if the ball ever settles instead of bouncing.
+    expect(Math.abs(after!.vy - before!.vy)).toBeGreaterThan(1);
+  });
+});

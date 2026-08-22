@@ -148,12 +148,13 @@ function TrackList({
           <span style={{ color: '#667', fontSize: 10 }} title="A value edit keys this property at the current playhead frame">keys @ f{propVal.frame}</span>
         </div>
       )}
-      <TipButton tip="Add one or more animated properties (Trait.field) under the Animator root" onClick={onAddProperty} style={addBtn}>+ Add Property</TipButton>
+      <TipButton uiId="animation.trackList.addProperty" tip="Add one or more animated properties (Trait.field) under the Animator root" onClick={onAddProperty} style={addBtn}>+ Add Property</TipButton>
       {/* Dopesheet | Curves tabs (Unity places these at the bottom of the property list) */}
       <div style={{ display: 'flex', borderTop: '1px solid #333' }}>
         {(['dopesheet', 'curves'] as const).map((m) => (
           <TipButton
             key={m}
+            uiId={`animation.viewMode.${m}`}
             tip={m === 'dopesheet' ? 'Dopesheet — keyframe timing (diamonds)' : 'Curves — keyframe values + easing (graph)'}
             onClick={() => onSetViewMode(m)}
             style={{ flex: 1, padding: '4px 0', background: viewMode === m ? '#2a2a40' : '#16161f', color: viewMode === m ? '#cdd' : '#778', border: 'none', borderRight: m === 'dopesheet' ? '1px solid #333' : 'none', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11, textTransform: 'capitalize' }}

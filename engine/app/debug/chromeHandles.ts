@@ -30,6 +30,13 @@ export const UI_ID_ATTR = 'data-ui-id';
 const UI_KIND_ATTR = 'data-ui-kind';
 const UI_LABEL_ATTR = 'data-ui-label';
 
+/** Optional CURRENT-VALUE attribute, reported as `meta.state`. Same argument as
+ *  `meta.disabled` below: which segment of a tri-state control is active is DATA, and
+ *  without it an agent has to infer "selected" from a background colour in a downscaled
+ *  JPEG. Set it only where the control has a state worth reading back — a segmented
+ *  Auto/On/Off row, a toggle — never as decoration on a plain button. */
+const UI_STATE_ATTR = 'data-ui-state';
+
 /** Is this control present but inert? Covers the three ways the editor greys something out:
  *  a real `disabled` property, `aria-disabled`, and the `data-ui-disabled` escape hatch for
  *  a styled div that isn't a `<button>`. Reported as `meta.disabled` — an agent should not
@@ -66,6 +73,7 @@ export function chromeHandles(): InteractionHandle[] {
     const point = resolveElementPoint(el);
     if ('error' in point) continue; // hidden / not laid out — not aimable, so not offered
     const label = labelFor(el); // reads textContent — compute once, not once per use
+    const state = el.getAttribute(UI_STATE_ATTR);
     out.push({
       id,
       kind: el.getAttribute(UI_KIND_ATTR) ?? el.tagName.toLowerCase(),
@@ -77,7 +85,9 @@ export function chromeHandles(): InteractionHandle[] {
       // of every coordinate-addressed handle, not a chrome feature, so it does not belong here.
       owner: el,
       ...(label ? { label } : {}),
-      ...(isDisabled(el) ? { meta: { disabled: true } } : {}),
+      ...(isDisabled(el) || state
+        ? { meta: { ...(isDisabled(el) ? { disabled: true } : {}), ...(state ? { state } : {}) } }
+        : {}),
     });
   }
   return out;

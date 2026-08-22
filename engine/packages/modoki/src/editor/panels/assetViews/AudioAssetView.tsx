@@ -12,6 +12,7 @@ import {
   type AudioImportSettings, type AudioFormat, type AudioLoadType, type AudioCacheInfo,
 } from '../../../runtime/loaders/audioSettings';
 import { invalidateAudio } from '../../../runtime/loaders/audioBufferCache';
+import { useAssetInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
 import { getAudioContext } from '../../../runtime/audio/audioContext';
 import { inputStyle } from '../fields';
 import { formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
@@ -38,8 +39,15 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
   const setImportStatus = useEditorStore((s) => s.setImportStatus);
 
+  // Same path-keyed staleness ModelAssetView + TextureAssetView had (#303/#304): this
+  // re-read the sidecar on mount and after its OWN Apply button only, so a re-import
+  // from the Assets panel or the agent bridge left the stats and the `converted` flag
+  // showing pre-reimport values. The epoch cache-busts the URL, so it is a value this
+  // callback genuinely reads — the sidecar is rewritten in place at an unchanged URL.
+  const reimportEpoch = useAssetInvalidationEpoch('audio', (p) => p === path);
+
   const loadMeta = useCallback((signal?: AbortSignal) => {
-    return backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`, signal ? { signal } : undefined)
+    return backendFetch(cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, reimportEpoch), signal ? { signal } : undefined)
       .then((r) => (r.ok ? r.json() : {}))
       .then((m: Record<string, unknown>) => {
         setMeta(m);
@@ -47,7 +55,7 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
         setConverted(!!m.audioCache);
       })
       .catch(() => { /* keep defaults */ });
-  }, [path]);
+  }, [path, reimportEpoch]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -102,7 +110,7 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
       <div style={sectionStyle}>Load Type</div>
       <div style={rowStyle}>
         <span style={labelStyle}>Load Type</span>
-        <select value={settings.loadType} onChange={(e) => update({ loadType: e.target.value as AudioLoadType })} style={{ ...inputStyle, flex: 1 }}>
+        <select data-ui-id="assetView.audio.loadType" data-ui-kind="field" data-ui-label="Load Type" value={settings.loadType} onChange={(e) => update({ loadType: e.target.value as AudioLoadType })} style={{ ...inputStyle, flex: 1 }}>
           {(Object.keys(LOAD_TYPE_LABELS) as AudioLoadType[]).map((v) => <option key={v} value={v}>{LOAD_TYPE_LABELS[v]}</option>)}
         </select>
       </div>
@@ -110,21 +118,21 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
       <div style={sectionStyle}>Format</div>
       <div style={rowStyle}>
         <span style={labelStyle}>Format</span>
-        <select value={settings.format} onChange={(e) => update({ format: e.target.value as AudioFormat })} style={{ ...inputStyle, flex: 1 }}>
+        <select data-ui-id="assetView.audio.format" data-ui-kind="field" data-ui-label="Format" value={settings.format} onChange={(e) => update({ format: e.target.value as AudioFormat })} style={{ ...inputStyle, flex: 1 }}>
           {AUDIO_FORMATS.map((f) => <option key={f} value={f}>{FORMAT_LABELS[f]}</option>)}
         </select>
       </div>
       {lossy && (
         <div style={rowStyle}>
           <span style={labelStyle}>Bitrate (kbps)</span>
-          <select value={String(settings.quality)} onChange={(e) => update({ quality: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
+          <select data-ui-id="assetView.audio.bitrate" data-ui-kind="field" data-ui-label="Bitrate" value={String(settings.quality)} onChange={(e) => update({ quality: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
             {withCurrentValue(AUDIO_BITRATES, settings.quality).map((b) => <option key={b} value={b}>{b}</option>)}
           </select>
         </div>
       )}
       <div style={rowStyle}>
         <span style={labelStyle}>Sample Rate</span>
-        <select value={String(settings.sampleRate ?? 0)} onChange={(e) => update({ sampleRate: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
+        <select data-ui-id="assetView.audio.sampleRate" data-ui-kind="field" data-ui-label="Sample Rate" value={String(settings.sampleRate ?? 0)} onChange={(e) => update({ sampleRate: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
           {/* opus only accepts a fixed set of rates — offer just those for opus. A rate the
               sidecar already holds is spliced in either way: an unlisted `value` would
               otherwise display as the FIRST option and misreport the setting (#131). For
@@ -137,7 +145,7 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
       {settings.format === 'wav' && (
         <div style={rowStyle}>
           <span style={labelStyle}>Bit Depth</span>
-          <select value={String(settings.bitDepth ?? 16)} onChange={(e) => update({ bitDepth: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
+          <select data-ui-id="assetView.audio.bitDepth" data-ui-kind="field" data-ui-label="Bit Depth" value={String(settings.bitDepth ?? 16)} onChange={(e) => update({ bitDepth: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
             {withCurrentValue(AUDIO_BIT_DEPTHS, settings.bitDepth ?? 16).map((b) => <option key={b} value={b}>{b}-bit{b === 32 ? ' (float)' : ''}</option>)}
           </select>
         </div>
@@ -146,18 +154,19 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
       <div style={sectionStyle}>Processing</div>
       <div style={rowStyle}>
         <span style={labelStyle}>Force Mono</span>
-        <input type="checkbox" checked={settings.forceMono} onChange={(e) => update({ forceMono: e.target.checked })} />
+        <input data-ui-id="assetView.audio.forceMono" data-ui-kind="toggle" data-ui-label="Force Mono" data-ui-state={settings.forceMono ? 'checked' : 'unchecked'} type="checkbox" checked={settings.forceMono} onChange={(e) => update({ forceMono: e.target.checked })} />
       </div>
       <div style={rowStyle}>
         <span style={labelStyle}>Normalize Loudness</span>
-        <input type="checkbox" checked={settings.normalize} onChange={(e) => update({ normalize: e.target.checked })} />
+        <input data-ui-id="assetView.audio.normalize" data-ui-kind="toggle" data-ui-label="Normalize Loudness" data-ui-state={settings.normalize ? 'checked' : 'unchecked'} type="checkbox" checked={settings.normalize} onChange={(e) => update({ normalize: e.target.checked })} />
       </div>
       <div style={rowStyle}>
         <span style={labelStyle}>Trim Silence</span>
-        <input type="checkbox" checked={settings.trimSilence} onChange={(e) => update({ trimSilence: e.target.checked })} />
+        <input data-ui-id="assetView.audio.trimSilence" data-ui-kind="toggle" data-ui-label="Trim Silence" data-ui-state={settings.trimSilence ? 'checked' : 'unchecked'} type="checkbox" checked={settings.trimSilence} onChange={(e) => update({ trimSilence: e.target.checked })} />
       </div>
 
       <button
+        data-ui-id="assetView.audio.apply" data-ui-kind="button" data-ui-label={converted ? 'Re-import' : 'Apply'}
         disabled={importing}
         onClick={apply}
         style={{ ...reimportBtnStyle, marginTop: 8, background: importing ? '#555' : '#2ecc71', color: '#fff', border: `1px solid ${importing ? '#444' : '#27ae60'}`, cursor: importing ? 'wait' : 'pointer' }}

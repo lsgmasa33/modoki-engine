@@ -21,6 +21,7 @@
  */
 
 import { assetUrl } from './assetUrl';
+import { markUIDirty } from '../core/uiDirty';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import type { TextureImportSettings, TextureType } from './textureSettings';
 import type { AudioImportSettings, AudioCacheInfo } from './audioSettings';
@@ -96,8 +97,8 @@ export interface AssetEntry {
   /** Baked font block (`'font'` assets only), copied from the `.meta.json`
    *  `font` block at scan time. Present only once the font has been through the
    *  MSDF atlas converter (baked `~atlas.png` + `~metrics.json` variants exist).
-   *  Absent ⇒ the font is a plain CSS-family-name font (resolved by `fontFamily`,
-   *  never a GUID ref) and has no SDF atlas. */
+   *  Absent ⇒ the font has no SDF atlas — it is DOM/PixiJS-only, registered with the
+   *  browser by the FontFace loader. (Both kinds are referenced by GUID since #231.) */
   font?: FontManifestBlock;
   /** Baked environment block (`'environment'` HDR assets only) — present once the
    *  HDR has been downscaled (a `~env.hdr` variant exists). Absent ⇒ the HDR loads
@@ -243,7 +244,7 @@ export function registerAsset(
   path: string,
   type: AssetType,
   texture?: TextureImportSettings,
-  modelBlocks?: { model?: ModelImportSettings; modelCache?: ModelCacheInfo; postprocessor?: string; sprite?: SpriteAssetRef; atlas?: AtlasCacheBlock; audio?: AudioManifestBlock; video?: VideoManifestBlock; font?: FontManifestBlock; environment?: EnvManifestBlock },
+  modelBlocks?: { textureType?: TextureType; model?: ModelImportSettings; modelCache?: ModelCacheInfo; postprocessor?: string; sprite?: SpriteAssetRef; atlas?: AtlasCacheBlock; audio?: AudioManifestBlock; video?: VideoManifestBlock; font?: FontManifestBlock; environment?: EnvManifestBlock },
   hash?: string,
 ): void {
   if (!isGuid(guid)) {
@@ -254,6 +255,17 @@ export function registerAsset(
   if (prior && prior.path !== path) {
     pathToGuid.delete(prior.path);
   }
+  // A RE-IMPORT that changes what this texture's URL resolves to must invalidate every cached
+  // resolution of it, exactly as a re-slice does. `_spriteEpochByTexture` was bumped only by
+  // `registerSprite`, so a retype+reimport left the epoch untouched and every consumer that
+  // caches on it kept the pre-fix URL. Measured on `games/anim-bug` (bug `udpbnC6DHswvCj115B7M`,
+  // QA-ASSET-0007): retyping a texture 3d→ui and reimporting fixed the sidecar, the manifest and
+  // `resolveBrowserImageUrl` — and the live `UIElement.imageSrc` DOM kept `…/foo.png` with no
+  // `~webp` until the trait was touched. That is the narrow residue of `ZRFuilq9GcTBksO4HmAs`:
+  // the resolution was already correct at that moment, nothing had re-asked for it.
+  const bumpTextureEpoch = type === 'texture' && !!prior && textureResolutionChanged(prior, {
+    path, textureType: modelBlocks?.textureType, format: texture?.format, hash,
+  });
   // A font whose mode (baked↔dynamic) or content hash (re-bake) changed must evict
   // its live provider so the next render re-acquires with the new settings — else a
   // Font-Inspector mode flip or re-bake has no effect until a full editor restart.
@@ -273,6 +285,16 @@ export function registerAsset(
   guidToEntry.set(guid, {
     guid, path, type,
     texture: texture ?? (typeChanged ? undefined : prior?.texture),
+    // The AUTHORED usage type (`3d`/`2d`/`ui`), and it must ride along with `texture`: it is
+    // what `resolveBrowserImageUrl` asks `browserVariant` for, and an absent value there is
+    // not neutral — it falls back to inferring the type from the FORMAT, and a `ktx2-*` format
+    // infers `3d`, i.e. "no WebP sibling exists". So a `ui`-typed KTX2 texture (which the build
+    // DOES emit a WebP for) resolved to the raw, production-stripped source instead. This field
+    // was declared on `AssetEntry`, read in exactly one place, and written by NOBODY — retyping
+    // a texture and re-importing it fixed the file on disk and changed nothing in the running
+    // editor, because the field never crossed from the scanner's manifest into this map
+    // (QA-ASSET-0007).
+    textureType: modelBlocks?.textureType ?? (typeChanged ? undefined : prior?.textureType),
     model: modelBlocks?.model ?? (typeChanged ? undefined : prior?.model),
     // Derive variant URLs from the CURRENT path so a moved/renamed source resolves
     // without a re-import (the stored processedPath/lodPaths may be stale — see the
@@ -299,8 +321,34 @@ export function registerAsset(
     guidToEntry.delete(priorGuidForPath);
   }
   pathToGuid.set(path, guid);
+  if (bumpTextureEpoch) {
+    _spriteEpochByTexture.set(guid, (_spriteEpochByTexture.get(guid) ?? 0) + 1);
+    // Bumping the epoch is only half of it: the DOM UI tree rebuilds only when something marks
+    // it dirty, and an asset re-import never did. Scene2D re-keys its slots off the epoch on its
+    // own frame, and the editor SceneView re-resolves every frame — the DOM UI path is the one
+    // surface with neither, which is why the reimport landed everywhere except there.
+    markUIDirty();
+  }
   // Fire AFTER the entry is committed so a listener re-acquiring reads the new block.
   if (fontChanged) for (const fn of fontInvalidationListeners) { try { fn(guid); } catch { /* ignore */ } }
+}
+
+/** Would this re-registration change what a URL for this texture resolves to?
+ *
+ *  Deliberately NOT "did anything re-register": the manifest is re-broadcast wholesale by the
+ *  watcher, so bumping on every re-register would invalidate every cached resolution in the
+ *  editor on any unrelated asset change. These four inputs are what `resolveBrowserImageUrl` /
+ *  `resolveTextureVariantUrl` actually read — the served path, the AUTHORED usage type (which
+ *  decides whether a WebP sibling is even looked for), the encoded format, and the content hash
+ *  (a re-encode of the same settings). */
+export function textureResolutionChanged(
+  prior: { path: string; textureType?: string; texture?: { format?: string }; hash?: string },
+  next: { path: string; textureType?: string; format?: string; hash?: string },
+): boolean {
+  return prior.path !== next.path
+    || (next.textureType !== undefined && prior.textureType !== next.textureType)
+    || (next.format !== undefined && prior.texture?.format !== next.format)
+    || (next.hash !== undefined && prior.hash !== next.hash);
 }
 
 type FontInvalidationListener = (guid: string) => void;
@@ -485,6 +533,9 @@ const pathRefSeen = new Set<string>();
 export function resolveRef(ref: string): string | undefined {
   if (!ref) return undefined;
   if (isGuid(ref)) return guidToEntry.get(ref)?.path;
+  // A FONT path counts here too — `isInternalAssetPath` covers font extensions since #231
+  // (before that a literal font path passed through unrejected and with no error, unlike
+  // every other asset-ref field — QA-INSP-0004).
   if (isInternalAssetPath(ref)) {
     if (!pathRefSeen.has(ref)) {
       pathRefSeen.add(ref);
@@ -498,6 +549,9 @@ export function resolveRef(ref: string): string | undefined {
   return ref;
 }
 
+/** Guids registered BY `loadManifestJson` — the provenance the prune pass is scoped to. */
+const _manifestGuids = new Set<string>();
+
 /** Bulk-load a manifest JSON (production build path). Entries without a guid
  *  are ignored — they live in the same file for legacy font/panel discovery.
  *
@@ -507,13 +561,17 @@ export function resolveRef(ref: string): string | undefined {
  *  the shell's own assets and resolve against the shell's root. Prefixing each path
  *  once here, at merge time, is enough: the manifest is a guid→path map consumed only
  *  through `resolveRef` → `assetUrl`, never read again from the source JSON. */
-export function loadManifestJson(json: AssetManifestFile, opts?: { pathPrefix?: string }): void {
+export function loadManifestJson(json: AssetManifestFile, opts?: { pathPrefix?: string; prune?: boolean }): void {
   if (!Array.isArray(json.assets)) return;
   const prefix = opts?.pathPrefix ?? '';
+  const present = opts?.prune ? new Set<string>() : null;
   for (const entry of json.assets) {
     if (!entry.guid || !isGuid(entry.guid)) continue;
     const path = prefix ? prefix.replace(/\/$/, '') + entry.path : entry.path;
+    present?.add(entry.guid);
+    _manifestGuids.add(entry.guid);
     registerAsset(entry.guid, path, entry.type as AssetType, entry.texture, {
+      textureType: entry.textureType,
       model: entry.model,
       modelCache: entry.modelCache,
       postprocessor: entry.postprocessor,
@@ -524,6 +582,36 @@ export function loadManifestJson(json: AssetManifestFile, opts?: { pathPrefix?: 
       font: entry.font,
       environment: entry.environment,
     }, entry.hash);
+  }
+  // PRUNE (opt-in) — drop guids this manifest no longer carries.
+  //
+  // WHY (QA-DLG-0009). `guidToEntry` is a module-level Map that was only ever ADDED to. The dev
+  // server rescans on every file change and pushes a COMPLETE manifest, but the client merged it
+  // and never removed a guid that had gone — so a texture deleted through Move to Trash lived on
+  // in `getAllAssets()` for the life of the browser context, and the SpritePicker (whose whole
+  // data source is that array) kept offering phantom sprites that resolve to nothing. Only a full
+  // editor reload cleared it.
+  //
+  // Restricted to guids THIS function registered (`_manifestGuids`): the same entry point also
+  // merges an OTA sub-game's manifest FRAGMENT (see `pathPrefix`), which must never prune the
+  // shell's assets, and the client registers guids of its own that no scanner payload contains —
+  // a scene guid stamped by SceneManager at load, an editor-side `registerSprite`. Pruning by
+  // "absent from this payload" alone would silently delete those.
+  //
+  // NEVER prune to nothing. `rebuildManifest` (vite-asset-scanner) re-derives the asset roots
+  // and broadcasts whatever the scan returns, with no plausibility check — so a moment where
+  // the asset directory is unreadable (a project switch, a `git checkout` under a live editor)
+  // publishes an EMPTY manifest. Pruning on that would blank every texture, mesh and material
+  // in the running editor at once, turning "some files went away" into a total wipe. An empty
+  // payload can never legitimately REQUIRE a prune either: a project with no assets has nothing
+  // registered from a manifest to begin with (client-side registrations are out of scope above),
+  // so refusing here can only protect. Introduced with the prune; found by the close-out review.
+  if (present && present.size > 0) {
+    for (const guid of [..._manifestGuids]) {
+      if (present.has(guid)) continue;
+      _manifestGuids.delete(guid);
+      unregisterAsset(guid);
+    }
   }
 }
 
@@ -575,6 +663,7 @@ export function serializeManifest(): AssetManifestFile {
     assets.push({
       guid: entry.guid, path: entry.path, type: entry.type,
       texture: entry.texture,
+      textureType: entry.textureType,
       model: entry.model,
       modelCache: entry.modelCache,
       postprocessor: entry.postprocessor,
@@ -594,6 +683,7 @@ export function serializeManifest(): AssetManifestFile {
 export function clearManifest(): void {
   guidToEntry.clear();
   pathToGuid.clear();
+  _manifestGuids.clear();
   _spriteEpochByTexture.clear();
   clearAtlasFrames();
   manifestLoadPromise = null;

@@ -42,6 +42,7 @@ export function ShaderAssetView({ path }: { path: string }) {
     if (!old) return;
     persistAssetEdit(path, updated, invalidateShaderFile);
     pushAction({
+      _isFileDirect: true, // already on disk (persistAssetEdit) — see MaterialAssetView for why
       label,
       undo: () => persistAssetEdit(path, old, invalidateShaderFile),
       redo: () => persistAssetEdit(path, updated, invalidateShaderFile),

@@ -73,9 +73,36 @@ export const MIXED_PLACEHOLDER = '----';
 export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, parse: (raw: string) => T, mixed = false, validate?: (raw: string) => boolean) {
   const [localValue, setLocalValue] = useState<string>(mixed ? '' : String(externalValue));
   const focusedRef = useRef(false);
-  // Sync from ECS when not focused
+  // `parse` is an inline arrow at most call sites, so its identity changes every render and it
+  // CANNOT be an effect dep — the re-sync would then run on every render and overwrite the buffer
+  // any time the displayed text has not yet round-tripped through the store (an edit the `validate`
+  // guard below is deliberately holding back, for one). Read the latest one through a ref.
+  const parseRef = useRef(parse);
+  parseRef.current = parse;
+  // Sync from ECS when the value changed for a reason other than this field's own typing.
   useEffect(() => {
-    if (!focusedRef.current) setLocalValue(mixed ? '' : String(externalValue));
+    if (focusedRef.current) return;
+    setLocalValue((current) => {
+      // ⚠️ **`focusedRef` IS NOT ENOUGH, BECAUSE A FOCUS EVENT IS NOT GUARANTEED TO FIRE (#242).**
+      // Chromium dispatches `focus`/`blur` only while `document.hasFocus()`, so with the editor
+      // window not OS-focused — the permanent state of an agent-driven MCP session, and an ordinary
+      // one for a human with another window on top — `focusedRef` is never true and this effect
+      // clobbers the buffer mid-edit. It is this field's OWN commit that does the clobbering:
+      // clearing the field commits `parse('')` (0), the store echoes 0 back, and the echo rewrites
+      // the empty buffer to '0' — so the next keystrokes land on '0' and `-3.5` is typed as
+      // '0-3.5', which parses to 0. Measured on `games/sling` Lvl-0002: asked for -3.5, stored 0,
+      // and the input tool reported success. Same shape as #233 (`qa/knowledge.md` §5: nothing in
+      // the editor may depend on a focus event firing).
+      //
+      // ⭐ So the guard is the ECHO, not the focus: when the text on screen already MEANS the
+      // store's value, re-syncing can only reformat it ('' or '-' -> '0', '3.50' -> '3.5') — which
+      // is exactly the destruction above, and never new information. A real external change (a
+      // gizmo drag, an undo, a selection change) does not parse-match and still re-syncs.
+      // Stateless on purpose: remembering the last committed value instead would go stale the
+      // moment something dragged the value away and back to it, and skip a re-sync it owed.
+      if (!mixed && Object.is(parseRef.current(current), externalValue)) return current;
+      return mixed ? '' : String(externalValue);
+    });
   }, [externalValue, mixed]);
   const onFocus = useCallback(() => { focusedRef.current = true; }, []);
   const onBlur = useCallback(() => {
@@ -170,7 +197,7 @@ export function BufferedTextInput({ value, onChange, style, placeholder, mixed, 
     style={{ ...style, ...invalidStyle, ...roStyle }} />;
 }
 
-export function BufferedNumberInput({ value, onChange, step, style, readOnly, mixed, min, max }: { value: number; onChange: (v: number) => void; step?: number; style?: React.CSSProperties; readOnly?: boolean; mixed?: boolean; min?: number; max?: number }) {
+export function BufferedNumberInput({ value, onChange, step, style, readOnly, mixed, min, max, dataUiId }: { value: number; onChange: (v: number) => void; step?: number; style?: React.CSSProperties; readOnly?: boolean; mixed?: boolean; min?: number; max?: number; dataUiId?: string }) {
   // Enforce the declared range on COMMIT (the field hint's min/max were previously
   // display-only — only the wheel respected them, so a typed value could exceed the
   // cap, e.g. glowSize past its 0.5 seam budget). Clamp inside `parse` so an
@@ -191,5 +218,5 @@ export function BufferedNumberInput({ value, onChange, step, style, readOnly, mi
   // (negatives were only typeable digit-first then prepending `-`). With a text input the
   // buffered local string preserves the in-progress `-`/`.`; parseNumber still coerces
   // garbage to 0. `inputMode="decimal"` keeps a numeric soft-keyboard on touch devices.
-  return <input ref={ref} type="text" inputMode="decimal" value={localValue} placeholder={mixed ? MIXED_PLACEHOLDER : undefined} onFocus={onFocus} onBlur={onBlur} onChange={(e) => handleChange(e.target.value)} style={style} readOnly={readOnly} />;
+  return <input ref={ref} type="text" inputMode="decimal" value={localValue} placeholder={mixed ? MIXED_PLACEHOLDER : undefined} onFocus={onFocus} onBlur={onBlur} onChange={(e) => handleChange(e.target.value)} style={style} readOnly={readOnly} data-ui-id={dataUiId} />;
 }

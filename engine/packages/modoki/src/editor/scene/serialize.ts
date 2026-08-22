@@ -73,7 +73,12 @@ export interface SerializedEntity {
  *  in parallel before instantiating entities. Disposed when the scene unloads
  *  unless another scene also holds them. */
 export interface ResourceRef {
-  type: 'model' | 'riggedModel' | 'mesh' | 'material' | 'texture' | 'prefab' | 'font' | 'environment' | 'particle' | 'animation';
+  /** A SUBSET of the runtime `SceneResourceRef['type']` union — `collectResourceRefs`
+   *  delegates to the runtime collector and casts, so anything the runtime can emit may
+   *  appear here. Kept as a narrower list only because these are the kinds the editor
+   *  itself names. `font-family` = a DOM font ref (`UIElement.fontFamily`, #231), distinct
+   *  from `font` (an SDF font asset), since one asset can be acquired as both. */
+  type: 'model' | 'riggedModel' | 'mesh' | 'material' | 'texture' | 'prefab' | 'font' | 'font-family' | 'environment' | 'particle' | 'animation';
   path: string;
   loader?: string;
   postprocessor?: string;
@@ -168,27 +173,11 @@ function resolveEffectivePrefabOverride(
  *  Omitted (the default): behaves EXACTLY as before — this is the regression net
  *  every existing caller (enterPlay, timelinePreview, applyPrefabUndo, saveScene)
  *  depends on. */
-/** True when a live field value is indistinguishable from its trait's schema default,
- *  and therefore safe to OMIT from the scene file (the loader re-derives it).
- *
- *  Deliberately SCALAR-ONLY. A non-scalar default (array/object) in a koota SoA schema
- *  is a single shared instance handed to every entity, so "equal to the default" is
- *  neither cheap nor safe to decide: a deep compare would omit a live array that merely
- *  happens to match today, and identity compare would omit one the entity is actually
- *  ALIASING. Either way the file would stop recording a real value. Non-scalars are
- *  always written — the diff cost is small (few traits have them) and the semantics stay
- *  obvious. Same reasoning excludes AoS traits wholesale at the call site: their schema
- *  is a *function*, so there is no default to compare against at all.
- *
- *  `Object.is` (not `===`) so `NaN` matches its own default and `-0` does NOT collapse
- *  into `0` — a signed zero is a different authored value in a direction/velocity field.
- *
- *  Exported for unit testing. */
-export function isTraitDefault(value: unknown, def: unknown): boolean {
-  if (def !== null && (typeof def === 'object' || typeof def === 'function')) return false;
-  if (value !== null && (typeof value === 'object' || typeof value === 'function')) return false;
-  return Object.is(value, def);
-}
+// `isTraitDefault` moved to its own LEAF module so `prefab.ts` can share the rule without
+// importing this file's dependency graph. Re-exported here — this was its home, and
+// `@modoki/engine/editor` still surfaces it from this module.
+import { isTraitDefault } from './traitDefault';
+export { isTraitDefault };
 
 export async function serializeScene(opts?: {
   assignGuids?: boolean;
@@ -385,6 +374,67 @@ export async function serializeScene(opts?: {
     return prefabRootInfo.has(cur) ? { topId: cur, path } : null;
   };
 
+  /** The order entities are WRITTEN in — the Hierarchy's display order, made fully
+   *  stable (QA-HIER-0002).
+   *
+   *  It used to be live-world iteration order, which follows runtime ECS ids. Those are
+   *  reassigned by a delete+undo (the entity respawns at a new id) or a duplicate+delete,
+   *  so the next save re-emitted IDENTICAL data in a different order. Measured on
+   *  `games/anim-bug`: same guid set, zero entities whose content differed, and
+   *  `main.scene.json` still MODIFIED — one entity had moved within the array. That is
+   *  semantically harmless (sortOrder carries the authored intent), and it is exactly the
+   *  CLAUDE.md #18 hazard: a running editor writing to `games/**` with a contentless diff
+   *  that rides into an unrelated commit because nobody reads it. It also makes
+   *  "git status is clean" unusable as a QA cleanup check for any case touching entity
+   *  lifecycle.
+   *
+   *  Parents before their children, siblings by `sortOrder` — i.e. what the Hierarchy
+   *  shows (the owner's call: match the file to the panel, so a scene diff is readable).
+   *  The tiebreak is the GUID, not the ecs id `buildEntityTree` uses: colliding
+   *  sortOrders are ordinary (legacy entities all sit at 0) and an id tiebreak would
+   *  reintroduce exactly the churn this removes. Name is the last resort, for the
+   *  un-guidable entity `guidForId` returns '' for.
+   *
+   *  This supersedes the Phase 3 (scene-loading.md) choice to reproduce ECS-ID order on
+   *  the carry-respawn path: the written order no longer depends on how the scene was
+   *  loaded at all, so a carried save and a cold-loaded save agree by construction rather
+   *  than by keeping two paths in step. */
+  const orderedInfos = ((): typeof entityInfos => {
+    const present = new Set(entityInfos.map((e) => e.id));
+    const childrenOf = new Map<number, typeof entityInfos>();
+    const roots: typeof entityInfos = [];
+    for (const info of entityInfos) {
+      // A parent outside this scene's slice (a base-owned parent, an excluded
+      // transient) makes the entity a root here — the same rule buildEntityTree uses.
+      if (info.parentId && present.has(info.parentId)) {
+        const list = childrenOf.get(info.parentId);
+        if (list) list.push(info); else childrenOf.set(info.parentId, [info]);
+      } else {
+        roots.push(info);
+      }
+    }
+    const bySortThenGuid = (a: typeof entityInfos[number], b: typeof entityInfos[number]) =>
+      a.sortOrder - b.sortOrder
+      || guidForId(a.id).localeCompare(guidForId(b.id))
+      || a.name.localeCompare(b.name);
+    const out: typeof entityInfos = [];
+    const visit = (list: typeof entityInfos) => {
+      for (const info of [...list].sort(bySortThenGuid)) {
+        out.push(info);
+        const kids = childrenOf.get(info.id);
+        if (kids) visit(kids);
+      }
+    };
+    visit(roots);
+    // Belt-and-braces: a parent cycle would strand entities. Append anything the walk
+    // did not reach rather than silently DROPPING it from the saved scene.
+    if (out.length !== entityInfos.length) {
+      const emitted = new Set(out.map((e) => e.id));
+      for (const info of entityInfos) if (!emitted.has(info.id)) out.push(info);
+    }
+    return out;
+  })();
+
   const nestedOverridesByTop = new Map<number, NestedOverridePaths>();
   for (const ni of nestedInstances) {
     const resolved = resolvePath(ni.rootId);
@@ -402,7 +452,7 @@ export async function serializeScene(opts?: {
     nestedOverridesByTop.set(resolved.topId, map);
   }
 
-  for (const info of entityInfos) {
+  for (const info of orderedInfos) {
     // Skip prefab children + structural additions — re-instantiated from the prefab
     if (prefabChildIds.has(info.id)) continue;
 
@@ -507,7 +557,7 @@ export async function serializeScene(opts?: {
           // Writing them out instead FREEZES each file at the defaults of the day it
           // was saved, so a later change to a trait default silently stops reaching
           // every already-saved scene — the reason the repo-wide legacy-scene
-          // migration was on hold (docs/todo.md). Owner's call, 2026-07-31.
+          // migration was on hold (see docs/scene-loading.md). Owner's call, 2026-07-31.
           // …except a field the passes below REWRITE (parentId + every other
           // `entityId`-flagged ref, guid-ified there). Those are always emitted, so
           // skipping one here would only move it to the END of the object — pure diff
@@ -589,7 +639,7 @@ export async function serializeScene(opts?: {
   // re-registered under a different path string (a scanner rescan is enough), and a
   // miss there mints a fresh guid — which dangles every reference to the scene,
   // `project.config.json`'s included. That is how `tropical-island.json` lost its
-  // `4bc54ae4-…` id on a save (docs/todo.md, 2026-07-30).
+  // `4bc54ae4-…` id on a save (see docs/scene-loading.md, 2026-07-30).
   // `LoadedSceneEntry.guid` falls back to a `path:…` tag for a file with no valid
   // guid, so it is only trustworthy when it actually IS a guid.
   const sceneId = targetScene
@@ -807,7 +857,12 @@ export interface SaveResult {
    *
    *  Their dirty flags stay SET, so a later save retries them. */
   failed?: { path: string; guid: string; reason: string }[];
-  /** Pending particle/anim/timeline writes (Phase 3) flushed alongside this save, if any. */
+  /** Parked asset docs (particle/anim/timeline/spriteanim/rig2d) flushed by this save, if any.
+   *
+   *  Present on a FAILED result too, and that is the point: the asset flush no longer depends on
+   *  the scene write, so "the scene was refused but your 3 asset edits are on disk" is a real
+   *  outcome and the caller has to be able to say so (#259). Never report a bare failure over a
+   *  result that carries `assets.saved` — that is the C7 lie with the roles reversed. */
   assets?: FlushResult;
 }
 
@@ -871,9 +926,8 @@ export async function saveScene(opts: {
       if (knownPath !== _currentScenePath) setCurrentScenePath(knownPath);
       editorEmit('!save', { path: knownPath, entities: scene.entities.length }); // Editor Percept (V2)
       console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${knownPath}`);
-      const assets = await flushDirtyAssets(); // Phase 3: pending manual-mode particle/anim/timeline edits
       markSceneSaved();
-      return { saved: true, path: knownPath, reason: 'ok', ...(assets.saved.length || assets.failed.length ? { assets } : {}) };
+      return { saved: true, path: knownPath, reason: 'ok' };
     }
     console.error(`[Editor] Failed to save scene to ${knownPath}`);
     return { saved: false, path: knownPath, reason: 'write-failed' };
@@ -902,9 +956,8 @@ export async function saveScene(opts: {
     setCurrentScenePath(target); // persists, so the next Save All goes straight to it
     editorEmit('!save', { path: target, entities: scene.entities.length }); // Editor Percept (V2)
     console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${target}`);
-    const assets = await flushDirtyAssets(); // Phase 3: pending manual-mode particle/anim/timeline edits
     markSceneSaved();
-    return { saved: true, path: target, reason: 'ok', ...(assets.saved.length || assets.failed.length ? { assets } : {}) };
+    return { saved: true, path: target, reason: 'ok' };
   }
   console.error(`[Editor] Failed to save scene to ${target}`);
   return { saved: false, path: target, reason: 'write-failed' };
@@ -1047,11 +1100,17 @@ export function warnAuthoredWritesWhileStopped(): void {
   clearAuthoredWritesWhileStopped();
 }
 
-/** Save all editor-managed assets: the primary scene file (via `saveScene`), THEN
- *  every OTHER dirty scene in the loaded chain — a base edited in place (Phase 12,
- *  M3, scene-loading.md) — to ITS OWN file. Per-material edits are
- *  persisted separately in their own `.mat.json` files via the Asset Inspector, so
- *  there's nothing else to flush here.
+/** Save all editor-managed assets: every parked ASSET doc (the dirty-asset registry), the
+ *  primary scene file (via `saveScene`), THEN every OTHER dirty scene in the loaded chain — a
+ *  base edited in place (Phase 12, M3, scene-loading.md) — to ITS OWN file. Per-material edits
+ *  are persisted separately in their own `.mat.json` files via the Asset Inspector, so there's
+ *  nothing else to flush here.
+ *
+ *  ⚠️ **This is the only place the asset flush happens, and that is deliberate.** `saveScene` has
+ *  callers that are not "Save All" — `panels/builtinCreatableAssets.ts` (Create Scene) and
+ *  `undo/applyPrefabUndo.ts` (an Apply-to-Prefab undo/redo) — and while the flush lived inside it,
+ *  creating a scene file or pressing Cmd-Z committed every parked particle/anim/rig doc to disk as
+ *  a side effect. Keep it here.
  *
  *  A base is written ONLY after the primary's own save succeeds — `saveScene`'s
  *  run-mode refusal (no writing while playing/previewing) sits above this loop, so it
@@ -1061,8 +1120,18 @@ export function warnAuthoredWritesWhileStopped(): void {
  *  Hierarchy scene-group row (Phase 13) is the visibility half that makes a silent
  *  multi-file save legible instead of a surprise. */
 export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {}): Promise<SaveResult> {
+  // FIRST, and unconditionally (#259). Parked asset docs are authored documents an asset panel or
+  // an agent op owns; the scene's refusals below are all about the live WORLD holding state that
+  // must not reach an authored scene file, and none of that reasoning reaches a `.particle.json`.
+  // This used to live inside `saveScene`, AFTER the scene write had succeeded — so a save during
+  // scrub/preview, in a prefab-edit world, with no path, with the Save-As dialog cancelled, or
+  // with a failed scene write all silently dropped it. Once the panels park instead of autosaving,
+  // four of those five are "the human pressed Cmd+S and nothing saved their edit".
+  const assets = await flushDirtyAssets();
+  const withAssets = <T extends SaveResult>(r: T): T =>
+    (assets.saved.length || assets.failed.length ? { ...r, assets } : r);
   const primaryResult = await saveScene(opts);
-  if (!primaryResult.saved) return primaryResult;
+  if (!primaryResult.saved) return withAssets(primaryResult);
   // #124, warn-only: name any authored field a system rewrote while the editor was stopped —
   // those values were just written to disk. Reported AFTER the save succeeds so a refused save
   // (playing/previewing) doesn't warn about a file nothing wrote.
@@ -1102,9 +1171,9 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
     console.log(`[Editor] Saved scene: ${sceneFile.entities.length} entities → ${entry.path}`);
     extraSaved.push({ path: entry.path, guid: entry.guid });
   }
-  return {
+  return withAssets({
     ...primaryResult,
     ...(extraSaved.length ? { extraSaved } : {}),
     ...(failed.length ? { failed } : {}),
-  };
+  });
 }

@@ -1,8 +1,9 @@
 /** AssetRefField — a GUID-aware asset reference input shared by the Inspector and
  *  the Particle Editor. Accepts an asset drag-and-drop (stores the asset's GUID),
  *  displays a GUID ref by the asset's friendly name (with the guid/path in a hover
- *  tooltip), and offers a "locate in Assets" button. Font refs resolve to a CSS
- *  family name on drop. References are GUID-only — see assetManifest. */
+ *  tooltip), and offers a "locate in Assets" button. References are GUID-only — see
+ *  assetManifest; `UIElement.fontFamily` was the last exception and stopped being one in
+ *  #231 (it now stores a GUID like every other ref, with a picker instead of typed names). */
 
 import { useEffect, useRef, useState } from 'react';
 import { useEditorStore } from '../store/editorStore';
@@ -12,6 +13,8 @@ import { BufferedTextInput, Tooltip, inputStyle, MIXED_PLACEHOLDER } from './fie
 import { acceptMatchesAsset } from '../utils/dragGhost';
 import { classifyJsonAssetSuffix } from '../../runtime/loaders/assetTypeClassifier';
 import { SpritePicker } from './SpritePicker';
+import { wholeImageSpriteRef } from './spritePickerGroups';
+import { FontPicker } from './FontPicker';
 
 /** Infer asset type from file extension. The JSON asset kinds come from the shared
  *  classifier (assetTypeClassifier) — the same single source of truth the asset
@@ -40,23 +43,24 @@ export function assetDisplayName(path: string): string {
  *  and the picker always write a GUID, so this only guards manual text entry: a stray
  *  string like "1" must NOT be committable into a GUID-only ref field, or the runtime
  *  resolves it to a path that 404s (the exact bug this prevents). Accepts: empty (clear),
- *  an asset GUID, an external URL/data-URI, a font-family name (font fields only), and a
- *  primitive sprite keyword (sprite/image fields only). Everything else is rejected. */
-export function isAcceptableTypedRef(v: string, accept?: string[], fontFamilyRef = false): boolean {
+ *  an asset GUID, an external URL/data-URI, and a primitive sprite keyword (sprite/image
+ *  fields only). Everything else is rejected.
+ *
+ *  ⚠️ There used to be one more exception: a free-form FAMILY NAME, accepted for
+ *  `UIElement.fontFamily` alone. #231 removed it — that field holds a font-asset GUID now,
+ *  and a CSS family name goes in the separate `systemFont` field, which is a plain string
+ *  field and never reaches this function. */
+export function isAcceptableTypedRef(v: string, accept?: string[]): boolean {
   const s = v.trim();
   if (!s) return true;                                   // empty = clear
   if (isGuid(s) || isExternalUrl(s)) return true;        // pasted GUID / http(s)·data·blob URL
-  // A CSS-font-FAMILY field (UIElement.fontFamily) holds a family name — any string is
-  // plausible. An SDF font-GUID field (Text2D/Text3D.font) does NOT: a typed non-GUID
-  // there is rejected (the runtime resolves GUIDs only, so a family name renders nothing).
-  if (fontFamilyRef && accept?.some((ext) => /\.(ttf|otf|woff2?)$/i.test(ext))) return true;
   // Primitive sprite keywords are valid sprite/texture refs.
   if (/^(circle|square|triangle)$/i.test(s) &&
       accept?.some((a) => a === 'sprite' || /\.(png|jpe?g|webp)$/i.test(a))) return true;
   return false;
 }
 
-export function AssetRefField({ label, value, onChange, overrideColor = false, accept, hint, placeholder, mixed = false, fontFamilyRef = false, editorPanel }: {
+export function AssetRefField({ label, value, onChange, overrideColor = false, accept, hint, placeholder, mixed = false, editorPanel }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
@@ -74,20 +78,27 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
   /** This is a CSS-font-FAMILY field (`UIElement.fontFamily`, DOM/UI text), so a
    *  dropped font resolves to its family NAME. Default false: SDF font fields
    *  (`Text2D`/`Text3D.font`) store the asset GUID like every other asset ref. */
-  fontFamilyRef?: boolean;
 }) {
   const divRef = useRef<HTMLDivElement>(null);
-  const fontFamilyRefRef = useRef(fontFamilyRef);
-  fontFamilyRefRef.current = fontFamilyRef;
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
   const acceptRef = useRef(accept);
   acceptRef.current = accept;
   const selectAsset = useEditorStore((s) => s.selectAsset);
   const openPanel = useEditorStore((s) => s.openPanel);
+  // Re-derive `getAllAssets()` for the sprite/font pickers when the manifest
+  // changes — a "Make 2D" conversion (#293) mints a new sprite entry via
+  // `/api/reimport`, and without this subscription this component never
+  // re-renders, so the picker keeps getting the STALE array captured at this
+  // component's last render. Same pattern as AtlasAssetView.tsx.
+  const assetsVersion = useEditorStore((s) => s.assetsVersion);
+  void assetsVersion;
   // Sprite picker: fields that accept sprites get a "▾" button (sliced sprites have
   // no Assets-panel row to drag from, so a picker is the assignment path).
   const acceptsSprite = !!accept?.includes('sprite');
+  // Font picker: a font ref is a GUID now (#231), and a GUID cannot be typed — so a
+  // font-accepting field gets an explicit picker beside the drag-drop path.
+  const acceptsFont = !!accept?.some((ext) => /\.(ttf|otf|woff2?)$/i.test(ext));
   const [pickerAnchor, setPickerAnchor] = useState<DOMRect | null>(null);
 
   // Listen for asset-drop CustomEvent dispatched by dragGhost's completeAssetDrop()
@@ -97,18 +108,36 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
     const onAssetDrop = (e: Event) => {
       const raw = (e as CustomEvent).detail as string;
       const { path, guid, type } = JSON.parse(raw) as { path: string; guid?: string; type?: string };
-      if (!acceptMatchesAsset(acceptRef.current, path, type)) return;
-      // A CSS-family field (UIElement.fontFamily, DOM/UI text): resolve the dropped
-      // font to its family NAME + ensure it's loaded. SDF font fields (Text2D/Text3D
-      // .font) fall through to the GUID path below — storing a family name there
-      // makes the SDF loader reject the ref and the text renders NOTHING.
-      if (fontFamilyRefRef.current && /\.(ttf|otf|woff2?)$/i.test(path)) {
-        // F7: a failed font fetch/decode must not surface as an unhandled rejection —
-        // warn and leave the ref unchanged (the prior family stays in effect).
-        loadFont(path)
-          .then(family => onChangeRef.current(family))
-          .catch(err => console.warn(`[AssetRefField] font load failed for ${path}:`, err));
+      if (!acceptMatchesAsset(acceptRef.current, path, type)) {
+        // #293 — this used to be a bare return: dropping a 3D-typed texture (the import
+        // default) onto a sprite-accepting field silently did nothing, with no hint that
+        // the texture needs its type flipped to 2D/UI before it exposes a sprite at all.
+        if (acceptRef.current?.includes('sprite') && type === 'texture') {
+          // Say which of the two situations this actually is. Dropping the TEXTURE row
+          // is rejected either way (2D refs are sprites-only), but the reasons are
+          // opposite: an already-2D texture HAS a sprite and the user simply grabbed the
+          // wrong row, while a 3D-typed one has none to grab. Asserting "typed 3D" for
+          // both was wrong for the first case and sent the user to convert a texture
+          // that needed no conversion.
+          const entry = guid ? getAssetEntry(guid) : undefined;
+          const hasSprite = !!(entry?.guid && wholeImageSpriteRef(entry.guid, getAssetEntry));
+          console.warn(
+            `[AssetRefField] "${path}" is a texture and this field takes a SPRITE. ` +
+            (hasSprite
+              ? `This texture already exposes a whole-image sprite — pick it with the sprite picker (▦), or drag the sprite row nested under the texture in Assets.`
+              : `It exposes no whole-image sprite: only a 2D/UI texture gets one, and the import default is 3D. Open the sprite picker (▦) on this field to convert it.`),
+          );
+        }
         return;
+      }
+      // A dropped FONT registers its face with the browser as well as storing the GUID:
+      // `UIElement.fontFamily` is consumed as a DOM `font-family`, so without the
+      // FontFace registration the Game panel would keep rendering the default typeface
+      // until the next scene load. The ref is written either way — a failed fetch/decode
+      // is warned, never an unhandled rejection, and never a reason to drop the ref (#231
+      // replaced the old behaviour, which wrote the resolved family NAME instead of a GUID).
+      if (/\.(ttf|otf|woff2?)$/i.test(path)) {
+        loadFont(path).catch(err => console.warn(`[AssetRefField] font load failed for ${path}:`, err));
       }
       // Store a GUID, not a path — refs must survive the asset being moved, and
       // the runtime hard-rejects raw-path refs. Prefer the payload's guid, then
@@ -132,7 +161,8 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
   const isAssetPath = value && value.startsWith('/') && value.includes('.');
   // References are GUIDs — resolve through the manifest to a concrete path.
   const guidPath = value && isGuid(value) ? resolveGuidToPath(value) : null;
-  // Font family names aren't paths — reverse-lookup to find the font asset
+  // A LEGACY family-name value (pre-#231) isn't a path — reverse-lookup to find the font
+  // asset anyway, so "Locate in Assets" still works while such a scene is being migrated.
   const isFontAccept = accept && accept.some(ext => /\.(ttf|otf|woff2?)$/i.test(ext));
   const fontAssetPath = isFontAccept && value && !isAssetPath && !guidPath ? fontPathFromFamily(value) : null;
   const targetPath = guidPath || (isAssetPath ? value : null) || fontAssetPath;
@@ -187,7 +217,7 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
       {hint ? <Tooltip text={hint} style={{ flex: 1, display: 'flex' }}>{labelEl}</Tooltip> : labelEl}
       {mixed ? (
         <BufferedTextInput value="" onChange={onChange} mixed placeholder={MIXED_PLACEHOLDER}
-          validate={(v) => isAcceptableTypedRef(v, accept, fontFamilyRef)}
+          validate={(v) => isAcceptableTypedRef(v, accept)}
           style={{ ...inputStyle, flex: 1, color: inputColor, fontWeight: inputWeight }} />
       ) : refName !== null ? (
         <Tooltip text={refTooltip} style={{ flex: 1, display: 'flex' }}>
@@ -202,7 +232,7 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
         </Tooltip>
       ) : (
         <BufferedTextInput value={value} onChange={onChange} placeholder={placeholder}
-          validate={(v) => isAcceptableTypedRef(v, accept, fontFamilyRef)}
+          validate={(v) => isAcceptableTypedRef(v, accept)}
           style={{ ...inputStyle, flex: 1, color: inputColor, fontWeight: inputWeight }} />
       )}
       {acceptsSprite && (
@@ -211,6 +241,14 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
           title="Pick a sprite"
           style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#888', padding: 0, fontSize: '12px', lineHeight: 1, flexShrink: 0 }}
         >▦</button>
+      )}
+      {acceptsFont && (
+        <button
+          data-ui-id="assetRef.pickFont"
+          onClick={(e) => setPickerAnchor((e.currentTarget as HTMLElement).getBoundingClientRect())}
+          title="Pick a font"
+          style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#888', padding: 0, fontSize: '12px', lineHeight: 1, flexShrink: 0 }}
+        >Aa</button>
       )}
       {canOpenPanel && (
         <button onClick={openInPanel} title="Open in editor" style={{
@@ -229,7 +267,16 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
           </svg>
         </button>
       )}
-      {pickerAnchor && (
+      {pickerAnchor && acceptsFont && (
+        <FontPicker
+          anchor={pickerAnchor}
+          assets={getAllAssets()}
+          onPick={(guid) => { onChange(guid); setPickerAnchor(null); }}
+          onClear={() => { onChange(''); setPickerAnchor(null); }}
+          onClose={() => setPickerAnchor(null)}
+        />
+      )}
+      {pickerAnchor && !acceptsFont && (
         <SpritePicker
           anchor={pickerAnchor}
           assets={getAllAssets()}

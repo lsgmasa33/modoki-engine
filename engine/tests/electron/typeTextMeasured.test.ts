@@ -15,24 +15,42 @@ import type { BrowserWindow } from 'electron';
 import { typeText } from '../../electron/rendererOps';
 
 /** A window whose focused element accepts `accepts` characters of whatever is typed. */
-function fakeWindow(opts: { typable?: boolean; before?: string; accepts?: number | 'all' } = {}) {
-  const { typable = true, before = '', accepts = 'all' } = opts;
+function fakeWindow(opts: {
+  typable?: boolean; before?: string; accepts?: number | 'all';
+  /** Model a field that refuses to be emptied, to pin the clearFirst failure report. */
+  unclearable?: boolean;
+} = {}) {
+  const { typable = true, before = '', accepts = 'all', unclearable = false } = opts;
   let value = before;
+  let selected = false;
   const sent: Array<Record<string, unknown>> = [];
   const executeJavaScript = vi.fn(async (script: string) => {
     // The active-element probe is the one that answers `gameSwallows`.
     if (script.includes('gameSwallows')) return { typable, gameSwallows: false, descriptor: 'input#name' };
+    // The select-all probe — a real <input>.select() selects, it does not change the value.
+    // `unclearable` models a field that resists BOTH halves — the selection does not stick and
+    // the delete is swallowed — which is the only way the caller ends up with old+new.
+    if (script.includes('selectNodeContents')) { selected = !unclearable; return value; }
     return value;                                   // the focused-value probe
   });
   const sendInputEvent = vi.fn((e: Record<string, unknown>) => {
     sent.push(e);
+    if (e.type === 'keyDown' && e.keyCode === 'Backspace') {
+      if (unclearable) return;                      // swallows the delete
+      if (selected) { value = ''; selected = false; } else value = value.slice(0, -1);
+      return;
+    }
     if (e.type !== 'char') return;
     const inserted = sent.filter((x) => x.type === 'char').length;
-    if (accepts === 'all' || inserted <= accepts) value += String(e.keyCode);
+    if (accepts === 'all' || inserted <= accepts) {
+      if (selected) { value = ''; selected = false; }  // Chromium replaces the selection
+      value += String(e.keyCode);
+    }
   });
   return {
     win: { webContents: { executeJavaScript, sendInputEvent } } as unknown as BrowserWindow,
     read: () => value,
+    sent,
   };
 }
 
@@ -44,16 +62,25 @@ describe('typeText measures the insert', () => {
     expect(r.error).toBeUndefined();
   });
 
-  it('a field the char path cannot write is reported as a SHORT insert, with a cause', async () => {
-    // `accepts: 0` stands in for the real failure mode: the keyCode carries no insertable
-    // character, so nothing lands and sendInputEvent still cannot fail.
+  it('a field that rejects the input is reported as a SHORT insert, with a cause', async () => {
+    // `accepts: 0` stands in for a field that refuses what you type — a numeric input, a max
+    // length, an input mask. `sendInputEvent` still cannot fail, so the MEASUREMENT is the only
+    // thing that can notice.
     const { win, read } = fakeWindow({ before: '', accepts: 0 });
-    const r = await typeText(win, 'あいう');
+    const r = await typeText(win, 'abc');
     expect(read()).toBe('');                     // nothing actually landed…
     expect(r.typed).toBe(0);                     // …and that is what is reported
     expect(r.valueAfter).toBe('');
     expect(r.error).toMatch(/0 of 3 character\(s\) appear to have reached it/);
-    expect(r.error).toMatch(/non-ASCII/);
+    expect(r.error).toMatch(/reformats, truncates or rejects input as you type/);
+    // ⚠️ The message must NOT blame non-ASCII input. It did, and the claim is false: Japanese,
+    // accented letters and emoji all insert cleanly through the char path (measured on Electron
+    // 43.2.0 — bug `xaewBYMBYXoeuiTllsI8`, QA-INPUT-0003). The old wording sent agents to
+    // modoki_eval, a NON-input write that a React controlled input never sees, so the
+    // recommended workaround was strictly more fragile than the path that works. The owner
+    // writes Japanese, which makes this the common path rather than a corner.
+    expect(r.error).not.toMatch(/non-ASCII/);
+    expect(r.error).not.toMatch(/modoki_eval/);
   });
 
   it('a PARTIAL insert is short too — not rounded up to success', async () => {
@@ -149,5 +176,42 @@ describe('typeText and a replaced selection', () => {
     } as unknown as BrowserWindow;
     const r = await typeText(win, 'xyz');
     expect(r.error).toMatch(/NOT in the field/);
+  });
+});
+
+describe('clearFirst REPLACES the field (no native accelerator)', () => {
+  it('empties the field before typing, instead of deleting one character', async () => {
+    // The bug: clearFirst sent Cmd+A — a native macOS Edit-menu ACCELERATOR that
+    // sendInputEvent cannot trigger — then one Backspace, so 'New Entity' + 'Buffalo Fort'
+    // became 'New EntitBuffalo Fort' and was reported as {ok:true, typed:12}.
+    const { win, read } = fakeWindow({ before: 'New Entity' });
+    const r = await typeText(win, 'Buffalo Fort', { clearFirst: true });
+    expect(read()).toBe('Buffalo Fort');
+    expect(r.valueAfter).toBe('Buffalo Fort');
+    expect(r.typed).toBe(12);
+    expect(r.error).toBeUndefined();
+  });
+
+  it('never relies on a Cmd/Ctrl+A chord — selection happens in the renderer', async () => {
+    const { win, sent } = fakeWindow({ before: 'New Entity' });
+    await typeText(win, 'x', { clearFirst: true });
+    const selectAllChord = sent.filter((e) => e.keyCode === 'a'
+      && Array.isArray(e.modifiers) && (e.modifiers as string[]).some((m) => m === 'meta' || m === 'control'));
+    expect(selectAllChord).toEqual([]);
+  });
+
+  it('a field it could NOT empty is an error naming what is still there, not a silent append', async () => {
+    const { win, read } = fakeWindow({ before: 'Sticky', unclearable: true });
+    const r = await typeText(win, 'New', { clearFirst: true });
+    expect(read()).toBe('StickyNew');
+    expect(r.error).toMatch(/clearFirst did NOT empty the field/);
+    expect(r.error).toMatch(/"Sticky"/);
+  });
+
+  it('clearFirst on an already-empty field is a clean no-op', async () => {
+    const { win } = fakeWindow({ before: '' });
+    const r = await typeText(win, 'abc', { clearFirst: true });
+    expect(r.valueAfter).toBe('abc');
+    expect(r.error).toBeUndefined();
   });
 });

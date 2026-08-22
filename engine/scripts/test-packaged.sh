@@ -76,9 +76,15 @@ CSC_IDENTITY_AUTO_DISCOVERY=false ./node_modules/.bin/electron-builder --dir \
 BIN="$(node "$PATHS" "$OUT" bin)"
 [ -x "$BIN" ] || { echo "[test-packaged] ERROR: app not built at $BIN"; exit 1; }
 
+# PIN the Vite log per clone, the same way launch-editor.sh does, and print THAT — this
+# banner used to name a bare `modoki-vite.log` it never set, so it was reporting devServer's
+# default rather than a path this script controls. Native (forward-slashed) via tmpdir, not
+# a literal /tmp: the app opens it as a native process and MSYS never rewrites env vars.
+export MODOKI_VITE_LOG="${MODOKI_VITE_LOG:-$(node "$PATHS" tmpdir)/modoki-vite-packaged-$(basename "$REPO").log}"
+
 echo "[test-packaged] launching packaged app${PROJECT:+ on $MODOKI_PROJECT}…"
 echo "[test-packaged]   app:      $BIN   (outside repo → faithful resolution)"
-echo "[test-packaged]   vite log: $(node "$PATHS" tmpdir)/modoki-vite.log"
+echo "[test-packaged]   vite log: $MODOKI_VITE_LOG"
 echo "[test-packaged]   main-process logs stream below. Ctrl-C to stop."
 echo "──────────────────────────────────────────────────────────────"
 exec "$BIN"

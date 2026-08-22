@@ -29,7 +29,17 @@ export function registerRenderTools(tool: ToolDef, ctx: ToolContext): void {
       'If NO viewport is mounted, modoki_render_scene is NOT a fallback — it needs the Game ' +
       'panel\'s 3D surface, i.e. exactly what is missing. Open the panel, or read the scene as ' +
       'DATA (modoki_get_scene_state / modoki_diagnose), which needs no renderer at all. ' +
-      'This FORCES a fresh render, so it CANNOT reveal a stale or render-on-demand frame — the broken frame heals in the capture. For the TRUE framebuffer use CDP Page.captureScreenshot (see CLAUDE.md). ',
+      '\n\n⚠️ This does NOT force a render. It is `webContents.capturePage()` — a screenshot of ' +
+      'the WINDOW, i.e. whatever each surface last drew. The Game panel renders continuously so ' +
+      'its pixels are current, but the editor SceneView is RENDER-ON-DEMAND: with nothing marking ' +
+      'it dirty it can hand you a frame from minutes ago, and repeated captures come back ' +
+      'BYTE-IDENTICAL through a change you just made. (Measured 2026-08-18: painting a visible ' +
+      'material red left three successive captures identical until a camera move re-armed the ' +
+      'gate.) So a capture that "did not change" is NOT evidence the change failed to render — ' +
+      'this description used to claim the opposite and cost a QA session a wrong verdict. To ' +
+      'force one, use modoki_render_scene (a real offscreen render, Game panel only), or move ' +
+      'the SceneView camera first. For the TRUE framebuffer use CDP Page.captureScreenshot ' +
+      '(see CLAUDE.md). ',
     {
       maxSide: z.number().int().positive().optional().describe('Longest-side cap in px (default 1568).'),
       quality: z.number().int().min(1).max(100).optional().describe('JPEG quality 1-100 (default 70). SAME unit as render_scene/render_sequence; the effective value is echoed back.'),
@@ -51,7 +61,9 @@ export function registerRenderTools(tool: ToolDef, ctx: ToolContext): void {
       'orbiting. Only the runtime Scene3D (mounted by the Game panel) registers an offscreen ' +
       'renderer, so the framing you get is the GAME camera unless you override `camera`, and a ' +
       'closed Game panel means there is nothing to render. Check `surfaces` in ' +
-      'modoki_get_editor_state. The reply echoes `surface`.\n\n' +
+      'modoki_get_editor_state. The reply echoes `surface` — the label of the surface that ' +
+      'actually served the frame, read off the mounted registrant, so it confirms rather than ' +
+      'assumes (`game-3d` today, always).\n\n' +
       'This FORCES a fresh render, so it CANNOT reveal a stale or render-on-demand frame — the broken frame heals in the capture. For the TRUE framebuffer use CDP Page.captureScreenshot (see CLAUDE.md). ',
     {
       width: z.number().int().positive().max(4096).optional().describe('Output width px (default: live viewport; ≤4096).'),
@@ -75,7 +87,7 @@ export function registerRenderTools(tool: ToolDef, ctx: ToolContext): void {
       'Read a few of the returned frames in order to see the temporal progression.\n\n' +
       'REFUSED (409) when the editor is STOPPED: time does not advance there, so every frame ' +
       'would be identical and a sequence cannot show motion. Press Play first, or use ' +
-      'render_scene for a static frame — or pass force:true to render identical frames anyway.\n\n' +
+      'render_scene for a static frame — or pass forceRender:true to render identical frames anyway.\n\n' +
       'TIMING: use the returned `tMs[]` (ms from the first frame), never frameIndex × 1/fps. Each ' +
       'frame costs a synchronous render + IPC round-trip that the requested rate does not account ' +
       'for, so the reply reports `requestedFps` AND the achieved `actualFps`/`spanMs`.\n\n' +
@@ -83,15 +95,22 @@ export function registerRenderTools(tool: ToolDef, ctx: ToolContext): void {
     {
       frames: z.number().int().min(1).max(120).optional().describe('Frame count (default 8, ≤120).'),
       fps: z.number().min(1).max(60).optional().describe('REQUESTED sampling rate (default 10, ≤60). The achieved rate comes back as `actualFps`; frame times as `tMs[]`.'),
-      force: z.boolean().optional().describe('Render even when the editor is STOPPED and every frame will be identical.'),
+      // RENAMED from `force` (2026-08-22). §2: "if two tools need different meanings, they need
+      // different names" — `force` means "proceed even though there is unsaved work" on
+      // build/add_native_target/ota_publish/load_scene/prefab, and meant something entirely
+      // unrelated here. One word, two meanings, on one surface. With .strict() armed a caller who
+      // passes the old `force` now gets a refusal naming the real params, which is the loud
+      // outcome; silently accepting it under the wrong mental model was the quiet one.
+      forceRender: z.boolean().optional().describe('Render even when the editor is STOPPED and every frame will be identical. Nothing to do with unsaved work — unlike `force` on modoki_build / modoki_load_scene, which is about that.'),
       width: z.number().int().positive().max(4096).optional().describe('Output width px (default: live viewport; ≤4096). Per FRAME — forwarded to the same render op as modoki_render_scene.'),
       height: z.number().int().positive().max(4096).optional().describe('Output height px (default: live viewport; ≤4096). Per frame.'),
       quality: z.number().int().min(1).max(100).optional().describe('JPEG quality 1-100 (default 85), per frame — the SAME unit as capture_viewport/render_scene.'),
       camera: z.object({
-        position: z.array(z.number()).length(3).optional(),
-        target: z.array(z.number()).length(3).optional(),
-        fov: z.number().optional(),
-      }).optional(),
+        position: z.array(z.number()).length(3).optional().describe('World camera position [x,y,z].'),
+        target: z.array(z.number()).length(3).optional().describe('Look-at target [x,y,z].'),
+        fov: z.number().optional().describe('Vertical FOV degrees.'),
+      }).optional()
+        .describe('Override the render camera: position [x,y,z], target [x,y,z] to look at, fov in degrees. Omit to use the live viewport camera. Same shape as modoki_render_scene.'),
     },
     async (args) => {
       // Allow enough wall-clock for the whole sequence: frames sampled at fps, each

@@ -13,7 +13,8 @@
 import { useState, type CSSProperties } from 'react';
 import { scrollRootStyle } from '../tabLayout';
 import { useInterval } from '../useSampled';
-import { getFrameProfile, BUDGET_30FPS_MS } from '../../core/frameProfiler';
+import { getFrameProfile, BUDGET_30FPS_MS, getWorstStallWindow } from '../../core/frameProfiler';
+import { getBootTimeline, getBootOrigin, bootSpansOverlapping } from '../../core/bootTimeline';
 import { getMarkerFaults, isProfilerEnabled, getMarkerTree, type MarkerSample } from '../../core/profilerMarkers';
 import { getMarkerAggregate, MARKER_WINDOW_FRAMES } from '../../core/profilerAggregate';
 import { startCapture, stopCapture, getCapture, clearCapture, exportCapture, getWorstCapturedFrame } from '../../core/profilerCapture';
@@ -96,8 +97,8 @@ export function ProfilerTab() {
         <div style={headingStyle}>
           Markers
           <span style={{ float: 'right', display: 'flex', gap: 4 }}>
-            <button style={tabBtn(view === 'self')} onClick={() => setView('self')}>Self</button>
-            <button style={tabBtn(view === 'tree')} onClick={() => setView('tree')}>Tree</button>
+            <button data-ui-id="profiler.markers.self" style={tabBtn(view === 'self')} onClick={() => setView('self')}>Self</button>
+            <button data-ui-id="profiler.markers.tree" style={tabBtn(view === 'tree')} onClick={() => setView('tree')}>Tree</button>
           </span>
         </div>
 
@@ -130,6 +131,7 @@ export function ProfilerTab() {
         )}
       </section>
 
+      <BootSection />
       <GpuSection />
       <CountersSection />
       <CaptureSection />
@@ -141,6 +143,63 @@ export function ProfilerTab() {
  *  with "where did my 100ms go?" can find the switch. Off by default: enabling makes three
  *  allocate a query set and write two timestamps per pass, and the plan's overhead rule says the
  *  profiler must not change the thing it measures. */
+/** Boot phases (#238) — the one section here that is NOT about the live frame. A cold-boot
+ *  freeze is invisible to everything above it by construction: the frame profiler DROPS a stall
+ *  from its percentiles (one 1.8 s frame would poison the whole window), and the marker tree is
+ *  zeroed every frame. This reads the always-on boot timeline and, when a frame has been
+ *  dropped, says which spans were open across it — the attribution three frame-marker guesses
+ *  failed to produce. On device this is the only surface a human can read it from. */
+function BootSection() {
+  const tl = getBootTimeline();
+  if (tl.spans.length === 0) return null;
+  const stall = getWorstStallWindow();
+  const origin = getBootOrigin();
+  const during = stall ? bootSpansOverlapping(stall.startMs - origin, stall.endMs - origin) : [];
+  const longest = tl.spans
+    .filter((sp) => sp.endMs >= 0)
+    .sort((a, b) => (b.endMs - b.startMs) - (a.endMs - a.startMs))
+    .slice(0, 8);
+  const rows = during.length > 0 ? during.slice(0, 8) : longest;
+
+  return (
+    <section>
+      <div style={headingStyle}>Boot phases</div>
+      <div style={hintStyle}>
+        {during.length > 0
+          ? <>Spans open across the worst dropped frame ({(getFrameProfile().worstStallMs).toFixed(0)}ms) — what the boot stall was actually doing.</>
+          : <>No frame dropped yet, so nothing to attribute; showing the longest boot spans instead. Cold-boot to measure a stall.</>}
+        {tl.dropped > 0 && <> <b>Timeline full — {tl.dropped} later spans not recorded.</b></>}
+      </div>
+      <table style={tableStyle}>
+        <thead>
+          <tr>
+            <th style={thStyle}>Phase</th>
+            <th style={thStyle}>Detail</th>
+            <th style={thNumStyle}>At</th>
+            <th style={thNumStyle}>{during.length > 0 ? 'In stall' : 'Dur'}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((sp, i) => (
+            <tr key={`${sp.name}:${i}`}>
+              <td style={tdStyle}>{sp.name}</td>
+              <td style={{ ...tdStyle, opacity: 0.55 }}>{sp.detail ?? ''}</td>
+              <td style={tdNumStyle}>{sp.startMs.toFixed(0)}ms</td>
+              <td style={tdNumStyle}>
+                {'overlapMs' in sp
+                  ? `${(sp as { overlapMs: number }).overlapMs.toFixed(0)}ms`
+                  // An open span reports "open", never a plausible-looking number — it may BE
+                  // the stall, and a fabricated duration would hide exactly that.
+                  : (sp.endMs < 0 ? 'open' : `${(sp.endMs - sp.startMs).toFixed(0)}ms`)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
 function GpuSection() {
   useInterval(500);
   const gpu = getGpuProfile();
@@ -150,7 +209,7 @@ function GpuSection() {
       <div style={headingStyle}>
         GPU
         <span style={{ float: 'right', display: 'flex', gap: 4 }}>
-          <button style={tabBtn(on)} onClick={() => setGpuTimingEnabled(!on)}>
+          <button data-ui-id="profiler.gpu.toggle" style={tabBtn(on)} onClick={() => setGpuTimingEnabled(!on)}>
             {on ? '■ Stop' : '● Measure'}
           </button>
         </span>
@@ -266,19 +325,20 @@ function CaptureSection() {
       <div style={headingStyle}>Capture</div>
       <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
         {cap.capturing ? (
-          <button style={tabBtn(true)} onClick={() => stopCapture()}>■ Stop ({cap.frames.length})</button>
+          <button data-ui-id="profiler.capture.stop" style={tabBtn(true)} onClick={() => stopCapture()}>■ Stop ({cap.frames.length})</button>
         ) : (
-          <button style={tabBtn(false)} onClick={() => { startCapture(); setFrameIdx(0); }}>● Record</button>
+          <button data-ui-id="profiler.capture.record" style={tabBtn(false)} onClick={() => { startCapture(); setFrameIdx(0); }}>● Record</button>
         )}
         {has && !cap.capturing && (
           <>
-            <button style={tabBtn(false)} onClick={() => { clearCapture(); setFrameIdx(0); }}>Clear</button>
+            <button data-ui-id="profiler.capture.clear" style={tabBtn(false)} onClick={() => { clearCapture(); setFrameIdx(0); }}>Clear</button>
             {worst && (
-              <button style={tabBtn(false)} onClick={() => setFrameIdx(worst.index)}>
+              <button data-ui-id="profiler.capture.jumpWorst" style={tabBtn(false)} onClick={() => setFrameIdx(worst.index)}>
                 Jump to worst ({ms(worst.frameMs)})
               </button>
             )}
             <button
+              data-ui-id="profiler.capture.export"
               style={tabBtn(false)}
               onClick={() => {
                 // Plain JSON — diffable, attachable to an issue, and readable by an agent.

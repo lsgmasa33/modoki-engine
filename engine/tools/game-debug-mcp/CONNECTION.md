@@ -75,7 +75,7 @@ the lease is **first-wins**, so an explicit connect can't grab a device another 
 
 **Percept — read-by-data** (structured, summary-first, GUID-addressed, floats rounded 9 sig-figs).
 These reuse the SAME op registry as the editor `modoki` MCP, delegated onto the device path (see
-`docs/plans/device-percept-enact-plan.md`). Verify game state by DATA — critical on Android, where the
+`docs/debug-tools-mcp.md`). Verify game state by DATA — critical on Android, where the
 WebGPU screenshot is black:
 
 | Tool | Description |

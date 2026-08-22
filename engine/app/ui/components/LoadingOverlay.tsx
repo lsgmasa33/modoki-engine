@@ -6,13 +6,23 @@ import { useEffect, useState } from 'react';
 
 interface Props {
   visible: boolean;
+  /** Copy shown beside the spinner. Defaults to 'Loading…'. Ignored when `progress` is set —
+   *  that variant carries its own label. */
+  label?: string;
+  /** Skip the anti-flash mount delay below and show on the very next render.
+   *
+   *  ⚠️ Required by the tier-switch overlay (#227), which has ~2 frames to get PAINTED before the
+   *  main thread blocks on a shader recompile. Under the default 120 ms delay the compile would
+   *  start first and the overlay would appear — if at all — only after the stall it exists to
+   *  cover. */
+  immediate?: boolean;
   /** When set, shows a progress bar + label instead of the spinner — the OTA
    *  mandatory-update download gate (docs/ota-updates.md, Phase 3b) is the only
    *  caller today. `fraction: null` = indeterminate (total bytes not yet known). */
   progress?: { fraction: number | null; label: string } | null;
 }
 
-export default function LoadingOverlay({ visible, progress }: Props) {
+export default function LoadingOverlay({ visible, label, progress, immediate }: Props) {
   // Delay mount briefly so a fast preload (< 120 ms) doesn't flash an overlay.
   const [mounted, setMounted] = useState(false);
 
@@ -21,9 +31,13 @@ export default function LoadingOverlay({ visible, progress }: Props) {
       setMounted(false);
       return;
     }
+    if (immediate) {
+      setMounted(true);
+      return;
+    }
     const t = setTimeout(() => setMounted(true), 120);
     return () => clearTimeout(t);
-  }, [visible]);
+  }, [visible, immediate]);
 
   if (!visible && !mounted) return null;
 
@@ -89,7 +103,7 @@ export default function LoadingOverlay({ visible, progress }: Props) {
                 animation: 'loading-overlay-spin 0.9s linear infinite',
               }}
             />
-            <span>Loading…</span>
+            <span>{label ?? 'Loading…'}</span>
           </>
         )}
       </div>

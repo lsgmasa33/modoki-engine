@@ -46,6 +46,7 @@ function resolveMaterial(materialRef: string) { return materialProvider.get()?.r
 import { getReadValue } from '../core/readSourceRegistry';
 import { sampleCurve } from '../core/curves';
 import { onWorldSwap } from '../core/ecs/world';
+import { markMaterial3DDirty } from './materialDirty';
 
 /** Default clock wrap (seconds). Well below the ~45000 s float32 cliff that froze the
  *  stripe scroll, yet long enough that the wrap seam is rare in an editor session. */
@@ -63,6 +64,15 @@ const clocks = new Map<string, number>();
  *  here — it's unsupported; see resolvePropBase.) */
 const _defaultBaseCache = new Map<number, THREE.Material[]>();
 
+/** Last value written for each `prop` override, keyed `${id}:${index}:${target}`.
+ *
+ *  Its ONLY job is deciding when to bump the 3D material-dirty signal — the editor SceneView is
+ *  render-on-demand and nothing else in this write path arms its gate, so a changed prop that
+ *  never says so leaves the viewport showing the pre-change frame forever (see
+ *  `rendering/materialDirty.ts`). Comparing values rather than marking unconditionally is what
+ *  keeps a CONSTANT-source override costing one frame instead of pinning the gate open. */
+const _lastPropValue = new Map<string, number>();
+
 /** Entity ids already warned about an unsupported prop base (dev only) — one warning per entity. */
 const _noBaseWarned = new Set<number>();
 
@@ -75,11 +85,12 @@ const _vec2DWarned = new Set<number>();
 /** Entity ids already warned about a kind:'texture' override on a 3D material (dev only). */
 const _tex3DWarned = new Set<number>();
 
-onWorldSwap(() => { clocks.clear(); _defaultBaseCache.clear(); _noBaseWarned.clear(); _prop2DWarned.clear(); _vec2DWarned.clear(); _tex3DWarned.clear(); });
+onWorldSwap(() => { clocks.clear(); _lastPropValue.clear(); _defaultBaseCache.clear(); _noBaseWarned.clear(); _prop2DWarned.clear(); _vec2DWarned.clear(); _tex3DWarned.clear(); });
 
 /** Test/teardown hook — reset all accumulators. */
 export function resetMaterialInstanceClocks(): void {
   clocks.clear();
+  _lastPropValue.clear();
   _defaultBaseCache.clear();
   _noBaseWarned.clear();
   _prop2DWarned.clear();
@@ -257,7 +268,17 @@ export function materialInstanceSystem(world: World): void {
         if (!baseResolved) { base = resolvePropBase(entity, objects as THREE.Mesh[], id); baseResolved = true; }
         // base is undefined for a `.mat.json` GUID still async-loading (skip this frame, retry
         // next) OR an unsupported single-default material (warned once inside resolvePropBase).
-        if (base) applyPropOverride(id, objects as THREE.Mesh[], base, override.target, value);
+        if (base) {
+          const rebound = applyPropOverride(id, objects as THREE.Mesh[], base, override.target, value);
+          // Arm the SceneView's render-on-demand gate — this write touches a THREE material, not a
+          // trait, so no ECS dirty source sees it. Only on an ACTUAL change (or a rebind onto a
+          // new clone), so a constant override settles instead of pinning the gate open.
+          const vk = `${id}:${i}:${override.target}`;
+          if (rebound || _lastPropValue.get(vk) !== value) {
+            _lastPropValue.set(vk, value);
+            markMaterial3DDirty();
+          }
+        }
       } else {
         // Default (incl. omitted kind) → uniform: written to userData; the shader's uniform
         // reads it per-draw via onObjectUpdate. Matches hasPropOverride (kind === 'prop').

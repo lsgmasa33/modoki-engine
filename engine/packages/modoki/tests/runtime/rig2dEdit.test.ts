@@ -80,6 +80,43 @@ const soleBone = (part: { skinIndices?: number[]; skinWeights?: number[] }, v = 
   return -1;
 };
 
+// Found by the close-out sweep of the weight-precision fix: the SAME float32 truncation, one
+// function away, on the other half of the authored rig. `apply2D` writes into its `out` param,
+// and every caller here handed it a Float32Array — including the ones whose result goes straight
+// back into `bones[i].x/y` and onto disk via the 400ms autosave.
+describe('reparentBone preserves the authored local position exactly', () => {
+  const rigAt = (x: number, y: number): Rig2DFile => ({
+    id: 'g',
+    bones: [
+      { name: 'root', parent: -1, x: 0, y: 0, rot: 0 },
+      { name: 'child', parent: 0, x, y, rot: 0 },
+      { name: 'other', parent: -1, x: 0, y: 0, rot: 0 },
+    ],
+    mesh: { verts: [[0, 0]], uvs: [[0, 0]], tris: [] },
+    skinIndices: [0, 0, 0, 0], skinWeights: [1, 0, 0, 0],
+  });
+
+  it('reparenting under an IDENTITY frame is a no-op on x/y, to the last bit', () => {
+    // root and 'other' are both at the origin unrotated, so the world→local frame is the
+    // identity and the bone's local position must come back UNCHANGED. Through a Float32Array
+    // it came back as 0.10000000149011612 / 37.70000076293945 — values nobody authored, written
+    // to disk by an operation whose contract is "preserve the world position".
+    const r = reparentBone(rigAt(0.1, 37.7), 1, 2);
+    expect(r.bones![1].parent).toBe(2);
+    expect(r.bones![1].x).toBe(0.1);      // exact, not closeTo — float32 is ~1e-8 off here
+    expect(r.bones![1].y).toBe(37.7);
+  });
+
+  it('keeps float64 precision when the frame is NOT the identity', () => {
+    const d = rigAt(0.1, 37.7);
+    d.bones![2] = { name: 'other', parent: -1, x: 5.5, y: -2.25, rot: 0 };
+    const r = reparentBone(d, 1, 2);
+    // world (0.1, 37.7) seen from a parent at (5.5, -2.25) → exactly these doubles.
+    expect(r.bones![1].x).toBe(0.1 - 5.5);
+    expect(r.bones![1].y).toBe(37.7 + 2.25);
+  });
+});
+
 describe('removeBone on a v2 (multi-part) rig — #179', () => {
   it('renumbers EVERY part, not just the top-level v1 fields', () => {
     const r = removeBone(rigV2(), 0); // remove 'root' → mid 1→0, tip 2→1
@@ -154,6 +191,64 @@ describe('removeBone on a v2 (multi-part) rig — #179', () => {
     // absent `def.mesh` would be fabricating data — and it is what hid the bug.
     expect(r.skinIndices).toBeUndefined();
     expect(r.skinWeights).toBeUndefined();
+  });
+
+  // QA-ASSET-0015. Deleting a bone NO vertex is bound to used to rewrite every weight in the
+  // file: each surviving vertex was re-accumulated and divided by its own sum, and an authored
+  // set sums to 1 ± an ulp, so `w / sum` moved every value by an ulp. The editor's 400ms autosave
+  // then wrote that to disk — a 60-line git diff on a rig nothing semantically changed. These
+  // pin BYTE equality, not closeTo: an ulp is exactly what `toBeCloseTo` cannot see.
+  describe('an untouched vertex keeps its authored weights byte-for-byte', () => {
+    // The real numbers from games/skin-test/runtime/assets/rigs/bar.rig2d.json, whose first
+    // vertex sums to 1 + 2.2e-16 — the input that produced the reported diff.
+    const AUTHORED = [0.7172465286407307, 0.261419626458445, 0.021333844900824406, 0];
+
+    const withWeights = (): Rig2DFile => {
+      const d = rigV2();
+      d.parts![0].skinIndices = [2, 1, 0, 0];   // tip / mid / root — none of them 'bone3'
+      d.parts![0].skinWeights = [...AUTHORED];
+      // A fourth bone nothing is weighted to, so deleting it cannot touch any vertex.
+      d.bones!.push({ name: 'bone3', parent: 2, x: 0, y: 30, rot: 0 });
+      return d;
+    };
+
+    it('deleting an unweighted bone does not perturb a single weight', () => {
+      const r = removeBone(withWeights(), 3);
+      expect(r.parts![0].skinWeights).toEqual(AUTHORED);       // exact, not closeTo
+      expect(r.parts![0].skinIndices).toEqual([2, 1, 0, 0]);   // no bone below 3 shifted
+    });
+
+    it('keeps the weights exact even when the indices DO shift', () => {
+      // Delete 'root' (0) — every remaining bone renumbers, but this vertex loses no bucket and
+      // merges none, so its weights are still the authored ones.
+      const d = withWeights();
+      d.parts![0].skinIndices = [2, 1, 3, 0];  // tip / mid / bone3 — nothing on the doomed root
+      d.parts![0].skinWeights = [...AUTHORED];
+      const r = removeBone(d, 0);
+      expect(r.parts![0].skinWeights).toEqual(AUTHORED);
+      expect(r.parts![0].skinIndices).toEqual([1, 0, 2, 0]);   // 2→1, 1→0, 3→2
+    });
+
+    it('still renormalizes a vertex that genuinely lost a bucket', () => {
+      // The repair half must survive the fast path: dropping a bone this vertex IS bound to
+      // leaves the rest short of 1, and they have to be scaled back up.
+      const d = withWeights();
+      const r = removeBone(d, 0);   // 'root' carries AUTHORED[2] on this vertex
+      const w = r.parts![0].skinWeights!;
+      expect(w[0] + w[1] + w[2] + w[3]).toBeCloseTo(1, 12);
+      expect(w[0]).not.toBe(AUTHORED[0]);
+    });
+
+    it('still renormalizes a vertex whose authored weights do not sum to 1', () => {
+      // Genuinely malformed input is not "untouched" — the loader would renormalize it out from
+      // under the editor's raw-def preview, so removeBone still repairs it here.
+      const d = withWeights();
+      d.parts![0].skinWeights = [0.2, 0.2, 0, 0];
+      const r = removeBone(d, 3);   // deleting the unweighted bone — nothing else changes
+      const w = r.parts![0].skinWeights!;
+      expect(w[0]).toBeCloseTo(0.5, 12);
+      expect(w[1]).toBeCloseTo(0.5, 12);
+    });
   });
 
   it('a part with no mesh is passed through untouched', () => {

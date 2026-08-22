@@ -71,13 +71,26 @@ export async function acquireFont(sceneId: SceneId, guid: string): Promise<FontP
   const inFlight = loadPromises.get(guid);
   if (inFlight) return inFlight;
 
+  // Resolve BEFORE the memo, because an unresolvable guid must NOT be memoized. `fontUrls` is
+  // sync, so the old shape returned null from inside the promise body and then stored that
+  // settled null in `loadPromises` — where nothing ever removed it (the `finally` that clears the
+  // memo belongs to the try BELOW this early return). A font ref bound in the window before the
+  // manifest reaches the client was therefore dead for the whole session: the manifest arrived,
+  // the guid resolved, and every later acquire still handed back the cached null, so the font
+  // never rendered. Found writing the warn-forget test for it.
+  const urls = fontUrls(guid);
+  if (!urls) {
+    if (!unknownSeen.has(guid)) { unknownSeen.add(guid); console.warn(`[fontAtlasLoader] cannot resolve font guid ${guid}`); }
+    return null;
+  }
+  // It resolves now → forget it, so a genuine LATER break warns again. Same gap
+  // `resolveRefWarnOnce` had (QA-ASSET-0005): one miss in the window before the manifest
+  // arrives otherwise silences this guid for the rest of the session, and the deletion that
+  // actually breaks the font then produces no console line at all.
+  unknownSeen.delete(guid);
+
   const gen = generation;
   const promise = (async (): Promise<FontProvider | null> => {
-    const urls = fontUrls(guid);
-    if (!urls) {
-      if (!unknownSeen.has(guid)) { unknownSeen.add(guid); console.warn(`[fontAtlasLoader] cannot resolve font guid ${guid}`); }
-      return null;
-    }
     try {
       // Dynamic (path B): generate glyphs at runtime from real outlines — the pinned
       // `~instance.ttf` when axes are authored, else the source .ttf (never the baked

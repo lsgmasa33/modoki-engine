@@ -26,7 +26,11 @@ import type { MouseButton, InputModifier } from './rendererOps';
 // than re-declared because both sides speak this shape over the bridge, and a second copy
 // of a wire contract silently drifts.
 import type { DomPointResolution } from '../app/debug/domPointContract';
+// A VALUE, not a type — the refusal messages branch on it. From the DOM-free contract module for
+// the reason its header gives: importing domResolve.ts would pull `document` into this program.
+import { NOTHING_AT_POINT } from '../app/debug/domPointContract';
 import type { EntityPointSpec, EntityPointResolution, OcclusionScope, AimedAt } from '../app/debug/entityPointContract';
+import type { ErrorCode } from '../tools/shared/mcpResult';
 
 /** The trusted-input primitives, pre-bound to the live window by the caller. */
 export interface InputOps {
@@ -61,10 +65,38 @@ export interface InputRouteDeps {
   requestRenderer(op: string, params: unknown): Promise<unknown>;
 }
 
-/** The `/api/input/*` dispatcher, plus `resetHeldPointer` for the caller to clear the
- *  sustained-pointer state on a renderer reload (see createInputRoutes). */
+/** The `/api/input/*` dispatcher, plus the sustained-pointer lifecycle hooks the host needs
+ *  (see createInputRoutes).
+ *
+ *  Two clears, and they are NOT interchangeable:
+ *   • `resetHeldPointer()` — forget the press without dispatching anything. For a renderer
+ *     RELOAD, where the document that owned the press is already gone, so there is nothing left
+ *     to send a `mouseup` at and the fresh document starts with nothing held anyway.
+ *   • `releaseHeldPointer()` — dispatch the matching `mouseup` into the LIVE document, then
+ *     forget. This is the one that actually unlatches the renderer's `pointerSource` (#302).
+ *  Using the first where the second is meant is the whole defect: the backend forgets the press
+ *  and the renderer stays latched, with the human's own mouse dead in the Game panel. */
 export type InputRoutesHandler =
-  ((req: HostRequest) => Promise<BackendResult | null>) & { resetHeldPointer(): void };
+  ((req: HostRequest) => Promise<BackendResult | null>) & {
+    resetHeldPointer(): void;
+    /** Dispatch the held press's matching `mouseup` at its last point, then clear. For a mouse
+     *  gesture that does NOT flow through this dispatcher and so cannot supersede a hold on its
+     *  own — `/api/capture-gesture` drives its drag straight through `rendererOps`. Idempotent;
+     *  resolves to a description of what was released, or null if nothing was held. */
+    releaseHeldPointer(reason: 'superseded'): Promise<string | null>;
+    /** The live sustained-pointer state, for Percept (`/api/editor-state`). null = nothing held. */
+    getHeldPointer(): { button: MouseButton; x: number; y: number; heldMs: number } | null;
+  };
+
+/** How a held press ended, when it was not the agent's own `action:'up'`. Named rather than
+ *  boolean because the NEXT call's 409 quotes it: an agent whose `move` is refused has to learn
+ *  that its press is gone AND why, or the refusal is the same silent-diagnosis trap in a new
+ *  place — and the three causes call for three different responses.
+ *
+ *  `reload` is the odd one out and must not be folded into the others: nothing was DISPATCHED
+ *  there (see `resetHeldPointer`), the press died with its document. Reporting it as an
+ *  auto-release would describe a mouseup that never happened. */
+export type HeldLossReason = 'idle' | 'superseded' | 'reload';
 
 /** A point the agent wants to act on: an ENTITY, a CSS selector, or explicit coordinates.
  *
@@ -72,7 +104,21 @@ export type InputRoutesHandler =
  *  selector-overrides-coordinates rule rather than replacing it (the tool descriptions have
  *  documented that ordering since selectors landed, so re-litigating it here would break
  *  callers for no gain). */
-export interface PointSpec { x?: number; y?: number; selector?: string; entity?: EntityPointSpec }
+export interface PointSpec {
+  x?: number; y?: number; selector?: string; entity?: EntityPointSpec;
+  /** Aim at the target even though something covers it. Default false = REFUSE.
+   *
+   *  A resolvable aim (`entity`, `selector`) names a THING, so a press the surface would deliver
+   *  somewhere else is a failed intent, not a caveat — `mcp-tool-conventions.md` §0 ranks a false
+   *  success as the worst outcome on this surface, above backwards compatibility. The entity path
+   *  has refused since 2026-08-02 (609663e75 — 2026-07-29 added entity ADDRESSING, not the
+   *  refusal) and the DEVICE surface refuses a covered selector too
+   *  (`device_tap`: "a selector miss or an OCCLUDED target is refused here rather than tapping
+   *  something else"); the editor's selector path was the one holdout, which is the divergence §9
+   *  predicts when a rule is implemented twice. Raw `{x,y}` is deliberately NOT covered: you asked
+   *  for a coordinate and got the coordinate — §3's other category. */
+  allowOccluded?: boolean;
+}
 
 /** A resolved point plus the provenance an agent needs to trust it. */
 export interface ResolvedPoint {
@@ -105,27 +151,104 @@ export interface ResolvedPoint {
 }
 
 const json = (body: unknown, status?: number): BackendResult => ({ kind: 'json', ...(status ? { status } : {}), body });
-const bad = (error: string) => json({ error }, 400);
+const bad = (error: string, code?: ErrorCode) => json({ error, ...(code ? { code } : {}) }, 400);
 
 /** Resolve a `{selector}` in the renderer, or pass `{x,y}` through. Returns the point or
  *  a prefixed error string — never throws, so a bad selector is a 400, not a 500. */
+/** The one sentence a refusal adds when the DOCK IS MID-MOVE (#261).
+ *
+ *  An aim refusal can be TRUE at the instant it is asked and gone a frame later: the layout has
+ *  just changed and the target has not reached its final position. The refusal is accurate; the
+ *  advice it offers ("dismiss what covers it") is not, because nothing needs dismissing and the
+ *  caller's next move is simply to re-aim.
+ *
+ *  This is a HINT, not a retry. The call still refuses and the input is still not dispatched. The
+ *  trade #261 weighed was whether to re-resolve and press on, and the measurements argued against
+ *  it: the settle window is 0-1 frames, so a caller who re-aims at all has already waited longer
+ *  than the layout needs. What was missing was never the retry — it was the caller being able to
+ *  TELL the two cases apart.
+ *
+ *  Costs one frame, on the refusal path ONLY. Never throws: a renderer that cannot answer yields
+ *  no hint rather than a failed refusal. */
+async function settlingHint(requestRenderer: InputRouteDeps['requestRenderer']): Promise<string> {
+  try {
+    const r = (await requestRenderer('layout-settling', {})) as { settling?: boolean; moved?: number } | null;
+    if (!r?.settling) return '';
+    return ` ⚠️ THE LAYOUT IS STILL MOVING as this was measured (${r.moved} element(s) shifted within `
+      + 'one frame) — a dock/panel change has not settled, so this refusal may describe a position '
+      + 'the target is about to leave. Re-aim once before treating it as real.';
+  } catch { return ''; }
+}
+
 export async function resolvePoint(
   spec: PointSpec | undefined,
   which: string,
   requestRenderer: InputRouteDeps['requestRenderer'],
-): Promise<{ point: ResolvedPoint } | { error: string }> {
+): Promise<{ point: ResolvedPoint } | { error: string; code?: ErrorCode }> {
   // ── entity: resolve {guid}/{name}/{id} to the entity's LIVE screen rect in the renderer. ──
   // Highest precedence: it is the most specific thing the caller can say, and (unlike a
   // selector) there is no legacy call shape that passes it incidentally.
   if (spec && spec.entity && typeof spec.entity === 'object' && Object.keys(spec.entity).length > 0) {
     let res: EntityPointResolution | null;
+    // A top-level `allowOccluded` means the same thing whichever aim is used, so forward it —
+    // otherwise the flag would silently do nothing on the aim an agent is most likely to combine
+    // it with. An explicit `entity.allowOccluded` still wins.
+    const entitySpec = { ...spec.entity, allowOccluded: spec.entity.allowOccluded ?? spec.allowOccluded };
     try {
-      res = (await requestRenderer('resolve-entity-point', spec.entity)) as EntityPointResolution | null;
+      res = (await requestRenderer('resolve-entity-point', entitySpec)) as EntityPointResolution | null;
     } catch (e) {
       return { error: `${which}: renderer could not resolve entity (${e instanceof Error ? e.message : String(e)})` };
     }
     if (!res || !res.ok || typeof res.x !== 'number' || typeof res.y !== 'number') {
-      return { error: `${which}: ${res?.error ?? 'entity did not resolve'}` };
+      // The hint belongs HERE too — and this is the branch the #261 measurements actually hit.
+      // An unsettled panel reports a ZERO RECT, so the resolver refuses with "zero-size"/"off-screen"
+      // rather than OCCLUDED; instrumenting only the covered case would have left the hint silent on
+      // the one transient that reproduces. Without it the refusal reads as "your entity/selector is
+      // wrong" and the caller goes hunting for a better address instead of re-aiming.
+      return {
+        error: `${which}: ${res?.error ?? 'entity did not resolve'}${await settlingHint(requestRenderer)}`,
+        ...(res?.code ? { code: res.code } : {}),
+      };
+    }
+    // §3: "a resolvable aim that something COVERS is refused ... this binds `entity` and
+    // `selector` alike". Only the MESH-level half of that was implemented — entityResolve refuses
+    // when the surface's own picker says another entity is in front. DOM-level covering (a modal,
+    // a menu, a panel over the viewport) was reported as `occluded:true` and DISPATCHED ANYWAY on
+    // all three scopes, so a tap meant for a UI button under an open dialog pressed the dialog and
+    // answered ok:true — the §0 rank-1 false success, on the aim category §3 says is one category.
+    // The two documented carve-outs still hold and neither is here: raw {x,y} never reaches this
+    // branch, and a held gesture's move/up is forced through by its caller (see the pointer route).
+    //
+    // Reads `entitySpec.allowOccluded`, the value ALREADY sent to the renderer, rather than
+    // re-deriving it from the two fields. §9: a rule implemented twice diverges — and these two
+    // did, in one reachable combination. `entity:{allowOccluded:false}` with a top-level
+    // `allowOccluded:true` merges to false, so entityResolve refuses a picker-occluded aim while a
+    // re-derived `!false && !true` here would have waved a DOM-occluded one through: one flag,
+    // opposite answers, decided by which kind of cover happened to be in the way.
+    if (res.occluded && !entitySpec.allowOccluded) {
+      const scope = res.occlusionScope === 'canvas'
+        ? ' (this surface has no pick provider, so only DOM-level covering was checked — a mesh in '
+          + 'front of it would not be detected at all)'
+        : '';
+      // "Nothing" is not something you can dismiss. When the hit-test found NO element the point is
+      // clipped away or off-window, and telling the caller to move the thing covering it — which
+      // the message itself calls "nothing" — is self-contradictory advice for a real, if narrow,
+      // case: `centreIsInWindow` admits `x === innerWidth` while `elementFromPoint` is exclusive at
+      // that same edge, so a rect flush against the window's right/bottom lands here.
+      const nothingThere = !res.hitTarget || res.hitTarget === NOTHING_AT_POINT;
+      const settling = await settlingHint(requestRenderer);
+      return {
+        error: (nothingThere
+          ? `${which}: ${res.matched ?? 'the entity'} resolves to a point with NOTHING at it — `
+            + `(${Math.round(res.x)}, ${Math.round(res.y)}) is clipped away or past the window edge, so the `
+            + `input would go nowhere${scope}. Move the camera (or the entity) so it is framed well `
+            + 'inside the viewport, then re-aim.'
+          : `${which}: ${res.matched ?? 'the entity'} resolves to a point covered by `
+            + `${res.hitTarget} — the input would land on THAT, not on your target${scope}. `
+            + 'Dismiss/move what covers it, or pass allowOccluded:true to aim there anyway and see '
+            + 'what happens.') + settling,
+        code: 'OCCLUDED',
+      };
     }
     return {
       point: {
@@ -144,7 +267,27 @@ export async function resolvePoint(
       return { error: `${which}: renderer could not resolve selector (${e instanceof Error ? e.message : String(e)})` };
     }
     if (!res || !res.ok || typeof res.x !== 'number' || typeof res.y !== 'number') {
-      return { error: `${which}: ${res?.error ?? 'selector did not resolve'}` };
+      return { error: `${which}: ${res?.error ?? 'selector did not resolve'}${await settlingHint(requestRenderer)}` };
+    }
+    if (res.occluded && !spec.allowOccluded) {
+      // Two different diagnoses, because they want different actions and the covering element's
+      // name distinguishes them for nobody: an anonymous splitter div reads the same whether a
+      // modal is over your target or your target is scrolled out of its own list. `clipped` says
+      // which (a sweep of this editor's live selectors found 12 of 22 occluded hits were the
+      // scroll case), so the fix named is the fix that works.
+      const settling = await settlingHint(requestRenderer);
+      return {
+        error: (res.clipped
+          ? `${which}: ${JSON.stringify(spec.selector)} is SCROLLED OUT of its own container — its `
+            + `rect is real but nothing is drawn there, so the point lands on ${res.hitTarget ?? 'other chrome'} `
+            + 'instead. Scroll it into view (modoki_scroll over that panel) or enlarge the panel, then '
+            + 're-aim; allowOccluded:true would press the chrome behind it.'
+          : `${which}: ${JSON.stringify(spec.selector)} resolves to a point covered by `
+            + `${res.hitTarget ?? 'something else'} — the input would land on THAT, not on your target. `
+            + 'Dismiss/move what covers it (an open menu, a modal, a panel that overlaps), scroll the '
+            + 'target clear, or pass allowOccluded:true to aim there anyway and see what happens.') + settling,
+        code: 'OCCLUDED',
+      };
     }
     return { point: { x: res.x, y: res.y, matched: res.matched, hitTarget: res.hitTarget, occluded: res.occluded } };
   }
@@ -173,17 +316,207 @@ function provenance(p: ResolvedPoint): Record<string, unknown> {
   return out;
 }
 
+/** What the renderer says about whether trusted input can be DELIVERED right now.
+ *  `null` when the renderer could not answer — an UNKNOWN state, never a refusal. */
+export interface InputDeliverability { visibilityState?: string; hasFocus?: boolean }
+
+/** Ask the renderer whether trusted input can actually be DELIVERED right now.
+ *
+ *  Chromium drops every `sendInputEvent` to a page whose `visibilityState` is `'hidden'` —
+ *  nothing arrives at all. Measured 2026-08-18: three consecutive taps at a correctly-resolved
+ *  Assets row delivered ZERO events (a capture-phase `document` listener recorded nothing, the
+ *  row never selected), and every call still answered `ok:true, occluded:false`. That is the
+ *  silent-failure class this whole surface exists to remove: the reply described what the call
+ *  AIMED at, never what arrived, so the agent blamed whatever feature it was driving.
+ *
+ *  ⚠️ What PUTS a window into that state changed later the same day (#243), so do not read this
+ *  gate as "occluded input is dropped" — it no longer is, on macOS. `main.ts` now appends
+ *  `disable-backgrounding-occluded-windows`, and a COVERED window measures `'visible'` at 61fps
+ *  where it used to report `'hidden'` at fps 0. A MINIMISED one does too, and a trusted tap was
+ *  measured LANDING there (`mousedown:trusted`/`mouseup:trusted`, focus moved to the tapped
+ *  input). Believing the old rule is exactly the stop-and-ask-a-human round trip #243 removed.
+ *  The gate stays because its remaining causes are unmeasured — another Space, a sleeping
+ *  display, or a platform the switch does not reach — and a cheap gate that never fires costs
+ *  nothing, whereas removing it would restore the silent miss on whatever still triggers it.
+ *
+ *  Best-effort, like the attribution lease: a renderer that cannot answer must never fail the
+ *  input (a refused tap is a broken tool; an unqualified one is only a missing hint).
+ *
+ *  Exported because `/api/input/*` is NOT the only route that dispatches trusted input —
+ *  `/api/capture-gesture` drives its own drag through `rendererOps` — and a gate only one of
+ *  them passes through is a gate with a hole in it. */
+export async function inputDeliverability(
+  requestRenderer: InputRouteDeps['requestRenderer'],
+): Promise<InputDeliverability | null> {
+  try {
+    return (await requestRenderer('input-deliverability', {})) as InputDeliverability | null;
+  } catch { return null; }
+}
+
+/** The 409 for a hidden window, or null when the input can go ahead (including the
+ *  could-not-tell case). `what` names the caller's action so the message reads as the answer to
+ *  the call that was actually made. */
+export function hiddenWindowRefusal(live: InputDeliverability | null, what: string): BackendResult | null {
+  if (live?.visibilityState !== 'hidden') return null;
+  return json({
+    ok: false,
+    code: 'REFUSED_BY_OP' satisfies ErrorCode,
+    error: `the editor page reports document.visibilityState "hidden", so Chromium would drop `
+      + `${what} and deliver nothing — no event reaches the page at all. Nothing was dispatched; `
+      + 'the identical call lands once the page is visible. NOTE (#243): a COVERED or MINIMISED '
+      + 'window no longer causes this on macOS — both measure as "visible", and a trusted tap was '
+      + 'measured landing while minimised — so raising the window is probably NOT the fix here. '
+      + 'Look for a cause the occlusion switch does not reach: another Space, a sleeping display, '
+      + 'or a platform where it does not apply.',
+    windowVisibility: 'hidden',
+  }, 409);
+}
+
+/** The `/api/input/*` paths this file actually dispatches. The gate and the fall-through both
+ *  read it, so "is this one of ours?" has one answer — and a route added to `dispatchInput`
+ *  without being added here simply falls through, rather than being silently ungated. */
+const DISPATCHED_INPUT_ROUTES = new Set([
+  '/api/input/tap', '/api/input/drag', '/api/input/pointer', '/api/input/hover',
+  '/api/input/scroll', '/api/input/key', '/api/input/type', '/api/input/focus',
+  '/api/input/tap-handle', '/api/input/drag-handle',
+]);
+
+/** Routes that dispatch a NEW MOUSE GESTURE, and therefore cannot coexist with a sustained press.
+ *  Each of these sends its own mouseDown; arriving while `/api/input/pointer` still holds a button
+ *  down means the held gesture was abandoned (the agent errored, hit a refusal, or moved on), and
+ *  dispatching a second press underneath the first produces a garbage event stream either way.
+ *  So they release the hold first — see `releaseHeldPointer('superseded')`.
+ *
+ *  Deliberately NOT every route. `key`/`type`/`scroll`/`hover`/`focus` are all legitimate
+ *  MID-gesture: holding a drag while pressing Shift to constrain it, or Escape to cancel it, or
+ *  scrolling a list while dragging an item over it, are real things an agent does — and stealing
+ *  the press there would break the very interaction being tested. The rule is "a second mouse
+ *  gesture", not "any other input". */
+const MOUSE_GESTURE_ROUTES = new Set([
+  '/api/input/tap', '/api/input/drag', '/api/input/tap-handle', '/api/input/drag-handle',
+]);
+
+/** How long a sustained press may sit with NO `move`/`up` before the backend releases it itself.
+ *
+ *  This is the last backstop for #302: a stranded press latches the renderer's `pointerSource`
+ *  (`activeId !== null` early-returns every later `pointerdown`) and the Game panel then reads no
+ *  drags AT ALL — including the human's own mouse. #299's trusted-takeover cannot save the editor
+ *  the way it saves a device: editor input goes through `sendInputEvent`, which is real OS input,
+ *  so the stranded press is itself `isTrusted` and two trusted presses are indistinguishable.
+ *
+ *  A timeout is safe HERE in a way it is not in `pointerSource`. There the code cannot tell a
+ *  synthetic press from a finger, so a staleness rule would steal a legitimate long hold and break
+ *  the primary-touch rule. This state is only ever reachable from `/api/input/pointer`, so it is
+ *  synthetic BY CONSTRUCTION — there is no real finger to steal from.
+ *
+ *  IDLE, not total: every `move` restarts it (see `armIdleRelease`), so a long multi-step drag
+ *  never trips it and only genuine silence does. 120 s because the gap between a `down` and the
+ *  next `move` is a whole agent turn — a capture_viewport, reading the image, thinking — which
+ *  routinely runs tens of seconds. Too SHORT is the worse failure: it breaks a working gesture and
+ *  misdiagnoses as a product bug, which is exactly the round #299 cost. Too long only extends a
+ *  window that `MOUSE_GESTURE_ROUTES` above usually closes first. */
+export const HELD_POINTER_IDLE_MS = 120_000;
+
 /** Build the `/api/input/*` handler. Returns null for any other route so the caller can
  *  fall through to the next set of host routes / the shared router. */
 export function createInputRoutes(deps: InputRouteDeps) {
   const { ops, requestRenderer } = deps;
+
+  /** What `probe-key-reach` answers (editor/input/keyReach.ts). Loosely typed on purpose:
+   *  it crosses the renderer relay as JSON, and an editor build predating the op replies
+   *  with something else entirely — every field is therefore optional and unchecked here. */
+  type KeyReachReply = { focusedPanel?: string | null; editorBinding?: string | null; gameInputSuppressed?: boolean; simRunning?: boolean; chord?: string } | null;
+
+  /** Move the editor's KEYBOARD SCOPE to `panel`, or explain why it could not (#301).
+   *
+   *  Shared by `/api/input/key` and `/api/input/focus` so the two cannot drift — only the
+   *  first ever attempted a check, and the check it attempted could not fire. It compared the
+   *  renderer's echoed `focusedPanel` against the input, but the renderer stored any string it
+   *  was handed, so the echo ALWAYS equalled the input: a tautology. The refusal now comes
+   *  from the renderer, which is the only side that knows which panels have open tabs.
+   *
+   *  An editor build predating the op's `ok` field replies without one; that is read as
+   *  success (a `focusedPanel` echo is all the old contract promised) rather than as a
+   *  refusal, so a stale renderer degrades to the old behaviour instead of blocking input. */
+  async function setFocusScope(panel: string): Promise<{ focusedPanel: string | null; error?: string }> {
+    const f = (await requestRenderer('set-focus-scope', { panel })) as
+      { ok?: boolean; error?: string; focusedPanel?: string | null; openPanels?: string[] } | null;
+    const focusedPanel = f?.focusedPanel ?? null;
+    if (f && f.ok === false) {
+      const open = f.openPanels?.length ? f.openPanels.join(', ') : '(none)';
+      return {
+        focusedPanel,
+        error: `${f.error ?? `could not focus panel "${panel}"`} — scope is still `
+          + `${JSON.stringify(focusedPanel)}. Open panels: ${open}. Pass one of those, or open the `
+          + `panel you want from the Window menu first.`,
+      };
+    }
+    return { focusedPanel };
+  }
 
   /** The currently-HELD sustained pointer (from `/api/input/pointer` action:'down'), or null.
    *  Lives in the factory closure so it persists ACROSS requests — that is the whole point: a
    *  `down` in one MCP call, a `move`/`up` in later ones. Tracks the button so a `move`/`up`
    *  reuses the held one (and threads it into the event, making the move a drag-move), and so a
    *  `move`/`up` with nothing held is a clear 409 rather than a silent stray event. */
-  let heldPointer: { button: MouseButton; x: number; y: number } | null = null;
+  let heldPointer: { button: MouseButton; x: number; y: number; since: number } | null = null;
+  /** The pending idle-release timer for `heldPointer` (see HELD_POINTER_IDLE_MS), or null.
+   *  A real timer, not a lazily-evaluated deadline: the case this exists for is the agent going
+   *  COMPLETELY SILENT, so there is no later request to check a deadline on — a lazy check would
+   *  leave the human's mouse dead until they happened to drive the editor through an agent. */
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Set when a press was released by something other than `action:'up'`, and cleared by the next
+   *  `down`. The move/up 409 below quotes it, so an agent that comes back to a gesture the backend
+   *  ended learns WHY instead of reading "no pointer is held" and concluding it never pressed. */
+  let lastHeldLoss: { reason: HeldLossReason; button: MouseButton; x: number; y: number } | null = null;
+
+  function disarmIdleRelease(): void {
+    if (idleTimer !== null) { clearTimeout(idleTimer); idleTimer = null; }
+  }
+
+  /** (Re)start the idle countdown. Called on `down` and on every `move`, which is what makes the
+   *  budget IDLE rather than a cap on total gesture length. */
+  function armIdleRelease(): void {
+    disarmIdleRelease();
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      // The timer fires outside any request, so nothing is awaiting this and nothing would surface
+      // a rejection: a dead/destroyed window makes `ops.pointerUp` throw, and an unhandled
+      // rejection in the Electron main process is a far worse outcome than a press we could not
+      // release. `releaseHeldPointer` has already cleared the state by then either way.
+      void releaseHeldPointer('idle').catch(() => { /* window gone — nothing left to release into */ });
+    }, HELD_POINTER_IDLE_MS);
+    // Never hold the process open for a synthetic press. Irrelevant in Electron (the app is alive
+    // regardless) but load-bearing under vitest, where a live 120 s timer would stall the run.
+    idleTimer.unref?.();
+  }
+
+  /** Dispatch the held press's matching `mouseup` at its last known point, then clear.
+   *
+   *  The dispatch is what distinguishes this from `resetHeldPointer` — the renderer's
+   *  `pointerSource` latches `activeId` on the press and only a real `pointerup` unlatches it, so
+   *  merely forgetting the press here is precisely the #302 defect. */
+  async function releaseHeldPointer(reason: 'idle' | 'superseded'): Promise<string | null> {
+    disarmIdleRelease();
+    if (!heldPointer) return null;
+    const { button, x, y } = heldPointer;
+    // Cleared FIRST: a throwing dispatch (window destroyed mid-release) must not leave the press
+    // recorded as held, or the next `down` 409s forever on a press nothing can now release. Same
+    // discipline as the device bridge's `releaseHeldPointer`.
+    heldPointer = null;
+    lastHeldLoss = { reason, button, x, y };
+    // ATTRIBUTION. This mouseup is real trusted input and the renderer reacts to it — it commits a
+    // gizmo drag, drops a Hierarchy row, finalises a marquee. Dispatched outside the actor lease it
+    // journals as `source:'human'` with the `!` sigil (editorJournal's default actor), i.e. the
+    // editor would record the AGENT's abandoned gesture as something the owner did. CLAUDE.md tells
+    // the next session to read the journal and believe exactly that — "the human probably did it" —
+    // so an unattributed release does not merely mislabel a row, it aims a later session at
+    // undoing work nobody did. Inside `releaseHeldPointer` rather than at its call sites for the
+    // same reason `withAgentAttribution` wraps the dispatcher once: three call sites, one of them
+    // in main.ts, is three chances to forget.
+    await withAgentAttribution(() => ops.pointerUp(x, y, { button }));
+    return `${button} at ${x},${y} (${reason})`;
+  }
 
   /** Attribute everything this dispatch causes to the AGENT.
    *
@@ -214,35 +547,101 @@ export function createInputRoutes(deps: InputRouteDeps) {
     }
   }
 
+  /** Gate every dispatching `/api/input/*` route on whether trusted input can actually be
+   *  DELIVERED right now. Why this exists, what Chromium actually drops, and the #243 change to
+   *  which window states still reach it: see `inputDeliverability` above — the one copy. (This
+   *  used to restate that comment verbatim, and the two would have drifted apart at #243.) */
   const handler = (async function inputRoutes(req: HostRequest): Promise<BackendResult | null> {
     const { method, urlPath } = req;
     if (!urlPath.startsWith('/api/input/') || method !== 'POST') return null;
-    return withAgentAttribution(() => dispatchInput(req));
+    // An unrecognised `/api/input/<x>` must FALL THROUGH (null) so the caller can try the next
+    // handler — including while the window is hidden. Checking the route set here rather than
+    // letting `dispatchInput`'s trailing `return null` decide keeps that true: the gate below
+    // would otherwise answer 409 for a path this file does not own.
+    if (!DISPATCHED_INPUT_ROUTES.has(urlPath)) return null;
+    const live = await inputDeliverability(requestRenderer);
+    // `/api/input/focus` is exempt: it is the one route here that dispatches NO OS input —
+    // `focusElement` is `wc.focus()` plus `executeJavaScript`, which a hidden window still runs.
+    // Refusing it would state a reason ("Chromium would drop this input") that is untrue for it,
+    // and a refusal whose stated cause is false is worse than either answer.
+    const refusal = urlPath === '/api/input/focus' ? null : hiddenWindowRefusal(live, 'this input');
+    if (refusal) return refusal;
+    // A second mouse gesture proves the held one was abandoned — release it into the live document
+    // BEFORE dispatching, so the renderer's `pointerSource` is unlatched and the incoming gesture
+    // is actually read. After the refusal gate, so a call that dispatches nothing steals nothing.
+    if (heldPointer && MOUSE_GESTURE_ROUTES.has(urlPath)) {
+      // Swallowed for the same reason the idle timer's call is: a window destroyed mid-release must
+      // not convert THIS call — whose own dispatch has not run yet — into an opaque 500. The press
+      // is cleared before the dispatch either way, so nothing is left stranded.
+      await releaseHeldPointer('superseded').catch(() => { /* window gone; state already cleared */ });
+    }
+    const r = await withAgentAttribution(() => dispatchInput(req));
+    // Visible but NOT OS-focused: input arrives, yet Chromium fires no focus/blur/focusin/
+    // focusout — so anything the editor does ON a focus event silently does not happen (a
+    // commit-on-blur field is the classic). Reported, not refused: the input itself is real.
+    if (r && r.kind === 'json' && live && live.hasFocus === false && r.body && typeof r.body === 'object' && !Array.isArray(r.body)) {
+      (r.body as Record<string, unknown>).windowFocused = false;
+    }
+    return r;
   }) as InputRoutesHandler;
 
   /** Drop any held sustained-pointer press. Called when the renderer reloads/navigates: the
    *  synthetic press has no real OS button behind it, so a new document starts with nothing
    *  held — but `heldPointer` would otherwise persist and 409 the next `down` as "already
    *  held" (a stranded state machine). Idempotent. */
-  handler.resetHeldPointer = () => { heldPointer = null; };
+  handler.resetHeldPointer = () => {
+    disarmIdleRelease();
+    // Record THIS cause rather than leaving the previous one standing: a press dropped by a reload
+    // must not be reported as the idle timer's doing, and a stale entry from an earlier gesture
+    // would name a press the agent never asked about. Nothing held ⇒ nothing to explain.
+    lastHeldLoss = heldPointer ? { reason: 'reload', button: heldPointer.button, x: heldPointer.x, y: heldPointer.y } : null;
+    heldPointer = null;
+  };
+  handler.releaseHeldPointer = releaseHeldPointer;
+  handler.getHeldPointer = () => (heldPointer
+    ? { button: heldPointer.button, x: heldPointer.x, y: heldPointer.y, heldMs: Date.now() - heldPointer.since }
+    : null);
   return handler;
+
+  /** Explain a `move`/`up` refused because the backend itself ended the gesture. Empty when the
+   *  agent simply never pressed — the two are different mistakes and must not read alike. */
+  function autoReleaseNote(): string {
+    if (!lastHeldLoss) return '';
+    const { reason, button, x, y } = lastHeldLoss;
+    if (reason === 'reload') {
+      // Not an auto-release: no mouseup was dispatched, the document that owned the press is gone.
+      return ` NOTE: your ${button} press at ${x},${y} did not survive an editor page reload — the `
+        + 'document that held it was replaced, so the press is gone and nothing was dispatched. '
+        + 'Send a fresh down.';
+    }
+    const why = reason === 'idle'
+      ? `it sat ${HELD_POINTER_IDLE_MS / 1000}s with no move/up, so the backend released it — a `
+        + 'press left held latches the renderer\'s pointerSource and kills dragging for the human '
+        + 'too (#302). Send a fresh down; keep the gesture moving if it needs to last longer'
+      : 'a later tap/drag dispatched a new mouse gesture, which cannot coexist with a held press, '
+        + 'so the hold was released first. Send a fresh down';
+    return ` NOTE: your ${button} press at ${x},${y} was auto-released — ${why}.`;
+  }
 
   async function dispatchInput({ urlPath, body }: HostRequest): Promise<BackendResult | null> {
 
     if (urlPath === '/api/input/tap') {
-      const { x, y, selector, entity, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
-      const r = await resolvePoint({ x, y, selector, entity }, 'tap', requestRenderer);
-      if ('error' in r) return bad(r.error);
+      const { x, y, selector, entity, allowOccluded, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
+      const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'tap', requestRenderer);
+      if ('error' in r) return bad(r.error, r.code);
       await ops.tap(r.point.x, r.point.y, { button, clickCount, modifiers });
       return json({ ok: true, tapped: { x: r.point.x, y: r.point.y, button: button ?? 'left', clickCount: clickCount ?? 1 }, ...provenance(r.point) });
     }
 
     if (urlPath === '/api/input/drag') {
-      const { from, to, steps, button, modifiers } = (body ?? {}) as { from?: PointSpec; to?: PointSpec; steps?: number; button?: MouseButton; modifiers?: InputModifier[] };
-      const rf = await resolvePoint(from, 'from', requestRenderer);
-      if ('error' in rf) return bad(rf.error);
-      const rt = await resolvePoint(to, 'to', requestRenderer);
-      if ('error' in rt) return bad(rt.error);
+      const { from, to, steps, button, modifiers, allowOccluded } = (body ?? {}) as { from?: PointSpec; to?: PointSpec; steps?: number; button?: MouseButton; modifiers?: InputModifier[]; allowOccluded?: boolean };
+      // A top-level flag covers BOTH ends; a per-endpoint one still wins, so a caller can allow a
+      // covered destination while keeping the press honest.
+      const withFlag = (p?: PointSpec) => (p ? { ...p, allowOccluded: p.allowOccluded ?? allowOccluded } : p);
+      const rf = await resolvePoint(withFlag(from), 'from', requestRenderer);
+      if ('error' in rf) return bad(rf.error, rf.code);
+      const rt = await resolvePoint(withFlag(to), 'to', requestRenderer);
+      if ('error' in rt) return bad(rt.error, rt.code);
       // A zero-length drag is a CLICK, not a drag: mouseDown+mouseUp at one pixel is what Blink
       // synthesizes a `click` from. Measured — `modoki_drag {from:{700,200},to:{700,200}}` over
       // empty SceneView space returned ok:true and CLEARED the human's selection (entity 38 →
@@ -269,7 +668,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
     // slingshot pull, a charge meter, a drag-to-aim rubber-band — with get_scene_state / eval /
     // a screenshot mid-gesture, which the atomic drag can't expose.
     if (urlPath === '/api/input/pointer') {
-      const { action, x, y, selector, entity, button, modifiers } =
+      const { action, x, y, selector, entity, allowOccluded, button, modifiers } =
         (body ?? {}) as PointSpec & { action?: 'down' | 'move' | 'up'; button?: MouseButton; modifiers?: InputModifier[] };
       if (action !== 'down' && action !== 'move' && action !== 'up') {
         return bad(`pointer: action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`);
@@ -278,38 +677,81 @@ export function createInputRoutes(deps: InputRouteDeps) {
         return json({ error: `a pointer is already held (button '${heldPointer.button}' down at ${heldPointer.x},${heldPointer.y}). Release it with action:'up' before pressing again.` }, 409);
       }
       if ((action === 'move' || action === 'up') && !heldPointer) {
-        return json({ error: `no pointer is held — send action:'down' first (this ${action} would be a stray event).` }, 409);
+        return json({ error: `no pointer is held — send action:'down' first (this ${action} would be a stray event).${autoReleaseNote()}` }, 409);
       }
-      const r = await resolvePoint({ x, y, selector, entity }, `pointer ${action}`, requestRenderer);
-      if ('error' in r) return bad(r.error);
+      // Only the PRESS is gated on occlusion. A `move`/`up` mid-gesture is delivered to whatever
+      // captured the press, so what happens to sit under the destination says nothing about
+      // whether the event lands — refusing there would break legitimate held drags.
+      // …and for an ENTITY aim the force has to reach the entity spec too, not just the top-level
+      // flag: `resolvePoint` merges them with `??`, so a caller's explicit
+      // `entity:{allowOccluded:false}` would win and re-impose a refusal on a move the press has
+      // already captured. The carve-out is a fact about DELIVERY, not a preference, so it
+      // overrides rather than loses. (`??` stays the right precedence everywhere else, where the
+      // flag really is the caller's intent.)
+      // Disarm BEFORE the first await. `resolvePoint` yields, and an idle timer firing inside that
+      // window would release the very press this call is servicing: a mouseup dispatched underneath
+      // an in-flight move, and `heldPointer` left null for the `heldPointer!` reads below. Re-armed
+      // on every path that leaves a press still held — including the resolve-failure path, or a
+      // refused move would strand the press with no timer at all, which is the #302 defect again.
+      if (action !== 'down') disarmIdleRelease();
+      // Snapshot the held press SYNCHRONOUSLY, before any await. Disarming above stops the idle
+      // timer nulling it mid-flight, but a CONCURRENT request can too — `tap`/`drag` supersede a
+      // hold, and nothing serialises two in-flight requests. Every `heldPointer!` read below sits
+      // after an await (`resolvePoint` does a renderer round trip; the ops each end in a real
+      // `sleep(16)`), so asserting non-null there is a TypeError → an opaque 500 on a move whose
+      // OS event had already been dispatched. The 409s above have already proved this non-null.
+      const heldAtEntry = heldPointer;
+      const held = action !== 'down';
+      const r = await resolvePoint(
+        {
+          x, y, selector,
+          entity: held && entity ? { ...entity, allowOccluded: true } : entity,
+          allowOccluded: held ? true : allowOccluded,
+        },
+        `pointer ${action}`, requestRenderer,
+      );
+      if ('error' in r) {
+        if (heldPointer) armIdleRelease(); // the press survived a refused move — it must not lose its timer
+        return bad(r.error, r.code);
+      }
       // 'down' takes its button from the request (default left); 'move'/'up' REUSE the held one so
       // the whole gesture is one consistent button and a move reads as a drag-move.
-      const effButton: MouseButton = action === 'down' ? (button ?? 'left') : heldPointer!.button;
+      const effButton: MouseButton = action === 'down' ? (button ?? 'left') : heldAtEntry!.button;
       if (action === 'down') {
         await ops.pointerDown(r.point.x, r.point.y, { button: effButton, modifiers });
-        heldPointer = { button: effButton, x: r.point.x, y: r.point.y };
+        heldPointer = { button: effButton, x: r.point.x, y: r.point.y, since: Date.now() };
+        lastHeldLoss = null; // a fresh press — the previous gesture's fate is no longer the story
+        armIdleRelease();
       } else if (action === 'move') {
         await ops.pointerMove(r.point.x, r.point.y, { button: effButton, modifiers });
-        heldPointer = { button: effButton, x: r.point.x, y: r.point.y };
+        // Re-record only if the press still EXISTS. A concurrent tap/drag can have superseded it
+        // while this move was in flight — and that release already dispatched its mouseup, so
+        // resurrecting the press here would re-strand a gesture the backend has finished with,
+        // which is the very state #302 exists to prevent.
+        if (heldPointer) {
+          heldPointer = { button: effButton, x: r.point.x, y: r.point.y, since: heldAtEntry!.since };
+          armIdleRelease(); // IDLE budget: a moving gesture never expires
+        }
       } else {
         await ops.pointerUp(r.point.x, r.point.y, { button: effButton, modifiers });
         heldPointer = null;
+        disarmIdleRelease();
       }
       return json({ ok: true, pointer: { action, x: r.point.x, y: r.point.y, button: effButton, held: heldPointer !== null }, ...provenance(r.point) });
     }
 
     if (urlPath === '/api/input/hover') {
-      const { x, y, selector, entity, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
-      const r = await resolvePoint({ x, y, selector, entity }, 'hover', requestRenderer);
-      if ('error' in r) return bad(r.error);
+      const { x, y, selector, entity, allowOccluded, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
+      const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'hover', requestRenderer);
+      if ('error' in r) return bad(r.error, r.code);
       await ops.hover(r.point.x, r.point.y, modifiers);
       return json({ ok: true, hovered: { x: r.point.x, y: r.point.y }, ...provenance(r.point) });
     }
 
     if (urlPath === '/api/input/scroll') {
-      const { x, y, selector, entity, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
-      const r = await resolvePoint({ x, y, selector, entity }, 'scroll', requestRenderer);
-      if ('error' in r) return bad(r.error);
+      const { x, y, selector, entity, allowOccluded, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
+      const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'scroll', requestRenderer);
+      if ('error' in r) return bad(r.error, r.code);
       // A scroll with no delta is a no-op wearing an action's name (S3.15). `deltaY` documents no
       // default and the tool shape is non-strict about intent — a misspelled `dy` reaches here as
       // nothing at all — so the pre-fix behaviour dispatched a zero-delta wheel and answered
@@ -331,11 +773,24 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // instead of tapping-and-hoping. Reported back so a mismatch is visible. (P7)
       let focusedPanel: string | null | undefined;
       if (typeof panel === 'string' && panel) {
-        const f = (await requestRenderer('set-focus-scope', { panel })) as { focusedPanel?: string | null } | null;
-        focusedPanel = f?.focusedPanel ?? null;
-        if (focusedPanel !== panel) {
-          return bad(`could not focus panel "${panel}" (scope is now ${JSON.stringify(focusedPanel)}) — is that panel open? Panel ids are the FlexLayout tab ids: scene, game, hierarchy, inspector, console, assets, animation-editor, timeline-editor, particle-editor, spriteanim-editor, skin-editor, ai.`);
-        }
+        const f = await setFocusScope(panel);
+        if (f.error) return bad(f.error);
+        focusedPanel = f.focusedPanel;
+      }
+      // Will this press reach ANYTHING? Probe BEFORE dispatching — the press itself can move
+      // both the scope and DOM focus, so asking afterwards would report the wrong world.
+      // Best-effort by design: a probe that cannot answer (no renderer, an older renderer
+      // build that has not registered the op) must never fail the INPUT — it only decides
+      // whether a warning rides along. Same policy as withAgentAttribution above.
+      let reach: KeyReachReply = null;
+      try {
+        reach = (await requestRenderer('probe-key-reach', { key, modifiers })) as KeyReachReply;
+      } catch { /* unreachable renderer — press anyway, unwarned */ }
+      // Echo the scope on EVERY press, not only when the caller set it. Not knowing where the
+      // scope was is what made QA-PHYS-0003 unanswerable from the responses alone: 80 presses
+      // each said ok:true and none of them said which panel owned the keyboard.
+      if (focusedPanel === undefined && reach && typeof reach === 'object' && 'focusedPanel' in reach) {
+        focusedPanel = reach.focusedPanel ?? null;
       }
       const r = await ops.pressKey(key, modifiers);
       // The key IS dispatched (DOM hotkeys fire regardless), so this stays ok:true — but if a
@@ -347,10 +802,39 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // measured: `f` framed the selection with a readOnly input focused. The old wording
       // ("will swallow this key") claimed more than the probe knows and read as a flat
       // contradiction of what had just happened.
+      const warnings: string[] = [];
+      if (r.gameSwallows) {
+        warnings.push(`a form field (${r.activeElement}) has focus, so the RUNNING GAME's input sampler will ignore this key — call modoki_focus (no selector) to blur it if you meant to drive the game. Editor shortcuts are unaffected and may still fire.`);
+      }
+      // THE SECOND GATE (QA-PHYS-0003). Three conditions, and each one removes a class of
+      // false alarm the live check actually produced:
+      //   simRunning       — the gate is closed through most ordinary editing (any panel but
+      //                      the GameView closes it), so without this it fires on nearly every
+      //                      press in a stopped editor and gets tuned out inside one session.
+      //   gameInputSuppressed — measured by running the gate the editor installed, not by
+      //                      re-deriving its policy here.
+      //   !editorBinding   — a chord the keymap claims (a `w` that sets the gizmo mode with
+      //                      the Scene panel focused) is correct usage; stay quiet for it.
+      // WORDED TO WHAT THE GATE PROVES, no further. `editorBinding: null` rules out the
+      // keymap registry, which is the editor's only window-level CHORD listener — but not an
+      // element-level onKeyDown (a text input, the Add-Component picker), which fires while
+      // that element holds DOM focus. `activeElement` in this same response is that half of
+      // the answer. So: "did not reach the running game" yes, "did nothing at all" no.
+      const scopeBlocked = !!(reach?.simRunning && reach.gameInputSuppressed && !reach.editorBinding);
+      if (scopeBlocked) {
+        warnings.push(`the editor keyboard scope is ${JSON.stringify(reach!.focusedPanel ?? null)}, so the input gate blocked this key from the RUNNING GAME — it moved nothing there. Pass panel:"game" if you meant to drive the game. A bare modoki_focus {} does NOT do this: it clears DOM focus only, and the keyboard scope is separate state. (Editor shortcuts scoped to that panel are unaffected and may still have fired.)`);
+      }
       return json({
         ok: true, pressed: { key, modifiers: modifiers ?? [] }, activeElement: r.activeElement,
         ...(focusedPanel !== undefined ? { focusedPanel } : {}),
-        ...(r.gameSwallows ? { warning: `a form field (${r.activeElement}) has focus, so the RUNNING GAME's input sampler will ignore this key — call modoki_focus (no selector) to blur it if you meant to drive the game. Editor shortcuts are unaffected and may still fire.` } : {}),
+        // The resolved chord rides along ONLY with the scope warning. `keyReach` computes it
+        // either way and this used to drop it on the floor while the field's own docstring
+        // promised it was echoed — a claim nothing kept. It earns its place exactly here: the
+        // warning says a key reached nothing, and `chord` is how you tell "the scope was
+        // wrong" from "I spelled the key wrong" (`{key:'UpArro'}` canonicalizes to `uparro`,
+        // matches nothing, and dispatches a DOM event no sampler recognizes).
+        ...(scopeBlocked && reach?.chord ? { chord: reach.chord } : {}),
+        ...(warnings.length ? { warning: warnings.join(' ') } : {}),
       });
     }
 
@@ -391,8 +875,11 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // <body>. Both may be given — the scope is set first. (P7)
       let focusedPanel: string | null | undefined;
       if (typeof panel === 'string' && panel) {
-        const f = (await requestRenderer('set-focus-scope', { panel })) as { focusedPanel?: string | null } | null;
-        focusedPanel = f?.focusedPanel ?? null;
+        const f = await setFocusScope(panel);
+        // Refuse rather than focus the SELECTOR anyway: the caller asked for both, and
+        // silently delivering half of it is the false success this whole fix is about (#301).
+        if (f.error) return bad(f.error);
+        focusedPanel = f.focusedPanel;
       }
       const r = selector !== undefined || panel === undefined
         ? await ops.focusElement(selector)
@@ -407,29 +894,55 @@ export function createInputRoutes(deps: InputRouteDeps) {
       const h = (body ?? {}) as {
         id?: string; to?: { x: number; y: number }; toId?: string; delta?: { dx: number; dy: number };
         steps?: number; button?: MouseButton; clickCount?: number; modifiers?: InputModifier[];
+        allowOccluded?: boolean;
       };
       if (typeof h.id !== 'string' || !h.id) return bad('id (handle id) is required');
       // Carry the aimability annotations computeHandles already produces — the old closure narrowed
       // the result to {id,x,y} and DROPPED them, so tap/drag fired unconditionally: an off-screen
       // handle taps nothing, an occluded one hits the covering element, a disabled one is inert, and
       // all three returned ok:true. (F1)
-      type ResolvedHandle = { id: string; x: number; y: number; onScreen?: boolean; occludedBy?: string; occlusionChecked?: boolean; meta?: { disabled?: boolean } };
+      type ResolvedHandle = { id: string; x: number; y: number; onScreen?: boolean; clipped?: boolean; occludedBy?: string; occlusionChecked?: boolean; meta?: { disabled?: boolean } };
       const resolve = async (id: string) => {
         const res = (await requestRenderer('enact-handles', { ids: [id] })) as { handles?: ResolvedHandle[] } | null;
         return res?.handles?.find((x) => x.id === id) ?? null;
       };
-      // OFF-screen (scrolled out of its panel) or DISABLED (greyed-out) = a genuine miss → refuse
-      // (ok:false). OCCLUDED (something covers it) → the tap hits the cover, but mirror modoki_tap and
-      // still act while surfacing `occluded` as a warning, rather than refusing.
-      const blockedReason = (hd: ResolvedHandle): string | null =>
-        hd.onScreen === false ? 'off-screen — scroll it into view (modoki_scroll over the panel), then retry'
+      // OFF-screen (scrolled out of its panel), DISABLED (greyed-out), or OCCLUDED (something
+      // covers it) = a genuine miss → refuse (ok:false).
+      //
+      // Occluded USED to be a warning that still dispatched, on the stated grounds of mirroring
+      // modoki_tap. That mirror no longer holds — modoki_tap's ENTITY aim refuses an occluded aim
+      // unless `allowOccluded` — and the warning shape cost a QA session a wrong verdict: a 2D
+      // gizmo's free-move handle happened to sit under the SceneView's own 32px toolbar, the press
+      // went to the toolbar, and `ok:true` with a `occludedBy:"div"` field read as "the handle is
+      // completely inert" (testboard 5jE5Tip6Qwp7s7YVAYoH, filed high; the handle was fine — moving
+      // the entity out from under the toolbar moved it correctly on the first try). A press that
+      // provably lands on something else is a miss, and a miss reported as a success is how a tool
+      // manufactures a phantom product bug. `allowOccluded:true` still forces it through.
+      const blockedReason = (hd: ResolvedHandle, allowOccluded?: boolean): string | null =>
+        hd.onScreen === false
+          // `clipped` = inside the window but outside its OWN panel's visible box. Same refusal,
+          // different remedy: scrolling is what fixes a panel taller than its dock row, and is
+          // useless for a gizmo handle projected past the edge of its viewport (there the panel
+          // or the camera has to move). Saying "scroll it into view" for both sent a QA session
+          // scrolling a canvas that does not scroll.
+          ? (hd.clipped
+            ? 'off-screen — its coordinates are inside the window but OUTSIDE its own panel\'s visible box, so a press there lands on whatever panel occupies those pixels. Scroll that panel (modoki_scroll over it), enlarge it, or move the target back into view, then retry'
+            : 'off-screen — scroll it into view (modoki_scroll over the panel), then retry')
           : hd.meta?.disabled === true ? 'disabled (inert / greyed-out)'
-            : null;
+            : hd.occludedBy !== undefined && !allowOccluded
+              ? `covered by ${hd.occludedBy} — the press would land on THAT, not on the handle. Move the covering panel/menu (or the target) out of the way, or pass allowOccluded:true to press anyway and see what happens`
+              : null;
 
       const from = await resolve(h.id);
       if (!from) return json({ error: `no live handle with id '${h.id}' (query /api/enact-handles to list current handles)` }, 404);
-      const fromBlocked = blockedReason(from);
-      if (fromBlocked) return json({ ok: false, error: `handle '${h.id}' is ${fromBlocked}`, handle: { id: h.id, x: from.x, y: from.y, onScreen: from.onScreen ?? true } });
+      const fromBlocked = blockedReason(from, h.allowOccluded);
+      // §9 parity: the handle path is the THIRD place this refusal is written, and #261's hint has
+      // to reach it too or the rule diverges again — a handle sitting under a panel that has not
+      // finished moving reads exactly as "this handle is inert", which is how a working 2D gizmo
+      // handle got filed at severity high.
+      if (fromBlocked) {
+        return json({ ok: false, error: `handle '${h.id}' is ${fromBlocked}${await settlingHint(requestRenderer)}`, handle: { id: h.id, x: from.x, y: from.y, onScreen: from.onScreen ?? true } });
+      }
       // S3.17 — `occluded` means the SAME thing here as on every other aimed route: a BOOLEAN,
       // always present, with the covering element's identity in `occludedBy`. The handle routes
       // used to emit `occluded` as a STRING naming the cover and omit it when clean, so a caller
@@ -463,8 +976,10 @@ export function createInputRoutes(deps: InputRouteDeps) {
       if (!to && h.toId) {
         const t = await resolve(h.toId);
         if (!t) return json({ error: `no live handle with toId '${h.toId}'` }, 404);
-        const tBlocked = blockedReason(t);
-        if (tBlocked) return json({ ok: false, error: `toId handle '${h.toId}' is ${tBlocked}`, handle: { id: h.toId, x: t.x, y: t.y, onScreen: t.onScreen ?? true } });
+        const tBlocked = blockedReason(t, h.allowOccluded);
+        if (tBlocked) {
+          return json({ ok: false, error: `toId handle '${h.toId}' is ${tBlocked}${await settlingHint(requestRenderer)}`, handle: { id: h.toId, x: t.x, y: t.y, onScreen: t.onScreen ?? true } });
+        }
         to = { x: t.x, y: t.y };
         toHandle = t;
       }

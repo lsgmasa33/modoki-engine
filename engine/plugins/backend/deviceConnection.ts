@@ -16,14 +16,20 @@ import net from 'net';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { execFileSync } from 'child_process';
+import os from 'os';
+import { execFileSync, execFile as execFileDevice } from 'child_process';
+import { promisify } from 'node:util';
 import {
   adbArgs, adbBinary, describeAndroidDevice, forwardOwner, listAndroidDevices, resolveAndroidSerial,
   withFriendlyNames,
 } from './androidDevices';
-import { adbDeviceId, claimDevice, releaseDevice, releaseAllForThisProcess, wifiDeviceId } from './deviceClaims';
+import { adbDeviceId, claimDevice, releaseDevice, releaseAllForThisProcess, sweepStaleClaims, wifiDeviceId } from './deviceClaims';
 import { DeviceLeaseClient, type LeaseTransport, type LeaseRequest, type LeaseReply, type LeaseState } from './deviceLease';
 import { resetDeviceCdpSession, resolveDeviceCdpPort } from './deviceCdp';
+import { parseBoundBridgePort } from './deviceAndroidDiag';
+
+/** Async exec for the one adb call whose caller can await it — see `adbRunner.logcatDump`. */
+const execFileAsyncDevice = promisify(execFileDevice);
 
 /** The device plugin's TCP port (matches `GameDebugPlugin` default). This is the port ON THE PHONE
  *  — it is a property of the app, shared by every Modoki game, and deliberately NOT per-clone. */
@@ -99,7 +105,70 @@ export function resolveDeviceHostPort(env: NodeJS.ProcessEnv = process.env): num
  *  reply, which is byte-for-byte what a dead device end looks like through a forward. It names both
  *  and gives the one command that settles it. Reporting two candidates honestly beats reporting one
  *  confidently and wrongly. */
-export function explainConnectFailure(detail: string | undefined, port: number, useAdb = false): string | undefined {
+export function explainConnectFailure(
+  detail: string | undefined, port: number, useAdb = false, debugBuild?: boolean,
+  fallbackPort?: number | null,
+): string | undefined {
+  // ⭐ A KNOWN FALLBACK PORT OUTRANKS EVERY GUESS BELOW, because it is not a guess: the app
+  // PRINTED the port it bound. 9095 is shared by every Modoki game, so when a second one still
+  // holds it the app under test takes an OS-assigned port exactly as designed — and this message
+  // used to describe that state as "the native debug gate is off … rebuild", which is an
+  // expensive wrong turn and, on a device case, reads as a product defect in the project under
+  // test. Measured on a Galaxy A23 carrying 20 Modoki apps (bug `OikQcN8V5NMH0xUr9UnK`): a
+  // backgrounded `com.apiary.court` released 9095 0.3s after the app under test had already
+  // fallen back, and the diagnosis cost a pass through gradle, node_modules, capacitor config and
+  // module DCE before logcat gave it away.
+  if (fallbackPort && fallbackPort !== port) {
+    return `refused on port ${port} — but the app is RUNNING and listening on ${fallbackPort}. `
+      + `${port} is shared by every Modoki game, so when another one still holds it the app you `
+      + `just launched falls back to an OS-assigned port (#88) and logs which. Nothing is wrong `
+      + `with the build, the debug gate, or the lease. Fix, either way round: reconnect with `
+      + `\`device_connect {..., port: ${fallbackPort}}\`, or force-stop the app squatting `
+      + `${port} (\`adb shell ps -A | grep modoki\`, then \`adb shell am force-stop <pkg>\`) and `
+      + `relaunch, after which it binds ${port} first try.`;
+  }
+  // ⭐ A KNOWN-OFF FLAG IS THE LEADING SUSPECT (#239) — but only ECONNREFUSED lets it be the
+  // ONLY one, and that asymmetry is the whole of this branch.
+  //
+  // `build.debugBuild: false` means no TCP server was compiled in, so a project with it off
+  // explains "nothing is listening" completely. Six of twenty projects shipped without the flag
+  // and each cost a hunt, because the adb advice below leads with a HEAL problem — and healing a
+  // `false` flag writes it off again, so its one suggested fix could not work.
+  //
+  // ⚠️ **BUT THE FLAG IS THE OPEN PROJECT'S, AND THE PHONE MAY BE RUNNING A DIFFERENT APP.** The
+  // running app is only knowable AFTER a lease opens (`device_status` reports the socket holder
+  // for exactly this reason, #88), so at this moment it is unknown. That matters because
+  // `refused` means the socket OPENED and the handshake got no reply — something ACCEPTED the
+  // connection, which is proof a server is listening and therefore proof it is not simply absent.
+  // A backgrounded sibling app squatting the shared 9095 produces precisely that, and it is not
+  // hypothetical: it was hit on a Galaxy A23 on 2026-08-19, where `sling` answered a connect
+  // aimed at `postfx-demo`. So `refused` keeps the second cause; only ECONNREFUSED — where
+  // nothing accepted at all — gets to be definitive.
+  const flagOff = debugBuild === false;
+  if (flagOff && detail && /ECONNREFUSED/i.test(detail)) {
+    return `${detail} — this project has \`build.debugBuild: false\`, so the app was built with `
+      + `NO debug bridge: there is no TCP server on the device to connect to, and no lease to `
+      + `take. Nothing about the network, the port, or another Modoki holding the lease is `
+      + `involved. Fix: set Project Settings → Developer → "Debug build" (or \`build.debugBuild: `
+      + `true\` in project.config.json), then REBUILD and redeploy — reopening the project alone `
+      + `is not enough, because heal syncs the flag's current value into the native project and `
+      + `that value is off.`;
+  }
+  if (flagOff && detail === 'refused') {
+    return `refused — the socket opened but the app never answered the lease handshake. This `
+      + `project has \`build.debugBuild: false\`, so it ships NO debug bridge, which is the `
+      + `likeliest cause and the one to rule out first: set Project Settings → Developer → `
+      + `"Debug build" (or \`build.debugBuild: true\`), then REBUILD and redeploy — reopening the `
+      + `project alone is not enough, because heal syncs the flag's current value and that value `
+      + `is off.\n  It is NOT the only cause, because something accepted the connection: over adb `
+      + `the forward accepts on this clone's end even when the device port is dead, and over WiFi `
+      + `an accepted socket means some app IS listening on ${port} — a backgrounded sibling Modoki `
+      + `game squatting the shared port answers exactly like this. Find the REAL holder by its `
+      + `socket, not by its name — \`adb shell 'cat /proc/net/tcp /proc/net/tcp6' | awk '$4=="0A"'\` `
+      + `lists every listener with its uid — then force-stop that app, or relaunch this one. `
+      + `Grepping for "modoki" misses games whose package is not named that (com.apiary.court is `
+      + `one, and it cost a session an hour — #283).`;
+  }
   // `refused` is the sentinel `DeviceLeaseClient.connect` sets when the socket opened but the
   // handshake produced nothing (deviceLease.ts). A GENUINE busy reply from the device always names
   // its reason — `busy` / `no-lease` / `not-owner` — so this branch cannot swallow a real lease
@@ -114,15 +183,29 @@ export function explainConnectFailure(detail: string | undefined, port: number, 
       + `(hex, uppercase or lower) — no row means nothing is bound. Then reopen the project in the `
       + `editor (heal-on-open) and rebuild.\n`
       + `  2. Another Modoki genuinely owns the lease — it refuses an extra client by dropping the `
-      + `socket, which looks identical from here. Disconnect it there, or relaunch the app.`;
+      + `socket, which looks identical from here. Disconnect it there, or relaunch the app.\n`
+      + `  3. The app IS running, but listening on a DIFFERENT port — check this one FIRST on `
+      + `a phone with several Modoki apps installed, because causes 1 and 2 both send you `
+      + `somewhere expensive and wrong while the bridge is perfectly healthy. ${port} is shared by `
+      + `every Modoki game, so launching this app while another was still releasing the port makes `
+      + `it fall back to an OS-assigned one and never reclaim ${port} afterwards (#88/#283). `
+      + `\`adb logcat -d | grep "Native TCP server listening on port"\` names the real port `
+      + `— the "Native" is load-bearing, since a \`foregrounded — TCP server listening on port `
+      + `${port}\` line is the HOLDER announcing itself, not this app. Pass it as `
+      + `\`device_connect {useAdb:true, port:<actual>}\` — or force-stop the other apps and `
+      + `relaunch. Builds carrying the #283 retry only fall back when the other app holds the `
+      + `port for over 2s.`;
   }
   if (!detail || !/ECONNREFUSED/i.test(detail) || port !== DEVICE_PORT) return detail;
   return `${detail} — nothing is listening on the default port ${DEVICE_PORT}. The app may be `
     + 'running FINE on another port: 9095 is shared by every Modoki game, so if a second one still '
-    + 'holds it, the app you just launched falls back to an OS-assigned port (#88). Close the other '
-    + 'Modoki apps (`adb shell ps -A | grep modoki`, or swipe them away on iOS) and relaunch — or, '
-    + 'if you can see the real port in the device log or the in-game debug menu, pass it directly: '
-    + 'device_connect {ip:"…", port:<actual>}.';
+    + 'holds it, the app you just launched falls back to an OS-assigned port (#88/#283). Close the '
+    + 'other Modoki app and relaunch — but find it by its SOCKET, not its name: '
+    + '`adb shell \'cat /proc/net/tcp /proc/net/tcp6\' | awk \'$4=="0A"\'` lists every listener with '
+    + 'its uid, and a grep for "modoki" misses games whose package is not named that '
+    + '(com.apiary.court is one). Or read the real port off the device — '
+    + '`adb logcat -d | grep "TCP server listening"`, or the in-game debug menu — and pass it '
+    + 'directly: device_connect {ip:"…", port:<actual>}.';
 }
 
 // `adbBinary()` moved to `androidDevices.ts` (#149) — one module now owns "how to talk to adb",
@@ -130,6 +213,7 @@ export function explainConnectFailure(detail: string | undefined, port: number, 
 // the two modules import each other. Re-exported so the several call sites that resolve adb the
 // SAME way (never a bare `adb` on PATH) keep one import path.
 export { adbBinary } from './androidDevices';
+import { discoverBridgePort } from './androidBridgePort';
 
 /** The `adb forward` calls behind an overridable seam, so tests can inject a spy without mocking the
  *  `child_process` module (which fights vitest's per-file module cache in the full suite).
@@ -146,6 +230,23 @@ export const adbRunner = {
   forward(hostPort: number, serial?: string, devicePort: number = DEVICE_PORT): void {
     execFileSync(adbBinary(), adbArgs(serial, ['forward', `tcp:${hostPort}`, `tcp:${devicePort}`]), { timeout: 4000, stdio: 'pipe' });
   },
+  /** A logcat dump, for mining the port the debug bridge actually bound (see the sniff at the
+   *  failed-connect site). Behind this seam like every other adb call, so the unit tests never
+   *  reach the real binary — and it returns '' rather than throwing, because this only ever
+   *  IMPROVES an error message and must not become a second failure on top of the first. */
+  async logcatDump(serial?: string): Promise<string> {
+    // ⚠️ ASYNC, unlike its `execFileSync` siblings above, and that is deliberate rather than
+    // inconsistent. This backend runs INSIDE the Electron main process, so a sync spawn blocks the
+    // whole editor's input for as long as the command takes — the exact regression #168 fixed by
+    // moving the device LISTINGS off `execFileSync` (measured 1.3-1.4 s per call, freezing drags
+    // mid-gesture). A `logcat -d` dump is bounded at 6 s here, and 6 s of frozen editor on a
+    // failed connect would be a worse bug than the confusing error message this exists to improve.
+    // The siblings stay sync because their callers are sync; this one's caller already awaits.
+    try {
+      const { stdout } = await execFileAsyncDevice(adbBinary(), adbArgs(serial, ['logcat', '-d', '-t', '4000']), { timeout: 6000, encoding: 'utf8', maxBuffer: 32 << 20 });
+      return stdout;
+    } catch { return ''; }
+  },
   /** Every forward rule adb currently holds, across ALL devices — `--list` is daemon-wide and takes
    *  no `-s`, which is precisely why {@link forwardOwner} can answer "whose rule is this?". */
   listForwards(): string {
@@ -154,8 +255,8 @@ export const adbRunner = {
   /** Remove the rule on `hostPort` — but ONLY if it belongs to `serial`.
    *
    *  ⚠️ `adb forward --remove` matches on the HOST PORT SPEC, not on `-s` (#158). Measured: with two
-   *  phones leased by two clones, `adb -s RFCTB0EV83K forward --remove tcp:9095` deleted the rule
-   *  owned by `RFCTA14CMRF`, leaving that clone's live lease with no tunnel and no error — the same
+   *  phones leased by two clones, `adb -s RFDEADBEEF1 forward --remove tcp:9095` deleted the rule
+   *  owned by `RFDEADBEEF2`, leaving that clone's live lease with no tunnel and no error — the same
    *  cross-clone reach the `pkill -f` scoping rule exists to prevent, in a different mechanism.
    *  Per-clone host ports make the collision unreachable; this check means a mismatched removal
    *  refuses rather than reaches across even if something else ever re-introduces one. */
@@ -333,10 +434,28 @@ export class TcpLeaseTransport implements LeaseTransport {
 
 // ── GUID persistence (per clone) ──────────────────────────────────────────────
 
+/** Where this backend keeps its small persistent state (device GUID, last connect target).
+ *
+ *  A dev clone gets `<cwd>/.modoki`, so each checkout keeps its own stable token — that is the
+ *  "per clone" property the GUID doc below describes.
+ *
+ *  ⚠️ A PACKAGED editor must not use cwd: it is `REPO_ROOT`, which is
+ *  `<Resources>/app.asar.unpacked` — INSIDE the signed .app. Writing there breaks the bundle's
+ *  code signature, and `codesign --verify` / `spctl --assess` both start failing with "a sealed
+ *  resource is missing or invalid" (measured 2026-08-22: `.modoki/device-guid` was one of the two
+ *  files `codesign` named after a single build). There is also no "clone" to be per, so the
+ *  machine-wide `~/.modoki` is both safe and correct — it is already where `device-claims.json`
+ *  and `editor-launches.log` live. */
+export function modokiStateDir(): string {
+  return process.env.MODOKI_PACKAGED === '1'
+    ? path.join(os.homedir(), '.modoki')
+    : path.join(process.cwd(), '.modoki');
+}
+
 /** Load the clone's persistent device GUID, minting + saving one on first use. Keyed on the
- *  backend process's cwd (the clone root) so each checkout keeps its own stable token. `dir` is
- *  injectable for tests; production uses `<cwd>/.modoki`. */
-export function loadOrCreateGuid(dir: string = path.join(process.cwd(), '.modoki')): string {
+ *  backend process's cwd (the clone root) so each checkout keeps its own stable token — except
+ *  when packaged, see `modokiStateDir`. `dir` is injectable for tests. */
+export function loadOrCreateGuid(dir: string = modokiStateDir()): string {
   const file = path.join(dir, 'device-guid');
   try {
     const existing = fs.readFileSync(file, 'utf8').trim();
@@ -363,17 +482,22 @@ function lastTargetFile(dir: string): string {
   return path.join(dir, 'device-target.json');
 }
 
-export function loadLastTarget(dir: string = path.join(process.cwd(), '.modoki')): LastTarget | null {
+export function loadLastTarget(dir: string = modokiStateDir()): LastTarget | null {
   try {
     const t = JSON.parse(fs.readFileSync(lastTargetFile(dir), 'utf8'));
     if (typeof t?.ip === 'string' || typeof t?.useAdb === 'boolean') {
-      return { ip: String(t.ip ?? ''), useAdb: Boolean(t.useAdb) };
+      // `serial` round-trips too, or the picker's remembered phone is written and never read back
+      // (#149): `saveLastTarget` persists it, so dropping it here made the memory die with the
+      // process. Blank normalises to absent so the field is either a real serial or missing —
+      // a cosmetic tidy, not load-bearing (every consumer already tests it for truthiness).
+      const serial = typeof t?.serial === 'string' && t.serial ? t.serial : undefined;
+      return { ip: String(t.ip ?? ''), useAdb: Boolean(t.useAdb), ...(serial ? { serial } : {}) };
     }
   } catch { /* not created yet */ }
   return null;
 }
 
-export function saveLastTarget(t: LastTarget, dir: string = path.join(process.cwd(), '.modoki')): void {
+export function saveLastTarget(t: LastTarget, dir: string = modokiStateDir()): void {
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(lastTargetFile(dir), JSON.stringify(t));
@@ -426,6 +550,10 @@ export interface ConnectRequest {
    *  `adb devices`. Only meaningful with `useAdb`; a serial that matches nothing attached is an
    *  error, never a fall-through to another phone. */
   serial?: string;
+  /** The OPEN PROJECT's `build.debugBuild`, supplied by the router — never by the caller (#239).
+   *  When it is `false` the app has no debug bridge compiled in at all, which turns the handshake
+   *  failure below from two guesses into one certainty. */
+  debugBuild?: boolean;
 }
 
 export class DeviceConnectionManager {
@@ -464,7 +592,7 @@ export class DeviceConnectionManager {
 
   /** `stateDir` is the per-clone `.modoki` dir the last-target file lives in — injectable so tests
    *  isolate their persisted state instead of scribbling on the real repo's `.modoki`. */
-  constructor(guid = loadOrCreateGuid(), stateDir: string = path.join(process.cwd(), '.modoki')) {
+  constructor(guid = loadOrCreateGuid(), stateDir: string = modokiStateDir()) {
     this.guid = guid;
     this.stateDir = stateDir;
     this.lastTarget = loadLastTarget(stateDir);
@@ -497,6 +625,7 @@ export class DeviceConnectionManager {
     // 9095). Over adb the port we CONNECT to is this clone's derived host end of the tunnel; over
     // WiFi the two are the same port, because there is no tunnel.
     const devicePort = req.port ?? DEVICE_PORT;
+    const debugBuild = req.debugBuild;
     let port = devicePort;
     let host: string;
     let serial: string | undefined;
@@ -566,10 +695,74 @@ export class DeviceConnectionManager {
       transport: this.transport,
       // The advice keys off the DEVICE port, not the host end of the tunnel: an ECONNREFUSED on a
       // derived 127.0.0.1:9097 still means "nothing is listening on 9095 over there".
-      onState: (s, d) => { this.state = s; this.detail = explainConnectFailure(d, devicePort, useAdb); },
+      onState: (s, d) => { this.state = s; this.detail = explainConnectFailure(d, devicePort, useAdb, debugBuild); },
     });
     this.target = { host, port, useAdb, ...(serial ? { serial } : {}) };
-    const landed = await this.client.connect();
+    let landed = await this.client.connect();
+    // #283 — the app may be up and listening on a port that is NOT the default. Ask the DEVICE
+    // where its bridge actually is and try once more.
+    //
+    // Only after a failed landing (this costs three `adb shell` reads, and the happy path must not
+    // pay for them), only over adb (the reads need a shell), and only when the caller did not name
+    // a port — an explicit port is an instruction, and second-guessing it would take the escape
+    // hatch away from the very case it exists for.
+    //
+    // `discoverBridgePort` resolves the FOREGROUND app's uid and returns the socket that uid owns,
+    // so this cannot wander onto a backgrounded sibling — which is #88, and is a worse outcome than
+    // the refusal it would be replacing.
+    if (useAdb && req.port === undefined) {
+      const found = discoverBridgePort(serial);
+      // The test is PORT OWNERSHIP, not an identity self-report. An earlier cut asked the connected
+      // app to name itself and only re-targeted on a mismatch — which was inert against exactly the
+      // app most likely to be squatting: `court`'s older bridge answers no `app-identity` at all,
+      // so the check saw "could not look" and stood down (the docs already say the squatter is
+      // usually the build that cannot answer). uid ownership is ground truth and needs nobody's
+      // cooperation: if the FOREGROUND app owns a listening socket that is not the one we reached,
+      // we are on the wrong app whether or not anyone will admit it.
+      if (found && found.port !== devicePort) {
+        if (landed === 'connected') {
+          console.warn(`[device] connected on ${devicePort}, but ${found.pkg} is in the foreground and `
+            + `owns ${found.port} — re-targeting, since every device_* call would otherwise drive the `
+            + `wrong app (#88/#283).`);
+        }
+        this.retargetIdentity();
+        try {
+          // Hang up on the wrong app BEFORE re-targeting. Two live lease clients over one host
+          // port would both hold sockets through the same forward rule, and the one we are
+          // abandoning is exactly the app we do not want driven.
+          try { await this.client.disconnect(); } catch { /* already dead is fine */ }
+          adbRunner.forward(port, serial, found.port);
+          this.transport = new TcpLeaseTransport(host, port);
+          this.client = new DeviceLeaseClient({
+            guid: this.guid,
+            transport: this.transport,
+            onState: (st, d) => { this.state = st; this.detail = explainConnectFailure(d, found.port, useAdb, debugBuild); },
+          });
+          this.target = { host, port, useAdb, ...(serial ? { serial } : {}) };
+          landed = await this.client.connect();
+          if (landed === 'connected') {
+            console.warn(`[device] the app is listening on ${found.port}, not the default ${devicePort} `
+              + `(${found.pkg} — it lost the bind race, #283). Connected there.`);
+            // Verify the app that ANSWERED is the one we aimed at. The port already belongs to the
+            // foreground app's uid, so this should always agree — but "should" is what #88 was too,
+            // and a lease pointed at a sibling game answers every later call plausibly and wrongly.
+            //
+            // Only when the bridge NAMES itself: a pre-#88 build reports null, and refusing or
+            // crying mismatch on "could not look" would break every older build for no signal.
+            const answering = await this.deviceAppId();
+            if (answering && answering !== found.pkg) {
+              console.warn(`[device] ⚠️ discovered port ${found.port} for ${found.pkg}, but the app `
+                + `answering is ${answering}. device_* calls will drive ${answering} — disconnect and `
+                + `relaunch the app you meant (#88/#283).`);
+            }
+          }
+        } catch (e) {
+          // Keep the ORIGINAL failure as the reported one: this retry is a bonus attempt, and
+          // replacing "the app never answered" with "adb forward failed" would hide the real cause.
+          console.warn(`[device] port rediscovery failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    }
     // A connect that did NOT land must hand the hardware back (#164). The adb-forward failure above
     // already does this; the handshake failure did not, so the commonest failure of all — the app
     // is not listening — left a machine-wide claim standing. The visible symptom is the nastiest
@@ -591,11 +784,22 @@ export class DeviceConnectionManager {
     // guard costs one integer compare and makes the question moot, which is the right trade for a
     // failure whose blast radius is "two clones drive one phone".
     if (landed !== 'connected' && generation === this.connectGeneration) this.releaseClaim();
+    // The app may be alive on a FALLBACK port. Ask the phone before leaving the caller with a
+    // message that guesses — this is the one cause `explainConnectFailure` cannot infer from a
+    // socket outcome, and the app prints it (bug `OikQcN8V5NMH0xUr9UnK`). Done HERE rather than in
+    // `onState` because it needs an await, and only on a failed adb connect so the happy path pays
+    // nothing. Best-effort: the sniffer swallows its own errors, so a wedged adb leaves the
+    // original message rather than replacing one failure with two.
+    if (landed !== 'connected' && useAdb && this.state !== 'connected') {
+      const sniffed = parseBoundBridgePort(await adbRunner.logcatDump(serial), devicePort);
+      if (sniffed) this.detail = explainConnectFailure(this.detail, devicePort, useAdb, debugBuild, sniffed);
+    }
     // Learn the platform NOW, while the lease is healthy, rather than on first use. The WDA
     // screenshot path is reached precisely when the app has been SUSPENDED (lease 'reconnecting',
     // native capture 502s) — asking then would fail and refuse the feature in its motivating case.
     // Best-effort by construction: `devicePlatform` swallows its own errors and returns null.
     await this.devicePlatform();
+    this.stampClaimIdentity(landed);
     return this.status();
   }
 
@@ -629,6 +833,47 @@ export class DeviceConnectionManager {
     if (!this.target?.useAdb) return;
     try { adbRunner.removeForward(this.target.port, this.target.serial); }
     catch { /* forward may already be gone / adb absent — non-fatal */ }
+  }
+
+  /** Stamp what the phone says it IS onto this lease's claim (#285).
+   *
+   *  Only for a WiFi (`ip:`) claim, and the asymmetry is the whole point. An adb claim already names
+   *  a hardware SERIAL, which is exactly the id a raw `adb -s …` uses — a reader can match those
+   *  exactly. A WiFi claim can only name an ADDRESS, while every raw iOS CLI (`devicectl --device`,
+   *  `ideviceinstaller -u`, `xcodebuild -destination id=…`, go-ios `--udid`) names a UDID, and the
+   *  app is deliberately not allowed to report its UDID (see `deviceHardware`). So the two
+   *  namespaces cannot be joined directly, and the product type is the only fact that appears on
+   *  BOTH sides — the phone reports it here, and `xcrun`'s listing carries it for a given UDID.
+   *  Recording it lets the CLI guard say "the UDID you are about to install to is an iPhone18,4, and
+   *  another clone is holding an iPhone18,4 over WiFi" instead of shrugging.
+   *
+   *  Costs nothing on the connect path: `devicePlatform()` above has already run the one identity
+   *  probe, and `deviceHardware()` reads its latched result. Re-claiming with the same pid is a
+   *  refreshing no-op success by construction, so this can never turn a healthy lease into a refusal.
+   *  Best-effort throughout — a phone that does not report a model (a bridge older than #146) simply
+   *  leaves the field absent, which every reader is required to treat as "cannot tell". */
+  private stampClaimIdentity(landed: string): void {
+    if (landed !== 'connected') return;
+    const deviceId = this.claimedDeviceId;
+    if (!deviceId || !deviceId.startsWith('ip:')) return;
+    // Read the LATCHED identity; never call `deviceHardware()` here. That accessor ASKS, and a
+    // failed ask is deliberately not latched so it can be retried (see `deviceIdentity`) — so
+    // asking here would add a SECOND probe on precisely the connects where the first one already
+    // failed. Not hypothetical: it broke `deviceConnection.test.ts`'s "a FAILED ask is retried"
+    // (expected 1 call, got 2), which is the test that pins that rule. Nothing is lost by reading
+    // the latch: `devicePlatform()` immediately above has already run the one probe there is.
+    if (!this.platformResolved) return;
+    try {
+      const { deviceModel, osVersion } = this.hardware;
+      if (!deviceModel) return;
+      claimDevice({
+        deviceId,
+        guid: this.guid,
+        purpose: 'holding a device lease over WiFi',
+        model: deviceModel,
+        ...(osVersion ? { osVersion } : {}),
+      });
+    } catch { /* the claim is already held and usable; a missing model is never worth failing over */ }
   }
 
   /** Hand back the hardware claim, if this lease holds one. Idempotent — a second call after the
@@ -724,6 +969,30 @@ export class DeviceConnectionManager {
     return { deviceModel, osVersion };
   }
 
+  /** Should `connect` go looking for the bridge on another port? (#283)
+   *
+   *  TWO cases, and the second is the one that matters more in practice:
+   *
+   *   1. **The connect FAILED.** Nothing answered on the default port — the app may be up and
+   *      listening elsewhere.
+   *   2. **The connect SUCCEEDED, with the WRONG APP.** This is #88, and it is the commoner shape:
+   *      a backgrounded sibling that still holds the default port answers the handshake perfectly,
+   *      so there is no failure to notice. Measured on a Galaxy A23 — `court` held 9095 while
+   *      `skin-test` sat on 39213, and a bare `device_connect` landed on Court and reported
+   *      success. Every later `device_*` call would have driven the wrong game.
+   *
+   *  The mismatch test requires BOTH names to be known: a pre-#88 bridge reports a null appId, and
+   *  a phone with nothing in focus reports no package. "Could not look" is never a mismatch — that
+   *  would send every older build off rediscovering for no reason. */
+  private retargetIdentity(): void {
+    // The identity is LATCHED per lease, so it must be cleared before re-targeting or the new app
+    // would be reported under the OLD app's name — a wrong answer dressed as a verified one.
+    this.platformResolved = false;
+    this.platformInFlight = null;
+    this.platform = null;
+    this.appId = null;
+  }
+
   /** One probe, every fact. Latching rules are unchanged (see `devicePlatform`'s doc): a null is
    *  latched only when the bridge ANSWERED with one; a failure to ASK is transient and retried. */
   private async deviceIdentity(): Promise<DeviceIdentity> {
@@ -782,7 +1051,7 @@ export class DeviceConnectionManager {
 /** Process-global device connection (one per backend → one per clone). */
 export const deviceConnection = new DeviceConnectionManager();
 
-// NOTE: `reclaimStaleForwardsAtStartup()` is deliberately NOT called at module scope. It shells out
+// NOTE: `reclaimStaleDeviceStateAtStartup()` is deliberately NOT called at module scope. It shells out
 // to `adb forward --list`, and module load happens before any test's `beforeEach` can stub the
 // seam — so every suite that merely imports this file would run a real adb command whose result
 // depends on what is plugged into the machine. That is precisely the half-injectable-seam trap
@@ -807,10 +1076,21 @@ export const deviceConnection = new DeviceConnectionManager();
  *  all and outlives the machine's session.
  *
  *  Best-effort and never throws: this runs on the exit path, where a throw would abort the steps
- *  after it and could take the exit code with it. */
+ *  after it and could take the exit code with it.
+ *
+ *  ⚠️ **It was named `OnExit` and wired to no exit at all until #225** — the only callers were
+ *  tests, so the leak it was written to close was still open, invisibly, and the comment below
+ *  ("the exit hooks pass nothing") described hooks that did not exist. Its production caller is now
+ *  Electron's awaited `before-quit` teardown in `electron/main.ts`, which covers a normal quit
+ *  (⌘Q, Quit, an app-driven `app.quit()`). It does NOT cover a SIGTERM — `stop-editor.sh` sends
+ *  one and Chromium takes the signal, measured — nor a crash or `kill -9`. Those endings are closed
+ *  at the other end instead, by `reclaimStaleDeviceStateAtStartup()`, which no manner of dying can
+ *  skip. Do not add a SIGTERM listener here to "finish the job": it would suppress Node's default
+ *  terminate-on-signal and change how the editor shuts down, which is the trade `deviceClaims.ts`
+ *  already declined. */
 export function releaseDeviceResourcesOnExit(conn: DeviceConnectionManager = deviceConnection): void {
   // `conn` is a seam for tests only — production has exactly one manager (the singleton below), and
-  // the exit hooks pass nothing. Without it a test can only assert against process-global state.
+  // the before-quit caller passes nothing. Without it a test can only assert against process-global state.
   // Order matters only in that each step must not be able to prevent the next.
   try { conn.releaseAdbForwardSync(); } catch { /* adb gone / rule already removed */ }
   try { resetDeviceCdpSession(); } catch { /* already torn down */ }
@@ -839,7 +1119,17 @@ export function releaseDeviceResourcesOnExit(conn: DeviceConnectionManager = dev
  *  holds no lease, so a rule sitting on one of our own ports can only be our own leftover. It is
  *  emphatically not a sweep of "stale-looking" rules in general: reaching across to a port we do
  *  not own is #158, and this never does. */
-export function reclaimStaleForwardsAtStartup(): void {
+export function reclaimStaleDeviceStateAtStartup(): void {
+  // Claims first — it is pure fs and cannot be blocked by a missing adb. A dead-pid claim never
+  // BLOCKED anyone (every reader applies `isStale`), but it sits in `~/.modoki/device-claims.json`,
+  // which CLAUDE.md tells an agent to read as the answer to "did I give the phone back" — so a
+  // corpse there reads as a live hold and cost the #225 reporter two hand-edits. Startup is the
+  // one point neither a crash nor `stop-editor.sh`'s SIGTERM can skip; see `sweepStaleClaims`.
+  try {
+    for (const c of sweepStaleClaims()) {
+      console.log(`[device] swept a stale claim on ${c.deviceId} left by ${c.clone} (pid ${c.pid}, gone)`);
+    }
+  } catch { /* an unwritable claims file must never block startup */ }
   for (const port of [resolveDeviceHostPort(), resolveDeviceCdpPort()]) {
     try {
       const owner = forwardOwner(adbRunner.listForwards(), port);

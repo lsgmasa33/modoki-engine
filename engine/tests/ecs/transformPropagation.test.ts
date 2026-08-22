@@ -255,3 +255,98 @@ describe('transformPropagationSystem — clears between frames', () => {
     expect(worldTransforms.has(e2.id())).toBe(true);
   });
 });
+
+describe('transformPropagationSystem — a zero scale axis (#258)', () => {
+  // Regression for the "data-correct, pixels-wrong" class: the LOCAL trait reads back `sx: 0`
+  // exactly in the broken case, so a local-only assertion passes while the bug is live. Every
+  // assertion below is on the WORLD record, which is what the renderers actually consume.
+
+  it('keeps the parent chain scale instead of falling back to identity', () => {
+    w = createWorld();
+    // games/court's guard flag: a 0.53 root with a child whose sx is driven to 0 by a clip.
+    const parent = w.spawn(
+      Transform({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 0.53, sy: 0.53, sz: 0.53 }),
+      EntityAttributes({ parentId: 0 }),
+    );
+    const child = w.spawn(
+      Transform({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 0, sy: 1, sz: 1 }),
+      EntityAttributes({ parentId: parent.id() }),
+    );
+
+    transformPropagationSystem(w);
+
+    const wt = worldTransforms.get(child.id())!;
+    // Before the fix this read [1, 1, 1] — the element drew at FULL size, ~2x wider than the
+    // same child at sx = 0.907, and the parent's 0.53 vanished from the other axes too.
+    expect(wt.sx).toBe(0);
+    expect(wt.sy).toBeCloseTo(0.53, 9);
+    expect(wt.sz).toBeCloseTo(0.53, 9);
+  });
+
+  it('keeps the child ROTATION when one axis is flattened', () => {
+    w = createWorld();
+    const parent = w.spawn(
+      Transform({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 0.53, sy: 0.53, sz: 0.53 }),
+      EntityAttributes({ parentId: 0 }),
+    );
+    const child = w.spawn(
+      Transform({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: Math.PI / 2, sx: 2, sy: 0, sz: 3 }),
+      EntityAttributes({ parentId: parent.id() }),
+    );
+
+    transformPropagationSystem(w);
+
+    const wt = worldTransforms.get(child.id())!;
+    // A mesh flattened on ONE axis is still visible, so losing its orientation is a visible bug
+    // in its own right — and the identity fallback dropped rz to 0 silently.
+    expect(wt.rz).toBeCloseTo(Math.PI / 2, 9);
+    expect(wt.sx).toBeCloseTo(1.06, 9); // 0.53 x 2
+    expect(wt.sy).toBe(0);
+    expect(wt.sz).toBeCloseTo(1.59, 9); // 0.53 x 3
+  });
+
+  it('keeps a zero from a PARENT out of the children it should collapse', () => {
+    w = createWorld();
+    // The zero one level up: every descendant must inherit it, not be resurrected to full size.
+    const parent = w.spawn(
+      Transform({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 0, sy: 2, sz: 2 }),
+      EntityAttributes({ parentId: 0 }),
+    );
+    const child = w.spawn(
+      Transform({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 3, sy: 3, sz: 3 }),
+      EntityAttributes({ parentId: parent.id() }),
+    );
+    const grandchild = w.spawn(
+      Transform({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 }),
+      EntityAttributes({ parentId: child.id() }),
+    );
+
+    transformPropagationSystem(w);
+
+    for (const [name, e] of [['child', child], ['grandchild', grandchild]] as const) {
+      const wt = worldTransforms.get(e.id())!;
+      expect(wt.sx, name).toBe(0);
+      expect(wt.sy, name).toBeGreaterThan(0);
+    }
+  });
+
+  it('leaves 0.001 composing exactly as it does today', () => {
+    // The workaround #258 forced on games/court. Whatever changed for the exact zero must not
+    // have changed for the value content is currently relying on.
+    w = createWorld();
+    const parent = w.spawn(
+      Transform({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 0.53, sy: 0.53, sz: 0.53 }),
+      EntityAttributes({ parentId: 0 }),
+    );
+    const child = w.spawn(
+      Transform({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 0.001, sy: 1, sz: 1 }),
+      EntityAttributes({ parentId: parent.id() }),
+    );
+
+    transformPropagationSystem(w);
+
+    const wt = worldTransforms.get(child.id())!;
+    expect(wt.sx).toBeCloseTo(0.00053, 12);
+    expect(wt.sy).toBeCloseTo(0.53, 12);
+  });
+});

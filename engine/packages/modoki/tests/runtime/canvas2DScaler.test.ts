@@ -185,8 +185,8 @@ describe('screenToReference2D — the pick coordinate inverse (Phase 2)', () => 
 
 // referenceToScreen2D is the forward twin of screenToReference2D, added so bounds reporting
 // (Scene2D.tsx's bounds2DProvider) and agent-aim (games/court's clientToDesign2D usage) share
-// ONE coordinate transform instead of each re-deriving it — see docs/todo.md's "bounds coords
-// don't match the aim space" entry. referenceToScreen2D ∘ screenToReference2D must be the
+// ONE coordinate transform instead of each re-deriving it — see docs/rendering.md's Canvas2D
+// section. referenceToScreen2D ∘ screenToReference2D must be the
 // identity for every scale mode and any device-pixel-ratio / viewZoom baked into the rect.
 describe('referenceToScreen2D — the forward twin (round-trip with screenToReference2D)', () => {
   it('round-trips reference→client→reference for every scale mode', async () => {
@@ -226,7 +226,8 @@ describe('referenceToScreen2D — the forward twin (round-trip with screenToRefe
 });
 
 // clientToDesign2D / designToClient2D — the one-call convenience court now uses instead of a
-// hand-rolled copy of computeCanvasScale + screenToReference2D (docs/todo.md).
+// hand-rolled copy of computeCanvasScale + screenToReference2D (docs/rendering.md's Canvas2D
+// section).
 describe('clientToDesign2D / designToClient2D — game-facing convenience wrapper', () => {
   function makeCanvas(cssW: number, cssH: number, backingW: number, backingH: number): HTMLCanvasElement {
     const canvas = document.createElement('canvas');

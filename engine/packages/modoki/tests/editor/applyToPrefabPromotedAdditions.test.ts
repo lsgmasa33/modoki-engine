@@ -153,6 +153,55 @@ describe('applyToPrefabSelective — reports promoted additions', () => {
     expect(written.entities.some((e: any) => e.traits?.EntityAttributes?.name === 'Engine Flame L')).toBe(true);
   });
 
+  /** ── the promotion boundary between two deliberate conventions ────────────────
+   *
+   *  A scene's `added` bag is COMPACTED (a field at its schema default is omitted —
+   *  `snapshotAddedTraits`, bug kxcE2EBsVmrbbHpBzXMb). A prefab FILE is deliberately written
+   *  FULL by `serializePrefab`, because a real consumer depends on it: Court's
+   *  `layoutFromPrefabDoc` reads prefab fields BY NAME and its `num()` returns null for a
+   *  missing one, so the caller silently falls back to code constants — an authored value that
+   *  merely happens to equal its default would read as "not authored".
+   *
+   *  Promotion is where the two meet, so it has to convert. Without that, a promoted child lands
+   *  compacted beside members written full: one prefab file in two shapes, with only the promoted
+   *  rows misread. */
+  it('writes a promoted child FULL, not compacted, so it matches every other prefab member', async () => {
+    const { setPrefabCache, applyToPrefabSelective } = await getModule();
+    setPrefabCache(SRC, makePrefab() as any);
+
+    const root = testWorld.spawn(
+      Transform({ x: 0, y: 0, z: 0 }),
+      EntityAttributes({ name: 'Ship', parentId: 0, guid: 'g-root' }),
+      PrefabInstance({ source: SRC, localId: 1, rootInstanceId: 0 }),
+    );
+    const rootId = root.id();
+    testWorld.query(PrefabInstance).updateEach(([pi]) => { (pi as any).rootInstanceId = rootId; });
+    entityIndex.set(rootId, root);
+
+    // y and z sit at their schema default, so the SCENE bag omits them.
+    const flame = testWorld.spawn(
+      Transform({ x: 1, y: 0, z: 0 }),
+      EntityAttributes({ name: 'Engine Flame L', parentId: rootId, guid: 'g-flame' }),
+    );
+    entityIndex.set(flame.id(), flame);
+    entityInfos = [
+      { id: rootId, name: 'Ship', parentId: 0, sortOrder: 0, traits: ['Transform', 'EntityAttributes', 'PrefabInstance'] },
+      { id: flame.id(), name: 'Engine Flame L', parentId: rootId, sortOrder: 0, traits: ['Transform', 'EntityAttributes'] },
+    ];
+
+    await applyToPrefabSelective(rootId, new Set([`+added.g-flame`]));
+
+    const written = JSON.parse(writtenContent!);
+    const row = written.entities.find((e: any) => e.traits?.EntityAttributes?.name === 'Engine Flame L');
+    expect(row, 'the promoted child reached the prefab file').toBeTruthy();
+    // The authored value survives...
+    expect(row.traits.Transform.x).toBe(1);
+    // ...and so do the fields sitting at their default, which a by-name reader needs present.
+    expect(Object.keys(row.traits.Transform).sort()).toEqual(['x', 'y', 'z']);
+    expect(row.traits.Transform.y).toBe(0);
+    expect(row.traits.Transform.z).toBe(0);
+  });
+
   it('returns promotedAdditions=0 for a value-only apply (no scene re-save needed)', async () => {
     const { setPrefabCache, applyToPrefabSelective } = await getModule();
     setPrefabCache(SRC, makePrefab() as any);

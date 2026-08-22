@@ -88,7 +88,20 @@ export function serializeMenu(items: readonly MenuItemLike[], parentPath = ''): 
       ...(it.accelerator ? { accelerator: it.accelerator } : {}),
       enabled: it.enabled !== false,
       path,
-      actionable: typeof it.click === 'function' || typeof it.role === 'string',
+      // ⚠️ A CONTAINER IS NOT ACTIONABLE, and `click` cannot tell you that on a LIVE menu.
+      // This read `typeof it.click === 'function' || typeof it.role === 'string'` until
+      // 2026-08-22, which is true for EVERY node of a real application menu: main.ts hands us
+      // `Menu.getApplicationMenu().items`, and Electron gives every MenuItem a click wrapper
+      // regardless of what the template declared. So the field was trivially true — measured
+      // 89/89 nodes actionable, zero false — and carried no information at all. The unit tests
+      // could not see it because they build hand-shaped literals, where an absent `click` really
+      // is absent (this file's own header says so).
+      // The honest discriminator is the SUBMENU: Electron dispatches leaves and ignores a
+      // parent's click (projects.ts states this where the template is built), so a node with
+      // children is never firable. The role/click half is kept for the literal case, where it
+      // correctly rejects an inert leaf.
+      actionable: !(it.submenu && it.submenu.items.length > 0)
+        && (typeof it.role === 'string' || typeof it.click === 'function'),
     };
     if (it.submenu && it.submenu.items.length) node.submenu = serializeMenu(it.submenu.items, path);
     out.push(node);
@@ -170,6 +183,79 @@ export interface ClickContext {
   webContents?: unknown;
 }
 
+/** The BrowserWindow methods {@link executeWindowRole} needs, as a structural subset so this
+ *  module stays testable without Electron. */
+interface WindowLike {
+  minimize?: () => void;
+  maximize?: () => void;
+  unmaximize?: () => void;
+  isMaximized?: () => boolean;
+  setFullScreen?: (flag: boolean) => void;
+  isFullScreen?: () => boolean;
+  moveTop?: () => void;
+  close?: () => void;
+}
+
+/**
+ * Perform a WINDOW-role menu item against the live `BrowserWindow`, returning whether it was
+ * handled.
+ *
+ * ⚠️ **Why this exists rather than trusting `click()`.** For a native role, Electron performs the
+ * action through its own menu dispatch — the MenuItem's `click` wrapper does not do it. Calling
+ * `item.click?.(…)` on `Window → Minimize` therefore runs a function that does nothing, and the
+ * caller cheerfully reports `{ok:true, fired:"Minimize"}` while the window has not moved.
+ * Measured 2026-08-22: `AXMinimized` stayed false through repeated Minimize calls, and Zoom left
+ * the window at 1600x1000.
+ *
+ * WEBCONTENTS roles are deliberately NOT handled here. The same measurement found `View → Reload`
+ * genuinely works through the click path, so those are left alone — this table covers exactly the
+ * family that was proven broken, and nothing else.
+ *
+ * Returns `false` for any role it does not own, so the caller falls back to `click()`.
+ */
+function executeWindowRole(role: string, window: unknown): boolean {
+  const w = window as WindowLike | undefined;
+  if (!w) return false;
+  switch (role) {
+    case 'minimize': if (!w.minimize) return false; w.minimize(); return true;
+    // macOS "Zoom" TOGGLES; maximize alone would make a second call a no-op that still reports success.
+    case 'zoom':
+      if (!w.maximize || !w.unmaximize || !w.isMaximized) return false;
+      if (w.isMaximized()) w.unmaximize(); else w.maximize();
+      return true;
+    case 'togglefullscreen':
+      if (!w.setFullScreen || !w.isFullScreen) return false;
+      w.setFullScreen(!w.isFullScreen());
+      return true;
+    case 'front': if (!w.moveTop) return false; w.moveTop(); return true;
+    // `close` is the same window-lifecycle family as the three above and was MISSED by the first
+    // cut of this fix — `WindowLike.close` was declared and never referenced, which is what gave it
+    // away in review. Left unwired it kept the exact false success the rest of this function
+    // removes: File/Close and Window/Close would report `{ok:true, fired:"Close"}` with the window
+    // still open.
+    case 'close': if (!w.close) return false; w.close(); return true;
+    default: return false;
+  }
+}
+
+/**
+ * Roles this module can NEITHER perform NOR verify — so `trigger` refuses them instead of
+ * reporting a success it cannot substantiate.
+ *
+ * These are APP-level macOS roles dispatched by AppKit against the application object, not a
+ * window: `ClickContext` carries a window and a webContents, and nothing here can reach Electron's
+ * `app`. Falling through to `item.click?.()` would run the same inert wrapper that made
+ * Minimize/Zoom lie, and `quit` failing silently is the worst version of that — the caller believes
+ * the editor is going away and it is not.
+ *
+ * ⚠️ Refusing is deliberate, and it is the honest half of a fix that is not finished. Unlike
+ * minimize/zoom, these were NOT measured no-ops — the reasoning is Electron's documented macOS
+ * role dispatch, and the correct next step is to plumb `app` into `ClickContext` and perform them,
+ * not to keep the refusal forever. Until then a caller gets a reason it can act on rather than a
+ * cheerful lie.
+ */
+const UNPERFORMABLE_APP_ROLES = new Set(['quit', 'hide', 'hideothers', 'unhide', 'services']);
+
 /** Flatten a serialized tree to the label paths of every ACTIONABLE, enabled item — the useful
  *  "what could I have fired?" hint on a miss. */
 export function actionablePaths(nodes: readonly MenuNode[]): string[] {
@@ -205,8 +291,24 @@ export function triggerMenuItem(
   }
   const label = item.label ?? item.role ?? '(unnamed)';
   if (item.enabled === false) return { ok: false, error: `menu item "${label}" is disabled` };
+  // Containers first, and by SUBMENU rather than by a missing click: on a live menu every
+  // MenuItem has a click wrapper, so the check below cannot see a container and `File` would
+  // report `{ok:true, fired:"File"}` having done nothing. Electron ignores a parent's click.
+  if (item.submenu && item.submenu.items.length > 0) {
+    return { ok: false, error: `menu item "${label}" is a submenu container, not a command — aim at an item inside it`, available: actionablePaths(serializeMenu(items)) };
+  }
   if (typeof item.click !== 'function' && typeof item.role !== 'string') {
     return { ok: false, error: `menu item "${label}" has no action (it is a container/label, not a command)` };
+  }
+  // A window role must be performed against the BrowserWindow — its `click` is inert. See
+  // executeWindowRole for the measurement. Anything it does not own falls through to click().
+  if (typeof item.role === 'string' && executeWindowRole(item.role, ctx?.window)) {
+    return { ok: true, fired: label };
+  }
+  // Refuse what we can neither perform nor verify, rather than reporting a false success — the bug
+  // this whole function exists to remove. See UNPERFORMABLE_APP_ROLES.
+  if (typeof item.role === 'string' && UNPERFORMABLE_APP_ROLES.has(item.role.toLowerCase())) {
+    return { ok: false, error: `menu item "${label}" is the native macOS \`${item.role}\` role — it is dispatched by the OS against the application, not through this item's click handler, so firing it here would report a success that did not happen. Not supported from the agent surface.` };
   }
   try {
     // Pass (menuItem, window, webContents) — the same shape Electron's own menu dispatch uses — so

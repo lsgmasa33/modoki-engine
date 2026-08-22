@@ -38,6 +38,7 @@
  */
 
 import * as THREE from 'three';
+import { onWorldSwap } from '../core/ecs/world';
 
 /** Below this, one InstancedMesh costs more than the draw calls it saves. */
 export const MIN_INSTANCES = 6;
@@ -102,9 +103,21 @@ const groups = new Map<string, Group>();
 const hiddenByBatch = new WeakSet<THREE.Object3D>();
 const IDENTITY = new THREE.Matrix4();
 const _tmp = new THREE.Matrix4();
-let lastStats: BatchStats = {
-  considered: 0, batched: 0, groups: 0, drawCallsSaved: 0, skipped: {}, lodLevels: {}, top: [],
-};
+/** The "nothing batched" reading, SHARED rather than rebuilt.
+ *
+ *  `clearInstancedBatches` runs on the else branch of every sync — i.e. every frame, on every
+ *  surface, for as long as `BATCH_DRAW_CALLS` stays false, which is always today. Allocating a
+ *  fresh stats object (plus two maps and an array) there put four allocations per frame per
+ *  surface into the render loop of every game, to report a result that never changes. Frozen so a
+ *  consumer cannot make the shared instance lie. */
+const EMPTY_STATS: BatchStats = Object.freeze({
+  considered: 0, batched: 0, groups: 0, drawCallsSaved: 0,
+  skipped: Object.freeze({}) as Record<string, number>,
+  lodLevels: Object.freeze({}) as Record<string, number>,
+  top: Object.freeze([]) as unknown as BatchGroupStat[],
+});
+
+let lastStats: BatchStats = EMPTY_STATS;
 
 /** The most recent batching result — surfaced through `readRenderer`'s neighbours so the effect
  *  is readable without an eval. `calls` alone cannot say WHY it changed. */
@@ -112,20 +125,56 @@ export function getBatchStats(): BatchStats {
   return lastStats;
 }
 
-function disposeGroup(g: Group, scene: THREE.Scene): void {
-  scene.remove(g.mesh);
+function disposeGroup(g: Group): void {
+  // Removed from ITS OWN parent, never from a scene passed in by the caller: with one module-global
+  // `groups` map and more than one scene, a caller's scene and the group's scene can differ, and
+  // `otherScene.remove(mesh)` is a silent no-op. That left the InstancedMesh drawing in its real
+  // scene with its members un-hidden again — every batched mesh rendered TWICE.
+  g.mesh.removeFromParent();
   g.mesh.dispose();
   // Restore the individual meshes — the batch borrowed their visibility, it does not own it.
   for (const c of g.members) { if (hiddenByBatch.delete(c.obj)) c.obj.visible = true; }
 }
 
-/** Drop every batch and un-hide its members. Called on teardown and whenever batching is
- *  disabled, so turning it off can never leave a scene half-hidden. */
+/** Drop THIS scene's batches and un-hide their members. Called on teardown and whenever batching
+ *  is disabled, so turning it off can never leave a scene half-hidden.
+ *
+ *  ⚠️ SCENE-SCOPED, because `groups` is module-global while scenes are not. The editor runs the
+ *  Game panel (batching ON is the only place it ships) and the SceneView (batching always OFF —
+ *  it picks by raycasting the meshes a batch hides) against ONE module instance, so an unfiltered
+ *  clear would let the SceneView's sync dispose the Game panel's batches every frame and the game
+ *  rebuild them every frame — a dispose/rebuild loop, i.e. pipeline churn, from a function whose
+ *  job is cleanup. Filter by parent so each caller only ever clears what it owns. */
 export function clearInstancedBatches(scene: THREE.Scene): void {
-  for (const g of groups.values()) disposeGroup(g, scene);
-  groups.clear();
-  lastStats = { considered: 0, batched: 0, groups: 0, drawCallsSaved: 0, skipped: {}, lodLevels: {}, top: [] };
+  // `groups.size === 0` is the COMMON case — see EMPTY_STATS. Skip the spread copy as well as the
+  // object literal, so the always-taken path costs one map read.
+  if (groups.size > 0) {
+    for (const [key, g] of [...groups]) {
+      const parent = g.mesh.parent;
+      // A PARENTLESS group is an orphan — its scene was torn down or cleared without going through
+      // here, so nobody else can ever reclaim it. Skipping it (which scoping by `parent === scene`
+      // alone did) strands its members hidden forever and leaks the InstancedMesh plus strong refs
+      // to every member. Only a group living in ANOTHER scene is off limits.
+      if (parent !== scene && parent !== null) continue;
+      disposeGroup(g);
+      groups.delete(key);
+    }
+  }
+  lastStats = EMPTY_STATS;
 }
+
+/** Drop EVERY batch, whatever scene it belongs to — the world itself is going away, so there is no
+ *  other scene left to protect. Registered below on `onWorldSwap`, which is the idiom every sibling
+ *  module-level cache in this directory already uses (`flameMeshSync`'s lathe cache,
+ *  `blobShadowSync`'s quad, `scene3DSync`'s tint clones). Without it, a world swap with batching ON
+ *  left the previous scene's groups in the map: the retire pass only ever looks at the scene it was
+ *  handed, and the old scene is never handed to anything again. */
+export function clearAllInstancedBatches(): void {
+  for (const g of groups.values()) disposeGroup(g);
+  groups.clear();
+  lastStats = EMPTY_STATS;
+}
+onWorldSwap(clearAllInstancedBatches);
 
 /** Group the given objects and draw each qualifying group through one InstancedMesh.
  *
@@ -193,7 +242,7 @@ export function applyInstancedBatching(
     seen.add(key);
     const signature = `${members.length}:${members[0].obj.id}:${members[members.length - 1].obj.id}`;
     let g = groups.get(key);
-    if (g && g.signature !== signature) { disposeGroup(g, scene); groups.delete(key); g = undefined; }
+    if (g && g.signature !== signature) { disposeGroup(g); groups.delete(key); g = undefined; }
     if (!g) {
       const src = members[0];
       const inst = new THREE.InstancedMesh(src.geo, src.mat, members.length);
@@ -231,14 +280,21 @@ export function applyInstancedBatching(
   }
 
   // Retire batches whose group no longer qualifies — restoring their members' visibility.
+  // SCOPED to this scene: a group belonging to another scene was not a candidate for this call, so
+  // "not seen" says nothing about whether it still qualifies. Unscoped, a second scene's pass
+  // retired the first's batches on sight — and did it while passing the WRONG scene to the dispose,
+  // so the batch stayed in its real scene and drew alongside the members it had just un-hidden.
   for (const [key, g] of [...groups]) {
-    if (!seen.has(key)) { disposeGroup(g, scene); groups.delete(key); }
+    const parent = g.mesh.parent;
+    if (!seen.has(key) && (parent === scene || parent === null)) { disposeGroup(g); groups.delete(key); }
   }
 
   top.sort((a, b) => b.instances - a.instances);
   lastStats = {
-    considered, batched, groups: groups.size,
-    drawCallsSaved: Math.max(0, batched - groups.size),
+    // THIS scene's groups (`seen`), not the module-wide map — with several scenes the map counts
+    // batches this call never looked at, which would make `drawCallsSaved` subtract them too.
+    considered, batched, groups: seen.size,
+    drawCallsSaved: Math.max(0, batched - seen.size),
     skipped, lodLevels, top: top.slice(0, 8),
   };
   return lastStats;

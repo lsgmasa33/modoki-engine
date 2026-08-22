@@ -12,6 +12,8 @@
  *  an observation alone has nothing to check against.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { z } from '../../tools/modoki-mcp/node_modules/zod';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { CONTRACTS, contractFor } from '../../tools/modoki-mcp/src/contracts';
@@ -52,6 +54,142 @@ describe('tool contracts', () => {
         const match = made.find((r) => r.path.split('?')[0] === c.route);
         expect(match, `${name} never called ${c.route}; it called: ${made.map((r) => `${r.method} ${r.path}`).join(', ') || '(nothing)'}`).toBeDefined();
         expect(match!.method, `${name} method`).toBe(c.method);
+      });
+    }
+  });
+
+  /** `varies` OBSERVED, not just declared (2026-08-21).
+   *
+   *  `method`/`route`/`op` were checked against observation from the start; `varies` was not, and
+   *  it is the field that DISARMS the mutating-GET guards below (they all filter on `!c.varies`).
+   *  So a tool could exempt itself from them by declaring a variance it did not have — and
+   *  `modoki_hit_regions` did exactly that, with `varies:'both'` on a route with one arm, for as
+   *  long as the field existed. A refused `action:'show'` came back as a SUCCESSFUL tool call.
+   *
+   *  Nothing could have caught it: `minimalArgs` is one call, and one call cannot show variance.
+   *  Seeing it needs EVERY action driven and the method+route recorded for each. That is what this
+   *  does, so the class is now un-declarable rather than merely fixed once.
+   *
+   *  The action list is EXPLICIT rather than read off the zod enum: the enum is the vocabulary,
+   *  and some actions need a companion param to be valid at all (`watch action:'start'` needs a
+   *  `component`). A synthesized call would refuse before making a request and this would assert
+   *  nothing — the vacuous-guard failure mode the audit found four of. Totality is asserted
+   *  below, so a new multi-action tool cannot skip the table. */
+  const ACTION_PROBES: Record<string, Array<Record<string, unknown>>> = {
+    modoki_hit_regions: [{ action: 'read' }, { action: 'show' }, { action: 'hide' }],
+    modoki_watch: [
+      { action: 'list' }, { action: 'start', component: 'Transform' },
+      { action: 'read', id: 'w1' }, { action: 'clear' },
+    ],
+    modoki_input_watch: [{ action: 'read' }, { action: 'start' }, { action: 'stop' }, { action: 'clear' }],
+    modoki_profiler: [{ action: 'read' }, { action: 'boot' }, { action: 'capture-start' }, { action: 'reset' }],
+    modoki_project_settings: [{ action: 'get' }, { action: 'set', values: { app: { appName: 'X' } } }],
+    // The rest of the multi-action surface, which varies in NEITHER method nor route. Probing them
+    // is not busywork: it PINS that, so a future action added on a new route (the natural way
+    // `varies` becomes true) fails here instead of quietly making the declaration stale.
+    // Bare `{}` IS the read here — `action` is the capture-window control (start|stop only), and
+    // both halves need the `type` they gate on.
+    modoki_journal: [{}, { action: 'start', type: '@contact' }, { action: 'stop', type: '@contact' }],
+    modoki_pointer: [
+      { action: 'down', x: 1, y: 2 }, { action: 'move', x: 3, y: 4 }, { action: 'up', x: 3, y: 4 },
+    ],
+    modoki_play_control: [{ action: 'play' }, { action: 'stop' }, { action: 'pause' }, { action: 'resume' }, { action: 'step' }],
+    modoki_history: [{ action: 'undo' }, { action: 'redo' }],
+    modoki_prefab: [
+      { action: 'instantiate', path: '/assets/prefabs/probe.prefab.json' },
+      { action: 'overrides', entityGuid: '00000000-0000-0000-0000-000000000000' },
+      { action: 'detach', entityGuid: '00000000-0000-0000-0000-000000000000' },
+    ],
+    modoki_write_player_prefs: [
+      { action: 'flush' }, { action: 'set', key: 'k', value: 1 },
+      { action: 'delete', key: 'k' }, { action: 'clear', confirm: true },
+    ],
+  };
+
+  describe('a declared `varies` matches what the actions actually do', () => {
+    for (const [name, probes] of Object.entries(ACTION_PROBES)) {
+      it(`${name} varies exactly as declared`, async () => {
+        const seen: Array<{ method: string; route: string }> = [];
+        for (const args of probes) {
+          const before = realRequests(s).length;
+          await s.call(name, args).catch(() => {/* a refusal makes no request; the gap shows below */});
+          for (const r of realRequests(s).slice(before)) seen.push({ method: r.method, route: r.path.split('?')[0] });
+        }
+        // Every probe must actually reach the backend, or the observation is vacuous.
+        expect(seen.length, `${name}: some action made no request — the probe args are wrong, not the contract`)
+          .toBeGreaterThanOrEqual(probes.length);
+        const methodVaries = new Set(seen.map((r) => r.method)).size > 1;
+        const routeVaries = new Set(seen.map((r) => r.route)).size > 1;
+        const observed = methodVaries && routeVaries ? 'both' : methodVaries ? 'method' : routeVaries ? 'route' : undefined;
+        expect(CONTRACTS[name].varies, `${name}: observed ${JSON.stringify(seen)}`).toBe(observed);
+      });
+    }
+
+    it('every multi-action tool is probed — the table cannot silently omit one', () => {
+      // Totality, the same rule `liveCoverage.ts` uses: a guard whose input list can quietly miss a
+      // tool is a guard that stops covering the surface one addition at a time. "Multi-action" is
+      // read off the schema (an `action` enum with more than one value), so a NEW such tool fails
+      // here until it is probed, rather than being assumed single-shaped.
+      const multiAction = Object.keys(CONTRACTS).filter((name) => {
+        const field = (getTool(name)?.shape as Record<string, unknown> | undefined)?.action as
+          { _def?: { innerType?: { _def?: { values?: unknown[] } }; values?: unknown[] } } | undefined;
+        const values = field?._def?.values ?? field?._def?.innerType?._def?.values;
+        return Array.isArray(values) && values.length > 1;
+      });
+      expect(multiAction.filter((n) => !(n in ACTION_PROBES)), 'multi-action tools with no probe').toEqual([]);
+      expect(Object.keys(ACTION_PROBES).filter((n) => !multiAction.includes(n)), 'probes for tools that are no longer multi-action').toEqual([]);
+    });
+
+    it('…and THAT check can fail (mutation-tested against the pre-fix declaration)', () => {
+      // `modoki_hit_regions` declared 'both' and observed neither. Feed the classifier the shape it
+      // actually had, so this guard is known to fail rather than merely known to pass.
+      const preFix = [
+        { method: 'GET', route: '/api/hit-regions' },
+        { method: 'GET', route: '/api/hit-regions' },
+        { method: 'GET', route: '/api/hit-regions' },
+      ];
+      const mv = new Set(preFix.map((r) => r.method)).size > 1;
+      const rv = new Set(preFix.map((r) => r.route)).size > 1;
+      expect(mv && rv ? 'both' : mv ? 'method' : rv ? 'route' : undefined).toBeUndefined();
+    });
+  });
+
+  describe('`minimalArgsMutates` is OBSERVED, not trusted', () => {
+    /** The sibling of the `varies` defect, found by sweeping for the PATTERN rather than the
+     *  symptom: a contract field that is declared, never verified, and then trusted by a safety
+     *  mechanism.
+     *
+     *  This one is trusted by the most consequential mechanism on the surface.
+     *  `test-live-tools.ts:79` picks what to fire at the HUMAN'S OPEN EDITOR with
+     *  `!(minimalArgsMutates ?? mutating)` — so a tool that under-declares gets its smallest call
+     *  run for real against the human's project. The only existing check
+     *  (`liveCoverage.test.ts`) asserts the DECLARATION equals false, which is circular: it
+     *  confirms the tool says "safe", not that it is.
+     *
+     *  Failure it prevents: a tool whose default action later changes from a read to a write keeps
+     *  `minimalArgsMutates: false`, and the next live sweep silently mutates the human's project.
+     *
+     *  GET is the right proxy HERE specifically. It is not true surface-wide — `capture_viewport`
+     *  and `render_scene` are POST reads — but every tool that DECLARES this field is a
+     *  method-splitting tool whose read half is the GET half, which is the whole reason the field
+     *  exists. A POST from a call declared non-mutating is "do this" by §4, and wants a look. */
+    const declarers = Object.entries(CONTRACTS).filter(([, c]) => c.minimalArgsMutates === false);
+
+    it('the field is actually in use — this guard is not vacuous', () => {
+      expect(declarers.length, 'nothing declares minimalArgsMutates; the field or its consumers moved').toBeGreaterThan(0);
+    });
+
+    for (const [name] of declarers) {
+      it(`${name}'s smallest call really is a read (GET)`, async () => {
+        await s.call(name, CONTRACTS[name].minimalArgs);
+        const made = realRequests(s);
+        expect(made.length, `${name} made no request, so nothing was observed`).toBeGreaterThan(0);
+        const methods = [...new Set(made.map((r) => r.method))];
+        expect(
+          methods,
+          `${name} declares minimalArgsMutates:false — the live sweep fires this at the human's `
+          + `open editor on that basis — but its smallest call issued ${methods.join('/')}.`,
+        ).toEqual(['GET']);
       });
     }
   });
@@ -142,6 +280,60 @@ describe('tool contracts', () => {
     expect(denies.test('Create an entity. Pushes ONE undo entry.')).toBe(false);
   });
 
+  /** `undoable` OBSERVED against the op that implements it (2026-08-21).
+   *
+   *  The description check above is ONE-DIRECTIONAL — it fails on `undoable:true` + a description
+   *  that DENIES undo. The opposite pairing is the one that actually happened, and it is invisible
+   *  to that check twice over: `modoki_particle_set` and its four asset-authoring siblings declared
+   *  `undoable:false` (by omission) while their ops called `pushAssetUndo`, and their descriptions
+   *  said NOTHING about undo — so there was no sentence to contradict.
+   *
+   *  Nothing agent-facing was merely cosmetic about it. The generated catalog is rendered FROM this
+   *  table, so it stated the opposite of the truth for five tools in the doc that "cannot drift" —
+   *  the drift was upstream of the generator. And an agent that had just made a bad write could not
+   *  see that `modoki_history` was the way back.
+   *
+   *  So this reads the OP source, the same trick `mcpRegistry.test.ts` uses for its registration
+   *  guards. Direction matters: an op that pushes undo MUST be declared undoable. Not the converse
+   *  — a tool can be undoable through a mechanism that is not a literal `pushAssetUndo` call here
+   *  (the entity ops go through the editor store), and asserting that way round would produce false
+   *  failures instead of catching real ones. */
+  it('an agent op that pushes an undo entry is DECLARED undoable', () => {
+    const opsSrc = fs.readFileSync(
+      path.join(__dirname, '../../app/editor/agentEditorOps.ts'), 'utf-8',
+    );
+    // Split on the op registrations: each chunk runs from one op's name to the next registration,
+    // so it IS that op's body. `.slice(1)` drops the preamble, which is where `pushAssetUndo` is
+    // DEFINED — counting its own definition would mark the first op as pushing.
+    const chunks = opsSrc.split(/registerAgentOp\(\s*'/).slice(1);
+    const pushesUndo = new Set<string>();
+    for (const chunk of chunks) {
+      const op = chunk.slice(0, chunk.indexOf("'"));
+      if (/push(Asset)?Undo\(/.test(chunk)) pushesUndo.add(op);
+    }
+    // Pin the SET, not just its size. A `> 0` floor survives a source reshape that quietly drops
+    // four of the five — which would leave this green while covering almost nothing.
+    expect([...pushesUndo].sort(), 'the undo-pushing ops changed — extend the contracts, do not relax this')
+      .toEqual(['anim-add-key', 'anim-set-clip', 'particle-set', 'timeline-add-clip', 'timeline-set']);
+
+    const offenders: string[] = [];
+    for (const [name, c] of Object.entries(CONTRACTS)) {
+      if (c.op && pushesUndo.has(c.op) && !c.undoable) {
+        offenders.push(`${name} (op '${c.op}') pushes an undo entry but declares undoable:false`);
+      }
+    }
+    expect(offenders, 'contract vs the op it routes to disagree about undo').toEqual([]);
+  });
+
+  it('…and THAT check can fail (mutation-tested against the pre-fix declaration)', () => {
+    // The five were `undoable:false` with ops in the pushing set. Re-run the comparison with the
+    // declaration they actually had, so this guard is known to fail rather than known to pass.
+    const pushesUndo = new Set(['particle-set', 'anim-set-clip', 'anim-add-key', 'timeline-set', 'timeline-add-clip']);
+    const preFix = [{ name: 'modoki_particle_set', op: 'particle-set', undoable: false }];
+    expect(preFix.filter((c) => pushesUndo.has(c.op) && !c.undoable).map((c) => c.name))
+      .toEqual(['modoki_particle_set']);
+  });
+
   /** F3 — MUTATING operations reachable by GET. `getJson` deliberately does not run
    *  `isFailureBody` (a GET's `ok` may be the ANSWER — `diagnose`/`validate_scene` return
    *  `ok:false` to mean "unhealthy"), so a mutating GET's failure is structurally unchecked.
@@ -163,6 +355,12 @@ describe('tool contracts', () => {
     // through QUERY PARAMS on a GET (`?clear=1`, `?action=start`), so a scan of route methods
     // alone missed them.
     'modoki_journal', 'modoki_editor_journal',
+    // Added 2026-08-21. It was ALWAYS a mutating GET — `action:'show'|'hide'` flips the overlay
+    // and `/api/hit-regions` has one arm, `method === 'GET'` — but it declared `varies:'both'`,
+    // and the filter below excludes `varies` tools, so it was in none of the three guards here
+    // and its refusals reached the agent as successes. The declaration was the bug; see the
+    // `observes` block above, which now makes that class un-declarable.
+    'modoki_hit_regions',
   ];
 
   it('no NEW mutating operation hides behind GET', () => {
@@ -183,6 +381,7 @@ describe('tool contracts', () => {
   const MUTATING_GET_ARGS: Record<string, Record<string, unknown>> = {
     modoki_journal: { action: 'start', type: '@contact' },
     modoki_editor_journal: { clear: true },
+    modoki_hit_regions: { action: 'show' },
   };
 
   it('every mutating GET (outside the build family) has a mutating-args fixture', () => {
@@ -192,6 +391,19 @@ describe('tool contracts', () => {
       .filter(([, c]) => c.mutating && c.method === 'GET' && !c.varies && c.kind !== 'build')
       .map(([n]) => n).sort();
     expect(Object.keys(MUTATING_GET_ARGS).sort()).toEqual(expected);
+  });
+
+  it('…and the READ half of a split tool keeps C7 — `ok:false` stays an ANSWER', async () => {
+    // The other direction of the `modoki_hit_regions` fix, and the one a careless version would
+    // break: the check is armed per ACTION (`action !== 'read'`), not for the whole tool. Arming it
+    // wholesale would make every plain read of a route that answers `ok:false` a failed call —
+    // exactly what §4 says not to "fix". Without this, that regression passes silently, because the
+    // mutating assertion above would still be green.
+    const s2 = loadSurface(() => ({ body: { ok: false, regions: [], providers: [] } }));
+    try {
+      const r = await s2.call('modoki_hit_regions', { action: 'read' });
+      expect(r.isError, 'a plain read must not turn ok:false into a failed call').toBeFalsy();
+    } finally { s2.restore(); }
   });
 
   it('a mutating GET treats a 200 `ok:false` as a FAILURE (Phase 6)', async () => {

@@ -4,7 +4,7 @@
 import projectConfig from 'virtual:modoki-project-config';
 import { registerAllTraits } from './registerTraits';
 import { setNameTransform } from '@modoki/engine/runtime';
-import { getGameConfig, registerEngineActions, registerAudioControls, registerHapticControls, registerVideoControls, registerManager, timeManager, navigationManager, physics2DEventsManager, physics3DEventsManager, zone2DEventsManager, zone3DEventsManager, timelineEventsManager, inputSourcesManager, setPhysicsLayers, setTargetFPS, setRenderSettings } from '@modoki/engine/runtime';
+import { getGameConfig, registerEngineActions, registerAudioControls, registerHapticControls, registerQualityControls, registerVideoControls, registerManager, timeManager, navigationManager, physics2DEventsManager, physics3DEventsManager, zone2DEventsManager, zone3DEventsManager, timelineEventsManager, inputSourcesManager, setPhysicsLayers, setTargetFPS, setRenderSettings, getEffectiveTargetFps } from '@modoki/engine/runtime';
 
 let registered = false;
 
@@ -20,6 +20,9 @@ export function registerAll() {
   // inputBinding resolves bus volumes. Lets games control audio declaratively.
   registerAudioControls();
   registerHapticControls();
+  // Built-in quality control layer: quality.set (the player's Auto/Low/Mid/High choice),
+  // so a settings screen can drive render tier declaratively too.
+  registerQualityControls();
   // Skipped entirely when video is excluded — the `video.*` actions would have nothing to
   // drive, and registering them would pull the subsystem back into the bundle.
   if (__MODOKI_MODULE_VIDEO__) registerVideoControls();
@@ -47,11 +50,17 @@ export function registerAll() {
 
   // Project-defined 2D physics collision layers + matrix → runtime registry.
   setPhysicsLayers(projectConfig.physics);
-  // Project frame-rate cap → frame driver (0 = uncapped / display refresh).
-  setTargetFPS(projectConfig.rendering.targetFps);
-  // Project renderer knobs (three backend/AA/shadows/tone/exposure, pixi
+  // Project renderer knobs (targetFps, three backend/AA/shadows/tone/exposure, pixi
   // backend/AA/resolution, web canvas sizing) → engine render-settings registry.
   setRenderSettings(projectConfig.rendering);
+  // Project frame-rate cap → frame driver (0 = uncapped / display refresh).
+  //
+  // ⚠️ ORDER IS LOAD-BEARING, and it is the reverse of what it was: the cap is read back through
+  // `getEffectiveTargetFps()`, which needs the authored value already in the registry. It also
+  // must go through that accessor rather than `projectConfig.rendering.targetFps` directly, so a
+  // tier can clamp it (#202) — no tier is resolved this early, so the two agree here and diverge
+  // the moment one is (`applyActiveTierToRuntime` re-applies it then).
+  setTargetFPS(getEffectiveTargetFps());
 
   // Use nameTransform from game config if provided
   const config = getGameConfig();

@@ -8,10 +8,10 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { SAVE_PARAM } from '../shapes.js';
+import { DISCARD_UNSAVED_BASE, discardUnsavedParam, flatEntityAlias, foldEntityRef } from '../shapes.js';
 
 export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
-  const { getJson, postJson, editorAction } = ctx;
+  const { getJson, postJson, editorAction, fail } = ctx;
 
   // ── get_editor_state — "see everything a human sees" ──
   tool(
@@ -19,7 +19,13 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Read the WHOLE editor UI state in one call: current scene path, play state ' +
       '(stopped/playing/paused), gizmo mode/space, FPS, entity count, current selection ' +
       '(entity ids + selected asset), the editor viewport camera pose, undo/redo ' +
-      'availability + labels, and `persistenceMode` (always \'manual\' — see modoki_persistence). ' +
+      'availability + labels, `focusedPanel` (which panel owns the KEYBOARD SCOPE) with '
+      + '`openPanels` (the ids that currently have a tab — the only values modoki_focus / '
+      + 'modoki_press_key accept for `panel`, case-sensitively), '
+      + 'and `persistenceMode` (always \'manual\' — see modoki_persistence). ' +
+      'Also `heldPointer` — the sustained modoki_pointer press currently held ({button,x,y,heldMs}), ' +
+      'or null. Check it when the Game panel has stopped responding to drags: a press left held ' +
+      'latches pointer input for the human as well as the agent, and nothing else reports it (#302). ' +
       'The companion to get_scene_state (which reads the ECS world): this reads the EDITOR. ' +
       'Requires a connected editor renderer.',
     {},
@@ -52,11 +58,20 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_editor_journal',
     'Read the EDITOR-ACTIVITY stream — what is being done in the editor session (Editor Percept). ' +
-      'Event TYPES: !edit, !select, !create, !delete, !duplicate, !reparent, !transform, !undo, !redo, ' +
-      '!play, !pause, !stop, !scene-load, !save, !gizmo. Structural events carry guids: !create/!duplicate ' +
+      'Event TYPES: !edit, !mutate, !select, !create, !delete, !duplicate, !reparent, !transform, ' +
+      '!undo, !redo, !play, !pause, !stop, !scene-load, !save, !gizmo. ' +
+      '⚠️ **!mutate is what YOUR OWN modoki_mutate_scene / modoki_set_transform produce** (label ' +
+      '"Mutate Scene (N ops)"); !edit is the HUMAN Inspector-field path. This list omitted !mutate, ' +
+      'and a QA case that trusted it asserted !edit and failed against a perfectly healthy engine — ' +
+      'assert on what the journal returns, not on a remembered name. A !mutate is a COMPOSITE, so ' +
+      'its payload is `{count, ops:[{kind, label, …that op\'s own payload, detail?}], truncated?}` — ' +
+      'the entity guids are inside `ops[]`, one line per sub-op, not at the top level. ' +
+      'Structural events carry guids: !create/!duplicate ' +
       '`{entity, parent, source?}`, !delete `{entities:[guid]}`, !reparent `{entity, from, to, reorder}` ' +
       '(from/to are parent guids, "root" for scene root), !transform `{entity, before, after}` (a gizmo ' +
-      'drag — before/after hold only the TRS fields that moved, e.g. {x,y,z}). !scene-load `{path, ' +
+      'drag — before/after hold only the TRS fields that moved, e.g. {x,y,z}; a MULTI-SELECT drag is ' +
+      'ONE event shaped `{entities:[guid], members:[{entity, before, after}]}` instead, so read ' +
+      '`members` — `payload.entity` is undefined there). !scene-load `{path, ' +
       'entityCount}`, !save `{path, entities}`, !gizmo `{mode|space}`. ' +
       'A trait-field !edit ALSO carries a structured `detail: {trait, field, entities[guid], old[], ' +
       'new[]}` (index-aligned arrays; length-1 for a single edit, N for a multi-select — so "zeroed ' +
@@ -200,20 +215,20 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Switch the editor to a scene (returns to Stopped first, like opening a scene). Verify ' +
       'with modoki_get_editor_state / modoki_get_scene_state afterwards. REFUSES when the ' +
       'editor has unsaved live-world changes (it swaps the world, destroying them) — save_all ' +
-      'first, or pass force:true.',
+      'first, or pass discardUnsaved:true.',
     {
-      force: z.boolean().optional().describe('Discard unsaved live-world changes (they are destroyed — from the world, the file, AND the undo stack).'),
+      discardUnsaved: discardUnsavedParam,
       path: z.string().describe('Asset-root URL of the scene file.') },
-    async ({ path, force }) => editorAction('load-scene', { path, ...(force ? { force } : {}) }),
+    async ({ path, discardUnsaved }) => editorAction('load-scene', { path, ...(discardUnsaved ? { discardUnsaved } : {}) }),
   );
   tool(
     'modoki_new_scene',
     'Start a fresh untitled scene (clears all entities, spawns a default Camera). Unsaved ' +
       'until you modoki_save_all({path}) — it has no path yet, so save_all REQUIRES one. ' +
       'WARNING: this DISCARDS the live world; anything created and not saved is gone (it ' +
-      'refuses if there are unsaved changes — pass force:true to discard them deliberately).',
-    { force: z.boolean().optional().describe('Discard unsaved live-world changes deliberately.') },
-    async ({ force }) => editorAction('new-scene', force ? { force } : {}),
+      'refuses if there are unsaved changes — pass discardUnsaved:true to discard them deliberately).',
+    { discardUnsaved: discardUnsavedParam },
+    async ({ discardUnsaved }) => editorAction('new-scene', discardUnsaved ? { discardUnsaved } : {}),
   );
   tool(
     'modoki_save_all',
@@ -276,7 +291,6 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       shape: z.string().optional().describe('For kind=2d. One of: circle, square, triangle (default square). An unknown name is REFUSED. For an image sprite, create the entity then set Renderable2D.sprite to a texture GUID.'),
       preset: z.enum(['view', 'text', 'image', 'button', 'input', 'slider']).optional().describe('For kind=ui.'),
       light: z.enum(['ambient', 'directional', 'point', 'spot']).optional().describe('For kind=light.'),
-      save: SAVE_PARAM,
     },
     async ({ kind, parentId, parentGuid, mesh, shape, preset, light }) => {
       // Build the discriminated CreateEntitySpec the renderer op expects.
@@ -298,8 +312,16 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Duplicate an entity and its subtree (undoable, like Cmd+D). Address it by `guid` (PREFER — ' +
       'stable) or `id`. Returns {id, guid} of the new copy — carry the guid. LIVE-world only: NOT ' +
       'saved to disk (run modoki_save_all to persist).',
-    { id: z.number().optional().describe('Runtime id — reassigned on hot-reload. Prefer guid.'), guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.'), save: SAVE_PARAM },
-    async ({ id, guid }) => editorAction('duplicate-entity', { id, guid }),
+    {
+      id: z.number().optional().describe('Runtime id — reassigned on hot-reload. Prefer guid.'),
+      guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.'),
+      entity: flatEntityAlias,
+    },
+    async ({ id, guid, entity }) => {
+      const ref = foldEntityRef({ id, guid }, entity);
+      if ('conflict' in ref) return fail({ code: 'AMBIGUOUS', what: 'duplicate an entity', why: ref.conflict, expected: 'either `guid`/`id`, or `entity:{guid|name|id}` — not both' });
+      return editorAction('duplicate-entity', ref);
+    },
   );
   tool(
     'modoki_delete_entities',
@@ -311,7 +333,6 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       id: z.number().optional().describe('Singular form of `ids`, for deleting one entity.'),
       guids: z.array(z.string()).optional().describe('Stable entity guids (preferred).'),
       guid: z.string().optional().describe('Singular form of `guids` — the preferred way to delete ONE entity.'),
-      save: SAVE_PARAM,
     },
     async ({ ids, id, guids, guid }) => editorAction('delete-entities', { ids, id, guids, guid }),
   );
@@ -325,8 +346,10 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       guid: z.string().optional().describe('Stable guid of the entity to move (preferred). Wins over id.'),
       parentId: z.number().optional().describe('New parent runtime id (0 or omitted = root). Prefer parentGuid.'),
       parentGuid: z.string().optional().describe('New parent guid (preferred). Wins over parentId.'),
-      sortOrder: z.number().optional(),
-      save: SAVE_PARAM,
+      sortOrder: z.number().optional().describe(
+        'Index among the NEW parent\'s children, 0-based — where the entity lands in Hierarchy '
+        + 'order. Omit to append LAST. This is sibling order only; it has no effect on '
+        + 'rendering or transform.'),
     },
     async ({ id, guid, parentId, parentGuid, sortOrder }) => editorAction('reparent-entity', { id, guid, parentId, parentGuid, sortOrder }),
   );
@@ -337,9 +360,22 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Prefab actions: instantiate a .prefab.json into the scene (path + optional parent), ' +
       'create a prefab FROM an entity (entity + destination path), or detach an instance (entity, ' +
       '"unpack completely"). detach FAILS if the entity is not a prefab instance (nothing to unpack). ' +
-      'Persistence: instantiate/detach are LIVE-world only. create writes the .prefab.json to disk ' +
-      'AND tags the source entities as a PrefabInstance in the LIVE world (unsaved) — run ' +
-      'modoki_save_all to persist that linkage into the scene, or a reload discards it. ' +
+      'overrides/apply/revert are the agent path onto the human "Apply to Prefab" / "Revert ' +
+      'Overrides" dialogs: overrides is a READ-only discovery call — pass an instance entity, get ' +
+      'back every current override as exact key strings (plus per-field current/base values) — ' +
+      'apply/revert then take an optional `keys` subset of those SAME strings (omit `keys` to act ' +
+      'on ALL current overrides). apply WRITES the selected overrides into the .prefab.json (every ' +
+      'other instance now inherits them); revert resets the selected overrides on THIS instance ' +
+      'only, back to the prefab base — the file is untouched. Both FAIL loudly (never a silent ' +
+      'ok:true) if the entity is not an instance, if ANY of the given `keys` matches no real ' +
+      'override, or if the instance has no overrides at all. NOT every override is applyable: a ' +
+      'scene-only or runtime-only field (EntityAttributes.editorFolder, read-backs) can be ' +
+      'REVERTED but cannot be written into a template — naming one in `keys` refuses, and an ' +
+      'omitted-keys apply reports it under `skippedKeys` rather than counting it as applied. ' +
+      'Persistence: instantiate/detach/overrides/revert are LIVE-world only. create and apply ' +
+      'WRITE the .prefab.json to disk. create ALSO tags the source entities as a PrefabInstance ' +
+      'in the LIVE world (unsaved) — run modoki_save_all to persist that linkage into the scene, ' +
+      'or a reload discards it. ' +
       'Address the entity/parent by guid (PREFER — stable) or id. ' +
       'PREFAB-EDIT MODE (edit-open / edit-save / edit-exit) is how you edit the TEMPLATE itself: ' +
       'edit-open swaps the world for a synthetic scene holding the prefab in isolation (so it ' +
@@ -348,15 +384,17 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'and edit-exit reloads the scene you came from so its instances re-expand from the new file. ' +
       'While in that mode modoki_save_all REFUSES — edit-save is the save.',
     {
-      action: z.enum(['instantiate', 'create', 'detach', 'edit-open', 'edit-save', 'edit-exit'])
-        .describe("instantiate: spawn a prefab into the scene. create: turn an existing entity INTO a prefab asset. detach: break an instance's link to its prefab. edit-open/edit-save/edit-exit: enter, write, and leave prefab-edit mode on the template itself. Sent on the wire as `prefabAction` — the relay strips a param named `action`."),
+      action: z.enum(['instantiate', 'create', 'detach', 'overrides', 'apply', 'revert', 'edit-open', 'edit-save', 'edit-exit'])
+        .describe("instantiate: spawn a prefab into the scene. create: turn an existing entity INTO a prefab asset. detach: break an instance's link to its prefab. overrides: list an instance's current overrides as key strings (read-only — the discovery step for apply/revert). apply: write selected overrides into the .prefab.json. revert: reset selected overrides on this instance back to the prefab base. edit-open/edit-save/edit-exit: enter, write, and leave prefab-edit mode on the template itself. Sent on the wire as `prefabAction` — the relay strips a param named `action`."),
       path: z.string().optional().describe('instantiate / edit-open: prefab asset path. create: destination .prefab.json path.'),
-      force: z.boolean().optional().describe('edit-open: discard unsaved live work instead of refusing (edit-open swaps the world, like load_scene).'),
+      // EXTENDS the shared base rather than replacing it (§2 containment): the scope note is real
+      // per-tool information, and it sits after the rule instead of forking it.
+      discardUnsaved: discardUnsavedParam.describe(`${DISCARD_UNSAVED_BASE}. edit-open ONLY — that action swaps the world like modoki_load_scene; the other prefab actions ignore this.`),
       parentId: z.number().optional().describe('instantiate: parent entity id (default root). Prefer parentGuid.'),
       parentGuid: z.string().optional().describe('instantiate: parent entity guid (preferred; wins over parentId).'),
-      entityId: z.number().optional().describe('create/detach: the entity id. Prefer entityGuid.'),
-      entityGuid: z.string().optional().describe('create/detach: the entity guid (preferred; wins over entityId).'),
-      save: SAVE_PARAM,
+      entityId: z.number().optional().describe('create/detach/overrides/apply/revert: the entity id. Prefer entityGuid.'),
+      entityGuid: z.string().optional().describe('create/detach/overrides/apply/revert: the entity guid (preferred; wins over entityId).'),
+      keys: z.array(z.string()).optional().describe("apply/revert: the override keys to act on — exact strings from a prior `overrides` call's `keys.all`. ALL-or-nothing: one unrecognized key refuses the whole call rather than quietly acting on the rest. OMIT to act on ALL current overrides; an explicit empty array is REFUSED, because a filter that matched nothing means 'act on nothing' and must not fall through to 'act on everything'."),
     },
     // `prefabAction`, NOT `action`: /api/editor-action spends `action` on the op name and strips it
     // before relaying, so a param called `action` cannot reach the op. The MCP-facing parameter stays
@@ -427,7 +465,15 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Frame an entity in the SceneView orbit camera (the F-key / "Focus" action). Address it by ' +
       '`guid` (PREFER — stable) or `id`. Fails if the entity does not resolve, or if no SceneView ' +
       'is mounted to frame it in (so a "framed it" report always means the camera moved).',
-    { id: z.number().optional().describe('Runtime id. Prefer guid.'), guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.') },
-    async ({ id, guid }) => editorAction('focus-entity', { id, guid }),
+    {
+      id: z.number().optional().describe('Runtime id. Prefer guid.'),
+      guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.'),
+      entity: flatEntityAlias,
+    },
+    async ({ id, guid, entity }) => {
+      const ref = foldEntityRef({ id, guid }, entity);
+      if ('conflict' in ref) return fail({ code: 'AMBIGUOUS', what: 'frame an entity in the SceneView', why: ref.conflict, expected: 'either `guid`/`id`, or `entity:{guid|name|id}` — not both' });
+      return editorAction('focus-entity', ref);
+    },
   );
 }

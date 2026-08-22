@@ -3,6 +3,7 @@
  *  resolve relative to this container, not the browser window. */
 
 import { useRef, useCallback, useState, useEffect } from 'react';
+import { measureSafeAreaInsets } from './safeArea';
 import type { ReactNode } from 'react';
 import { useUIEntities } from './useUIEntities';
 import { UINode } from './UINode';
@@ -11,6 +12,7 @@ import { onPlayStateChange } from '../core/playState';
 import { useFocusStore, consumePendingActivation } from './focusManager';
 import { getCurrentWorld } from '../core/ecs/world';
 import { registerPointerBlocker } from '../core/pointerBlockers';
+import { UI_ROOT_ATTR } from '../traits/TouchControl';
 
 interface UIRendererProps {
   /** Store state object for binding resolution (typically from useGameStore) */
@@ -88,6 +90,14 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
           '--ui-vmax': `${Math.max(vw, vh)}px`,
         });
       }
+      // Safe-area insets for GAME CODE (`runtime/ui/safeArea.ts`) — measured from THIS
+      // container's cascade, so it reads the editor preview's simulated inset and the
+      // device's real `env()` through one path. Measured here rather than on its own
+      // observer because every event that can change an inset (orientation, an editor
+      // device-preset change, a panel resize) already resizes this container. Outside
+      // the w/h > 0 guard on purpose: a container can be measurable for insets before it
+      // has a non-zero box, and a stale inset is worse than an early-but-correct one.
+      measureSafeAreaInsets(el);
     };
     update(); // first paint: sync so vmin units resolve immediately
     // Observer updates are deferred to the next frame: measuring + setState
@@ -114,6 +124,12 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
   return (
     <div
       ref={measureRef}
+      // Which UI tree this is. The editor mounts a SECOND copy inside SceneView's authoring
+      // preview, where a press means "select this entity" — `input/touchControlSource.ts`
+      // refuses any control that is not inside a `runtime` root, so an on-screen d-pad in the
+      // Scene panel cannot drive the game. Keyed on the same `!onSelectEntity` structural
+      // property as the pointer-block registration above, for the same reason.
+      {...{ [UI_ROOT_ATTR]: onSelectEntity ? 'editor' : 'runtime' }}
       style={{
         position: 'absolute', inset: 0, zIndex: 2, pointerEvents: 'none', overflow: 'hidden',
         ...vpVars as any,

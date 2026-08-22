@@ -21,6 +21,7 @@ import {
   isUnderAssetRoot,
   isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps,
   otaPublishBundleNameAllowed, otaSigningKeyRefusal, isGcloudObjectNotFoundError,
+  otaPublishBuildStepEnv,
   type AssetRoot,
 } from '../../plugins/vite-asset-scanner';
 import { findGamesEntry } from '../../plugins/findGamesEntry';
@@ -905,15 +906,36 @@ describe('buildManifest auto-heal', () => {
     spy.mockRestore();
   });
 
-  it('does NOT mint a GUID for fonts (they are referenced by CSS family, not GUID)', () => {
+  /** Fonts USED to be skipped here, on the premise that they were "referenced by CSS family,
+   *  not GUID". That was already half-wrong (`Text2D.font` is a GUID) and #231 made it wholly
+   *  wrong — with the skip in place, a font a user drops into their project has no GUID and
+   *  cannot be assigned to ANY font field: the Inspector refuses the drop rather than write a
+   *  raw path, and the picker has nothing to offer. The engine's bundled families all carry
+   *  committed sidecars, so the "churn" the skip avoided does not arise. */
+  it('mints a GUID for a font like any other asset (#231)', () => {
     const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const fontPath = path.join(tmpDir, 'Roboto-Regular.ttf');
     fs.writeFileSync(fontPath, 'TTFBYTES');
     const m = buildManifest([
       { path: '/Roboto-Regular.ttf', name: 'Roboto-Regular', type: 'font', absPath: fontPath },
     ], true);
-    expect(m.assets[0].guid).toBeUndefined();
-    expect(fs.existsSync(fontPath + '.meta.json')).toBe(false); // no churn for the ~140 bundled fonts
+    expect(m.assets[0].guid).toBeTruthy();
+    expect(fs.existsSync(fontPath + '.meta.json')).toBe(true);
+    expect(JSON.parse(fs.readFileSync(fontPath + '.meta.json', 'utf-8')).id).toBe(m.assets[0].guid);
+    spy.mockRestore();
+  });
+
+  /** The bundled families all ship committed sidecars, so heal must leave them alone — a
+   *  re-mint would rewrite nine engine assets and break every ref to them. */
+  it('leaves a font that already HAS a guid alone (no re-mint)', () => {
+    const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fontPath = path.join(tmpDir, 'Arimo-Regular.ttf');
+    fs.writeFileSync(fontPath, 'TTFBYTES');
+    fs.writeFileSync(fontPath + '.meta.json', JSON.stringify({ id: '30000000-0000-4000-8000-00000000000a' }));
+    const m = buildManifest([
+      { guid: '30000000-0000-4000-8000-00000000000a', path: '/Arimo-Regular.ttf', name: 'Arimo-Regular', type: 'font', absPath: fontPath },
+    ], true);
+    expect(m.assets[0].guid).toBe('30000000-0000-4000-8000-00000000000a');
     spy.mockRestore();
   });
 
@@ -996,7 +1018,7 @@ describe('writeAssetGuid', () => {
     expect(JSON.parse(fs.readFileSync(glb + '.meta.json', 'utf-8')).id).toBe(fresh);
   });
 
-  // Regression for the non-deterministic-GUID bug (docs/todo.md, 2026-07-28): an
+  // Regression for the non-deterministic-GUID bug (see docs/build.md's GUID-stamping passage, 2026-07-28): an
   // unrecognized top-level-ARRAY .json (e.g. a level-index manifest) falls through
   // detectType's catch-all to 'scene' (an ID_BEARING_TYPE), but `json.id = guid` on
   // an array is dropped by JSON.stringify — the old code reported success while
@@ -1278,6 +1300,27 @@ describe('otaSigningKeyRefusal (/api/ota/publish signing-key identity guard)', (
   it('is exact — no trimming or case leniency on a cryptographic identity', () => {
     expect(otaSigningKeyRefusal(`${KEY_A} `, KEY_A)).toBe('mismatch');
     expect(otaSigningKeyRefusal(KEY_A.toLowerCase(), KEY_A)).toBe('mismatch');
+  });
+});
+
+/** #212 — the OTA publish pipeline's `--target native` build step must be distinguishable from
+ *  a plain native package build, so `shouldEmitTextureTierVariants('auto')` can emit tier
+ *  variants for one and not the other. Both routes run the identical
+ *  `build-web.mjs --target native` command; MODOKI_OTA_PUBLISH=1 is the only thing that tells
+ *  them apart. */
+describe('otaPublishBuildStepEnv (/api/ota/publish native-build env)', () => {
+  it('sets MODOKI_OTA_PUBLISH=1 alongside MODOKI_PROJECT, on top of the caller\'s base env', () => {
+    const out = otaPublishBuildStepEnv({ PATH: '/usr/bin', FOO: 'bar' }, '/repo/games/sling');
+    expect(out.MODOKI_OTA_PUBLISH).toBe('1');
+    expect(out.MODOKI_PROJECT).toBe('/repo/games/sling');
+    expect(out.PATH).toBe('/usr/bin');
+    expect(out.FOO).toBe('bar');
+  });
+
+  it('does not mutate the caller\'s env object', () => {
+    const base = { PATH: '/usr/bin' };
+    otaPublishBuildStepEnv(base, '/repo/games/sling');
+    expect(base).toEqual({ PATH: '/usr/bin' });
   });
 });
 

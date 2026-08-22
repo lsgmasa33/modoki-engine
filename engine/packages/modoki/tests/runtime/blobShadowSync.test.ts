@@ -1,12 +1,13 @@
-/** blobShadowSync — BlobShadow entity → ground-contact shadow quad (low-end-device-support
- *  §0b: a cheap grounding cue for entities that don't cast a real shadow).
+/** blobShadowSync — BlobShadow entity → ground-contact shadow quad (a cheap grounding cue for
+ *  entities that don't cast a real shadow, from the low-end-device-support workstream — see
+ *  docs/rendering.md § "Quality tiers").
  *
  *  Covers the PURE decision logic (`blobShadowPlacement`): the fade curve from full
  *  opacity at the surface down to 0 at `fadeHeight` and beyond (clamped), and that a
  *  null raycast result (no ground / no physics world) yields a hidden blob. Also a light
  *  sync smoke test (create/update/reap), mirroring flameMeshSync's mock shape. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as THREE from 'three';
 
 vi.mock('three/webgpu', () => ({
@@ -54,6 +55,7 @@ import {
   blobShadowPlacement, blobEdgeStart, createBlobShadowSyncState, syncBlobShadows,
   disposeBlobShadowSyncState,
 } from '../../src/runtime/rendering/blobShadowSync';
+import { getRenderSettings, setRenderSettings, resetRenderSettings } from '../../src/runtime/rendering/renderSettings';
 
 describe('blobEdgeStart — the soft edge, and the cap that keeps it visible', () => {
   it('maps softness 0..1 to a descending fade start', () => {
@@ -285,5 +287,69 @@ describe('disposeBlobShadowSyncState', () => {
       expect(scene.children).not.toContain(rec.mesh);
       expect(rec.mat.dispose).toHaveBeenCalled();
     }
+  });
+});
+
+describe('syncBlobShadows — the onlyWhenShadowsOff gate (R7.2)', () => {
+  let world: ReturnType<typeof createWorld>;
+  let scene: THREE.Scene;
+  let state: ReturnType<typeof createBlobShadowSyncState>;
+
+  beforeEach(() => {
+    world = createWorld();
+    scene = new THREE.Scene();
+    state = createBlobShadowSyncState();
+    raycast3DMock.mockReset();
+    raycast3DMock.mockReturnValue({ x: 0, y: 0, z: 0, nx: 0, ny: 1, nz: 0, distance: 0 });
+    resetRenderSettings();
+  });
+  afterEach(() => resetRenderSettings());
+
+  // ⚠️ BOTH DIRECTIONS, and the raycast assertion is the load-bearing half. The whole point of the
+  // gate is that it short-circuits BEFORE the ground raycast — a version that built no mesh but
+  // still paid the scene query would satisfy a visible/undefined assertion alone while saving
+  // nothing, which is the cost this exists to remove.
+  it('ticked + real shadows ON: no mesh, and NO raycast paid', () => {
+    setRenderSettings({ three: { ...getRenderSettings().three, shadows: true } });
+    const e = world.spawn(Transform({ x: 0, y: 1, z: 0 }), BlobShadow({ onlyWhenShadowsOff: true }));
+    syncBlobShadows(world, scene, state);
+
+    expect(state.recs.get(e.id())).toBeUndefined();
+    expect(raycast3DMock).not.toHaveBeenCalled();
+  });
+
+  it('ticked + real shadows OFF: draws normally', () => {
+    setRenderSettings({ three: { ...getRenderSettings().three, shadows: false } });
+    const e = world.spawn(Transform({ x: 0, y: 1, z: 0 }), BlobShadow({ onlyWhenShadowsOff: true }));
+    syncBlobShadows(world, scene, state);
+
+    expect(state.recs.get(e.id())).toBeDefined();
+    expect(raycast3DMock).toHaveBeenCalled();
+  });
+
+  // The DEFAULT (owner, 2026-08-12): opt-in, so an authored blob is never invisible in the
+  // unclamped editor. A default flipped to `true` would fail this.
+  it('default (unticked) draws even with real shadows ON', () => {
+    setRenderSettings({ three: { ...getRenderSettings().three, shadows: true } });
+    const e = world.spawn(Transform({ x: 0, y: 1, z: 0 }), BlobShadow({}));
+    syncBlobShadows(world, scene, state);
+
+    expect(state.recs.get(e.id())).toBeDefined();
+    expect(raycast3DMock).toHaveBeenCalled();
+  });
+
+  it('a ticked blob is REAPED when the tier promotes into real shadows', () => {
+    setRenderSettings({ three: { ...getRenderSettings().three, shadows: false } });
+    const e = world.spawn(Transform({ x: 0, y: 1, z: 0 }), BlobShadow({ onlyWhenShadowsOff: true }));
+    syncBlobShadows(world, scene, state);
+    const mesh = state.recs.get(e.id())!.mesh;
+    expect(scene.children).toContain(mesh);
+
+    setRenderSettings({ three: { ...getRenderSettings().three, shadows: true } });
+    syncBlobShadows(world, scene, state);
+
+    // Gives back the draw call and the GPU memory, not just the visibility.
+    expect(state.recs.get(e.id())).toBeUndefined();
+    expect(scene.children).not.toContain(mesh);
   });
 });

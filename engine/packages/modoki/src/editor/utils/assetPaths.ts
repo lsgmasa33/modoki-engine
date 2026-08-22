@@ -4,6 +4,7 @@
  *  the React component. */
 
 import type { SpriteAssetRef } from '../../runtime/loaders/spriteSheet';
+import { JSON_ASSET_SUFFIX_TYPE } from '../../runtime/loaders/assetTypeClassifier';
 
 export interface AssetEntry {
   guid?: string;
@@ -22,20 +23,63 @@ export interface FolderNode {
   files: AssetEntry[];
 }
 
-/** Split an asset path into its folder, base filename, and extension. Splits
- *  on the FIRST dot so compound extensions (.prefab.json, .mat.json, .meta.json)
- *  stay intact — the base is what the user edits when renaming/duplicating.
- *  A LEADING dot (dotfile like `.gitkeep`) is part of the base, not an empty-base
- *  extension — start scanning for the extension dot at index 1 in that case so a
- *  dotfile rename/duplicate keeps its name instead of producing `${dir}/ copy.gitkeep`. */
+/** The compound extensions that must survive a rename as ONE unit — the engine's own
+ *  `.<kind>.json` asset kinds (from the shared classifier, so a new kind is picked up
+ *  automatically) plus the two sidecars, which are not asset kinds and so are not in it. */
+const COMPOUND_EXTS: ReadonlyArray<string> = [
+  ...JSON_ASSET_SUFFIX_TYPE.map(([suffix]) => suffix),
+  '.meta.json',
+  '.meta.local.json',
+];
+
+/** Split an asset path into its folder, base filename, and extension. The base is
+ *  what the user edits when renaming/duplicating, so what counts as "extension"
+ *  decides what they are ALLOWED to edit.
+ *
+ *  A KNOWN compound extension (`.prefab.json`, `.mat.json`, `.meta.json`, …) is kept
+ *  intact; otherwise only the LAST extension is split off.
+ *
+ *  ⚠️ This used to split on the FIRST dot, which silently made every dot in a filename
+ *  un-editable. macOS names a screenshot `Screenshot 2026-08-20 at 11.35.37 AM.png`, so
+ *  the rename box offered `Screenshot 2026-08-20 at 11` and renaming it to "Test"
+ *  produced `Test.35.37 AM.png` — the timestamp was welded on as an extension and could
+ *  not be removed (reported from a live editor, 2026-08-21). A versioned `v1.2.glb` edited
+ *  as `v1`, and `Level.1.court.json` as `Level`. Duplicate/paste naming shares this split,
+ *  so a copy of `v1.2.glb` was `v1 copy.2.glb`.
+ *  The first-dot rule was reaching for the compound extensions above; it could not tell
+ *  them from an ordinary dot, so it now asks the classifier instead of guessing. The
+ *  codebase already knew the rule was wrong — `planAutoImports` below documents using
+ *  last-extension stripping "NOT splitAssetPath's first-dot split" for multi-dot models.
+ *
+ *  A LEADING dot (a dotfile like `.gitkeep`) is part of the base, not an empty-base
+ *  extension, so a dotfile rename/duplicate keeps its name instead of producing
+ *  `${dir}/ copy.gitkeep`. */
 export function splitAssetPath(p: string): { dir: string; base: string; ext: string } {
   const slash = p.lastIndexOf('/');
   const dir = slash >= 0 ? p.substring(0, slash) : '';
   const filename = slash >= 0 ? p.substring(slash + 1) : p;
-  const dot = filename.indexOf('.', filename.startsWith('.') ? 1 : 0);
-  const base = dot >= 0 ? filename.substring(0, dot) : filename;
-  const ext = dot >= 0 ? filename.substring(dot) : '';
-  return { dir, base, ext };
+
+  // A known compound extension wins over the last-dot rule — `weed.prefab.json` must
+  // edit as `weed`, never as `weed.prefab`. Longest match first so `.meta.local.json`
+  // is not shadowed by `.meta.json`... (they do not overlap today, but the ordering
+  // makes that independent of the classifier's list order).
+  const lower = filename.toLowerCase();
+  let compound = '';
+  for (const suffix of COMPOUND_EXTS) {
+    if (lower.endsWith(suffix) && filename.length > suffix.length && suffix.length > compound.length) {
+      compound = suffix;
+    }
+  }
+  if (compound) {
+    return { dir, base: filename.substring(0, filename.length - compound.length), ext: filename.substring(filename.length - compound.length) };
+  }
+
+  // Otherwise the extension is the LAST dot onward. `start` keeps a dotfile's leading
+  // dot on the base: for `.gitkeep` the only dot is at 0, which is not an extension.
+  const start = filename.startsWith('.') ? 1 : 0;
+  const dot = filename.lastIndexOf('.');
+  if (dot < start) return { dir, base: filename, ext: '' };
+  return { dir, base: filename.substring(0, dot), ext: filename.substring(dot) };
 }
 
 /** Plan which freshly-discovered assets to auto-import with default config

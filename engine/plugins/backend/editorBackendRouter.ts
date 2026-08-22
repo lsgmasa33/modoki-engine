@@ -165,22 +165,35 @@ import {
   PROJECT_CONFIG_FILENAME, PRIVATE_BUILD_FIELDS,
   findNullPatchPaths, DEFAULT_PROJECT_CONFIG, DEFAULT_PROJECT_USER_CONFIG, type RawProjectConfig,
 } from '../../project-config';
-import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, type PrefabResolver } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
+import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, type PrefabResolver, type AssetRefResolver, makeAssetRefResolver } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
-import { getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData, type AssetSchemaType } from '../../packages/modoki/src/runtime/assets/assetSchemas';
+import type { ErrorCode } from '../../tools/shared/mcpResult';
+// ASSET_SCHEMA_TYPES is IMPORTED, never restated. This file used to keep its own copy, and it
+// advertised a narrower set in its 400s than `getAssetSchema` actually served — a wrong error
+// message is not cosmetic on a surface whose whole job is telling an agent what it may pass.
+import {
+  getAssetSchema, validateAssetData, normalizeAssetData, defaultAssetData,
+  ASSET_SCHEMA_TYPES, type AssetSchemaType,
+} from '../../packages/modoki/src/runtime/assets/assetSchemas';
+import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
-import { adbBinary, isUsable, listAndroidDevices, withFriendlyNames } from './androidDevices';
+import { adbBinary, isUsable, listAndroidDevices, resolveBuildAndroidSerial, withFriendlyNames } from './androidDevices';
 import { adbDeviceId, iosDeviceId, listClaims, type DeviceClaim } from './deviceClaims';
 import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM } from './deviceCdp';
 import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDeviceWdaScreenshot, TRUSTED_WDA_MECHANISM, WDA_NOT_IOS_REASON, NO_WDA_ON_THIS_DEVICE } from './deviceWda';
 import { isDeviceFailureReply } from './deviceAim';
 import { listIosDevicesForSelection, stopWda } from './wdaLauncher';
+import { captureIosSyslog, resolveGoIos } from './deviceSyslog';
+import { resolveGoIosDevice, listGoIosUdids, pickHostSidePlatform } from './goIosDevice';
+import { readAndroidDiagnostics, readAndroidSystemLog } from './deviceAndroidDiag';
+import { listCrashReports, fetchCrashReport, filterCrashReports, summarizeCrashReport, RAW_CHARS_MAX } from './deviceCrashReports';
 import { resolveModules } from '../detect-modules';
 // Type-only — erased at runtime, so it does NOT pull the tree-shaker (and its
 // vite-asset-scanner import) into this host-agnostic router.
-import type { TreeShakeResult } from '../asset-tree-shaker';
+import type { TreeShakeResult, RefEdgeEnumeration } from '../asset-tree-shaker';
+import { buildRefGraph, resolveTarget, findReferences, type FindReferencesResponse } from '../assetRefGraph';
 
 /** Minimal shape of a manifest entry the router needs (structurally compatible
  *  with the scanner's AssetEntry — avoids an import cycle with the host). */
@@ -227,6 +240,23 @@ export interface BackendContext {
    *  Host-provided so the router stays free of the tree-shaker → scanner import
    *  cycle. */
   computeUnused(): TreeShakeResult;
+  /** Enumerate every reference edge in the open project — the shaker's own walk with
+   *  an observer attached (#284). Backs `/api/find-references`. Host-provided for the
+   *  same reason `computeUnused` is: it keeps the router free of the tree-shaker →
+   *  scanner import cycle. */
+  computeRefEdges(): RefEdgeEnumeration;
+  /** The sustained pointer currently held by `/api/input/pointer`, or null (#302).
+   *
+   *  Host-provided because the state lives in the Electron main process — `createInputRoutes`'
+   *  closure — while this router only ever relays to the RENDERER, which cannot see it. Reported
+   *  through `/api/editor-state` so a stranded press is READ rather than inferred: its symptom
+   *  (the Game panel stops reading drags, for the human as well as the agent) has no error
+   *  anywhere and otherwise reads as a bug in whatever feature was under test.
+   *
+   *  Optional: the Vite dev-server backend serves no `/api/input/*` routes, so it has no such
+   *  state and must say nothing rather than claim `null` — "not applicable here" and "nothing is
+   *  held" are different answers. */
+  getHeldPointer?(): { button: string; x: number; y: number; heldMs: number } | null;
 }
 
 /** What a handler returns. The host serializes it onto its response object. */
@@ -247,11 +277,6 @@ export interface BackendRequest {
   body: unknown;
 }
 
-/** Every asset type `getAssetSchema` serves. The routes used to advertise a NARROWER set in their
- *  own 400s (material|particle|animation) than they actually accept, which is how the timeline
- *  authoring loop ended up with no reachable schema. */
-const ASSET_SCHEMA_TYPES = ['material', 'particle', 'animation', 'spriteanim', 'timeline'] as const;
-
 const json = (body: unknown, status?: number): BackendResult => ({ kind: 'json', status, body });
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -261,6 +286,31 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  *  POST /api/project-settings private-build-field split below. */
 const isPlainObjectLocal = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** Every key path in a reference object, NESTED KEYS INCLUDED (`postFX.bloom`, not `postFX`).
+ *
+ *  ⚠️ **A TOP-LEVEL LIST LETS THROUGH THE ONE SHAPE THE TIERS GUARD BELOW EXISTS TO REFUSE**
+ *  (close-out 2026-08-12). `postFX` is one key, so `hasOwnProperty(tier,'postFX')` is satisfied by
+ *  `{npr:false}` — and `complete()` (qualityTier.ts) merges a partial block over `ALL_POSTFX`,
+ *  reading every ABSENT effect as ALLOWED. A Project Settings / `modoki_project_settings` patch
+ *  that dropped four of the five effects therefore passed a check whose stated job is "post the
+ *  complete block", was written to disk, and silently switched those effects back ON for that
+ *  tier — the exact silent-wrong the guard was added for, one level down. The engine's own
+ *  `hasEveryField` already descends into `postFX`; this makes the route agree with it. */
+function requiredKeyPaths(ref: Record<string, unknown>, prefix = ''): string[] {
+  return Object.entries(ref).flatMap(([k, v]) =>
+    isPlainObjectLocal(v) ? requiredKeyPaths(v, `${prefix}${k}.`) : [`${prefix}${k}`]);
+}
+
+/** Is a dotted key path present on an untrusted patch value? Presence only — never the value. */
+function hasKeyPath(o: unknown, keyPath: string): boolean {
+  let cur: unknown = o;
+  for (const seg of keyPath.split('.')) {
+    if (!isPlainObjectLocal(cur) || !Object.prototype.hasOwnProperty.call(cur, seg)) return false;
+    cur = cur[seg];
+  }
+  return true;
+}
 
 // ── MCP persistence: MANUAL ONLY (owner decision, 2026-07-30) ──────────
 // There used to be an 'auto' mode (the default) in which every live mutation ALSO saved the
@@ -302,6 +352,12 @@ function writeDataUrlToTemp(dataUrl: unknown): string {
 /** Atomic JSON write: tmp file + rename. (Mirrors the scanner's helper; kept
  *  local to avoid an import cycle.) */
 function writeJsonAtomic(absPath: string, data: unknown): void {
+  // mkdir -p first, exactly as /api/write-file does. Without it /api/create-asset
+  // threw a raw ENOENT 500 whenever the target folder did not exist yet — while
+  // the sibling endpoint happily created it, so which of the two you called
+  // decided whether "write an asset into a new folder" worked (QA-CTX-0008).
+  const dir = path.dirname(absPath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const tmp = absPath + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
   fs.renameSync(tmp, absPath);
@@ -415,6 +471,44 @@ function makePrefabResolver(ctx: BackendContext): PrefabResolver {
     cache.set(sourceRef, result);
     return result;
   };
+}
+
+/** Build an `AssetRefResolver` (#292) over the host's cached manifest, for injecting
+ *  into `validateSceneData` so a GUID naming a DELETED asset is reported instead of
+ *  validating clean. `validateSceneData` itself does no I/O (module docs) — this is the
+ *  Node-only glue that supplies it.
+ *
+ *  Returns `null` when the manifest is empty or unreadable, and the caller then passes
+ *  NO resolver — which is the difference between "this ref is dead" and "I could not
+ *  check". A resolver built over an empty manifest would answer `false` for every ref
+ *  in the scene and report a perfectly healthy file as entirely dangling.
+ *
+ *  The index is built ONCE per request and closed over, not rebuilt per ref: a scene
+ *  with 400 refs would otherwise re-scan the whole asset array 400 times. Sliced-sprite
+ *  and auto-emitted whole-image-sprite guids are `type:'sprite'` sub-entries in
+ *  `manifest.assets` with guids of their own, so sweeping `assets[]` covers them —
+ *  a `Renderable2D.sprite` / `UIElement.imageSrc` guid resolves here like any other.
+ *
+ *  ⚠️ **Matched case-SENSITIVELY, unlike `makePrefabResolver` above.** That is not an
+ *  inconsistency to tidy up: this resolver's answer is a prediction about `resolveRef`,
+ *  which is a plain `guidToEntry.get(ref)` over guids stored verbatim — so lowercasing
+ *  both sides here would vouch for a ref that resolves to `undefined` at load. The
+ *  second, lowercased index exists only to tell that case apart from a genuinely absent
+ *  asset, because the two have different fixes. See `AssetRefVerdict`. */
+function makeAssetResolver(ctx: BackendContext): AssetRefResolver | undefined {
+  let assets: ManifestEntry[];
+  try {
+    assets = ctx.getManifest().assets;
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(assets)) return undefined;
+  // The RULE lives in `makeAssetRefResolver` (one implementation, shared with the
+  // hot-reload consumer — the two hand-written copies had already diverged on case).
+  // This function is only the ctx glue: reach the manifest without throwing, and hand
+  // over its guids. `a?.guid` tolerates a null/malformed entry, which used to throw out
+  // of here and turn a 200 validation into a 500.
+  return makeAssetRefResolver(assets.map((a) => a?.guid));
 }
 
 /**
@@ -564,6 +658,24 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
   }
 
+  // ── GET /api/game-tools (M→R) ── the GAME's own MCP tool declarations (#270). The MCP server
+  // polls this and materializes one real tool per entry; `version` moves whenever the game's
+  // registry changes, which is the signal to re-register and send `tools/list_changed`.
+  // An empty list is a normal answer (most projects register none, and a release build with the
+  // debug menu off reports none by design) — never an error.
+  if (urlPath === '/api/game-tools' && method === 'GET') {
+    try { return json(await ctx.requestBrowser('game-tools', {})); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+
+  // ── POST /api/game-tool-call {name, args} (M→R) ── invoke one game tool. POST because a game
+  // tool may mutate (it declares which); the reply is the handler's OWN answer, passed through.
+  if (urlPath === '/api/game-tool-call' && method === 'POST') {
+    const b = (body ?? {}) as { name?: string; args?: Record<string, unknown> };
+    try { return json(await ctx.requestBrowser('game-tool-call', { name: b.name, args: b.args ?? {} })); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+  }
+
   // ── GET /api/layout-bounds[?layer=&ids=&guids=&name=&entities=&overlaps=] (M→R) ── numeric screen-space
   // rects per entity (UI DOM rects + projected 2D/3D) + overlap/off-screen flags, so an agent
   // verifies layout WITHOUT a screenshot. Untargeted ⇒ counts only (the rects and the O(n²)
@@ -664,7 +776,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
 
   // ── GET /api/diagnose (M→R) ── structured render/scene health report (Phase F). ──
   if (urlPath === '/api/diagnose' && method === 'GET') {
-    try { return json(await ctx.requestBrowser('diagnose', {})); }
+    // `?video=1` opts INTO the downloaded-video cache index (#288 Phase 6). Opt-in because this is
+    // a swept read tool and §6 is summary-first — a per-clip index would grow every caller's
+    // payload to answer a question almost none of them asked.
+    const wantVideo = query.get('video') === '1' || query.get('video') === 'true';
+    try { return json(await ctx.requestBrowser('diagnose', wantVideo ? { video: true } : {})); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
   }
 
@@ -759,7 +875,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   }
   if (urlPath === '/api/device/connect' && method === 'POST') {
     const b = (body ?? {}) as ConnectRequest;
-    try { return json(await deviceConnection.connect({ ip: b.ip, useAdb: b.useAdb, port: b.port, serial: b.serial })); }
+    // `debugBuild` comes from the OPEN PROJECT's config, never from `b` — a caller must not be
+    // able to talk the refusal out of naming the real cause (#239).
+    let debugBuild: boolean | undefined;
+    try { debugBuild = loadProjectConfig(ctx.projectRoot).build.debugBuild === true; } catch { /* unreadable config: stay silent rather than guess */ }
+    try { return json(await deviceConnection.connect({ ip: b.ip, useAdb: b.useAdb, port: b.port, serial: b.serial, debugBuild })); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 500); }
   }
   if (urlPath === '/api/device/disconnect' && method === 'POST') {
@@ -794,6 +914,160 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // 10s — that one crosses an HMR websocket relay; this is one LAN/USB hop.
       const deadline = Number.isFinite(opTimeout) && opTimeout > 0 ? opTimeout + 5_000 : undefined;
       const proxy = (m: string, p: Record<string, unknown>) => deviceConnection.proxy(m, p, deadline);
+      // SYSTEM logs come from the HOST, not the app (see deviceSyslog.ts). Handled before every
+      // lease-dependent path below, and deliberately NOT gated on the lease: the questions this
+      // source exists for — why did it crash, what did launch do, did the system jetsam us — are
+      // asked exactly when the app is not there to answer. It reads the phone over USB and takes no
+      // hardware claim, the same rule `adb shell` already follows in deviceClaims.ts.
+      // WHICH phone, for every host-side go-ios op below — asked of GO-IOS, not of devicectl/xctrace
+      // (see goIosDevice.ts: an iPhone 8 measurably vanished from the xctrace listing while go-ios
+      // talked to it throughout, so resolving through Apple's listing failed about a device that was
+      // plugged in and answering). The lease contributes only its hardware MODEL, which is all it is
+      // allowed to know (#146). Shared by the syslog and crash-report branches so one request can
+      // never target two different phones.
+      const resolveHostSideIosDevice = async () => {
+        const goIos = resolveGoIos();
+        if (!goIos) {
+          return { error: "go-ios is not installed. Install it from the editor's Build Support dialog (iOS Build Support → go-ios), or set MODOKI_GO_IOS." };
+        }
+        return resolveGoIosDevice({ goIos, env: process.env, lease: await deviceConnection.deviceHardware() });
+      };
+      // WHICH Android, for the host-side adb ops. The LEASE's serial wins (it is the phone the
+      // caller is already driving); otherwise the same rule a build follows — the project pin, else
+      // the only attached device, else a refusal naming every candidate (#149). Never a bare `adb`
+      // with three handsets plugged in, which reads whichever one adb happens to list first.
+      const resolveHostSideAndroidSerial = async (): Promise<{ serial?: string } | { error: string }> => {
+        const st = deviceConnection.status();
+        if (st.target?.serial) return { serial: st.target.serial };
+        const attached = withFriendlyNames(listAndroidDevices().filter(isUsable));
+        // ⚠️ A WIFI lease carries NO serial — `target.serial` is set only on the `useAdb` path — so
+        // "there is a lease" does not mean "we know which handset". Falling straight through to the
+        // build resolver then reads logs off whichever OTHER phone happens to be on USB, labelled
+        // as if it were the leased one: the same silent wrong-device answer the platform gate above
+        // exists to refuse. So when a lease is live but serial-less, disambiguate the way the iOS
+        // side does — by the hardware MODEL the lease reports — and refuse rather than guess.
+        if (st.state === 'connected') {
+          const model = (await deviceConnection.deviceHardware()).deviceModel;
+          const hits = model ? attached.filter((d) => d.model === model || d.name === model) : [];
+          if (hits.length === 1) return { serial: hits[0].serial };
+          if (attached.length === 1 && !model) return { serial: attached[0].serial };
+          return { error: `the lease is over WiFi, so it names no adb serial${model ? ` (device model ${model})` : ''} — attached: ${attached.map((d) => `${d.serial}${d.name ? ` (${d.name})` : ''}`).join(', ') || 'none'}. Reconnect over adb, or pin device.androidDeviceId in Project Settings.` };
+        }
+        const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: loadProjectUserConfig(ctx.projectRoot).device.androidDeviceId });
+        return 'error' in picked ? picked : { serial: picked.serial };
+      };
+      // WHICH PLATFORM these host-side ops read. The lease answers it when there is one — but these
+      // ops exist precisely for when there ISN'T (the app died, so the lease died with it), and the
+      // first cut fell through to iOS whenever the platform was unknown.
+      //
+      // ⚠️ MEASURED, and it is why this is a function and not a boolean: with an iPhone and three
+      // Androids attached and no lease, `crashReports` silently answered about the IPHONE —
+      // `device: 30afceaf…, totalOnDevice: 99` — to a caller who may well have been debugging the
+      // Samsung. No error, no hint that a choice was made. That is the "confidently wrong answer
+      // that looks right" class #149 refuses for adb serials, one level up: the same rule has to
+      // bind the PLATFORM, not just which handset within one.
+      //
+      // So: an explicit `platform` wins, then the lease, then what is actually ATTACHED — and when
+      // both kinds are attached it REFUSES and says how to disambiguate, rather than picking.
+      // The DECISION is `pickHostSidePlatform` (pure, unit-tested); this only gathers its inputs.
+      // Both listings are best-effort: a missing adb or go-ios means "that platform has nothing
+      // attached", which the decision then reads as evidence rather than as an error — the whole
+      // point being to answer from what IS present.
+      const resolveHostSidePlatform = async (explicit?: string): Promise<'ios' | 'android' | { error: string }> => {
+        let androids: string[] = [];
+        try { androids = listAndroidDevices().filter(isUsable).map((d) => d.serial); } catch { /* no adb */ }
+        let iphones: string[] = [];
+        const goIos = resolveGoIos();
+        if (goIos) { try { iphones = await listGoIosUdids(goIos); } catch { /* no usbmuxd */ } }
+        return pickHostSidePlatform({ explicit, leased: await deviceConnection.devicePlatform(), iphones, androids });
+      };
+      if (b.method === 'nativeLogs' && (b.params as { source?: string } | undefined)?.source === 'system') {
+        const p = (b.params ?? {}) as { seconds?: number; limit?: number; filter?: string; platform?: string };
+        const plat = await resolveHostSidePlatform(p.platform);
+        if (typeof plat !== 'string') return json({ error: `system logs: ${plat.error}` }, 409);
+        if (plat === 'android') {
+          const picked = await resolveHostSideAndroidSerial();
+          if ('error' in picked) return json({ error: `system logs: ${picked.error}` }, 409);
+          try {
+            // BACKWARD, unlike iOS: logcat dumps a ring buffer that already holds the past, so
+            // there is no capture window and `seconds` has nothing to mean here.
+            const log = await readAndroidSystemLog({ serial: picked.serial, limit: p.limit, filter: p.filter });
+            return json({ result: log.lines, backward: true, clamped: log.clamped, device: picked.serial ?? 'the attached device' });
+          } catch (e) {
+            return json({ error: e instanceof Error ? e.message : String(e) }, 409);
+          }
+        }
+        const picked = await resolveHostSideIosDevice();
+        if ('error' in picked) return json({ error: `system logs: ${picked.error}` }, 409);
+        try {
+          const cap = await captureIosSyslog({
+            udid: picked.device.udid, seconds: p.seconds, limit: p.limit, filter: p.filter,
+          });
+          return json({ result: cap.lines, capturedFor: cap.capturedFor, truncated: cap.truncated, device: picked.device.name ?? picked.device.udid });
+        } catch (e) {
+          return json({ error: e instanceof Error ? e.message : String(e) }, 409);
+        }
+      }
+      // Crash / jetsam reports — the BACKWARD-looking record, and the only surface that can explain
+      // a death that already happened (see deviceCrashReports.ts). Host-side and lease-free for the
+      // same reason as the syslog branch, only more so: by definition the app is not running.
+      if (b.method === 'crashReports') {
+        const p = (b.params ?? {}) as { name?: string; app?: string; limit?: number; all?: boolean; raw?: boolean; platform?: string };
+        const plat = await resolveHostSidePlatform(p.platform);
+        if (typeof plat !== 'string') return json({ error: `crash reports: ${plat.error}` }, 409);
+        if (plat === 'android') {
+          const picked = await resolveHostSideAndroidSerial();
+          if ('error' in picked) return json({ error: `crash reports: ${picked.error}` }, 409);
+          // The package, which on Android IS the process name (unlike iOS, where every Modoki game
+          // is the Capacitor `App` target). The leased app first; else the OPEN PROJECT's appId,
+          // which the backend already knows and which is what you almost always mean.
+          const pkg = p.all ? undefined : (p.app || await deviceConnection.deviceAppId() || loadProjectConfig(ctx.projectRoot).app.appId);
+          try {
+            // No two-step here, and that asymmetry is real rather than an oversight: iOS lists
+            // FILES you then fetch, while logcat hands back the content itself, already bounded.
+            // `name` therefore has nothing to address on Android.
+            if (p.name) return json({ error: 'crash reports: `name` is iOS-only — Android returns the records themselves, since logcat has no report files to address.' }, 409);
+            const diag = await readAndroidDiagnostics({ serial: picked.serial, pkg, limit: p.limit });
+            return json({
+              result: diag.records, device: picked.serial ?? 'the attached device',
+              totalOnDevice: diag.totalSeen, matched: diag.matched, shown: diag.records.length,
+              filteredTo: pkg ?? null,
+            });
+          } catch (e) {
+            return json({ error: e instanceof Error ? e.message : String(e) }, 409);
+          }
+        }
+        const picked = await resolveHostSideIosDevice();
+        if ('error' in picked) return json({ error: `crash reports: ${picked.error}` }, 409);
+        const udid = picked.device.udid;
+        // Every Modoki iOS game is the Capacitor `App` target, so that is the process name the
+        // device files reports under — NOT the bundle id, which never appears in a report FILENAME.
+        // Overridable for the odd target, and bypassable entirely with `all`.
+        const appProcess = p.all ? undefined : (p.app || 'App');
+        try {
+          if (p.name) {
+            const text = await fetchCrashReport({ udid, name: p.name });
+            if (p.raw) {
+              const clipped = text.length > RAW_CHARS_MAX;
+              return json({ result: clipped ? `${text.slice(0, RAW_CHARS_MAX)}\n…[truncated ${text.length - RAW_CHARS_MAX} chars]` : text, truncated: clipped });
+            }
+            return json({ result: summarizeCrashReport(text, appProcess), name: p.name, device: picked.device.name ?? picked.device.udid });
+          }
+          const all = await listCrashReports({ udid });
+          const refs = filterCrashReports(all, appProcess);
+          const limit = Math.max(1, Math.floor(p.limit ?? 20));
+          // Say what was HIDDEN. A filtered listing that silently drops 80 of 99 files reads as "the
+          // device has 19 reports", and the next question ("is it really not there?") then gets the
+          // wrong answer — the no-silent-caps rule this repo already applies to workflows.
+          return json({
+            result: refs.slice(0, limit), device: picked.device.name ?? picked.device.udid,
+            totalOnDevice: all.length, matched: refs.length, shown: Math.min(limit, refs.length),
+            filteredTo: appProcess ?? null,
+          });
+        } catch (e) {
+          return json({ error: e instanceof Error ? e.message : String(e) }, 409);
+        }
+      }
       // #102 — iOS out-of-app capture. The native path is the APP'S OWN capture, so a system dialog
       // or springboard is invisible to it (it returns the app underneath, which reads as a fine
       // screenshot of the wrong thing). WDA sees the whole screen. Two triggers, each covering what
@@ -1013,20 +1287,23 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     const markers = query.get('markers');
     const limit = query.get('limit');
     const action = query.get('action') ?? 'read';
-    const MUTATING = ['capture-start', 'capture-stop', 'capture-clear', 'gpu-on', 'gpu-off', 'reset'];
-    if (action !== 'read' && action !== 'capture-read') {
+    const MUTATING = ['capture-start', 'capture-stop', 'capture-clear', 'gpu-on', 'gpu-off', 'reset', 'boot-reset'];
+    if (action !== 'read' && action !== 'capture-read' && action !== 'boot') {
       // A mutating action arriving by GET is refused rather than served: obeying it here is exactly
       // the unchecked-failure hole §4 describes. An UNKNOWN action is a DIFFERENT error and must not
       // be told it "mutates" — `?action=Read` (wrong case) used to get that sentence, which is
       // simply false and sends the reader looking for the wrong fix.
       return MUTATING.includes(action)
-        ? json({ error: `profiler action "${action}" MUTATES profiler state, so it must be POSTed to /api/profiler — GET serves only read / capture-read.` }, 405)
-        : json({ error: `unknown profiler action "${action}". GET serves read / capture-read; POST /api/profiler takes ${MUTATING.join(' / ')}.` }, 400);
+        ? json({ error: `profiler action "${action}" MUTATES profiler state, so it must be POSTed to /api/profiler — GET serves only read / capture-read / boot.` }, 405)
+        : json({ error: `unknown profiler action "${action}". GET serves read / capture-read / boot; POST /api/profiler takes ${MUTATING.join(' / ')}.` }, 400);
     }
     const params = {
       action,
       ...(markers != null && markers !== '' && !Number.isNaN(Number(markers)) ? { markers: Number(markers) } : {}),
       ...(limit != null && limit !== '' && !Number.isNaN(Number(limit)) ? { limit: Number(limit) } : {}),
+      // action:boot — the full-timeline escape hatch. Only `true` turns it on; anything else is
+      // the default, so a stray `?all=0` cannot flip it on by being truthy-as-a-string.
+      ...(query.get('all') === 'true' ? { all: true } : {}),
     };
     try { return json(await ctx.requestBrowser('profiler', params)); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
@@ -1090,11 +1367,14 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   if (urlPath === '/api/render-scene' && method === 'POST') {
     pruneOldTempFiles('modoki-render-'); // drop stale frames from prior sessions
     try {
-      const result = await ctx.requestBrowser('render-scene', body ?? {}, 15000) as { width: number; height: number; quality?: number; dataUrl: string };
+      const result = await ctx.requestBrowser('render-scene', body ?? {}, 15000) as { width: number; height: number; quality?: number; surface?: string; dataUrl: string };
       // Echo the EFFECTIVE quality (1–100) the renderer actually used, so an out-of-unit value is
       // visibly converted rather than silently ignored (S3.13).
+      // Echo `surface` too — the tool description promises it and used to be alone in doing so
+      // (bug `XBayncnNfJj3RtjVZiBX`); it names which surface actually served the frame.
       return json({ path: writeDataUrlToTemp(result.dataUrl), width: result.width, height: result.height,
-        ...(result.quality !== undefined ? { quality: result.quality } : {}) });
+        ...(result.quality !== undefined ? { quality: result.quality } : {}),
+        ...(result.surface !== undefined ? { surface: result.surface } : {}) });
     } catch (e) {
       return json({ error: String(e instanceof Error ? e.message : e) }, 504);
     }
@@ -1126,14 +1406,20 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         const st = await ctx.requestBrowser('editor-state', {}, 2000) as { runMode?: string; playState?: string };
         runMode = st?.runMode ?? st?.playState;
       } catch { /* headless / no renderer — the render call below reports it */ }
-      if (runMode === 'stopped' && !(b as { force?: boolean }).force) {
+      // `forceRender`, with `force` still accepted. The TOOL param was renamed (§2: `force` means
+      // "proceed despite unsaved work" on build/load_scene/ota_publish, and meant something
+      // unrelated here). The old name stays valid on the WIRE because the dev-server curl API has
+      // human callers, unlike the tool surface, where there are none to protect.
+      const forceIdentical = (b as { forceRender?: boolean; force?: boolean }).forceRender
+        ?? (b as { force?: boolean }).force;
+      if (runMode === 'stopped' && !forceIdentical) {
         return json({
           ok: false,
           error:
             'REFUSED: the editor is STOPPED, so time does not advance and every frame would be ' +
             'IDENTICAL — a sequence cannot show motion from here. Nothing was rendered.',
           runMode,
-          hint: 'Press Play first (modoki_play_control {action:"play"}), or use modoki_render_scene for a single static frame. Pass force:true to render identical frames deliberately. NOTE a Timeline/Animation PREVIEW or SCRUB is not "stopped" — those advance and are captured normally.',
+          hint: 'Press Play first (modoki_play_control {action:"play"}), or use modoki_render_scene for a single static frame. Pass forceRender:true to render identical frames deliberately. NOTE a Timeline/Animation PREVIEW or SCRUB is not "stopped" — those advance and are captured normally.',
         }, 409);
       }
       // Per-frame timestamps. The returned `fps` was the REQUESTED rate, and the sleep happened
@@ -1209,7 +1495,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       if (!absPath || !fs.existsSync(absPath)) return json({ error: `scene not found: ${scenePath}` }, 404);
       const data = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
       const schema = ctx.getSchema();
-      const result = validateSceneData(data, schema, makePrefabResolver(ctx));
+      const result = validateSceneData(data, schema, makePrefabResolver(ctx), makeAssetResolver(ctx));
       return json({ path: scenePath, schemaApplied: result.schemaApplied, schemaAvailable: !!schema, warnings: result.warnings });
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : String(e) }, 500);
@@ -1377,6 +1663,7 @@ async function describeUnresolvedAgainstLiveWorld(
           const live = (await ctx.requestBrowser('apply-scene-ops', { ops }, 30_000)) as {
             ok: boolean; changed: number; errors: string[]; warnings: string[]; unresolved: EntityRef[];
             created?: Array<{ op: number; id: number; guid: string; name: string }>;
+            code?: ErrorCode;
           };
           // Manual-only: a live edit NEVER writes the file. `saved:false` is the truth for
           // every live call now, and the hint says how to persist — the field is kept (rather
@@ -1396,6 +1683,7 @@ async function describeUnresolvedAgainstLiveWorld(
             ...(live.created?.length ? { created: live.created } : {}),
             ...(live.changed > 0 ? { hint: 'applied to the LIVE world only — run modoki_save_all to write it to disk.' } : {}),
             ...(live.unresolved.length ? { unresolved: live.unresolved } : {}),
+            ...(live.code ? { code: live.code } : {}),
           });
         } catch (e) {
           // The live path itself failed (relay error mid-call, not "no editor") — this is NOT
@@ -1425,11 +1713,11 @@ async function describeUnresolvedAgainstLiveWorld(
       // below) before writing — otherwise every setTrait through this route would
       // reintroduce an `id` field on EVERY entity, the exact diff noise Phase 3 removed.
       const backfilledIds = assignSyntheticEntityIds(scene);
-      const { changed, errors, warnings: opWarnings, unresolved, created } = applyOps(scene, ops);
+      const { changed, errors, warnings: opWarnings, unresolved, created, code: applyCode } = applyOps(scene, ops);
       // Surface BOTH the op-level warnings (dangling refs / orphaned parents from F5)
       // and the post-apply schema validation warnings.
       const schema = ctx.getSchema();
-      const { warnings: schemaWarnings } = validateSceneData(scene, schema, makePrefabResolver(ctx));
+      const { warnings: schemaWarnings } = validateSceneData(scene, schema, makePrefabResolver(ctx), makeAssetResolver(ctx));
       const warnings = [...opWarnings, ...schemaWarnings, ...preflightWarnings];
       // The probe never answered, so NEITHER guard above could run. Say so: the write proceeds
       // (a genuinely headless edit is the normal case and must keep working), but the caller must
@@ -1482,6 +1770,7 @@ async function describeUnresolvedAgainstLiveWorld(
         ...(created?.length ? { created } : {}),
         ...(liveHint ? { hint: liveHint } : {}),
         ...(returnScene && changed > 0 ? { scene } : {}),
+        ...(applyCode ? { code: applyCode } : {}),
       });
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : String(e) }, 500);
@@ -1510,7 +1799,28 @@ async function describeUnresolvedAgainstLiveWorld(
       // Single-path back-compat: a lone non-existent target is still a 404.
       if (resolved.length === 0 && !Array.isArray(paths)) return json({ error: 'File not found' }, 404);
       if (resolved.length > 0) moveToTrash(resolved);
-      return json({ ok: true, trashed: resolved.length, missing });
+      // Rebuild the asset manifest INLINE, like the other asset routes that mint or
+      // retire a path↔GUID mapping already do — /api/reimport, /api/create-asset and
+      // /api/import-file. (NOT duplicate-asset or move-file: both change the mapping
+      // and neither rebuilds, but both are panel-only and the panel calls refresh().
+      // An earlier draft of this comment named duplicate-asset as a sibling that
+      // rebuilds; it does not. Verified by attributing every ctx.rebuildManifest()
+      // call site to its route.) Both backends DO
+      // watch `unlink` and rebuild on their own, but on a 150ms debounce — so a
+      // reply sent now is AHEAD of the state a caller would verify with, and a
+      // /api/scan-assets issued straight after (or a modoki_list_assets in the same
+      // modoki_batch) can still see the asset it was just told was trashed. NOT
+      // resolve-refs — that resolves ENTITY refs and never answers about an asset
+      // guid at all, which is a mistake this comment made once.
+      // A rebuild failure is NOT a delete failure: the trash already happened,
+      // so it downgrades to `manifestRebuilt:false` — which tells the caller to
+      // wait for the debounce — rather than a 500 that would read as
+      // "nothing was deleted" and invite a retry against files already gone.
+      let manifestRebuilt = false;
+      if (resolved.length > 0) {
+        try { ctx.rebuildManifest(); manifestRebuilt = true; } catch { manifestRebuilt = false; }
+      }
+      return json({ ok: true, trashed: resolved.length, missing, manifestRebuilt });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -1547,6 +1857,72 @@ async function describeUnresolvedAgainstLiveWorld(
         // Drop warnings about the engine root we filtered out — they'd be noise here.
         warnings: result.warnings,
       });
+    } catch (e) {
+      return json({ error: e instanceof Error ? e.message : String(e) }, 500);
+    }
+  }
+
+  // Parse a bounded integer query param. Out-of-range and non-numeric both fall back
+  // to the default rather than erroring: these are response-size knobs, and refusing a
+  // whole reference query over a mistyped `limit` costs the caller more than clamping.
+  const clampInt = (raw: string | null, dflt: number, min: number, max: number): number => {
+    const n = Number(raw);
+    if (raw == null || raw === '' || !Number.isFinite(n)) return dflt;
+    return Math.min(max, Math.max(min, Math.trunc(n)));
+  };
+
+  // ── GET /api/find-references?target=… (M) ── the reverse reference graph (#284).
+  // "What references this?" over assets AND entities, including the INDIRECT chains
+  // (texture ← material ← mesh ← entity) and the implicit edges no file records —
+  // most importantly a UI `imageSrc` holding the auto-emitted whole-image sprite guid
+  // rather than the texture's own. Reading the texture's guid out of the scene finds
+  // none of those, which is how every icon in games/court once read as orphaned.
+  //
+  // Backs the editor's Assets/Hierarchy "Find References" and the modoki_find_references
+  // MCP tool — one implementation, three consumers, because two reverse walks over the
+  // same data would drift and a wrong "0 references" is indistinguishable from a right one.
+  //
+  // There is deliberately NO "list everything nothing references" mode here. It was
+  // built, then measured and removed: `unreferenced` is a strict SUBSET of the
+  // tree-shaker's orphan list on every committed project (court 17/17, 3d-test 29/31,
+  // forest-camp 30/60, sling 38/73, particle-demo 19/21 — and nothing appeared in the
+  // unreferenced set that was not already an orphan, which is structural: a file
+  // nothing points at cannot be reachable unless it is a seed). It reported only the
+  // ENTRY POINTS of a dead subtree where /api/unused-assets reports the whole subtree.
+  // A second, weaker answer to a question that already has one is the cross-tool
+  // inconsistency docs/mcp-tool-conventions.md section 2 exists to prevent.
+  // "What would the build drop?" belongs to /api/unused-assets, alone.
+  if (urlPath === '/api/find-references' && method === 'GET') {
+    try {
+      const enumeration = ctx.computeRefEdges();
+      const graph = buildRefGraph(enumeration);
+
+      const target = (query.get('target') || '').trim();
+      if (!target) {
+        return json({ error: 'find-references needs a `target`: an asset GUID, an entity GUID, or a virtual asset path (/assets/…). To list assets a production build would drop, use /api/unused-assets.' }, 400);
+      }
+      const node = resolveTarget(graph, target);
+      if (!node) {
+        // "Could not look" is never reported as "nothing is there" — an unresolvable
+        // target is a refusal, not an answer of zero references.
+        return json({
+          error: `no asset or entity matches "${target}". Expected an asset GUID, an entity GUID (EntityAttributes.guid, or a prefab instance's own guid), or a virtual path starting with "/".`,
+        }, 404);
+      }
+
+      const result = findReferences(graph, node, {
+        limit: clampInt(query.get('limit'), 50, 1, 1000),
+        maxDepth: clampInt(query.get('maxDepth'), 6, 1, 20),
+        reachableOnly: query.get('reachableOnly') === '1',
+      });
+      const body: FindReferencesResponse = {
+        ...result,
+        // A lead, not a verdict — a ref to a game-defined JSON kind the shaker does
+        // not classify lands here even though the file exists. Scoped to this target
+        // so the payload does not carry the whole project's every time.
+        unresolvedRefsFromTarget: graph.dangling.filter(d => d.from.id === node.id).map(d => ({ via: d.via, guid: d.guid })),
+      };
+      return json(body);
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : String(e) }, 500);
     }
@@ -1732,7 +2108,13 @@ async function describeUnresolvedAgainstLiveWorld(
         if (!abs) { summary.skipped++; unresolved.push(a.path); continue; }
         try {
           await handler(a.path, abs, reCtx); summary.converted++;
-          if (a.type === 'model' || a.type === 'texture') invalidate.push({ path: a.path, type: a.type });
+          // EVERY baked type is announced, and the renderer op decides which ones hold a
+          // cache worth evicting (#304 close-out). This used to filter to model|texture
+          // here AND branch on the same two in the op — so widening one without the other
+          // changed nothing, which is exactly how audio and HDR stayed stale after the op
+          // itself learned about them. One list, in `invalidate-assets`; a type it does
+          // not know costs an ignored array entry.
+          invalidate.push({ path: a.path, type: a.type });
         }
         catch (e) { summary.errors.push(`${a.path}: ${e instanceof Error ? e.message : String(e)}`); }
       }
@@ -1791,7 +2173,9 @@ async function describeUnresolvedAgainstLiveWorld(
   // an existing file's `id` when the new data omits one.
   if (urlPath === '/api/asset-write' && method === 'POST') {
     try {
-      const { path: assetPath, type, data } = (body ?? {}) as { path?: string; type?: AssetSchemaType; data?: unknown; replace?: boolean };
+      const { path: assetPath, type, data } = (body ?? {}) as {
+        path?: string; type?: AssetSchemaType; data?: unknown; replace?: boolean; selfWrite?: boolean;
+      };
       if (!assetPath || !type) return json({ error: 'asset-write requires { path, type, data }' }, 400);
       if (!getAssetSchema(type)) return json({ error: `unknown asset type '${type}' — valid: ${ASSET_SCHEMA_TYPES.join(', ')}`, types: ASSET_SCHEMA_TYPES }, 400);
       const abs = ctx.resolveAssetPath(assetPath);
@@ -1847,6 +2231,18 @@ async function describeUnresolvedAgainstLiveWorld(
       if (out && typeof out === 'object' && !out.id && fs.existsSync(abs)) {
         try { const prev = JSON.parse(fs.readFileSync(abs, 'utf-8')); if (prev?.id) out.id = prev.id; } catch { /* ignore */ }
       }
+      // `selfWrite` — the editor is flushing a doc it ALREADY applied to the live cache
+      // (dirtyAssets.flushDirtyAssets), so fingerprint the bytes the way /api/write-file does and
+      // let the watcher skip its own save. Without it the flush's own change event comes back
+      // ~150ms later, invalidates the cache it just agreed with, and `dropParkedWriteFor` discards
+      // whatever the human parked in the meantime — an edit made in the second after Cmd+S,
+      // gone. A file-direct write_asset must NOT set this: there the cached def really is stale,
+      // which is the whole reason the invalidation exists.
+      const selfWrite = (body as { selfWrite?: boolean } | null)?.selfWrite === true;
+      if (selfWrite) {
+        const bytes = Buffer.from(JSON.stringify(out, null, 2));
+        ctx.markEditorWrite(abs, crypto.createHash('sha1').update(bytes).digest('hex'));
+      }
       writeJsonAtomic(abs, out);
       return json({ ok: true, saved: true, warnings, path: assetPath });
     } catch (e) {
@@ -1867,6 +2263,18 @@ async function describeUnresolvedAgainstLiveWorld(
       const id = crypto.randomUUID();
       const data = defaultAssetData(type) as Record<string, unknown>;
       data.id = id;
+      // Fingerprint our own write so the watcher skips it — the same guard /api/asset-write,
+      // /api/write-file and the rename route already carry, and the ONE write route that never
+      // had it. Without this the creation's own change event comes back a debounce later, is read
+      // as an EXTERNAL edit, and `dropParkedWriteFor` (agentBridge.ts) discards whatever was
+      // parked for that path: the live-cache entry AND the `dirtyAssetPaths` entry both vanish, so
+      // a later `save_all` writes nothing and reports no error. Silent data loss in the authoring
+      // path — an edit made in the second after create_asset, gone. Measured ~500ms end-to-end.
+      // Fingerprint the bytes `writeJsonAtomic` will actually write (JSON.stringify(x, null, 2),
+      // no trailing newline); a mismatch here fails OPEN and silently restores the bug.
+      // Unlike a file-direct `write_asset`, suppressing this event is safe: the file is brand new,
+      // so there is no stale cached def the invalidation needs to clear.
+      ctx.markEditorWrite(abs, crypto.createHash('sha1').update(Buffer.from(JSON.stringify(data, null, 2))).digest('hex'));
       writeJsonAtomic(abs, data);
       ctx.rebuildManifest(); // register the new asset's GUID
       return json({ ok: true, saved: true, path: assetPath, id });
@@ -1961,6 +2369,17 @@ async function describeUnresolvedAgainstLiveWorld(
         catch { /* stat failed → treat as a real collision */ }
         if (!sameEntry) return json({ error: 'Destination exists' }, 409);
       }
+      // The destination is about to APPEAR, and the watcher cannot tell a rename from an
+      // external overwrite — so fingerprint it as the editor's own write, exactly as
+      // /api/asset-write and /api/write-file already do. Without this the rename's own change
+      // event comes back and `dropParkedWriteFor` discards the parked write that
+      // `applyMovesToParkedAssets` just deliberately moved ONTO this path: the human's unsaved
+      // edit is gone, the panel still shows it, and the badge reads `Saved ✓`
+      // (bug 1MCF9DFktot8hXsgBuWp). Read the bytes BEFORE the move — after it, absFrom is gone.
+      try {
+        const moved = fs.readFileSync(absFrom);
+        ctx.markEditorWrite(absTo, crypto.createHash('sha1').update(moved).digest('hex'));
+      } catch { /* unreadable (a directory move) — fall through; the guard is best-effort */ }
       moveAssetFile(absFrom, absTo);
       return json({ ok: true });
     } catch (e) {
@@ -2091,6 +2510,12 @@ async function describeUnresolvedAgainstLiveWorld(
   // any UNDECLARED top-level key. Pre-existing — the old route did the same — and
   // inert, since every reader resolves through that same list. Unknown keys nested
   // INSIDE a declared section do survive, via prune's already-on-disk rule.)
+  // ⚠️ **EXCEPT `rendering.three.tiers`** (REPLACE_WHOLESALE, project-config.ts): it is merged as
+  // a LEAF, not a section, so a patch naming it REPLACES the whole map — an omitted tier is
+  // DELETED, not left alone, and an omitted FIELD inside a named tier is refused below rather than
+  // silently dropped (see the tiers-completeness check further down). This is deliberate — the
+  // Project Settings "Remove tier" button needs a way to express deletion, which "omission means
+  // untouched" cannot express.
   // This is load-bearing: the Project Settings
   // dialog posts the WHOLE object (so every key is present and blanking a field
   // still works), but `modoki_project_settings action=set` and the OTA-keys
@@ -2173,6 +2598,31 @@ async function describeUnresolvedAgainstLiveWorld(
           error: `null is not a valid value for ${nulls.join(', ')} — no project-config field is ` +
             'nullable. Use "" (string), false (boolean) or 0 (number) to clear a field.',
         }, 400);
+      }
+      // `rendering.three.tiers` is in REPLACE_WHOLESALE (project-config.ts) — a patch that names
+      // it is deep-merged as a LEAF, so a tier object missing a field doesn't inherit that field
+      // from the file, it simply LOSES it. `complete()` (qualityTier.ts) then fills the hole from
+      // UNCLAMPED_OVERRIDES at read time, so the tier quietly stops clamping and this route still
+      // answers ok:true — the exact silent-wrong this route's own docblock and
+      // `modoki_project_settings`'s tool description warn `tiers` is the one exception to
+      // "an omitted section is left untouched". Refuse a partial tier object rather than merge it
+      // back (that would defeat the Project Settings "Remove tier" button, which relies on
+      // REPLACE_WHOLESALE to express deletion) — the caller must post the complete block.
+      const tiersThree = isPlainObjectLocal(configPart.rendering) ? (configPart.rendering as Record<string, unknown>).three : undefined;
+      const tiersPatch = isPlainObjectLocal(tiersThree) ? (tiersThree as Record<string, unknown>).tiers : undefined;
+      if (isPlainObjectLocal(tiersPatch)) {
+        // NESTED key paths, not top-level keys — see `requiredKeyPaths`: a partial `postFX` block
+        // otherwise passes this gate and reads back as "every missing effect ALLOWED".
+        const requiredFields = requiredKeyPaths(UNCLAMPED_OVERRIDES as unknown as Record<string, unknown>);
+        const incompleteTiers = Object.entries(tiersPatch as Record<string, unknown>).filter(
+          ([, tierValue]) => !isPlainObjectLocal(tierValue) || requiredFields.some((f) => !hasKeyPath(tierValue, f)),
+        );
+        if (incompleteTiers.length) {
+          return json({
+            error: `rendering.three.tiers is replaced wholesale — post the complete block. ` +
+              `${incompleteTiers.map(([k]) => `"${k}"`).join(', ')} is missing one or more of: ${requiredFields.join(', ')}.`,
+          }, 400);
+        }
       }
       // Keep the PRE-EDIT file around: it is what prune measures "was already
       // recorded" against. Pruning against nextRaw instead would make every key in
@@ -2341,7 +2791,16 @@ async function describeUnresolvedAgainstLiveWorld(
       // agents at for placing entities — got it wrong: its documented `path` default 403'd on
       // every call. Answer it here, once, rather than leave each caller to guess.
       const ref = toAssetRef(ctx, typeof obj.scenePath === 'string' ? obj.scenePath : undefined);
-      return json({ ...obj, ...(ref ? { scenePathRef: ref } : {}), persistenceMode: getPersistenceMode() });
+      // `heldPointer` — a MAIN-process fact merged into the relayed renderer state, the same way
+      // `persistenceMode` is. Present only when the host can answer (Electron); omitted entirely
+      // on a backend with no input routes, so its absence never reads as "nothing is held".
+      const held = ctx.getHeldPointer?.();
+      return json({
+        ...obj,
+        ...(ref ? { scenePathRef: ref } : {}),
+        ...(ctx.getHeldPointer ? { heldPointer: held ?? null } : {}),
+        persistenceMode: getPersistenceMode(),
+      });
     } catch (e) {
       return json({ error: String(e instanceof Error ? e.message : e) }, 504);
     }
@@ -2438,6 +2897,99 @@ async function describeUnresolvedAgainstLiveWorld(
       // answering (400), not a dead gateway.
       const msg = String(e instanceof Error ? e.message : e);
       return json({ error: msg }, relayFailureStatus(e));
+    }
+  }
+
+  // ── POST /api/scene-query {kind, dim, ...} (M→R) ── raycast / shapecast / point-pick against
+  // the live PHYSICS world (#288 gap 1). POST rather than GET despite being a pure read: the
+  // payload is nested vectors, and a GET would mean serializing arrays through query params for
+  // no gain. `capture_viewport` / `render_scene` are the same shape — read tools on POST because
+  // their input is structured, not because they mutate.
+  if (urlPath === '/api/scene-query' && method === 'POST') {
+    try {
+      const result = await ctx.requestBrowser('scene-query', body ?? {});
+      // The op distinguishes "there is no physics world" and "the direction was degenerate" from a
+      // genuine miss, and those refusals must NOT arrive as a 200 the way a miss does — a miss is
+      // `{ok:true, hit:null}`, which is a real answer. `postJson` runs isFailureBody, so
+      // 200-with-{ok:false} already becomes a failed tool call carrying the op's `code`.
+      return json(result);
+    } catch (e) {
+      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
+    }
+  }
+
+  // ── GET /api/creatable-assets (M→R) ── the Assets panel's "New X" registry as it stands in the
+  // OPEN project (#288 gap 5). GET, per the C7 convention: it tells you something.
+  //
+  // Its own route rather than the editor-action relay, and that is the circularity guard in
+  // `liveCoverage.test.ts` doing its job: a tool declaring `mutating:false` while POSTing to
+  // /api/editor-action is flagged, because that combination is exactly how an under-declared write
+  // used to be swept as "safe" AND exempted from the coverage ledger. This op really is a pure
+  // read, so the honest fix is the method, not the declaration.
+  if (urlPath === '/api/creatable-assets' && method === 'GET') {
+    try {
+      const result = await ctx.requestBrowser('list-creatable-assets', {});
+      // `getJson` does NOT run isFailureBody (on a GET, `ok` may be the ANSWER — diagnose,
+      // validate_scene), so a 200 carrying {ok:false} would reach the agent as a successful read
+      // of an empty registry. The op cannot fail today; this matches what the /api/player-prefs
+      // GET sibling does, so the two do not diverge the moment one of them grows a refusal.
+      if (result && typeof result === 'object' && (result as { ok?: unknown }).ok === false) return json(result, 409);
+      return json(result);
+    }
+    catch (e) {
+      const msg = String(e instanceof Error ? e.message : e);
+      return json({ error: msg }, relayFailureStatus(e));
+    }
+  }
+
+  // ── GET /api/player-prefs[?key=] (M→R) ── read the engine's PlayerPrefs store (#288 gap 4).
+  // GET, per the C7 convention: this tells you something, it does not do something. The WRITE half
+  // is a separate op behind POST /api/editor-action (`player-prefs-write`) — one tool, one job
+  // (docs/mcp-tool-conventions.md §7), and it keeps §4's "no mutating operation is reachable by
+  // GET" true by construction rather than by an allowlist check.
+  if (urlPath === '/api/player-prefs' && method === 'GET') {
+    // Inventory the QUERY PARAMS, not just the route and the method (§4): a scan of route methods
+    // was blind to three of the six mutating-GET violators because they mutate via `?action=` /
+    // `?clear=`. Anything but `key` here is refused by name rather than silently ignored, so a
+    // caller reaching for a write through this route learns where the write actually lives.
+    const stray = [...query.keys()].filter((k) => k !== 'key');
+    if (stray.length > 0) {
+      return json({
+        error: `unknown query param(s) on /api/player-prefs: ${stray.join(', ')}. This route READS only; the write half is POST /api/editor-action {action:'player-prefs-write'}.`,
+        code: 'UNKNOWN_PARAM',
+        expected: 'key',
+      }, 400);
+    }
+    const key = query.get('key');
+    try {
+      const result = await ctx.requestBrowser('player-prefs-read', key != null ? { key } : {});
+      // The op's refusal must arrive as a non-2xx: `getJson` does NOT run `isFailureBody` (that is
+      // deliberate — on a GET, `ok` may be the ANSWER, as it is for diagnose/validate_scene), so a
+      // 200 carrying {ok:false} would reach the agent as a successful read of an empty store. That
+      // is exactly the "could not look" → "nothing is there" collapse this op refuses to make.
+      // The body is passed through whole so its `code` survives into the §5 envelope.
+      if (result && typeof result === 'object' && (result as { ok?: unknown }).ok === false) return json(result, 409);
+      return json(result);
+    } catch (e) {
+      const msg = String(e instanceof Error ? e.message : e);
+      return json({ error: msg }, relayFailureStatus(e));
+    }
+  }
+
+  // ── POST /api/player-prefs {action, key?, value?, confirm?} (M→R) ── the WRITE half.
+  // Its OWN route rather than the /api/editor-action relay, and that is not a style choice: the
+  // relay's routing key is literally `action`, and it strips it before relaying — so an op with an
+  // `action` param of its own receives `undefined` and runs the wrong branch while every layer
+  // reports success. Measured on this very op (#288 Phase 2). `editorAction()` now REFUSES that
+  // shape outright; this route is where the op moved to.
+  if (urlPath === '/api/player-prefs' && method === 'POST') {
+    try {
+      const result = await ctx.requestBrowser('player-prefs-write', body ?? {});
+      // 200-with-{ok:false} is fine on a POST — `postJson` runs `isFailureBody` and turns it into a
+      // failed tool call, carrying the op's own `code` (§4's C7 convention). No status mapping here.
+      return json(result);
+    } catch (e) {
+      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
     }
   }
 
@@ -2742,7 +3294,25 @@ function relayFailureStatus(e: unknown): number {
   // fix, in the opposite direction. (`'editor window closed'` was already covered by `window
   // closed`.) A teardown is retryable once the renderer is back; a refusal is not, so telling the
   // two apart changes what the agent does next.
-  const transport = /no (editor )?renderer|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|project changed|window (is )?closed|destroyed|websocket not ready/i.test(msg);
+  // ⚠️ **`destroyed` WAS A BARE ALTERNATIVE, AND IT MATCHED THE REFUSALS THIS FUNCTION EXISTS TO
+  // PROTECT** (bug BHdZZ52JIu4afJmoX7O6). It is here for Electron's own `Object has been
+  // destroyed`, thrown when a BrowserWindow/webContents dies mid-request — a genuine transport
+  // failure. But `load-scene`'s unsaved-work refusal reads "…the scene edits would be DESTROYED
+  // (gone from the world, the file, and the undo stack)", so an op answering clearly and correctly
+  // was reported as `HTTP 504 / NOT_AVAILABLE_HERE`: "this editor cannot do that", when the truth
+  // was "save first, or pass discardUnsaved". That is precisely the could-not-look vs it-said-no
+  // inversion described above, produced BY the fix for it.
+  //
+  // Reproduced 2026-08-22 against a live editor: create_entity, then load_scene with no
+  // discardUnsaved → 504 with the correct message. The wording that tripped it is the WORD
+  // "destroyed" in ordinary prose, so the lesson generalises: every alternative here must name its
+  // SUBJECT. A bare verb will eventually appear in an op's own explanation of what it refuses to
+  // do — that is the vocabulary these messages are written in.
+  // ⚠️ `\b` around the subject group, and it is NOT decoration: without it `view` matches inside
+  // `preview`, `overview` and `review`, so "…the PREVIEW was destroyed…" would be misclassified as
+  // transport — this fix reintroducing its own bug one word smaller. Caught in review, before it
+  // could bite.
+  const transport = /no (editor )?renderer|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|project changed|window (is )?closed|object has been destroyed|\b(renderer|window|webcontents|view)\b (has been |was |is )?destroyed|websocket not ready/i.test(msg);
   return transport ? 504 : 400;
 }
 
@@ -2751,7 +3321,8 @@ function relayFailureStatus(e: unknown): number {
  *  can't invoke arbitrary renderer ops. Keep in sync with registerEditorAgentOps. */
 const EDITOR_ACTIONS = new Set<string>([
   'set-selection', 'set-gizmo', 'set-scene-view-mode', 'set-collider-edit',
-  'open-particle-editor', 'open-sprite-editor', 'open-nine-slice-editor', 'focus-entity',
+  'open-particle-editor', 'open-sprite-editor', 'open-nine-slice-editor',
+  'open-animation-editor', 'focus-entity',
   'play', 'resume', 'stop', 'pause', 'step',
   'undo', 'redo',
   'load-scene', 'new-scene', 'save-all',
@@ -2764,6 +3335,9 @@ const EDITOR_ACTIONS = new Set<string>([
   'dispatch-action', 'clear-journal', 'set-timescale',
   // Phase D (particle/animation first-pass editing).
   'anim-add-key', 'set-playhead', 'particle-set', 'anim-set-clip',
+  // The pose `set-playhead` deliberately does not do (#288 gap 2).
+  'pose-clip', 'exit-pose-envelope',
+  'create-registered-asset',
   'timeline-set', 'timeline-add-clip',
   // Enact Phase 1 (HTML5 drag-and-drop synthesis) — a renderer-DOM op (needs a live
   // DataTransfer), so it rides the browser relay and works in dev AND the DMG.

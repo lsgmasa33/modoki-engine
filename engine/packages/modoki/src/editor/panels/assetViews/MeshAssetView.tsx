@@ -6,23 +6,31 @@ import { useState, useEffect } from 'react';
 import { whenMeshTemplate, meshStatsFromTemplate } from '../../../runtime/loaders/meshTemplateCache';
 import { InfoRow, Section } from './widgets';
 import { MeshPreview } from '../MeshPreview';
+import { useModelInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
 
 export function MeshAssetView({ path }: { path: string }) {
   const [data, setData] = useState<Record<string, unknown> | null>(null);
   // null = not yet resolved; false = permanently failed to load geometry.
   const [meshInfo, setMeshInfo] = useState<{ vertices: number; triangles: number; attributes: string[] } | null | false>(null);
 
+  // A re-import rewrites this `.mesh.json` in place, so neither `path` nor the
+  // browser's cached copy of it changes (#294) — bump both off the invalidation epoch.
+  const epoch = useModelInvalidationEpoch();
+
   useEffect(() => {
     const ac = new AbortController();
-    fetch(path, { signal: ac.signal })
+    fetch(cacheBustReimport(path, epoch), { signal: ac.signal })
       .then(r => r.ok ? r.json() : null)
       .then(setData)
       .catch(e => { if (e.name !== 'AbortError') setData(null); });
     return () => ac.abort();
-  }, [path]);
+  }, [path, epoch]);
 
   // Resolve mesh template for geometry stats — await the cache load promise
   // instead of polling (F9). Resolves to undefined on permanent failure.
+  // Re-runs after a re-import because the refetch above hands back a fresh `data`
+  // object; `invalidateModel` has already dropped this mesh's cache entry by then,
+  // so `whenMeshTemplate` re-resolves the new geometry rather than the stale stats.
   useEffect(() => {
     if (!data) return;
     let cancelled = false;

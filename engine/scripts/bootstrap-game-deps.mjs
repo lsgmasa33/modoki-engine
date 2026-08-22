@@ -10,10 +10,17 @@
  * game packages. Without them, opening such a game in the editor 500s with
  * `Failed to resolve import "@3d-test/app-services"`.
  *
- * This runs from the root `postinstall`: for every games/<g>/package.json that
- * declares `workspaces`, run `npm install` in that folder so its package links
- * exist. A failure for one game is logged but does NOT fail the root install —
- * the engine core still works; only that game would be broken.
+ * This runs from the root `postinstall`: for every project that owns sub-packages
+ * to LINK (`workspaces`) **or declares dependencies to INSTALL**, run `npm install`
+ * in that folder. A failure for one project is logged but does NOT fail the root
+ * install — the engine core still works; only that project would be broken.
+ *
+ * ⚠️ The second half of that test is not decoration (#215). It used to be
+ * `workspaces` alone, which silently skipped the 14 projects that have real deps
+ * but own no sub-packages — so a fresh clone got no node_modules for any of them
+ * and their native builds died at package resolution, on a `Package.swift` that
+ * correctly points at the project's OWN node_modules. The selection rule lives in
+ * `projectNeedsInstall.mjs` so a test can sweep every real project against it.
  *
  * After a game's deps are linked we also run its `build:plugins` script IF it
  * defines one. A game's native Capacitor plugins (e.g. capacitor-applovin-max)
@@ -27,11 +34,12 @@
  * game's `npm install` is a fully-completed child process, so its `.bin` (incl.
  * rollup) is already linked by the time we invoke `build:plugins` afterwards.
  */
-import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discoverProjects } from './projectRoots.mjs';
+import { projectNeedsInstall } from './projectNeedsInstall.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -64,8 +72,17 @@ for (const proj of projects) {
     console.warn(`[bootstrap-game-deps] skip ${label}: unreadable package.json (${e.message})`);
     continue;
   }
-  if (!pkg.workspaces) continue; // not a workspace root → nothing to link
+  // Two reasons to install: it owns sub-packages to LINK (`workspaces`), or it declares real
+  // dependencies to INSTALL. The rule lives in projectNeedsInstall.mjs so a test can sweep every
+  // real project against it — `!pkg.workspaces` alone silently skipped 14 projects (#215).
+  if (!projectNeedsInstall(pkg)) continue;
 
+  // ⚠️ Deliberately NOT skipped when `node_modules` already exists. That shortcut is what #215
+  // looked like from the inside: `games/court/node_modules` was PRESENT but stale — every
+  // `@capacitor/*` except the one added last — so "already installed" was true and wrong, and the
+  // iOS build failed on the missing package. npm is cheap when the tree is already satisfied
+  // (~0.3s for a no-op), so re-running it is the honest check. `bootstrap-mcp-deps.mjs` carried
+  // the same wrong shortcut for engine/tools/* and no longer does.
   console.log(`[bootstrap-game-deps] installing ${label} …`);
   try {
     npmRun(['install'], gameDir);
@@ -93,42 +110,13 @@ for (const proj of projects) {
   }
 }
 
-// ── Dev MCP tool deps (engine/tools/*) ──────────────────────────────────────
-// The repo's root workspaces cover engine/packages/* only, so a stdio MCP server
-// under engine/tools/ (e.g. modoki-mcp, spawned by .mcp.json via `npx tsx`) never
-// gets its deps from a root `npm install`. Without them it crashes on launch with
-// `Cannot find package '@modelcontextprotocol/sdk'`, so the editor MCP silently
-// fails to connect in a fresh clone/worktree. Install each tool that declares
-// dependencies and is missing its node_modules (idempotent — skips if present).
-const toolsDir = path.join(repoRoot, 'engine', 'tools');
-let toolsInstalled = 0;
-if (existsSync(toolsDir)) {
-  for (const dir of readdirSync(toolsDir, { withFileTypes: true }).filter((d) => d.isDirectory())) {
-    const toolDir = path.join(toolsDir, dir.name);
-    const pkgPath = path.join(toolDir, 'package.json');
-    if (!existsSync(pkgPath)) continue;
-    let pkg;
-    try {
-      pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
-    } catch {
-      continue;
-    }
-    if (!pkg.dependencies || Object.keys(pkg.dependencies).length === 0) continue;
-    if (existsSync(path.join(toolDir, 'node_modules'))) continue; // already installed
-    console.log(`[bootstrap-game-deps] installing engine/tools/${dir.name} (MCP/dev tool) …`);
-    try {
-      npmRun(['install'], toolDir);
-      toolsInstalled++;
-    } catch (e) {
-      console.warn(
-        `[bootstrap-game-deps] WARNING: npm install failed in engine/tools/${dir.name} — ` +
-          `its MCP server won't launch until its deps install. (${e.message})`
-      );
-    }
-  }
-}
+// NOTE: engine/tools/* (the MCP servers) are installed by `bootstrap-mcp-deps.mjs`, which runs
+// immediately BEFORE this script in the root postinstall. A duplicate loop lived here and was
+// unreachable in the normal flow for exactly that reason — the earlier script had already created
+// each tool's node_modules, so this one's "skip if present" guard always fired and it installed
+// nothing. Two copies of one rule, one of them dead; the dedicated script owns the job.
 
 console.log(
-  `[bootstrap-game-deps] done (${installed} game workspace(s) installed, ` +
-    `${built} built native plugins, ${toolsInstalled} dev tool(s) installed).`
+  `[bootstrap-game-deps] done (${installed} project(s) installed, ` +
+    `${built} built native plugins).`
 );

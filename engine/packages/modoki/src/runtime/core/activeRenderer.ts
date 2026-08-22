@@ -353,16 +353,26 @@ function attachWebGlContextLostListener(renderer: WebGPURenderer | THREE.WebGLRe
 let _ktx2CapsReadyResolve: () => void;
 export const ktx2CapsReady: Promise<void> = new Promise((r) => { _ktx2CapsReadyResolve = r; });
 let ktx2CapsReadyFired = false;
-let ktx2CapsSource: 'viewport' | 'probe' | 'none' = 'none';
+let ktx2CapsSource: Ktx2CapsSource = 'none';
 
 /** True once KTX2 transcoder caps are known, whether from a real viewport or a probe. */
 export function areKtx2CapsReady(): boolean {
   return ktx2CapsReadyFired;
 }
 
+/** Where KTX2 transcoder caps came from.
+ *   - `'viewport'` — a real renderer registered (`setActiveRenderer`).
+ *   - `'probe'`    — the throwaway probe renderer ran (`ensureKtx2Caps`).
+ *   - `'no-3d'`    — this build excluded the 3D renderer (`build.modules.render3d: false`), so
+ *                    there is nothing to detect and the gate opened without probing. NOT a
+ *                    failure: three's KTX2Loader is a 3D-only consumer (PixiJS transcodes the 2D
+ *                    path itself) and `selectVariant`'s '2d' branch never reads the caps.
+ *   - `'none'`     — not resolved yet. */
+export type Ktx2CapsSource = 'viewport' | 'probe' | 'no-3d' | 'none';
+
 /** Mark KTX2 caps ready without implying a live renderer. Idempotent — first call wins the
  *  recorded `source`, e.g. if a probe and a real viewport race, whichever settles first sticks. */
-export function markKtx2CapsReady(source: 'viewport' | 'probe'): void {
+export function markKtx2CapsReady(source: Exclude<Ktx2CapsSource, 'none'>): void {
   if (!ktx2CapsReadyFired) {
     ktx2CapsReadyFired = true;
     ktx2CapsSource = source;
@@ -371,7 +381,7 @@ export function markKtx2CapsReady(source: 'viewport' | 'probe'): void {
 }
 
 /** Which path resolved KTX2 caps — surfaced in `RendererGateHealth` for agent diagnosis. */
-export function getKtx2CapsSource(): 'viewport' | 'probe' | 'none' {
+export function getKtx2CapsSource(): Ktx2CapsSource {
   return ktx2CapsSource;
 }
 
@@ -453,9 +463,10 @@ export interface RendererGateHealth {
   progress: string;
   error?: string;
   /** Which path resolved KTX2 transcoder caps: a real viewport, the demand-driven probe
-   *  (`ensureKtx2Caps`), or neither yet. Independent of `status` — a viewport-less layout can
-   *  sit at `status: 'pending'` while `capsSource` is already `'probe'`. */
-  capsSource: 'viewport' | 'probe' | 'none';
+   *  (`ensureKtx2Caps`), a build with no 3D renderer to probe, or neither yet. Independent of
+   *  `status` — a viewport-less layout can sit at `status: 'pending'` while `capsSource` is
+   *  already `'probe'`. See `Ktx2CapsSource`. */
+  capsSource: Ktx2CapsSource;
 }
 
 export function getRendererGateHealth(): RendererGateHealth {

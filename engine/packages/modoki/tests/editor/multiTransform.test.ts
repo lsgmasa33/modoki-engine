@@ -68,6 +68,32 @@ describe('applyGroupTransform3D — translate', () => {
     const d = decomp(out[1]);
     expect(d.s.x).toBeCloseTo(2); expect(d.s.y).toBeCloseTo(2);
   });
+
+  // #258 close-out review — nothing pinned this. Translate mode decomposes each member's start
+  // world matrix and recomposes it at the new position. A member with a zero scale axis has a
+  // SINGULAR start matrix, and three's Matrix4.decompose answers that with scale (1,1,1) and an
+  // identity quaternion — so simply DRAGGING a group used to resize a hidden member to full size
+  // and reset its rotation as a side effect of moving it.
+  it('translating a group does not resize or unrotate a member scaled to ZERO', () => {
+    const hidden = mat(1, 0, 0, 0, 0, Math.PI / 2, 3, 0, 2); // flattened on Y, rotated
+    const out = applyGroupTransform3D({
+      memberStartWorld: [hidden],
+      pivotStart: mat(0, 0, 0),
+      pivotNow: mat(4, 0, 0),
+      mode: 'translate',
+    });
+    expect(pos(out[0]).x).toBeCloseTo(5); // moved by the delta…
+
+    // …and the rest of the matrix is byte-for-byte the input's. Asserted on the MATRIX, not via
+    // this file's `decomp` helper: that helper calls three's raw `Matrix4.decompose`, which is
+    // the very API that substitutes (1,1,1) on a singular matrix — reading the answer through it
+    // would report [1,1,1] no matter how correct `applyGroupTransform3D` was. A test whose own
+    // instrument carries the bug it is testing for cannot see the bug.
+    const expected = mat(5, 0, 0, 0, 0, Math.PI / 2, 3, 0, 2);
+    for (let i = 0; i < 16; i++) {
+      expect(out[0].elements[i], `element ${i}`).toBeCloseTo(expected.elements[i], 9);
+    }
+  });
 });
 
 describe('applyGroupTransform3D — rotate (rigid orbit around the pivot point)', () => {

@@ -42,9 +42,6 @@ describe('detectModules', () => {
     expect(used.physics3d).toBe(true);
     expect(used.render2d).toBe(false);
     expect(used.physics2d).toBe(false);
-    // Sub-features conservatively follow render3d until finer detection lands.
-    expect(used.npr).toBe(true);
-    expect(used.gpuParticles).toBe(true);
   });
 
   it('detects a pure-2D + Rapier2D scene', () => {
@@ -61,8 +58,6 @@ describe('detectModules', () => {
     expect(used.physics2d).toBe(true);
     expect(used.render3d).toBe(false);
     expect(used.physics3d).toBe(false);
-    expect(used.npr).toBe(false);
-    expect(used.gpuParticles).toBe(false);
   });
 
   it('scans multiple scenes and unions their modules', () => {
@@ -190,7 +185,7 @@ describe('mergeProjectConfig — build.modules', () => {
     const cfg = mergeProjectConfig(null);
     expect(cfg.build.modules).toEqual({
       render3d: 'auto', render2d: 'auto', physics2d: 'auto',
-      physics3d: 'auto', npr: 'auto', gpuParticles: 'auto', video: 'auto',
+      physics3d: 'auto', video: 'auto',
     });
   });
 

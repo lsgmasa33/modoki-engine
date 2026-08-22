@@ -24,6 +24,7 @@ import type { World } from 'koota';
 import { Transform } from '../traits/Transform';
 import { EntityAttributes } from '../traits/EntityAttributes';
 import { getCurrentWorld } from './worldRegistry';
+import { decomposeTrs } from './decomposeTrs';
 
 export interface WorldTransform3D { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }
 
@@ -107,7 +108,7 @@ export function hasParent(entityId: number, world: World = getCurrentWorld()): b
 export function getWorldTransform3D(entityId: number, world: World = getCurrentWorld()): WorldTransform3D {
   buildTransformMaps(world);
   composeWorldMatrixInto(_wt3Mat, entityId);
-  _wt3Mat.decompose(_wt3Pos, _wt3Quat, _wt3Scale);
+  decomposeTrs(_wt3Mat, _wt3Pos, _wt3Quat, _wt3Scale); // singular-safe — see #258
   _wt3Euler.setFromQuaternion(_wt3Quat); // default XYZ
   _wt3.x = _wt3Pos.x; _wt3.y = _wt3Pos.y; _wt3.z = _wt3Pos.z;
   _wt3.rx = _wt3Euler.x; _wt3.ry = _wt3Euler.y; _wt3.rz = _wt3Euler.z;
@@ -164,7 +165,7 @@ export function worldToLocal3D(
   _w2lWorld.compose(_w2lPos, _w2lQuat, _w2lScale);
   // local = parentWorld⁻¹ · world
   _w2lLocal.copy(_w2lParent).invert().multiply(_w2lWorld);
-  _w2lLocal.decompose(_w2lPos, _w2lQuat, _w2lScale);
+  decomposeTrs(_w2lLocal, _w2lPos, _w2lQuat, _w2lScale); // singular-safe — see #258
   _w2lEuler.setFromQuaternion(_w2lQuat); // default XYZ
   _w2lOut.x = _w2lPos.x; _w2lOut.y = _w2lPos.y; _w2lOut.z = _w2lPos.z;
   _w2lOut.rx = _w2lEuler.x; _w2lOut.ry = _w2lEuler.y; _w2lOut.rz = _w2lEuler.z;

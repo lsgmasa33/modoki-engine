@@ -138,3 +138,36 @@ describe('every build-web.mjs invocation passes --target (regression guard)', ()
     ).toEqual([]);
   });
 });
+
+/** The build path's `vite build` must NOT pass `--configLoader runner`.
+ *
+ *  The inverted assertion, and it is inverted because the first cut of this guard demanded the
+ *  flag. The flag does stop Vite writing its bundled config into `node_modules/.vite-temp` — which
+ *  in a packaged editor is inside the signed .app — but it tears the module runner down after
+ *  config load, so any build hook that dynamically imports dies with "Vite module runner has been
+ *  closed". Measured on the v0.5.2 rc: `rigged-model-optimize.ts`'s `@gltf-transform/*` import
+ *  failed, char_Ranger.glb fell back to raw source, and `assertNoConversionFallback` failed the
+ *  build. The `win` clone independently reproduced it in isolation and reverted the same change.
+ *
+ *  ⚠️ The trap that let it reach an rc: a project with NO rigged model (games/anim-bug) builds
+ *  cleanly WITH the flag. Verifying there passes under both hypotheses and proves nothing — the
+ *  distinguishing project is one that exercises a build-hook dynamic import, i.e. any rigged GLB.
+ *
+ *  The dev server is the opposite case and keeps the flag: it loads the config once and keeps the
+ *  runner alive, and it needs the flag for read-only installs. So the two spawn sites legitimately
+ *  DIFFER, which is why this asserts each one separately rather than assuming symmetry. */
+describe('vite build must not use the runner config loader', () => {
+  const read = (p: string) => fs.readFileSync(path.join(__dirname, '../..', p), 'utf8');
+
+  it('build-web.mjs runs `vite build` WITHOUT --configLoader runner', () => {
+    const src = read('scripts/build-web.mjs');
+    const buildLine = src.split('\n').find((l) => /viteBin\)\}\s+build/.test(l));
+    expect(buildLine, 'could not find the `vite build` invocation in build-web.mjs').toBeDefined();
+    expect(buildLine!, '--configLoader runner breaks build-hook dynamic imports (rigged-model '
+      + 'conversion); see this block\'s header before re-adding it').not.toContain('--configLoader');
+  });
+
+  it('the DEV SERVER still passes it — the two sites differ on purpose', () => {
+    expect(read('electron/devServer.ts')).toContain("'--configLoader', 'runner'");
+  });
+});

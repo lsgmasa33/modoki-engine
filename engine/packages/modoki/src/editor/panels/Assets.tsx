@@ -23,13 +23,19 @@ import {
   deletionPathsFor, planRename,
 } from './assetOps';
 import { resolveClickSelection, dragPathsFor } from './assetSelection';
-import { isTextAsset, makeDeleteUndo, makeDuplicateUndo, type Snapshot, type DeleteResult, type DupResult } from './assetUndo';
-import { unbindDeletedAssetEditors, applyAssetPathMoves, type PathMove } from './assetEditorBindings';
-import { newGuid, registerAsset, type AssetType } from '../../runtime/loaders/assetManifest';
+import {
+  isTextAsset, makeDeleteUndo, makeDuplicateUndo, logBindingChanges,
+  makeRenameUndo, makeEmptyFolderDeleteUndo, makeNewFolderUndo, makeFolderRenameUndo,
+  makePasteUndo, makeFilesDropUndo, makeModelImportUndo, makeFileImportUndo,
+  type Snapshot, type DeleteResult, type DupResult, type PasteMove, type DropMove,
+} from './assetUndo';
+import { unbindDeletedAssetEditors, applyAssetPathMoves } from './assetEditorBindings';
+import { newGuid } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
 import { reimportPaths } from './assetViews/reimport';
 import { openAssetInEditor } from './openAssetInEditor';
 import { saveAssetDialog } from '../utils/saveDialog';
+import { createRegisteredAsset } from './createRegisteredAsset';
 
 /** Display name from an asset path: last segment minus a known double/single extension. */
 function assetDisplayName(p: string, ext: string): string {
@@ -53,6 +59,10 @@ import { resolveAssetKey } from './assetKeyCommands';
 import ScriptTree from './ScriptTree';
 import { SectionHeader, TreeFolderRow, TreeSearchInput, TypeFilterMenu } from './treeChrome';
 import { useExpandedSet } from './useExpandedSet';
+import {
+  useExpanded, usePendingFolders, useTypeFilter, useViewMode,
+  setExpanded, setPendingFolders, setTypeFilter, setViewMode,
+} from './assetFolderState';
 
 
 async function instantiatePrefabFromPath(prefabPath: string, _name: string) {
@@ -175,7 +185,18 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
 
     // Temporarily spawn entities to serialize as prefab, then clean up
     const rootId = await importModel(assetPath, prefix, postprocessorId, rootTransform);
-    if (!rootId) return;
+    // #311: `importModel` returns 0 when a generated-file write failed and it aborted. This
+    // early return is OLDER than that and used to be dead code — before the abort existed the
+    // import always returned a real spawned entity id — so it returned from inside the `try`
+    // WITHOUT clearing the progress modal, leaving a full-screen blocking spinner with no OK
+    // button until a page reload. Report it the same way the catch below reports a throw: an
+    // abort is an import failure, and `setImportError` is the dismissible modal for one.
+    // (A blanket `finally { setImportStatus(false) }` would be wrong — it resets `failed`,
+    // wiping the very error modal the catch sets.)
+    if (!rootId) {
+      setImportError(`Import of "${assetName}" was aborted — a generated file could not be written (see console).`);
+      return;
+    }
 
     const prefab = serializePrefab(rootId);
 
@@ -188,14 +209,18 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
       const baseName = assetPath.substring(assetPath.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
       const prefabPath = `${dir}/${baseName}.prefab.json`;
       const content = JSON.stringify(prefab, null, 2);
-      await writeFile(prefabPath, content);
-      console.log(`[Assets] Created prefab: ${prefabPath}`);
-
-      pushAction({
-        label: `Import Model "${assetName}"`,
-        undo: async () => { await deleteAsset(prefabPath); onDone?.(); },
-        redo: async () => { await writeFile(prefabPath, content); onDone?.(); },
-      });
+      // #308 follow-up A: the forward write was unchecked too (not just undo/redo) —
+      // pushing an undo entry for a prefab that was never actually written would make
+      // the resulting Cmd+Z trash a file that isn't there.
+      const wrote = await writeFile(prefabPath, content);
+      if (!wrote) {
+        console.error(`[Assets] Failed to create prefab ${prefabPath}`);
+      } else {
+        console.log(`[Assets] Created prefab: ${prefabPath}`);
+        // Builder in assetUndo.ts (#308) — both directions now check the write/delete
+        // and report a failure instead of discarding it silently.
+        pushAction(makeModelImportUndo({ assetName, prefabPath, content, onDone }));
+      }
     }
 
     refreshAssets();
@@ -214,12 +239,8 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
 // ─── Asset row (shared between views) ────────────────────────────────
 
 // Folder-relative move (computes the destination path from a target folder).
-/** Report what an asset move/delete did to the open asset editors (#186). Silent when it
- *  touched none, which is almost always — but a binding that silently repoints or closes is
- *  how the original bug stayed invisible, so the one case that matters says so. */
-function logBindingChanges(notes: string[]): void {
-  for (const n of notes) console.log(`[Assets] ${n}`);
-}
+// `logBindingChanges` moved to assetUndo.ts (#308) so the undo/redo builders there can share
+// it without importing this file.
 
 // Distinct from assetOps.moveFileTo, which takes an explicit full target path.
 async function moveFile(fromPath: string, toFolder: string): Promise<boolean> {
@@ -545,38 +566,7 @@ function countAll(node: FolderNode): number {
 
 // ─── Main component ──────────────────────────────────────────────────
 
-const LS_VIEW_MODE = 'editor:assets:viewMode';
-// v2: the top-level tree gained an "Assets" section header (ASSETS_SECTION key),
-// so bump the key to seed it open by default over any older saved set.
-const LS_EXPANDED = 'editor:assets:expanded:v2';
-const LS_PENDING_FOLDERS = 'editor:assets:pendingFolders';
-const LS_TYPE_FILTER = 'editor:assets:typeFilter';
 const LS_CURRENT_FOLDER = 'editor:assets:currentFolder';
-
-function loadStringSet(key: string): Set<string> {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return new Set();
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? new Set(arr.filter((x) => typeof x === 'string')) : new Set();
-  } catch { return new Set(); }
-}
-
-function loadViewMode(): ViewMode {
-  try {
-    const v = localStorage.getItem(LS_VIEW_MODE);
-    return v === 'folder' ? 'folder' : 'category';
-  } catch { return 'category'; }
-}
-
-function loadExpanded(): Set<string> {
-  try {
-    const raw = localStorage.getItem(LS_EXPANDED);
-    if (!raw) return new Set([ASSETS_SECTION]);
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? new Set(arr.filter((x) => typeof x === 'string')) : new Set([ASSETS_SECTION]);
-  } catch { return new Set([ASSETS_SECTION]); }
-}
 
 export default function Assets() {
   const [assets, setAssets] = useState<AssetEntry[]>([]);
@@ -591,7 +581,7 @@ export default function Assets() {
   // subtree) — merged into the tree below so externally-created empty dirs are visible.
   const [diskFolders, setDiskFolders] = useState<string[]>([]);
   const [filter, setFilter] = useState('');
-  const [expanded, setExpanded] = useState<Set<string>>(loadExpanded);
+  const expanded = useExpanded();
   // `selected` = the active/lead item (drives the Inspector, scroll-to, and the
   // shift-range anchor). `selection` = the full multi-select set (highlighting,
   // batch ops). The active item is always a member of the selection.
@@ -603,14 +593,14 @@ export default function Assets() {
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
   const anchorRef = useRef<string | null>(null); // shift-range anchor
-  const [viewMode, setViewMode] = useState<ViewMode>(loadViewMode);
+  const viewMode = useViewMode();
   // Freshly-created empty folders (persisted) — the scanner only reports files,
   // so without this an empty folder vanishes from the tree on the next rescan.
-  const [pendingFolders, setPendingFolders] = useState<Set<string>>(() => loadStringSet(LS_PENDING_FOLDERS));
+  const pendingFolders = usePendingFolders();
   const [renamingFolderPath, setRenamingFolderPath] = useState<string | null>(null);
   // Active type filter — when non-empty, only assets whose `type` is in the set
   // are shown (the chips bar). Empty = show everything.
-  const [typeFilter, setTypeFilter] = useState<Set<string>>(() => loadStringSet(LS_TYPE_FILTER));
+  const typeFilter = useTypeFilter();
   // Cut/copy clipboard + keyboard-nav helpers.
   const [clipboard, setClipboard] = useState<{ paths: string[]; op: 'copy' | 'cut' } | null>(null);
   const visiblePathsRef = useRef<string[]>([]);   // in-render-order asset paths
@@ -650,24 +640,12 @@ export default function Assets() {
     return firstFromEntries(assets) ?? '/';
   }, [assets, selected]);
 
-  // Persist view mode + expanded + pending folders across sessions.
-  useEffect(() => {
-    try { localStorage.setItem(LS_VIEW_MODE, viewMode); } catch { /* ignore */ }
-  }, [viewMode]);
-  useEffect(() => {
-    try { localStorage.setItem(LS_EXPANDED, JSON.stringify([...expanded])); } catch { /* ignore */ }
-  }, [expanded]);
-  useEffect(() => {
-    try { localStorage.setItem(LS_PENDING_FOLDERS, JSON.stringify([...pendingFolders])); } catch { /* ignore */ }
-  }, [pendingFolders]);
-  useEffect(() => {
-    try { localStorage.setItem(LS_TYPE_FILTER, JSON.stringify([...typeFilter])); } catch { /* ignore */ }
-  }, [typeFilter]);
   const selectAsset = useEditorStore((s) => s.selectAsset);
   const setSelectedAssets = useEditorStore((s) => s.setSelectedAssets);
   const selectedAsset = useEditorStore((s) => s.selectedAsset);
   const assetsVersion = useEditorStore((s) => s.assetsVersion);
   const setImportStatus = useEditorStore((s) => s.setImportStatus);
+  const openFindReferences = useEditorStore((s) => s.openFindReferences);
 
   // Publish a MULTI-asset selection to the store so the Inspector can render a
   // batch editor. Single/none selection is already handled by the selectAsset()
@@ -737,6 +715,22 @@ export default function Assets() {
   }, []);
 
   useEffect(() => { refresh(); }, [refresh, assetsVersion]);
+
+  /** What the toolbar's Refresh button runs — NOT `refresh` directly.
+   *
+   *  `refresh` re-scans and repopulates THIS panel only. `assetsVersion` is the
+   *  editor-wide "assets changed" signal, and other views subscribe to it — the
+   *  Script tree re-fetches on it, and it is the only trigger it has. So a Refresh
+   *  that called `refresh` left a script added or deleted on disk invisible until
+   *  something unrelated (an asset save, a full editor reload) happened to bump the
+   *  version: the one affordance a human reaches for did not fix the one thing they
+   *  reached for it about (QA-EDITOR-0009).
+   *
+   *  Bumping the version is enough for this panel too — the effect above is keyed on
+   *  it — so this is a bump, not a bump PLUS a direct call, which would scan twice. */
+  const refreshAll = useCallback(() => {
+    useEditorStore.getState().refreshAssets();
+  }, []);
 
   // Derive the re-importable type set from the server registry once on mount, so
   // the per-row "Re-import" menu + recursive re-import count track what the server
@@ -942,18 +936,22 @@ export default function Assets() {
       defaultFolder: folder ?? def.defaultFolder, prompt: def.prompt ?? def.label,
     });
     if (!path) return;
-    const guid = newGuid();
-    const name = assetDisplayName(path, def.ext);
+    // The `create`-OVERRIDE kinds (Scene) stay HERE and are not routed through
+    // `createRegisteredAsset`, which refuses them. That is not an inconsistency: the override
+    // discards the live world, and the dialog above is what makes a cancel safe — which is exactly
+    // the guard an explicit-path call would remove. See createRegisteredAsset.ts's header.
     if (def.create) {
       await def.create(path);
-    } else {
-      const body = def.body ? def.body(guid, name) : { id: guid };
-      const ok = await writeFile(path, JSON.stringify(body, null, 2));
-      if (!ok) { console.error(`[Assets] Failed to write ${path}`); return; }
-      registerAsset(guid, path, def.assetType as AssetType);
+      refresh();
+      def.onCreated?.({ path, name: assetDisplayName(path, def.ext), guid: newGuid() });
+      return;
     }
+    // Everything else shares ONE create path with the agent op (#288 gap 5), so a kind that works
+    // for the human cannot silently differ for a tool.
+    const r = await createRegisteredAsset(def.id, path);
+    if (!r.ok) { console.error(`[Assets] ${r.error}`); return; }
     refresh();
-    def.onCreated?.({ path, name, guid });
+    def.onCreated?.({ path: r.path, name: r.name, guid: r.guid });
   }, [refresh]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent, asset: AssetEntry) => {
@@ -1030,8 +1028,8 @@ export default function Assets() {
 
   // Build + push a single coalesced undo/redo for one or more completed
   // deletes (builder in assetUndo.ts — F6).
-  const pushDeleteUndo = useCallback((results: DeleteResult[]) => {
-    pushAction(makeDeleteUndo(results, refresh));
+  const pushDeleteUndo = useCallback((results: DeleteResult[], trashedMissing: string[] = []) => {
+    pushAction(makeDeleteUndo(results, refresh, trashedMissing));
   }, [refresh]);
 
   // Delete one or more assets in a SINGLE OS-trash call (one trash sound),
@@ -1045,18 +1043,22 @@ export default function Assets() {
     for (const a of targets) { const r = await collectDeletion(a); if (r) results.push(r); }
     if (results.length === 0) return;
     const allPaths = Array.from(new Set(results.flatMap((r) => r.deletePaths)));
-    const ok = await deleteAssets(allPaths);
-    if (!ok) { console.error('[Assets] Delete failed'); return; }
+    const del = await deleteAssets(allPaths);
+    if (!del.ok) { console.error('[Assets] Delete failed'); return; }
     const removed = new Set(results.map((r) => r.asset.path));
     setAssets((prev) => prev.filter((a) => !removed.has(a.path)));
     if (selected && removed.has(selected)) { setSelected(null); selectAsset(null); }
     // Same idea as the selection reset above, one layer deeper: an ASSET EDITOR bound to a
-    // deleted file would keep editing it and its debounced autosave would write the file
-    // back (#186). Checked against `allPaths`, not `removed`, so a generated file that a
-    // model delete drags along also unbinds.
+    // deleted file would keep editing it, and the write parked for that path would put the file
+    // back at the next Cmd+S (#186; the same hazard when the panels autosaved, now deferred to
+    // save time — which is also why this repairs the dirty-asset REGISTRY, not only the binding,
+    // see applyAssetPathMoves). Checked against `allPaths`, not `removed`, so a generated file
+    // that a model delete drags along also unbinds.
     logBindingChanges(unbindDeletedAssetEditors(allPaths));
-    console.log(`[Assets] Moved ${allPaths.length} file(s) to trash`);
-    pushDeleteUndo(results); // ONE undo entry for the whole gesture
+    console.log(`[Assets] Moved ${del.trashed} file(s) to trash`);
+    // `del.missing` is threaded into the undo so a later restore can tell a sidecar that was
+    // never on disk from a file it failed to bring back (#291).
+    pushDeleteUndo(results, del.missing); // ONE undo entry for the whole gesture
     if (rescan) refresh();   // ONE rescan, not one per file
   }, [collectDeletion, pushDeleteUndo, refresh, selected, selectAsset]);
 
@@ -1108,25 +1110,10 @@ export default function Assets() {
     logBindingChanges(applyAssetPathMoves([{ from: asset.path, to: toPath, name: safe }]));
     refresh();
 
-    pushAction({
-      label: `Rename ${asset.name}`,
-      // Each direction gates the remap on the move actually happening. Repointing a binding
-      // at a path the file is NOT at is the forking bug itself: /api/move-file 409s when the
-      // destination exists, so an undo after something else took the old name would
-      // otherwise aim the next autosave at a file that isn't there.
-      undo: async () => {
-        if (await moveFileTo(toPath, asset.path)) {
-          logBindingChanges(applyAssetPathMoves([{ from: toPath, to: asset.path, name: asset.name }]));
-        }
-        refresh();
-      },
-      redo: async () => {
-        if (await moveFileTo(asset.path, toPath)) {
-          logBindingChanges(applyAssetPathMoves([{ from: asset.path, to: toPath, name: safe }]));
-        }
-        refresh();
-      },
-    });
+    // Undo/redo builder in assetUndo.ts (#308) — each direction gates the remap on the move
+    // actually happening AND reports a failure (toast only on a 409 collision) instead of
+    // discarding it silently.
+    pushAction(makeRenameUndo({ originalPath: asset.path, originalName: asset.name, toPath, newName: safe, refresh }));
   }, [assets, selected, selectAsset, refresh]);
 
   const commitRename = useCallback((asset: AssetEntry, newBase: string) => {
@@ -1177,11 +1164,9 @@ export default function Assets() {
     if (results.length > 0) {
       pushDeleteUndo(results); // restoring the files recreates the folder
     } else {
-      pushAction({
-        label: `Delete folder ${folderName}`,
-        undo: async () => { await createFolderApi(folderPath); refresh(); },
-        redo: async () => { await deleteAsset(folderPath); refresh(); },
-      });
+      // Builder in assetUndo.ts (#308) — reports a failed recreate/re-delete instead of
+      // discarding it silently.
+      pushAction(makeEmptyFolderDeleteUndo({ folderPath, folderName, refresh }));
     }
   }, [assets, collectDeletion, pushDeleteUndo, clearSelection, refresh]);
 
@@ -1236,29 +1221,11 @@ export default function Assets() {
     // NEW file and leaves the original where it is, so nothing bound has moved.
     if (op === 'cut') logBindingChanges(applyAssetPathMoves(done.map(({ from, to }) => ({ from, to }))));
     refresh();
-    pushAction({
-      label: `${op === 'cut' ? 'Move' : 'Paste'} ${done.length} item(s)`,
-      // As in handleRename: only the moves that actually landed may repoint a binding.
-      undo: async () => {
-        const back: PathMove[] = [];
-        for (const { from, to } of done) {
-          if (op === 'cut') { if (await moveFileTo(to, from)) back.push({ from: to, to: from }); }
-          else { await deleteAsset(to); if (!isTextAsset(to)) await deleteAsset(to + '.meta.json'); }
-        }
-        if (op === 'cut') logBindingChanges(applyAssetPathMoves(back));
-        else logBindingChanges(unbindDeletedAssetEditors(done.map(({ to }) => to)));
-        refresh();
-      },
-      redo: async () => {
-        const fwd: PathMove[] = [];
-        for (const { from, to } of done) {
-          if (op === 'cut') { if (await moveFileTo(from, to)) fwd.push({ from, to }); }
-          else await duplicateAsset(from, to);
-        }
-        if (op === 'cut') logBindingChanges(applyAssetPathMoves(fwd));
-        refresh();
-      },
-    });
+    // Builder in assetUndo.ts (#308) — as in handleRename, only the moves that actually
+    // landed may repoint a binding, and every skipped item is now reported as one message
+    // (was silently dropped one at a time).
+    const doneMoves: PasteMove[] = done.map(({ from, to }) => ({ from, to }));
+    pushAction(makePasteUndo({ op, done: doneMoves, refresh }));
   }, [clipboard, selected, assets, refresh]);
 
   // ── New Folder + folder rename ──────────────────────────────────────
@@ -1285,19 +1252,9 @@ export default function Assets() {
     });
     setViewMode('folder');
     setRenamingFolderPath(path); // immediately editable, Finder-style
-    pushAction({
-      label: 'New Folder',
-      undo: async () => {
-        await deleteAsset(path);
-        setPendingFolders((p) => { const n2 = new Set(p); n2.delete(path); return n2; });
-        refresh();
-      },
-      redo: async () => {
-        await createFolderApi(path);
-        setPendingFolders((p) => new Set(p).add(path));
-        refresh();
-      },
-    });
+    // Builder in assetUndo.ts (#308) — setPendingFolders now only updates on success, and a
+    // failure is reported instead of discarded.
+    pushAction(makeNewFolderUndo({ path, refresh, setPendingFolders, setExpanded }));
   }, [assets, pendingFolders, diskFolders, refresh]);
 
   const commitFolderRename = useCallback(async (node: FolderNode, newName: string) => {
@@ -1320,21 +1277,12 @@ export default function Assets() {
     logBindingChanges(applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]));
     clearSelection();
     refresh();
-    pushAction({
-      label: `Rename folder ${node.name}`,
-      undo: async () => {
-        const ok2 = await moveFileTo(newPath, oldPath);
-        setPendingFolders((p) => remapPrefix(p, newPath, oldPath));
-        if (ok2) logBindingChanges(applyAssetPathMoves([{ from: newPath, to: oldPath, prefix: true }]));
-        refresh();
-      },
-      redo: async () => {
-        const ok2 = await moveFileTo(oldPath, newPath);
-        setPendingFolders((p) => remapPrefix(p, oldPath, newPath));
-        if (ok2) logBindingChanges(applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]));
-        refresh();
-      },
-    });
+    // Builder in assetUndo.ts (#308) — was the worst site: setPendingFolders ran
+    // UNCONDITIONALLY here, so a failed undo/redo desynced the client folder tree from disk
+    // (an active desync, not a no-op). Now gated on the move landing, `setExpanded` is
+    // remapped too (previously never remapped by undo/redo at all), and a failure is
+    // reported (toast only on a 409 collision).
+    pushAction(makeFolderRenameUndo({ oldPath, newPath, folderName: node.name, refresh, setPendingFolders, setExpanded }));
   }, [assets, pendingFolders, diskFolders, clearSelection, refresh]);
 
   // Smooth-scroll a path's row into view (after the tree commits).
@@ -1435,9 +1383,12 @@ export default function Assets() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: asset.path }),
     }) });
+    // Inspection, not a mutation — GUID when we have one (the route also accepts a
+    // virtual path, but a GUID is the stable address a moved/renamed file keeps).
+    if (!many) items.push({ label: 'Find References', onClick: () => openFindReferences(asset.guid || asset.path, asset.name) });
     items.push({ label: `Move to Trash${suffix}`, onClick: () => (many ? deleteSelection() : handleDelete(asset)), danger: true });
     return items;
-  }, [handleDelete, handleDuplicate, refresh, reimport, selection, clipboard, duplicateSelection, deleteSelection, copySelection, pasteClipboard]);
+  }, [handleDelete, handleDuplicate, refresh, reimport, selection, clipboard, duplicateSelection, deleteSelection, copySelection, pasteClipboard, openFindReferences]);
 
   // Drop handler: entity dragged from Hierarchy → create prefab
   const [dropHighlight, setDropHighlight] = useState<string | null>(null); // folder path being hovered
@@ -1484,17 +1435,11 @@ export default function Assets() {
       }
     }
     refresh();
-    pushAction({
-      label: imported.length > 1 ? `Import ${imported.length} files` : `Import "${imported[0].path.split('/').pop()}"`,
-      // Undoing an import DELETES the files, and you can have opened one in the meantime
-      // (import a .particle.json → double-click it → ⌘Z), so it unbinds like any delete.
-      undo: async () => {
-        for (const f of imported) await deleteAsset(f.path);
-        logBindingChanges(unbindDeletedAssetEditors(imported.map((f) => f.path)));
-        refresh();
-      },
-      redo: async () => { for (const f of imported) await writeFile(f.path, f.content, 'base64'); refresh(); },
-    });
+    // Builder in assetUndo.ts (#308) — every result in both loops used to be discarded,
+    // and undo unbound ALL N files regardless of which deletes actually landed; only the
+    // files that were really trashed are unbound now, and every failure in either
+    // direction is batch-reported as one message (like makePasteUndo/makeFilesDropUndo).
+    pushAction(makeFileImportUndo({ imported, refresh }));
   }, [assets, refresh, setImportStatus]);
 
   const handleDrop = useCallback(async (e: React.DragEvent, targetFolder?: string) => {
@@ -1537,38 +1482,28 @@ export default function Assets() {
   // bundled into a single undo entry.
   const handleFilesDrop = useCallback(async (filePaths: string[], targetFolder: string) => {
     const normalizedTarget = targetFolder === '/' ? '' : targetFolder;
-    const moves: { from: string; to: string; originalFolder: string }[] = [];
+    const moves: DropMove[] = [];
     for (const filePath of filePaths) {
       const originalFolder = filePath.substring(0, filePath.lastIndexOf('/')) || '/';
       if (targetFolder === originalFolder || targetFolder === filePath || targetFolder.startsWith(filePath + '/')) continue;
       const ok = await moveFile(filePath, targetFolder);
       if (!ok) { console.warn(`[Assets] Could not move ${filePath} → ${targetFolder}`); continue; }
       const fileName = filePath.substring(filePath.lastIndexOf('/') + 1);
-      moves.push({ from: filePath, to: `${normalizedTarget}/${fileName}`, originalFolder });
+      moves.push({ from: filePath, to: `${normalizedTarget}/${fileName}` });
     }
     if (moves.length === 0) return;
     console.log(`[Assets] Moved ${moves.length} item(s) → ${targetFolder}`);
     // Drag-drop into a folder is a MOVE like any other, so a bound editor must follow it
     // (#186). This site uses `moveFile` (folder-target) rather than `moveFileTo`
     // (explicit-path) — which is exactly why the first sweep for this bug missed it.
-    logBindingChanges(applyAssetPathMoves(moves.map(({ from, to }) => ({ from, to }))));
+    logBindingChanges(applyAssetPathMoves(moves));
     refresh();
 
-    pushAction({
-      label: moves.length > 1 ? `Move ${moves.length} items` : `Move "${moves[0].from.split('/').pop()}"`,
-      undo: async () => {
-        const back: PathMove[] = [];
-        for (const m of moves) if (await moveFile(m.to, m.originalFolder)) back.push({ from: m.to, to: m.from });
-        logBindingChanges(applyAssetPathMoves(back));
-        refresh();
-      },
-      redo: async () => {
-        const fwd: PathMove[] = [];
-        for (const m of moves) if (await moveFile(m.from, targetFolder)) fwd.push({ from: m.from, to: m.to });
-        logBindingChanges(applyAssetPathMoves(fwd));
-        refresh();
-      },
-    });
+    // Builder in assetUndo.ts (#308) — same skip-every-item shape as pasteClipboard's cut
+    // branch, now reported as one message instead of dropped per-item. Explicit full paths
+    // (from/to) are already known, so the builder calls moveFileToStatus directly rather than
+    // re-deriving a destination from a folder.
+    pushAction(makeFilesDropUndo({ moves, refresh }));
   }, [refresh]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -1677,7 +1612,8 @@ export default function Assets() {
             types={availableTypes}
             selected={typeFilter}
             onToggle={toggleTypeFilter}
-            onClear={() => setTypeFilter(new Set())}
+            onClear={() => setTypeFilter(() => new Set())}
+            uiId="assets.toolbar.typeFilter"
           />
         )}
         <div style={toolbarDividerStyle} />
@@ -1709,7 +1645,7 @@ export default function Assets() {
         <div style={toolbarDividerStyle} />
         {/* — Scan / convert: Refresh, Re-import all (heavy → last) — */}
         <button
-          onClick={refresh}
+          onClick={refreshAll}
           disabled={loading}
           title="Scan public/ folder"
           data-ui-id="assets.toolbar.refresh" data-ui-kind="button" data-ui-label="refresh"
@@ -1867,7 +1803,7 @@ export default function Assets() {
         </span>
         {typeFilter.size > 0 && (
           <span
-            onClick={() => setTypeFilter(new Set())}
+            onClick={() => setTypeFilter(() => new Set())}
             title="A type filter is active, hiding non-matching assets — click to clear"
             data-ui-id="assets.toolbar.typeFilterBanner" data-ui-kind="button" data-ui-label="clear type filter"
             style={{ color: '#5a8ec5', cursor: 'pointer', textDecoration: 'underline' }}

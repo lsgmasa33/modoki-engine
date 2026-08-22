@@ -19,8 +19,8 @@
  *  SkinnedModel, no manifest entry yet) resident until full teardown. */
 
 import * as THREE from 'three';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
+import type { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { makeGltfLoader } from './threeLoaderModules';
 import { isInternalAssetPath, getAssetEntry } from './assetManifest';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
 import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
@@ -28,6 +28,7 @@ import { lodUrlSuffix } from './modelSettings';
 import { getKTX2Loader, ensureKtx2Caps } from './textureResolver';
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
 import { takeParsedGltf, disposePendingGltf } from './parsedGltfHandoff';
+import { notifyModelTemplatesLoaded } from './modelLoadNotify';
 
 export interface RiggedModel {
   /** The parsed GLB scene graph — bones, SkinnedMeshes, materials. Cloned per
@@ -57,11 +58,24 @@ let generation = 0;
 // Constructed lazily on first load (not at module scope) so importing this
 // module is side-effect-free — matches meshTemplateCache, and keeps callers that
 // never load a rigged GLB (and test mocks without setMeshoptDecoder) working.
-let _gltfLoader: GLTFLoader | undefined;
-function getLoader(): GLTFLoader {
-  if (!_gltfLoader) {
-    _gltfLoader = new GLTFLoader();
-    _gltfLoader.setMeshoptDecoder(MeshoptDecoder);
+let _gltfLoader: Promise<GLTFLoader> | undefined;
+/** ⚠️ Memoises the PROMISE, not the loader. Since #254 both halves of the setup are async
+ *  (three's loader/meshopt modules, then the shared KTX2Loader), which opens a window a
+ *  synchronous `getLoader()` never had: with the LOADER memoised, a second caller arriving
+ *  after the assignment but before `setKTX2Loader` sees a truthy field and gets the loader
+ *  back UNCONFIGURED — and an optimized `.processed.glb` then throws "setKTX2Loader must be
+ *  called before loading KTX2 textures". Memoising the promise closes it: every caller awaits
+ *  the same fully-configured result, and there is still exactly one loader and one import.
+ *
+ *  ⚠️ On REACHABILITY, because the first write-up of this overstated it: the only caller is
+ *  `ensureKtx2Caps().then(getLoader)`, and in a render3d build every way caps become ready runs
+ *  `await getKTX2Loader()` first (`setActiveRendererHandle`, or the probe). So by the time
+ *  `getLoader` runs the KTX2 module is already imported and the exposed window is one microtask,
+ *  not a chunk fetch — a second acquire has to be scheduled precisely inside it. Latent, not
+ *  "the normal case". Kept because the shape is wrong regardless and the fix is free. */
+function getLoader(): Promise<GLTFLoader> {
+  return (_gltfLoader ??= (async () => {
+    const loader = await makeGltfLoader();
     // Rigged GLBs are optimized at import time (/api/optimize-rigged): their
     // embedded textures become KTX2 and geometry/animation become meshopt. The
     // shared KTX2Loader singleton already has its transcoder path + GPU-format
@@ -70,12 +84,12 @@ function getLoader(): GLTFLoader {
     // (un-optimized / no toktx) still load — KTX2Loader is only consulted when
     // the GLB actually carries a KHR_texture_basisu image.
     try {
-      _gltfLoader.setKTX2Loader(getKTX2Loader());
+      loader.setKTX2Loader(await getKTX2Loader());
     } catch (e) {
       console.warn('[RiggedCache] KTX2Loader unavailable — KTX2 textures in rigged GLBs will fail to decode:', e);
     }
-  }
-  return _gltfLoader;
+    return loader;
+  })().catch((e) => { _gltfLoader = undefined; throw e; }));
 }
 
 const unknownGuidSeen = new Set<string>();
@@ -196,6 +210,11 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
       // / owners lookups resolve regardless of which candidate actually loaded.
       cache.set(path, model);
       console.log(`[RiggedCache] Loaded ${loadedFrom} — ${model.animations.length} clip(s): ${model.animations.map((c) => c.name).join(', ')}`);
+      // Same render-on-demand edge the static mesh cache fires: a re-imported SKINNED GLB is
+      // evicted from the scene by attachInvalidationListener and rebuilt only on a frame that
+      // runs, and this parse is the slow half. Without this the rig is the one thing
+      // QA-ASSET-0008's fix would still have left missing. See modelLoadNotify.ts.
+      notifyModelTemplatesLoaded(path);
       resolve();
     };
 
@@ -204,7 +223,7 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
     const handoff = takeParsedGltf(path);
     if (handoff) { finishLoad({ scene: handoff.scene, animations: handoff.animations }, `${path} (import handoff)`); return; }
 
-    const tryLoad = (i: number) => getLoader().load(
+    const tryLoad = (loader: GLTFLoader, i: number) => loader.load(
       // modelGlbUrl appends the model's content hash as ?v=<hash> in PROD builds
       // (mirrors the static modelGlbUrl path) so a re-import busts immutable
       // CDN/browser caches. Both candidates (the `.processed.glb` variant and
@@ -215,7 +234,7 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
       (err) => {
         if (i + 1 < candidates.length) {
           console.warn(`[RiggedCache] ${candidates[i]} failed; falling back to raw ${candidates[i + 1]}`);
-          tryLoad(i + 1);
+          tryLoad(loader, i + 1);
         } else {
           console.error(`[RiggedCache] Failed to load ${path}:`, err);
           resolve(); // resolve anyway — the render sync just skips an unloaded model
@@ -232,7 +251,13 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
     // live" — `ensureKtx2Caps` resolves via a real viewport when one exists, or a
     // throwaway probe when none does (scene load no longer waits for a viewport
     // to exist; see docs/textures.md, "Runtime resolution").
-    void ensureKtx2Caps().then(() => tryLoad(0));
+    void ensureKtx2Caps().then(getLoader).then(
+      (loader) => tryLoad(loader, 0),
+      (err) => {
+        console.error(`[RiggedCache] GLTF loader unavailable for ${path}:`, err);
+        resolve(); // resolve anyway — the render sync just skips an unloaded model
+      },
+    );
   }).finally(() => {
     loadPromises.delete(path);
   });

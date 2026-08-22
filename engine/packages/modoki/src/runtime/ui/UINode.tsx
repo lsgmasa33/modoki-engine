@@ -20,10 +20,16 @@ const UIVideoMount = __MODOKI_MODULE_VIDEO__
   : null;
 import { resolveDomImageUrl, resolveSprite } from '../core/textureRefs';
 import { isGuid } from '../core/assetRefRules';
-import { applyAnchorStyle } from './anchorCss';
+import { onWorldSwap } from '../core/ecs/world';
+import { applyAnchorStyle, applyRotationStyle } from './anchorCss';
 import { NineSliceImage } from './NineSliceImage';
 import { uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
 import { useFocusStore } from './focusManager';
+import { isTouchDevice } from '../core/formFactor';
+import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
+import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo } from './scrollViewDom';
+import { scrollByEntry } from './scrollApi';
+import { driveEntriesFromScroll } from './entriesSystem';
 
 /** The CSS-animated text span, isolated in React.memo. The game UI re-renders every
  *  frame (fps is in its store selector); re-creating the span each frame RESTARTS its
@@ -31,8 +37,8 @@ import { useFocusStore } from './focusManager';
  *  (all value-stable frame-to-frame) makes React bail out, leaving the span's DOM
  *  untouched so the browser-driven animation runs uninterrupted. */
 const AnimatedText = React.memo(function AnimatedText(
-  { text, animation, ampPx, extra, perCharStagger, perCharLoop, perCharFade }:
-  { text: string; animation: string; ampPx: number; extra?: Record<string, string>;
+  { text, animation, amp, extra, perCharStagger, perCharLoop, perCharFade }:
+  { text: string; animation: string; amp: number; extra?: Record<string, string>;
     perCharStagger?: number; perCharLoop?: boolean; perCharFade?: boolean },
 ) {
   // Typewriter: split into one span per glyph and stagger each by `perCharStagger`, so
@@ -64,7 +70,12 @@ const AnimatedText = React.memo(function AnimatedText(
     );
   }
   const style: React.CSSProperties = { display: 'inline-block', animation, willChange: 'transform', ...(extra as React.CSSProperties) };
-  if (ampPx) (style as Record<string, string>)['--ui-amp'] = `${ampPx}px`;
+  // ⚠️ **em, not px** (#245). The amplitude is a MULTIPLE of the font size — `uiTextAnimation`'s
+  // own doc calls it "em" — and it used to be resolved to px by multiplying the authored
+  // `fontSize` NUMBER. That silently breaks the moment `fontSizeUnit` is not px, because the
+  // number is then vmin, not pixels. `em` resolves against the element's own COMPUTED font size,
+  // so it is correct for every unit and needs no resolution step at all.
+  if (amp) (style as Record<string, string>)['--ui-amp'] = `${amp}em`;
   return <span style={style}>{text}</span>;
 });
 
@@ -82,6 +93,24 @@ export function cssVal(value: number, unit: string): string | number | undefined
     case 'vmax': return `calc(${value} * var(--ui-vmax, 1vmax))`;
     default:     return value; // px
   }
+}
+
+/** Warn ONCE per entity that a UIToggle can never move: it carries no binding on an
+ *  event the switch fires. A toggle does not write its own `value`, so an unbound one
+ *  renders perfectly and is inert — the silent-authoring-failure class that has cost
+ *  this repo real time. Warn, never throw: an authoring mistake must not blank the
+ *  screen mid-render. */
+const _deadToggles = new Set<string>();
+// ⚠️ Cleared on world swap, because the fallback key is an ENTITY ID and runtime ids are reassigned
+// on every scene reload — so a stale entry could swallow a DIFFERENT dead toggle's warning after a
+// reload, which is the one moment an author is most likely to be looking for it. (A guid-bearing
+// entity is unaffected; guid-less ones are the runtime-spawned case.)
+onWorldSwap(() => _deadToggles.clear());
+
+function warnDeadToggle(key: string): void {
+  if (_deadToggles.has(key)) return;
+  _deadToggles.add(key);
+  console.warn(`[UIToggle] ${key} has no 'change' binding, so tapping it does nothing. A toggle does not write its own value — add a UIAction binding on event 'change' that sets UIToggle.value to '$value'. NOTE a 'click' binding will NOT work here (the Inspector defaults to 'click'): the switch dispatches 'change', and applyBindings skips rows whose event differs.`);
 }
 
 export function hexToRgba(hex: number, opacity: number): string {
@@ -116,6 +145,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // selector subscribes THIS node to the focus store, so only the entering/leaving
   // node re-renders when focus moves. Hook runs before any early return (React rule).
   const isFocused = useFocusStore((s) => !onSelectEntity && s.focusedGuid !== '' && s.focusedGuid === node.guid);
+
+  // Scroll view (UIScrollView). Like the focus hook above, this must run before ANY early
+  // return — the hook itself no-ops when `node.scroll` is absent, which is the vast majority
+  // of nodes. It writes scroll position back into ECS WITHOUT dirtying the UI tree.
+  const scrollRef = React.useRef<HTMLDivElement | null>(null);
+  useScrollView(node, scrollRef);
 
   // isVisible is authored (or flipped by a button's UIAction `kind:'set'` binding). A
   // state-driven visibility binding (UIBinding.visibleBinding) can additionally hide the element
@@ -223,10 +258,21 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     }
   }
 
+  // ── Font family — emitted whether or not THIS node has text ──
+  // `font-family` inherits, so authoring it on a container is how a whole UI tree gets one
+  // typeface from one field. It used to live inside the `if (text)` block below, which made
+  // that impossible: a container's authored family was silently dropped, and the only way to
+  // restyle a scene was to repeat the family on every text node — 41 of them in Court, i.e. 41
+  // copies of one decision, which is the drift this repo's palette work exists to end. The
+  // field is on every UIElement and the Inspector shows it everywhere, so honouring it only on
+  // leaves was an authoring surface that lied.
+  if (node.fontFamily) style.fontFamily = node.fontFamily;
+
   // ── Text styling (only when text content exists) ──
   if (text) {
-    if (node.fontFamily) style.fontFamily = node.fontFamily;
-    style.fontSize = node.fontSize;
+    // `cssVal` so a non-px `fontSizeUnit` resolves through the same `--ui-*` custom properties
+    // every other length uses (#245). Default 'px' returns the bare number, i.e. unchanged.
+    style.fontSize = cssVal(node.fontSize, node.fontSizeUnit);
     style.fontWeight = node.fontWeight as any;
     if (node.fontStyle !== 'normal') style.fontStyle = node.fontStyle;
     style.color = hexToRgba(node.textColor, node.textOpacity ?? 1);
@@ -235,7 +281,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     // unitless, which CSS reads as a font-size MULTIPLIER (e.g. 20 → 20×14px =
     // 280px/line). Emit explicit px so the authored value means pixels.
     if (node.lineHeight) style.lineHeight = `${node.lineHeight}px`;
-    if (node.letterSpacing) style.letterSpacing = node.letterSpacing;
+    if (node.letterSpacing) style.letterSpacing = cssVal(node.letterSpacing, node.letterSpacingUnit);
     if (node.textShadowBlur || node.textShadowOffsetX || node.textShadowOffsetY) {
       style.textShadow = `${node.textShadowOffsetX}px ${node.textShadowOffsetY}px ${node.textShadowBlur}px ${hexToRgba(node.textShadowColor, node.textShadowOpacity ?? 1)}`;
     }
@@ -268,6 +314,64 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   if (node.anchor) {
     applyAnchorStyle(style, node.anchor);
   }
+
+  // ── Rotation (#234) ──
+  // AFTER the anchor, because it composes onto the anchor's pivot translate rather than replacing
+  // it. Applies to anchored and flow-laid-out elements alike; the pivot rules live in anchorCss.
+  applyRotationStyle(style, node.rotation, node.anchor);
+
+  // Scroll-view CSS (snap + overscroll). Deliberately does NOT set `overflow` — that stays
+  // `UIElement.overflow`, which the author already knows, so one visible consequence keeps one
+  // owner. A UIScrollView on an element left at `overflow:'visible'` therefore does not scroll,
+  // which is the honest outcome rather than two fields silently fighting.
+  if (node.scroll) Object.assign(style, scrollViewStyle(node.scroll));
+  // The snap TARGET half, stamped by the enclosing scroll view during the tree build — snapping
+  // is declared on the box and honoured on the target, and those are different elements.
+  if (node.snapChild) Object.assign(style, node.snapChild);
+
+  // ── TouchControl (on-screen d-pad / button, #297) ──
+  //
+  // Mounting is decided by the HOST, not by what was last pressed: the control has to be there
+  // BEFORE the player's first touch, or it is the thing preventing them from producing one.
+  //
+  // ⚠️ In the editor's authoring preview (`onSelectEntity`) a control is ALWAYS mounted, whatever
+  // `showOn` says. The editor is a desktop host, so honouring `showOn:'touch'` there would leave
+  // a d-pad invisible in the very viewport you position it in — un-clickable in the Hierarchy's
+  // click-to-select, un-draggable, un-authorable. `showOn:'never'` still hides it, because that
+  // is an author saying "off", not a host saying "not applicable".
+  const touch = node.touch;
+  if (touch && (touch.showOn === 'never'
+    || (!onSelectEntity && touch.showOn === 'touch' && !isTouchDevice()))) return null;
+
+  // A touch control must RECEIVE the press (its parent HUD panel is usually
+  // `pointer-events:none`), and must not let the browser turn a thumb-hold into a scroll, a
+  // pinch, a text selection or a tap highlight. Done in CSS rather than with `preventDefault`
+  // in the source: passive listeners stay passive, and the suppression is scoped to the
+  // element instead of to the window.
+  //
+  // ⚠️ Only a plain `div` can BE a control. `touchAttrs` is spread into the two `<div>` returns
+  // at the bottom of this function; the `input`/`range`/`UIToggle` branches return earlier and
+  // do not carry it. So the attribute — the only thing `input/touchControlSource.ts` resolves
+  // controls by — would be missing while the touch STYLES below were still applied, leaving an
+  // element that suppresses scrolling and tap highlights and drives nothing. That is the
+  // partially-wired authoring surface CLAUDE.md warns about, and it is the fourth instance of
+  // the same class in this file (see the canvas2D / UIToggle / VideoPlayer warns above). Both
+  // halves are gated on `touchWired` so the element is coherently NOT a control, and DEV says so.
+  const touchWired = !!touch && node.elementType === 'div' && !node.toggle;
+  if (import.meta.env?.DEV && touch && !touchWired) {
+    const why = node.toggle ? 'a UIToggle draws its own switch' : `elementType '${node.elementType}' is not a div`;
+    console.warn(
+      `[UINode] entity ${node.entityId}: TouchControl ('${touch.action}') will NOT drive input here — ${why}, so the control attribute is never stamped. Put the TouchControl on a plain div entity.`,
+    );
+  }
+  const touchAttrs: Record<string, string> = {};
+  // Never stamped in the editor preview: the source refuses a control outside a runtime UI root
+  // anyway, so this is the second of two independent guards, not the only one.
+  if (touchWired && !onSelectEntity) {
+    touchAttrs[TOUCH_ATTR] = touch!.action;
+    touchAttrs[TOUCH_OPACITY_ATTR] = String(touch!.pressedOpacity);
+  }
+
 
   // ── Click handler ──
   // A button is interactive if it dispatches an action OR applies declarative
@@ -327,6 +431,23 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     style.cursor = undefined;
   }
 
+  // ⚠️ AFTER every rule above, including `pointerThrough`, and that ordering is the point. A
+  // d-pad arrow is a LEAF, so the leaf default two blocks up would have set `pointer-events:
+  // none` and the pad would have been inert while looking perfect — the exact failure class the
+  // pointer-blocker passthrough bug was. `TouchControl` is the strongest statement of intent
+  // available ("this element IS a control"), so it outranks the inferred defaults and an
+  // author's `pointerThrough` alike.
+  if (touchWired) {
+    style.pointerEvents = 'auto';
+    // Stop the browser turning a thumb-hold into a scroll, a pinch, a text selection or a tap
+    // highlight. In CSS rather than `preventDefault` in the source: the listeners stay passive,
+    // and the suppression is scoped to the element instead of to the window.
+    style.touchAction = 'none';
+    style.userSelect = 'none';
+    (style as unknown as Record<string, string>).WebkitUserSelect = 'none';
+    (style as unknown as Record<string, string>).WebkitTapHighlightColor = 'transparent';
+  }
+
   // Editor 2D-only layer: strip UI visuals but keep layout, so nested Canvas2D
   // canvases still mount and position while the UI layer is hidden. The canvas
   // itself renders regardless (its own pointerEvents stay 'auto').
@@ -370,6 +491,17 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       `[UINode] entity ${node.entityId}: elementType '${node.elementType}' takes precedence over its Canvas2D — the 2D canvas will NOT mount. Put the Canvas2D on its own child entity.`,
     );
   }
+  // ⚠️ Same class, second door. `UIToggle` returns its own subtree BEFORE the Canvas2D block and
+  // before the children walk, and it does it WITHOUT touching `elementType` — so the check above
+  // (which keys off `elementType !== 'div'`) is blind to it and both cases were silent. A toggle
+  // draws exactly a track and a knob; anything else authored on that entity is dropped.
+  if (import.meta.env?.DEV && node.toggle && (node.canvas2D || node.children.length > 0)) {
+    const dropped = [node.canvas2D && 'its Canvas2D', node.children.length > 0 && `${node.children.length} child entity/entities`]
+      .filter(Boolean).join(' and ');
+    console.warn(
+      `[UINode] entity ${node.entityId}: UIToggle draws only a track and a knob, so ${dropped} will NOT render. Move that content to a sibling entity.`,
+    );
+  }
 
   // Same class, same silence: `videoLayer` is injected into the returns that render a
   // <div>, and an <input>/<range> is a VOID element that cannot carry it. So a
@@ -390,7 +522,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       : '';
     // Apply text styles to the input element
     if (node.fontFamily) style.fontFamily = node.fontFamily;
-    style.fontSize = node.fontSize;
+    style.fontSize = cssVal(node.fontSize, node.fontSizeUnit);
     style.fontWeight = node.fontWeight as any;
     style.color = hexToRgba(node.textColor, node.textOpacity ?? 1);
     if (onSelectEntity) {
@@ -480,6 +612,99 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     );
   }
 
+  // Toggle: an on/off switch — a track with a knob that sits at one end or the other.
+  // The FIRST control in the engine that draws more than one DOM node from one entity
+  // (the `input`/`range` branches above delegate to a native element), so a couple of
+  // things are deliberate rather than incidental:
+  //
+  //  • The ROOT element is the TRACK, carrying the standard `style` object built above.
+  //    That is what makes the focus ring, anchoring, visibility and the pointer-events
+  //    rules apply to a toggle for free. Wrapping it in a bespoke element instead would
+  //    have re-implemented all four, badly.
+  //  • The knob is laid out by FLEX, not by measuring anything. `justifyContent` flips
+  //    between the two ends and the knob is a square sized off the track's own height
+  //    (`aspectRatio`), so the switch works at any authored size with no JS measurement
+  //    and no second render pass.
+  //  • ⚠️ The toggle OWNS its inner layout, so `UIElement`'s flex + padding fields are
+  //    overridden here and have no effect on a UIToggle entity. Everything else on
+  //    UIElement (size, border, opacity, anchoring) still applies normally.
+  //
+  // It does NOT write `value` itself — see the UIToggle trait header for why (a self-write
+  // would mutate the scene from a Stopped editor, which `applyBindings` exists to prevent).
+  if (node.toggle) {
+    const t = node.toggle;
+    const inset = Math.max(0, t.knobInset);
+    // ⚠️ `'change'` ONLY, and the narrowness is the whole point. `fire()` dispatches `'change'`,
+    // and `applyBindings` skips every row whose own `event` differs — so a toggle carrying only a
+    // `'click'` binding can never move. This test used to accept `'click'` too, which made the
+    // control interactive AND silent: worse than having no binding at all, because the dead-toggle
+    // warning below was suppressed by the very binding that could not work.
+    //
+    // It is also the LIKELIEST authoring mistake, not a hypothetical: the Inspector's "add binding"
+    // button defaults to `event: 'click'` (`UIActionBindingsField.tsx`), so an author who adds a
+    // binding and does not change the dropdown lands exactly here — and now gets told.
+    const canFire = !!node.action?.bindings?.some(b => (b.event || 'click') === 'change');
+    if (import.meta.env?.DEV && !onSelectEntity && !canFire) warnDeadToggle(node.guid || String(node.entityId));
+
+    const fire = () => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: !t.value });
+    const interactive = canFire && !t.disabled && !onSelectEntity;
+
+    const trackStyle: React.CSSProperties = {
+      ...style,
+      display: 'flex',
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: t.value ? 'flex-end' : 'flex-start',
+      padding: inset,
+      boxSizing: 'border-box',
+      backgroundColor: hexToRgba(t.value ? t.trackOnColor : t.trackOffColor, t.trackOpacity),
+      borderRadius: t.trackRadius,
+      // Multiplied, not assigned: a toggle inside a fading panel must keep fading with it.
+      opacity: (style.opacity as number ?? 1) * (t.disabled ? 0.5 : 1),
+    };
+    // Editor mode wins over `pointerThrough`/interactivity alike, exactly as the branches
+    // above do: an authored element must stay pickable in the viewport.
+    if (onSelectEntity) { trackStyle.pointerEvents = 'auto'; trackStyle.cursor = 'pointer'; }
+    else if (interactive && !node.pointerThrough) { trackStyle.pointerEvents = 'auto'; trackStyle.cursor = 'pointer'; }
+    else if (!node.pointerThrough) { trackStyle.pointerEvents = 'auto'; trackStyle.cursor = 'default'; }
+
+    const knobStyle: React.CSSProperties = {
+      height: '100%',
+      aspectRatio: '1 / 1',
+      flexShrink: 0,
+      backgroundColor: hexToRgba(t.knobColor, t.knobOpacity),
+      borderRadius: t.knobRadius,
+    };
+
+    return (
+      <div
+        style={trackStyle}
+        role="switch"
+        aria-checked={t.value}
+        aria-disabled={t.disabled || undefined}
+        // Native focus + Space/Enter, so a toggle is keyboard-operable wherever it is
+        // rendered. NOTE this is the DOM's own focus, not `UIFocusable`'s controller
+        // navigation — routing a toggle through that is a follow-up, because the focus
+        // manager activates by firing 'click' bindings with no event value, and a switch
+        // has to carry the NEW value with it. Deliberately not half-wired.
+        tabIndex={interactive ? 0 : -1}
+        onClick={onSelectEntity
+          ? (e: React.MouseEvent) => { e.stopPropagation(); onSelectEntity(node.entityId); }
+          : interactive
+            ? (e: React.MouseEvent) => { e.stopPropagation(); fire(); }
+            : undefined}
+        onKeyDown={interactive
+          ? (e: React.KeyboardEvent) => {
+            if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); fire(); }
+          }
+          : undefined}
+        data-entity-id={node.entityId}
+      >
+        <div style={knobStyle} />
+      </div>
+    );
+  }
+
   // Canvas2D: mount the 2D canvas inline among the UI children so it stacks by
   // hierarchy (DOM order). Runtime → pooled PixiJS canvas (Canvas2DMount). Editor
   // → injected editor canvas via renderCanvas2D (null when 2D layer is toggled off).
@@ -493,7 +718,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // does NOT pass it — the editor viewport sizes itself / uses device presets.
       : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode /></Suspense> : null);
     return (
-      <div style={style} onClick={handleClick} data-entity-id={node.entityId}>
+      <div ref={scrollRef} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
         {nineSliceLayer}
         {videoLayer}
         {canvas2DContent}
@@ -511,16 +736,16 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // geometry paths), and its presence/absence drives the re-render on Play/Stop.
   let textContent: React.ReactNode = text;
   if (text && node.textAnim) {
-    const a = uiTextAnimation(node.textAnim, node.fontSize || 16);
+    const a = uiTextAnimation(node.textAnim);
     if (a) {
       ensureUITextAnimStyles();
-      textContent = <AnimatedText text={text} animation={a.animation} ampPx={a.ampPx} extra={a.style}
+      textContent = <AnimatedText text={text} animation={a.animation} amp={a.amp} extra={a.style}
         perCharStagger={a.perChar?.staggerSec} perCharLoop={a.perChar?.loop} perCharFade={a.perChar?.fadeIn} />;
     }
   }
 
   return (
-    <div style={style} onClick={handleClick} data-entity-id={node.entityId}>
+    <div ref={scrollRef} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
       {nineSliceLayer}
       {videoLayer}
       {textContent}
@@ -529,6 +754,140 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       ))}
     </div>
   );
+}
+
+
+/** How long the wheel must be QUIET before a new `wheel: 'entry'` gesture may move again. Long
+ *  enough to swallow a trackpad's continuous stream, short enough that a deliberate second flick
+ *  is not refused. */
+const WHEEL_GESTURE_GAP_MS = 140;
+
+/** Wire a `UIScrollView` element to the DOM: read scroll position back into ECS on every scroll
+ *  event, measure the viewport/content, and consume any pending `scrollTo*` request.
+ *
+ *  ⚠️ **None of these writes marks the UI tree dirty.** See `scrollViewDom.writeScrollState` —
+ *  a scroll frame that does not move the entry window must cost a field write and nothing more.
+ *  The consumer that DOES need to react (`UIEntries`) is a system reading the trait, not this. */
+function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | null>) {
+  const scroll = node.scroll;
+  const guid = node.guid;
+  // ⚠️ **Snapping and recycling used to fight each other here, and the fix is NOT in this file.**
+  //
+  // The offset is carried as PADDING on the pooled content, so a pool re-drive rewrites it while
+  // the view is mid-scroll. When the window was built from the scroll the system could still
+  // OBSERVE, that padding described where the view WAS while the DOM was moving to where it had
+  // been ASKED to go — and `scroll-snap-type: mandatory` answered the mismatch by re-snapping to
+  // the previously-snapped element, which recycling had just repointed at different data. That
+  // moved the scroll, which re-drove the pool, which rewrote the padding: a closed loop that both
+  // landed on the wrong page and cost ~3x the frame time at rest.
+  //
+  // Suspending snap from here while the view moved was tried, shipped briefly, and REMOVED. It
+  // worked, and the owner immediately felt what it cost: with snap off during momentum the browser
+  // cannot decelerate INTO a snap point, so the view coasted to a full stop mid-page and then
+  // jerked into line — *"the scroll stops completely once, then it snaps"*, and past the halfway
+  // mark that jerk read as an extra page. Fixing the window at its source
+  // (`entriesSystem`: a converted request builds the frame's window from the TARGET) removes the
+  // mismatch entirely, so snap never has anything to correct and can stay on throughout. Verified
+  // with snap mandatory the whole time: swipe +1, +1, fling +3, swipe -2 all land exactly, a
+  // programmatic jump to entry 19 lands on 19, and frame time is p50 13ms at page 3 AND at page 21.
+  //
+  // So: do not reintroduce a snap suspension here. If a snap/recycle symptom reappears, the window
+  // is being built from the wrong offset — fix that.
+
+  // ── wheel: 'entry' — one wheel GESTURE moves exactly one entry ──────────────────────────────
+  //
+  // ⚠️ **A delta multiplier cannot do this job.** Under `snap: mandatory` the browser quantises
+  // any offset to a whole entry, so scaling the delta changes nothing that reaches the screen.
+  // What needs bounding is how many entries ONE gesture may cross — and it does need bounding: a
+  // single wheel notch (~100-120px against a 218px page) is under half an entry and snaps back to
+  // where it started, while a trackpad swipe emits a rapid stream of events whose deltas
+  // accumulate into hundreds of pixels before the browser resolves them, so one flick crossed
+  // several pages. Owner on Court's level selector, 2026-08-22: *"with the mouse wheel, scroll is
+  // too sensitive."*
+  //
+  // A gesture ends when the wheel has been QUIET for `WHEEL_GESTURE_GAP_MS`, not after a fixed
+  // cooldown from the first event: a trackpad's stream is continuous, so a cooldown would let a
+  // long swipe fire repeatedly and reintroduce exactly the runaway being fixed. Discrete mouse
+  // notches spaced further apart than the gap each move one entry, which is what a mouse user
+  // expects.
+  //
+  // Touch is untouched — a swipe is not a wheel event.
+  const wheelBusy = React.useRef(false);
+  const wheelTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  React.useEffect(() => () => { if (wheelTimer.current) clearTimeout(wheelTimer.current); }, []);
+
+  const wheelMode = scroll?.wheel;
+  const axis = scroll?.axis;
+  React.useEffect(() => {
+    const el = ref.current;
+    if (!el || !guid || wheelMode !== 'entry') return;
+    const onWheel = (e: WheelEvent) => {
+      // ⚠️ **Only swallow the wheel when this box can actually scroll on its axis.** Non-passive
+      // so it CAN preventDefault — without that the browser also applies the raw delta and fights
+      // the request below — but doing it unconditionally is the classic wheel trap: a view with
+      // nothing to scroll (content fits, or it is nested inside another scroller) would capture
+      // every wheel event over it and drop it, so the ancestor scrollable never moves while the
+      // pointer is there. Input captured and discarded is worse than input not handled.
+      const canScroll = axis === 'y'
+        ? el.scrollHeight > el.clientHeight
+        : el.scrollWidth > el.clientWidth;
+      if (!canScroll) return;
+      e.preventDefault();
+      if (wheelTimer.current) clearTimeout(wheelTimer.current);
+      wheelTimer.current = setTimeout(() => { wheelBusy.current = false; }, WHEEL_GESTURE_GAP_MS);
+      if (wheelBusy.current) return;          // still inside one gesture — already moved for it
+      // A horizontal pager is usually driven by a VERTICAL wheel (a plain mouse has no X axis),
+      // so take whichever delta is larger and let the view's own axis decide where it applies.
+      const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+      if (!delta) return;
+      const step = delta > 0 ? 1 : -1;
+      const moved = axis === 'y'
+        ? scrollByEntry(guid, { y: step }, { behavior: 'smooth' })
+        : scrollByEntry(guid, { x: step }, { behavior: 'smooth' });
+      if (moved) wheelBusy.current = true;
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [ref, guid, wheelMode, axis]);
+
+  // A ref, not state: the handler must not re-render the component it is attached to.
+  React.useEffect(() => {
+    const el = ref.current;
+    if (!el || !scroll || !guid) return;
+    const push = () => {
+      const changed = writeScrollState(guid, {
+        scrollX: Math.round(el.scrollLeft), scrollY: Math.round(el.scrollTop),
+        viewportWidth: el.clientWidth, viewportHeight: el.clientHeight,
+        contentWidth: el.scrollWidth, contentHeight: el.scrollHeight,
+      });
+      // Re-drive the pool NOW, in the same frame the browser is painting this offset in — a
+      // `scroll` event lands before rAF, so the projection still picks it up this frame. Waiting
+      // for the next pipeline tick costs a frame, and that frame is what makes a fast scroll go
+      // black: the band has to cover twice the per-frame travel instead of once. Guarded on
+      // `changed` so a scroll event landing on the same rounded pixel still costs nothing, and
+      // routed through `driveEntriesFromScroll` (never `entriesSystem` directly) because the
+      // pool spawns and needs the system-tick flag for `Transient`.
+      if (changed) driveEntriesFromScroll();
+    };
+    push();                                   // seed, so a system sees real numbers on frame 1
+    el.addEventListener('scroll', push, { passive: true });
+    // The geometry stands on the viewport size, so measure it rather than assuming the authored
+    // width/height resolved to what we think (percentages, flex, safe-area insets).
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(push) : null;
+    ro?.observe(el);
+    return () => { el.removeEventListener('scroll', push); ro?.disconnect(); };
+  }, [ref, guid, scroll ? 1 : 0]);           // eslint-disable-line react-hooks/exhaustive-deps
+
+  // One-shot scrollTo request. Keyed on the request VALUES, so re-requesting the same offset
+  // after the game cleared it fires again rather than being swallowed.
+  React.useEffect(() => {
+    const el = ref.current;
+    if (!el || !scroll || !guid) return;
+    const req = pendingScrollTo(scroll);
+    if (!req) return;
+    el.scrollTo(req as ScrollToOptions);
+    clearScrollRequest(guid);
+  }, [ref, guid, scroll?.scrollToX, scroll?.scrollToY, scroll?.scrollBehavior]); // eslint-disable-line react-hooks/exhaustive-deps
 }
 
 export const UINode = React.memo(UINodeInner);

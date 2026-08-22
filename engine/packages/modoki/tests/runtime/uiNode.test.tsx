@@ -83,13 +83,13 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     marginBottom: 0, marginBottomUnit: 'px', marginLeft: 0, marginLeftUnit: 'px',
     minWidth: 0, minWidthUnit: 'px', maxWidth: 0, maxWidthUnit: 'px',
     minHeight: 0, minHeightUnit: 'px', maxHeight: 0, maxHeightUnit: 'px',
-    alignSelf: 'auto', zIndex: 0, overflow: 'visible', isVisible: true, pointerThrough: false,
+    alignSelf: 'auto', zIndex: 0, rotation: 0, overflow: 'visible', isVisible: true, pointerThrough: false,
     backgroundColor: 0, backgroundOpacity: 0, borderRadius: 0, borderWidth: 0, borderColor: 0x333333, borderOpacity: 1, opacity: 1,
-    text: '', fontFamily: '', fontSize: 16, fontWeight: 'normal', fontStyle: 'normal',
-    textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0,
+    text: '', fontFamily: '', fontSize: 16, fontSizeUnit: 'px', fontWeight: 'normal', fontStyle: 'normal',
+    textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0, letterSpacingUnit: 'px',
     textShadowColor: 0, textShadowOpacity: 1, textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0,
     textStrokeColor: 0, textStrokeOpacity: 1, textStrokeWidth: 0, textOverflow: 'clip', maxLines: 0,
-    imageSrc: '', imageMode: 'cover', hasVideo: false, elementType: 'div', placeholder: '',
+    imageSrc: '', imageMode: 'cover', imageEpoch: 0, hasVideo: false, elementType: 'div', placeholder: '',
     rangeMin: 0, rangeMax: 100, rangeStep: 1,
     children: [],
     ...over,
@@ -127,6 +127,33 @@ describe('UINode CSS helpers', () => {
     expect(hexToColor(0xffffff)).toBe('#ffffff');
     expect(hexToColor(0x0000ff)).toBe('#0000ff');
     expect(hexToColor(0)).toBe('#000000');
+  });
+});
+
+// ── Font family ──
+describe('UINode fontFamily is emitted on containers, not only on text nodes', () => {
+  /**
+   * `font-family` inherits, so authoring it on a container is how a whole UI tree gets one
+   * typeface from ONE field. It used to be written only inside the `if (text)` branch, which
+   * silently dropped a container's authored family — and the only remaining way to restyle a
+   * scene was to repeat the family on every text node (41 of them in Court).
+   *
+   * The regression is invisible without this test: the container still renders, the field is
+   * still in the Inspector, and the text still has A font. Only the wrong one.
+   */
+  it('a container with no text still emits its authored family, so descendants inherit it', () => {
+    const { container } = render(<UINode node={makeNode({ text: '', fontFamily: 'Varela Round' })} storeState={{}} />);
+    expect((container.firstElementChild as HTMLElement).style.fontFamily).toContain('Varela Round');
+  });
+
+  it('a text node still emits its own family', () => {
+    const { container } = render(<UINode node={makeNode({ text: 'hi', fontFamily: 'Varela Round' })} storeState={{}} />);
+    expect((container.firstElementChild as HTMLElement).style.fontFamily).toContain('Varela Round');
+  });
+
+  it('an unauthored family is left alone, so the inherited one wins', () => {
+    const { container } = render(<UINode node={makeNode({ text: 'hi', fontFamily: '' })} storeState={{}} />);
+    expect((container.firstElementChild as HTMLElement).style.fontFamily).toBe('');
   });
 });
 
@@ -278,6 +305,30 @@ describe('UINode text rendering', () => {
     const el = renderNode(makeNode({ text: 'Hello', lineHeight: 20, fontSize: 14 }));
     expect(el.textContent).toBe('Hello');
     expect(el.style.lineHeight).toBe('20px');
+  });
+
+  /** #245 — text-sized content must be able to scale with the viewport, like every other length
+   *  on UIElement already can. Court's main menu overflowed its percentage-height paper page below
+   *  a ~975px window because three text-sized buttons could not shrink with it. */
+  it('emits fontSize through the --ui-* custom properties when fontSizeUnit is not px', () => {
+    const el = renderNode(makeNode({ text: 'Hello', fontSize: 4, fontSizeUnit: 'vmin' }));
+    expect(el.style.fontSize).toBe('calc(4 * var(--ui-vmin, 1vmin))');
+  });
+
+  it('a px fontSize is emitted unchanged — the default cannot re-lay-out existing UI', () => {
+    // The whole safety of #245 rests on this: `fontSizeUnit` defaults to 'px', and px must go out
+    // as the bare number it always was. A regression here silently re-sizes every authored screen.
+    const el = renderNode(makeNode({ text: 'Hello', fontSize: 14, fontSizeUnit: 'px' }));
+    expect(el.style.fontSize).toBe('14px');
+  });
+
+  /** #245 sibling — tracking is only meaningful as a RATIO of the glyph size, so a px
+   *  letterSpacing under a scaling fontSize says something different at every viewport. Court's
+   *  menu title measured 0.130em of tracking at its reference size and 0.261em at a 480px window
+   *  from the SAME authored 7px, because only the font shrank. */
+  it('emits letterSpacing through the --ui-* custom properties when its unit is not px', () => {
+    const el = renderNode(makeNode({ text: 'Hello', letterSpacing: 1.14, letterSpacingUnit: 'vh' }));
+    expect(el.style.letterSpacing).toBe('calc(1.14 * var(--ui-vh, 1vh))');
   });
 
   it('resolves a text binding through resolveTemplate', () => {
@@ -461,7 +512,20 @@ describe('UINode anchor CSS', () => {
   it('safeArea: stretch → all four insets', () => {
     const s = safeAreaStyle('stretch');
     for (const e of ['top', 'bottom', 'left', 'right']) expect(s).toContain(`env(safe-area-inset-${e})`);
-    expect(s).toMatch(/max\(0px,\s*env\(safe-area-inset-top\)\)/);
+    expect(s).toMatch(/max\(0px,\s*var\(--ui-sa-top,\s*env\(safe-area-inset-top\)\)\)/);
+  });
+
+  // The inset is emitted as `var(--ui-sa-*, env(...))`, not a bare `env()`. Both halves
+  // are load-bearing and this pins BOTH: the var is what lets an editor device preview
+  // simulate a notch (desktop `env()` is always 0, which is why a notched-phone layout
+  // was structurally invisible in the editor — #271), and the `env()` fallback is what
+  // every shipped build actually runs, since nothing sets the var there. Dropping the
+  // fallback would silently zero the safe area on real hardware.
+  it('safeArea: each edge is an overridable var with the real env() as its fallback', () => {
+    const s = safeAreaStyle('stretch');
+    for (const e of ['top', 'bottom', 'left', 'right']) {
+      expect(s).toContain(`var(--ui-sa-${e}, env(safe-area-inset-${e}))`);
+    }
   });
   it('safeArea: v-stretch (full height) → top + bottom only', () => {
     const s = safeAreaStyle('v-stretch');
@@ -484,11 +548,60 @@ describe('UINode anchor CSS', () => {
     expect(s).toContain('env(safe-area-inset-right)');
     expect(s).not.toContain('env(safe-area-inset-bottom)');
   });
-  it('safeArea: center (non-stretch) → NO safe-area padding (the button footgun)', () => {
+  it('safeArea: center reaches no edge → a genuine no-op, padding AND offset', () => {
     expect(safeAreaStyle('center')).not.toContain('env(safe-area-inset');
   });
-  it('safeArea: top-left (non-stretch corner) → NO safe-area padding', () => {
-    expect(safeAreaStyle('top-left')).not.toContain('env(safe-area-inset');
+
+  // A POINT anchor takes the inset as an OFFSET, never as padding (#272). Padding would
+  // inflate the element — a 44pt gear anchored top-right renders 106pt tall on a notched
+  // iPhone with its glyph shoved to the bottom — which is why the padding arm is
+  // stretch-gated. This used to assert "no safe area AT ALL" on a corner, and that was
+  // the defect wearing a test: a corner-anchored badge then had no way to clear the
+  // camera, and the Inspector greyed the checkbox out to say so.
+  const parsed = (a: string) => {
+    const s = safeAreaStyle(a);
+    return { style: s, hasPadding: /padding[^;]*safe-area-inset/.test(s) };
+  };
+  it('safeArea: top-left corner → offsets top and left, and pads NOTHING', () => {
+    const { style, hasPadding } = parsed('top-left');
+    expect(hasPadding).toBe(false);
+    expect(style).toContain('var(--ui-sa-top, env(safe-area-inset-top))');
+    expect(style).toContain('var(--ui-sa-left, env(safe-area-inset-left))');
+    expect(style).not.toContain('safe-area-inset-bottom');
+    expect(style).not.toContain('safe-area-inset-right');
+  });
+  it('safeArea: bottom-right corner → offsets bottom and right only', () => {
+    const { style, hasPadding } = parsed('bottom-right');
+    expect(hasPadding).toBe(false);
+    expect(style).toContain('var(--ui-sa-bottom, env(safe-area-inset-bottom))');
+    expect(style).toContain('var(--ui-sa-right, env(safe-area-inset-right))');
+    expect(style).not.toContain('safe-area-inset-top');
+    expect(style).not.toContain('safe-area-inset-left');
+  });
+
+  // The exclusivity is the anti-double-inset guarantee: every anchor takes exactly one
+  // arm. A stretched anchor pads (its CHILDREN move, its own box does not), a point
+  // anchor offsets (its box moves, its size does not), and none does both.
+  it('no anchor takes BOTH arms — padding and offset are mutually exclusive', () => {
+    const MODES = ['stretch', 'top', 'bottom', 'left', 'right', 'top-left', 'top-right',
+      'bottom-left', 'bottom-right', 'center', 'top-stretch', 'bottom-stretch',
+      'left-stretch', 'right-stretch', 'h-stretch', 'v-stretch'];
+    for (const m of MODES) {
+      const s = safeAreaStyle(m);
+      const pads = /padding[^;]*safe-area-inset/.test(s);
+      // An offset is a safe-area term reached through top/left rather than a padding.
+      const offsets = /(^|;)\s*(top|left):[^;]*safe-area-inset/.test(s);
+      expect(pads && offsets, `${m} took both arms`).toBe(false);
+    }
+  });
+
+  // The authored offset is composed with, not replaced: `top: 4vmin` on a notched phone
+  // must mean "4vmin BELOW the notch", which is what whoever wrote 4vmin meant.
+  it('safeArea composes with an authored offset instead of overwriting it', () => {
+    const s = styleAttr(renderNode(makeNode({
+      anchor: anchor({ anchor: 'top-right', safeArea: true, top: 4, topUnit: 'vmin' }),
+    })));
+    expect(s).toMatch(/top:\s*calc\([^;]*--ui-vmin[^;]*\+\s*var\(--ui-sa-top/);
   });
 });
 
@@ -549,6 +662,179 @@ describe('UINode range branch', () => {
     const { container } = render(<UINode node={node} storeState={{ bad: 'not-a-number' }} />);
     const input = container.querySelector('input[type=range]') as HTMLInputElement;
     expect(input.value).toBe('3'); // Number('not-a-number') is NaN → clamps to rangeMin
+  });
+});
+
+// ── toggle branch ──
+// The FIRST control that draws more than one DOM node from one entity — root is the
+// track (carrying the standard `style`), the single child is the knob. See the UIToggle
+// trait header + the branch's own comment in UINode.tsx for the design.
+describe('UINode toggle branch', () => {
+  it('renders a track containing exactly one child (the knob)', () => {
+    const el = renderNode(makeNode({ toggle: toggle() }));
+    expect(el.children).toHaveLength(1);
+  });
+
+  it('role=switch, aria-checked follows value (both states)', () => {
+    const off = renderNode(makeNode({ guid: 'tg-1', toggle: toggle({ value: false }) }));
+    expect(off.getAttribute('role')).toBe('switch');
+    expect(off.getAttribute('aria-checked')).toBe('false');
+    cleanup();
+    const on = renderNode(makeNode({ guid: 'tg-2', toggle: toggle({ value: true }) }));
+    expect(on.getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('justifyContent flips with value: flex-end when on, flex-start when off', () => {
+    const off = renderNode(makeNode({ guid: 'tg-3', toggle: toggle({ value: false }) }));
+    expect(off.style.justifyContent).toBe('flex-start');
+    cleanup();
+    const on = renderNode(makeNode({ guid: 'tg-4', toggle: toggle({ value: true }) }));
+    expect(on.style.justifyContent).toBe('flex-end');
+  });
+
+  it('track background uses trackOnColor when on, trackOffColor when off', () => {
+    // jsdom's CSSOM drops alpha 1 down to rgb(...), so match channels rather than the
+    // exact rgba() string hexToRgba produces (same idiom as the box-rendering test above).
+    const off = renderNode(makeNode({
+      guid: 'tg-5', toggle: toggle({ value: false, trackOnColor: 0x00ff00, trackOffColor: 0xff0000, trackOpacity: 1 }),
+    }));
+    expect(off.style.backgroundColor).toMatch(/255,\s*0,\s*0/);
+    cleanup();
+    const on = renderNode(makeNode({
+      guid: 'tg-6', toggle: toggle({ value: true, trackOnColor: 0x00ff00, trackOffColor: 0xff0000, trackOpacity: 1 }),
+    }));
+    expect(on.style.backgroundColor).toMatch(/0,\s*255,\s*0/);
+  });
+
+  it('clicking with a change binding calls applyBindings with the NEGATED value — both starting states', () => {
+    const offNode = makeNode({
+      guid: 'tg-7', toggle: toggle({ value: false }),
+      action: { bindings: [{ event: 'change', kind: 'set' } as never] },
+    });
+    const offEl = renderNode(offNode);
+    fireEvent.click(offEl);
+    expect(h.applyBindings).toHaveBeenCalledWith(offNode.action!.bindings, 'change', { selfGuid: 'tg-7', eventValue: true });
+    cleanup();
+
+    const onNode = makeNode({
+      guid: 'tg-8', toggle: toggle({ value: true }),
+      action: { bindings: [{ event: 'change', kind: 'set' } as never] },
+    });
+    const onEl = renderNode(onNode);
+    fireEvent.click(onEl);
+    expect(h.applyBindings).toHaveBeenCalledWith(onNode.action!.bindings, 'change', { selfGuid: 'tg-8', eventValue: false });
+  });
+
+  // ⚠️ This test asserted the OPPOSITE until 2026-08-20, under the name "a click binding (not just
+  // change) also fires the toggle" — and it passed, because `applyBindings` is mocked in this file,
+  // so it only ever proved that UINode CALLED the mock with 'change'. The real `applyBindings`
+  // skips every row whose own `event` differs from the dispatched one (pinned independently by
+  // `bindings.test.ts` § "only runs bindings whose event matches"), so a 'click'-only toggle could
+  // never move — while the mocked test vouched for it. A reinstated "click works" expectation here
+  // is a regression, not a fix.
+  it('a click-ONLY binding cannot move the toggle: it is inert and warns as dead', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const node = makeNode({
+      guid: 'tg-9', toggle: toggle({ value: false }),
+      action: { bindings: [{ event: 'click', kind: 'set' } as never] },
+    });
+    // try/finally, not a trailing `mockRestore()`: this file's other warn tests restore at the END
+    // OF THE BODY, so a failing assertion leaks the console.warn spy into every later test in the
+    // file. Measured while mutation-testing this very block — one real failure cascaded into three
+    // unrelated warning tests and made the signal unreadable twice.
+    try {
+      const el = renderNode(node);
+      fireEvent.click(el);
+      // Not interactive, so nothing is dispatched at all — the click cannot silently half-work.
+      expect(h.applyBindings).not.toHaveBeenCalled();
+      // And the author is TOLD, naming the event mistake the Inspector's 'click' default leads to.
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain("'click' binding will NOT work");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a toggle drops a Canvas2D and any children — and says so', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const node = makeNode({
+      guid: 'tg-drop', toggle: toggle({ value: false }),
+      action: { bindings: [{ event: 'change', kind: 'set' } as never] },
+      canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain' },
+      children: [makeNode({ guid: 'tg-drop-kid' })],
+    });
+    try {
+      const el = renderNode(node);
+      // Only the knob renders — the child never mounts.
+      expect(el.querySelectorAll('[data-entity-id]').length).toBe(0);
+      const msgs = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(msgs).toContain('UIToggle draws only a track and a knob');
+      expect(msgs).toContain('its Canvas2D');
+      expect(msgs).toContain('child');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('disabled: no applyBindings call on click, and aria-disabled is set', () => {
+    const node = makeNode({
+      guid: 'tg-10', toggle: toggle({ value: false, disabled: true }),
+      action: { bindings: [{ event: 'change', kind: 'set' } as never] },
+    });
+    const el = renderNode(node);
+    expect(el.getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(el);
+    expect(h.applyBindings).not.toHaveBeenCalled();
+  });
+
+  it('no bindings at all: no applyBindings call on click', () => {
+    const el = renderNode(makeNode({ guid: 'tg-11', toggle: toggle({ value: false }) }));
+    fireEvent.click(el);
+    expect(h.applyBindings).not.toHaveBeenCalled();
+  });
+
+  it('keyboard: Space and Enter fire the same applyBindings call; another key does not', () => {
+    const node = makeNode({
+      guid: 'tg-12', toggle: toggle({ value: false }),
+      action: { bindings: [{ event: 'change', kind: 'set' } as never] },
+    });
+    const el = renderNode(node);
+    fireEvent.keyDown(el, { key: ' ' });
+    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'change', { selfGuid: 'tg-12', eventValue: true });
+    h.applyBindings.mockClear();
+
+    fireEvent.keyDown(el, { key: 'Enter' });
+    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'change', { selfGuid: 'tg-12', eventValue: true });
+    h.applyBindings.mockClear();
+
+    fireEvent.keyDown(el, { key: 'a' });
+    expect(h.applyBindings).not.toHaveBeenCalled();
+  });
+
+  it('editor mode: clicking selects the entity and does NOT call applyBindings', () => {
+    const onSelect = vi.fn();
+    const node = makeNode({
+      entityId: 30, guid: 'tg-13', toggle: toggle({ value: false }),
+      action: { bindings: [{ event: 'change', kind: 'set' } as never] },
+    });
+    const el = renderNode(node, { onSelectEntity: onSelect });
+    fireEvent.click(el);
+    expect(onSelect).toHaveBeenCalledWith(30);
+    expect(h.applyBindings).not.toHaveBeenCalled();
+  });
+
+  it('dev-warns once when a toggle has no change/click binding, and dedupes per guid', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const node = makeNode({ guid: 'tg-dead-1', toggle: toggle({ value: false }) });
+    render(<UINode node={node} storeState={{}} />);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('UIToggle');
+    cleanup();
+
+    // Same guid again → dedupe suppresses the second warning.
+    render(<UINode node={node} storeState={{}} />);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
   });
 });
 
@@ -707,6 +993,15 @@ function anchor(over: Partial<NonNullable<UINodeData['anchor']>> = {}): NonNulla
   };
 }
 
+/** Toggle block with the trait's own defaults; override per test. */
+function toggle(over: Partial<NonNullable<UINodeData['toggle']>> = {}): NonNullable<UINodeData['toggle']> {
+  return {
+    value: false, trackOnColor: 0x4aa3ff, trackOffColor: 0x767676, trackOpacity: 1,
+    knobColor: 0xffffff, knobOpacity: 1, knobInset: 2, trackRadius: 999, knobRadius: 999,
+    disabled: false, ...over,
+  };
+}
+
 // @vitest-environment jsdom
 describe('NineSliceImage — per-slice background math', () => {
   afterEach(cleanup);
@@ -734,5 +1029,34 @@ describe('NineSliceImage — per-slice background math', () => {
     expect(inners[4].style.backgroundPosition).toBe('50% 75%');
     // center size: 100/84 & 60/44 as %
     expect(inners[4].style.backgroundSize).toBe(`${(100 / 84) * 100}% ${(60 / 44) * 100}%`);
+  });
+});
+
+/** #234 — the tilt reaching the DOM. anchorCss.test.ts pins the CSS the emitter BUILDS; this pins
+ *  that a `rotation` authored on the trait actually arrives on the rendered element, which is the
+ *  half a unit test of the emitter cannot see (a field wired into nothing renders perfectly). */
+describe('UIElement.rotation (#234)', () => {
+  it('renders a tilted element', () => {
+    const { container } = render(<UINode node={makeNode({ rotation: 5 })} storeState={{}} />);
+    expect((container.firstElementChild as HTMLElement).style.transform).toBe('rotate(5deg)');
+  });
+
+  it('leaves an untilted element with no transform at all', () => {
+    const { container } = render(<UINode node={makeNode({ rotation: 0 })} storeState={{}} />);
+    expect((container.firstElementChild as HTMLElement).style.transform).toBe('');
+  });
+
+  it('composes with the anchor pivot translate rather than replacing it', () => {
+    const node = makeNode({
+      rotation: -4,
+      anchor: {
+        anchor: 'center', top: 0, topUnit: 'px', right: 0, rightUnit: 'px',
+        bottom: 0, bottomUnit: 'px', left: 0, leftUnit: 'px',
+        pivotX: 0.5, pivotY: 0.5, safeArea: false, zIndex: 0,
+      },
+    });
+    const el = render(<UINode node={node} storeState={{}} />).container.firstElementChild as HTMLElement;
+    expect(el.style.transform).toBe('translate(-50%, -50%) rotate(-4deg)');
+    expect(el.style.transformOrigin).toBe('50% 50%');
   });
 });

@@ -17,11 +17,26 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "getNativeLogs", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getDeviceIp", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getDeviceHardware", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "triggerFault", returnType: CAPPluginReturnPromise),
     ]
 
     private var listener: NWListener?
     private var clientConnection: NWConnection?
     private var serverPort: UInt16 = 9095
+    /// True when the listener ended up on an OS-assigned port instead of 9095 — i.e. no host can
+    /// reach it without being told the number (#283).
+    private var onFallbackPort = false
+    /// One retry announcement per start attempt — the retry re-enters `startListener`, so an
+    /// unguarded log would print once per attempt across the whole window.
+    private var retryAnnounced = false
+    /// How long to retry the PREFERRED port before accepting an OS-assigned one (#283).
+    /// Small on purpose — see the Java constant: on Android the outgoing app's release never
+    /// arrives while we retry, it lands after the loop gives up, and the delay scales with the
+    /// window, so no value wins that race. Host-side port discovery is the fix. iOS has not been
+    /// observed losing this race at all (its handover releases before the incoming app binds), so
+    /// this is parity rather than an iOS measurement.
+    private static let bindRetryWindowMs = 1000
+    private static let bindRetryIntervalMs = 150
     private var running = false
     private var receiveBuffer = Data()
 
@@ -57,17 +72,27 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
         let preferred = UInt16(call.getInt("port") ?? 9095)
-        startListener(on: preferred, allowFallback: true, call: call)
+        retryAnnounced = false
+        let deadline = Date().addingTimeInterval(Double(Self.bindRetryWindowMs) / 1000.0)
+        startListener(on: preferred, allowFallback: true, retryUntil: deadline, call: call)
     }
 
     /// Bind the TCP server + resolve JS with the ACTUAL port — only once the listener is
     /// `.ready`, never before (a fixed port can't be assumed bound: a lingering previous app
-    /// instance holds it → "Address already in use"). On that conflict, retry on an OS-assigned
-    /// free port (port 0). No Bonjour advertisement: connection is by MANUAL IP through Modoki's
+    /// instance holds it → "Address already in use"). On that conflict it RETRIES the same port
+    /// until `retryUntil`, and only then falls back to an OS-assigned free port (port 0).
+    ///
+    /// The fallback is a last resort, not a first response (#283): a host connects on the default
+    /// port, so an app that quietly lands elsewhere is unreachable by every `device_*` tool for
+    /// its whole lifetime — nothing ever comes back to reclaim the port once it frees up. Retrying
+    /// across the handover window makes "the foreground app is on 9095" true once the handover
+    /// settles, instead of decided by which process bound first.
+    ///
+    /// No Bonjour advertisement: connection is by MANUAL IP through Modoki's
     /// lease (see docs/debug-tools-mcp.md), so nothing broadcasts on the LAN — this
     /// removes the auto-discovery attack surface that let idle Claude sessions storm the device.
     /// Resolves/rejects the call exactly once (`settled`).
-    private func startListener(on port: UInt16, allowFallback: Bool, call: CAPPluginCall) {
+    private func startListener(on port: UInt16, allowFallback: Bool, retryUntil: Date, call: CAPPluginCall) {
         let newListener: NWListener
         do {
             let params = NWParameters.tcp
@@ -91,9 +116,13 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
                 settled = true
                 let actual = newListener.port?.rawValue ?? port
                 self.serverPort = actual
+                // Keyed on `allowFallback`, not on `actual != 9095` — only the port-0 retry passes
+                // false, so this means "we did not get the port we asked for". A caller that
+                // REQUESTS a non-default port and gets it is a success, not a fallback (#283).
+                self.onFallbackPort = !allowFallback
                 self.running = true
                 print("[GameDebug] TCP server listening on port \(actual)")
-                call.resolve(["port": Int(actual)])
+                call.resolve(["port": Int(actual), "fallbackPort": self.onFallbackPort])
             case .failed(let err):
                 if settled { return }
                 settled = true
@@ -102,8 +131,25 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
                 newListener.cancel()
                 self.listener = nil
                 if allowFallback, case .posix(let code) = err, code == .EADDRINUSE {
-                    print("[GameDebug] port \(port) in use (previous instance?) — retrying on an OS-assigned port")
-                    self.startListener(on: 0, allowFallback: false, call: call)
+                    if Date() < retryUntil {
+                        // Announce the WAIT, not just its outcome — the Android side gained this
+                        // line only after a live test showed the port handover left no trace
+                        // anyone would grep for (#283). Logged once, on the first retry.
+                        if !self.retryAnnounced {
+                            self.retryAnnounced = true
+                            print("[GameDebug] port \(port) busy — retrying for up to \(Self.bindRetryWindowMs)ms")
+                        }
+                        // Same port, after a beat — the previous owner is most likely mid-release.
+                        // Async rather than a sleep: this runs on the listener's state-update
+                        // handler, and blocking it would stall the very callback the retry needs.
+                        let delay = DispatchTimeInterval.milliseconds(Self.bindRetryIntervalMs)
+                        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) {
+                            self.startListener(on: port, allowFallback: true, retryUntil: retryUntil, call: call)
+                        }
+                        return
+                    }
+                    print("[GameDebug] port \(port) still in use after \(Self.bindRetryWindowMs)ms — falling back to an OS-assigned port. Pass the port explicitly to device_connect.")
+                    self.startListener(on: 0, allowFallback: false, retryUntil: retryUntil, call: call)
                 } else {
                     call.reject("TCP server failed: \(err)")
                 }
@@ -130,6 +176,7 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
             "running": running,
             "clientConnected": connected,
             "port": Int(serverPort),
+            "fallbackPort": onFallbackPort,
         ])
     }
 
@@ -538,6 +585,65 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    // MARK: - Fault triggers (#278)
+
+    /// `Info.plist` key carrying the project's `build.debugBuild` — the iOS mirror of Android's
+    /// `com.modokiengine.gamedebug.DEBUG_BUILD` manifest meta-data. Written by
+    /// `healIosDebugBuildInfoPlist` (engine/plugins/healNativeConfig.ts); the NAME is the contract
+    /// between the two, so keep them in sync.
+    private static let debugBuildPlistKey = "ModokiDebugBuild"
+
+    /// Is `build.debugBuild` on for this app?
+    ///
+    /// Absent key → FALSE. Fail closed, exactly as Android does: a project that has not been
+    /// reopened since this landed loses the fault triggers rather than shipping a reachable way to
+    /// kill the app, and the reject message says how to turn them back on.
+    ///
+    /// ⚠️ This gate is deliberately NOT applied to `startServer` in the same change. That method
+    /// has been ungated on iOS since it was written, so failing it closed would take the debug
+    /// bridge away from every project at once, on a heal nobody has run yet. Retrofitting it is a
+    /// separate decision with a separate rollout — see #278.
+    private func isDebugBuildEnabled() -> Bool {
+        return Bundle.main.object(forInfoDictionaryKey: GameDebugPlugin.debugBuildPlistKey) as? Bool ?? false
+    }
+
+    /// Small delay between resolving the JS call and raising the fault, so the resolve marshals
+    /// back across the bridge before the process dies. Best effort, not a guarantee.
+    private static let faultDelaySeconds: TimeInterval = 0.25
+
+    /// Raise a deliberate native fault so the crash pipeline can be proven (#278).
+    ///
+    /// iOS supports `crash` ONLY. `anr` and `uncaught` are rejected rather than approximated:
+    /// iOS has no ANR — the watchdog (0x8badf00d) kills only during launch/suspend transitions,
+    /// not steady-state foreground, and Crashlytics does not report hangs at all. An approximation
+    /// here would produce a probe that appears to test something and tests nothing.
+    @objc func triggerFault(_ call: CAPPluginCall) {
+        guard isDebugBuildEnabled() else {
+            call.reject("Fault triggers disabled: build.debugBuild is off for this project "
+                        + "(Project Settings → Developer → \"Debug build\"). Rebuild after enabling it.")
+            return
+        }
+
+        let kind = call.getString("kind") ?? ""
+        switch kind {
+        case "crash":
+            NSLog("[GameDebug] triggerFault: dereferencing a bad pointer on purpose (#278)")
+            call.resolve(["ok": true])
+            DispatchQueue.main.asyncAfter(deadline: .now() + GameDebugPlugin.faultDelaySeconds) {
+                // A real EXC_BAD_ACCESS — the segfault shape — rather than `fatalError()`, which
+                // traps as SIGILL and reports as a different kind of fault.
+                let bad = UnsafeMutablePointer<Int>(bitPattern: 0x1)!
+                bad.pointee = 0
+            }
+        case "anr", "uncaught":
+            call.reject("Fault kind \"\(kind)\" is Android-only. iOS has no ANR (the watchdog fires "
+                        + "on launch/suspend transitions, not a foreground hang) and Crashlytics does not "
+                        + "report hangs — MetricKit MXHangDiagnostic is the oracle for those. Use \"crash\".")
+        default:
+            call.reject("Unknown fault kind \"\(kind)\" — iOS supports: crash.")
+        }
+    }
+
     // MARK: - Cleanup
 
     private func stopAll() {
@@ -550,6 +656,9 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
         listener?.cancel()
         listener = nil
         running = false
+        // Cleared with the listener it describes — a stale `true` would have `getStatus` report a
+        // fallback port on a server that is not running (#283).
+        onFallbackPort = false
         print("[GameDebug] Server stopped")
     }
 

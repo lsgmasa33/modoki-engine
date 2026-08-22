@@ -75,10 +75,16 @@ export interface TargetRow {
 }
 
 /** How an iOS row will be installed, spelled out in the row itself — this is the single most
- *  useful thing the old menu could not tell you. `devicectl` installs and launches hands-free;
- *  everything else (every pre-iPhone-X handset, which only `xctrace` can see) builds and hands off
- *  to Xcode for a manual ⌘R. */
-const iosInstallNote = (d: IosDeviceRow): string => (d.devicectl ? 'hands-free install' : 'Xcode handoff, ⌘R');
+ *  useful thing the old menu could not tell you. `devicectl` installs and launches hands-free on
+ *  iOS 17+; everything below it (every pre-iPhone-X handset, which only `xctrace` can see) is
+ *  hands-free through go-ios, which the build provisions on demand.
+ *
+ *  This row used to read "Xcode handoff, ⌘R", and that was the whole defect: a legacy device
+ *  genuinely could not be installed to from the editor. Naming the TOOL rather than just saying
+ *  "hands-free" keeps the two paths distinguishable when one of them misbehaves — they are
+ *  different programs talking to the phone in different ways. The label describes the PLAN; if
+ *  go-ios can't be provisioned the build still falls back to the handoff and says so in the log. */
+const iosInstallNote = (d: IosDeviceRow): string => (d.devicectl ? 'hands-free install' : 'hands-free install (go-ios)');
 
 /** Who holds a device, or null when nobody does. A claim is the DEBUG LEASE, not the hardware: a
  *  build can install to a phone another clone is debugging, so this annotates and never disables.

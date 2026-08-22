@@ -7,6 +7,7 @@
     "./runtime": "./src/runtime/index.ts",
     "./runtime/rendering": "./src/runtime/rendering/index.ts",
     "./runtime/rendering/Scene3D": "./src/runtime/rendering/Scene3D.tsx",
+    "./runtime/rendering/tierBoot": "./src/runtime/rendering/tierBoot.ts",
     "./runtime/rendering/Game": "./src/runtime/rendering/Game.tsx",
     "./runtime/debug": "./src/runtime/debug/index.ts",
     "./editor": "./src/editor/index.ts",

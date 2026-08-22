@@ -9,7 +9,7 @@ import { fileURLToPath } from 'url';
 import { spawn, execFileSync } from 'child_process';
 import crypto, { randomUUID } from 'crypto';
 import type { Plugin } from 'vite';
-import { computeKeptAssets, formatBytes } from './asset-tree-shaker';
+import { computeKeptAssets, enumerateRefEdges, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
 import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors } from './load-project-config';
 import { stripPrivateBuildFields } from '../project-config';
@@ -18,8 +18,11 @@ import { findGamesEntry } from './findGamesEntry';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
 import { projectAssetRoots } from '../scripts/projectRoots.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
+// Through the typed shell, not the .mjs directly: TypeScript consumers all enter the claim store
+// by one door, so a future caller cannot pick up a differently-typed view of the same rules.
+import { foreignClaimFor, describeConflict, adbDeviceId, adbSerialOf, iosDeviceId, ownAdbClaim } from './backend/deviceClaims';
 import { acquireBuild, releasePolicy } from './backend/buildLock';
-import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
+import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
 import { textureReimportHandler } from './reimport-texture';
 import { modelReimportHandler, resolvePostprocessorForId, validatePostprocessorRegistry, isRiggedMeta } from './reimport-model';
@@ -52,19 +55,20 @@ import { getModelCacheDir, lodCachePath } from './model-cache';
 import { convertTexture } from './texture-convert';
 import { convertModel } from './model-convert';
 import { convertRiggedModel } from './rigged-model-optimize';
-import { resolveTextureSettings, resolveTextureType, variantSuffix, variantsToEmit, type TextureImportSettings, type TextureType, type TextureVariant } from '../packages/modoki/src/runtime/loaders/textureSettings';
+import { resolveTextureSettings, resolveTextureType, variantSuffix, variantsToEmit, sizesToEmit, type TextureImportSettings, type TextureType, type TextureVariant } from '../packages/modoki/src/runtime/loaders/textureSettings';
 import { isPlayableBuild, playableTextureSettings, playableEnvSettings } from './playable-profile';
+import { shouldEmitTextureTierVariants } from './textureTierEmit';
 import { deriveGuid } from '../packages/modoki/src/runtime/core/assetRefRules';
 import { resolveModelSettings, lodUrlSuffix, type ModelImportSettings, type ModelCacheInfo } from '../packages/modoki/src/runtime/loaders/modelSettings';
 import { type SpriteSlice, type SpriteAssetRef } from '../packages/modoki/src/runtime/loaders/spriteSheet';
 import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { handleBackendRequest, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
-import { reclaimStaleForwardsAtStartup } from './backend/deviceConnection';
+import { reclaimStaleDeviceStateAtStartup } from './backend/deviceConnection';
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
-import { ICON_TOOL, ICON_COLORS, iconIsUpToDate, iconStampValue } from './iconAssets';
+import { iconIsUpToDate, iconStampValue } from './iconAssets';
 import { ensureCapacitorDeps, scaffoldNativeTarget, type NativePlatform } from './addNativeTarget';
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
@@ -447,8 +451,9 @@ export function isValidBuildPlatform(p: string | null | undefined): p is BuildPl
 
 /** How an iOS build gets its freshly-built `.app` onto the phone.
  *  - `devicectl`    — `xcrun devicectl device install|launch`, hands-free. iOS 17+ ONLY.
+ *  - `go-ios`       — the provisioned `ios install|launch`, hands-free on iOS 12–16.
  *  - `xcode-handoff`— open the Xcode project and let the human press Run (⌘R). */
-export type IosInstallMode = 'devicectl' | 'xcode-handoff';
+export type IosInstallMode = 'devicectl' | 'go-ios' | 'xcode-handoff';
 
 /** The single decision behind an iOS device build: may it run, and how does it install?
  *
@@ -457,14 +462,21 @@ export type IosInstallMode = 'devicectl' | 'xcode-handoff';
  *  where they live, and the Xcode-handoff fallback are documented in
  *  docs/build.md § "iOS Device" — don't restate them here.
  *
+ *  `goIos` is "go-ios is present, or this editor can provision it" — the caller's answer, because
+ *  it depends on the toolchain dir and the running platform, which a pure function can't see. It is
+ *  consulted ONLY when devicectl can't be used: an iOS 17+ device stays on Apple's own tool, so we
+ *  never need go-ios's sudo tunnel, and the ONE case go-ios serves is the one that used to demand a
+ *  human at the keyboard.
+ *
  *  Kept as one pure function, and exported, because these two answers must not drift apart:
  *  when the preflight required more than the step plan consumed, the guard rejected the very
  *  case the plan's own Xcode-handoff branch existed to serve. */
-export function planIosInstall(o: { iosDeviceId: string; iosDevicectlId: string }):
+export function planIosInstall(o: { iosDeviceId: string; iosDevicectlId: string; goIos?: boolean }):
   | { ok: false; missing: 'iosDeviceId' }
   | { ok: true; mode: IosInstallMode } {
   if (!o.iosDeviceId.trim()) return { ok: false, missing: 'iosDeviceId' };
-  return { ok: true, mode: o.iosDevicectlId.trim() ? 'devicectl' : 'xcode-handoff' };
+  if (o.iosDevicectlId.trim()) return { ok: true, mode: 'devicectl' };
+  return { ok: true, mode: o.goIos ? 'go-ios' : 'xcode-handoff' };
 }
 
 /** /api/ota/publish only ever builds+publishes the CURRENTLY OPEN project as ITSELF — see
@@ -512,6 +524,18 @@ export function playableBuildSteps(buildCwd: string, webCwd: string): BuildStep[
     { label: 'Building playable ad (single HTML)...', cmd: 'node engine/scripts/build-web.mjs --target playable', env: { VITE_PLAYABLE: '1' }, cwd: buildCwd },
     { label: 'Revealing ads/...', cmd: `open ${JSON.stringify(adsDir)}`, winCmd: `start "" "${adsDir}"`, cwd: webCwd },
   ];
+}
+
+/** Env for the OTA publish pipeline's `--target native` web-asset build step. Layers
+ *  `MODOKI_OTA_PUBLISH=1` on top of the caller's (gcloud-augmented) base env — the trap
+ *  `shouldEmitTextureTierVariants` exists to avoid: this step always passes `--target native`
+ *  (an OTA bundle replaces the web content INSIDE an installed app, so it must be served from
+ *  the app root, never the web sub-path — see the `--target native` comment above), which would
+ *  otherwise be indistinguishable from a plain native package build that should NOT emit tier
+ *  variants. Pure — extracted from the `/api/ota/publish` handler so this is unit-testable
+ *  without spawning a real build. */
+export function otaPublishBuildStepEnv(gcloudEnv: NodeJS.ProcessEnv, projectRoot: string): NodeJS.ProcessEnv {
+  return { ...gcloudEnv, MODOKI_PROJECT: projectRoot, MODOKI_OTA_PUBLISH: '1' };
 }
 
 // resolveGcloudDir moved to ./backend/gcloud.ts (shared with editorBackendRouter.ts,
@@ -985,15 +1009,15 @@ export function buildManifest(assets: AssetEntry[], heal = false): { version: 2;
   if (heal) {
     for (const it of items) {
       if (it.entry.guid || !it.absPath || !fs.existsSync(it.absPath)) continue;
-      // Fonts are the one type referenced by CSS family name, never by GUID
-      // (see assetManifest's fontFamily exception) — minting sidecars for the
-      // bundled families would be pure churn, so skip them.
-      // NOTE this skips MINTING only. A font that already HAS a sidecar keeps its
-      // guid: the loop bails at the `it.entry.guid` check above, and the manifest
-      // reads the id like any other asset. That is how the engine's default MSDF
-      // font works — its sidecar is committed (builtinAssets' DEFAULT_FONT_GUID)
-      // rather than minted here, which is why it survives this skip.
-      if (it.entry.type === 'font') continue;
+      // ⚠️ Fonts used to be SKIPPED here, on the premise that they were "referenced by CSS
+      // family name, never by GUID". That premise was already half-wrong — `Text2D.font` /
+      // `Text3D.font` are manifest GUIDs — and #231 made it wholly wrong by turning
+      // `UIElement.fontFamily` into a GUID ref too. With the skip in place a font a user
+      // drops into their project has NO guid, so it cannot be assigned to any font field at
+      // all: the Inspector refuses the drop (it will not write a raw path) and the picker
+      // has nothing to offer. The engine's nine bundled families all carry COMMITTED
+      // sidecars, so nothing is minted for them and the "pure churn" the skip avoided does
+      // not arise; a game's own font mints one sidecar, exactly as a texture does.
       const fresh = randomUUID();
       if (writeAssetGuid(it.absPath, it.entry.type, fresh)) {
         it.entry.guid = fresh;
@@ -1379,7 +1403,7 @@ export function assetScannerPlugin(): Plugin {
 
     configureServer(server) {
       // The OTHER backend host — see startBackendServer in electron/backendServer.ts (#160).
-      reclaimStaleForwardsAtStartup();
+      reclaimStaleDeviceStateAtStartup();
       viteServer = server as unknown as { ws: { send: (m: object) => void } };
 
       // Agent bridge: cache the trait schema the browser pushes, and resolve
@@ -1543,6 +1567,7 @@ export function assetScannerPlugin(): Plugin {
               if (mod) server.moduleGraph.invalidateModule(mod);
             },
             computeUnused: () => computeKeptAssets(projectRoot, assetRoots),
+            computeRefEdges: () => enumerateRefEdges(projectRoot, assetRoots),
           };
           // Read the request body (empty for GET) before dispatch.
           let raw = '';
@@ -1862,9 +1887,23 @@ export function assetScannerPlugin(): Plugin {
           const APP_ID = cfg.app.appId;
           const IOS_DEST = user.device.iosDeviceId;
           const IOS_DEVICECTL = user.device.iosDevicectlId;
+          // go-ios: the hands-free install path for a device `devicectl` cannot reach (iOS ≤16).
+          // Resolved to an ABSOLUTE path where possible, and QUOTED at every use — the provisioned
+          // one lives under "…/Application Support/Modoki Editor/toolchain/…" (spaces), and these
+          // commands are interpolated into a bash string, the same trap `adb` documents below.
+          //
+          // `goIosUsable` is "present, or we can get it": the toolchain dir is where install() puts
+          // it, so being able to provision counts. The async phase before the steps run does the
+          // actual provisioning if it's missing — resolving the PATH here, before that, is safe
+          // precisely because the install lands at exactly this path.
+          const goIosDetected = detectTool('go-ios');
+          const goIosToolchainDir = process.env.MODOKI_TOOLCHAIN_DIR;
+          const GO_IOS = goIosDetected.command
+            ?? (goIosToolchainDir ? goIosBinFor(path.join(goIosToolchainDir, 'go-ios')) : 'ios');
+          const goIosUsable = goIosDetected.present || (!!goIosToolchainDir && isInstallable('go-ios'));
           // ONE decision, consumed by both the step plan (below) and the preflight guard
           // (further down) — see planIosInstall for why they must not diverge.
-          const iosInstall = planIosInstall({ iosDeviceId: IOS_DEST, iosDevicectlId: IOS_DEVICECTL });
+          const iosInstall = planIosInstall({ iosDeviceId: IOS_DEST, iosDevicectlId: IOS_DEVICECTL, goIos: goIosUsable });
           // adb: an absolute path resolved from the SHARED toolchain (<android-sdk>/platform-tools/
           // adb) so it works even when platform-tools isn't on PATH (a packaged/no-PATH machine);
           // bare `adb` only as a fallback. -s <id> targets the configured device.
@@ -1884,9 +1923,37 @@ export function assetScannerPlugin(): Plugin {
           let androidSerialError: string | null = null;
           let androidSerial = user.device.androidDeviceId;
           if (platform === 'android') {
-            const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: user.device.androidDeviceId });
+            // The HELD LEASE's phone is consulted too (#235). The refusal this can produce
+            // offers `device_connect {useAdb:true, serial}` and the AI panel's picker as
+            // remedies — both of which act by opening a lease — so without this the build
+            // advertised two actions it then ignored, and an agent that followed the advice
+            // got the identical refusal on the next build. The lease is read HERE rather than
+            // inside resolveBuildAndroidSerial because androidDevices.ts must not import the
+            // lease manager (deviceConnection.ts imports IT; see that module's header).
+            //
+            // ⚠️ Read from the CLAIMS FILE, never `deviceConnection.status()`. That singleton is
+            // per-PROCESS, and this router is mounted in two of them (here, and Electron's
+            // `backendServer.ts`). `device_connect` opens the lease in the ELECTRON process, so the
+            // copy visible HERE is permanently `disconnected` and #235's fix never fired at all —
+            // the build kept advertising the two remedies it ignored. The claims file is the state
+            // both processes share; `foreignClaimFor` below already reads it for the sibling-clone
+            // check. Only an adb claim carries a serial — a WiFi/IP lease has none (`ip:`), and
+            // two claimed handsets report null so the ordinary rule refuses with both named.
+            const ownClaim = ownAdbClaim();
+            const leaseSerial = ownClaim ? adbSerialOf(ownClaim.deviceId) : undefined;
+            const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: user.device.androidDeviceId, leaseSerial });
             if ('error' in picked) androidSerialError = picked.error;
-            else androidSerial = picked.serial;
+            else {
+              androidSerial = picked.serial;
+              // #285 sibling: a resolved serial can still be a SIBLING CLONE's claimed phone — the
+              // lease check just above only catches a device THIS clone leased; it says nothing
+              // about one leased elsewhere. Refused through the same androidSerialError channel as
+              // every other "can't pick a device" case, so it costs no gradle build first.
+              const foreign = foreignClaimFor(adbDeviceId(androidSerial));
+              if (foreign) {
+                androidSerialError = `${describeConflict(foreign)} (refused by the build, not just device_connect).`;
+              }
+            }
           }
           const adb = androidSerial ? `${adbBin} -s ${androidSerial}` : adbBin;
           // JAVA_HOME / ANDROID_HOME come from the SHARED toolchain (an explicit user.sdk override,
@@ -1956,29 +2023,23 @@ export function assetScannerPlugin(): Plugin {
             : path.join(buildCwd, 'build/icon.png');
           // `--<plat>` (a FLAG, not the positional arg) makes the platform list
           // exclusive — the positional form still tries PWA and fails on a missing
-          // www/manifest.json. Colors are double-quoted (portable across bash +
-          // cmd.exe; `#` isn't a comment inside quotes on either). The mkdir+copy prep
-          // differs per shell (posix `mkdir -p`/`cp` vs cmd `mkdir`/`copy`); the
-          // `|| echo` non-fatal fallback works on both.
-          //
-          // VERSION IS PINNED. This used to be a bare `@capacitor/assets` under a comment
-          // claiming it was "verified against 3.0.5" — but `npx --yes` installs LATEST, so
-          // the comment documented a version the build did not actually use. A newer
-          // release then started emitting extra density buckets (drawable-night-*, *-ldpi,
-          // mipmap-ldpi), which showed up as mystery untracked dirs in games that had done
-          // nothing but build. The generated icons are committed release artifacts; the
-          // tool that generates them cannot be a moving target.
-          const iconGen = (plat: 'ios' | 'android') =>
-            `npx --yes ${ICON_TOOL} generate --${plat} ${ICON_COLORS}`;
-          const iconStampRel = (plat: 'ios' | 'android', win: boolean) =>
-            win ? `.cache\\icon-stamp-${plat}` : `.cache/icon-stamp-${plat}`;
+          // www/manifest.json. The tool version is PINNED (scripts/iconAssets.mjs); the
+          // flag does NOT keep the run inside that platform, which is what the wrapper
+          // below is for.
+          // The staging, the run, the freshness stamp and the SIDE-EFFECT CLEANUP all live in
+          // `engine/scripts/generate-icons.mjs` — one portable Node step instead of two
+          // hand-kept shell variants. It exists because the generator does not stay inside the
+          // platform it is given: `generate --android` also rewrites `ios/…/project.pbxproj`
+          // (mangling `LastUpgradeCheck = 0920` → `920`) and re-serializes AndroidManifest.xml
+          // (#236). The script restores every pre-existing NON-image file the run touched and
+          // reports what it restored; images — its actual product — are left alone.
           const iconStep = (plat: 'ios' | 'android'): BuildStep | null => {
             if (iconIsUpToDate(projectRoot, iconSrcAbs, plat)) return null;
             const stamp = iconStampValue(iconSrcAbs, plat);
+            const script = path.join(buildCwd, 'engine/scripts/generate-icons.mjs');
             return {
               label: 'Generating app icons...',
-              cmd: `mkdir -p assets .cache && cp ${JSON.stringify(iconSrcAbs)} assets/icon.png && ${iconGen(plat)} && printf '%s' ${stamp} > ${JSON.stringify(iconStampRel(plat, false))} || echo '[icon] generation skipped (source missing or @capacitor/assets error)'`,
-              winCmd: `(if not exist assets mkdir assets) && (if not exist .cache mkdir .cache) && copy /y "${iconSrcAbs}" assets\\icon.png && ${iconGen(plat)} && (echo ${stamp}>"${iconStampRel(plat, true)}") || echo [icon] generation skipped`,
+              cmd: `node ${JSON.stringify(script)} --project ${JSON.stringify(projectRoot)} --platform ${plat} --icon ${JSON.stringify(iconSrcAbs)} --stamp ${stamp}`,
               cwd: plat === 'ios' ? iosCwd : androidCwd,
             };
           };
@@ -2000,6 +2061,74 @@ export function assetScannerPlugin(): Plugin {
           // and the step is dropped from the plan entirely rather than run as a no-op.
           const iosIconStep = iconStep('ios');
           const androidIconStep = iconStep('android');
+          // ── How the built .app reaches the phone (see planIosInstall for the 3 modes) ──
+          // The freshly-built bundle: newest matching DerivedData product. Shared by both
+          // hands-free modes so they can never disagree about WHICH .app was just built.
+          const iosAppPath = 'APP_PATH=$(ls -dt ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app 2>/dev/null | head -1)';
+          const iosProjPath = iosXcodeTarget.replace(/^-(workspace|project) /, '');
+          // The shared bail-out: the app BUILT, only the push failed, so say that and hand the
+          // project to Xcode rather than reporting a raw tool error that reads as a broken build.
+          const iosHandoff = (why: string) =>
+            `echo ""; echo "${why}"; echo "   The app BUILT fine; only the command-line install is unavailable."; echo "   Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosProjPath}" 2>/dev/null || true`;
+          const GO_IOS_Q = JSON.stringify(GO_IOS);
+          const iosDeploySteps: BuildStep[] =
+            // ⚠️ The failure message names CANDIDATES, not a verdict — the same correction the
+            // go-ios launch step below carries. It used to assert "it requires iOS 17+", which is
+            // wrong-by-construction on the path almost everyone takes: `iosDevicectlId` is filled
+            // from the Build menu's device picker, and the picker sets it ONLY for a device
+            // devicectl can see, i.e. one that is already iOS 17+. So a failure here is a locked
+            // or untrusted phone far more often than a version problem, and the old copy sent the
+            // reader to fix the one thing that could not be the cause. The version note survives
+            // because the id CAN also be hand-typed in Project Settings, where it is reachable.
+            //
+            // `devicectl` is CoreDevice-only — it REFUSES anything below iOS 17 with
+            // "This device does not support acquiring a usage assertion" (error 1010) or a
+            // bare "device was not found". The xcodebuild step works fine on an old device,
+            // so the build genuinely succeeded and only the CLI handoff is impossible.
+            // Measured on an iPhone 7 / iOS 15.8.2, where devicectl cannot install but Xcode's
+            // Run does. iOS 17+ deliberately STAYS here rather than moving to go-ios: go-ios
+            // needs a sudo `ios tunnel start` on 17+, and Apple's own tool needs nothing.
+            iosInstall.ok && iosInstall.mode === 'devicectl' ? [
+              { label: 'Installing on device...', cmd: `${iosAppPath} && { xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH" || { ${iosHandoff('⚠️  devicectl could not install to this device. Check it is unlocked, awake and trusted; devicectl also cannot reach anything below iOS 17.')}; exit 1; }; }`, cwd: iosCwd },
+              { label: 'Launching app...', cmd: `xcrun devicectl device process launch --device ${IOS_DEVICECTL} ${APP_ID}`, cwd: iosCwd },
+            ]
+            // go-ios: the iOS ≤16 device that has no devicectl id in EXISTENCE (it isn't a
+            // CoreDevice, so `devicectl list devices` reports it `unavailable`). This used to be
+            // the dead end that ended every such build with a human pressing ⌘R. go-ios talks to
+            // the device over usbmuxd and installs the `.app` FOLDER directly — no Payload/ + zip
+            // step, unlike the libimobiledevice recipe in docs/build.md. Verified end to end on
+            // an iPhone 8 / iOS 16.7.16: kill → install → launch → a new pid that outlives the
+            // tool, 4s for the whole cycle.
+            : iosInstall.ok && iosInstall.mode === 'go-ios' ? [
+              { label: 'Installing on device (go-ios)...', cmd: `${iosAppPath} && { ${GO_IOS_Q} install --path="$APP_PATH" --udid=${IOS_DEST} || { ${iosHandoff('⚠️  go-ios could not install to this device.')}; exit 1; }; }`, cwd: iosCwd },
+              // A launch failure is NOT worth failing the build over: the new build is already on
+              // the phone, which is the part that can't be redone by tapping an icon. Say what
+              // happened and exit 0.
+              //
+              // ⚠️ **LEAD WITH THE INSTALL HAVING SUCCEEDED, and do not blame the lock screen.** This
+              // used to read "unlock the device and tap the icon", which names the ONE cause an
+              // agent or a human can act on and is wrong on the hardware that actually hits this.
+              // `go-ios launch` drives Apple's INSTRUMENTS service (`processcontrol` over
+              // `com.apple.instruments.remoteserver.DVTSecureSocketProxy`), and on an older handset
+              // that service can be permanently unavailable — measured on the iPhone 8 / iOS 16.7.16
+              // under Xcode 26.5, where it fails with a handshake EOF that no unlock, replug or
+              // Developer-Disk-Image mount changes (one is already mounted; `ios image auto` is a
+              // no-op there). It is the same dead instruments stack that stops WebDriverAgent on
+              // that phone and hides it from `xctrace` — see docs/trusted-device-input.md, and do
+              // not re-diagnose it.
+              //
+              // The failure therefore reads as "the build did not deploy" while the app is sitting
+              // on the phone, freshly installed. The one thing the reader needs is that the INSTALL
+              // landed; the cause is second, and go-ios's own error is already on the build stream
+              // above this line for the detail.
+              { label: 'Launching app...', cmd: `${GO_IOS_Q} launch ${APP_ID} --udid=${IOS_DEST} || { echo ""; echo "✅ Installed — the new build IS on the device."; echo "⚠️  Auto-launch failed, so it did not come to the foreground. Tap the app icon to run it."; echo "   Launching goes through Apple's instruments service, which some older devices do not"; echo "   provide (iOS ≤16 on a recent Xcode) — there the install is hands-free but the launch"; echo "   never will be. A locked or asleep device causes this too, so check that first."; }`, cwd: iosCwd },
+            ]
+            // Neither tool can reach it: an iOS ≤16 device on an editor with no go-ios and no way
+            // to provision one. The build DID succeed, so report success and hand off — exiting
+            // non-zero here would label a healthy legacy-device build "failed".
+            : [
+              { label: 'Handing off to Xcode (no CLI install available)...', cmd: `echo "ℹ️  No devicectl id set (that needs iOS 17+), and go-ios is not available to install to an older device."; echo "   Install go-ios from Build Support to make this hands-free."; ${iosHandoff('ℹ️  Deploying from Xcode instead.')}`, cwd: iosCwd },
+            ];
           const stepsByPlatform: Record<string, BuildStep[]> = {
             // iOS is macOS-only (preflight blocks it off-darwin), so its bash-only steps
             // (`$(…)`, `~`, xcodebuild/xcrun) never run on Windows — no winCmd needed.
@@ -2009,26 +2138,7 @@ export function assetScannerPlugin(): Plugin {
               ...(iosIconStep ? [iosIconStep] : []),
               { label: 'Syncing Capacitor iOS...', cmd: 'npx cap sync ios', cwd: iosCwd },
               { label: 'Building Xcode project...', cmd: `xcodebuild ${iosXcodeTarget} -scheme App -configuration Debug -destination 'id=${IOS_DEST}' -allowProvisioningUpdates build`, cwd: iosCwd },
-              // `devicectl` is CoreDevice-only — it REFUSES anything below iOS 17 with
-              // "This device does not support acquiring a usage assertion" (error 1010) or a
-              // bare "device was not found". The xcodebuild step above works fine on an old
-              // device, so the build genuinely succeeded and only the CLI handoff is
-              // impossible; failing with a raw CoreDeviceError there reads as "your build is
-              // broken" when the only thing missing is a way to push it. So fall back to
-              // handing the project to Xcode, which can still deploy to iOS 15. Measured on an
-              // iPhone 7 / iOS 15.8.2, where devicectl cannot install but Xcode's Run does.
-              // A pre-iOS-17 device has NO devicectl id to configure (it isn't a CoreDevice,
-              // so `xcrun devicectl list devices` reports it `unavailable`). That is a known,
-              // expected state — not a misconfiguration — so when the id is empty we skip
-              // straight to the Xcode handoff and report SUCCESS: the build did succeed, and
-              // only the CLI push is unavailable. Exiting non-zero here would label a healthy
-              // legacy-device build "failed".
-              iosInstall.ok && iosInstall.mode === 'devicectl'
-                ? { label: 'Installing on device...', cmd: `APP_PATH=$(ls -dt ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app 2>/dev/null | head -1) && { xcrun devicectl device install app --device ${IOS_DEVICECTL} "$APP_PATH" || { echo ""; echo "⚠️  devicectl could not install to this device — it requires iOS 17+."; echo "   The app BUILT fine; only the command-line install is unavailable."; echo "   Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosXcodeTarget.replace(/^-(workspace|project) /, '')}" 2>/dev/null || true; exit 1; }; }`, cwd: iosCwd }
-                : { label: 'Handing off to Xcode (device predates devicectl)...', cmd: `echo "ℹ️  No iOS devicectl id set — devicectl requires iOS 17+, so this device can only be deployed from Xcode."; echo "   The app BUILT fine. Opening the Xcode project — press Run (⌘R) there to deploy."; open "${iosXcodeTarget.replace(/^-(workspace|project) /, '')}" 2>/dev/null || true`, cwd: iosCwd },
-              ...(iosInstall.ok && iosInstall.mode === 'devicectl'
-                ? [{ label: 'Launching app...', cmd: `xcrun devicectl device process launch --device ${IOS_DEVICECTL} ${APP_ID}`, cwd: iosCwd }]
-                : []),
+              ...iosDeploySteps,
             ],
             android: [
               { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
@@ -2195,6 +2305,21 @@ export function assetScannerPlugin(): Plugin {
             sendStatus(`FAILED:No iOS device configured\n${msg}`);
             res.end();
             return;
+          }
+
+          // #285 sibling: IOS_DEST is confirmed non-empty by the `iosInstall.ok` guard just above —
+          // check it against the machine-wide claims the same way the Android leg does, before the
+          // build spends minutes on `xcodebuild` only to install over a sibling clone's phone.
+          if (platform === 'ios') {
+            const foreign = foreignClaimFor(iosDeviceId(IOS_DEST));
+            if (foreign) {
+              const msg = `[build] Cannot build to this iOS device: ${describeConflict(foreign)} `
+                + '(refused by the build, not just device_connect).';
+              send(msg);
+              sendStatus(`FAILED:iOS device is claimed by another clone\n${msg}`);
+              res.end();
+              return;
+            }
           }
 
           // iOS signing needs a Team ID that maps to a signed-in Xcode account.
@@ -2384,6 +2509,23 @@ export function assetScannerPlugin(): Plugin {
             // + cheap; a no-op when nothing changed (or already healed by the scaffold).
             if (platform === 'ios' || platform === 'android') {
               for (const n of healNativeConfig(projectRoot).notes) send(`[heal] ${n}`);
+            }
+            // Provision go-ios the moment a build actually needs it — this build targets an iOS
+            // device `devicectl` cannot reach, and without go-ios the deploy ends in a manual ⌘R.
+            // Deliberately NOT in AUTO_INSTALL: 17 MB down / 45 MB on disk, useless to anyone whose
+            // phone is iOS 17+, so it is fetched here (once) rather than by every editor at
+            // onboarding. A failure is NOT fatal — the steps still run, `ios install` fails, and
+            // the step's own bail-out hands the project to Xcode exactly as it did before go-ios
+            // existed. That is why this can't strand a build it was only ever trying to improve.
+            if (platform === 'ios' && iosInstall.ok && iosInstall.mode === 'go-ios' && !goIosDetected.present && goIosToolchainDir) {
+              send('\nThis device predates devicectl (iOS 17+), so the build needs go-ios to install hands-free.');
+              try {
+                await installTool('go-ios', { toolchainDir: goIosToolchainDir, onLog: (line) => send(line) });
+                send('✅ go-ios provisioned — the app will install and launch without Xcode.');
+              } catch (e) {
+                send(`⚠️  Could not provision go-ios (${e instanceof Error ? e.message : String(e)}) — falling back to the Xcode handoff.`);
+              }
+              if (aborted) return;
             }
             // Heal engine-REQUIRED Capacitor plugins on EVERY native build. A project
             // scaffolded before an engine feature added a runtime plugin — @capacitor/preferences
@@ -2641,7 +2783,7 @@ export function assetScannerPlugin(): Plugin {
             // content INSIDE an installed native app, so it is served from the app root — never
             // `--target web`, which would bake in the project's sub-path webBasePath (#40).
             sendStatus('Building web assets...');
-            const build = await runStep('Building web assets...', 'node engine/scripts/build-web.mjs --target native', buildCwd, { ...gcloudEnv, MODOKI_PROJECT: projectRoot });
+            const build = await runStep('Building web assets...', 'node engine/scripts/build-web.mjs --target native', buildCwd, otaPublishBuildStepEnv(gcloudEnv, projectRoot));
             if (aborted) return;
             if (!build.ok) { sendStatus(`FAILED:Building web assets\n${build.output.slice(-1500)}`); res.end(); return; }
 
@@ -2779,12 +2921,49 @@ export function assetScannerPlugin(): Plugin {
       // Resolve the module flags the same way vite.config.ts does, so the shaker and the
       // bundle agree on what is in this build. `video: false` drops the clips — the toggle's
       // real payload, since video's JS is engine code the runtime barrel keeps alive anyway.
+      const projectConfig = loadProjectConfig(projectRoot);
       const buildModules = resolveModules(
-        loadProjectConfig(projectRoot).build.modules,
+        projectConfig.build.modules,
         projectRoot,
         { playable: process.env.VITE_PLAYABLE === '1' },
       );
+      // Texture LOD by quality tier (#212): the DISTINCT non-zero `textureMaxSize` caps this
+      // project's `mid`/`low` tiers author, if any. Read ONCE here (not project's `high`/default —
+      // that tier ships the source size, nothing to shrink). An unauthored project (no `tiers`,
+      // the common case today) yields an empty array and the emit loop below is a no-op — a
+      // byte-identical build to before this feature existed.
+      //
+      // Gated on `shouldEmitTextureTierVariants` (owner decision): every size ships INSIDE the
+      // package, so a plain native install pays the +19% dist cost for nothing it will ever
+      // fetch. Emit only when the payload travels over the wire (web, or an OTA publish) unless
+      // the project's `build.textureTierVariants` overrides it — see `plugins/textureTierEmit.ts`.
+      const tierTextureMaxSizeCaps = shouldEmitTextureTierVariants(projectConfig.build.textureTierVariants)
+        ? Array.from(new Set(
+          [projectConfig.rendering.three.tiers?.mid?.textureMaxSize, projectConfig.rendering.three.tiers?.low?.textureMaxSize]
+            .filter((v): v is number => typeof v === 'number' && v > 0),
+        ))
+        : [];
       const result = computeKeptAssets(projectRoot, assetRoots, { excludeVideo: !buildModules.video });
+      // Build-time guard (#237): fail rather than ship a ref the structured walk could not see.
+      // computeKeptAssets' unreachableRefs is empty on every committed project today — a
+      // non-empty entry means probeTraitRefs (plugins/asset-tree-shaker.ts) has a blind spot
+      // like #237's (SkinnedMeshRenderer.materials, a nested Record no field-shape handler
+      // covered), and the asset it names resolves to nothing at runtime: dropped from the build,
+      // 404ing on-device with no dev-mode symptom to catch it first (dev serves everything off
+      // disk regardless of the shake). Deliberately BUILD-ONLY — the editor's own
+      // computeUnused() call (the "Clean Up Unused Assets" dialog, above in this file) must stay
+      // non-throwing, since it runs on every keystroke-adjacent editor action, not just a build.
+      if (result.unreachableRefs.length > 0) {
+        const detail = result.unreachableRefs
+          .map((r) => `  ${r.guid} → ${r.target} (referenced by ${r.referencedBy})`)
+          .join('\n');
+        throw new Error(
+          `[asset-shaker] found ${result.unreachableRefs.length} ref(s) the tree-shaker could not see:\n${detail}\n` +
+          `Each of these resolves to nothing at runtime — the asset is dropped from the build and the ` +
+          `value silently does not apply. Either teach the walker this ref shape (probeTraitRefs in ` +
+          `plugins/asset-tree-shaker.ts), remove the ref, or list the asset in this project's asset-keep.json.`,
+        );
+      }
       const CONVERTIBLE = new Set(['.png', '.jpg', '.jpeg']);
       const MODEL_EXTS = new Set(['.glb', '.gltf']);
       const AUDIO_EXTS = new Set(['.mp3', '.m4a', '.aac', '.wav', '.ogg', '.flac']);
@@ -2842,6 +3021,28 @@ export function assetScannerPlugin(): Plugin {
             fs.copyFileSync(cacheFile, destPath);
             variantCount++;
           }
+          // Texture LOD by quality tier (#212) — additional derived files at the project's
+          // authored tier caps, ORTHOGONAL to the primary conversion above (same source, same
+          // format, only `maxSize` differs). `sizesToEmit` is the pure decision (unit-tested on
+          // its own); a cap that cannot shrink this texture further than it already is emits
+          // nothing, so a texture already below every tier cap costs zero extra files. Skipped
+          // entirely for a project that authors no tiers (`tierTextureMaxSizeCaps` is empty) —
+          // the whole point being that such a project's build stays byte-identical.
+          const capSizes = sizesToEmit(tierTextureMaxSizeCaps, settings.maxSize, conv.srcWidth, conv.srcHeight);
+          for (const cap of capSizes) {
+            const capSettings: TextureImportSettings = { ...settings, maxSize: cap as TextureImportSettings['maxSize'] };
+            const capConv = await convertTexture({ projectRoot, sourceUrlPath: virtualPath, absSource: srcAbs, settings: capSettings, textureType });
+            for (const v of capConv.variants) {
+              const cacheFile = cachePathFor(getCacheDir(projectRoot), virtualPath, capConv.hash, v);
+              const destPath = path.join(distDir, (virtualPath + variantSuffix(v, cap)).replace(/^\//, ''));
+              fs.mkdirSync(path.dirname(destPath), { recursive: true });
+              fs.copyFileSync(cacheFile, destPath);
+              variantCount++;
+            }
+          }
+          // Bake which caps actually got a variant onto the manifest-bound settings — the runtime
+          // resolver must never GUESS a capped URL that wasn't emitted (see textureResolver.ts).
+          if (capSizes.length > 0) settings.sizes = capSizes;
           convertedSettings.set(virtualPath.normalize('NFC'), settings);
           convertedHashes.set(virtualPath.normalize('NFC'), conv.hash);
         } catch (e) {
@@ -3016,14 +3217,15 @@ export function assetScannerPlugin(): Plugin {
       // The source `.ttf`/`.otf` ships ONLY when something needs it. There are two
       // distinct consumers, and only one needs the real outlines: CANVAS text
       // (`Text2D.font`, a GUID) renders from the atlas alone, while DOM/PixiJS text
-      // (`UIElement.fontFamily`, a CSS family NAME) goes through the browser's
+      // (`UIElement.fontFamily`, a font-asset GUID since #231) goes through the browser's
       // FontFace API — and the manifest entry for a font IS its source path, so
       // `loadAllFonts` FontFace-loads exactly that. Shipping it unconditionally wastes
       // ~300KB/font on a canvas-only game; never shipping it 404s at boot
       // ("[FontLoader] N/N fonts failed to load") for a DOM-using one. So: ship the
       // source iff `result.domFontFiles` (computed by the shaker's font-family walk —
       // see resolveFontsByFamily in asset-tree-shaker.ts) says a scene/prefab named
-      // this font's family in `fontFamily`, UNLESS `shipSource` overrides the call —
+      // this font in `fontFamily` (by GUID, or by family name in a pre-#231 scene),
+      // UNLESS `shipSource` overrides the call —
       // `'always'` for a family named from CODE (a runtime string, not a scene field,
       // which the static scan can't see) or `'never'` to force-drop despite detected
       // DOM usage. The decision is recorded as `sourceShipped` on the manifest's `font`
@@ -3233,8 +3435,6 @@ export function assetScannerPlugin(): Plugin {
               __MODOKI_MODULE_RENDER2D__: 'true',
               __MODOKI_MODULE_PHYSICS2D__: 'true',
               __MODOKI_MODULE_PHYSICS3D__: 'true',
-              __MODOKI_MODULE_NPR__: 'true',
-              __MODOKI_MODULE_GPU_PARTICLES__: 'true',
               __MODOKI_MODULE_VIDEO__: 'true',
             },
             resolve: {
@@ -3499,6 +3699,13 @@ export function assetScannerPlugin(): Plugin {
             // than storing a variant list. A 2d/ui texture also emits a WebP sibling.
             for (const v of variantsToEmit(entry.texture.format, entry.textureType ?? resolveTextureType({ texture: entry.texture }))) {
               checkFile(entry.path + variantSuffix(v), 'variant');
+              // Texture LOD by quality tier (#212) — verify every size the manifest CLAIMS was
+              // emitted actually landed in dist. `entry.texture.sizes` is baked by the emitter
+              // above, so a mismatch here is a real bug (a cap the runtime would 404 on), not a
+              // derivable set like the base variants above it.
+              for (const cap of entry.texture.sizes ?? []) {
+                checkFile(entry.path + variantSuffix(v, cap), 'tier-sized variant');
+              }
             }
           } else if (entry.modelCache) {
             for (const lodPath of entry.modelCache.lodPaths) {

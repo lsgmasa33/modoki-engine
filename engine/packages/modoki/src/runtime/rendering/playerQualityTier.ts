@@ -22,7 +22,7 @@
 
 import { playerTierStore } from '../core/playerTierStore';
 import { getDeviceCapsSync } from './deviceCaps';
-import { resolveTier, type QualityTier } from './qualityTier';
+import { buildTierResolveInput, isQualityTier, resolveTier, type QualityTier } from './qualityTier';
 import { getRenderSettings } from './renderSettings';
 import { applyQualityTier } from './tierCalibration';
 
@@ -33,7 +33,10 @@ import { applyQualityTier } from './tierCalibration';
  *  into the renderer. Anything unrecognised reads as "no choice". */
 export function getPlayerQualityTier(): QualityTier | null {
   const raw = playerTierStore.get()?.read() ?? null;
-  return raw === 'low' || raw === 'high' ? raw : null;
+  // Through `isQualityTier`, never a hand-written union: a second copy of the valid set is how a
+  // newly added tier (`mid`, #188) would persist fine and then read back as "no choice" on the
+  // next launch, which looks exactly like the player never picked it.
+  return isQualityTier(raw) ? raw : null;
 }
 
 /** Record the player's choice. `null` clears it, handing control back to the project setting and
@@ -70,15 +73,22 @@ export function choosePlayerQualityTier(tier: QualityTier | null): void {
   // Feed the CACHED probe, never a bare `{platform:''}` (#155). Since `'auto'` became the default,
   // an input with no facts resolves `low` — so passing none would downgrade a desktop the moment
   // its player picked "Auto", which is the opposite of what Auto means. Sync by design: the probe
-  // ran at renderer bring-up, so by the time a settings menu exists it is cached; `null` (it
-  // somehow did not) falls through to the same safe side as a failed probe.
+  // ran at renderer bring-up, so by the time a settings menu exists it is cached; `null` falls
+  // through to the same safe side as a failed probe.
+  //
+  // ⚠️ `null` IS ROUTINE NOW, not the "somehow it did not" this comment used to call it. A
+  // project that authored ONE quality config never reaches `getDeviceCaps()` at all — bring-up
+  // returns at the `single-config` gate above it (`resolveActiveTierOnce`), deliberately, since
+  // building a throwaway caps-probe renderer to choose between configs that do not exist is
+  // exactly the cost that gate removes. What keeps this from being a #155 regression is that
+  // with one config EVERY tier resolves to the same unclamped overrides, so the tier named here
+  // cannot change a pixel. If that ever stops being true, warm the caps before this line.
+  //
+  // ⚠️ THROUGH `buildTierResolveInput`, NOT A HAND-ASSEMBLED OBJECT. This call site used to build
+  // its own and omit `probeClass` — so "Auto" threw away the boot probe's verdict and, on Android
+  // (where the GPU allowlist is empty and nothing else can answer), dropped a device the probe had
+  // measured as `middle` all the way to `calibrating → low`. See the builder's docblock.
   const caps = getDeviceCapsSync();
-  const resolved = resolveTier({
-    platform: caps?.platform ?? '',
-    deviceModel: caps?.deviceModel,
-    gpuRenderer: caps?.gpuRenderer,
-    formFactor: caps?.formFactor,
-    projectSetting: setting,
-  });
+  const resolved = resolveTier(buildTierResolveInput(caps, setting));
   applyQualityTier(resolved.tier, resolved.source, `player chose Auto — ${resolved.reason}`);
 }

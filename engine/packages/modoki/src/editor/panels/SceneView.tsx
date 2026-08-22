@@ -17,6 +17,7 @@ import { setSkeletalPreview } from '../../runtime/core/skeletalPreview';
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/transformPropagationSystem';
+import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { markOverrideIfInstance } from '../undo/entityActions';
 import { Transform, EntityAttributes, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
@@ -34,7 +35,8 @@ import {
   PRIORITY_EDITOR_3D, PRIORITY_EDITOR_2D,
 } from '../../runtime/rendering/frameDriver';
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from '../../runtime/rendering/particleSync';
-import { registerBoundsProvider, projectAABBToScreen, type EntityScreenBounds } from '../../runtime/core/screenBounds';
+import { registerBoundsProvider } from '../../runtime/core/screenBounds';
+import { computeEntityScreenBounds } from '../../runtime/rendering/entityScreenBounds';
 import { registerPickProvider } from '../../runtime/core/screenPick';
 import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from '../../runtime/rendering/flameMeshSync';
@@ -50,7 +52,8 @@ import { acquireRenderer, releaseRenderer, discardRenderer } from './rendererLea
 import { drawColliderOutline, drawSkinnedMeshFlat2D, drawSkinnedMeshWireframe2D, drawWeightHeatmap2D, drawDominantBoneMap2D, computePivotOffset, COLLIDER_SPRITE } from '../../runtime/rendering/render2DUtils';
 import { getSkin2DBuffer } from '../../runtime/skinning/skin2DBuffers';
 import { getRig2D, type ParsedRig2D } from '../../runtime/loaders/rig2dCache';
-import { resolveMeshTemplate } from '../../runtime/loaders/meshTemplateCache';
+import { resolveMeshTemplate, onModelInvalidated } from '../../runtime/loaders/meshTemplateCache';
+import { onModelTemplatesLoaded } from '../../runtime/loaders/modelLoadNotify';
 import { boneWeightField, dominantBoneField } from '../../runtime/skinning/rig2dWeightPaint';
 import { overlayPartIndices } from './skinWeightOverlay';
 import { computeCanvasScale, screenToReference2D } from '../../runtime/rendering/canvas2DScaler';
@@ -66,7 +69,7 @@ import { useEditorStore } from '../store/editorStore';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { isTextEditable } from '../input/focusScope';
-import { worldToLocalTransform } from '../scene/gizmoTransform';
+import { worldToLocalTransform, clampScaleCrossingPivot, scaleCrossedPivot, scaleFromGizmoRatio, type ScaleSigns } from '../scene/gizmoTransform';
 import { boneRelToProxyLocal, proxyLocalToBoneLocal } from '../scene/billboardBonePose';
 import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, canFrameSelected, setViewportController, setEcsObjectsRegistry } from '../scene/sceneViewBus';
 import { withWarnFilter } from '../scene/warnFilter';
@@ -85,10 +88,12 @@ import {
 } from '../../runtime/core/colliderPoints';
 import { colliderEditInfo, worldPointToLocal, localToWorld, pickVertex, colliderPickHalfExtents } from './colliderEdit2D';
 import { descendantUnionGizmoBox2D } from './gizmoBounds';
+import { gizmoWorldScale, rotateRingAim, scaleCenterAim, axisPickAim, ROTATE_RING_RADIUS, SCALE_XYZ_HALF_EXTENT, AXIS_PICKER_CENTER } from './gizmo3dAim';
 import { drawGizmo2D, hitTestGizmo2D, cursorForHandle, applyGizmoDrag2D, snapDragResult, DEFAULT_GIZMO_SNAP, worldToLocal2D, type GizmoHandle } from './Gizmo2D';
 import { layoutText } from '../../runtime/rendering/text/layoutText';
 import { getLoadedFont } from '../../runtime/loaders/fontAtlasLoader';
 import { onTextDirty } from '../../runtime/rendering/text/textDirty';
+import { onMaterial3DDirty } from '../../runtime/rendering/materialDirty';
 
 /** The 2D gizmo box for a Text2D entity: the laid-out text block (px in Canvas2D
  *  units) as HALF-extents (the gizmo/outline convention — box is w*2×h*2), with the
@@ -109,6 +114,8 @@ function text2DGizmoBox(entity: { has: (t: unknown) => boolean; get: (t: unknown
   return { halfW: layout.width / 2, halfH: layout.height / 2, pivotX: (t.anchorX as number) ?? 0.5, pivotY: (t.anchorY as number) ?? 0.5 };
 }
 import { pick2D, pick3D, type Pick2DCandidate, type Pick3DEntry } from './picking';
+import { safeAreaCssVars } from '../scene/devicePresets';
+import SafeAreaOverlay from '../rendering/SafeAreaOverlay';
 import { UIResizeOverlay } from './UIResizeOverlay';
 import { UIFocusGraphOverlay } from './UIFocusGraphOverlay';
 import { SceneViewGizmo } from './SceneViewGizmo';
@@ -391,9 +398,18 @@ function SceneBreadcrumb({ onExitPrefab }: { onExitPrefab: () => void }) {
 
 export default function SceneView() {
   const hmrEpoch = useHmrEpoch();
-  // Mode lives in the editor store (init from localStorage there) so it's
-  // agent-drivable (set-scene-view-mode) — the <select> below is native and can't
-  // be operated by trusted input. The setter persists to localStorage + marks 2D dirty.
+  // Mode lives in the editor store (init from localStorage there) so it's agent-drivable
+  // (`set-scene-view-mode` / `modoki_scene_view_mode`). The setter persists to localStorage +
+  // marks 2D dirty.
+  //
+  // The <select> below carries `data-ui-id="sceneView.toolbar.mode"` so it can at least be
+  // ADDRESSED — located, and its committed `value` asserted after a mode change. That is the
+  // honest limit of what a hook buys here: a NATIVE select's option list is rendered by the OS,
+  // not the page, so neither a synthetic click nor ArrowDown can open or commit it (verified with
+  // focus confirmed on the element). The id is therefore for verification, not for driving; the
+  // programmatic op above remains the only way to CHANGE the mode. Swapping this for a custom
+  // DOM dropdown is what would make the gesture itself testable, and is deliberately not done
+  // here — see the editor-surface convention in CLAUDE.md before changing it.
   const mode = useEditorStore((s) => s.sceneViewMode);
   const setMode = useEditorStore((s) => s.setSceneViewMode);
   const modeRef = useRef(mode);
@@ -632,15 +648,18 @@ export default function SceneView() {
 
   return (
     <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-      {/* Toolbar */}
-      <div style={{
+      {/* Toolbar. `data-ui-id` is not decoration: this strip OVERLAPS the viewport's top edge, so a
+          gizmo/collider handle near the top of the scene resolves to a point underneath it, and the
+          occlusion report is the only thing that tells a caller why their press did nothing. An
+          anonymous div made that report read "covered by div" (testboard 5jE5Tip6Qwp7s7YVAYoH). */}
+      <div data-ui-id="sceneView.toolbar" style={{
         height: 32, background: '#1e1e30', borderBottom: '1px solid #333',
         display: 'flex', alignItems: 'center', padding: '0 6px', flexShrink: 0,
         fontFamily: 'monospace', fontSize: '13px', gap: 3,
       }}>
         <SceneBreadcrumb onExitPrefab={exitPrefabEdit} />
         <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
-        <select value={mode} onChange={(e) => setMode(e.target.value as '3d' | 'ui')} style={{
+        <select data-ui-id="sceneView.toolbar.mode" value={mode} onChange={(e) => setMode(e.target.value as '3d' | 'ui')} style={{
           background: '#1e1e30', color: '#ccc', border: '1px solid #555', borderRadius: 3,
           padding: '2px 6px', fontSize: '12px', fontFamily: 'monospace', fontWeight: 'bold', cursor: 'pointer',
         }}>
@@ -2019,6 +2038,7 @@ function registerScene2DColliderHandles(canvasEntityId: number, getCanvas: () =>
         y: rect.top + (backingY / ph) * rect.height,
         label: `vertex ${i}`,
         meta: { entityId: selId, index: i, local: [p.x, p.y] },
+        owner: canvas,
       };
     });
   });
@@ -2072,6 +2092,7 @@ function registerScene2DGizmoHandles(getCanvas: () => HTMLCanvasElement | null, 
         y: rect.top + (backingY / ph) * rect.height,
         label: `${mode} ${handle}`,
         meta: { handle, mode, space, world: [wx, wy] },
+        owner: canvas,
       };
     });
   });
@@ -2188,6 +2209,7 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
   const selectEntity = useEditorStore((s) => s.selectEntity);
   const selectedId = useEditorStore((s) => s.selectedEntityId);
   const gameViewSize = useEditorStore((s) => s.gameViewSize);
+  const gameViewSafeArea = useEditorStore((s) => s.gameViewSafeArea);
   const showFocusGraph = useEditorStore((s) => s.showFocusGraph);
   const bounds = useLetterboxBounds();
   // Render the UI at the LOGICAL device resolution and visually fit it with
@@ -2227,6 +2249,11 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
       zIndex: 10,
       overflow: 'hidden',
       pointerEvents: 'none',
+      // Same simulated safe area as the Game panel (published to the store by GameView,
+      // which owns the device picker). Both viewports mount the SAME UI tree, so an inset
+      // applied in one and not the other would put an element in two different places and
+      // make the authoring preview the liar instead of the game preview (#271).
+      ...safeAreaCssVars(gameViewSafeArea),
     }}>
       <UIRenderer
         onSelectEntity={(id) => selectEntity(id)}
@@ -2234,6 +2261,9 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
         uiVisualsHidden={!showUI}
       />
       {showUI && showFocusGraph && <UIFocusGraphOverlay />}
+      {/* The bands the vars above inset by — same overlay the Game panel draws, so the
+          authoring view and the game view explain themselves identically. */}
+      {showUI && <SafeAreaOverlay insets={gameViewSafeArea} />}
       {selectedId !== null && (
         <div style={{ position: 'absolute', inset: 0, zIndex: 100000, pointerEvents: 'none' }}>
           <UIResizeOverlay entityId={selectedId} />
@@ -2376,8 +2406,19 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       releaseRenderer(container);
       return;
     }
-    setActiveRenderer(renderer); // KTX2Loader GPU-format detection
+    await setActiveRenderer(renderer); // KTX2Loader GPU-format detection (async since #254)
     noteRendererProgress('renderer registered (setActiveRenderer called)');
+    // RE-CHECK, and it is the SECOND await in this body, not the first. #254 made
+    // `setActiveRenderer` genuinely async (it fetches the KTX2Loader chunk on a cold boot), so
+    // an unmount can land here — past the guard above. `cleanup` is not assigned until the very
+    // END of setup(), ~2000 lines down, so bailing without this check makes the effect's
+    // teardown a no-op while setup runs on to `startFrameDriver()`: a zombie renderer animating
+    // a detached canvas, its container lease never released, one per open/close cycle.
+    if (outerDisposed) {
+      noteRendererProgress('viewport unmounted while the KTX2 loader chunk was in flight');
+      releaseRenderer(container);
+      return;
+    }
     rendererRef.current = renderer;
 
     let disposed = false;
@@ -2438,6 +2479,31 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       onWorldSwap(markViewportDirty),              // scene load/reload, Play/Stop world rebuild
       onPlayStateChange(markViewportDirty),        // Play ↔ Stop ↔ Pause edges
       onTextDirty(markViewportDirty),              // dynamic-font glyph gen / async atlas load (not an ECS write)
+      // MaterialInstance prop overrides write a number straight onto a THREE.Material clone —
+      // no trait write, no store change, so NOTHING else here armed the gate and the viewport
+      // kept showing the pre-change frame. Data-level checks all pass while only the pixels are
+      // stale, and capture_viewport cannot reveal it either (it screenshots the window, it does
+      // not force a render). See runtime/rendering/materialDirty.ts.
+      onMaterial3DDirty(markViewportDirty),
+      // Model re-import — BOTH edges, and both are load-bearing. The invalidation evicts the
+      // live meshes (attachInvalidationListener above), which changes the image immediately;
+      // the rebuild lands whenever the GLB finishes re-parsing, which routinely outlasts the
+      // gate's ~1s grace. Without the second one the object stayed missing indefinitely on
+      // this render-on-demand viewport (QA-ASSET-0008).
+      onModelInvalidated(markViewportDirty),
+      onModelTemplatesLoaded(markViewportDirty),
+      // ⚠️ UNDO/REDO. It reverts traits with a direct `entity.set`, which does NOT go through
+      // writeTraitField and so fires NO dirty broadcast — the 2D gate has said exactly this since
+      // it was bitten (see the subscribeUndo effect above), and the 3D gate simply never got the
+      // same wiring. Without it `scene3DSync` does not run after an undo, so the THREE object
+      // keeps its PRE-undo world matrix while the ECS Transform is already reverted, and the next
+      // reader of the render-side state gets the stale value for one call: `focus_entity` framed
+      // the camera at x:1807 for an entity back at x:5, a gizmo drag computed its base from the
+      // un-reverted position (so a second undo could not restore the original), and the projected
+      // gizmo aim-points briefly reported no handles at all. Calling either a SECOND time
+      // "fixed" it only because the first call moved the camera, and OrbitControls' own 'change'
+      // armed the gate. Testboard QA-SVIEW-0001 / QA-SVIEW-0003.
+      subscribeUndo(markViewportDirty),
       useEditorStore.subscribe(markViewportDirty), // selection, gizmo mode/space, view mode, layers, particlePreview, gameRect …
     ];
 
@@ -2458,6 +2524,26 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     //    axis basis follows gizmoSpace. Skips an axis pointing ~at/away from the camera
     //    (un-aimable) and returns [] when nothing's attached. meta.approximate flags these
     //    as aim aids, not exact handle centres.
+    //
+    //    ROTATE is the exception and does NOT use a fixed pixel offset — its picker is a thin
+    //    torus with nothing inside it, so an offset guess aims into the hole and the press
+    //    orbits the camera. `gizmo3dAim.ts` derives that ring's real world radius instead.
+    //
+    //    `owner` is the renderer canvas, and it is load-bearing rather than decorative. The
+    //    aim point is the object's origin plus a FIXED SCREEN OFFSET (52px), so on a narrow
+    //    Scene panel it can land past the canvas edge and over a neighbouring panel — where
+    //    the trusted click goes to that panel and the gizmo never sees a pointerdown. Without
+    //    an owner, `computeHandles` cannot occlusion-check the point, so the handle came back
+    //    `occlusionChecked:false` and `modoki_drag_handle` answered a cheerful ok:true with a
+    //    resolved from/to while nothing moved at all.
+    //
+    //    MEASURED 2026-08-18 (games/anim-bug, backend 5183, Scene canvas 256px wide): the Sun
+    //    light's origin projected to x=253.8, its +x aim point to x=305.1 — 49px into the
+    //    Assets panel, `document.elementFromPoint` returning that panel's row — and the drag
+    //    moved nothing, while the Sphere at x=177 moved 0 -> 1.516 on the identical call. It
+    //    was filed as "a LIGHT's gizmo does nothing, a mesh works" (QA-SVIEW-0003) and is not
+    //    about lights: it is about WHERE the two happened to project. With the owner supplied
+    //    the same call now reports `occluded:true` + `occludedBy` naming the cover.
     const unregGizmo3DHandles = registerHandleProvider((): InteractionHandle[] => {
       const obj = gizmo.object;
       if (!obj || !gizmo.enabled || !(gizmo as { visible?: boolean }).visible) return [];
@@ -2480,31 +2566,66 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         const base = ax === 'x' ? new THREE.Vector3(1, 0, 0) : ax === 'y' ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, 0, 1);
         return localBasis ? base.applyQuaternion(q) : base;
       };
-      // On-screen unit direction of a world axis at the origin (null if ~parallel to view).
-      const screenDir = (dir: THREE.Vector3) => {
-        const sC = project(origin.clone().addScaledVector(dir, 0.001));
-        if (sC.z > 1) return null; // stepped behind camera
-        const dxs = sC.x - oC.x, dys = sC.y - oC.y;
-        const len = Math.hypot(dxs, dys);
-        if (len < 1e-4) return null; // axis points ~at/away from camera → un-aimable
-        return { x: dxs / len, y: dys / len };
-      };
       const out: InteractionHandle[] = [];
-      const push = (id: string, label: string, px: number, dir: THREE.Vector3, axis: string) => {
-        const sd = screenDir(dir);
-        if (!sd) return;
-        out.push({ id, kind: 'gizmo-axis', editor: 'gizmo3d', x: oC.x + sd.x * px, y: oC.y + sd.y * px, label, meta: { axis, mode: gizmoMode, space: gizmoSpace, approximate: true } });
+      const gizmoCam = (gizmo.camera ?? activeEditorCam) as THREE.PerspectiveCamera | THREE.OrthographicCamera;
+      const camPos = gizmoCam.getWorldPosition(new THREE.Vector3());
+      const worldScale = gizmoWorldScale(gizmoCam, camPos, origin, gizmo.size);
+      // `project` wants a real Vector3 (it clones + projects); the aim module speaks plain {x,y,z}.
+      const projectPlain = (p: { x: number; y: number; z: number }) => project(new THREE.Vector3(p.x, p.y, p.z));
+      // A handle with several equally good grab points prefers one the canvas actually owns, so the
+      // toolbar / view-cube chrome over the viewport corners doesn't blind an otherwise fine aim.
+      const reachable = (p: { x: number; y: number }) => {
+        const el = document.elementFromPoint(p.x, p.y);
+        return !!el && (el === renderer.domElement || renderer.domElement.contains(el));
       };
-      const PX = 52, RING_PX = 66;
+      // three's OWN `eye`, and the branch matters: for an ORTHOGRAPHIC camera it is the negated
+      // view direction, NOT the direction to the camera's position (TransformControls.js:1113).
+      // The editor has an orthographic sibling camera, so getting this wrong there would hide an
+      // axis three kept (dropping a usable handle) or publish one three collapsed to 1e-10 —
+      // reintroducing the exact miss this module exists to prevent, in ortho only.
+      const eye = (gizmoCam as THREE.OrthographicCamera).isOrthographicCamera
+        ? gizmoCam.getWorldDirection(new THREE.Vector3()).negate()
+        : camPos.clone().sub(origin).normalize();
+      // Which of three's internal pickers a press would select. Same defensive read as the pick
+      // provider below: a rename on upgrade degrades to "cannot tell" rather than throwing.
+      const pickerNameAt = (px: number, py: number): string | null => {
+        const picker = (gizmo as unknown as { _gizmo?: { picker?: Record<string, THREE.Object3D> } })._gizmo?.picker?.[gizmo.getMode()];
+        if (!picker || !picker.children.length) return null;
+        const n = { x: ((px - r.left) / r.width) * 2 - 1, y: -((py - r.top) / r.height) * 2 + 1 };
+        raycaster.setFromCamera(new THREE.Vector2(n.x, n.y), gizmoCam);
+        const hit = raycaster.intersectObjects(picker.children, true)[0];
+        return hit ? (hit.object.parent?.name || hit.object.name || null) : null;
+      };
       if (gizmoMode === 'translate' || gizmoMode === 'scale') {
-        for (const ax of ['x', 'y', 'z'] as const) push(`gizmo3d:${gizmoMode}:${ax}`, `${gizmoMode} ${ax}`, PX, axisDir(ax), ax);
-        // Centre = screen-space plane move / uniform scale (grab at the origin itself).
-        out.push({ id: `gizmo3d:${gizmoMode}:center`, kind: 'gizmo-axis', editor: 'gizmo3d', x: oC.x, y: oC.y, label: `${gizmoMode} center`, meta: { axis: 'center', mode: gizmoMode, space: gizmoSpace, approximate: true } });
+        for (const ax of ['x', 'y', 'z'] as const) {
+          const aim = axisPickAim({ origin, dir: axisDir(ax), offsetWorld: AXIS_PICKER_CENTER * worldScale, eye, project: projectPlain, reachable });
+          if (!aim) continue;
+          out.push({ id: `gizmo3d:${gizmoMode}:${ax}`, kind: 'gizmo-axis', editor: 'gizmo3d', x: aim.x, y: aim.y, label: `${gizmoMode} ${ax}`, meta: { axis: ax, mode: gizmoMode, space: gizmoSpace, approximate: true, world: [aim.world.x, aim.world.y, aim.world.z] }, owner: renderer.domElement });
+        }
+        // Centre = screen-space plane move (translate) / uniform scale. Translate grabs the origin
+        // itself; SCALE must not — three divides by the press's radius from the origin, so an
+        // exactly-centred press blows the ratio up (and flips its sign). See scaleCenterAim.
+        let centre: { x: number; y: number } | null = { x: oC.x, y: oC.y };
+        if (gizmoMode === 'scale') {
+          const camRight = new THREE.Vector3().setFromMatrixColumn(gizmoCam.matrixWorld, 0);
+          const camUp = new THREE.Vector3().setFromMatrixColumn(gizmoCam.matrixWorld, 1);
+          centre = scaleCenterAim({ origin, cameraRight: camRight, cameraUp: camUp, halfExtentWorld: SCALE_XYZ_HALF_EXTENT * worldScale, project: projectPlain, reachable, picksUniform: (p) => pickerNameAt(p.x, p.y) === 'XYZ' });
+        }
+        if (centre) out.push({ id: `gizmo3d:${gizmoMode}:center`, kind: 'gizmo-axis', editor: 'gizmo3d', x: centre.x, y: centre.y, label: `${gizmoMode} center`, meta: { axis: 'center', mode: gizmoMode, space: gizmoSpace, approximate: true }, owner: renderer.domElement });
       } else if (gizmoMode === 'rotate') {
-        // Each rotation ring lies perpendicular to its axis — aim a point ON the ring by
-        // offsetting along a perpendicular axis (x-ring↔y dir, y-ring↔z, z-ring↔x).
-        const perp: Record<'x' | 'y' | 'z', 'x' | 'y' | 'z'> = { x: 'y', y: 'z', z: 'x' };
-        for (const ax of ['x', 'y', 'z'] as const) push(`gizmo3d:rotate:${ax}`, `rotate ${ax}`, RING_PX, axisDir(perp[ax]), ax);
+        // A rotation ring is an ANNULUS with nothing inside it, so a fixed screen offset the way
+        // translate/scale use one cannot work: it aims into the hole, the press falls through to
+        // the viewport background, and the drag ORBITS THE CAMERA. Compute the ring's real world
+        // radius instead, and aim at a 45° diagonal of its own plane (the axis-aligned points are
+        // where two rings intersect). Why, and the measurement: `gizmo3dAim.ts`'s header.
+        const radius = ROTATE_RING_RADIUS * worldScale;
+        const planeAxes: Record<'x' | 'y' | 'z', ['x' | 'y' | 'z', 'x' | 'y' | 'z']> = { x: ['y', 'z'], y: ['z', 'x'], z: ['x', 'y'] };
+        for (const ax of ['x', 'y', 'z'] as const) {
+          const [ua, va] = planeAxes[ax];
+          const aim = rotateRingAim({ origin, u: axisDir(ua), vAxis: axisDir(va), radius, project: projectPlain, reachable });
+          if (!aim) continue;
+          out.push({ id: `gizmo3d:rotate:${ax}`, kind: 'gizmo-axis', editor: 'gizmo3d', x: aim.x, y: aim.y, label: `rotate ${ax}`, meta: { axis: ax, mode: gizmoMode, space: gizmoSpace, approximate: true, world: [aim.world.x, aim.world.y, aim.world.z] }, owner: renderer.domElement });
+        }
       }
       return out;
     });
@@ -2552,6 +2673,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // Track which entity the gizmo is attached to (for ECS sync skip)
     let gizmoEntityId: number | null = null;
     let gizmoDragStart: { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number } | null = null;
+    /** The ATTACHED OBJECT's scale at pointer-down — the basis TransformControls multiplies.
+     *  For a mesh-less entity that object is an editor icon whose scale nothing syncs from the
+     *  entity, so only the RATIO against this snapshot is meaningful. See `scaleFromGizmoRatio`. */
+    let gizmoProxyScaleStart: { x: number; y: number; z: number } | null = null;
+    /** Sign of the gizmo'd object's scale when a scale drag STARTED — so a drag that crosses the
+     *  pivot stops at 0 instead of mirroring the entity (clampScaleCrossingPivot). */
+    let gizmoScaleStartSign: ScaleSigns | null = null;
 
     // ── Multi-select group gizmo ──
     // When >1 entity is selected the gizmo attaches to this empty PROXY parked at the group
@@ -2575,7 +2703,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       out.compose(_grpPos.set(t.x, t.y, t.z), _trsQuat.setFromEuler(_trsEuler.set(t.rx, t.ry, t.rz)), _grpScale.set(t.sx, t.sy, t.sz));
     /** Decompose a world Matrix4 → LOCAL TRS relative to a parent's world transform. */
     const worldMatrixToLocal = (m: THREE.Matrix4, parentWorld: WT | null | undefined) => {
-      m.decompose(_grpPos, _grpQuat, _grpScale);
+      decomposeTrs(m, _grpPos, _grpQuat, _grpScale); // singular-safe — see #258
       _grpEuler.setFromQuaternion(_grpQuat);
       return worldToLocalTransform({ position: _grpPos, rotation: _grpEuler, scale: _grpScale }, parentWorld);
     };
@@ -2615,6 +2743,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           return { id, parentId, startWorld: trsToMatrix(w, new THREE.Matrix4()), before };
         });
         groupDrag = { members, pivotStart: groupProxy.matrixWorld.clone() };
+        gizmoScaleStartSign = { x: Math.sign(groupProxy.scale.x), y: Math.sign(groupProxy.scale.y), z: Math.sign(groupProxy.scale.z) };
         return;
       }
       if (gizmoEntityId === null) return;
@@ -2622,6 +2751,9 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       if (!entity || !entity.has(Transform)) return;
       const tf = entity.get(Transform);
       gizmoDragStart = { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz };
+      const o = gizmo.object;
+      gizmoScaleStartSign = o ? { x: Math.sign(o.scale.x), y: Math.sign(o.scale.y), z: Math.sign(o.scale.z) } : null;
+      gizmoProxyScaleStart = o ? { x: o.scale.x, y: o.scale.y, z: o.scale.z } : null;
     };
     gizmo.addEventListener('mouseDown', onGizmoMouseDown);
 
@@ -2637,6 +2769,15 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       if (!(gizmo as any).dragging) return;
       const obj = gizmo.object;
       if (!obj) return;
+      // WAIT FOR THE SNAPSHOT. TransformControls dispatches `change` from the SETTER of its
+      // `dragging` property (`defineProperty` in TransformControls.js), and `this.dragging = true`
+      // runs one line BEFORE `dispatchEvent(_mouseDownEvent)` — so the first change of every drag
+      // arrives before `onGizmoMouseDown` has captured anything, carrying the object's PRE-drag
+      // pose. Acting on it writes the proxy's own pose onto the entity, and `mouseDown` then
+      // records THAT as the undo `before`. Harmless for a mesh (its object already holds the
+      // entity's pose); for a mesh-less entity it is how a Light's authored scale was destroyed
+      // and its undo poisoned in the same tick (bug `euf2YDw0bXcPZ6CziuSU`).
+      if (!gizmoDragStart && !groupDrag) return;
 
       // Group (multi-select) drag: apply the proxy's world delta to every member via the pure
       // cluster math, then convert each new world matrix back to that member's LOCAL Transform.
@@ -2645,6 +2786,11 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         if (!groupDrag) return;
         groupProxy.updateMatrixWorld(true);
         const mode = gizmo.getMode() as 'translate' | 'rotate' | 'scale';
+        // Crossing the pivot mid-scale mirrors the proxy, and a group scale spreads members by the
+        // same ratio — so a mirrored frame does not just invert scales, it throws every member
+        // through the pivot. Drop the frame; the drag stops at its last valid state. See
+        // `scaleCrossedPivot` for the measurement.
+        if (mode === 'scale' && scaleCrossedPivot(groupProxy.scale, gizmoScaleStartSign)) return;
         const news = applyGroupTransform3D({
           memberStartWorld: groupDrag.members.map((m) => m.startWorld),
           pivotStart: groupDrag.pivotStart,
@@ -2715,7 +2861,14 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       } else if (mode === 'rotate') {
         entity.set(Transform, { ...current, rx: clampAngle(local.rx), ry: clampAngle(local.ry), rz: clampAngle(local.rz) });
       } else if (mode === 'scale') {
-        entity.set(Transform, { ...current, sx: local.sx, sy: local.sy, sz: local.sz });
+        // Scale from the RATIO the gizmo applied to its proxy, not from the proxy's absolute
+        // scale — the two agree for a mesh and diverge without bound for an icon gizmo. The
+        // decomposed `local` stays the fallback for an axis whose proxy started at 0.
+        const scaled = gizmoDragStart && gizmoProxyScaleStart
+          ? scaleFromGizmoRatio(gizmoDragStart, gizmoProxyScaleStart, obj.scale, local)
+          : local;
+        const s = clampScaleCrossingPivot({ ...local, ...scaled }, obj.scale, gizmoScaleStartSign);
+        entity.set(Transform, { ...current, sx: s.sx, sy: s.sy, sz: s.sz });
       }
       // Bulk entity.set bypasses writeTraitField, which is what normally
       // fires the dirty broadcast. Notify subscribers (Inspector, Canvas2D
@@ -2786,6 +2939,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         markOverrideIfInstance(eid, 'Transform', k);
       }
       gizmoDragStart = null;
+      gizmoProxyScaleStart = null;
     };
     gizmo.addEventListener('mouseUp', onGizmoMouseUp);
 
@@ -2951,6 +3105,29 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             gameAspectFromRect(useEditorStore.getState().gameRect, getGameAspect()))
         : computeFullNDC(clientX, clientY, r);
       const activeCam = isUI ? gameActiveCam : activeEditorCam;
+      // A press that lands on the TRANSFORM GIZMO never reaches the selection at all:
+      // TransformControls handles it first and starts a drag, and `onPointerDown` below bails
+      // while it is dragging. So the honest answer for such a point is "the selection stays as it
+      // is" — the gizmo's own entity — NOT whatever mesh happens to be behind the gizmo.
+      //
+      // Predicting this matters because the gizmo sits exactly where an aim usually lands (the
+      // selected entity's origin) and covers ~50-200 px around it. Without this, `pickAt` named a
+      // mesh the click provably would not select: measured 2026-08-19 on games/anim-bug, with a
+      // 20x box enclosing a cone, `modoki_tap` reported "a click here selects Box" while the click
+      // changed no selection at all — which is how testboard UfbeEfhHmNwd0GVVnESC came to read as
+      // "the report contradicts the real outcome". From a CLEARED selection (no gizmo on screen)
+      // the same click does select Box, exactly as reported.
+      //
+      // three's picker geometry is internal, so this reads it defensively: a rename on upgrade
+      // degrades to the old behaviour rather than throwing.
+      const gizmoOwner = gizmoEntityId ?? useEditorStore.getState().selectedEntityIds[0] ?? null;
+      if (gizmoOwner !== null && gizmo.enabled && (gizmo as { visible?: boolean }).visible && gizmo.object) {
+        const picker = (gizmo as unknown as { _gizmo?: { picker?: Record<string, THREE.Object3D> } })._gizmo?.picker?.[gizmo.getMode()];
+        if (picker && picker.children.length) {
+          raycaster.setFromCamera(new THREE.Vector2(mx, my), activeCam);
+          if (raycaster.intersectObjects(picker.children, true).length) return gizmoOwner;
+        }
+      }
       const { show3D } = layersRef.current;
       // Meshes listed before gizmos so a mesh wins the tie at a shared ancestor.
       const entries: Pick3DEntry[] = [
@@ -3085,6 +3262,12 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // viewport and intercepting clicks meant for models behind it. No-op raycast
     // removes it from picking entirely while keeping it rendered when selected.
     camFrustumLines.raycast = () => {};
+    // …and for the SAME reason it must not contribute to the entity's measured BOUNDS: a rect
+    // that spans the frustum describes a region a click cannot select the camera in, so an
+    // entity aim computed from it lands in empty space (QA-CTX-0006). `noBounds` prunes this
+    // subtree from the bounds provider's walk, keeping "what is measured" equal to "what is
+    // clickable". Set beside the raycast override so the two can't drift apart.
+    camFrustumLines.userData.noBounds = true;
     camGizmoPivot.add(camFrustumLines);
 
     // Updated each frame from the Camera trait's fov/aspect/near/far. Writes
@@ -3145,6 +3328,40 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     }
 
     // Shared gizmo geometries (reused across entities)
+    /** Pose an ECS icon gizmo (light / particle emitter / environment / empty marker) from
+     *  the entity's WORLD transform.
+     *
+     *  Rotation is the part that was missing, and it is not cosmetic: TransformControls
+     *  derives LOCAL space from the attached object's world quaternion, so an icon left at
+     *  identity made `gizmoSpace:'local'` behave exactly like `'world'` for every
+     *  icon-represented entity. MEASURED on games/anim-bug (2026-08-18): with the Sun light
+     *  rotated 45deg about Y, the `gizmo3d:translate:x` handle sat at the IDENTICAL screen
+     *  position in both spaces (305.12574311218117), while a real mesh moved correctly
+     *  (177.46 world -> 179.53 local). QA-SVIEW-0003.
+     *
+     *  The frame-box, zone and camera gizmos already did this — these four sites simply
+     *  never got it. It is also more truthful on its own terms: a particle emitter's CONE
+     *  icon pointed +Y no matter which way the emitter faced.
+     *
+     *  `skipRotation` mirrors the camera pivot's guard: while THIS entity is mid-drag,
+     *  TransformControls owns the object's rotation and writing the ECS value back on top
+     *  of it every frame would fight the drag. */
+    const poseIconGizmo = (g: THREE.Object3D, id: number, gizmoDragging: boolean) => {
+      const wt = worldTransforms.get(id);
+      if (!wt) return;
+      g.position.set(wt.x, wt.y, wt.z);
+      if (!gizmoDragging) {
+        g.rotation.set(wt.rx, wt.ry, wt.rz);
+        // These icons are FIXED-SIZE affordances — a light has no extent, so the octahedron is
+        // not showing you the entity's scale and must not drift. TransformControls mutates the
+        // attached object's scale during a scale drag, and nothing used to put it back, so the
+        // icon kept every drag's growth (and, before `scaleFromGizmoRatio`, that drift WAS the
+        // drag's basis). Restoring it here is now cosmetic — the write-back no longer reads this
+        // value absolutely — but an icon that quietly grows to 800x is its own lie.
+        g.scale.set(1, 1, 1);
+      }
+    };
+
     const GIZMO_SHAPES = {
       light: new THREE.OctahedronGeometry(0.25),
       environment: new THREE.SphereGeometry(0.2, 12, 12),
@@ -3185,31 +3402,29 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // whole file is stripped from game builds); if both this and the game provider report
     // the same id, agentBridge's boundsById Map keeps the last (worldAABB is identical;
     // screen is a valid projection either way).
-    const _svBoundsBox = new THREE.Box3();
-    const _svSize = new THREE.Vector3(), _svCenter = new THREE.Vector3();
+    // Declared HERE, above the bounds provider, because that provider now reads it (below).
+    // Icon gizmos for Camera/Light/Environment/empty entities — the objects that make an
+    // otherwise-invisible entity clickable in the viewport.
+    const ecsGizmos = new Map<number, THREE.Object3D>();
+
     const unregBounds = registerBoundsProvider((ids) => {
-      const out: EntityScreenBounds[] = [];
       const r = renderer.domElement.getBoundingClientRect();
-      const vp = { left: r.left, top: r.top, width: r.width, height: r.height };
-      const projectOne = (id: number, obj: THREE.Object3D) => {
-        if (ids && !ids.has(id)) return;
-        obj.updateWorldMatrix(true, true);
-        _svBoundsBox.setFromObject(obj);
-        const { screen, onScreen } = projectAABBToScreen(_svBoundsBox, activeEditorCam, vp);
-        let worldAABB: EntityScreenBounds['worldAABB'];
-        if (!_svBoundsBox.isEmpty()) {
-          _svBoundsBox.getSize(_svSize); _svBoundsBox.getCenter(_svCenter);
-          worldAABB = { size: [_svSize.x, _svSize.y, _svSize.z], center: [_svCenter.x, _svCenter.y, _svCenter.z] };
-        }
-        out.push({ id, layer: '3d', surface: 'scene-view', screen, onScreen, ...(worldAABB ? { worldAABB } : {}) });
-      };
-      for (const [id, obj] of renderState.ecsObjects) projectOne(id, obj);
-      // Skinned meshes (SkinnedMeshRenderer) live in `skinned`, keyed by entity id, with
-      // their cloned hierarchy at `entry.root` — the whole point of this provider for a
-      // skeletal scene. (The runtime Scene3D provider covers only ecsObjects; skinned
-      // parity there is a possible follow-up.) setFromObject uses the bind-pose bounds.
-      for (const [id, entry] of renderState.skinned) projectOne(id, entry.root);
-      return out;
+      // WHAT is measured (and why an icon gizmo is measured differently from a mesh) lives in
+      // `editor/scene/sceneViewBounds.ts`, where it is unit-tested. Only the live inputs —
+      // this renderer's viewport rect and the active editor camera — belong here.
+      return computeEntityScreenBounds(
+        {
+          ecsObjects: renderState.ecsObjects,
+          skinned: renderState.skinned,
+          billboards: renderState.billboards,
+          textMeshes: renderState.textMeshes,
+          gizmos: ecsGizmos,
+        },
+        activeEditorCam,
+        { left: r.left, top: r.top, width: r.width, height: r.height },
+        'scene-view',
+        ids,
+      );
     }, 'scene-view');
 
     // Pick provider (F15 — docs/enact.md): `pickEntityAtViewportPoint` (defined above,
@@ -3220,7 +3435,6 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // registers at 10 since it visually sits on top and must win when both answer (#80).
     const unregPick = registerPickProvider(pickEntityAtViewportPoint, 'scene-view');
 
-    const ecsGizmos = new Map<number, THREE.Object3D>();
     const outlineMeshes = new Map<number, THREE.LineSegments>();
     // Dimmer secondary outlines for the selected entity's descendants (children,
     // grandchildren, deeper) — keyed by descendant id, following each one's baked world TRS.
@@ -3389,7 +3603,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // detach the shared bone proxy first so it isn't left dangling under a disposed
       // group across the swap (mirrors the effect-cleanup detach at teardown).
       if (boneProxy.parent) boneProxy.parent.remove(boneProxy);
-      disposeRenderState(renderState, scene, true);
+      disposeRenderState(renderState, scene);
       for (const [, outline] of outlineMeshes) { scene.remove(outline); outline.geometry.dispose(); (outline.material as THREE.Material).dispose(); }
       outlineMeshes.clear();
       for (const [id] of colliderWires) disposeColliderWire(id);
@@ -3617,8 +3831,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             ecsGizmos.set(envId, g);
           }
           if (ecsGizmos.has(envId)) {
-            const wt = worldTransforms.get(envId);
-            if (wt) ecsGizmos.get(envId)!.position.set(wt.x, wt.y, wt.z);
+            poseIconGizmo(ecsGizmos.get(envId)!, envId, gizmoEntityId === envId && !!(gizmo as { dragging?: boolean }).dragging);
           }
           // Editor background: show editor bg color when env doesn't show as background
           if (scene.environment && !env.showAsBackground) {
@@ -3652,8 +3865,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           }
           const g = ecsGizmos.get(id)!;
           ((g as THREE.Mesh).material as THREE.MeshBasicMaterial).color.setHex(light.color);
-          const wt = worldTransforms.get(id);
-          if (wt) g.position.set(wt.x, wt.y, wt.z);
+          poseIconGizmo(g, id, gizmoEntityId === id && !!(gizmo as { dragging?: boolean }).dragging);
           // Shadow-frustum viz: outline the shadow-camera coverage for a flagged
           // directional shadow-caster (single reusable box — one key light is typical).
           if (!sfShown && light.lightType === 'directional' && light.castShadow && light.showShadowFrustum) {
@@ -3690,8 +3902,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             scene.add(g);
             ecsGizmos.set(id, g);
           }
-          const wt = worldTransforms.get(id);
-          if (wt) ecsGizmos.get(id)!.position.set(wt.x, wt.y, wt.z);
+          poseIconGizmo(ecsGizmos.get(id)!, id, gizmoEntityId === id && !!(gizmo as { dragging?: boolean }).dragging);
         });
         // Remove icons for emitters deleted within the current scene.
         for (const id of particleGizmoIds) {
@@ -3911,6 +4122,11 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           const wt = worldTransforms.get(id);
           if (wt) {
             g.position.set(wt.x, wt.y, wt.z);
+            // Rotation too — see poseIconGizmo. (Scale below is bespoke here, so this site
+            // sets the pose inline rather than calling that helper.)
+            if (!(gizmoEntityId === id && (gizmo as { dragging?: boolean }).dragging)) {
+              g.rotation.set(wt.rx, wt.ry, wt.rz);
+            }
             // Size the marker by the entity's WORLD scale, so a heavily-scaled rig's
             // bones (model root ~0.0005 × armature 100× ≈ 0.05) get small joint markers
             // instead of fixed 0.3-unit boxes that dwarf the whole model. Plain empties
@@ -3919,10 +4135,17 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             // marker size — inheriting it would blow the "small empty marker" up to the full
             // frame box (the very box showGizmo=off is meant to hide). Keep it fixed-small so
             // the entity stays selectable without drawing a second frame-sized box.
-            if (entity.has(CameraFrame)) {
-              g.scale.set(1, 1, 1);
-            } else {
-              g.scale.set(Math.abs(wt.sx) || 1, Math.abs(wt.sy) || 1, Math.abs(wt.sz) || 1);
+            // Not while THIS entity is mid-drag: TransformControls owns the object's scale then,
+            // and the sign it leaves there is what `clampScaleCrossingPivot` reads to detect a
+            // drag past the pivot — `Math.abs` below would erase that signal every frame. (The
+            // magnitude no longer matters to the write-back, which goes through
+            // `scaleFromGizmoRatio`; the sign still does.)
+            if (!(gizmoEntityId === id && (gizmo as { dragging?: boolean }).dragging)) {
+              if (entity.has(CameraFrame)) {
+                g.scale.set(1, 1, 1);
+              } else {
+                g.scale.set(Math.abs(wt.sx) || 1, Math.abs(wt.sy) || 1, Math.abs(wt.sz) || 1);
+              }
             }
           }
         });
@@ -4437,7 +4660,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       scene.remove(groupProxy); // multi-select group-gizmo pivot proxy
       scene.remove(gizmoHelper); // F5: explicit detach, independent of scene.clear() below
       gizmo.dispose();
-      disposeRenderState(renderState, scene, true);
+      disposeRenderState(renderState, scene);
       disposeParticleSyncState(particleState, scene);
       disposeFlameMeshSyncState(flameState, scene);
       disposeBlobShadowSyncState(blobShadowState, scene);
@@ -4525,7 +4748,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       recovery.request();
     });
 
-    // Fire-and-forget; the async body guards on `outerDisposed` after its await.
+    // Fire-and-forget; the async body guards on `outerDisposed` after EACH of its awaits
+    // (renderer acquire, then `setActiveRenderer` — #254 added the second one).
     // The `.catch` is load-bearing, not hygiene: `setup()` registers the frame callback and
     // calls startFrameDriver() at its very END, after ~2000 lines of synchronous scene/gizmo
     // wiring. A throw anywhere in there leaves the renderer ALREADY registered (so

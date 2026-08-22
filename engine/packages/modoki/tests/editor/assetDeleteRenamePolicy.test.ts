@@ -17,7 +17,15 @@ describe('deletionPathsFor — the sidecar rule', () => {
 
   it('trashes a BINARY asset\'s .meta.json, not just snapshots it', () => {
     // The regression: this list used to contain only the asset.
-    expect(deletionPathsFor('/a/hero.png', 'texture')).toEqual(['/a/hero.png', '/a/hero.png.meta.json']);
+    expect(deletionPathsFor('/a/hero.png', 'texture'))
+      .toEqual(['/a/hero.png', '/a/hero.png.meta.json', '/a/hero.png.meta.local.json']);
+  });
+
+  it('trashes the GITIGNORED .meta.local.json half too (QA-CTX-0005)', () => {
+    // The second regression in the same rule. `.meta.local.json` holds this machine's
+    // byte stats and is gitignored, so a stranded one never shows in `git status` —
+    // every binary delete left one behind, forever.
+    expect(deletionPathsFor('/a/hero.png', 'texture')).toContain('/a/hero.png.meta.local.json');
   });
 
   it('gives a TEXT asset no sidecar — it carries its id inline', () => {
@@ -29,7 +37,7 @@ describe('deletionPathsFor — the sidecar rule', () => {
     // Only a model import generates; a texture carrying a stale `generated` block
     // must not drag unrelated files into the trash.
     expect(deletionPathsFor('/a/hero.png', 'texture', { textures: ['/a/other.png'] }))
-      .toEqual(['/a/hero.png', '/a/hero.png.meta.json']);
+      .toEqual(['/a/hero.png', '/a/hero.png.meta.json', '/a/hero.png.meta.local.json']);
   });
 
   it('takes a model\'s generated meshes, materials and textures', () => {
@@ -39,10 +47,11 @@ describe('deletionPathsFor — the sidecar rule', () => {
       textures: ['/m/rig_diffuse.png'],
     });
     expect(paths).toEqual([
-      '/m/rig.glb', '/m/rig.glb.meta.json',
+      '/m/rig.glb', '/m/rig.glb.meta.json', '/m/rig.glb.meta.local.json',
       '/m/rig.mesh.json',            // text — no sidecar
       '/m/rig.mat.json',             // text — no sidecar
-      '/m/rig_diffuse.png', '/m/rig_diffuse.png.meta.json', // binary — sidecar too
+      // binary — BOTH sidecar halves
+      '/m/rig_diffuse.png', '/m/rig_diffuse.png.meta.json', '/m/rig_diffuse.png.meta.local.json',
     ]);
   });
 
@@ -50,12 +59,15 @@ describe('deletionPathsFor — the sidecar rule', () => {
     const paths = deletionPathsFor('/m/rig.glb', 'model', { textures: ['/m/a.png', '/m/b.png'], meshes: ['/m/a.mesh.json'] });
     expect(paths.filter((p) => p.endsWith('.meta.json')))
       .toEqual(['/m/rig.glb.meta.json', '/m/a.png.meta.json', '/m/b.png.meta.json']);
+    expect(paths.filter((p) => p.endsWith('.meta.local.json')))
+      .toEqual(['/m/rig.glb.meta.local.json', '/m/a.png.meta.local.json', '/m/b.png.meta.local.json']);
   });
 
   it('degrades to the bare model delete when the meta is missing or empty', () => {
-    expect(deletionPathsFor('/m/rig.glb', 'model', null)).toEqual(['/m/rig.glb', '/m/rig.glb.meta.json']);
-    expect(deletionPathsFor('/m/rig.glb', 'model', {})).toEqual(['/m/rig.glb', '/m/rig.glb.meta.json']);
-    expect(deletionPathsFor('/m/rig.glb', 'model', { meshes: [] })).toEqual(['/m/rig.glb', '/m/rig.glb.meta.json']);
+    const bare = ['/m/rig.glb', '/m/rig.glb.meta.json', '/m/rig.glb.meta.local.json'];
+    expect(deletionPathsFor('/m/rig.glb', 'model', null)).toEqual(bare);
+    expect(deletionPathsFor('/m/rig.glb', 'model', {})).toEqual(bare);
+    expect(deletionPathsFor('/m/rig.glb', 'model', { meshes: [] })).toEqual(bare);
   });
 });
 

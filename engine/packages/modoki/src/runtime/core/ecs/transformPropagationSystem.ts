@@ -31,14 +31,51 @@ import type { World } from 'koota';
 // trait graph into L0 for two traits that now live in core/traits/ anyway.
 import { Transform } from '../traits/Transform';
 import { EntityAttributes } from '../traits/EntityAttributes';
+import { decomposeTrs } from './decomposeTrs';
+
+/** World position / Euler rotation / scale. NOT a matrix — already decomposed.
+ *  (`getWorldMatrix3D` in `worldTransform.ts` is the matrix API.) */
+export interface WorldTransformRecord {
+  x: number; y: number; z: number;
+  rx: number; ry: number; rz: number;
+  sx: number; sy: number; sz: number;
+}
 
 /** Computed world transforms, updated each frame. Renderers read from here.
- *  PERF (ecs-core F6): values are MUTATED IN PLACE across passes rather than replaced —
- *  an unchanged-pass short-circuit relies on the object identity for a given id staying
- *  stable so it can skip rewriting it. Every consumer does `.get(id)` and reads the fields
- *  immediately, so nothing may retain a value object across frames — read it fresh each
- *  time you need it. */
-export const worldTransforms = new Map<number, { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }>();
+ *
+ *  ⚠️ **THE VALUES ARE POOLED AND MUTATED IN PLACE — NOTHING MAY RETAIN ONE.** (PERF, ecs-core F6:
+ *  an unchanged-pass short-circuit relies on the object identity for a given id staying stable so
+ *  it can skip rewriting it, which is what makes a frozen scene cost nothing.) A retained record
+ *  silently becomes the NEXT pass's values: a drag-start snapshot turns into the current pose and
+ *  the code reads a zero delta, with no error anywhere.
+ *
+ *  **If you need the value beyond the current statement, use {@link readWorldTransformInto} —
+ *  do not hold what `.get()` returns.** That rule was carried only by a comment here while the map
+ *  itself was on the public barrel, so 76 read sites were verified by hand exactly once and nothing
+ *  held the invariant afterwards (review 2026-08-12, R7.1).
+ *
+ *  This map is the per-frame CACHE, filled by `transformPropagationSystem`. It is not
+ *  interchangeable with `getWorldTransform3D`, which recomputes ON DEMAND — that one rebuilds two
+ *  full-world maps per call, so it is right for a one-off (a bootstrap marker lookup) and wrong for
+ *  reading many entities per frame. */
+export const worldTransforms = new Map<number, WorldTransformRecord>();
+
+/** Copy an entity's cached world transform into a caller-owned `out`. Returns `false` (leaving
+ *  `out` untouched) when the entity has no world transform this frame.
+ *
+ *  **The retention-safe way to read {@link worldTransforms}.** O(1) and allocation-free — the
+ *  caller owns `out`, so it can be a long-lived scratch object or a snapshot kept across frames,
+ *  neither of which is safe to do with the pooled record `.get()` hands back. Prefer this anywhere
+ *  the value outlives the statement that read it; `.get()` remains correct for the hot render paths
+ *  that destructure immediately. */
+export function readWorldTransformInto(entityId: number, out: WorldTransformRecord): boolean {
+  const w = worldTransforms.get(entityId);
+  if (!w) return false;
+  out.x = w.x; out.y = w.y; out.z = w.z;
+  out.rx = w.rx; out.ry = w.ry; out.rz = w.rz;
+  out.sx = w.sx; out.sy = w.sy; out.sz = w.sz;
+  return true;
+}
 
 /** Entities deactivated via EntityAttributes.isActive (includes children of inactive parents). */
 export const deactivatedEntities = new Set<number>();
@@ -306,7 +343,10 @@ export function transformPropagationSystem(world: World) {
     } else {
       // Child entity — need matrix multiplication
       const mat = getWorldMatrix(e.id);
-      mat.decompose(_pos, _quat, _scale);
+      // decomposeTrs, not mat.decompose: a zero scale ANYWHERE in the chain makes this
+      // matrix singular, and three answers a singular matrix with identity scale+rotation
+      // — so the entity authored invisible would be cached at FULL size (#258).
+      decomposeTrs(mat, _pos, _quat, _scale);
       _euler.setFromQuaternion(_quat);
       x = _pos.x; y = _pos.y; z = _pos.z;
       rx = _euler.x; ry = _euler.y; rz = _euler.z;

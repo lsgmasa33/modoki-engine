@@ -123,6 +123,81 @@ describe('computeHandles', () => {
     });
   });
 
+  describe('onScreen is judged against the owning panel\'s CLIP box, not just the window', () => {
+    // testboard AceYUBoBXbcGtIIFmzGb: a gradient stop 800px down a docked panel's un-scrolled
+    // content flow reports a y that IS inside the window but is hundreds of px below its own
+    // panel — physically over a different panel. Window-only judging said onScreen:true and the
+    // aim drove the Assets panel's context menu.
+    const clipper = (rect: { x: number; y: number; w: number; h: number }) => {
+      const box = document.createElement('div');
+      box.style.overflow = 'hidden';
+      box.getBoundingClientRect = () => ({
+        left: rect.x, top: rect.y, right: rect.x + rect.w, bottom: rect.y + rect.h,
+        width: rect.w, height: rect.h, x: rect.x, y: rect.y, toJSON: () => ({}),
+      }) as DOMRect;
+      document.body.appendChild(box);
+      return box;
+    };
+
+    it('a handle scrolled out of its clipped panel is OFF-screen, though it is inside the window', () => {
+      const panel = clipper({ x: 0, y: 0, w: 400, h: 260 });
+      const inner = document.createElement('div');
+      panel.appendChild(inner);
+      provide(h({ id: 'particle:gradient:color:1', editor: 'particle', x: 200, y: 863, owner: inner }));
+
+      const r = computeHandles();
+      expect(r.handles[0].onScreen).toBe(false);
+      expect(r.offScreenCount).toBe(1);
+    });
+
+    it('the same handle inside the clip box stays on-screen', () => {
+      const panel = clipper({ x: 0, y: 0, w: 400, h: 260 });
+      const inner = document.createElement('div');
+      panel.appendChild(inner);
+      provide(h({ id: 'particle:gradient:color:1', editor: 'particle', x: 200, y: 120, owner: inner }));
+      expect(computeHandles().handles[0].onScreen).toBe(true);
+    });
+
+    it('the OWNER\'s own overflow counts — the Dopesheet hands out its own clipped container', () => {
+      // DopesheetView/CurvesView register `owner: <their own overflow:hidden div>` and compute each
+      // handle's x as `rect.left + timeToX(t)`, unclamped — so a keyframe panned out of the visible
+      // time window sits beside the container, over the TrackList sidebar. Walking from the PARENT
+      // saw only the panel's outer clip (wider than that) and called it aimable, reopening the
+      // very bug this guard closes one level down.
+      const own = clipper({ x: 400, y: 100, w: 300, h: 200 });
+      provide(h({ id: 'dope:key:Transform.x:3', editor: 'dopesheet', x: 180, y: 150, owner: own }));
+      const r = computeHandles();
+      expect(r.handles[0].onScreen).toBe(false);
+      expect(r.handles[0].clipped).toBe(true);
+    });
+
+    it('…and a handle inside that same container is still aimable', () => {
+      const own = clipper({ x: 400, y: 100, w: 300, h: 200 });
+      provide(h({ id: 'dope:key:Transform.x:4', editor: 'dopesheet', x: 500, y: 150, owner: own }));
+      expect(computeHandles().handles[0].onScreen).toBe(true);
+    });
+
+    it('the ancestor walk runs ONCE per owner, not once per handle', () => {
+      // A Dopesheet gives ~2000 keyframes the same container; without the per-call memo each one
+      // re-walks an identical chain calling getComputedStyle per hop.
+      const own = clipper({ x: 0, y: 0, w: 800, h: 600 });
+      const spy = vi.spyOn(window, 'getComputedStyle');
+      provide(...Array.from({ length: 50 }, (_, i) => h({ id: `dope:key:${i}`, x: 10 + i, y: 20, owner: own })));
+      computeHandles();
+      // One walk = one getComputedStyle per element in the chain (owner + its non-body ancestors),
+      // so a handful — emphatically not 50x that.
+      expect(spy.mock.calls.length).toBeLessThan(10);
+      spy.mockRestore();
+    });
+
+    it('an owner with no clipping ancestor is judged by the window alone', () => {
+      const loose = document.createElement('div');
+      document.body.appendChild(loose);
+      provide(h({ id: 'free', x: 200, y: 863, owner: loose }));
+      expect(computeHandles().handles[0].onScreen).toBe(true);
+    });
+  });
+
   it('filters by editor, and reports only the surviving editors', () => {
     provide(h({ id: 'c1', editor: 'chrome' }), h({ id: 's1', editor: 'skin' }));
     expect(computeHandles({ editor: 'chrome' })).toMatchObject({ count: 1, editors: ['chrome'] });

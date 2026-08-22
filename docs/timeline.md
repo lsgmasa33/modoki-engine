@@ -69,7 +69,7 @@ discipline as `animationSystem` and `zoneTriggerCore`).
   have no activity guard at all, so an "off" Director kept advancing (measured: 2.7434 → 2.7566 frame
   to frame) and kept firing its signal markers, visibly flipping a demo through its stations while it
   was supposed to be held still. Workaround-by-`playing` was the natural reach and is a *different*
-  concept. The guard is `isEntityActiveInHierarchy` (`runtime/ecs/entityIndex.ts`), which walks
+  concept. The guard is `isEntityActiveInHierarchy` (`runtime/core/ecs/entityIndex.ts`), which walks
   `parentId` over the index the system already builds — deliberately NOT the renderers'
   `deactivatedEntities`, which comes from a THREE module, is produced at priority 200 (one frame
   late for a system at 149), and is always empty headless. A nested/slaved child freezes with its
@@ -172,11 +172,18 @@ the playhead leaves the span — see the editor panel below.
 Mirrors the Zone stack (`zoneTriggerCore.routeZone`): each start/marker/end fans to
 
 1. **Journal** — `emit('@sequence'|'@marker'|'@cue', …, world)` (the tick-stamped verification trace).
-2. **Code bus** — `timelineEvents` (`runtime/managers/TimelineEvents.ts`): world-scoped
+2. **Code bus** — `timelineEvents` (`runtime/timeline/TimelineEvents.ts`): world-scoped
    `onSequenceStart` / `onMarker` / `onSequenceEnd`, registered as a scene-scoped Manager (clears
    subscribers on scene swap).
 3. **Declarative `OnSequence` trait** — `{ onStart, onEnd }` (UIAction names) on the Director entity;
    fired via pipeline-safe `dispatchGameAction`. Per-marker reactions are the signal track's own actions.
+   Worked example: `games/timeline-demo`'s `main.scene.json` Cutscene, which hides the standing Title
+   card on start and takes the last subtitle line down on end (#307). That end reaction is the one a
+   signal marker CANNOT stand in for — a marker only fires at a tick somebody authored, so the final
+   line would otherwise sit on screen forever; the sequence end is the only edge that knows the
+   cutscene is over. Pinned by `games/timeline-demo/tests/cutscene-onsequence.test.ts`, which reads the
+   action names out of the scene so a rename on either side goes red instead of silently doing nothing
+   (an unresolved action name is a warning, not a crash).
 
 ## Resource wiring
 

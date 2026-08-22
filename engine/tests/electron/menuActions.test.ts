@@ -184,11 +184,17 @@ describe('triggerMenuItem', () => {
     expect(res.error).toMatch(/disabled/);
   });
 
-  it('refuses a container (submenu header with no click/role)', () => {
+  it('refuses a container (submenu header)', () => {
     const { items } = makeMenu();
     const res = triggerMenuItem(items, { path: 'View' });
     expect(res.ok).toBe(false);
-    expect(res.error).toMatch(/no action/);
+    // Was `/no action/` — the refusal now comes from the SUBMENU check, which runs first and
+    // says something more useful. The old expectation was not wrong, it was just weaker: it
+    // relied on 'View' having no click, which is only true of these hand-built literals. On the
+    // live menu every item carries a click wrapper, so the old branch never fired and a
+    // container reported `{ok:true, fired:"View"}` (bug qJ1FKHrGY0DgLiCyxZ5z / RpWMZZR1Pk4HPHKisu9C).
+    expect(res.error).toMatch(/submenu container/);
+    expect(res.available).toContain('View/Zoom In');
   });
 
   it('on a miss, returns the actionable paths as a hint', () => {
@@ -229,5 +235,112 @@ describe('actionablePaths', () => {
     expect(paths).toContain('View/Zoom In');
     expect(paths).toContain('File/Close'); // role:'close' counts as actionable
     expect(paths).not.toContain('View/Disabled Thing');
+  });
+});
+
+/**
+ * THE LIVE-MENU SHAPE — the branch production actually takes, which the literals above cannot
+ * reach.
+ *
+ * `main.ts` passes `Menu.getApplicationMenu().items`, and Electron gives EVERY MenuItem a `click`
+ * wrapper regardless of what the template declared. The fixtures above omit `click` on containers
+ * and on role items, so they exercised a shape the shipped code never sees — which is how two
+ * bugs stayed green here for months:
+ *   - every node reported `actionable: true` (measured 89/89, zero false), and
+ *   - `Window → Minimize` reported `{ok:true, fired:"Minimize"}` while the window never moved.
+ * These fixtures give every item a click, the way Electron does.
+ */
+describe('menuActions against a LIVE-shaped menu (every item has a click wrapper)', () => {
+  const wrapper = () => vi.fn(); // stands in for Electron's own MenuItem.click
+  const liveMenu = (): MenuItemLike[] => [
+    { label: 'View', click: wrapper(), submenu: { items: [
+      { label: 'Zoom In', click: vi.fn() },
+    ] } },
+    { label: 'Window', role: 'window', click: wrapper(), submenu: { items: [
+      { label: 'Minimize', role: 'minimize', click: wrapper() },
+      { label: 'Zoom', role: 'zoom', click: wrapper() },
+    ] } },
+  ];
+
+  it('does not call a container actionable just because Electron gave it a click', () => {
+    const nodes = serializeMenu(liveMenu());
+    expect(nodes.find((n) => n.label === 'View')!.actionable).toBe(false);
+    expect(nodes.find((n) => n.label === 'Window')!.actionable).toBe(false);
+    // ...while the leaves inside it still are.
+    expect(nodes.find((n) => n.label === 'Window')!.submenu!.map((n) => n.actionable)).toEqual([true, true]);
+    // The whole point: `actionable` must DISCRIMINATE. A field that is true for everything is
+    // exactly as useful as no field, and that is what shipped.
+    expect(actionablePaths(nodes)).toEqual(['View/Zoom In', 'Window/Minimize', 'Window/Zoom']);
+  });
+
+  it('refuses a container instead of reporting a false success', () => {
+    const res = triggerMenuItem(liveMenu(), { path: 'Window' });
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/submenu container/);
+  });
+
+  it('performs a window role on the BrowserWindow, not through the inert click wrapper', () => {
+    const items = liveMenu();
+    const minimize = vi.fn();
+    const res = triggerMenuItem(items, { path: 'Window/Minimize' }, { window: { minimize } });
+    expect(res).toEqual({ ok: true, fired: 'Minimize' });
+    expect(minimize).toHaveBeenCalledOnce();
+    // The click wrapper is what USED to be called, and calling it is what produced the false
+    // success — for a native role it performs nothing.
+    const item = items[1].submenu!.items[0];
+    expect(item.click).not.toHaveBeenCalled();
+  });
+
+  it('TOGGLES on zoom, so a second call is not a silent no-op that still reports success', () => {
+    const items = liveMenu();
+    let maximized = false;
+    const win = {
+      maximize: vi.fn(() => { maximized = true; }),
+      unmaximize: vi.fn(() => { maximized = false; }),
+      isMaximized: () => maximized,
+    };
+    expect(triggerMenuItem(items, { path: 'Window/Zoom' }, { window: win }).ok).toBe(true);
+    expect(win.maximize).toHaveBeenCalledOnce();
+    expect(triggerMenuItem(items, { path: 'Window/Zoom' }, { window: win }).ok).toBe(true);
+    expect(win.unmaximize).toHaveBeenCalledOnce();
+  });
+
+  it('performs `close` on the window — the role the first cut of this fix MISSED', () => {
+    // `WindowLike.close` was declared and never referenced, so File/Close reported
+    // `{ok:true, fired:"Close"}` with the window still open — the same false success the rest of
+    // this function removes. Caught in close-out review.
+    const items: MenuItemLike[] = [
+      { label: 'File', click: vi.fn(), submenu: { items: [{ label: 'Close', role: 'close', click: vi.fn() }] } },
+    ];
+    const close = vi.fn();
+    expect(triggerMenuItem(items, { path: 'File/Close' }, { window: { close } })).toEqual({ ok: true, fired: 'Close' });
+    expect(close).toHaveBeenCalledOnce();
+    expect(items[0].submenu!.items[0].click).not.toHaveBeenCalled();
+  });
+
+  it('REFUSES an app-level role it can neither perform nor verify, rather than lying', () => {
+    // `quit`/`hide`/... are dispatched by AppKit against the application, and ClickContext carries
+    // no `app`. Falling through to the inert click wrapper would claim the editor is going away
+    // when it is not — the worst version of the bug this module had.
+    const items: MenuItemLike[] = [
+      { label: 'Modoki', click: vi.fn(), submenu: { items: [{ label: 'Quit', role: 'quit', click: vi.fn() }] } },
+    ];
+    const res = triggerMenuItem(items, { path: 'Modoki/Quit' }, { window: { close: vi.fn() } });
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/native macOS `quit` role/);
+    // and it did NOT fire the inert wrapper on the way out
+    expect(items[0].submenu!.items[0].click).not.toHaveBeenCalled();
+  });
+
+  it('falls back to click() for a role it does not own — webContents roles still work that way', () => {
+    // `View → Reload` was MEASURED working through the click path on 2026-08-22, so the window-role
+    // table must not swallow every role and change behaviour that was already correct.
+    const reload = vi.fn();
+    const items: MenuItemLike[] = [
+      { label: 'View', click: vi.fn(), submenu: { items: [{ label: 'Reload', role: 'reload', click: reload }] } },
+    ];
+    const res = triggerMenuItem(items, { path: 'View/Reload' }, { window: { minimize: vi.fn() } });
+    expect(res.ok).toBe(true);
+    expect(reload).toHaveBeenCalledOnce();
   });
 });

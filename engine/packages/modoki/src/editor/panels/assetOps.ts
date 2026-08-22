@@ -15,6 +15,7 @@
 import { backendFetch } from '../backend/editorBackend';
 import { serializePrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, setPrefabCache, warnInertPrefabSizes, type PrefabFile } from '../scene/prefab';
 import { entityRef } from '../undo/entityRef';
+import { reportUndoFailure } from '../undo/undoFailure';
 import type { UndoAction } from '../undo/undoManager';
 import { registerAsset } from '../../runtime/loaders/assetManifest';
 import { firstAssetRoot } from './assetRoots';
@@ -99,26 +100,37 @@ export function planImports(
  *  standing up fetch + the backend.
  *
  *  - The asset itself always goes first, so an undo restores in the original order.
- *  - A BINARY asset also drops its `.meta.json` (GUID + import settings — both
- *    dangle if lost across a delete/undo). Text assets carry their id inline and
- *    have no sidecar.
+ *  - A BINARY asset also drops BOTH sidecar halves: the committed `.meta.json`
+ *    (GUID + import settings — both dangle if lost across a delete/undo) and the
+ *    gitignored `.meta.local.json` (this machine's byte-stats; see
+ *    `engine/plugins/meta-sidecar.ts`). Missing the local half left a file on disk
+ *    after every delete, forever — invisible to `git status` because it is
+ *    gitignored, and unbounded over time (QA-CTX-0005). Text assets carry their id
+ *    inline and have no sidecar.
  *  - A MODEL additionally drops everything it generated (meshes / materials /
  *    textures) and each generated BINARY file's own sidecar.
  *
  *  The backend skips paths that no longer exist, so listing a maybe-absent sidecar
  *  is harmless — which is why this can be a pure list rather than an existence
  *  check per path. */
+/** Both halves of a binary asset's sidecar pair: the committed `.meta.json` and
+ *  the gitignored machine-local `.meta.local.json`. They are written as a pair by
+ *  `writeMetaSidecar`, so anything that moves or removes one must handle both. */
+function sidecarsFor(assetPath: string): string[] {
+  return [assetPath + '.meta.json', assetPath + '.meta.local.json'];
+}
+
 export function deletionPathsFor(
   assetPath: string,
   assetType: string,
   generated?: { meshes?: string[]; materials?: string[]; textures?: string[] } | null,
 ): string[] {
   const paths: string[] = [assetPath];
-  if (!isTextAsset(assetPath)) paths.push(assetPath + '.meta.json');
+  if (!isTextAsset(assetPath)) paths.push(...sidecarsFor(assetPath));
   if (assetType === 'model' && generated) {
     for (const f of [...(generated.meshes ?? []), ...(generated.materials ?? []), ...(generated.textures ?? [])]) {
       paths.push(f);
-      if (!isTextAsset(f)) paths.push(f + '.meta.json');
+      if (!isTextAsset(f)) paths.push(...sidecarsFor(f));
     }
   }
   return paths;
@@ -171,19 +183,40 @@ export async function deleteAssetFile(assetPath: string): Promise<boolean> {
   } catch { return false; }
 }
 
+/** What a batch trash actually did. `missing` are the paths that were not on
+ *  disk, so nothing was trashed for them — the caller MUST NOT treat those as
+ *  recoverable files. `deletionPathsFor` deliberately lists maybe-absent
+ *  sidecars (`.meta.local.json` is gitignored and usually not there), so
+ *  "asked to trash" and "trashed" routinely differ and only the backend knows
+ *  by how much. Discarding that distinction is what let an undo failure name
+ *  files that never existed (#291). */
+export type DeleteFilesResult = { ok: boolean; trashed: number; missing: string[] };
+
 /** Trash MANY paths in a single request → ONE OS-trash invocation → one trash
  *  sound (vs. one chime per file when each path was its own POST). The backend
  *  skips any path that no longer exists, so a list carrying maybe-absent
- *  sidecars is safe. */
-export async function deleteAssetFiles(paths: string[]): Promise<boolean> {
-  if (paths.length === 0) return true;
+ *  sidecars is safe — and it REPORTS those in `missing`, which is the only way
+ *  a caller can tell an absent sidecar from a file it failed to save. */
+export async function deleteAssetFiles(paths: string[]): Promise<DeleteFilesResult> {
+  if (paths.length === 0) return { ok: true, trashed: 0, missing: [] };
   try {
     const res = await backendFetch('/api/delete-asset', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paths }),
     });
-    return res.ok;
-  } catch { return false; }
+    if (!res.ok) return { ok: false, trashed: 0, missing: [] };
+    // A body we cannot parse is not a failed delete — the trash already happened.
+    // Fall back to "everything we asked for was trashed", which is what the old
+    // boolean return assumed for every call.
+    try {
+      const body = await res.json() as Partial<DeleteFilesResult>;
+      return {
+        ok: true,
+        trashed: typeof body?.trashed === 'number' ? body.trashed : paths.length,
+        missing: Array.isArray(body?.missing) ? body.missing : [],
+      };
+    } catch { return { ok: true, trashed: paths.length, missing: [] }; }
+  } catch { return { ok: false, trashed: 0, missing: [] }; }
 }
 
 /** Copy an asset to a new path; the backend regenerates the GUID so the
@@ -213,13 +246,30 @@ export async function createFolderApi(folderPath: string): Promise<boolean> {
  *  the asset's .meta.json sidecar). The caller controls the full target path,
  *  not just the destination folder. */
 export async function moveFileTo(from: string, to: string): Promise<boolean> {
+  return (await moveFileToStatus(from, to)).ok;
+}
+
+/** `moveFileTo` with the HTTP status preserved, so a caller can tell a COLLISION
+ *  from a backend failure. `/api/move-file` never clobbers: it answers **409
+ *  "Destination exists"** when something already occupies the destination, and
+ *  403/404/5xx for everything else. That distinction is what an undo/redo needs
+ *  in order to report honestly (#308) — a 409 is user-caused and user-fixable
+ *  (they recreated something at the old path, so undoing a rename can't move it
+ *  back), while a 5xx is neither. `status` is 0 when the request itself threw.
+ *
+ *  `moveFileTo` deliberately stays a bare boolean rather than being widened to
+ *  this shape: every existing call site uses it directly in boolean context
+ *  (`if (await moveFileTo(a, b))`), and an object return is ALWAYS truthy — so
+ *  widening it in place would silently disarm each of those guards while
+ *  typechecking cleanly. */
+export async function moveFileToStatus(from: string, to: string): Promise<{ ok: boolean; status: number }> {
   try {
     const res = await backendFetch('/api/move-file', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from, to }),
     });
-    return res.ok;
-  } catch { return false; }
+    return { ok: res.ok, status: res.status };
+  } catch { return { ok: false, status: 0 }; }
 }
 
 /** Resolve the first real (writable) asset root by scanning the live manifest.
@@ -282,13 +332,41 @@ export async function createPrefabFromEntity(
   const ref = entityRef(entityId);
   const action: UndoAction = {
     label,
+    // Both directions are ALL-OR-NOTHING: the file write/delete is gated, and the
+    // cache + the live tree's instance tagging only follow if it landed (#308).
+    //
+    // That differs from makeDeleteUndo, which deliberately restores what it can and
+    // reports the shortfall — and the difference is the unit of work, not a
+    // disagreement. There, undo covers N INDEPENDENT files and partial progress is
+    // genuinely useful. Here it is ONE coupled operation: the .prefab.json and the
+    // entities linked to it. Half-applying that leaves the user in a state that is
+    // neither before nor after — entities un-linked from a prefab still on disk, or
+    // linked to one that is not. Refusing cleanly and saying so is the honest answer.
     undo: async () => {
-      await deleteAssetFile(savePath);
+      if (!(await deleteAssetFile(savePath))) {
+        reportUndoFailure({
+          direction: 'Undo', label,
+          detail: `the prefab file was not trashed and is still on disk: ${savePath}. The entities were left linked to it rather than half-undone.`,
+        });
+        return;
+      }
       setPrefabCache(cacheKey, null);
       const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id);
     },
     redo: async () => {
-      await writeAssetFile(savePath, content);
+      // Why gating matters MORE than logging on this side: caching the prefab (and
+      // tagging the live tree as an instance of it) after a failed write leaves the
+      // editor believing in a .prefab.json that is not on disk. It reads correctly
+      // from cache for the rest of the session and comes back missing on the next
+      // scene load or a fresh editor launch, which read the FILE. That delay is what
+      // makes the desync expensive — the failure surfaces far from its cause.
+      if (!(await writeAssetFile(savePath, content))) {
+        reportUndoFailure({
+          direction: 'Redo', label,
+          detail: `the prefab file was not written: ${savePath}. The entities were left un-linked rather than pointed at a file that is not there.`,
+        });
+        return;
+      }
       if (prefab.id) registerAsset(prefab.id, savePath, 'prefab');
       setPrefabCache(cacheKey, prefab);
       const id = ref.resolve(); if (id != null) tagEntityTreeAsInstance(id, savePath);

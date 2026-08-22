@@ -14,7 +14,7 @@
 import { Capacitor } from '@capacitor/core';
 import { ENGINE_API_VERSION, loadManifestJson, type AssetManifestFile, type GameDefinition } from '@modoki/engine/runtime';
 import projectConfig from 'virtual:modoki-project-config';
-import { checkAppSubgameUpdates } from './ota';
+import { checkAppSubgameUpdates, isPluginUnimplemented } from './ota';
 import { registerDynamicGame } from './gameRegistry';
 
 export interface SubgameLoadError {
@@ -157,7 +157,12 @@ async function loadOneSubgame(bundle: { name: string; version: string; path: str
     const m = await import('capacitor-modoki-ota');
     await m.ModokiOta.confirmBoot({ name: bundle.name });
   } catch (e) {
-    console.warn(`[GameShell] sub-game "${bundle.name}" confirmBoot failed (non-fatal):`, e);
+    // Same distinction as the shell's own confirmBoot — see `isPluginUnimplemented`.
+    if (isPluginUnimplemented(e)) {
+      console.log(`[GameShell] no OTA plugin — sub-game "${bundle.name}" confirmBoot skipped`);
+    } else {
+      console.warn(`[GameShell] sub-game "${bundle.name}" confirmBoot failed (non-fatal):`, e);
+    }
   }
 }
 

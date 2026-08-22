@@ -41,6 +41,13 @@ rotation is undone first), so a rotated box/plane/cylinder contains correctly.
 - `box` — full size = scale (half-extents `sx/2`, `sy/2`)
 - `capsule` — vertical pill along local Y, radius = `sx`, total height = `sy`
 
+**Containment tests the occupant's POSITION — a point, not its volume.** `zoneTriggerCore`
+resolves each occupant to a world position and asks the zone `contains(x, y, z)`; the occupant's
+own collider/renderable extent is never consulted (it may not have one — that is the point). So an
+object reads as inside strictly later, and outside strictly earlier, than the same object crossing
+an identically sized Rapier sensor, by roughly its own radius at each face. Size a zone for where
+you want the CENTRE to be, not by matching a sensor you are replacing.
+
 ## The three sinks (per crossing)
 
 For every enter and exit, `zone2DSystem` / `zone3DSystem` fan out to:
@@ -77,7 +84,7 @@ For every enter and exit, `zone2DSystem` / `zone3DSystem` fan out to:
   trigger collider fires `OnTriggerExit`.) ⚠️ Note this is the OPPOSITE of `Director`, which FREEZES
   when its entity is deactivated (see [timeline.md](./timeline.md)) — a playhead has no ledger to
   keep balanced, so resuming where it stopped is the useful behaviour there. Both use the same core
-  predicate, `isEntityActiveInHierarchy` (`runtime/ecs/entityIndex.ts`); what differs is what the
+  predicate, `isEntityActiveInHierarchy` (`runtime/core/ecs/entityIndex.ts`); what differs is what the
   subsystem does about it.
 - **Self-skip.** A zone that is itself tagged `ZoneOccupant` never triggers on itself.
 - **Channel isolation.** 2D and 3D occupancy state is kept per-channel, so a scene running both
@@ -92,13 +99,39 @@ For every enter and exit, `zone2DSystem` / `zone3DSystem` fan out to:
 4. Register a `level.checkpoint` UIAction. Walking the player in dispatches it with the player as
    `ctx.target`.
 
+## Worked example in a shipped project
+
+**`demos/3d-physics-demo` and `demos/2d-physics-demo` each carry the chain end to end**, in both
+cases deliberately parked next to the physics sensor doing the same job, so the two mechanisms are
+comparable in one scene:
+
+| | **Sensor Zone** | **Trigger Zone** |
+|---|---|---|
+| Traits | `RigidBody` + `Collider{isSensor}` + `OnCollision` | `Zone` + `OnZone` |
+| Rapier body | yes | **none** |
+| Detects | anything with a collider | anything tagged `ZoneOccupant` |
+
+Each tints its own primitive and journals its own event from a registered UIAction, so a crossing
+is verifiable as data (`modoki_journal`) rather than by eye. The demo's `tests/zone-station.test.ts`
+pins that wiring (and its 2D twin does the same): each reads the action names out of the scene JSON
+and asserts the demo's real handlers run, which is the failure this system is prone to — an authored
+action name that no longer resolves is a warning, not a crash, so an unwired zone keeps looking
+healthy in the Inspector.
+
+⚠️ **In 2D, a matching visual is authored at `0.5`, not `1`.** `Renderable2D.width`/`height` are
+**half-extents** and the Transform scale multiplies them, so a sprite draws `width * 2 * sx` wide —
+while a `Zone2D` box TESTS the scale itself (full size). The two agree only at `0.5 x 0.5`. Measured
+on `demos/2d-physics-demo`: `width: 1` under `sx: 260` draws **520** design px over a zone that tests
+260, and the bar overhangs the arena wall. Only the drawn half is visible, so this desync is found by
+looking at the render, not by reading the scene.
+
 ## Code map
 
 - Traits: `runtime/traits/{Zone3D,Zone2D,ZoneOccupant,OnZone3D,OnZone2D}.ts`
 - Shared core (routing + occupancy diff + despawn synthesis + world-pose read):
   `runtime/zones/zoneTriggerCore.ts`
 - Dimension systems: `runtime/zones/{zone3DSystem,zone2DSystem}.ts` (containment math per shape)
-- Event buses: `runtime/managers/{zoneEventBus,Zone3DEvents,Zone2DEvents}.ts`
+- Event buses: `runtime/zones/{zoneEventBus,Zone3DEvents,Zone2DEvents}.ts`
 - Wiring: systems in `engine/app/ecs/pipeline.ts`, managers in `engine/app/ecs/register.ts`, editor
   metadata in `engine/app/ecs/registerTraits.ts`
 - Editor wireframe: `Zone3D` in `editor/panels/SceneView.tsx` (3D mesh gizmo); `Zone2D` in the same

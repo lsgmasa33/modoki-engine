@@ -5,19 +5,22 @@
  *
  *  Architecture mirrors ParticleEditor/AnimationEditor: the live def is the single
  *  source of truth in the editor store, so the GLOBAL undo stack applies edits even
- *  when this panel is unfocused; edits coalesce per group; persistence is a debounced
- *  /api/write-file, and each edit re-seeds the shared spriteAnimCache so any live
- *  SpriteAnimator referencing this asset updates next frame. */
+ *  when this panel is unfocused; edits coalesce per group; the document is PARKED in the
+ *  dirty-asset registry and written by Cmd+S (Save All) — see useParkedAssetDoc.ts (#259) — and
+ *  each edit re-seeds the shared spriteAnimCache so any live SpriteAnimator referencing this
+ *  asset updates next frame. */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { backendFetch } from '../backend/editorBackend';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath } from '../../runtime/loaders/assetManifest';
 import { spriteThumbStyle } from './SpritePicker';
+import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
+import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { normalizeSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
 import { defaultSpriteClip, type SpriteClip } from '../../runtime/traits/SpriteAnimator';
 import { spriteIndexFromStep } from '../../runtime/particles/types';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { useDebouncedSave } from './useDebouncedSave';
+import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
@@ -25,7 +28,6 @@ import { BufferedNumberInput, inputStyle } from './fields';
 import { FrameThumb, TrackNameField, iconBtn, labelStyle } from './SpriteAnimatorSection';
 
 const COALESCE_MS = 500;
-const AUTOSAVE_MS = 400;
 type SpriteAnimAction = UndoAction & { _after: SpriteAnimDef };
 
 export default function SpriteAnimEditor() {
@@ -41,7 +43,6 @@ export default function SpriteAnimEditor() {
   // Active track is LOCAL panel state — the asset is just the clip set, it has no
   // "active clip" concept (that lives on the SpriteAnimator trait instead).
   const [active, setActive] = useState('');
-  const [saveMsg, setSaveMsg] = useState('');
 
   // ── Load the asset def when the open target changes ──
   useEffect(() => {
@@ -50,21 +51,44 @@ export default function SpriteAnimEditor() {
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingSpriteAnimDef;
-    if (existing) { savedMarkRef.current?.(existing); return; } // bare re-mount — keep unsaved edits
+    if (existing) {
+      // ⚠️ "In sync" means EQUAL TO DISK, and a parked write means it is not. This branch marked
+      // `existing` as the saved baseline unconditionally, so re-entering the effect while a write
+      // was pending told the hook the pending doc was already written — and its reconciliation
+      // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
+      // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
+      // it returns HERE and never reaches the pendingAssetDoc branch below.
+      if (!pendingAssetDoc(asset.path, 'spriteanim')) savedMarkRef.current?.(existing);
+      return;   // either way the loaded doc stays — that is what this branch is for
+    }
     const { loadSpriteAnimDef } = useEditorStore.getState();
+    // An UNSAVED write parked for this asset is not on disk yet, so fetching the file would open
+    // the PRE-edit doc and re-seed the live cache with it — discarding the edit everywhere except
+    // the registry that still holds it (QA-CTX-0008, measured on the Timeline twin of this path).
+    // That used to be reachable only via an agent op; since #259 the PANEL parks too, so closing
+    // and reopening this panel with unsaved edits would silently throw the human's own work away.
+    // Marked saved because it is parked, not written: it stays pending until Save All.
+    const parked = pendingAssetDoc(asset.path, 'spriteanim');
+    if (parked) {
+      const doc = normalizeSpriteAnim(parked as Parameters<typeof normalizeSpriteAnim>[0]);
+      if (!doc.id) doc.id = newGuid();
+      registerAsset(doc.id, asset.path, 'spriteanim');
+      adoptParkedDoc(asset.path, 'spriteanim', doc);
+      loadSpriteAnimDef(doc);
+      setActive(Object.keys(doc.clips)[0] ?? '');
+      return;
+    }
     fetch(asset.path)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((json) => {
         if (cancelled) return;
         const loaded = normalizeSpriteAnim(json);
-        if (!loaded.id) {
-          loaded.id = newGuid();
-          registerAsset(loaded.id, asset.path, 'spriteanim');
-          savedMarkRef.current?.(normalizeSpriteAnim(json)); // id-less twin → autosave persists the new id
-        } else {
-          registerAsset(loaded.id, asset.path, 'spriteanim');
-          savedMarkRef.current?.(loaded);
-        }
+        // Baseline is the doc WITH the minted id, never an id-less twin — that trick made the
+        // autosave write the new id, and without an autosave it would park a write just for
+        // OPENING a legacy asset. The scanner heals missing GUIDs already (buildManifest heal).
+        if (!loaded.id) loaded.id = newGuid();
+        registerAsset(loaded.id, asset.path, 'spriteanim');
+        savedMarkRef.current?.(loaded);
         loadSpriteAnimDef(loaded);
         setActive(Object.keys(loaded.clips)[0] ?? '');
       })
@@ -102,6 +126,13 @@ export default function SpriteAnimEditor() {
       const a: SpriteAnimAction = {
         _after: next,
         label: `spriteanim ${group.split(':')[0]}`,
+        // Asset-document edit: it changes a .spriteanim.json file, NOT any scene entity, so it must not
+        // bump the scene's edit-version. Its unsaved state is tracked by the dirty-asset registry
+        // (hasUnsavedChanges ORs both), and a falsely-dirty SCENE is not cosmetic — it self-blocks
+        // the file-direct agent routes, makes modoki_build refuse, and (since #259) makes Cmd+S
+        // interrupt a preview and rewrite the scene file on every save while authoring. The agent
+        // twins have set this since S2.27; the panels never did.
+        _isFileDirect: true,
         undo: () => useEditorStore.getState().applySpriteAnimDef(path, before),
         redo: () => useEditorStore.getState().applySpriteAnimDef(path, a._after),
       };
@@ -151,23 +182,17 @@ export default function SpriteAnimEditor() {
     const doc = { id: guid, clips: { idle: defaultSpriteClip() } };
     const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(doc, null, 2) }) }).then((r) => r.ok).catch(() => false);
     if (!ok) return;
+    // CREATE writes immediately (the file must exist for registerAsset/the manifest), so the file
+    // is authoritative — drop any parked write for that path.
+    assetWrittenToDisk(path);
     registerAsset(guid, path, 'spriteanim');
     const name = (path.split('/').pop() || 'SpriteAnim').replace(/\.spriteanim\.json$/i, '');
     useEditorStore.getState().openSpriteAnimEditor({ path, type: 'spriteanim', name });
   }, []);
 
-  // ── Debounced auto-save to disk (watches the store def → covers edits + undo/redo) ──
-  const writeDef = useCallback((d: SpriteAnimDef): Promise<boolean> => {
-    const path = asset?.path;
-    if (!path) return Promise.resolve(false);
-    setSaveMsg('Saving…');
-    return backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content: JSON.stringify(d, null, 2) }),
-    }).then((res) => { setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`); return res.ok; })
-      .catch((e) => { console.error('[SpriteAnimEditor] auto-save failed', e); setSaveMsg('Save failed'); return false; });
-  }, [asset?.path]);
-  const { markSaved } = useDebouncedSave(def, writeDef, AUTOSAVE_MS);
+  // ── Park the edit; Cmd+S writes it (#259) ──
+  // Watches the store def, so it covers edits AND global undo/redo.
+  const { markSaved, dirty } = useParkedAssetDoc(def, asset?.path, 'spriteanim');
   savedMarkRef.current = markSaved;
 
   const frames = clip?.frames ?? [];
@@ -180,12 +205,12 @@ export default function SpriteAnimEditor() {
           ? <FlipbookPreview clip={clip} />
           : <div style={{ color: '#555' }}>{asset ? 'No frames in this clip yet' : 'Double-click a .spriteanim.json in Assets to edit'}</div>}
         {!asset && (
-          <button onClick={newSpriteAnim} style={{ ...btn, position: 'absolute', bottom: 40, padding: '6px 14px' }}>+ New Sprite Animation</button>
+          <button data-ui-id="spriteAnim.preview.new" data-ui-kind="button" data-ui-label="New Sprite Animation" onClick={newSpriteAnim} style={{ ...btn, position: 'absolute', bottom: 40, padding: '6px 14px' }}>+ New Sprite Animation</button>
         )}
         {def && (
           <div style={{ position: 'absolute', left: 8, bottom: 8, display: 'flex', gap: 6 }}>
-            <button onClick={() => gUndo()} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
-            <button onClick={() => gRedo()} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
+            <button data-ui-id="spriteAnim.preview.undo" data-ui-kind="button" data-ui-label="Undo" onClick={() => gUndo()} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
+            <button data-ui-id="spriteAnim.preview.redo" data-ui-kind="button" data-ui-label="Redo" onClick={() => gRedo()} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
           </div>
         )}
       </div>
@@ -195,18 +220,18 @@ export default function SpriteAnimEditor() {
         <div style={{ width: 290, flexShrink: 0, borderLeft: '1px solid #333', overflowY: 'auto', padding: 10 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
             <span style={{ fontWeight: 'bold', color: '#ddd' }}>{asset?.name}</span>
-            <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#2ecc71' }}>{saveMsg || 'Auto-save'}</span>
+            <span style={{ fontSize: 10, color: dirty ? '#f1c40f' : '#2ecc71' }}>{saveStatusLabel(dirty)}</span>
           </div>
 
           {/* Track picker */}
           <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>Clips</div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 4 }}>
-            <select value={activeName} onChange={(e) => setActive(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 0 }} disabled={names.length === 0}>
+            <select data-ui-id="spriteAnim.clips.select" data-ui-kind="field" data-ui-label="clip" value={activeName} onChange={(e) => setActive(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 0 }} disabled={names.length === 0}>
               {names.length === 0 && <option value="">(no clips)</option>}
               {names.map((n) => <option key={n} value={n}>{n}</option>)}
             </select>
-            <button onClick={addTrack} title="Add clip" style={iconBtn(false)}>＋</button>
-            <button onClick={deleteTrack} disabled={!activeName} title="Delete clip" style={iconBtn(!activeName)}>🗑</button>
+            <button data-ui-id="spriteAnim.clips.add" data-ui-kind="button" data-ui-label="Add clip" onClick={addTrack} title="Add clip" style={iconBtn(false)}>＋</button>
+            <button data-ui-id="spriteAnim.clips.delete" data-ui-kind="button" data-ui-label="Delete clip" onClick={deleteTrack} disabled={!activeName} title="Delete clip" style={iconBtn(!activeName)}>🗑</button>
           </div>
 
           {!activeName ? (
@@ -221,7 +246,7 @@ export default function SpriteAnimEditor() {
                 <span style={labelStyle}>fps</span>
                 <BufferedNumberInput value={clip!.fps} step={1} onChange={(v) => writeClip(activeName, `fps:${activeName}`, (c) => ({ ...c, fps: v }))} style={{ ...inputStyle, width: 56 }} />
                 <span style={labelStyle}>mode</span>
-                <select value={clip!.mode} onChange={(e) => writeClip(activeName, `mode:${activeName}`, (c) => ({ ...c, mode: e.target.value as SpriteClip['mode'] }))} style={{ ...inputStyle, flex: 1, minWidth: 0 }}>
+                <select data-ui-id="spriteAnim.clip.mode" data-ui-kind="field" data-ui-label="mode" value={clip!.mode} onChange={(e) => writeClip(activeName, `mode:${activeName}`, (c) => ({ ...c, mode: e.target.value as SpriteClip['mode'] }))} style={{ ...inputStyle, flex: 1, minWidth: 0 }}>
                   <option value="once">once</option>
                   <option value="loop">loop</option>
                   <option value="pingpong">pingpong</option>
@@ -243,9 +268,9 @@ export default function SpriteAnimEditor() {
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <AssetRefField label="" value={ref} onChange={(v) => setFrameAt(i, v)} accept={['sprite']} />
                   </div>
-                  <button onClick={() => moveFrame(i, -1)} disabled={i === 0} title="Move up" style={iconBtn(i === 0)}>↑</button>
-                  <button onClick={() => moveFrame(i, 1)} disabled={i === frames.length - 1} title="Move down" style={iconBtn(i === frames.length - 1)}>↓</button>
-                  <button onClick={() => removeFrame(i)} title="Remove frame" style={iconBtn(false)}>✕</button>
+                  <button data-ui-id={`spriteAnim.frames.${i}.up`} data-ui-kind="button" data-ui-label="Move up" onClick={() => moveFrame(i, -1)} disabled={i === 0} title="Move up" style={iconBtn(i === 0)}>↑</button>
+                  <button data-ui-id={`spriteAnim.frames.${i}.down`} data-ui-kind="button" data-ui-label="Move down" onClick={() => moveFrame(i, 1)} disabled={i === frames.length - 1} title="Move down" style={iconBtn(i === frames.length - 1)}>↓</button>
+                  <button data-ui-id={`spriteAnim.frames.${i}.remove`} data-ui-kind="button" data-ui-label="Remove frame" onClick={() => removeFrame(i)} title="Remove frame" style={iconBtn(false)}>✕</button>
                 </div>
               ))}
               <div style={{ marginTop: 2 }}>

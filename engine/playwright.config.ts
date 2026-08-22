@@ -75,7 +75,7 @@ export default defineConfig({
   //
   // `retries` stays 0 deliberately: retrying would paper over exactly the signal this
   // suite exists to give. The real fix is per-worker isolation (a dev server each), which
-  // would let this go parallel again; until then, serial. See docs/todo.md.
+  // would let this go parallel again; until then, serial. See docs/editor.md's e2e-suite passage.
   workers: 1,
   retries: 0,
   // `list` for humans, plus a guard that fails a run which reported success while covering only

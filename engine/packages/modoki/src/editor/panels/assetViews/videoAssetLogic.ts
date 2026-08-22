@@ -65,7 +65,26 @@ export function videoSettingsWarnings(
       // Measured, docs/video.md § Remote delivery: Releases serves range requests but
       // sends no Access-Control-Allow-Origin, and a clip bound as a GPU texture is
       // loaded crossOrigin='anonymous' — so it fails the load outright.
-      out.push('GitHub Releases sends no CORS header — a clip used as a texture will fail to load. Use jsDelivr or archive.org.');
+      out.push('GitHub Releases sends no CORS header — a clip used as a texture will fail to load. Use jsDelivr.');
+    } else if (/^https:\/\/([A-Za-z0-9-]+\.)*archive\.org\//i.test(url)) {
+      // Measured 2026-08-11 (docs/video.md § Remote delivery): archive.org answers the /download/
+      // request with a 302 carrying `ACAO: *`, then redirects to an `ia<n>`/`dn<n>.us.archive.org`
+      // storage node whose 200 carries NO CORS header at all. The redirect is what makes this a
+      // trap — a `curl -I` follows it and prints the header the real response does not have.
+      //
+      // ⚠️ SUBDOMAINS MUST MATCH, and this is the whole reason the pattern is not `(www\.)?`:
+      // the storage node is where a user's URL usually comes FROM. They paste the /download/ link,
+      // preview it in a browser, and the address bar now reads
+      // `https://ia801409.us.archive.org/0/items/…` — so the URL a human actually copies is the
+      // one a domain-anchored pattern misses, leaving the Inspector silent on the exact input the
+      // check exists for. (`ia801409…` 301s to `dn801201…`; both are archive.org subdomains, so
+      // one subdomain-permitting pattern covers the family. `archive.org.evil.com` and
+      // `notarchive.org` still correctly do not match — see the test.)
+      //
+      // NOT measured: `web.archive.org` (Wayback) playback URLs. They match this pattern and get
+      // warned, which is the safe direction — the hint names what was measured and points at a
+      // host known to work, rather than asserting Wayback's behaviour.
+      out.push('archive.org does not send CORS on the response that serves the bytes — its /download/ redirect carries the header and the ia*/dn* storage node behind it does not, so a clip used as a texture will fail to load. Use jsDelivr.');
     }
   }
   if (settings.audio === 'strip' && cache?.hasAudio) {

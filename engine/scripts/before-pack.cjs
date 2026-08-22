@@ -12,14 +12,18 @@
  * provisions them on-demand into the userData toolchain (install('ffmpeg')), keeping
  * the base app lean. See the decision matrix in editor-shipping-strategy.
  *
- * Order is irrelevant — they stage into disjoint files under build/bin/, which
- * electron-builder then ships as extraResources → Contents/Resources/bin and signs.
+ * Order is irrelevant — every stager writes to a disjoint path. The two native-tool stagers
+ * land in build/bin/, which electron-builder ships as extraResources → Contents/Resources/bin
+ * and signs; stage-vite-config emits engine/vite.config.cjs, which ships via the `engine/**`
+ * files glob (#326 — it keeps the packaged editor from writing inside its own signed bundle).
  */
 
 const stageToktx = require('./stage-toktx.cjs').default;
 const stageMsdf = require('./stage-msdf.cjs').default;
+const stageViteConfig = require('./stage-vite-config.cjs').default;
 
 exports.default = async function beforePack(context) {
   await stageToktx(context);
   await stageMsdf(context);
+  await stageViteConfig(context);
 };

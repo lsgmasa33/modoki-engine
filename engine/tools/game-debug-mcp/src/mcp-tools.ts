@@ -418,7 +418,12 @@ function renderScreenshot(
   const mimeType = decoded.dataUrl.startsWith('data:image/jpeg') ? 'image/jpeg' : 'image/png';
   const info = decoded.info + (opts.aimHint ?? '');
   const buf = Buffer.from(base64, 'base64');
-  const outPath = opts.savePath ?? join(tmpdir(), `device-screenshot.${extFor(mimeType)}`);
+  // pid-tagged like the adb capture path above, and for the same reason: the temp dir is
+  // machine-wide, one MCP server runs per clone, and the device LEASE is per DEVICE — so two
+  // clones driving two different phones both wrote this one file and each got back a path
+  // holding the OTHER phone's pixels. A screenshot that silently shows someone else's device
+  // is worse than no screenshot; it is evidence, and it was wrong.
+  const outPath = opts.savePath ?? join(tmpdir(), `device-screenshot-${process.pid}.${extFor(mimeType)}`);
   writeFileSync(outPath, buf);
   // fire-and-forget (macOS). `VITEST` guard: this is the first code path a test drives end-to-end,
   // and a suite that opens a GUI app on the developer's machine is a suite people stop running —
@@ -435,6 +440,15 @@ function renderScreenshot(
 async function deviceRequest(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
   const body = (await backendPost('/api/device/request', { method, params })) as { result?: unknown };
   return body.result;
+}
+
+/** As `deviceRequest`, but keeps the SIBLING fields the route sets beside `result`. Most ops have
+ *  none; the ones that do are reporting something about the read itself that the payload cannot
+ *  carry — a truncated syslog capture is the case that forced this, since silent truncation reads
+ *  as "that is all the device logged", which is the "no silent caps" rule this repo already applies
+ *  to workflows. */
+async function deviceRequestFull(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  return (await backendPost('/api/device/request', { method, params })) as Record<string, unknown>;
 }
 
 // ── Tool registration ────────────────────────────────────────
@@ -748,7 +762,7 @@ export function registerTools(server: McpServer) {
   // Verify game state by DATA, not pixels — critical on device, where Claude is weak at pixels AND
   // Android WebGPU screenshots come back black (only the adb framebuffer has the scene). These proxy
   // the SAME summary-first, GUID-addressed, float-rounded ops the editor MCP uses (agentBridge), now
-  // reachable on the device path. See docs/plans/device-percept-enact-plan.md.
+  // reachable on the device path. See docs/debug-tools-mcp.md.
 
   /** Run a structured op over the lease and shape its reply (compact JSON, or `isError` for a device
    *  `Error:` reply). Shared by the Percept tools. */
@@ -766,8 +780,13 @@ export function registerTools(server: McpServer) {
    *  one-line addition next to the reasoning instead of a second scattered special case. */
   const OK_IS_A_VERDICT = new Set(['diagnose']);
 
-  async function perceptCall(tool: string, method: string, params: Record<string, unknown> = {}) {
-    const what = `read ${method} from the connected device`;
+  async function perceptCall(tool: string, method: string, params: Record<string, unknown> = {}, whatOverride?: string) {
+    // §5 wants the envelope in the CALLER's terms. The default names the op, which is right for a
+    // tool that IS its op — but wrong for a relay, where the op is plumbing and the caller asked
+    // about something else entirely. `device_game_tool_call` is the case: every refusal read "read
+    // game-tool-call from the connected device", naming neither the game tool the caller invoked
+    // nor, for a mutating one, the right verb.
+    const what = whatOverride ?? `read ${method} from the connected device`;
     try {
       const parsed = parseReply<unknown>(await deviceRequest(method, params));
       if (isDeviceError(parsed)) {
@@ -871,6 +890,128 @@ export function registerTools(server: McpServer) {
       'live named read-values (e.g. canGoBack, timeSinceGameStart). Use before device_dispatch_action.',
     {},
     async () => perceptCall('device_introspect', 'game-introspect'),
+  );
+
+  // ── PlayerPrefs + scene queries (#288 Phase 6) ──────────────────────────────
+  //
+  // §9 makes this parity a FINDING, not optional scope: both ops register in `agentBridge.ts`
+  // (runtime), so the device runtime already has them — shipping no `device_*` tools would leave
+  // exactly the asymmetry that rule names. And prefs matter MORE here than in the editor: on a
+  // device the store is a real player's save data, namespaced by appId, not a playtest fixture.
+  tool('device_player_prefs',
+    'READ the game\'s PlayerPrefs store on the connected device — the durable per-key JSON save ' +
+      'data (progress, settings, unlocks) as the INSTALLED app actually holds it.\n\n' +
+      'CALLED BARE it returns the key INDEX plus `pendingWrites`; pass `key` for that key\'s ' +
+      'value. Every reply names its `namespace` — on a device that is the game\'s own (typically ' +
+      'the appId), NOT the editor\'s `<gameId>@editor` sandbox, so this is the only place you can ' +
+      'read what a player would see.\n\n' +
+      'An un-hydrated store REFUSES (NOT_AVAILABLE_HERE) rather than answering with an empty list: ' +
+      'the cache is filled only by PlayerPrefs.init() during boot, and before that "no keys" and ' +
+      '"nobody looked" are the same empty array. THIS IS A PURE READ — use ' +
+      'device_write_player_prefs to change anything.',
+    {
+      key: z.string().optional().describe("Read ONE key's value instead of the index. An absent key is an ANSWER (`present:false`), not an error — `present` is explicit because a key holding JSON null is otherwise indistinguishable from a missing one."),
+    },
+    async (args) => perceptCall('device_player_prefs', 'player-prefs-read',
+      Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
+      "read the game's PlayerPrefs store on the device"),
+  );
+
+  tool('device_write_player_prefs',
+    'WRITE the game\'s PlayerPrefs store on the connected device. device_player_prefs is the read ' +
+      'that VERIFIES anything done here.\n\n' +
+      '⚠️ THIS IS A REAL PLAYER\'S SAVE DATA. Not a fixture, not undoable, and not journaled as a ' +
+      'scene edit — the target is an INSTALLED app on a phone somebody uses. `action:"clear"` ' +
+      'wipes the whole namespace and therefore additionally requires confirm:true; a required ' +
+      '`action` stops a typo becoming a destructive default, but only the acknowledgement stops a ' +
+      'deliberate clear aimed at the wrong lease. Check device_status first if you are unsure ' +
+      'which phone you hold.\n\n' +
+      '`set` and `delete` FLUSH before replying, so `saved:true` means the backend accepted the ' +
+      'durable write rather than merely that the in-memory cache changed — a rejected write keeps ' +
+      'its value in the cache, so a read-back still shows it while nothing survives a restart. ' +
+      'Such a write is reported PARTIAL, never as success.',
+    {
+      action: z.enum(['set', 'delete', 'clear', 'flush'])
+        .describe('REQUIRED. set = write one key (needs key + value). delete = remove one key (needs key; a key that is not there is REFUSED with the real key list, not a silent no-op). clear = remove EVERY key in the namespace (needs confirm:true). flush = force pending debounced writes out and report any the backend rejected.'),
+      key: z.string().optional().describe('The key, for action set/delete. Ignored by clear/flush.'),
+      value: z.any().optional().describe('The JSON document to store, for action:"set". Any JSON value including null. Omitting it is REFUSED rather than treated as a delete.'),
+      confirm: z.boolean().optional().describe('Required (true) for action:"clear" only — it removes every key in the namespace, on a real installed app, and is not undoable. The refusal lists the keys it would have removed.'),
+    },
+    async (args) => perceptCall('device_write_player_prefs', 'player-prefs-write',
+      Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
+      "write the game's PlayerPrefs store on the device"),
+  );
+
+  tool('device_scene_query',
+    'Cast a ray, sweep a sphere/circle, or pick a point against the LIVE PHYSICS world on the ' +
+      'device — "what is over there / would this fit / what is under this point", answered as DATA ' +
+      'instead of from a screenshot. All six engine queries (raycast/shapecast/point, 2D and 3D) ' +
+      'behind one tool; every one is a pure read.\n\n' +
+      'A MISS AND A REFUSAL ARE DIFFERENT ANSWERS. The engine functions return the same null for a ' +
+      'clean miss, an absent physics world, and a zero-length direction; the last two are ruled out ' +
+      'BEFORE casting, so `ok:true` with `hit:null` genuinely means the query ran and found ' +
+      'nothing. A scene with no colliders has no Rapier world at all and REFUSES.\n\n' +
+      'Every hit reports `guid` and `name` beside `entityId` — use the GUID, since runtime ids are ' +
+      'reassigned on every scene reload. `entityId:-1` with a null guid means a collider with no ' +
+      'ECS owner.',
+    {
+      kind: z.enum(['raycast', 'shapecast', 'point'])
+        .describe('REQUIRED. raycast: first collider along a ray. shapecast: same but sweeping a sphere/circle of `radius`. point: which collider CONTAINS a point.'),
+      dim: z.enum(['2d', '3d'])
+        .describe('REQUIRED. Which physics world to query — they are separate, and asking for a dimension the scene has no world for REFUSES rather than reporting a miss.'),
+      origin: z.array(z.number()).optional().describe('Ray/sweep start in ECS world coords. [x,y] for dim:2d, [x,y,z] for dim:3d. Required for raycast/shapecast.'),
+      direction: z.array(z.number()).optional().describe('Ray/sweep direction, same arity as origin. Need NOT be normalized, but must be non-zero — a zero vector is refused rather than reported as a miss. Required for raycast/shapecast.'),
+      point: z.array(z.number()).optional().describe('The point to test containment at, same arity as origin. Required for kind:point.'),
+      radius: z.number().optional().describe('Sphere/circle radius in world units. Required for kind:shapecast, and must be > 0.'),
+      maxDistance: z.number().optional().describe('Cap the cast length in world units. Default: unbounded, matching the engine functions.'),
+      solid: z.boolean().optional().describe('raycast only. Default true: a ray starting INSIDE a collider hits it at distance 0. Pass false to ignore the collider you start inside.'),
+      exclude: z.string().optional().describe("raycast only — a guid or exact entity NAME (never a raw id) whose body is never reported as a hit. An ambiguous name is REFUSED. Refused outright for kind:shapecast, whose engine function takes no exclusion filter."),
+      precision: z.number().optional().describe('Significant digits for the returned floats. Default 9 — verify a position with a TOLERANCE, never ===.'),
+    },
+    async (args) => perceptCall('device_scene_query', 'scene-query',
+      Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
+      'run a physics scene query on the device'),
+  );
+
+  // ── Game-registered tools (#286) ────────────────────────────────────────────
+  //
+  // The GAME's own tools, reached over the lease. Two STATIC relays, deliberately — not the
+  // dynamic tail the editor server materializes (#270). The device tool list is static by design
+  // (this server is a thin client of the lease), and a tail keyed to *which phone is leased and
+  // what build it carries* is far more volatile than one keyed to the open project: the
+  // device_eval_api guidance already warns that "an older app reports fewer ops".
+  //
+  // These add DISCOVERABILITY, not capability — `device_eval`'s `modoki.call('game-tool-call', …)`
+  // has reached the same ops since #270. An agent that does not already know that recipe will not
+  // find it, which is the whole reason these exist.
+  //
+  // Neither names a game: `name` is a runtime string and the declarations come from the connected
+  // build, so nothing here knows Court exists.
+  tool('device_game_tools',
+    'What TOOLS the game on the device registers for agents (registerAgentTool) — name, description, ' +
+      'params, whether each mutates, and whether it needs the sim Playing. These are the GAME\'s own ' +
+      'tools, not the engine\'s, so the list depends entirely on which game the connected build is: ' +
+      'this is the DISCOVERY call, ask it rather than guessing a name. Invoke one with ' +
+      'device_game_tool_call. Empty is normal — most projects register none, and a release build ' +
+      'reports none by design (the registry is gated on the debug menu).',
+    {},
+    async () => perceptCall('device_game_tools', 'game-tools', {}, "read the connected game's registered agent tools"),
+  );
+
+  tool('device_game_tool_call',
+    'Invoke one game-registered tool on the device by name. Discover the names AND their params with ' +
+      'device_game_tools first — `args` is validated on the device against that tool\'s declaration, ' +
+      'so a misspelled key is REFUSED rather than dropped. The reply is the tool\'s own answer, ' +
+      'passed through unchanged.',
+    {
+      name: z.string().describe('Tool name, exactly as device_game_tools reported it. Do not guess: the connected build decides which tools exist.'),
+      args: z.record(z.string(), z.any()).optional().describe('Arguments object, shaped by that tool\'s declared params. Omit for a no-argument tool.'),
+    },
+    async ({ name, args }) => perceptCall(
+      'device_game_tool_call', 'game-tool-call', { name, args: args ?? {} },
+      // Names the GAME TOOL, not the relay op. A refusal from court_load_level should say so.
+      `invoke the game tool ${name} on the connected device`,
+    ),
   );
 
   tool('device_layout_bounds',
@@ -1082,7 +1223,7 @@ export function registerTools(server: McpServer) {
       'iOS only: `source:"wda"` captures the WHOLE DEVICE SCREEN via WebDriverAgent instead of the ' +
       'app\'s own capture — the only way to see a system permission/ATT dialog, springboard, or ' +
       'anything outside the app. Its pixels are DEVICE-screen coordinates and must NOT be fed to ' +
-      'device_tap/device_drag (aim by selector/entity instead).',
+      'device_tap/device_drag (aim by `selector` instead — this surface has no `entity` addressing).',
     {
       savePath: z.string().optional().describe('Where to save (e.g., /tmp/screenshot.jpg). Defaults to a temp file.'),
       inline: z.boolean().optional().describe('Also embed the image in the response. Large — only when you need to SEE it.'),
@@ -1321,7 +1462,11 @@ export function registerTools(server: McpServer) {
       '`entity` addressing on this surface. move/up reuse the button from the down; a move/up with ' +
       'nothing held, or a down while already held, is REFUSED rather than silently re-pressing/re-aiming. ' +
       'Always dispatches synthetic DOM events, never OS-level trusted input — this op is not ' +
-      'routed through the trusted paths on either platform (#32), and says so on every reply.',
+      'routed through the trusted paths on either platform (#32), and says so on every reply. ' +
+      'RELEASE WHAT YOU PRESS: a down left un-released latches the engine pointer source, and until ' +
+      'a real finger presses again (or the lease drops, which now sends the up for you) the game ' +
+      'reads NO dragging at all — including the human\'s (#299). The reply says where the press ' +
+      'landed: `dom:<element>` when it went to DOM UI, `canvas:<how>` when it went to the game surface.',
     {
       action: z.enum(['down', 'move', 'up']).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device; refuses if occluded). Preferred.'),
@@ -1607,18 +1752,24 @@ export function registerTools(server: McpServer) {
       'cost (not the most recent), so a hitch is findable after the fact. gpu-on/gpu-off enable GPU ' +
       'timestamp queries, which have a real cost and so must be deliberate; on a backend without ' +
       'timer-query support the status comes back "unsupported" with a reason and NO number is ' +
-      'fabricated. This is the tool for a phone-only perf question — the editor runs on a desktop ' +
-      'GPU where the frame is fast regardless.',
+      'fabricated. boot reads the BOOT-PHASE timeline (#238): always-on spans across scene load, ' +
+      'asset acquire, shader prewarm and renderer init, intersected with the worst dropped frame — ' +
+      'the read that attributes a cold-boot freeze, which the frame aggregate cannot see because a ' +
+      'stall is dropped from its percentiles by design. This is the tool for a phone-only perf ' +
+      'question — the editor runs on a desktop GPU where the frame is fast regardless, and the boot ' +
+      'stall this exists for is a low-end-device fault.',
     {
-      action: z.enum(['read', 'capture-start', 'capture-stop', 'capture-read', 'capture-clear', 'gpu-on', 'gpu-off', 'reset'])
-        .optional().describe('Default "read" (the live aggregate). capture-* records/reads frames; gpu-* toggles GPU timestamps; reset clears markers + captures.'),
+      action: z.enum(['read', 'capture-start', 'capture-stop', 'capture-read', 'capture-clear', 'gpu-on', 'gpu-off', 'reset', 'boot', 'boot-reset'])
+        .optional().describe('Default "read" (the live aggregate). capture-* records/reads frames; gpu-* toggles GPU timestamps; reset clears markers + captures; boot reads the boot-phase timeline; boot-reset re-arms it.'),
       markers: z.number().optional().describe('action:read — how many marker rows to return (default 12).'),
-      limit: z.number().optional().describe('action:capture-read — how many of the WORST frames to return (default 5, max 20).'),
+      limit: z.number().optional().describe('action:capture-read (worst frames, default 5, max 20) or action:boot (rows per section, default 15, max 200).'),
+      all: z.boolean().optional().describe('action:boot only — return EVERY recorded span, not just the stall overlap and the costliest. Large.'),
     },
-    async ({ action, markers, limit }) => perceptCall('device_profiler', 'profiler', {
+    async ({ action, markers, limit, all }) => perceptCall('device_profiler', 'profiler', {
       ...(action !== undefined ? { action } : {}),
       ...(markers !== undefined ? { markers } : {}),
       ...(limit !== undefined ? { limit } : {}),
+      ...(all !== undefined ? { all } : {}),
     }),
   );
 
@@ -1898,27 +2049,94 @@ async function coordScaleOrRefusal(
     },
   );
 
+  // ── Crash reports ──────────────────────────────────────────
+
+  tool('device_crash_reports',
+    'What the DEVICE recorded when the app died — the backward-looking surface, since ' +
+    "device_native_logs source:'app' needs the app alive. Bare call = the recent records for this " +
+    'app. iOS: crash + jetsam `.ips` reports (every device-wide jetsam included — that is how an ' +
+    'app dies without writing a report of its own); pass `name` for a SUMMARY of one. Android: ' +
+    'FATAL EXCEPTION crashes plus activity-manager kills (`am_kill`, with the oom_adj and reason), ' +
+    'returned directly — logcat has no report FILES, so `name` is iOS-only. Needs go-ios (iOS) or ' +
+    'adb (Android); needs no lease and no running app.',
+    {
+      name: z.string().optional().describe('iOS only: summarise this report (a filename from the bare listing). Omit to list. Android returns records directly and refuses this.'),
+      app: z.string().optional().describe("Which app. iOS: the PROCESS name (default 'App' — every Modoki iOS game is the Capacitor App target), not the bundle id, which never appears in a report filename. Android: the PACKAGE, defaulting to the leased app or the open project's."),
+      limit: z.number().optional().describe('Max reports to list (default: 20, newest first)'),
+      all: z.boolean().optional().describe('List EVERY report on the device, not just this app’s. Noisy — a phone keeps ~100, mostly Siri/system chatter.'),
+      raw: z.boolean().optional().describe('IGNORED unless `name` is given (iOS). With `name`: the raw report text instead of the summary, capped at 20k chars. A jetsam report is ~117KB of device-wide snapshot, which is why summary is the default.'),
+      platform: z.enum(['ios', 'android']).optional().describe("Which platform to read, when no lease says. Needed ONLY when both an iPhone and an Android are attached — then the call refuses rather than picking one, because reading the wrong phone gives a confidently wrong answer."),
+    },
+    async ({ name, app, limit, all, raw, platform }) => {
+      try {
+        const body = await deviceRequestFull('crashReports', {
+          ...(name ? { name } : {}), ...(app ? { app } : {}), ...(platform ? { platform } : {}),
+          ...(limit !== undefined ? { limit } : {}), ...(all ? { all } : {}), ...(raw ? { raw } : {}),
+        });
+        const result = body.result;
+        // The C7 class: a device/route refusal arrives as an `Error: …` STRING resolved as a normal
+        // result, and `raw:true` legitimately returns a string too — so without this check a refusal
+        // would be handed back as if it were the report text.
+        if (isDeviceError(result)) return deviceReplyFailure('device_crash_reports', 'read the device crash reports', result);
+        // `raw` — the route already appends its own truncation marker to the text, so nothing to add.
+        if (typeof result === 'string') return { content: [{ type: 'text' as const, text: result }] };
+        // A listing says what it HID. "19 reports" when 99 exist is a different answer from "19
+        // reports exist", and only one of them is true.
+        const note = Array.isArray(result)
+          ? `[${String(body.shown)} of ${String(body.matched)} matching · ${String(body.totalOnDevice)} on device${body.filteredTo ? ` · filtered to process '${String(body.filteredTo)}' (pass all:true for everything)` : ''}]\n`
+          : '';
+        return { content: [{ type: 'text' as const, text: note + JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return caughtFailure('device_crash_reports', 'read the device crash reports', e);
+      }
+    },
+  );
+
   // ── Native Logs ────────────────────────────────────────────
 
   tool('device_native_logs',
-    'Return native logs from the device (logcat on Android, os_log on iOS).',
+    "Return native logs from the device. source:'app' (default) reads the app's OWN os_log/logcat " +
+    'from inside the process, LOOKING BACK `seconds`. ' +
+    "source:'system' reads the whole device log from the host — use it for a launch-time failure " +
+    'or a system kill, which the app cannot report about itself. ⚠️ The DIRECTION differs by ' +
+    'platform: on iOS it streams FORWARD for `seconds` (start it, then reproduce — it cannot show ' +
+    'something that already happened), while on Android it dumps logcat BACKWARD, so it needs no ' +
+    'capture window and `seconds` is ignored there.',
     {
       limit: z.number().optional().describe('Max lines (default: 50)'),
       filter: z.string().optional().describe('Text filter (case-insensitive). Only return lines containing this string.'),
-      seconds: z.number().optional().describe('Time window in seconds (default: 60)'),
+      seconds: z.number().optional().describe("Window in seconds. source:'app' looks BACK this far (default 60). source:'system' on iOS CAPTURES for this long (default 10, max 60) and you wait it out; on Android it is IGNORED — logcat already holds the past."),
+      source: z.enum(['app', 'system']).optional().describe("'app' (default) = in-process, needs the app running and connected. 'system' = host-side device log (go-ios syslog on iOS, adb logcat on Android); needs no lease and works when the app is dead."),
+      platform: z.enum(['ios', 'android']).optional().describe("Which platform to read, when no lease says. Needed ONLY when both an iPhone and an Android are attached — then the call refuses rather than picking one, because reading the wrong phone gives a confidently wrong answer."),
     },
-    async ({ limit, filter, seconds }) => {
+    async ({ limit, filter, seconds, source, platform }) => {
       try {
-        const raw = await deviceRequest('nativeLogs', {
+        const body = await deviceRequestFull('nativeLogs', {
           limit: limit ?? 50,
-          seconds: seconds ?? 60,
+          // Two different questions, so two different defaults — see the description. Sending the
+          // app path's 60 into a forward capture would make every system read a minute long.
+          seconds: seconds ?? (source === 'system' ? 10 : 60),
+          ...(source ? { source } : {}),
+          ...(platform ? { platform } : {}),
           ...(filter ? { filter } : {}),
         });
+        const raw = body.result;
         // Same class as device_console_logs above: an `Error: …` reply would be String()'d straight
         // into the payload and read as log CONTENT.
         if (isDeviceError(raw)) return deviceReplyFailure('device_native_logs', 'read the native device logs', raw);
         const result = parseReply<string[]>(raw);
-        return { content: [{ type: 'text' as const, text: (Array.isArray(result) ? result.join('\n') : String(result)) || 'No logs.' }] };
+        const text = (Array.isArray(result) ? result.join('\n') : String(result)) || 'No logs.';
+        // Say what the read actually WAS when it was a forward capture — an empty system result is
+        // "nothing was logged in those N seconds", not "the device has no logs", and those lead to
+        // opposite next moves. Truncation is stated for the same reason.
+        const note = source !== 'system' ? ''
+          // Android dumps a ring buffer (backward); iOS streams (forward). Saying WHICH read you
+          // got is the difference between "nothing was logged" and "nothing happened while I
+          // watched", and those lead to opposite next moves.
+          : body.backward
+            ? `[system log (logcat dump, backward)${body.device ? ` · ${String(body.device)}` : ''}${body.clamped ? ' · limit capped at 400 lines (response budget)' : ''}]\n`
+            : `[system syslog${body.device ? ` · ${String(body.device)}` : ''} · streamed forward for ${String(body.capturedFor ?? seconds ?? 10)}s${body.truncated ? ` · older matching lines dropped past limit ${limit ?? 50}` : ''}]\n`;
+        return { content: [{ type: 'text' as const, text: note + text }] };
       } catch (e) {
         return caughtFailure('device_native_logs', 'read the native device logs (logcat / os_log)', e);
       }

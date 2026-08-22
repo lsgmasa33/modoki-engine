@@ -59,7 +59,7 @@ export interface AudioHandle {
 }
 
 export interface AudioLogEntry {
-  op: 'play' | 'stop' | 'setBusVolume' | 'resume' | 'listener';
+  op: 'play' | 'stop' | 'setBusVolume' | 'resume' | 'listener' | 'fade';
   clip?: string;
   bus?: BusName;
   volume?: number;
@@ -67,6 +67,10 @@ export interface AudioLogEntry {
   loop?: boolean;
   /** Spatial start position (record mode) — lets tests assert the WORLD pose a source played at. */
   position?: { x: number; y: number; z: number };
+  /** Ramp length for an `op:'fade'` entry, in seconds. Without this, a crossfade and a
+   *  voice-cap steal are both invisible headlessly — the ramp is the whole behaviour, and
+   *  a no-op `fade()` cannot tell an authored 250 ms from a hardcoded 10 ms. */
+  durationSec?: number;
 }
 
 // ── Record mode (headless / tests) ────────────────────────────────
@@ -75,8 +79,25 @@ const log: AudioLogEntry[] = [];
 
 /** Force record mode even when an AudioContext exists (test hook). */
 export function setAudioRecordMode(on: boolean): void { forcedRecord = on; }
+
+/** Live record-mode handles, so a test can end them (see `endRecordedVoices`). */
+const recordedVoices = new Set<{ _markEnded(): void }>();
+
+/** Simulate every outstanding record-mode voice reaching its natural end.
+ *
+ *  Record mode has no audio clock and no `onended`, so nothing ever finishes on its own —
+ *  which left the "a finished voice frees its slot" behaviour untestable, and a test that
+ *  *looked* like it covered the reap sweep actually passed only because teardown cleared
+ *  the list wholesale. This is the missing affordance: record mode exists so tests can
+ *  assert what WOULD have happened, and "the sound finished" is part of that.
+ *
+ *  Not a `stop()` — a natural end is not a teardown, so nothing is logged. */
+export function endRecordedVoices(): void {
+  for (const h of [...recordedVoices]) h._markEnded();
+  recordedVoices.clear();
+}
 export function getAudioLog(): readonly AudioLogEntry[] { return log; }
-export function clearAudioLog(): void { log.length = 0; }
+export function clearAudioLog(): void { log.length = 0; recordedVoices.clear(); }
 
 function recording(): boolean {
   return forcedRecord || !hasAudioSupport();
@@ -95,19 +116,47 @@ const INERT: AudioHandle = {
   ended: true,
 };
 
-// Returned in record mode: `ended: false` so the system tracks it as an active
-// source (headless has no real 'ended' callback). Cleared wholesale on stop.
-const RECORDING_HANDLE: AudioHandle = {
-  stop() { /* no-op */ },
-  setVolume() { /* no-op */ },
-  setPitch() { /* no-op */ },
-  fade() { /* no-op */ },
-  stopAfter() { /* no-op */ },
-  pause() { /* no-op */ },
-  resume() { /* no-op */ },
-  setPosition() { /* no-op */ },
-  ended: false,
-};
+// Returned in record mode, ONE PER `play()` — not a shared singleton.
+//
+// It used to be a single frozen object with `ended: false` hardcoded and a no-op
+// `stop()`, which made teardown unobservable in two distinct ways (#289). The
+// obvious one: `getAudioLog()` could prove a voice STARTED and never that one was
+// torn down, so any lifetime assertion silently passed. The subtler one: because
+// every headless source shared the object, `audioSystem`'s per-source reap check
+// (`if (src.handle.ended)`) was answered by a process-wide constant rather than by
+// the source it was asked about — one handle could not differ from another.
+//
+// So each play mints its own, flipping its OWN `ended` and appending a `stop` entry.
+// `ended` still starts false so the system tracks it as live (headless has no real
+// 'ended' callback, and nothing ends a record-mode voice on its own).
+class RecordingHandle implements AudioHandle {
+  ended = false;
+  _markEnded(): void { this.ended = true; }
+  // Declared + assigned rather than a `private readonly` constructor parameter:
+  // the ROOT tsconfig sets `erasableSyntaxOnly`, under which a parameter property
+  // is a hard error (TS1294) — and the package's own tsconfig.check.json does not,
+  // so this only fails at `npm run typecheck`, not at the package typecheck.
+  private readonly clip?: string;
+  constructor(clip?: string) { this.clip = clip; recordedVoices.add(this); }
+  stop(): void {
+    if (this.ended) return;
+    this.ended = true;
+    recordedVoices.delete(this);
+    log.push({ op: 'stop', clip: this.clip });
+  }
+  setVolume(): void { /* no-op */ }
+  setPitch(): void { /* no-op */ }
+  fade(target: number, durationSec: number): void {
+    log.push({ op: 'fade', clip: this.clip, volume: target, durationSec });
+  }
+  // No audio clock in record mode, so a scheduled stop cannot fire on its own. The
+  // callers that care (a crossfade tail) also force-stop via `stopWorldAudio`, so the
+  // tail is still reaped — just at teardown rather than after `seconds`.
+  stopAfter(): void { /* no-op — see above */ }
+  pause(): void { /* no-op */ }
+  resume(): void { /* no-op */ }
+  setPosition(): void { /* no-op */ }
+}
 
 // ── Live Web Audio graph (lazy) ───────────────────────────────────
 interface Graph {
@@ -303,7 +352,7 @@ export function play(spec: AudioPlaySpec): AudioHandle {
       volume: spec.volume ?? 1, spatial: !!spec.spatial, loop: !!spec.loop,
       ...(spec.spatial && spec.position ? { position: { ...spec.position } } : {}),
     });
-    return RECORDING_HANDLE;
+    return new RecordingHandle(spec.clip);
   }
   const g = graphOrNull();
   if (!g) return INERT;

@@ -104,7 +104,7 @@ export interface CaptureWindowFacts {
  *  was found this said the renderer "is most likely wedged". That reads as a diagnosis, and it
  *  was WRONG for a fully-supported state — a layout with no Scene/Game panel open (a 2D-only
  *  project with both closed) has an `idle` frame loop by design, and the message sent the
- *  reader chasing a renderer fault that did not exist. See `docs/todo.md`.
+ *  reader chasing a renderer fault that did not exist. See `docs/debug-tools-mcp.md`.
  *
  *  So: assert a wedge ONLY when the frame loop actually reports `stalled`, and otherwise report
  *  what the renderer says. `idle` and `hidden` get their own actionable text; a `running` loop
@@ -322,7 +322,7 @@ export interface TapOpts {
  *  page zoom (factor f = 1.2^level) they differ: Chromium maps an injected DIP coordinate
  *  into the page by DIVIDING by f, so to land on the element at zoomed-CSS point P we must
  *  inject P·f. No-op at zoom 0 (f=1). MEASURED + rationale: the coordinate audit in
- *  docs/plans/editor-ui-zoom-plan.md. */
+ *  docs/debug-tools-mcp.md. */
 const toDip = (wc: Electron.WebContents, x: number, y: number): { x: number; y: number } => {
   const f = wc.getZoomFactor();
   return { x: x * f, y: y * f };
@@ -353,8 +353,31 @@ export interface DragOpts {
   steps?: number;
   /** Mouse button (default 'left'). 'middle'/'right' = orbit-pan in 3D. */
   button?: MouseButton;
-  /** Held modifiers (Shift = gizmo snap, Alt = duplicate-drag, …). */
+  /** Held modifiers (Shift = gizmo snap, Alt = duplicate-drag, …). Set on every mouse
+   *  event of the gesture AND sent as real keyDown/keyUp around it — see `MODIFIER_KEYCODE`. */
   modifiers?: InputModifier[];
+}
+
+/** An `InputModifier` → the Electron `keyCode` for the physical modifier key.
+ *
+ *  A drag's `modifiers` used to set the bit on the MOUSE event only, which is invisible to a
+ *  `window` keydown/keyup listener — and that is how the editor tracks a modifier whose LEVEL
+ *  matters rather than its edge. `SceneView`'s 3D-gizmo snap is exactly that (`onSnapKey`, which
+ *  needs the keyup as much as the keydown), so no sequence of MCP calls could hold Shift for the
+ *  duration of a gizmo drag and the 3D half of snapping was untestable (bug XmytWgSlUzMPCNHtrhUw);
+ *  `modoki_press_key` could not close the gap either, because it completes keyDown→keyUp inside
+ *  one call. Sending the real key events around the gesture makes both consumers agree. */
+type CanonModifier = 'shift' | 'control' | 'alt' | 'meta';
+const CANON_MODIFIER: Record<InputModifier, CanonModifier> = {
+  shift: 'shift', control: 'control', alt: 'alt', meta: 'meta', cmd: 'meta', command: 'meta',
+};
+const MODIFIER_KEYCODE: Record<CanonModifier, string> = {
+  shift: 'Shift', control: 'Control', alt: 'Alt', meta: 'Meta',
+};
+
+/** `modifiers` as distinct canonical keys, stable order ('cmd'/'command'/'meta' collapse to one). */
+function canonModifiers(modifiers: InputModifier[] | undefined): CanonModifier[] {
+  return [...new Set((modifiers ?? []).map((m) => CANON_MODIFIER[m]).filter(Boolean))];
 }
 
 /** Trusted drag from → to with intermediate moves (gesture thresholds — match-3
@@ -377,8 +400,20 @@ export async function drag(
   // `pointerMove` (see `buttonHeldModifier`): without it Chromium reports `buttons:0`
   // on each move, so a listener gating on `e.buttons` sees the gesture as released.
   const heldModifiers = [...(modifiers ?? []), buttonHeldModifier(button)];
+  const modKeys = canonModifiers(modifiers);
+  // Keyboard events dispatch to the FOCUSED web contents (mouse events hit-test by coordinate),
+  // so an agent-driven window that isn't OS-focused would drop the modifier keyDown. Same reason
+  // `pressKey` focuses. Only when there IS a modifier — a plain drag must not touch focus.
+  if (modKeys.length) { wc.focus(); await sleep(16); }
   wc.sendInputEvent({ type: 'mouseMove', x: from.x, y: from.y, modifiers } as Electron.MouseInputEvent);
   wc.sendInputEvent({ type: 'mouseDown', x: from.x, y: from.y, button, clickCount: 1, modifiers } as Electron.MouseInputEvent);
+  // Press the modifier AFTER mouseDown: the press is what gives the panel keyboard scope, and
+  // SceneView's snap listener only arms while its own panel is focused. Released after mouseUp
+  // so the whole gesture — every intermediate move — happens with the key genuinely down.
+  modKeys.forEach((m, i) => {
+    // Each keyDown reports the modifiers held INCLUDING itself — what a real keyboard does.
+    wc.sendInputEvent({ type: 'keyDown', keyCode: MODIFIER_KEYCODE[m], modifiers: modKeys.slice(0, i + 1) } as Electron.KeyboardInputEvent);
+  });
   await sleep(16);
   for (let i = 1; i <= n; i++) {
     const t = i / n;
@@ -388,6 +423,12 @@ export async function drag(
     await sleep(16);
   }
   wc.sendInputEvent({ type: 'mouseUp', x: to.x, y: to.y, button, clickCount: 1, modifiers } as Electron.MouseInputEvent);
+  // Release in reverse, each keyUp reporting only the modifiers STILL held — so the last one
+  // reports `shiftKey:false`. A listener that reads the level off the event (onSnapKey does)
+  // would otherwise latch the modifier ON forever after an agent drag.
+  for (let i = modKeys.length - 1; i >= 0; i--) {
+    wc.sendInputEvent({ type: 'keyUp', keyCode: MODIFIER_KEYCODE[modKeys[i]], modifiers: modKeys.slice(0, i) } as Electron.KeyboardInputEvent);
+  }
 }
 
 export interface PointerOpts {
@@ -505,7 +546,7 @@ export async function scroll(
 /** Electron `sendInputEvent` keyCode wants Accelerator names (`Up`/`Down`/…), not the
  *  DOM `key` names (`ArrowUp`/…). Alias the DOM arrow names so callers can pass either and
  *  the game still receives a DOM keydown with `e.key === 'ArrowDown'`. */
-const KEYCODE_ALIAS: Record<string, string> = {
+export const KEYCODE_ALIAS: Record<string, string> = {
   ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
 };
 
@@ -597,8 +638,9 @@ export async function focusElement(
  *  `sendInputEvent` char events flow through Chromium's input pipeline, so a React
  *  controlled input (e.g. the Inspector's BufferedTextInput) fires its real
  *  onChange — a synthetic `element.value =` would not. Focus the target first
- *  (e.g. `tap` on the input). `clearFirst` selects-all + deletes so the field is
- *  replaced rather than appended; `submitKey` presses a terminal key afterward —
+ *  (e.g. `tap` on the input). `clearFirst` selects the field's contents (in the renderer — a
+ *  native Cmd+A accelerator is unreachable from `sendInputEvent`) and deletes them with a trusted
+ *  Backspace, so the field is replaced rather than appended, and says so if it could not; `submitKey` presses a terminal key afterward —
  *  'Tab'/'Escape' BLUR the field (the key case for verifying commit-on-blur),
  *  'Enter' submits. */
 /** TWO DIFFERENT QUESTIONS, deliberately not one predicate (measured 2026-07-22).
@@ -637,13 +679,74 @@ async function readActiveElement(wc: Electron.WebContents): Promise<{ typable: b
     .catch(() => ({ typable: false, gameSwallows: false, descriptor: null }));
 }
 
+/** Select the focused field's entire contents, from INSIDE the renderer.
+ *
+ *  NOT Cmd+A. On macOS Select All in a text field is a native Edit-menu ACCELERATOR, and
+ *  Chromium's `sendInputEvent` does not trigger native menu accelerators — `pressKey`'s own
+ *  description already says so. So the old clearFirst sent an inert Cmd+A followed by a
+ *  Backspace that deleted exactly ONE character, and the caller got old-text-minus-a-letter with
+ *  the new text appended, reported as `{ok:true, typed:<full length>}`. Selection is not input,
+ *  so doing it in the renderer costs nothing in fidelity: the DELETE that follows is still a
+ *  trusted key event, which is the part a React controlled input must see.
+ *
+ *  Returns the selected text (so the caller knows how much to delete), or null if there is
+ *  nothing selectable. */
+const SELECT_ALL_PROBE = `(() => {
+  const a = document.activeElement;
+  if (!a) return null;
+  if (a.isContentEditable === true) {
+    const r = document.createRange();
+    r.selectNodeContents(a);
+    const sel = window.getSelection();
+    if (!sel) return null;
+    sel.removeAllRanges();
+    sel.addRange(r);
+    return a.textContent || '';
+  }
+  if (typeof a.select === 'function') { a.select(); return a.value == null ? '' : String(a.value); }
+  return null;
+})()`;
+
+/** Empty the focused field. Returns undefined on success, or an explanation of what is STILL in
+ *  it — clearFirst failing silently is what made the original bug invisible. */
+async function clearFocusedField(wc: Electron.WebContents): Promise<string | undefined> {
+  const selected: string | null = await wc.executeJavaScript(SELECT_ALL_PROBE, true).catch(() => null);
+  if (selected === null) return undefined; // nothing selectable (canvas/div) — nothing to clear
+  const backspace = async () => {
+    wc.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' } as Electron.KeyboardInputEvent);
+    wc.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' } as Electron.KeyboardInputEvent);
+    await sleep(8);
+  };
+  await backspace(); // deletes the whole SELECTION in one press
+  let left = await readFocusedValue(wc);
+  // Belt and braces for a field that re-seeds itself or swallows the selection: delete what is
+  // left one character at a time, bounded by its own length so this can never spin.
+  for (let i = 0; left && i < left.length + 1 && i < 256; i++) {
+    await backspace();
+    const next = await readFocusedValue(wc);
+    if (next === left) break; // no progress — stop rather than hammer the field
+    left = next;
+  }
+  if (left) {
+    return `clearFirst did NOT empty the field — it still holds ${JSON.stringify(left)}, so what `
+      + 'you typed is appended to it rather than replacing it. Clear it through the app\'s own UI, '
+      + 'or set the value with modoki_eval.';
+  }
+  return undefined;
+}
+
 /** Read the focused element's current text — the MEASUREMENT `typed` is derived from (S3.18).
  *
  *  `typed: text.length` was a restatement of the request, not an observation: `sendInputEvent`
- *  cannot fail, and Chromium's synthetic `char` path only inserts characters it can express as a
- *  `keyCode`, so non-ASCII (CJK, emoji, accented) input was reported as typed under ok:true while
- *  the field was unchanged. Same false-success class `enact.md` records for the readOnly case,
- *  which was only closed for "nothing typable is focused". */
+ *  cannot fail, so a field that silently rejected or reformatted the input was reported as typed
+ *  under ok:true while it was unchanged. Same false-success class `enact.md` records for the
+ *  readOnly case, which was only closed for "nothing typable is focused".
+ *
+ *  ⚠️ This comment used to name non-ASCII input as the example, and that example is FALSE
+ *  (bug `xaewBYMBYXoeuiTllsI8`): Japanese, accented letters and emoji all insert cleanly through
+ *  the `char` path on Electron 43. Keeping the MEASUREMENT is still right — it is what makes any
+ *  such rejection visible — but the stated cause was steering agents away from a path that
+ *  works. */
 const FOCUSED_VALUE_PROBE = `(() => {
   const a = document.activeElement;
   if (!a) return null;
@@ -680,16 +783,8 @@ export async function typeText(
   if (!active.typable) return { typed: 0, editable: false, activeElement: active.descriptor };
   // Read BEFORE `clearFirst` runs? No — after it, so the delta measures what THIS call inserted
   // rather than counting the cleared text as a negative.
-  if (opts?.clearFirst) {
-    // Cmd+A (macOS) / Ctrl+A elsewhere, then Backspace — empty the field first.
-    const mod = process.platform === 'darwin' ? 'meta' : 'control';
-    wc.sendInputEvent({ type: 'keyDown', keyCode: 'a', modifiers: [mod] } as Electron.KeyboardInputEvent);
-    wc.sendInputEvent({ type: 'keyUp', keyCode: 'a', modifiers: [mod] } as Electron.KeyboardInputEvent);
-    await sleep(8);
-    wc.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' } as Electron.KeyboardInputEvent);
-    wc.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' } as Electron.KeyboardInputEvent);
-    await sleep(8);
-  }
+  let clearError: string | undefined;
+  if (opts?.clearFirst) clearError = await clearFocusedField(wc);
   const before: string | null = await readFocusedValue(wc);
   for (const ch of text) {
     // Only the `char` event inserts text; keyDown/keyUp bracket it so key handlers
@@ -711,7 +806,10 @@ export async function typeText(
   // wrapper, say) — then there is nothing to measure and `typed` falls back to the request, which
   // is at least no worse than before and is not dressed up as an observation.
   if (before === null || after === null) {
-    return { typed: text.length, editable: true, activeElement: active.descriptor, valueAfter: after };
+    return {
+      typed: text.length, editable: true, activeElement: active.descriptor, valueAfter: after,
+      ...(clearError ? { error: clearError } : {}),
+    };
   }
   // WHAT LANDED, not how much the length grew (independent review, 2026-07-30). A length delta is
   // the insert count only when typing APPENDS — but Chromium replaces the current SELECTION, so
@@ -725,18 +823,31 @@ export async function typeText(
   // append and replace, and needs no knowledge of what was selected.
   const landed = text.length === 0 || after.includes(text);
   const inserted = landed ? text.length : Math.max(0, after.length - before.length);
+  // A clearFirst that did not clear is a FAILURE even when the typed text landed: the field then
+  // holds old+new concatenated, and `ok:true` with a correct `typed` count hides it completely
+  // (the bug this replaced produced 'New EntitBuffalo Fort' and reported success).
+  if (clearError) {
+    return {
+      typed: inserted, editable: true, activeElement: active.descriptor, valueAfter: after,
+      error: clearError,
+    };
+  }
   return {
     typed: inserted,
     editable: true,
     activeElement: active.descriptor,
     valueAfter: after,
     ...(landed ? {} : {
+      // Describe the OBSERVATION and leave the cause open. This string used to blame non-ASCII
+      // input and recommend modoki_eval; both halves were wrong (bug `xaewBYMBYXoeuiTllsI8`) —
+      // non-ASCII types fine, and modoki_eval is a non-input write a controlled input never sees,
+      // so the "workaround" was more fragile than the path it replaced.
       error: `the requested text is NOT in the field after typing — ${inserted} of ${text.length} `
         + `character(s) appear to have reached it (before: ${JSON.stringify(before)}, after: `
-        + `${JSON.stringify(after)}). The usual cause is that Chromium's synthetic char path can `
-        + `only insert what it can express as a keyCode, so non-ASCII text (CJK, emoji, accented `
-        + `letters) is dropped; a field that reformats or rejects input as you type does the same. `
-        + `Set the value through the app's own UI, or use modoki_eval for a non-input-driven write.`,
+        + `${JSON.stringify(after)}). The usual cause is a field that reformats, truncates or `
+        + `rejects input as you type (a numeric field, a max-length, an input mask), so `
+        + `\`valueAfter\` above is what it actually accepted. Retype in the shape the field wants, `
+        + `or drive the value through the control the app gives it.`,
     }),
   };
 }

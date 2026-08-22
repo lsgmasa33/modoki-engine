@@ -11,8 +11,8 @@
  *  Both dependencies are injected — no Electron window, no DOM. That is why the routes
  *  were lifted out of `main.ts` in the first place. */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { createInputRoutes, resolvePoint, type InputOps } from '../../electron/inputRoutes';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createInputRoutes, resolvePoint, HELD_POINTER_IDLE_MS, type InputOps } from '../../electron/inputRoutes';
 
 /** Ordered log of everything that happened, so we can assert on sequence.
  *  Actor-lease traffic is recorded SEPARATELY (`leaseCalls`) — it brackets every route, so
@@ -20,6 +20,15 @@ import { createInputRoutes, resolvePoint, type InputOps } from '../../electron/i
  *  pin, in noise identical on every single one of them. */
 let calls: string[];
 let leaseCalls: { open?: boolean; id?: number }[];
+/** What the fake `probe-key-reach` answers. Default = the open world (no panel owns the
+ *  keyboard, so the gate lets input through); a test that needs the QA-PHYS-0003 world
+ *  reassigns it before posting. */
+let keyReach: { focusedPanel: string | null; editorBinding: string | null; gameInputSuppressed: boolean; simRunning: boolean };
+/** Which panels the fake renderer reports as having an open tab. `set-focus-scope` refuses
+ *  anything outside this list, exactly as the real op does (#301). Case-sensitive on purpose:
+ *  a miscased id is the failure that motivated the guard. */
+let openPanels: string[];
+
 
 function makeOps(): InputOps {
   return {
@@ -44,16 +53,43 @@ function makeRenderer(overrides?: Record<string, unknown>) {
       leaseCalls.push(p);
       return p.open ? { id: 42 } : { ok: true };
     }
+    // Window deliverability brackets every route like the lease does — kept out of `calls`
+    // (and overridable per-test) for the same reason: it is identical noise on every test and
+    // would bury the resolve-vs-dispatch ordering these tests exist to pin.
+    if (op === 'input-deliverability') return overrides?.['input-deliverability'] ?? { visibilityState: 'visible', hasFocus: true };
     calls.push(`renderer:${op}`);
     if (op === 'resolve-dom-point') {
       const sel = (params as { selector: string }).selector;
       if (sel === '#kebab') return { ok: true, x: 210, y: 110, matched: 'button#kebab', hitTarget: 'button#kebab', occluded: false };
       if (sel === '#covered') return { ok: true, x: 50, y: 60, matched: 'button#covered', hitTarget: 'div.menu', occluded: true };
+      // Scrolled out of its own list: occluded, but by the chrome BEHIND it, not by something on top.
+      if (sel === '#scrolled-out') return { ok: true, x: 20, y: 483, matched: 'div#scrolled-out', hitTarget: 'div.flexlayout__splitter', occluded: true, clipped: true };
       return { ok: false, error: `no element matches selector "${sel}"` };
     }
     if (op === 'resolve-entity-point') {
       const spec = (params ?? {}) as { guid?: string; name?: string; id?: number; allowOccluded?: boolean };
       // 'Puck' is a 3D scene entity — canvas-scope occlusion, nothing covering it.
+      // Hit-test found NO element: the point is clipped away or past the window edge. `hitTarget`
+      // is the shared NOTHING_AT_POINT sentinel, not a describable cover.
+      if (spec.name === 'EdgeCube') {
+        return {
+          ok: true, x: 1000, y: 300,
+          entity: { id: 11, name: 'EdgeCube', guid: 'g-edge', layer: '3d' },
+          matched: 'EdgeCube [g-edge]', hitTarget: 'nothing (clipped or off-window)',
+          occluded: true, occlusionScope: 'canvas', surface: 'game-3d',
+        };
+      }
+      // 'entity' scope, picker FOUND the target, and a modal covers the canvas over it — the
+      // combination the suite had no fixture for.
+      if (spec.name === 'CoveredHero') {
+        return {
+          ok: true, x: 420, y: 260,
+          entity: { id: 12, name: 'CoveredHero', guid: 'g-covhero', layer: '3d' },
+          matched: 'CoveredHero [g-covhero]', hitTarget: 'div.modal',
+          occluded: true, occlusionScope: 'entity', surface: 'scene-view',
+          occludedByEntity: null, aimedAt: 'centre',
+        };
+      }
       if (spec.guid === 'g-puck' || spec.name === 'Puck') {
         return {
           ok: true, x: 400, y: 300,
@@ -92,11 +128,27 @@ function makeRenderer(overrides?: Record<string, unknown>) {
       if (spec.name === 'Enemy') return { ok: false, error: '3 entities are named "Enemy" (g-a, g-b, g-c) — address by guid' };
       return { ok: false, error: `no entity with guid ${JSON.stringify(spec.guid ?? spec.name ?? spec.id)}` };
     }
+    if (op === 'probe-key-reach') {
+      // The default world: nothing focused, so the gate is open and the press reaches the
+      // game. Individual tests override `keyReach` to model a closed gate.
+      return { ok: true, ...keyReach, chord: String((params as { key: string }).key).toLowerCase() };
+    }
     if (op === 'set-focus-scope') {
+      if (overrides?.['set-focus-scope'] !== undefined) return overrides['set-focus-scope'];
       const wanted = (params as { panel: string }).panel;
-      // The real op returns the store's value AFTER the set — a panel that is not open
-      // leaves the scope unchanged, which is how the route detects the failure.
-      return { ok: true, focusedPanel: wanted === 'not-open' ? null : wanted };
+      // Models the REAL op (agentEditorOps.ts `set-focus-scope`): it refuses a panel with no
+      // open tab and leaves the scope alone, reporting the ids that ARE open.
+      //
+      // ⚠️ This fake previously returned `{ok:true, focusedPanel: wanted}` for everything
+      // except a magic 'not-open' string — i.e. it modelled a renderer that rejected by
+      // changing its echoed value. No renderer ever did that: `setFocusedPanel` is a bare
+      // setter, so the echo always equalled the input and the route's `focusedPanel !== panel`
+      // guard was a tautology. The fake was the only thing making that guard look alive, which
+      // is why the FAILS-LOUDLY test below passed for years over a defect (#301).
+      if (!openPanels.includes(wanted)) {
+        return { ok: false, error: `no open panel ${JSON.stringify(wanted)} — panel ids are the FlexLayout tab ids and are case-sensitive`, focusedPanel: null, openPanels };
+      }
+      return { ok: true, focusedPanel: wanted, openPanels };
     }
     if (op === 'enact-handles') {
       const wanted = (params as { ids: string[] }).ids;
@@ -107,13 +159,15 @@ function makeRenderer(overrides?: Record<string, unknown>) {
       // below is the realistic shape for a keyframe/bone/vertex handle — the majority case that
       // the old `occluded: occludedBy !== undefined` derivation answered `false` for, asserting a
       // check that never ran.
-      const known: Array<{ id: string; x: number; y: number; onScreen?: boolean; occludedBy?: string; occlusionChecked?: boolean; meta?: { disabled?: boolean } }> = [
+      const known: Array<{ id: string; x: number; y: number; onScreen?: boolean; clipped?: boolean; occludedBy?: string; occlusionChecked?: boolean; meta?: { disabled?: boolean } }> = [
         { id: 'bone.0', x: 11, y: 22, occlusionChecked: true },
         { id: 'bone.1', x: 90, y: 80, occlusionChecked: true },
         { id: 'bone.off', x: -5, y: 400, onScreen: false },
         { id: 'bone.disabled', x: 30, y: 30, onScreen: true, meta: { disabled: true } },
         { id: 'bone.covered', x: 40, y: 40, onScreen: true, occludedBy: 'div.modal', occlusionChecked: true },
         { id: 'bone.canvas', x: 60, y: 60, onScreen: true },
+        // Inside the window, outside its own panel's clip box (testboard AceYUBoBXbcGtIIFmzGb).
+        { id: 'grad.clipped', x: 200, y: 863, onScreen: false, clipped: true, occlusionChecked: true },
       ];
       return { handles: known.filter((h) => wanted.includes(h.id)) };
     }
@@ -131,6 +185,8 @@ const post = (urlPath: string, body: unknown) =>
 beforeEach(() => {
   calls = [];
   leaseCalls = [];
+  keyReach = { focusedPanel: null, editorBinding: null, gameInputSuppressed: false, simRunning: false };
+  openPanels = ['scene', 'game', 'hierarchy', 'inspector', 'console', 'assets'];
   ops = makeOps();
   requestRenderer = makeRenderer();
   routes = createInputRoutes({ ops, requestRenderer });
@@ -150,7 +206,7 @@ describe('tap', () => {
     expect(res).toMatchObject({ kind: 'json', body: { ok: true, tapped: { x: 769, y: 310, button: 'left', clickCount: 1 } } });
     expect(calls).toEqual(['tap(769,310)']);
     // The renderer is asked for NOTHING but the actor lease — no resolution round-trip.
-    expect(requestRenderer.mock.calls.every(([op]) => op === 'actor-lease')).toBe(true);
+    expect(requestRenderer.mock.calls.every(([op]) => op === 'actor-lease' || op === 'input-deliverability')).toBe(true);
     // A coordinate tap carries no provenance fields — nothing was matched.
     expect((res as { body: Record<string, unknown> }).body.matched).toBeUndefined();
   });
@@ -161,19 +217,108 @@ describe('tap', () => {
     expect(ops.tap).toHaveBeenCalledWith(210, 110, expect.anything());
   });
 
-  it('reports matched / hitTarget / occluded so a covered target is visible without a screenshot', async () => {
-    const res = await post('/api/input/tap', { selector: '#covered' });
+  /** REVERSED 2026-08-19, deliberately. Two tests here used to assert that a covered selector was
+   *  TAPPED and merely reported (`occlusion is provenance, not a veto`), on the grounds that the
+   *  agent might know the overlay was harmless and a swallowed dispatch would surprise more than a
+   *  click that lands somewhere the response names.
+   *
+   *  That reasoning does not survive `mcp-tool-conventions.md` §0, which ranks a FALSE SUCCESS as
+   *  the worst outcome on this surface — above backwards compatibility — and it was already
+   *  contradicted twice on the surface itself: an `entity` aim has refused since 2026-07-29, and
+   *  the DEVICE twin refuses a covered selector too (`device_tap`: "an OCCLUDED target is refused
+   *  here rather than tapping something else"). The editor's selector path was the sole holdout,
+   *  i.e. §9's "a rule implemented twice diverges". The harmless-overlay case is real but rare, and
+   *  it now has an explicit name: `allowOccluded:true`. `pointer-events:none` never needed it —
+   *  `elementFromPoint` skips such elements, so they never read as occluders. */
+  /** #261 — a refusal that is TRUE right now and gone a frame later.
+   *
+   *  The trade the issue weighed was whether `resolvePoint` should settle-and-retry. Measured three
+   *  ways first (React commit 0 frames, FlexLayout tab reveal 1, tab add/remove 0-1; none producing
+   *  a false cover), which argued against the retry: a caller who re-aims at all has already waited
+   *  longer than the layout needs. What was missing was never the retry — it was the caller being
+   *  able to TELL a transient cover from a real one. So the refusal stands and gains a hint.
+   *
+   *  The input must STILL not be dispatched: this is a diagnosis, not a licence. */
+  it('#261 — a covered selector refusal SAYS SO when the dock is still moving', async () => {
+    requestRenderer = makeRenderer({ 'layout-settling': { settling: true, moved: 3, sampled: 15 } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { selector: '#covered' }) as { status?: number; body: { error: string; code: string } };
+    expect(res.body.code).toBe('OCCLUDED');
+    expect(res.body.error).toMatch(/covered by div\.menu/);      // the real diagnosis survives
+    expect(res.body.error).toMatch(/LAYOUT IS STILL MOVING/);     // …and is qualified
+    expect(res.body.error).toMatch(/Re-aim once/);
+    expect(ops.tap, 'a hint is a diagnosis, not a licence to dispatch').not.toHaveBeenCalled();
+  });
+
+  it('#261 — and stays SILENT when the layout is settled, so the hint means something', async () => {
+    // A hint on every refusal is noise a reader learns to skip, which is the same as not having it.
+    //
+    // The renderer must answer a REAL settled report here, not `null`. Asserting silence against an
+    // ABSENT answer passed vacuously: an "always fire" mutation then threw reaching `r.moved` and
+    // the best-effort catch swallowed it, so the test went green against the exact regression it
+    // was written for. Caught by mutation-checking this test rather than by reading it.
+    requestRenderer = makeRenderer({ 'layout-settling': { settling: false, moved: 0, sampled: 15 } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { selector: '#covered' }) as { body: { error: string } };
+    expect(res.body.error).toMatch(/covered by div\.menu/);
+    expect(res.body.error).not.toMatch(/LAYOUT IS STILL MOVING/);
+  });
+
+  it('#261 — a DID-NOT-RESOLVE refusal gets the hint too, which is the branch that reproduces', async () => {
+    // Close-out finding against my own change. The first version instrumented only the OCCLUDED
+    // refusal — the shape the ISSUE reported — and left this one silent. But the shape the
+    // MEASUREMENTS actually produce is this one: an unsettled panel reports a ZERO RECT, so the
+    // resolver refuses with "zero-size"/"no element", not with a cover. Without the hint here the
+    // refusal reads as "your selector is wrong" and the caller goes looking for a better address
+    // instead of simply re-aiming — the exact wrong-cause failure #261 is about, in the branch most
+    // likely to hit it.
+    requestRenderer = makeRenderer({ 'layout-settling': { settling: true, moved: 4, sampled: 15 } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { selector: '#missing' }) as { body: { error: string } };
+    expect(res.body.error).toMatch(/LAYOUT IS STILL MOVING/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('#261 — an ENTITY aim gets the same hint (§9: one rule, not one per path)', async () => {
+    requestRenderer = makeRenderer({ 'layout-settling': { settling: true, moved: 1, sampled: 15 } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { entity: { name: 'StartButton' }, surface: 'game-ui' }) as { body: { error: string; code: string } };
+    expect(res.body.code).toBe('OCCLUDED');
+    expect(res.body.error).toMatch(/LAYOUT IS STILL MOVING/);
+  });
+
+  it('#261 — a renderer that cannot answer costs the refusal nothing', async () => {
+    // The hint is best-effort by construction: a throwing/absent `layout-settling` must not turn a
+    // clean 400 refusal into a 500 or a hang. It is the refusal path — the worst possible place to
+    // introduce a new way to fail.
+    requestRenderer = makeRenderer({ 'layout-settling': undefined });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { selector: '#covered' }) as { status?: number; body: { error: string; code: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('OCCLUDED');
+    expect(res.body.error).toMatch(/covered by div\.menu/);
+  });
+
+  it('REFUSES a covered selector, naming the cover and the escape hatch, and dispatches nothing', async () => {
+    const res = await post('/api/input/tap', { selector: '#covered' }) as { status?: number; body: { error: string; code: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('OCCLUDED');
+    expect(res.body.error).toMatch(/covered by div\.menu/);
+    expect(res.body.error).toMatch(/allowOccluded/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('…and allowOccluded:true taps anyway, still reporting matched / hitTarget / occluded', async () => {
+    const res = await post('/api/input/tap', { selector: '#covered', allowOccluded: true });
     expect(res).toMatchObject({
       kind: 'json',
       body: { ok: true, tapped: { x: 50, y: 60 }, matched: 'button#covered', hitTarget: 'div.menu', occluded: true },
     });
+    expect(ops.tap).toHaveBeenCalledWith(50, 60, expect.anything());
   });
 
-  it('an occluded target is REPORTED, not refused — occlusion is provenance, not a veto', async () => {
-    // The agent may know the overlay is harmless (a pointer-events:none scrim), or may be
-    // deliberately clicking the thing on top. Silently swallowing the dispatch would be a
-    // far worse surprise than a click that lands somewhere the response names.
-    await post('/api/input/tap', { selector: '#covered' });
+  it('a RAW {x,y} aim is never refused for occlusion — a coordinate is what you asked for', async () => {
+    await post('/api/input/tap', { x: 50, y: 60 });
     expect(ops.tap).toHaveBeenCalledWith(50, 60, expect.anything());
   });
 
@@ -200,6 +345,31 @@ describe('tap', () => {
   });
 });
 
+/** The refusal is a property of the AIM, not of `tap` — so it binds every aimed route, and the one
+ *  carve-out is stated as a test rather than left to the reader (mcp-tool-conventions.md §9). */
+describe('occlusion refusal across the aimed routes', () => {
+  it('hover and scroll refuse a covered selector too', async () => {
+    const h = await post('/api/input/hover', { selector: '#covered' }) as { body: { code: string } };
+    expect(h.body.code).toBe('OCCLUDED');
+    expect(ops.hover).not.toHaveBeenCalled();
+    const sc = await post('/api/input/scroll', { selector: '#covered', deltaY: 120 }) as { body: { code: string } };
+    expect(sc.body.code).toBe('OCCLUDED');
+    expect(ops.scroll).not.toHaveBeenCalled();
+  });
+
+  it("pointer 'down' refuses, but 'move'/'up' do NOT — they land on whatever captured the press", async () => {
+    const down = await post('/api/input/pointer', { action: 'down', selector: '#covered' }) as { body: { code: string } };
+    expect(down.body.code).toBe('OCCLUDED');
+    expect(ops.pointerDown).not.toHaveBeenCalled();
+    // Establish a real held press somewhere clear, then re-aim it ONTO the covered element.
+    await post('/api/input/pointer', { action: 'down', x: 10, y: 10 });
+    await post('/api/input/pointer', { action: 'move', selector: '#covered' });
+    expect(ops.pointerMove).toHaveBeenCalledWith(50, 60, expect.anything());
+    await post('/api/input/pointer', { action: 'up', selector: '#covered' });
+    expect(ops.pointerUp).toHaveBeenCalledWith(50, 60, expect.anything());
+  });
+});
+
 describe('drag', () => {
   it('resolves BOTH endpoints before the single trusted drag', async () => {
     await post('/api/input/drag', { from: { selector: '#kebab' }, to: { x: 400, y: 400 } });
@@ -207,9 +377,18 @@ describe('drag', () => {
   });
 
   it('reports per-endpoint provenance only where a selector was used', async () => {
-    const res = await post('/api/input/drag', { from: { selector: '#covered' }, to: { x: 9, y: 9 } });
+    const res = await post('/api/input/drag', { from: { selector: '#covered' }, to: { x: 9, y: 9 }, allowOccluded: true });
     expect(res).toMatchObject({ body: { ok: true, fromTarget: { occluded: true, hitTarget: 'div.menu' } } });
     expect((res as { body: Record<string, unknown> }).body.toTarget).toBeUndefined();
+  });
+
+  it('REFUSES a covered endpoint, and a per-endpoint flag can allow just one of the two', async () => {
+    const refused = await post('/api/input/drag', { from: { selector: '#covered' }, to: { x: 9, y: 9 } }) as { body: { code: string } };
+    expect(refused.body.code).toBe('OCCLUDED');
+    expect(ops.drag).not.toHaveBeenCalled();
+    // Allow the covered SOURCE alone — the top-level flag is not needed, and not implied.
+    await post('/api/input/drag', { from: { selector: '#covered', allowOccluded: true }, to: { x: 9, y: 9 } });
+    expect(ops.drag).toHaveBeenCalledWith({ x: 50, y: 60 }, { x: 9, y: 9 }, expect.anything());
   });
 
   it('400s naming WHICH endpoint failed, and drags nothing', async () => {
@@ -363,6 +542,206 @@ describe('sustained pointer (held across calls)', () => {
     // the hold survived the failed move, so up succeeds and clears it
     const u = await post('/api/input/pointer', { action: 'up', x: 2, y: 2 });
     expect((u as { body: { pointer: { held: boolean } } }).body.pointer.held).toBe(false);
+    expect(ops.pointerUp).toHaveBeenCalledOnce();
+  });
+});
+
+/** #302 — a sustained press that is never released latches the renderer's `pointerSource`
+ *  (`activeId !== null` early-returns every later `pointerdown`), so the Game panel reads NO
+ *  dragging at all, the human's own mouse included. #299's trusted-takeover cannot fire here:
+ *  editor input is `sendInputEvent`, i.e. real OS input, so the stranded press is itself
+ *  `isTrusted` and the takeover's `!e.isTrusted || activeTrusted` guard skips it.
+ *
+ *  These tests assert the release DISPATCHES (`ops.pointerUp`), never merely that the state was
+ *  forgotten — forgetting is exactly the pre-#302 behaviour, and a test that only checked `held`
+ *  would pass against the bug. */
+describe('sustained pointer: the backend releases a stranded press (#302)', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  /** Run the pending idle timer and let its async release settle. */
+  const advance = async (ms: number) => { vi.advanceTimersByTime(ms); await vi.advanceTimersByTimeAsync(0); };
+
+  it('releases the press with a REAL mouseup once it sits idle past the budget', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 40, y: 50, button: 'right' });
+    expect(routes.getHeldPointer()).toMatchObject({ button: 'right', x: 40, y: 50 });
+
+    await advance(HELD_POINTER_IDLE_MS);
+
+    // The dispatch is the whole point — a cleared flag alone leaves pointerSource latched.
+    expect(ops.pointerUp).toHaveBeenCalledWith(40, 50, { button: 'right' });
+    expect(routes.getHeldPointer()).toBeNull();
+  });
+
+  it('does not fire one tick early — the budget is the budget', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    await advance(HELD_POINTER_IDLE_MS - 1);
+    expect(ops.pointerUp).not.toHaveBeenCalled();
+    expect(routes.getHeldPointer()).not.toBeNull();
+  });
+
+  it('is an IDLE budget, not a cap on gesture length — every move restarts it', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    // Three near-budget waits, each broken by a move. A total-duration cap would have fired by now.
+    for (let i = 0; i < 3; i++) {
+      await advance(HELD_POINTER_IDLE_MS - 1);
+      await post('/api/input/pointer', { action: 'move', x: 10 + i, y: 20 });
+      expect(ops.pointerUp).not.toHaveBeenCalled();
+    }
+    // …and it still expires from the LAST move, at that move's point rather than the press's.
+    await advance(HELD_POINTER_IDLE_MS);
+    expect(ops.pointerUp).toHaveBeenCalledWith(12, 20, { button: 'left' });
+  });
+
+  it('an explicit up disarms the timer, so no phantom release follows', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    await post('/api/input/pointer', { action: 'up', x: 2, y: 2 });
+    await advance(HELD_POINTER_IDLE_MS * 2);
+    expect(ops.pointerUp).toHaveBeenCalledOnce(); // the explicit one only
+  });
+
+  it('resetHeldPointer disarms it too — a reloaded document must not be sent a stray mouseup', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    routes.resetHeldPointer(); // the renderer reloaded; that document is gone
+    await advance(HELD_POINTER_IDLE_MS * 2);
+    expect(ops.pointerUp).not.toHaveBeenCalled();
+  });
+
+  it('a reload reports itself as a reload, NOT as an auto-release that never dispatched', async () => {
+    // The bug this pins: `lastHeldLoss` outliving its cause. Idle-release one press, press again,
+    // then reload — the second press is gone for a different reason, and quoting the first one's
+    // story would name the wrong press AND claim a mouseup that was never sent.
+    await post('/api/input/pointer', { action: 'down', x: 11, y: 11 });
+    await advance(HELD_POINTER_IDLE_MS);
+    await post('/api/input/pointer', { action: 'down', x: 77, y: 88 });
+    routes.resetHeldPointer();
+
+    const err = (await post('/api/input/pointer', { action: 'move', x: 1, y: 1 }) as { body: { error: string } }).body.error;
+    expect(err).toContain('77,88');          // the press that was actually lost…
+    expect(err).not.toContain('11,11');      // …not the earlier one
+    expect(err).toContain('reload');
+    expect(err).not.toContain('auto-released'); // nothing was dispatched
+  });
+
+  it('a reset with nothing held explains nothing — there is no press to have a story about', async () => {
+    routes.resetHeldPointer();
+    const err = (await post('/api/input/pointer', { action: 'up', x: 1, y: 1 }) as { body: { error: string } }).body.error;
+    expect(err).not.toContain('NOTE:');
+  });
+
+  it('the refusal that follows an auto-release NAMES it, instead of "you never pressed"', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 40, y: 50 });
+    await advance(HELD_POINTER_IDLE_MS);
+    const res = await post('/api/input/pointer', { action: 'move', x: 60, y: 70 });
+    expect(res).toMatchObject({ status: 409 });
+    const err = (res as { body: { error: string } }).body.error;
+    expect(err).toContain('auto-released');
+    expect(err).toContain('40,50');
+    expect(err).toContain('#302');
+    // …and a fresh press clears the story, so the next honest mistake reads as itself.
+    await post('/api/input/pointer', { action: 'down', x: 5, y: 5 });
+    await post('/api/input/pointer', { action: 'up', x: 5, y: 5 });
+    const plain = await post('/api/input/pointer', { action: 'move', x: 1, y: 1 });
+    expect((plain as { body: { error: string } }).body.error).not.toContain('auto-released');
+  });
+
+  it('a later tap releases the hold FIRST, so the new gesture is actually read', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 40, y: 50 });
+    calls = [];
+    await post('/api/input/tap', { x: 100, y: 200 });
+    // Order is the assertion: a tap dispatched while the button is still down is a mouseDown
+    // underneath a mouseDown, and pointerSource ignores it entirely.
+    expect(calls).toEqual(['pup(40,50,left)', 'tap(100,200)']);
+    expect(routes.getHeldPointer()).toBeNull();
+  });
+
+  it.each(['/api/input/drag', '/api/input/tap-handle', '/api/input/drag-handle'])(
+    '%s supersedes a held press for the same reason a tap does',
+    async (urlPath) => {
+      await post('/api/input/pointer', { action: 'down', x: 40, y: 50 });
+      await post(urlPath, { x: 1, y: 1, from: { x: 1, y: 1 }, to: { x: 9, y: 9 }, handle: 'h1', delta: { dx: 5, dy: 5 } });
+      expect(ops.pointerUp).toHaveBeenCalledWith(40, 50, { button: 'left' });
+      expect(routes.getHeldPointer()).toBeNull();
+    },
+  );
+
+  it.each(['key', 'type', 'scroll', 'hover', 'focus'])(
+    'a mid-gesture %s leaves the hold ALONE — those are legitimate during a drag',
+    async (route) => {
+      await post('/api/input/pointer', { action: 'down', x: 40, y: 50 });
+      await post(`/api/input/${route}`, { key: 'Shift', text: 'x', deltaY: 10, x: 1, y: 1, selector: '#kebab' });
+      // Constraining a drag with Shift, cancelling with Escape, or scrolling a list while dragging
+      // over it are real interactions; stealing the press would break the thing under test.
+      expect(ops.pointerUp).not.toHaveBeenCalled();
+      expect(routes.getHeldPointer()).toMatchObject({ x: 40, y: 50 });
+    },
+  );
+
+  it('getHeldPointer reports nothing held as null, which is what Percept surfaces', async () => {
+    expect(routes.getHeldPointer()).toBeNull();
+  });
+
+  // ── PROVENANCE ──
+  // An auto-released mouseup is REAL trusted input and the renderer acts on it: it commits a gizmo
+  // drag, drops a Hierarchy row, finalises a marquee. Dispatched outside the actor lease it is
+  // journaled `source:'human'` with the `!` sigil — so the editor records the AGENT's abandoned
+  // gesture as something the owner did, and CLAUDE.md tells the next session to believe exactly
+  // that ("read the editor journal first — the human probably did it"). Mislabelling here does not
+  // just misattribute a row; it aims a later session at undoing work nobody did.
+  it('the IDLE release carries the actor lease, so it is not journaled as the human', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    leaseCalls = [];
+    await advance(HELD_POINTER_IDLE_MS);
+    expect(ops.pointerUp).toHaveBeenCalled();
+    expect(leaseCalls.some((c) => c.open === true)).toBe(true);  // opened…
+    expect(leaseCalls.some((c) => c.id !== undefined)).toBe(true); // …and closed
+  });
+
+  it('the SUPERSEDE release carries it too — it fires outside the dispatcher its own wrapper covers', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    leaseCalls = [];
+    calls = [];
+    await post('/api/input/tap', { x: 9, y: 9 });
+    expect(calls).toEqual(['pup(1,1,left)', 'tap(9,9)']);
+    // Two leases: one bracketing the release, one bracketing the tap. Neither dispatch is bare.
+    expect(leaseCalls.filter((c) => c.open === true).length).toBe(2);
+    expect(leaseCalls.filter((c) => c.id !== undefined).length).toBe(2);
+  });
+
+  // ── the move/timer race ──
+  // The handler awaits the deliverability probe and the actor lease BEFORE `dispatchInput` runs,
+  // so the idle timer can still land in that window and release the press out from under an
+  // arriving move. That outcome is CORRECT — the budget really did elapse — but it must present as
+  // the explanatory 409, never as a stray half-gesture or an opaque 500.
+  it('a move that arrives just after the budget elapsed is refused cleanly, dispatching nothing', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    await advance(HELD_POINTER_IDLE_MS);
+    const res = await post('/api/input/pointer', { action: 'move', x: 2, y: 2 });
+    expect(res).toMatchObject({ status: 409 });
+    expect((res as { body: { error: string } }).body.error).toContain('auto-released');
+    expect(ops.pointerMove).not.toHaveBeenCalled(); // no move for a press that no longer exists
+    expect(ops.pointerUp).toHaveBeenCalledOnce();   // exactly one release, not two
+  });
+
+  it('a concurrent tap superseding an IN-FLIGHT move neither crashes it nor resurrects the press', async () => {
+    // The window the snapshot fix exists for: every `heldPointer!` read sits after an await, and
+    // nothing serialises two in-flight requests. Before the fix this dereferenced null and returned
+    // an opaque 500 on a move whose OS event had already been dispatched.
+    await post('/api/input/pointer', { action: 'down', x: 1, y: 1 });
+    let unblock: () => void = () => {};
+    const slow = new Promise<void>((res) => { unblock = res; });
+    (ops.pointerMove as unknown as { mockImplementationOnce(f: () => Promise<void>): void })
+      .mockImplementationOnce(async () => { calls.push('pmove(slow)'); await slow; });
+
+    const inFlight = post('/api/input/pointer', { action: 'move', x: 2, y: 2 });
+    await vi.advanceTimersByTimeAsync(0);          // let the move reach its stuck dispatch
+    await post('/api/input/tap', { x: 9, y: 9 });  // …and supersede it from under there
+    unblock();
+
+    expect(await inFlight).toMatchObject({ kind: 'json', body: { ok: true } }); // not a 500
+    // The supersede released the press and dispatched its mouseup; the move must not undo that by
+    // re-recording a hold the backend has already finished with.
+    expect(routes.getHeldPointer()).toBeNull();
     expect(ops.pointerUp).toHaveBeenCalledOnce();
   });
 });
@@ -539,12 +918,35 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
   });
 
   // ── F1: the resolve closure used to drop onScreen/occludedBy/disabled, so tap/drag fired
-  //    unconditionally and always returned ok:true. Now off-screen / disabled = a genuine miss
-  //    (ok:false, dispatch nothing); occluded = still act, but surface `occluded`. ──
+  //    unconditionally and always returned ok:true. Now off-screen / disabled / OCCLUDED are all a
+  //    genuine miss (ok:false, dispatch nothing), and `allowOccluded:true` is the escape hatch.
+  //    Occluded was a warning-that-still-dispatched until 2026-08-19: a 2D gizmo handle sitting
+  //    under the SceneView's own toolbar pressed the TOOLBAR and answered ok:true, which was filed
+  //    as "the handle is completely inert" (testboard 5jE5Tip6Qwp7s7YVAYoH — it was not). ──
+  it('a SCROLLED-OUT selector is refused with the scroll remedy, not "dismiss the modal"', async () => {
+    // The covering element is an anonymous splitter either way, so its name cannot tell the caller
+    // which fix applies. `clipped` can.
+    const res = await post('/api/input/tap', { selector: '#scrolled-out' }) as { status: number; body: { error: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/SCROLLED OUT/);
+    expect(res.body.error).toMatch(/modoki_scroll/);
+    expect(res.body.error).not.toMatch(/an open menu, a modal/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
   it('tap-handle REFUSES an off-screen handle (ok:false) and dispatches nothing', async () => {
     const res = await post('/api/input/tap-handle', { id: 'bone.off' }) as { body: { ok: boolean; error: string } };
     expect(res.body.ok).toBe(false);
     expect(res.body.error).toMatch(/off-screen/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('a CLIPPED handle is refused with the remedy that actually applies, not "scroll it"', async () => {
+    // Off the PANEL, not off the window: the press would land on whichever panel owns those
+    // pixels, and telling the caller to scroll is wrong for a handle drawn past a viewport edge.
+    const res = await post('/api/input/tap-handle', { id: 'grad.clipped' }) as { body: { ok: boolean; error: string } };
+    expect(res.body.ok).toBe(false);
+    expect(res.body.error).toMatch(/OUTSIDE its own panel/);
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
@@ -555,8 +957,16 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('tap-handle TAPS an occluded handle but surfaces `occluded` (provenance, not a veto)', async () => {
-    const res = await post('/api/input/tap-handle', { id: 'bone.covered' }) as { body: Record<string, unknown> };
+  it('tap-handle REFUSES an occluded handle, naming the cover and the escape hatch', async () => {
+    const res = await post('/api/input/tap-handle', { id: 'bone.covered' }) as { body: { ok: boolean; error: string } };
+    expect(res.body.ok).toBe(false);
+    expect(res.body.error).toMatch(/covered by div\.modal/);
+    expect(res.body.error).toMatch(/allowOccluded/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('…and allowOccluded:true presses anyway, still reporting `occluded`', async () => {
+    const res = await post('/api/input/tap-handle', { id: 'bone.covered', allowOccluded: true }) as { body: Record<string, unknown> };
     expect(ops.tap).toHaveBeenCalledWith(40, 40, expect.anything());
     // S3.17 — `occluded` is a BOOLEAN here, exactly as on tap/hover/drag/pointer; the covering
     // element's identity lives in `occludedBy`. It used to be the STRING itself, so the handle
@@ -579,16 +989,20 @@ describe('handle-aimed input (moved from main.ts intact)', () => {
     expect(ops.drag).not.toHaveBeenCalled();
   });
 
-  it('drag-handle still drags an occluded endpoint but reports `occluded`', async () => {
-    const res = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 } }) as { body: Record<string, unknown> };
+  it('drag-handle REFUSES a covered source, and drags it under allowOccluded', async () => {
+    const refused = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 } }) as { body: { ok: boolean; error: string } };
+    expect(refused.body.ok).toBe(false);
+    expect(refused.body.error).toMatch(/covered by div\.modal/);
+    expect(ops.drag).not.toHaveBeenCalled();
+    const forced = await post('/api/input/drag-handle', { id: 'bone.covered', to: { x: 5, y: 5 }, allowOccluded: true }) as { body: Record<string, unknown> };
     expect(ops.drag).toHaveBeenCalledWith({ x: 40, y: 40 }, { x: 5, y: 5 }, expect.anything());
-    expect(res.body).toMatchObject({ ok: true, occluded: true, occludedBy: 'div.modal' });
+    expect(forced.body).toMatchObject({ ok: true, occluded: true, occludedBy: 'div.modal' });
   });
 
   it('drag-handle says WHICH endpoint was covered (S3.17)', async () => {
     // The two endpoints used to collapse into one `occluded` field, so a caller could not tell a
     // covered source from a covered destination — and the fixes differ.
-    const res = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.covered' }) as
+    const res = await post('/api/input/drag-handle', { id: 'bone.0', toId: 'bone.covered', allowOccluded: true }) as
       { body: { fromTarget?: Record<string, unknown>; toTarget?: Record<string, unknown> } };
     expect(res.body.fromTarget).toMatchObject({ id: 'bone.0', occluded: false, occludedBy: null, occlusionChecked: true });
     expect(res.body.toTarget).toMatchObject({ id: 'bone.covered', occluded: true, occludedBy: 'div.modal', occlusionChecked: true });
@@ -655,16 +1069,108 @@ describe('entity-aimed input (the third target surface)', () => {
     // canvas scope: `occluded:false` says nothing about a mesh in FRONT of the target.
     const mesh = await post('/api/input/tap', { entity: { guid: 'g-puck' } });
     expect((mesh as { body: unknown }).body).toMatchObject({ occluded: false, occlusionScope: 'canvas' });
-    // element scope: a real DOM comparison, so this one is trustworthy.
-    const ui = await post('/api/input/tap', { entity: { name: 'StartButton' } });
+    // element scope, COVERED: this used to dispatch and report {occluded:true, ok:true}. The scope
+    // is still reported — on the forced path, which is the only one that presses a covered target.
+    const ui = await post('/api/input/tap', { entity: { name: 'StartButton' }, allowOccluded: true });
     expect((ui as { body: unknown }).body).toMatchObject({ occluded: true, occlusionScope: 'element', hitTarget: 'div.modal' });
+  });
+
+  it('REFUSES a covered ENTITY aim, on every scope — §3 binds `entity` and `selector` alike', async () => {
+    // The OLD expectation (asserted right above until 2026-08-19) was that a UI button under an
+    // open modal resolves, dispatches, and comes back ok:true with occluded:true. That is the §0
+    // rank-1 false success: the press went to the modal. Only the MESH half of §3's rule was
+    // implemented — the picker's "another entity is in front" — while DOM-level covering was a
+    // flag on all three scopes.
+    const res = await post('/api/input/tap', { entity: { name: 'StartButton' } }) as { status: number; body: { error: string; code?: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('OCCLUDED');
+    expect(res.body.error).toMatch(/covered by div\.modal/);
+    expect(res.body.error).toMatch(/allowOccluded/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('NOTHING at the point gets its own remedy — you cannot dismiss "nothing"', async () => {
+    // centreIsInWindow admits x === innerWidth while elementFromPoint is exclusive at that edge, so
+    // a rect flush against the right/bottom of the window resolves to a point with no element at
+    // all. The generic message told the caller to "dismiss/move what covers it" — which the same
+    // sentence calls "nothing".
+    const res = await post('/api/input/tap', { entity: { name: 'EdgeCube', surface: 'game-3d' } }) as { status: number; body: { error: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/NOTHING at it/);
+    expect(res.body.error).toMatch(/Move the camera/);
+    expect(res.body.error).not.toMatch(/Dismiss\/move what covers it/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('refuses a covered entity aim on hover, scroll and BOTH drag endpoints too, not just tap', async () => {
+    // The guard is shared, but nothing asserted it for these routes — only selector-addressed
+    // covers were tested there, so an entity-specific regression could pass the suite.
+    const hover = await post('/api/input/hover', { entity: { name: 'StartButton' } }) as { status: number };
+    const scroll = await post('/api/input/scroll', { entity: { name: 'StartButton' }, deltaY: 100 }) as { status: number };
+    const dragFrom = await post('/api/input/drag', { from: { entity: { name: 'StartButton' } }, to: { x: 5, y: 5 } }) as { status: number };
+    const dragTo = await post('/api/input/drag', { from: { x: 5, y: 5 }, to: { entity: { name: 'StartButton' } } }) as { status: number };
+    expect([hover.status, scroll.status, dragFrom.status, dragTo.status]).toEqual([400, 400, 400, 400]);
+    expect(ops.hover).not.toHaveBeenCalled();
+    expect(ops.scroll).not.toHaveBeenCalled();
+    expect(ops.drag).not.toHaveBeenCalled();
+  });
+
+  it("the 'entity' scope refuses when the picker FOUND the target but a modal covers the canvas", async () => {
+    // Two independent occluders, and only the mesh one was ever refused: the pick succeeds, so the
+    // surface WOULD select the entity — but the click never reaches the canvas at all.
+    const res = await post('/api/input/tap', { entity: { name: 'CoveredHero', surface: 'scene-view' } }) as { status: number; body: { error: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/covered by div\.modal/);
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('one flag, one answer: entity.allowOccluded:false + top-level true refuses BOTH kinds of cover', async () => {
+    // §9 — the merge was written twice and the copies disagreed in exactly this combination.
+    // `resolvePoint` sends the renderer `entity.allowOccluded ?? allowOccluded` = false, so
+    // entityResolve refuses a PICKER-occluded aim; a re-derived `!false && !true` in the route
+    // waved a DOM-occluded one through. Which cover was in the way decided the behaviour.
+    const res = await post('/api/input/tap', {
+      entity: { name: 'StartButton', allowOccluded: false }, allowOccluded: true,
+    }) as { status: number; body: { code?: string } };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('OCCLUDED');
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('…and a held gesture\'s move/up is never refused — it goes to whatever captured the press', async () => {
+    // The one carve-out §3 names, and it is about DELIVERY rather than aim: what sits under the
+    // destination cannot stop a captured drag. inputRoutes forces allowOccluded for non-`down`.
+    await post('/api/input/pointer', { action: 'down', entity: { guid: 'g-puck' } });
+    const moved = await post('/api/input/pointer', { action: 'move', entity: { name: 'StartButton' } }) as { status: number };
+    expect(moved.status).not.toBe(400);
+    expect(ops.pointerMove).toHaveBeenCalled();
+  });
+
+  it('…and an explicit entity.allowOccluded:false does NOT re-impose a refusal on that move', async () => {
+    // The carve-out is about DELIVERY — the press already captured the target — so it overrides
+    // the caller's flag instead of losing to it via `??`. Before this, the top-level force reached
+    // only the top-level field and the explicit false won at the entity layer, refusing a move
+    // mid-gesture and stranding the held press.
+    await post('/api/input/pointer', { action: 'down', entity: { guid: 'g-puck' } });
+    const moved = await post('/api/input/pointer', {
+      action: 'move', entity: { name: 'StartButton', allowOccluded: false },
+    }) as { status: number };
+    expect(moved.status).not.toBe(400);
+    expect(ops.pointerMove).toHaveBeenCalled();
+    await post('/api/input/pointer', { action: 'up', entity: { guid: 'g-puck' } });
   });
 
   it('refuses an ambiguous name instead of picking one — and dispatches nothing', async () => {
     const res = await post('/api/input/tap', { entity: { name: 'Enemy' } });
     expect((res as { status: number }).status).toBe(400);
     expect((res as { body: { error: string } }).body.error).toContain('address by guid');
-    expect(calls).toEqual(['renderer:resolve-entity-point']);
+    // Was `toEqual(['renderer:resolve-entity-point'])`. The old form encoded "no input was
+    // dispatched" as an EXACT renderer call list, so it also pinned how many READS the route makes
+    // — and #261's settle hint adds one (`layout-settling`) on the refusal path. The intent (this
+    // comment's own words, and the reason the assertion exists) is unchanged and now asserted
+    // directly: no input op ran. That is also stricter, since a stray dispatch of ANY input op
+    // fails it, not just one that changes the list length.
+    expect(calls.filter((c) => !c.startsWith('renderer:')), 'no INPUT was dispatched').toEqual([]);
   });
 
   it('takes precedence over selector and {x,y}', async () => {
@@ -707,7 +1213,13 @@ describe('entity-aimed input (the third target surface)', () => {
     expect((res as { status: number }).status).toBe(400);
     expect((res as { body: { error: string } }).body.error).toContain('Wall');
     expect((res as { body: { error: string } }).body.error).toContain('allowOccluded');
-    expect(calls).toEqual(['renderer:resolve-entity-point']); // the tap op was never called
+    // Was `toEqual(['renderer:resolve-entity-point'])`. The old form encoded "no input was
+    // dispatched" as an EXACT renderer call list, so it also pinned how many READS the route makes
+    // — and #261's settle hint adds one (`layout-settling`) on the refusal path. The intent (this
+    // comment's own words, and the reason the assertion exists) is unchanged and now asserted
+    // directly: no input op ran. That is also stricter, since a stray dispatch of ANY input op
+    // fails it, not just one that changes the list length.
+    expect(calls.filter((c) => !c.startsWith('renderer:')), 'no INPUT was dispatched').toEqual([]);
   });
 
   it('threads `allowOccluded` through to the resolver, and reports what was actually hit', async () => {
@@ -753,7 +1265,9 @@ describe('panel-targeted input (focus-scope P7)', () => {
     // time, so focusing after the press would be useless.
     const r = await post('/api/input/key', { key: 'w', panel: 'scene' }) as { body: unknown };
     expect(r.body).toMatchObject({ ok: true, focusedPanel: 'scene' });
-    expect(calls).toEqual(['renderer:set-focus-scope', 'key(w)']);
+    // The reach probe rides between them and must also precede the press — it reports the
+    // world the key is about to land in, which the press itself can change.
+    expect(calls).toEqual(['renderer:set-focus-scope', 'renderer:probe-key-reach', 'key(w)']);
   });
 
   it('FAILS LOUDLY when the panel is not open, and does NOT press the key', async () => {
@@ -761,15 +1275,78 @@ describe('panel-targeted input (focus-scope P7)', () => {
     // panel is simply yielded by the dispatcher, so it looks like a successful no-op.
     const r = await post('/api/input/key', { key: 'w', panel: 'not-open' }) as { status: number; body: { error: string } };
     expect(r.status).toBe(400);
-    expect(String(r.body.error)).toContain('could not focus panel "not-open"');
+    // Wording changed with #301: the refusal is now the RENDERER's (it is the only side that
+    // knows which panels have tabs), where this route used to compose it from a comparison
+    // that could never be false.
+    expect(String(r.body.error)).toContain('no open panel "not-open"');
     expect(ops.pressKey).not.toHaveBeenCalled();
   });
 
-  it('leaves the key path untouched when no panel is given', async () => {
+  it('REFUSES a miscased panel id, and does NOT press the key', async () => {
+    // The #301 failure. "Game" is not 'game', so the editor's input gate — which compares
+    // against the lowercase id — stays SHUT. Before the fix this answered
+    // {ok:true, focusedPanel:"Game"} and pressed anyway, so the agent read a confirmation
+    // for a keypress that reached nothing. Every following press did the same: that is
+    // QA-PHYS-0003 (80 presses, all ok, a character controller wrongly declared broken)
+    // reached by a second route.
+    const r = await post('/api/input/key', { key: 'w', panel: 'Game' }) as { status: number; body: { error: string } };
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain('no open panel "Game"');
+    // The message must be ACTIONABLE — a refusal that does not say what IS focusable just
+    // moves the guessing one step later.
+    expect(String(r.body.error)).toContain('case-sensitive');
+    expect(String(r.body.error)).toContain('game');
+    expect(ops.pressKey).not.toHaveBeenCalled();
+  });
+
+  it('REFUSES a valid id whose panel is closed — the case the old guard could never see', async () => {
+    // 'profiler' is a real panel id (PANEL_LABELS) but has no tab here. The old route
+    // compared the renderer's echo to the input, and the renderer echoed whatever it was
+    // handed, so this was indistinguishable from success.
+    const r = await post('/api/input/key', { key: 'w', panel: 'profiler' }) as { status: number; body: { error: string } };
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain('no open panel "profiler"');
+    expect(ops.pressKey).not.toHaveBeenCalled();
+  });
+
+  it('accepts a CUSTOM panel id the renderer reports as open', async () => {
+    // A game can register its own panels, so the vocabulary is not a fixed list — which is
+    // why the refusal is server-side and not a z.enum in the tool schema.
+    openPanels = [...openPanels, 'court-levels'];
+    const r = await post('/api/input/key', { key: 'w', panel: 'court-levels' }) as { body: unknown };
+    expect(r.body).toMatchObject({ ok: true, focusedPanel: 'court-levels' });
+    expect(ops.pressKey).toHaveBeenCalled();
+  });
+
+  it('focus REFUSES a closed panel and does NOT focus the selector either', async () => {
+    // All-or-nothing: the caller asked for scope AND DOM focus, so delivering only the
+    // selector would be the same partial-success this fix exists to remove.
+    const r = await post('/api/input/focus', { panel: 'Inspector', selector: '#kebab' }) as { status: number; body: { error: string } };
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain('no open panel "Inspector"');
+    expect(ops.focusElement).not.toHaveBeenCalled();
+  });
+
+  it('degrades to the old behaviour against a renderer with no `ok` field', async () => {
+    // An editor build predating the op replies with just an echo. Reading that silence as a
+    // refusal would block ALL panel-targeted input against a stale renderer — a worse
+    // failure than the one being fixed.
+    requestRenderer = makeRenderer({ 'set-focus-scope': { focusedPanel: 'scene' } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const r = await post('/api/input/key', { key: 'w', panel: 'scene' }) as { body: unknown };
+    expect(r.body).toMatchObject({ ok: true, focusedPanel: 'scene' });
+    expect(ops.pressKey).toHaveBeenCalled();
+  });
+
+  it('does NOT set the scope when no panel is given — but still reports where it is', async () => {
+    // This used to assert the response had NO `focusedPanel` at all. That silence is what
+    // made QA-PHYS-0003 undiagnosable from the transcript: 80 presses, every one ok:true,
+    // and nothing anywhere saying which panel owned the keyboard. Echoing it is free.
+    keyReach = { focusedPanel: 'hierarchy', editorBinding: 'app.undo', gameInputSuppressed: true, simRunning: false };
     const r = await post('/api/input/key', { key: 'z', modifiers: ['meta'] }) as { body: unknown };
-    expect(r.body).toMatchObject({ ok: true, pressed: { key: 'z' } });
-    expect(r.body).not.toHaveProperty('focusedPanel');
-    expect(calls).toEqual(['key(z)']);
+    expect(r.body).toMatchObject({ ok: true, pressed: { key: 'z' }, focusedPanel: 'hierarchy' });
+    expect(calls).toEqual(['renderer:probe-key-reach', 'key(z)']);
+    expect(calls).not.toContain('renderer:set-focus-scope');
   });
 
   it('focus accepts a panel WITHOUT touching DOM focus', async () => {
@@ -789,6 +1366,93 @@ describe('panel-targeted input (focus-scope P7)', () => {
     const r = await post('/api/input/focus', {}) as { body: unknown };
     expect(r.body).toMatchObject({ ok: true });
     expect(ops.focusElement).toHaveBeenCalledWith(undefined);
+  });
+});
+
+/** QA-PHYS-0003 — the SECOND gate.
+ *
+ *  A runner drove `press_key {key:'d'}` 80 times at a running platformer and reported the
+ *  character controller broken. It was not: the previous case had left the keyboard scope on
+ *  `scene`, so EditorApp's input gate dropped every key before the game sampled it, while the
+ *  route answered ok:true 80 times. The press was a provable no-op and nothing said so. */
+describe('press_key: warning when the press reached NOTHING', () => {
+  it('warns, and names panel:"game" as the fix, when the gate blocked an unbound key', async () => {
+    keyReach = { focusedPanel: 'scene', editorBinding: null, gameInputSuppressed: true, simRunning: true };
+    const r = await post('/api/input/key', { key: 'd' }) as { body: { ok: boolean; warning?: string; focusedPanel?: string | null; chord?: string } };
+    expect(r.body.ok).toBe(true);                    // the key WAS dispatched — this is advice, not a refusal
+    expect(r.body.focusedPanel).toBe('scene');
+    expect(r.body.warning).toContain('blocked this key from the RUNNING GAME');
+    expect(r.body.warning).toContain('panel:"game"');
+    // The exact misconception that produced the false negative, named in the message.
+    expect(r.body.warning).toContain('modoki_focus {}');
+    // And the chord it resolved, so "wrong scope" is distinguishable from "wrong key spelling".
+    expect(r.body.chord).toBe('d');
+  });
+
+  it('echoes `chord` ONLY with the scope warning — it is noise on a press that worked', async () => {
+    keyReach = { focusedPanel: 'game', editorBinding: null, gameInputSuppressed: false, simRunning: true };
+    const r = await post('/api/input/key', { key: 'd' }) as { body: Record<string, unknown> };
+    expect(r.body).not.toHaveProperty('chord');
+  });
+
+  it('claims only what the GATE proves — never that the press did nothing at all', async () => {
+    // `editorBinding: null` rules out the keymap REGISTRY — the editor's only window-level
+    // chord listener — but not an element-level onKeyDown, which fires while that element
+    // holds DOM focus. `activeElement` (same response) is the other half. So the message may
+    // say the key never reached the game and must not say the press did nothing at all.
+    keyReach = { focusedPanel: 'hierarchy', editorBinding: null, gameInputSuppressed: true, simRunning: true };
+    const r = await post('/api/input/key', { key: 'ArrowDown' }) as { body: { warning?: string } };
+    expect(r.body.warning).not.toContain('did nothing at all');
+    expect(r.body.warning).toContain('may still have fired');
+  });
+
+  it('stays silent while the sim is STOPPED — the gate is shut through most ordinary editing', async () => {
+    // Without this condition the warning fires on nearly every press in a stopped editor
+    // (any panel but the GameView closes the gate) and is tuned out inside one session.
+    keyReach = { focusedPanel: 'scene', editorBinding: null, gameInputSuppressed: true, simRunning: false };
+    const r = await post('/api/input/key', { key: 'd' }) as { body: { warning?: string } };
+    expect(r.body.warning).toBeUndefined();
+  });
+
+  it('stays SILENT when an editor binding claimed the chord — that is correct usage', async () => {
+    // `w` sets the gizmo mode with the Scene panel focused. The gate is closed (the game
+    // gets nothing) and that is exactly right. Warning here would fire on most presses in a
+    // normal editor session and train the reader to skip the field.
+    keyReach = { focusedPanel: 'scene', editorBinding: 'gizmo.translate', gameInputSuppressed: true, simRunning: true };
+    const r = await post('/api/input/key', { key: 'w' }) as { body: { warning?: string } };
+    expect(r.body.warning).toBeUndefined();
+  });
+
+  it('stays silent when the gate is OPEN, even with nothing bound — the game got the key', async () => {
+    keyReach = { focusedPanel: 'game', editorBinding: null, gameInputSuppressed: false, simRunning: true };
+    const r = await post('/api/input/key', { key: 'd' }) as { body: { warning?: string } };
+    expect(r.body.warning).toBeUndefined();
+  });
+
+  it('reports BOTH gates when both are shut, rather than picking one', async () => {
+    // A Console filter field has focus AND the scope is on that panel. Two independent
+    // causes, two different fixes; naming one would send the caller to do half the work.
+    ops.pressKey = vi.fn(async (k: string) => { calls.push(`key(${k})`); return { activeElement: 'input#filter', gameSwallows: true }; });
+    routes = createInputRoutes({ ops, requestRenderer });
+    keyReach = { focusedPanel: 'console', editorBinding: null, gameInputSuppressed: true, simRunning: true };
+    const r = await post('/api/input/key', { key: 'd' }) as { body: { warning?: string } };
+    expect(r.body.warning).toContain('a form field (input#filter) has focus');
+    expect(r.body.warning).toContain('blocked this key from the RUNNING GAME');
+  });
+
+  it('presses anyway when the probe is unavailable — a broken probe must not break input', async () => {
+    // An editor build predating the op, or a renderer that went away between calls. The
+    // press is the product; the warning is commentary.
+    requestRenderer = vi.fn(async (op: string) => {
+      calls.push(`renderer:${op}`);
+      if (op === 'probe-key-reach') throw new Error('unknown op');
+      return null;
+    }) as unknown as typeof requestRenderer;
+    routes = createInputRoutes({ ops, requestRenderer });
+    const r = await post('/api/input/key', { key: 'd' }) as { body: { ok: boolean; warning?: string } };
+    expect(r.body.ok).toBe(true);
+    expect(r.body.warning).toBeUndefined();
+    expect(calls).toContain('key(d)');
   });
 });
 
@@ -863,5 +1527,104 @@ describe('actor lease brackets every input dispatch', () => {
   it('does NOT bracket a non-input route', async () => {
     expect(await post('/api/capture-viewport', {})).toBeNull();
     expect(leaseCalls).toEqual([]);
+  });
+});
+
+/** A HIDDEN window swallows trusted input whole — Chromium delivers nothing at all while
+ *  `document.visibilityState === 'hidden'` (the editor occluded by another app, or minimised).
+ *  Before this gate every route answered `ok:true, occluded:false` for input that never
+ *  arrived, which is the exact silent-miss class the provenance fields exist to remove: the
+ *  reply described what the call AIMED at, not what landed. Measured live 2026-08-18 on backend
+ *  5183 — three taps, zero events on a capture-phase `document` listener; raising the window
+ *  made the identical call land.
+ *
+ *  ⚠️ These tests MOCK `visibilityState:'hidden'`, so they still pin the gate exactly — but do
+ *  not read them as evidence that a covered window reaches it. Later on 2026-08-18, #243 added
+ *  `disable-backgrounding-occluded-windows`, after which a covered window measures 'visible' at
+ *  61fps and a MINIMISED one delivers a trusted tap. The gate is near-unreachable on macOS now;
+ *  it is kept for the states nobody has measured. See `inputDeliverability` in inputRoutes.ts. */
+describe('window deliverability', () => {
+  const ROUTES: [string, unknown][] = [
+    ['/api/input/tap', { x: 1, y: 2 }],
+    ['/api/input/drag', { from: { x: 1, y: 2 }, to: { x: 3, y: 4 } }],
+    ['/api/input/pointer', { action: 'down', x: 1, y: 2 }],
+    ['/api/input/hover', { x: 1, y: 2 }],
+    ['/api/input/scroll', { x: 1, y: 2, deltaY: 120 }],
+    ['/api/input/key', { key: 'Escape' }],
+    ['/api/input/type', { text: 'hi' }],
+    ['/api/input/tap-handle', { id: 'bone.0' }],
+    ['/api/input/drag-handle', { id: 'bone.0', delta: { dx: 5, dy: 5 } }],
+  ];
+
+  it.each(ROUTES)('%s REFUSES while the window is hidden, and dispatches nothing', async (urlPath, body) => {
+    requestRenderer = makeRenderer({ 'input-deliverability': { visibilityState: 'hidden', hasFocus: false } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post(urlPath, body);
+    expect(res).toMatchObject({ kind: 'json', status: 409, body: { ok: false, code: 'REFUSED_BY_OP', windowVisibility: 'hidden' } });
+    // The message names the OBSERVED state, not a guessed cause. It used to assert
+    // "HIDDEN/OCCLUDED ... raise the editor window", and #243 made both halves wrong on macOS:
+    // `disable-backgrounding-occluded-windows` keeps a covered AND a minimised window at
+    // 'visible' (a trusted tap was measured landing while minimised), so occlusion no longer
+    // reaches this branch and raising the window is no longer the remedy. Telling a reader to
+    // un-cover a window sends them hunting a cause that cannot apply — the failure mode this
+    // repo already names: an error message that guesses a cause is worse than one that reports.
+    const err = (res as { body: { error: string } }).body.error;
+    expect(err).toMatch(/visibilityState "hidden"/);
+    expect(err).toMatch(/#243/);
+    expect(err).not.toMatch(/Raise the editor window/);
+    // Nothing was dispatched, and nothing was even resolved — the refusal is BEFORE the aim.
+    expect(calls).toEqual([]);
+    // ...and no attribution lease was opened for a dispatch that never happened.
+    expect(leaseCalls).toEqual([]);
+  });
+
+  it('EXEMPTS /api/input/focus — it dispatches no OS input, so the refusal would be a false claim', () => {
+    // `focusElement` is `wc.focus()` + executeJavaScript, which a hidden window still runs. The
+    // refusal's stated reason ("Chromium would drop this input") is simply untrue for this route,
+    // and a refusal whose cause is false is worse than either answer.
+    return (async () => {
+      requestRenderer = makeRenderer({ 'input-deliverability': { visibilityState: 'hidden', hasFocus: false } });
+      routes = createInputRoutes({ ops, requestRenderer });
+      const res = await post('/api/input/focus', { selector: '#kebab' });
+      expect(ops.focusElement).toHaveBeenCalledWith('#kebab');
+      expect(res).toMatchObject({ kind: 'json', body: { ok: true } });
+    })();
+  });
+
+  it('an UNRECOGNISED /api/input/* path still falls through while hidden, instead of 409-ing', async () => {
+    // The gate must not answer for a path this file does not own — the caller has other handlers
+    // to try, and a 409 here would swallow the request whenever the window happened to be hidden.
+    requestRenderer = makeRenderer({ 'input-deliverability': { visibilityState: 'hidden', hasFocus: false } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    expect(await post('/api/input/unknown', {})).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
+  it('a VISIBLE but unfocused window still dispatches, and says so', async () => {
+    // The weaker sibling: input arrives, but Chromium fires no focus/blur/focusin/focusout, so
+    // anything the editor does ON a focus event (commit-on-blur, for one) silently does not
+    // happen. That is a report, not a veto — the input itself is real.
+    requestRenderer = makeRenderer({ 'input-deliverability': { visibilityState: 'visible', hasFocus: false } });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { x: 5, y: 6 });
+    expect(ops.tap).toHaveBeenCalledWith(5, 6, expect.anything());
+    expect(res).toMatchObject({ kind: 'json', body: { ok: true, windowFocused: false } });
+  });
+
+  it('a focused, visible window adds no noise to the response', async () => {
+    const res = await post('/api/input/tap', { x: 5, y: 6 });
+    expect((res as { body: Record<string, unknown> }).body.windowFocused).toBeUndefined();
+    expect((res as { body: Record<string, unknown> }).body.windowVisibility).toBeUndefined();
+  });
+
+  it('dispatches when the renderer cannot answer at all — an unknown state must not veto input', async () => {
+    // Same rule as the attribution lease: a renderer mid-reload, or one too old to know the op,
+    // must not be able to break input. An unqualified tap is a missing hint; a refused one is a
+    // broken tool.
+    requestRenderer = makeRenderer({ 'input-deliverability': null });
+    routes = createInputRoutes({ ops, requestRenderer });
+    const res = await post('/api/input/tap', { x: 7, y: 8 });
+    expect(ops.tap).toHaveBeenCalledWith(7, 8, expect.anything());
+    expect(res).toMatchObject({ body: { ok: true } });
   });
 });

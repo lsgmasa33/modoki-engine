@@ -14,6 +14,7 @@ export { TextAnimation } from './TextAnimation';
 export { SkinnedSprite2D } from './SkinnedSprite2D';
 export { Bone2D } from './Bone2D';
 export { Billboard3D } from './Billboard3D';
+export { GroupAlpha } from './GroupAlpha';
 export { FlatSprite3D } from './FlatSprite3D';
 export { Zone3D } from './Zone3D';
 export { Zone2D } from './Zone2D';
@@ -33,11 +34,20 @@ export { Persistent, markPersistent } from './Persistent';
 export { Transient } from '../core/traits/Transient';
 export { Time } from '../core/traits/Time';
 export { HapticSettings } from './HapticSettings';
+export { AudioSettings } from './AudioSettings';
 export { Input } from './Input';
 export { UIElement, type UILengthUnit } from './UIElement';
 export { UIBinding } from './UIBinding';
 export { UIAction } from './UIAction';
 export { UIFocusable } from './UIFocusable';
+export { UIToggle } from './UIToggle';
+export { UIEntry } from './UIEntry';
+export { UIEntries, type UIEntryPrefab, type UIEntryLengthUnit } from './UIEntries';
+export { UIScrollView, NO_SCROLL_REQUEST, type UIScrollAxis, type UIScrollSnap, type UIScrollSnapStop, type UIScrollOverscroll, type UIScrollBehavior } from './UIScrollView';
+export {
+  TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, TOUCH_ATTR, TOUCH_OPACITY_ATTR, UI_ROOT_ATTR,
+  type TouchControlAction, type TouchControlShowOn,
+} from './TouchControl';
 export { UIAnchor } from './UIAnchor';
 export { Canvas2D, type Canvas2DScaleMode } from './Canvas2D';
 export { NPRPostFX } from './NPRPostFX';

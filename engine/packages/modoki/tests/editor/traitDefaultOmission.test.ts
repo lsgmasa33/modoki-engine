@@ -3,8 +3,8 @@
  *  WHY (owner's call, 2026-07-31): writing every schema field out FREEZES each scene at
  *  the defaults of the day it was saved. A later change to a trait default then silently
  *  stops reaching every already-saved scene — which is what put the repo-wide legacy
- *  scene migration on hold (47 scenes across 19 projects, 10 of them in published demos:
- *  docs/todo.md). Omitting default-valued fields keeps the default LIVE, and is lossless
+ *  scene migration on hold (47 scenes across 19 projects as counted then; the migration was
+ *  carried out 2026-08-04 over 48 across 20 — see docs/scene-loading.md). Omitting default-valued fields keeps the default LIVE, and is lossless
  *  because the loader rebuilds each trait with `meta.trait(partialData)` and koota fills
  *  every absent key from the same schema.
  *

@@ -2,10 +2,10 @@
  *  Cache is keyed by model path + mesh name for proper identity. */
 
 import * as THREE from 'three';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
-import { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
-import { UltraHDRLoader } from 'three/examples/jsm/loaders/UltraHDRLoader.js';
+import { decomposeTrs } from '../core/ecs/decomposeTrs';
+import type { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
+import type { UltraHDRLoader } from 'three/examples/jsm/loaders/UltraHDRLoader.js';
+import { hdrLoaderCtor, makeGltfLoader, ultraHdrLoaderCtor } from './threeLoaderModules';
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
 import { getMaterialBuilder } from './materialTypes';
 import { registerBuiltinMaterialTypes } from './materialPresets';
@@ -14,10 +14,12 @@ import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
 import { takeParsedGltf, clearParsedGltfHandoff } from './parsedGltfHandoff';
+import { notifyModelTemplatesLoaded } from './modelLoadNotify';
 import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
-import { loadTexture3D, releaseTexture3D, isSharedTexture, resolveEnvVariantUrl, getEnvFormat } from './textureResolver';
+import { loadTexture3D, releaseTexture3D, isSharedTexture, isRetiredTexture, resolveEnvVariantUrl, getEnvFormat } from './textureResolver';
 import { clearParticleCache } from './particleCache';
 import { fireDirtyListeners } from '../core/ecs/entityUtils';
+import { emitAssetInvalidated, onAssetInvalidated } from '../core/assetInvalidation';
 import { clearAnimationClipCache } from './animationClipCache';
 import { clearTimelineCache } from './timelineCache';
 import { clearControlSpawns } from '../timeline/controlSpawnRegistry';
@@ -26,6 +28,7 @@ import { clearSpriteAnimCache } from './spriteAnimCache';
 import { releaseRiggedModelsForScene, disposeAllRiggedModels, getRiggedOwnerCounts } from './riggedModelCache';
 import { releaseAudioForScene, disposeAllAudioBuffers } from './audioBufferCache';
 import { releaseFontsForScene, disposeAllFonts } from './fontAtlasLoader';
+import { disposeAllFontFaces } from './fontLoader';
 
 // Ensure built-in material presets (pbr/unlit/custom) are registered regardless
 // of how this module is imported (production main bundle, tests with reset
@@ -315,7 +318,10 @@ export function decomposeLocalTransform(
   const p = new THREE.Vector3();
   const q = new THREE.Quaternion();
   const s = new THREE.Vector3();
-  local.decompose(p, q, s);
+  // decomposeTrs, not local.decompose: a GLB node authored with a zero scale axis (a common
+  // way to hide one) composes to a SINGULAR matrix, and three answers that with scale (1,1,1)
+  // — the hidden node would be imported at FULL size, with its rotation dropped (#258).
+  decomposeTrs(local, p, q, s);
   const e = new THREE.Euler().setFromQuaternion(q);
   return { position: [p.x, p.y, p.z], rotation: [e.x, e.y, e.z], scale: [s.x, s.y, s.z] };
 }
@@ -384,17 +390,22 @@ function disposeMaterial(mat: THREE.Material, disposedTex?: Set<string>) {
  *  "setIndexBuffer parameter 1 is not of type 'GPUBuffer'" because the
  *  in-scene meshes still hold pointers to the just-disposed buffers. */
 type ModelInvalidationListener = (modelPath: string, targets: ReadonlySet<string>) => void;
-const modelInvalidationListeners = new Set<ModelInvalidationListener>();
 
 /** Subscribe to model-invalidation events. Returns an unsubscribe function.
  *  Renderers should remove any scene objects rendered from `modelPath` (or any
  *  of its baked LOD siblings, surfaced as `targets`) before this returns —
  *  the cache entries are dropped *after* every listener has run, then GPU
- *  geometry is disposed. */
+ *  geometry is disposed.
+ *
+ *  A `kind: 'model'` filter over the shared `onAssetInvalidated` registry (#304)
+ *  — kept as its own export because "models only" is what every one of its
+ *  callers means, and because it predates the shared event. */
 export function onModelInvalidated(fn: ModelInvalidationListener): () => void {
-  modelInvalidationListeners.add(fn);
-  return () => { modelInvalidationListeners.delete(fn); };
+  return onAssetInvalidated((kind, path, targets) => {
+    if (kind === 'model') fn(path, targets);
+  });
 }
+
 
 /** Per-source-path snapshot of LOD paths captured at acquireModel time. Used by
  *  release-time invalidation so a manifest entry that gets torn down (rename,
@@ -418,10 +429,7 @@ export function invalidateModel(modelPath: string) {
 
   // Notify renderers BEFORE we touch the cache so they can drop any live
   // THREE.Mesh references to soon-disposed GPU geometry.
-  for (const fn of modelInvalidationListeners) {
-    try { fn(modelPath, targets); }
-    catch (e) { console.warn('[MeshCache] invalidation listener threw:', e); }
-  }
+  emitAssetInvalidated('model', modelPath, targets);
 
   const disposedGeo = new Set<string>();
   for (const target of targets) {
@@ -681,6 +689,9 @@ export function loadModelTemplates(
         if (typeof (model as { clear?: () => void }).clear === 'function') (model as { clear: () => void }).clear();
 
         console.log(`[MeshCache] Loaded ${count} templates from ${path}`);
+        // Re-arm the editor SceneView's dirty gate — see modelLoadNotify.ts for why the
+        // invalidation edge alone does not close QA-ASSET-0008.
+        notifyModelTemplatesLoaded(path);
         resolve();
       } catch (err) {
         console.error(`[MeshCache] Failed during template processing for ${path}:`, err);
@@ -694,16 +705,29 @@ export function loadModelTemplates(
     const handoff = takeParsedGltf(path);
     if (handoff) { void onGltf({ scene: handoff.scene }); return; }
 
-    const gltfLoader = new GLTFLoader();
-    // gltfpack-produced LODs use EXT_meshopt_compression — decode them in
-    // the browser via three's bundled meshopt decoder.
-    gltfLoader.setMeshoptDecoder(MeshoptDecoder);
-    gltfLoader.load(modelGlbUrl(path), onGltf, undefined, (error) => {
-      console.error(`[MeshCache] Failed to load ${path}:`, error);
+    // gltfpack-produced LODs use EXT_meshopt_compression, so the loader is built with
+    // three's bundled meshopt decoder already wired. Both modules are imported on demand
+    // behind the `render3d` gate (#254) — a rejection means a 2D-only bundle reached a GLB.
+    makeGltfLoader().then((gltfLoader) => {
+      gltfLoader.load(modelGlbUrl(path), onGltf, undefined, (error) => {
+        console.error(`[MeshCache] Failed to load ${path}:`, error);
+        reject(error);
+      });
+    }, (error) => {
+      console.error(`[MeshCache] GLTF loader unavailable for ${path}:`, error);
       reject(error);
     });
   });
 
+  // Evict on REJECTION only. `loading` doubles as "already parsed" state — a successful entry
+  // must stay so a second acquire dedupes, and `invalidateModel` is what clears it on re-import.
+  // But a rejection stored here was permanent: every later acquire of that GLB got the same
+  // rejected promise back with no new attempt. That was survivable while the only way to reject
+  // was a missing/corrupt GLB (a permanent condition); #254 added a plausibly TRANSIENT cause —
+  // the loader's own chunk fetch — and `threeLoaderModules` self-heals from that one layer down,
+  // so leaving it poisoned here would strand the recovery just short of the caller.
+  // Identity-checked so a re-armed load started by an intervening `invalidateModel` survives.
+  void promise.catch(() => { if (loading.get(key) === promise) loading.delete(key); });
   loading.set(key, promise);
   return promise;
 }
@@ -957,11 +981,114 @@ const materialCache = new Map<string, THREE.Material | typeof MATERIAL_FAILED>()
 const materialLoadPromises = new Map<string, Promise<void>>();
 
 /** Invalidate a cached material so it will be re-fetched on next resolve. */
+/** Every texture a material binds — the same walk `disposeMaterial` uses (enumerable texture
+ *  props + the `userData.textures` convention TSL/NodeMaterial builds use). */
+function materialTextures(mat: THREE.Material): THREE.Texture[] {
+  const out: THREE.Texture[] = [];
+  const props = mat as unknown as Record<string, unknown>;
+  for (const key of Object.keys(props)) {
+    const val = props[key] as THREE.Texture | undefined;
+    if (val && val.isTexture) out.push(val);
+  }
+  const extra = (mat.userData as { textures?: THREE.Texture[] } | undefined)?.textures;
+  if (extra) out.push(...extra);
+  return out;
+}
+
+/** A TEXTURE re-import had no material-side consumer, and that is what made the announcement a
+ *  dead mechanism: `invalidateTexture` evicts + retires the instance, but nothing told a live
+ *  material to re-resolve — so the viewport kept sampling the PRE-reimport bytes, and the
+ *  retired texture was never freed (its releasing call arrives through `disposeMaterial`).
+ *
+ *  A MODEL re-import happened to be fine only because `modelImport` also calls
+ *  `invalidateMaterial` per deduped material. The standalone texture paths — the Inspector's
+ *  Convert/Re-import (`TextureAssetView`) and the batch `reimportPaths` — call
+ *  `invalidateTexture` and nothing else, so both silently did not take.
+ *
+ *  ⚠️ Deferred to a microtask ON PURPOSE. `invalidateTexture` announces BEFORE it evicts (so
+ *  path-keyed panels see the event), which means the retirement has not happened yet when this
+ *  listener runs synchronously. The microtask lands after `invalidateTexture`'s whole
+ *  synchronous body, so `isRetiredTexture` reads the settled state. */
+onAssetInvalidated((kind) => {
+  if (kind !== 'texture') return;
+  queueMicrotask(() => {
+    for (const [path, mat] of [...materialCache]) {
+      if (mat === MATERIAL_FAILED) continue;
+      if (materialTextures(mat).some(isRetiredTexture)) invalidateMaterial(path);
+    }
+  });
+});
+
 export function invalidateMaterial(matPath: string) {
   const mat = materialCache.get(matPath);
-  if (mat && mat !== MATERIAL_FAILED) disposeMaterial(mat);
+  // RETIRE, don't dispose (#317) — the same rule as textures (`invalidateTexture`) and HDR envs
+  // (#315), and for the same reason: this instance is on `mesh.material` right now. Nothing
+  // rebinds it here — `syncMaterial` cannot, because the ref is unchanged and `resolveMaterial`
+  // returns undefined until the async refetch lands, so its re-bind branch does nothing. Live
+  // measurement on `games/3d-test`: a texture re-import left the rotating cube drawing a
+  // DISPOSED material for 4 rendered frames. `disposeMaterial` also releases the material's
+  // shared textures, so disposing here freed those out from under the same live mesh.
+  if (mat && mat !== MATERIAL_FAILED) { retiredMaterials.add(mat); retiredMaterialPaths.set(mat, matPath); }
   materialCache.delete(matPath);
   materialLoadPromises.delete(matPath);
+}
+
+/** Materials evicted while a live mesh still bound them (see {@link invalidateMaterial}).
+ *
+ *  Freed by `syncSceneRenderables3D`'s sweep once no live surface binds one — the same
+ *  shape as the retired-env sweep, and for the same reason there is no refcount to use:
+ *  `materialOwners` is a per-scene owner SET, and the binding lives in `scene3DSync`.
+ *
+ *  A base whose only remaining holders are DERIVED CLONES (tint / MaterialInstance / light-mask
+ *  variants all hold `base.clone()`, which shares the base's texture references) is kept alive
+ *  too: each clone carries a `__derivedBase` stamp and the sweep walks that chain from every
+ *  bound material, so the base counts as bound (#318, `rendering/derivedMaterials.ts`). Before
+ *  that, a mesh-based sweep could not see those caches at all and freed the base — releasing
+ *  textures the clones were still sampling. */
+const retiredMaterials = new Set<THREE.Material>();
+
+/** Retired base → the `.mat.json` path it was evicted FROM, so a holder that only has the dead
+ *  instance can find its successor (#318).
+ *
+ *  WHY A POINTER AND NOT AN EVENT: a light-mask variant is bound to a mesh and recovers its base
+ *  from `userData`, i.e. from the retired INSTANCE — there is no path from there back to the
+ *  material ref, so an "your base was invalidated" announcement leaves the holder re-deriving
+ *  from the same dead pointer. `syncMaterial` cannot help either: it deliberately skips its
+ *  per-frame re-bind for tinted / instanced / masked entities, so those meshes are never handed
+ *  the fresh instance. This table is what closes that loop.
+ *
+ *  Entries die with the retiree — {@link disposeRetiredMaterial} and
+ *  {@link disposeAllCachedResources} both clear it, so it never pins a material. */
+const retiredMaterialPaths = new Map<THREE.Material, string>();
+
+/** The instance that REPLACED a retired material, or `undefined`.
+ *
+ *  `undefined` covers three different states on purpose, and every caller wants the same thing
+ *  from all three — keep using what you have: `mat` was never retired; it was retired and the
+ *  async refetch has not landed yet; or the refetch FAILED (`MATERIAL_FAILED`) and nothing will
+ *  ever replace it. Falling back to the retiree is correct in each — the sweep keeps it alive
+ *  precisely because something still binds it. */
+export function refreshedMaterial(mat: THREE.Material): THREE.Material | undefined {
+  const path = retiredMaterialPaths.get(mat);
+  if (path === undefined) return undefined;
+  const next = materialCache.get(path);
+  if (!next || next === MATERIAL_FAILED || next === mat) return undefined;
+  return next as THREE.Material;
+}
+
+/** The retired-material set, for `scene3DSync`'s sweep. Empty in the common case — callers
+ *  check `.size` before doing any per-surface work. */
+export function retiredMaterials3D(): ReadonlySet<THREE.Material> {
+  return retiredMaterials;
+}
+
+/** Free one retired material once the sweep has established that nothing binds it. This is
+ *  where the deferred `disposeMaterial` finally runs, so it is also what releases the
+ *  material's shared textures. Never call `disposeMaterial` on a retiree directly. */
+export function disposeRetiredMaterial(mat: THREE.Material): void {
+  if (!retiredMaterials.delete(mat)) return; // not retired (or already freed)
+  retiredMaterialPaths.delete(mat);
+  disposeMaterial(mat);
 }
 
 /** Resolve material for a mesh: checks Renderable.material, then mesh asset's material field.
@@ -1114,6 +1241,18 @@ function fetchMaterial(matPath: string): Promise<void> {
 
       // If cache was disposed while we were loading, discard this material
       if (gen !== cacheGeneration) { disposeMaterial(mat); return; }
+      // An invalidate mid-flight clears `materialLoadPromises`, so a SECOND fetch for this path
+      // can already have landed here — `fetchMaterial` dedupes on that map alone. Retire the
+      // incumbent instead of letting `set` silently orphan it: orphaned, it is unreachable to
+      // `materialCache`, to the sweep AND to `disposeAllCachedResources`, so it leaks along with
+      // every shared-texture ref it holds. Retiring is also the only safe move — a mesh may be
+      // binding it right now, so disposing here would be #317 again. (Twin of the same defect in
+      // `fetchEnvironment`, fixed under #315.)
+      const prevMat = materialCache.get(matPath);
+      if (prevMat && prevMat !== MATERIAL_FAILED && prevMat !== mat) {
+        retiredMaterials.add(prevMat);
+        retiredMaterialPaths.set(prevMat, matPath);
+      }
       materialCache.set(matPath, mat);
       // Wake the render loop so syncMaterial re-binds this freshly-built instance.
       // Critical for a LIVE material edit: invalidateMaterial() drops the old
@@ -1138,7 +1277,25 @@ function fetchMaterial(matPath: string): Promise<void> {
 }
 
 /** Dispose all cached GPU resources (geometries, materials, textures).
- *  Call before loading a new scene to free VRAM. */
+ *  Call before loading a new scene to free VRAM.
+ *
+ *  ⚠️ **IT DOES NOT KNOW ABOUT MATERIAL CLONES, AND IT CANNOT.** Tint, MaterialInstance,
+ *  light-mask, video and prewarm clones all hold this cache's materials as their base and share
+ *  their texture references (#318, `rendering/derivedMaterials.ts`), and this function releases
+ *  every one of those textures unconditionally. It cannot drain them itself: those caches live in
+ *  `rendering/` (L2) and this module is `loaders/` (L3), so reaching them would invert the layer
+ *  contract.
+ *
+ *  Today that is harmless because **nothing in production calls this** — `releaseAllForScene` is
+ *  the release entry point app/editor code uses (see CLAUDE.md § Resource Management), and the
+ *  clone caches are drained on their own `onWorldSwap` handlers. It is only reachable from tests,
+ *  which is why `materialCloneInvalidation.test.ts` pairs it with `resetDerivedMaterials()` +
+ *  `resetMaterialInstanceClones()` by hand.
+ *
+ *  So: **a future caller must tear the rendering-side caches down in the same breath** — the
+ *  "unload unused assets" action anticipated by the `releaseAllForScene` INVARIANT note further
+ *  down this file is exactly the caller that would otherwise free textures out from under a live
+ *  clone. */
 export function disposeAllCachedResources() {
   cacheGeneration++; // invalidate in-flight async material fetches
 
@@ -1179,6 +1336,14 @@ export function disposeAllCachedResources() {
   }
   materialCache.clear();
   materialLoadPromises.clear();
+  // Retired materials too: their sweep runs from `syncSceneRenderables3D`, so a surface that
+  // stops rendering (or a build with no 3D surface) would otherwise strand them. Everything
+  // binding them is torn down with this generation anyway.
+  for (const mat of retiredMaterials) {
+    if (!disposedMat.has(mat.uuid)) { disposeMaterial(mat, disposedTex); disposedMat.add(mat.uuid); }
+  }
+  retiredMaterials.clear();
+  retiredMaterialPaths.clear();
 
   // Dispose any cached HDR environments and clear env owners — they're tied
   // to the same cacheGeneration / scene lifetime as everything else here.
@@ -1186,6 +1351,11 @@ export function disposeAllCachedResources() {
   envCache.clear();
   envLoadPromises.clear();
   envOwners.clear();
+  // Retired envs too: their sweep runs from `syncEnvironment`, so a surface that stops
+  // rendering (or a build with no 3D surface at all) would otherwise strand them forever.
+  // Everything binding them is being torn down with this generation anyway.
+  for (const tex of retiredEnvs) tex.dispose();
+  retiredEnvs.clear();
 
   // Clear refcount tracking
   modelOwners.clear();
@@ -1217,6 +1387,11 @@ export function disposeAllCachedResources() {
 
   // SDF font atlases (parallel cache) — drop this session's fonts on teardown.
   disposeAllFonts();
+
+  // Browser `FontFace` registrations (the DOM/CSS half — parallel cache, no GPU
+  // resources). Removed from `document.fonts` too: a face the browser still holds
+  // after its registry is cleared can never be removed afterwards (#276).
+  disposeAllFontFaces();
 
   // Drop any editor import parse offered but never consumed (F4) — bounds the leak
   // of an un-taken handoff to a full teardown.
@@ -1429,7 +1604,9 @@ function releaseMaterialByPath(sceneId: SceneId, matPath: string): void {
   if (!matPath.endsWith('.mat.json')) return;
   const wasLast = removeOwner(materialOwners, matPath, sceneId);
   if (wasLast) {
-    invalidateMaterial(matPath); // disposes the THREE.Material + texture
+    // Retires it (#317) — the sweep frees it once no live mesh binds it. NOT a synchronous
+    // dispose: the outgoing scene may still be on screen for a frame or two after the swap.
+    invalidateMaterial(matPath);
   }
 }
 
@@ -1451,15 +1628,26 @@ export async function acquirePrefab(sceneId: SceneId, prefabRef: string): Promis
 const envCache = new Map<string, THREE.DataTexture>();
 const envLoadPromises = new Map<string, Promise<void>>();
 const envOwners = new Map<string, Set<SceneId>>();
-const hdrLoader = new HDRLoader();
+// Both memoise the PROMISE rather than the loader: construction is async since #254, and a
+// field assigned after an await is observable half-done by a concurrent caller. Nothing is
+// configured after construction here, so the worst case would only be a wasted second loader
+// — but the shape is the same one that IS a defect in `riggedModelCache.getLoader`, so keep
+// them identical rather than leaving one instance of the class alive.
+let hdrLoader: Promise<HDRLoader> | null = null;
 // Lazily-built loader for the UltraHDR (gainmap JPEG) format — only constructed if a
 // scene actually uses an `ultrahdr` env, so the WASM/loader isn't pulled otherwise.
-let ultraHdrLoader: UltraHDRLoader | null = null;
-function loaderForEnv(hdrPath: string) {
+let ultraHdrLoader: Promise<UltraHDRLoader> | null = null;
+/** Resolve the HDR loader for `hdrPath`, importing three's loader module on first use via
+ *  `threeLoaderModules` — which owns the `render3d` gate and the reasoning (#254). Both
+ *  loaders stay memoised here rather than there because what is cached is a *constructed*
+ *  loader, and only this file knows which format a given env path resolves to. */
+async function loaderForEnv(hdrPath: string): Promise<HDRLoader | UltraHDRLoader> {
   if (getEnvFormat(hdrPath) === 'ultrahdr') {
-    return ultraHdrLoader ?? (ultraHdrLoader = new UltraHDRLoader());
+    return (ultraHdrLoader ??= ultraHdrLoaderCtor()
+      .then((Ctor) => new Ctor()).catch((e) => { ultraHdrLoader = null; throw e; }));
   }
-  return hdrLoader;
+  return (hdrLoader ??= hdrLoaderCtor()
+    .then((Ctor) => new Ctor()).catch((e) => { hdrLoader = null; throw e; }));
 }
 
 /** Look up a cached HDR environment texture. Accepts guid or path. Returns undefined if not preloaded. */
@@ -1487,7 +1675,12 @@ function releaseEnvironmentByPath(sceneId: SceneId, hdrPath: string): void {
   const wasLast = removeOwner(envOwners, hdrPath, sceneId);
   if (wasLast) {
     const tex = envCache.get(hdrPath);
-    if (tex) tex.dispose();
+    // Retire rather than dispose, for the same reason `invalidateEnvironment` does (#315).
+    // "Last OWNER" is not "nothing binds it": a render-on-demand SceneView that has not redrawn
+    // since the swap still has this instance on `scene.environment`, and would draw a destroyed
+    // texture on its next frame. The sweep frees it once no surface binds it — which, on a swap
+    // where the new scene has no env, is that surface's very next `syncEnvironment`.
+    if (tex) retiredEnvs.add(tex);
     envCache.delete(hdrPath);
     envLoadPromises.delete(hdrPath);
   }
@@ -1504,10 +1697,40 @@ export function invalidateEnvironment(hdrRef: string): void {
   // through it and accept a path as-is — it's just the cache key. (Mirrors invalidateTexture.)
   const hdrPath = isGuid(hdrRef) ? refToPath(hdrRef) : hdrRef;
   if (!hdrPath) return;
+  // Announce before evicting, like every other kind (#304) — the Environment
+  // Inspector's stats are sidecar-derived and path-keyed, same as the rest.
+  emitAssetInvalidated('environment', hdrPath);
   const tex = envCache.get(hdrPath);
-  if (tex) tex.dispose();
+  // RETIRE, don't dispose (#315). This call KEEPS the scene owners, so the render surfaces are
+  // still binding this instance to `scene.environment`/`scene.background` right now — disposing
+  // it here made the next submit bind a destroyed texture. It stays alive, unreachable to new
+  // lookups, until `sweepRetiredEnvironments` observes that no live surface binds it any more.
+  if (tex) retiredEnvs.add(tex);
   envCache.delete(hdrPath);
   envLoadPromises.delete(hdrPath);
+}
+
+/** HDR envs evicted by {@link invalidateEnvironment} while a render surface still bound them.
+ *
+ *  ⚠️ The env cache has no per-holder release to hang the free off — owners are SETS
+ *  (`envOwners`), and the binding lives in another module (`scene3DSync`). So unlike the shared
+ *  texture cache's `retired` map, this cannot be refcounted: it is freed by a sweep that reads
+ *  the live `scene.environment`/`scene.background` of every surface. Reading the real property
+ *  rather than a shadow record is deliberate — five sites outside `syncEnvironment` clear those
+ *  bindings, and a hand-maintained list of them would go stale invisibly. */
+const retiredEnvs = new Set<THREE.DataTexture>();
+
+/** The retired-env set, for `scene3DSync`'s sweep. Empty in the overwhelmingly common case —
+ *  callers check `.size` before doing any per-surface work. */
+export function retiredEnvironments(): ReadonlySet<THREE.DataTexture> {
+  return retiredEnvs;
+}
+
+/** Free one retired env once the sweep has established that nothing binds it. Never call
+ *  `dispose()` on a retired env directly — that is the bug this exists to prevent. */
+export function disposeRetiredEnvironment(tex: THREE.DataTexture): void {
+  if (!retiredEnvs.delete(tex)) return; // not retired (or already freed) — nothing to do
+  tex.dispose();
 }
 
 function fetchEnvironment(hdrPath: string): Promise<void> {
@@ -1518,37 +1741,54 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
   // full disposeAllCachedResources) is observable when the texture arrives.
   const gen = cacheGeneration;
 
-  const promise = new Promise<void>((resolve) => {
+  const promise = (async () => {
     // Load the converted variant (`~env.hdr` downscaled Radiance, or `~ultrahdr.jpg`
     // gainmap) when the HDR has been converted, else the raw source. The loader is
-    // picked by the resolved format (UltraHDRLoader for ultrahdr, else HDRLoader).
-    loaderForEnv(hdrPath).load(
-      resolveEnvVariantUrl(hdrPath) ?? assetUrl(hdrPath),
-      (texture) => {
-        // If the cache was disposed or the owner released this HDR mid-load,
-        // dispose the just-loaded texture instead of leaving it owner-less in
-        // the cache forever.
-        if (gen !== cacheGeneration || !envOwners.has(hdrPath)) {
-          texture.dispose();
+    // picked by the resolved format (UltraHDRLoader for ultrahdr, else HDRLoader) and
+    // imported on first use (#254), so resolving it is a step that can itself fail.
+    let loader;
+    try {
+      loader = await loaderForEnv(hdrPath);
+    } catch (err) {
+      console.warn(`[MeshCache] HDR loader unavailable for ${hdrPath}:`, err);
+      return; // syncEnvironment falls back to no env — same degrade as a failed load
+    }
+    await new Promise<void>((resolve) => {
+      loader.load(
+        resolveEnvVariantUrl(hdrPath) ?? assetUrl(hdrPath),
+        (texture) => {
+          // If the cache was disposed or the owner released this HDR mid-load,
+          // dispose the just-loaded texture instead of leaving it owner-less in
+          // the cache forever.
+          if (gen !== cacheGeneration || !envOwners.has(hdrPath)) {
+            texture.dispose();
+            resolve();
+            return;
+          }
+          texture.mapping = THREE.EquirectangularReflectionMapping;
+          // An invalidate mid-flight clears `envLoadPromises`, so a SECOND fetch for this path
+          // can already have landed here. Retire the incumbent instead of letting `set`
+          // silently orphan it — orphaned, it is unreachable to every lookup AND to the sweep,
+          // i.e. an HDR-sized leak. Retiring is also the only safe move: a surface may be
+          // binding it right now, so disposing here would be #315 again.
+          const prev = envCache.get(hdrPath);
+          if (prev && prev !== texture) retiredEnvs.add(prev);
+          envCache.set(hdrPath, texture);
+          // Wake the render-on-demand viewport so syncEnvironment applies this IBL.
+          // Like the material refetch above, an HDR that finishes loading after the
+          // Inspector's dirty grace window (editor live-edit / re-import) would otherwise
+          // leave the scene idle and unlit until the next redraw (camera move) or reload.
+          fireDirtyListeners();
           resolve();
-          return;
-        }
-        texture.mapping = THREE.EquirectangularReflectionMapping;
-        envCache.set(hdrPath, texture);
-        // Wake the render-on-demand viewport so syncEnvironment applies this IBL.
-        // Like the material refetch above, an HDR that finishes loading after the
-        // Inspector's dirty grace window (editor live-edit / re-import) would otherwise
-        // leave the scene idle and unlit until the next redraw (camera move) or reload.
-        fireDirtyListeners();
-        resolve();
-      },
-      undefined,
-      (err) => {
-        console.warn(`[MeshCache] HDR load failed for ${hdrPath}:`, err);
-        resolve(); // resolve anyway — syncEnvironment will fall back to no env
-      },
-    );
-  }).finally(() => {
+        },
+        undefined,
+        (err) => {
+          console.warn(`[MeshCache] HDR load failed for ${hdrPath}:`, err);
+          resolve(); // resolve anyway — syncEnvironment will fall back to no env
+        },
+      );
+    });
+  })().finally(() => {
     envLoadPromises.delete(hdrPath);
   });
 
@@ -1570,6 +1810,14 @@ function releasePrefabByPath(sceneId: SceneId, prefabPath: string): void {
 }
 
 /** Look up a cached prefab. Accepts guid or path. Returns undefined if not loaded. */
+/** ⚠️ Takes the REF (a GUID), not a resolved path — `refToPath` runs INSIDE. Handing it an
+ *  already-resolved `/assets/…` path re-enters `resolveRef` with an asset path, which is
+ *  rejected ("path reference no longer supported") and returns undefined, so the prefab reads
+ *  as permanently uncached and whatever needed it silently never appears.
+ *
+ *  Worth stating because several callers name their local `prefabPath` while holding a GUID
+ *  (`SceneManager`'s `fetchPrefab` parameter, for one), and that naming is what led one caller
+ *  to resolve first. */
 export function getCachedPrefab(prefabRef: string): unknown | undefined {
   const prefabPath = refToPath(prefabRef);
   if (!prefabPath) return undefined;

@@ -1,9 +1,10 @@
 /** Keep an asset editor's binding in step when its file MOVES or disappears (#186).
  *
  *  Five panels hold a live binding to the asset they are editing — Particle, SpriteAnim,
- *  Skin, Animation, Timeline — and the binding is a PATH. Each also autosaves that path on
- *  a 400ms debounce (`useDebouncedSave`), so any operation that changes where the file
- *  lives, without telling the panel, makes the next edit write to the OLD location:
+ *  Skin, Animation, Timeline — and the binding is a PATH. Each also PARKS its document under
+ *  that path (`scene/dirtyAssets.ts`), to be written by the next Cmd+S, so any operation that
+ *  changes where the file lives, without telling the panel, makes the next save write to the OLD
+ *  location:
  *
  *  - **Delete** → the file you just moved to the trash comes BACK on the next edit.
  *  - **Rename / move** → worse: the asset FORKS. Measured on `games/timeline-demo` — after
@@ -16,12 +17,22 @@
  *  down, and the reason it is a shared module rather than five inline blocks is that the
  *  first version of this fix covered `executeDeletion` alone and missed the other four.
  *
+ *  ⚠️ **The BINDING is only half of it now (#259).** While the panels autosaved, closing the
+ *  panel ended the story: nothing else held the path. Now the panel parks its document in the
+ *  dirty-asset registry, which outlives the binding — so unbinding a deleted asset leaves a parked
+ *  write that the next Cmd+S turns straight back into the file you deleted, and repointing a moved
+ *  one leaves the old path parked, which forks the asset exactly as #186 measured. Worse, the
+ *  registry keeps an entry for an asset whose panel was CLOSED, where there is no binding to
+ *  repair at all. So the moves are applied to the registry independently of the bindings — see
+ *  `applyMovesToParkedAssets`.
+ *
  *  Paths are compared exactly (or by path-segment prefix for a folder). Both sides
  *  originate from the same `AssetEntry.path` — the Assets panel moves by it, and
  *  `openAssetInEditor` binds by it — so there is no normalization to get wrong; if that
  *  ever stops being true this needs a shared canonicalizer, not a looser match here. */
 
 import { useEditorStore } from '../store/editorStore';
+import { getDirtyAssetPaths, peekDirtyAsset, markAssetDirty, discardDirtyAssets } from '../scene/dirtyAssets';
 
 /** One editor's binding: the store field naming its asset, and the action that clears it. */
 export interface AssetEditorBinding {
@@ -97,9 +108,52 @@ export function resolveBindingMoves<T extends { readonly label: string }>(
   return out;
 }
 
+/** Apply `moves` to the PARKED WRITES in the dirty-asset registry, which are keyed by path and
+ *  outlive both the panel binding and the panel itself.
+ *
+ *  A moved asset keeps its parked doc — it is the same asset at a new location, and silently
+ *  dropping a human's unsaved edits because they renamed the file would be its own bug. A DELETED
+ *  asset loses it: the file is gone, and a parked write for it is a resurrection waiting for the
+ *  next save. That discard is reported (never silent) for the same reason `discardDirtyAssets`
+ *  and `dropParkedWriteFor` are — it destroys pending work.
+ *
+ *  Exported for tests; `applyAssetPathMoves` is the only production caller. */
+export function applyMovesToParkedAssets(moves: Iterable<PathMove>): string[] {
+  const list = [...moves];
+  // PLAN, then apply — the same two-phase shape as `resolveBindingMoves` above, and for a reason
+  // that is not stylistic: applying in-loop writes the moved doc back into the registry, so a
+  // LATER iteration can pick it up as though it were that path's own. Concretely, with docs parked
+  // for /a and /b and moves [a→b, b→c]: /a moves onto /b, then /b (still in the snapshot) moves
+  // what is now A's doc on to /c — A lands at /c and B's edit is gone. No caller passes a chained
+  // move today, so this is a trap rather than a live bug; resolving first makes it unreachable.
+  const planned: { from: string; to: string | null; doc: ReturnType<typeof peekDirtyAsset> }[] = [];
+  for (const path of getDirtyAssetPaths()) {
+    for (const m of list) {
+      const to = applyMove(path, m);
+      if (to === undefined) continue;   // this move does not touch this path — try the next
+      if (to !== path) planned.push({ from: path, to, doc: peekDirtyAsset(path) });
+      break;                            // first matching move wins, as it does for bindings
+    }
+  }
+  const notes: string[] = [];
+  // Drop every source path FIRST, so a rename onto a path that is itself parked cannot be
+  // undone by its own discard landing after the new entry.
+  for (const { from } of planned) discardDirtyAssets([from]);
+  for (const { from, to, doc } of planned) {
+    if (to === null) {
+      notes.push(`dropped the unsaved edit parked for ${from} (its asset was deleted)`);
+    } else if (doc) {
+      markAssetDirty(to, doc.type, doc.data, doc.origin);
+      notes.push(`moved the unsaved edit parked for ${from} → ${to}`);
+    }
+  }
+  return notes;
+}
+
 /** Apply `moves` to every asset editor binding: unbind the ones whose asset is gone, repoint
- *  the ones whose asset moved. Returns a short description per change (empty in the
- *  overwhelmingly common case where nothing bound was touched). */
+ *  the ones whose asset moved — AND repair the parked writes, which the binding does not cover
+ *  (see `applyMovesToParkedAssets`). Returns a short description per change (empty in the
+ *  overwhelmingly common case where nothing bound or parked was touched). */
 export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
   const state = useEditorStore.getState();
   const bound = ASSET_EDITOR_BINDINGS.map((b) => ({ ...b, path: state[b.assetField]?.path }));
@@ -115,6 +169,8 @@ export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
       notes.push(`repointed the ${c.binding.label} editor to ${c.to}`);
     }
   }
+  // Independently of the bindings: a parked write can belong to an asset whose panel is CLOSED.
+  notes.push(...applyMovesToParkedAssets(moves));
   return notes;
 }
 

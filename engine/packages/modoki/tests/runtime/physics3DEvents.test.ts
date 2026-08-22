@@ -295,3 +295,111 @@ describe('Physics3DEvents — despawn exit, hot edit, unsubscribe', () => {
     expect(count).toBe(0);
   });
 });
+
+describe('Physics3DEvents — contact events survive substepping (#205 R2)', () => {
+  it('a fast body that crosses a thin sensor within a single 1/30 tick still reports both enter and exit', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    tw.spawn(Physics3D({ gravityX: 0, gravityY: 0, gravityZ: 0 }));
+    // A thin sensor slab in X (half-width 0.1) that a fast sphere (radius 0.2, overlap band
+    // ±0.3) fully crosses within one 1/30 s tick at vx=24 — geometrically the body is already
+    // outside the slab by the end of that SAME tick (physicsSubsteps splits it into two 1/60
+    // substeps: after substep 1 it's inside, after substep 2 it's out the far side).
+    tw.spawn(Transform({ x: 0, y: 0, z: 0 }), RigidBody3D({ bodyType: 'static' }),
+      Collider3D({ shape: 'box', halfW: 0.1, halfH: 5, halfD: 5, isSensor: true }));
+    tw.spawn(Transform({ x: -0.35, y: 0, z: 0 }),
+      RigidBody3D({ bodyType: 'dynamic', vx: 24, gravityScale: 0 }),
+      Collider3D({ shape: 'sphere', radius: 0.2 }));
+
+    const hits: string[] = [];
+    physics3DEvents.onSensor((_s, _o, phase) => hits.push(phase), tw.world);
+
+    // Rapier's own enter/exit reporting lags the geometric transition by up to one world.step()
+    // call, so 'exit' can land a tick after the body has physically left — give it a few ticks
+    // at 1/30 (the render-rate-capped frame this bug was about) and require BOTH phases to show
+    // up, not just 'enter'. Before this fix (a single un-substepped `world.step(1/30)`), the
+    // sphere's whole crossing (-0.35 → 0.45, a 0.8-unit jump) happens inside ONE coarse discrete
+    // step and is never sampled overlapping at all — neither phase ever fires. The intermediate
+    // bug this comment/test guards against (2 world.step() calls but ONE drain after the loop)
+    // captures 'enter' but permanently loses 'exit', because the auto-draining EventQueue is
+    // cleared at the start of the second `world.step()` before the first drain ever runs.
+    for (let i = 0; i < 5 && !(hits.includes('enter') && hits.includes('exit')); i++) tw.step(1, 1 / 30);
+
+    expect(hits).toContain('enter');
+    expect(hits).toContain('exit');
+  });
+});
+
+describe('Physics3DEvents — a collision callback reads the POST-step world', () => {
+  // #205 R2 moved the contact drain INSIDE the substep loop (correct — the auto-draining
+  // EventQueue is cleared by every `world.step`), but the loop sits BEFORE the Rapier→ECS pull,
+  // so every subscriber started seeing the PREVIOUS frame's Transform + velocity. Sling's bumper
+  // reads both (`speed = hypot(rb.vx, rb.vz)`, direction from the puck's world position) and so
+  // kicked the puck at its un-bounced APPROACH speed — the owner's "the puck accelerates when it
+  // collides with a bumper".
+  it('sees the same Transform/velocity the frame ends with, not the frame it started with', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    tw.spawn(Physics3D({ gravityX: 0, gravityY: -20, gravityZ: 0 }));
+    tw.spawn(Transform({ x: 0, y: 0, z: 0 }), RigidBody3D({ bodyType: 'static' }),
+      Collider3D({ shape: 'box', halfW: 5, halfH: 0.5, halfD: 5 }));
+    const ball = tw.spawn(Transform({ x: 0, y: 4, z: 0 }),
+      RigidBody3D({ bodyType: 'dynamic' }),
+      Collider3D({ shape: 'sphere', radius: 0.3, restitution: 0.8 }));
+
+    let inCb: { y: number; vy: number } | null = null;
+    physics3DEvents.onCollision((_a, _b, phase) => {
+      if (phase !== 'enter' || inCb) return;
+      inCb = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody3D)!.vy };
+    }, tw.world);
+
+    let before: { y: number; vy: number } | null = null;
+    let after: { y: number; vy: number } | null = null;
+    for (let i = 0; i < 240 && !inCb; i++) {
+      const pre = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody3D)!.vy };
+      tw.step(1);
+      if (inCb) { before = pre; after = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody3D)!.vy }; }
+    }
+
+    expect(inCb).toBeTruthy();
+    // The callback must observe the pose/velocity the step produced …
+    expect(inCb!.y).toBeCloseTo(after!.y, 9);
+    expect(inCb!.vy).toBeCloseTo(after!.vy, 9);
+    // … and NOT the pre-step approach state. The bounce reverses vy, so the two are far apart;
+    // assert that explicitly so the test cannot pass vacuously if the ball ever settles.
+    expect(Math.abs(after!.vy - before!.vy)).toBeGreaterThan(1);
+  });
+});
+
+describe('Physics3DEvents — the POST-step guarantee holds on a SUBSTEPPED frame', () => {
+  // At 1/60 `physicsSubsteps` returns count 1, so the collect-then-route split is only one step
+  // deep and the ordering bug would look the same either way. At 1/30 the frame splits in two:
+  // pairs collected in substep 1 are routed after substep 2 AND after the pull, which is the seam
+  // the split actually exists for. A capped-to-30fps device is the production case.
+  it('a contact routed after two substeps still reads the frame-END transform', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    tw.spawn(Physics3D({ gravityX: 0, gravityY: -20, gravityZ: 0 }));
+    tw.spawn(Transform({ x: 0, y: 0, z: 0 }), RigidBody3D({ bodyType: 'static' }),
+      Collider3D({ shape: 'box', halfW: 5, halfH: 0.5, halfD: 5 }));
+    const ball = tw.spawn(Transform({ x: 0, y: 4, z: 0 }),
+      RigidBody3D({ bodyType: 'dynamic' }),
+      Collider3D({ shape: 'sphere', radius: 0.3, restitution: 0.8 }));
+
+    let inCb: { y: number; vy: number } | null = null;
+    physics3DEvents.onCollision((_a, _b, phase) => {
+      if (phase !== 'enter' || inCb) return;
+      inCb = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody3D)!.vy };
+    }, tw.world);
+
+    let before: { y: number; vy: number } | null = null;
+    let after: { y: number; vy: number } | null = null;
+    for (let i = 0; i < 240 && !inCb; i++) {
+      const pre = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody3D)!.vy };
+      tw.step(1, 1 / 30);   // dt/(1/60 * 1.05) = 1.9 -> ceil = 2 substeps
+      if (inCb) { before = pre; after = { y: ball.get(Transform)!.y, vy: ball.get(RigidBody3D)!.vy }; }
+    }
+
+    expect(inCb).toBeTruthy();
+    expect(inCb!.y).toBeCloseTo(after!.y, 9);
+    expect(inCb!.vy).toBeCloseTo(after!.vy, 9);
+    expect(Math.abs(after!.vy - before!.vy)).toBeGreaterThan(1);
+  });
+});

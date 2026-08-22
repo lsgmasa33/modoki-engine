@@ -79,18 +79,18 @@ describe('looksLikeIp', () => {
 // ── #149 — adb device picker helpers ──────────────────────────────────────────
 
 const mkClaim = (over: Partial<DeviceClaim> = {}): DeviceClaim =>
-  ({ deviceId: 'adb:RFCTB0EV83K', clone: 'work-ai', branch: 'work-ai', pid: 8123, at: 0, ...over });
+  ({ deviceId: 'adb:RFDEADBEEF1', clone: 'work-ai', branch: 'work-ai', pid: 8123, at: 0, ...over });
 
 const mkRow = (over: Partial<AndroidDeviceRow> = {}): AndroidDeviceRow =>
-  ({ serial: 'RFCTB0EV83K', state: 'device', usable: true, claim: null, ...over });
+  ({ serial: 'RFDEADBEEF1', state: 'device', usable: true, claim: null, ...over });
 
 describe('androidRowLabel', () => {
   it('shows model + serial when adb read a model', () => {
-    expect(androidRowLabel(mkRow({ model: 'SC_56C', serial: 'RFCTA14CMRF' }))).toBe('SC_56C — RFCTA14CMRF');
+    expect(androidRowLabel(mkRow({ model: 'SC_56C', serial: 'RFDEADBEEF2' }))).toBe('SC_56C — RFDEADBEEF2');
   });
 
   it('falls back to the serial alone with no model (e.g. unauthorized)', () => {
-    expect(androidRowLabel(mkRow({ model: undefined, serial: 'RFCTA14CMRF' }))).toBe('RFCTA14CMRF');
+    expect(androidRowLabel(mkRow({ model: undefined, serial: 'RFDEADBEEF2' }))).toBe('RFDEADBEEF2');
   });
 });
 

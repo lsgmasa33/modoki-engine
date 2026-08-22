@@ -45,6 +45,11 @@ const NATIVE_MARKERS: Array<{ label: string; file: string; needle: string }> = [
   { label: 'iOS plugin registration', file: 'ios/App/App/MyViewController.swift', needle: 'registerPluginInstance(gameDebugPlugin)' },
   { label: 'iOS Local Network plist key', file: 'ios/App/App/Info.plist', needle: 'NSLocalNetworkUsageDescription' },
   { label: 'iOS Bonjour plist key', file: 'ios/App/App/Info.plist', needle: 'NSBonjourServices' },
+  // #278 — the iOS mirror of the Android meta-data below, and the gate `triggerFault` reads. The
+  // needle is the TRUE form: a flag-off project keeps the key with `<false/>`, which is a
+  // deliberate write (a write-once flag would leave the capability behind on a project that turned
+  // debugBuild off — exactly the state that must not be able to crash on demand).
+  { label: 'iOS ModokiDebugBuild plist key', file: 'ios/App/App/Info.plist', needle: '<key>ModokiDebugBuild</key>\n\t<true/>' },
   { label: 'iOS archive warning phase', file: 'ios/App/App.xcodeproj/project.pbxproj', needle: "Warn: Modoki 'Debug build' is ON" },
   { label: 'Android debug-build meta-data', file: 'android/app/src/main/AndroidManifest.xml', needle: 'com.modokiengine.gamedebug.DEBUG_BUILD" android:value="true"' },
   { label: 'Android release-build warning', file: 'android/app/build.gradle', needle: 'modoki:debug-build-warning-begin' },

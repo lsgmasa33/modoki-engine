@@ -112,6 +112,17 @@ describe('reading a definition back', () => {
     expect((r.def as { sprite: string }).sprite).toBe('sp1');
   });
 
+  it('reports a rig2d at its AUTHORED precision, not the parsed rig (QA-ASSET-0015)', async () => {
+    // rig2d is the one kind whose live cache holds a RUNTIME structure — packed Float32Arrays,
+    // weights renormalized. Answering with that made the op report float32 numbers for a file
+    // holding float64 ones, and a QA run read the difference as the editor corrupting the rig
+    // on load. Every other kind reports the authored doc; so does this one now.
+    const AUTHORED = 0.7172465286407307;
+    setRig2D(RIG2D, { ...MINIMAL_RIG, skinIndices: [0, 0, 0, 0], skinWeights: [AUTHORED, 0, 0, 0] });
+    const r = await runAgentOp('read-asset-def', { path: RIG2D }) as Def;
+    expect((r.def as { skinWeights: number[] }).skinWeights[0]).toBe(AUTHORED);
+  });
+
   it('sees an edit made through particle-set — the verification path', async () => {
     // This is the whole point: a caller can now CHECK an asset edit by data instead of by pixels.
     setParticleEffect(PARTICLE, { maxParticles: 300 } as never);

@@ -21,6 +21,7 @@ import { DEFAULT_LAYER } from './layers';
 import { worldTransforms, deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { onWorldSwap } from '../core/ecs/world';
 import { getRaycast3D, type Raycast3DHit as RaycastHit } from '../core/raycast3DRegistry';
+import { getEffectiveThreeSettings } from './renderSettings';
 
 // ── Pure placement logic (no THREE, no world) — the part the unit tests exercise ──
 
@@ -189,11 +190,24 @@ export function syncBlobShadows(world: World, scene: THREE.Object3D, state: Blob
   const seen = new Set<number>();
 
   type TransformData = { x: number; y: number; z: number };
-  type BlobData = { radius: number; opacity: number; groundOffset: number; maxDrop: number; fadeStart: number; fadeHeight: number; softness: number };
+  type BlobData = { radius: number; opacity: number; groundOffset: number; maxDrop: number; fadeStart: number; fadeHeight: number; softness: number; onlyWhenShadowsOff: boolean };
+
+  // Read ONCE per pass, not per entity: it resolves through `getActiveTierOverrides()`, and the
+  // tier cannot change midway through a sync.
+  const realShadowsOn = getEffectiveThreeSettings().shadows;
 
   world.query(Transform, BlobShadow).updateEach(([tf, bs]: [TransformData, BlobData], entity) => {
     const id = entity.id();
     if (deactivatedEntities.has(id)) return;
+
+    // ⚠️ BEFORE the raycast — that is the whole point of the gate. A blob authored as a
+    // shadows-off substitute must cost NOTHING on a tier that renders real shadows, rather than
+    // paying a scene query per frame per viewport whose result is then thrown away.
+    // Deliberately NOT `seen.add`ed: falling through to the sweep below disposes its mesh, so a
+    // device that promotes into real shadows also gives back the draw call and the GPU memory. It
+    // rebuilds on demotion — a tier-change event, not a per-frame cost.
+    if (bs.onlyWhenShadowsOff && realShadowsOn) return;
+
     seen.add(id);
 
     let rec = state.recs.get(id);

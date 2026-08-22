@@ -29,6 +29,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { backendFetch } from '../../backend/editorBackend';
 import { pushAction } from '../../undo/undoManager';
+import { makeBaseSceneUndo } from './baseSceneUndo';
 import { AssetRefField, assetDisplayName } from '../AssetRefField';
 import { isGuid, resolveGuidToPath } from '../../../runtime/loaders/assetManifest';
 import { resolveSceneChain, type FetchSceneMeta } from '../../../runtime/scene/sceneChain';
@@ -50,11 +51,25 @@ const fetchSceneMetaForEditor: FetchSceneMeta = async (locator) => {
   }
 };
 
-async function mutateScene(path: string, baseScene: string | null): Promise<{ ok: boolean; errors: string[] }> {
-  const res = await backendFetch('/api/scene-mutate', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, ops: [{ op: 'setBaseScene', baseScene }] }),
-  });
+// Exported for unit testing without mounting the component.
+export async function mutateScene(path: string, baseScene: string | null): Promise<{ ok: boolean; errors: string[] }> {
+  // Resolve `{ok:false}` on a THROWN request too, matching every sibling backend wrapper
+  // in assetOps (each is `try { … return res.ok } catch { return false }`). Without this
+  // the fetch rejection escaped `write()` and, through it, this view's undo/redo closures —
+  // and a throw from an undo closure is the one failure mode #308 rules out: `undo()` pops
+  // the action BEFORE awaiting it, so the rejection skips `redoStack.push` and the `!undo`
+  // event and loses the action from BOTH stacks. An HTTP error already resolved false; only
+  // a network-level failure could throw, which is exactly when the editor is least able to
+  // afford losing an undo entry.
+  let res: Response;
+  try {
+    res = await backendFetch('/api/scene-mutate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, ops: [{ op: 'setBaseScene', baseScene }] }),
+    });
+  } catch (e) {
+    return { ok: false, errors: [e instanceof Error ? e.message : String(e)] };
+  }
   const body = await res.json().catch(() => ({ ok: false, errors: [`HTTP ${res.status}`] }));
   return { ok: res.ok && body.ok !== false, errors: body.errors ?? (res.ok ? [] : [body.error ?? `HTTP ${res.status}`]) };
 }
@@ -115,18 +130,10 @@ export function SceneAssetView({ path, name }: { path: string; name: string }) {
   const commit = useCallback(async (next: string) => {
     const old = baseSceneRef.current;
     if (!await write(next)) return;
-    pushAction({
-      label: next ? 'Set base scene' : 'Clear base scene',
-      undo: async () => { await write(old); },
-      redo: async () => { await write(next); },
-      // scene-mutate writes straight to the FILE — this edit (and its undo/redo) is
-      // ALREADY persisted, unlike a normal trait/entity edit that's genuinely pending
-      // a Cmd+S. Without this, pushAction/undo/redo's unconditional edit-version bump
-      // would falsely mark the ACTIVE scene dirty and self-block a FOLLOW-UP
-      // scene-mutate call via the "unsaved live changes" guard that route carries.
-      _isFileDirect: true,
-    });
-  }, [write]);
+    // Builder in baseSceneUndo.ts (#308) — a framework-free factory so the undo/redo
+    // closures are unit-testable without mounting this panel.
+    pushAction(makeBaseSceneUndo({ path, old, next, write }));
+  }, [write, path]);
 
   const handleChange = useCallback(async (v: string) => {
     setWarning(null);

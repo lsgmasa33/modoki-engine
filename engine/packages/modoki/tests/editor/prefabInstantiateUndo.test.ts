@@ -6,8 +6,19 @@
  *  redo-spawned instance. The shared helper keeps the live id in one mutable slot
  *  so undo always targets whatever is currently live. */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { makePrefabInstantiateAction } from '../../src/editor/undo/prefabInstantiateUndo';
+
+// Console spies are restored in afterEach, NOT inline: a failing assertion skips the rest
+// of the body, so an inline restore never runs and console stays mocked for every later
+// test (the trap documented in assetUndo.test.ts).
+let spies: Array<{ mockRestore: () => void }> = [];
+const spyError = () => {
+  const s = vi.spyOn(console, 'error').mockImplementation(() => {});
+  spies.push(s);
+  return s;
+};
+afterEach(() => { for (const s of spies) s.mockRestore(); spies = []; });
 
 describe('makePrefabInstantiateAction', () => {
   it('a second undo (after redo) tears down the REDO-spawned instance, not the dead original', async () => {
@@ -52,6 +63,7 @@ describe('makePrefabInstantiateAction', () => {
   });
 
   it('leaves the live id unchanged when respawn returns null (prefab file gone between undo and redo)', async () => {
+    const err = spyError();
     const removed: number[] = [];
     const action = makePrefabInstantiateAction({
       label: 'i',
@@ -64,5 +76,9 @@ describe('makePrefabInstantiateAction', () => {
     await action.redo(); // respawn fails → no new instance, slot stays 5
     await action.undo(); // still references 5 (a no-op delete on the dead id in real code)
     expect(removed).toEqual([5, 5]);
+    // The no-op is the deliberate contract; the SILENCE was not (#308). redo pops the
+    // stack and reads as done, so the failure has to say so.
+    expect(err).toHaveBeenCalledTimes(1);
+    expect(String(err.mock.calls[0][0])).toContain('Redo');
   });
 });

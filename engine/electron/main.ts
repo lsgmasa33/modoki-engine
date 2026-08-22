@@ -52,18 +52,25 @@ const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : a
 // profile, and clobbering it is the same class of bug in reverse. (The CSP smoke launches
 // the packaged app with one.)
 if (shouldOverrideUserData(process.argv)) {
-  app.setPath('userData', resolveUserDataDir({
+  // §14.4: several editors run inside ONE clone under MODOKI_MULTI and would otherwise
+  // share this clone's profile → LevelDB single-writer fight. Give each its own
+  // sub-profile keyed on the project it opened (stable across relaunch, distinct between
+  // co-running editors). Only under MULTI, so the normal single-editor case is unchanged.
+  const profileSubKey = process.env.MODOKI_MULTI ? multiProfileKey(process.env.MODOKI_PROJECT) : null;
+  const base = resolveUserDataDir({
     appData: app.getPath('appData'),
     isPackaged: app.isPackaged,
     repoRoot: app.isPackaged
       ? path.join(process.resourcesPath, 'app.asar.unpacked')
       : path.resolve(__dirname, '..', '..', '..'),
-    // §14.4: several editors run inside ONE clone under MODOKI_MULTI and would otherwise
-    // share this clone's profile → LevelDB single-writer fight. Give each its own
-    // sub-profile keyed on the project it opened (stable across relaunch, distinct between
-    // co-running editors). Only under MULTI, so the normal single-editor case is unchanged.
-    subKey: process.env.MODOKI_MULTI ? multiProfileKey(process.env.MODOKI_PROJECT) : null,
-  }));
+    subKey: null,
+  });
+  app.setPath('userData', profileSubKey ? path.join(base, profileSubKey) : base);
+  // …but the UI PREFS follow the clone, not the sub-profile. The split exists for Chromium's
+  // single-writer LevelDB; a zoom level is our own atomically-written file and belongs to the
+  // human, so letting a MULTI launch strand it in a sibling directory just looks like "the
+  // persisted zoom is never restored" (testboard q1k7p2hGZB9lGvYi11go). See setUiPrefsDir.
+  setUiPrefsDir(base);
 }
 
 // Adopt a pre-existing toolchain instead of re-fetching ~1.2GB. Pinning the toolchain dir
@@ -89,7 +96,7 @@ import { startBackendServer, type BackendServerHandle, type HostRoutes } from '.
 import type { LiveReloadKind } from '../plugins/vite-asset-scanner';
 import { captureViewport, tap, drag, hover, scroll, pointerDown, pointerMove, pointerUp, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
 import type { RenderSurfaceFacts } from './rendererOps';
-import { createInputRoutes } from './inputRoutes';
+import { createInputRoutes, inputDeliverability, hiddenWindowRefusal } from './inputRoutes';
 import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
 import { getSsrLoadModule, closeSsrLoader } from './ssrLoader';
 import { buildProdCsp, PROD_CSP_ORIGINS } from './csp';
@@ -105,7 +112,7 @@ import { vendorEnginePlugins, writeVendorMarker, type VendorResult } from '../pl
 import { composeDepsInstallError } from './projectDeps';
 import { healNativeConfig } from '../plugins/healNativeConfig';
 import { setupAutoUpdate, checkForUpdatesInteractive, isUpdateInstalling } from './autoUpdate';
-import { restoreZoom, handleZoom } from './zoom';
+import { restoreZoom, handleZoom, setUiPrefsDir } from './zoom';
 import { registerReimportHandler } from '../plugins/reimport-registry';
 import { textureReimportHandler } from '../plugins/reimport-texture';
 import { modelReimportHandler } from '../plugins/reimport-model';
@@ -115,6 +122,7 @@ import { environmentReimportHandler } from '../plugins/reimport-environment';
 import { atlasReimportHandler } from '../plugins/reimport-atlas';
 import { videoReimportHandler } from '../plugins/reimport-video';
 import type { BackendContext } from '../plugins/backend/editorBackendRouter';
+import { releaseDeviceResourcesOnExit } from '../plugins/backend/deviceConnection';
 import type { SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { ENGINE_VERSION } from '../packages/modoki/src/runtime/core/version';
 
@@ -352,6 +360,15 @@ let DEV_URL = process.env.MODOKI_DEV_URL || `http://127.0.0.1:${process.env.MODO
 // dev the shell loads from Vite (HMR) and only the backend is main-hosted.
 const PROD = app.isPackaged || process.env.MODOKI_PROD === '1';
 
+// Tell every CHILD process that this is a packaged editor. Set on our own env so it is
+// inherited automatically — the Vite dev server (devServer.ts spawns with `...process.env`)
+// and anything it runs in turn, like build-web.mjs. `vendorEnginePlugins` reads it to decide
+// whether shelling out to an engine plugin's `npm run build` is even possible: a packaged app
+// ships src/ + dist/ but no devDependencies and no `node_modules/.bin` shims, so that build
+// exits 127 and takes the dev server down with it. Deliberately NOT a parameter threaded
+// through three call sites — see the default in vendorPlugins.ts for what that cost.
+if (app.isPackaged) process.env.MODOKI_PACKAGED = '1';
+
 // Repo root (the npm/vite root) — owns the Vite dev-server process (dev AND
 // packaged, per C4c-3b "run Vite in prod") and resolves engine source + node_modules.
 //   • dev: engine/electron/dist/main.cjs → three levels up = the repo.
@@ -382,6 +399,19 @@ if (CDP.openSwitch) {
   app.commandLine.appendSwitch('remote-debugging-port', String(CDP.port));
   logToFile('info', `[cdp] renderer remote-debugging enabled on 127.0.0.1:${CDP.port}`);
 }
+// Keep the frame loop alive when another window COVERS the editor (#243). This is a
+// different mechanism from the `backgroundThrottling: false` we already set on the
+// BrowserWindow: that governs Chromium's background TIMER throttling, whereas macOS
+// occlusion makes the OS report the window as occluded, Chromium transitions the
+// renderer to hidden, and rAF stops outright rather than being throttled. Measured with
+// backgroundThrottling already false: a covered editor read visibilityState 'hidden',
+// fps 0, and never spawned a level's entities — so scene load, prefab instantiation,
+// play/step and every agent-driven verification stalled until a human raised the window.
+// Unconditional on purpose: it does not add a policy, it makes the one the BrowserWindow
+// comment ALREADY states ("don't throttle when the window is occluded or backgrounded …
+// including headless/MCP verification runs") actually hold. Cost is a covered window
+// that keeps rendering; that trade was already accepted for the backgrounded case.
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 // A per-launch nonce baked into the renderer URL (`?cdpNonce=<uuid>#/editor`) so probeCdp
 // can prove a CDP endpoint is OUR process, not a sibling editor / stray Chrome tab (§12.2).
 // Minted once per process; loadURL uses it and cdpStatus() matches it.
@@ -1247,6 +1277,11 @@ app.whenReady().then(async () => {
     getManifest: () => state.backend.getManifest(),
     rebuildManifest: () => state.backend.rebuildManifest(),
     computeUnused: () => state.backend.computeUnused(),
+    computeRefEdges: () => state.backend.computeRefEdges(),
+    // Reads the held sustained-pointer out of the input routes' closure for /api/editor-state
+    // (#302). `inputRoutes` is declared below this object, which is fine: the getter runs per
+    // request, long after this block finishes.
+    getHeldPointer: () => inputRoutes.getHeldPointer(),
     requestBrowser: requestRenderer,
     getSchema: () => cachedSchema,
     markEditorWrite: (p, h) => state.backend.markEditorWrite(p, h),
@@ -1376,6 +1411,21 @@ app.whenReady().then(async () => {
       if (playProbe && playProbe.playState !== 'playing') {
         return { kind: 'json', status: 409, body: { error: `game is ${playProbe.playState ?? 'not playing'} — press Play first (modoki_play_control play). capture_gesture samples the motion the drag causes; a stopped game produces a flat, misleading trajectory.` } };
       }
+      // A HIDDEN window drops every sendInputEvent, so the drag would deliver nothing and the
+      // trajectory would be flat — the third way this route can produce a confident, misleading
+      // "the object didn't track the drag", after the phantom guid and the stopped sim above.
+      // The same gate `/api/input/*` applies, reached through the shared helper rather than a
+      // second copy of the rule (this route drives its own drag through rendererOps, so it does
+      // not pass through createInputRoutes).
+      const gestureRefusal = hiddenWindowRefusal(await inputDeliverability(requestRenderer), 'the drag this samples');
+      if (gestureRefusal) return gestureRefusal;
+      // …and for the same reason it borrows that gate: this drag is a mouse gesture, so it cannot
+      // coexist with a sustained `/api/input/pointer` press. The routes that DO flow through
+      // `createInputRoutes` supersede a held press themselves (MOUSE_GESTURE_ROUTES); this one
+      // bypasses the dispatcher, so it has to ask. Dispatching a mouseDown underneath a held
+      // button would sample a trajectory the renderer's pointerSource never saw — the flat,
+      // misleading result this route already guards against twice above (#302).
+      await inputRoutes.releaseHeldPointer('superseded');
       const result = await captureGesture(mainWindow, {
         from, to, steps,
         sample: () => requestRenderer('scene-state', sampleParams),
@@ -1920,6 +1970,14 @@ app.on('before-quit', (e) => {
     // Bound the teardown so a wedged close() (e.g. a stuck SSE socket) can't hang
     // the quit, and always exit even if a step rejects. (E4)
     const teardown = (async () => {
+      // Give the phone back BEFORE anything can hang: an adb forward and a device claim are
+      // MACHINE-WIDE state that outlives this process, and until #225 nothing in production called
+      // this at all — the only caller was `/api/device/disconnect`, i.e. the case where a human had
+      // already tidied up. All of it is sync, so it completes even if a step below wedges and the
+      // 5s race times the teardown out. It does NOT cover a SIGTERM (`stop-editor.sh`) or a crash:
+      // Chromium takes the signal and this listener never runs — that is what the startup sweep in
+      // `reclaimStaleDeviceStateAtStartup` is for.
+      try { releaseDeviceResourcesOnExit(); } catch { /* never let cleanup block the quit */ }
       await backendHandle?.close().catch(() => {});
       await state.backend?.stop().catch(() => {});
       await closeSsrLoader().catch(() => {});

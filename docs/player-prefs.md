@@ -18,7 +18,8 @@ Claude-friendly store modelled on Unity's `PlayerPrefs`, refined in three ways:
   in-memory cache is touched in JS's single thread.)
 - **Best-effort durability** (atomic ≠ durable). A kill immediately after `set()` can *lose*
   the last write but never *corrupt* it — the same guarantee Unity gives. `flush()` and
-  flush-on-background close the gap.
+  flush-on-background NARROW the gap; they do not close it (see Gotchas — a `SIGKILL` loses a
+  flushed web write, measured).
 
 It is an engine-owned singleton, exported from the runtime barrel like `sceneManager` — a
 game just imports and calls it; there is no registration.
@@ -48,6 +49,7 @@ PlayerPrefs.delete(key): void                    // also: set(key, undefined)
 PlayerPrefs.keys(): string[]
 PlayerPrefs.clear(): void                         // empties THIS game's namespace
 PlayerPrefs.isHydrated(): boolean                 // true once init() has hydrated the cache
+PlayerPrefs.hasPendingWrite(key): boolean         // a write the backend has NOT accepted (see Gotchas)
 await PlayerPrefs.flush()                         // resolve once pending writes are durable
 ```
 
@@ -89,10 +91,46 @@ if (score > best) PlayerPrefs.set('bestScore', score);
 
 ## Gotchas
 
-- **Atomic ≠ durable.** A crash right after `set()` can lose that write; it is never partially
-  written. Call `flush()` at a save point you care about. On Android, `SharedPreferences.apply()`
-  is async-to-disk, so even an awaited `set()`/`flush()` is not a hard fsync — durability leans
-  on the OS lifecycle (that's what flush-on-background is for).
+- **Atomic ≠ durable, and `flush()` does NOT close that gap — it is not an fsync on ANY backend.**
+  A crash right after `set()` can lose that write; it is never partially written. `flush()` gets the
+  value to the *platform*, and then the platform decides when it reaches the platter:
+  - **Android** — `SharedPreferences.apply()` returns before the write hits disk.
+  - **Web / Electron** — `localStorage.setItem` is synchronous into Chromium's in-memory area, but
+    the on-disk LevelDB is committed on a **clean shutdown**. A `SIGKILL` loses every write since
+    the last commit.
+
+  **MEASURED on the editor** (2026-08-19, `games/anim-bug`, backend 5183): identical
+  `set()` + `await flush()` returning `pending:false`, with the raw `localStorage` entry confirmed
+  present, then —
+
+  | how the process ended | the flushed value after relaunch |
+  |---|---|
+  | `npm run editor:stop`, graceful (SIGTERM, exit hooks ran) | **survives** |
+  | `SIGKILL` immediately after `flush()` | **lost** |
+  | `SIGKILL` 8 s after `flush()` | **lost** |
+
+  Not a timing race — waiting does not help, because nothing commits until shutdown. ⚠️ This bites
+  the editor itself: `stop-editor.sh` falls back to `SIGKILL` when Electron does not exit within its
+  graceful window ("did not exit gracefully — forcing"), so the sanctioned stop CAN discard editor
+  prefs — no longer silently, and less often: the window was raised 5 s → 15 s after a
+  healthy-but-slow exit was measured at 10 s, and the force path now names what it drops. It also means a `kill -9`'d session's *deletes* revert — the old value is still the
+  last thing on disk.
+
+  So a game that must not lose progress cannot rely on `flush()` alone; it leans on the OS lifecycle
+  (that is what flush-on-background is for) and, where the value is irreversible, on being able to
+  re-derive the state from an authority that is not PlayerPrefs.
+- ⚠️ **`flush()` resolving does NOT mean the write landed, and reading it back cannot tell you.**
+  A rejected `backend.set()` (quota exceeded, a native I/O error) is caught in `drain()`, re-queued
+  into `dirty` and warned about — and `writeChain` still settles *fulfilled* so later writes are not
+  poisoned. Meanwhile `cache` keeps the value, so `get()` returns it happily. Every ordinary signal
+  says success. **`await flush()` then `hasPendingWrite(key)` is the only way to learn otherwise.**
+
+  This exists because the IAP ledger needs it (see [iap.md](./iap.md)): its durability check read
+  the value back and therefore could not fail, so it confirmed a grant that never reached the disk
+  and the purchase state machine then took an irreversible step on it. Any consumer gating something
+  irreversible on "is it saved?" must use this; a read-back is self-confirming. Still not an fsync —
+  `false` means the platform accepted it, not that it is on the platter.
+
 - **No cross-key transaction.** Two values that must stay consistent belong in **one** key.
 - **JSON only.** `undefined` deletes the key. A top-level function/symbol or a cyclic value is
   skipped with a warning (not stored). Nested functions are dropped by `JSON.stringify`;
@@ -100,6 +138,34 @@ if (score > best) PlayerPrefs.set('bestScore', score);
 - **Determinism.** `playerPrefs.ts` is under `runtime/**` and uses no wall-clock / randomness
   (the envelope has no timestamp/nonce), so it's safe for the verification harness — tests run
   against `InMemoryBackend` with `resetPlayerPrefsForTest()` in `afterEach`.
+
+## Agent surface
+
+`modoki_player_prefs` (read, `GET /api/player-prefs`) and `modoki_write_player_prefs` (write, `POST
+/api/player-prefs`) expose the store to an agent; `device_player_prefs` / `device_write_player_prefs`
+are the on-device twins. Split in two per `docs/mcp-tool-conventions.md` §7 ("if one argument value
+changes whether it writes to disk, it is more than one tool") — verified in the code: `get`/`keys`/
+`has`/`hasPendingWrite` are pure cache reads with no lazy hydration and no `scheduleFlush`, while
+`set`/`delete`/`clear` all dirty a key and schedule a durable write.
+
+Every reply names its `namespace`, and it must be read, not assumed: the editor deliberately
+hydrates `<gameId>@editor` (`engine/app/editor/setup.ts`) so a playtest save can't reach a shipped
+build's store, so prefs read through the editor are NOT the store a web/native build sees. An
+un-hydrated store REFUSES (`NOT_AVAILABLE_HERE`) rather than answering with an empty key list — the
+cache fills only in `init()`, and before that "no keys" and "nobody looked" are the same empty
+array. It gates writes too, and that half is sharper: a `set()` before `init()` lands in a throwaway
+cache under the `'default'` namespace that `init()` then clears — every signal says success and
+nothing survives.
+
+`set`/`delete` flush before replying, so `saved:true` means the backend accepted the durable write;
+a rejected write (quota, native I/O error) keeps its value in the cache, so a read-back structurally
+cannot see the failure (see `hasPendingWrite` above) — such a write reports PARTIAL, never success.
+`action` is required on the WRITE tool (the read takes only an optional `key`), and
+`action:'clear'` additionally requires `confirm:true` — one rule on both surfaces, and on the device
+the target is a real player's save data on an installed app.
+
+`PlayerPrefs` gained a `namespace()` getter for this (`runtime/storage/playerPrefs.ts`) — a key list
+is meaningless without knowing which store it came from.
 
 ## Related
 

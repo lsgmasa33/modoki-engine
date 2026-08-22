@@ -51,6 +51,7 @@ export default function DevicePicker({ preset, orientation, onSelect, onToggleOr
       // whole device name ellipsizes away and only the 📱 is left.
       minWidth: 120, flexShrink: 1 }}>
       <button
+        data-ui-id="gameView.devicePicker.trigger"
         onClick={() => setOpen((o) => !o)}
         title="Select device"
         style={{
@@ -80,6 +81,7 @@ export default function DevicePicker({ preset, orientation, onSelect, onToggleOr
           {/* Search + orientation toggle */}
           <div style={{ display: 'flex', gap: 6, padding: 6, borderBottom: '1px solid #333', alignItems: 'center' }}>
             <input
+              data-ui-id="gameView.devicePicker.search"
               ref={inputRef}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
@@ -90,6 +92,7 @@ export default function DevicePicker({ preset, orientation, onSelect, onToggleOr
               }}
             />
             <button
+              data-ui-id="gameView.devicePicker.orientation"
               onClick={onToggleOrientation}
               disabled={isFree}
               title={orientation === 'portrait' ? 'Switch to Landscape' : 'Switch to Portrait'}
@@ -115,6 +118,9 @@ export default function DevicePicker({ preset, orientation, onSelect, onToggleOr
                   return (
                     <button
                       key={d.name}
+                      // Keyed by the device NAME, not the row index: a search filters the list,
+                      // so an index-based hook would aim at a different device per query.
+                      data-ui-id={`gameView.devicePicker.device.${d.name}`}
                       onClick={() => { onSelect(d); setOpen(false); setQuery(''); }}
                       style={{
                         display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', width: '100%',

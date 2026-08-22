@@ -1,7 +1,7 @@
 {
   "name": "modoki-engine",
   "private": true,
-  "version": "0.4.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "Modoki — a Claude-friendly game engine + visual editor",
   "author": "Modoki",
@@ -14,8 +14,9 @@
     "node": ">=24"
   },
   "scripts": {
+    "upload:dsyms": "node engine/scripts/upload-dsyms.mjs",
     "dev": "vite --config engine/vite.config.ts",
-    "build:plugins": "npm run build --workspace engine/packages/capacitor-game-debug --workspace engine/packages/capacitor-litert-lm --workspace engine/packages/capacitor-modoki-ota",
+    "build:plugins": "npm run build --workspace engine/packages/capacitor-game-debug --workspace engine/packages/capacitor-litert-lm --workspace engine/packages/capacitor-modoki-ota --workspace engine/packages/capacitor-modoki-iap",
     "postinstall": "npm run build:plugins && node engine/scripts/bootstrap-mcp-deps.mjs && node engine/scripts/bootstrap-game-deps.mjs",
     "electron:build": "node engine/scripts/build-electron.mjs",
     "dev:electron": "npm run electron:build && electron engine/electron/dist/main.cjs",
@@ -51,6 +52,9 @@
     "coverage": "npm --prefix engine/packages/modoki test -- --coverage && cross-env MODOKI_COVERAGE_ENGINE_ONLY=1 vitest run --config engine/vite.config.ts --coverage && node engine/scripts/merge-coverage.mjs",
     "test:framework": "vitest run --config engine/vite.config.ts engine/tests/framework",
     "test:game": "vitest run --config engine/vite.config.ts engine/tests/game",
+    "test:court": "cross-env MODOKI_COURT_TESTS=1 vitest run --config engine/vite.config.ts games/court/tests",
+    "test:court:quick": "cross-env MODOKI_COURT_QUICK=1 vitest run --config engine/vite.config.ts games/court/tests",
+    "test:court:watch": "cross-env MODOKI_COURT_QUICK=1 vitest --config engine/vite.config.ts games/court/tests",
     "test:e2e": "playwright test --config engine/playwright.config.ts",
     "test:packaged": "bash engine/scripts/test-packaged.sh",
     "smoke:packaged": "bash engine/scripts/smoke-packaged.sh",
@@ -62,6 +66,10 @@
     "editor:ai": "MODOKI_BACKEND_PORT=5180 bash engine/scripts/launch-editor.sh games/3d-test",
     "editor:main:packaged": "MODOKI_BACKEND_PORT=5179 bash engine/scripts/test-packaged.sh games/3d-test",
     "editor:ai:packaged": "MODOKI_BACKEND_PORT=5180 bash engine/scripts/test-packaged.sh games/3d-test",
+    "device:claim": "node engine/scripts/device.mjs claim",
+    "device:release": "node engine/scripts/device.mjs release",
+    "device:list": "node engine/scripts/device.mjs list",
+    "device:run": "node engine/scripts/device.mjs run",
     "test:mcp:live": "npm --prefix engine/tools/modoki-mcp run test:live && npm --prefix engine/tools/modoki-mcp run smoke"
   },
   "dependencies": {

@@ -13,7 +13,7 @@ This file is the normative ritual. `CLAUDE.md` carries a short pointer to it.
 | Kind of thing | Home | Why |
 |---|---|---|
 | **Open, claimable work** — a bug to fix, a feature to build | **GitHub Issue** | Must be claimable across clones with no sync delay |
-| **Closed incident write-up** — root cause, wrong theories, the lesson | `docs/todo.md` "Issues", or folded into the feature doc | Code-adjacent, greppable, versioned with the code it describes. An Issue buries it behind search |
+| **Closed incident write-up** — root cause, wrong theories, the lesson | **The feature doc** for the subsystem it broke (`prefabs.md`, `scene-loading.md`, …) — NOT `todo.md`, which was cleared of them 2026-08-10 | Code-adjacent, greppable, versioned with the code it describes, and read by whoever next touches that subsystem. An Issue buries it behind search; a todo list buries it under everything else |
 | **Declined decision** — considered and rejected, with the trigger to revisit | `docs/todo.md` "Deferred decisions" | Its job is to stop the question being re-litigated; it is not work |
 | **Capability backlog** — "what a mature engine has that Modoki doesn't" | `docs/todo.md` "Missing features" | A roadmap, not claimable tasks. Promote an entry to an Issue when it becomes real work |
 
@@ -28,7 +28,7 @@ something, it stays in the repo.**
 gh issue list --state open                       # what's open
 gh issue list --state open --label "wip/work-ai2"  # what THIS clone already claimed
 # what's actually available to an agent right now:
-gh issue list --state open --search "-label:needs-owner -label:blocked -label:wip/main -label:wip/work-ai -label:wip/work-ai2 -label:wip/work-ai3 -label:wip/win"
+gh issue list --state open --search "-label:needs-owner -label:blocked -label:wip/main -label:wip/work-ai -label:wip/work-ai2 -label:wip/work-ai3 -label:wip/work-qa -label:wip/win"
 ```
 
 Anything carrying a `wip/*` label is **taken by another session** — pick something else,
@@ -58,6 +58,7 @@ The label is the claim. Derive it from the **current branch**, not the directory
 | `work-ai` | `wip/work-ai` | `~/Projects/modoki-ai` |
 | `work-ai2` | `wip/work-ai2` | `~/Projects/modoki-ai2` |
 | `work-ai3` | `wip/work-ai3` | `~/Projects/modoki-ai3` |
+| `work-qa` | `wip/work-qa` | `~/Projects/modoki-qa` |
 | `win` | `wip/win` | Windows machine |
 
 ```bash
@@ -117,7 +118,8 @@ gh issue edit <N> --remove-label "wip/$(git branch --show-current)"
 ```
 
 **Do not wait for the merge to close it.** GitHub only auto-closes on a commit reaching the
-**default branch** (`main`), and worker clones commit to `work-ai`/`work-ai2`/`work-ai3`/`win` — so
+**default branch** (`main`), and worker clones commit to
+`work-ai`/`work-ai2`/`work-ai3`/`work-qa`/`win` — so
 relying on the trailer alone leaves finished work sitting in the open list, indistinguishable
 from untouched work, until the owner next integrates. That is the stale-checkbox class the
 Issues migration existed to kill, reappearing one level up. Closing early costs nothing: the
@@ -140,8 +142,10 @@ dropped or a change reverted, reopen the issue; do not assume closed means shipp
 An Issue's value dies when it closes. Before landing a non-trivial fix, put the durable part
 — root cause, what the wrong theories were, the lesson — in the **feature doc** it belongs
 to, per [doc-conventions.md](./doc-conventions.md). The Issue tracks *that the work happened*;
-the repo explains *what was learned*. Several of the best entries in `docs/todo.md` record a
-diagnosis that was wrong for a day; that content must not evaporate into a closed ticket.
+the repo explains *what was learned*. The best of these write-ups record a diagnosis that was
+wrong for a day — see the prefab-persistence and scene-id incidents in
+[prefabs.md](./prefabs.md) and [scene-loading.md](./scene-loading.md) — and that content must
+not evaporate into a closed ticket.
 
 ## Filing new work
 
@@ -149,7 +153,7 @@ diagnosis that was wrong for a day; that content must not evaporate into a close
 gh issue create --title "..." --body "..."
 ```
 
-Write the body the way the good `docs/todo.md` entries are written — the measured evidence,
+Write the body the way the incident write-ups in the feature docs are written — the measured evidence,
 the file and line, what was ruled out — not a one-line summary. The detail is what makes an
 item actionable months later by a session with none of today's context.
 

@@ -79,6 +79,13 @@ export const SYSTEM_PRIORITY = {
    *  via object userData) while the sim is paused/stopped, exactly like AUDIO. Runs in
    *  the ECS pipeline (before the separate RENDER_3D frame callback reads the values). */
   MATERIAL: 260,
+  /** Scroll-view entry pooling — presentation tier (priority 270), AFTER transform propagation
+   *  and >= TRANSFORM so it keeps RECYCLING while the sim is paused, exactly like AUDIO and
+   *  MATERIAL. That is not a nicety: a settings list, a pause menu and a level select are
+   *  precisely the views you scroll while paused, and a sim-gated pool would let the native DOM
+   *  scroll keep moving while entries went stale or blank. Below PROJECTION (300) so the UI
+   *  tree rebuild sees this frame's entry writes. */
+  UI_ENTRIES: 270,
   /** Projections / store sync — after all state changes (priority 300) */
   PROJECTION: 300,
 } as const;

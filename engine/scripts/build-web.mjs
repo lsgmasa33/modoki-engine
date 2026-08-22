@@ -16,6 +16,7 @@ import path from 'node:path';
 import { isProjectDir } from './projectRoots.mjs';
 import { parseBuildTarget } from './buildTarget.mjs';
 import { scopedTsconfigContent } from './scopedTsconfig.mjs';
+import { chooseViteConfig } from './viteConfigChoice.mjs';
 import { loadEnginePluginModule } from './loadVendorPlugins.mjs';
 
 // --target parsing lives in buildTarget.mjs (pure, unit-tested) — see its header comment for
@@ -47,8 +48,9 @@ if (proj) {
 // The scoped-config SHAPE (extends + exclude restatement) is shared with
 // typecheck-projects.mjs (#24's per-project CI sweep) via scopedTsconfig.mjs — see
 // that module's header comment for why `exclude` has to be restated here at all.
+// The write itself is deferred to just before the typecheck actually runs (see the
+// `existsSync(tscBin)` branch below) — see that branch's comment for why.
 const scopedPath = path.join(engineDir, 'tsconfig.app.scoped.json');
-writeFileSync(scopedPath, JSON.stringify(scopedTsconfigContent(include), null, 2) + '\n');
 
 // Invoke tsc/vite via their resolved JS entrypoints with THIS node (process.execPath),
 // not via a bare `tsc`/`vite` on PATH. Reasons: the packaged editor runs this as
@@ -175,12 +177,47 @@ try {
   // and an EXTERNAL project's game code isn't in the tsc scope anyway — see `include`
   // above). vite transpiles TS via esbuild, so the actual build needs no typescript.
   if (existsSync(tscBin)) {
+    // Written HERE, not unconditionally at module load: a packaged install's `engine/`
+    // is the app's own read-only install directory (e.g. an admin-elevated `C:\Program
+    // Files\...` on Windows — writable only during install, not by the running,
+    // unelevated app), and this branch not firing there (no tsc shipped) is exactly what
+    // makes the write unnecessary too. Doing it unconditionally EPERM'd every build from
+    // such an install, dev or packaged, before the target-specific work even started.
+    writeFileSync(scopedPath, JSON.stringify(scopedTsconfigContent(include), null, 2) + '\n');
     run(`${q(node)} ${q(tscBin)} -p engine/tsconfig.app.scoped.json`); // app + active game (scoped)
     run(`${q(node)} ${q(tscBin)} -p engine/tsconfig.node.json`);        // vite config / electron
   } else {
     console.log('[build-web] typescript not installed — skipping typecheck (packaged build).');
   }
-  run(`${q(node)} ${q(viteBin)} build --config engine/vite.config.ts`);
+  // ⚠️ Do NOT add `--configLoader runner` here (tried in bug vSlzfZLr7pIX5Yw0RSSe, reverted).
+  // It fixes the `.vite-temp` EPERM below by never bundling the config to disk, but its
+  // module runner is torn down once config-loading finishes — so ANY plugin hook that does
+  // a dynamic `import()` LATER in the build (writeBundle, generateBundle — exactly what
+  // rigged-model-optimize.ts's `@gltf-transform/*` imports and the SSR-postprocessor loader
+  // in vite-asset-scanner.ts both do) throws "Vite module runner has been closed". Proved
+  // with a two-line repro: a plugin doing `await import('node:fs/promises')` from
+  // `writeBundle` fails under `--configLoader runner` and succeeds under the default loader.
+  // `--configLoader native` avoids both problems but requires every relative import under
+  // `engine/` to carry a real extension (Node's native ESM resolution, unlike Vite's own,
+  // does not guess `.ts`) — this repo's plugin tree does not, so native fails to even load
+  // vite.config.ts. The `.vite-temp` EPERM on an admin-elevated (`Program Files`) install is
+  // instead fixed at the INSTALLER, not here: build/installer.nsh grants write access to
+  // just that one subfolder from the (elevated) install step — see its own comment.
+  //
+  // ⚠️ macOS: the same `.vite-temp` write lands INSIDE the signed .app (`REPO_ROOT` is
+  // `<Resources>/app.asar.unpacked` when packaged). There it is an integrity seal rather than a
+  // permission, and the write SUCCEEDS silently. Measured 2026-08-22: on a build that completes,
+  // Vite unlinks the temp file and leaves an EMPTY directory, which `codesign` does not seal — so
+  // this alone does not persistently invalidate the signature. It does leave a window during the
+  // build where the bundle is invalid, and a build that dies mid-config-load leaves the file. The
+  // persistent seal breaks measured on the v0.5.2 rc came from two other writers, both since
+  // fixed: `engine/tsconfig.app.scoped.json` (3df0e65d4) and the `.modoki/` backend state
+  // (ed17ff8a2). Do not re-derive that from this comment — re-measure, per QA-PKG-0009 step 7.
+  //
+  // Either way the packaged editor should not write inside its own bundle at all, and the fix is
+  // to hand Vite a CJS config, whose loader branch compiles in memory. Which config, and why the
+  // choice is by file existence, is `viteConfigChoice.mjs` — not restated here.
+  run(`${q(node)} ${q(viteBin)} build --config ${chooseViteConfig(engineDir)}`);
 } catch (e) {
   // A failing CHILD already printed its diagnostics via inherited stdio, so re-printing would
   // duplicate them — that is what the bare `catch` here was for, and it stays right for `run()`.

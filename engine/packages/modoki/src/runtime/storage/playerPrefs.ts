@@ -10,7 +10,12 @@
  *     JS's single thread.
  *   - DURABILITY IS BEST-EFFORT (atomic ≠ durable): a kill right after `set()` can
  *     lose the last write but never corrupt it — the guarantee Unity gives. Call
- *     `flush()` (before quit / on background) to make pending writes durable.
+ *     `flush()` (before quit / on background) to push pending writes to the platform.
+ *     ⚠️ `flush()` is NOT an fsync on any backend: it resolves once the platform has
+ *     ACCEPTED the write, and the platform decides when that reaches the platter.
+ *     On web/Electron, Chromium commits the localStorage area on a CLEAN SHUTDOWN, so
+ *     a SIGKILL loses a flushed write — measured, and waiting does not help (see
+ *     docs/player-prefs.md § Gotchas for the three-arm measurement).
  *
  *  Shape mirrors the engine's other singletons (audioService, sceneManager): a
  *  module singleton games `import { PlayerPrefs } from '@modoki/engine/runtime'` and
@@ -238,6 +243,47 @@ function isHydrated(): boolean {
   return hydrated;
 }
 
+/** The namespace these keys live under — the sanitized `init({namespace})`, or `'default'`
+ *  before init.
+ *
+ *  Exposed because a key list is meaningless without it. The same game has SEPARATE stores
+ *  depending on where it runs: a real build uses the game's own namespace, while the editor
+ *  deliberately hydrates `<gameId>@editor` so playtest experiments cannot write into the save a
+ *  shipped build reads (`app/editor/setup.ts`). Anything reporting prefs back to a human or an
+ *  agent has to say WHICH store it looked in, or "the key is not there" is unanswerable. */
+function getNamespace(): string {
+  return namespace;
+}
+
+/**
+ * Does this key still have a write the backend has NOT accepted?
+ *
+ * ⚠️ **Read this together with `flush()`, because `flush()` resolving does not mean the write
+ * landed.** A rejected `backend.set()` (quota exceeded, a native I/O error) is caught in `drain()`,
+ * re-queued into `dirty`, and warned about — and `writeChain` still settles *fulfilled* so later
+ * writes are not poisoned. Meanwhile `cache` keeps the value, so `get()` happily returns it. Every
+ * signal a caller normally has says the write succeeded.
+ *
+ * So: `await flush()` then `hasPendingWrite(key)` is the only way to learn that it did not.
+ *
+ * This exists for the purchase ledger (#196), where the distinction is money. Its durability check
+ * read the value back through `get()` and therefore could not fail: it was re-reading the
+ * optimistic cache, so it confirmed a grant that had never reached the disk, and the state machine
+ * then FINISHED the transaction — telling the store to stop re-delivering a purchase whose record
+ * was about to vanish on the next launch. Nothing else in the engine cares this much; nothing else
+ * has an irreversible step gated on the answer.
+ *
+ * NOTE this still is not an fsync — `false` means "the platform ACCEPTED it", not "it is on the
+ * platter", and that holds on EVERY backend, not just the native one: Android's
+ * `SharedPreferences.apply()` is async-to-disk, and on web/Electron Chromium commits the
+ * localStorage area only on a clean shutdown, so a SIGKILL loses a flushed write. This function
+ * therefore separates "the backend rejected it" from "the backend took it" — never "it is safe".
+ * See docs/player-prefs.md § Gotchas.
+ */
+function hasPendingWrite(key: string): boolean {
+  return dirty.has(key);
+}
+
 export const PlayerPrefs = {
   init,
   get,
@@ -248,6 +294,8 @@ export const PlayerPrefs = {
   clear,
   flush,
   isHydrated,
+  namespace: getNamespace,
+  hasPendingWrite,
 } as const;
 
 // ── Test seam ─────────────────────────────────────────────────────

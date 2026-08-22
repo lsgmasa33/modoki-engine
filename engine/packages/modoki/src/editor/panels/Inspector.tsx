@@ -29,7 +29,7 @@ import { AssetRefField } from './AssetRefField';
 import { parseClipBank, stringifyClipBank, type ClipBankEntry } from '../../runtime/audio/clipBank';
 import { SpriteAnimatorSection } from './SpriteAnimatorSection';
 import { AnimatorClipsSection } from './AnimatorClipsSection';
-import { FieldLabel, NumberField, DropdownField, ColorField, Section, SubSection, DEFAULT_COLOR, colorToHex } from './assetViews/widgets';
+import { FieldLabel, NumberField, DropdownField, ColorField, Section, SubSection, DEFAULT_COLOR, colorToHex, writeMetaOrWarn } from './assetViews/widgets';
 import { defaultForHint, FieldValueWidget, EntityRefField, useWorldDirtyTick } from './inspectorFields';
 import { AddComponentPicker } from './AddComponentPicker';
 import { UIActionBindingsField } from './UIActionBindingsField';
@@ -239,13 +239,14 @@ function AnchorPickerField({ value, onChange, mixed = false }: { value: string; 
 // colorToHex + ColorField moved to ./assetViews/widgets (F2); imported above.
 // colorToHex is re-exported (near defaultForHint) for back-compat (tests import it).
 
-function VecField({ label, fields, data, onChange, overriddenKeys, mixedKeys }: {
+function VecField({ label, fields, data, onChange, overriddenKeys, mixedKeys, traitName }: {
   label: string;
   fields: { key: string; hint: FieldHint }[];
   data: Record<string, unknown>;
   onChange: (key: string, v: number) => void;
   overriddenKeys?: Set<string>;
   mixedKeys?: Set<string>;
+  traitName: string;
 }) {
   // Derive short labels: strip common prefix, use last distinct part
   // e.g. [lookAtX, lookAtY, lookAtZ] → [X, Y, Z], [near, far] → [Near, Far].
@@ -282,6 +283,7 @@ function VecField({ label, fields, data, onChange, overriddenKeys, mixedKeys }: 
               <BufferedNumberInput value={parseFloat(displayVal.toFixed(2))} step={f.hint.step || 0.1} mixed={isMixed} readOnly={f.hint.readOnly}
                 onChange={(v) => onChange(f.key, isDeg ? v * (Math.PI / 180) : v)}
                 min={isDeg ? undefined : f.hint.min} max={isDeg ? undefined : f.hint.max}
+                dataUiId={`inspector.field.${traitName}.${f.key}`}
                 style={{ ...inputStyle, flex: 1, minWidth: 0, color: isOv ? '#5dade2' : '#ddd', fontWeight: isOv ? 'bold' : 'normal', ...(f.hint.readOnly ? readOnlyFieldStyle : null) }} />
             </div>
           );
@@ -950,6 +952,7 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
           <FieldLabel label={key} hint={labelHint} style={{ width: 50, color: ov ? '#5dade2' : '#888', fontSize: '11px', fontWeight: ov ? 'bold' : 'normal' }} />
           <BufferedNumberInput value={val as number} step={hint.step ?? 1} mixed={mx} min={hint.min} max={hint.max}
             onChange={v => write(key, v)} readOnly={stretchDisabled}
+            dataUiId={`inspector.field.${meta.name}.${key}`}
             style={{ flex: 1, background: '#111', color: '#ddd', border: '1px solid #444', borderRadius: 3, padding: '2px 4px', fontSize: '12px', fontFamily: 'monospace' }} />
           <select value={isMixed(unitKey) ? '' : unit} onChange={e => { if (e.target.value !== '') write(unitKey, e.target.value); }} disabled={stretchDisabled}
             style={{ background: '#111', color: '#ddd', border: '1px solid #444', borderRadius: 3, padding: '2px 2px', fontSize: '11px', fontFamily: 'monospace', cursor: 'pointer' }}>
@@ -967,7 +970,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     if (hint.type === 'number') {
       const disabledByAnchor = selfPlacementDisabled(key);
       return <div key={key} style={{ ...(ov ? overrideStyle : {}), ...(disabledByAnchor ? { opacity: 0.35 } : {}) }}><NumberField label={key} value={val as number} step={hint.step}
-        readOnly={hint.readOnly || disabledByAnchor} wide onChange={(v) => write(key, v)} overrideColor={ov} hint={hint} mixed={mx} /></div>;
+        readOnly={hint.readOnly || disabledByAnchor} wide onChange={(v) => write(key, v)} overrideColor={ov} hint={hint} mixed={mx}
+        dataUiId={`inspector.field.${meta.name}.${key}`} /></div>;
     }
     if (hint.type === 'string') {
       if (meta.name === 'PrefabInstance' && key === 'source' && val) {
@@ -1004,7 +1008,7 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
             if (e?.type === 'sprite' && e.sprite) { write('pivotX', e.sprite.pivot.x); write('pivotY', e.sprite.pivot.y); }
           }
         : (v: string) => write(key, v);
-      return <div key={key} style={ov ? overrideStyle : undefined}><AssetRefField label={key} value={val as string} onChange={onChangeRef} overrideColor={ov} accept={hint.accept} mixed={mx} fontFamilyRef={key === 'fontFamily'} editorPanel={hint.editorPanel} /></div>;
+      return <div key={key} style={ov ? overrideStyle : undefined}><AssetRefField label={key} value={val as string} onChange={onChangeRef} overrideColor={ov} accept={hint.accept} mixed={mx} editorPanel={hint.editorPanel} /></div>;
     }
     if (hint.type === 'color') {
       // A color field can fold a sibling 0..1 field into an A slider (hint.alphaField),
@@ -1036,18 +1040,20 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
       return <div key={key} style={{ ...(ov ? overrideStyle : {}), ...(enumDisabled ? { opacity: 0.35 } : {}) }}><DropdownField label={key} value={val as string} options={opts} onChange={(v) => write(key, v)} hint={hint} mixed={mx} disabled={enumDisabled} /></div>;
     }
     if (hint.type === 'boolean') {
-      // UIAnchor.safeArea only takes effect on a STRETCHED anchor: safe-area padding
-      // insets a stretched container's children from the notch/home-indicator; on a
-      // non-stretched element it does nothing (the runtime gates it — see anchorCss).
-      // Disable the checkbox there so the UI doesn't imply an effect it won't have.
-      const safeAreaInert = meta.name === 'UIAnchor' && key === 'safeArea' && (() => {
-        const anc = data.anchor as string;
-        return !(STRETCH_X.includes(anc) || STRETCH_Y.includes(anc));
-      })();
+      // UIAnchor.safeArea is inert on exactly ONE anchor: `center`, which reaches no
+      // screen edge and so has no notch or home indicator to clear. Every other anchor
+      // takes one of the two arms — a stretched anchor PADS (its children move away from
+      // the edge), a point anchor OFFSETS (its own box moves inward) — see anchorCss.
+      // ⚠️ This used to disable the checkbox for every non-stretched anchor, back when
+      // the runtime really did nothing there. That was the defect, not the explanation
+      // for it: a corner-anchored badge could not clear the camera at all, and the greyed
+      // box told authors it was working as intended (#272).
+      const safeAreaInert = meta.name === 'UIAnchor' && key === 'safeArea'
+        && (data.anchor as string) === 'center';
       // The reason moved off `title=` and onto the label's Tooltip: native tooltips
       // never render in this Electron build, so this explanation was unreadable.
       const safeAreaHint = safeAreaInert
-        ? { ...hint, tooltip: 'Safe Area only applies to a stretched anchor — it insets a container’s children from the notch/home-indicator. No effect on a non-stretched element.' }
+        ? { ...hint, tooltip: 'Safe Area has no effect on a centered anchor — it reaches no screen edge, so there is no notch or home indicator to clear.' }
         : hint;
       return (
         <label key={key}
@@ -1068,7 +1074,7 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     const mxKeys = new Set(groupFields.filter((f) => isMixed(f.key)).map((f) => f.key));
     return (
       <div key={`group:${name}`} style={ovKeys.size > 0 ? overrideStyle : undefined}>
-        <VecField label={name} fields={groupFields} data={data} onChange={(key, v) => write(key, v)} overriddenKeys={ovKeys} mixedKeys={mxKeys} />
+        <VecField label={name} fields={groupFields} data={data} onChange={(key, v) => write(key, v)} overriddenKeys={ovKeys} mixedKeys={mxKeys} traitName={meta.name} />
       </div>
     );
   };
@@ -1282,6 +1288,17 @@ function AssetBatchInspector({ assets }: { assets: SelectedAsset[] }) {
 
 function AssetInspector({ asset }: { asset: SelectedAsset }) {
   const [postprocessor, setPostprocessor] = useState('none');
+  // The FULL sidecar, kept so a postprocessor change MERGES into it. `/api/write-meta` REPLACES
+  // the file (`writeMetaSidecar` → `writeJsonAtomic`, no merge on the server), so posting a bare
+  // `{version:1, postprocessor}` — which this did — destroyed every other key. On a real model
+  // (demos/forest-camp/…/char_Ranger.glb.meta.json) that is `id`, `rig`, `generated` and
+  // `modelCache`: the asset's STABLE GUID, so every scene and mesh ref to it dangles and the next
+  // scan mints a new one; the derived-file cleanup list; and the LOD block. It also downgraded
+  // `version` 2 → 1. Every other writer in the editor spreads the loaded meta first; these two
+  // (here and ModelBatchView, which did it to every selected model at once) did not.
+  // A ref, not state: nothing RENDERS from it — it exists only so the change handler can merge
+  // into the sidecar it loaded, so writing it must not re-render.
+  const metaRef = useRef<Record<string, unknown> | null>(null);
   const [metaLoaded, setMetaLoaded] = useState(false);
   const postprocessorIds = getModelPostprocessorIds();
 
@@ -1292,7 +1309,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
     const ac = new AbortController();
     backendFetch(`/api/read-meta?path=${encodeURIComponent(asset.path)}`, { signal: ac.signal })
       .then(r => r.ok ? r.json() : {})
-      .then((meta: Record<string, unknown>) => { if (meta.postprocessor) setPostprocessor(meta.postprocessor as string); setMetaLoaded(true); })
+      .then((m: Record<string, unknown>) => { metaRef.current = m; if (m.postprocessor) setPostprocessor(m.postprocessor as string); setMetaLoaded(true); })
       .catch(e => { if (e.name !== 'AbortError') setMetaLoaded(true); });
     return () => ac.abort();
   }, [asset.path, asset.type]);
@@ -1300,10 +1317,11 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
   // Persist postprocessor to meta when changed
   const handlePostprocessorChange = useCallback((newPostprocessor: string) => {
     setPostprocessor(newPostprocessor);
-    backendFetch('/api/write-meta', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: asset.path, meta: { version: 1, postprocessor: newPostprocessor } }),
-    }).catch(() => {});
+    const updated = { ...(metaRef.current ?? {}), version: 2, postprocessor: newPostprocessor };
+    metaRef.current = updated;
+    // writeMetaOrWarn, not a raw fetch with `.catch(() => {})` — that swallow-catch is exactly
+    // the pattern it exists to replace (a dev-server outage looked like a successful edit).
+    void writeMetaOrWarn(asset.path, updated);
   }, [asset.path]);
 
   return (

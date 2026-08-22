@@ -183,7 +183,7 @@ function mockDeps() {
     const cacheMap = new Map<string, any>();
     const unloaded: string[] = [];
     const Assets = {
-      cache: { has: (url: string) => cacheMap.has(url) },
+      cache: { has: (url: string) => cacheMap.has(url), remove: (url: string) => cacheMap.delete(url) },
       get: (url: string) => cacheMap.get(url),
       load: (url: string) => {
         const t = cacheMap.get(url) ?? { width: 32, height: 32, source: { style: {} } };

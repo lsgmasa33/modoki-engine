@@ -27,6 +27,7 @@ import { getAllTraits } from '../core/ecs/traitRegistry';
 import { resolveKootaSchema } from './sceneSchema';
 import { resolveSceneChain, type SceneRef, type FetchSceneMeta } from './sceneChain';
 import { emit } from '../core/journal';
+import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { clearAllOverrideMarks, getOverrideMarkSet, markOverride } from '../loaders/overrideMarks';
 import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
 import { SCENE_FORMAT_VERSION } from '../core/version';
@@ -43,7 +44,8 @@ import {
 import { acquireRiggedModel } from '../loaders/riggedModelCache';
 import { acquireAudio } from '../loaders/audioBufferCache';
 import { acquireFont } from '../loaders/fontAtlasLoader';
-import { registerAsset, isGuid, resolveRef, resolveGuidToPath, getAudioLoadType } from '../loaders/assetManifest';
+import { loadFontFamily, loadFontFamilyForRef } from '../loaders/fontLoader';
+import { registerAsset, isGuid, resolveGuidToPath, getAudioLoadType } from '../loaders/assetManifest';
 import { loadTimelineNow } from '../loaders/timelineCache';
 import { collectTimelineAudioRefs, collectTimelineControlRefs, collectTimelineVideoRefs } from '../timeline/types';
 import { ASSET_FETCH_INIT, parseAssetJson } from '../loaders/assetFetch';
@@ -259,6 +261,9 @@ class SceneManagerImpl implements SceneManager {
    *  complete and the new scene is active. Rejects if the load fails or is
    *  aborted (the current scene remains untouched on failure). */
   async loadScene(path: string, opts: LoadOptions = {}): Promise<void> {
+    // Boot timeline (#238): the whole load, plus a span per phase below. Always on — a cold boot
+    // has nobody there to switch a profiler on, and the boot stall is only reproducible cold.
+    const loadSpan = beginBootSpan('scene-load', path);
     // 1. Cancel in-flight load
     if (this.nextLoad) {
       this.nextLoad.controller.abort();
@@ -299,6 +304,13 @@ class SceneManagerImpl implements SceneManager {
       } else {
         // assetUrl() is a no-op in dev/native (BASE_URL '/'), prefixes for sub-path web
         // hosting, and resolves to the inlined blob: URL in a playable single-file build.
+        // try/finally, NOT a bare end after the await: `parseAssetJson` throws on the editor's
+        // candidate-path walk (see below — a miss returns 200 + index.html), which is a normal boot
+        // path, and a leaked span is not merely missing. `bootSpansOverlapping` treats an open span
+        // as running to the end of the window, so a dead fetch would rank FIRST in a later stall
+        // attribution — the instrument confidently naming something that finished seconds earlier.
+        const fetchSpan = beginBootSpan('scene-fetch-json', path);
+        try {
         const res = await fetch(assetUrl(path), { signal: controller.signal, ...ASSET_FETCH_INIT });
         if (!res.ok) throw new Error(`Failed to fetch scene "${path}": HTTP ${res.status}`);
         // parseAssetJson, not res.json(): the dev server answers an unknown path with a 200 OK
@@ -309,6 +321,7 @@ class SceneManagerImpl implements SceneManager {
         // path, and the resulting red console error is indistinguishable from a real failure to
         // `smoke-packaged.sh` / `assert-app-renders.sh`, both of which fail on ANY console error.
         data = await parseAssetJson(res, path) as SceneData;
+        } finally { endBootSpan(fetchSpan); }
       }
       // Register scene id in the manifest so the editor can recover it on save
       const sceneGuid = (data as { id?: string }).id;
@@ -357,7 +370,8 @@ class SceneManagerImpl implements SceneManager {
         if (g && isGuid(g)) registerAsset(g, basePath, 'scene');
         return { guid: g && isGuid(g) ? g : `path:${basePath}`, path: basePath, baseScene: cached!.baseScene };
       };
-      const { chain: newChain, warnings: chainWarnings } = await resolveSceneChain(path, fetchSceneMeta);
+      const { chain: newChain, warnings: chainWarnings } = await bootSpanAsync(
+        'scene-resolve-chain', () => resolveSceneChain(path, fetchSceneMeta), path);
       for (const w of chainWarnings) console.warn(w);
 
       if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -424,7 +438,8 @@ class SceneManagerImpl implements SceneManager {
       for (const ref of toLoadRefs) {
         const sceneData = ref === primaryRef ? data : rawSceneCache.get(ref.path)!;
         const sid = sceneIdByPath.get(ref.path)!;
-        const refs = await this.collectSceneResourceRefs(sid, sceneData, controller);
+        const refs = await bootSpanAsync(
+          'scene-collect-refs', () => this.collectSceneResourceRefs(sid, sceneData, controller), ref.path);
         perSceneRefs.set(ref.path, refs);
         preparedSceneData.set(ref.path, sceneData);
       }
@@ -438,6 +453,8 @@ class SceneManagerImpl implements SceneManager {
       // no-op via the cache but ensures the refcount is set. Remaining resources
       // (models, meshes, materials, environments, fonts) fetch here in parallel,
       // one scene at a time (parallel WITHIN a scene, same as today).
+      const acquireSpan = beginBootSpan('scene-acquire-resources', `${totalResources} refs`);
+      try {
       for (const ref of toLoadRefs) {
         const sid = sceneIdByPath.get(ref.path)!;
         await Promise.all(perSceneRefs.get(ref.path)!.map(async (r) => {
@@ -446,6 +463,7 @@ class SceneManagerImpl implements SceneManager {
           opts.onProgress?.(loadedCount, totalResources);
         }));
       }
+      } finally { endBootSpan(acquireSpan); }
 
       if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
@@ -525,6 +543,8 @@ class SceneManagerImpl implements SceneManager {
         const beforeIds = new Set<number>();
         for (const e of stagingWorld.entities) beforeIds.add((e as unknown as { id(): number }).id());
 
+        const spawnSpan = beginBootSpan('scene-spawn-entities', ref.path);
+        try {
         await loadSceneFile(sceneData, {
           world: stagingWorld,
           clearMarks: false, // once-per-world clear above owns this (A9 defect 1)
@@ -622,6 +642,7 @@ class SceneManagerImpl implements SceneManager {
           },
           loadModels: false, // already preloaded above
         });
+        } finally { endBootSpan(spawnSpan); }
 
         if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
@@ -730,7 +751,7 @@ class SceneManagerImpl implements SceneManager {
         // Transient: this singleton is MATERIALIZED here, not authored — so it must
         // never be written back to whichever scene happens to be saved next. Without
         // the tag a save silently GREW any scene lacking a Time entity by one
-        // (measured on ui-focus-demo.json, 9 → 10 entities, docs/todo.md), which is a
+        // (measured on ui-focus-demo.json, 9 → 10 entities; see docs/scene-loading.md), which is a
         // counter-example to the A10 "a no-op save is a no-op" invariant. Worse for a
         // BASE scene: the foreign-entity filter in serialize.ts skips any entity
         // without EntityAttributes, and this one has none, so it lands in EVERY file
@@ -760,7 +781,10 @@ class SceneManagerImpl implements SceneManager {
       // we flip setCurrentWorld. This eliminates the first-frame shader-compile
       // stutter after swap. Hooks are best-effort — failures are logged and the
       // swap proceeds anyway.
-      await this.fireBeforeSwapHooks(nextWorld);
+      // This is where shader PREWARM happens (a renderer hook compiling against the staging
+      // world) — one of the three boot phases #238 names, and the reason this span is separate.
+      const swapWorld = nextWorld;
+      await bootSpanAsync('scene-before-swap-hooks', () => this.fireBeforeSwapHooks(swapWorld));
 
       if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
@@ -853,8 +877,8 @@ class SceneManagerImpl implements SceneManager {
       // an in-game swap keeps them running), then the new scene's scene-scoped
       // managers. Awaited so async init (e.g. entity spawning) completes before
       // loadScene resolves.
-      if (gameChanged) await initGameManagersFor(nextGameId, path);
-      await initSceneManagersFor(path);
+      if (gameChanged) await bootSpanAsync('game-managers-init', () => initGameManagersFor(nextGameId, path));
+      await bootSpanAsync('scene-managers-init', () => initSceneManagersFor(path), path);
 
       // 12. Done
     } catch (err) {
@@ -867,6 +891,7 @@ class SceneManagerImpl implements SceneManager {
       if (this.nextLoad?.id === id) this.nextLoad = null;
       throw err;
     } finally {
+      endBootSpan(loadSpan);
       opts.signal?.removeEventListener('abort', externalAbort);
     }
   }
@@ -915,13 +940,20 @@ class SceneManagerImpl implements SceneManager {
       const def = await loadTimelineNow(tRef.path);
       if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
       if (!def) continue;
+      // The GUID goes in AS-IS — `acquireAudio` resolves it itself, exactly like prefabs and
+      // video below, and exactly like every audio resource a scene file authors (checked: every
+      // `type:'audio'` entry in games/ + demos/ is a GUID). This line used to pre-resolve the
+      // GUID to a path, which made the ref resolve TWICE: `acquireAudio` → `refToPath` →
+      // `resolveRef(<internal path>)`, which correctly rejects an internal path
+      // ("[assetManifest] path reference no longer supported — use a GUID"), bailed, and left the
+      // clip un-preloaded — so a timeline audio cue never played and every boot logged the error
+      // (QA-GAME-0001, timeline-demo). Invisible to `assetRefIntegrity`, which scans committed
+      // data: this path only ever existed at runtime.
       for (const cueRef of collectTimelineAudioRefs(def)) {
-        const audioPath = isGuid(cueRef) ? resolveRef(cueRef) : cueRef;
-        if (audioPath) addRef({ type: 'audio', path: audioPath });
+        if (cueRef) addRef({ type: 'audio', path: cueRef });
       }
       // Prefab resources carry the GUID (not a resolved path) — matching the entity collector's
-      // PrefabInstance.source refs, since acquirePrefab resolves the GUID itself. (Audio above
-      // carries the resolved path; the two resource kinds differ by convention.)
+      // PrefabInstance.source refs, since acquirePrefab resolves the GUID itself.
       for (const prefabRef of collectTimelineControlRefs(def)) {
         if (prefabRef) addRef({ type: 'prefab', path: prefabRef });
       }
@@ -1294,17 +1326,17 @@ function snapshotPersistentEntities(world: World, keptBaseGuids: Set<string> = n
     entriesById.set(id, entry);
   }
 
-  // Return in ECS-ID order, not BFS/subtree order (scene-loading.md,
-  // Phase 3 — the owner-chosen fix for the "carry" half of the entity-order churn
-  // Phase 0 measured). This array becomes `loadSceneFile`'s spawn order for these
-  // entities (SceneManager.ts's carry-respawn call passes it straight through as
-  // `data.entities`), which in turn is the array order `serializeScene` later
-  // reproduces on save. A COLD load spawns a scene's entities in FILE order —
-  // ecs ids are handed out sequentially by a fresh world's allocator — so id
-  // order and file order coincide there. Reproducing that same id order here
-  // means a base scene saved after being CARRIED across a swap comes out in the
-  // same order as one saved after a cold load, instead of BFS's subtree-grouped
-  // order (which regroups by root→children and doesn't match the file at all).
+  // Return in ECS-ID order, not BFS/subtree order (scene-loading.md, Phase 3 — the
+  // owner-chosen fix for the "carry" half of the entity-order churn Phase 0 measured).
+  // This array becomes `loadSceneFile`'s spawn order for these entities (the
+  // carry-respawn call below passes it straight through as `data.entities`).
+  //
+  // It no longer decides the SAVED order: `serializeScene` sorts into Hierarchy display
+  // order (parents first, siblings by sortOrder, guid tiebreak) regardless of how the
+  // scene was loaded (QA-HIER-0002), so a carried save and a cold-loaded save now agree
+  // by construction rather than by keeping this in step with the allocator. Kept as-is
+  // because spawn order is still the cheapest stable choice here and nothing gains from
+  // churning it.
   // Parent-before-child is NOT required: `loadSceneFile` spawns every entity in
   // pass 1, then resolves every `parentId` in pass 2, after the full array has
   // already been spawned — order-independent by construction.
@@ -1312,7 +1344,24 @@ function snapshotPersistentEntities(world: World, keptBaseGuids: Set<string> = n
 }
 
 /** Dispatch to the right typed acquire function based on resource type. */
+/** Resource kinds that actually FETCH or DECODE something. The rest are manifest-only entries
+ *  (listed so the build tree-shaker keeps the file; the runtime lazy-loads them elsewhere), so
+ *  spanning them would spend the boot timeline's cap on hundreds of zero-length rows and push
+ *  the real work off the end of it. */
+const LOADING_RESOURCE_TYPES: ReadonlySet<string> = new Set([
+  'model', 'riggedModel', 'mesh', 'material', 'prefab', 'font', 'environment', 'audio',
+]);
+
+/** Per-resource boot spans (#238). The stall being hunted is per-project and bimodal, and the
+ *  hypothesis-driven attributions from frame markers were wrong three times — so this records
+ *  WHICH asset was open when, and lets the read intersect that with the stall window rather
+ *  than inferring a cause from the aggregate. */
 async function acquireResource(sceneId: SceneId, ref: SceneResourceRef): Promise<void> {
+  if (!LOADING_RESOURCE_TYPES.has(ref.type)) return acquireResourceInner(sceneId, ref);
+  return bootSpanAsync(`acquire:${ref.type}`, () => acquireResourceInner(sceneId, ref), ref.path);
+}
+
+async function acquireResourceInner(sceneId: SceneId, ref: SceneResourceRef): Promise<void> {
   switch (ref.type) {
     case 'model':    return acquireModel(sceneId, ref.path, ref.postprocessor);
     case 'riggedModel': return acquireRiggedModel(sceneId, ref.path);
@@ -1378,9 +1427,31 @@ async function acquireResource(sceneId: SceneId, ref: SceneResourceRef): Promise
       // Two kinds share this resource type. A GUID ref is an SDF font (Text3D/
       // Text2D.font) — acquire it scene-scoped so it's loaded BEFORE the old scene
       // is released (cross-swap survival) and refcounted via releaseFontsForScene.
-      // A non-GUID ref is a CSS family NAME (UIElement.fontFamily), loaded globally
-      // via the FontFace loader (loadAllFonts) — no scene-scoped hold needed.
-      if (isGuid(ref.path)) { await acquireFont(sceneId, ref.path); }
+      if (isGuid(ref.path)) { await acquireFont(sceneId, ref.path); return; }
+      // A non-GUID ref is a CSS family NAME (UIElement.fontFamily), registered globally
+      // with the browser via the FontFace loader — no scene-scoped hold needed (a face added
+      // to `document.fonts` costs nothing to keep and the browser owns it).
+      //
+      // ⚠️ This used to `return` here, on the reasoning that the global `loadAllFonts` had
+      // already registered every font. Its only editor-side caller is the ASSETS PANEL, so a
+      // scene's typeface depended on the editor's dock layout: with that tab unmounted every
+      // DOM string in the Game panel rendered in the default serif, silently. Registering from
+      // the SCENE-load path is what makes a scene's fonts a property of the scene (#253 —
+      // mechanism, the measured A/B and the guard: docs/ui-system.md § "Who registers a
+      // scene's fonts").
+      await loadFontFamily(ref.path);
+      return;
+    case 'font-family':
+      // `UIElement.fontFamily` — a font ASSET consumed by the DOM (#231). Register every
+      // VARIANT of its family with the browser (a UI authoring `fontWeight:'bold'` needs the
+      // Bold file under the same family, or the browser synthesizes a fake bold). Not
+      // scene-scoped: a face added to `document.fonts` costs nothing to keep and the browser
+      // owns it — the same reasoning as the legacy by-name branch above.
+      //
+      // Registering from the SCENE-load path (rather than trusting the Assets panel's global
+      // `loadAllFonts`) is what makes a scene's typeface a property of the scene — see #253
+      // and docs/ui-system.md § "Who registers a scene's fonts".
+      await loadFontFamilyForRef(ref.path);
       return;
     case 'environment':
       // Preload the HDR so the first frame of the new scene has correct PBR

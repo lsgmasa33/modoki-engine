@@ -115,6 +115,27 @@ describe('chromeHandles', () => {
     });
   });
 
+  describe('state — which segment of a tri-state control is active is DATA too', () => {
+    it('reports data-ui-state as meta.state', () => {
+      const { el, cx, cy } = tag('module-toggles.physics3d.off', { attrs: { 'data-ui-state': 'selected' } });
+      stubHitTest([{ x: cx, y: cy, el }]);
+      expect(byId('module-toggles.physics3d.off')!.meta).toEqual({ state: 'selected' });
+    });
+
+    it('an UNSET state carries no meta (the unselected segments are the common case)', () => {
+      const { el, cx, cy } = tag('module-toggles.physics3d.auto');
+      stubHitTest([{ x: cx, y: cy, el }]);
+      expect(byId('module-toggles.physics3d.auto')!.meta).toBeUndefined();
+    });
+
+    it('state and disabled COMPOSE — one does not shadow the other', () => {
+      // They shared one `meta` object, so whichever spread ran last used to win outright.
+      const { el, cx, cy } = tag('m.seg.x', { attrs: { 'data-ui-state': 'selected', 'aria-disabled': 'true' } });
+      stubHitTest([{ x: cx, y: cy, el }]);
+      expect(byId('m.seg.x')!.meta).toEqual({ disabled: true, state: 'selected' });
+    });
+  });
+
   describe('kind and label', () => {
     it('kind defaults to the tag name, and data-ui-kind overrides it', () => {
       const a = tag('p.r.a');

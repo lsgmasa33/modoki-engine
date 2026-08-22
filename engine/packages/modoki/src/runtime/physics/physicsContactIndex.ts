@@ -23,8 +23,9 @@
  *
  *  Two responsibilities, deliberately split (learned from review):
  *   - LIVE separation (two bodies that stay alive move apart) → the incremental
- *     enter/exit from the DRAIN path (`drainContactEvents` → updateContactIndex), where
- *     both entities are alive so the collider→body roll-up is symmetric with the enter.
+ *     enter/exit from the DRAIN path (`collectContactEvents` → `routeContactEvents` →
+ *     updateContactIndex), where both entities are alive so the collider→body roll-up is
+ *     symmetric with the enter.
  *   - REMOVAL (a body despawns/rebuilds) → `dropEntityFromContactIndex(world, bodyId)` from the
  *     systems' `removeBody` + zero-body early-out. We do NOT trust the synthesized-exit
  *     roll-up here: a dead/reparented compound child re-resolves to a DIFFERENT body than

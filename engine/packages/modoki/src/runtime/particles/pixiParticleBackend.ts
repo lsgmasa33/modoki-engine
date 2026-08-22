@@ -98,9 +98,18 @@ export class PixiParticleBackend implements IParticle2DBackend {
     const url = resolveImageUrl(ref);
     if (!url) return;
     textureProvider.get()?.ensurePixiKtxTranscoder(); // idempotent; registers the KTX2 loader before we fetch one
-    // Lazy import Assets so a headless/test import of this module doesn't require a browser.
-    import('pixi.js')
-      .then(({ Assets }) => Assets.load(url))
+    // Lazy import so a headless/test import of this module doesn't require a browser.
+    //
+    // ⚠️ **Goes through `loadPixiTexture`, not a bare `Assets.load`.** This was the FIFTH consumer
+    // of Pixi's texture cache and `12fea928`'s sweep enumerated four — it missed this one because
+    // the sweep searched for the `cache.has(url)` → `Assets.get(url)` shape and this path has no
+    // `has()` check at all, it loads straight. Both of the shim's guarantees were therefore absent
+    // here: no `blob:` parser forcing (so a PLAYABLE build's particle textures never load) and no
+    // sourceless-entry eviction (so a torn-down shared texture is handed back dead — and
+    // `pixiParticleObject`'s flipbook path reads `base.source.width` with no guard, which is a
+    // TypeError rather than a blank sprite).
+    import('./../rendering/pixiTextureLoad')
+      .then(({ loadPixiTexture }) => loadPixiTexture(url))
       .then((tex) => {
         // Stale: entry disposed or its texture ref changed while loading.
         if (!this.entries.has(entry.id) || entry.textureRef !== ref) return;

@@ -115,7 +115,7 @@ writes:
   update-depth limit; the rAF defer collapses it to a single post-load render.
 
 Every entity carries the **`EntityAttributes`** trait
-(`runtime/traits/EntityAttributes.ts`) for metadata: `name`, `isActive`, `sortOrder`,
+(`runtime/core/traits/EntityAttributes.ts`) for metadata: `name`, `isActive`, `sortOrder`,
 `parentId` (0 = root), `layer`, and `guid`. `parentId` builds the scene hierarchy;
 `guid` is the entity's stable UUID that survives scene swaps and cross-prefab
 references.
@@ -342,10 +342,11 @@ kept `x`, dropped the `y`/`z` that made it correct, and left the entity where it
 `changed:1`. Writing all nine instead would land decompose noise on axes nobody mentioned.
 
 A **collapsed** (zero-scale) ancestor is **refused**, naming the axes: it maps every descendant onto
-its own origin, so the request has no solution. This was silent by construction —
-`Matrix4.decompose` hits its `det === 0` branch and substitutes scale `(1,1,1)` with an identity
-quaternion, so a collapsed parent read back as unscaled *and* unrotated and the conversion proceeded
-confidently on a parent that does not exist.
+its own origin, so the request has no solution. There were two independent reasons the old code
+answered anyway, and only one of them has since been fixed — the refusal is **not** obsolete:
+`worldToLocalTrs` inverts the parent's matrix, and a singular matrix inverts to the **zero matrix**.
+No decomposition rescues that; the information is gone from the matrix. (The other reason — that
+`Matrix4.decompose` LIED about the parent — is fixed; see below.)
 
 A **prefab-instance** ancestor contributes its `overrides[localId].Transform`, not `traits.Transform`
 — a captured instance root has no top-level Transform at all. (Narrower remaining gap: an instance
@@ -369,6 +370,72 @@ The corollary, confirmed as the convention on 2026-07-31: **a sheared parent is 
 the way it is not in Unity's `Transform`. An authoring path that is *more* exact than the format is
 not more correct — it just disagrees with the format, the gizmo, and the other path. That is why the
 live path was changed to decompose rather than the file path being changed to invert.
+
+### A zero scale axis: `decomposeTrs`, not `Matrix4.decompose` (#258)
+
+Shear above is a limit the TRS format genuinely has. A **zero scale axis is not** — it is an
+ordinary authored value ("hidden", "not yet grown", and what a keyframe clip keys when something
+grows from nothing) — and three.js answered it with a lie rather than an error:
+
+```js
+// three r184, Matrix4.decompose
+const det = this.determinant();
+if ( det === 0 ) { scale.set( 1, 1, 1 ); quaternion.identity(); return this; }
+```
+
+So an entity scaled to zero anywhere in its parent chain composed to a **singular** world matrix and
+came back at **identity scale and identity rotation** — drawn at FULL size, with the parent chain's
+scale dropped from the other axes and any rotation silently discarded. Measured on `games/court`'s
+guard flag: a child at `sx = 0` under a `0.53` root drew 10.8 CSS px wide against 5.2 px for the same
+child at `sx = 0.907`. The ECS data was perfectly correct throughout (the local trait reads back `0`
+exactly), so only the pixels were wrong.
+
+**Every decomposition of a matrix that can be singular therefore goes through
+`runtime/core/ecs/decomposeTrs.ts`** instead of calling `Matrix4.decompose` directly. It delegates
+to three whenever the matrix is invertible (identical output, no epsilon anywhere — `0.001` must
+keep composing exactly as it does today) and, only on `det === 0`, takes the scale from the basis
+column lengths and rebuilds the rotation from the surviving columns. What a TRS triple still cannot
+carry at a zero — the scale's SIGN, and the roll about a lone surviving axis — is listed in that
+file's header.
+
+The call sites, because "which ones" is the part that rots: both halves of the world-transform
+contract (`transformPropagationSystem`, `worldTransform`), the authoring conversion above
+(`transformSpace`), the editor's gizmo / group-drag / reparent paths (`gizmoTransform`,
+`multiTransform`, `entityActions`, `SceneView`), **GLB import** (`meshTemplateCache`
+— a node authored with a zero scale axis, a common way to hide one, would otherwise import at full
+size), and the **skeletal** paths (`scene3DSync` ×3, `rigBones`). The skeletal write-back is the
+user-reachable one: `Bone` entities are hand-posable, so typing `0` into a bone's scale in the
+Inspector composes a singular matrix, and through three that wrote scale 1 and an identity rotation
+straight onto the `THREE.Bone`.
+
+The invariant that makes this safe to apply broadly: **`decomposeTrs` is byte-identical to
+`Matrix4.decompose` for every invertible matrix**, so converting a site can only change behaviour
+where the old answer was already wrong.
+
+`grep -rn '\.decompose(' engine/packages/modoki/src engine/app games/*/runtime demos/*/runtime`
+should return exactly one live call — `games/sling`'s aim visual, whose two callers both floor the
+length (`1.0 + …` and `|| 0.001`) so its matrix is never singular. A new hit is either a new site
+that needs converting or a deliberate exception that should say why.
+
+**Telling the truth about a zero exposed a trap that had been hiding behind the lie.** The SceneView
+scale gizmo clamps an axis to 0 when its sign FLIPS mid-drag (`clampScaleCrossingPivot`, so dragging
+past the pivot stops instead of mirroring), and it captures the start sign with `Math.sign` off the
+object's *world* scale. `Math.sign(0) === 0`, so an axis that starts collapsed differs from every
+non-zero drag value and gets clamped back to 0 on every tick — the entity appears to grow during the
+drag and snaps back to invisible on mouse-up. That always affected ROOT entities (their world scale
+is their local scale, no decompose involved); fixing the composition made it reachable for CHILDREN
+too, because a collapsed child used to read back as scale 1. An axis whose start sign is 0 is now
+exempt in both `clampScaleCrossingPivot` and `scaleCrossedPivot` — 0 has no side, so there is no
+pivot to cross. Being able to drag back out of "hidden" is the workflow the zero idiom exists for.
+
+**The same class, one API over**: `Matrix4.invert()` and `Matrix3.invert()` return the **zero
+matrix** on `det === 0`, equally silently. That one is not fixable by better math — a singular
+matrix has no inverse — which is why the authoring path *refuses* (`collapsedParentAxes`) rather
+than answering. Treat a new `.invert()` on a parent-chain matrix as needing a refusal, not a
+fallback.
+
+A knock-on worth knowing: guards written `wt.sx ? … : 0` (e.g. `editor/panels/colliderEdit2D.ts`)
+never fired before, because `wt.sx` read back as `1` rather than `0`. They work now.
 
 ## Zustand Bridge
 
@@ -426,14 +493,90 @@ metadata. Current projects: `3d-test` (Tropical Island — Three.js/NPR/model im
 iOS+Android native), `alien-animal` (skeletal-animation showcase), `space-console`,
 `chess`, `llm-test`, and others; the template scaffold lives at `engine/templates/starter`.
 
+### The boot effect runs EXACTLY ONCE per `gameId` (#267)
+
+Every hook above is driven from one effect in `engine/app/App.tsx` (`GameShell`), in this
+order: `unregisterSystems` (previous game) → `registerPostprocessors` → `registerSystems` →
+`registerAppServices` → `attribution.init()`/`ads.init()` → `PlayerPrefs.init` → `resetPhase`
+registration → `loadConfig` → `initWorldSync` (first load) → quality-tier resolution →
+renderers mount → `loadScene` → `onSceneReady`. **A hook may assume it is called once per
+game load** — so a hook is allowed to have side effects that must not repeat (starting a native
+SDK, showing a consent prompt, spending a network call).
+
+That guarantee is younger than the code. The effect's dependency array used to be
+`[gameId, initialized, configReady]` while the effect itself calls `setConfigReady(true)`
+and `setInitialized(true)` mid-body, so it re-ran for the same game and drove the whole
+sequence twice. It was invisible for a long time because `loadScene` is cancel-and-replace
+and therefore idempotent — the screen was right and only the side effects doubled. What
+finally showed it was a native SDK: `games/court`'s AppsFlyer integration put **two App
+Tracking Transparency prompts** in front of the player on one launch (iPhone 8,
+2026-08-19 — `requestTrackingAuthorization` at 21:49:33.175 and again at 21:49:35.364).
+
+⚠️ **"Once" means once in a SHIPPED build.** `engine/app/main.tsx` wraps the app in React
+`<StrictMode>`, which deliberately double-invokes every effect in dev (mount → cleanup →
+mount), and that is unchanged by the fix — the boot sequence really does run twice in the
+editor and in `npm run dev`. The device measurement above was a production build, where
+StrictMode is inert. So a game hook whose side effect must not repeat still wants its own
+latch for the dev path (`games/court`'s AppsFlyer wrapper is the worked example); what the
+fix removes is the double-drive that reached PLAYERS.
+
+**The game-SWITCH path has two failure modes that outlive the switch**, both fixed alongside
+the above and both worth knowing before you touch the early-return guard. Switching A→B and
+back to A while B is still loading cancels B's run before it reaches either
+`setTransitioning(false)`, and lands on the `activeGameIdRef.current === gameId` guard — which
+must therefore clear `transitioning` itself, or the opaque loading overlay covers a game that
+is running perfectly well underneath, for the rest of the session. And `error` gates the whole
+render tree, so it is cleared at the start of every new load: it had no path back to `null`
+at all, which meant one unknown gameId left the error screen up even after a later game
+loaded successfully behind it.
+
+The rule that follows, for anyone editing that effect: **its dependency array is `[gameId]`
+and nothing else.** State the effect writes is mirrored into refs (`configReadyRef`,
+`initializedRef`) precisely so it cannot appear there. Re-entrancy for a *different* game is
+still supported and still cancels the in-flight load — that is what the `cancelled` flag and
+`activeGameIdRef` are for. Pinned by `engine/tests/app/gameShellLoadOnce.test.tsx`, whose
+third case is the one that matters: it proves a second game still loads, i.e. that the fix
+tightened the guard rather than freezing the effect.
+
 For how scenes are loaded into a world and how prefabs instantiate, see
 [Scene Loading](./scene-loading.md) and [Prefabs](./prefabs.md).
+
+## Single source of truth — where a value lives is decided by what KIND of value it is
+
+A core Modoki philosophy: never hardcode game data in TS that duplicates the scene/prefab/config;
+a resize/recolor/reposition should be a **one-place** edit. Decision rule for any structural or
+tunable value:
+
+- **Spatial / geometry** (an entity's position, extent, size, colour) → **Scene or prefab**
+  (authored entity data). Game code READS it at bind/spawn time and derives from it — e.g. read
+  wall x / red-line z from the scene, collider radius + primitive colour from the prefab —
+  rather than keeping a parallel constant.
+- **Designer-tunable balance/feel knob** (speeds, damage, HP, timings) → the game's **config
+  resource** — a singleton resource-trait read at bootstrap with code defaults (e.g.
+  `SlingConfig`; registered `category:'resource'`, live-editable in the Inspector, hot-reloads).
+- **Asset reference** (a texture/prefab/mesh/material/particle/audio/font GUID) → a field on a
+  **resource trait authored in the scene**, NOT a code constant. **This AMENDS the rule (#53):
+  "asset GUID" used to sit under *code constant* below, and that was wrong for a reason the rule
+  never considered — a GUID in code is a ref THE BUILD CANNOT SEE**, so the asset is dropped from
+  the production build and it fails only once you ship (dev serves everything off disk). Guarded
+  by `engine/tests/assets/codeAssetRefs.test.ts`. Why, the three passes it broke, and what the
+  guard does/doesn't reach: [build.md](./build.md) § "Assets the build cannot see". Still a code
+  constant: a GUID used *only* as a no-scene fallback for something the scene also authors.
+- **Structural invariant / implementation detail** (fixed dt, a value used ONLY as the
+  no-scene/no-prefab fallback, a sentinel, an epsilon) → a **code constant** — this is mechanism,
+  not config; don't force it into the scene/config.
+
+The failure mode to avoid: a code constant that SHADOWS a scene/prefab/config value and has to be
+kept in sync by hand — it will go stale (e.g. a `WALL_X` const drifting from the authored walls
+after a resize). Read from the one source instead. Worked example: `games/sling/runtime/systems.ts`
+reads field bounds from the scene walls in `bindStaticField` and entity size/colour from the
+prefab via `prefabSphereR`/`prefabColor`; only genuine fallbacks/invariants remain as consts.
 
 ## Editor Backend (Vite / Electron parity)
 
 The editor's `/api/*` command endpoints are served by a **transport-agnostic router**
-(`engine/plugins/backend/editorBackendRouter.ts`) — ~59 pure `(ctx, params) =>
-BackendResult` handlers (over ~57 `/api` paths) over a small filesystem/exec
+(`engine/plugins/backend/editorBackendRouter.ts`) — pure `(ctx, params) =>
+BackendResult` handlers over `/api` paths, over a small filesystem/exec
 `BackendContext` interface. The
 same router is mounted by **both** hosts, so daily Electron use exercises the exact
 production backend path the DMG ships, not a Vite-only surrogate:

@@ -1,9 +1,11 @@
 /** Particle Editor panel — a dedicated authoring surface for `.particle.json` effects.
  *  Left: a live WebGPU preview viewport (orbit camera) driving the real particle backend.
  *  Right: property sections (emission/shape/start/over-life/render) with live apply.
- *  Top: play / pause / restart / scrub timeline + Save. Edits apply to the running
- *  preview immediately (backend.setDef) and seed the shared cache so any ParticleEmitter
- *  entity referencing this asset in GameView updates too. */
+ *  Top: play / pause / restart / scrub timeline. Edits apply to the running preview immediately
+ *  (backend.setDef) and seed the shared cache so any ParticleEmitter entity referencing this asset
+ *  in GameView updates too; the DOCUMENT is parked in the dirty-asset registry and written by
+ *  Cmd+S (Save All), like every other authored surface. It used to autosave on a 400ms debounce —
+ *  see useParkedAssetDoc.ts and docs/mcp-persistence.md for why that went. */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { backendFetch } from '../backend/editorBackend';
@@ -17,10 +19,13 @@ import { defaultParticleEffect, type ParticleEffectDef, type ParticleHandle, typ
 import { normalizeParticleDef } from '../../runtime/loaders/particleCache';
 import { newGuid, registerAsset } from '../../runtime/loaders/assetManifest';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { useDebouncedSave } from './useDebouncedSave';
+import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { applyWheelStep, useWheelStep } from './fields';
 import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
+import { SectionIdContext, particleFieldSlug, useFieldId } from './particle/fieldIds';
+import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
+import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
 import CurveEditor from './particle/CurveEditor';
 import { DEFAULT_CURVE_POINTS, withCurvePoints, withCurveScale } from './particle/curveMath';
@@ -29,10 +34,6 @@ import { displayElapsed } from './particle/previewMath';
 
 /** Consecutive edits to the same field within this window collapse into one undo step. */
 const COALESCE_MS = 500;
-/** Auto-save debounce: write `.particle.json` this long after the last edit. Particle
- *  edits (slider/curve/gradient drags) fire continuously, so unlike the material
- *  Inspector (discrete clicks, no debounce) we coalesce writes onto a trailing timer. */
-const AUTOSAVE_MS = 400;
 /** A particle undo entry; `_after` is the (coalescing-)mutable redo target. */
 type ParticleAction = UndoAction & { _after: ParticleEffectDef };
 
@@ -65,7 +66,6 @@ export default function ParticleEditor() {
   const [playing, setPlaying] = useState(true);
   const [elapsed, setElapsed] = useState(0);
   const [sceneReady, setSceneReady] = useState(false);
-  const [saveMsg, setSaveMsg] = useState('');
   const [showFloor, setShowFloor] = useState(false);
 
   // ── Viewport (renderer / scene / camera / orbit / rAF) ──
@@ -82,7 +82,12 @@ export default function ParticleEditor() {
       try { renderer = await makeWebGPURenderer(container); }
       catch (e) { console.error('[ParticleEditor] renderer init failed', e); return; }
       if (disposed) { renderer.dispose(); renderer.domElement.remove(); return; }
-      setActiveRenderer(renderer);
+      await setActiveRenderer(renderer); // async since #254 — imports three's KTX2Loader
+      // RE-CHECK: `setActiveRenderer` became a real await in #254 (it fetches the KTX2Loader
+      // chunk), so the panel can unmount HERE — after the check above. `cleanupRef.current` is
+      // not assigned until the rAF loop is already running below, so bailing without this leaves
+      // the effect's cleanup a no-op and the renderer + loop + ResizeObserver alive forever.
+      if (disposed) { renderer.dispose(); renderer.domElement.remove(); return; }
       rendererRef.current = renderer;
 
       const scene = new THREE.Scene();
@@ -183,25 +188,50 @@ export default function ParticleEditor() {
     elapsedRef.current = 0; setElapsed(0);
     playingRef.current = true; setPlaying(true);
     const existing = useEditorStore.getState().editingParticleDef;
-    if (existing) { savedMarkRef.current?.(existing); return; } // already loaded — keep it (treat as in-sync)
+    if (existing) {
+      // ⚠️ "In sync" means EQUAL TO DISK, and a parked write means it is not. This branch marked
+      // `existing` as the saved baseline unconditionally, so re-entering the effect while a write
+      // was pending told the hook the pending doc was already written — and its reconciliation
+      // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
+      // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
+      // it returns HERE and never reaches the pendingAssetDoc branch below.
+      if (!pendingAssetDoc(asset.path, 'particle')) savedMarkRef.current?.(existing);
+      return;   // either way the loaded doc stays — that is what this branch is for
+    }
     const { loadParticleDef } = useEditorStore.getState();
+    // An UNSAVED write parked for this asset (an agent `particle-set` under manual
+    // persistence) is not on disk yet — fetching the file would open the PRE-edit doc and re-seed
+    // the live cache with it, discarding the edit everywhere except the registry that still holds
+    // it (QA-CTX-0008, measured on the timeline twin of this path). Marked saved because it is
+    // parked, not written: the pending write stays pending until Save All, and the autosave must
+    // not commit it on open.
+    const parked = pendingAssetDoc(asset.path, 'particle');
+    if (parked) {
+      const doc = normalizeParticleDef(parked as Partial<ParticleEffectDef>);
+      // Same id/registration parity as the fetch path below — a legacy def with no in-file guid
+      // must still get one, or the asset stays unaddressable by GUID for as long as it is open.
+      if (!doc.id) doc.id = newGuid();
+      registerAsset(doc.id, asset.path, 'particle');
+      adoptParkedDoc(asset.path, 'particle', doc);
+      loadParticleDef(doc);
+      return;
+    }
     fetch(asset.path)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((json) => {
         if (cancelled) return;
         const loaded = normalizeParticleDef(json);
-        if (!loaded.id) {
-          // Legacy/new effect with no in-file guid. Assign + register one so scenes
-          // and sub-emitters can reference it by guid (survives move/rename). Seed the
-          // saved-baseline with an id-less twin so the autosave detects the new id as a
-          // change and persists it to disk.
-          loaded.id = newGuid();
-          registerAsset(loaded.id, asset.path, 'particle');
-          savedMarkRef.current?.(normalizeParticleDef(json));
-        } else {
-          registerAsset(loaded.id, asset.path, 'particle');
-          savedMarkRef.current?.(loaded);
-        }
+        // Legacy/new effect with no in-file guid: assign + register one so scenes and sub-emitters
+        // can reference it by guid (survives move/rename). The saved-baseline is the doc WITH the
+        // id — deliberately not an id-less twin. That trick existed to make the autosave notice the
+        // new id and write it, and with the autosave gone it would mean merely OPENING a legacy
+        // asset parks a write: the editor goes dirty because you looked at it, and
+        // `hasUnsavedChanges()` then blocks modoki_build and the file-direct routes. It is also
+        // redundant — `buildManifest(…, heal=true)` (vite-asset-scanner.ts) already mints AND
+        // persists a missing GUID at scan time, in dev and in the packaged Electron backend alike.
+        if (!loaded.id) loaded.id = newGuid();
+        registerAsset(loaded.id, asset.path, 'particle');
+        savedMarkRef.current?.(loaded);
         loadParticleDef(loaded);
       })
       .catch((e) => { if (cancelled) return; console.warn('[ParticleEditor] load failed, using default', e); const fallback = defaultParticleEffect(); savedMarkRef.current?.(fallback); loadParticleDef(fallback); });
@@ -262,6 +292,13 @@ export default function ParticleEditor() {
       const a: ParticleAction = {
         _after: next,
         label: `particle ${group.split(':')[0]}`,
+        // Asset-document edit: it changes a .particle.json file, NOT any scene entity, so it must not
+        // bump the scene's edit-version. Its unsaved state is tracked by the dirty-asset registry
+        // (hasUnsavedChanges ORs both), and a falsely-dirty SCENE is not cosmetic — it self-blocks
+        // the file-direct agent routes, makes modoki_build refuse, and (since #259) makes Cmd+S
+        // interrupt a preview and rewrite the scene file on every save while authoring. The agent
+        // twins have set this since S2.27; the panels never did.
+        _isFileDirect: true,
         undo: () => useEditorStore.getState().applyParticleDef(path, before),
         redo: () => useEditorStore.getState().applyParticleDef(path, a._after),
       };
@@ -290,6 +327,10 @@ export default function ParticleEditor() {
     const def = { ...defaultParticleEffect(), id: guid };
     const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(def, null, 2) }) }).then((r) => r.ok).catch(() => false);
     if (!ok) return;
+    // CREATE still writes immediately — the file has to exist for registerAsset + the manifest to
+    // see it — so the file is authoritative: drop any parked write for that path, or the next save
+    // flushes a stale doc over the one just created.
+    assetWrittenToDisk(path);
     registerAsset(guid, path, 'particle');
     const name = (path.split('/').pop() || 'Effect').replace(/\.particle\.json$/i, '');
     useEditorStore.getState().openParticleEditor({ path, type: 'particle', name });
@@ -302,26 +343,12 @@ export default function ParticleEditor() {
     return () => clearInterval(id);
   }, [playing]);
 
-  // ── Debounced auto-save to disk ──
-  // Like the material Inspector, edits persist without an explicit Save — but on a
-  // trailing timer so a slider/curve drag doesn't write the file every frame. Watching
-  // the store's `def` covers every mutation path (field edits AND global undo/redo,
-  // which both rewrite editingParticleDef). The live preview + shared cache were already
-  // updated synchronously by applyParticleDef; this only handles persistence. The load
-  // effect calls markSaved(def) so opening an asset never rewrites it.
-  const writeDef = useCallback((d: ParticleEffectDef): Promise<boolean> => {
-    const path = asset?.path;
-    if (!path) return Promise.resolve(false);
-    setSaveMsg('Saving…');
-    return backendFetch('/api/write-file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content: JSON.stringify(d, null, 2) }),
-    }).then((res) => {
-      setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`);
-      return res.ok;
-    }).catch((e) => { console.error('[ParticleEditor] auto-save failed', e); setSaveMsg('Save failed'); return false; });
-  }, [asset?.path]);
-  const { markSaved } = useDebouncedSave(def, writeDef, AUTOSAVE_MS);
+  // ── Park the edit; Cmd+S writes it (#259) ──
+  // Watching the store's `def` covers every mutation path (field edits AND global undo/redo, which
+  // both rewrite editingParticleDef). The live preview + shared cache were already updated
+  // synchronously by applyParticleDef, so this is only about persistence. The load effect calls
+  // markSaved(def) so opening an asset never dirties it.
+  const { markSaved, dirty } = useParkedAssetDoc(def, asset?.path, 'particle');
   savedMarkRef.current = markSaved; // let the load effect seed the saved reference
 
   return (
@@ -332,19 +359,19 @@ export default function ParticleEditor() {
         {/* Timeline toolbar */}
         {def && (
           <div style={{ position: 'absolute', left: 8, right: 8, bottom: 8, display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(0,0,0,0.55)', border: '1px solid #333', borderRadius: 4, padding: '6px 8px' }}>
-            <button onClick={togglePlay} style={btn}>{playing ? '⏸' : '▶'}</button>
-            <button onClick={restart} style={btn}>⟲</button>
-            <button onClick={() => gUndo()} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
-            <button onClick={() => gRedo()} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
-            <button onClick={() => setShowFloor((v) => !v)} title="Toggle opaque ground plane (occludes particles behind it; use for soft particles / ground reference)" style={{ ...btn, background: showFloor ? '#2d6cdf' : '#2a2a40' }}>▦</button>
-            <input type="range" min={0} max={def.duration} step={0.01} value={displayElapsed(elapsed, def.duration, def.looping)} onChange={(e) => scrub(+e.target.value)} style={{ flex: 1 }} />
+            <button data-ui-id="particle.transport.play" data-ui-kind="button" data-ui-label="play/pause" data-ui-state={playing ? 'playing' : 'paused'} onClick={togglePlay} style={btn}>{playing ? '⏸' : '▶'}</button>
+            <button data-ui-id="particle.transport.restart" data-ui-kind="button" data-ui-label="restart" onClick={restart} style={btn}>⟲</button>
+            <button data-ui-id="particle.transport.undo" data-ui-kind="button" data-ui-label="undo" onClick={() => gUndo()} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
+            <button data-ui-id="particle.transport.redo" data-ui-kind="button" data-ui-label="redo" onClick={() => gRedo()} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
+            <button data-ui-id="particle.transport.floor" data-ui-kind="toggle" data-ui-label="ground plane" data-ui-state={showFloor ? 'on' : 'off'} onClick={() => setShowFloor((v) => !v)} title="Toggle opaque ground plane (occludes particles behind it; use for soft particles / ground reference)" style={{ ...btn, background: showFloor ? '#2d6cdf' : '#2a2a40' }}>▦</button>
+            <input data-ui-id="particle.transport.scrub" data-ui-kind="field" data-ui-label="scrub" type="range" min={0} max={def.duration} step={0.01} value={displayElapsed(elapsed, def.duration, def.looping)} onChange={(e) => scrub(+e.target.value)} style={{ flex: 1 }} />
             <span style={{ width: 56, textAlign: 'right', color: '#888' }}>{displayElapsed(elapsed, def.duration, def.looping).toFixed(2)}s</span>
           </div>
         )}
         {!asset && (
           <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center', justifyContent: 'center', color: '#555' }}>
             <div>Double-click a .particle.json in Assets to edit</div>
-            <button onClick={newParticle} style={{ ...btn, padding: '6px 14px' }}>+ New Particle</button>
+            <button data-ui-id="particle.empty.new" data-ui-kind="button" onClick={newParticle} style={{ ...btn, padding: '6px 14px' }}>+ New Particle</button>
           </div>
         )}
       </div>
@@ -353,9 +380,11 @@ export default function ParticleEditor() {
       {def && (
         <div style={{ width: 290, flexShrink: 0, borderLeft: '1px solid #333', overflowY: 'auto', padding: 10 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-            <input value={def.name ?? ''} onChange={(e) => patch({ name: e.target.value })} style={{ ...input, fontWeight: 'bold', width: 150 }} />
-            {/* Auto-saved — no Save button. This reflects the debounced write status. */}
-            <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#2ecc71' }}>{saveMsg || 'Auto-save'}</span>
+            <input data-ui-id="particle.header.name" data-ui-kind="field" data-ui-label="effect name" value={def.name ?? ''} onChange={(e) => patch({ name: e.target.value })} style={{ ...input, fontWeight: 'bold', width: 150 }} />
+            {/* No Save button on purpose: Cmd+S (Save All) is the one save in this editor, and a
+                per-panel button would be a second one that saved less. This says whether THIS
+                asset is on disk. */}
+            <span style={{ fontSize: 10, color: dirty ? '#f1c40f' : '#2ecc71' }}>{saveStatusLabel(dirty)}</span>
           </div>
 
           <Section title="General">
@@ -373,13 +402,13 @@ export default function ParticleEditor() {
             <Num label="Rate / sec" hint="Continuous particles spawned per second. Disabled when Fill pool is on." v={def.emission.rateOverTime} min={0} step={5} disabled={!!def.emission.fillPool} on={(v) => patch({ emission: { ...def.emission, rateOverTime: v } })} />
             <div style={row}>
               <Label text="Bursts" hint="One-shot emissions at a specific time (seconds into Duration). Each row: time, then particle count. Fires every loop." />
-              <button style={miniBtn} onClick={() => patch({ emission: { ...def.emission, bursts: [...(def.emission.bursts ?? []), { time: 0, count: 20 }] } })}>+ add</button>
+              <button data-ui-id="particle.bursts.add" data-ui-kind="button" data-ui-label="add burst" style={miniBtn} onClick={() => patch({ emission: { ...def.emission, bursts: [...(def.emission.bursts ?? []), { time: 0, count: 20 }] } })}>+ add</button>
             </div>
             {(def.emission.bursts ?? []).map((b, i) => (
               <div key={i} style={{ display: 'flex', gap: 4, marginBottom: 4, alignItems: 'center', paddingLeft: 8 }}>
                 <NumInput title="time (s)" value={b.time} min={0} step={0.1} on={(n) => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).map((x, k) => k === i ? { ...x, time: n } : x) } })} width={54} />
                 <NumInput title="count" value={b.count} min={0} step={1} on={(n) => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).map((x, k) => k === i ? { ...x, count: Math.round(n) } : x) } })} width={54} />
-                <button style={miniBtn} onClick={() => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).filter((_, k) => k !== i) } })}>×</button>
+                <button data-ui-id={`particle.bursts.row.${i}.remove`} data-ui-kind="button" data-ui-label="remove burst" style={miniBtn} onClick={() => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).filter((_, k) => k !== i) } })}>×</button>
               </div>
             ))}
           </Section>
@@ -428,17 +457,17 @@ export default function ParticleEditor() {
           <Section title="Forces" hint="Continuous external forces applied every frame (GPU sim supports up to 8).">
             <div style={row}>
               <Label text="Fields" hint="Directional = constant wind along (x,y,z). Point = attract (+strength) or repel (−strength) toward the (x,y,z) position. Strength scales the effect." />
-              <button style={miniBtn} onClick={() => patch({ forces: [...(def.forces ?? []), { type: 'directional', x: 1, y: 0, z: 0, strength: 2 }] })}>+ add</button>
+              <button data-ui-id="particle.forces.add" data-ui-kind="button" data-ui-label="add force" style={miniBtn} onClick={() => patch({ forces: [...(def.forces ?? []), { type: 'directional', x: 1, y: 0, z: 0, strength: 2 }] })}>+ add</button>
             </div>
             {(def.forces ?? []).map((f, i) => (
               <div key={i} style={{ marginBottom: 6, paddingLeft: 8, borderLeft: '2px solid #2a2a40' }}>
                 <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginBottom: 3 }}>
-                  <select value={f.type} onChange={(e) => updForce(i, { type: e.target.value as ForceField['type'] })} style={{ ...input, width: 100 }}>
+                  <select data-ui-id={`particle.forces.row.${i}.type`} data-ui-kind="field" data-ui-label="force type" data-ui-state={f.type} value={f.type} onChange={(e) => updForce(i, { type: e.target.value as ForceField['type'] })} style={{ ...input, width: 100 }}>
                     <option value="directional">directional</option>
                     <option value="point">point</option>
                   </select>
                   <span style={{ color: '#666', fontSize: 9 }}>{f.type === 'point' ? 'pos' : 'dir'}</span>
-                  <button style={{ ...miniBtn, marginLeft: 'auto' }} onClick={() => patch({ forces: (def.forces ?? []).filter((_, k) => k !== i) })}>×</button>
+                  <button data-ui-id={`particle.forces.row.${i}.remove`} data-ui-kind="button" data-ui-label="remove force" style={{ ...miniBtn, marginLeft: 'auto' }} onClick={() => patch({ forces: (def.forces ?? []).filter((_, k) => k !== i) })}>×</button>
                 </div>
                 <div style={{ display: 'flex', gap: 4 }}>
                   <NumInput title="x" value={f.x} step={0.1} on={(n) => updForce(i, { x: n })} width={44} />
@@ -535,17 +564,17 @@ export default function ParticleEditor() {
           <Section title="Sub-emitters" hint="Nested effects spawned in response to a parent particle's lifecycle (depth-1). CPU sim only — a GPU effect with sub-emitters falls back to CPU.">
             <div style={row}>
               <Label text="On birth/death" hint="Each row fires a burst of a child .particle.json effect when a parent particle is born or dies. Count = particles per trigger; probability = 0..1 chance per parent; inherit-v = fraction of the parent's velocity passed on." />
-              <button style={miniBtn} onClick={() => patch({ subEmitters: [...(def.subEmitters ?? []), { trigger: 'death', effect: '', count: 8, probability: 1, inheritVelocity: 0 }] })}>+ add</button>
+              <button data-ui-id="particle.subEmitters.add" data-ui-kind="button" data-ui-label="add sub-emitter" style={miniBtn} onClick={() => patch({ subEmitters: [...(def.subEmitters ?? []), { trigger: 'death', effect: '', count: 8, probability: 1, inheritVelocity: 0 }] })}>+ add</button>
             </div>
             {(def.subEmitters ?? []).map((s, i) => (
               <div key={i} style={{ marginBottom: 6, paddingLeft: 8, borderLeft: '2px solid #2a2a40' }}>
                 <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginBottom: 3 }}>
-                  <select value={s.trigger} onChange={(e) => updSub(i, { trigger: e.target.value as SubEmitter['trigger'] })} style={{ ...input, width: 70 }}>
+                  <select data-ui-id={`particle.subEmitters.row.${i}.trigger`} data-ui-kind="field" data-ui-label="sub-emitter trigger" data-ui-state={s.trigger} value={s.trigger} onChange={(e) => updSub(i, { trigger: e.target.value as SubEmitter['trigger'] })} style={{ ...input, width: 70 }}>
                     <option value="birth">birth</option>
                     <option value="death">death</option>
                   </select>
                   <NumInput title="count per trigger" value={s.count ?? 8} min={1} step={1} on={(n) => updSub(i, { count: Math.max(1, Math.round(n)) })} width={44} />
-                  <button style={{ ...miniBtn, marginLeft: 'auto' }} onClick={() => patch({ subEmitters: (def.subEmitters ?? []).filter((_, k) => k !== i) })}>×</button>
+                  <button data-ui-id={`particle.subEmitters.row.${i}.remove`} data-ui-kind="button" data-ui-label="remove sub-emitter" style={{ ...miniBtn, marginLeft: 'auto' }} onClick={() => patch({ subEmitters: (def.subEmitters ?? []).filter((_, k) => k !== i) })}>×</button>
                 </div>
                 <AssetRefField label="effect" hint="Child .particle.json fired by this sub-emitter. Drag a particle effect from the Assets panel, or use the locate button." accept={['.particle.json']} placeholder="drop a particle effect, or paste a GUID" value={s.effect} onChange={(val) => updSub(i, { effect: val })} />
                 <div style={{ display: 'flex', gap: 4 }}>
@@ -571,12 +600,15 @@ const lbl: React.CSSProperties = { color: '#999', fontSize: 11 };
 
 function Section({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
   return (
-    <div style={{ marginBottom: 10 }}>
-      <div style={{ color: '#7aa2f7', fontSize: 11, fontWeight: 'bold', borderBottom: '1px solid #2a2a40', paddingBottom: 3, marginBottom: 6, display: 'flex', alignItems: 'center' }}>
-        {title}{hint && <Hint text={hint} />}
+    <SectionIdContext.Provider value={particleFieldSlug(title)}>
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ color: '#7aa2f7', fontSize: 11, fontWeight: 'bold', borderBottom: '1px solid #2a2a40', paddingBottom: 3, marginBottom: 6, display: 'flex', alignItems: 'center' }}
+          data-ui-id={`particle.section.${particleFieldSlug(title)}`} data-ui-kind="section" data-ui-label={title}>
+          {title}{hint && <Hint text={hint} />}
+        </div>
+        {children}
       </div>
-      {children}
-    </div>
+    </SectionIdContext.Provider>
   );
 }
 
@@ -606,26 +638,52 @@ function Hint({ text }: { text: string }) {
   );
 }
 
+/** The value {@link NumInput}'s `handle` would push upstream for this text, or `null` when it
+ *  pushes nothing (mid-typing: '', '-', '.'). **One definition, because the re-sync effect has to
+ *  ask the same question** — a second copy of the clamp would drift, and the two disagreeing is
+ *  exactly a buffer that re-syncs when it should not. */
+function committedValueOf(raw: string, min?: number, max?: number): number | null {
+  const n = parseFloat(raw);
+  if (!Number.isFinite(n)) return null;
+  let c = n;
+  if (min !== undefined) c = Math.max(min, c);
+  if (max !== undefined) c = Math.min(max, c);
+  return c;
+}
+
 /** Signed-number input. Uses `type="text"` (not `type="number"`) because a number
  *  input reports `value === ''` for an incomplete entry like a lone `-`, so the minus
  *  sign is wiped before a digit can follow — you could only type negatives by entering
  *  the digit first and prepending `-`. We buffer the raw string locally while focused
  *  (preserving in-progress `-`, `.`, `-.5`, …) and only push a value upstream when the
  *  text parses to a finite number; on blur we resync to the committed value. */
-function NumInput({ value, on, title, min, max, step, disabled, width }: { value: number; on: (v: number) => void; title?: string; min?: number; max?: number; step?: number; disabled?: boolean; width: number }) {
+function NumInput({ uiId, uiLabel, value, on, title, min, max, step, disabled, width }: { uiId?: string; uiLabel?: string; value: number; on: (v: number) => void; title?: string; min?: number; max?: number; step?: number; disabled?: boolean; width: number }) {
   const [local, setLocal] = useState(String(value));
   const focused = useRef(false);
   const ref = useRef<HTMLInputElement>(null);
   const valueRef = useRef(value);
   valueRef.current = value;
-  useEffect(() => { if (!focused.current) setLocal(String(value)); }, [value]);
+  // ⚠️ **`focused` ALONE CANNOT GUARD THIS — Chromium dispatches `focus`/`blur` only while
+  // `document.hasFocus()` (#242, and #233's rule: nothing in the editor may depend on a focus event
+  // firing).** With the window behind another one no focus event lands, so this effect ran mid-edit
+  // and the field's OWN commit was what clobbered it. Concretely, on one of the clamped fields here
+  // (25 of the 38 carry a `min`/`max`): typing `-3.5` into a field showing 0.4 pushes nothing for
+  // `-`, clamps `-3` to 0, and the echo of that 0 rewrote the buffer to '0' — so the rest of the
+  // keystrokes landed on it and the field committed **0.5**. Focused, the same typing commits 0.
+  // Focus decided the result, which is the bug. Measured on demos/particle-demo's comet effect.
+  //
+  // ⭐ So the guard is the ECHO: when the text on screen would commit exactly the value already in
+  // the store, re-syncing can only reformat it, which is the destruction itself and never new
+  // information. A real external change (a preset load, an undo, retargeting the panel) does not
+  // match and still re-syncs. Same fix as `useBufferedValue` in `fields.tsx`.
+  useEffect(() => {
+    if (focused.current) return;
+    setLocal((cur) => (Object.is(committedValueOf(cur, min, max), value) ? cur : String(value)));
+  }, [value, min, max]);
   const handle = (raw: string) => {
     setLocal(raw);
-    const n = parseFloat(raw);
-    if (!Number.isFinite(n)) return; // mid-typing ("", "-", ".") — keep the text, push nothing
-    let c = n;
-    if (min !== undefined) c = Math.max(min, c);
-    if (max !== undefined) c = Math.min(max, c);
+    const c = committedValueOf(raw, min, max);
+    if (c === null) return; // mid-typing ("", "-", ".") — keep the text, push nothing
     on(c);
   };
   // Mouse-wheel adjust (focused only); Shift = ×10. Steps from the shown value, falling
@@ -641,6 +699,7 @@ function NumInput({ value, on, title, min, max, step, disabled, width }: { value
   return (
     <input
       ref={ref}
+      data-ui-id={uiId} data-ui-kind="field" data-ui-label={uiLabel}
       type="text" inputMode="decimal" title={title} value={local} disabled={disabled}
       onFocus={() => { focused.current = true; }}
       onBlur={() => { focused.current = false; setLocal(String(value)); }}
@@ -651,50 +710,56 @@ function NumInput({ value, on, title, min, max, step, disabled, width }: { value
 }
 
 function Num({ label, hint, v, on, min, max, step, disabled }: { label: string; hint?: string; v: number; on: (v: number) => void; min?: number; max?: number; step?: number; disabled?: boolean }) {
+  const uiId = useFieldId(label);
   return (
     <div style={{ ...row, opacity: disabled ? 0.4 : 1 }}><Label text={label} hint={hint} />
-      <NumInput value={v} min={min} max={max} step={step} disabled={disabled} on={on} width={80} />
+      <NumInput uiId={uiId} uiLabel={label} value={v} min={min} max={max} step={step} disabled={disabled} on={on} width={80} />
     </div>
   );
 }
 function MinMax({ label, hint, v, on, step }: { label: string; hint?: string; v: { min: number; max: number }; on: (v: { min: number; max: number }) => void; step?: number }) {
+  const uiId = useFieldId(label);
   return (
     <div style={row}><Label text={label} hint={hint} />
       <span style={{ display: 'flex', gap: 4 }}>
-        <NumInput title="min" value={v.min} step={step} on={(n) => on({ ...v, min: n })} width={56} />
-        <NumInput title="max" value={v.max} step={step} on={(n) => on({ ...v, max: n })} width={56} />
+        <NumInput uiId={uiId && `${uiId}.min`} uiLabel={`${label} min`} title="min" value={v.min} step={step} on={(n) => on({ ...v, min: n })} width={56} />
+        <NumInput uiId={uiId && `${uiId}.max`} uiLabel={`${label} max`} title="max" value={v.max} step={step} on={(n) => on({ ...v, max: n })} width={56} />
       </span>
     </div>
   );
 }
 function Vec3Row({ label, hint, v, on, step }: { label: string; hint?: string; v: [number, number, number]; on: (v: [number, number, number]) => void; step?: number }) {
+  const uiId = useFieldId(label);
   return (
     <div style={row}><Label text={label} hint={hint} />
       <span style={{ display: 'flex', gap: 4 }}>
-        <NumInput title="x" value={v[0]} step={step} on={(n) => on([n, v[1], v[2]])} width={50} />
-        <NumInput title="y" value={v[1]} step={step} on={(n) => on([v[0], n, v[2]])} width={50} />
-        <NumInput title="z" value={v[2]} step={step} on={(n) => on([v[0], v[1], n])} width={50} />
+        <NumInput uiId={uiId && `${uiId}.x`} uiLabel={`${label} x`} title="x" value={v[0]} step={step} on={(n) => on([n, v[1], v[2]])} width={50} />
+        <NumInput uiId={uiId && `${uiId}.y`} uiLabel={`${label} y`} title="y" value={v[1]} step={step} on={(n) => on([v[0], n, v[2]])} width={50} />
+        <NumInput uiId={uiId && `${uiId}.z`} uiLabel={`${label} z`} title="z" value={v[2]} step={step} on={(n) => on([v[0], v[1], n])} width={50} />
       </span>
     </div>
   );
 }
 function Check({ label, hint, v, on }: { label: string; hint?: string; v: boolean; on: (v: boolean) => void }) {
-  return <div style={row}><Label text={label} hint={hint} /><input type="checkbox" checked={v} onChange={(e) => on(e.target.checked)} /></div>;
+  const uiId = useFieldId(label);
+  return <div style={row}><Label text={label} hint={hint} /><input data-ui-id={uiId} data-ui-kind="toggle" data-ui-label={label} data-ui-state={v ? 'on' : 'off'} type="checkbox" checked={v} onChange={(e) => on(e.target.checked)} /></div>;
 }
 function Enum({ label, hint, v, options, on }: { label: string; hint?: string; v: string; options: string[]; on: (v: string) => void }) {
+  const uiId = useFieldId(label);
   return (
     <div style={row}><Label text={label} hint={hint} />
-      <select value={v} onChange={(e) => on(e.target.value)} style={{ ...input, width: 90 }}>
+      <select data-ui-id={uiId} data-ui-kind="field" data-ui-label={label} data-ui-state={v} value={v} onChange={(e) => on(e.target.value)} style={{ ...input, width: 90 }}>
         {options.map((o) => <option key={o} value={o}>{o}</option>)}
       </select>
     </div>
   );
 }
 function Color({ label, hint, v, on }: { label: string; hint?: string; v: { r: number; g: number; b: number }; on: (v: { r: number; g: number; b: number }) => void }) {
+  const uiId = useFieldId(label);
   const hex = `#${[v.r, v.g, v.b].map((n) => Math.max(0, Math.min(255, Math.round(n * 255))).toString(16).padStart(2, '0')).join('')}`;
   return (
     <div style={row}><Label text={label} hint={hint} />
-      <input type="color" value={hex} onChange={(e) => { const n = parseInt(e.target.value.slice(1), 16); on({ r: ((n >> 16) & 255) / 255, g: ((n >> 8) & 255) / 255, b: (n & 255) / 255 }); }} />
+      <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={label} data-ui-state={hex} type="color" value={hex} onChange={(e) => { const n = parseInt(e.target.value.slice(1), 16); on({ r: ((n >> 16) & 255) / 255, g: ((n >> 8) & 255) / 255, b: (n & 255) / 255 }); }} />
     </div>
   );
 }

@@ -215,3 +215,38 @@ describe('starter template ships (New Project / Connect Claude Code)', () => {
     expect(excludes, `exclude(s) dropping the template: ${excludes.join(', ')}`).toHaveLength(0);
   });
 });
+
+/**
+ * NSIS `.vite-temp` ACL grant (bug vSlzfZLr7pIX5Yw0RSSe) — nsis.include has no explicit
+ * override in electron-builder.yml, so it defaults to `build/installer.nsh` (verified against
+ * app-builder-lib/scheme.json's documented default) and electron-builder picks it up with no
+ * config change needed. That implicit pickup is exactly the kind of wiring that goes stale
+ * silently — a renamed/moved/emptied file would build a perfectly normal-looking installer
+ * that quietly reintroduces the `.vite-temp` EPERM on an admin-elevated (`Program Files`)
+ * install, which only shows up on the FIRST Build press, not at install or launch. See
+ * docs/windows.md's "Packaged-app bugs" entry #5 for why the write can't be avoided instead
+ * (Vite hardcodes the bundled-config temp path with no override) and why the broader
+ * alternatives (--configLoader runner/native) were tried and reverted.
+ */
+describe('installer.nsh grants write access to .vite-temp', () => {
+  const installerNsh = path.join(repoRoot, 'build', 'installer.nsh');
+
+  it('exists at the path nsis.include defaults to (no explicit override in electron-builder.yml)', () => {
+    expect(existsSync(installerNsh)).toBe(true);
+  });
+
+  it('defines customInstall and grants Users write access to node_modules/.vite-temp', () => {
+    const nsh = readFileSync(installerNsh, 'utf8');
+    expect(nsh, 'must define the customInstall macro electron-builder inserts post-install').toMatch(
+      /!macro\s+customInstall/,
+    );
+    expect(nsh, 'must create the exact directory Vite writes its bundled config into').toContain(
+      'node_modules\\.vite-temp',
+    );
+    // S-1-5-32-545 = BUILTIN\Users (the well-known SID, not a localized group name) with
+    // (OI)(CI) inheritance so files vite writes INSIDE the folder inherit the grant too.
+    expect(nsh, 'must grant BUILTIN\\Users write via icacls, inherited to created files').toMatch(
+      /icacls[\s\S]*S-1-5-32-545:\(OI\)\(CI\)M/,
+    );
+  });
+});

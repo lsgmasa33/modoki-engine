@@ -31,7 +31,16 @@ export default function AiCaptureSection(): React.ReactElement {
     <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid #2a2a3a' }}>
       <div style={{ color: '#888', marginBottom: 6, fontSize: 12 }}>Percept capture</div>
       <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 12, color: '#cdd' }}>
-        <input type="checkbox" checked={onLaunch} onChange={(e) => toggle(e.target.checked)} />
+        {/* Stable hook, per docs/editor.md. Without it QA-EDITOR-0011/0015 had to locate this
+            box by its label string, which only worked because the AI panel happens to have three
+            checkboxes and one of them carries that text — it breaks on any relabel, translation
+            included (bug `08YqPAxziytF52D9bwmG`). */}
+        <input
+          data-ui-id="ai.capture.onLaunch"
+          type="checkbox"
+          checked={onLaunch}
+          onChange={(e) => toggle(e.target.checked)}
+        />
         Capture @contact events on Play
       </label>
       <div style={{ color: '#666', marginTop: 4, fontSize: 11 }}>

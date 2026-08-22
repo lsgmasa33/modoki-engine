@@ -29,7 +29,7 @@ describe('readFontAxes', () => {
   // DEFAULT instance is frequently the axis MINIMUM, not Regular 400. Unpinned, Geologica
   // renders Thin — which is what made it look unusable, and what got misread as a
   // baked-vs-dynamic difference. If this ever changes, the sidecar defaults in §7 of
-  // docs/plans/font-variation-axes-plan.md should be revisited.
+  // docs/fonts.md should be revisited.
   it('shows Geologica defaults to Thin 100, not Regular 400', () => {
     expect(readFontAxes(read(GEOLOGICA)).find((a) => a.tag === 'wght')!.def).toBe(100);
   });

@@ -55,7 +55,7 @@ not "build a harness from scratch."
 
 | Need | Existing seam | File |
 |------|---------------|------|
-| Centralized time | `Time` trait (`delta`/`elapsed`/`smoothedDelta`/`frame`) | `runtime/traits/Time.ts` |
+| Centralized time | `Time` trait (`delta`/`elapsed`/`smoothedDelta`/`frame`) | `runtime/core/traits/Time.ts` |
 | Clock source | `timeSystem` — module-global `let lastTime = performance.now()` | `runtime/core/timeSystem.ts` |
 | Single-step | `Paused` trait + `stepOneFrame` (editor step button) | `runtime/rendering/frameDriver.ts`, `timeSystem.ts` |
 | Sim on/off gate | `playState` — `getPlayState/setPlayState/isSimRunning` | `runtime/core/playState.ts` |
@@ -140,9 +140,10 @@ visualDelta     = smoothedCadence * timeScale   // presentation: smooth
 - The cadence EMA keeps tracking real hardware frame time even while paused, so un-pausing is
   smooth with no catch-up spike.
 - **Delete the `Paused` early-return** in `timeSystem` — pause is now just `timeScale = 0`,
-  applied uniformly by the multiply. (The editor Pause button sets an *editor* scale factor
-  layered on top of game `timeScale`: `effective = gameTimeScale × editorPauseFactor`, so the
-  dev tool and an in-game power don't fight over one flag.)
+  applied uniformly by the multiply. (The editor Pause button is NOT a second scale factor —
+  there is no `editorPauseFactor` in the code. Pause sets the run mode to playing-but-not-advancing,
+  and `isSimRunning()` (`playState.ts`) then gates the TIME/GAME/ANIMATION pipeline tiers off
+  wholesale (`pipeline.ts`), so the dev tool and an in-game power don't fight over one flag.)
 
 **1c. One accessor seam — `getVisualDelta` / `getSimDelta`.** Every per-frame consumer routes
 through these (most already do via `readDelta`/`getTime`):

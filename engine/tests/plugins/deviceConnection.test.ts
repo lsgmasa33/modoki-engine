@@ -7,6 +7,7 @@ import {
   DeviceConnectionManager,
   TcpLeaseTransport,
   loadOrCreateGuid,
+  modokiStateDir,
   loadLastTarget,
   saveLastTarget,
 } from '../../plugins/backend/deviceConnection';
@@ -303,6 +304,21 @@ describe('device persistence helpers', () => {
     expect(loadLastTarget(dir)).toEqual({ ip: '192.168.1.54', useAdb: true });
   });
 
+  // The round-trip above passed for months while `serial` was write-only: it asserts on a target
+  // that never had one, so it could not tell a dropped field from an absent one. #149's whole point
+  // is that the picked phone survives a restart, and `loadLastTarget` was where it died.
+  it('round-trips a remembered adb serial — the picked phone survives a restart', () => {
+    saveLastTarget({ ip: '', useAdb: true, serial: 'RFTESTSERIAL1' }, dir);
+    expect(loadLastTarget(dir)).toEqual({ ip: '', useAdb: true, serial: 'RFTESTSERIAL1' });
+  });
+
+  it('normalises a blank or non-string remembered serial to absent', () => {
+    fs.writeFileSync(path.join(dir, 'device-target.json'), JSON.stringify({ ip: '', useAdb: true, serial: '' }));
+    expect(loadLastTarget(dir)).toEqual({ ip: '', useAdb: true });
+    fs.writeFileSync(path.join(dir, 'device-target.json'), JSON.stringify({ ip: '', useAdb: true, serial: 42 }));
+    expect(loadLastTarget(dir)).toEqual({ ip: '', useAdb: true });
+  });
+
   it('returns null (not a throw) for a corrupt device-target.json', () => {
     fs.writeFileSync(path.join(dir, 'device-target.json'), '{not valid json');
     expect(loadLastTarget(dir)).toBeNull();
@@ -411,5 +427,26 @@ describe('DeviceConnectionManager.devicePlatform — what latches and what does 
       await mgr.disconnect();
       await device.close();
     }
+  });
+});
+
+/** The packaged editor must not keep its state inside the signed .app. `.modoki/device-guid` was
+ *  one of two files `codesign` named after a single build on the v0.5.2 rc — cwd IS
+ *  `app.asar.unpacked` there, so every default that reached for `process.cwd()` was writing into
+ *  the bundle and invalidating its signature. */
+describe('modokiStateDir', () => {
+  const prev = process.env.MODOKI_PACKAGED;
+  afterEach(() => { if (prev === undefined) delete process.env.MODOKI_PACKAGED; else process.env.MODOKI_PACKAGED = prev; });
+
+  it('a dev clone keeps per-clone state under <cwd>/.modoki', () => {
+    delete process.env.MODOKI_PACKAGED;
+    expect(modokiStateDir()).toBe(path.join(process.cwd(), '.modoki'));
+  });
+
+  it('a PACKAGED editor uses machine-wide ~/.modoki, never cwd (which is the signed bundle)', () => {
+    process.env.MODOKI_PACKAGED = '1';
+    const dir = modokiStateDir();
+    expect(dir).toBe(path.join(os.homedir(), '.modoki'));
+    expect(dir).not.toContain('app.asar.unpacked');
   });
 });

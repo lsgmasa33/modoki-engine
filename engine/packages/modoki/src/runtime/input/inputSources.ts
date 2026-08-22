@@ -17,6 +17,7 @@ import type { InputFrame } from '../core/inputActions';
 import { keyboardSource } from './keyboardSource';
 import { gamepadSource } from './gamepadSource';
 import { pointerSource } from './pointerSource';
+import { touchControlSource } from './touchControlSource';
 import { registerInputPromptSources } from './inputPromptSources';
 
 export interface InputSource {
@@ -54,13 +55,11 @@ export interface InputSource {
 // at the registry covers all three and anything a game registers later.
 
 let inputGate: (() => boolean) | null = null;
-let wasSuppressed = false;
 
 /** Install the host's suppression predicate — return true to BLOCK input from reaching
  *  the game. Pass null to clear. */
 export function setInputGate(fn: (() => boolean) | null): void {
   inputGate = fn;
-  if (!fn) wasSuppressed = false;
 }
 
 /** Is input currently suppressed by the host? A throwing gate fails OPEN — a broken
@@ -84,6 +83,7 @@ export function registerSource(source: InputSource): void {
 }
 
 export function unregisterSource(name: string): void {
+  brokenResets.delete(name);
   const idx = sources.findIndex((s) => s.name === name);
   if (idx >= 0) { sources[idx].detach(); sources.splice(idx, 1); }
 }
@@ -106,34 +106,85 @@ export function detachAll(): void {
 
 /** Merge every attached source into `out`, in registration order.
  *
- *  While the host gate is closed, sources are NOT sampled and their latched state is
- *  dropped on the closing edge. The reset is load-bearing, not tidiness: hold W, click
- *  the Hierarchy, and without it `held` still contains 'w', so the character keeps
- *  walking until you physically release. Same class as the existing blur / play-start
- *  resets in keyboardSource. */
+ *  While the host gate is closed, sources are NOT sampled and every frame DRAINS them.
+ *  The drop is load-bearing, not tidiness, and it answers two different problems:
+ *
+ *    - latched LEVEL state: hold W, click the Hierarchy, and without a reset `held` still
+ *      contains 'w', so the character keeps walking until you physically release. Same
+ *      class as the existing blur / play-start resets in keyboardSource.
+ *    - QUEUED discrete events: a source's raw listeners are never detached by the gate —
+ *      only `sample()` is skipped — so pointerSource's press/release FIFO keeps filling
+ *      with every click made in an editor panel while the game is unfocused. Left alone,
+ *      reopening replays that whole backlog into the game, one entry per frame.
+ *
+ *  ⚠️ DRAIN CONTINUOUSLY, NEVER ON THE REOPENING EDGE (#264). This used to reset on both
+ *  edges — closing, then again on reopening to clear the backlog — and the reopening reset
+ *  ate the very input that OPENED the gate. `PanelFocusHost` moves the keyboard scope on
+ *  CAPTURE-phase pointerdown, before any panel handler and before pointerSource's own
+ *  window listener enqueues the press. So a click into the Game panel flips the gate open
+ *  and lands in the queue within the same tick, and the next frame — still carrying
+ *  `wasSuppressed` from before — reset it away. Not just its pressed edge: `reset()` clears
+ *  `activeId`, so the gesture's later move/up fall through pointerSource's
+ *  `pointerId !== activeId` checks too, and a drag-to-aim died whole. The second click
+ *  worked, which is what made it read as flaky rather than broken.
+ *
+ *  Draining every suppressed frame keeps the backlog property (nothing survives to replay)
+ *  while leaving the reopened frame untouched, so a press that arrives AFTER the gate opens
+ *  is delivered. It also removes the edge bookkeeping entirely — there is no `wasSuppressed`
+ *  any more, and no way to get its two edges out of step.
+ *
+ *  This runs only while a host gate is installed AND closed — i.e. in the editor, with the
+ *  sim playing and a non-game panel focused. A shipped game installs no gate and never
+ *  reaches it. `reset()` must stay CHEAP for that reason: it is now per-frame, not per-edge. */
 export function sampleAll(out: InputFrame): void {
-  const suppressed = isInputSuppressed();
-  if (suppressed) {
-    if (!wasSuppressed) { wasSuppressed = true; for (const s of sources) s.reset?.(); }
+  if (isInputSuppressed()) {
+    for (const s of sources) drain(s);
     return;
   }
-  // Reset again on the REOPENING edge, not just the closing one: a source's raw
-  // listeners (window pointerdown/up, etc.) are never detached by the gate — only
-  // `sample()` is skipped while suppressed — so a source that queues discrete events
-  // (pointerSource's press/release FIFO) keeps enqueuing every click made in an
-  // editor panel while the game is unfocused. Without this, reopening the gate
-  // replays that whole backlog into the game one entry per frame. Closing-edge reset
-  // alone only clears what was ALREADY latched at the moment of closing.
-  if (wasSuppressed) { for (const s of sources) s.reset?.(); }
-  wasSuppressed = false;
   for (const s of sources) s.sample(out);
 }
 
-// Built-in sources. Keyboard + gamepad + pointer are always registered (all inert
-// until they see input / a controller connects / the pointer goes down).
+/** Names already reported for a throwing `reset()`, so the warning is once per source, not
+ *  once per frame. Cleared in `unregisterSource` so a re-registered (fixed) source can warn
+ *  again. */
+const brokenResets = new Set<string>();
+
+/** Drain one source, FAILING OPEN like the gate predicate above.
+ *
+ *  Why this is guarded when `sample()` is not: making the drain continuous (#264) removed the
+ *  natural throttle that used to bound a throwing `reset()`. Under the old edge-triggered
+ *  shape a throw could not repeat — the next suppressed frame took the early return, ran
+ *  clean, and `frameDriver` clears a callback's error count on any successful run. Per-frame,
+ *  a throwing reset throws EVERY suppressed frame, and `frameDriver` auto-unregisters a
+ *  callback after 10 consecutive errors (rendering/frameDriver.ts) — that callback being the
+ *  whole `'ecs'` pipeline. So a game registering one buggy `InputSource` could kill physics,
+ *  animation and transforms for the session by clicking into an editor panel and leaving it
+ *  there for a sixth of a second. None of the three built-in sources can throw (all pure
+ *  field/Set writes), so this is a guard for `registerSource`'s public contract, not for us.
+ *
+ *  Swallowed but NOT silent: a broken reset strands held state, which is exactly what this
+ *  mechanism exists to prevent, so it is reported once per source rather than hidden.
+ *  `sample()` is deliberately left unguarded — it is unchanged by #264 and has always run
+ *  once per unsuppressed frame, so guarding it here would be a behaviour change smuggled in
+ *  under a fix for something else. */
+function drain(s: InputSource): void {
+  try {
+    s.reset?.();
+  } catch (err) {
+    if (!brokenResets.has(s.name)) {
+      brokenResets.add(s.name);
+      console.error(`[input] source "${s.name}" threw in reset() — its held state cannot be cleared while input is suppressed, so it may strand. Reported once.`, err);
+    }
+  }
+}
+
+// Built-in sources. All four are always registered and all four are inert until they see
+// input — a controller connects, the pointer goes down, or a scene authors a `TouchControl`
+// (with none authored, `touch-control` matches no element and contributes nothing).
 registerSource(keyboardSource);
 registerSource(gamepadSource);
 registerSource(pointerSource);
+registerSource(touchControlSource);
 
 /** App-scope Manager: attaches all sources on register, detaches on unregister.
  *  Replaces the old keyboard-only `inputManagerDef`. */

@@ -57,6 +57,10 @@ const EXPECTED: Record<string, { pin: string; why: string }> = {
     pin: '^5.9.3',
     why: 'builds with `tsc && rollup`; its compiler emits plugin JS that ships to devices',
   },
+  'engine/packages/capacitor-modoki-iap/package.json': {
+    pin: '^5.9.3',
+    why: 'builds with `tsc && rollup`; its compiler emits plugin JS that ships to devices',
+  },
   'engine/tools/modoki-mcp/package.json': {
     pin: '~6.0.3',
     why: 'ON the root compiler (#87); carries its own only because it is deliberately not a root workspace',

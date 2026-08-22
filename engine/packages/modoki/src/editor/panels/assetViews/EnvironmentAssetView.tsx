@@ -14,6 +14,7 @@ import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { DEFAULT_ENV_SETTINGS, ENV_MAX_SIZES, ULTRAHDR_VARIANT_SUFFIX, resolveEnvSettings, type EnvImportSettings, type EnvMaxSize, type EnvCacheInfo } from '../../../runtime/core/environmentSettings';
 import { invalidateEnvironment } from '../../../runtime/loaders/meshTemplateCache';
+import { useAssetInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { inputStyle } from '../fields';
 import { formatBytes, reimportBtnStyle, writeMetaOrWarn } from './widgets';
@@ -46,8 +47,15 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
   const setImportStatus = useEditorStore((s) => s.setImportStatus);
 
+  // Same path-keyed staleness ModelAssetView + TextureAssetView had (#303/#304): this
+  // re-read the sidecar on mount and after its OWN Apply button only, so a re-import
+  // from the Assets panel or the agent bridge left the stats and the `converted` flag
+  // showing pre-reimport values. The epoch cache-busts the URL, so it is a value this
+  // callback genuinely reads — the sidecar is rewritten in place at an unchanged URL.
+  const reimportEpoch = useAssetInvalidationEpoch('environment', (p) => p === path);
+
   const loadMeta = useCallback((signal?: AbortSignal) => {
-    return backendFetch(`/api/read-meta?path=${encodeURIComponent(path)}`, signal ? { signal } : undefined)
+    return backendFetch(cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, reimportEpoch), signal ? { signal } : undefined)
       .then((r) => (r.ok ? r.json() : {}))
       .then((m: Record<string, unknown>) => {
         setMeta(m);
@@ -55,7 +63,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
         setConverted(!!m.environmentCache);
       })
       .catch(() => { /* keep defaults */ });
-  }, [path]);
+  }, [path, reimportEpoch]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -193,7 +201,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
 
       <div style={rowStyle}>
         <span style={labelStyle}>Exposure</span>
-        <input type="range" min={-3} max={3} step={0.1} value={Math.log2(exposure)}
+        <input data-ui-id="assetView.environment.exposure" data-ui-kind="field" data-ui-label="Exposure" type="range" min={-3} max={3} step={0.1} value={Math.log2(exposure)}
           onChange={(e) => setExposure(Math.pow(2, Number(e.target.value)))}
           style={{ flex: 2 }} />
         <span style={{ color: '#ccc', fontSize: 11, width: 34, textAlign: 'right' }}>{exposure.toFixed(2)}×</span>
@@ -205,7 +213,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
       <div style={sectionStyle}>Import</div>
       <div style={rowStyle}>
         <span style={labelStyle}>Format</span>
-        <select value={settings.format} onChange={(e) => update({ format: e.target.value as EnvImportSettings['format'] })} style={{ ...inputStyle, flex: 1 }}>
+        <select data-ui-id="assetView.environment.format" data-ui-kind="field" data-ui-label="Format" value={settings.format} onChange={(e) => update({ format: e.target.value as EnvImportSettings['format'] })} style={{ ...inputStyle, flex: 1 }}>
           <option value="hdr">HDR (downscaled Radiance)</option>
           <option value="ultrahdr">UltraHDR (gainmap JPEG, ~10× smaller)</option>
         </select>
@@ -226,6 +234,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
           : 'Downscales the equirect HDR to the max edge (never upscales). A 2K env is ~6 MB; 1K is ~3× smaller and, since the map feeds a blurred PMREM, the detail loss is largely invisible.'}
       </div>
       <button
+        data-ui-id="assetView.environment.apply" data-ui-kind="button" data-ui-label={converted ? 'Re-import' : 'Apply'}
         disabled={importing}
         onClick={apply}
         style={{ ...reimportBtnStyle, marginTop: 4, background: importing ? '#555' : '#2ecc71', color: '#fff', border: `1px solid ${importing ? '#444' : '#27ae60'}`, cursor: importing ? 'wait' : 'pointer' }}

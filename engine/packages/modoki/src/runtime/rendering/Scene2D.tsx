@@ -33,13 +33,13 @@ import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Assets, Conta
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
 import { getAllTraits } from '../core/ecs/traitRegistry';
-import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text2D, TextAnimation } from '../traits';
+import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text2D, TextAnimation, GroupAlpha } from '../traits';
 import { MaterialInstance } from '../traits/MaterialInstance';
 import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from './text/textAnimate';
 import { getTime } from '../core/getTime';
 import { ensureFontLoaded, getLoadedFont } from '../loaders/fontAtlasLoader';
 import { getFontTexturePixi } from './text/fontTexturePixi';
-import { loadPixiTexture } from './pixiTextureLoad';
+import { isPixiTextureLive, loadPixiTexture } from './pixiTextureLoad';
 import { makeMtsdfPixiShader, updateMtsdfPixiStyle } from './text/mtsdfPixiShader';
 import { layoutText } from './text/layoutText';
 import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage } from './text/textMesh';
@@ -64,12 +64,13 @@ import { makePixiShaderInstance, type PixiShaderProgram } from './pixiShaderBuil
 import { coerceParamValue } from '../loaders/shaderSchema';
 import { register2DMaterialShaderMap, isEntity2DMaterialDirty } from './sprite2DMaterialBroker';
 import { computePaintOrder } from './paintOrder';
-import { findCanvasAncestor as resolveCanvasAncestor } from './canvas2DRouting';
+import { computeGroupAlpha } from './groupAlpha';
+import { findCanvasAncestor as resolveCanvasAncestor, Orphan2DTracker } from './canvas2DRouting';
 import {
   createParticleSync2DState, syncParticles2D, releaseCanvas2DEmitters, disposeParticleSync2DState,
   type ParticleSync2DState, type ParticleSync2DCtx,
 } from './particleSync2D';
-import { addDirtyListener, onStructureDirty } from '../core/ecs/entityUtils';
+import { addDirtyListener, onStructureDirty, readTraitData } from '../core/ecs/entityUtils';
 import { isSimRunning, onPlayStateChange } from '../core/playState';
 import { Canvas2DPool, defaultPool } from './canvas2DPool';
 import { registerBoundsProvider, type BoundsSurface, type EntityScreenBounds } from '../core/screenBounds';
@@ -124,14 +125,39 @@ interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; s
 // SHARED across all Scene2DRenderer instances: two viewports displaying the same URL
 // each hold a ref, so a texture unloads only when the LAST viewport releases it (F3).
 const spriteTextureRefs = new Map<string, number>();
+
+// ⚠️ A refcount reaching 0 does NOT mean the texture is finished with — it means nothing holds it
+// AT THIS INSTANT. A renderer that rebuilds a subtree by despawning and respawning it (Court's
+// board overlay does exactly this on every interaction) legitimately drops a url to 0 and back to
+// 1 inside ONE synchronous frame, and unloading on the spot destroyed the source out from under
+// the sprite about to re-retain it: `Assets.unload` removes the cache entry asynchronously but
+// destroys the source eagerly, so the respawned sprite found `cache.has(url) === true`, bound a
+// sourceless texture and drew NOTHING, permanently. So the unload is DEFERRED by a macrotask and
+// CANCELLED if anything re-retains in the meantime — a same-frame rebuild never reaches it, while
+// a genuine last release still frees the VRAM one tick later.
+const pendingTextureUnloads = new Map<string, ReturnType<typeof setTimeout>>();
+
+function unloadSpriteTextureNow(url: string) {
+  if (Assets.cache.has(url)) Assets.unload(url).catch(() => { /* ignore */ });
+}
+
 function retainSpriteTexture(url: string) {
+  const pending = pendingTextureUnloads.get(url);
+  if (pending !== undefined) { clearTimeout(pending); pendingTextureUnloads.delete(url); }
   spriteTextureRefs.set(url, (spriteTextureRefs.get(url) ?? 0) + 1);
 }
 function releaseSpriteTexture(url: string) {
   const n = (spriteTextureRefs.get(url) ?? 0) - 1;
   if (n <= 0) {
     spriteTextureRefs.delete(url);
-    if (Assets.cache.has(url)) Assets.unload(url).catch(() => { /* ignore */ });
+    if (pendingTextureUnloads.has(url)) return;
+    const handle = setTimeout(() => {
+      pendingTextureUnloads.delete(url);
+      // Re-retained while we waited (the same-frame rebuild case) — the hold is live again.
+      if ((spriteTextureRefs.get(url) ?? 0) > 0) return;
+      unloadSpriteTextureNow(url);
+    }, 0);
+    pendingTextureUnloads.set(url, handle);
   } else {
     spriteTextureRefs.set(url, n);
   }
@@ -144,11 +170,29 @@ function releaseSpriteTexture(url: string) {
  *  texture), so this is a defensive net that also enforces the "no texture accounting
  *  survives a scene" invariant (F3) — without it any drift would pin VRAM across scenes. */
 function unloadAllSpriteTextures() {
-  for (const url of spriteTextureRefs.keys()) {
-    if (Assets.cache.has(url)) Assets.unload(url).catch(() => { /* ignore */ });
-  }
+  for (const url of spriteTextureRefs.keys()) unloadSpriteTextureNow(url);
   spriteTextureRefs.clear();
+  // Deferred unloads must be SETTLED here, not left to fire after the world is gone: their
+  // timers close over a url whose accounting this call is erasing, so leaving one armed would
+  // let it run against the NEXT scene's cache. Flushing them (rather than only cancelling)
+  // keeps the "no texture accounting survives a scene" invariant (F3) exact.
+  for (const [url, handle] of pendingTextureUnloads) { clearTimeout(handle); unloadSpriteTextureNow(url); }
+  pendingTextureUnloads.clear();
 }
+
+/** SCANNED frames a visible 2D entity may go undrawn for want of a Canvas2D ancestor before the
+ *  warning fires — deliberately 1, i.e. the first scan that sees it.
+ *
+ *  This started as ~1s-at-60fps, on the reasonable-sounding theory that a grace window would
+ *  cover a load that spawns a child before its canvas host. Measured in a live editor: it NEVER
+ *  fired. `renderFrame` skips its entire ECS scan while the sim is stopped and nothing is dirty
+ *  (the idle skip below), so these are not wall-clock frames at all — instantiating an orphaned
+ *  rig into a stopped editor produced exactly ONE scan with the entity orphaned, and then
+ *  silence. Any threshold above 1 is therefore a warning that only fires while the game is
+ *  running, which is precisely the case a human is least likely to be reading the console for.
+ *  The residual risk — a mid-load scan catching a child before its canvas — is a single
+ *  console line, against the alternative of the silence this whole change exists to end. */
+const ORPHAN_2D_WARN_FRAMES = 1;
 
 // ── Trait metadata cache (global — the trait registry is process-wide) ──
 let traitsCached = false;
@@ -313,6 +357,12 @@ interface TextSnap {
   canvasId: number; x: number; y: number; rz: number; sx: number; sy: number;
   anchorX: number; anchorY: number; paint: number; compX: number; compY: number;
   layoutHash: string; styleHash: string;
+  /** GroupAlpha ancestry product (#211). Its own field rather than a term in `styleHash`:
+   *  text opacity lives in the MTSDF shader uniforms, group alpha rides on the container,
+   *  and folding it into the style hash would trigger a pointless uniform rewrite on every
+   *  frame of a fade. It still has to be COMPARED here — the block early-returns when
+   *  nothing changed, so a parent fading over a static label would otherwise never paint. */
+  groupAlpha: number;
 }
 
 /** Per-entity snapshot for the 2D-material (Mesh) pass — the inputs that determine the
@@ -438,11 +488,25 @@ export class Scene2DRenderer {
   private readonly parentOfEntity = new Map<number, number>();   // entityId → parentId
   private readonly sortOrderOfEntity = new Map<number, number>(); // entityId → EntityAttributes.sortOrder
   private paintOrderOf = new Map<number, number>();              // entityId → global paint index (sortOrder DFS)
+  /** entityId → alpha inherited from GroupAlpha ancestors × its own (#211). SPARSE: only
+   *  entities actually faded appear, so a scene with no GroupAlpha keeps an empty map and
+   *  every read falls through to 1. */
+  private groupAlphaOf = new Map<number, number>();
   private readonly canvasOfEntity = new Map<number, number>();   // entityId → canvas2D entityId (cached)
   private readonly canvasEntityIds = new Set<number>();          // all Canvas2D entity IDs this frame
   private readonly canvasCompensate = new Map<number, { x: number; y: number }>();  // canvasEntityId → shape compensation
   // Reused out-param so the path-caching walk allocates nothing per call.
   private readonly ancestorPath: number[] = [];
+  // Visible Renderable2D entities skipped for want of a Canvas2D ancestor: id → consecutive
+  // frames skipped. A 2D entity outside every canvas draws NOTHING and said so nowhere — the
+  // one measured cost was an agent instantiating a 2D prefab at the world root (the tool's own
+  // default), getting ok:true and screen:null, and having to reparent by trial and error
+  // (QA-ASSET-0014). Counted rather than warned on sight because a scene/prefab load can spawn a
+  // child a frame or two before its canvas host, and a warning fired in that window is a lie.
+  // Warn-once bookkeeping for "visible 2D entity with no Canvas2D ancestor". Keyed by guid
+  // (falling back to id) so the warning survives a hot-reload's id reassignment; see
+  // `Orphan2DTracker` in canvas2DRouting.ts for what it guarantees and why it is not inline here.
+  private readonly orphan2D = new Orphan2DTracker();
 
   // ── 2D particle emitters ──
   private particleState2D: ParticleSync2DState | null = null;
@@ -482,6 +546,7 @@ export class Scene2DRenderer {
       slotContainer: (cid) => this.pool.getSlot(cid)?.container ?? null,
       markDirty: (cid) => { this.dirtyCanvases.add(cid); },
       compensate: (cid) => this.canvasCompensate.get(cid) ?? this._oneComp,
+      groupAlphaOf: (id) => this.groupAlphaOf.get(id) ?? 1,
     };
   }
 
@@ -501,7 +566,7 @@ export class Scene2DRenderer {
 
   /** Toggle collider-ONLY mode (editor): hides every sprite and forces every Collider2D
    *  outline on, in purple — the 2D SceneView counterpart of the 3D "Colliders" toolbar
-   *  toggle (docs/todo.md "manual edit"). Forces a redraw so sprites vanish/reappear now. */
+   *  toggle (see docs/editor.md). Forces a redraw so sprites vanish/reappear now. */
   setCollidersOnly(on: boolean) {
     if (this._collidersOnly === on) return;
     this._collidersOnly = on;
@@ -513,6 +578,27 @@ export class Scene2DRenderer {
    *  i.e. it's actually drawn right now, not just Renderable2D.isVisible on the ECS side. Lets
    *  an E2E assert collider-only mode really hides sprites (see devTestBridge.has2DSprite). */
   hasSprite(entityId: number): boolean { return this.slots.has(entityId); }
+
+  /** The guid-or-id key this entity warns under. A callback at both call sites so the trait read
+   *  never happens on the healthy path — see `Orphan2DTracker`. */
+  private orphan2DKey(entityId: number): string {
+    const attrs = attrMeta ? readTraitData(entityId, attrMeta) : null;
+    return ((attrs?.guid as string) || '') || `id:${entityId}`;
+  }
+
+  /** Count a frame in which `entityId` was visible, active, and drawn by nothing because no
+   *  Canvas2D ancestor exists — and say so ONCE, after the grace window, at warn level. */
+  private noteOrphan2D(entityId: number): void {
+    const key = this.orphan2D.note(entityId, () => this.orphan2DKey(entityId), ORPHAN_2D_WARN_FRAMES);
+    if (!key) return;
+    const attrs = attrMeta ? readTraitData(entityId, attrMeta) : null;
+    const name = (attrs?.name as string) || `entity ${entityId}`;
+    console.warn(
+      `[Scene2D] "${name}" (${key}) is a visible 2D entity with no Canvas2D ancestor, so it is `
+      + 'never drawn. Parent it under the scene\'s Canvas2D host entity — a 2D entity at the '
+      + 'world root renders nowhere.',
+    );
+  }
 
   private findCanvasAncestor(entityId: number): number | null {
     // Per-frame cache fast-path (set by the path-caching below for siblings that
@@ -535,9 +621,17 @@ export class Scene2DRenderer {
     container.addChild(sp);
     const url = resolved.url;
     retainSpriteTexture(url);
-    if (Assets.cache.has(url)) {
-      sp.texture = frameTexture(Assets.get(url) as Texture, resolved);
+    // ⚠️ Presence in the cache is NOT the same as being usable, and this used to test only
+    // `has(url)`. An entry whose source was destroyed by an in-flight `Assets.unload` is still
+    // PRESENT — binding it yields a sprite that draws nothing, forever, because this branch
+    // never kicks a load. `resolveMaterialTexture` already validates `source` for the same
+    // reason; the sprite path did not, which is the whole of Court's invisible pen marks.
+    // Evict the dead entry first, or `Assets.load` would hand back the same corpse.
+    const cachedBase = Assets.cache.has(url) ? (Assets.get(url) as Texture | undefined) : undefined;
+    if (cachedBase?.source) {
+      sp.texture = frameTexture(cachedBase, resolved);
     } else {
+      if (cachedBase) Assets.cache.remove(url);
       loadPixiTexture(url).then((base: Texture) => {
         // F12 — the `sp.destroyed` check is the LOAD-BEARING guard against a stale async
         // load clobbering the wrong texture. A sprite is NEVER reused across URL changes:
@@ -598,8 +692,12 @@ export class Scene2DRenderer {
         const framed = !wholeOnly && resolved.frame != null;
         return { tex: framed ? frameTexture(base, resolved) : base, url, hasFrame: framed };
       }
+      // ⚠️ Sourceless-but-cached is TERMINAL unless the entry is evicted. `markDirty` alone only
+      // re-runs this same branch, which re-reads the same dead entry — a livelock that renders
+      // WHITE forever. Drop it so the load path below can genuinely refetch. (Mid-decode entries
+      // are not reachable here: Pixi publishes to the cache on resolve, not before.)
+      Assets.cache.remove(url);
       this.markDirty();
-      return { tex: Texture.WHITE, url: '', hasFrame: false };
     }
     if (!this._materialTexLoading.has(url)) {
       this._materialTexLoading.add(url);
@@ -667,6 +765,13 @@ export class Scene2DRenderer {
     const previewChanged2D = previewing2D !== this._wasPreviewing2D;
     this._wasPreviewing2D = previewing2D;
 
+    // A slot whose renderer was rebuilt after GPU context loss owes its new (empty) frame a FULL
+    // redraw (#213). Read-and-clear, and read BEFORE the idle skip below: a context can die while
+    // the sim is paused — an editor viewport, or a game between levels — and skipping the frame
+    // would drop the one signal that says "everything on this surface must be drawn again",
+    // leaving it blank behind a perfectly healthy context.
+    if (this.pool.consumeRebuildFlag()) this._externalDirty = true;
+
     // (1) Idle whole-frame skip — while the sim is stopped/paused, 2D only changes
     // via paths that set _externalDirty, so idle + clean ⇒ no ECS scan, no render.
     if (!isSimRunning() && !this._externalDirty && !previewing2D && !previewChanged2D) return;
@@ -699,6 +804,14 @@ export class Scene2DRenderer {
     // Global paint order (hierarchy DFS by sortOrder, re-ranked by orderInLayer) — drives
     // Pixi child z so 2D siblings stack by hierarchy, matching the editor SceneView.
     this.paintOrderOf = computePaintOrder(this.sortOrderOfEntity, this.parentOfEntity, orderInLayerOfEntity.size ? orderInLayerOfEntity : undefined);
+    // Group alpha (#211): the ancestor product that the flat PixiJS tree cannot give us for
+    // free. Same parent map as the paint order, one pass, and skipped entirely when nothing
+    // in the scene carries the trait.
+    const groupAlphaOfEntity = new Map<number, number>();
+    world.query(GroupAlpha).updateEach(([g]: any[], entity: any) => {
+      if (g.alpha !== 1) groupAlphaOfEntity.set(entity.id(), g.alpha);
+    });
+    this.groupAlphaOf = computeGroupAlpha(groupAlphaOfEntity, this.parentOfEntity);
 
     // Step 2: Collect Canvas2D entity IDs and set up their pool slots + scaler. A
     // canvas is dirty when its scaler output changed (resize / referenceWidth /
@@ -755,7 +868,8 @@ export class Scene2DRenderer {
 
         // Find which Canvas2D this entity belongs to
         const canvasId = this.findCanvasAncestor(id);
-        if (canvasId === null) return; // no Canvas2D ancestor — skip
+        if (canvasId === null) { this.noteOrphan2D(id); return; } // no Canvas2D ancestor — skip
+        this.orphan2D.clear(id, () => this.orphan2DKey(id));
 
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
@@ -849,6 +963,11 @@ export class Scene2DRenderer {
         const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
         const wt = getWorldTransform2D(id, tf);
         const paint = this.paintOrderOf.get(id) ?? 0;
+        // Effective alpha = the entity's own opacity × its GroupAlpha ancestry (#211). The
+        // PRODUCT is what goes in the snapshot below, not `rend.opacity` — otherwise a parent
+        // group fading while the child's own opacity holds still reads as "unchanged" and the
+        // fade never paints.
+        const alpha = rend.opacity * (this.groupAlphaOf.get(id) ?? 1);
         let texW = 0, texH = 0;
         if (displaySlot.kind === 'sprite') {
           const sp = displaySlot.obj as Sprite;
@@ -867,7 +986,7 @@ export class Scene2DRenderer {
         const changed = forceAll || !snap ||
           snap.canvasId !== canvasId || snap.kind !== displaySlot.kind || snap.spriteRef !== rend.sprite ||
           snap.x !== wt.x || snap.y !== wt.y || snap.rz !== wt.rz || snap.sx !== wt.sx || snap.sy !== wt.sy ||
-          snap.color !== rend.color || snap.opacity !== rend.opacity || snap.w !== rend.width || snap.h !== rend.height ||
+          snap.color !== rend.color || snap.opacity !== alpha || snap.w !== rend.width || snap.h !== rend.height ||
           snap.px !== px || snap.py !== py || snap.keepAspect !== rend.keepAspect ||
           snap.flipX !== rend.flipX || snap.flipY !== rend.flipY ||
           snap.texW !== texW || snap.texH !== texH || snap.compX !== comp.x || snap.compY !== comp.y ||
@@ -885,7 +1004,7 @@ export class Scene2DRenderer {
         // Stack by hierarchy paint order (sortableChildren re-sorts on render).
         displaySlot.obj.zIndex = paint;
         // Alpha (color's A channel) — applies to both sprites and primitives.
-        displaySlot.obj.alpha = rend.opacity;
+        displaySlot.obj.alpha = alpha;
         // Blend/compositing mode — set on the view (Sprite or Graphics both support it).
         (displaySlot.obj as Sprite | Graphics).blendMode = blend;
 
@@ -922,14 +1041,14 @@ export class Scene2DRenderer {
         if (snap) {
           snap.canvasId = canvasId; snap.kind = displaySlot.kind; snap.spriteRef = rend.sprite;
           snap.x = wt.x; snap.y = wt.y; snap.rz = wt.rz; snap.sx = wt.sx; snap.sy = wt.sy;
-          snap.color = rend.color; snap.opacity = rend.opacity; snap.w = rend.width; snap.h = rend.height; snap.px = px; snap.py = py;
+          snap.color = rend.color; snap.opacity = alpha; snap.w = rend.width; snap.h = rend.height; snap.px = px; snap.py = py;
           snap.keepAspect = rend.keepAspect; snap.flipX = rend.flipX; snap.flipY = rend.flipY; snap.texW = texW; snap.texH = texH;
           snap.compX = comp.x; snap.compY = comp.y; snap.paint = paint; snap.colliderSig = colliderSig; snap.blend = blend;
         } else {
           this.lastRender.set(id, {
             canvasId, kind: displaySlot.kind, spriteRef: rend.sprite,
             x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy,
-            color: rend.color, opacity: rend.opacity, w: rend.width, h: rend.height, px, py, keepAspect: rend.keepAspect,
+            color: rend.color, opacity: alpha, w: rend.width, h: rend.height, px, py, keepAspect: rend.keepAspect,
             flipX: rend.flipX, flipY: rend.flipY,
             texW, texH, compX: comp.x, compY: comp.y, paint, colliderSig, blend,
           });
@@ -1043,9 +1162,11 @@ export class Scene2DRenderer {
         const paint = this.paintOrderOf.get(id) ?? 0;
         const fx = rend.flipX ? -1 : 1, fy = rend.flipY ? -1 : 1;
         const blend = pixiBlendMode2D(rend.blendMode);
+        const alpha = rend.opacity * (this.groupAlphaOf.get(id) ?? 1); // #211 — see the sprite path
+
         // Apply the placement/appearance every frame (cheap property writes, always correct).
         mesh.zIndex = paint;
-        mesh.alpha = rend.opacity;
+        mesh.alpha = alpha;
         mesh.tint = rend.color; // flows into the shader's vColor (localUniformBit)
         mesh.blendMode = blend;
         mesh.position.set(wt.x, wt.y);
@@ -1071,12 +1192,12 @@ export class Scene2DRenderer {
           if (snap && snap.canvasId !== canvasId) this.dirtyCanvases.add(snap.canvasId); // left a canvas → redraw it too
           if (snap) {
             snap.canvasId = canvasId; snap.x = wt.x; snap.y = wt.y; snap.rz = wt.rz; snap.sx = wt.sx; snap.sy = wt.sy;
-            snap.color = rend.color; snap.opacity = rend.opacity; snap.blend = blend; snap.paint = paint;
+            snap.color = rend.color; snap.opacity = alpha; snap.blend = blend; snap.paint = paint;
             snap.flipX = rend.flipX; snap.flipY = rend.flipY; snap.compX = comp.x; snap.compY = comp.y;
           } else {
             this.lastMaterialRender.set(id, {
               canvasId, x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy,
-              color: rend.color, opacity: rend.opacity, blend, paint,
+              color: rend.color, opacity: alpha, blend, paint,
               flipX: rend.flipX, flipY: rend.flipY, compX: comp.x, compY: comp.y,
             });
           }
@@ -1110,11 +1231,15 @@ export class Scene2DRenderer {
         // returning before `activeIds.add` lets the end-of-pass sweep dispose any stale 2D slot.
         if (entity.has(Billboard3D) || entity.has(FlatSprite3D)) return;
         const id = entity.id();
+        // Canvas routing is checked BEFORE rig readiness: "parented outside every canvas" is the
+        // more fundamental failure of the two, and a rig that never finishes loading would
+        // otherwise swallow the report of it entirely (measured — the warning never fired).
+        const canvasId = this.findCanvasAncestor(id);
+        if (canvasId === null) { this.noteOrphan2D(id); return; }
+        this.orphan2D.clear(id, () => this.orphan2DKey(id));
         const buf = getSkin2DBuffer(id);
         if (!buf || !buf.parts.length) return; // rig not ready yet — skin2DSystem retries next frame
 
-        const canvasId = this.findCanvasAncestor(id);
-        if (canvasId === null) return;
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
 
@@ -1122,7 +1247,12 @@ export class Scene2DRenderer {
         let allLoaded = true;
         for (const part of buf.parts) {
           if (!part.url) { allLoaded = false; continue; }
-          if (!Assets.cache.has(part.url)) {
+          // ⚠️ `isPixiTextureLive`, NOT `Assets.cache.has` — a present-but-SOURCELESS entry must
+          // count as "not loaded" or this loop skips the shim and binds the corpse into a `new Mesh`
+          // below. `12fea928` named this exact site and judged it covered by the shim's eviction;
+          // it was not, because `has()` short-circuits before the shim is ever called. See
+          // `isPixiTextureLive`'s banner.
+          if (!isPixiTextureLive(part.url)) {
             allLoaded = false;
             loadPixiTexture(part.url).then(() => this.markDirty()).catch((e: unknown) => {
               console.warn(`[Scene2D] Skinned mesh texture load failed: ${part.url}`, e);
@@ -1169,13 +1299,14 @@ export class Scene2DRenderer {
         const paint = this.paintOrderOf.get(id) ?? 0;
         const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
         const deform = buf.version;
+        const alpha = ss.opacity * (this.groupAlphaOf.get(id) ?? 1); // #211 — see the sprite path
 
         // Change detection: skip when neither the placement nor the deform moved.
         const snap = this.lastMeshRender.get(id);
         const changed = forceAll || !snap ||
           snap.canvasId !== canvasId ||
           snap.x !== wt.x || snap.y !== wt.y || snap.rz !== wt.rz || snap.sx !== wt.sx || snap.sy !== wt.sy ||
-          snap.color !== ss.color || snap.opacity !== ss.opacity ||
+          snap.color !== ss.color || snap.opacity !== alpha ||
           snap.flipX !== ss.flipX || snap.flipY !== ss.flipY || snap.paint !== paint ||
           snap.deform !== deform || snap.compX !== comp.x || snap.compY !== comp.y;
         if (!changed) return;
@@ -1202,7 +1333,7 @@ export class Scene2DRenderer {
         // (editor visibility toggle) simply doesn't draw.
         for (let pi = 0; pi < meshes.length; pi++) { meshes[pi].tint = ss.color; meshes[pi].visible = buf.parts[pi]?.visible !== false; }
         container.zIndex = paint;
-        container.alpha = ss.opacity;
+        container.alpha = alpha;
         container.position.set(wt.x, wt.y);
         container.rotation = wt.rz;
         // flipX/flipY mirror about the rig origin — a render-only sign flip on scale.
@@ -1211,12 +1342,12 @@ export class Scene2DRenderer {
 
         if (snap) {
           snap.canvasId = canvasId; snap.x = wt.x; snap.y = wt.y; snap.rz = wt.rz; snap.sx = wt.sx; snap.sy = wt.sy;
-          snap.color = ss.color; snap.opacity = ss.opacity; snap.flipX = ss.flipX; snap.flipY = ss.flipY;
+          snap.color = ss.color; snap.opacity = alpha; snap.flipX = ss.flipX; snap.flipY = ss.flipY;
           snap.paint = paint; snap.deform = deform; snap.compX = comp.x; snap.compY = comp.y;
         } else {
           this.lastMeshRender.set(id, {
             canvasId, x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy,
-            color: ss.color, opacity: ss.opacity, flipX: ss.flipX, flipY: ss.flipY,
+            color: ss.color, opacity: alpha, flipX: ss.flipX, flipY: ss.flipY,
             paint, deform, compX: comp.x, compY: comp.y,
           });
         }
@@ -1235,7 +1366,8 @@ export class Scene2DRenderer {
         if (!t.isVisible || this._collidersOnly || deactivatedEntities.has(entity.id())) return;
         const id = entity.id();
         const canvasId = this.findCanvasAncestor(id);
-        if (canvasId === null) return;
+        if (canvasId === null) { this.noteOrphan2D(id); return; }
+        this.orphan2D.clear(id, () => this.orphan2DKey(id));
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
 
@@ -1361,12 +1493,13 @@ export class Scene2DRenderer {
         const paint = this.paintOrderOf.get(id) ?? 0;
         const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
 
+        const groupAlpha = this.groupAlphaOf.get(id) ?? 1; // #211 — t.opacity is already in the shader
         const snap = this.lastTextRender.get(id);
         const changed = forceAll || !snap ||
           snap.canvasId !== canvasId ||
           snap.x !== wt.x || snap.y !== wt.y || snap.rz !== wt.rz || snap.sx !== wt.sx || snap.sy !== wt.sy ||
           snap.anchorX !== t.anchorX || snap.anchorY !== t.anchorY || snap.paint !== paint ||
-          snap.compX !== comp.x || snap.compY !== comp.y ||
+          snap.compX !== comp.x || snap.compY !== comp.y || snap.groupAlpha !== groupAlpha ||
           snap.layoutHash !== layoutHash || snap.styleHash !== styleHash;
         if (!changed) return;
 
@@ -1383,16 +1516,17 @@ export class Scene2DRenderer {
         container.rotation = wt.rz;
         container.scale.set(wt.sx * comp.x, wt.sy * comp.y);
         container.zIndex = paint;
+        container.alpha = groupAlpha;
 
         if (snap) {
           snap.canvasId = canvasId; snap.x = wt.x; snap.y = wt.y; snap.rz = wt.rz; snap.sx = wt.sx; snap.sy = wt.sy;
           snap.anchorX = t.anchorX; snap.anchorY = t.anchorY; snap.paint = paint; snap.compX = comp.x; snap.compY = comp.y;
-          snap.layoutHash = layoutHash; snap.styleHash = styleHash;
+          snap.layoutHash = layoutHash; snap.styleHash = styleHash; snap.groupAlpha = groupAlpha;
         } else {
           this.lastTextRender.set(id, {
             canvasId, x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy,
             anchorX: t.anchorX, anchorY: t.anchorY, paint, compX: comp.x, compY: comp.y,
-            layoutHash, styleHash,
+            layoutHash, styleHash, groupAlpha,
           });
         }
        } catch (e) {

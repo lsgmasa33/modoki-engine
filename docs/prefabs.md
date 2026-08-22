@@ -169,7 +169,7 @@ renderer should draw a row for it. A field can persist and still be absent from 
 loader apply (`applyOverridesByLocalToEcs`) — used to treat `field in meta.fields` as
 "does this field persist", which lost data twice over: the loader **dropped** such a
 field instead of applying it (and so never seeded its override mark), and capture never
-**read** it, so the next save deleted it from the file. Measured on `skinned-test.json`: a load→save removed a populated
+**read** it, so the next save deleted it from the file. Measured on `skinned-test.scene.json`: a load→save removed a populated
 `Animator.clips` bank naming a real clip guid. A field the schema does not declare is
 still ignored — that is the genuinely renamed/retired case. Capture additionally skips
 `runtimeOnly` fields at the READ, mirroring `serializeScene`, so live read-back
@@ -255,6 +255,85 @@ re-applies the root's extra traits, and replays the `overrides` map per localId.
 Override tracking is per-localId, so edits to a sub-entity (not just the root)
 survive a reload.
 
+## ⚠️ A prefab EDIT empties the runtime cache, and nothing refills it
+
+**Saving a prefab in the editor drops it out of the runtime cache, and only a SCENE LOAD puts it
+back.** A game that spawns prefab instances at runtime therefore stops being able to, silently,
+for the rest of the session — the symptom is whatever that game does when the prefab is missing.
+
+The mechanism, verified in a running editor (2026-08-19):
+
+- A prefab write goes through `setPrefabCache()` / `writePrefabFile()`
+  (`editor/scene/prefab.ts`), which calls `invalidatePrefab(source)` — deleting the entry from
+  the **runtime** `prefabCache` in `runtime/loaders/meshTemplateCache.ts`.
+- `acquirePrefab` is the only thing that refills it, and it is called from just two kinds of
+  place: `SceneManager` during a scene load, and games that preload deliberately
+  (`games/sling`, `demos/forest-camp`, each with its own owner-id sentinel).
+- So after such a write, `getCachedPrefab()` returns `undefined` until the next scene load.
+  **Nothing warns.**
+
+⚠️ **WHICH writes actually strand it — this matters, and an earlier draft of this section got it
+wrong.** The invalidate's own comment states the intended contract ("so the NEXT scene load
+re-reads the new file"), and **prefab-EDIT MODE honours it**: `exitPrefabEditing` calls
+`loadScene(target)`, which re-acquires. So the open-edit-save-exit loop is safe, and
+`games/court/art.md`'s claim that the tray "picks the new offsets up when you leave edit mode"
+is **correct for that workflow**.
+
+The paths that invalidate an in-use prefab and do **not** reload are:
+- **Apply to Prefab** on a scene instance — `applyToPrefabWithUndo` → `writePrefabFile`, live-only.
+- **`modoki_prefab action:'apply'`** (and `'create'`), the agent surface for the same op.
+
+Creating a NEW prefab from an entity (`assetOps.ts`) also invalidates, but only its own
+freshly-minted guid, which nothing is using yet — harmless.
+
+⚠️ **There is NO file-watcher path.** Editing a `.prefab.json` on disk does not invalidate
+anything, so the runtime keeps serving the OLD prefab until a scene load — a staleness problem,
+not a fallback one, and the opposite failure to the above.
+
+**What this looks like in a game.** Court's guard flag falls back to drawn primitives when its
+prefab is uncached, so after an Apply-to-Prefab the flags already planted keep the real art while
+every new one draws a placeholder, and the board stays mixed until a scene load. Fixed there by
+recording the art each instance was spawned with, retiring on a mismatch, and asking for the
+prefab back once on a miss (`syncFlags`, `games/court/runtime/systems.ts`).
+
+**Measured on Court's tray badge, 2026-08-19** — the wholesale version of the same failure. With
+the prefab cached, a board build gives the authored instance (`Coin` ×6, `CountBadge`, `CountBanner`,
+`InfoBadge`, `ChipRow`). Invalidate, then rebuild the board with **no** scene reload, and every one
+of those drops to **0**, replaced by the pre-#171 code-spawned set (`TrayIcon_<piece>`,
+`TrayCountBanner_<piece>`, `InfoBadge_<piece>` …). The tray silently reverts to the old art and
+the constant layout — `refreshBadgeLayout` and the instantiation are two separate consumers of the
+same cache and both fall back.
+
+**If you spawn prefab instances at runtime, handle the miss on purpose.** Two things, and the
+first alone is not enough:
+
+1. **Re-acquire on a cache miss** — `void acquirePrefab(<your owner sentinel>, guid)`, guarded so
+   it fires once per guid rather than every frame.
+   ⚠️ **Re-arm that guard on the fetch POPULATING the cache — never in a `.catch`.** Measured
+   2026-08-19: `acquirePrefab` on an unresolvable guid **RESOLVES**, with the cache still empty —
+   `fetchPrefab` swallows `!res.ok` and parse errors and never rejects. So a `.catch(() => rearm)`
+   is dead code, and a guard that is never re-armed heals only the FIRST invalidation: a second
+   Apply-to-Prefab in the same session stays broken. Re-arming unconditionally is the opposite
+   trap, refetching a genuinely-missing prefab every frame forever. `.finally(() => { if
+   (getCachedPrefab(ref)) rearm; })` is the shape that does neither.
+   ⚠️ Whether you are exposed depends on **what else clears your guard**: `games/court` clears its
+   on every board build, so it was safe either way; `games/sling` clears its only on unregister and
+   `demos/forest-camp` only on world swap — and an Apply-to-Prefab is neither.
+2. **Remember what each live instance was built FROM**, and retire instances whose source no
+   longer matches. Without this, the window between the invalidation and the re-acquire leaves a
+   mixed population that never converges, because "this cell already has an instance" is true and
+   says nothing about which art that instance wears.
+
+Court's tray badge has now been audited (#262) — see the measurement above.
+
+⚠️ **Acquiring under your own owner sentinel means RELEASING it too.** `acquirePrefab(<sentinel>,
+guid)` adds that sentinel to the prefab's owner set, so the scene's own `releaseAllForScene` can
+never evict it and the prefab outlives the game. Drop the holds wholesale when the game
+unregisters — `releaseAllForScene(<sentinel>)`, not `releasePrefab` per guid, because a per-guid
+release leaks anything the acquire pulled in transitively (`games/sling` records this at its own
+call site, and `games/court` had to add it after missing it). Two other games still spawn prefabs
+at runtime without the re-acquire half: #265.
+
 ## Mesh sharing
 
 Instances are cheap: they reuse the cached mesh **template** geometry and
@@ -303,6 +382,17 @@ shows there in normal mode too.
 - **Cmd+S** routes to `savePrefabEdit()`, which serializes the prefab subtree
   back to its `.prefab.json` (the `__PrefabEdit*` scaffolds are excluded — they
   aren't descendants of the root, located via a sentinel `EntityAttributes.guid`).
+- **It refuses while the run mode is not `stopped`** — the prefab twin of `saveScene`'s transience
+  guard, and for the same reason doubled: it serializes out of the LIVE world, so a save during a
+  scrub/preview envelope or during Play bakes a posed rig or a spawned prefab into the file, and
+  every scene instantiating it inherits them. The guard lives inside `savePrefabEdit`, not in its
+  callers, so the agent op (`prefabAction:'edit-save'`) inherits it — it had no such guard while the
+  check sat in the Cmd+S handler alone. **Cmd+S does not need you to exit preview first**:
+  `runSaveAll` puts a live envelope down before saving and picks it back up after (docs/editor.md
+  § Animation Editor), so the guard is already satisfied by the time it runs. Stopping Play is still
+  on you, and the agent op refuses in every non-stopped mode.
+  Parked ASSET docs still flush in that state, because a `.particle.json` the panel owns is
+  authored data in every run mode — see [mcp-persistence.md](./mcp-persistence.md) § 5.
 - The breadcrumb **Back** button reloads the originating scene, which
   re-instantiates every instance of the just-saved prefab.
 - Right-click → **Instantiate** still adds a copy to the current scene (the old
@@ -315,7 +405,7 @@ shows there in normal mode too.
 exposed as the `prefab` agent op / `modoki_prefab` MCP tool's `prefabAction: 'edit-open' |
 'edit-save' | 'edit-exit'` — full tool contract (params, refusals, minimal call) in
 [debug-tools-mcp.md](./debug-tools-mcp.md)'s generated tool catalog. `edit-open` swaps the world
-exactly as `load-scene` does (refuses on unsaved work, takes `force`) and additionally saves the
+exactly as `load-scene` does (refuses on unsaved work, takes `discardUnsaved`) and additionally saves the
 current scene on the way in, deliberately, so the return trip's reload-from-disk is
 non-destructive; `modoki_save_all` refuses outright while in prefab-edit mode. This is what
 `engine/scripts/resave-prefabs.sh` drives to bulk-migrate prefabs to the current serializer

@@ -16,10 +16,15 @@ a couple of small polish items remain. Owner: solo.
   per-bus `GainNode` routing and ECS-driven listener/panner positions are more
   direct, and the subsystem carries **zero Three dependency** — a pure-2D game
   that drops 3D rendering drops nothing here.
-- **The journal is NOT the audio transport.** The journal is the
-  verification/debug OUTPUT trace and can be disabled in shipped builds
-  (`setJournalEnabled(false)`), so depending on it would silently mute the game.
-  Audio is driven by **traits + a dedicated cue bus + direct service calls**.
+- **The journal is NOT the audio transport — but audio does REPORT into it.**
+  These are two directions and only one of them was ever forbidden. The journal is
+  the verification/debug OUTPUT trace and can be disabled in shipped builds
+  (`setJournalEnabled(false)`), so routing *playback* through it would silently mute
+  the game; audio is therefore driven by **traits + a dedicated cue bus + direct
+  service calls**. Observation runs the other way: `audioSystem` emits an **`@audio`**
+  event for every voice lifecycle transition (#289), so audio is assertable from the
+  same trace as `@zone`/`@sequence` — and if journaling is off, the game still sounds
+  exactly the same, it is only unobservable. See "`@audio` — the assertion surface" below.
 - **Native (`@capacitor-community/native-audio`) deferred** — a swappable backend
   behind the same service, only if device latency is measured as bad. All targets
   (web + iOS + Android) are WebView/browser, so Web Audio covers 100% today.
@@ -70,7 +75,11 @@ AudioListener trait ─┘        │
 - **`audioSystem`** — presentation tier (250, ≥ TRANSFORM so it runs while
   paused). App-pipeline only, never in `createTestWorld`, so headless stays
   deterministic. Reconciles sources, autoplay-once, drains cues, updates
-  listener/panner from each entity's **local** Transform. No wall-clock/random.
+  listener/panner from each entity's **local** Transform. No wall-clock/random. Also
+  the sole emitter of **`@audio`** — it is the only layer that knows which ENTITY a
+  voice belongs to, and it behaves identically headless and live (`audioService` is
+  a backend that is fully no-op'd in record mode, so an event emitted there would be
+  describing the mock rather than the game).
 - **`audioService`** (`runtime/audio/`) — raw Web Audio graph, buffer + stream
   playback paths, global mute gain (`setAudioMuted`). Headless → **record mode**
   (`getAudioLog()`) so tests assert *what would play* with no journal dependency.
@@ -143,6 +152,14 @@ Commits `25f3b2f` + `633abcf` (review fixes).
   the hash** (it forks the runtime path, not the bytes). Settings + `AudioCacheInfo`
   live in the `.meta.json` `audio`/`audioCache` blocks; `audioSettings.ts` is the
   shared source of truth (like `textureSettings.ts`).
+- **Re-importing a clip evicts the decoded buffer — and for a long time it did not.**
+  `invalidateAudio(ref)` accepts a **path as well as a guid**; it used to resolve every ref
+  through the manifest, and `resolveRef` rejects an internal asset path, so its one caller
+  (the Audio Inspector's Apply button, which passes the path) evicted nothing and the game
+  kept playing the pre-conversion buffer until an editor restart. The batch/agent re-import
+  paths did not call it at all. Both fixed in #304's close-out; the chain and the shared
+  event behind it are in [editor.md](editor.md) § "An asset preview keyed on the PATH".
+
 - **Pipeline parity with textures** — the scanner bakes the `audio` block (loadType
   always; format+ext once converted) into the manifest, serves the `~audio.<ext>`
   variant (dev on-demand self-heal in `staticAssets.ts` + build drop-source), and
@@ -184,7 +201,7 @@ trait fields controlled by built-in actions** — and every game gets it for fre
   used to reap a crossfade tail reliably even during a time-stop (`timeScale 0`),
   where an engine-delta reaper would stall (`getVisualDelta` is 0). The `fadingOut`
   list now only force-stops tails on Stop/scene-swap + sweeps ended handles.
-- **Built-in `audio.*` UIActions** (`runtime/audio/audioControls.ts`,
+- **Built-in `audio.*` UIActions** (`runtime/actions/audioControls.ts`,
   `registerAudioControls()` wired in `app/ecs/register.ts` alongside
   `registerEngineActions`): `audio.play` / `pause` / `toggle` / `stop` / `setClip` /
   `toggleCrossfade` (flips `crossfadeSec` 0↔N) / `setBusVolume` / `playOneShot`.
@@ -230,6 +247,190 @@ trait fields controlled by built-in actions** — and every game gets it for fre
 - **Tests** — `tests/runtime/audioDeclarative.test.ts`: reconcile gating (playing
   vs autoplay), the Stop-sticks-on-autoplay regression, hard-cut + crossfade clip
   swaps, key-based bank resolution, and every built-in action (record mode).
+
+## `@audio` — the assertion surface (#289)
+
+Until this landed, audio was the **one subsystem a test or QA case could not assert
+on**. There was no `@audio.*` event anywhere (`grep -rn "emit(" runtime/audio/*.ts`
+returned nothing), so the pattern every other subsystem uses — assert on the journal
+trace — was simply unavailable, and cases had to pivot to trait state plus the record
+log. That log can prove a voice *started* and, until the fix below, nothing else.
+
+**The event.** `audioSystem` emits `@audio` on every voice lifecycle transition:
+
+| `phase` | when |
+|---|---|
+| `start` | a source began a clip, or a cue one-shot fired |
+| `swap` | a playing source changed clip (carries `crossfadeSec` when crossfaded) |
+| `pause` | `playing` went false — handle retained, position kept |
+| `resume` | `playing` went true again on a paused handle |
+| `stop` | handle torn down; `reason` names which path |
+| `end` | a non-looping source finished on its own and was reaped |
+| `dropped` | a one-shot cue given up on — `reason` is `decode-timeout` (aged out of `pendingCues`) or `retry-overflow` (arrived with the retry list already at `MAX_PENDING_CUES`). `warn` |
+| `unresolved` | an entity source whose clip will not resolve. `warn` |
+
+Payload: `{ phase, entity?, clip, bus, loop, spatial, crossfadeSec?, reason? }`.
+`entity` is `entityRef` (the stable GUID, so a trace survives a scene hot-reload) and
+is **omitted for a fire-and-forget cue one-shot**, which has no owning entity by
+design — that absence is the signal, not a gap. `reason` distinguishes the four
+teardown paths (`entity-stop` · `entity-gone` · `not-playing` · `world-teardown`),
+which are otherwise indistinguishable from outside.
+
+**`@audio` vs the Timeline's `@cue` — they are a PAIR, not a duplicate.** Timeline's
+audio track (`timelineSystem.ts:618-620`) calls `cueClip(...)` and then emits `@cue`,
+which records that the Director *asked* for a sound at that beat. `@audio` records
+whether a voice actually *started*. So a Timeline audio beat normally produces
+`@cue` followed by `@audio {phase:'start'}` — and the diagnostic case is when the
+first appears without the second, which is precisely "the cutscene called for a sound
+and none played". Do not read the two events as double-counting one thing.
+
+**A crossfade TAIL is a voice and is traced as one.** When a swap crossfades, the
+outgoing handle moves to `fadingOut` and is reaped later (on its own audio-clock
+`stopAfter`, or force-stopped at teardown). It stays audible throughout, so it emits
+its own `end`/`stop` — `fadingOut` holds `{handle, clip}` rather than a bare handle
+precisely so the tail's teardown can name the clip it belonged to. Omitting it left
+`start`+`swap` and `stop`+`end` unbalanced by exactly one per crossfade, which is the
+arithmetic a voice-count measurement depends on.
+
+**`unresolved` exists because that retry is UNBOUNDED.** A cue that will not decode
+ages out after `ONE_SHOT_RETRY_FRAMES` and emits `dropped`; an *entity source* whose
+clip will not resolve is retried by `startOrSwap` every frame forever, with `playing`
+left true. Without an event, that entity is indistinguishable in the trace from one
+that never tried to play — which is exactly the broken-asset-ref case a QA case most
+wants to catch. It is emitted **once per (entity, clip)**, re-arming when the clip
+changes, because per-frame would be 60 events/sec.
+
+⚠️ **`unresolved` and both `dropped` reasons are only reachable with a real decoder
+present.** In record mode `hasAudioSupport()` is false, so `resolveSpec` never returns
+null and these paths cannot fire — a headless test asserting on them needs the
+`hasAudioSupport → true` mock in `tests/runtime/audioCueRetry.test.ts`, which is why
+those cases live in that file rather than beside the rest of the `@audio` tests.
+
+**Journal volume.** `@audio` is a Tier-1 (always-recorded) type, not gated behind
+`setVerboseCapture` the way `@contact` is, because it fires on lifecycle
+*transitions* rather than per frame — the same shape as `@zone`/`@collision`. The
+caveat: a game that cues a sound every frame would emit ~60/s and wrap the 10,000-event
+ring in **~167 s**, evicting other subsystems' events. Nothing in the repo does that
+today; if something starts to, `@audio` is the candidate to move into `VERBOSE_TYPES`.
+
+**Why `audioSystem` and not `audioService`.** The service is a Web Audio backend that
+knows nothing about entities and is fully no-op'd in record mode; the system is where
+playback intent is decided. Emitting from the backend would name no entity and, in the
+headless harness (which has no AudioContext at all), would be describing the mock
+rather than the game.
+
+**Record-mode `stop()` is now real.** `RECORDING_HANDLE` used to be a shared singleton
+with `ended: false` hardcoded and a no-op `stop()`. That broke observability twice:
+the known half is that `getAudioLog()` could never prove a teardown, so any lifetime
+assertion silently passed. The half nobody had noticed is that because *every*
+headless source shared one object, `audioSystem`'s per-source reap check
+(`if (src.handle.ended)`) was answered by a process-wide constant rather than by the
+source it was asked about — two handles could not differ. It is now one
+`RecordingHandle` per `play()`, flipping its own `ended` and logging `{op:'stop', clip}`.
+
+**Known limit, deliberately not fixed:** record mode has no audio clock, so
+`stopAfter()` cannot self-fire. A crossfade tail is reaped at `stopWorldAudio`
+(teardown) instead of after `seconds`. Noted at the call site so a headless test does
+not read the surviving tail as a leak.
+
+## The sfx voice cap (owner policy, 2026-08-21)
+
+The mixer used to be **uncapped**: every `cueSound`/`cueClip` minted an independent
+`AudioBufferSourceNode` with no limit and no stealing policy. That was an accident
+rather than a choice, and it had teeth — the graph has no `DynamicsCompressorNode`, so
+stacked voices do not get louder, they **hard-clip**. The stacking shape that bites is
+`cueSound(name)` fanning out to every matching `AudioSource`: identical clips started
+on the same frame are phase-coherent and sum **linearly**, ~+20 dB at ten copies, not
+by √N. Separately, every spatial voice builds an HRTF `PannerNode`, so a hundred
+concurrent one-shots is a CPU problem before it is a loudness one.
+
+**The policy, and the four decisions in it:**
+
+| | |
+|---|---|
+| **Limit** | `AudioSettings.sfxVoiceLimit`, **default 4** |
+| **Steal ramp** | `AudioSettings.sfxStealFadeSec`, **default 10 ms** (`0` = hard cut) |
+| **Stealing** | **oldest first** — insertion order is age order, so the victim is `shift()`, not a search |
+| **Scope** | fire-and-forget one-shots on the **`sfx` bus only** |
+| **Exempt** | music · the `ui` bus · every entity-owned `AudioSource` |
+
+**The number is AUTHORED, not a constant.** It lives on the `AudioSettings` resource
+trait, live-editable in the Inspector, because its right value is only knowable after
+hearing it — too low and a busy moment eats sounds the designer wanted, too high and
+the mix clips. `AUDIO_SETTINGS_DEFAULT_LIMIT` is the trait's own default re-exported
+for the no-`AudioSettings`-in-scene fallback, so there is exactly one copy of the
+number. **`<= 0` means uncapped**, not "silence the sfx bus" — the escape hatch for a
+game that would rather have the old behaviour than lose a shot.
+
+**Why each exemption exists** — these are the policy, not omissions:
+
+- **Music is never capped.** It is on its own bus and sustained by design.
+- **Entity-owned `AudioSource` voices are never stolen, even on the `sfx` bus.** This
+  is the one that is easy to get wrong: a looping campfire crackle is the OLDEST voice
+  essentially forever, so naive oldest-first would kill it the instant four one-shots
+  fired, permanently. The cap is for *disposable* sounds; an entity source is something
+  the game deliberately keeps alive.
+  ⚠️ **This exemption is STRUCTURAL, not a guard** — there is no `if (entity-owned) skip`
+  to delete. `state.oneShots` is written in exactly one place (`playOneShot`), and the
+  declarative path (`startOrSwap`) simply never touches it; the two are disjoint call
+  paths. So the test covering it is a design-invariant check, not a guard-toggle check,
+  and only a structural change — routing `startOrSwap` through `playOneShot` — could
+  break it. Worth knowing before trusting a mutation run to have "proved" the exemption.
+- **The `ui` bus is uncapped.** UI sounds are user-triggered and inherently low-rate; a
+  click going silent because gameplay is busy reads as a broken button — worse than the
+  stacking it would prevent. This one extends "keep the music" a level further than the
+  owner's words did, so it was put back to them explicitly and **confirmed, 2026-08-21**.
+  Unlike the limit it is STRUCTURAL, not an authored field: capping `ui` is a code change.
+- **A NAMED cue fan-out is still capped.** `cueSound` plays each matching source as a
+  fire-and-forget one-shot with no handle retained on the entity, so it counts like any
+  other shot — and it is the single most likely way to blow the cap.
+
+**A steal is a fade, not a hard cut — and its length is AUTHORED too**
+(`AudioSettings.sfxStealFadeSec`, default 10 ms). A bare `stop()` is an instant
+amplitude discontinuity — an audible click on *every* steal, which would have a cap
+meant to protect the mix contributing its own artifact. 10 ms is below the threshold
+where a fade reads as a fade, so the sound still stops abruptly to the ear; it just
+stops cleanly. Scheduled on the AUDIO clock, so it completes under `timeScale: 0`.
+**`0` is a legitimate authored value meaning hard cut**, and schedules no ramp at all
+rather than a zero-length one. This started life as a code constant and was moved onto
+the trait during close-out for exactly the reason `sfxVoiceLimit` is on it: it is a feel
+value, and "one constant to revert if it feels wrong" is the definition of something the
+owner should be able to reach without an engine change. **The 10 ms default is
+owner-confirmed (2026-08-21)**, not an assumption left standing — the alternatives were
+put to them as 0 (audibly clicky) and ~50-100 ms (an audible duck you would hear on every
+steal at a limit of 4).
+
+**Record mode logs the ramp** (`op: 'fade'`, carrying the target and `durationSec`).
+Without it a steal and a crossfade are both invisible headlessly — the ramp *is* the
+behaviour, and a no-op `fade()` cannot tell an authored 250 ms from the 10 ms default,
+so a test asserting on the authored value would pass vacuously.
+
+**A stolen voice emits `@audio {phase:'stolen', reason:'voice-cap'}`** — so the cap is
+observable rather than a silent disappearance, which is exactly the failure mode a cap
+introduces. A stolen shot still emits `start` first: it *did* play, it was cut short.
+
+**`stolen` is that voice's TERMINAL event — it does not also emit `end`.** Every voice
+emits exactly one of `stop` / `end` / `stolen`, so `start`+`swap` balances against
+`stop`+`end`+`stolen` and a voice count never drifts. The ramping handle is still handed
+to `fadingOut` (marked `silent`) rather than orphaned, because dropping the last
+reference would remove teardown's ability to force-stop it mid-ramp — the whole reason
+`fadingOut` exists — and in record mode, where `stopAfter` cannot fire, nothing would
+ever call `stop()` on it. `reapTail` is the single place that decides whether a reaped
+tail emits, deliberately shared across all three reap sites: record mode can only reach
+one of them, so an inlined copy of that guard was untested and a mutation removing it
+stayed green.
+
+**The limit is FLOORED when read.** The Inspector's number box accepts a typed fraction
+(`step: 1` only constrains the spinner), and `while (length >= 2.5)` settles at 3 — an
+off-by-one effective cap that nothing would report. A voice count is an integer.
+
+**Implementation note:** enforcing this required tracking one-shots at all. Before, the
+handle from a one-shot `play()` was discarded outright, so nothing in the engine knew
+how many were sounding. `AudioState.oneShots` now holds them oldest-first, swept each
+frame by `handle.ended`. In record mode nothing ends on its own, which is what lets a
+headless test drive the cap deterministically.
+
+Covered by `packages/modoki/tests/runtime/audioJournal.test.ts`.
 
 ## Remaining
 

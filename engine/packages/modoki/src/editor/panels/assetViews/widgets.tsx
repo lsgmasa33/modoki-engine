@@ -29,23 +29,40 @@ export function FieldLabel({ label, hint, style }: { label: string; hint?: Field
   return <span style={style}>{label}</span>;
 }
 
-/** Fire-and-forget POST to /api/write-meta with a loud failure log. Replaces
- *  the swallow-catch pattern (`.catch(() => {})`) that hid dev-server outages
- *  — the user would update a field, see it apply locally, reload, and find
- *  the change reverted silently. */
-export function writeMetaOrWarn(path: string, meta: unknown): void {
-  backendFetch('/api/write-meta', {
+/** POST to /api/write-meta with a loud failure log. Replaces the swallow-catch pattern
+ *  (`.catch(() => {})`) that hid dev-server outages — the user would update a field, see it
+ *  apply locally, reload, and find the change reverted silently.
+ *
+ *  RETURNS THE PROMISE, and a caller that then READS the file back must await it. It used to
+ *  return `void`, which made the write unsequenceable: the 9-slice and Sprite editors both did
+ *  `writeMetaOrWarn(...)` then `onClose()`, and the Inspector's onClose handler re-reads the
+ *  meta — so a GET raced an un-awaited POST over the same file. When the GET won, the write
+ *  landed on disk and the Inspector showed the PRE-edit numbers, indefinitely. Intermittent by
+ *  construction, which is why it read as "the 9-slice editor doesn't change the Inspector
+ *  values" and survived a first attempt to reproduce it. `EnvironmentAssetView` was already
+ *  writing `await writeMetaOrWarn(...)` against the `void` signature — an await that resolved
+ *  instantly and sequenced nothing, so the intent was there and silently did not hold.
+ *
+ *  Resolves `true` when the write reached disk. Existing fire-and-forget callers can keep
+ *  ignoring it — an unread promise is the old behaviour exactly. */
+export function writeMetaOrWarn(path: string, meta: unknown): Promise<boolean> {
+  return backendFetch('/api/write-meta', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path, meta }),
   }).then(async (res) => {
-    if (!res.ok) console.error(`[Inspector] /api/write-meta failed for ${path}: ${res.status} ${await res.text().catch(() => '')}`);
+    if (!res.ok) {
+      console.error(`[Inspector] /api/write-meta failed for ${path}: ${res.status} ${await res.text().catch(() => '')}`);
+      return false;
+    }
+    return true;
   }).catch((e) => {
     console.error(`[Inspector] /api/write-meta network error for ${path}:`, e);
+    return false;
   });
 }
 
-export function NumberField({ label, value, onChange, step = 0.1, readOnly = false, wide = false, overrideColor = false, hint, mixed = false }: {
-  label: string; value: number; onChange: (v: number) => void; step?: number; readOnly?: boolean; wide?: boolean; overrideColor?: boolean; hint?: FieldHint; mixed?: boolean;
+export function NumberField({ label, value, onChange, step = 0.1, readOnly = false, wide = false, overrideColor = false, hint, mixed = false, dataUiId }: {
+  label: string; value: number; onChange: (v: number) => void; step?: number; readOnly?: boolean; wide?: boolean; overrideColor?: boolean; hint?: FieldHint; mixed?: boolean; dataUiId?: string;
 }) {
   // Enforce the hint's declared min/max on commit (previously display-only — see
   // BufferedNumberInput). Clamp in `parse` so a typed out-of-range value is capped.
@@ -69,6 +86,7 @@ export function NumberField({ label, value, onChange, step = 0.1, readOnly = fal
           min={hint!.min} max={hint!.max} step={sliderStep}
           value={mixed ? hint!.min! : parseNumber(localValue)}
           onChange={(e) => handleChange(e.target.value)}
+          data-ui-id={dataUiId ? `${dataUiId}.slider` : undefined}
           style={{ flex: 1, minWidth: 0, accentColor: '#5dade2', cursor: 'pointer' }}
         />
       )}
@@ -82,6 +100,7 @@ export function NumberField({ label, value, onChange, step = 0.1, readOnly = fal
         onBlur={onBlur}
         onDoubleClick={(e) => (e.target as HTMLInputElement).select()}
         onChange={(e) => handleChange(e.target.value)}
+        data-ui-id={dataUiId}
         style={{ ...inputStyle, ...(bounded ? { width: 52, flexShrink: 0 } : { flex: 1 }), color: overrideColor ? '#5dade2' : '#ddd', fontWeight: overrideColor ? 'bold' : 'normal', ...(readOnly ? readOnlyFieldStyle : null) }}
       />
     </div>
@@ -240,11 +259,36 @@ export function ColorField({ label, value, onChange, mixed = false, alpha, onAlp
 }
 
 /** Collapsible sub-section within a trait section (lighter styling than main Section). */
+/** `Advanced` -> `advanced`, `LOD levels` -> `lod-levels`. Titles are unique within one
+ *  asset view, and only one asset is inspected at a time, so the title alone is a stable
+ *  address — but only ACCIDENTALLY: the id carries no owning-trait segment, so nothing in
+ *  the type system stops two traits picking one section name. `engine/tests/editor/
+ *  subSectionUiIds.test.ts` is what pins it. (This comment previously cited that test before
+ *  it existed — a close-out review caught the false citation, and writing the test was the
+ *  honest fix.) */
+function subSectionSlug(title: string): string {
+  return title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
 export function SubSection({ title, children, defaultOpen = true }: { title: string; children: React.ReactNode; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
+  // Tagged as of #287, reversing the "deliberately not tagged" call in docs/enact.md.
+  // That call was correct while nothing BEHIND these toggles was addressable. It stopped
+  // being correct the moment the asset views were tagged: TextureAssetView's Advanced
+  // subsection is `defaultOpen={false}` and holds seven tagged controls (format, maxSize,
+  // mipmaps, colorspace, flipY, flipGreen, uastcLevel), so with the toggle un-addressable
+  // those seven ids were unreachable — present in the DOM contract and impossible to click.
+  // Measured, not reasoned: a live editor reported 4 assetView.texture.* handles where the
+  // source has 11. A tag behind a door an agent cannot open is not a tag.
+  // `data-ui-state` carries open/closed so the agent can tell "already open" from "needs a
+  // click" instead of toggling blind and closing it.
   return (
     <div style={{ marginTop: 4, marginBottom: 2 }}>
       <div onClick={() => setOpen(!open)}
+        data-ui-id={`inspector.subsection.${subSectionSlug(title)}`}
+        data-ui-kind="toggle"
+        data-ui-label={title}
+        data-ui-state={open ? 'open' : 'closed'}
         style={{ padding: '2px 0', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
         <span style={{ color: '#666', fontSize: '9px' }}>{open ? '▼' : '▶'}</span>
         <span style={{ color: '#999', fontSize: '10px', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{title}</span>

@@ -193,6 +193,7 @@ export class DynamicFontProvider implements FontProvider {
   private readonly kern = new Map<number, number>();
   private _metrics: FontMetrics | null = null;
   private disposables: Array<() => void> = [];
+  private disposed = false;
 
   // Atlas placement: forward shelf growth, then LRU eviction once all pages are full
   // (pure/testable — see atlasAllocator.ts). This provider only blits pixels + keeps
@@ -504,9 +505,15 @@ export class DynamicFontProvider implements FontProvider {
     ctx.putImageData(cell, dx, dy);
   }
 
-  addDisposable(fn: () => void): void { this.disposables.push(fn); }
+  // A late registration (an atlas load that landed after this provider was disposed) runs NOW —
+  // see FontProvider.addDisposable; queueing it would strand the cleanup forever.
+  addDisposable(fn: () => void): void {
+    if (this.disposed) { try { fn(); } catch { /* ignore */ } return; }
+    this.disposables.push(fn);
+  }
 
   dispose(): void {
+    this.disposed = true;
     // Renderer-attached per-page GPU textures clean up via their addDisposable hooks.
     for (const fn of this.disposables) { try { fn(); } catch { /* ignore */ } }
     this.disposables = [];

@@ -3,11 +3,53 @@ import { type Page, expect } from '@playwright/test';
 export const SCENE = '/tests/e2e/fixtures/e2e-smoke.scene.json';
 export const SCENE_2D = '/tests/e2e/fixtures/e2e-2d.scene.json';
 
+/** Pin the dock layout to the SHIPPED DEFAULT for every spec, in both directions.
+ *
+ *  WRITE (`POST`) is swallowed so a spec cannot persist a dock-layout change into this
+ *  clone's `.modoki/layouts/autosave.layout.json`.
+ *
+ *  That file is gitignored and is read back on EVERY editor boot, including a fresh Playwright
+ *  context — so a layout written by one spec is inherited by every later run AND by the human's
+ *  next editor launch. It is not covered by "e2e leaves the working tree unchanged": `git diff`
+ *  cannot see an ignored file. Measured 2026-08-19: a spec that opened the Particle Editor panel
+ *  left a `particle-editor` tab SELECTED over the Scene tab, so `[data-scene-viewport] canvas`
+ *  never mounted again and the whole suite timed out at boot — at HEAD, with no source change,
+ *  which reads exactly like a real regression. Blocked in the goto helpers so a spec cannot
+ *  forget; `page.unroute('**\/api/layout')` if you are actually testing layout persistence.
+ *
+ *  READ (`GET`) is answered 404 for the same reason, and blocking only the write was NOT
+ *  enough: `loadInitialModel` reads the autosave on every boot, so a developer's saved
+ *  arrangement silently replaced the default in local runs while CI — which has no autosave
+ *  — booted the default. The two were testing different editors, and that is not academic:
+ *  a change to `defaultLayout` left the Assets type-filter menu covered by a sibling panel,
+ *  `editor-assets.spec.ts` went red on the public runner, and the local suite stayed 55/55
+ *  green on this clone for three merges. A 404 falls through `readLayout`'s `!res.ok` arm to
+ *  the default, which is exactly the fresh-clone state CI reproduces. */
+async function blockLayoutAutosave(page: Page) {
+  // ⚠️ Routed by PATHNAME, not by the glob `**/api/layout`. Playwright matches a glob against
+  // the FULL url including the query, so `**/api/layout` matches the write (`POST /api/layout`,
+  // no query) and silently MISSES the read (`GET /api/layout?name=autosave`) — a no-op that
+  // looks like an interception. Measured: with the glob, a spec still booted this clone's saved
+  // layout. Pathname equality also keeps `/api/layout-bounds` and `/api/layout-delete` — real,
+  // unrelated endpoints — out of the match, which a `**/api/layout*` glob would swallow.
+  await page.route((url) => url.pathname === '/api/layout', (route) => {
+    const method = route.request().method();
+    if (method === 'POST') {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true,"e2e":"layout write suppressed"}' });
+    }
+    if (method === 'GET') {
+      return route.fulfill({ status: 404, contentType: 'application/json', body: '{"ok":false,"e2e":"layout read pinned to default"}' });
+    }
+    return route.continue();
+  });
+}
+
 /** Navigate to the editor with a fixture scene loaded and the WebGL2 path forced.
  *  Waits until the scene has populated (optionally until a named entity exists). */
 export async function gotoEditorWithScene(page: Page, scene = SCENE, waitForEntity?: string) {
   // Force WebGL2 (detection does requestAdapter/Device → "no WebGPU" → WebGL2/SwiftShader).
   await page.addInitScript(() => { try { delete (navigator as any).gpu; } catch { /* ignore */ } });
+  await blockLayoutAutosave(page);
   await page.goto('/#/editor');
   await page.waitForSelector('[data-scene-viewport] canvas', { timeout: 30_000 });
   // Load the fixture through the bridge rather than seeding localStorage: the editor
@@ -26,6 +68,7 @@ export async function gotoEditorWithScene(page: Page, scene = SCENE, waitForEnti
  *  the viewport canvas is up and the dev test bridge is installed. */
 export async function gotoEmptyEditor(page: Page) {
   await page.addInitScript(() => { try { delete (navigator as any).gpu; } catch { /* ignore */ } });
+  await blockLayoutAutosave(page);
   await page.goto('/#/editor');
   await page.waitForSelector('[data-scene-viewport] canvas', { timeout: 30_000 });
   await page.waitForFunction(() => !!(window as any).__modokiEditorTest, null, { timeout: 30_000 });

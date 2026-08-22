@@ -31,20 +31,49 @@ Related: [Architecture](./architecture.md) · [Scene Loading](./scene-loading.md
 ## Shell & layout
 
 `editor/EditorApp.tsx` is the shell. It uses **`flexlayout-react`** for dockable,
-resizable, Unity-style tabbed panels. The default layout is Hierarchy (left), a
-Scene/Game/Console/Assets column (center), and Inspector (right).
+resizable, Unity-style tabbed panels. The default layout is three columns: the
+viewports on the left (Game above a Scene tabset that also hosts the Particle
+Editor / Sprite Animation / 2D Skin editors, with Console/Animation/Timeline
+beneath), then Hierarchy over Assets, then Inspector over AI. It is a capture of
+the owner's working arrangement, so the retargeting asset editors are docked from
+the start rather than opened on demand — they show a placeholder until something
+is selected. They cost nothing at boot: FlexLayout's `tabEnableRenderOnDemand`
+defaults to **true** and nothing overrides it, so a tab's component is not mounted
+until its tab is first shown — only the visible tab of each tabset (Game, Scene,
+Console, Hierarchy, Assets, Inspector, AI) mounts on load.
+
+⚠️ That is what makes the column *weights* safe to read literally: they are 55/15/15
+and do **not** sum to 100. FlexLayout normalizes a row's weights against their sum,
+so the proportions are what matters, not the total. Don't "fix" them to 100 — that
+would silently rescale the columns.
 
 Layout state is persisted two ways:
 
-- **Working state** auto-saves (debounced) to `localStorage` under `editor-layout`.
+- **Working state** auto-saves (debounced) BOTH to `localStorage` under `editor-layout`
+  **and** to a reserved server-side layout named `autosave` — the recovery point the Load
+  Layout dialog pins as *"Last session (auto-saved)"*.
 - **Named layouts** are written as `<name>.layout.json` files under
   `<project>/.modoki/layouts` via the backend's `/api/layout` POST endpoint
   (listed via `/api/layouts` GET) (File → *Save Layout As…* / *Load Layout…*). The tracked file path is stored in
   `localStorage` so the association survives a reload.
 
-On startup `loadInitialModel()` prefers the tracked file, then the localStorage mirror,
-then the built-in default layout. *Reset Layout* clears both and reloads (live
-Three.js/Pixi viewports don't tear down cleanly on an in-place model swap).
+On startup `loadInitialModel()` ranks **tracked file → autosave → localStorage mirror →
+built-in default**. The autosave tier is easy to forget and is load-bearing: it sits ABOVE
+the mirror, so clearing the two `localStorage` keys does not get you the default.
+
+*Reset Layout* therefore does not work by deletion. It clears the two keys, arms a one-shot
+`sessionStorage` marker (`editor-layout-reset`), and reloads; `loadInitialModel()` consults
+that marker first and skips every restore tier for exactly that one **load** (live
+Three.js/Pixi viewports don't tear down cleanly on an in-place model swap, hence the reload).
+Deleting the autosave instead would destroy the recovery point, and doing nothing about it was
+QA-EDITOR-0004: once any panel had moved, *Reset Layout* restored the very layout being reset.
+
+⚠️ One-shot per **load**, not per call, and that distinction is load-bearing. `main.tsx` wraps
+the app in `<StrictMode>`, so in dev React runs `EditorApp`'s init effect, discards it, and runs
+it again — two `loadInitialModel()` calls per page load, and the SECOND is the one that renders.
+A plain read-and-clear was consumed by the discarded first call, which put the bug straight back
+in every `npm run dev` session. `takeLayoutResetFlag()` clears the marker on its first read but
+keeps answering from a module-level memo for the rest of that load.
 
 A named layout is project-local (`.modoki/layouts` is gitignored) — to move a layout to
 another project/machine or share it, both directions go through a portable
@@ -52,7 +81,8 @@ another project/machine or share it, both directions go through a portable
 imports one (parsed, guarded by `isLayoutJson`, then written into the project store under
 its derived base name), and both *Save Layout As…* and *Load Layout…* have an *Export to
 file…* action that downloads the current/selected layout via a `Blob` + `<a download>`
-click (`downloadLayoutJson`, `sanitizeExportFileName` in `editor/utils/layoutNames.ts`).
+click (`downloadLayoutJson` in `editor/utils/layoutStore.ts`, `sanitizeExportFileName` in
+`editor/utils/layoutNames.ts`).
 There is no top-level menu item for export — it's reached through those two modals.
 
 The menu bar (`File` / `Edit` / `View`, plus host-injected menus) is rendered by
@@ -108,9 +138,15 @@ because two rows can share a label — device names repeat.
 
 `Build → iOS Device` / `Android Device` name the device they will build for, and their submenus
 switch it (#170). Each row says what picking it means — a devicectl-reachable iPhone reads
-"hands-free install", a pre-iOS-17 one "Xcode handoff, ⌘R", because that is the consequence the
-old menu could not tell you and it is decided by whether `iosDevicectlId` ends up set
-(`planIosInstall`). Picking writes `user.device.*` into the gitignored `project.user.json` through
+"hands-free install", a pre-iOS-17 one "hands-free install (go-ios)" (#217), because that is the
+consequence the old menu could not tell you and it is decided by `planIosInstall`'s three modes
+(`'devicectl'` / `'go-ios'` / `'xcode-handoff'`), keyed off `iosDevicectlId`. Both rows now read
+"hands-free" because both ARE hands-free — go-ios closed the gap where an older device used to read
+"Xcode handoff, ⌘R" — and the tool name stays in the label so the two paths are still
+distinguishable when one of them misbehaves: a devicectl install/launch failure and a go-ios
+install/launch failure surface differently, and only the latter can fall further back to the Xcode
+handoff (when go-ios itself isn't present or provisionable). Picking writes `user.device.*` into
+the gitignored `project.user.json` through
 the same `/api/project-settings` route Project Settings saves to, as a partial patch — so the two
 surfaces can never disagree, and hand-typed values this menu does not offer survive.
 
@@ -208,6 +244,17 @@ projects:
   the already-RESOLVED config, where the bad value has been coerced away and is no longer there
   to complain about. Not wired into the settings-save route, which round-trips out-of-union
   values on purpose (`coerceUnions:false`).
+- **The Scenes tab discovers scenes LIVE, not at boot.** Every other field's `options` are a
+  static list the schema carries, built once during editor setup — for the scene list that made
+  the dialog describe a project that no longer existed. Measured on `games/anim-bug`
+  (QA-DLG-0005): a scene authored in the session (New Scene → Save As) was on disk and in the
+  asset manifest — `modoki_list_assets {type:'scene'}` returned it — and the Scenes tab listed
+  only the boot-time scene, with no error, until a relaunch, so it could not be added to the
+  build list at all. `SceneListEditor.discoverScenes` now unions the boot-time `options` with
+  the live manifest (`getAllAssets()`, the same source `list_assets` reads); the boot-time
+  LABELS still win, since the host built them from the backend's own paths, and an empty
+  manifest falls back to exactly the old list.
+
 - **A vocabulary is declared ONCE, in `engine/project-config.ts`.** Each string union is an
   exported `as const` tuple (`ORIENTATIONS`, `TONE_MAPPINGS`, `WEB_DEPLOY_MODES`, …) that both
   the validator and the Project Settings dropdowns read — the dialog used to restate all ten
@@ -284,6 +331,124 @@ example — it looks and behaves like a pull-down and is fully drivable by `modo
 
 This applies to NEW chrome. The existing `<select>`s (Inspector enum fields, device presets) are not
 worth a sweep on their own; convert one when you are already changing it and it blocks a check.
+
+### Find References (Assets row, Hierarchy row)
+
+Right-click an asset in the Assets panel or an entity in the Hierarchy and pick **Find References**
+to see everything that points at it — direct AND indirect (a texture reached only through
+material to mesh reports the entities at the far end), with the field to edit named on each hop.
+
+Two things about it that are easy to misread:
+- **It reads files on disk, not the live world.** Unsaved scene edits are invisible to it, so wire
+  something up, save, then ask. A "0 references" answer on an unsaved edit is the instrument being
+  stale, not the truth.
+- **It answers about ONE target — it is not a cleanup tool.** For "what can I delete?" use the
+  Assets menu's **Clean Up Unused Assets**, which is strictly more complete: it reports a whole
+  dead subtree where a per-target "nothing references this" only ever sees that subtree's entry
+  point (measured on `games/sling`: 73 orphans against 38). Find References tells you what breaks
+  if you delete THIS; the cleanup dialog tells you what is already dead.
+
+The graph behind it is the asset tree-shaker's own walk, inverted — including the implicit
+texture-to-derived-sprite edge that makes an ad-hoc search for "who uses this texture?" wrong rather
+than merely incomplete. Mechanism, the measured numbers, and the traps:
+[build.md](build.md) § "Find References — the same walk, inverted".
+
+### Dropping an asset into a panel — accept what you act on, and refuse the rest VISIBLY
+
+Two panels take an asset dragged out of the Assets panel, and each takes one kind:
+
+| Target | Accepts | Because |
+|---|---|---|
+| **Hierarchy** | prefabs | It instantiates entities. Every other kind is a *reference* (mesh, material, texture, clip) with no entity shape of its own, so a drop has nothing to create. |
+| **Skin editor parts list** | sprites + textures (or any `.png`/`.jpg`/`.webp`) | A part's source art is a sprite; a dropped texture is resolved to its derived whole-image sprite. |
+
+Dropping onto the **SceneView viewport** does nothing at all, and that is a decision rather than a
+gap — see `todo.md` § Deferred decisions.
+
+⚠️ **A refusal has two halves, and shipping only one is its own bug** (#306). Until 2026-08-21 both
+panels called `preventDefault()` on `dragover` for any `application/editor-asset` — because the MIME
+type says nothing about the KIND — and then filtered on the real rule in the drop handler and bailed.
+A texture got the copy cursor *and* the row highlight from the Hierarchy; a prefab got the copy
+cursor *and* the blue outline from the parts list; both then did nothing, with no explanation. The
+two halves now are:
+
+1. **dragover does not `preventDefault()`** for a kind the panel will not act on. That is what
+   paints the browser's no-drop cursor, suppresses the highlight, stops `drop` firing at all, and —
+   the part that matters for QA — makes `modoki_dnd` fail with an honest `accepted:false` instead of
+   returning `accepted:true, committed:false`, a shape `engine/app/debug/domDnd.ts` had to carry a
+   heuristic warning about because it is indistinguishable from a drop that legitimately makes no
+   edit. (`qa/cases/assets/assets-drag-drop-into-hierarchy.md` asserted the OLD result and was
+   inverted in the same change.)
+2. **the drag ghost says why** — `setDragGhostRefusal` in `editor/utils/dragGhost.ts` repaints the
+   label already following the cursor (🚫, red, *"only prefabs can be dropped here"*). A bare
+   no-drop cursor says "not here" without saying whether you missed the target or picked the wrong
+   file, so each refusal names what WOULD work. That half is invisible to the agent tier — the
+   ghost is torn down by `dragend` before a tool call returns — so it is pinned by unit tests, and
+   a *silent* refusal would pass QA and still be a defect.
+
+**The browser constraint that made this non-obvious**, and the reason a drop target cannot simply
+apply its rule: **`dataTransfer.getData()` returns `''` during `dragover`** — the drag data store is
+in *protected mode* until `drop`, exposing only `types`. Both panels accepted everything because at
+decision time they genuinely had nothing to decide with. The answer is `getAssetDragInfo()`, reading
+the payload the Assets panel stores module-side at dragstart (`setAssetDragPayload`, single
+producer — verified by grep). A null result during an asset drag means a foreign or stale drag and
+is refused, not waved through.
+
+**Each rule has exactly one copy**, in `editor/panels/assetDropPolicy.ts`, called by both the
+dragover handler and the drop handler. That matters more than the refusal text: the Skin editor's
+drop handler had its own hand-written `isImage`, and a second copy of an accept test is precisely
+how the affordance and the action drift apart again — invisibly, since the panel keeps working and
+merely accepts a little more or less than it acts on. (`dragGhost.acceptMatchesAsset` makes the same
+point for `data-accept` targets.) The panels only wire the policy in; it is pure and unit-tested,
+per the editor `.ts`-carries-tests rule below.
+
+`handlePrefabDrop`'s `type !== 'prefab'` bail is still load-bearing even though no human can reach
+it, because `modoki_dnd` dispatches `drop` unconditionally and only *reports* what `accepted` was.
+
+### A panel that reads `getAllAssets()` must subscribe to `assetsVersion`
+
+`getAllAssets()` reads the module-level manifest map, and React has no idea when that map
+changes. An import or re-import repopulates it out of band — dev server rescans → the
+`asset-manifest-updated` HMR event → `loadManifestJson(…, {prune:true})` in `createEditor()`
+→ `refreshAssets()`, which bumps `assetsVersion` in the editor store. **A component that
+calls `getAllAssets()` during render, or memoizes its result, and does not subscribe to
+`assetsVersion` will keep showing the asset list as it stood at its last render** — and
+nothing about that looks wrong on screen, because a stale list is a perfectly plausible one.
+
+Two sites had it (#293): `AssetRefField`, which builds the SpritePicker's `assets` prop —
+so a texture converted by the picker's own "Make 2D" button minted a new sprite that the
+still-open picker could not see, making the button look broken — and `TimelineEditor`,
+whose value pickers were memoized on the open-target nonce alone, so an audio file dropped
+into Assets never reached the audio-cue picker until the panel was retargeted.
+
+The exceptions are real and worth recognizing so this is not applied blindly: a function
+called fresh on each open (`discoverScenes` in `SceneListEditor.tsx` — deliberately
+unmemoized, documented as such) and a one-shot read at boot (`createEditor()`) need
+nothing. The rule bites *memoized* or *render-time* reads inside a long-lived panel.
+
+### A list built from `getAllAssets()` must be SORTED, not left in map order
+
+`getAllAssets()` returns `guidToEntry` in **Map insertion order**, and `registerAsset`
+re-registers an existing guid in place while appending a new one. So anything imported or
+converted *during a session* goes to the END of any list derived from it — and jumps into
+position on the next reload, because a fresh boot registers the manifest in scan order.
+
+That reload is what makes this expensive: the list looks correctly ordered every time you
+go looking, so nothing suggests an ordering rule is missing. It was reported as
+*"I see it but it's at the end of list"* only after first reading as the asset being
+missing from the picker entirely (#293 follow-up), and the reload that appeared to fix it
+was really just re-sorting the entry back into place — which sent one session hunting a
+manifest-propagation bug that did not exist.
+
+Sorted as of that sweep: the **SpritePicker**'s texture groups (`sortGroupsByName` in
+`spritePickerGroups.ts` — pure and unit-tested), the **shader** dropdown
+(`shaderCatalog.ts`, built-ins keep their deliberate lead), the **scene** picker
+(`SceneListEditor.discoverScenes`, with the host's boot options left in caller order), and
+the **Timeline Editor**'s audio/prefab value pickers. `FontPicker` already sorted by family
+— it is the one that shows the rule was known.
+
+The test to apply to a new list: *would an asset created five minutes ago appear where the
+user expects, without reloading?* Position must not depend on when the entry was registered.
 
 ### Where a panel's LOGIC belongs (and what is tested)
 
@@ -443,18 +608,34 @@ Panels live in `editor/panels/`:
 - **ModelPreview** (`ModelPreview.tsx`) — an embeddable mini 3D viewer used by the Model
   inspector. It owns its own `WebGLRenderer`, orbit controls, and lights, with a toolbar
   for LOD-level switch, wireframe toggle, and camera reset; it disposes everything on
-  unmount.
+  unmount. It reloads on a re-import off the invalidation epoch — see "The asset Inspector"
+  below, rule 3.
 
 Dialogs/modals mounted by the shell include `ApplyPrefabDialog`,
 `ProjectSettingsDialog`, and the import/build progress modals. Each panel is wrapped in a
 `PanelErrorBoundary` so one panel crashing doesn't take down the editor.
+
+**"Reload Panel" cannot fix every crash, and the boundary now says so instead of looping.** The
+button really does unmount and remount the children, so a panel that died on transient state
+recovers. What it cannot touch is a crash caused by the panel's PERSISTED tab config: the children
+are still bound to the same FlexLayout tab-node object resident in the in-memory model, so the
+initializer re-reads the same bad `node.getConfig()` and dies identically — and repairing the file
+on disk changes nothing until the layout model is re-read. Measured with a non-iterable Console
+`config.levels` (QA-EDITOR-0008): the data was fixed on disk, `Reload Panel` still re-crashed every
+time, and only a full reload recovered — which the UI gave no hint of needing.
+
+So the boundary counts its own retries. A crash arriving after a reset means the in-place path
+failed for THIS crash, and only then does it add the explanation plus a **Reload Editor** button,
+behind an in-place confirm (the reload discards unsaved scene edits, and `window.confirm` blocks
+the renderer). A remount that SURVIVES clears the counter, so a panel that crashed, recovered, and
+hit something unrelated later still gets its own cheap retry first.
 
 ---
 
 ## Trait registry & the auto-generated Inspector
 
 Every ECS trait the editor can show is described by a **`TraitMeta`** in the trait registry
-(`runtime/ecs/traitRegistry.ts`). A game registers its traits once (engine traits via
+(`runtime/core/ecs/traitRegistry.ts`). A game registers its traits once (engine traits via
 `engine/app/ecs/registerTraits.ts`'s `registerAllTraits()`; game traits from the game's own
 `setup.ts`), and from that metadata the editor **auto-generates the Inspector, serializes
 generically, and discovers entities** — there is no hand-written Inspector form per trait.
@@ -518,6 +699,67 @@ derives basic hints from a koota schema's default values; it has no internal cal
 
 The gizmo mode (`translate | rotate | scale`) and space (`world | local`) live in
 `editorStore` and are shared by both modes via a toolbar.
+
+### The idle render gate — what re-arms it, and the edge that keeps being missed
+
+The 3D viewport draws only while its dirty gate has frames left (`editor/panels/viewportDirtyGate.ts`
+— a 60-frame / ~1s COUNTDOWN, not a boolean, because several async loaders in `scene3DSync` poll
+"not ready, retry next frame" with no completion callback). Everything that can change the rendered
+image therefore has to re-arm it, and `SceneView`'s subscription list is the whole set: trait writes,
+structure changes, world swaps, play-state edges, dynamic-font glyph generation, the editor store,
+OrbitControls, and — since QA-ASSET-0008 — **both edges of a model re-import**.
+
+**Both edges, and the second is the one that gets forgotten.** An editor re-import calls
+`invalidateModel`, which evicts the live meshes before the GPU geometry is disposed; that changes the
+image at once. The REBUILD only happens on a frame that runs, and a GLB re-parse routinely takes
+longer than the 1s grace — so re-arming on the invalidation alone still left a re-imported object
+missing indefinitely (measured on `games/space-console`: 10s+, twice, recovering only when an
+unrelated selection forced a frame). It reads as data loss, not as a stale frame. The completion edge
+is `runtime/loaders/modelLoadNotify.ts`, fired by **both** model caches — `meshTemplateCache` for
+static templates and `riggedModelCache` for skinned prototypes. A notifier wired into only the first
+would leave re-imported CHARACTERS broken while every static mesh recovered, which is why it is a
+shared leaf module rather than an export of either cache.
+
+**UNDO/REDO was missing from that list entirely, and it is the sharpest case (2026-08-18).** Undo
+reverts a transform through `gizmoUndo.ts`'s `apply`, a raw `en.set(trait, …)` — it does not go
+through `writeTraitField`, so it fires NO dirty broadcast. The 2D gate has compensated for exactly
+this since it was bitten (the `subscribeUndo` effect in `SceneView.tsx`); the 3D gate never got the
+same wiring. So after an undo `scene3DSync` did not run, and the THREE object kept its PRE-undo
+world matrix while the ECS Transform was already reverted — the next reader of render-side state
+got the stale value for one call. That is `modoki_focus_entity` framing the camera at x:1807 for an
+entity back at x:5 (QA-SVIEW-0003), a gizmo drag computing its base from the un-reverted position so
+a second undo could not restore the original (QA-SVIEW-0001), and the projected gizmo aim-points
+briefly reporting no handles. Calling either a SECOND time "fixed" it only because the first call
+moved the camera and OrbitControls' own `change` armed the gate — which is why it read as
+"stale for exactly one call" rather than as a dead viewport.
+
+MEASURED, same camera pose either side, `games/anim-bug`, Sun dragged +260 px on the X gizmo then
+undone: **before** the fix the scene-view screen rect stayed byte-identical to the DRAGGED reading
+(x 172.528) and only snapped to the reverted x −53.722 when an unrelated selection change armed the
+gate; **after**, the first read is already x −53.721. Note a `modoki_set_transform` + undo does NOT
+reproduce it — that path goes through `mutate_scene`, which does fire the broadcast, so a repro has
+to use the real gizmo drag.
+
+**MaterialInstance was the same shape, found a different way (2026-08-18).** A `kind:'prop'` override
+writes a plain NUMBER onto a per-entity THREE material clone — opacity, colour, roughness, a map
+offset. No trait is written and no store changes, so **not one** of the sources above saw it and the
+viewport kept showing the pre-change frame indefinitely. Every data-level check passes while only
+the pixels are stale: `get_scene_state` reports the authored override and the clone genuinely
+carries the new value. `runtime/rendering/materialDirty.ts` is the missing channel (the sibling of
+`text/textDirty.ts`, and the 3D half of what `markEntity2DMaterialDirty` already did for Pixi);
+`materialInstanceSystem` bumps it only on an ACTUAL value change or a clone rebind, so a
+constant-source override costs one frame and a time/curve-driven one redraws every frame, which is
+what it is asking for.
+
+⚠️ **`modoki_capture_viewport` cannot detect any of this**, and believing otherwise is how the
+MaterialInstance case was mis-diagnosed as "the override never reaches the render, even after a
+FORCED render". It does not force a render, so on this viewport it returns the last drawn frame —
+see [rendering.md](rendering.md) § "The measurement protocol" for the mechanism and what to use
+instead. **This is the standing hazard for anything measured through this panel**, not a detail of
+the MaterialInstance case.
+
+The continuously-rendering GameView needs none of this, which is why the bug was viewport-specific —
+and why "it works in the Game panel" is not evidence that a render-on-demand path is fine.
 
 #### Multi-select gizmo
 
@@ -612,6 +854,13 @@ running game with selectable **device presets**. Unlike SceneView, it composites
 three rendering layers — `3d` (Three.js), `2d` (PixiJS), and `ui` (the DOM
 `UIRenderer`) — exactly as they appear on device. See [Architecture](./architecture.md)
 for the layer model.
+
+A device preset carries its **safe-area insets** as well as its logical and physical
+sizes, and the preview publishes them so UI insets exactly as it would on that phone —
+`env(safe-area-inset-*)` is 0 on a desktop browser, so without this the preview cannot
+show a notch bug at all. Always on, with the bands drawn over the frame. Mechanism, the
+per-orientation data, and what is measured vs published:
+[UI system](./ui-system.md) § "The editor simulates the safe area".
 
 ---
 
@@ -736,12 +985,12 @@ asset-binding bug above was found. The check is permissive on purpose — any re
 outside `editorStore.ts` counts, including from a test — and it excludes its own file from
 the corpus, since naming an orphan in an allowlist would otherwise launder it.
 
-### The asset Inspector — two rules that have each failed three times
+### The asset Inspector — three rules that have each failed repeatedly
 
 The Inspector's asset view (`Inspector.tsx`) is the door to everything above: it renders a
 per-kind branch, and for any kind it does not recognise it prints "No actions for `<type>`
-assets". Both halves of that sentence have gone wrong repeatedly, in ways nothing failed on,
-so both are now enforced rather than remembered.
+assets". Every one of the rules below went wrong in a way nothing failed on, so each is now
+enforced rather than remembered.
 
 **1. Every `AssetType` gets an action.** The recognised-kinds list used to be a string array
 written inline in the JSX, kept in step with the branches above it by hand. It drifted three
@@ -780,6 +1029,94 @@ Complementary, not redundant: `tests/assets/importSettingsOptions.test.ts` separ
 every import-setting **default** appears in its own option list. Splicing can never reveal a
 bad default — a spliced default looks perfectly correct in the dropdown.
 
+**3. An asset preview keyed on the PATH cannot see a re-import (#294).** A re-import is
+precisely the gesture that rewrites the bytes behind a path *without changing the path*, so a
+`resetKey={path}` (or a `useEffect` on `[path]`) never fires and the panel keeps showing the
+pre-reimport asset with nothing saying so — the shape of bug that makes someone re-do an
+export three times believing it did not take. `MeshPreview` shipped that way; `MaterialPreview`
+happened to escape it only because it is keyed on serialized `data` it receives as a prop, not
+because anyone reasoned about re-imports.
+
+The signal a path cannot carry is **`useAssetInvalidationEpoch(kind, matches?)`**
+(`editor/panels/useAssetInvalidationEpoch.ts`), a counter over the re-import event the asset
+caches fire; `useModelInvalidationEpoch()` is the model-only spelling of it. Fold it into the
+`resetKey` (`MeshPreview`) or the effect deps (`MeshAssetView`). Two things about it are
+load-bearing:
+
+- **Cache-busting is a separate problem from re-rendering, and `ModelPreview` needs both.** It
+  fetches the baked `.glb` over HTTP, so even a re-run effect would replay the browser's cached
+  copy of an unchanged URL. `cacheBustReimport(url, epoch)` appends `?reimport=<n>` — with the
+  `blob:`/`data:` carve-out `withCacheBust` makes for the same reason (a blob URL is matched by
+  UUID, so a query suffix 404s the model). The engine's own `withCacheBust` cannot serve here:
+  it is PROD-and-content-hash only, and the editor is neither.
+- **The epoch coalesces on a trailing 250 ms timer, and that is not cosmetic.** ONE Import click
+  fires `invalidateModel` for the same model **three** times — measured on `games/sling`'s
+  `ramp_wedge`, 2 ms apart then 32 ms later (it invalidates before re-deriving templates, again
+  around prefab regeneration, and once at the end). Uncoalesced, each bump costs a subscriber a
+  full GLB refetch and re-parse, so the fix would buy correct pixels at 3x the work on exactly
+  the large models where that hurts. Verified live: three invalidations, one refetch.
+
+Prefer a **filtered** epoch (`targets` names the model plus its baked LOD siblings) wherever the
+consumer knows its own model path, so an unrelated re-import does not refetch a multi-MB GLB.
+`MeshPreview` cannot: mapping a `.mesh.json` back to its source model is only possible through
+the very `meshAssetCache` entry the invalidation is about to delete, so it bumps unfiltered and
+pays one cheap clone-from-cache rebuild.
+
+**4. The same staleness in the sidecar-derived STATS (#303 + #304).** #294 fixed the previews;
+the numbers beside them had the identical bug with a different trigger. `ModelAssetView` and
+`TextureAssetView` re-read `/api/read-meta` on mount and after their OWN import button only, so
+a re-import fired from the Assets panel's "Re-import all", a batch view, or the agent bridge
+left every sidecar-sourced value showing pre-reimport data — source tris, LOD byte sizes, the
+LOD count, texture variant sizes, and the `converted` / `hasCache` flags, which gate UI rather
+than merely display it. Once #294 landed, the Model Inspector actively disagreed with itself:
+fresh geometry in the preview, stale numbers beside it.
+
+Fixed by **one shared event** rather than a second mechanism: `runtime/core/assetInvalidation.ts`
+(L0, imports nothing, so any L3 cache can emit through it without a cycle) carries
+`emitAssetInvalidated(kind, path, targets)` / `onAssetInvalidated(fn)`, and `invalidateModel`,
+`invalidateTexture` and `invalidateAudio` all fire it **before** evicting. `onModelInvalidated`
+survives as a `kind: 'model'` filter over it, so its renderer subscribers
+(`scene3DSync`, `SceneView`) are untouched. The alternative — mirroring a texture-only listener
+onto `invalidateTexture` — was rejected because `audioBufferCache` already documented itself as
+mirroring `invalidateTexture`, making a third parallel one-off the default outcome.
+
+The panel side is deliberately NOT a bare effect dep. The epoch cache-busts the `/api/read-meta`
+URL through `cacheBustReimport`, so it is a value `loadMeta` genuinely reads: the sidecar is
+rewritten **in place at an unchanged URL**, which is exactly the request a browser may replay
+from cache. That also sidesteps the `exhaustive-deps` "unnecessary dependency" warning honestly,
+instead of suppressing it or poking it with a tautology. The self-initiated import path reads
+the sidecar twice as a result (once explicitly, once via the epoch) — one coalesced call
+returning the same bytes.
+
+Also corrected here: `invalidateTexture`'s doc comment claimed its callers "then reload the
+active scene", which is why a listener was never thought necessary. None of its four call sites
+reloads anything.
+
+**5. The same sweep found the chain broken for AUDIO and HDR entirely, in three places.** The
+server registers re-import handlers for **seven** types (texture, model, atlas, audio, video,
+font, environment) and only two of them were ever evicted browser-side. Three independent gates
+each hard-coded `model | texture`, so widening any ONE of them would have changed nothing:
+
+1. `assetViews/reimport.ts` — the client path (Assets panel "Re-import all", batch views).
+2. `/api/reimport` in `editorBackendRouter.ts` — filtered the items before pushing them to the
+   renderer, so the MCP/curl path never even reported an audio or HDR bake.
+3. the `invalidate-assets` agent op — branched on the same two types again.
+
+And underneath all three, `invalidateAudio` was a **silent no-op for its only production
+caller**: it resolved every ref through the manifest, and `resolveRef` rejects an internal asset
+path, so the Audio Inspector's Apply button (which passes the path) evicted nothing. Re-encoding
+a clip left the game playing the OLD decoded buffer, and re-importing an `.hdr` left the viewport
+lit by the old environment, until an editor restart.
+
+Now: the route forwards **every** baked type and the op is the single place that decides which
+kinds hold a cache, so a new kind is one branch in one file. `font` is deliberately not one of
+them — it refreshes through `onFontInvalidated` in `assetManifest`, a manifest-hash channel both
+font caches already subscribe to — and `atlas`/`video` hold no engine-side cache at all (atlas
+frames are read off the manifest; a video streams from its URL). A test in
+`tests/plugins/reimportNotify.test.ts` asserted the OLD filter, on the stated grounds that a clip
+is "not a GPU cache the renderer keys by path"; `audioBufferCache` is keyed by path, so that
+premise was simply false and the test was defending the bug.
+
 ### Animation Editor
 
 `editor/panels/AnimationEditor.tsx` — a Unity-style keyframe timeline for `.anim.json`
@@ -810,15 +1147,35 @@ pans).
 - Editing a trait field **while recording** keys the clip at the playhead (the record hook in
   `animation/recording.ts`); editing an entity **not** under the Animator root warns and is
   dropped rather than silently lost.
-- **Preview envelope + ⏹ Exit Preview** — a scrub or ▶ preview opens a snapshot session
+- **Preview envelope + ⏹ Exit Preview** — a scrub, a ▶ preview, **or any clip edit** (every path
+  that poses; see `pose` in `AnimationEditor.tsx`) opens a snapshot session
   (`editor/scene/timelinePreview.ts`, shared with the Timeline panel) and sets run-mode
-  `scrub`/`preview`. **Cmd+S is refused for the whole envelope** — the pose writes authored traits,
-  so a save would bake it. **⏹ Exit Preview** reverts to the authored snapshot, re-resolves the
+  `scrub`/`preview`. The pose writes authored traits, so a scene save inside the envelope would bake
+  it — which is exactly what happened before the clip-edit path opened one.
+- **An asset-doc edit must not dirty the SCENE.** Every undo entry a panel pushes for a
+  `.anim/.particle/.timeline/.spriteanim/.rig2d/.mat/.shader/.animset` edit carries
+  `_isFileDirect: true` (`editor/undo/undoManager.ts`), so it does not bump the scene's
+  edit-version — its unsaved state is the dirty-asset registry's job, or (for the Inspector's
+  asset views) already on disk. A falsely-dirty scene is not cosmetic: it self-blocks the
+  file-direct agent routes, makes `modoki_build` refuse, and makes Cmd+S interrupt a preview to
+  rewrite a scene nothing changed. The agent twins have set it since S2.27; the panels did not
+  until this was found by the Cmd+S work.
+- **Cmd+S inside the envelope does not refuse; it works.** Three outcomes, in the order the save
+  checks them (`editor/scene/saveCommand.ts`):
+  - nothing needs an authored world — the scene is clean AND this is not a prefab-edit world (the
+    common case while authoring a clip) → **only the parked asset docs are flushed**, the preview is
+    left alone. No reload, no flicker, and no rewrite of a scene file that did not change.
+  - the scene was CHANGED inside the envelope → **the scene save is refused**, and the toast says
+    why. Exiting would restore the snapshot and revert those edits; a save must not destroy work to
+    make itself possible.
+  - otherwise → **exit → save → resume** at the same playhead (`PreviewSaveHandler`), so the save
+    serializes authored data and the animator keeps their frame. Costs one world reload; if the
+    owning panel closed mid-save, the toast says "preview ended" rather than resuming into it. **⏹ Exit Preview** reverts to the authored snapshot, re-resolves the
   Animator root (the reload reassigns entity ids) and returns to `stopped`, which re-enables saving;
   unmount / clip-switch do the same. Without it the panel wedged saves with no way out but closing
-  the tab. Caveat: poses made OUTSIDE the envelope (MCP `set_playhead`, a clip edit's re-pose) open
-  no session, so Exit reverts only to the envelope's start — see Phase 3 of
-  `docs/plans/preview-mode-refactor.md`.
+  the tab. (The old caveat — "poses made OUTSIDE the envelope open no session" — is retired: a clip
+  edit's re-pose now opens one like any other pose, and MCP `set_playhead` moves the playhead VALUE
+  without posing at all, answering `posed:false`.)
 - **Live pose** — scrubbing and preview playback pose the bound entities every frame via the
   shared runtime samplers `applyClipAtTime` + `applyClipDeform` (so a scrubbed clip previews
   skeletal/cloth deformation exactly as it plays), then fire the dirty listeners so the
@@ -857,6 +1214,13 @@ ramps). Top: play / pause / restart / scrub. Every edit calls `backend.setDef` i
 and seeds the shared particle cache, so a `ParticleEmitter` entity referencing the same
 asset in GameView updates too.
 
+**Saving is manual, in this panel and the four other asset editors** (Animation, Timeline, Skin,
+SpriteAnim). An edit parks its document in the dirty-asset registry and **Cmd+S writes it**; the
+status text next to the asset name says `Unsaved ●` or `Saved ✓`, and there is no Save button
+because Save All is the one save. They autosaved on a 400 ms debounce until #259 — see
+[mcp-persistence.md](./mcp-persistence.md) § 5 for what that cost and why the registry is now the
+single path from an asset edit to disk.
+
 ### Sprite Editor
 
 `editor/panels/SpriteEditor.tsx` — Unity-style **sprite slicing** for a texture in
@@ -867,7 +1231,29 @@ cell size, with offset/padding), **auto-detect by alpha islands** (threshold sli
 persists `sprites[]` + `spriteSheet` (and the `spriteGrid` / `spriteAlphaThreshold`
 controls) into the texture's `.meta.json`, and live-registers each slice as a `'sprite'`
 manifest entry so it can be referenced from `Renderable2D.sprite`. One undo step captures
-the full slice set **and** the slicing parameters. See [Materials & Textures](./textures.md).
+the full slice set **and** the slicing parameters. Its fields commit on EVERY keystroke, so a
+run of them coalesces into that one step via `panels/coalescedEdit.ts` — opened on the first
+change and closed by an idle timer or by anything else that touches the history, **never by a
+focus event**, which does not fire in an unfocused window (#244; the class, and how to test it,
+is in [editor input](./editor-input.md)). See [Materials & Textures](./textures.md).
+
+> **A `.meta.json` write REPLACES the file — every writer must read-modify-write.**
+> `/api/write-meta` → `writeMetaSidecar` → `writeJsonAtomic(sidecarPath, committed)`: no merge with
+> what is on disk, deliberately (it also has to split the local-only cache keys out into
+> `.meta.local.json`). So a writer that posts a fragment destroys everything else in the sidecar.
+> Both **postprocessor** controls did exactly that — `Inspector.tsx`'s single-asset dropdown and
+> `ModelBatchView`'s batch one, each posting a bare `{version: 1, postprocessor}`. On a real model
+> (`demos/forest-camp/.../char_Ranger.glb.meta.json`, keys `version, id, rig, generated,
+> modelCache`) picking a postprocessor left `{version: 1, postprocessor}`, losing the asset's
+> **stable GUID** — so every scene and mesh ref to it dangles and the next scan mints a new one,
+> which re-importing cannot repair — plus the `generated` cleanup list (orphaning its derived
+> meshes/materials), the `rig` block and the LOD `modelCache`, and downgrading `version` 2 → 1.
+> The batch view did it to every selected model per click. Both now merge into the sidecar they
+> loaded, like every other writer already did. A literal that does NOT spread is legal only when
+> it authors a COMPLETE sidecar including `id` (the model-import path in `ModelAssetView`);
+> `engine/tests/editor/metaMergeNotClobber.test.ts` encodes exactly that rule. Found by the
+> close-out sweep of the 9-slice work, not by a report — the post succeeds, the UI updates, and
+> the damage sits in a file nobody re-reads until much later.
 
 ### SpriteAnim Editor
 
@@ -885,9 +1271,12 @@ The Material inspector (`editor/panels/assetViews/MaterialAssetView.tsx`) edits 
 file: a shader-kind dropdown plus one auto-dispatched **`ParamField`** widget per shader
 param — texture ref / color / bool / float / vecN, chosen from the shader schema (a
 multi-select shows a non-committal "mixed" placeholder that broadcasts on pick). Unlike the
-coalescing asset editors above, each discrete edit persists synchronously via
-`persistAssetEdit` (against the file **and** the material cache) and pushes its own undo
-entry. Alongside it, `MaterialPreview.tsx` renders the material on a **lit IBL sphere**
+asset editors above — which park their document for Cmd+S (#259) — each discrete edit here
+persists IMMEDIATELY via `persistAssetEdit` (against the file **and** the material cache) and
+pushes its own undo entry. The cache and the panel update optimistically, before the write is
+known to have landed, so the viewport reflects the edit at once; a write that then FAILS is
+reported (console + a warn toast) and the edited value is deliberately left live rather than
+reverted — the next edit rewrites the whole file, so editing again is the retry. Alongside it, `MaterialPreview.tsx` renders the material on a **lit IBL sphere**
 (built with the engine's own `buildPreviewMaterial` inside the shared `Preview3DShell`),
 rebuilt on any field change so a color/roughness tweak reflects live. The **Mesh**
 inspector (`MeshAssetView.tsx`) uses the same shell: `MeshPreview.tsx` loads the shared
@@ -1021,6 +1410,38 @@ rather than keeping two copies of the hash):
 | `smoke-packaged.sh` | 38600 + 0..199 | `SMOKE_BACKEND_PORT` |
 | `assert-app-renders.sh` | 38900 + 0..199 | `RENDER_BACKEND_PORT` |
 
+**The e2e suite has to report its own completeness, because a SHORT run reports green.** It once
+printed `17 passed (1.9m)` instead of 46 — exit 0, zero failures. A subset that reports success is
+strictly worse than a red run: it sails through the pre-push ritual looking like a pass. The root
+cause was found only by trying to start the dev server by hand and getting "port already in use" on
+a port believed free — an **orphaned Vite dev server** was bound to the e2e port and
+`webServer.reuseExistingServer: true` silently **adopted** it, then that adopted server died partway
+through the run. That is why the failure point moved between runs (test 38, then 13, then 5) and why
+the symptom alternated between a truncated run and a cascade of `net::ERR_CONNECTION_REFUSED`.
+Measured on one commit and tree: adopted orphan → 41 failed / 5 passed; port cleared first → 46
+passed, exit 0, clean teardown. Fixed by `reuseExistingServer: false` on the dedicated port — the
+suite would rather fail loudly than adopt a server it cannot vouch for. **What creates an orphan is
+still unknown**; the leading theory is a run killed by a signal (a `| head` closing the pipe, a
+timeout, a Ctrl-C) leaving `npm run dev`'s child vite behind when the npm parent dies.
+
+`engine/tests/e2e/runCompleteReporter.ts` catches the class regardless of cause: a run that reports
+success while covering only part of the suite FAILS. Two checks, and the second is not redundant —
+every discovered test must actually have run, **and** at least `EXPECTED_MIN_TESTS` must have been
+discovered, because if discovery itself comes up short the first check is trivially true.
+`MODOKI_E2E_MIN_TESTS=n` for a deliberate subset. Implementation note: `process.exitCode = 1` does
+**not** work in a Playwright reporter (Playwright assigns its own exit code after reporters finish),
+so the guard returns `{ status: 'failed' }` from `onEnd`. The `46`s above are the 2026-07-29
+incident's numbers and stay as narration — **today's floor is `EXPECTED_MIN_TESTS`, currently 54,
+matching 54 discovered specs.** Read the constant, never a count copied out of prose; growing the
+suite without raising it is how the guard quietly loosens.
+
+**Per-worker dev servers are the real fix for the serial cost, and are deliberately low priority.**
+(Why the suite is serial at all — 4 workers contending on the one shared dev server, failing
+nondeterministically — is in CLAUDE.md's e2e section.) The ceiling was estimated at ~1.7m: fixed
+dev-server boot ≈30s + the then-46 tests ÷ 4. So ~3m/run at best, minus whatever 4 concurrent Vite + backend + chokidar
+instances cost each other in I/O and RAM, against the cost of replacing `webServer` with a
+worker-scoped fixture plus per-worker teardown.
+
 Keep the blocks wide. A tight range is the tempting simplification and it is wrong: 10 slots was
 tried for the packaged harnesses and immediately mapped two real clones to the same port
 (birthday problem — ~30% for four clones in ten slots), which is a per-clone scheme that isn't.
@@ -1125,6 +1546,23 @@ Three things make it worth reading rather than just writing:
 
 Logging is best-effort throughout: it must never take down a launch.
 
+### Verifying a CDP attach is actually YOUR clone
+
+`MODOKI_CDP_PORT=9222` (or any derived CDP port) does not guarantee the resulting page belongs
+to your clone — with several clones running, the port you asked for can already be held by a
+sibling, and a probe against the wrong page silently drives someone else's editor. Verify before
+trusting the attach:
+
+1. `curl http://127.0.0.1:<cdp>/json` and read the page URL back — its Vite port must be your
+   clone's (cross-check with `lsof -nP -iTCP:<vite-port> -sTCP:LISTEN`: the electron process's
+   command path should contain your clone's directory).
+2. `curl http://127.0.0.1:<vite-port>/@fs/<absolute path to a file you just edited>` and grep for
+   your new code, to confirm the CDP page is actually serving your bundle and not a sibling's.
+
+**HMR does NOT re-run `installEditorTestBridge`** — it is captured once at startup, so a newly
+added `devTestBridge` method is not CDP-callable until the page gets a full reload/navigate, not
+just an HMR update.
+
 ### Stopping an editor
 
 `npm run editor:stop` (`engine/scripts/stop-editor.sh`) is the counterpart to the launcher. It
@@ -1209,7 +1647,216 @@ selected at each one.
 
 The undo stack is capped at 200 entries (oldest dropped, warned once per session).
 
+### Asset delete IS undoable — it is snapshot-backed, not a filesystem one-way door
+
+`Assets` → **Move to Trash** looks irreversible and is not. `executeDeletion` calls
+`collectDeletion` FIRST, which `fetch`es every path the delete covers and keeps the bytes —
+text as text, **binaries base64-round-tripped** (`fetch().text()` would UTF-8-corrupt a `.glb`) —
+then `makeDeleteUndo` (`panels/assetUndo.ts`) writes the whole set back on undo. The set is
+`deletionPathsFor`'s output, so a model's generated meshes/materials/textures and their
+`.meta.json` sidecars come back too, GUIDs intact. Folder delete has its own undo entry.
+
+**This is written down because its absence caused a wrong bug report.** #291 was filed asserting
+*"Move to Trash is a filesystem operation and undo does not cover it"* and proposed confirmation
+dialogs on the strength of it. Nothing in `docs/` contradicted that. The dialogs were declined —
+see `docs/todo.md` § Deferred decisions for that call and for why the one surviving
+`window.confirm` (cross-scene move) is not an inconsistency.
+
+**What undo does NOT survive is an editor relaunch** — `undoStack`/`redoStack` are module state
+in `undo/undoManager.ts`. That is normal and is deliberately not treated as a defect.
+
+**The rule that came out of it: an undo that restores less than it trashed must SAY SO.** The
+empty case used to `console.warn` and return, so Cmd+Z read as working while the files sat in the
+OS trash; the partial case was not reported at all. `makeDeleteUndo` now restores what it can and
+`console.error`s the **shortfall**, which covers both. Two details are load-bearing:
+
+- **The shortfall is measured against what the backend ACTUALLY trashed, not against
+  `deletePaths`.** `deletionPathsFor` deliberately lists maybe-absent sidecars
+  (`.meta.local.json` is gitignored and usually not on disk), so a `deletePaths` diff would name
+  files that never existed and send the user hunting in the trash for them. `/api/delete-asset`
+  returns `{ok, trashed, missing}`; `deleteAssetFiles` surfaces that as `DeleteFilesResult` and
+  the caller threads `missing` into the undo action. It used to return a bare boolean and throw
+  the rest away.
+- **`redo` checks its re-delete too.** A failed re-trash left the files on disk while `refresh()`
+  re-listed them, so redo read as a no-op — the same false success on the other half of the pair.
+
+### An undo/redo that discards a failed filesystem op — the whole class (#308)
+
+⚠️ **This class was never confined to asset delete.** The helpers are the trap: `writeAssetFile`,
+`deleteAssetFile`, `moveFileTo`, `createFolderApi` and `duplicateAssetFile`
+**never throw** — they catch and resolve `false`. (`SceneAssetView`'s `mutateScene` was the one
+exception: it resolved `{ok:false}` for an HTTP error but let a network-level rejection escape,
+straight out of an undo closure and into the both-stacks-lost path below. It now catches too.) So ignoring the return value is silent *by
+construction*, and `undoManager` pops the entry and reports success either way: Cmd+Z reads as
+working while nothing happened. The forward path of the same function usually checks the return;
+it was only ever the undo/redo closures that didn't.
+
+**The reporting bar, and why it is not a throw.** A throw looks like the stronger answer — leave
+the entry on the stack so the user can retry — and it is worse. It used to be worse because
+`undo()` popped the action **before** awaiting `action.undo()` with no catch, so a throw skipped
+`redoStack.push`, `notifyEdited`, `markAffectedScenesDirty`, `notifyUndoChanged` and the `!undo`
+event: the action was lost from **BOTH** stacks while the panel still rendered it as completed,
+and `serialize` handed the rejection to a caller that does not catch it. **#310 fixed that
+bookkeeping** (see below), so a throw is now survivable — but the entry is still *dropped*, so a
+throw still costs the user their way back. The bar is unchanged, and is #291's — report, let the
+stack pop, keep editor state consistent with disk:
+
+- **`reportUndoFailure`** (`undo/undoFailure.ts`) is the one reporter. `console.error` naming the
+  direction, the action's label and the paths, always. That log is the user's only hand-recovery
+  path, which is why it names paths rather than saying "the operation failed".
+- **A toast on top, for a collision only.** `/api/move-file` never clobbers: it answers **409
+  "Destination exists"** when something now occupies the path we were moving back to, and
+  403/404/5xx otherwise. A 409 is user-CAUSED and user-FIXABLE (they recreated something at the old
+  name), so it is worth interrupting them for — the console is not a place anyone is looking. A
+  backend failure is not actionable, so it stays console-only.
+- **`moveFileToStatus`** (`panels/assetOps.ts`) exists so that distinction is *measured* rather than
+  guessed. `moveFileTo` deliberately stays a bare boolean: every existing call site uses it as
+  `if (await moveFileTo(…))`, and an object return is always truthy — widening it in place would
+  silently disarm each of those guards while typechecking cleanly.
+- **Gate the dependent state, don't just log it.** The log is for the user; the gate is what keeps
+  the editor honest. Folder rename was an ACTIVE DESYNC rather than a no-op — `setPendingFolders`
+  ran unconditionally while only the binding remap was gated, so a failed undo remapped the client
+  tree to `/Old` while the folder was still physically at `/New`.
+
+**Partial-progress vs all-or-nothing is decided by the UNIT OF WORK, not by taste** — the two
+shapes in this codebase are not a disagreement:
+
+- `makeDeleteUndo` / `makePasteUndo` / `makeFilesDropUndo` cover **N independent files**, so they
+  do what they can, batch the shortfall into ONE message naming every skipped path, and always
+  `refresh()` — whatever *did* change must appear.
+- `createPrefabFromEntity` / `makeRigPrefabAsset` cover **ONE coupled operation** — a
+  `.prefab.json` plus the entities linked to it — so they are all-or-nothing. Half-applying that
+  leaves the user in a state which is neither before nor after (entities un-linked from a prefab
+  still on disk, or linked to one that is not).
+
+**A batch undo must track what it actually MOVED, not replay its list.** This is the trap the
+first fix walked into, and it is the same lie pointed the other way. After a partial failure the
+two directions are out of step: undo moves A and B back but C's move fails, so C is still at its
+forward location. Replaying the whole list on the next redo then asks the backend to move C from
+a path nothing is at — `/api/move-file` answers 404 "Source not found", `/api/duplicate-asset`
+answers 409 "Destination exists" — and that gets folded into the failure report as though C had
+been lost. It has not: C is sitting exactly where redo wanted to put it, and the user is sent
+hunting for a file that was never in danger. So each batch builder remembers which items are
+currently in the undone state and acts only on those. A skip happens ONLY when the item is
+already in the state that direction wants, so a genuine retry still retries.
+
+⚠️ Two things make that state safe to keep in the closure, and both were checked rather than
+assumed: `undoManager` puts an action on `redoStack` *only* via `undo()`, so `redo`-before-`undo`
+is a sequence production cannot produce; and undo actions are never serialized or cloned
+(`swapHistory` stores the same live objects, and the only `structuredClone` touches
+`journalPayload`). If either ever changes, this state is what breaks.
+
+**The delayed-desync case is why gating beats logging.** A `setPrefabCache` after a failed write
+leaves the editor believing in a file that is not on disk: it reads correctly from cache for the
+rest of the session and comes back missing on the next scene load or a fresh editor launch, which
+read the FILE. The failure surfaces far from its cause.
+
+**Every fixed site is now a framework-free FACTORY, and that is a testability constraint rather
+than tidiness.** Six of these lived inside `Assets.tsx` and one inside `SceneAssetView.tsx`, and a
+panel may not be mounted in jsdom to test it (§ Panels — that asserts the mock). So each undo
+builder moved to a plain `.ts` module beside its panel — `panels/assetUndo.ts`,
+`panels/assetViews/baseSceneUndo.ts` — taking `refresh`, the narrow React setters, or the
+component's own `write` as explicit parameters. The panel keeps a one-line
+`pushAction(makeXUndo({…}))`. `assetUndo.ts` already existed for exactly this reason (F6); this
+extended it rather than inventing a second home.
+
+**Deliberately left alone:** the ~15 closures in `undo/entityActions.ts` that no-op when
+`ref.resolve()` returns null. That is an entity which is genuinely gone, not a discarded
+filesystem boolean — and stack ordering means the entity is present in the normal case (deleting
+it pushed its own undo entry, which unwinds first). The abnormal case is a world-rebuild
+guid-index gap, a different bug to chase; fifteen speculative warnings would be noise.
+
 ---
+
+### Undoable panel state cannot live in `useState` (#309)
+
+The sibling of the class above, and it survived #308's sweep because it is not a discarded return
+value — the call *succeeds* and still does nothing.
+
+An undo builder's closures outlive the render that created them. So a builder handed a React
+`setState` from the panel is holding a setter bound to a **fiber that may be gone**: rename folder
+`/A` → `/B`, close the Assets panel, press ⌘Z. The file genuinely moves back, and that half reports
+correctly — but `setExpanded`/`setPendingFolders` are bound to an unmounted fiber and
+**silently no-op, with no warning** (React 19 here; the setState-on-unmounted warning was dropped
+in 18 and has not returned). The mounted `useEffect` that mirrored them to `localStorage`
+never re-runs either, so the stale `/B` value survives and the next mount reads it back: a phantom
+`/B` node, or `/A` rendering collapsed when it was expanded.
+
+**The fix is to move the state out of the component, not to make the setter lookup lazier.**
+`panels/assetFolderState.ts` owns `expanded` / `pendingFolders` / `typeFilter` / `viewMode` at
+module scope, persists on every mutation, and is read through `useSyncExternalStore`. An undo
+closure then holds a **stable module function**, so it is unmount-safe by construction rather than
+by discipline.
+
+⚠️ **`assetViews/persist.ts`'s `_assetViewSetters` registry does NOT transfer here**, and the
+difference is the whole reason a second mechanism exists. There the FILE + CACHE are the source of
+truth and the registered setter is only a live refresh for a panel that happens to be mounted — with
+none registered the write still lands and a later re-select re-reads from disk. Folder-tree state has
+no file: **the sets ARE the truth**, so a registry with nothing in it drops the update and leaves
+`localStorage` stale, i.e. the bug unchanged. Pick by asking *what is the source of truth* — a
+setter registry when it is the file, a store when it is the state itself.
+
+**What is NOT affected, and why it is worth knowing.** Every other Assets undo builder receives
+`refresh`, which is also panel-bound and also no-ops after unmount — harmlessly, because
+`Assets.tsx`'s mount effect calls `refresh()` and re-derives the listing from disk. `useExpandedSet`
+(the read-only Engine + Scripts trees) has the same `useState`-plus-mounted-persist shape and is
+also safe: no undo builder touches those trees. **The shape alone is not the defect** — it needs
+state that is its own source of truth AND a closure that outlives the panel.
+
+Undoing a folder *create* is a folder *delete*, so it prunes both sets, matching
+`handleDeleteFolder`. `makeNewFolderUndo` pruned only `pendingFolders` until #309: the forward
+`createFolder` never adds the new folder's own key to `expanded` (only its ancestor chain, so the
+inline rename input can mount), but `commitFolderRename` does (`.add(newPath)`) — so
+create → rename → undo → undo left a key for a folder that no longer exists. Inert, because
+`buildFolderTree` builds nodes from `pendingFolders`/`diskFolders`/assets and never from `expanded`
+— but persisted, so it accumulated forever. Redo deliberately does not re-add it: the forward path
+never put it there.
+
+
+### A throwing undo/redo closure drops the action, loudly (#310)
+
+The sibling of the class above, and the reason its bar is "report, never throw". Split out of #308
+because it needed a policy decision, not a mechanical guard.
+
+**The mechanism.** `undo()` pops the action, then awaits `action.undo()`. Before #310 only
+`_executing` was in a `try/finally`, so a throw skipped every statement after the await —
+`redoStack.push`, `notifyEdited`, `markAffectedScenesDirty`, `notifyUndoChanged` and the `!undo`
+event. The action ended up on **neither** stack: it could not be redone and could not be undone
+again, it vanished from the panel *as though it had completed*, and `serialize` handed the
+rejection to a caller that does not catch it — including the MCP `undo` op, which reported `did`
+for a step that threw. `redo()` was symmetric, and identical, because the two were duplicated.
+
+**The policy (owner, 2026-08-21): drop the action, with a loud report.** It is the same outcome
+as before — the entry is gone — but deliberate and *reported* instead of silent. The alternatives
+and why they lost:
+
+| | Why not |
+|---|---|
+| Put it back on its own stack to retry | A closure that threw PARTWAY has already applied some of its work; ⌘Z again re-applies that half |
+| Push to the other stack as if it succeeded | Keeps the stacks symmetric, but that is the original false success in a nicer costume |
+
+**Three things must still happen on the failure path**, and each was its own bug. Whatever policy
+a future change picks, these do not change:
+
+- **`notifyUndoChanged()` fires.** The stack really did change, so a panel that skips this keeps
+  rendering history that no longer exists — the part the user actually sees.
+- **The journal event still fires, carrying `failed: true`.** Emitting nothing lets an entry
+  disappear with no trace; emitting a bare `!undo` claims an undo that did not happen.
+- **The dirty signals fire.** A closure that threw halfway HAS moved the world and we cannot know
+  how far, so marking dirty is the conservative direction — under-reporting loses the user's work.
+
+`undo()` and `redo()` now share one `runStep` helper, because they had the same bug twice.
+`runStep` returns whether the step applied; `false` reaches the MCP op as `did`. The reporter is
+`reportUndoThrew` (`undo/undoFailure.ts`), which **always** toasts — the two-level rule above
+distinguishes a failure the user can fix from one they cannot, and this is neither: it is history
+loss, worth interrupting for whatever caused it.
+
+⚠️ **This was LATENT when fixed** — #308 closed the last live route (`SceneAssetView`'s
+`mutateScene` let a network-level rejection escape; it catches now), and every filesystem helper
+resolves `false` rather than throwing. It was fixed anyway because "just throw so the entry stays
+on the stack" is the obvious-looking design the next change will reach for, and it did not work
+until this landed.
+
 
 ## Quick reference
 
@@ -1219,7 +1866,7 @@ The undo stack is capped at 200 entries (oldest dropped, warned once per session
 | Host configuration factory | `editor/createEditor.tsx` |
 | Editor state (selection, gizmo) | `editor/store/editorStore.ts` |
 | Panels | `editor/panels/` (Hierarchy, Inspector, SceneView, Assets, Console, ModelPreview) |
-| Trait registry / Inspector field hints | `runtime/ecs/traitRegistry.ts`, `engine/app/ecs/registerTraits.ts` |
+| Trait registry / Inspector field hints | `runtime/core/ecs/traitRegistry.ts`, `engine/app/ecs/registerTraits.ts` |
 | 3D gizmo | Three.js `TransformControls` (in `SceneView.tsx`) |
 | UI / 2D gizmo | `editor/panels/UIResizeOverlay.tsx`, `Gizmo2D.ts` |
 | Multi-select group-gizmo math (3D + 2D) | `editor/scene/multiTransform.ts` |

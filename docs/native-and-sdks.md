@@ -107,16 +107,146 @@ Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine
 
 ### Key files
 
-- `engine/packages/modoki/src/runtime/appServices.ts` — the registry: `registerAppServices(services)` (merge-registers), `appServices()` (read the current set), `clearAppServices()` (drop them on game swap). Interfaces `CrashlyticsService` (`recordError`/`log`), `AdsService` (`init`/`cleanup`), `AttributionService` (`init`).
-- `engine/packages/modoki/src/runtime/gameDefinition.ts` — the `GameDefinition.registerAppServices?()` hook a project implements.
+- `engine/packages/modoki/src/runtime/core/appServices.ts` — the registry: `registerAppServices(services)` (merge-registers), `appServices()` (read the current set), `clearAppServices()` (drop them on game swap). Interfaces `CrashlyticsService` (`recordError`/`log`), `AdsService` (`init`/`cleanup`), `AttributionService` (`init`).
+- `engine/packages/modoki/src/runtime/core/gameDefinition.ts` — the `GameDefinition.registerAppServices?()` hook a project implements.
 - `games/3d-test/packages/app-services/src/index.ts` — a game's implementation: `register()` calls `registerAppServices({ crashlytics, ads, attribution })`, wiring its own `crashlytics.ts` / `ads.ts` / `attribution.ts` into the engine surface.
-- `engine/app/App.tsx` — the shell that drives the lifecycle; `engine/app/ui/components/ErrorBoundary.tsx` + `engine/app/store/gameStore.ts` — the engine-side callers of `crashlytics`.
+- `engine/app/App.tsx` — the shell that drives the lifecycle.
+- `engine/packages/modoki/src/runtime/core/globalErrors.ts` + `engine/app/installErrorCapture.ts` — the engine's **global JS error capture** (#275). The largest caller of `crashlytics`, and the one a shipped build most depends on — see below.
+- `engine/app/ui/components/ErrorBoundary.tsx` (via `reportReactError`) and `runtime/store/gameStore.ts` (screen breadcrumbs) — the other two engine-side callers.
 
 ### How it works
 
-The engine sees only the **small hook surface** — `crashlytics.recordError/log`, `ads.init/cleanup`, `attribution.init`. A game's package keeps its full API (`showInterstitial`, `logEvent`, `setUserProperty`, …) for the game itself to import and call directly; the engine never sees those. On game bootstrap `App.tsx` calls, in order: `def.registerAppServices()` (the game populates the registry), then — **only on `Capacitor.isNativePlatform()`** — `appServices().attribution?.init()` and `appServices().ads?.init()`. Ads are cleaned up (`appServices().ads?.cleanup()`) on unmount. Crashlytics is pull-driven: `ErrorBoundary` calls `appServices().crashlytics?.recordError(message)` and `gameStore` logs screen breadcrumbs via `appServices().crashlytics?.log(...)`.
+The engine sees only the **small hook surface** — `crashlytics.recordError/log`, `ads.init/cleanup`, `attribution.init`. A game's package keeps its full API (`showInterstitial`, `logEvent`, `setUserProperty`, …) for the game itself to import and call directly; the engine never sees those. On game bootstrap `App.tsx` calls, in order: `def.registerAppServices()` (the game populates the registry), then — **only on `Capacitor.isNativePlatform()`** — `appServices().attribution?.init()` and `appServices().ads?.init()`. Ads are cleaned up (`appServices().ads?.cleanup()`) on unmount. Crashlytics is pull-driven: `gameStore` logs screen breadcrumbs via `appServices().crashlytics?.log(...)`, `ErrorBoundary` reports a React subtree crash through `reportReactError`, and the global capture below reports everything else.
 
 **Every hook is optional and every unregistered hook is a silent no-op** (callers use `?.`) — which is also the correct web/editor behaviour, since the underlying Capacitor plugins stub out off-device anyway. On a game switch `App.tsx` calls `clearAppServices()` **before** the next game's `registerAppServices()`, so a previous game's ad/attribution SDKs don't leak into the next game. Native SDK init is no longer wired in `main.tsx` — that comment there points here. The game package is also the dogfood stand-in for a future Modoki-hosted npm package (see `docs/modoki-package-manager.md`).
+
+### Global JS error capture (#275)
+
+**A shipped build had none.** `window.addEventListener('error'|'unhandledrejection')` existed in four
+files and every one is a debug or editor surface a release build does not carry — `agentBridge.ts`
+and `hmrStaleness.ts` behind `if (__MODOKI_EDITOR__)`, `bridge.ts` behind `build.debugBuild`, and
+`src/editor/consoleCapture.ts` by location. So an uncaught throw outside a React subtree, an async
+failure in a system, or a rejected asset load reached nothing at all in production. `globalErrors.ts`
+closes that, and it is **deliberately ungated** — the same reason analytics may not ride the event
+journal, which `setJournalEnabled` switches off in a release build.
+
+- **`console.error` → `recordError` (a non-fatal ISSUE); `console.warn` → `log` (a BREADCRUMB).**
+  Two different Crashlytics concepts: an issue is grouped and alerted on, a breadcrumb is visible
+  only inside somebody else's report. A game warns on ordinary paths, and promoting those to alerting
+  issues buries the one report that is a real crash.
+- ⚠️ **It is installed by a SIDE-EFFECT IMPORT above `./App.tsx`, not by a call.** ES imports are
+  hoisted and evaluated before any statement of the importing module, so the installer written as
+  `main.tsx`'s first statement still ran after App.tsx's whole module graph — leaving a top-level
+  throw there uncovered, which reaches a player as a blank screen on launch reporting nothing.
+  `engine/tests/architecture/errorCaptureInstallOrder.test.ts` parses the import list (a text match
+  would be satisfied by the comment explaining the rule) and fails if the order moves.
+- **Events raised before a game registers its services are QUEUED**, then flushed on
+  `onAppServicesRegistered` — a crash during boot is the one worth most and the one a
+  fire-and-forget handler loses.
+- **Rate limiting, three layers, and their ORDER is load-bearing**: per-message dedupe first (it
+  counts attempts), then the session cap, then the burst window — charged only for a message about
+  to be sent. Charging the burst window first meant a deduped per-frame warning could exhaust it
+  with attempts that never reached the SDK, and the next unrelated first-ever crash was dropped.
+- ⚠️ **Both Capacitor and React `console.error` an error they are already reporting**, so one fault
+  arrived as two issues until the capture learned to defer a lone-`Error` console report by a
+  microtask and let the richer report claim the object first.
+- The **re-entrancy latch is synchronous and a real service is async**, so what bounds the
+  report-the-report bounce is the game wrapper's own once-per-message latch. Measured at two
+  messages and pinned by a test.
+
+### Deliberate native fault triggers (#278)
+
+The sibling of the above, for everything that does **not** originate in JavaScript.
+`GameDebug.triggerFault({ kind })` (`capacitor-game-debug`) raises a real `SIGSEGV` /
+`EXC_BAD_ACCESS`, an uncaught Java exception, or a 15 s block of Android's main looper, exposed as
+the **Faults** section of the debug menu's Device tab. The reasoning, the platform asymmetry, and
+the three ways a run can report nothing while working correctly are in
+[debug-menu.md](debug-menu.md) § "Faults".
+
+Two facts belong here rather than there, because they are about the native plugin:
+
+- **iOS had no native gate before this.** Android refuses every `GameDebugPlugin` method unless the
+  manifest meta-data is on; the Swift half checked nothing, and stayed out of shipped games only
+  because JS never called `startServer`. Harmless for a server nobody starts, not harmless for a
+  method that kills the app — hence the `ModokiDebugBuild` Info.plist key, written both ways by
+  `healNativeConfig` and read by `isDebugBuildEnabled()`.
+- **The gate is deliberately NOT retrofitted onto `startServer`** in the same change. It fails
+  closed, so every project would lose the iOS bridge at once, on a heal nobody has run yet.
+
+### Android native crashes — the NDK artifact (#279)
+
+The Android sibling of the dSYM gap, and it has the same shape: the report arrives, and it is
+useless. `firebase-crashlytics` alone installs a JAVA handler, which never sees a signal — so a
+genuine `SIGSEGV` produced only the `ApplicationExitInfo reason=5 (APP CRASH(NATIVE))` row
+Crashlytics reconstructs on the next launch, with no stack.
+
+`games/court/android/app/build.gradle` now carries
+`com.google.firebase:firebase-crashlytics-ndk`, pinned to the same version
+`@capacitor-firebase/crashlytics` resolves (they are a matched pair, and a mismatch fails at
+runtime rather than at resolution — i.e. silently). Verified with #278's `crash` probe on an S22:
+`libcrashlytics-handler.so` ships in the APK, and logcat goes from `convertApplicationExitInfo` to
+`Minidump file exists` → `Finalizing native report for session …`. The full before/after is in
+[debug-menu.md](debug-menu.md) § Faults.
+
+Deliberately NOT enabled: `nativeSymbolUploadEnabled`. It uploads symbols for the app's own
+unstripped `.so` files, and Court ships none — a crash in libc or libart is symbolicated by neither
+setting. The artifact is what makes the crash REPORTED at all; symbol upload would only sharpen a
+stack we do not have. Turn it on if a project ever ships its own native code.
+
+### iOS symbolication — dSYMs (#279)
+
+An iOS crash report without a dSYM is a list of raw addresses. Court's dashboard read **"This app
+has 8 unprocessed crashes. Upload 1 dSYM file to process them."** — while a build phase named
+`Upload Crashlytics dSYMs` had been sitting in its pbxproj since #275, doing nothing.
+
+**Why it did nothing, and why that is the interesting part.** The phase gated itself on
+`DEBUG_INFORMATION_FORMAT = dwarf-with-dsym` and said, in a comment, that a skip was *"expected in
+Debug"*. It was — Xcode's Debug default is plain `dwarf`, which produces no dSYM at all. But **Debug
+is the configuration every device build we test with uses**, including the crash probes, so the
+phase was armed only in the configuration nobody debugs with. It reported its own skip correctly on
+every build and nobody read the line.
+
+`healNativeConfig` now owns both halves, for any project depending on
+`@capacitor-firebase/crashlytics`:
+
+- `DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"` in **every** configuration — rewriting the ones
+  that name `dwarf` and adding the key to the ones that omit it.
+- The upload phase itself, generalized out of Court's hand-edited pbxproj (deferred from #275,
+  which is why `games/3d-test` never had it). Strip-and-reinsert on every heal, so editing the
+  script text updates existing projects instead of pinning them to whatever they were healed with.
+
+**The manual tool** — `npm run upload:dsyms -- <projectDir> [--upload] [--dsym <path>]` — covers
+what a build phase cannot: crashes already in the console, an `.xcarchive` from TestFlight, a dSYM
+that arrived some other way.
+
+⚠️ **It LISTS by default and uploads only on `--upload`, and that asymmetry is deliberate.** The
+first version had it the other way round, with `--dry-run` to preview — and
+`npm run upload:dsyms games/court --dry-run` **silently loses the flag**, because `--dry-run` is one
+of npm's own options. Measured: npm echoed `node engine/scripts/upload-dsyms.mjs games/court` and
+the tool uploaded for real. A safety flag the runner can swallow is worse than none, so the
+destructive direction carries the word.
+
+⚠️ **Its load-bearing detail is picking the right DerivedData.** Every Capacitor project's Xcode
+project is literally named `App`, so `~/Library/Developer/Xcode/DerivedData/App-*` matches every
+game on the machine — and with several clones of this repo it matches the same game several times
+(measured: three `App-*` dirs whose workspace is `<clone>/games/court/ios/App/App.xcodeproj`). The
+tool matches the absolute `WorkspacePath` in each candidate's `info.plist`. A newest-wins or
+substring heuristic would upload a sibling clone's symbols and **fail silently**: Crashlytics
+accepts them, and the crash stays unsymbolicated because the UUIDs do not match.
+
+Two limits worth knowing:
+
+- **The 8 already-unprocessed crashes are probably unrecoverable.** They came from builds whose
+  dSYM never existed, so there is nothing to upload for those UUIDs. This fixes everything from the
+  next build onward.
+- **Crashlytics does not record a crash while a debugger is attached** — and on iOS ≤16 the only
+  automatable launch is `idevicedebug run`, which attaches one. So verifying an iOS crash REPORT on
+  the iPhone 8 needs the app started by tapping its icon; the crash TRIGGER can be verified either
+  way (the plugin call and the process death are both visible over the bridge).
+
+A worked example of a game filling the slot — including the Firebase wrapper, the Proxy-thenable
+trap, the gradle/dSYM wiring and the on-device verification — is
+[games/court/attribution.md](../games/court/attribution.md) § "Phase 7 — Crashlytics".
 
 ## AppLovin MAX Mediation (12 networks)
 
@@ -143,7 +273,16 @@ The core AppLovin MAX SDK comes from SPM (`capacitor-applovin-max/Package.swift`
 
 ### SKAdNetwork
 
-258 SKAdNetwork IDs in `ios/App/App/Info.plist` (a superset of AppLovin's official 152). Consolidated list: `https://skadnetwork-ids.applovin.com/v1/skadnetworkids.json`.
+258 SKAdNetwork IDs in `ios/App/App/Info.plist` (a superset of AppLovin's official 152 —
+measured 2026-08-19, the endpoint returns exactly 152).
+
+⚠️ **`https://skadnetwork-ids.applovin.com/v1/skadnetworkids.json` is NOT a consolidated list**,
+though it is easy to read as one. AppLovin states it covers **their own network only** — "this
+is not the case for the other ad networks that AppLovin mediates". The other ~106 ids in the
+258 come from the individual mediation adapters' own documentation. So a script that populates
+`SKAdNetworkItems` from that endpoint alone produces a list that **looks complete and silently
+omits every mediated network** — the ads still serve, and the attribution for those networks
+just never arrives.
 
 ## Debug Bridge & MCP
 
@@ -167,31 +306,8 @@ reads as false. Detail:
 ### MCP tools
 
 The MCP server at `engine/tools/game-debug-mcp/` is a **thin client** of Modoki's device lease — every tool
-proxies through the editor backend's `/api/device/request`. It exposes 20 tools to Claude Code
-(device Percept/Enact parity work grew this from an original 7):
-
-| Tool | Description |
-|---|---|
-| `device_status` | Report the Modoki lease (connected device, or how to connect) |
-| `device_connect` | Connect to a device by IP or adb |
-| `device_disconnect` | Release the device lease |
-| `device_eval` | Execute JavaScript in the game WebView |
-| `device_get_scene_state` | Read live scene/entity/trait state (Percept) |
-| `device_diagnose` | Report NaN transforms, broken refs, orphaned entities |
-| `device_journal` | Read the tick-stamped semantic event journal |
-| `device_resolve_refs` | Resolve GUID refs to live entities |
-| `device_introspect` | Inspect available traits/actions |
-| `device_layout_bounds` | Read UI layout bounds |
-| `device_watch` | Live time-series of chosen entities/traits |
-| `device_screenshot` | Capture the device screen → saves the file, opens Preview, returns **path + dimensions** (image inlined only with `inline:true`) |
-| `device_tap` | Tap at screenshot pixel coordinates (device converts to CSS off the last capture) |
-| `device_drag` | Drag between two points (PixiJS EventSystem) |
-| `device_dispatch_action` | Dispatch a trusted game action (Enact) |
-| `device_press_key` | Send a trusted key press |
-| `device_hover` | Send a trusted hover/pointer-move |
-| `device_scroll` | Send a trusted scroll |
-| `device_console_logs` | Read captured `console.log/warn/error` |
-| `device_native_logs` | Read iOS OSLogStore or Android logcat |
+proxies through the editor backend's `/api/device/request`. Full device tool catalog:
+[debug-tools-mcp.md](./debug-tools-mcp.md).
 
 **Connection is a deliberate, Modoki-owned lease** — the human clicks *Connect a Device* in the
 editor's AI panel (IP or adb); the backend holds one socket + the lease GUID (which never leaves the
@@ -222,9 +338,23 @@ Opening a project in the Electron editor runs two idempotent "make it just work"
 `healNativeConfig(projectRoot)` is deterministic + idempotent — it writes only when something is missing or detectably wrong, never clobbering hand edits. It heals the machine-local / derivable bits that a fresh `cap add` (or a fresh clone) leaves missing:
 
 - **`android/local.properties`** → `sdk.dir` (gitignored, machine-specific; without it Gradle fails "SDK location not found"). Discovered from `$ANDROID_HOME`/`$ANDROID_SDK_ROOT` then the common install dirs.
-- **iOS `DEVELOPMENT_TEAM`** → synced from `build.appleTeamId` (the value lives in the gitignored `project.user.json` — [engine-oss-publishing.md](./engine-oss-publishing.md) § "Private build fields"), scoped to the **App target's** build configs only (via `appBuildConfigUUIDs` — never flattens a separate extension/widget/watch target's team). Corrects any existing value, including the empty `DEVELOPMENT_TEAM = "";` a fresh `cap add ios` leaves.
+- **iOS `DEVELOPMENT_TEAM`** → written from `build.appleTeamId` into a **gitignored `ios/modoki.local.xcconfig`**, and **stripped out of the tracked pbxproj**, so an owner-private value never reaches git (the source value lives in the gitignored `project.user.json` — [engine-oss-publishing.md](./engine-oss-publishing.md) § "Private build fields", which carries the full rationale and the measurements). Debug picks it up via an optional `#include?` appended to Capacitor's own `ios/debug.xcconfig`; **Release needs its own tracked `ios/modoki.xcconfig` wrapper**, because Capacitor attaches `debug.xcconfig` to the Debug configs only and would otherwise leave the shipping configuration unsigned. Still scoped to the **App target's** build configs only (via `appBuildConfigUUIDs` — never touches a separate extension/widget/watch target's team). Removal is deliberate rather than blanking: a target's `buildSettings` beat its `baseConfigurationReference`, so a leftover `DEVELOPMENT_TEAM = "";` would shadow the include.
+
+  <a id="cocoapods-and-the-team-id-xcconfig"></a>
+  ⚠️ **CocoaPods and the Team ID xcconfig.** `pod install` reassigns each configuration's `baseConfigurationReference` to the generated Pods xcconfig, which would orphan `modoki.xcconfig` and silently drop the team from Release builds. No project here has a Podfile today. A project that gains CocoaPods adapters (see [AppLovin mediation](#applovin-max-mediation-adapters), the one pattern that needs them) must add `#include? "modoki.local.xcconfig"` to the Pods xcconfig instead — and the tell is a signing failure that appears only in Release.
 - **iOS orientation + status bar** and **Android `screenOrientation`** → patched into `Info.plist` / `AndroidManifest.xml` to match `capacitor.orientation` / status-bar settings.
 - **Android immersive fullscreen** → when `capacitor.statusBarHidden` is set, a marker-fenced block is patched into **`MainActivity.java`** hiding `systemBars()` via `WindowInsetsControllerCompat`, re-applied in `onWindowFocusChanged`. Three things about this are load-bearing. It hides **both** bars (status *and* navigation) even though the flag is named for the status bar: iOS has no second bar, so `statusBarHidden` there already means "the game owns the screen", and leaving Android's nav bar up would honour the name while missing the intent. It has to be **Java, not a theme** — `android:windowFullscreen` reaches the status bar only. And it must re-apply on focus regain, because the bars return after a notification shade / permission dialog / task switch, so hiding once in `onCreate` silently decays. A MainActivity with custom code (non-empty class body, no marker) is left alone and reported rather than rewritten; clearing the flag removes the block and its imports.
+
+  ⚠️ **A fourth thing, and it is the one that shipped broken: the block must also set
+  `layoutInDisplayCutoutMode = SHORT_EDGES`.** `WindowCompat.setDecorFitsSystemWindows(false)`
+  opts out of fitting the system **bars** and says nothing about the display cutout, so without
+  it the window is laid out BENEATH the cutout — measured on a Galaxy A23 as a frame of
+  `[0,59][720,1560]` inside a 1560px display. With the bars hidden nothing draws in that strip,
+  so the window background shows through as a **59px black band**. The same fact also makes
+  `env(safe-area-inset-*)` report `0` on Android, because a window that never reaches the cutout
+  has no inset to tell CSS about — which is how "Android has no safe-area insets" briefly got
+  recorded as a platform fact instead of a symptom. With the flag: frame `[0,0][720,1560]`, no
+  band, and `env()` reports the real cutout (28dp on an A23, 27dp on an S22).
 - **game-debug wiring** (only when the project depends on `capacitor-game-debug`): adds the `NSLocalNetworkUsageDescription` + `NSBonjourServices` Info.plist keys (iOS 14+ gates the device's inbound-LAN TCP listener behind the **Local Network permission**, prompted via these keys). *(`NSBonjourServices` predates the Bonjour removal and is likely now vestigial — the lease connects by direct IP, no mDNS — but it hasn't been re-verified on-device, so it's left in for now.)* Also writes `MyViewController.swift` + points the storyboard's bridge VC at it + adds the pbxproj file-refs that compile `MyViewController.swift` and the engine's `GameDebugPlugin.swift` into the App target (the SPM static-linking workaround — see the [iOS SPM static-linking gotcha](#ios-spm-static-linking-gotcha)). The Local Network keys and the plugin registration both track `build.debugBuild` **in both directions** — flip it off and the next heal removes them, so an App Store build ships without a Local Network prompt. (Pre-#112 the keys were added unconditionally and stripped from the BUILT plist by a `CONFIGURATION == Release` build phase; that phase is retired, and the heal deletes it from any project that still carries it.)
 
 It is called explicitly on open — **not** buried inside `ensureProjectDeps` — so it runs even for a flat game with native folders but no `package.json`, can't be silently skipped by a dep-install refactor, and always logs (a "already up to date" line included).

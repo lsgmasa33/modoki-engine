@@ -19,6 +19,7 @@ describe('collectResourceRefs', () => {
   const PRIM_MAT_GUID = 'a0000000-0000-4000-8000-000000000003';
   const SPRITE_GUID = 'a0000000-0000-4000-8000-000000000004';
   const IMG_GUID = 'a0000000-0000-4000-8000-000000000005';
+  const FONT_GUID = 'a0000000-0000-4000-8000-000000000007';
   const MODEL_GUID = 'a0000000-0000-4000-8000-000000000010';
   const PREFAB_GUID = 'a0000000-0000-4000-8000-000000000011';
   const ENV_GUID = 'a0000000-0000-4000-8000-000000000012';
@@ -114,12 +115,26 @@ describe('collectResourceRefs', () => {
     expect(refs).toHaveLength(0);
   });
 
-  it('extracts font refs from UIElement', async () => {
+  /** `fontFamily` holds a font-asset GUID since #231 and is collected as `font-family` —
+   *  a DOM font ref, distinct from the `font` (SDF atlas) acquire the same asset gets from
+   *  `Text2D.font`, because one asset can be consumed by both and each needs its own load. */
+  it('extracts a font-family ref from UIElement', async () => {
+    const { collectResourceRefs } = await getModule();
+    const refs = collectResourceRefs([
+      entity('label', { UIElement: { fontFamily: FONT_GUID, imageSrc: '' } }),
+    ]);
+    expect(refs).toContainEqual({ type: 'font-family', path: FONT_GUID });
+  });
+
+  it('ignores a legacy CSS family NAME in fontFamily (not a fetchable ref)', async () => {
+    // Pre-#231 authoring. The runtime still RENDERS it (uiTreeStore's read-side fallback),
+    // but it is not a ref, so it cannot be collected as a resource — which is exactly the
+    // build-invisibility that made the migration worth doing.
     const { collectResourceRefs } = await getModule();
     const refs = collectResourceRefs([
       entity('label', { UIElement: { fontFamily: 'Roboto', imageSrc: '' } }),
     ]);
-    expect(refs).toContainEqual({ type: 'font', path: 'Roboto' });
+    expect(refs).toEqual([]);
   });
 
   it('extracts image refs from UIElement', async () => {
@@ -291,7 +306,7 @@ describe('collectResourceRefs', () => {
     const refs = collectResourceRefs([
       entity('complex', {
         Renderable3D: { mesh: MESH_GUID, material: MAT_GUID },
-        UIElement: { fontFamily: 'Roboto', imageSrc: IMG_GUID },
+        UIElement: { fontFamily: FONT_GUID, imageSrc: IMG_GUID },
       }),
     ]);
     expect(refs).toHaveLength(4);

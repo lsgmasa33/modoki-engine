@@ -3,7 +3,7 @@
  *  material builders (buildPreviewMaterial), then loads its texture maps (base color,
  *  normal, roughness, …) and shows it under IBL in the shared Preview3DShell. Rebuilds
  *  on any data edit (keyed on the serialized data), so a color/roughness/texture tweak
- *  reflects live. See docs/asset-inspector-plan.md Phase 2. */
+ *  reflects live. See docs/editor.md "The asset Inspector — three rules". */
 
 import { useCallback, useMemo } from 'react';
 import * as THREE from 'three';

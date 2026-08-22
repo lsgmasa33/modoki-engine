@@ -8,6 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
+import { unsavedForceParam } from '../shapes.js';
 
 export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
   const { fail, getJson, postJson, unsavedChangesWarning, consumeBuildStream } = ctx;
@@ -65,12 +66,15 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
       'the file needs repairing by hand first. action=set deep-merges ' +
       '`values` onto what is ON DISK and persists: a section you omit is left untouched, and only ' +
       'what the project actually chose is written (engine defaults are not baked in). A PARTIAL SET ' +
-      'IS SAFE — edit one field at a time. Arrays (content.scenes, physics.layers) replace wholesale ' +
-      'rather than merging, and a key you DO pass always wins — including "" and false, which is how ' +
-      'you clear a field. Refused with 400 (nothing written) if: a build field would be unsafe to ' +
-      'interpolate into a shell command; the patch contains a `null` anywhere (no field is nullable — ' +
-      'use ""/false/0 to clear); or project.config.json exists but is not valid JSON, since a patch ' +
-      'onto a file that cannot be read would replace it. Contract + rationale: docs/editor.md ' +
+      'IS SAFE — edit one field at a time. Arrays (content.scenes, physics.layers) AND ' +
+      '`rendering.three.tiers` replace wholesale rather than merging, and a key you DO pass always ' +
+      'wins — including "" and false, which is how you clear a field. Refused with 400 (nothing ' +
+      'written) if: a build field would be unsafe to interpolate into a shell command; the patch ' +
+      'contains a `null` anywhere (no field is nullable — use ""/false/0 to clear); ' +
+      '`rendering.three.tiers` is present but any named tier object is missing a field (it is NOT ' +
+      'merged onto the on-disk tier — post the complete tier block or omit the key entirely); or ' +
+      'project.config.json exists but is not valid JSON, since a patch onto a file that cannot be ' +
+      'read would replace it. Contract + rationale: docs/editor.md ' +
       '"Project Settings — the save contract".',
     {
       action: z.enum(['get', 'set']),
@@ -111,7 +115,7 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
     {
       platform: z.enum(['web', 'ios', 'android', 'playable'])
         .describe("Build target. 'web' → dist/; 'ios'/'android' → the native app (auto-scaffolds the platform on first build); 'playable' → a single self-contained MRAID ad HTML."),
-      force: z.boolean().optional().describe('Build even with unsaved editor changes (the artifact will NOT contain them).'),
+      force: unsavedForceParam,
     },
     async ({ platform, force }) => {
       // A build reads the scene FILE. The live-world tools (create_entity / duplicate / prefab)
@@ -142,7 +146,7 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
       'Target…". Consumes the stream to completion.',
     {
       platform: z.enum(['ios', 'android']).describe('Which native platform to scaffold into the project (creates games/<id>/ios or /android).'),
-      force: z.boolean().optional().describe('Scaffold even with unsaved editor changes (the web build it runs will NOT contain them).'),
+      force: unsavedForceParam,
     },
     async ({ platform, force }) => {
       // The third build-family tool, and the last one without the stale-scene gate: it runs a web
@@ -187,7 +191,7 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
       bundleName: z.string().optional().describe('Must equal (or be omitted, defaulting to) this project\'s own project.config.json ota.bundleName — the server refuses any other value. This route always builds the CURRENTLY OPEN project as a normal web build and publishes it as itself; it does NOT build/publish a Phase 4 sub-game module bundle (that needs build-subgame.mjs + a manual publish, not this tool). To publish a sub-game, open ITS OWN project and call this tool there.'),
       key: z.string().optional().describe('Signing key name under build/ota-keys/<key>.json (default "default").'),
       bucket: z.string().optional().describe('gs://bucket[/prefix] override — only needed when ota.baseUrl is a custom CDN domain that cannot be reverse-derived to its gs:// form.'),
-      force: z.boolean().optional().describe('Publish even with unsaved editor changes (the shipped bundle will NOT contain them).'),
+      force: unsavedForceParam,
     },
     async ({ version, mandatory, bundleName, key, bucket, force }) => {
       // Same gate as modoki_build, and it belongs here MORE: a build produces a local artifact you

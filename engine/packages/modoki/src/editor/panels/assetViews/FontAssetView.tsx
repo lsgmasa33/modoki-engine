@@ -4,7 +4,7 @@
  *  The baked mtsdf atlas + Chlumsky metrics are served at `<src>~atlas.png` +
  *  `<src>~metrics.json`; the font is then GUID-referenceable by the Text traits. */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import {
@@ -130,6 +130,29 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
     });
   }, [meta, path]);
 
+  // Commit the custom-charset field. Not a naive `onBlur`-only commit (#233, same class
+  // as `RenameInput`/`AxisRow` below): Chromium only dispatches focus/blur while
+  // `document.hasFocus()`, so in an agent-driven session (window never OS-focused) the
+  // old blur-only version never committed at all. Enter now commits DIRECTLY, and the
+  // trailing `.blur()` it issues still fires `onBlur` when the window IS focused — which
+  // would double-write the sidecar if not guarded: `settings.customChars` is a state
+  // closure that has not caught up yet in that same synchronous tick, so comparing
+  // against it alone is not enough. `lastCommittedCustomCharsRef` is updated
+  // synchronously and closes that gap.
+  const lastCommittedCustomCharsRef = useRef<string | null>(null);
+  // Clear the latch whenever the value changes from OUTSIDE (undo, another panel, a
+  // reselect). It exists only to swallow the trailing blur that Enter fires in the SAME
+  // synchronous tick, and that window closes at the next render — held any longer it
+  // becomes the very bug this fix removes: re-entering a previously-committed value
+  // after an external change would compare equal to the latch and silently do nothing.
+  useEffect(() => { lastCommittedCustomCharsRef.current = null; }, [settings.customChars]);
+  const commitCustomChars = useCallback((v: string) => {
+    if (v !== (settings.customChars ?? '') && v !== lastCommittedCustomCharsRef.current) {
+      lastCommittedCustomCharsRef.current = v;
+      update({ customChars: v });
+    }
+  }, [settings.customChars, update]);
+
   const apply = useCallback(async () => {
     setImporting(true);
     setImportStatus(true, `Baking ${name}...`);
@@ -174,7 +197,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
         <>
           <div style={rowStyle}>
             <span style={labelStyle}>Field type</span>
-            <select value={settings.fieldType} onChange={(e) => update({ fieldType: e.target.value as FontFieldType })} style={{ ...inputStyle, flex: 1 }}>
+            <select data-ui-id="assetView.font.fieldType" data-ui-kind="field" data-ui-label="Field type" value={settings.fieldType} onChange={(e) => update({ fieldType: e.target.value as FontFieldType })} style={{ ...inputStyle, flex: 1 }}>
               {FIELD_TYPE_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
           </div>
@@ -193,13 +216,13 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       )}
       <div style={rowStyle}>
         <span style={labelStyle}>Glyph size (px/em)</span>
-        <select value={String(settings.size)} onChange={(e) => update({ size: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
+        <select data-ui-id="assetView.font.size" data-ui-kind="field" data-ui-label="Glyph size" value={String(settings.size)} onChange={(e) => update({ size: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
           {withCurrentValue(FONT_SIZES, settings.size).map((s) => <option key={s} value={s}>{s}{s >= 96 ? ' (sharp corners)' : ''}</option>)}
         </select>
       </div>
       <div style={rowStyle}>
         <span style={labelStyle}>Distance range (px)</span>
-        <select value={String(settings.pxRange)} onChange={(e) => update({ pxRange: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
+        <select data-ui-id="assetView.font.pxRange" data-ui-kind="field" data-ui-label="Distance range" value={String(settings.pxRange)} onChange={(e) => update({ pxRange: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }}>
           {withCurrentValue(FONT_PX_RANGES, settings.pxRange).map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
       </div>
@@ -239,7 +262,25 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
           <input
             value={customChars}
             onChange={(e) => setCustomChars(e.target.value)}
-            onBlur={() => update({ customChars })}
+            // Reads the DOM node, never the `customChars` state closure: the trailing blur below
+            // fires inside the same synchronous stack, where that closure is still pre-Escape.
+            onBlur={(e) => commitCustomChars(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') { commitCustomChars(e.currentTarget.value); (e.target as HTMLInputElement).blur(); }
+          // Escape must revert ORDER-INDEPENDENTLY. `setX(...)` only SCHEDULES a React update, and
+          // the `.blur()` on the next line dispatches synchronously in a genuinely focused window —
+          // before that flush — so an onBlur that reads state (or a DOM node the revert has not
+          // reached) would commit the very text just discarded, then repaint as reverted so it LOOKS
+          // like Escape worked. Writing the DOM node first makes the trailing blur see the reverted
+          // value and no-op, whichever order they run in. Same shape as SkinEditor's InlineNameField,
+          // which is uncontrolled and was always safe for exactly this reason.
+              else if (e.key === 'Escape') {
+                const persisted = settings.customChars ?? '';
+                e.currentTarget.value = persisted;
+                setCustomChars(persisted);
+                (e.target as HTMLInputElement).blur();
+              }
+            }}
             placeholder="e.g. 0123ABC…"
             style={{ ...inputStyle, flex: 1 }}
           />
@@ -276,6 +317,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       )}
 
       <button
+        data-ui-id="assetView.font.apply" data-ui-kind="button" data-ui-label={converted ? 'Re-bake' : 'Apply'}
         disabled={importing}
         onClick={apply}
         style={{ ...reimportBtnStyle, marginTop: 8, background: importing ? '#555' : '#2ecc71', color: '#fff', border: `1px solid ${importing ? '#444' : '#27ae60'}`, cursor: importing ? 'wait' : 'pointer' }}

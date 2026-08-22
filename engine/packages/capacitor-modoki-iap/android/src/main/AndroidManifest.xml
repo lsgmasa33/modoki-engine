@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- com.android.vending.BILLING is contributed by com.android.billingclient:billing via
+         manifest merge, NOT declared here. Declaring it by hand without the library is what makes
+         Play report the integration as legacy "AIDL" billing and refuse monetization (#196). -->
+</manifest>

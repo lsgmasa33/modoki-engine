@@ -3,11 +3,11 @@
 
 import {
   registerSystem, runPipeline as modokiRunPipeline,
-  timeSystem, uiTreeProjection, rotate3DSystem, timelineSystem, animationSystem, spriteAnimationSystem,
+  timeSystem, uiTreeProjection, entriesSystem, installEntryPrefabProvider, rotate3DSystem, timelineSystem, animationSystem, spriteAnimationSystem,
   physics2DSystem, physics3DSystem, zone2DSystem, zone3DSystem, inputSystem, characterInputSystem, characterInput3DSystem, characterAnimationSystem, uiFocusSystem, hapticsSystem, skin2DSystem, audioSystem, setAudioWorldPositionResolver, materialInstanceSystem, SYSTEM_PRIORITY,
   videoSystem, setVideoUrlResolver, resolveVideoUrl,
   setVideoSourceResolver, setVideoDownloader, resolveVideoSource,
-  VideoCache, CacheApiBackend, hasCacheStorage,
+  VideoCache, CacheApiBackend, hasCacheStorage, setActiveVideoCache,
 } from '@modoki/engine/runtime';
 import { transformPropagationSystem, worldTransforms } from '@modoki/engine/runtime';
 
@@ -114,10 +114,20 @@ if (__MODOKI_MODULE_VIDEO__) {
     void videoCache.reconcile();
     setVideoDownloader((key, url, onProgress) =>
       videoCache.fetchAndStore(key, url, onProgress && ((p) => onProgress(p.receivedBytes, p.totalBytes))));
+    setActiveVideoCache(videoCache);
   }
   registerSystem('video', videoSystem, SYSTEM_PRIORITY.AUDIO);
 }
 registerSystem('materialInstance', materialInstanceSystem, SYSTEM_PRIORITY.MATERIAL);
+// The pool reaches prefabs through a registered provider, not an import: runtime/ui/ is an L2
+// subsystem and the loaders are L3 (see docs/architecture-layers.md). Installed here, in the
+// composition layer, which is the one place allowed to know about both.
+installEntryPrefabProvider();
+
+// Scroll-view entry pooling. >= TRANSFORM so it keeps recycling on a PAUSED view (see the
+// UI_ENTRIES banner in core/pipeline.ts), and below PROJECTION so the tree rebuild that follows
+// sees this frame's entry writes.
+registerSystem('uiEntries', entriesSystem, SYSTEM_PRIORITY.UI_ENTRIES);
 registerSystem('uiTreeProjection', uiTreeProjection, SYSTEM_PRIORITY.PROJECTION);
 
 /** Run all registered systems in order. Called once per frame. */

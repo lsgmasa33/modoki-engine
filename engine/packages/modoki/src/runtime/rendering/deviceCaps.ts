@@ -42,6 +42,7 @@
  *  production, fails silently. A probe validated only in dev would have missed every one. */
 
 import { getWebGPUSupported } from './gpuDetect';
+import { readPlatform, readFormFactor } from '../core/formFactor';
 import { getActiveRenderer, readRendererBackend } from '../core/activeRenderer';
 
 export interface CompressedTextureSupport {
@@ -95,39 +96,10 @@ export interface DeviceCaps {
 let cached: DeviceCaps | null = null;
 let pending: Promise<DeviceCaps> | null = null;
 
-/** Read the Capacitor global rather than importing `@capacitor/core`.
- *
- *  Deliberate, and it matches the debug menu's `DeviceTab`: this module ships inside every
- *  game, and the published demos are **web-only**. A hard import would make a native plugin a
- *  build-time requirement for a web page that can never use it. Reading the global degrades to
- *  `'web'` with nothing installed. */
-function readPlatform(): string {
-  const cap = (globalThis as unknown as { Capacitor?: { getPlatform?: () => string } }).Capacitor;
-  try { return cap?.getPlatform?.() ?? 'web'; } catch { return 'web'; }
-}
-
-/** Desktop-class host? See `DeviceCaps.formFactor` for why this is not `platform`.
- *
- *  Ordered by how much each signal actually knows, and every branch that is not a POSITIVE
- *  desktop answer falls through to `'mobile'`:
- *  1. A native iOS/Android build is a handheld, full stop.
- *  2. `userAgentData.mobile` is the browser TELLING us (Chromium, incl. Electron) — believed in
- *     both directions because it is an answer, not an inference.
- *  3. Otherwise (Safari, Firefox — no `userAgentData`): a fine pointer AND no touch points. A
- *     touchscreen laptop fails this and boots low; calibration promotes it. That is the cheap
- *     side of the error, which is why the test is written to be strict rather than clever. */
-function readFormFactor(platform: string): 'mobile' | 'desktop' {
-  if (platform === 'ios' || platform === 'android') return 'mobile';
-  try {
-    const uaData = (navigator as unknown as { userAgentData?: { mobile?: boolean } }).userAgentData;
-    if (typeof uaData?.mobile === 'boolean') return uaData.mobile ? 'mobile' : 'desktop';
-    const finePointer = globalThis.matchMedia?.('(pointer: fine)').matches === true;
-    const noTouch = (navigator.maxTouchPoints ?? 0) === 0;
-    return finePointer && noTouch ? 'desktop' : 'mobile';
-  } catch {
-    return 'mobile'; // cannot tell → the safe side
-  }
-}
+/** Platform + form factor come from L0 core (`core/formFactor.ts`) — the same test the UI's
+ *  touch-control gating asks, kept in ONE place so the tier a device boots at and the controls
+ *  it is offered can never disagree. Re-exported here so existing `deviceCaps` importers are
+ *  unchanged. */
 
 /** Hardware model via the **debug-bridge** plugin global. Resolves `undefined` when it is absent
  *  (web) — never throws, never rejects.

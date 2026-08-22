@@ -24,6 +24,8 @@
 
 import * as THREE from 'three';
 import { onWorldSwap } from '../core/ecs/world';
+import { markDerived } from './derivedMaterials';
+import { retireVariantsOf } from './lightMaskVariants';
 
 /** entity id → its owned clone + the base material the clone was derived from. The base
  *  is the RESOLVED shared material (from the entity's material GUID, re-resolved each frame
@@ -65,24 +67,44 @@ export function resetMaterialInstanceClones(): void {
  *  be a STABLE reference (the caller caches it), so the
  *  `!==` guard rebuilds only on a genuine base change and never thrashes. `meshes` are all the
  *  entity's drawables across every surface — one clone is shared by all. For a prop that touches a
- *  material array, the value is written to EVERY slot. Idempotent once bound. */
-export function applyPropOverride(id: number, meshes: THREE.Mesh[], base: MatOrArray, target: string, value: number): void {
+ *  material array, the value is written to EVERY slot. Idempotent once bound.
+ *
+ *  Returns TRUE when this call (re)bound a clone — a fresh entity, a changed base, or a mesh that
+ *  was still pointing at the shared material. The caller uses it to arm the SceneView's
+ *  render-on-demand gate: the picture changes on a rebind even when the driven VALUE did not (see
+ *  `rendering/materialDirty.ts`), so value comparison alone would miss the very first frame. */
+export function applyPropOverride(id: number, meshes: THREE.Mesh[], base: MatOrArray, target: string, value: number): boolean {
   let entry = clones.get(id);
   let old: MatOrArray | undefined;
+  let rebound = false;
   if (!entry || entry.base !== base) {
     // New entity, or the resolved base changed (material ref swap / async load landed).
     old = entry?.clone;
-    entry = { clone: Array.isArray(base) ? base.map((m) => m.clone()) : base.clone(), base };
+    // `markDerived` stamps each clone with the base whose TEXTURE references it shares, so the
+    // retired-material sweep can see that a mesh binding this clone is still holding the base
+    // (#318). Without it a base whose only holder is a prop clone was swept and freed, and
+    // `disposeMaterial` released the textures the clone is still sampling — reachable by
+    // deactivating this entity, re-importing the `.mat.json`, and reactivating.
+    entry = Array.isArray(base)
+      ? { clone: base.map((m) => markDerived(m.clone(), m)), base }
+      : { clone: markDerived(base.clone(), base), base };
     clones.set(id, entry);
+    rebound = true;
   }
   for (const mesh of meshes) {
-    if (mesh.material !== entry.clone) mesh.material = entry.clone as THREE.Material | THREE.Material[];
+    if (mesh.material !== entry.clone) { mesh.material = entry.clone as THREE.Material | THREE.Material[]; rebound = true; }
   }
   if (Array.isArray(entry.clone)) { for (const c of entry.clone) applyProp(c, target, value); }
   else applyProp(entry.clone, target, value);
   // Dispose the superseded clone AFTER every mesh has been rebound, so nothing renders a
-  // disposed material even momentarily.
+  // disposed material even momentarily. Immediate is still right: `meshes` is every drawable
+  // this entity has on every surface, and the loop above rebound all of them.
+  // First drop any light-mask variant derived from the old clone (#318) — the mesh moved off it
+  // in the same loop, so it has no binder, but its cache entry is keyed by the dead clone's uuid
+  // and would otherwise sit in `owned` holding freed texture references until the world swap.
+  if (old) for (const m of Array.isArray(old) ? old : [old]) retireVariantsOf(m);
   if (old) disposeMat(old);
+  return rebound;
 }
 
 /** Write one standard material property from a numeric driver value. Color-typed props

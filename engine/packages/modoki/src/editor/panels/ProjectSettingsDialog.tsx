@@ -9,6 +9,7 @@ import { getProjectSettings, type ProjectSettingsField } from '../createEditor';
 import PhysicsLayersEditor from './PhysicsLayersEditor';
 import SceneListEditor from './SceneListEditor';
 import ModuleTogglesEditor from './ModuleTogglesEditor';
+import QualityTiersEditor from './QualityTiersEditor';
 
 type Values = Record<string, unknown>;
 
@@ -51,11 +52,13 @@ function Field({ field, value, onChange, onPick }: {
     </div>
   );
 
+  const uiId = `projectSettings.${field.key}`;
+
   switch (field.type) {
     case 'checkbox':
       return (
         <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#ddd', fontSize: 12 }}>
-          <input type="checkbox" checked={Boolean(value)} onChange={(e) => onChange(e.target.checked)} />
+          <input data-ui-id={uiId} data-ui-kind="toggle" data-ui-label={field.label} data-ui-state={value ? 'checked' : 'unchecked'} type="checkbox" checked={Boolean(value)} onChange={(e) => onChange(e.target.checked)} />
           {field.label}
           {field.help && <span style={{ color: '#666' }}>{field.help}</span>}
         </label>
@@ -63,14 +66,14 @@ function Field({ field, value, onChange, onPick }: {
     case 'number':
       return (
         <div>{label}
-          <input type="number" style={inputStyle} value={value == null || value === '' ? '' : Number(value)}
+          <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} type="number" style={inputStyle} value={value == null || value === '' ? '' : Number(value)}
             placeholder={field.placeholder} onChange={(e) => onChange(e.target.value === '' ? '' : Number(e.target.value))} />
         </div>
       );
     case 'select':
       return (
         <div>{label}
-          <select style={inputStyle} value={String(value ?? '')} onChange={(e) => onChange(e.target.value)}>
+          <select data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} style={inputStyle} value={String(value ?? '')} onChange={(e) => onChange(e.target.value)}>
             {(field.options ?? []).map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
         </div>
@@ -88,13 +91,13 @@ function Field({ field, value, onChange, onPick }: {
       return (
         <div>{label}
           {opts.length > 0 && (
-            <select style={{ ...inputStyle, marginBottom: 4 }} value={known ? cur : ''}
+            <select data-ui-id={`${uiId}.select`} data-ui-kind="field" data-ui-label={`${field.label} (known)`} style={{ ...inputStyle, marginBottom: 4 }} value={known ? cur : ''}
               onChange={(e) => { if (e.target.value) onChange(e.target.value); }}>
               <option value="">{cur && !known ? `— custom: ${cur} —` : '— select a team —'}</option>
               {opts.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
           )}
-          <input type="text" style={inputStyle} value={cur}
+          <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} type="text" style={inputStyle} value={cur}
             placeholder={field.placeholder} onChange={(e) => onChange(e.target.value)} />
         </div>
       );
@@ -102,7 +105,7 @@ function Field({ field, value, onChange, onPick }: {
     case 'string-list':
       return (
         <div>{label}
-          <textarea style={{ ...inputStyle, minHeight: 56, resize: 'vertical' }}
+          <textarea data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} style={{ ...inputStyle, minHeight: 56, resize: 'vertical' }}
             value={Array.isArray(value) ? value.join('\n') : ''}
             placeholder={field.placeholder ?? 'one per line'}
             onChange={(e) => onChange(e.target.value.split('\n').map((s) => s.trim()).filter(Boolean))} />
@@ -112,10 +115,10 @@ function Field({ field, value, onChange, onPick }: {
       return (
         <div>{label}
           <div style={{ display: 'flex', gap: 6 }}>
-            <input type="text" style={inputStyle} value={String(value ?? '')}
+            <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} type="text" style={inputStyle} value={String(value ?? '')}
               placeholder={field.placeholder} onChange={(e) => onChange(e.target.value)} />
             {onPick && (
-              <button style={browseBtn} onClick={async () => {
+              <button data-ui-id={`${uiId}.browse`} data-ui-kind="button" data-ui-label={`Browse ${field.label}`} style={browseBtn} onClick={async () => {
                 const picked = await onPick(field.pathMode ?? 'folder');
                 if (picked != null) onChange(picked);
               }}>Browse…</button>
@@ -126,7 +129,7 @@ function Field({ field, value, onChange, onPick }: {
     case 'readonly-text':
       return (
         <div>{label}
-          <input type="text" disabled style={{ ...inputStyle, color: '#888', background: '#101018', cursor: 'default' }}
+          <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} type="text" disabled style={{ ...inputStyle, color: '#888', background: '#101018', cursor: 'default' }}
             value={String(value ?? '')} placeholder={field.placeholder} />
         </div>
       );
@@ -136,10 +139,12 @@ function Field({ field, value, onChange, onPick }: {
       return <div>{label}<PhysicsLayersEditor value={value} onChange={onChange} /></div>;
     case 'module-toggles':
       return <div>{label}<ModuleTogglesEditor value={value} onChange={onChange} /></div>;
+    case 'quality-tiers':
+      return <div>{label}<QualityTiersEditor value={value} onChange={onChange} /></div>;
     default:
       return (
         <div>{label}
-          <input type="text" style={inputStyle} value={String(value ?? '')}
+          <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} type="text" style={inputStyle} value={String(value ?? '')}
             placeholder={field.placeholder} onChange={(e) => onChange(e.target.value)} />
         </div>
       );
@@ -265,7 +270,7 @@ export default function ProjectSettingsDialog() {
             {/* Tab bar */}
             <div style={{ display: 'flex', gap: 2, borderBottom: '1px solid #333', marginBottom: 12, flexWrap: 'wrap' }}>
               {schema.tabs.map((t, i) => (
-                <button key={t.title} onClick={() => setActiveTab(i)}
+                <button key={t.title} data-ui-id={`projectSettings.tabs.${i}`} data-ui-kind="tab" data-ui-label={t.title} data-ui-state={i === activeTab ? 'selected' : undefined} onClick={() => setActiveTab(i)}
                   style={{
                     padding: '5px 12px', border: 'none', borderBottom: i === activeTab ? '2px solid #2d6cdf' : '2px solid transparent',
                     background: 'transparent', color: i === activeTab ? '#fff' : '#999', cursor: 'pointer',
@@ -319,8 +324,8 @@ export default function ProjectSettingsDialog() {
         )}
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
-          <button onClick={close} disabled={saving} style={footerBtn}>Cancel</button>
-          <button onClick={apply} disabled={saving || draft === null || inert}
+          <button data-ui-id="projectSettings.footer.cancel" data-ui-kind="button" data-ui-label="Cancel" onClick={close} disabled={saving} style={footerBtn}>Cancel</button>
+          <button data-ui-id="projectSettings.footer.apply" data-ui-kind="button" data-ui-label="Apply" onClick={apply} disabled={saving || draft === null || inert}
             title={inert ? 'Repair the config file first — a save onto a file that could not be read is refused.' : undefined}
             style={{ ...footerBtn, background: '#2d6cdf', borderColor: '#2d6cdf', color: '#fff', opacity: inert ? 0.4 : 1 }}>
             {saving ? 'Applying…' : 'Apply'}

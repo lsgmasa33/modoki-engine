@@ -199,7 +199,16 @@ export function retargetNarrowHint(text: string, filters: readonly string[]): st
  *  - `string` payloads (build logs, plain messages) truncate with a trailing note; they are
  *    not JSON, so there is no envelope to preserve.
  *  - everything else is compact JSON; over the cap it becomes a valid `{elided:true,…}`
- *    envelope carrying counts + a hint instead of a severed blob. */
+ *    envelope carrying counts + a hint instead of a severed blob.
+ *
+ *  The over-cap envelope carries `code:'TOO_LARGE'` — the §5 name for exactly this condition.
+ *  It is NOT an `isError` result and must not become one: §6's whole point is that the caller
+ *  still gets a usable answer (counts, a preview, and the filter that would narrow it), so
+ *  reclassifying it as a failure would turn every legitimately-elided read into a dead end.
+ *  The code is there so the caller can BRANCH on "the answer exists but did not fit" without
+ *  string-matching the hint — which is the only reason the closed set exists. Until this,
+ *  `TOO_LARGE` was documented and declared but never emitted anywhere (found by the
+ *  QA-TOOL-0003 reachability guard, `engine/tests/tools/mcpErrorCodes.test.ts`). */
 export function encode(data: unknown, maxChars: number = MAX_PAYLOAD_CHARS): string {
   if (typeof data === 'string') return capText(data, maxChars);
   const text = JSON.stringify(data);
@@ -208,6 +217,7 @@ export function encode(data: unknown, maxChars: number = MAX_PAYLOAD_CHARS): str
   if (text.length <= maxChars) return text;
   return JSON.stringify({
     elided: true,
+    code: 'TOO_LARGE',
     bytes: text.length,
     hint: narrowHint(text.length, maxChars),
     preview: summarize(data),

@@ -30,6 +30,7 @@ import { materialInstanceSystem, resetMaterialInstanceClocks } from '../../src/r
 import { resetMaterialInstanceClones } from '../../src/runtime/rendering/materialInstanceClones';
 import { registerReadSource, __resetReadSourcesForTesting } from '../../src/runtime/core/readSourceRegistry';
 import { register2DMaterialShaderMap, isEntity2DMaterialDirty } from '../../src/runtime/rendering/sprite2DMaterialBroker';
+import { onMaterial3DDirty } from '../../src/runtime/rendering/materialDirty';
 
 // koota caps at 16 live worlds/process — track and destroy each test's world.
 const _worlds: ReturnType<typeof createWorld>[] = [];
@@ -646,5 +647,74 @@ describe('materialInstanceSystem — 2D materials', () => {
 
     materialInstanceSystem(world);
     expect(sh.resources.matUniforms.uniforms.uK).toBe(0); // not written into freed state
+  });
+});
+
+describe('materialInstanceSystem — the 3D render-on-demand dirty signal', () => {
+  /** Count dirty bumps while `fn` runs. The editor SceneView arms its idle render gate off this
+   *  channel; without it a prop write (a plain number onto a THREE.Material, no trait write, no
+   *  store change) leaves the viewport showing the pre-change frame indefinitely. */
+  function countDirty(fn: () => void): number {
+    let n = 0;
+    const off = onMaterial3DDirty(() => { n++; });
+    try { fn(); } finally { off(); }
+    return n;
+  }
+
+  it('marks dirty on the first apply and when a driven value changes', () => {
+    const world = newWorld();
+    spawnTime(world, 0.5);
+    attachProp(world, [{ target: 'roughness', kind: 'prop', source: { type: 'time' } }], { roughness: 0 });
+    expect(countDirty(() => materialInstanceSystem(world))).toBe(1);   // first bind
+    expect(countDirty(() => materialInstanceSystem(world))).toBe(1);   // time advanced → new value
+  });
+
+  it('goes QUIET for a constant override once it has been applied', () => {
+    const world = newWorld();
+    spawnTime(world, 0.5);
+    attachProp(world, [{ target: 'opacity', kind: 'prop', source: { type: 'constant', value: 0.15 } }], { opacity: 1 });
+    expect(countDirty(() => materialInstanceSystem(world))).toBe(1);   // first bind + write
+    // Marking unconditionally would pin the gate open and defeat the idle-render gate entirely —
+    // the reason this is a value comparison rather than a blanket mark.
+    expect(countDirty(() => { materialInstanceSystem(world); materialInstanceSystem(world); })).toBe(0);
+  });
+
+  it('marks dirty when the BASE changes even though the driven value does not', () => {
+    // A `.mat.json` finishing its async load, or a material-ref swap, hands `resolvePropBase` a
+    // different base object; `applyPropOverride` then builds a fresh clone. The value is
+    // identical, so the value comparison alone says "quiet" — and the viewport would keep drawing
+    // the OLD clone. This is what `applyPropOverride`'s rebind return exists for.
+    const world = newWorld();
+    spawnTime(world, 0.5);
+    const { e } = attachProp(world, [{ target: 'opacity', kind: 'prop', source: { type: 'constant', value: 0.15 } }], { opacity: 1 });
+    expect(countDirty(() => materialInstanceSystem(world))).toBe(1);   // first bind
+    expect(countDirty(() => materialInstanceSystem(world))).toBe(0);   // settled
+    const guid = (e.get(Renderable3DPrimitive) as { material: string }).material;
+    fakeBases.set(guid, makeMaterial({ opacity: 1 }));                 // async load / ref swap landed
+    expect(countDirty(() => materialInstanceSystem(world))).toBe(1);
+  });
+
+  it('a throwing listener cannot break the frame, nor starve the listeners after it', () => {
+    // markMaterial3DDirty fires from inside materialInstanceSystem's per-frame updateEach, so an
+    // escaping throw would take out the ECS system loop for that frame. An observer must not be
+    // able to break the simulation — or the observers behind it.
+    const world = newWorld();
+    spawnTime(world, 0.5);
+    attachProp(world, [{ target: 'opacity', kind: 'prop', source: { type: 'constant', value: 0.15 } }], { opacity: 1 });
+    let after = 0;
+    const offBad = onMaterial3DDirty(() => { throw new Error('observer blew up'); });
+    const offGood = onMaterial3DDirty(() => { after++; });
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => materialInstanceSystem(world)).not.toThrow();
+      expect(after).toBe(1);
+    } finally { err.mockRestore(); offBad(); offGood(); }
+  });
+
+  it('does not mark dirty for a uniform-only override (no material property is touched)', () => {
+    const world = newWorld();
+    spawnTime(world);
+    attach(world, [{ target: 'glow', kind: 'uniform', source: { type: 'constant', value: 0.7 } }]);
+    expect(countDirty(() => materialInstanceSystem(world))).toBe(0);
   });
 });

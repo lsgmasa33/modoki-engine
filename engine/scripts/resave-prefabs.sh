@@ -39,6 +39,10 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PORT=${MODOKI_BACKEND_PORT:-5179}
 BE="http://127.0.0.1:${PORT}"
+# Per clone, keyed on the backend port — /tmp is machine-wide, so a bare name lets two
+# clones sweeping at once overwrite each other's launch output, and this file is only ever
+# read on the `FAILED to open` branch below (i.e. when a sibling's log misleads most).
+LAUNCH_LOG="/tmp/resave-prefabs-launch-${PORT}.log"
 cd "$ROOT"
 
 # Projects whose game code mutates authored state on load (#124). Their scenes are still on
@@ -66,7 +70,7 @@ for PROJ in "$@"; do
   esac
 
   # Repo-scoped launcher — never touches a sibling clone's editor.
-  MODOKI_BACKEND_PORT="$PORT" engine/scripts/launch-editor.sh "$PROJ" > /tmp/resave-prefabs-launch.log 2>&1
+  MODOKI_BACKEND_PORT="$PORT" engine/scripts/launch-editor.sh "$PROJ" > "$LAUNCH_LOG" 2>&1
 
   # Match the FULL projectRoot, not a bare substring (see resave-scenes.sh) — a future
   # `games/court-2` would make a loose match open the wrong project and rewrite its prefabs.
@@ -78,7 +82,7 @@ for PROJ in "$@"; do
   done
   case "$ident" in
     *"\"projectRoot\":\"$ROOT/$PROJ\""*) ;;
-    *) echo "  FAILED to open (identity: ${ident:-none})"; tail -5 /tmp/resave-prefabs-launch.log; fail=1; continue;;
+    *) echo "  FAILED to open (identity: ${ident:-none})"; tail -5 "$LAUNCH_LOG"; fail=1; continue;;
   esac
 
   # The backend answers before the renderer window exists, but edit-open needs the RENDERER —

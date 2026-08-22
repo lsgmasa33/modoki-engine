@@ -29,13 +29,13 @@ import ApplyPrefabDialog, { RevertPrefabDialog } from './panels/ApplyPrefabDialo
 import ProjectSettingsDialog from './panels/ProjectSettingsDialog';
 import BuildSupportDialog from './panels/BuildSupportDialog';
 import CleanupAssetsDialog from './panels/CleanupAssetsDialog';
+import FindReferencesDialog from './panels/FindReferencesDialog';
 import PublishOtaDialog from './panels/PublishOtaDialog';
 import OtaKeysDialog from './panels/OtaKeysDialog';
 import PanelErrorBoundary from './panels/PanelErrorBoundary';
-import { saveAll } from './scene/serialize';
-import { enterPlay, pausePlay, getModeOwner } from './scene/playMode';
-import { getPlayState, setPlayState, onPlayStateChange, getRunMode, canEdit as canEditMode } from '../runtime/core/playState';
-import { savePrefabEdit, isEditingPrefab } from './scene/prefabEdit';
+import { runSaveAll, toastForSave } from './scene/saveCommand';
+import { enterPlay, pausePlay } from './scene/playMode';
+import { getPlayState, setPlayState, onPlayStateChange } from '../runtime/core/playState';
 import { useEditorStore } from './store/editorStore';
 import { setActionCallback } from './undo/entityActions';
 import { pushAction, undo, redo, canUndo, canRedo, undoLabel, redoLabel, subscribeUndo, getUndoVersion } from './undo/undoManager';
@@ -117,6 +117,31 @@ export default function EditorApp() {
   // (✓ shown / hidden) recomputes when a panel is closed or re-shown.
   const [layoutVersion, setLayoutVersion] = useState(0);
 
+  // ── Publish the open-panel set for the AGENT surface (#301) ──
+  // Same walk as isPanelVisible, but collected once and pushed into the store, because
+  // `set-focus-scope` runs outside React and has no way to reach the FlexLayout model.
+  // Without it that op stored ANY string it was handed and echoed it back, so the
+  // `/api/input/key` guard comparing the echo to the input could never fire: a miscased
+  // `{panel:"Game"}` reported ok:true while the input gate stayed shut, and every following
+  // press reached nothing.
+  //
+  // ⚠️ Called SYNCHRONOUSLY from the two points where the model can change — never from a
+  // `useEffect`. An effect keyed on `layoutVersion` publishes one React commit LATE, and
+  // `set-focus-scope` reads the store with a plain `getState()`, so an agent call landing in
+  // that window would be answered from the pre-change list: the human closes a tab, the agent
+  // focuses it, and the op reports ok for a panel that is already gone. That is the very
+  // failure #301 closes, reopened through a timing gap.
+  const publishOpenPanels = useCallback((model: Model) => {
+    const ids: string[] = [];
+    model.visitNodes((node) => {
+      if (node.getType() === 'tab') {
+        const id = (node as TabNode).getComponent();
+        if (id) ids.push(id);
+      }
+    });
+    useEditorStore.getState().setOpenPanels(ids);
+  }, []);
+
   // Build the initial model (tracked layout → autosave → localStorage → default).
   useEffect(() => {
     let alive = true; // guard against setState after unmount (fast remount / StrictMode)
@@ -139,11 +164,14 @@ export default function EditorApp() {
       }
       if (newlyDocked.length) markAutoDocked(newlyDocked);
       modelRef.current = m;
+      publishOpenPanels(m);
       setLayoutName(currentLayoutName()); // may have been cleared if the layout was missing
       setReady(true);
     });
     return () => { alive = false; };
-  }, []);
+    // publishOpenPanels is a stable useCallback([]) — listed so the mount effect does not
+    // silently close over a stale one if that ever gains dependencies.
+  }, [publishOpenPanels]);
 
   // Show a (possibly hidden) panel from the Window menu: focus its tab if it's
   // already open, else dock it back into the Scene tabset (or the first tabset).
@@ -166,6 +194,7 @@ export default function EditorApp() {
     });
     return visible;
   }, []);
+
 
   // Save Layout — write the current layout to the tracked layout (and mirror to
   // localStorage). Falls back to localStorage-only when no layout is tracked.
@@ -256,50 +285,25 @@ export default function EditorApp() {
         scope: 'app-chord',
         menu: { path: 'File/Save All' },
         run: () => {
-          // Saving is disabled unless fully STOPPED — while playing/previewing/scrubbing the live
-          // world holds mutated/temporary state (a preview pose, a control-spawned prefab). Persisting
-          // it would bake preview state into the scene. Stop/exit preview first to save authored data.
-          // (saveScene() also refuses on its own — this is the friendly early message; see Phase 2.)
-          if (!canEditMode()) {
-            const m = getRunMode();
-            // Name the panel that actually owns the mode: BOTH the Timeline and the Animation panel
-            // drive it, and a hardcoded "timeline" sent Animation users hunting for a control in the
-            // wrong window (which is also why the Animation panel now has its own ⏹ Exit Preview).
-            const who = getModeOwner() === 'animation' ? 'Animation' : 'Timeline';
-            const msg = m === 'scrub' || m === 'preview'
-              ? `Exit ${m} to save — press ⏹ Exit Preview in the ${who} panel (poses revert on exit).`
-              : 'Stop the game to save — Cmd+S is disabled during Play (live changes revert on Stop).';
-            console.warn(`[Editor] ${msg}`);
-            useEditorStore.getState().showToast(msg, 'warn');
-            return;
-          }
-          // ⚠️ AWAIT it and report what happened. This fired the green toast unconditionally, without
-          // awaiting — so a refused save (prefab root not found, the opened prefab gone from the
-          // editor cache, a failed write) told the human their work was safe when nothing had been
-          // written. Exactly the C7 class fixed for scenes three lines below, still live here.
-          if (isEditingPrefab()) {
-            void savePrefabEdit().then((ok) => {
-              const t = useEditorStore.getState().showToast;
-              if (ok) t('Prefab saved', 'success');
-              else t('Prefab save FAILED — nothing written to disk (see console)', 'warn');
-            });
-          }
-          // Report what actually happened. This showed a green "Scene saved" unconditionally —
-          // not even awaiting saveAll — so a Save-As CANCEL or a failed write (project moved,
-          // disk full, permissions) told the HUMAN their work was safe when it was not. (C7)
-          else {
-            void saveAll().then((r) => {
-              const t = useEditorStore.getState().showToast;
-              if (r.saved) t('Scene saved', 'success');
-              else if (r.reason === 'cancelled') t('Save cancelled — nothing written', 'info');
-              // Reachable only when the prefab-edit world is loaded but the editingPrefab flag is
-              // gone, so the branch above did not claim the keystroke. Say which save is missing
-              // rather than "Save FAILED (prefab-edit)", which reads like a bug in the prefab.
-              else if (r.reason === 'prefab-edit') {
-                t('This is a prefab-edit world — re-open the prefab to save it (nothing written)', 'warn');
-              } else t(`Save FAILED (${r.reason}) — nothing written to disk`, 'warn');
-            });
-          }
+          // ⚠️ NO run-mode early return here any more (#259). Saving used to be refused outright
+          // unless fully STOPPED, because the live world holds preview state (a pose, a
+          // control-spawned prefab) that must not be baked into an authored SCENE. That reasoning
+          // covers the scene and nothing else: a `.particle.json` / `.anim.json` the panel owns is
+          // authored data in every run mode, and now that the panels park instead of autosaving,
+          // refusing here would leave an Animation-Editor user in scrub mode with no way to save
+          // the clip they just edited. `saveScene` still refuses the SCENE (it owns that guard);
+          // the parked asset docs flush regardless, and the toast says which half happened.
+          //
+          // ⚠️ AWAIT it and report what happened. Both branches once fired a green toast
+          // unconditionally, without awaiting — so a refused save (prefab root not found, a
+          // cancelled Save-As, a failed write) told the human their work was safe when nothing had
+          // been written. That is the C7 class, and `toastForSave` is where it stays fixed for
+          // BOTH entry points at once.
+          void runSaveAll().then((o) => {
+            const { text, kind } = toastForSave(o);
+            if (kind !== 'success') console.warn(`[Editor] ${text}`);
+            useEditorStore.getState().showToast(text, kind);
+          });
         },
       }),
       register({
@@ -378,6 +382,9 @@ export default function EditorApp() {
     // Refresh the Window menu's visibility checkmarks immediately (a panel was
     // closed/added/moved); the actual save stays debounced below.
     setLayoutVersion((v) => v + 1);
+    // Republish the agent-facing open-panel set in the SAME synchronous turn as the change
+    // that caused it — see publishOpenPanels for why this cannot be deferred to an effect.
+    publishOpenPanels(model);
 
     // ── Focus follows tab selection (focus-scope refactor P3.0) ──
     // FlexLayout's tab BUTTONS live outside PanelFocusHost, so clicking a tab to bring a
@@ -414,7 +421,7 @@ export default function EditorApp() {
       // recovery point — no "Save Layout As" required first.
       void writeLayout(AUTOSAVE_NAME, m);
     }, 1000);
-  }, []);
+  }, [publishOpenPanels]);
 
   // Opening a .particle.json surfaces the Particle Editor: select its tab if it
   // already exists, else dock a new tab next to the Scene viewport.
@@ -642,23 +649,16 @@ export default function EditorApp() {
       // FILE. Save Scene As → rename the scene in the Assets window. Both dropped here.
       { label: 'Save All', shortcut: 'Cmd+S', action: () => {
         // ⚠️ This is the NATIVE File-menu twin of the `app.saveAll` keymap handler above, reachable
-        // without the shortcut, and it must report failures the same way. It did not: the prefab
-        // branch was fire-and-forget with no toast at all, so a refused prefab save (root not
-        // found, prefab evicted from the editor cache, write rejected) told the user nothing. The
-        // keymap handler was fixed first and this duplicate 360 lines away was missed — the exact
-        // hazard of having two entry points for one command.
-        if (isEditingPrefab()) {
-          void savePrefabEdit().then((ok) => {
-            const t = useEditorStore.getState().showToast;
-            t(ok ? 'Prefab saved' : 'Prefab save FAILED — nothing written to disk (see console)', ok ? 'success' : 'warn');
-          });
-          return;
-        }
-        void saveAll().then((r) => { // never claim a save that didn't land (C7)
-          const t = useEditorStore.getState().showToast;
-          if (r.saved) t('Scene saved', 'success');
-          else if (r.reason === 'prefab-edit') t('This is a prefab-edit world — re-open the prefab to save it (nothing written)', 'warn');
-          else if (r.reason !== 'cancelled') t(`Save FAILED (${r.reason}) — nothing written to disk`, 'warn');
+        // without the shortcut, and it must report the same thing. It did not: the prefab branch
+        // was fire-and-forget with no toast at all, so a refused prefab save (root not found,
+        // prefab evicted from the editor cache, write rejected) told the user nothing. The keymap
+        // handler was fixed first and this duplicate 360 lines away was missed — the exact hazard
+        // of having two entry points for one command. Both now call ONE command that returns ONE
+        // message (scene/saveCommand.ts), so they cannot disagree again.
+        void runSaveAll().then((o) => {
+          const { text, kind } = toastForSave(o);
+          if (kind !== 'success') console.warn(`[Editor] ${text}`);
+          useEditorStore.getState().showToast(text, kind);
         });
       } },
     ],
@@ -780,6 +780,7 @@ export default function EditorApp() {
       <RevertPrefabDialog />
       <ProjectSettingsDialog />
       <CleanupAssetsDialog />
+      <FindReferencesDialog />
       <BuildSupportDialog />
       <PublishOtaDialog />
       <OtaKeysDialog />
@@ -826,6 +827,7 @@ function SaveLayoutAsModal({ initial, onSave, onExport, onClose }: { initial: st
       <div onClick={(e) => e.stopPropagation()} style={{ background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px', minWidth: 300, fontFamily: 'monospace' }}>
         <div style={{ color: '#fff', fontSize: 13, marginBottom: 12 }}>Save Layout As</div>
         <input
+          data-ui-id="layout.saveAs.name"
           ref={inputRef}
           value={name}
           onChange={(e) => setName(e.target.value)}
@@ -838,10 +840,10 @@ function SaveLayoutAsModal({ initial, onSave, onExport, onClose }: { initial: st
           }}
         />
         <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 12 }}>
-          <button onClick={exportToFile} title="Download the current layout as a portable .layout.json file (doesn't save it in the project)" style={{ padding: '4px 16px', border: '1px solid #555', borderRadius: 3, background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Export to file…</button>
+          <button data-ui-id="layout.saveAs.export" onClick={exportToFile} title="Download the current layout as a portable .layout.json file (doesn't save it in the project)" style={{ padding: '4px 16px', border: '1px solid #555', borderRadius: 3, background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Export to file…</button>
           <div style={{ display: 'flex', gap: 8 }}>
-            <button onClick={onClose} style={{ padding: '4px 16px', border: '1px solid #555', borderRadius: 3, background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Cancel</button>
-            <button onClick={commit} style={{ padding: '4px 16px', border: '1px solid #3a6', borderRadius: 3, background: '#244', color: '#cfc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Save</button>
+            <button data-ui-id="layout.saveAs.cancel" onClick={onClose} style={{ padding: '4px 16px', border: '1px solid #555', borderRadius: 3, background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Cancel</button>
+            <button data-ui-id="layout.saveAs.save" onClick={commit} style={{ padding: '4px 16px', border: '1px solid #3a6', borderRadius: 3, background: '#244', color: '#cfc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11 }}>Save</button>
           </div>
         </div>
       </div>
@@ -913,14 +915,14 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 320, overflowY: 'auto' }}>
             {layouts.map((l) => (
               <div key={l.name} style={{ display: 'flex', gap: 4 }}>
-                <button onClick={() => load(l.name)} style={{
+                <button data-ui-id={`layout.load.${l.name}`} onClick={() => load(l.name)} style={{
                   flex: 1, textAlign: 'left', padding: '6px 10px', border: '1px solid #444', borderRadius: 3,
                   background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12,
                 }}
                   onMouseEnter={(e) => (e.currentTarget.style.background = '#3a3a5c')}
                   onMouseLeave={(e) => (e.currentTarget.style.background = '#2a2a40')}
                 >{l.label}</button>
-                <button onClick={() => exportLayout(l.name)} title="Export to file…" style={{
+                <button data-ui-id={`layout.export.${l.name}`} onClick={() => exportLayout(l.name)} title="Export to file…" style={{
                   padding: '6px 10px', border: '1px solid #444', borderRadius: 3,
                   background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12,
                 }}
@@ -932,11 +934,11 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
           </div>
         )}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 12 }}>
-          <button onClick={loadFromFile} style={{
+          <button data-ui-id="layout.load.fromFile" onClick={loadFromFile} style={{
             padding: '4px 16px', border: '1px solid #555', borderRadius: 3,
             background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11,
           }}>Load from file…</button>
-          <button onClick={onClose} style={{
+          <button data-ui-id="layout.load.cancel" onClick={onClose} style={{
             padding: '4px 16px', border: '1px solid #555', borderRadius: 3,
             background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11,
           }}>Cancel</button>

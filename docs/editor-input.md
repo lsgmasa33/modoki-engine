@@ -80,11 +80,15 @@ Five, resolved by priority. `resolve()` picks the highest-priority candidate for
 | `overlay` | only for the top of the overlay **stack**; outranks everything, so it may swallow an app-chord | Escape-to-close, the SpriteEditor modal's ⌘Z |
 | `text-field` | when `document.activeElement` is text-editable | Enter/Escape commits, Backspace-clears-ref |
 | `<panelId>` | only when that panel is focused, and never while text-editable | everything panel-specific |
-| `app-key` | everywhere **except** text-editable | `f` (frame selected) |
+| `app-key` | everywhere **except** text-editable | *(no registrations today — see note)* |
 | `app-chord` | everywhere, **text fields included** | ⌘S, ⌘Z, ⌘⇧Z, ⌘P |
 
-The two-way split of "app" is the whole point: `f` must frame the selection from any panel, but
-must not fire while you type "fog" into a name field. A panel scope is a **FlexLayout tab component
+The two-way split of "app" is the whole point: a command must not fire while you type into a name
+field. ⚠️ **`app-key` currently has ZERO registrations** — `grep "scope: 'app-key'"` returns nothing.
+This doc long cited `f` ("frame selected") as its canonical example, and that was wrong: `f` is
+registered TWICE at PANEL scope (`Hierarchy.tsx`, `SceneView.tsx`), each deliberately, because
+`app-key` fires from every panel and framing should follow the panel you are in. The tier exists and
+is wired; nothing uses it yet. A panel scope is a **FlexLayout tab component
 id** — `scene`, `game`, `hierarchy`, `inspector`, `console`, `assets`, `particle-editor`,
 `animation-editor`, `timeline-editor`, `spriteanim-editor`, `skin-editor`, `ai`, plus any
 game-registered id.
@@ -111,14 +115,67 @@ Other properties worth knowing:
   create a routing feedback loop (undo changes focus → the next ⌘Z routes elsewhere). Focus may
   *follow* undo (reveal the owning panel), but is always derived, never `pushAction`ed.
 - **Not persisted** across launches.
-- **Observable as data** — `focusedPanel` is in `modoki_get_editor_state`, and a scope change
-  journals `!focus {panel, from, to, source}` (on change only, never per keystroke). A focus ring
-  that existed only as CSS would make "which panel owns keys?" a screenshot question, which
-  [debug-tools-mcp.md](./debug-tools-mcp.md) forbids.
+- **Observable as data** — `focusedPanel` is in `modoki_get_editor_state`, alongside `openPanels`
+  (every id with an open tab), and a scope change journals `!focus {panel, from, to, source}` (on
+  change only, never per keystroke). A focus ring that existed only as CSS would make "which panel
+  owns keys?" a screenshot question, which [debug-tools-mcp.md](./debug-tools-mcp.md) forbids.
 - **Drivable** — `modoki_press_key` and `modoki_focus` take a `panel` argument. The route fails
-  loudly (400, naming the valid ids) when that panel isn't open, because a panel-scoped chord aimed
-  at a closed panel is otherwise a silent no-op: the dispatcher just yields. `panel` and `selector`
-  stay separate on `modoki_focus` — keyboard scope and `activeElement` are different questions.
+  loudly (400, naming the ids that ARE open) when that panel isn't open, because a panel-scoped
+  chord aimed at a closed panel is otherwise a silent no-op: the dispatcher just yields. `panel` and
+  `selector` stay separate on `modoki_focus` — keyboard scope and `activeElement` are different
+  questions.
+
+### ⚠️ That "fails loudly" was a TAUTOLOGY until #301 — and this doc asserted it anyway
+
+The guard existed and could not fire. `/api/input/key` compared the renderer's echoed
+`focusedPanel` against the `panel` it sent; the renderer's `set-focus-scope` op handed the string
+straight to `setFocusedPanel`, which is a bare `set()` — so the echo **always** equalled the input.
+The comparison could only fire if the renderer had *changed* the value, which it never did.
+`/api/input/focus` did not attempt the check at all.
+
+What that cost: `modoki_focus {panel:"Game"}` answered `{ok:true, focusedPanel:"Game"}`, but the
+input gate compares against `'game'`, so it stayed **shut** and every following `modoki_press_key`
+reached nothing — each also reporting `ok`. That is the QA-PHYS-0003 failure above reached by a
+second route the incident never closed: there the panel was *forgotten*, here a wrong value is
+*accepted*. Miscasing is not a contrived input — this doc, `CLAUDE.md` and the tool descriptions
+all say "the Game panel" in prose, and nothing types the ids.
+
+The fix refuses on **open-ness**, not on a vocabulary list:
+
+- `editorStore.openPanels` is published by `EditorApp` from the one FlexLayout model walk it
+  already does for the Window menu (keyed on the model being ready + `layoutVersion`).
+- `set-focus-scope` refuses a `panel` outside that set, returns `openPanels`, and **does not move
+  the scope** — a half-applied focus is worse than none, because the caller cannot tell which it got.
+- Both routes share one `setFocusScope` helper, so they cannot drift again. A renderer predating
+  the op's `ok` field degrades to the old echo-only behaviour rather than blocking all input.
+
+Open-ness rather than a `z.enum` of ids, for two reasons: a game can register **custom panels**, so
+no fixed list can be right; and open-ness is a superset of the typo case — it is what the error
+message already promised.
+
+Two things the adversarial pass then caught in that fix itself, both now closed:
+
+- **`openPanels` must be published SYNCHRONOUSLY, never from an effect.** It was first written
+  as a `useEffect` keyed on `layoutVersion`, which publishes one React commit *late* — and
+  `set-focus-scope` reads the store with a plain `getState()`. A call landing in that window is
+  answered from the pre-change list: the human closes a tab, the agent focuses it, and the op
+  reports `ok` for a panel that is already gone — the very failure this fix closes, reopened
+  through a timing gap. `publishOpenPanels` is therefore called from the two points where the
+  model can change (the initial load, and the top of `onModelChange`), in the same synchronous
+  turn as the change. **Do not move it back into an effect.**
+- **A non-string `panel` is refused, not stored.** The open-ness test only guards strings, so
+  anything else fell through to the bare setter. That is reachable, not theoretical:
+  `set-focus-scope` is on the `/api/editor-action` allowlist, so
+  `{action:'set-focus-scope', panel:12345}` bypasses the MCP tool's `z.string()`. Measured on a
+  live editor: `ok:true`, and `get_editor_state.focusedPanel` then reported the **number**
+  12345 — which the gate's `p !== null && p !== 'game'` reads as "some panel owns the
+  keyboard", suppressing all game input permanently with no panel to blame.
+
+**The lesson worth carrying past this bug:** the test suite covered this route and stayed green,
+because the renderer *fake* modelled a rejection by changing its echoed value — behaviour no real
+renderer ever had. A guard whose only evidence is a fake that flatters it is not a guard. Both
+halves are now mutation-checked (neuter the refusal → 4 route tests and 2 op tests fail):
+`engine/tests/electron/inputRoutes.test.ts` and `engine/tests/editor/setFocusScopeOp.test.ts`.
 
 ## The runtime input gate — mechanism vs. policy
 
@@ -136,11 +193,264 @@ the policy.**
 - `EditorApp` installs `() => focusedPanel !== null && focusedPanel !== 'game'`. **A shipped game
   never calls `setInputGate`**, so the default gate stays null → zero behaviour change in a build,
   and `createTestWorld`/headless is untouched.
-- **Closing the gate resets held state**, on the closing edge. Hold `W`, click the Hierarchy, and
-  the character must stop — otherwise `sample()` keeps reporting `w` held until physical release.
+- **A closed gate DRAINS every frame** (`reset()` on each source), rather than once on an edge.
+  Hold `W`, click the Hierarchy, and the character must stop — otherwise `sample()` keeps
+  reporting `w` held until physical release. The same drain stops a queued backlog (pointerSource's
+  press FIFO fills from clicks made in editor panels) from replaying into the game on reopen.
+  ⚠️ It must NOT reset on the REOPENING edge, which is what it used to do (#264): `PanelFocusHost`
+  moves the scope on capture-phase pointerdown, so a click into the Game panel opens the gate and
+  lands in the queue in the same tick — and the reopening reset then ate it, along with the rest of
+  that gesture (`reset()` nulls `activeId`, so the later move/up fall through). First click lost,
+  second fine, which reads as flaky. Measured live 2026-08-19: pre-fix the first tap delivered 0
+  presses to the game and the second delivered 1; after, the first delivers 1.
 - **Null focus deliberately does not suppress**: pressing Play and immediately using WASD has to
   work without first clicking the GameView.
-- The gate **fails open** if the policy function throws.
+- The gate **fails open** if the policy function throws — and so does the DRAIN. A source whose
+  `reset()` throws is reported once, by name, and skipped; the rest still drain. That guard is
+  load-bearing only because the drain is per-frame: `frameDriver` auto-unregisters a callback
+  after 10 *consecutive* throws, and the callback here is the whole `'ecs'` pipeline, so an
+  unguarded throwing reset would let one buggy game-registered source kill physics, animation
+  and transforms by leaving a non-game panel focused for ~166 ms. The old edge-triggered shape
+  could not reach 10 in a row (the next suppressed frame returned early and ran clean, which
+  clears the count). `sample()` stays unguarded — it is unchanged, and always ran per frame.
+
+### The agent-facing half: a suppressed key used to look identical to a delivered one
+
+The gate is right, and it was also **invisible**. `modoki_press_key` answered `ok:true` whether the
+key reached the game or was dropped at the gate, and its own docs named only the OTHER gate (a
+focused text field), telling callers to fix it with a bare `modoki_focus {}` — which clears DOM
+focus and does not touch `focusedPanel`. A QA run followed that advice literally, pressed `d` 80
+times at a running platformer with the scope stuck on `scene`, measured a byte-identical
+`Transform.x`, and reported the character controller broken (testboard `xfMfBSDskBmFY7phWSVm`).
+
+`/api/input/key` now asks the renderer one read-only question BEFORE dispatching —
+`probe-key-reach` → `editor/input/keyReach.ts` — and reports:
+
+- `focusedPanel` on **every** press, not only when the caller set it;
+- a warning when the press reached **nothing**: `isInputSuppressed()` is true AND `resolve()` found
+  no binding for the chord in the current scope.
+
+Both halves of that condition are load-bearing. `gameInputSuppressed` alone is true through most
+ordinary editor work — a `w` that sets the gizmo mode with the Scene panel focused is correct usage
+— so warning on it would fire on nearly every press and be tuned out within a session. Paired with
+"no binding claimed it", the press is a **provable** no-op, which is worth interrupting for.
+
+**What `editorBinding: null` does and does not prove.** It rules out the keymap registry, which
+is the editor's only window-level *chord* listener (`dispatcher.ts`, plus one Shift-snap modifier
+watcher in SceneView that binds nothing). It does not rule out an element-level `onKeyDown` — a
+text input, the Add-Component picker, `AssetRefField` — which fires while that element holds DOM
+focus; `activeElement`, reported in the same response, is that half of the answer. So the warning
+says the key never reached the running game, and deliberately does **not** say the press did
+nothing at all.
+
+The probe calls `isInputSuppressed()` and `resolve()` rather than re-deriving
+`focusedPanel !== 'game'` in the main process: the policy above is stated in exactly one place and
+a second copy would drift the first time the gate learns a new condition. The one fact that *is*
+duplicated across the process boundary — the arrow-key name aliases — has a drift guard
+(`engine/tests/electron/keyReach.test.ts`), because a one-sided addition there would make the
+warning lie on that key alone.
+
+## Never make a commit depend on a focus EVENT (#233)
+
+Chromium dispatches `focus` and `blur` **only while `document.hasFocus()`**. With the editor window
+behind another window — an ordinary state for a human, and the PERMANENT one for any agent-driven
+MCP session — `el.blur()` still moves `document.activeElement` but fires **no event**. So the
+familiar field idiom
+
+```tsx
+onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}   // ✗ commit never runs
+onBlur={(e) => commit(e.target.value)}
+```
+
+silently does nothing: the value is typed, Enter is pressed, and nothing is written. Nothing errors.
+
+**The rule: Enter commits DIRECTLY.** Keep `onBlur` committing too — that is the click-away path, and
+a click-away only happens while the window IS focused, which is exactly when the browser does deliver
+the event.
+
+```tsx
+onKeyDown={(e) => { if (e.key === 'Enter') { commit(e.currentTarget.value); e.currentTarget.blur(); } }}
+onBlur={(e) => commit(e.target.value)}
+```
+
+Two consequences that are easy to get wrong, both of which cost a real bug in #233:
+
+- **The trailing `blur()` DOES fire `onBlur` when the window is focused**, so `commit` runs twice.
+  Make it idempotent — and check per site rather than assuming, because a guard that compares against
+  a **prop** is stale in that same synchronous tick (React has not re-rendered). A ref updated inside
+  `commit` is what actually closes it.
+- **That idempotency guard must be RESET when the value changes externally** (an undo, another panel,
+  a reselect). It exists only to swallow the trailing blur, and held longer it becomes the very bug it
+  was added to prevent: re-entering a previously-committed value compares equal and silently does
+  nothing.
+
+The same applies to `onFocus`: any state it gates is dead in an unfocused window. Drive
+"is the user mid-edit?" from `onChange`, which fires regardless.
+
+### A per-keystroke commit needs a THIRD pattern: guard on the ECHO, not on focus (#242)
+
+The two rules above fit a field that commits on a terminal signal. A field that commits on **every
+keystroke** — `useBufferedValue`, which backs every Inspector field, and `ParticleEditor`'s
+`NumInput` — has no terminal signal to hang an `editingRef` off, and its `focusedRef` guard was dead
+in an unfocused window. **What clobbered the buffer was the field's OWN commit**: clearing it commits
+`parse('')` = 0, the store echoes 0 back, the re-sync effect rewrites the empty buffer to `'0'`, and
+the remaining keystrokes land on that. Measured on `games/sling` Lvl-0002: `-3.5` typed into a
+cleared `Transform.x` stored **0** and left the field reading `0-3.5`, with `modoki_type_text`
+reporting success.
+
+**The rule: skip the re-sync when the text on screen already MEANS the store's value.** At that point
+re-syncing can only reformat it (`''` or `'-'` → `'0'`), which is the destruction itself and never
+new information; a genuine external change (a gizmo drag, an undo, a reselect) does not parse-match
+and still re-syncs.
+
+```tsx
+useEffect(() => {
+  if (focusedRef.current) return;
+  setLocalValue((cur) => (Object.is(parse(cur), externalValue) ? cur : String(externalValue)));
+}, [externalValue]);
+```
+
+⚠️ `parse` is read through a **ref** in the real code, not closed over as above. It is an inline
+arrow at most call sites, so as an effect dep it would re-run this on every render and clobber any
+text that has not yet round-tripped through the store — and omitting it from the deps without a ref
+is a stale closure plus a lint warning. The `setLocalValue` updater is what keeps `localValue`
+itself out of the deps, which matters for the same reason.
+
+- **Stateless on purpose.** Remembering the last value the field committed also settles the repro and
+  goes stale: nothing clears the memory, so once something drags the value away and back to the
+  remembered one, the field skips a re-sync it owes and sits on the intermediate text. (`NumBox`'s
+  latch is the same idea done safely — it is cleared by the external-change effect, which is exactly
+  what makes it a *trailing-blur* swallow rather than a permanent one.)
+- **Two known costs, both deliberate.** A non-injective `parse` — `BufferedNumberInput`'s min/max
+  clamp — cannot be told from a reformat, so typing `1.8` into a `max=1` field leaves the display on
+  `1.8` while the store holds `1` until blur reconciles it. That is what a FOCUSED window already
+  did, so the fix aligns the two rather than inventing a behaviour; but with no blur in an
+  agent-driven session, **read the value back with `modoki_get_scene_state`, never off the field.**
+  And in mixed (multi-select) mode the guard is skipped entirely, so entering mixed mode still clears
+  the buffer and shows the `----` placeholder.
+- **`ParticleEditor`'s `NumInput` had the same defect and auto-saved**, so the corrupted value reached
+  disk with no Save at all (it wrote on a trailing timer, by design — until #259 made the panel park
+  its document for Cmd+S like every other surface). Typing `-3.5`
+  into one of its clamped fields committed **0.5** — the clamp of an in-progress `-3` to 0 is what
+  moved the store and supplied the echo. Most of its number fields are clamped (25 of 38 carry a
+  `min`/`max`, by `grep -nE "<(Num|NumInput)\b[^>]*(min|max)=\{"`), so the exposure is the panel,
+  not a corner of it.
+
+### And the mirror-image trap: Escape, in a window that IS focused
+
+The rule above is about a blur that never fires. The opposite state has its own bug, and the #233
+close-out review caught it about to ship. A controlled input whose Escape handler reads
+
+```tsx
+else if (e.key === 'Escape') { setLocal(value); e.currentTarget.blur(); }   // ✗
+```
+
+**schedules** the revert and then blurs on the next line. In a genuinely OS-focused window that
+`.blur()` dispatches *synchronously, inside the same handler*, before React has flushed anything —
+so `onBlur` still sees the pre-Escape value and **commits the text the user just discarded**. The
+field then repaints as reverted, so Escape looks like it worked while the garbage was already
+persisted.
+
+**Revert the DOM node first, and never commit from a state closure:**
+
+```tsx
+onBlur={(e) => commit(e.currentTarget.value)}                 // read the node, not a closure
+onKeyDown={(e) => {
+  if (e.key === 'Escape') {
+    e.currentTarget.value = value;                            // synchronous — beats the blur
+    setLocal(value);
+    e.currentTarget.blur();
+  }
+}}
+```
+
+Now the trailing blur sees the reverted value and no-ops whichever order the two run in. An
+**uncontrolled** field (`defaultValue` + a direct `e.currentTarget.value = initial` revert) was never
+exposed to this — that is why `SkinEditor`'s `InlineNameField` is clean and the two controlled fields
+were not.
+
+**A test that stubs `blur()` to a no-op cannot see this class**, because it models only the unfocused
+window. Editor field tests need BOTH: the non-dispatching stub for the #233 condition, and a stub
+that really dispatches `focusout` for this one. See `textCommitField.test.tsx`.
+
+### And a fourth shape: an undo SNAPSHOT (#244)
+
+The three shapes above are all about the VALUE. A field can also hang something else off focus —
+the Sprite Editor's slicer params took their undo snapshot in `onFocus` and pushed it in `onBlur`,
+which is a fourth way for the same missing event to bite. With no focus events the value still
+landed on every keystroke and **nothing reached the modal's history**, so ⌘Z reverted whatever step
+came *before* the edit. Nothing errored, and the value looked right.
+
+**The rule: open the session from `onChange` and close it on a signal that does not need focus.**
+`editor/panels/coalescedEdit.ts` is the shared piece — `note()` snapshots lazily on the first change
+since the last commit, an idle timer commits the run as ONE undo step, and `flush()` closes it from
+anything else that touches the history.
+
+Two consequences that are easy to miss:
+
+- **`undo`/`redo` MUST `flush()` first.** This half of the bug does not need an unfocused window at
+  all: type into a field and press ⌘Z without leaving it, and the pending snapshot is still
+  un-pushed when the stack is popped. That is what makes it testable (see below).
+- **Keep `onBlur` flushing** — it is the click-away path, and a *second* commit signal is free.
+  What #244 was is `onBlur` being the ONLY one. In `SpriteEditor`'s `Num` it sits on the `<label>`
+  rather than the input, because React's `onBlur` is `focusout` (it bubbles) and the shared
+  `BufferedNumberInput` owns the input's own focus handlers.
+
+The same change replaced that panel's bespoke `<input type="number">` with `BufferedNumberInput`.
+A number input reports `value === ''` for an incomplete entry like a lone `-`, so with a
+commit-per-keystroke field the sign was wiped before a digit could follow and a negative offset was
+not typeable — the reason `fields.tsx` moved off `type="number"` in the first place.
+
+### Testing this class: drive the field with no focus events
+
+`engine/tests/e2e/editor-unfocused-field-commits.spec.ts` is the guard for #244 **and** for #242,
+which shipped live-verified only. It is worth knowing why it looks the way it does.
+
+Headless Chromium reports `document.hasFocus() === true`, and a second page does not change that
+(measured) — so the unfocused state cannot be produced by window management. It is produced through
+the EVENTS instead: dispatch `input` on the field through React's own value setter and never
+dispatch `focus`/`blur`. The component sees exactly what an unfocused window gives it.
+
+Three details are load-bearing, and a test that skips them passes against the broken code:
+
+- **Append one character at a time, re-reading the field's value from the DOM each time.** If the
+  field's own commit echoes back and rewrites the buffer mid-edit (#242), the next character has to
+  land on the rewritten text — which is what a human typing into an unfocused window gets, and what
+  pushing whole strings would hide.
+- **Assert the STORE, not just the field**, wherever the display legitimately holds an
+  unreconciled value (a clamped field shows `-3.5` while the store holds the clamp).
+- **Never let the assertion race the coalescing window** (#300). Typing that way costs several CDP
+  round-trips plus two rAF *per character*; in the full suite a gap stretched past the real 500 ms
+  idle window, the coalescer correctly closed the step mid-run, and ⌘Z reverted to the intermediate
+  `12` instead of `0` — about 1 run in 6, never in isolation. Forcing a 600 ms gap reproduces it
+  100%, a 0 ms gap never does. Nothing was wrong with the coalescer: a human pausing 600 ms
+  mid-number gets two undo steps too. So the spec widens the window past any plausible load via
+  `__modokiEditorTest.setCoalesceMs()`, and says "the user paused" with
+  `__modokiEditorTest.flushCoalescedEdits()` rather than sleeping for a timer.
+
+  **Nothing is given up by that**, which is the part worth internalising: the timer's own behaviour
+  ("a fast run stays one entry") is already pinned deterministically under `vi.useFakeTimers()` in
+  `engine/packages/modoki/tests/editor/coalescedEdit.test.ts`. An E2E should only be buying what
+  *only* a real browser can show — here the unfocused event delivery and a real ⌘Z flushing before
+  it pops. Verified by mutation: the spec still fails if `undo()` stops flushing, and if a
+  per-keystroke history returns.
+
+  ⚠️ **The registry behind `flushCoalescedEdits()` is keyed on the SESSION, not on the edit
+  object's lifetime**, and the difference is not cosmetic. Registering at construction and
+  deregistering in `cancel()` reads as equivalent, but React StrictMode mounts → unmounts →
+  remounts in dev: the unmount cleanup's `cancel()` fires once while the edit survives in a ref, so
+  the session became unreachable forever and `flushCoalescedEdits()` silently saw zero. Joining in
+  `note()` and leaving in `flush()`/`cancel()` also makes the set leak-free by construction.
+
+### Remount a field when its TARGET changes
+
+A field that tracks "is the user mid-edit?" in a ref must be keyed on what it edits. The ref is
+cleared by a commit, so a target swap that never blurs the input — an agent changing selection over
+MCP — leaves the previous target's typed text in place, and the next commit applies it to the NEW
+target. The component cannot tell a target swap from an ordinary external value change, so the fix is
+a React `key`, not more logic inside it.
+
+Measured behaviour, the diagnosis, and how to reproduce it live: **[qa/knowledge.md](../qa/knowledge.md) §5**.
 
 ## Guards
 
@@ -189,7 +499,7 @@ the wrong panel). Two source-text tripwires stand in for that:
 - **HMR is untrustworthy for this code.** Hook order and listener registration change here, so a
   session that has absorbed a lot of HMR is not evidence either way — a correct fix measured four
   separate times as "not working" before a forced CDP `Page.reload` showed it working. Relaunch, or
-  reload, before concluding anything. (Also tracked in [todo.md](./todo.md).)
+  reload, before concluding anything.
 
 ## Related
 

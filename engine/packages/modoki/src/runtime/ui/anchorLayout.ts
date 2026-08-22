@@ -38,7 +38,21 @@ export interface AnchorData {
   bottom: number; bottomUnit: string;
   left: number; leftUnit: string;
   pivotX: number; pivotY: number;
+  /** Opt in to clearing the notch / home indicator. Lives here rather than only on the
+   *  CSS side so the PIXEL path can gate on the same field — the two must agree about
+   *  which elements move, not just about where an un-inset one goes. Optional because
+   *  most callers build this from a trait where it is already resolved; note the TRAIT
+   *  defaults to true, so an absent field in a scene JSON means ON. */
+  safeArea?: boolean;
 }
+
+/** Safe-area insets in logical px, for the pixel path. The CSS path gets the same four
+ *  numbers from `var(--ui-sa-*, env(safe-area-inset-*))` — this is the measured twin, and
+ *  the editor feeds it from the selected device preset so gizmos and the overlay land on
+ *  the element the browser actually drew. */
+export interface SafeAreaPx { top: number; right: number; bottom: number; left: number; }
+
+export const ZERO_INSETS: SafeAreaPx = { top: 0, right: 0, bottom: 0, left: 0 };
 
 /** Resolve a length (value + unit) to LOGICAL pixels. THE shared resolver for every
  *  pixel-space path (anchor offsets, Canvas2D sizing, SceneView).
@@ -74,6 +88,7 @@ export function resolveAnchorRect(
   w: number, h: number,
   vpW: number, vpH: number,
   anchor: AnchorData,
+  insets: SafeAreaPx = ZERO_INSETS,
 ): { x: number; y: number; w: number; h: number } {
   let x = 0, y = 0, rw = w, rh = h;
 
@@ -146,6 +161,20 @@ export function resolveAnchorRect(
   if (anchor.bottom) {
     const v = resolveVal(anchor.bottom, anchor.bottomUnit, vpH);
     if (stretchY) rh -= v; else y -= v;
+  }
+
+  // Safe area on a POINT anchor moves the anchor point inward; the box keeps its size.
+  // Mirrors applyAnchorStyle's offset arm (anchorCss.ts) — including the exclusivity: a
+  // stretched anchor takes the inset as PADDING instead, which insets its children
+  // without moving its own rect, so there is nothing for this path to apply. Runs AFTER
+  // the authored offsets so it composes with them rather than replacing them, and BEFORE
+  // pivot so the inset shifts the anchor point, not the already-pivoted box.
+  if (anchor.safeArea && !stretchX && !stretchY) {
+    const m = anchor.anchor;
+    if (m.startsWith('top')) y += insets.top;
+    else if (m.startsWith('bottom')) y -= insets.bottom;
+    if (m.includes('left')) x += insets.left;
+    else if (m.includes('right')) x -= insets.right;
   }
 
   // Pivot: translate(-pivotX%, -pivotY%) shifts from the anchor point.

@@ -77,6 +77,85 @@ other drift. `add-native-target` (`engine/plugins/addNativeTarget.ts`) and the v
 wire in per-game native plugins. Restart the editor after pulling build-pipeline changes — the
 Vite plugin loads once at dev-server start.
 
+**Crash reporting is one of the things it repairs, on BOTH platforms, for any project that depends
+on `@capacitor-firebase/crashlytics`** — gated on that dependency alone (`usesCrashlytics`), and
+deliberately independent of `build.debugBuild`: whether a crash report is readable has nothing to
+do with the debug bridge, and a Release build needs it more, not less. iOS gets
+`dwarf-with-dsym` in every configuration plus the `Upload Crashlytics dSYMs` phase (#279); Android
+gets the `firebase-crashlytics-gradle` classpath, the `firebase-crashlytics-ndk` artifact, and
+`apply plugin: 'com.google.firebase.crashlytics'` **inside** the `google-services.json` guard
+(#282) — outside it, a project with no such file fails to build. Both were hand edits in
+`games/court` first; generalizing them is what gave `games/3d-test` native crash reporting it had
+silently never had. ⚠️ **The NDK version is emitted as an EXPRESSION**
+(`rootProject.ext.firebaseCrashlyticsVersion` with a fallback), not a frozen number: it and the
+artifact the Capacitor plugin resolves are a matched pair, and a mismatch is a RUNTIME failure —
+no NDK reporting at all — rather than a resolution error, so no build log would catch it.
+
+**Four rules the heal follows here, each of them a bug that was found and fixed rather than a
+principle someone thought of first** (close-out, 2026-08-20):
+
+- **An ordinary-path warn is a LOG, and the sweep for them is not done by grepping one shape.**
+  `console.warn` files a Crashlytics issue (owner, 2026-08-20), so anything that fires on a healthy
+  launch becomes an alerting issue per session. The first sweep caught `tierResolve`'s boot lines
+  and the OTA confirmBoot catch, and MISSED `tierCalibration`'s tier switch and hold reports —
+  because they only fire on a device that actually changes tier, which the iPad never did. Measured
+  on a Galaxy S22: a cold boot demoted to `mid` then `low` as the first frames came in over budget,
+  filing **4** `recordException` calls for the adaptive system working as designed; after the fix,
+  **0**. ⚠️ The device that needs the headroom most is the one that files the most noise, so a
+  one-device check is not a check. Genuine anomalies still warn — a scene that never finishes
+  loading (the `ARM_BACKSTOP_MS` failsafe) is a real problem and stays a warning.
+- **A note means a real change.** The dSYM phase and the archive-time "Debug build is ON" phase
+  both used to splice in right after the `PBXShellScriptBuildPhase` section-open line, so each put
+  ITSELF first and shoved the other second: the two objects swapped on every project open, each
+  heal rewrote the pbxproj, and each reported "synced …" for work that netted to nothing. Measured
+  on `games/court` — two writes of equal length and opposite content, file byte-identical before
+  and after. They now take deterministic slots (warning first, dSYM **last**), so both are fixed
+  points and both projects heal to ZERO notes. A heal note is the editor's report to the human
+  that something was repaired; one that fires every time is a false success that hides the real ones.
+- **An inline comment must not make an anchor invisible.** The anchors matched `[ \t]*$`, so
+  `apply plugin: 'com.google.gms.google-services' // keep with crashlytics` read as "no guard
+  present" — the plugin apply was skipped while the classpath and NDK artifact still landed, and
+  the heal still returned a success note. That is the half-wired shape this whole section exists to
+  end. Anchors now tolerate a trailing `//` comment (and only a comment — `dependencies { impl 'x' }`
+  is a one-line block, and inserting "after" it would put the artifact outside the block).
+- **A skipped apply-plugin says so.** When there genuinely is no `com.google.gms.google-services`
+  apply to anchor on, the note now carries `⚠️ apply-plugin NOT wired … Crashlytics symbol upload
+  is inert` instead of listing the two cosmetic edits as success.
+- **CRLF in, CRLF out.** Every edit here is written as LF text, so a CRLF gradle file came back
+  with mixed endings, differing from its input — the heal then rewrote it on the next pass too,
+  drifting a blank line each time. `.gitattributes` pins `*.gradle text eol=lf` so this needs a
+  non-git write path, but Windows-only EOL bugs are a documented recurring class here
+  ([windows.md](./windows.md)) and the guard is one regex: edit in LF, restore what the file had.
+
+⚠️ **`healNativeConfig` mints pbxproj objects from HARDCODED id spaces, and there are TWO of
+them.** `GD_UUID` owns `DD0000000000000000000001` … `DD0000000000000000000007` (the
+MainViewController + GameDebug plugin file/build-file pairs, the retired Release strip phase, the
+archive-time "Debug build is ON" warning phase, and — since #279 — the `Upload Crashlytics dSYMs`
+phase at `…0007`), and `WRAPPER_UUID` separately owns
+`D0D0D0D0D0D0D0D0D0D0D0D0` (the `modoki.xcconfig` file reference). Fixed ids rather than random
+ones are what keep the heal idempotent and its diff stable — so **anything else that hand-writes
+an object id into a pbxproj must avoid BOTH ranges.** (This entry named only the first until the
+close-out that followed it; a reader taking it at its word would have thought `D0D0…` was free.)
+
+Getting this wrong produces a failure that looks nothing like its cause. A pbxproj is an object
+graph keyed by 24-char ids; defining one id twice is not a syntax error (`plutil -lint` says the
+file is fine), the later definition silently wins, and every reference to that id then resolves to
+an object of the WRONG CLASS. Xcode refuses the entire project:
+
+```
+xcodebuild: error: Unable to read project 'App.xcodeproj' …
+  Reason: The project 'App' is damaged and cannot be opened.
+  Exception: -[PBXShellScriptBuildPhase buildPhase]: unrecognized selector sent to instance
+```
+
+`games/ota-test` shipped exactly this and was **unbuildable for iOS on every clone** from
+`7de8607fc` until 2026-08-20: the OTA bring-up had hand-written `OtaCore.swift`'s `PBXBuildFile` at
+`DD…0006`, which the archive-warning phase later claimed. Nobody noticed because that fixture is
+only built when someone runs the OTA device case — which could then never run. Fixed by renumbering
+the OTA side to `DD…000C`, and guarded by
+`engine/tests/architecture/pbxprojObjectIds.test.ts`, which fails `npm test` on any duplicate
+object definition in a committed `games/**` or `demos/**` pbxproj.
+
 ## Committing native folders (SOURCE only)
 
 Each game's `ios/` + `android/` are tracked (pbxproj, gradle scripts, `res/`, `Info.plist`,
@@ -105,8 +184,12 @@ Two things went wrong before it did:
   across two games in one day, burying real diffs in re-encoded binaries.
 - The generator was invoked as a bare `npx --yes @capacitor/assets` beneath a comment claiming
   it was "verified against 3.0.5". `npx --yes` installs **latest**, so the comment described a
-  version the build never used; a newer release started emitting extra density buckets
-  (`drawable-night-*`, `*-ldpi`, `mipmap-ldpi`) that surfaced as mystery untracked directories.
+  version the build never used.
+  ⚠️ That fix also blamed the **extra density buckets** (`drawable-*-night-*`, `*-ldpi`,
+  `mipmap-ldpi`, `mipmap-<dpi>/ic_launcher_background.png`) on the floating version. Measured
+  2026-08-19 on `demos/forest-camp`: the **pinned 3.0.5 emits them too** — 21 paths no project
+  commits. Pinning made them stop *changing*; it did not make them stop *appearing*. Whether
+  they should be committed or gitignored is still open (#236).
 
 Now: the tool version is **pinned** (`ICON_TOOL`), and a stamp under the project's gitignored
 `.cache/` records the tool version + platform + colour flags + the **content hash** of the
@@ -114,6 +197,24 @@ source image. Regeneration happens when any of those change, or when the generat
 been deleted (a sentinel file is checked, so a wiped `res/` still comes back). Content-hashing
 means repointing `app.iconSource` at a byte-identical file is correctly a no-op, while editing
 an image in place is not.
+
+**The generator does not stay inside the platform it is given** (#236). Measured on
+`forest-camp`: `generate --android` also rewrites `ios/App/App.xcodeproj/project.pbxproj`,
+stripping the leading zero off `LastUpgradeCheck = 0920` → `920` — an **iOS** file mangled by an
+**Android** build — and re-serializes `AndroidManifest.xml` (blank lines dropped, `<?xml … ?>`
+respaced). Neither is a semantic change, and about half the repo's projects already carry the
+mangled `920` in a commit, which is how quietly it travels. `demos/` is the publishable tree, so
+this is CLAUDE.md's #18 hazard arriving from the build instead of the editor.
+
+So the step now runs through **`engine/scripts/generate-icons.mjs`** rather than a shell
+one-liner. It snapshots everything under `ios/`+`android/` outside the running platform's
+**product directory** — `android/app/src/main/res/**` for `--android`,
+`ios/App/App/Assets.xcassets/**` for `--ios`, both measured rather than assumed — runs the
+generator, then puts back anything it wrote outside that scope and **reports what it put back**,
+so a project that genuinely needs such an edit sees a line every build rather than silence.
+The scope is a PATH, not a file type: an extension-based rule also reverted
+`res/mipmap-anydpi-v26/ic_launcher.xml`, where the generator legitimately repoints the adaptive
+icon's background at the PNG it just made. Guard: `engine/tests/plugins/generateIcons.test.ts`.
 
 **Why not just gitignore the icons?** Generation is deliberately non-fatal (`|| echo '[icon]
 generation skipped'`) and needs `npx` to reach the network. Untracked icons would let an
@@ -136,6 +237,47 @@ the SAME resolution** via `eval "$(node engine/scripts/print-toolchain-env.mjs)"
 bundles and calls `engine/toolchain`'s own `detect()` rather than probing for itself, because a
 second probe is precisely what this module was consolidated to remove (#159). Full detail:
 [editor-toolchain.md](./editor-toolchain.md).
+
+### From an agent: `modoki_build` IS that menu item
+
+An agent does not need the CLI recipes below. **`modoki_build {platform}`** drives the same
+`/api/build` the menu does — same toolchain resolution, same per-step cwd, same one-at-a-time slot
+— and consumes the SSE stream to completion, returning `{ok, log}` or the failure tail. For a
+native platform it also **installs and launches on the attached device**, so a successful call
+leaves the app running rather than leaving you an artifact to deploy by hand.
+
+```
+modoki_build {platform: 'android'}   // → gradle, install, launch
+modoki_build {platform: 'ios'}       // → xcodebuild, install, launch
+modoki_build {platform: 'web'}       // → games/<id>/dist
+modoki_build {platform: 'playable'}  // → games/<id>/ads/index.html
+```
+
+Prefer it over shelling out. The CLI recipes exist for a human at a terminal and for the cases the
+tool cannot express; reaching for them from an agent means re-deriving cwd, toolchain env, and the
+build slot by hand, which is where the drift starts.
+
+Three things that bite:
+
+- **It is HEAVY** — a native build runs gradle/xcodebuild and installs. Minutes, not seconds. Slow
+  is not hung; do not kill it and retry.
+- **`force` here is the NON-destructive one.** `modoki_build {force:true}` proceeds despite unsaved
+  live-world edits; the artifact is built from the FILES, so your unsaved work is left alone and
+  merely not included. This is why the build family kept the name `force` while the world-swapping
+  tools (`load_scene`, `prefab`, `new_scene`) renamed theirs to `discardUnsaved` — they DESTROY
+  that work. Prefer `modoki_save_all` first and pass nothing.
+- **The project must be OPEN in the editor**, and for a device build that open is load-bearing
+  beyond convenience: `healNativeConfig` runs on open and is what actually registers
+  `GameDebugPlugin` and the local-network keys after a `build.debugBuild` change. Set the flag →
+  reopen → *then* build. Build before the reopen and you get an app with no debug bridge, which
+  presents as a lease handshake failure and reads like a network fault. See
+  [qa/README.md](../qa/README.md) § "Device cases".
+
+⚠️ **Several phones of the same platform attached? The install target is whichever device this
+clone has CLAIMED**, and a raw `adb`/`devicectl` command against an unclaimed one is refused by the
+`PreToolUse` hook (#285) naming the holder. Claim before building (`npm run device:claim <serial>`,
+or connect it in the editor), and release the moment you are done — a claim is machine-wide and
+locks that phone out of every other clone and out of the owner's own hands.
 
 ### One build at a time (#173)
 
@@ -273,6 +415,25 @@ whose log was clean:
 | Asset manifest | filtered to the kept assets | same | `resolveGuidToPath` resolves nothing |
 | `detectType` | filename/dir convention | `assets/levels/index.json` typed `scene` | level manifest offered as the BOOT scene |
 
+That same `detectType` misclassification also broke GUID stamping, independent of the tree-shaker
+bugs above. Rule: an asset's GUID lives in a top-level `id` field ONLY when the parsed JSON is a
+stampable plain object; anything else gets the same `<file>.meta.json` sidecar that binary assets
+use. The two halves of that rule failed together: `detectType` **then** ended in a catch-all that
+typed any leftover `.json` as `'scene'` — an `ID_BEARING_TYPES` kind whose guid is meant to live in
+a top-level `id` — and `games/court/runtime/assets/levels/index.json`
+is a top-level JSON **array**, so `json.id = guid` on it was silently dropped by
+`JSON.stringify` (arrays serialize only numeric-index elements). So `writeAssetGuid` wrote the file
+back unchanged yet still returned `true`, the heal loop logged "minted missing GUID" as if it had
+succeeded, the next scan found no `id`, and it re-minted forever — a non-deterministic GUID on
+every scan. **Both halves are now closed, and either one alone would have been enough** — which is
+why the rule is worth stating rather than treating as a footnote to #54. `detectType` no longer
+guesses (it returns `null` for an uncategorized `.json`; see the row above), *and* `writeAssetGuid`
+takes the in-place-`id` path only when `isStampableObject` holds (`!!json && typeof json ===
+'object' && !Array.isArray(json)`), falling back to the sidecar otherwise. Regression cover in
+`engine/tests/plugins/viteAssetScanner.test.ts` — the `writeAssetGuid` array fallback and
+`buildManifest` heal stability across repeated scans. That Court file is the live proof the
+fallback fires: it carries a committed `index.json.meta.json` rather than an inert in-file `id`.
+
 **The fix is to author the ref, not to patch the keep-list.** Put it on a **resource trait** in
 the scene: the tree-shaker's generic sweep (`probeTraitRefs`, `engine/plugins/asset-tree-shaker.ts`)
 keeps any GUID on any trait bag that resolves in the asset index — **game-defined traits included,
@@ -320,6 +481,192 @@ Pre-existing refs are listed in that file's `PENDING_MIGRATION`, pinned per `fil
 stale-checked both ways so the backlog can only shrink. **Verify any migration with a real
 production build** (`MODOKI_PROJECT=games/<id> npm run build -- --target web`) — `npm test` cannot
 see this class.
+
+### The other direction — a ref the walker cannot SEE (#237)
+
+Everything above is a ref the build cannot see because it lives in **code**. There is a second half,
+and it bites authored data that is doing everything right: a ref in a **scene or prefab**, in a
+*shape* the walker does not reach.
+
+`SkinnedMeshRenderer.materials` is the worked example. It is a `Record<string, string>` — material
+slot NAME → `.mat.json` GUID — and `probeTraitRefs` reached exactly two shapes: a scalar field named
+in `REF_FIELDS_BY_TRAIT` (scalar-only, and with no `SkinnedMeshRenderer` entry) and one level of
+string ARRAY. A map is neither, so **every per-slot material override was shaken out of every
+production build**. Measured across all 23 committed projects: 11 such refs in 3 projects
+(`demos/forest-camp` ×1, `games/alien-animal` ×5, `games/timeline-demo` ×5), 11 dropped.
+
+Two things make this class nastier than the code-ref one:
+
+- **The runtime and the build disagreed, and the runtime was right.**
+  `collectResourceRefsFromEntities` (`runtime/loaders/loadSceneFile.ts`) has had an explicit
+  `SkinnedMeshRenderer.materials` branch all along, so the material is acquired and applied in dev
+  and in the editor. Only the *build* was blind. Two walkers over the same authored data, one with a
+  hole in it, and nothing compared them.
+- **The failure is silent by construction.** An authored material override that resolves to nothing
+  does not error — it simply does not apply, and the mesh keeps whatever material its GLB brought.
+  It shipped in the flagship published demo and surfaced only as a single
+  `[MeshCache] Unknown asset guid:` line in a device log.
+
+**Guard**: `computeKeptAssets` returns `unreachableRefs`, and a build with any entry **fails**.
+After the walk it re-reads every KEPT walkable asset JSON as text and flags any GUID that (a) the
+asset index resolves to a real shippable asset and (b) the keep-set does not contain. Both
+conditions carry weight: a GUID the asset index does not know is an entity ref and is ignored, which
+is what makes the check exact rather than noisy — measured **0 false positives across all 23
+projects**, against exactly the 11 true positives above. It is deliberately **shape-blind**: it does
+not care how the ref was written, so the *next* blind spot fails the build instead of shipping.
+
+Two details that are load-bearing rather than incidental:
+
+- It runs **before** the `build.modules.video` drop, so a clip excluded on purpose is never
+  misreported as a ref the walker missed.
+- It scans exactly the types the walk opens, asked via `classify()` — **not a suffix regex of its
+  own**. A second hand-maintained list of "files that carry refs" would be the same walker-vs-checker
+  drift the guard exists to catch (concretely: a legacy pre-migration scene is a plain `.json` under
+  `/scenes/`, which `classify` types `scene` and the walker reads, and which a `.scene.json` regex
+  would have skipped).
+
+As with the keep-list above, the fix for a flagged ref is to **teach `probeTraitRefs` the shape**,
+not to paper over it with an `asset-keep.json` entry.
+
+**The sweep that follows from this** — and it found a second instance immediately. State the defect
+as "the RUNTIME collector and the BUILD walker disagree about a trait", and the two lists are both
+readable: `collectResourceRefsFromEntities` (`runtime/loaders/loadSceneFile.ts`) carries explicit
+handlers for 14 traits, `probeTraitRefs` for 5. Differencing them turned up **`AudioSource.clips`** —
+a JSON-STRING bank `[{key, ref}]`, parsed by the runtime and by nothing in the build.
+`REF_FIELDS_BY_TRAIT` covers only the scalar `clip`, and the generic sweep sees one JSON string, so
+`isGuid()` is false and every ref inside is invisible to it. Now handled.
+
+Nothing was broken on committed content, and *why* is the part worth carrying: every committed
+`AudioSource` lives in a **scene**, and a scene carries a `resources[]` manifest — regenerated from
+that same runtime collector — which the walk reads, so the bank refs were reached by that route. A
+**prefab** has no `resources[]`. That is the asymmetry behind both bugs: a ref authored in a prefab
+gets exactly one chance to be seen, and it is the walker's own trait handling. `char_Ranger.prefab.json`
+is why #237 shipped; an `AudioSource` bank in a prefab would have shipped the same way, with
+`audio.play` on every non-active key silently playing nothing on device.
+
+**And a THIRD instance, which that sweep could not have found** — worth stating because it corrects
+the sweep's own framing. Differencing the two walkers' *trait handler* lists is a field-shape test,
+and the remaining gap was **structural**: `extractEntityRefs` walked an entity's `traits` and its
+`overrides`, while `collectResourceRefsFromEntities` also walks `nestedOverrides` (one level deeper —
+`{ path: { localId: { Trait } } }`) and every `added` subtree, each of which carries its own override
+maps. So the right pattern statement is not "which traits does each walker know" but **"which STORES
+can hold an override, and does each walker read all of them"** — and the answer now lives in one
+recursive helper per walker, so the two can be compared by eye.
+
+Nothing in committed content reaches it (`space-console`'s `Station.scene.json` is the only
+`nestedOverrides` user, and it overrides two scalar floats). The reason to fix it anyway is the guard
+above: since a ref the walker cannot see now **fails the build**, leaving the gap would have turned a
+silent 404 into a hard stop on legitimate authoring.
+
+## Find References — the same walk, inverted (#284)
+
+"What references this?" is the reverse of the question the tree-shaker above answers, and it is
+served by **inverting that same walk** rather than by a second one. `enumerateRefEdges`
+(`engine/plugins/asset-tree-shaker.ts`) runs `computeKeptAssets` with three options a production
+shake never sets — an `onRef` observer, an `onEntity` observer, and `seedAllWalkable` — and
+`engine/plugins/assetRefGraph.ts` builds the reverse index out of the edges it emits. Consumers:
+`GET /api/find-references`, the `modoki_find_references` MCP tool, and the editor's **Find
+References** on an Assets row and a Hierarchy row.
+
+⚠️ **Do not write a second walker for this.** Two graphs over the same data drift, and the one that
+drifts is the one nothing in CI runs — which would be this one. The failure is silent: a wrong
+"0 references" looks exactly like a right one, and the reader acts on it by deleting something.
+
+**Why an ad-hoc grep is not merely inconvenient but WRONG.** The graph has edges no file records,
+and they are the majority of the 2D/UI surface:
+
+| implicit edge | what holds it | why a grep misses it |
+|---|---|---|
+| **derived sprite** | a `Renderable2D.sprite` / `UIElement.imageSrc` holds `deriveGuid('sprite:' + textureGuid)` | that guid appears in **no file** as the texture's id |
+| **slice** | a sprite-sheet slice guid, living in the texture's `.meta.json` `sprites[]` | the ref names the slice, not the sheet |
+| **atlas member** | a packed member guid, redirected to the built `.atlas.json` | the ref names the member, not the atlas |
+
+This is not hypothetical. An agent asked "is this texture still used?", swept for each texture's own
+guid, and reported **every icon in `games/court` as orphaned** — including two wired minutes
+earlier. Measured on Court today, over the DEDUPED graph: **108 of its 233 asset-to-asset edges are
+`derived-sprite`** — 46%, so that sweep was blind to nearly half the graph it was reasoning about.
+`buildGuidIndex` already models all three, which is exactly why the inversion reuses it.
+
+**What it returns, and the two distinctions that make an answer actionable:**
+- **Paths, not a count.** `Coin@tray-badge.prefab.json [Renderable2D.sprite derived-sprite]` names
+  the file AND the field to edit; "12 references" names nothing.
+- **direct vs indirect.** A texture reached only through material → mesh is still used, but what
+  you edit to break the link is a different file.
+- **`reachable`.** A referrer that is itself dropped from a production build is a weaker reference
+  than one that ships. Computed by forward BFS from the shake's real seeds (scenes + keep-list),
+  which is why `seedAllWalkable` is a graph-only option: the reverse index needs an orphan
+  prefab's OUTBOUND edges, but must not let seeding it make it look live.
+
+**Three traps recorded because each one produced a wrong answer during the build:**
+- **A prefab instance's identity is the entry's top-level `guid`, not `EntityAttributes.guid`** —
+  measured on Court, where all 25 instances are shaped that way and `PrefabInstance.rootInstanceId`
+  names that same guid. Reading only the trait made 26 live entity refs look dangling. That rule now
+  lives in ONE place, `entityGuid` in `runtime/scene/sceneMutate.ts`, and the walk calls it: the
+  mutate path already had it right, this walk re-derived it and got the fallback order wrong — which
+  is the same single-source-of-truth failure the feature itself is about, one level down.
+- **A self-edge is not a reference.** `rootInstanceId` on an instance root names its own guid, so
+  every prefab instance reported itself as its own referrer — which also made `unreferenced` wrong,
+  since a self-edge is an inbound edge.
+- **`meta` sidecars are not assets.** Both halves (`.meta.json` and the machine-local
+  `.meta.local.json`) are metadata ABOUT an asset; listing them added a phantom row per imported
+  binary, the same defect the Clean Up dialog already fixed once (QA-DLG-0006).
+
+**"What would the build drop?" has exactly ONE owner: `/api/unused-assets`.** Find References
+briefly shipped an `?unreferenced=1` mode — "list every asset nothing points at" — and it was
+measured and deleted in the same close-out. Its result is a strict SUBSET of the tree-shaker's
+orphan list on every committed project (court 17/17, 3d-test 29/31, forest-camp 30/60, sling 38/73,
+particle-demo 19/21), and nothing ever appeared in it that was not already an orphan. That is
+structural rather than lucky: a file nothing points at cannot be reachable unless it is a seed, and
+seeds were excluded. Where the two differed it was strictly WORSE — it reported only the ENTRY
+POINTS of a dead subtree while the orphan list reports the whole subtree (38 against 73 on sling).
+A second, weaker answer to a question that already has one is the cross-tool inconsistency
+[mcp-tool-conventions.md](mcp-tool-conventions.md) § 2 exists to prevent, so it is gone rather than
+kept "for completeness". If the Clean Up dialog ever wants its orphans GROUPED by dead-subtree
+root, that is a presentation pass over `orphanDetails`, not a second query.
+
+**There are TWO reachability implementations, and a test is what keeps them equal.** The shake
+already computes reachability — its keep-set IS that answer, and it is the one production ships by.
+`computeReachable` in `assetRefGraph.ts` re-derives it from the edge list, because
+`enumerateRefEdges` seeds every walkable file (to see orphans' outbound edges), which makes that
+run's keep-set useless as a reachability answer. That is a real reason for the second walk and not
+a reason to trust it: `reachable` is what tells a reader whether a reference survives the build, so
+a drift shows up as a reference quietly mislabelled and nothing else. Measured, they agree exactly
+— **1168/1168 paths on Court**, zero disagreement either way across court / sling / forest-camp /
+3d-test / particle-demo — and `assetRefGraphCourt.test.ts` asserts that equality over three real
+projects. Real projects rather than a fixture on purpose: the shapes that could diverge (a
+keep-listed prefab, font-family resolution, a shader's sibling `.wgsl`, atlas redirection) exist in
+committed content and not in anything hand-built. Dropping the entity-fold from `computeReachable`
+fails `sling` and NOT `court`, because Court's scenes carry `resources[]` manifests that make the
+file a graph node anyway — which is why one project would not have caught it.
+
+**`dangling` is a superset of the shake's `unresolved GUID ref:` warnings, not a competitor.**
+Every warned guid appears in `dangling`; the reverse does not hold, because the generic entity-ref
+sweep deliberately does not warn (an entity guid is never in the asset index, so warning there
+would flood every build log). Measured across court / 3d-test / sling: nothing warned was missing
+from `dangling`. Don't "reconcile" them — one is unstructured build-log text, the other a
+structured per-node projection that also covers entity refs.
+
+**`dangling` is a lead, not a verdict.** A guid that resolves to neither a tracked asset nor an
+entity is reported as "could not resolve" — never as "broken" — because the guid index only covers
+asset kinds `classify()` knows, so a ref to a game-defined JSON kind lands there even when the file
+exists (Court's `.court.json` levels are `unknown-json`).
+
+Cost, measured warm on this Mac: **6-64 ms** to enumerate and **0-2 ms** to build the graph, across
+five committed projects (56-1,185 files). No caching — the query is on-demand and the walk is
+cheaper than the round trip. (It was roughly double that until the close-out review noticed
+`buildGuidIndex` — which stats every shippable file and reads every `.meta.json` sidecar — was
+running twice per query; `computeKeptAssets` now takes a prebuilt index.)
+
+**`dangling` covers declared asset slots too, and that is not where it started.** It was populated
+only from the generic entity-ref sweep, so a `.mesh.json` whose `model` guid pointed at nothing
+answered `unresolvedRefsFromTarget: []` — the structured signal silently absent for exactly the
+asset-to-asset refs this section is about, while the doc comment promised the opposite. Caught in
+the #284 close-out review, pinned by a mutation-checked test. A `font-family` edge is deliberately
+NOT dangling: a CSS family name is not a guid, and `resolveFontsByFamily` resolves it at the end of
+the walk.
+
+⚠️ **It reads FILES ON DISK.** An unsaved live-world edit is invisible to it, so a user who just
+wired something up and did not save will be told "0 references". Save first.
 
 ## Packaged editor loop (test the DMG faithfully, fast)
 
@@ -373,6 +720,15 @@ Three loops, three jobs — don't conflate them:
   the tree, so an in-repo `.app` would find the repo's `node_modules` and **mask** the exact
   "dependency excluded from the package" bugs the test exists to catch. Building outside the repo is a
   deliberate correctness property — do NOT relocate the build into the project folder.
+  - **…and each loop owns its OWN directory there, per clone.** The temp dir is machine-wide, so the
+    name is the only thing separating them: `test-packaged.sh` builds at `modoki-pkg-test-<clone>`,
+    `smoke-packaged.sh` at `modoki-pkg-smoke-<clone>`. They must not converge — `editor:*:packaged`
+    is `test-packaged.sh` `exec`ing a long-lived interactive editor out of its dir, while the smoke
+    reaps packaged apps and `rm -rf`s its own before every build. `repro-cold-boot.sh` is the one
+    deliberate SHARER: its default `OUT` reuses the **smoke** dir, because its job is to relaunch the
+    app that gate just built. That coupling is invisible when it breaks — the script finds an older
+    app and reports on it — so `engine/tests/architecture/tempPathScoping.test.ts` pins the two names
+    to each other, and fails any temp path that lacks a per-clone discriminator.
 
 ⚠️ **`fs.stat` timestamps are FABRICATED for paths inside `app.asar`.** Electron's asar shim
 reports a real `size` but synthesizes the times — measured on packaged Windows (2026-08-02),
@@ -552,6 +908,128 @@ The one thread genuinely shared with #21 — a suspected teardown race on the pa
 Vite dep-cache — is a *hypothesis overlap*, not an established common cause. Worth checking both if
 either recurs.
 
+### Packaged renderer boot + build-chain bugs (fixed)
+
+Four bugs found stress-testing the very first packaged DMG (`dist:dir`), each invisible to
+`npm run dev` because each depends on a packaging-only boundary:
+
+- **Renderer never mounted** — the Vite error overlay reported `Failed to resolve import
+  "@zappar/msdf-generator"` from the pre-bundled `SceneManager` chunk, so React never mounted and
+  the whole `/api/*` backplane was dead. Root cause: `main.ts` relocates Vite's dep cache to
+  `userData/vite-cache`, OUT of the `node_modules` tree (the bundle itself is read-only), so the
+  `optimizeDeps.exclude`d `@zappar` package (WASM + worker, self-resolves via `import.meta.url`)
+  could no longer resolve a bare import from there. Reproduced only packaged — an on-disk
+  `MODOKI_PROD=1` smoke test worked, because that keeps the dep cache in-tree. Fixed with a
+  `resolve.alias['@zappar/msdf-generator']` in `engine/vite.config.ts` pointing at the absolute
+  `<repoRoot>/node_modules/@zappar/msdf-generator` path (guarded with `existsSync`, so it's a no-op
+  in dev).
+- **`npm run build` → "Missing script: build"** — electron-builder strips `scripts` from the
+  packaged app's `package.json` unconditionally, even via `extraMetadata`. Fixed by invoking the
+  script directly at every build-step call site: `node engine/scripts/build-web.mjs`.
+- **`tsc: command not found`** — the packaged app ships no `node_modules/.bin` symlinks, and
+  `typescript` is a pruned devDependency (only `dependencies` + `optionalDependencies` ship — `vite`
+  is a real dep so it's present). Fixed in `build-web.mjs`: run Vite via its resolved JS entry with
+  `process.execPath` (`node node_modules/vite/bin/vite.js`) instead of a `.bin` shim, and **skip the
+  tsc typecheck when `node_modules/typescript/bin/tsc` is absent** — the engine ships pre-built, an
+  external project's game code isn't in the tsc scope anyway, and Vite transpiles TS via esbuild
+  regardless.
+- **Misleading "Connection lost"** — the no-`webBucket` deploy path sent a bare SSE `status` event
+  then closed the stream, so the client's `onerror` fired and reported a generic connection failure
+  instead of the real message. Fixed by sending an explicit `FAILED:` status (matching the
+  missing-tools path), so build/deploy failures now surface cleanly instead of reading as a dropped
+  connection.
+
+All four verified end-to-end on a clean-from-source repackage: renderer mounts, `/api/scene-state`
+returns 200 entities, a "Build → Web" run on a clean packaged install completes and deploys.
+
+### The packaged editor must not write inside its own bundle (#326)
+
+A packaged editor's `REPO_ROOT` is `<Resources>/app.asar.unpacked` — **inside the signed `.app`**.
+Anything the build chain writes relative to it lands in the bundle, where a write is not a
+permission problem but an **integrity seal** problem: nothing errors, and only `codesign --verify`
+and `spctl --assess` ever notice. Three writers were found and closed:
+
+| writer | fix |
+|---|---|
+| `engine/tsconfig.app.scoped.json` | not written at all in a packaged build — deferred into the `existsSync(tscBin)` branch that already gates the typecheck (`3df0e65d4`) |
+| `.modoki/device-guid` +3 backend state defaults | routed through `modokiStateDir()`, which points at `~/.modoki` when `MODOKI_PACKAGED=1` (`ed17ff8a2`) |
+| `node_modules/.vite-temp/…mjs` — Vite's compiled config | the packaged app is handed a **CJS** config, whose loader branch never writes (below) |
+
+**The `.vite-temp` mechanism, and the one asymmetry the fix rests on.** Vite's default `bundle`
+config loader esbuild-bundles the config, then `loadConfigFromBundledFile` branches on
+`isFilePathESM(configPath)` — which is decided by extension first, and only then by the nearest
+`package.json` `type`:
+
+- **ESM** (`engine/vite.config.ts` under this repo's `"type": "module"` root) → writes the compiled
+  config to `<nearest node_modules>/.vite-temp/…mjs`, imports it, unlinks it. The directory is
+  chosen by walking up from the **config file**, not from `root` or `cacheDir`, so no option moves
+  it — which is why every attempt to configure this away failed.
+- **CJS** (`.cjs`) → hooks `require.extensions` and compiles **in memory**. It writes nothing.
+
+So `engine/scripts/stage-vite-config.cjs` (a `beforePack` stager) esbuild-bundles `vite.config.ts`
+into a gitignored `engine/vite.config.cjs` shipped in the bundle, and `chooseViteConfig()`
+(`engine/scripts/viteConfigChoice.mjs`) hands Vite that one when it exists. Regenerated on every
+pack, so it cannot drift; chosen by file existence rather than an env var, so a dev clone (no
+`.cjs`) and a packaged app (always one) cannot disagree.
+
+⚠️ **Bundling to CJS empties `import.meta`, and this plugin graph is full of self-locating modules.**
+Three already branch to `__filename`/`__dirname` when it is absent — and `native-dynamic-import.ts`
+**depends** on the absence, so do NOT "fix" the esbuild warnings with a `--define:import.meta.url=…`;
+that silently takes the wrong branch. The one module that did not branch, `courtAuthored.mjs`, killed
+the entire packaged build at config load with `fileURLToPath(undefined)`.
+⚠️ And **everywhere in this graph `import.meta.url` must appear verbatim.** Vite's own config
+bundler rewrites that exact expression to the defining module's URL; a paraphrase like
+`(import.meta as { url?: string }).url` slips past the define and silently resolves to the **temp
+file** under `node_modules/.vite-temp/` instead. Measured against vite 8.2.0 under the repo's own
+shape — a `.ts` config beneath a `"type": "module"` root — for the entry config *and* for an
+imported module. (Probe it under any other shape and it looks clean: a `.cjs`/non-`type: module`
+config takes the in-memory branch, and with no `node_modules` above it the temp file lands beside
+the original, where the wrong path is indistinguishable from the right one.) In `vite.config.ts`
+the paraphrase killed the build outright — `engine/node_modules/.vite-temp/index.html`; in
+`font-instance.ts` it was silently wrong for months and merely benign, because `require.resolve`
+walks up to the same `node_modules` anyway. Both classes are pinned by
+`engine/tests/plugins/packagedViteConfig.test.ts`.
+
+**Measured 2026-08-22 — two corrections to what was previously believed here.**
+
+1. **`.vite-temp` alone does not persistently break the seal.** On a build that completes, Vite
+   unlinks the temp file and leaves an **empty** directory, and `codesign` does not seal empty
+   directories — `codesign --verify --deep --strict` still exits 0. It does leave a window *during*
+   the build where the bundle is invalid, and a build that dies mid-config-load leaves the file. The
+   persistent breaks measured on the v0.5.1/v0.5.2 rcs were the other two writers in the table.
+   The fix is still worth having (no write at all, and it removes the Windows EPERM at its source —
+   see `docs/windows.md`, where the installer grant STAYS until Windows verifies it) but do not
+   re-derive the causal story from this paragraph: **re-measure**, per QA-PKG-0009 step 7.
+2. **A broken seal does not strand users.** Measured against the real GitHub feed with the published
+   signed `v0.4.0` (feed latest `v0.4.1`): a seal-broken app still launches, its main binary still
+   reports a Developer ID signature so the ad-hoc skip in `autoUpdate.ts` never fires, the check
+   finds the update, downloads it, and **the install succeeds** — replacing the whole bundle, which
+   both applies the fix and restores a valid signature. The update path is self-healing.
+
+**`npm run smoke:packaged` now checks this automatically.** It snapshots the bundle's file list
+after `electron-builder` finishes and re-lists it after both app boots, failing on any added or
+removed path (`engine/scripts/assertBundleUnchanged.mjs`). Directories are deliberately not
+listed — an empty `.vite-temp` is not a seal break, and listing it would report the wrong writer.
+An empty snapshot fails rather than passing vacuously. It does NOT cover a *build*, only startup;
+for the build path the manual protocol below is still the check.
+
+**How to verify a fix in this class — nothing cheaper distinguishes the outcomes.** Build the
+packaged `.app` (`npm run smoke:packaged` leaves one under the temp dir); it is ad-hoc signed by
+`--dir` in a state that already fails `--verify`, so give it a real seal first with
+`codesign --force --deep --sign - <app>` and confirm exit 0. Then launch it with a scaffolded
+throwaway project, run **Build → Web from its own menu**, and re-assess:
+
+```bash
+codesign --verify --deep --strict "<app>"; echo "exit=$?"     # must still be 0
+find "<app>" -type f | sort > after.txt; comm -13 before.txt after.txt   # must be empty
+```
+
+Two traps this class keeps setting. **Never read the exit code through a pipe** — `codesign … | tail`
+reports `tail`'s status, and a broken signature reads as a pass. And **verify on a project that
+exercises the asset pipeline**: `games/anim-bug` has no rigged model, so it builds identically with
+or without the `--configLoader runner` that was wrongly declared good on it; `demos/forest-camp` is
+the distinguishing fixture.
+
 ## CLI recipes
 
 The examples use `games/<id>`; substitute the project and its appId. Note the **project-dir cwd**
@@ -601,6 +1079,22 @@ install condition — rather than re-deriving them:
 - `ensureCapacitorDeps` needs a platform, and `--target native` covers both; the CLI heals
   whichever of `ios/`/`android/` the project already has on disk (a project with neither yet is
   the editor's scaffold-then-build path, which the CLI has no equivalent entry point for).
+- ⚠️ **A PACKAGED editor must never let this chain BUILD a plugin, and that is decided by an env
+  var, not by the call site.** `vendorEnginePlugins`'s `canBuild` defaults to
+  `process.env.MODOKI_PACKAGED !== '1'`; `main.ts` sets `MODOKI_PACKAGED=1` when `app.isPackaged`,
+  and every child inherits it (`devServer.ts` spawns Vite with `...process.env`, and `build-web.mjs`
+  runs under that). A packaged app ships each plugin's `src/` **and** `dist/` but no
+  devDependencies — and packaging strips every binary shim, so its root `node_modules/.bin/` is
+  EMPTY. `npm run build` there runs `rimraf` and exits 127.
+  **Why the default and not the three call sites:** it was the call sites, and it shipped broken.
+  `ensurePluginBuilt` has had the guard all along and `main.ts` passed it correctly, but the two
+  sites that run during a native build — `vite-asset-scanner`'s build path and `addNativeTarget`'s
+  auto-scaffold — live in the Vite dev-server process and passed nothing, so `?? true` won. In the
+  v0.5.0 packaged editor the first iOS/Android build of any project killed its own dev server;
+  the Electron backend survived, so every later build reported **"Connection lost"** and it read
+  as a network fault rather than a dead server. Found building `demos/forest-camp`, fixed in 0.5.1.
+  Pinned from both ends: `tests/electron/packagedEnvSignal.test.ts` (the signal is SET and
+  inherited) and `vendorPlugins.test.ts` § "the packaged-editor default" (it is READ).
 
 #### The engine-required Capacitor plugins must be COMMITTED, not just healed
 
@@ -634,6 +1128,72 @@ Two notes worth carrying:
 - To re-vendor **without** building: `node engine/scripts/vendor-plugins.mjs games/<id>`, then
   `npm install` in the project. `engine/tests/architecture/vendoredPluginFreshness.test.ts` fails
   `npm test` on a project whose pin has gone stale.
+- **Re-vendoring is NOT automatic on an ordinary build** — it only runs on project open/scaffold,
+  or when `ensureCapacitorDeps` detects a missing dep. So editing `engine/packages/capacitor-<x>/**`
+  mid-session and then just re-running a build silently builds against the STALE vendored copy.
+  Re-vendor after **every** plugin source edit, not once per session: `node
+  engine/scripts/vendor-plugins.mjs games/<id>` then `npm install` in that game dir — verify by
+  grepping the new source string into `games/<id>/node_modules/<plugin>/...` before trusting a
+  device build. A `git status` on `games/<id>/plugins/*.tgz`/`package.json` after re-vendoring
+  confirms whether it actually changed.
+
+#### Why the vendored tarball's hash churns, and the fix
+
+The tarball naming (`games/<id>/plugins/<plugin>-<hash>.tgz`) used to re-pin constantly across
+clones/over time with **zero shipped-content changes**, forcing a spurious re-vendor + re-commit
+in every game that depends on the plugin. Root cause: `engine/plugins/vendorPlugins.ts`'s
+`pluginContentHash` hashed the plugin's **built output** (`dist/`, rebuilt on every `npm install`
+and sensitive to the exact tsc/rollup version, plus local uncommitted `android/build/` +
+`android/.gradle/` litter) instead of its source. That output drifts across clones/over time with
+no source change → new hash → new filename → re-vendor churn. An earlier fix ("scope to the
+published fileset") was insufficient — it still hashed `dist/` and assumed `src/` was the volatile
+input, when it's the reverse.
+
+**Fix:** hash the plugin's SOURCE inputs instead — every file EXCEPT derived build/cache dirs
+(`dist`, `build`, `.gradle`, `.build`, `DerivedData`, `Pods`, `.cxx`, at any depth) plus npm junk.
+The tarball identity now answers "did the source change?", not "did the build output shift?". Plus
+`.gitattributes` forces `eol=lf` on the hashed source text types (`.mjs`/`.cjs`/`.mts`/`.cts`/
+`.kt`/`.kts`/`.podspec`) so a Windows CRLF checkout can't drift it on its own. Guard test in
+`engine/tests/plugins/vendorPlugins.test.ts` ("does NOT re-pack when ONLY the built `dist/`
+changes" + a build-litter test). **If it churns again, the hash differing between clones means
+their checked-out SOURCE differs — check line endings or an untracked file leaking into the plugin
+dir, not the build output.**
+
+⚠️ **STILL OPEN: the hash covers non-shipped files.** `pluginHashInputs` hashes everything not
+under `dist`/build dirs, which still includes a plugin's **test** files (`android/src/test/`,
+`ios/Tests/`, `test-vectors/`) — not in the plugin's npm `files` allowlist and not shipped in the
+tarball. Adding/editing plugin tests therefore still re-pins the vendored tarball in every game
+that depends on it, with a byte-identical shipped-content diff. The correct fix is NOT simply
+"scope to the npm `files` allowlist" — that would drop `src/` from the hash and break the
+deliberate, tested contract (`vendorPlugins.test.ts`) that a `src/` edit MUST re-pack (`src/` is
+hashed as a proxy for the excluded, toolchain-volatile `dist/`). The correct input set is
+`(shipped files MINUS dist/) ∪ (dist build-inputs: src/ + tsconfig + rollup + package.json)` —
+keep `src/` + shipped native, exclude only non-shipped/non-build dirs (tests, test-vectors).
+Deferred as medium+delicate, not small — changing the algorithm re-pins every game's tarball once.
+
+#### Web deploy (`gcloud`)
+
+The web deploy step (`gsutil`/`gcloud storage` upload + CDN invalidation to `webBucket`) shells out
+to `gcloud`, which is a **sanctioned system tool like `xcodebuild`** — it carries the user's cloud
+auth, so it can never be provisioned by the toolchain the way Node/JDK/Android SDK are (see
+[editor-toolchain.md](editor-toolchain.md)). A **Finder-launched** packaged editor gets a minimal
+PATH with no Google Cloud SDK on it, so a deploy that works from a full-PATH shell can fail on the
+exact same machine when launched normally, with `gcloud: command not found`.
+
+`resolveGcloudDir(override?)` (`engine/plugins/vite-asset-scanner.ts`) resolves it in order:
+
+1. **Project Settings override** — `user.sdk.gcloudPath` (a binary or bin dir), the per-machine
+   `project.user.json` field surfaced in the editor as Web Deploy → "gcloud path override".
+2. **Well-known dirs** — `/opt/homebrew/bin`, `/usr/local/bin`, `~/google-cloud-sdk/bin`,
+   `/usr/local/google-cloud-sdk/bin`, `~/.local/bin`.
+3. **Login-shell `command -v gcloud`** — a last resort that only works when launched from a shell
+   that sources the user's profile.
+
+The web-deploy step prepends the resolved dir onto every deploy step's PATH (mirroring the
+iOS/CocoaPods PATH block); if `gcloud` is genuinely absent, the step fails fast with an install
+hint instead of the mid-stream "command not found" a bare shell-out would produce. Verified on the
+packaged app under a minimal PATH (no `/opt/homebrew`): the deploy resolves `gcloud` via the
+well-known dirs and completes ("✅ deployed successfully").
 
 ### iOS Simulator
 ```bash
@@ -659,15 +1219,132 @@ xcrun devicectl device process launch --device <DEVICE_ID> <appId>
 First device install requires trusting the developer profile: Settings → General →
 VPN & Device Management → Trust.
 
+⚠️ **Those last two lines are iOS 17+ ONLY.** `devicectl` is CoreDevice-only and **cannot see an
+iOS ≤16 device at all** — including this Mac's main iOS test device, the iPhone 8 (16.7.16). Read
+without this note, the recipe above looks like the only route and the answer looks like "open Xcode
+and press ⌘R"; it is not, and an agent can deploy to a 16.x phone unattended — both from the CLI
+recipes below and, as of #217, from `Build → iOS Device` itself (next section).
+
+**iOS ≤16 — go-ios** (`engine/toolchain/goIosProvision.ts`; installable from **Build Support…** or
+provisioned automatically by a build that needs it). This is what `Build → iOS Device` now uses —
+see "Hands-free install (go-ios)" below. The manual equivalent is shorter than libimobiledevice:
+`ios install` takes the built `.app` **folder** directly, no `Payload`/zip step:
+
+```bash
+xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
+  -destination 'id=<UDID>' -allowProvisioningUpdates -derivedDataPath /tmp/<id>-dd build
+ios install --path=/tmp/<id>-dd/Build/Products/Debug-iphoneos/App.app --udid=<UDID>
+ios launch <appId> --udid=<UDID>
+```
+
+No sudo, no tunnel, no manual Developer Disk Image mount is needed on 16.x — measured on the iPhone
+8 (16.7.16): kill the running app, `ios install` + `ios launch`, whole cycle ~4s, verified by a new
+pid that outlives the tool.
+
+⚠️ **`ios install` is INTERMITTENT, and `ideviceinstaller` is the fallback that has never failed
+here** (2026-08-20, QA-BUILD-0004). The ~4s success above is real and reproducible at other times —
+but the same command also fails outright, and when it does the message points at the wrong thing:
+
+```
+ERROR failed writing — "your app is not properly signed for this device, check your codesigning
+and provisioningprofile. original error: 'ApplicationVerificationFailed' errorDescription:'Failed
+to verify code signature of .../installd.staging/temp.XXXX/extracted/App.app.ipa.app :
+0xe8008017 (A signed resource has been added, modified, or deleted.)'"
+```
+
+**Do not go hunting the signing — it is verifiably correct when this happens.** Measured on
+`games/3d-test`: `codesign --verify --deep --strict` reports *valid on disk* and *satisfies its
+Designated Requirement*; zero extended attributes; no AppleDouble, `.DS_Store`, symlinks or empty
+directories; six nested framework seals all validating; and the `embedded.mobileprovision` is the
+wildcard team profile **containing the target device's UDID**.
+
+Five controlled installs isolate it — and the discriminator is **nested frameworks**, not the
+device and not iOS 16:
+
+| installer | bundle | frameworks | device | result |
+|---|---|---|---|---|
+| go-ios 1.3.2 | 3d-test | 6 | iPhone 8 (16.7.16) | FAIL `0xe8008017` @ VerifyingApplication 40% — debug-dylib build |
+| go-ios 1.3.2 | 3d-test | 6 | iPhone 8 (16.7.16) | FAIL `0xe8008017` @ 40% — rebuilt `ENABLE_DEBUG_DYLIB=NO`, monolithic |
+| go-ios 1.3.2 | 3d-test | 6 | iPad mini (18.7.8) | FAIL `0xe8008017` @ 40% — same bundle |
+| go-ios 1.3.2 | 3d-test | 6 | iPhone 8 (16.7.16) | FAIL — 4th attempt, *after* ideviceinstaller had installed it |
+| **go-ios 1.3.2** | **court** | **2** | **iPhone 8 (16.7.16)** | **SUCCESS — InstallComplete (100%)** |
+| **ideviceinstaller 1.2.0** | 3d-test | 6 | iPhone 8 (16.7.16) | **SUCCESS — InstallComplete (100%)** |
+
+⚠️ **So go-ios is NOT broken generally, and this is the correction that matters.** An earlier
+version of this section said the installs isolated the fault "to go-ios, not to the bundle" — the
+`court` control disproves that. `com.apiary.court` carries 2 frameworks (Capacitor, Cordova)
+and installs first try; `com.modokiengine.tropicalisland` carries 6 (those two plus
+FirebaseAnalytics, GoogleAppMeasurement, GoogleAppMeasurementIdentitySupport,
+GoogleAdsOnDeviceConversion) and fails **4/4**. Both pass `codesign --verify --deep --strict` and
+both embed a profile containing the device UDID. **It is deterministic per bundle**, which is why
+it reads as "works sometimes": nearly every project here has 2 frameworks, and only `3d-test`
+carries the Firebase/Google set.
+
+`ios install` zips the `.app` and lets `installd` extract it (note the `.ipa.app` in the error
+path); that round-trip is what breaks the signature's resource seal, and more nested signed code
+means more seal to preserve. libimobiledevice does not use that path. Three dead ends already ruled
+out, so nobody repeats them: it is **not** the Xcode 16 debug-dylib layout (rebuilding monolithic
+changed nothing), **not** an iOS-16 limitation (the iPadOS 18.7.8 control failed identically), and
+**not fixable by updating go-ios** — v1.3.2 (2026-08-11) is already the newest release, main's
+commits since are dtx/instruments work, and the alternative install path is open and unmerged
+upstream (danielpaulus/go-ios #810 AFC staging, #400 InstallProxy).
+
+**So: when `Build → iOS Device` fails this way, install with `ideviceinstaller` rather than
+debugging the certificate.** On 1.2.0 it takes the `.app` folder directly — no `Payload`/zip step:
+
+```bash
+ideviceinstaller -u <UDID> install /tmp/<id>-dd/Build/Products/Debug-iphoneos/App.app
+```
+
+⚠️ **`ideviceinstaller` is NOT part of Modoki's toolchain — do not design around it as a fallback.**
+`engine/toolchain/` provisions go-ios, the JDK, the Android SDK, Node, Ruby and WDA; libimobiledevice
+appears nowhere in engine code except two comments. It is on THIS Mac because it was `brew
+install`ed, so the recipe above is a machine-local workaround an agent can use here — not something
+a fresh clone on a fresh Mac will have. The product fix therefore cannot be "fall back to
+`ideviceinstaller`" as-is; it has to be either fixing/upgrading go-ios past 1.3.2, or provisioning
+libimobiledevice the way `goIosProvision.ts` provisions go-ios.
+
+Tracked as testboard bug `QMomlhq4qN3dFQfpfSVT` (p1).
+
+**iOS ≤16 — libimobiledevice** (`brew install libimobiledevice ideviceinstaller`; already on PATH on
+this Mac) is the older manual route — kept because it still works and #205 proved it, on a device
+class (an iPhone 7) that took a development-signed build with **no Xcode run at all**:
+
+```bash
+idevice_id -l                                   # the UDID; xcrun xctrace also lists 16.x devices
+xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
+  -destination 'id=<UDID>' -allowProvisioningUpdates -derivedDataPath /tmp/court-dd build
+mkdir -p /tmp/ipa/Payload && cp -R /tmp/court-dd/Build/Products/Debug-iphoneos/App.app /tmp/ipa/Payload/
+(cd /tmp/ipa && zip -qry app.ipa Payload)
+ideviceinstaller -u <UDID> install /tmp/ipa/app.ipa
+idevicedebug -u <UDID> run <appId>              # launch + attach stdout; idevicesyslog for logs
+```
+
+Three caveats, none of which the install step can fix for you:
+- **This replaces the INSTALL, not the SIGNING.** The `.app` must already be development-signed —
+  that is what the `xcodebuild` step above does, and it still needs a Team ID
+  (`project.user.json`).
+- **`idevicedebug run` needs the Developer Disk Image mounted**, which it is on any device Xcode
+  has already run something on.
+- **It does NOT buy trusted input.** That needs a WebDriverAgent XCUITest bundle, and Xcode refuses
+  the iPhone 8 as a TEST destination — six theories tested and disproved, see
+  [trusted-device-input.md](./trusted-device-input.md) § "iOS 16 devices". Getting there is `go-ios`
+  territory and an owner decision, not something to re-diagnose.
+
+The intended split, per [plans/low-end-device-support.md](./plans/low-end-device-support.md):
+**iOS 15/16 → go-ios** (`ios install`/`ios launch`, what the editor build now uses; the manual
+libimobiledevice recipe above still works as a fallback);
+**iOS 17+ → `xcrun devicectl … --console`**.
+
 **Normally you never type either of these — pick the phone from the Build menu.** `Build → iOS
 Device` names its current target in the label and lists every device this Mac can see in a
 submenu; picking one writes BOTH ids below into `project.user.json` **and starts the build**, so
 the menu and Project Settings stay one source of truth. (`Set target without building…` in the
 same submenu is the way to change the target without committing to a build — a started build
-cannot be cancelled.) The submenu also says which install each device will get
-("hands-free install" vs "Xcode handoff, ⌘R") — see [editor.md](./editor.md) § "Build → picking
-the target device". The fields stay editable by hand for a device no listing can see (remote/WiFi,
-an unusual setup).
+cannot be cancelled.) The submenu also says which install each device will get ("hands-free
+install" for a devicectl-reachable iPhone, "hands-free install (go-ios)" for an older one) — see
+[editor.md](./editor.md) § "Build → picking the target device". The fields stay editable by hand
+for a device no listing can see (remote/WiFi, an unusual setup).
 
 **Two DIFFERENT ids, and only the first is required.** Both live in the project's gitignored
 `project.user.json` (per-machine, never committed — Project Settings → Build → "This Machine"):
@@ -685,16 +1362,45 @@ form), which is why the Build-menu picker can fill both fields from the one id i
 
 ⚠️ **`devicectl` is CoreDevice-only — iOS 17+.** A pre-iOS-17 device has no devicectl id *in
 existence*: `xcrun devicectl list devices` lists it `unavailable`, with no
-`hardwareProperties.udid` at all. So leave `iosDevicectlId` **empty** for such a device and the
-build plans an **Xcode handoff** instead — it builds, opens the `.xcodeproj`, and reports
-success; you press Run (⌘R) to deploy. The decision is `planIosInstall`
+`hardwareProperties.udid` at all. So leave `iosDevicectlId` **empty** for such a device — the build
+then installs via **go-ios** instead (#217), provisioning it on demand if it isn't already present,
+and only falls all the way back to the Xcode handoff (open the `.xcodeproj`, press Run ⌘R) when
+go-ios is neither present nor provisionable. The decision is `planIosInstall`
 (`engine/plugins/vite-asset-scanner.ts`), deliberately one exported pure function so the
-preflight guard and the step plan cannot disagree.
+preflight guard and the step plan cannot disagree — it now returns one of three modes:
+`'devicectl'`, `'go-ios'`, `'xcode-handoff'`.
 
 That disagreement is exactly what shipped for a while: the preflight demanded BOTH ids, so a
 build that `xcodebuild` handles perfectly was refused before it started, and the refusal named
 `project.config.json` — the wrong file. Caught on an iPhone 8 / iOS 16.7.16, whose build then
 succeeded unchanged once the demand was dropped.
+
+⚠️ **On some legacy hardware the INSTALL is hands-free and the LAUNCH never will be — the build
+says so rather than reporting a failure** (measured 2026-08-19, iPhone 8 / iOS 16.7.16, Xcode
+26.5). `ios install` lands the `.app` over usbmuxd in ~8 s; `ios launch` then fails with
+`processcontrol failed: instruments service
+"com.apple.instruments.remoteserver.DVTSecureSocketProxy" unavailable`, exit 1. That is the SAME
+dead instruments stack that stops WebDriverAgent on that phone and hides it from `xctrace` — see
+[trusted-device-input.md](./trusted-device-input.md) § "iOS 16 devices"; do not re-diagnose it, and
+note that mounting the Developer Disk Image is not the fix (`ios image auto` reports one is already
+mounted and the launch fails identically).
+
+The launch step is deliberately non-fatal — the new build is already ON the phone, which is the
+part a tap cannot redo — so the build stays green and prints that the install succeeded, that the
+app did not come to the foreground, and that launching goes through a service some older devices
+do not provide. It used to say only "unlock the device and tap the icon", which names the one
+cause that can never apply here and reads as "the deploy failed" while the app sits installed one
+tap away. A locked or asleep device is still a real cause on healthy hardware, so it stays in the
+message as the first thing to check — the correction is that it is no longer presented as the only
+one. The install step's own failure message was corrected the same way: it asserted "it requires
+iOS 17+", which is wrong-by-construction whenever `iosDevicectlId` came from the Build menu's
+picker (the picker only fills it for a device devicectl can already see).
+
+`idevicedebug --detach run <bundle-id>` (libimobiledevice, Homebrew) DOES launch that phone —
+verified, exit 0, and the app outlives the tool. It is deliberately **not** wired into the build:
+the editor does not provision libimobiledevice, so depending on it would make the deploy behave
+differently on two machines depending on what Homebrew happens to have installed. Run it by hand
+when you want the loop hands-free on such a device.
 
 ### Android Device
 ```bash
@@ -724,7 +1430,7 @@ independent consumers needing different files:
 | consumer | authored as | needs |
 |---|---|---|
 | canvas text (`Text2D.font`) | a **GUID** | `~atlas.png` + `~metrics.json` |
-| DOM text (`UIElement.fontFamily`, CSS) | a **family NAME** | the source `.ttf`/`.otf`, via FontFace |
+| DOM text (`UIElement.fontFamily`) | a **GUID** (a family NAME before #231) | the source `.ttf`/`.otf`, via FontFace |
 
 `loadAllFonts` FontFace-loads the manifest path directly, so dropping the source 404'd every baked
 font at boot in every game — visible only as `[FontLoader] N/N fonts failed to load`, with the
@@ -736,10 +1442,73 @@ the tree-shaker's font-family walk (`TreeShakeResult.domFontFiles`). The build l
 per font, and the manifest records `font.sourceShipped`, which `loadAllFonts` reads so a
 deliberately-dropped font is skipped rather than fetched-and-warned.
 
-⚠️ **`shipSource: 'auto'` cannot see a family named in CSS or assigned from game code** — a static
-scan only reaches scene/prefab `fontFamily`. A game that styles DOM text from a stylesheet must set
+⚠️ **`shipSource: 'auto'` cannot see a font named in CSS or assigned from game code** — a static
+scan only reaches scene/prefab `fontFamily` (a GUID since #231, so the walk follows it as a real
+ref and keeps its family's other variants too). A game that styles DOM text from a stylesheet must set
 `shipSource: 'always'` in the font's `.meta.json`, or its text silently falls back to a system face.
 This is the one known blind spot in the rule.
+
+The DEV-EDITOR half of the same class — a scene's fonts registered by whichever editor panel
+happened to be mounted, so the Game panel rendered serif with the Assets tab closed — is #253,
+written up in [UI System](./ui-system.md) § "Who registers a scene's fonts". The runtime's
+family→asset match (`loadFontFamily`) deliberately uses the SAME `parseFontFilename(path).family`
+rule as `resolveFontsByFamily` here; if they ever diverge, a font works in the editor and is
+absent from the shipped game.
+
+## The app version + build number (`app.version` / `app.buildNumber`)
+
+Two committed fields, synced into both platforms by `healNativeConfig` on project open and before
+every native build — the same shape as the platform floors below:
+
+| field | Android | iOS |
+|---|---|---|
+| `app.version` (marketing string, e.g. `"1.0"`) | `versionName` | `MARKETING_VERSION` → `CFBundleShortVersionString` |
+| `app.buildNumber` (monotonic integer) | `versionCode` | `CURRENT_PROJECT_VERSION` → `CFBundleVersion` |
+
+⚠️ **This exists because a duplicate build number is refused SILENTLY.** Play does not say "that
+`versionCode` is taken" — the bundle never attaches, and the release page then reports three errors
+that all mean *"this release is empty"* and none of which mention versions. It reads as a broken
+upload rather than a refused one, so the first instinct is to re-upload, re-export, or re-check
+signing. App Store Connect behaves the same way for a duplicate `CFBundleVersion`, with a different
+but equally indirect message. Before #199 nothing in the engine managed either number, so every
+project shipped the scaffolder's hardcoded `1` — which only mattered once a project published, and
+then cost a diagnosis cycle.
+
+**The heal never LOWERS a build number.** Lowering is the one direction that is always a mistake,
+and it is exactly what a stale config, a fresh clone, or a forgotten bump would produce on a project
+that has already uploaded. A would-be lowering is reported instead — naming the current value and
+the smallest number that would work — rather than silently written.
+
+⚠️ **A value the heal cannot READ is refused, not treated as absent** — that distinction is what
+makes the never-lower rule hold, and getting it wrong defeated the rule in the version that first
+shipped it. Two shapes reach it:
+
+- **A dotted build number.** `CURRENT_PROJECT_VERSION = 1.2;` is legal — Apple compares
+  `CFBundleVersion` component-wise, so `1.2` > `1` — but it is not an integer to order against.
+  Skipping it read as "no existing value", which let the write lower `1.2` to `1`: the exact silent
+  rejection this heal exists to prevent, produced by the code preventing it. Normalise such a value
+  to a plain integer if you want `app.buildNumber` to manage it.
+- **A form the pattern cannot see.** Both the Groovy `versionCode 1` and the AGP-8
+  `versionCode = 1` are handled (the file's own separator is preserved, since these `build.gradle`
+  files already mix the two — `namespace = `, `compileSdk = `). A *third* form — a variable
+  reference, a syntax a later template introduces — is reported rather than silently unmanaged,
+  which is the failure mode that would quietly reintroduce #199.
+
+⚠️ **The two platforms' counters DRIFT APART**, because each store counts its own uploads:
+`games/iap-test` measured Android 11 against iOS 5 (2026-08-20). One `app.buildNumber` still serves
+both — the stores only require the number to RISE, so the lagging platform takes a one-time jump and
+both stay valid from then on. That is why the never-lower guard compares per platform rather than
+once, and why it reads the **highest** of a file's occurrences: a pbxproj carries the key per build
+configuration, and a Debug left at 1 must not authorise lowering a Release at 11.
+
+**Auto-increment is deliberately not offered.** A build number that changes itself makes builds
+non-reproducible and churns a committed file on every build (the write-behind-your-back hazard in
+CLAUDE.md). The owner bumps it, in the same change as the native edit it ships — a native change
+that is not bumped never reaches the device.
+
+The defaults (`"1.0"` / `1`) are exactly what `cap add` scaffolds, so adopting these fields rewrote
+nothing: running the heal across all 20 projects touched **one file**, `games/iap-test`'s pbxproj,
+raising the lagging iOS counter to its Android value.
 
 ## The shipped platform floors (`build.iosMinVersion` / `build.androidMinSdk`)
 
@@ -809,6 +1578,45 @@ Android sibling, with the same shape:
 `cap add` scaffolds `minSdkVersion = 24` and nothing else ever revisits it, so without the heal a
 newly-scaffolded project silently ships API 24 and the floor drifts per-project — the same drift
 `iosMinVersion` was introduced to close on iOS. Same test file adds parallel Android coverage.
+
+## Testing on hardware BELOW the shipping floor (Y6, iPhone 7)
+
+The two weakest devices this engine has real measurements from are **below the target floor on
+purpose** (`androidMinSdk: 31`, `iosMinVersion: '16.4'`), so a stock build refuses to install. They
+are still the most valuable hardware for a low-end campaign — they are the devices the shipping
+floors exist because of. **Lower the floor temporarily; never commit it.**
+
+### Android (Huawei Y6 2019 — API 28)
+
+`INSTALL_FAILED_OLDER_SDK` is the symptom. **Two files must move together** — a guard fails the
+build if a committed native floor disagrees with its config (that gate has gone red before):
+
+```bash
+# 1. the config
+node -e "const f=require('fs'),p='games/<id>/project.config.json',c=JSON.parse(f.readFileSync(p));\
+  c.build.androidMinSdk=28; f.writeFileSync(p,JSON.stringify(c,null,2)+'\n')"
+# 2. the native floor healNativeConfig syncs FROM it
+gsed -i 's/minSdkVersion = 31/minSdkVersion = 28/' games/<id>/android/variables.gradle
+
+# build + install as usual, then REVERT BOTH:
+git checkout -- games/<id>/project.config.json games/<id>/android/variables.gradle
+```
+
+⚠️ **Revert before committing anything.** Verified working 2026-08-12: `games/sling` installed and
+ran on the Y6 at API 28, and produced a probe-vs-identity A/B that nothing else could.
+⚠️ `npx cap sync android` also rewrites the **#206** escaping `@capacitor/haptics` gradle path on
+every run — revert that too (`git status` after every build).
+
+### iOS (iPhone 7 — iOS 15.x max)
+
+Same shape, different knob: the floor is `build.iosMinVersion` (`'16.4'`), synced into the Xcode
+project's `IPHONEOS_DEPLOYMENT_TARGET` by `healNativeConfig`. Lower both, build, **revert both**.
+⚠️ The iPhone 7 additionally cannot run WebDriverAgent, so its input is synthetic-only — see
+[trusted-device-input.md](./trusted-device-input.md). It is a MEASUREMENT device, not an
+interaction device.
+
+**Why this is written down**: both devices are permanently out of the shipping floor, so this is
+not a one-off — it is the standing procedure for every future campaign that wants the low end.
 
 ## iOS build notes
 

@@ -5,7 +5,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
-  parseAdbDevices, resolveAndroidSerial, adbArgs, describeAndroidDevice, isUsable,
+  parseAdbDevices, resolveAndroidSerial, resolveBuildAndroidSerial, adbArgs, describeAndroidDevice, isUsable,
   friendlyName, withFriendlyNames, _clearFriendlyNameCache, androidDevicesExec,
   type AndroidDevice,
 } from '../../plugins/backend/androidDevices';
@@ -30,19 +30,19 @@ describe('parseAdbDevices', () => {
       '* daemon not running; starting now at tcp:5037',
       '* daemon started successfully',
       'List of devices attached',
-      'RFCTB0EV83K   device',
+      'RFDEADBEEF1   device',
     ].join('\n');
-    expect(parseAdbDevices(out)).toEqual([{ serial: 'RFCTB0EV83K', state: 'device' }]);
+    expect(parseAdbDevices(out)).toEqual([{ serial: 'RFDEADBEEF1', state: 'device' }]);
   });
 
   it('keeps unauthorized and offline devices, with their raw state (no model on an unauthorized phone)', () => {
     const out = [
       'List of devices attached',
-      'RFCTA14CMRF        unauthorized usb:2-1.1',
+      'RFDEADBEEF2        unauthorized usb:2-1.1',
       'ABCDEF123          offline',
     ].join('\n');
     expect(parseAdbDevices(out)).toEqual([
-      { serial: 'RFCTA14CMRF', state: 'unauthorized' },
+      { serial: 'RFDEADBEEF2', state: 'unauthorized' },
       { serial: 'ABCDEF123', state: 'offline' },
     ]);
   });
@@ -58,8 +58,8 @@ describe('parseAdbDevices', () => {
   });
 
   it('skips blank and whitespace-only lines', () => {
-    const out = '\n   \nList of devices attached\n\nRFCTB0EV83K   device\n\n   \n';
-    expect(parseAdbDevices(out)).toEqual([{ serial: 'RFCTB0EV83K', state: 'device' }]);
+    const out = '\n   \nList of devices attached\n\nRFDEADBEEF1   device\n\n   \n';
+    expect(parseAdbDevices(out)).toEqual([{ serial: 'RFDEADBEEF1', state: 'device' }]);
   });
 
   it('skips garbage lines that carry no state token', () => {
@@ -80,23 +80,23 @@ describe('isUsable / describeAndroidDevice', () => {
   });
 
   it('describes a usable device by serial + model, with no state suffix', () => {
-    expect(describeAndroidDevice({ serial: 'RFCTB0EV83K', state: 'device', model: 'SC_56C' }))
-      .toBe('RFCTB0EV83K (SC_56C)');
+    expect(describeAndroidDevice({ serial: 'RFDEADBEEF1', state: 'device', model: 'SC_56C' }))
+      .toBe('RFDEADBEEF1 (SC_56C)');
   });
 
   it('describes an unusable device with its state, since that IS the fix', () => {
-    expect(describeAndroidDevice({ serial: 'RFCTA14CMRF', state: 'unauthorized' }))
-      .toBe('RFCTA14CMRF (unauthorized)');
+    expect(describeAndroidDevice({ serial: 'RFDEADBEEF2', state: 'unauthorized' }))
+      .toBe('RFDEADBEEF2 (unauthorized)');
   });
 
   it('describes a bare device with neither model nor a usability suffix as just the serial', () => {
-    expect(describeAndroidDevice({ serial: 'RFCTB0EV83K', state: 'device' })).toBe('RFCTB0EV83K');
+    expect(describeAndroidDevice({ serial: 'RFDEADBEEF1', state: 'device' })).toBe('RFDEADBEEF1');
   });
 });
 
 describe('adbArgs', () => {
   it('prefixes -s <serial> when a serial is known', () => {
-    expect(adbArgs('RFCTB0EV83K', ['shell', 'echo', 'hi'])).toEqual(['-s', 'RFCTB0EV83K', 'shell', 'echo', 'hi']);
+    expect(adbArgs('RFDEADBEEF1', ['shell', 'echo', 'hi'])).toEqual(['-s', 'RFDEADBEEF1', 'shell', 'echo', 'hi']);
   });
 
   it('is the identity when serial is undefined', () => {
@@ -298,5 +298,50 @@ describe('friendlyName / withFriendlyNames / describeAndroidDevice — #149 frie
       expect(describeAndroidDevice({ serial: 'S', state: 'unauthorized', model: 'SC_56C', name: 'Galaxy A23 5G' }))
         .toBe('S (Galaxy A23 5G, unauthorized)');
     });
+  });
+});
+
+describe('resolveBuildAndroidSerial — the BUILD path also honours the held lease (#235)', () => {
+  const A = { serial: 'AAA', state: 'device', model: 'SM_S901U1' };
+  const B = { serial: 'BBB', state: 'device', model: 'SC_56C' };
+
+  it('uses the lease serial when the project has no pin — the refusal names device_connect, so it must work', () => {
+    // The bug: with three phones attached the build refused and told the caller to run
+    // `device_connect {useAdb:true, serial}`. Doing exactly that produced the IDENTICAL
+    // refusal on the next build, because the build path passed only the project pin —
+    // costing a full build-and-refuse cycle to discover the advice was inert.
+    expect(resolveBuildAndroidSerial([A, B], { leaseSerial: 'BBB', env: {} })).toEqual({ serial: 'BBB' });
+  });
+
+  it('the project pin still wins over the lease — durable config beats session state', () => {
+    expect(resolveBuildAndroidSerial([A, B], { projectPin: 'AAA', leaseSerial: 'BBB', env: {} })).toEqual({ serial: 'AAA' });
+  });
+
+  it('the lease beats the environment pin', () => {
+    expect(resolveBuildAndroidSerial([A, B], { leaseSerial: 'BBB', env: { MODOKI_ANDROID_SERIAL: 'AAA' } }))
+      .toEqual({ serial: 'BBB' });
+  });
+
+  it('a lease whose phone was UNPLUGGED degrades to the ordinary rule — a preference, not a pin', () => {
+    // A lease outlives the cable. Treated as a pin, an unplugged leased handset would hard-fail
+    // the build naming a serial the human never typed; as a preference the one remaining phone
+    // just builds. Same rule deviceConnection.ts states for its remembered target.
+    expect(resolveBuildAndroidSerial([A], { leaseSerial: 'BBB', env: {} })).toEqual({ serial: 'AAA' });
+  });
+
+  it('an UNUSABLE leased device is ignored too, and the refusal names the real candidates', () => {
+    const unauthorized = { serial: 'BBB', state: 'unauthorized' };
+    const r = resolveBuildAndroidSerial([A, unauthorized], { leaseSerial: 'BBB', env: {} });
+    // A is the only usable one, so it wins rather than the build dying on an unauthorized phone.
+    expect(r).toEqual({ serial: 'AAA' });
+  });
+
+  it('no pin, no lease, several phones — still refuses with every candidate named', () => {
+    const r = resolveBuildAndroidSerial([A, B], { env: {} });
+    expect('error' in r).toBe(true);
+    if ('error' in r) {
+      expect(r.error).toContain('AAA');
+      expect(r.error).toContain('BBB');
+    }
   });
 });

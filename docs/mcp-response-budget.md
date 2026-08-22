@@ -100,10 +100,11 @@ A corollary, learned adversarially:
 
 ## The compaction choke point — `result.ts`
 
-The single highest-leverage mechanism is one function applied to all 75 tools' output, with no shape
-change. Result formatting lives in `engine/tools/modoki-mcp/src/result.ts` — a pure, importable
+The single highest-leverage mechanism is one function applied to every tool's output, with no shape
+change (tool catalog: [debug-tools-mcp.md](debug-tools-mcp.md)). Result formatting lives in
+`engine/tools/modoki-mcp/src/result.ts` — a pure, importable
 module with no MCP-SDK dependency, so it is unit-testable
-(`engine/tests/tools/mcpResult.test.ts`); `index.ts` keeps the 75 `server.tool(...)` registrations
+(`engine/tests/tools/mcpResult.test.ts`); `index.ts` keeps the `server.tool(...)` registrations
 and imports the formatter.
 
 ```ts
@@ -135,7 +136,7 @@ Load-bearing details:
 - **Compact JSON everywhere.** `ok()` no longer does `JSON.stringify(data, null, 2)`. The indent was
   pure overhead — MCP ships `content[].text` opaquely and the model reads compact JSON identically.
   Pretty-printing cost 48% of `layout-bounds`, 38% of `scene-state`, 25% of `scan-assets`, across
-  all 75 tools.
+  every tool.
 - **The identity `banner()` is prepended OUTSIDE the capped payload.** The "you are driving the
   sibling clone's editor" warning must never be the thing that gets truncated.
 - **`err()` bodies are capped too** — a backend 500 that echoes a scene or a stack was unbounded.
@@ -161,7 +162,7 @@ with a default `limit` and a `hint`:
 
 ```jsonc
 {
-  "scenePath": "…/tropical-island.json",
+  "scenePath": "…/tropical-island.scene.json",
   "entityCount": 135,
   "truncated": false,
   "entities": [
@@ -393,7 +394,7 @@ is a pure function of the GUID, so an entity's short form never changes.
 - **Collisions are a non-issue at 12 hex** (48 bits; birthday p ≈ 1.8e-7 at 100k ids; zero
   collisions measured across 100k derived + 100k random ids even at 8 hex).
 - **Never truncate below ~6 hex.** `deriveGuid`'s leading hex chars are the least-diffused part of a
-  weak hash — see the frozen-function comment in `runtime/loaders/assetRefRules.ts`.
+  weak hash — see the frozen-function comment in `runtime/core/assetRefRules.ts`.
 - **Safety property, free:** `isGuid` demands the full dashed form, so a short GUID persisted into a
   scene file is rejected loudly by `resolveRef` rather than dangling silently.
 - **The real cost:** `sceneMutate` and every editor op taking `{guid}` must accept prefixes, and an

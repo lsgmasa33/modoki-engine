@@ -26,16 +26,22 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createToolContext } from './context.js';
 import { registerAllTools } from './registerAll.js';
+import { createGameToolSync } from './gameTools.js';
 
 const BACKEND = (process.env.MODOKI_BACKEND || 'http://localhost:5173').replace(/\/$/, '');
 
 const server = new McpServer({ name: 'modoki', version: '1.0.0' });
-registerAllTools(server, createToolContext({ backend: BACKEND, token: process.env.MODOKI_TOKEN }));
+const ctx = createToolContext({ backend: BACKEND, token: process.env.MODOKI_TOKEN });
+registerAllTools(server, ctx);
+// The DYNAMIC tail: tools the OPEN PROJECT's game registers (#270). Started after connect, so
+// the first `tools/list_changed` cannot race the transport handshake.
+const gameTools = createGameToolSync(server, ctx);
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write(`[modoki-mcp] started — backend ${BACKEND}\n`);
+  gameTools.start();
 }
 
 main().catch((e) => {

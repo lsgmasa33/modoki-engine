@@ -15,6 +15,7 @@ import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
 import { serializePrefab, setPrefabCache } from './prefab';
 import { writeAssetFile, deleteAssetFile } from '../panels/assetOps';
 import { pushAction, type UndoAction } from '../undo/undoManager';
+import { reportUndoFailure } from '../undo/undoFailure';
 
 /** Build the SkinnedSprite2D + Bone2D subtree spec for a rig. The root sits at its
  *  local origin — a prefab is placed relative to its instantiation parent. */
@@ -84,13 +85,35 @@ export async function makeRigPrefabAsset(
   setPrefabCache(cacheKey, prefab);
 
   const updated = prevContent != null;
+  const label = `${updated ? 'Update' : 'Make'} prefab "${rootName}"`;
   const action: UndoAction = {
-    label: `${updated ? 'Update' : 'Make'} prefab "${rootName}"`,
+    label,
     undo: async () => {
-      if (prevContent != null) { await writeAssetFile(savePath, prevContent); try { setPrefabCache(cacheKey, JSON.parse(prevContent)); } catch { setPrefabCache(cacheKey, null); } }
-      else { await deleteAssetFile(savePath); setPrefabCache(cacheKey, null); }
+      if (prevContent != null) {
+        // Restore the prior prefab content. Only update the cache if the write
+        // actually landed — a failed write must not leave the in-memory cache
+        // reverted while the file on disk still holds the newer version (#308).
+        if (!(await writeAssetFile(savePath, prevContent))) {
+          reportUndoFailure({ direction: 'Undo', label, detail: `"${savePath}" was not restored` });
+          return;
+        }
+        try { setPrefabCache(cacheKey, JSON.parse(prevContent)); } catch { setPrefabCache(cacheKey, null); }
+      } else {
+        if (!(await deleteAssetFile(savePath))) {
+          reportUndoFailure({ direction: 'Undo', label, detail: `"${savePath}" was not deleted` });
+          return;
+        }
+        setPrefabCache(cacheKey, null);
+      }
     },
-    redo: async () => { await writeAssetFile(savePath, content); if (prefab.id) registerAsset(prefab.id, savePath, 'prefab'); setPrefabCache(cacheKey, prefab); },
+    redo: async () => {
+      if (!(await writeAssetFile(savePath, content))) {
+        reportUndoFailure({ direction: 'Redo', label, detail: `"${savePath}" was not written` });
+        return;
+      }
+      if (prefab.id) registerAsset(prefab.id, savePath, 'prefab');
+      setPrefabCache(cacheKey, prefab);
+    },
   };
   pushAction(action);
   return { path: savePath, updated };

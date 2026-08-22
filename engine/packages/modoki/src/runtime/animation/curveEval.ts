@@ -215,6 +215,31 @@ export function applyTangentMode(keys: Keyframe[], i: number, mode: TangentMode)
       k.broken = false;
       break;
     }
+    case 'freeSmooth': {
+      // Hand-authored AND unified: keep the shape, and MIRROR the two handles onto one
+      // slope. `free` preserves the numbers too, but by breaking the handles apart, which
+      // is not what a unified drag asked for — that difference is the mode's whole point.
+      //
+      // Mirroring has to actually happen here, not just `broken = false`. Coming from a
+      // BROKEN key the two sides differ, and clearing the flag alone would leave
+      // `{broken:false, in !== out}` — a key that claims to be unified and does not look
+      // it, the same contradictory state the break/unify round-trip (A3) was already fixed
+      // once for. The average is the symmetric choice: neither side wins arbitrarily, and
+      // both handles move toward each other rather than one snapping to the other. A key
+      // that arrived here from a unified DRAG already has in === out, so this is a no-op
+      // for it — including on every later `reapplyTangent`.
+      //
+      // Non-finite guard: a `constant` key carries outTangent = STEPPED (+Infinity), and
+      // averaging that would poison BOTH handles with Infinity. Mirror onto the finite
+      // side instead (0 if neither is finite) — switching a stepped key to Free Smooth
+      // means "stop holding", so the hold must not survive on the incoming handle.
+      const finite = [k.inTangent, k.outTangent].filter((t) => Number.isFinite(t));
+      const slope = finite.length ? finite.reduce((a, b) => a + b, 0) / finite.length : 0;
+      k.inTangent = slope;
+      k.outTangent = slope;
+      k.broken = false;
+      break;
+    }
     case 'free':
     default:
       // Leave tangents as-is; just mark broken so in/out move independently.

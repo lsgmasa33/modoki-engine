@@ -4,6 +4,7 @@ import {
   variantExtension, variantSuffix, selectVariant,
   deriveSettingsForType, resolveTextureType,
   DEFAULT_WEBP_QUALITY, resolveWebpQuality,
+  sizesToEmit,
 } from '../../src/runtime/loaders/textureSettings';
 
 describe('deriveSettingsForType', () => {
@@ -97,6 +98,60 @@ describe('variantExtension / variantSuffix', () => {
     expect(variantExtension('webp')).toBe('webp');
     expect(variantSuffix('uastc')).toBe('~uastc.ktx2');
     expect(variantSuffix('webp')).toBe('~webp.webp');
+  });
+
+  // #212 texture LOD by quality tier.
+  it('an ABSENT size cap reproduces exactly today\'s suffix — every asset shipped before this ' +
+    'feature exists keeps its URL byte-for-byte', () => {
+    expect(variantSuffix('uastc')).toBe('~uastc.ktx2');
+    expect(variantSuffix('uastc', undefined)).toBe('~uastc.ktx2');
+  });
+
+  it('`0` is the same "no cap" sentinel used everywhere else in this pipeline', () => {
+    expect(variantSuffix('uastc', 0)).toBe('~uastc.ktx2');
+  });
+
+  it('a positive size cap appends `@<size>` before the extension', () => {
+    expect(variantSuffix('uastc', 512)).toBe('~uastc@512.ktx2');
+    expect(variantSuffix('webp', 1024)).toBe('~webp@1024.webp');
+  });
+});
+
+describe('sizesToEmit (#212 — the build-side emit decision, pure)', () => {
+  it('emits nothing when the project authors no tier caps', () => {
+    expect(sizesToEmit([], 2048, 2048, 2048)).toEqual([]);
+  });
+
+  it('emits a cap strictly below both the authored maxSize and the source dimensions', () => {
+    expect(sizesToEmit([512, 1024], 2048, 2048, 2048)).toEqual([512, 1024]);
+  });
+
+  it('a texture ALREADY at or below every cap emits no extra file at all', () => {
+    // Source is only 400x400: neither 512 nor 1024 could shrink it further than it already is.
+    expect(sizesToEmit([512, 1024], 2048, 400, 400)).toEqual([]);
+  });
+
+  it('a texture at or below ONE cap but not the other emits only the cap that actually shrinks it', () => {
+    // 800x800 source: a 512 cap still shrinks it; a 1024 cap could not (already smaller).
+    expect(sizesToEmit([512, 1024], 2048, 800, 800)).toEqual([512]);
+  });
+
+  it('a cap at or above the texture\'s own authored maxSize emits nothing for that cap', () => {
+    // The texture already authors maxSize:512, so a 512 tier cap would duplicate the primary file.
+    expect(sizesToEmit([512, 1024], 512, 2048, 2048)).toEqual([]);
+  });
+
+  it('checks width and height independently — the LONGEST source edge decides', () => {
+    // 2000x300 source: longest edge 2000, so a 1024 cap still shrinks it; 512 too.
+    expect(sizesToEmit([512, 1024], 2048, 2000, 300)).toEqual([512, 1024]);
+  });
+
+  it('de-duplicates and sorts ascending regardless of input order/repeats', () => {
+    expect(sizesToEmit([1024, 512, 1024, 512], 2048, 2048, 2048)).toEqual([512, 1024]);
+  });
+
+  it('ignores non-positive caps (the shared "0 = no cap" sentinel)', () => {
+    expect(sizesToEmit([0, 512], 2048, 2048, 2048)).toEqual([512]);
   });
 });
 

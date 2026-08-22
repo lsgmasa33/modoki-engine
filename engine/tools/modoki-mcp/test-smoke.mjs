@@ -102,6 +102,23 @@ if (!cj.ok || cj.ran !== 3) throw new Error(`batch chain did not run 3 steps: ${
 if (cj.steps.map((s) => s.i).join() !== '0,1,2') throw new Error('batch steps came back out of order');
 console.log('batch runs an ordered chain (incl. wait) →', cj.ran, 'steps ✓');
 
+// 2b. The `modoki_` prefix is OPTIONAL on a step's tool name (#295). Read-only, and asserted
+//     LIVE because the resolution happens server-side against the REAL registry — a fake one
+//     proves only that the helper agrees with itself. The distinguishing part is that the
+//     reported names come back RESOLVED: a batch that merely refused more politely would not
+//     produce them.
+const bare = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+  { tool: 'get_editor_state', args: {} },
+  { tool: 'modoki_wait', args: { ms: 1 } },
+  { tool: 'list_scenes', args: {} },
+] } })));
+if (!bare.ok || bare.ran !== 3) throw new Error(`bare-named batch did not run: ${JSON.stringify(bare)}`);
+const bareNames = (bare.steps ?? []).concat(bare.quiet ?? []).sort((a, b) => a.i - b.i).map((s) => s.tool).join();
+if (bareNames !== 'modoki_get_editor_state,wait,modoki_list_scenes') {
+  throw new Error(`bare names did not resolve to full ones: ${bareNames}`);
+}
+console.log('batch accepts a bare tool name and reports it resolved →', bareNames, '✓');
+
 // 3. `resultDefault:'none'` suppresses clean steps into `quiet` — the token saving.
 const quiet = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: {
   steps: [{ tool: 'modoki_get_editor_state', args: {} }, { tool: 'modoki_list_scenes', args: {} }, { tool: 'modoki_list_traits', args: {} }],
@@ -337,6 +354,14 @@ const uc3 = JSON.parse(text(await client.callTool({ name: 'modoki_batch', argume
   // legitimately returns "Boat Hull" for every one of the 25 sampled points, and #15's
   // occlusion check correctly REFUSES. That is the tool being right and the fixture being
   // unreproducible. focus_entity makes the precondition something this suite controls.
+  //
+  // ⚠️ The SCENE is not controlled the same way, and a failed run poisons the next one. UC8 swaps
+  // scenes and restores at the end — so a run that DIES before that restore (UC3 itself throwing,
+  // say) leaves the editor remembering the swapped scene, and the next `launch-editor.sh` reopens
+  // it. UC3 then SKIPS ("no entity named 'cube' in the OPEN scene") and later cases fail on a
+  // fixture nobody chose. Measured 2026-08-19, three runs to work out. Launch the gate with the
+  // scene PINNED — `launch-editor.sh games/3d-test --scene tropical-island` — and it is
+  // reproducible.
   { tool: 'modoki_focus_entity', args: { guid: CUBE_GUID }, result: 'none' },
   { tool: 'wait', args: { ms: 200 }, result: 'none' },
   { tool: 'modoki_tap', args: { entity: { name: 'cube', surface: 'scene-view' } } },
@@ -507,6 +532,262 @@ await withCleanup(async () => {
   console.log('UC6 restores the def and discards the parked write — no asset left dirty ✓');
 });
 }
+
+// UC10 — the ASSET LIFECYCLE: scaffold a probe asset, prove it is REACHABLE, trash it, prove it is
+// GONE. This closes the gap that made #288 gap 3 a QA finding: an agent could create an asset and
+// had nothing to remove it with, so the flagship animation case cleaned up with `rm` — a shell-out
+// that neither the tool surface nor this suite can see.
+//
+// It is written as one modoki_batch on purpose. The delete route used to reply `ok` BEFORE the
+// file watcher's 150ms debounce rebuilt the asset manifest, so the most natural verification there
+// is — delete, then list — could still see the asset, and read as "the delete silently failed".
+// Inside a batch there is no wall-clock gap at all, which is the tightest possible version of that
+// race and the reason the route now rebuilds the manifest inline. A `sleep` before the read would
+// hide exactly the bug this case exists to catch.
+//
+// The probe lives under the OPEN project's own asset root and is trashed (recoverable) rather than
+// unlinked, so a mid-run failure leaves one file in the OS trash, not a stray committed into
+// games/** (CLAUDE.md #18).
+const PROBE = '/assets/particles/mcp-smoke-probe.particle.json';
+const PROBE_NAME = 'mcp-smoke-probe';
+/** The manifest rows matching the probe, from one modoki_list_assets result.
+ *  Throws rather than answering `[]` when the step was SUMMARIZED: a batch reports
+ *  any non-terminal step over 1500 chars as a shape summary with no `assets` key,
+ *  and reading that absence as "the asset is gone" would make this case pass
+ *  whether or not the delete worked. Measured — an unfiltered particle list is
+ *  ~2.5KB and was summarized exactly this way on the first live run. */
+const probeRows = (step, label) => {
+  if (!Array.isArray(step?.assets)) {
+    throw new Error(`UC10 ${label}: list_assets returned no \`assets\` array (summarized? ${JSON.stringify(step).slice(0, 200)}) — cannot tell present from absent`);
+  }
+  return step.assets.filter((a) => a.path === PROBE);
+};
+if (probeRows(JSON.parse(text(await client.callTool({ name: 'modoki_list_assets', arguments: { type: 'particle', name: PROBE_NAME } }))), 'precheck').length) {
+  throw new Error(`UC10 cannot run: ${PROBE} already exists — a previous run left it behind. Trash it and re-run.`);
+}
+await withCleanup(async () => {
+  // The reads are NAME-FILTERED, which is both the ergonomic form and what keeps
+  // each step small enough to come back in full (see probeRows).
+  const uc9 = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+    { tool: 'modoki_create_asset', args: { type: 'particle', path: PROBE } },
+    { tool: 'modoki_list_assets', args: { type: 'particle', name: PROBE_NAME }, result: 'full' },
+    { tool: 'modoki_delete_asset', args: { paths: [PROBE] }, result: 'full' },
+    { tool: 'modoki_list_assets', args: { type: 'particle', name: PROBE_NAME } },
+  ] } })));
+  if (!uc9.ok) throw new Error(`UC10 asset lifecycle batch failed: ${JSON.stringify(uc9).slice(0, 400)}`);
+  const [created, after1, deleted, after2] = uc9.steps.map((s2) => s2.result);
+  if (!created?.ok || !created?.id) throw new Error(`UC10 create_asset returned no fresh GUID: ${JSON.stringify(created)}`);
+  // The create half: a scaffolded asset the manifest cannot see is not usable by anything.
+  if (probeRows(after1, 'after create').length !== 1) {
+    throw new Error(`UC10 the created probe is NOT in the asset manifest — create-asset did not register its GUID: ${JSON.stringify(after1).slice(0, 300)}`);
+  }
+  // The delete half. `trashed:1` counts files that really existed, so it distinguishes
+  // "trashed it" from "there was nothing there" — which `ok:true` alone cannot.
+  if (deleted?.trashed !== 1) throw new Error(`UC10 delete_asset reported trashed=${deleted?.trashed}, expected 1: ${JSON.stringify(deleted)}`);
+  if ((deleted?.missing ?? []).length !== 0) throw new Error(`UC10 delete_asset reported the probe missing: ${JSON.stringify(deleted?.missing)}`);
+  // The race. `manifestRebuilt` is the tool's own claim that the read below is answerable NOW.
+  if (deleted?.manifestRebuilt !== true) {
+    throw new Error(`UC10 delete_asset did not rebuild the manifest inline (manifestRebuilt=${deleted?.manifestRebuilt}) — a verification issued straight after can still see the asset`);
+  }
+  if (probeRows(after2, 'after delete').length !== 0) {
+    throw new Error('UC10 the probe is STILL in the manifest immediately after the delete — the 150ms debounce race is back');
+  }
+  console.log('UC10 create → listed → delete → gone, in ONE batch (no debounce gap) ✓');
+}, async () => {
+  // Belt-and-braces: if the batch failed anywhere after the create, the probe is still
+  // on disk. A delete of an already-gone path is `trashed:0, missing:[…]`, not an error,
+  // so this is safe to run unconditionally — which is the point of the route's
+  // skip-missing behaviour.
+  const swept = JSON.parse(text(await client.callTool({ name: 'modoki_delete_asset', arguments: { paths: [PROBE] } })));
+  if (swept.trashed > 0) console.log('UC10 cleanup trashed a leftover probe (the case failed after creating it)');
+});
+
+// UC11 — PlayerPrefs round-trip: read the index, set a probe key, read the VALUE back, delete it,
+// confirm it is gone. #288 gap 4 — until now the only way to reach the store was modoki_eval + a
+// dynamic import, which is not a tool and cannot be swept.
+//
+// ⚠️ It never calls action:'clear'. That wipes the whole namespace, and the namespace here is the
+// HUMAN's editor playtest saves (`<gameId>@editor`) — for a smoke suite pointed at a live editor
+// that is not a risk worth any coverage. `clear`'s refusal path is unit-tested instead, where the
+// store is a fixture; its success path is deliberately un-swept.
+const PREF_KEY = '__mcp_smoke_probe';
+const prefs0 = JSON.parse(text(await client.callTool({ name: 'modoki_player_prefs', arguments: {} })));
+if (!prefs0.ok || !Array.isArray(prefs0.keys)) {
+  throw new Error(`UC11 could not read the prefs index: ${JSON.stringify(prefs0).slice(0, 300)}`);
+}
+// The namespace is on every reply for a reason — an editor reads `<gameId>@editor`, not the store
+// a shipped build sees. Assert it is THERE, so a reply that silently dropped it is a failure
+// rather than something a later reader has to notice.
+if (typeof prefs0.namespace !== 'string' || !prefs0.namespace) {
+  throw new Error(`UC11 the prefs read did not name its namespace: ${JSON.stringify(prefs0).slice(0, 300)}`);
+}
+if (prefs0.keys.includes(PREF_KEY)) {
+  throw new Error(`UC11 cannot run: ${PREF_KEY} already exists in ${prefs0.namespace} — a previous run left it behind`);
+}
+await withCleanup(async () => {
+  const wrote = JSON.parse(text(await client.callTool({
+    name: 'modoki_write_player_prefs', arguments: { action: 'set', key: PREF_KEY, value: { n: 7, tag: 'smoke' } },
+  })));
+  // saved:true is the claim that the BACKEND accepted the durable write, not merely that the
+  // in-memory cache changed — the distinction a read-back structurally cannot make.
+  if (!wrote.ok || wrote.saved !== true) throw new Error(`UC11 set did not report a durable write: ${JSON.stringify(wrote)}`);
+  const readBack = JSON.parse(text(await client.callTool({ name: 'modoki_player_prefs', arguments: { key: PREF_KEY } })));
+  if (readBack.present !== true || readBack.value?.n !== 7) {
+    throw new Error(`UC11 read-back did not return the written value: ${JSON.stringify(readBack).slice(0, 300)}`);
+  }
+  if (readBack.namespace !== prefs0.namespace) {
+    throw new Error(`UC11 the write landed in a DIFFERENT namespace than the index read (${readBack.namespace} vs ${prefs0.namespace})`);
+  }
+  // A delete that hits nothing is a refusal listing the real keys, not a silent no-op — the
+  // difference between "removed it" and "there was nothing to remove".
+  const typo = JSON.parse(text(await client.callTool({
+    name: 'modoki_write_player_prefs', arguments: { action: 'delete', key: `${PREF_KEY}_nope` },
+  })));
+  if (!/NOT_FOUND/.test(JSON.stringify(typo))) throw new Error(`UC11 a delete of an absent key must be refused, got: ${JSON.stringify(typo).slice(0, 300)}`);
+  console.log(`UC11 prefs set → read back → typo'd delete refused, in namespace ${prefs0.namespace} ✓`);
+}, async () => {
+  const gone = JSON.parse(text(await client.callTool({
+    name: 'modoki_write_player_prefs', arguments: { action: 'delete', key: PREF_KEY },
+  })));
+  // The probe may never have been written (the case can fail before the set), and a delete of an
+  // absent key is CORRECTLY a refusal — so only a delete that reports something else is a problem.
+  if (!gone.ok && !/NOT_FOUND/.test(JSON.stringify(gone))) {
+    throw new Error(`UC11 failed to remove the probe key: ${JSON.stringify(gone).slice(0, 300)}`);
+  }
+  const after = JSON.parse(text(await client.callTool({ name: 'modoki_player_prefs', arguments: { key: PREF_KEY } })));
+  if (after.present !== false) throw new Error(`UC11 left ${PREF_KEY} behind in the human's editor prefs`);
+  console.log('UC11 removes its probe key — the human\'s prefs end as they started ✓');
+});
+
+// UC12 — a real scene query against a real Rapier world (#288 gap 1).
+//
+// ⚠️ THE SWEEP CANNOT COVER THIS, and the reason is worth stating rather than discovering. A
+// Rapier world is built by the physics system on its first tick, so a scene with NO physics
+// colliders never has one — and `tropical-island`, the scene this whole gate pins itself to, has
+// exactly zero (measured: `scene-state?trait=Collider3D` returns 0 entities, playing or stopped).
+// So `modoki_scene_query`'s ergonomic form correctly refuses NOT_AVAILABLE_HERE there, forever,
+// and an EXPECTED_REFUSALS entry covers it. That entry proves the ROUTE is alive; it proves
+// nothing whatsoever about the casting path. This case builds a world so something does.
+//
+// It spawns its own floor rather than looking for one, plays, casts, stops, and removes it.
+const UC12_FLOOR = 'UC12_floor';
+const UC12_PHYS = 'UC12_physics';
+await withCleanup(async () => {
+  const built = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: {
+    resultDefault: 'none',
+    steps: [
+      // A Physics3D config entity is what makes the system build a world at all.
+      { tool: 'modoki_mutate_scene', args: { ops: [{ op: 'addEntity', name: UC12_PHYS, parentId: 0,
+        traits: { Transform: { x: 0, y: 0, z: 0 }, Physics3D: { gravityX: 0, gravityY: -9.81, gravityZ: 0 } } }] } },
+      // A static box centred at y=-500, far below anything the scene already has, so the cast
+      // below cannot accidentally hit island geometry and pass for the wrong reason.
+      { tool: 'modoki_mutate_scene', args: { ops: [{ op: 'addEntity', name: UC12_FLOOR, parentId: 0,
+        traits: {
+          Transform: { x: 0, y: -500, z: 0 },
+          EntityAttributes: { layer: '3d' },
+          RigidBody3D: { bodyType: 'static' },
+          Collider3D: { shape: 'box', halfW: 50, halfH: 1, halfD: 50 },
+        } }] } },
+      { tool: 'modoki_play_control', args: { action: 'play' } },
+      { tool: 'wait', args: { ms: 400 } },
+      // Straight down from just above the floor's top surface (y = -499).
+      { tool: 'modoki_scene_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, -1, 0], maxDistance: 200 }, result: 'full' },
+      { tool: 'modoki_scene_query', args: { kind: 'point', dim: '3d', point: [0, -500, 0] }, result: 'full' },
+      // A cast the same length in the OPPOSITE direction — the distinguishing observation. Without
+      // it, a tool that reported a hit unconditionally would pass every assertion above.
+      { tool: 'modoki_scene_query', args: { kind: 'raycast', dim: '3d', origin: [0, -400, 0], direction: [0, 1, 0], maxDistance: 200 }, result: 'full' },
+    ],
+  } })));
+  if (!built.ok) throw new Error(`UC12 setup/query batch failed: ${JSON.stringify(built).slice(0, 500)}`);
+  const [down, pick, up] = built.steps.slice(-3).map((s2) => s2.result);
+  if (!down?.ok) throw new Error(`UC12 the raycast did not run: ${JSON.stringify(down).slice(0, 400)}`);
+  if (!down.hit) throw new Error(`UC12 the downward ray MISSED a floor directly beneath it — the physics world was not built, or the cast is broken: ${JSON.stringify(down)}`);
+  if (down.hit.name !== UC12_FLOOR) throw new Error(`UC12 hit '${down.hit.name}', expected ${UC12_FLOOR}`);
+  // §3 — the guid is the address, and a hit that only carries a runtime id is a hit an agent
+  // cannot safely act on.
+  if (!down.hit.guid) throw new Error(`UC12 the hit carries no guid: ${JSON.stringify(down.hit)}`);
+  // ~99 units from y=-400 to the floor's top at y=-499. A tolerance, never ===.
+  if (Math.abs(down.hit.distance - 99) > 1) throw new Error(`UC12 distance ${down.hit.distance}, expected ~99`);
+  if (pick?.hit?.name !== UC12_FLOOR) throw new Error(`UC12 the point pick did not find the floor: ${JSON.stringify(pick).slice(0, 300)}`);
+  // A point result must NOT carry a zeroed distance/normal — same field name, same meaning, or absent.
+  if ('distance' in (pick.hit ?? {})) throw new Error(`UC12 the point result padded a distance field: ${JSON.stringify(pick.hit)}`);
+  if (!up?.ok) throw new Error(`UC12 the upward cast did not run: ${JSON.stringify(up).slice(0, 300)}`);
+  if (up.hit !== null) throw new Error(`UC12 the upward ray HIT something (${up.hit?.name}) — the two casts differ only in sign, so a hit here means the result does not depend on the query`);
+  console.log(`UC12 raycast + point pick against a real Rapier world → ${down.hit.name} at ${down.hit.distance} ✓`);
+}, async () => {
+  await client.callTool({ name: 'modoki_play_control', arguments: { action: 'stop' } });
+  const cleaned = JSON.parse(text(await client.callTool({ name: 'modoki_batch', arguments: { steps: [
+    { tool: 'modoki_mutate_scene', args: { ops: [
+      { op: 'removeEntity', entity: { name: UC12_FLOOR } },
+      { op: 'removeEntity', entity: { name: UC12_PHYS } },
+    ] }, result: 'none' },
+    { tool: 'modoki_get_scene_state', args: { name: 'UC12_' }, result: 'full' },
+  ] } })));
+  const left = cleaned.steps?.at(-1)?.result?.entities?.length;
+  if (left !== 0) throw new Error(`UC12 left ${left} entities behind`);
+  console.log('UC12 stops the sim and removes its physics fixture ✓');
+});
+
+// UC13 — the "New X" registry (#288 gap 5): discover the kinds, create one at an explicit path,
+// verify it registered, and trash it. Phase 1's modoki_delete_asset is the cleanup — which is why
+// that phase came first.
+//
+// The path an agent would take is exactly this one, and it exists because the panel's own flow
+// opens a BLOCKING osascript save panel on macOS before writing anything.
+const REG_PROBE = '/assets/materials/mcp-smoke-registered';   // extension deliberately OMITTED
+const REG_PROBE_FULL = `${REG_PROBE}.mat.json`;
+const kinds = JSON.parse(text(await client.callTool({ name: 'modoki_list_creatable_assets', arguments: {} })));
+if (!kinds.ok || !Array.isArray(kinds.kinds)) throw new Error(`UC13 could not list creatable kinds: ${JSON.stringify(kinds).slice(0, 300)}`);
+const sceneKind = kinds.kinds.find((k) => k.kind === 'scene');
+// The single most important property of this surface, asserted BEFORE anything is created: the
+// kind that would discard the human's live world advertises itself as not agent-creatable.
+if (!sceneKind || sceneKind.agentCreatable !== false) {
+  throw new Error(`UC13 the 'scene' kind must be flagged agentCreatable:false — it DISCARDS the live world: ${JSON.stringify(sceneKind)}`);
+}
+if (!kinds.kinds.some((k) => k.kind === 'material' && k.agentCreatable === true)) {
+  throw new Error(`UC13 the 'material' kind should be agent-creatable: ${JSON.stringify(kinds.kinds).slice(0, 300)}`);
+}
+// …and the refusal really refuses, against the LIVE editor rather than a fixture. A `scene` create
+// here would throw away whatever the human has open, so this asserts the guard exists rather than
+// exercising what it prevents.
+const refused = text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { kind: 'scene', path: '/assets/scenes/mcp-smoke-NEVER.json' } }));
+if (!/REFUSED_BY_OP/.test(refused) || !/modoki_new_scene/.test(refused)) {
+  throw new Error(`UC13 a scene create must be refused and point at modoki_new_scene, got: ${refused.slice(0, 400)}`);
+}
+const stillThere = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+if (stillThere.scenePath !== pre.scenePath) {
+  throw new Error(`UC13 the refused scene create CHANGED the open scene (${pre.scenePath} -> ${stillThere.scenePath}) — the refusal did not happen before the override ran`);
+}
+await withCleanup(async () => {
+  const made = JSON.parse(text(await client.callTool({
+    name: 'modoki_create_registered_asset', arguments: { kind: 'material', path: REG_PROBE },
+  })));
+  if (!made.ok || !made.guid) throw new Error(`UC13 create failed: ${JSON.stringify(made).slice(0, 300)}`);
+  // The extension is appended server-side. Without it the file would be written as a plain .json
+  // and registered as a material — an asset whose type the manifest disagrees with.
+  if (made.path !== REG_PROBE_FULL) throw new Error(`UC13 expected the .mat.json extension to be appended, got ${made.path}`);
+  // The claim the read below rests on. Registering the guid happens in the RENDERER; list_assets
+  // reads the BACKEND's scanned map, and /api/write-file suppresses the watcher for the editor's
+  // own saves — so without an explicit rescan the reply is ahead of every verification there is.
+  if (made.manifestRebuilt !== true) throw new Error(`UC13 the create did not rebuild the backend manifest (manifestRebuilt=${made.manifestRebuilt}) — a list_assets issued now can still miss it`);
+  // Registered, not merely WRITTEN — that distinction is the whole point of going through the
+  // registry rather than write-file, and only the manifest can answer it.
+  //
+  // ⚠️ `modoki_resolve_refs` looks like the read for this and is NOT: it resolves ENTITY refs from
+  // journal payloads, so an asset guid comes back `unresolved` — including the guid of a material
+  // that has been in the project for months (measured, which is what ruled out "the new one just
+  // has not registered yet"). Three descriptions named it as an asset verification; all three were
+  // corrected in the same commit.
+  const listed = JSON.parse(text(await client.callTool({ name: 'modoki_list_assets', arguments: { type: 'material', name: 'mcp-smoke-registered' } })));
+  if (!Array.isArray(listed.assets)) throw new Error(`UC13 list_assets returned no assets array (summarized?): ${JSON.stringify(listed).slice(0, 200)}`);
+  const row = listed.assets.find((a) => a.path === REG_PROBE_FULL);
+  if (!row) throw new Error(`UC13 the new asset is not in the manifest: ${JSON.stringify(listed).slice(0, 300)}`);
+  if (row.guid !== made.guid) throw new Error(`UC13 the manifest guid ${row.guid} differs from the one reported (${made.guid}) — the reply names an identity the project does not have`);
+  console.log(`UC13 list kinds → scene refused → create material at an explicit path → in the manifest ✓`);
+}, async () => {
+  const swept = JSON.parse(text(await client.callTool({ name: 'modoki_delete_asset', arguments: { paths: [REG_PROBE_FULL] } })));
+  if (swept.trashed > 0) console.log('UC13 trashed its probe material ✓');
+});
 
 // UC7 — a batch that fails MID-WAY, on real tools, after a MUTATING step already applied. The
 // harness's earlier failure check uses read tools against a fixture-ish path; this one proves the
@@ -700,6 +981,24 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     const stray = await client.callTool({ name: 'modoki_profiler', arguments: { action: 'reset', markers: 5 } });
     if (!/UNKNOWN_PARAM/.test(text(stray))) throw new Error('profiler must refuse a read-side filter on action:reset');
     console.log(`profiler capture round-trip ✓ (frames captured: ${frames.frameCount})`);
+
+    // action:boot (#238) — the boot-phase read. Only a LIVE call can prove it: the timeline is
+    // written during the real boot path, so a unit test would be asserting against spans it
+    // opened itself. The editor has by definition already loaded a scene, so a zero-span answer
+    // here means the instrumentation never ran.
+    const boot = JSON.parse(text(await client.callTool({ name: 'modoki_profiler', arguments: { action: 'boot', limit: 4 } })));
+    if (typeof boot.spanCount !== 'number') throw new Error(`profiler boot returned no spanCount: ${JSON.stringify(boot)}`);
+    if (boot.spanCount === 0) throw new Error('profiler boot recorded ZERO spans — the boot path is not instrumented on this build');
+    if (!Array.isArray(boot.top)) throw new Error('profiler boot returned no `top` array');
+    if (boot.top.length > 4) throw new Error(`profiler boot ignored limit:4 — got ${boot.top.length} rows, so the query param never reached the op`);
+    // Longest first: the ranking is the point, exactly as with capture-read.
+    for (let i = 1; i < boot.top.length; i++) {
+      if (boot.top[i].durMs > boot.top[i - 1].durMs) throw new Error('profiler boot `top` is not sorted longest-first');
+    }
+    // `all` is a boot-only filter and must be refused elsewhere by name, not dropped.
+    const strayAll = await client.callTool({ name: 'modoki_profiler', arguments: { action: 'read', all: true } });
+    if (!/UNKNOWN_PARAM/.test(text(strayAll))) throw new Error('profiler must refuse `all` on action:read');
+    console.log(`profiler boot read ✓ (${boot.spanCount} spans, longest ${boot.top[0]?.name} ${boot.top[0]?.durMs}ms)`);
   }, async () => {
     await client.callTool({ name: 'modoki_profiler', arguments: { action: 'capture-clear' } });
   });

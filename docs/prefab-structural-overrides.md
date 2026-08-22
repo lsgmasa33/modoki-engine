@@ -210,7 +210,9 @@ about to be deleted — if it does, that's a malformed scene; log and skip).
 
 ### Dialog (`ApplyPrefabDialog.tsx`) — recursive
 
-`buildTree` gains two node kinds beside the existing field-diff nodes:
+The field-diff walk (`collectInstanceOverrideFields`, `editor/scene/prefabOverrideKeys.ts` — moved
+out of the dialog file so the `modoki_prefab {prefabAction:'overrides'}` agent op can build the
+same key set without a dialog to render into) gains two node kinds beside the field-diff nodes:
 
 - **Added** — one node per `AddedEntity`, rendered **recursively** (subtree with
   its `children`), each row labeled *added*. One checkbox per added subtree root
@@ -349,4 +351,7 @@ capture format.
   apply removals.
 - `packages/modoki/src/editor/panels/ApplyPrefabDialog.tsx` — recursive
   added/removed nodes + selection keys.
+- `packages/modoki/src/editor/scene/prefabOverrideKeys.ts` — the shared key-format
+  helpers + override-key walk, consumed by both the dialog and the
+  `modoki_prefab {prefabAction:'overrides'|'apply'|'revert'}` agent op.
 - `packages/modoki/tests/editor/` — new structural-override tests.

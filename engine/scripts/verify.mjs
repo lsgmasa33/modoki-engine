@@ -1,12 +1,48 @@
 #!/usr/bin/env node
-// `npm run verify` runs its legs SEQUENTIALLY: typecheck (25s) + lint (2s) +
-// root `npm test` (198s) + `npm --prefix engine/packages/modoki test` (20s) — ~245s total,
-// measured warm. The root test suite (vitest) leaves most of this machine's cores idle for
-// nearly all of that 198s, so the other legs can run concurrently INSIDE it for free: the
-// three lanes below are independent of each other (no lane's result depends on another
-// lane's output) and are launched in parallel via `child_process.spawn`. Only within lane 2
-// is there a real dependency — lint is cheap and only interesting when the types are sane —
-// so lint runs after typecheck, sequentially, inside that one lane.
+// `npm run verify` used to run its legs as one `&&` chain and took ~245s warm. The root test
+// suite (vitest) leaves most of this machine's cores idle for much of its run, so the other
+// legs can run concurrently INSIDE it for close to free: the TWO lanes below are independent
+// of each other (no lane's result depends on another lane's output) and are launched in
+// parallel via `child_process.spawn`. Only within lane 2 is there a real dependency — lint is
+// cheap and only interesting when the types are sane — so lint runs after typecheck,
+// sequentially, inside that one lane.
+//
+// MEASURED 2026-08-18 on this Mac, quiet box, warm caches (4 runs). ⚠️ Quote the RANGE — the
+// spread between rounds is larger than most changes you would make here:
+//
+//                              standalone      inside the lane
+//   typecheck                       12.4s          15.9-17.3s
+//   lint                             1.3s            2.0-2.2s
+//   engine tests (6 workers)        12.1s          33.8-36.2s
+//   ---------------------------------------------------------
+//   lane 2 total                  ~26s of work     51.8-55.7s
+//   app tests (lane 1)                             82.1-86.0s
+//   verify wall-clock                              82.1-86.0s
+//
+// ⚠️ **The app lane IS the wall clock — LANE 2 NEVER BINDS.** Wall exceeded appLane by 7-8ms in
+// every run (82.077/82.070, 79.564/79.556, 86.019/86.012, 86.100/86.093), which is this script's
+// own overhead and nothing else. It has ~30s of
+// slack, so nothing removed from it changes the gate's wall-clock. Two consequences that have
+// each already cost someone a session:
+//
+//   1. Lane 2 is ~26s of WORK stretched to ~54s by sharing the box with the app pool. The
+//      engine suite is 12.1s standalone at 12 workers and 34s here. Do not read the in-lane
+//      number as the suite's cost, and do not go hunting a pole inside it — there isn't one
+//      (556 files, evenly spread, nothing slow enough for the reporter to print).
+//   2. Typecheck is NOT the lane-2 pole; the engine suite is, at ~2x. Parallelising the five
+//      independent typecheck commands inside `npm run typecheck` (six `tsc` programs, no project
+//      references between them) would buy ~10s off a leg that
+//      is not the constraint, and 0s off the gate. Measured and declined.
+//
+// ⚠️ **Running typecheck ‖ engine tests was MEASURED AND DECLINED (2026-08-18) — and it works.**
+// The three-lane instability documented below does NOT reproduce now that the worker cap
+// exists: A/B'd back to back, lane 2 goes 54s -> 35s with the app lane unchanged (82.1/86.0
+// chained vs 79.6/86.1 concurrent — the two ROUNDS differ more than the two variants). It is
+// declined because it buys 19s of slack nobody spends and 0s of wall-clock, while inflating
+// typecheck 16s -> 24s (descheduled against the engine pool) — CPU spent for nothing, and the
+// `win` clone pays that trade worst. Revisit ONLY if the app lane ever drops below ~54s.
+//
+// The only lever on `verify` is the app lane. It was the pole in all four runs.
 //
 // Output is BUFFERED per lane and flushed as a block when the lane finishes, so concurrent
 // output never interleaves line-by-line. `verify:serial` (the old `&&` chain) is kept in
@@ -82,6 +118,12 @@ function runCommand(cmd, extraEnv = {}) {
  * single-threaded, so while it runs the app suite has the cores to itself; the engine suite then
  * starts late, is short, and is the only thing ever competing with the app pool. Lint runs only if
  * typecheck passed — it is cheap, and its result is only interesting when the types are sane.
+ *
+ * ⚠️ RE-MEASURED 2026-08-18 and the instability above no longer reproduces — the pinned
+ * `ENGINE_LANE_WORKERS` is why. Chaining is kept for a DIFFERENT reason than it was adopted for:
+ * splitting is now wall-clock-neutral rather than harmful, so it simply buys nothing. Note also
+ * that chaining does not avoid the two pools overlapping — the engine suite runs t=~18s to t=~54s,
+ * entirely inside the app lane — it only delays the overlap. See the header for the A/B.
  */
 async function checksAndEngineLane() {
   const start = Date.now();

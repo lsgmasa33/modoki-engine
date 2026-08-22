@@ -6,7 +6,7 @@
  *  into slope+weight. `handlePt` (forward) and `deriveTangentFromHandle` (inverse) must
  *  round-trip: drag a handle to a data point, read it back, get the same data point. */
 
-import { DEFAULT_TANGENT_WEIGHT, type Keyframe } from '../../../runtime/animation/types';
+import { DEFAULT_TANGENT_WEIGHT, STEPPED, type Keyframe, type TangentMode } from '../../../runtime/animation/types';
 
 const EPS = 1e-3;
 
@@ -49,18 +49,31 @@ export function deriveTangentFromHandle(
   segDt: number,
   unified: boolean,
 ): Partial<Keyframe> {
+  // RECORD the mode, or the drag is temporary. Without it the key keeps whatever mode it had
+  // — usually 'auto' — and the next neighbour edit re-derives the hand-shaped tangent away
+  // (`reapplyTangent` honours the key's OWN mode). `freeSmooth` vs `free` preserves what the
+  // drag meant: a unified handle stays mirrored, a broken one stays broken.
+  // Dragging the IN handle of a STEPPED key leaves the hold intact — the hold lives on the
+  // OUTGOING tangent — so the key is still 'constant' and must keep saying so. Relabelling it
+  // 'free' here is silent data loss one reload later: STEPPED is +Infinity,
+  // JSON.stringify(Infinity) is "null", and `tangentMode:'constant'` is the ONLY thing that
+  // tells normalizeAnimationClip to reconstruct the hold on load. Dragging the OUT handle is
+  // different — that REPLACES the hold with a real slope, so the key genuinely stops being
+  // constant and the free/freeSmooth label is correct.
+  const stillHolds = side === 'in' && k.outTangent === STEPPED;
+  const mode: TangentMode = stillHolds ? 'constant' : (unified ? 'freeSmooth' : 'free');
   if (side === 'out') {
     const ddt = Math.max(EPS, dataT - k.t);
     const slope = (dataV - k.v) / ddt;
     const w = Math.max(0.02, Math.min(1, ddt / Math.max(EPS, segDt)));
-    const patch: Partial<Keyframe> = { outTangent: slope, outWeight: w };
+    const patch: Partial<Keyframe> = { outTangent: slope, outWeight: w, tangentMode: mode, broken: !unified };
     if (unified) patch.inTangent = slope;
     return patch;
   }
   const bdt = Math.max(EPS, k.t - dataT);
   const slope = (k.v - dataV) / bdt;
   const w = Math.max(0.02, Math.min(1, bdt / Math.max(EPS, segDt)));
-  const patch: Partial<Keyframe> = { inTangent: slope, inWeight: w };
+  const patch: Partial<Keyframe> = { inTangent: slope, inWeight: w, tangentMode: mode, broken: !unified };
   if (unified) patch.outTangent = slope;
   return patch;
 }

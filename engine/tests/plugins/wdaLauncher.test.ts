@@ -5,8 +5,8 @@ import path from 'node:path';
 import {
   parseIosDevices, resolveIosDevice, ensureWdaRunning, stopWda,
   isWdaProcessRunning, _resetWdaLauncherForTests, WDA_PROBE_TIMEOUT_MS,
-  parseXctraceDevices, mergeIosDevices, pickWdaFailureLine, describeExecFailure,
-  _devicectlOutPath,
+  parseXctraceDevices, mergeIosDevices, mergeGoIosDevices, pickWdaFailureLine, describeExecFailure,
+  _devicectlOutPath, listIosDevicesForSelection, wdaLauncherExec, _clearIosListCache,
 } from '../../plugins/backend/wdaLauncher';
 
 /**
@@ -732,5 +732,156 @@ describe('mergeIosDevices — devicectl stays authoritative, legacy only ADDS (#
     const legacyOnlyDevice = merged.find((d) => d.name === 'iPhone8');
     expect(devicectlDevice?.devicectl).toBe(true);
     expect(legacyOnlyDevice?.devicectl).toBeUndefined();
+  });
+});
+
+/**
+ * The device listing must include what only go-ios can see (bug `ca0A0LZ4knjvVNzclLRl`).
+ *
+ * Measured 2026-08-20: `Build → iOS Device` offered three DISCONNECTED phones and omitted the
+ * connected iPhone 8, identically before and after `Refresh devices`, while `go-ios list`,
+ * `idevice_id -l` and Xcode's Devices window all saw it. The omitted device is the only class that
+ * NEEDS the go-ios install path — devicectl is CoreDevice-only and cannot see iOS ≤16 at all — so
+ * #217's hands-free install was unreachable from its own picker, silently.
+ */
+describe('iOS listing — go-ios fills what Apple\'s listings drop', () => {
+  const D = (udid: string, name: string, connected = false): ReturnType<typeof parseIosDevices>[number] =>
+    ({ udid, name, connected }) as ReturnType<typeof parseIosDevices>[number];
+
+  it('appends a device only go-ios saw, marked connected', () => {
+    const out = mergeGoIosDevices([D('AAA', 'Nana’s iPhone')], [{ udid: 'BBB', name: 'iPhone8' }]);
+    expect(out.map((d) => d.udid)).toEqual(['AAA', 'BBB']);
+    expect(out[1]).toMatchObject({ name: 'iPhone8', connected: true });
+    // No devicectlId: this is exactly the class that must take the go-ios install branch.
+    expect(out[1]).not.toHaveProperty('devicectlId');
+  });
+
+  it('names a row even when the device will not answer `ios info`', () => {
+    // A bare UDID is a poor row; an ABSENT row is the bug. It must also say where it came from,
+    // or the reader is left wondering why one entry looks unlike the rest.
+    const [row] = mergeGoIosDevices([], [{ udid: 'a11ce511deadbeef0000000000000000000000ff' }]);
+    expect(row.name).toContain('a11ce511');
+    expect(row.name).toContain('go-ios');
+  });
+
+  it('dedupes the go-ios list against ITSELF', () => {
+    // MEASURED, not hypothetical: `ios list` on this Mac returned the iPhone 8's UDID twice in a
+    // single call, and a known-set-only filter puts two identical rows in the Build menu. The
+    // unit tests above did not catch it; a live probe against the real binary did.
+    const out = mergeGoIosDevices([], [
+      { udid: 'BBB', name: 'iPhone8' },
+      { udid: 'BBB', name: 'iPhone8' },
+    ]);
+    expect(out.map((d) => d.udid)).toEqual(['BBB']);
+  });
+
+  it('does NOT touch a row the Apple listings already produced', () => {
+    // Including a `connected:false` they may have got wrong: correcting that from here would layer
+    // a second inference on the first, and the fix is about the MISSING row.
+    const out = mergeGoIosDevices([D('AAA', 'iPhone8', false)], [{ udid: 'AAA', name: 'other' }]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ name: 'iPhone8', connected: false });
+  });
+
+  it('the real listing consults go-ios and unions the result', async () => {
+    const realList = wdaLauncherExec.listGoIosUdids;
+    const realInfo = wdaLauncherExec.goIosInfo;
+    const realDev = wdaLauncherExec.listDevices;
+    const realLegacy = wdaLauncherExec.listLegacyDevices;
+    try {
+      _clearIosListCache();
+      wdaLauncherExec.listDevices = async () => { throw new Error('no devicectl'); };
+      wdaLauncherExec.listLegacyDevices = async () => '';
+      wdaLauncherExec.listGoIosUdids = async () => ['a11ce511deadbeef0000000000000000000000ff'];
+      wdaLauncherExec.goIosInfo = async () => ({ name: 'iPhone8', productType: 'iPhone10,1' });
+
+      const devices = await listIosDevicesForSelection();
+      expect(devices).toHaveLength(1);
+      expect(devices[0]).toMatchObject({ name: 'iPhone8', connected: true, productType: 'iPhone10,1' });
+    } finally {
+      _clearIosListCache();
+      wdaLauncherExec.listGoIosUdids = realList; wdaLauncherExec.goIosInfo = realInfo;
+      wdaLauncherExec.listDevices = realDev; wdaLauncherExec.listLegacyDevices = realLegacy;
+    }
+  });
+
+  it('only asks `ios info` about devices the Apple listings MISSED', async () => {
+    // One extra shell-out per missing device is fine (usually zero); one per PAIRED device would
+    // be paid on every poll of a listing the AI panel refreshes every 2.5s.
+    const real = { l: wdaLauncherExec.listGoIosUdids, i: wdaLauncherExec.goIosInfo, d: wdaLauncherExec.listDevices, g: wdaLauncherExec.listLegacyDevices };
+    const asked: string[] = [];
+    try {
+      _clearIosListCache();
+      wdaLauncherExec.listDevices = async () => { throw new Error('no devicectl'); };
+      wdaLauncherExec.listLegacyDevices = async () => '';
+      wdaLauncherExec.listGoIosUdids = async () => ['AAA'];
+      wdaLauncherExec.goIosInfo = async (u: string) => { asked.push(u); return {}; };
+      await listIosDevicesForSelection();
+      expect(asked).toEqual(['AAA']);
+    } finally {
+      _clearIosListCache();
+      wdaLauncherExec.listGoIosUdids = real.l; wdaLauncherExec.goIosInfo = real.i;
+      wdaLauncherExec.listDevices = real.d; wdaLauncherExec.listLegacyDevices = real.g;
+    }
+  });
+});
+
+describe('the iOS listing coalesces concurrent misses', () => {
+  // Found by the close-out review. Each uncached call spawns up to FOUR bounded subprocesses
+  // (devicectl 20s, xctrace 20s, `ios list` 10s, `ios info` 10s), and the AI panel polls this
+  // every 2.5s — so a slow or wedged tool made every poll during that window start another full
+  // set instead of waiting for the one already in flight.
+  it('runs the exec seam ONCE for N concurrent callers, and they all get the same answer', async () => {
+    const real = { d: wdaLauncherExec.listDevices, g: wdaLauncherExec.listLegacyDevices, l: wdaLauncherExec.listGoIosUdids, i: wdaLauncherExec.goIosInfo };
+    let listCalls = 0;
+    try {
+      _clearIosListCache();
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      wdaLauncherExec.listDevices = async () => { listCalls++; await gate; throw new Error('no devicectl'); };
+      wdaLauncherExec.listLegacyDevices = async () => '';
+      wdaLauncherExec.listGoIosUdids = async () => ['AAA'];
+      wdaLauncherExec.goIosInfo = async () => ({ name: 'iPhone8' });
+
+      const all = Promise.all([listIosDevicesForSelection(), listIosDevicesForSelection(), listIosDevicesForSelection()]);
+      release();
+      const [a, b, c] = await all;
+
+      expect(listCalls).toBe(1);
+      expect(a).toBe(b);            // literally the same array — one listing, shared
+      expect(b).toBe(c);
+      expect(a.map((d) => d.name)).toEqual(['iPhone8']);
+    } finally {
+      _clearIosListCache();
+      wdaLauncherExec.listDevices = real.d; wdaLauncherExec.listLegacyDevices = real.g;
+      wdaLauncherExec.listGoIosUdids = real.l; wdaLauncherExec.goIosInfo = real.i;
+    }
+  });
+
+  it('a FAILED listing does not wedge every later call', async () => {
+    // The in-flight slot must be released on rejection too, or one bad listing poisons the picker
+    // for the life of the process.
+    const real = { d: wdaLauncherExec.listDevices, g: wdaLauncherExec.listLegacyDevices, l: wdaLauncherExec.listGoIosUdids };
+    try {
+      _clearIosListCache();
+      wdaLauncherExec.listDevices = async () => { throw new Error('no devicectl'); };
+      wdaLauncherExec.listLegacyDevices = async () => { throw new Error('boom'); };
+      wdaLauncherExec.listGoIosUdids = async () => [];
+      // The stub REPLACES `listLegacyDevices`' own try/catch, so this rejection reaches the
+      // listing — which is precisely the case worth pinning: `.finally()` must release the
+      // in-flight slot on the failure path too.
+      await expect(listIosDevicesForSelection()).rejects.toThrow('boom');
+      // ⚠️ NO `_clearIosListCache()` here, deliberately. That helper nulls the in-flight slot
+      // itself, so clearing between the two calls would exercise the helper instead of the
+      // `.finally()` release and the assertion would pass with the release deleted — it did, on
+      // the first draft of this test.
+      wdaLauncherExec.listLegacyDevices = async () => '';
+      wdaLauncherExec.listGoIosUdids = async () => ['BBB'];
+      const second = await listIosDevicesForSelection();
+      expect(second.map((d) => d.udid)).toEqual(['BBB']);
+    } finally {
+      _clearIosListCache();
+      wdaLauncherExec.listDevices = real.d; wdaLauncherExec.listLegacyDevices = real.g; wdaLauncherExec.listGoIosUdids = real.l;
+    }
   });
 });

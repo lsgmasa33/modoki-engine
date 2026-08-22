@@ -87,6 +87,9 @@ describe('addressing', () => {
     expect(r.ok).toBe(false);
     expect(r.error).toContain('2 entities are named');
     expect(r.error).toContain('address by guid');
+    // QA-TOOL-0003: the machine-readable twin of the same refusal — was REFUSED_BY_OP,
+    // indistinguishable from any other refusal without string-matching `error`.
+    expect(r.code).toBe('AMBIGUOUS');
   });
 
   it('resolves by id, but guid wins when both are given', () => {
@@ -98,8 +101,14 @@ describe('addressing', () => {
   });
 
   it('reports a miss as a result, never a throw', () => {
-    expect(resolveEntityPointReport({ guid: 'nope', surface: 'game-3d' })).toMatchObject({ ok: false, error: expect.stringContaining('no entity with guid') });
-    expect(resolveEntityPointReport({})).toMatchObject({ ok: false, error: expect.stringContaining('provide an entity') });
+    expect(resolveEntityPointReport({ guid: 'nope', surface: 'game-3d' })).toMatchObject({
+      ok: false, error: expect.stringContaining('no entity with guid'), code: 'NOT_FOUND',
+    });
+    // No `{guid}|{name}|{id}` at all is a different mistake (a malformed call, not "not found")
+    // and stays uncoded — the caller's REFUSED_BY_OP fallback is the honest answer for it.
+    const noSpec = resolveEntityPointReport({});
+    expect(noSpec).toMatchObject({ ok: false, error: expect.stringContaining('provide an entity') });
+    expect(noSpec.code).toBeUndefined();
   });
 });
 
@@ -252,6 +261,7 @@ describe('multi-surface entities', () => {
     expect(r.error).toMatch(/'scene-view'/);
     // The error must carry the fix, not just the complaint.
     expect(r.error).toMatch(/Pass surface:'game-3d'/);
+    expect(r.code).toBe('AMBIGUOUS_SURFACE');
   });
 
   it('REFUSES a 2D/3D aim with no surface even when only ONE surface has the entity', () => {
@@ -349,6 +359,7 @@ describe('multi-surface entities', () => {
     expect(r.error).toMatch(/rendered in 2 surfaces/);
     expect(r.error).toMatch(/scene-view/);
     expect(r.error).toMatch(/game-ui/);
+    expect(r.code).toBe('AMBIGUOUS_SURFACE');
   });
 
   it('aims in the surface the caller names, not the first in document order', () => {
@@ -405,6 +416,9 @@ describe('2D/3D entities with a pick provider (entity scope)', () => {
     expect(r.ok).toBe(false);
     expect(r.error).toContain('Wall');
     expect(r.error).toContain('allowOccluded:true'); // the escape hatch is discoverable from the error
+    // QA-TOOL-0003 — MEASURED live as the motivating bug: this refusal used to arrive as the
+    // generic REFUSED_BY_OP, indistinguishable from any other refusal without string-matching.
+    expect(r.code).toBe('OCCLUDED');
   });
 
   it('the SAME call with allowOccluded:true dispatches and reports what was actually hit', () => {
@@ -456,5 +470,56 @@ describe('2D/3D entities with a pick provider (entity scope)', () => {
     stubTopmost(document.createElement('canvas'));
     pickAt.mockReturnValue(undefined); // explicit, though it is also the describe-level default
     expect(aimPuck()).toMatchObject({ ok: true, occlusionScope: 'canvas' });
+  });
+});
+
+describe('the aim point must be on the surface that was ASKED FOR', () => {
+  /** A canvas inside a named editor host, as the real DOM has it: the SceneView's canvas lives
+   *  under `[data-scene-viewport]`, the Game panel's under `[data-game-view-area]`. */
+  const hostedCanvas = (marker: 'data-game-view-area' | 'data-scene-viewport') => {
+    const host = document.createElement('div');
+    host.setAttribute(marker, '');
+    const c = document.createElement('canvas');
+    host.appendChild(c);
+    document.body.appendChild(host);
+    return c;
+  };
+
+  it('REFUSES a game-3d aim whose centre lands on the Scene panel\'s canvas', () => {
+    // The editor puts the two canvases side by side (measured on games/3d-test at 1600x968: Game
+    // 3D x 0-366, SceneView x 370-736), and a rect straddling the Game canvas's edge has its
+    // CENTRE on the SceneView. Every check downstream is then answering about the wrong surface:
+    // the pick says "nothing there" and the DOM check sees *a* canvas and calls it clean. Measured
+    // 2026-08-19 before this guard: ok:true, occluded:false, and the click focused the Scene panel.
+    stubTopmost(hostedCanvas('data-scene-viewport'));
+    const r = aimPuck();
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('the Scene panel');
+    expect(r.code).toBe('OCCLUDED');
+  });
+
+  it('REFUSES a scene-view aim whose centre lands on the Game panel\'s canvas', () => {
+    collectScreenBounds.mockReturnValue([{ ...bounds()[0], surface: 'scene-view' }]);
+    stubTopmost(hostedCanvas('data-game-view-area'));
+    const r = resolveEntityPointReport({ guid: 'g-puck', surface: 'scene-view' });
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('the Game panel');
+  });
+
+  it('allows the aim when the canvas belongs to the surface that was asked for', () => {
+    stubTopmost(hostedCanvas('data-game-view-area'));
+    expect(aimPuck()).toMatchObject({ ok: true, occlusionScope: 'canvas' });
+  });
+
+  it('an UNMARKED canvas stays permissive — a shipped game carries neither host marker', () => {
+    // The markers are editor chrome. Reading "not in the Game panel" as "foreign" would refuse
+    // every aim in a real game build, where the canvas is under neither.
+    stubTopmost(document.createElement('canvas'));
+    expect(aimPuck()).toMatchObject({ ok: true, occlusionScope: 'canvas' });
+  });
+
+  it('allowOccluded does NOT open it — nothing is covering the target, the aim is on the wrong surface', () => {
+    stubTopmost(hostedCanvas('data-scene-viewport'));
+    expect(aimPuck({ allowOccluded: true })).toMatchObject({ ok: false });
   });
 });

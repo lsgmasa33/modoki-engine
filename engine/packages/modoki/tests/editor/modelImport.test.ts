@@ -3,7 +3,14 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as THREE from 'three';
-import { isGuid, resolveGuidToPath, clearManifest, registerAsset } from '../../src/runtime/loaders/assetManifest';
+import { isGuid, resolveGuidToPath, clearManifest, registerAsset, serializeManifest } from '../../src/runtime/loaders/assetManifest';
+
+/** Every path the manifest currently maps a guid to (#311). Enumerated rather than probed by
+ *  expected path, so the assertion is about the MANIFEST — a registered ref to a file that was
+ *  never written is exactly the defect, whatever the path turned out to be. */
+function allRegisteredPaths(): string[] {
+  return serializeManifest().assets.map((a) => a.path);
+}
 
 // ── Mocks ──
 
@@ -48,9 +55,15 @@ let writtenFiles: { path: string; content: string }[] = [];
 let writtenMeta: { path: string; meta: any } | null = null;
 
 // Mock fetch for file writes and meta writes
+/** #311: make the write for the first path matching this substring fail, so a test can drive
+ *  the abort path. Null = every write succeeds (the default for every other test here). */
+let failWriteMatching: string | null = null;
 const mockFetch = vi.fn(async (url: string, opts?: any) => {
   if (url === '/api/write-file') {
     const body = JSON.parse(opts.body);
+    if (failWriteMatching && String(body.path).includes(failWriteMatching)) {
+      return { ok: false, status: 500 };
+    }
     writtenFiles.push({ path: body.path, content: body.content });
     return { ok: true };
   }
@@ -110,6 +123,7 @@ vi.mock('../../src/runtime/traits', () => {
 beforeEach(() => {
   writtenFiles = [];
   writtenMeta = null;
+  failWriteMatching = null;
   mockTemplates = new Map();
   loadGLBResult = new Map();
   mockPostprocessor = {};
@@ -588,5 +602,76 @@ describe('importModel', () => {
     expect(matAsset.side).toBe('double');
     expect(matAsset.alphaTest).toBe(0.5);
     expect(matAsset.envMapIntensity).toBe(1.2);
+  });
+});
+
+/** #311 — a failed write ABORTS the whole import (owner's policy, 2026-08-21).
+ *
+ *  The defect: `writeAssetFile` never throws (it resolves `false`) and three call sites
+ *  discarded that. Two registered the asset FIRST, so a failed write left a GUID mapped to a
+ *  path with no file — everything resolved for the rest of the session and the dangling ref
+ *  surfaced on the next scene load or a fresh editor launch, far from the cause.
+ *
+ *  Two independent halves, and the ORDERING one is what these mostly pin: registering only
+ *  after a confirmed write is what stops the dangling ref, while the abort is what stops a
+ *  silently-incomplete model. A test that only checked the return value would pass with the
+ *  ordering still wrong. */
+describe('#311 — a failed write aborts the import', () => {
+  it('returns 0 rather than throwing, so the caller’s `if (!rootId)` guard sees it', async () => {
+    const { importModel } = await getModule();
+    addTemplate('ground_mesh', mockMaterial({ name: 'grass', color: 0x00ff00 }));
+    failWriteMatching = '.mat.json';
+
+    // The contract is a falsy return, NOT an exception — both call sites
+    // (Assets.tsx, ModelAssetView.tsx) check the value and neither wraps this in a try.
+    await expect(importModel('/assets/models/island.glb', 'island')).resolves.toBe(0);
+  });
+
+  it('does NOT register a material whose write failed — the dangling-ref half', async () => {
+    const { importModel } = await getModule();
+    addTemplate('ground_mesh', mockMaterial({ name: 'grass', color: 0x00ff00 }));
+    failWriteMatching = '.mat.json';
+
+    await importModel('/assets/models/island.glb', 'island');
+
+    // Nothing in the manifest may point at the file that was never written. Scanning every
+    // registered guid is what makes this an assertion about the MANIFEST rather than about
+    // the order of two lines.
+    const dangling = allRegisteredPaths().filter((p) => p.includes('.mat.json'));
+    expect(dangling).toEqual([]);
+  });
+
+  it('does NOT register a mesh whose write failed', async () => {
+    const { importModel } = await getModule();
+    addTemplate('ground_mesh', mockMaterial({ name: 'grass', color: 0x00ff00 }));
+    failWriteMatching = '.mesh.json';
+
+    await importModel('/assets/models/island.glb', 'island');
+
+    const dangling = allRegisteredPaths().filter((p) => p.includes('.mesh.json'));
+    expect(dangling).toEqual([]);
+  });
+
+  it('stops at the FIRST failure — no later artifact is written', async () => {
+    const { importModel } = await getModule();
+    addTemplate('ground_mesh', mockMaterial({ name: 'grass', color: 0x00ff00 }));
+    failWriteMatching = '.mat.json';
+
+    await importModel('/assets/models/island.glb', 'island');
+
+    // The mesh file is written after the material one; aborting means it never happens.
+    // Skip-and-continue (the rejected policy) would have produced it.
+    expect(writtenFiles.filter((f) => f.path.includes('.mesh.json'))).toEqual([]);
+  });
+
+  it('a successful import still registers everything — the abort path is not always-on', async () => {
+    const { importModel } = await getModule();
+    addTemplate('ground_mesh', mockMaterial({ name: 'grass', color: 0x00ff00 }));
+
+    const rootId = await importModel('/assets/models/island.glb', 'island');
+
+    expect(rootId).not.toBe(0);
+    expect(writtenFiles.some((f) => f.path.includes('.mat.json'))).toBe(true);
+    expect(allRegisteredPaths().some((p) => p.includes('.mat.json'))).toBe(true);
   });
 });

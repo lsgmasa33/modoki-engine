@@ -109,6 +109,10 @@ const GD_UUID = {
   stripPhase: 'DD0000000000000000000005',
   /** The archive-time "Debug build is ON" warning phase (#112 Phase 2). */
   archiveWarnPhase: 'DD0000000000000000000006',
+  /** The Crashlytics dSYM upload phase (#279). The value matches the UUID Court's pbxproj was
+   *  hand-edited with in #275, so healing that project REPLACES its phase rather than adding a
+   *  second one beside it. */
+  dsymUploadPhase: 'DD0000000000000000000007',
 } as const;
 
 /** RETIRED (#112) — the Release Info.plist-strip build phase. It deleted the two
@@ -178,6 +182,60 @@ const ARCHIVE_WARN_PHASE_BLOCK = [
   '/* End PBXShellScriptBuildPhase section */',
   '',
 ].join('\n');
+
+/** Name of the Crashlytics dSYM upload phase (#279) — matches the hand-edited phase #275 put in
+ *  Court's pbxproj, which is what lets the heal replace it in place. */
+const DSYM_PHASE_NAME = 'Upload Crashlytics dSYMs';
+
+/** The dSYM upload phase, as pbxproj text.
+ *
+ *  Apple's `run` script ships INSIDE the firebase-ios-sdk SPM checkout, under the derived-data
+ *  SourcePackages dir — hence the `${BUILD_DIR%/Build/*}` trim. A Capacitor project using
+ *  CocoaPods has a Pods copy, so both are tried before giving up.
+ *
+ *  It narrates every skip. A dSYM upload that quietly does nothing is indistinguishable from one
+ *  that worked until the day somebody reads a crash report and finds raw addresses — which is
+ *  exactly what happened here: this phase existed in Court for weeks, exited early on every build,
+ *  and the console accumulated 8 unprocessed crashes (#279). */
+const DSYM_PHASE_BLOCK = [
+  '/* Begin PBXShellScriptBuildPhase section */',
+  `\t\t${GD_UUID.dsymUploadPhase} /* ${DSYM_PHASE_NAME} */ = {`,
+  '\t\t\tisa = PBXShellScriptBuildPhase;',
+  '\t\t\tbuildActionMask = 2147483647;',
+  '\t\t\talwaysOutOfDate = 1;',
+  '\t\t\tfiles = (',
+  '\t\t\t);',
+  '\t\t\tinputPaths = (',
+  '\t\t\t\t"${DWARF_DSYM_FOLDER_PATH}/${DWARF_DSYM_FILE_NAME}/Contents/Resources/DWARF/${TARGET_NAME}",',
+  '\t\t\t\t"$(SRCROOT)/$(BUILT_PRODUCTS_DIR)/$(INFOPLIST_PATH)",',
+  '\t\t\t);',
+  `\t\t\tname = "${DSYM_PHASE_NAME}";`,
+  '\t\t\toutputPaths = (',
+  '\t\t\t);',
+  '\t\t\trunOnlyForDeploymentPostprocessing = 0;',
+  '\t\t\tshellPath = /bin/sh;',
+  '\t\t\tshellScript = "set -e\\n'
+    + '# Crashlytics symbol upload (#275, generalized in #279). Without it an iOS crash report comes\\n'
+    + '# back as raw addresses, which is the difference between a report and a puzzle.\\n'
+    + 'RUN=\\"${BUILD_DIR%/Build/*}/SourcePackages/checkouts/firebase-ios-sdk/Crashlytics/run\\"\\n'
+    + '[ -f \\"$RUN\\" ] || RUN=\\"${SRCROOT}/Pods/FirebaseCrashlytics/run\\"\\n'
+    + 'if [ ! -f \\"$RUN\\" ]; then\\n'
+    + '  echo \\"warning: Crashlytics dSYM upload SKIPPED - no run script found. Run \'npx cap sync ios\' and let Xcode resolve packages, or crash reports will not be symbolicated.\\"\\n'
+    + '  exit 0\\n'
+    + 'fi\\n'
+    + '# Modoki sets dwarf-with-dsym in EVERY configuration (#279), Debug included, because Debug is\\n'
+    + '# where the crash probes run. So a skip here is a defect in either configuration now, not the\\n'
+    + '# expected Debug behaviour it used to be.\\n'
+    + 'if [ \\"${DEBUG_INFORMATION_FORMAT}\\" != \\"dwarf-with-dsym\\" ]; then\\n'
+    + '  echo \\"warning: Crashlytics dSYM upload skipped - DEBUG_INFORMATION_FORMAT is \'${DEBUG_INFORMATION_FORMAT}\', so no dSYM exists. Reopen the project so healNativeConfig can fix it.\\"\\n'
+    + '  exit 0\\n'
+    + 'fi\\n'
+    + '\\"$RUN\\"\\n";',
+  '\t\t};',
+  '/* End PBXShellScriptBuildPhase section */',
+  '',
+].join('\n');
+
 
 /** The Gradle sibling of the iOS archive warning, fenced so the heal owns only its own
  *  lines in the hand-editable `android/app/build.gradle`. Warns when the task graph
@@ -304,56 +362,181 @@ function appBuildConfigUUIDs(lines: string[]): Set<string> {
   return uuids;
 }
 
-/** Ensure the App target's build configs in the iOS pbxproj have
- *  DEVELOPMENT_TEAM=<teamId>. Inserts it after PRODUCT_NAME where missing and
- *  corrects ANY existing value (including the empty `DEVELOPMENT_TEAM = "";`
- *  form a fresh `cap add` leaves). Scoped to the App target ONLY — other targets'
- *  teams are left untouched. No-op when appleTeamId is empty or no ios/. */
+/** The gitignored file that actually carries the Team ID, and the tracked one-liner that pulls it
+ *  in. Both live in `ios/`, beside Capacitor's own `debug.xcconfig`. */
+const IOS_LOCAL_XCCONFIG = 'modoki.local.xcconfig';
+/** `#include?` — Xcode's OPTIONAL include. A missing file is not an error, which is the whole
+ *  reason this shape works for a gitignored target: a fresh clone parses the xcconfig fine and
+ *  simply has no team. Measured (`xcodebuild -showBuildSettings`, 3d-test, 2026-08-18): with the
+ *  file absent, exit 0, zero warnings, `CAPACITOR_DEBUG` still resolves, `DEVELOPMENT_TEAM` absent. */
+const IOS_XCCONFIG_INCLUDE = `#include? "${IOS_LOCAL_XCCONFIG}"`;
+
+/** Put the Apple Team ID where git cannot reach it — a gitignored `ios/modoki.local.xcconfig`,
+ *  pulled in by an optional `#include?` in the TRACKED `ios/debug.xcconfig`, with the value
+ *  STRIPPED from the tracked pbxproj.
+ *
+ *  This closes the last hole in #172. That change moved five owner-private `build.*` values out of
+ *  the committed `project.config.json`, but the Team ID has a second home the overlay could not
+ *  reach: this function used to WRITE it into `ios/App/App.xcodeproj/project.pbxproj`, which is
+ *  tracked. So the value went straight back into git on every project open and every iOS build, and
+ *  `privateBuildFields.test.ts` could not see it (it reads project configs, not pbxproj). Four such
+ *  lines sat committed in two publishable demos, green on every gate, until #228's close-out.
+ *
+ *  **Why an xcconfig rather than build-time injection.** `xcodebuild DEVELOPMENT_TEAM=…` would
+ *  cover Modoki's own build route and nothing else — CLAUDE.md's iPhone-8 recipe deliberately hands
+ *  off to Xcode for a manual ⌘R, and that build would be unsigned. The xcconfig is read by every
+ *  consumer of the project: our CLI, the editor's Build route, and Xcode itself.
+ *
+ *  **Precedence is why the pbxproj line must GO, not be blanked.** A setting in a target's
+ *  `buildSettings` beats its `baseConfigurationReference` xcconfig, so leaving
+ *  `DEVELOPMENT_TEAM = "";` behind would shadow the include with an empty string and break signing
+ *  in a way that looks exactly like a missing team. Removal is the fix, not a blank.
+ *
+ *  **No new wiring was needed**: every Capacitor project already points BOTH the Debug and Release
+ *  configs' `baseConfigurationReference` at `ios/debug.xcconfig` (verified across all 20 projects
+ *  here), so this appends one line to a file Xcode already reads.
+ *
+ *  ⚠️ **CocoaPods would break this.** `pod install` reassigns `baseConfigurationReference` to the
+ *  Pods xcconfig, orphaning our include and silently dropping the team. No project here has a
+ *  Podfile today (checked). A project that gains CocoaPods adapters must `#include?` this file from
+ *  the Pods xcconfig instead — see docs/native-and-sdks.md.
+ *
+ *  Scoped to the App target ONLY, as before. No-op without `ios/`; the strip runs only when there
+ *  is a `teamId` to move, so a project relying on a still-committed value is never left with
+ *  nothing. */
 function healIosDevelopmentTeam(projectRoot: string, teamId: string): string | undefined {
   if (!teamId) return undefined;
-  const pbx = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  const iosDir = path.join(projectRoot, 'ios');
+  const pbx = path.join(iosDir, 'App', 'App.xcodeproj', 'project.pbxproj');
   if (!fs.existsSync(pbx)) return undefined;
-  const lines = fs.readFileSync(pbx, 'utf8').split('\n');
+  const notes: string[] = [];
 
+  // 1. The gitignored value file.
+  const local = path.join(iosDir, IOS_LOCAL_XCCONFIG);
+  const wantLocal = `// Generated by Modoki (healNativeConfig) from build.appleTeamId.\n`
+    + `// GITIGNORED — never commit. Set it in this project's project.user.json.\n`
+    + `DEVELOPMENT_TEAM = ${teamId}\n`;
+  if (!fs.existsSync(local) || fs.readFileSync(local, 'utf8') !== wantLocal) {
+    fs.writeFileSync(local, wantLocal);
+    notes.push(`wrote ios/${IOS_LOCAL_XCCONFIG}`);
+  }
+
+  // 2a. DEBUG — Capacitor already points both Debug configs at `debug.xcconfig`, so one optional
+  //     include there is all Debug needs. Appending (rather than owning the file) keeps
+  //     `CAPACITOR_DEBUG = true` and anything else Capacitor puts there intact.
+  const dbg = path.join(iosDir, 'debug.xcconfig');
+  if (fs.existsSync(dbg)) {
+    const orig = fs.readFileSync(dbg, 'utf8');
+    if (!orig.includes(IOS_XCCONFIG_INCLUDE)) {
+      fs.writeFileSync(dbg, `${orig.replace(/\s*$/, '')}\n\n${IOS_XCCONFIG_INCLUDE}\n`);
+      notes.push('wired debug.xcconfig');
+    }
+  }
+
+  // 2b. RELEASE — and this is the half that is easy to miss. Capacitor attaches
+  //     `debug.xcconfig` to the DEBUG configurations ONLY; the Release configs have no
+  //     `baseConfigurationReference` at all, so a Debug-only include leaves the configuration that
+  //     actually SHIPS with no team. Caught by `xcodebuild -showBuildSettings -configuration
+  //     Release` after a Debug-only version measured green — do not "simplify" this back.
+  //
+  //     Release cannot simply reuse `debug.xcconfig`: that would leak `CAPACITOR_DEBUG = true` into
+  //     release builds. So we own a tracked wrapper that carries NO value, only the same optional
+  //     include, and attach it to every Release config lacking a base configuration.
+  const wrapper = path.join(iosDir, 'modoki.xcconfig');
+  const wantWrapper = `// Generated by Modoki (healNativeConfig). Tracked, and carries NO value.\n`
+    + `// Exists because Capacitor wires debug.xcconfig to the Debug configs only, leaving Release\n`
+    + `// with no base configuration — so this is what gets the Team ID into a shipping build.\n`
+    + `${IOS_XCCONFIG_INCLUDE}\n`;
+  if (!fs.existsSync(wrapper) || fs.readFileSync(wrapper, 'utf8') !== wantWrapper) {
+    fs.writeFileSync(wrapper, wantWrapper);
+    notes.push('wrote ios/modoki.xcconfig');
+  }
+
+  // 3. Strip the value out of the tracked pbxproj (see the precedence note above), and attach the
+  //    Release wrapper.
+  const pbxBefore = fs.readFileSync(pbx, 'utf8');
+  let lines = pbxBefore.split('\n');
   const appCfg = appBuildConfigUUIDs(lines);
-  if (appCfg.size === 0) return undefined; // can't identify the App target — bail safely
+  if (appCfg.size === 0) return notes.length ? `iOS team → ${IOS_LOCAL_XCCONFIG} (${notes.join(', ')})` : undefined;
 
-  // Locate the App target's XCBuildConfiguration blocks; record where to correct
-  // or insert. Apply bottom-up so splices don't shift not-yet-processed indices.
-  interface Block { teamLine: number; productLine: number; openLine: number; indent: string }
-  const blocks: Block[] = [];
+  // A fixed id rather than a random one so the heal is idempotent and the diff is stable. Verified
+  // free across every pbxproj in the repo; pbxproj ids are project-scoped, so a constant is safe.
+  const WRAPPER_UUID = 'D0D0D0D0D0D0D0D0D0D0D0D0';
+  if (!lines.some((l) => l.includes(WRAPPER_UUID))) {
+    let text = lines.join('\n');
+    const fileRefRe = /^\t\t[0-9A-Fa-f]{24} \/\* debug\.xcconfig \*\/ = \{isa = PBXFileReference;.*$/m;
+    const groupRe = /^(\t+)[0-9A-Fa-f]{24} \/\* debug\.xcconfig \*\/,$/m;
+    const fr = text.match(fileRefRe);
+    const gr = text.match(groupRe);
+    if (fr && gr) {
+      text = text.replace(fileRefRe, (m) => `${m}\n\t\t${WRAPPER_UUID} /* modoki.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = modoki.xcconfig; path = ../modoki.xcconfig; sourceTree = SOURCE_ROOT; };`);
+      text = text.replace(groupRe, (m, indent: string) => `${m}\n${indent}${WRAPPER_UUID} /* modoki.xcconfig */,`);
+      // Only a Release block that has NO base configuration — never displace an existing one
+      // (that is how a CocoaPods project would be broken).
+      text = text.replace(
+        /(\/\* Release \*\/ = \{\n(\t+)isa = XCBuildConfiguration;\n)(?!\t+baseConfigurationReference)/g,
+        (_m, head: string, indent: string) => `${head}${indent}baseConfigurationReference = ${WRAPPER_UUID} /* modoki.xcconfig */;\n`,
+      );
+      lines = text.split('\n');
+      // Claim it only if it is really there — the note used to be pushed unconditionally.
+      if (text.includes(WRAPPER_UUID)) notes.push('attached modoki.xcconfig to the Release configs');
+    }
+  }
+
+  const teamLines: number[] = [];
   for (let i = 0; i < lines.length; i++) {
     const head = lines[i].match(/^(\s*)([0-9A-Fa-f]{24}) \/\* .* \*\/ = \{/);
     if (!head || !appCfg.has(head[2])) continue;
     let end = i;
     while (end < lines.length && !/^\s*\};/.test(lines[end])) end++;
-    let isBuildCfg = false, teamLine = -1, productLine = -1, indent = head[1] + '\t';
+    let isBuildCfg = false;
+    const found: number[] = [];
     for (let j = i; j <= end; j++) {
       if (/isa = XCBuildConfiguration/.test(lines[j])) isBuildCfg = true;
-      if (teamLine === -1 && /DEVELOPMENT_TEAM = /.test(lines[j])) teamLine = j;
-      const pm = lines[j].match(/^(\s*)PRODUCT_NAME = /);
-      if (pm && productLine === -1) { productLine = j; indent = pm[1]; }
+      if (/^\s*DEVELOPMENT_TEAM = [^;]*;\s*$/.test(lines[j])) found.push(j);
     }
-    if (isBuildCfg) blocks.push({ teamLine, productLine, openLine: i, indent });
+    if (isBuildCfg) teamLines.push(...found);
+  }
+  // ⚠️ NEVER STRIP UNLESS BOTH CONFIGURATIONS ARE ACTUALLY WIRED.
+  //
+  // The strip destroys the only remaining copy of the Team ID in the project, so it is only safe
+  // once something else supplies it. Every wiring step above can legitimately decline: the Debug
+  // include needs `ios/debug.xcconfig` to exist, and the Release attach needs that file's
+  // PBXFileReference + group membership to be present (it refuses to invent references into a
+  // project shape it does not recognise). Both hold for all 20 projects here, but a Capacitor
+  // template change or a hand-trimmed project would make one false — and the old code stripped
+  // anyway, leaving a project with no team in ANY configuration and no committed value to fall
+  // back on. Signing then fails with Xcode's cryptic "requires a development team".
+  //
+  // Requiring BOTH is deliberate rather than either-or: wiring only Debug is precisely the bug
+  // that shipped once already (Release, the configuration that ships, silently unsigned).
+  const debugWired = fs.existsSync(dbg) && fs.readFileSync(dbg, 'utf8').includes(IOS_XCCONFIG_INCLUDE);
+  const releaseWired = lines.some((l) => l.includes(WRAPPER_UUID));
+  if (!debugWired || !releaseWired) {
+    // Persist whatever attaching DID succeed — it is safe on its own — then stop short of the strip.
+    const attachedOnly = lines.join('\n');
+    if (attachedOnly !== pbxBefore) fs.writeFileSync(pbx, attachedOnly);
+    notes.push(`left the pbxproj team in place — ${!debugWired ? 'Debug' : 'Release'} is not wired to the xcconfig`);
+    return `iOS team → ios/${IOS_LOCAL_XCCONFIG} (${notes.join(', ')})`;
   }
 
-  let changed = false;
-  for (let k = blocks.length - 1; k >= 0; k--) {
-    const b = blocks[k];
-    if (b.teamLine >= 0) {
-      // Correct ANY value form (KQ…; / ""; / stale team) — scoped to this line.
-      const fixed = lines[b.teamLine].replace(/DEVELOPMENT_TEAM = [^;]*;/, `DEVELOPMENT_TEAM = ${teamId};`);
-      if (fixed !== lines[b.teamLine]) { lines[b.teamLine] = fixed; changed = true; }
-    } else {
-      const at = b.productLine >= 0 ? b.productLine : b.openLine;
-      lines.splice(at + 1, 0, `${b.indent}DEVELOPMENT_TEAM = ${teamId};`);
-      changed = true;
-    }
-  }
+  // Bottom-up so a splice never shifts a not-yet-removed index.
+  for (const idx of teamLines.sort((a, b) => b - a)) lines.splice(idx, 1);
+  if (teamLines.length) notes.push(`removed ${teamLines.length} DEVELOPMENT_TEAM line(s) from the tracked pbxproj`);
 
-  if (!changed) return undefined;
-  fs.writeFileSync(pbx, lines.join('\n'));
-  return `synced iOS DEVELOPMENT_TEAM = ${teamId} (App target)`;
+  // ⚠️ ONE write, gated on the TEXT changing — not on the strip having found something.
+  //
+  // This was gated on `teamLines.length` and it silently discarded the Release attachment on every
+  // project whose pbxproj had already been stripped by an earlier run: the edit was computed, the
+  // note claimed success, and the file was never written. It survived because the one project
+  // spot-checked had been reverted and so still had lines to strip. Measured by
+  // `xcodebuild -showBuildSettings -configuration Release` across four projects — 1 worked, 3
+  // reported no team while the heal reported success. Keep the write keyed on content.
+  const after = lines.join('\n');
+  if (after !== pbxBefore) fs.writeFileSync(pbx, after);
+
+  if (notes.length === 0) return undefined;
+  return `iOS team → ios/${IOS_LOCAL_XCCONFIG} (${notes.join(', ')})`;
 }
 
 /** Sync the iOS Info.plist's Local Network keys to `build.debugBuild` — BOTH ways.
@@ -529,6 +712,311 @@ function insertArchiveWarnPhase(pbx: string): string | undefined {
   const anchor = '/* Begin PBXSourcesBuildPhase section */';
   if (!text.includes(anchor)) return undefined;
   return text.replace(anchor, ARCHIVE_WARN_PHASE_BLOCK + '\n' + anchor);
+}
+
+
+/** Does this project report to Crashlytics? Gate for {@link healIosCrashlyticsDsyms} — the dSYM
+ *  phase is meaningless without it, and adding one to every project would put a confusing
+ *  "no run script found" warning in builds that never wanted symbol upload. */
+function usesCrashlytics(projectRoot: string): boolean {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')) as
+      { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+    return Boolean(deps['@capacitor-firebase/crashlytics']);
+  } catch {
+    return false;
+  }
+}
+
+/** Make iOS crash reports SYMBOLICATED (#279) — two halves that only work together.
+ *
+ *  1. `DEBUG_INFORMATION_FORMAT = dwarf-with-dsym` in EVERY configuration, Debug included.
+ *  2. The `Upload Crashlytics dSYMs` build phase, generalized out of Court's hand-edited pbxproj
+ *     (#275) so any Crashlytics project gets it.
+ *
+ *  **Why Debug too, when Xcode's default is plain `dwarf` there.** Debug is where the crash probes
+ *  run (#278) and where every device build we test with comes from. Court had the phase for weeks
+ *  and it exited early on every single build — correctly, by its own rule — so the console
+ *  accumulated 8 crashes it could not process. A symbolication pipeline that is only armed in the
+ *  configuration nobody debugs with is not a pipeline. The cost is `dsymutil` on the app binary
+ *  per build, which is small next to the frameworks that already produce dSYMs.
+ *
+ *  Strip-then-reinsert, like the archive warning: a presence check would pin whatever script text
+ *  the project was first healed with, so editing {@link DSYM_PHASE_BLOCK} later would leave every
+ *  existing project on the old one. Re-deriving is still idempotent — identical output means
+ *  nothing is written. */
+function healIosCrashlyticsDsyms(projectRoot: string): string | undefined {
+  if (!usesCrashlytics(projectRoot)) return undefined;
+  const pbxPath = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  if (!fs.existsSync(pbxPath)) return undefined;
+  const orig = fs.readFileSync(pbxPath, 'utf8');
+
+  // `dwarf` may be absent entirely (Xcode omits the key and defaults to it), so set it on every
+  // XCBuildConfiguration rather than only rewriting the ones that spell it out.
+  let text = setDsymFormatEverywhere(orig);
+  const inserted = insertDsymPhase(removeDsymPhase(text));
+  if (inserted === undefined) return undefined; // anchor missing — bail without a partial edit
+  text = inserted;
+
+  if (text === orig) return undefined;
+  fs.writeFileSync(pbxPath, text);
+  return 'synced the Crashlytics dSYM upload phase + dwarf-with-dsym in every configuration (#279)';
+}
+
+/** Force `DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"` in every build configuration — rewriting
+ *  the ones that name it, and ADDING it to the ones that leave it to Xcode's default (which is
+ *  `dwarf` for Debug, i.e. no dSYM at all). Pure. */
+function setDsymFormatEverywhere(pbx: string): string {
+  const want = 'DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";';
+  return insertMissingDsymFormat(pbx.replace(/DEBUG_INFORMATION_FORMAT = [^;]+;/g, want), want);
+}
+
+/** Add the key to any `buildSettings` dict that lacks it. Split out so the regex walk is readable:
+ *  it scans dict-by-dict rather than globally, because "does this config already have the key" is
+ *  a per-dict question and a global `includes` would answer for the whole file. Pure. */
+function insertMissingDsymFormat(pbx: string, want: string): string {
+  const lines = pbx.split('\n');
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    out.push(lines[i]);
+    const open = /^(\t+)buildSettings = \{$/.exec(lines[i]);
+    if (!open) continue;
+    // Find this dict's extent to decide whether the key is already inside it.
+    let depth = 1;
+    let j = i + 1;
+    let has = false;
+    for (; j < lines.length && depth > 0; j++) {
+      if (/\{\s*$/.test(lines[j])) depth++;
+      if (/^\s*\};?\s*$/.test(lines[j])) depth--;
+      if (depth > 0 && lines[j].includes('DEBUG_INFORMATION_FORMAT')) has = true;
+    }
+    if (!has) out.push(`${open[1]}\t${want}`);
+  }
+  return out.join('\n');
+}
+
+/** Drop the dSYM phase's `buildPhases` reference AND its object. Mirrors
+ *  {@link removeArchiveWarnPhase}; see its comment for the line shapes. Pure. */
+function removeDsymPhase(pbx: string): string {
+  if (!pbx.includes(DSYM_PHASE_NAME)) return pbx;
+  const lines = pbx.split('\n');
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].includes(DSYM_PHASE_NAME)) { out.push(lines[i]); continue; }
+    if (/,\s*$/.test(lines[i])) continue;
+    if (/= \{\s*$/.test(lines[i])) {
+      while (i < lines.length && !/^\s*\};\s*$/.test(lines[i])) i++;
+      continue;
+    }
+    out.push(lines[i]);
+  }
+  return out.join('\n').replace(
+    /\/\* Begin PBXShellScriptBuildPhase section \*\/\n\/\* End PBXShellScriptBuildPhase section \*\/\n\n?/, '');
+}
+
+/** Add the dSYM phase's reference + object. LAST in `buildPhases` — it needs the dSYM the build
+ *  just produced. Returns undefined (bail, no partial edit) when the anchor is missing. Pure. */
+function insertDsymPhase(pbx: string): string | undefined {
+  const lines = pbx.split('\n');
+  const resIdx = lines.findIndex((l) => /^\s*[0-9A-Fa-f]{6,} \/\* Resources \*\/,$/.test(l));
+  if (resIdx < 0) return undefined;
+  // After Resources, skip any phases already listed (e.g. the archive warning) so this one is last.
+  let at = resIdx + 1;
+  while (at < lines.length && /^\s*[0-9A-Fa-f]{6,} \/\* .* \*\/,$/.test(lines[at])) at++;
+  lines.splice(at, 0, `\t\t\t\t${GD_UUID.dsymUploadPhase} /* ${DSYM_PHASE_NAME} */,`);
+  const text = lines.join('\n');
+
+  // ⚠️ Insert at the END of an existing section, where {@link insertArchiveWarnPhase} inserts at
+  // the START — and that asymmetry is the fix for a measured defect, not an accident. Both used to
+  // splice in right after the section-open line, so each put ITSELF first and shoved the other to
+  // second: on every project open the two phase objects swapped places, each heal rewrote the
+  // pbxproj, and each returned a "synced …" note for work that netted to nothing. Measured on
+  // games/court 2026-08-20 — two writes of equal length and opposite content, with the file
+  // identical before and after the pass. Deterministic slots (warning first, dSYM last) make both
+  // heals fixed points on an already-correct file, so a note now means a real change.
+  const sectionOpen = '/* Begin PBXShellScriptBuildPhase section */';
+  const sectionEnd = '/* End PBXShellScriptBuildPhase section */';
+  if (text.includes(sectionOpen) && text.includes(sectionEnd)) {
+    return text.replace(sectionEnd,
+      DSYM_PHASE_BLOCK.split('\n').slice(1, -2).join('\n') + '\n' + sectionEnd);
+  }
+  const anchor = '/* Begin PBXSourcesBuildPhase section */';
+  if (!text.includes(anchor)) return undefined;
+  return text.replace(anchor, DSYM_PHASE_BLOCK + '\n' + anchor);
+}
+
+/** Crashlytics Gradle plugin version (#282, generalized out of Court's hand-edited
+ *  `android/build.gradle`, #275). Needed for the mapping.txt / NDK symbol upload that makes a
+ *  native or minified stack readable — without it the SDK still reports, but the frames come
+ *  back obfuscated on any build with minifyEnabled on. */
+const CRASHLYTICS_GRADLE_PLUGIN_VERSION = '3.0.3';
+
+/** FALLBACK Crashlytics NDK artifact version (#282, generalized out of Court's hand-edited
+ *  `android/app/build.gradle`, #279) — used only when the project does not expose
+ *  `firebaseCrashlyticsVersion`.
+ *
+ *  ⚠️ **The emitted line PREFERS the project's own resolved version, and that is deliberate.**
+ *  `firebase-crashlytics-ndk` and the `firebase-crashlytics` artifact `@capacitor-firebase/crashlytics`
+ *  pulls in are a MATCHED PAIR: a mismatch is a RUNTIME failure — silently absent NDK crash
+ *  reporting — not a resolution error, so nothing in a build log would catch it. Court's hand
+ *  edit read `rootProject.ext.firebaseCrashlyticsVersion` for exactly that reason, so the
+ *  generated block keeps the expression rather than freezing a number that drifts the moment the
+ *  plugin bumps. This constant is the no-property fallback only, and matches the plugin's current
+ *  default. */
+const CRASHLYTICS_NDK_VERSION = '20.0.3';
+
+/** The NDK dependency's version expression — the project's own `firebaseCrashlyticsVersion` when
+ *  it has one, else {@link CRASHLYTICS_NDK_VERSION}. See that constant for why this is an
+ *  expression and not a literal. */
+const CRASHLYTICS_NDK_VERSION_EXPR =
+  `\${project.hasProperty('firebaseCrashlyticsVersion') ? rootProject.ext.firebaseCrashlyticsVersion : '${CRASHLYTICS_NDK_VERSION}'}`;
+
+const CRASHLYTICS_CLASSPATH_BEGIN = '// modoki:crashlytics-classpath-begin (#282)';
+const CRASHLYTICS_CLASSPATH_END = '// modoki:crashlytics-classpath-end';
+const CRASHLYTICS_NDK_BEGIN = '// modoki:crashlytics-ndk-begin (#282)';
+const CRASHLYTICS_NDK_END = '// modoki:crashlytics-ndk-end';
+const CRASHLYTICS_APPLY_BEGIN = '// modoki:crashlytics-apply-begin (#282)';
+const CRASHLYTICS_APPLY_END = '// modoki:crashlytics-apply-end';
+
+/** Normalize a file's line endings for editing, and put them back on the way out.
+ *
+ *  Every gradle edit below is written as LF-only text — fences, anchors, inserted blocks. Handed a
+ *  CRLF file those edits produce a MIXED-ending file that differs from its input, so the heal
+ *  rewrites it, and rewrites it again on the next pass: measured drift of one extra blank line per
+ *  run before it settled, with the inserted block left bare-LF inside a CRLF file. `.gitattributes`
+ *  pins `*.gradle text eol=lf`, so this needs a non-git write path to happen at all — but this repo
+ *  has a documented history of Windows-only EOL bugs (docs/windows.md) and the guard is one regex.
+ *  Edit in LF, restore whatever the file had. */
+function eolSafe(orig: string): { lf: string; restore: (edited: string) => string } {
+  const crlf = orig.includes('\r\n');
+  return {
+    lf: crlf ? orig.replace(/\r\n/g, '\n') : orig,
+    restore: (edited: string) => (crlf ? edited.replace(/\n/g, '\r\n') : edited),
+  };
+}
+
+/** Add the Crashlytics Gradle plugin classpath to `android/build.gradle`'s
+ *  `buildscript { dependencies { … } }` block — generalized out of Court's hand edit (#275).
+ *  Anchored after the `com.google.gms:google-services` classpath when present (Crashlytics rides
+ *  the same `google-services.json`), otherwise after the AGP classpath every project has.
+ *  Strip-then-reinsert, like {@link healIosCrashlyticsDsyms} — see its doc comment for why a
+ *  presence check is the wrong shape here too: a version bump to the constant above must reach
+ *  every project that already has the block, not just fresh ones. Also migrates a pre-existing
+ *  HAND-EDITED (unmarked) classpath line — any pinned version — to the fenced form, so a
+ *  hand-edited project (Court, 3d-test) ends up with exactly one copy. */
+function healAndroidCrashlyticsClasspath(projectRoot: string): string | undefined {
+  const gradle = path.join(projectRoot, 'android', 'build.gradle');
+  if (!fs.existsSync(gradle)) return undefined;
+  const raw = fs.readFileSync(gradle, 'utf8');
+  const { lf: orig, restore } = eolSafe(raw);
+
+  const fenceRe = new RegExp(`\\n*[ \\t]*${escapeRe(CRASHLYTICS_CLASSPATH_BEGIN)}[\\s\\S]*?${escapeRe(CRASHLYTICS_CLASSPATH_END)}\\n?`);
+  let text = orig.replace(fenceRe, '\n');
+  text = text.replace(/^[ \t]*classpath[^\n]*firebase-crashlytics-gradle[^\n]*\r?\n?/gm, '');
+
+  const gmsAnchor = /^([ \t]*classpath\s+['"]com\.google\.gms:google-services:[^'"]*['"])[ \t]*(?:\/\/[^\n]*)?$/m;
+  const agpAnchor = /^([ \t]*classpath\s+['"]com\.android\.tools\.build:gradle:[^'"]*['"])[ \t]*(?:\/\/[^\n]*)?$/m;
+  const block = `        ${CRASHLYTICS_CLASSPATH_BEGIN}\n`
+    + `        classpath 'com.google.firebase:firebase-crashlytics-gradle:${CRASHLYTICS_GRADLE_PLUGIN_VERSION}'\n`
+    + `        ${CRASHLYTICS_CLASSPATH_END}`;
+  if (gmsAnchor.test(text)) text = text.replace(gmsAnchor, `$1\n${block}`);
+  else if (agpAnchor.test(text)) text = text.replace(agpAnchor, `$1\n${block}`);
+  else return undefined; // neither anchor found — bail without a partial edit
+
+  if (text === orig) return undefined;
+  fs.writeFileSync(gradle, restore(text));
+  return 'Gradle plugin classpath';
+}
+
+/** Add the Crashlytics NDK artifact to `android/app/build.gradle`'s top-level
+ *  `dependencies { … }` block — generalized out of Court's hand edit (#279); see
+ *  {@link CRASHLYTICS_NDK_VERSION}'s comment for why the version is pinned. Inserted immediately
+ *  after the `dependencies {` line — Gradle does not care about order. Strip-then-reinsert +
+ *  hand-edit migration, like its sibling above. */
+function healAndroidCrashlyticsNdk(projectRoot: string): string | undefined {
+  const gradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  if (!fs.existsSync(gradle)) return undefined;
+  const raw = fs.readFileSync(gradle, 'utf8');
+  const { lf: orig, restore } = eolSafe(raw);
+
+  const fenceRe = new RegExp(`\\n*[ \\t]*${escapeRe(CRASHLYTICS_NDK_BEGIN)}[\\s\\S]*?${escapeRe(CRASHLYTICS_NDK_END)}\\n?`);
+  let text = orig.replace(fenceRe, '\n');
+  text = text.replace(/^[ \t]*implementation[^\n]*firebase-crashlytics-ndk[^\n]*\r?\n?/gm, '');
+
+  // Only a trailing COMMENT is tolerated here, never arbitrary text: `dependencies { impl 'x' }`
+  // is a one-line block, and inserting "after" it would put the artifact OUTSIDE the block.
+  const anchor = /^(dependencies \{)[ \t]*(?:\/\/[^\n]*)?$/m;
+  if (!anchor.test(text)) return undefined;
+  const block = `    ${CRASHLYTICS_NDK_BEGIN}\n`
+    + `    implementation "com.google.firebase:firebase-crashlytics-ndk:${CRASHLYTICS_NDK_VERSION_EXPR}"\n`
+    + `    ${CRASHLYTICS_NDK_END}`;
+  text = text.replace(anchor, `$1\n${block}`);
+
+  if (text === orig) return undefined;
+  fs.writeFileSync(gradle, restore(text));
+  return 'NDK artifact';
+}
+
+/** Add `apply plugin: 'com.google.firebase.crashlytics'` inside the SAME `servicesJSON` guard as
+ *  `com.google.gms.google-services` — generalized out of Court's hand edit (#275/#279).
+ *  ⚠️ Placement is load-bearing: Crashlytics rides the same `google-services.json` as
+ *  google-services, and applying it OUTSIDE the guard fails the build for a project that has none.
+ *  If the guard is absent (no `com.google.gms.google-services` apply-plugin line to anchor on),
+ *  this edit is skipped — never invented — while its two siblings above still run. */
+function healAndroidCrashlyticsApplyPlugin(projectRoot: string): string | undefined {
+  const gradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  if (!fs.existsSync(gradle)) return undefined;
+  const raw = fs.readFileSync(gradle, 'utf8');
+  const { lf: orig, restore } = eolSafe(raw);
+
+  const fenceRe = new RegExp(`\\n*[ \\t]*${escapeRe(CRASHLYTICS_APPLY_BEGIN)}[\\s\\S]*?${escapeRe(CRASHLYTICS_APPLY_END)}\\n?`);
+  let text = orig.replace(fenceRe, '\n');
+  text = text.replace(/^[ \t]*apply plugin:\s*['"]com\.google\.firebase\.crashlytics['"][ \t]*\r?\n?/gm, '');
+
+  const anchor = /^([ \t]*apply plugin:\s*['"]com\.google\.gms\.google-services['"])[ \t]*(?:\/\/[^\n]*)?$/m;
+  if (!anchor.test(text)) return undefined; // guard absent — don't invent it, just skip this edit
+  const block = `        ${CRASHLYTICS_APPLY_BEGIN}\n`
+    + `        apply plugin: 'com.google.firebase.crashlytics'\n`
+    + `        ${CRASHLYTICS_APPLY_END}`;
+  text = text.replace(anchor, `$1\n${block}`);
+
+  if (text === orig) return undefined;
+  fs.writeFileSync(gradle, restore(text));
+  return 'apply plugin';
+}
+
+/** Generalizes Court's hand-edited Android Crashlytics gradle wiring (#275, #279) the way
+ *  {@link healIosCrashlyticsDsyms} generalizes the iOS symbol-upload phase — any project
+ *  depending on `@capacitor-firebase/crashlytics` gets it automatically. Same gate
+ *  ({@link usesCrashlytics}), same strip-then-reinsert reasoning, three fenced edits across two
+ *  files: the Gradle-plugin classpath, the NDK artifact, and the apply-plugin line (skipped, not
+ *  invented, when its guard is absent). */
+function healAndroidCrashlytics(projectRoot: string): string | undefined {
+  if (!usesCrashlytics(projectRoot)) return undefined;
+  // Each sub-heal returns its own label, or undefined when it changed nothing. Taking the label
+  // from the return value rather than repeating it here keeps the two from drifting apart.
+  const changed = [
+    healAndroidCrashlyticsClasspath(projectRoot),
+    healAndroidCrashlyticsNdk(projectRoot),
+    healAndroidCrashlyticsApplyPlugin(projectRoot),
+  ].filter((c): c is string => c !== undefined);
+
+  // ⚠️ SAY SO when the load-bearing step is missing, instead of reporting the other two as a
+  // success. Without `apply plugin: 'com.google.firebase.crashlytics'` the classpath and the NDK
+  // artifact do nothing — no mapping upload, no native symbolication — and that is precisely the
+  // half-wired shape #282 exists to end (3d-test carried a classpath with no NDK artifact for
+  // weeks and looked configured). The apply step is skipped only when there is no
+  // `com.google.gms.google-services` apply to anchor on, which also means the project has no
+  // Firebase config at all; silence there reads as "done".
+  const appGradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  if (changed.length > 0 && fs.existsSync(appGradle)
+      && !fs.readFileSync(appGradle, 'utf8').includes("apply plugin: 'com.google.firebase.crashlytics'")) {
+    changed.push('⚠️ apply-plugin NOT wired — no `com.google.gms.google-services` apply to anchor on,'
+      + ' so Crashlytics symbol upload is inert');
+  }
+  if (changed.length === 0) return undefined;
+  return `synced Android Crashlytics gradle wiring — ${changed.join(', ')} (#282)`;
 }
 
 /** The Gradle sibling of {@link healIosArchiveWarning}. Appends (flag on) or removes
@@ -777,12 +1265,120 @@ function healAndroidOrientation(projectRoot: string, cap: ProjectConfig['capacit
   return `synced Android screenOrientation=${value} (AndroidManifest)`;
 }
 
+/** The generated `<meta-data>` pointing Android's GameManager at our game-mode config,
+ *  fenced like the debug-build block so the heal rewrites only its own element. */
+const ANDROID_GAME_MODE_META_BEGIN = '        <!-- modoki:game-mode-begin — generated by healNativeConfig -->';
+const ANDROID_GAME_MODE_META_END = '        <!-- modoki:game-mode-end -->';
+
+/** `res/xml/game_mode_config.xml`. Written verbatim; the heal rewrites it whenever it drifts.
+ *
+ *  **`supports*GameMode` is `false` because we do not read the mode.** Declaring support is a
+ *  promise that the app calls `GameManager.getGameMode()` and adapts itself; the engine has no
+ *  binding for it at all (grep: every `GameManager` hit in `runtime/` is Modoki's own manager
+ *  registry). Claiming it would be CLAUDE.md's "an unwired field is a lie with a tooltip", aimed at
+ *  the OS instead of the Inspector — and the plausible cost is real: a user selecting Battery game
+ *  mode gets an app that advertised it would economise and then does nothing. Both flipped from
+ *  `true` during the #228 close-out review. **Flip one to `true` only in the same change that adds
+ *  the `getGameMode()` binding and makes the engine act on it.**
+ *
+ *  The two interventions are opted OUT of, and they are what this file is actually FOR. They are
+ *  Android's backward-compat handling for games that do not manage their own quality, and this
+ *  engine does: `allowGameDownscaling` lets the OS drop our render resolution and
+ *  `allowGameFpsOverride` lets it cap our frame rate, both behind the engine's back. An OS-imposed
+ *  fps cap would also corrupt live tier calibration (#227), which reads measured frame times to
+ *  decide a device's tier — it would demote a device for a slowdown the OS itself imposed. */
+const ANDROID_GAME_MODE_CONFIG_XML = `<?xml version="1.0" encoding="utf-8"?>
+<!-- Generated by Modoki (healNativeConfig). Do not hand-edit. -->
+<game-mode-config
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:supportsBatteryGameMode="false"
+    android:supportsPerformanceGameMode="false"
+    android:allowGameDownscaling="false"
+    android:allowGameFpsOverride="false" />
+`;
+
+/** Declare the app a GAME to the platform — `android:appCategory="game"` on `<application>`
+ *  plus a `game_mode_config.xml` resource wired by `<meta-data>` (#228).
+ *
+ *  Every Modoki output is a game, so this is unconditional rather than a config knob.
+ *
+ *  ⚠️ **This is NOT a scheduling fix, and was measured not to be one.** It was added while chasing
+ *  #228 (frame-critical threads pinned to the LITTLE cluster) on the theory that the OEM
+ *  game-performance path is keyed on the app being RECOGNISED as a game — no Modoki project
+ *  declared either key, and `dumpsys game` reported an empty GameManagerService, so that path had
+ *  never been engaged. Declaring it DID register the app (the dump now lists the package), and
+ *  moved thread placement **not at all**: A/B/A on a Galaxy A23, 30 samples per arm, RenderThread
+ *  on a big core 3/30 → 4/30 → 4/30, every other frame thread ~0/30, cpu7 median 985 MHz of 2203
+ *  in all three arms. Do not re-run that experiment; do not cite this heal as a perf win.
+ *
+ *  It stays because the two intervention opt-outs below are worth having on their own, and because
+ *  correct app metadata is correct regardless.
+ *
+ *  Both keys degrade silently on older platforms: `appCategory` is API 26+ and the game-mode
+ *  config is API 33+; an older device ignores an attribute it does not know.
+ *
+ *  Idempotent. No-op without `android/`. */
+function healAndroidGameMode(projectRoot: string): string | undefined {
+  const main = path.join(projectRoot, 'android', 'app', 'src', 'main');
+  const manifest = path.join(main, 'AndroidManifest.xml');
+  if (!fs.existsSync(manifest)) return undefined;
+  const changed: string[] = [];
+
+  const xmlDir = path.join(main, 'res', 'xml');
+  const xmlFile = path.join(xmlDir, 'game_mode_config.xml');
+  const existingXml = fs.existsSync(xmlFile) ? fs.readFileSync(xmlFile, 'utf8') : undefined;
+  if (existingXml !== ANDROID_GAME_MODE_CONFIG_XML) {
+    fs.mkdirSync(xmlDir, { recursive: true });
+    fs.writeFileSync(xmlFile, ANDROID_GAME_MODE_CONFIG_XML);
+    changed.push('res/xml/game_mode_config.xml');
+  }
+
+  const orig = fs.readFileSync(manifest, 'utf8');
+  let text = orig;
+  const appTagRe = /<application\b[^>]*>/;
+  const m = text.match(appTagRe);
+  if (m) {
+    // `() => tag` rather than a string: a replacement string would eat `$&`/`$1` sequences,
+    // and this manifest legitimately carries `${applicationId}` elsewhere.
+    const tag = /android:appCategory="[^"]*"/.test(m[0])
+      ? m[0].replace(/android:appCategory="[^"]*"/, 'android:appCategory="game"')
+      : m[0].replace(/<application\b/, '<application\n        android:appCategory="game"');
+    text = text.replace(appTagRe, () => tag);
+
+    const block = [
+      ANDROID_GAME_MODE_META_BEGIN,
+      '        <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />',
+      ANDROID_GAME_MODE_META_END,
+    ].join('\n');
+    const fenceRe = new RegExp(`[ \\t]*${escapeRe(ANDROID_GAME_MODE_META_BEGIN.trim())}[\\s\\S]*?${escapeRe(ANDROID_GAME_MODE_META_END.trim())}`);
+    if (fenceRe.test(text)) {
+      text = text.replace(fenceRe, () => block);
+    } else {
+      const close = text.lastIndexOf('</application>');
+      if (close !== -1) {
+        const lineStart = text.lastIndexOf('\n', close) + 1;
+        text = text.slice(0, lineStart) + block + '\n' + text.slice(lineStart);
+      }
+    }
+  }
+  if (text !== orig) {
+    fs.writeFileSync(manifest, text);
+    changed.push('AndroidManifest');
+  }
+  if (changed.length === 0) return undefined;
+  return `synced Android game mode: appCategory=game + game_mode_config (${changed.join(', ')})`;
+}
+
 /** The generated `<meta-data>` that carries `build.debugBuild` into the Android app,
  *  fenced by XML comments so the heal rewrites only its own element. */
 const ANDROID_DEBUG_META_BEGIN = '        <!-- modoki:debug-build-begin — generated from project.config.json (build.debugBuild) -->';
 const ANDROID_DEBUG_META_END = '        <!-- modoki:debug-build-end -->';
 /** Must match `GameDebugPlugin.META_DEBUG_BUILD`. */
 const ANDROID_DEBUG_META_NAME = 'com.modokiengine.gamedebug.DEBUG_BUILD';
+
+/** iOS Info.plist mirror of {@link ANDROID_DEBUG_META_NAME}. Read by
+ *  `GameDebugPlugin.swift`'s `isDebugBuildEnabled()` (#278). */
+const IOS_DEBUG_BUILD_PLIST_KEY = 'ModokiDebugBuild';
 
 /** Sync `build.debugBuild` into the Android app as an AndroidManifest `<meta-data>`
  *  the game-debug plugin reads (#112).
@@ -822,6 +1418,30 @@ function healAndroidDebugBuildMetaData(projectRoot: string, debugBuild: boolean)
   if (text === orig) return undefined;
   fs.writeFileSync(manifest, text);
   return `synced Android ${ANDROID_DEBUG_META_NAME}=${debugBuild} (from build.debugBuild)`;
+}
+
+/** Sync the iOS Info.plist's `ModokiDebugBuild` flag from `build.debugBuild` — the iOS MIRROR of
+ *  {@link healAndroidDebugBuildMetaData}, and the gate the plugin's fault triggers read (#278).
+ *
+ *  Until this existed, `GameDebugPlugin.swift` checked NOTHING: Android refuses every plugin
+ *  method unless its manifest meta-data is on, while iOS kept the bridge out of shipped games only
+ *  because JS never called `startServer`. That asymmetry was harmless for a server nobody starts
+ *  and is not harmless for `triggerFault`, which kills the app on demand — a release binary must
+ *  not carry a reachable way to do that.
+ *
+ *  Written BOTH ways (true and false), like the Local Network keys and unlike a
+ *  write-once flag: a project that turns `debugBuild` off must lose the capability on the next
+ *  heal, not keep it because the key was already there.
+ *
+ *  The KEY NAME is the contract with `GameDebugPlugin.debugBuildPlistKey` — keep them in sync. */
+function healIosDebugBuildInfoPlist(projectRoot: string, debugBuild: boolean): string | undefined {
+  const plist = path.join(projectRoot, 'ios', 'App', 'App', 'Info.plist');
+  if (!fs.existsSync(plist)) return undefined;
+  const orig = fs.readFileSync(plist, 'utf8');
+  const text = setPlistKey(orig, IOS_DEBUG_BUILD_PLIST_KEY, debugBuild ? '<true/>' : '<false/>');
+  if (text === orig) return undefined;
+  fs.writeFileSync(plist, text);
+  return `synced iOS ${IOS_DEBUG_BUILD_PLIST_KEY}=${debugBuild} (from build.debugBuild)`;
 }
 
 /** Sync the iOS deployment target from `build.iosMinVersion`.
@@ -910,12 +1530,186 @@ function healAndroidMinSdk(projectRoot: string, minSdk: number): string | undefi
   return `synced Android minSdkVersion = ${minSdk} (from build.androidMinSdk)`;
 }
 
+/** A marketing version is free-form but must not be junk we paste into a gradle string or a
+ *  pbxproj literal. Dotted digits only — what both stores accept and what every scaffold writes. */
+function isMarketingVersion(v: unknown): v is string {
+  return typeof v === 'string' && /^\d+(\.\d+)*$/.test(v) && v.length <= 32;
+}
+
+/** A build number is the monotonic integer both stores dedupe by. */
+function isBuildNumber(n: unknown): n is number {
+  return Number.isInteger(n) && (n as number) > 0 && (n as number) < 2_100_000_000;
+}
+
+/** What a native file currently says about its build number — the input to the never-lower
+ *  decision below. Three cases, and the third is the one that matters: a value we cannot ORDER
+ *  against is not the same as no value, and treating it as "no value" would let the write proceed
+ *  unguarded. */
+type ExistingBuild =
+  | { kind: 'none' }                       // the key is not in this file — nothing to protect
+  | { kind: 'ok'; max: number }            // every occurrence is a plain integer
+  | { kind: 'unreadable'; why: string };   // present, but not comparable
+
+/** Read the build number a native file currently carries.
+ *
+ *  Returns the MAX of the occurrences, not the first: a pbxproj carries the key once per build
+ *  configuration and a gradle file could carry it per flavour, so "what is this project at" is the
+ *  highest of them — reading the first would let a Debug-only 1 authorise lowering a Release 11.
+ *
+ *  ⚠️ **`unreadable` is load-bearing, not defensive tidiness.** Two shapes reach it, and both
+ *  silently defeated the never-lower guard before it existed:
+ *   - a **dotted** value. `CURRENT_PROJECT_VERSION = 1.2;` is legal (Apple compares CFBundleVersion
+ *     component-wise, so 1.2 > 1), but it is not an integer to compare. Skipping it left `current`
+ *     null, the guard's `current !== null` false, and the write LOWERED 1.2 to 1 — the exact
+ *     rejection this whole heal exists to prevent, produced by the code preventing it.
+ *   - a value the regex cannot see at all, which is how this breaks NEXT: AGP 8 writes
+ *     `versionCode = 1`, and these very build.gradle files already mix that assignment syntax
+ *     (`namespace = `, `compileSdk = `). The patterns below accept both forms now, but the point
+ *     of this branch is that a THIRD form arriving later is reported rather than silently
+ *     unmanaged. */
+function readExistingBuild(text: string, re: RegExp, key: string): ExistingBuild {
+  let best: number | null = null;
+  let dotted = false;
+  let found = false;
+  for (const m of text.matchAll(re)) {
+    found = true;
+    const raw = m[m.length - 1];
+    if (!/^\d+$/.test(raw)) { dotted = true; continue; }
+    const n = parseInt(raw, 10);
+    if (best === null || n > best) best = n;
+  }
+  if (dotted) {
+    return { kind: 'unreadable', why: `${key} is not a plain integer here, so it cannot be ordered against` };
+  }
+  if (!found) {
+    // The key is in the file but in a shape the pattern does not match (a variable reference, or a
+    // syntax we have not met). Saying so beats writing nothing and reporting nothing.
+    return text.includes(key)
+      ? { kind: 'unreadable', why: `${key} is present but not in a form this heal can read` }
+      : { kind: 'none' };
+  }
+  return { kind: 'ok', max: best! };
+}
+
+/** The never-lower decision, shared so both platforms cannot drift apart. Returns whether to write
+ *  and, when not, the note explaining it — a refusal the owner never sees is a refusal that reads
+ *  as "the number I typed is the number that ships". */
+function decideBuildWrite(
+  existing: ExistingBuild,
+  buildNumber: number,
+  label: string,
+  store: string,
+): { write: boolean; note?: string } {
+  if (existing.kind === 'unreadable') {
+    return { write: false, note: `left ${label} alone: ${existing.why}. Set it by hand, or normalise it to a plain integer so app.buildNumber can manage it.` };
+  }
+  if (existing.kind === 'ok' && existing.max > buildNumber) {
+    return {
+      write: false,
+      note:
+        `REFUSED to lower ${label} ${existing.max} -> ${buildNumber}: ${store} rejects a build ` +
+        `number it has already seen, and does it silently. Raise app.buildNumber to at least ` +
+        `${existing.max + 1} before the next upload.`,
+    };
+  }
+  return { write: true };
+}
+
+/** Sync the Android marketing version + build number from `app.version` / `app.buildNumber`.
+ *
+ *  ⚠️ **`versionCode` is never LOWERED.** Play refuses a `versionCode` it has already seen and
+ *  does so SILENTLY — the bundle never attaches and the release page reports three errors that
+ *  all mean "this release is empty", none of which mention versions (#199). So a config value
+ *  BELOW what the project already carries is the single most expensive thing this heal could
+ *  write, and it is exactly what a stale config, a fresh clone, or a forgotten bump produces.
+ *  The refusal is reported rather than swallowed: the owner has to see that the number they
+ *  edited is not the number that will ship.
+ *
+ *  `versionName` has no such rule — it is a display string with no ordering requirement, so it
+ *  is synced in both directions.
+ *
+ *  Rewrites EVERY occurrence, mirroring healAndroidMinSdk/healIosDeploymentTarget: a flavoured
+ *  gradle file can carry the keys more than once and healing only the first leaves the shipping
+ *  variant behind. */
+function healAndroidVersion(projectRoot: string, version: unknown, buildNumber: unknown): string | undefined {
+  const gradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  if (!fs.existsSync(gradle)) return undefined;
+  const orig = fs.readFileSync(gradle, 'utf8');
+  let text = orig;
+  const notes: string[] = [];
+
+  // Both the Groovy (`versionCode 1`) and the AGP-8 assignment (`versionCode = 1`) forms, with the
+  // file's OWN separator preserved on write — these build.gradle files already mix the two
+  // (`namespace = `, `compileSdk = `), so normalising one to the other would be a gratuitous diff.
+  if (isMarketingVersion(version)) {
+    text = text.replace(/(versionName)(\s*=\s*|\s+)"[^"]*"/g, (_m, k: string, sep: string) => `${k}${sep}"${version}"`);
+  }
+
+  if (isBuildNumber(buildNumber)) {
+    const decision = decideBuildWrite(
+      readExistingBuild(text, /versionCode(?:\s*=\s*|\s+)([0-9.]+)/g, 'versionCode'),
+      buildNumber, 'Android versionCode', 'Play',
+    );
+    if (decision.note) notes.push(decision.note);
+    if (decision.write) {
+      text = text.replace(/(versionCode)(\s*=\s*|\s+)[0-9.]+/g, (_m, k: string, sep: string) => `${k}${sep}${buildNumber}`);
+    }
+  }
+
+  if (text !== orig) {
+    fs.writeFileSync(gradle, text);
+    notes.unshift(`synced Android versionName/versionCode (from app.version/app.buildNumber)`);
+  }
+  return notes.length > 0 ? notes.join(' — ') : undefined;
+}
+
+/** The iOS half — `MARKETING_VERSION` (read by Info.plist as `CFBundleShortVersionString` through
+ *  `$(MARKETING_VERSION)`) and `CURRENT_PROJECT_VERSION` (`CFBundleVersion`). Same never-lower
+ *  rule as {@link healAndroidVersion}: App Store Connect refuses a duplicate `CFBundleVersion`
+ *  with an equally indirect message.
+ *
+ *  ⚠️ The two platforms' counters drift APART in practice — `games/iap-test` measured Android 11
+ *  against iOS 5 (2026-08-20), because each store counts its own uploads. One `app.buildNumber`
+ *  still serves both: the stores only require the number to RISE, so the lagging platform takes a
+ *  one-time jump to catch up and both stay valid from then on. That jump is why the never-lower
+ *  guard is per-platform rather than computed once. */
+function healIosVersion(projectRoot: string, version: unknown, buildNumber: unknown): string | undefined {
+  const pbx = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  if (!fs.existsSync(pbx)) return undefined;
+  const orig = fs.readFileSync(pbx, 'utf8');
+  let text = orig;
+  const notes: string[] = [];
+
+  if (isMarketingVersion(version)) {
+    text = text.replace(/MARKETING_VERSION = [0-9.]+;/g, `MARKETING_VERSION = ${version};`);
+  }
+
+  if (isBuildNumber(buildNumber)) {
+    const decision = decideBuildWrite(
+      readExistingBuild(text, /CURRENT_PROJECT_VERSION = ([0-9.]+);/g, 'CURRENT_PROJECT_VERSION'),
+      buildNumber, 'iOS CURRENT_PROJECT_VERSION', 'App Store Connect',
+    );
+    if (decision.note) notes.push(decision.note);
+    if (decision.write) {
+      text = text.replace(/CURRENT_PROJECT_VERSION = [0-9.]+;/g, `CURRENT_PROJECT_VERSION = ${buildNumber};`);
+    }
+  }
+
+  if (text !== orig) {
+    fs.writeFileSync(pbx, text);
+    notes.unshift(`synced iOS MARKETING_VERSION/CURRENT_PROJECT_VERSION (from app.version/app.buildNumber)`);
+  }
+  return notes.length > 0 ? notes.join(' — ') : undefined;
+}
+
 /** The generated immersive-mode block in MainActivity.java. Fenced by marker comments so the
  *  heal can find, replace, or remove exactly its own code and never touch a hand edit. */
 const IMMERSIVE_BEGIN = '    // modoki:immersive-begin — generated from project.config.json (capacitor.statusBarHidden)';
 const IMMERSIVE_END = '    // modoki:immersive-end';
 const IMMERSIVE_IMPORTS = [
+  'import android.os.Build;',
   'import android.os.Bundle;',
+  'import android.view.WindowManager;',
   'import androidx.core.view.WindowCompat;',
   'import androidx.core.view.WindowInsetsCompat;',
   'import androidx.core.view.WindowInsetsControllerCompat;',
@@ -937,6 +1731,18 @@ const IMMERSIVE_BODY = [
   '    }',
   '',
   '    private void applyImmersiveMode() {',
+  '        // Lay the window out INTO the display cutout. `setDecorFitsSystemWindows(false)`',
+  '        // below only opts out of fitting the system BARS — without this the window is',
+  '        // still placed beneath the cutout, and because the bars are hidden nothing draws',
+  '        // there: the window background shows through as a black band (measured 59px on a',
+  '        // Galaxy A23). It is also what makes `env(safe-area-inset-*)` report anything at',
+  '        // all — a window that never reaches the cutout has no inset to tell CSS about.',
+  '        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {',
+  '            WindowManager.LayoutParams lp = getWindow().getAttributes();',
+  '            lp.layoutInDisplayCutoutMode =',
+  '                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;',
+  '            getWindow().setAttributes(lp);',
+  '        }',
   '        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);',
   '        WindowInsetsControllerCompat c =',
   '            WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());',
@@ -1041,6 +1847,13 @@ export function healNativeConfig(projectRoot: string): HealResult {
     if (sp) notes.push(sp);
     const ams = healAndroidMinSdk(projectRoot, cfg.build.androidMinSdk);
     if (ams) notes.push(ams);
+    // App version + build number → both platforms' native version fields (#199). Nothing
+    // managed these before, so every project shipped the scaffolder's hardcoded 1 — and a
+    // duplicate build number is refused SILENTLY by both stores.
+    const av = healAndroidVersion(projectRoot, cfg.app.version, cfg.app.buildNumber);
+    if (av) notes.push(av);
+    const iv = healIosVersion(projectRoot, cfg.app.version, cfg.app.buildNumber);
+    if (iv) notes.push(iv);
     // Orientation + status bar → native Info.plist / AndroidManifest.
     const io = healIosOrientationStatusBar(projectRoot, cfg.capacitor);
     if (io) notes.push(io);
@@ -1048,6 +1861,17 @@ export function healNativeConfig(projectRoot: string): HealResult {
     if (ao) notes.push(ao);
     const af = healAndroidFullscreen(projectRoot, cfg.capacitor);
     if (af) notes.push(af);
+    // Declare the app a game to the platform (#228) — unconditional, every Modoki output is one.
+    const agm = healAndroidGameMode(projectRoot);
+    if (agm) notes.push(agm);
+    // Symbolication (#279). Deliberately OUTSIDE the usesGameDebug block below and independent of
+    // build.debugBuild: whether crash reports are readable has nothing to do with the debug bridge,
+    // and a Release build needs it more, not less. It gates itself on Crashlytics being installed.
+    const ds = healIosCrashlyticsDsyms(projectRoot);
+    if (ds) notes.push(ds);
+    // Android half of the same concern (#282) — likewise independent of build.debugBuild.
+    const dsa = healAndroidCrashlytics(projectRoot);
+    if (dsa) notes.push(dsa);
     // game-debug heals — only for a project that depends on the bridge. Every one of
     // these keys on build.debugBuild and NOTHING else (#112): the Xcode/Gradle
     // configuration means optimization + symbols, never "is this a debug build".
@@ -1064,6 +1888,8 @@ export function healNativeConfig(projectRoot: string): HealResult {
       if (s) notes.push(s);
       const am = healAndroidDebugBuildMetaData(projectRoot, debugBuild);
       if (am) notes.push(am);
+      const ip = healIosDebugBuildInfoPlist(projectRoot, debugBuild);
+      if (ip) notes.push(ip);
       // Phase 2 — a WARNING, never a refusal (TestFlight ships with the flag on).
       const iw = healIosArchiveWarning(projectRoot, debugBuild);
       if (iw) notes.push(iw);

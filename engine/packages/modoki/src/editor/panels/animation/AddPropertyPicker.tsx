@@ -210,8 +210,8 @@ export default function AddPropertyPicker({
     <div style={overlay} onClick={onClose}>
       <div style={popover} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
-          <input autoFocus placeholder="Filter properties…" value={filter} onChange={(e) => setFilter(e.target.value)} style={input} />
-          <button style={btn} onClick={onClose}>×</button>
+          <input data-ui-id="animation.addProperty.filter" data-ui-kind="field" data-ui-label="Filter properties" autoFocus placeholder="Filter properties…" value={filter} onChange={(e) => setFilter(e.target.value)} style={input} />
+          <button data-ui-id="animation.addProperty.close" data-ui-kind="button" data-ui-label="Close" style={btn} onClick={onClose}>×</button>
         </div>
         {tree.length === 0 ? (
           <div style={{ color: '#666', padding: 8 }}>No animatable properties{filter ? ' match' : ''}.</div>
@@ -226,6 +226,7 @@ export default function AddPropertyPicker({
                 return (
                   <div
                     key={node.id}
+                    data-ui-id={`animation.addProperty.entity.${node.id}`} data-ui-kind="row" data-ui-label={node.name}
                     onClick={() => setSelectedId(node.id)}
                     title={node.path || '(root)'}
                     style={{ display: 'flex', alignItems: 'center', gap: 2, padding: '2px 4px', paddingLeft: 4 + node.depth * 12, cursor: 'pointer', background: isSel ? '#2a2a40' : 'transparent', color: isSel ? '#cdd' : '#aab', fontSize: 11, userSelect: 'none', whiteSpace: 'nowrap' }}
@@ -255,6 +256,7 @@ export default function AddPropertyPicker({
                 return (
                   <div
                     key={`${c.trait}.${c.field}`}
+                    data-ui-id={`animation.addProperty.field.${c.entityId}.${c.trait}.${c.field}`} data-ui-kind="row" data-ui-label={c.label} data-ui-state={on ? 'selected' : undefined}
                     onClick={() => toggleChecked(c)}
                     onDoubleClick={() => onAdd([c])}
                     title="Click to select · double-click to add just this one"
@@ -277,7 +279,7 @@ export default function AddPropertyPicker({
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
           <span style={{ color: '#889', fontSize: 11 }}>{checked.size} selected</span>
           <span style={{ flex: 1 }} />
-          <button style={{ ...btn, opacity: checked.size ? 1 : 0.4, cursor: checked.size ? 'pointer' : 'default' }} disabled={checked.size === 0} onClick={commitChecked}>
+          <button data-ui-id="animation.addProperty.add" data-ui-kind="button" data-ui-label="Add Properties" style={{ ...btn, opacity: checked.size ? 1 : 0.4, cursor: checked.size ? 'pointer' : 'default' }} disabled={checked.size === 0} onClick={commitChecked}>
             + Add {checked.size || ''} {checked.size === 1 ? 'Property' : 'Properties'}
           </button>
         </div>

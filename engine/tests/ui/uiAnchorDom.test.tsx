@@ -124,7 +124,7 @@ describe('UIAnchor trait → projection → DOM', () => {
 
   it('an authored UIElement.width loses to the stretched axis all the way to the DOM', async () => {
     // NarrationBand also carries width:90%, which the anchor clears — so the offsets
-    // are the only thing sizing that axis. See docs/todo.md (inert width/height).
+    // are the only thing sizing that axis. See docs/ui-system.md (inert width/height).
     const el = await renderFromTraits(
       { anchor: 'bottom-stretch', left: 5, leftUnit: '%', right: 5, rightUnit: '%' },
       { width: 90, widthUnit: '%' },

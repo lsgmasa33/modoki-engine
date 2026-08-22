@@ -25,6 +25,8 @@
  *  Guards `typeof window` so importing it headless is inert; no wall-clock / no RNG. */
 
 import type { InputSource } from './inputSources';
+import { noteUserInput } from '../core/userActivity';
+import { rawNow } from '../core/clock';
 import type { InputFrame } from '../core/inputActions';
 import { getPlayState, onPlayStateChange } from '../core/playState';
 
@@ -50,7 +52,12 @@ function editing(): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
 }
 
-function onKeyDown(e: KeyboardEvent): void { if (!editing()) held.add(key(e)); }
+function onKeyDown(e: KeyboardEvent): void {
+  // Stamped even while `editing()` suppresses the key: the human IS touching the device, which is
+  // the only thing tier calibration needs to know. See core/userActivity.ts.
+  noteUserInput(rawNow());
+  if (!editing()) held.add(key(e));
+}
 function onKeyUp(e: KeyboardEvent): void { held.delete(key(e)); }
 function onBlur(): void { reset(); }
 function onVisibility(): void { if (document.visibilityState === 'hidden') reset(); }

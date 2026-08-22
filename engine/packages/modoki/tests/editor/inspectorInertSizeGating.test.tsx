@@ -276,6 +276,49 @@ describe('Inspector — self-placement props follow the SAME unanimity rule (#34
   });
 });
 
+describe('Inspector — every data-ui-id in one render is UNIQUE', () => {
+  // Not a style rule: chromeHandles.ts walks [data-ui-id] and `tap_handle` resolves the
+  // FIRST match, so a duplicate id silently drives the wrong element (docs/debug-tools-mcp.md).
+  // The property holds today because TraitSection renders ONCE PER TRAIT for the whole
+  // selection (key={meta.name}, entityIds={selectedIds}) rather than once per selected
+  // entity, and because a field lands in exactly one render branch. Both are structural
+  // decisions elsewhere in Inspector.tsx that nothing else pins — a refactor that moved
+  // TraitSection inside a per-entity loop would still LOOK right and would start emitting
+  // one duplicate id per extra selected entity.
+  const ids = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll('[data-ui-id]')).map((el) => el.getAttribute('data-ui-id')!);
+
+  it('single selection', () => {
+    const got = ids(mount('center').container);
+    expect(got.length).toBeGreaterThan(0); // worthless if the render emitted none
+    expect(new Set(got).size).toBe(got.length);
+  });
+
+  it('multi-select does NOT duplicate a trait section per selected entity', () => {
+    const { container } = mountMulti(['center', 'center', 'center']);
+    const got = ids(container);
+    expect(got.length).toBeGreaterThan(0);
+    const dupes = got.filter((id, i) => got.indexOf(id) !== i);
+    expect(dupes, `duplicate data-ui-id across a 3-entity selection: ${[...new Set(dupes)].join(', ')}`).toEqual([]);
+  });
+});
+
+describe('Inspector — number field data-ui-id (bug y9WMNPkT0DivkxZKJDWU)', () => {
+  // A QA case previously aimed a CSS selector at the input's stale `value` attribute,
+  // which stops matching the moment the value changes. Confirms the stable id actually
+  // reaches the DOM for both widgets: the generic `hint.type:'number'` NumberField
+  // ('gap') and the bounded UI-anchor BufferedNumberInput (the sizeRow 'width' input).
+  it('tags a generic NumberField as inspector.field.<Trait>.<field>', () => {
+    const { container } = mountMulti(['stretch', 'stretch']);
+    expect(numberRow(container, 'gap').input.getAttribute('data-ui-id')).toBe('inspector.field.UIElement.gap');
+  });
+
+  it('tags the bounded size BufferedNumberInput the same way', () => {
+    const { container } = mount('bottom-stretch');
+    expect(sizeRow(container, 'height').input.getAttribute('data-ui-id')).toBe('inspector.field.UIElement.height');
+  });
+});
+
 describe('Inspector — the anchor banner tells the truth about a mixed selection (#34)', () => {
   it('claims the fields are disabled only when they actually are', () => {
     const { container } = mountMulti(['center', 'center']);

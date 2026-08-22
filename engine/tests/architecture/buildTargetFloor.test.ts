@@ -40,6 +40,23 @@ function defaultIosMinVersion(): number {
   return parseFloat(m[1]);
 }
 
+/** The floor ONE project actually asks for: its own `build.iosMinVersion`, or the schema default
+ *  when it states none (which is most of them — the field is an override, not a required key). */
+function projectIosMinVersion(projectDir: string): number {
+  const cfg = path.join(projectDir, 'project.config.json');
+  if (!fs.existsSync(cfg)) return defaultIosMinVersion();
+  try {
+    const v = (JSON.parse(fs.readFileSync(cfg, 'utf8')) as { build?: { iosMinVersion?: unknown } })
+      .build?.iosMinVersion;
+    const n = typeof v === 'string' || typeof v === 'number' ? parseFloat(String(v)) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : defaultIosMinVersion();
+  } catch {
+    // An unparseable config is a different failure with its own guards; do not let it masquerade
+    // as a stale floor here.
+    return defaultIosMinVersion();
+  }
+}
+
 /** The schema default for `build.androidMinSdk` — the Android sibling of `iosMinVersion`. */
 function defaultAndroidMinSdk(): number {
   const m = PROJECT_CONFIG.match(/androidMinSdk:\s*(\d+)/);
@@ -93,8 +110,18 @@ describe('shipped iOS floor', () => {
   // Every project's COMMITTED state, not just the mechanism — the heal only runs on project
   // open / native build, so a project nobody has opened since a floor change stays stale on
   // disk. This is the half that would have caught the drift.
-  it('every project on disk carries the SPM floor the config asks for', () => {
-    const major = Math.trunc(defaultIosMinVersion());
+  it('every project on disk carries the SPM floor ITS OWN config asks for', () => {
+    // ⚠️ **AGAINST THE PROJECT'S OWN FLOOR, NOT THE SCHEMA DEFAULT.** This compared every project
+    // to `defaultIosMinVersion()`, which silently assumed no project ever overrides it — so a
+    // DELIBERATE per-project floor read as staleness and failed the build. It is a per-project
+    // field (`healNativeConfig` syncs both native floors from `cfg.build.iosMinVersion`, the
+    // project's own), and the Android sibling is already overridden in exactly this way:
+    // `demos/postfx-demo` pins `androidMinSdk: 28` against a default of 31, for the Huawei Y6.
+    //
+    // The original catch is untouched, because it never depended on the comparison being against
+    // the default: a project that nobody re-opened after the floor moved has NO override, so it
+    // still inherits the default and still fails. What changes is only that a project which states
+    // its own floor is checked against the floor it states.
     const stale: string[] = [];
     for (const root of ['games', 'demos']) {
       const abs = path.join(ROOT, '..', root);
@@ -103,14 +130,17 @@ describe('shipped iOS floor', () => {
         if (!entry.isDirectory()) continue;
         const pkg = path.join(abs, entry.name, 'ios', 'App', 'CapApp-SPM', 'Package.swift');
         if (!fs.existsSync(pkg)) continue; // no iOS target — nothing to be stale
+        const want = Math.trunc(projectIosMinVersion(path.join(abs, entry.name)));
         const m = fs.readFileSync(pkg, 'utf8').match(/platforms:\s*\[[^\]]*\.iOS\(\.v(\d+)/);
-        if (m && parseInt(m[1], 10) !== major) stale.push(`${root}/${entry.name}: .v${m[1]} (want .v${major})`);
+        if (m && parseInt(m[1], 10) !== want) {
+          stale.push(`${root}/${entry.name}: .v${m[1]} (its config asks for .v${want})`);
+        }
       }
     }
     expect(stale, stale.length
-      ? `Stale SPM iOS floor — build.iosMinVersion says ${defaultIosMinVersion()} but these declare `
-        + `something else:\n  ${stale.join('\n  ')}\n\nFix: open each project in the editor (heal runs `
-        + `on open), or run a native build for it.`
+      ? `Stale SPM iOS floor — these projects declare something other than their own `
+        + `build.iosMinVersion:\n  ${stale.join('\n  ')}\n\nFix: open each project in the editor `
+        + `(heal runs on open), or run a native build for it.`
       : '',
     ).toEqual([]);
   });

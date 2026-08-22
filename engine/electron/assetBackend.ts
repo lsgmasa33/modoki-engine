@@ -18,7 +18,7 @@ import {
   type AssetRoot,
   type LiveReloadKind,
 } from '../plugins/vite-asset-scanner';
-import { computeKeptAssets, type TreeShakeResult } from '../plugins/asset-tree-shaker';
+import { computeKeptAssets, enumerateRefEdges, type TreeShakeResult, type RefEdgeEnumeration } from '../plugins/asset-tree-shaker';
 
 export interface ElectronAssetManifest { version: 2; assets: Array<{ path: string; type: string; guid?: string }> }
 
@@ -32,6 +32,9 @@ export interface ElectronAssetBackend {
   /** Run the asset tree-shaker over the project (orphan detection for the
    *  "Clean Up Unused Assets" dialog). Uses the live asset roots. */
   computeUnused(): TreeShakeResult;
+  /** Enumerate every reference edge in the project — the shaker's own walk with an
+   *  observer attached — for the reverse index behind Find References (#284). */
+  computeRefEdges(): RefEdgeEnumeration;
   markEditorWrite(absPath: string, hash?: string | null): void;
   /** Begin watching asset roots for changes. */
   start(): void;
@@ -145,6 +148,7 @@ export function createAssetBackend(opts: {
     getManifest: () => cachedManifest,
     rebuildManifest,
     computeUnused: () => computeKeptAssets(projectRoot, assetRoots),
+    computeRefEdges: () => enumerateRefEdges(projectRoot, assetRoots),
     markEditorWrite,
     start() {
       if (watcher) return;

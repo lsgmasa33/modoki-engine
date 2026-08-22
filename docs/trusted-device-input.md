@@ -109,10 +109,14 @@ directly: the log shows the install line, no handler line after it, `Electron ex
 SIGTERM`, and both rules still standing. Even if it did fire, `kill -9`, an OOM and a crash all skip
 it — the three ways an editor most often dies badly.
 
-So the lifetime is closed at **startup** instead — `reclaimStaleForwardsAtStartup()`, called by both
+So the lifetime is closed at **startup** instead — `reclaimStaleDeviceStateAtStartup()`, called by both
 backend hosts (`startBackendServer` in Electron, the Vite plugin's `configureServer` under a bare
 `npm run dev`), which no manner of dying can skip. Same shape the device-claims file already uses: a
-claim is expired by pid-liveness **on read**, not by a polite release. Safe because both ports are
+claim is expired by pid-liveness **on read**, not by a polite release — and since #225 the same
+startup hook also SWEEPS those expired claims out of the file, so `~/.modoki/device-claims.json`
+stops accumulating corpses that read as live holds. (What #225 turned out NOT to be: a lockout. A
+dead-pid claim never blocked another clone, because every reader already applied the expiry. The
+file was lying, not the rule.) Safe because both ports are
 derived per clone, so a rule on one of our own ports at startup can only be our own leftover — this
 is not a sweep of "stale-looking" rules in general, which would be #158.
 
@@ -292,6 +296,16 @@ build, the per-machine signing, and the expiry rule.
   visible only by re-running the command by hand — the launcher discarded the child's output and
   reported a guess about signing instead, which is a large part of why this took as long as it did.
 
+  ⚠️ **The same dead instruments stack also blocks `go-ios launch` on that phone, so this is not
+  only a WDA fact** (measured 2026-08-19, Xcode 26.5). `ios launch <bundle-id>` drives
+  `processcontrol` over `com.apple.instruments.remoteserver.DVTSecureSocketProxy` and fails with
+  that service `unavailable` (handshake EOF), exit 1 — while `ios install` over usbmuxd works
+  perfectly, and `xctrace` cannot see the phone at all even though `xcodebuild -showdestinations`
+  can. Mounting the Developer Disk Image is NOT the fix: `ios image auto` reports one already
+  mounted and the launch fails identically. Consequence for deploys, and the message the build
+  prints instead of a failure: [build.md](./build.md) § "iOS Device". `idevicedebug --detach run`
+  (libimobiledevice) goes through debugserver rather than instruments and DOES launch it.
+
   `xcodebuild -showdestinations` omits it for EVERY scheme in the WDA project while listing four
   iOS-26 phones — **two of which are disconnected** — so destination eligibility tracks OS
   version, not connection. Xcode will build and run ordinary apps on it (that is how the game gets
@@ -308,10 +322,57 @@ build, the per-machine signing, and the expiry rule.
   (`IPHONEOS_DEPLOYMENT_TARGET = 15.0`). The one measurement that settled it was a CONTROL: the
   same xctestrun launches WDA on the iPhone Air first try, isolating the variable to the OS.
 
-  Consequence for testing: **the iPhone 8 is a synthetic-input-only device.** Use the Air for any
-  trusted-input verification. The only avenue that could change this is a third-party XCUITest
+  Consequence for testing: **the iPhone 8 is a synthetic-input-only device.** Use the iPad mini for
+  any trusted-input verification — it replaced the Air as the default on 2026-08-21; the Air is in
+  the same profile and still works. (Device ids live in `docs/devices.md`, which is private — this
+  doc publishes, so it names hardware and never identifies it.) The only avenue that could change this is a third-party XCUITest
   launcher (e.g. `go-ios`) that bypasses Xcode's test machinery — a new toolchain dependency, so
   an owner decision rather than an agent one.
+
+- **`0xe8008012` on a device is PROFILE MEMBERSHIP, not an OS limit — do not read it as the
+  iPhone 8 case (measured 2026-08-21, iPad mini 5 / iOS 18.7.8).** Two failures present as "WDA
+  does not work on this device" and they need opposite responses, so the discriminator matters:
+
+  ```
+  Failed to install embedded profile for com.modokiengine.WebDriverAgentRunner.xctrunner :
+  0xe8008012 (This provisioning profile cannot be installed on this device.)
+  ```
+
+  That is the runner failing to INSTALL, and it means the device is absent from the profile the
+  cached WDA build was signed with. The iPhone 8's is a different line entirely (`Logic Testing
+  Unavailable`) and fails LATER, at the test-destination stage, permanently. This one is fixed in
+  one rebuild.
+
+  **Why it happens even on a device Xcode can already deploy to:** `ensureWda` CACHES the build —
+  "a present, unexpired build short-circuits with no npm and no xcodebuild" — so the embedded
+  profile is a snapshot of the devices registered *when it was built*. A device added afterwards
+  (an ordinary `-allowProvisioningUpdates` app build registers one implicitly) installs games fine
+  and is still missing from WDA's months-old profile. Measured: the build dated 2026-08-07 listed
+  **6** devices, including the Air — which is precisely why WDA had always worked there — and not
+  the iPad.
+
+  **The fix is two halves and BOTH are needed.** First, force a rebuild, which re-runs
+  `xcodebuild … -allowProvisioningUpdates` and mints a profile covering what is registered now:
+
+  ```js
+  import { install } from './engine/toolchain/index'
+  await install('webdriveragent', { toolchainDir: process.env.MODOKI_TOOLCHAIN_DIR })
+  ```
+  Back the old build up first (`mv .../16.1.1/build .../16.1.1/build.bak`) — it is the one that
+  currently works for every other device, and restoring it is the rollback. Verify the new profile
+  before trusting it, and check the devices you care about are BOTH in it:
+  ```bash
+  P=".../wda/<ver>/build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app/embedded.mobileprovision"
+  security cms -D -i "$P" | plutil -extract ProvisionedDevices raw -o - -   # count
+  security cms -D -i "$P" | grep -c "<the UDID>"                            # membership
+  ```
+  Second — and an agent **cannot** do this half — the owner must trust the developer profile
+  on-device (Settings → General → VPN & Device Management). Until then the runner installs but will
+  not launch, and the symptom is silence rather than an error.
+
+  Result on the iPad: 6 → 7 devices, both the iPad and the Air present, and a real tap returned
+  `[input:trusted-wda]` with a page-level probe recording `isTrusted: true`. `ios-ipad` is a
+  trusted-input target now (QA-INPUT-0001, run `bwlTB0Fg2WDyrFFWyUHW`).
 
 - **macOS-only, to start AND to use** — it is an `xcodebuild` run, matching
   `isInstallable('webdriveragent')`. Off macOS `ensureWdaRunning` refuses immediately, before any

@@ -55,12 +55,14 @@
  *  `pointerId !== activeId` checks below — for free, with no additional state, and
  *  a SECOND pointer landing on the canvas becomes the active gesture (the only real
  *  multitouch benefit available here — `pointerSource` tracks a single pointer, so
- *  there is nothing to key a claim by `pointerId`; see the module's git history /
- *  `docs/todo.md` for the earlier per-pointerId design this replaced). Because the
+ *  there is nothing to key a claim by `pointerId`; see the module's git history and
+ *  docs/input.md for the earlier per-pointerId design this replaced). Because the
  *  decision is recomputed from the live DOM at every event rather than latched into
  *  a claim, a registration can never "leak" — there is no claim state to strand. */
 
 import type { InputSource } from './inputSources';
+import { noteUserInput } from '../core/userActivity';
+import { rawNow } from '../core/clock';
 import type { InputFrame } from '../core/inputActions';
 import { getPlayState, onPlayStateChange } from '../core/playState';
 import { isPointerBlocked } from '../core/pointerBlockers';
@@ -86,6 +88,10 @@ let y = 0;
 let startX = 0;
 let startY = 0;
 let activeId: number | null = null;
+/** Whether the gesture owning `activeId` came from a REAL pointer (`isTrusted`). A synthetic press
+ *  — the device debug bridge's `device_pointer`/`device_tap` — sets this false, which is what lets
+ *  a real finger reclaim a stranded one; see `onPointerDown` (#299). */
+let activeTrusted = false;
 let active = false;         // saw activity since last sample → sets lastDevice='pointer'
 // Smoothed pointer position + velocity, published for latency extrapolation
 // (`pointerPredictedPos`). Both come from a 1€ filter per axis rather than a fixed EMA: a fixed
@@ -133,7 +139,7 @@ let wheelAccum = 0;
 const pending: PointerTransition[] = [];
 
 function reset(): void {
-  down = false; activeId = null; wheelAccum = 0; pending.length = 0;
+  down = false; activeId = null; activeTrusted = false; wheelAccum = 0; pending.length = 0;
   vx = 0; vy = 0; lastMoveT = 0;
   filterX.reset(); filterY.reset();
 }
@@ -151,7 +157,29 @@ function pushTransition(t: PointerTransition): void {
 }
 
 function onPointerDown(e: PointerEvent): void {
-  if (activeId !== null) return;           // a gesture already owns the pointer
+  noteUserInput(rawNow()); // see core/userActivity.ts — tier calibration must not judge an idle device
+  if (activeId !== null) {
+    // A gesture already owns the pointer — EXCEPT when it is a stranded SYNTHETIC one. A synthetic
+    // press (the device debug bridge) can be left un-released with nothing able to clear it: no
+    // matching `up` ever arrives, and `blur`/`visibilitychange`/play-start resets do not fire in a
+    // running shipped game. From then on this early return swallows EVERY real finger — measured on
+    // an A23, where camera orbit stayed dead until a force-stop (#299).
+    //
+    // A real pointer reclaims it, because the two cannot physically coexist: an `isTrusted` press
+    // is a finger on the glass, and a finger cannot arrive while a *synthetic* gesture is genuinely
+    // in progress. That makes the takeover exact — unlike a staleness TIMEOUT, which would also
+    // steal a legitimate long hold from a second finger, breaking the primary-touch rule below for
+    // real multitouch. The reverse case (a synthetic press during a real gesture) is NOT adopted:
+    // there the finger is real and owns the gesture.
+    if (!e.isTrusted || activeTrusted) return;
+    // Close the stale gesture with a real release before latching the new one, so `pending` keeps
+    // its down/up alternation — see `pushTransition`: a down following a down makes
+    // `computePointerEdge` emit neither edge, silently swallowing the finger we are trying to hand
+    // control to. It must be `endGesture()` and not a hand-rolled clear: the blocked-root check
+    // below can `return` between here and the new latch, so this is the LAST thing that touches the
+    // velocity, and leaving it non-zero would publish a moving pointer that is up.
+    endGesture();
+  }
   if (isPointerBlocked(e.target)) {
     // Never latch `activeId` for a blocked press — the whole gesture (its later
     // move/up) already falls through the `pointerId !== activeId` checks below
@@ -164,6 +192,7 @@ function onPointerDown(e: PointerEvent): void {
     return;
   }
   activeId = e.pointerId;
+  activeTrusted = e.isTrusted;
   down = true;
   x = e.clientX; y = e.clientY;
   startX = x; startY = y;
@@ -184,6 +213,7 @@ function onPointerDown(e: PointerEvent): void {
 }
 
 function onPointerMove(e: PointerEvent): void {
+  noteUserInput(rawNow()); // see core/userActivity.ts — tier calibration must not judge an idle device
   if (e.pointerId !== activeId) return;
   const dt = e.timeStamp - lastMoveT;
   if (dt > VEL_MIN_DT_MS && dt < VEL_MAX_DT_MS) {
@@ -202,15 +232,19 @@ function onPointerMove(e: PointerEvent): void {
   active = true;
 }
 
-/** Up OR cancel: end the gesture. `pointercancel` is treated identically to `up`
- *  (a plain release) rather than as an abort, so a browser-reclaimed touch doesn't
- *  strand `down=true` forever — the consumer sees a clean released edge. */
-function onPointerUp(e: PointerEvent): void {
-  if (e.pointerId !== activeId) return;
-  x = e.clientX; y = e.clientY;
+/** End the active gesture at the current `x`/`y` and queue its release transition.
+ *
+ *  Shared by the two paths that can end one — a real `pointerup`/`pointercancel`, and the
+ *  stale-synthetic takeover in `onPointerDown` — because they MUST leave identical state and a
+ *  hand-copied second version already drifted: the takeover's first draft cleared `activeId`/`down`
+ *  but not the velocity or the 1€ filters, so a takeover that then hit the pointer-block check
+ *  returned with `down:false` and a NON-ZERO `vx/vy`. That breaks this module's published contract
+ *  (velocity is zero whenever the pointer is up — see `pointerPredictedPos`) and leaves the
+ *  predicted point extrapolating from a gesture that has ended. */
+function endGesture(): void {
   down = false;
   activeId = null;
-  active = true;
+  activeTrusted = false;
   // Kill the velocity on release so the extrapolated point collapses onto the true one. A
   // flick-and-lift would otherwise leave the picture coasting past the finger on the very
   // frame the gesture is being resolved.
@@ -219,10 +253,21 @@ function onPointerUp(e: PointerEvent): void {
   pushTransition({ down: false, x, y, startX, startY });
 }
 
+/** Up OR cancel: end the gesture. `pointercancel` is treated identically to `up`
+ *  (a plain release) rather than as an abort, so a browser-reclaimed touch doesn't
+ *  strand `down=true` forever — the consumer sees a clean released edge. */
+function onPointerUp(e: PointerEvent): void {
+  if (e.pointerId !== activeId) return;
+  x = e.clientX; y = e.clientY;
+  active = true;
+  endGesture();
+}
+
 /** Wheel/scroll — accumulate one signed notch per event (magnitude-agnostic, so a
  *  free-spinning vs clicky wheel behave the same). Passive listener, no
  *  `preventDefault`, so it never fights editor-panel scrolling. */
 function onWheel(e: WheelEvent): void {
+  noteUserInput(rawNow()); // see core/userActivity.ts — tier calibration must not judge an idle device
   if (e.deltaY === 0) return;
   // Unlike pointerdown, this check is correct PER EVENT: a wheel notch is not a
   // gesture, so there is no "hold for the whole gesture" argument here — a

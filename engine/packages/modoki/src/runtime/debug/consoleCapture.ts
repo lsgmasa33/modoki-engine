@@ -22,10 +22,49 @@ let seq = 0;
 let version = 0;
 let installed = false;
 let recording = false; // re-entrancy guard (a logged object whose getter logs, etc.)
+/** The ORIGINAL console.error, captured before patching. A flush-time failure must report through
+ *  this and never through the patched method, which would record itself and re-enter the bump it
+ *  is already inside. Null until `installConsoleCapture` runs. */
+let originalError: ((...args: unknown[]) => void) | null = null;
 
+// Notify OUT of the current task, coalesced to one call per burst.
+//
+// ⚠️ Synchronous notification is a REAL bug, not a style question. A `console.warn` raised from
+// inside a React render body reaches a `useSyncExternalStore` subscriber synchronously — which is
+// a setState during another component's render, and React logs a genuine console.error for it:
+// "Cannot update a component (`ErrorToaster`) while rendering a different component
+// (`UINodeInner`)". Measured on `games/anim-bug` (bug `mfAJ8yTNTqOQbU3sqY46`): `UINode` warns
+// during render when an `imageSrc` points at a 3d-typed KTX2, and that one intentional,
+// well-worded warning became a warning PLUS a scary React error in the same millisecond. Nothing
+// about it is specific to that warn — ANY runtime warn or error emitted from a render path trips
+// it. It also manufactures a spurious not-ok from `modoki_diagnose`, which gates on recent
+// console errors.
+//
+// `version` still increments IMMEDIATELY, so a snapshot read straight after the log is already
+// correct and `useSyncExternalStore` stays consistent; only the listener call is deferred.
+// `queueMicrotask` rather than a timer or rAF: it is the smallest deferral that escapes the
+// render, and unlike rAF it exists headless and unlike a timer it is not swallowed by fake
+// timers in tests.
+let notifyScheduled = false;
+/** Bumped by the test reset, so a flush queued before it cannot fire against the new state. */
+let notifyGeneration = 0;
 function bump(): void {
   version++;
-  for (const l of listeners) l();
+  if (notifyScheduled) return;
+  notifyScheduled = true;
+  const generation = notifyGeneration;
+  queueMicrotask(() => {
+    if (generation !== notifyGeneration) return; // reset between schedule and drain
+    notifyScheduled = false;
+    for (const l of listeners) {
+      // Per-listener, and NOT optional. The loop used to run inside `record()`, which
+      // `installConsoleCapture` wraps in "never let capture break logging" — deferring it to a
+      // microtask moved it OUT of that try, so a throwing listener went from a silent no-op to an
+      // uncaught exception. Swallowed here rather than left to escape, and reported through the
+      // ORIGINAL console.error so it cannot recurse back into the capture that is mid-flush.
+      try { l(); } catch (err) { originalError?.('[consoleCapture] a listener threw during flush', err); }
+    }
+  });
 }
 
 function stringifyArg(a: unknown): string {
@@ -58,6 +97,7 @@ export function installConsoleCapture(): void {
   if (installed) return;
   installed = true;
   const levels: ConsoleLevel[] = ['log', 'info', 'warn', 'error'];
+  originalError = console.error.bind(console);
   for (const level of levels) {
     const original = console[level].bind(console);
     console[level] = (...args: unknown[]) => {
@@ -96,6 +136,8 @@ export function subscribeConsole(listener: () => void): () => void {
 
 /** Test-only: reset the capture (unwrap can't be undone, but clear state). */
 export function __resetConsoleCaptureForTest(): void {
+  notifyGeneration++;
+  notifyScheduled = false;
   buffer.length = 0;
   seq = 0;
 }

@@ -4,10 +4,13 @@
     "webBucket": "",
     "webBasePath": "/",
     "webCdnUrlMap": "",
-    "appleTeamId": ""
+    "appleTeamId": "",
+    "debugBuild": true
   },
   "app": {
     "appId": "__APP_ID__",
-    "appName": "__GAME_NAME__"
+    "appName": "__GAME_NAME__",
+    "version": "1.0",
+    "buildNumber": 1
   }
 }

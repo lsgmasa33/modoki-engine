@@ -7,15 +7,16 @@ the running desktop editor — the `modoki` MCP **and** `chrome-devtools` over C
 config, so a DMG/exe user gets the same Claude-friendly authoring-and-verify loop that previously
 only worked from a cloned repo.
 
-It is the **cheap alternative** to the cloud embed (`docs/cloud-editor-embedded-claude.md`): rather
-than host Claude server-side, the user's own Claude Code connects to the running editor — ~1% of the
-cloud effort, ~90% of the value, for the audience that already has Claude Code. The MCP *tool
+It is the **cheap alternative** to the cloud embed: rather than host Claude server-side, the
+user's own Claude Code connects to the running editor — ~1% of the cloud effort, ~90% of the
+value, for the audience that already has Claude Code. The MCP *tool
 behavior* it exposes (the failure-reporting contract, addressing, Percept/Enact/Watch/Journal) is
 documented in **[debug-tools-mcp.md](./debug-tools-mcp.md)**; this doc is the *wiring*.
 
 ## The gap this closes
 
-Modoki's whole pitch is **Claude-friendly**: the `modoki` MCP (75 tools), **Percept**
+Modoki's whole pitch is **Claude-friendly**: the `modoki` MCP (tool catalog:
+[debug-tools-mcp.md](./debug-tools-mcp.md)), **Percept**
 (read-by-data), **Enact** (trusted input), and **CDP** (drop into the live renderer)
 let Claude author scenes and *verify its own work*. Today that loop **only works from a
 cloned git repo** — the repo's `.mcp.json` hardcodes `npx tsx
@@ -443,7 +444,7 @@ required step obvious and one call away.
 3. **`save_all`** — returned void, swallowing cancel AND write-failure behind `{ok:true}`. Now
    `SaveResult`; takes `path` (the panel needs a human); **actually blocked during Play**, as
    its description always claimed.
-4. **`load_scene`/`new_scene`** refuse to destroy unsaved live work (`force:true` to discard).
+4. **`load_scene`/`new_scene`** refuse to destroy unsaved live work (`discardUnsaved:true` to discard).
 5. **`build`** refuses on unsaved changes; `dispatch_action`/`play_clip`/`capture_gesture`
    reject phantom guids; `delete_entities`/`reparent_entity` report what happened;
    `list_traits` distinguishes "registry empty" from "unknown trait".

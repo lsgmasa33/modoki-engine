@@ -114,7 +114,7 @@ function mockDeps() {
     const cacheMap = new Map<string, any>();
     const unloaded: string[] = [];
     const Assets = {
-      cache: { has: (url: string) => cacheMap.has(url) },
+      cache: { has: (url: string) => cacheMap.has(url), remove: (url: string) => cacheMap.delete(url) },
       get: (url: string) => cacheMap.get(url),
       load: (url: string) => {
         // Loaded textures carry a live `source` (with a `.style`) — the 2D-material path
@@ -270,7 +270,7 @@ describe('Scene2D.renderFrame', () => {
 
   it('creates a Sprite for an image ref and binds the cached texture + tint', async () => {
     const { pixi, traits, pool, scene2d, world } = await setup();
-    pixi.Assets.__seed('/a.png', { width: 64, height: 64 });
+    pixi.Assets.__seed('/a.png', { width: 64, height: 64, source: { style: {} } });
     const canvas = spawnCanvas(world, traits);
     spawnChild(world, traits, canvas.id(), { sprite: 'img:/a.png', color: 0x00ff00 });
 
@@ -312,6 +312,7 @@ describe('Scene2D.renderFrame', () => {
 
     child.destroy();
     scene2d.renderFrame();
+    await new Promise((r) => setTimeout(r, 0)); // let a (should-be-absent) deferred unload elapse
 
     expect(pixi.Assets.__unloaded).toHaveLength(0);
   });
@@ -566,6 +567,7 @@ describe('Scene2D.renderFrame', () => {
       matReady.add('matGuid');                            // shader compiled → material pass takes over
       scene2d.markScene2DDirty();
       scene2d.renderFrame();
+      await new Promise((r) => setTimeout(r, 0)); // let a (should-be-absent) deferred unload elapse
 
       const kids = pool.getSlot(canvas.id())!.container.children as any[];
       expect(kids).toHaveLength(1);
@@ -592,6 +594,7 @@ describe('Scene2D.renderFrame', () => {
       child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), material: '' });
       scene2d.markScene2DDirty();
       scene2d.renderFrame();
+      await new Promise((r) => setTimeout(r, 0)); // let a (should-be-absent) deferred unload elapse
 
       const kids = pool.getSlot(canvas.id())!.container.children as any[];
       expect(kids).toHaveLength(1);
@@ -611,6 +614,7 @@ describe('Scene2D.renderFrame', () => {
       child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), width: 40 }); // matSig changes, texUrl unchanged
       scene2d.markScene2DDirty();
       scene2d.renderFrame();
+      await new Promise((r) => setTimeout(r, 0)); // let a (should-be-absent) deferred unload elapse
 
       const mesh = pool.getSlot(canvas.id())!.container.children[0] as any;
       expect(mesh.kind).toBe('material');
@@ -725,11 +729,13 @@ describe('Scene2D.renderFrame', () => {
       const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/hero.png', material: 'matGuid' });
 
       scene2d.renderFrame();
+      await new Promise((r) => setTimeout(r, 0)); // let a (should-be-absent) deferred unload elapse
       expect(pixi.Assets.__unloaded).not.toContain('http://t/noise.png'); // held while resident
 
       child.destroy();
       scene2d.markScene2DDirty();
       scene2d.renderFrame();
+      await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
 
       expect(pool.getSlot(canvas.id())!.container.children.length).toBe(0); // Mesh disposed
       expect(pixi.Assets.__unloaded).toContain('http://t/noise.png');      // last release → unloaded
@@ -774,6 +780,7 @@ describe('Scene2D.renderFrame', () => {
       child.add(traits.MaterialInstance({ overrides: [{ target: 'uReveal', kind: 'texture', ref: 'http://t/override.png' }] }));
 
       scene2d.renderFrame();
+      await new Promise((r) => setTimeout(r, 0)); // let a (should-be-absent) deferred unload elapse
 
       const mesh = pool.getSlot(canvas.id())!.container.children[0] as any;
       expect(mesh.shader.extraTextures.uReveal).toBe(over);   // the override ref, not the default
@@ -801,6 +808,7 @@ describe('Scene2D.renderFrame', () => {
       child.set(traits.MaterialInstance, { overrides: [{ target: 'uReveal', kind: 'texture', ref: 'http://t/b.png' }] });
       scene2d.markScene2DDirty();
       scene2d.renderFrame();
+      await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
 
       const mesh = pool.getSlot(canvas.id())!.container.children[0] as any;
       expect(mesh.shader.extraTextures.uReveal).toBe(b);          // rebuilt with the new ref
@@ -817,6 +825,7 @@ describe('Scene2D.renderFrame', () => {
       scene2d.renderFrame();
       child.destroy();
       scene2d.renderFrame();
+      await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
 
       // Last user gone → the sprite bitmap is unloaded (refcount balanced through disposeSlot).
       expect(pixi.Assets.__unloaded).toContain('http://t/hero.png');
@@ -854,6 +863,7 @@ describe('Scene2D.renderFrame', () => {
 
       child.destroy();
       scene2d.renderFrame();
+      await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
 
       expect(wrapper.destroy).toHaveBeenCalledWith(false);            // wrapper dropped, source kept
       expect(pixi.Assets.__unloaded).toContain('http://t/sheet.png'); // base source unloaded at refcount 0
@@ -890,6 +900,7 @@ describe('Scene2D.renderFrame', () => {
     scene2d.renderFrame();
     child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'http://t/b.png' });
     scene2d.renderFrame();
+    await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
 
     // a.png was the last (only) user → unloaded; b.png now bound, not unloaded.
     expect(pixi.Assets.__unloaded).toContain('http://t/a.png');
@@ -905,7 +916,7 @@ describe('Scene2D.renderFrame', () => {
   // screen, old framed wrapper destroyed, texture never unloaded.
   it('swaps the frame IN PLACE for a same-sheet ref change — no flash, no unload churn', async () => {
     const { pixi, traits, pool, scene2d, world } = await setup();
-    pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10 });
+    pixi.Assets.__seed('http://t/sheet.png', { width: 100, height: 10, source: { style: {} } });
     const canvas = spawnCanvas(world, traits);
     const child = spawnChild(world, traits, canvas.id(), { sprite: 'sheet:0' });
 
@@ -983,6 +994,7 @@ describe('Scene2D.renderFrame', () => {
 
     child.destroy();
     scene2d.renderFrame();
+    await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
 
     expect(obj.destroyed).toBe(true);
     expect(pool.getSlot(canvas.id())!.container.children.length).toBe(0);
@@ -1003,6 +1015,7 @@ describe('Scene2D.renderFrame', () => {
     scene2d.renderFrame();
     child.destroy();
     scene2d.renderFrame();
+    await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
 
     expect(pixi.Assets.__unloaded).toContain('/a.png');
   });
@@ -1023,6 +1036,7 @@ describe('Scene2D.renderFrame', () => {
 
     canvas.destroy();          // remove the CANVAS but keep its child entity
     scene2d.renderFrame();
+    await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
 
     expect(obj.destroyCount).toBe(1);                 // destroyed once, not twice
     expect(obj.destroyed).toBe(true);
@@ -1072,11 +1086,13 @@ describe('Scene2D.renderFrame', () => {
 
       a.destroy();
       scene2d.renderFrame();
+      await new Promise((r) => setTimeout(r, 0)); // let a (should-be-absent) deferred unload elapse
       // b still uses it → must NOT be unloaded yet.
       expect(pixi.Assets.__unloaded).not.toContain('http://t/shared.png');
 
       b.destroy();
       scene2d.renderFrame();
+      await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
       // last user gone → unloaded exactly once.
       expect(pixi.Assets.__unloaded.filter((u: string) => u === 'http://t/shared.png')).toHaveLength(1);
     });
@@ -1091,6 +1107,7 @@ describe('Scene2D.renderFrame', () => {
       scene2d.renderFrame();
       a.destroy(); b.destroy();
       scene2d.renderFrame();                       // both released → unloaded once, map cleared
+      await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
       expect(pixi.Assets.__unloaded.filter((u: string) => u === 'http://t/shared.png')).toHaveLength(1);
 
       scene2d.stopScene2D();                        // unloadAllSpriteTextures over an empty map → no-op
@@ -1112,6 +1129,55 @@ describe('Scene2D.renderFrame', () => {
       worldReg.setCurrentWorld(newWorld());
       expect(pixi.Assets.__unloaded.filter((u: string) => u === 'http://t/shared.png')).toHaveLength(1);
       scene2d.stopScene2D();
+    });
+
+    // Pins the fix: a renderer that rebuilds a subtree by despawning and respawning it
+    // legitimately drops a url to 0 and back to 1 with no macrotask boundary crossed in
+    // between (Court's board overlay does exactly this on every interaction). The eager
+    // `Assets.unload` used to destroy the source out from under the sprite about to
+    // re-retain it; the release is now deferred by a macrotask and CANCELLED by a
+    // same-window re-retain, so the texture must never reach __unloaded and must still
+    // be in the cache once the (cancelled) timer's slot has elapsed.
+    it('does not unload when a url is released and re-retained in the same frame', async () => {
+      const { pixi, traits, scene2d, pool, world } = await setup();
+      pixi.Assets.__seed('http://t/shared.png', { width: 64, height: 64, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      const a = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/shared.png' });
+      scene2d.renderFrame(); // refcount 1
+
+      // Despawn then respawn the SAME url with no render in between the release and the
+      // re-retain — the sweep in the next renderFrame() releases the old slot (refcount 0,
+      // unload DEFERRED), and the following renderFrame() retains the new slot (refcount
+      // 0→1) before any macrotask has run, so retainSpriteTexture cancels the pending timer.
+      a.destroy();
+      scene2d.renderFrame(); // dispose sweep releases the url → refcount 0, unload deferred
+      spawnChild(world, traits, canvas.id(), { sprite: 'http://t/shared.png' });
+      scene2d.renderFrame(); // new slot retains the SAME url → refcount 0→1, cancels the timer
+
+      await new Promise((r) => setTimeout(r, 0)); // give the (cancelled) timer's slot a chance to fire
+
+      expect(pixi.Assets.__unloaded).not.toContain('http://t/shared.png');
+      expect(pixi.Assets.cache.has('http://t/shared.png')).toBe(true);
+    });
+
+    // Pins the fix: a cache entry whose SOURCE was destroyed by an in-flight unload is still
+    // PRESENT (`cache.has` true) — binding it draws nothing, forever, because the sprite path
+    // used to test only presence. makeSprite must evict it and take the load path instead.
+    it('evicts and reloads a cached-but-sourceless texture instead of binding it', async () => {
+      const { pixi, traits, pool, scene2d, world } = await setup();
+      const stale = { width: 64, height: 64, source: null }; // present, but its source is gone
+      pixi.Assets.__seed('http://t/stale.png', stale);
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'http://t/stale.png' });
+
+      scene2d.renderFrame();
+      const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
+      expect(obj.texture).not.toBe(stale); // never bound the sourceless corpse
+
+      await Promise.resolve(); await Promise.resolve(); // let the evict-and-reload settle (markDirty)
+
+      expect(obj.texture).not.toBe(stale);
+      expect(obj.texture.source?.style).toBeDefined();   // the RELOADED texture (Assets.load mints a live source)
     });
   });
 
@@ -1287,15 +1353,19 @@ describe('Scene2DRenderer instancing', () => {
 
     scene2d.renderFrame();        // primary retains /a.png (shared count 1)
     editorRenderer.renderFrame(); // editor retains /a.png (shared count 2)
+    await new Promise((r) => setTimeout(r, 0)); // let a (should-be-absent) deferred unload elapse
     expect(pixi.Assets.__unloaded).not.toContain('/a.png');
 
     // GameView (primary) closes while the editor is still live → per-slot release drops the count
     // 2→1 but NOT the last renderer, so the blanket nuke must be skipped: /a.png survives.
     scene2d.stopScene2D(); // live=1
+    await new Promise((r) => setTimeout(r, 0)); // let a (should-be-absent) deferred unload elapse
     expect(pixi.Assets.__unloaded).not.toContain('/a.png');
 
-    // Editor closes last → count 1→0 (last-one-out) → /a.png finally unloads.
+    // Editor closes last → count 1→0 (last-one-out); a NON-primary stop does not call the
+    // blanket unloadAllSpriteTextures net, so this is a deferred per-slot release — flush it.
     editorRenderer.stop(); // live=0
+    await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
     expect(pixi.Assets.__unloaded).toContain('/a.png');
   });
 });

@@ -264,6 +264,7 @@ function CurvesView({
             x: rect.left + timeToX(k.t, s.view), y: rect.top + s.valueToY(k.v),
             label: `${track.trait}.${track.field} t=${k.t.toFixed(3)} v=${k.v}`,
             meta: { trackIndex: ti, keyIndex: ki, time: k.t, value: k.v, path: track.path },
+            owner: el,
           });
           // Tangent handles: only for the active track, mirroring the render guards.
           if (ti !== s.activeTi) return;
@@ -271,11 +272,11 @@ function CurvesView({
           const prevStepped = ki > 0 && !Number.isFinite(track.keys[ki - 1].outTangent);
           if (ki > 0 && Number.isFinite(k.inTangent) && !prevStepped) {
             const p = tanPt(track, ki, 'in');
-            out.push({ id: `curves:tan:in:${trackKey}:${ki}`, kind: 'tangent', editor: 'curves', x: rect.left + p.x, y: rect.top + p.y, label: `in-tangent ${track.field} k${ki}`, meta: { trackIndex: ti, keyIndex: ki, side: 'in', path: track.path } });
+            out.push({ id: `curves:tan:in:${trackKey}:${ki}`, kind: 'tangent', editor: 'curves', x: rect.left + p.x, y: rect.top + p.y, label: `in-tangent ${track.field} k${ki}`, meta: { trackIndex: ti, keyIndex: ki, side: 'in', path: track.path }, owner: el });
           }
           if (ki < track.keys.length - 1 && !stepped) {
             const p = tanPt(track, ki, 'out');
-            out.push({ id: `curves:tan:out:${trackKey}:${ki}`, kind: 'tangent', editor: 'curves', x: rect.left + p.x, y: rect.top + p.y, label: `out-tangent ${track.field} k${ki}`, meta: { trackIndex: ti, keyIndex: ki, side: 'out', path: track.path } });
+            out.push({ id: `curves:tan:out:${trackKey}:${ki}`, kind: 'tangent', editor: 'curves', x: rect.left + p.x, y: rect.top + p.y, label: `out-tangent ${track.field} k${ki}`, meta: { trackIndex: ti, keyIndex: ki, side: 'out', path: track.path }, owner: el });
           }
         });
       }
@@ -288,6 +289,7 @@ function CurvesView({
     { label: 'Auto (smooth)', onClick: () => onSetTangentMode(menu.ti, menu.ki, 'auto') },
     { label: 'Linear', onClick: () => onSetTangentMode(menu.ti, menu.ki, 'linear') },
     { label: 'Constant (stepped)', onClick: () => onSetTangentMode(menu.ti, menu.ki, 'constant') },
+    { label: 'Free Smooth (hand-set, mirrored)', onClick: () => onSetTangentMode(menu.ti, menu.ki, 'freeSmooth') },
     { label: 'Free (broken)', onClick: () => onSetTangentMode(menu.ti, menu.ki, 'free') },
     { label: '—', separator: true },
     { label: 'Delete key', danger: true, onClick: () => onDeleteKey(menu.ti, menu.ki) },

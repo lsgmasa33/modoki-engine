@@ -16,7 +16,7 @@
 import http from 'http';
 import type { AddressInfo } from 'net';
 import { handleBackendRequest, type BackendContext, type BackendResult } from '../plugins/backend/editorBackendRouter';
-import { reclaimStaleForwardsAtStartup } from '../plugins/backend/deviceConnection';
+import { reclaimStaleDeviceStateAtStartup } from '../plugins/backend/deviceConnection';
 import { serveProjectAsset, serveAppShell } from '../plugins/backend/staticAssets';
 import { writeBackendResult } from '../plugins/backend/writeResult';
 import { checkToken, tokenMismatchError, TOKEN_HEADER, type TokenCheck } from './instanceToken';
@@ -67,12 +67,13 @@ export interface BackendServerOptions {
 
 export function startBackendServer(ctx: BackendContext, opts: BackendServerOptions = {}): Promise<BackendServerHandle> {
   const { hostRoutes, appDistDir, port = 0, viteOrigin, getExpectedToken } = opts;
-  // Take back any adb forward this clone left on its own ports last run (#160). Called from the two
-  // backend HOSTS rather than at module scope, so importing the module in a test never shells out to
-  // adb; the other host is the Vite plugin's `configureServer`. Startup is the only teardown point
-  // that a SIGTERM/`kill -9`/crash cannot skip — measured: the process-exit hooks never fire under
-  // Electron, see the function's own doc.
-  reclaimStaleForwardsAtStartup();
+  // Take back the machine-wide device state this clone left behind last run: any adb forward on its
+  // own ports (#160), and any claim in `~/.modoki/device-claims.json` whose pid is gone (#225).
+  // Called from the two backend HOSTS rather than at module scope, so importing the module in a test
+  // never shells out to adb; the other host is the Vite plugin's `configureServer`. Startup is the
+  // only teardown point that a SIGTERM/`kill -9`/crash cannot skip — measured: the process-exit
+  // hooks never fire under Electron, see the function's own doc.
+  reclaimStaleDeviceStateAtStartup();
   const server = http.createServer((req, res) => {
     const u = new URL(req.url || '/', 'http://127.0.0.1');
     // CORS: the Vite dev renderer reaches this backend cross-origin (localhost vs

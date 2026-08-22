@@ -23,16 +23,17 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   return <label style={row}><span style={lblW}>{label}</span>{children}</label>;
 }
 
-function NumField({ label, value, onChange, min, step, placeholder, optional }: {
+function NumField({ label, value, onChange, min, step, placeholder, optional, uiId }: {
   label: string; value: number | undefined; onChange: (v: number | undefined) => void; min?: number; step?: number; placeholder?: string;
   /** When true, clearing the field emits `undefined` (the value is UNSET) instead of 0 — so an optional
    *  field (duration/volume/pitch/transform) round-trips to its default instead of a semantically
    *  different 0. Required fields (start/t/end) leave this false and clear to 0 (review C5). */
   optional?: boolean;
+  uiId?: string;
 }) {
   return (
     <Field label={label}>
-      <input style={inpFull} type="number" min={min} step={step ?? 0.1} value={value ?? ''} placeholder={placeholder}
+      <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={label} style={inpFull} type="number" min={min} step={step ?? 0.1} value={value ?? ''} placeholder={placeholder}
         onChange={(e) => {
           const raw = e.target.value;
           if (optional && raw === '') { onChange(undefined); return; } // cleared → unset (not 0)
@@ -45,12 +46,12 @@ function NumField({ label, value, onChange, min, step, placeholder, optional }: 
 
 /** One auto-generated field for a signal marker's `params`, driven by the target action's declared
  *  `params` FieldHint schema (so a typed form replaces raw JSON when the action declares its shape). */
-function ParamField({ name, hint, value, onChange, actionNames }: {
-  name: string; hint: FieldHint; value: unknown; onChange: (v: unknown) => void; actionNames: string[];
+function ParamField({ name, hint, value, onChange, actionNames, uiId }: {
+  name: string; hint: FieldHint; value: unknown; onChange: (v: unknown) => void; actionNames: string[]; uiId: string;
 }) {
   const label = <span style={lblW} title={hint.tooltip}>{name}</span>;
   if (hint.type === 'boolean') {
-    return <label style={row}>{label}<input type="checkbox" checked={value === true} onChange={(e) => onChange(e.target.checked)} /></label>;
+    return <label style={row}>{label}<input data-ui-id={uiId} data-ui-kind="toggle" data-ui-label={name} data-ui-state={value === true ? 'checked' : 'unchecked'} type="checkbox" checked={value === true} onChange={(e) => onChange(e.target.checked)} /></label>;
   }
   // `color` gets a real swatch + hex field, matching the trait Inspector's ColorField.
   // It used to fall through to the numeric input below, which meant authoring a colour
@@ -63,7 +64,7 @@ function ParamField({ name, hint, value, onChange, actionNames }: {
         {label}
         <span style={{ position: 'relative', width: 28, height: 18, flex: 'none', borderRadius: 2, overflow: 'hidden', border: '1px solid #333' }}>
           <span style={{ position: 'absolute', inset: 0, backgroundColor: colorToHex(n) }} />
-          <input type="color" value={colorToHex(n)} aria-label={`${name} color`}
+          <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={`${name} color`} type="color" value={colorToHex(n)} aria-label={`${name} color`}
             onChange={(e) => onChange(parseInt(e.target.value.slice(1), 16))}
             style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', opacity: 0, border: 'none', padding: 0, cursor: 'pointer' }} />
         </span>
@@ -76,16 +77,16 @@ function ParamField({ name, hint, value, onChange, actionNames }: {
     );
   }
   if (hint.type === 'number') {
-    return <label style={row}>{label}<input style={inpFull} type="number" min={hint.min} max={hint.max} step={hint.step ?? 0.1}
+    return <label style={row}>{label}<input data-ui-id={uiId} data-ui-kind="field" data-ui-label={name} style={inpFull} type="number" min={hint.min} max={hint.max} step={hint.step ?? 0.1}
       value={typeof value === 'number' ? value : ''} onChange={(e) => onChange(Number(e.target.value) || 0)} /></label>;
   }
   const opts = hint.type === 'enum' ? (hint.optionsSource === 'uiActions' ? actionNames : (hint.options ?? [])) : null;
   if (opts) {
-    return <label style={row}>{label}<select style={inpFull} value={typeof value === 'string' ? value : ''} onChange={(e) => onChange(e.target.value)}>
+    return <label style={row}>{label}<select data-ui-id={uiId} data-ui-kind="field" data-ui-label={name} style={inpFull} value={typeof value === 'string' ? value : ''} onChange={(e) => onChange(e.target.value)}>
       <option value="" />{opts.map((o) => <option key={o} value={o}>{o}</option>)}
     </select></label>;
   }
-  return <label style={row}>{label}<input style={inpFull} value={value == null ? '' : String(value)} onChange={(e) => onChange(e.target.value)} /></label>;
+  return <label style={row}>{label}<input data-ui-id={uiId} data-ui-kind="field" data-ui-label={name} style={inpFull} value={value == null ? '' : String(value)} onChange={(e) => onChange(e.target.value)} /></label>;
 }
 
 export default function ItemInspector({
@@ -134,10 +135,10 @@ export default function ItemInspector({
       {track.type === 'animation' && (() => {
         const c = track.clips[itemIdx];
         return (<>
-          <Field label="clip"><input style={inpFull} value={c.clip} placeholder="clip name" onChange={(e) => onEdit({ clip: e.target.value }, 'clip')} /></Field>
-          <NumField label="start" value={c.start} onChange={(v) => onEdit({ start: v }, 'start')} min={0} />
-          <NumField label="dur" value={c.duration} onChange={(v) => onEdit({ duration: v }, 'dur')} min={0} placeholder="auto" optional />
-          <Field label="scrub"><input type="checkbox" checked={c.scrub !== false} onChange={(e) => onEdit({ scrub: e.target.checked }, 'scrub')} /></Field>
+          <Field label="clip"><input data-ui-id="timeline.item.animation.clip" data-ui-kind="field" data-ui-label="clip" style={inpFull} value={c.clip} placeholder="clip name" onChange={(e) => onEdit({ clip: e.target.value }, 'clip')} /></Field>
+          <NumField label="start" uiId="timeline.item.animation.start" value={c.start} onChange={(v) => onEdit({ start: v }, 'start')} min={0} />
+          <NumField label="dur" uiId="timeline.item.animation.duration" value={c.duration} onChange={(v) => onEdit({ duration: v }, 'dur')} min={0} placeholder="auto" optional />
+          <Field label="scrub"><input data-ui-id="timeline.item.animation.scrub" data-ui-kind="toggle" data-ui-label="scrub" data-ui-state={c.scrub !== false ? 'checked' : 'unchecked'} type="checkbox" checked={c.scrub !== false} onChange={(e) => onEdit({ scrub: e.target.checked }, 'scrub')} /></Field>
         </>);
       })()}
 
@@ -149,21 +150,21 @@ export default function ItemInspector({
         const params = (m.params ?? {}) as Record<string, unknown>;
         const setParam = (key: string, v: unknown) => onEdit({ params: { ...params, [key]: v } }, `params:${key}`);
         return (<>
-          <NumField label="t" value={m.t} onChange={(v) => onEdit({ t: v }, 't')} min={0} />
+          <NumField label="t" uiId="timeline.item.signal.t" value={m.t} onChange={(v) => onEdit({ t: v }, 't')} min={0} />
           <Field label="action">
-            <input style={inpFull} list="tl-action-names" value={m.action} placeholder="action name" onChange={(e) => onEdit({ action: e.target.value }, 'action')} />
+            <input data-ui-id="timeline.item.signal.action" data-ui-kind="field" data-ui-label="action" style={inpFull} list="tl-action-names" value={m.action} placeholder="action name" onChange={(e) => onEdit({ action: e.target.value }, 'action')} />
             <datalist id="tl-action-names">{actionNames.map((n) => <option key={n} value={n} />)}</datalist>
           </Field>
           {schema && Object.keys(schema).length > 0 ? (
             <>
               <div style={{ fontSize: 10, color: '#8a8a96', marginTop: 2 }}>params — from <code>{m.action}</code></div>
               {Object.entries(schema).map(([k, hint]) => (
-                <ParamField key={k} name={k} hint={hint} value={params[k]} onChange={(v) => setParam(k, v)} actionNames={actionNames} />
+                <ParamField key={k} name={k} hint={hint} value={params[k]} onChange={(v) => setParam(k, v)} actionNames={actionNames} uiId={`timeline.item.signal.param.${k}`} />
               ))}
             </>
           ) : (
             <Field label="params">
-              <input style={{ ...inpFull, borderColor: paramsBad ? '#8a4d4d' : '#333' }} value={paramsText} placeholder={'{"text":"Hi"}'} spellCheck={false} onChange={(e) => commitParams(e.target.value)} />
+              <input data-ui-id="timeline.item.signal.params" data-ui-kind="field" data-ui-label="params" style={{ ...inpFull, borderColor: paramsBad ? '#8a4d4d' : '#333' }} value={paramsText} placeholder={'{"text":"Hi"}'} spellCheck={false} onChange={(e) => commitParams(e.target.value)} />
             </Field>
           )}
         </>);
@@ -173,28 +174,28 @@ export default function ItemInspector({
         const c = track.cues[itemIdx];
         const known = audioAssets.some((a) => a.guid === c.clip);
         return (<>
-          <NumField label="t" value={c.t} onChange={(v) => onEdit({ t: v }, 't')} min={0} />
+          <NumField label="t" uiId="timeline.item.audio.t" value={c.t} onChange={(v) => onEdit({ t: v }, 't')} min={0} />
           <Field label="clip">
-            <select style={inpFull} value={c.clip} onChange={(e) => onEdit({ clip: e.target.value }, 'clip')}>
+            <select data-ui-id="timeline.item.audio.clip" data-ui-kind="field" data-ui-label="clip" style={inpFull} value={c.clip} onChange={(e) => onEdit({ clip: e.target.value }, 'clip')}>
               {!known && <option value={c.clip}>{c.clip || '(none)'}</option>}
               {audioAssets.map((a) => <option key={a.guid} value={a.guid}>{a.label}</option>)}
             </select>
           </Field>
           <Field label="bus">
-            <select style={inpFull} value={c.bus ?? 'sfx'} onChange={(e) => onEdit({ bus: e.target.value as 'master' | 'music' | 'sfx' | 'ui' }, 'bus')}>
+            <select data-ui-id="timeline.item.audio.bus" data-ui-kind="field" data-ui-label="bus" style={inpFull} value={c.bus ?? 'sfx'} onChange={(e) => onEdit({ bus: e.target.value as 'master' | 'music' | 'sfx' | 'ui' }, 'bus')}>
               {['master', 'music', 'sfx', 'ui'].map((b) => <option key={b} value={b}>{b}</option>)}
             </select>
           </Field>
-          <NumField label="vol" value={c.volume} onChange={(v) => onEdit({ volume: v }, 'vol')} min={0} step={0.05} optional />
-          <NumField label="pitch" value={c.pitch} onChange={(v) => onEdit({ pitch: v }, 'pitch')} min={0} step={0.05} optional />
+          <NumField label="vol" uiId="timeline.item.audio.volume" value={c.volume} onChange={(v) => onEdit({ volume: v }, 'vol')} min={0} step={0.05} optional />
+          <NumField label="pitch" uiId="timeline.item.audio.pitch" value={c.pitch} onChange={(v) => onEdit({ pitch: v }, 'pitch')} min={0} step={0.05} optional />
         </>);
       })()}
 
       {track.type === 'activation' && (() => {
         const s = track.spans[itemIdx];
         return (<>
-          <NumField label="start" value={s.start} onChange={(v) => onEdit({ start: v }, 'start')} min={0} />
-          <NumField label="end" value={s.end} onChange={(v) => onEdit({ end: v }, 'end')} min={0} />
+          <NumField label="start" uiId="timeline.item.activation.start" value={s.start} onChange={(v) => onEdit({ start: v }, 'start')} min={0} />
+          <NumField label="end" uiId="timeline.item.activation.end" value={s.end} onChange={(v) => onEdit({ end: v }, 'end')} min={0} />
         </>);
       })()}
 
@@ -205,6 +206,7 @@ export default function ItemInspector({
         return (<>
           <Field label="kind">
             <select
+              data-ui-id="timeline.item.control.kind" data-ui-kind="field" data-ui-label="kind"
               style={inpFull}
               value={kind}
               onChange={(e) => onEdit(
@@ -229,20 +231,20 @@ export default function ItemInspector({
             </div>
           ) : (
             <Field label="prefab">
-              <select style={inpFull} value={c.prefab ?? ''} onChange={(e) => onEdit({ prefab: e.target.value }, 'prefab')}>
+              <select data-ui-id="timeline.item.control.prefab" data-ui-kind="field" data-ui-label="prefab" style={inpFull} value={c.prefab ?? ''} onChange={(e) => onEdit({ prefab: e.target.value }, 'prefab')}>
                 {!known && <option value={c.prefab ?? ''}>{c.prefab || '(none)'}</option>}
                 {prefabAssets.map((a) => <option key={a.guid} value={a.guid}>{a.label}</option>)}
               </select>
             </Field>
           )}
-          <NumField label="start" value={c.start} onChange={(v) => onEdit({ start: v }, 'start')} min={0} />
-          <NumField label="dur" value={c.duration} onChange={(v) => onEdit({ duration: v }, 'dur')} min={0} placeholder="stay" optional />
+          <NumField label="start" uiId="timeline.item.control.start" value={c.start} onChange={(v) => onEdit({ start: v }, 'start')} min={0} />
+          <NumField label="dur" uiId="timeline.item.control.duration" value={c.duration} onChange={(v) => onEdit({ duration: v }, 'dur')} min={0} placeholder="stay" optional />
           {kind === 'prefab' && (() => {
             const tf = c.transform ?? {};
             const setTf = (k: string, v: number | undefined) => onEdit({ transform: { ...tf, [k]: v } }, `tf:${k}`);
             const row = (keys: readonly string[], ph: string) => (
               <div style={{ display: 'flex', gap: 4 }}>
-                {keys.map((k) => <NumField key={k} label={k} value={(tf as Record<string, number>)[k]} onChange={(v) => setTf(k, v)} placeholder={ph} optional />)}
+                {keys.map((k) => <NumField key={k} label={k} uiId={`timeline.item.control.transform.${k}`} value={(tf as Record<string, number>)[k]} onChange={(v) => setTf(k, v)} placeholder={ph} optional />)}
               </div>
             );
             return (
@@ -257,7 +259,7 @@ export default function ItemInspector({
         </>);
       })()}
 
-      <button style={del} onClick={onDelete}>🗑 Delete item</button>
+      <button data-ui-id="timeline.item.delete" data-ui-kind="button" data-ui-label="Delete item" style={del} onClick={onDelete}>🗑 Delete item</button>
     </div>
   );
 }

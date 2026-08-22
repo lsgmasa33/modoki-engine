@@ -29,14 +29,19 @@ const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  *  was passed through as if it were a usable URL. Found by the #123 close-out sweep — the
  *  same "a ref the guard cannot see" pattern, one layer down.
  *
- *  FONTS (.ttf/.otf/.woff/.woff2) stay excluded on purpose: `UIElement.fontFamily` is a CSS
- *  family name (or font path), not a manifest-asset GUID. */
+ *  FONTS (.ttf/.otf/.woff/.woff2) are in this list as of #231. They were excluded for one
+ *  reason only: `UIElement.fontFamily` held a CSS family name (or a font path) rather than a
+ *  manifest GUID, so the answer for a font path depended on the FIELD, not the extension —
+ *  which is why the field-aware `isInternalFontPath` existed alongside this predicate
+ *  (QA-INSP-0004). #231 made `fontFamily` a GUID ref like every other one, so there is no
+ *  longer a field where a literal font path is legitimate, and the split has been retired. */
 const JSON_ASSET_SUFFIXES = [
   'scene', 'atlas', 'mesh', 'mat', 'prefab', 'shader', 'particle',
   'animset', 'spriteanim', 'rig2d', 'anim', 'level', 'wave', 'timeline', 'court',
 ] as const;
 const BINARY_ASSET_EXTS = [
   'glb', 'gltf', 'fbx',
+  'ttf', 'otf', 'woff', 'woff2',
   'png', 'jpg', 'jpeg', 'webp',
   'hdr', 'exr',
   'mp3', 'm4a', 'aac', 'wav', 'ogg', 'flac',
@@ -84,9 +89,13 @@ export function newGuid(): string {
  *
  *  It is tempting to read "derived, so it need not be serialized" and conclude the algorithm is
  *  swappable. It is not. Two call sites write the result into files that outlive the process:
- *    - `SpritePicker.tsx` assigns `deriveGuid('sprite:' + textureGuid)` — the whole-image sprite id
- *      — into scene `Renderable2D`/UI refs. `asset-tree-shaker.ts` re-derives the same value to
- *      avoid shaking the texture out of a build, and `assetRefIntegrity.test.ts` validates against it.
+ *    - `editor/panels/spritePickerGroups.ts` derives `deriveGuid('sprite:' + textureGuid)` — the
+ *      whole-image sprite id — for the SpritePicker's "whole" button and SkinEditor's drag-drop,
+ *      which write it into scene `Renderable2D`/UI refs and rig2d `parts[].sprite`.
+ *      `asset-tree-shaker.ts` re-derives the same value to avoid shaking the texture out of a
+ *      build, and `assetRefIntegrity.test.ts` validates against it. (Both editor callers go
+ *      through `wholeImageSpriteRef`, which returns undefined when the sprite does not exist —
+ *      a sliced sheet has none. See docs/textures.md § Gotchas.)
  *    - Prefab-member ids are referenced from OUTSIDE the instance, and those referring entities
  *      are serialized.
  *  Change the seed format, the hash, or the layout, and every 2D sprite reference in every project

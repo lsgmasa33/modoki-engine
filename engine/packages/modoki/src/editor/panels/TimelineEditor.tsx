@@ -5,11 +5,12 @@
  *
  *  Architecture mirrors AnimationEditor: the live timeline doc is the single source of truth in the
  *  editor store, so the GLOBAL undo stack applies edits even when this panel is unfocused. Edits
- *  coalesce per group; persistence is a debounced validated /api/asset-write. */
+ *  coalesce per group; the timeline document is PARKED in the dirty-asset registry and written
+ *  by Cmd+S (Save All) — see useParkedAssetDoc.ts (#259). */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { backendFetch } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
+import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { getCurrentWorld, onWorldSwap } from '../../runtime/core/ecs/world';
@@ -22,6 +23,7 @@ import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import { previewTimelineAt, previewTimelineStep, previewControlAt, clearPreviewControls } from '../../runtime/timeline/timelineSystem';
 import {
   beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession, setTimelinePreviewActive,
+  setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
 import { enterScrubMode, enterPreviewMode, exitPreviewMode } from '../scene/playMode';
 import { getRunMode, isAdvancing, onRunModeChange } from '../../runtime/core/playState';
@@ -29,7 +31,7 @@ import {
   defaultTimeline, normalizeTimeline,
   type TimelineDef, type TrackDef, type TrackKind,
 } from '../../runtime/timeline/types';
-import { useDebouncedSave } from './useDebouncedSave';
+import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { pushAction, peekUndo, isExecutingUndoRedo, type UndoAction } from '../undo/undoManager';
 import { shouldCoalesce } from '../animation/undoCoalesce';
 import { DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
@@ -38,8 +40,14 @@ import ClipTrackView from './timeline/ClipTrackView';
 import ItemInspector from './timeline/ItemInspector';
 import { withAddedItem, withMovedItem, withUpdatedItem, withDeletedItem, itemCount, type TrackItemPatch } from './timeline/itemEdit';
 
+/** Order a picker list by label. `getAllAssets()` returns the manifest map in INSERTION
+ *  order, so an asset imported during the session is appended and shows up LAST in a
+ *  dropdown, then moves on the next reload. Same defect the sprite picker had — see
+ *  `sortGroupsByName` in spritePickerGroups.ts. */
+const byLabel = <T extends { label: string }>(xs: T[]): T[] =>
+  [...xs].sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }));
+
 const COALESCE_MS = 500;
-const AUTOSAVE_MS = 400;
 const TRACK_LIST_W = 190;
 const INSPECTOR_W = 232; // default; user-resizable (persisted) — see inspectorW state
 const INSPECTOR_MIN_W = 180;
@@ -79,7 +87,6 @@ export default function TimelineEditor() {
   const [viewport, setViewport] = useState<Viewport>(DEFAULT_VIEWPORT);
   const [selectedTrack, setSelectedTrack] = useState<number | null>(null);
   const [selectedItem, setSelectedItem] = useState<number | null>(null);
-  const [saveMsg, setSaveMsg] = useState('');
 
   // Resizable right-side inspector dock (persisted across reloads). The divider sits to the LEFT of
   // the dock, so dragging it left WIDENS the inspector (startW grows as clientX decreases).
@@ -126,8 +133,19 @@ export default function TimelineEditor() {
   }, []);
 
   // ── Pose the bound subtree at time t (state + keyframe sample), then repaint. ──
-  const pose = useCallback((d: TimelineDef | null, t: number) => {
+  /** Never call directly — go through `pose`, which guarantees the preview envelope is open. */
+  const applyPose = useCallback((d: TimelineDef | null, t: number) => {
     if (!d || rootId == null) return;
+    // The invariant, asserted where the damage would happen — the twin of AnimationEditor's. A pose
+    // with no session held is unrevertible AND unguarded (run-mode reads 'stopped', so a save bakes
+    // it), and this one is the worse of the two: `previewControlAt` SPAWNS control-track prefabs.
+    if (!hasTimelinePreviewSession()) {
+      console.error(
+        '[TimelineEditor] refused to pose with no preview session held — the pose would be ' +
+        'unrevertible and a scene save would bake it. Every pose must go through `pose`.',
+      );
+      return;
+    }
     try {
       previewTimelineAt(getCurrentWorld(), rootId, d, t);
       previewControlAt(getCurrentWorld(), rootId, d, t); // control-track prefab presence (span containment)
@@ -136,6 +154,20 @@ export default function TimelineEditor() {
       console.debug('[TimelineEditor] pose failed (world not ready)', e);
     }
   }, [rootId]);
+
+  /** Pose INSIDE the preview envelope, opening it first if it is not held.
+   *
+   *  ⚠️ Same fix as `AnimationEditor.pose`, same reason: `commit()` re-poses on every timeline edit
+   *  and did NOT open the envelope, so dragging a clip posed the world (and spawned control-track
+   *  prefabs) while `getRunMode()` still read `'stopped'` — and a save then baked it over the
+   *  authored scene, with the transience guard passing. Found sweeping for siblings of the
+   *  Animation-panel instance, which cost the owner real data first. */
+  const pose = useCallback((d: TimelineDef | null, t: number) => {
+    if (!d || rootId == null) return;
+    if (hasTimelinePreviewSession()) { applyPose(d, t); return; }
+    enterScrubMode('timeline');
+    void beginTimelinePreviewSession().then(() => applyPose(d, t));
+  }, [rootId, applyPose]);
   const poseLatest = useCallback((d: TimelineDef) => pose(d, useEditorStore.getState().playheadTime), [pose]);
 
   // ── Load the doc when the open target changes ──
@@ -155,8 +187,33 @@ export default function TimelineEditor() {
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingTimelineDoc;
-    if (existing) { savedMarkRef.current?.(existing); return; } // keep unsaved edits on re-mount
+    if (existing) {
+      // ⚠️ "In sync" means EQUAL TO DISK, and a parked write means it is not. This branch marked
+      // `existing` as the saved baseline unconditionally, so re-entering the effect while a write
+      // was pending told the hook the pending doc was already written — and its reconciliation
+      // branch then DISCARDED the write (bug 1MCF9DFktot8hXsgBuWp). The rename path reaches the
+      // effect exactly this way: repointing changes `asset.path`, the panel is already loaded, so
+      // it returns HERE and never reaches the pendingAssetDoc branch below.
+      if (!pendingAssetDoc(asset.path, 'timeline')) savedMarkRef.current?.(existing);
+      return;   // either way the loaded doc stays — that is what this branch is for
+    }
     const { loadTimelineDoc } = useEditorStore.getState();
+    // An UNSAVED write parked for this asset (an agent `timeline-set`/`timeline-add-clip` under
+    // manual persistence) is not on disk yet — fetching the file would open the PRE-edit doc and
+    // re-seed the live cache with it, discarding the edit everywhere except the registry that
+    // still holds it (QA-CTX-0008). Marked saved because it is parked, not written: the pending
+    // write stays pending until Save All, and the autosave must not commit it on open.
+    const parked = pendingAssetDoc(asset.path, 'timeline');
+    if (parked) {
+      const doc = normalizeTimeline(parked as Partial<TimelineDef>);
+      // Same id/registration parity as the fetch path below — a legacy def with no in-file guid
+      // must still get one, or the asset stays unaddressable by GUID for as long as it is open.
+      if (!doc.id) doc.id = newGuid();
+      registerAsset(doc.id, asset.path, 'timeline');
+      adoptParkedDoc(asset.path, 'timeline', doc);
+      loadTimelineDoc(doc);
+      return;
+    }
     fetch(asset.path)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((json) => {
@@ -195,6 +252,13 @@ export default function TimelineEditor() {
       const a: TLAction = {
         _after: next,
         label: `timeline ${group.split(':')[0]}`,
+        // Asset-document edit: it changes a .timeline.json file, NOT any scene entity, so it must not
+        // bump the scene's edit-version. Its unsaved state is tracked by the dirty-asset registry
+        // (hasUnsavedChanges ORs both), and a falsely-dirty SCENE is not cosmetic — it self-blocks
+        // the file-direct agent routes, makes modoki_build refuse, and (since #259) makes Cmd+S
+        // interrupt a preview and rewrite the scene file on every save while authoring. The agent
+        // twins have set this since S2.27; the panels never did.
+        _isFileDirect: true,
         undo: () => { useEditorStore.getState().applyTimelineDoc(path, before); poseLatest(before); },
         redo: () => { useEditorStore.getState().applyTimelineDoc(path, a._after); poseLatest(a._after); },
       };
@@ -253,14 +317,24 @@ export default function TimelineEditor() {
   // Value-picker sources, rebuilt when the open target changes (nonce is a manual invalidation
   // key — the getters read module state the linter can't see). Audio cues pick a GUID from the
   // project's audio assets; signal markers autocomplete registered action names.
+  //
+  // `assetsVersion` is the second key, and it is load-bearing: `getAllAssets()` reads the
+  // module-level manifest map, which an import/re-import repopulates via the dev server's
+  // `asset-manifest-updated` HMR event. Keyed on `nonce` alone, a `.mp3` dropped into Assets
+  // while this panel stayed on the same timeline never reached the audio-cue picker — the
+  // memo had no reason to recompute, so the new cue was simply absent until the panel was
+  // retargeted. Same class as the SpritePicker staleness fixed in #293.
+  const assetsVersion = useEditorStore((s) => s.assetsVersion);
   const pickers = useMemo(
     () => ({
-      audioAssets: getAllAssets().filter((a) => a.type === 'audio').map((a) => ({ guid: a.guid, label: a.path.split('/').pop() ?? a.guid })),
-      prefabAssets: getAllAssets().filter((a) => a.type === 'prefab').map((a) => ({ guid: a.guid, label: a.path.split('/').pop() ?? a.guid })),
+      // Sorted by label: `getAllAssets()` is Map INSERTION order, so an asset imported
+      // during the session lands last in these dropdowns until the next reload.
+      audioAssets: byLabel(getAllAssets().filter((a) => a.type === 'audio').map((a) => ({ guid: a.guid, label: a.path.split('/').pop() ?? a.guid }))),
+      prefabAssets: byLabel(getAllAssets().filter((a) => a.type === 'prefab').map((a) => ({ guid: a.guid, label: a.path.split('/').pop() ?? a.guid }))),
       actionNames: getUIActionNames(),
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [nonce],
+    [nonce, assetsVersion],
   );
 
   // ── Delete / Backspace removes the selected item (Animation-editor convention). Scoped to the
@@ -320,17 +394,76 @@ export default function TimelineEditor() {
   // ── Exit the preview envelope: revert to the authored snapshot (discards scrub poses + forward-
   //    preview mutations + control spawns), rebind, and return to stopped. The explicit way out of
   //    preview mode (option #2), and the real fix for the scrub save-wedge. ──
-  const exitPreview = useCallback(() => {
+  /** Returns a promise resolving once the world is actually restored — Cmd+S awaits it and
+   *  serializes immediately after, so a fire-and-forget restore would let the save write the POSED
+   *  world. (The ⏹ button ignores the promise; only the save path needs it.) */
+  const exitPreview = useCallback((): Promise<void> => {
     const store = useEditorStore.getState();
     stopPreviewLoop(); // stop the loop + close gates synchronously (C7)
     store.setPreviewPlaying(false);
     clearPreviewControls();
     const path = store.editingTimelineAsset?.path;
-    void endTimelinePreviewSession({ restore: true, rebind: () => (path ? resolveDirectorRootForTimeline(path) : null) }).then((newRoot) => {
+    const done = endTimelinePreviewSession({ restore: true, rebind: () => (path ? resolveDirectorRootForTimeline(path) : null) }).then((newRoot) => {
       if (newRoot != null) useEditorStore.getState().setDirectorRoot(newRoot);
     });
     exitPreviewMode('timeline');
+    return done;
   }, [stopPreviewLoop]);
+
+  // ── Cmd+S inside the envelope: exit → save → resume at the same playhead (see PreviewSaveHandler) ──
+  // Registered only while a session is actually held, so the save never calls a panel that already
+  // exited — and the Animation panel's handler wins whenever IT owns the envelope, since whichever
+  // panel opened one registered last.
+  //
+  // ⚠️ THE HANDLER OBJECT IS STABLE, and its methods go through a ref. This is not a
+  // micro-optimisation — it is what makes the resume reachable at all.
+  //
+  // The save cycle is `suspend()` → save → `resume()`. `suspend()` is `exitPreview()`, which sets
+  // the run-mode to 'stopped' — the very condition this effect's guard bails on. So the state
+  // change the suspend itself causes tore down this effect, `clearPreviewSaveHandler` dropped the
+  // registration, the guard then refused to re-register, and by the time the (async) save
+  // finished there was no handler left to resume through. The scene was written correctly and the
+  // human's scrub session silently ended on EVERY save, with the panel still displaying a playhead
+  // for an envelope that no longer existed (bug `tSv0EWjWICpEl9HSjRe9`, QA-TIMELINE-0007).
+  //
+  // Keeping one object alive is what lets `saveCommand` fall back to it. Reading the callbacks
+  // out of a ref is what makes that fallback CORRECT: `suspend()` rebuilds the world and
+  // re-resolves the Director root, so `poseAt` is a different closure afterwards — resuming
+  // through the captured one would pose a dead root, which is the trap
+  // `currentPreviewSaveHandlerFor` was written for.
+  const previewHooks = useRef({ exitPreview, poseAt });
+  previewHooks.current = { exitPreview, poseAt };
+  // Is this panel still mounted? A save cycle that finds no registration must tell "the panel
+  // closed" (do not resume — it would wedge the run-mode at 'scrub' with nobody driving it) from
+  // "the suspend deregistered us" (resume: the human is still here). Nothing else can.
+  const mountedRef = useRef(true);
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
+  const saveHandlerRef = useRef<PreviewSaveHandler | null>(null);
+  if (!saveHandlerRef.current) {
+    saveHandlerRef.current = {
+      owner: 'timeline',
+      isLive: () => mountedRef.current,
+      suspend: () => previewHooks.current.exitPreview(),
+      resume: () => {
+        const st = useEditorStore.getState();
+        enterScrubMode('timeline');
+        const pose = previewHooks.current.poseAt;
+        void beginTimelinePreviewSession().then(() => pose(st.playheadTime));
+      },
+    };
+  }
+  useEffect(() => {
+    // ⚠️ `runMode` here is the REACTIVE one (subscribed above), not `getRunMode()`. Reading it
+    // imperatively meant this effect had no dep that changed when a plain ruler scrub opened the
+    // envelope — so it never re-ran, the handler was never registered, and Cmd+S fell through to
+    // the flat refusal ("exit scrub to save") on a clean scene: exactly the non-event warning the
+    // assets-only branch exists to remove. The Animation panel worked only because its own dep
+    // happens to be a `useState` that the scrub sets.
+    if (!playing && runMode === 'stopped') return;
+    const mine = saveHandlerRef.current!;
+    setPreviewSaveHandler(mine);
+    return () => clearPreviewSaveHandler(mine);
+  }, [playing, runMode]);
 
   // ── Preview playback loop ──
   // ── ▶ Preview: a real FORWARD playthrough — poses (keyframe + skeletal seek + activation) AND
@@ -438,18 +571,8 @@ export default function TimelineEditor() {
     if (asset) st.setDirectorRoot(resolveDirectorRootForTimeline(asset.path));
   }), []);
 
-  // ── Debounced validated save ──
-  const writeDoc = useCallback((d: TimelineDef): Promise<boolean> => {
-    const path = asset?.path;
-    if (!path) return Promise.resolve(false);
-    setSaveMsg('Saving…');
-    return backendFetch('/api/asset-write', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, type: 'timeline', data: d }),
-    }).then((res) => { setSaveMsg(res.ok ? 'Saved ✓' : `Save failed (${res.status})`); return res.ok; })
-      .catch((e) => { setSaveMsg('Save failed'); console.warn('[TimelineEditor] save failed', e); return false; });
-  }, [asset?.path]);
-  const { markSaved } = useDebouncedSave(doc, writeDoc, AUTOSAVE_MS);
+  // ── Park the edit; Cmd+S writes it (#259) ──
+  const { markSaved, dirty } = useParkedAssetDoc(doc, asset?.path, 'timeline');
   savedMarkRef.current = markSaved;
 
   if (!asset) return <div style={{ padding: 12, color: '#8a8a96', fontSize: 12 }}>No timeline open. Double-click a <code>.timeline.json</code> in Assets, or open a Director&apos;s timeline.</div>;
@@ -492,7 +615,7 @@ export default function TimelineEditor() {
               ? `● Preview ${runMode === 'preview' && advancing ? 'playing' : 'paused'}`
               : runMode === 'playing'
                 ? (advancing ? '▶ Playing (Game)' : '⏸ Play paused')
-                : 'Editing'}{saveMsg ? ` · ${saveMsg}` : ''}
+                : 'Editing'} · {saveStatusLabel(dirty)}
         </span>
       </div>
 

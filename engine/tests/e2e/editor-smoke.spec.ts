@@ -84,3 +84,62 @@ test('clicking an entity row in the Hierarchy selects it (DOM wiring)', async ({
   await page.getByText('OffsetSphere', { exact: true }).click();
   await expect.poll(() => selectedName(page)).toBe('OffsetSphere');
 });
+
+/** The pick PREDICTION must agree with the real click.
+ *
+ *  `modoki_tap`'s entity aim asks the surface's own hit-test what a click would select and refuses
+ *  when the answer is not the target (reporting it as `occludedByEntity`). That guarantee is only
+ *  worth anything if the prediction matches what actually happens — and it did not: the transform
+ *  gizmo of the SELECTED entity sits exactly where an aim lands, TransformControls consumes the
+ *  press, and the selection does not move, while the predictor happily named whatever mesh was
+ *  behind the gizmo (testboard UfbeEfhHmNwd0GVVnESC, 2026-08-19). The gizmo is now part of the
+ *  prediction, so this asserts the invariant rather than the mechanism: predict, click, compare. */
+test('the pick prediction agrees with what the click actually selects, gizmo included', async ({ page }) => {
+  await gotoEditorWithScene(page);
+  const { cx, cy } = await viewportCenter(page);
+  // Select the cube first — that is what puts a transform gizmo over the viewport centre.
+  await expect.poll(async () => {
+    await page.mouse.click(cx, cy);
+    return selectedName(page);
+  }, { timeout: 15_000, intervals: [150, 300, 500, 800] }).toBe('CenterCube');
+
+  // WAIT for the gizmo to actually attach before predicting anything. Selection is committed on
+  // pointer-up but the gizmo is attached by the render loop a frame or more later, so a prediction
+  // read in that window says "nothing here" while the click that follows is already being eaten by
+  // the arm — a real race that failed this spec once in a full-suite run. Poll a point ON the arm
+  // until it predicts SOMETHING; that is the steady state the agreement claim is about. (A timeout
+  // here means the prediction never accounts for the gizmo at all — the bug this spec guards.)
+  await expect.poll(
+    () => page.evaluate(([x, y]) => (window as any).__modokiEditorTest.predictPickAt(x, y) ?? null, [cx + 60, cy] as const),
+    { timeout: 15_000, intervals: [100, 200, 400, 800] },
+  ).not.toBeNull();
+
+  // A ring around the gizmo, wide enough to leave the cube's own silhouette (~30 px) but inside
+  // the gizmo arms' reach (~110 px), plus one point far outside everything. The interesting
+  // candidates are the ones over EMPTY SKY but ON an arm: there the naive predictor says "nothing
+  // here" while the click is eaten by the gizmo and the selection does not clear.
+  const ring = ([60, 90] as const).flatMap((r) =>
+    ([[1, 0], [0, -1], [-1, 0], [0, 1], [0.7, -0.7], [-0.7, -0.7], [0.7, 0.7], [-0.7, 0.7]] as const)
+      .map(([ux, uy]) => [Math.round(ux * r), Math.round(uy * r)] as const));
+  for (const [dx, dy] of [[0, 0] as const, ...ring, [200, 140] as const]) {
+    const predicted = await page.evaluate(
+      ([x, y]) => (window as any).__modokiEditorTest.predictPickAt(x, y) ?? null,
+      [cx + dx, cy + dy] as const,
+    );
+    await page.mouse.click(cx + dx, cy + dy);
+    const actual = await selectedId(page);
+    expect(actual, `prediction disagreed with the click at (+${dx}, +${dy})`).toBe(predicted);
+    // Re-arm: leave the cube selected so the next iteration still has a gizmo on screen — and wait
+    // for the gizmo to be back before the next prediction, for the same reason as above.
+    if (actual === null) {
+      await expect.poll(async () => {
+        await page.mouse.click(cx, cy);
+        return selectedName(page);
+      }, { timeout: 15_000, intervals: [150, 300, 500] }).toBe('CenterCube');
+      await expect.poll(
+        () => page.evaluate(([x, y]) => (window as any).__modokiEditorTest.predictPickAt(x, y) ?? null, [cx + 60, cy] as const),
+        { timeout: 15_000, intervals: [100, 200, 400, 800] },
+      ).not.toBeNull();
+    }
+  }
+});

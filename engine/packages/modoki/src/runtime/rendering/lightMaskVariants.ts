@@ -12,7 +12,7 @@
  *  seeing only ambient + directional = 98 ms; dropping the post-FX stack on top of that = 20 ms
  *  (49 fps). Culling lights was worth ~470 ms of that 689 while the ENTIRE post-FX stack was
  *  worth 104 — hence a light-count cap being the highest-value low-tier knob there is.
- *  Detail: docs/plans/low-end-device-support.md §4.
+ *  Detail: docs/rendering.md § "Quality tiers" → "The automatic light cap".
  *
  *  MECHANISM: three's `NodeMaterial.lightsNode` overrides the scene's global light list for one
  *  material, in a SINGLE pass (`NodeMaterial.js` — `this.lightsNode || builder.lightsNode`). It
@@ -44,6 +44,7 @@
 
 import * as THREE from 'three';
 import { onWorldSwap } from '../core/ecs/world';
+import { markDerived, retireDerivedMaterial } from './derivedMaterials';
 
 /** Layer 0. Both `Light.renderingLayerMask` and a renderable's default to this, so masks are
  *  opt-in: an unauthored scene behaves exactly as it did before the feature existed. */
@@ -268,12 +269,41 @@ export function getMaskedMaterial(
   // looked correct. `baseOf` lets the caller recover the true base instead. Same discipline
   // materialInstanceClones states for its own base: never read it off `mesh.material`.
   material.userData = { ...material.userData, [BASE_KEY]: base };
+  // Second stamp, different question (#318). BASE_KEY answers "re-derive from THIS", which is why
+  // a tint clone must answer it with itself; `markDerived` answers "my texture references belong
+  // to that", so the retired-material sweep can see that a mesh binding this variant is still
+  // holding the base — and the base's textures — through it.
+  markDerived(material, base);
   owned.add(material);
   variants.set(key, { material });
   return material;
 }
 
 const BASE_KEY = '__lightMaskBase';
+
+/** Drop every variant derived from `base`, retiring each so it is disposed once no mesh binds it.
+ *
+ *  Called when `base` itself has gone stale — a re-imported `.mat.json` (the retired instance a
+ *  bound variant recovers through `baseOf`), or a superseded tint clone. Eviction alone would not
+ *  be enough and is not what fixes the staleness: the CALLER must also re-derive from the fresh
+ *  base, because a variant re-derived from the dead one lands on the same key. This is the
+ *  lifetime half — without it the orphaned variant sits in `owned` until world swap, holding
+ *  texture references its base is about to release.
+ *
+ *  Idempotent: a second call for the same base finds nothing. */
+export function retireVariantsOf(base: THREE.Material): void {
+  for (const [key, variant] of [...variants]) {
+    if ((variant.material.userData as Record<string, unknown> | undefined)?.[BASE_KEY] !== base) continue;
+    variants.delete(key);
+    // Out of `owned` at RETIRE time, not at dispose time: otherwise a world swap in between would
+    // dispose it from both sides.
+    owned.delete(variant.material);
+    const stale = variant.material;
+    retireDerivedMaterial(stale, () => stale.dispose());
+  }
+  // The lights nodes are deliberately left alone — they are keyed by light SELECTION, shared
+  // across every base, and own the shadow state a rebuilt variant will bind straight back to.
+}
 
 /** The material `m` was derived from, or `m` itself when it is not a variant. Callers hand this
  *  back into `getMaskedMaterial` so a re-entrant frame keys off the ORIGINAL base. */

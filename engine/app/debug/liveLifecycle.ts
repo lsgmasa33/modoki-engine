@@ -1,5 +1,5 @@
 /** Live-world entity lifecycle — create / duplicate / delete, shared by the DEVICE and the editor
- *  (#166 P2, docs/plans/device-authoring-parity-plan.md).
+ *  (#166 P2, docs/mcp-tool-conventions.md §9).
  *
  *  These are the undo-free RUNTIME twins of the editor ops in `../editor/agentEditorOps.ts`. The
  *  editor registers its own richer, undoable versions at editor startup, and `registerAgentOp` is a

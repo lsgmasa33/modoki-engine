@@ -9,7 +9,7 @@
  */
 
 import * as THREE from 'three';
-import { KTX2Loader } from 'three/examples/jsm/loaders/KTX2Loader.js';
+import type { KTX2Loader } from 'three/examples/jsm/loaders/KTX2Loader.js';
 import type { WebGPURenderer } from 'three/webgpu';
 import { assetUrl, withCacheBust } from './assetUrl';
 import { resolveRef, getAssetEntry, isGuid, getAtlasFrame, type AtlasFrameRef } from './assetManifest';
@@ -21,7 +21,10 @@ import { envVariantSuffix, type EnvFormat } from '../core/environmentSettings';
 import {
   setActiveRendererHandle, ktx2CapsReady, areKtx2CapsReady, markKtx2CapsReady,
 } from '../core/activeRenderer';
+import { ktx2LoaderCtor, prewarmGlbLoaders } from './threeLoaderModules';
 import { warnVocabOnce } from '../core/warnVocab';
+import { getActiveTextureSizeCap } from '../core/textureSizeCap';
+import { emitAssetInvalidated } from '../core/assetInvalidation';
 export { getActiveRenderer, onRendererReady, rendererReady, getRendererGateHealth } from '../core/activeRenderer';
 export type { RendererGateHealth } from '../core/activeRenderer';
 export type { ResolvedSprite } from '../core/textureProvider';
@@ -37,10 +40,21 @@ let ktx2Loader: KTX2Loader | null = null;
 let texLoader: THREE.TextureLoader | null = null;
 let detectedCaps = { astc: false };
 
-export function getKTX2Loader(): KTX2Loader {
+/** The shared KTX2 transcoder. ASYNC because three's `KTX2Loader` module is imported on
+ *  demand behind the `render3d` gate (#254) — a static import here put 60.2 kB of transcoder
+ *  into every 2D-only bundle, reachable from the runtime barrel. Every caller was already on
+ *  an async path (all of them gate on `ensureKtx2Caps` first — see `ktx2CapsGuard`), so this
+ *  costs no new plumbing; the memo keeps it to one import and one loader. */
+export async function getKTX2Loader(): Promise<KTX2Loader> {
   if (!ktx2Loader) {
-    ktx2Loader = new KTX2Loader();
-    ktx2Loader.setTranscoderPath(assetUrl('/basis/'));
+    const Ctor = await ktx2LoaderCtor();
+    // Re-check: two concurrent callers can both pass the guard above and await in parallel.
+    // Whoever lands second must reuse the first loader, or `detectSupport` gets applied to a
+    // loader nobody else holds and every KTX2 load after it rejects on missing caps.
+    if (!ktx2Loader) {
+      ktx2Loader = new Ctor();
+      ktx2Loader.setTranscoderPath(assetUrl('/basis/'));
+    }
   }
   return ktx2Loader;
 }
@@ -52,9 +66,9 @@ function getTextureLoader(): THREE.TextureLoader {
 /** Register the active renderer so the KTX2Loader can detect which compressed
  *  formats the GPU supports. Must run after `renderer.init()` for WebGPU.
  *  Idempotent + cheap — safe to call from every renderer creation site. */
-export function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer): void {
+export async function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer): Promise<void> {
   try {
-    const loader = getKTX2Loader();
+    const loader = await getKTX2Loader();
     loader.detectSupport(renderer as never);
     const cfg = (loader as unknown as { workerConfig?: { astcSupported?: boolean } }).workerConfig;
     detectedCaps = { astc: !!cfg?.astcSupported };
@@ -62,6 +76,9 @@ export function setActiveRenderer(renderer: WebGPURenderer | THREE.WebGLRenderer
     console.warn('[textureResolver] detectSupport failed:', e);
   }
   setActiveRendererHandle(renderer);
+  // A 3D renderer exists, so a GLB parse is likely imminent — start fetching the on-demand
+  // loader chunks now rather than on the critical path of the first model load (#254).
+  prewarmGlbLoaders();
 }
 
 /** Default delay before `ensureKtx2Caps` gives up waiting for a real viewport and stands up a
@@ -83,7 +100,7 @@ async function runCapsProbe(
       let probe: WebGPURenderer | THREE.WebGLRenderer | undefined;
       try {
         probe = await probeFactory();
-        getKTX2Loader().detectSupport(probe as never);
+        (await getKTX2Loader()).detectSupport(probe as never);
       } catch (e) {
         // Resolve anyway: a per-texture rejection with a clear cause beats an eternal hang for
         // every future KTX2 load. `detectSupport` copies capability booleans synchronously and
@@ -105,13 +122,25 @@ async function runCapsProbe(
  *  (`capsProbeRenderer.ts`, dynamically imported so `runtime/loaders` never statically depends
  *  on `runtime/rendering` — see `docs/architecture-layers.md`'s cycle guard) purely to run
  *  `detectSupport`. Never rejects — a probe failure still resolves the gate (see `runCapsProbe`)
- *  so a dead GPU degrades to per-texture errors instead of hanging every future KTX2 load. */
+ *  so a dead GPU degrades to per-texture errors instead of hanging every future KTX2 load.
+ *  In a `build.modules.render3d: false` bundle there is no probe at all — see the gate below. */
 export async function ensureKtx2Caps(opts?: {
   delayMs?: number;
   probeFactory?: () => Promise<WebGPURenderer | THREE.WebGLRenderer>;
   timers?: { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout };
 }): Promise<void> {
   if (areKtx2CapsReady()) return;
+  // No 3D renderer in this build → there is nothing for a probe to detect, and standing one up
+  // is what dragged 546 KB of `three/webgpu` into a 2D-only bundle (#214): the probe is the ONLY
+  // module reaching `scene3DSync` from a 2D boot, so this early return is what lets Rolldown DCE
+  // the `import('../rendering/capsProbeRenderer')` below — keep the import AFTER it (same shape
+  // as `materialPresets`'s fileShaderBuilder gate). Nothing is lost: three's KTX2Loader is a
+  // 3D-only consumer (PixiJS transcodes the 2D path itself), `selectVariant`'s '2d' branch
+  // returns before it ever reads `detectedCaps`, and every caller of this gate — scene3DSync,
+  // riggedModelCache, the editor — is itself 3D-only. Resolving (rather than hanging or
+  // rejecting) keeps the contract this function documents: it never rejects, and a caller that
+  // somehow reaches it in a 2D build proceeds instead of waiting forever.
+  if (!__MODOKI_MODULE_RENDER3D__) { markKtx2CapsReady('no-3d'); return; }
   const delayMs = opts?.delayMs ?? KTX2_PROBE_DELAY_MS;
   const timers = opts?.timers ?? {
     setTimeout: globalThis.setTimeout.bind(globalThis),
@@ -144,9 +173,17 @@ export function resolveTextureVariantUrl(ref: string, usage: '2d' | '3d'): strin
   const settings = entry?.texture;
   if (!settings) return assetUrl(sourcePath); // unconverted → source fallback
   const variant = selectVariant(settings, usage, detectedCaps);
+  // Texture LOD by quality tier (#212). The active tier's cap is used ONLY when the manifest
+  // says a variant was actually EMITTED at that size — never guessed. A cap the build didn't
+  // produce (project authors no tiers; this size wasn't below this texture's own maxSize/source
+  // dims; an older manifest predating this feature) falls straight through to today's URL,
+  // unchanged — the resolver must not request a file that may not exist (a missing asset hangs
+  // rather than fails, per this repo's own history).
+  const cap = getActiveTextureSizeCap();
+  const sizeCap = cap > 0 && settings.sizes?.includes(cap) ? cap : undefined;
   // Cache-bust immutable production assets with the content hash (shared helper —
   // matches modelGlbUrl + the invalidateTexture eviction key below).
-  return withCacheBust(assetUrl(sourcePath + variantSuffix(variant)), entry?.hash);
+  return withCacheBust(assetUrl(sourcePath + variantSuffix(variant, sizeCap)), entry?.hash);
 }
 
 /** Resolve an environment (HDR) ref to the served URL of its converted variant
@@ -191,6 +228,42 @@ function resolveAtlasPageBrowserUrl(frame: AtlasFrameRef): string | undefined {
   return withCacheBust(assetUrl(`${atlasPath}~page${frame.page}${variantSuffix(variant)}`), frame.hash);
 }
 
+/** One-time warn for a 2D sprite ref that will never resolve.
+ *
+ *  WHY (QA-ASSET-0011). The 3D path warns once per unresolvable guid via
+ *  `resolveRefWarnOnce` (`[MeshCache] Unknown asset guid: …`); the 2D path returned
+ *  `undefined` and both Scene2D call sites bailed silently ("wait for next frame" — which
+ *  never ends for a ref that will never resolve). Delete a texture a 2D sprite references
+ *  and you got a blank screen with a clean console. The asymmetry WAS the defect. Warned
+ *  here rather than at the two call sites so every `resolveSprite` consumer inherits it.
+ *
+ *  Deduped per ref, so the transient window before the manifest loads costs at most one line —
+ *  the same trade `resolveRefWarnOnce` already makes on the 3D side. But a ref that LATER
+ *  resolves is FORGOTTEN (`forgetUnresolvedSprite`), so that transient miss cannot permanently
+ *  silence the guid: without that, a ref that failed once before the manifest arrived, then
+ *  worked, then genuinely broke mid-session would fail in exactly the "blank screen, clean
+ *  console" way this warning exists to prevent. (The 3D `unknownGuidSeen` sets had the same gap
+ *  until QA-ASSET-0005 measured its cost; `resolveRefWarnOnce` forgets a resolving ref too now.) */
+const _unresolvedSpriteWarned = new Set<string>();
+function warnUnresolvedSprite(ref: string, why: string): undefined {
+  if (!isGuid(ref) || _unresolvedSpriteWarned.has(ref)) return undefined;
+  _unresolvedSpriteWarned.add(ref);
+  console.warn(`[Sprite2D] Unknown asset guid: ${ref}\n  (${why} — deleted, dropped from the build, renamed, or never assigned an id?)`);
+  return undefined;
+}
+
+/** A ref that resolves is no longer "unresolved" — drop it so a future genuine failure warns. */
+function forgetUnresolvedSprite(ref: string): void {
+  if (_unresolvedSpriteWarned.size) _unresolvedSpriteWarned.delete(ref);
+}
+
+/** Forget every warned ref. Called by the harness teardown (`createTestWorld().dispose()`)
+ *  alongside the other warn-once registries, so a warning assertion cannot be swallowed by a
+ *  sibling test that already tripped it. */
+export function resetUnresolvedSpriteWarnings(): void {
+  _unresolvedSpriteWarned.clear();
+}
+
 /** Resolve a 2D image-or-sprite ref to `{ url, frame, pivot }`.
  *  - A sprite GUID that's a member of a BUILT atlas resolves to the atlas page URL +
  *    its rect ON THE PAGE. `sheetW/sheetH` carry the page dims so a consumer can
@@ -206,6 +279,7 @@ export function resolveSprite(ref: string): ResolvedSprite | undefined {
   if (af) {
     const url = resolveAtlasPageUrl(af, '2d');
     if (url) {
+      forgetUnresolvedSprite(ref);
       return { url, frame: { ...af.rect }, pivot: { ...af.pivot }, sheetW: af.pageW, sheetH: af.pageH };
     }
     // No 2D page variant (mis-set atlas format) — fall through to the source sprite.
@@ -215,7 +289,8 @@ export function resolveSprite(ref: string): ResolvedSprite | undefined {
     // Resolve the URL through the parent texture's 2D variant (the slice has no file
     // of its own). Phase-2 packing will redirect this to the atlas page + page rect.
     const url = resolveTextureVariantUrl(entry.sprite.texture, '2d');
-    if (!url) return undefined;
+    if (!url) return warnUnresolvedSprite(ref, `its parent texture ${entry.sprite.texture} has no 2D variant`);
+    forgetUnresolvedSprite(ref);
     return {
       url, frame: { ...entry.sprite.rect }, pivot: { ...entry.sprite.pivot },
       sheetW: entry.sprite.sheetW ?? null, sheetH: entry.sprite.sheetH ?? null,
@@ -223,7 +298,8 @@ export function resolveSprite(ref: string): ResolvedSprite | undefined {
     };
   }
   const url = resolveTextureVariantUrl(ref, '2d');
-  if (!url) return undefined;
+  if (!url) return warnUnresolvedSprite(ref, 'not in the manifest');
+  forgetUnresolvedSprite(ref);
   return { url, frame: null, pivot: null, sheetW: null, sheetH: null };
 }
 
@@ -272,6 +348,12 @@ export function resolveBrowserImageUrl(ref: string, warnKtx = false): string | u
     // The WebP/PNG sibling a 2d/ui texture exposes (mirrors what the build emits).
     const variant = browserVariant(settings.format, texEntry?.textureType);
     if (variant) {
+      // It has a sibling now → forget any earlier complaint about this ref, so a retype BACK to
+      // `3d` (or a re-import that drops the sibling) warns again instead of riding on the
+      // silence the first warning bought. Retype+reimport is the DOCUMENTED repair for this
+      // exact warning and it only started taking effect live once `textureType` reached the
+      // runtime manifest (QA-ASSET-0007) — so this condition genuinely flips mid-session now.
+      if (_domKtxWarned.size) _domKtxWarned.delete(ref);
       return withCacheBust(assetUrl(sourcePath + variantSuffix(variant)), texEntry?.hash);
     }
     // 3d-typed KTX2 texture in the DOM → no browser variant on disk.
@@ -326,6 +408,21 @@ interface TexCacheEntry {
 }
 const texCache = new Map<string, TexCacheEntry>();
 
+/** Entries evicted by `invalidateTexture` while materials still BIND their texture.
+ *
+ *  Eviction used to `dispose()` unconditionally, ignoring `refCount` — a use-after-free by
+ *  construction: a live material kept `mat.map` pointing at a destroyed GPUTexture, and the
+ *  next frame died with "Destroyed texture used in a submit". Freshness is not what required
+ *  that; freshness comes from holders RE-RESOLVING after `emitAssetInvalidated`. So an evicted
+ *  entry is retired here instead, unreachable to new lookups but still reachable to the
+ *  refcount, and the LAST `releaseTexture3D` frees it exactly as the refcount intended.
+ *
+ *  ⚠️ Keyed by the TEXTURE INSTANCE, never by the cache key. A re-load after invalidation
+ *  builds a new entry under the SAME key (the URL is unchanged in dev — the ?v= cache-bust
+ *  only moves when the content hash does), so a key-keyed map would let a stale release
+ *  decrement the NEW entry and dispose a texture that is very much in use. */
+const retired = new Map<THREE.Texture, TexCacheEntry>();
+
 function texCacheKey(url: string, isKtx: boolean, flipY?: boolean): string {
   // KTX2 is always bottom-origin (applyTextureSettings forces flipY=false), so flipY
   // doesn't differentiate the resulting texture there — keep those calls on ONE entry.
@@ -347,7 +444,6 @@ export async function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Pr
   if (hit) { hit.refCount++; return hit.promise; }
 
   const settings = getTextureSettings(ref);
-  const loader = isKtx ? getKTX2Loader() : getTextureLoader();
   const entry: TexCacheEntry = { promise: undefined as never, texture: null, refCount: 1, url };
   // Gate KTX2 loads on transcoder caps: KTX2Loader.loadAsync throws "Missing
   // initialization with `.detectSupport( renderer )`" if it runs before caps are known.
@@ -363,7 +459,11 @@ export async function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Pr
   const gate = isKtx && !areKtx2CapsReady() ? ensureKtx2Caps() : Promise.resolve();
   // Cast unifies the KTX2Loader/TextureLoader loadAsync union (CompressedTexture
   // extends Texture) so the extra `.then` gate doesn't break inference.
-  entry.promise = gate.then(() => loader.loadAsync(url) as Promise<THREE.Texture>).then((loaded) => {
+  entry.promise = gate
+    // The KTX2 loader module is imported on demand (#254), so pick the loader AFTER the caps
+    // gate rather than before it — the two awaits collapse into the one the gate already cost.
+    .then((): Promise<KTX2Loader | THREE.TextureLoader> => (isKtx ? getKTX2Loader() : Promise.resolve(getTextureLoader())))
+    .then((loader) => loader.loadAsync(url) as Promise<THREE.Texture>).then((loaded) => {
     const tex = loaded as THREE.Texture;
     applyTextureSettings(tex, settings, isKtx, opts?.flipY);
     (tex.userData as Record<string, unknown>)[KEY] = key;
@@ -386,13 +486,35 @@ export async function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Pr
  *  safe no-op. Call this — never `tex.dispose()` — for anything from `loadTexture3D`. */
 export function releaseTexture3D(tex: THREE.Texture | null | undefined): void {
   if (!tex) return;
+  // Retired first: this texture was evicted while still bound, so its entry is no longer in
+  // texCache and the key lookup below would either miss (leak) or hit a NEWER entry (dispose
+  // a live texture). Checked by instance, so neither can happen.
+  const retiredEntry = retired.get(tex);
+  if (retiredEntry) {
+    if (--retiredEntry.refCount > 0) return;
+    tex.dispose();
+    retired.delete(tex);
+    return;
+  }
   const key = (tex.userData as Record<string, unknown> | undefined)?.[KEY] as string | undefined;
   if (!key) { tex.dispose(); return; } // not shared-cache owned → dispose directly
   const entry = texCache.get(key);
-  if (!entry) return; // already force-evicted by invalidateTexture (texture disposed there)
+  if (!entry) return; // no entry and not retired — already fully released
+  // A re-load after an invalidation occupies the same key with a DIFFERENT texture. Releasing
+  // the old instance must not decrement the new entry. (`entry.texture` is null only while the
+  // load is still in flight, where the instance cannot be this one anyway.)
+  if (entry.texture && entry.texture !== tex) return;
   if (--entry.refCount > 0) return;
   entry.texture?.dispose();
   texCache.delete(key);
+}
+
+/** Whether `tex` is an evicted-but-still-referenced texture (see `retired`). Lets the material
+ *  cache find the live materials that a texture re-import just orphaned, so they re-resolve to
+ *  the fresh bytes AND release the retired instance — without that, `invalidateTexture` alone
+ *  leaves the viewport sampling the pre-reimport image forever. */
+export function isRetiredTexture(tex: THREE.Texture | null | undefined): boolean {
+  return !!tex && retired.has(tex);
 }
 
 /** Whether `tex` came from the shared cache (and so must be freed via
@@ -408,7 +530,11 @@ export function isSharedTexture(tex: THREE.Texture | null | undefined): boolean 
 export function getSharedTextureStats(): { count: number; refs: number } {
   let refs = 0;
   for (const e of texCache.values()) refs += e.refCount;
-  return { count: texCache.size, refs };
+  // Retired entries are still ALIVE (a material binds them) and still hold refs — omitting
+  // them would report a re-imported scene as holding fewer textures than it does, which is
+  // the opposite of what a leak check wants to see.
+  for (const e of retired.values()) refs += e.refCount;
+  return { count: texCache.size + retired.size, refs };
 }
 
 /** Hard reset — dispose every shared texture regardless of refcount and clear the
@@ -418,14 +544,24 @@ export function getSharedTextureStats(): { count: number; refs: number } {
 export function disposeAllSharedTextures(): void {
   for (const e of texCache.values()) e.texture?.dispose();
   texCache.clear();
+  // Retired-but-still-referenced entries are part of "every shared texture" — a teardown that
+  // skipped them would leak exactly the textures an editor session re-imported.
+  for (const t of retired.keys()) t.dispose();
+  retired.clear();
 }
 
 /** Drop the shared cache's textures for a ref's variants so a subsequent load
  *  re-fetches + re-transcodes the freshly-converted files. Called by the editor's
- *  texture re-import + model re-import, both of which then reload the active scene —
- *  materials rebuild and re-acquire fresh bytes. The old THREE.Texture instances are
- *  force-disposed here regardless of refcount; any outstanding `releaseTexture3D` on
- *  them becomes a safe no-op (the entry is already gone), so there's no double dispose. */
+ *  texture re-import + model re-import.
+ *
+ *  ⚠️ It does NOT dispose a texture that is still referenced. It used to — force-disposing
+ *  regardless of refcount — and that is a use-after-free: a live material keeps `mat.map`
+ *  pointing at the destroyed instance, and the next frame dies with "Destroyed texture used in
+ *  a submit" (owner-reported on a 3d-test island re-import). Disposal was never what made the
+ *  re-import take effect; RE-RESOLVING is, via the `emitAssetInvalidated` above plus the
+ *  material rebuild. Evicted-but-referenced entries are retired (see `retired`) and freed by
+ *  the last `releaseTexture3D`, which arrives through `disposeMaterial` when the material
+ *  re-resolves — so the texture and material invalidations are order-independent. */
 export function invalidateTexture(ref: string): void {
   // `ref` is normally a GUID, but the editor's texture re-import + model import
   // call this with the asset PATH directly. resolveRef rejects internal paths
@@ -433,17 +569,40 @@ export function invalidateTexture(ref: string): void {
   // as-is — this is just a cache key, so the literal source is what we want.
   const sourcePath = isGuid(ref) ? resolveRef(ref) : ref;
   if (!sourcePath) return;
+  // Announce BEFORE evicting, matching invalidateModel (#304). Panels keyed on the
+  // asset PATH are the reason this event exists — a re-import rewrites the bytes
+  // behind a path without changing it, so nothing else tells a Texture Inspector
+  // that its sidecar-derived stats just went stale. Callers may pass a GUID; the
+  // resolved source path is what a subscriber can match itself against.
+  emitAssetInvalidated('texture', sourcePath);
   // The set of variant URLs this ref could have been loaded under — built with the
   // SAME key construction loadTexture3D uses, including the ?v=<hash> suffix in prod.
   const hash = getAssetEntry(ref)?.hash;
   const urls = new Set<string>();
+  // ⚠️ **EVERY EMITTED SIZE, NOT JUST THE UNCAPPED ONE (#212).** This set is matched against
+  // `TexCacheEntry.url`, so a variant missing from it can never be evicted — and a per-tier capped
+  // texture (`~uastc@512.ktx2`) was missing from it for exactly as long as the feature existed.
+  // Measured: `invalidateAssets` reported `textures: 0` on a scene holding 21 of them. It fails
+  // SILENTLY in the worst direction for an editor re-import — the stale texture simply stays on
+  // screen and the author concludes their re-import did not take.
+  const sizes: (number | undefined)[] = [undefined, ...(getAssetEntry(ref)?.texture?.sizes ?? [])];
   for (const v of ['uastc', 'etc1s', 'astc', 'webp', 'png'] as const) {
-    urls.add(withCacheBust(assetUrl(sourcePath + variantSuffix(v)), hash));
+    for (const size of sizes) {
+      urls.add(withCacheBust(assetUrl(sourcePath + variantSuffix(v, size)), hash));
+    }
   }
   urls.add(withCacheBust(assetUrl(sourcePath), hash));
-  // Force-evict + dispose any shared textures bound to those URLs.
+  // Evict any shared textures bound to those URLs, so the next loadTexture3D misses and
+  // fetches the re-imported bytes. It does NOT dispose: a live material still binds the old
+  // instance, and destroying it under the renderer is the use-after-free described on
+  // `retired`. The last releaseTexture3D frees it — which arrives via disposeMaterial when the
+  // material re-resolves, so the two invalidations are order-independent by construction.
   for (const [key, entry] of texCache) {
-    if (urls.has(entry.url)) { entry.texture?.dispose(); texCache.delete(key); }
+    if (!urls.has(entry.url)) continue;
+    texCache.delete(key);
+    if (entry.texture) retired.set(entry.texture, entry);
+    // Still loading: retire it once it resolves, or its refs could never be freed.
+    else entry.promise.then((t) => { retired.set(t, entry); }).catch(() => { /* load failed — nothing to free */ });
   }
   // THREE.Cache holds decoded image bytes only when Cache.enabled (it isn't, today);
   // evict for parity in case it's ever turned on.

@@ -49,22 +49,39 @@ describe('resolveSceneCandidates (fallback order)', () => {
 });
 
 describe('resolveBootSceneOverride (issue #43 — --scene / MODOKI_SCENE launch override)', () => {
-  const SCENES = ['/assets/scenes/Level-0001.json', '/assets/scenes/Level-0002.json', '/assets/scenes/main.json'];
+  // The fixture uses the `<name>.scene.json` DOUBLE extension every real project uses.
+  // It did not (single `.json`) until QA-PROJECT-0003, and that is precisely why a
+  // green suite sat on top of a bare-name override that could never match in practice.
+  // One legacy single-extension entry stays so both strips are covered.
+  const SCENES = [
+    '/assets/scenes/Level-0001.scene.json',
+    '/assets/scenes/Level-0002.scene.json',
+    '/assets/scenes/main.scene.json',
+    '/assets/scenes/legacy.json',
+  ];
 
   it('returns a path candidate verbatim, no lookup (contains a slash)', () => {
-    expect(resolveBootSceneOverride('/assets/scenes/Level-0002.json', SCENES)).toBe('/assets/scenes/Level-0002.json');
+    expect(resolveBootSceneOverride('/assets/scenes/Level-0002.scene.json', SCENES)).toBe('/assets/scenes/Level-0002.scene.json');
     // Not even present in the list — still passed through untouched.
-    expect(resolveBootSceneOverride('/assets/scenes/not-in-manifest.json', SCENES)).toBe('/assets/scenes/not-in-manifest.json');
+    expect(resolveBootSceneOverride('/assets/scenes/not-in-manifest.scene.json', SCENES)).toBe('/assets/scenes/not-in-manifest.scene.json');
   });
 
   it('returns a bare filename verbatim, no lookup (ends in .json)', () => {
-    expect(resolveBootSceneOverride('Level-0002.json', SCENES)).toBe('Level-0002.json');
+    expect(resolveBootSceneOverride('Level-0002.scene.json', SCENES)).toBe('Level-0002.scene.json');
+  });
+
+  it('matches a bare name against a *.scene.json file (QA-PROJECT-0003)', () => {
+    expect(resolveBootSceneOverride('Level-0002', SCENES)).toBe('/assets/scenes/Level-0002.scene.json');
+  });
+
+  it('still matches a bare name against a legacy single-extension *.json file', () => {
+    expect(resolveBootSceneOverride('legacy', SCENES)).toBe('/assets/scenes/legacy.json');
   });
 
   it('matches a bare name case-insensitively against the scene list', () => {
-    expect(resolveBootSceneOverride('level-0002', SCENES)).toBe('/assets/scenes/Level-0002.json');
-    expect(resolveBootSceneOverride('LEVEL-0002', SCENES)).toBe('/assets/scenes/Level-0002.json');
-    expect(resolveBootSceneOverride('main', SCENES)).toBe('/assets/scenes/main.json');
+    expect(resolveBootSceneOverride('level-0002', SCENES)).toBe('/assets/scenes/Level-0002.scene.json');
+    expect(resolveBootSceneOverride('LEVEL-0002', SCENES)).toBe('/assets/scenes/Level-0002.scene.json');
+    expect(resolveBootSceneOverride('main', SCENES)).toBe('/assets/scenes/main.scene.json');
   });
 
   it('falls through to null when the name matches nothing (typo)', () => {
@@ -96,7 +113,7 @@ describe('resolveBootSceneOverride (issue #43 — --scene / MODOKI_SCENE launch 
     // decides it — so this cannot pass while the real boot order drifts.
     const resolved = resolveBootSceneOverride('level-0002', SCENES);
     expect(resolveSceneCandidates('/assets/scenes/last-opened.json', '/assets/scenes/config-default.json', resolved)).toEqual([
-      '/assets/scenes/Level-0002.json',
+      '/assets/scenes/Level-0002.scene.json',
       '/assets/scenes/last-opened.json',
       '/assets/scenes/config-default.json',
     ]);

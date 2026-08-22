@@ -16,7 +16,8 @@ import { setActiveResetPhase } from './ui/components/ErrorBoundary';
 import { audioDispose, audioResume } from '@modoki/engine/runtime';
 import { VideoOverlay } from '@modoki/engine/runtime';
 import { useKeyboardShift } from './hooks/useKeyboardShift';
-import { checkAppOtaUpdate, subscribeOtaGate, type OtaGateState } from './ota';
+import { onTierSwitchOverlay } from '@modoki/engine/runtime';
+import { checkAppOtaUpdate, isPluginUnimplemented, subscribeOtaGate, type OtaGateState } from './ota';
 import OtaRestartGate from './ui/components/OtaRestartGate';
 import { loadStagedSubgames } from './subgameLoader';
 import { findGame as findGameInRegistry } from './gameRegistry';
@@ -41,7 +42,7 @@ const EditorApp = GAME_ONLY ? null : lazy(() => import('./editor/setup').then(m 
 // In-game debug menu (F12 / 3-finger tap). Present in the editor and in a game build
 // that opts in via project.config.json `build.debugBuild`. The flag is a build-time
 // constant so the dynamic import below is dead-code-eliminated and the whole
-// debug-menu chunk never ships when off. See docs/debug-menu-plan.md.
+// debug-menu chunk never ships when off. See docs/debug-menu.md.
 const DEBUG_MENU_ON = __MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__;
 const DebugMenu = DEBUG_MENU_ON
   ? lazy(() => import('@modoki/engine/runtime/debug').then(m => ({ default: m.DebugMenu })))
@@ -100,8 +101,17 @@ function findGame(gameId: string): GameDefinition | undefined {
  *  NOTE: Scene3D captures GameConfig at mount only (Scene3D.tsx). Today both
  *  games' sceneSetup hooks are no-ops so this is safe. If a future game needs
  *  per-game sceneSetup, Scene3D will need a gameConfig subscription. */
-const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) {
+/** Exported for `tests/app/gameShellLoadOnce.test.tsx` (#267) — the boot sequence's
+ *  once-per-game contract is a React SCHEDULING property, so it can only be pinned by
+ *  rendering the real component; there is no pure module to extract it into. */
+export const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) {
   useKeyboardShift();
+
+  // The engine applies a quality-tier promotion mid-play when no scene boundary arrives to hide the
+  // shader recompile in (#227) — a single-scene game never reaches one. It publishes copy here so
+  // the player sees an explained pause rather than a freeze. Subscribed once for the app's life;
+  // the initial read covers a switch that started before this effect ran.
+  useEffect(() => onTierSwitchOverlay(setTierSwitchMessage), []);
 
   // configReady: config is set, renderers can mount (scene may not be loaded)
   // initialized: scene loaded + rendered, everything ready
@@ -113,7 +123,33 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
   const [GameUI, setGameUI] = useState<React.ComponentType | null>(null);
   const [disable3D, setDisable3D] = useState(false);
   const [otaGate, setOtaGate] = useState<OtaGateState | null>(null);
+  /** Copy for the tier-switch overlay, or null when no tier switch is being applied (#227). The
+   *  engine publishes it (`onTierSwitchOverlay`); this is its ONE reader. */
+  const [tierSwitchMessage, setTierSwitchMessage] = useState<string | null>(null);
   const activeGameIdRef = useRef<string | null>(null);
+  /**
+   * Mirrors of `configReady` / `initialized` for the LOAD EFFECT to read (#267).
+   *
+   * ⚠️ THE EFFECT BELOW SETS BOTH OF THOSE STATE VALUES MID-BODY, so reading the state
+   * itself would put them in its dependency array — and an effect that depends on state it
+   * writes re-runs itself. It did: `setConfigReady(true)` (still ~100 lines from the end)
+   * flipped a dependency while `activeGameIdRef` was still null, so the re-entrancy guard at
+   * the top could not bail, and the whole sequence — `registerSystems`, `registerAppServices`,
+   * `attribution.init()`, `PlayerPrefs.init`, `loadScene` — ran a SECOND time for the same
+   * game. Measured on an iPhone 8, 2026-08-19: two ATT consent prompts in one launch
+   * (`requestTrackingAuthorization` at 21:49:33.175 and 21:49:35.364).
+   *
+   * So the dependency array of that effect is `[gameId]` and must stay that way. The contract
+   * that buys — every `GameDefinition` hook is called ONCE per game load, so a hook may hold a
+   * side effect that must not repeat — is documented in
+   * `docs/architecture.md` § "The boot effect runs EXACTLY ONCE per `gameId`", and pinned by
+   * `tests/app/gameShellLoadOnce.test.tsx`.
+   */
+  const configReadyRef = useRef(false);
+  const initializedRef = useRef(false);
+  /** Whether this shell started the no-3D tier-calibration loop, so a game swap knows to stop it.
+   *  A ref rather than state: it is read inside the load effect and must never re-run it. */
+  const no3DTierLoopRef = useRef(false);
 
   useEffect(() => subscribeOtaGate(setOtaGate), []);
 
@@ -123,10 +159,25 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
       setError(`Unknown game: "${gameId}"`);
       return;
     }
-    if (activeGameIdRef.current === gameId) return; // no-op re-render
+    if (activeGameIdRef.current === gameId) {
+      // Already the loaded game, so there is no transition in progress — and saying so is
+      // load-bearing, not tidiness. A→B→A while B is still in flight cancels B's run before
+      // it can reach either `setTransitioning(false)` below, and lands here, where the old
+      // early return left `transitioning` stuck TRUE for the rest of the session: the
+      // opaque LoadingOverlay covers a game that is running perfectly well underneath.
+      setTransitioning(false);
+      return; // no-op re-render
+    }
+
+    // A previous game's failure must not outlive it. `error` gates the whole render tree
+    // (`if (error) return <error page>`) and had no path back to null anywhere in this file,
+    // so an unknown gameId — or one game failing to load — left the error screen up even
+    // after a later game loaded successfully behind it. React bails out of the re-render
+    // when the value is already null, so this costs nothing on the ordinary path.
+    setError(null);
 
     let cancelled = false;
-    const isFirstLoad = !initialized;
+    const isFirstLoad = !initializedRef.current;
 
     // Show overlay for game-to-game transitions. For first load, the opaque
     // overlay renders on top of the (empty) renderers — same visual as before.
@@ -142,6 +193,19 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
           const prevDef = findGame(prevGameId);
           if (prevDef?.unregisterSystems) await prevDef.unregisterSystems();
           clearAppServices(); // drop the previous game's services before the next registers
+          // ⚠️ AND THE 2D TIER-CALIBRATION LOOP, which the no-3D boot path below registers on the
+          // frame driver (#203). It was exported with a teardown and never given one: swapping a
+          // 2D game for a 3D one skipped the branch that starts it, so nothing stopped it, and
+          // `Scene3D` then ticked `tickTierCalibration` alongside it every frame for the rest of
+          // the session. Stopped unconditionally here and restarted below only if the NEW game
+          // needs it, so the pair is symmetric rather than conditional at both ends — a
+          // conditional teardown is what produced the leak.
+          if (no3DTierLoopRef.current) {
+            const { stopTierCalibrationForNo3DProject } =
+              await import('@modoki/engine/runtime/rendering/tierBoot');
+            stopTierCalibrationForNo3DProject();
+            no3DTierLoopRef.current = false;
+          }
         }
         if (cancelled) return;
         if (def.registerPostprocessors) await def.registerPostprocessors();
@@ -186,18 +250,71 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
         if (cancelled) return;
 
         setGameConfig(config);
+        const no3D = !!config.disable3D || !Scene3D;
         setDisable3D(!!config.disable3D);
 
         if (isFirstLoad) {
           // First-ever render: trait registry + font kickoff.
           initWorldSync();
         }
+        // ⭐ A PROJECT WITH NO 3D SURFACE RESOLVES ITS QUALITY TIER HERE (#203).
+        //
+        // A 3D project resolves inside `makeWebGPURenderer`, and must: `antialias` is a renderer
+        // CONSTRUCTOR option, so a tier decided after the first drawing buffer exists cannot apply
+        // it. A project that never builds a renderer therefore never reached that call at all —
+        // `getActiveQualityTier()` stayed null for the process lifetime, `getActiveTierOverrides()`
+        // returned UNCLAMPED, and every field in the `rendering.three.tiers` config chess,
+        // audio-demo and space-invader were seeded with did nothing. This is the missing door.
+        //
+        // ⚠️ `!Scene3D` as well as `config.disable3D` — they are DIFFERENT projects and the second
+        // is the one a `disable3D` check misses. `space-invader` sets `build.modules.render3d:
+        // false`, which makes `Scene3D` null at build time while `disable3D` stays unset, so a
+        // condition on the config flag alone would leave the playable-ad project — the one with the
+        // tightest performance budget here — exactly as unclassified as before.
+        //
+        // ⚠️ AWAITED, and ahead of `setConfigReady`. The 2D backing-buffer scale comes from the
+        // resolved tier and `setConfigReady(true)` is what mounts the renderers; resolving after it
+        // would size the first buffers unclamped and pop when the tier landed. Same ordering
+        // argument as the `PlayerPrefs.init` above, which is awaited here for the sibling reason
+        // (the player's saved tier choice is read synchronously out of that cache).
+        //
+        // ⚠️⚠️ **AND IT MUST COME AFTER `initWorldSync()`, WHICH IS WHERE THE PROJECT'S RENDER
+        // SETTINGS ARE INJECTED** (`ecs/register.ts` → `setRenderSettings(projectConfig.rendering)`).
+        // It sat one block earlier for its first hour and was silently WRONG on device: with the
+        // settings still at their defaults, `three.tiers` is empty, the resolver's "one config ⇒
+        // nothing to choose between" gate fires, and the project publishes `{tier: 'high', source:
+        // 'single-config'}` — i.e. UNCLAMPED — before its two authored configs exist. Sticky, too:
+        // `resolveActiveTier` early-outs on an existing tier, so the correct resolution can never
+        // happen afterwards. Measured on a Galaxy A23 running `games/space-invader`: not one probe
+        // line across a wiped launch, because the tier had already been decided from an empty
+        // config. Pinned by `tierBoot.test.ts` ("resolving before the project's tiers are loaded").
+        //
+        // ⭐ **AND A 3D PROJECT RESOLVES HERE TOO NOW (#212, 2026-08-14).** It used to resolve
+        // ONLY inside `makeWebGPURenderer`, which was fine while every tier knob was read by the
+        // renderer itself — and stopped being fine the moment a tier knob was read by the ASSET
+        // path. `textureMaxSize` is consulted when a scene's textures resolve, and scene load
+        // races renderer creation, so the cap arrived too late to choose a variant. Measured on a
+        // Galaxy A23 pinned `low`: cap 512 in force, `sizes:[512]` in the manifest, 21 `@512`
+        // files in the APK, and 0 of 21 textures fetched the capped URL. Silent, because the
+        // uncapped URL is the correct fallback for "no cap".
+        const { resolveTierForNo3DProject, resolveTierBeforeSceneLoad } =
+          await import('@modoki/engine/runtime/rendering/tierBoot');
+        if (no3D) {
+          await resolveTierForNo3DProject();
+          no3DTierLoopRef.current = true;
+        } else {
+          // The 3D shape (`shade`, not `fill`), and no calibration loop — `Scene3D` owns that one.
+          await resolveTierBeforeSceneLoad();
+        }
+        if (cancelled) return;
+
 
         // Mount renderers BEFORE scene load so their registerBeforeSwap hooks
         // (Scene3D shader prewarm, Scene2D sprite preload) are registered in
         // time. configReady gates the mount; the opaque LoadingOverlay covers
         // everything until the scene is fully loaded and rendered.
-        if (!configReady) {
+        if (!configReadyRef.current) {
+          configReadyRef.current = true;
           setConfigReady(true);
           // Yield to React so Scene3D/Game/UIRenderer mount and their useEffects
           // run (registering beforeSwap hooks). Two rAFs to cover PixiJS
@@ -286,7 +403,14 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
         if (Capacitor.isNativePlatform()) {
           import('capacitor-modoki-ota')
             .then((m) => m.ModokiOta.confirmBoot({ name: 'shell' }))
-            .catch((e) => console.warn('[GameShell] OTA confirmBoot failed (non-fatal):', e));
+            .catch((e) => {
+              // A project without the OTA native plugin rejects this on EVERY launch, so a warn
+              // here files a Crashlytics issue per session for a non-event. A real confirmBoot
+              // failure still warns — on a project that ships OTA it is what the rollback
+              // watchdog keys on. See `isPluginUnimplemented`.
+              if (isPluginUnimplemented(e)) console.log('[GameShell] no OTA plugin on this platform — confirmBoot skipped');
+              else console.warn('[GameShell] OTA confirmBoot failed (non-fatal):', e);
+            });
         }
 
         // Dismiss the native splash on this SAME "fully booted" signal (Phase 3b) —
@@ -298,10 +422,16 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
         if (Capacitor.isNativePlatform() && isFirstLoad) {
           import('@capacitor/splash-screen')
             .then((m) => m.SplashScreen.hide())
-            .catch((e) => console.warn('[GameShell] SplashScreen.hide failed (non-fatal):', e));
+            .catch((e) => {
+              // Same shape as the OTA catch above. Not observed firing — SplashScreen ships in
+              // every project today — but a project that drops it would warn every launch.
+              if (isPluginUnimplemented(e)) console.log('[GameShell] no SplashScreen plugin — hide skipped');
+              else console.warn('[GameShell] SplashScreen.hide failed (non-fatal):', e);
+            });
         }
 
         activeGameIdRef.current = gameId;
+        initializedRef.current = true;
         setInitialized(true);
         setTransitioning(false);
       } catch (e) {
@@ -314,7 +444,10 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
     })();
 
     return () => { cancelled = true; };
-  }, [gameId, initialized, configReady]);
+    // ⚠️ `[gameId]` ONLY — see the `configReadyRef`/`initializedRef` note above (#267). This
+    // effect writes `configReady` and `initialized`; listing either here makes it re-run
+    // itself and double-drive every registration in the body.
+  }, [gameId]);
 
   // Shipped web build's screen sizing (rendering.web.sizeMode). `fixed` letterboxes
   // the game to its authored aspect; `free`/`max` fill the viewport (max clamps the
@@ -359,7 +492,11 @@ const GameShell = React.memo(function GameShell({ gameId }: { gameId: string }) 
               presentation-mode clip is playing. */}
           {__MODOKI_MODULE_VIDEO__ && <VideoOverlay />}
           <LoadingOverlay
-            visible={!initialized || transitioning}
+            visible={!initialized || transitioning || tierSwitchMessage != null}
+            // A tier switch must PAINT before the main thread blocks on the recompile, so it skips
+            // the anti-flash delay. Boot and game swaps keep it.
+            immediate={tierSwitchMessage != null}
+            label={tierSwitchMessage ?? undefined}
             progress={otaGate?.phase === 'downloading' ? {
               fraction: otaGate.progress && otaGate.progress.bytesTotal > 0 ? otaGate.progress.bytesDone / otaGate.progress.bytesTotal : null,
               label: 'Downloading update…',

@@ -10,8 +10,9 @@ import { setAudioMuted, isAudioMuted } from '../../runtime/audio/audioService';
 import { enterPlay, stopPlay, pausePlay } from '../scene/playMode';
 import { useEditorStore } from '../store/editorStore';
 import { computeDeviceLetterbox } from '../scene/sceneViewMath';
-import { FREE_PRESET, resolveLogicalSize, type DevicePreset } from '../scene/devicePresets';
+import { FREE_PRESET, resolveLogicalSize, resolveSafeArea, safeAreaCssVars, type DevicePreset } from '../scene/devicePresets';
 import DevicePicker from './DevicePicker';
+import SafeAreaOverlay from './SafeAreaOverlay';
 import { DebugMenu } from '../../runtime/debug';
 import { VideoOverlay } from '../../runtime/video/VideoOverlay';
 
@@ -41,6 +42,7 @@ export default function GameView({ uiLayer }: GameViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const gameAreaRef = useRef<HTMLDivElement>(null);
   const setGameViewSize = useEditorStore((s) => s.setGameViewSize);
+  const setGameViewSafeArea = useEditorStore((s) => s.setGameViewSafeArea);
   const setStoreGameRect = useEditorStore((s) => s.setGameRect);
   // Single source of truth — the letterbox rect lives in the store (read here for
   // the preview div style; SceneView overlay/picking read the same store value).
@@ -48,6 +50,15 @@ export default function GameView({ uiLayer }: GameViewProps) {
 
   const isFree = preset.logicalW === 0;
   const { w: deviceW, h: deviceH } = resolveLogicalSize(preset, orientation);
+  // The preset's safe-area insets, published to the preview as --ui-sa-* below. `Free`
+  // and the abstract aspect presets carry zeros, so this is a no-op for them without a
+  // branch. Logical px, which is the space the preview div is laid out in (the visual
+  // fit is a transform: scale() applied OUTSIDE the layout — see the div's comment).
+  const safeArea = resolveSafeArea(preset, orientation);
+  // Publish to the store so SceneView's UI preview frame insets identically — it sizes
+  // itself from `gameViewSize` and has no access to the device picker, which lives here.
+  // The setter no-ops on an unchanged quartet, so this is safe to run every render.
+  useEffect(() => { setGameViewSafeArea(safeArea); }, [safeArea, setGameViewSafeArea]);
 
   // Track effective size
   useEffect(() => {
@@ -124,24 +135,27 @@ export default function GameView({ uiLayer }: GameViewProps) {
         <DevicePicker preset={preset} orientation={orientation} onSelect={setPreset} onToggleOrientation={toggleOrientation} />
         <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
         {isStopped ? (
-          <button onClick={onPlay} style={{ ...iconBtnStyle, color: '#2ecc71' }} title="Play (⌘P)">▶</button>
+          <button data-ui-id="gameView.toolbar.play" onClick={onPlay} style={{ ...iconBtnStyle, color: '#2ecc71' }} title="Play (⌘P)">▶</button>
         ) : (
-          <button onClick={onStop} style={{ ...iconBtnStyle, color: '#e74c3c' }} title="Stop">⏹</button>
+          <button data-ui-id="gameView.toolbar.stop" onClick={onStop} style={{ ...iconBtnStyle, color: '#e74c3c' }} title="Stop">⏹</button>
         )}
-        <button onClick={isPaused ? onPlay : onPause} style={{ ...iconBtnStyle, opacity: isStopped ? 0.4 : 1 }}
+        {/* One control, two labels — the id stays `pause` in BOTH states on purpose: an agent
+            aims by id and reads which it is from get_editor_state.playState, so a resume can't
+            miss because the selector changed underneath it. */}
+        <button data-ui-id="gameView.toolbar.pause" onClick={isPaused ? onPlay : onPause} style={{ ...iconBtnStyle, opacity: isStopped ? 0.4 : 1 }}
           title={isPaused ? 'Resume (⌘P)' : 'Pause (⌘P)'} disabled={isStopped}>
           {isPaused ? '▶' : '⏸'}
         </button>
-        <button onClick={stepOnce} style={{ ...iconBtnStyle, opacity: isPaused ? 1 : 0.4 }} title="Step Frame" disabled={!isPaused}>
+        <button data-ui-id="gameView.toolbar.step" onClick={stepOnce} style={{ ...iconBtnStyle, opacity: isPaused ? 1 : 0.4 }} title="Step Frame" disabled={!isPaused}>
           ⏭
         </button>
         <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
-        <button onClick={toggleColliders} style={{ ...iconBtnStyle, color: showColliders ? '#2effa6' : '#888' }}
+        <button data-ui-id="gameView.toolbar.colliders" onClick={toggleColliders} style={{ ...iconBtnStyle, color: showColliders ? '#2effa6' : '#888' }}
           title="Toggle 2D collider overlay">⬡</button>
-        <button onClick={toggleMute} style={{ ...iconBtnStyle, color: muted ? '#e74c3c' : '#888' }}
+        <button data-ui-id="gameView.toolbar.mute" onClick={toggleMute} style={{ ...iconBtnStyle, color: muted ? '#e74c3c' : '#888' }}
           title={muted ? 'Unmute audio' : 'Mute audio'}>{muted ? '🔇' : '🔊'}</button>
         <span style={{ flex: 1 }} />
-        <span style={{ color: isStopped ? '#888' : isPaused ? '#f1c40f' : '#2ecc71', fontSize: '11px', whiteSpace: 'nowrap', flexShrink: 0 }}>
+        <span data-ui-id="gameView.status" style={{ color: isStopped ? '#888' : isPaused ? '#f1c40f' : '#2ecc71', fontSize: '11px', whiteSpace: 'nowrap', flexShrink: 0 }}>
           {isStopped ? 'STOPPED' : isPaused ? 'PAUSED' : 'PLAYING'}
         </span>
         <span style={{ color: '#555', fontSize: '11px', flexShrink: 0 }}>|</span>
@@ -162,12 +176,20 @@ export default function GameView({ uiLayer }: GameViewProps) {
             the scaled size, so vmin buttons would grow out of proportion with the
             fixed-px text. gameRect (the visual rect) stays in the store for the
             SceneView overlay/picking math. */}
-        <div style={isFree ? { position: 'absolute', inset: 0 } : {
-          position: 'absolute', left: gameRect.left, top: gameRect.top,
-          width: deviceW, height: deviceH,
-          transform: `scale(${deviceW > 0 ? gameRect.width / deviceW : 1})`,
-          transformOrigin: 'top left',
-          border: '1px solid #333',
+        <div style={{
+          ...(isFree ? { position: 'absolute', inset: 0 } : {
+            position: 'absolute', left: gameRect.left, top: gameRect.top,
+            width: deviceW, height: deviceH,
+            transform: `scale(${deviceW > 0 ? gameRect.width / deviceW : 1})`,
+            transformOrigin: 'top left',
+            border: '1px solid #333',
+          }),
+          // Simulate the device's safe area for everything inside this preview.
+          // `anchorCss` emits `var(--ui-sa-top, env(safe-area-inset-top))`, so setting
+          // these overrides the desktop `env()` — which is always 0 and is why the editor
+          // structurally could not show a notched-phone layout before (#271). A shipped
+          // build never sets them and falls through to the device's real values.
+          ...safeAreaCssVars(safeArea),
         }}>
           <Scene3D />
           <Game />
@@ -182,6 +204,9 @@ export default function GameView({ uiLayer }: GameViewProps) {
               which is where it gets authored. Renders nothing unless a
               presentation-mode clip is playing. */}
           <VideoOverlay />
+          {/* The bands the insets above correspond to — drawn so an element that moves
+              has a visible reason. Renders nothing when the preset has no insets. */}
+          <SafeAreaOverlay insets={safeArea} />
           {/* Stopped: the game sim is frozen and UI actions don't dispatch, so
               clicking buttons/sliders does nothing. Make that explicit with a
               click-to-play call-to-action overlaying the game. */}

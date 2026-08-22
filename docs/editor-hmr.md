@@ -98,6 +98,62 @@ broken shape is narrow — a registry in a non-boundary module whose writers are
 inside components that *are* boundaries. Don't add `import.meta.hot` handling on suspicion; establish
 that shape first.
 
+## Measured: no editor registry subscription needs `hmrEpoch` (#312)
+
+Panel effects that subscribe to a module-level listener `Set` with `[]` deps are exactly the broken
+shape above, so they were **measured rather than patched**. Every one is safe, and none needed a
+change. The reason has nothing to do with the effect's deps.
+
+The unit of measurement is the **registry module**, not the site — a fresh `Set` can only appear if
+that module is re-evaluated while the subscriber survives. Touching each one:
+
+| Registry module | Touched → | Subscribing sites |
+|---|---|---|
+| `runtime/core/ecs/worldRegistry.ts` (`onWorldSwap`, via the `ecs/world.ts` re-export) | **page reload** | `SceneView.tsx` :356 :2470 :3592 · `Hierarchy.tsx` :603 :625 :743 · `TimelineEditor.tsx` :563 |
+| `runtime/core/ecs/entityUtils.ts` (`addDirtyListener`, `onStructureDirty`, `onStructureDirtyCoalesced`) | **page reload** | `Console.tsx` :63 · `Hierarchy.tsx` :742 · `SceneView.tsx` :2468 :2469 |
+| `runtime/core/uiDirty.ts` (`onEditorDirty`, via `runtime/ui/uiTreeStore`) | **page reload** | `inspectorFields.tsx` :23 · `Inspector.tsx` :1633 · `UIFocusGraphOverlay.tsx` :143 · `UIResizeOverlay.tsx` :267 |
+| `runtime/core/activeRenderer.ts` (`onRendererLost`) | **page reload** | `SceneView.tsx` :4736 |
+| `runtime/core/playState.ts` (`onPlayStateChange`) | **page reload** | `SceneView.tsx` :2471 |
+| `runtime/rendering/text/textDirty.ts` (`onTextDirty`) | **page reload** | `SceneView.tsx` :2472 |
+| `runtime/rendering/materialDirty.ts` (`onMaterial3DDirty`) | **page reload** | `SceneView.tsx` :2478 |
+| `editor/animation/poseClip.ts` (`onPoseEnvelopeExited`) | **page reload** | `AnimationEditor.tsx` :439 — see below |
+| *control:* `editor/panels/Console.tsx` | `hmr update` | — |
+
+A full reload rebuilds the registry **and** its subscribers together, so the stale-`Set` fork cannot
+happen. **The control is the load-bearing row**: without one module that genuinely stops at a
+boundary, "page reload everywhere" is indistinguishable from a probe that cannot see the difference.
+
+**Re-running the sweep** (the site list above is a snapshot; this query is not):
+
+```bash
+cd engine/packages/modoki/src
+grep -rn --include='*.tsx' -E "useEffect\(\(\) => on[A-Z]" editor      # inline-return form
+grep -rn --include='*.tsx' -E "(=|return|\[)\s*on[A-Z][A-Za-z]*\(" editor | grep -vE "\bon[A-Z][a-z]*="
+```
+
+Then, per registry module, in a running editor: stamp `window.__hmrProbe` via `modoki_eval`, append
+a comment to the module, re-read the probe. Gone (and `performance.timeOrigin` advanced) → full
+reload, site is safe. **Surviving → the update stopped at a component, and that site needs
+`useHmrEpoch()`.** The vite log (`page reload …` vs `hmr update …`) agrees but is not sufficient
+alone — read the probe.
+
+**`poseClip.ts` is the row to understand, because it is why #312 was filed.** It is imported by
+`AnimationEditor.tsx`, a component Fast Refresh accepts — the textbook broken shape. It still
+full-reloads, because **`editor/index.ts` imports it too**, and that barrel is a non-component
+module with no accepting boundary above it. Vite full-reloads when *any* propagation path fails to
+find one. The barrel re-exports nearly the whole editor surface, so almost every editor and
+`runtime/core` module inherits a non-accepting path to the root — **that is what makes this bug
+class unreachable in practice**, and it is why the keymap registries needed an explicit
+`location.reload()` while these do not (they are reached only through component importers).
+
+So #312's premise that the hazard "just bit for real" is **wrong**: the `useHmrEpoch()` key added to
+`AnimationEditor` in `9c6215f35` is harmless and costs nothing in a shipped build, but it was never
+load-bearing. Do not read it as evidence the hazard fired.
+
+⚠️ **This verdict is a property of the import graph, not of the effects.** It would stop holding if
+a registry module's only importers became components — so re-measure with the query above after a
+refactor that narrows one, rather than trusting this table.
+
 ## Unrecoverable Fast Refresh
 
 Changing **hook order** (adding/removing a hook) throws *"Rendered more hooks than during the

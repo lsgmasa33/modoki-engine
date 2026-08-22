@@ -1,0 +1,14 @@
+--------- beginning of crash
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: FATAL EXCEPTION: main
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: Process: com.modokiengine.court, PID: 13160
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: android.app.RemoteServiceException$CrashedByAdbException: shell-induced crash
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: 	at android.app.ActivityThread.throwRemoteServiceException(ActivityThread.java:2309)
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: 	at android.app.ActivityThread.-$$Nest$mthrowRemoteServiceException(ActivityThread.java:0)
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: 	at android.app.ActivityThread$H.handleMessage(ActivityThread.java:2619)
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: 	at android.os.Handler.dispatchMessage(Handler.java:106)
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: 	at android.os.Looper.loopOnce(Looper.java:230)
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: 	at android.os.Looper.loop(Looper.java:319)
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: 	at android.app.ActivityThread.main(ActivityThread.java:9063)
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: 	at java.lang.reflect.Method.invoke(Native Method)
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: 	at com.android.internal.os.RuntimeInit$MethodAndArgsCaller.run(RuntimeInit.java:588)
+08-13 18:11:17.565 13160 13160 E AndroidRuntime: 	at com.android.internal.os.ZygoteInit.main(ZygoteInit.java:1103)

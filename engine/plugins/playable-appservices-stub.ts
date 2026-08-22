@@ -8,3 +8,30 @@
  *  while dropping the SDK code entirely; `register()` is a no-op should it ever be called. */
 
 export function register(): void {}
+
+/** Analytics — a no-op here for the same reason `register()` is: an ad creative must not fire
+ *  the game's own analytics, and the Firebase SDK behind the real one is exactly the byte weight
+ *  this stub exists to drop.
+ *
+ *  ⚠️ THIS FILE MUST EXPORT EVERY NAME A GAME'S RUNTIME IMPORTS FROM ITS `app-services` PACKAGE.
+ *  A missing one is not a silent degradation — Rollup fails the playable build outright with
+ *  `[MISSING_EXPORT] "x" is not exported by ...`, and it fails ONLY on `--target playable`, which
+ *  no test suite runs. That is how `track`/`setTrackProperty` broke it: they were added to
+ *  `games/court/runtime/systems.ts` and nothing here knew. `engine/tests/architecture/
+ *  playableAppServicesStub.test.ts` now derives the required set from the games themselves. */
+export function track(_name: string, _params?: Record<string, string | number>): void {}
+export function setTrackProperty(_track: string): void {}
+export function startInstallMilestones(): void {}
+
+/** Crash reporting — a no-op for the same reason. An ad creative has no Firebase app, and the
+ *  Crashlytics SDK behind the real wrapper is byte weight the cap cannot afford. Exported as a
+ *  namespace object because that is the shape `export * as crashlytics from './crashlytics'`
+ *  gives the real package: a runtime that ever writes `crashlytics.setCustomKey(...)` must find
+ *  it here, or `--target playable` fails with [MISSING_EXPORT] and nothing else does. */
+export const crashlytics = {
+  recordError(_message: string): void {},
+  log(_message: string): void {},
+  setCustomKey(_key: string, _value: string | number | boolean): void {},
+  crash(): void {},
+  setEnabled(_enabled: boolean): void {},
+};

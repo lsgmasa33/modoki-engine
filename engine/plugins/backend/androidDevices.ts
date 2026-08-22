@@ -72,8 +72,8 @@ export interface ForwardRule { serial: string; local: string; remote: string }
 /** Parse `adb forward --list`. PURE.
  *
  *  Format:
- *    RFCTB0EV83K tcp:9095 tcp:9095
- *    RFCTA14CMRF tcp:9333 localabstract:webview_devtools_remote_12345
+ *    RFDEADBEEF1 tcp:9095 tcp:9095
+ *    RFDEADBEEF2 tcp:9333 localabstract:webview_devtools_remote_12345
  *
  *  A cold daemon prepends its `* daemon …` banner on the same stream, dropped EXPLICITLY here the
  *  way `parseAdbDevices` drops it — not left to the shape check below. Both known banner lines
@@ -116,7 +116,7 @@ export function isUsable(d: AndroidDevice): boolean {
  *  Format, which the parse depends on:
  *    List of devices attached
  *    ASJ6R19826001453   device usb:2-1.4.3 model:MRD_LX3 device:HWMRD transport_id:3
- *    RFCTA14CMRF        unauthorized usb:2-1.1
+ *    RFDEADBEEF2        unauthorized usb:2-1.1
  *    emulator-5554      device product:sdk_gphone64_arm64 model:sdk_gphone64_arm64
  *
  *  A cold daemon prepends `* daemon not running; starting now at tcp:5037` and `* daemon started
@@ -254,7 +254,7 @@ export function withFriendlyNames(devices: AndroidDevice[]): AndroidDevice[] {
   });
 }
 
-/** A one-line description of a device for a message: `RFCTA14CMRF (Galaxy A23 5G)`. Prefers the
+/** A one-line description of a device for a message: `RFDEADBEEF2 (Galaxy A23 5G)`. Prefers the
  *  phone's own name over the model code — on a desk with three Androids, `SC_56C` vs `SM_S901U1` is
  *  precisely the pair a human cannot tell apart. Falls back to the model when no name was learned. */
 export function describeAndroidDevice(d: AndroidDevice): string {
@@ -338,18 +338,47 @@ function unusableMessage(d: AndroidDevice): string {
 }
 
 /** The serial a native Android BUILD should install to: the project's own pin first (it is explicit
- *  config the human typed in Project Settings), falling back to the same rule as the lease.
+ *  config the human typed in Project Settings), then the HELD LEASE's device, then the same rule as
+ *  the lease itself (env pin → the only usable device → refuse with the candidates named).
  *
  *  Exists because the build path used to interpolate the pin when set and bare `adb` when not —
  *  which meant an unpinned project on a two-phone Mac failed the install with adb's own
  *  `more than one device/emulator` and no hint that a pin existed. Returning an ERROR here lets the
  *  caller refuse with the candidates named, which is the same contract every other device selection
- *  in this repo now follows. */
+ *  in this repo now follows.
+ *
+ *  ⚠️ `leaseSerial` is #235, and it is what makes the refusal HONEST. The shared message offers
+ *  three remedies — `device_connect {useAdb:true, serial}`, the AI panel's picker, and
+ *  `MODOKI_ANDROID_SERIAL` — but the first two both act by opening a LEASE, and the build path
+ *  consulted only the project pin. So an agent that did exactly what the message said (connect to
+ *  the phone, confirm it with `device_status`) got the identical refusal on the very next build,
+ *  and paid a full build-and-refuse cycle to discover it. `docs/mcp-tool-conventions.md` §5 asks a
+ *  refusal to be actionable; one that names an action with no effect is worse than a terse one.
+ *  Fixed by honouring the lease HERE rather than by shortening the message, because an agent that
+ *  has just connected to a phone is unambiguously saying which one it means.
+ *
+ *  It is passed IN rather than read here on purpose: this module owns "how to talk to adb" and must
+ *  not import the lease manager — `deviceConnection.ts` already imports this one, and the header
+ *  above records why that direction is the one that holds. The caller reads the lease. */
 export function resolveBuildAndroidSerial(
   devices: AndroidDevice[],
-  opts: { projectPin?: string; env?: NodeJS.ProcessEnv } = {},
+  opts: { projectPin?: string; leaseSerial?: string; env?: NodeJS.ProcessEnv } = {},
 ): { serial: string } | { error: string } {
-  return resolveAndroidSerial(devices, { explicit: opts.projectPin, env: opts.env });
+  // The project pin still wins: it is durable config a human typed for THIS project, whereas the
+  // lease is session state. Both beat the environment, matching resolveAndroidSerial's own order.
+  //
+  // The lease is applied as a PREFERENCE, not a pin — it counts only while its phone is still
+  // attached and usable. Same rule `deviceConnection.ts` states for its remembered target, and for
+  // the same reason: a lease outlives the cable. Unplug the leased handset mid-session and a pin
+  // would hard-fail the build with "serial RFC… matches none of the Android devices attached" —
+  // naming a serial the human never typed and cannot place. Degrading to the ordinary rule instead
+  // means one remaining phone just builds, and two still refuse with both candidates named.
+  const leaseSerial = opts.leaseSerial?.trim();
+  const leaseUsable = leaseSerial && devices.some((d) => d.serial === leaseSerial && isUsable(d))
+    ? leaseSerial
+    : undefined;
+  const explicit = opts.projectPin?.trim() || leaseUsable;
+  return resolveAndroidSerial(devices, { explicit, env: opts.env });
 }
 
 /** Prefix adb args with `-s <serial>` when one is known. The seam every adb call site goes through,

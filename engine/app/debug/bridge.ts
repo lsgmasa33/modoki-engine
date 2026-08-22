@@ -224,15 +224,20 @@ function showDragLine(fromX: number, fromY: number, toX: number, toY: number) {
  *  - `hit`       — `elementFromPoint` landed on a canvas (or inside one). The honest answer.
  *  - `only`      — the point is not over a canvas, but the document has exactly one, so there is
  *                  nothing to disambiguate. (Also the jsdom case: no layout, so every rect is 0x0.)
- *  - `contains`  — several canvases and the point missed them all per hit-testing (an overlay is on
- *                  top), so pick the LAST one whose rect contains the point — DOM order approximates
- *                  paint order, so the last is the topmost.
+ *  - `contains`  — several canvases and the point missed them all per hit-testing (the hit landed on
+ *                  a CONTAINER of them — `<body>`, an app root), so pick the LAST one whose rect
+ *                  contains the point: DOM order approximates paint order, so the last is topmost.
  *  - `ambiguous` — several canvases and none contains the point. Falls back to the first, i.e. the
  *                  OLD behaviour, but now says so instead of reporting a clean hit.
  *
+ *  This is reached only AFTER `pickDomTargetAt` declines (#299): a hit-test landing on genuine DOM
+ *  UI is dispatched THERE, not routed to a canvas underneath it — a real finger on an overlay does
+ *  not reach the canvas either. So `contains`/`ambiguous` now describe a hit on a container or a
+ *  layout miss, not an overlay.
+ *
  *  Note the marker overlay cannot skew the hit test: `ensureMarkerContainer` sets
- *  `pointer-events:none`, which is also why the DOM-button check above already trusts
- *  `elementFromPoint` after drawing a marker. */
+ *  `pointer-events:none`, which is also why `pickDomTargetAt` can trust `elementFromPoint` after a
+ *  marker has been drawn. */
 type CanvasPick = { canvas: HTMLCanvasElement | null; how: 'hit' | 'only' | 'contains' | 'ambiguous' };
 
 function pickCanvasAt(x: number, y: number): CanvasPick {
@@ -316,6 +321,71 @@ export async function handleResolveAim(params: Record<string, unknown>): Promise
   return resolveAim(p, selKey, xKey, yKey);
 }
 
+/** The DOM element a synthetic aim should be dispatched ON, or null to fall through to the game
+ *  canvas (#299).
+ *
+ *  THE DEFECT this closes: `dispatchTapAt`/`handlePointer` only recognised `<button>`/`<a>` as DOM
+ *  targets and sent everything else at the canvas. An on-screen control built from a `div` — the
+ *  engine `UIRenderer`'s output, a game's own touch controls — therefore
+ *  received an event whose `target` was the CANVAS, so every `closest(...)`/`e.target` handler
+ *  missed while the reply said `ok (canvas:only)`. Measured on the Galaxy A23: a `device_pointer`
+ *  down on the d-pad left `CharacterController3D.moveX` at 0, and a `device_tap` on the aim button
+ *  never toggled archery. That is the false-success shape this surface exists to refuse.
+ *
+ *  Dispatching on the element loses nothing the canvas path provided: the events still bubble to
+ *  `window`, which is where `pointerSource` (the source-agnostic Input seam a game reads) listens,
+ *  and `isPointerBlocked` then suppresses the game read for a registered UI root exactly as it does
+ *  for a real finger. What it does NOT reach is a canvas-local listener (Pixi's federated
+ *  EventSystem) — which is correct, because a real finger landing on an overlay does not reach it
+ *  either.
+ *
+ *  The guard is deliberately conservative: an element that CONTAINS a canvas (`<body>`, an app root,
+ *  a wrapper) is not a UI target — the aim is meant for the surface beneath it, so those keep the
+ *  `pickCanvasAt` geometry fallback and its honest `contains`/`ambiguous` labels. jsdom returns
+ *  `null` here by default (tests/setup.ts), so every coordinate-aimed test keeps the canvas path. */
+function pickDomTargetAt(x: number, y: number): Element | null {
+  const el = document.elementFromPoint(x, y);
+  // `Element`, NOT `HTMLElement`: an inline `<svg>` icon inside a button is an SVGElement, which is
+  // not an HTMLElement — narrowing to HTMLElement sent every icon-button tap back down the canvas
+  // path with a clean `ok`, i.e. the #299 defect again, scoped to SVG-rooted UI.
+  if (!(el instanceof Element)) return null;
+  if (el instanceof HTMLCanvasElement || el.closest('canvas')) return null; // the game surface itself
+  if (el === document.body || el === document.documentElement) return null; // never a UI control
+  // A container OF the game surface, not UI. Only a VISIBLE canvas counts: a UI panel that happens
+  // to hold a hidden utility canvas (an offscreen text-metrics scratch surface is the usual one) is
+  // ordinary UI, and treating it as a container would route its whole subtree back to the canvas.
+  // `checkVisibility` is Chromium 105+; where it is absent (jsdom) fall back to "any canvas counts",
+  // which is the conservative reading.
+  const canvases = Array.from(el.querySelectorAll('canvas'));
+  if (canvases.some((c) => (typeof c.checkVisibility === 'function' ? c.checkVisibility() : true))) return null;
+  return el;
+}
+
+/** A short, stable description of a dispatch target for the reply line — the agent has to be able to
+ *  tell from the reply WHICH element it actually drove, since that is the fact #299 got wrong.
+ *  `data-entity-id` is what the GAME `UIRenderer` emits (the editor's `data-ui-id` handles are not
+ *  on this surface — see docs/debug-tools-mcp.md), so it is the handle an agent aims a device
+ *  selector at. Nothing here is keyed to a particular game's markup; an element carrying neither
+ *  attribute still names its tag. */
+function describeEl(el: Element): string {
+  const id = el.id ? `#${el.id}` : '';
+  const entity = el.getAttribute('data-entity-id');
+  const uiId = el.getAttribute('data-ui-id');
+  const attr = entity ? `[data-entity-id="${entity}"]` : uiId ? `[data-ui-id="${uiId}"]` : '';
+  return `${el.tagName.toLowerCase()}${id}${attr}`;
+}
+
+/** The full event sequence a real finger produces on a DOM element, in order. Pointer events alone
+ *  are NOT enough and that gap nearly shipped inside the #299 fix: the engine `UIRenderer` binds
+ *  React `onClick`, so a control tapped with only `pointerdown`/`pointerup` still does nothing —
+ *  the exact silence the fix exists to end. `mousedown`/`mouseup` come along for handlers written
+ *  against mouse events. `click` is dispatched AT the aim point rather than via `el.click()` so it
+ *  carries real coordinates and reaches an enclosing `<button>` by bubbling, the way a finger's
+ *  does. */
+function mouseInit(x: number, y: number): MouseEventInit {
+  return { clientX: x, clientY: y, bubbles: true, cancelable: true, button: 0 };
+}
+
 /** A window-bubbling pointer event init at (x,y) — the mouse-pointer shape a real tap/drag carries. */
 function ptrInit(x: number, y: number): PointerEventInit {
   return { clientX: x, clientY: y, bubbles: true, pointerId: 1, pointerType: 'mouse', isPrimary: true };
@@ -334,13 +404,26 @@ function ptrInit(x: number, y: number): PointerEventInit {
 async function dispatchTapAt(x: number, y: number): Promise<string> {
   showMarker(x, y, 'red', `tap(${Math.round(x)},${Math.round(y)})`);
 
-  // Try DOM element first (buttons)
-  const el = document.elementFromPoint(x, y);
-  if (el && (el instanceof HTMLButtonElement || el instanceof HTMLAnchorElement || el.closest('button'))) {
-    const clickTarget = el.closest('button') ?? el;
-    (clickTarget as HTMLElement).click();
-    const msg = `ok (clicked DOM: ${clickTarget.tagName})`;
-    _log(`[debug-bridge] TAP → ${msg}`);
+  // DOM UI first: dispatch ON the element under the aim, so `e.target` is what a real finger would
+  // have hit (#299). A button/anchor additionally gets a real `click()` — a synthetic pointer pair
+  // does not synthesize one, and that is what those elements' handlers listen for.
+  const domTarget = pickDomTargetAt(x, y);
+  if (domTarget) {
+    domTarget.dispatchEvent(new PointerEvent('pointerdown', ptrInit(x, y)));
+    domTarget.dispatchEvent(new MouseEvent('mousedown', mouseInit(x, y)));
+    await new Promise((r) => setTimeout(r, 50)); // same hold as the canvas path — let Input sample the down edge
+    // The element can be GONE by now — a control that unmounts itself on its own press is an
+    // ordinary React pattern. `dispatchEvent` on a detached node neither throws nor fails, but the
+    // events cannot bubble to React's delegated root listener, so the `click` (what most controls
+    // actually listen for) reaches nothing. Saying `ok` alone there would be a false success of
+    // exactly the kind this fix exists to remove, so the reply states it instead.
+    const detached = !domTarget.isConnected;
+    domTarget.dispatchEvent(new PointerEvent('pointerup', ptrInit(x, y)));
+    domTarget.dispatchEvent(new MouseEvent('mouseup', mouseInit(x, y)));
+    domTarget.dispatchEvent(new MouseEvent('click', mouseInit(x, y)));
+    const msg = `ok (dom:${describeEl(domTarget)})`
+      + (detached ? ' — the target left the DOM during the press, so only the down half was delivered; the click reached nothing' : '');
+    _log(`[debug-bridge] TAP → ${msg} css(${x.toFixed(1)},${y.toFixed(1)})`);
     return msg;
   }
 
@@ -353,11 +436,50 @@ async function dispatchTapAt(x: number, y: number): Promise<string> {
   return `ok (canvas:${how}) css(${Math.round(x)},${Math.round(y)})`;
 }
 
+/** Release a sustained press before dispatching a NEW gesture, and say so in the reply (#305).
+ *
+ *  Two presses cannot coexist, and the failure is silent in both directions. `pointerSource`
+ *  latches `activeId` on the held down and early-returns for every later `pointerdown` — and
+ *  #299's trusted-takeover cannot save this one, because a synthetic tap is not `isTrusted`
+ *  either. So the tap's press reaches nothing while the call still answers `ok`: a false success,
+ *  the outcome `mcp-tool-conventions.md` §0 ranks worst on this surface. Its `pointerup` then
+ *  matches the held `pointerId` and ends the gesture anyway, leaving `heldPointer` and
+ *  `pointerSource` disagreeing about whether anything is down.
+ *
+ *  Called AFTER the aim resolves and BEFORE the dispatch: a call that is refused dispatches
+ *  nothing, so it must steal nothing. Mirrors the editor's `MOUSE_GESTURE_ROUTES`, and stops at
+ *  the same place — `device_hover`/`device_scroll`/`device_press_key` are all legitimate
+ *  mid-gesture and leave the hold alone. */
+function supersedeHeldPress(by: string): string {
+  const dropped = dropHeldPress('superseded');
+  if (!dropped) return '';
+  _log(`[debug-bridge] ${by} released a press left held: ${dropped}`);
+  return ` — released a pointer left held (${dropped}); a new gesture cannot coexist with it`;
+}
+
+/** Drop a held press on behalf of a gesture dispatched from the HOST, not from here (#305).
+ *
+ *  The trusted route (CDP on Android, WebDriverAgent on iOS) resolves its aim in-page and then
+ *  injects the touch host-side, so `handleTap`/`handleDrag` — and the supersede they do for
+ *  themselves — are never reached. Measured on an S22: after a trusted `device_tap`, the bridge
+ *  still reported `held:true` while `pointerSource` had already handed the gesture to the tap via
+ *  #299's takeover. The two then disagree about whether anything is down, so a later `up` sends a
+ *  stray `pointerup`, and a later `down` is refused as "already held" when nothing is.
+ *
+ *  Note the asymmetry with the synthetic path, and that it is not a smaller version of the same
+ *  bug: a TRUSTED tap is not swallowed — the takeover admits it — so nothing is lost here. What is
+ *  wrong is only the bookkeeping, which is why this is a plain release with no reply suffix of its
+ *  own; the host decides what to tell the agent. */
+function handleReleaseHeldPointer(): { released: string | null } {
+  return { released: dropHeldPress('superseded') };
+}
+
 export async function handleTap(params: Record<string, unknown>): Promise<string> {
   const aim = await resolveAim(params, 'selector', 'x', 'y');
   if ('error' in aim) { _log(`[debug-bridge] TAP → ${aim.error}`); return aim.error; }
   _log(`[debug-bridge] TAP @ ${aim.label}`);
-  return withMechanismSuffix(`${await dispatchTapAt(aim.x, aim.y)} @ ${aim.label}`);
+  const superseded = supersedeHeldPress('TAP');
+  return withMechanismSuffix(`${await dispatchTapAt(aim.x, aim.y)} @ ${aim.label}${superseded}`);
 }
 
 export async function handleDrag(params: Record<string, unknown>): Promise<string> {
@@ -369,6 +491,10 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   const to = { x: toAim.x, y: toAim.y };
   const steps = (params.steps as number) || 5;
   const delayMs = (params.delayMs as number) || 20;
+  // Both aims resolved, so this call WILL dispatch — see `supersedeHeldPress` for why it must not
+  // dispatch on top of a held press. Before the markers, so the overlay never shows a drag being
+  // set up while the old press is still down.
+  const superseded = supersedeHeldPress('DRAG');
 
   _log(`[debug-bridge] DRAG ${fromAim.label}→${toAim.label} → css(${from.x.toFixed(1)},${from.y.toFixed(1)})→(${to.x.toFixed(1)},${to.y.toFixed(1)})`);
   showMarker(from.x, from.y, 'lime', `from(${Math.round(from.x)},${Math.round(from.y)})`);
@@ -384,10 +510,12 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   const grabEl = (typeof params.fromSelector === 'string' && params.fromSelector
     ? document.querySelector(params.fromSelector)
     : document.elementFromPoint(from.x, from.y)) as HTMLElement | null;
-  const domMode = explicitDom === true || (explicitDom !== false && !!grabEl && grabEl.tagName !== 'CANVAS' && !grabEl.closest('canvas'));
+  // `!grabEl.querySelector('canvas')` matches `pickDomTargetAt`'s container rule (#299): an element
+  // that CONTAINS the game surface (body, an app root, a wrapper) is not a DOM UI target.
+  const domMode = explicitDom === true || (explicitDom !== false && !!grabEl && grabEl.tagName !== 'CANVAS' && !grabEl.closest('canvas') && !grabEl.querySelector('canvas'));
   if (domMode) {
     if (!grabEl) return `Error: no element to drag at ${typeof params.fromSelector === 'string' ? JSON.stringify(params.fromSelector) : `(${Math.round(from.x)},${Math.round(from.y)})`}`;
-    return withMechanismSuffix(await domDrag(grabEl, from, to, steps, delayMs));
+    return withMechanismSuffix(`${await domDrag(grabEl, from, to, steps, delayMs)}${superseded}`);
   }
 
   // World-space drag: dispatch a real pointer sequence ON the canvas under the GRAB point so it
@@ -410,7 +538,7 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   }
   canvas.dispatchEvent(new PointerEvent('pointerup', ptrInit(to.x, to.y)));
   _log(`[debug-bridge] DRAG → canvas:${how}`);
-  return withMechanismSuffix(`ok (canvas:${how}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})`);
+  return withMechanismSuffix(`ok (canvas:${how}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})${superseded}`);
 }
 
 function handleConsoleLogs(params: Record<string, unknown>): ReturnType<typeof consoleRing.query> {
@@ -572,7 +700,92 @@ export function createPortLifecycleHandler(deps: {
  *  that owns the gesture", not a workaround. A held press does NOT currently survive a page
  *  navigation/reload on the device (unlike the editor, which explicitly persists across one);
  *  that asymmetry is inherent to there being no separate backend process here. */
-let heldPointer: { button: number; x: number; y: number; canvas: HTMLCanvasElement; how: CanvasPick['how'] } | null = null;
+let heldPointer: { button: number; x: number; y: number; target: Element; how: HeldHow } | null = null;
+
+/** How the sustained press chose its dispatch target — a `pickCanvasAt` verdict, or `dom` when the
+ *  aim landed on a DOM UI element and the press went there instead (#299). */
+type HeldHow = CanvasPick['how'] | 'dom';
+
+/** Bumped by every `releaseHeldPointer` call, i.e. every point at which a held press was supposed
+ *  to end. `handlePointer` samples it on entry and re-checks after its awaits, because a `down`
+ *  whose lease died WHILE it was resolving its aim would otherwise set `heldPointer` AFTER the
+ *  disconnect handler's release had already run and found nothing to release — leaving a press
+ *  nothing can ever lift, which is exactly the state these defences exist to make unreachable.
+ *  The window is one async hop (`resolveSelectorPoint`'s dynamic import), and the consequence is
+ *  the unrecoverable one, so it is worth a counter. Counting releases rather than disconnects
+ *  keeps the whole mechanism reachable from `releaseHeldPointer` alone — nothing needs a
+ *  test-only seam to exercise it. */
+let leaseEpoch = 0;
+
+/** Release a press left held, by dispatching its matching `pointerup` at the held point (#299).
+ *
+ *  A sustained press spans calls BY DESIGN, so nothing in `handlePointer` can know a gesture was
+ *  abandoned. The one moment we do know is the lease dropping: from then on the agent cannot send
+ *  the `up` at all. Leaving it held is not inert — `pointerSource` latches `activeId` on the down
+ *  and early-returns for every later pointerdown, so the phone goes DEAF TO THE HUMAN'S FINGER for
+ *  dragging until the app is force-stopped. That is what happened on the A23 while the owner was
+ *  playing, and it read as a product bug in the feature under test.
+ *
+ *  Returns a description of what it released, or null if nothing was held. */
+export function releaseHeldPointer(): string | null {
+  leaseEpoch++; // counted even with nothing held — that is the case `handlePointer` must notice
+  return dropHeldPress('lease');
+}
+
+/** Why a held press ended without the agent's own `action:'up'`. Quoted back to the agent, because
+ *  both causes are otherwise invisible: the press simply stops existing. */
+type HeldLossReason = 'lease' | 'superseded';
+
+/** The last press that ended without an `up`, cleared by the next `down`. A `move`/`up` that
+ *  follows one is refused, and the bare "no pointer is held" would be a lie by omission there —
+ *  the agent DID press, and something else ended it. */
+let lastHeldLoss: { reason: HeldLossReason; button: number; x: number; y: number } | null = null;
+
+/** Explain a refusal that is really "your press was ended for you". Empty when the agent simply
+ *  never pressed — the two are different mistakes and must not read alike. */
+function heldLossNote(): string {
+  if (!lastHeldLoss) return '';
+  const { reason, button, x, y } = lastHeldLoss;
+  const why = reason === 'lease'
+    ? 'the debugger lease dropped, and from that moment you could no longer send the up yourself'
+    : 'a later device_tap/device_drag dispatched a new gesture, which cannot coexist with a held '
+      + 'press, so the hold was released first';
+  return ` NOTE: your ${POINTER_BUTTON_NAME[button]} press at ${x.toFixed(1)},${y.toFixed(1)} was `
+    + `released for you — ${why}. Send a fresh down.`;
+}
+
+/** The DISPATCH half of a release, without the `leaseEpoch` bump.
+ *
+ *  The split keeps `leaseEpoch` meaning exactly one thing: "a release happened because the agent
+ *  can no longer send the `up`". `handlePointer` re-checks it after its awaits to catch a `down`
+ *  whose lease died mid-resolve, and self-releases the press it just latched. A SUPERSEDE is not
+ *  that — the lease is alive and the agent is actively driving — so routing it through the
+ *  exported `releaseHeldPointer` (which bumps the counter even with nothing held, deliberately)
+ *  would overload the signal.
+ *
+ *  ⚠️ The concrete consequence is NOT demonstrated, and this comment is deliberately weaker than
+ *  its first draft. A `down` that entered before such a bump and latched after it would read the
+ *  changed epoch and cancel itself — a stranded-gesture shape invented by the fix for the old one.
+ *  The transport makes that reachable in principle: the `message` listener is async with no queue,
+ *  so two requests genuinely interleave. But a single agent drives the lease sequentially, and no
+ *  test here pins it — every attempt raced the wrong way, because `handleTap`'s own 50 ms hold
+ *  lets the `down` latch first. Treat the split as preserving a signal's meaning, which is
+ *  checkable by reading, rather than as a guard against a failure anyone has measured. */
+function dropHeldPress(reason: HeldLossReason): string | null {
+  if (!heldPointer) return null;
+  const { target, button, x, y, how } = heldPointer;
+  lastHeldLoss = { reason, button, x, y };
+  heldPointer = null; // cleared FIRST — a throwing dispatch must not leave the press held anyway
+  try {
+    target.dispatchEvent(mkButtonedPointerEvent('pointerup', x, y, button));
+    // Mirror the mouse modality exactly as the live `up` path does — otherwise a handler that
+    // tracks the press via `mousedown`/`mouseup` sees the press begin and never end, which is the
+    // stranded-press shape this function exists to prevent, one modality over.
+    if (how === 'dom') target.dispatchEvent(new MouseEvent('mouseup', { clientX: x, clientY: y, bubbles: true, cancelable: true, button, buttons: 0 }));
+  } catch { /* the target may be detached by now; the point is to clear our own held state */ }
+  const where = how === 'dom' ? `dom:${describeEl(target)}` : `canvas:${how}`;
+  return `${POINTER_BUTTON_NAME[button]} at ${x.toFixed(1)},${y.toFixed(1)} on ${where}`;
+}
 
 /** Test-only reset — a held gesture left by one test would otherwise leak into the next
  *  (module state persists for the life of the imported module, and vitest does not re-import
@@ -605,6 +818,7 @@ function mkButtonedPointerEvent(type: string, x: number, y: number, button: numb
 // backend and asserts on the MCP tool's relayed payload cannot exercise them; jsdom lets this
 // module import cleanly (measured), so a direct call is the honest way to cover them.
 export async function handlePointer(params: Record<string, unknown>): Promise<string> {
+  const epochOnEntry = leaseEpoch;
   const action = params.action as string;
   if (action !== 'down' && action !== 'move' && action !== 'up') {
     return `Error: pointer action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`;
@@ -613,7 +827,7 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
     return `Error: a pointer is already held (button ${POINTER_BUTTON_NAME[heldPointer.button]} down at ${heldPointer.x.toFixed(1)},${heldPointer.y.toFixed(1)}). Release it with action:'up' before pressing again.`;
   }
   if ((action === 'move' || action === 'up') && !heldPointer) {
-    return `Error: no pointer is held — send action:'down' first (this ${action} would be a stray event).`;
+    return `Error: no pointer is held — send action:'down' first (this ${action} would be a stray event).${heldLossNote()}`;
   }
   // A 'move'/'up' MAY omit the aim, and an 'up' normally does — releasing happens wherever the
   // gesture got to. Fall back to the HELD position, for the same reason the button is reused
@@ -641,26 +855,51 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
   // Re-picking per call would let a drag that crosses onto another canvas switch mid-gesture and
   // deliver its `up` to an element that never saw the `down` — the same pointer-capture break the
   // held button and held position already exist to avoid.
-  let canvas: HTMLCanvasElement;
-  let how: CanvasPick['how'];
+  let target: Element;
+  let how: HeldHow;
   if (action === 'down') {
-    const picked = pickCanvasAt(aim.x, aim.y);
-    if (!picked.canvas) return 'Error: No canvas element found';
-    canvas = picked.canvas;
-    how = picked.how;
+    // DOM UI under the aim wins, for the reason in `pickDomTargetAt` (#299): a press sent at the
+    // canvas arrives with the wrong `e.target` and no DOM handler ever sees it.
+    const domTarget = pickDomTargetAt(aim.x, aim.y);
+    if (domTarget) {
+      target = domTarget;
+      how = 'dom';
+    } else {
+      const picked = pickCanvasAt(aim.x, aim.y);
+      if (!picked.canvas) return 'Error: No canvas element found';
+      target = picked.canvas;
+      how = picked.how;
+    }
   } else {
-    canvas = heldPointer!.canvas;
+    target = heldPointer!.target;
     how = heldPointer!.how;
   }
 
   const type = action === 'down' ? 'pointerdown' : action === 'move' ? 'pointermove' : 'pointerup';
-  canvas.dispatchEvent(mkButtonedPointerEvent(type, aim.x, aim.y, button));
+  target.dispatchEvent(mkButtonedPointerEvent(type, aim.x, aim.y, button));
+  if (how === 'dom') {
+    // Mirror the mouse modality for handlers written against it. Deliberately NO synthetic `click`
+    // on `up`: a sustained gesture is often a drag, and a finger that travelled does not produce
+    // one. Use `device_tap` when a click is what you mean.
+    const mouseType = action === 'down' ? 'mousedown' : action === 'move' ? 'mousemove' : 'mouseup';
+    target.dispatchEvent(new MouseEvent(mouseType, { ...mouseInit(aim.x, aim.y), button, buttons: action === 'up' ? 0 : (1 << button) }));
+  }
   showMarker(aim.x, aim.y, action === 'down' ? 'orange' : action === 'move' ? 'yellow' : 'purple', `pointer${action}(${Math.round(aim.x)},${Math.round(aim.y)})`);
-  heldPointer = action === 'up' ? null : { button, x: aim.x, y: aim.y, canvas, how };
+  if (action === 'down') lastHeldLoss = null; // a fresh press — the previous gesture's fate is no longer the story
+  heldPointer = action === 'up' ? null : { button, x: aim.x, y: aim.y, target, how };
   await new Promise((r) => setTimeout(r, 16)); // let per-frame Input sampling see the edge, same as tap/drag
 
-  _log(`[debug-bridge] POINTER ${action} → canvas:${how} @ ${aim.label}`);
-  return withMechanismSuffix(`ok (${action} canvas:${how}, button ${buttonName}, held:${heldPointer !== null}) @ ${aim.label}`);
+  const where = how === 'dom' ? `dom:${describeEl(target)}` : `canvas:${how}`;
+  // The lease died while this call was resolving its aim, so the disconnect handler's release ran
+  // before there was anything to release. Release it here instead of returning a held press nobody
+  // can ever lift.
+  if (heldPointer && leaseEpoch !== epochOnEntry) {
+    releaseHeldPointer();
+    _log(`[debug-bridge] POINTER ${action} → ${where}, then released: the lease dropped mid-call`);
+    return withMechanismSuffix(`ok (${action} ${where}, button ${buttonName}, held:false) @ ${aim.label} — the lease dropped during this call, so the press was released rather than left held`);
+  }
+  _log(`[debug-bridge] POINTER ${action} → ${where} @ ${aim.label}`);
+  return withMechanismSuffix(`ok (${action} ${where}, button ${buttonName}, held:${heldPointer !== null}) @ ${aim.label}`);
 }
 
 // --- Type text into the focused element (#31) ---
@@ -868,6 +1107,10 @@ async function handleMessage(req: Request): Promise<unknown> {
     // Resolve-only twin of the dispatch ops below (#32 Phase 1) — used by the backend's
     // trusted-CDP route, which resolves the aim in-page then dispatches host-side.
     case 'resolve-aim': return await handleResolveAim(p);
+    // Release-only twin of the supersede `handleTap`/`handleDrag` do for themselves — for the
+    // TRUSTED route, which resolves the aim in-page and then dispatches host-side over CDP/WDA,
+    // so it never reaches those handlers at all. See `handleReleaseHeldPointer` (#305).
+    case 'release-held-pointer': return handleReleaseHeldPointer();
     case 'tap': return await handleTap(p);
     case 'drag': return await handleDrag(p);
     case 'pointer': return await handlePointer(p);
@@ -883,7 +1126,7 @@ async function handleMessage(req: Request): Promise<unknown> {
     // registration side-effects run on first import, so runAgentOp then resolves. Imported
     // DYNAMICALLY so the ops chunk is code-split out of the main bundle and only loads on the
     // first Percept request over a live lease (a release game's server rejects connections, so
-    // handleMessage never runs → the chunk never loads). See docs/plans/device-percept-enact-plan.md.
+    // handleMessage never runs → the chunk never loads). See docs/debug-tools-mcp.md.
     default: return await delegateToAgentOps(req.method, p);
   }
 }
@@ -920,6 +1163,19 @@ async function initNativeBridge() {
   try {
     const result = await GameDebug.startServer();
     _log('[debug-bridge] Native TCP server listening on port', result.port);
+    // A fallback port is a SILENT unreachability, so it is warned rather than logged (#283). The
+    // start SUCCEEDED — nothing throws, nothing looks wrong — but every device_* tool connects on
+    // the default port and this app is not on it, for the rest of its life. `_log` would not do:
+    // the console ring keeps warn/error, so a log-level line is invisible to `device_console_logs`
+    // and the one trace left is a single logcat line nobody greps for. The measured case is
+    // launching a game while another Modoki app is still releasing 9095 (#283).
+    if (result.fallbackPort) {
+      console.warn(
+        `[debug-bridge] listening on FALLBACK port ${result.port}, not the default 9095 — another `
+        + 'Modoki app still held it. Every device_* tool assumes 9095, so connect with '
+        + `device_connect {useAdb:true, port:${result.port}}, or close the other app and relaunch.`,
+      );
+    }
   } catch (e) {
     _err('[debug-bridge] GameDebug.startServer failed:', (e as Error).message);
     throw e;
@@ -1003,6 +1259,9 @@ async function initNativeBridge() {
       setJournalEnabled(true);
     } else {
       _log('[debug-bridge] MCP client disconnected');
+      // Never leave a press the agent can no longer release (#299) — see `releaseHeldPointer`.
+      const released = releaseHeldPointer(); // bumps `leaseEpoch` — see there
+      if (released) _log(`[debug-bridge] released a pointer left held by the dropped lease: ${released}`);
     }
   });
 

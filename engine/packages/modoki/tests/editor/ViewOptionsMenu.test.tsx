@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /** ViewOptionsMenu — the "View ▾" dropdown consolidating SceneView's FX/Grid/Colliders (3D)
- *  and FX/Focus/Colliders (2D) toggles (docs/todo.md "manual edit"). Covers the chrome logic
+ *  and FX/Focus/Colliders (2D) toggles (see docs/editor.md). Covers the chrome logic
  *  that isn't provable by the e2e collider-mode spec: badge count, closed-by-default, opening
  *  on trigger click, closing on outside click, and that each row's `onToggle` fires without
  *  the menu itself owning any checked state (the caller does — this is dumb chrome). Escape-

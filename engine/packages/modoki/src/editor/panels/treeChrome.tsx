@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { useOverlayEscape } from '../input/useOverlayEscape';
 
 /** Shared chrome for the Assets-panel trees so the three top-level sections
@@ -118,6 +119,11 @@ export function TypeFilterMenu({ types, selected, onToggle, onClear, label = 'Ty
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  /** The dropdown is PORTALED to <body>, so it needs its own ref for the outside-click
+   *  test (it is no longer inside `ref`) and a measured anchor rect for placement. */
+  const menuRef = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const [anchor, setAnchor] = useState<{ top: number; right: number } | null>(null);
   // Collapsed category set (membership = collapsed → default all expanded), persisted.
   const [collapsedCats, setCollapsedCats] = useState<Set<string>>(() => {
     if (!groupCollapseKey) return new Set();
@@ -133,7 +139,12 @@ export function TypeFilterMenu({ types, selected, onToggle, onClear, label = 'Ty
 
   useEffect(() => {
     if (!open) return;
-    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as Node;
+      // Both subtrees count as "inside": the trigger stays in the panel, the menu is in <body>.
+      if (ref.current?.contains(t) || menuRef.current?.contains(t)) return;
+      setOpen(false);
+    };
     document.addEventListener('mousedown', onDoc);
     return () => { document.removeEventListener('mousedown', onDoc); };
   }, [open]);
@@ -157,7 +168,12 @@ export function TypeFilterMenu({ types, selected, onToggle, onClear, label = 'Ty
   return (
     <div ref={ref} style={{ position: 'relative' }}>
       <button
-        onClick={() => setOpen((o) => !o)}
+        ref={btnRef}
+        onClick={() => {
+          const r = btnRef.current?.getBoundingClientRect();
+          if (r) setAnchor({ top: r.bottom + 3, right: window.innerWidth - r.right });
+          setOpen((o) => !o);
+        }}
         title={title}
         data-ui-id={uiId} data-ui-kind={uiId ? 'menu' : undefined} data-ui-label={uiId ? title : undefined}
         style={{
@@ -172,13 +188,25 @@ export function TypeFilterMenu({ types, selected, onToggle, onClear, label = 'Ty
         <span>{label}{active ? ` (${selected.size})` : ''}</span>
         <span style={{ fontSize: 8, opacity: 0.7 }}>▾</span>
       </button>
-      {open && (
+      {open && anchor && createPortal((
         <div
+          ref={menuRef}
+          data-tree-chrome-menu=""
           style={{
             // Right-anchored: these panels are narrow and the Type button sits near
             // the right edge, so opening leftward keeps the menu inside the panel
             // instead of clipping past its right border.
-            position: 'absolute', top: '100%', right: 0, marginTop: 3, zIndex: 1000,
+            //
+            // ⚠️ PORTALED to <body> and `fixed`, not `absolute` inside the panel — and that
+            // is a correctness fix, not styling. FlexLayout renders every panel as an
+            // absolutely-positioned SIBLING, so a menu that overflows its own panel is
+            // painted over by whichever panel comes later in the DOM; `zIndex` cannot
+            // help, because the stacking contest is between the panels, not inside one.
+            // It stayed invisible while the old default layout happened to leave the
+            // Assets panel room to contain the menu. The new default arrangement does
+            // not, and the menu became unclickable: `editor-assets.spec.ts` timed out on
+            // the public CI with the Console panel's empty state intercepting the click.
+            position: 'fixed', top: anchor.top, right: anchor.right, zIndex: 1000,
             background: '#1e1e30', border: '1px solid #555', borderRadius: 4, padding: 4,
             minWidth: 150, maxHeight: 340, overflowY: 'auto', boxShadow: '0 4px 12px rgba(0,0,0,0.45)',
           }}
@@ -216,7 +244,7 @@ export function TypeFilterMenu({ types, selected, onToggle, onClear, label = 'Ty
                 <TypeFilterRow key={type} type={type} count={count} checked={selected.has(type)} onToggle={() => onToggle(type)} />
               ))}
         </div>
-      )}
+      ), document.body)}
     </div>
   );
 }

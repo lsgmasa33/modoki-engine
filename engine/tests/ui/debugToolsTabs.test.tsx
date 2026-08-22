@@ -1,7 +1,7 @@
 /** Cheats / Console / Device debug tabs + console capture — tests (Phase 4). */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { render, cleanup, fireEvent } from '@testing-library/react';
+import { render, cleanup, fireEvent, act } from '@testing-library/react';
 import { registerUIAction, unregisterUIAction } from '@modoki/engine/runtime';
 import {
   installConsoleCapture,
@@ -59,11 +59,15 @@ describe('ConsoleTab', () => {
     expect(queryByText('an-error-line')).not.toBeNull();
   });
 
-  it('clears the captured entries', () => {
+  it('clears the captured entries', async () => {
     console.log('to-be-cleared');
     const { queryByText, getByText } = render(<ConsoleTab />);
     expect(queryByText('to-be-cleared')).not.toBeNull();
     fireEvent.click(getByText('Clear'));
+    // The store notifies its subscribers on a MICROTASK, not synchronously — a synchronous
+    // notify is a setState during whatever render happens to be in progress, which is bug
+    // `mfAJ8yTNTqOQbU3sqY46`. The version bumps immediately; only the listener call is deferred.
+    await act(async () => {});
     expect(queryByText('to-be-cleared')).toBeNull();
   });
 });

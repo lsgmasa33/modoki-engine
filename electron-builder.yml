@@ -134,9 +134,12 @@ asarUnpack:
 # bake), each graceful when its binary is absent. We bundle ONLY tools with no npm
 # download path; ffmpeg/ffprobe are provisioned on-demand into the userData toolchain.
 beforePack: engine/scripts/before-pack.cjs
-# Copy three/examples/jsm back in (electron-builder strips "examples" dirs); runtime
-# imports three/examples/jsm/* under Vite-in-prod. Runs before signing.
-afterPack: engine/scripts/copy-three-addons.cjs
+# afterPack takes one hook → after-pack.cjs fans out: copy-three-addons.cjs copies
+# three/examples/jsm back in (electron-builder strips "examples" dirs, and the runtime imports
+# them under Vite-in-prod), then clean-vite-config.cjs deletes the source-tree
+# engine/vite.config.cjs that beforePack staged (#326). Runs after files are staged, before
+# signing — so anything written into the staged app here is still signed.
+afterPack: engine/scripts/after-pack.cjs
 extraResources:
   - from: build/bin
     to: bin

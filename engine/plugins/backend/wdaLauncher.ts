@@ -28,7 +28,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { claimDevice, iosDeviceId, releaseDevice } from './deviceClaims';
-import { wdaBaseDir } from '../../toolchain';
+import { wdaBaseDir, detect as detectTool } from '../../toolchain';
+import { listGoIosUdids, goIosDeviceInfo } from './goIosDevice';
 import { findXctestrun, wdaDerivedDataDir } from '../../toolchain/wdaProvision';
 
 /** One iOS device `xcodebuild` could target. `connected` = a live tunnel right now.
@@ -147,6 +148,38 @@ export function mergeIosDevices(primary: IosDevice[], legacy: IosDevice[]): IosD
   return [...primary, ...legacy.filter((d) => !seen.has(d.udid))];
 }
 
+/** Fold in the devices only go-ios could see. Pure, so the union rule is testable without a phone.
+ *
+ *  Appended, never promoted: the Apple listings carry `osVersion`/`productType`/`devicectlId` that
+ *  decide how a build installs, and a go-ios row knows none of that. What it does know is the one
+ *  thing the others got WRONG — that the device is plugged in RIGHT NOW — so a go-ios-only entry is
+ *  `connected: true` and deliberately has no `devicectlId`: it is precisely the iOS ≤16 class that
+ *  must take the go-ios install branch rather than a devicectl one.
+ *
+ *  ⚠️ A device the Apple listings already reported keeps THEIR row untouched, including a
+ *  `connected: false` they may have got wrong. Correcting that from here would be a second
+ *  inference layered on the first; the fix this exists for is the MISSING row, and widening it
+ *  silently is how a narrow fix becomes an unreviewed behaviour change. */
+export function mergeGoIosDevices(known: IosDevice[], goIos: { udid: string; name?: string; productType?: string }[]): IosDevice[] {
+  // `seen` grows as we go, so the go-ios list is deduped against ITSELF as well as against the
+  // Apple listings. ⚠️ Not defensive padding: measured on this Mac, `ios list` returned the
+  // iPhone 8's UDID TWICE in one call, which a known-set-only filter turns into two identical
+  // rows in the Build menu. The unit tests did not catch it — a live probe did.
+  const seen = new Set(known.map((d) => d.udid));
+  const extra = goIos
+    .filter((d) => (seen.has(d.udid) ? false : (seen.add(d.udid), true)))
+    .map((d): IosDevice => ({
+      udid: d.udid,
+      // A bare UDID is a poor row, but an ABSENT row is the bug. `goIosInfo` fills the name when
+      // the device answers; when it does not, say where the row came from rather than leaving the
+      // reader to wonder why one entry looks different from the rest.
+      name: d.name || `iOS device ${d.udid.slice(0, 8)}… (seen by go-ios)`,
+      connected: true,
+      ...(d.productType ? { productType: d.productType } : {}),
+    }));
+  return [...known, ...extra];
+}
+
 /** Overridable seam so tests never shell out.
  *
  *  ⚠️ `--json-output` MUST be a real file, never `/dev/stdout`. devicectl writes its human-readable
@@ -217,6 +250,40 @@ export const wdaLauncherExec = {
       return stdout;
     } catch { return ''; }
   },
+  /** THE THIRD SOURCE (#ca0A0LZ4knjvVNzclLRl) — what go-ios can reach, asked of go-ios.
+   *
+   *  Both Apple listings above can DROP a device that is plugged in and answering: measured on
+   *  2026-08-20, `Build → iOS Device` offered three DISCONNECTED phones and omitted the connected
+   *  iPhone 8, identically before and after `Refresh devices`, while `go-ios list`, `idevice_id -l`
+   *  and Xcode's own Devices window all saw it. `goIosDevice.ts` already documented xctrace
+   *  dropping that same handset for minutes at a time and worked around it for the LEASE path;
+   *  every other consumer of this listing inherited the flakiness with no fallback.
+   *
+   *  That omission is worse than cosmetic: an iOS ≤16 device is exactly the one that NEEDS go-ios
+   *  (devicectl is CoreDevice-only and cannot see it at all), so #217's hands-free install was
+   *  unreachable from its own picker, silently — the row was simply absent, with nothing saying
+   *  why.
+   *
+   *  ⚠️ NEVER PROVISIONS. `detect` only; downloading a toolchain from a listing that the AI panel
+   *  polls every 2.5 s would be a surprising network fetch on a UI refresh. If go-ios is not
+   *  already here this returns [] and the listing is exactly what it was before. */
+  async listGoIosUdids(): Promise<string[]> {
+    try {
+      const found = detectTool('go-ios');
+      if (!found.present || !found.command) return [];
+      return await listGoIosUdids(found.command);
+    } catch { return []; }
+  },
+  /** Name + product type for a device only go-ios can see, so its row reads like the others
+   *  instead of as a bare UDID. Called ONLY for the devices the Apple listings missed — usually
+   *  none, occasionally one — so it costs nothing on the common path. */
+  async goIosInfo(udid: string): Promise<{ name?: string; productType?: string }> {
+    try {
+      const found = detectTool('go-ios');
+      if (!found.present || !found.command) return {};
+      return await goIosDeviceInfo(found.command, udid);
+    } catch { return {}; }
+  },
 
   // ── The SYNC twins, for `ensureWdaRunning` only ──────────────────────────────────────────────
   //
@@ -270,9 +337,29 @@ export const wdaLauncherExec = {
 export async function listIosDevicesForSelection(): Promise<IosDevice[]> {
   const now = Date.now();
   if (iosListCache && now - iosListCache.at < IOS_LIST_TTL_MS) return iosListCache.devices;
+  // COALESCE CONCURRENT MISSES onto one listing. The AI panel polls this every 2.5s while each
+  // uncached call spawns up to four bounded subprocesses (devicectl 20s, xctrace 20s, and now
+  // `ios list` + `ios info` at 10s each) — so a slow or wedged tool made every poll during that
+  // window start ANOTHER full set rather than waiting for the one already in flight. The cache
+  // only helps once an answer exists; this is what stops the pile-up while it does not.
+  if (iosListPending) return iosListPending;
+  iosListPending = computeIosDeviceListing(now).finally(() => { iosListPending = null; });
+  return iosListPending;
+}
+
+async function computeIosDeviceListing(now: number): Promise<IosDevice[]> {
   let primary: IosDevice[] = [];
   try { primary = parseIosDevices(await wdaLauncherExec.listDevices()); } catch { /* no Xcode / devicectl */ }
-  const devices = mergeIosDevices(primary, parseXctraceDevices(await wdaLauncherExec.listLegacyDevices()));
+  const appleListed = mergeIosDevices(primary, parseXctraceDevices(await wdaLauncherExec.listLegacyDevices()));
+  // Ask go-ios for whatever Apple's two listings missed — see `wdaLauncherExec.listGoIosUdids`.
+  const goIosUdids = await wdaLauncherExec.listGoIosUdids();
+  const known = new Set(appleListed.map((d) => d.udid));
+  // `new Set` because `ios list` can repeat a UDID — measured returning the iPhone 8 twice in one
+  // call. `mergeGoIosDevices` dedupes the rows anyway; deduping HERE is what stops the duplicate
+  // costing a second `ios info` shell-out.
+  const missing = [...new Set(goIosUdids)].filter((u) => !known.has(u));
+  const enriched = await Promise.all(missing.map(async (udid) => ({ udid, ...(await wdaLauncherExec.goIosInfo(udid)) })));
+  const devices = mergeGoIosDevices(appleListed, enriched);
   iosListCache = { at: now, devices };
   return devices;
 }
@@ -287,9 +374,13 @@ export async function listIosDevicesForSelection(): Promise<IosDevice[]> {
  *  below the threshold where a human re-checks, and four polls out of five now cost nothing. */
 const IOS_LIST_TTL_MS = 10_000;
 let iosListCache: { at: number; devices: IosDevice[] } | null = null;
+/** The listing currently in flight, so concurrent misses share it — see `listIosDevicesForSelection`. */
+let iosListPending: Promise<IosDevice[]> | null = null;
 
-/** Test seam — drop the cached listing so a test can change what `xcrun` reports. */
-export function _clearIosListCache(): void { iosListCache = null; }
+/** Test seam — drop the cached listing so a test can change what `xcrun` reports. Also drops any
+ *  IN-FLIGHT listing, or a test that swapped the exec seam would still be handed the previous
+ *  one's answer. */
+export function _clearIosListCache(): void { iosListCache = null; iosListPending = null; }
 
 /** Test seam for the per-call temp path (see `devicectlOutPath`) — the ONLY way to assert the
  *  uniqueness that keeps a concurrent sync + async listing from sharing a file. */

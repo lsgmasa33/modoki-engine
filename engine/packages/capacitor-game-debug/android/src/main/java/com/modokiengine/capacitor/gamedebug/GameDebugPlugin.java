@@ -31,8 +31,35 @@ public class GameDebugPlugin extends Plugin {
 
     private static final String TAG = "GameDebug";
     private static final int DEFAULT_PORT = 9095;
+    /** How long to retry the PREFERRED port before accepting an OS-assigned one (#283).
+     *
+     *  ⚠️ **THE RETRY CANNOT WIN THE FOREGROUND HANDOVER — measured, and this constant is
+     *  deliberately small because of it.** Launching a Modoki game while another is foregrounded,
+     *  on a Galaxy A23, the outgoing app's release never arrives WHILE we are retrying; it lands
+     *  shortly after the loop gives up, and the delay scales with how long we waited:
+     *
+     *      window   gave up at   released at   release − give-up
+     *       0.5 s     +0.60 s      +1.10 s          0.49 s
+     *       2   s     +2.11 s      +2.88 s          0.77 s
+     *       5   s     +5.13 s      +6.32 s          1.19 s
+     *
+     *  Three window sizes, and the fallback happened every time (3/3 at 2 s, 3/3 at 5 s). Waiting
+     *  longer only postpones the release — the retry defers the very thing it waits for. So the
+     *  original 2000, sized on a single 449 ms sample from a DIFFERENT situation (the outgoing app
+     *  resuming and immediately re-pausing), was not merely too short: no value is long enough.
+     *
+     *  What actually fixes the case is HOST-SIDE PORT DISCOVERY (`androidBridgePort.ts`) — the
+     *  lease asks which app is foregrounded and connects to the socket that uid owns, so a fallback
+     *  port is reachable instead of fatal. This retry is kept small as cheap insurance for the
+     *  unrelated case where the previous owner is already gone (a killed app), which SO_REUSEADDR
+     *  alone does not cover; it is not the fix for the handover. */
+    private static final int BIND_RETRY_WINDOW_MS = 1000;
+    private static final int BIND_RETRY_INTERVAL_MS = 150;
 
     private ServerSocket serverSocket;
+    /** True when the listener ended up on an OS-assigned port instead of {@link #DEFAULT_PORT} —
+     *  i.e. the host cannot reach it without being told the number (#283). */
+    private boolean onFallbackPort = false;
     // volatile + guarded by synchronized(this): the read thread's finally, handleNewClient, and the
     // sendResponse/writeControlReply writers all touch these across threads — without a happens-before
     // edge a reconnecting owner could be spuriously refused or a check-then-write could NPE (L13).
@@ -115,7 +142,17 @@ public class GameDebugPlugin extends Plugin {
      *  listener-state callback to wait for — the try/catch below IS the bind outcome, and
      *  `call.resolve`/`call.reject` only fires once it is known. (Capacitor invokes plugin methods
      *  off the main thread, so this synchronous bind cannot trip `NetworkOnMainThreadException` —
-     *  the accept LOOP still runs on its own daemon thread since it blocks indefinitely.) */
+     *  the accept LOOP still runs on its own daemon thread since it blocks indefinitely. The same
+     *  fact is what makes the retry sleep below safe.)
+     *
+     *  ── WHY IT RETRIES BEFORE FALLING BACK (#283) ────────────────────────────────────────────
+     *  The fallback is a LAST resort, not a first response. A host connects on the default port;
+     *  an app that quietly lands on an OS-assigned one is unreachable by every `device_*` tool for
+     *  its entire lifetime — `startListener` binds once and never comes back to reclaim the port,
+     *  so the app stays unreachable even after the port frees up seconds later. That was measured,
+     *  not theorised: skin-test sat on 33111 while 9095 was free. Retrying across the handover
+     *  window makes "the foreground app is on 9095" true once the handover settles, instead of
+     *  decided by which process got there first. */
     private void startListener(int port, boolean allowFallback, PluginCall call) {
         ServerSocket socket;
         try {
@@ -129,12 +166,15 @@ public class GameDebugPlugin extends Plugin {
             // re-binding on resume (#95): a just-closed listener leaves the port in TIME_WAIT, and
             // without SO_REUSEADDR the re-bind fails, falls back to an OS-assigned port, and
             // recreates the very unreachability that change exists to remove.
-            socket = new ServerSocket();
-            socket.setReuseAddress(true);
-            socket.bind(new java.net.InetSocketAddress(port));
+            //
+            // SO_REUSEADDR handles a TIME_WAIT remnant of OUR OWN previous listener; it
+            // deliberately does NOT let us take a port from a LIVE listener, which is the #283
+            // case — another Modoki app that has not finished pausing yet. Only waiting fixes that.
+            socket = bindWithRetry(port, allowFallback);
         } catch (java.net.BindException e) {
             if (allowFallback) {
-                Log.w(TAG, "port " + port + " in use (previous instance?) — retrying on an OS-assigned port");
+                Log.w(TAG, "port " + port + " still in use after " + BIND_RETRY_WINDOW_MS
+                        + "ms — falling back to an OS-assigned port. Pass the port explicitly to device_connect.");
                 startListener(0, false, call);
                 return;
             }
@@ -150,6 +190,12 @@ public class GameDebugPlugin extends Plugin {
         serverSocket = socket;
         int actualPort = socket.getLocalPort();
         serverPort = actualPort;
+        // Keyed on `allowFallback`, NOT on `actualPort != DEFAULT_PORT`: only the port-0 retry
+        // passes false, so this says "we did not get the port we asked for" rather than "we are
+        // not on 9095". The difference shows when a caller REQUESTS a non-default port and gets
+        // exactly it — that is a success, and flagging it as a fallback would be a false alarm in
+        // the one field whose entire job is to be trusted (#283).
+        onFallbackPort = !allowFallback;
         running = true;
         Log.i(TAG, "TCP server listening on port " + actualPort);
 
@@ -168,7 +214,56 @@ public class GameDebugPlugin extends Plugin {
 
         JSObject result = new JSObject();
         result.put("port", actualPort);
+        // Announced rather than left to be inferred from the number: a host that assumes the
+        // default port needs to know it is NOT on it, and "port: 33111" only says so to a reader
+        // who already knows what the default is (#283).
+        result.put("fallbackPort", onFallbackPort);
         call.resolve(result);
+    }
+
+    /** Bind `port`, retrying across {@link #BIND_RETRY_WINDOW_MS} while it is held by a LIVE
+     *  listener. Throws {@link java.net.BindException} once the window is spent, so the caller
+     *  owns the fallback decision. No retry when `allowFallback` is false — that call IS the
+     *  fallback (port 0), and port 0 cannot be in use. */
+    private ServerSocket bindWithRetry(int port, boolean allowFallback) throws Exception {
+        long deadline = System.currentTimeMillis() + BIND_RETRY_WINDOW_MS;
+        int attempts = 0;
+        while (true) {
+            // SO_REUSEADDR must be set BEFORE the bind, so the socket is created UNBOUND and bound
+            // explicitly (see the caller's note) — which means a fresh socket per attempt: a
+            // ServerSocket whose bind threw cannot be re-bound.
+            ServerSocket socket = new ServerSocket();
+            try {
+                socket.setReuseAddress(true);
+                socket.bind(new java.net.InetSocketAddress(port));
+                if (attempts > 0) {
+                    Log.i(TAG, "port " + port + " acquired after " + attempts + " retr"
+                            + (attempts == 1 ? "y" : "ies") + " — the previous owner had not released it yet");
+                }
+                return socket;
+            } catch (java.net.BindException e) {
+                try { socket.close(); } catch (Exception ignored) { /* nothing bound to leak */ }
+                if (!allowFallback || System.currentTimeMillis() >= deadline) throw e;
+                if (attempts == 0) {
+                    // Announce the WAIT, not just its outcome. The whole reason #283 went
+                    // undiagnosed is that the port handover left no trace anyone would grep for;
+                    // a line here means logcat tells the story whichever way the retry ends.
+                    Log.i(TAG, "port " + port + " busy — retrying for up to " + BIND_RETRY_WINDOW_MS + "ms");
+                }
+                attempts++;
+                try {
+                    Thread.sleep(BIND_RETRY_INTERVAL_MS);
+                } catch (InterruptedException ie) {
+                    // Restore the flag and give up retrying rather than swallowing the interrupt —
+                    // the caller's fallback still runs, so the bridge starts either way.
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            } catch (Exception e) {
+                try { socket.close(); } catch (Exception ignored) { /* nothing bound to leak */ }
+                throw e;
+            }
+        }
     }
 
     @PluginMethod
@@ -185,6 +280,7 @@ public class GameDebugPlugin extends Plugin {
         result.put("running", running);
         result.put("clientConnected", clientSocket != null && clientSocket.isConnected() && !clientSocket.isClosed());
         result.put("port", serverPort);
+        result.put("fallbackPort", onFallbackPort);
         call.resolve(result);
     }
 
@@ -520,10 +616,103 @@ public class GameDebugPlugin extends Plugin {
         }
     }
 
+    // --- Fault triggers (#278) ---
+
+    /** How long `anr` blocks the main looper.
+     *
+     *  Sized by what makes the ANR REPORTABLE, not by what makes the system notice it. Measured on
+     *  an S22 (2026-08-20): the system declared the ANR ~11 s in either way, but a 15 s block ended
+     *  on its own, the app recovered, no {@code ApplicationExitInfo} record was written, and
+     *  Crashlytics — with {@code collect_anrs: true} — had nothing to collect. The report only
+     *  exists if the PROCESS DIES of the ANR, which needs the "Close app" button in the system
+     *  dialog. 45 s leaves that dialog on screen long enough to press; pressing it kills the
+     *  process immediately, so the rest of the block costs nothing. */
+    private static final long DEFAULT_ANR_BLOCK_MS = 45000;
+
+    /** Small delay between resolving the JS call and raising the fault. The resolve has to marshal
+     *  back across the bridge before the process dies, or the caller sees a promise that neither
+     *  settles nor errors and cannot tell "refused" from "worked". It is a best effort, not a
+     *  guarantee — see the note on {@code triggerFault} in definitions.ts. */
+    private static final long FAULT_DELAY_MS = 250;
+
+    private final Handler faultHandler = new Handler(Looper.getMainLooper());
+
+    /** Raise a deliberate native fault so the crash pipeline can be proven (#278).
+     *
+     *  Behind the SAME {@code build.debugBuild} gate as the debug bridge, for the same reason: this
+     *  kills the app on demand, and a release build must not carry a reachable way to do that.
+     *
+     *  Each kind is a DIFFERENT route into the crash reporter, which is the whole point — a signal
+     *  crash, an uncaught Java exception and an ANR are three separate pipelines, and proving one
+     *  says nothing about the other two. */
+    @PluginMethod
+    public void triggerFault(PluginCall call) {
+        if (!isDebugBuildEnabled()) {
+            call.reject("Fault triggers disabled: build.debugBuild is off for this project "
+                    + "(Project Settings → Developer → \"Debug build\"). Rebuild after enabling it.");
+            return;
+        }
+
+        String kind = call.getString("kind", "");
+        switch (kind) {
+            case "crash": {
+                Log.w(TAG, "triggerFault: raising SIGSEGV on purpose (#278)");
+                JSObject ok = new JSObject();
+                ok.put("ok", true);
+                call.resolve(ok);
+                // A signal kills the process wherever it is raised, so the thread does not matter
+                // here — `faultHandler` is the main looper, like every other kind. The delay, not
+                // the thread, is the load-bearing part: it lets the resolve above marshal back
+                // across the bridge first.
+                faultHandler.postDelayed(
+                        () -> android.os.Process.sendSignal(android.os.Process.myPid(), 11), FAULT_DELAY_MS);
+                return;
+            }
+            case "uncaught": {
+                Log.w(TAG, "triggerFault: throwing an uncaught RuntimeException on the UI thread (#278)");
+                JSObject ok = new JSObject();
+                ok.put("ok", true);
+                call.resolve(ok);
+                faultHandler.postDelayed(() -> {
+                    throw new RuntimeException("[modoki] deliberate fault probe: uncaught RuntimeException (#278)");
+                }, FAULT_DELAY_MS);
+                return;
+            }
+            case "anr": {
+                final long blockMs = call.getInt("blockMs", (int) DEFAULT_ANR_BLOCK_MS);
+                Log.w(TAG, "triggerFault: blocking the main looper for " + blockMs + "ms (#278) — "
+                        + "TAP THE SCREEN to raise it, then choose \"Close app\" — a block that ends on its own is never reported");
+                JSObject ok = new JSObject();
+                ok.put("ok", true);
+                call.resolve(ok);
+                faultHandler.postDelayed(() -> {
+                    // The real main looper, not the WebView renderer's thread — that renderer lives in
+                    // a separate sandboxed process, which is why blocking JS raises nothing at all.
+                    long until = android.os.SystemClock.uptimeMillis() + blockMs;
+                    while (android.os.SystemClock.uptimeMillis() < until) {
+                        try {
+                            Thread.sleep(50);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                    Log.w(TAG, "triggerFault: main-looper block finished (#278)");
+                }, FAULT_DELAY_MS);
+                return;
+            }
+            default:
+                call.reject("Unknown fault kind \"" + kind + "\" — expected one of: crash, anr, uncaught.");
+        }
+    }
+
     // --- Cleanup ---
 
     private void stopAll() {
         running = false;
+        // Cleared with the listener it describes: a stale `true` here would have `getStatus`
+        // reporting a fallback port on a server that is not running (#283).
+        onFallbackPort = false;
         if (clientSocket != null) { try { clientSocket.close(); } catch (Exception ignored) {} clientSocket = null; }
         if (serverSocket != null) { try { serverSocket.close(); } catch (Exception ignored) {} serverSocket = null; }
         clientOutput = null;

@@ -10,7 +10,7 @@ import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { type ToolResult } from '../result.js';
 import { summarizeAssets, summarizeTraits, type AssetEntry, type TraitSchema } from '../summarize.js';
-import { SAVE_PARAM, mutateOpSchema } from '../shapes.js';
+import { mutateOpSchema, precisionParam } from '../shapes.js';
 
 export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
   const { ok, fail, httpFailure, call, getJson, postJson, unreachable } = ctx;
@@ -41,7 +41,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       world: z.boolean().optional().describe('Add each entity\'s RESOLVED world transform (position/rotation/scale after parent-chain propagation) + activeInHierarchy flag. Default false (local Transform only). Saves composing the parent chain by hand.'),
       bounds: z.boolean().optional().describe('Add each entity\'s screen-space rect (screen {x,y,w,h} CSS px) + onScreen flag, plus (3D only) worldAABB {size:[x,y,z], center:[x,y,z]} — the TRUE geometric extent in world units (distinct from the authored scale). Geometry without a separate get_layout_bounds call. Default false. Needs the renderer.'),
       contacts: z.boolean().optional().describe('Add each body\'s CURRENT physics contacts as GUID arrays (rolled up to bodies): `contacts` (solid, load-bearing — resting on the ground) + `overlaps` (sensor/trigger — inside a zone). The STATE view ("what is it touching NOW"), vs the @contact/@sensor journal EVENTS ("when did they touch"). Present only on bodies currently touching something. Default false.'),
-      precision: z.number().int().nonnegative().optional().describe('Significant digits for float values. Default 9 — trims float64 mantissa noise (247.13061935179246 -> 247.130619), saving ~17-29% of the response with a max error of 3.5e-7. Verify edits with a TOLERANCE, not string/=== equality. Pass precision=0 for exact float64.'),
+      precision: precisionParam(),
     },
     async ({ trait, id, guid, name, where, full, resources, limit, world, bounds, contacts, precision }) => {
       const q = new URLSearchParams();
@@ -122,7 +122,6 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
         'removeEntity: {"op":"removeEntity","entity":{"id":11}}. ' +
         'setBaseScene (base-scene persistence — scene-level, no entity ref; guid of a base scene to load additively, or null to clear): ' +
         '{"op":"setBaseScene","baseScene":"<scene guid>"}.'),
-      save: SAVE_PARAM,
     },
     async ({ path, ops }) => {
       const resolved = await activeScenePath(path, 'modoki_mutate_scene');
@@ -177,7 +176,6 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       scale: z.union([z.number(), z.array(z.number()).length(3)]).optional()
         .describe('Scale — uniform (a single number) or per-axis [sx, sy, sz], in `space`.'),
       path: z.string().optional().describe('Scene file URL. Defaults to the active scene.'),
-      save: SAVE_PARAM,
     },
     async ({ entity, space, position, rotation, scale, path }) => {
       const fields: Record<string, number> = {};
@@ -208,8 +206,10 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_validate_scene',
     'Validate a scene file against the live trait schema (warn-but-load): unknown ' +
-      'trait/field, type mismatch, and literal-asset-path-instead-of-GUID mistakes. ' +
-      'schemaAvailable:false means no editor renderer is connected (ref checks still run).',
+      'trait/field, type mismatch, literal-asset-path-instead-of-GUID mistakes, and ' +
+      'asset refs whose GUID names nothing in the manifest (a deleted asset — the ref ' +
+      'will not resolve at load). schemaAvailable:false means no editor renderer is ' +
+      'connected (ref checks still run).',
     { path: z.string().describe('Asset-root URL of the scene file.') },
     async ({ path }) => getJson(`/api/validate-scene?path=${encodeURIComponent(path)}`),
   );

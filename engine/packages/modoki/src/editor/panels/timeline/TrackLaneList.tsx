@@ -37,16 +37,16 @@ function TrackLaneList({
           const badge = KIND_BADGE[track.type];
           const selected = selectedTrack === i;
           return (
-            <div key={track.id || i} onPointerDown={() => onSelectTrack(i)}
+            <div key={track.id || i} data-ui-id={`timeline.tracks.row.${i}`} data-ui-kind="row" data-ui-label={badge.label} onPointerDown={() => onSelectTrack(i)}
               style={{ height: ROW_H, display: 'flex', alignItems: 'center', gap: 4, padding: '0 4px', cursor: 'pointer',
                 background: selected ? '#2b3350' : 'transparent', borderBottom: '1px solid #26262c' }}>
               <span style={{ fontSize: 8, fontWeight: 700, color: '#fff', background: badge.color, borderRadius: 2, padding: '1px 3px' }}>{badge.label}</span>
-              <input value={track.target} placeholder="(root)" title="Target — relative name-path from the Director root"
+              <input data-ui-id={`timeline.tracks.row.${i}.target`} data-ui-kind="field" data-ui-label="target" value={track.target} placeholder="(root)" title="Target — relative name-path from the Director root"
                 onChange={(e) => onSetTarget(i, e.target.value)} onPointerDown={(e) => e.stopPropagation()}
                 style={{ flex: 1, minWidth: 0, background: '#191919', border: '1px solid #333', color: '#cfcfd6', fontSize: 10, padding: '1px 3px', borderRadius: 2 }} />
-              <button title={track.muted ? 'Unmute' : 'Mute'} onClick={(e) => { e.stopPropagation(); onToggleMute(i); }}
+              <button data-ui-id={`timeline.tracks.row.${i}.mute`} data-ui-kind="toggle" data-ui-label={track.muted ? 'Unmute' : 'Mute'} data-ui-state={track.muted ? 'muted' : 'unmuted'} title={track.muted ? 'Unmute' : 'Mute'} onClick={(e) => { e.stopPropagation(); onToggleMute(i); }}
                 style={{ fontSize: 9, background: 'none', border: 'none', color: track.muted ? '#b05b5b' : '#6a6a76', cursor: 'pointer' }}>{track.muted ? '🔇' : '🔊'}</button>
-              <button title="Delete track" onClick={(e) => { e.stopPropagation(); onRemoveTrack(i); }}
+              <button data-ui-id={`timeline.tracks.row.${i}.delete`} data-ui-kind="button" data-ui-label="Delete track" title="Delete track" onClick={(e) => { e.stopPropagation(); onRemoveTrack(i); }}
                 style={{ fontSize: 10, background: 'none', border: 'none', color: '#6a6a76', cursor: 'pointer' }}>✕</button>
             </div>
           );
@@ -54,7 +54,7 @@ function TrackLaneList({
       </div>
       <div style={{ borderTop: '1px solid #2f2f37', padding: 4, display: 'flex', gap: 3, flexWrap: 'wrap' }}>
         {ADD_KINDS.map((k) => (
-          <button key={k} onClick={() => onAddTrack(k)} title={`Add ${k} track`}
+          <button key={k} data-ui-id={`timeline.tracks.add.${k}`} data-ui-kind="button" data-ui-label={`Add ${k} track`} onClick={() => onAddTrack(k)} title={`Add ${k} track`}
             style={{ fontSize: 9, background: '#2a2a31', border: '1px solid #3a3a42', color: '#bfbfc8', borderRadius: 3, padding: '2px 5px', cursor: 'pointer' }}>+{k}</button>
         ))}
       </div>
