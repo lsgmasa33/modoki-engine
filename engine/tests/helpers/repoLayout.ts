@@ -74,6 +74,16 @@ export function hasSkills(): boolean {
   return fs.existsSync(path.join(REPO_ROOT, '.claude', 'skills'));
 }
 
+/** True when this checkout carries the Claude subagent definitions (`.claude/agents/`).
+ *
+ *  Separate from `hasSkills()` even though both live under `.claude/` and the snapshot ships
+ *  neither: skills and agents are independently deletable, and a guard that reads
+ *  `.claude/agents/**` should say so rather than borrow a predicate about a sibling
+ *  directory. Same reasoning as `hasPublishScripts()` vs `hasPrivateTooling()` above. */
+export function hasAgentDefinitions(): boolean {
+  return fs.existsSync(path.join(REPO_ROOT, '.claude', 'agents'));
+}
+
 /** True when the `oss/` publish overlay (the workflows rewritten onto the public repo by
  *  `scripts/publish-engine-oss.sh`) is present in this checkout. */
 export function hasOssOverlay(): boolean {
