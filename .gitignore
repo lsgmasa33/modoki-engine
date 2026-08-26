@@ -191,6 +191,9 @@ engine/tsconfig.app.scoped.json
 # opencode project config — pins THIS clone's backend/CDP ports (machine-local, per-worktree)
 .opencode/
 
+# opencode per-clone MCP config — pins THIS clone's backend/CDP ports, never shared
+/opencode.json
+
 # stray archive of games/ (e.g. for copying a project OUT of the monorepo, #29) — never commit
 /games.zip
 

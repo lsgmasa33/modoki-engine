@@ -24,6 +24,72 @@ import { CpuParticleSim } from './cpuSimulator';
 import { createPixiParticles, type PixiParticleObject } from './pixiParticleObject';
 import { resolveImageUrl } from '../core/textureRefs';
 import { textureProvider } from '../core/textureProvider';
+import { resolveGravity, type Vec3 } from './simSpec';
+
+/** The default soft-circle texture's side length (`getDefaultParticleTexture` in
+ *  `pixiParticleObject.ts`) — the reference size `startSize` multiplies when an effect sets no
+ *  custom `render.texture`. Used only as a heuristic for {@link warnIfSubPixel2D}: a custom
+ *  texture's real size isn't known until it loads async, so the warning can under/over-estimate
+ *  for those effects — acceptable for a diagnostic, not load-bearing for rendering. */
+const DEFAULT_TEXTURE_PX = 64;
+
+/** Effect ids currently flagged as sub-pixel in 2D (per module instance — an editor session's
+ *  worth of dedup is enough; this is a diagnostic, not a persisted record). An id is REMOVED the
+ *  moment a def with that id reads clean, so a live edit that fixes an effect re-arms the warning
+ *  if it's later edited back into sub-pixel territory — "once per bad state", not "once ever". */
+const warnedSubPixel2D = new Set<string>();
+const _gravityScratch: Vec3 = { x: 0, y: 0, z: 0 };
+
+/**
+ * A 2D-routed effect authored in 3D (metre-scale) units renders technically-correctly but
+ * invisibly: the CPU sim is unit-agnostic (see `pixiParticleMap.ts`), so a `startSize`/`startSpeed`
+ * meant as metres becomes the same number of Canvas2D DESIGN PIXELS, shrinking a normal 3D effect
+ * to a fraction of a pixel on screen. Nothing else signals this — no error, no zero particle count
+ * (the sim runs fine), `modoki_diagnose` sees nothing wrong. Warn once per bad state so an author
+ * gets a lead instead of a silently blank viewport (see docs/particles.md "2D vs 3D units").
+ *
+ * KNOWN LIMITATIONS (deliberately not chased further — this is a cheap heuristic, not a render):
+ * it reads `def` alone, so it CANNOT see a per-instance `Transform.scale` an author used to make a
+ * shared/metre-scale asset visible in this one placement (the CLAUDE.md-sanctioned fix — scale the
+ * SCENE entity, not fork the asset) — that placement will warn every session regardless. And the
+ * reach estimate below is still an upper bound that ignores drag and an early collision plane, so
+ * it can UNDER-estimate a real sim's travel in the other direction.
+ */
+function warnIfSubPixel2D(def: ParticleEffectDef): void {
+  const id = def.id;
+  if (!id) return;
+  // Speed × lifetime (ignoring drag/collision, which only shrink it further) PLUS the ballistic
+  // drop from gravity alone (½·|g|·life² — the distance gravity contributes even at zero start
+  // speed, e.g. a falling/rising effect with a strong pull and a weak launch). Together an upper
+  // bound on travel. Thresholds (16 / 24 design px) are picked so a real metre-scale 3D effect
+  // (e.g. startSize ~0.1-0.2, speed ~3-6, life ~2-3 → sprite ~6-13px, reach ~18px) trips it, while
+  // a properly 2D-authored effect (tens-to-hundreds of design px) does not.
+  const life = def.startLifetime.max;
+  const g = resolveGravity(def.gravity, _gravityScratch);
+  const gravityMag = Math.hypot(g.x, g.y, g.z);
+  const reachDesignPx = def.startSpeed.max * life + 0.5 * gravityMag * life * life;
+  // Sprite size is only checkable against the DEFAULT soft-circle texture (a known 64px
+  // constant) — a `render.texture` effect's real size isn't known until the async load
+  // completes (see `loadTextureFor`), and guessing 64px false-positives on any real sprite sheet
+  // authored bigger than that (confirmed against games/court's shipped win-sequence confetti,
+  // which uses a custom texture and a startSize that reads as sub-pixel ONLY under the 64px
+  // default-texture assumption). So a textured effect skips this half and is judged on reach
+  // alone — worse recall for that case, but no false positive on real, working content.
+  const spriteDesignPx = def.render.texture ? Infinity : def.startSize.max * DEFAULT_TEXTURE_PX;
+  if (spriteDesignPx >= 16 && reachDesignPx >= 24) {
+    warnedSubPixel2D.delete(id); // now reads clean — allow a future regression to warn again
+    return;
+  }
+  if (warnedSubPixel2D.has(id)) return; // already told this session, in the same bad state
+  warnedSubPixel2D.add(id);
+  const spritePart = Number.isFinite(spriteDesignPx) ? `sprite ≈ ${spriteDesignPx.toFixed(2)} design px, ` : '';
+  console.warn(
+    `[particles2d] effect "${def.name || id}" (${id}) renders sub-pixel in 2D: ${spritePart}` +
+    `plume reach ≈ ${reachDesignPx.toFixed(2)} design px. ` +
+    `2D sim units are Canvas2D design pixels, not metres — this effect looks authored for the 3D ` +
+    `backend. See docs/particles.md "2D vs 3D units".`,
+  );
+}
 
 /** The 2D (PixiJS) particle backend contract: the renderer-agnostic core plus the PixiJS
  *  `Container` to mount (the 2D counterpart of {@link IParticleBackend}'s `getObject3D`). */
@@ -60,6 +126,7 @@ export class PixiParticleBackend implements IParticle2DBackend {
   }
 
   create(def: ParticleEffectDef): ParticleHandle {
+    warnIfSubPixel2D(def);
     const id = this.nextId++;
     const seed = (id * 9973) >>> 0;
     const entry: Entry = {
@@ -162,6 +229,7 @@ export class PixiParticleBackend implements IParticle2DBackend {
   setDef(handle: ParticleHandle, def: ParticleEffectDef): void {
     const e = this.entries.get(handle.id);
     if (!e) return;
+    warnIfSubPixel2D(def);
     const newTexRef = def.render.texture ?? '';
     const texChanged = newTexRef !== e.textureRef;
     const structural =

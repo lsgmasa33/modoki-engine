@@ -140,12 +140,34 @@ push `speedScale`, and `update` on the **visual delta** scaled by `playbackSpeed
 
 ## Gotchas
 
-- **2D `startSize` is a TEXTURE MULTIPLIER, not a pixel size.** The Pixi backend copies the
-  sim's scale straight onto `Particle.scaleX/scaleY` (`pixiParticleMap.ts`), so rendered height
-  = `startSize × textureHeight` in design px (both position and size live under the single
-  canvas-slot scale, so the result is device-independent). A 64×128 strip at `startSize: 0.2`
-  renders ~26 design px tall. Authoring `startSize: 28` "as pixels" renders the texture at 28×
-  — a full-screen wash. The 3D backends are the opposite: `startSize` there IS world units.
+- **2D vs 3D units — the CPU sim is unit-agnostic; EVERY length-dimensioned field means something
+  different per backend, not just `startSize`.** The 3D backends read the sim's output as **metres**
+  (world units); the Pixi 2D backend reads the exact same numbers as **Canvas2D design pixels**
+  (`pixiParticleMap.ts` — position and size both live under the single canvas-slot scale, so the
+  result is device-independent). That covers `startSize` (a TEXTURE MULTIPLIER: rendered height =
+  `startSize × textureHeight` in design px — a 64×128 strip at `startSize: 0.2` renders ~26 design
+  px tall; authoring `startSize: 28` "as pixels" renders the texture at 28× — a full-screen wash) —
+  and identically `startSpeed` (design px/s), `gravity`/`forces` (design px/s²), `shape.radius`/
+  `size`/`points` (design px), and `collision.planePoint`/radius/extents (design px). `drag` is a
+  unitless s⁻¹ rate and does NOT need converting. **There is no auto-conversion** — porting a
+  metre-authored effect to 2D means multiplying every one of those fields by a chosen
+  pixels-per-metre factor `L` (`startSize` is the odd one out: multiply by `L / textureHeightPx`
+  instead). Get one of these wrong (most often: reusing a 3D asset's numbers unchanged in a
+  Canvas2D-parented emitter) and the effect still SIMULATES correctly — it just renders at a
+  fraction of a pixel, indistinguishable from nothing. `PixiParticleBackend` warns once per effect
+  id to the console when an effect looks sub-pixel in 2D (`warnIfSubPixel2D` in
+  `pixiParticleBackend.ts` — a cheap heuristic on `startSize`/`startSpeed`/`startLifetime`, not a
+  hard error), but nothing else signals it: no thrown error, particle count stays nonzero,
+  `modoki_diagnose` reports no issues. **The sprite-size half of that heuristic only applies to
+  the DEFAULT soft-circle texture** — a `render.texture` effect's real size isn't known until the
+  async load completes, so a textured effect is judged on plume reach alone (worse recall, but no
+  false positive on a real sprite sheet authored bigger than the 64px default — confirmed against
+  `games/court`'s shipped win-sequence confetti). The 3D backends are the opposite of all of the
+  above — every one of these fields there IS world units, unscaled.
+- **2D silently ignores `render.mode: 'mesh'` (and trails/sub-emitters).** The Pixi backend only
+  ever draws billboard sprites (`pixiParticleObject.ts`) — a Canvas2D-routed emitter using a
+  mesh-mode 3D effect (`meshPrimitive`/`meshLit`) still renders, just as the default soft-circle
+  sprite instead. Same asset, categorically different look per backend, with no warning.
 - **Untextured 2D particles render as soft round blobs** — the default texture is a radial
   alpha falloff (`pixiParticleObject.ts`), so "plain coloured squares" is not what you get.
   Confetti/paper effects need a real strip texture (`render.texture`), authored near-white so
