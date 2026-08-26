@@ -27,6 +27,7 @@ import { uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
 import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
+import { UI_PAINT_ATTR } from './uiPaintMarker';
 import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo } from './scrollViewDom';
 import { scrollByEntry } from './scrollApi';
 import { driveEntriesFromScroll } from './entriesSystem';
@@ -58,7 +59,7 @@ const AnimatedText = React.memo(function AnimatedText(
     // a steps() timing on the one-shot, and the -cycle-hard keyframe for the loop.
     const fade = perCharFade !== false;
     return (
-      <span aria-label={text} style={{ display: 'inline-block', whiteSpace: 'pre-wrap' }}>
+      <span aria-label={text} {...{ [UI_PAINT_ATTR]: 'text' }} style={{ display: 'inline-block', whiteSpace: 'pre-wrap' }}>
         {chars.map((ch, i) => {
           const delay = i * perCharStagger;
           const anim = perCharLoop
@@ -76,7 +77,7 @@ const AnimatedText = React.memo(function AnimatedText(
   // number is then vmin, not pixels. `em` resolves against the element's own COMPUTED font size,
   // so it is correct for every unit and needs no resolution step at all.
   if (amp) (style as Record<string, string>)['--ui-amp'] = `${amp}em`;
-  return <span style={style}>{text}</span>;
+  return <span {...{ [UI_PAINT_ATTR]: 'text' }} style={style}>{text}</span>;
 });
 
 /** Convert a numeric value + unit string to a CSS value. Returns undefined if value is 0/falsy.
@@ -716,7 +717,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // `rendering.web.sizeMode` — matching Scene3D, which clamps the 3D buffer on the
       // same surface. The editor branch above (renderCanvas2D, SceneView.tsx) deliberately
       // does NOT pass it — the editor viewport sizes itself / uses device presets.
-      : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode /></Suspense> : null);
+      //
+      // pointerThrough must be threaded explicitly: Canvas2DMount's own wrapper div hardcodes
+      // `pointerEvents: 'auto'` unless told otherwise, and a DOM ancestor set to `none` does not
+      // stop a descendant set to `auto` from receiving pointer events — so the outer `style`
+      // above (which already reflects `node.pointerThrough`) can't reach through to it on its own.
+      : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode pointerThrough={node.pointerThrough} /></Suspense> : null);
     return (
       <div ref={scrollRef} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
         {nineSliceLayer}

@@ -114,6 +114,7 @@ function text2DGizmoBox(entity: { has: (t: unknown) => boolean; get: (t: unknown
   return { halfW: layout.width / 2, halfH: layout.height / 2, pivotX: (t.anchorX as number) ?? 0.5, pivotY: (t.anchorY as number) ?? 0.5 };
 }
 import { pick2D, pick3D, type Pick2DCandidate, type Pick3DEntry } from './picking';
+import { resolvePreviewPick, readPreviewStack } from './uiPreviewPick';
 import { safeAreaCssVars } from '../scene/devicePresets';
 import SafeAreaOverlay from '../rendering/SafeAreaOverlay';
 import { UIResizeOverlay } from './UIResizeOverlay';
@@ -131,6 +132,12 @@ import { editorCanvas2DPool, editorScene2DRenderer, editorMarkScene2DDirty } fro
 // raycast while mounted; the 2D pointer handler calls it when its own pick2D misses. Null when
 // no 3D viewport is mounted.
 let _pickBillboardInUI: ((clientX: number, clientY: number) => number | null) | null = null;
+
+// Per-canvas 2D-ONLY pick lookup for the "ui" preview mode's paint-order arbiter (#337,
+// `uiPreviewPick.ts`). Populated/cleared by `installScene2DInteraction`'s own mount/teardown —
+// one entry per mounted Canvas2D chrome overlay, keyed by the SAME canvasEntityId stamped on its
+// `[data-2d-pick]` canvas's `data-canvas-entity-id` attribute (`Scene2DChromeOverlay`).
+const _pick2DByCanvas = new Map<number, (clientX: number, clientY: number) => number | null>();
 
 // Reusable Three.js objects for SceneView render loop — avoids per-frame allocations
 const _svCamPos = new THREE.Vector3();
@@ -842,6 +849,21 @@ function pickUnderlyingUIEntity(clientX: number, clientY: number): number | null
   return Number.isFinite(id) ? id : null;
 }
 
+/** #337 — predicts what a real click at a viewport point would select in the "ui" preview mode,
+ *  reconciling the REAL browser paint stack (`readPreviewStack`) against paint-order policy
+ *  (`resolvePreviewPick`, `uiPreviewPick.ts`) instead of trusting DOM click routing (which a
+ *  `stopPropagation`-ing UI element on top can get wrong even when it paints nothing there — see
+ *  the file header). Registered as BOTH this surface's higher-priority pick provider (so
+ *  `modoki_tap` prediction agrees with a real click) AND the function driving `UIEditorOverlay`'s
+ *  own capture-phase pointerdown arbiter below — same rule as `pickEntityAtViewportPoint`
+ *  (`screenPick.ts`'s header): a provider must call the SAME code path a real click runs. */
+function resolvePreviewPickAt(clientX: number, clientY: number): number | null {
+  const stack = readPreviewStack(clientX, clientY);
+  const pick2DAt = (canvasEntityId: number) => _pick2DByCanvas.get(canvasEntityId)?.(clientX, clientY) ?? null;
+  const pick = resolvePreviewPick(stack, pick2DAt);
+  return pick ? pick.id : null;
+}
+
 /** The editor's per-Canvas2D drawing surface. Inline-mounted INSIDE its UI-node
  *  div (via UINode's renderCanvas2D injection), so it fills that div and stacks
  *  by hierarchy/zIndex exactly like the runtime's Canvas2DMount — no separate
@@ -1111,18 +1133,28 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       });
     }
 
-    // Predicts what a real click at a viewport point would select on THIS 2D canvas — the exact
-    // candidate-gather + pick2D call `onPointerDown` runs below, plus its billboard/underlying-UI
-    // fallbacks, hoisted out so it can also be registered as this canvas's pick provider
-    // (`registerPickProvider`, F15 — `docs/enact.md`). Must stay the
-    // ONE code path both callers use — see the rule in `screenPick.ts`. Returns `null` for
-    // "nothing here", including a point outside this canvas's own rect (do not clamp — an
-    // out-of-rect point belongs to whichever surface actually covers it, if any).
-    function pickEntityAtViewportPoint(clientX: number, clientY: number): number | null {
+    // Shared by `pick2DEntityAtViewportPoint` and `pickEntityAtViewportPoint` below (opus-reviewer,
+    // #337 close-out — was two independently-maintained copies of the same guard, a drift hazard:
+    // giving this canvas a grab tolerance or a scaled rect later would need editing both, silently,
+    // to stay in sync). `true` only when there IS a canvas and the point is inside its rect.
+    function withinCanvasRect(clientX: number, clientY: number): boolean {
       const c = canvasRef.current;
-      if (!c) return null;
+      if (!c) return false;
       const rect = c.getBoundingClientRect();
-      if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return null;
+      return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+    }
+
+    // Predicts what a real click at a viewport point would select on THIS 2D canvas ALONE — the
+    // exact candidate-gather + pick2D call `onPointerDown` runs below, plus its billboard
+    // fallback. Deliberately does NOT fall through to the underlying UI node (`pickEntityAtViewportPoint`
+    // below adds that, for the non-"ui"-preview 2D flow) — the "ui" preview mode's paint-order
+    // arbiter (`uiPreviewPick.ts`, #337) needs the 2D-ONLY answer so it can decide for itself
+    // whether a UI element above this canvas actually beats a genuine 2D hit, rather than this
+    // function silently making that call first. Returns `null` for "nothing here", including a
+    // point outside this canvas's own rect (do not clamp — an out-of-rect point belongs to
+    // whichever surface actually covers it, if any).
+    function pick2DEntityAtViewportPoint(clientX: number, clientY: number): number | null {
+      if (!withinCanvasRect(clientX, clientY)) return null;
       const { x: px, y: py } = toGame(clientX, clientY);
       const allTraits = getAllTraits();
       const transformMeta = allTraits.find((t) => t.name === 'Transform');
@@ -1212,14 +1244,31 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       const bbId = _pickBillboardInUI?.(clientX, clientY);
       if (bbId != null) return bbId;
 
+      return null;
+    }
+
+    // Non-"ui"-preview 2D flow (`registerPickProvider` below, and this canvas's own
+    // `onPointerDown`): falls through to the UI node underneath a 2D miss, same as before #337.
+    // The "ui" preview mode's arbiter does NOT use this — see `pick2DEntityAtViewportPoint`'s doc.
+    // ⚠️ Re-checks "no canvas" / "point outside this canvas's rect" itself, matching the ORIGINAL
+    // pre-#337 behavior exactly: those are hard misses for THIS canvas's provider, not "ask the UI
+    // layer instead" — falling through for them would make this provider answer for points
+    // outside its own surface, which another registered provider (or nothing) owned before.
+    function pickEntityAtViewportPoint(clientX: number, clientY: number): number | null {
+      if (!withinCanvasRect(clientX, clientY)) return null;
+      const id2d = pick2DEntityAtViewportPoint(clientX, clientY);
+      if (id2d !== null) return id2d;
       // No 2D entity here. This canvas (pointerEvents:'auto') sits above the DOM
       // UI layer, so without this it would swallow clicks meant for a UI element
       // showing through the transparent canvas. Select the UI node beneath, if any.
-      const uiId = pickUnderlyingUIEntity(clientX, clientY);
-      if (uiId !== null) return uiId;
-
-      return null;
+      return pickUnderlyingUIEntity(clientX, clientY);
     }
+
+    // Registered so the "ui" preview mode's paint-order arbiter (`UIEditorOverlay`,
+    // `uiPreviewPick.ts`, #337) can ask THIS canvas's own 2D-only hit-test by canvas entity id —
+    // the same recipe `registerPickProvider` uses for the whole-surface prediction below, scoped
+    // per canvas instead of per surface. Cleared in the teardown below.
+    _pick2DByCanvas.set(canvasEntityId, pick2DEntityAtViewportPoint);
 
     function onPointerDown(e: PointerEvent) {
       deselectGesture.reset(); // a fresh press supersedes any stale pending deselect
@@ -1615,6 +1664,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       window.removeEventListener('pointerup', marquee2dUp);
       marqueeEl2d.remove();
       unregPick2D();
+      if (_pick2DByCanvas.get(canvasEntityId) === pick2DEntityAtViewportPoint) _pick2DByCanvas.delete(canvasEntityId);
     };
 }
 
@@ -2272,8 +2322,89 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
     ? (id: number) => <><Canvas2DMount entityId={id} pool={editorCanvas2DPool} markDirty={editorMarkScene2DDirty} viewZoom={viewZoom} /><Scene2DChromeOverlay canvasEntityId={id} showBoundary={selected2D} viewZoom={viewZoom} /></>
     : () => null;
 
+  // #337 — register the paint-order arbiter (`resolvePreviewPickAt`) as this surface's pick
+  // provider, ABOVE the 2D canvas's own priority-10 registration (#80): the arbiter's answer is a
+  // superset (it already runs `pick2DAt` for any canvas in the stack), so it must be asked first.
+  // Scoped to this component's mount lifetime, i.e. `sceneViewMode === 'ui'` (see the render gate
+  // this component is mounted behind, `mode === 'ui'` in the parent).
+  useEffect(() => registerPickProvider(resolvePreviewPickAt, 'scene-view', 20), []);
+
+  // #337 — capture-phase arbiter: a real click can land on a UI element that visually paints
+  // nothing at that point (`UINode`'s `pointerEvents:'auto'` + unconditional `stopPropagation`),
+  // so it swallows a click meant for a genuine 2D hit underneath before that 2D canvas's own
+  // handler ever sees it. Reconcile against the real paint stack and, if the arbiter disagrees
+  // with plain DOM routing, redirect the selection and swallow BOTH this pointerdown and the
+  // `click` React dispatches after it (its own bubble-phase `onClick` would otherwise re-select
+  // the DOM target and undo this).
+  const frameRef = useRef<HTMLDivElement>(null);
+  const overrodeClickRef = useRef(false);
+  // Generation counter for the deferred `clearStuckSwallow` below (opus-reviewer, #337
+  // close-out): a plausible-but-unobserved race under a congested main thread — a rAF clear
+  // SCHEDULED by gesture 1's `pointerup` can fire AFTER gesture 2's `pointerdown` has already
+  // re-armed the flag, clearing gesture 2's arm before ITS OWN `click` gets a chance to consume
+  // it. Tagging each arm with a generation and only clearing when the generation still matches
+  // makes a late clear a no-op instead of clobbering a newer arm, without having to reason about
+  // exact browser event-queue/rAF ordering at all.
+  const swallowGenRef = useRef(0);
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const onPointerDownCapture = (e: PointerEvent) => {
+      // Left button only — matches the 2D canvas's own handler (`e.button !== 0` guard nearby).
+      // A right/middle press never selects here today (right-click opens a context menu via a
+      // separate `onContextMenu`), and redirecting selection on one would be a new behavior this
+      // fix must not introduce.
+      if (e.button !== 0) return;
+      const target = e.target as Element | null;
+      const uiTarget = target?.closest('[data-entity-id]') as HTMLElement | null;
+      // Not on a UI-attributed element at all (empty space, a resize handle, a raw click on the
+      // pick canvas itself) — leave normal DOM routing / the canvas's own handler untouched.
+      if (!uiTarget) return;
+      if (target?.closest('[data-2d-pick]')) return; // landed on the pick canvas — its own handler owns this
+      const winner = resolvePreviewPickAt(e.clientX, e.clientY);
+      const domId = Number(uiTarget.getAttribute('data-entity-id'));
+      if (winner === null || winner === domId) return; // arbiter agrees with default DOM routing
+      selectEntity(winner);
+      e.stopPropagation();
+      e.preventDefault();
+      overrodeClickRef.current = true;
+      swallowGenRef.current++;
+    };
+    const onClickCapture = (e: MouseEvent) => {
+      if (!overrodeClickRef.current) return;
+      overrodeClickRef.current = false;
+      e.stopPropagation();
+      e.preventDefault();
+    };
+    // A redirect's swallow flag is consumed by the `click` that normally follows a `pointerdown`
+    // — but a press that becomes a drag (release outside `frame`, so `click`'s common ancestor
+    // never reaches here) or that never produces a `click` at all leaves it stuck, silently
+    // eating one unrelated LATER click. `pointerup`/`pointercancel` fire synchronously BEFORE any
+    // `click` the browser is about to dispatch for the same gesture, so clearing the flag directly
+    // in their handler would race ahead of `onClickCapture` and break the redirect it exists to
+    // protect — deferring one animation frame lets that `click` (if any) run and consume the flag
+    // itself first; this is then a harmless no-op. Listened on `window`, not `frame`: the release
+    // that ends a drag is frequently outside the frame's bounds.
+    const clearStuckSwallow = () => {
+      const armedGen = swallowGenRef.current;
+      requestAnimationFrame(() => {
+        if (swallowGenRef.current === armedGen) overrodeClickRef.current = false;
+      });
+    };
+    frame.addEventListener('pointerdown', onPointerDownCapture, { capture: true });
+    frame.addEventListener('click', onClickCapture, { capture: true });
+    window.addEventListener('pointerup', clearStuckSwallow, { capture: true });
+    window.addEventListener('pointercancel', clearStuckSwallow, { capture: true });
+    return () => {
+      frame.removeEventListener('pointerdown', onPointerDownCapture, { capture: true });
+      frame.removeEventListener('click', onClickCapture, { capture: true });
+      window.removeEventListener('pointerup', clearStuckSwallow, { capture: true });
+      window.removeEventListener('pointercancel', clearStuckSwallow, { capture: true });
+    };
+  }, [selectEntity]);
+
   return (
-    <div data-ui-preview-frame style={{
+    <div ref={frameRef} data-ui-preview-frame style={{
       position: 'absolute',
       left: bounds.x, top: bounds.y,
       width: logW, height: logH,

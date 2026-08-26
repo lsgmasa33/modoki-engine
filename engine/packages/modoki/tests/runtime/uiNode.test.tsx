@@ -57,6 +57,8 @@ vi.mock('../../src/runtime/video/UIVideoMount', () => ({
 
 import { UINode, cssVal, hexToRgba, hexToColor } from '../../src/runtime/ui/UINode';
 import { NineSliceImage } from '../../src/runtime/ui/NineSliceImage';
+import { UI_PAINT_ATTR } from '../../src/runtime/ui/uiPaintMarker';
+import { isPaintOpaque } from '../../src/editor/panels/uiPreviewPick';
 import type { UINodeData } from '../../src/runtime/ui/uiTreeStore';
 
 afterEach(() => {
@@ -430,6 +432,40 @@ describe('UINode image path (F3)', () => {
     const el = renderNode(makeNode({ imageSrc: GUID }));
     expect(el.style.borderImageSource).toBe('');
     expect(el.style.backgroundImage).toMatch(/url\(/);
+  });
+
+  // #337 close-out (opus-reviewer, 2nd pass): the SceneView editor's click arbiter
+  // (`isPaintOpaque`, `editor/panels/uiPreviewPick.ts`) reads the `data-ui-paint` marker
+  // `NineSliceImage` stamps to know a 9-sliced host paints something even with no CSS
+  // background of its own. Every earlier test for this marker hand-built a `<div>` and set the
+  // attribute directly — asserting the CONSUMER against a fixture of the test's own making, not
+  // against what `UINode` actually renders. A prior mutation check found that stripping the
+  // marker from all four real producers left `npm run verify` fully green, because nothing tied
+  // producer to consumer. This test renders the REAL `UINode` → `NineSliceImage` path and feeds
+  // its REAL output into the REAL `isPaintOpaque` — it fails if either side of that contract
+  // (the attribute name, or where it gets stamped) drifts.
+  it('a real 9-sliced UINode host is opaque to the SceneView click arbiter, via the REAL NineSliceImage marker', () => {
+    const GUID = '11111111-1111-4111-8111-111111111111';
+    h.resolveSprite.mockReturnValue({ border: { l: 8, r: 8, t: 12, b: 4 }, sheetW: 100, sheetH: 60, frame: { x: 0, y: 0, w: 100, h: 60 } });
+    const el = renderNode(makeNode({ imageSrc: GUID, imageMode: 'fill' }));
+    const overlay = el.firstElementChild as HTMLElement;
+    expect(overlay.getAttribute(UI_PAINT_ATTR)).toBe('nine-slice');
+    expect(isPaintOpaque(el)).toBe(true);
+  });
+
+  // #337 close-out: while a TextAnimation plays, `AnimatedText` wraps the text in its OWN
+  // <span> — the text is no longer a direct text-node child of the host `isPaintOpaque`'s
+  // generic check looks at, which is exactly why the marker exists for this path too. Same
+  // real-producer-into-real-consumer shape as the 9-slice test above.
+  it('a real UINode host with a playing TextAnimation is opaque, via the REAL AnimatedText marker', () => {
+    const el = renderNode(makeNode({
+      text: 'Score: 12',
+      textAnim: { effect: 'fade', speed: 1, amplitude: 0.1, frequency: 1, loop: false, fadeIn: true },
+    }));
+    const span = el.querySelector(`[${UI_PAINT_ATTR}="text"]`);
+    expect(span).not.toBeNull();
+    expect(span?.textContent).toBe('Score: 12');
+    expect(isPaintOpaque(el)).toBe(true);
   });
 });
 

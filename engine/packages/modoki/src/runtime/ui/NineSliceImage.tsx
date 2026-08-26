@@ -13,6 +13,7 @@
  *  real, unknown size; corners stay fixed, edges + centre stretch. */
 
 import React from 'react';
+import { UI_PAINT_ATTR } from './uiPaintMarker';
 
 export interface NineSliceImageProps {
   url: string;
@@ -72,7 +73,7 @@ export function NineSliceImage({ url, imgW: W, imgH: H, frame, l, r, t, b, scale
   };
 
   return (
-    <div aria-hidden style={outer}>
+    <div aria-hidden {...{ [UI_PAINT_ATTR]: 'nine-slice' }} style={outer}>
       {cell(url, W, H, fx, fy, l, t, 'tl')}
       {cell(url, W, H, cx, fy, midW, t, 'tc')}
       {cell(url, W, H, rx, fy, r, t, 'tr')}

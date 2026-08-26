@@ -17,6 +17,7 @@ vi.mock('../../src/runtime/video/videoSystem', () => ({
 }));
 
 import { UIVideoMount } from '../../src/runtime/video/UIVideoMount';
+import { UI_PAINT_ATTR } from '../../src/runtime/ui/uiPaintMarker';
 
 let el: HTMLVideoElement;
 
@@ -41,6 +42,16 @@ describe('UIVideoMount', () => {
     await pump();
     expect(hostOf(container).contains(el)).toBe(true);
     expect(el.style.objectFit).toBe('contain');
+  });
+
+  // #337 close-out: the SceneView editor's click arbiter (`isPaintOpaque`,
+  // `editor/panels/uiPreviewPick.ts`) reads this marker on the REAL host element to know a
+  // video backdrop paints something even before an element is adopted — pinned against the real
+  // component, not a hand-built fixture, so the producer side of that contract can't drift
+  // silently (see the identical rationale on the NineSliceImage marker test in uiNode.test.tsx).
+  it('stamps the data-ui-paint marker on its host', () => {
+    const { container } = render(<UIVideoMount entityId={7} />);
+    expect(hostOf(container).getAttribute(UI_PAINT_ATTR)).toBe('video');
   });
 
   it('gives the element to the HIGHER-priority host when the tree is mounted twice', async () => {

@@ -26,6 +26,7 @@
 
 import { useEffect, useRef } from 'react';
 import { videoElementFor } from './videoSystem';
+import { UI_PAINT_ATTR } from '../ui/uiPaintMarker';
 
 /** Every mounted host that wants a given entity's element, by priority. A multiset:
  *  two hosts of equal priority both stay registered, and the winner is simply the
@@ -111,10 +112,20 @@ export function UIVideoMount({ entityId, fit = 'cover', priority = 1 }: UIVideoM
   // `inset: 0` rather than 100%/100%: the host node may be a flex container with other
   // children (a UI backdrop usually is), and a video that participated in that layout
   // would push them around. It is a background layer, so it is taken out of flow.
+  //
+  // ⚠️ `UI_PAINT_ATTR` marks this host OPAQUE (#337 close-out) for the SceneView editor's
+  // click arbiter even when this box is currently empty — the `<video>` element is adopted
+  // imperatively above (`host.appendChild`), not authored in this JSX, so there is no cheap way
+  // to know from the DOM alone whether one is attached at classify time. Accepted, documented
+  // trade-off: a video-element author is claiming that box as visual content by nature (same
+  // spirit as `NineSliceImage`'s bordered sprite), and in the Stopped editor — the only place
+  // this classification runs — the box is reliably empty regardless, so this can only ever
+  // over-claim, never under-claim, a genuinely authored video backdrop.
   return (
     <div
       ref={hostRef}
       data-modoki-ui-video={entityId}
+      {...{ [UI_PAINT_ATTR]: 'video' }}
       style={{ position: 'absolute', inset: 0, overflow: 'hidden', pointerEvents: 'none' }}
     />
   );

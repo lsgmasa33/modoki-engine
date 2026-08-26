@@ -168,6 +168,20 @@ push `speedScale`, and `update` on the **visual delta** scaled by `playbackSpeed
   ever draws billboard sprites (`pixiParticleObject.ts`) — a Canvas2D-routed emitter using a
   mesh-mode 3D effect (`meshPrimitive`/`meshLit`) still renders, just as the default soft-circle
   sprite instead. Same asset, categorically different look per backend, with no warning.
+- ⚠️ **`render.aspect` COMPOUNDS with the texture's own shape — it is not a correction for it.**
+  The mapping is `scaleX = size × aspect`, `scaleY = size` (`pixiParticleMap.ts`), and both are
+  multipliers on the texture's OWN pixel dimensions. So `aspect` below 1 on an already-tall
+  texture multiplies the tallness: a 64×128 strip at `aspect: 0.5` renders **1:4**, not 1:2.
+  This is what made Court's first confetti invisible (#333) — `startSize: 0.15–0.24` read as
+  "19–31 design px" counting only the height, while the width was 4.8–7.7 px, i.e. a rotating
+  hairline. **Compute BOTH axes before believing a size**: `w = startSize × texW × aspect`,
+  `h = startSize × texH`. `aspect: 1` means "render the texture undistorted", not "square".
+- ⚠️ **2D `noise.frequency` is in DESIGN PIXELS, so the usable values are ~100× smaller than
+  they look.** `accumNoise` (`simSpec.ts`) feeds the particle's raw POSITION into the sine, so the
+  spatial wavelength is `2π / frequency` px: `0.9` is a **7 px** wavelength — every particle
+  jitters — while a visible flutter wants `~0.02` (a ~310 px sway). The 3D backends pass world
+  units, where `0.9` is the sane end of the range; the number does not transfer between spaces.
+  Pair it with `strength`, which is an acceleration in px/s² (peak `2 × strength`).
 - **Untextured 2D particles render as soft round blobs** — the default texture is a radial
   alpha falloff (`pixiParticleObject.ts`), so "plain coloured squares" is not what you get.
   Confetti/paper effects need a real strip texture (`render.texture`), authored near-white so

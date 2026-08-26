@@ -67,12 +67,18 @@ the occlusion check could see, because `occluded:false` does not mean the same t
   engine has no business deciding what a game considers clickable. A game registers its own
   provider to opt in; only the editor's `scene-view` surface ships one today (its SceneView
   pointer-handler picking, hoisted into a shared function both the handler and the provider call).
-  `scene-view` registers **two** — the 2D canvas overlay and the 3D viewport, which overlap on
-  screen — so `registerPickProvider` takes an explicit `priority` (higher consulted first,
-  registration order breaking ties) and the 2D overlay declares that it sits on top. Before #80
-  this could not bite, because a 2D `scene-view` aim was refused for want of bounds before any
-  picker ran; the order it fell back on was React effect mount order, which is not guaranteed to
-  match z-order. State the priority rather than relying on mount timing.
+  `scene-view` registers **two in general, three while the SceneView's "ui" preview mode is
+  mounted** — the 2D canvas overlay (priority 10) and the 3D viewport, which overlap on screen —
+  so `registerPickProvider` takes an explicit `priority` (higher consulted first, registration
+  order breaking ties) and the 2D overlay declares that it sits on top. Before #80 this could not
+  bite, because a 2D `scene-view` aim was refused for want of bounds before any picker ran; the
+  order it fell back on was React effect mount order, which is not guaranteed to match z-order.
+  State the priority rather than relying on mount timing. The "ui" preview mode's paint-order
+  arbiter (`uiPreviewPick.ts`, #337) registers a THIRD, at priority **20** — above the 2D overlay
+  — because its answer is a strict superset: it already runs the 2D overlay's own `pick2D` for any
+  canvas in the combined DOM+canvas paint stack, then additionally reconciles that against real UI
+  elements sharing the same preview, so it must be asked first or its reconciliation would never
+  run.
 
 Reporting the scope is what stops the weaker check from being read as the stronger one; a bare
 `occluded:false` on `'canvas'` would be a false clean bill of health. The `'entity'` scope also
