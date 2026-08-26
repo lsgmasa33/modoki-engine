@@ -688,9 +688,13 @@ itself evidence (the killer already exited). Do not "simplify" the pattern back.
 
 Three loops, three jobs — don't conflate them:
 
-- **`editor:main` / `editor:ai` (+ `MODOKI_BACKEND_PORT=5181 …` for ai2)** — the **HMR dev loop**.
-  Vite dev server + Electron; edit a file, see it in ~200ms. This is for *building* the software and
-  is your default.
+- **`npm run editor:dev`** — the **HMR dev loop**. Vite dev server + Electron; edit a file, see it in
+  ~200ms. This is for *building* the software and is your default. It works unchanged in every clone:
+  the backend port comes from the clone DIRECTORY via `engine/scripts/editorPorts.mjs`, so no
+  `MODOKI_BACKEND_PORT=…` prefix is needed (#349 — that prefix used to be mandatory on every worker
+  clone, and forgetting it aimed the launch at the hub's 5179). The old clone-named `editor:main` /
+  `editor:ai` scripts were deleted with #349 — a per-clone NAME cannot be right in a repo every clone
+  shares, which is the same mistake as the per-clone port default they carried.
 - **`npm run test:packaged` / `smoke:packaged`** — the **faithful packaged loop**. Both run
   `electron-builder --dir` to produce the REAL `Modoki Editor.app` (asar packed, workspace symlinks
   dereferenced, devDeps pruned) — it is **the DMG minus code-signing + dmg-packaging** (the only slow
@@ -709,9 +713,12 @@ Three loops, three jobs — don't conflate them:
     editor lane** — so a throwaway smoke build could silently answer an agent's `modoki_*` calls
     (#68). `engine/tests/architecture/clonePortHardcoding.test.ts` now fails any packaged-app
     spawner that doesn't derive a port.
-  - **Per-clone MCP-targetable packaged editor**: `editor:main:packaged` / `editor:ai:packaged` (or
-    `MODOKI_BACKEND_PORT=<port> bash engine/scripts/test-packaged.sh games/<id>`) build the `.app` and
-    launch it on the clone's pinned backend port — the packaged app honors `MODOKI_BACKEND_PORT`, so
+  - **Per-clone MCP-targetable packaged editor**: `npm run editor:packaged` (or
+    `bash engine/scripts/test-packaged.sh games/<id>`) builds the `.app` and
+    launches it on the clone's pinned backend port — which `test-packaged.sh` now derives from the
+    clone directory itself (#349). It has to: the pin used to arrive only as a literal prefix on the
+    two npm entries, so running the script directly, or from ai2/ai3/qa, left `main.ts`'s
+    sticky-then-scan to pick — and that list *starts at 5179*. The packaged app honors `MODOKI_BACKEND_PORT`, so
     `MODOKI_BACKEND=http://127.0.0.1:<port>` drives it exactly like the dev editor. It uses the SAME
     port as that clone's dev editor, so run one **or** the other per clone, not both (the packaged app
     pins the port and refuses to drift). The launch stops the local dev editor + any packaged app

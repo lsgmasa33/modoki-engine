@@ -1,7 +1,8 @@
 /** Per-clone ports must be DERIVED or injected, never baked into a shared file (#20, #69, #68).
  *
- *  Four clones share this machine (root CLAUDE.md § Clones), each with its own lane:
- *  backend 5179/5180/5181, Vite 5173/5174/5175, CDP 9222/9223/9224. Anything committed that names
+ *  Five clones share this machine (root CLAUDE.md § Clones), each with its own lane — backend
+ *  5179..5183, with Vite and CDP derived from it. The authored table is `editorPorts.mjs` (#349);
+ *  this file imports it rather than restating it. Anything committed that names
  *  one of those numbers is, by construction, correct for at most ONE clone — and wrong SILENTLY for
  *  the rest, because the call still succeeds, just against a sibling checkout. That is the same
  *  failure shape as the "which editor is this?" gotcha, and it has now happened twice:
@@ -22,6 +23,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { hasPrivateTooling } from '../helpers/repoLayout';
+import { CLONE_BACKEND_PORTS, vitePortForBackend, cdpPortForBackend } from '../../scripts/editorPorts.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
 const read = (rel: string) => readFileSync(path.join(REPO, rel), 'utf8');
@@ -37,8 +39,18 @@ const MCP_CONFIGS = ['.mcp.json', '.cursor/mcp.json', '.codex/config.toml'];
 /** The per-clone lanes from root CLAUDE.md § Clones. A literal occurrence of any of these in a
  *  shared config is the bug — UNLESS it is the default of a `${VAR:-…}` expansion, which is the
  *  sanctioned escape: the shared file then carries a sensible default and each clone overrides it
- *  through its own gitignored `.claude/settings.local.json`. */
-const CLONE_PORTS = [5173, 5174, 5175, 5179, 5180, 5181, 9222, 9223, 9224];
+ *  through its own gitignored `.claude/settings.local.json`.
+ *
+ *  DERIVED, not hand-listed (#349). This list used to stop at three clones — 5179/5180/5181,
+ *  5173-5175, 9222-9224 — while five existed, so `modoki-ai3`'s and `modoki-qa`'s lanes were
+ *  invisible to the very guard whose job is to spot a baked-in lane. That is the same drift the
+ *  guard exists to catch, in the guard itself, and it is why the ports now come from
+ *  `editorPorts.mjs` (the one authored table) instead of a literal array here. */
+const CLONE_PORTS = Object.values(CLONE_BACKEND_PORTS).flatMap((backend) => [
+  backend,
+  vitePortForBackend(backend),
+  cdpPortForBackend(backend),
+]);
 
 /** Strip every `${VAR:-default}` expansion, so what remains is only the genuinely hardcoded text. */
 function stripEnvExpansions(src: string): string {

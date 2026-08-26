@@ -46,7 +46,17 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `flexShrink`, per-edge `padding*`/`margin*` (each with its own `*Unit`),
   `minWidth`/`maxWidth`/`minHeight`/`maxHeight`, `alignSelf`, `zIndex`, `rotation` (see below),
   `overflow`
-  (`visible | hidden | scroll`), `isVisible`, `pointerThrough` (see below).
+  (`visible | hidden | scroll`), `scrollbarStyle` (`auto | tinted | hidden`) with
+  `scrollbarThumbColor`/`scrollbarTrackColor`, `isVisible`, `pointerThrough` (see below).
+
+  **The scrollbar skin is `scrollbar-color` + `scrollbar-width` and nothing else**, because these
+  are INLINE styles and `::-webkit-scrollbar` is a pseudo-element that cannot be written inline at
+  all (`scrollViewDom.ts` records the same limit where it hides a scroll view's bar). So you get a
+  thumb colour, a track colour and a coarse width — no shape, corner or arrow control. The skin is
+  gated on `overflow: 'scroll'`, so a tint authored on an element that never scrolls does nothing
+  rather than sitting in the Inspector pretending to.
+  ⚠️ `'hidden'` removes an **affordance**, not just a decoration: with no bar, nothing on screen
+  says the content continues below the fold. Use it only where something else already does.
 
   ⚠️ **Match `gapUnit` to the unit the CHILDREN are sized in.** `gap` was px-only until
   2026-08-07, and a `flexWrap: 'wrap'` container whose items scale (`vh`/`vmin`/`%`) while its

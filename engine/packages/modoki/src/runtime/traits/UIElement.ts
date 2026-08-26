@@ -83,6 +83,28 @@ export const UIElement = trait({
    */
   rotation: 0,
   overflow: 'visible' as 'visible' | 'hidden' | 'scroll',
+  /**
+   * How this element's scrollbar is drawn when `overflow: 'scroll'` actually overflows.
+   *
+   * - `'auto'`   — the platform's own scrollbar. The default, so nothing existing changes.
+   * - `'tinted'` — `scrollbarThumbColor` / `scrollbarTrackColor` are applied.
+   * - `'hidden'` — no scrollbar at all; the element still scrolls by drag/wheel.
+   *
+   * ⚠️ **This is the ONLY way to theme a scrollbar here, because these are INLINE styles.**
+   * `::-webkit-scrollbar` is a pseudo-element and cannot be expressed inline (`scrollViewDom.ts`
+   * says the same thing where it hides a scroll view's bar), so the standards properties
+   * `scrollbar-color` / `scrollbar-width` are the whole available surface. That buys the thumb and
+   * track colour and a coarse width — not a custom shape, and not a corner or arrow style.
+   *
+   * ⚠️ **`'hidden'` removes an AFFORDANCE, not just a decoration.** With no bar there is nothing on
+   * screen saying content continues below the fold. Use it only where something else already says
+   * so.
+   */
+  scrollbarStyle: 'auto' as 'auto' | 'tinted' | 'hidden',
+  /** Thumb colour for `scrollbarStyle: 'tinted'` (0xRRGGBB). Ignored otherwise. */
+  scrollbarThumbColor: 0x888888 as number,
+  /** Track colour for `scrollbarStyle: 'tinted'` (0xRRGGBB). Ignored otherwise. */
+  scrollbarTrackColor: 0xdddddd as number,
   isVisible: true,
   /**
    * Never take the pointer: taps fall through to whatever is BEHIND this element, while its

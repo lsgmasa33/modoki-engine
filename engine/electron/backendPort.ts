@@ -26,10 +26,10 @@ export const PORT_PREF_FILE = 'backend-port.json';
 /**
  * Ports owned by the PINNED `MODOKI_BACKEND_PORT` contract — an UNPINNED editor must
  * never squat one. 5180/5181 are the two-clone dev editors (CLAUDE.md: work-ai / work-ai2,
- * `npm run editor:ai`) and 5188 is the packaged-smoke gate (smoke-packaged.sh). Squatting
+ * the `editor-ai` shell function) and 5188 is the packaged-smoke gate (smoke-packaged.sh). Squatting
  * one is worse than it looks: we'd also `writeLastPort` it, so EVERY later launch grabs it
  * first, and the pinned editor then hits its "refusing to drift" `app.exit(1)` — a consumer
- * editor would permanently break `npm run editor:ai` / `verify:packaged`.
+ * editor would permanently break `npm run editor:dev` / `verify:packaged`.
  *
  * 5179 is deliberately NOT reserved: it's the conventional default, and a lone consumer
  * editor (no dev clones) should land on it. When it IS taken, we skip past the reserved

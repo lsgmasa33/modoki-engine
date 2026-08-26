@@ -36,7 +36,7 @@ describe('portCandidates', () => {
   it('NEVER offers a reserved pinned-contract port (5180/5181/5188)', () => {
     // 5180/5181 are the two-clone dev editors, 5188 the packaged-smoke gate. An unpinned
     // editor squatting one — and then persisting it — permanently breaks `npm run
-    // editor:ai` / `verify:packaged` (they pin it and exit(1) rather than drift).
+    // editor:dev` / `verify:packaged` (they pin it and exit(1) rather than drift).
     const c = portCandidates({ lastPort: null, span: 20 });
     for (const reserved of RESERVED_BACKEND_PORTS) expect(c).not.toContain(reserved);
   });

@@ -124,7 +124,10 @@ export function createToolContext(config: { backend: string; token?: string }): 
             // reader on modoki-qa (5183) to work-ai2's editor. A hint that confidently names the
             // wrong port is worse than no hint, so state the convention and point at the one
             // source that cannot be stale: the launch banner.
-            'per-clone backend ports: main=5179, work-ai=5180, work-ai2=5181, work-ai3=5182, work-qa=5183 — set MODOKI_BACKEND (or env.MODOKI_BACKEND in .claude/settings.local.json) to YOUR clone\'s port',
+            // …and having said that, this line then enumerated all five ports itself — correct
+            // on the day it was written and one more copy to keep in step (#349 found four such
+            // copies, two already stale). The convention now has ONE authored home; cite it.
+            'each clone pins its own backend port (engine/scripts/editorPorts.mjs; docs/clones-and-ports.md § RULE 2) — set MODOKI_BACKEND (or env.MODOKI_BACKEND in .claude/settings.local.json) to YOUR clone\'s port',
             'the launch banner prints the port it actually bound — trust it over any table',
           ],
         });

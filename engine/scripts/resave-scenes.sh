@@ -11,7 +11,7 @@
 #
 # Usage:
 #   engine/scripts/resave-scenes.sh games/sling demos/forest-camp
-#   MODOKI_BACKEND_PORT=5180 engine/scripts/resave-scenes.sh games/sling   # a worker clone
+#   MODOKI_BACKEND_PORT=5180 engine/scripts/resave-scenes.sh games/sling   # override (no longer required)
 #
 # Afterwards ALWAYS review with:
 #   node engine/scripts/check-scene-churn.mjs <same projects>
@@ -37,7 +37,13 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-PORT=${MODOKI_BACKEND_PORT:-5179}
+# PORT used to default to 5179 — the HUB's pinned port — so a bare run from a worker
+# clone drove the HUB's editor over HTTP instead of failing (#349). Derive from the
+# clone directory instead; unlike the launcher's "auto ports" degrade, an empty
+# result here would build a nonsense `http://127.0.0.1:` URL and fail confusingly
+# deep inside the curl loop below, so fail loud up front instead.
+PORT="${MODOKI_BACKEND_PORT:-$(node "$ROOT/engine/scripts/editorPorts.mjs" backend "$ROOT" || true)}"
+[ -n "$PORT" ] || { echo "[resave-scenes] '$(basename "$ROOT")' is not a known clone and MODOKI_BACKEND_PORT is unset — refusing to guess which editor to drive. Set MODOKI_BACKEND_PORT explicitly." >&2; exit 2; }
 BE="http://127.0.0.1:${PORT}"
 # Per clone, keyed on the backend port like every other editor-adjacent temp path here:
 # /tmp is machine-wide, so a bare name means two clones resaving at once overwrite each

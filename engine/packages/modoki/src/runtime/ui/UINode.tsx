@@ -201,6 +201,24 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     boxSizing: 'border-box',
   };
 
+  // ── Scrollbar skin ──
+  // Only the STANDARDS properties, because these are inline styles: `::-webkit-scrollbar` is a
+  // pseudo-element and cannot be written here at all (`scrollViewDom.ts` records the same limit
+  // where it hides a scroll view's bar). `scrollbar-color` + `scrollbar-width` is therefore the
+  // entire available surface — thumb, track, coarse width; no shape, corner or arrow control.
+  //
+  // Gated on `overflow: 'scroll'` so the fields cannot have an effect on an element that never
+  // scrolls: an authored value that quietly does nothing somewhere else is the "field nothing
+  // reads" trap, and this keeps the one visible consequence tied to the one field that causes it.
+  if (node.overflow === 'scroll') {
+    if (node.scrollbarStyle === 'hidden') {
+      style.scrollbarWidth = 'none';
+    } else if (node.scrollbarStyle === 'tinted') {
+      style.scrollbarWidth = 'thin';
+      style.scrollbarColor = `${hexToColor(node.scrollbarThumbColor)} ${hexToColor(node.scrollbarTrackColor)}`;
+    }
+  }
+
   // ── Focus ring ──
   // Data-driven outline drawn when this element is the focused nav target. Kept as a
   // non-layout `outline` (+offset) so it never shifts the flexbox box. Pointer/touch

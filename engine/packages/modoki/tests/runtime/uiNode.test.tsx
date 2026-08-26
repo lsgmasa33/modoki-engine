@@ -86,6 +86,7 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     minWidth: 0, minWidthUnit: 'px', maxWidth: 0, maxWidthUnit: 'px',
     minHeight: 0, minHeightUnit: 'px', maxHeight: 0, maxHeightUnit: 'px',
     alignSelf: 'auto', zIndex: 0, rotation: 0, overflow: 'visible', isVisible: true, pointerThrough: false,
+    scrollbarStyle: 'auto', scrollbarThumbColor: 0x888888, scrollbarTrackColor: 0xdddddd,
     backgroundColor: 0, backgroundOpacity: 0, borderRadius: 0, borderWidth: 0, borderColor: 0x333333, borderOpacity: 1, opacity: 1,
     text: '', fontFamily: '', fontSize: 16, fontSizeUnit: 'px', fontWeight: 'normal', fontStyle: 'normal',
     textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0, letterSpacingUnit: 'px',
@@ -221,6 +222,52 @@ describe('UINode box rendering', () => {
   it('disables pointer events on a non-interactive leaf', () => {
     const el = renderNode(makeNode({ children: [] }));
     expect(el.style.pointerEvents).toBe('none');
+  });
+
+  /**
+   * The scrollbar skin (#347). Only the STANDARDS properties exist here: these are inline styles,
+   * and `::-webkit-scrollbar` is a pseudo-element that cannot be written inline at all — so
+   * `scrollbar-color` / `scrollbar-width` is the whole surface. jsdom keeps both as plain CSS
+   * strings, which is exactly what is being asserted: that the right declaration is emitted.
+   */
+  describe('scrollbarStyle', () => {
+    it('emits nothing by default, so an untouched element keeps the platform bar', () => {
+      const el = renderNode(makeNode({ overflow: 'scroll' }));
+      expect(el.style.scrollbarWidth, 'auto must stay the platform default').toBe('');
+      expect(el.style.scrollbarColor).toBe('');
+    });
+
+    it('tinted emits scrollbar-color as thumb-then-track, plus a thin bar', () => {
+      const el = renderNode(makeNode({
+        overflow: 'scroll', scrollbarStyle: 'tinted',
+        scrollbarThumbColor: 0x8fa3b0, scrollbarTrackColor: 0xdfe7ec,
+      }));
+      expect(el.style.scrollbarWidth).toBe('thin');
+      // Order is load-bearing: CSS reads `scrollbar-color: <thumb> <track>`, and swapping them
+      // renders a dark track under a pale thumb — the exact inverse of the intent, and something
+      // no screenshot-free check would otherwise catch.
+      expect(el.style.scrollbarColor).toBe('#8fa3b0 #dfe7ec');
+    });
+
+    it('hidden removes the bar without disabling the scroll', () => {
+      const el = renderNode(makeNode({ overflow: 'scroll', scrollbarStyle: 'hidden' }));
+      expect(el.style.scrollbarWidth).toBe('none');
+      expect(el.style.overflow, 'it must still be a scroll container').toBe('auto');
+    });
+
+    /**
+     * ⚠️ The gate that keeps an authored value from being a lie. A tint on an element that never
+     * scrolls would sit in the Inspector doing nothing — the "field nothing reads" trap — so the
+     * skin is tied to the one property that causes a bar to exist.
+     */
+    it('is inert unless the element actually is a scroll container', () => {
+      for (const overflow of ['visible', 'hidden']) {
+        const el = renderNode(makeNode({
+          overflow, scrollbarStyle: 'tinted', scrollbarThumbColor: 0x8fa3b0,
+        }));
+        expect(el.style.scrollbarColor, `overflow:${overflow} must not be skinned`).toBe('');
+      }
+    });
   });
 });
 

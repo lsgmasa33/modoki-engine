@@ -66,8 +66,12 @@ export function caughtFailure(tool: string, what: string, e: unknown): DeviceRes
       tool, what,
       why: msg,
       options: [
-        'start this clone\'s editor: engine/scripts/launch-editor.sh games/<id>',
-        'each clone pins its own backend port (main=5179, work-ai=5180, work-ai2=5181) — check MODOKI_BACKEND',
+        'start this clone\'s editor: engine/scripts/launch-editor.sh games/<id> (it derives THIS clone\'s port — no MODOKI_BACKEND_PORT prefix needed)',
+        // Do NOT enumerate the ports here. This line used to read "(main=5179, work-ai=5180,
+        // work-ai2=5181)" — written when there were three clones and silently stale from the
+        // day a fourth appeared, which is the exact drift #349 was about. Name the one source
+        // instead; it cannot go out of date because the launcher reads it too.
+        'each clone pins its own backend port (engine/scripts/editorPorts.mjs; docs/clones-and-ports.md § RULE 2) — check MODOKI_BACKEND matches YOUR clone, and trust the launch banner over any table',
       ],
     });
   }

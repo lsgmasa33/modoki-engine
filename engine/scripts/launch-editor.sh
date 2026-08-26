@@ -60,7 +60,8 @@ fi
 # MODOKI_MULTI=1 launches an ADDITIONAL editor alongside running ones: it skips
 # the single-instance cleanup (no pkill, no dev:stop) and lets main auto-pick free
 # Vite + backend ports (findFreePort) so nothing clashes. Default (unset) keeps the
-# single-instance behavior: relaunch replaces the prior editor on the stable 5179.
+# single-instance behavior: relaunch replaces the prior editor on THIS CLONE's own
+# pinned port (editorPorts.mjs — 5179 for the hub, a different port per worker clone).
 MULTI="${MODOKI_MULTI:-}"
 # Snapshot the env pins the CALLER actually set, BEFORE this script exports its own
 # derived values over them. The launch log reconstructs the invocation from these, and a
@@ -71,7 +72,17 @@ CALLER_VITE_PORT="${MODOKI_VITE_PORT:-}"
 CALLER_CDP_PORT="${MODOKI_CDP_PORT:-}"
 CALLER_DEV_URL="${MODOKI_DEV_URL:-}"
 # In multi mode leave the backend port unset so each editor auto-picks a free one.
-if [ -n "$MULTI" ]; then BACKEND_PORT="${MODOKI_BACKEND_PORT:-}"; else BACKEND_PORT="${MODOKI_BACKEND_PORT:-5179}"; fi
+# The non-multi default used to be a literal 5179 — the HUB's pinned port — so a bare
+# launch from a WORKER clone silently targeted main's lane (#349). Derive it instead
+# from the clone directory via editorPorts.mjs: it prints the pinned port for a known
+# clone and NOTHING for an unknown one (with a stderr warning), which the `:-` here
+# turns into an empty BACKEND_PORT — i.e. auto ports, same fallback MULTI mode already
+# uses, rather than a wrong pin.
+if [ -n "$MULTI" ]; then
+  BACKEND_PORT="${MODOKI_BACKEND_PORT:-}"
+else
+  BACKEND_PORT="${MODOKI_BACKEND_PORT:-$(node "$REPO/engine/scripts/editorPorts.mjs" backend "$REPO" || true)}"
+fi
 PROJECT="${1:-}"
 # An explicitly-named project HARD-forces itself (MODOKI_PROJECT), which wins over
 # recents in main's resolveInitialProject (envProject → recents → envDefault): if you
@@ -152,7 +163,13 @@ npm run electron:build >/dev/null 2>&1
 #    relies on it). With a pinned backend port (single-instance default) export it;
 #    in multi mode leave it unset so main auto-picks free ports.
 : > "$EDITOR_LOG"
-echo "[launch-editor] launching editor (${BACKEND_PORT:+backend port $BACKEND_PORT}${BACKEND_PORT:+, }${BACKEND_PORT:-auto ports}${PROJECT:+, project $PROJECT}${MODOKI_SCENE:+, scene $MODOKI_SCENE})…"
+# An explicit if, not a chain of `${VAR:+…}${VAR:-…}`: the old form printed the port TWICE
+# ("backend port 5180, 5180") because a `:-` arm expands to the VALUE when the variable is set,
+# not to its literal fallback — so it can never be the "unset" half of a two-arm expansion.
+# Worth getting right now that the auto-ports arm is genuinely reachable (an unknown clone
+# directory, #349): this banner is the only thing that tells you which arm you got.
+if [ -n "$BACKEND_PORT" ]; then PORT_LABEL="backend port $BACKEND_PORT"; else PORT_LABEL="auto ports"; fi
+echo "[launch-editor] launching editor (${PORT_LABEL}${PROJECT:+, project $PROJECT}${MODOKI_SCENE:+, scene $MODOKI_SCENE})…"
 [ -n "$BACKEND_PORT" ] && export MODOKI_BACKEND_PORT="$BACKEND_PORT"
 # Vite dev-server port — derived per clone exactly like CDP below: 5173 + (backend
 # − 5179), so 5179→5173, 5180→5174, 5181→5175. Without this every clone PREFERS
@@ -207,6 +224,30 @@ elif [ -n "$BACKEND_PORT" ] && echo "$BACKEND_PORT" | grep -qE '^[0-9]+$'; then
   DERIVED=$((9222 + BACKEND_PORT - 5179))
   if valid_cdp_port "$DERIVED"; then
     CDP_PORT="$DERIVED"
+  fi
+elif [ -z "$MULTI" ]; then
+  # SINGLE-INSTANCE with no pinned backend — an unknown clone directory (#349). CDP stays ON,
+  # because "off" would be a regression: before #349 this case took BACKEND_PORT=5179 from the
+  # literal default and therefore got CDP 9222, and CLAUDE.md promises "CDP is on by default in
+  # the dev launcher".
+  #
+  # But NOT on 9222. That was the first attempt and it recreated this very bug one layer down:
+  # with the hub's editor up, 9222 is the HUB's CDP port, so the scratch clone could not bind it
+  # while the banner still advertised it — and an agent aiming there drives the hub's renderer.
+  # editorPorts.mjs hands this to clonePort.mjs's HASH (9240..9279, clear of the human 9222-9226
+  # lane and of the chrome-devtools MCP), which is what that module is for: no authored table,
+  # and an unknown clone is by definition absent from ours.
+  #
+  # Still skipped under MODOKI_MULTI: there, several editors of ONE clone race deliberately and
+  # a shared CDP port is exactly what must not happen. Set MODOKI_CDP_PORT to force it there.
+  #
+  # Asked of editorPorts.mjs rather than written as `9222` here: a bare per-clone port in this
+  # file is indistinguishable from the defaults #349 deleted, and editorPorts.test.ts's
+  # hardcoding guard rejects it — which it did, correctly, when this was first written as a
+  # literal. The guard is worth keeping honest rather than carving an exception into.
+  UNPINNED_CDP="$(node "$REPO/engine/scripts/editorPorts.mjs" cdp-unpinned "$REPO" 2>/dev/null || true)"
+  if valid_cdp_port "$UNPINNED_CDP"; then
+    CDP_PORT="$UNPINNED_CDP"
   fi
 fi
 [ -n "$CDP_PORT" ] && CDP_ARG="--remote-debugging-port=${CDP_PORT}"
@@ -319,7 +360,9 @@ fi
 if [ -n "$CDP_PORT" ]; then
   echo "[launch-editor]   CDP:          http://127.0.0.1:${CDP_PORT}  (renderer remote-debugging)"
 else
-  echo "[launch-editor]   CDP:          off (auto backend port; set MODOKI_CDP_PORT to enable)"
+  # Reached only under MODOKI_MULTI now: an unpinned SINGLE instance gets a hashed CDP port
+  # (#349), so "auto backend port" stopped being the reason CDP is off. Say the real one.
+  echo "[launch-editor]   CDP:          off (MODOKI_MULTI — several editors would race one port; set MODOKI_CDP_PORT to force it)"
 fi
 echo "[launch-editor]   Log:          $EDITOR_LOG"
 echo "[launch-editor]   Vite log:     $VITE_LOG"

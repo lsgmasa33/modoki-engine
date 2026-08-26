@@ -171,7 +171,7 @@ loop. If you see the reload happen twice, the edit has a real defect; it is not 
 Silence on all three means the running build is the one that booted and nothing was lost.
 
 Plugin changes (`engine/plugins/**`) are **not** hot-reloadable at all — restart the editor
-(`npm run editor:ai`) after pulling or editing them.
+(`npm run editor:dev`) after pulling or editing them.
 
 ## This applies to the PACKAGED editor too
 

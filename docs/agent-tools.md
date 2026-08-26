@@ -273,6 +273,55 @@ overwrites the human's stored board — unlike Court's three navigation tools, w
 declares they never write progress. That banner had to be rewritten rather than left standing: a
 declared invariant that a new tool quietly breaks is worse than one that was never written down.
 
+### Phase 2: `court_move_piece` — a separate tool, not an optional param (#339)
+
+Move (cell→cell) reuses everything above rather than re-deriving it, and adds two lessons of its
+own.
+
+**An optional param that can be forgotten is a different-operation-reported-as-success waiting to
+happen.** The obvious shape for "move" is an optional `from` on `court_place_piece`. It was
+rejected: forgetting `from` silently turns an intended move into a fresh tray placement — the exact
+§0 rank-1 false-success class this whole feature keeps tripping over. `court_move_piece` is its own
+tool with `from`/`to` both *required*, so there is no path that forgets one.
+
+**The guard preamble is shared through a function, not a fourth hand-copy.** `agentPlacePiece` had
+all six board-touchability checks (no level, sim stopped, intro/menu, `boardInputBlocker`,
+`domModalOverBoard`, a refusal already on screen) inline — and a second tool needing the identical
+run would have been the fourth copy of that disjunction in this file (`hitTest`, the hit-region
+provider and `agentPlacePiece` were the first three, and two review rounds exist because they had
+already drifted apart once). `agentBoardGate()` extracts it; both `agentPlacePiece` and
+`agentMovePiece` call it, and neither hand-copies a guard the other already checks.
+
+**`piece` is an assertion, not a second address.** When given, it must match whatever is actually
+standing at `from` — a real drag grabs whichever piece is under the finger, never a piece named in
+advance. Given and mismatched, the tool refuses rather than silently moving the *actual* occupant.
+
+**A move has a restore surface a placement does not.** `commitMove` is a retreat-and-place recorded
+as one Action (memo.md's #85 scope update), so leaving `from` can give back notes that piece's
+original landing there wiped — `court_move_piece` reports this as `memoRestored`/
+`chipNotesRestored`, alongside the destination-side `memoCleared`/`chipNotesCleared` Phase 1 already
+had. An agent that only read the destination fields would miss half of what the move just did.
+
+### Phase 3: `court_recall_piece` — smaller on purpose (#339)
+
+Recall (cell→tray) reuses `agentBoardGate()` exactly as move does, and takes only a source cell — a
+real drag recalls whenever a board-origin drop ends on anything that is NOT a cell, so there is no
+destination to name or judge.
+
+**A result type should not carry fields the operation cannot produce.** Removing a piece can never
+violate a rule, so `commitRecall` never arms `pendingRevert` — no `accepted`, no `refusedByGame`, no
+`hearts.lostThisPlacement` on the response. A field that can only ever hold one value is noise, and
+an eternal `refusedByGame: null` would invite a caller to read it as meaning something. The report is
+restore-only: `memoRestored`/`chipNotesRestored`, computed by `commitRecall` *after* the recall is
+applied so the restore judges the board the retreat actually leaves behind.
+
+**The tutorial gate still applies, even though the lesson script never judges a recall.**
+`commitRecall` never calls `judgeTutorialMove` — there is no destination for a script to assert
+against — but `onPressAt`'s `wouldLift` still gates which piece may be *lifted* in the first place,
+gate's-own-piece-on-the-board included. `agentRecallPiece` re-asserts that lift gate the same way
+`agentMovePiece` does, or a synthetic call could pull a piece off the board mid-lesson that no real
+drag could ever lift.
+
 ## Limits worth knowing before you rely on this
 
 - **A game tool's mutation is not undoable.** Engine tools declare `undoable` in `contracts.ts` and

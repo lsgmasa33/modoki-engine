@@ -104,16 +104,40 @@ bites a build run from the *same* install's postinstall.
 
 The Vite and CDP ports are DERIVED from it so every clone runs in its own lane. The launcher pins
 the backend (the MCP target) so it's stable per session, then sets Vite to
-`5173 + (backend − 5179)` and CDP to `9222 + (backend − 5179)`. Use the port assigned to the
-clone:
+`5173 + (backend − 5179)` and CDP to `9222 + (backend − 5179)`.
+
+**You no longer pass the port — the launcher derives it from the CLONE DIRECTORY** (#349).
+`engine/scripts/launch-editor.sh <project>` gives you *this* clone's lane in every clone; the
+`MODOKI_BACKEND_PORT=…` prefix still works and still wins, but it is an override, not a
+requirement. The table is authored in **`engine/scripts/editorPorts.mjs`**, which is the single
+source of truth every launch path reads — this table is checked against it by
+`engine/tests/architecture/editorPorts.test.ts`, so the two cannot drift.
 
 | Clone | Backend port | Vite | CDP | Launch command |
 |----------|-------------|------|------|----------------|
-| `~/Projects/modoki` (main) | 5179 (default) | 5173 | 9222 | `engine/scripts/launch-editor.sh games/3d-test` |
-| `~/Projects/modoki-ai` (work-ai) | 5180 | 5174 | 9223 | `MODOKI_BACKEND_PORT=5180 engine/scripts/launch-editor.sh games/3d-test` |
-| `~/Projects/modoki-ai2` (work-ai2) | 5181 | 5175 | 9224 | `MODOKI_BACKEND_PORT=5181 engine/scripts/launch-editor.sh games/3d-test` |
-| `~/Projects/modoki-ai3` (work-ai3) | 5182 | 5176 | 9225 | `MODOKI_BACKEND_PORT=5182 engine/scripts/launch-editor.sh games/3d-test` |
-| `~/Projects/modoki-qa` (work-qa) | 5183 | 5177 | 9226 | `MODOKI_BACKEND_PORT=5183 engine/scripts/launch-editor.sh games/3d-test` |
+| `~/Projects/modoki` (main) | 5179 | 5173 | 9222 | `engine/scripts/launch-editor.sh games/3d-test` |
+| `~/Projects/modoki-ai` (work-ai) | 5180 | 5174 | 9223 | `engine/scripts/launch-editor.sh games/3d-test` |
+| `~/Projects/modoki-ai2` (work-ai2) | 5181 | 5175 | 9224 | `engine/scripts/launch-editor.sh games/3d-test` |
+| `~/Projects/modoki-ai3` (work-ai3) | 5182 | 5176 | 9225 | `engine/scripts/launch-editor.sh games/3d-test` |
+| `~/Projects/modoki-qa` (work-qa) | 5183 | 5177 | 9226 | `engine/scripts/launch-editor.sh games/3d-test` |
+
+⚠️ **A clone directory not in that table gets AUTO ports, not a pinned one** — deliberately. Any
+hardcoded fallback is correct on exactly one clone and silently wrong on the rest, which was the
+#349 bug: `launch-editor.sh` defaulted to **5179, the hub's port**, so a bare launch from a worker
+clone aimed at `main`'s lane. Auto ports can't collide with anyone's pinned lane; the launcher
+warns on stderr and the banner tells you what it actually bound. A scratch clone that wants a
+stable MCP target should pass `MODOKI_BACKEND_PORT` explicitly. **CDP stays ON** for such a launch,
+on a port HASHED from the repo path via `clonePort.mjs` (9240–9279 — clear of the 9222–9226 human
+lane and of the `chrome-devtools` MCP). Not 9222: that is the *hub's* CDP port, so beside a live hub
+the banner would advertise a port the scratch clone could not bind and an agent aiming there would
+drive the hub's renderer — #349 relocated from the backend port to CDP. Only `MODOKI_MULTI` turns
+CDP off, because there several editors of one clone would race a single port.
+
+**The Windows machine is not in the table and does not need to be** — it holds exactly ONE clone
+(owner, 2026-08-26), so nothing there can collide whatever the directory is called. If its directory
+is `modoki` (the default `git clone` name) it simply reads as the hub row; otherwise it takes the
+unknown-clone path above — no pinned backend, `main.ts`'s sticky-then-scan settles on 5179, and CDP
+lands in the hashed block. Either way it keeps a working editor and a working CDP.
 
 The CDP column is the launcher's DERIVED default. On the main Mac the `editor-*` shell functions
 in `~/.zshrc` override it to the **932x** series (main 9322 / ai 9323 / ai2 9324 / ai3 9325 / qa
@@ -127,9 +151,14 @@ you (`Editor page: … (wanted 5173 — it was taken)`) — so trust the banner,
 they disagree. Why the derivation exists, and why a "free-looking" port may not be:
 [editor.md](./editor.md) § "Port selection".
 
-(`npm run editor:main` / `editor:ai` are shortcuts for the first two; the `ai2`/`ai3` clones have
-no npm shortcut — pass `MODOKI_BACKEND_PORT=5181` / `5182` explicitly, or use the `editor-ai2` /
-`editor-ai3` shell functions.)
+(`npm run editor:dev` is the npm shortcut, in **every** clone — it derives the port like the launcher
+does. The clone-named `editor:main` / `editor:ai` / `:packaged` twins were DELETED in #349: once the
+directory decides the port they all did the same thing, and a script named after one clone in a repo
+every clone shares is the same category of mistake as the port default they used to carry.
+`npm run editor` adds branch reporting and a project-dir default. The `editor-main`/`editor-ai`/
+`editor-ai2`/`editor-ai3`/`editor-qa` shell functions in `~/.zshrc` are unaffected — they invoke
+`launch-editor.sh` directly, and additionally pin CDP to the 932x series so it cannot collide with
+the `chrome-devtools` MCP's 9222.)
 
 Then point that session's MCP at its own backend: `MODOKI_BACKEND=http://127.0.0.1:<port>`.
 `launch-editor.sh` / `stop-dev.sh` are **repo-scoped** — they match THIS repo's absolute paths

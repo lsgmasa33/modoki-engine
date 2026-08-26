@@ -75,7 +75,14 @@ describe('§5 — classification: the code must match what actually went wrong',
     expect(e.code).toBe('NOT_AVAILABLE_HERE');
     expect(e.options?.join(' ')).toContain('launch-editor.sh');
     // The port matters: pointed at the sibling clone, every call "succeeds" against the wrong tree.
-    expect(e.options?.join(' ')).toContain('5181');
+    // This used to assert the literal `5181` — work-ai2's port, present only because the hint
+    // ENUMERATED every clone's port inline. That expectation was wrong in the same way the hint
+    // was (#349): a shared string that names one clone's number is correct on one clone and
+    // stale the day a clone is added, and the sibling hint in game-debug-mcp proved it by
+    // sitting at three-of-five for months. Assert the durable property instead — that the hint
+    // names the variable you must set and points at the one place the answer lives.
+    expect(e.options?.join(' ')).toContain('MODOKI_BACKEND');
+    expect(e.options?.join(' ')).toMatch(/editorPorts\.mjs|clones-and-ports\.md/);
   });
 
   it('a timeout is TIMEOUT, not a generic failure — a wedged editor is retryable', async () => {
