@@ -229,6 +229,83 @@ describe('uiTreeStore', () => {
     });
   });
 
+  /** ZERO is a value, not "unset" — the `||` trap, swept during #340's close-out.
+   *
+   *  The projection reads each `UIElement` field with a fallback, and for a field whose identity
+   *  is NOT zero the fallback has to be `??`. Written `||`, an authored 0 is falsy and gets
+   *  silently replaced by the default: the author sets a value, the Inspector shows it, and the
+   *  renderer draws something else. Nothing errors, so it is invisible until someone looks
+   *  closely at pixels. Both fields below were real: `scale` would have been (caught while
+   *  adding it), `borderColor` was (found by sweeping for the pattern, fixed in the same pass). */
+  describe('an authored ZERO survives the projection (the `||` trap)', () => {
+    function fakeWorldWithUI(fields: Record<string, unknown>) {
+      const rUI = { name: 'RenderableUI' } as any;
+      const ui = { name: 'UIElement' } as any;
+      const attr = { name: 'EntityAttributes' } as any;
+      vi.doMock('../../src/runtime/core/ecs/world', () => ({
+        getCurrentWorld: vi.fn(), onWorldSwap: vi.fn(),
+      }));
+      vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
+        getAllTraits: () => [
+          { name: 'RenderableUI', trait: rUI, category: 'component', fields: {} },
+          { name: 'UIElement', trait: ui, category: 'component', fields: {} },
+          { name: 'EntityAttributes', trait: attr, category: 'component', fields: {} },
+        ],
+      }));
+      vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({ addDirtyListener: vi.fn() }));
+
+      const uiEl = {
+        width: 0, height: 0, widthUnit: 'px', heightUnit: 'px',
+        flexDirection: 'row', justifyContent: 'flex-start', alignItems: 'stretch',
+        gap: 0, flexGrow: 0, flexShrink: 0,
+        paddingTop: 0, paddingLeft: 0, paddingRight: 0, paddingBottom: 0,
+        overflow: 'visible', isVisible: true,
+        text: '', fontSize: 16, textColor: 0xffffff,
+        ...fields,
+      };
+      return {
+        query: () => ({
+          updateEach: (cb: (data: any[], entity: any) => void) => {
+            cb([uiEl], { id: () => 1, has: () => true, get: () => ({ parentId: 0, sortOrder: 0 }) });
+          },
+        }),
+      } as any;
+    }
+
+    it('keeps scale 0 instead of promoting it to full size', async () => {
+      // A pop-in clip's FIRST keyframe is scale 0. Promoted to 1, the card is already at full
+      // size on the frame it appears and the animation visibly does nothing at its start.
+      const world = fakeWorldWithUI({ scale: 0 });
+      const { uiTreeProjection, useUITreeStore } = await import('../../src/runtime/ui/uiTreeStore');
+      uiTreeProjection(world);
+      expect(useUITreeStore.getState().tree[0].scale).toBe(0);
+    });
+
+    it('keeps borderColor 0 (pure black) instead of repainting it the default grey', async () => {
+      // 0 is a colour here, not an absence — `|| 0x333333` drew an authored black border as
+      // dark grey. ⚠️ Cite the case with a VISIBLE consequence: eleven elements in
+      // `games/alien-animal/.../alien-animal.scene.json` author `borderColor: 0` with a non-zero
+      // borderWidth and changed from #333333 to #000000 when this was fixed.
+      // (`games/3d-test/.../Game_Canvas.prefab.json` also authors 0, but at `borderWidth: 0`,
+      // so it is exactly the instance that could never have shown the bug.)
+      const world = fakeWorldWithUI({ borderColor: 0, borderWidth: 2 });
+      const { uiTreeProjection, useUITreeStore } = await import('../../src/runtime/ui/uiTreeStore');
+      uiTreeProjection(world);
+      expect(useUITreeStore.getState().tree[0].borderColor).toBe(0);
+    });
+
+    it('still falls back for a field that is genuinely absent', async () => {
+      // The other half: `??` must not become "never default". An older scene has no `scale` key
+      // at all, and that one DOES take the default.
+      const world = fakeWorldWithUI({});
+      const { uiTreeProjection, useUITreeStore } = await import('../../src/runtime/ui/uiTreeStore');
+      uiTreeProjection(world);
+      const node = useUITreeStore.getState().tree[0];
+      expect(node.scale, 'absent scale defaults to 1').toBe(1);
+      expect(node.borderColor, 'absent borderColor defaults to the grey').toBe(0x333333);
+    });
+  });
+
   describe('entity active flag (deactivatedEntities cascade)', () => {
     function fakeWorld(entities: Array<{ id: number; parentId: number; sortOrder?: number }>) {
       const rUI = { name: 'RenderableUI' } as any;

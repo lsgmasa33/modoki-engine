@@ -363,6 +363,37 @@ Two costs, both real:
   unrotated rect, so a tilted element's outline and gizmo box do not follow the tilt. Cosmetic —
   the render is correct — and deliberately out of scope.
 
+### Scale (`UIElement.scale`)
+
+`scale` is a **uniform** scale about the anchor pivot; 1 is natural size. It rides the same composer
+as `rotation` (`applyRotationStyle` in `ui/anchorCss.ts`) and inherits every rule above: it composes
+onto the anchor's pivot translate rather than replacing it, it takes the same pivot-derived
+`transform-origin` so the anchored point does not move as the element grows, and it creates the same
+stacking context. Uniform scale and rotation commute about a shared origin, so the order the two are
+appended in does not matter.
+
+**It scales the RENDER, not the layout.** The element's box keeps its laid-out size, so siblings do
+not reflow and nothing shifts underneath a growing card. That is the reason the field exists at all
+rather than keying `width`/`height`: those *do* reflow, and they leave text at its original size, so
+a "pop" authored that way reads as a box stretching around stationary words.
+
+Why it exists (#340): Court's level-win dialog snapped on screen with no transition, and the fix had
+to be an **authored keyframe clip** rather than a tween in code (owner's standing rule — timing and
+easing are data the owner retunes in the editor, not numbers an agent picks in a `.ts`).
+`UIElement.opacity` was already keyable, but a fade alone reads as soft; a dialog wants to arrive.
+No keyable property in the UI layer could express that. The worked example is
+`games/court/runtime/assets/anim/dialog-pop.anim.json` — a scale track 0.8 → 1.06 → 1.0 against an
+opacity track, played by an `Animator` authored on the card.
+
+⚠️ **Identity is 1, and it is checked against 1, not against falsy.** `scale: 0` is a legitimate
+authored value (a pop-in's first keyframe) and must emit `scale(0)`; a `|| 1` anywhere on this path
+would silently promote it and the animation would start already open. The projection in
+`uiTreeStore.ts` uses `?? 1` for exactly this reason. An element left at 1 emits no transform at
+all, so everything that predates the field is byte-identical and gains no stacking context.
+
+⚠️ Like `rotation`, the editor's selection overlay stays at the **unscaled** rect — `resolveAnchorRect`
+measures layout, and this deliberately does not change layout.
+
 **An offset means a different thing per axis, and the axis decides — not the field.**
 On a **non-stretched** axis the anchor is a single *point*, so an offset **moves** the
 box and leaves its size alone: `left`/`top` push away from that point, `right`/`bottom`

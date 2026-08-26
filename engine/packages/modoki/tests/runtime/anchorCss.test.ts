@@ -217,3 +217,60 @@ describe('applyRotationStyle — the tilt (#234)', () => {
     expect(s.transformOrigin).toBeUndefined();
   });
 });
+
+/** #340 — the scale, added so a dialog can POP in from an authored keyframe clip. It rides the
+ *  same composer as the tilt, so the risk is the same one twice: that it replaces the anchor's
+ *  translate, or grows about a point the anchor never pinned. Plus one the tilt does not have —
+ *  `scale: 0` is a legitimate authored value (a pop-in's first keyframe) and must not be mistaken
+ *  for "unset". */
+describe('applyRotationStyle — the scale (#340)', () => {
+  const scaled = (scale: number, over: Partial<AnchorCssData> = {}, deg = 0): CSSProperties => {
+    const s: CSSProperties = {};
+    const a = anchor(over);
+    applyAnchorStyle(s, a);
+    applyRotationStyle(s, deg, a, scale);
+    return s;
+  };
+
+  it('appends to the anchor pivot translate instead of clobbering it', () => {
+    const s = scaled(0.8, { anchor: 'center', pivotX: 0.5, pivotY: 0.5 });
+    expect(s.transform).toBe('translate(-50%, -50%) scale(0.8)');
+  });
+
+  it('grows about the anchor PIVOT, so the anchored point stays put', () => {
+    // Without this the card slides across the screen as it pops, which reads as a broken anchor
+    // rather than as a scale.
+    expect(scaled(1.2, { anchor: 'top-left', pivotX: 0, pivotY: 0 }).transformOrigin).toBe('0% 0%');
+    expect(scaled(1.2, { anchor: 'center', pivotX: 0.5, pivotY: 0.5 }).transformOrigin).toBe('50% 50%');
+  });
+
+  it('ignores the pivot on a STRETCHED axis, matching the tilt and the layout', () => {
+    expect(scaled(1.2, { anchor: 'top-stretch', pivotX: 1, pivotY: 1 }).transformOrigin).toBe('50% 100%');
+  });
+
+  it('composes with a tilt, both about the shared pivot origin', () => {
+    // Uniform scale and rotation commute about a common origin, so only the presence of both
+    // matters, not their order.
+    const s = scaled(1.5, { anchor: 'center', pivotX: 0.5, pivotY: 0.5 }, 5);
+    expect(s.transform).toBe('translate(-50%, -50%) rotate(5deg) scale(1.5)');
+    expect(s.transformOrigin).toBe('50% 50%');
+  });
+
+  it('writes NOTHING at 1 — an element that predates the field emits identical CSS', () => {
+    const s = scaled(1, { anchor: 'center', pivotX: 0.5, pivotY: 0.5 });
+    expect(s.transform).toBe('translate(-50%, -50%)');
+    expect(s.transformOrigin).toBeUndefined();
+  });
+
+  it('defaults to 1 when omitted, so every existing call site is unchanged', () => {
+    const s: CSSProperties = {};
+    applyRotationStyle(s, 0, anchor({ anchor: 'top-left', pivotX: 0, pivotY: 0 }));
+    expect(s.transform).toBeUndefined();
+  });
+
+  it('EMITS scale(0) — zero is an authored keyframe, not an unset field', () => {
+    // The `|| 1` trap: promoting 0 to 1 would make a pop-in clip start already at full size, so
+    // the animation would silently do nothing for its first frames.
+    expect(scaled(0, { anchor: 'top-left', pivotX: 0, pivotY: 0 }).transform).toBe('scale(0)');
+  });
+});

@@ -85,7 +85,7 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     marginBottom: 0, marginBottomUnit: 'px', marginLeft: 0, marginLeftUnit: 'px',
     minWidth: 0, minWidthUnit: 'px', maxWidth: 0, maxWidthUnit: 'px',
     minHeight: 0, minHeightUnit: 'px', maxHeight: 0, maxHeightUnit: 'px',
-    alignSelf: 'auto', zIndex: 0, rotation: 0, overflow: 'visible', isVisible: true, pointerThrough: false,
+    alignSelf: 'auto', zIndex: 0, rotation: 0, scale: 1, overflow: 'visible', isVisible: true, pointerThrough: false,
     scrollbarStyle: 'auto', scrollbarThumbColor: 0x888888, scrollbarTrackColor: 0xdddddd,
     backgroundColor: 0, backgroundOpacity: 0, borderRadius: 0, borderWidth: 0, borderColor: 0x333333, borderOpacity: 1, opacity: 1,
     text: '', fontFamily: '', fontSize: 16, fontSizeUnit: 'px', fontWeight: 'normal', fontStyle: 'normal',

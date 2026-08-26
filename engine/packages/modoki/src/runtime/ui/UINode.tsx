@@ -334,10 +334,10 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     applyAnchorStyle(style, node.anchor);
   }
 
-  // ── Rotation (#234) ──
+  // ── Rotation (#234) + scale (#340) ──
   // AFTER the anchor, because it composes onto the anchor's pivot translate rather than replacing
   // it. Applies to anchored and flow-laid-out elements alike; the pivot rules live in anchorCss.
-  applyRotationStyle(style, node.rotation, node.anchor);
+  applyRotationStyle(style, node.rotation, node.anchor, node.scale);
 
   // Scroll-view CSS (snap + overscroll). Deliberately does NOT set `overflow` — that stays
   // `UIElement.overflow`, which the author already knows, so one visible consequence keeps one

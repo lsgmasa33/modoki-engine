@@ -40,7 +40,7 @@ export interface UINodeData {
   marginLeft: number; marginLeftUnit: string;
   minWidth: number; minWidthUnit: string; maxWidth: number; maxWidthUnit: string;
   minHeight: number; minHeightUnit: string; maxHeight: number; maxHeightUnit: string;
-  alignSelf: string; zIndex: number; rotation: number;
+  alignSelf: string; zIndex: number; rotation: number; scale: number;
   overflow: string; isVisible: boolean; pointerThrough: boolean;
   scrollbarStyle: string; scrollbarThumbColor: number; scrollbarTrackColor: number;
   // ── Style ──
@@ -354,6 +354,9 @@ function buildTree(world: World): UINodeData[] | null {
         minHeight: ui.minHeight || 0, minHeightUnit: ui.minHeightUnit || 'px',
         maxHeight: ui.maxHeight || 0, maxHeightUnit: ui.maxHeightUnit || 'px',
         alignSelf: ui.alignSelf || 'auto', zIndex: ui.zIndex || 0, rotation: ui.rotation || 0,
+        // `?? 1`, NOT `|| 1`: 0 is a legitimate authored scale (a pop-in clip's first keyframe),
+        // and `||` would silently promote it to full size — the animation would start already-open.
+        scale: ui.scale ?? 1,
         overflow: ui.overflow, isVisible: ui.isVisible,
         pointerThrough: ui.pointerThrough === true,
         scrollbarStyle: ui.scrollbarStyle || 'auto',
@@ -361,7 +364,19 @@ function buildTree(world: World): UINodeData[] | null {
         scrollbarTrackColor: ui.scrollbarTrackColor ?? 0xdddddd,
         backgroundColor: ui.backgroundColor || 0, backgroundOpacity: ui.backgroundOpacity || 0,
         borderRadius: ui.borderRadius || 0, borderWidth: ui.borderWidth || 0,
-        borderColor: ui.borderColor || 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,
+        // `??`, not `||`, for the same reason as `scale` above: 0 is PURE BLACK, a legitimate
+        // authored colour, and `||` silently repainted it as the 0x333333 default. `textColor`
+        // two lines down already had this right. (`fontSize: ui.fontSize || 16` below is the same
+        // SHAPE but not the same bug — no scene authors `fontSize: 0`, and the trait default is
+        // 16, so that fallback is unreachable for a real trait. Left alone deliberately.)
+        //
+        // ⚠️ This change is VISIBLE, not theoretical: eleven elements in
+        // `games/alien-animal/runtime/assets/scenes/alien-animal.scene.json` author
+        // `borderColor: 0` with a non-zero `borderWidth` (Credits Button/Panel, Close Button,
+        // the seven Clip buttons, Cycle Button). They rendered #333333 before and render #000000
+        // now — i.e. what their author actually asked for. Called out because "a one-character
+        // fix" and "eleven borders in a shipped project got darker" are the same edit.
+        borderColor: ui.borderColor ?? 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,
         text: ui.text || '', fontFamily: resolveUIFontFamily(ui.fontFamily as string, ui.systemFont as string),
         fontSize: ui.fontSize || 16, fontSizeUnit: ui.fontSizeUnit || 'px', fontWeight: ui.fontWeight || 'normal',
         fontStyle: ui.fontStyle || 'normal', textColor: ui.textColor ?? 0xffffff, textOpacity: ui.textOpacity ?? 1,
