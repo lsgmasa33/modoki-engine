@@ -422,6 +422,33 @@ file at load. Files that contain a nested row are written as `version: 2` (flat
 prefabs stay `version: 1`; the nested fields are optional, so a v1 file is a
 valid v2 file — no migration).
 
+⚠️ **Nothing on the loading path READS `version`, and writing that down is the
+point of this paragraph.** `fetchPrefab` (`runtime/loaders/meshTemplateCache.ts`)
+fetches, parses and caches; there is no version comparison anywhere between the
+file and a spawned instance, and `getCachedPrefab` is a map lookup. The field is
+a marker for the SERIALIZER — it records whether the file nests, and no consumer
+acts on it.
+
+Say so plainly, because the gap where this sentence used to be is what produced
+the defect: #344 read a version marker with no stated consumer, inferred that an
+unexpected value must gate loading, and that inference was then written as fact
+into a commit message, two game docs, a guard test and three issues (#363, #364,
+#365) before anybody observed it. Two independent measurements killed it —
+`games/space-console`'s nested spaceship prefab spawns byte-identically at 1 and
+at 2 across all three of its scenes, and Court's flat level tile at `version: 2`
+renders its full pooled 25-tile grid with no console warning. `version` is
+guarded by `engine/tests/assets/prefabFormatVersion.test.ts` against a value the
+serializer would never write (2 on a prefab that nests nothing — #344's actual
+mistake), NOT against a loader that does not exist.
+
+**What emptied #344's grid is therefore still unidentified.** The file is
+byte-identical across the "broken" and "fixed" commits apart from that one
+number, so the A/B was confounded — most likely by the prefab cache, which
+serves the doc it read at scene load: restructure a `.prefab.json` under a live
+editor and instances keep spawning from the OLD copy until something forces a
+re-read. **If a pooled view renders empty, restart the editor before believing
+the file.**
+
 - **`rootInstanceId` semantics are unchanged**: it is the ECS id of the
   *innermost* instance root an entity belongs to. Nesting is expressed purely
   through `EntityAttributes.parentId` — the inner instance's root hangs under an
