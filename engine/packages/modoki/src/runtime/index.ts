@@ -488,6 +488,12 @@ export {
 export { onQualityTierChange, resetQualityTierChangeListeners } from './rendering/tierChangeNotify';
 export type { QualityTierChangeListener } from './rendering/tierChangeNotify';
 export { playerTierStore, type PlayerTierStore } from './core/playerTierStore';
+// First-real-frame readiness (#334) — the DOM layer's "is there anything under the loading
+// overlay yet" signal. A leaf with no three.js import, so it costs a 2D-only build nothing.
+export {
+  waitForScenePaint, isScenePaintPending, SCENE_PAINT_MAX_WAIT_MS, resetScenePaintSignal,
+  armScenePaint, markScenePainted, abandonScenePaint, type ScenePaintOutcome,
+} from './rendering/scenePaintSignal';
 export type { RenderSettings, ThreeRenderSettings, PixiRenderSettings, WebRenderSettings } from './rendering/renderSettings';
 export { getWorldTransform3D, getWorldMatrix3D, getParentWorldMatrix3D, worldToLocal3D, hasParent } from './core/ecs/worldTransform';
 export type { WorldTransform3D } from './core/ecs/worldTransform';

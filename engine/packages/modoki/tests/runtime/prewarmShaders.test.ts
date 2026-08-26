@@ -99,7 +99,7 @@ async function setup(opts: { primitives?: boolean; env?: unknown; rig?: THREE.Ob
 
 /** A renderer stub that records, AT compile time, a snapshot of the scene it was
  *  handed (prewarm clears the scene afterwards, so post-call inspection is empty). */
-function makeRendererStub() {
+function makeRendererStub(stubOpts: { isWebGPU?: boolean } = {}) {
   const compiledScenes: THREE.Scene[] = [];
   const standardMeshCounts: number[] = [];
   /** Captured AT compile time for the same reason as the counts: prewarm detaches the shared
@@ -151,6 +151,9 @@ function makeRendererStub() {
       );
     }),
   };
+  // `worldWillUseStack` gates on this (Scene3D builds a stack only on WebGPU), so a stub that
+  // does not declare it reports "no stack" — which is what every pre-#324b test wants.
+  (renderer as { isWebGPURenderer?: boolean }).isWebGPURenderer = stubOpts.isWebGPU === true;
   return { renderer, compiledScenes, standardMeshCounts, compiledEnvironments, compiledLightShadows, compiledMeshShadows, compiledFog, compiledSkinned, compiledMeshes };
 }
 
@@ -167,6 +170,71 @@ describe('prewarmShadersForWorld — F4 empty-scene first-compile guarantee', ()
     expect(renderer.compileAsync).toHaveBeenCalledTimes(1); // did NOT early-return
     expect(compiledScenes).toHaveLength(1);
     expect(standardMeshCounts[0]).toBeGreaterThanOrEqual(1); // placeholder normal material compiled first
+  });
+
+  /** #324b. Under a post-FX stack the per-(mesh, material) walk is provably worthless — it
+   *  compiles in the CANVAS context at depth 0 while the stack draws the scene through its own
+   *  pass at depth 1, and binds light-mask variant clones a pre-swap copy cannot produce. Measured
+   *  on `demos/postfx-demo`: 9 node-builder states built in the canvas context, ZERO reused by any
+   *  frame. So the walk is skipped and F4 becomes the only thing compiled.
+   *
+   *  ⚠️ The half that must NOT change is the first-compile guarantee. F4 is the renderer's first
+   *  compile here exactly as it is on the empty-world path, and it must still be a PLAIN standard
+   *  material — if the stack branch ever let the NPR/MRT pass compile first, the WGSL
+   *  `unresolved type 'OutputType'` bug this whole function exists to prevent comes straight back. */
+  it('skips the placeholder walk under a post-FX stack, and F4 is the ONLY thing compiled', async () => {
+    const { world, sync, Renderable3DPrimitive, createPrimitiveMesh } = await setup({ primitives: true });
+    const { NPRPostFX } = await import('../../src/runtime/traits/NPRPostFX');
+    const { renderer, standardMeshCounts, compiledMeshes } = makeRendererStub({ isWebGPU: true });
+
+    // Deliberately DISABLED: postfx-demo authors its traits this way and enables them from the
+    // Director after the swap, which is why the predicate keys on presence (postFXTraitScan.ts).
+    world.spawn(NPRPostFX({ enabled: false }));
+    for (let i = 0; i < 6; i++) {
+      world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: i, color: i, material: `guid-${i}` }));
+    }
+
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+
+    expect(standardMeshCounts[0], 'F4 only — the six primitives must not be placed').toBe(1);
+    expect(createPrimitiveMesh, 'the per-entity mint must be skipped too, not just the placement').not.toHaveBeenCalled();
+    // FIRST, and plain. `compiledMeshes[0]` is in scene-child order, which is placement order.
+    expect(compiledMeshes[0][0].material).toBeInstanceOf(THREE.MeshStandardMaterial);
+    expect(compiledMeshes[0][0].material.constructor).toBe(THREE.MeshStandardMaterial);
+  });
+
+  /** The control arm, and the one that makes the test above mean something: the SAME world with
+   *  no post-FX trait must still walk its renderables. A predicate stuck at `true` would pass the
+   *  assertion above for the wrong reason. */
+  it('still walks every placeholder when no post-FX trait is present', async () => {
+    const { world, sync, Renderable3DPrimitive, createPrimitiveMesh } = await setup({ primitives: true });
+    const { renderer, standardMeshCounts } = makeRendererStub({ isWebGPU: true });
+
+    for (let i = 0; i < 6; i++) {
+      world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: i, color: i, material: `guid-${i}` }));
+    }
+
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+
+    expect(standardMeshCounts[0], 'six distinct materials, six placeholders, and NO F4 on top').toBe(6);
+    expect(createPrimitiveMesh).toHaveBeenCalledTimes(6);
+  });
+
+  /** The other gate, asserted through the prewarm rather than only through the predicate's own
+   *  unit test: on a WebGL2 fallback `Scene3D` builds no stack, so the canvas-context placeholders
+   *  ARE the right ones and skipping them would buy a first-frame stall on the slowest hardware in
+   *  the fleet. */
+  it('does NOT skip the walk on a WebGL2 fallback, where no stack is built', async () => {
+    const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true });
+    const { NPRPostFX } = await import('../../src/runtime/traits/NPRPostFX');
+    const { renderer, standardMeshCounts } = makeRendererStub({ isWebGPU: false });
+
+    world.spawn(NPRPostFX({ enabled: true }));
+    world.spawn(Renderable3DPrimitive({ isVisible: true, mesh: 'box', size: 1, color: 0, material: 'guid-a' }));
+
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+
+    expect(standardMeshCounts[0]).toBe(1);
   });
 
   it('leaves the prewarm scene clean afterwards (placeholder disposed + removed)', async () => {

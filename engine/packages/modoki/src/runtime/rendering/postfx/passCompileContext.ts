@@ -81,9 +81,15 @@ export function observePassCallDepth(
   if (typeof scenePass?.updateBefore !== 'function') return;
   const original = scenePass.updateBefore.bind(scenePass);
   scenePass.updateBefore = (frame: unknown) => {
-    scenePass.updateBefore = original;
     const depth = (renderer as { _callDepth?: number } | null)?._callDepth;
-    if (typeof depth === 'number') {
+    // ⚠️ A NEGATIVE depth means this is not a draw at all — `_callDepth` rests at −1 and only
+    // `_renderScene` increments it, so the pass's `updateBefore` firing at −1 is a PRECOMPILE
+    // walking the graph (`Renderer.compileAsync`'s drain loop calls `_nodes.updateBefore`
+    // directly). Consuming that would latch depth 0 forever and silently undo sharp edge 3's fix,
+    // because this wrapper self-removes on the call it accepts. So neither record nor unwrap:
+    // wait for a real frame. Found when #323's stage precompile started firing first.
+    if (typeof depth === 'number' && depth >= 0) {
+      scenePass.updateBefore = original;
       const actual = depth + 1;
       if (actual !== getPassCallDepth() && !warned) {
         warned = true;

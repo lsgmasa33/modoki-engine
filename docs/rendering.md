@@ -2963,8 +2963,56 @@ The same graph built by a draw is one unbroken block.
 
 | | when | what it compiles | what it cannot cover |
 |---|---|---|---|
-| `prewarmShadersForWorld` (`scene3DSync.ts`) | in `SceneManager`'s awaited **before-swap** hook | a throwaway COPY of the incoming scene — one placeholder per distinct (mesh, material, shadow-flags, mirror) key | anything created by the sync itself, because the sync has not run |
+| `prewarmShadersForWorld` (`scene3DSync.ts`) | in `SceneManager`'s awaited **before-swap** hook | a throwaway COPY of the incoming scene — one placeholder per distinct (mesh, material, shadow-flags, mirror) key. **Unless a post-FX stack is coming, in which case ONLY the F4 placeholder** — see below | anything created by the sync itself, because the sync has not run |
 | `compileLiveScene` (`scene3DSync.ts`) | on the first frame **after** the swap, before the submit | the objects the sync actually placed, in the render context they will be drawn in | objects that arrive later (a Director beat revealing content) |
+
+### Under a post-FX stack the pre-swap half places ONLY F4 (#324b)
+
+**Fixed 2026-08-26.** Under a stack the per-(mesh, material) walk warms nothing the render reads,
+for two independent reasons either of which alone is fatal: it compiles in the **canvas** render
+context at call depth 0 while the stack draws the scene through its own pass at depth 1
+(`context.id` keys the node-builder cache — sharp edge 3), and the materials the render binds are
+per-(material, light-selection) variant CLONES that a pre-swap copy cannot produce and the swap
+disposes anyway. So `prewarmShadersForWorldInner` asks `worldWillUseStack(world, {isWebGPU})` and,
+when it is true, skips all three placement walks and places only the F4 placeholder.
+
+Measured on `demos/postfx-demo` with `nodeprobe.mjs`, same 18 s window both arms:
+
+| | before | after |
+|---|---|---|
+| pre-swap prewarm, canvas context (`ctx 0`) | 9 builds / 169 ms | **1 build / 36 ms** |
+| post-swap live compile, stack context (`ctx 4`) | 22 builds / 131 ms | 22 builds / 152 ms |
+| frame-phase builds before the Director's tour re-key | 24 / 18 ms | 24 / 22 ms |
+| synchronous first-frame pipelines (`pipeprobe.mjs`) | 18 | 18 |
+
+No build moved into a frame, and the synchronous first-frame count is unchanged — the removed
+builds were pure waste. `games/3d-test` (no stack) is byte-identical: 16 prewarm pipelines,
+6 first-frame, 149 meshes / 77 materials placed, both arms.
+
+⚠️ **The predicate keys on trait PRESENCE, not on `enabled`, and that is the design.** An
+`enabled`-based version was written first and measured **inert on the only project it exists for**:
+`demos/postfx-demo` authors all five post-FX traits with `enabled` at its default of `false` and
+turns them on from the Director's tour (`postfx.showOnly`), which runs **after** the swap. At
+before-swap time that world honestly reports "no stage enabled", so the walk ran and every
+placeholder was in the wrong context one beat later. Presence is the strongest thing knowable
+before the swap. The cost of that conservatism, stated plainly: a scene authoring a post-FX trait
+it never enables loses its pre-swap walk and is covered by `compileLiveScene` instead — later, and
+behind the first-frame hold, but still ahead of the first draw, so a hold-duration regression and
+not a stall. Nothing in the fleet has that shape (checked across every `games/**` + `demos/**`
+scene: `space-console` and `demos/particle-demo` author `enabled: true`, `postfx-demo` flips at
+runtime, nothing else authors one). **The tier mask and the `isWebGPU` gate are both kept** — either
+can legitimately say "no stack", and a WebGL2 fallback draws straight to the canvas where the
+placeholders ARE right.
+
+⚠️ **F4 keeps the scene-global mirrors (lights, environment, fog) in this branch, deliberately.**
+Under a stack it is the only thing the pre-swap half compiles, so it is also what absorbs the
+one-time first-lit-build premium described below on behalf of `compileLiveScene`; a bare
+environment-free warm build costs ~1 ms and primes nothing.
+
+⚠️ **One enumeration, two consumers.** `postfx/postFXTraitScan.ts` owns the "which traits mean a
+stage" list; `Scene3D`'s `buildReq` and this predicate both read it, and
+`tests/runtime/postFXTraitScan.test.ts` fails if either file grows a `world.query(<Trait>PostFX)`
+of its own. Add a sixth post-FX trait THERE, once.
 
 The pre-swap half runs during the load, where there is time. The post-swap half is what catches
 everything the copy could not model — and it is **self-limiting**: whatever the prewarm got right
@@ -2999,6 +3047,183 @@ frame the surface shows the previous content — usually a loading screen — wh
 ticking. Before it, the surface drew one frame and then froze mid-draw for the same duration.
 Neither is free; the hold keeps rAF alive, so loading UI, input and audio keep running instead of
 the app appearing hung.
+
+### The DOM overlay hides on the same signal (#334)
+
+⚠️ **"The previous content, usually a loading screen" above is only true if the loading screen is
+still up** — and for eight months it was not. `GameShell` (`engine/app/App.tsx`) hid its opaque
+`LoadingOverlay` after a fixed **two `requestAnimationFrame`s** past the swap, a heuristic written
+before this hold existed and never reconciled with it. Two frames is nothing next to a 300 ms–1 s
+live compile, so the overlay lifted mid-hold and the game's PERMANENT HUD — `demos/forest-camp`'s
+title text and D-pad — sat over a flat dark canvas with no 3D drawn at all. Confirmed on a Galaxy
+A23 cold boot; the owner's verdict was that a half-drawn state reads as broken where nothing at all
+would not.
+
+`rendering/scenePaintSignal.ts` is the wire between the two levels. `Scene3D` calls `armScenePaint()`
+in the same `onWorldSwap` listener that calls `liveCompile.arm()`, and `markScenePainted()` at the
+END of `renderFrame` — a line every early return skips, `liveCompile.tick`'s hold included, so it
+marks **submitted frames only**. `GameShell` awaits `waitForScenePaint()` where the two-rAF wait
+used to be (the two rAFs are still there, after it, for `onSceneReady`'s runtime-spawned content and
+for presentation).
+
+| property | how |
+|---|---|
+| costs a fast project nothing | resolves `'idle'` synchronously when the paint already landed — the ordinary case, since the caller has a scene load and an `onSceneReady` to get through first |
+| a no-3D project never hangs | `GameShell` gates the await on the same `disable3D \|\| !Scene3D` condition that decides whether `Scene3D` renders, and on a boot scene actually being loaded |
+| cannot stick forever | `SCENE_PAINT_MAX_WAIT_MS` (5 s) mirrors `LIVE_COMPILE_MAX_HOLD_MS`; a renderer that never comes up calls `abandonScenePaint()` instead of making the caller sit out the ceiling |
+| no leak on a game change | the boot effect's `AbortController` is passed as `signal`, so cleanup drops the waiter and its timer |
+
+⚠️ **It is one bit, not a generation token, and that is deliberate** — unlike `liveCompileGate`,
+which needs one. Both calls are synchronous (swap listener, submit point), so a paint can only ever
+be attributed to the swap that most recently armed; there is no promise that can land late. A waiter
+parked across a second swap therefore waits for the NEWER scene, which is the one that will be under
+the overlay.
+
+⚠️ **`LoadingOverlay`'s 120 ms anti-flash mount delay was left alone**, and the reasoning is worth
+recording because it looks like part of this bug. That delay opens a window where `visible` is true
+but opacity is still 0 — but on first boot it elapses at `configReady`, when the world is EMPTY: no
+scene, so no HUD entities, so nothing for the window to expose (and the `!configReady` branch it
+replaces paints the same `#0a0a1a`). By the time the paint signal resolves, the overlay is many
+seconds past mounted. Shortening it would trade a real anti-flash benefit for nothing.
+
+### Precompiling the stack's own stage quads (#323)
+
+**Partially fixed 2026-08-26.** `compileSceneAsync` covers the scene pass. The stack's INTERNAL
+stages — bloom's mip pyramid (`highPass` + 5 × `separable` + `comp`), DOF's targets, GTAO, an
+`rtt()` wrapper, the terminal colour transform — each own a `QuadMesh` inside three's node graph,
+and **`RenderPipeline` exposes no compile entry point at all** (r184). Priced from a Dawn trace on
+the A23 (2026-08-22): 8 pipelines / 329 ms of the 751 ms burst.
+
+A stage quad IS an ordinary `THREE.Mesh`, so `renderer.compileAsync` compiles one like anything
+else. `PostFXStack.compileStagesAsync()` supplies the two things three does not — WHICH quads
+(`postfx/stageCompileJobs.ts`, a pure walk grouping every stage material by the ATTACHMENT
+SIGNATURE of the targets its own node holds, in bounded walk→compile ROUNDS because a stage's
+materials are minted by its `setup()`), and the renderer state that makes the compile
+key-identical to the draw. It runs on its own `liveCompileGate` armed at every stack CONSTRUCTION,
+not on the world swap — measured, the two events do not coincide (`demos/particle-demo`'s swap
+precedes the `Scene3D` mount; `demos/postfx-demo`'s Director rebuilds the stack ~700 ms after the
+swap's compile settled).
+
+**Two more three.js sharp edges, on top of the four above. Both were found by measurement, and
+either alone makes the precompile warm a parallel set of pipelines nothing draws:**
+
+5. **`compileAsync` reads `depth`/`stencil` off the RENDERER; `_renderScene` reads them off the
+   RENDER TARGET.** Both reach the SAME `RenderContext` instance (it is keyed by attachment state),
+   so the compile MUTATES the context the render will use and
+   `getCurrentDepthStencilFormat()` then returns a format the target does not have. Measured on
+   `demos/postfx-demo` against an already-warm cache (`tools-scratch/boot-stall/stagekeytest.mjs`):
+   without mirroring, the compile created **7 fresh bloom pipelines AND evicted the 7 the render
+   was using**, which the next frame rebuilt synchronously; mirroring took it to **0 created**.
+6. **`compileAsync` calls `_nodes.updateBefore(renderObject)` itself, and in a post-FX graph
+   `updateBefore` IS THE DRAW** — `BloomNode.updateBefore` renders its seven quads,
+   `PassNode.updateBefore` renders the scene. So compiling any object of the graph draws the whole
+   stack synchronously, through `createRenderPipeline`, which is exactly what #323 rules out.
+   `compileStagesAsync` stubs `renderer.render` for its duration. ⚠️ Stubbing `updateBefore`
+   instead was tried and is WRONG: it also assigns the inter-stage texture values, and without them
+   bloom's five blur materials compiled against `texture(null)`, collapsed to one shared shader,
+   and the first frame rebuilt all five.
+
+⚠️ **No call-depth pin here, unlike `compileSceneAsync`, and that is deliberate.** The GPU
+pipeline key does not contain the context id — `Pipelines._getRenderCacheKey()` is
+`stageVertex.id + stageFragment.id + backend.getRenderCacheKey()`, and the stage ids are keyed by
+the generated WGSL SOURCE. Call depth keys the node-builder cache (cheap, main thread), not the
+pipeline (~130 ms on the A23). The 0-created measurement was taken with no pin. For the record, the
+stage quads on `demos/postfx-demo` draw at depth **2** — terminal quad (0) → the NPR composite's
+`rtt()` quad (1) → bloom's quads (2) — and the depth moves with the stage set, so there is no
+constant to pin to before the first frame.
+
+**Reaching a stage behind an `rtt()` wrapper — the second pass (2026-08-26).** A stage's materials
+are minted by its `setup()`, which runs when the graph CONTAINING it is built. Compiling the
+terminal quad builds one level, which is why `demos/particle-demo` (bloom directly in the terminal
+graph) was covered from the start. Across an `rtt()` boundary — what `demos/postfx-demo` composes at
+SS > 1 — the wrapper shows the terminal graph a plain texture, and everything inside it is built
+only when the WRAPPER'S OWN quad material is. ⚠️ **And that material is empty until it draws:
+`RTTNode.updateBefore` is what assigns `_quadMesh.material.fragmentNode`.** So the round that
+compiled the wrapper's quad compiled a null graph, and the round below it never appeared.
+
+`driveNodeUpdates` (`postfx/stageCompileJobs.ts`) closes it by running every node's `updateBefore`
+hook by hand, with the renderer's own `nodeFrame`, once per round — safe **only** because renders
+are already stubbed (sharp edge 6). The two mechanisms are a pair: driving the hooks makes the
+wrapper's quad compilable, compiling it runs the inner stage's `setup()`, and the next round's
+drive populates that stage's uniforms. ⚠️ **It gates on `getUpdateBeforeType() !== 'none'`, exactly
+as three's own `NodeFrame.updateBeforeNode` does** — `Node.prototype.updateBefore` is an abstract
+stub that logs `THREE.Abstract function.`, so an ungated call fires on all ~3,100 nodes of a stack
+graph and floods the console with what reads as a renderer fault. Individual hooks are caught, not
+just the walk: bloom's own `updateBefore` throws in round 1 because it indexes a materials array
+`setup()` has not filled yet, and that must cost its stage, never the boot.
+
+Measured on `demos/postfx-demo`, same 14 s window, `pipeattrib.mjs`:
+
+| | before #323 | after the first pass | after this one |
+|---|---|---|---|
+| synchronous first-frame post-FX pipelines | 10 | 10 | **2** |
+| compile-phase async pipelines | 0 | 17 | **24** |
+
+`demos/particle-demo` is unchanged at 0 / 8, and `games/3d-test` is byte-identical (4 sync, 15
+async, `compileStagesAsync` never called — the wiring sits inside `hasStages && isWebGPU`).
+
+**Priced on a Galaxy A23** (`coldtrace.sh`, cold boot, 2026-08-26). Dawn labels each pipeline, so
+this is a COUNT measurement, not a timing one — which is what transfers:
+
+| | before (#323's own trace, 2026-08-22) | after |
+|---|---|---|
+| bloom's 7 quads | `APICreateRenderPipeline` — **synchronous**, 304 ms | `…Async` — **off-thread**, 411 ms |
+| terminal colour-transform quad | synchronous, 25 ms | `…Async`, 21 ms |
+| pipelines still created SYNCHRONOUSLY in the boot | 12 | **7, none of them a stage quad** — 2 × PMREM, 2 × `ShadowMaterial`, one `MeshStandardMaterial`, the pre-stack `outputColorTransform`, one mipmap |
+
+⚠️ **The worst rAF gap did NOT move, and that is the expected result, not a disappointment.**
+393 ms here against 402/373/362 ms recorded before this change. The gap is now a DIFFERENT
+phenomenon: its profile is `fireBeforeSwapHooks → compileAsync → build`, 270 ms of node-builder
+work inside the PRE-SWAP prewarm (#324's first-lit-build premium, in Known gaps below), with only
+two trivial 0.3 ms / 0.1 ms pipelines inside it. What this change removed was off-thread GPU work
+that the draw used to block on; what tops the boot now is main-thread WGSL generation. Judge it by
+the sync/async split above. (The A23 had run many consecutive cold boots that day, so its timing
+carries the SIOP thermal confound from #322 — another reason the counts are the signal here.)
+
+⚠️ **Three defects found by review AFTER this landed, all fixed 2026-08-26. Each is a way a boot
+optimisation can become a rendering bug, and none was visible from the node graph:**
+
+1. **Overlapping compiles left `renderer.render` a permanent no-op.** `liveCompileGate.tick()`
+   guards on `armed`, never on `pending`, so a stack REBUILD mid-compile kicks a second
+   `compileStagesAsync` — and the two belong to DIFFERENT `PostFXStack` instances, so no
+   instance-level guard can see the collision. With save/restore in local `const`s, call B captured
+   call A's STUB as its "original", A restored the real `render`, and B then restored A's stub.
+   Fixed by `postfx/precompileSession.ts`: the borrowed renderer state is owned per RENDERER,
+   refcounted, and `runExclusivePrecompile` serialises so overlap cannot happen at all. Serialising
+   is the half that matters — refcounting alone would still let two compiles interleave their
+   `setRenderTarget` calls and warm each other's jobs against the wrong attachment state.
+2. **The gate's ceiling could release a frame while `render` was still stubbed** — a blank submit,
+   then `markScenePainted()` lifting the loading overlay over it, which is #334's bug from the
+   other side. `liveCompileGate`'s deadline releases the FRAME, not the compile, by design. So the
+   session carries its OWN, SHORTER ceiling (`PRECOMPILE_MAX_HOLD_MS`, 4 s vs the gate's 5 s), and
+   `isPrecompileActive` is not a passive query: past the deadline it RESTORES the renderer and
+   answers false, so the caller asking "may I draw?" is the one that gets the renderer back, and
+   the in-flight compile stops at its next `await`. `Scene3D` asks before the submit (both
+   branches — a stack disposed mid-compile routes the next frame down the plain path, stubbed just
+   the same), and the offscreen capture path calls `endAllPrecompiles` so a capture can never read
+   back an untouched buffer.
+3. **The material→target pairing exploded on `DepthOfFieldNode`** — see
+   `stageCompileJobsFromDraws`. The pairs are now OBSERVED from the draws the stubbed renderer
+   records rather than inferred from a node's fields. Measured across `demos/postfx-demo`'s full
+   90 s Director tour, which enables DOF and bloom together at its last beat: synchronous post-FX
+   pipelines **12 → 12** (identical set — no coverage lost) and compile-phase async **75 → 66**,
+   i.e. nine wasted compiles removed. The all-composed beat now reports 15 stage materials / 16
+   compiles and is NOT capped; under the cross-product it was DOF 5x3 + bloom 7 + GTAO 1 + the
+   wrapper quads, over the cap, so bloom's real jobs were being truncated.
+
+**The two that remain on `demos/postfx-demo`, and why:**
+- The **`npr-particles` stage's own INTERNAL `RenderPipeline`** — a second `RenderPipeline`
+  instance owned by the stage, not by `this.pipeline`, so the walk structurally cannot see it.
+  Reaching it means enumerating nested pipelines, which is a different feature.
+- **`Bloom [ Composite ]`**, one pipeline. Named rather than guessed, with
+  `tools-scratch/boot-stall/compkeydiff.mjs` (hooks `Pipelines._getRenderCacheKey` and splits it
+  into vertex-stage id / fragment-stage id / backend key): the **backend key is IDENTICAL** — so
+  target, attachment state, sample count and material state all match — and the **fragment stage
+  id differs**, i.e. the node builder genuinely emits different WGSL for that material in the
+  compile than in the draw. It is therefore not a state input this code can mirror. A settle pass
+  that recompiles every job after the graph stops changing was tried and did NOT fix it, which also
+  eliminates compile-order staleness as the cause. Left open deliberately: three attempts did not
+  converge, and it is one cheap pipeline out of ten.
 
 ### The checklist: what actually goes into a pipeline key
 
@@ -3138,22 +3363,38 @@ three's incrementing material id, which differs between two runs of the same bui
   `Text3D` and video screens are still first-frame compiles. Rigs do not get side-pinning.
 - The mirror reads AUTHORED scale, so a determinant sign flipped at runtime is invisible to it.
 - Objects hidden at swap time and revealed later (a Director beat) compile when revealed.
-- ⚠️ **Under a post-FX stack the PRE-SWAP half warms nothing the render reads, and is not free.**
-  It compiles against the canvas context at call depth 0; the scene is drawn through the pass
-  context at depth 1, and on top of that the render binds light-mask variants the copy cannot
-  produce. Measured on `demos/postfx-demo` with `nodeprobe.mjs`: the prewarm builds 9 node-builder
-  states, **every** later hit on one of them is another call inside the prewarm itself, and no
-  frame ever reuses one — for 166 ms of main-thread build time here and a 359 ms longtask on the
-  A23 (the second-worst gap of that boot). It is still load-bearing for the TSL first-compile race
-  below, so it cannot simply be dropped; retargeting it at the incoming scene's pass is not
-  possible either, because at before-swap time the stack still belongs to the OUTGOING scene.
-- **The post-FX STAGE quads are not compiled at all.** `compileSceneAsync` covers the scene pass;
-  bloom's mip pyramid, DOF's six targets, GTAO and the terminal colour transform each build their
-  own pipelines on their first draw, and `RenderPipeline` exposes no compile entry point. After the
-  call-depth pin landed, `demos/postfx-demo`'s worst remaining boot gap is ~500 ms with the main
-  thread **95% idle** — off-thread pipeline creation. Priced from a Dawn trace on the A23
-  (2026-08-22): the quads are 8 of the 12 pipelines in that burst but only **329 ms of its
-  751 ms** — the side-pinned pair above is the bigger half, so fix that first.
+- ⭐ **Under a post-FX stack the PRE-SWAP half used to warm nothing the render reads — FIXED
+  2026-08-26 (#324b)**, by placing only F4 there. See § "Under a post-FX stack the pre-swap half
+  places ONLY F4" above for the mechanism, the numbers, and why the predicate keys on trait
+  presence rather than `enabled`. What remains is the F4 build itself, which is not waste: it is
+  what keeps a normal material the renderer's first compile, and what absorbs the first-lit-build
+  premium below.
+- ⚠️ **The FIRST lit node-graph build a renderer performs costs several times an identical later
+  one, and nothing can move it off the boot.** Measured on `games/3d-test` with `nodeprobe.mjs`
+  (2026-08-26): of the prewarm's 26 builds the first costs **24.4 ms** and the other 25 cost
+  4.9-7.1 ms — and the *same* material (`matKey=6872641185743564`) rebuilds later in the same
+  compile for **5.3 ms**. On the A23 that premium is ~11x: the worst boot longtask is 372 ms with
+  **273.6 ms** inside one `getNodeBuilderState` subtree. Two fixes were designed against it and
+  both were measured and rejected, so do not re-propose either:
+  - **Batching the prewarm scene with engine-owned yields buys nothing.** `scheduler.yield()`
+    exists on the A23's WebView (Chrome 151) and DOES create real task boundaries — 8 x 60 ms busy
+    chunks separated by it produced 8 separate 60 ms long tasks — and three's `compileAsync` drain
+    loop already awaits `yieldToMain()` between every render object. The boot profile confirms it
+    lands: later long-task windows have `compileAsync` as the top frame under `(root)` with no
+    `fireBeforeSwapHooks` above them, i.e. resumed iterations in their own tasks. And no yield can
+    split a single build — `NodeBuilder.build()`'s recursion contains no `await`.
+  - **Hoisting a warm-up build to renderer-init time does not prime it.** A throwaway plain lit
+    mesh compiled right after `renderer.init()` builds in **1.0 ms** and the next real build still
+    cost 25.6 ms; adding a shadow-casting light and a stand-in environment did not change that (the
+    node builder reported `env none` for the stand-in). The premium belongs to the first material
+    carrying the scene's REAL environment and shadow subgraphs, which do not exist before the
+    assets load. It can be moved a few hundred ms earlier within the same boot, not off it.
+- ⭐ **The post-FX STAGE quads now have a precompile — PARTIALLY (#323, 2026-08-26).**
+  `PostFXStack.compileStagesAsync()` warms them; see § "Precompiling the stack's own stage quads"
+  above for the mechanism, the two new three.js sharp edges it exists for, and what it still
+  misses. Measured locally: `demos/particle-demo` 8 synchronous first-frame post-FX pipelines →
+  **0**; `demos/postfx-demo` **10 → 2** (the `npr-particles` stage's own internal `RenderPipeline`
+  and one bloom composite; both explained above).
 
 ## Gotcha: TSL first-compile race (prewarm)
 

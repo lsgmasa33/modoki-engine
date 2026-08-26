@@ -2,7 +2,7 @@ import React, { Component, lazy, Suspense, useEffect, useRef, useState } from 'r
 import type { ErrorInfo, ReactNode } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend } from '@modoki/engine/runtime';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint } from '@modoki/engine/runtime';
 import { App as CapacitorApp } from '@capacitor/app';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
@@ -177,6 +177,11 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
     setError(null);
 
     let cancelled = false;
+    /** Cancel token for the awaits that park on something OTHER than a promise this body owns —
+     *  today the render-readiness wait (#334), which would otherwise hold its 5 s timer alive
+     *  after a game change. `cancelled` still guards every resumption point; this makes the
+     *  waiter itself let go rather than merely being ignored when it lands. */
+    const abortBoot = new AbortController();
     const isFirstLoad = !initializedRef.current;
 
     // Show overlay for game-to-game transitions. For first load, the opaque
@@ -386,10 +391,38 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
           if (cancelled) return;
         }
 
-        // Wait for two render frames after the world swap so syncRenderables
-        // populates meshes and the renderer paints them. Without this, the
-        // overlay hides before meshes appear, exposing the empty sky background
-        // for a few frames (race between swap and first populated render).
+        // ⭐ WAIT FOR THE RENDERER TO ACTUALLY PAINT THIS SCENE (#334).
+        //
+        // This used to be the two-rAF wait alone, with a comment naming the very failure it then
+        // shipped: two frames is a HEURISTIC, and `liveCompileGate` holds `Scene3D`'s submit for
+        // as long as the post-swap live compile takes — 300 ms to 1 s on a mid-tier Android, i.e.
+        // tens of frames. So the overlay hid, and the game's permanent HUD (title text, D-pad)
+        // appeared over a flat dark canvas with nothing 3D drawn. Measured on a Galaxy A23 cold-
+        // booting `demos/forest-camp`. The owner's verdict on seeing it: render NOTHING rather
+        // than a half state.
+        //
+        // `waitForScenePaint` resolves on the first frame `Scene3D` actually SUBMITS after the
+        // swap, so the hold and the overlay are finally the same decision. It resolves instantly
+        // when that frame already landed (the ordinary trivial-compile case — no added delay), and
+        // it is bounded by its own 5 s ceiling, mirroring the render-level hold's, so a renderer
+        // that never draws cannot leave the overlay up forever.
+        //
+        // ⚠️ GATED ON `no3D` — the same condition that decides whether `Scene3D` is rendered at
+        // all (`config.disable3D || !Scene3D`). A project with no 3D surface has nothing to arm or
+        // mark the signal, so awaiting it there would buy a 5 s stall on every boot. And on
+        // `bootScenePath`, because no scene load means no world swap means nothing armed.
+        if (!no3D && bootScenePath) {
+          const paint = await waitForScenePaint({ signal: abortBoot.signal });
+          if (paint === 'timeout') {
+            console.warn('[GameShell] renderer did not paint the loaded scene before the readiness ceiling — revealing the game anyway');
+          }
+          if (cancelled) return;
+        }
+        // …and THEN two render frames, as before: `syncRenderables` must place whatever
+        // `onSceneReady` just spawned (content generated at runtime is not in the scene at swap
+        // time, so the paint above cannot have included it), and the submitted frame has to reach
+        // the swapchain. Kept as well as the wait above, not replaced by it — they cover different
+        // halves of "there is something under the overlay".
         await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
         if (cancelled) return;
 
@@ -443,7 +476,7 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
       }
     })();
 
-    return () => { cancelled = true; };
+    return () => { cancelled = true; abortBoot.abort(); };
     // ⚠️ `[gameId]` ONLY — see the `configReadyRef`/`initializedRef` note above (#267). This
     // effect writes `configReady` and `initialized`; listing either here makes it re-run
     // itself and double-drive every registration in the body.

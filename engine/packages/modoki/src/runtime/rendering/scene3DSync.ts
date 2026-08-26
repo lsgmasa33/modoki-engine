@@ -46,6 +46,7 @@ import {
   getRenderSettings, resolveToneMapping, getEffectiveThreeSettings, getActiveTierOverrides,
 } from './renderSettings';
 import { tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, shadowBiasScale } from './qualityTier';
+import { worldWillUseStack } from './postfx/postFXTraitScan';
 import { armAutoLightCap, autoCapMaskFor, isAutoLightCapEngaged } from './autoLightCapFrame';
 import { armShadowCasterCap, shadowCasterAllowed } from './shadowCasterCapFrame';
 import { casterTypeOf, keptShadowCasters, type ShadowCaster } from './shadowCasterCap';
@@ -3606,6 +3607,37 @@ async function prewarmShadersForWorldInner(
   registerRenderSurface(prewarmScene);
   let count = 0;
 
+  /** Will the incoming world be drawn through a post-FX stack? If so, EVERY per-(mesh, material)
+   *  placeholder below is provably worthless and this pass places none of them (#324b).
+   *
+   *  Two independent reasons, either of which alone is fatal, both measured rather than argued:
+   *  the placeholders compile in the CANVAS render context at call depth 0 while the stack draws
+   *  the scene through its own pass at depth 1 (`context.id` keys the node-builder cache — see
+   *  docs/rendering.md sharp edge 3), and the materials the render actually binds are
+   *  per-(material, light-selection) variant CLONES that `applyLightMask` mints from live
+   *  `THREE.Light` instances a pre-swap copy cannot reproduce, and whose cache the swap disposes
+   *  anyway. Measured on `demos/postfx-demo` with `nodeprobe.mjs` (2026-08-26): the prewarm builds
+   *  9 node-builder states in `ctx 0` costing 163 ms, the live post-swap compile builds 22 in the
+   *  stack's `ctx 4`, and the overlap between the two sets is ZERO.
+   *
+   *  ⚠️ **This is a SKIP, not a delete.** The F4 placeholder below is forced on regardless (see its
+   *  note), because the first-compile race it guards has nothing to do with post-FX and everything
+   *  to do with a normal material being the renderer's first compile. What the world loses here is
+   *  covered by `compileLiveScene`, which runs after the swap through the stack's own pass — the
+   *  only half that CAN be right under a stack.
+   *
+   *  ⚠️ The predicate deliberately shares `Scene3D`'s trait enumeration rather than re-listing the
+   *  post-FX traits (`postfx/postFXTraitScan.ts`). A second list here would silently stop matching
+   *  the moment a sixth post-FX trait is added — and it would fail in the expensive direction:
+   *  reporting "no stack" for a world that gets one, so this pass resumes paying for placeholders
+   *  nothing reads. */
+  const willUseStack = worldWillUseStack(world, {
+    isWebGPU: (renderer as { isWebGPURenderer?: boolean }).isWebGPURenderer === true,
+  });
+  /** Read at each walk below. Named rather than inlined as `!willUseStack` so the reason a walk is
+   *  skipped is legible at the walk. */
+  const walkPlaceholders = !willUseStack;
+
   // Lights are disposed at the end of this call; everything else the prewarm mints outlives it
   // (see `_prewarmRetained`). GLB template geometries/materials are SHARED and never disposed here.
   const prewarmLights: THREE.Light[] = [];
@@ -3775,7 +3807,7 @@ async function prewarmShadersForWorldInner(
     }
   });
 
-  world.query(Renderable3D).updateEach(([rend]: [{ isVisible: boolean; mesh: string; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
+  if (walkPlaceholders) world.query(Renderable3D).updateEach(([rend]: [{ isVisible: boolean; mesh: string; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
     if (!rend.isVisible || !rend.mesh) return;
     // Shadow flags join the dedupe key (#238): they are part of the pipeline key, not a uniform,
     // so two entities sharing a (mesh, material) pair but differing in what they cast or receive
@@ -3795,7 +3827,7 @@ async function prewarmShadersForWorldInner(
     count += place(template.geometry, material, mirrored, (o) => applyShadowFlags(o, rend.castShadow, rend.receiveShadow));
   });
 
-  world.query(Renderable3DPrimitive).updateEach(([rend]: [{ isVisible: boolean; mesh: string; size: number; color: number; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
+  if (walkPlaceholders) world.query(Renderable3DPrimitive).updateEach(([rend]: [{ isVisible: boolean; mesh: string; size: number; color: number; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
     if (!rend.isVisible) return;
     const mirrored = isMirrored(entity.id());
     if (skip(`p|${rend.mesh}|${rend.material}|${shadowFlagsKey(rend.castShadow, rend.receiveShadow)}|${mirrored ? 'm' : ''}`)) return;
@@ -3848,7 +3880,7 @@ async function prewarmShadersForWorldInner(
   /** Rigs placed. Counted separately from `count` on purpose — see the F4 note below. */
   let rigCount = 0;
   const overridesByParent = new Map<number, { node: string; materials: Record<string, string> | undefined; visible: boolean }[]>();
-  world.query(SkinnedMeshRenderer).updateEach(([r]: [{ node: string; materials: Record<string, string>; visible: boolean }], entity) => {
+  if (walkPlaceholders) world.query(SkinnedMeshRenderer).updateEach(([r]: [{ node: string; materials: Record<string, string>; visible: boolean }], entity) => {
     const parentId = entity.has(EntityAttributes) ? entity.get(EntityAttributes)!.parentId : 0;
     if (!parentId) return;
     const list = overridesByParent.get(parentId) ?? [];
@@ -3856,7 +3888,7 @@ async function prewarmShadersForWorldInner(
     overridesByParent.set(parentId, list);
   });
 
-  world.query(SkinnedModel).updateEach(([sm]: [{ isVisible: boolean; model: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
+  if (walkPlaceholders) world.query(SkinnedModel).updateEach(([sm]: [{ isVisible: boolean; model: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
     if (!sm.isVisible || !sm.model || deactivatedEntities.has(entity.id())) return;
     // Overrides join the dedupe key alongside the shadow flags, for the same reason they do on
     // Renderable3D: two entities sharing a rig but rebinding different materials need both
@@ -3907,8 +3939,23 @@ async function prewarmShadersForWorldInner(
   // and re-triggers the WGSL `unresolved type 'OutputType'` bug this prewarm exists
   // to prevent. Add a throwaway 1-tri standard mesh so a plain material is always
   // compiled first. Cost is one trivial compile per scene swap; harmless if NPR is off.
+  //
+  // ⚠️ **Also forced whenever a post-FX stack is coming** (#324b). `willUseStack` skipped every
+  // walk above, so `count` is 0 by construction there and this branch would fire anyway — the
+  // condition names the second reason explicitly rather than leaning on that coincidence, because
+  // the coincidence is exactly the kind a later refactor breaks silently. Under a stack this
+  // placeholder is the ONLY thing the pre-swap half compiles, and that is the point: it costs one
+  // trivial plain-material compile and it is what keeps the renderer's first compile a NORMAL
+  // material rather than the stack's MRT/NPR pass.
+  //
+  // It keeps the scene-global mirrors (lights, environment, fog) set up above, deliberately rather
+  // than by omission: those mirrors are what make this build exercise the LIT graph. Measured
+  // 2026-08-26 on `games/3d-test` — a bare, environment-free warm build costs ~1 ms and primes
+  // NOTHING (the next real lit build still cost 25.6 ms), whereas the first lit+env build costs
+  // ~24 ms and every later lit build then costs ~5 ms. So under a stack this placeholder is also
+  // what absorbs that one-time premium on behalf of `compileLiveScene`.
   let placeholderMesh: THREE.Mesh | undefined;
-  if (count === 0) {
+  if (count === 0 || willUseStack) {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
     geo.computeVertexNormals();

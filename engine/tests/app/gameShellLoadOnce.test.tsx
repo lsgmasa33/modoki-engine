@@ -48,6 +48,10 @@ vi.mock('@modoki/engine/runtime', () => ({
   audioResume: vi.fn(),
   VideoOverlay: () => null,
   onTierSwitchOverlay: vi.fn(() => () => {}),
+  // Every game here is `disable3D: true`, so GameShell never actually awaits this (#334) — but
+  // the barrel is fully mocked, and a named export App.tsx imports and this factory omits is a
+  // module-init error, not a missing call.
+  waitForScenePaint: vi.fn(async () => 'idle'),
 }));
 
 vi.mock('@modoki/engine/runtime/debug', () => ({

@@ -37,7 +37,7 @@
 // which is exactly how a correct shader fix ended up looking broken.
 
 import * as THREE from 'three';
-import { RenderPipeline } from 'three/webgpu';
+import { RenderPipeline, QuadMesh } from 'three/webgpu';
 import { pass, mrt, output, normalView, add, mul, mix, float, vec3, uniform, rtt, materialReference, vec4 } from 'three/tsl';
 import { bloom } from 'three/examples/jsm/tsl/display/BloomNode.js';
 import { dof } from 'three/examples/jsm/tsl/display/DepthOfFieldNode.js';
@@ -54,6 +54,13 @@ import {
   type PostFXRequest, type StageKind,
 } from './stackPlan';
 import { pinPassCallDepth, observePassCallDepth, getPassCallDepth } from './passCompileContext';
+import {
+  stageCompileJobsFromDraws, driveNodeUpdates, MAX_STAGE_COMPILES, MAX_STAGE_COMPILE_ROUNDS,
+} from './stageCompileJobs';
+import {
+  beginPrecompile, runExclusivePrecompile, type PrecompileSession,
+} from './precompileSession';
+import { rawNow } from '../../core/clock';
 
 /** One assembled stage.
  *  - `applyConfig` pushes this stage's own config into live uniforms (a no-op
@@ -116,6 +123,57 @@ interface StageCtx {
 // consumes the value before the next call.
 const _size = new THREE.Vector2();
 
+/** The private surface of three's `RenderPipeline` that `compileStagesAsync` reaches for (r184,
+ *  `three/src/renderers/common/RenderPipeline.js` lines 85 / 179). Private on purpose: there is no
+ *  public compile entry point on `RenderPipeline`, and the alternative is reimplementing its
+ *  `render()` prologue. Every use is presence-checked, and `postfxStack.test.ts` carries a
+ *  TRIPWIRE that fails `npm test` loudly if a three bump moves any of it. */
+interface RenderPipelineInternals {
+  _update?(): void;
+  _quadMesh?: { camera?: THREE.Camera; material?: unknown };
+  outputNode?: unknown;
+}
+
+/** The renderer state `RenderPipeline.render()` sets around its draw, plus the two fields
+ *  `Renderer.compileAsync` reads where `_renderScene` reads the render target instead. */
+interface RendererInternals {
+  compileAsync?(object: unknown, camera: unknown): Promise<void>;
+  toneMapping: THREE.ToneMapping;
+  outputColorSpace: string;
+  depth: boolean;
+  stencil: boolean;
+  xr?: { enabled: boolean };
+  /** three's `NodeManager`. Only `nodeFrame` is read — the argument every node's `updateBefore`
+   *  expects. See `driveNodeUpdates`. */
+  _nodes?: { nodeFrame?: unknown };
+}
+
+/** Mirror a render target's depth/stencil onto the renderer for the duration of a compile.
+ *
+ *  ⚠️ See `compileStagesAsync`'s header, input 3 — this is the difference between every stage
+ *  compile being a cache hit and it creating a parallel set of pipelines that also EVICTS the
+ *  ones the render uses. Not cosmetic. Both fields are saved and restored by the precompile
+ *  session, so this only ever writes inside a borrowed renderer.
+ */
+function mirrorDepthStencil(r: RendererInternals, rt: THREE.RenderTarget | null): void {
+  if (!rt) return;
+  r.depth = rt.depthBuffer;
+  r.stencil = rt.stencilBuffer;
+}
+
+let _warnedStageCompile = false;
+/** Announced once, not absorbed: silently dropping the optimisation is exactly how a boot
+ *  regression hides. Mirrors `passCompileContext`'s one-shot warn. */
+function warnStageCompileUnavailable(): void {
+  if (_warnedStageCompile) return;
+  _warnedStageCompile = true;
+  console.warn(
+    '[PostFXStack] stage-quad precompile skipped — three\'s RenderPipeline no longer exposes '
+    + '`_update`/`_quadMesh`. The post-FX stage pipelines will build on the first drawn frame '
+    + '(#323).',
+  );
+}
+
 /** Owner of the terminal RenderPipeline + assembled stage chain for one
  *  Scene3D instance. `render()` replaces `renderer.render(scene, camera)`. */
 export class PostFXStack {
@@ -125,6 +183,20 @@ export class PostFXStack {
   private readonly scenePass: ScenePassLike;
   private readonly stages: StageHandle[];
   private req: PostFXRequest;
+  /** Quads minted by `compileStagesAsync`, held for as long as this stack lives.
+   *
+   *  ⚠️ Held, not disposed — and NOT because tidying was forgotten. three refcounts a GPU pipeline
+   *  by the render objects referencing it (`Pipelines.delete` → `usedTimes--` → `_releasePipeline`
+   *  at zero), so dropping a quad releases the pipeline the compile just paid for. Same reasoning
+   *  as `_prewarmRetained` / `_liveRetained` in `scene3DSync.ts`; the generation here is the
+   *  stack's own lifetime, since a rebuilt stack brings new stage materials anyway. Nothing in the
+   *  list owns GPU memory of its own: `QuadMesh` shares one module-level geometry and these hold
+   *  the LIVE stage materials, so `dispose()` just drops the references. */
+  private readonly compiledQuads: QuadMesh[] = [];
+  /** Set by `dispose()`. Checked after every `await` in `compileStagesInner` so a compile whose
+   *  stack was replaced mid-flight (a rebuild) stops instead of warming pipelines for a graph
+   *  nothing will draw — and so it cannot keep appending to a disposed instance's retain list. */
+  private disposed = false;
 
   constructor(renderer: unknown, scene: THREE.Scene, camera: THREE.Camera, req: PostFXRequest) {
     this.req = req;
@@ -555,6 +627,210 @@ export class PostFXStack {
     );
   }
 
+  /** Compile the pipelines the stack's OWN STAGE QUADS will need, without drawing a frame (#323).
+   *
+   *  `compileSceneAsync` above covers the scene pass. It cannot cover the stack's internal stages:
+   *  bloom's mip pyramid, DOF's targets, GTAO, an `rtt()` wrapper and the terminal colour
+   *  transform each own a `QuadMesh` inside three's node graph, and **`RenderPipeline` exposes no
+   *  compile entry point at all** (r184 — `render()` and a deprecated `renderAsync()`, nothing
+   *  else). Priced from a Dawn trace on a Galaxy A23 (2026-08-22): 8 pipelines / ~330 ms of
+   *  off-thread GPU compile, the largest single item left in `demos/postfx-demo`'s boot gap.
+   *
+   *  A stage quad is an ordinary `THREE.Mesh` (`QuadMesh` extends it and draws via a plain
+   *  `renderer.render(this, camera)`), so `renderer.compileAsync` compiles one exactly like any
+   *  other object. What this method supplies is the two things three does not: WHICH quads
+   *  (`collectStageCompileJobs`), and the renderer state that makes the compile key-identical to
+   *  the draw.
+   *
+   *  ── The three state inputs, all measured, none obvious ────────────────────────────────────
+   *  1. **`_update()` runs BEFORE the tone-mapping flip**, because that is the order
+   *     `RenderPipeline.render()` uses. `_update()` compares `this._toneMapping` against
+   *     `renderer.toneMapping` and rebuilds the terminal fragment node when they differ — so
+   *     calling it AFTER setting `NoToneMapping` bakes a graph with no tone map, warms that
+   *     pipeline, and leaves the next real `render()` to rebuild the true one. Silent, and
+   *     doubly expensive: the exact failure shape `rendering.md`'s checklist exists for.
+   *  2. **The prologue is a pipeline-key input, not tidying.** `compileAsync` computes
+   *     `useFrameBufferTarget = this.needsFrameBufferTarget && this._renderTarget === null`, and
+   *     `needsFrameBufferTarget` reads tone mapping + output colour space. With the app's real
+   *     values still set, the terminal quad compiles against a DIFFERENT attachment state.
+   *  3. ⚠️ **A FIFTH three.js sharp edge — `compileAsync` takes `depth`/`stencil` from the
+   *     RENDERER, `_renderScene` takes them from the RENDER TARGET.** `Renderer.compileAsync`
+   *     does `renderContext.depth = this.depth; renderContext.stencil = this.stencil`, while
+   *     `_renderScene` does `renderContext.depth = renderTarget.depthBuffer` when a target is
+   *     bound. Both reach the SAME `RenderContext` instance (it is keyed by attachment state, and
+   *     `depthBuffer` is part of that key), so the compile MUTATES the context the render will
+   *     use, `getCurrentDepthStencilFormat()` then returns a depth format the target does not
+   *     have, and the pipeline key differs. Measured live on `demos/postfx-demo` with
+   *     `tools-scratch/boot-stall/stagekeytest.mjs`, against an already-warm cache: without the
+   *     mirror the compile created **7 fresh bloom pipelines** and the next frame rebuilt its own
+   *     SYNCHRONOUSLY on top (the compile had evicted them); mirroring `renderer.depth`/`.stencil`
+   *     from each target took that to **0 created** — every compile a cache hit.
+   *
+   *  ── Why there is no call-depth pin here, unlike `compileSceneAsync` ───────────────────────
+   *  Because the GPU pipeline key does not contain the render context's id.
+   *  `Pipelines._getRenderCacheKey()` is `stageVertex.id + ',' + stageFragment.id + ',' +
+   *  backend.getRenderCacheKey(renderObject)`, the stage ids are keyed by the generated WGSL
+   *  SOURCE, and `getRenderCacheKey` reads only material state plus format/sample/depth-format
+   *  facts read THROUGH the context. Call depth changes `context.id`, which keys the node-builder
+   *  cache (the WGSL text, main-thread, cheap for a quad) — not the pipeline (off-thread, ~130 ms
+   *  on the A23), which is what this method exists to move. The 0-created measurement above was
+   *  taken with no pin at all. Worth knowing if a pin is ever added: on `demos/postfx-demo` the
+   *  stage quads draw at call depth **2**, not the scene pass's 1 — terminal quad (0) → the NPR
+   *  composite's `rtt()` quad (1) → bloom's quads (2) — and the depth moves with the stage set,
+   *  so there is no constant to pin to before the first frame.
+   *
+   *  Never throws: every private reach is presence-checked, and an unrecognised graph compiles
+   *  nothing. `Scene3D` also runs this AFTER `compileSceneAsync`, so a failure here cannot cost
+   *  the larger, proven win. */
+  async compileStagesAsync(): Promise<void> {
+    // ⚠️ SERIALISED per renderer, and this is a correctness guard, not tidiness.
+    // `liveCompileGate.tick()` guards on `armed`, never on `pending`, so a stack REBUILD while a
+    // compile is in flight kicks a second one — and the two belong to different `PostFXStack`
+    // instances, so no instance-level guard can see the collision. Overlapping compiles corrupted
+    // renderer-global state permanently (a `render` stub restored over the real one) and would
+    // also interleave their `setRenderTarget` calls, compiling each other's jobs against the wrong
+    // attachment state. See `precompileSession.ts`.
+    return runExclusivePrecompile(this.rawRenderer, () => this.compileStagesInner());
+  }
+
+  private async compileStagesInner(): Promise<void> {
+    if (this.disposed) return;
+    const pipeline = this.pipeline as unknown as RenderPipelineInternals;
+    const r = this.rawRenderer as RendererInternals;
+    if (typeof pipeline?._update !== 'function' || !pipeline._quadMesh
+      || typeof r?.compileAsync !== 'function') {
+      warnStageCompileUnavailable();
+      return;
+    }
+    const terminalQuad = pipeline._quadMesh;
+    const camera = terminalQuad.camera;
+    if (!camera) { warnStageCompileUnavailable(); return; }
+
+    // Borrows the renderer: saves every field this method mutates and swaps `render` for a
+    // RECORDER. Refcounted per renderer and deadline-bounded — the deadline is what stops a slow
+    // compile from letting `liveCompileGate`'s own ceiling release a frame through a stubbed
+    // `render` (a blank submit, then `markScenePainted`: #334's bug). Restores everything itself.
+    const session: PrecompileSession | null = beginPrecompile(this.rawRenderer, rawNow());
+    if (!session) { warnStageCompileUnavailable(); return; }
+
+    const prevRT = this.renderer.getRenderTarget();
+    /** The argument every node's `updateBefore` expects. three's own, so a hook reading anything
+     *  beyond `.renderer` still gets a real object; the bare fallback covers a renderer whose
+     *  private shape has moved. */
+    const nodeFrame = r._nodes?.nodeFrame ?? { renderer: r };
+    let compiles = 0;
+    let fired = 0;
+    let failed = 0;
+    let walked = 0;
+    let materials = 0;
+    let capped = false;
+    let rounds = 0;
+    let abandoned = false;
+    const compiled = new Set<string>();
+    /** After every `await`: has something taken the renderer back (the deadline, or a capture),
+     *  or has this stack been disposed by a rebuild? Either way stop — continuing would issue
+     *  REAL draws through an un-stubbed renderer, which is the one thing this must never do. */
+    const stillOurs = (): boolean => {
+      if (session.alive && !this.disposed) return true;
+      abandoned = true;
+      return false;
+    };
+    try {
+      // Phase 1 — the terminal colour-transform quad, under `RenderPipeline.render()`'s own
+      // prologue. The render target is deliberately left as-is: `render()` does not set one
+      // either, it draws into whatever is bound (the canvas at boot).
+      pipeline._update();
+      r.toneMapping = THREE.NoToneMapping;
+      r.outputColorSpace = THREE.ColorManagement.workingColorSpace;
+      if (r.xr) r.xr.enabled = false;
+      mirrorDepthStencil(r, prevRT);
+      // ⚠️ `compileAsync` FRUSTUM-CULLS its render list, against the frustum the previous
+      // RENDERED frame left behind (rendering.md sharp edge 2) — the scene camera's, which has
+      // nothing to do with the quad's own ortho camera. A culled quad compiles NOTHING, silently:
+      // measured on `demos/postfx-demo`, where the terminal quad was dropped and the whole graph
+      // below it therefore never got built, so the walk saw 2 of its 9 stage materials while
+      // `demos/particle-demo` (whose camera happened to contain the quad) saw all 7.
+      const terminalCulled = (terminalQuad as unknown as THREE.Object3D).frustumCulled;
+      (terminalQuad as unknown as THREE.Object3D).frustumCulled = false;
+      try {
+        await r.compileAsync(terminalQuad, camera);
+      } finally {
+        (terminalQuad as unknown as THREE.Object3D).frustumCulled = terminalCulled;
+      }
+      compiles++;
+
+      // Phase 2 — the stage quads, in ROUNDS.
+      //
+      // ⚠️ One pass is not enough, and the reason is the same fact Phase 1 exploits: a stage's
+      // materials are minted by its `setup()`, which runs when the graph containing it is BUILT.
+      // Building the terminal quad only builds ONE level — a stage behind an `rtt()` wrapper
+      // (what `demos/postfx-demo` composes at SS > 1) sits behind a texture node, and its
+      // `setup()` does not run until the WRAPPER'S own quad material is built. So compiling this
+      // round's quads is what makes the next round's stages exist at all.
+      //
+      // Bounded twice over — `MAX_STAGE_COMPILE_ROUNDS` and the total compile cap — because a
+      // graph that keeps producing new stages must degrade to "warms fewer than it could", never
+      // to a loop.
+      while (rounds < MAX_STAGE_COMPILE_ROUNDS && compiles <= MAX_STAGE_COMPILES) {
+        if (!stillOurs()) break;
+        rounds++;
+        // Assign the fragment nodes, size the targets and bind the inter-stage textures that
+        // three normally only does inside a draw — the half that makes a stage behind an `rtt()`
+        // wrapper reachable at all. The draws these hooks attempt land in `session.draws`.
+        const drive = driveNodeUpdates(pipeline.outputNode, nodeFrame);
+        fired += drive.fired;
+        failed += drive.failed;
+        const scan = stageCompileJobsFromDraws(
+          session.draws, MAX_STAGE_COMPILES - compiled.size, compiled,
+        );
+        walked = scan.walked;
+        materials = scan.materials;
+        capped = capped || scan.capped;
+        if (scan.jobs.length === 0) break;
+        for (const job of scan.jobs) {
+          if (!stillOurs()) break;
+          compiled.add(job.key);
+          this.renderer.setRenderTarget(job.target as unknown as THREE.RenderTarget);
+          mirrorDepthStencil(r, job.target as unknown as THREE.RenderTarget);
+          // A LOCALLY-OWNED quad, not the node's own module-level one — three's stage quads swap
+          // `.material` per draw, and borrowing one would fight that. It is key-identical for
+          // cache purposes: `getMaterialCacheKey()` folds `object.uuid` only for
+          // instanced/batched/morph meshes, and `QuadMesh` shares one module-level geometry, so
+          // `getGeometryCacheKey()` matches too. Verified by the 0-pipelines-created measurement
+          // in this method's header.
+          const quad = new QuadMesh(job.material as unknown as THREE.Material);
+          quad.frustumCulled = false; // sharp edge 2, as above
+          quad.updateMatrixWorld(true);
+          // ⚠️ RETAINED, never disposed here. three refcounts a pipeline by the render objects
+          // referencing it, so dropping this quad would release the pipeline it just warmed
+          // (rendering.md sharp edge 4). Freed with the whole stack in `dispose()`.
+          this.compiledQuads.push(quad);
+          await r.compileAsync(quad, camera);
+          compiles++;
+        }
+      }
+    } catch (e) {
+      // Same contract as the shape checks: cost the optimisation, never the boot.
+      console.warn('[PostFXStack] stage-quad precompile failed:', e);
+    } finally {
+      // Only the LAST holder actually restores; a session torn down early (deadline, capture) has
+      // already restored and this is a no-op. Everything this method touched — `render`, tone
+      // mapping, colour space, xr, depth/stencil, MRT and the bound render target — is saved and
+      // returned there, together, so a partial restore is not expressible.
+      session.end();
+    }
+    if (import.meta.env?.DEV) {
+      console.debug(
+        `[PostFXStack] stage precompile: ${walked} draw(s) observed, `
+        + `${materials} stage material(s), ${compiles} compile(s) issued `
+        + `over ${rounds} round(s), ${fired} node update(s) driven`
+        + (failed ? `, ${failed} declined` : '')
+        + (abandoned ? ', ABANDONED early' : '')
+        + (capped ? ` (CAPPED at ${MAX_STAGE_COMPILES})` : ''),
+      );
+    }
+  }
+
   /** Push live config into every stage's uniforms, OR report that the
    *  request needs a structural rebuild (stage set / MRT layout / an NPR
    *  structural field changed — the caller must `dispose()` this instance and
@@ -570,11 +846,15 @@ export class PostFXStack {
   }
 
   dispose(): void {
+    this.disposed = true;
     this.pipeline.dispose();
     // Hand-free every node-owned render target: RenderPipeline.dispose() does
     // NOT recurse into the node graph, so without this an SS-scale rebuild
     // (dispose + reconstruct) leaks a target per rebuild.
     for (const stage of this.stages) stage.dispose?.();
     this.scenePass.dispose?.();
+    // Drop the precompile quads' references only — see the field's own note on why nothing here
+    // is disposed.
+    this.compiledQuads.length = 0;
   }
 }
