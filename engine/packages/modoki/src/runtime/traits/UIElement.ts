@@ -125,6 +125,11 @@ export const UIElement = trait({
    * `scrollbar-color` / `scrollbar-width` are the whole available surface. That buys the thumb and
    * track colour and a coarse width — not a custom shape, and not a corner or arrow style.
    *
+   * ⚠️ **`UIScrollView.scrollbar` overlaps this and takes precedence** — both emit
+   * `scrollbar-width: none` for their hidden case, and the scroll view's style is merged after
+   * this one. On an element with a `UIScrollView`, let that trait decide whether a bar exists and
+   * use these fields only to tint it.
+   *
    * ⚠️ **`'hidden'` removes an AFFORDANCE, not just a decoration.** With no bar there is nothing on
    * screen saying content continues below the fold. Use it only where something else already says
    * so.

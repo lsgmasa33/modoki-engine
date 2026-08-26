@@ -210,6 +210,14 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // Gated on `overflow: 'scroll'` so the fields cannot have an effect on an element that never
   // scrolls: an authored value that quietly does nothing somewhere else is the "field nothing
   // reads" trap, and this keeps the one visible consequence tied to the one field that causes it.
+  //
+  // ⚠️ **`UIScrollView.scrollbar` says the same thing and WINS.** Both it and
+  // `scrollbarStyle: 'hidden'` emit `scrollbar-width: none`, and `scrollViewStyle` is merged
+  // BELOW this block — so on an element carrying a `UIScrollView`, that trait decides whether a
+  // bar exists and this one only tints it. `scrollbarStyle: 'tinted'` on a `scrollbar: 'hidden'`
+  // view therefore sets `scrollbar-color` on a bar that never renders. Authoring both is the
+  // author's mistake to make, but nothing errors, so it is stated here and in the trait docs
+  // rather than left to be discovered.
   if (node.overflow === 'scroll') {
     if (node.scrollbarStyle === 'hidden') {
       style.scrollbarWidth = 'none';

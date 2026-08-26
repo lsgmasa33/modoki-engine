@@ -55,6 +55,9 @@ Field groups (representative fields, verified against `UIElement.ts`):
   thumb colour, a track colour and a coarse width — no shape, corner or arrow control. The skin is
   gated on `overflow: 'scroll'`, so a tint authored on an element that never scrolls does nothing
   rather than sitting in the Inspector pretending to.
+  ⚠️ **`UIScrollView.scrollbar` says the same thing and WINS** — both emit `scrollbar-width: none`
+  for their hidden case and the scroll view's style is merged after, so on an element carrying a
+  `UIScrollView` that trait decides whether a bar exists and `scrollbarStyle` only tints it.
   ⚠️ `'hidden'` removes an **affordance**, not just a decoration: with no bar, nothing on screen
   says the content continues below the fold. Use it only where something else already does.
 
