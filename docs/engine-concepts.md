@@ -36,6 +36,35 @@ number. It has no data of its own; everything about it lives in the components
 attached to it. Parent/child relationships are expressed by
 `EntityAttributes.parentId`, not a scene-graph object.
 
+⚠️ **`entity.id()` is the INDEX, not the identity — never trust it across frames.** It masks the
+generation off the packed number, and so do `has()`/`get()`; only `isAlive()` checks it. koota's
+entity index is a **LIFO free list**, so a despawn immediately followed by a same-shape respawn
+reclaims the exact freed index. Any state that (a) is **held across frames/ticks** rather than
+rebuilt from a query every call and (b) **trusts an `entity.id()` lookup as "still the same logical
+entity"** will hand a new entity the dead one's state. A `seen`-set sweep at the end of a pass is
+not a defence: a despawn+respawn landing BETWEEN two passes never gets one.
+
+Two sanctioned fixes, and the choice is about who else holds the id:
+- **Key by the packed entity** (`entity.valueOf()` — generation included) when the map is private
+  to the module. Used by `zones/zoneTriggerCore.ts` (QA-ZONE-0003).
+- **Keep the id key and store the generation alongside it**, rebuilding on a mismatch, when the id
+  is also a public *addressing* contract other modules call you with. Used by
+  `physics/physics2DSystem.ts`+`physics3DSystem.ts` (`BodyRec.entityGen`, see
+  [physics-2d.md](physics-2d.md)), by `video/videoSystem.ts` (its `owner` map — #336; its ids reach
+  it from the texture surfaces, `UIVideoMount` and the `video.*` actions), and by
+  `rendering/materialInstanceSystem.ts`'s `_defaultBaseCache` (#336 — a cache deliberately held
+  "forever" so re-reading `mesh.material` can't thrash the clone, which is exactly what makes it
+  outlive its entity).
+
+Neither is needed for a cache whose every entry is **revalidated against a value recomputed this
+frame** — that is why `skinning/skin2DSystem.ts` is safe despite looking identical, and
+`tests/runtime/skin2DIdReuse.test.ts` pins it so a future trust-based entry there is caught.
+Likewise a per-frame-rebuilt index (`entityIndex.ts`, `transformPropagationSystem.ts`) never holds
+a value across a despawn and does not share the hazard.
+
+**In serialized data and event payloads, use the GUID, never the id** — runtime ids are reassigned
+on every scene hot-reload.
+
 ### Component (Trait)
 A **component** is a bag of typed data attached to an entity. In koota's
 vocabulary (and ours) it's called a **trait**. Two kinds:

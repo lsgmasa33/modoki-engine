@@ -282,6 +282,21 @@ indistinguishable from one that shipped fine until someone plays it.
 
 ## Gotchas
 
+**A recycled entity index must not inherit the previous entity's decoder (#336).** `videoSystem`'s
+`live`/`pending`/`progress`/`readyUrls`/`failed` all persist across frames keyed by `entity.id()`,
+which strips koota's generation — and the `seen`-set sweep that releases a dead entity's state runs
+at the END of a pass, so a despawn+respawn landing between two passes never gets one. The
+`existing.clip !== vp.clip` hard-swap self-heals a *different* clip; a **same-clip** respawn (a
+prefab re-instantiated, two players streaming one intro) does not, and the newcomer silently
+adopted the dead entity's decoder, download progress and sticky failure. Fixed with an `owner` map
+(id → packed entity) checked at the top of the reconcile — the maps stay id-keyed because
+`videoElementFor`/`seekEntityVideo` are a public addressing contract the texture surfaces,
+`UIVideoMount` and the `video.*` actions all call with a masked id. `owner` is dropped on a world
+swap but NOT on `stopWorldVideo`, so a sticky download failure still survives Stop→Play as
+intended. Background and the general rule:
+[engine-concepts.md](engine-concepts.md) § Entity. Regression test:
+`tests/video/videoSystemIdReuse.test.ts`.
+
 **`playsInline` and `crossOrigin` are both mandatory, and both fail silently.** Without
 `playsInline`, iOS hijacks playback into a native fullscreen player. Without
 `crossOrigin='anonymous'`, a remote clip taints the canvas and cannot become a texture at all.

@@ -202,6 +202,77 @@ succeeds is worse than one that answers a smaller question honestly. Use `rawNow
 `@modoki/engine/runtime` (the sanctioned wall-clock wrapper; `setManualNow` makes the budget
 testable), not `Date.now()`.
 
+## Court's placement tools — the guard-completeness trap (#339)
+
+Court's second pair of tools (`court_place_piece`, `court_board_state`) is worth reading before you
+write a game tool that DRIVES gameplay rather than navigating it, because the obvious
+implementation is wrong in a way nothing catches.
+
+**The state function is not the whole operation.** Court's `commitPlace(piece, cell)` does the full
+job of landing a piece — memo wipe, heart charge, journal, revert-arm, save. It looks like exactly
+the seam a tool should call. But the guards a real drop passes live in its **callers**: cell
+emptiness is checked in `onRelease`, tray exhaustion in `onPressAt` before a drag can even begin.
+Calling `commitPlace` bare therefore lets an agent **over-place a piece type**, which fails rule 1
+`wrong-piece-count` — an END-STATE violation, so nothing flashes, nothing reverts, and the board can
+look solved while being illegal. That is the [§0 rank-1 false
+success](mcp-tool-conventions.md#0-the-rule-that-generates-the-others).
+
+So the rule generalises: **find the guards in the caller, not just the state function, and
+re-assert every one.** A game tool that reproduces a player action must reproduce what the player
+*cannot* do as faithfully as what they can.
+
+⚠️ **"The caller" is not one function, and this is where the first attempt failed review.** Court's
+guards live at *three* depths: two module-level gates in `onPressAt` (intro running, menu open), the
+emptiness check in `onRelease` — and six more inside **`hitTest`**, which answers with a *backdrop*
+target rather than a cell whenever the board is untargetable (solved, Game Over, a hint story
+playing, a tutorial narration beat, the `(i)` reference open, a flyout open). The first
+implementation walked the first two and stopped, so the tool would happily land a piece on a **Game
+Over board** — writing the player's saved session behind an overlay they cannot dismiss — and place
+a piece *underneath* a hint story, leaving the narration describing a position that no longer
+existed. A green suite saw none of it.
+
+The fix that holds is not a longer list at the call site but **one predicate both paths read**
+(`boardInputBlocker()`), because the same disjunction had already been hand-copied a third time into
+the hit-region provider. When you find yourself enumerating "states where input is refused" in a
+tool, that list almost certainly already exists somewhere in the input path — share it rather than
+restate it, and the next state added lands in both places at once.
+
+⚠️ **And there may be a layer the engine never sees at all.** Court blocks the board in *two*
+places: the engine list above, and the **DOM** — `UIRenderer`'s pointer-blocker swallows a press
+over a scene-authored overlay before `hitTest` ever runs. Court's region-chip flyout is blocked only
+that way (it is dismissed by a scene `UIAction`, not a hit-test branch), so it appears in no engine
+predicate, and a tool that checked only the engine could place a piece "through" an open flyout that
+a real finger cannot reach past. **A synthetic call bypasses every layer, so it has to ask every
+layer** — enumerate the DOM-modal overlays too, and keep that check separate rather than folding it
+into the engine predicate, since widening the engine one would change real input behaviour.
+
+**Then test the refusals, not just the successes.** The differential test covered the six cases
+anyone would think of (occupied, hole, exhausted…) and none of the six above, which is exactly why
+the gap survived. A guard with no test is how the copy drifts back apart.
+
+One case in that test deliberately asserts the two arms **disagree**: headless has no DOM, so the
+gesture arm is the *unfaithful* one for a DOM-blocked overlay. Say so loudly in the test, or the
+next reader will "fix" the divergence away and reopen the hole.
+
+**Reproduce the input path, do not invent rules.** The sharp pair in Court: a **hole** is refused
+(it gets no `cellCenters` entry, so a real drag cannot hit-test it either) while a **civilian cell
+is allowed to land** (it is hit-testable, and the resulting rule-5 violation with its ✕ and heart
+cost is exactly what QA needs reachable — it was a real shipped bug, #47). The tool never
+pre-judges legality; it lands the drop and reports the game's own verdict, read off `pendingRevert`
+rather than re-derived.
+
+**Duplicated guards need a differential test.** Because the guards now exist in two places,
+`games/court/tests/agentToolsPlacement.test.ts` drives the real gesture machine and the tool side
+by side on one fixture board and asserts they reach the same outcome on both axes (did a placement
+land, did a revert arm). Cases the gesture cannot express at all — a hole has no screen point to
+aim at — are asserted as that impossibility rather than skipped. Without this, the copy drifts;
+Court has been bitten twice by hand-copied predicates diverging from the code they copied.
+
+**Say when a tool writes the player's data.** `court_place_piece` ends in `saveSession()`, so it
+overwrites the human's stored board — unlike Court's three navigation tools, whose file banner
+declares they never write progress. That banner had to be rewritten rather than left standing: a
+declared invariant that a new tool quietly breaks is worse than one that was never written down.
+
 ## Limits worth knowing before you rely on this
 
 - **A game tool's mutation is not undoable.** Engine tools declare `undoable` in `contracts.ts` and

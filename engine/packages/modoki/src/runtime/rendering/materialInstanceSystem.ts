@@ -61,8 +61,14 @@ const clocks = new Map<string, number>();
  *  baked per-slot material ARRAY (a multi-material mesh). Cached the first time we see it and reused
  *  forever — re-reading `mesh.material` after we bind a clone to it would make the base look like it
  *  changed and thrash the clone. Cleared on world swap. (A SINGLE default material is NOT cached
- *  here — it's unsupported; see resolvePropBase.) */
-const _defaultBaseCache = new Map<number, THREE.Material[]>();
+ *  here — it's unsupported; see resolvePropBase.)
+ *
+ *  Carries the entity's koota GENERATION, because "forever" outlives the entity: this is keyed by
+ *  `entity.id()`, the masked index, and koota's free list is LIFO — so a despawn+respawn hands a
+ *  NEW entity the dead one's cached array, and `applyPropOverride` then clones the dead entity's
+ *  materials onto the newcomer's meshes (#336; the same idiom as `BodyRec.entityGen` in the
+ *  physics systems, and the general rule in `docs/engine-concepts.md` § Entity). */
+const _defaultBaseCache = new Map<number, { mats: THREE.Material[]; gen: number }>();
 
 /** Last value written for each `prop` override, keyed `${id}:${index}:${target}`.
  *
@@ -168,11 +174,13 @@ function resolvePropBase(entity: Entity, meshes: THREE.Mesh[], id: number): THRE
     _defaultBaseCache.delete(id); // switched from a baked array to an explicit material
     return resolveMaterial(guid) ?? undefined;
   }
+  // A cache entry is this entity's only if the GENERATION matches — see `_defaultBaseCache`.
+  const gen = entity.generation();
   const cached = _defaultBaseCache.get(id);
-  if (cached) return cached;
+  if (cached && cached.gen === gen) return cached.mats;
   const mat = meshes[0]?.material as THREE.Material | THREE.Material[] | undefined;
   if (!mat) return undefined; // no mesh yet
-  if (Array.isArray(mat)) { _defaultBaseCache.set(id, mat); return mat; }
+  if (Array.isArray(mat)) { _defaultBaseCache.set(id, { mats: mat, gen }); return mat; }
   // Single default material, no GUID → unsupported (leak-prone on resize); warn once, skip.
   if (import.meta.env?.DEV && !_noBaseWarned.has(id)) {
     _noBaseWarned.add(id);
