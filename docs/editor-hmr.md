@@ -110,7 +110,8 @@ that module is re-evaluated while the subscriber survives. Touching each one:
 | Registry module | Touched → | Subscribing sites |
 |---|---|---|
 | `runtime/core/ecs/worldRegistry.ts` (`onWorldSwap`, via the `ecs/world.ts` re-export) | **page reload** | `SceneView.tsx` :356 :2470 :3592 · `Hierarchy.tsx` :603 :625 :743 · `TimelineEditor.tsx` :563 |
-| `runtime/core/ecs/entityUtils.ts` (`addDirtyListener`, `onStructureDirty`, `onStructureDirtyCoalesced`) | **page reload** | `Console.tsx` :63 · `Hierarchy.tsx` :742 · `SceneView.tsx` :2468 :2469 |
+| `runtime/core/renderDirty.ts` (`addDirtyListener`, re-exported unchanged from `entityUtils.ts`) | **not independently re-measured** — moved out of `entityUtils.ts` (side-effect-free extraction, matching `uiDirty.ts`'s own split off `uiTreeStore.ts`); touching `renderDirty.ts` alone now resets this Set, touching `entityUtils.ts` alone may no longer | `Console.tsx` :63 · `Hierarchy.tsx` :742 · `SceneView.tsx` :2468 |
+| `runtime/core/ecs/entityUtils.ts` (`onStructureDirty`, `onStructureDirtyCoalesced`) | **page reload** | `SceneView.tsx` :2469 |
 | `runtime/core/uiDirty.ts` (`onEditorDirty`, via `runtime/ui/uiTreeStore`) | **page reload** | `inspectorFields.tsx` :23 · `Inspector.tsx` :1633 · `UIFocusGraphOverlay.tsx` :143 · `UIResizeOverlay.tsx` :267 |
 | `runtime/core/activeRenderer.ts` (`onRendererLost`) | **page reload** | `SceneView.tsx` :4736 |
 | `runtime/core/playState.ts` (`onPlayStateChange`) | **page reload** | `SceneView.tsx` :2471 |

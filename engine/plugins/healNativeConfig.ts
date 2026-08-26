@@ -17,6 +17,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { loadProjectConfig } from './load-project-config';
 import { detect as detectTool } from '../toolchain';
 import type { ProjectConfig } from '../project-config';
@@ -1615,6 +1616,227 @@ function decideBuildWrite(
   return { write: true };
 }
 
+/** Resolve the effective build number this heal pass writes to the native files.
+ *
+ *  With `app.buildNumberAuto` FALSE, `app.buildNumber` passes straight through. TRUE — the
+ *  "Auto" checkbox — the typed value is IGNORED and the number is derived from
+ *  `git rev-list --count HEAD` of the project's repo, keeping the typed value as a FLOOR —
+ *  so a store-forced jump still wins without turning auto off, and both stores keep seeing one
+ *  number that only moves up (the never-lower guard below stays the last line of defence either
+ *  way). A project copied out of its repo has no git; that falls back to the config value with
+ *  a note rather than failing the whole heal. */
+export function resolveBuildNumber(projectRoot: string, cfg: ProjectConfig): { value: number; note?: string } {
+  if (!cfg.app.buildNumberAuto) return { value: cfg.app.buildNumber };
+  const floor = cfg.app.buildNumber;
+  let count: number | null = null;
+  try {
+    const r = spawnSync('git', ['-C', projectRoot, 'rev-list', '--count', 'HEAD'], {
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    if (r.status === 0 && r.stdout) {
+      const n = parseInt(String(r.stdout).trim(), 10);
+      if (Number.isInteger(n) && n >= 0) count = n;
+    }
+  } catch {
+    // fall through to the fallback below
+  }
+  if (count === null) {
+    return {
+      value: floor,
+      note: 'build number source is git commits, but no commit count could be read (not a git repo, or git failed) — using app.buildNumber',
+    };
+  }
+  // The floor wins when the owner typed a jump past the count (or the count is somehow lower).
+  if (floor >= count) {
+    return { value: floor, note: `build number ${floor} = app.buildNumber floor (git reports ${count} commits)` };
+  }
+  return { value: count, note: `build number ${count} derived from git commit count` };
+}
+
+/** The bundle id a config may legally contribute to native files — same shape rule as
+ *  {@link validateBuildConfig}'s BUILD_FIELD_RULES. An invalid id is REFUSED here (with a note)
+ *  rather than written everywhere: garbage in a pbxproj breaks the build in four files at once,
+ *  and the settings save already validates the field on its own path. */
+function usableIdentity(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const v = value.trim();
+  return /^[A-Za-z0-9._-]+$/.test(v) ? v : undefined;
+}
+
+function replaceAllIfMatches(text: string, re: RegExp, to: string): { text: string; changed: boolean } {
+  const next = text.replace(re, to);
+  return { text: next, changed: next !== text };
+}
+
+/** Sync `app.appId` / `app.appName` into every native file that carries them.
+ *
+ *  These were WRITE-ONCE before this heal existed: `cap add` baked them into the pbxproj,
+ *  build.gradle, strings.xml, Info.plist and capacitor.config.json at scaffold time, and
+ *  `ensureCapacitorConfig` deliberately never clobbers an existing file — so changing Project
+ *  Settings afterwards changed NOTHING anywhere (the audit that added this, 2026-08-25).
+ *
+ *  ⚠️ **A changed appId is a NEW app to both stores** — previously uploaded builds and installed
+ *  updates no longer connect to it. That trade-off belongs to the owner, so the heal performs it
+ *  but says so loudly every time it rewrites an id. A name change is cosmetic and only noted.
+ *
+ *  Per-file, diff-before-write (a matching file is left byte-identical):
+ *   - capacitor.config.json   → `appId` / `appName`
+ *   - android/app/build.gradle → `applicationId "…"` (NOT `namespace` — that is the code
+ *     package and renaming it strands MainActivity's package path)
+ *   - android strings.xml      → `package_name` + `custom_url_scheme` (id),
+ *     `app_name` + `title_activity_main` (name); AndroidManifest labels reference these
+ *   - iOS pbxproj              → `PRODUCT_BUNDLE_IDENTIFIER` (every build configuration);
+ *     Info.plist's CFBundleIdentifier reads it via `$(PRODUCT_BUNDLE_IDENTIFIER)`
+ *   - iOS Info.plist           → `CFBundleDisplayName` (name) */
+export function healAppIdentity(projectRoot: string, appId: unknown, appName: unknown): string[] {
+  const notes: string[] = [];
+  const id = usableIdentity(appId);
+  const name = typeof appName === 'string' && appName.trim() ? appName.trim() : undefined;
+  if (appId != null && id === undefined) notes.push(`REFUSED to sync app.appId ${JSON.stringify(appId)}: not a valid bundle id (letters, digits, dots, dashes, underscores only).`);
+  if (!id && !name) return notes;
+
+  /** The app's PREVIOUS bundle id — the anchor that keeps the rewrite scoped. The pbxproj may
+   *  legitimately carry OTHER targets' ids (`com.x.y.widget` for an extension) and a gradle
+   *  file may carry flavour ids (`com.x.y.free`); replacing every occurrence would silently
+   *  rename those to the app's id and break their embedding. Only values equal to the old id
+   *  move. Sourced from capacitor.config.json — the same file `cap add` baked the native
+   *  ids FROM — so when it is unreadable there is no safe anchor and the id half is SKIPPED
+   *  with a note rather than guessed. */
+  let oldId: string | undefined;
+  let idChangedFrom: string | undefined;
+  let idSkipNoted = false;
+
+  /** Per-file guard: one unreadable/unwritable file must not abort the heals AFTER identity
+   *  (orientation, game-mode, crashlytics…) the way a throw through main()'s outer catch
+   *  would — partial state plus a generic "heal skipped" note hid both the failure and what
+   *  it prevented. Each file reports its own failure; the pass continues. */
+  const guarded = (label: string, fn: () => void): void => {
+    try {
+      fn();
+    } catch (e) {
+      notes.push(`${label} sync failed (${e instanceof Error ? e.message : String(e)}) — remaining identity files were still attempted`);
+    }
+  };
+
+  // capacitor.config.json — parsed + rewritten as JSON so any shape survives; this file IS
+  // machine-generated (ensureCapacitorConfig writes JSON.stringify(…, null, 2)), so comparing
+  // SERIALIZED forms is fair: only a real field change produces a diff.
+  const capPath = path.join(projectRoot, 'capacitor.config.json');
+  guarded('capacitor.config.json', () => {
+    if (!fs.existsSync(capPath)) return;
+    try {
+      const json = JSON.parse(fs.readFileSync(capPath, 'utf8')) as Record<string, unknown>;
+      const before = JSON.stringify(json, null, 2) + '\n';
+      if (typeof json.appId === 'string' && json.appId) oldId = json.appId;
+      if (id && json.appId !== id) {
+        if (typeof json.appId === 'string' && json.appId) idChangedFrom = json.appId;
+        json.appId = id;
+      }
+      if (name && json.appName !== name) json.appName = name;
+      const out = JSON.stringify(json, null, 2) + '\n';
+      if (out !== before) {
+        fs.writeFileSync(capPath, out);
+        notes.push('synced capacitor.config.json identity');
+      }
+    } catch {
+      notes.push('capacitor.config.json exists but does not parse — identity not synced there');
+    }
+  });
+
+  /** Scoped id replacement for gradle/pbxproj. Returns whether anything moved. */
+  const replaceScoped = (text: string, re: RegExp, to: string): { text: string; changed: boolean } => {
+    const next = text.replace(re, to);
+    return { text: next, changed: next !== text };
+  };
+  /** Emit once, not per file, when the old id could not be anchored. */
+  const noteIdSkipped = (): void => {
+    if (idSkipNoted) return;
+    idSkipNoted = true;
+    notes.push('cannot determine this project\'s previous bundle id (capacitor.config.json missing or unreadable) — applicationId/PRODUCT_BUNDLE_IDENTIFIER NOT rewritten; fix or restore capacitor.config.json first');
+  };
+
+  // Android half.
+  const gradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  guarded('build.gradle', () => {
+    if (!fs.existsSync(gradle)) return;
+    const orig = fs.readFileSync(gradle, 'utf8');
+    let text = orig;
+    if (id) {
+      if (!oldId) noteIdSkipped();
+      else {
+        const r = replaceScoped(text, new RegExp(`applicationId\\s+"${oldId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`, 'g'), `applicationId "${id}"`);
+        if (r.changed) {
+          text = r.text;
+          idChangedFrom = idChangedFrom ?? oldId;
+          notes.push('synced applicationId (build.gradle)');
+        }
+      }
+    }
+    if (text !== orig) fs.writeFileSync(gradle, text);
+  });
+  const strings = path.join(projectRoot, 'android', 'app', 'src', 'main', 'res', 'values', 'strings.xml');
+  guarded('strings.xml', () => {
+    if (!fs.existsSync(strings)) return;
+    const orig = fs.readFileSync(strings, 'utf8');
+    let text = orig;
+    if (id) {
+      // package_name / custom_url_scheme ARE the app id by definition — no scoping needed.
+      text = text.replace(/(<string name="package_name">)[^<]*(<\/string>)/g, `$1${id}$2`);
+      text = text.replace(/(<string name="custom_url_scheme">)[^<]*(<\/string>)/g, `$1${id}$2`);
+    }
+    if (name) {
+      text = text.replace(/(<string name="app_name">)[^<]*(<\/string>)/g, `$1${name}$2`);
+      text = text.replace(/(<string name="title_activity_main">)[^<]*(<\/string>)/g, `$1${name}$2`);
+    }
+    if (text !== orig) {
+      fs.writeFileSync(strings, text);
+      notes.push('synced strings.xml identity (app_name/package_name)');
+    }
+  });
+
+  // iOS half.
+  const pbx = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  guarded('pbxproj', () => {
+    if (!fs.existsSync(pbx)) return;
+    const orig = fs.readFileSync(pbx, 'utf8');
+    if (id) {
+      if (!oldId) noteIdSkipped();
+      else {
+        const esc = oldId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const r = replaceScoped(orig, new RegExp(`PRODUCT_BUNDLE_IDENTIFIER = ${esc};`, 'g'), `PRODUCT_BUNDLE_IDENTIFIER = ${id};`);
+        if (r.changed) {
+          fs.writeFileSync(pbx, r.text);
+          idChangedFrom = idChangedFrom ?? oldId;
+          notes.push('synced PRODUCT_BUNDLE_IDENTIFIER (pbxproj)');
+        }
+      }
+    }
+  });
+  const plist = path.join(projectRoot, 'ios', 'App', 'App', 'Info.plist');
+  guarded('Info.plist', () => {
+    if (!fs.existsSync(plist) || !name) return;
+    const orig = fs.readFileSync(plist, 'utf8');
+    const { text, changed } = replaceAllIfMatches(
+      orig,
+      /(<key>CFBundleDisplayName<\/key>\s*<string>)[^<]*(<\/string>)/g,
+      `$1${name}$2`,
+    );
+    if (changed) {
+      fs.writeFileSync(plist, text);
+      notes.push('synced CFBundleDisplayName (Info.plist)');
+    }
+  });
+
+  if (idChangedFrom) {
+    notes.push(
+      `WARNING: bundle id changed ${idChangedFrom} -> ${id} — to both stores this is a NEW app; ` +
+      'previously uploaded builds and installed updates no longer connect to it.',
+    );
+  }
+  return notes;
+}
+
 /** Sync the Android marketing version + build number from `app.version` / `app.buildNumber`.
  *
  *  ⚠️ **`versionCode` is never LOWERED.** Play refuses a `versionCode` it has already seen and
@@ -1849,11 +2071,17 @@ export function healNativeConfig(projectRoot: string): HealResult {
     if (ams) notes.push(ams);
     // App version + build number → both platforms' native version fields (#199). Nothing
     // managed these before, so every project shipped the scaffolder's hardcoded 1 — and a
-    // duplicate build number is refused SILENTLY by both stores.
-    const av = healAndroidVersion(projectRoot, cfg.app.version, cfg.app.buildNumber);
+    // duplicate build number is refused SILENTLY by both stores. `buildNumberAuto` decides
+    // whether the number comes from the typed field or the repo's commit count.
+    const bn = resolveBuildNumber(projectRoot, cfg);
+    if (bn.note) notes.push(bn.note);
+    const av = healAndroidVersion(projectRoot, cfg.app.version, bn.value);
     if (av) notes.push(av);
-    const iv = healIosVersion(projectRoot, cfg.app.version, cfg.app.buildNumber);
+    const iv = healIosVersion(projectRoot, cfg.app.version, bn.value);
     if (iv) notes.push(iv);
+    // App identity → EVERY native file that carries it. Write-once at `cap add` before this:
+    // changing Project Settings afterwards silently changed nothing anywhere.
+    for (const n of healAppIdentity(projectRoot, cfg.app.appId, cfg.app.appName)) notes.push(n);
     // Orientation + status bar → native Info.plist / AndroidManifest.
     const io = healIosOrientationStatusBar(projectRoot, cfg.capacitor);
     if (io) notes.push(io);

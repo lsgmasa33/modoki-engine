@@ -9,22 +9,12 @@ import { Transient } from '../traits/Transient';
 import { isSimRunning } from '../playState';
 import { inSystemTick } from '../systemTick';
 import { noteAuthoredWriteWhileStopped } from './authoredWrites';
-
-// Pluggable dirty listeners — multiple systems (uiTreeStore, the editor's
-// Canvas2DLayer) register callbacks to be notified on any ECS trait write.
-const _dirtyListeners: Set<() => void> = new Set();
-/** Register a dirty listener. Returns an unsubscribe function. */
-export function addDirtyListener(fn: () => void): () => void {
-  _dirtyListeners.add(fn);
-  return () => { _dirtyListeners.delete(fn); };
-}
-/** Fire ALL registered dirty listeners (NOT UI-specific — it just notifies every
- *  subscriber, one of which is uiTreeStore.markUIDirty). Renamed from the former
- *  `markUIDirty` to end the name collision with the UI-flag setter of the same name
- *  in uiTreeStore (F7). Use after a direct trait write that bypasses writeTraitField
- *  (e.g. a bulk `entity.set` from a gizmo drag), so the Inspector and other subscribers
- *  refresh. writeTraitField already calls this internally. */
-export function fireDirtyListeners() { for (const fn of _dirtyListeners) fn(); }
+// Re-exported for backward compatibility — every existing caller imports these from here.
+// The implementation lives in `renderDirty.ts` (a side-effect-free L0 module) so a module
+// that only needs the dirty signal (e.g. `loaders/assetManifest.ts`) doesn't have to import
+// this file's `setStructureCallback` wiring below just to reach it.
+import { addDirtyListener, fireDirtyListeners } from '../renderDirty';
+export { addDirtyListener, fireDirtyListeners };
 
 // Structure-dirty subscriber set — notifies Hierarchy, Console, etc. when
 // entities are created, deleted, or reparented. Multiple subscribers supported.

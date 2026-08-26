@@ -9,7 +9,8 @@
  *  The rig TYPES + normalization moved to `skinning/rig2dTypes.ts` (P7 C13) — re-exported
  *  here for existing callers. This file keeps only the fetch/cache lifecycle. */
 
-import { resolveRef, isGuid, registerAsset } from './assetManifest';
+import { isGuid, registerAsset } from './assetManifest';
+import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { normalizeRig2D, type Rig2DFile, type ParsedRig2D } from '../skinning/rig2dTypes';
 import { parseAssetJson } from './assetFetch';
@@ -43,12 +44,14 @@ const sourceCache = new Map<string, Rig2DFile>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
 let generation = 0;
+// Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here.
+const unknownGuidSeen = new Set<string>();
 
 /** Resolve a cache key. A GUID resolves through the manifest; the editor seeds /
  *  invalidates by file path directly (like spriteAnimCache). */
 function rig2dCacheKey(refOrPath: string): string | undefined {
   if (!refOrPath) return undefined;
-  return isGuid(refOrPath) ? resolveRef(refOrPath) : refOrPath;
+  return isGuid(refOrPath) ? resolveRefWarnOnce(refOrPath, 'rig2dCache', unknownGuidSeen) : refOrPath;
 }
 
 /** Resolve a rig ref to its parsed rig, or null if not yet loaded. Kicks off a lazy

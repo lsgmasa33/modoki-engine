@@ -802,8 +802,10 @@ same actions + state a person has in the editor. They relay to the renderer over
   to `get_scene_state`). `modoki_get_console_logs` — renderer console + uncaught errors.
 - **Eval live renderer state:** `modoki_eval` — run JS in the editor RENDERER and get the value back
   (the editor twin of `device_eval`). For reading/poking live state a file read can't see — a global
-  (`window.__3d`), `devicePixelRatio`, a React fiber value, WGSL validation, dispatching a bridge
-  event. Runs as an **async** function body (`return x`; `await` is allowed — see below); return a
+  (`window.__3d` for the Three.js GameView, `window.__2d` for the PixiJS one — both GameView ONLY,
+  not the editor SceneView, which has its own separate surface), `devicePixelRatio`, a React fiber
+  value, WGSL validation, dispatching a bridge event. Runs as an **async** function body (`return x`;
+  `await` is allowed — see below); return a
   PROJECTION for anything large/circular. This
   is what removed most of the "stand up a raw CDP client" cases below. *(Electron editor only.)*
   - **`await` works on BOTH eval surfaces** (`modoki_eval` and `device_eval`) — the body is compiled

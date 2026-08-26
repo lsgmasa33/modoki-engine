@@ -81,6 +81,55 @@ describe('registerAsset / resolveGuidToPath / getGuidForPath', () => {
     expect(resolveGuidToPath(newGuid())).toBeUndefined();
     expect(getAssetType(newGuid())).toBeUndefined();
   });
+
+  // Close-out review of QA-ASSET-0005's fix: `unregisterAsset` marks a frame dirty on delete, but
+  // a RESTORE (undo, or a re-import that re-adds a guid the idle-gated renderer still remembers
+  // as broken) went through `registerAsset`, which fired nothing — so an entity whose ref went
+  // stale during a delete stayed on its "unresolved" fallback even after the asset came back,
+  // until an unrelated dirty event. `registerAsset` now fires on a genuinely NEW/changed
+  // registration, mirroring `bumpTextureEpoch`'s existing "not on a no-op re-register" discipline
+  // so a wholesale manifest rebroadcast doesn't fire on every unchanged asset.
+  describe('registerAsset fires the shared dirty-listener set (QA-ASSET-0005 follow-up)', () => {
+    it('fires when a guid is registered for the first time (the restore-after-delete case)', async () => {
+      const { addDirtyListener } = await import('../../src/runtime/core/renderDirty');
+      const fired = vi.fn();
+      const unsub = addDirtyListener(fired);
+      try {
+        registerAsset(newGuid(), '/foo.mat.json', 'material');
+        expect(fired).toHaveBeenCalledTimes(1);
+      } finally {
+        unsub();
+      }
+    });
+
+    it('does NOT fire on an identical re-register (a wholesale manifest rebroadcast)', async () => {
+      const { addDirtyListener } = await import('../../src/runtime/core/renderDirty');
+      const g = newGuid();
+      registerAsset(g, '/foo.mat.json', 'material');
+      const fired = vi.fn();
+      const unsub = addDirtyListener(fired);
+      try {
+        registerAsset(g, '/foo.mat.json', 'material'); // same guid, same path, same type
+        expect(fired).not.toHaveBeenCalled();
+      } finally {
+        unsub();
+      }
+    });
+
+    it('fires when a re-register moves the path', async () => {
+      const { addDirtyListener } = await import('../../src/runtime/core/renderDirty');
+      const g = newGuid();
+      registerAsset(g, '/old.mat.json', 'material');
+      const fired = vi.fn();
+      const unsub = addDirtyListener(fired);
+      try {
+        registerAsset(g, '/new.mat.json', 'material');
+        expect(fired).toHaveBeenCalledTimes(1);
+      } finally {
+        unsub();
+      }
+    });
+  });
 });
 
 describe('unregisterAsset', () => {
@@ -103,6 +152,40 @@ describe('unregisterAsset', () => {
     registerAsset(g2, '/foo.mesh.json', 'mesh'); // overwrites path → g2
     unregisterAsset(g1); // should not touch /foo.mesh.json
     expect(getGuidForPath('/foo.mesh.json')).toBe(g2);
+  });
+
+  // QA-ASSET-0005 (third occurrence, 2026-08-25): the 3D idle render gate skips the whole
+  // ECS→Three sync once nothing has marked a frame dirty, and an asset delete is invisible to
+  // every dirty source it already listened to (trait writes, structure changes, play-state
+  // edges) — so `resolveMaterial`'s per-frame re-check of a bound-but-now-broken ref simply
+  // never ran again, and the "fixed" unknown-guid warning stayed silent. `unregisterAsset` must
+  // itself mark a frame dirty so the renderer (and Scene2D, which shares the same dirty-listener
+  // set) re-evaluates every ref on the very next frame.
+  it('fires the shared dirty-listener set so an idle-gated renderer re-checks refs (QA-ASSET-0005)', async () => {
+    const { addDirtyListener } = await import('../../src/runtime/core/renderDirty');
+    const fired = vi.fn();
+    const unsub = addDirtyListener(fired);
+    try {
+      const g = newGuid();
+      registerAsset(g, '/foo.mat.json', 'material');
+      fired.mockClear(); // registerAsset itself is not under test here
+      unregisterAsset(g);
+      expect(fired).toHaveBeenCalledTimes(1);
+    } finally {
+      unsub();
+    }
+  });
+
+  it('does NOT fire dirty listeners for an unknown guid (true no-op)', async () => {
+    const { addDirtyListener } = await import('../../src/runtime/core/renderDirty');
+    const fired = vi.fn();
+    const unsub = addDirtyListener(fired);
+    try {
+      unregisterAsset(newGuid());
+      expect(fired).not.toHaveBeenCalled();
+    } finally {
+      unsub();
+    }
   });
 });
 
@@ -275,6 +358,27 @@ describe('loadManifestJson — prune', () => {
     loadManifestJson(file([A, B]));
     loadManifestJson(file([A]));
     expect(getAllAssets().map((e) => e.guid).sort()).toEqual([A, B]);
+  });
+
+  // QA-ASSET-0005 (third occurrence): a dev-server rescan is the exact path a real asset
+  // delete + `/api/rescan-assets` takes, and it's the one the idle render gate could never see —
+  // so the prune has to mark a frame dirty itself.
+  it('marks a frame dirty when a rescan actually prunes a guid, not on a no-op rescan', async () => {
+    const { addDirtyListener } = await import('../../src/runtime/core/renderDirty');
+    const fired = vi.fn();
+    const unsub = addDirtyListener(fired);
+    try {
+      loadManifestJson(file([A, B]), { prune: true });
+      fired.mockClear();
+
+      loadManifestJson(file([A, B]), { prune: true }); // nothing changed
+      expect(fired).not.toHaveBeenCalled();
+
+      loadManifestJson(file([A]), { prune: true });    // B deleted on disk
+      expect(fired).toHaveBeenCalledTimes(1);
+    } finally {
+      unsub();
+    }
   });
 
   it('never prunes a guid the client registered itself', () => {

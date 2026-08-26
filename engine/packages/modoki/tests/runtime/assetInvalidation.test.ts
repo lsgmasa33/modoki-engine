@@ -52,6 +52,21 @@ describe('emitAssetInvalidated', () => {
     expect(warn).toHaveBeenCalled();
     warn.mockRestore();
   });
+
+  // QA-ASSET-0005's sibling, close-out sweep: a re-import landing while the 3D/2D render loop
+  // is idle-gated is exactly as invisible to it as an asset DELETE was (the bug this mirrors),
+  // unless something marks a frame dirty. `unregisterAsset` covers delete; this covers re-import.
+  it('marks a frame dirty on every emit, even with zero listeners subscribed', async () => {
+    const { addDirtyListener } = await import('../../src/runtime/core/renderDirty');
+    const fired = vi.fn();
+    const unsub = addDirtyListener(fired);
+    try {
+      emitAssetInvalidated('model', '/x.glb');
+      expect(fired).toHaveBeenCalledTimes(1);
+    } finally {
+      unsub();
+    }
+  });
 });
 
 describe('the caches emit through it', () => {

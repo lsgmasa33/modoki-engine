@@ -140,6 +140,21 @@ push `speedScale`, and `update` on the **visual delta** scaled by `playbackSpeed
 
 ## Gotchas
 
+- **2D `startSize` is a TEXTURE MULTIPLIER, not a pixel size.** The Pixi backend copies the
+  sim's scale straight onto `Particle.scaleX/scaleY` (`pixiParticleMap.ts`), so rendered height
+  = `startSize × textureHeight` in design px (both position and size live under the single
+  canvas-slot scale, so the result is device-independent). A 64×128 strip at `startSize: 0.2`
+  renders ~26 design px tall. Authoring `startSize: 28` "as pixels" renders the texture at 28×
+  — a full-screen wash. The 3D backends are the opposite: `startSize` there IS world units.
+- **Untextured 2D particles render as soft round blobs** — the default texture is a radial
+  alpha falloff (`pixiParticleObject.ts`), so "plain coloured squares" is not what you get.
+  Confetti/paper effects need a real strip texture (`render.texture`), authored near-white so
+  `startColor` multiplies it cleanly.
+- **2D `render.renderOrder` must exceed the canvas's whole paint rank.** A Canvas2D slot sorts
+  children by zIndex, and every Renderable2D's zIndex is a DENSE rank over ALL entities
+  (`computePaintOrder`: orderInLayer primary, hierarchy DFS tiebreak) — on a real board that
+  runs well past 100, so `renderOrder: 100` lands mid-board and the effect draws behind cells.
+  Use ~1e6 (Scene2D's own "above every sprite" idiom is 1e9).
 - **CPU is deterministic; GPU is not headless-testable.** Only the CPU sim can be driven headless
   with a fixed seed. GPU↔CPU parity is maintained *by construction* via `simSpec.ts` transcription,
   not by a test — so edits to the shared math must touch both sides. `simSpec.ts`, `emitterShapes.ts`,

@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   getRig2D, getRig2DSource, setRig2D, invalidateRig2D, clearRig2DCache, type Rig2DFile,
 } from '../../src/runtime/loaders/rig2dCache';
+import { clearManifest, newGuid } from '../../src/runtime/loaders/assetManifest';
 
 const MINIMAL_RIG: Rig2DFile = {
   bones: [{ name: 'root', parent: -1, x: 0, y: 0, rot: 0 }],
@@ -17,6 +18,7 @@ const MINIMAL_RIG: Rig2DFile = {
 
 beforeEach(() => {
   clearRig2DCache();
+  clearManifest();
   vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('no network in test'))));
 });
 afterEach(() => {
@@ -98,5 +100,20 @@ describe('getRig2DSource — the AUTHORED doc, not the parsed rig (QA-ASSET-0015
     setRig2D(PATH, AUTHORED);
     clearRig2DCache();
     expect(getRig2DSource(PATH)).toBeNull();
+  });
+});
+
+// Close-out sweep of QA-ANIM-0018 (animationClipCache's fix): every sibling `*Cache` module
+// shared the same `isGuid(ref) ? resolveRef(ref) : ref` cache-key helper, silently returning
+// undefined for a guid absent from the manifest with no warning at all.
+describe('rig2dCache — unresolved guid warns once (parity with animationClipCache)', () => {
+  it('warns once for a guid absent from the manifest', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const guid = newGuid();
+    expect(getRig2D(guid)).toBeNull();
+    expect(getRig2D(guid)).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain(guid);
+    warn.mockRestore();
   });
 });

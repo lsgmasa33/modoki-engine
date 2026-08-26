@@ -436,6 +436,12 @@ export interface ProjectSettingsField {
    *  `key` (a dot-path into the settings object) is one of `in`. Used e.g. to
    *  show the GCS/CDN fields only in the matching web-deploy mode. */
   showIf?: { key: string; in: string[] };
+  /** Conditional EDITABILITY: grey the control out while the value at `key`
+   *  equals `is` (compared as String(), so a checkbox's `true` matches `'true'`),
+   *  without hiding it. Used when an override makes the field inert but the
+   *  stored value still matters — e.g. the build number under the auto
+   *  checkbox: hidden entirely, you could not see what floor you'd fall back to. */
+  disabledIf?: { key: string; is: string };
 }
 
 /** One group of fields inside a Project Settings tab. */

@@ -9,14 +9,24 @@
  *  outcome. A single registry keyed by `kind` means the next invalidatable asset
  *  kind adds an emit call and nothing else.
  *
- *  L0 on purpose: it imports nothing, so every cache module in L3 `loaders/` can
- *  emit through it without an import cycle between them.
+ *  L0 on purpose: importing only the equally side-effect-free `renderDirty.ts` (see below), so
+ *  every cache module in L3 `loaders/` can emit through it without an import cycle between them.
  *
  *  Listeners run BEFORE the emitting cache evicts anything. That ordering is
  *  load-bearing for models — a renderer must drop its live THREE.Mesh references
  *  before the underlying GPU geometry is disposed, or the next render dies on a
  *  freed buffer. Texture and audio have no such constraint, but they keep the
- *  same ordering: one rule to reason about beats three. */
+ *  same ordering: one rule to reason about beats three.
+ *
+ *  Also fires the shared render-dirty signal (QA-ASSET-0005's sibling): the 3D/2D idle render
+ *  gates only re-run their per-frame ref checks when SOMETHING marks a frame dirty, and a
+ *  re-import landing while the surface is idle is exactly as invisible to them as an asset
+ *  DELETE was — same root cause, different trigger (`unregisterAsset` covers delete;
+ *  `emitAssetInvalidated` covers re-import). Without this, a model/texture/audio re-import
+ *  during an idle Play/GameView would silently wait for an unrelated dirty event before the new
+ *  bytes ever got drawn. */
+
+import { fireDirtyListeners } from './renderDirty';
 
 export type InvalidatedAssetKind = 'model' | 'texture' | 'audio' | 'environment';
 
@@ -60,6 +70,7 @@ export function emitAssetInvalidated(
     try { fn(kind, path, targets); }
     catch (e) { console.warn(`[assetInvalidation] ${kind} listener threw:`, e); }
   }
+  fireDirtyListeners();
 }
 
 /** Test teardown only — drop every subscription. Production code unsubscribes

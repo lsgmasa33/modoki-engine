@@ -24,7 +24,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { UI_SURFACE_GAME, UI_SURFACE_SCENE_VIEW } from '../../app/debug/uiSurface';
-import { entitySpec } from '../../tools/modoki-mcp/src/shapes';
+import { makeEntitySpec } from '../../tools/modoki-mcp/src/shapes';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BOUNDS_SURFACE_SRC = path.resolve(
@@ -50,7 +50,7 @@ function backendSurfaces(): string[] {
 
 /** The names the MCP tool schema will actually accept, read off the live zod enum. */
 function schemaSurfaces(): string[] {
-  const shape = (entitySpec as unknown as { shape: Record<string, unknown> }).shape;
+  const shape = (makeEntitySpec() as unknown as { shape: Record<string, unknown> }).shape;
   const field = shape.surface as { _def: { innerType?: { _def: { values: string[] } } } };
   // `.optional()` wraps the enum, so unwrap before reading its values.
   const values = field._def.innerType?._def.values;

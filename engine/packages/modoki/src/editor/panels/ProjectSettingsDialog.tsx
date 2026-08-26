@@ -39,11 +39,15 @@ const browseBtn: React.CSSProperties = {
   color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12, whiteSpace: 'nowrap',
 };
 
-function Field({ field, value, onChange, onPick }: {
+function Field({ field, value, onChange, onPick, disabled }: {
   field: ProjectSettingsField;
   value: unknown;
   onChange: (v: unknown) => void;
   onPick?: (mode: 'file' | 'folder') => Promise<string | null>;
+  /** Rendered inert but still visible — the stored value stays readable (see
+   *  `disabledIf`). Native `disabled`, not just dimming, so keyboard focus and
+   *  wheel-step can't reach a control that would write an ignored value. */
+  disabled?: boolean;
 }) {
   const label = (
     <div style={{ color: '#aaa', fontSize: 11, marginBottom: 3 }}>
@@ -53,12 +57,15 @@ function Field({ field, value, onChange, onPick }: {
   );
 
   const uiId = `projectSettings.${field.key}`;
+  const dimStyle: React.CSSProperties | undefined = disabled
+    ? { opacity: 0.45, cursor: 'default' }
+    : undefined;
 
   switch (field.type) {
     case 'checkbox':
       return (
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#ddd', fontSize: 12 }}>
-          <input data-ui-id={uiId} data-ui-kind="toggle" data-ui-label={field.label} data-ui-state={value ? 'checked' : 'unchecked'} type="checkbox" checked={Boolean(value)} onChange={(e) => onChange(e.target.checked)} />
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#ddd', fontSize: 12, ...(dimStyle ?? {}) }}>
+          <input data-ui-id={uiId} data-ui-kind="toggle" data-ui-label={field.label} data-ui-state={value ? 'checked' : 'unchecked'} type="checkbox" checked={Boolean(value)} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
           {field.label}
           {field.help && <span style={{ color: '#666' }}>{field.help}</span>}
         </label>
@@ -66,14 +73,14 @@ function Field({ field, value, onChange, onPick }: {
     case 'number':
       return (
         <div>{label}
-          <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} type="number" style={inputStyle} value={value == null || value === '' ? '' : Number(value)}
-            placeholder={field.placeholder} onChange={(e) => onChange(e.target.value === '' ? '' : Number(e.target.value))} />
+          <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} type="number" style={{ ...inputStyle, ...(dimStyle ?? {}) }} value={value == null || value === '' ? '' : Number(value)}
+            placeholder={field.placeholder} disabled={disabled} onChange={(e) => onChange(e.target.value === '' ? '' : Number(e.target.value))} />
         </div>
       );
     case 'select':
       return (
         <div>{label}
-          <select data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} style={inputStyle} value={String(value ?? '')} onChange={(e) => onChange(e.target.value)}>
+          <select data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} style={{ ...inputStyle, ...(dimStyle ?? {}) }} value={String(value ?? '')} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
             {(field.options ?? []).map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
         </div>
@@ -306,6 +313,7 @@ export default function ProjectSettingsDialog() {
                       .map((field) => (
                         <Field key={field.key} field={field} value={getByPath(draft, field.key)}
                           onPick={schema.pickPath}
+                          disabled={field.disabledIf !== undefined && String(getByPath(draft, field.disabledIf.key) ?? '') === field.disabledIf.is}
                           onChange={(v) => setDraft((d) => (d ? setByPath(d, field.key, v) : d))} />
                       ))}
                   </div>

@@ -19,12 +19,17 @@
 
 import type { PixiShaderProgram } from '../rendering/pixiShaderBuilder';
 import { buildPixiShaderProgram } from '../rendering/pixiShaderBuilder';
-import { resolveRef } from './assetManifest';
+import { resolveRefWarnOnce } from './modelGlbUrl';
 
 const programs = new Map<string, PixiShaderProgram>(); // guid → resolved program
 const loading = new Map<string, Promise<void>>();      // guid → in-flight compile
 const waiters = new Map<string, Set<() => void>>();    // guid → onReady wakes awaiting the in-flight compile
 const failed = new Set<string>();                      // guid → compile returned null (don't retry every frame)
+// Parity fix, close-out sweep of QA-ANIM-0018: `resolveRef` never warns for a validly-shaped
+// guid simply absent from the manifest — the comment below claiming "resolveRef already warned"
+// was wrong. Separate from `failed` above: this one forgets a guid once it resolves (so a LATER
+// genuine break warns again), where `failed` intentionally stays sticky until a world swap.
+const unknownGuidSeen = new Set<string>();
 
 /** The resolved program for a material GUID, or undefined if not (yet) available. */
 export function getSpriteMaterialProgram(guid: string): PixiShaderProgram | undefined {
@@ -55,8 +60,8 @@ export function ensureSpriteMaterial(guid: string, onReady?: () => void): PixiSh
     return undefined;
   }
 
-  const path = resolveRef(guid);
-  if (!path) { failed.add(guid); return undefined; } // unresolved GUID — resolveRef already warned
+  const path = resolveRefWarnOnce(guid, 'spriteMaterialCache', unknownGuidSeen);
+  if (!path) { failed.add(guid); return undefined; } // unresolved GUID — warned once above
 
   const set = new Set<() => void>();
   if (onReady) set.add(onReady);

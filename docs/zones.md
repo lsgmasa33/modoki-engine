@@ -52,8 +52,11 @@ you want the CENTRE to be, not by matching a sensor you are replacing.
 
 For every enter and exit, `zone2DSystem` / `zone3DSystem` fan out to:
 
-1. **Journal** — `emit('@zone', { zone, other, phase })`. `zone`/`other` use `entityRef` (a stable
-   GUID when the entity has one, else its numeric id), so a trace survives scene hot-reloads. Read it
+1. **Journal** — `emit('@zone', { zone, other, phase })`. `zone`/`other` use a stable GUID when the
+   entity is still alive, else the numeric id CACHED at the moment it entered the zone — never
+   re-derived from a handle that may have despawned (koota's `has()`/`get()` don't check
+   generation, so re-deriving from a dead handle can silently resolve to whatever unrelated
+   entity later reclaimed its index; mirrors `physicsContactEvents.refOf`). Read the journal
    headlessly with `tw.events({ type: '@zone' })`. This is the Percept-verifiable path — assert on
    events, not pixels.
 2. **Event bus** (`zone2DEvents` / `zone3DEvents`) — subscribe in code:

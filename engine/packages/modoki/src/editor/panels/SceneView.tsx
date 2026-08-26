@@ -906,12 +906,16 @@ function gizmo2DBoxFor(entity: ReturnType<typeof findEntity>, allTraits: ReturnT
     halfW = rend.width; halfH = rend.height; ok = true;
   } else {
     const ssMeta = allTraits.find((t) => t.name === 'SkinnedSprite2D');
+    const peMeta = allTraits.find((t) => t.name === 'ParticleEmitter');
     if (ssMeta && entity.has(ssMeta.trait)) {
       const buf = getSkin2DBuffer(entity.id());
       if (buf) for (const part of buf.parts) for (let i = 0; i < part.positions.length; i += 2) {
         halfW = Math.max(halfW, Math.abs(part.positions[i])); halfH = Math.max(halfH, Math.abs(part.positions[i + 1]));
       }
       ok = true;
+    } else if (peMeta && entity.has(peMeta.trait)) {
+      // No visual box of its own — a fixed icon-sized box, same idiom as Bone2D.
+      halfW = 4; halfH = 4; ok = true;
     } else {
       const tbox = text2DGizmoBox(entity, allTraits.find((t) => t.name === 'Text2D'));
       if (tbox) { halfW = tbox.halfW; halfH = tbox.halfH; ok = true; }
@@ -1186,6 +1190,18 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
           candidates.push({ id: eid, wx, wy, wsx, wsy, width: tbox.halfW, height: tbox.halfH, pivotX: tbox.pivotX, pivotY: tbox.pivotY, order: paintOrder.get(eid) ?? 0 });
         });
       }
+      // ParticleEmitter bodies pick by the same fixed icon box the gizmo now draws for them
+      // (#332) — they carry no Renderable2D either, so without this a click on a particle
+      // emitter's icon selected nothing (only the Hierarchy row could select it).
+      const peMetaPick = allTraits.find((t) => t.name === 'ParticleEmitter');
+      if (peMetaPick) {
+        getCurrentWorld().query(transformMeta.trait, peMetaPick.trait).updateEach(([tf]: any, entity: any) => {
+          const eid = entity.id();
+          if (deactivatedEntities.has(eid) || !ownedByThisCanvas(eid)) return;
+          const { x: wx, y: wy, sx: wsx, sy: wsy } = getWorldTransform2D(eid, tf);
+          candidates.push({ id: eid, wx, wy, wsx, wsy, width: 4, height: 4, pivotX: 0.5, pivotY: 0.5, order: paintOrder.get(eid) ?? 0 });
+        });
+      }
       const bestId = pick2D(px, py, candidates);
       if (bestId !== null) return bestId;
 
@@ -1291,6 +1307,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
           // (deformed-mesh AABB), or Bone2D (a point — rotate/translate to pose it).
           const ssMetaG = allTraits.find((t) => t.name === 'SkinnedSprite2D');
           const boneMetaG = allTraits.find((t) => t.name === 'Bone2D');
+          const peMetaG = allTraits.find((t) => t.name === 'ParticleEmitter');
           let gw = 0, gh = 0, canGizmo = false;
           if (entity.has(r2dMeta.trait)) {
             const rend = entity.get(r2dMeta.trait); gw = rend.width; gh = rend.height; canGizmo = true;
@@ -1299,6 +1316,8 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
             if (buf) for (const part of buf.parts) for (let i = 0; i < part.positions.length; i += 2) { gw = Math.max(gw, Math.abs(part.positions[i])); gh = Math.max(gh, Math.abs(part.positions[i + 1])); }
             canGizmo = true;
           } else if (boneMetaG && entity.has(boneMetaG.trait)) {
+            gw = 4; gh = 4; canGizmo = true;
+          } else if (peMetaG && entity.has(peMetaG.trait)) {
             gw = 4; gh = 4; canGizmo = true;
           } else {
             const t2d = allTraits.find((t) => t.name === 'Text2D');
@@ -1872,6 +1891,19 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
             selectedW = tbox.halfW; selectedH = tbox.halfH;
             selectedPivotX = tbox.pivotX; selectedPivotY = tbox.pivotY;
           }
+        }
+      }
+
+      // ParticleEmitter has a Transform but no Renderable2D box either — same reasoning as the
+      // Text2D fallback above (#332): a fixed icon-sized box, same idiom as Bone2D's point.
+      if (!selectedTf && currentSelectedId !== null) {
+        const peMeta = allTraits.find((t) => t.name === 'ParticleEmitter');
+        const selEnt = peMeta ? findEntity(currentSelectedId) : null;
+        if (selEnt && peMeta && selEnt.has(peMeta.trait) && selEnt.has(transformMeta.trait)
+            && findCanvasAncestor(currentSelectedId, parentOf, canvasIds) === canvasEntityId) {
+          const wt = getWorldTransform2D(currentSelectedId, selEnt.get(transformMeta.trait) as never);
+          selectedTf = { x: wt.x, y: wt.y, rz: wt.rz, sx: wt.sx, sy: wt.sy };
+          selectedW = 4; selectedH = 4; selectedPivotX = 0.5; selectedPivotY = 0.5;
         }
       }
 

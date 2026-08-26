@@ -5,7 +5,8 @@
  * next frame. Timelines are plain data — nothing to GPU-dispose.
  */
 
-import { resolveRef, isGuid, registerAsset } from './assetManifest';
+import { isGuid, registerAsset } from './assetManifest';
+import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { normalizeTimeline, type TimelineDef } from '../timeline/types';
@@ -14,12 +15,14 @@ const cache = new Map<string, TimelineDef>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
 let generation = 0;
+// Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here.
+const unknownGuidSeen = new Set<string>();
 
 /** Resolve a cache key. A GUID resolves through the manifest; the editor seeds /
  *  invalidates by file path directly (like animationClipCache). */
 function timelineCacheKey(refOrPath: string): string | undefined {
   if (!refOrPath) return undefined;
-  return isGuid(refOrPath) ? resolveRef(refOrPath) : refOrPath;
+  return isGuid(refOrPath) ? resolveRefWarnOnce(refOrPath, 'timelineCache', unknownGuidSeen) : refOrPath;
 }
 
 /** Resolve a timeline ref to its parsed definition, or null if not yet loaded. */

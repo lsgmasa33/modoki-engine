@@ -188,6 +188,9 @@ engine/tsconfig.app.scoped.json
 # Claude Code local approvals / settings (machine-local, per-worktree)
 .claude/settings.local.json
 
+# opencode project config — pins THIS clone's backend/CDP ports (machine-local, per-worktree)
+.opencode/
+
 # stray archive of games/ (e.g. for copying a project OUT of the monorepo, #29) — never commit
 /games.zip
 
@@ -215,3 +218,6 @@ tools-scratch/boot-stall/trace.json
 # Generated at pack time by engine/scripts/stage-vite-config.cjs — the packaged editor's
 # CJS Vite config (#326). Regenerated on every pack; never committed, so it cannot drift.
 engine/vite.config.cjs
+
+# per-clone opencode config (pins THIS clone's backend port)
+opencode.json

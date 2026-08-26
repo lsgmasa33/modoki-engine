@@ -4,6 +4,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { healNativeConfig, androidSdkDirValue } from '../../plugins/healNativeConfig';
 // Read the floors from the schema rather than hardcoding them: this file asserts the WIRING
 // (the default reaches the heal at all). The floor VALUES are pinned, deliberately and with
@@ -2061,6 +2062,266 @@ describe('healNativeConfig — orientation + status bar', () => {
       // Assert the scaffolded values are actually GONE, not merely co-present.
       expect(fs.readFileSync(pbx, 'utf8')).not.toContain('15.0');
       expect(fs.readFileSync(gradle, 'utf8')).not.toContain('minSdkVersion = 24');
+    });
+  });
+
+  /** `app.buildNumberAuto = true` — the owner asked to stop hand-bumping the build
+   *  number per store upload. The commit count is derived per heal pass; `app.buildNumber`
+   *  stays as a FLOOR, and the never-lower guard keeps its role as the last line of defence. */
+  describe('build number source = git commits', () => {
+    const GRADLE = [
+      'android {',
+      '    defaultConfig {',
+      '        versionCode 1',
+      '        versionName "1.0"',
+      '    }',
+      '}',
+      '',
+    ].join('\n');
+    const PBX = [
+      'buildSettings = {',
+      '\tCURRENT_PROJECT_VERSION = 1;',
+      '\tMARKETING_VERSION = 1.0;',
+      '};',
+      '',
+    ].join('\n');
+    const gradlePath = () => path.join(root, 'android', 'app', 'build.gradle');
+    const pbxPath = () => path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    function writeNative(gradle = GRADLE, pbx = PBX) {
+      fs.mkdirSync(path.dirname(gradlePath()), { recursive: true });
+      fs.writeFileSync(gradlePath(), gradle);
+      fs.mkdirSync(path.dirname(pbxPath()), { recursive: true });
+      fs.writeFileSync(pbxPath(), pbx);
+    }
+    function writeCfg(app: Record<string, unknown>) {
+      fs.writeFileSync(path.join(root, 'project.config.json'), JSON.stringify({ app, build: {}, capacitor: {} }));
+    }
+    /** A REAL temp git repo with `commits` commits — rev-list --count against it is the
+     *  production code path end-to-end, not a mock of git's output shape. `-c commit.gpgsign=false`
+     *  because a machine with signing configured globally would otherwise fail every commit
+     *  here silently (count 0) and flake the derivation test; each call's status is asserted
+     *  so a fixture-setup failure is loud, never a vacuous pass. */
+    function gitRepoWithCommits(commits: number) {
+      const run = (args: string[]) => {
+        const r = spawnSync('git', ['-C', root, '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8' });
+        if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed (${r.status}): ${r.stderr}`);
+        return r;
+      };
+      run(['init']);
+      run(['config', 'user.email', 'test@example.com']);
+      run(['config', 'user.name', 'Test']);
+      for (let i = 0; i < commits; i++) {
+        fs.writeFileSync(path.join(root, `f${i}.txt`), String(i));
+        run(['add', `f${i}.txt`]);
+        run(['commit', '-m', `c${i}`]);
+      }
+    }
+
+    it('derives the build number from the commit count', () => {
+      writeNative();
+      gitRepoWithCommits(7);
+      writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 7');
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('CURRENT_PROJECT_VERSION = 7;');
+      expect(r.notes.join(' ')).toContain('derived from git commit count');
+    });
+
+    it('keeps app.buildNumber as a FLOOR above the commit count', () => {
+      writeNative();
+      gitRepoWithCommits(3);
+      writeCfg({ version: '1.0', buildNumber: 10, buildNumberAuto: true });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 10');
+      expect(r.notes.join(' ')).toContain('floor');
+    });
+
+    it('the never-lower guard still wins over a derived number', () => {
+      // The native project already uploaded at 50; the repo only has 3 commits. Writing 3
+      // would be exactly the silent Play rejection this whole heal exists to prevent.
+      writeNative(GRADLE.replace('versionCode 1', 'versionCode 50'), PBX.replace('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 50;'));
+      gitRepoWithCommits(3);
+      writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 50');
+      expect(r.notes.join(' ')).toContain('REFUSED to lower Android versionCode 50');
+    });
+
+    it('falls back to app.buildNumber (with a note) outside a git repo', () => {
+      writeNative();
+      writeCfg({ version: '1.0', buildNumber: 4, buildNumberAuto: true });
+      const r = healNativeConfig(root); // root is a bare tmpdir — no .git anywhere
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 4');
+      expect(r.notes.join(' ')).toContain('no commit count could be read');
+    });
+
+    it('auto OFF (the default) passes the typed value straight through', () => {
+      writeNative();
+      gitRepoWithCommits(30);
+      writeCfg({ version: '1.0', buildNumber: 2 }); // no buildNumberAuto field at all
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 2');
+      expect(r.notes.join(' ')).not.toContain('commit');
+    });
+  });
+
+  /** App identity heal — appId/appName were WRITE-ONCE at `cap add`: changing Project
+   *  Settings afterwards silently changed nothing in any native file (audit, 2026-08-25). */
+  describe('app identity (appId/appName) reaches every native file', () => {
+    const CAP = JSON.stringify({ appId: 'com.old.id', appName: 'Old Name', webDir: 'dist' }, null, 2) + '\n';
+    const GRADLE = [
+      'android {',
+      '    namespace "com.other.code"', // must NEVER move — renaming strands MainActivity's package
+      '    defaultConfig {',
+      '        applicationId "com.old.id"',
+      '    }',
+      '}',
+      '',
+    ].join('\n');
+    const STRINGS = [
+      '<?xml version=\'1.0\' encoding=\'utf-8\'?>',
+      '<resources>',
+      '    <string name="app_name">Old Name</string>',
+      '    <string name="title_activity_main">Old Name</string>',
+      '    <string name="package_name">com.old.id</string>',
+      '    <string name="custom_url_scheme">com.old.id</string>',
+      '</resources>',
+      '',
+    ].join('\n');
+    const PBX = [
+      'buildSettings = {',
+      '\tPRODUCT_BUNDLE_IDENTIFIER = com.old.id;',
+      '};',
+      'buildSettings = {',
+      '\tPRODUCT_BUNDLE_IDENTIFIER = com.old.id;',
+      '};',
+      '',
+    ].join('\n');
+    const PLIST = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+      '<plist version="1.0">',
+      '<dict>',
+      '\t<key>CFBundleDisplayName</key>',
+      '\t<string>Old Name</string>',
+      '</dict>',
+      '</plist>',
+      '',
+    ].join('\n');
+
+    const capPath = () => path.join(root, 'capacitor.config.json');
+    const gradlePath = () => path.join(root, 'android', 'app', 'build.gradle');
+    const stringsPath = () => path.join(root, 'android', 'app', 'src', 'main', 'res', 'values', 'strings.xml');
+    const pbxPath = () => path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    const plistPath = () => path.join(root, 'ios', 'App', 'App', 'Info.plist');
+    function writeNative() {
+      fs.mkdirSync(path.dirname(gradlePath()), { recursive: true });
+      fs.writeFileSync(gradlePath(), GRADLE);
+      fs.mkdirSync(path.dirname(stringsPath()), { recursive: true });
+      fs.writeFileSync(stringsPath(), STRINGS);
+      fs.mkdirSync(path.dirname(pbxPath()), { recursive: true });
+      fs.writeFileSync(pbxPath(), PBX);
+      fs.mkdirSync(path.dirname(plistPath()), { recursive: true });
+      fs.writeFileSync(plistPath(), PLIST);
+      fs.writeFileSync(capPath(), CAP);
+    }
+    function writeCfg(app: Record<string, unknown>) {
+      fs.writeFileSync(path.join(root, 'project.config.json'), JSON.stringify({ app, build: {}, capacitor: {} }));
+    }
+
+    it('syncs a changed appId/appName into ALL five files', () => {
+      writeNative();
+      writeCfg({ appId: 'com.new.id', appName: 'New Name' });
+      const r = healNativeConfig(root);
+      const all = [capPath(), gradlePath(), stringsPath(), pbxPath()].map((p) => fs.readFileSync(p, 'utf8')).join('\n')
+        + fs.readFileSync(plistPath(), 'utf8');
+      expect(all).not.toContain('com.old.id');
+      expect(all).not.toContain('Old Name');
+      expect(all.match(/com\.new\.id/g)!.length).toBeGreaterThanOrEqual(5); // cap cfg, gradle, strings ×2, pbx ×2
+      expect(all).toContain('New Name');
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('namespace "com.other.code"'); // untouched
+      expect(r.notes.join(' ')).toContain('WARNING: bundle id changed com.old.id -> com.new.id');
+    });
+
+    it('is a byte-identical no-op when everything already matches', () => {
+      writeNative();
+      writeCfg({ appId: 'com.old.id', appName: 'Old Name' });
+      healNativeConfig(root);
+      const once = [capPath(), gradlePath(), stringsPath(), pbxPath(), plistPath()]
+        .map((p) => fs.readFileSync(p, 'utf8')).join('|');
+      healNativeConfig(root);
+      expect([capPath(), gradlePath(), stringsPath(), pbxPath(), plistPath()]
+        .map((p) => fs.readFileSync(p, 'utf8')).join('|')).toBe(once);
+      expect(once).toContain('com.old.id'); // sanity: nothing rewrote it anyway
+    });
+
+    it('REFUSES an invalid bundle id instead of writing garbage into four files', () => {
+      writeNative();
+      writeCfg({ appId: 'not valid! id', appName: 'Fine Name' });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('"com.old.id"');
+      expect(r.notes.join(' ')).toContain('REFUSED to sync app.appId');
+    });
+
+    it('a name-only change does NOT fire the new-app warning', () => {
+      writeNative();
+      writeCfg({ appId: 'com.old.id', appName: 'Renamed' });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(plistPath(), 'utf8')).toContain('<string>Renamed</string>');
+      expect(r.notes.join(' ')).not.toContain('WARNING');
+    });
+
+    /** The rewrite is SCOPED to the old id: an extension target (`com.x.y.widget`) or a
+     *  gradle flavour (`com.x.y.free`) deliberately carries a DIFFERENT id in the same file,
+     *  and a blind replace-all would rename it to the app's id, breaking its embedding. */
+    it('does NOT touch sibling targets/flavour ids that differ from the app id', () => {
+      writeNative();
+      // An extension target + a flavour id alongside the app's own.
+      fs.writeFileSync(pbxPath(), PBX + 'buildSettings = {\n\tPRODUCT_BUNDLE_IDENTIFIER = com.old.id.widget;\n};\n');
+      fs.writeFileSync(gradlePath(), GRADLE.replace(
+        '    }',
+        '    }\n    productFlavors {\n        free {\n            applicationId "com.old.id.free"\n        }\n    }',
+      ));
+      writeCfg({ appId: 'com.new.id', appName: 'Old Name' });
+      const r = healNativeConfig(root);
+      const pbx = fs.readFileSync(pbxPath(), 'utf8');
+      expect(pbx).toContain('PRODUCT_BUNDLE_IDENTIFIER = com.new.id;');   // app configs moved
+      expect(pbx).toContain('PRODUCT_BUNDLE_IDENTIFIER = com.old.id.widget;'); // extension survived
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('applicationId "com.old.id.free"'); // flavour survived
+      expect(r.notes.join(' ')).toContain('WARNING: bundle id changed com.old.id -> com.new.id');
+    });
+
+    /** Without capacitor.config.json there is NO anchor for which pbxproj/gradle ids are the
+     *  APP's (vs an extension's), so the id half must be SKIPPED with a note — never guessed.
+     *  The name half needs no anchor and still syncs. */
+    it('skips the id rewrite (with a note) when no old-id anchor exists, name still syncs', () => {
+      writeNative();
+      fs.rmSync(capPath());
+      writeCfg({ appId: 'com.new.id', appName: 'Renamed' });
+      const r = healNativeConfig(root);
+      // gradle + pbxproj carry the app id AND sibling/flavour ids — no anchor, no rewrite.
+      const unanchored = fs.readFileSync(gradlePath(), 'utf8') + fs.readFileSync(pbxPath(), 'utf8');
+      expect(unanchored).not.toContain('com.new.id');
+      expect(unanchored).toContain('com.old.id');
+      // strings.xml keys ARE the app id by name — no anchor needed there.
+      expect(fs.readFileSync(stringsPath(), 'utf8')).toContain('package_name">com.new.id<');
+      expect(fs.readFileSync(plistPath(), 'utf8')).toContain('<string>Renamed</string>');
+      expect(r.notes.join(' ')).toContain('cannot determine this project\'s previous bundle id');
+      expect(r.notes.join(' ')).not.toContain('WARNING: bundle id changed');
+    });
+
+    /** Per-file guard: one unreadable file must not abort the heals AFTER identity through
+     *  main()'s outer catch — that skipped orientation/game-mode/crashlytics with a generic
+     *  note naming neither the failure nor what it prevented. */
+    it('a failing identity file does not abort the rest of the heal pass', () => {
+      writeNative();
+      // Make ONE file unreadable-as-file (a directory where Info.plist belongs).
+      fs.rmSync(plistPath());
+      fs.mkdirSync(plistPath());
+      writeCfg({ appId: 'com.old.id', appName: 'Renamed' });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(stringsPath(), 'utf8')).toContain('Renamed'); // later files still healed
+      expect(r.notes.join(' ')).toContain('Info.plist sync failed');
     });
   });
 });

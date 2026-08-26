@@ -1506,9 +1506,52 @@ non-reproducible and churns a committed file on every build (the write-behind-yo
 CLAUDE.md). The owner bumps it, in the same change as the native edit it ships — a native change
 that is not bumped never reaches the device.
 
+### `app.buildNumberAuto` — derive it from the commit count (2026-08-25)
+
+Hand-bumping per upload is exactly the chore this checkbox removes. With **Auto build number**
+checked in Project Settings (General → App Identity), the typed `app.buildNumber` is IGNORED and
+the effective number is derived from `git rev-list --count HEAD` of the project's repo at every
+open/build, with the typed value kept as a **FLOOR** (`max` of the two) — so a store-forced jump
+typed by hand still wins without turning auto off, and the never-lower guard keeps its role as the
+last line of defence either way. The native files always see ONE resolved number; how it was
+derived never leaks into them.
+
+Two known wrinkles, both absorbed by the floor + never-lower pair rather than by cleverness:
+commit counts differ between clones (`main` vs a worker branch), and the count is shared by every
+game in the repo. Only store uploads care about the absolute value, and only monotonicity matters
+there. A project copied OUT of its repo (no git) falls back to `app.buildNumber` with a note.
+
+⚠️ **Auto mode re-introduces committed-file churn on purpose.** The rationale above rejects a
+self-incrementing build number because it churns committed native files on every build — auto does
+exactly that (the count moves with every merged commit, so whichever clone builds first rewrites
+`versionCode`/`CURRENT_PROJECT_VERSION`). That is accepted noise here, not an accident: the churn
+is the number staying TRUE instead of drifting stale, and merge conflicts from two concurrent
+builds resolve to the higher value either way. The #18 rule still applies — don't sweep these into
+unrelated commits.
+
 The defaults (`"1.0"` / `1`) are exactly what `cap add` scaffolds, so adopting these fields rewrote
 nothing: running the heal across all 20 projects touched **one file**, `games/iap-test`'s pbxproj,
 raising the lagging iOS counter to its Android value.
+
+## The app identity (`app.appId` / `app.appName`)
+
+Synced into **every** native file that carries them by `healNativeConfig` on open/build — they were
+WRITE-ONCE before 2026-08-25: `cap add` baked them in at scaffold time, `ensureCapacitorConfig`
+never clobbers an existing `capacitor.config.json`, so changing Project Settings afterwards
+silently changed nothing anywhere (a device app kept its old identity forever).
+
+| field | lands in |
+|---|---|
+| `app.appId` | `capacitor.config.json` · gradle `applicationId` · strings.xml `package_name` + `custom_url_scheme` · pbxproj `PRODUCT_BUNDLE_IDENTIFIER` (Info.plist's `CFBundleIdentifier` reads it via `$(PRODUCT_BUNDLE_IDENTIFIER)`) |
+| `app.appName` | `capacitor.config.json` · strings.xml `app_name` + `title_activity_main` (AndroidManifest labels reference these) · Info.plist `CFBundleDisplayName` |
+
+Deliberately NOT touched: gradle `namespace` (the code package — renaming it strands MainActivity),
+and `CFBundleName` (stays `$(PRODUCT_NAME)`).
+
+⚠️ **A changed appId is a NEW app to both stores** — previously uploaded builds and installed
+updates no longer connect to it. The heal performs the change but logs a WARNING naming both ids
+every time it rewrites one; an id that fails the bundle-id shape check is REFUSED outright rather
+than written into four files at once.
 
 ## The shipped platform floors (`build.iosMinVersion` / `build.androidMinSdk`)
 

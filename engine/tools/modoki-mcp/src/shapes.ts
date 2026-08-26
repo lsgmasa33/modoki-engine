@@ -26,8 +26,16 @@ import { z } from 'zod';
 export const modifierEnum = z.enum(['shift', 'control', 'alt', 'meta', 'cmd', 'command']);
 
 /** A point to aim trusted input at: page CSS coordinates, or a CSS selector resolved to
- *  the element's center inside the same call (no read-then-tap race). */
-export const entitySpec = z.object({
+ *  the element's center inside the same call (no read-then-tap race).
+ *
+ *  A FACTORY, not a shared const: `zod-to-json-schema` dedupes a schema reused BY REFERENCE
+ *  within one tool's shape into a `$ref` in the advertised inputSchema (measured against
+ *  `modoki_drag`, whose `from`/`to` both carried this object — `to.entity` came out as a bare
+ *  `{"$ref": "#/properties/from/properties/entity"}`, no `type` at that node). A client that does
+ *  not resolve JSON Schema `$ref` sees an untyped field and can mis-encode it — the exact failure
+ *  mode that broke `modoki_dnd` (see `makeDndEndpoint` in `tools/input.ts`). Every call site making
+ *  its own instance keeps each one a plain inline object in the schema, no `$ref` involved. */
+export const makeEntitySpec = () => z.object({
   guid: z.string().optional(),
   name: z.string().optional(),
   id: z.number().optional(),
@@ -212,12 +220,23 @@ export const DISCARD_UNSAVED_BASE =
   + 'NOTHING, and one word cannot mean both';
 export const discardUnsavedParam = z.boolean().optional().describe(`${DISCARD_UNSAVED_BASE}.`);
 
-export const pointSpec = z.object({
+/** A factory for the same `$ref`-dedup reason as `makeEntitySpec` above — `modoki_drag` uses this
+ *  twice (`from`/`to`) in one shape, so a shared instance would dedupe the same way.
+ *
+ *  ⚠️ EVERY field must be built FRESH inside this factory, not read from a shared module-level
+ *  const — `allowOccluded` used to reference the shared `allowOccludedParam` here, and because
+ *  `zod-to-json-schema` dedupes by REFERENCE (not by structural shape), `to.allowOccluded` still
+ *  came back as `{"$ref": "#/properties/from/properties/allowOccluded"}` even after `from`/`to`
+ *  themselves stopped sharing an object (close-out review caught this: the dedup just moved one
+ *  level deeper, into the one field this factory forgot to freshen). A client that doesn't
+ *  resolve `$ref` reads that field as untyped and can encode `true`/`false` as a string — the
+ *  exact `modoki_dnd` failure this factory exists to prevent, one field short of covering it. */
+export const makePointSpec = () => z.object({
   x: z.number().optional(),
   y: z.number().optional(),
   selector: z.string().optional(),
-  entity: entitySpec.optional(),
-  allowOccluded: allowOccludedParam,
+  entity: makeEntitySpec().optional(),
+  allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`),
 });
 
 /** The `mutate_scene` op vocabulary as a REAL schema, not `z.record(z.any())`.
@@ -232,7 +251,13 @@ export const pointSpec = z.object({
  *
  *  The vocabulary is fixed and small, so there is no reason for it to be untyped. A discriminated
  *  union also makes the refusal name the op it could not parse. */
-const entityRef = z.object({
+// A FACTORY, not a shared const — three `mutateOpSchema` variants (setTrait/removeTrait/
+// removeEntity) each need their own `entity` schema INSTANCE. Found by the close-out $ref sweep
+// (mcpSchemaNoRef.test.ts): `mutateOpSchema` is itself an array-element schema, so all 5 variants
+// live in ONE root tree, and the old shared `entityRef` const dedupe'd into removeTrait/
+// removeEntity's `entity` field coming back as a bare `$ref` — the same class of bug as
+// `modoki_dnd`'s `to`, just one level inside `modoki_mutate_scene`'s `ops` array.
+const makeEntityRef = () => z.object({
   id: z.number().int().optional(),
   name: z.string().optional(),
   guid: z.string().optional(),
@@ -241,14 +266,14 @@ const entityRef = z.object({
 export const mutateOpSchema = z.discriminatedUnion('op', [
   z.object({
     op: z.literal('setTrait'),
-    entity: entityRef,
+    entity: makeEntityRef(),
     trait: z.string(),
     fields: z.record(z.any()).optional(),
     space: z.enum(['local', 'world']).optional(),
   }).strict("setTrait accepts: op, entity, trait, fields, space (note `fields`, not `feilds`)"),
   z.object({
     op: z.literal('removeTrait'),
-    entity: entityRef,
+    entity: makeEntityRef(),
     trait: z.string(),
   }).strict('removeTrait accepts: op, entity, trait'),
   z.object({
@@ -259,7 +284,7 @@ export const mutateOpSchema = z.discriminatedUnion('op', [
   }).strict('addEntity accepts: op, name, parentId, traits'),
   z.object({
     op: z.literal('removeEntity'),
-    entity: entityRef,
+    entity: makeEntityRef(),
   }).strict('removeEntity accepts: op, entity'),
   z.object({
     op: z.literal('setBaseScene'),

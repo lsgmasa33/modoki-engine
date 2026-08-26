@@ -8,9 +8,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 let build: ReturnType<typeof vi.fn<(p: string) => unknown>>;
 const paths = new Map<string, string>();
 
-vi.mock('../../src/runtime/loaders/assetManifest', () => ({
-  resolveRef: (guid: string) => paths.get(guid),
-}));
+vi.mock('../../src/runtime/loaders/assetManifest', async (importOriginal) => {
+  // Keep the REAL isGuid/getAssetEntry — resolveRefWarnOnce (modelGlbUrl.ts) needs both, and
+  // this suite's fake ids ('g1', 'missing') aren't UUID-shaped, so the real isGuid treats them
+  // as non-guid paths and resolveRefWarnOnce falls through to a plain resolveRef lookup —
+  // preserving every existing test's behavior unchanged. Only resolveRef itself is stubbed.
+  const actual = await importOriginal<typeof import('../../src/runtime/loaders/assetManifest')>();
+  return { ...actual, resolveRef: (guid: string) => paths.get(guid) };
+});
 vi.mock('../../src/runtime/rendering/pixiShaderBuilder', () => ({
   buildPixiShaderProgram: (p: string) => build(p),
 }));
@@ -123,6 +128,21 @@ describe('ensureSpriteMaterial', () => {
     expect(cache.ensureSpriteMaterial('missing')).toBeUndefined();
     cache.ensureSpriteMaterial('missing');
     expect(build).not.toHaveBeenCalled();
+  });
+
+  // Close-out sweep of QA-ANIM-0018 (animationClipCache's fix): this file's OWN comment used to
+  // claim "resolveRef already warned" for an unresolved guid — false, `resolveRef` is silent for
+  // a valid-shaped guid simply absent from the manifest. Needs a REAL UUID shape: `isGuid` is not
+  // mocked here (see the vi.mock comment above), and every other test's short fake id ('g1',
+  // 'missing') is deliberately non-guid-shaped so it bypasses this warning path entirely.
+  it('warns once for a real-shaped guid absent from the manifest (parity with animationClipCache)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const guid = '11111111-2222-4333-8444-555555555555'; // not seeded in `paths`
+    expect(cache.ensureSpriteMaterial(guid)).toBeUndefined();
+    expect(cache.ensureSpriteMaterial(guid)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain(guid);
+    warn.mockRestore();
   });
 
   it('returns undefined for an empty guid', () => {

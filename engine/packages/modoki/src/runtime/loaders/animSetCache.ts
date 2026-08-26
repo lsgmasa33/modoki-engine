@@ -16,7 +16,8 @@
  * the `SkeletalAnimator` on a `SkinnedModel`.
  */
 
-import { resolveRef, isGuid, registerAsset } from './assetManifest';
+import { isGuid, registerAsset } from './assetManifest';
+import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { parseAssetJson } from './assetFetch';
 
@@ -58,12 +59,15 @@ const cache = new Map<string, AnimSetDef>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
 let generation = 0;
+// Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here,
+// same as animationClipCache before its fix.
+const unknownGuidSeen = new Set<string>();
 
 /** Resolve a cache key. A GUID resolves through the manifest; the editor seeds /
  *  invalidates by file path directly (like animationClipCache). */
 function animSetCacheKey(refOrPath: string): string | undefined {
   if (!refOrPath) return undefined;
-  return isGuid(refOrPath) ? resolveRef(refOrPath) : refOrPath;
+  return isGuid(refOrPath) ? resolveRefWarnOnce(refOrPath, 'animSetCache', unknownGuidSeen) : refOrPath;
 }
 
 function normalizeAnimSet(json: Partial<AnimSetDef> | undefined): AnimSetDef {
