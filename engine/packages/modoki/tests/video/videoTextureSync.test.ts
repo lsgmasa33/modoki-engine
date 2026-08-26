@@ -46,6 +46,7 @@ vi.mock('three/webgpu', () => ({
 const { syncVideoTextures, disposeVideoTextures, videoTextureCount } =
   await import('../../src/runtime/rendering/videoTextureSync');
 const { derivedBaseOf } = await import('../../src/runtime/rendering/derivedMaterials');
+const { baseOf } = await import('../../src/runtime/rendering/lightMaskVariants');
 
 // videoSystem owns the elements; this suite is about what the RENDERER does with one.
 const elements = new Map<number, HTMLVideoElement>();
@@ -68,10 +69,18 @@ class FakeMaterial {
   needsUpdate = false;
   roughness = 0.5;
   disposed = false;
+  userData: Record<string, unknown> = {};
   clone(): FakeMaterial {
     const c = new FakeMaterial();
     c.map = this.map;
     c.roughness = this.roughness;
+    // ⚠️ Faithful to `THREE.Material.copy()` ON PURPOSE, and the fidelity is what makes the #325
+    // tests mean anything: three deep-copies `userData` through `JSON.parse(JSON.stringify(...))`,
+    // which FLATTENS a Material parked in there into a plain document. A fake that copied
+    // `userData` by reference (or not at all) would let a bare `.clone()` pass the very assertions
+    // written to catch it — the first version of this fixture did exactly that, and the
+    // "does not JSON-round-trip" test below passed against the unfixed code.
+    c.userData = JSON.parse(JSON.stringify(this.userData));
     return c;
   }
   dispose(): void { this.disposed = true; }
@@ -108,7 +117,15 @@ beforeEach(() => {
   state = { ecsObjects: new Map() };
   elements.clear();
 });
-afterEach(() => { disposeVideoTextures(state); vi.restoreAllMocks(); });
+afterEach(() => {
+  disposeVideoTextures(state);
+  // koota allocates world IDs from a pool of 16 and `createWorld` THROWS once it is exhausted, so
+  // a suite that only ever creates them has a hard ceiling on its own test count. This one reached
+  // 16 and the next three tests added failed on `Too many worlds created` — a failure that names
+  // koota rather than the test, and lands on whoever adds the 17th case.
+  world.destroy();
+  vi.restoreAllMocks();
+});
 
 describe('syncVideoTextures — binding', () => {
   it('puts the video on the mesh without mutating the material it found', () => {
@@ -369,5 +386,129 @@ describe('syncVideoTextures — the clone keeps its base alive (#318)', () => {
     sync(world, state);
 
     expect(derivedBaseOf(matOf(mesh) as never)).toBe(replacement);
+  });
+});
+
+describe('syncVideoTextures — cloning a LIGHT-MASK VARIANT (#325)', () => {
+  /** What `applyLightMask` leaves on a masked mesh, in the shape the two properties that matter
+   *  actually have: `lightsNode` and `customProgramCacheKey` are OWN properties assigned after the
+   *  clone, and the base Material object itself is parked in `userData.__lightMaskBase`.
+   *
+   *  `FakeMaterial.clone()` copies neither own property, on purpose — so if `cloneDerived`'s
+   *  own-property carry stops running, these tests fail rather than passing on three's `copy()`
+   *  doing the work for us. */
+  function fakeVariant(base: FakeMaterial, sel = '0,2') {
+    const v = new FakeMaterial() as FakeMaterial & {
+      lightsNode: unknown; customProgramCacheKey: () => string; userData: Record<string, unknown>;
+    };
+    v.lightsNode = { sel };                         // shared per selection — carried by REFERENCE
+    v.customProgramCacheKey = () => `|lightmask:${sel}`;
+    v.userData = { __lightMaskBase: base };
+    return v;
+  }
+
+  it('carries lightsNode and customProgramCacheKey onto the video clone', () => {
+    // THE correctness bug. Without these two the clone hashes to the BASE's pipeline key — the
+    // #136 collision — and renders lit by every light, silently ignoring the authored mask.
+    const base = new FakeMaterial();
+    const variant = fakeVariant(base);
+    const mesh = fakeMesh(variant);
+    spawnVideo(mesh);
+
+    sync(world, state);
+
+    const bound = matOf(mesh) as FakeMaterial & {
+      lightsNode: unknown; customProgramCacheKey: () => string;
+    };
+    expect(bound).not.toBe(variant);                        // still a private clone
+    expect(bound.map).toBeInstanceOf(FakeVideoTexture);     // still carrying the video
+    expect(bound.lightsNode).toBe(variant.lightsNode);      // same node — NOT a copy
+    expect(bound.customProgramCacheKey()).toBe('|lightmask:0,2');
+  });
+
+  it('does not SERIALISE the base Material parked in userData', () => {
+    // Asserted at the mechanism, not at the value. The obvious assertion — "`__lightMaskBase` is
+    // still the Material" — passes under BOTH hypotheses, because `inheritMaskBase` rewrites that
+    // key a line after the clone regardless of what the clone did to `userData`. (It was written
+    // that way first, and review caught it passing against the unfixed code.)
+    //
+    // What actually distinguishes them is whether the round-trip HAPPENED: `JSON.stringify` calls
+    // `toJSON()` on anything that has one, so a base that counts its own serialisations answers
+    // yes-or-no with nothing in between. In production this is `Texture.toJSON` firing per texture
+    // slot — `THREE.Texture: Unable to serialize Texture.` for a compressed one.
+    const base = new FakeMaterial();
+    let serialised = 0;
+    (base as unknown as { toJSON: () => unknown }).toJSON = () => { serialised++; return {}; };
+    const mesh = fakeMesh(fakeVariant(base));
+    spawnVideo(mesh);
+
+    sync(world, state);
+
+    expect(serialised).toBe(0);
+    // …and the parked base is still reachable as the Material object itself.
+    expect((matOf(mesh) as unknown as { userData: Record<string, unknown> })
+      .userData.__lightMaskBase).toBe(base);
+  });
+
+  it('answers baseOf with the variant\'s base, not with itself', () => {
+    // This is what keeps the two systems at a FIXED POINT. `applyLightMask` re-derives every frame
+    // from `baseOf(mesh.material)` and keys the variant cache on `${base.uuid}|${sel}`. Inheriting
+    // the base keeps that key stable, so the lookup HITS and the same variant object comes back.
+    // Answering with the clone instead keys on the clone's own uuid, misses, mints a variant of
+    // the clone — which this module then does not recognise, so it rebuilds, which mints a new
+    // clone, forever: a material and a pipeline per frame.
+    const base = new FakeMaterial();
+    const mesh = fakeMesh(fakeVariant(base));
+    spawnVideo(mesh);
+
+    sync(world, state);
+    const bound = matOf(mesh);
+
+    expect(baseOf(bound as never)).toBe(base);
+    expect(baseOf(bound as never)).not.toBe(bound);
+  });
+
+  it('settles: re-asserting the variant each frame mints no further clones', () => {
+    // The whole frame loop, as the two systems actually run it: the renderable pass puts the
+    // variant back (its cache hit returns the same object), then this module re-asserts its clone.
+    // Neither side may allocate after the first frame.
+    const base = new FakeMaterial();
+    const variant = fakeVariant(base);
+    const mesh = fakeMesh(variant);
+    spawnVideo(mesh);
+
+    sync(world, state);
+    const first = matOf(mesh);
+
+    for (let frame = 0; frame < 10; frame++) {
+      mesh.material = variant;   // what applyLightMask does on a cache hit
+      sync(world, state);
+      expect(matOf(mesh)).toBe(first);
+    }
+    expect(first.disposed).toBe(false);
+    expect(videoTextureCount(state)).toBe(1);
+  });
+
+  it('rebuilds against the NEW variant when the mask selection changes', () => {
+    // The one case that SHOULD re-clone: a different selection is a different variant object, so
+    // the clone's carried lightsNode is stale and must be replaced.
+    //
+    // ⚠️ This pins that the rebuild is CORRECT, not that rebuilding is the right strategy. The
+    // rebuild also disposes and recreates the `VideoTexture`, and `maskForObject` picks the nearest
+    // lights with NO hysteresis — so a selection that FLAPS across an equidistance boundary pays a
+    // texture + material + pipeline every frame. Measured at 10 distinct textures over 10 alternating
+    // frames. Tracked separately (#352); unreachable today for the same reason #325 is.
+    const base = new FakeMaterial();
+    const mesh = fakeMesh(fakeVariant(base, '0,2'));
+    spawnVideo(mesh);
+    sync(world, state);
+
+    const moved = fakeVariant(base, '1');
+    mesh.material = moved;
+    sync(world, state);
+
+    const bound = matOf(mesh) as FakeMaterial & { customProgramCacheKey: () => string };
+    expect(bound.customProgramCacheKey()).toBe('|lightmask:1');
+    expect(baseOf(bound as never)).toBe(base);      // still the base, not the superseded variant
   });
 });

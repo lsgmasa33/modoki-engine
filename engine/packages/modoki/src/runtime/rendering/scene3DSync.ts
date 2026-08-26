@@ -67,7 +67,7 @@ import {
   beginLightMaskFrame, getMaskedMaterial, isLightMaskingActive, maskNeedsVariant, baseOf, retireVariantsOf,
   DEFAULT_RENDERING_LAYER_MASK, type MaskedLight, type LightingFactory,
 } from './lightMaskVariants';
-import { markDerived, collectDerivedChain, retireDerivedMaterial, retiredDerivedMaterials, retiredDerivedCount, disposeRetiredDerivedMaterial } from './derivedMaterials';
+import { cloneDerived, collectDerivedChain, retireDerivedMaterial, retiredDerivedMaterials, retiredDerivedCount, disposeRetiredDerivedMaterial } from './derivedMaterials';
 import { getActiveRenderer } from '../core/activeRenderer';
 import { setActiveRenderer } from '../loaders/textureResolver';
 import { PARTICLE_LAYER } from './layers';
@@ -132,7 +132,13 @@ function tintedMaterial(basePath: string, color: number, amount: number): THREE.
     retireDerivedMaterial(stale, () => stale.dispose());
     _tintMaterials.delete(key);
   }
-  const clone = markDerived(base.clone(), base);
+  // `cloneDerived`, not a bare `.clone()` (#325) — a TSL/file-shader base parks real
+  // `THREE.Texture` objects at `userData.textures`, which `Material.copy()` would JSON-round-trip
+  // into this clone one serialised texture at a time. A tint clone must not carry that list anyway:
+  // it is a texture-OWNERSHIP record, and both readers (`disposeMaterial` and `materialTextures`,
+  // the latter behind the `onAssetInvalidated('texture')` listener) walk `materialCache` — i.e.
+  // BASES only, never a clone.
+  const clone = cloneDerived(base, base);
   (clone as unknown as { color?: THREE.Color }).color?.setHex(color);
   (clone as unknown as { nprColorPreserve: number }).nprColorPreserve = amount;
   _tintMaterials.set(key, { clone, base });
@@ -3465,27 +3471,12 @@ function sidePinnedVariants(material: THREE.Material): THREE.Side[] {
  *  the key — and `_listeners` in particular MUST NOT be shared, or a dispose on either material
  *  would fire the other's handlers. */
 export function pinnedSideClone(material: THREE.Material, side: THREE.Side): THREE.Material {
-  // ⚠️ `Material.copy()` deep-copies `userData` with `JSON.parse(JSON.stringify(...))`, and #136's
-  // light-mask variants park the BASE MATERIAL object in there (`baseOf`). So a naive
-  // `material.clone()` serialises an entire material graph — textures included — during the exact
-  // phase this code exists to make cheap, and a compressed texture cannot be serialised at all, so
-  // it logs `THREE.Texture: Unable to serialize Texture.` per clone and yields garbage. Measured
-  // on `demos/postfx-demo`: 18 such warnings the first time this shipped. `userData` is one of the
-  // properties `getMaterialCacheKey()` explicitly SKIPS, so an empty one on the clone is free.
-  const savedUserData = material.userData;
-  let clone: THREE.Material;
-  material.userData = {};
-  // Stamped HERE, at the clone site (#318) — `pinnedSideClone` has two callers (the live
-  // compile's stand-ins and the prewarm's side-pinned variants) and the sweep learns a clone
-  // holds its base only from this stamp. Same line, as `materialCloneStamp.test.ts` requires.
-  try { clone = markDerived(material.clone(), material); } finally { material.userData = savedUserData; }
-  const src = material as unknown as Record<string, unknown>;
-  const dst = clone as unknown as Record<string, unknown>;
-  for (const key of Object.keys(src)) {
-    if (/^(is[A-Z]|_)/.test(key)) continue;
-    if (Object.prototype.hasOwnProperty.call(dst, key)) continue;
-    dst[key] = src[key];
-  }
+  // The `userData`-suppressing clone and the own-property carry that used to live here are now
+  // `cloneDerived` (#325) — the prewarm was the FIRST site to need them, and videoTextureSync
+  // turned out to be the second, having hit the identical trap independently. Read that function's
+  // header for the two failure modes; the stand-ins' own stamping requirement (#318) is satisfied
+  // inside it, on the clone line, exactly as `materialCloneStamp.test.ts` requires.
+  const clone = cloneDerived(material, material);
   clone.side = side;
   return clone;
 }

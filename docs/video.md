@@ -335,6 +335,19 @@ per-entity clones. Two consequences worth knowing:
   a `.mat.json` re-import lets `sweepRetiredMaterials` free the base (no *mesh* binds it any more —
   the clone does) and release textures this clone is drawing with. Mechanism:
   `docs/textures.md` § "The CLONES are the other half".
+- **A light-masked video screen needs more than the stamp (#325).** Once masking is active, the
+  material this module finds on the mesh is a light-mask VARIANT, so it clones through
+  `cloneDerived` and calls `inheritMaskBase`. A bare `.clone()` — which is what shipped for months —
+  dropped the variant's `lightsNode` and `customProgramCacheKey`, so the screen rendered lit by
+  every light, **silently ignoring the mask it was authored with**, and collided with the base's
+  pipeline key (the #136 failure). It also JSON-round-tripped the base Material parked in
+  `userData`, serialising a whole material graph — `THREE.Texture: Unable to serialize Texture.` for
+  a compressed one.
+  ⚠️ Nothing authored reaches this today: video-demo's screens are default-material primitives, and
+  `scene3DSync`'s primitive branch only masks a primitive with an explicit `.mat.json`. It becomes
+  reachable the moment a video screen is a GLB `Renderable3D`, or a primitive with a material and a
+  `renderingLayerMask`. Reasoning about who owns the slot: `docs/rendering.md`
+  § "Rendering-layer light masks".
 
 The 2D twin is unaffected: PixiJS has no such observer, and it swaps `sprite.texture` rather than a
 material property.

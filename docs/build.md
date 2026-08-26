@@ -1512,9 +1512,18 @@ Hand-bumping per upload is exactly the chore this checkbox removes. With **Auto 
 checked in Project Settings (General → App Identity), the typed `app.buildNumber` is IGNORED and
 the effective number is derived from `git rev-list --count HEAD` of the project's repo at every
 open/build, with the typed value kept as a **FLOOR** (`max` of the two) — so a store-forced jump
-typed by hand still wins without turning auto off, and the never-lower guard keeps its role as the
-last line of defence either way. The native files always see ONE resolved number; how it was
-derived never leaks into them.
+typed by hand still wins, and the never-lower guard keeps its role as the last line of defence
+either way. The native files always see ONE resolved number; how it was derived never leaks into
+them.
+
+⚠️ **Typing that floor means unchecking Auto first.** `app.buildNumber`'s input carries
+`disabledIf: { key: 'app.buildNumberAuto', is: 'true' }`, which is a real native `disabled` — not
+dimming — so while Auto is on the field cannot be focused or typed into. The escape hatch is
+three steps: **uncheck Auto, type the higher number, re-check Auto**, which is what the field's own
+help text says. (This paragraph used to claim the floor could be raised *without* turning auto off;
+it never could, and the help text added in the same commit contradicted it.) The floor survives the
+round-trip because `buildNumber` is stored independently of `buildNumberAuto` — that is precisely
+why the field is greyed out rather than hidden.
 
 Two known wrinkles, both absorbed by the floor + never-lower pair rather than by cleverness:
 commit counts differ between clones (`main` vs a worker branch), and the count is shared by every

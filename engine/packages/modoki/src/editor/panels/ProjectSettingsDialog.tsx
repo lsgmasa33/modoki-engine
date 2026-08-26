@@ -39,15 +39,39 @@ const browseBtn: React.CSSProperties = {
   color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12, whiteSpace: 'nowrap',
 };
 
-function Field({ field, value, onChange, onPick, disabled }: {
+/** One settings field, rendered inert-but-readable when `disabled` (see `disabledIf`).
+ *
+ *  ⚠️ The disabling lives HERE, in ONE wrapper, and deliberately NOT as a `disabled` prop
+ *  threaded through {@link FieldControl}'s twelve `case`s. That enumeration was tried and
+ *  reached three of them (checkbox/number/select), so `disabledIf` on a `text`, `path`,
+ *  `combo`, `string-list` or any sub-editor field was a SILENT no-op — the control stayed
+ *  fully live while claiming to be greyed out. Same reasoning, and the same `<fieldset
+ *  disabled>` primitive, as the whole-form `inert` wrapper further down: it disables every
+ *  descendant control natively, including a field type nobody has added yet.
+ *
+ *  A real box, not `display:contents` — unlike that outer wrapper this one is a plain item
+ *  in a non-scrolling column, so it has no shrink problem to dodge, and it needs a box for
+ *  `opacity`/`pointerEvents` to apply at all. `minWidth:0` because a fieldset's intrinsic
+ *  minimum width would otherwise stop it shrinking with the dialog. */
+function Field({ disabled, ...props }: React.ComponentProps<typeof FieldControl> & { disabled?: boolean }) {
+  return (
+    <fieldset
+      disabled={disabled}
+      style={{
+        border: 0, padding: 0, margin: 0, minWidth: 0,
+        ...(disabled ? { opacity: 0.45, cursor: 'default', pointerEvents: 'none' } : {}),
+      }}
+    >
+      <FieldControl {...props} />
+    </fieldset>
+  );
+}
+
+function FieldControl({ field, value, onChange, onPick }: {
   field: ProjectSettingsField;
   value: unknown;
   onChange: (v: unknown) => void;
   onPick?: (mode: 'file' | 'folder') => Promise<string | null>;
-  /** Rendered inert but still visible — the stored value stays readable (see
-   *  `disabledIf`). Native `disabled`, not just dimming, so keyboard focus and
-   *  wheel-step can't reach a control that would write an ignored value. */
-  disabled?: boolean;
 }) {
   const label = (
     <div style={{ color: '#aaa', fontSize: 11, marginBottom: 3 }}>
@@ -57,15 +81,12 @@ function Field({ field, value, onChange, onPick, disabled }: {
   );
 
   const uiId = `projectSettings.${field.key}`;
-  const dimStyle: React.CSSProperties | undefined = disabled
-    ? { opacity: 0.45, cursor: 'default' }
-    : undefined;
 
   switch (field.type) {
     case 'checkbox':
       return (
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#ddd', fontSize: 12, ...(dimStyle ?? {}) }}>
-          <input data-ui-id={uiId} data-ui-kind="toggle" data-ui-label={field.label} data-ui-state={value ? 'checked' : 'unchecked'} type="checkbox" checked={Boolean(value)} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#ddd', fontSize: 12 }}>
+          <input data-ui-id={uiId} data-ui-kind="toggle" data-ui-label={field.label} data-ui-state={value ? 'checked' : 'unchecked'} type="checkbox" checked={Boolean(value)} onChange={(e) => onChange(e.target.checked)} />
           {field.label}
           {field.help && <span style={{ color: '#666' }}>{field.help}</span>}
         </label>
@@ -73,14 +94,14 @@ function Field({ field, value, onChange, onPick, disabled }: {
     case 'number':
       return (
         <div>{label}
-          <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} type="number" style={{ ...inputStyle, ...(dimStyle ?? {}) }} value={value == null || value === '' ? '' : Number(value)}
-            placeholder={field.placeholder} disabled={disabled} onChange={(e) => onChange(e.target.value === '' ? '' : Number(e.target.value))} />
+          <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} type="number" style={inputStyle} value={value == null || value === '' ? '' : Number(value)}
+            placeholder={field.placeholder} onChange={(e) => onChange(e.target.value === '' ? '' : Number(e.target.value))} />
         </div>
       );
     case 'select':
       return (
         <div>{label}
-          <select data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} style={{ ...inputStyle, ...(dimStyle ?? {}) }} value={String(value ?? '')} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
+          <select data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} style={inputStyle} value={String(value ?? '')} onChange={(e) => onChange(e.target.value)}>
             {(field.options ?? []).map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
         </div>

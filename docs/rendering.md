@@ -298,6 +298,18 @@ THIS" — which a tint clone must answer with *itself*, or a masked+tinted mesh 
 `__derivedBase` means "my texture references belong to that", so the retired-material sweep can see
 that a mesh binding a variant is still holding the base.
 
+**A clone layered OUTSIDE masking inherits the base instead of self-referencing (#325).** The tint
+rule above is not universal, and `videoTextureSync` is the counter-case: it clones whatever
+`applyLightMask` settled on, so its clone must answer `baseOf` with the *variant's* base
+(`inheritMaskBase`), not with itself. The reason is the variant cache key, `${base.uuid}|${sel}`.
+Inheriting keeps that key stable, so the next frame's lookup HITS and the same variant object comes
+back — the fixed point both systems settle at. Self-referencing keys on the clone's own uuid, misses,
+mints a variant *of the clone*, which `videoTextureSync` then does not recognise, so it rebuilds —
+**a fresh material and a fresh pipeline every frame, forever**. Video can afford to sit outside
+because `syncVideoTextures` runs after the renderable pass and so gets the last word on the slot;
+a tint clone cannot, because it is cached and outlives the frame while a video clone owns and
+disposes the `VideoTexture` it carries.
+
 Not yet masked: skinned meshes, billboards and text have no mask field, and multi-material meshes
 are skipped.
 
@@ -3281,8 +3293,17 @@ input — the one that is invisible from the material and the scene:
    parks the BASE MATERIAL object in there — so a naive clone serialises a whole material graph,
    textures included, during the phase this code exists to make cheap (measured: 18
    `Unable to serialize Texture` warnings the first time the live-compile clone shipped).
-   `pinnedSideClone` carries own properties across generically and gives the clone an empty
-   `userData`, which is free because `getMaterialCacheKey()` skips `userData` outright.
+   Both are handled by **`cloneDerived` (`rendering/derivedMaterials.ts`)**, which carries own
+   properties across generically and clones with `userData` suppressed — free, because
+   `getMaterialCacheKey()` skips `userData` outright. `pinnedSideClone` is a thin wrapper over it.
+   ⚠️ **This is not a prewarm-only concern, and reaching for a bare `.clone()` on a live mesh is the
+   recurring mistake** — `videoTextureSync` hit the identical trap independently and shipped with it
+   for months (#325). Its symptom was the quieter one: a light-masked video screen rendered lit by
+   every light, silently ignoring its authored mask, because the clone lost `lightsNode` and hashed
+   to the base's pipeline key. **Use `cloneDerived` for any material clone bound to a live mesh.**
+   A clone layered OUTSIDE masking must also call `inheritMaskBase` so `baseOf` keeps resolving to
+   the true base — see § "Rendering-layer light masks" for why that is what keeps the two systems from
+   minting a material per frame at each other.
 2. **`compileAsync` frustum-culls its render list, against the previous frame's frustum**, and
    never updates world matrices. `_projectObject` culls exactly as a render does, using the
    module-level `_frustum` the last RENDERED frame left behind — the OUTGOING scene's camera. Both

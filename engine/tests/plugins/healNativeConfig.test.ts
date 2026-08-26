@@ -2155,6 +2155,19 @@ describe('healNativeConfig — orientation + status bar', () => {
       expect(r.notes.join(' ')).toContain('no commit count could be read');
     });
 
+    /** The `floor >= count` boundary. At floor === count the two branches return the SAME
+     *  number, so only the note tells them apart — which is why a mutation to `floor > count`
+     *  survived the whole suite. Pinned on the note, since that is the only observable. */
+    it('at floor === count it reports the FLOOR, not a derived number', () => {
+      writeNative();
+      gitRepoWithCommits(7);
+      writeCfg({ version: '1.0', buildNumber: 7, buildNumberAuto: true });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 7');
+      expect(r.notes.join(' ')).toContain('floor');
+      expect(r.notes.join(' ')).not.toContain('derived from git commit count');
+    });
+
     it('auto OFF (the default) passes the typed value straight through', () => {
       writeNative();
       gitRepoWithCommits(30);
@@ -2322,6 +2335,172 @@ describe('healNativeConfig — orientation + status bar', () => {
       const r = healNativeConfig(root);
       expect(fs.readFileSync(stringsPath(), 'utf8')).toContain('Renamed'); // later files still healed
       expect(r.notes.join(' ')).toContain('Info.plist sync failed');
+    });
+
+    /** ⚠️ `app.appName` is a DISPLAY name with no `BUILD_FIELD_RULES` pattern behind it (unlike
+     *  `app.appId`, which is charset-restricted) — and it must stay free text, because "Rock &
+     *  Roll" is a real app name. So it has to be ESCAPED at these two write sites, and it was
+     *  not: the value went into `strings.xml` and `Info.plist` raw. Every case below produced a
+     *  structurally broken COMMITTED file from a name the owner typed into Project Settings,
+     *  written by a heal that runs on every open/build. */
+    describe('appName is escaped, not injected', () => {
+      /** Parse as XML the strict way `AAPT2`/`plutil` do — a bare `&` or `<` must FAIL here.
+       *  DOMParser reports a parsererror element rather than throwing. */
+      function xmlIsWellFormed(text: string): boolean {
+        const doc = new DOMParser().parseFromString(text, 'application/xml');
+        return doc.getElementsByTagName('parsererror').length === 0;
+      }
+
+      it('an ampersand does not make strings.xml and Info.plist malformed', () => {
+        writeNative();
+        writeCfg({ appId: 'com.old.id', appName: 'Rock & Roll' });
+        healNativeConfig(root);
+        const strings = fs.readFileSync(stringsPath(), 'utf8');
+        const plist = fs.readFileSync(plistPath(), 'utf8');
+        expect(xmlIsWellFormed(strings), `strings.xml is malformed XML:\n${strings}`).toBe(true);
+        expect(xmlIsWellFormed(plist), `Info.plist is malformed XML:\n${plist}`).toBe(true);
+        // Escaped on the way in, so it PARSES BACK to exactly what the owner typed.
+        expect(new DOMParser().parseFromString(plist, 'application/xml')
+          .getElementsByTagName('string')[0].textContent).toBe('Rock & Roll');
+        expect(strings).toContain('&amp;');
+      });
+
+      /** `$&`, `$1`, `` $` `` and `$'` are SUBSTITUTION DIRECTIVES in a `String.replace`
+       *  replacement string. Built with a template literal, a name containing one is injected
+       *  rather than inserted — this exact input nested `<string name="app_name">` inside
+       *  itself and, in the plist, swallowed the preceding `<key>` line. */
+      it('a dollar sequence is inserted literally, not interpreted as a replacement pattern', () => {
+        writeNative();
+        writeCfg({ appId: 'com.old.id', appName: 'Court $& Co' });
+        healNativeConfig(root);
+        const strings = fs.readFileSync(stringsPath(), 'utf8');
+        const plist = fs.readFileSync(plistPath(), 'utf8');
+        expect(xmlIsWellFormed(strings), `strings.xml is malformed XML:\n${strings}`).toBe(true);
+        expect(xmlIsWellFormed(plist), `Info.plist is malformed XML:\n${plist}`).toBe(true);
+        // The structural tell of the injection: the key line eaten, or the tag duplicated.
+        expect(plist).toContain('<key>CFBundleDisplayName</key>');
+        expect(strings.match(/<string name="app_name">/g)!.length).toBe(1);
+        expect(new DOMParser().parseFromString(plist, 'application/xml')
+          .getElementsByTagName('string')[0].textContent).toBe('Court $& Co');
+      });
+
+      /** AAPT2-only rule, which plain XML escaping does not cover: an unescaped apostrophe in a
+       *  `<string>` resource is a hard build error ("Apostrophe not preceded by \\"). The plist
+       *  must NOT get that backslash — it would show up in the displayed name. */
+      it('an apostrophe is backslash-escaped for AAPT2 in strings.xml but NOT in the plist', () => {
+        writeNative();
+        writeCfg({ appId: 'com.old.id', appName: "Cat's Court" });
+        healNativeConfig(root);
+        expect(fs.readFileSync(stringsPath(), 'utf8')).toContain("Cat\\'s Court");
+        expect(fs.readFileSync(plistPath(), 'utf8')).toContain("<string>Cat's Court</string>");
+      });
+
+      it('stays idempotent — escaping an already-escaped file rewrites nothing', () => {
+        writeNative();
+        writeCfg({ appId: 'com.old.id', appName: 'Rock & Roll' });
+        healNativeConfig(root);
+        const once = [stringsPath(), plistPath()].map((p) => fs.readFileSync(p, 'utf8')).join('|');
+        healNativeConfig(root);
+        expect([stringsPath(), plistPath()].map((p) => fs.readFileSync(p, 'utf8')).join('|')).toBe(once);
+      });
+    });
+
+    /** ⚠️ capacitor.config.json is the ANCHOR — `oldId` scopes every gradle/pbxproj rewrite and
+     *  is recoverable from nowhere else. It used to be written FIRST, so a native write that
+     *  then failed (which `guarded` catches by design, to keep the pass going) advanced the
+     *  anchor to the NEW id while those files still held the OLD one. The next pass then matched
+     *  nothing and reported no change: permanent, silent divergence. It is committed LAST now,
+     *  which makes a partial failure retryable instead. */
+    // ⚠️ The fault is a READ-ONLY file, not a directory-in-its-place like the per-file-guard
+    // test above uses. Aimed at the pbxproj, that trick never reaches this code: EARLIER heals
+    // (DEVELOPMENT_TEAM, crashlytics, game-debug) read the same pbxproj with no per-file guard
+    // of their own, so the whole pass aborts through main()'s outer catch with a bare
+    // "heal skipped: EISDIR" — measured. A read-only file lets every reader succeed and fails
+    // only the WRITE, which is exactly the partial failure this test is about.
+    // Skipped on Windows, where a mode bit does not make a file unwritable the same way.
+    it.skipIf(process.platform === 'win32')(
+      'leaves the anchor on the OLD id when a native write fails, so the next pass retries', () => {
+      writeNative();
+      fs.chmodSync(pbxPath(), 0o444);
+      writeCfg({ appId: 'com.new.id', appName: 'Old Name' });
+      const first = healNativeConfig(root);
+      expect(first.notes.join(' ')).toContain('pbxproj sync failed');
+      expect(
+        JSON.parse(fs.readFileSync(capPath(), 'utf8')).appId,
+        'the anchor must NOT advance past a failed native write — advancing it strands the ' +
+          'files that did not get rewritten, unrecoverably',
+      ).toBe('com.old.id');
+
+      // Repair the fault; the retry must now complete, which it could not do from a lost anchor.
+      fs.chmodSync(pbxPath(), 0o644);
+      healNativeConfig(root);
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('PRODUCT_BUNDLE_IDENTIFIER = com.new.id;');
+      expect(JSON.parse(fs.readFileSync(capPath(), 'utf8')).appId).toBe('com.new.id');
+    });
+
+    /** Coverage hole found by mutation-testing: the gradle branch and the pbxproj branch each
+     *  carry their OWN `if (!oldId) noteIdSkipped()`, but `noteIdSkipped` is shared and fires
+     *  once — so deleting either branch's guard left the other still emitting the note, and the
+     *  suite could not tell whether a given branch's check existed at all.
+     *
+     *  ⚠️ CONTENT cannot distinguish them, which is why the first attempt at this test failed to
+     *  catch the mutation: a branch that fell back to `oldId ?? id` would rewrite the new id TO
+     *  the new id — a no-op in the file no matter what is seeded. The note is the only
+     *  observable, so each branch is ISOLATED instead: remove the other platform's folder
+     *  entirely, and whichever note survives can only have come from the branch under test. */
+    /** ⚠️ The anchor gate must express "did the id LAND?", not "did anything throw?".
+     *
+     *  There are TWO ways the id rewrite does not happen, and only one of them throws. This is
+     *  the other: a `capacitor.config.json` that PARSES but carries no `appId` leaves `oldId`
+     *  undefined, so gradle/pbxproj skip via `noteIdSkipped()` and return NORMALLY —
+     *  `guarded()` reports success. Gating the anchor on exceptions alone committed the new id
+     *  anyway, and every later pass then searched gradle for an id the file does not contain,
+     *  found nothing, and reported nothing: the divergence is permanent AND silent from pass 2
+     *  onward, which is worse than the bug the ordering fix was written for.
+     *
+     *  Note the two anchor tests below cannot see this — they `rmSync` the cap file, which
+     *  leaves `capJson` undefined so `writeCapacitorConfig` returns early and the anchor cannot
+     *  advance under any predicate. The file has to be PRESENT and appId-less. */
+    it('a cap config that parses but has NO appId does not advance the anchor either', () => {
+      writeNative();
+      fs.writeFileSync(capPath(), JSON.stringify({ appName: 'Old Name', webDir: 'dist' }, null, 2) + '\n');
+      writeCfg({ appId: 'com.new.id', appName: 'Old Name' });
+
+      const first = healNativeConfig(root);
+      expect(first.notes.join(' ')).toContain('cannot determine this project\'s previous bundle id');
+      expect(fs.readFileSync(gradlePath(), 'utf8'), 'gradle was not rewritten').toContain('applicationId "com.old.id"');
+      expect(
+        JSON.parse(fs.readFileSync(capPath(), 'utf8')).appId,
+        'the anchor must NOT be minted from a rewrite that never happened — doing so makes every '
+          + 'later pass search for an id the native files do not contain, silently',
+      ).toBeUndefined();
+
+      // Pass 2 must still SAY something rather than going quiet on a broken project.
+      const second = healNativeConfig(root);
+      expect(
+        second.notes.join(' '),
+        'the second pass must keep reporting the problem, not fall silent',
+      ).toContain('cannot determine this project\'s previous bundle id');
+    });
+
+    it('the GRADLE branch refuses to guess an anchor on its own (iOS absent)', () => {
+      writeNative();
+      fs.rmSync(capPath());                                 // no anchor
+      fs.rmSync(path.join(root, 'ios'), { recursive: true }); // pbxproj branch cannot emit
+      writeCfg({ appId: 'com.new.id', appName: 'Old Name' });
+      const r = healNativeConfig(root);
+      expect(r.notes.join(' ')).toContain('cannot determine this project\'s previous bundle id');
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('applicationId "com.old.id"');
+    });
+
+    it('the PBXPROJ branch refuses to guess an anchor on its own (Android absent)', () => {
+      writeNative();
+      fs.rmSync(capPath());                                     // no anchor
+      fs.rmSync(path.join(root, 'android'), { recursive: true }); // gradle branch cannot emit
+      writeCfg({ appId: 'com.new.id', appName: 'Old Name' });
+      const r = healNativeConfig(root);
+      expect(r.notes.join(' ')).toContain('cannot determine this project\'s previous bundle id');
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('PRODUCT_BUNDLE_IDENTIFIER = com.old.id;');
     });
   });
 });

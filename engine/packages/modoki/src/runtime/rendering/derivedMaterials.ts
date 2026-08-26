@@ -50,6 +50,52 @@ export function markDerived<T extends THREE.Material>(clone: T, base: THREE.Mate
   return clone;
 }
 
+/** Clone `material` for binding to a live mesh: stamped, and WITHOUT `userData`'s JSON round-trip.
+ *
+ *  **Use this instead of a bare `material.clone()` anywhere the source could be a material this
+ *  engine already derived** — which, on a live mesh, is almost everywhere. `Material.copy()`
+ *  deep-copies `userData` with `JSON.parse(JSON.stringify(...))`, and two separate things go wrong
+ *  when the source is a light-mask variant (#325, and #318's prewarm before it):
+ *
+ *    1. **It serialises a whole material graph.** `lightMaskVariants` parks the BASE MATERIAL
+ *       OBJECT in `userData.__lightMaskBase`, so the round-trip drags `Material.toJSON` →
+ *       `Texture.toJSON` → image serialisation behind it. A compressed texture cannot be
+ *       serialised at all and logs `THREE.Texture: Unable to serialize Texture.` per clone; an
+ *       uncompressed one becomes a data URL. `demos/postfx-demo` produced 18 such warnings the
+ *       first time a naive clone shipped on the prewarm path.
+ *    2. **It drops the properties that make a variant DISTINCT.** `Material.copy()` copies only
+ *       the fields it knows about, so a variant's `lightsNode` and `customProgramCacheKey` — the
+ *       two own properties `getMaskedMaterial` sets — do not survive. The clone then hashes to the
+ *       BASE's pipeline key, which is precisely the collision that made masked objects render
+ *       black in #136. Silent: the picture is merely lit by the wrong lights.
+ *
+ *  So: suppress `userData` across the clone itself, then carry over every own property the fresh
+ *  clone does not already have. `userData` is one of the properties `getMaterialCacheKey()`
+ *  explicitly SKIPS, so leaving the clone's own `userData` minimal is free — a caller that needs
+ *  something in there (`inheritMaskBase`) writes it deliberately, after.
+ *
+ *  Keys matching `is[A-Z]`/`_` are skipped: those are three's type brands and private fields, and
+ *  copying a brand onto a clone of a different class is how a material starts lying about what it
+ *  is. */
+export function cloneDerived<T extends THREE.Material>(material: T, base: THREE.Material): T {
+  const savedUserData = material.userData;
+  let clone: T;
+  material.userData = {};
+  // Stamped HERE, on the clone line, for the same reason every other site stamps on its own line:
+  // `materialCloneStamp.test.ts` reads the LINE, and a stamp applied elsewhere is one a future
+  // caller can forget. Restored in `finally` so a throwing clone cannot strand the source's
+  // userData empty — which would silently unstamp a variant's base.
+  try { clone = markDerived(material.clone() as T, base); } finally { material.userData = savedUserData; }
+  const src = material as unknown as Record<string, unknown>;
+  const dst = clone as unknown as Record<string, unknown>;
+  for (const key of Object.keys(src)) {
+    if (/^(is[A-Z]|_)/.test(key)) continue;
+    if (Object.prototype.hasOwnProperty.call(dst, key)) continue;
+    dst[key] = src[key];
+  }
+  return clone;
+}
+
 /** The material `m` was cloned from, or `undefined` when `m` is not a derived clone. */
 export function derivedBaseOf(m: THREE.Material): THREE.Material | undefined {
   const b = (m.userData as Record<string, unknown> | undefined)?.[DERIVED_BASE_KEY];

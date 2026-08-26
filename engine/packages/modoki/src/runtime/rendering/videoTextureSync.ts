@@ -43,7 +43,8 @@ import * as THREE from 'three/webgpu';
 import type { World } from 'koota';
 import { VideoPlayer } from '../traits/VideoPlayer';
 import { videoElementFor } from '../video/videoSystem';
-import { markDerived } from './derivedMaterials';
+import { cloneDerived } from './derivedMaterials';
+import { inheritMaskBase } from './lightMaskVariants';
 
 /** What we hold per (surface, entity). */
 interface Bound {
@@ -199,13 +200,25 @@ export function syncVideoTextures(
     // A private clone, never the shared material we found — see the header and
     // docs/video.md § Gotchas (#192).
     //
-    // `markDerived` is what keeps the base alive while this clone is bound (#318). Only `.map` is
-    // replaced below; every other slot the base carries (normal/roughness/emissive…) is still a
-    // SHARED reference, so a `.mat.json` re-import that retires the base would otherwise let the
-    // sweep free it — releasing textures this clone is drawing with. Staleness needs no fix here:
-    // `syncMaterial` re-binds a video entity's resolved material (it is neither tinted, instanced
-    // nor masked), so the `current !== existing.original` branch above already rebuilds.
-    const clone = markDerived(target.material.clone(), target.material) as MapMaterial;
+    // `cloneDerived` rather than a bare `.clone()`, and both halves of it matter here (#325).
+    //
+    // The STAMP keeps the base alive while this clone is bound (#318). Only `.map` is replaced
+    // below; every other slot the base carries (normal/roughness/emissive…) is still a SHARED
+    // reference, so a `.mat.json` re-import that retires the base would otherwise let the sweep
+    // free it — releasing textures this clone is drawing with.
+    //
+    // The rest of `cloneDerived` is what makes a LIGHT-MASKED video screen correct. The material
+    // we find on the mesh is whatever `applyLightMask` settled on, and once masking is active that
+    // is a VARIANT — so a bare `.clone()` both JSON-round-tripped the base Material parked in its
+    // `userData` and dropped the `lightsNode`/`customProgramCacheKey` that make the variant
+    // distinct, leaving the screen lit by every light and colliding with the base's pipeline key.
+    // The original comment here asserted a video entity "is neither tinted, instanced nor masked";
+    // the first two hold, the third never did.
+    const clone = cloneDerived(target.material, target.material) as MapMaterial;
+    // Answer `baseOf` with the variant's OWN base, not with this clone — see `inheritMaskBase` for
+    // why video inherits where a tint clone self-references, and what mints a material per frame
+    // if it does not.
+    inheritMaskBase(clone, target.material);
     clone.map = texture;
     clone.needsUpdate = true;
     const bound: Bound = {

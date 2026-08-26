@@ -24,7 +24,7 @@
 
 import * as THREE from 'three';
 import { onWorldSwap } from '../core/ecs/world';
-import { markDerived } from './derivedMaterials';
+import { cloneDerived } from './derivedMaterials';
 import { retireVariantsOf } from './lightMaskVariants';
 
 /** entity id → its owned clone + the base material the clone was derived from. The base
@@ -80,14 +80,21 @@ export function applyPropOverride(id: number, meshes: THREE.Mesh[], base: MatOrA
   if (!entry || entry.base !== base) {
     // New entity, or the resolved base changed (material ref swap / async load landed).
     old = entry?.clone;
-    // `markDerived` stamps each clone with the base whose TEXTURE references it shares, so the
+    // `cloneDerived` stamps each clone with the base whose TEXTURE references it shares, so the
     // retired-material sweep can see that a mesh binding this clone is still holding the base
     // (#318). Without it a base whose only holder is a prop clone was swept and freed, and
     // `disposeMaterial` released the textures the clone is still sampling — reachable by
     // deactivating this entity, re-importing the `.mat.json`, and reactivating.
+    //
+    // The helper rather than a bare `.clone()` for the reason in its header (#325): a TSL/file-shader
+    // base parks real `THREE.Texture` objects at `userData.textures`, and `Material.copy()` would
+    // JSON-round-trip them — serialising each one into the clone. Suppressing that is also the more
+    // correct answer here: `userData.textures` is a texture-OWNERSHIP list, and both readers
+    // (`disposeMaterial`, and `materialTextures` behind the `onAssetInvalidated('texture')`
+    // listener) walk `materialCache` — BASES only, never a clone. A clone carrying it is a lie.
     entry = Array.isArray(base)
-      ? { clone: base.map((m) => markDerived(m.clone(), m)), base }
-      : { clone: markDerived(base.clone(), base), base };
+      ? { clone: base.map((m) => cloneDerived(m, m)), base }
+      : { clone: cloneDerived(base, base), base };
     clones.set(id, entry);
     rebound = true;
   }

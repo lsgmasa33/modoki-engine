@@ -1664,8 +1664,41 @@ function usableIdentity(value: unknown): string | undefined {
   return /^[A-Za-z0-9._-]+$/.test(v) ? v : undefined;
 }
 
-function replaceAllIfMatches(text: string, re: RegExp, to: string): { text: string; changed: boolean } {
-  const next = text.replace(re, to);
+/** Escape a value for XML CHARACTER DATA (`<string>here</string>`, `<key>` bodies).
+ *
+ *  ⚠️ Unlike {@link usableIdentity}'s bundle id, `app.appName` is a DISPLAY name and must stay
+ *  free text — "Rock & Roll" is a legitimate app name, and restricting the charset to make the
+ *  writes below safe would be fixing the wrong end. It has no `BUILD_FIELD_RULES` pattern behind
+ *  it either, so it arrives here exactly as typed. Unescaped, a single `&` makes `strings.xml`
+ *  fatally malformed (AAPT2: "not well-formed (invalid token)") and `Info.plist` unparseable —
+ *  from a value the owner typed into Project Settings, written by a heal that runs on every
+ *  open/build, into two COMMITTED files. */
+function xmlText(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/** Escape a value for an Android `<string>` resource — XML escaping PLUS the AAPT2-specific
+ *  rules plain XML does not have. An unescaped apostrophe is a hard build error ("Apostrophe not
+ *  preceded by \\"), and a leading `@` or `?` would be read as a resource reference rather than
+ *  as text. "Cat's Court" is the case that makes this not hypothetical. */
+function androidResText(value: string): string {
+  const escaped = xmlText(value).replace(/(["'\\])/g, '\\$1');
+  return /^[@?]/.test(escaped) ? `\\${escaped}` : escaped;
+}
+
+/** Replace with a LITERAL string — never a replacement PATTERN.
+ *
+ *  ⚠️ Why a replacer FUNCTION rather than `text.replace(re, `$1${v}$2`)`: in a replacement
+ *  string `$&`, `$1`, `` $` `` and `$'` are substitution directives, so a value containing one is
+ *  INJECTED rather than inserted. An app name of "Court $& Co" turned `<string name="app_name">`
+ *  into a nested duplicate of itself and, in `Info.plist`, swallowed the preceding `<key>` line
+ *  outright — structural corruption of a committed file from a plausible display name. A
+ *  function replacer has no such syntax. */
+function replaceAllIfMatches(text: string, re: RegExp, value: string): { text: string; changed: boolean } {
+  const next = text.replace(re, (_m, open: string, close: string) => `${open}${value}${close}`);
   return { text: next, changed: next !== text };
 }
 
@@ -1711,25 +1744,61 @@ export function healAppIdentity(projectRoot: string, appId: unknown, appName: un
    *  (orientation, game-mode, crashlytics…) the way a throw through main()'s outer catch
    *  would — partial state plus a generic "heal skipped" note hid both the failure and what
    *  it prevented. Each file reports its own failure; the pass continues. */
-  const guarded = (label: string, fn: () => void): void => {
+  const guarded = (label: string, fn: () => void): boolean => {
     try {
       fn();
+      return true;
     } catch (e) {
       notes.push(`${label} sync failed (${e instanceof Error ? e.message : String(e)}) — remaining identity files were still attempted`);
+      return false;
     }
   };
+
+  /** Set when an ID-BEARING native file (gradle / pbxproj) failed to sync. Gates the anchor —
+   *  see the capacitor.config.json banner below. `appName` is unaffected: it anchors nothing, so
+   *  a failed name write costs only that file and is retried on its own next pass. */
+  let idWriteFailed = false;
 
   // capacitor.config.json — parsed + rewritten as JSON so any shape survives; this file IS
   // machine-generated (ensureCapacitorConfig writes JSON.stringify(…, null, 2)), so comparing
   // SERIALIZED forms is fair: only a real field change produces a diff.
+  //
+  // ⚠️ READ HERE, WRITTEN LAST — the two halves are deliberately split around the native files.
+  // This file is the ANCHOR: `oldId` is what scopes every rewrite below, and it is recoverable
+  // from nowhere else. Writing the new id here FIRST (as this did) means a gradle or pbxproj
+  // write that then fails — which `guarded` catches by design, so the pass continues — leaves the
+  // anchor on the NEW id while those files still hold the OLD one. The next pass reads the new
+  // id, its scoped regex matches nothing, and it reports no change: the divergence is permanent
+  // and SILENT, and the per-file guard that made the failure survivable is exactly what made it
+  // unrecoverable. Committing the anchor last, and only when the id-bearing writes SUCCEEDED,
+  // makes a partial failure retryable instead.
   const capPath = path.join(projectRoot, 'capacitor.config.json');
+  let capJson: Record<string, unknown> | undefined;
   guarded('capacitor.config.json', () => {
     if (!fs.existsSync(capPath)) return;
     try {
       const json = JSON.parse(fs.readFileSync(capPath, 'utf8')) as Record<string, unknown>;
-      const before = JSON.stringify(json, null, 2) + '\n';
       if (typeof json.appId === 'string' && json.appId) oldId = json.appId;
-      if (id && json.appId !== id) {
+      capJson = json;
+    } catch {
+      notes.push('capacitor.config.json exists but does not parse — identity not synced there');
+    }
+  });
+
+  /** Commit the anchor. Called only after every native file has had its turn — see the banner
+   *  above for why the ordering is load-bearing rather than incidental. */
+  const writeCapacitorConfig = (): void => {
+    guarded('capacitor.config.json', () => {
+      const json = capJson;
+      if (!json) return;
+      const before = JSON.stringify(json, null, 2) + '\n';
+      if (id && json.appId !== id && idWriteFailed) {
+        notes.push(
+          'capacitor.config.json appId left at the OLD id because an id-bearing native file '
+          + 'failed to sync — it is the anchor those rewrites are scoped to, so advancing it now '
+          + 'would strand them permanently. Fix the failure above; the next open/build retries.',
+        );
+      } else if (id && json.appId !== id) {
         if (typeof json.appId === 'string' && json.appId) idChangedFrom = json.appId;
         json.appId = id;
       }
@@ -1739,10 +1808,8 @@ export function healAppIdentity(projectRoot: string, appId: unknown, appName: un
         fs.writeFileSync(capPath, out);
         notes.push('synced capacitor.config.json identity');
       }
-    } catch {
-      notes.push('capacitor.config.json exists but does not parse — identity not synced there');
-    }
-  });
+    });
+  };
 
   /** Scoped id replacement for gradle/pbxproj. Returns whether anything moved. */
   const replaceScoped = (text: string, re: RegExp, to: string): { text: string; changed: boolean } => {
@@ -1751,6 +1818,16 @@ export function healAppIdentity(projectRoot: string, appId: unknown, appName: un
   };
   /** Emit once, not per file, when the old id could not be anchored. */
   const noteIdSkipped = (): void => {
+    // ⚠️ This ALSO blocks the anchor, and that is the point — the invariant the anchor gate has
+    // to express is "did the id LAND?", not "did anything throw?". Reaching here is the second,
+    // NON-throwing way for the id rewrite to not happen: with no `oldId` there is nothing to
+    // scope on, so gradle/pbxproj are skipped and `guarded()` still returns true. Gating the
+    // anchor on exceptions alone let that case commit the new id anyway, which is exactly the
+    // permanent silent divergence this whole ordering exists to prevent, reached through the
+    // other door. Concretely: a capacitor.config.json that PARSES but carries no `appId` leaves
+    // gradle on the old id, advances the anchor to the new one, and every later pass then
+    // searches for an id the file does not contain, finds nothing, and reports NOTHING.
+    idWriteFailed = true;
     if (idSkipNoted) return;
     idSkipNoted = true;
     notes.push('cannot determine this project\'s previous bundle id (capacitor.config.json missing or unreadable) — applicationId/PRODUCT_BUNDLE_IDENTIFIER NOT rewritten; fix or restore capacitor.config.json first');
@@ -1758,7 +1835,7 @@ export function healAppIdentity(projectRoot: string, appId: unknown, appName: un
 
   // Android half.
   const gradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
-  guarded('build.gradle', () => {
+  if (!guarded('build.gradle', () => {
     if (!fs.existsSync(gradle)) return;
     const orig = fs.readFileSync(gradle, 'utf8');
     let text = orig;
@@ -1774,20 +1851,24 @@ export function healAppIdentity(projectRoot: string, appId: unknown, appName: un
       }
     }
     if (text !== orig) fs.writeFileSync(gradle, text);
-  });
+  })) idWriteFailed = true;
   const strings = path.join(projectRoot, 'android', 'app', 'src', 'main', 'res', 'values', 'strings.xml');
   guarded('strings.xml', () => {
     if (!fs.existsSync(strings)) return;
     const orig = fs.readFileSync(strings, 'utf8');
     let text = orig;
+    // Every write below goes through `replaceAllIfMatches` (a literal replacer, never a
+    // replacement PATTERN) and an escaper. The id needs neither in principle — `usableIdentity`
+    // already bars `$`, `&` and `<` — but routing it the same way makes the safe path the ONLY
+    // path here, rather than a property of one field a later edit could forget.
     if (id) {
       // package_name / custom_url_scheme ARE the app id by definition — no scoping needed.
-      text = text.replace(/(<string name="package_name">)[^<]*(<\/string>)/g, `$1${id}$2`);
-      text = text.replace(/(<string name="custom_url_scheme">)[^<]*(<\/string>)/g, `$1${id}$2`);
+      text = replaceAllIfMatches(text, /(<string name="package_name">)[^<]*(<\/string>)/g, androidResText(id)).text;
+      text = replaceAllIfMatches(text, /(<string name="custom_url_scheme">)[^<]*(<\/string>)/g, androidResText(id)).text;
     }
     if (name) {
-      text = text.replace(/(<string name="app_name">)[^<]*(<\/string>)/g, `$1${name}$2`);
-      text = text.replace(/(<string name="title_activity_main">)[^<]*(<\/string>)/g, `$1${name}$2`);
+      text = replaceAllIfMatches(text, /(<string name="app_name">)[^<]*(<\/string>)/g, androidResText(name)).text;
+      text = replaceAllIfMatches(text, /(<string name="title_activity_main">)[^<]*(<\/string>)/g, androidResText(name)).text;
     }
     if (text !== orig) {
       fs.writeFileSync(strings, text);
@@ -1797,7 +1878,7 @@ export function healAppIdentity(projectRoot: string, appId: unknown, appName: un
 
   // iOS half.
   const pbx = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
-  guarded('pbxproj', () => {
+  if (!guarded('pbxproj', () => {
     if (!fs.existsSync(pbx)) return;
     const orig = fs.readFileSync(pbx, 'utf8');
     if (id) {
@@ -1812,7 +1893,7 @@ export function healAppIdentity(projectRoot: string, appId: unknown, appName: un
         }
       }
     }
-  });
+  })) idWriteFailed = true;
   const plist = path.join(projectRoot, 'ios', 'App', 'App', 'Info.plist');
   guarded('Info.plist', () => {
     if (!fs.existsSync(plist) || !name) return;
@@ -1820,13 +1901,18 @@ export function healAppIdentity(projectRoot: string, appId: unknown, appName: un
     const { text, changed } = replaceAllIfMatches(
       orig,
       /(<key>CFBundleDisplayName<\/key>\s*<string>)[^<]*(<\/string>)/g,
-      `$1${name}$2`,
+      // Plain XML here, NOT `androidResText` — a plist has no AAPT2 apostrophe rule, and
+      // backslash-escaping an apostrophe would put the backslash in the displayed name.
+      xmlText(name),
     );
     if (changed) {
       fs.writeFileSync(plist, text);
       notes.push('synced CFBundleDisplayName (Info.plist)');
     }
   });
+
+  // The anchor, committed only now that every native file has had its turn.
+  writeCapacitorConfig();
 
   if (idChangedFrom) {
     notes.push(

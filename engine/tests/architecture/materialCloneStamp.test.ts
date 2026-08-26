@@ -28,16 +28,19 @@ const RUNTIME = join(__dirname, '../../packages/modoki/src/runtime');
  *  is the exact failure this guard exists to prevent. */
 const CLONE = /(^|[^A-Za-z0-9_])(\w*[Mm]aterial|base|mat)\s*\.clone\(\)/;
 
+/** `cloneDerived(material, base)` — the shared helper that clones, stamps ON its own clone line,
+ *  and suppresses the `userData` round-trip (#325). A call to it IS a stamped clone site: the
+ *  stamp cannot be forgotten because the caller never writes the `.clone()`. Tracked separately so
+ *  the known-sites check below still names every file that mints a mesh-bound material, which is
+ *  the signal that would otherwise be lost by routing sites through a helper. */
+const CLONE_HELPER = /(^|[^A-Za-z0-9_])cloneDerived\s*\(/;
+
 /** Clone sites that do NOT need the stamp on the line, each with the reason. Keyed by
  *  `runtime`-relative path + the distinguishing text of the line. */
 const EXEMPT: Array<{ file: string; contains: string; why: string }> = [
-  {
-    file: 'rendering/lightMaskVariants.ts',
-    contains: 'base.clone() as LightsNodeMaterial',
-    why: 'stamped a few lines down, and it must be: the `material.userData = {...}` assignment '
-      + 'that writes __lightMaskBase would have to spread a stamp written first, and the two keys '
-      + 'answer different questions (see the module header). Its own tests cover the stamp.',
-  },
+  // `lightMaskVariants`' own `base.clone()` used to sit here. It is now a `cloneDerived` call
+  // (#325): that site had the very `userData` round-trip this family of bugs is made of, because
+  // `applyLightMask` hands it a `markDerived` clone whenever the mesh is tinted or instanced.
 ];
 
 /** POSIX-normalised so the `EXEMPT` keys and the known-sites set below — both hand-authored with
@@ -77,37 +80,62 @@ function codeLines(src: string): Array<{ n: number; text: string }> {
   return out;
 }
 
+/** The one file allowed to contain a raw material `.clone()`: the helper itself. */
+const HELPER_FILE = 'rendering/derivedMaterials.ts';
+
 describe('material clones carry the derived-base stamp', () => {
-  it('every material .clone() in runtime/ is markDerived-wrapped or allowlisted', () => {
-    const unstamped: string[] = [];
+  it('every material .clone() in runtime/ goes through cloneDerived or is allowlisted', () => {
+    // ⚠️ The invariant TIGHTENED in #325, and `markDerived` on the line is no longer enough.
+    // Stamping only ever answered "does the sweep see this holder"; it says nothing about the
+    // `userData` JSON round-trip, so a site could be fully stamp-compliant and still serialise a
+    // material graph — which is exactly what `videoTextureSync`, `lightMaskVariants`,
+    // `tintedMaterial` and `applyPropOverride` were all doing while this guard was green. The rule
+    // is now "use the helper", and the helper is the only place the raw clone may live.
+    const raw: string[] = [];
     for (const file of walk(RUNTIME)) {
       const rel = toPosix(relative(RUNTIME, file));
+      if (rel === HELPER_FILE) continue;
       for (const { n, text } of codeLines(readFileSync(file, 'utf8'))) {
         if (!CLONE.test(text)) continue;
-        if (text.includes('markDerived')) continue;
         if (EXEMPT.some((e) => e.file === rel && text.includes(e.contains))) continue;
-        unstamped.push(`${rel}:${n} — ${text.trim()}`);
+        raw.push(`${rel}:${n} — ${text.trim()}`);
       }
     }
-    expect(unstamped, 'a material clone bound to a mesh must be markDerived(clone, base) — see '
-      + 'runtime/rendering/derivedMaterials.ts. If this clone is never bound to a live mesh, add '
-      + 'it to EXEMPT with the reason.').toEqual([]);
+    expect(raw, 'a material clone bound to a mesh must go through cloneDerived(material, base) — '
+      + 'see runtime/rendering/derivedMaterials.ts. A bare .clone() JSON-round-trips userData, '
+      + 'which serialises any Material or Texture parked in it and drops the own properties that '
+      + 'make a light-mask variant distinct. If this clone is never bound to a live mesh, add it '
+      + 'to EXEMPT with the reason.').toEqual([]);
   });
 
   it('finds the known clone sites — the scan is not vacuously passing', () => {
     // The guard above is a NEGATIVE assertion, which a broken regex satisfies perfectly. This is
     // the distinguishing check: the scan must still SEE the sites it is meant to police.
-    const stamped: string[] = [];
+    //
+    // Counted by `cloneDerived` CALLS only — deliberately not "has markDerived on the line". The
+    // looser form made reverting a migrated site invisible: it kept the set identical, so the two
+    // sites this guard's own rule was extended to cover could have gone back to a bare stamped
+    // clone with the suite green.
+    const sites: string[] = [];
+    let helperStampsItsOwnClone = false;
     for (const file of walk(RUNTIME)) {
       const rel = toPosix(relative(RUNTIME, file));
       for (const { text } of codeLines(readFileSync(file, 'utf8'))) {
-        if (CLONE.test(text) && text.includes('markDerived')) stamped.push(rel);
+        if (rel === HELPER_FILE) {
+          // The helper is where the ONE raw clone lives, and it must still stamp on that line.
+          if (CLONE.test(text) && text.includes('markDerived')) helperStampsItsOwnClone = true;
+          continue;
+        }
+        if (CLONE_HELPER.test(text) && !text.startsWith('import')) sites.push(rel);
       }
     }
-    expect(new Set(stamped)).toEqual(new Set([
+    expect(new Set(sites)).toEqual(new Set([
+      'rendering/lightMaskVariants.ts',      // per-(base, light-selection) variants
       'rendering/scene3DSync.ts',            // tint clones + the prewarm side-pinned variants
       'rendering/materialInstanceClones.ts', // per-entity prop clones (single + array)
       'rendering/videoTextureSync.ts',       // the per-entity video-surface clone
     ]));
+    expect(helperStampsItsOwnClone, 'cloneDerived must still markDerived on its own clone line')
+      .toBe(true);
   });
 });
