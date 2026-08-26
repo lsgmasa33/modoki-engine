@@ -21,6 +21,7 @@ const INVOKE_CHANNELS = new Set<string>([
   'modoki:connect-claude-status',
   'modoki:set-cdp-enabled',
   'modoki:clear-browser-caches',
+  'modoki:flush-storage-data',
 ]);
 
 // Backend base handed in via additionalArguments (`--modoki-backend-base=...`).

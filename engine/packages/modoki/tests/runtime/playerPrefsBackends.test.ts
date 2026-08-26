@@ -81,6 +81,35 @@ describe('LocalStorageBackend', () => {
     const b = new LocalStorageBackend();
     await expect(b.set('mk:g1:a', 'A')).rejects.toThrow();
   });
+
+  describe('flush() — Electron forced-commit lever (#335)', () => {
+    it('is a no-op in a headless/node context with no `window` global at all', async () => {
+      expect(typeof window).toBe('undefined'); // this suite's env — the branch this case names
+      const b = new LocalStorageBackend();
+      await expect(b.flush!()).resolves.toBeUndefined();
+    });
+
+    it('is a no-op in a plain browser tab (`window` present, no __modokiElectron bridge)', async () => {
+      vi.stubGlobal('window', {}); // a real browser global with nothing Electron-specific on it
+      const b = new LocalStorageBackend();
+      await expect(b.flush!()).resolves.toBeUndefined();
+    });
+
+    it('invokes modoki:flush-storage-data when __modokiElectron is present', async () => {
+      const invoke = vi.fn().mockResolvedValue({ ok: true });
+      vi.stubGlobal('window', { __modokiElectron: { invoke } });
+      const b = new LocalStorageBackend();
+      await b.flush!();
+      expect(invoke).toHaveBeenCalledWith('modoki:flush-storage-data');
+    });
+
+    it('swallows a rejected invoke — best-effort, never poisons the write pipeline', async () => {
+      const invoke = vi.fn().mockRejectedValue(new Error('ipc gone'));
+      vi.stubGlobal('window', { __modokiElectron: { invoke } });
+      const b = new LocalStorageBackend();
+      await expect(b.flush!()).resolves.toBeUndefined();
+    });
+  });
 });
 
 describe('PreferencesBackend', () => {

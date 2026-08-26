@@ -1791,6 +1791,18 @@ app.whenReady().then(async () => {
     }
   });
 
+  // PlayerPrefs durability (#335): Chromium's localStorage-backed LevelDB store commits to
+  // disk only on a clean shutdown, so a SIGKILL right after `flush()` resolves can still lose
+  // the write. `session.flushStorageData()` is a real, main-process-only hook that forces that
+  // commit — PlayerPrefs' Electron/web backend calls this after every write reaches
+  // `localStorage`, shrinking the loss window to "the one write in flight" (docs/player-prefs.md
+  // § Gotchas).
+  ipcMain.handle('modoki:flush-storage-data', (e) => {
+    if (!fromMainFrame(e)) return { ok: false, error: 'untrusted frame' };
+    mainWindow?.webContents.session.flushStorageData();
+    return { ok: true };
+  });
+
   ipcMain.handle('modoki:set-cdp-enabled', (e, enabled: boolean) => {
     if (!fromMainFrame(e)) return { ok: false, error: 'untrusted frame' };
     // The remote-debugging switch is applied at STARTUP only (cdp.ts), so a change
