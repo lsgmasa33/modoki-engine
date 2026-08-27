@@ -427,10 +427,30 @@ Connection setup + full guide: `engine/tools/game-debug-mcp/CONNECTION.md`; leas
 resume-in-grace / expiry+takeover / not-owner / non-owner-drop-doesn't-re-arm) that
 `engine/tests/plugins/deviceLeaseGoldenVectors.test.ts` pins the TS authority to, and the
 `LeaseCoreTests.swift` / `LeaseCoreTest.java` templates replay against a pure `LeaseCore` port.
-**Follow-up:** wire the native test targets (a Package.swift test target + the Android `src/test`
-sourceSet + `org.json` testImpl) and refactor the plugins to delegate their arbitration to `LeaseCore`
-so the native tests cover the shipping code (which also lets the native grace drop its timer for the
-spec's timer-free lazy expiry).
+**Both native replays now RUN** (#376) — before that neither ever had, and the Swift one's fixture
+path was off by one directory, which is what an unrunnable test cannot tell you. They are wired to
+`npm run test:native` (`engine/scripts/test-native.mjs`), an **on-demand** gate: `npm run verify` is
+vitest and can run neither XCTest nor gradle, so their silence there is deliberate and each file's
+header says so.
+
+| replay | runner |
+|---|---|
+| `engine/tests/plugins/deviceLeaseGoldenVectors.test.ts` | vitest — in `npm run verify` |
+| `LeaseCoreTests.swift` | `swift test --package-path` the standalone `capacitor-game-debug/ios/Tests/Package.swift` |
+| `LeaseCoreTest.java` | gradle on `capacitor-game-debug/android/test-harness` (plain JVM — no AGP, no SDK, no emulator) |
+
+Both harnesses live **outside** the plugin's packed fileset on purpose, so adding them did not move
+the content hash or force a re-vendor. The iOS one is a separate package rather than a `testTarget`
+in the plugin's `Package.swift` because that package is iOS-only and pulls in capacitor-swift-pm —
+`swift test` cannot run it from a terminal at all — and because `ios/Tests/` is unshipped, so a
+`testTarget` in the shipped manifest would name a path the vendored tarball does not contain.
+
+⚠️ **A green native run proves the PORTS agree with the vectors, not the plugin.** `LeaseCore` still
+lives inside each test file while `GameDebugPlugin` keeps its own lease state behind a platform timer
+(`DispatchWorkItem` / `Handler.postDelayed`). **Follow-up:** extract `LeaseCore` into the shipping
+sources and have `evaluateLease`/`startLeaseGrace` delegate to it, which also lets the native grace
+drop its timer for the spec's timer-free lazy expiry — a behavioural native change, so it needs
+device verification, and #376 deliberately stopped short of it.
 
 ## Heal-on-open & project deps
 

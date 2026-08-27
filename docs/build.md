@@ -1137,7 +1137,20 @@ Two notes worth carrying:
   its tarball. Expect a re-vendor after a docs-only plugin edit.
 - To re-vendor **without** building: `node engine/scripts/vendor-plugins.mjs games/<id>`, then
   `npm install` in the project. `engine/tests/architecture/vendoredPluginFreshness.test.ts` fails
-  `npm test` on a project whose pin has gone stale.
+  `npm test` on a project whose pin has gone stale — and, since #375, on a tarball whose NAME is
+  current while its BYTES are not. That second check OPENS the `.tgz` and compares it to the plugin
+  source file by file; the name check alone let an interrupted re-vendor, a merge that took the new
+  `package.json` with the old `plugins/*.tgz`, or a `git checkout <old-sha> -- <project>/plugins/`
+  pass green and ship the previous native code. It compares the shipped set MINUS `dist/` — the same
+  set the tarball's NAME is computed over. `dist/` is deliberately out of scope: it is gitignored,
+  rebuilt per clone, and the vendorer already refuses to re-pack on a dist-only change (the
+  "toolchain-drift churn killer" test), so failing on one would demand a re-vendor of all 21
+  tarballs plus 21 lockfiles for a tsc patch bump — the exact churn that decision exists to
+  prevent. Two halves of one system cannot hold opposite positions on the same input. A third check hashes each tarball and compares it to the `integrity` its
+  project's `package-lock.json` records (driven off the lockfile, so a project that drops the dep
+  from `package.json` while the lock keeps it is still seen) — a re-vendor can rewrite a tarball under an UNCHANGED name
+  (the name omits `dist/` by design), and a lockfile not refreshed in the same commit breaks
+  `npm ci` in CI and in every fresh clone while a warm `node_modules` hides it locally.
 - **Re-vendoring is NOT automatic on an ordinary build** — it only runs on project open/scaffold,
   or when `ensureCapacitorDeps` detects a missing dep. So editing `engine/packages/capacitor-<x>/**`
   mid-session and then just re-running a build silently builds against the STALE vendored copy.

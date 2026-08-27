@@ -125,6 +125,32 @@ export function hasAnyProject(): boolean {
   return discoverProjects(REPO_ROOT).length > 0;
 }
 
+/** True when at least one project carries a COMMITTED vendored plugin tarball
+ *  (`<project>/plugins/*.tgz`).
+ *
+ *  Narrower than `hasAnyProject()`, and the CI snapshot is what separates them:
+ *  `scripts/publish-engine-oss.sh` deletes `ios android packages plugins` from every demo it
+ *  stages AND strips every `file:` dependency from its package.json, so the snapshot has
+ *  projects and no vendored plugins at all. #375's guards open those tarballs and assert they
+ *  opened at least one, so on the loose predicate they would fail the public gate for having
+ *  nothing to check.
+ *
+ *  ⚠️ It reads the TARBALLS, not the dependency specs those guards iterate — deliberately. A
+ *  predicate computed from the guard's own join is self-disabling: rename what
+ *  `listEnginePlugins()` reports, or move the `file:` pin into `devDependencies`, and the
+ *  premise silently goes false, the guards skip, and `npm run verify` stays green with #375's
+ *  check dead. Reading a different fact means that breakage lands as a RED "checked nothing"
+ *  instead. Same lesson as `hasInternalGames()` above, one notch over. */
+export function hasVendoredPluginTarballs(): boolean {
+  return discoverProjects(REPO_ROOT).some((p) => {
+    try {
+      return fs.readdirSync(path.join(p.dir, 'plugins')).some((f) => f.endsWith('.tgz'));
+    } catch {
+      return false; // no plugins/ dir — the snapshot's state, and a legitimate project's
+    }
+  });
+}
+
 /** True when at least one TRACKED iOS Xcode project (`project.pbxproj`) exists.
  *
  *  Narrower than `hasAnyProject()` on purpose, and the CI snapshot is exactly what separates

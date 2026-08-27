@@ -1,0 +1,89 @@
+// Runs android/src/test/java as a PLAIN JVM test — no Android SDK, no AGP, no emulator (#376).
+//
+// Why not the real android module. `../build.gradle` is `com.android.library` and depends on
+// `project(':capacitor-android')`, so it only builds inside a consuming app's gradle project —
+// and `android/src/test/` is NOT in package.json `files`, so the vendored copy a game consumes
+// contains no test sources at all. The test therefore can only ever run in-repo, and everything it
+// touches (LeaseCore + org.json + junit) is pure JVM. This harness is the smallest thing that
+// actually runs it.
+//
+// Deliberately OUTSIDE the packed fileset (`files: ["android/src/main/", "android/build.gradle", …]`)
+// so adding it does not move the plugin's content hash and re-vendor all 21 consuming projects
+// (#90 / #375). Adding junit here rather than to ../build.gradle is the same reasoning.
+//
+// Run it via `npm run test:native` (engine/scripts/test-native.mjs) — an ON-DEMAND gate; `npm run
+// verify` is vitest and cannot run gradle.
+plugins {
+    id 'java'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    // JVM unit tests get no android org.json stub — the real artifact is required.
+    testImplementation 'org.json:json:20240303'
+}
+
+sourceSets {
+    test {
+        java {
+            srcDirs = ['../src/test/java']
+        }
+    }
+}
+
+// A harness pointed at the wrong directory compiles nothing, runs nothing, and gradle reports
+// BUILD SUCCESSFUL — measured: a typo'd srcDirs gave `:test NO-SOURCE`, exit 0. So the source set
+// is checked at CONFIGURATION time.
+//
+// ⚠️ It interrogates `sourceSets.test.java` — the RESOLVED set — not `file('../src/test/java')`.
+// The first version of this guard checked the literal path, which is a different quantity: with a
+// typo'd srcDirs the path still existed, the guard passed, and zero tests ran anyway. Measured, on
+// the guard written to prevent exactly that. And a `doLast` results check cannot cover it either:
+// a NO-SOURCE task never runs its actions.
+def leaseTests = sourceSets.test.java.matching { include '**/*Test*.java' }.files
+if (leaseTests.isEmpty()) {
+    throw new GradleException(
+        "no test sources resolved from ${sourceSets.test.java.srcDirs} — srcDirs is wrong, the tests moved, " +
+        "or a file was renamed out of the '*Test*.java' convention this guard matches on")
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+test {
+    // The golden vectors are read at RUNTIME (the test walks up to test-vectors/), so gradle cannot
+    // see them as an input on its own — and it does not: perturbing the fixture left `:test`
+    // UP-TO-DATE and the leg reported PASS while running nothing. Declaring the file fixes it. A
+    // green run that skipped the work is the exact failure mode #376 is about.
+    inputs.file(file('../../test-vectors/lease-golden-vectors.json'))
+
+    // …and never UP-TO-DATE. Declaring the fixture fixed the case where it CHANGED, but a second
+    // `npm run test:native` with nothing changed still reported PASS while executing nothing — and
+    // for an on-demand gate whose entire purpose is "a green run means the assertions ran", one
+    // second of re-running beats a green that means gradle skipped the work.
+    outputs.upToDateWhen { false }
+
+    testLogging {
+        events 'passed', 'failed', 'skipped'
+        exceptionFormat = 'full'
+    }
+
+    // The belt to the configuration-time brace: assert that results were actually produced. NOT an
+    // `afterSuite` listener — that was the first attempt and it is dead code, because gradle emits
+    // no root suite event when zero test classes exist (so it cannot fire in the one case its own
+    // message named), and it is removed in Gradle 9 besides.
+    doLast {
+        def xml = reports.junitXml.outputLocation.get().asFile
+        def produced = xml.isDirectory() ? xml.listFiles({ f -> f.name.endsWith('.xml') } as FileFilter) : null
+        if (!produced || produced.length == 0) {
+            throw new GradleException("no test results in ${xml} — zero tests ran")
+        }
+    }
+}

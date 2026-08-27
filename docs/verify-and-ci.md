@@ -123,6 +123,39 @@ a run is requested, read BOTH legs before calling it green** — but note that r
 so on an ordinary push there is no remote leg at all: local `verify` + `test:e2e` is the whole
 gate, and the Windows class of bug is simply unguarded until the next manual run.
 
+### `test:native` — the on-demand native gate
+
+`npm run verify` is vitest. It cannot run XCTest and it cannot run gradle, so anything written in
+Swift or Java is structurally outside it. **`npm run test:native`** (`engine/scripts/test-native.mjs`)
+is where those suites run, on demand. Four legs today, all golden-vector parity replays:
+
+| leg | what runs it |
+|---|---|
+| `ios/lease-parity` | `swift test` on the standalone `capacitor-game-debug/ios/Tests` package — no deps, no simulator, seconds |
+| `android/lease-parity` | gradle on `capacitor-game-debug/android/test-harness` — plain JVM, no AGP, no Android SDK |
+| `ios/ota-core` | `swift test` on `capacitor-modoki-ota/core` (already a standalone package) |
+| `android/ota-core` | `javac` + `java` on `OtaCoreSelfTest` — a `main()` that exits non-zero, no gradle at all |
+
+The lease legs were wired in #376 after both sat unrunnable — and therefore permanently
+green-looking — since they were written; the OTA legs existed only as two hand-typed recipes in
+[ota-updates.md](./ota-updates.md), so they ran when somebody remembered.
+
+Gradle comes from `MODOKI_GRADLE`, else any project's committed `gradlew`, else a system `gradle`
+— the wrapper before PATH deliberately, since every wrapper here pins 8.14.3 while a Homebrew/scoop
+`gradle` is 9.x. (Those wrappers pin the `-all` distribution, so the very first run on a machine
+with no cached wrapper distribution downloads ~200 MB; set `MODOKI_GRADLE` to skip that.) `JAVA_HOME` comes from `print-toolchain-env.mjs`, never from
+`/usr/libexec/java_home -v 21` (which on this Mac hands back a JDK 25 path with exit 0).
+
+A leg that cannot run on this machine reports **SKIP** with the reason, as loudly as a failure, and
+`--require-all` makes a skip fatal. That is the point: the defect these tests were part of is a test
+that never runs looking exactly like a test that passes.
+
+⚠️ **It is not part of `npm run verify` and must not be** — but nor is it optional after touching
+`engine/packages/capacitor-*/**`. And read the legs separately: the OTA ones replay the SHIPPING
+`OtaCore`, while the lease ones replay a port that lives inside the test file — a green lease leg
+does not vouch for `GameDebugPlugin` ([native-and-sdks.md](./native-and-sdks.md) § Lease parity
+harness).
+
 ### `verify:publish` — the hub-only privacy gate
 
 **On the HUB, add `npm run verify:publish` before pushing `main`** — ~5s, and it is the only

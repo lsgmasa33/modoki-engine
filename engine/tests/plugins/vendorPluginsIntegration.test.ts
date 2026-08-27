@@ -12,7 +12,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { pluginHashInputs } from '../../plugins/vendorPlugins';
+import * as tar from 'tar';
+import { pluginHashInputs, compareTarballToSource } from '../../plugins/vendorPlugins';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const enginePkgs = path.join(repoRoot, 'engine', 'packages');
@@ -135,4 +136,115 @@ describe.skipIf(!esbuildOk())('vendor-plugins.mjs CLI runs (esbuild-bundled, no 
     const dep = JSON.parse(fs.readFileSync(path.join(tmp, 'package.json'), 'utf8')).dependencies[pluginName];
     expect(dep).toBe(`file:plugins/${tgz[0]}`);
   }, 130_000);
+});
+
+// ── The tarball's BYTES, not its name (#375) ──────────────────────────────────
+// `vendoredPluginFreshness` now opens each committed .tgz and compares it to the plugin source.
+// That guard is green on a healthy repo — which is exactly what a guard that checks NOTHING also
+// looks like, and this repo's recurring defect. So this drives compareTarballToSource with
+// deliberately drifted tarballs and asserts each kind of drift is actually reported. Real tar, real
+// gzip, a throwaway plugin dir — never the repo's own.
+describe('compareTarballToSource detects a tarball whose NAME is fine and whose BYTES are not', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tgz-drift-'));
+  afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  const pluginDir = path.join(tmp, 'plugin');
+  const tarball = path.join(tmp, 'fixture.tgz');
+
+  /** A minimal plugin whose shipped set is `ios/Sources/` + `dist/` (plus npm's always-shipped
+   *  package.json). No `src/`, so the dist is authoritative and its bytes ARE compared. */
+  function writePlugin(native: string, dist: string) {
+    fs.mkdirSync(path.join(pluginDir, 'ios', 'Sources'), { recursive: true });
+    fs.mkdirSync(path.join(pluginDir, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, 'package.json'), JSON.stringify({
+      name: 'capacitor-fixture', version: '1.0.0', files: ['ios/Sources/', 'dist/'],
+    }, null, 2));
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Sources', 'Plugin.swift'), native);
+    fs.writeFileSync(path.join(pluginDir, 'dist', 'plugin.js'), dist);
+    // Not shipped (not in `files`) — a change here must never read as drift.
+    fs.mkdirSync(path.join(pluginDir, 'ios', 'Tests'), { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Tests', 'PluginTests.swift'), '// tests\n');
+  }
+
+  /** Pack the plugin's shipped set the way npm pack lays it out: everything under `package/`. */
+  function pack() {
+    const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tgz-stage-'));
+    fs.cpSync(pluginDir, path.join(stage, 'package'), { recursive: true });
+    fs.rmSync(path.join(stage, 'package', 'ios', 'Tests'), { recursive: true, force: true });
+    tar.create({ file: tarball, sync: true, gzip: true, cwd: stage }, ['package']);
+    fs.rmSync(stage, { recursive: true, force: true });
+  }
+
+  it('reports NOTHING when the tarball matches (the baseline this rests on)', () => {
+    writePlugin('// v1 native\n', '// v1 js\n');
+    pack();
+    const r = compareTarballToSource(tarball, pluginDir);
+    expect(r.drift).toEqual([]);
+    // The fileset really was walked — an empty drift from an unread tarball looks identical.
+    expect(r.skipped.map((s) => s.path)).toContain('dist/plugin.js');
+  });
+
+  it('reports bytes-differ when the SOURCE moved on and the tarball did not — the #375 case', () => {
+    writePlugin('// v1 native\n', '// v1 js\n');
+    pack();
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Sources', 'Plugin.swift'), '// v2 native — the fix\n');
+    expect(compareTarballToSource(tarball, pluginDir).drift)
+      .toEqual([{ path: 'ios/Sources/Plugin.swift', kind: 'bytes-differ' }]);
+  });
+
+  it('stays SILENT on a changed dist — the toolchain-drift decision the vendorer already made', () => {
+    // dist/ is gitignored and rebuilt per clone; a tsc/rollup patch bump changes its bytes with no
+    // source change and no tarball rename (vendorPlugins.test.ts pins that: "does NOT re-pack when
+    // ONLY the built dist/ changes"). A guard that failed here would demand a re-vendor of all 21
+    // tarballs plus 21 lockfiles — the churn the vendorer exists to refuse.
+    writePlugin('// v1 native\n', '// v1 js\n');
+    pack();
+    fs.writeFileSync(path.join(pluginDir, 'dist', 'plugin.js'), '// built by a newer rollup\n');
+    fs.writeFileSync(path.join(pluginDir, 'dist', 'plugin.cjs.js'), '// a file the newer build emits\n');
+    expect(compareTarballToSource(tarball, pluginDir).drift).toEqual([]);
+  });
+
+  it('reports missing-from-tarball for a shipped file the tarball never got', () => {
+    writePlugin('// v1 native\n', '// v1 js\n');
+    pack();
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Sources', 'Extra.swift'), '// added after packing\n');
+    expect(compareTarballToSource(tarball, pluginDir).drift)
+      .toEqual([{ path: 'ios/Sources/Extra.swift', kind: 'missing-from-tarball' }]);
+  });
+
+  it('reports not-in-source for a tarball entry the plugin no longer has', () => {
+    writePlugin('// v1 native\n', '// v1 js\n');
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Sources', 'Doomed.swift'), '// deleted after packing\n');
+    pack();
+    fs.rmSync(path.join(pluginDir, 'ios', 'Sources', 'Doomed.swift'));
+    expect(compareTarballToSource(tarball, pluginDir).drift)
+      .toEqual([{ path: 'ios/Sources/Doomed.swift', kind: 'not-in-source' }]);
+  });
+
+  it('a NON-dist file differing only by CRLF IS drift — the exactness dist does not get', () => {
+    // The scoping half of the previous test. `.gitattributes` pins eol=lf for every extension the
+    // plugins ship, so a newline difference in shipped source is real drift, not a Windows
+    // checkout — and nothing measured that until this test.
+    writePlugin('// line one\n// line two\n', '// v1 js\n');
+    pack();
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Sources', 'Plugin.swift'), '// line one\r\n// line two\r\n');
+    expect(compareTarballToSource(tarball, pluginDir).drift)
+      .toEqual([{ path: 'ios/Sources/Plugin.swift', kind: 'bytes-differ' }]);
+  });
+
+  it('needs no local dist at all — the state of every CI machine before build:plugins', () => {
+    writePlugin('// v1 native\n', '// v1 js\n');
+    pack();
+    fs.rmSync(path.join(pluginDir, 'dist'), { recursive: true, force: true });
+    // The old stamp-gated version compared nothing here; the version after it reported all 12
+    // dist entries as `not-in-source`. Neither is right: dist is simply not this check's business.
+    expect(compareTarballToSource(tarball, pluginDir).drift).toEqual([]);
+  });
+
+  it('stays silent on a NON-shipped file — the scoping that keeps this from crying wolf', () => {
+    writePlugin('// v1 native\n', '// v1 js\n');
+    pack();
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Tests', 'PluginTests.swift'), '// edited tests\n');
+    expect(compareTarballToSource(tarball, pluginDir).drift).toEqual([]);
+  });
 });

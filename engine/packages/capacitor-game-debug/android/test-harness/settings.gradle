@@ -1,0 +1,2 @@
+// Standalone JVM harness for the plugin's Android parity test (#376). See build.gradle.
+rootProject.name = 'game-debug-lease-parity'

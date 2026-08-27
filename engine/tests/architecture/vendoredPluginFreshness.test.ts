@@ -14,6 +14,13 @@
  *  it was caught only because the tarball hash was checked by hand. A guard is what removes the
  *  "someone has to think of it" step.
  *
+ *  ⚠️ The name is not the bytes (#375). For most of this guard's life it compared the plugin's
+ *  source hash against the FILENAME in each project's package.json and never opened the tarball —
+ *  so a `.tgz` with a correct name and stale contents passed green, which is the same shipping
+ *  accident by a different route (an interrupted re-vendor, a merge taking the new manifest with
+ *  the old tarball, a `git checkout <old-sha> -- <project>/plugins/`). The second test below opens
+ *  it and compares the contents; the name check stays as the cheap first pass.
+ *
  *  This asserts the STATE (what is committed), which is what an APK is actually built from. The
  *  build-path fix in `vite-asset-scanner.ts` keeps it true going forward; this catches a project
  *  that drifts anyway — e.g. a plugin edited without rebuilding every consumer, exactly the
@@ -22,10 +29,11 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import path from 'path';
+import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
-import { pluginContentHash, listEnginePlugins } from '../../plugins/vendorPlugins';
+import { pluginContentHash, listEnginePlugins, compareTarballToSource } from '../../plugins/vendorPlugins';
 import { PROJECT_ROOT_DIRS } from '../../scripts/projectRoots.mjs';
-import { hasAnyProject } from '../helpers/repoLayout';
+import { hasAnyProject, hasVendoredPluginTarballs } from '../helpers/repoLayout';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -47,6 +55,21 @@ function allProjects(): { id: string; dir: string }[] {
 describe('vendored engine plugins are not stale (#90)', () => {
   const plugins = listEnginePlugins(repoRoot);
   const projects = allProjects();
+
+  /** Every (project, plugin, spec) the repo actually pins. Iteration only — NOT the premise:
+   *  `hasVendoredPluginTarballs()` is the gate, and it reads the committed tarballs instead of
+   *  this join. Gating on `pins.length` would be self-disabling — rename what
+   *  `listEnginePlugins()` reports, or move a `file:` pin into `devDependencies`, and the guards
+   *  below would skip silently green rather than fail "checked nothing". */
+  const pins = plugins.flatMap((plugin) =>
+    projects.flatMap((project) => {
+      const pkg = JSON.parse(fs.readFileSync(path.join(project.dir, 'package.json'), 'utf8')) as {
+        dependencies?: Record<string, string>;
+      };
+      const spec = pkg.dependencies?.[plugin.name];
+      return spec ? [{ plugin, project, spec }] : [];
+    }),
+  );
 
   // Gated on the LOOSE predicate: any project that pins a plugin is in scope, so "is there
   // anything to scan?" is the question. The public RELEASE snapshot on `main` ships no projects
@@ -84,6 +107,80 @@ describe('vendored engine plugins are not stale (#90)', () => {
         + `(#90) and the CLI's \`npm run build -- --target native\` (#148). This message used to claim `
         + `"the native build does this automatically", which was true of the EDITOR path only, and it `
         + `said so to a reader who had just been burned by the CLI one.`
+      : '',
+    ).toEqual([]);
+  });
+
+  // ── The LOCKFILE's integrity, against the same bytes (#375) ───────────────────────────
+  // A lockfile records a sha512 OF THE TARBALL. Re-vendoring can rewrite a tarball under an
+  // UNCHANGED name — the name omits dist/ by design — and if the lockfiles are not refreshed in
+  // the same commit, `npm ci` fails in CI and in every fresh clone while a dev machine with warm
+  // node_modules stays happy. Nothing checked this either; it was verified by hand during #368's
+  // review, which is precisely the "someone has to think of it" step a guard removes.
+  it.skipIf(!hasVendoredPluginTarballs())('every lockfile integrity matches the committed tarball bytes', () => {
+    const problems: string[] = [];
+    let checked = 0;
+
+    // Driven off the LOCKFILE, not `pins`: a project that drops the plugin from package.json
+    // while its lockfile keeps the `file:` entry still breaks `npm ci` in every fresh clone, and
+    // that is exactly the state this test is for.
+    for (const plugin of plugins) {
+      for (const project of projects) {
+        const lockPath = path.join(project.dir, 'package-lock.json');
+        if (!fs.existsSync(lockPath)) continue; // a project may legitimately not commit one
+        const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as {
+          packages?: Record<string, { resolved?: string; integrity?: string }>;
+        };
+        const entry = lock.packages?.[`node_modules/${plugin.name}`];
+        if (!entry?.integrity || !entry.resolved?.startsWith('file:')) continue;
+        const abs = path.join(project.dir, entry.resolved.replace(/^file:/, ''));
+        if (!fs.existsSync(abs)) { problems.push(`${project.id}: lockfile resolves ${plugin.name} to ${entry.resolved}, which does not exist`); continue; }
+        const actual = `sha512-${createHash('sha512').update(fs.readFileSync(abs)).digest('base64')}`;
+        checked++;
+        if (actual !== entry.integrity) {
+          problems.push(`${project.id}: ${entry.resolved} — lockfile integrity ${entry.integrity.slice(0, 24)}… but the file hashes to ${actual.slice(0, 24)}…`);
+        }
+      }
+    }
+
+    expect(checked, 'no lockfile integrity was checked — the check ran on nothing').toBeGreaterThan(0);
+    expect(problems, problems.length
+      ? `Lockfile integrity does not match the committed tarball — \`npm ci\` will fail in CI and in `
+        + `every fresh clone, while a warm node_modules hides it locally:\n  ${problems.join('\n  ')}\n\n`
+        + `Fix: \`npm install\` in each named project and commit the package-lock.json.`
+      : '',
+    ).toEqual([]);
+  });
+
+  // ── The BYTES, not the name (#375) ────────────────────────────────────────────────────
+  // Only meaningful where a project actually pins a plugin; the release snapshot ships none.
+  it.skipIf(!hasVendoredPluginTarballs())('every pinned tarball CONTAINS the plugin source it is named after', () => {
+    const problems: string[] = [];
+    let checked = 0;
+
+    {
+      for (const { plugin, project, spec } of pins) {
+        const rel = spec.replace(/^file:/, '');
+        const abs = path.join(project.dir, rel);
+        // A dep spec pointing at a tarball that is not there breaks `npm install` outright, and
+        // the name-only check above cannot see it — it reads the string, not the disk.
+        if (!fs.existsSync(abs)) { problems.push(`${project.id}: ${plugin.name} pins "${spec}" but ${rel} does not exist`); continue; }
+        const { drift } = compareTarballToSource(abs, plugin.dir);
+        checked++;
+        for (const d of drift) problems.push(`${project.id}: ${rel} — ${d.path} ${d.kind}`);
+      }
+    }
+
+    // A guard that checked nothing must not report green (repoLayout.ts's own header). hasAnyProject
+    // says some project exists; this says at least one of them actually pins a plugin we opened.
+    expect(checked, 'no committed plugin tarball was opened — the check ran on nothing').toBeGreaterThan(0);
+    expect(problems, problems.length
+      ? `Committed plugin tarball(s) do NOT match the plugin source, despite a CURRENT name — `
+        + `a build from these would report success and ship the tarball's (older) native code:\n  `
+        + `${problems.join('\n  ')}\n\n`
+        + `Fix: \`node engine/scripts/vendor-plugins.mjs <projectDir>\` then \`npm install\` in the project.\n`
+        + `Note this compares the shipped set MINUS dist/ — the same set the tarball's NAME is `
+        + `computed over — so a report here is a real content difference, never toolchain drift.`
       : '',
     ).toEqual([]);
   });

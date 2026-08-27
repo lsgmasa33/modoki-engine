@@ -28,11 +28,33 @@ final class OtaCoreTests: XCTestCase {
     "test-vectors/ota-gate-vectors-phase3.json",
   ]
 
+  /// The vector files declare `constants` — and until this was added, NOTHING read them, so the
+  /// fixture could say maxAttempts:4 while both implementations used 3 and all 27 scenarios still
+  /// passed (measured, 2026-08-27). A contract nothing enforces is a comment with a schema.
+  func testFixtureConstantsMatchImplementation() {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent()
+      .deletingLastPathComponent().deletingLastPathComponent()
+    var checked = 0
+    for file in Self.vectorFiles {
+      let data = try! Data(contentsOf: packageRoot.appendingPathComponent(file))
+      let obj = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+      guard let constants = obj["constants"] as? [String: Any] else { continue }
+      if let v = constants["maxAttempts"] as? Int {
+        XCTAssertEqual(v, OtaCore.maxAttempts, "\(file): maxAttempts"); checked += 1
+      }
+      if let v = constants["requiredConfirms"] as? Int {
+        XCTAssertEqual(v, OtaCore.requiredConfirms, "\(file): requiredConfirms"); checked += 1
+      }
+    }
+    XCTAssertGreaterThan(checked, 0, "no `constants` found in any vector file — this test checked nothing")
+  }
+
   func loadVectors() -> [[String: Any]] {
     let packageRoot = URL(fileURLWithPath: #filePath)
       .deletingLastPathComponent() // OtaCoreTests.swift -> ModokiOtaCoreTests/
       .deletingLastPathComponent() // -> Tests/
-      .deletingLastPathComponent() // -> ios/
+      .deletingLastPathComponent() // -> core/
       .deletingLastPathComponent() // -> package root
     var scenarios: [[String: Any]] = []
     for file in Self.vectorFiles {
@@ -41,6 +63,21 @@ final class OtaCoreTests: XCTestCase {
       scenarios += obj["scenarios"] as! [[String: Any]]
     }
     return scenarios
+  }
+
+  /// An emptied or truncated vector file would replay zero scenarios and pass. Asserted PER FILE:
+  /// there are two, and emptying one left the combined count positive — so a whole-corpus count
+  /// is a check that cannot see the case it was written for. The Java twin does the same.
+  func testEveryFixtureHasScenarios() {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent()
+      .deletingLastPathComponent().deletingLastPathComponent()
+    for file in Self.vectorFiles {
+      let data = try! Data(contentsOf: packageRoot.appendingPathComponent(file))
+      let obj = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+      let scenarios = obj["scenarios"] as? [[String: Any]] ?? []
+      XCTAssertGreaterThan(scenarios.count, 0, "\(file): no scenarios — the replay would check nothing")
+    }
   }
 
   func stringMap(_ obj: [String: Any], _ key: String) -> [String: String] {
