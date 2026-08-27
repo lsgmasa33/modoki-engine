@@ -126,7 +126,20 @@ export default function AnimationEditor() {
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const selectedKeysRef = useRef<Set<string>>(selectedKeys);
   const setSel = useCallback((s: Set<string>) => { selectedKeysRef.current = s; setSelectedKeys(s); }, []);
-  const [viewMode, setViewMode] = useState<'dopesheet' | 'curves'>('dopesheet');
+  // Dopesheet vs Curves lives in the STORE, not here: exactly one of the two views is mounted and
+  // each publishes its own interaction handles, so component-local state made every `curves:tan:*`
+  // handle unreachable to an agent (#369). See editorStore.animationViewMode.
+  const viewMode = useEditorStore((s) => s.animationViewMode);
+  const setViewMode = useEditorStore((s) => s.setAnimationViewMode);
+  // Publish mountedness for the agent read-back. FlexLayout mounts only the SELECTED tab, so
+  // "the Animation tab exists" (openPanels) is not "a view is showing" — the distinction #367
+  // had to learn on the Game panel. Without this, set-animation-view-mode answers ok:true for an
+  // editor where neither view's handle provider is registered.
+  const setPanelMounted = useEditorStore((s) => s.setAnimationPanelMounted);
+  useEffect(() => {
+    setPanelMounted(true);
+    return () => setPanelMounted(false);
+  }, [setPanelMounted]);
   // Shared horizontal timeline viewport (zoom + pan), used by BOTH the Dopesheet
   // and Curves views so switching views keeps the same zoom. Wheel zooms toward the
   // cursor; right-drag pans (SceneView convention). Reset via Home / 0.

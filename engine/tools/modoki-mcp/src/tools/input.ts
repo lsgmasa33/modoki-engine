@@ -348,7 +348,15 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'empty list: it names what IS live (`byEditor`/`byKind` + a hint), so a typo\'d filter cannot ' +
       'read as a correct negative answer. Works in dev AND the DMG.',
     {
-      editor: z.string().optional().describe('Filter to one editor, e.g. "collider2d", "dopesheet", "skin".'),
+      editor: z.string().optional().describe(
+        'Filter to one editor, e.g. "collider2d", "dopesheet", "skin". The editor\'s view must be '
+        + 'MOUNTED for its handles to exist at all: "dopesheet" and "curves" are the Animation '
+        + 'panel\'s two views and only ONE is mounted — set it with modoki_animation_view_mode. '
+        + 'Within "curves", kind:"tangent" needs an ACTIVE TRACK on top of the view (empty on any '
+        + 'clip with 2+ numeric tracks until one is selected — see modoki_get_editor_state '
+        + '`animationView`). "collider2d" needs modoki_scene_view_mode \'ui\' + '
+        + 'modoki_collider_edit.',
+      ),
       kind: z.string().optional().describe('Filter to one handle kind, e.g. "collider-vertex", "keyframe", "bone-joint".'),
       ids: z.string().optional().describe('Comma-separated handle ids to restrict to.'),
     },

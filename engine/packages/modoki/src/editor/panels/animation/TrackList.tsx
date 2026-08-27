@@ -85,6 +85,19 @@ function TrackList({
           return (
             <div
               key={`${t.path}|${t.trait}|${t.field}`}
+              /* Agent-addressable (#369 close-out). Selecting a track is NOT cosmetic: CurvesView
+                 publishes its tangent handles for the ACTIVE track only, and `activeTi` resolves
+                 without a selection ONLY when exactly one curve is visible — so on any clip with
+                 two or more numeric tracks, `modoki_handles editor=curves kind=tangent` came back
+                 empty with no way for an agent to change that. Tagged rather than lifted into the
+                 store on purpose: a tap here runs `onSelect` — the SAME path a human takes, entity
+                 selection included — where an op setting the store field would have to reimplement
+                 that and could drift from it. `data-ui-state` makes "which track is active"
+                 readable as DATA instead of a background colour in a screenshot. */
+              data-ui-id={`animation.trackList.row.${i}`}
+              data-ui-kind="row"
+              data-ui-label={`${t.trait}.${t.field}${t.path ? ` on ${t.path}` : ''}`}
+              data-ui-state={isSel ? 'selected' : undefined}
               draggable
               onDragStart={(e) => { hideTip(); setDragIdx(i); e.dataTransfer.effectAllowed = 'move'; }}
               onDragOver={(e) => { if (dragIdx !== null) { e.preventDefault(); setOverIdx(i); } }}
@@ -155,6 +168,8 @@ function TrackList({
           <TipButton
             key={m}
             uiId={`animation.viewMode.${m}`}
+            uiKind="tab"
+            uiState={viewMode === m ? 'selected' : undefined}
             tip={m === 'dopesheet' ? 'Dopesheet — keyframe timing (diamonds)' : 'Curves — keyframe values + easing (graph)'}
             onClick={() => onSetViewMode(m)}
             style={{ flex: 1, padding: '4px 0', background: viewMode === m ? '#2a2a40' : '#16161f', color: viewMode === m ? '#cdd' : '#778', border: 'none', borderRight: m === 'dopesheet' ? '1px solid #333' : 'none', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11, textTransform: 'capitalize' }}

@@ -30,6 +30,13 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       + 'logical + physical size, dpr, safe-area insets). Read it before quoting any layout '
       + 'measurement: the same HUD is correct on one device and broken on another, so a number '
       + 'with no screen attached to it is unfalsifiable. Set it with modoki_game_view_device. ' +
+      'Also `animationViewMode` (dopesheet|curves) — WHICH of the Animation panel\'s two views is '
+      + 'showing, and therefore which interaction handles exist at all. `animationView` carries the '
+      + 'same answer WITH the two qualifiers an empty handle list needs: `panelMounted` (an '
+      + 'Animation tab that exists but was never SELECTED does not mount, and then NEITHER view '
+      + 'publishes handles) and, in curves, a note that tangent handles need an ACTIVE TRACK as '
+      + 'well as the view. Read these before concluding a clip has no tangents. Set the view with '
+      + 'modoki_animation_view_mode. ' +
       'The companion to get_scene_state (which reads the ECS world): this reads the EDITOR. ' +
       'Requires a connected editor renderer.',
     {},
@@ -77,7 +84,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'ONE event shaped `{entities:[guid], members:[{entity, before, after}]}` instead, so read ' +
       '`members` — `payload.entity` is undefined there). !scene-load `{path, ' +
       'entityCount}`, !save `{path, entities}`, !gizmo `{mode|space}`, !sceneviewmode `{mode}`, ' +
-      '!gameviewdevice `{device, orientation}`. ' +
+      '!gameviewdevice `{device, orientation}`, !animationviewmode `{mode}`. ' +
       'A trait-field !edit ALSO carries a structured `detail: {trait, field, entities[guid], old[], ' +
       'new[]}` (index-aligned arrays; length-1 for a single edit, N for a multi-select — so "zeroed ' +
       'gravityScale on 3 crates" is machine-readable, not just a label). !undo/!redo echo the ' +
@@ -425,6 +432,34 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'their interaction handles (modoki_handles editor=collider2d). Returns editor state.',
     { mode: z.enum(['3d', 'ui']) },
     async ({ mode }) => editorAction('set-scene-view-mode', { mode }),
+  );
+  tool(
+    'modoki_animation_view_mode',
+    "Set which view the Animation editor's timeline area shows: 'dopesheet' (keyframe TIMING — "
+      + "diamonds) or 'curves' (keyframe VALUES + easing — a graph). Exactly ONE is mounted, and "
+      + 'they publish DIFFERENT interaction handles, so this decides what modoki_handles can even '
+      + "see: `curves:key:*` and the tangent handles (`curves:tan:in|out:*`, kind 'tangent') exist "
+      + "in Curves ONLY. The default is 'dopesheet', so `modoki_handles editor=curves` returns an "
+      + 'empty list until you call this — which reads as "this clip has no tangents", not "wrong '
+      + 'view". ⚠️ NECESSARY BUT NOT SUFFICIENT for TANGENT handles: those are published for '
+      + 'the ACTIVE track only, and with nothing selected that resolves only when exactly ONE '
+      + 'numeric curve is visible. On a clip with two or more numeric tracks kind:tangent stays '
+      + 'EMPTY after this call — select a track too (modoki_handles {editor:"chrome", kind:"row"} '
+      + 'lists animation.trackList.row.<i>, data-ui-state "selected" marks the active one, then '
+      + 'modoki_tap_handle). Measured: 1-track clip 2 tangents, 2-track clip 0. A tangent is also '
+      + 'legitimately absent on the first key (no in) and last key (no out), on a stepped key, and '
+      + 'on any non-numeric track, which is never drawn at all. Settable before a clip is open. '
+      + 'Does NOT open or reload a clip (that is modoki_open_animation_editor, which also resets '
+      + 'the playhead) and touches no keyframe data. Returns editor state, which reports the '
+      + 'result as `animationViewMode` plus an `animationView` carrying panelMounted and these '
+      + 'caveats.',
+    {
+      mode: z.enum(['dopesheet', 'curves']).describe(
+        "'dopesheet' = keyframe timing; 'curves' = value/easing graph, and the ONLY view with "
+        + 'tangent handles. Anything else is refused, never coerced.',
+      ),
+    },
+    async ({ mode }) => editorAction('set-animation-view-mode', { mode }),
   );
 
   // ── GameView device simulation (#367) ──

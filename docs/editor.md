@@ -1243,6 +1243,40 @@ pans).
 
 Both views also register **interaction handles** (`registerHandleProvider`) so an agent can
 query and drag keys/tangents by id — see the Enact tooling in the repo `CLAUDE.md`.
+
+⚠️ **Exactly ONE view is mounted, and they do not publish the same handles** — `curves:key:*`
+and the tangent handles `curves:tan:in|out:*` (kind `'tangent'`) exist in Curves ALONE. So which
+view is showing decides what `modoki_handles` can see at all, and the default is Dopesheet:
+`modoki_handles editor=curves` comes back empty until the view is switched, which reads as *"this
+clip has no tangents"* rather than *"you are looking at the wrong view"*. The choice therefore
+lives in the **editor store** (`animationViewMode`), not in `AnimationEditor` local state, so it is
+agent-drivable — `modoki_animation_view_mode {mode}` sets it and `modoki_get_editor_state` reports
+it back (#369). Same move, and the same reason, as `sceneViewMode` gating the Collider2D handles.
+Setting it does not open, reload, or reset a clip; `modoki_open_animation_editor` does (it clears
+the loaded document and resets the playhead to 0), which is why the view is a separate call rather
+than a parameter on the open.
+
+⚠️ **The view is NECESSARY BUT NOT SUFFICIENT for the tangent handles, and that second gate cost
+this fix a wrong verdict.** `CurvesView` publishes `curves:tan:*` for the **active track only**
+(`if (ti !== s.activeTi) return`), and `activeTi` falls back to the sole visible curve — so with no
+track selected it resolves *only* when the clip has exactly one numeric track. Measured on a live
+editor: `fade-in.anim.json` (1 numeric track) gave 2 keyframe + **2 tangent** handles after the
+switch; `dialog-pop.anim.json` (2 numeric tracks), same view, nothing selected, gave 5 keyframe +
+**0 tangent**. The first measurement was taken as proof the fix worked, and it passes under both
+"curves is enough" and "curves plus a one-track clip is enough" — a reminder that a perturbation
+has to be able to come out the other way. Selecting a track is therefore part of the agent route:
+the `TrackList` rows carry `data-ui-id="animation.trackList.row.<i>"` with
+`data-ui-state="selected"` on the active one, so `modoki_handles {editor:'chrome', kind:'row'}`
+lists them and `modoki_tap_handle` picks one. They are **tagged rather than lifted into the store**
+on purpose — a tap runs `onSelect`, the same path a human takes (entity selection included), where
+an op writing a store field would have to reimplement it and could drift.
+
+`modoki_get_editor_state` reports both gates under `animationView`: `panelMounted` (an Animation
+tab that exists in the layout but was never SELECTED does not mount — FlexLayout renders tabs on
+demand — and then *neither* view publishes handles) and, in curves, the active-track caveat. A
+`kind:'tangent'` list is also legitimately empty on the first key (no in-tangent), the last key (no
+out-tangent), a stepped key, and any non-numeric track, which is never drawn at all. Lifting it also means the view now survives the panel being
+unmounted/reselected within a session; it is deliberately NOT persisted across launches.
 - **Architecture** — the edit logic is pure functions in `animation/recording.ts` /
   `animation/clipEdits.ts` (`planPaste`, `extractKeyBlock`, `applyBreakUnify`,
   `remapSelectionAfterRemoval/Reorder/Delete`, `groupSelection`), not component closures —

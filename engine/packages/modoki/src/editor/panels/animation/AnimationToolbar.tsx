@@ -9,13 +9,21 @@ import { saveStatusLabel } from '../useParkedAssetDoc';
 /** A toolbar button with a custom hover tooltip. Native HTML `title` tooltips do
  *  NOT render in the Electron editor (confirmed: hovering >5s shows nothing), so —
  *  like the Inspector's `Tooltip` — we render our own fixed-position popover. */
-export function TipButton({ tip, onClick, disabled, style, uiId, children }: {
+export function TipButton({ tip, onClick, disabled, style, uiId, uiKind, uiState, children }: {
   tip: string;
   onClick?: (e: React.MouseEvent) => void;
   disabled?: boolean;
   style?: React.CSSProperties;
   /** Optional `data-ui-id` so Enact/MCP can aim at the button by selector. */
   uiId?: string;
+  /** Optional `data-ui-kind` — the handle's `kind`, which an agent filters on. Without it
+   *  chromeHandles falls back to the tag name ('button'), so a segmented view switcher is
+   *  invisible to `modoki_handles {editor:'chrome', kind:'tab'}`. */
+  uiKind?: string;
+  /** Optional `data-ui-state` (chromeHandles' CURRENT-VALUE attribute). Set it on a SEGMENTED
+   *  control, where "which segment is active" is data an agent would otherwise have to read off a
+   *  background colour in a downscaled JPEG. Leave it unset on a plain button. */
+  uiState?: string;
   children: React.ReactNode;
 }) {
   const [show, setShow] = useState(false);
@@ -28,6 +36,8 @@ export function TipButton({ tip, onClick, disabled, style, uiId, children }: {
       onClick={onClick}
       disabled={disabled}
       data-ui-id={uiId}
+      data-ui-kind={uiKind}
+      data-ui-state={uiState}
       onMouseEnter={(e) => { const r = e.currentTarget.getBoundingClientRect(); setPos({ x: r.left, y: r.bottom + 4 }); clear(); timer.current = setTimeout(() => setShow(true), 450); }}
       onMouseLeave={() => { clear(); setShow(false); }}
       onMouseDown={() => { clear(); setShow(false); }}

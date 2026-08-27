@@ -171,6 +171,43 @@ function describeGameView() {
   };
 }
 
+/** What the Animation panel is SHOWING, with the two qualifiers an empty handle list needs.
+ *
+ *  `mode` alone is not enough to explain `modoki_handles editor=curves` coming back empty, and
+ *  reporting it alone repeats the mistake `describeGameView` above had to fix one commit earlier:
+ *
+ *  - **`panelMounted`** — FlexLayout mounts only the SELECTED tab, so neither view's handle
+ *    provider is registered when the Animation tab has never been clicked. `mode` would still
+ *    read 'curves'.
+ *  - **`tangentsNeedActiveTrack`** — CurvesView publishes tangent handles for the ACTIVE track
+ *    only (`CurvesView.tsx`), and `activeTi` resolves with no selection ONLY when exactly one
+ *    curve is visible. So on a clip with two or more numeric tracks, switching to Curves is
+ *    necessary and NOT sufficient, and the empty list reads as "this clip has no tangents".
+ *    Measured, not reasoned: 1-track clip -> 2 keyframe + 2 tangent; 2-track clip, same view,
+ *    nothing selected -> 5 keyframe + 0 tangent.
+ */
+function describeAnimationView() {
+  const s = useEditorStore.getState();
+  const mounted = s.animationPanelMounted;
+  return {
+    mode: s.animationViewMode,
+    panelMounted: mounted,
+    ...(mounted ? {} : {
+      panelNote: 'The Animation panel is NOT mounted, so neither view is showing and NEITHER '
+        + "publishes handles — modoki_handles editor=dopesheet|curves is empty for that reason, "
+        + 'not because the clip is empty. FlexLayout mounts only the SELECTED tab, so open AND '
+        + 'select the Animation tab (modoki_open_animation_editor does both when it opens a clip).',
+    }),
+    ...(s.animationViewMode === 'curves' ? {
+      tangentsNeedActiveTrack: 'Tangent handles (curves:tan:in|out:*) are published for the ACTIVE '
+        + 'track only. With no track selected that resolves only when exactly ONE numeric curve is '
+        + 'visible — so on a multi-track clip kind:tangent is empty until you select a track: '
+        + 'modoki_handles {editor:"chrome", kind:"row"} lists animation.trackList.row.<i> '
+        + '(data-ui-state "selected" marks the active one), then modoki_tap_handle it.',
+    } : {}),
+  };
+}
+
 function readEditorState() {
   const s = useEditorStore.getState();
   return {
@@ -189,6 +226,16 @@ function readEditorState() {
     gizmoMode: s.gizmoMode,
     gizmoSpace: s.gizmoSpace,
     sceneViewMode: s.sceneViewMode,
+    // Which view the Animation editor is showing ('dopesheet' | 'curves'). Reported because the
+    // two views publish DIFFERENT interaction handles, so without it "why does modoki_handles
+    // editor=curves return nothing" is answerable only from a screenshot — an empty list is
+    // otherwise indistinguishable from a clip with no tangents (#369). Set with
+    // modoki_animation_view_mode. Kept as a FLAT scalar as well as inside `animationView` below:
+    // it is the single most-read field here, and every caller written against it stays correct.
+    animationViewMode: s.animationViewMode,
+    // The same answer WITH its qualifiers — see describeAnimationView. `animationViewMode` alone
+    // cannot explain an empty handle list; this can.
+    animationView: describeAnimationView(),
     // Which screen the Game panel is previewing at. Reported so a layout measurement can be
     // ATTRIBUTED to a screen size — without it, "the HUD overlaps the notch" is unfalsifiable,
     // since the reader cannot tell which device produced it (#367). Set with
@@ -972,6 +1019,39 @@ export function registerEditorAgentOps(): void {
     const p = (params ?? {}) as { mode?: '3d' | 'ui' };
     if (p.mode === '3d' || p.mode === 'ui') useEditorStore.getState().setSceneViewMode(p.mode);
     return readEditorState();
+  });
+
+  // ── Animation editor: Dopesheet vs Curves (#369) ──
+  // The SAME defect one panel over from `set-scene-view-mode`, and for the same reason: exactly one
+  // of the two views is mounted, and they do NOT publish the same interaction handles. `curves:key:*`
+  // and `curves:tan:in|out:*` (kind 'tangent') exist in CurvesView alone, so while the view lived in
+  // AnimationEditor-local `useState` — defaulting to 'dopesheet' — tangent editing was reachable only
+  // if the human happened to have left the panel in Curves. `modoki_handles editor=curves` then
+  // returned nothing, which reads as "this clip has no tangents" rather than "wrong view".
+  //
+  // A SEPARATE op rather than a `view` param on `open-animation-editor`, which was the cheaper
+  // option on the issue: `openAnimationEditor` nulls `editingAnimationClip` and resets the playhead
+  // to 0, so re-opening to switch view would throw away the loaded document and the scrub position
+  // an agent had just set. Switching views mid-inspection is a real intent, not a sub-step of
+  // opening, so it gets its own call. Setting it BEFORE opening a clip is fine — the store holds it
+  // and the panel mounts into it.
+  registerAgentOp('set-animation-view-mode', (params) => {
+    const p = (params ?? {}) as { mode?: unknown };
+    if (p.mode !== 'dopesheet' && p.mode !== 'curves') {
+      // Refused, not ignored: `set-scene-view-mode` above silently drops a bad mode and returns a
+      // state read that looks like success, which is §0's readiness lie. An agent that typo'd
+      // 'curve' would be told nothing and then read an empty handle list as "no tangents".
+      return {
+        ok: false,
+        error: `mode must be 'dopesheet' or 'curves' — got ${JSON.stringify(p.mode)}`,
+        options: ['dopesheet', 'curves'],
+        // The CURRENT view rides along: a refusal that omits it makes the caller spend a second
+        // call to learn the state it did not change.
+        animationViewMode: useEditorStore.getState().animationViewMode,
+      };
+    }
+    useEditorStore.getState().setAnimationViewMode(p.mode);
+    return { ...readEditorState(), ok: true };
   });
 
   // ── GameView device simulation (#367) ──

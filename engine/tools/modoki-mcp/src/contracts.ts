@@ -430,6 +430,14 @@ const DECLS: Record<string, Decl> = {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-scene-view-mode', mutating: true, persists: 'session',
     minimalArgs: { mode: '3d' },
   },
+  modoki_animation_view_mode: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-animation-view-mode',
+    mutating: true, persists: 'session',
+    minimalArgs: { mode: 'dopesheet' },
+    notes: "Editor-session state (which of the Animation panel's two timeline views is mounted), "
+      + 'not clip data and not on disk. It gates which interaction handles exist at all — the '
+      + 'tangent handles are published by CurvesView alone (#369).',
+  },
   modoki_game_view_devices: {
     kind: 'read', method: 'GET', route: '/api/game-view-devices',
     notes: 'The catalog is relayed from the renderer (editor/scene/devicePresets.ts), never copied '

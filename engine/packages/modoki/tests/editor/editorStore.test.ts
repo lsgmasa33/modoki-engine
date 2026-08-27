@@ -398,6 +398,49 @@ describe('editorStore', () => {
     });
   });
 
+  describe('animationViewMode (#369 — the agent-drivable Animation view)', () => {
+    it("defaults to 'dopesheet', matching the panel's old local state", () => {
+      expect(useEditorStore.getState().animationViewMode).toBe('dopesheet');
+    });
+
+    it('switches between the two views', () => {
+      useEditorStore.getState().setAnimationViewMode('curves');
+      expect(useEditorStore.getState().animationViewMode).toBe('curves');
+      useEditorStore.getState().setAnimationViewMode('dopesheet');
+      expect(useEditorStore.getState().animationViewMode).toBe('dopesheet');
+    });
+
+    it('writes nothing to localStorage, unlike sceneViewMode', () => {
+      // Deliberate: the view reset to 'dopesheet' on every panel mount before it moved into the
+      // store, and a view restored days later changes what a fresh editor shows. Asserted rather
+      // than left implicit because the neighbouring setter DOES persist, so copying it is the
+      // likely accident. This env has no localStorage, so a stub is installed — a bare
+      // `getItem(...) === null` assertion would pass vacuously against the missing global,
+      // proving nothing about the setter.
+      const before = useEditorStore.getState().sceneViewMode;
+      const writes: string[] = [];
+      const stub = { getItem: () => null, setItem: (k: string) => { writes.push(k); }, removeItem: () => {} };
+      const g = globalThis as { localStorage?: unknown };
+      const had = 'localStorage' in g;
+      const prev = g.localStorage;
+      g.localStorage = stub;
+      try {
+        useEditorStore.getState().setAnimationViewMode('curves');
+        expect(useEditorStore.getState().animationViewMode).toBe('curves');
+        expect(writes).toEqual([]);
+        // The control: the neighbouring setter DOES write, so an empty list above is the setter
+        // being quiet, not the stub being unreachable.
+        useEditorStore.getState().setSceneViewMode('ui');
+        expect(writes).toEqual(['editor:sceneViewMode']);
+      } finally {
+        if (had) g.localStorage = prev; else delete g.localStorage;
+        // Both globals restored: this file has no beforeEach for either, so the positive control
+        // above would otherwise leave every later test running in sceneViewMode 'ui'.
+        useEditorStore.setState({ sceneViewMode: before, animationViewMode: 'dopesheet' });
+      }
+    });
+  });
+
   describe('gameViewDevice (#367 — the agent-drivable preview screen)', () => {
     it('defaults to Free in portrait', () => {
       expect(useEditorStore.getState().gameViewDevice.name).toBe('Free');

@@ -3338,6 +3338,8 @@ const EDITOR_ACTIONS = new Set<string>([
   // own (/api/game-view-devices), because a read relayed through this POST relay would be a
   // 'do this' answering a 'tell me this' (§4 of docs/mcp-tool-conventions.md).
   'set-game-view-device',
+  // Animation editor Dopesheet|Curves (#369) — gates which interaction handles exist at all.
+  'set-animation-view-mode',
   'open-particle-editor', 'open-sprite-editor', 'open-nine-slice-editor',
   'open-animation-editor', 'focus-entity',
   'play', 'resume', 'stop', 'pause', 'step',

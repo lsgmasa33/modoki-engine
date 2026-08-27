@@ -2086,6 +2086,11 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
 // entity as a viewport-CSS-px point (modoki_handles / modoki_drag_handle). Mirrors the vertex DRAW
 // math (localToWorld → canvas-scale → backing px → client). Shared by the DOM Canvas2DLayer AND the
 // Pixi chrome overlay. Empty unless collider-edit mode is on and this canvas owns the selection.
+// ⚠️ That is only HALF the gate, and reading it as the whole one misleads: this provider is not
+// merely empty but UNREGISTERED unless `layers.show2D` is on, because `Scene2DChromeOverlay` — its
+// sole registrar — is produced by `renderCanvas2D` alone. `show2D` is component-local state with no
+// store field and no agent op, so a human who toggled 2D off makes `modoki_handles editor=collider2d`
+// answer an empty list an agent cannot recover from. Same shape as #369, one panel over — #373.
 function registerScene2DColliderHandles(canvasEntityId: number, getCanvas: () => HTMLCanvasElement | null, canvasScaleRef: { current: ReturnType<typeof computeCanvasScale> }): () => void {
   return registerHandleProvider((): InteractionHandle[] => {
     const canvas = getCanvas();

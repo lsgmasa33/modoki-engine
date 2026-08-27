@@ -1039,6 +1039,53 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
   });
 }
 
+// ── modoki_animation_view_mode (#369) ────────────────────────────────────────
+// Smoke-covered, not declared un-sweepable: the Animation panel's view is editor-session state and
+// the case restores whatever it found. What only a live call proves is that
+// `set-animation-view-mode` is BOTH on the /api/editor-action allowlist and registered in the
+// renderer — the modoki_prefab failure mode, green on T1+T2 and 400 on every real call.
+{
+  const st0 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+  const before = st0.animationViewMode;
+  if (before !== 'dopesheet' && before !== 'curves') {
+    throw new Error(`editor-state must report animationViewMode, got ${JSON.stringify(before)}`);
+  }
+
+  await withCleanup(async () => {
+    // Set the view the caller is NOT already in, so a no-op setter cannot pass by coincidence —
+    // the store's setter early-returns on an unchanged value, so asserting the current value back
+    // would be true whether or not the op reached it.
+    const target = before === 'curves' ? 'dopesheet' : 'curves';
+    await client.callTool({ name: 'modoki_animation_view_mode', arguments: { mode: target } });
+    // Read back through the OTHER route: the op returns its own state read, so asserting on its
+    // reply alone cannot separate "reached the store" from "echoed the argument".
+    const st1 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+    if (st1.animationViewMode !== target) {
+      throw new Error(`the view did not change: asked ${target}, editor-state says ${st1.animationViewMode}`);
+    }
+    // And back, so both arms are exercised rather than only the one that happened to differ.
+    await client.callTool({ name: 'modoki_animation_view_mode', arguments: { mode: before } });
+    const st2 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+    if (st2.animationViewMode !== before) throw new Error(`the view did not switch back to ${before}`);
+
+    // A bad mode is REFUSED, not dropped. NOTE what this does and does not prove: the tool's
+    // z.enum rejects 'curve' before the request is ever made, so this asserts the SCHEMA arm only.
+    // The op's own refusal (agentEditorOps set-animation-view-mode) guards the raw /api/editor-action
+    // route, which no tool call can reach — it is covered by the T1/T2 tiers, not here. Both exist
+    // because the failure is silent either way: a typo'd mode that reports success leaves the caller
+    // reading an empty `modoki_handles editor=curves` as "this clip has no tangents".
+    const bad = await client.callTool({ name: 'modoki_animation_view_mode', arguments: { mode: 'curve' } });
+    if (!bad.isError) throw new Error("an unknown view mode must be refused, not ignored");
+    // ...and the refusal must not have moved the view on its way out.
+    const st3 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+    if (st3.animationViewMode !== before) throw new Error('a refused mode changed the view anyway');
+
+    console.log(`animation_view_mode switches dopesheet<->curves and refuses an unknown mode \u2713 (was ${before})`);
+  }, async () => {
+    await client.callTool({ name: 'modoki_animation_view_mode', arguments: { mode: before } });
+  });
+}
+
 // ── modoki_profiler (#166 P6) ────────────────────────────────────────────────
 // Self-cleaning, so it is smoke-covered rather than listed as un-sweepable: the capture buffer is
 // profiler state, not the human's project, and the case restores GPU timing to how it found it.

@@ -89,6 +89,35 @@ interface EditorState {
    *  SceneView-local state into the store so it's agent-drivable (set-scene-view-mode)
    *  — the mode selector is a native <select> that trusted input can't operate. */
   sceneViewMode: '3d' | 'ui';
+  /** Which view the Animation editor's timeline area is showing: the Dopesheet (keyframe
+   *  TIMING, diamonds) or Curves (keyframe VALUES + easing, a graph). Lifted from
+   *  AnimationEditor-local state into the store so it is agent-drivable
+   *  (`set-animation-view-mode` / `modoki_animation_view_mode`, #369) — the same move
+   *  `sceneViewMode` above records.
+   *
+   *  It is not cosmetic: exactly ONE of the two views is mounted, and each publishes its own
+   *  interaction handles. `curves:tan:in|out:*` (kind 'tangent') exist ONLY in Curves, so with
+   *  no way to set this, tangent editing was unreachable unless the human happened to have left
+   *  the panel in Curves — and the default is 'dopesheet'. `modoki_handles editor=curves`
+   *  correctly returned nothing, which reads as "this clip has no tangents".
+   *
+   *  Deliberately NOT persisted to localStorage, unlike `sceneViewMode`: it reset to
+   *  'dopesheet' on every panel mount before it moved here, and restoring a view days later
+   *  would change what a fresh editor shows. Lifting it DOES make the choice survive the panel
+   *  being unmounted/reselected within a session, which the local `useState` did not — that is
+   *  the same continuity `sceneViewMode` has, and the better behaviour. */
+  animationViewMode: 'dopesheet' | 'curves';
+  /** Whether the Animation panel is actually MOUNTED and running its effects.
+   *
+   *  Same requirement, and the same reason, as `gameViewMounted` below: FlexLayout defaults
+   *  `tabEnableRenderOnDemand: true`, so an Animation tab that EXISTS in the layout but has never
+   *  been selected does not mount — and `openPanels` reports it anyway, which is exactly the
+   *  derivation #367 rejected as wrong. Without this the agent surface answers
+   *  `animationViewMode:'curves'` for an editor showing no Animation view at all, and neither
+   *  view's handle provider is registered, so `modoki_handles editor=curves` is empty for a
+   *  reason the payload cannot express. Written by AnimationEditor's mount effect; nothing else
+   *  may set it. */
+  animationPanelMounted: boolean;
   /** Which FlexLayout panel owns the keyboard ('scene' | 'hierarchy' | 'animation-editor' | …),
    *  or null when nothing has been engaged yet. Set on capture-phase mousedown (click-to-focus).
    *
@@ -320,6 +349,10 @@ interface EditorState {
   setColliderEditMode: (on: boolean) => void;
   setShowFocusGraph: (on: boolean) => void;
   setSceneViewMode: (mode: '3d' | 'ui') => void;
+  /** Set the Animation editor's timeline view. No-ops (and does not journal) on a re-set. */
+  setAnimationViewMode: (mode: 'dopesheet' | 'curves') => void;
+  /** Set from AnimationEditor's mount effect + its cleanup. Nothing else may call it. */
+  setAnimationPanelMounted: (mounted: boolean) => void;
   setFocusedPanel: (panel: string | null) => void;
   setOpenPanels: (ids: string[]) => void;
   setGizmoSpace: (space: 'local' | 'world') => void;
@@ -497,6 +530,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
   colliderEditMode: false,
   showFocusGraph: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:showFocusGraph') === '1'),
   sceneViewMode: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:sceneViewMode') === 'ui') ? 'ui' : '3d',
+  animationViewMode: 'dopesheet',
+  animationPanelMounted: false,
   focusedPanel: null,
   openPanels: [],
   particlePreview: false,
@@ -648,6 +683,12 @@ export const useEditorStore = create<EditorState>((set, get) => {
     if (typeof localStorage !== 'undefined') localStorage.setItem('editor:sceneViewMode', mode);
     mark2DDirty();
   },
+  setAnimationViewMode: (mode) => {
+    if (get().animationViewMode === mode) return;
+    editorEmit('!animationviewmode', { mode });
+    set({ animationViewMode: mode });
+  },
+  setAnimationPanelMounted: (mounted) => { if (get().animationPanelMounted !== mounted) set({ animationPanelMounted: mounted }); },
   /** Click-to-focus. Journals `!focus` on a real SCOPE CHANGE only — a commit point, so the
    *  stream stays sparse (never per-keystroke), and it is what makes "why did my key go there?"
    *  answerable from data instead of a re-run. Focus is NOT undoable: it is transient chrome, and

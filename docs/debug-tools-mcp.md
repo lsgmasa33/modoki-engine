@@ -1097,7 +1097,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*101 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*102 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -1192,6 +1192,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
+| `modoki_animation_view_mode` | POST `/api/editor-action` `set-animation-view-mode` | session | editor | — | `{"mode":"dopesheet"}` |
 | `modoki_collider_edit` | POST `/api/editor-action` `set-collider-edit` | session | editor | — | `{"on":true}` |
 | `modoki_dispatch_action` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | — | `{"name":"probe"}` |
 | `modoki_eval` | POST `/api/eval` | no persistence | editor + renderer | — | `{"code":"return 1 + 1;"}` |
@@ -1665,9 +1666,20 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
   a modal that only mounts when its tab/asset is active is a separate OS layer `sendInputEvent` can't
   touch): `modoki_scene_view_mode {3d|ui}` (REQUIRED before Collider2D editing — its vertex handles
   only live in `ui`/2D mode), `modoki_collider_edit {on}` (the toolbar "Points" toggle),
-  `modoki_open_particle_editor` / `modoki_open_sprite_editor` / `modoki_open_nine_slice_editor` (pass
-  the asset's served path — mounts the panel/modal so its handle providers register). `get_editor_state`
-  now reports `sceneViewMode`/`colliderEditMode`.
+  `modoki_animation_view_mode {dopesheet|curves}` (the Animation panel shows exactly ONE of its two
+  views, and only **Curves** publishes `curves:key:*` and the tangent handles `curves:tan:in|out:*` —
+  the default is Dopesheet, so `modoki_handles editor=curves` is empty until you switch, which reads
+  as "this clip has no tangents"; it does NOT open or reload a clip, unlike
+  `modoki_open_animation_editor`). ⚠️ **Curves is necessary but NOT sufficient for `kind:'tangent'`**
+  — those are published for the ACTIVE TRACK only, which with nothing selected resolves solely when
+  exactly one numeric curve is visible, so a 2+-track clip stays empty. Select a track as well:
+  `modoki_handles {editor:'chrome', kind:'row'}` lists `animation.trackList.row.<i>`
+  (`data-ui-state:'selected'` marks the active one) → `modoki_tap_handle`. `get_editor_state`'s
+  `animationView` reports both this and `panelMounted`.
+  Also `modoki_open_particle_editor` / `modoki_open_sprite_editor` / `modoki_open_nine_slice_editor`
+  (pass the asset's served path — mounts the panel/modal so its handle providers register).
+  `get_editor_state` reports `sceneViewMode`/`colliderEditMode`/`animationViewMode`, plus the
+  qualified `animationView` (`panelMounted` + the active-track caveat).
 - **Canonical loop:** open the editor/sub-mode → `modoki_handles` to discover geometry → `drag_handle`/
   `tap_handle` (or `dnd`) to act → verify via Percept (`get_scene_state`/`watch`/`get_layout_bounds`)
   → `modoki_history undo` to revert. Registry twin of `screenBounds.ts`:
