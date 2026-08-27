@@ -109,7 +109,7 @@ import { portCandidates, readLastPort, writeLastPort, parseBackendPort } from '.
 import { buildMcpServerEntry, buildChromeDevtoolsEntry, mergeMcpConfig, isMcpStale, mcpChromePort, isMcpTokenForeign, ensureMcpGitignored, detectClaudeCli, atomicWriteFileSync, healMcpPort, resolveMcpTarget, mcpHasModoki, mcpBackendRaw, gitTrackedState, ensureProjectClaudeMd } from './connectClaude';
 import { ensureToken } from './instanceToken';
 import { vendorEnginePlugins, writeVendorMarker, type VendorResult } from '../plugins/vendorPlugins';
-import { composeDepsInstallError } from './projectDeps';
+import { composeDepsInstallError, hasStaleWorkspaceLink } from './projectDeps';
 import { healNativeConfig } from '../plugins/healNativeConfig';
 import { setupAutoUpdate, checkForUpdatesInteractive, isUpdateInstalling } from './autoUpdate';
 import { restoreZoom, handleZoom, setUiPrefsDir } from './zoom';
@@ -253,7 +253,11 @@ async function installProjectDeps(cwd: string, opts: { preferCi: boolean }): Pro
  *
  * Skips when: the project has no package.json, it's the editor repo itself (its
  * deps are already managed), it has nothing to install (no deps/workspaces), or
- * node_modules already exists (cheap heuristic — avoids reinstalling every open).
+ * node_modules already exists AND none of the project's own workspace packages
+ * are missing from it (hasStaleWorkspaceLink — the #215/#326 class: node_modules
+ * present but one workspace symlink stale, which a bare existence check misses).
+ * Still a cheap heuristic overall — avoids reinstalling every open in the common
+ * case where nothing is actually wrong.
  */
 /** Heal a project's native config on open — idempotent, dep-INDEPENDENT: writes a
  *  machine-local android/local.properties, syncs iOS DEVELOPMENT_TEAM from
@@ -284,7 +288,7 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   const pkgPath = path.join(projectRoot, 'package.json');
   if (!fs.existsSync(pkgPath)) return; // not an npm project
 
-  let pkg: { dependencies?: object; devDependencies?: object; workspaces?: unknown };
+  let pkg: { dependencies?: object; devDependencies?: object; workspaces?: unknown; scripts?: Record<string, string> };
   try {
     pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
   } catch {
@@ -303,7 +307,10 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   // and point the dep at it (no symlink; dmg-safe). This may rewrite package.json
   // (migrating off the old file:../../engine dir-symlink) and/or regenerate the
   // gitignored tarball, in which case node_modules must be (re)built.
-  let needsInstall = !fs.existsSync(path.join(projectRoot, 'node_modules'));
+  // The plain existence check misses the #215 class: node_modules present overall but one of
+  // THIS project's own workspace packages missing from it (see hasStaleWorkspaceLink's comment).
+  let needsInstall = !fs.existsSync(path.join(projectRoot, 'node_modules'))
+    || hasStaleWorkspaceLink(projectRoot, pkg, fs);
   let vendorResult: VendorResult | null = null;
   let vendorError: string | null = null;
   try {
@@ -341,6 +348,24 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   // detect a stale extraction (D3).
   if (vendorResult) writeVendorMarker(projectRoot, vendorResult.expectedVendor);
   console.log(`[modoki-electron] dependencies installed for ${projectRoot}`);
+
+  // `npm install` only creates the WORKSPACE SYMLINK for a project-owned native plugin (e.g.
+  // games/court's capacitor-applovin-max) — it does not build it. Those plugins ship their JS
+  // only in a gitignored `dist/` (bootstrap-game-deps.mjs's own comment on this exact class), so
+  // an install that stops here can leave the symlink restored and the import still unresolved:
+  // `Failed to resolve import "capacitor-applovin-max"`, now AFTER a log line that reads as
+  // success. bootstrap-game-deps.mjs already runs `build:plugins` after every install for
+  // exactly this reason; this ports that, non-fatally (a broken plugin build shouldn't block
+  // opening the rest of the project, same posture as a vendoring failure above).
+  if (pkg.scripts?.['build:plugins']) {
+    console.log(`[modoki-electron] building plugins for ${projectRoot} …`);
+    try {
+      const code = await runNpm(projectRoot, ['run', 'build:plugins', '--if-present']);
+      if (code !== 0) throw new Error(`npm run build:plugins exited with code ${code}`);
+    } catch (e) {
+      console.warn(`[modoki-electron] build:plugins failed (continuing): ${e instanceof Error ? e.message : e}`);
+    }
+  }
 }
 
 // The Vite dev-server origin the renderer loads from. Resolved at startup:
