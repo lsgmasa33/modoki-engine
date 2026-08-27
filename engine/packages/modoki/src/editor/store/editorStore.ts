@@ -248,6 +248,14 @@ interface EditorState {
    *  it. Enables headless open (agent parity), same rationale as openParticleEditor. */
   textureEditorRequest: { path: string; kind: 'sprite' | 'nineslice'; nonce: number } | null;
 
+  /** Which slice is selected in the currently-open Sprite Editor (guid, or null = none).
+   *  Was component-local `useState` in SpriteEditor.tsx with no store field and no agent op —
+   *  since the modal's resize/pivot handles only exist for the SELECTED slice, and it opens
+   *  fresh with nothing selected, `modoki_handles editor=sprite` returned an empty list in the
+   *  NORMAL case, indistinguishable from "no slices" (#373). Set with `select-sprite-slice`;
+   *  reset to null by SpriteEditor itself on mount/unmount, matching the modal's own lifetime. */
+  spriteEditorSelection: string | null;
+
   /** .spriteanim asset currently open in the SpriteAnim Editor (null = none). */
   editingSpriteAnimAsset: SelectedAsset | null;
   /** Live def for the open sprite-anim set — single source of truth the panel renders
@@ -347,6 +355,7 @@ interface EditorState {
   closeOtaKeys: () => void;
   setGizmoMode: (mode: 'translate' | 'rotate' | 'scale') => void;
   setColliderEditMode: (on: boolean) => void;
+  setSpriteEditorSelection: (guid: string | null) => void;
   setShowFocusGraph: (on: boolean) => void;
   setSceneViewMode: (mode: '3d' | 'ui') => void;
   /** Set the Animation editor's timeline view. No-ops (and does not journal) on a re-set. */
@@ -528,6 +537,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   gizmoPivot: 'pivot',
   unlockedGhostSelKey: null,
   colliderEditMode: false,
+  spriteEditorSelection: null,
   showFocusGraph: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:showFocusGraph') === '1'),
   sceneViewMode: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:sceneViewMode') === 'ui') ? 'ui' : '3d',
   animationViewMode: 'dopesheet',
@@ -672,6 +682,11 @@ export const useEditorStore = create<EditorState>((set, get) => {
   // repaint immediately. 3D uses its own gate (useEditorStore.subscribe(markViewportDirty)).
   setGizmoMode: (mode) => { if (get().gizmoMode !== mode) editorEmit('!gizmo', { mode }); set({ gizmoMode: mode }); mark2DDirty(); },
   setColliderEditMode: (on) => set({ colliderEditMode: on }),
+  setSpriteEditorSelection: (guid) => {
+    if (get().spriteEditorSelection === guid) return;
+    editorEmit('!spriteeditorselection', { guid });
+    set({ spriteEditorSelection: guid });
+  },
   setShowFocusGraph: (on) => {
     if (typeof localStorage !== 'undefined') localStorage.setItem('editor:showFocusGraph', on ? '1' : '0');
     set({ showFocusGraph: on });
@@ -840,7 +855,11 @@ export const useEditorStore = create<EditorState>((set, get) => {
   setActiveSkinPart: (idx) => set({ activeSkinPart: Math.max(-1, idx | 0) }), // -1 = none selected
   toggleSkinPreviewPart: (idx) => set((s) => ({ skinPreviewHidden: s.skinPreviewHidden.includes(idx) ? s.skinPreviewHidden.filter((i) => i !== idx) : [...s.skinPreviewHidden, idx] })),
   setSkinPreviewHidden: (indices) => set({ skinPreviewHidden: indices }),
-  setSkinMode: (mode) => set({ skinMode: mode }),
+  setSkinMode: (mode) => {
+    if (get().skinMode === mode) return;
+    editorEmit('!skinmode', { mode });
+    set({ skinMode: mode });
+  },
   setSkinBoneTool: (tool) => set({ skinBoneTool: tool }),
   setSkinWeightTool: (tool) => set({ skinWeightTool: tool }),
   setSkinPaint: (patch) => set((s) => ({ skinPaint: { ...s.skinPaint, ...patch } })),

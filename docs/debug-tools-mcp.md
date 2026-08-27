@@ -1097,7 +1097,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*102 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*105 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -1209,6 +1209,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_open_animation_editor` | POST `/api/editor-action` `open-animation-editor` | session | editor + scene | asset | `{"path":"/assets/animations/probe.anim.json"}` |
 | `modoki_open_nine_slice_editor` | POST `/api/editor-action` `open-nine-slice-editor` | no persistence | editor | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_open_particle_editor` | POST `/api/editor-action` `open-particle-editor` | no persistence | editor | asset | `{"path":"/assets/particles/probe.particle.json"}` |
+| `modoki_open_skin_editor` | POST `/api/editor-action` `open-skin-editor` | no persistence | editor | asset | `{"path":"/assets/characters/probe.rig2d.json"}` |
 | `modoki_open_sprite_editor` | POST `/api/editor-action` `open-sprite-editor` | no persistence | editor | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_persistence` | POST `/api/persistence` | no persistence | editor | — | *(no args)* |
 | `modoki_play_clip` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | entity | `{"guid":"00000000-0000-0000-0000-000000000000","clip":"Idle"}` |
@@ -1217,8 +1218,10 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_profiler` | GET `/api/profiler` *(method varies)* | session | editor + renderer | — | *(no args)* |
 | `modoki_project_settings` | GET `/api/project-settings` *(method varies)* | file | project | — | `{"action":"get"}` |
 | `modoki_scene_view_mode` | POST `/api/editor-action` `set-scene-view-mode` | session | editor | — | `{"mode":"3d"}` |
+| `modoki_select_sprite_slice` | POST `/api/editor-action` `select-sprite-slice` | session | editor | — | *(no args)* |
 | `modoki_set_playhead` | POST `/api/editor-action` `set-playhead` | session | editor | — | `{"t":0}` |
 | `modoki_set_selection` | POST `/api/editor-action` `set-selection` | session | editor | entity | *(no args)* |
+| `modoki_set_skin_mode` | POST `/api/editor-action` `set-skin-mode` | session | editor | — | `{"mode":"rig"}` |
 | `modoki_set_timescale` | POST `/api/editor-action` `set-timescale` | no persistence | editor + renderer | — | `{"scale":1}` |
 | `modoki_watch` | GET `/api/watch/list` *(both varies)* | session | editor + renderer | — | `{"action":"list"}` |
 
@@ -1678,8 +1681,15 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
   `animationView` reports both this and `panelMounted`.
   Also `modoki_open_particle_editor` / `modoki_open_sprite_editor` / `modoki_open_nine_slice_editor`
   (pass the asset's served path — mounts the panel/modal so its handle providers register).
-  `get_editor_state` reports `sceneViewMode`/`colliderEditMode`/`animationViewMode`, plus the
-  qualified `animationView` (`panelMounted` + the active-track caveat).
+  ⚠️ `modoki_open_sprite_editor` is NECESSARY but NOT SUFFICIENT: the modal opens with NOTHING
+  selected, and its 8 resize handles + pivot only exist for the SELECTED slice — call
+  `modoki_select_sprite_slice {guid}` next, or `modoki_handles editor=sprite` reads as "no slices"
+  when it actually means "nothing picked yet" (#373). Also `modoki_open_skin_editor` (a .rig2d.json
+  path) for the Skin editor — its `bone-joint` handles exist in skinMode `rig` OR `weights`, NOT
+  `parts` (`modoki_set_skin_mode`).
+  `get_editor_state` reports `sceneViewMode`/`colliderEditMode`/`animationViewMode`/
+  `spriteEditorSelection`/`editingSkinAsset`/`skinMode`, plus the qualified `animationView`
+  (`panelMounted` + the active-track caveat).
 - **Canonical loop:** open the editor/sub-mode → `modoki_handles` to discover geometry → `drag_handle`/
   `tap_handle` (or `dnd`) to act → verify via Percept (`get_scene_state`/`watch`/`get_layout_bounds`)
   → `modoki_history undo` to revert. Registry twin of `screenBounds.ts`:

@@ -355,7 +355,16 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
         + 'Within "curves", kind:"tangent" needs an ACTIVE TRACK on top of the view (empty on any '
         + 'clip with 2+ numeric tracks until one is selected — see modoki_get_editor_state '
         + '`animationView`). "collider2d" needs modoki_scene_view_mode \'ui\' + '
-        + 'modoki_collider_edit.',
+        + 'modoki_collider_edit, AND the SceneView 2D layer toggle left on — a human can turn it '
+        + 'off with no agent-readable state or route back on yet (#373 part 2; the toolbar button '
+        + 'is chrome-tappable at data-ui-id "sceneView.toolbar.layer.show2D" with data-ui-state '
+        + '"on"/"off", but blindly tapping it can turn 2D OFF if that was never the problem — '
+        + 'check the state first). "sprite" (open with action:open-sprite-editor) additionally '
+        + 'needs a slice SELECTED (action:select-sprite-slice) — check modoki_get_editor_state '
+        + '`spriteEditorSelection` rather than assuming none, since a session an agent joins after '
+        + 'a human may already have one selected. "skin" needs action:open-skin-editor, and '
+        + 'kind:"bone-joint" additionally needs skinMode "rig" or "weights" — NOT "parts" — see '
+        + 'modoki_get_editor_state `skinMode`.',
       ),
       kind: z.string().optional().describe('Filter to one handle kind, e.g. "collider-vertex", "keyframe", "bone-joint".'),
       ids: z.string().optional().describe('Comma-separated handle ids to restrict to.'),

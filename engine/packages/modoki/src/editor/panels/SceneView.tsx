@@ -696,7 +696,10 @@ export default function SceneView() {
             const labels = ['3D', '2D', 'UI'];
             const c = layers[key] ? colors[i] : '#444';
             return (
-              <button key={key} onClick={() => toggleLayer(key)} style={{
+              <button key={key} onClick={() => toggleLayer(key)}
+                data-ui-id={`sceneView.toolbar.layer.${key}`} data-ui-kind="toggle" data-ui-label={`${labels[i]} layer`}
+                data-ui-state={layers[key] ? 'on' : 'off'}
+                style={{
                 width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center',
                 background: layers[key] ? `${c}22` : 'none',
                 border: `1px solid ${c}`,

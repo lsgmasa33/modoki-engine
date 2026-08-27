@@ -63,7 +63,17 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   const [imgDims, setImgDims] = useState<{ w: number; h: number } | null>(null);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [sprites, setSprites] = useState<SpriteSlice[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
+  // Store-backed, not local `useState`: an agent needs a route to change which slice is
+  // selected (`select-sprite-slice`), and `modoki_get_editor_state` needs to be able to report
+  // it — a local state is invisible to both (#373). Reset on mount/unmount below so each open
+  // of this modal starts fresh, matching the old local-state lifetime.
+  const selected = useEditorStore((s) => s.spriteEditorSelection);
+  const setSelected = useEditorStore((s) => s.setSpriteEditorSelection);
+  useEffect(() => {
+    setSelected(null);
+    return () => setSelected(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [grid, setGrid] = useState<GridOpts>(DEFAULT_GRID);
   const [alphaThreshold, setAlphaThreshold] = useState(8);
   const initialGuidsRef = useRef<Set<string>>(new Set());
@@ -311,6 +321,11 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   gridRef.current = grid;
   const alphaRef = useRef(alphaThreshold);
   alphaRef.current = alphaThreshold;
+  // `selected` now comes from the store (see above) rather than local state, so a functional
+  // `setSelected(sel => …)` update can no longer read "the latest value" that way — mirror the
+  // sprites/grid/alpha refs above instead.
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
   const pastRef = useRef<EditorSnap[]>([]);
   const futureRef = useRef<EditorSnap[]>([]);
   const gestureStartRef = useRef<EditorSnap | null>(null);
@@ -355,7 +370,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     setSprites(s.sprites.map((x) => ({ ...x, rect: { ...x.rect }, pivot: { ...x.pivot } })));
     setGrid({ ...s.grid });
     setAlphaThreshold(s.alpha);
-    setSelected((sel) => (s.sprites.some((x) => x.guid === sel) ? sel : null));
+    setSelected(s.sprites.some((x) => x.guid === selectedRef.current) ? selectedRef.current : null);
   };
   const undo = useCallback(() => {
     // Commit a pending param session BEFORE popping — otherwise the edit the user is
@@ -507,14 +522,32 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     const drag = dragRef.current;
     dragRef.current = { kind: 'none' };
     if (drag.kind === 'create') {
-      setSprites((prev) => {
-        const pv = prev.find((s) => s.guid === '__preview__');
-        const rest = prev.filter((s) => s.guid !== '__preview__');
-        if (!pv || pv.rect.w < 3 || pv.rect.h < 3) { setSelected(null); return rest; }
+      // Was a `setSprites(prev => { …; setSelected(x); return next; })` functional updater that
+      // called `setSelected` from INSIDE it. That was safe when `selected` was local `useState`
+      // (React tolerates a same-component update queued from an updater); now that `setSelected`
+      // writes to the Zustand store — which notifies every subscriber, including OTHER
+      // components, synchronously — it's a "setState while rendering a different component"
+      // shape. Read the pre-commit sprites from `spritesRef` (kept fresh every render, same as
+      // the history refs below) instead, so both setters are called as siblings from this plain
+      // event handler, not one nested inside the other's updater.
+      // ⚠️ This relies on `spritesRef.current` reflecting the LAST onMouseMove's `setSprites`
+      // by the time this (separate, later) browser event runs — the same freshness assumption
+      // `takeSnap()` below already makes of `spritesRef`/`gridRef`/`alphaRef` for undo/redo, not
+      // a new one introduced here. React flushes a native event's state updates before yielding
+      // back to the browser for the next event, so this holds under normal event dispatch; it
+      // would NOT hold under a manually-dispatched mousedown+mousemove+mouseup batched into one
+      // synchronous call (e.g. some test harnesses) — drive those as separate dispatches.
+      const prev = spritesRef.current;
+      const pv = prev.find((s) => s.guid === '__preview__');
+      const rest = prev.filter((s) => s.guid !== '__preview__');
+      if (!pv || pv.rect.w < 3 || pv.rect.h < 3) {
+        setSelected(null);
+        setSprites(rest);
+      } else {
         const slice = makeSliceNamed(`${baseName(name)}_${rest.length}`, roundRect(pv.rect));
         setSelected(slice.guid);
-        return [...rest, slice];
-      });
+        setSprites([...rest, slice]);
+      }
     }
     // Commit one undo step for the whole gesture — but only if it changed the
     // slices (a plain selection click leaves them untouched). Defer the compare so
@@ -682,10 +715,12 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
               <Section title="Sprites">
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
                   {sprites.filter((s) => s.guid !== '__preview__').map((s) => (
-                    <div key={s.guid} onClick={() => setSelected(s.guid)} style={{
-                      padding: '2px 6px', fontSize: 11, cursor: 'pointer', borderRadius: 2,
-                      background: s.guid === selected ? '#2c4' : 'transparent', color: s.guid === selected ? '#000' : '#bbb',
-                    }}>{s.name}</div>
+                    <div key={s.guid} onClick={() => setSelected(s.guid)}
+                      data-ui-id={`spriteEditor.slice.${s.guid}`} data-ui-kind="row" data-ui-label={s.name}
+                      style={{
+                        padding: '2px 6px', fontSize: 11, cursor: 'pointer', borderRadius: 2,
+                        background: s.guid === selected ? '#2c4' : 'transparent', color: s.guid === selected ? '#000' : '#bbb',
+                      }}>{s.name}</div>
                   ))}
                 </div>
               </Section>

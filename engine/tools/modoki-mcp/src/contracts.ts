@@ -467,6 +467,22 @@ const DECLS: Record<string, Decl> = {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'open-nine-slice-editor',
     mutating: true, aim: 'asset', minimalArgs: { path: '/assets/textures/probe.png' },
   },
+  modoki_select_sprite_slice: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'select-sprite-slice',
+    mutating: true, persists: 'session', minimalArgs: {},
+    notes: "Editor-session state (SpriteEditor.tsx's `spriteEditorSelection`) — the modal opens with "
+      + 'nothing selected, so its resize/pivot handles are otherwise unreachable by an agent (#373).',
+  },
+  modoki_open_skin_editor: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'open-skin-editor',
+    mutating: true, aim: 'asset', minimalArgs: { path: '/assets/characters/probe.rig2d.json' },
+  },
+  modoki_set_skin_mode: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-skin-mode',
+    mutating: true, persists: 'session', minimalArgs: { mode: 'rig' },
+    notes: "'parts' hides every bone-joint handle — 'rig' or 'weights' is required for "
+      + 'modoki_handles editor=skin to report anything (#373).',
+  },
   modoki_focus_entity: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'focus-entity',
     mutating: true, requires: ['editor', 'scene'], aim: 'entity',

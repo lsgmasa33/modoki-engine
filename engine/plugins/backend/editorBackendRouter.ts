@@ -3342,6 +3342,9 @@ const EDITOR_ACTIONS = new Set<string>([
   'set-animation-view-mode',
   'open-particle-editor', 'open-sprite-editor', 'open-nine-slice-editor',
   'open-animation-editor', 'focus-entity',
+  // #373 — the handle-provider-gate sweep: a route for a slice/panel selection an agent could
+  // not previously reach at all.
+  'select-sprite-slice', 'open-skin-editor', 'set-skin-mode',
   'play', 'resume', 'stop', 'pause', 'step',
   'undo', 'redo',
   'load-scene', 'new-scene', 'save-all',

@@ -57,7 +57,7 @@ import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDI
 import {
   getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity, findUnrenderable2D,
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, getParticleEffect, mountedSurfaces,
-  getTimeline, normalizeTimeline, getGuidForPath, getAssetType, getPresentationScale,
+  getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
   getAllTraits, PRIMITIVE_NAMES, PRIMITIVE_SPRITE_NAMES, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
@@ -257,6 +257,21 @@ function readEditorState() {
     // can tell a stale editor from a working one by looking. (docs/editor-hmr.md)
     ...hmrFields(),
     colliderEditMode: s.colliderEditMode,
+    // Which slice is selected in the open Sprite Editor (guid, or null). The editor's
+    // resize/pivot handles only exist for the selected slice, so without this an empty
+    // `modoki_handles editor=sprite` list is indistinguishable from "no slices" (#373). Set with
+    // `select-sprite-slice`, reset to null on every `open-sprite-editor` call and by the modal's
+    // own mount/unmount — but NOT gated on the modal being open right now: `select-sprite-slice`
+    // will happily set this with no Sprite Editor mounted at all, same as `animationViewMode`
+    // before `animationView.panelMounted` was added to qualify it. So a non-null value here is
+    // NOT proof the modal is open; check `textureEditorRequest`/that a modal-opening call
+    // preceded it, or expect the same class of gap `animationView` was added to close.
+    spriteEditorSelection: s.spriteEditorSelection,
+    // Which .rig2d.json is open in the Skin editor (null = none), and which of its three
+    // modes (rig/parts/weights) is active — 'parts' hides every `skin:bone:*` handle. Set
+    // with `open-skin-editor` / `set-skin-mode` (#373).
+    editingSkinAsset: s.editingSkinAsset,
+    skinMode: s.skinMode,
     fps: Math.round(getCurrentFPS()),
     // Liveness, NOT run mode. `playState`/`runMode`/`advancing` above only say what the
     // editor INTENDS to do; they read "playing"/true even when the rAF chain is dead and
@@ -382,11 +397,18 @@ function resolveLiveId(ref: { id?: number; guid?: string } | undefined): number 
 /** Validate that `path` names a real asset of `expected` type before opening an editor on it.
  *  The open-*-editor ops used to mount a panel at ANY string path and return editor state
  *  (success), so a typo'd/wrong-type path silently produced a panel with no handles and no
- *  error — indistinguishable from "not mounted". Now a bad path is an actionable failure. (C7 re-audit.) */
+ *  error — indistinguishable from "not mounted". Now a bad path is an actionable failure. (C7 re-audit.)
+ *
+ *  ⚠️ The type check here used to call `getAssetType(path)`, but that function is
+ *  guid-KEYED (`guidToEntry.get(guid)`) — a path is never a key in that map, so `type` was
+ *  ALWAYS undefined and the mismatch branch could never throw (#373 close-out review: caught
+ *  because `modoki_open_skin_editor {path:'/assets/textures/ui.png'}` opened the Skin editor on
+ *  a PNG with a clean success). `getAssetEntry` indexes BOTH guid and path, so it actually
+ *  resolves what this asserts against. */
 function requireAssetPath(path: string | undefined, expected: string, op: string): void {
   if (typeof path !== 'string' || !path) throw new Error(`${op} requires { path } — the asset's served URL (see modoki_list_assets).`);
   if (!getGuidForPath(path)) throw new Error(`${op}: no asset found at "${path}" — it resolves to no manifest entry (typo, or wrong path). Find it with modoki_list_assets.`);
-  const type = getAssetType(path);
+  const type = getAssetEntry(path)?.type;
   if (type && type !== expected) throw new Error(`${op}: "${path}" is a ${type}, not a ${expected} — this editor only opens ${expected} assets.`);
 }
 
@@ -1254,6 +1276,11 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('open-sprite-editor', (params) => {
     const p = (params ?? {}) as { path?: string; name?: string };
     requireAssetPath(p.path, 'texture', 'open-sprite-editor');
+    // The modal's own mount effect resets `spriteEditorSelection` to null, but a call on a path
+    // that is ALREADY open re-triggers no mount (TextureAssetView's `setSpriteEditorOpen(true)`
+    // is a no-op on an already-true boolean) — so without this, joining a session the human
+    // already had open would report whatever THEY had selected as if this call selected it.
+    useEditorStore.getState().setSpriteEditorSelection(null);
     useEditorStore.getState().requestTextureEditor(p.path!, 'sprite', p.name);
     return readEditorState();
   });
@@ -1262,6 +1289,43 @@ export function registerEditorAgentOps(): void {
     requireAssetPath(p.path, 'texture', 'open-nine-slice-editor');
     useEditorStore.getState().requestTextureEditor(p.path!, 'nineslice', p.name);
     return readEditorState();
+  });
+  // Select a slice in the currently-open Sprite Editor, so its 8 resize handles + pivot
+  // register (`spriteEditorSelection` — #373: the modal opens with nothing selected, and
+  // there was no route to change that). `guid: null` (or omitted) deselects.
+  registerAgentOp('select-sprite-slice', (params) => {
+    const p = (params ?? {}) as { guid?: string | null };
+    useEditorStore.getState().setSpriteEditorSelection(p.guid ?? null);
+    return readEditorState();
+  });
+  // Open the Skin (2D rig) editor on a .rig2d.json — normally reached from the Assets panel
+  // double-click or the Texture Inspector's "Auto Rig". Neither `editingSkinAsset` (which
+  // asset is open) nor `skinMode` (rig/parts/weights — `bone-joint` handles are gone in
+  // 'parts') had an agent route at all (#373); this is the missing "open the panel" half —
+  // once open, the mode buttons carry `data-ui-id="skin.mode.*"` and are chrome-tappable.
+  registerAgentOp('open-skin-editor', (params) => {
+    const p = (params ?? {}) as { path?: string; name?: string };
+    requireAssetPath(p.path, 'rig2d', 'open-skin-editor');
+    const name = p.name ?? p.path!.split('/').pop()?.replace(/\.rig2d\.json$/i, '') ?? p.path!;
+    useEditorStore.getState().openSkinEditor({ path: p.path!, type: 'rig2d', name });
+    return readEditorState();
+  });
+  registerAgentOp('set-skin-mode', (params) => {
+    const p = (params ?? {}) as { mode?: unknown };
+    if (p.mode !== 'parts' && p.mode !== 'rig' && p.mode !== 'weights') {
+      // Refused, not ignored (the set-animation-view-mode precedent, NOT set-scene-view-mode's
+      // silent drop): a typo'd mode here would otherwise read as ok:true with nothing changed,
+      // and the caller would go on to read an empty/wrong bone-joint handle list as "no rig",
+      // not "the mode never switched". Current mode rides along so a refusal costs no 2nd call.
+      return {
+        ok: false,
+        error: `mode must be 'parts', 'rig', or 'weights' — got ${JSON.stringify(p.mode)}`,
+        options: ['parts', 'rig', 'weights'],
+        skinMode: useEditorStore.getState().skinMode,
+      };
+    }
+    useEditorStore.getState().setSkinMode(p.mode);
+    return { ...readEditorState(), ok: true };
   });
 
   // Open a .anim.json in the Animation editor and BIND it to an entity, exactly as a

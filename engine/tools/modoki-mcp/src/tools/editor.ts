@@ -37,6 +37,12 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       + 'publishes handles) and, in curves, a note that tangent handles need an ACTIVE TRACK as '
       + 'well as the view. Read these before concluding a clip has no tangents. Set the view with '
       + 'modoki_animation_view_mode. ' +
+      'Also `spriteEditorSelection` (guid|null) — which slice is selected in the open Sprite ' +
+      'Editor; its resize/pivot handles only exist for that slice, and it opens with none ' +
+      'selected, so an empty `modoki_handles editor=sprite` is otherwise ambiguous. Set with ' +
+      'action:select-sprite-slice. Also `editingSkinAsset` + `skinMode` (rig|parts|weights) for ' +
+      'the Skin editor — open one with action:open-skin-editor, switch mode with ' +
+      'action:set-skin-mode. ' +
       'The companion to get_scene_state (which reads the ECS world): this reads the EDITOR. ' +
       'Requires a connected editor renderer.',
     {},
@@ -534,12 +540,24 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_open_sprite_editor',
     'Open the Sprite slicer modal on a texture (the Texture Inspector "Sprite Editor" button). ' +
-      'Selects the texture + opens the modal, so its slice-handle providers appear ' +
-      "(modoki_handles editor=sprite — the selected sprite's 8 corner/edge handles + pivot). " +
+      'Selects the texture + opens the modal. ⚠️ It opens with NOTHING selected, and the 8 ' +
+      "corner/edge handles + pivot only exist for the SELECTED slice — so modoki_handles " +
+      "editor=sprite returns an empty list right after this call; that is the normal case, not " +
+      'a bug (#373). Call modoki_select_sprite_slice next. ' +
       "Pass the texture's served path (e.g. '/assets/textures/sheet.png'). Returns editor state.",
     { path: z.string().describe("The texture's served path, e.g. '/assets/textures/ui.png'."),
       name: z.string().optional().describe('Display label for the editor (default: the filename stem).') },
     async ({ path, name }) => editorAction('open-sprite-editor', { path, name }),
+  );
+  tool(
+    'modoki_select_sprite_slice',
+    'Select (or deselect) a slice in the currently-open Sprite Editor — normally a click on a ' +
+      "rect or its row in the Sprites list. This is what makes a slice's 8 resize handles + " +
+      "pivot appear in modoki_handles editor=sprite: the modal opens with nothing selected and " +
+      'had no other route to change that (#373). Returns editor state, which reports the result ' +
+      'as `spriteEditorSelection`.',
+    { guid: z.string().nullable().optional().describe('The slice guid to select (from the Sprite Editor / asset manifest), or omit/null to deselect.') },
+    async ({ guid }) => editorAction('select-sprite-slice', { guid: guid ?? null }),
   );
   tool(
     'modoki_open_nine_slice_editor',
@@ -549,6 +567,27 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     { path: z.string().describe("The texture's served path, e.g. '/assets/textures/ui.png'."),
       name: z.string().optional().describe('Display label for the editor (default: the filename stem).') },
     async ({ path, name }) => editorAction('open-nine-slice-editor', { path, name }),
+  );
+  tool(
+    'modoki_open_skin_editor',
+    'Open the Skin (2D rig) editor panel on a .rig2d.json asset — normally an Assets-panel ' +
+      'double-click or the Texture Inspector "Auto Rig" button. There was previously NO agent ' +
+      "route to open this panel at all (#373). Once open, modoki_handles editor=skin lists its " +
+      "bone-joint handles in skinMode 'rig' or 'weights' — NOT 'parts' (modoki_set_skin_mode). " +
+      "Pass the rig's served path (e.g. '/assets/characters/hero.rig2d.json'). Returns editor state.",
+    { path: z.string().describe("The rig's served path, e.g. '/assets/characters/hero.rig2d.json'."),
+      name: z.string().optional().describe('Display label for the panel tab (default: the filename stem).') },
+    async ({ path, name }) => editorAction('open-skin-editor', { path, name }),
+  );
+  tool(
+    'modoki_set_skin_mode',
+    "Switch the open Skin editor's sub-mode: 'rig' (add/select/move/rotate bones), 'parts' " +
+      "(reposition each part's source mesh — NO bone-joint handles), or 'weights' (paint the " +
+      "selected bone's per-vertex influence). modoki_handles editor=skin reports bone-joint " +
+      "handles in 'rig' AND 'weights' — only 'parts' hides them. The toolbar buttons carry " +
+      '`data-ui-id="skin.mode.*"` and are chrome-tappable too; this is the direct route. Returns editor state.',
+    { mode: z.enum(['parts', 'rig', 'weights']) },
+    async ({ mode }) => editorAction('set-skin-mode', { mode }),
   );
   tool(
     'modoki_focus_entity',
