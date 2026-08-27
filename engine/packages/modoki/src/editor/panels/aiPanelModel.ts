@@ -110,8 +110,10 @@ export function portRows(s: ConnectStatus): PortRow[] {
 }
 
 /**
- * The CDP row — the one that must never lie. `cdpEnabled` only means we asked Chromium
- * for the port; it can fail to bind silently, or the port can be held by ANOTHER editor
+ * The CDP row — the one that must never lie. `cdpEnabled` only means Chromium was ASKED
+ * for the port (since #356, read from its own command line rather than from our env, so a
+ * launcher-derived port no longer reads as disabled — but "asked" is still not "bound").
+ * It can fail to bind silently, or the port can be held by ANOTHER editor
  * (observed: a packaged editor showed "CDP 9222" green while 9222 was a sibling clone's
  * editor, and the written .mcp.json would have aimed Claude at that other renderer).
  * So: green ONLY when the endpoint was probed and proved ours.

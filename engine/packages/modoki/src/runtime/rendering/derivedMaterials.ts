@@ -27,6 +27,7 @@
 
 import * as THREE from 'three';
 import { onWorldSwap } from '../core/ecs/world';
+import { carryMaterialExtras } from './materialExtras';
 
 /** `userData` key holding the material this one was cloned from.
  *
@@ -76,7 +77,16 @@ export function markDerived<T extends THREE.Material>(clone: T, base: THREE.Mate
  *
  *  Keys matching `is[A-Z]`/`_` are skipped: those are three's type brands and private fields, and
  *  copying a brand onto a clone of a different class is how a material starts lying about what it
- *  is. */
+ *  is. (Same rule three's own `getMaterialCacheKey` applies, for the same reason.)
+ *
+ *  ⚠️ **The `_` skip has one deliberate exception, carried explicitly: `materialExtras`** (#351).
+ *  The engine augments `Material.prototype` with `lineColor`/`nprColorPreserve`, and while those
+ *  stored into `_`-prefixed backing fields they survived NEITHER clone route — this one skipped
+ *  them as private, and `Material.copy()` had never heard of them. A mesh that was both tinted and
+ *  light-masked silently lost its `Tint.amount` that way. They now live in a namespaced corner of
+ *  `userData`, which this function otherwise suppresses wholesale, so it carries that ONE key by
+ *  whitelist. Do not widen this into "carry userData": the suppression is load-bearing (see above),
+ *  and a namespace is what keeps the exception from becoming a hole. */
 export function cloneDerived<T extends THREE.Material>(material: T, base: THREE.Material): T {
   const savedUserData = material.userData;
   let clone: T;
@@ -86,6 +96,14 @@ export function cloneDerived<T extends THREE.Material>(material: T, base: THREE.
   // caller can forget. Restored in `finally` so a throwing clone cannot strand the source's
   // userData empty — which would silently unstamp a variant's base.
   try { clone = markDerived(material.clone() as T, base); } finally { material.userData = savedUserData; }
+  // Runs AFTER the `finally` restore, so `material.userData` is whole again — reading it before
+  // the restore would see the emptied stand-in and carry nothing.
+  //
+  // Order relative to the own-property loop below is irrelevant, and deliberately not relied on:
+  // this writes into `clone.userData`, and that loop never touches `userData` (the clone always
+  // has its own, so its `hasOwnProperty(dst, key)` check short-circuits). Stated because an
+  // earlier version of this comment claimed the ordering protected something; it protects nothing.
+  carryMaterialExtras(material, clone);
   const src = material as unknown as Record<string, unknown>;
   const dst = clone as unknown as Record<string, unknown>;
   for (const key of Object.keys(src)) {

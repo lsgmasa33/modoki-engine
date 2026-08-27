@@ -16,6 +16,12 @@ beforeEach(() => {
 });
 
 async function setup() {
+  // ⚠️ This fake's `nprColorPreserve` is a PLAIN OWN PROPERTY, which a real material does not have
+  // — the real one is a prototype accessor storing into `userData` (see `materialExtras.ts`). So
+  // these tests pin that tintedMaterial WRITES the amount, and can say nothing about whether it
+  // SURVIVES a clone; #351 (the amount lost through the light-mask variant route) was invisible
+  // here and stayed green throughout. That question is covered against real materials in
+  // `materialExtras.test.ts` — extend that one, not this fake, if it comes up again.
   const fakeBase: any = { uuid: 'base', color: { setHex: vi.fn() }, nprColorPreserve: 0, dispose: vi.fn() };
   fakeBase.clone = vi.fn(() => ({ uuid: 'clone', color: { setHex: vi.fn() }, nprColorPreserve: 0, dispose: vi.fn() }));
 

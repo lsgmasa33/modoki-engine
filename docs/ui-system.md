@@ -858,6 +858,32 @@ rebuild and is never per-frame.
   `__uiEntriesRow` per pooled row. See "the DOM shape" below for why the row layer exists.
 - **The entry prefab root needs `RenderableUI`**, or the entry renders nothing while looking
   perfect in `get_scene_state`.
+- ⚠️ **A prefab the loader never caches leaves the view BLANK, and since #363 it says so.** "Not
+  cached yet" is normal for the first frames of a scene load, so `spawnInstance` returns `0` and
+  the system retries — but a *permanent* miss is indistinguishable from a transient one at that
+  return value, and used to be retried silently forever with no throw, warn or log. The provider
+  is now asked `isCached` directly (a zero `rootSize` cannot answer it — an unsized prefab root is
+  a legitimate `0`), and `UNCACHED_WARN_TICKS` consecutive pipeline ticks of "no" warns once per
+  view, naming the prefab and the causes that were verified against the loader: a GUID that is not
+  the one the file declares as its `id`, a prefab unreachable from the scene's `resources`, or a
+  fetch that failed. It is exactly the diagnostic #344 lacked — Court's level selector rendered an
+  empty grid with `npm run verify` green at 8,462 tests, because every one of those tests reads the
+  prefab FILE and the file was well-formed.
+  ⚠️ **#344's recorded cause — "a `version: 2` makes the loader decline to cache" — is not real,
+  and the belief had spread to four places.** `fetchPrefab` (`meshTemplateCache.ts`) fetches,
+  parses and caches without ever inspecting `version`; `editor/scene/prefab.ts` *writes* `2` for
+  any prefab holding nested-instance rows; and `games/court/.../level-page.prefab.json` carries 25
+  nested rows at version `1` and works. **Confirmed live** (#365): with `level-tile.prefab.json`
+  set to `2` and the editor restarted cold, the selector rendered its full 100 tiles at rects
+  byte-identical to the version-1 control, with nothing logged. `prefabFormatVersion.test.ts`,
+  which required every committed prefab to be `1` citing that mechanism, is **deleted** — it
+  guarded a non-entrance and contradicted the serializer, so any editor re-save of a nested prefab
+  would have turned `npm run verify` red telling the author to undo what the editor had just done.
+  What actually emptied #344's grid is **still unestablished, and probably not a defect at all**:
+  the reported commit was checked out and booted COLD, and it rendered the grid in full. The
+  symptom belongs to one editor session, not to a tree — most likely the prefab cache serving the
+  pre-restructure doc under a live editor. See [prefabs.md](./prefabs.md) and #365 before acting on
+  the version theory again.
 - ⚠️ **`axis` PINS the cross axis, and it has to.** `UIElement.overflow: 'scroll'` is a both-axes
   CSS property, so an `axis: 'x'` view scrolled vertically too — and on any platform with CLASSIC
   scrollbars (desktop web, the Electron editor) the second scrollbar STEALS cross-axis space from

@@ -301,7 +301,7 @@ Developer) by `healNativeConfig`, not from the Xcode/Gradle configuration (#112)
 `debugBuild: true` + a Release configuration is a *working* debug build, which is what a TestFlight
 QA build is. Reopen the project after flipping the flag so the heal runs. Absent Android meta-data
 reads as false. Detail:
-[debug-tools-mcp.md](./debug-tools-mcp.md) § "Debug vs Release".
+[debug-tools-mcp.md](./debug-tools-mcp.md) § "Native Debug Bridge" (the "Debug vs Release — ONE flag decides" note).
 
 ### MCP tools
 

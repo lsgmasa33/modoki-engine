@@ -292,6 +292,23 @@ provider and `agentPlacePiece` were the first three, and two review rounds exist
 already drifted apart once). `agentBoardGate()` extracts it; both `agentPlacePiece` and
 `agentMovePiece` call it, and neither hand-copies a guard the other already checks.
 
+⚠️ **`domModalOverBoard` is GONE as of #355 — the tool layer no longer carries its own second
+predicate.** It existed because Court's engine-side blocker (`boardInputBlocker`, which `hitTest`
+reads) covered only 7 of 10 modal states: the region-chip flyout, the settings panel and the rules
+reference blocked from the DOM alone, so a *tool* had to ask a second question the *input* layer
+could not answer. That split was the defect, not the design — it meant a headless test could drive
+a board tap no player can perform and pass, and `courtHitRegionsDesign()` listed covered cells as
+available targets, i.e. the invariant was false rather than merely unenforced. The three states now
+have engine branches, so the tools inherit the coverage from the one shared list like every other
+state, and the refusal reports the real kind (`chip-backdrop` / `dom-modal-backdrop`) instead of a
+tool-only `dom-overlay`. **Anything else driving `hitTest` is now protected too**, which the old
+arrangement could not promise. One deliberate limit: the settings and rules branches **swallow**
+where the DOM dismisses — their *dismissal* is stated by a scene `set` binding, so closing them from
+`fireTap` would duplicate a rule the scene already owns and would let a refused agent placement close
+a panel the player is reading. (The split is about who owns the dismissal, not about who ever writes
+the field: `startTutorialReplay` hides `SettingsRoot` from code.) The chip flyout *does* dismiss,
+because `chipFlyoutPiece` is Court's own module state.
+
 **`piece` is an assertion, not a second address.** When given, it must match whatever is actually
 standing at `from` — a real drag grabs whichever piece is under the finger, never a piece named in
 advance. Given and mismatched, the tool refuses rather than silently moving the *actual* occupant.

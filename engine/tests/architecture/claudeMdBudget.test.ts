@@ -56,6 +56,15 @@ function budgets(): Record<string, number> {
 const SKIP_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', 'coverage', 'release', 'ios', 'android',
   '.vite', '.gradle', 'DerivedData', 'subgame-dist', 'ads',
+  // ⚠️ `.claude` holds AGENT SCRATCH, not repo content — in particular `.claude/worktrees/<id>/`,
+  // a full second checkout that a subagent launched with `isolation: 'worktree'` lives in. This
+  // walker is a raw `fs.readdirSync`, so without this entry every CLAUDE.md in that checkout is
+  // reported as un-budgeted and `npm run verify` goes RED for as long as any worktree agent runs —
+  // i.e. during exactly the fan-out workflow CLAUDE.md recommends. (Measured: one review agent
+  // produced 20+ offenders and a red gate that had nothing to do with the change under test.)
+  // Sibling guards escape this for free by enumerating with `git ls-files`, which cannot see a
+  // separate checkout; this one cannot, because an UNTRACKED CLAUDE.md is exactly what it must catch.
+  '.claude',
 ]);
 
 /** Every `CLAUDE.md` in the tree, repo-relative and POSIX-separated. */

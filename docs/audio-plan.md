@@ -158,7 +158,7 @@ Commits `25f3b2f` + `633abcf` (review fixes).
   (the Audio Inspector's Apply button, which passes the path) evicted nothing and the game
   kept playing the pre-conversion buffer until an editor restart. The batch/agent re-import
   paths did not call it at all. Both fixed in #304's close-out; the chain and the shared
-  event behind it are in [editor.md](editor.md) § "An asset preview keyed on the PATH".
+  event behind it are in [editor.md](editor.md) § "The asset Inspector" (rule 3, the preview keyed on the PATH).
 
 - **Pipeline parity with textures** — the scanner bakes the `audio` block (loadType
   always; format+ext once converted) into the manifest, serves the `~audio.<ext>`

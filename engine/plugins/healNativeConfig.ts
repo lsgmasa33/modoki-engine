@@ -158,7 +158,7 @@ const ARCHIVE_WARN_TEXT =
  *  archive`, same `method: app-store-connect` export — release-to-store is a button in
  *  App Store Connect afterwards). There is no build-time signal to refuse on that would
  *  not also block the workflow in daily use. See
- *  docs/debug-tools-mcp.md § "Debug vs Release". */
+ *  docs/debug-tools-mcp.md § "Native Debug Bridge" (the "Debug vs Release" note). */
 const ARCHIVE_WARN_PHASE_BLOCK = [
   '/* Begin PBXShellScriptBuildPhase section */',
   `\t\t${GD_UUID.archiveWarnPhase} /* ${ARCHIVE_WARN_PHASE_NAME} */ = {`,

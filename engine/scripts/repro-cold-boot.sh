@@ -18,7 +18,7 @@
 # materially lower on macOS and this loop is unlikely to pay off here. It is kept for the
 # **Windows clone**, where the bug was actually seen and where the leading theory lives
 # (one-time Defender/SmartScreen read latency over a freshly extracted app.asar.unpacked,
-# which a Mac structurally cannot exercise). See docs/build.md § "Cold-boot crash (#21)".
+# which a Mac structurally cannot exercise). See docs/build.md § "Two packaged-boot flakes, both closed unreproduced" (the cold-boot crash, #21).
 #
 # Usage (build the app first — npm run dist:dir, or reuse the smoke build):
 #   N=30 engine/scripts/repro-cold-boot.sh

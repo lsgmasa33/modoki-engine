@@ -12,9 +12,12 @@
  * Both failure shapes below were live when this guard was written (2026-08-20), and neither was
  * catchable by reading:
  *   - `/dev-restart` cited `scripts/stop-dev.sh`; the reorg moved it to `engine/scripts/`.
- *   - `/release-version` cited `qa/README.md` §"Running a case" — a section that does not exist
- *     under that name (it is "Executing a case — the runner's protocol"). Found by a reviewer
+ *   - `/release-version` cited a `qa/README.md` section titled "Running a case" — which does not
+ *     exist under that name (it is "Executing a case — the runner's protocol"). Found by a reviewer
  *     grepping for it, which is exactly the check a machine should be doing.
+ *     (Written WITHOUT the `§ "…"` form on purpose: docCitations' rule 4 reads that form as a live
+ *     citation wherever it appears, so quoting the dead one verbatim made this comment itself
+ *     dangle — it was one of #329's eleven, and the only one that was never a real citation.)
  *
  * Deliberately CONSERVATIVE, for the reason that guard gives: it only inspects paths inside
  * markdown code spans, and only ones carrying a directory separator and a known file extension,

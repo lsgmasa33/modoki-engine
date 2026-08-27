@@ -35,3 +35,25 @@ export const crashlytics = {
   crash(): void {},
   setEnabled(_enabled: boolean): void {},
 };
+
+/**
+ * Ads — a no-op namespace, mirroring `export * as ads from './ads'` in Court's package (#342).
+ *
+ * ⚠️ The no-op here is not merely a size saving, it is REQUIRED. A playable ad already runs inside
+ * somebody else's ad slot: an interstitial launched from within a creative would be an ad inside
+ * an ad, and MRAID has no notion of it. So the honest stub answers "nothing was shown" rather than
+ * doing nothing silently — `showInterstitial` resolving `false` is what makes the caller's
+ * "did it show" branch take the right path instead of stamping a cooldown for an ad that
+ * never existed.
+ */
+export const ads = {
+  async initAds(): Promise<void> {},
+  cleanupAds(): void {},
+  onRewardEarned(_handler: unknown): void {},
+  async showBanner(): Promise<void> {},
+  async hideBanner(): Promise<void> {},
+  async showInterstitial(_placement: string): Promise<boolean> { return false; },
+  async showRewardedAd(_placement: string): Promise<boolean> { return false; },
+  async isRewardedReady(): Promise<boolean> { return false; },
+  async showAdDebugger(): Promise<void> {},
+};

@@ -1335,7 +1335,7 @@ Three caveats, none of which the install step can fix for you:
   has already run something on.
 - **It does NOT buy trusted input.** That needs a WebDriverAgent XCUITest bundle, and Xcode refuses
   the iPhone 8 as a TEST destination — six theories tested and disproved, see
-  [trusted-device-input.md](./trusted-device-input.md) § "iOS 16 devices". Getting there is `go-ios`
+  [trusted-device-input.md](./trusted-device-input.md) § "WebDriverAgent lifecycle" (the "iOS 16 devices" entry). Getting there is `go-ios`
   territory and an owner decision, not something to re-diagnose.
 
 The intended split, per [plans/low-end-device-support.md](./plans/low-end-device-support.md):
@@ -1388,7 +1388,7 @@ says so rather than reporting a failure** (measured 2026-08-19, iPhone 8 / iOS 1
 `processcontrol failed: instruments service
 "com.apple.instruments.remoteserver.DVTSecureSocketProxy" unavailable`, exit 1. That is the SAME
 dead instruments stack that stops WebDriverAgent on that phone and hides it from `xctrace` — see
-[trusted-device-input.md](./trusted-device-input.md) § "iOS 16 devices"; do not re-diagnose it, and
+[trusted-device-input.md](./trusted-device-input.md) § "WebDriverAgent lifecycle" (the "iOS 16 devices" entry); do not re-diagnose it, and
 note that mounting the Developer Disk Image is not the fix (`ios image auto` reports one is already
 mounted and the launch fails identically).
 

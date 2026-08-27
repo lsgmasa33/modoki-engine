@@ -61,6 +61,25 @@ export interface EntryPrefabProvider {
   /** Spawn one instance under `parentId`. Returns the root ecs id, or 0 if it cannot yet (the
    *  prefab is not cached) — the caller then tries again next frame rather than guessing. */
   spawnInstance(world: World, prefabGuid: string, opts: { parentId: number; guidSeed: string }): number;
+  /** Is the prefab cached and spawnable RIGHT NOW?
+   *
+   *  ⚠️ This exists so the system can tell a TRANSIENT miss from a PERMANENT one, which nothing
+   *  downstream of `spawnInstance` can (#363). Both look identical — `0` — and the retry is
+   *  silent, so a prefab that will never cache is retried every frame forever with no throw, no
+   *  warn and no log. That is what #344 cost: Court's pooled level selector rendered an EMPTY
+   *  grid while `npm run verify` stayed green at 8,462 tests — every one of them reads the prefab
+   *  FILE, and the file was well-formed.
+   *
+   *  ⚠️ #344 was written up as "a `version: 2` made the loader decline to cache it". **That
+   *  mechanism does not exist** — `fetchPrefab` never inspects `version`, and the editor's
+   *  serializer writes `2` itself for any prefab with nested-instance rows. So what actually
+   *  emptied that grid is still unestablished; this warning is what would have said so at the
+   *  time, and deliberately does not repeat the theory.
+   *
+   *  It must NOT be inferred from `rootSize` returning 0: a prefab root with no authored width or
+   *  height is a legitimate answer of 0, so that test cannot tell "uncached" from "unsized". The
+   *  provider is the only thing that knows, so it is the thing that gets asked. */
+  isCached(prefabGuid: string): boolean;
 }
 
 let provider: EntryPrefabProvider | null = null;
@@ -143,16 +162,60 @@ interface ViewState {
    *  the pool went 8 -> 29 rows on a fast scroll and STAYED at 29 through 60 idle frames. */
   lastCols: number;
   lastRows: number;
+  /** Consecutive PIPELINE TICKS on which this view's entry prefab was not cached — the counter
+   *  behind the "still uncached" warning. Scroll-event drives do not advance it: they are not
+   *  frames, and counting them would turn a threshold in frames into a threshold in gestures. */
+  uncachedTicks: number;
 }
 const viewStates = new Map<string, ViewState>();
-onWorldSwap(() => { viewStates.clear(); });
+onWorldSwap(() => { viewStates.clear(); warnedUncached.clear(); });
 
-/** Views already warned about, so a per-frame system does not spam the console. Cleared with
- *  the rest of the module state, so a re-authored scene gets told again. */
+/** Views already warned about an AUTHORING mistake (see `diagnoseBlankView`), so a per-frame
+ *  system does not spam the console.
+ *
+ *  ⚠️ Cleared by `resetEntriesSystem` only — NOT by the world swap above, unlike `viewStates` and
+ *  `warnedUncached`. So a scene swap does not re-warn about a countX/countY or missing-source
+ *  mistake within one session. That is a deliberate difference and not an oversight: those two
+ *  faults are properties of the AUTHORED trait, which a swap cannot change, whereas whether a
+ *  prefab is cached is a property of the loaded scene and is exactly what a swap re-decides. */
 const warned = new Set<string>();
 
+/** Views already warned about a permanently-uncached prefab. Deliberately a SEPARATE set from
+ *  `warned`: sharing one would let a view that already reported a blank-view authoring mistake
+ *  swallow the prefab warning, which is a different fault with a different fix. Unlike `warned`
+ *  it is also cleared on a world swap — a scene load is exactly when the answer can change, and
+ *  the counter above resets there anyway, so keeping the guard would silence the SECOND
+ *  occurrence for good. */
+const warnedUncached = new Set<string>();
+
+/** How many consecutive pipeline ticks a prefab may stay uncached before the system says so.
+ *  120 ticks is ~2s at 60fps, and matches the established `Canvas2DMount` precedent for exactly
+ *  this shape of diagnostic ("canvas still 0x0 after 120 frames"). It is a WARN, not an error:
+ *  a false positive on a very slow load costs one console line, a false negative costs #344. */
+const UNCACHED_WARN_TICKS = 120;
+
 /** Reset module state — tests and teardown. */
-export function resetEntriesSystem(): void { viewStates.clear(); warned.clear(); }
+export function resetEntriesSystem(): void { viewStates.clear(); warned.clear(); warnedUncached.clear(); }
+
+/** Say WHY a pooled view is blank when the cause is the PREFAB rather than the authoring.
+ *
+ *  Returns the tick count to carry forward. See `EntryPrefabProvider.isCached` for why this is
+ *  asked of the provider instead of inferred from a zero size or a zero spawn. */
+function tickUncachedPrefab(viewGuid: string, prefabGuid: string, isFrameTick: boolean, prior: number): number {
+  if (!provider || !isFrameTick) return prior;
+  if (provider.isCached(prefabGuid)) return 0;
+  const ticks = prior + 1;
+  if (ticks >= UNCACHED_WARN_TICKS && !warnedUncached.has(viewGuid)) {
+    warnedUncached.add(viewGuid);
+    // ⚠️ Names only causes that were VERIFIED against the loader. An earlier draft told the
+    // author to check that the prefab's `version` is 1 — inherited from #344's write-up, and
+    // wrong: `fetchPrefab` (meshTemplateCache.ts) never inspects `version`, and the editor's own
+    // serializer WRITES 2 for a prefab containing nested instances. That advice would have had
+    // authors break a legitimate format marker while the real cause went unfound.
+    console.warn(`[UIEntries] view ${viewGuid}: entry prefab ${prefabGuid} is STILL not cached after ${UNCACHED_WARN_TICKS} frames, so the pool cannot spawn and the view stays blank. Check, in this order: is that GUID the one the prefab file actually declares as its 'id'; is the prefab reachable from the scene's 'resources' (directly, or through a prefab that is); and did its fetch fail (a 404 or an unparseable file logs '[MeshCache] Failed to load prefab').`);
+  }
+  return ticks;
+}
 
 /** Say WHY a view is blank.
  *
@@ -340,7 +403,14 @@ function driveView(
   const st = viewStates.get(viewGuid)
     ?? { seeded: false, lastFirstX: 0, lastFirstY: 0, lastEpoch: -1, lastCountX: -1, lastCountY: -1, travel: 0,
          frameScrollX: 0, frameScrollY: 0,
-         lastEntryW: -1, lastEntryH: -1, lastCols: -1, lastRows: -1 };
+         lastEntryW: -1, lastEntryH: -1, lastCols: -1, lastRows: -1, uncachedTicks: 0 };
+
+  // ⚠️ Runs BEFORE the early-outs below, and that placement is the whole point. A prefab that
+  // never caches makes `rootSize` 0, so an authored `entryHeight: 0` ("read it from the prefab")
+  // yields stride 0 -> `EMPTY_WINDOW` -> a plan of zero slots, and `ensurePool` is never even
+  // asked to spawn. Diagnosing from pool starvation would therefore miss the very case that
+  // reads most like "the feature is broken". Asking the provider covers both entrances.
+  const uncachedTicks = tickUncachedPrefab(viewGuid, kinds[0].prefab, isFrameTick, st.uncachedTicks);
   const floor = (en.overscan as number) ?? 2;
 
   // How far the SCROLL has moved since the last pipeline tick, in entries — see
@@ -410,6 +480,7 @@ function driveView(
     frameScrollX: jumpX ?? (isFrameTick ? sv.scrollX : st.frameScrollX),
     frameScrollY: jumpY ?? (isFrameTick ? sv.scrollY : st.frameScrollY),
     lastEntryW: entryW, lastEntryH: entryH, lastCols: xw.pooled, lastRows: yw.pooled,
+    uncachedTicks,
   });
 
   const content = ensureContentChild(world, view, m);

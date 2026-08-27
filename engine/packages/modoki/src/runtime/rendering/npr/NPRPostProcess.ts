@@ -28,8 +28,10 @@
 // `import.meta.hot.invalidate()` — it only propagates to importers and was silently
 // swallowed by Scene3D.tsx's Fast Refresh boundary.
 
-import * as THREE from 'three';
 import { normalView, materialReference, outputStruct, vec4 } from 'three/tsl';
+// A real import, not just the re-export below: `nprFragmentOutput` CALLS this, and a
+// re-export creates no local binding.
+import { ensureLineColorOnMaterials } from '../materialExtras';
 
 /** Helper for custom NodeMaterial shaders rendered into the NPR pass. Wraps
  *  a fragment color expression into an outputStruct that writes to all three
@@ -89,17 +91,6 @@ export function applyNprFragmentOutput(mat: { fragmentNode: unknown; fog: boolea
   mat.fog = false;
 }
 
-// Default outline color for materials that don't explicitly set one. Shared so
-// the prototype getter doesn't allocate per access — which means EVERY material
-// without an explicit `lineColor` returns the SAME Color instance (F8). If a
-// caller mutated it in place (e.g. `mat.lineColor.setHex(...)` instead of
-// `mat.lineColor = new Color(...)`), it would shift the default for all
-// materials process-wide. `Object.freeze` makes that aliasing footgun throw
-// (in strict mode) / no-op instead of silently corrupting the shared default.
-// THREE.Color's mutators write `.r/.g/.b` directly, so freezing the instance
-// blocks every in-place edit path. Read-only use (passing it to the Sobel/MRT
-// node graph, copying via `.clone()`/`new Color().copy(default)`) is unaffected.
-const _DEFAULT_LINE_COLOR = Object.freeze(new THREE.Color(0x000000)) as THREE.Color;
 
 /** Texel size for the Sobel kernel (F1). It samples the SUPERSAMPLED scene-pass
  *  textures — sized to drawing-buffer pixels × superSampleScale by the pass's
@@ -116,53 +107,13 @@ export function computeNprTexelSize(
   return { x: 1 / w, y: 1 / h };
 }
 
-// Augment THREE.Material with `lineColor` + `nprColorPreserve` properties —
-// every material answers to them, defaulting to black / 0. This lets us write
-// `materialReference('lineColor','color')` and `materialReference('nprColorPreserve',
-// 'float')` into the MRT and have them work for ALL materials (including ones
-// imported from GLB) without patching every creation site. A material that
-// wants a custom outline or to keep its color through NPR just assigns its own.
-//
-// PERMANENT, GLOBAL & IRREVERSIBLE (F8): this defines accessors on
-// `THREE.Material.prototype` — the single shared prototype for EVERY material
-// in the process. The patch is:
-//   - global: it affects materials in other renderers/scenes, not just this
-//     NPR instance, the moment any NPRPostProcess is constructed (or
-//     nprFragmentOutput is called during prewarm);
-//   - permanent: it is NEVER removed — `dispose()` does not (and cannot safely)
-//     undo it, because other live materials may already depend on the accessors;
-//   - idempotent: guarded by the module-level `_lineColorPatched` flag so it
-//     runs exactly once regardless of how many NPR instances exist.
-// Accept this as a one-time, process-lifetime contract. The accessors are
-// `configurable: true` only so a future redefinition isn't fatal; do not rely
-// on re-defining them. The shared default returned by the getter is frozen
-// (see `_DEFAULT_LINE_COLOR`) so no consumer can mutate it through the alias.
-let _lineColorPatched = false;
-export function ensureLineColorOnMaterials() {
-  if (_lineColorPatched) return;
-  _lineColorPatched = true;
-  Object.defineProperty(THREE.Material.prototype, 'lineColor', {
-    get(this: THREE.Material & { _lineColor?: THREE.Color }) {
-      return this._lineColor ?? _DEFAULT_LINE_COLOR;
-    },
-    set(this: THREE.Material & { _lineColor?: THREE.Color }, v: THREE.Color) {
-      this._lineColor = v;
-    },
-    configurable: true,
-  });
-  // Per-material NPR color-preserve amount (0..1). 0 = full NPR (grayscale fill),
-  // 1 = keep the material's true color. Read into the lineColor MRT target's
-  // alpha; the composite uses it to lerp the fill toward the lit color.
-  Object.defineProperty(THREE.Material.prototype, 'nprColorPreserve', {
-    get(this: THREE.Material & { _nprColorPreserve?: number }) {
-      return this._nprColorPreserve ?? 0;
-    },
-    set(this: THREE.Material & { _nprColorPreserve?: number }, v: number) {
-      this._nprColorPreserve = v;
-    },
-    configurable: true,
-  });
-}
+// The `lineColor` / `nprColorPreserve` prototype accessors moved to `rendering/materialExtras.ts`
+// (#351 review). They have to be reachable from `meshTemplateCache`, which must install them before
+// it writes either property — and importing them from THIS module dragged `three/tsl`, i.e. the
+// whole Three node pipeline, into the 2D-only boot path. `render3dBoundary.test.ts` caught it.
+// Putting them beside the storage they write is the better home anyway. Re-exported here because
+// this is where the NPR graph and its tests have always reached for them.
+export { ensureLineColorOnMaterials };
 
 export type NPRFillMode = 'flat' | 'grayscale';
 

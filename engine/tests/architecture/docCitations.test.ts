@@ -472,26 +472,27 @@ function headingTitles(absDoc: string): string[] {
 
 /** Titled section citations that dangle TODAY, ratcheted so no NEW one can land (#328).
  *
- *  Found by this guard the moment it was written: 11 citations naming a section title that no
- *  longer exists in the cited doc. Each needs a human to decide what the citation MEANT — the
- *  sections were renamed substantially or folded away, and guessing a replacement produces a
- *  confidently-wrong pointer, which is worse than a dangling one because it reads authoritative.
- *  They are listed rather than fixed blind, and the meta-test below FAILS if an entry stops
- *  dangling, so fixing one forces its removal from this list. Burn-down: #329.
+ *  ⚠️ **EMPTY, and it must stay that way — the burn-down is done (#329).** All eleven original
+ *  entries were repointed rather than deleted, per `docs/doc-conventions.md`: "if the citation
+ *  reads as a live pointer, repoint it instead, because that is the defect and not the exception."
+ *
+ *  What #329 found, which is worth knowing before adding an entry here: **the sections had NOT
+ *  been "renamed substantially or folded away" — nine of the eleven pointed at material that was
+ *  right there**, written as a **bold lead-in** rather than as a `#### heading`. This guard only
+ *  reads headings, so an accurate citation of a bold-styled section dangles. Those were repointed
+ *  to the enclosing real heading with the specific phrase kept in prose
+ *  (`§ "How it works" (the "A stranded synthetic press" note)`) — the house style already used by
+ *  the ABSORBED_BY table above. The other two were not citation defects at all: one was a line
+ *  naming TWO docs before the `§` (the regex attributes it to the first, a human reads the
+ *  second), and one was a code comment QUOTING a known-bad citation as a historical example,
+ *  which rule 4 cannot tell from a live one.
+ *
+ *  So before ratcheting anything: check whether the target exists as non-heading text, and whether
+ *  the citing line names more than one `.md`. Adding an entry to get a rename past the gate is
+ *  explicitly forbidden by `docs/doc-conventions.md`; this list only ever shrinks, and the
+ *  meta-test below fails if an entry stops dangling.
  */
-const KNOWN_DANGLING_TITLES: ReadonlyArray<{ doc: string; title: string }> = [
-  { doc: 'CLAUDE.md', title: 'The measurement protocol' },
-  { doc: 'docs/build.md', title: 'Cold-boot crash (#21)' },
-  { doc: 'docs/debug-tools-mcp.md', title: 'Debug vs Release' },
-  { doc: 'docs/debug-tools-mcp.md', title: 'Synthetic input: which canvas gets it' },
-  { doc: 'docs/editor.md', title: 'An asset preview keyed on the PATH' },
-  { doc: 'docs/haptics.md', title: 'On iOS: there is no equivalent' },
-  { doc: 'docs/input.md', title: 'A stranded synthetic press' },
-  { doc: 'docs/native-and-sdks.md', title: 'CocoaPods and the Team ID xcconfig' },
-  { doc: 'docs/rendering.md', title: 'an idle window is not evidence' },
-  { doc: 'docs/trusted-device-input.md', title: 'iOS 16 devices' },
-  { doc: 'qa/README.md', title: 'Running a case' },
-];
+const KNOWN_DANGLING_TITLES: ReadonlyArray<{ doc: string; title: string }> = [];
 
 function isKnownDangling(citedDocRel: string, rawTitle: string): boolean {
   const want = normHeading(rawTitle);

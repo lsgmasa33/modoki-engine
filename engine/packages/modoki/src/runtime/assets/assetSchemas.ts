@@ -81,7 +81,9 @@ const MATERIAL_FIELDS: FieldMeta[] = [
   { key: 'flipY', type: 'boolean', default: true },
   { key: 'textureRepeat', type: 'array', note: '[x,y] UV tiling applied to ALL maps (a single number = uniform). Needs the texture wrap set to repeat (the 3D default).' },
   { key: 'lineColor', type: 'color', note: 'NPR outline color' },
-  { key: 'nprColorPreserve', type: 'boolean' },
+  // 0..1 FLOAT, not a flag — it is lerped, and `Tint.amount` drives it. It was typed `boolean`
+  // here, which is the only description an agent authoring a .mat.json ever sees (#351).
+  { key: 'nprColorPreserve', type: 'number', default: 0, min: 0, max: 1, note: '0 = full NPR greyscale fill, 1 = keep the material colour. NPR stack only.' },
   // Texture map slots — GUID refs (see Asset References: never a literal path).
   // Sourced from the single slot list (materialTextureSlots) shared with the runtime
   // loader + tree-shaker, so the editor's ref fields can't drift from what ships.

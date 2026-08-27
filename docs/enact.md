@@ -677,7 +677,7 @@ enumerated. The warning says exactly what is known and no more.
       DOM events, never OS-level trusted input, a strictly weaker fidelity position than the editor
       twins above. (It also carried a private-API PixiJS v8 poke for canvas ops; that was **inert** —
       the global it read was never assigned — and is now deleted. See #93 and
-      [docs/debug-tools-mcp.md](debug-tools-mcp.md) § "Synthetic input: which canvas gets it".) Full
+      [docs/debug-tools-mcp.md](debug-tools-mcp.md) § "Device debugging" (the "Synthetic input: which canvas gets it" note).) Full
       route research + phased plan:
       **[docs/trusted-device-input.md](trusted-device-input.md)**
       (issue #32). Phase 0 (make the gap HONEST — every reply states the mechanism it used) has

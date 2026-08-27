@@ -295,7 +295,7 @@ Two replies say more than `ok`, and both are cases where a bare `ok` would over-
 until the app is force-stopped. That is what made this bug expensive to find: the d-pad kept working
 (it tracks its own `pointerId`s), so "drag is broken but buttons are fine" read as a product bug.
 Two defences now exist, and neither excuses skipping the `up`: a real finger reclaims a stranded
-synthetic gesture ([input.md](input.md) § "A stranded synthetic press"), and dropping the lease sends
+synthetic gesture ([input.md](input.md) § "How it works" — the "A stranded synthetic press" note), and dropping the lease sends
 the `up` for you. (`tap_handle`/`drag_handle` aren't ported — the game UIRenderer emits no
 `data-ui-id`.) Full tool table: [`CONNECTION.md`](../engine/tools/game-debug-mcp/CONNECTION.md).
 

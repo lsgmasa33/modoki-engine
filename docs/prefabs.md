@@ -437,11 +437,18 @@ into a commit message, two game docs, a guard test and three issues (#363, #364,
 `games/space-console`'s nested spaceship prefab spawns byte-identically at 1 and
 at 2 across all three of its scenes, and Court's flat level tile at `version: 2`
 renders its full pooled 25-tile grid with no console warning. `version` is
-guarded by `engine/tests/assets/prefabFormatVersion.test.ts` against a value the
-serializer would never write (2 on a prefab that nests nothing — #344's actual
-mistake), NOT against a loader that does not exist.
+now guarded by **nothing**: `prefabFormatVersion.test.ts` was deleted (owner,
+2026-08-27) rather than narrowed to "2 only on a prefab that really nests
+another". The narrowed rule was written and green, and the reason it went is
+worth keeping — the mistake it caught is one both measurements had just proved
+**harmless**, so it was a red gate with no failure mode behind it, on a field no
+code reads.
 
-**What emptied #344's grid is therefore still unidentified.** The file is
+**What emptied #344's grid is therefore still unidentified — and there is very
+likely nothing to find.** `ec48f2586`, the commit reported as broken, was checked
+out and the editor booted COLD against it: the selector rendered 100 tiles and
+100 visible numbers, and nothing on the prefab-loading path has changed since. So
+the symptom does not belong to any committed tree. The file is also
 byte-identical across the "broken" and "fixed" commits apart from that one
 number, so the A/B was confounded — most likely by the prefab cache, which
 serves the doc it read at scene load: restructure a `.prefab.json` under a live

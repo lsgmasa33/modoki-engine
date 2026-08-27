@@ -2912,6 +2912,15 @@ The material property `nprColorPreserve` (0..1) lets a material keep its true hu
 
 Both `lineColor` and `nprColorPreserve` are auto-patched onto `THREE.Material.prototype` via `Object.defineProperty` (defaulting to black / `0`), so `materialReference(...)` resolves for **all** materials — including GLB-imported ones — without patching every creation site. (The `Tint` trait sets `nprColorPreserve` on its tinted clones so the grayscale fill blends toward the team color.)
 
+⚠️ **Both values are stored in `userData`, under one namespaced key, by `rendering/materialExtras.ts` — never in a `_`-prefixed backing field.** That is not a style choice; a `_` field survives **neither** clone route in this engine (#351). `Material.copy()` is a hand-written field list that has never heard of ours, and `cloneDerived` skips `/^(is[A-Z]|_)/` as three's own private-field convention. While they lived in `_nprColorPreserve` / `_lineColor`, a mesh that was **both tinted and light-masked** lost its `Tint.amount` and rendered at `nprColorPreserve: 0` — full grayscale fill. It failed in the confusing direction, because `.color` IS a field `Material.copy()` knows: the object looked tinted while the preserve strength was wrong, which reads as an NPR/lighting bug rather than a Tint one.
+
+Two rules follow, and both are load-bearing:
+
+- **`cloneDerived` carries this ONE key by explicit whitelist.** It otherwise suppresses `userData` wholesale, and that suppression must stay — see § "Shader prewarm and the first-frame compile" on why letting `__lightMaskBase` through the JSON round-trip serialises a whole material graph. A namespace is what keeps the exception from becoming a hole; do not widen it into "carry `userData`".
+- **Only JSON-safe primitives may go in there.** A bare `.clone()` carries `userData` through `JSON.parse(JSON.stringify(...))`, so a class instance comes back a prototype-less `{r,g,b}` that throws on the next `.getHex()`. This is why `lineColor` **stores a hex number** and materialises a memoised `THREE.Color` in its accessor, rather than storing the Color it presents as. Storing the Color passes every `cloneDerived` test and fails only on a bare clone — `materialExtrasAreJsonSafe` pins the rule.
+
+⚠️ **Both values ARE part of the pipeline cache key — and the fix changed it for exactly the materials it repaired.** It is tempting (and wrong, this doc said so for one commit) to reason that `getMaterialCacheKey()` skips `/^(is[A-Z]|_)/` and `userData`, so a value stored in either is invisible to it. That regex tests the **property name**, and `getKeys` walks the prototype chain pushing every key that has a **getter** — so `lineColor` and `nprColorPreserve`, being getters named without a `_`, were always in the key, wherever their backing field lived. A number contributes `value !== 0 ? '1' : '0'`, so a light-mask variant that used to read `nprColorPreserve === 0` (contributing `'0'`) now reads the carried `0.7` and contributes `'1'`: those draws hash to a **different pipeline than before**. That is the correct direction — the variant now agrees with the tint clone it came from, and #136 is the precedent for why a collision there is dangerous — but if you are reading first-frame compile counts, this is a thing that moved. What genuinely does not change is that the values reach the shader as per-material **uniforms** via `materialReference`, so one pipeline still serves many values.
+
 ### Control trait — `runtime/traits/NPRPostFX.ts`
 
 `NPRPostFX` is a singleton ECS trait (first entity wins), editable in the Inspector. Defaults from the source:
@@ -3296,6 +3305,10 @@ input — the one that is invisible from the material and the scene:
    Both are handled by **`cloneDerived` (`rendering/derivedMaterials.ts`)**, which carries own
    properties across generically and clones with `userData` suppressed — free, because
    `getMaterialCacheKey()` skips `userData` outright. `pinnedSideClone` is a thin wrapper over it.
+   ⚠️ That generic carry skips `/^(is[A-Z]|_)/`, with **one deliberate whitelisted exception**: the
+   engine's own material extras (`lineColor`, `nprColorPreserve`), which now live in a namespaced
+   corner of `userData` precisely because a `_` field survived neither route — see § "Color
+   preservation" for the tint-plus-mask defect that came of it (#351).
    ⚠️ **This is not a prewarm-only concern, and reaching for a bare `.clone()` on a live mesh is the
    recurring mistake** — `videoTextureSync` hit the identical trap independently and shipped with it
    for months (#325). Its symptom was the quieter one: a light-masked video screen rendered lit by

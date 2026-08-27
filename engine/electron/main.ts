@@ -394,6 +394,11 @@ const CDP = resolveCdpConfig({
   // Sticky ladder (§12.2 item 5): last launch's port + whether it bound ours, so a 9222
   // collision advances instead of dead-ending. Packaged only (dev's port is launcher-pinned).
   memo: app.isPackaged ? readCdpPortMemo(app.getPath('userData')) : null,
+  // What Chromium ACTUALLY got, read from its own command line rather than from our env
+  // (#356). This is read BEFORE the appendSwitch below, so in the packaged app it sees only
+  // a switch that came from the OS/CLI — never our own. `getSwitchValue` returns '' when
+  // absent, which isValidCdpPort rejects.
+  switchPort: app.commandLine.getSwitchValue('remote-debugging-port'),
 });
 if (CDP.openSwitch) {
   app.commandLine.appendSwitch('remote-debugging-port', String(CDP.port));
@@ -901,9 +906,10 @@ function refreshInstanceToken(): void {
  *  of reload (not earlier) so the OLD renderer can't consume it first. */
 let pendingOpenProjectSettings = false;
 
-/** The OBSERVED CDP state — never the pref alone. `cdpEnabled` only means "we asked
- *  Chromium for the port"; it can fail to bind silently, or the port can belong to a
- *  DIFFERENT editor (see probeCdp). Everything user- or agent-facing must key off this,
+/** The OBSERVED CDP state — never the pref alone. `cdpEnabled` only means "Chromium was
+ *  asked for the port" (since #356, read off its own command line, so a launcher-derived
+ *  port no longer reports as disabled); it can still fail to bind silently, or the port can
+ *  belong to a DIFFERENT editor (see probeCdp). Everything user- or agent-facing keys off this,
  *  so we never again report a green CDP that is really someone else's renderer.
  *  Short TTL: the panel polls ~2.5s and identity is hit per MCP process, so one probe
  *  serves them all without hammering the endpoint. */
@@ -931,6 +937,13 @@ async function cdpStatus(): Promise<CdpStatus> {
  *  cdpMemoVerdict keeps a TRANSIENT probe timeout from advancing off a good port. */
 function rememberCdpPort(probe: CdpProbe): void {
   if (!app.isPackaged || !healedAfterMount || !CDP.enabled) return;
+  // ⚠️ Never memoise a port we did not CHOOSE (#356 review). The memo answers "which port should
+  // the ladder try next time", and since the port can now come from an observed `--remote-debugging-port`,
+  // one hand-typed launch (`Modoki.app --remote-debugging-port=9350`) would otherwise write
+  // {port:9350, ours:true} and every later double-click launch would stick on 9350 forever — the
+  // app silently stops using its own default, and only a collision ever heals it. `openSwitch` is
+  // exactly "main picked this port and opened it", so it is the right thing to gate on.
+  if (!CDP.openSwitch) return;
   const verdict = cdpMemoVerdict(probe);
   if (verdict === null || _cdpMemoWrittenOurs === verdict) return;
   _cdpMemoWrittenOurs = verdict;
