@@ -13,6 +13,7 @@
  * passes. `repoLayoutGuard.test.ts` is the tripwire against exactly that.
  */
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
@@ -122,4 +123,35 @@ export function hasInternalGames(): boolean {
  *  precisely so the choice between loose and strict is visible at the call site. */
 export function hasAnyProject(): boolean {
   return discoverProjects(REPO_ROOT).length > 0;
+}
+
+/** True when at least one TRACKED iOS Xcode project (`project.pbxproj`) exists.
+ *
+ *  Narrower than `hasAnyProject()` on purpose, and the CI snapshot is exactly what separates
+ *  them: `scripts/publish-engine-oss.sh` deletes `ios android packages plugins` from every
+ *  demo it stages, so the snapshot HAS projects and has no native at all. A test that walks
+ *  pbxproj content therefore finds nothing there while `hasAnyProject()` still reads true.
+ *
+ *  ⚠️ **Tracked, via `git ls-files` — deliberately NOT `fs.existsSync`.** Its consumers grep
+ *  the INDEX (`git grep`), so an on-disk check would gate on a different question than the one
+ *  the assertion asks, which is the `hasAnyProject`/`hasInternalGames` mistake this file is a
+ *  monument to, moved one notch over. The reachable failure: a user of the public snapshot
+ *  scaffolds a project and runs a native build, `healNativeConfig.ts` writes a NEW UNTRACKED
+ *  pbxproj, an on-disk predicate flips true while `git grep` still sees nothing — and the
+ *  guarded test goes red on the public gate, the exact outcome the gating exists to prevent.
+ *
+ *  Returns false rather than throwing when git cannot answer (absent, or not a checkout); the
+ *  consumers' own `git grep` fails the same way in that case, so both go quiet together
+ *  instead of disagreeing. */
+export function hasNativeProjects(): boolean {
+  try {
+    const out = execFileSync('git', ['ls-files', '--', '*/ios/App/App.xcodeproj/project.pbxproj'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return out.trim() !== '';
+  } catch {
+    return false;
+  }
 }

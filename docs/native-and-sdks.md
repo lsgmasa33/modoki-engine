@@ -33,7 +33,26 @@ Mixing CocoaPods and SPM produces duplicate-framework conflicts. Any SDK that ha
 
 ### iOS SPM static-linking gotcha
 
-SPM static linking **strips plugin classes that have no external framework dependencies**. `capacitor-game-debug` hits this — it must be registered manually in `MyViewController`, plus an Xcode file reference from the App target to the plugin source (project-relative path in the pbxproj, no copy). Edit the package source only.
+SPM static linking **strips plugin classes that have no external framework dependencies**. The class compiles and links, then is simply absent at runtime, so Capacitor reports `"GameDebug" plugin is not implemented on ios`. `capacitor-game-debug` and `capacitor-modoki-ota` both hit this — each must be registered manually in `MyViewController` (`bridge?.registerPluginInstance(...)`, which keeps the class alive), plus an Xcode file reference from the App target to the plugin source (project-relative path in the pbxproj, no copy). Edit the package source only.
+
+⚠️ **Only the game-debug half is generated.** `engine/plugins/healNativeConfig.ts` writes the pbxproj reference and the fenced registration block for `GameDebugPlugin` in every project; it contains **no OTA wiring at all**. `capacitor-modoki-ota`'s pbxproj refs and its `ModokiOtaPlugin` registration are **hand-maintained, in `games/ota-test` only** — the heal is deliberately fenced rather than whole-file precisely because that project hand-extends `MyViewController.swift` with an OTA boot hook (see the comment at `healNativeConfig.ts:596`). So regenerating that project's iOS — `cap add ios`, or deleting `ios/` after a native-config problem — restores the GameDebug wiring and **silently drops OTA**. Re-add it by hand and verify the plugin registers.
+
+⚠️ **Those plugins' `package.json` therefore declares `"capacitor": { "android": … }` with NO `ios` entry, and that is DELIBERATE.** The App target already compiles the `.swift` directly; adding an `ios` entry makes `cap sync ios` *also* add the SPM package, so the plugin class lands in two modules — **one `@objc` runtime class name with two implementations**. (What that then does at runtime has not been observed: the ObjC runtime resolves one name to one implementation, so expect a duplicate-class warning and a nondeterministic winner rather than, say, two `NWListener`s both binding :9095. The defect is the duplication; the symptom is unverified.)
+
+**The reading that misleads:** `npx cap sync ios` reports one fewer plugin than `cap sync android` (5 vs 6 on a typical project), because the count cannot see the pbxproj road. That gap is expected, not a defect — it was filed as one in #368, where the proposed one-line fix would have broken every iOS build it meant to repair. Guarded by `engine/tests/architecture/capacitorPlatformDeclarations.test.ts`.
+
+`capacitor-modoki-iap` is the contrasting case: it goes through SPM normally and correctly declares both platforms, and it is verified working (real store sandboxes on hardware, 2026-08-12). Note its own `Package.swift` header is deliberately agnostic about *why* — do not read it as a rule that "a system framework import is enough to keep the class"; that causal claim is untested.
+
+`capacitor-litert-lm` is a THIRD case, and the one most easily got wrong. Its
+`ios/Sources/LitertLmPlugin/LitertLmPlugin.swift` is a **complete ~380-line MediaPipe
+implementation** (`import MediaPipeTasksGenAI`, real `LlmInference` model loading and streaming) —
+**not a stub**, despite a stale comment at the top of its `Package.swift` still calling it one. What
+actually blocks iOS is narrower: **`Package.swift` declares only `capacitor-swift-pm`, while
+`CapacitorLitertLm.podspec` declares `MediaPipeTasksGenAI` + `MediaPipeTasksGenAIC`.** So an SPM
+build of that target cannot resolve `import MediaPipeTasksGenAI` and fails to compile, and the
+podspec is not a "fallback" here — it is the only iOS path whose dependencies resolve. Declaring
+`"ios"` on this package without first adding the MediaPipe dependency to `Package.swift` turns a
+green `npm run verify` into a broken `cap sync ios` build on `games/llm-test`.
 
 ## SDK Plugins
 

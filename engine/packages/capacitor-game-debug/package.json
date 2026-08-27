@@ -11,7 +11,6 @@
     "android/build.gradle",
     "dist/",
     "ios/Sources/",
-    "CapacitorGameDebug.podspec",
     "Package.swift"
   ],
   "author": "",

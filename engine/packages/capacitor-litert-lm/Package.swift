@@ -1,9 +1,18 @@
 // swift-tools-version: 5.9
 import PackageDescription
 
-// Note: iOS LiteRT-LM Swift API is not yet available.
-// This plugin provides a stub implementation that rejects all calls.
-// Once Google ships the Swift SDK, add the SPM dependency here.
+// ⚠️ This comment used to say the iOS side is "a stub that rejects all calls". That is FALSE and
+// it misled a reader into documenting it as fact (#368): `ios/Sources/LitertLmPlugin/
+// LitertLmPlugin.swift` is a complete ~380-line MediaPipe implementation — it `import
+// MediaPipeTasksGenAI`, builds `LlmInference.Options(modelPath:)`, downloads models and streams
+// generation. The `call.reject` lines in it are ordinary argument validation.
+//
+// What is ACTUALLY missing is right here: this manifest declares only `capacitor-swift-pm`, while
+// `CapacitorLitertLm.podspec` declares `MediaPipeTasksGenAI` + `MediaPipeTasksGenAIC`. So an SPM
+// build of this target cannot resolve `import MediaPipeTasksGenAI` and fails to compile, and the
+// podspec is the only iOS path whose dependencies resolve. Add the MediaPipe SPM dependency here
+// BEFORE declaring `"ios"` in package.json — `capacitorPlatformDeclarations.test.ts` enforces that
+// order, because otherwise `npm run verify` stays green and `cap sync ios` breaks the build.
 let package = Package(
     name: "CapacitorLitertLm",
     platforms: [.iOS(.v15)],
