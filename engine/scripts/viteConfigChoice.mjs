@@ -46,7 +46,9 @@ export function chooseViteConfig(engineDir, exists = existsSync, env = process.e
   if (!isPackagedEngineDir(engineDir, env)) return 'engine/vite.config.ts';
   if (exists(path.join(engineDir, 'vite.config.cjs'))) return 'engine/vite.config.cjs';
   warn('[build] WARNING: packaged, but engine/vite.config.cjs was not staged — this build will '
-    + 'write node_modules/.vite-temp INSIDE the app bundle and break its code signature (#326). '
-    + 'Check the beforePack stager (engine/scripts/stage-vite-config.cjs).');
+    + 'write node_modules/.vite-temp INSIDE the app bundle. On macOS that breaks its code '
+    + 'signature; on an admin-elevated Windows install (e.g. C:\\Program Files) the write itself '
+    + 'EPERMs and the build fails outright — there is no installer-level mitigation for this '
+    + 'anymore (#326). Check the beforePack stager (engine/scripts/stage-vite-config.cjs).');
   return 'engine/vite.config.ts';
 }

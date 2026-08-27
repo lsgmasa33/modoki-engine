@@ -975,9 +975,12 @@ config loader esbuild-bundles the config, then `loadConfigFromBundledFile` branc
 
 So `engine/scripts/stage-vite-config.cjs` (a `beforePack` stager) esbuild-bundles `vite.config.ts`
 into a gitignored `engine/vite.config.cjs` shipped in the bundle, and `chooseViteConfig()`
-(`engine/scripts/viteConfigChoice.mjs`) hands Vite that one when it exists. Regenerated on every
-pack, so it cannot drift; chosen by file existence rather than an env var, so a dev clone (no
-`.cjs`) and a packaged app (always one) cannot disagree.
+(`engine/scripts/viteConfigChoice.mjs`) hands Vite that one when the engine is running **packaged**
+(not by whether a `.cjs` happens to exist — a stray one left behind by an interrupted pack would
+otherwise make a dev clone silently build against a frozen snapshot, and a packaged app whose
+`.cjs` never got staged would otherwise silently fall back to the writing config with nothing
+said). Deciding on packaged-ness makes a stray `.cjs` in a clone inert and a missing one in a
+packaged app loud instead.
 
 ⚠️ **Bundling to CJS empties `import.meta`, and this plugin graph is full of self-locating modules.**
 Three already branch to `__filename`/`__dirname` when it is absent — and `native-dynamic-import.ts`
@@ -1005,8 +1008,8 @@ walks up to the same `node_modules` anyway. Both classes are pinned by
    the build where the bundle is invalid, and a build that dies mid-config-load leaves the file. The
    persistent breaks measured on the v0.5.1/v0.5.2 rcs were the other two writers in the table.
    The fix is still worth having (no write at all, and it removes the Windows EPERM at its source —
-   see `docs/windows.md`, where the installer grant STAYS until Windows verifies it) but do not
-   re-derive the causal story from this paragraph: **re-measure**, per QA-PKG-0009 step 7.
+   confirmed on Windows, grant removed entirely, see `docs/windows.md`) but do not re-derive the
+   causal story from this paragraph: **re-measure**, per QA-PKG-0009 step 7.
 2. **A broken seal does not strand users.** Measured against the real GitHub feed with the published
    signed `v0.4.0` (feed latest `v0.4.1`): a seal-broken app still launches, its main binary still
    reports a Developer ID signature so the ad-hoc skip in `autoUpdate.ts` never fires, the check

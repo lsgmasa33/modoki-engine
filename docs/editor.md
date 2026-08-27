@@ -862,6 +862,56 @@ show a notch bug at all. Always on, with the bands drawn over the frame. Mechani
 per-orientation data, and what is measured vs published:
 [UI system](./ui-system.md) § "The editor simulates the safe area".
 
+### Driving the preview screen from an agent (#367)
+
+The selected device and orientation live in the **editor store** (`gameViewDevice` /
+`gameViewOrientation`), not in GameView-local state, so `modoki_game_view_device` can set them —
+the same lift `sceneViewMode` got, for the same reason: the device picker is a popup that trusted
+input cannot operate. Before it, every layout check an agent ran measured whatever device the human
+last left selected, and the per-device bug class (safe-area insets, panel-fit budgets) is precisely
+the one that needs the device changed repeatedly to be checked at all. `modoki_game_view_devices`
+lists the catalog; `modoki_get_editor_state` reports the current selection as `gameView`, so a
+measurement can be attributed to a screen size.
+
+Four things about that surface are load-bearing:
+
+- **`gameViewDevice` + `gameViewOrientation` are the source of truth; `gameViewSize`,
+  `gameViewSafeArea` and `gameRect` stay DERIVED** — GameView resolves them and publishes them
+  downward for SceneView's preview frame. Writing them from the setter as well would give each two
+  writers to keep in sync by hand.
+- **An explicit `{logicalWidth, logicalHeight}` is carried as a synthetic preset named `Custom`**,
+  so every `resolve*` helper and every GameView consumer handles it unbranched. `logicalW: 0` is
+  reserved by `FREE_PRESET` for "fill the panel", so a zero dimension is refused rather than
+  silently becoming Free.
+- **A custom size reports `safeAreaBasis: 'custom-none'`.** There is no device to look insets up
+  from, so its zeros are zeros *by construction* — and four bare zeros are indistinguishable from a
+  measured "this screen has no notch", which is the mis-authoring `devicePresets.ts` warns about.
+  A catalog preset reports `'preset'`, where a zero is a statement.
+- **A `dpr` that cannot round-trip is refused, not rounded.** `physical` is stored as
+  `round(logical × dpr)` and the read-back recovers dpr as `physical / logical`, so `{1, 1, dpr: 0.5}`
+  used to be accepted and answer `dpr: 1` — a wrong answer stated authoritatively. The combination is
+  now refused, naming the offending dimension. This is a round-trip guard, not a ban on fractional
+  dpr — 2.5 on an even dimension passes. But a real phone is not the example to reach for: Pixel 9
+  is 412×924 → 1080×2424, ~2.6214 wide and ~2.6234 tall, so it has **no single dpr** and
+  `{412, 924, 2.62}` is refused. That is exactly why the catalog stores physical sizes explicitly
+  rather than deriving them — pick such a screen by name.
+- **The read-back reports `panelMounted`, and `panelSize` when the device is `Free`.** The derived
+  values are written only by GameView's own effects, so with the Game tab unmounted the store's
+  device changes and nothing derived moves — a complete iPhone 16 Pro read-back while SceneView's
+  preview still shows the old size and zero insets. And `Free`, the default, has `logical: {0,0}`
+  by construction, so the field the docs tell you to read before quoting a measurement answered 0×0
+  in the most common case; `panelSize` carries the real one.
+- **An explicit size defaults the orientation to portrait, so its numbers are literal.** Found
+  against a live editor: orientation is sticky and presets are authored portrait and flipped, so
+  `{logicalWidth: 640, logicalHeight: 480}` sent while the panel sat in landscape previewed
+  **480×640**. The read-back said so honestly — never a false success — but "I asked for 640 wide
+  and got 480" is a trap worth not setting. Passing `orientation` alongside a custom size still
+  rotates it; that is an explicit request rather than a leftover.
+
+Not persisted to localStorage, unlike `sceneViewMode`: this reset to `Free` on every mount before it
+moved to the store, and a custom resolution silently restored days later is a measurement taken at a
+size nobody chose.
+
 ---
 
 ## Play / Stop / Pause

@@ -2773,6 +2773,19 @@ async function describeUnresolvedAgainstLiveWorld(
     } catch (e) { return json({ error: String(e) }, 500); }
   }
 
+  // ── GET /api/game-view-devices (M→R) ── the device-preset catalog the Game panel can preview
+  // at, plus which one is selected right now. A pure read, so it is a GET and its own route
+  // rather than an action on the POST relay (§4). The catalog lives in the renderer
+  // (editor/scene/devicePresets.ts) and is relayed rather than duplicated here — a second copy
+  // would go stale the first time a device is added, silently.
+  if (urlPath === '/api/game-view-devices' && method === 'GET') {
+    try {
+      return json(await ctx.requestBrowser('game-view-devices', {}));
+    } catch (e) {
+      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
+    }
+  }
+
   // ── GET /api/editor-state (M→R) ── the WHOLE editor UI state in one read:
   // selection, play state, gizmo mode/space, fps, entity count, editor camera
   // pose, undo/redo labels. Relayed to the renderer (the editor store + play
@@ -3321,6 +3334,10 @@ function relayFailureStatus(e: unknown): number {
  *  can't invoke arbitrary renderer ops. Keep in sync with registerEditorAgentOps. */
 const EDITOR_ACTIONS = new Set<string>([
   'set-selection', 'set-gizmo', 'set-scene-view-mode', 'set-collider-edit',
+  // GameView device simulation (#367). The READ half is not here — it is a GET route of its
+  // own (/api/game-view-devices), because a read relayed through this POST relay would be a
+  // 'do this' answering a 'tell me this' (§4 of docs/mcp-tool-conventions.md).
+  'set-game-view-device',
   'open-particle-editor', 'open-sprite-editor', 'open-nine-slice-editor',
   'open-animation-editor', 'focus-entity',
   'play', 'resume', 'stop', 'pause', 'step',

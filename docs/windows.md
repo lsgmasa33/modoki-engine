@@ -224,18 +224,10 @@ real Windows hardware:
        requires every relative import under `engine/` to carry a real extension for Node's
        native ESM resolution — this repo's plugin tree does not, so `native` fails to even
        load `vite.config.ts`.
-     - **The mitigation that shipped, and is still in place: grant write access to just that
-       one subfolder, from the installer, which runs elevated exactly when it needs to.**
-       `build/installer.nsh` (picked up automatically — `nsis.include` defaults to that path,
-       no config change needed) hooks electron-builder's `customInstall` macro (fires after all
-       files are extracted) to `CreateDirectory` the `.vite-temp` folder and
-       `icacls … /grant *S-1-5-32-545:(OI)(CI)M` (BUILTIN\Users, Modify, inherited to files
-       created inside) on it — nothing else in the install tree is touched. This is the shape
-       to reach for when a write genuinely cannot be avoided (a third-party tool hardcodes the
-       path): a scoped, install-time exception, not a runtime workaround and not a blanket
-       loosening of the whole install directory.
-     - **The write has since been removed at its source, on macOS (#326).** Vite's default
-       `bundle` config loader (`loadConfigFromBundledFile` in
+     - **A mitigation shipped for a while — an installer-time ACL grant on just that one
+       subfolder — and has since been REMOVED (#326, 2026-08-27): the write it was
+       compensating for is gone at the source, on both platforms.** Vite's default `bundle`
+       config loader (`loadConfigFromBundledFile` in
        `node_modules/vite/dist/node/chunks/node.js`) only takes the disk-write path — bundle,
        write to `.vite-temp/…mjs`, import, unlink — for an ESM config; a `.cjs` config is
        hooked into `require.extensions` and compiled in memory, writing nothing at all.
@@ -247,11 +239,17 @@ real Windows hardware:
        branch and never writes `.vite-temp` — verified on a packaged, ad-hoc-resealed macOS
        `.app`: Build → Web from its own menu, then `codesign --verify --deep --strict` exit 0,
        zero files added to the bundle, no `.vite-temp` anywhere.
-     - ⚠️ **This is UNVERIFIED ON WINDOWS — measured only on macOS.** The installer grant
-       above STAYS until a session on the `win` clone confirms that an elevated
-       `C:\Program Files` install can complete a build with the grant removed. Pulling it based
-       on the macOS measurement would be exactly the hypothesis-fix-from-a-Mac this repo's
-       Windows rule forbids: the macOS run cannot observe an elevated install tree at all.
+     - **Confirmed on Windows too, with the grant actually removed (not just theorized).**
+       `build/installer.nsh`'s `customInstall` macro (`CreateDirectory` +
+       `icacls … /grant *S-1-5-32-545:(OI)(CI)M`) was emptied and the installer rebuilt; a
+       fresh install to `C:\Program Files\Modoki Editor` (an admin-elevated per-machine path —
+       the discriminating one) launched pointed at `demos/forest-camp` (chosen for its rigged
+       model, the exact case `--configLoader runner` breaks) and pressed a real Build → Web:
+       the compile completed (rigged GLB optimized, no runner-closed error), `.vite-temp` was
+       never created at all, and no EPERM anywhere. `installer.nsh` now ships with an
+       intentionally empty `customInstall` — kept as a stub, not deleted, because
+       `nsis.include`'s implicit default pickup of this exact path is itself worth guarding
+       against going stale (`packagingManifest.test.ts`).
 
 ## Process control
 

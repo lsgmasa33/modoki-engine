@@ -1097,7 +1097,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*99 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*101 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -1110,6 +1110,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_editor_journal` | GET `/api/editor-journal` | session · **IMPURE READ** (an optional arg destroys state) | editor | — | *(no args)* |
 | `modoki_eval_api` | GET `/api/eval-api` | read-only | editor + renderer | — | *(no args)* |
 | `modoki_find_references` | GET `/api/find-references` | read-only | project | asset | `{"target":"/assets/scenes/main.scene.json"}` |
+| `modoki_game_view_devices` | GET `/api/game-view-devices` | read-only | editor | — | *(no args)* |
 | `modoki_get_asset_meta` | GET `/api/read-meta` | read-only | project | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_get_console_logs` | GET `/api/console-logs` | read-only | editor | — | *(no args)* |
 | `modoki_get_editor_state` | GET `/api/editor-state` | read-only | editor | — | *(no args)* |
@@ -1196,6 +1197,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_eval` | POST `/api/eval` | no persistence | editor + renderer | — | `{"code":"return 1 + 1;"}` |
 | `modoki_exit_pose_envelope` | POST `/api/editor-action` `exit-pose-envelope` | live | editor + scene | — | *(no args)* |
 | `modoki_focus_entity` | POST `/api/editor-action` `focus-entity` | no persistence | editor + scene | entity | *(no args)* |
+| `modoki_game_view_device` | POST `/api/editor-action` `set-game-view-device` | session | editor | — | `{"device":"Free"}` |
 | `modoki_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
 | `modoki_history` | POST `/api/editor-action` *(op = your `action`)* | live | editor | — | `{"action":"undo"}` |
 | `modoki_hit_regions` | GET `/api/hit-regions` | session | editor + renderer | — | `{"action":"read"}` |

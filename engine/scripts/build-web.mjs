@@ -200,9 +200,12 @@ try {
   // `--configLoader native` avoids both problems but requires every relative import under
   // `engine/` to carry a real extension (Node's native ESM resolution, unlike Vite's own,
   // does not guess `.ts`) — this repo's plugin tree does not, so native fails to even load
-  // vite.config.ts. The `.vite-temp` EPERM on an admin-elevated (`Program Files`) install is
-  // instead fixed at the INSTALLER, not here: build/installer.nsh grants write access to
-  // just that one subfolder from the (elevated) install step — see its own comment.
+  // vite.config.ts. The `.vite-temp` EPERM on an admin-elevated (`Program Files`) install used
+  // to be mitigated at the INSTALLER (build/installer.nsh granted write access to just that
+  // one subfolder from the elevated install step) — removed once the CJS config below was
+  // measured to not write there at all: a real Build press from a packaged editor installed to
+  // `C:\Program Files\Modoki Editor`, grant removed, produced zero files under `.vite-temp` and
+  // no EPERM (#326, 2026-08-27).
   //
   // ⚠️ macOS: the same `.vite-temp` write lands INSIDE the signed .app (`REPO_ROOT` is
   // `<Resources>/app.asar.unpacked` when packaged). There it is an integrity seal rather than a

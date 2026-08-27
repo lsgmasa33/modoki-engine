@@ -13,6 +13,7 @@ import { setAnimationClip } from '../../runtime/loaders/animationClipCache';
 import type { AnimationClipDef } from '../../runtime/animation/types';
 import { setTimeline } from '../../runtime/loaders/timelineCache';
 import type { TimelineDef } from '../../runtime/timeline/types';
+import { FREE_PRESET, type DevicePreset, type Orientation } from '../scene/devicePresets';
 
 // Toast auto-dismiss state, module-scoped (F5): a newer toast clears the prior
 // timer so N rapid toasts don't leave N zombie timers, and the id is a monotonic
@@ -113,6 +114,45 @@ interface EditorState {
   openPanels: string[];
   /** Opt-in: simulate + render ParticleEmitter effects live in the 3D SceneView */
   particlePreview: boolean;
+  /** The Game panel's selected device preset, and the orientation it is viewed in. Lifted from
+   *  GameView-local state into the store so they are agent-drivable (`set-game-view-device` /
+   *  `modoki_game_view_device`, #367) — the same move `sceneViewMode` above records, and for the
+   *  same reason: the device picker is a popup an agent's trusted input cannot operate, so any
+   *  layout check a session runs used to measure whatever device the human last left selected.
+   *
+   *  These two are the SOURCE OF TRUTH. `gameViewSize`/`gameViewSafeArea`/`gameRect` below stay
+   *  DERIVED — GameView resolves them from this pair and publishes them downward for SceneView.
+   *  Writing them from the setter as well would give each two writers to keep in sync by hand.
+   *
+   *  A custom resolution (no catalog entry) is carried as a synthetic preset named 'Custom' with
+   *  `NO_SAFE_AREA`, so every `resolve*` helper and every GameView consumer works on it unbranched.
+   *
+   *  Deliberately NOT persisted to localStorage, unlike `sceneViewMode`: this reset to `Free` on
+   *  every mount before it moved here, and a custom resolution silently restored days later is a
+   *  measurement taken at a size nobody chose. */
+  gameViewDevice: DevicePreset;
+  gameViewOrientation: Orientation;
+  /** Whether the GameView component is actually MOUNTED and running its effects.
+   *
+   *  ⚠️ **Not derivable from `openPanels`, and the first attempt at this got it wrong.**
+   *  `openPanels` is every TAB NODE in the FlexLayout model, with no selection test — and
+   *  FlexLayout defaults `tabEnableRenderOnDemand: true`, so a Game tab sharing a tabset with
+   *  another panel and never clicked EXISTS without ever mounting. Inferring mountedness from the
+   *  layout therefore reported `true` for exactly the case the flag was added to catch, which is
+   *  worse than not reporting it: `set-game-view-device` would answer a complete iPhone 16 Pro
+   *  read-back, assert the panel was live, and none of the derived values below would have moved.
+   *
+   *  So GameView publishes it itself, from an effect with cleanup — the only place the fact is
+   *  actually known. */
+  gameViewMounted: boolean;
+  /** The Game panel's game AREA in real CSS px, measured whether or not a device is selected.
+   *
+   *  Deliberately NOT `gameViewSize`, which means something different: while a FIXED device is
+   *  selected GameView writes the DEVICE's logical size there, so reading it as "how big is the
+   *  panel" answers with the phone. That is stale in precisely the transition it would be consulted
+   *  for — switching iPhone 16 Pro -> Free returned 402x874 as the panel size, and on a cold editor
+   *  it returned the fabricated `{800, 450}` default. This one is always the panel. */
+  gameAreaSize: { width: number; height: number };
   gameViewSize: { width: number; height: number };
   /** Safe-area insets (logical px) of the Game panel's selected device preset. Written by
    *  GameView, which owns the device picker; read by SceneView's UI preview frame so BOTH
@@ -286,6 +326,13 @@ interface EditorState {
   setGizmoPivot: (pivot: 'pivot' | 'center') => void;
   setUnlockedGhostSelKey: (key: string | null) => void;
   setParticlePreview: (on: boolean) => void;
+  /** Set the Game panel's device preset and/or its orientation. Omitting either leaves it alone,
+   *  so the orientation toggle and the picker are one setter. No-ops (and does not journal) when
+   *  neither actually changes. */
+  setGameViewDevice: (device?: DevicePreset, orientation?: Orientation) => void;
+  /** Set from GameView's mount effect + its cleanup. Nothing else may call it. */
+  setGameViewMounted: (mounted: boolean) => void;
+  setGameAreaSize: (width: number, height: number) => void;
   setGameViewSize: (width: number, height: number) => void;
   setGameViewSafeArea: (insets: EditorState['gameViewSafeArea']) => void;
   setGameRect: (rect: EditorState['gameRect']) => void;
@@ -453,6 +500,10 @@ export const useEditorStore = create<EditorState>((set, get) => {
   focusedPanel: null,
   openPanels: [],
   particlePreview: false,
+  gameViewDevice: FREE_PRESET,
+  gameViewOrientation: 'portrait',
+  gameViewMounted: false,
+  gameAreaSize: { width: 0, height: 0 },
   gameViewSize: { width: 800, height: 450 },
   gameViewSafeArea: { top: 0, right: 0, bottom: 0, left: 0 },
   gameRect: { left: 0, top: 0, width: 800, height: 450 },
@@ -624,6 +675,30 @@ export const useEditorStore = create<EditorState>((set, get) => {
   setGizmoPivot: (pivot: 'pivot' | 'center') => { if (get().gizmoPivot !== pivot) editorEmit('!gizmo', { pivot }); set({ gizmoPivot: pivot }); mark2DDirty(); },
   setUnlockedGhostSelKey: (key: string | null) => set({ unlockedGhostSelKey: key }),
   setParticlePreview: (on: boolean) => set({ particlePreview: on }),
+  setGameViewDevice: (device, orientation) => {
+    const cur = get();
+    // Compare the preset by VALUE, not by identity: a custom size arrives as a freshly built
+    // synthetic preset every call, so an identity check would journal + re-render on a no-op.
+    const nextDevice = device ?? cur.gameViewDevice;
+    const nextOrientation = orientation ?? cur.gameViewOrientation;
+    const sameDevice = nextDevice === cur.gameViewDevice
+      || (nextDevice.name === cur.gameViewDevice.name
+        && nextDevice.logicalW === cur.gameViewDevice.logicalW
+        && nextDevice.logicalH === cur.gameViewDevice.logicalH
+        && nextDevice.physicalW === cur.gameViewDevice.physicalW
+        && nextDevice.physicalH === cur.gameViewDevice.physicalH);
+    if (sameDevice && nextOrientation === cur.gameViewOrientation) return;
+    editorEmit('!gameviewdevice', { device: nextDevice.name, orientation: nextOrientation });
+    set({ gameViewDevice: nextDevice, gameViewOrientation: nextOrientation });
+  },
+  setGameViewMounted: (mounted) => { if (get().gameViewMounted !== mounted) set({ gameViewMounted: mounted }); },
+  // Identity-compared: written from a ResizeObserver, so a fresh object per callback would
+  // re-notify every subscriber on frames where nothing moved.
+  setGameAreaSize: (width, height) => {
+    const cur = get().gameAreaSize;
+    if (cur.width === width && cur.height === height) return;
+    set({ gameAreaSize: { width, height } });
+  },
   setGameViewSize: (width, height) => set({ gameViewSize: { width, height } }),
   // Identity-compared before writing: this is set from a render-time value in GameView, and
   // a fresh object every render would re-notify every subscriber (SceneView's preview frame

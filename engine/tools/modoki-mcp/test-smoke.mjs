@@ -949,6 +949,96 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
   });
 }
 
+// ── modoki_game_view_device (#367) ───────────────────────────────────────────
+// Smoke-covered rather than declared un-sweepable: the Game panel's preview size is editor-session
+// state, fully restorable, and nothing in the human's project changes. What only a live call can
+// prove is that `set-game-view-device` is on the /api/editor-action allowlist AND registered in the
+// renderer — a tool can be perfect on both static tiers and 400 on every call (modoki_prefab did,
+// for months). The read-back is asserted from modoki_get_editor_state, i.e. from a DIFFERENT route
+// than the write, so a setter that answered cheerfully without reaching the store would fail here.
+{
+  const catalog = JSON.parse(text(await client.callTool({ name: 'modoki_game_view_devices', arguments: {} })));
+  if (!Array.isArray(catalog.presets) || catalog.presets.length === 0) throw new Error('game_view_devices returned no presets');
+  if (!catalog.current || typeof catalog.current.device !== 'string') throw new Error('game_view_devices must report the CURRENT selection, not just the catalog');
+  const before = catalog.current;
+
+  await withCleanup(async () => {
+    const target = catalog.presets.find((p) => p.name === 'iPhone 16 Pro') ?? catalog.presets.find((p) => !p.free);
+    if (!target) throw new Error('the catalog carries no non-Free preset to test with');
+
+    const set = JSON.parse(text(await client.callTool({
+      name: 'modoki_game_view_device', arguments: { device: target.name, orientation: 'landscape' },
+    })));
+    if (set.device !== target.name) throw new Error(`set did not resolve the named device: ${JSON.stringify(set)}`);
+    // Landscape is a FLIP, not a catalog row — so the logical size must come back swapped. This is
+    // the assertion that would catch an orientation silently dropped on the wire.
+    if (set.logical.w !== target.logical.h || set.logical.h !== target.logical.w) {
+      throw new Error(`landscape did not flip the logical size: ${JSON.stringify(set.logical)} vs portrait ${JSON.stringify(target.logical)}`);
+    }
+    // Read it back through the OTHER route. A write that reports its own argument back is not
+    // evidence it reached the store.
+    const st = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+    if (!st.gameView || st.gameView.device !== target.name || st.gameView.orientation !== 'landscape') {
+      throw new Error(`editor-state does not report the device that was just set: ${JSON.stringify(st.gameView)}`);
+    }
+
+    // An explicit size the catalog has no entry for — the half the human UI cannot do at all.
+    // NOTE the orientation is still 'landscape' from the call above, and is deliberately NOT
+    // passed here: an explicit size must be taken LITERALLY (640 wide means 640 wide), not flipped
+    // by whatever orientation the panel happened to be left in. Measured against a live editor
+    // before this defaulted — it came back 480x640.
+    const custom = JSON.parse(text(await client.callTool({
+      name: 'modoki_game_view_device', arguments: { logicalWidth: 640, logicalHeight: 480, dpr: 2 },
+    })));
+    if (custom.orientation !== 'portrait') throw new Error(`an explicit size must default to portrait so its numbers are literal, got ${custom.orientation}`);
+    if (custom.logical.w !== 640 || custom.logical.h !== 480) throw new Error(`custom size did not take: ${JSON.stringify(custom.logical)}`);
+    if (custom.physical.w !== 1280 || custom.physical.h !== 960) throw new Error(`dpr did not reach the physical size: ${JSON.stringify(custom.physical)}`);
+    // Zeros with no device behind them must SAY they are zeros by construction — four bare zeros
+    // are indistinguishable from a measured "this screen has no notch".
+    if (custom.safeAreaBasis !== 'custom-none') throw new Error(`a custom size must report safeAreaBasis:'custom-none', got ${custom.safeAreaBasis}`);
+
+    // An unknown name is refused WITH the real list, never fuzzy-matched onto a nearby screen.
+    const unknown = await client.callTool({ name: 'modoki_game_view_device', arguments: { device: 'iPhone 16 Pruo' } });
+    if (!unknown.isError) throw new Error('an unknown device name must be refused, not fuzzy-matched');
+    if (!/iPhone 16 Pro/.test(text(unknown))) throw new Error('the refusal must list the real preset names');
+
+    // Two addresses at once is ambiguous — refused rather than resolved by precedence.
+    const both = await client.callTool({ name: 'modoki_game_view_device', arguments: { device: 'Free', logicalWidth: 100, logicalHeight: 100 } });
+    if (!both.isError) throw new Error('device + an explicit size together must be refused as ambiguous');
+
+    // A dpr that cannot round-trip is refused rather than silently rounded: the read-back derives
+    // dpr from the ROUNDED physical size, so accepting this would answer a dpr nobody asked for.
+    const badDpr = await client.callTool({ name: 'modoki_game_view_device', arguments: { logicalWidth: 3, logicalHeight: 3, dpr: 0.5 } });
+    if (!badDpr.isError) throw new Error('a dpr whose product is fractional must be refused, not rounded away');
+
+    // The Game panel's mounted-ness is reported: the store accepts a device whether or not GameView
+    // is mounted, but NOTHING derived (preview size, insets, letterbox) moves while it is not — so
+    // a measurement attributed to this screen would be measured at the previous one.
+    // `=== true`, not `typeof === 'boolean'`: the weak form passes when the field is always false,
+    // so it would have stayed green under a miscased panel-id lookup or a hardcoded constant. The
+    // smoke runs the default layout, where the Game tab is alone in its tabset and therefore
+    // mounted — so true is the only correct answer here.
+    if (custom.panelMounted !== true) throw new Error(`panelMounted must be true with the Game panel open — got ${custom.panelMounted}`);
+    // Free reports the real measured panel area; a fixed device does not (its `logical` IS the size).
+    if (custom.panelSize !== undefined) throw new Error('panelSize must be omitted for a fixed device — logical is the answer there');
+    const freeBack = JSON.parse(text(await client.callTool({ name: 'modoki_game_view_device', arguments: { device: 'Free' } })));
+    if (!freeBack.panelSize || !(freeBack.panelSize.w > 0) || !(freeBack.panelSize.h > 0)) {
+      throw new Error(`Free must report a MEASURED panelSize, not the device it just left: ${JSON.stringify(freeBack.panelSize)}`);
+    }
+    // The regression that matters: panelSize must not echo the phone we were just on.
+    if (freeBack.panelSize.w === custom.logical.w && freeBack.panelSize.h === custom.logical.h) {
+      throw new Error('panelSize returned the PREVIOUS device size — it is reading gameViewSize, not the measured area');
+    }
+
+    console.log(`game_view_device sets by name, by explicit size, and refuses an unknown one ✓ (${catalog.presets.length} presets)`);
+  }, async () => {
+    await client.callTool({
+      name: 'modoki_game_view_device',
+      arguments: { device: before.device === 'Custom' ? 'Free' : before.device, orientation: before.orientation },
+    });
+  });
+}
+
 // ── modoki_profiler (#166 P6) ────────────────────────────────────────────────
 // Self-cleaning, so it is smoke-covered rather than listed as un-sweepable: the capture buffer is
 // profiler state, not the human's project, and the case restores GPU timing to how it found it.

@@ -26,6 +26,10 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'Also `heldPointer` — the sustained modoki_pointer press currently held ({button,x,y,heldMs}), ' +
       'or null. Check it when the Game panel has stopped responding to drags: a press left held ' +
       'latches pointer input for the human as well as the agent, and nothing else reports it (#302). ' +
+      'Also `gameView` — WHICH SCREEN the Game panel is previewing at (device name, orientation, '
+      + 'logical + physical size, dpr, safe-area insets). Read it before quoting any layout '
+      + 'measurement: the same HUD is correct on one device and broken on another, so a number '
+      + 'with no screen attached to it is unfalsifiable. Set it with modoki_game_view_device. ' +
       'The companion to get_scene_state (which reads the ECS world): this reads the EDITOR. ' +
       'Requires a connected editor renderer.',
     {},
@@ -72,7 +76,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'drag — before/after hold only the TRS fields that moved, e.g. {x,y,z}; a MULTI-SELECT drag is ' +
       'ONE event shaped `{entities:[guid], members:[{entity, before, after}]}` instead, so read ' +
       '`members` — `payload.entity` is undefined there). !scene-load `{path, ' +
-      'entityCount}`, !save `{path, entities}`, !gizmo `{mode|space}`. ' +
+      'entityCount}`, !save `{path, entities}`, !gizmo `{mode|space}`, !sceneviewmode `{mode}`, ' +
+      '!gameviewdevice `{device, orientation}`. ' +
       'A trait-field !edit ALSO carries a structured `detail: {trait, field, entities[guid], old[], ' +
       'new[]}` (index-aligned arrays; length-1 for a single edit, N for a multi-select — so "zeroed ' +
       'gravityScale on 3 crates" is machine-readable, not just a label). !undo/!redo echo the ' +
@@ -420,6 +425,56 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'their interaction handles (modoki_handles editor=collider2d). Returns editor state.',
     { mode: z.enum(['3d', 'ui']) },
     async ({ mode }) => editorAction('set-scene-view-mode', { mode }),
+  );
+
+  // ── GameView device simulation (#367) ──
+  tool(
+    'modoki_game_view_devices',
+    'List the device presets the Game panel can preview at, plus the one selected now. Each row '
+      + 'carries the LOGICAL size (CSS points — the space layout math runs in), the PHYSICAL size '
+      + '(device pixels), the dpr, and safe-area insets for both orientations. Read this instead of '
+      + 'hardcoding a device table. Rows are PORTRAIT — landscape is a flip applied on selection, '
+      + 'not a separate row, so pass `orientation` to modoki_game_view_device. Changes nothing.',
+    {},
+    async () => getJson('/api/game-view-devices'),
+  );
+  tool(
+    'modoki_game_view_device',
+    'Set WHICH SCREEN the Game panel previews at. The device picker is a popup trusted input '
+      + 'cannot operate, so this is the only way an agent can change it — without it every layout '
+      + 'check measures whatever device the human last left selected. Pass `device` (a name from '
+      + "modoki_game_view_devices; 'Free' fills the panel) OR logicalWidth+logicalHeight for a size "
+      + 'the catalog lacks — both together is refused as ambiguous. An unknown name is refused with '
+      + 'the real list, never fuzzy-matched: previewing a screen other than the one you named makes '
+      + 'every later measurement wrong. A custom size gets ZERO safe-area insets '
+      + "(safeAreaBasis:'custom-none') — there is no device to look them up from, so do not read "
+      + 'those zeros as "no notch". Returns the resolved selection, which modoki_get_editor_state '
+      + 'also reports as `gameView`. Editor-session state — nothing is written to disk, and a real '
+      + 'device is unaffected.',
+    {
+      device: z.string().optional().describe(
+        "A preset NAME from modoki_game_view_devices, e.g. 'iPhone 16 Pro', or 'Free' to fill the "
+        + 'panel. Matched exactly (case-insensitively). Mutually exclusive with logicalWidth/Height.',
+      ),
+      orientation: z.enum(['portrait', 'landscape']).optional().describe(
+        'Presets are authored portrait and flipped by this. Settable on its own; defaults to leaving '
+        + 'the current orientation unchanged.',
+      ),
+      logicalWidth: z.number().optional().describe(
+        'Explicit width in LOGICAL pixels (CSS points), 1-8192, for a size the catalog lacks. '
+        + 'Requires logicalHeight. Taken literally — an explicit size defaults to portrait, so these '
+        + 'are the numbers you get; pass orientation:landscape alongside to rotate them. Named '
+        + '`logical` because a bare `width` would be ambiguous with the physical (backbuffer) size '
+        + 'this tool also reports.',
+      ),
+      logicalHeight: z.number().optional().describe('Explicit height in LOGICAL pixels, 1-8192. Requires logicalWidth.'),
+      dpr: z.number().optional().describe(
+        'Device pixel ratio for a custom size, 0.5-4 (default 1); physical = logical x dpr. A dpr '
+        + 'whose product with either dimension is fractional is REFUSED rather than rounded — the '
+        + 'read-back derives dpr from the physical size, so rounding would report a dpr you did not ask for.',
+      ),
+    },
+    async (p) => editorAction('set-game-view-device', p),
   );
   tool(
     'modoki_collider_edit',

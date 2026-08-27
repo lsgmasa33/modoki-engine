@@ -430,6 +430,19 @@ const DECLS: Record<string, Decl> = {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-scene-view-mode', mutating: true, persists: 'session',
     minimalArgs: { mode: '3d' },
   },
+  modoki_game_view_devices: {
+    kind: 'read', method: 'GET', route: '/api/game-view-devices',
+    notes: 'The catalog is relayed from the renderer (editor/scene/devicePresets.ts), never copied '
+      + 'here — a second table goes stale the first time a device is added.',
+  },
+  modoki_game_view_device: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-game-view-device',
+    mutating: true, persists: 'session',
+    minimalArgs: { device: 'Free' },
+    notes: "Editor-session state (the Game panel's preview size), not scene data and not on disk. "
+      + 'Split from modoki_game_view_devices on §4: the read half is a GET, and a mutating op '
+      + 'reached by GET has its refusal read as a success.',
+  },
   modoki_collider_edit: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-collider-edit', mutating: true, persists: 'session',
     minimalArgs: { on: true },

@@ -100,6 +100,12 @@ describe('electron-builder packaging manifest', () => {
       'engine/tools/modoki-mcp/src/index.ts',
       'engine/packages/modoki/src/editor/createEditor.tsx',
       'engine/packages/modoki/src/runtime/core/clock.ts',
+      // engine/vite.config.cjs (gitignored, staged into the source tree only at pack time by
+      // stage-vite-config.cjs) is chooseViteConfig()'s ONLY way to avoid the .vite-temp write
+      // (#326) in a packaged app — an exclude dropping it silently restores the write this test
+      // file's other describe block exists to keep gone. Not present on disk in a dev clone, so
+      // this asserts against the GLOB, same as every other entry here, not a real file read.
+      'engine/vite.config.cjs',
     ];
     for (const file of mustShip) {
       const hit = excludes.filter((glob) => picomatch.isMatch(file, glob));
@@ -221,32 +227,37 @@ describe('starter template ships (New Project / Connect Claude Code)', () => {
  * override in electron-builder.yml, so it defaults to `build/installer.nsh` (verified against
  * app-builder-lib/scheme.json's documented default) and electron-builder picks it up with no
  * config change needed. That implicit pickup is exactly the kind of wiring that goes stale
- * silently — a renamed/moved/emptied file would build a perfectly normal-looking installer
- * that quietly reintroduces the `.vite-temp` EPERM on an admin-elevated (`Program Files`)
- * install, which only shows up on the FIRST Build press, not at install or launch. See
- * docs/windows.md's "Packaged-app bugs" entry #5 for why the write can't be avoided instead
- * (Vite hardcodes the bundled-config temp path with no override) and why the broader
- * alternatives (--configLoader runner/native) were tried and reverted.
+ * silently, which is why this guard still asserts the file EXISTS at that path even though the
+ * grant itself was removed (#326, 2026-08-27): the CJS packaged Vite config no longer writes
+ * into `.vite-temp` at all (measured on Windows, grant removed, real Build press, zero files
+ * created), so a `customInstall` macro would have nothing left to grant. See
+ * docs/windows.md's "Packaged-app bugs" entry #5 and `engine/scripts/build-web.mjs`'s comment
+ * on the `vite build` call for the fuller history.
  */
-describe('installer.nsh grants write access to .vite-temp', () => {
+describe('installer.nsh', () => {
   const installerNsh = path.join(repoRoot, 'build', 'installer.nsh');
 
   it('exists at the path nsis.include defaults to (no explicit override in electron-builder.yml)', () => {
     expect(existsSync(installerNsh)).toBe(true);
   });
 
-  it('defines customInstall and grants Users write access to node_modules/.vite-temp', () => {
+  it('defines customInstall (electron-builder inserts a call to it post-install) with no ACL grant left in it', () => {
     const nsh = readFileSync(installerNsh, 'utf8');
     expect(nsh, 'must define the customInstall macro electron-builder inserts post-install').toMatch(
       /!macro\s+customInstall/,
     );
-    expect(nsh, 'must create the exact directory Vite writes its bundled config into').toContain(
-      'node_modules\\.vite-temp',
-    );
-    // S-1-5-32-545 = BUILTIN\Users (the well-known SID, not a localized group name) with
-    // (OI)(CI) inheritance so files vite writes INSIDE the folder inherit the grant too.
-    expect(nsh, 'must grant BUILTIN\\Users write via icacls, inherited to created files').toMatch(
-      /icacls[\s\S]*S-1-5-32-545:\(OI\)\(CI\)M/,
+    // Strip `;`-comments first — this doc's own commentary describes the removed grant by name
+    // (icacls, .vite-temp), and a bare substring check over the whole file would fail on that
+    // prose rather than on actual NSIS code. Only CODE re-adding the grant should trip this.
+    const code = nsh
+      .split('\n')
+      .map((line) => line.replace(/;.*$/, ''))
+      .join('\n');
+    // The .vite-temp write this used to work around is gone at the source (#326) — any of these
+    // ACL mechanisms reappearing in CODE would mean someone reintroduced the write it was
+    // compensating for (icacls/cacls the CLI tools, Set-Acl/AccessControl the NSIS-plugin routes).
+    expect(code, 'must not re-add an ACL grant this issue removed').not.toMatch(
+      /\bicacls\b|\bcacls\b|Set-Acl|AccessControl::/i,
     );
   });
 });

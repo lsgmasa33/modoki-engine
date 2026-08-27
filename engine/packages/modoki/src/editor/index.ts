@@ -18,6 +18,17 @@ export {
 } from '../runtime/scene/entityCreateSpecs';
 export { buildUiCreateSpecs, type UiPreset } from '../runtime/ui/uiAuthoring';
 export { enterPlay, stopPlay, pausePlay, resetPlayMode } from './scene/playMode';
+// GameView device simulation. Exported for the agent ops behind `modoki_game_view_device` /
+// `modoki_game_view_devices` (#367) — the catalog is the single source of truth for what screens
+// exist, so an op that hardcoded a table would go stale on the next device added.
+export {
+  DEVICE_PRESETS, DEVICE_CATEGORY_ORDER, FREE_PRESET, NO_SAFE_AREA, NO_INSETS,
+  resolveLogicalSize, resolvePhysicalSize, resolveSafeArea, safeAreaCssVars, presetDpr, presetLabel,
+  filterDevices, findPresetByName, makeCustomPreset, validateCustomSize, describeDeviceSelection,
+  CUSTOM_PRESET_NAME, CUSTOM_SIZE_MIN, CUSTOM_SIZE_MAX, CUSTOM_DPR_MIN, CUSTOM_DPR_MAX,
+  type DevicePreset, type DeviceCategory, type Orientation, type SafeAreaSet, type SafeAreaPx,
+  type DeviceSelection, type SafeAreaBasis,
+} from './scene/devicePresets';
 export {
   editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,
   withEditorActor, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS, ACTOR_LEASE_GRACE_MS,

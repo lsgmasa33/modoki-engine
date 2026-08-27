@@ -430,7 +430,11 @@ describe('the real registered surface', () => {
   // 18% of slack, which would have let ~8 new tools land without ever firing, i.e. exactly the
   // growth it claims to catch. A pin set above the real number is not a pin. Re-measure when you
   // raise it: `bytes` below is the number to use.
-  const DEFINITION_BYTES = 124_262;
+  // Re-measured 2026-08-27 (#367, +modoki_game_view_device/_devices and get_editor_state's
+  // `gameView` line). The two new tools account for ~2.3 KB of the ~4.9 KB jump — the rest was
+  // growth that had accumulated INSIDE the old headroom without ever re-pinning, which is the
+  // drift this ledger exists to surface. Re-measure on every raise, do not add to the old value.
+  const DEFINITION_BYTES = 129_199;
   const DEFINITION_HEADROOM = 4_000;
 
   it(`the tool definitions stay near their recorded size (~${Math.round(DEFINITION_BYTES / 1000)} KB)`, () => {

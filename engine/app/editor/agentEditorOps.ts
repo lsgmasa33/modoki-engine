@@ -48,6 +48,9 @@ import {
   waitForEditorJournal,
   getResolvedRender3d,
   probeKeyReach,
+  DEVICE_PRESETS, findPresetByName, makeCustomPreset, validateCustomSize,
+  describeDeviceSelection, presetDpr, resolveLogicalSize, resolvePhysicalSize, resolveSafeArea,
+  type DevicePreset, type Orientation,
   type PrefabFile,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
@@ -124,6 +127,50 @@ function gpuFields(): { gpu?: ReturnType<typeof getGpuFaultState> } {
 }
 
 /** The whole editor UI state in one read — the "get all UI state" payload. */
+/** The Game panel's selected screen, plus the two editor-session facts the preset itself cannot
+ *  know. Both were review findings on #367, and BOTH were got wrong on the first attempt — the
+ *  wrong versions are recorded here because each looked obviously right:
+ *
+ *  - **`panelMounted`** — read from `gameViewMounted`, which GameView sets from its own mount
+ *    effect. It was first DERIVED from `openPanels.includes('game')`, which is wrong: `openPanels`
+ *    is every tab NODE in the FlexLayout model with no selection test, and FlexLayout defaults
+ *    `tabEnableRenderOnDemand: true`, so a Game tab that shares a tabset and has never been
+ *    clicked exists without mounting. That version answered `mounted: true` for exactly the case
+ *    the field exists to catch — asserting the panel was live, with authority, while none of the
+ *    derived values had moved. Worse than not reporting it at all.
+ *
+ *    Why it matters: `gameViewSize`/`gameViewSafeArea`/`gameRect` are written ONLY by GameView's
+ *    effects. Unmounted, the store's device changes and NOTHING derived follows, so a measurement
+ *    attributed to the new screen was taken at the old one.
+ *
+ *  - **`panelSize`** — read from `gameAreaSize`, measured by an always-on ResizeObserver. It first
+ *    read `gameViewSize`, which means something different: while a FIXED device is selected that
+ *    holds the DEVICE's logical size. So `iPhone 16 Pro` then `Free` answered `panelSize:
+ *    {402, 874}` — the phone just left, presented as the panel's size — and a cold editor answered
+ *    the fabricated `{800, 450}` default. Stale in precisely the transition it was added for.
+ *
+ *    Reported only when `free`, because a fixed device's `logical` IS the answer; and only when
+ *    mounted, because nothing has measured the area otherwise.
+ */
+function describeGameView() {
+  const s = useEditorStore.getState();
+  const sel = describeDeviceSelection(s.gameViewDevice, s.gameViewOrientation);
+  const panelMounted = s.gameViewMounted;
+  return {
+    ...sel,
+    ...(sel.free && panelMounted
+      ? { panelSize: { w: s.gameAreaSize.width, h: s.gameAreaSize.height } }
+      : {}),
+    panelMounted,
+    ...(panelMounted ? {} : {
+      panelNote: 'The Game panel is NOT mounted, so nothing derived from this selection has moved — '
+        + 'the preview size, safe-area insets and letterbox rect all still describe the previous '
+        + 'state. Open (and SELECT) the Game tab before attributing any layout measurement to this '
+        + 'screen: an unselected tab does not mount.',
+    }),
+  };
+}
+
 function readEditorState() {
   const s = useEditorStore.getState();
   return {
@@ -142,6 +189,11 @@ function readEditorState() {
     gizmoMode: s.gizmoMode,
     gizmoSpace: s.gizmoSpace,
     sceneViewMode: s.sceneViewMode,
+    // Which screen the Game panel is previewing at. Reported so a layout measurement can be
+    // ATTRIBUTED to a screen size — without it, "the HUD overlaps the notch" is unfalsifiable,
+    // since the reader cannot tell which device produced it (#367). Set with
+    // modoki_game_view_device; the full catalog is modoki_game_view_devices.
+    gameView: describeGameView(),
     // Which panel owns the KEYBOARD ('scene' | 'hierarchy' | 'animation-editor' | …), or null.
     // Readable as DATA on purpose: the focus ring is a CSS box-shadow, so without this the
     // question "which panel would this key go to?" would only be answerable from a screenshot —
@@ -920,6 +972,124 @@ export function registerEditorAgentOps(): void {
     const p = (params ?? {}) as { mode?: '3d' | 'ui' };
     if (p.mode === '3d' || p.mode === 'ui') useEditorStore.getState().setSceneViewMode(p.mode);
     return readEditorState();
+  });
+
+  // ── GameView device simulation (#367) ──
+  // The device picker is a popup that trusted input cannot operate, and the orientation toggle is
+  // a toolbar button in a panel an agent may not even have on screen — so before these ops the one
+  // knob deciding WHAT SIZE the game is previewed at was human-only, and every layout check a
+  // session ran measured whatever device the human last left selected. The per-device bug class
+  // (#271/#272 safe-area insets, Court's panel-fit budget #358) is precisely the class that needs
+  // the device changed, repeatedly, to be checked at all.
+  //
+  // Two ops, not one, and deliberately so: `game-view-devices` ANSWERS a question and
+  // `set-game-view-device` DOES something. docs/mcp-tool-conventions.md §4 — a mutating op reached
+  // by GET has its refusal read as a success, because `getJson` does not run `isFailureBody`.
+  registerAgentOp('game-view-devices', () => {
+    const s = useEditorStore.getState();
+    return {
+      ok: true,
+      current: describeDeviceSelection(s.gameViewDevice, s.gameViewOrientation),
+      // The catalog itself, resolved in PORTRAIT (how the table is authored) — landscape is a flip
+      // applied at selection time, not a second set of entries, so listing both would double the
+      // payload to say the same thing. `orientation` on the setter is what chooses.
+      presets: DEVICE_PRESETS.map((p) => ({
+        name: p.name,
+        category: p.category,
+        logical: resolveLogicalSize(p, 'portrait'),
+        physical: resolvePhysicalSize(p, 'portrait'),
+        dpr: presetDpr(p),
+        safeArea: { portrait: resolveSafeArea(p, 'portrait'), landscape: resolveSafeArea(p, 'landscape') },
+        free: p.logicalW <= 0,
+      })),
+      note: "Sizes are LOGICAL (CSS points) unless named physical; layout math runs in logical space. "
+        + "Set one with modoki_game_view_device {device, orientation}, or give an explicit "
+        + '{logicalWidth, logicalHeight} for a size the catalog does not carry.',
+    };
+  });
+
+  registerAgentOp('set-game-view-device', (params) => {
+    const p = (params ?? {}) as {
+      device?: unknown; orientation?: unknown;
+      logicalWidth?: unknown; logicalHeight?: unknown; dpr?: unknown;
+    };
+    const store = useEditorStore.getState();
+    const names = DEVICE_PRESETS.map((d) => d.name);
+
+    let orientation: Orientation | undefined;
+    if (p.orientation !== undefined) {
+      if (p.orientation !== 'portrait' && p.orientation !== 'landscape') {
+        return {
+          ok: false,
+          error: `orientation must be 'portrait' or 'landscape' — got ${JSON.stringify(p.orientation)}`,
+          options: ['portrait', 'landscape'],
+        };
+      }
+      orientation = p.orientation;
+    }
+
+    const wantsCustom = p.logicalWidth !== undefined || p.logicalHeight !== undefined || p.dpr !== undefined;
+    // Both addresses at once is AMBIGUOUS, not resolved by precedence: a caller who gave two
+    // answers does not know which screen they got, and picking for them is §0's rank-1 class.
+    if (wantsCustom && p.device !== undefined) {
+      return {
+        ok: false,
+        error: 'give EITHER device (a catalog preset by name) OR logicalWidth+logicalHeight (an '
+          + 'explicit size) — not both. Which screen you meant cannot be inferred from the pair.',
+      };
+    }
+
+    let device: DevicePreset | undefined;
+    if (wantsCustom) {
+      const bad = validateCustomSize(p.logicalWidth, p.logicalHeight, p.dpr);
+      if (bad) return { ok: false, error: `custom size refused: ${bad}` };
+      device = makeCustomPreset(p.logicalWidth as number, p.logicalHeight as number, (p.dpr as number | undefined) ?? 1);
+      // An explicit size is taken LITERALLY: default it to portrait so the numbers asked for are
+      // the numbers previewed. Presets are authored portrait and flipped by the orientation, and
+      // orientation is sticky — so without this, `{logicalWidth:640, logicalHeight:480}` sent while
+      // the panel happened to be in landscape previews 480x640. The read-back would say so
+      // honestly, but "I asked for 640 wide and got 480" is a trap worth not setting. Passing
+      // `orientation` alongside a custom size still rotates it — that is an explicit request.
+      orientation ??= 'portrait';
+    } else if (p.device !== undefined) {
+      if (typeof p.device !== 'string') {
+        return { ok: false, error: `device must be a preset NAME (a string) — got ${typeof p.device}`, options: names };
+      }
+      // No fuzzy match, by rule (§5): previewing a DIFFERENT screen than the one named is worse
+      // than failing, because every measurement taken after it is attributed to the wrong device.
+      device = findPresetByName(p.device);
+      if (!device) {
+        return {
+          ok: false,
+          error: `no device preset named ${JSON.stringify(p.device)}. Names are matched exactly `
+            + '(case-insensitively) and NOT fuzzy-matched — a near miss would silently preview a '
+            + 'different screen. Use "Free" to fill the panel, or pass logicalWidth+logicalHeight '
+            + 'for a size the catalog does not carry.',
+          options: names,
+        };
+      }
+    }
+
+    if (device === undefined && orientation === undefined) {
+      return {
+        ok: false,
+        error: 'nothing to set: pass device (a preset name), or logicalWidth+logicalHeight for an '
+          + 'explicit size, or orientation. A call with none of them would report success for a '
+          + 'no-op. Read the current selection with modoki_get_editor_state (gameView) or '
+          + 'modoki_game_view_devices.',
+      };
+    }
+
+    store.setGameViewDevice(device, orientation);
+    return {
+      ok: true,
+      ...describeGameView(),
+      // §8: persistence is stated, never guessed. This is EDITOR-SESSION state — it is not scene
+      // data, nothing is written to disk, and it resets to Free when the editor restarts.
+      saved: false,
+      note: 'Preview-only editor state — the project is unchanged and nothing was written to disk. '
+        + 'A real device is unaffected (device_* drives hardware, which already IS its resolution).',
+    };
   });
   // Set the KEYBOARD SCOPE — which panel the keymap dispatcher resolves chords against
   // (focus-scope refactor P7). Without this, an agent's only way to steer a keypress was

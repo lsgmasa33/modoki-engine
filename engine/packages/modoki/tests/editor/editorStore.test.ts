@@ -16,6 +16,7 @@ vi.mock('../../src/editor/undo/undoManager', () => ({
 // Must import after mocks are set up
 const { useEditorStore } = await import('../../src/editor/store/editorStore');
 const { get2DDirtyVersion } = await import('../../src/editor/store/canvas2DDirty');
+const { DEVICE_PRESETS, makeCustomPreset } = await import('../../src/editor/scene/devicePresets');
 
 beforeEach(() => {
   pushedSelections = [];
@@ -394,6 +395,69 @@ describe('editorStore', () => {
       setGameRect(rect);
 
       expect(useEditorStore.getState().gameRect).toEqual(rect);
+    });
+  });
+
+  describe('gameViewDevice (#367 — the agent-drivable preview screen)', () => {
+    it('defaults to Free in portrait', () => {
+      expect(useEditorStore.getState().gameViewDevice.name).toBe('Free');
+      expect(useEditorStore.getState().gameViewOrientation).toBe('portrait');
+    });
+
+    it('sets the device and the orientation independently', () => {
+      const { setGameViewDevice } = useEditorStore.getState();
+      const iphone = DEVICE_PRESETS.find((p) => p.name === 'iPhone 16 Pro')!;
+      setGameViewDevice(iphone);
+      expect(useEditorStore.getState().gameViewDevice.name).toBe('iPhone 16 Pro');
+      expect(useEditorStore.getState().gameViewOrientation).toBe('portrait');
+
+      // Orientation alone must not disturb the device — this is what lets the toolbar toggle and
+      // the picker share one setter.
+      setGameViewDevice(undefined, 'landscape');
+      expect(useEditorStore.getState().gameViewDevice.name).toBe('iPhone 16 Pro');
+      expect(useEditorStore.getState().gameViewOrientation).toBe('landscape');
+    });
+
+    it('compares a custom preset BY VALUE, so re-setting the same size is a no-op', () => {
+      // A custom size arrives as a freshly built object every call. An identity check would treat
+      // each one as a change, journalling and re-rendering on a no-op.
+      const { setGameViewDevice } = useEditorStore.getState();
+      setGameViewDevice(makeCustomPreset(640, 480), 'portrait');
+      const first = useEditorStore.getState().gameViewDevice;
+      setGameViewDevice(makeCustomPreset(640, 480));
+      expect(useEditorStore.getState().gameViewDevice).toBe(first);
+
+      // A DIFFERENT size under the same name must still register as a change.
+      setGameViewDevice(makeCustomPreset(800, 600));
+      expect(useEditorStore.getState().gameViewDevice.logicalW).toBe(800);
+    });
+
+    it('mountedness is published by GameView, and defaults to NOT mounted', () => {
+      // The agent read-back reports this, and it must not default to an optimistic true: an
+      // unmounted GameView means none of the derived values (preview size, insets, letterbox)
+      // follow a device change, so a measurement attributed to the new screen was taken at the
+      // old one. It was first DERIVED from openPanels, which reports a tab that exists but has
+      // never been selected — FlexLayout renders tabs on demand — i.e. true in exactly the case
+      // the flag exists to catch.
+      expect(useEditorStore.getState().gameViewMounted).toBe(false);
+      useEditorStore.getState().setGameViewMounted(true);
+      expect(useEditorStore.getState().gameViewMounted).toBe(true);
+      useEditorStore.getState().setGameViewMounted(false);
+      expect(useEditorStore.getState().gameViewMounted).toBe(false);
+    });
+
+    it('the game AREA size is tracked separately from the device size', () => {
+      // These two must never be conflated: `gameViewSize` holds the DEVICE's logical size while a
+      // device is selected, so reading it as "how big is the panel" answers with the phone — and
+      // is wrong in precisely the transition it would be consulted for.
+      const { setGameViewDevice, setGameAreaSize, setGameViewSize } = useEditorStore.getState();
+      setGameAreaSize(365, 549);
+      const iphone = DEVICE_PRESETS.find((p) => p.name === 'iPhone 16 Pro')!;
+      setGameViewDevice(iphone, 'portrait');
+      setGameViewSize(iphone.logicalW, iphone.logicalH); // what GameView does for a fixed device
+      expect(useEditorStore.getState().gameViewSize).toEqual({ width: 402, height: 874 });
+      // The panel did not change size just because a device was picked.
+      expect(useEditorStore.getState().gameAreaSize).toEqual({ width: 365, height: 549 });
     });
   });
 
