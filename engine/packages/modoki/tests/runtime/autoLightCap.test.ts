@@ -10,7 +10,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   globalKeptMask, maskForObject, capChangesAnything, canAutoCap,
-  MAX_CAPPABLE_LIGHTS, effectiveness, type CapLight, type LightCaps,
+  MAX_CAPPABLE_LIGHTS, ALL_LIGHTS_MASK, effectiveness, type CapLight, type LightCaps,
 } from '../../src/runtime/rendering/autoLightCap';
 
 const LOW: LightCaps = { maxDirectional: 1, maxLocal: 1 };
@@ -73,6 +73,34 @@ describe('globalKeptMask', () => {
   it('excludes point/spot — those are chosen per object', () => {
     expect(bits(globalKeptMask([amb(0), pt(1, 0), pt(2, 5)], LOW))).toEqual([0]);
   });
+
+  describe('hysteresis (#353)', () => {
+    const WITH_MARGIN: LightCaps = { maxDirectional: 1, maxLocal: 1, hysteresisMargin: 0.2 };
+
+    it('margin 0 (the default) behaves exactly like the memoryless rule', () => {
+      // dir(1) is a hair ahead of dir(0) — with no margin the incumbent gets no help.
+      expect(bits(globalKeptMask([dir(0, 10), dir(1, 10.01)], LOW, ALL_LIGHTS_MASK, 1 /* dir(0) was kept */)))
+        .toEqual([1]);
+    });
+
+    it('keeps the incumbent through a near tie that would otherwise flap every frame', () => {
+      const incumbent = 1 << 0; // dir(0) was kept last frame
+      // dir(1) edges ahead by less than the 20% margin — an index tie-break alone cannot help
+      // here because there is no exact tie, just a challenger that is barely, not clearly, better.
+      expect(bits(globalKeptMask([dir(0, 10), dir(1, 11)], WITH_MARGIN, ALL_LIGHTS_MASK, incumbent)))
+        .toEqual([0]);
+    });
+
+    it('still lets a CLEAR winner take over — margin damps flap, it does not freeze the scene', () => {
+      const incumbent = 1 << 0;
+      expect(bits(globalKeptMask([dir(0, 10), dir(1, 20)], WITH_MARGIN, ALL_LIGHTS_MASK, incumbent)))
+        .toEqual([1]);
+    });
+
+    it('has no incumbent to protect the first time it runs (previousMask 0)', () => {
+      expect(bits(globalKeptMask([dir(0, 10), dir(1, 11)], WITH_MARGIN))).toEqual([1]);
+    });
+  });
 });
 
 describe('maskForObject', () => {
@@ -106,6 +134,44 @@ describe('maskForObject', () => {
     const noLocal = [amb(0), dir(1, 5), dir(2, 1)];
     const gm = globalKeptMask(noLocal, LOW);
     expect(bits(maskForObject(noLocal, LOW, gm, 3, 4, 5))).toEqual([0, 1]);
+  });
+
+  describe('hysteresis (#353)', () => {
+    // pt(2,0) at x=0, pt(3,10) at x=10 — an object at x=5.2 is a near tie (d²=27.04 vs 23.04, an
+    // 8% gap) that would flap every frame as the object drifts, well inside the 20% margin.
+    const WITH_MARGIN: LightCaps = { maxDirectional: 1, maxLocal: 1, hysteresisMargin: 0.2 };
+
+    it('keeps the incumbent local light through a near tie', () => {
+      const incumbentIsPt2 = 1 << 2;
+      expect(bits(maskForObject(lights, WITH_MARGIN, g, 5.2, 0, 0, ALL_LIGHTS_MASK, incumbentIsPt2)))
+        .toEqual([0, 1, 2]); // pt(2) kept despite pt(3) now being nominally nearer
+    });
+
+    it('still hands off once the challenger is clearly nearer, not just nominally', () => {
+      const incumbentIsPt2 = 1 << 2;
+      // At x=9 pt(3) (x=10, d=1) is overwhelmingly closer than pt(2) (x=0, d=9) — far past any
+      // reasonable margin, so the incumbent does not get to pin the object dark-side-out forever.
+      expect(bits(maskForObject(lights, WITH_MARGIN, g, 9, 0, 0, ALL_LIGHTS_MASK, incumbentIsPt2)))
+        .toEqual([0, 1, 3]);
+    });
+
+    it('margin 0 (the default) reproduces the plain nearest-N result exactly', () => {
+      const incumbentIsPt2 = 1 << 2;
+      expect(bits(maskForObject(lights, LOW, g, 5.2, 0, 0, ALL_LIGHTS_MASK, incumbentIsPt2)))
+        .toEqual([0, 1, 3]); // no memory effect: pt(3) wins on raw distance as it would today
+    });
+
+    it('an out-of-range margin is clamped rather than freezing the selection forever (#353 review)', () => {
+      // caps.hysteresisMargin >= 1 makes `d2 * (1 - margin)` <= 0, so a discounted incumbent would
+      // win against ANY distance — a typo'd project config (e.g. `1.5`) would pin a light selection
+      // permanently with no error anywhere. It must be clamped, not trusted.
+      const incumbentIsPt2 = 1 << 2;
+      const RUNAWAY: LightCaps = { maxDirectional: 1, maxLocal: 1, hysteresisMargin: 1.5 };
+      // pt(4) at x=100 is overwhelmingly farther than pt(3) at x=10, from an object at x=9 — no
+      // legitimate margin should let the far incumbent win here.
+      expect(bits(maskForObject(lights, RUNAWAY, g, 9, 0, 0, ALL_LIGHTS_MASK, 1 << 4)))
+        .toEqual([0, 1, 3]);
+    });
   });
 });
 

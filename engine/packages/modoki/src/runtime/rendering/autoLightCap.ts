@@ -69,6 +69,25 @@ export interface LightCaps {
   maxDirectional: number;
   /** 0 = unlimited. */
   maxLocal: number;
+  /** Fraction in [0, 1) a CHALLENGER must beat the incumbent selection by before it replaces it
+   *  (#353). 0 (or omitted) = no hysteresis — today's tie-break-by-index-only behaviour, which
+   *  handles an EXACT tie but not a near tie that evolves across frames as an object or an
+   *  intensity animates. Applied identically to both flap sources (§ `globalKeptMask`'s
+   *  directional-by-effectiveness churn and `maskForObject`'s local-by-distance churn) because
+   *  both are the same disease: a selection swap is a material-variant swap. */
+  hysteresisMargin?: number;
+}
+
+/** Clamp an authored `hysteresisMargin` into a range where it can't misbehave. Read at every use
+ *  site rather than at the authoring boundary, because `LightCaps` is also built by hand in tests
+ *  and by `resolveTierOverrides`' generic spread — there is no single place upstream to validate.
+ *  0.9 rather than 1: at margin 1 a local incumbent's discounted `d2 * (1 - margin)` hits exactly 0,
+ *  so it wins against literally any distance; a project-authored typo like `1.5` would go negative
+ *  and still win, freezing a light selection with no error anywhere. Negative is clamped to 0
+ *  (hysteresis off) rather than treated as "prefer the challenger", which nothing here means. */
+function clampMargin(margin: number | undefined): number {
+  if (margin === undefined || !Number.isFinite(margin)) return 0;
+  return Math.min(Math.max(margin, 0), 0.9);
 }
 
 /** Masks are 32-bit, so a scene with more lights than this cannot address them individually.
@@ -92,11 +111,19 @@ export function canAutoCap(lightCount: number): boolean {
  *
  *  Ties break on `index` so the choice is DETERMINISTIC — two equally effective lights must not
  *  swap between frames (or between the editor and a device), because a changed selection swaps a
- *  material variant and would strobe the scene. */
+ *  material variant and would strobe the scene.
+ *
+ *  `previousMask` (index-space, the caller's memory) is what an EVOLVING near-tie needs, which the
+ *  index tie-break above cannot give it — nothing is ever exactly equidistant/equi-bright for more
+ *  than one frame while something animates (#353). When `caps.hysteresisMargin` is set, a light
+ *  that was kept last frame gets its effectiveness boosted by that fraction before ranking, so a
+ *  challenger must beat it by MORE than the margin to take over — not merely edge past it. Margin
+ *  0 (the default) makes this identical to the ranking above. */
 export function globalKeptMask(
   lights: readonly CapLight[],
   caps: LightCaps,
   allowed: number = ALL_LIGHTS_MASK,
+  previousMask: number = 0,
 ): number {
   let mask = 0;
   const directional: CapLight[] = [];
@@ -105,8 +132,11 @@ export function globalKeptMask(
     if (l.type === 'ambient') mask |= 1 << l.index;      // never capped
     else if (l.type === 'directional') directional.push(l);
   }
+  const margin = clampMargin(caps.hysteresisMargin);
+  const rank = (l: CapLight) =>
+    effectiveness(l) * (margin > 0 && ((previousMask >> l.index) & 1) === 1 ? 1 + margin : 1);
   const keep = caps.maxDirectional > 0
-    ? [...directional].sort((a, b) => (effectiveness(b) - effectiveness(a)) || (a.index - b.index))
+    ? [...directional].sort((a, b) => (rank(b) - rank(a)) || (a.index - b.index))
         .slice(0, caps.maxDirectional)
     : directional;
   for (const l of keep) mask |= 1 << l.index;
@@ -120,6 +150,14 @@ export function globalKeptMask(
  *  which light wins as intensities animate, and every change of winner is a material-variant swap.
  *  Nearest is stable, cheap, and predictable, which matters more here than being optimal.
  *
+ *  `previousLocalMask` (index-space bits of the point/spot lights THIS OBJECT kept last frame) is
+ *  the per-object memory a moving object needs to stop flapping across an equidistance boundary
+ *  (#353) — an index tie-break alone only catches an EXACT tie, never a near one evolving frame to
+ *  frame. When `caps.hysteresisMargin` is set, an incumbent's distance is discounted by that
+ *  fraction before ranking, so a challenger must be nearer by MORE than the margin to displace it.
+ *  Margin 0 (the default) makes this identical to plain nearest-N.
+ *
+
  *  ⚠️ **`allowed` RESTRICTS THE CANDIDATES; IT IS NOT A FILTER ON THE RESULT.** When a scene also
  *  authors rendering-layer masks, an object may only be lit by some of these lights — and choosing
  *  the nearest N globally and intersecting afterwards is measurably wrong, not merely redundant:
@@ -135,6 +173,7 @@ export function maskForObject(
   globalMask: number,
   x: number, y: number, z: number,
   allowed: number = ALL_LIGHTS_MASK,
+  previousLocalMask: number = 0,
 ): number {
   if (caps.maxLocal <= 0) {
     let mask = globalMask;
@@ -144,14 +183,21 @@ export function maskForObject(
     }
     return mask;
   }
-  const local: { l: CapLight; d2: number }[] = [];
+  // ⚠️ For maxLocal > 1 this discounts every incumbent independently rather than doing an exact
+  // one-for-one "does THIS challenger beat THIS incumbent" swap, so a many-way near-tie at the
+  // cutoff can behave slightly differently from the single-swap description above. It is exact
+  // for maxLocal === 1 (mid's 3 is the only case where the difference is even reachable).
+  const margin = clampMargin(caps.hysteresisMargin);
+  const local: { l: CapLight; rank: number }[] = [];
   for (const l of lights) {
     if (l.type !== 'point' && l.type !== 'spot') continue;
     if (((allowed >> l.index) & 1) === 0) continue;
     const dx = l.x - x, dy = l.y - y, dz = l.z - z;
-    local.push({ l, d2: dx * dx + dy * dy + dz * dz });
+    const d2 = dx * dx + dy * dy + dz * dz;
+    const incumbent = margin > 0 && ((previousLocalMask >> l.index) & 1) === 1;
+    local.push({ l, rank: incumbent ? d2 * (1 - margin) : d2 });
   }
-  local.sort((a, b) => (a.d2 - b.d2) || (a.l.index - b.l.index));
+  local.sort((a, b) => (a.rank - b.rank) || (a.l.index - b.l.index));
   let mask = globalMask;
   for (let i = 0; i < Math.min(caps.maxLocal, local.length); i++) mask |= 1 << local[i].l.index;
   return mask;

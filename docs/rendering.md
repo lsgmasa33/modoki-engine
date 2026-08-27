@@ -1123,6 +1123,36 @@ luminance-weighted intensity rather than raw intensity — a deep-blue rim light
 less visible light than a white key at 1.0 and would otherwise win. Locals are chosen per object,
 by distance.
 
+⚠️ **Both selections carry hysteresis (#353), `low`/`mid` set to 0.15.** With no margin, an object or
+light animating across a near tie (distance for locals, luminance-weighted intensity for
+directionals) flaps the selection every frame it lingers near the boundary — an index tie-break
+alone only catches an EXACT tie, never one evolving frame to frame. Each flap is a different
+material variant, and `#352` measured what that costs a `VideoTexture`: 10 distinct textures and 12
+material clones over 10 alternating frames. `hysteresisMargin` (`LightCaps`/`TierRenderOverrides`)
+makes a challenger beat the incumbent by more than that fraction before it takes over. 0.15 was
+picked by running the shipped code against two of this project's own real point lights (`Sun` aside,
+`postfx-demo` has no scene with an overlapping multi-light bucket today, so the repro is synthetic
+geometry, real numbers): a stationary object jittering ~2 cm from an exact tie flapped 12 times over
+30 frames at margin 0, 0 times at 0.15. A genuine crossing DOES cost some handoff lag while the gap
+sits inside the margin band — that is the mechanism working as intended, not a side effect — but a
+challenger that clears the margin hands off on the exact same frame it would at margin 0 (verified:
+the frame-by-frame trace matches once the gap exceeds ~15%). Retune by watching a moving light in the
+editor if a scene's own geometry disagrees — see `LightCaps.hysteresisMargin`'s doc in
+`autoLightCap.ts` for the trade-off.
+
+⚠️ **The memory is per-object (`scene3DSync` keys it on each entity's own `THREE.Object3D`), so two
+DIFFERENT renderables that happen to sit at the exact same position can, in principle, resolve
+different local-light selections depending on how each one GOT there** — one arriving from a near tie
+its own history already settled, a freshly-spawned neighbour with no history yet picking whatever is
+nakedly nearest. Today that only widens the near-tie BAND (still bounded by `hysteresisMargin`, never
+unbounded); it does not misfire on its own the way a stale index binding would (see the paragraph
+above and the `#353` review that caught it — a light being added/removed reassigns every later
+light's index, which is why the memory is invalidated wholesale the instant the light SET stops
+matching frame to frame, not trusted across a shape change). Left unguarded on purpose: fixing THIS
+would mean either giving up per-object history (defeating the point) or reconciling two objects'
+histories against each other, which is real design work nobody has needed yet. Flagged during
+`work-ai3`'s review of #352.
+
 **Measured on two real devices** (`demos/postfx-demo`, frozen viewpoint, cap toggled on and off
 inside a single run, with the run rejected unless the viewpoint, the tier and the toggle all held):
 

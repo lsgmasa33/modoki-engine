@@ -58,7 +58,8 @@
           "pixiPixelRatioCap": 1,
           "pixiAntialias": false,
           "textureMaxSize": 1024,
-          "maxShadowCasters": 1
+          "maxShadowCasters": 1,
+          "hysteresisMargin": 0.15
         },
         "low": {
           "pixelRatioCap": 1,
@@ -81,7 +82,8 @@
           "pixiPixelRatioCap": 1,
           "pixiAntialias": false,
           "textureMaxSize": 512,
-          "maxShadowCasters": 1
+          "maxShadowCasters": 1,
+          "hysteresisMargin": 0.15
         }
       }
     },

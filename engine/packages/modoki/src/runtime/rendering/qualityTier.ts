@@ -187,6 +187,12 @@ export interface TierRenderOverrides {
   maxDirectional: number;
   /** Most POINT+SPOT ("local") lights an object may be lit by. 0 = unlimited. */
   maxLocal: number;
+  /** Fraction in [0, 1) a challenger light must beat the incumbent SELECTION by before it
+   *  replaces it (#353) — passed straight through to `LightCaps.hysteresisMargin`. Undefined (or
+   *  0) is a no-op: `maxDirectional`/`maxLocal` alone flap on a near tie that evolves across
+   *  frames as an object or a light animates, because index-based tie-breaking only ever
+   *  catches an EXACT tie. See that field's own doc for what the number trades off. */
+  hysteresisMargin?: number;
   /** Most lights that may RENDER A SHADOW MAP this frame. **0 = unlimited.** (#229)
    *
    *  The sibling of `maxDirectional`/`maxLocal`, and NOT covered by them: those cap how many
@@ -323,6 +329,18 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
     // IBL saving on FRAME RATE, which is where it actually lands.
     pixelRatioCap: 1, antialias: false, shadows: false, shadowMapCeiling: 512, postFX: NO_POSTFX,
     maxDirectional: 1, maxLocal: 1,
+    // 0.15 (#353) — run against the SHIPPED code with two of postfx-demo's real point-light
+    // positions (8 units apart; no scene has an overlapping multi-light bucket today, so the
+    // near-tie itself is synthetic geometry, not an authored one): a stationary object hovering
+    // ~2cm from the exact equidistance/equi-effectiveness tie flapped the selection 12 times over
+    // 30 frames at margin 0, 0 times at 0.15. A genuine crossing DOES cost some handoff lag while
+    // the gap sits inside the margin band — that is the mechanism working as designed, not a side
+    // effect — but a challenger that clears the margin hands off on the exact same frame it would
+    // at margin 0 (verified: the frame-by-frame trace matches once the gap exceeds ~15%). A
+    // starting point, not a final one — see `LightCaps.hysteresisMargin`'s doc for what it trades
+    // off, and retune by watching a moving light in the editor if a scene's own geometry needs a
+    // different value.
+    hysteresisMargin: 0.15,
     // Inert while `shadows: false` above holds, and set to the honest value anyway rather than 0:
     // a project that turns shadows back on at `low` (its tier config is its own to tune) must not
     // silently inherit "unlimited" from a row that had no reason to think about it.
@@ -415,6 +433,7 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
   mid: {
     pixelRatioCap: 1.5, antialias: false, shadows: true, shadowMapCeiling: 1024, postFX: NO_POSTFX,
     maxDirectional: 2, maxLocal: 3,   // enforced per frame — see above
+    hysteresisMargin: 0.15,           // #353 — see `low`'s row for the measurement
     // ⚠️ **1 IS A DELIBERATE BEHAVIOUR CHANGE**, in the same spirit as `low`'s `targetFps: 30`
     // below: `0` would be authorable-and-inert, and this issue exists precisely because there was
     // nothing between "all shadows off" and "every caster renders a full map". At ~3.6 ms per

@@ -114,6 +114,11 @@ export interface TierOverridesConfig {
   };
   maxDirectional: number;
   maxLocal: number;
+  /** Fraction in [0, 1) a challenger light must beat the incumbent selection by before it
+   *  replaces it (#353). Mirrors `TierRenderOverrides.hysteresisMargin`
+   *  (runtime/rendering/qualityTier.ts) — undefined/0 disables it, matching today's plain
+   *  nearest/most-effective selection. */
+  hysteresisMargin?: number;
   /** Most lights that may render a shadow map this frame. **0 = unlimited** (#229). Mirrors
    *  `TierRenderOverrides.maxShadowCasters` (runtime/rendering/qualityTier.ts) — separate from
    *  `maxDirectional`/`maxLocal` (those cap how many lights SHADE a fragment; this caps how many

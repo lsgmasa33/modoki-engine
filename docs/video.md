@@ -337,14 +337,35 @@ clip stops — is wrong twice:
 `videoTextureSync` therefore binds a private clone: the shared original is never mutated, and the
 clone is swapped out whole and disposed rather than having its map cleared. The cost is one extra
 pipeline per video surface — the same trade `Tint` and `MaterialInstance` already make for their own
-per-entity clones. Two consequences worth knowing:
+per-entity clones. Consequences worth knowing:
 
 - It runs **last** in the frame, so it re-asserts its clone against `syncMaterial`'s per-frame
   re-bind of a resolved `.mat.json`; if the material *ref* genuinely changed, it rebuilds the clone
-  from the new base instead of pinning the old look.
+  from the new base instead of pinning the old look — **carrying the existing `VideoTexture` onto
+  it** rather than minting a new one (next bullet).
 - If the slot **shape** changes under a live binding (single ⇄ material array) the binding is dropped
   and re-derived, never re-asserted — writing into a slot that no longer exists would clobber a
   freshly-assigned array, or strand a binding nothing could restore.
+- **A texture's lifetime follows the ELEMENT, never the material (#352).** A material swapping
+  identity under a live binding re-derives the *clone* and keeps the *texture*
+  (`rebindMaterial`). The two used to be freed together, from inside a branch that had already
+  established the element was unchanged — so the module threw away a texture it had just proved
+  was still valid. Harmless for a one-shot change and ruinous for a repeating one: `maskForObject`
+  picks the nearest lights with no hysteresis, so an object crossing an equidistance boundary
+  alternates between two **cached** variants indefinitely, and an identity test against one
+  remembered material cannot tell "one I have already seen" from "a brand new one". That measured
+  **10 GPU texture create+destroy pairs over 10 alternating frames** — ~60/sec at 60 fps, on the
+  mid/low tier where the automatic light cap engages. Pinned by
+  `tests/video/videoTextureSync.test.ts` § "the texture follows the ELEMENT".
+  The flap itself is a separate defect in the light selection (#353); this fix makes a selection
+  change cost a clone instead of a texture whether or not it repeats.
+  ⚠️ **Two** same-element paths still dispose, both deliberately. A slot **shape** change
+  (previous bullet) — carrying there would mean re-plumbing the rVFC pump, which closes over the
+  binding record a shape change replaces, and a mesh does not oscillate between single and array,
+  so it costs one texture, once. And a replacement material with **no `map` slot**: a file-shader
+  `.mat.json` resolves to a bare `NodeMaterial` (`loaders/fileShaderBuilder.ts`) whose textures
+  ride TSL nodes rather than PBR slots, so there is nothing to carry the texture *onto* — that
+  path is a refusal to bind, not a rebuild.
 - The clone is stamped `markDerived` (#318). Only `.map` is replaced, so every other slot the base
   carries — normal, roughness, emissive — is still a **shared** texture reference; without the stamp
   a `.mat.json` re-import lets `sweepRetiredMaterials` free the base (no *mesh* binds it any more —

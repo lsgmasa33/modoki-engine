@@ -1516,7 +1516,9 @@ function syncMaterial(
 function lightMaskFor(renderableMask: number, obj: THREE.Object3D): number {
   if (!isAutoLightCapEngaged()) return renderableMask;
   const p = obj.matrixWorld.elements;
-  return autoCapMaskFor(renderableMask, p[12], p[13], p[14]);
+  // `obj` doubles as the hysteresis identity (#353) — the same Object3D every frame for a given
+  // entity, so its previously-kept local lights are remembered across frames.
+  return autoCapMaskFor(renderableMask, p[12], p[13], p[14], obj);
 }
 
 function applyLightMask(obj: THREE.Object3D, mask: number): void {
@@ -2597,7 +2599,12 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
   // when the tier's caps would actually restrict something (`high` never can — its caps are 0 =
   // unlimited), so the common path is untouched. When it engages it also ARMS masking, since the
   // scene itself may have authored nothing.
-  const capEngaged = armAutoLightCap(_maskedLights, getActiveTierOverrides());
+  // `state` doubles as the hysteresis memory's per-surface key (#353 review) — SceneView and the
+  // Game panel's `Scene3D` each own their own `RenderState` and their own `THREE.Light` instances
+  // for the same scene, so a shared memory would see two different light sets alternate every
+  // call and permanently invalidate itself. One `RenderState` per surface (see its own header
+  // note) makes it the identity already at hand here.
+  const capEngaged = armAutoLightCap(_maskedLights, getActiveTierOverrides(), state);
   beginLightMaskFrame(_maskedLights, anyRenderableMasked || capEngaged);
 
   // ── GLB meshes (Renderable3D) ─────────────────────────

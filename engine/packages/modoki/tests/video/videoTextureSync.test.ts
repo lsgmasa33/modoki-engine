@@ -112,6 +112,27 @@ function spawnVideo(mesh: Mesh): number {
 
 const matOf = (mesh: Mesh) => mesh.material as FakeMaterial;
 
+/** What `applyLightMask` leaves on a masked mesh, in the shape the two properties that matter
+ *  actually have: `lightsNode` and `customProgramCacheKey` are OWN properties assigned after the
+ *  clone, and the base Material object itself is parked in `userData.__lightMaskBase`.
+ *
+ *  `FakeMaterial.clone()` copies neither own property, on purpose — so if `cloneDerived`'s
+ *  own-property carry stops running, the #325 tests fail rather than passing on three's `copy()`
+ *  doing the work for us.
+ *
+ *  ONE copy, shared by the #325 and #352 blocks (close-out review). There were two, with
+ *  different signatures and only one carrying this warning — so a real variant growing another
+ *  own property would have been modelled by one fixture and silently not by the other. */
+function fakeVariant(base: FakeMaterial, sel = '0,2') {
+  const v = new FakeMaterial() as FakeMaterial & {
+    lightsNode: unknown; customProgramCacheKey: () => string; userData: Record<string, unknown>;
+  };
+  v.lightsNode = { sel };                         // shared per selection — carried by REFERENCE
+  v.customProgramCacheKey = () => `|lightmask:${sel}`;
+  v.userData = { __lightMaskBase: base };
+  return v;
+}
+
 beforeEach(() => {
   world = createWorld();
   state = { ecsObjects: new Map() };
@@ -390,23 +411,6 @@ describe('syncVideoTextures — the clone keeps its base alive (#318)', () => {
 });
 
 describe('syncVideoTextures — cloning a LIGHT-MASK VARIANT (#325)', () => {
-  /** What `applyLightMask` leaves on a masked mesh, in the shape the two properties that matter
-   *  actually have: `lightsNode` and `customProgramCacheKey` are OWN properties assigned after the
-   *  clone, and the base Material object itself is parked in `userData.__lightMaskBase`.
-   *
-   *  `FakeMaterial.clone()` copies neither own property, on purpose — so if `cloneDerived`'s
-   *  own-property carry stops running, these tests fail rather than passing on three's `copy()`
-   *  doing the work for us. */
-  function fakeVariant(base: FakeMaterial, sel = '0,2') {
-    const v = new FakeMaterial() as FakeMaterial & {
-      lightsNode: unknown; customProgramCacheKey: () => string; userData: Record<string, unknown>;
-    };
-    v.lightsNode = { sel };                         // shared per selection — carried by REFERENCE
-    v.customProgramCacheKey = () => `|lightmask:${sel}`;
-    v.userData = { __lightMaskBase: base };
-    return v;
-  }
-
   it('carries lightsNode and customProgramCacheKey onto the video clone', () => {
     // THE correctness bug. Without these two the clone hashes to the BASE's pipeline key — the
     // #136 collision — and renders lit by every light, silently ignoring the authored mask.
@@ -493,11 +497,10 @@ describe('syncVideoTextures — cloning a LIGHT-MASK VARIANT (#325)', () => {
     // The one case that SHOULD re-clone: a different selection is a different variant object, so
     // the clone's carried lightsNode is stale and must be replaced.
     //
-    // ⚠️ This pins that the rebuild is CORRECT, not that rebuilding is the right strategy. The
-    // rebuild also disposes and recreates the `VideoTexture`, and `maskForObject` picks the nearest
-    // lights with NO hysteresis — so a selection that FLAPS across an equidistance boundary pays a
-    // texture + material + pipeline every frame. Measured at 10 distinct textures over 10 alternating
-    // frames. Tracked separately (#352); unreachable today for the same reason #325 is.
+    // ⚠️ This pins that the rebuild is CORRECT — it says nothing about what the rebuild COSTS.
+    // It used to dispose and recreate the `VideoTexture` too, which made a flapping selection pay
+    // a GPU texture every frame; that half is fixed (#352) and pinned by the block below, which is
+    // where the texture-identity assertions live. Keep this test material-only.
     const base = new FakeMaterial();
     const mesh = fakeMesh(fakeVariant(base, '0,2'));
     spawnVideo(mesh);
@@ -510,5 +513,192 @@ describe('syncVideoTextures — cloning a LIGHT-MASK VARIANT (#325)', () => {
     const bound = matOf(mesh) as FakeMaterial & { customProgramCacheKey: () => string };
     expect(bound.customProgramCacheKey()).toBe('|lightmask:1');
     expect(baseOf(bound as never)).toBe(base);      // still the base, not the superseded variant
+  });
+});
+
+describe('syncVideoTextures — the texture follows the ELEMENT, not the material (#352)', () => {
+  it('keeps the SAME VideoTexture across a mask-selection change', () => {
+    // The decoupling, at its smallest. The material legitimately changed and the clone must be
+    // re-derived — but nothing about the VIDEO did, so the texture has no reason to be rebuilt.
+    const base = new FakeMaterial();
+    const mesh = fakeMesh(fakeVariant(base, '0,2'));
+    spawnVideo(mesh);
+    sync(world, state);
+    const first = matOf(mesh).map as FakeVideoTexture;
+
+    mesh.material = fakeVariant(base, '1');
+    sync(world, state);
+
+    expect(matOf(mesh).map).toBe(first);          // the SAME texture object, not an equal one
+    expect(first.dispose).not.toHaveBeenCalled();
+  });
+
+  it('mints exactly ONE texture across a selection that flaps for 10 frames', () => {
+    // The regression that matters, asserted as the MEASUREMENT it came from. Before the fix this
+    // read 10 distinct textures and 10 disposes — a GPU create+destroy every frame, indefinitely,
+    // because `maskForObject` has no hysteresis and the validity test compared against a single
+    // remembered material. Counted by identity rather than by `videoTextureCount`, which reports
+    // the binding-table SIZE and stays at 1 through the whole churn — it cannot see this.
+    const base = new FakeMaterial();
+    const a = fakeVariant(base, '0,2');
+    const b = fakeVariant(base, '1');
+    const mesh = fakeMesh(a);
+    spawnVideo(mesh);
+
+    const textures = new Set<unknown>();
+    for (let frame = 0; frame < 10; frame++) {
+      mesh.material = frame % 2 === 0 ? a : b;    // what applyLightMask does on a cache hit
+      sync(world, state);
+      textures.add(matOf(mesh).map);
+    }
+
+    expect(textures.size).toBe(1);
+    expect([...textures][0]).toBeInstanceOf(FakeVideoTexture);
+    expect((([...textures][0]) as FakeVideoTexture).dispose).not.toHaveBeenCalled();
+  });
+
+  it('still re-derives the CLONE from the new variant while carrying the texture', () => {
+    // Carrying the texture must not turn into carrying the material. The clone has to come from
+    // whatever is on the slot NOW, or a selection change would keep rendering the old lighting —
+    // trading a texture churn for a silent correctness bug.
+    const base = new FakeMaterial();
+    const mesh = fakeMesh(fakeVariant(base, '0,2'));
+    spawnVideo(mesh);
+    sync(world, state);
+    const firstClone = matOf(mesh);
+
+    const moved = fakeVariant(base, '1');
+    mesh.material = moved;
+    sync(world, state);
+
+    const bound = matOf(mesh) as FakeMaterial & {
+      lightsNode: unknown; customProgramCacheKey: () => string;
+    };
+    expect(bound).not.toBe(firstClone);                   // a new clone...
+    expect(bound).not.toBe(moved);                        // ...still private, not the shared one
+    expect(bound.lightsNode).toBe(moved.lightsNode);      // ...carrying the NEW selection
+    expect(bound.customProgramCacheKey()).toBe('|lightmask:1');
+    expect(firstClone.disposed).toBe(true);               // and the superseded one is released
+  });
+
+  it('does NOT take the map off the superseded variant — the #192 rule survives the new path', () => {
+    // `rebindMaterial` is a second route by which a material leaves our hands. The cardinal rule
+    // is the same on it as on `release`: nothing is handed back to the renderer map-free.
+    const base = new FakeMaterial();
+    const first = fakeVariant(base, '0,2');
+    const mesh = fakeMesh(first);
+    spawnVideo(mesh);
+    sync(world, state);
+
+    const second = fakeVariant(base, '1');
+    mesh.material = second;
+    sync(world, state);
+
+    expect(first.map ?? null).toBeNull();      // never had one, never given one, never cleared
+    expect(second.map ?? null).toBeNull();     // we cloned it, we did not mutate it
+    expect(first.disposed).toBe(false);        // the shared variant is the cache's, not ours
+    expect(second.disposed).toBe(false);
+  });
+
+  it('declines a map-less replacement instead of forcing a map onto it', () => {
+    // The carry path is a SHORTCUT around `videoTargetOf`, which is where the `'map' in material`
+    // guard lives. Without re-checking it here the shortcut would accept a material the full path
+    // refuses — inventing a `.map` on something three never monitors for one.
+    const mesh = fakeMesh(new FakeMaterial());
+    spawnVideo(mesh);
+    sync(world, state);
+
+    const mapless = { roughness: 0.5, userData: {}, needsUpdate: false } as unknown as FakeMaterial;
+    mesh.material = mapless;                 // no `map` property at all
+    sync(world, state);
+
+    expect(matOf(mesh)).toBe(mapless);       // left alone, not cloned and not given a map
+    expect('map' in (mapless as object)).toBe(false);
+    expect(videoTextureCount(state)).toBe(0);
+  });
+
+  it('SETTLES after a one-shot material change — no clone per frame afterwards', () => {
+    // The guard the block was missing, found by the close-out review. Deleting `b.original = next`
+    // from `rebindMaterial` — the bookkeeping that makes a rebind ONE-SHOT — passed all 25 tests
+    // including every other test here. Without it `original` stays at the pre-change material, so
+    // every later frame re-enters the rebind: a `dispose()` (which tears down that material's
+    // RenderObject and bind groups in the WebGPU renderer), a fresh `cloneDerived`, and a
+    // `needsUpdate`, forever, on a scene that is standing perfectly still.
+    //
+    // That is #352's own defect shape — unbounded per-frame churn — merely relocated from the
+    // texture to the material. The #325 block has exactly this test for its path ("settles:
+    // re-asserting the variant each frame mints no further clones"); this one did not.
+    const base = new FakeMaterial();
+    const mesh = fakeMesh(fakeVariant(base, '0,2'));
+    spawnVideo(mesh);
+    sync(world, state);
+
+    const moved = fakeVariant(base, '1');
+    mesh.material = moved;
+    sync(world, state);
+    const settled = matOf(mesh);
+
+    for (let frame = 0; frame < 5; frame++) {
+      mesh.material = moved;          // applyLightMask cache HIT: the same object every frame
+      sync(world, state);
+      expect(matOf(mesh)).toBe(settled);
+    }
+    expect(settled.disposed).toBe(false);
+  });
+
+  it('keeps the rVFC upload pump driving the carried texture across a rebind', () => {
+    // The fix's central design claim — "the pump closes over the Bound record, which is mutated
+    // IN PLACE rather than replaced, so uploads carry on" — was asserted in three comment blocks,
+    // a doc bullet and a commit message, and exercised by NOTHING: jsdom has no
+    // `requestVideoFrameCallback`, so `driveUploads` returns early and every other test in this
+    // file runs three's per-frame fallback with `rvfcHandle` 0.
+    //
+    // Replacing the Bound instead of mutating it would leave the pump driving the OLD record's
+    // texture — which the rebuild would have disposed — and nothing would have said so.
+    const pending: (() => void)[] = [];
+    const el = fakeElement() as HTMLVideoElement & {
+      requestVideoFrameCallback: (cb: () => void) => number;
+      cancelVideoFrameCallback: (h: number) => void;
+    };
+    let next = 1;
+    el.requestVideoFrameCallback = vi.fn((cb: () => void) => { pending.push(cb); return next++; });
+    el.cancelVideoFrameCallback = vi.fn();
+
+    const base = new FakeMaterial();
+    const mesh = fakeMesh(fakeVariant(base, '0,2'));
+    const id = spawnVideo(mesh);
+    elements.set(id, el);                    // an element that HAS rVFC, unlike the default fake
+    sync(world, state);
+
+    expect(pending.length).toBe(1);          // the pump registered at bind
+    const texture = matOf(mesh).map as FakeVideoTexture;
+
+    mesh.material = fakeVariant(base, '1');  // the selection moves — rebind, carrying the texture
+    sync(world, state);
+    expect(matOf(mesh).map).toBe(texture);
+
+    texture.needsUpdate = false;
+    pending.shift()!();                      // the decoder presents a frame AFTER the rebind
+
+    expect(texture.needsUpdate).toBe(true);           // ...and the pump still drives it
+    expect(matOf(mesh).map).toBe(texture);            // ...on the material now in the slot
+    expect(texture.dispose).not.toHaveBeenCalled();
+    expect(pending.length).toBe(1);                   // and it re-armed itself for the next frame
+  });
+
+  it('STILL rebuilds the texture when the ELEMENT changes — the decoupling is not a free-for-all', () => {
+    // The guard against over-applying the fix. A new element is a new decoder, so the old texture
+    // is genuinely dead and must be disposed; only the MATERIAL's identity was ever the wrong
+    // reason to throw one away.
+    const mesh = fakeMesh(new FakeMaterial());
+    const id = spawnVideo(mesh);
+    sync(world, state);
+    const first = matOf(mesh).map as FakeVideoTexture;
+
+    elements.set(id, fakeElement());     // clip swapped — a different HTMLVideoElement
+    sync(world, state);
+
+    expect(matOf(mesh).map).not.toBe(first);
+    expect(first.dispose).toHaveBeenCalled();
   });
 });
