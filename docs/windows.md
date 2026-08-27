@@ -384,8 +384,10 @@ one measurement on Windows did.
 ## Devices
 
 A debug APK built on one machine will **not** install over one built on another —
-`INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match`, because each clone generates its own
-debug keystore. Uninstalling first destroys that app's on-device data, so ask before you do. The
+`INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match`, because the debug keystore is one per
+MACHINE (`~/.android/debug.keystore`; no project sets a `signingConfig`) — so this is a Mac-vs-Windows
+split, not a per-clone one. Uninstalling first destroys that app's on-device data, so ask before you
+do. The
 gradle step succeeds and only the install step fails, which reads like a Windows build bug and is
 not one.
 

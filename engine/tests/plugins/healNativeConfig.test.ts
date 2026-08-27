@@ -929,6 +929,89 @@ describe('healNativeConfig — iOS game-debug wiring (Task 3)', () => {
     expect(fs.existsSync(path.resolve(path.join(root, 'ios', 'App'), m![1]))).toBe(true);
   });
 
+  // #368 — the SceneDelegate trap. A scene-based app builds its window in code, overriding the
+  // storyboard's customClass, so MyViewController never runs and GameDebugPlugin is never
+  // registered: the game renders perfectly and the iOS debug bridge is silently dead.
+  const SCENE_DELEGATE = (vc: string) => `import UIKit
+import Capacitor
+
+class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        window = UIWindow(windowScene: windowScene)
+        window?.rootViewController = ${vc}()
+        window?.makeKeyAndVisible()
+    }
+}
+`;
+  const SD = ['ios', 'App', 'App', 'SceneDelegate.swift'];
+  const readSd = () => fs.readFileSync(path.join(root, ...SD), 'utf8');
+
+  it('repoints a SceneDelegate off the base CAPBridgeViewController (#368)', () => {
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    fs.writeFileSync(path.join(root, ...SD), SCENE_DELEGATE('CAPBridgeViewController'));
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(readSd()).toContain('rootViewController = MyViewController()');
+    expect(notes).toContain('SceneDelegate.swift');
+  });
+
+  it('leaves an already-correct SceneDelegate alone (no churn, no duplicate note)', () => {
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    const good = SCENE_DELEGATE('MyViewController');
+    fs.writeFileSync(path.join(root, ...SD), good);
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(readSd()).toBe(good);
+    expect(notes).not.toContain('SceneDelegate.swift');
+  });
+
+  it('repoints EVERY assignment, not just the first (#368 close-out)', () => {
+    // A non-global regex rewrites one branch, emits the success note, and leaves the other with a
+    // dead bridge — a half-fix reported as a whole one, which the guard test then fails on forever
+    // with nothing able to auto-repair it.
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    fs.writeFileSync(path.join(root, ...SD), `import UIKit
+import Capacitor
+
+class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        window = UIWindow(windowScene: windowScene)
+        if #available(iOS 17.0, *) {
+            window?.rootViewController = CAPBridgeViewController()
+        } else {
+            window?.rootViewController = CAPBridgeViewController()
+        }
+        window?.makeKeyAndVisible()
+    }
+}
+`);
+    healNativeConfig(root);
+    const out = readSd();
+    expect(out).not.toContain('CAPBridgeViewController()');
+    expect(out.match(/rootViewController = MyViewController\(\)/g)).toHaveLength(2);
+  });
+
+  it('does NOT repoint when MyViewController is not compiled into the target', () => {
+    // The safety interlock. On-disk is not enough: repointing at a class Swift cannot see trades
+    // a silently dead debug bridge (the app still builds and runs) for a BROKEN BUILD. Here the
+    // engine plugin is absent, so the wiring heal bails before adding the Sources entry — and
+    // MyViewController.swift exists only because a PREVIOUS heal left it behind.
+    scaffoldIos(); writeConfig(''); writeGameDebugDep();   // no engine/ planted → wiring bails
+    fs.writeFileSync(path.join(root, ...MVC), '// left over from an earlier heal\n');
+    fs.writeFileSync(path.join(root, ...SD), SCENE_DELEGATE('CAPBridgeViewController'));
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(readPbx()).not.toContain('MyViewController.swift in Sources');
+    expect(readSd()).toContain('rootViewController = CAPBridgeViewController()');
+    // …and it SAYS so. A silent refusal is how #368 recurs invisibly: the guard test reads
+    // `git ls-files`, so it cannot see the projects that land in this branch — one scaffolded or
+    // copied OUT of the repo, or an Xcode 16 synchronized-group project with no Sources entries.
+    expect(notes).toContain('would break the BUILD');
+  });
+
   it('is idempotent — a second pass changes nothing', () => {
     scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
     healNativeConfig(root);

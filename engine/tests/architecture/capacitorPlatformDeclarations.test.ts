@@ -86,6 +86,64 @@ function compiledIntoAppTarget(name: string): boolean {
   }
 }
 
+/** Remove Swift comments while PRESERVING string literals.
+ *
+ *  A scanner, not a regex, because three separate regex attempts here were each subtly wrong and
+ *  each failure disarmed or falsely tripped the guard below:
+ *    · a naive line-comment pattern ate the `//` in `https://…/Dep.git`, erasing the dependency
+ *      NAME from a manifest that correctly declared it — a false failure that fires exactly when
+ *      someone does the right thing;
+ *    · guarding it with `[^:]` still lost `https://host//path` (doubled separator) and still
+ *      treated `dependencies://x` as code;
+ *    · stripping block comments first is blind to `//`, so a `/*` inside a LINE comment ate
+ *      forward to the next `*​/` anywhere in the file — the same asymmetry that terminated a
+ *      JSDoc in this very file.
+ *  Tokenizing is the only thing that gets all of them, and it is 20 lines. Swift block comments
+ *  nest, so the depth counter is real rather than defensive. */
+export function stripSwiftComments(src: string): string {
+  let out = '';
+  let i = 0;
+  let inString = false;
+  let inLine = false;
+  let blockDepth = 0;
+  while (i < src.length) {
+    const c = src[i];
+    const d = src[i + 1];
+    if (inLine) {
+      if (c === '\n') { inLine = false; out += c; }        // keep the newline: lines stay aligned
+      i += 1;
+    } else if (blockDepth > 0) {
+      if (c === '/' && d === '*') { blockDepth += 1; i += 2; }
+      else if (c === '*' && d === '/') { blockDepth -= 1; i += 2; }
+      else { if (c === '\n') out += c; i += 1; }
+    } else if (inString) {
+      if (c === '\\') { out += c + (d ?? ''); i += 2; }     // an escape cannot close the literal
+      else { if (c === '"') inString = false; out += c; i += 1; }
+    } else if (c === '"') { inString = true; out += c; i += 1; }
+    else if (c === '/' && d === '/') { inLine = true; i += 2; }
+    else if (c === '/' && d === '*') { blockDepth = 1; i += 2; }
+    else { out += c; i += 1; }
+  }
+  return out;
+}
+
+/** Podspec dependencies that `Package.swift` does not declare — the reason a package must not
+ *  claim `capacitor.ios` (cap sync would add an SPM package whose target cannot compile).
+ *
+ *  Comments are stripped first: a dependency NAMED in prose is not a declaration, and a guard that
+ *  substring-matches raw source is silently disarmed by any comment mentioning the name. That is
+ *  not hypothetical — the commit that introduced this rule also wrote an explanatory comment into
+ *  `capacitor-litert-lm/Package.swift` naming `MediaPipeTasksGenAI`, and the guard went quiet. */
+export function missingSpmDeps(podspecText: string, spmText: string): string[] {
+  const code = stripSwiftComments(spmText);
+  return [...podspecText.matchAll(/s\.dependency\s+['"]([^'"]+)['"]/g)]
+    .map((m) => m[1])
+    // Capacitor/Cordova reach an SPM target through capacitor-swift-pm under different product
+    // names, so their absence from the manifest is expected rather than a defect.
+    .filter((d) => !/^(Capacitor|Cordova)$/.test(d))
+    .filter((d) => !code.includes(d));
+}
+
 describe('capacitor plugin platform declarations', () => {
   const pkgs = pluginPackages();
 
@@ -136,18 +194,94 @@ describe('capacitor plugin platform declarations', () => {
       const podspec = fs.readdirSync(p.dir).find((f) => f.endsWith('.podspec'));
       const manifest = path.join(p.dir, 'Package.swift');
       if (!podspec || !fs.existsSync(manifest)) continue;
-      const spm = fs.readFileSync(manifest, 'utf8');
-      const deps = [...fs.readFileSync(path.join(p.dir, podspec), 'utf8')
-        .matchAll(/s\.dependency\s+['"]([^'"]+)['"]/g)].map((m) => m[1])
-        // Capacitor/Cordova arrive through capacitor-swift-pm under different product names.
-        .filter((d) => !/^(Capacitor|Cordova)$/.test(d));
-      for (const d of deps) if (!spm.includes(d)) offenders.push(`${p.name}: podspec needs ${d}, Package.swift does not declare it`);
+      for (const d of missingSpmDeps(
+        fs.readFileSync(path.join(p.dir, podspec), 'utf8'),
+        fs.readFileSync(manifest, 'utf8'),
+      )) offenders.push(`${p.name}: podspec needs ${d}, Package.swift does not declare it`);
     }
     expect(
       offenders,
       `${offenders.join('; ')} — declaring capacitor.ios claims SPM support the manifest cannot `
         + `deliver: cap sync adds the package and the target fails to compile on the missing import.`,
     ).toEqual([]);
+  });
+
+  /** The rule above executes its body ZERO times on the shipped tree — `capacitor-modoki-iap` is
+   *  the only `ios` declarer and ships no podspec, so every other package `continue`s. It is a
+   *  trap set for a future edit, which means the repo state can never exercise it and a broken
+   *  rule would look exactly like a clean pass.
+   *
+   *  ⚠️ It WAS broken exactly that way. The first version substring-matched the raw `Package.swift`,
+   *  and the very commit that added it also wrote an explanatory comment into
+   *  `capacitor-litert-lm/Package.swift` naming `MediaPipeTasksGenAI` — so the manifest "declared"
+   *  the dependency in prose and the guard went quiet. Applying #368's exact one-liner left the
+   *  suite green. The mutation check missed it only because it ran BEFORE that comment was written.
+   *  Hence fixtures: they exercise the rule directly, so it cannot be disarmed by repo content. */
+  describe('missingSpmDeps — the rule itself, on fixtures (it is vacuous against the repo)', () => {
+    const POD = `s.dependency 'Capacitor'\ns.dependency 'MediaPipeTasksGenAI'\n`;
+
+    it('flags a dependency the manifest never declares', () => {
+      expect(missingSpmDeps(POD, '.package(url: "…/capacitor-swift-pm.git", from: "8.0.0")'))
+        .toEqual(['MediaPipeTasksGenAI']);
+    });
+
+    it('a dependency named only in a COMMENT does not count as declared', () => {
+      const commented = `// Add MediaPipeTasksGenAI here before declaring "ios".\n`
+        + `/* MediaPipeTasksGenAI is what the podspec uses. */\n`
+        + `.package(url: "…/capacitor-swift-pm.git", from: "8.0.0")`;
+      expect(missingSpmDeps(POD, commented)).toEqual(['MediaPipeTasksGenAI']);
+    });
+
+    it('a real declaration satisfies it — with a REAL https URL, which contains //', () => {
+      expect(missingSpmDeps(POD,
+        '.package(url: "https://github.com/google/MediaPipeTasksGenAI.git", from: "1.0.0")',
+      )).toEqual([]);
+    });
+
+    it('a trailing comment after a real declaration is still stripped', () => {
+      expect(missingSpmDeps(POD,
+        '.package(url: "https://github.com/google/MediaPipeTasksGenAI.git", from: "1.0.0") // ok',
+      )).toEqual([]);
+      // …and the comment alone still does not count as a declaration.
+      expect(missingSpmDeps(POD, '.package(url: "https://example.com/x.git") // MediaPipeTasksGenAI'))
+        .toEqual(['MediaPipeTasksGenAI']);
+    });
+
+    // The comment stripper's edges. `^` has no `m` flag, so a comment on a later line is matched
+    // via `[^:]` consuming the preceding newline and `$1` restoring it — checked here rather than
+    // reasoned about, because that is a non-obvious way for a stripper to be subtly wrong.
+    it.each([
+      ['comment at the very start', '// MediaPipeTasksGenAI\n.package(url: "https://x/Dep.git")'],
+      ['comment on a later line', '.package(url: "https://x/Dep.git")\n// MediaPipeTasksGenAI'],
+      ['two consecutive comment lines', '// MediaPipeTasksGenAI\n// MediaPipeTasksGenAIC\n.package(url: "https://x/Dep.git")'],
+      ['a URL inside a comment', '// see https://github.com/google/MediaPipeTasksGenAI\n.package(url: "https://x/Dep.git")'],
+      ['a URL inside a block comment', '/* https://github.com/google/MediaPipeTasksGenAI */\n.package(url: "https://x/Dep.git")'],
+    ])('a name only in a comment never counts as declared — %s', (_label, spm) => {
+      expect(missingSpmDeps(`s.dependency 'MediaPipeTasksGenAI'\n`, spm)).toEqual(['MediaPipeTasksGenAI']);
+    });
+
+    // The three shapes that defeated the regex versions. Each was VERIFIED broken before the
+    // scanner replaced them, so these are regression pins, not speculation.
+    it('a `:` adjacent to // is still a comment (regex `[^:]` guard read it as code)', () => {
+      expect(missingSpmDeps(POD, 'dependencies:// MediaPipeTasksGenAI')).toEqual(['MediaPipeTasksGenAI']);
+    });
+
+    it('a /* inside a LINE comment does not open a block (it ate the file)', () => {
+      const src = '// a /* opener\n.package(url: "https://github.com/google/MediaPipeTasksGenAI.git")\n/* real */';
+      expect(missingSpmDeps(POD, src)).toEqual([]);
+    });
+
+    it('a doubled path separator in a URL does not eat the name', () => {
+      expect(missingSpmDeps(POD, '.package(url: "https://github.com//google/MediaPipeTasksGenAI.git")')).toEqual([]);
+    });
+
+    it('nested block comments close at the right depth (Swift allows nesting)', () => {
+      expect(missingSpmDeps(POD, '/* outer /* inner */ still comment MediaPipeTasksGenAI */')).toEqual(['MediaPipeTasksGenAI']);
+    });
+
+    it('Capacitor/Cordova are exempt — they arrive via capacitor-swift-pm under other names', () => {
+      expect(missingSpmDeps(`s.dependency 'Capacitor'\ns.dependency 'Cordova'\n`, '')).toEqual([]);
+    });
   });
 
   it('every concrete file promised in files[] exists', () => {

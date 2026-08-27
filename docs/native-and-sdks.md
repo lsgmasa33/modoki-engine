@@ -54,6 +54,90 @@ podspec is not a "fallback" here — it is the only iOS path whose dependencies 
 `"ios"` on this package without first adding the MediaPipe dependency to `Package.swift` turns a
 green `npm run verify` into a broken `cap sync ios` build on `games/llm-test`.
 
+### The SceneDelegate trap — a silently dead iOS debug bridge (#368)
+
+`MyViewController` is what registers `GameDebugPlugin` into the bridge, and `Main.storyboard` names
+it via `customClass="MyViewController"`. **A `SceneDelegate` that builds its window in code
+overrides the storyboard entirely:**
+
+```swift
+window?.rootViewController = CAPBridgeViewController()   // ← storyboard never consulted
+```
+
+`MyViewController` is then never instantiated, the registration never runs, and the plugin — which
+IS compiled into the binary via the pbxproj reference — is never wired in. Use `MyViewController()`.
+
+**The failure is invisible everywhere you would look.** No crash, no render fault: the WebView loads
+and the game draws perfectly. The only symptom is `[debug-bridge] startServer failed: "GameDebug"
+plugin is not implemented on ios` in the JS console — which reaches **no device log**, because the
+plugin logs via `print()` (stdout) and its single `NSLog` is inside `triggerFault`. From the host it
+presents only as `ECONNREFUSED :9095`, indistinguishable from "the app is not running". Reading it
+needs Xcode's console or `device_console_logs`, and the latter needs the very bridge that is down.
+
+**How 9 projects got it at once.** The file comes from Capacitor's own iOS template — nothing here
+CREATES one (`healIosSceneDelegateBridgeVC` only repoints an existing file, never writes a new one),
+so `cap add ios` is what introduces it. `e2973d940` scaffolded native for **ten** projects in one
+run and verified them **on Android hardware only** — iOS was generated and never launched — and
+`games/iap-test` inherited it later.
+
+⚠️ **The emission rule is NOT understood, and this doc will not pretend otherwise.** That single run,
+same tool, produced a `SceneDelegate.swift` for eight projects and none for `demos/3d-physics-demo`
+or `games/chess` (which also have no `UIApplicationSceneManifest`). Nor does that run account for
+every file: there are **ten** tracked `SceneDelegate.swift` today — those eight, plus `games/iap-test`,
+plus `demos/postfx-demo`, which predates the run entirely and is where the trap was first found and
+fixed. Three separate origins, one unexplained split. Capacitor 8.5's templates — both
+`ios-spm-template.tar.gz` and `ios-pods-template.tar.gz` — DO ship the file today, so new projects
+get it and the heal covers them. But whatever made two projects in one batch differ is unexplained:
+treat "which projects get a SceneDelegate" as an open question, and rely on the heal + guard rather
+than on predicting it. Every *other* heal made them look correct: `healNativeConfig`
+wrote a right `MyViewController.swift` and a right pbxproj ref into projects whose SceneDelegate
+bypassed all of it.
+
+`demos/postfx-demo` hit and fixed this locally on 2026-08-05 and left a comment predicting exactly
+this spread. A per-project comment cannot enforce anything on projects that do not exist yet, so it
+is now enforced in two places instead: **`healIosSceneDelegateBridgeVC` repoints it** on project
+open / native build, and **`engine/tests/architecture/sceneDelegateBridgeVC.test.ts`** fails the gate
+on committed state.
+
+Measured on the iPhone 8 (iOS 16.7.16), 2026-08-27: with the base VC, port 9095 refused; after the
+one-word change, `device_connect` succeeded, `getStatus` reported `running: true, port: 9095`, and
+`getDeviceIp` returned the LAN IP. ⚠️ That last point matters — the debug menu's "WiFi is down" was
+this same bug, not a network fault: `getDeviceIp()` was rejecting because the plugin was absent.
+**So `wifiIPv4()`'s hardcoded `en0` is NOT the bug** — it returned the right address the moment the
+plugin was registered, and an Android-parity rewrite of it was reasoned out and deliberately not
+shipped. That is the verified claim, and the only one.
+
+**Separately — now HARDENED, 2026-08-27.** `wifiIPv4()` used to force-dereference
+`interface.ifa_addr.pointee`, and `getifaddrs(3)` may hand back an interface with NO address
+(normal for `awdl0`, an unconfigured tunnel, a downed cellular link). Swift imports `ifa_addr` as an
+implicitly-unwrapped optional, so that compiled cleanly and would have TRAPPED on such an entry —
+crashing `getDeviceIp()`, which the debug menu's Device tab calls. The loop inspects every interface
+before deciding which one it wants, so one address-less entry anywhere in the list was enough.
+
+⚠️ **The obvious form of the fix HANGS**, which is why it is spelled out here. `wifiIPv4()` advances
+its cursor on the LAST line of the loop body, so a bare `guard … else { continue }` never advances
+and the `while let cur = ptr` spins forever — trading a crash for an unkillable hang, on precisely
+the interface list that triggered it. The shipped form advances first:
+`guard let addr = interface.ifa_addr else { ptr = interface.ifa_next; continue }`.
+
+**What is and is not verified.** Verified on the iPhone 8: it compiles, and `getDeviceIp()` still
+returns the LAN IP — so no regression on the path that is actually taken. NOT verified: the guarded
+branch itself, including its cursor advance, because no device we have produces an address-less
+interface. Its correctness rests on INSPECTION — both exits from the loop body assign
+`ptr = interface.ifa_next` before leaving — not on measurement.
+
+⚠️ **An earlier version of this paragraph claimed "five consecutive calls in 9 ms, so provably no
+hang". That proved nothing and the wording is kept here as the correction.** The hang can only occur
+on an interface with a NULL `ifa_addr`, which this device does not have, so the `else` branch never
+executes: build the plugin with the BAD `guard … else { continue }` form and the same five calls
+still return the same address in the same time. The observation is identical under both hypotheses —
+a check that cannot fail is not evidence. Guarding a condition you cannot reproduce means accepting
+an unexercised branch and SAYING so, rather than dressing inference as measurement.
+
+Note the cost of touching this file at all: it moves the plugin's content hash and forces a
+re-vendor across every consuming project (the `vendoredPluginFreshness` guard, #90 — that guard owns
+the count, so it is not repeated here), so batch such edits rather than drip them.
+
 ## SDK Plugins
 
 Current plugins and minimal usage:

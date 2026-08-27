@@ -263,11 +263,23 @@ public class GameDebugPlugin: CAPPlugin, CAPBridgedPlugin {
         var ptr: UnsafeMutablePointer<ifaddrs>? = first
         while let cur = ptr {
             let interface = cur.pointee
-            if interface.ifa_addr.pointee.sa_family == UInt8(AF_INET) {
+            // `getifaddrs(3)` may hand back an interface with NO address — normal for `awdl0`, an
+            // unconfigured tunnel, or a downed cellular link. Swift imports `ifa_addr` as an
+            // IMPLICITLY-UNWRAPPED optional, so `.pointee` on it compiles cleanly and TRAPS at
+            // runtime on such an entry. This loop inspects every interface before deciding which
+            // one it wants, so one address-less entry anywhere in the list would crash
+            // `getDeviceIp()` — which the in-game debug menu's Device tab calls.
+            //
+            // ⚠️ Advance the cursor BEFORE continuing. `ptr` moves on the LAST line of this body,
+            // so a bare `guard ... else { continue }` never advances and the `while` spins
+            // forever — trading a crash for an unkillable hang, on exactly the interface list
+            // that triggered it.
+            guard let addr = interface.ifa_addr else { ptr = interface.ifa_next; continue }
+            if addr.pointee.sa_family == UInt8(AF_INET) {
                 let name = String(cString: interface.ifa_name)
                 if name == "en0" { // WiFi on iOS
                     var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
+                    getnameinfo(addr, socklen_t(addr.pointee.sa_len),
                                 &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
                     address = String(cString: hostname)
                 }

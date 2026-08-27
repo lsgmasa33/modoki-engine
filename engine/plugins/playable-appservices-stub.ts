@@ -57,3 +57,55 @@ export const ads = {
   async isRewardedReady(): Promise<boolean> { return false; },
   async showAdDebugger(): Promise<void> {},
 };
+
+/**
+ * Auth — a no-op namespace, mirroring `export * as auth from './auth'` in Court's package
+ * (#359/#360).
+ *
+ * ⚠️ Like `ads` above, the no-op is REQUIRED rather than merely a size saving, and for a sharper
+ * reason. A playable ad is a few seconds inside somebody else's ad slot: it has no Firebase app, no
+ * native plugin bridge, and no business asking for an Apple or Google account. So every sign-in
+ * here reports `not-configured` — the SAME answer the real seam gives off-device — which is what
+ * makes the caller hide the sign-in UI rather than render a button that can only fail.
+ *
+ * `currentUser` resolving `null` matters just as much: a creative must read as a signed-out player
+ * with no cloud save, not as an account whose progress failed to load.
+ */
+export const auth = {
+  async signInWithApple() { return PLAYABLE_NO_AUTH; },
+  async signInWithGoogle() { return PLAYABLE_NO_AUTH; },
+  async continueAsGuest() { return PLAYABLE_NO_AUTH; },
+  async linkGuestTo(_provider: string) { return PLAYABLE_NO_AUTH; },
+  async deleteAuthUser() { return PLAYABLE_NO_AUTH; },
+  async currentUser() { return null; },
+  async signOut(): Promise<void> {},
+  async onAuthChanged(_cb: unknown): Promise<() => void> { return () => {}; },
+  classifyAuthError(_e: unknown) { return 'not-configured' as const; },
+  toCourtUser(_raw: unknown) { return null; },
+  __resetAuthForTest(): void {},
+};
+
+const PLAYABLE_NO_AUTH = {
+  ok: false as const,
+  reason: 'not-configured' as const,
+  message: 'A playable creative has no Firebase app — sign-in is unavailable by design.',
+};
+
+/**
+ * Cloud save — a no-op namespace, mirroring `export * as cloudSave from './cloudSave'` (#361).
+ *
+ * ⚠️ `loadSave` THROWS rather than resolving `null`, and the asymmetry is deliberate. `null` means
+ * "this account has no save yet", which would invite the sync protocol to treat a creative as a
+ * fresh device and try to CREATE one. Throwing means "could not read", which every caller already
+ * handles as a failed sync that leaves local storage alone — the correct behaviour for a session
+ * that lasts seconds and must never touch a real player's document.
+ */
+export const cloudSave = {
+  async loadSave(_uid: string): Promise<never> {
+    throw new Error('A playable creative has no cloud save.');
+  },
+  async pushSave(_uid: string, _doc: unknown): Promise<'ok' | 'conflict' | 'failed'> { return 'failed'; },
+  async deleteSave(_uid: string): Promise<boolean> { return false; },
+  isConflict(_e: unknown): boolean { return false; },
+  __resetCloudSaveForTest(): void {},
+};

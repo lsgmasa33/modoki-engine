@@ -1058,6 +1058,70 @@ function removePlistKey(text: string, key: string): string {
  *  target. Idempotent (skips whatever's already present); only for a project that
  *  depends on capacitor-game-debug AND lives inside the modoki repo. Bails without
  *  writing if any pbxproj anchor is missing (never leaves a partial edit). */
+/** Point a scene-based iOS app's `SceneDelegate` at `MyViewController`, not the base
+ *  `CAPBridgeViewController` (#368).
+ *
+ *  A `SceneDelegate` that builds its window in code OVERRIDES `Main.storyboard`, whose
+ *  `customClass="MyViewController"` is otherwise what gets our `registerPluginInstance` call to
+ *  run. With the base VC there, `MyViewController` is never instantiated, `GameDebugPlugin` is
+ *  never registered, and the iOS debug bridge is silently dead — the game renders perfectly and
+ *  only the JS console says `"GameDebug" plugin is not implemented on ios`, which reaches no
+ *  device log. From the host it looks exactly like "the app is not running" (ECONNREFUSED :9095).
+ *
+ *  ⚠️ This heal exists because the OTHER heals hid the bug. `healIosGameDebugWiring` writes a
+ *  correct `MyViewController.swift` and a correct pbxproj reference, so every artifact this file
+ *  owns looked right in 9 projects whose SceneDelegate bypassed all of it. Capacitor's own iOS
+ *  template is where the file comes from (nothing in this repo writes one), so we cannot fix it
+ *  upstream — we can only heal what it generated. */
+function healIosSceneDelegateBridgeVC(projectRoot: string): string | undefined {
+  const sd = path.join(projectRoot, 'ios', 'App', 'App', 'SceneDelegate.swift');
+  if (!fs.existsSync(sd)) return undefined;   // storyboard path — the VC comes from Main.storyboard
+  if (!fs.existsSync(path.join(projectRoot, 'ios', 'App', 'App', 'MyViewController.swift'))) return undefined;
+
+  // ⚠️ On disk is NOT enough — the class must be COMPILED INTO THE TARGET, or repointing here
+  // turns a recoverable failure into an unrecoverable one: today's symptom is a silently dead
+  // debug bridge (the app builds, runs and renders); naming a type Swift cannot see makes the
+  // App target fail to COMPILE. Never trade a dead bridge for a dead build.
+  //
+  // `healIosGameDebugWiring` normally guarantees the Sources entry and runs before this — but it
+  // has early returns (no pbxproj, and notably no resolvable plugin source), so "the file exists"
+  // and "the file is in the build" are different questions. Ask the one that matters. When this
+  // bails, the guard test still fails the gate on the committed state, so the bug stays visible
+  // rather than becoming silent again.
+  const pbxPath = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  if (!fs.existsSync(pbxPath)) return undefined;
+  if (!/MyViewController\.swift in Sources/.test(fs.readFileSync(pbxPath, 'utf8'))) {
+    // SPEAK, don't return undefined. The other bails above are genuine "nothing to do"; this one
+    // is "something is wrong and I am refusing to act", and staying silent is what lets #368
+    // recur invisibly. The guard test is NOT the safety net here — it reads `git ls-files`, so it
+    // covers tracked in-repo projects only, and the project that lands in this branch is exactly
+    // the one it cannot see: a game scaffolded or copied OUT of the repo, or an Xcode 16
+    // `PBXFileSystemSynchronizedRootGroup` project, which has no Sources phase entries at all for
+    // `healIosGameDebugWiring`'s anchors to find.
+    return '⚠️ SceneDelegate.swift still builds CAPBridgeViewController, and MyViewController.swift '
+      + 'is not in the App target\'s Sources phase — repointing it would break the BUILD, so this was '
+      + 'left alone. The iOS debug bridge stays dead until the pbxproj is wired (#368).';
+  }
+  const orig = fs.readFileSync(sd, 'utf8');
+  // GLOBAL: a delegate with two assignments (an `if #available` fork, say) must have BOTH
+  // repointed. A non-global replace rewrites the first, returns the success note, and leaves the
+  // other branch with a dead bridge — a half-fix that reports as a whole one, and that the guard
+  // test then fails on forever with nothing to auto-repair it.
+  const re = /(rootViewController\s*=\s*)CAPBridgeViewController(\s*\()/g;
+  if (!re.test(orig)) return undefined;
+  // No `re.lastIndex` reset needed: `String.prototype.replace` with a global regex resets it
+  // itself, and `re` is function-local so nothing carries between calls.
+  try {
+    fs.writeFileSync(sd, orig.replace(re, '$1MyViewController$2'));
+  } catch (e) {
+    // Never throw from here: this runs mid-chain on project OPEN, and an uncaught write error
+    // aborts every heal AFTER it (the Android debug-build metadata among them) while reporting
+    // only the write failure. A read-only file should cost this one heal, not the rest.
+    return `⚠️ could not repoint SceneDelegate.swift (${(e as Error).message}) — the iOS debug bridge stays dead until it is fixed by hand (#368)`;
+  }
+  return 'SceneDelegate.swift: rootViewController CAPBridgeViewController → MyViewController (else GameDebugPlugin never registers — #368)';
+}
+
 function healIosGameDebugWiring(projectRoot: string, debugBuild: boolean): string | undefined {
   if (!usesGameDebug(projectRoot)) return undefined;
   const iosApp = path.join(projectRoot, 'ios', 'App');
@@ -2198,6 +2262,9 @@ export function healNativeConfig(projectRoot: string): HealResult {
       // AFTER the wiring — it may have just scaffolded MyViewController.swift.
       const r = healIosGameDebugRegistration(projectRoot, debugBuild);
       if (r) notes.push(r);
+      // AFTER the wiring too: it may have just scaffolded the MyViewController this points at.
+      const sd = healIosSceneDelegateBridgeVC(projectRoot);
+      if (sd) notes.push(sd);
       const s = healIosRemoveReleaseStripPhase(projectRoot);
       if (s) notes.push(s);
       const am = healAndroidDebugBuildMetaData(projectRoot, debugBuild);
