@@ -33,6 +33,7 @@ import { resolveCollider } from './colliders';
 import { resolveShape } from './emitterShapes';
 import { resolveGravity, type Vec3 } from './simSpec';
 import { createOverLifeLUT, type OverLifeLUT } from './gpuLut';
+import { poolRevealDue } from './gpuPoolReveal';
 import { makeParticlePrimitiveGeometry } from './meshParticles';
 import { orientSampleUv, radialAlpha, softParticleFade, spriteFrameNode, spriteSheetUv } from './billboardTsl';
 import { textureProvider } from '../core/textureProvider';
@@ -45,6 +46,12 @@ function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Promise<THREE.T
 function releaseTexture3D(tex: THREE.Texture | null | undefined): void {
   textureProvider.get()?.releaseTexture3D(tex);
 }
+
+
+
+/** The one WebGPU queue method this backend needs, declared structurally so the file does not
+ *  depend on `@webgpu/types` being in the lib set. */
+interface GPUQueueLike { onSubmittedWorkDone(): Promise<void> }
 
 /** Minimal view of the renderer used to dispatch compute passes. */
 interface ComputeRenderer { compute(node: unknown): void; }
@@ -174,6 +181,15 @@ interface GpuEntry {
   count: number;
   playing: boolean;
   inited: boolean;
+  /** Has the pool been made visible yet? Separate from `inited` on purpose — the reveal must
+   *  happen a FULL FRAME after the init dispatch, never in the same `update()`. See update(). */
+  revealed: boolean;
+  /** update() calls since the init dispatch — the FALLBACK gate (see REVEAL_DELAY_FRAMES). */
+  framesSinceInit: number;
+  /** Bumped by every `build()`. An `onSubmittedWorkDone` promise captures the value it was armed
+   *  with and reveals only if it still matches — otherwise a promise armed for a DISCARDED pool
+   *  would reveal the fresh one that replaced it, early and against unfilled buffers. */
+  readyToken: number;
   textureRef: string;
   texture: THREE.Texture | null;
   /** The renderer actually drawing this mesh, captured via onBeforeRender. Compute is
@@ -275,7 +291,7 @@ export class GpuComputeBackend implements IParticleBackend {
     const entry: GpuEntry = {
       id, def, group, mesh: null, u: makeUniforms(), lut: null,
       computeInit: null, computeUpdate: null, count: Math.max(1, def.maxParticles),
-      playing: true, inited: false,
+      playing: true, inited: false, revealed: false, framesSinceInit: 0, readyToken: 0,
       textureRef: def.render.mode === 'mesh' ? '' : (def.render.texture ?? ''), texture: null, renderer: null,
     };
     this.build(entry, def);
@@ -563,6 +579,26 @@ export class GpuComputeBackend implements IParticleBackend {
     entry.mesh.onBeforeRender = (renderer) => { entry.renderer = renderer as unknown as ComputeRenderer; };
     entry.group.add(entry.mesh);
     entry.inited = false;
+    // ⚠️ DRAW NOTHING until the pool is ready — see `ensurePoolReady` / `gpuPoolReveal.ts` (#338).
+    // The renderer is obtainable only from `onBeforeRender`, i.e. from a DRAW, so the first draw
+    // necessarily precedes the first dispatch. Drawing `count` instances there renders them
+    // against buffers `computeInit` has not filled, which on a 40k pool is a full-screen white
+    // wash for the station's opening frames.
+    //
+    // ⚠️ Do NOT re-attribute this to the over-life LUT. That theory was tested on-device and
+    // DISPROVED (probe: the LUTs are resident by the reveal draw), as were "the init dispatch was
+    // skipped" (zeros give meta.z = 0 -> scaleNode = 0 -> nothing drawn, not white) and "one frame
+    // boundary is enough" (measured: still flashed). The measurements that survive live in
+    // `gpuPoolReveal.ts`; an earlier version of THIS comment carried the LUT story with a
+    // different set of numbers, which is precisely how a ruled-out theory gets re-investigated.
+    //
+    // instanceCount 0 still issues the draw, so `onBeforeRender` DOES fire and the renderer is
+    // still captured — verified live before relying on it; without that this would deadlock
+    // (never drawn -> never captured -> never inited -> never drawn).
+    (entry.mesh.geometry as THREE.InstancedBufferGeometry).instanceCount = 0;
+    entry.revealed = false;
+    entry.framesSinceInit = 0;
+    entry.readyToken++;
   }
 
   private buildMesh(
@@ -711,9 +747,79 @@ export class GpuComputeBackend implements IParticleBackend {
     return this.req(handle).group;
   }
 
+  /** Dispatch `computeInit` and, once enough frames have passed, REVEAL the pool.
+   *
+   *  ⚠️ Deliberately callable while PAUSED, and called before `update()`'s play gate (#338
+   *  review). Readiness is reachable only from here, so gating it on `playing` stranded a pool
+   *  that was rebuilt while paused: `ParticleEditor` stops driving `update()` when paused
+   *  (`ParticleEditor.tsx`'s rAF loop), and a structural edit there calls `build()`, which
+   *  re-hides. The preview then stayed EMPTY until the user pressed Play, with no reason to
+   *  connect the two. Readiness is about the buffers being drawable, not about time advancing —
+   *  the gate counts calls, not simulated seconds, so a paused (dt = 0) driver still converges. */
+  private ensurePoolReady(e: GpuEntry): void {
+    const r = e.renderer; // captured in onBeforeRender — the renderer drawing this mesh
+    if (!r) return; // compute needs a renderer; the dispatch waits for the first draw
+    if (!e.inited && e.computeInit) {
+      // Upload the over-life LUTs explicitly rather than leaving it to the first draw: the mesh
+      // renders 0 instances until revealed below, so there is no draw to trigger a lazy upload.
+      // `initTexture` throws if the backend is not initialized — it is here by construction (we
+      // only hold a renderer because it already drew), so a throw means something we did not
+      // model; swallow it rather than tearing down a frame, since the reveal below is what
+      // actually protects the picture.
+      const ri = r as unknown as { initTexture?: (t: THREE.Texture) => void };
+      if (e.lut && typeof ri.initTexture === 'function') {
+        try { ri.initTexture(e.lut.scalarTex); ri.initTexture(e.lut.colorTex); } catch { /* not fatal — see above */ }
+      }
+      r.compute(e.computeInit);
+      e.inited = true;
+      this.revealWhenGpuWorkDone(e);
+      return; // ⚠️ never reveal in the same call that dispatched — see gpuPoolReveal.ts
+    }
+    if (e.inited && !e.revealed && poolRevealDue(++e.framesSinceInit)) this.revealPool(e);
+  }
+
+  /** Ask the GPU to tell us when the init dispatch has actually COMPLETED, and reveal then.
+   *
+   *  This is the readiness SIGNAL the frame counter was standing in for, and it is why
+   *  `REVEAL_DELAY_FRAMES` is a fallback rather than the mechanism. `finishCompute` submits each
+   *  compute group's own command buffer immediately (three r184 `WebGPUBackend.js`), so a
+   *  `queue.onSubmittedWorkDone()` taken right after `compute()` returns covers our dispatch: it
+   *  resolves once the work submitted so far has finished on the device. Revealing there cannot be
+   *  too early by construction, and it self-tunes across GPUs instead of encoding one device's
+   *  pipeline depth as a number.
+   *
+   *  ⚠️ Why the frame count STAYS as a backstop rather than being deleted: this reaches through
+   *  `backend.device`, which only exists on the native WebGPU backend — the WebGL fallback has no
+   *  such queue — and a lost device or a browser without `onSubmittedWorkDone` would otherwise
+   *  leave the pool hidden forever. Capability-checked, and the counter still runs underneath.
+   *
+   *  ⚠️ The token compare is load-bearing. `build()` mints fresh buffers and re-hides, so a promise
+   *  armed for the pool that was just discarded must not reveal the one that replaced it — that
+   *  would draw full instance count against buffers whose own dispatch has not landed, i.e. the
+   *  exact defect this file exists to prevent, reintroduced through a stale closure. */
+  private revealWhenGpuWorkDone(e: GpuEntry): void {
+    const q = (e.renderer as unknown as { backend?: { device?: { queue?: GPUQueueLike } } })?.backend?.device?.queue;
+    if (!q || typeof q.onSubmittedWorkDone !== 'function') return; // WebGL / no device — the counter covers it
+    const token = e.readyToken;
+    q.onSubmittedWorkDone().then(() => {
+      if (this.entries.get(e.id) !== e || e.readyToken !== token) return; // disposed, or a newer pool owns the mesh
+      this.revealPool(e);
+    }).catch(() => { /* device lost — the frame counter still reveals */ });
+  }
+
+  /** Make the pool drawable. Guarded together so `revealed` can never latch true on an entry
+   *  whose mesh is missing (which would leave it permanently hidden AND permanently "revealed"). */
+  private revealPool(e: GpuEntry): void {
+    if (!e.mesh) return;
+    (e.mesh.geometry as THREE.InstancedBufferGeometry).instanceCount = e.count;
+    e.revealed = true;
+  }
+
   update(handle: ParticleHandle, dt: number): void {
     const e = this.entries.get(handle.id);
-    if (!e || !e.playing) return;
+    if (!e) return;
+    this.ensurePoolReady(e); // BEFORE the play gate — see ensurePoolReady
+    if (!e.playing) return;
     // Advance the noise/sim clock EVERY frame, even before a renderer has been
     // captured (F1) — the CPU backend always steps its clock, so render-gating the
     // time as well as the dispatch made GPU time start from 0 only once the mesh
@@ -723,9 +829,8 @@ export class GpuComputeBackend implements IParticleBackend {
     const cdt = clampSimDt(dt);
     e.u.dt.value = cdt;
     e.u.time.value += cdt;
-    const r = e.renderer; // captured in onBeforeRender — the renderer drawing this mesh
-    if (!r) return; // compute needs a renderer; dispatch waits a frame, but time already advanced
-    if (!e.inited && e.computeInit) { r.compute(e.computeInit); e.inited = true; }
+    const r = e.renderer;
+    if (!r) return; // no renderer yet — the clock advanced above, the dispatch waits for a draw
     if (e.computeUpdate) r.compute(e.computeUpdate);
   }
 
@@ -821,6 +926,16 @@ export class GpuComputeBackend implements IParticleBackend {
     e.u.dt.value = PREWARM_STEP;
     const steps = seekSteps(e.u.time.value, seconds);
     for (let s = 0; s < steps; s++) { e.u.time.value += PREWARM_STEP; r.compute(e.computeUpdate); }
+    // ⚠️ Do NOT reveal here, and the reason is the one thing #338 actually MEASURED. An earlier
+    // version did, justified as "a seek steps the buffers itself, so they are valid by
+    // construction" — inference, and it contradicts the disproved-theory list in
+    // `gpuPoolReveal.ts` two files away: a ONE-frame boundary between dispatch and draw still
+    // flashed on both devices, and this path has a ZERO-frame one (`seekSteps(0, ~0)` can be 0,
+    // so nothing at all separates the `computeInit` above from the next draw at full instance
+    // count). Instead, restart the countdown and let `ensurePoolReady` reveal: the Particle
+    // Editor pumps `update(h, 0)` while paused, so a scrub converges in REVEAL_DELAY_FRAMES
+    // frames (~50 ms) — imperceptible, and it cannot flash.
+    if (!e.revealed) e.framesSinceInit = 0;
   }
 
   dispose(handle: ParticleHandle): void {

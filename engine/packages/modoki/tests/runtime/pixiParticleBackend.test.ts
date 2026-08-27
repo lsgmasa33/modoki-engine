@@ -279,3 +279,27 @@ function getObj(be: PixiParticleBackend, h: { id: number }): { committed: number
   const entry = (be as any).entries.get(h.id);
   return entry.obj;
 }
+
+describe('a textured 2D emitter waits HIDDEN, bounded (#338 close-out F4)', () => {
+  // The 2D backend has the SAME defect the 3D one was fixed for: build() constructs the render
+  // object AND a CpuParticleSim together, and the texture `.then` calls build() again — so a cold
+  // sprite discards every live particle and resets the clock, on screen. Fixing the 3D path and
+  // the sub-emitter path while leaving this one is how the second instance survives a sweep.
+  //
+  // ⚠️ These run headless (`typeof window === 'undefined'` in the node env), which is exactly the
+  // "nothing will ever arrive" case — so they pin that the emitter is NOT left hidden there, which
+  // is the failure mode that would break every 2D particle in a headless/test render.
+  it('is not left hidden when no texture load can run (headless)', () => {
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const h = be.create(def({ render: { blend: 'additive', texture: 'some-guid' } } as Partial<ParticleEffectDef>));
+    expect(be.getContainer(h).visible, 'headless has no loader — reveal rather than hide forever').toBe(true);
+  });
+
+  it('an untextured 2D emitter is never hidden', () => {
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const h = be.create(def());
+    expect(be.getContainer(h).visible).toBe(true);
+  });
+});

@@ -142,6 +142,14 @@ export default function ParticleEditor() {
         if (h && playingRef.current) {
           elapsedRef.current += dt;
           particleBackend.update(h, dt);
+        } else if (h) {
+          // ⚠️ Keep driving the backend with dt = 0 while PAUSED (#338). A GPU pool is not
+          // drawable until its init compute has been dispatched and it has been revealed, and
+          // both happen only inside `update()`. Skipping the call entirely left a pool that was
+          // rebuilt while paused — which any structural edit does — hidden until the user pressed
+          // Play, with nothing on screen to explain why. dt = 0 advances no simulation, so a
+          // paused preview still shows the frozen frame it is meant to.
+          particleBackend.update(h, 0);
         }
         renderer.render(scene, camera);
       };

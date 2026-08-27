@@ -527,3 +527,49 @@ export function defaultParticleEffect(): ParticleEffectDef {
     render: { blend: 'additive' },
   };
 }
+
+/** How many frames a fresh emitter may stay HIDDEN waiting for its declared sprite texture (#338).
+ *
+ *  ## Why hide at all
+ *
+ *  `build()` constructs the render objects AND a new `CpuParticleSim` together, and
+ *  `loadTextureFor` calls it a SECOND time when the texture arrives — because a sprite texture
+ *  changes the material (textured quad vs. the radial soft-circle alpha), so the billboard cannot
+ *  simply be re-pointed. That second build discards every live particle and resets the sim clock
+ *  to 0, which the owner observed as particles "spawning for 1-2 frames, resetting, and
+ *  continuing". It only bites the FIRST activation: `loadTexture3D` is async even on a cache HIT,
+ *  but a hit resolves on a microtask (before the next rAF), so a warm texture rebuilds before
+ *  anything is drawn. A COLD one takes a frame or two, and that rebuild is visible.
+ *
+ *  So a fresh emitter that DECLARES a texture starts hidden: the throwaway build and its reset
+ *  happen off-screen, and the emitter is revealed on the rebuild that has the texture. One
+ *  visible start, no reset, and the sim the player sees begins at t=0 (a burst authored at 0
+ *  still fires on the frame they first see).
+ *
+ *  ## Why the wait is BOUNDED
+ *
+ *  Hiding until the texture lands is right for a showcase, and wrong for gameplay VFX: a hit
+ *  spark or explosion that shows NOTHING while a large/cold KTX2 transcodes reads as a dropped
+ *  effect. So the wait is capped — past the budget the emitter is revealed untextured (the radial
+ *  soft-circle fallback it would have drawn anyway) and picks up its sprite when the load
+ *  completes.
+ *
+ *  ⚠️ **Be precise about what that degradation actually is, because an earlier version of this
+ *  comment overstated it.** It said "degrades to a texture pop rather than to silence". It does
+ *  not: past the budget the emitter is visible, and the late arrival still runs `build()`, which
+ *  discards every live particle and zeroes `simTime` — so what the player sees is a full RESET,
+ *  on screen. That is the owner's original "spawn for 1-2 frames, reset, continue" report,
+ *  surviving on exactly the slow/cold-texture case this budget exists for. The budget still buys
+ *  the right thing (something rather than nothing), but it does not make the reset a pop.
+ *
+ *  Removing the reset means letting the sim survive a render rebuild — `CpuParticleSim` holds its
+ *  `out` as a plain reference, so a `setOutputs()` plus a render-only rebuild path would do it.
+ *  Deliberately NOT done here: it widens a close-out fix into a lifecycle change that wants its
+ *  own review, and the path only fires when a texture takes longer than the budget.
+ *
+ *  Frames rather than milliseconds, deliberately: the cost being bounded is a RENDERING concern,
+ *  and a slower device drawing slower frames should get proportionally longer to load. ~6 frames
+ *  is 100ms at 60fps / 200ms at 30fps — under the ~100ms that reads as instant, and far longer
+ *  than the 1-2 frames a warm or local texture actually needs.
+ */
+export const TEXTURE_WAIT_BUDGET_FRAMES = 6;

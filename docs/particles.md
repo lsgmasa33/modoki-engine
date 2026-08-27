@@ -103,6 +103,45 @@ Trails keep a per-particle position-history ring; sub-emitters are depth-1 (a ch
 and sub-emitters are stripped — it's driven purely by injected bursts at the parent's birth/death
 events).
 
+⚠️ **A fresh emitter that declares a sprite texture starts HIDDEN, and this is not cosmetic (#338).**
+`build()` constructs the render objects **and** a new `CpuParticleSim` together, and
+`loadTextureFor` calls it a **second** time when the texture arrives — a sprite texture changes the
+material (textured quad vs. the radial soft-circle alpha), so the billboard cannot simply be
+re-pointed. That second build **discards every live particle and resets the sim clock to 0**,
+which the owner saw as particles "spawning for 1-2 frames, resetting, and continuing".
+
+It only bites the FIRST activation, and the reason is worth knowing: `loadTexture3D` is async even
+on a cache **hit**, but a hit resolves on a microtask — before the next rAF — so a warm texture
+rebuilds before anything is drawn. A **cold** one takes a frame or two, and that rebuild is
+visible. Which is also why restarting always looked clean.
+
+So the throwaway build happens off-screen and the emitter is revealed on the rebuild that has the
+texture: one visible start, no reset, and the sim the player sees begins at t=0 (a burst authored
+at 0 still fires on the frame they first see). **The wait is BOUNDED** —
+`TEXTURE_WAIT_BUDGET_FRAMES`, counted in `update()` calls so a paused emitter cannot burn it while
+frozen. Hiding until the texture lands is right for a showcase and wrong for gameplay VFX: a hit
+spark showing *nothing* while a large or cold KTX2 transcodes reads as a dropped effect, so past
+the budget the emitter is revealed untextured and picks up its sprite on arrival. A failed load
+reveals too — a 404 must never hide an emitter forever, and neither may a ref that `setDef` swaps
+away mid-load (that path starts no replacement load, so it reveals on the way out).
+
+⚠️ **What the budget does NOT buy:** past it, the late texture arrival still rebuilds, so the
+player sees the full reset rather than a texture pop. The budget trades *silence* for *a visible
+reset*, which is better but is not "no artifact" — removing it means letting the sim survive a
+render rebuild (`CpuParticleSim` holds `out` by reference, so a `setOutputs()` would do it), which
+is a lifecycle change deliberately left for its own change. The **`update()`-call** denominator
+matters here too: the budget is spent before the play gate (a paused emitter whose load went stale
+would otherwise be hidden forever) and never inside `advance()`, which `seek()`/`prewarm()` call in
+a loop — a counter there measures sim steps and a single scrub would spend the whole budget.
+
+⚠️ **`buildChildRender()` rebuilds a sub-emitter child's `sim` as well as its render**, despite the
+name — so the identical defect exists one level down, and a late child texture deletes every
+particle the parent has injected. The child gets the same bounded hidden-wait. Latent today (no
+sub-emitter child in the repo declares a sprite) and reachable the moment one does, which for a
+spark or debris child is an entirely ordinary thing to author. Related: the texture rebuild also
+discards the sim `create()` built **including its prewarm**, so `prewarm` + a texture is re-applied
+after the rebuild rather than silently lost.
+
 ### The GPU sim
 
 `GpuComputeBackend` holds all state in `instancedArray` storage buffers (`pos`, `vel`, a packed
@@ -115,6 +154,40 @@ The render mesh is an `InstancedBufferGeometry` whose per-instance state comes f
 (`.element(instanceIndex)`), not vertex attributes, sidestepping WebGPU's 8-vertex-buffer cap;
 over-life size/opacity/color are sampled from small baked LUT textures (`gpuLut.ts`). Compute is
 dispatched against the renderer that actually draws the mesh, captured via `onBeforeRender`.
+
+⚠️ **That capture creates an ordering hole, and a fresh pool must therefore stay HIDDEN for its
+first frames (#338).** The renderer is only obtainable from `onBeforeRender` — i.e. from a DRAW —
+so the first draw necessarily happens *before* the first `update()` that can dispatch anything.
+Drawing `maxParticles` instances there renders them against buffers the init kernel has not filled:
+on `demos/particle-demo`'s 40k Nebula that is a **full-screen white wash** for the station's opening
+frames. (Not zeroed buffers — zeros give `meta.z = 0` → `scaleNode = 0` → nothing drawn. What reads
+back is stale/recycled pool memory, drawn additively at 40k instances.) So **`build()`** starts the mesh at
+`instanceCount = 0` — `build()`, not `create()`, because it is also the texture-load and `setDef`
+rebuild path, and each of those mints fresh buffers that must be hidden again. `ensurePoolReady()`
+then uploads the over-life LUTs explicitly rather than letting the first draw do it lazily, and
+reveals the pool only after `REVEAL_DELAY_FRAMES` (`gpuPoolReveal.ts`).
+
+⚠️ **Readiness runs even while PAUSED**, before `update()`'s play gate, and `seek()` reveals
+directly (it steps the buffers itself, so they are valid by construction). Both matter for the
+Particle Editor, which stops driving `update()` when paused: without them, any structural edit made
+while paused left the preview EMPTY until the user pressed Play. The editor also calls
+`update(handle, 0)` while paused so readiness can converge with no simulation advancing.
+
+**The reveal is driven by a readiness SIGNAL, not by a timer.** `revealWhenGpuWorkDone` takes
+`backend.device.queue.onSubmittedWorkDone()` immediately after the init dispatch — `finishCompute`
+submits each compute group's own command buffer, so that promise resolves once the dispatch has
+actually completed on the device. It cannot fire too early, and it self-tunes across GPUs.
+`REVEAL_DELAY_FRAMES` remains only as a **backstop** for the paths that signal cannot reach: the
+WebGL fallback (no `backend.device`), a lost device, or a browser without the method.
+
+⚠️ **The backstop's value has a cautionary history worth keeping.** It was first bisected on two
+devices and reported as "exactly 3 on both" — which was wrong, not because the measurement was
+sloppy but because **the failure is intermittent and the bisect ran one take per value**. Re-running
+a single build pinned at 3 gave one flash in four takes. The value is now 6 (double the observed
+edge), verified 5/5 by repeated takes. **Never conclude from one run here**, in either direction.
+Method: `screenrecord` a timeline pass → `ffmpeg signalstats` per-frame `YAVG` → compare a station's
+entry against its own steady-state luma, and lock the screen orientation first (black side-bars in
+landscape dilute the mean and make takes incomparable).
 
 ### Shared-math discipline
 

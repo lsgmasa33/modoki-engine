@@ -10,7 +10,7 @@
  */
 
 import * as THREE from 'three';
-import { renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type SubEmitter } from './types';
+import { TEXTURE_WAIT_BUDGET_FRAMES, renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type SubEmitter } from './types';
 import { CpuParticleSim } from './cpuSimulator';
 import { createBillboard, type BillboardObject } from './spriteBillboard';
 import { createMeshParticles } from './meshParticles';
@@ -53,6 +53,10 @@ interface SubChild {
   childDef: ParticleEffectDef | null; // the def the current sim/render was built for
   texture: THREE.Texture | null;
   textureRef: string;
+  /** Same bounded hidden-wait as the parent (#338): `buildChildRender` rebuilds this child's SIM
+   *  as well as its render, so a late texture wipes every injected particle. */
+  awaitingTexture: boolean;
+  framesAwaitingTexture: number;
 }
 
 interface Entry {
@@ -70,6 +74,11 @@ interface Entry {
   /** Seconds simulated so far — lets seek() step forward from here instead of
    *  re-simulating from zero on every scrub event. */
   simTime: number;
+  /** Waiting for a declared sprite texture to arrive, with the group HIDDEN meanwhile (#338).
+   *  Cleared when the texture lands, when the wait budget expires, or when the load fails. */
+  awaitingTexture: boolean;
+  /** update() calls spent hidden — bounded by TEXTURE_WAIT_BUDGET_FRAMES. */
+  framesAwaitingTexture: number;
 }
 
 /** Cheap signature of a def's sub-emitter list to detect structural edits. */
@@ -101,11 +110,18 @@ export class CpuTslBackend implements IParticleBackend {
       id, def, group, seed, playing: true,
       textureRef: def.render.texture ?? '', texture: null,
       sim: null as unknown as CpuParticleSim, billboard: null as unknown as BillboardObject, trail: null,
-      subs: [], simTime: 0,
+      subs: [], simTime: 0, awaitingTexture: false, framesAwaitingTexture: 0,
     };
     this.build(entry, def);
     this.entries.set(id, entry);
-    if (entry.textureRef && def.render.mode !== 'mesh') this.loadTextureFor(entry);
+    if (entry.textureRef && def.render.mode !== 'mesh') {
+      // Hide BEFORE the load starts: a warm texture resolves on a microtask, so the reveal can
+      // happen in the same tick and the emitter is never actually seen hidden.
+      entry.awaitingTexture = true;
+      entry.framesAwaitingTexture = 0;
+      entry.group.visible = false;
+      this.loadTextureFor(entry);
+    }
     if (def.prewarm && def.duration > 0) this.prewarm(entry);
     return { id };
   }
@@ -153,7 +169,7 @@ export class CpuTslBackend implements IParticleBackend {
         probRng: makeRng(seed ^ 0x5bd1e995),
         warnedTruncation: false,
         group: g, sim: null, render: null, trail: null, childDef: null,
-        texture: null, textureRef: '',
+        texture: null, textureRef: '', awaitingTexture: false, framesAwaitingTexture: 0,
       } satisfies SubChild;
     });
   }
@@ -203,14 +219,33 @@ export class CpuTslBackend implements IParticleBackend {
     const texRef = childDef.render.mode !== 'mesh' ? (childDef.render.texture ?? '') : '';
     if (texRef && texRef !== c.textureRef) {
       c.textureRef = texRef;
+      // ⚠️ Hide until the texture lands, for the SAME reason the parent does (#338):
+      // `buildChildRender` rebuilds `c.sim` too (despite its name), so a late texture deletes
+      // every particle the parent has injected since the child was built. Without this the
+      // player sees sparks appear and then vanish — the parent's own defect, one level down.
+      // Latent today (no sub-emitter child in the repo declares a sprite) and reachable the
+      // moment one does, which for a spark/debris child is an entirely ordinary thing to author.
+      c.awaitingTexture = true;
+      c.framesAwaitingTexture = 0;
+      c.group.visible = false;
       loadTexture3D(texRef)
         .then((tex) => {
-          if (!this.entries.has(entry.id) || c.childDef !== childDef) { releaseTexture3D(tex); return; } // stale — release our ref
+          // ⚠️ IDENTITY, not `childDef` equality (#338 close-out F6). A parent `build()` — from a
+          // structural setDef, or from the parent's OWN texture arrival — runs `disposeSubs` and
+          // replaces `entry.subs`, but this closure still holds the old `c` with an unchanged
+          // `childDef`, so an equality guard passes. It would then allocate a billboard + sim
+          // nothing disposes and re-acquire a texture refcount that `disposeSubs` already
+          // released, with nothing left to release it again.
+          if (!entry.subs.includes(c) || c.childDef !== childDef) { releaseTexture3D(tex); return; } // stale — release our ref
           releaseTexture3D(c.texture); // release prior before replacing
           c.texture = tex;
           this.buildChildRender(c, childDef);
+          this.revealChild(c);
         })
-        .catch((e) => console.warn(`[particles] sub-emitter texture load failed: ${texRef}`, e));
+        .catch((e) => {
+          console.warn(`[particles] sub-emitter texture load failed: ${texRef}`, e);
+          this.revealChild(c); // a dead sprite must not hide the child forever
+        });
     }
   }
 
@@ -250,6 +285,21 @@ export class CpuTslBackend implements IParticleBackend {
     }
   }
 
+  /** Sub-emitter twin of `revealEmitter`. */
+  private revealChild(c: SubChild): void {
+    c.awaitingTexture = false;
+    c.framesAwaitingTexture = 0;
+    c.group.visible = true;
+  }
+
+  /** Stop waiting on a texture and draw this emitter. Idempotent, and safe to call for an entry
+   *  that was never hidden (a mesh-mode or textureless effect). */
+  private revealEmitter(entry: Entry): void {
+    entry.awaitingTexture = false;
+    entry.framesAwaitingTexture = 0;
+    entry.group.visible = true;
+  }
+
   private loadTextureFor(entry: Entry): void {
     const ref = entry.textureRef;
     if (!ref) return;
@@ -258,12 +308,32 @@ export class CpuTslBackend implements IParticleBackend {
         // stale: entry disposed or ref changed mid-load. The texture is shared +
         // refcounted (texture-shader-font F3) — release our ref so it's freed when
         // the last holder drops it (here, immediately, if no one else acquired it).
-        if (!this.entries.has(entry.id) || entry.textureRef !== ref) { releaseTexture3D(tex); return; }
+        if (!this.entries.has(entry.id) || entry.textureRef !== ref) {
+          releaseTexture3D(tex);
+          // ⚠️ REVEAL on the way out. This branch fires when the entry was disposed OR when
+          // `setDef` swapped the ref mid-load — and a swap to an empty/mesh ref starts no
+          // replacement load, so returning silently leaves the emitter hidden with nothing left
+          // that could ever show it (#338 close-out F1).
+          if (this.entries.has(entry.id)) this.revealEmitter(entry);
+          return;
+        }
         releaseTexture3D(entry.texture); // release any prior texture before replacing
         entry.texture = tex;
         this.build(entry, entry.def);
+        // ⚠️ The rebuild discards the sim `create()` built — including its PREWARM. Without this,
+        // a `prewarm` effect that also declares a texture silently loses its prewarm on first
+        // activation and starts empty instead of settled. Latent today (no effect in the repo
+        // pairs the two) but reachable the moment one does, and invisible when it happens.
+        if (entry.def.prewarm && entry.def.duration > 0) this.prewarm(entry);
+        // The rebuild above reset the sim — that is exactly why we were hidden. Reveal now, so
+        // the first frame the player sees is a textured effect at its own t=0.
+        this.revealEmitter(entry);
       })
-      .catch((e) => console.warn(`[particles] texture load failed: ${ref}`, e));
+      .catch((e) => {
+        console.warn(`[particles] texture load failed: ${ref}`, e);
+        // Never leave an emitter invisible because a texture 404'd — show the radial fallback.
+        this.revealEmitter(entry);
+      });
   }
 
   private prewarm(entry: Entry): void {
@@ -280,7 +350,29 @@ export class CpuTslBackend implements IParticleBackend {
 
   update(handle: ParticleHandle, dt: number): void {
     const e = this.entries.get(handle.id);
-    if (!e || !e.playing) return;
+    if (!e) return;
+    // ⚠️ The texture wait is spent BEFORE the play gate, and counted in update() CALLS rather
+    // than in simulated seconds (#338 close-out). An earlier version gated it on `playing`,
+    // reasoning that a paused emitter should not burn its wait while frozen — which sounds right
+    // and strands the emitter: reveal has only two sources, this counter and the texture promise,
+    // and `loadTextureFor`'s stale branch returns WITHOUT revealing whenever `setDef` swaps the
+    // ref (clearing the texture, or switching to mesh mode, starts no replacement load at all).
+    // Paused + stale = hidden forever. Reproduced: create(textured) → pause() → setDef(no
+    // texture) → resolve the original load → 200 updates → still invisible. Real driver is the
+    // Particle Editor, which pumps `update(h, 0)` while paused for exactly this reason — the same
+    // mistake, and the same fix, as `gpuComputeBackend.ensurePoolReady`.
+    if (e.awaitingTexture && ++e.framesAwaitingTexture >= TEXTURE_WAIT_BUDGET_FRAMES) {
+      this.revealEmitter(e);
+    }
+    // ⚠️ The children's budgets are spent HERE too, not in `advance()` (#338 close-out F3).
+    // `advance()` is called in a LOOP by `seek()` and `prewarm()` — a scrub to 2s runs ~120
+    // iterations in one tick — so a counter living there measures SIM STEPS, and would reveal a
+    // child untextured six steps into a single synchronous scrub, long before any load could
+    // land. Frames are what the wait is denominated in; `update()` is the only per-frame call.
+    for (const c of e.subs) {
+      if (c.awaitingTexture && ++c.framesAwaitingTexture >= TEXTURE_WAIT_BUDGET_FRAMES) this.revealChild(c);
+    }
+    if (!e.playing) return;
     // Clamp the frame step once (shared ceiling with the GPU backend) and use
     // the SAME value for integration and the sim clock so a long frame can't
     // teleport particles or desync time from motion.

@@ -188,6 +188,16 @@ engine/tsconfig.app.scoped.json
 # Claude Code local approvals / settings (machine-local, per-worktree)
 .claude/settings.local.json
 
+# Subagent worktrees — a FULL second checkout of this repo, created by an agent launched with
+# `isolation: 'worktree'` and removed when it finishes. The rest of `.claude/` is tracked (agents,
+# skills), so without this line a running agent's checkout shows up as untracked noise in
+# `git status` and is one `git add -A` away from being committed — and #18 declined a pre-commit
+# hook, so explicit staging is the only guard. Sibling instance of the same hazard:
+# `claudeMdBudget.test.ts` walks the tree with a raw readdir and had to skip `.claude` for exactly
+# this reason (its CLAUDE.md files were reported as un-budgeted, reddening `npm run verify` for as
+# long as any worktree agent ran).
+.claude/worktrees/
+
 # opencode project config — pins THIS clone's backend/CDP ports (machine-local, per-worktree)
 .opencode/
 

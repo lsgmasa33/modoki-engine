@@ -17,6 +17,7 @@
 import { Container } from 'pixi.js';
 import type { Matrix4 } from 'three';
 import {
+  TEXTURE_WAIT_BUDGET_FRAMES,
   renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps,
   type IParticleBackendCore, type ParticleEffectDef, type ParticleHandle,
 } from './types';
@@ -114,6 +115,10 @@ interface Entry {
   textureRef: string;
   /** Seconds simulated so far — lets seek() step forward instead of re-simulating from zero. */
   simTime: number;
+  /** Bounded hidden-wait for a declared sprite texture (#338) — see the 3D twin in
+   *  `cpuTslBackend`, whose `TEXTURE_WAIT_BUDGET_FRAMES` this shares by import. */
+  awaitingTexture: boolean;
+  framesAwaitingTexture: number;
 }
 
 export class PixiParticleBackend implements IParticle2DBackend {
@@ -135,11 +140,22 @@ export class PixiParticleBackend implements IParticle2DBackend {
       wrapper: new Container(),
       sim: null as unknown as CpuParticleSim,
       obj: null as unknown as PixiParticleObject,
-      simTime: 0,
+      simTime: 0, awaitingTexture: false, framesAwaitingTexture: 0,
     };
     this.build(entry, def, null);
     this.entries.set(id, entry);
-    if (entry.textureRef) this.loadTextureFor(entry);
+    if (entry.textureRef) {
+      // ⚠️ Same bounded hidden-wait as the 3D CPU backend (#338 close-out F4). `build()` here
+      // ALSO constructs the render object and a new CpuParticleSim together, and the texture
+      // `.then` calls it again — so a cold sprite discards every live particle and resets the
+      // clock, on screen. The 2D route is exactly as close to reachable as the sub-emitter one
+      // (nothing pairs `space:'2d'` with `render.texture` today), and fixing one while leaving
+      // the other is how the second instance survives a sweep.
+      entry.awaitingTexture = true;
+      entry.framesAwaitingTexture = 0;
+      entry.wrapper.visible = false;
+      this.loadTextureFor(entry);
+    }
     if (def.prewarm && def.duration > 0) this.prewarm(entry);
     return { id };
   }
@@ -159,11 +175,19 @@ export class PixiParticleBackend implements IParticle2DBackend {
     entry.simTime = 0;
   }
 
+  /** Stop waiting on a texture and draw this emitter. Idempotent. */
+  private revealEmitter(entry: Entry): void {
+    entry.awaitingTexture = false;
+    entry.framesAwaitingTexture = 0;
+    entry.wrapper.visible = true;
+  }
+
   private loadTextureFor(entry: Entry): void {
     const ref = entry.textureRef;
-    if (!ref || typeof window === 'undefined') return; // headless: no async texture load
+    // Headless / no resolvable url: nothing will ever arrive, so do not leave the emitter hidden.
+    if (!ref || typeof window === 'undefined') { this.revealEmitter(entry); return; }
     const url = resolveImageUrl(ref);
-    if (!url) return;
+    if (!url) { this.revealEmitter(entry); return; }
     textureProvider.get()?.ensurePixiKtxTranscoder(); // idempotent; registers the KTX2 loader before we fetch one
     // Lazy import so a headless/test import of this module doesn't require a browser.
     //
@@ -178,11 +202,20 @@ export class PixiParticleBackend implements IParticle2DBackend {
     import('./../rendering/pixiTextureLoad')
       .then(({ loadPixiTexture }) => loadPixiTexture(url))
       .then((tex) => {
-        // Stale: entry disposed or its texture ref changed while loading.
-        if (!this.entries.has(entry.id) || entry.textureRef !== ref) return;
+        // Stale: entry disposed or its texture ref changed while loading. Reveal on the way out —
+        // a swapped-away ref starts no replacement load, so returning silently strands it hidden.
+        if (!this.entries.has(entry.id) || entry.textureRef !== ref) {
+          if (this.entries.has(entry.id)) this.revealEmitter(entry);
+          return;
+        }
         this.build(entry, entry.def, tex as import('pixi.js').Texture);
+        if (entry.def.prewarm && entry.def.duration > 0) this.prewarm(entry); // the rebuild dropped it
+        this.revealEmitter(entry);
       })
-      .catch((e) => console.warn(`[particles2d] texture load failed: ${ref}`, e));
+      .catch((e) => {
+        console.warn(`[particles2d] texture load failed: ${ref}`, e);
+        this.revealEmitter(entry); // a dead sprite must never hide an emitter forever
+      });
   }
 
   private prewarm(entry: Entry): void {
@@ -199,7 +232,13 @@ export class PixiParticleBackend implements IParticle2DBackend {
 
   update(handle: ParticleHandle, dt: number): void {
     const e = this.entries.get(handle.id);
-    if (!e || !e.playing) return;
+    if (!e) return;
+    // Spent BEFORE the play gate, for the reason the 3D twin documents at length: reveal has only
+    // two sources, and a paused emitter whose load went stale would otherwise stay hidden forever.
+    if (e.awaitingTexture && ++e.framesAwaitingTexture >= TEXTURE_WAIT_BUDGET_FRAMES) {
+      this.revealEmitter(e);
+    }
+    if (!e.playing) return;
     const cdt = clampSimDt(dt); // shared frame-step ceiling with the 3D backend
     e.sim.step(cdt);
     e.simTime += cdt;
