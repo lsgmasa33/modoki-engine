@@ -177,6 +177,16 @@ git ls-files 'games/*/ios/**' 'games/*/android/**' | git check-ignore --stdin
 `@capacitor/assets` during the native build. That combination is only safe because the build
 **skips regeneration when nothing changed** (`engine/plugins/iconAssets.ts`).
 
+**Where the source image comes from, and the trap in it.** `app.iconSource` in
+`<project>/project.config.json` is a **project-relative** path (absolute is honoured too). When it
+is **empty — the scaffolder's default — the build falls back to the repo-root `build/icon.png`,
+which is the Modoki EDITOR's own icon**, so an unconfigured project silently ships Modoki's panda
+as its app icon and looks authored. ⚠️ **`<project>/assets/icon.png` is NOT the source**, however
+much it reads like one: `generate-icons.mjs` COPIES the resolved source there because that is
+`@capacitor/assets`' input convention, and `games/*/assets/` + `demos/*/assets/` are **gitignored**.
+Editing that file changes nothing and is overwritten on the next run — put the master somewhere
+tracked (`games/court/art/icon-app-master.png` is the worked example) and point `iconSource` at it.
+
 Two things went wrong before it did:
 
 - The step ran on **every** native build, rewriting every tracked mipmap/splash PNG each time,
