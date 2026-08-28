@@ -1951,7 +1951,10 @@ for the next one.
 generated `ios/App/build/exportOptions.plist`. `app-store-connect` is the shipping path;
 `ad-hoc`/`development` produce an .ipa installable on registered devices, for testing the
 release-signed build before it goes near a store. The Team ID is `build.appleTeamId` — for Court and
-wordweave that is Apiary's shipping team (see the root `CLAUDE.md` § App Identity), not the dev team.
+wordweave that is the **Apiary publisher team**, not the dev one — the two ids, and which projects
+are the exceptions, are in the root `CLAUDE.md` § "App Identity". The literal is deliberately not
+repeated here: `docs/` is the publish switch for modoki-engine.com, and `verify:publish` aborts on a
+real Team ID reaching it.
 
 ⚠️ The generated plist and the archive live under `ios/App/build/`, which every project's
 `ios/.gitignore` already covers — they carry the Apple Team ID, a `PRIVATE_BUILD_FIELDS` value.
@@ -1964,28 +1967,50 @@ the project never chose.
 
 ### What still has to happen by hand
 
-**Play App Signing and the Firebase SHA-1s are console work, not build work.**
-
-⚠️ **Registering the fingerprints is ENOUGH — it does not need a rebuild.** The
-`com.google.gms.google-services` plugin compiles exactly seven resources out of
-`google-services.json` into the app: `default_web_client_id`, `gcm_defaultSenderId`,
-`google_api_key`, `google_app_id`, `google_crash_reporting_api_key`, `google_storage_bucket`,
-`project_id`. The `client_type: 1` (Android) entries — the ones carrying `certificate_hash` — are
-**not** among them; the cert↔client mapping is enforced by Google's servers. Verified on Court
-2026-08-28 by grepping the whole release build tree for a newly added fingerprint: it appears only
-in the source JSON, in no built artifact. So an already-shipped build starts working the moment the
-SHA-1 is registered. Committing the regenerated `google-services.json` is still right — the source
-of truth should match — but it is not the thing that unblocks sign-in, and treating it as one costs
-a build-and-upload cycle nobody needed. (This entry exists because that is exactly what was claimed
-first, from the general shape of the file rather than from what the plugin emits.)
-
- Google Sign-In
+**Play App Signing and the Firebase SHA-1s are console work, not build work.** Google Sign-In
 matches an app by package name + signing certificate SHA-1, and with Play App Signing there are
 **three** certificates: debug, the upload key, and the **app signing key Google generates and
 re-signs every install with**. Registering only the first two makes sign-in work in every test
 anyone runs and fail for every single person who installs from Play. All three fingerprints belong
 in the Firebase console, and the third only exists once the app is enrolled in Play App Signing —
 i.e. after the first AAB upload.
+
+⚠️ **Adding a FINGERPRINT does not need a rebuild. Enabling the PROVIDER does.** The two look like
+the same console visit and are not:
+
+| console change | reaches the app how | rebuild? |
+|---|---|---|
+| Register another certificate SHA-1 | server-side only — nothing cert-derived is in the artifact | **no** |
+| Enable the Google provider (mints the web OAuth client) | `default_web_client_id`, a compiled string resource | **yes** |
+
+The `com.google.gms.google-services` plugin turns `google-services.json` into Android string
+resources, and **the set it emits depends on what the JSON contains** — do not memorise a fixed
+list. (4.4.4 knows ten: `default_web_client_id`, `gcm_defaultSenderId`, `google_api_key`,
+`google_app_id`, `google_crash_reporting_api_key`, `google_storage_bucket`, `project_id`,
+`firebase_database_url`, `ga_trackingId`, `google_maps_key`. Court's release build emits seven; its
+older *debug* build emitted six, missing `default_web_client_id`, because it predates the web client
+being added.) **The invariant that actually holds is narrower and stable: no emitted resource is
+derived from `certificate_hash`.**
+
+Measured on Court, 2026-08-28, against the real artifacts — and deliberately using the
+fingerprints that were ALREADY in the JSON when the artifact was built, since grepping for a
+newly-added one passes whether the claim is true or false:
+
+- `google-services.json` is not packaged in the APK or the AAB at all.
+- The pre-existing fingerprints and their Android client ids: **0 occurrences** in either archive
+  (whole-archive decompressed byte grep, plus `res/raw/`, uppercase and colon-separated forms).
+- The web client id: **1 occurrence** — the control that proves the grep can find what IS shipped.
+
+So a build that already shipped does not need rebuilding for a fingerprint. ⚠️ **What was measured
+is "no rebuild required", not "works instantly"** — nobody signed in on a Play-installed build after
+registering, because Court was rebuilt anyway and destroyed the counterfactual. Google's propagation
+for a newly registered SHA-1 (minutes to hours) and Credential Manager's client-side credential
+caching both sit between registration and a working sign-in, and neither was measured.
+
+Committing the regenerated `google-services.json` is still right — the source of truth should match
+the console — it is just not what unblocks sign-in. (This section exists because the opposite was
+asserted first, reasoned from the shape of the JSON rather than from what the plugin emits, and it
+cost a build-and-upload cycle.)
 
 ## iOS build notes
 

@@ -169,6 +169,9 @@ describe('renderKeystoreProperties', () => {
 
 describe('renderExportOptionsPlist', () => {
   it('carries the method and team through', () => {
+    // ⚠️ A PLACEHOLDER, never the real Apiary id. engine/tests/** ships in the OSS snapshot, so a
+    // real Team ID here is a leak `verify:publish` aborts on — and only the HUB runs that gate, so
+    // it surfaces at merge time on someone else's branch. Same scar as the device-id one.
     const out = renderExportOptionsPlist({ teamId: 'ABCDE12345', method: 'app-store-connect' });
     expect(out).toContain('<key>method</key>\n\t<string>app-store-connect</string>');
     expect(out).toContain('<key>teamID</key>\n\t<string>ABCDE12345</string>');
