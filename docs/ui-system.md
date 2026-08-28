@@ -871,9 +871,12 @@ rebuild and is never per-frame.
   prefab FILE and the file was well-formed.
   ⚠️ **#344's recorded cause — "a `version: 2` makes the loader decline to cache" — is not real,
   and the belief had spread to four places.** `fetchPrefab` (`meshTemplateCache.ts`) fetches,
-  parses and caches without ever inspecting `version`; `editor/scene/prefab.ts` *writes* `2` for
-  any prefab holding nested-instance rows; and `games/court/.../level-page.prefab.json` carries 25
-  nested rows at version `1` and works. **Confirmed live** (#365): with `level-tile.prefab.json`
+  parses and caches without ever inspecting `version`; `editor/scene/prefab.ts` *wrote* `2` for
+  any prefab holding nested-instance rows; and `games/court/.../level-page.prefab.json` carried 25
+  nested rows at version `1` and worked. (Both of those are stated in the past tense on purpose:
+  #379 made every writer stamp `PREFAB_FORMAT_VERSION` unconditionally and migrated the fleet, so
+  `level-page.prefab.json` now reads `2` like everything else. The argument is unaffected — it was
+  never about which value, only that no value gates loading.) **Confirmed live** (#365): with `level-tile.prefab.json`
   set to `2` and the editor restarted cold, the selector rendered its full 100 tiles at rects
   byte-identical to the version-1 control, with nothing logged. `prefabFormatVersion.test.ts`,
   which required every committed prefab to be `1` citing that mechanism, is **deleted** — it

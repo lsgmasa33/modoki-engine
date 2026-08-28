@@ -294,8 +294,10 @@ save/reload (it was previously dropped, then briefly re-anchored to the scene ro
   recurses a reference node's own `added`, so `SceneManager` acquires the child
   prefab (and its transitive refs) at load.
 - **Apply to Prefab.** `insertAddedSubtree` writes a reference node as a nested
-  **row** in the owner's `.prefab.json` (bumping it to `version: 2`), so promoting it
-  matches how `serializePrefab` writes nested rows.
+  **row** in the owner's `.prefab.json`, so promoting it matches how `serializePrefab`
+  writes nested rows. (It also raises `version` to `PREFAB_FORMAT_VERSION`, which since
+  #379 every writer stamps unconditionally — the bump is no longer a signal that the file
+  gained nesting.)
 - **Recursion.** Because `captureInstanceReference` calls `captureInstanceStructure`,
   a user-added instance nested inside another is captured (and expanded) recursively.
   `serializePrefab`'s nested-row loop skips an instance already folded into a parent

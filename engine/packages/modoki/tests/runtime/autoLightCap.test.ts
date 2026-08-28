@@ -12,6 +12,9 @@ import {
   globalKeptMask, maskForObject, capChangesAnything, canAutoCap,
   MAX_CAPPABLE_LIGHTS, ALL_LIGHTS_MASK, effectiveness, type CapLight, type LightCaps,
 } from '../../src/runtime/rendering/autoLightCap';
+import {
+  resolveTierOverrides, type TierRenderOverrides,
+} from '../../src/runtime/rendering/qualityTier';
 
 const LOW: LightCaps = { maxDirectional: 1, maxLocal: 1 };
 const UNCAPPED: LightCaps = { maxDirectional: 0, maxLocal: 0 };
@@ -172,6 +175,55 @@ describe('maskForObject', () => {
       expect(bits(maskForObject(lights, RUNAWAY, g, 9, 0, 0, ALL_LIGHTS_MASK, 1 << 4)))
         .toEqual([0, 1, 3]);
     });
+  });
+});
+
+describe('the AUTHORED hysteresisMargin reaches the selection (#353)', () => {
+  /** Every hysteresis test above builds its `LightCaps` BY HAND, so all of them would still pass
+   *  if `resolveTierOverrides` dropped `hysteresisMargin` on the way out of a project's
+   *  `project.config.json`. Nothing else covers that seam, and it cannot be covered by inspection:
+   *  all 24 project configs author `0.15` and the engine's own `TIER_SETTINGS` default is also
+   *  `0.15`, so **a value that coincides with the code default cannot tell "read" from "ignored"**
+   *  (CLAUDE.md § authoring surfaces — every field you expose must be READ).
+   *
+   *  So these perturb it in BOTH directions through the real resolution path: one case only passes
+   *  with a margin BELOW the default, the other only ABOVE it. No single wrong value — and in
+   *  particular not the 0.15 default, and not 0 — satisfies both. */
+  const authored = (low: Partial<TierRenderOverrides>) =>
+    resolveTierOverrides('low', { low: low as TierRenderOverrides });
+
+  // One incumbent, one challenger, `maxLocal: 1` — so exactly one survives and the assertion is
+  // which. Object sits at x=10: the incumbent (x=0) is 10 away, the challenger is nearer.
+  const near = [pt(0, 0), pt(1, 19.5)];   // challenger 9.5 away -> it wins only while margin < 0.0975
+  const clear = [pt(0, 0), pt(1, 18)];    // challenger 8   away -> it wins only while margin < 0.36
+  const INCUMBENT = 1 << 0;
+  const pick = (lights: CapLight[], margin: number | undefined) => bits(
+    maskForObject(lights, authored({ maxLocal: 1, maxDirectional: 0, hysteresisMargin: margin }),
+      0, 10, 0, 0, ALL_LIGHTS_MASK, INCUMBENT));
+
+  it('an authored margin BELOW the default lets a challenger through that the default would hold', () => {
+    expect(pick(near, 0.05)).toEqual([1]);   // authored 0.05 < 0.0975 -> challenger takes over
+    expect(pick(near, 0.15)).toEqual([0]);   // the default's own behaviour, for contrast
+  });
+
+  it('an authored margin ABOVE the default holds an incumbent the default would release', () => {
+    expect(pick(clear, 0.6)).toEqual([0]);   // authored 0.6 > 0.36 -> incumbent held
+    expect(pick(clear, 0.15)).toEqual([1]);  // the default's own behaviour, for contrast
+  });
+
+  it('a tier block that OMITS the field gets hysteresis off, not the engine default', () => {
+    // `hysteresisMargin` is not in `UNCLAMPED_OVERRIDES`, so `complete()` injects nothing for it —
+    // absent resolves to `undefined`, which `clampMargin` reads as 0. Worth pinning because the
+    // seeded fleet all carry the field today, so the omission path is otherwise unexercised.
+    //
+    // ⚠️ The key must be ABSENT, not present-and-undefined. `complete()` merges with
+    // `{ ...UNCLAMPED_OVERRIDES, ...o }` (`qualityTier.ts`), where a present `undefined`
+    // OVERWRITES a default and an absent key INHERITS it — so the two differ under exactly the
+    // change this guards. Written the other way first, and the close-out review measured it
+    // passing: adding `hysteresisMargin: 0.15` to `UNCLAMPED_OVERRIDES` left all 30 tests green.
+    const omitted = maskForObject(
+      near, authored({ maxLocal: 1, maxDirectional: 0 }), 0, 10, 0, 0, ALL_LIGHTS_MASK, INCUMBENT);
+    expect(bits(omitted)).toEqual([1]);
   });
 });
 

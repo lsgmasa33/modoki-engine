@@ -71,11 +71,21 @@ export const ads = {
  * `currentUser` resolving `null` matters just as much: a creative must read as a signed-out player
  * with no cloud save, not as an account whose progress failed to load.
  */
+/**
+ * A playable ad is a web creative, so it is neither iOS nor Android as far as the auth plugin is
+ * concerned — and `providersFor` is only ever consulted to decide which dead buttons to draw on a
+ * screen a playable never opens. Reporting `'web'` keeps that consistent with the real
+ * implementation's own fallback rather than inventing a third answer here.
+ */
+export function getPlatform(): string { return 'web'; }
+
+export function providersFor(_platform: string): { apple: boolean; google: boolean } {
+  return { apple: true, google: true };
+}
+
 export const auth = {
   async signInWithApple() { return PLAYABLE_NO_AUTH; },
   async signInWithGoogle() { return PLAYABLE_NO_AUTH; },
-  async continueAsGuest() { return PLAYABLE_NO_AUTH; },
-  async linkGuestTo(_provider: string) { return PLAYABLE_NO_AUTH; },
   async deleteAuthUser() { return PLAYABLE_NO_AUTH; },
   async currentUser() { return null; },
   async signOut(): Promise<void> {},

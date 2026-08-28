@@ -49,6 +49,7 @@ export {
   type DeviceListReply, type AndroidDeviceRow, type IosDeviceRow, type DeviceClaim,
 } from './panels/deviceConnectModel';
 export {
+  PREFAB_FORMAT_VERSION,
   serializePrefab, instantiatePrefab, instantiatePrefabAsync, setPrefabSource,
   getPrefabSource, setPrefabCache, getOverrides, getOverrideValues,
   captureInstanceOverrides, applyOverridesByRootInstance,
