@@ -28,7 +28,7 @@ import {
   texture, uv, mix, sin, cos, max, floor, abs, sign, select,
   positionLocal, normalLocal,
 } from 'three/tsl';
-import { renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, MAX_GPU_FORCES, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType } from './types';
+import { renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, MAX_GPU_FORCES, TEXTURE_WAIT_BUDGET_MS, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType } from './types';
 import { resolveCollider } from './colliders';
 import { resolveShape } from './emitterShapes';
 import { resolveGravity, type Vec3 } from './simSpec';
@@ -37,6 +37,7 @@ import { poolRevealDue } from './gpuPoolReveal';
 import { makeParticlePrimitiveGeometry } from './meshParticles';
 import { orientSampleUv, radialAlpha, softParticleFade, spriteFrameNode, spriteSheetUv } from './billboardTsl';
 import { textureProvider } from '../core/textureProvider';
+import { rawNow } from '../core/clock';
 import { warnVocabOnce } from '../core/warnVocab';
 
 function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Promise<THREE.Texture> {
@@ -192,6 +193,14 @@ interface GpuEntry {
   readyToken: number;
   textureRef: string;
   texture: THREE.Texture | null;
+  /** Waiting for a declared sprite to arrive, with the pool held at 0 instances meanwhile (#338
+   *  reopen). The CPU backends have had this since the first #338 pass; THIS ONE DID NOT, and it
+   *  is the worst place to be missing it: a 40k `fillPool` effect revealed before its sprite draws
+   *  40,000 radial soft-circles additively — measured at mean frame luma 241/255 on
+   *  `demos/particle-demo`'s Nebula, i.e. the full-screen white wash the issue reports. */
+  awaitingTexture: boolean;
+  /** `rawNow()` past which the pool is revealed untextured — see TEXTURE_WAIT_BUDGET_MS. */
+  textureDeadline: number;
   /** The renderer actually drawing this mesh, captured via onBeforeRender. Compute is
    *  dispatched against it so the buffers live on the same device that renders them
    *  (the editor has several renderers; a global "active renderer" would mismatch). */
@@ -293,10 +302,17 @@ export class GpuComputeBackend implements IParticleBackend {
       computeInit: null, computeUpdate: null, count: Math.max(1, def.maxParticles),
       playing: true, inited: false, revealed: false, framesSinceInit: 0, readyToken: 0,
       textureRef: def.render.mode === 'mesh' ? '' : (def.render.texture ?? ''), texture: null, renderer: null,
+      awaitingTexture: false, textureDeadline: 0,
     };
     this.build(entry, def);
     this.entries.set(id, entry);
-    if (entry.textureRef && def.render.mode !== 'mesh') this.loadTextureFor(entry);
+    if (entry.textureRef && def.render.mode !== 'mesh') {
+      // Arm the wait BEFORE starting the load: a warm texture resolves on a microtask, so the
+      // rebuild lands before anything is drawn and the pool is never actually seen held back.
+      entry.awaitingTexture = true;
+      entry.textureDeadline = rawNow() + TEXTURE_WAIT_BUDGET_MS;
+      this.loadTextureFor(entry);
+    }
     return { id };
   }
 
@@ -735,12 +751,24 @@ export class GpuComputeBackend implements IParticleBackend {
         // stale: the entry was disposed or its ref changed while we loaded. The texture
         // is shared + refcounted (texture-shader-font F3) — release our ref instead of
         // disposing, so a sibling emitter sharing the same sprite isn't torn out from under.
-        if (!this.entries.has(entry.id) || entry.textureRef !== ref) { releaseTexture3D(tex); return; }
+        if (!this.entries.has(entry.id) || entry.textureRef !== ref) {
+          releaseTexture3D(tex);
+          // ⚠️ Stop waiting on the way out — the CPU twin's #338 close-out F1, which applies
+          // verbatim here now that this path can hold a pool back: `setDef` swapping to an empty
+          // or mesh-mode ref starts NO replacement load, so returning silently would leave the
+          // pool at 0 instances with nothing left that could ever reveal it.
+          if (this.entries.has(entry.id)) entry.awaitingTexture = false;
+          return;
+        }
         releaseTexture3D(entry.texture); // release any prior texture this entry held before replacing
         entry.texture = tex;
-        this.build(entry, entry.def); // rebuild render with the texture
+        entry.awaitingTexture = false;
+        this.build(entry, entry.def); // rebuild render with the texture (re-hides; re-reveals when ready)
       })
-      .catch((e) => console.warn(`[gpu-particles] texture load failed: ${ref}`, e));
+      .catch((e) => {
+        entry.awaitingTexture = false; // a dead sprite must not hide the pool forever
+        console.warn(`[gpu-particles] texture load failed: ${ref}`, e);
+      });
   }
 
   getObject3D(handle: ParticleHandle): THREE.Object3D {
@@ -775,6 +803,10 @@ export class GpuComputeBackend implements IParticleBackend {
       this.revealWhenGpuWorkDone(e);
       return; // ⚠️ never reveal in the same call that dispatched — see gpuPoolReveal.ts
     }
+    // The texture deadline is spent here, alongside the readiness gate and BEFORE `update()`'s
+    // play gate, for the same reason: a paused pool must still converge (the Particle Editor
+    // pumps `update(h, 0)`), and reveal has no other source.
+    if (e.awaitingTexture && rawNow() >= e.textureDeadline) e.awaitingTexture = false;
     if (e.inited && !e.revealed && poolRevealDue(++e.framesSinceInit)) this.revealPool(e);
   }
 
@@ -808,9 +840,15 @@ export class GpuComputeBackend implements IParticleBackend {
   }
 
   /** Make the pool drawable. Guarded together so `revealed` can never latch true on an entry
-   *  whose mesh is missing (which would leave it permanently hidden AND permanently "revealed"). */
+   *  whose mesh is missing (which would leave it permanently hidden AND permanently "revealed").
+   *
+   *  ⚠️ TWO conditions, not one: the buffers must be filled AND the declared sprite must have
+   *  settled. Both callers can arrive first — `revealWhenGpuWorkDone` fires once, so this returning
+   *  early there would strand the pool if that were the only path; it is not, because
+   *  `ensurePoolReady`'s frame counter keeps re-trying every `update()` once `poolRevealDue` is
+   *  true, and clears `awaitingTexture` itself at the deadline. */
   private revealPool(e: GpuEntry): void {
-    if (!e.mesh) return;
+    if (!e.mesh || e.awaitingTexture) return;
     (e.mesh.geometry as THREE.InstancedBufferGeometry).instanceCount = e.count;
     e.revealed = true;
   }
@@ -884,7 +922,21 @@ export class GpuComputeBackend implements IParticleBackend {
     if (texChanged) { releaseTexture3D(e.texture); e.textureRef = newTexRef; e.texture = null; } // shared, refcounted (F3) — release
     if (structural) {
       this.build(e, def);
-      if (texChanged && newTexRef) this.loadTextureFor(e);
+      if (texChanged && newTexRef) {
+        // Re-arm the hidden-wait for the NEW sprite, exactly as create() does — otherwise a live
+        // texture swap in the Particle Editor reveals the rebuilt pool untextured for a frame.
+        e.awaitingTexture = true;
+        e.textureDeadline = rawNow() + TEXTURE_WAIT_BUDGET_MS;
+        this.loadTextureFor(e);
+      } else if (texChanged) {
+        e.awaitingTexture = false; // swapped to mesh mode / no sprite — nothing left to wait for
+      }
+      // ⚠️ `else if (texChanged)`, NOT a bare `else`. `structural` is true for a dozen non-texture
+      // reasons (maxParticles, blend, forces, collider shape…), so a bare else cleared the wait on
+      // ANY structural edit — including one made while the ORIGINAL sprite was still in flight,
+      // which reveals the untextured pool and is precisely the white wash this gate exists to
+      // prevent, reintroduced through the sweep that added it. Leaving the flag alone here is
+      // correct: `build()` above re-used the (still null) texture, so the wait is still owed.
     } else {
       applyUniforms(e.u, def);
       e.lut?.update(def);

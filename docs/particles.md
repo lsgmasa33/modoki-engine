@@ -118,21 +118,47 @@ visible. Which is also why restarting always looked clean.
 So the throwaway build happens off-screen and the emitter is revealed on the rebuild that has the
 texture: one visible start, no reset, and the sim the player sees begins at t=0 (a burst authored
 at 0 still fires on the frame they first see). **The wait is BOUNDED** —
-`TEXTURE_WAIT_BUDGET_FRAMES`, counted in `update()` calls so a paused emitter cannot burn it while
-frozen. Hiding until the texture lands is right for a showcase and wrong for gameplay VFX: a hit
-spark showing *nothing* while a large or cold KTX2 transcodes reads as a dropped effect, so past
-the budget the emitter is revealed untextured and picks up its sprite on arrival. A failed load
-reveals too — a 404 must never hide an emitter forever, and neither may a ref that `setDef` swaps
-away mid-load (that path starts no replacement load, so it reveals on the way out).
+`TEXTURE_WAIT_BUDGET_MS` (1500 ms of wall clock, read through `rawNow()`), spent before the play
+gate so a paused emitter cannot be stranded by it. Hiding until the texture lands is right for a
+showcase and wrong for gameplay VFX: a hit spark showing *nothing* while a large or cold KTX2
+transcodes reads as a dropped effect, so past the budget the emitter is revealed untextured and
+picks up its sprite on arrival. A failed load reveals too — a 404 must never hide an emitter
+forever, and neither may a ref that `setDef` swaps away mid-load (that path starts no replacement
+load, so it reveals on the way out). A `setDef` that swaps to a NEW sprite re-arms the wait, because
+the rebuild it triggers is untextured.
 
-⚠️ **What the budget does NOT buy:** past it, the late texture arrival still rebuilds, so the
+⚠️ **This budget was `TEXTURE_WAIT_BUDGET_FRAMES = 6` and both the number and the UNIT were wrong —
+that is the whole of #338's reopen.** The reasoning for frames was "a slower device drawing slower
+frames should get proportionally longer to load", which is backwards: what is being waited on is a
+network fetch plus a transcode, and neither cares about the frame rate (a 120 Hz desktop got 50 ms,
+a 30 Hz phone 200 ms, for the same download). Measured on the deployed
+`modoki-engine.com/particle-demo`, cold, in a fresh Chrome window: the sprite landed **~120 ms**
+after the emitter was created and the budget expired at **~80 ms**, so the very first station
+flashed on every cold load — invisible from the editor and from any warm reload, because a cached
+texture resolves on a microtask. See the reveal-is-not-a-degradation note below for why losing that
+race is so loud.
+
+⚠️ **Revealing untextured is the WRONG MATERIAL, not a lesser one — and describing it as a mild
+degradation is what let the budget stay too small.** An effect that declares a sprite never draws
+the radial fallback in steady state, and the fallback is far brighter per particle: a full-quad
+`radialAlpha()` at opacity 1, where an authored fire or dust sprite is mostly near-transparent.
+Measured on `demos/particle-demo` with texture responses held back at the server (CDP screencast →
+`ffmpeg signalstats` per-frame mean luma): the Fireball station reads **69 untextured at 61
+particles** and **49 textured at 292** — roughly 15x the light per particle — and the 40k GPU Nebula
+pool reaches **241 of 255, a full-screen white wash**. Before/after over the same experiment: 434
+untextured-visible frames and peak luma 241 → **0 frames and peak 121** (Nebula's own legitimate
+steady state) with an 800 ms delay, while a 3000 ms delay still falls back rather than hiding
+forever. That is #338's "burst": not extra particles, the wrong material.
+
+⚠️ **What the budget still does NOT buy:** past it, the late texture arrival still rebuilds, so the
 player sees the full reset rather than a texture pop. The budget trades *silence* for *a visible
 reset*, which is better but is not "no artifact" — removing it means letting the sim survive a
 render rebuild (`CpuParticleSim` holds `out` by reference, so a `setOutputs()` would do it), which
-is a lifecycle change deliberately left for its own change. The **`update()`-call** denominator
-matters here too: the budget is spent before the play gate (a paused emitter whose load went stale
-would otherwise be hidden forever) and never inside `advance()`, which `seek()`/`prewarm()` call in
-a loop — a counter there measures sim steps and a single scrub would spend the whole budget.
+is a lifecycle change deliberately left for its own change. The deadline is checked before the play
+gate (a paused emitter whose load went stale would otherwise be hidden forever) and in `update()`,
+never inside `advance()`, which `seek()`/`prewarm()` call in a loop — the old counter there measured
+sim steps and a single scrub spent the whole budget. A wall-clock deadline is immune to that by
+construction, since a synchronous loop spends no real time.
 
 ⚠️ **`buildChildRender()` rebuilds a sub-emitter child's `sim` as well as its render**, despite the
 name — so the identical defect exists one level down, and a late child texture deletes every
@@ -167,8 +193,21 @@ rebuild path, and each of those mints fresh buffers that must be hidden again. `
 then uploads the over-life LUTs explicitly rather than letting the first draw do it lazily, and
 reveals the pool only after `REVEAL_DELAY_FRAMES` (`gpuPoolReveal.ts`).
 
-⚠️ **Readiness runs even while PAUSED**, before `update()`'s play gate, and `seek()` reveals
-directly (it steps the buffers itself, so they are valid by construction). Both matter for the
+⚠️ **The pool waits for its declared SPRITE as well as for its buffers, and until #338's reopen it
+did not.** The CPU backends have held a textured emitter hidden since the first #338 pass; this one
+had no such gate at all, and revealed as soon as `computeInit` completed whatever the texture was
+doing. It is the worst place for the gap, because every effect the router sends here is a `fillPool`
+one — Nebula is 40,000 particles in a single frame — so the untextured build is the 241/255 white
+wash measured above. `revealPool()` therefore has TWO conditions (`!e.mesh || e.awaitingTexture`),
+and the frame backstop in `ensurePoolReady()` is what retries it: the `onSubmittedWorkDone` promise
+fires once, so a reveal blocked there would strand the pool if the counter were not still running
+underneath. Every exit — arrival, failure, a `setDef` that swaps the ref away, the deadline — clears
+`awaitingTexture`, for the same reason the CPU twin does.
+
+⚠️ **Readiness runs even while PAUSED**, before `update()`'s play gate. `seek()` deliberately does
+NOT reveal directly — it steps the buffers itself, but doing so in the same JS call as the dispatch
+is a ZERO-frame boundary, and a one-frame boundary is on the measured disproved list; it restarts
+the countdown and lets `ensurePoolReady` finish. Both matter for the
 Particle Editor, which stops driving `update()` when paused: without them, any structural edit made
 while paused left the preview EMPTY until the user pressed Play. The editor also calls
 `update(handle, 0)` while paused so readiness can converge with no simulation advancing.

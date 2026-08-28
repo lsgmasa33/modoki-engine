@@ -94,10 +94,10 @@
  *  boundary, when a one-frame boundary is on the disproved list above. It restarts the countdown
  *  instead and lets `ensurePoolReady` finish the job.
  *
- *  ## ⚠️ There is no readiness SIGNAL to use instead — checked, in three r184
+ *  ## ⚠️ The renderer API's two lookalike signals are TRAPS — checked, in three r184
  *
- *  The principled fix would be "reveal when the dispatch has demonstrably completed". That signal
- *  does not exist in the renderer API, and the two things that look like it are traps:
+ *  The signal actually used is raw `renderer.backend.device.queue.onSubmittedWorkDone()` (see
+ *  above). The two public methods that read like it are not:
  *
  *    - `Renderer.waitForGPU()` — WAS this signal. It is now a stub that only raises an error
  *      (three r184 `Renderer.js`, see mrdoob/three.js#32012).
@@ -105,9 +105,13 @@
  *      does not: the body awaits BACKEND INIT and then dispatches synchronously. Rewriting this
  *      gate as `await computeAsync(...)` would reintroduce the flash with a green gate.
  *
- *  The only true signal is raw `renderer.backend.device.queue.onSubmittedWorkDone()` — private,
- *  WebGPU-only, outside the `ComputeRenderer` seam this backend deliberately narrows to, and
- *  asynchronous onto some later frame anyway. The frame count is the right fix for today.
+ *  ## ⚠️ Filled buffers are only HALF of "drawable" (#338 reopen)
+ *
+ *  This file answers "have the buffers landed?". `revealPool` also requires "has the declared
+ *  SPRITE landed?" — see `gpuComputeBackend.awaitingTexture` and `TEXTURE_WAIT_BUDGET_MS`. Missing
+ *  that second condition produced the same symptom this gate exists to prevent, by a different
+ *  route: 40k instances of the untextured `radialAlpha()` fallback, measured at mean frame luma
+ *  241/255 on Nebula. If you are here because a pool flashes white, check BOTH gates.
  */
 export const REVEAL_DELAY_FRAMES = 6;
 

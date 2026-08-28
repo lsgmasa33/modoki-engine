@@ -11,9 +11,10 @@
  *  backend's own visibility decisions, never the mocks: a fake billboard cannot tell you whether
  *  a group was drawn, but `group.visible` is the backend's answer to exactly that question.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as THREE from 'three';
-import { defaultParticleEffect, type ParticleEffectDef } from '../../src/runtime/particles/types';
+import { defaultParticleEffect, TEXTURE_WAIT_BUDGET_MS, type ParticleEffectDef } from '../../src/runtime/particles/types';
+import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
 
 const h = vi.hoisted(() => ({
   /** Resolve the pending texture load by hand, so the test owns the timing. */
@@ -70,7 +71,15 @@ const plain = (): ParticleEffectDef => ({
   ...defaultParticleEffect(), render: { blend: 'additive' },
 }) as ParticleEffectDef;
 
-beforeEach(() => { h.resolveTex = null; h.rejectTex = null; h.simsBuilt = 0; h.childDef = null; });
+// ⚠️ The wait is a WALL-CLOCK deadline now, not a frame count (#338 reopen — six frames is ~80 ms
+// on a 75 Hz display and the deployed sprite landed at ~120 ms, so the very first station flashed
+// on every cold load). Pinning the manual clock is what makes these deterministic: without it
+// "hidden for 3 frames" would depend on how long the test machine took to run three calls.
+beforeEach(() => {
+  h.resolveTex = null; h.rejectTex = null; h.simsBuilt = 0; h.childDef = null;
+  setManualNow(0);
+});
+afterEach(() => { restoreRealClock(); });
 
 describe('a fresh emitter waits HIDDEN for its declared texture (#338)', () => {
   it('starts hidden, and is revealed by the texture arriving', async () => {
@@ -106,12 +115,23 @@ describe('a fresh emitter waits HIDDEN for its declared texture (#338)', () => {
 });
 
 describe('the wait is BOUNDED — silence is worse than an untextured frame (#338)', () => {
-  it('reveals untextured once the frame budget is spent', () => {
+  it('reveals untextured once the time budget is spent — and NOT before', () => {
     const be = new CpuTslBackend();
     const handle = be.create(textured());
     const group = be.getObject3D(handle);
     // Never resolve the texture — the pathological slow/cold case.
-    for (let i = 0; i < 20; i++) be.update(handle, 1 / 60);
+    // 20 frames' worth of update() calls with the clock barely moving: under the OLD frame-count
+    // budget this alone revealed the emitter, which is the whole of #338's reopen. Nothing about
+    // how many times update() is called may spend a network wait.
+    for (let i = 0; i < 20; i++) { advanceManual(1); be.update(handle, 1 / 60); }
+    expect(group.visible, '20 frames in 20 ms must not spend a 1.5 s budget').toBe(false);
+
+    advanceManual(TEXTURE_WAIT_BUDGET_MS - 21);
+    be.update(handle, 1 / 60);
+    expect(group.visible, 'one millisecond short of the deadline').toBe(false);
+
+    advanceManual(1);
+    be.update(handle, 1 / 60);
     expect(group.visible, 'must not stay invisible forever waiting on a texture').toBe(true);
   });
 
@@ -128,6 +148,7 @@ describe('the wait is BOUNDED — silence is worse than an untextured frame (#33
     const handle = be.create(textured());
     const group = be.getObject3D(handle);
     be.pause(handle);
+    advanceManual(TEXTURE_WAIT_BUDGET_MS);
     for (let i = 0; i < 20; i++) be.update(handle, 1 / 60);
     expect(group.visible, 'the wait is bounded even while paused').toBe(true);
   });
@@ -153,6 +174,72 @@ describe('the wait is BOUNDED — silence is worse than an untextured frame (#33
     h.rejectTex?.(new Error('404'));           // the way a missing/undecodable sprite fails
     await Promise.resolve(); await Promise.resolve();
     expect(group.visible, 'a dead texture must not hide the emitter forever').toBe(true);
+  });
+});
+
+describe('a live sprite SWAP re-arms the wait (#338 reopen sweep)', () => {
+  // `setDef` with a new texture ref is structural, so `build()` runs and rebuilds the billboard
+  // UNTEXTURED. Revealing that is the same wrong-material flash as a cold first activation, just
+  // reached through the Particle Editor instead — and the three backends must not disagree about
+  // it, since the whole reopen was one backend lacking the gate the others had.
+  const textured2 = (): ParticleEffectDef => ({
+    ...defaultParticleEffect(), render: { blend: 'additive', texture: 'other-guid' },
+  }) as ParticleEffectDef;
+
+  it('hides across the swap, and reveals on the NEW sprite', async () => {
+    const be = new CpuTslBackend();
+    const handle = be.create(textured());
+    const group = be.getObject3D(handle);
+    h.resolveTex?.({ dispose: vi.fn() });                 // settle the first sprite
+    await Promise.resolve(); await Promise.resolve();
+    expect(group.visible).toBe(true);
+
+    be.setDef(handle, textured2());                       // swap -> untextured rebuild
+    expect(group.visible, 'the rebuilt billboard has no sprite yet').toBe(false);
+
+    h.resolveTex?.({ dispose: vi.fn() });                 // the replacement load lands
+    await Promise.resolve(); await Promise.resolve();
+    expect(group.visible, 'the new sprite arrived — draw it').toBe(true);
+  });
+
+  it('a swap to NO sprite mid-wait reveals immediately, rather than waiting out the budget', async () => {
+    // Clearing the flag is not enough on this backend — the GROUP is what was hidden, so a bare
+    // `awaitingTexture = false` would leave it invisible. Before this branch existed the emitter
+    // depended on the in-flight promise's stale exit, which a hung fetch never reaches.
+    const be = new CpuTslBackend();
+    const handle = be.create(textured());
+    const group = be.getObject3D(handle);
+    expect(group.visible).toBe(false);
+    be.setDef(handle, plain());              // sprite removed while the first load is still pending
+    expect(group.visible, 'nothing left to wait for — draw it now').toBe(true);
+  });
+
+  it('a structural edit that does NOT touch the sprite leaves the wait owed', async () => {
+    // The mirror of the above, and the reason it is guarded on `texChanged`: revealing here would
+    // draw the untextured rebuild, which is the flash the whole change exists to remove.
+    const be = new CpuTslBackend();
+    const handle = be.create(textured());
+    const group = be.getObject3D(handle);
+    const bigger = { ...textured(), maxParticles: 4321 } as ParticleEffectDef;
+    be.setDef(handle, bigger);               // structural, same sprite, still in flight
+    expect(group.visible, 'the sprite is still owed').toBe(false);
+    h.resolveTex?.({ dispose: vi.fn() });
+    await Promise.resolve(); await Promise.resolve();
+    expect(group.visible, 'and it draws once the sprite lands').toBe(true);
+  });
+
+  it('is bounded across the swap too — a swap must not strand the emitter', async () => {
+    const be = new CpuTslBackend();
+    const handle = be.create(textured());
+    const group = be.getObject3D(handle);
+    h.resolveTex?.({ dispose: vi.fn() });
+    await Promise.resolve(); await Promise.resolve();
+
+    be.setDef(handle, textured2());                       // the replacement never arrives
+    expect(group.visible).toBe(false);
+    advanceManual(TEXTURE_WAIT_BUDGET_MS);
+    be.update(handle, 1 / 60);
+    expect(group.visible, 'a swap that never resolves must still time out').toBe(true);
   });
 });
 
@@ -193,6 +280,8 @@ describe('a SUB-EMITTER child waits hidden too — the same defect one level dow
   });
 
   it("a seek's advance() LOOP must not spend the child's budget", () => {
+    // Still true, and now true by construction rather than by placement: a synchronous loop
+    // spends no wall-clock time, so a deadline cannot be crossed by iterating it.
     // #338 close-out F3: the counter used to live in advance(), which seek()/prewarm() call in a
     // loop — a scrub to 2s runs ~120 iterations in ONE tick, revealing the child untextured six
     // steps in, long before any load could land. Frames, not sim steps.
@@ -210,7 +299,9 @@ describe('a SUB-EMITTER child waits hidden too — the same defect one level dow
     h.childDef = { ...defaultParticleEffect(), render: { blend: 'additive', texture: 'child-tex' } };
     const be = new CpuTslBackend();
     const handle = be.create(withChild());
-    for (let i = 0; i < 20; i++) be.update(handle, 1 / 60);   // never resolve the texture
+    be.update(handle, 1 / 60);                                 // builds the child + arms its wait
+    advanceManual(TEXTURE_WAIT_BUDGET_MS);
+    be.update(handle, 1 / 60);                                 // never resolve the texture
     const child = be.getObject3D(handle).children.find((o) => typeof o.name === 'string' && o.name.startsWith('subfx:'));
     expect(child?.visible, 'a child must not stay invisible forever either').toBe(true);
   });

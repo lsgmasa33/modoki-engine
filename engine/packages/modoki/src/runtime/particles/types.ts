@@ -550,9 +550,19 @@ export function defaultParticleEffect(): ParticleEffectDef {
  *
  *  Hiding until the texture lands is right for a showcase, and wrong for gameplay VFX: a hit
  *  spark or explosion that shows NOTHING while a large/cold KTX2 transcodes reads as a dropped
- *  effect. So the wait is capped — past the budget the emitter is revealed untextured (the radial
- *  soft-circle fallback it would have drawn anyway) and picks up its sprite when the load
- *  completes.
+ *  effect. So the wait is capped — past the budget the emitter is revealed untextured and picks
+ *  up its sprite when the load completes.
+ *
+ *  ⚠️ **Revealing untextured is NOT a mild degradation, and calling it one is what made this
+ *  budget too small.** An earlier version of this comment described the fallback as "the radial
+ *  soft-circle fallback it would have drawn anyway". It would not: an effect that declares a
+ *  sprite never draws the fallback in steady state, and the fallback is much BRIGHTER per
+ *  particle — a full-quad radial alpha at opacity 1, where an authored fire/dust sprite is mostly
+ *  near-transparent. Measured on `demos/particle-demo` served over the network (per-frame mean
+ *  luma from a CDP screencast): the Fireball station reads 69 untextured at 61 particles and 49
+ *  textured at 292 — roughly 15x the light per particle — and the 40k GPU Nebula pool reaches
+ *  **241 of 255, a full-screen white wash**. That is issue #338's "burst": not extra particles,
+ *  the wrong material. So the budget must be long enough that a cold FETCH normally wins it.
  *
  *  ⚠️ **Be precise about what that degradation actually is, because an earlier version of this
  *  comment overstated it.** It said "degrades to a texture pop rather than to silence". It does
@@ -567,9 +577,25 @@ export function defaultParticleEffect(): ParticleEffectDef {
  *  Deliberately NOT done here: it widens a close-out fix into a lifecycle change that wants its
  *  own review, and the path only fires when a texture takes longer than the budget.
  *
- *  Frames rather than milliseconds, deliberately: the cost being bounded is a RENDERING concern,
- *  and a slower device drawing slower frames should get proportionally longer to load. ~6 frames
- *  is 100ms at 60fps / 200ms at 30fps — under the ~100ms that reads as instant, and far longer
- *  than the 1-2 frames a warm or local texture actually needs.
+ *  ## Milliseconds, not frames — the unit was the bug
+ *
+ *  ⚠️ This was `TEXTURE_WAIT_BUDGET_FRAMES = 6` on the reasoning that "the cost being bounded is a
+ *  RENDERING concern, so a slower device drawing slower frames should get proportionally longer to
+ *  load". That is backwards. What is being waited on is a network FETCH plus a KTX2 transcode, and
+ *  neither has anything to do with the frame rate — a 120 Hz desktop gets 50 ms and a 30 Hz phone
+ *  gets 200 ms for the *same* download. Six frames is also simply too few: on the deployed
+ *  `modoki-engine.com/particle-demo`, cold, the sprite landed ~120 ms after the emitter was
+ *  created and the budget expired at ~80 ms, so the very first station flashed on every cold load
+ *  in a fresh Chrome window. That is the whole of #338's reopen.
+ *
+ *  1500 ms is chosen to lose the race only when the network is genuinely broken: it is ~12x the
+ *  measured cold-fetch latency, and the wait is paid at most ONCE per texture per session (a
+ *  second emitter on the same sprite hits the cache and resolves on a microtask, invisibly). The
+ *  trade it makes is explicit: a gameplay VFX whose sprite has never been fetched can be silent
+ *  for up to 1.5 s on its first use, rather than flashing white for that long and then resetting.
+ *
+ *  Wall-clock via `rawNow()` (the sanctioned clock wrapper), so `setManualNow`/`advanceManual`
+ *  drive it deterministically in tests and the determinism guard stays satisfied. It is a
+ *  presentation deadline, never game state.
  */
-export const TEXTURE_WAIT_BUDGET_FRAMES = 6;
+export const TEXTURE_WAIT_BUDGET_MS = 1500;

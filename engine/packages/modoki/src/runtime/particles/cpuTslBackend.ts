@@ -10,7 +10,8 @@
  */
 
 import * as THREE from 'three';
-import { TEXTURE_WAIT_BUDGET_FRAMES, renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type SubEmitter } from './types';
+import { TEXTURE_WAIT_BUDGET_MS, renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type SubEmitter } from './types';
+import { rawNow } from '../core/clock';
 import { CpuParticleSim } from './cpuSimulator';
 import { createBillboard, type BillboardObject } from './spriteBillboard';
 import { createMeshParticles } from './meshParticles';
@@ -56,7 +57,8 @@ interface SubChild {
   /** Same bounded hidden-wait as the parent (#338): `buildChildRender` rebuilds this child's SIM
    *  as well as its render, so a late texture wipes every injected particle. */
   awaitingTexture: boolean;
-  framesAwaitingTexture: number;
+  /** `rawNow()` past which the child is revealed untextured — see TEXTURE_WAIT_BUDGET_MS. */
+  textureDeadline: number;
 }
 
 interface Entry {
@@ -77,8 +79,10 @@ interface Entry {
   /** Waiting for a declared sprite texture to arrive, with the group HIDDEN meanwhile (#338).
    *  Cleared when the texture lands, when the wait budget expires, or when the load fails. */
   awaitingTexture: boolean;
-  /** update() calls spent hidden — bounded by TEXTURE_WAIT_BUDGET_FRAMES. */
-  framesAwaitingTexture: number;
+  /** `rawNow()` past which the emitter is revealed untextured — bounded by
+   *  TEXTURE_WAIT_BUDGET_MS. A wall-clock DEADLINE, not a frame count: the wait is on a network
+   *  fetch, whose latency is independent of the frame rate (see the constant's note). */
+  textureDeadline: number;
 }
 
 /** Cheap signature of a def's sub-emitter list to detect structural edits. */
@@ -110,7 +114,7 @@ export class CpuTslBackend implements IParticleBackend {
       id, def, group, seed, playing: true,
       textureRef: def.render.texture ?? '', texture: null,
       sim: null as unknown as CpuParticleSim, billboard: null as unknown as BillboardObject, trail: null,
-      subs: [], simTime: 0, awaitingTexture: false, framesAwaitingTexture: 0,
+      subs: [], simTime: 0, awaitingTexture: false, textureDeadline: 0,
     };
     this.build(entry, def);
     this.entries.set(id, entry);
@@ -118,7 +122,7 @@ export class CpuTslBackend implements IParticleBackend {
       // Hide BEFORE the load starts: a warm texture resolves on a microtask, so the reveal can
       // happen in the same tick and the emitter is never actually seen hidden.
       entry.awaitingTexture = true;
-      entry.framesAwaitingTexture = 0;
+      entry.textureDeadline = rawNow() + TEXTURE_WAIT_BUDGET_MS;
       entry.group.visible = false;
       this.loadTextureFor(entry);
     }
@@ -169,7 +173,7 @@ export class CpuTslBackend implements IParticleBackend {
         probRng: makeRng(seed ^ 0x5bd1e995),
         warnedTruncation: false,
         group: g, sim: null, render: null, trail: null, childDef: null,
-        texture: null, textureRef: '', awaitingTexture: false, framesAwaitingTexture: 0,
+        texture: null, textureRef: '', awaitingTexture: false, textureDeadline: 0,
       } satisfies SubChild;
     });
   }
@@ -226,7 +230,7 @@ export class CpuTslBackend implements IParticleBackend {
       // Latent today (no sub-emitter child in the repo declares a sprite) and reachable the
       // moment one does, which for a spark/debris child is an entirely ordinary thing to author.
       c.awaitingTexture = true;
-      c.framesAwaitingTexture = 0;
+      c.textureDeadline = rawNow() + TEXTURE_WAIT_BUDGET_MS;
       c.group.visible = false;
       loadTexture3D(texRef)
         .then((tex) => {
@@ -288,7 +292,6 @@ export class CpuTslBackend implements IParticleBackend {
   /** Sub-emitter twin of `revealEmitter`. */
   private revealChild(c: SubChild): void {
     c.awaitingTexture = false;
-    c.framesAwaitingTexture = 0;
     c.group.visible = true;
   }
 
@@ -296,7 +299,6 @@ export class CpuTslBackend implements IParticleBackend {
    *  that was never hidden (a mesh-mode or textureless effect). */
   private revealEmitter(entry: Entry): void {
     entry.awaitingTexture = false;
-    entry.framesAwaitingTexture = 0;
     entry.group.visible = true;
   }
 
@@ -351,7 +353,7 @@ export class CpuTslBackend implements IParticleBackend {
   update(handle: ParticleHandle, dt: number): void {
     const e = this.entries.get(handle.id);
     if (!e) return;
-    // ⚠️ The texture wait is spent BEFORE the play gate, and counted in update() CALLS rather
+    // ⚠️ The texture wait is spent BEFORE the play gate, and measured in WALL-CLOCK ms rather
     // than in simulated seconds (#338 close-out). An earlier version gated it on `playing`,
     // reasoning that a paused emitter should not burn its wait while frozen — which sounds right
     // and strands the emitter: reveal has only two sources, this counter and the texture promise,
@@ -361,16 +363,17 @@ export class CpuTslBackend implements IParticleBackend {
     // texture) → resolve the original load → 200 updates → still invisible. Real driver is the
     // Particle Editor, which pumps `update(h, 0)` while paused for exactly this reason — the same
     // mistake, and the same fix, as `gpuComputeBackend.ensurePoolReady`.
-    if (e.awaitingTexture && ++e.framesAwaitingTexture >= TEXTURE_WAIT_BUDGET_FRAMES) {
-      this.revealEmitter(e);
-    }
-    // ⚠️ The children's budgets are spent HERE too, not in `advance()` (#338 close-out F3).
+    const nowMs = rawNow();
+    if (e.awaitingTexture && nowMs >= e.textureDeadline) this.revealEmitter(e);
+    // ⚠️ The children's deadlines are checked HERE too, not in `advance()` (#338 close-out F3).
     // `advance()` is called in a LOOP by `seek()` and `prewarm()` — a scrub to 2s runs ~120
-    // iterations in one tick — so a counter living there measures SIM STEPS, and would reveal a
-    // child untextured six steps into a single synchronous scrub, long before any load could
-    // land. Frames are what the wait is denominated in; `update()` is the only per-frame call.
+    // iterations in one tick — so a counter living there measured SIM STEPS and revealed a child
+    // untextured six steps into a single synchronous scrub, long before any load could land. A
+    // wall-clock deadline is immune to that by construction (a synchronous loop spends no real
+    // time), but the check stays in `update()` anyway: it is the per-frame call, and a reveal is
+    // a render decision.
     for (const c of e.subs) {
-      if (c.awaitingTexture && ++c.framesAwaitingTexture >= TEXTURE_WAIT_BUDGET_FRAMES) this.revealChild(c);
+      if (c.awaitingTexture && nowMs >= c.textureDeadline) this.revealChild(c);
     }
     if (!e.playing) return;
     // Clamp the frame step once (shared ceiling with the GPU backend) and use
@@ -427,7 +430,22 @@ export class CpuTslBackend implements IParticleBackend {
     }
     if (structural) {
       this.build(e, def); // fresh sim → emission clock already clean
-      if (texChanged && newTexRef && !isMesh) this.loadTextureFor(e);
+      if (texChanged && newTexRef && !isMesh) {
+        // ⚠️ Re-arm the hidden-wait for the NEW sprite, exactly as create() does. `build()` above
+        // rebuilt the billboard UNTEXTURED, so without this a live sprite swap draws the radial
+        // fallback until the load lands — the same wrong-material flash as a cold first
+        // activation, just reached through the Particle Editor instead (#338 reopen sweep).
+        e.awaitingTexture = true;
+        e.textureDeadline = rawNow() + TEXTURE_WAIT_BUDGET_MS;
+        e.group.visible = false;
+        this.loadTextureFor(e);
+      } else if (texChanged && e.awaitingTexture) {
+        // Swapped to NO sprite (or to mesh mode) mid-wait: nothing will ever arrive, so stop
+        // waiting and draw. Guarded on `texChanged` for the GPU twin's reason — a structural edit
+        // that did not touch the texture leaves the original wait owed, and revealing there would
+        // draw the untextured rebuild.
+        this.revealEmitter(e);
+      }
     } else {
       e.sim.setDef(def);
       if (timingChanged) {

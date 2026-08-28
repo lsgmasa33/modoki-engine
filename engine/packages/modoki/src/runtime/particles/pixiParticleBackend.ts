@@ -17,10 +17,11 @@
 import { Container } from 'pixi.js';
 import type { Matrix4 } from 'three';
 import {
-  TEXTURE_WAIT_BUDGET_FRAMES,
+  TEXTURE_WAIT_BUDGET_MS,
   renderStructuralKey, clampSimDt, PREWARM_STEP, seekSteps,
   type IParticleBackendCore, type ParticleEffectDef, type ParticleHandle,
 } from './types';
+import { rawNow } from '../core/clock';
 import { CpuParticleSim } from './cpuSimulator';
 import { createPixiParticles, type PixiParticleObject } from './pixiParticleObject';
 import { resolveImageUrl } from '../core/textureRefs';
@@ -116,9 +117,10 @@ interface Entry {
   /** Seconds simulated so far — lets seek() step forward instead of re-simulating from zero. */
   simTime: number;
   /** Bounded hidden-wait for a declared sprite texture (#338) — see the 3D twin in
-   *  `cpuTslBackend`, whose `TEXTURE_WAIT_BUDGET_FRAMES` this shares by import. */
+   *  `cpuTslBackend`, whose `TEXTURE_WAIT_BUDGET_MS` this shares by import. */
   awaitingTexture: boolean;
-  framesAwaitingTexture: number;
+  /** `rawNow()` past which the emitter is revealed untextured. */
+  textureDeadline: number;
 }
 
 export class PixiParticleBackend implements IParticle2DBackend {
@@ -140,7 +142,7 @@ export class PixiParticleBackend implements IParticle2DBackend {
       wrapper: new Container(),
       sim: null as unknown as CpuParticleSim,
       obj: null as unknown as PixiParticleObject,
-      simTime: 0, awaitingTexture: false, framesAwaitingTexture: 0,
+      simTime: 0, awaitingTexture: false, textureDeadline: 0,
     };
     this.build(entry, def, null);
     this.entries.set(id, entry);
@@ -152,7 +154,7 @@ export class PixiParticleBackend implements IParticle2DBackend {
       // (nothing pairs `space:'2d'` with `render.texture` today), and fixing one while leaving
       // the other is how the second instance survives a sweep.
       entry.awaitingTexture = true;
-      entry.framesAwaitingTexture = 0;
+      entry.textureDeadline = rawNow() + TEXTURE_WAIT_BUDGET_MS;
       entry.wrapper.visible = false;
       this.loadTextureFor(entry);
     }
@@ -178,7 +180,6 @@ export class PixiParticleBackend implements IParticle2DBackend {
   /** Stop waiting on a texture and draw this emitter. Idempotent. */
   private revealEmitter(entry: Entry): void {
     entry.awaitingTexture = false;
-    entry.framesAwaitingTexture = 0;
     entry.wrapper.visible = true;
   }
 
@@ -235,9 +236,7 @@ export class PixiParticleBackend implements IParticle2DBackend {
     if (!e) return;
     // Spent BEFORE the play gate, for the reason the 3D twin documents at length: reveal has only
     // two sources, and a paused emitter whose load went stale would otherwise stay hidden forever.
-    if (e.awaitingTexture && ++e.framesAwaitingTexture >= TEXTURE_WAIT_BUDGET_FRAMES) {
-      this.revealEmitter(e);
-    }
+    if (e.awaitingTexture && rawNow() >= e.textureDeadline) this.revealEmitter(e);
     if (!e.playing) return;
     const cdt = clampSimDt(dt); // shared frame-step ceiling with the 3D backend
     e.sim.step(cdt);
@@ -286,7 +285,19 @@ export class PixiParticleBackend implements IParticle2DBackend {
     if (structural) {
       // Rebuild radial (no texture) first; async-load the new texture after, if any.
       this.build(e, def, null);
-      if (newTexRef) this.loadTextureFor(e);
+      if (newTexRef) {
+        // Re-arm the hidden-wait for the NEW sprite — the 3D twin's reasoning verbatim: the
+        // rebuild above is UNTEXTURED, so drawing it is the wrong material, not a lesser one.
+        e.awaitingTexture = true;
+        e.textureDeadline = rawNow() + TEXTURE_WAIT_BUDGET_MS;
+        e.wrapper.visible = false;
+        this.loadTextureFor(e);
+      } else if (e.awaitingTexture) {
+        // No sprite at all now — nothing will arrive, so stop waiting and draw. (No `texChanged`
+        // guard needed here, unlike the 3D twins: this backend reloads whenever `newTexRef` is
+        // set, so reaching this branch already means there is nothing outstanding.)
+        this.revealEmitter(e);
+      }
     } else {
       e.sim.setDef(def);
       // renderOrder is a cheap live tweak on the wrapper (what the Canvas2D sorts) — no rebuild.
