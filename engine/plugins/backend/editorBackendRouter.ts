@@ -25,6 +25,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
+import { relativiseUnderProject } from './projectPaths';
 import { readMetaSidecar, writeMetaSidecar } from '../meta-sidecar';
 import { readFontAxes } from '../font-instance';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash } from '../asset-fs-ops';
@@ -2435,6 +2436,9 @@ async function describeUnresolvedAgainstLiveWorld(
   // chooser for Project Settings path fields (icon source, SDK paths). Returns
   // the chosen path RELATIVE to the project when it lives inside it (e.g. an icon
   // under resources/), else the absolute path (e.g. a JAVA_HOME outside the repo).
+  // That decision — and WHY a tracked `app.iconSource` must never be absolute — is
+  // `relativiseUnderProject` (#394); it lives in its own module because this route
+  // blocks on a modal panel and cannot itself be tested.
   if (urlPath === '/api/pick-path' && method === 'POST') {
     try {
       const { mode = 'folder', prompt = 'Choose' } = (body ?? {}) as { mode?: 'file' | 'folder'; prompt?: string };
@@ -2454,9 +2458,7 @@ async function describeUnresolvedAgainstLiveWorld(
         // osascript exits non-zero on user cancel (-128).
         return json({ cancelled: true });
       }
-      const rel = path.relative(ctx.projectRoot, chosenAbs);
-      const inside = rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
-      return json({ path: inside ? rel : chosenAbs, abs: chosenAbs });
+      return json({ path: relativiseUnderProject(ctx.projectRoot, chosenAbs), abs: chosenAbs });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }

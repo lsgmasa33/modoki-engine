@@ -25,9 +25,9 @@
 import * as THREE from 'three';
 import {
   DEFAULT_TIER_SETTING, applyTierToThree, applyTierToPixi, applyTierToTargetFps,
-  resolveTierOverrides,
+  resolveTierOverrides, TIER_DEFAULT_FIELDS,
   type QualityTier, type QualityTierSetting, type TierResolution,
-  type TierRenderOverrides, type AuthoredTiers,
+  type TierRenderOverrides, type AuthoredTiers, type TierDefaultOverrides,
 } from './qualityTier';
 import { publishQualityTierChange } from './tierChangeNotify';
 
@@ -46,6 +46,27 @@ export interface ThreeRenderSettings {
   /** 'ACESFilmic' | 'AgX' | 'Neutral' | 'Linear' | 'None' */
   toneMapping: string;
   exposure: number;
+  // ── The project's authored DEFAULT-tier fields (#403) ──────────────────────────────────────
+  // Fed to `resolveTierOverrides` as `TierDefaultOverrides`, which is what makes them the base a
+  // `mid`/`low` config completes against. Each defaults to the engine identity, so a project that
+  // authors none of them resolves exactly as it did before these existed. See that type's doc for
+  // why they were tier-only until now.
+  /** May IBL light the scene at the default tier? Identity: `true`. */
+  ibl: boolean;
+  /** Ambient multiplier applied while `ibl` is false. Identity: `1`. */
+  iblOffAmbientBoost: number;
+  /** Exposure multiplier applied while `ibl` is false. Identity: `1`. */
+  iblOffExposure: number;
+  /** Ceiling on `Light.shadowMapSize` at the default tier. Identity: `0` (no ceiling). */
+  shadowMapCeiling: number;
+  /** Most directional lights an object may be lit by. Identity: `0` (unlimited). */
+  maxDirectional: number;
+  /** Most point/spot lights an object may be lit by. Identity: `0` (unlimited). */
+  maxLocal: number;
+  /** Light-selection hysteresis margin. Identity: `0` (off). */
+  hysteresisMargin: number;
+  /** Most lights that may render a shadow map per frame. Identity: `0` (unlimited). */
+  maxShadowCasters: number;
   /** A project's authored `mid`/`low` degradation configs (docs/rendering.md § "Quality tiers")
    *  — ABSENT, not an empty object, when the project has authored neither. Presence is the
    *  signal `configCount` (and, from A2, the boot-probe gate) reads. Fed straight through from
@@ -115,6 +136,16 @@ const DEFAULTS: Readonly<RenderSettings> = Object.freeze({
     antialias: true,
     pixelRatioCap: 2,
     shadows: true,
+    // The six #403 default-tier fields, each at the engine IDENTITY — the same value
+    // `UNCLAMPED_OVERRIDES` carries, which is what makes them a no-op until a project authors one.
+    ibl: true,
+    iblOffAmbientBoost: 1,
+    iblOffExposure: 1,
+    shadowMapCeiling: 0,
+    maxDirectional: 0,
+    maxLocal: 0,
+    hysteresisMargin: 0,
+    maxShadowCasters: 0,
     qualityTier: DEFAULT_TIER_SETTING,
     toneMapping: 'ACESFilmic',
     exposure: 1.2,
@@ -385,7 +416,57 @@ export function getActiveTierOrDefault(): QualityTier {
  *  around this accessor rather than through it — that is the failure this exists to make
  *  impossible ("prefer binding the whole thing over enumerating fields"). */
 export function getActiveTierOverrides(): TierRenderOverrides {
-  return resolveTierOverrides(getActiveTierOrDefault(), getRenderSettings().three.tiers);
+  return resolveTierOverridesFor(getActiveTierOrDefault());
+}
+
+/** {@link getActiveTierOverrides} for a tier that is NOT the active one — what the settings *would*
+ *  be if the device moved there. Calibration asks this about the tier above before promoting.
+ *
+ *  It exists so that question also goes through the one resolution point: calling
+ *  `resolveTierOverrides(up, settings.three.tiers)` directly would skip the project's authored
+ *  DEFAULT-tier fields (#403), and the resulting overrides would be a config no tier actually
+ *  resolves to — the exact "reads around this accessor" failure {@link getActiveTierOverrides}'s
+ *  doc calls out. */
+export function resolveTierOverridesFor(tier: QualityTier): TierRenderOverrides {
+  const s = getRenderSettings();
+  return resolveTierOverrides(tier, s.three.tiers, projectTierDefaults(s));
+}
+
+/** Memo for {@link projectTierDefaults}, keyed on the `three` block the defaults were read from.
+ *  `setRenderSettings` REPLACES `settings.three` rather than mutating it, so the key changes
+ *  exactly when the values do.
+ *
+ *  ⚠️ That holds only because **every field this memo reads lives on `three`** — which is now true
+ *  by construction (`TIER_DEFAULT_FIELDS`), not by coincidence. An earlier draft also lifted
+ *  `textureMaxSize` from the settings ROOT while keying on `three`; it was correct only via the
+ *  unrelated fact that `setRenderSettings` rebuilds `three` unconditionally, so an obvious future
+ *  optimisation (skip the spread when `next.three` is undefined) would have frozen that value at
+ *  its first-seen reading with no test failing. If a default-tier field is ever added OUTSIDE
+ *  `three`, this key must widen with it. */
+const tierDefaultsBySettings = new WeakMap<object, TierDefaultOverrides>();
+
+/** The project's authored DEFAULT-tier fields (#403), as the patch `resolveTierOverrides` takes.
+ *
+ *  ⚠️ **MEMOIZED, AND THAT IS LOAD-BEARING, NOT AN OPTIMISATION.** `resolveTierOverrides` keys its
+ *  own base memo on THIS OBJECT'S IDENTITY, so returning a fresh literal per call would miss that
+ *  cache every frame and re-merge the whole override set — in the render loop, on the weak hardware
+ *  the tier system exists for. One object per config load, reused for the life of that config.
+ *
+ *  ⚠️ `textureMaxSize` is deliberately ABSENT — it is the one tier field a project may not author
+ *  as a default, because the BUILD emits a downscaled variant only for a cap a `mid`/`low` tier
+ *  names. See the `textureMaxSize` row in `editor/panels/qualityTiersModel.ts` for the full
+ *  reasoning; authoring it here would store a number that changes nothing. */
+function projectTierDefaults(s: RenderSettings): TierDefaultOverrides {
+  let defaults = tierDefaultsBySettings.get(s.three);
+  if (!defaults) {
+    // Built from `TIER_DEFAULT_FIELDS`, never a written-out literal — see that constant for why.
+    // Every field it names lives on `three`, which is what lets the memo key be `s.three` alone.
+    defaults = Object.fromEntries(
+      TIER_DEFAULT_FIELDS.map((k) => [k, s.three[k]]),
+    ) as TierDefaultOverrides;
+    tierDefaultsBySettings.set(s.three, defaults);
+  }
+  return defaults;
 }
 
 /** Map a tone-mapping name to the THREE constant. Unknown → ACESFilmic. */

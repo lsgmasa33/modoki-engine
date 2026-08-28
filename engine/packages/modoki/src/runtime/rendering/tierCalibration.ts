@@ -42,11 +42,12 @@ import { forceResizeAllSurfaces } from './resizeBus';
 import {
   getActiveQualityTier, getAssessedQualityTier, setActiveQualityTier, getEffectiveThreeSettings,
   getEffectiveTargetFps, getRenderSettings, getActiveTierOverrides, getTierSwitchMessage,
+  resolveTierOverridesFor,
 } from './renderSettings';
 import { setTargetFPS } from './frameDriver';
 import {
   evaluateTierChange, freshTierChangeState, promotionCeiling, configCount,
-  tierAbove, applyTierToTargetFps, resolveTierOverrides, ASSUMED_UNCAPPED_FPS,
+  tierAbove, applyTierToTargetFps, ASSUMED_UNCAPPED_FPS,
   type QualityTier, type TierChangeState, type TierSource,
 } from './qualityTier';
 import { hasPlayerQualityTier } from './playerQualityTier';
@@ -326,9 +327,15 @@ export function applyActiveTierToRuntime(): void {
   const r = getActiveRenderer() as unknown as { shadowMap?: { enabled: boolean } } | null;
   const three = getEffectiveThreeSettings();
   if (r?.shadowMap) r.shadowMap.enabled = three.shadows;
-  // Texture LOD by quality tier (#212). Not a `ThreeRenderSettings` field — there is no
-  // project-authored counterpart to clamp against (unlike `pixelRatioCap`), so this reads the
-  // resolved tier's own `textureMaxSize` directly rather than through `getEffectiveThreeSettings`.
+  // Texture LOD by quality tier (#212). Read off the RESOLVED overrides rather than through
+  // `getEffectiveThreeSettings`, because there is no project-authored counterpart to clamp against
+  // (unlike `pixelRatioCap`) — the authored value lives ONLY on a `mid`/`low` tier.
+  // ⚠️ #403 made the other eight tier fields default-authorable and deliberately left this one out,
+  // so the sentence above still holds. It is the one field the BUILD honours rather than the
+  // runtime: `sizesToEmit` (vite-asset-scanner.ts) emits a downscaled variant only for a cap a
+  // tier names, so a default cap would select a file nothing built —
+  // `resolveTextureVariantUrl` guards that and falls back, which makes the field silently inert
+  // rather than loud. See the `textureMaxSize` row in `editor/panels/qualityTiersModel.ts`.
   // Written to the L0 seam (`runtime/core/textureSizeCap.ts`) so `textureResolver.ts` can read
   // it without `runtime/loaders` statically importing `runtime/rendering` — see that module's
   // header. No `forceResizeAllSurfaces()`-style re-apply needed: a texture in flight keeps
@@ -378,7 +385,7 @@ function promotionTargetFrameMs(tier: QualityTier): number {
   const up = tierAbove(tier);
   const settings = getRenderSettings();
   const fps = up
-    ? applyTierToTargetFps(settings.targetFps, resolveTierOverrides(up, settings.three.tiers))
+    ? applyTierToTargetFps(settings.targetFps, resolveTierOverridesFor(up))
     : settings.targetFps;
   return 1000 / (fps > 0 ? fps : ASSUMED_UNCAPPED_FPS);
 }

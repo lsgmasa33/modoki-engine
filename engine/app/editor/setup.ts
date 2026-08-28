@@ -417,7 +417,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               fields: [
                 { key: 'app.appId', label: 'Bundle ID', type: 'text' },
                 { key: 'app.appName', label: 'App name', type: 'text' },
-                { key: 'app.iconSource', label: 'App icon (source PNG)', type: 'path', pathMode: 'file', placeholder: 'empty = bundled Modoki icon', help: 'square, ≥1024px; all sizes generated on build' },
+                { key: 'app.iconSource', label: 'App icon (source PNG)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = bundled Modoki icon', help: 'square, ≥1024px; all sizes generated on build' },
                 { key: 'app.version', label: 'Version', type: 'text', placeholder: '1.0', help: 'marketing version, what players see in the store listing — synced into Android versionName + iOS MARKETING_VERSION on open and before every build' },
                 { key: 'app.buildNumber', label: 'Build number', type: 'number', placeholder: '1', disabledIf: { key: 'app.buildNumberAuto', is: 'true' }, help: 'BUMP BEFORE EVERY STORE UPLOAD (read-only while Auto is on — uncheck Auto to edit). Both stores refuse a build number they have already seen and do it SILENTLY — Play just reports "this release is empty". Synced into Android versionCode + iOS CURRENT_PROJECT_VERSION on open and before every build (not on save); never lowered — a lower value is reported in the log and ignored.' },
                 { key: 'app.buildNumberAuto', label: 'Auto build number', type: 'checkbox', help: 'ON = the build number above is IGNORED; versionCode / CFBundleVersion derive from this repo\'s total git commit count on every open/build — no more hand-bumping per upload. The stored number still acts as a floor; if a store ever demands a jump past it, uncheck Auto, type the higher number, and re-check.' },
@@ -447,8 +447,14 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               ],
             },
             {
+              // ⚠️ Engine Modules lives HERE, not on Graphics, and that was a deliberate audit
+              // finding (#403): `build.modules` toggles render3d/render2d/physics2d/physics3d AND
+              // video, so filing it under either Graphics or Physics would have been wrong for the
+              // other three. What it actually answers is "what ships in the build" — the same
+              // question as the two fields below it.
               title: 'Developer',
               fields: [
+                { key: 'build.modules', label: 'Engine modules', type: 'module-toggles', help: 'which engine seams ship in the build — Auto detects from the included scenes; Off lets the bundler drop the whole module (smaller playable ads / web builds).' },
                 { key: 'build.debugBuild', label: 'Debug build', type: 'checkbox', help: 'Ships the event journal (emit/modoki_journal), the in-game debug menu (F12 / 3-finger tap: stats, world, journal, device IP), and the debug bridge that device_* AI tools connect to — INCLUDING device_eval (arbitrary JS on the device). Turn ON for a QA/playtest/profiling build; leave OFF for release, where the debug menu and the bridge are tree-shaken out entirely (nothing to connect to) and the journal stops recording. Always on in the editor/dev. Rebuild to apply.' },
                 { key: 'build.textureTierVariants', label: 'Texture tier variants', type: 'select', options: labeled(TEXTURE_TIER_VARIANTS_MODES, {
                   auto: 'Auto (emit only when delivered over the wire)',
@@ -577,50 +583,52 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
           ],
         },
         {
-          title: 'Rendering & Physics',
+          // ⚠️ SPLIT FROM "Rendering & Physics" (#403). One tab held four unrelated groups and the
+          // tier matrix, which is the single longest surface in this dialog; physics shared it for
+          // no reason beyond both being "engine-ish". Engine Modules moved to General — see the
+          // note there for why neither half of this split was a correct home for it.
+          title: 'Graphics',
           groups: [
-            {
-              title: 'Engine Modules',
-              fields: [
-                { key: 'build.modules', label: '', type: 'module-toggles', help: 'which engine seams ship in the build — Auto detects from the included scenes; Off lets the bundler drop the whole module (smaller playable ads / web builds).' },
-              ],
-            },
-            {
-              title: 'Frame Loop',
-              fields: [
-                { key: 'rendering.targetFps', label: 'Target FPS', type: 'number', placeholder: '0 = uncapped (display refresh)', help: 'throttles the rAF loop to save battery/heat' },
-              ],
-            },
             {
               title: 'Three.js (3D)',
               fields: [
                 { key: 'rendering.three.backend', label: 'GPU backend', type: 'select', options: GPU_BACKENDS.map((v) => ({ value: v, label: v })), help: 'auto = detect, prefer WebGPU' },
-                // ⚠️ Ten fields across two consumption paths now (docs/rendering.md § "Quality tiers"),
-                // not four, and there are THREE tiers ('mid' authored separately below) — the old text said
-                // "four fields below" from when this dropdown was the only tier surface. ⚠️ Pinning a tier
-                // this project has NOT authored (via "quality-tiers" below) does NOTHING: every tier resolves
-                // to the unclamped default until a config exists for it (resolveTierOverrides falls back to
-                // the default, never invents clamping). The plan (§2.3) wants this dropdown filtered to only
-                // the tiers actually authored, which needs a new schema capability for dynamic (data-dependent)
-                // select options — out of scope for A3; tracked there, not half-built here.
-                { key: 'rendering.three.qualityTier', label: 'Quality tier', type: 'select', options: QUALITY_TIERS.map((v) => ({ value: v, label: v })), help: "auto = measure the device and pick among the tiers this project authored below. Pinning 'mid'/'low' does NOTHING unless that tier has been added under Quality Tiers — an unauthored tier always resolves the unclamped default. Takes effect on the next renderer bring-up — use the debug menu Device tab to preview it live" },
-                { key: 'rendering.three.antialias', label: 'Antialias', type: 'checkbox' },
-                { key: 'rendering.three.shadows', label: 'Shadows', type: 'checkbox' },
-                { key: 'rendering.three.pixelRatioCap', label: 'Pixel-ratio cap', type: 'number', placeholder: '2 (0 = uncapped)' },
+                // ⚠️ Pinning a tier this project has NOT authored (in the matrix below) does NOTHING:
+                // every tier resolves to the project's default until a config exists for it
+                // (resolveTierOverrides falls back to the default, never invents clamping). Filtering
+                // this dropdown to the authored tiers needs dynamic (data-dependent) select options,
+                // which the schema still cannot express — tracked, not half-built here.
+                { key: 'rendering.three.qualityTier', label: 'Quality tier (pin)', type: 'select', options: QUALITY_TIERS.map((v) => ({ value: v, label: v })), help: "auto = measure the device and pick among the tiers this project authored in the matrix below. Pinning 'mid'/'low' does NOTHING unless that tier column has been added — an unauthored tier resolves the Default column. Takes effect on the next renderer bring-up — use the debug menu Device tab to preview it live" },
                 { key: 'rendering.three.toneMapping', label: 'Tone mapping', type: 'select', options: TONE_MAPPINGS.map((v) => ({ value: v, label: v })) },
                 { key: 'rendering.three.exposure', label: 'Exposure', type: 'number', placeholder: '1' },
-                { key: 'rendering.three.tiers', label: 'Quality Tiers (mid / low)', type: 'quality-tiers', help: 'add a mid/low degradation on top of the default above — seeded from the engine\'s measured behaviour. No tiers authored = one config = the boot probe never runs.' },
               ],
             },
             {
               title: 'PixiJS (2D)',
               fields: [
                 { key: 'rendering.pixi.backend', label: 'GPU backend', type: 'select', options: GPU_BACKENDS.map((v) => ({ value: v, label: v })), help: 'auto = detect, prefer WebGPU' },
-                { key: 'rendering.pixi.antialias', label: 'Antialias', type: 'checkbox' },
+                // `resolution` is a PIN and is deliberately NOT in the tier matrix — a tier may not
+                // overrule a pin (capping one would make the pin a lie), so it has no Default/Mid/Low
+                // row and stays a plain field here.
                 { key: 'rendering.pixi.resolution', label: 'Resolution', type: 'number', placeholder: '0 = auto (devicePixelRatio)' },
-                { key: 'rendering.pixi.pixelRatioCap', label: 'Pixel-ratio cap', type: 'number', placeholder: '2 (0 = uncapped)' },
               ],
             },
+            {
+              // ⚠️ EVERY OTHER RENDERER FIELD IS IN HERE, not in the two groups above (#403).
+              // `pixelRatioCap`, `antialias`, `shadows`, `targetFps` and the two `pixi` twins used
+              // to sit in those groups AND again inside each tier card — the same setting authored
+              // in two places, with nothing saying they were the same setting. They now appear
+              // exactly once, in this matrix's Default column.
+              title: 'Quality Tiers',
+              fields: [
+                { key: 'rendering', label: '', type: 'quality-tiers', help: 'Default is what every device gets. Add Mid / Low to degrade on top of it for weaker hardware — each seeded from the engine\'s measured behaviour. No tiers added = one config = the boot probe never runs.' },
+              ],
+            },
+          ],
+        },
+        {
+          title: 'Physics',
+          groups: [
             {
               title: '2D Physics',
               fields: [

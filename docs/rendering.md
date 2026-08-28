@@ -834,8 +834,9 @@ read by live tier calibration as the device being slow — demoting it for a slo
 #### ⭐ A TIER'S CONTENT IS AUTHORED BY THE PROJECT — `TIER_SETTINGS` is only the seed
 
 Owner decision, 2026-08-11. The table above is **not** what runs any more; it is what a project
-**starts from**. A project authors its own degradation in **Project Settings → Rendering & Physics
-→ Three.js (3D)**, and the rule that shapes everything else is:
+**starts from**. A project authors its own degradation in **Project Settings → Graphics → Quality
+Tiers** (the tab was "Rendering & Physics" until #403 split it), and the rule that shapes everything
+else is:
 
 > **A project starts with ONE config — the default, which is what it authored — and *adds* a `mid`
 > and a `low` only if it wants degradation.**
@@ -845,13 +846,39 @@ exactly the bias CLAUDE.md's "Author values in the SCENE and the PREFAB" rule ex
 project could only pin *which row it got*, never say what a row meant — so postfx-demo, a post-FX
 *showcase*, had to drop the entire stack on `low` because the engine said so.
 
-- **The default is the ABSENCE of clamping**, not a stored object. `rendering.three` gains nothing;
-  only an added tier carries values (`rendering.three.tiers.{mid,low}`, both optional and **absent**
-  rather than empty when unauthored). That is what `high` already meant — the engine guarantees it
-  is a no-op — so this names existing behaviour. `UNCLAMPED_OVERRIDES` is the identity.
-  ⚠️ It is a **true** identity, which `TIER_SETTINGS.high` was not: that row carries
-  `pixelRatioCap: 2` and the clamp is `Math.min(authored, 2)`, so a project authoring 3 silently
-  got 2 (#200).
+- **The default is a config the project AUTHORS — amended by #403.** It used to be the pure absence
+  of clamping (`rendering.three` held nothing; `UNCLAMPED_OVERRIDES` was the identity and the only
+  base). That left the authoring surface **asymmetric**: `pixelRatioCap`, `antialias`, `shadows`,
+  `targetFps` and the two `pixi` twins had project-level fields, while `ibl`, `iblOffAmbientBoost`,
+  `iblOffExposure`, `shadowMapCeiling`, `maxDirectional`, `maxLocal`, `hysteresisMargin` and
+  `maxShadowCasters` existed **only inside a `mid`/`low` config** — so the author could *degrade*
+  eight values they had no way to *set*. Those eight are now real `rendering.three.*` fields, each
+  **defaulting to the engine identity**, and they form the base a tier is completed against
+  (`TierDefaultOverrides` → `resolveTierOverrides`'s third argument).
+  ⚠️ **`textureMaxSize` is deliberately NOT among them, and the reason is the build.** It does not
+  shrink a texture; it selects an already-emitted smaller variant, and `sizesToEmit`
+  (`vite-asset-scanner.ts`) emits those only for a cap a `mid`/`low` tier names. A default cap
+  would name a file nothing built — `resolveTextureVariantUrl` guards that
+  (`settings.sizes?.includes(cap)`), so it would not 404; it would store a number, display it, and
+  change nothing. Emitting for it would be the wrong shape too: if every device is capped, shipping
+  the full size alongside is waste, and under the `auto` emit gate it would work on a web build and
+  silently not on a native one. The knob for "never above N here" is that texture's own `maxSize`,
+  which caps at conversion time.
+  ⚠️ **A project that authors none of them still resolves `UNCLAMPED_OVERRIDES` BY REFERENCE.** The
+  all-identity patch short-circuits deliberately, and the reason is where the keys come from: no
+  `project.config.json` in the fleet contains them (checked across all 23 — the files stay minimal,
+  recording only what a project *chose*), but `mergeProjectConfig` overlays `DEFAULT_PROJECT_CONFIG`
+  before anything reaches `setRenderSettings`, so the **resolved** config every project hands the
+  engine carries all eight at their identity values. Without the short-circuit that resolved config
+  would produce a value-identical *copy* instead of the shared object, flipping every identity
+  comparison in the engine on the day the fields landed — a silent behaviour change from a feature
+  whose whole premise is that it is a no-op until authored.
+  ⚠️ `UNCLAMPED_OVERRIDES` is a **true** identity, which `TIER_SETTINGS.high` was not: that row
+  carries `pixelRatioCap: 2` and the clamp is `Math.min(authored, 2)`, so a project authoring 3
+  silently got 2 (#200).
+- **A tier still WINS over the default for any field it carries** — the default is a base, not an
+  override. What changed is where a tier's *missing* field comes from: the project's default, not
+  the engine's. Reaching past the author to a code constant is what the whole section is against.
 - **Resolution falls DOWN, never up.** A `low` on a project that authored only `mid` gets `mid` —
   the author's most conservative config is the closest thing to what they meant, and reaching for
   the unclamped default there would hand the weakest hardware the settings they were degrading away

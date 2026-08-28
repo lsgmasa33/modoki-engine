@@ -361,6 +361,46 @@ export interface ProjectConfig {
       /** Upper bound on devicePixelRatio (perf vs sharpness). */
       pixelRatioCap: number;
       shadows: boolean;
+      /** May image-based lighting (an HDR `Environment`) light the scene at the DEFAULT tier?
+       *
+       *  ⚠️ One of SEVEN fields (#403) that used to exist ONLY inside an authored `mid`/`low`
+       *  config, with the default hardcoded in the engine's `UNCLAMPED_OVERRIDES`. That made the
+       *  Project Settings tier matrix asymmetric — the author could degrade IBL on a weak device
+       *  but could not turn it off for the project — so the engine's identity value became this
+       *  authored default, defaulting to the same value it hardcoded. A project that never touches
+       *  it is byte-identical to before. */
+      ibl: boolean;
+      /** Multiplier on AMBIENT light intensity while `ibl` is false, to put back the fill light the
+       *  environment was providing. Identity: `1`.
+       *
+       *  ⚠️ Default-authorable BECAUSE `ibl` is (#403), not for symmetry's sake: a project that
+       *  turns IBL off at the default tier would otherwise have its scene go dark and flat with the
+       *  compensation pinned at the engine's no-op. A knob you cannot act on is worse than none. */
+      iblOffAmbientBoost: number;
+      /** Multiplier on tone-mapping exposure while `ibl` is false — the second half of the same
+       *  compensation as `iblOffAmbientBoost`. Identity: `1`. */
+      iblOffExposure: number;
+      /** Ceiling on `Light.shadowMapSize` at the DEFAULT tier, in texels. **0 = no ceiling** —
+       *  the identity, and the value the engine hardcoded before #403. */
+      shadowMapCeiling: number;
+      /** Most DIRECTIONAL lights an object may be lit by at the DEFAULT tier. **0 = unlimited**
+       *  (the identity). Directional is where the light cost lives — forward shading pays the full
+       *  BRDF per light per fragment (#403; see `TierRenderOverrides.maxDirectional`). */
+      maxDirectional: number;
+      /** Most POINT+SPOT ("local") lights an object may be lit by at the DEFAULT tier.
+       *  **0 = unlimited** (the identity). */
+      maxLocal: number;
+      /** Fraction in [0, 1) a challenger light must beat the incumbent selection by before it
+       *  replaces it, at the DEFAULT tier. **0 = off** (the identity), matching today's plain
+       *  nearest/most-effective selection. Inert unless `maxDirectional`/`maxLocal` cap something
+       *  — it damps the selection flapping those caps can otherwise produce near a tie (#353). */
+      hysteresisMargin: number;
+      /** Most lights that may RENDER a shadow map per frame at the DEFAULT tier.
+       *  **0 = unlimited** (the identity). Separate from `maxDirectional`/`maxLocal` (which cap
+       *  how many lights SHADE a fragment) and from `shadowMapCeiling` (which caps a map's SIZE,
+       *  not how many are rendered) — a shadow map is a whole extra submit of the caster set for
+       *  the whole scene, once per frame (#229). */
+      maxShadowCasters: number;
       /** Quality tier (#121): 'auto' delegates to the device allowlist + on-device calibration;
        *  'low'/'mid'/'high' pin it. A tier CLAMPS the settings above — it never raises them — so
        *  'high' is exactly today's behaviour and the fields beside it stay authoritative.
@@ -582,7 +622,17 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   rendering: {
     targetFps: 60, // matches the frame driver's historical default cap
     tierSwitchMessage: '', // empty = the engine's own default copy
-    three: { backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true, qualityTier: 'auto', toneMapping: 'ACESFilmic', exposure: 1.2 },
+    // ⚠️ The six #403 fields below (ibl … maxShadowCasters) each default to the value the engine
+    // previously hardcoded in `UNCLAMPED_OVERRIDES` — the IDENTITY. That is what makes making
+    // them authorable a no-op for every project that does not touch them, which was the condition
+    // for adding them at all.
+    three: {
+      backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true,
+      ibl: true, iblOffAmbientBoost: 1, iblOffExposure: 1,
+      shadowMapCeiling: 0, maxDirectional: 0, maxLocal: 0,
+      hysteresisMargin: 0, maxShadowCasters: 0,
+      qualityTier: 'auto', toneMapping: 'ACESFilmic', exposure: 1.2,
+    },
     pixi: { backend: 'auto', antialias: true, resolution: 0, pixelRatioCap: 2 },
     web: { sizeMode: 'free', width: 1280, height: 720 },
   },

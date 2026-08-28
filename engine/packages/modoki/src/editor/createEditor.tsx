@@ -428,6 +428,13 @@ export interface ProjectSettingsField {
   help?: string;
   /** For `path` fields — whether the Browse… button picks a file or a folder. */
   pathMode?: 'file' | 'folder';
+  /** For `path` fields — this value is COMMITTED (it lands in the tracked
+   *  `project.config.json`, not the gitignored `project.user.json`), so it must be
+   *  project-relative: an absolute path is dead on every other clone and in a copied-out
+   *  game (#394). The picker relativises what it can, but the field is also a text box and
+   *  a file outside the project has no relative form — so a machine-local value gets an
+   *  inline warning here, at the control that produced it, rather than only at the gate. */
+  committedPath?: boolean;
   /** `readonly-text` renders a disabled input showing the current value — for a
    *  setting that's DERIVED (e.g. `ota.publicKey`, written by a dedicated flow
    *  like the OTA Keys dialog), never hand-typed. Still persisted through the

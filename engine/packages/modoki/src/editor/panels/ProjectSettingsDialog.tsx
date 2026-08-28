@@ -10,6 +10,7 @@ import PhysicsLayersEditor from './PhysicsLayersEditor';
 import SceneListEditor from './SceneListEditor';
 import ModuleTogglesEditor from './ModuleTogglesEditor';
 import QualityTiersEditor from './QualityTiersEditor';
+import { committedPathWarning } from './projectSettingsPaths';
 
 type Values = Record<string, unknown>;
 
@@ -139,7 +140,11 @@ function FieldControl({ field, value, onChange, onPick }: {
             onChange={(e) => onChange(e.target.value.split('\n').map((s) => s.trim()).filter(Boolean))} />
         </div>
       );
-    case 'path':
+    case 'path': {
+      // #394 — said at the control, whatever produced the value: the picker relativises a file
+      // inside the project, but one outside it has no relative form and the text box takes
+      // anything. The gate guard catches a committed one; this catches it a step earlier.
+      const pathWarning = committedPathWarning(field, value);
       return (
         <div>{label}
           <div style={{ display: 'flex', gap: 6 }}>
@@ -152,8 +157,12 @@ function FieldControl({ field, value, onChange, onPick }: {
               }}>Browse…</button>
             )}
           </div>
+          {pathWarning && (
+            <div data-ui-id={`${uiId}.warning`} data-ui-kind="text" style={{ color: '#e0b060', fontSize: 11, marginTop: 3 }}>{pathWarning}</div>
+          )}
         </div>
       );
+    }
     case 'readonly-text':
       return (
         <div>{label}
@@ -250,7 +259,11 @@ export default function ProjectSettingsDialog() {
       onMouseDown={(e) => { if (e.target === e.currentTarget) close(); }}>
       <div style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6,
-        padding: '16px 20px', width: 540, maxWidth: '92vw', maxHeight: '85vh',
+        // 940, not the old 540: the Graphics tab's quality-tier MATRIX is four columns wide
+        // (#403) and a 540px dialog scrolled it sideways at every window size, which defeats the
+        // point of putting the tiers side by side. `92vw` still bounds it on a small display, and
+        // the narrower tabs simply centre their content rather than stretching.
+        padding: '16px 20px', width: 940, maxWidth: '92vw', maxHeight: '85vh',
         display: 'flex', flexDirection: 'column', fontFamily: 'monospace',
       }}>
         <div style={{ color: '#fff', fontSize: 13, fontWeight: 'bold', marginBottom: 12 }}>Project Settings</div>

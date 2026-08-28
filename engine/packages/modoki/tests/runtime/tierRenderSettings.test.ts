@@ -138,6 +138,12 @@ describe('getActiveTierOverrides', () => {
       textureMaxSize: 999,
       // #229's field, same argument once more: every engine table holds 0 or 1, never 3.
       maxShadowCasters: 3,
+      // #403. It became a field of `UNCLAMPED_OVERRIDES` — and so a field `hasEveryField` checks —
+      // when a project gained the ability to author it as a DEFAULT: a config that omits it must
+      // fall through to the project's value rather than be waved past as complete. So it is needed
+      // here for this config to still BE complete, which is what the `toBe` below rests on. 0.42
+      // appears in no engine table (they hold 0.15 or 0), same argument as every value above.
+      hysteresisMargin: 0.42,
     };
     setRenderSettings({ three: { tiers: { low: authoredLow } } });
     setActiveQualityTier({ tier: 'low', source: 'project', reason: 'test' });

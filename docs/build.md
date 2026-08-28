@@ -210,6 +210,23 @@ much it reads like one: `generate-icons.mjs` COPIES the resolved source there be
 Editing that file changes nothing and is overwritten on the next run — put the master somewhere
 tracked (`games/court/art/icon-app-master.png` is the worked example) and point `iconSource` at it.
 
+**Keep the committed value project-relative** (#394). `project.config.json` is tracked, so
+`/Users/<name>/Projects/modoki/games/court/art/…` is dead on every other clone, dead on `win`, and
+dead in a copied-out `games/<id>` (#29) — besides being a home path in a file `demos/`' publish
+scan hard-fails on. Project Settings' **Browse…** can only ever return an absolute path, so
+`/api/pick-path` relativises one that resolves under the project root (`relativiseUnderProject`,
+symlinked ancestors included) and keeps absolute only what genuinely escapes — which is right for
+the `user.sdk.*` fields, since those live in the gitignored `project.user.json`, and wrong here.
+Two routes still reach an absolute value in this field: **picking a file that lives outside the
+project** (it has no relative form) and typing one in. Neither is refused — the build honours an
+absolute `iconSource` — so instead the dialog shows an inline warning under any `committedPath`
+field holding a non-portable value (`committedPathWarning`: absolute, `~`, a drive letter, a `\`
+separator, or a `..` segment that escapes the project). The gate imports that same predicate rather
+than restating it, and
+`tests/architecture/trackedConfigPaths.test.ts` fails the gate before one reaches a commit. That
+guard reads the schema, so a new `type: 'path'` field outside `user.*` (#396's splash source) has
+to be listed in it or the guard goes red.
+
 Two things went wrong before it did:
 
 - The step ran on **every** native build, rewriting every tracked mipmap/splash PNG each time,
