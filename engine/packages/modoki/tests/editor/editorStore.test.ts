@@ -14,7 +14,7 @@ vi.mock('../../src/editor/undo/undoManager', () => ({
 }));
 
 // Must import after mocks are set up
-const { useEditorStore } = await import('../../src/editor/store/editorStore');
+const { useEditorStore, lsBool, lsEnum } = await import('../../src/editor/store/editorStore');
 const { get2DDirtyVersion } = await import('../../src/editor/store/canvas2DDirty');
 const { DEVICE_PRESETS, makeCustomPreset } = await import('../../src/editor/scene/devicePresets');
 
@@ -382,11 +382,13 @@ describe('editorStore', () => {
 
   describe('gizmo mode/space/pivot + particlePreview persistence (#399)', () => {
     // This env has no localStorage — install a stub for the duration of each test (same
-    // pattern as the sceneViewMode/animationViewMode positive control above) so writes have
-    // somewhere to land instead of the check passing vacuously against a missing global.
-    function withLocalStorageStub(run: (writes: string[]) => void) {
-      const writes: string[] = [];
-      const stub = { getItem: () => null, setItem: (k: string) => { writes.push(k); }, removeItem: () => {} };
+    // pattern as the sceneViewMode/animationViewMode positive control above). Records
+    // [key, value] PAIRS, not just keys: a mutation test (deliberately corrupting the write
+    // to `localStorage.setItem('editor:gizmoMode', 'BOGUS')`) showed a keys-only assertion
+    // passes even when the persisted VALUE is wrong (close-out review finding #2).
+    function withLocalStorageStub(run: (writes: [string, string][]) => void) {
+      const writes: [string, string][] = [];
+      const stub = { getItem: () => null, setItem: (k: string, v: string) => { writes.push([k, v]); }, removeItem: () => {} };
       const g = globalThis as { localStorage?: unknown };
       const had = 'localStorage' in g;
       const prev = g.localStorage;
@@ -395,21 +397,62 @@ describe('editorStore', () => {
       finally { if (had) g.localStorage = prev; else delete g.localStorage; }
     }
 
-    it('setGizmoMode/Space/Pivot each persist their own key', () => {
+    it('setGizmoMode/Space/Pivot each persist their own key AND value', () => {
       withLocalStorageStub((writes) => {
         useEditorStore.getState().setGizmoMode('rotate');
         useEditorStore.getState().setGizmoSpace('local');
         useEditorStore.getState().setGizmoPivot('center');
-        expect(writes).toEqual(['editor:gizmoMode', 'editor:gizmoSpace', 'editor:gizmoPivot']);
+        expect(writes).toEqual([
+          ['editor:gizmoMode', 'rotate'],
+          ['editor:gizmoSpace', 'local'],
+          ['editor:gizmoPivot', 'center'],
+        ]);
       });
     });
 
-    it('setParticlePreview persists', () => {
+    it('setParticlePreview persists true/false as "1"/"0"', () => {
       withLocalStorageStub((writes) => {
         useEditorStore.getState().setParticlePreview(true);
         expect(useEditorStore.getState().particlePreview).toBe(true);
-        expect(writes).toEqual(['editor:particlePreview']);
+        useEditorStore.getState().setParticlePreview(false);
+        expect(writes).toEqual([['editor:particlePreview', '1'], ['editor:particlePreview', '0']]);
       });
+    });
+
+    // The tests above only exercise the WRITE half. The bug #399 fixes is the READ half — the
+    // initial state computed at STORE-CREATION time (module load), before any React render —
+    // which the store-level tests above never touch (the store is already constructed by the
+    // time they run). `lsBool`/`lsEnum` are the exact functions the initial-state block calls,
+    // so test them directly rather than reconstructing the store (see the export's doc comment
+    // for why re-importing the module is the wrong way to do this in this shared test file).
+    it('lsBool/lsEnum restore a valid persisted value and fall back to the default otherwise', () => {
+      // Unlike `withLocalStorageStub` above (a write-only recorder — `getItem` always returns
+      // null), this needs a REAL get/set round trip to exercise the restore path.
+      const values = new Map<string, string>();
+      const stub = {
+        getItem: (k: string) => (values.has(k) ? values.get(k)! : null),
+        setItem: (k: string, v: string) => void values.set(k, v),
+        removeItem: (k: string) => void values.delete(k),
+      };
+      const g = globalThis as { localStorage?: unknown };
+      const had = 'localStorage' in g;
+      const prev = g.localStorage;
+      g.localStorage = stub;
+      try {
+        localStorage.setItem('k1', '1');
+        expect(lsBool('k1', false)).toBe(true);
+        expect(lsBool('missing', false)).toBe(false);
+        expect(lsBool('missing', true)).toBe(true);
+
+        localStorage.setItem('k2', 'rotate');
+        expect(lsEnum('k2', ['translate', 'rotate', 'scale'] as const, 'translate')).toBe('rotate');
+        // A foreign/stale value (an older build's different enum member, or corrupted storage)
+        // must fall back, not propagate — GizmoToolbar can only render a known mode.
+        localStorage.setItem('k3', 'BOGUS');
+        expect(lsEnum('k3', ['pivot', 'center'] as const, 'pivot')).toBe('pivot');
+      } finally {
+        if (had) g.localStorage = prev; else delete g.localStorage;
+      }
     });
   });
 

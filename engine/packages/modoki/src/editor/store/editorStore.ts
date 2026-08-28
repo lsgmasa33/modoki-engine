@@ -38,12 +38,19 @@ function saveCamGizmoShown(s: Set<string>): void {
 // Small typed readers for the `editor:*`-prefixed localStorage prefs below (gizmo mode/space/
 // pivot, particle preview) — same "editor-only display preference, not scene data" rationale as
 // CAM_GIZMO_LS_KEY above, just for values that aren't a per-guid set.
-function lsBool(key: string, fallback: boolean): boolean {
+// Exported (not just module-scope) so the "restores from localStorage / falls back for a
+// foreign value" logic — the actual READ half of the persistence fix — is directly
+// unit-testable. The store's initial-state block below only runs ONCE at module load, before
+// any test can install a localStorage stub, so testing it via the constructed store would
+// need `vi.resetModules()` — which desyncs this file's OTHER dynamic re-imports (spriteAnim/
+// particle/animation/timeline caches) from the statically-imported singletons editorStore.ts
+// itself uses, corrupting unrelated tests. Testing the pure functions directly avoids that.
+export function lsBool(key: string, fallback: boolean): boolean {
   if (typeof localStorage === 'undefined') return fallback;
   const v = localStorage.getItem(key);
   return v === null ? fallback : v === '1';
 }
-function lsEnum<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+export function lsEnum<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
   if (typeof localStorage === 'undefined') return fallback;
   const v = localStorage.getItem(key);
   return v !== null && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;

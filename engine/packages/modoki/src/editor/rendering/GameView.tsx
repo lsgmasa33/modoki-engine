@@ -15,7 +15,7 @@ import DevicePicker from './DevicePicker';
 import SafeAreaOverlay from './SafeAreaOverlay';
 import { DebugMenu } from '../../runtime/debug';
 import { VideoOverlay } from '../../runtime/video/VideoOverlay';
-import { loadGameViewMuted, saveGameViewMuted, loadGameViewShowColliders, saveGameViewShowColliders } from './gameViewPrefs';
+import { saveGameViewMuted, loadGameViewShowColliders, saveGameViewShowColliders, resolveInitialGameViewMute } from './gameViewPrefs';
 
 // ── Main GameView ───────────────────────────────────────
 
@@ -47,11 +47,10 @@ export default function GameView({ uiLayer }: GameViewProps) {
     setShowColliders(next);
     saveGameViewShowColliders(next);
   }, []);
-  // Unity-style "Mute Audio" — silences all game audio during editing/preview. Persisted (#399)
-  // the same way as showColliders above.
-  const [muted, setMuted] = useState(loadGameViewMuted);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { setAudioMuted(muted); }, []);
+  // Unity-style "Mute Audio" — silences all game audio during editing/preview. Persisted
+  // across a RELOAD (#399) but not stomped on a same-session remount — see
+  // `resolveInitialGameViewMute`'s doc comment for why that distinction matters.
+  const [muted, setMuted] = useState(() => resolveInitialGameViewMute(isAudioMuted, setAudioMuted));
   const toggleMute = useCallback(() => {
     const next = !isAudioMuted();
     setAudioMuted(next);

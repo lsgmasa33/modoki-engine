@@ -28,6 +28,7 @@ import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
 import CurveEditor from './particle/CurveEditor';
+import { loadParticleEditorShowFloor, saveParticleEditorShowFloor } from './particleEditorPrefs';
 import { DEFAULT_CURVE_POINTS, withCurvePoints, withCurveScale } from './particle/curveMath';
 import GradientEditor from './particle/GradientEditor';
 import { displayElapsed } from './particle/previewMath';
@@ -66,7 +67,10 @@ export default function ParticleEditor() {
   const [playing, setPlaying] = useState(true);
   const [elapsed, setElapsed] = useState(0);
   const [sceneReady, setSceneReady] = useState(false);
-  const [showFloor, setShowFloor] = useState(false);
+  const [showFloor, setShowFloorState] = useState(loadParticleEditorShowFloor);
+  const setShowFloor = (next: boolean | ((prev: boolean) => boolean)) => {
+    setShowFloorState((prev) => { const on = typeof next === 'function' ? next(prev) : next; saveParticleEditorShowFloor(on); return on; });
+  };
 
   // ── Viewport (renderer / scene / camera / orbit / rAF) ──
   useEffect(() => {
@@ -271,9 +275,14 @@ export default function ParticleEditor() {
 
   // Toggle the opaque ground plane. Off by default (it occludes particles behind it);
   // turn on as a ground reference or to preview soft particles fading against it.
+  // `sceneReady` is in the deps (not just `showFloor`): the viewport effect above creates
+  // `floor` inside an async IIFE, so on mount this effect can run BEFORE `floorRef.current`
+  // exists — without `sceneReady` it silently no-ops once and never re-runs (`showFloor`
+  // itself doesn't change), so a persisted `showFloor:true` renders the toolbar button ON
+  // with no ground plane actually drawn (#399 close-out review).
   useEffect(() => {
     if (floorRef.current) floorRef.current.visible = showFloor;
-  }, [showFloor]);
+  }, [showFloor, sceneReady]);
 
   // ── Edit helper: apply an immutable change to the def AND record it on the GLOBAL
   // undo stack (the same one Hierarchy/Inspector/SceneView use). `group` keys

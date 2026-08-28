@@ -91,14 +91,15 @@ The menu bar (`File` / `Edit` / `View`, plus host-injected menus) is rendered by
 
 ⚠️ **"Save Layout" covers only the panel ARRANGEMENT above — not other session options** (#399).
 Toggles like Mute Audio, GameView's Show Colliders, SceneView's View ▾ menu (Grid/Colliders/
-layers) and particle preview, and the gizmo mode/space/pivot, are separate `localStorage` keys
-(`editor:gizmoMode`, `editor:sceneViewOptions`, `editor/rendering/gameViewPrefs.ts`'s
-`editor:gameViewMuted`/`editor:gameViewShowColliders`, etc. — same `editor:`-prefixed convention
-as `editorStore.ts`'s `CAM_GIZMO_LS_KEY`/`showFocusGraph`), each read on mount and written on
-change, independent of the layout save/load flow. Adding a new persistent editor-only toggle:
-follow that convention (a small `load*`/`save*` pair beside the component, or an inline
-`localStorage.getItem`/`setItem` in a Zustand setter) rather than folding it into layout JSON —
-layout is FlexLayout's `Model`, not a general prefs bag.
+layers), the Particle Editor's ground-plane toggle, and particle preview, and the gizmo
+mode/space/pivot, are separate `localStorage` keys (`editor:gizmoMode`, `editor:sceneViewOptions`,
+`editor/rendering/gameViewPrefs.ts`'s `editor:gameViewMuted`/`editor:gameViewShowColliders`,
+`editor/panels/particleEditorPrefs.ts`'s `editor:particleEditorShowFloor`, etc. — same
+`editor:`-prefixed convention as `editorStore.ts`'s `CAM_GIZMO_LS_KEY`/`showFocusGraph`), each
+read on mount and written on change, independent of the layout save/load flow. Adding a new
+persistent editor-only toggle: follow that convention (a small `load*`/`save*` pair beside the
+component, or an inline `localStorage.getItem`/`setItem` in a Zustand setter) rather than
+folding it into layout JSON — layout is FlexLayout's `Model`, not a general prefs bag.
 
 ### `createEditor()` — host configuration
 
