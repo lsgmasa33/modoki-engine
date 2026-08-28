@@ -117,6 +117,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 
 | Doc | What it is |
 |---|---|
+| [projects.md](./projects.md) | **Private** (excluded from the OSS snapshot) — the full per-project roster of `games/` + `demos/`, every test fixture included, with what each one is and which natives it carries. CLAUDE.md keeps the `games/`-vs-`demos/` *rule*; this is the catalog |
 | [task-claiming.md](./task-claiming.md) | **Normative** — how concurrent Claude sessions across the four clones claim work without duplicating it: open work is GitHub Issues (a live query, no push/fetch delay), one `wip/*` label per clone, release-on-abandon, correcting an issue your work disproves, closing it yourself once done + verified (`Fixes #N` is the link, not the trigger), and what stays in `todo.md` instead |
 | [unity-vs-react-pixijs.md](./unity-vs-react-pixijs.md) | Point-in-time evaluation comparing Unity against a React + PixiJS/Three.js web stack for 2D puzzle games |
 | [reviews/](./reviews/) | Dated point-in-time architecture/code reviews — incl. the [2026-07-30 MCP tool-quality audit](./reviews/2026-07-30-mcp-tool-audit.md) (**78 findings, all closed**; the appendices at the END are the useful part — what was measured, and several self-corrections), and the [carried-instance-overrides investigation](./reviews/a9-carried-instance-overrides-investigation.md) (resolved 2026-07-26) |

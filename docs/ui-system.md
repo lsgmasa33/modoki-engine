@@ -777,6 +777,41 @@ And **the 2-D grid is genuinely heavy**: 229 DOM entities is ~7× the strip's, a
 p95 at 66 ms. That is the cost of a grid on a Mali-G57, not a defect — but it is the number to
 weigh before making Court's page a scrolling grid rather than a pager.
 
+### Focus follows the ENTRY across recycling — measured
+
+`games/scroll-demo`'s `row.prefab.json` authors `UIFocusable` for one reason: nothing else in the
+repo does. Court's selector is pointer-driven and uses no focus nav, so the engine's
+focus-on-recycle re-target (`runtime/ui/entriesFocus.ts`) had zero live callers before this — the
+same "an API nothing calls" shape as `scrollTo`'s buttons, one layer up.
+
+`uiFocusSystem` autofocuses the first row on Play, and as you scroll the focus ring stays on the
+same **Entry N** while hopping between pooled entities. Measured in the editor 2026-08-22 — a
+wheel up from `scrollTop` 363 to 123 moved the ring from entity **22 to 24** with its label still
+reading `Entry 1`, while entity 22 went on to show `Entry 0`. That second half is the bug being
+prevented: without the re-target the ring would have sat on entity 22 and the player would have
+been on `Entry 0` believing they were on `Entry 1`.
+
+### Status (#250, #316, #321)
+
+Built as the live verification harness for #250 and kept as `games/scroll-demo`. All three of the
+plan's cases are authored and were measured in a running editor (2026-08-21) — and authoring the
+two new ones is what found three engine defects the vertical strip could not expose: the
+collapsing content box, a resize that never re-laid-out, and `scroll-snap-align` that no code ever
+applied. All three were then flung on a Galaxy A23 with real touch input — no blank frames on any
+shape, and a defect that only a device could show: the overscan raise fed itself, so a grid nobody
+was touching re-drove its pool on 102 of 154 frames (see "Measured on the low-end target" above).
+`wheel` and `scrollbar` were authored on the pager on 2026-08-22 (#321) and measured in the editor
+the same day: a trusted 480px wheel advances the pager **exactly one page** (410px) and three
+gestures in a row land +1, +1, +1 with a reverse flick at -1, while the identical wheel on the
+strip travels 363px freely — the half that proves the `'native'` default survived. And the two
+boxes read `clientWidth == offsetWidth` (pager, `scrollbar: 'hidden'`) against **447 vs 462**
+(strip, the `'auto'` default): the 15px a classic desktop scrollbar steals, measured on the same
+machine in the same session rather than quoted.
+
+The Court migration landed on 2026-08-21 (#316) — Court's level selector is a pager over this same
+mechanism, with a 5x5 page as the entry, and wiring its arrows to `scrollToEntry` immediately
+found two engine defects this harness had not.
+
 `entryWidth`/`entryHeight` of **`0` means "read it from the prefab root"**, so a fixed-size entry
 is not a second copy of a number the prefab already states; `%` resolves against the viewport,
 which is how a pager is expressed.

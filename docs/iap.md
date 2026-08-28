@@ -211,6 +211,26 @@ it through `registerPlugin` by name with a type-only import, so nothing pulls it
 
 ## 7. Platform notes
 
+### Current state — honest inventory (`games/iap-test`)
+
+**Phases 1–3, 5 and 6 are landed and working on real hardware.** Phase 4 (server verification) was
+declined by the owner in favour of local on-device verification; the `PurchaseVerifier` seam ships
+empty so it can land later without touching the state machine.
+
+| | Android | iOS |
+|---|---|---|
+| Purchase → grant → persist → consume | ✅ verified on a Galaxy A23 | ✅ verified on the iPhone Air |
+| Products loading | both products resolve — `com.modoki.subscription` was created in Play Console 2026-08-11 | `store: 2/2` **from the real App Store sandbox** (2026-08-12, once each product had localization text) |
+| Subscription purchase + entitlement | ✅ **bought through REAL Play billing** on the A23 (owner, 2026-08-11) | ✅ **bought through the REAL App Store sandbox** (owner, 2026-08-12) |
+| **Force-quit recovery — the requirement** | ✅ **verified 2026-08-11** | ✅ **verified 2026-08-11** — driven through Xcode's Manage Transactions on the local catalog, which is now DELETED; re-running it needs the sandbox's own tools + the `holdPoint` harness |
+| Real store sandbox | ✅ **fully exercised** — internal testing track, both products, a real subscription purchase | ✅ **working** — the local catalog was deleted 2026-08-12 (see below for the two wrong diagnoses it took) |
+
+**Both platforms now run against their REAL store sandboxes** — Play via the internal testing
+track (2026-08-11), the App Store once each product had localization text (2026-08-12) — so every
+claim below is backed by a real store rather than by a mock or a local catalog. #201 is closed out
+with the diagnosis below; what is left there is optional tidying (a stray `com.modoki.iap1`
+consumable) rather than a blocker.
+
 ### iOS — the real App Store sandbox is the loop
 
 The fixture talks to the **real sandbox**: both products load and purchase there. The local
@@ -233,7 +253,9 @@ theories; two were recorded here before the right one, and both were wrong:
 What actually fixed it, twice: **adding the localization text.** The subscription group's
 Localization was empty, then `com.modoki.coins100`'s was; each product resolved as soon as it had
 one. A sandbox tester is irrelevant to this symptom — product *fetch* touches no account, so the
-Users and Access role requirement bites only at purchase time.
+Users and Access role requirement bites only at purchase time. If a sandbox tester ever does block
+a *purchase*, a **TestFlight** build sidesteps it: IAPs there run against the sandbox, free, on the
+tester's real Apple ID.
 
 The `store: N/2` line the fixture puts on screen is what makes this tractable: **`0/2` is
 app-level** (agreement, bundle id, signing team), **`k/2` is one product's own state**. Read the
@@ -254,6 +276,12 @@ This is also why the repo once had a catalog attached while the phone was on the
   crash matrix was performed by hand on iOS. The matrix is verified, but re-running it now means the
   sandbox's own tools (Settings → Developer, accelerated renewals) plus the fixture's built-in
   interruption harness.
+
+⚠️ **Do not "restore" `Modoki.storekit` casually.** If a local catalog is genuinely wanted again, it
+must be recreated AND attached to the Run action AND the two assertions in
+`games/iap-test/tests/storekitScheme.test.ts` flipped in the same commit. An unreferenced catalog
+file is a trap rather than a fallback: nothing reads it, so it drifts from the scene unnoticed until
+someone re-attaches it and unknowingly tests against a stale product list.
 
 [tn3186]: https://developer.apple.com/documentation/technotes/tn3186-troubleshooting-in-app-purchases-availability-in-the-sandbox
 
@@ -282,6 +310,19 @@ This is also why the repo once had a catalog attached while the phone was on the
 - **One `BillingClient`, ever.** Building one per call produced four concurrent clients at boot; the
   plugin holds a single client with queued callers and reconnects rather than replacing.
 - Release builds swallow JS console logs unless `loggingBehavior: "production"` is set.
+
+**`games/iap-test`'s upload history**, so a later reader can date a device behaviour to a build:
+**1** first upload (no billing library) · **2** billing library added but built before the store UI
+existed, so nothing to tap · **3** the first build a purchase could be driven from · **5** the
+single-`BillingClient` fix (4 skipped) · **9** `loggingBehavior: production`, which finally made
+the JS trace visible in logcat · **10** the `markUIDirty` fix — the ledger had been right all along
+and only the screen was stale · **11** the close-out review's two Android fixes, NEITHER
+device-verified, both needing a real purchase to exercise (a parked `purchase()` no longer
+resolving `cancelled` on an unrelated Play delivery; a second concurrent `purchase()` refused
+instead of orphaning the first call, whose promise then hung forever on a double-tapped Buy). It
+reads **11** on the fixture, this project's real Play upload count; iOS sat at 5 because each store
+counts its own uploads, and the first heal raised it to 11. iOS is the opposite of Android here — a
+directly-installed dev build is enough, no upload needed per iteration.
 
 ---
 

@@ -262,22 +262,29 @@ describe('project CLAUDE.md is written, not left as the scaffolder template (#19
  *
  *  Rows are matched by the LINK TARGET (`](games/<id>/CLAUDE.md)`), not the label, so renaming a
  *  row's display text cannot fool the check. */
-describe('root CLAUDE.md enumerates every project (#195)', () => {
+describe('docs/projects.md enumerates every project (#195)', () => {
   it('every games/ and demos/ project has a table row, and every row a project', (ctx) => {
-    // The OSS snapshot ships engine/ + build/ + docs/ + a few root configs — NOT the root
-    // CLAUDE.md and NOT games/. So in the snapshot this rule has neither side of its comparison
-    // and would ENOENT-crash rather than legitimately pass. Skip explicitly, the way
+    // The roster MOVED out of root CLAUDE.md into docs/projects.md: it is a catalog, not a rule,
+    // and CLAUDE.md is loaded on every turn (see claudeMdBudget.test.ts). The guard follows the
+    // fact — what it protects is unchanged, namely that a project on disk is DISCOVERABLE from
+    // the docs an agent reads, so a fixture cannot go undocumented the way three once did.
+    //
+    // The OSS snapshot ships engine/ + build/ + docs/ + a few root configs — but NOT games/, and
+    // docs/projects.md is explicitly excluded from it too (publish-engine-oss.sh), because it
+    // describes internal projects. So in the snapshot this rule has neither side of its
+    // comparison and would ENOENT-crash rather than legitimately pass. Skip explicitly, the way
     // publish-engine-oss.sh reasons about repoLayoutGuard: "this content is absent" is what the
     // snapshot IS, so a rule about that content cannot self-gate there. It still runs on every
     // real clone, which is where the table is edited.
-    const rootDoc = path.join(repoRoot, 'CLAUDE.md');
-    if (!fs.existsSync(rootDoc)) {
+    const rosterDoc = path.join(repoRoot, 'docs/projects.md');
+    if (!fs.existsSync(rosterDoc)) {
       ctx.skip();
       return;
     }
-    const root = fs.readFileSync(rootDoc, 'utf8');
+    const roster = fs.readFileSync(rosterDoc, 'utf8');
     const linked = new Set<string>();
-    for (const m of root.matchAll(/\]\((games|demos)\/([A-Za-z0-9._-]+)\/CLAUDE\.md\)/g)) {
+    // Paths are written relative to docs/, i.e. `../games/<id>/CLAUDE.md`.
+    for (const m of roster.matchAll(/\]\(\.\.\/(games|demos)\/([A-Za-z0-9._-]+)\/CLAUDE\.md\)/g)) {
       linked.add(`${m[1]}/${m[2]}`);
     }
 
@@ -287,7 +294,7 @@ describe('root CLAUDE.md enumerates every project (#195)', () => {
 
     expect(
       { missingRow, missingProject },
-      'the root CLAUDE.md project tables disagree with what is on disk. `missingRow` exists but is '
+      'the docs/projects.md roster disagrees with what is on disk. `missingRow` exists but is '
         + 'not listed (an agent will never learn it exists — say plainly if it is a fixture rather '
         + 'than a game); `missingProject` is listed but gone (delete the row).',
     ).toEqual({ missingRow: [], missingProject: [] });

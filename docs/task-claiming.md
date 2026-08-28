@@ -1,6 +1,6 @@
 # Task claiming across clones (GitHub Issues)
 
-**Open work lives in GitHub Issues, not in a file.** Four clones run concurrent Claude
+**Open work lives in GitHub Issues, not in a file.** Six clones run concurrent Claude
 sessions against the same repo, and a git-tracked list can't stop two of them starting the
 same task: a `docs/todo.md` entry only crosses clones when someone pushes *and* the other
 fetches, so the collision surfaces at merge time — after both sessions have done the work.

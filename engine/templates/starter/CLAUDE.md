@@ -20,21 +20,10 @@ from source alone (see the section below).
 
 ## The engine's own source is on this machine — read it when you need to
 
-This project depends on `@modoki/engine`, but not as an installed npm package: the running
-**Modoki Editor** app serves it to your project live, from its own install. That means the
-engine's actual TypeScript source (rendering, ECS, physics, everything under
-`engine/packages/modoki/src/`) is sitting on disk, unpacked and readable, inside the editor
-app you have installed — not hidden inside a compiled bundle. **Don't guess the path** — call
-`modoki_identity`; its `repoRoot` field IS this path (the monorepo root in dev, or
-`<resourcesPath>/app.asar.unpacked` when `packaged` is true), and it's authoritative for
-*this* running editor rather than an assumed install location.
-
-**Reach for this when the MCP tools and this file's docs aren't enough** — e.g. a trait
-behaves unexpectedly and you need to see its actual system logic, not just its current
-data. Prefer the verification loop below for "what is the game doing right now"; reach into
-the engine source for "why does the engine behave this way." (There's also a public,
-Apache-2.0 mirror of this source — search GitHub for `modoki-engine` — if you'd rather work
-from a separate clone than the installed app's copy.)
+This project depends on `@modoki/engine`, served live by the running **Modoki Editor** from
+its own install — the engine's actual TypeScript source (`engine/packages/modoki/src/`) is
+sitting on disk, unpacked and readable, not hidden in a compiled bundle. **Don't guess the
+path** — call `modoki_identity`; its `repoRoot` field IS this path.
 
 ## Observe the running game — don't infer it from source
 
@@ -59,46 +48,26 @@ returned.** "Did you check?" should never be a question the human has to ask you
 
 ## Tools
 
-**Author & inspect (the core loop)**
-- `modoki_get_scene_state` — dump the LIVE ECS world (entities, traits) as JSON. Called
-  bare it's a cheap index (names + trait names); target with `trait=`/`name=`/`where=` for
-  values. Address entities by `guid` — ids churn on hot-reload.
-- `modoki_mutate_scene` — validated `setTrait`/`removeTrait`/`addEntity`/`removeEntity`;
-  writes the scene file atomically, the editor hot-reloads. Never hand-write scene JSON.
-- `modoki_set_transform` — one-call place/rotate/scale (prefab-instance aware).
-- `modoki_validate_scene`, `modoki_list_traits`, `modoki_list_assets` — the schema you can
-  set + the project's assets (every asset ref MUST be a GUID from here).
-- `modoki_create_entity` / `duplicate` / `delete` / `reparent` / `prefab` — undoable, like
-  the Hierarchy menus. `modoki_load_scene` / `new_scene` / `save_all` / `list_scenes`.
+Modoki names its two tool families:
+- **Percept** — verify by data, not vibes: `modoki_get_scene_state`, `modoki_journal`
+  (tick-stamped game events), `modoki_diagnose` (NaN transforms, broken refs, orphaned
+  entities in one call), `modoki_watch` (a live time-series on chosen entities/traits).
+- **Enact** — trusted input, like a human tester: `modoki_play_control` (play/stop/pause/
+  step), `modoki_tap`/`drag`/`hover`/`scroll`/`press_key`/`type_text` aimed by CSS
+  `selector` or `x,y`.
 
-**Test it like a human (Enact — trusted input)**
-- `modoki_play_control` — play / stop / pause / resume / step the game.
-- `modoki_tap` / `drag` / `hover` / `scroll` / `press_key` / `type_text` — real trusted
-  input; aim with a CSS `selector` or page `x,y`. `modoki_handles` + `tap_handle` /
-  `drag_handle` drive the DOM-less Canvas2D/SVG editors (bones, keyframes, collider verts).
-
-**Verify by DATA, not vibes (Percept)**
-- `modoki_journal` — the game's tick-stamped semantic events (match / score / win / …);
-  assert on these instead of screenshots. `modoki_diagnose` flags likely problems (NaN
-  transforms, broken asset refs, orphaned entities) in one call.
-- `modoki_editor_journal` / `modoki_watch` — what the **human just did** in the editor
-  (selected / moved / edited) and a live watch on chosen entities/traits. Reach for these
-  *before* guessing why the scene differs from what you expected. `modoki_get_editor_state`
-  dumps the whole editor UI state in one call.
-
-**Drop into the live renderer (CDP / chrome-devtools)** — when the data isn't enough:
-read React/Three state via `evaluate_script`, validate WGSL, or grab the TRUE framebuffer
-with `take_screenshot`/`Page.captureScreenshot` (unlike `capture_viewport`, it doesn't
-force a render, so it exposes render-on-demand / stale-frame bugs). The `chrome-devtools`
-MCP is wired to THIS editor's renderer only when you enabled **Renderer debugging (CDP)**
-in the AI panel.
+When the data isn't enough, the `chrome-devtools` MCP (**CDP**) reads live React/Three state or
+grabs the true framebuffer — wired to this editor's renderer only when you enabled **Renderer
+debugging (CDP)** in the AI panel. The full tool catalog, conventions, and engine concepts:
+**https://modoki-engine.com**.
 
 ## Rules
 
 - **Asset references are GUIDs, never literal paths.** Any `mesh` / `material` / `texture`
   / `imageSrc` / `source` field takes a GUID from `modoki_list_assets`. (Exceptions:
-  `http(s)://` / `data:` URLs, the primitive sprite keywords `circle` / `square` /
-  `triangle`, and `UIElement.fontFamily`.)
+  `http(s)://` / `data:` URLs, the primitive sprite keywords `circle` / `square` / `triangle`
+  (plus `collider`). `UIElement.fontFamily` is a font GUID too since #231 —
+  a CSS family name goes in `UIElement.systemFont`.)
 - **Scenes are the source of truth.** Persist via `modoki_mutate_scene`, not imperative
   setup, for anything that should survive a reload.
 - **Keep changes incremental.** One mechanic at a time; verify with
@@ -106,21 +75,9 @@ in the AI panel.
 
 ## Layout
 
-```
-__GAME_NAME__/
-├── game.ts                              # exports `game: GameDefinition` (entry point)
-├── project.config.json                  # app id/name, default game, build settings
-├── package.json                         # this project's own npm root
-└── runtime/                             # your game code + assets
-    ├── config.ts                        # GameConfig (points at the starting scene)
-    ├── setup.ts                         # register your ECS systems here
-    └── assets/                          # asset root → served at /assets/...
-        ├── scenes/main.scene.json             # the starting scene (edit via modoki_mutate_scene)
-        └── models/  textures/  materials/  prefabs/   # drop assets here
-```
-
-The starting scene's URL is `/assets/scenes/main.scene.json` — pass that as `path` to
-`modoki_mutate_scene` / `modoki_validate_scene`.
+`game.ts` is the entry point (exports `game: GameDefinition`); the starting scene is
+`runtime/assets/scenes/main.scene.json` (`/assets/scenes/main.scene.json` as the `path` for
+`modoki_mutate_scene` / `modoki_validate_scene`).
 
 Start by inspecting the current scene with `modoki_get_scene_state`, then ask the human
 what game to build.
