@@ -331,6 +331,27 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
     is empirically nil. `os.cpus().length` cannot answer (it reports LOGICAL cores), and the
     PowerShell `Get-CimInstance Win32_Processor` query that can costs ~1.9s per vitest launch —
     noise inside `verify`, but it would double a single-file run.
+- **`testTimeout` is 60s on Windows, 20s everywhere else — in BOTH vitest configs**
+  ([engine/vite.config.ts](../engine/vite.config.ts) for the app lane,
+  [engine/packages/modoki/vitest.config.ts](../engine/packages/modoki/vitest.config.ts) for the
+  engine lane). There are exactly two, they run CONCURRENTLY as verify.mjs's two lanes, and a
+  ceiling raised in only one of them just moves which lane goes red — the engine config holds the
+  larger share of the repo's test files. (Per-leg counts deliberately not quoted here; they live in
+  `engine/scripts/verify.mjs`'s header, and copying them is how the old figure went stale.) Raising
+  one config and grepping only the file you edited is how the second gets missed; sweep repo-wide
+  for `testTimeout:`. The 20s ceiling was itself a Windows
+  accommodation (cold esbuild transforms of the three.js + engine graph); it stopped being enough.
+  The worker cap above removed the *contention* that made `qaCaseReferences` time out, but not the
+  margin: measured 2026-08-28 on the `win` clone it runs **8.1s idle** — up from the 4.6s in the
+  table above — and still exceeded **35s** inside the app lane, failing 2 of 3 `npm run verify`
+  runs. It walks the whole QA corpus off disk, so it grows with the suite it checks; a budget set
+  on faster hardware was always going to be the binding constraint here first.
+  - Deliberately **not** a global raise. On a machine where 20s is generous, a 60s ceiling turns a
+    real hang into a long wait instead of a failure — and the cost of that is paid on the boxes
+    most likely to notice a hang at all.
+  - This is the contention bullet above *acted on* rather than restated: tests nearest the ceiling
+    fail as timeouts, which is indistinguishable from a regression until somebody re-runs idle.
+    Raising the Windows ceiling is what stops that re-run being the routine cost of the gate.
 - **A PowerShell CIM query costs SECONDS — never run one you can prove will match nothing.**
   `Win32_Processor` above is ~1.9s; `Get-CimInstance Win32_Process` is worse, because it is a cold
   PowerShell start *plus* a full enumeration of every process on the box. Worked example (#313):

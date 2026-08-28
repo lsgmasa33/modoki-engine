@@ -28,14 +28,21 @@ export default defineConfig({
     // The first test in a file cold-importing three.js / PixiJS + the engine can exceed the 5s
     // default on Windows under full-suite parallel load, so renderer tests (Scene2D, scene3DSync,
     // syncSceneRenderables3D) timed out intermittently — and a mid-test timeout left the shared
-    // canvas pool dirty, cascading into a sibling assertion. Mirrors engine/vite.config.ts; Mac/Linux
-    // finish these in milliseconds so the higher ceiling never triggers there.
-    testTimeout: 20000,
+    // canvas pool dirty, cascading into a sibling assertion. Mac/Linux finish these in milliseconds
+    // so the higher ceiling never triggers there.
+    //
+    // Kept in step with engine/vite.config.ts DELIBERATELY, not incidentally: verify.mjs runs this
+    // package as the engine lane CONCURRENTLY with the app lane,
+    // so both pools meet the same contention and a ceiling raised in only one of them just moves
+    // which lane goes red. See docs/windows.md for the measurement behind 60s.
+    testTimeout: process.platform === 'win32' ? 60000 : 20000,
     hookTimeout: 30000,
     // Coverage is OFF unless --coverage is passed. This suite is the FIRST leg of a
     // two-leg measurement: the root suite (engine/vite.config.ts) and this one both
-    // exercise packages/modoki/src, so either leg alone understates it — this package
-    // holds 466 of the repo's 742 test files, the root suite the other 276.
+    // exercise packages/modoki/src, so either leg alone understates it — this package holds the
+    // larger share of the repo's test files. (The counts that used to be quoted here — 466 of 742,
+    // root the other 276 — were stale: measured 2026-08-28, this package alone holds 635. Per-leg
+    // figures belong in engine/scripts/verify.mjs's header, not copied out to where they rot.)
     //
     // Each leg emits a RAW per-file report into its own dir under engine/coverage/.legs/;
     // engine/scripts/merge-coverage.mjs then merges them into the real report. Two earlier

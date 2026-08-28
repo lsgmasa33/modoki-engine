@@ -47,6 +47,29 @@ native plugins → `dist/`) **and** `engine/scripts/bootstrap-game-deps.mjs`, wh
 `dist/` is what makes `npm test` / the editor fail with `Failed to resolve import
 "capacitor-<x>"`. See the Two Clones section of `CLAUDE.md`.
 
+The chain also runs `engine/scripts/stamp-plugin-builds.mjs` immediately after `build:plugins`
+(#395). `build:plugins` builds each plugin's `dist/` directly and wrote no **build stamp**, so the
+next caller of `ensurePluginBuilt` (the editor on open, the vendorer, a test) read a perfectly
+current `dist/` as STALE and rebuilt it — deleting and recreating `dist/` *inside the repo* while
+other processes were importing it. Under `npm run verify` that raced the app lane's
+`await import('capacitor-game-debug')` and failed the suite with exactly the resolve error above —
+once. It never reproduced on a re-run, because by then the rebuild had written the stamp. The
+stamp is source-derived and shares `pluginSourceHash` with `ensurePluginBuilt`, so the two cannot
+disagree about what counts as a build input.
+
+Two properties make that stamp safe rather than merely convenient, and both are easy to break:
+
+- **It stamps only the workspaces `build:plugins` names**, parsed out of the script — NOT the set
+  `listEnginePlugins` discovers. Those two are allowed to diverge (`pluginBuildCoverage.test.ts`
+  says so: a plugin used solely by a game reaches it as a vendored `.tgz` and needs no workspace
+  build). Stamping the discovered set would vouch for a plugin this install never built — and a
+  stale `dist/` left over from an earlier build would then be trusted **forever**, since the stamp
+  is computed from the plugin's CURRENT sources. That is the #90 failure the stamp exists to
+  prevent: a tarball whose name is current and whose bytes are stale.
+- **The `&&` chaining** means a failed build never reaches the stamper. Note npm does *not* abort
+  at the first failing workspace — later ones still build — but the overall exit is non-zero, so
+  nothing is stamped and the successful siblings simply pay one redundant rebuild.
+
 ⚠️ **That same error can mean a HALF-built `dist/`, not a missing one — and the install will
 have told you it succeeded.** A plugin's `build` is `tsc && rollup`, so a `tsc` failure leaves
 `dist/esm` present and `dist/plugin.cjs.js` (the `main` entry) absent; `bootstrap-game-deps.mjs`

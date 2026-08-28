@@ -516,6 +516,35 @@ function writeBuildStamp(pluginDir: string, stamp: string): void {
   } catch { /* best-effort: a missing stamp only costs one extra rebuild */ }
 }
 
+/** Stamp `pluginDir`'s already-built `dist/` as CURRENT for its sources.
+ *
+ *  The root `build:plugins` postinstall builds every engine plugin's dist directly
+ *  (`npm run build --workspace ...`) and, before #395, wrote no stamp. So the FIRST
+ *  thing to call ensurePluginBuilt after an install always judged a perfectly current
+ *  dist stale and rebuilt it — deleting and recreating dist/ in the repo while other
+ *  processes were importing it. In `npm run verify` that raced the app lane's
+ *  `await import('capacitor-game-debug')` and failed the suite with a module-resolution
+ *  error that never reproduced on a second run (the rebuild had written a stamp by then).
+ *
+ *  This is the ONLY other writer of the stamp, and it deliberately reuses
+ *  pluginSourceHash + writeBuildStamp rather than recomputing the hash: a second
+ *  implementation that drifted from ensurePluginBuilt's would vouch for a stale dist,
+ *  which is a quiet wrong build in place of a loud flake.
+ *
+ *  Returns false (and stamps nothing) when there is no dist to vouch for, or no sources
+ *  to hash (a packaged editor, where the shipped dist is authoritative anyway). */
+export function stampPluginBuild(pluginDir: string): boolean {
+  if (!fs.existsSync(path.join(pluginDir, 'dist'))) return false;
+  const srcHash = pluginSourceHash(pluginDir);
+  if (srcHash === null) return false;
+  writeBuildStamp(pluginDir, srcHash);
+  // writeBuildStamp is best-effort and SWALLOWS its errors (read-only node_modules, ENOSPC),
+  // so `true` must mean "a stamp is on disk and reads back correctly", not "a write was
+  // attempted". Otherwise the postinstall reports work it did not do, and the only signal
+  // anyone has that #395 is fixed is a lie.
+  return readBuildStamp(pluginDir) === srcHash;
+}
+
 /** Ensure the plugin's built `dist/` exists AND is CURRENT for its sources (it
  *  ships JS only from a gitignored dist). In a packaged editor dist is shipped;
  *  in dev it's built by the root `build:plugins` postinstall — but build it on

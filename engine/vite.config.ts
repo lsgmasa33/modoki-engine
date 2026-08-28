@@ -622,7 +622,13 @@ export default defineConfig(({ command }) => {
     // take several seconds on Windows, so tests intermittently timed out under full-suite load.
     // Mac/Linux CI finishes these in milliseconds, so the higher ceiling never triggers there; it
     // only gives a cold Windows compile room. hookTimeout covers heavy beforeAll/afterEach setup.
-    testTimeout: 20000,
+    //
+    // 20s was still not enough on the `win` clone: qaCaseReferences.test.ts walks the whole QA
+    // corpus off disk, runs 8s unloaded, and blew past 35s under the app lane — failing 2 of 3
+    // verify runs. That is a budget set on faster hardware, not a misbehaving test, so Windows
+    // gets its own ceiling and every other platform keeps the tighter one (a global raise would
+    // hide a real hang on the machines fast enough to notice it).
+    testTimeout: process.platform === 'win32' ? 60000 : 20000,
     hookTimeout: 30000,
     include: [
       // ENGINE tests only — tests/** is the engine test surface, and it ships to the
