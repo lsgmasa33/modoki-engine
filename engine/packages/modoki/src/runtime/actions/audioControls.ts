@@ -29,7 +29,8 @@ import { markUIDirty } from '../ui/uiTreeStore';
 import { AudioSource } from '../traits/AudioSource';
 import { stopEntityAudio } from '../audio/audioSystem';
 import { setBusVolume, type BusName } from '../audio/audioService';
-import { cueClip } from '../audio/audioCues';
+import { cueClip, cueSound } from '../audio/audioCues';
+import { setUIClickCue } from '../ui/bindings';
 import { clipRefForKey } from '../audio/clipBank';
 
 type MixBus = 'master' | 'music' | 'sfx' | 'ui';
@@ -94,6 +95,12 @@ export function registerAudioControls(): void {
   registered = true;
 
   addStoreHook(useAudioMixSelector);
+
+  // The built-in button click. Registered from THIS side because `runtime/ui/` may not import
+  // `runtime/audio/` — see `setUIClickCue`. A game opts in by authoring one `AudioSource` with
+  // `playOnCue: 'ui.click'`; a game that authors none hears nothing, so the cost to a silent game
+  // is one queue push per click and no more.
+  setUIClickCue(() => cueSound('ui.click'));
 
   registerUIAction('audio.play', ({ target }) => patchSource(target, { playing: true }));
   registerUIAction('audio.pause', ({ target }) => patchSource(target, { playing: false }));

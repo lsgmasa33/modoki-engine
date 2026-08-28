@@ -25,7 +25,11 @@ const ALLOW_WALLCLOCK = new Set<string>([
 
 /** Files permitted to use Math.random (cosmetic-only; never gameplay state). */
 const ALLOW_RANDOM = new Set<string>([
-  // (none yet — engine runtime is clean. Cosmetic particle jitter would go here.)
+  // The music-playlist shuffle. Cosmetic by construction: a playlist order reaches no game state,
+  // no journal event and no replay. Routing it through the seeded RNG would be actively WRONG —
+  // it would consume the stream gameplay draws from, so which track plays would change which
+  // level is generated.
+  'audio/playlist.ts',
 ]);
 
 /** Files permitted to mint an UNSEEDED guid (`crypto.randomUUID` / `newGuid()`). These are

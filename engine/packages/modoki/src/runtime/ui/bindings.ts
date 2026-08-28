@@ -60,6 +60,24 @@ function resolveGuids(world: ReturnType<typeof getCurrentWorld>, needed: Set<str
   return out;
 }
 
+/** The button-click sound, INVERTED rather than imported.
+ *
+ *  `runtime/ui/` is L2 and may not reach `runtime/audio/`, another L2 subsystem, so the audio side
+ *  registers itself here instead (`registerAudioControls` → `setUIClickCue`) — the same
+ *  dependency-inversion the layer guard asks for, and the same shape as
+ *  `setAudioWorldPositionResolver`. Unregistered → silent, which is what a headless test or a
+ *  game that never wires audio should be.
+ *
+ *  ⚠️ It lives at the BINDING layer, not in a game, because a game cannot see every button. Court
+ *  put its click on its own chrome dispatcher and the settings panel stayed silent — those rows
+ *  open and close through plain `set` bindings authored in the scene, so no game code runs there
+ *  at all. Any per-button fix is a list somebody has to maintain, and it goes stale on the first
+ *  button added; this is the one place every button provably passes through. */
+let clickCue: (() => void) | null = null;
+
+/** Install (or clear, with `null`) the click sound. Called by `registerAudioControls`. */
+export function setUIClickCue(fn: (() => void) | null): void { clickCue = fn; }
+
 /** Run every binding registered for `event`.
  *
  *  ⚠️ EVENT-HANDLER ONLY (F10): call this from a DOM event handler, never from a
@@ -88,6 +106,9 @@ export function applyBindings(
   if (!anyRow) return;
 
   const world = getCurrentWorld();
+  // Only 'click': 'change' fires continuously while a slider is dragged, and 'submit' is a
+  // keystroke, so neither is a press to acknowledge.
+  if (event === 'click') clickCue?.();
   // Resolve only the needed guids (early-break scan), shared by 'set' + 'call'.
   const byGuid = resolveGuids(world, needed);
 

@@ -588,6 +588,10 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
             }
           }
           : undefined}
+        // Same contract as the range below and the toggle further down: focusing a text field is
+        // not a click on whatever sits behind it. Latent rather than reported — no shipped game
+        // has yet put a text input inside a dismiss-on-backdrop panel — but it is the same bug.
+        onClick={(e: React.MouseEvent) => e.stopPropagation()}
         data-entity-id={node.entityId}
       />
     );
@@ -634,6 +638,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         onChange={node.action?.bindings?.length
           ? (e: React.ChangeEvent<HTMLInputElement>) => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: Number(e.target.value) })
           : undefined}
+        // A click that lands on an interactive control has been CONSUMED by it, and must not also
+        // read as a click on an ancestor. Without this a slider inside the canonical
+        // click-the-backdrop-to-dismiss panel closes that panel on every adjustment — reported on
+        // games/court's settings sliders, which dismissed the dialog mid-drag. The toggle branch
+        // below has always done this; `range` and the text input above simply never did.
+        onClick={(e: React.MouseEvent) => e.stopPropagation()}
         data-entity-id={node.entityId}
       />
     );

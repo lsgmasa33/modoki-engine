@@ -56,6 +56,14 @@ export interface AudioHandle {
   setPosition(x: number, y: number, z: number): void;
   /** True once the clip has finished / been stopped. */
   readonly ended: boolean;
+  /** Seconds of this clip still to play, or `null` when that is not knowable —
+   *  a looping source (it never ends), a stream whose metadata has not loaded yet,
+   *  or record mode, which has no audio clock at all.
+   *
+   *  Exists so a playlist can cross-fade INTO the next track: waiting for `ended`
+   *  is too late, because by then there is no live voice left to fade out. `null`
+   *  must be read as "do not act yet", never as "0". */
+  remainingSec(): number | null;
 }
 
 export interface AudioLogEntry {
@@ -114,6 +122,7 @@ const INERT: AudioHandle = {
   resume() { /* no-op */ },
   setPosition() { /* no-op */ },
   ended: true,
+  remainingSec: () => null,
 };
 
 // Returned in record mode, ONE PER `play()` — not a shared singleton.
@@ -132,6 +141,9 @@ const INERT: AudioHandle = {
 class RecordingHandle implements AudioHandle {
   ended = false;
   _markEnded(): void { this.ended = true; }
+  // Record mode has no audio clock — see the class banner. `null`, not 0, so a caller
+  // that treats 0 as "swap now" does not fire on every headless frame.
+  remainingSec(): number | null { return null; }
   // Declared + assigned rather than a `private readonly` constructor parameter:
   // the ROOT tsconfig sets `erasableSyntaxOnly`, under which a parameter property
   // is a hard error (TS1294) — and the package's own tsconfig.check.json does not,
@@ -378,6 +390,10 @@ export function dispose(): void {
 class LiveHandle implements AudioHandle {
   ended = false;
   private deliberatelyPaused = false;
+  /** `ctx.currentTime` when a BUFFER source started — a buffer node exposes no playhead,
+   *  so its remaining time is derived from the audio clock rather than read back. */
+  private bufStartedAt = 0;
+  private looping = false;
   private ctx: AudioContext;
   private gain: GainNode;
   private bufSrc?: AudioBufferSourceNode;
@@ -417,6 +433,7 @@ class LiveHandle implements AudioHandle {
       src.connect(this.gain);
       src.onended = () => { if (!spec.loop) this.cleanup(); };
       src.start();
+      this.bufStartedAt = ctx.currentTime;
       this.bufSrc = src;
     } else if (spec.url) {
       const el = new Audio(spec.url);
@@ -432,7 +449,33 @@ class LiveHandle implements AudioHandle {
     } else {
       throw new Error('play() needs a buffer or url');
     }
+    this.looping = !!spec.loop;
     active.add(this);
+  }
+
+  /**
+   * Seconds still to play, or `null` when unknowable.
+   *
+   * `null` for a LOOPING source (it never runs out), for a stream whose metadata has not
+   * arrived (`duration` is NaN until then), and for anything already ended. A caller must read
+   * `null` as "do not act yet" — returning 0 there would make a playlist swap on the first frame
+   * of every track, before a note of it had played.
+   *
+   * The two source kinds answer differently because they must: a media element carries a real
+   * playhead (`currentTime`), while a buffer node exposes none, so its position is derived from
+   * the AUDIO clock — which is also the clock the crossfade ramps run on, so the two agree.
+   */
+  remainingSec(): number | null {
+    if (this.ended || this.looping) return null;
+    if (this.mediaEl) {
+      const { duration, currentTime } = this.mediaEl;
+      if (!Number.isFinite(duration)) return null;   // metadata not in yet
+      return Math.max(0, duration - currentTime);
+    }
+    const buf = this.bufSrc?.buffer;
+    if (!buf) return null;
+    const rate = this.bufSrc?.playbackRate.value || 1;
+    return Math.max(0, (buf.duration - (this.ctx.currentTime - this.bufStartedAt) * rate) / rate);
   }
 
   stop(): void {

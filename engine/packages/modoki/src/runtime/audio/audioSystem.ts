@@ -34,6 +34,7 @@ import {
   AudioSettings, AUDIO_SETTINGS_DEFAULT_LIMIT, AUDIO_SETTINGS_DEFAULT_STEAL_FADE,
 } from '../traits/AudioSettings';
 import { AudioListener } from '../traits/AudioListener';
+import { nextClip, type PlaylistState } from './playlist';
 import { getPlayState } from '../core/playState';
 import { isTimelinePreviewActive } from '../core/timelinePreview';
 import { onWorldSwap } from '../core/ecs/world';
@@ -117,6 +118,11 @@ interface SourceState {
 interface AudioState {
   /** Live entity sources keyed by entity id. */
   sources: Map<number, SourceState>;
+  /** Playlist walk state per entity — separate from `sources` because a swap REPLACES the
+   *  SourceState, and the walk has to survive exactly that. */
+  playlists: Map<number, PlaylistState>;
+  /** Entities already warned about `playlist` + `loop` together (warn once, not per frame). */
+  warnedLoopingPlaylist: Set<number>;
   /** Entities whose autoplay already fired (so it doesn't restart after a stop). */
   autoplayed: Set<number>;
   /** Handles fading out under a crossfade. Each self-stops on the AUDIO clock via
@@ -157,7 +163,8 @@ function stateFor(world: World): AudioState {
   let s = states.get(world);
   if (!s) {
     s = {
-      sources: new Map(), autoplayed: new Set(), fadingOut: [], oneShots: [],
+      sources: new Map(), playlists: new Map(), warnedLoopingPlaylist: new Set(),
+      autoplayed: new Set(), fadingOut: [], oneShots: [],
       warnedUnresolved: new Map(), pendingCues: [],
     };
     states.set(world, s);
@@ -245,6 +252,8 @@ export function audioSystem(world: World): void {
         journalAudio(world, 'stop', undefined, { clip: src.clip, reason: 'not-playing' });
       }
       state.sources.clear();
+      state.playlists.clear();
+      state.warnedLoopingPlaylist.clear();
       for (const t of state.fadingOut) {
         t.handle.stop();
         reapTail(world, t, 'not-playing');
@@ -311,11 +320,38 @@ export function audioSystem(world: World): void {
     let src = state.sources.get(id);
 
     // Drop a finished (non-looping) source.
+    let justEnded = false;
     if (src && src.handle.ended) {
       journalAudio(world, 'end', entity, { clip: src.clip });
       state.sources.delete(id);
       src = undefined;
-      a.playing = false;
+      // ⚠️ A PLAYLIST source stays `playing` here. Clearing it was a permanent silence: the
+      // playlist block below requires `playing`, and `autoplayed` already holds this id so
+      // autoplay cannot restart it — so one missed cross-fade window ended the music for the rest
+      // of the session, with `playing: false` in the Inspector and nothing to explain it. The
+      // block below sees `justEnded` and takes the next clip unconditionally.
+      if (a.playlist === 'off') a.playing = false;
+      else justEnded = true;
+    }
+
+    // Playlist: start the next clip while this one is still sounding — or, if the window was
+    // missed and it has already ended, immediately. Before the reconcile below, so the swap it
+    // requests is applied THIS frame rather than one late.
+    if (a.playlist !== 'off' && a.playing) {
+      if (a.loop && !state.warnedLoopingPlaylist.has(id)) {
+        state.warnedLoopingPlaylist.add(id);
+        // Not an error — the source still plays. But it plays clip one forever, and the bank looks
+        // perfectly valid in the Inspector, so nothing else would ever say why.
+        console.warn(`[audio] AudioSource ${id} has playlist='${a.playlist}' AND loop=true — a looping clip never ends, so the playlist will never advance.`);
+      }
+      let pl = state.playlists.get(id);
+      if (!pl) { pl = { order: [], idx: 0, pending: '', bank: '', shuffled: false }; state.playlists.set(id, pl); }
+      const next = nextClip(
+        pl, a.clips, a.playlist, a.clip,
+        src && !src.paused ? src.handle.remainingSec() : null,
+        a.crossfadeSec, justEnded,
+      );
+      if (next) a.clip = next;
     }
 
     if (a.playing) {
@@ -347,6 +383,8 @@ export function audioSystem(world: World): void {
       src.handle.stop();
       state.sources.delete(id);
       state.autoplayed.delete(id);
+      state.playlists.delete(id);
+      state.warnedLoopingPlaylist.delete(id);
       journalAudio(world, 'stop', undefined, { clip: src.clip, reason: 'entity-gone' });
     }
   }

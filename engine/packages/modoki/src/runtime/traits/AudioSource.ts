@@ -51,6 +51,16 @@ export const AudioSource = trait({
   // by `audio.setClip { key }` / `audio.playOneShot { key }`; parse via parseClipBank.
   // The collector reads the refs out of this string so every banked clip ships.
   clips: '' as string,
+  // Walk the `clips` bank instead of playing only `clip`: 'sequential' in the authored order,
+  // 'shuffle' in a random one that covers every entry before repeating. 'off' (the default) leaves
+  // the bank as a lookup table, which is what it was before playlists existed.
+  //
+  // The next clip starts while the current one is still sounding — `crossfadeSec` before it ends —
+  // so that same field decides both how long the blend is and when it begins.
+  //
+  // ⚠️ A playlist source must NOT `loop`: a looping clip never runs out, so nothing ever triggers
+  // the advance and the bank's first entry plays forever. `audioSystem` warns once if both are set.
+  playlist: 'off' as 'off' | 'sequential' | 'shuffle',
   // Runtime playback state (not serialized) — reflects whether the source is
   // currently sounding, for the Inspector + debug tooling.
   playing: false as boolean,
