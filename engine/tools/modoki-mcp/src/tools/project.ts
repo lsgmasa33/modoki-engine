@@ -10,6 +10,68 @@ import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { unsavedForceParam } from '../shapes.js';
 
+/** What `modoki_project_settings action=get` shows instead of a signing password (#370).
+ *
+ *  Chosen to be obviously-not-a-password and stable, so `action=set` can recognise it coming back. */
+export const REDACTED = '••••••••';
+
+/** The `user.keystore` fields that must never reach an agent's context. The Android upload key's
+ *  two passwords — the key itself lives outside the repo, but these unlock it.
+ *
+ *  ⚠️ `storeFile` and `keyAlias` are deliberately NOT redacted: a path and an alias are not secrets,
+ *  and an agent diagnosing "why did the release build refuse" needs to see whether they are set. */
+const SECRET_PATHS: readonly [string, string][] = [
+  ['keystore', 'storePassword'],
+  ['keystore', 'keyPassword'],
+];
+
+/** Blank the signing passwords out of a `/api/project-settings` GET reply.
+ *
+ *  The route nests the whole per-machine `user` subtree in its response, and since #370 that subtree
+ *  holds the Play upload key's passwords in plaintext. Before this, an agent making the cheap,
+ *  routine, read-only call to check `appId` or `debugBuild` pulled those passwords into its context,
+ *  its transcript, and any paste of that response. The Project Settings dialog is unaffected — it
+ *  calls `backendFetch` directly, not through this tool.
+ *
+ *  Redacts rather than deleting the keys: their PRESENCE is the useful signal ("a key is
+ *  configured"), and an absent field reads identically to an unconfigured one. */
+export function redactSecrets(reply: unknown): unknown {
+  if (!reply || typeof reply !== 'object') return reply;
+  const r = reply as Record<string, unknown>;
+  const user = r.user;
+  if (!user || typeof user !== 'object') return reply;
+  const u = { ...(user as Record<string, unknown>) };
+  for (const [section, field] of SECRET_PATHS) {
+    const sec = u[section];
+    if (!sec || typeof sec !== 'object') continue;
+    const s = sec as Record<string, unknown>;
+    if (typeof s[field] === 'string' && s[field] !== '') u[section] = { ...s, [field]: REDACTED };
+  }
+  return { ...r, user: u };
+}
+
+/** Drop any redaction sentinel from an `action=set` patch before it is written.
+ *
+ *  ⚠️ This is the half that makes redaction SAFE rather than destructive. The natural agent pattern
+ *  is get → modify one field → set the whole object back; without this, that round-trip writes
+ *  `'••••••••'` into `project.user.json` as the literal password and the next release build fails
+ *  with `Keystore was tampered with, or password was incorrect` — a redaction that destroys the
+ *  secret it was protecting. Omitting the key means "leave it alone", which is exactly what the
+ *  route's patch semantics already do for an absent field. */
+export function redactedBack(values: Record<string, unknown>): Record<string, unknown> {
+  const user = values.user;
+  if (!user || typeof user !== 'object') return values;
+  const u = { ...(user as Record<string, unknown>) };
+  let touched = false;
+  for (const [section, field] of SECRET_PATHS) {
+    const sec = u[section];
+    if (!sec || typeof sec !== 'object') continue;
+    const s = { ...(sec as Record<string, unknown>) };
+    if (s[field] === REDACTED) { delete s[field]; u[section] = s; touched = true; }
+  }
+  return touched ? { ...values, user: u } : values;
+}
+
 export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
   const { fail, getJson, postJson, unsavedChangesWarning, consumeBuildStream } = ctx;
 
@@ -75,7 +137,12 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
       'merged onto the on-disk tier — post the complete tier block or omit the key entirely); or ' +
       'project.config.json exists but is not valid JSON, since a patch onto a file that cannot be ' +
       'read would replace it. Contract + rationale: docs/editor.md ' +
-      '"Project Settings — the save contract".',
+      '"Project Settings — the save contract". ' +
+      '⚠️ The two Android signing passwords (user.keystore.storePassword / .keyPassword) come back ' +
+      'REDACTED as \u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022 — they are a signing secret and this is a channel that ends up in a ' +
+      'transcript. action=set drops that exact sentinel rather than writing it, so a get\u2192edit\u2192set ' +
+      'round-trip cannot destroy the real password; the corollary is that you cannot SET a password ' +
+      'whose literal value is the sentinel. storeFile and keyAlias are NOT redacted.',
     {
       action: z.enum(['get', 'set']),
       values: z.record(z.any()).optional().describe(
@@ -83,8 +150,19 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
           'sections you leave out keep their on-disk values. No value may be null.',
       ),
     },
-    async ({ action, values }) =>
-      action === 'get' ? getJson('/api/project-settings') : postJson('/api/project-settings', values ?? {}),
+    async ({ action, values }) => {
+      if (action === 'set') return postJson('/api/project-settings', redactedBack(values ?? {}));
+      // `getJson`'s `transform` hook, NOT a raw `call`. The secret must be removed from the PARSED
+      // body before it is encoded — scrubbing the encoded text afterwards means pattern-matching a
+      // password inside JSON that may already be elided or bannered. But reaching for raw `call` to
+      // get at the body silently drops three things `getJson` does and this tool needs: the §5
+      // unreachable-backend envelope (a raw call THROWS, and the SDK turns that into the bare
+      // free-text error §5 exists to eliminate), the SPA-fallthrough guard (the Vite dev server
+      // answers a missing /api route with index.html at status 200, which this tool would then
+      // report as the project's settings), and `ensureIdentity`'s wrong-clone banner — which, on a
+      // tool that is a natural FIRST call, is exactly when #349 bites.
+      return getJson('/api/project-settings', undefined, undefined, redactSecrets);
+    },
   );
 
   // ── import a new asset from disk ──
@@ -115,9 +193,11 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
     {
       platform: z.enum(['web', 'ios', 'android', 'playable'])
         .describe("Build target. 'web' → dist/; 'ios'/'android' → the native app (auto-scaffolds the platform on first build); 'playable' → a single self-contained MRAID ad HTML."),
+      variant: z.enum(['debug', 'release']).optional()
+        .describe("ios/android ONLY; default 'debug'. 'debug' = the historical behaviour (a dev-signed build INSTALLED on the configured device). 'release' = a store artifact and NO device: Android produces a signed .aab + .apk (refuses unless the upload key is set in project.user.json user.keystore), iOS archives and exports an .ipa using build.iosExportMethod. A release build installs nothing and deploys nowhere — it leaves a file you upload by hand."),
       force: unsavedForceParam,
     },
-    async ({ platform, force }) => {
+    async ({ platform, variant, force }) => {
       // A build reads the scene FILE. The live-world tools (create_entity / duplicate / prefab)
       // do NOT save — so an unsaved editor builds a world that is missing exactly the work the
       // agent just did, reports ok:true, and the deployed web build / device install is stale
@@ -128,7 +208,7 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
         if (stale) {
           return fail({
             code: 'REQUIRES_SAVE',
-            what: `build the ${platform} target`,
+            what: `build the ${platform}${variant === 'release' ? ' release' : ''} target`,
             why: stale,
             options: [
               'call modoki_save_all first — then the build sees your work',
@@ -137,7 +217,16 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
           });
         }
       }
-      return consumeBuildStream(`/api/build?platform=${platform}`, 30 * 60_000);
+      // ⚠️ `variant` MUST reach the URL. It was accepted, documented and dropped here for a while:
+      // the server then read no variant, defaulted to `debug` (correctly — that is the contract for
+      // an absent one), and `modoki_build {variant:'release'}` ran assembleDebug + `adb install`
+      // onto the owner's phone, reported "✅ Android build deployed successfully", and produced no
+      // AAB. The keystore refusal and the debugBuild warning never fired either, because nothing on
+      // the server ever knew a release was asked for. Omitted for `debug` so the request stays
+      // byte-identical to what every pre-#370 caller sent. Pinned by
+      // `engine/tests/tools/releaseBuildTools.test.ts`.
+      const q = variant === 'release' ? `?platform=${platform}&variant=release` : `?platform=${platform}`;
+      return consumeBuildStream(`/api/build${q}`, 30 * 60_000);
     },
   );
   tool(

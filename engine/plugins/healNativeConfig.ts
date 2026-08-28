@@ -257,6 +257,61 @@ const ANDROID_WARN_BLOCK = [
   ANDROID_WARN_END,
 ].join('\n');
 
+/** ── Android release signing (#370) ────────────────────────────────────────────────────────────
+ *
+ *  Until this block existed, NO project in the repo set a `signingConfig`, so a release build was
+ *  signed in debug mode and Play rejected it at upload — after the build had reported success.
+ *
+ *  **Why it is APPENDED rather than inserted into `android { }`.** Re-opening the `android`
+ *  extension later in the same script is legal Groovy-DSL and merges into the existing config
+ *  (`signingConfigs`/`buildTypes` are NamedDomainObjectContainers, so naming `release` creates or
+ *  configures it). Appending a fenced block therefore needs no anchor inside a file every project
+ *  hand-edits — the same reason {@link ANDROID_WARN_BLOCK} appends. An inserter that had to find
+ *  `buildTypes {` would bail on any project that had moved it, which is the failure mode a heal
+ *  can least afford.
+ *
+ *  **Why it is inert without the properties file.** A fresh clone, another machine or CI has no
+ *  upload key, and failing Gradle CONFIGURATION there would break `assembleDebug` for every clone
+ *  that never signs anything — which is most of them. So the whole block is behind
+ *  `if (file.exists())`, and a machine without a key keeps building debug exactly as before. The
+ *  release path's own `keystoreRefusal` (./releaseBuild.ts) is what turns "no key" into a loud, actionable
+ *  refusal, and it fires before Gradle is ever invoked. */
+const ANDROID_SIGNING_BEGIN = '// modoki:release-signing-begin — generated; the key comes from project.user.json (user.keystore)';
+const ANDROID_SIGNING_END = '// modoki:release-signing-end';
+const ANDROID_SIGNING_BLOCK = [
+  ANDROID_SIGNING_BEGIN,
+  '// keystore.properties is GENERATED (and gitignored) by the release build from the per-machine',
+  '// project.user.json. Nothing secret is in THIS file, so it stays committed and portable.',
+  "def modokiKeystoreFile = rootProject.file('keystore.properties')",
+  'if (modokiKeystoreFile.exists()) {',
+  '    def modokiKeystore = new Properties()',
+  '    // withReader(UTF-8), NOT withInputStream: Properties.load(InputStream) decodes ISO-8859-1',
+  '    // by contract, while the generator writes UTF-8. A non-ASCII password — or a keystore path',
+  '    // under a non-ASCII directory — round-trips as mojibake and Gradle then reports "Keystore',
+  '    // was tampered with, or password was incorrect", which points at the key, not the encoding.',
+  "    modokiKeystoreFile.withReader('UTF-8') { modokiKeystore.load(it) }",
+  '    android {',
+  '        signingConfigs {',
+  '            release {',
+  "                storeFile file(modokiKeystore['storeFile'])",
+  "                storePassword modokiKeystore['storePassword']",
+  "                keyAlias modokiKeystore['keyAlias']",
+  "                keyPassword modokiKeystore['keyPassword']",
+  '            }',
+  '        }',
+  '        buildTypes {',
+  '            release {',
+  '                // Without this a release bundle is signed in DEBUG mode, and Play rejects it',
+  '                // with "You uploaded an APK or Android App Bundle that was signed in debug',
+  '                // mode" — a failure that only appears at upload time.',
+  '                signingConfig signingConfigs.release',
+  '            }',
+  '        }',
+  '    }',
+  '}',
+  ANDROID_SIGNING_END,
+].join('\n');
+
 /** Does this project depend on the game-debug bridge? Gates every game-debug
  *  heal (Info.plist keys, iOS pbxproj wiring, Release strip) so a project that
  *  doesn't use it stays untouched. */
@@ -1038,6 +1093,149 @@ function healAndroidArchiveWarning(projectRoot: string, debugBuild: boolean): st
   if (text === orig) return undefined;
   fs.writeFileSync(gradle, text);
   return `${debugBuild ? 'added' : 'removed'} the Gradle release-build "Debug build is ON" warning (#112)`;
+}
+
+/** Keep {@link ANDROID_SIGNING_BLOCK} in sync in `android/app/build.gradle` (#370).
+ *
+ *  Always re-derived from the current constant rather than presence-checked, for the reason
+ *  {@link healIosArchiveWarning} spells out: a "it's already there, done" check pins whatever text
+ *  the project was healed with, so editing the block later would leave every existing project on
+ *  the old version. Re-deriving stays idempotent — identical output means nothing is written.
+ *
+ *  ⚠️ **Skips a project that already configures `signingConfigs` by hand**, outside our fence.
+ *  `games/iap-test` is exactly that (#196 wired its Play upload key before this engine path
+ *  existed), and healing over it would give the file two `signingConfigs.release` definitions —
+ *  the second silently winning. A hand-written config that already reads the same
+ *  `keystore.properties` needs nothing from us; one that reads something else is a deliberate
+ *  choice this heal has no business overriding. */
+function healAndroidReleaseSigning(projectRoot: string): string | undefined {
+  const gradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  if (!fs.existsSync(gradle)) return undefined;
+  const orig = fs.readFileSync(gradle, 'utf8');
+  // CRLF-safe, like the Crashlytics heals next door: this block is LF-joined, and appending it
+  // straight onto a CRLF gradle file inserts bare-LF lines into a CRLF file. Normalize, edit,
+  // restore. (The CRLF guard in healNativeConfig.test.ts caught exactly this.)
+  const { lf, restore } = eolSafe(orig);
+  const fenceRe = new RegExp(`\\n*${escapeRe(ANDROID_SIGNING_BEGIN)}[\\s\\S]*?${escapeRe(ANDROID_SIGNING_END)}\\n?`);
+  const hasFence = fenceRe.test(lf);
+
+  // A hand-written signingConfigs OUTSIDE our fence owns this project — leave it alone.
+  //
+  // Comments are stripped before the test, in both directions. A `signingConfigs {` sitting inside
+  // a `/* … */` block or behind a `//` would otherwise read as a real hand-written config, and the
+  // project would silently never get release signing — producing `app-release-unsigned.apk` while
+  // the build's success message points at the signed path. (The inverse, a real config the regex
+  // fails to see, appends a second `signingConfigs.release` that quietly wins over the author's.)
+  const codeOnly = lf
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+  if (!hasFence && /(^|\n)\s*signingConfigs\s*\{/.test(codeOnly)) return undefined;
+
+  const text = hasFence
+    ? lf.replace(fenceRe, '\n\n' + ANDROID_SIGNING_BLOCK + '\n')
+    : lf.replace(/\n*$/, '\n') + '\n' + ANDROID_SIGNING_BLOCK + '\n';
+  if (text === lf) return undefined;
+  fs.writeFileSync(gradle, restore(text));
+  return `${hasFence ? 'synced' : 'added'} the Gradle release signing config (#370)`;
+}
+
+/** The keystore-ignore block every `android/.gitignore` must carry (#370). */
+const ANDROID_GITIGNORE_KEYSTORE_BLOCK = [
+  '# Keystore files',
+  '# UNCOMMENTED deliberately (#370). The Android template ships these commented out, which means a',
+  '# keystore dropped in this folder is COMMITTED by default — into a repo whose snapshot is published',
+  '# publicly. An upload key in git is a signing-identity compromise, not a tidiness problem.',
+  '# The real key for this project lives OUTSIDE the repo (~/.modoki/keystores/); these lines are',
+  '# defence in depth for anyone who later puts one here by habit.',
+  '*.jks',
+  '*.keystore',
+  '',
+  '# Signing config — absolute paths + passwords for the upload key. NEVER committed.',
+  '# app/build.gradle reads it if present and silently skips release signing if absent, so a fresh',
+  '# clone still builds debug without it.',
+  'keystore.properties',
+].join('\n');
+
+/** Uncomment the keystore-ignore lines in `android/.gitignore`, and add `keystore.properties` (#370).
+ *
+ *  **Why this is a HEAL and not a one-time sweep.** The file is generated by `cap add`, from
+ *  Capacitor's copy of the upstream Android template — which ships `#*.jks` / `#*.keystore`
+ *  COMMENTED OUT. So fixing the 21 existing projects by hand fixes exactly those 21: the very next
+ *  `Add Android Target…` writes the unsafe version again, and the failure is silent until someone
+ *  drops a `.jks` in that folder and `git add` sweeps a signing identity into a repo whose snapshot
+ *  is published publicly. A heal is the only thing that holds.
+ *
+ *  Idempotent: no-op once the uncommented lines and `keystore.properties` are all present. Matches
+ *  the commented block loosely (by the `#*.jks` line) because the surrounding comment wording has
+ *  varied across template versions, and anchoring on the exact sentence is how a heal quietly stops
+ *  firing after an upstream reword. */
+function healAndroidGitignoreKeystore(projectRoot: string): string | undefined {
+  const file = path.join(projectRoot, 'android', '.gitignore');
+  if (!fs.existsSync(file)) return undefined;
+  const orig = fs.readFileSync(file, 'utf8');
+  const { lf, restore } = eolSafe(orig);
+
+  // Already right — the common case on every open after the first. Compared against the canonical
+  // block (not "are the three entries present somewhere"), so a project healed by an OLDER engine
+  // picks up an edited block instead of being pinned to the text it first got.
+  //
+  // ⚠️ Modulo the ISSUE NUMBER in the block's first comment. `games/iap-test` carries this same
+  // block referencing #196, because it wired its Play upload key before the engine had a release
+  // path at all — and that provenance is worth more than uniformity. Comparing literally made the
+  // heal treat that file as unhealed, and the converge pass below then appended a SECOND copy of
+  // the block while orphaning the #196 comment lines. Normalising the number means a correct file
+  // is recognised whichever issue introduced it.
+  const unIssue = (t: string) => t.replace(/\(#\d+\)/g, '(#N)');
+  if (unIssue(lf).includes(unIssue(ANDROID_GITIGNORE_KEYSTORE_BLOCK))) return undefined;
+
+  // CONVERGE, don't patch. Earlier versions branched on the file's shape — pristine template vs.
+  // everything else — and a file where somebody had hand-uncommented only `*.jks` matched neither
+  // branch's assumptions, so it took the append path and grew a SECOND `*.jks`, a second
+  // "# Keystore files" header and an orphan `#*.keystore`, on every single project open. Stripping
+  // every keystore-related line first means a half-edited file, a pristine one and an
+  // already-healed one all reduce to the same input, and the block goes back where the old one was.
+  const lines = lf.split('\n');
+  // Every line the canonical block itself contains counts as ours to replace — derived FROM the
+  // constant rather than re-listed, so editing the block cannot leave this predicate behind
+  // stripping the previous wording. Issue numbers normalised for the iap-test reason above.
+  const blockLines = new Set(
+    ANDROID_GITIGNORE_KEYSTORE_BLOCK.split('\n').map((l) => unIssue(l.trim())).filter(Boolean),
+  );
+  const isKeystoreLine = (l: string) => {
+    const t = l.trim();
+    return /^#?\*\.(jks|keystore)$/.test(t)
+      || /^#?keystore\.properties$/.test(t)
+      || /^# Uncomment the following lines? if you do not want to check your keystore files? in\.?$/.test(t)
+      || blockLines.has(unIssue(t));
+  };
+  let anchor = -1;
+  const kept: string[] = [];
+  for (const l of lines) {
+    if (isKeystoreLine(l)) { if (anchor === -1) anchor = kept.length; continue; }
+    kept.push(l);
+  }
+  // No keystore section anywhere → append at the end.
+  if (anchor === -1) anchor = kept.length;
+  // Collapse a blank line the strip may have stranded next to the insertion point, so repeated
+  // heals cannot accrete empty lines.
+  while (anchor > 0 && kept[anchor - 1].trim() === '' && kept[anchor]?.trim() === '') kept.splice(anchor, 1);
+  const block = ANDROID_GITIGNORE_KEYSTORE_BLOCK.split('\n');
+  const out = [...kept.slice(0, anchor), ...block, ...kept.slice(anchor)];
+  // Squeeze blank lines ONLY around the block we just inserted, never file-wide: a project's
+  // .gitignore may legitimately use several blank lines to group sections, and rewriting those is
+  // an edit in a region this heal has no business in — the #18 write-behind-your-back hazard, done
+  // to ourselves. Bounded to the inserted span plus one line either side.
+  const lo = Math.max(0, anchor - 1);
+  const hi = Math.min(out.length, anchor + block.length + 1);
+  const squeezed = [
+    ...out.slice(0, lo),
+    ...out.slice(lo, hi).join('\n').replace(/\n{3,}/g, '\n\n').split('\n'),
+    ...out.slice(hi),
+  ];
+  const text = squeezed.join('\n').replace(/\n*$/, '\n');
+  if (text === lf) return undefined;
+  fs.writeFileSync(file, restore(text));
+  return 'uncommented the keystore ignores + added keystore.properties in android/.gitignore (#370)';
 }
 
 /** Remove a top-level Info.plist key AND its value element. Inverse of
@@ -2250,6 +2448,14 @@ export function healNativeConfig(projectRoot: string): HealResult {
     // Android half of the same concern (#282) — likewise independent of build.debugBuild.
     const dsa = healAndroidCrashlytics(projectRoot);
     if (dsa) notes.push(dsa);
+    // Release signing (#370) — unconditional, and deliberately NOT gated on this machine having an
+    // upload key. The block is inert without `android/keystore.properties`, so healing it in
+    // everywhere means the gradle side is already correct the first time anyone configures a key,
+    // rather than needing a second project-open to appear.
+    const rs = healAndroidReleaseSigning(projectRoot);
+    if (rs) notes.push(rs);
+    const gi = healAndroidGitignoreKeystore(projectRoot);
+    if (gi) notes.push(gi);
     // game-debug heals — only for a project that depends on the bridge. Every one of
     // these keys on build.debugBuild and NOTHING else (#112): the Xcode/Gradle
     // configuration means optimization + symbols, never "is this a debug build".

@@ -163,6 +163,17 @@ function FieldControl({ field, value, onChange, onPick }: {
         </div>
       );
     }
+    // Masked because the value is a signing-key password and this dialog is routinely open while
+    // the owner screen-shares or screenshots the editor (#370). It is masking, NOT secrecy: the
+    // value round-trips through the same GET/POST as every other field and sits in plain text in
+    // the gitignored project.user.json, which is the honest place for it.
+    case 'password':
+      return (
+        <div>{label}
+          <input data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} type="password" autoComplete="off" style={inputStyle} value={String(value ?? '')}
+            placeholder={field.placeholder} onChange={(e) => onChange(e.target.value)} />
+        </div>
+      );
     case 'readonly-text':
       return (
         <div>{label}

@@ -28,8 +28,17 @@ import { REPO_ROOT, hasAnyProject, hasInternalGames } from '../helpers/repoLayou
  *  the gitignored `user.*` subtree belongs here — the `user.sdk.*` ones are per-machine by design
  *  and absolute is correct for them. That correspondence is not left to a comment: the test below
  *  reads the schema and asserts set equality, so #396's splash source cannot be added to the UI
- *  and quietly miss this guard. */
-const PROJECT_PATH_FIELDS = ['app.iconSource'] as const;
+ *  and quietly miss this guard — which is precisely what it caught when #396/#397 landed the
+ *  seven fields below. */
+const PROJECT_PATH_FIELDS = [
+  'app.iconSource',
+  'app.iconMonochromeSource',
+  'app.iconDarkSource',
+  'app.iconTintedSource',
+  'app.splashSource',
+  'app.splashDarkSource',
+  'app.splashTitleSource',
+] as const;
 
 const SETTINGS_SCHEMA_SRC = join(REPO_ROOT, 'engine/app/editor/setup.ts');
 

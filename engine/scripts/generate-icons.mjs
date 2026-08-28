@@ -45,6 +45,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { ICON_TOOL, iconColorArgs } from './iconAssets.mjs';
+import { composeSplashOverlays } from './splashCompose.mjs';
+import { writeIosIconVariants, writeAndroidIconVariants } from './iconVariants.mjs';
+import { applyAndroidSplashTheme } from './androidSplashTheme.mjs';
 
 /** The one directory each platform's run owns. Everything the generator writes here is its
  *  product and is kept; everything it writes elsewhere is collateral and is undone. Measured,
@@ -125,19 +128,26 @@ export function restoreSnapshot(snapshot, projectRoot) {
   return { restored, failed };
 }
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   const platform = args.platform;
   const iconSrc = args.icon;
   // Validate BEFORE resolving: `path.resolve(undefined)` throws ERR_INVALID_ARG_TYPE, so a
   // missing --project used to crash with a stack trace instead of reaching this message.
   if (!args.project || (platform !== 'ios' && platform !== 'android')) {
-    console.error('[icon] usage: generate-icons.mjs --project <dir> --platform ios|android --icon <file> [--stamp <value>]');
+    console.error('[icon] usage: generate-icons.mjs --project <dir> --platform ios|android --icon <file> [--stamp <value>]\n'
+      + '                        [--splash <file>] [--splash-dark <file>] [--title <file>]\n'
+      + '                        [--title-width <pct>] [--title-offset <pct>] [--badge true|false]\n'
+      + '                        [--badge-light <file>] [--badge-dark <file>] [--orientation portrait|landscape|any]\n'
+      + '                        [--icon-dark <file>] [--icon-tinted <file>] [--icon-monochrome <file>]');
     process.exit(2);
   }
   const projectRoot = path.resolve(args.project);
 
-  // The generator's input convention: <project>/assets/icon.png.
+  // The generator's input convention: <project>/assets/{icon,splash,splash-dark}.png. Staging a
+  // splash is the whole of #396's generation half — `@capacitor/assets` has always read these
+  // two filenames (project.js:45-54) and cover-crops them into every bucket; nothing ever put a
+  // file there, so every project's splash was its icon by default rather than by design.
   try {
     fs.mkdirSync(path.join(projectRoot, 'assets'), { recursive: true });
     fs.mkdirSync(path.join(projectRoot, '.cache'), { recursive: true });
@@ -146,6 +156,32 @@ function main() {
     // Non-fatal by design: an icon-less build still ships, with the committed icons intact.
     console.log(`[icon] generation skipped — could not stage the source image (${e.message})`);
     return;
+  }
+
+  const stageSplash = (src, name) => {
+    if (!src) return false;
+    try {
+      fs.copyFileSync(src, path.join(projectRoot, 'assets', name));
+      return true;
+    } catch (e) {
+      // Loud, and NOT fatal: the icon-derived splash still ships. Silence here would look
+      // exactly like "the author never set a splash".
+      console.error(`[icon] could not stage ${name} from ${src}: ${e.message}`);
+      return false;
+    }
+  };
+  // An unset dark splash reuses the light art rather than falling back to the ICON-derived
+  // splash, which would make dark mode the only mode still showing the old panda-on-white.
+  const splashStaged = stageSplash(args.splash, 'splash.png');
+  if (splashStaged) stageSplash(args['splash-dark'] || args.splash, 'splash-dark.png');
+  if (!splashStaged) {
+    // ⚠️ The staging directory is gitignored SCRATCH that survives between builds, so a splash
+    // left there by an earlier build would keep being picked up after `splashSource` was
+    // cleared — "remove the custom splash" would appear to do nothing. Clearing a setting has
+    // to clear its input.
+    for (const stale of ['splash.png', 'splash-dark.png']) {
+      try { fs.rmSync(path.join(projectRoot, 'assets', stale), { force: true }); } catch { /* nothing staged */ }
+    }
   }
 
   const productAbs = path.join(projectRoot, PRODUCT_DIR[platform]);
@@ -185,6 +221,79 @@ function main() {
     console.error('[icon] Check `git status` and revert them by hand. No freshness stamp written — the next build retries.');
     return;
   }
+  // Everything below runs AFTER the restore, on purpose (#397): the files it edits — the iOS
+  // `AppIcon.appiconset/Contents.json` and Android's `mipmap-anydpi-v26/ic_launcher*.xml` — sit
+  // INSIDE the running platform's product directory, so the snapshot never held them and the
+  // restore cannot undo this work. Run before the restore and it would.
+  // ⚠️ A step that FAILED must not be stamped. `restoreSnapshot`'s docstring states the rule for
+  // the restore path — "with the stamp written, `iconIsUpToDate` returns true forever, the step
+  // never runs again" — and it applies just as hard to everything below: these steps write
+  // file-by-file, so a throw half way leaves a PARTIAL splash set, and this module's own header
+  // says a partial set is worse than none because it looks fine on the device you happen to test.
+  // Stamping that is how it becomes permanent behind one scrolled-past console line.
+  let postFailed = false;
+
+  try {
+    const variants = platform === 'ios'
+      ? await writeIosIconVariants({
+        projectRoot,
+        iconSrcAbs: iconSrc,
+        darkSrcAbs: args['icon-dark'],
+        tintedSrcAbs: args['icon-tinted'],
+      })
+      : await writeAndroidIconVariants({
+        projectRoot,
+        iconSrcAbs: iconSrc,
+        monochromeSrcAbs: args['icon-monochrome'],
+      });
+    if (platform === 'android') {
+      // The Android 12+ system splash is the only launch surface the platform actually draws —
+      // the generated drawable buckets are never shown at minSdk 31+. See androidSplashTheme.mjs.
+      const theme = await applyAndroidSplashTheme({ projectRoot, splashSrcAbs: args.splash });
+      if (theme.changed) console.log(`[icon] system splash colour ${theme.colour} (sampled from the splash master)`);
+      for (const n of theme.notes) console.log(`[icon] ${n}`);
+    }
+    if (variants.written.length) console.log(`[icon] icon variants: ${variants.written.length} file(s)`);
+    for (const n of variants.notes) console.log(`[icon] ${n}`);
+  } catch (e) {
+    // Non-fatal for the BUILD — the base icons are already generated and committed, and a missing
+    // variant degrades to the OS's own fallback — but NOT stamped, so the next build retries.
+    console.error(`[icon] icon variants failed (${e.message}) — base icons are unaffected, will retry next build`);
+    postFailed = true;
+  }
+
+  try {
+    const overlays = await composeSplashOverlays({
+      projectRoot,
+      platform,
+      orientation: args.orientation,
+      titleSrc: args.title,
+      titleWidthPct: Number(args['title-width'] ?? 55),
+      titleOffsetPct: Number(args['title-offset'] ?? -8),
+      badge: args.badge === 'true',
+      badgeLightArt: args['badge-light'],
+      badgeDarkArt: args['badge-dark'],
+      // A custom splash is re-encoded whether or not it carries overlays — see SPLASH_PNG.
+      optimise: splashStaged,
+    });
+    if (overlays.files) {
+      console.log(`[icon] splash pass over ${overlays.files} image(s)`
+        + `${overlays.title ? ` — title x${overlays.title}` : ''}`
+        + `${overlays.badge ? `, badge x${overlays.badge}` : ''}`
+        + `${overlays.bytesSaved > 0 ? `, re-encoded ${(overlays.bytesSaved / 1048576).toFixed(1)} MB smaller` : ''}`);
+    }
+    // Clamping means an authored placement did not fit the crop-safe region. Reported rather
+    // than silently corrected: the overlay IS on screen, but not where it was asked to be.
+    for (const c of overlays.clamped) console.log(`[icon] ⚠️  overlay clamped into the crop-safe box: ${c}`);
+  } catch (e) {
+    console.error(`[icon] splash overlays failed (${e.message}) — will retry next build`);
+    postFailed = true;
+  }
+
+  if (postFailed) {
+    console.error('[icon] no freshness stamp written — the next build will re-run this step.');
+    return;
+  }
   if (args.stamp) {
     try { fs.writeFileSync(path.join(projectRoot, '.cache', `icon-stamp-${platform}`), args.stamp); }
     catch (e) { console.log(`[icon] could not write the freshness stamp (${e.message}) — the next build will regenerate`); }
@@ -192,4 +301,4 @@ function main() {
 }
 
 // Importable for tests; only the CLI entry runs main().
-if (import.meta.url === `file://${process.argv[1]}`) main();
+if (import.meta.url === `file://${process.argv[1]}`) await main();

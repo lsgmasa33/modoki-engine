@@ -20,6 +20,7 @@ import {
   CAPACITOR_ORIENTATIONS, STATUS_BAR_STYLES, KEYBOARD_RESIZE_MODES, WEB_DEPLOY_MODES, WEB_SIZE_MODES,
   PLAYABLE_NETWORKS, IOS_CONTENT_MODES, ANDROID_SCHEMES, GPU_BACKENDS, QUALITY_TIERS, TONE_MAPPINGS,
   TEXTURE_TIER_VARIANTS_MODES,
+  IOS_EXPORT_METHODS,
 } from '../../project-config';
 import { loadProjectGames } from '../projectGames';
 import { registerAll } from '../ecs/register';
@@ -65,7 +66,7 @@ async function runGameHook(gameId: string, phase: string, hook?: () => unknown):
 }
 
 /** Trigger a build + deploy via the dev server's SSE endpoint */
-async function runBuild(platform: 'ios' | 'android' | 'web' | 'playable') {
+async function runBuild(platform: 'ios' | 'android' | 'web' | 'playable', variant: 'debug' | 'release' = 'debug') {
   // Refuse a SECOND concurrent build (see `buildRefusal` for what two at once actually do to the
   // project dir). The DOM progress modal does not gate this: under Electron the build items live
   // in the native application menu, which a modal cannot cover.
@@ -87,7 +88,10 @@ async function runBuild(platform: 'ios' | 'android' | 'web' | 'playable') {
       }
     } catch { /* fall through to the build (its preflight still fails friendly) */ }
   }
-  runStream(`/api/build?platform=${platform}`, 5, `${platform} build`, 'Starting build...');
+  // #370: `variant` is omitted for a debug build so the request stays byte-identical to what every
+  // pre-release caller sent — the server's default is `debug` for the same reason.
+  const q = variant === 'release' ? `?platform=${platform}&variant=release` : `?platform=${platform}`;
+  runStream(`/api/build${q}`, 5, `${platform}${variant === 'release' ? ' release' : ''} build`, 'Starting build...');
 }
 
 // ── Build → device target picker (#170) ──────────────────────────────────────────────────────
@@ -391,6 +395,14 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
       { label: webLabel, action: () => runBuild('web') },
       { label: `Playable Ad — ${appName}`, action: () => runBuild('playable') },
       { label: '', separator: true },
+      // Release builds (#370) — deliberately NOT under the device submenus. They target no device
+      // at all (an archive for `generic/platform=iOS`; an AAB that installs nowhere), so nesting
+      // them under a phone picker would attach a choice that does not apply and imply an install
+      // that never happens. The labels name the ARTIFACT, because that is the whole product: the
+      // build ends with a file you then upload by hand.
+      { label: iosUnavailable ? 'iOS Release (App Store .ipa) — needs macOS' : `iOS Release (App Store .ipa) — ${appName}`, action: () => runBuild('ios', 'release'), disabled: iosUnavailable },
+      { label: `Android Release (Play AAB) — ${appName}`, action: () => runBuild('android', 'release') },
+      { label: '', separator: true },
       { label: iosUnavailable ? 'Add iOS Target… (needs macOS)' : 'Add iOS Target…', action: () => runAddNativeTarget('ios'), disabled: iosUnavailable },
       { label: 'Add Android Target…', action: () => runAddNativeTarget('android') },
       { label: '', separator: true },
@@ -418,6 +430,15 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
                 { key: 'app.appId', label: 'Bundle ID', type: 'text' },
                 { key: 'app.appName', label: 'App name', type: 'text' },
                 { key: 'app.iconSource', label: 'App icon (source PNG)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = bundled Modoki icon', help: 'square, ≥1024px; all sizes generated on build' },
+                { key: 'app.iconMonochromeSource', label: 'Icon — monochrome (Android)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = derived from the app icon', help: 'the silhouette a themed-icon launcher tints (Android 13+). The derived version is a fallback: flattening a full-colour PAINTING to one tone usually gives a low-contrast blob, so author this one whenever the icon is artwork rather than a flat mark.' },
+                { key: 'app.iconDarkSource', label: 'Icon — dark (iOS 18+)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = derived from the app icon', help: 'the dark-mode home-screen icon. Derived by flattening onto the dark ground and easing the luminance down.' },
+                { key: 'app.iconTintedSource', label: 'Icon — tinted (iOS 18+)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = derived from the app icon', help: 'GREYSCALE — iOS applies the user\'s tint to its luminance. Derived by greyscaling and normalising; without an entry iOS derives its own, poorly.' },
+                { key: 'app.splashSource', label: 'Splash (source PNG)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = generated from the app icon', help: 'the NATIVE launch screen, shown before the web view boots — not an in-game title card. Ideally a large square (2732²). ⚠️ Both platforms COVER-FILL it, so the edges are always cropped: on a 19.5:9 phone only the central ~45% of the WIDTH survives. Compose the subject inside that column.' },
+                { key: 'app.splashDarkSource', label: 'Splash — dark mode', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = reuse the splash above', help: 'fills the iOS -dark slots and the Android drawable-night-* buckets, which before this both held the light art.' },
+                { key: 'app.splashTitleSource', label: 'Splash title (transparent PNG)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = no title overlay', help: 'the game\'s wordmark, composited onto the splash at build time rather than painted into the art — so it is always typeset correctly and stays repositionable without regenerating the artwork.' },
+                { key: 'app.splashTitleWidthPct', label: 'Splash title width %', type: 'number', placeholder: '55', help: 'percentage of the splash\'s CROP-SAFE width (not the image\'s), which is what makes one number hold across every device shape.' },
+                { key: 'app.splashTitleOffsetPct', label: 'Splash title offset %', type: 'number', placeholder: '-8', help: 'vertical offset from the centre of the crop-safe region, as a percentage of its height. Negative is up. Clamped into the safe region, with a build log line when that happens.' },
+                { key: 'app.splashBadge', label: 'Splash: "Made by Modoki Engine"', type: 'checkbox', help: 'composites the small Modoki mark at the bottom of the splash\'s crop-safe region. Off by default — nothing already shipped grows a mark it did not have. The badge picks cream or navy per image by measuring the brightness underneath it.' },
                 { key: 'app.version', label: 'Version', type: 'text', placeholder: '1.0', help: 'marketing version, what players see in the store listing — synced into Android versionName + iOS MARKETING_VERSION on open and before every build' },
                 { key: 'app.buildNumber', label: 'Build number', type: 'number', placeholder: '1', disabledIf: { key: 'app.buildNumberAuto', is: 'true' }, help: 'BUMP BEFORE EVERY STORE UPLOAD (read-only while Auto is on — uncheck Auto to edit). Both stores refuse a build number they have already seen and do it SILENTLY — Play just reports "this release is empty". Synced into Android versionCode + iOS CURRENT_PROJECT_VERSION on open and before every build (not on save); never lowered — a lower value is reported in the log and ignored.' },
                 { key: 'app.buildNumberAuto', label: 'Auto build number', type: 'checkbox', help: 'ON = the build number above is IGNORED; versionCode / CFBundleVersion derive from this repo\'s total git commit count on every open/build — no more hand-bumping per upload. The stored number still acts as a floor; if a store ever demands a jump past it, uncheck Auto, type the higher number, and re-check.' },
@@ -536,6 +557,13 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               fields: [
                 { key: 'build.appleTeamId', label: 'Apple Team ID', type: 'combo', options: teamOptions, placeholder: 'e.g. ABCDE12345', help: 'pick a team found on this Mac (or type an ID) — synced into iOS DEVELOPMENT_TEAM on every iOS build' },
                 { key: 'build.iosMinVersion', label: 'Minimum iOS version', type: 'text', placeholder: '16.4', help: 'the ONE floor — sets both the JS bundle target and the native IPHONEOS_DEPLOYMENT_TARGET. Below 15.4 needs polyfills (structuredClone / Array.at / Object.hasOwn land in 15.4), not just a smaller number' },
+                { key: 'build.iosExportMethod', label: 'Release export method', type: 'select', options: labeled(IOS_EXPORT_METHODS, {
+                  'app-store-connect': 'App Store Connect (the shipping path)',
+                  'app-store': 'App Store (pre-Xcode-15.3 spelling)',
+                  'ad-hoc': 'Ad Hoc (registered devices only)',
+                  development: 'Development (registered devices only)',
+                  enterprise: 'Enterprise (in-house distribution)',
+                }), help: 'Used ONLY by Build → iOS Release: the `method` in the generated exportOptions.plist. Ad Hoc / Development produce an .ipa you can install on registered devices to test the RELEASE-signed build before it goes near a store — which is the only way to exercise the release signing certificate. Ignored by a debug device build.' },
               ],
             },
             {
@@ -571,6 +599,19 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
                 { key: 'user.device.androidDeviceId', label: 'Android serial', type: 'text', placeholder: 'empty = default adb device' },
                 { key: 'user.sdk.javaHome', label: 'JAVA_HOME override', type: 'path', pathMode: 'folder', placeholder: 'empty = auto-detect (brew → java_home -v 21)' },
                 { key: 'user.sdk.androidHome', label: 'ANDROID_HOME override', type: 'path', pathMode: 'folder', placeholder: 'empty = auto-detect' },
+              ],
+            },
+            {
+              // #370. Lives under "this machine" for the passwords' sake, but the KEY it points at
+              // is emphatically not per-machine: Play matches an AAB against the key the app was
+              // enrolled with, so a second machine must copy the same .jks rather than make its own.
+              // That is the opposite of the debug key, and the reason this group says so in its title.
+              title: 'Android release signing (project.user.json — not committed)',
+              fields: [
+                { key: 'user.keystore.storeFile', label: 'Upload keystore (.jks)', type: 'path', pathMode: 'file', placeholder: '~/.modoki/keystores/<appId>-upload.jks', help: 'The Play UPLOAD key — ONE key across every machine, kept OUTSIDE the repo. Create one with: keytool -genkeypair -v -keystore ~/.modoki/keystores/<appId>-upload.jks -alias upload -keyalg RSA -keysize 2048 -validity 10000. Empty ⇒ Build → Android Release refuses (an unsigned AAB builds fine and is then rejected at upload).' },
+                { key: 'user.keystore.keyAlias', label: 'Key alias', type: 'text', placeholder: 'upload' },
+                { key: 'user.keystore.storePassword', label: 'Keystore password', type: 'password' },
+                { key: 'user.keystore.keyPassword', label: 'Key password', type: 'password', help: 'Often the same as the keystore password — keytool sets both unless you asked for different ones.' },
               ],
             },
             {

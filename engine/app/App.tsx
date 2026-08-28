@@ -8,6 +8,7 @@ import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
 import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
 import LoadingOverlay from './ui/components/LoadingOverlay';
+import { dismissBootSplash, hasBootSplash, BOOT_SPLASH_TIMEOUT_MS } from './ui/bootSplash';
 import { initWorldSync } from './ecs/init';
 import { runPipeline } from './ecs/pipeline';
 import { GAMES } from 'virtual:modoki-games';
@@ -151,7 +152,54 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
    *  A ref rather than state: it is read inside the load effect and must never re-run it. */
   const no3DTierLoopRef = useRef(false);
 
-  useEffect(() => subscribeOtaGate(setOtaGate), []);
+  useEffect(() => subscribeOtaGate((gate) => {
+    // An OTA gate must be SEEN. The boot splash outranks every boot surface by z-index, so a
+    // download that starts before the game is ready would otherwise show a still launch image for
+    // however long the download takes — indistinguishable from a hang, on exactly the slow
+    // connection where it lasts longest.
+    if (gate) dismissBootSplash();
+    setOtaGate(gate);
+  }), []);
+
+  // ⚠️ The boot splash outranks EVERY other surface by z-index, so any path that ends with the
+  // user looking at the app has to take it down — otherwise a real, explained failure is a static
+  // launch image forever. Three nets, because the success path alone is not enough:
+  //
+  //  1. any `error` state (the unknown-gameId early return below never reaches the try/catch,
+  //     and `gameId` comes from the URL hash — a stale bookmark or a deep link reaches it);
+  //  2. a hard TIMEOUT, which is the only thing that covers a render-time throw caught by
+  //     `<ErrorBoundary>` (its fallback renders inside this component, i.e. UNDER the splash) and
+  //     a boot that simply never completes — the two rAFs the load path awaits do not fire in a
+  //     backgrounded tab;
+  //  3. the success and OTA paths, below.
+  useEffect(() => { if (error) dismissBootSplash(); }, [error]);
+
+  // Hand the NATIVE splash over to the web boot splash as soon as the latter is on screen, rather
+  // than holding it until the game is ready.
+  //
+  // ⚠️ This is what makes the authored splash visible on Android at all. From API 31 the platform
+  // draws its OWN splash — an icon on a solid colour — and ignores the generated drawables
+  // entirely (measured on an S22, API 34); a full-bleed image is not expressible there, by
+  // platform design. So the art has to come from the web layer, and it cannot if the native
+  // splash covers the web view until the game has already painted.
+  //
+  // Phase 3b held it until fully-booted so nobody saw an unstyled white web view. That reason is
+  // gone: the web view's FIRST PAINT is now the boot splash, the same artwork. The hold therefore
+  // stays in place for any project that has no boot splash to hand over to — which is the
+  // `hasBootSplash()` condition, not a nicety.
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform() || !hasBootSplash()) return;
+    import('@capacitor/splash-screen')
+      .then((m) => m.SplashScreen.hide())
+      .catch((e) => {
+        if (isPluginUnimplemented(e)) console.log('[GameShell] no SplashScreen plugin — early hide skipped');
+        else console.warn('[GameShell] early SplashScreen.hide failed (non-fatal):', e);
+      });
+  }, []);
+  useEffect(() => {
+    const t = window.setTimeout(dismissBootSplash, BOOT_SPLASH_TIMEOUT_MS);
+    return () => window.clearTimeout(t);
+  }, []);
 
   useEffect(() => {
     const def = findGame(gameId);
@@ -463,6 +511,12 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
             });
         }
 
+        // The WEB boot splash, on the same "fully booted" signal as the native one above — the two
+        // are the same artwork, so the handoff is one continuous image rather than a cut to dark
+        // navy. A no-op wherever no boot splash was injected (dev, editor, playable, or a project
+        // that has authored no splash).
+        dismissBootSplash();
+
         activeGameIdRef.current = gameId;
         initializedRef.current = true;
         setInitialized(true);
@@ -470,6 +524,9 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
       } catch (e) {
         if (!cancelled) {
           console.error('[GameShell] Failed to load game:', e);
+          // Take the splash down so the error is SEEN: it outranks every boot surface by z-index,
+          // so leaving it up turns an explained failure into an apparent hang.
+          dismissBootSplash();
           setError(String(e));
           setTransitioning(false);
         }

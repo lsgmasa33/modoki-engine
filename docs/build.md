@@ -248,6 +248,133 @@ been deleted (a sentinel file is checked, so a wiped `res/` still comes back). C
 means repointing `app.iconSource` at a byte-identical file is correctly a no-op, while editing
 an image in place is not.
 
+⚠️ **Everything #396/#397 added is in that stamp too** — the splash master and its dark twin, the
+title wordmark, the three icon-variant overrides, the badge artwork, the two placement numbers, the
+badge flag, the **orientation** (it decides where the overlays go, so it changes the output with
+every source file byte-identical), and a `SPLASH_PIPELINE_VERSION` for changes to our own
+post-processing, which no source file can express. This is not belt-and-braces: `iconStep` **drops
+itself from the build plan** on a stamp match, so an input the hash cannot see does not merely take
+an extra build to appear — it never appears, until someone deletes `.cache/icon-stamp-*` by hand.
+One case per input in `tests/plugins/iconAssets.test.ts`.
+
+### The splash: authored, not derived from the icon (#396)
+
+**`app.splashSource`** is the native launch screen — shown before the web view has booted at all,
+and NOT an in-game title card. Empty means what every project shipped before this: the splash is
+derived from `app.iconSource`, i.e. the app icon centred on white. `app.splashDarkSource` fills the
+iOS `-dark` slots and the Android `drawable-night-*` buckets, which had existed all along holding
+the light art; unset, it reuses the light splash.
+
+The generation half is smaller than it looks: `@capacitor/assets` has always read
+`assets/splash.png` and `assets/splash-dark.png` as first-class inputs and cover-crops them into
+every bucket. Nothing had ever put a file there — `generate-icons.mjs` staged only `assets/icon.png`
+— so every project's splash was its icon **by default rather than by design**.
+
+⚠️ **The staging directory is gitignored scratch that SURVIVES between builds**, so clearing
+`splashSource` has to actively delete `assets/splash*.png`; otherwise "remove the custom splash"
+regenerates the old one and appears to do nothing.
+
+**Both platforms COVER-FILL, so a splash is always shown cropped** — and on iOS the crop happens at
+RUNTIME, not at generation: `LaunchScreen.storyboard` shows a single square 2732² image with
+`contentMode="scaleAspectFill"`, which on a 19.5:9 phone leaves only **the central ~45% of the
+width** visible. `engine/scripts/splashLayout.mjs` derives that crop-safe box (the intersection of
+every crop the project's orientation allows) and the title and badge are placed inside it, per
+bucket, against that bucket's own dimensions. Nothing can rescue subject matter authored into the
+corners of the master, so compose around the centre column. `tests/plugins/splashLayout.test.ts`
+pins the derivation.
+
+**The title is composited, never painted into the art.** An image generator mangles lettering often
+enough that the one element which must be perfect cannot be trusted to it, and typesetting it at
+build time keeps `splashTitleWidthPct` / `splashTitleOffsetPct` tunable without regenerating
+artwork. `app.splashBadge` adds the small "Made by Modoki Engine" mark at the bottom of the safe
+box — **default OFF** (owner, 2026-08-28), so nothing already shipped grows a mark it did not have.
+The badge ships as two committed PNGs and picks cream or navy per image by **measuring** the mean
+luminance underneath it; its artwork is rebuilt by `engine/scripts/make-splash-badge.mjs`, whose
+output is committed precisely because it typesets through the system's fonts and would otherwise
+differ per machine.
+
+⚠️ **A real splash is enormous under sharp's defaults, and this is worth knowing before you author
+one.** `@capacitor/assets` writes PNGs with default options, which do almost nothing on a
+photographic image: Court's painted 2732² master came out at **17.6 MB per iOS slot** against 22 MB
+raw, and its first real generation produced **163 MB of committed binaries**. The panda-on-white it
+replaced compressed to nothing, so nothing had ever exercised this. `compressionLevel: 9` +
+`effort: 10` takes the same image to 4.2 MB **losslessly** (163 MB → 41 MB overall), and that
+re-encode runs for every splash of a project with a custom master, overlays or not.
+
+### ⚠️ On Android the generated splash buckets are NEVER DRAWN — the system splash is
+
+Measured on a Galaxy S22 (API 34), and it is not an old-device edge case: **at `minSdkVersion 31`
+this is every supported Android device.** The launch theme inherits `Theme.SplashScreen`, and from
+API 31 the platform draws its own splash and ignores `android:background`, so all 26
+`drawable-*` splash PNGs are dead weight in the APK and the player saw **the app icon on black**.
+
+**And the art cannot be moved there.** Google's splash-screen documentation is explicit — *"Set a
+single window background color with no transparency"*, *"The window background consists of a single
+opaque color"*. There is no documented opt-out; `windowSplashScreenAnimatedIcon` is an ICON
+(circularly masked, 240 dp with an icon background or 288 dp without); and the only image slot,
+`windowSplashScreenBrandingImage`, is 200x80 dp at the bottom, absent from the AndroidX compat
+library, and recommended against by Google. A full-bleed painted launch screen is **not achievable
+as the system splash on Android 12+**, by platform design.
+
+So the launch screen is split across two surfaces, and both halves are needed:
+
+1. **Colour** — `androidSplashTheme.mjs` samples the splash master's EDGE RING and writes it into
+   the launch theme (both the AndroidX and the platform spelling of the attribute). The icon then
+   sits on the game's own colour rather than black. The edge, not the whole image: what fills the
+   perimeter of the frame that follows is the master's border, and averaging the whole thing
+   returns a colour that appears nowhere — for Court, the wood averaged with the cream page.
+2. **Art** — the WEB boot splash below, which is why `App.tsx` hands the native splash over as soon
+   as that has painted rather than holding it until the game is ready.
+
+Verified on device: home → icon on Court's wood → the painted splash with its title and badge →
+the game. ⚠️ The dead `drawable-*` buckets are still generated and still committed (~16 MB on
+Court) — a project that lowered its floor below API 31 would need them, so removing them is an
+owner call rather than a cleanup.
+
+### The WEB boot splash — the same image as the loading screen
+
+The splash art is also emitted as `boot-splash.webp` and injected into `index.html` as a fixed,
+full-bleed element (`engine/plugins/bootSplash.ts`), so the browser paints the game's launch image
+from its **first paint** instead of the four hardcoded dark-navy surfaces that used to fill boot
+(white → `#0f0f23` → a "Loading..." string → the spinner overlay). It is injected into the HTML
+rather than rendered by React on purpose: the window being closed is precisely the one React is not
+alive for. `App.tsx` fades it out on the same "fully booted" signal that hides the native splash —
+so on device the native splash hands over to the identical composition rather than cutting to dark
+— and also whenever something must be seen underneath it (a boot error, an OTA download's
+progress), since a launch image outranking an error would turn an explained failure into a hang.
+Build-only, and skipped for the editor shell and for a playable.
+
+⚠️ **The native splash is handed over as soon as the boot splash has painted**, not when the game
+is ready — `hasBootSplash()` gates it, so a project with no boot splash keeps the old
+hold-until-booted behaviour. Phase 3b held it so nobody saw an unstyled white web view; that reason
+is gone now that the web view's first paint IS the artwork. On Android this is what makes the
+authored splash visible at all (see above). **There is deliberately no minimum display time**
+(owner, 2026-08-28: *"faster load is more important"*) — the splash is as brief as the boot is, and
+that is the intent, not a defect to tune out.
+
+### Icon variants — dark, tinted, monochrome (#397)
+
+`@capacitor/assets@3.0.5` emits one `universal` 1024 entry with no `appearances` and an
+`ic_launcher.xml` with no `<monochrome>`, so iOS 18's dark and tinted icons and Android 13's themed
+icon were all missing. `engine/scripts/iconVariants.mjs` writes them **after** the generator has
+run: both files it edits (the iOS `AppIcon.appiconset/Contents.json` and Android's
+`mipmap-anydpi-v26/ic_launcher*.xml`) sit INSIDE the running platform's product directory, so the
+#236 snapshot-and-restore never sees them — provided this keeps running after the restore, not
+before it. The XML edit is idempotent, because it runs on every build.
+
+Each variant is **derived by default and overridable per project** (`app.iconDarkSource`,
+`iconTintedSource`, `iconMonochromeSource`). ⚠️ **The derivations are fallbacks, not answers.** They
+take a finished painting and try to recover a mark from it, which is the wrong direction: Court's
+derived monochrome kept the region cells and the wood grain and gave a themed launcher a
+knight-shaped smudge. Any project whose icon is artwork rather than a flat mark should author that
+one — `games/court/art/make-icon-monochrome.mjs` is the worked example, and its header records why
+the obvious "the knight is the bright bit" key does not work.
+
+**Judging any of this needs a contact sheet, not a file browser.** `engine/scripts/review-icons.mjs
+--project <dir>` composites the real generated output at true size over both a light and a dark
+ground, simulates the Android adaptive mask at the real inset, shows the tinted variant under a
+tint, and shows each splash as a device crops it.
+
 **The generator does not stay inside the platform it is given** (#236). Measured on
 `forest-camp`: `generate --android` also rewrites `ios/App/App.xcodeproj/project.pbxproj`,
 stripping the leading zero off `LastUpgradeCheck = 0920` → `920` — an **iOS** file mangled by an
@@ -1742,6 +1869,123 @@ interaction device.
 
 **Why this is written down**: both devices are permanently out of the shipping floor, so this is
 not a one-off — it is the standing procedure for every future campaign that wants the low end.
+
+## Release builds (#370)
+
+Until #370 the native pipeline was **dev-install-only on both platforms**: Android ran
+`assembleDebug` + `adb install`, iOS ran `xcodebuild -configuration Debug` + a device install, and
+no project set a `signingConfig`. Nothing shippable had ever come out of it — which was fine until
+`games/court` and `games/wordweave` needed to ship.
+
+**Build → iOS Release (App Store .ipa)** and **Build → Android Release (Play AAB)** are the entry
+points; over HTTP it is `GET /api/build?platform=ios|android&variant=release`, and over MCP it is
+`modoki_build {platform, variant:'release'}`. An **absent `variant` still means `debug`**, so every
+caller that predates this is unchanged.
+
+A release build **installs nothing and deploys nowhere.** It leaves a file:
+
+| platform | artifact |
+|---|---|
+| Android | `android/app/build/outputs/bundle/release/app-release.aab` (Play) + `.../apk/release/app-release.apk` |
+| iOS | `ios/App/build/ipa/*.ipa`, from an `xcodebuild archive` + `-exportArchive` |
+
+The APK is not redundant. It is the only way to `adb install` and actually TEST the build that
+ships — and for Google Sign-In (#360) that is not optional, because sign-in matches on the signing
+CERTIFICATE and a debug build cannot exercise the release one at all.
+
+Both variants share everything up to the compile — the web bundle, the OTA manifest, icons,
+`cap sync`, the dep heal, the version heal. Only the compile step and the device requirement
+differ, which is why `variant` is a separate parameter rather than two more `BUILD_PLATFORMS`
+values: a release build must never miss a check the debug build gets.
+
+### The Android upload key
+
+Release signing reads `android/keystore.properties`, which the release build **generates** from the
+gitignored, per-machine `games/<id>/project.user.json`:
+
+```jsonc
+{ "keystore": {
+    "storeFile": "/Users/you/.modoki/keystores/com.apiary.court-upload.jks",
+    "storePassword": "…", "keyAlias": "upload", "keyPassword": "…" } }
+```
+
+Edit it in **Project Settings → Android → Android release signing**, or create a key with:
+
+```bash
+keytool -genkeypair -v -keystore ~/.modoki/keystores/<appId>-upload.jks \
+  -alias upload -keyalg RSA -keysize 2048 -validity 10000
+```
+
+⚠️ **The upload key is ONE key across every machine.** Play matches the AAB against the key the app
+was enrolled with and rejects any other, so a second machine **copies the same `.jks`** — it does
+not generate its own. This is the opposite of `~/.android/debug.keystore`, which is legitimately
+per-machine (and whose per-machine-ness causes `INSTALL_FAILED_UPDATE_INCOMPATIBLE` across
+machines). Keep the file OUTSIDE the repo.
+
+A release Android build **refuses** when the key is missing or the `.jks` is not on disk, naming
+what to set. That refusal is the point: Gradle happily builds an unsigned release AAB and reports
+success, and Play then rejects it at **upload** time with "signed in debug mode" — a failure
+discovered long after the build looked fine.
+
+⚠️ **`modoki_project_settings action=get` REDACTS the two keystore passwords** (`••••••••`), and
+`action=set` drops that sentinel rather than writing it. The route itself returns them — the Project
+Settings dialog needs them — but an agent asking for `appId` should not pull a signing password into
+its transcript. `storeFile` and `keyAlias` stay readable, so "why did the release build refuse" is
+still diagnosable. The `set` half is what makes this safe: without it a get → edit → set round-trip
+would write the sentinel in as the literal password.
+
+`healAndroidReleaseSigning` writes the `signingConfigs.release` block into
+`android/app/build.gradle` (a fenced, re-derived block), and it is **inert without
+`keystore.properties`** — a keyless clone or CI still builds debug exactly as before.
+`games/iap-test` configures signing by hand (#196) and the heal deliberately skips it.
+
+⚠️ **`healAndroidGitignoreKeystore` exists because `cap add` regenerates `android/.gitignore` from
+the upstream Android template, where `#*.jks` / `#*.keystore` are COMMENTED OUT.** A keystore
+dropped in that folder would be committed by default — into a repo whose snapshot is published
+publicly. Fixing the existing projects by hand fixes exactly those projects; the heal is what holds
+for the next one.
+
+### The iOS archive
+
+`build.iosExportMethod` (committed, Project Settings → iOS → Signing) becomes the `method` in a
+generated `ios/App/build/exportOptions.plist`. `app-store-connect` is the shipping path;
+`ad-hoc`/`development` produce an .ipa installable on registered devices, for testing the
+release-signed build before it goes near a store. The Team ID is `build.appleTeamId` — for Court and
+wordweave that is Apiary's shipping team (see the root `CLAUDE.md` § App Identity), not the dev team.
+
+⚠️ The generated plist and the archive live under `ios/App/build/`, which every project's
+`ios/.gitignore` already covers — they carry the Apple Team ID, a `PRIVATE_BUILD_FIELDS` value.
+`verify:publish` is the backstop, not the defence; do not relocate them.
+
+⚠️ `manageAppVersionAndBuildNumber` is pinned **false**. Xcode's default is true, which lets the
+export rewrite `CFBundleVersion` — silently overwriting the number the version heal just wrote from
+`app.buildNumber` (see § "The app version + build number" above), so the build would ship a number
+the project never chose.
+
+### What still has to happen by hand
+
+**Play App Signing and the Firebase SHA-1s are console work, not build work.**
+
+⚠️ **Registering the fingerprints is ENOUGH — it does not need a rebuild.** The
+`com.google.gms.google-services` plugin compiles exactly seven resources out of
+`google-services.json` into the app: `default_web_client_id`, `gcm_defaultSenderId`,
+`google_api_key`, `google_app_id`, `google_crash_reporting_api_key`, `google_storage_bucket`,
+`project_id`. The `client_type: 1` (Android) entries — the ones carrying `certificate_hash` — are
+**not** among them; the cert↔client mapping is enforced by Google's servers. Verified on Court
+2026-08-28 by grepping the whole release build tree for a newly added fingerprint: it appears only
+in the source JSON, in no built artifact. So an already-shipped build starts working the moment the
+SHA-1 is registered. Committing the regenerated `google-services.json` is still right — the source
+of truth should match — but it is not the thing that unblocks sign-in, and treating it as one costs
+a build-and-upload cycle nobody needed. (This entry exists because that is exactly what was claimed
+first, from the general shape of the file rather than from what the plugin emits.)
+
+ Google Sign-In
+matches an app by package name + signing certificate SHA-1, and with Play App Signing there are
+**three** certificates: debug, the upload key, and the **app signing key Google generates and
+re-signs every install with**. Registering only the first two makes sign-in work in every test
+anyone runs and fail for every single person who installs from Play. All three fingerprints belong
+in the Firebase console, and the third only exists once the app is enrolled in Play App Signing —
+i.e. after the first AAB upload.
 
 ## iOS build notes
 

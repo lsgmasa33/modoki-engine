@@ -420,7 +420,7 @@ export async function awaitRendererReady(
 export interface ProjectSettingsField {
   key: string;
   label: string;
-  type: 'text' | 'number' | 'checkbox' | 'select' | 'combo' | 'string-list' | 'physics-layers' | 'path' | 'scene-list' | 'module-toggles' | 'quality-tiers' | 'readonly-text';
+  type: 'text' | 'number' | 'checkbox' | 'select' | 'combo' | 'string-list' | 'physics-layers' | 'path' | 'scene-list' | 'module-toggles' | 'quality-tiers' | 'readonly-text' | 'password';
   /** Options for `select` fields, and suggestions for a `combo` (free-text +
    *  datalist) field — the stored value is the option's `value`. */
   options?: { value: string; label: string }[];

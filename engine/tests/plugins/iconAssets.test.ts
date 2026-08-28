@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   ICON_TOOL, ICON_COLORS, iconStampValue, iconIsUpToDate,
-  iconStampPath, iconSentinelPath,
+  iconStampPath, iconSentinelPath, SPLASH_PIPELINE_VERSION,
 } from '../../plugins/iconAssets';
 
 let root: string;
@@ -77,7 +77,13 @@ describe('icon freshness stamp', () => {
   });
 
   it('regenerates when the pinned tool version changes', () => {
-    markGenerated('android', iconStampValue(src, 'android').replace(/^./, 'f'));
+    // ⚠️ The mutation must ALWAYS change the value. This used to be `.replace(/^./, 'f')`, which
+    // is a NO-OP whenever the hash already starts with 'f' — a 1-in-16 chance of asserting that an
+    // identical stamp is stale, i.e. passing vacuously. It duly went red the first time an
+    // unrelated change moved the digest onto an 'f'. Flipping the first character to a DIFFERENT
+    // one cannot degenerate.
+    const real = iconStampValue(src, 'android');
+    markGenerated('android', (real[0] === 'f' ? '0' : 'f') + real.slice(1));
     expect(iconIsUpToDate(root, src, 'android')).toBe(false);
   });
 
@@ -104,5 +110,102 @@ describe('icon freshness stamp', () => {
 
   it('keeps the stamp inside the gitignored .cache/ (never a committed file)', () => {
     expect(path.relative(root, iconStampPath(root, 'ios')).split(path.sep)[0]).toBe('.cache');
+  });
+});
+
+/** #396/#397 added nine inputs, and `iconStep` DROPS ITSELF from the build plan on a stamp
+ *  match. So anything that changes the output and is not in this hash does not merely take an
+ *  extra build to appear — it never appears, until somebody deletes `.cache/icon-stamp-*` by
+ *  hand. Both issues named that as the trap to avoid, so every new input gets a case here.
+ *
+ *  Each case perturbs ONE input and asserts the stamp moved: a test that changed two at once
+ *  would pass with either half of the hash missing. */
+describe('splash + icon-variant inputs are all in the stamp', () => {
+  let other: string;
+  beforeEach(() => {
+    other = path.join(root, 'other.png');
+    fs.writeFileSync(other, 'different-bytes');
+  });
+
+  const base = () => iconStampValue(src, 'android');
+
+  it('an unconfigured project hashes to a stable value', () => {
+    expect(iconStampValue(src, 'android', {})).toBe(base());
+  });
+
+  it.each([
+    ['splashSrcAbs'],
+    ['splashDarkSrcAbs'],
+    ['titleSrcAbs'],
+    ['badgeArtAbs'],
+    ['iconDarkSrcAbs'],
+    ['iconTintedSrcAbs'],
+    ['iconMonochromeSrcAbs'],
+  ])('configuring %s changes the stamp', (field) => {
+    expect(iconStampValue(src, 'android', { [field]: other })).not.toBe(base());
+  });
+
+  it('hashes each source file\'s CONTENT, so editing one in place regenerates', () => {
+    const before = iconStampValue(src, 'android', { splashSrcAbs: other });
+    fs.writeFileSync(other, 'edited-in-place');
+    expect(iconStampValue(src, 'android', { splashSrcAbs: other })).not.toBe(before);
+  });
+
+  it('distinguishes an UNSET source from one whose file has gone missing', () => {
+    // Both are "no usable file", but they must not collide: repairing a broken path would
+    // otherwise hash identically to the broken state and regenerate nothing.
+    const unset = iconStampValue(src, 'android', {});
+    const missing = iconStampValue(src, 'android', { splashSrcAbs: path.join(root, 'nope.png') });
+    expect(missing).not.toBe(unset);
+  });
+
+  it('does NOT regenerate when a source is repointed at byte-identical art', () => {
+    const copy = path.join(root, 'copy.png');
+    fs.copyFileSync(other, copy);
+    expect(iconStampValue(src, 'android', { splashSrcAbs: copy }))
+      .toBe(iconStampValue(src, 'android', { splashSrcAbs: other }));
+  });
+
+  it('covers the placement numbers — they move the overlay without touching a single file', () => {
+    expect(iconStampValue(src, 'android', { titleWidthPct: 55 }))
+      .not.toBe(iconStampValue(src, 'android', { titleWidthPct: 60 }));
+    expect(iconStampValue(src, 'android', { titleOffsetPct: -8 }))
+      .not.toBe(iconStampValue(src, 'android', { titleOffsetPct: -12 }));
+  });
+
+  it('hashes the DARK badge art too, not just the light one', () => {
+    // Found in review. Only `badgeArtAbs` (the light mark) was hashed, so re-cutting the dark
+    // mark — the one shown on a LIGHT splash — produced an identical stamp and shipped the old art.
+    expect(iconStampValue(src, 'android', { badgeArtAbs: src, badgeDarkArtAbs: other }))
+      .not.toBe(iconStampValue(src, 'android', { badgeArtAbs: src }));
+  });
+
+  it('covers the badge flag', () => {
+    expect(iconStampValue(src, 'android', { badge: true }))
+      .not.toBe(iconStampValue(src, 'android', { badge: false }));
+  });
+
+  it('covers ORIENTATION — it decides the crop-safe box, so it moves the overlays', () => {
+    // The subtle one: every source file is byte-identical, and the output still changes.
+    expect(iconStampValue(src, 'android', { orientation: 'portrait' }))
+      .not.toBe(iconStampValue(src, 'android', { orientation: 'auto' }));
+  });
+
+  it('exposes a post-processing version, the only input that can express a CODE change', () => {
+    // A change to the derivations or the overlay geometry is invisible to every other input —
+    // no source file moves — so bumping this constant is what invalidates already-stamped
+    // projects. The test can only assert that it exists and is non-empty: it is a module
+    // constant folded into the hash by construction, and faking a second value to compare
+    // against would be testing the mock, not the stamp.
+    expect(typeof SPLASH_PIPELINE_VERSION).toBe('string');
+    expect(SPLASH_PIPELINE_VERSION.length).toBeGreaterThan(0);
+  });
+
+  it('feeds through iconIsUpToDate, not just the raw hash', () => {
+    markGenerated('android', iconStampValue(src, 'android', { badge: true }));
+    expect(iconIsUpToDate(root, src, 'android', { badge: true })).toBe(true);
+    expect(iconIsUpToDate(root, src, 'android', { badge: false })).toBe(false);
+    // …and the old two-argument call still means "nothing configured".
+    expect(iconIsUpToDate(root, src, 'android')).toBe(false);
   });
 });

@@ -11,6 +11,7 @@ import { loadProjectConfig } from './plugins/load-project-config'
 import { resolveModules } from './plugins/detect-modules'
 import { inlinePlayablePlugin } from './plugins/inlinePlayable'
 import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from './plugins/subgameBuild'
+import { bootSplashPlugin } from './plugins/bootSplash'
 import { perfCoreWorkers } from './testWorkers'
 
 // C3: engine/ is the vite root (this config + index.html + app/ live here). The
@@ -391,6 +392,13 @@ export default defineConfig(({ command }) => {
     faviconPlugin(),
     assetScannerPlugin(),
     ...(externalProject ? [hostSharedDeps()] : []),
+    // The web boot splash (#396). Build-only and opt-in: a project with no `app.splashSource`
+    // emits nothing and its boot is unchanged. Skipped for the EDITOR shell, which opens projects
+    // at runtime and so has no project splash to bake in, and for a PLAYABLE, whose whole point is
+    // one file under a byte cap.
+    ...(process.env.MODOKI_EDITOR !== 'true' && !isPlayable
+      ? [bootSplashPlugin(buildProjectRoot, loadProjectConfig(buildProjectRoot), repoRoot)]
+      : []),
     ...(isPlayable ? [inlinePlayablePlugin(playableMaxBytes)] : []),
     ...(isSubgame ? [subgameBuildPlugin({ projectRoot: buildProjectRoot, engineApi: subgameEngineApi })] : []),
   ],

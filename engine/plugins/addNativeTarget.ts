@@ -187,7 +187,17 @@ export function ensureCapacitorConfig(projectRoot: string, cfg: ProjectConfig): 
     // (docs/ota-updates.md, Phase 3b). Existing projects created before this field
     // existed keep the default timer — this only applies to a FRESH
     // capacitor.config.json (this function never clobbers an existing one).
-    plugins: { Keyboard: { resize: cfg.capacitor.keyboardResize }, SplashScreen: { launchAutoHide: false } },
+    // androidScaleType CENTER_CROP — the plugin's default is FIT_XY, which STRETCHES the splash
+    // to the screen and preserves no aspect at all. With an authored splash (#396) that visibly
+    // distorts the artwork and the composited title: on a 1080x2340 phone the 960x1600
+    // `port-xxhdpi` bucket is scaled x1.125 horizontally against x1.4625 vertically — the wordmark
+    // renders ~30% taller relative to its width than it was drawn. CENTER_CROP is also what the
+    // crop-safe geometry in `scripts/splashLayout.mjs` assumes, and iOS already does it
+    // (`scaleAspectFill`), so this makes the two platforms agree.
+    plugins: {
+      Keyboard: { resize: cfg.capacitor.keyboardResize },
+      SplashScreen: { launchAutoHide: false, androidScaleType: 'CENTER_CROP' },
+    },
   };
   fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
   return { changed: true, notes: [`created capacitor.config.json (${cfg.app.appId} / "${cfg.app.appName}")`] };

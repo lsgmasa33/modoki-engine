@@ -68,6 +68,12 @@ import { reclaimStaleDeviceStateAtStartup } from './backend/deviceConnection';
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
+import {
+  parseBuildVariant, keystoreRefusal, renderKeystoreProperties, renderExportOptionsPlist,
+  androidReleaseSteps, iosReleaseSteps, debugBuildReleaseWarning,
+  IOS_EXPORT_OPTIONS_PATH, IOS_EXPORT_DIR, ANDROID_AAB_PATH, ANDROID_RELEASE_APK_PATH,
+} from './releaseBuild';
+import { PROJECT_USER_CONFIG_FILENAME } from '../project-config';
 import { iconIsUpToDate, iconStampValue } from './iconAssets';
 import { ensureCapacitorDeps, scaffoldNativeTarget, type NativePlatform } from './addNativeTarget';
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
@@ -1795,7 +1801,8 @@ export function assetScannerPlugin(): Plugin {
           return;
         }
 
-        // GET /api/build?platform=ios|android|web|playable — build + deploy (SSE stream)
+        // GET /api/build?platform=ios|android|web|playable[&variant=debug|release] — build + deploy
+        // (SSE stream)
         if ((req.url === '/api/build' || req.url?.startsWith('/api/build?')) && req.method === 'GET') {
           const url = new URL(req.url, 'http://localhost');
           const platform = url.searchParams.get('platform');
@@ -1804,6 +1811,23 @@ export function assetScannerPlugin(): Plugin {
             res.end(JSON.stringify({ error: 'platform must be ios, android, web, or playable' }));
             return;
           }
+          // #370. An ABSENT variant is `debug` — every caller that predates release builds must keep
+          // meaning exactly what it meant before. A release variant is only meaningful for the two
+          // NATIVE platforms: `web`/`playable` have no signed artifact, and silently ignoring the
+          // param there would report a "release web build" that is the ordinary one.
+          const variantParse = parseBuildVariant(url.searchParams.get('variant'));
+          if (!variantParse.ok) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: variantParse.message }));
+            return;
+          }
+          const variant = variantParse.variant;
+          if (variant === 'release' && platform !== 'ios' && platform !== 'android') {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: `variant=release applies to ios and android only, not ${platform}` }));
+            return;
+          }
+          const isRelease = variant === 'release';
 
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
@@ -1820,7 +1844,7 @@ export function assetScannerPlugin(): Plugin {
           // `consumeBuildStream` and then surfaces as "stream ended without a final status", i.e. an
           // actionable refusal disguised as a protocol anomaly), and BEFORE any config load or
           // preflight so a refused build does nothing at all.
-          const slot = acquireBuild(`${platform} build`);
+          const slot = acquireBuild(`${platform}${isRelease ? ' release' : ''} build`);
           if (!slot.ok) {
             send(`[build] ${slot.message}`);
             sendStatus(`FAILED:Another job is already running\n${slot.message}`);
@@ -1922,7 +1946,11 @@ export function assetScannerPlugin(): Plugin {
           // so it can never break a WEB or iOS build that has no business consulting adb at all.
           let androidSerialError: string | null = null;
           let androidSerial = user.device.androidDeviceId;
-          if (platform === 'android') {
+          // `!isRelease`: a release build produces an AAB + APK and installs NOTHING, so it must not
+          // consult adb at all. Without this exclusion a release build could be refused because two
+          // handsets were plugged in, or because a sibling clone held the phone — a device conflict
+          // blocking a build that never touches a device.
+          if (platform === 'android' && !isRelease) {
             // The HELD LEASE's phone is consulted too (#235). The refusal this can produce
             // offers `device_connect {useAdb:true, serial}` and the AI panel's picker as
             // remedies — both of which act by opening a lease — so without this the build
@@ -2033,13 +2061,69 @@ export function assetScannerPlugin(): Plugin {
           // (mangling `LastUpgradeCheck = 0920` → `920`) and re-serializes AndroidManifest.xml
           // (#236). The script restores every pre-existing NON-image file the run touched and
           // reports what it restored; images — its actual product — are left alone.
+          // #396/#397 — the splash master, its dark twin, the title wordmark and the three icon
+          // variant overrides all resolve the same way as `iconSource`: project-relative unless
+          // absolute, and EMPTY MEANS UNSET rather than meaning a default path, so an
+          // unconfigured project generates exactly what it generated before.
+          const projectFile = (raw: string): string | undefined => {
+            const t = raw?.trim();
+            if (!t) return undefined;
+            return path.isAbsolute(t) ? t : path.join(projectRoot, t);
+          };
+          const splashSrcAbs = projectFile(cfg.app.splashSource);
+          const splashDarkSrcAbs = projectFile(cfg.app.splashDarkSource);
+          const titleSrcAbs = projectFile(cfg.app.splashTitleSource);
+          const iconDarkSrcAbs = projectFile(cfg.app.iconDarkSource);
+          const iconTintedSrcAbs = projectFile(cfg.app.iconTintedSource);
+          const iconMonochromeSrcAbs = projectFile(cfg.app.iconMonochromeSource);
+          // Engine-owned badge artwork, committed so no build depends on system fonts.
+          // ⚠️ Under `engine/`, NOT `build/`. `electron-builder.yml`'s `files:` ships
+          // `engine/**` + `dist/**` + `package.json` and nothing else — `build/` reaches the
+          // package only as `build/bin` via extraResources. Resolved under `build/`, these were
+          // MISSING in the packaged editor, and because `overlayLayersFor` builds the title layer
+          // before it reads the badge, one unreadable badge discarded the title too: a packaged
+          // -editor build produced title-less, badge-less splashes.
+          const badgeLightArt = path.join(buildCwd, 'engine/assets/splash-badge-light.png');
+          const badgeDarkArt = path.join(buildCwd, 'engine/assets/splash-badge-dark.png');
+          // The orientation decides the CROP-SAFE box the overlays are placed in, so it is a
+          // generation input, not just a runtime setting — see splashLayout.mjs.
+          const splashOrientation = cfg.capacitor.orientation;
+          // ⚠️ Every one of these is in the stamp. `iconStep` drops itself from the build plan
+          // on a stamp match, so an input the hash cannot see changes nothing until someone
+          // deletes `.cache/icon-stamp-*` by hand — the silent no-op both issues called out.
+          const stampExtras = {
+            splashSrcAbs,
+            splashDarkSrcAbs,
+            titleSrcAbs,
+            badgeArtAbs: cfg.app.splashBadge ? badgeLightArt : undefined,
+            badgeDarkArtAbs: cfg.app.splashBadge ? badgeDarkArt : undefined,
+            iconDarkSrcAbs,
+            iconTintedSrcAbs,
+            iconMonochromeSrcAbs,
+            titleWidthPct: cfg.app.splashTitleWidthPct,
+            titleOffsetPct: cfg.app.splashTitleOffsetPct,
+            badge: cfg.app.splashBadge,
+            orientation: splashOrientation,
+          };
           const iconStep = (plat: 'ios' | 'android'): BuildStep | null => {
-            if (iconIsUpToDate(projectRoot, iconSrcAbs, plat)) return null;
-            const stamp = iconStampValue(iconSrcAbs, plat);
+            if (iconIsUpToDate(projectRoot, iconSrcAbs, plat, stampExtras)) return null;
+            const stamp = iconStampValue(iconSrcAbs, plat, stampExtras);
             const script = path.join(buildCwd, 'engine/scripts/generate-icons.mjs');
+            const opt = (flag: string, value: string | undefined) =>
+              (value ? ` ${flag} ${JSON.stringify(value)}` : '');
             return {
               label: 'Generating app icons...',
-              cmd: `node ${JSON.stringify(script)} --project ${JSON.stringify(projectRoot)} --platform ${plat} --icon ${JSON.stringify(iconSrcAbs)} --stamp ${stamp}`,
+              cmd: `node ${JSON.stringify(script)} --project ${JSON.stringify(projectRoot)} --platform ${plat} --icon ${JSON.stringify(iconSrcAbs)} --stamp ${stamp}`
+                + opt('--splash', splashSrcAbs)
+                + opt('--splash-dark', splashDarkSrcAbs)
+                + opt('--title', titleSrcAbs)
+                + ` --title-width ${cfg.app.splashTitleWidthPct} --title-offset ${cfg.app.splashTitleOffsetPct}`
+                + ` --badge ${cfg.app.splashBadge ? 'true' : 'false'}`
+                + (cfg.app.splashBadge ? `${opt('--badge-light', badgeLightArt)}${opt('--badge-dark', badgeDarkArt)}` : '')
+                + ` --orientation ${splashOrientation}`
+                + opt('--icon-dark', iconDarkSrcAbs)
+                + opt('--icon-tinted', iconTintedSrcAbs)
+                + opt('--icon-monochrome', iconMonochromeSrcAbs),
               cwd: plat === 'ios' ? iosCwd : androidCwd,
             };
           };
@@ -2129,22 +2213,39 @@ export function assetScannerPlugin(): Plugin {
             : [
               { label: 'Handing off to Xcode (no CLI install available)...', cmd: `echo "ℹ️  No devicectl id set (that needs iOS 17+), and go-ios is not available to install to an older device."; echo "   Install go-ios from Build Support to make this hands-free."; ${iosHandoff('ℹ️  Deploying from Xcode instead.')}`, cwd: iosCwd },
             ];
+          // Everything a native build does BEFORE it compiles: the web bundle, the OTA manifest, the
+          // icons, `cap sync`. Identical for debug and release (#370) and named once so the release
+          // tail cannot drift out of step with the debug one — a release build that quietly skipped
+          // `cap sync` would ship the previous run's web assets, which is invisible until players
+          // report a stale game.
+          const iosPrefixSteps: BuildStep[] = [
+            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
+            ...(otaEmbedStep ? [otaEmbedStep] : []),
+            ...(iosIconStep ? [iosIconStep] : []),
+            { label: 'Syncing Capacitor iOS...', cmd: 'npx cap sync ios', cwd: iosCwd },
+          ];
+          const androidPrefixSteps: BuildStep[] = [
+            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
+            ...(otaEmbedStep ? [otaEmbedStep] : []),
+            ...(androidIconStep ? [androidIconStep] : []),
+            { label: 'Syncing Capacitor Android...', cmd: 'npx cap sync android', cwd: androidCwd },
+          ];
           const stepsByPlatform: Record<string, BuildStep[]> = {
             // iOS is macOS-only (preflight blocks it off-darwin), so its bash-only steps
             // (`$(…)`, `~`, xcodebuild/xcrun) never run on Windows — no winCmd needed.
-            ios: [
-              { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
-              ...(otaEmbedStep ? [otaEmbedStep] : []),
-              ...(iosIconStep ? [iosIconStep] : []),
-              { label: 'Syncing Capacitor iOS...', cmd: 'npx cap sync ios', cwd: iosCwd },
+            ios: isRelease ? [
+              ...iosPrefixSteps,
+              ...iosReleaseSteps({ iosCwd, iosXcodeTarget }),
+            ] : [
+              ...iosPrefixSteps,
               { label: 'Building Xcode project...', cmd: `xcodebuild ${iosXcodeTarget} -scheme App -configuration Debug -destination 'id=${IOS_DEST}' -allowProvisioningUpdates build`, cwd: iosCwd },
               ...iosDeploySteps,
             ],
-            android: [
-              { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
-              ...(otaEmbedStep ? [otaEmbedStep] : []),
-              ...(androidIconStep ? [androidIconStep] : []),
-              { label: 'Syncing Capacitor Android...', cmd: 'npx cap sync android', cwd: androidCwd },
+            android: isRelease ? [
+              ...androidPrefixSteps,
+              ...androidReleaseSteps({ androidCwd, buildCwd, env: androidBuildEnv, ota: cfg.ota.enabled }),
+            ] : [
+              ...androidPrefixSteps,
               // gradlew wrapper: posix `android/gradlew` vs Windows `android\gradlew.bat`.
               // JAVA_HOME/ANDROID_HOME are injected via env (not a bash export prefix).
               // --no-daemon: don't leave a persistent Gradle daemon (a java.exe running from the
@@ -2284,7 +2385,11 @@ export function assetScannerPlugin(): Plugin {
           // it needs no such check.) The simulator isn't a target of this device pipeline.
           // Which ids are required, and why devicectl's is not, is documented once on
           // `planIosInstall` — this guard only reports its verdict.
-          if (platform === 'ios' && !iosInstall.ok) {
+          // `!isRelease`: the same exclusion the Android serial resolution takes above. A release
+          // archive targets `generic/platform=iOS` and exports an .ipa — no device is involved, so
+          // demanding a configured `iosDeviceId` would refuse an App Store build for want of a
+          // plugged-in phone.
+          if (platform === 'ios' && !isRelease && !iosInstall.ok) {
             // project.USER.json, not project.config.json: these are per-MACHINE device ids
             // (gitignored, never committed). The message named the committed file until this
             // close-out caught it — sending anyone who hit it to edit the wrong file.
@@ -2310,7 +2415,7 @@ export function assetScannerPlugin(): Plugin {
           // #285 sibling: IOS_DEST is confirmed non-empty by the `iosInstall.ok` guard just above —
           // check it against the machine-wide claims the same way the Android leg does, before the
           // build spends minutes on `xcodebuild` only to install over a sibling clone's phone.
-          if (platform === 'ios') {
+          if (platform === 'ios' && !isRelease) {
             const foreign = foreignClaimFor(iosDeviceId(IOS_DEST));
             if (foreign) {
               const msg = `[build] Cannot build to this iOS device: ${describeConflict(foreign)} `
@@ -2343,6 +2448,29 @@ export function assetScannerPlugin(): Plugin {
             if (signingTeams.length && !signingTeams.some((t) => t.id === teamId)) {
               send(`[build] ⚠️  Apple Team ID "${teamId}" isn't among the teams found on this Mac:\n${fmtSigningTeams()}\nIf signing fails, pick one above in Project Settings → iOS → Signing, or sign into that team in Xcode → Settings → Accounts.`);
             }
+          }
+
+          // ── Release-build gates (#370) ────────────────────────────────────────────────────────
+          // Both checked BEFORE the pipeline spends minutes on a web build + `cap sync` + gradle,
+          // because neither failure would otherwise surface as a build failure at all: an unsigned
+          // AAB builds clean and is refused by Play at UPLOAD, and a debug-instrumented release
+          // builds clean and ships a JS-eval bridge to players.
+          if (isRelease && platform === 'android') {
+            const refusal = keystoreRefusal(
+              user.keystore,
+              (p) => fs.existsSync(p),
+              path.relative(buildCwd, path.join(projectRoot, PROJECT_USER_CONFIG_FILENAME)),
+            );
+            if (refusal) {
+              send(`[build] ${refusal}`);
+              sendStatus(`FAILED:No Android upload key configured\n${refusal}`);
+              res.end();
+              return;
+            }
+          }
+          if (isRelease) {
+            const warn = debugBuildReleaseWarning(cfg.build.debugBuild === true);
+            if (warn) send(`[build] ${warn}`);
           }
 
           // A GCS deploy needs a destination bucket. Without it, `gcloud storage rsync dist`
@@ -2510,6 +2638,37 @@ export function assetScannerPlugin(): Plugin {
             if (platform === 'ios' || platform === 'android') {
               for (const n of healNativeConfig(projectRoot).notes) send(`[heal] ${n}`);
             }
+            // #370: write the two GENERATED, GITIGNORED inputs a release build needs. Both are
+            // re-derived every run rather than hand-maintained, so the upload key and the Team ID
+            // each have exactly one home (`project.user.json`) and the native files that consume
+            // them cannot go stale. Placed HERE — after the auto-scaffold and the heal — because
+            // `android/` or `ios/` may not have existed when the request arrived.
+            //
+            // ⚠️ Both files hold private values (the key passwords; the Apple Team ID, which is a
+            // PRIVATE_BUILD_FIELDS value). They are written to paths the project's own `.gitignore`
+            // covers — `android/keystore.properties` and `ios/App/build/` — and `verify:publish` is
+            // the backstop for that, not the defence. Do not relocate either without checking the
+            // ignore rules first.
+            if (isRelease && platform === 'android') {
+              const propsPath = path.join(projectRoot, 'android', 'keystore.properties');
+              // `mode` applies only when writeFileSync CREATES the file, so a keystore.properties
+              // that already exists keeps whatever mode it had (0644 from an earlier engine, or
+              // from a hand-written one). chmod unconditionally afterwards — this file holds the
+              // upload key's passwords, and "it was already there" is not a reason to leave it
+              // world-readable. Best-effort: a filesystem without POSIX modes must not fail a build.
+              fs.writeFileSync(propsPath, renderKeystoreProperties(user.keystore), { mode: 0o600 });
+              try { fs.chmodSync(propsPath, 0o600); } catch { /* non-POSIX fs — the write still landed */ }
+              send(`[build] wrote ${path.relative(buildCwd, propsPath)} from project.user.json (user.keystore)`);
+            }
+            if (isRelease && platform === 'ios') {
+              const optsPath = path.join(projectRoot, IOS_EXPORT_OPTIONS_PATH);
+              fs.mkdirSync(path.dirname(optsPath), { recursive: true });
+              fs.writeFileSync(optsPath, renderExportOptionsPlist({
+                teamId: cfg.build.appleTeamId.trim(),
+                method: cfg.build.iosExportMethod,
+              }));
+              send(`[build] wrote ${path.relative(buildCwd, optsPath)} (method: ${cfg.build.iosExportMethod})`);
+            }
             // Provision go-ios the moment a build actually needs it — this build targets an iOS
             // device `devicectl` cannot reach, and without go-ios the deploy ends in a manual ⌘R.
             // Deliberately NOT in AUTO_INSTALL: 17 MB down / 45 MB on disk, useless to anyone whose
@@ -2517,7 +2676,12 @@ export function assetScannerPlugin(): Plugin {
             // onboarding. A failure is NOT fatal — the steps still run, `ios install` fails, and
             // the step's own bail-out hands the project to Xcode exactly as it did before go-ios
             // existed. That is why this can't strand a build it was only ever trying to improve.
-            if (platform === 'ios' && iosInstall.ok && iosInstall.mode === 'go-ios' && !goIosDetected.present && goIosToolchainDir) {
+            // `!isRelease` (#370): go-ios exists to INSTALL onto a device, and a release build
+            // installs nothing. Without this, an editor whose configured phone is iOS ≤16 (the
+            // iPhone 8 here) downloads 17 MB / 45 MB-on-disk of go-ios during an App Store archive
+            // that never touches a device — and announces "the build needs go-ios to install
+            // hands-free", which is false for this variant.
+            if (platform === 'ios' && !isRelease && iosInstall.ok && iosInstall.mode === 'go-ios' && !goIosDetected.present && goIosToolchainDir) {
               send('\nThis device predates devicectl (iOS 17+), so the build needs go-ios to install hands-free.');
               try {
                 await installTool('go-ios', { toolchainDir: goIosToolchainDir, onLog: (line) => send(line) });
@@ -2613,6 +2777,19 @@ export function assetScannerPlugin(): Plugin {
             }
             sendStep(total, total);
             sendStatus('DONE');
+            // A RELEASE build deploys nowhere and installs nothing — it leaves an artifact on disk —
+            // so it gets its own wording plus the PATH. Saying "build deployed successfully" for a
+            // build whose entire product is a file you must now go and upload would be the same
+            // class of lie the playable's "built" wording already exists to avoid.
+            if (isRelease) {
+              const artifacts = platform === 'android'
+                ? [ANDROID_AAB_PATH, ANDROID_RELEASE_APK_PATH]
+                : [`${IOS_EXPORT_DIR}/`];
+              send(`\n✅ ${platform === 'ios' ? 'iOS' : 'Android'} RELEASE build succeeded — nothing was installed or deployed.`);
+              send(`   Artifacts (under ${path.relative(buildCwd, projectRoot) || '.'}):\n${artifacts.map((a) => `     • ${a}`).join('\n')}`);
+              res.end();
+              return;
+            }
             const label = platform === 'ios' ? 'iOS' : platform === 'android' ? 'Android' : platform === 'playable' ? 'Playable Ad (ads/index.html)' : 'Web (modoki-engine.com/demo)';
             // "built" for the playable (nothing is deployed — the one HTML file IS the artifact); "deployed" for the rest.
             send(`\n✅ ${label} ${platform === 'playable' ? 'built' : 'build deployed'} successfully!`);

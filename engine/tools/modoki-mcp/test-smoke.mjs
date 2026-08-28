@@ -282,7 +282,19 @@ const uc8 = JSON.parse(text(await client.callTool({ name: 'modoki_batch', argume
 await withCleanup(() => {
   if (!uc8.ok) throw new Error(`UC8 scene swap failed: ${JSON.stringify(uc8)}`);
   const st = uc8.steps.find((s2) => s2.tool === 'modoki_get_editor_state')?.result;
-  if (st?.scenePathRef !== FIXTURE_SCENE) {
+  // ⚠️ A step's ack is VERBATIM only under `ACK_VERBATIM_CHARS` (1500); above it, `batchReport.ts`
+  // degrades it to `{elided, bytes, preview}` where every leaf is JSON-STRINGIFIED. That is the
+  // batch budget working as designed, not a failure — but reading `st.scenePathRef` straight off
+  // the envelope made this assertion depend on how big the editor state happened to be, i.e. on
+  // how many panels the human left open. Measured: 1733 chars standalone (verbatim, fine) vs 1726
+  // inside the batch (elided) on an editor with the skin editor and 6 panels open, so UC8 failed
+  // with "did not see the swapped scene" while the swap had worked perfectly. Read through the
+  // preview when elided; the assertion still fails for a real regression.
+  const scenePathRefOf = (s) => {
+    if (!s?.elided) return s?.scenePathRef;
+    try { return JSON.parse(s.preview?.scenePathRef ?? 'null'); } catch { return undefined; }
+  };
+  if (scenePathRefOf(st) !== FIXTURE_SCENE) {
     throw new Error(`UC8 later step did not see the swapped scene: ${JSON.stringify(st)}`);
   }
   // A NAME resolved AFTER the swap: this is what proves the reload did not invalidate the step.

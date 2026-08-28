@@ -42,7 +42,13 @@ export type ToolContext = {
    *  Pass `checkFailure:true` for a MUTATING GET (`?action=`/`?clear=` — where `ok` IS a success
    *  flag, not an answer). Without it, `modoki_journal {action:'start'}` missing its `type` reported
    *  the route's `{ok:false, reason:…}` refusal as a successful call (measured live, Phase 6). */
-  getJson: (path: string, timeoutMs?: number, checkFailure?: boolean) => Promise<ToolResult>;
+  /** `transform` (#370) rewrites the parsed body just before it is encoded — and is applied to a
+   *  4xx body too, so a failure envelope cannot carry what the transform exists to remove. Added so
+   *  a tool can REDACT a secret without dropping to raw `call`: doing that loses the unreachable-
+   *  backend envelope, the SPA-fallthrough guard (a dev server answers a missing /api route with
+   *  index.html, 200) and the `ensureIdentity` wrong-clone banner — three guarantees that are
+   *  invisible until the day they matter. */
+  getJson: (path: string, timeoutMs?: number, checkFailure?: boolean, transform?: (body: unknown) => unknown) => Promise<ToolResult>;
   /** POST = "do this" → `ok` is a SUCCESS FLAG, so this DOES run `isFailureBody` (C7).
    *  `what` labels the failure envelope in the CALLER's terms (§5): without it a refusal reads
    *  "POST /api/scene-mutate on the editor backend", which describes our plumbing rather than the
@@ -271,11 +277,13 @@ export function createToolContext(config: { backend: string; token?: string }): 
    *  with no check that refusal reached the agent as a SUCCESSFUL call (measured live against the
    *  editor on 5181, Phase 6). Opt in per call site rather than flipping the default, because the
    *  two families genuinely disagree about what `ok` means. */
-  async function getJson(path: string, timeoutMs?: number, checkFailure?: boolean): Promise<ToolResult> {
+  async function getJson(
+    path: string, timeoutMs?: number, checkFailure?: boolean, transform?: (body: unknown) => unknown,
+  ): Promise<ToolResult> {
     try {
       await ensureIdentity();
       const { status, body } = await call(path, undefined, timeoutMs);
-      if (status >= 400) return httpFailure(`read ${path} from the editor backend`, status, body);
+      if (status >= 400) return httpFailure(`read ${path} from the editor backend`, status, transform ? transform(body) : body);
       if (htmlFallthrough(body)) return noSuchRoute(path);
       if (checkFailure) {
         const failure = isFailureBody(body);
@@ -288,7 +296,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
           });
         }
       }
-      return ok(body);
+      return ok(transform ? transform(body) : body);
     } catch (e) {
       return unreachable(e);
     }

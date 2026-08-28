@@ -12,6 +12,23 @@ import { healNativeConfig, androidSdkDirValue } from '../../plugins/healNativeCo
 // would mean a reviewed floor change had to be edited in two places.
 import { DEFAULT_PROJECT_CONFIG } from '../../project-config';
 
+/** Strip the #370 release-signing fence from an `app/build.gradle` before comparing it.
+ *
+ *  Several tests below assert a WHOLE-FILE no-op ("leaves the project ALONE on junk values"), which
+ *  is a deliberately strong assertion and worth keeping strong. But `healAndroidReleaseSigning`
+ *  writes its block on every project unconditionally — it is not gated on the thing those tests are
+ *  about — so a literal comparison would now fail for a reason unrelated to what each one guards.
+ *
+ *  Stripping ONLY the fence keeps the rest of the assertion byte-exact: if the version heal (or any
+ *  other) touched a single character it still fails. The signing block has its own tests, so this
+ *  removes nothing from the suite's coverage — it stops one heal from masking every other one. */
+function withoutSigningBlock(text: string): string {
+  // Replaced with a single '\n', not '' — the block is APPENDED after a blank separator line, so
+  // swallowing every newline before it would also eat the file's own trailing newline and report a
+  // one-character diff on a file the heal left alone.
+  return text.replace(/\n*\/\/ modoki:release-signing-begin[\s\S]*?\/\/ modoki:release-signing-end\n?/, '\n');
+}
+
 let root: string;
 let savedToolchainDir: string | undefined;
 
@@ -636,7 +653,8 @@ describe('healNativeConfig — Android Crashlytics gradle wiring (#282)', () => 
     const beforeTop = readTop(); const beforeApp = readApp();
     healNativeConfig(root);
     expect(readTop()).toBe(beforeTop);
-    expect(readApp()).toBe(beforeApp);
+    // #370's signing block is written for every project and is not what this test is about.
+    expect(withoutSigningBlock(readApp())).toBe(beforeApp);
   });
 
   it('migrates 3d-test\'s shape (classpath + apply-plugin hand-edited, NDK absent) to exactly one of each, no duplicates', () => {
@@ -1995,7 +2013,7 @@ describe('healNativeConfig — orientation + status bar', () => {
       writeNative(viaVar);
       writeAppCfg({ version: '1.0', buildNumber: 8 });
       const r = healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(viaVar);
+      expect(withoutSigningBlock(fs.readFileSync(gradlePath(), 'utf8'))).toBe(viaVar);
       expect(r.notes.join(' ')).toContain('versionCode is present but not in a form this heal can read');
     });
 
@@ -2029,7 +2047,7 @@ describe('healNativeConfig — orientation + status bar', () => {
       writeNative();
       writeAppCfg({ version: 'banana', buildNumber: 'lots' });
       healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+      expect(withoutSigningBlock(fs.readFileSync(gradlePath(), 'utf8'))).toBe(GRADLE);
       expect(fs.readFileSync(pbxPath(), 'utf8')).toBe(PBX);
     });
 
@@ -2037,7 +2055,7 @@ describe('healNativeConfig — orientation + status bar', () => {
       writeNative();
       writeAppCfg({ version: '1.0', buildNumber: 0 });
       healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+      expect(withoutSigningBlock(fs.readFileSync(gradlePath(), 'utf8'))).toBe(GRADLE);
     });
 
     /** The defaults are chosen to match what `cap add` scaffolds, so adopting the feature
@@ -2049,7 +2067,7 @@ describe('healNativeConfig — orientation + status bar', () => {
       healNativeConfig(root);
       expect(DEFAULT_PROJECT_CONFIG.app.version).toBe('1.0');
       expect(DEFAULT_PROJECT_CONFIG.app.buildNumber).toBe(1);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+      expect(withoutSigningBlock(fs.readFileSync(gradlePath(), 'utf8'))).toBe(GRADLE);
       expect(fs.readFileSync(pbxPath(), 'utf8')).toBe(PBX);
     });
   });
@@ -2094,14 +2112,14 @@ describe('healNativeConfig — orientation + status bar', () => {
       writeGradle();
       writeBuildCfg({ appleTeamId: '', androidMinSdk: 'banana' });
       healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+      expect(withoutSigningBlock(fs.readFileSync(gradlePath(), 'utf8'))).toBe(GRADLE);
     });
 
     it('leaves the project ALONE on an out-of-range value (0)', () => {
       writeGradle();
       writeBuildCfg({ appleTeamId: '', androidMinSdk: 0 });
       healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+      expect(withoutSigningBlock(fs.readFileSync(gradlePath(), 'utf8'))).toBe(GRADLE);
     });
 
     it('does nothing when the project has no android/variables.gradle', () => {
@@ -2585,5 +2603,255 @@ describe('healNativeConfig — orientation + status bar', () => {
       expect(r.notes.join(' ')).toContain('cannot determine this project\'s previous bundle id');
       expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('PRODUCT_BUNDLE_IDENTIFIER = com.old.id;');
     });
+  });
+});
+
+describe('healNativeConfig — Android release signing + keystore ignores (#370)', () => {
+  const APP_GRADLE = ['android', 'app', 'build.gradle'];
+  const GITIGNORE = ['android', '.gitignore'];
+  const readGradle = () => fs.readFileSync(path.join(root, ...APP_GRADLE), 'utf8');
+  const readIgnore = () => fs.readFileSync(path.join(root, ...GITIGNORE), 'utf8');
+
+  const PLAIN_GRADLE = [
+    "apply plugin: 'com.android.application'",
+    '',
+    'android {',
+    '    namespace = "com.example.app"',
+    '    buildTypes {',
+    '        release {',
+    '            minifyEnabled false',
+    '        }',
+    '    }',
+    '}',
+    '',
+  ].join('\n');
+
+  /** What Capacitor's `cap add android` actually writes — the upstream Android template's
+   *  keystore lines, COMMENTED OUT. This fixture is the whole reason the heal exists. */
+  const TEMPLATE_IGNORE = [
+    '# Built application files',
+    '*.apk',
+    '*.aab',
+    '',
+    '# Keystore files',
+    '# Uncomment the following lines if you do not want to check your keystore files in.',
+    '#*.jks',
+    '#*.keystore',
+    '',
+    '# External native build folder',
+    '.externalNativeBuild',
+    '',
+  ].join('\n');
+
+  function writeAndroid(gradle = PLAIN_GRADLE, ignore = TEMPLATE_IGNORE) {
+    fs.mkdirSync(path.join(root, 'android', 'app'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...APP_GRADLE), gradle);
+    fs.writeFileSync(path.join(root, ...GITIGNORE), ignore);
+    writeConfig('');
+  }
+
+  it('adds the signing block, reading keystore.properties', () => {
+    writeAndroid();
+    healNativeConfig(root);
+    const g = readGradle();
+    expect(g).toContain('modoki:release-signing-begin');
+    expect(g).toContain("rootProject.file('keystore.properties')");
+    expect(g).toContain('signingConfig signingConfigs.release');
+  });
+
+  it('the block is INERT without keystore.properties — a keyless clone still builds debug', () => {
+    // The single most important property of this heal. Failing Gradle CONFIGURATION on a machine
+    // with no upload key would break `assembleDebug` for every clone that never signs anything,
+    // which is most of them (and CI). So the whole block sits behind an exists() check.
+    writeAndroid();
+    healNativeConfig(root);
+    const block = /modoki:release-signing-begin([\s\S]*?)modoki:release-signing-end/.exec(readGradle())![1];
+    expect(block).toContain('if (modokiKeystoreFile.exists()) {');
+    // and every signing statement is INSIDE that guard, not before it
+    expect(block.indexOf('if (modokiKeystoreFile.exists())')).toBeLessThan(block.indexOf('signingConfigs'));
+  });
+
+  it('is idempotent — a second pass writes nothing', () => {
+    writeAndroid();
+    healNativeConfig(root);
+    const afterFirst = readGradle();
+    healNativeConfig(root);
+    expect(readGradle()).toBe(afterFirst);
+    expect((readGradle().match(/modoki:release-signing-begin/g) ?? []).length).toBe(1);
+  });
+
+  it('REPLACES a stale block rather than leaving the project on the old text', () => {
+    // Same distinguishing case the Crashlytics dSYM heal documents: a presence check ("it's there,
+    // done") passes every other test here while pinning whatever text the project was first healed
+    // with, so a later fix to the block never reaches an existing project.
+    writeAndroid();
+    healNativeConfig(root);
+    const aged = readGradle().replace('signingConfig signingConfigs.release', 'signingConfig signingConfigs.OLD');
+    fs.writeFileSync(path.join(root, ...APP_GRADLE), aged);
+    expect(readGradle()).toContain('signingConfigs.OLD'); // the fixture is what we think it is
+
+    healNativeConfig(root);
+    expect(readGradle()).not.toContain('signingConfigs.OLD');
+    expect((readGradle().match(/modoki:release-signing-begin/g) ?? []).length).toBe(1);
+  });
+
+  it('SKIPS a project that configures signingConfigs by hand (games/iap-test)', () => {
+    // iap-test wired its Play upload key before this engine path existed (#196). Healing over it
+    // would leave TWO signingConfigs.release definitions in one file, the second silently winning.
+    const handWritten = PLAIN_GRADLE.replace('android {', [
+      'android {',
+      '    signingConfigs {',
+      '        release {',
+      "            storeFile file('/somewhere/else.jks')",
+      '        }',
+      '    }',
+    ].join('\n'));
+    writeAndroid(handWritten);
+    healNativeConfig(root);
+    expect(readGradle()).toBe(handWritten);
+    expect(readGradle()).not.toContain('modoki:release-signing-begin');
+  });
+
+  it('keeps a CRLF gradle file on CRLF', () => {
+    writeAndroid(PLAIN_GRADLE.replace(/\n/g, '\r\n'));
+    healNativeConfig(root);
+    expect(readGradle()).toContain('modoki:release-signing-begin');
+    expect(/[^\r]\n/.test(readGradle()), 'no bare-LF line was inserted').toBe(false);
+  });
+
+  it('uncomments the template keystore ignores and adds keystore.properties', () => {
+    // The regression this prevents: `cap add` regenerates .gitignore from the upstream template,
+    // where these lines are COMMENTED OUT — so a .jks dropped in that folder is committed by
+    // default, into a repo whose snapshot is published publicly.
+    writeAndroid();
+    expect(readIgnore()).toContain('#*.jks'); // the fixture is the unsafe upstream shape
+    healNativeConfig(root);
+    const ig = readIgnore();
+    expect(ig).toMatch(/^\*\.jks$/m);
+    expect(ig).toMatch(/^\*\.keystore$/m);
+    expect(ig).toMatch(/^keystore\.properties$/m);
+    expect(ig).not.toContain('#*.jks');
+    // exactly one "# Keystore files" header, not the template's plus ours
+    expect((ig.match(/^# Keystore files$/gm) ?? []).length).toBe(1);
+  });
+
+  it('the .gitignore heal is idempotent and preserves unrelated lines', () => {
+    writeAndroid();
+    healNativeConfig(root);
+    const afterFirst = readIgnore();
+    healNativeConfig(root);
+    expect(readIgnore()).toBe(afterFirst);
+    expect(readIgnore()).toContain('.externalNativeBuild');
+    expect(readIgnore()).toContain('*.aab');
+  });
+
+  it('appends the ignores to a .gitignore that has no keystore section at all', () => {
+    writeAndroid(PLAIN_GRADLE, '*.apk\n');
+    healNativeConfig(root);
+    expect(readIgnore()).toContain('*.apk');
+    expect(readIgnore()).toMatch(/^\*\.jks$/m);
+    expect(readIgnore()).toMatch(/^keystore\.properties$/m);
+  });
+
+  it('leaves an ALREADY-correct .gitignore byte-identical', () => {
+    writeAndroid();
+    healNativeConfig(root);
+    const healed = readIgnore();
+    // A fresh project whose file already carries the block (a clone of a healed repo) must not be
+    // rewritten on open — that is the #18 write-behind-your-back hazard.
+    fs.writeFileSync(path.join(root, ...GITIGNORE), healed);
+    healNativeConfig(root);
+    expect(readIgnore()).toBe(healed);
+  });
+});
+
+describe('healNativeConfig — #370 review findings', () => {
+  const APP_GRADLE = ['android', 'app', 'build.gradle'];
+  const GITIGNORE = ['android', '.gitignore'];
+  const readGradle = () => fs.readFileSync(path.join(root, ...APP_GRADLE), 'utf8');
+  const readIgnore = () => fs.readFileSync(path.join(root, ...GITIGNORE), 'utf8');
+  const GRADLE = "apply plugin: 'com.android.application'\n\nandroid {\n    namespace = \"x\"\n}\n";
+  function write(gradle = GRADLE, ignore = '*.apk\n') {
+    fs.mkdirSync(path.join(root, 'android', 'app'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...APP_GRADLE), gradle);
+    fs.writeFileSync(path.join(root, ...GITIGNORE), ignore);
+    writeConfig('');
+  }
+
+  it('the Gradle block reads keystore.properties as UTF-8, not the ISO-8859-1 default', () => {
+    // `Properties.load(InputStream)` decodes ISO-8859-1 by contract while the generator writes
+    // UTF-8, so a non-ASCII password or path became mojibake and Gradle blamed the keystore.
+    write();
+    healNativeConfig(root);
+    // ⚠️ Assert on CODE, not on the file: the generated block's own comment explains why
+    // `withInputStream` is wrong, so a bare `not.toContain('withInputStream')` fails on the
+    // warning against it. (The same comments-vs-code trap `androidSerialBlock()` documents.)
+    const code = readGradle().split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    expect(code).toContain("withReader('UTF-8') { modokiKeystore.load(it) }");
+    expect(code).not.toContain('withInputStream');
+  });
+
+  it('skips a project whose signingConfigs is real, but NOT one that is only in a comment', () => {
+    // False positive on a commented-out block = that project silently never gets release signing,
+    // and the build then emits app-release-unsigned.apk while reporting the signed path.
+    write(GRADLE.replace('android {', '/* android {\n    signingConfigs { release { } }\n} */\nandroid {'));
+    healNativeConfig(root);
+    expect(readGradle(), 'a commented signingConfigs must not block the heal').toContain('modoki:release-signing-begin');
+
+    // …and a REAL one still wins.
+    fs.writeFileSync(path.join(root, ...APP_GRADLE), GRADLE.replace('android {', 'android {\n    signingConfigs { release { } }'));
+    const before = readGradle();
+    healNativeConfig(root);
+    expect(readGradle()).toBe(before);
+  });
+
+  it('a line-comment signingConfigs does not block the heal either', () => {
+    write(GRADLE.replace('android {', '// signingConfigs {\nandroid {'));
+    healNativeConfig(root);
+    expect(readGradle()).toContain('modoki:release-signing-begin');
+  });
+
+  it('converges a HALF-uncommented .gitignore instead of appending a duplicate', () => {
+    // Somebody uncomments only *.jks by hand. The old code matched neither the all-present
+    // early-out nor the adjacent-commented-pair regex, so it appended the whole block — a second
+    // *.jks, a second header, and the orphan #*.keystore left behind, on EVERY project open.
+    write(GRADLE, '# Keystore files\n# Uncomment the following lines if you do not want to check your keystore files in.\n*.jks\n#*.keystore\n\n.externalNativeBuild\n');
+    healNativeConfig(root);
+    const ig = readIgnore();
+    expect((ig.match(/^\*\.jks$/gm) ?? []).length, 'exactly one *.jks').toBe(1);
+    expect((ig.match(/^# Keystore files$/gm) ?? []).length, 'exactly one header').toBe(1);
+    expect(ig).not.toContain('#*.keystore');
+    expect(ig).toMatch(/^\*\.keystore$/m);
+    expect(ig).toMatch(/^keystore\.properties$/m);
+    expect(ig, 'unrelated lines survive').toContain('.externalNativeBuild');
+    // and it settles — a second pass writes nothing
+    const after = ig;
+    healNativeConfig(root);
+    expect(readIgnore()).toBe(after);
+  });
+
+  it('does NOT reflow blank lines elsewhere in the file', () => {
+    // The squeeze that normalises spacing around the inserted block used to run file-wide, so any
+    // run of 2+ blank lines a project used to group its sections was silently rewritten on the
+    // first heal — an edit in a region this heal has no business in (#18, self-inflicted).
+    write(GRADLE, 'a\n\n\n\nb\n\n# Keystore files\n#*.jks\n#*.keystore\n\n\n\nz\n');
+    healNativeConfig(root);
+    const ig = readIgnore();
+    expect(ig, 'the 3 blank lines between a and b are untouched').toContain('a\n\n\n\nb');
+    expect(ig).toMatch(/^\*\.jks$/m);
+    expect(ig).toContain('z');
+  });
+
+  it('recognises an already-correct block that cites a DIFFERENT issue number', () => {
+    // games/iap-test carries this block referencing #196, because it wired its upload key before
+    // the engine had a release path. A literal comparison treated that as unhealed and appended a
+    // second copy while orphaning the #196 comments. Provenance is worth keeping.
+    write();
+    healNativeConfig(root);
+    const healed = readIgnore();
+    fs.writeFileSync(path.join(root, ...GITIGNORE), healed.replace('(#370)', '(#196)'));
+    const aged = readIgnore();
+    healNativeConfig(root);
+    expect(readIgnore(), 'a #196-cited block is left byte-identical').toBe(aged);
   });
 });
