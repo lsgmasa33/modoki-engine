@@ -125,6 +125,7 @@ import { createViewportDirtyGate, useRearmDirtyOnChange } from './viewportDirtyG
 import { mark2DDirty, get2DDirtyVersion, ensureCanvas2DListeners } from '../store/canvas2DDirty';
 import { Canvas2DMount } from '../../runtime/rendering/Canvas2DMount';
 import { editorCanvas2DPool, editorScene2DRenderer, editorMarkScene2DDirty } from '../rendering/editorScene2D';
+import { loadSceneViewPrefs, saveSceneViewPrefs, type SceneViewLayers } from './sceneViewPrefs';
 
 // Bridge so the 2D Canvas overlay can raycast-pick 2.5D billboards. A billboard renders as a
 // THREE mesh via the game camera in BOTH 3D and 2D mode, so its screen position is a 3D
@@ -421,22 +422,34 @@ export default function SceneView() {
   const setMode = useEditorStore((s) => s.setSceneViewMode);
   const modeRef = useRef(mode);
   modeRef.current = mode;
-  const [layers, setLayers] = useState({ show3D: true, show2D: true, showUI: true });
-  const [showGrid, setShowGrid] = useState(true);
-  const [showColliders, setShowColliders] = useState(false);
-  const [colliders2DOnly, setColliders2DOnlyState] = useState(false);
+  // View-menu toggles (Grid/Colliders/layer visibility) are editor-only display preferences —
+  // read once per mount so a value another tab/reload persisted isn't clobbered mid-session.
+  const initialViewPrefsRef = useRef(loadSceneViewPrefs());
+  const [layers, setLayersState] = useState(initialViewPrefsRef.current.layers);
+  const [showGrid, setShowGridState] = useState(initialViewPrefsRef.current.showGrid);
+  const [showColliders, setShowCollidersState] = useState(initialViewPrefsRef.current.showColliders);
+  const [colliders2DOnly, setColliders2DOnlyState] = useState(initialViewPrefsRef.current.colliders2DOnly);
+  const setShowGrid = (next: boolean | ((prev: boolean) => boolean)) => {
+    setShowGridState((prev) => { const on = typeof next === 'function' ? next(prev) : next; saveSceneViewPrefs({ showGrid: on }); return on; });
+  };
+  const setShowColliders = (next: boolean | ((prev: boolean) => boolean)) => {
+    setShowCollidersState((prev) => { const on = typeof next === 'function' ? next(prev) : next; saveSceneViewPrefs({ showColliders: on }); return on; });
+  };
+  const setLayers = (updater: (prev: SceneViewLayers) => SceneViewLayers) => {
+    setLayersState((prev) => { const next = updater(prev); saveSceneViewPrefs({ layers: next }); return next; });
+  };
   // 2D counterpart of showColliders: local state drives the ViewOptionsMenu checkbox, and
   // mirrors into editorScene2DRenderer (the actual render-loop flag Scene2D reads every
   // frame) — there's no other consumer of this React state, so a plain setter call is enough.
-  const setColliders2DOnly = (on: boolean) => { setColliders2DOnlyState(on); editorScene2DRenderer.setCollidersOnly(on); };
+  const setColliders2DOnly = (on: boolean) => { setColliders2DOnlyState(on); editorScene2DRenderer.setCollidersOnly(on); saveSceneViewPrefs({ colliders2DOnly: on }); };
   const showFocusGraph = useEditorStore((s) => s.showFocusGraph);
   const setShowFocusGraph = useEditorStore((s) => s.setShowFocusGraph);
   // editorScene2DRenderer is a module-level singleton (outlives this component across
-  // remounts/HMR), so a stale `true` from a PRIOR mount could otherwise survive into a fresh
-  // mount whose React state defaults back to false — force it back in sync on mount, and
+  // remounts/HMR), so a stale flag from a PRIOR mount could otherwise survive into a fresh
+  // mount — force it back in sync with THIS mount's (persisted) initial value on mount, and
   // clear it on unmount so a closed SceneView never leaves 2D sprites hidden behind it.
   useEffect(() => {
-    editorScene2DRenderer.setCollidersOnly(false);
+    editorScene2DRenderer.setCollidersOnly(initialViewPrefsRef.current.colliders2DOnly);
     return () => editorScene2DRenderer.setCollidersOnly(false);
   }, []);
   const selectedId = useEditorStore((s) => s.selectedEntityId);

@@ -380,6 +380,39 @@ describe('editorStore', () => {
     });
   });
 
+  describe('gizmo mode/space/pivot + particlePreview persistence (#399)', () => {
+    // This env has no localStorage — install a stub for the duration of each test (same
+    // pattern as the sceneViewMode/animationViewMode positive control above) so writes have
+    // somewhere to land instead of the check passing vacuously against a missing global.
+    function withLocalStorageStub(run: (writes: string[]) => void) {
+      const writes: string[] = [];
+      const stub = { getItem: () => null, setItem: (k: string) => { writes.push(k); }, removeItem: () => {} };
+      const g = globalThis as { localStorage?: unknown };
+      const had = 'localStorage' in g;
+      const prev = g.localStorage;
+      g.localStorage = stub;
+      try { run(writes); }
+      finally { if (had) g.localStorage = prev; else delete g.localStorage; }
+    }
+
+    it('setGizmoMode/Space/Pivot each persist their own key', () => {
+      withLocalStorageStub((writes) => {
+        useEditorStore.getState().setGizmoMode('rotate');
+        useEditorStore.getState().setGizmoSpace('local');
+        useEditorStore.getState().setGizmoPivot('center');
+        expect(writes).toEqual(['editor:gizmoMode', 'editor:gizmoSpace', 'editor:gizmoPivot']);
+      });
+    });
+
+    it('setParticlePreview persists', () => {
+      withLocalStorageStub((writes) => {
+        useEditorStore.getState().setParticlePreview(true);
+        expect(useEditorStore.getState().particlePreview).toBe(true);
+        expect(writes).toEqual(['editor:particlePreview']);
+      });
+    });
+  });
+
   describe('gameViewSize and gameRect', () => {
     it('setGameViewSize updates dimensions', () => {
       const { setGameViewSize } = useEditorStore.getState();

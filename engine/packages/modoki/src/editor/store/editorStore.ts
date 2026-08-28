@@ -35,6 +35,20 @@ function saveCamGizmoShown(s: Set<string>): void {
   try { localStorage.setItem(CAM_GIZMO_LS_KEY, JSON.stringify([...s])); } catch { /* storage full/blocked */ }
 }
 
+// Small typed readers for the `editor:*`-prefixed localStorage prefs below (gizmo mode/space/
+// pivot, particle preview) — same "editor-only display preference, not scene data" rationale as
+// CAM_GIZMO_LS_KEY above, just for values that aren't a per-guid set.
+function lsBool(key: string, fallback: boolean): boolean {
+  if (typeof localStorage === 'undefined') return fallback;
+  const v = localStorage.getItem(key);
+  return v === null ? fallback : v === '1';
+}
+function lsEnum<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  if (typeof localStorage === 'undefined') return fallback;
+  const v = localStorage.getItem(key);
+  return v !== null && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
+}
+
 export interface SelectedAsset {
   path: string;
   type: string;
@@ -532,9 +546,9 @@ export const useEditorStore = create<EditorState>((set, get) => {
   selectedEntityIds: [],
   selectedAsset: null,
   selectedAssets: [],
-  gizmoMode: 'translate',
-  gizmoSpace: 'world',
-  gizmoPivot: 'pivot',
+  gizmoMode: lsEnum('editor:gizmoMode', ['translate', 'rotate', 'scale'] as const, 'translate'),
+  gizmoSpace: lsEnum('editor:gizmoSpace', ['world', 'local'] as const, 'world'),
+  gizmoPivot: lsEnum('editor:gizmoPivot', ['pivot', 'center'] as const, 'pivot'),
   unlockedGhostSelKey: null,
   colliderEditMode: false,
   spriteEditorSelection: null,
@@ -544,7 +558,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   animationPanelMounted: false,
   focusedPanel: null,
   openPanels: [],
-  particlePreview: false,
+  particlePreview: lsBool('editor:particlePreview', false),
   gameViewDevice: FREE_PRESET,
   gameViewOrientation: 'portrait',
   gameViewMounted: false,
@@ -680,7 +694,12 @@ export const useEditorStore = create<EditorState>((set, get) => {
   // 2D scene keeps drawing the PREVIOUS gizmo until some unrelated redraw fires — the mode
   // toggle looked like a no-op. Mark dirty here so translate/rotate/scale (and world/local)
   // repaint immediately. 3D uses its own gate (useEditorStore.subscribe(markViewportDirty)).
-  setGizmoMode: (mode) => { if (get().gizmoMode !== mode) editorEmit('!gizmo', { mode }); set({ gizmoMode: mode }); mark2DDirty(); },
+  setGizmoMode: (mode) => {
+    if (get().gizmoMode !== mode) editorEmit('!gizmo', { mode });
+    set({ gizmoMode: mode });
+    if (typeof localStorage !== 'undefined') localStorage.setItem('editor:gizmoMode', mode);
+    mark2DDirty();
+  },
   setColliderEditMode: (on) => set({ colliderEditMode: on }),
   setSpriteEditorSelection: (guid) => {
     if (get().spriteEditorSelection === guid) return;
@@ -727,10 +746,23 @@ export const useEditorStore = create<EditorState>((set, get) => {
     if (prev.length === next.length && prev.every((id, i) => id === next[i])) return;
     set({ openPanels: next });
   },
-  setGizmoSpace: (space: 'local' | 'world') => { if (get().gizmoSpace !== space) editorEmit('!gizmo', { space }); set({ gizmoSpace: space }); mark2DDirty(); },
-  setGizmoPivot: (pivot: 'pivot' | 'center') => { if (get().gizmoPivot !== pivot) editorEmit('!gizmo', { pivot }); set({ gizmoPivot: pivot }); mark2DDirty(); },
+  setGizmoSpace: (space: 'local' | 'world') => {
+    if (get().gizmoSpace !== space) editorEmit('!gizmo', { space });
+    set({ gizmoSpace: space });
+    if (typeof localStorage !== 'undefined') localStorage.setItem('editor:gizmoSpace', space);
+    mark2DDirty();
+  },
+  setGizmoPivot: (pivot: 'pivot' | 'center') => {
+    if (get().gizmoPivot !== pivot) editorEmit('!gizmo', { pivot });
+    set({ gizmoPivot: pivot });
+    if (typeof localStorage !== 'undefined') localStorage.setItem('editor:gizmoPivot', pivot);
+    mark2DDirty();
+  },
   setUnlockedGhostSelKey: (key: string | null) => set({ unlockedGhostSelKey: key }),
-  setParticlePreview: (on: boolean) => set({ particlePreview: on }),
+  setParticlePreview: (on: boolean) => {
+    set({ particlePreview: on });
+    if (typeof localStorage !== 'undefined') localStorage.setItem('editor:particlePreview', on ? '1' : '0');
+  },
   setGameViewDevice: (device, orientation) => {
     const cur = get();
     // Compare the preset by VALUE, not by identity: a custom size arrives as a freshly built

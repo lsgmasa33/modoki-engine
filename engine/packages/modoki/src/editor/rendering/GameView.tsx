@@ -15,6 +15,7 @@ import DevicePicker from './DevicePicker';
 import SafeAreaOverlay from './SafeAreaOverlay';
 import { DebugMenu } from '../../runtime/debug';
 import { VideoOverlay } from '../../runtime/video/VideoOverlay';
+import { loadGameViewMuted, saveGameViewMuted, loadGameViewShowColliders, saveGameViewShowColliders } from './gameViewPrefs';
 
 // ── Main GameView ───────────────────────────────────────
 
@@ -34,18 +35,28 @@ export default function GameView({ uiLayer }: GameViewProps) {
   const setGameViewMounted = useEditorStore((s) => s.setGameViewMounted);
   const setGameAreaSize = useEditorStore((s) => s.setGameAreaSize);
   const setPreset = useCallback((p: DevicePreset) => setGameViewDevice(p), [setGameViewDevice]);
-  const [showColliders, setShowColliders] = useState(isShowColliders2D());
+  // Persisted across reloads (#399) — the runtime flag itself (`isShowColliders2D()`) starts
+  // false on every fresh module load, so it can't be the source of truth for the initial
+  // React state; apply the persisted value to the runtime once on mount instead.
+  const [showColliders, setShowColliders] = useState(loadGameViewShowColliders);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { setShowColliders2D(showColliders); }, []);
   const toggleColliders = useCallback(() => {
     const next = !isShowColliders2D();
     setShowColliders2D(next);
     setShowColliders(next);
+    saveGameViewShowColliders(next);
   }, []);
-  // Unity-style "Mute Audio" — silences all game audio during editing/preview.
-  const [muted, setMuted] = useState(isAudioMuted());
+  // Unity-style "Mute Audio" — silences all game audio during editing/preview. Persisted (#399)
+  // the same way as showColliders above.
+  const [muted, setMuted] = useState(loadGameViewMuted);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { setAudioMuted(muted); }, []);
   const toggleMute = useCallback(() => {
     const next = !isAudioMuted();
     setAudioMuted(next);
     setMuted(next);
+    saveGameViewMuted(next);
   }, []);
   const containerRef = useRef<HTMLDivElement>(null);
   const gameAreaRef = useRef<HTMLDivElement>(null);
