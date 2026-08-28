@@ -26,6 +26,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { hasInternalGames } from '../helpers/repoLayout';
+import { SCENE_FORMAT_VERSION } from '@modoki/engine/runtime';
 
 const REPO = path.resolve(__dirname, '../../..');
 const hasGames = hasInternalGames();
@@ -130,6 +131,31 @@ describe.skipIf(!hasGames)('committed scenes stay in the current serializer shap
       + 'version but holds pre-v12 content, so every scaffolded project starts life needing a '
       + 're-save. Regenerate it by scaffolding a throwaway project, re-saving it through the '
       + 'editor, and copying the result back (the scaffolder re-mints the GUIDs).').toEqual([]);
+  });
+
+  /** ⚠️ No guard compared `version` against the constant until #405, and that is exactly how a
+   *  hand-authored `"version": 13` sat in `games/court/main.scene.json` undetected: 13 is a number
+   *  NOTHING emits (`SCENE_FORMAT_VERSION` is 12, and there is no v12→v13 migration step in
+   *  `loadSceneFile`). The loader only warns for a too-new file, into a console nobody reads in a
+   *  test run, and the markers above are blind to it — so the first editor save "regressed" 13 → 12
+   *  and read as data loss in a bug report.
+   *
+   *  A version ABOVE the constant is the failure this catches: it is unreachable by the serializer,
+   *  so it can only have been typed. BELOW is legitimate and deliberately allowed — that is just a
+   *  scene the migration chain has not re-saved yet, which the markers above already police on
+   *  their own terms. */
+  it('no scene claims a version the engine cannot emit', () => {
+    const tooNew = sceneFiles()
+      .map((f) => ({ file: rel(f), v: JSON.parse(fs.readFileSync(f, 'utf8')).version as number }))
+      .filter((r) => typeof r.v === 'number' && r.v > SCENE_FORMAT_VERSION)
+      .map((r) => `${r.file} → version ${r.v}, but SCENE_FORMAT_VERSION is ${SCENE_FORMAT_VERSION}`);
+    expect(
+      tooNew,
+      'A scene claims a format version newer than this engine emits, so it was hand-edited rather '
+        + 'than saved. The loader only warns, and the next real save silently "downgrades" it — '
+        + 'which reads as data loss in a diff. Either bump SCENE_FORMAT_VERSION with its migration '
+        + 'step (runtime/core/version.ts + loadSceneFile.ts), or correct the file.',
+    ).toEqual([]);
   });
 
   it('every BASELINE entry still fires (no stale exemptions)', () => {

@@ -22,7 +22,12 @@ export {
   setNameTransform, transformName,
   type TraitMeta, type FieldHint, type FieldType,
 } from './core/ecs/traitRegistry';
-export { traitFieldOrDefault } from './core/ecs/traitSchema';
+// `soaSchema` is exported alongside `traitFieldOrDefault` because the two answer one question
+// together: a test comparing two authored entities field-by-field needs the trait's DECLARED key
+// set (this) and a default-aware read for each key (that). Deriving the key set from the authored
+// JSON instead is the trap — `serializeScene` omits a field holding its default, so a field
+// defaulted on BOTH sides drops out of the union and is then compared by nothing, silently (#405).
+export { traitFieldOrDefault, soaSchema } from './core/ecs/traitSchema';
 export {
   registerEntrySource, unregisterEntrySource, getEntrySource, getEntrySourceNames,
   type EntryCoord, type EntryContent, type EntryResolver,

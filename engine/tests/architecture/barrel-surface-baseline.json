@@ -893,6 +893,7 @@
   "skin2DSystem",
   "skinVertex2D",
   "snapToNearest",
+  "soaSchema",
   "spawnEntity",
   "spawnPrefabInstance",
   "spriteAnimHasClip",

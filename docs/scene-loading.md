@@ -172,6 +172,34 @@ Note this is a *serializer* rule, not a format version: it changes what a save w
 what a load accepts, so no migration is involved and older fully-populated files keep
 loading unchanged.
 
+**A field the file SPELLS OUT at its default is dropped too** — "absent" and "present at
+default" are the same live state after a load, so the serializer cannot tell them apart and
+does not try. This is the decided behaviour, and it is the half that surprises people:
+`serializeScene` consults only the live world, never the document on disk, so an authored
+`bus: "sfx"` is indistinguishable from an unauthored one and both go. Keeping it would mean
+retaining the loaded document at save time (nothing does — `SceneManager` keeps only
+path/guid/`createdAt`/`baseScene`) and would make the output depend on what the file already
+held, so the same world saved from two starting points would produce two different files.
+
+⚠️ **The consequence for TESTS, which is how this actually bites: a raw
+`parsed.traits.X.y` read asserts "the file spells this out", not "the value is y."** It is
+correct only while the authored value happens to differ from the default. Route that class
+of read through **`traitFieldOrDefault(Trait, bag, field)`**
+(`runtime/core/ecs/traitSchema.ts`) — strictly stronger, since it also fails when the
+*engine* default moves under an unauthored field, and it throws on a misspelled field
+instead of quietly yielding `undefined`. Where a test compares two entities field-by-field,
+take the key set from **`soaSchema({ trait })`**, never from the authored keys: a key set
+derived from the same data the loop iterates thins out silently as fields default away.
+
+*(#405, 2026-08-28.* An editor save of `games/court/main.scene.json` dropped 44
+hand-authored default-valued fields across 33 entities and broke two Court tests doing
+exactly that raw read. Filed as a serializer bug proposing "never strip a value present on
+disk"; declined, because it reverses the 2026-07-31 decision above and because the churn was
+a **one-time normalization of a hand-authored file** — the scene carried `"version": 13`, a
+number no code emits — not the per-edit churn the report described. A second save is
+byte-stable, as `traitDefaultOmission.test.ts` has always asserted. The two tests were the
+defect and were fixed; that test file now also pins the present-at-default case directly.)*
+
 **Where it applies, and the one boundary between the two conventions:**
 
 - **Scene entities** — compacted, as above.
