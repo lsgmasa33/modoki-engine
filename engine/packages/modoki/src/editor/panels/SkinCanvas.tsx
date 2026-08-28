@@ -5,7 +5,7 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useEditorStore } from '../store/editorStore';
-import { paintPressIntent, promotesToStroke } from './skinPaintGesture';
+import { paintPressIntent, promotesToStroke, advancePaintStroke, type PaintStrokeState } from './skinPaintGesture';
 import { register } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { activePartOf, withActivePart, partCount, bboxCenter } from './skinParts';
@@ -176,8 +176,10 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
   // the pre-drag snapshot (one undo) + the original verts (absolute-delta, no drift).
   const movePartRef = useRef<{ startX: number; startY: number; origVerts: number[][]; before: Rig2DFile } | null>(null);
   useEffect(() => { viewUserRef.current = { zoom: 1, panX: 0, panY: 0 }; }, [nonce]);
-  // active weight-paint stroke (pre-stroke snapshot for a single undo) + brush cursor.
-  const paintRef = useRef<{ before: Rig2DFile } | null>(null);
+  // active weight-paint stroke: pre-stroke snapshot for a single undo, plus the stroke's own
+  // sweep state (#392's interpolation, so a fast stroke doesn't tunnel between stamps) —
+  // advanced ONLY through `advancePaintStroke` so all three open/move sites stay in sync.
+  const paintRef = useRef<{ before: Rig2DFile; stroke: PaintStrokeState } | null>(null);
   const cursorRef = useRef<{ x: number; y: number } | null>(null);
   // A pointer-down on a JOINT while the brush is active is ambiguous: it could be a click
   // (switch which bone you're painting) or the head of a stroke that happens to start over
@@ -612,16 +614,23 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
     return [out[0], out[1]];
   };
 
-  // Paint the selected bone's weight at a texture-space point across every CHECKED part — the
-  // parts-list checkboxes act as a paint mask (unchecked/hidden parts are protected, matching
-  // "paint what you see"). The brush isn't bound to the active part, so a stroke near a joint
-  // blends both visible parts that meet there. Each part is painted against its own DISPLAYED
-  // (posed) verts so the brush hits what you see.
-  const paintAt = useCallback((tx: number, ty: number, subtract: boolean) => {
+  // Paint the selected bone's weight along a swept list of texture-space centers — one call
+  // per pointer move rather than per center (#392: `paintStrokeCenters` interpolates the move
+  // so a fast stroke can't tunnel between stamps). Across every CHECKED part — the parts-list
+  // checkboxes act as a paint mask (unchecked/hidden parts are protected, matching "paint what
+  // you see"). The brush isn't bound to the active part, so a stroke near a joint blends both
+  // visible parts that meet there. Each part is painted against its own DISPLAYED (posed)
+  // verts so the brush hits what you see.
+  //
+  // ⚠️ `skinMats` and, per part, `dverts` are computed ONCE for the whole move, not once per
+  // center — `paintWeights` is the expensive part (recomputed skin mats would be bad enough;
+  // `deformMesh` per part per center would multiply it), so the centers are chained through
+  // the SAME `dverts`, each accumulating into the running `skinIndices`/`skinWeights`.
+  const paintAt = useCallback((centers: ReadonlyArray<{ x: number; y: number }>, subtract: boolean) => {
     const store = useEditorStore.getState();
     const cur = store.editingSkinDef;
     const path = store.editingSkinAsset?.path;
-    if (!cur || !path || selBone < 0) return;
+    if (!cur || !path || selBone < 0 || !centers.length) return;
     const sp = store.skinPaint;
     const hidden = store.skinPreviewHidden; // parts-list checkbox = paint mask
     const bb = coerceBones(cur.bones);
@@ -635,12 +644,18 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       const verts = view.mesh?.verts;
       if (!verts?.length) continue;
       const dverts = deformMesh(verts, skinMats, view.skinIndices ?? [], view.skinWeights ?? []);
-      const result = paintWeights({
-        verts: dverts, skinIndices: view.skinIndices ?? [], skinWeights: view.skinWeights ?? [],
-        boneIndex: selBone, center: [tx, ty], radius: sp.radius, strength: sp.strength,
-        falloff: 'smooth', mode: subtract ? 'subtract' : sp.brush, bonePositions,
-      });
-      next = withActivePart(next, i, { skinIndices: result.skinIndices, skinWeights: result.skinWeights });
+      let skinIndices = view.skinIndices ?? [];
+      let skinWeights = view.skinWeights ?? [];
+      for (const { x: tx, y: ty } of centers) {
+        const result = paintWeights({
+          verts: dverts, skinIndices, skinWeights,
+          boneIndex: selBone, center: [tx, ty], radius: sp.radius, strength: sp.strength,
+          falloff: 'smooth', mode: subtract ? 'subtract' : sp.brush, bonePositions,
+        });
+        skinIndices = result.skinIndices;
+        skinWeights = result.skinWeights;
+      }
+      next = withActivePart(next, i, { skinIndices, skinWeights });
     }
     if (next !== cur) store.applySkinDef(path, next);
   }, [selBone, displayOrigin, paintMode, testPose]);
@@ -721,7 +736,11 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       if (intent === 'select') { setSelBone(hit); return; }
       if (intent !== 'paint') return; // empty space with no bone selected — nothing to stroke
       const before = useEditorStore.getState().editingSkinDef;
-      if (before) { paintRef.current = { before }; (e.target as Element).setPointerCapture?.(e.pointerId); cursorRef.current = { x, y }; paintAt(x, y, e.altKey); }
+      if (before) {
+        const { centers, state } = advancePaintStroke(null, { x, y }, useEditorStore.getState().skinPaint.radius);
+        paintRef.current = { before, stroke: state };
+        (e.target as Element).setPointerCapture?.(e.pointerId); cursorRef.current = { x, y }; paintAt(centers, e.altKey);
+      }
       return;
     }
     // 3. Add tool.
@@ -835,11 +854,23 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
         paintPendingRef.current = null;
         const before = useEditorStore.getState().editingSkinDef;
         // A drag paints the bone you have SELECTED, never the one you happened to press —
-        // same as a drag starting anywhere else on the mesh.
-        if (before) { paintRef.current = { before }; paintAt(pend.tx, pend.ty, e.altKey); }
+        // same as a drag starting anywhere else on the mesh. The stroke opens at the PRESS
+        // point (pend.tx/ty), not here, so #392's interpolation below sweeps from where the
+        // stroke actually started, not from this first post-promotion sample.
+        if (before) {
+          const { centers, state } = advancePaintStroke(null, { x: pend.tx, y: pend.ty }, useEditorStore.getState().skinPaint.radius);
+          paintRef.current = { before, stroke: state };
+          paintAt(centers, e.altKey);
+        }
       }
       cursorRef.current = { x, y };
-      if (paintRef.current) paintAt(x, y, e.altKey);
+      if (paintRef.current) {
+        // #392: sweep from the last painted point to here so a fast stroke can't tunnel
+        // between brush stamps.
+        const { centers, state } = advancePaintStroke(paintRef.current.stroke, { x, y }, useEditorStore.getState().skinPaint.radius);
+        paintAt(centers, e.altKey);
+        paintRef.current.stroke = state;
+      }
       draw(); // redraw heatmap + brush cursor
     }
   }, [paintMode, paintSubTool, showGizmo, gizmoLocal, displayOrigin, skinMode, partGizmoCenter, testPose, selBone, paintAt, draw, applyBoneTransform]);
@@ -918,6 +949,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
       <div style={{ position: 'relative' }}>
         <canvas
           ref={canvasRef}
+          data-ui-id="skin.canvas"
           style={{ width: '100%', height: HEIGHT, display: 'block', borderRadius: 4, border: '1px solid #2a2a3a', cursor, touchAction: 'none' }}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}

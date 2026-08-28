@@ -55,6 +55,9 @@ export default function SkinBoneList({ selBone, setSelBone }: { selBone: number;
         {rows.map(({ i, depth }) => (
           <div
             key={i}
+            data-ui-id={`skin.bones.row.${i}`}
+            data-ui-kind="button"
+            data-ui-label={`select bone ${bones[i].name}`}
             draggable
             onDragStart={(e) => e.dataTransfer.setData('application/skin-bone', String(i))}
             onDragOver={(e) => { if (e.dataTransfer.types.includes('application/skin-bone')) e.preventDefault(); }}
