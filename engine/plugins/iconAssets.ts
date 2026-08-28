@@ -26,6 +26,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+
 export type IconPlatform = 'ios' | 'android';
 
 /** PINNED — see (1) above. Bumping this invalidates every stamp, so the next build of each
@@ -51,15 +52,50 @@ export function iconSentinelPath(projectRoot: string, plat: IconPlatform): strin
   );
 }
 
-/** Bumped whenever OUR OWN post-processing changes what lands on disk — the splash overlay
- *  geometry, the icon-variant derivations, the badge artwork's placement. `ICON_TOOL` pins the
- *  upstream generator, but everything #396/#397 added runs after it and is ours; without a
- *  version in the stamp, improving a derivation would leave every already-built project on the
- *  old output until someone deleted `.cache/` by hand.
+/** The post-processing modules whose OUTPUT lands on disk. Their CONTENT is the version. */
+const PIPELINE_SOURCES = [
+  'splashCompose.mjs',
+  'splashLayout.mjs',
+  'iconVariants.mjs',
+  'androidSplashTheme.mjs',
+] as const;
+
+/** Hash of the given files' contents — the identity of our own post-processing code.
+ *  Exported so it can be tested against fixtures rather than against itself. */
+export function pipelineVersionFrom(files: string[]): string {
+  const h = crypto.createHash('sha256');
+  for (const f of files) {
+    // A missing file hashes as its name, so a rename cannot silently collide with the old set.
+    try { h.update(fs.readFileSync(f)); } catch { h.update(`missing:${path.basename(f)}`); }
+  }
+  return h.digest('hex').slice(0, 12);
+}
+
+/** Identity of OUR OWN post-processing — the splash overlay geometry, the icon-variant
+ *  derivations, the Android theme colour, the PNG encoder settings. `ICON_TOOL` pins the upstream
+ *  generator; everything #396/#397 added runs after it and is ours.
  *
- *  Bumped to '2' when the generated PNGs moved to `GENERATED_PNG`'s lossless settings — every
- *  already-built project must re-encode once to pick up the smaller files. */
-export const SPLASH_PIPELINE_VERSION = '2';
+ *  ⚠️ **DERIVED from the sources, not a hand-bumped constant, and that is the whole point.** It was
+ *  a literal (`'1'`, then `'2'`) for exactly one session before a fix to `regionLuminanceOf` — the
+ *  function choosing the splash badge's colour — shipped with the constant untouched. Measured on
+ *  Court at that moment: `iconIsUpToDate` returned TRUE, so `iconStep` dropped itself from the build
+ *  plan and the fix reached nothing. Worse, the WEB boot splash is not stamped at all and recomposes
+ *  every build, so the two halves of one launch screen would have been composed by different
+ *  versions of the same code — the precise drift `overlayLayersFor` exists to prevent.
+ *
+ *  A constant that must be remembered is a step that will be forgotten; hashing the code removes the
+ *  step. The cost is that editing any of those files — a comment included — invalidates every
+ *  project's stamp and buys one regeneration. That is the correct trade: regeneration is idempotent
+ *  and byte-stable, while a missed bump is silent and permanent. */
+export function splashPipelineVersion(engineRootAbs: string | undefined): string {
+  // ⚠️ NOT resolved from this module. `import.meta.url` is `undefined` in the CJS bundle the
+  // packaged editor builds its Vite config into, so `fileURLToPath` threw AT LOAD and took the
+  // whole config with it (caught by packagedViteConfig.test.ts, #326). `__dirname` is no better:
+  // in a bundle it points at the bundle. The anchor therefore comes from the caller, exactly like
+  // every other path this build resolves (`build/icon.png`, `engine/assets/splash-badge-*`).
+  if (!engineRootAbs) return 'pipeline:unanchored';
+  return pipelineVersionFrom(PIPELINE_SOURCES.map((f) => path.join(engineRootAbs, 'engine', 'scripts', f)));
+}
 
 /** The extra inputs #396/#397 added. All optional — an omitted field means "not configured",
  *  which is exactly the pre-#396 behaviour, so an existing caller's stamp is unaffected in
@@ -81,6 +117,10 @@ export interface IconStampExtras {
   /** Feeds the crop-safe box, so it changes WHERE the overlays land. A project flipped from
    *  portrait to unlocked must regenerate even though every source file is byte-identical. */
   orientation?: string;
+  /** Repo/engine root, so the stamp can hash OUR OWN post-processing sources. Omitted → the stamp
+   *  carries the literal `pipeline:unanchored`, which differs from every real hash, so a caller
+   *  that forgets it is visible in the digest rather than silently unprotected. */
+  engineRootAbs?: string;
 }
 
 /** Content hash of one optional source file. `absent` and `missing` are deliberately different
@@ -112,7 +152,7 @@ export function iconStampValue(
   return crypto.createHash('sha256')
     .update([
       ICON_TOOL,
-      SPLASH_PIPELINE_VERSION,
+      splashPipelineVersion(extras.engineRootAbs),
       plat,
       ICON_COLORS,
       srcHash,

@@ -2104,6 +2104,8 @@ export function assetScannerPlugin(): Plugin {
             titleOffsetPct: cfg.app.splashTitleOffsetPct,
             badge: cfg.app.splashBadge,
             orientation: splashOrientation,
+            // Anchors the post-processing-source hash; see splashPipelineVersion.
+            engineRootAbs: buildCwd,
           };
           const iconStep = (plat: 'ios' | 'android'): BuildStep | null => {
             if (iconIsUpToDate(projectRoot, iconSrcAbs, plat, stampExtras)) return null;

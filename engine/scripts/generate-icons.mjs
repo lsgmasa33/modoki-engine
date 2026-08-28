@@ -246,13 +246,7 @@ async function main() {
         iconSrcAbs: iconSrc,
         monochromeSrcAbs: args['icon-monochrome'],
       });
-    if (platform === 'android') {
-      // The Android 12+ system splash is the only launch surface the platform actually draws —
-      // the generated drawable buckets are never shown at minSdk 31+. See androidSplashTheme.mjs.
-      const theme = await applyAndroidSplashTheme({ projectRoot, splashSrcAbs: args.splash });
-      if (theme.changed) console.log(`[icon] system splash colour ${theme.colour} (sampled from the splash master)`);
-      for (const n of theme.notes) console.log(`[icon] ${n}`);
-    }
+
     if (variants.written.length) console.log(`[icon] icon variants: ${variants.written.length} file(s)`);
     for (const n of variants.notes) console.log(`[icon] ${n}`);
   } catch (e) {
@@ -260,6 +254,22 @@ async function main() {
     // variant degrades to the OS's own fallback — but NOT stamped, so the next build retries.
     console.error(`[icon] icon variants failed (${e.message}) — base icons are unaffected, will retry next build`);
     postFailed = true;
+  }
+
+  // Its OWN try, so a failure here is not reported as "icon variants failed" — it is reachable
+  // (`splashEdgeColour` throws `extract_area: bad extract area` on a master 1 px in either
+  // dimension) and an operator told the wrong subsystem failed looks in the wrong place.
+  if (platform === 'android') {
+    try {
+      // The Android 12+ system splash is the only launch surface the platform actually draws —
+      // the generated drawable buckets are never shown at minSdk 31+. See androidSplashTheme.mjs.
+      const theme = await applyAndroidSplashTheme({ projectRoot, splashSrcAbs: args.splash });
+      if (theme.changed) console.log(`[icon] system splash colour ${theme.colour} (sampled from the splash master)`);
+      for (const n of theme.notes) console.log(`[icon] ${n}`);
+    } catch (e) {
+      console.error(`[icon] system splash colour failed (${e.message}) — will retry next build`);
+      postFailed = true;
+    }
   }
 
   try {

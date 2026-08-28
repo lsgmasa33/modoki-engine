@@ -36,7 +36,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Plugin } from 'vite';
-import { composeWebSplash } from '../scripts/splashCompose.mjs';
+import { composeWebSplash, splashEdgeColour } from '../scripts/splashCompose.mjs';
 import type { ProjectConfig } from '../project-config';
 
 /** Emitted at the dist root; referenced from the injected markup. */
@@ -75,6 +75,8 @@ export function bootSplashPlugin(projectRoot: string, cfg: ProjectConfig, engine
   const titleSrc = projectFile(projectRoot, cfg.app.splashTitleSource);
   let composed: Buffer | null = null;
   let base = '/';
+  /** Sampled from the master, NOT a literal — see the assignment in buildStart. */
+  let background = '#0a0a1a';
 
   return {
     name: 'modoki:boot-splash',
@@ -103,6 +105,13 @@ export function bootSplashPlugin(projectRoot: string, cfg: ProjectConfig, engine
           badgeDarkArt: path.join(engineRoot, 'engine/assets/splash-badge-dark.png'),
         });
         composed = buffer;
+        // ⚠️ The background must be the SAME colour the Android system splash uses, because this
+        // element is what the native splash now hands over to. Hardcoding one meant two files
+        // decided "the colour behind the splash art" and disagreed by construction: #55341a on the
+        // system splash, near-black here, with the handover between them. It is painted for the
+        // window before the 1440² webp decodes — a window this change opened by hiding the native
+        // splash at React mount instead of when the game is ready.
+        background = await splashEdgeColour(splashSrc);
         for (const what of clamped) {
           this.warn(`[boot-splash] ${what} was clamped into the crop-safe box`);
         }
@@ -123,7 +132,7 @@ export function bootSplashPlugin(projectRoot: string, cfg: ProjectConfig, engine
       handler(html) {
         if (!composed) return html;
         const url = `${base.endsWith('/') ? base : `${base}/`}${BOOT_SPLASH_FILE}`;
-        return html.replace('</body>', `${bootSplashMarkup(url, '#0a0a1a')}</body>`);
+        return html.replace('</body>', `${bootSplashMarkup(url, background)}</body>`);
       },
     },
   };

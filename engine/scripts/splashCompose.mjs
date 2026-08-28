@@ -74,7 +74,14 @@ async function regionLuminanceOf(src, rect) {
   const top = Math.max(0, Math.min(height - 1, rect.y));
   const w = Math.max(1, Math.min(width - left, rect.w));
   const h = Math.max(1, Math.min(height - top, rect.h));
-  const stats = await sharp(src).extract({ left, top, width: w, height: h }).stats();
+  // ⚠️ `.extract(...).stats()` does NOT sample the extracted region — sharp's `stats()` reads the
+  // INPUT image, so the crop is ignored and this returned the WHOLE splash's mean luminance. The
+  // badge then picked its colour from the average of the entire image rather than from the ground
+  // it actually covers: on a splash that is dark overall but LIGHT where the badge sits, it chose
+  // the cream mark and put it on near-white. Court was unaffected only by luck (both are dark).
+  // Materialising the region to a buffer first is what makes the crop real.
+  const region = await sharp(src).extract({ left, top, width: w, height: h }).toBuffer();
+  const stats = await sharp(region).stats();
   // `stats.channels` is [r,g,b,(a)] means in 0..255. Rec.709 on the means is close enough for a
   // light/dark decision and far cheaper than a per-pixel pass over 26 buckets.
   const [r, g, b] = stats.channels;
@@ -97,6 +104,50 @@ const SPLASH_PNG = GENERATED_PNG;
 /** Re-encode one splash efficiently, flattening the alpha compositing introduces. */
 function encodeSplash(pipeline) {
   return pipeline.flatten({ background: '#000000' }).png(SPLASH_PNG).toBuffer();
+}
+
+/** The colour to put behind the icon: the mean of the master's EDGE RING.
+ *
+ *  The edge rather than the whole image, because the frame that follows this one is the splash
+ *  cover-cropped to the screen — and what fills that frame's perimeter is the master's border. For
+ *  Court that is the painted wood, not the cream page sitting in the middle of it. Sampling the
+ *  whole image would average the page in and give a colour that appears nowhere.
+ *
+ *  ⚠️ **The MEAN is right for Court and wrong for two ordinary compositions.** A master with a dark
+ *  VIGNETTE gives a ring mean darker than anything visible after the crop, so the icon sits on a
+ *  colour the art never shows; a light MAT around dark art (an ordinary framed poster) puts the icon
+ *  on the mat and makes the handover a hard cut. Neither shape exists in this repo today. If one
+ *  arrives, the ring's MEDIAN is the robust replacement — a vignette moves a mean far more than it
+ *  moves a median — not a wider or narrower `ringFrac`. */
+export async function splashEdgeColour(srcPath, ringFrac = 0.12) {
+  const img = sharp(srcPath);
+  const { width, height } = await img.metadata();
+  const band = Math.max(1, Math.round(Math.min(width, height) * ringFrac));
+  // Four strips rather than "whole image minus centre", which sharp cannot express directly.
+  const strips = [
+    { left: 0, top: 0, width, height: band },
+    { left: 0, top: height - band, width, height: band },
+    { left: 0, top: band, width: band, height: Math.max(1, height - band * 2) },
+    { left: width - band, top: band, width: band, height: Math.max(1, height - band * 2) },
+  ];
+  let r = 0, g = 0, b = 0, weight = 0;
+  for (const s of strips) {
+    // ⚠️ `.extract(...).stats()` does NOT sample the extracted region — sharp's `stats()` reads the
+    // INPUT image, so the crop is ignored and every strip returns the WHOLE image's mean. That
+    // silently turned this function into "average the whole master", which is exactly what the
+    // comment above says not to do: on Court it returned the wood averaged with the cream page,
+    // a colour that appears nowhere, and the step at the handover was visible on device.
+    // Materialising the region to a buffer first is what makes the crop real.
+    const region = await sharp(srcPath).extract(s).toBuffer();
+    const stats = await sharp(region).stats();
+    const px = s.width * s.height;
+    r += stats.channels[0].mean * px;
+    g += stats.channels[1].mean * px;
+    b += stats.channels[2].mean * px;
+    weight += px;
+  }
+  const hex = (v) => Math.max(0, Math.min(255, Math.round(v / weight))).toString(16).padStart(2, '0');
+  return `#${hex(r)}${hex(g)}${hex(b)}`;
 }
 
 /** The overlay layers for one base image of `width` x `height`.

@@ -4,9 +4,14 @@
  *
  *  Measured on a Galaxy S22 (API 34): the 26 generated `drawable-*` splash buckets are NEVER
  *  SHOWN. The launch theme inherits `Theme.SplashScreen`, and from API 31 the platform draws its
- *  own splash and ignores `android:background` — so a player saw the app icon on a black field,
+ *  own splash and ignores `android:windowBackground` unless it is a single colour — so a player saw
+ *  the app icon on a black field,
  *  and every one of those buckets was dead weight. Court's floor is `minSdkVersion 31`, so this is
  *  not an old-device edge case: it is every supported Android device.
+ *
+ *  (The `android:background` Capacitor's template sets on that theme is a VIEW attribute, and was
+ *  never the window background — it was inert long before API 31 mattered. The buckets it names are
+ *  dead either way; the platform simply makes it unambiguous.)
  *
  *  ## And it cannot be fixed by drawing the art there
  *
@@ -32,6 +37,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
+import { splashEdgeColour } from './splashCompose.mjs';
 
 const STYLES = path.join('android', 'app', 'src', 'main', 'res', 'values', 'styles.xml');
 
@@ -39,43 +45,6 @@ const STYLES = path.join('android', 'app', 'src', 'main', 'res', 'values', 'styl
  *  hand-authored line beside it. */
 const BEGIN = '<!-- modoki:splash-begin — generated from app.splashSource -->';
 const END = '<!-- modoki:splash-end -->';
-
-/** The colour to put behind the icon: the mean of the master's EDGE RING.
- *
- *  The edge rather than the whole image, because the frame that follows this one is the splash
- *  cover-cropped to the screen — and what fills that frame's perimeter is the master's border. For
- *  Court that is the painted wood, not the cream page sitting in the middle of it. Sampling the
- *  whole image would average the page in and give a colour that appears nowhere. */
-export async function splashEdgeColour(srcPath, ringFrac = 0.12) {
-  const img = sharp(srcPath);
-  const { width, height } = await img.metadata();
-  const band = Math.max(1, Math.round(Math.min(width, height) * ringFrac));
-  // Four strips rather than "whole image minus centre", which sharp cannot express directly.
-  const strips = [
-    { left: 0, top: 0, width, height: band },
-    { left: 0, top: height - band, width, height: band },
-    { left: 0, top: band, width: band, height: Math.max(1, height - band * 2) },
-    { left: width - band, top: band, width: band, height: Math.max(1, height - band * 2) },
-  ];
-  let r = 0, g = 0, b = 0, weight = 0;
-  for (const s of strips) {
-    // ⚠️ `.extract(...).stats()` does NOT sample the extracted region — sharp's `stats()` reads the
-    // INPUT image, so the crop is ignored and every strip returns the WHOLE image's mean. That
-    // silently turned this function into "average the whole master", which is exactly what the
-    // comment above says not to do: on Court it returned the wood averaged with the cream page,
-    // a colour that appears nowhere, and the step at the handover was visible on device.
-    // Materialising the region to a buffer first is what makes the crop real.
-    const region = await sharp(srcPath).extract(s).toBuffer();
-    const stats = await sharp(region).stats();
-    const px = s.width * s.height;
-    r += stats.channels[0].mean * px;
-    g += stats.channels[1].mean * px;
-    b += stats.channels[2].mean * px;
-    weight += px;
-  }
-  const hex = (v) => Math.max(0, Math.min(255, Math.round(v / weight))).toString(16).padStart(2, '0');
-  return `#${hex(r)}${hex(g)}${hex(b)}`;
-}
 
 /** `styles.xml` with our generated block replaced (or added). Pure string work, and idempotent —
  *  it runs on every build, like the adaptive-icon XML edit.
@@ -106,6 +75,8 @@ export function withSplashTheme(xml, colour) {
   return stripped.replace(launch, `$1${block}`);
 }
 
+export { splashEdgeColour };
+
 /** Write the sampled colour into the launch theme. Returns `{changed, colour, notes}`. */
 export async function applyAndroidSplashTheme({ projectRoot, splashSrcAbs }) {
   const notes = [];
@@ -118,7 +89,17 @@ export async function applyAndroidSplashTheme({ projectRoot, splashSrcAbs }) {
   const colour = await splashEdgeColour(splashSrcAbs);
   const before = fs.readFileSync(file, 'utf8');
   const after = withSplashTheme(before, colour);
-  if (after === before) return { changed: false, colour, notes };
+  if (after === before) {
+    // Two ways to land here, and they mean opposite things. Either the block is already correct
+    // (a rebuild — the common case, silent by design), or `withSplashTheme` DECLINED: no
+    // `AppTheme.NoActionBarLaunch` in this styles.xml, or its `>` is not followed by a bare `\n`
+    // (CRLF). The decline used to be indistinguishable from success, so a renamed launch theme
+    // left the system splash black with the build printing nothing at all.
+    if (!/windowSplashScreenBackground/.test(after)) {
+      notes.push(`could not find an AppTheme.NoActionBarLaunch style in ${STYLES} — system splash colour NOT set`);
+    }
+    return { changed: false, colour, notes };
+  }
   fs.writeFileSync(file, after);
   return { changed: true, colour, notes };
 }

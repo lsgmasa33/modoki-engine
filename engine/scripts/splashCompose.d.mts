@@ -44,3 +44,7 @@ export declare function composeSplashOverlays(
 ): Promise<SplashComposeReport>;
 
 export type { SafeBox };
+
+/** Mean colour of the master's EDGE RING — the colour behind the Android system splash and
+ *  behind the web boot splash before its image decodes. */
+export declare function splashEdgeColour(srcPath: string, ringFrac?: number): Promise<string>;

@@ -305,7 +305,8 @@ re-encode runs for every splash of a project with a custom master, overlays or n
 
 Measured on a Galaxy S22 (API 34), and it is not an old-device edge case: **at `minSdkVersion 31`
 this is every supported Android device.** The launch theme inherits `Theme.SplashScreen`, and from
-API 31 the platform draws its own splash and ignores `android:background`, so all 26
+API 31 the platform draws its own splash and ignores `android:windowBackground` unless it is a
+single colour, so all 26
 `drawable-*` splash PNGs are dead weight in the APK and the player saw **the app icon on black**.
 
 **And the art cannot be moved there.** Google's splash-screen documentation is explicit — *"Set a

@@ -127,6 +127,29 @@ describe('composeSplashOverlays', () => {
     expect(await read()).toBeLessThan(0.5);               // → navy badge
   });
 
+  it('measures the ground UNDER the badge, not the whole image', async () => {
+    // Found by the close-out's pattern sweep, as a sibling of the same bug in androidSplashTheme:
+    // `.extract(...).stats()` reads the INPUT image, so the crop is silently ignored. A splash that
+    // is dark overall but LIGHT where the badge sits got the CREAM mark on near-white — invisible.
+    // Court passed only by luck: its badge region and its whole-image mean are both dark.
+    const f = path.join(root, RES, 'drawable-port-xhdpi', 'splash.png');
+    await solid(f, 720, 1280, [15, 15, 20]);                       // dark overall…
+    const strip = await sharp({ create: { width: 720, height: 260, channels: 4, background: { r: 245, g: 242, b: 235, alpha: 1 } } })
+      .png().toBuffer();
+    fs.writeFileSync(f, await sharp(f).composite([{ input: strip, top: 1280 - 300, left: 0 }]).png().toBuffer());
+    // …but light exactly where the badge lands (bottom of the portrait safe box).
+
+    await composeSplashOverlays({
+      projectRoot: root, platform: 'android', orientation: 'portrait',
+      badge: true, badgeLightArt: badgeLight, badgeDarkArt: badgeDark,
+    });
+    const { data, info } = await sharp(f).raw().toBuffer({ resolveWithObject: true });
+    const y = Math.round(160 + 960 - 960 * 0.06 - 20);
+    const i = (y * info.width + 360) * info.channels;
+    const lum = (data[i] * 0.2126 + data[i + 1] * 0.7152 + data[i + 2] * 0.0722) / 255;
+    expect(lum).toBeLessThan(0.5); // the NAVY badge, because the ground under it is light
+  });
+
   it('THROWS on an unreadable title rather than quietly shipping a splash without one', async () => {
     // This is the precondition for the stamp guard in generate-icons.mjs: the caller catches,
     // sets `postFailed`, and WITHHOLDS the freshness stamp. If this resolved quietly instead, the

@@ -5,9 +5,10 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { REPO_ROOT } from '../helpers/repoLayout';
 import {
   ICON_TOOL, ICON_COLORS, iconStampValue, iconIsUpToDate,
-  iconStampPath, iconSentinelPath, SPLASH_PIPELINE_VERSION,
+  iconStampPath, iconSentinelPath, splashPipelineVersion, pipelineVersionFrom,
 } from '../../plugins/iconAssets';
 
 let root: string;
@@ -191,14 +192,42 @@ describe('splash + icon-variant inputs are all in the stamp', () => {
       .not.toBe(iconStampValue(src, 'android', { orientation: 'auto' }));
   });
 
-  it('exposes a post-processing version, the only input that can express a CODE change', () => {
-    // A change to the derivations or the overlay geometry is invisible to every other input —
-    // no source file moves — so bumping this constant is what invalidates already-stamped
-    // projects. The test can only assert that it exists and is non-empty: it is a module
-    // constant folded into the hash by construction, and faking a second value to compare
-    // against would be testing the mock, not the stamp.
-    expect(typeof SPLASH_PIPELINE_VERSION).toBe('string');
-    expect(SPLASH_PIPELINE_VERSION.length).toBeGreaterThan(0);
+  it('DERIVES the post-processing version from the source files, so it cannot be forgotten', () => {
+    // This replaced `typeof === 'string'`, which passed under both hypotheses and duly failed to
+    // notice a real missed bump: a fix to `regionLuminanceOf` (the splash badge's colour) shipped
+    // with the constant untouched, `iconIsUpToDate` returned true, and the fix reached nothing.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pipeline-'));
+    const a = path.join(dir, 'a.mjs'); const b = path.join(dir, 'b.mjs');
+    fs.writeFileSync(a, 'export const x = 1;'); fs.writeFileSync(b, 'export const y = 2;');
+
+    const before = pipelineVersionFrom([a, b]);
+    expect(before).toMatch(/^[0-9a-f]{12}$/);
+    expect(pipelineVersionFrom([a, b])).toBe(before);           // stable
+
+    fs.writeFileSync(a, 'export const x = 2;');                 // ANY edit moves it
+    expect(pipelineVersionFrom([a, b])).not.toBe(before);
+
+    // Order is part of the identity, and a missing file cannot collide with a present one.
+    expect(pipelineVersionFrom([b, a])).not.toBe(pipelineVersionFrom([a, b]));
+    expect(pipelineVersionFrom([a, path.join(dir, 'gone.mjs')])).not.toBe(pipelineVersionFrom([a, b]));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('tracks the REAL pipeline sources when anchored — not a placeholder', () => {
+    // Guards the wiring, not just the helper: pinned back to a literal, this stops matching.
+    const expected = pipelineVersionFrom(
+      ['splashCompose.mjs', 'splashLayout.mjs', 'iconVariants.mjs', 'androidSplashTheme.mjs']
+        .map((f) => path.join(REPO_ROOT, 'engine', 'scripts', f)),
+    );
+    expect(splashPipelineVersion(REPO_ROOT)).toBe(expected);
+  });
+
+  it('makes an UNANCHORED caller visible in the digest instead of silently unprotected', () => {
+    // The anchor comes from the caller (import.meta.url is undefined in the packaged CJS bundle —
+    // #326). A caller that forgets it must not quietly get "no post-processing identity".
+    expect(splashPipelineVersion(undefined)).toBe('pipeline:unanchored');
+    expect(iconStampValue(src, 'android', { engineRootAbs: REPO_ROOT }))
+      .not.toBe(iconStampValue(src, 'android', {}));
   });
 
   it('feeds through iconIsUpToDate, not just the raw hash', () => {
