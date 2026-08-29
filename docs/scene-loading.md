@@ -233,7 +233,7 @@ override.
 `meta.fields` is the *Inspector's* curated list: a persistent field owned by a custom
 Inspector section is deliberately absent from it (`Animator.clips`/`clip`,
 `SpriteAnimator.clip`, `AudioSource.clips`, `UIElement.flexWrap`,
-`EntityAttributes.editorFolder`, `Time.timeScale`, …). Every persistence path therefore
+`EntityAttributes.editorFolder`, …). Every persistence path therefore
 reads through `readTraitDataFull` (`runtime/core/ecs/entityUtils.ts`) and gates stored
 fields with `isPersistentTraitField` (`runtime/core/ecs/traitSchema.ts`) — the scene
 serializer, `serializePrefab`,
@@ -816,13 +816,14 @@ is therefore scoped to same-file collisions deliberately, and says so in its own
   any entity without `EntityAttributes`, and this one has none, so it landed in a shared
   **base** just as readily.
 
-  A scene may still **author** its own Time — hosting the resource in a shared base scene
-  is a supported setup, and it is why `timeScale` is deliberately not marked `runtimeOnly`.
-  A Time that came from a file carries no `Transient` tag and serializes normally.
-  **Provenance is the only workable discriminator**: an authored Time sitting at the
-  default `timeScale` is byte-identical to the materialized one, so no value-based rule
-  could tell them apart without deleting the authored one. (`Input` needs no tag — it is
-  simply not in the trait registry.) Gate:
+  A scene may still **author** its own Time entity — hosting the resource in a shared base
+  scene is a supported setup, and it is why the `Transient` tag is needed at all. A Time
+  that came from a file carries no `Transient` tag and serializes normally — but as of
+  #410, every field on `Time` including `timeScale` is `runtimeOnly`, so an authored Time
+  serializes as `"Time": {}`. **Provenance is the only workable discriminator**: an
+  authored Time is now byte-identical to the materialized one *at every value*, not just
+  the default, so no value-based rule could ever tell them apart without deleting the
+  authored one. (`Input` needs no tag — it is simply not in the trait registry.) Gate:
   `engine/packages/modoki/tests/editor/timeResourceProvenance.test.ts`.
 - **An entity SPAWNED BY A SYSTEM is tagged `Transient` at the spawn site, so it is never
   saved** (#124). Same provenance principle as the Time singleton, generalized: `spawnEntity`
@@ -1030,7 +1031,18 @@ staging world. `SceneManager`:
 Each snapshotted field is the union of the trait's koota `.schema` keys and its
 registered `meta.fields` keys (not `meta.fields` alone, which is a curated Inspector
 subset) — otherwise a field absent from the Inspector's curated set (e.g.
-`Time.timeScale`) would silently reset to its schema default across every swap.
+`AnimationLibrary.animSets`, an AoS field `snapshotFieldNames` itself cites) would
+silently reset to its schema default across every swap. `snapshotFieldNames`
+deliberately ignores `runtimeOnly` too — a **carried** entity's live runtime state
+(a kept base's `Time`, a `Persistent` entity mid-tween) must not be reset by the
+swap that preserves it. ⚠️ That says nothing about the materialized `Time`
+singleton, which is carried by NEITHER route: `snapshotPersistentEntities` collects
+roots via `world.query(Persistent)` and via `EntityAttributes.sourceScene ∈
+keptBaseGuids`, and the materialized Time has no `Persistent` tag and no
+`EntityAttributes` at all — so a swap respawns it at `timeScale: 1`. A Time authored
+in the PRIMARY scene is not carried either (its `sourceScene` is never a kept-base
+guid). A debug slow-mo therefore survives a swap only in the kept-BASE setup, which
+no committed scene exercises today.
 
 > Persistent entities must be **ECS-pure** — trait data only. Anything held in a
 > closure, an in-flight tween, or a Web Audio node is lost on swap, since that

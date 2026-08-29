@@ -757,12 +757,15 @@ class SceneManagerImpl implements SceneManager {
         // without EntityAttributes, and this one has none, so it lands in EVERY file
         // saved while it exists rather than being confined to the primary.
         //
-        // This does NOT stop a scene from AUTHORING its own Time (that's the point of
-        // `timeScale` not being marked runtimeOnly, and of hosting the resource in a
-        // shared BASE scene): a Time that came from a file has no Transient tag and
-        // serializes normally. The tag distinguishes PROVENANCE, which is the only
-        // thing that can tell the two apart — an authored Time sitting at the default
-        // timeScale is byte-identical to this one, so no value-based rule could.
+        // This does NOT stop a scene from AUTHORING its own Time ENTITY — hosting the
+        // resource in a shared BASE scene is a supported setup: a Time that came from a
+        // file has no Transient tag and serializes normally (as `"Time": {}`, since #410
+        // flags every field runtimeOnly). The tag distinguishes PROVENANCE, which is the
+        // only thing that can tell the two apart — an authored Time is byte-identical to
+        // this one on disk, so no value-based rule could. That was already true before
+        // #410 (an authored Time at the default timeScale was indistinguishable); the flag
+        // only makes it true for every value, which STRENGTHENS the case for the tag
+        // rather than weakening it.
         // Re-materialized on every chain load that needs it, so nothing is lost.
         spawnEntity(stagingWorld, Time(), Transient);
       }
@@ -1197,11 +1200,13 @@ export function filterDuplicateChainGuids(
 /** The field set a carried entity is snapshotted with: the union of the trait's
  *  koota `.schema` keys and its registered Inspector `fields`. The koota schema
  *  is the authoritative serialized set (see `buildSceneSchema`) — `meta.fields`
- *  is a curated SUBSET, so using it alone silently drops real state (e.g.
- *  `Time.timeScale`, which is in Time's schema but not its Inspector fields, and
- *  AoS fields like `AnimationLibrary.animSets`). `runtimeOnly` is deliberately
- *  ignored: that flag gates *scene-file* serialization, and carrying runtime
- *  state across a swap is the entire point of a snapshot. */
+ *  is a curated SUBSET, so using it alone silently drops real state (e.g. AoS fields
+ *  like `AnimationLibrary.animSets`). `runtimeOnly` is deliberately ignored: that
+ *  flag gates *scene-file* serialization, and carrying runtime state across a swap
+ *  is the entire point of a snapshot — a debug slow-mo or a paused world survives a
+ *  scene swap precisely because this union ignores the flag. (`Time.timeScale` was
+ *  this docblock's schema-but-not-Inspector example until #410 added it to the
+ *  Inspector fields to flag it; it is now an example of the runtimeOnly half.) */
 export function snapshotFieldNames(meta: { trait: unknown; fields: Record<string, unknown> }): string[] {
   const koota = resolveKootaSchema(meta.trait);
   if (!koota) return Object.keys(meta.fields);

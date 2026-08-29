@@ -2,7 +2,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld } from 'koota';
-import { getCurrentWorld, loadSceneFile, SCENE_FORMAT_VERSION, spawnEntity } from '@modoki/engine/runtime';
+import { getCurrentWorld, loadSceneFile, SCENE_FORMAT_VERSION, spawnEntity, setTimeScale } from '@modoki/engine/runtime';
 import { Transform, Renderable3D, Renderable3DPrimitive, EntityAttributes, Time, Paused, Transient, PrefabInstance } from '@modoki/engine/runtime';
 import { RenderableUI, UIElement, UIBinding, UIAction, UIScrollView, UIEntries, type UIActionBinding } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -523,5 +523,38 @@ describe('serializeScene — runtimeOnly fields never reach the file', () => {
     const t = scene.entities.map((e) => e.traits['Time']).find(Boolean) as Record<string, unknown> | undefined;
     expect(t, 'a Time entity serialized (beforeEach spawns one)').toBeDefined();
     expect(t, 'Time.elapsed is recomputed every frame').not.toHaveProperty('elapsed');
+  });
+
+  // #410: `timeScale` used to be the one authored knob on Time and was left unflagged, so a
+  // debug inspection (`setTimeScale`, exactly what the `set-timescale`/`sim-step` agent ops and
+  // the device Time tab call) followed by any save could bake e.g. `"timeScale": 0` into a
+  // shipping scene. It is now `runtimeOnly` like the rest of Time. The beforeEach Time entity has
+  // no Transient tag, so this is the AUTHORED case — the strongest one the flag has to hold up.
+  it('drops a debug-set timeScale — the value setTimeScale leaves behind never reaches the file', async () => {
+    setTimeScale(getCurrentWorld(), 0); // exactly what modoki_step / sim-step leaves the world at
+    const scene = await serializeScene();
+    const t = scene.entities.map((e) => e.traits['Time']).find(Boolean) as Record<string, unknown> | undefined;
+    expect(t, 'a Time entity serialized (beforeEach spawns one)').toBeDefined();
+    expect(Object.keys(t!)).not.toContain('timeScale');
+  });
+
+  it('drops a debug-set timeScale at a non-zero value too (0 is falsy — must not pass by accident)', async () => {
+    setTimeScale(getCurrentWorld(), 0.3);
+    const scene = await serializeScene();
+    const t = scene.entities.map((e) => e.traits['Time']).find(Boolean) as Record<string, unknown> | undefined;
+    expect(t, 'a Time entity serialized (beforeEach spawns one)').toBeDefined();
+    expect(Object.keys(t!)).not.toContain('timeScale');
+  });
+});
+
+// #410 anti-drift guard: `timeResourceProvenance.test.ts` mocks the trait registry with its OWN
+// copy of Time's `fields`, so it cannot see whether the REAL registration actually flags
+// `timeScale` runtimeOnly — it could silently keep modelling behaviour the engine no longer has.
+// This pins the real registration directly.
+describe('Time.timeScale registration (#410)', () => {
+  it('is registered runtimeOnly in the real trait registry', () => {
+    const meta = getAllTraits().find((t) => t.name === 'Time');
+    expect(meta, 'Time is registered').toBeDefined();
+    expect(meta!.fields?.timeScale?.runtimeOnly).toBe(true);
   });
 });

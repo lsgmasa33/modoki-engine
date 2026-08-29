@@ -778,14 +778,48 @@ export function registerAllTraits() {
   registerTrait({
     name: 'Time', trait: Time, category: 'resource',
     fields: {
-      // Pure runtime state — recomputed each frame by timeSystem, so runtimeOnly
-      // keeps them out of the serialized scene (no save churn). `timeScale` is
-      // the one authored knob and is intentionally NOT marked → it persists.
+      // ALL of Time is pure runtime state, so every field is `runtimeOnly` and none of it
+      // reaches a scene file. The cadence fields are recomputed each frame by timeSystem.
+      //
+      // `timeScale` was registered as "the one authored knob" and deliberately left unflagged
+      // until #410. Nothing ever AUTHORED it — no scene in games/ or demos/ sets it — while four
+      // purely TRANSIENT callers write it and none restore it: the
+      // `set-timescale` agent op, the `sim-step` op (which ends at 0 BY DESIGN, re-freezing the
+      // world on both the success and the timeout path), the on-device Time-tab slider, and
+      // `demos/video-demo`'s `demo.timeScale` UI action — a timeline SIGNAL track, so the value
+      // is authored in the timeline asset and the write itself is transient (the tour re-sets 1x
+      // at t=0, which is why a Stop mid-slow-mo never stranded a slowed clock). That fourth
+      // caller is a save-bake vector too, not a counter-example: it is the strongest argument
+      // for the flag, since it fires during ordinary PLAY rather than during inspection. An
+      // agent inspecting a stopped scene with two encouraged debug moves, followed by any save,
+      // baked `"timeScale": 0` into the scene — and that scene then SHIPS FROZEN. `setTimeScale`
+      // writes through koota's `updateEach`, so the `authoredWrites` stopped-write recorder never
+      // saw it either (it hooks `writeTraitField`); nor is it a system, so `runPipeline`'s
+      // skip-while-stopped gate does not cover it. Flagging it is the whole fix: the debug paths
+      // keep writing it freely, it simply stops being persistable.
+      //
+      // The flag stops NEW bakes; it does not heal an old one. Load and save are deliberately
+      // ASYMMETRIC: `runtimeOnly` gates the SERIALIZER, and nothing on the load side consults it
+      // — a plain scene entity's trait bag is spawned as-is (`loadSceneFile`'s first-pass
+      // `fieldData = traitData`, no per-field filter; the `isPersistentTraitField` gate further
+      // down is the prefab-OVERRIDE path only). So a scene already carrying `"timeScale": 0`
+      // still loads it and still boots frozen until something re-saves it. No committed scene or prefab carries the field today, so there is nothing to
+      // migrate — the only repo-wide hits are stale, gitignored build artifacts.
+      //
+      // Note this REMOVES a per-scene authored time scale, which the registration advertised and
+      // nothing used. If one is ever wanted, it belongs in the game's config resource, not here —
+      // a scene's pace is a designer balance knob, not frame-cadence state. Guarded corpus-wide by
+      // `tests/assets/runtimeOnlyFieldsOffDisk.test.ts` and behaviourally by
+      // `packages/modoki/tests/editor/timeResourceProvenance.test.ts`.
       delta: { type: 'number', readOnly: true, runtimeOnly: true },
       elapsed: { type: 'number', readOnly: true, runtimeOnly: true },
       frame: { type: 'number', readOnly: true, runtimeOnly: true },
       smoothedDelta: { type: 'number', readOnly: true, runtimeOnly: true },
       smoothedElapsed: { type: 'number', readOnly: true, runtimeOnly: true },
+      timeScale: {
+        type: 'number', readOnly: true, runtimeOnly: true,
+        tooltip: 'Live global time scale: 1 = normal, 0 = pause/time-stop, 0.3 = slow-mo, 2 = fast-forward. Runtime state, never saved — set it from the debug menu\'s Time tab or `modoki_set_timescale`, not here.',
+      },
     },
   });
 
