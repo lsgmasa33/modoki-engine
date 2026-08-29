@@ -599,6 +599,10 @@ Two mechanisms now close it, and they are deliberately different in reach:
   `getprop`, `logcat -d`, `devicectl device info`) are always allowed — the claim arbitrates
   interference, not curiosity, and a guard that refused listings would be routed around.
 
+A different `PreToolUse` hook, `engine/scripts/context-cost-guard.mjs`, warns (never blocks) on a
+large unbounded `Read` or an unbounded verbose `Bash` call — see
+[docs/agent-context-cost.md](./agent-context-cost.md).
+
 ⚠️ **Wireless adb: the TRANSPORT verbs are carved out, because the fail-safe default was
 unsatisfiable for them.** `adb connect` / `disconnect` / `pair` address a device as `HOST:PORT` and
 have **no `-s` form at all** — the address IS the target. They were not in either verb set, so the
