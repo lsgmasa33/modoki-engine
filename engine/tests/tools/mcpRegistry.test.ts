@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 // v4 `z`, proving nothing about the v3 semantics `modoki_batch` actually runs against. Surfaced
 // by issue #23 (TS2740 — two structurally different ZodType implementations).
 import { z } from '../../tools/modoki-mcp/node_modules/zod';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 import {
   registerTool,
   getTool,
@@ -48,6 +49,16 @@ const allSrcFiles = () =>
   fs.readdirSync(SRC).filter((f) => f.endsWith('.ts')).concat(toolModules());
 
 const okResult = { content: [{ type: 'text' as const, text: '{}' }] };
+
+/** A module's source, comments stripped via the shared scanner (@modoki/engine/testing, #419) —
+ *  the lazy-regex stripper this replaced could delete real code hiding behind a `/*`-shaped line
+ *  comment. */
+const codeOf = (f: string): string => {
+  const raw = read(f);
+  const stripped = stripComments(raw);
+  assertScanIsSane(raw, stripped, f);
+  return stripped;
+};
 
 describe('registry', () => {
   beforeEach(() => clearRegistry());
@@ -488,7 +499,6 @@ describe('source guards that cannot be expressed as assertions', () => {
     //     legacy overload shape-sniffs its arguments and REJECTS a ZodObject outright, so it
     //     cannot carry the strict schema that conventions §1 requires — reverting to it would
     //     silently restore the "typo becomes a different operation" bug.
-    const codeOf = (f: string) => read(f).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
     const registerSites = allSrcFiles().filter((f) => /server\.registerTool\(/.test(codeOf(f)));
     expect(registerSites).toEqual(['registerAll.ts']);
     const legacy = allSrcFiles().filter((f) => /\bserver\.tool\(/.test(codeOf(f)));
@@ -515,7 +525,7 @@ describe('source guards that cannot be expressed as assertions', () => {
     // reads the environment cannot be pointed at a stub backend, and the surface becomes
     // untestable again by degrees.
     for (const f of toolModules().concat('context.ts', 'shapes.ts', 'registerAll.ts')) {
-      const code = read(f).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+      const code = codeOf(f);
       expect(code, `${f} must not read process.env`).not.toMatch(/process\.env/);
       expect(code, `${f} must not connect a transport`).not.toMatch(/StdioServerTransport|\.connect\(/);
     }

@@ -79,6 +79,21 @@ export const BINARY_EXT_TYPE: Readonly<Record<string, string>> = {
   '.mp4': 'video', '.mov': 'video', '.m4v': 'video', '.webm': 'video', '.mkv': 'video',
 };
 
+/** Classify a BINARY asset by file extension — the mirror of {@link classifyJsonAssetSuffix},
+ *  over {@link BINARY_EXT_TYPE}. Returns null when the extension is not a shippable binary
+ *  asset kind (the caller applies its own fallback).
+ *
+ *  Exists so a CONSUMER can share the table without importing node's `path` to split the
+ *  extension itself — which is what pushed `AssetRefField.assetTypeFromPath` into hand-writing
+ *  a parallel regex ladder that then drifted (#417): it silently labelled `.fbx`, `.exr` and
+ *  every video container 'unknown' while the build classified them correctly. */
+export function classifyBinaryExt(pathOrName: string): string | null {
+  const base = pathOrName.slice(pathOrName.lastIndexOf('/') + 1);
+  const dot = base.lastIndexOf('.');
+  if (dot < 0) return null;
+  return BINARY_EXT_TYPE[base.slice(dot).toLowerCase()] ?? null;
+}
+
 /** Asset types whose GUID lives in the file's OWN top-level `id` (JSON assets),
  *  as opposed to a `<file>.meta.json` sidecar (binary assets). `scene` now comes
  *  from the JSON suffix table itself (`.scene.json`, issue #54) rather than being

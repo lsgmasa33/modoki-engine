@@ -54,8 +54,25 @@ const MAX_PLAUSIBLE_FRAME_MS = 1000;
  *  share of `budgetMs`, but the question it asks is about the TARGET FRAME TIME, and re-deriving
  *  the target means undoing this slack. A second literal `1.2` over there would be a code
  *  constant shadowing this one, which is exactly the drift the single-source-of-truth rule
- *  exists to prevent. NOT the same number as `isVsyncBound`'s 1.2 — that one is a tolerance for
- *  recognising a refresh interval, and the two are free to move independently. */
+ *  exists to prevent.
+ *
+ *  ⚠️ **`isVsyncBound` has two tolerances, and only ONE of them is this number** (#417). Its
+ *  ENGINE-CAP branch measures the same reading against the same cap that `budgetMs` is derived
+ *  from, so it uses `BUDGET_SLACK` and the two divide at the same point. Its DISPLAY-REFRESH
+ *  branch is a different quantity entirely — see {@link VSYNC_TOLERANCE} — and is free to move
+ *  independently of this one.
+ *
+ *  ⚠️ **That shared threshold makes the two verdicts complements only while the cap is no faster
+ *  than the fastest refresh interval the profiler recognises** (i.e. `targetFps <= 60`, which is
+ *  every project in the repo today). Above that, `isVsyncBound` FALLS THROUGH to the refresh
+ *  branch, and a reading can be both — `targetFps: 120` on a 60 Hz panel measures 16 ms against a
+ *  10 ms budget: over budget AND idle-waiting on the display. Both flags are then true and both
+ *  are CORRECT; that pair is the signal that the panel, not the engine, is the floor. Pinned in
+ *  both directions by `tests/runtime/frameProfiler.test.ts`.
+ *
+ *  Both of those facts used to be asserted, in contradiction, by two comments in this same file:
+ *  this one said the numbers were unrelated, `getFrameProfile`'s said they could not disagree.
+ *  Neither was right, because there were two numbers wearing one literal. */
 export const BUDGET_SLACK = 1.2;
 
 export interface FrameStat {
@@ -182,6 +199,17 @@ const summarize = summarizeStat;
  *  means the renderer is finishing early and waiting — not that it is GPU-bound. */
 const VSYNC_INTERVALS_MS = [1000 / 60, 1000 / 120, 1000 / 90, 1000 / 144];
 
+/** How far above a nominal refresh interval a median may sit and still be RECOGNISED as that
+ *  interval. This is a pattern-matching tolerance — it exists because a real 60 Hz loop measures
+ *  a hair over 16.67 ms, not because 16.67 ms is anyone's budget.
+ *
+ *  ⚠️ Deliberately NOT {@link BUDGET_SLACK}, which happens to hold the same value. That one says
+ *  "how late is still acceptable" and is compared against the ENGINE'S cap; this one says "close
+ *  enough to be that refresh rate" and is compared against the DISPLAY's intervals. Retuning the
+ *  budget must not silently re-classify which displays the profiler can recognise, so the numbers
+ *  are named apart even while they coincide (#417). */
+const VSYNC_TOLERANCE = 1.2;
+
 /** The interval the ENGINE'S OWN frame cap is pacing to, ms; 0 when uncapped.
  *
  *  ⚠️ **THIS FIELD EXISTS BECAUSE ITS ABSENCE DISABLED TIER PROMOTION ON EVERY PROJECT IN THE
@@ -215,8 +243,16 @@ function isVsyncBound(medianFrameMs: number): boolean {
   if (medianFrameMs <= 0) return false;
   // The engine's own cap first: a loop pacing to 33.3 ms because it was TOLD to is finishing
   // early and waiting, which is exactly what this flag means — the same regime as vsync.
-  if (frameCapIntervalMs > 0 && medianFrameMs <= frameCapIntervalMs * 1.2) return true;
-  return VSYNC_INTERVALS_MS.some((iv) => medianFrameMs <= iv * 1.2);
+  //
+  // BUDGET_SLACK, not a literal, and not VSYNC_TOLERANCE: this is the SAME reading against the
+  // SAME cap that `getFrameProfile`'s `budgetMs` is derived from, so the two split the line at
+  // the same point, from the one constant (#417).
+  if (frameCapIntervalMs > 0 && medianFrameMs <= frameCapIntervalMs * BUDGET_SLACK) return true;
+  // FALLS THROUGH when the cap branch says no — deliberately. A cap FASTER than the panel cannot
+  // be met, and the reading is then genuinely both late (vs the cap) and idle-waiting (vs the
+  // panel), so the display question still has to be asked. This is why the two verdicts are
+  // complements only up to a 60 fps cap; see BUDGET_SLACK's banner.
+  return VSYNC_INTERVALS_MS.some((iv) => medianFrameMs <= iv * VSYNC_TOLERANCE);
 }
 
 /** Summarise the current window. Pure — safe to call from a diagnose payload or a debug tab at
@@ -247,8 +283,11 @@ export function getFrameProfile(): FrameProfile {
     // Judged against the cap in force, not a fixed 30 fps. A project that ASKED for 30 is not
     // "over budget" for delivering it — and at `targetFps: 30` the nominal interval is
     // BUDGET_30FPS_MS to the decimal, so a bare `>` made obeying the cap a jitter-decided coin
-    // flip. The 1.2x matches `isVsyncBound`'s tolerance so the two cannot disagree about the
-    // same reading.
+    // flip. This divides at `cap * BUDGET_SLACK`, the same point as `isVsyncBound`'s cap branch
+    // and from the same constant — so up to a 60 fps cap the two verdicts are complements. Above
+    // that they can BOTH be true, and correctly so (see BUDGET_SLACK's banner). This comment used
+    // to claim it matched `isVsyncBound`'s "tolerance", which was two different numbers under one
+    // literal, and then claimed a complement that does not hold at every cap — #417.
     overBudget: frameMs.median > budgetMs,
     budgetMs,
     discontinuities,

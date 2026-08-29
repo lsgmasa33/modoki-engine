@@ -74,7 +74,7 @@ export {
   IapLedger, NoopStoreBackend, LocalVerifier, MockStoreBackend, pickStoreBackend,
   type ConfigureIapOptions, type StoreBackend, type IapLedgerStore, type PurchaseVerifier,
   type ProductKind, type IapProduct, type IapProductInfo, type StoreTransaction,
-  type PurchaseOutcome, type PurchaseResult,
+  type PurchaseOutcome, type PurchaseResult, type IapGrant,
 } from './iap';
 export { registerIapControls } from './actions/iapControls';
 export { hapticsSystem } from './haptics/hapticsSystem';

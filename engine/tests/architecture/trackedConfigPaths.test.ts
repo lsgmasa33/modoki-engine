@@ -22,6 +22,7 @@ import { join } from 'node:path';
 import { mergeProjectConfig } from '../../project-config';
 import { isNonPortableProjectPath } from '../../packages/modoki/src/editor/panels/projectSettingsPaths';
 import { REPO_ROOT, hasAnyProject, hasInternalGames } from '../helpers/repoLayout';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 /** Fields whose value is a path into the PROJECT's own files, so a committed value must be
  *  project-relative. Every `type: 'path'` field in the Project Settings schema that lives OUTSIDE
@@ -47,9 +48,9 @@ const SETTINGS_SCHEMA_SRC = join(REPO_ROOT, 'engine/app/editor/setup.ts');
  *  rather than this silently returning fewer keys than there are fields. Comments are stripped
  *  first — a schema line quoted inside a doc comment is not a declaration. */
 function schemaPathFields(): { keys: string[]; warned: string[]; pathFieldCount: number } {
-  const src = readFileSync(SETTINGS_SCHEMA_SRC, 'utf8')
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+  const raw = readFileSync(SETTINGS_SCHEMA_SRC, 'utf8');
+  const src = stripComments(raw);
+  assertScanIsSane(raw, src, 'engine/app/editor/setup.ts');
   const lines = src.split('\n').filter((l) => /\btype:\s*'path'/.test(l));
   const entries = lines
     .map((l) => ({ key: /\bkey:\s*'([^']+)'/.exec(l)?.[1], warns: /\bcommittedPath:\s*true/.test(l) }))

@@ -19,7 +19,7 @@ import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath, getGuidForPat
 import { wholeImageSpriteRef } from './spritePickerGroups';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
-import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
+import { coerceRigBones, defaultRig2DFile } from '../../runtime/skinning/rig2dTypes';
 import { generateGridMesh } from '../../runtime/skinning/rig2dTessellate';
 import { computeAutoWeights } from '../../runtime/skinning/rig2dAutoWeights';
 import { loadSpriteAlphaMask } from './spriteAlphaMask';
@@ -549,7 +549,7 @@ export default function SkinEditor() {
     const path = await saveAssetDialog({ defaultName: 'New Rig.rig2d.json', ext: '.rig2d.json', prompt: 'Create Rig2D' });
     if (!path) return;
     const guid = newGuid();
-    const doc: Rig2DFile = { id: guid, sprite: '', bones: [{ name: 'root', parent: -1, x: 0, y: 0, rot: 0 }], mesh: { verts: [], uvs: [], tris: [] }, skinIndices: [], skinWeights: [] };
+    const doc: Rig2DFile = { id: guid, ...defaultRig2DFile() };
     const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(doc, null, 2) }) }).then((r) => r.ok).catch(() => false);
     if (!ok) return;
     assetWrittenToDisk(path); // CREATE writes the file directly → it is authoritative over any park

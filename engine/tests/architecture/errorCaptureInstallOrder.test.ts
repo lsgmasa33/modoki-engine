@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 /**
  * The global error capture (#275) must be installed by a SIDE-EFFECT IMPORT placed above
@@ -23,19 +24,17 @@ import { fileURLToPath } from 'node:url';
 const appDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../app');
 const MAIN = path.join(appDir, 'main.tsx');
 
-/** Import specifiers in source order, with comments and strings-in-comments removed. */
-function importSpecifiers(src: string): string[] {
-  const code = src
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n')
-    .map((l) => l.replace(/^\s*\/\/.*$/, ''))
-    .join('\n');
+/** Import specifiers in source order, comments stripped via the shared scanner
+ *  (@modoki/engine/testing, #419). */
+function importSpecifiers(src: string, label: string): string[] {
+  const code = stripComments(src);
+  assertScanIsSane(src, code, label);
   return [...code.matchAll(/^\s*import\s+(?:[^'"]*?from\s*)?['"]([^'"]+)['"]/gm)].map((m) => m[1]);
 }
 
 describe('global error capture install order (#275)', () => {
   const src = fs.readFileSync(MAIN, 'utf8');
-  const specs = importSpecifiers(src);
+  const specs = importSpecifiers(src, 'app/main.tsx');
 
   it('imports ./installErrorCapture before ./App.tsx', () => {
     const capture = specs.findIndex((s) => s.includes('installErrorCapture'));
@@ -51,10 +50,10 @@ describe('global error capture install order (#275)', () => {
   });
 
   it('does NOT install by calling the function from main.tsx\'s body', () => {
-    const body = src
-      .replace(/\/\*[\s\S]*?\*\//g, '')
+    const stripped = stripComments(src);
+    assertScanIsSane(src, stripped, 'app/main.tsx');
+    const body = stripped
       .split('\n')
-      .map((l) => l.replace(/^\s*\/\/.*$/, ''))
       .filter((l) => !/^\s*import\s/.test(l))
       .join('\n');
     expect(
@@ -68,6 +67,6 @@ describe('global error capture install order (#275)', () => {
     const capture = fs.readFileSync(path.join(appDir, 'installErrorCapture.ts'), 'utf8');
     expect(/^\s*installGlobalErrorHandlers\s*\(\s*\)\s*;?\s*$/m.test(capture)).toBe(true);
     // Anything this module imports is itself evaluated uncovered, so the list stays at one.
-    expect(importSpecifiers(capture)).toEqual(['@modoki/engine/runtime']);
+    expect(importSpecifiers(capture, 'app/installErrorCapture.ts')).toEqual(['@modoki/engine/runtime']);
   });
 });

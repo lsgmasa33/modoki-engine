@@ -27,17 +27,15 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { stripComments, assertScanIsSane, assertEveryCodeTokenSurvives } from '@modoki/engine/testing';
 
 const dialogPath = path.resolve(
   __dirname,
   '../../packages/modoki/src/editor/panels/ProjectSettingsDialog.tsx',
 );
 
-/** Strip block + line comments: this file's prose explains the very hazard being guarded,
- *  so an unstripped scan would match its own documentation and pass (or fail) vacuously. */
-function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
-}
+// Comment stripping is the shared scanner (@modoki/engine/testing, #419) — this file's own prose
+// explains the very hazard being guarded, so an unstripped scan would match its own documentation.
 
 /** The body of `function FieldControl(...)` — from its declaration to the declaration that
  *  follows it at column 0. Deliberately textual: the point is to catch a `disabled` written
@@ -55,7 +53,13 @@ function fieldControlBody(code: string): string {
 }
 
 describe('Project Settings disabledIf is total, not enumerated', () => {
-  const code = stripComments(fs.readFileSync(dialogPath, 'utf8'));
+  const raw = fs.readFileSync(dialogPath, 'utf8');
+  const code = stripComments(raw);
+
+  it('the comment scan is sane and did not eat code', () => {
+    assertScanIsSane(raw, code, 'ProjectSettingsDialog.tsx');
+    assertEveryCodeTokenSurvives(raw, code, 'ProjectSettingsDialog.tsx');
+  });
 
   it('disables via a <fieldset>, the one primitive that reaches every field type', () => {
     // Two fieldsets are expected: the per-field wrapper, and the whole-form `inert` one.

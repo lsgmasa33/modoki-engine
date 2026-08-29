@@ -12,7 +12,8 @@
     "./runtime/debug": "./src/runtime/debug/index.ts",
     "./editor": "./src/editor/index.ts",
     "./editor/rendering": "./src/editor/rendering/index.ts",
-    "./three": "./src/three/index.ts"
+    "./three": "./src/three/index.ts",
+    "./testing": "./tests/helpers/sourceScanner.ts"
   },
   "scripts": {
     "test": "vitest run",
@@ -26,6 +27,7 @@
     "zustand": ">=5.0.0"
   },
   "devDependencies": {
+    "typescript": "~6.0.3",
     "vitest": "^4.1.0"
   },
   "dependencies": {

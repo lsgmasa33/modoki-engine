@@ -17,6 +17,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripComments, assertScanIsSane } from '../helpers/sourceScanner';
 
 const SRC = join(fileURLToPath(new URL('.', import.meta.url)), '../../src');
 
@@ -27,12 +28,7 @@ const rigs = vi.hoisted(() => ({ byRef: new Map<string, unknown>() }));
 const ensureSpy = vi.hoisted(() => ({ fn: undefined as undefined | ((ref: string) => void) }));
 const inval = vi.hoisted(() => ({ listener: undefined as undefined | ((p: string, t: Set<string>) => void), assets: new Map<string, { model: string }>() }));
 
-/** Strip block + line comments so a function name mentioned in prose (this
- *  subsystem documents the divergence heavily) doesn't count as a call site —
- *  mirrors determinismGuard.test.ts. */
-function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
-}
+// Comment stripping is the shared scanner (#419) — see sourceScanner.ts.
 
 function countCalls(code: string, fn: string): number {
   return (code.match(new RegExp(`\\b${fn}\\s*\\(`, 'g')) ?? []).length;
@@ -132,8 +128,17 @@ describe('syncSceneRenderables3D — functional', () => {
 // ── 2. Structural anti-drift guard ─────────────────────────────────────────
 
 describe('syncSceneRenderables3D — orchestrators route through the shared helper (F1 anti-drift)', () => {
-  const scene3D = stripComments(readFileSync(join(SRC, 'runtime/rendering/Scene3D.tsx'), 'utf8'));
-  const sceneView = stripComments(readFileSync(join(SRC, 'editor/panels/SceneView.tsx'), 'utf8'));
+  const scene3DRaw = readFileSync(join(SRC, 'runtime/rendering/Scene3D.tsx'), 'utf8');
+  const sceneViewRaw = readFileSync(join(SRC, 'editor/panels/SceneView.tsx'), 'utf8');
+  const scene3D = stripComments(scene3DRaw);
+  const sceneView = stripComments(sceneViewRaw);
+
+  // Length/line parity is true by construction for the scanner (sourceScanner.ts) — this pins
+  // against a regression to a regex stripper. The forward oracle lives in sourceScanner.test.ts.
+  it('the comment strip is length- and line-exact (a regex stripper would not be)', () => {
+    assertScanIsSane(scene3DRaw, scene3D, 'runtime/rendering/Scene3D.tsx');
+    assertScanIsSane(sceneViewRaw, sceneView, 'editor/panels/SceneView.tsx');
+  });
 
   it('Scene3D uses the helper in BOTH renderFrame and the offscreen capture', () => {
     expect(countCalls(scene3D, 'syncSceneRenderables3D')).toBeGreaterThanOrEqual(2);

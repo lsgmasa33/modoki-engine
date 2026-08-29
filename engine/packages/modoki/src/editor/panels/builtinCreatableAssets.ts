@@ -100,12 +100,9 @@ export function registerBuiltinCreatableAssets(): void {
     assetType: 'rig2d',
     prompt: 'Create 2D Rig',
     order: 5,
-    // Seeds a single `root` bone + empty mesh (same minimal shape as the Skin Editor's
-    // own "New Rig").
-    body: (guid) => ({
-      id: guid, sprite: '', bones: [{ name: 'root', parent: -1, x: 0, y: 0, rot: 0 }],
-      mesh: { verts: [], uvs: [], tris: [] }, skinIndices: [], skinWeights: [],
-    }),
+    // Seed comes from the shared `defaultRig2DFile` via `defaultAssetData`, so the MCP
+    // `create-asset` route and this button cannot disagree.
+    body: (guid) => ({ id: guid, ...(defaultAssetData('rig2d') as Record<string, unknown>) }),
     onCreated: ({ path, name }) => useEditorStore.getState().openSkinEditor({ path, type: 'rig2d', name }),
   });
 

@@ -46,6 +46,25 @@ export interface IapProduct {
   readonly grant?: number;
 }
 
+/**
+ * What the game is being asked to apply, handed to `ConfigureIapOptions.onGrant`.
+ *
+ * ⚠️ **`transactionId` is the idempotency key, and the hook MUST use it.** The hook runs once per
+ * settle pass until a `finish()` lands — on the fresh purchase AND on every re-delivery — so a hook
+ * that credits unconditionally mints currency on exactly the crash the subsystem exists to survive.
+ * It is the same key the ledger uses, which is what makes the two agree by construction rather than
+ * by two people remembering the same rule.
+ */
+export interface IapGrant {
+  /** Stable, store-assigned, unique per purchase. THE idempotency key. */
+  readonly transactionId: string;
+  readonly productId: string;
+  /** The catalog entry as the game authored it. */
+  readonly product: IapProduct;
+  /** The authored `grant` quantity for a consumable (300 coins, 1 pass); 0 for everything else. */
+  readonly units: number;
+}
+
 /** Live pricing/label pulled from the store at runtime. Never authored — the store is the only
  *  correct source for a localized, currency-correct price, and Apple rejects hardcoded prices. */
 export interface IapProductInfo {

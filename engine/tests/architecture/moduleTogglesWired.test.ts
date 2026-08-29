@@ -29,6 +29,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { MODULE_KEYS } from '../../plugins/detect-modules';
 import { REPO_ROOT } from '../helpers/repoLayout';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 /** `gpuParticles` → `__MODOKI_MODULE_GPU_PARTICLES__`; `render3d` → `__MODOKI_MODULE_RENDER3D__`
  *  (no camel boundary before a digit, so it does NOT become `RENDER_3D`). */
@@ -36,27 +37,18 @@ function defineName(key: string): string {
   return `__MODOKI_MODULE_${key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toUpperCase()}__`;
 }
 
-/** Strip comments so a MENTION cannot masquerade as a branch.
+/** Comment stripping is the shared scanner (`@modoki/engine/testing`, #419).
  *
- *  This is the guard's own #256, caught in its close-out review: the check was a bare
+ *  Why this guard strips at all — its own #256, caught in close-out review: the check was a bare
  *  `includes`, and `app/sharedRegistry.ts` names `__MODOKI_MODULE_RENDER3D__` in a doc comment
  *  explaining the DCE. That comment counted as a consumer. Both render keys have real branches
- *  too, so nothing was wrong — but the guard would have stayed GREEN if the last real branch
- *  were deleted and the comment left behind, which is exactly the failure it exists to catch.
+ *  too, so nothing was wrong — but the guard would have stayed GREEN if the last real branch were
+ *  deleted and the comment left behind, which is exactly the failure it exists to catch.
  *
- *  `//` preceded by `:` is left alone so a `https://…` inside a string literal does not eat the
- *  rest of its line. Erring here costs a false FAIL (loud, and the fix is obvious), never a
- *  false pass.
- *
- *  What this still does NOT prove: that the surviving mention is a REACHABLE branch. An unused
- *  `const x = __MODOKI_MODULE_FOO__` and a file nobody imports both still count — catching those
- *  needs the import graph and an AST, which `render3dBoundary.test.ts` has and this does not.
- *  The gap is narrow and stated rather than papered over. */
-export function stripComments(src: string): string {
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
-}
+ *  ⚠️ **What this still does NOT prove: that the surviving mention is a REACHABLE branch.** An
+ *  unused `const x = __MODOKI_MODULE_FOO__` and a file nobody imports both still count — catching
+ *  those needs the import graph and an AST, which `render3dBoundary.test.ts` has and this does
+ *  not. The gap is narrow and stated rather than papered over. */
 
 /** The files that DEFINE or DECLARE the defines. A mention here is not a consumer. */
 const DEFINITION_SITES = new Set([
@@ -97,12 +89,13 @@ describe('build.modules toggles are wired in both directions', () => {
     expect(MODULE_KEYS.length).toBeGreaterThan(0);
   });
 
-  it('stripComments removes mentions without eating code or URLs', () => {
-    expect(stripComments('/** __MODOKI_MODULE_X__ */ const a = 1;')).not.toContain('__MODOKI_MODULE_X__');
-    expect(stripComments('// gate on __MODOKI_MODULE_X__\nconst a = 1;')).not.toContain('__MODOKI_MODULE_X__');
-    expect(stripComments('if (__MODOKI_MODULE_X__) go();')).toContain('__MODOKI_MODULE_X__');
-    // A protocol's `//` must not swallow the rest of its line.
-    expect(stripComments("const u = 'https://x.dev'; if (__MODOKI_MODULE_X__) go();")).toContain('__MODOKI_MODULE_X__');
+  // The scanner's own self-test (four inline snippets) now lives in sourceScanner.test.ts (#419).
+
+  it('the comment scan is sane over every collected source file', () => {
+    for (const rel of sources) {
+      const raw = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+      assertScanIsSane(raw, stripComments(raw), rel);
+    }
   });
 
   it.each(MODULE_KEYS)('%s actually has a define emitted for it', (key) => {

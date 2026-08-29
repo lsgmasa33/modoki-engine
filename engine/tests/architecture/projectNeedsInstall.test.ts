@@ -26,8 +26,19 @@ import { projectNeedsInstall } from '../../scripts/projectNeedsInstall.mjs';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 // Project presence is asked in exactly ONE place (#98) — never an inline `existsSync('games')`.
 import { hasAnyProject } from '../helpers/repoLayout';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+/** Comments stripped via the shared scanner (@modoki/engine/testing, #419) — these scripts
+ *  DISCUSS the wrong pattern at length, and matching prose instead of code is how a guard like
+ *  this turns into a false positive. */
+function codeOf(scriptName: string): string {
+  const raw = readFileSync(path.join(repoRoot, 'engine', 'scripts', scriptName), 'utf8');
+  const stripped = stripComments(raw);
+  assertScanIsSane(raw, stripped, scriptName);
+  return stripped;
+}
 
 describe('projectNeedsInstall — the rule', () => {
   it('selects a project that owns sub-packages to LINK', () => {
@@ -64,10 +75,7 @@ describe('the bootstrap scripts never treat a present node_modules as "installed
 
   for (const name of SCRIPTS) {
     it(`${name} re-runs npm install rather than skipping on an existing node_modules`, () => {
-      const src = readFileSync(path.join(repoRoot, 'engine', 'scripts', name), 'utf8');
-      // Strip comments — this file DISCUSSES the wrong pattern at length, and matching prose
-      // instead of code is how a guard like this turns into a false positive.
-      const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+      const code = codeOf(name);
       const offenders = code
         .split('\n')
         .filter((l) => /node_modules/.test(l) && /existsSync/.test(l) && /continue|return/.test(l));
@@ -80,8 +88,7 @@ describe('the bootstrap scripts never treat a present node_modules as "installed
     // second always found node_modules the first had just created and installed nothing — a
     // duplicate that was dead in the normal flow, and a second place for the rule to drift.
     const owners = SCRIPTS.filter((name) => {
-      const src = readFileSync(path.join(repoRoot, 'engine', 'scripts', name), 'utf8');
-      const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+      const code = codeOf(name);
       return /'engine',\s*'tools'/.test(code) || /engine\/tools/.test(code);
     });
     expect(owners).toEqual(['bootstrap-mcp-deps.mjs']);

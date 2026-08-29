@@ -28,6 +28,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 const runtimeDir = path.resolve(__dirname, '../../packages/modoki/src/runtime');
 
@@ -43,12 +44,8 @@ const ALLOWLIST = new Map<string, string>([
   ],
 ]);
 
-/** Strip `//` line comments and `/* *\/` blocks so a comment ABOUT `.json()` is not a violation. */
-function stripComments(src: string): string {
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/(^|[^:])\/\/.*$/gm, '$1');
-}
+// Comment stripping is the shared scanner (#419) — it tracks string state, so a `//` inside a URL
+// string is not mistaken for a comment and needs no `[^:]` hack.
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -65,7 +62,9 @@ describe('asset JSON is parsed through parseAssetJson, not res.json()', () => {
     for (const abs of walk(runtimeDir)) {
       const rel = path.relative(runtimeDir, abs).replace(/\\/g, '/');
       if (ALLOWLIST.has(rel)) continue;
-      const code = stripComments(fs.readFileSync(abs, 'utf8'));
+      const raw = fs.readFileSync(abs, 'utf8');
+      const code = stripComments(raw);
+      assertScanIsSane(raw, code, rel);
       code.split('\n').forEach((line, i) => {
         if (/\.json\s*\(\s*\)/.test(line)) offenders.push(`${rel}:${i + 1}  ${line.trim()}`);
       });

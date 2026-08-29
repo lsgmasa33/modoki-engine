@@ -25,6 +25,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { hasPrivateTooling } from '../helpers/repoLayout';
+import { stripComments as stripJsComments } from '@modoki/engine/testing';
 import {
   CLONE_BACKEND_PORTS,
   HUB_BACKEND_PORT,
@@ -193,12 +194,23 @@ describe.skipIf(skip)('no shared script re-introduces a hardcoded hub-port defau
   //  missed the regression written in the same style as the fix.
   const DEFAULTED_PORT = /(?::-|=|:)\s*["']?(?:http:\/\/(?:127\.0\.0\.1|localhost):)?(517[3-9]|518[0-3]|922[2-6])\b/;
 
+  /**
+   * Dual language: `#` for shell, the shared scanner (`@modoki/engine/testing`, #419) for JS.
+   *
+   * ⚠️ **The JS half used to be a line filter dropping any line starting with `//`, `*` or `/*`,
+   * and that is a silent-DELETION bug of exactly the #419 class** (found sweeping the siblings).
+   * A wrapped multiplication — `const derived = base\n  * factor;` — starts with `*` and was
+   * dropped as if it were a JSDoc continuation, taking real code out of the guard's view; and a
+   * block comment whose continuation lines do NOT start with `*` survived it entirely. The
+   * scanner decides by STATE rather than by how a line happens to begin, which is the only thing
+   * that can tell those two apart.
+   *
+   * The shell half stays a line filter: bash has no block comments, so there is no phantom-region
+   * ambiguity to exploit, and the scanner does not speak `#`.
+   */
   function stripComments(src: string, rel: string): string {
-    const lines = src.split('\n');
-    const isComment = rel.endsWith('.mjs')
-      ? (l: string) => /^\s*(\/\/|\*|\/\*)/.test(l)
-      : (l: string) => /^\s*#/.test(l);
-    return lines.filter((l) => !isComment(l)).join('\n');
+    if (rel.endsWith('.mjs')) return stripJsComments(src);
+    return src.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
   }
 
   for (const rel of SHARED) {

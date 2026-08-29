@@ -25,6 +25,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { stripComments as stripJsComments, assertScanIsSane } from '@modoki/engine/testing';
 
 const scriptsDir = path.resolve(__dirname, '../../scripts');
 
@@ -42,15 +43,24 @@ function scriptFiles(): string[] {
 }
 
 /** Strip comments so the many prose mentions of `pkill` in these files (they explain this
- *  very hazard) are not mistaken for code. */
+ *  very hazard) are not mistaken for code. Dual language: `#` comments for shell, the shared
+ *  scanner (#419) for JS/TS. */
 function stripComments(src: string, isShell: boolean): string {
   if (isShell) {
     return src.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
   }
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n');
+  return stripJsComments(src);
 }
 
 describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
+  it('the comment scan is sane over every JS/TS script file', () => {
+    for (const file of scriptFiles()) {
+      if (file.endsWith('.sh')) continue;
+      const raw = fs.readFileSync(file, 'utf8');
+      assertScanIsSane(raw, stripJsComments(raw), path.relative(scriptsDir, file));
+    }
+  });
+
   it('every `pkill -f` pattern is anchored to an absolute path', () => {
     const offenders: string[] = [];
     for (const file of scriptFiles()) {

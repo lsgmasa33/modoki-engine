@@ -20,6 +20,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripComments, assertScanIsSane } from '../helpers/sourceScanner';
 
 const RUNTIME = join(fileURLToPath(new URL('.', import.meta.url)), '../../src/runtime');
 
@@ -41,15 +42,20 @@ function tsFiles(dir: string): string[] {
   return out;
 }
 
-/** Strip block + line comments so a mention in prose (e.g. this very file's own doc comment
- *  talking about `getKTX2Loader()`) can't trip the guard — only real call sites count. */
-function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
-}
+// Comment stripping is the shared scanner (#419) — see sourceScanner.ts.
 
-const FILES = tsFiles(RUNTIME).map((f) => ({ rel: relative(RUNTIME, f).replace(/\\/g, '/'), code: stripComments(readFileSync(f, 'utf8')) }));
+const FILES = tsFiles(RUNTIME).map((f) => {
+  const raw = readFileSync(f, 'utf8');
+  return { rel: relative(RUNTIME, f).replace(/\\/g, '/'), raw, code: stripComments(raw) };
+});
 
 describe('KTX2-caps guard', () => {
+  // Length/line parity is true by construction for the scanner (sourceScanner.ts) — this pins
+  // against a regression to a regex stripper. The forward oracle lives in sourceScanner.test.ts.
+  it('the comment strip is length- and line-exact (a regex stripper would not be)', () => {
+    for (const f of FILES) assertScanIsSane(f.raw, f.code, f.rel);
+  });
+
   it('every file that touches the shared KTX2 loader also gates on ensureKtx2Caps', () => {
     const offenders = FILES
       .filter((f) => /\bgetKTX2Loader\s*\(/.test(f.code))

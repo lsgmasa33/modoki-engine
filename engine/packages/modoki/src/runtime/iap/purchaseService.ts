@@ -38,7 +38,7 @@ import { peekCurrentWorld } from '../core/ecs/worldRegistry';
 import { NoopStoreBackend, type StoreBackend } from './storeBackend';
 import { IapLedger, type IapLedgerStore } from './ledger';
 import { LocalVerifier, type PurchaseVerifier } from './verifier';
-import type { IapProduct, IapProductInfo, PurchaseResult, StoreTransaction } from './types';
+import type { IapGrant, IapProduct, IapProductInfo, PurchaseResult, StoreTransaction } from './types';
 
 /** Journal without requiring a world. `reconcile()` runs at boot, potentially before any scene has
  *  loaded, and a missing world must not turn recovery into a crash. */
@@ -64,6 +64,8 @@ interface IapConfig {
   verifier: PurchaseVerifier;
   /** productId → catalog entry. Authored data, supplied by the game (see `types.ts`). */
   catalog: Map<string, IapProduct>;
+  /** The game's own durable write, run BEFORE the finish. See `ConfigureIapOptions.onGrant`. */
+  onGrant: ((grant: IapGrant) => Promise<boolean> | boolean) | null;
 }
 
 let cfg: IapConfig | null = null;
@@ -100,6 +102,35 @@ export interface ConfigureIapOptions {
   products: readonly IapProduct[];
   /** Defaults to `LocalVerifier` (the platform already verified — see `verifier.ts`). */
   verifier?: PurchaseVerifier;
+  /**
+   * The game's own durable write, run **after** the ledger grant is durable and **before** the
+   * finish. Return true once the game's state is safely stored; false (or throw) to withhold the
+   * finish.
+   *
+   * ── Why this exists ────────────────────────────────────────────────────────
+   * Invariant 1 says "grant durably, THEN finish", and without this hook it only holds for the
+   * ENGINE's ledger. A game whose truth lives elsewhere — a coin wallet, an entitlement flag —
+   * would necessarily write it *after* `finish()` had already told the store to stop re-delivering,
+   * so a crash in that window loses the purchase with no recovery. That is invariant 1's own
+   * failure mode, reintroduced one layer out by wiring rather than by logic.
+   *
+   * `games/iap-test` never needed it because the fixture holds no game-side state at all: it reads
+   * `iapBalanceOf()` straight off the ledger, so for it the ledger genuinely IS the truth. Court is
+   * the first caller for which it is not (#371).
+   *
+   * ⚠️ **It MUST be idempotent, keyed by `IapGrant.transactionId`.** It runs once per settle pass
+   * until a finish lands — on the fresh purchase AND on every re-delivery — because it also runs on
+   * the already-granted path. That is deliberate: were it skipped there, a crash between the ledger
+   * write and the game's write would be unrecoverable, since the re-delivery would find the ledger
+   * already processed and go straight to the finish, applying nothing, forever.
+   *
+   * ⚠️ **Returning false is the SAFE outcome, not an error path.** The transaction stays unfinished,
+   * the store re-delivers next launch, and nothing is lost — the same trade `confirmDurable` already
+   * makes. A hook that cannot confirm its write must say so rather than let the finish proceed.
+   *
+   * Omitted by default, so every existing caller is unchanged.
+   */
+  onGrant?: (grant: IapGrant) => Promise<boolean> | boolean;
 }
 
 /** Wire the subsystem up. Called once per game load by L3 composition. */
@@ -109,6 +140,7 @@ export function configureIap(opts: ConfigureIapOptions): void {
     ledger: new IapLedger(opts.store),
     verifier: opts.verifier ?? new LocalVerifier(),
     catalog: new Map(opts.products.map((p) => [p.id, p])),
+    onGrant: opts.onGrant ?? null,
   };
   entitled = new Set();
 }
@@ -329,9 +361,59 @@ async function settleInner(
     journal('iap.duplicate', { productId: tx.productId, transactionId: tx.transactionId, source });
   }
 
+  // ── The game's own durable write, BEFORE the consume (#371) ────────────────────────────────
+  //
+  // Invariant 1 for the GAME's state rather than the ledger's. Owner, 2026-08-29: *"the flow should
+  // be purchase start, callback, increment the balance / change flag, save them, then consume the
+  // purchase. the consume must be called last."*
+  //
+  // ⚠️ **Deliberately OUTSIDE the `if (!alreadyGranted)` block above.** On the already-granted path
+  // the ledger has recorded this transaction but the game may not have — that is exactly the crash
+  // this re-delivery exists to repair. Skipping the hook there would let the finish land with the
+  // game's state never written, unrecoverably, since the store never re-delivers a finished
+  // transaction. The cost is that the hook sees repeats, which is why its contract demands
+  // idempotency by transaction id.
+
+  // Last point before the hook writes persistent storage — see `stillActive`. Without this, the
+  // `alreadyGranted` path has NO check between the catalog lookup and the hook, so a config swap
+  // (resetIap()+PlayerPrefs.init(), e.g. File → Open Project) landing mid-`await` lets the hook
+  // write into ANOTHER game's PlayerPrefs namespace — not merely a wasted call.
+  if (!stillActive(c)) return tornDown(tx, source);
+
+  if (c.onGrant) {
+    let applied: boolean;
+    try {
+      applied = await c.onGrant({
+        transactionId: tx.transactionId,
+        productId: tx.productId,
+        // `product` is the outer binding — non-null by construction, since the unknown-product
+        // branch returned long before here. Reused rather than re-fetched so the hook and the
+        // ledger cannot disagree about which catalog entry this transaction is.
+        product,
+        units: product.kind === 'consumable' ? (product.grant ?? 1) : 0,
+      });
+    } catch (e) {
+      // A throwing hook is treated exactly as a refusal, never as a reason to finish anyway. The
+      // game failing to store its half is the one case where finishing destroys the purchase.
+      journal('iap.grant-hook-threw', { productId: tx.productId, transactionId: tx.transactionId, error: String(e) }, 'error');
+      applied = false;
+    }
+    if (!applied) {
+      journal('iap.grant-hook-refused', { productId: tx.productId, transactionId: tx.transactionId, source }, 'error');
+      return {
+        outcome: 'failed', productId: tx.productId, transactionId: tx.transactionId,
+        error: 'the game did not confirm its grant; the transaction stays unfinished and recovers next launch',
+      };
+    }
+  }
+
   // The destructive step, and the other side of `stillActive`: finishing against a torn-down
   // session would tell the store to stop re-delivering a purchase whose grant may have gone into
   // the wrong namespace. Leave it open instead.
+  //
+  // ⚠️ Checked AFTER the hook, not only before it: `onGrant` awaits the game's own flush, which is
+  // another window a game swap can land in. The hook's write went to the OLD game's namespace and
+  // finishing here would tell the store to forget a purchase the incoming game will never see.
   if (!stillActive(c)) return tornDown(tx, source);
 
   try {

@@ -16,6 +16,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripComments, assertScanIsSane } from '../helpers/sourceScanner';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const REPO_ROOT = join(HERE, '../../../../..');
@@ -46,8 +47,15 @@ const ALLOW = new Set<string>([
   'engine/packages/modoki/src/runtime/debug/DebugMenu.tsx',
 ]);
 
-function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+// Comment stripping is the shared scanner (#419) — see sourceScanner.ts.
+
+/** Read + strip a set of absolute file paths once, keeping raw alongside stripped so the
+ *  sanity check and the guards can both use it without re-reading/re-scanning. */
+function scanAll(files: string[]): { abs: string; rel: string; raw: string; code: string }[] {
+  return files.map((f) => {
+    const raw = readFileSync(f, 'utf8');
+    return { abs: f, rel: relative(REPO_ROOT, f).replace(/\\/g, '/'), raw, code: stripComments(raw) };
+  });
 }
 
 /** All .ts/.tsx (non-test) files under `dir`, skipping any path segment `skip`. */
@@ -83,10 +91,19 @@ function gameFiles(): string[] {
 }
 
 describe('input source guard (Part A6)', () => {
+  const engine = scanAll(engineFiles());
+  const games = scanAll(gameFiles());
+
+  // Length/line parity is true by construction for the scanner (sourceScanner.ts) — this pins
+  // against a regression to a regex stripper. The forward oracle lives in sourceScanner.test.ts.
+  it('the comment strip is length- and line-exact (a regex stripper would not be)', () => {
+    for (const f of [...engine, ...games]) assertScanIsSane(f.raw, f.code, f.rel);
+  });
+
   it('no raw DOM/gamepad input reads outside runtime/input/ sources', () => {
-    const offenders = [...engineFiles(), ...gameFiles()]
-      .filter((f) => FORBIDDEN.test(stripComments(readFileSync(f, 'utf8'))))
-      .map((f) => relative(REPO_ROOT, f).replace(/\\/g, '/'))
+    const offenders = [...engine, ...games]
+      .filter((f) => FORBIDDEN.test(f.code))
+      .map((f) => f.rel)
       .filter((rel) => !ALLOW.has(rel));
     expect(
       offenders,
@@ -95,9 +112,9 @@ describe('input source guard (Part A6)', () => {
   });
 
   it('no raw pointer/mouse/touch listeners in game runtimes (use the Input pointer source)', () => {
-    const offenders = gameFiles()
-      .filter((f) => FORBIDDEN_POINTER.test(stripComments(readFileSync(f, 'utf8'))))
-      .map((f) => relative(REPO_ROOT, f).replace(/\\/g, '/'))
+    const offenders = games
+      .filter((f) => FORBIDDEN_POINTER.test(f.code))
+      .map((f) => f.rel)
       .filter((rel) => !ALLOW.has(rel));
     expect(
       offenders,

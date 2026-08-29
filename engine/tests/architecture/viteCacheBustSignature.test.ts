@@ -26,11 +26,13 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 const mainTs = path.resolve(__dirname, '../../electron/main.ts');
 
-/** The statements that compute `buildSig`, comments stripped — this file's own prose explains
- *  the mtime hazard at length and must not read as a violation of it. */
+/** The statements that compute `buildSig`, comments stripped via the shared scanner
+ *  (`@modoki/engine/testing`, #419) — this file's own prose explains the mtime hazard at length
+ *  and must not read as a violation of it. */
 function signatureBlock(): string {
   const src = fs.readFileSync(mainTs, 'utf8');
   const start = src.indexOf('const sigFile = path.join');
@@ -39,12 +41,10 @@ function signatureBlock(): string {
   // Walk back to the start of the enclosing try, forward to the sig write.
   const from = src.lastIndexOf('try {', start);
   const to = src.indexOf('process.env.MODOKI_VITE_CACHEDIR', start);
-  return src
-    .slice(from, to)
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n')
-    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
-    .join('\n');
+  const raw = src.slice(from, to);
+  const stripped = stripComments(raw);
+  assertScanIsSane(raw, stripped, 'engine/electron/main.ts (vite-cache bust block)');
+  return stripped;
 }
 
 describe('packaged Vite dep-cache bust signature (#21)', () => {

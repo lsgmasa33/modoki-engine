@@ -23,6 +23,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 const EDITOR = path.resolve(__dirname, '../../packages/modoki/src/editor');
 
@@ -81,9 +82,10 @@ function actionLiteral(src: string, open: number): string {
   return brace >= 0 && brace < open ? braceBlock(src, brace) : args;
 }
 
-/** Strip comments, so a literal cannot be "flagged" by a line of prose about the flag. */
+/** Strip comments (shared scanner, @modoki/engine/testing, #419), so a literal cannot be
+ *  "flagged" by a line of prose about the flag. */
 function code(text: string): string {
-  return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  return stripComments(text);
 }
 
 /** Every asset-doc undo entry that does not carry the flag, set to TRUE. */
@@ -120,6 +122,15 @@ describe('asset-document undo entries do not dirty the scene', () => {
       'applyAnimationClip', 'applyParticleDef', 'applyTimelineDoc', 'applySkinDef',
       'applySpriteAnimDef', 'persistAssetEdit',
     ]));
+  });
+
+  it('the comment scan is sane over every editor source file this guard reads', () => {
+    const files = editorSources(EDITOR);
+    expect(files.length, 'no editor sources found — the guard below would scan nothing').toBeGreaterThan(0);
+    for (const file of files) {
+      const raw = fs.readFileSync(file, 'utf8');
+      assertScanIsSane(raw, stripComments(raw), path.relative(EDITOR, file));
+    }
   });
 
   it('every asset-doc undo entry in editor/** carries _isFileDirect', () => {

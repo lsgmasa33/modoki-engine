@@ -24,6 +24,7 @@ import {
   balanceOf, isEntitled, spend, productInfo,
   type StoreBackend, type StoreTransaction, type IapLedgerStore, type IapProduct, type IapProductInfo,
 } from '../../src/runtime/iap';
+import type { ConfigureIapOptions } from '../../src/runtime/iap/purchaseService';
 
 const COINS: IapProduct = { id: 'coins.100', kind: 'consumable', grant: 100 };
 const CATALOG = [COINS];
@@ -295,6 +296,54 @@ describe('teardown', () => {
     expect(r.outcome).toBe('failed');
     expect(s.finished).toEqual([]);
     expect(d.doc).toBeUndefined();                 // nothing reached the other game's storage
+  });
+
+  it('the ALREADY-GRANTED path never invokes onGrant once the session has torn down (finding 3)', async () => {
+    // Court-store-plan §8 finding 3: unlike the fresh-purchase path (which has a `stillActive`
+    // check right before it touches storage), the `alreadyGranted` path used to have NO check
+    // between the catalog lookup and `c.onGrant` — so a game swap landing while `acknowledge()` is
+    // still in flight let the hook write into the NEXT game's PlayerPrefs namespace. Silent: no
+    // exception, no failed assertion anywhere else, just a write into the wrong save file.
+    resetIap();
+    const s = new FlakyStore();
+    const d = new MemStore();
+    const hookCalls: string[] = [];
+    const hook: ConfigureIapOptions['onGrant'] = (g) => { hookCalls.push(g.transactionId); return true; };
+
+    // Session 1: grant the transaction but never finish it (`finish()` throws), so the ledger
+    // records it as processed while the store keeps re-delivering it — the crash matrix's row 3
+    // window, needed here to reach `alreadyGranted` on the next session.
+    s.finishThrows = true;
+    configureIap({ backend: s, store: d, products: CATALOG, onGrant: hook });
+    await purchase(COINS.id);
+    expect(hookCalls).toEqual(['tx-1']);
+    expect(s.finished).toEqual([]);
+
+    // Session 2: the store re-delivers the same unfinished transaction via `reconcile()`, which
+    // takes the ALREADY-GRANTED branch this finding is about. Pause the in-flight `acknowledge()`
+    // (the await finding 3 names) and swap the game out from under it mid-settle — the same seam
+    // the sibling "settle that outlives its session" test above uses for the fresh-purchase path.
+    hookCalls.length = 0;
+    s.finishThrows = false;
+    s.outstanding = [{ transactionId: 'tx-1', productId: COINS.id }];
+    let ackEntered = false;
+    let release!: () => void;
+    s.acknowledge = () => new Promise<void>((res) => { ackEntered = true; release = res; });
+    configureIap({ backend: s, store: d, products: CATALOG, onGrant: hook });
+
+    const pending = reconcile();
+    // `reconcile()` awaits `refreshEntitlements()` and `unfinished()` before it ever reaches
+    // `acknowledge()` — unlike the sibling test above, the pause is not the FIRST await, so spin
+    // microtasks until execution has actually entered it before tearing the session down.
+    while (!ackEntered) await Promise.resolve();
+    resetIap();                 // the game swaps out mid-settle, before the hook ever runs
+    release();
+
+    const [r] = await pending;
+
+    expect(hookCalls).toEqual([]);   // the hook must NEVER see a delivery from a torn-down session
+    expect(s.finished).toEqual([]);  // and the transaction must not be finished either
+    expect(r.outcome).toBe('failed');
   });
 });
 

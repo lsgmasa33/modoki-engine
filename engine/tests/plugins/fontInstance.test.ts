@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { instanceFont, readFontAxes, hasAxes } from '../../plugins/font-instance';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 const FONTS = path.resolve(__dirname, '../../packages/modoki/src/runtime/assets/fonts');
 const GEOLOGICA = path.join(FONTS, 'Geologica/Geologica-VariableFont_CRSV,SHRP,slnt,wght.ttf');
@@ -146,9 +147,11 @@ describe('wasm resolution survives CJS as well as ESM', () => {
     path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../plugins/font-instance.ts'),
     'utf8',
   );
-  /** Comments stripped: the module DOCUMENTS the bad call as the trap to avoid, so a
-   *  naive scan over the whole file matches its own warning and fails green code. */
-  const CODE = SRC.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  /** Comments stripped via the shared scanner (@modoki/engine/testing, #419): the module
+   *  DOCUMENTS the bad call as the trap to avoid, so a naive scan over the whole file matches
+   *  its own warning and fails green code. */
+  const CODE = stripComments(SRC);
+  assertScanIsSane(SRC, CODE, 'plugins/font-instance.ts');
 
   it('never passes import.meta.url straight to createRequire', () => {
     expect(CODE).not.toMatch(/createRequire\(\s*import\.meta\.url\s*\)/);

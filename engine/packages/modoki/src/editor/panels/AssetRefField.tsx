@@ -11,24 +11,28 @@ import { fontPathFromFamily, loadFont } from '../../runtime/loaders/fontLoader';
 import { isGuid, isExternalUrl, resolveGuidToPath, getGuidForPath, getAllAssets, getAssetEntry } from '../../runtime/loaders/assetManifest';
 import { BufferedTextInput, Tooltip, inputStyle, MIXED_PLACEHOLDER } from './fields';
 import { acceptMatchesAsset } from '../utils/dragGhost';
-import { classifyJsonAssetSuffix } from '../../runtime/loaders/assetTypeClassifier';
+import { classifyJsonAssetSuffix, classifyBinaryExt } from '../../runtime/loaders/assetTypeClassifier';
 import { SpritePicker } from './SpritePicker';
 import { wholeImageSpriteRef } from './spritePickerGroups';
 import { FontPicker } from './FontPicker';
 
-/** Infer asset type from file extension. The JSON asset kinds come from the shared
- *  classifier (assetTypeClassifier) — the same single source of truth the asset
- *  scanner + tree-shaker use — so this can't drift (it previously lacked
- *  `.animset.json`/`.shader.json` and mislabeled them 'unknown'). */
+/** Infer asset type from a file path, using the shared classifier (assetTypeClassifier) for
+ *  BOTH halves — the same single source of truth the asset scanner + tree-shaker use.
+ *
+ *  ⚠️ The binary half used to be a hand-written regex ladder while only the JSON half was
+ *  shared, and the docstring claimed the whole function couldn't drift. It had drifted: `.fbx`,
+ *  `.exr` and every video container read as 'unknown' here while the build classified them
+ *  correctly, so "Locate in Assets" and Find References mislabelled them (#417). Pinned by
+ *  tests/editor/assetTypeFromPath.test.ts, which iterates both shared tables.
+ *
+ *  Returns 'unknown' for a file the asset pipeline does not manage — including the
+ *  scanner-only import sources `.obj`/`.dae`, which are deliberately absent from
+ *  BINARY_EXT_TYPE (scenes reference the converted GLB, never the source). */
 export function assetTypeFromPath(path: string): string {
   const jsonType = classifyJsonAssetSuffix(path);
   if (jsonType) return jsonType;
-  if (path.endsWith('.scene.json')) return 'scene';
-  if (path.endsWith('.hdr')) return 'environment';
-  if (/\.(png|jpe?g|webp)$/i.test(path)) return 'texture';
-  if (/\.(glb|gltf)$/i.test(path)) return 'model';
-  if (/\.(mp3|m4a|aac|wav|ogg|flac)$/i.test(path)) return 'audio';
-  if (/\.(ttf|otf|woff2?)$/i.test(path)) return 'font';
+  const binaryType = classifyBinaryExt(path);
+  if (binaryType) return binaryType;
   return 'unknown';
 }
 

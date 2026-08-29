@@ -93,12 +93,40 @@ export const auth = {
   classifyAuthError(_e: unknown) { return 'not-configured' as const; },
   toCourtUser(_raw: unknown) { return null; },
   __resetAuthForTest(): void {},
+  // A playable ad has no signed-in user to mint a Google-signed ID token from, so `null` (the real
+  // function's own "no trusted time available" answer) is exactly right — the same reasoning
+  // `serverTime.getDateHeaderTimeMs` below already documents. `refreshTrustedClock` calls this
+  // unconditionally at boot (`courtIapBootSystem`), playable included — this was missing once and
+  // the caller's own try/catch swallowed the resulting `TypeError`, but silently: it aborted before
+  // ever trying `serverTime`'s fallback, so a playable never anchored at all (#371 close-out).
+  async getServerTimeMs() { return null; },
 };
 
 const PLAYABLE_NO_AUTH = {
   ok: false as const,
   reason: 'not-configured' as const,
   message: 'A playable creative has no Firebase app — sign-in is unavailable by design.',
+};
+
+/**
+ * Trusted-time fallback — a no-op namespace, mirroring `export * as serverTime from
+ * './serverTime'` (Court's unauthenticated `Date`-header source, added alongside `auth
+ * .getServerTimeMs` for a player who has never signed in).
+ *
+ * ⚠️ **A playable DOES call this, every boot.** An earlier version of this comment said the
+ * opposite ("no store, no `courtOnGrant`, nothing that would ever call this") — false, and the
+ * exact vouching-for-a-property-the-code-lacks class #371's close-out kept finding.
+ * `courtIapBootSystem` fires `refreshTrustedClock('boot')` unconditionally, playable included, and
+ * it reaches this the moment `auth.getServerTimeMs()` returns `null` — which in a playable it
+ * always does. What IS true is that nothing downstream cares: a playable has no purchase flow, so
+ * no pass expiry is ever computed from the anchor this would have set.
+ *
+ * `null` (the real function's own "could not get a trusted time" answer) is therefore exactly right
+ * rather than a special case: every caller already treats `null` as "fall through to the next
+ * source", which for a playable ends at the ordinary `Date.now()` fallback.
+ */
+export const serverTime = {
+  async getDateHeaderTimeMs(): Promise<number | null> { return null; },
 };
 
 /**

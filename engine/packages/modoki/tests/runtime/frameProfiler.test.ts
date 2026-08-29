@@ -10,9 +10,11 @@
  *  at all — the plan exists because a previous fix was shipped against the wrong bottleneck. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import {
   recordFrame, getFrameProfile, resetFrameProfile, setProfilerFrameCap, getWorstStallWindow,
-  BUDGET_30FPS_MS, PROFILE_WINDOW_FRAMES,
+  BUDGET_30FPS_MS, PROFILE_WINDOW_FRAMES, BUDGET_SLACK,
 } from '../../src/runtime/core/frameProfiler';
 
 /** Feed frames of exactly `frameMs` apart, each costing `cpuMs` of main-thread work. */
@@ -227,6 +229,110 @@ describe('frameProfiler — setProfilerFrameCap (#202 close-out: the cap must be
     feed(Array.from({ length: 20 }, () => ({ frameMs: 1000 / 30, cpuMs: 5 })));
     const p = getFrameProfile();
     expect(p.vsyncBound).toBe(false);
+  });
+});
+
+describe('frameProfiler — the two tolerances are separate numbers (#417)', () => {
+  // ⚠️ `isVsyncBound` carried two bare `1.2` literals doing DIFFERENT jobs, and two comments in
+  // frameProfiler.ts contradicted each other about whether either matched BUDGET_SLACK. The cap
+  // branch genuinely IS the same reading against the same cap as `budgetMs`; the display-refresh
+  // branch is a pattern-matching tolerance and is unrelated. These guards pin that split.
+  //
+  // Every threshold below is DERIVED from BUDGET_SLACK, never a hardcoded 1.2 — a test that
+  // re-states the constant cannot notice the constant moving, which is the whole failure class.
+  afterEach(() => setProfilerFrameCap(0)); // module state — must not leak into other test files
+
+  const CAP_FPS = 30;
+  const CAP_MS = 1000 / CAP_FPS;
+
+  it('at a cap no faster than the panel, vsyncBound and overBudget are exact complements', () => {
+    // The property that breaks the moment the two thresholds stop sharing BUDGET_SLACK: such a
+    // median is one verdict or the other, never both and never neither. Swept across the
+    // boundary rather than probed at one point.
+    //
+    // ⚠️ Scoped to CAP_FPS = 30 on purpose — the complement does NOT hold at every cap, and the
+    // next test pins the case where it fails. An earlier version of this comment claimed it held
+    // universally, which was the #417 defect class reappearing inside its own fix.
+    for (const mult of [0.25, 0.5, 0.9, 0.99, BUDGET_SLACK, BUDGET_SLACK * 1.01, BUDGET_SLACK * 2]) {
+      resetFrameProfile();
+      setProfilerFrameCap(CAP_FPS);
+      feed(Array.from({ length: 20 }, () => ({ frameMs: CAP_MS * mult, cpuMs: 1 })));
+      const p = getFrameProfile();
+      expect(p.vsyncBound !== p.overBudget, `median = cap * ${mult} produced `
+        + `vsyncBound: ${p.vsyncBound}, overBudget: ${p.overBudget} — under a cap these must be `
+        + 'complements. isVsyncBound\'s cap branch and budgetMs must both divide at '
+        + 'cap * BUDGET_SLACK, from the one constant.').toBe(true);
+    }
+  });
+
+  it('the capped verdict flips exactly at cap * BUDGET_SLACK, in both directions', () => {
+    // Distinguishing the shared threshold from a coincidence: just under is the idle-waiting
+    // regime, just over is late. Multipliers sit off the boundary so an ULP cannot decide it.
+    for (const [mult, vsyncBound] of [[BUDGET_SLACK * 0.99, true], [BUDGET_SLACK * 1.01, false]] as const) {
+      resetFrameProfile();
+      setProfilerFrameCap(CAP_FPS);
+      feed(Array.from({ length: 20 }, () => ({ frameMs: CAP_MS * mult, cpuMs: 1 })));
+      const p = getFrameProfile();
+      expect(p.vsyncBound, `at cap * ${mult}`).toBe(vsyncBound);
+      expect(p.overBudget, `at cap * ${mult}`).toBe(!vsyncBound);
+      expect(p.budgetMs).toBeCloseTo(CAP_MS * BUDGET_SLACK, 6);
+    }
+  });
+
+  it('a cap FASTER than the panel reports both flags — the complement stops there', () => {
+    // The exception the test above is scoped around, pinned rather than merely documented.
+    // `targetFps: 120` on a 60Hz panel cannot be met: 16ms measured against a 10ms budget is
+    // over budget, and `isVsyncBound` falls through to the refresh branch and recognises the
+    // panel. Both flags true, and both correct — that pair is how a reader tells "the display is
+    // the floor" from "the engine is too slow". Nothing in the repo authors targetFps > 60 today
+    // (`rendering.targetFps` is authored project data and nothing clamps it), so this is latent;
+    // it is pinned so the next person to raise a cap finds the behaviour described, not guessed.
+    resetFrameProfile();
+    setProfilerFrameCap(120);
+    feed(Array.from({ length: 20 }, () => ({ frameMs: 16, cpuMs: 1 })));
+    const p = getFrameProfile();
+    expect(p.budgetMs).toBeCloseTo((1000 / 120) * BUDGET_SLACK, 6);
+    expect(p.overBudget, '16ms against a 10ms budget').toBe(true);
+    expect(p.vsyncBound, '16ms is within tolerance of the 60Hz interval').toBe(true);
+  });
+
+  it('UNCAPPED, the refresh-interval tolerance sits in the 1.2 band, applied to display intervals', () => {
+    // ⚠️ This CANNOT distinguish VSYNC_TOLERANCE from BUDGET_SLACK — both hold 1.2, so swapping
+    // one for the other in `isVsyncBound` leaves every assertion here green (verified: that
+    // mutation passes 26/26). No runtime assertion can separate two constants of equal value;
+    // the separation is a SOURCE fact, and the guard for it is the next test. What this one
+    // pins is the VALUE and the branch: a median 15% above the 60Hz interval must still be
+    // RECOGNISED as 60Hz, one 25% above must not, and the cap must be out of the way for the
+    // refresh branch to be the thing answering.
+    const HZ60_MS = 1000 / 60;
+    for (const [mult, expected] of [[1.15, true], [1.25, false]] as const) {
+      resetFrameProfile();
+      setProfilerFrameCap(0); // uncapped — only the display-refresh branch can answer
+      feed(Array.from({ length: 20 }, () => ({ frameMs: HZ60_MS * mult, cpuMs: 1 })));
+      expect(getFrameProfile().vsyncBound, `60Hz interval * ${mult}, uncapped`).toBe(expected);
+    }
+  });
+
+  // The guard that DOES distinguish them, and the only shape that can while both hold 1.2: a
+  // source assertion that each branch names its own constant. Behaviour cannot see the
+  // difference; the whole point of #417 was that two numbers were wearing one literal, and a
+  // test blind to which constant is used would re-admit exactly that.
+  //
+  // Negative-only where a comment could forge a pass: the bare-literal ban is a `not.toMatch`,
+  // so a `1.2` reappearing inside a comment fails loudly, which is the safe direction.
+  it('each branch of isVsyncBound names its own constant — no bare literal returns', () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, '../../src/runtime/core/frameProfiler.ts'),
+      'utf8',
+    );
+    const fn = src.slice(src.indexOf('function isVsyncBound'));
+    const body = fn.slice(0, fn.indexOf('\n}'));
+    expect(body, 'the engine-cap branch must divide at the same constant as budgetMs')
+      .toMatch(/frameCapIntervalMs \* BUDGET_SLACK/);
+    expect(body, 'the display-refresh branch must use its own tolerance, not the budget slack')
+      .toMatch(/iv \* VSYNC_TOLERANCE/);
+    expect(body, 'a bare numeric multiplier is back in isVsyncBound — that is #417 exactly')
+      .not.toMatch(/\*\s*\d+\.\d+/);
   });
 });
 

@@ -312,3 +312,61 @@ Tests live under `engine/tests/` and `engine/packages/modoki/tests/`, split by s
 them rather than trusting a listing here. Run a subset by path:
 `npx vitest run --config engine/vite.config.ts <path>` (the `--config` is required — without it a
 game's tests fail with `__MODOKI_MODULE_RENDER2D__ is not defined`).
+
+### Source-scanning guards, and the ONE comment scanner they share
+
+A large family of guards works by reading source off disk and asserting that a forbidden pattern
+does not appear — `determinismGuard` (no raw `performance.now()` in `runtime/**`), `reapScoping`
+(no unscoped `pkill`), `posixPathGuard`, `assetJsonGuard`, `inputSourceGuard`, `ktx2CapsGuard`,
+Court's `sharedPredicates` and `palette`, and others. Every one of them must strip comments first,
+because these files' own prose explains the very hazard being guarded and an unstripped scan
+matches its own documentation.
+
+⚠️ **Never write a comment stripper. Import `@modoki/engine/testing`.** Enforced by
+`engine/tests/architecture/commentStripperIsShared.test.ts`, which fails on a hand-rolled stripper
+in any test file — a rule this repo states but does not enforce is how twelve copies accumulated,
+and how the first sweep for #419 still missed sixteen more.
+(`engine/packages/modoki/tests/helpers/sourceScanner.ts`.) Inside that package use the relative
+path; from `engine/tests/**` and from a game's tests use the package subpath — a game may not
+reach outside its own folder by relative path (`assets/gamePortability.test.ts`).
+
+```ts
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+const stripped = stripComments(raw);          // or { strings: 'blank' } / { regexLiterals: false }
+assertScanIsSane(raw, stripped, 'file.ts');   // BEFORE any count is trusted
+```
+
+**Why this is a correctness rule and not a tidiness one (#419).** Twenty-eight guards each carried
+a private stripper, and every one was built the same broken way: strip block comments with a lazy
+regex, then line comments. A `/*` sequence inside a **line** comment opens a phantom block that
+runs to the next real terminator, and everything between is **deleted**. Measured: a line comment
+in `runtime/rendering/Scene3D.tsx` writes the glob `runtime/**`, which hid 82 lines — 22 of them
+`import` statements — from `determinismGuard`. Mutation-proved both directions: a
+`performance.now()` planted inside that window left the guard green; the same line outside it
+failed.
+
+⚠️ **Every failure mode of a comment stripper LOWERS what the scan can see, and these are
+forbidden-pattern guards — so a lower count is a PASS.** They fail silent and green, which is the
+only direction that matters. Hence the two rules: one scanner (the multiplicity is what let one
+copy be fixed twice, in #411 and #418, while eleven copies of the original bug carried on), and
+`assertScanIsSane` at every call site, because a guard whose own instrument can delete the code it
+inspects is not a guard.
+
+⚠️ **`strings: 'blank'` is a different function, and it is PARSER-driven for a reason.**
+`stripCommentsAndStrings` blanks string and template literal content as well, for a guard hunting a
+value that can hide in prose either way (Court's bare-hex sweep). It uses TypeScript's own tokens
+rather than the character scanner because a scanner cannot tell a quote or backtick in **JSX text**
+from a string delimiter: one stray backtick in JSX prose blanked six following lines of real code,
+including a `0xff0000` constant, and the hex guard reported nothing. It therefore requires source
+TypeScript can parse and throws otherwise — reach for `stripComments` on anything else (shader
+text, a sliced function body, `.mjs`).
+
+The scanner is a five-state machine (code / line / block / string / regex literal) that is
+**length- and line-preserving**, so a reported line number still addresses the real file and a
+parser's token offsets over the raw source address the stripped string directly. That last property
+is what `findDamagedCodeTokens` / `assertEveryCodeTokenSurvives` rest on: TypeScript parses the raw
+file and every non-comment leaf token must be byte-identical in the stripped output. Its own test
+sweeps all of `src/runtime/**` with that oracle (~340 ms) as a **forward** guard — it needs nobody
+to have thought of the next hazard first. The crafted snippets in that test are the only
+*regression* cover, with a measured matrix of which snippet catches which scanner defect; real
+fixture files strip byte-identically under most of them and can tell nothing apart.

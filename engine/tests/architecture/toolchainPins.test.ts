@@ -61,6 +61,13 @@ const EXPECTED: Record<string, { pin: string; why: string }> = {
     pin: '^5.9.3',
     why: 'builds with `tsc && rollup`; its compiler emits plugin JS that ships to devices',
   },
+  'engine/packages/modoki/package.json': {
+    pin: '~6.0.3',
+    why: 'ON the root compiler, and a devDependency only — the `./testing` subpath\'s scanner asks '
+      + 'TypeScript to locate string literals (#419). Declared rather than left to hoisting '
+      + 'because an exports subpath is a public surface; nothing under `src/` imports it, so no '
+      + 'compiler reaches a shipped bundle',
+  },
   'engine/tools/modoki-mcp/package.json': {
     pin: '~6.0.3',
     why: 'ON the root compiler (#87); carries its own only because it is deliberately not a root workspace',

@@ -18,6 +18,7 @@ import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { normalizeSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
 import { defaultSpriteClip, type SpriteClip } from '../../runtime/traits/SpriteAnimator';
+import { defaultSpriteAnimData } from '../../runtime/assets/assetSchemas';
 import { spriteIndexFromStep } from '../../runtime/particles/types';
 import { saveAssetDialog } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
@@ -179,7 +180,7 @@ export default function SpriteAnimEditor() {
     const path = await saveAssetDialog({ defaultName: 'New Sprite Animation.spriteanim.json', ext: '.spriteanim.json', prompt: 'Create Sprite Animation' });
     if (!path) return;
     const guid = newGuid();
-    const doc = { id: guid, clips: { idle: defaultSpriteClip() } };
+    const doc = { id: guid, ...defaultSpriteAnimData() };
     const ok = await backendFetch('/api/write-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(doc, null, 2) }) }).then((r) => r.ok).catch(() => false);
     if (!ok) return;
     // CREATE writes immediately (the file must exist for registerAsset/the manifest), so the file

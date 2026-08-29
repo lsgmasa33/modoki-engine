@@ -20,6 +20,16 @@ import { hasInternalGames } from '../helpers/repoLayout';
  *
  * It is a CHEAP proxy for the real thing (running the playable build), which costs minutes — so
  * it checks the one failure mode that has actually happened, not that a playable build succeeds.
+ *
+ * ⚠️ **A SECOND failure mode has actually happened, and the top-level check above cannot see it.**
+ * `games/court/runtime/systems.ts` called `auth.getServerTimeMs()` unconditionally; the stub's
+ * `auth` namespace object existed (so `stubExports()` — which only matches top-level
+ * `export function`/`export const` — was satisfied) but had no `getServerTimeMs` MEMBER. Rollup
+ * cannot catch this at all (`auth.getServerTimeMs` is a property read the bundler doesn't verify),
+ * so it throws at RUNTIME in the ad: `TypeError: auth.getServerTimeMs is not a function`. The
+ * `stubExports`/`requiredNames` check below is therefore extended to also cross-check MEMBERS of
+ * each `export const <namespace> = { … }` object in the stub against `<namespace>.<member>` call
+ * sites the games actually use — same idea, one level deeper.
  */
 
 const repoRoot = path.resolve(__dirname, '../../..');
@@ -34,19 +44,12 @@ function stubExports(): Set<string> {
   return names;
 }
 
-/**
- * Names the games ask for, in the two shapes that actually appear:
- *   `import { track } from '@court/app-services'`            — static named import
- *   `import('@court/app-services').then((m) => m.register())` — dynamic member access
- * The second is how `game.ts` wires `registerAppServices`, and it is NOT caught by Rollup at
- * build time — it fails at RUNTIME in the ad, which is worse. Both are covered.
- */
-function requiredNames(): Map<string, string[]> {
-  // ⚠️ Listed broadly and filtered HERE, not with a `**` pathspec. git's wildmatch made
-  // `games/*/runtime/**/*.ts` require an intermediate directory, so it silently skipped
-  // `games/court/runtime/systems.ts` — the very file that broke the build. The first draft of
-  // this guard passed happily with the stub's `track` export renamed away.
-  const files = execFileSync('git', ['ls-files', 'games', 'demos'], { cwd: repoRoot, encoding: 'utf8' })
+/** ⚠️ Listed broadly and filtered HERE, not with a `**` pathspec. git's wildmatch made
+ *  `games/*\/runtime/**\/*.ts` require an intermediate directory, so it silently skipped
+ *  `games/court/runtime/systems.ts` — the very file that broke the build. The first draft of
+ *  this guard passed happily with the stub's `track` export renamed away. */
+function scannableFiles(): string[] {
+  return execFileSync('git', ['ls-files', 'games', 'demos'], { cwd: repoRoot, encoding: 'utf8' })
     .trim().split('\n').filter(Boolean)
     .filter((f) => /\.tsx?$/.test(f))
     // The app-services package DEFINES these names; it is not a consumer of the stub.
@@ -57,8 +60,22 @@ function requiredNames(): Map<string, string[]> {
     // with a stack trace instead of an answer, which reads as a broken test rather than as a file
     // that is on its way out. Skipping it is right: a deleted file imports nothing.
     .filter((f) => existsSync(path.join(repoRoot, f)));
+}
 
+/**
+ * Names the games ask for, in the two shapes that actually appear:
+ *   `import { track } from '@court/app-services'`            — static named import
+ *   `import('@court/app-services').then((m) => m.register())` — dynamic member access
+ * The second is how `game.ts` wires `registerAppServices`, and it is NOT caught by Rollup at
+ * build time — it fails at RUNTIME in the ad, which is worse. Both are covered.
+ *
+ * Also returns each name's LOCAL alias per file (`import { auth as a }`), keyed the same way,
+ * because {@link requiredNamespaceMembers} has to know what a namespace is called INSIDE the file
+ * it's scanning, not what the stub calls it.
+ */
+function requiredNames(files: readonly string[]): { required: Map<string, string[]>; aliases: Map<string, Map<string, string>> } {
   const out = new Map<string, string[]>();
+  const aliases = new Map<string, Map<string, string>>(); // file -> localName -> originalName
   const add = (name: string, where: string) => {
     const list = out.get(name) ?? [];
     if (!list.includes(where)) list.push(where);
@@ -69,12 +86,80 @@ function requiredNames(): Map<string, string[]> {
     const src = readFileSync(path.join(repoRoot, rel), 'utf8');
     for (const m of src.matchAll(/import\s*\{([^}]*)\}\s*from\s*'@[^/']+\/app-services'/g)) {
       for (const raw of m[1].split(',')) {
-        const name = raw.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
-        if (name) add(name, rel);
+        const trimmed = raw.trim().replace(/^type\s+/, '');
+        if (!trimmed) continue;
+        const [originalName, localName] = trimmed.split(/\s+as\s+/).map((s) => s.trim());
+        add(originalName, rel);
+        let fileAliases = aliases.get(rel);
+        if (!fileAliases) { fileAliases = new Map(); aliases.set(rel, fileAliases); }
+        fileAliases.set(localName ?? originalName, originalName);
       }
     }
     for (const m of src.matchAll(/import\(\s*'@[^/']+\/app-services'\s*\)[\s\S]{0,120}?\bm\.([A-Za-z_$][\w$]*)/g)) {
       add(m[1], rel);
+    }
+  }
+  return { required: out, aliases };
+}
+
+/**
+ * For each `export const <Name> = { … }` object in the stub, the top-level method/property names
+ * it defines. Brace-balanced (not a single-line regex) because `crashlytics`/`ads`/`auth` all span
+ * many lines and several members return object literals of their own (`PLAYABLE_NO_AUTH`).
+ */
+function stubNamespaceMembers(): Map<string, Set<string>> {
+  const src = readFileSync(STUB, 'utf8');
+  const out = new Map<string, Set<string>>();
+  for (const m of src.matchAll(/^export const ([A-Za-z_$][\w$]*)\s*=\s*\{/gm)) {
+    const name = m[1];
+    const bodyStart = m.index! + m[0].length;
+    let depth = 1;
+    let i = bodyStart;
+    while (i < src.length && depth > 0) {
+      if (src[i] === '{') depth++;
+      else if (src[i] === '}') depth--;
+      i++;
+    }
+    const body = src.slice(bodyStart, i - 1);
+    const members = new Set<string>();
+    // A member declaration line: `foo(...)`, `async foo(...)`, or `foo: value`. Matched against
+    // the START of each statement (after a `,`/`{`/newline), not anywhere in the body, so a
+    // parameter or a return value never gets mistaken for a member name.
+    for (const mm of body.matchAll(/(?:^|[,{]|\n)\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*[(:]/g)) {
+      members.add(mm[1]);
+    }
+    out.set(name, members);
+  }
+  return out;
+}
+
+/**
+ * `<namespace>.<member>(` call sites in the games, restricted to namespaces the stub actually
+ * defines (so an unrelated local variable that happens to be called `auth` can't false-positive),
+ * and resolved through each file's own import aliases.
+ */
+function requiredNamespaceMembers(
+  files: readonly string[],
+  aliases: Map<string, Map<string, string>>,
+  namespaces: ReadonlySet<string>,
+): Map<string, Map<string, string[]>> {
+  const out = new Map<string, Map<string, string[]>>(); // namespace -> member -> files
+  const add = (namespace: string, member: string, where: string) => {
+    let byMember = out.get(namespace);
+    if (!byMember) { byMember = new Map(); out.set(namespace, byMember); }
+    const list = byMember.get(member) ?? [];
+    if (!list.includes(where)) list.push(where);
+    byMember.set(member, list);
+  };
+
+  for (const rel of files) {
+    const fileAliases = aliases.get(rel);
+    if (!fileAliases) continue;
+    const src = readFileSync(path.join(repoRoot, rel), 'utf8');
+    for (const [localName, originalName] of fileAliases) {
+      if (!namespaces.has(originalName)) continue; // not one of the stub's namespace objects
+      const re = new RegExp(`\\b${localName}\\.([A-Za-z_$][\\w$]*)\\s*\\(`, 'g');
+      for (const m of src.matchAll(re)) add(originalName, m[1], rel);
     }
   }
   return out;
@@ -88,8 +173,10 @@ function requiredNames(): Map<string, string[]> {
  *  `hasInternalGames()` (not `hasAnyProject()`) is the correct predicate: the snapshot does
  *  ship demos, and no demo has an app-services package for this to find. */
 describe.skipIf(!hasInternalGames())('the playable app-services stub keeps up with the games (#269)', () => {
+  const files = scannableFiles();
+  const { required, aliases } = requiredNames(files);
+
   it('exports every name a game imports from its app-services package', () => {
-    const required = requiredNames();
     // Guard the guard: if the scan finds nothing, every assertion below is vacuous. At least
     // `register` is always imported — `game.ts` cannot wire `registerAppServices` without it.
     expect(required.size, 'the import scan matched nothing — the queries have gone stale').toBeGreaterThan(0);
@@ -100,6 +187,36 @@ describe.skipIf(!hasInternalGames())('the playable app-services stub keeps up wi
     expect(
       missing.map(([name, where]) => `${name} (imported by ${where.join(', ')})`),
       'these names would fail a --target playable build with [MISSING_EXPORT]',
+    ).toEqual([]);
+  });
+
+  it('every namespace object exports every MEMBER a game calls on it', () => {
+    const namespaceMembers = stubNamespaceMembers();
+    // Guard the guard: the stub currently has several `export const <namespace> = { … }` objects
+    // (`auth`, `ads`, `crashlytics`, `serverTime`, `cloudSave`) — if the brace-balanced parser
+    // above finds none, every assertion below is vacuous.
+    expect(namespaceMembers.size, 'stubNamespaceMembers found no namespace objects — the parser has gone stale').toBeGreaterThan(0);
+
+    const requiredMembers = requiredNamespaceMembers(files, aliases, new Set(namespaceMembers.keys()));
+    // Guard the guard, the other direction: the games DO call members on these namespaces
+    // (`auth.getServerTimeMs`, `auth.currentUser`, `cloudSave.deleteSave`, `ads.showInterstitial`,
+    // `crashlytics.crash`, …) — a scan that found none has gone stale, not a codebase that stopped
+    // using them.
+    expect(requiredMembers.size, 'the namespace-member scan matched nothing — the queries have gone stale').toBeGreaterThan(0);
+
+    const missing: string[] = [];
+    for (const [namespace, byMember] of requiredMembers) {
+      const exportedMembers = namespaceMembers.get(namespace) ?? new Set<string>();
+      for (const [member, where] of byMember) {
+        if (!exportedMembers.has(member)) {
+          missing.push(`${namespace}.${member} (called by ${where.join(', ')})`);
+        }
+      }
+    }
+    expect(
+      missing,
+      'these calls would fail a --target playable build at RUNTIME with "is not a function" — ' +
+      'Rollup cannot catch a missing namespace MEMBER the way it catches a missing top-level export',
     ).toEqual([]);
   });
 });

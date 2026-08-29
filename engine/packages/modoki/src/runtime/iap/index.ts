@@ -12,6 +12,7 @@
  */
 
 export type {
+  IapGrant,
   ProductKind, IapProduct, IapProductInfo, StoreTransaction, PurchaseOutcome, PurchaseResult,
 } from './types';
 export { type StoreBackend, NoopStoreBackend } from './storeBackend';

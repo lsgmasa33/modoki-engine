@@ -145,8 +145,11 @@ const SPRITEANIM_FIELDS: FieldMeta[] = [
   { key: 'clips', type: 'object', note: '{ <name>: { frames: sprite-slice GUID[], fps, mode:once|loop|pingpong, cycles } }' },
 ];
 
-/** A fresh sprite-anim set with one empty "idle" clip ready to receive frames. */
-function defaultSpriteAnimData(): { clips: Record<string, ReturnType<typeof defaultSpriteClip>> } {
+/** A fresh sprite-anim set with one empty "idle" clip ready to receive frames.
+ *  The ONE definition behind BOTH the Assets panel's "Create" button (via
+ *  `defaultAssetData('spriteanim')`) and the SpriteAnim Editor's own "+ New" — guarded by
+ *  `tests/editor/spriteAnimCreateParity.test.ts` (#417). */
+export function defaultSpriteAnimData(): { clips: Record<string, ReturnType<typeof defaultSpriteClip>> } {
   return { clips: { idle: defaultSpriteClip() } };
 }
 

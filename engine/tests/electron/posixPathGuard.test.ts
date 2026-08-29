@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 /**
  * PACKAGING GUARD — no hardcoded POSIX-only paths in packaged-app code.
@@ -51,13 +52,20 @@ describe('packaged-app code has no hardcoded POSIX-only paths', () => {
     expect(files.length).toBeGreaterThan(0);
   });
 
+  it('the comment scan is sane over every scanned file', () => {
+    for (const rel of files) {
+      const raw = fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+      assertScanIsSane(raw, stripComments(raw), rel);
+    }
+  });
+
   for (const rel of files) {
     it(`${rel} uses os.tmpdir()/app.getPath, not a literal /tmp`, () => {
-      const src = fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+      const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
       const offenders = src
         .split('\n')
         .map((line, i) => ({ line, n: i + 1 }))
-        .filter(({ line }) => BAD.test(line) && !/^\s*(\*|\/\/)/.test(line)); // skip comments
+        .filter(({ line }) => BAD.test(line));
       expect(
         offenders,
         `hardcoded POSIX path (crashes on Windows) — use os.tmpdir() / app.getPath('temp'):\n` +
@@ -135,11 +143,16 @@ describe('test files reach the filesystem through os.tmpdir(), not a literal POS
     + '|createReadStream|readFileSync|readdirSync|existsSync|copyFileSync|cpSync|statSync|renameSync'
     + '|writeFile|readFile|mkdir|appendFile';
 
-  const stripComments = (src: string): string =>
-    src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')
-      .map((l) => (/^\s*(\*|\/\/)/.test(l) ? '' : l)).join('\n');
+  // Comment stripping is the shared scanner (@modoki/engine/testing, #419) — imported above.
 
   const files = testRoots().flatMap((r) => testFiles(r));
+
+  it('the comment scan is sane over every scanned test file', () => {
+    for (const rel of files) {
+      const raw = fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+      assertScanIsSane(raw, stripComments(raw), rel);
+    }
+  });
 
   it('scans a non-empty set of test files, across engine AND project suites', () => {
     // A root that silently stops matching turns this whole block into a cheerful no-op — the

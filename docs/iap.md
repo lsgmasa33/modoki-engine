@@ -34,6 +34,49 @@ both.
 They are two halves of one thing: invariant 1 chooses to risk duplicate delivery over lost money,
 and invariant 2 is what makes that trade free.
 
+### Invariant 1 covers the GAME's state too — the grant hook (#371)
+
+⚠️ **A game whose truth lives outside the ledger needs `configureIap({ onGrant })`, or invariant 1
+holds only for the engine.** `settle()` runs `verify → ledger.recordGrant → flush → confirmDurable →
+finish`, and `finish()` IS the consume. A game that writes its own coin wallet or entitlement flag
+when `purchase()` resolves writes it *after* the store has already been told to stop re-delivering —
+so a crash in that window loses the purchase with no recovery. That is invariant 1's own failure
+mode, reintroduced one layer out by wiring rather than by logic.
+
+The hook moves the consume behind the game's write:
+
+```
+verify → ledger.recordGrant → flush → confirmDurable
+       → onGrant(grant)   ← the game writes its state and CONFIRMS it durable
+       → backend.finish   ← the consume, last, and only if onGrant returned true
+```
+
+Owner, 2026-08-29: *"the flow should be purchase start, callback, increment the balance / change
+flag, save them, then consume the purchase. the consume must be called last."*
+
+Four contract points, each load-bearing:
+
+1. **Returning false — or throwing — withholds the finish.** The transaction stays unfinished and
+   the store re-delivers next launch. Same trade `confirmDurable` already makes: leaving a
+   transaction open beats finishing one we failed to record. A refusal is the safe outcome, not an
+   error path.
+2. ⚠️ **The hook runs on the ALREADY-GRANTED path too**, not only on a fresh grant. Skipping it
+   there makes the crash between the ledger write and the game's write *unrecoverable*: the
+   re-delivery would find the ledger already processed, go straight to the finish, and the game
+   would apply nothing, forever.
+3. **Therefore the hook MUST be idempotent, keyed by `IapGrant.transactionId`** — it is called once
+   per settle pass until a finish lands. It is the same key the ledger uses, which is what makes the
+   two agree by construction rather than by two people remembering the same rule.
+4. **`stillActive()` is re-checked after it returns.** The hook awaits the game's own flush, which
+   is another window a game swap can land in.
+
+**Optional, and omitting it changes nothing.** `games/iap-test` passes no hook and does not need
+one: the fixture holds no game-side state at all, reading `iapBalanceOf()` straight off the ledger,
+so for it the ledger genuinely *is* the truth. `games/court` is the first caller for which it is not.
+
+Proved by five rows in `iapCrashMatrix.test.ts` — a refusing hook, a throwing hook, the
+already-granted repair, many relaunches crediting once, and the no-hook default.
+
 ### The crash matrix
 
 | Crash point | Store state | Our state | Next launch |
