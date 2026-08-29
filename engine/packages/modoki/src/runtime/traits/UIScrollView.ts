@@ -97,6 +97,13 @@ export const UIScrollView = trait({
   scrollY: 0,
   viewportWidth: 0,
   viewportHeight: 0,
+  /** The box's full content extent (`scrollWidth`/`scrollHeight`). **Written every scroll event and
+   *  read by no engine code (#414)** — a DIAGNOSTIC, and the intended source for extent-derived
+   *  features a pooled view cannot supply. Why they are kept, what they would be used for, and the
+   *  ⚠️ that has to be settled before deriving behaviour from them (the measurement comes from
+   *  whichever of the editor's two `UIRenderer` mounts fired) are stated ONCE, in
+   *  `docs/ui-system.md` § "Rules that bite" — restating them here is the same defect #411 is
+   *  about, one file over. */
   contentWidth: 0,
   contentHeight: 0,
 

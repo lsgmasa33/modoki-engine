@@ -659,7 +659,7 @@ scrolling shop strip is a lie an author reads past forever.
 
 | Trait | Owns |
 |---|---|
-| `UIScrollView` | the box: `axis`, `snap`, `snapStop`, `overscroll`, plus engine-written `scrollX/Y`, viewport + content size |
+| `UIScrollView` | the box: `axis`, `snap`, `snapStop`, `overscroll`, plus engine-written `scrollX/Y` and viewport size — and content size, which the engine writes and only a reader consumes (see "Rules that bite") |
 | `UIEntries` | what it shows: `prefabs` (a JSON bank of `{name, prefab}`), entry size, `gap`, `overscan`, `countX/countY`, `epoch`, `source` |
 | `UIEntry` | stamped by the engine on each pooled instance: the **data** index, the slot, and `live` |
 
@@ -901,6 +901,24 @@ rebuild and is never per-frame.
   size by construction; the residual hazard is a MIXED measurement instead — a real viewport from
   one mount paired with `scrollX: 0` from the other while the two trees disagree on scroll offset,
   which can still land the pool's window outside the visible band and blank the view.
+- **`contentWidth`/`contentHeight` are DIAGNOSTICS the engine writes and does not read (#414).** They
+  carry the box's `scrollWidth`/`scrollHeight` — its full content extent — and every consumer in the
+  repo is a human or an agent reading the trait through Percept: `contentWidth === viewportWidth`
+  while `countX: 5` is the observation that first said "this view is sized for one page" in #413. No
+  engine code derives anything from them. `entriesSystem` and `scrollApi` use only the **viewport**
+  pair, and a pooled view's own extent is the PADDING `writeLayout` computes from the entry stride,
+  which is a separately-computed quantity. This is deliberate, not an oversight: they are also the
+  intended source for the extent-derived features a pooled view cannot supply — a scrollbar thumb
+  (`viewport / content`), edge fades, a "can this scroll?" affordance, scroll-to-end, near-the-end
+  prefetch, and the upper clamp `scrollByEntry` still lacks — it clamps at `0` only, so a wheel past
+  the last entry arms a request off the end, `consumeEntryRequest` hands that target back, and
+  **this frame's pooled window is planned for a place the view never reaches** before the DOM clamps
+  the offset. The view lands right; the pool spent a frame elsewhere, and nothing in the engine can
+  answer "already at the end" for a caller wanting to grey the arrow out (Court's `level-page`
+  handler clamps for itself with `clampPage`). All of those are `content − viewport`, and on a
+  `UIScrollView` carrying **no** `UIEntries` there is no other source for it.
+  ⚠️ **Scope the measurement to one owning tree before building behaviour on them** — they come from
+  whichever of the two editor mounts fired, which is exactly the mixed-measurement hazard above.
 - **A parked entry reads as DESTROYED to Percept and Enact** — not listed, not aimable, subtree
   included. This is NOT the same as `isVisible: false`, which stays addressable.
 - **Every pooled instance shares the prefab's authored `sortOrder`**, so ties fall to koota
