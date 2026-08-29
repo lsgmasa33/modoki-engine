@@ -323,6 +323,77 @@ describe('PlayerPrefs — backend-failure resilience', () => {
     await PlayerPrefs.flush();
     expect(store.get('mk:g1:a')).toBe(JSON.stringify({ v: 1, d: 1 }));
   });
+
+  it('pendingKeys() sees a rejected DELETE that keys() structurally cannot (#422)', async () => {
+    // A delete removes the key from `cache` immediately, so `keys()` never has it — but it's
+    // still `dirty` if the backend rejected the remove. `keys().filter(hasPendingWrite)` can
+    // never reconstruct that; `pendingKeys()` reads `dirty` directly and does.
+    const store = new Map<string, string>();
+    store.set('mk:g1:k', JSON.stringify({ v: 1, d: 1 }));
+    const flaky: PrefsBackend = {
+      getAll: async (prefix) => {
+        const out: Record<string, string> = {};
+        for (const [k, v] of store) if (k.startsWith(prefix)) out[k] = v;
+        return out;
+      },
+      set: async (k, v) => { store.set(k, v); },
+      // Always rejects — the test asserts the state right after flush(), which drains twice
+      // internally; a reject-once backend would let the second internal drain quietly succeed.
+      remove: async () => { throw new Error('I/O error (simulated)'); },
+    };
+    await PlayerPrefs.init({ namespace: 'g1', backend: flaky });
+    expect(PlayerPrefs.get('k')).toBe(1); // hydrated
+
+    PlayerPrefs.delete('k');
+    await PlayerPrefs.flush(); // the backend.remove() call rejects once, re-queuing 'k' into dirty
+
+    expect(PlayerPrefs.keys()).not.toContain('k'); // blind spot: gone from the cache-derived view
+    expect(PlayerPrefs.pendingKeys()).toContain('k'); // authoritative: still pending
+  });
+
+  it('pendingKeys() under-reports MID-DRAIN — pinning KNOWN behaviour the doc now qualifies, not a bug (#422)', async () => {
+    // `drain()` does `const keys = [...dirty]; dirty.clear();` and only THEN awaits the backend
+    // calls, so `dirty` — and so `pendingKeys()` — is empty for the entire duration of a batch,
+    // even though every one of those writes is genuinely still in flight. This mechanic is
+    // pre-existing and correct (drain() must own the keys it's about to attempt so a write
+    // dirtied mid-batch isn't silently swallowed); the #422 follow-up fixed only that the doc
+    // comments called `pendingKeys()` unconditionally "authoritative" with no timing qualifier.
+    let releaseGate: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    const store = new Map<string, string>();
+    const gated: PrefsBackend = {
+      getAll: async (prefix) => {
+        const out: Record<string, string> = {};
+        for (const [k, v] of store) if (k.startsWith(prefix)) out[k] = v;
+        return out;
+      },
+      // Blocks on `gate`, then always rejects — simulates a slow backend whose write is
+      // in flight and about to be rejected (quota, native I/O).
+      set: async () => { await gate; throw new Error('rejected after delay (simulated)'); },
+      remove: async (k) => { store.delete(k); },
+    };
+    await PlayerPrefs.init({ namespace: 'g1', backend: gated });
+
+    PlayerPrefs.set('k', 1);
+    const flushPromise = PlayerPrefs.flush(); // drain() starts; its set() call is now blocked on `gate`
+
+    // Let the microtask queue advance far enough for drain()'s synchronous
+    // `dirty.clear()` to run (it happens before the gated `await` inside the per-key write).
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Mid-drain: the write is genuinely in flight (blocked on `gate`), but `dirty` has already
+    // been emptied — this is the under-report the doc comments now describe.
+    expect(PlayerPrefs.pendingKeys()).toEqual([]);
+
+    releaseGate();
+    await flushPromise;
+
+    // The blocked write has now resolved — and rejected — so it was re-queued into `dirty`.
+    // `pendingKeys()` is authoritative again now that we're at a stable point (post-flush).
+    expect(PlayerPrefs.pendingKeys()).toContain('k');
+  });
 });
 
 describe('PlayerPrefs — namespace edge cases', () => {

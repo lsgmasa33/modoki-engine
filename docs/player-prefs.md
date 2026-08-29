@@ -51,6 +51,7 @@ PlayerPrefs.keys(): string[]
 PlayerPrefs.clear(): void                         // empties THIS game's namespace
 PlayerPrefs.isHydrated(): boolean                 // true once init() has hydrated the cache
 PlayerPrefs.hasPendingWrite(key): boolean         // a write the backend has NOT accepted (see Gotchas)
+PlayerPrefs.pendingKeys(): string[]               // the authoritative pending set (see Gotchas — NOT keys().filter(hasPendingWrite))
 await PlayerPrefs.flush()                         // resolve once pending writes are durable
 ```
 
@@ -157,6 +158,15 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   irreversible on "is it saved?" must use this; a read-back is self-confirming. Still not an fsync —
   `false` means the platform accepted it, not that it is on the platter.
 
+- ⚠️ **`keys()` cannot see a rejected DELETE — use `pendingKeys()`, not `keys().filter(hasPendingWrite)`.**
+  `delete(key)` removes the key from `cache` (and so from `keys()`) in the same call that marks it
+  `dirty`, so a key with a rejected `backend.remove()` is dirty and simultaneously absent from every
+  cache-derived view. `pendingKeys()` reads `dirty` directly and is the only source that sees it
+  (#422 — the agent-facing `player-prefs` ops reported `pendingWrites: []` for exactly this case
+  before the fix). **"Authoritative" holds only at a STABLE point — after an awaited `flush()`**,
+  the same qualifier `hasPendingWrite` already carries: `drain()` empties `dirty` BEFORE awaiting the
+  backend calls, so mid-drain `pendingKeys()` under-reports a write that is genuinely in flight.
+
 - **No cross-key transaction.** Two values that must stay consistent belong in **one** key.
 - **JSON only.** `undefined` deletes the key. A top-level function/symbol or a cyclic value is
   skipped with a warning (not stored). Nested functions are dropped by `JSON.stringify`;
@@ -171,7 +181,7 @@ if (score > best) PlayerPrefs.set('bestScore', score);
 /api/player-prefs`) expose the store to an agent; `device_player_prefs` / `device_write_player_prefs`
 are the on-device twins. Split in two per `docs/mcp-tool-conventions.md` §7 ("if one argument value
 changes whether it writes to disk, it is more than one tool") — verified in the code: `get`/`keys`/
-`has`/`hasPendingWrite` are pure cache reads with no lazy hydration and no `scheduleFlush`, while
+`has`/`hasPendingWrite`/`pendingKeys` are pure cache reads with no lazy hydration and no `scheduleFlush`, while
 `set`/`delete`/`clear` all dirty a key and schedule a durable write.
 
 Every reply names its `namespace`, and it must be read, not assumed: the editor deliberately
@@ -192,6 +202,23 @@ the target is a real player's save data on an installed app.
 
 `PlayerPrefs` gained a `namespace()` getter for this (`runtime/storage/playerPrefs.ts`) — a key list
 is meaningless without knowing which store it came from.
+
+Three behavioural refinements to the op contract (#422 follow-up — a key dirty-and-absent-from-cache
+is not proof of a rejection; it's the identical signature an ordinary DEBOUNCED write leaves too):
+
+- **`delete` on a key that is dirty and absent from the cache flushes rather than assuming a
+  rejection.** If the flush settles it (the key was only ever debounced, never attempted), the op
+  returns `ok:true, deleted:true, saved:true, alreadyRemoved:true` — the durable remove genuinely
+  happened, this call just performed it. Only if the flush leaves the key pending does it return
+  `PARTIAL` (the backend actually rejected it).
+- **The named-key read's `present:false` branch carries `pendingWrite`**, but that flag means "the
+  durable remove has not been accepted yet" — rejected, or merely still debounced — not "still on
+  disk". `player-prefs-read` never flushes, so it can't settle which one it is; it only reports the
+  ambiguity.
+- **`clear`'s `PARTIAL` separates keys this call enumerated from keys already pending beforehand.**
+  `pendingWrites` is the honest full dirty set; `failed` (keys this clear's own `flush()` retried and
+  saw rejected again) and `alsoPending` (dirty before the clear ran) are reported as separate clauses
+  so the count in the message stays consistent with `cleared`/`keys`.
 
 ## Related
 

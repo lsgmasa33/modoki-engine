@@ -1475,14 +1475,28 @@ registerAgentOp('player-prefs-read', (params) => {
     // Summary-first (§6): the INDEX by default, a value only when a key is named.
     return {
       ok: true, namespace, totalCount: keys.length, keys,
-      pendingWrites: keys.filter((k) => PlayerPrefs.hasPendingWrite(k)),
+      // The authoritative pending set AT A STABLE POINT, NOT `keys.filter(hasPendingWrite)` — a
+      // key can be pending and simultaneously ABSENT from `keys` (a DELETE the backend rejected:
+      // `PlayerPrefs.delete` removes it from the cache immediately, so `keys` never has it). So
+      // this list can legitimately contain a key this same response's `keys` array does not —
+      // that's the point, not a bug. This op does not flush, so mid-drain it can also UNDER-report
+      // a write that is genuinely in flight — see `pendingKeys()`'s doc comment.
+      pendingWrites: PlayerPrefs.pendingKeys().sort(),
     };
   }
   // A key that is genuinely absent is an ANSWER, not a refusal — we looked, and it is not there.
   // `present` carries that explicitly rather than leaving it to be inferred from a missing
   // `value`, which is indistinguishable from a key holding JSON `null`.
   if (!PlayerPrefs.has(p.key)) {
-    return { ok: true, namespace, key: p.key, present: false, totalCount: keys.length, keys };
+    return {
+      ok: true, namespace, key: p.key, present: false, totalCount: keys.length, keys,
+      // A key absent from the cache can still be DIRTY. That does NOT prove a rejection — an
+      // ordinary debounced delete (still inside its 150ms window, never yet sent to the backend)
+      // has the identical signature. What it proves is that the durable remove has not been
+      // ACCEPTED yet, so the key may still be on disk. `present: false` alone would report it as
+      // durably gone (#422's own failure shape, on the branch an agent uses to verify a single key).
+      pendingWrite: PlayerPrefs.hasPendingWrite(p.key),
+    };
   }
   return {
     ok: true, namespace, key: p.key, present: true,
@@ -1510,8 +1524,10 @@ registerAgentOp('player-prefs-write', async (params) => {
     // re-queues the key into `dirty`, and settles fulfilled so later writes are not poisoned —
     // while `cache` keeps the value, so `get()` still returns it. Re-reading the pending set is the
     // only way to see it, so reporting a clean `ok:true` here would be a false success by
-    // construction.
-    const stillPending = PlayerPrefs.keys().filter((k) => PlayerPrefs.hasPendingWrite(k));
+    // construction. Must be `PlayerPrefs.pendingKeys()`, not `keys().filter(hasPendingWrite)` — a
+    // rejected DELETE leaves the key dirty but removes it from `cache` (and so from `keys()`) in the
+    // same call, so the cache-derived filter structurally cannot see it.
+    const stillPending = PlayerPrefs.pendingKeys().sort();
     if (stillPending.length > 0) {
       return {
         ok: false, code: 'PARTIAL', namespace, pendingWrites: stillPending,
@@ -1543,6 +1559,35 @@ registerAgentOp('player-prefs-write', async (params) => {
     }
     PlayerPrefs.clear();
     await PlayerPrefs.flush();
+    // Same rejection possibility as `flush`/`set`/`delete` — a clear queues every key as a delete,
+    // and any of those backend.remove() calls can be rejected (quota, native I/O) and re-queued.
+    const stillPending = PlayerPrefs.pendingKeys().sort();
+    // `stillPending` is the whole dirty set, which can include a key that was ALREADY pending before
+    // this clear ran (an earlier rejected delete) — that key is not one this clear enumerated, and
+    // attributing it here produced "REJECTED for 2 of them" against `cleared: 1`.
+    const failed = stillPending.filter((k) => keys.includes(k));
+    const alsoPending = stillPending.filter((k) => !keys.includes(k));
+    if (stillPending.length > 0) {
+      // `alsoPending`'s state pre-dates this clear, but this clear's own `await flush()` above
+      // retried every dirty key (including these) — so if one is still pending here, THIS call's
+      // retry was rejected again, not merely "not caused by it".
+      const alsoPendingClause = alsoPending.length > 0
+        ? ` (${alsoPending.join(', ')} — already pending before this clear ran, and this call's ` +
+          `flush retried ${alsoPending.length === 1 ? 'it' : 'them'} and ` +
+          `${alsoPending.length === 1 ? 'was' : 'were'} rejected again)`
+        : '';
+      // "the backend accepted the durable remove for all of them" is false whenever `alsoPending`
+      // fired alongside an empty `failed` — this clause only speaks for the keys THIS clear
+      // enumerated, which `failed` (not `stillPending`) tracks.
+      const failedClause = failed.length > 0
+        ? `the backend REJECTED the durable remove for ${failed.length} of them: ${failed.join(', ')} — the on-disk state for ${failed.length === 1 ? 'it is' : 'them is'} unchanged from before this call`
+        : 'every key this clear enumerated was durably removed';
+      return {
+        ok: false, code: 'PARTIAL', namespace, cleared: keys.length, keys, pendingWrites: stillPending,
+        error: `clear removed ${keys.length} key(s) from the live cache but ${failedClause}${alsoPendingClause}`,
+        hint: 'A rejected write keeps the key out of the cache but not off disk. Retry with player-prefs-write action:\'flush\' once the underlying issue (quota, I/O) clears.',
+      };
+    }
     return { ok: true, namespace, cleared: keys.length, keys };
   }
 
@@ -1555,6 +1600,28 @@ registerAgentOp('player-prefs-write', async (params) => {
     // useful than the no-op would have been, because a delete that hits nothing is almost always
     // a mistyped key and the real ones are right here.
     if (!PlayerPrefs.has(p.key)) {
+      // A key absent from the cache but still DIRTY is not a missing key — but it is NOT proof of
+      // a rejection either. `PlayerPrefs.delete()` does `cache.delete; dirty.add; scheduleFlush()`
+      // on a 150ms debounce, so an ordinary in-flight delete (the game's own `PlayerPrefs.delete()`,
+      // or a prior call to this op before its own flush lands) has the IDENTICAL signature — dirty,
+      // absent from cache, nothing yet sent to the backend. Flushing settles which one this is, and
+      // if it was merely debounced, it also completes the removal this delete call asked for.
+      if (PlayerPrefs.hasPendingWrite(p.key)) {
+        await PlayerPrefs.flush();
+        if (PlayerPrefs.hasPendingWrite(p.key)) {
+          return {
+            ok: false, code: 'PARTIAL', namespace, key: p.key, deleted: true, saved: false,
+            // Same symmetry as the PARTIAL below: "still on disk" would be false for a key whose
+            // only prior write was itself a rejected SET.
+            error: `'${p.key}' was already out of the live cache from an earlier delete, and the backend REJECTED its durable remove — the on-disk state is unchanged from before this call`,
+            hint: "The cache removal already happened, so a second delete cannot help. Retry the durable remove with action:'flush' once the underlying issue (quota, I/O) clears.",
+          };
+        }
+        return {
+          ok: true, namespace, key: p.key, deleted: true, saved: true, alreadyRemoved: true,
+          note: `'${p.key}' had already been removed from the live cache by an earlier delete whose durable write was still pending (the game's own delete, or a prior call); this call flushed it, so it is now durably removed`,
+        };
+      }
       const keys = [...PlayerPrefs.keys()].sort();
       return {
         ok: false, code: 'NOT_FOUND', namespace, key: p.key, keys,
@@ -1564,6 +1631,21 @@ registerAgentOp('player-prefs-write', async (params) => {
     }
     PlayerPrefs.delete(p.key);
     await PlayerPrefs.flush();
+    // Mirrors the `set` path's check below. `deleted: true` stays true even in the PARTIAL shape —
+    // the cache removal DID happen, `get()`/`has()` on this key now behave as if it's gone. It's
+    // `saved` that's false: the durable remove was rejected, so the key is still on disk and will
+    // come back on the next launch. That asymmetry is the honest report.
+    if (PlayerPrefs.hasPendingWrite(p.key)) {
+      return {
+        ok: false, code: 'PARTIAL', namespace, key: p.key, deleted: true, saved: false,
+        // "Still on disk" would be false for a key whose only prior write was itself a rejected
+        // SET — it was never durably written in the first place. State it symmetrically instead:
+        // the durable remove failed, so whatever was on disk before this call (if anything) is
+        // unchanged.
+        error: `'${p.key}' was removed from the live cache but the backend REJECTED the durable remove (quota, or a native I/O error) — the on-disk state is unchanged from before this call`,
+        hint: "Retry the durable remove with action:'flush'. A second delete cannot help — the cache removal already happened, so it reports this same PARTIAL rather than removing anything.",
+      };
+    }
     return { ok: true, namespace, key: p.key, deleted: true, saved: true };
   }
 

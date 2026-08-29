@@ -302,6 +302,32 @@ function hasPendingWrite(key: string): boolean {
   return dirty.has(key);
 }
 
+/**
+ * The logical keys with a write the backend has NOT accepted yet — the authoritative
+ * pending set, for a caller that needs the whole list rather than one key at a time.
+ *
+ * ⚠️ **This is NOT derivable from `keys()`.** `keys()` mirrors `cache`, which a delete
+ * empties out immediately (`del()` does `cache.delete(key); dirty.add(key)`): the key is
+ * dirty and simultaneously absent from `cache`. So `keys().filter(hasPendingWrite)` can
+ * never see a rejected DELETE — that's a blind spot by construction, not a bug in the
+ * filter, and it's exactly the trap `pendingKeys()` exists to route around by reading
+ * `dirty` directly instead of reconstructing it from `cache`.
+ *
+ * ⚠️ **"Authoritative" holds only at a STABLE point — after an awaited `flush()`**, exactly
+ * how `hasPendingWrite`'s own doc frames it ("`await flush()` then `hasPendingWrite(key)`").
+ * Mid-drain it UNDER-reports: `drain()` does `const keys = [...dirty]; dirty.clear();` and
+ * only then awaits the backend calls, so `dirty` (and so `pendingKeys()`) is empty for the
+ * whole duration of a batch, even though every one of those writes is still in flight and
+ * could be about to be rejected.
+ *
+ * Same caveats as `hasPendingWrite` apply per-key: "pending" means "the backend has not
+ * ACCEPTED it", not "it is unsynced to disk" — see that doc comment for what `flush()`
+ * resolving does and doesn't guarantee.
+ */
+function pendingKeys(): string[] {
+  return [...dirty];
+}
+
 export const PlayerPrefs = {
   init,
   get,
@@ -314,6 +340,7 @@ export const PlayerPrefs = {
   isHydrated,
   namespace: getNamespace,
   hasPendingWrite,
+  pendingKeys,
 } as const;
 
 // ── Test seam ─────────────────────────────────────────────────────

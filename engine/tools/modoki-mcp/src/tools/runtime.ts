@@ -228,7 +228,10 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'dynamic import.\n\n' +
       'NOT modoki_persistence, which is the EDITOR\'s scene/asset save mode and is unrelated — ' +
       'that name collision is the confusion this description exists to stop.\n\n' +
-      'CALLED BARE it returns the KEY INDEX (`keys`, `totalCount`) plus `pendingWrites`; pass ' +
+      'CALLED BARE it returns the KEY INDEX (`keys`, `totalCount`) plus `pendingWrites`. ' +
+      '`pendingWrites` is NOT a subset of `keys` — a key can be pending and absent from `keys` (a ' +
+      'delete whose durable remove has not been accepted yet — rejected, or merely still ' +
+      'debounced), so it may still be on disk. Pass ' +
       '`key` to get that key\'s `value`. Every reply names the `namespace` it read, and you should ' +
       'check it: the same game has SEPARATE stores depending on where it runs. The editor ' +
       'deliberately hydrates `<gameId>@editor` so playtest saves cannot reach a shipped build\'s ' +

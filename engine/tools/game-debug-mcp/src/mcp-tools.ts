@@ -901,7 +901,10 @@ export function registerTools(server: McpServer) {
   tool('device_player_prefs',
     'READ the game\'s PlayerPrefs store on the connected device — the durable per-key JSON save ' +
       'data (progress, settings, unlocks) as the INSTALLED app actually holds it.\n\n' +
-      'CALLED BARE it returns the key INDEX plus `pendingWrites`; pass `key` for that key\'s ' +
+      'CALLED BARE it returns the key INDEX plus `pendingWrites`. `pendingWrites` is NOT a subset ' +
+      'of `keys` — a key can be pending and absent from `keys` (a delete whose durable remove has ' +
+      'not been accepted yet — rejected, or merely still debounced), so it may still be on disk. ' +
+      'Pass `key` for that key\'s ' +
       'value. Every reply names its `namespace` — on a device that is the game\'s own (typically ' +
       'the appId), NOT the editor\'s `<gameId>@editor` sandbox, so this is the only place you can ' +
       'read what a player would see.\n\n' +
