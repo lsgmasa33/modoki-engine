@@ -31,6 +31,13 @@
 #    check-scene-churn.mjs catches the runtime-entity class, and compares the resource
 #    manifest by IDENTITY — a dropped ref the scene still references fails it (exit 1).
 #    Run it before you stage anything.
+#    ⚠️ A THIRD class it was blind to until #406: an engine-written trait field marked `hidden`
+#    but not `runtimeOnly` serializes, so a save bakes a LIVE measurement into authored data —
+#    games/scroll-demo took the editor's 410x312 device-preview size into three scenes while this
+#    gate said "0 semantic changes". It now reports those as GAINED; if you see one, the fix is
+#    usually the missing `runtimeOnly: true` in engine/app/ecs/registerTraits.ts, not a revert —
+#    unless the field is genuinely authored AND runtime-written, which the flag cannot fix (#409).
+#    check-prefab-churn.mjs got the same GAINED check, so the prefab sweep is covered too.
 #    Prefabs are covered by a sibling script, not this one: engine/scripts/resave-prefabs.sh
 #    (#125) — load-scene has no prefab equivalent, so prefabs round-trip through prefab-edit
 #    mode instead.

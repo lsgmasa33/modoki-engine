@@ -401,6 +401,49 @@ what verifies a real re-save. It also parses `entities[].traits` rather than sca
 because prefab `added[]` subtrees legitimately carry full trait data (defaults and blank refs
 included) and a text scan flags an already-migrated scene as legacy.
 
+**A third leak class — an engine-written field with no `runtimeOnly` flag (#406).** #406 measured
+`games/scroll-demo` as the last project holding present-at-default fields, and its sweep looked
+clean: 0 semantic changes, no new entities, `Transient` verified on the pooled entries. It was not.
+The re-save had written `UIScrollView.viewportWidth/Height` + `contentWidth/Height` as **410x312 —
+the editor's own measured UI viewport** — and `UIEntries.visibleX/visibleY/poolSize` into three
+committed scenes, because those fields were marked `hidden` (an Inspector-display flag) but never
+`runtimeOnly` (the flag `serializeScene` actually reads). `games/court` authors two scroll views and
+ships, so its next save would have put one editor's viewport size into a shipping scene.
+
+Two gaps let it through, and both are now closed:
+- `check-scene-churn.mjs` compared only fields present in **both** versions, so a field *appearing*
+  was invisible. It now reports `GAINED` — a field the committed file did not spell out can only be
+  emitted because it no longer holds its default, i.e. a live value on authored data. The
+  exemptions are per FIELD (`EntityAttributes.guid`/`.parentId`, `PrefabInstance.rootInstanceId` —
+  all minted by the serializer), **not per trait**: exempting `EntityAttributes` wholesale also
+  silenced `isActive`, which the Director's activation track writes live, so a sweep baking a
+  permanently-deactivated entity into a scene would still have printed "0 semantic changes". A
+  field *disappearing* stays unreported — indistinguishable from default-compaction without the
+  trait schemas. **`check-prefab-churn.mjs` had the identical hole** and got the identical fix: its
+  comment argued a gained field was "a default made explicit", which is the reasoning this whole
+  entry disproves. Its minted set is different (a template has no instance row, and
+  `serializePrefab` emits `EntityAttributes` inline as `{name, parentId, guid}` for every row).
+- `engine/tests/assets/runtimeOnlyFieldsOffDisk.test.ts` fails `npm test` on any committed scene or
+  prefab holding a `runtimeOnly` field, walking `traits`, `overrides[localId]` and `added[]`
+  subtrees alike, across all 142 project + template files (enumerated by extension under
+  `runtime/assets`, not by a `scenes/`+`prefabs/` allowlist — 52 of them, the GLB-wrapper prefabs
+  carrying `Animator`/`SkeletalAnimator`, live elsewhere). This is the cheap half of the
+  canonicality check the marker guard says it cannot afford: proving a scene byte-exact needs a
+  world, but proving no field on disk is one the serializer would never emit needs only the
+  registry. **Its reach is engine traits only** — a game's own `runtimeOnly` field (sling's
+  `Enemy.hpBarId`) is registered by that game's runtime and is invisible to a vitest run.
+
+The rule for a trait author: `hidden` and `runtimeOnly` answer different questions — *may a human
+edit this?* vs *may this reach disk?* — and an engine-written read-back needs both
+(docs/editor.md § FieldHint).
+
+**The flag cannot fix the third shape, and #409 is it:** a field that is genuinely AUTHORED and
+also written at runtime. `UIScrollView.scrollBehavior` is an authored enum that
+`scrollApi.scrollToEntry` overwrites with the per-request behaviour, so one `ui.scrollTo` destroys
+the author's default and the next save writes the request out. Flagging it would delete authored
+data instead; the fix is a separate request field, which is a behaviour decision. The `GAINED`
+check above is what notices it in the meantime.
+
 **Prefabs needed their own route (#125), and are now swept too** — see "Re-saving legacy
 prefabs" below.
 

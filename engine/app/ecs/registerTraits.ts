@@ -1111,10 +1111,29 @@ export function registerAllTraits() {
       // ⚠️ Engine-written state and the game-written scrollTo request. HIDDEN rather than shown
       // read-only: an author editing scrollY would have it overwritten on the next scroll event,
       // which is a field that looks authored and is not.
-      scrollX: { type: 'number', hidden: true }, scrollY: { type: 'number', hidden: true },
-      viewportWidth: { type: 'number', hidden: true }, viewportHeight: { type: 'number', hidden: true },
-      contentWidth: { type: 'number', hidden: true }, contentHeight: { type: 'number', hidden: true },
-      scrollToX: { type: 'number', hidden: true }, scrollToY: { type: 'number', hidden: true },
+      //   `runtimeOnly` is the half that keeps them OFF DISK, and `hidden` cannot stand in for it
+      // (#406): hidden is an Inspector-display flag, while `serializeScene` skips `runtimeOnly`.
+      // Without it a save baked the LIVE measurement into the authored scene — a scroll-demo
+      // re-save wrote viewportWidth/Height + contentWidth/Height as 410x312, the editor's own
+      // measured UI viewport, into three committed scenes. Court authors two scroll views and
+      // ships, so the same save would have put one editor's viewport size into a shipping scene.
+      //   ⚠️ Known cost, accepted: the device WorldTab derives read-only as
+      // `hint.readOnly || hint.runtimeOnly` and does not filter `hidden`, so the four scrollTo*
+      // REQUEST fields below can no longer be poked by hand in the on-device overlay. They are
+      // game-written requests, not measurements, so that surface was a real (if narrow) way to
+      // drive a scroll. It is not the only one — the `ui.scrollTo` action does the same job and is
+      // reachable from `device_dispatch_action` (games/scroll-demo authors two buttons on it) —
+      // and keeping a pending request off disk is worth more than the poke.
+      //   ⚠️ But that workaround DIRTIES THE SCENE, and this is not the field to fix it on:
+      // `scrollApi.scrollToEntry` persists the per-request behaviour onto the AUTHORED
+      // `scrollBehavior` above (`runtime/ui/scrollApi.ts`), so one 'smooth' request overwrites the
+      // author's default for good and the next save writes it out. Flagging `scrollBehavior`
+      // cannot fix that — it is genuinely authored — so the request needs its own field. Tracked
+      // separately as #409; `check-scene-churn.mjs` reports it as GAINED in the meantime.
+      scrollX: { type: 'number', hidden: true, runtimeOnly: true }, scrollY: { type: 'number', hidden: true, runtimeOnly: true },
+      viewportWidth: { type: 'number', hidden: true, runtimeOnly: true }, viewportHeight: { type: 'number', hidden: true, runtimeOnly: true },
+      contentWidth: { type: 'number', hidden: true, runtimeOnly: true }, contentHeight: { type: 'number', hidden: true, runtimeOnly: true },
+      scrollToX: { type: 'number', hidden: true, runtimeOnly: true }, scrollToY: { type: 'number', hidden: true, runtimeOnly: true },
     },
   });
 
@@ -1135,16 +1154,24 @@ export function registerAllTraits() {
       gapY: { type: 'number', min: 0, tooltip: 'Gap between entries vertically, px.' },
       overscan: { type: 'number', min: 0, step: 1, tooltip: 'Entries kept beyond the viewport per edge, on top of the visible+1 floor. This is a FLOOR — the engine raises it to cover measured scroll travel, because a fixed value blanks on a fling (measured on a Galaxy A23: a hard fling traverses up to 4.56 entries between pool updates).' },
       source: { type: 'string', tooltip: 'Name of the registered entry source that fills an entry.' },
-      // Game-written data extent and the invalidation counter — not authored.
+      // Data extent — hidden from the Inspector, AUTHORED, and also refreshed at runtime by the
+      // game (`games/court/runtime/systems.ts` writes `countX: pages` every tick as levels
+      // unlock). Persisting them anyway is the deliberate call, and it is why these two alone
+      // keep no `runtimeOnly`: the value is needed at LOAD, before any system has run, so
+      // flagging them would delete authored data — court's pager reads countX 9 and
+      // scroll-demo's strip countY 5000 straight out of the scene. Do not read the absence of
+      // the flag as "nothing writes this".
       countX: { type: 'number', hidden: true }, countY: { type: 'number', hidden: true },
-      epoch: { type: 'number', hidden: true },
+      // Engine-written invalidation counter — `runtimeOnly` so a save cannot freeze a live epoch
+      // into the file (see UIScrollView's block for the failure this class produced, #406).
+      epoch: { type: 'number', hidden: true, runtimeOnly: true },
       // Game-written scroll request in ENTRY coordinates, consumed and cleared by the system.
-      scrollToEntryX: { type: 'number', hidden: true }, scrollToEntryY: { type: 'number', hidden: true },
+      scrollToEntryX: { type: 'number', hidden: true, runtimeOnly: true }, scrollToEntryY: { type: 'number', hidden: true, runtimeOnly: true },
       // Engine-written window state. Hidden rather than read-only for the same reason as
       // UIScrollView's: an author editing firstY would have it overwritten next frame.
-      firstX: { type: 'number', hidden: true }, firstY: { type: 'number', hidden: true },
-      visibleX: { type: 'number', hidden: true }, visibleY: { type: 'number', hidden: true },
-      poolSize: { type: 'number', hidden: true },
+      firstX: { type: 'number', hidden: true, runtimeOnly: true }, firstY: { type: 'number', hidden: true, runtimeOnly: true },
+      visibleX: { type: 'number', hidden: true, runtimeOnly: true }, visibleY: { type: 'number', hidden: true, runtimeOnly: true },
+      poolSize: { type: 'number', hidden: true, runtimeOnly: true },
     },
   });
 
@@ -1156,10 +1183,13 @@ export function registerAllTraits() {
     name: 'UIEntry', trait: UIEntry, category: 'component', componentCategory: 'UI',
     priority: 63.95,
     fields: {
-      x: { type: 'number', hidden: true }, y: { type: 'number', hidden: true },
-      index: { type: 'number', hidden: true }, slot: { type: 'number', hidden: true },
-      viewGuid: { type: 'string', hidden: true }, kind: { type: 'string', hidden: true },
-      live: { type: 'boolean', hidden: true },
+      // Every field is `runtimeOnly` as well as hidden: a pooled entry is Transient today, so the
+      // serializer never reaches one — but that is a property of WHERE it is spawned (inside a
+      // system tick), not of the trait, and this makes the trait itself unable to reach disk.
+      x: { type: 'number', hidden: true, runtimeOnly: true }, y: { type: 'number', hidden: true, runtimeOnly: true },
+      index: { type: 'number', hidden: true, runtimeOnly: true }, slot: { type: 'number', hidden: true, runtimeOnly: true },
+      viewGuid: { type: 'string', hidden: true, runtimeOnly: true }, kind: { type: 'string', hidden: true, runtimeOnly: true },
+      live: { type: 'boolean', hidden: true, runtimeOnly: true },
     },
   });
 

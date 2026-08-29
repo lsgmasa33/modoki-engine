@@ -21,6 +21,11 @@
  *  The markers below are the ones the v11→v12 step and default-compaction remove, so they
  *  catch the realistic regressions cheaply. A scene can pass here and still not be byte-exact;
  *  `engine/scripts/check-scene-churn.mjs` is what verifies a real re-save.
+ *
+ *  One slice of real canonicality IS affordable and lives in a sibling:
+ *  `runtimeOnlyFieldsOffDisk.test.ts` fails on any committed scene or prefab holding a field the
+ *  serializer would never emit. That direction needs only the trait registry's Inspector metadata
+ *  — no world — and it is the direction that actually bit (#406).
  */
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';

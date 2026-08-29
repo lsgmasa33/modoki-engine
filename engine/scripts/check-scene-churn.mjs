@@ -5,13 +5,22 @@
 //
 // Reports entities lost/gained, traits lost/gained, and non-default values changed.
 // Pure format compaction (defaults omitted, the runtime `id` dropped) is the POINT of the
-// re-save and is deliberately NOT reported — otherwise every scene would be flagged.
+// re-save and is deliberately NOT reported — otherwise every scene would be flagged. That is
+// also this gate's one remaining blind spot, and it is a deliberate trade: a field DISAPPEARING
+// is indistinguishable here from default-compaction without the trait schemas, which is exactly
+// what a plain node script does not have. `engine/tests/assets/runtimeOnlyFieldsOffDisk.test.ts`
+// covers the other direction from the registry side.
 //
 // What to look for in the output:
 //   NEW ENTITY ...        the game SPAWNED it on load and save-all baked it in (#124). Revert
 //                         the scene; that project cannot be swept (measured: games/chess).
 //   CHANGED <live value>  runtime state leaked into the file, same cause as above (#124;
 //                         measured: a progress bar's width/text in games/chess + games/llm-test).
+//   GAINED ...            a field the committed file did not spell out, which the re-save now
+//                         emits — so it no longer holds its schema default and something wrote a
+//                         LIVE value onto authored data. Same class as CHANGED, and invisible
+//                         here until #406 (see the loop below). Usually the fix is a missing
+//                         `runtimeOnly: true` in engine/app/ecs/registerTraits.ts, not a revert.
 //   RESOURCE ADDED        normally a FIX: the committed manifest was missing an asset the
 //                         scene references, so nothing preloaded or scene-refcounted it.
 //   RESOURCE DROPPED      benign ONLY if the scene no longer references it. This script now
@@ -33,6 +42,19 @@ import { diffResources, sceneBodyText } from './lib/resourceDiff.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const key = (e) => e.traits?.EntityAttributes?.guid ?? 'name:' + e.name;
+
+/** Fields a re-save legitimately WRITES where the committed file had none, so a gain is the
+ *  migration working rather than a leak: `guid` is minted for a never-saved entity, `parentId` is
+ *  guid-ified from a live id, and `rootInstanceId` is `entityId`-flagged so serialize emits it
+ *  unconditionally.
+ *  ⚠️ Keyed `Trait.field` deliberately — see the GAINED branch for what a trait-wide exemption
+ *  swallowed. Any FUTURE `entityId`-flagged field is emitted unconditionally too and will report
+ *  GAINED on the first legacy sweep that meets it; add it here rather than widening a key. */
+const MINTED_FIELDS = new Set([
+  'EntityAttributes.guid',
+  'EntityAttributes.parentId',
+  'PrefabInstance.rootInstanceId',
+]);
 
 let totalScenes = 0, totalChanged = 0, problems = 0, regressions = 0;
 
@@ -66,6 +88,24 @@ for (const proj of process.argv.slice(2)) {
         if (!(t in (ea.traits || {}))) { notes.push(`NEW TRAIT ${ea.name}.${t}`); continue; }
         for (const [fl, v] of Object.entries(eb.traits[t])) {
           const ov = ea.traits[t][fl];
+          // A field the committed file did NOT spell out. The loader gave it the schema default,
+          // so the only way the re-save emits it is that it no longer HOLDS the default — i.e.
+          // something wrote a live value onto authored data. That is the #124 class, and this
+          // gate was blind to it until #406: the loop only ever compared fields present in BOTH
+          // versions, so a scroll-demo re-save that baked `UIScrollView.viewportWidth` 410 — the
+          // live measurement of the editor's UI viewport — into three scenes reported
+          // "0 semantic changes".
+          //   The exemptions are per FIELD, not per trait, and that distinction is the whole
+          // value of the check. Exempting all of `EntityAttributes` (the first version of this
+          // did) also silences `isActive`, which the Director's activation track writes live
+          // (`runtime/timeline/timelineSystem.ts` — `entity.set(EntityAttributes, { …, isActive })`).
+          // A scene omits `isActive` because it defaults to true, so a Director sweep baking a
+          // permanently-deactivated entity into the file lands as a GAIN — exactly the leak this
+          // is for — and the trait-wide exemption printed "0 semantic changes" over it.
+          if (ov === undefined && !MINTED_FIELDS.has(`${t}.${fl}`)) {
+            notes.push(`GAINED ${ea.name}.${t}.${fl} = ${JSON.stringify(v)} (absent before, so this is a LIVE value written onto authored data)`);
+            continue;
+          }
           if (ov !== undefined && JSON.stringify(ov) !== JSON.stringify(v)) {
             notes.push(`CHANGED ${ea.name}.${t}.${fl} ${JSON.stringify(ov)} -> ${JSON.stringify(v)}`);
           }

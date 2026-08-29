@@ -683,6 +683,15 @@ Animation Editor's property picker and the scene validator:
   snapshot or churns the file. Independent of `readOnly` (a field can be read-only in the
   Inspector yet still authored and persisted).
 
+  ⚠️ **`hidden: true` is NOT a substitute — it hides the widget, and the serializer does not
+  read it** (#406). `UIScrollView.viewportWidth/Height` + `contentWidth/Height` and
+  `UIEntries.firstX/visibleX/poolSize/epoch` were hidden-only, so a `games/scroll-demo`
+  re-save wrote the editor's own measured UI viewport (410x312) into three committed scenes as
+  authored data. The two flags answer different questions — *may a human edit this?* vs *may
+  this reach disk?* — and an engine-written field needs BOTH.
+  `engine/tests/assets/runtimeOnlyFieldsOffDisk.test.ts` now fails on any committed scene or
+  prefab carrying a `runtimeOnly` field, which catches the leak from the other side.
+
 `registerTrait()` is keyed by the koota `Trait` object but also indexed `byName`; on
 re-registration — a script hot-reload re-imports a trait module and produces a **new**
 `Trait` object with the **same** name — it evicts the prior object first, so

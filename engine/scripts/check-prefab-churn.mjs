@@ -17,6 +17,12 @@
 //   CHANGED <value>       an authored value moved. A stopped-mode system wrote to the prefab
 //                         world (#124's mutation half, which no Transient tag can reach) —
 //                         the editor console carries the save-time warning naming the field.
+//   GAINED <value>        a field the committed file did not spell out, which the writer now
+//                         emits — so it no longer holds its default. Same cause as CHANGED, and
+//                         invisible here until #406. Often a missing `runtimeOnly: true` in
+//                         engine/app/ecs/registerTraits.ts (`hidden` does NOT keep a field off
+//                         disk); the GLB-wrapper prefabs under models//rigs//ships/ are the
+//                         Animator/SkeletalAnimator carriers, so they are where to expect it.
 //   NESTED <field>        the nested-instance row's prefab ref / overrides / added / removed
 //                         changed. This is the one class the re-save can genuinely REGRESS:
 //                         a nested child that wasn't cached at serialize time FLATTENS
@@ -24,6 +30,19 @@
 //                         "not cached; flattening instead of referencing"). Treated as a
 //                         regression (exit 1) when a `prefab` ref is LOST.
 //
+/** Fields `serializePrefab` writes for every row regardless of the committed file, so a gain is
+ *  the writer working rather than a leak: it emits `EntityAttributes` inline as
+ *  `{ name, parentId, guid: '' }` with parentId remapped into the template's localId space
+ *  (editor/scene/prefab.ts). Keyed `Trait.field`, NOT trait-wide — the scene gate's trait-wide
+ *  version of this list silenced `EntityAttributes.isActive`, which the Director writes live.
+ *  The scene sibling exempts `PrefabInstance.rootInstanceId` too; a template carries no instance
+ *  row, so it is deliberately absent here rather than copied across. */
+const MINTED_FIELDS = new Set([
+  'EntityAttributes.name',
+  'EntityAttributes.parentId',
+  'EntityAttributes.guid',
+]);
+
 // Why keyed by localId and not by name: a prefab has no entity GUIDs — serializePrefab
 // clears them (the template is not an instance). localId is the template's own stable
 // address and the space its parentId/overrides/removed fields are written in, so it is the
@@ -105,13 +124,22 @@ for (const proj of process.argv.slice(2)) {
           if (JSON.stringify(av) !== JSON.stringify(bv)) notes.push(`CHANGED ${who}.${t} ${JSON.stringify(av)} -> ${JSON.stringify(bv)}`);
           continue;
         }
-        // Only fields PRESENT in the old file are compared: a field the new writer omits is
-        // compaction (the point of the sweep), and one it adds is a default made explicit.
+        // A field the new writer OMITS is compaction — the point of the sweep, not reported.
+        // A field it ADDS is not. That direction used to be waved off here as "a default made
+        // explicit", and #406 disproved it on the scene side: the writer compacts defaults, so a
+        // field it emits where the committed file had none can only be there because it no longer
+        // HOLDS its default — i.e. something wrote a live value onto authored data. The scene
+        // gate's silence on exactly this shape is how a re-save baked the editor's measured
+        // viewport into three committed scenes while reporting "0 semantic changes".
         for (const [fl, ov] of Object.entries(av)) {
           if (!(fl in bv)) continue;
           if (JSON.stringify(ov) !== JSON.stringify(bv[fl])) {
             notes.push(`CHANGED ${who}.${t}.${fl} ${JSON.stringify(ov)} -> ${JSON.stringify(bv[fl])}`);
           }
+        }
+        for (const fl of Object.keys(bv)) {
+          if (fl in av || MINTED_FIELDS.has(`${t}.${fl}`)) continue;
+          notes.push(`GAINED ${who}.${t}.${fl} = ${JSON.stringify(bv[fl])} (absent before, so this is a LIVE value written onto authored data)`);
         }
       }
 
