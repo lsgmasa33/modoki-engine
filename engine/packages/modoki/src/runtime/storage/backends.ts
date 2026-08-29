@@ -22,6 +22,16 @@ export interface PrefsBackend {
   set(fullKey: string, value: string): Promise<void>;
   /** Remove one entry. */
   remove(fullKey: string): Promise<void>;
+  /** Push whatever `set`/`remove` already handed the platform the rest of the way to disk,
+   *  if this backend has a lever for that (see `LocalStorageBackend.flush` for the only one
+   *  that currently does). Optional — most backends have no additional step beyond `set`.
+   *
+   *  ⚠️ MUST NOT reject. The write pipeline's `drain()` calls this once per drained batch,
+   *  guarded so a rejection can never poison `writeChain` (playerPrefs.ts) — but an
+   *  implementation should treat "couldn't force the extra commit" as best-effort and
+   *  swallow its own errors, the way `LocalStorageBackend.flush` does, rather than lean on
+   *  the caller's guard. */
+  flush?(): Promise<void>;
 }
 
 /** In-memory backend — the default. Deterministic, platform-free: the verification
@@ -48,13 +58,17 @@ export class InMemoryBackend implements PrefsBackend {
  *  wholesale (atomic — a reader never sees a torn string). `set` may throw
  *  `QuotaExceededError`; the write pipeline in playerPrefs.ts catches it and re-queues.
  *
- *  Caveat (durability), the exact counterpart of the Android one below: `setItem` is
- *  SYNCHRONOUS into the browser's in-memory area, but the on-disk store is written back
- *  asynchronously — under Electron, Chromium commits the localStorage LevelDB on a CLEAN
- *  SHUTDOWN. So an awaited `set()`/`flush()` guarantees atomicity but NOT persistence: a
- *  SIGKILL (crash, force-quit, `stop-editor.sh`'s own force path) loses every write since the
- *  last commit, and waiting longer does not help. Measured three ways in
- *  docs/player-prefs.md § Gotchas. */
+ *  Caveat (durability) on a PLAIN browser tab, the exact counterpart of the Android one
+ *  below: `setItem` is SYNCHRONOUS into the browser's in-memory area, but the on-disk store
+ *  is written back asynchronously and there is no way from a renderer to force that — so an
+ *  awaited `set()`/`flush()` guarantees atomicity but NOT persistence there.
+ *
+ *  Under ELECTRON specifically this backend also calls `flush()` (below): Electron's main
+ *  process exposes `session.flushStorageData()`, a real forced-commit hook a plain browser
+ *  tab has no equivalent of (docs/player-prefs.md § Gotchas). That shrinks the durability
+ *  window from "everything since the last clean shutdown" down to "the write(s) currently
+ *  in flight" — still not an fsync guarantee (the call itself is fire-and-forget void), but
+ *  the best lever this platform has. Measured three ways in docs/player-prefs.md § Gotchas. */
 export class LocalStorageBackend implements PrefsBackend {
   async getAll(prefix: string): Promise<Record<string, string>> {
     const out: Record<string, string> = {};
@@ -74,6 +88,29 @@ export class LocalStorageBackend implements PrefsBackend {
 
   async remove(fullKey: string): Promise<void> {
     localStorage.removeItem(fullKey);
+  }
+
+  /** Electron only — asks main to force the localStorage LevelDB commit right now, rather
+   *  than waiting for a clean shutdown. A no-op (never rejects) outside Electron, or if the
+   *  bridge/channel isn't there for any reason — this is a durability improvement, not a
+   *  contract the write pipeline can depend on succeeding. */
+  async flush(): Promise<void> {
+    if (typeof window === 'undefined') return;
+    const invoke = (window as unknown as { __modokiElectron?: { invoke?: (c: string, p?: unknown) => Promise<unknown> } })
+      .__modokiElectron?.invoke;
+    if (!invoke) return;
+    try {
+      const result = await invoke('modoki:flush-storage-data');
+      // Today this can only be {ok:false} if the caller isn't the main frame (main.ts's
+      // fromMainFrame guard) — unreachable while the game preview always runs in the top
+      // frame, but worth a signal if that ever stops being true rather than looking identical
+      // to success.
+      if ((result as { ok?: boolean } | undefined)?.ok === false) {
+        console.warn('[PlayerPrefs] modoki:flush-storage-data was refused', result);
+      }
+    } catch {
+      /* best-effort — see class doc comment */
+    }
   }
 }
 

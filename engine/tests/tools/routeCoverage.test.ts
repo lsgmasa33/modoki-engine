@@ -91,6 +91,8 @@ const NO_TOOL_BY_DESIGN: Record<string, string> = {
   '/api/read-file': 'Claude reads files directly; a tool would be a strictly worse duplicate bounded by the asset roots',
   '/api/write-file': 'same — Claude writes files directly. The asset-DEF writes that need editor round-tripping have their own tools',
   '/api/exists': 'an fs.existsSync behind HTTP; Claude can stat a path directly',
+  '/api/source-image': "serves the BYTES of a project image outside the asset roots, so the Project Settings preview can show an <img>. Claude reads an image file directly (and can see it); an HTTP wrapper bounded by the project root is strictly less",
+  '/api/adopt-file': "the Project Settings drop target — copy a dropped file into the project unless it is already there, and hand back the project-relative path. Every half of that is something Claude does natively (stat, copy, relativise), and the route exists only because the RENDERER cannot",
 
   // ── asset-panel plumbing ──
   '/api/reimport-types': 'the asset types the server can re-import, for the Assets-panel dropdown; modoki_reimport_asset just takes a path',

@@ -8,6 +8,13 @@
 
 import { test, expect, type Page } from '@playwright/test';
 import { gotoEmptyEditor } from './helpers';
+import { pickHostProject } from './hostProject';
+
+// These tests browse whatever project the editor opens by default — never a specific
+// game's content — but that means they need AT LEAST ONE project to exist. A release
+// snapshot of the public OSS repo publishes with NO projects (games/ and demos/ both
+// absent). See hostProject.ts for the pick and why it can't throw.
+test.skip(!pickHostProject(), 'editor-assets: this snapshot ships no project for the Assets panel to list');
 
 /** Category groups are collapsed by default (empty `expanded` set). Seed the
  *  type-keyed expanded set + section header + folder root so asset rows are actually

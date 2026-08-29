@@ -22,6 +22,7 @@
 
 import { assetUrl } from './assetUrl';
 import { markUIDirty } from '../core/uiDirty';
+import { fireDirtyListeners } from '../core/renderDirty';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import type { TextureImportSettings, TextureType } from './textureSettings';
 import type { AudioImportSettings, AudioCacheInfo } from './audioSettings';
@@ -331,6 +332,16 @@ export function registerAsset(
   }
   // Fire AFTER the entry is committed so a listener re-acquiring reads the new block.
   if (fontChanged) for (const fn of fontInvalidationListeners) { try { fn(guid); } catch { /* ignore */ } }
+  // Mark a frame dirty on a MEANINGFUL registration (close-out review of QA-ASSET-0005's fix):
+  // `unregisterAsset` fires when a guid disappears, but nothing fired when one REAPPEARS or
+  // starts resolving somewhere new — so an idle-gated renderer holding a stale "unresolved" ref
+  // (from a delete) never re-checked it after an undo/restore brought the guid back, and stayed
+  // showing the broken fallback until an unrelated dirty event. Same "not on a no-op re-register"
+  // discipline as `bumpTextureEpoch` above — the wholesale re-broadcast on every scan must not
+  // fire this on every asset, or a scan would look no different from something actually changing.
+  if (!prior || prior.path !== path || typeChanged || bumpTextureEpoch || fontChanged) {
+    fireDirtyListeners();
+  }
 }
 
 /** Would this re-registration change what a URL for this texture resolves to?
@@ -488,6 +499,15 @@ export function unregisterAsset(guid: string): void {
   if (entry.type === 'atlas') removeAtlasFromIndex(guid);
   guidToEntry.delete(guid);
   if (pathToGuid.get(entry.path) === guid) pathToGuid.delete(entry.path);
+  // Mark the render loop dirty (QA-ASSET-0005, third occurrence). The 3D idle render gate
+  // (Scene3D.tsx "Idle render gate (T1)") skips syncSceneRenderables3D entirely once
+  // `dirtyFrames` decays to 0, and a manifest prune is invisible to every source it listens
+  // to — not an ECS trait write, not a structure change, not a play-state edge. So a bound,
+  // UNCHANGED material ref going stale (an asset deleted out from under it) stopped
+  // re-running `resolveMaterial` → `resolveRefWarnOnce` at all once the surface went idle: the
+  // warning code was intact and had already been fixed twice, but nothing was calling it. This
+  // is the missing dirty source, not a third copy of the same fix.
+  fireDirtyListeners();
 }
 
 /** Resolve a guid to its current path, or return undefined if unknown. */

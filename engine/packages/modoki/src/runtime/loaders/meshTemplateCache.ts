@@ -13,6 +13,12 @@ import { isGuid, isExternalUrl, resolveGuidToPath, resolveRef, registerAsset, ge
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
+// The `lineColor` / `nprColorPreserve` prototype accessors. Imported for its ORDERING guarantee,
+// not for NPR: this module writes both properties and must not do so before they are accessors.
+// ⚠️ From `materialExtras`, NOT from `npr/NPRPostProcess` — that module imports `three/tsl`, and
+// reaching it from here drags the whole Three node pipeline into the 2D-only boot path
+// (`render3dBoundary.test.ts` fails, #214). NPRPostProcess re-exports this for its own callers.
+import { ensureLineColorOnMaterials } from '../rendering/materialExtras';
 import { takeParsedGltf, clearParsedGltfHandoff } from './parsedGltfHandoff';
 import { notifyModelTemplatesLoaded } from './modelLoadNotify';
 import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
@@ -1159,6 +1165,16 @@ function fetchMaterial(matPath: string): Promise<void> {
         return;
       }
       const mat = await builder.build(data);
+      // ⚠️ Install the prototype accessors BEFORE writing either one (#351 review). They are
+      // patched onto `THREE.Material.prototype` lazily, and the two callers that do it are the
+      // `PostFXStack` constructor and `nprFragmentOutput` — i.e. the first NPR render and the
+      // custom/file-shader path. Neither is ordered before material LOAD, and the `pbr`/`unlit`
+      // builders never call it. Writing `mat.lineColor` in that window creates a plain own DATA
+      // property instead of going through the setter, so the value never reaches the `userData`
+      // namespace and is lost by the next `Material.copy()` — the exact #351 defect, unfixed, on
+      // materials that DO author these today (`games/space-console`'s ship-halo + matte).
+      // Idempotent and one flag-check when already installed, so this is free.
+      ensureLineColorOnMaterials();
       // Per-material outline color (NPR). Only assign when explicitly set;
       // otherwise the `THREE.Material.prototype.lineColor` default fires.
       if (data.lineColor !== undefined) {

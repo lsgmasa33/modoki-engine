@@ -2,12 +2,13 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld } from 'koota';
-import { getCurrentWorld, loadSceneFile, SCENE_FORMAT_VERSION, spawnEntity } from '@modoki/engine/runtime';
+import { getCurrentWorld, loadSceneFile, SCENE_FORMAT_VERSION, spawnEntity, setTimeScale } from '@modoki/engine/runtime';
 import { Transform, Renderable3D, Renderable3DPrimitive, EntityAttributes, Time, Paused, Transient, PrefabInstance } from '@modoki/engine/runtime';
-import { RenderableUI, UIElement, UIBinding, UIAction, type UIActionBinding } from '@modoki/engine/runtime';
+import { RenderableUI, UIElement, UIBinding, UIAction, UIScrollView, UIEntries, type UIActionBinding } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { TestPhase, registerTestGameTraits } from './_fixtures/testGame';
 import { serializeScene, isTraitDefault } from '@modoki/engine/editor';
+import { getAllTraits } from '@modoki/engine/runtime';
 
 // Ensure traits are registered (idempotent — registerTrait overwrites)
 registerAllTraits();
@@ -396,5 +397,164 @@ describe('plain-entity full round-trip (serialize → loadSceneFile)', () => {
     expect(rChild.get(EntityAttributes).parentId).toBe(rParent.id());
     // …and roots stay unparented.
     expect(rParent.get(EntityAttributes).parentId).toBe(0);
+  });
+});
+
+/** `runtimeOnly` is the flag that keeps a live value off disk, and it is the ONLY one — the
+ *  serializer does not read `hidden`, which only hides an Inspector widget.
+ *
+ *  #406: `UIScrollView`'s measured viewport/content size and `UIEntries`' pool window were
+ *  `hidden` and nothing else, so a `games/scroll-demo` re-save wrote the editor's 410x312 device
+ *  preview into three committed scenes as authored data — with `check-scene-churn.mjs` reporting
+ *  "0 semantic changes" (it compared only fields present in both files, so a field APPEARING was
+ *  invisible). `games/court` authors two scroll views and ships.
+ *
+ *  The assertions pair each dropped field with a KEPT one on the same trait, because "the trait
+ *  serialized nothing" would satisfy a drop-only check just as well as the correct behaviour. */
+describe('serializeScene — runtimeOnly fields never reach the file', () => {
+  it('drops engine-written scroll state while keeping the authored fields beside it', async () => {
+    const world = getCurrentWorld();
+    spawnEntity(world,
+      RenderableUI(),
+      EntityAttributes({ name: 'ro-scroll' }),
+      UIElement({ overflow: 'scroll' }),
+      // Authored (axis) + engine-written (the rest), on one trait, in one save.
+      UIScrollView({ axis: 'x', scrollX: 88, viewportWidth: 410, viewportHeight: 312, contentWidth: 410 }),
+      // countX is `hidden` but genuinely AUTHORED — it is what a scene says its data extent is —
+      // so it must survive while poolSize/visibleX beside it do not.
+      UIEntries({ source: 'test.rows', countX: 9, poolSize: 4, visibleX: 2, firstX: 3, epoch: 7 }),
+    );
+
+    const scene = await serializeScene();
+    const e = scene.entities.find((x) => x.name === 'ro-scroll');
+    expect(e, 'the entity serialized at all').toBeDefined();
+
+    const sv = e!.traits['UIScrollView'] as Record<string, unknown>;
+    expect(sv.axis, 'authored axis survives').toBe('x');
+    for (const f of ['scrollX', 'viewportWidth', 'viewportHeight', 'contentWidth']) {
+      expect(sv, `UIScrollView.${f} is engine-written and must not reach disk`).not.toHaveProperty(f);
+    }
+
+    const ue = e!.traits['UIEntries'] as Record<string, unknown>;
+    expect(ue.source, 'authored source survives').toBe('test.rows');
+    expect(ue.countX, 'countX is hidden but authored — the scene\'s own data extent').toBe(9);
+    for (const f of ['poolSize', 'visibleX', 'firstX', 'epoch']) {
+      expect(ue, `UIEntries.${f} is engine-written and must not reach disk`).not.toHaveProperty(f);
+    }
+  });
+
+  /** ⚠️ The test below asks the REGISTRY which fields to check, so it proves the serializer
+   *  HONOURS the flag — it cannot prove the right fields carry it. Un-flag `visibleY` and it
+   *  simply stops being asked about (measured: the mutation left all tests green). So the flagged
+   *  SET is pinned here, exactly and in both directions: dropping a flag fails, and adding one
+   *  fails until a human confirms the field really is engine-written and not authored data being
+   *  deleted (which is the mistake `countX`/`countY` are one edit away from — see registerTraits).
+   *  It goes red only when someone edits these three traits, which is exactly when to look. */
+  it('flags exactly the engine-written fields on the scroll traits — no more, no fewer', () => {
+    const flaggedSet = (traitName: string): string[] => {
+      const meta = getAllTraits().find((m) => m.name === traitName);
+      const fields = (meta!.fields ?? {}) as Record<string, { runtimeOnly?: boolean } | undefined>;
+      return Object.keys(fields).filter((f) => fields[f]?.runtimeOnly).sort();
+    };
+    expect(flaggedSet('UIScrollView')).toEqual(
+      ['contentHeight', 'contentWidth', 'scrollToBehavior', 'scrollToX', 'scrollToY',
+        'scrollX', 'scrollY', 'viewportHeight', 'viewportWidth'].sort(),
+    );
+    expect(flaggedSet('UIEntries')).toEqual(
+      ['epoch', 'firstX', 'firstY', 'poolSize', 'scrollToEntryX', 'scrollToEntryY',
+        'visibleX', 'visibleY'].sort(),
+    );
+    // UIEntry is stamped on pooled entries only; every field of it is engine-written.
+    expect(flaggedSet('UIEntry')).toEqual(
+      ['index', 'kind', 'live', 'slot', 'viewGuid', 'x', 'y'].sort(),
+    );
+    // countX/countY are hidden AND runtime-refreshed by court, yet deliberately persisted — the
+    // scene is where the value comes from at load. Flagging them would delete authored data.
+    expect(flaggedSet('UIEntries')).not.toContain('countX');
+    expect(flaggedSet('UIEntries')).not.toContain('countY');
+    // `scrollBehavior` is the AUTHORED motion default and must stay off the flagged list, however
+    // much it looks like a sibling of the `scrollToBehavior` above it (#409). Flagging it would
+    // delete the author's choice on the next save — the reason the per-request half is a separate
+    // field at all.
+    expect(flaggedSet('UIScrollView')).not.toContain('scrollBehavior');
+  });
+
+  /** The test above pins WHICH fields are flagged. This one pins that the flag WORKS, asking the
+   *  registry rather than a hand list so a newly flagged field is covered the day it is added. */
+  it('drops EVERY field the registry flags on the scroll traits, not just the named ones', async () => {
+    const flagged = (traitName: string): string[] => {
+      const meta = getAllTraits().find((m) => m.name === traitName);
+      expect(meta, `${traitName} is registered`).toBeDefined();
+      const fields = (meta!.fields ?? {}) as Record<string, { runtimeOnly?: boolean } | undefined>;
+      return Object.keys(fields).filter((f) => fields[f]?.runtimeOnly);
+    };
+    // Set every flagged field to a NON-default value first — a field left at its default would be
+    // compacted out anyway, so the assertion could not tell the two mechanisms apart.
+    const svFields = flagged('UIScrollView');
+    const ueFields = flagged('UIEntries');
+    expect(svFields.length, 'UIScrollView has flagged fields to check').toBeGreaterThan(0);
+    expect(ueFields.length, 'UIEntries has flagged fields to check').toBeGreaterThan(0);
+    const nonDefault = (t: Record<string, unknown>, keys: string[]) =>
+      Object.fromEntries(keys.map((k) => [k, typeof t[k] === 'string' ? 'x' : (t[k] as number) + 17]));
+
+    const world = getCurrentWorld();
+    spawnEntity(world,
+      RenderableUI(),
+      EntityAttributes({ name: 'ro-all' }),
+      UIScrollView({ axis: 'both', ...nonDefault(UIScrollView.schema as Record<string, unknown>, svFields) }),
+      UIEntries({ source: 'test.all', ...nonDefault(UIEntries.schema as Record<string, unknown>, ueFields) }),
+    );
+
+    const scene = await serializeScene();
+    const e = scene.entities.find((x) => x.name === 'ro-all');
+    expect(e, 'the entity serialized at all').toBeDefined();
+    const sv = e!.traits['UIScrollView'] as Record<string, unknown>;
+    const ue = e!.traits['UIEntries'] as Record<string, unknown>;
+    // The authored neighbours prove the traits serialized at all — otherwise "no flagged field
+    // present" would be satisfied by the traits being dropped wholesale.
+    expect(sv.axis).toBe('both');
+    expect(ue.source).toBe('test.all');
+    expect(svFields.filter((f) => f in sv), 'UIScrollView runtimeOnly fields on disk').toEqual([]);
+    expect(ueFields.filter((f) => f in ue), 'UIEntries runtimeOnly fields on disk').toEqual([]);
+  });
+
+  it('drops Time.elapsed, the original case the flag exists for', async () => {
+    const scene = await serializeScene();
+    const t = scene.entities.map((e) => e.traits['Time']).find(Boolean) as Record<string, unknown> | undefined;
+    expect(t, 'a Time entity serialized (beforeEach spawns one)').toBeDefined();
+    expect(t, 'Time.elapsed is recomputed every frame').not.toHaveProperty('elapsed');
+  });
+
+  // #410: `timeScale` used to be the one authored knob on Time and was left unflagged, so a
+  // debug inspection (`setTimeScale`, exactly what the `set-timescale`/`sim-step` agent ops and
+  // the device Time tab call) followed by any save could bake e.g. `"timeScale": 0` into a
+  // shipping scene. It is now `runtimeOnly` like the rest of Time. The beforeEach Time entity has
+  // no Transient tag, so this is the AUTHORED case — the strongest one the flag has to hold up.
+  it('drops a debug-set timeScale — the value setTimeScale leaves behind never reaches the file', async () => {
+    setTimeScale(getCurrentWorld(), 0); // exactly what modoki_step / sim-step leaves the world at
+    const scene = await serializeScene();
+    const t = scene.entities.map((e) => e.traits['Time']).find(Boolean) as Record<string, unknown> | undefined;
+    expect(t, 'a Time entity serialized (beforeEach spawns one)').toBeDefined();
+    expect(Object.keys(t!)).not.toContain('timeScale');
+  });
+
+  it('drops a debug-set timeScale at a non-zero value too (0 is falsy — must not pass by accident)', async () => {
+    setTimeScale(getCurrentWorld(), 0.3);
+    const scene = await serializeScene();
+    const t = scene.entities.map((e) => e.traits['Time']).find(Boolean) as Record<string, unknown> | undefined;
+    expect(t, 'a Time entity serialized (beforeEach spawns one)').toBeDefined();
+    expect(Object.keys(t!)).not.toContain('timeScale');
+  });
+});
+
+// #410 anti-drift guard: `timeResourceProvenance.test.ts` mocks the trait registry with its OWN
+// copy of Time's `fields`, so it cannot see whether the REAL registration actually flags
+// `timeScale` runtimeOnly — it could silently keep modelling behaviour the engine no longer has.
+// This pins the real registration directly.
+describe('Time.timeScale registration (#410)', () => {
+  it('is registered runtimeOnly in the real trait registry', () => {
+    const meta = getAllTraits().find((t) => t.name === 'Time');
+    expect(meta, 'Time is registered').toBeDefined();
+    expect(meta!.fields?.timeScale?.runtimeOnly).toBe(true);
   });
 });

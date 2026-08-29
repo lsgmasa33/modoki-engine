@@ -82,7 +82,63 @@ export const UIElement = trait({
    * (the render is correct), and deliberately out of scope; it is the honest cost of the feature.
    */
   rotation: 0,
+  /**
+   * Uniform scale about the ANCHOR PIVOT. 1 = natural size.
+   *
+   * Scales the RENDER, not the layout: the element's box keeps its laid-out size, so siblings do
+   * not reflow as it grows and nothing shifts underneath a scaling card. That is the whole reason
+   * this exists rather than keying `width`/`height` — those DO reflow, and they leave the text
+   * behind at its original size, so a "pop" authored that way reads as a box stretching around
+   * stationary words.
+   *
+   * Why it exists (#340): the level-win dialog snapped on screen with no transition, and the fix
+   * had to be an authored keyframe clip rather than a tween in code. `UIElement.opacity` was
+   * already keyable, but a fade alone reads as soft — a dialog wants to arrive. There was no
+   * keyable property in the whole UI layer that could express that.
+   *
+   * ⚠️ **Scales about the anchor pivot, not the box centre** — the same rule {@link rotation}
+   * follows, for the same reason: the pivot is the point that sits ON the anchor point, so it is
+   * the one point that must not move. Growing about the box centre would slide a top-left-anchored
+   * element off its own anchor as it scaled. Unanchored or STRETCHED-axis elements scale about
+   * their centre, there being no pivot to honour.
+   *
+   * ⚠️ **A scale ≠ 1 creates a STACKING CONTEXT**, exactly as a non-zero rotation does, and traps
+   * the `zIndex` of everything inside it. Scale the CARD, not the layer that holds it. An element
+   * left at 1 emits no transform at all and is unaffected.
+   *
+   * ⚠️ Like `rotation`, the editor's selection overlay stays at the UNSCALED rect —
+   * `resolveAnchorRect` measures layout, and this deliberately does not change layout. The render
+   * is correct; the gizmo box just does not follow.
+   */
+  scale: 1,
   overflow: 'visible' as 'visible' | 'hidden' | 'scroll',
+  /**
+   * How this element's scrollbar is drawn when `overflow: 'scroll'` actually overflows.
+   *
+   * - `'auto'`   — the platform's own scrollbar. The default, so nothing existing changes.
+   * - `'tinted'` — `scrollbarThumbColor` / `scrollbarTrackColor` are applied.
+   * - `'hidden'` — no scrollbar at all; the element still scrolls by drag/wheel.
+   *
+   * ⚠️ **This is the ONLY way to theme a scrollbar here, because these are INLINE styles.**
+   * `::-webkit-scrollbar` is a pseudo-element and cannot be expressed inline (`scrollViewDom.ts`
+   * says the same thing where it hides a scroll view's bar), so the standards properties
+   * `scrollbar-color` / `scrollbar-width` are the whole available surface. That buys the thumb and
+   * track colour and a coarse width — not a custom shape, and not a corner or arrow style.
+   *
+   * ⚠️ **`UIScrollView.scrollbar` overlaps this and takes precedence** — both emit
+   * `scrollbar-width: none` for their hidden case, and the scroll view's style is merged after
+   * this one. On an element with a `UIScrollView`, let that trait decide whether a bar exists and
+   * use these fields only to tint it.
+   *
+   * ⚠️ **`'hidden'` removes an AFFORDANCE, not just a decoration.** With no bar there is nothing on
+   * screen saying content continues below the fold. Use it only where something else already says
+   * so.
+   */
+  scrollbarStyle: 'auto' as 'auto' | 'tinted' | 'hidden',
+  /** Thumb colour for `scrollbarStyle: 'tinted'` (0xRRGGBB). Ignored otherwise. */
+  scrollbarThumbColor: 0x888888 as number,
+  /** Track colour for `scrollbarStyle: 'tinted'` (0xRRGGBB). Ignored otherwise. */
+  scrollbarTrackColor: 0xdddddd as number,
   isVisible: true,
   /**
    * Never take the pointer: taps fall through to whatever is BEHIND this element, while its

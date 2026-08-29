@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { backendFetch } from '../backend/editorBackend';
+import { fileToBase64 } from './fileBytes';
 import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
 import {
@@ -133,20 +134,6 @@ async function readMeta(assetPath: string): Promise<ModelMeta> {
     if (res.ok) return await res.json();
   } catch { /* ignore */ }
   return {};
-}
-
-// Read a browser File as base64 (no data: prefix) for POST /api/write-file.
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string; // "data:<mime>;base64,XXXX"
-      const comma = result.indexOf(',');
-      resolve(comma >= 0 ? result.slice(comma + 1) : result);
-    };
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
 }
 
 // The asset tree root ("/") and intermediate nodes (e.g. "/games") are virtual —
@@ -806,7 +793,7 @@ export default function Assets() {
 
   // Context menu
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; asset: AssetEntry } | null>(null);
-  const [folderCtx, setFolderCtx] = useState<{ x: number; y: number; path: string; name: string } | null>(null);
+  const [folderCtx, setFolderCtx] = useState<{ x: number; y: number; path: string; name: string; createOnly?: boolean } | null>(null);
   // Inline rename — path of the asset whose filename is currently editable
   const [renamingPath, setRenamingPath] = useState<string | null>(null);
 
@@ -1617,8 +1604,31 @@ export default function Assets() {
           />
         )}
         <div style={toolbarDividerStyle} />
-        {/* — Create / add: New Folder, Import. (Create Animation/Particle/Atlas
-            live in the folder + Assets-header right-click menu, not the toolbar.) — */}
+        {/* — Create / add: the full Create menu (New Folder, Create Material/Particle/…),
+            New Folder, Import. QA-ASSET-0030: right-click-empty-space is the only OTHER path
+            to this menu, and a large project's asset tree fills the panel — no empty space
+            survives to right-click, and scrolling to the bottom doesn't create any (the last
+            row sits directly above the status bar). This button is a position-independent
+            path to the SAME menu (`setFolderCtx`), so it works regardless of tree size.
+            `createOnly: true` (close-out review): the row-menu builder below suppresses
+            Rename/Delete/Re-import-all/Reveal for `assetsRoot.path`, matching the SAME check
+            the existing Assets-header right-click already relies on — but THIS button targets
+            `defaultTargetFolder()` (wherever the user is currently working), which is usually a
+            REAL folder the suppression does not cover. Without the flag, "+" on a selected
+            texture opened Delete on that texture's folder with no confirmation dialog. */}
+        <button
+          onClick={(e) => {
+            const r = e.currentTarget.getBoundingClientRect();
+            setFolderCtx({ x: r.left, y: r.bottom, path: defaultTargetFolder(), name: 'Assets', createOnly: true });
+          }}
+          title="Create…"
+          data-ui-id="assets.toolbar.create" data-ui-kind="button" data-ui-label="create"
+          style={toolbarBtnStyle}
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" style={{ display: 'block' }}>
+            <path d="M7 1h2v6h6v2H9v6H7V9H1V7h6V1z"/>
+          </svg>
+        </button>
         <button
           onClick={() => createFolder(defaultTargetFolder())}
           title="New Folder (⇧⌘N)"
@@ -1830,14 +1840,18 @@ export default function Assets() {
             // entries show up without a remount — see creatableAssets.ts.
             ...getCreatableAssets().map((d) => ({ label: d.label, onClick: () => runCreate(d, folderCtx.path) })),
             { label: 'Import Files…', onClick: () => { setCurrentFolder(folderCtx.path); importTargetRef.current = folderCtx.path; fileInputRef.current?.click(); } },
-            ...(folderCtx.path !== '/' && folderCtx.path !== assetsRoot.path ? [{ label: 'Rename', onClick: () => setRenamingFolderPath(folderCtx.path) }] : []),
-            ...(folderCtx.path !== '/' && folderCtx.path !== assetsRoot.path ? [{ label: 'Delete', onClick: () => handleDeleteFolder(folderCtx.path, folderCtx.name) }] : []),
-            ...(clipboard ? [{ label: `Paste${clipboard.paths.length > 1 ? ` (${clipboard.paths.length})` : ''}`, onClick: () => pasteClipboard(folderCtx.path) }] : []),
-            { label: 'Re-import all (recursive)', onClick: () => reimport(folderCtx.path, true) },
-            { label: 'Reveal in Finder', onClick: () => backendFetch('/api/reveal-in-finder', {
+            // `createOnly` (the toolbar Create button, close-out review): this menu's `path` is
+            // wherever the user is currently working, not necessarily the Assets root the
+            // '/' / assetsRoot.path check below assumes — so a folder-scoped action here would
+            // reach a REAL folder without ever having been an intentional right-click on it.
+            ...(!folderCtx.createOnly && folderCtx.path !== '/' && folderCtx.path !== assetsRoot.path ? [{ label: 'Rename', onClick: () => setRenamingFolderPath(folderCtx.path) }] : []),
+            ...(!folderCtx.createOnly && folderCtx.path !== '/' && folderCtx.path !== assetsRoot.path ? [{ label: 'Delete', onClick: () => handleDeleteFolder(folderCtx.path, folderCtx.name) }] : []),
+            ...(!folderCtx.createOnly && clipboard ? [{ label: `Paste${clipboard.paths.length > 1 ? ` (${clipboard.paths.length})` : ''}`, onClick: () => pasteClipboard(folderCtx.path) }] : []),
+            ...(!folderCtx.createOnly ? [{ label: 'Re-import all (recursive)', onClick: () => reimport(folderCtx.path, true) }] : []),
+            ...(!folderCtx.createOnly ? [{ label: 'Reveal in Finder', onClick: () => backendFetch('/api/reveal-in-finder', {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ path: folderCtx.path }),
-            }) },
+            }) }] : []),
           ]}
           x={folderCtx.x}
           y={folderCtx.y}

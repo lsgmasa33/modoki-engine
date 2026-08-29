@@ -6,10 +6,12 @@
 // does NOT force a render, so it exposes render-on-demand / stale-frame bugs).
 //
 // Chromium requires `--remote-debugging-port` at STARTUP (before app.ready) and binds
-// it to 127.0.0.1 only. Remote debugging = full renderer control, so in the PACKAGED
-// app it is OFF by default and opt-in: the user enables it (persisted pref), which
-// relaunches with the switch. In DEV the launcher (launch-editor.sh) passes the CLI
-// arg directly, so main only REPORTS the port there — it never double-opens it.
+// it to 127.0.0.1 only. This editor is agent-first, so in the PACKAGED app CDP is ON BY
+// DEFAULT and opt-OUT: `readCdpEnabled` returns true unless the user explicitly disabled
+// it in the AI panel, and toggling relaunches with (or without) the switch. In DEV the
+// launcher (launch-editor.sh) passes the CLI arg directly, so main only REPORTS the port
+// there — it never double-opens it, and since #356 it reports what Chromium ACTUALLY got
+// rather than what our env was told.
 //
 // These helpers are pure / fs-only (no electron import) so main.ts wires them and the
 // unit tests can exercise the port + switch decision without an Electron runtime.
@@ -35,7 +37,15 @@ export const CDP_PORT_PREF_FILE = 'cdp-port.json';
  *  can't be VALID enough to force-open CDP yet INVALID enough to fall back to 9222 —
  *  the split that let `MODOKI_CDP_PORT=0` (a user meaning "off") silently open 9222. */
 export function isValidCdpPort(raw: unknown): boolean {
-  const n = raw != null && raw !== '' ? Number(raw) : NaN;
+  // Plain DECIMAL DIGITS only — `Number()` alone also accepts `'1e3'` (→1000), `'0x2400'` (→9216)
+  // and `' 9223'`, none of which Chromium's own `base::StringToInt` accepts: it parses them as 0
+  // and takes an ephemeral port instead, which then silently diverges from whatever we reported.
+  // `launch-editor.sh` states it "mirrors cdp.ts isValidCdpPort" with a `^[0-9]+$` grep; this is
+  // what makes that claim true rather than approximately true. Matters more since #356, because
+  // this validator now also judges an OBSERVED switch, not just our own env.
+  if (typeof raw === 'number') return Number.isInteger(raw) && raw > 0 && raw < 65536;
+  if (typeof raw !== 'string' || !/^[0-9]+$/.test(raw)) return false;
+  const n = Number(raw);
   return Number.isInteger(n) && n > 0 && n < 65536;
 }
 
@@ -253,30 +263,57 @@ export interface CdpConfig {
  *    MODOKI_CDP_PORT wins; otherwise the STICKY ladder picks the port from the persisted
  *    memo (§12.2 item 5) so a 9222 collision self-heals across relaunches.
  *  - Dev: the launcher passes --remote-debugging-port directly (Chromium reads it), so
- *    main NEVER opens the switch — it only reports the port as enabled when the launcher
- *    set MODOKI_CDP_PORT. (Dev never uses the sticky ladder — the launcher owns the port.) */
+ *    main NEVER opens the switch — it only REPORTS what Chromium was actually given.
+ *    (Dev never uses the sticky ladder — the launcher owns the port.)
+ *
+ *  ⚠️ `switchPort` — the `--remote-debugging-port` Chromium ACTUALLY received — outranks
+ *  the environment in both branches, because it is an observation and MODOKI_CDP_PORT is
+ *  only a request. #356: `launch-editor.sh` passes the port as an argv flag and never
+ *  EXPORTS the variable, so whenever the launcher DERIVES the port (a bare
+ *  `launch-editor.sh`, i.e. the common case) Chromium got CDP and main reported
+ *  `cdpEnabled: false` for a live endpoint. Reading the env alone cannot be fixed by
+ *  exporting the variable either: that would only make main report the REQUEST accurately,
+ *  and a variable set with no endpoint behind it lies in the other direction. */
 export function resolveCdpConfig(opts: {
   isPackaged: boolean;
   prefEnabled: boolean;
   env?: NodeJS.ProcessEnv;
   /** The persisted last-tried CDP port + ours-verdict (packaged only). */
   memo?: CdpPortMemo | null;
+  /** The `--remote-debugging-port` value Chromium was actually launched with, as observed
+   *  from its own command line — `''`/absent when there is none. Ground truth: if this is a
+   *  valid port, an endpoint is being opened on it whatever the env and prefs say. */
+  switchPort?: string | number | null;
 }): CdpConfig {
   const env = opts.env ?? process.env;
   // Force-on ONLY for a VALID port — so a garbage/`0` MODOKI_CDP_PORT fails CLOSED
   // (no port) rather than force-opening the default 9222. Same validator as the port.
   const envForced = isValidCdpPort(env.MODOKI_CDP_PORT);
-  // An explicit MODOKI_CDP_PORT always wins (dev launcher pins it; CI/power users). Else
-  // the packaged app uses the sticky ladder; dev's reported port is the plain default.
-  const port = envForced
-    ? resolveCdpPort(env)
-    : opts.isPackaged
-      ? resolveStickyCdpPort({ memo: opts.memo ?? null })
-      : DEFAULT_CDP_PORT;
+  // Observed beats requested. Same validator again, so a malformed switch fails CLOSED
+  // to the env/pref path rather than reporting a port nothing can bind.
+  const observed = isValidCdpPort(opts.switchPort);
+  // ⚠️ PRESENCE, not validity — and the two must NOT be collapsed. `observed` decides what we
+  // REPORT (an unparseable switch names no port we can honestly report). This decides whether we
+  // APPEND, and a switch that is present-but-junk (`--remote-debugging-port=abc`) still occupies
+  // the flag: Chromium parses junk as 0 → an ephemeral port (`launch-editor.sh` § CDP records the
+  // same, and a duplicate/mismatched flag WAS the bug in `assert-app-csp.mjs`). Keying the append
+  // off `observed` would append a SECOND value there, and we have not measured which one Chromium
+  // honours on a duplicate — so this stays safe under both readings by never creating one.
+  const switchPresent = opts.switchPort != null && String(opts.switchPort) !== '';
+  // The observed switch wins; then an explicit MODOKI_CDP_PORT (dev launcher pins it;
+  // CI/power users); else the packaged app uses the sticky ladder and dev the plain default.
+  const port = observed
+    ? Number(opts.switchPort)
+    : envForced
+      ? resolveCdpPort(env)
+      : opts.isPackaged
+        ? resolveStickyCdpPort({ memo: opts.memo ?? null })
+        : DEFAULT_CDP_PORT;
   if (opts.isPackaged) {
-    const enabled = opts.prefEnabled || envForced;
-    return { enabled, port, openSwitch: enabled };
+    const enabled = observed || opts.prefEnabled || envForced;
+    // Never re-append when the flag is already on the command line at all — see `switchPresent`.
+    return { enabled, port, openSwitch: enabled && !switchPresent };
   }
   // Dev: the launcher (launch-editor.sh) owns the switch; main only reports it.
-  return { enabled: envForced, port, openSwitch: false };
+  return { enabled: observed || envForced, port, openSwitch: false };
 }

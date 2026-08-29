@@ -35,6 +35,14 @@ export const entryPrefabProvider: EntryPrefabProvider = {
     const ui = root.traits?.['UIElement'] as { width?: number; height?: number } | undefined;
     return { width: ui?.width ?? 0, height: ui?.height ?? 0 };
   },
+  // ⚠️ "Cached" means SPAWNABLE, which is a hair stricter than `spawnInstance`'s own guard and
+  // deliberately so. That guard is `!prefab?.entities`, and `[]` is truthy — so a prefab file
+  // with an empty `entities` passes it, reaches `spawnPrefabInstance`, gets `0` back from
+  // `instantiatePrefabIntoWorld` (no root to return), and lands in the silent-retry-forever hole
+  // this whole diagnostic exists to light up. Reporting it "cached" would suppress the warning
+  // for precisely that case. Agreement with the spawn path is the invariant here, and it is
+  // agreement about the OUTCOME — can this produce an instance — not about the expression.
+  isCached(prefabGuid) { return (cached(prefabGuid)?.entities?.length ?? 0) > 0; },
   spawnInstance(world: World, prefabGuid, opts) {
     const prefab = cached(prefabGuid);
     // Not cached yet is NORMAL on the first frames of a scene — the caller retries rather than

@@ -202,6 +202,143 @@ succeeds is worse than one that answers a smaller question honestly. Use `rawNow
 `@modoki/engine/runtime` (the sanctioned wall-clock wrapper; `setManualNow` makes the budget
 testable), not `Date.now()`.
 
+## Court's placement tools — the guard-completeness trap (#339)
+
+Court's second pair of tools (`court_place_piece`, `court_board_state`) is worth reading before you
+write a game tool that DRIVES gameplay rather than navigating it, because the obvious
+implementation is wrong in a way nothing catches.
+
+**The state function is not the whole operation.** Court's `commitPlace(piece, cell)` does the full
+job of landing a piece — memo wipe, heart charge, journal, revert-arm, save. It looks like exactly
+the seam a tool should call. But the guards a real drop passes live in its **callers**: cell
+emptiness is checked in `onRelease`, tray exhaustion in `onPressAt` before a drag can even begin.
+Calling `commitPlace` bare therefore lets an agent **over-place a piece type**, which fails rule 1
+`wrong-piece-count` — an END-STATE violation, so nothing flashes, nothing reverts, and the board can
+look solved while being illegal. That is the [§0 rank-1 false
+success](mcp-tool-conventions.md#0-the-rule-that-generates-the-others).
+
+So the rule generalises: **find the guards in the caller, not just the state function, and
+re-assert every one.** A game tool that reproduces a player action must reproduce what the player
+*cannot* do as faithfully as what they can.
+
+⚠️ **"The caller" is not one function, and this is where the first attempt failed review.** Court's
+guards live at *three* depths: two module-level gates in `onPressAt` (intro running, menu open), the
+emptiness check in `onRelease` — and six more inside **`hitTest`**, which answers with a *backdrop*
+target rather than a cell whenever the board is untargetable (solved, Game Over, a hint story
+playing, a tutorial narration beat, the `(i)` reference open, a flyout open). The first
+implementation walked the first two and stopped, so the tool would happily land a piece on a **Game
+Over board** — writing the player's saved session behind an overlay they cannot dismiss — and place
+a piece *underneath* a hint story, leaving the narration describing a position that no longer
+existed. A green suite saw none of it.
+
+The fix that holds is not a longer list at the call site but **one predicate both paths read**
+(`boardInputBlocker()`), because the same disjunction had already been hand-copied a third time into
+the hit-region provider. When you find yourself enumerating "states where input is refused" in a
+tool, that list almost certainly already exists somewhere in the input path — share it rather than
+restate it, and the next state added lands in both places at once.
+
+⚠️ **And there may be a layer the engine never sees at all.** Court blocks the board in *two*
+places: the engine list above, and the **DOM** — `UIRenderer`'s pointer-blocker swallows a press
+over a scene-authored overlay before `hitTest` ever runs. Court's region-chip flyout is blocked only
+that way (it is dismissed by a scene `UIAction`, not a hit-test branch), so it appears in no engine
+predicate, and a tool that checked only the engine could place a piece "through" an open flyout that
+a real finger cannot reach past. **A synthetic call bypasses every layer, so it has to ask every
+layer** — enumerate the DOM-modal overlays too, and keep that check separate rather than folding it
+into the engine predicate, since widening the engine one would change real input behaviour.
+
+**Then test the refusals, not just the successes.** The differential test covered the six cases
+anyone would think of (occupied, hole, exhausted…) and none of the six above, which is exactly why
+the gap survived. A guard with no test is how the copy drifts back apart.
+
+One case in that test deliberately asserts the two arms **disagree**: headless has no DOM, so the
+gesture arm is the *unfaithful* one for a DOM-blocked overlay. Say so loudly in the test, or the
+next reader will "fix" the divergence away and reopen the hole.
+
+**Reproduce the input path, do not invent rules.** The sharp pair in Court: a **hole** is refused
+(it gets no `cellCenters` entry, so a real drag cannot hit-test it either) while a **civilian cell
+is allowed to land** (it is hit-testable, and the resulting rule-5 violation with its ✕ and heart
+cost is exactly what QA needs reachable — it was a real shipped bug, #47). The tool never
+pre-judges legality; it lands the drop and reports the game's own verdict, read off `pendingRevert`
+rather than re-derived.
+
+**Duplicated guards need a differential test.** Because the guards now exist in two places,
+`games/court/tests/agentToolsPlacement.test.ts` drives the real gesture machine and the tool side
+by side on one fixture board and asserts they reach the same outcome on both axes (did a placement
+land, did a revert arm). Cases the gesture cannot express at all — a hole has no screen point to
+aim at — are asserted as that impossibility rather than skipped. Without this, the copy drifts;
+Court has been bitten twice by hand-copied predicates diverging from the code they copied.
+
+**Say when a tool writes the player's data.** `court_place_piece` ends in `saveSession()`, so it
+overwrites the human's stored board — unlike Court's three navigation tools, whose file banner
+declares they never write progress. That banner had to be rewritten rather than left standing: a
+declared invariant that a new tool quietly breaks is worse than one that was never written down.
+
+### Phase 2: `court_move_piece` — a separate tool, not an optional param (#339)
+
+Move (cell→cell) reuses everything above rather than re-deriving it, and adds two lessons of its
+own.
+
+**An optional param that can be forgotten is a different-operation-reported-as-success waiting to
+happen.** The obvious shape for "move" is an optional `from` on `court_place_piece`. It was
+rejected: forgetting `from` silently turns an intended move into a fresh tray placement — the exact
+§0 rank-1 false-success class this whole feature keeps tripping over. `court_move_piece` is its own
+tool with `from`/`to` both *required*, so there is no path that forgets one.
+
+**The guard preamble is shared through a function, not a fourth hand-copy.** `agentPlacePiece` had
+all six board-touchability checks (no level, sim stopped, intro/menu, `boardInputBlocker`,
+`domModalOverBoard`, a refusal already on screen) inline — and a second tool needing the identical
+run would have been the fourth copy of that disjunction in this file (`hitTest`, the hit-region
+provider and `agentPlacePiece` were the first three, and two review rounds exist because they had
+already drifted apart once). `agentBoardGate()` extracts it; both `agentPlacePiece` and
+`agentMovePiece` call it, and neither hand-copies a guard the other already checks.
+
+⚠️ **`domModalOverBoard` is GONE as of #355 — the tool layer no longer carries its own second
+predicate.** It existed because Court's engine-side blocker (`boardInputBlocker`, which `hitTest`
+reads) covered only 7 of 10 modal states: the region-chip flyout, the settings panel and the rules
+reference blocked from the DOM alone, so a *tool* had to ask a second question the *input* layer
+could not answer. That split was the defect, not the design — it meant a headless test could drive
+a board tap no player can perform and pass, and `courtHitRegionsDesign()` listed covered cells as
+available targets, i.e. the invariant was false rather than merely unenforced. The three states now
+have engine branches, so the tools inherit the coverage from the one shared list like every other
+state, and the refusal reports the real kind (`chip-backdrop` / `dom-modal-backdrop`) instead of a
+tool-only `dom-overlay`. **Anything else driving `hitTest` is now protected too**, which the old
+arrangement could not promise. One deliberate limit: the settings and rules branches **swallow**
+where the DOM dismisses — their *dismissal* is stated by a scene `set` binding, so closing them from
+`fireTap` would duplicate a rule the scene already owns and would let a refused agent placement close
+a panel the player is reading. (The split is about who owns the dismissal, not about who ever writes
+the field: `startTutorialReplay` hides `SettingsRoot` from code.) The chip flyout *does* dismiss,
+because `chipFlyoutPiece` is Court's own module state.
+
+**`piece` is an assertion, not a second address.** When given, it must match whatever is actually
+standing at `from` — a real drag grabs whichever piece is under the finger, never a piece named in
+advance. Given and mismatched, the tool refuses rather than silently moving the *actual* occupant.
+
+**A move has a restore surface a placement does not.** `commitMove` is a retreat-and-place recorded
+as one Action (memo.md's #85 scope update), so leaving `from` can give back notes that piece's
+original landing there wiped — `court_move_piece` reports this as `memoRestored`/
+`chipNotesRestored`, alongside the destination-side `memoCleared`/`chipNotesCleared` Phase 1 already
+had. An agent that only read the destination fields would miss half of what the move just did.
+
+### Phase 3: `court_recall_piece` — smaller on purpose (#339)
+
+Recall (cell→tray) reuses `agentBoardGate()` exactly as move does, and takes only a source cell — a
+real drag recalls whenever a board-origin drop ends on anything that is NOT a cell, so there is no
+destination to name or judge.
+
+**A result type should not carry fields the operation cannot produce.** Removing a piece can never
+violate a rule, so `commitRecall` never arms `pendingRevert` — no `accepted`, no `refusedByGame`, no
+`hearts.lostThisPlacement` on the response. A field that can only ever hold one value is noise, and
+an eternal `refusedByGame: null` would invite a caller to read it as meaning something. The report is
+restore-only: `memoRestored`/`chipNotesRestored`, computed by `commitRecall` *after* the recall is
+applied so the restore judges the board the retreat actually leaves behind.
+
+**The tutorial gate still applies, even though the lesson script never judges a recall.**
+`commitRecall` never calls `judgeTutorialMove` — there is no destination for a script to assert
+against — but `onPressAt`'s `wouldLift` still gates which piece may be *lifted* in the first place,
+gate's-own-piece-on-the-board included. `agentRecallPiece` re-asserts that lift gate the same way
+`agentMovePiece` does, or a synthetic call could pull a piece off the board mid-lesson that no real
+drag could ever lift.
+
 ## Limits worth knowing before you rely on this
 
 - **A game tool's mutation is not undoable.** Engine tools declare `undoable` in `contracts.ts` and

@@ -7,7 +7,7 @@
  * setDef, transform extraction (local + worldSpace), restart, and dispose invalidation.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Container } from 'pixi.js';
 import { Matrix4 } from 'three';
 import { PixiParticleBackend } from '../../src/runtime/particles/pixiParticleBackend';
@@ -162,6 +162,115 @@ describe('PixiParticleBackend lifecycle', () => {
   });
 });
 
+describe('PixiParticleBackend sub-pixel 2D warning', () => {
+  // A failed expect() inside a test throws, skipping any cleanup written later in that test's
+  // body — this restores unconditionally so one test's failure can't leak its console.warn spy
+  // into the next.
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('warns once for a metre-scale (3D-authored) effect with an id', () => {
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Same shape as a real 3D effect (e.g. confetti.particle.json): small size/speed, short life.
+    const metreScale = def({ id: 'metre-scale-1', startSize: { min: 0.1, max: 0.2 }, startSpeed: { min: 3.5, max: 6 } });
+    be.create(metreScale);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('metre-scale-1');
+    expect(warn.mock.calls[0][0]).toContain('renders sub-pixel in 2D');
+
+    // A second effect instance with the SAME id doesn't warn again.
+    be.create(metreScale);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not warn for a design-px-scaled (2D-authored) effect', () => {
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const designPxScale = def({ id: 'design-px-1', startSize: { min: 0.5, max: 1 }, startSpeed: { min: 60, max: 120 } });
+    be.create(designPxScale);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('does not warn on sprite size alone for a TEXTURED effect (real size unknown until async load)', () => {
+    // games/court's shipped win-sequence confetti: startSize reads as sub-pixel ONLY under the
+    // 64px default-texture assumption, but it sets a custom render.texture, so that assumption
+    // does not apply. Reach is comfortably large (fast + long-lived), so this must stay quiet.
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const texturedSmallSprite = def({
+      id: 'textured-small-sprite-1',
+      startSize: { min: 0.15, max: 0.24 },
+      startSpeed: { min: 200, max: 380 },
+      startLifetime: { min: 3.8, max: 5.2 },
+      render: { blend: 'normal', texture: 'some-texture-guid' },
+    });
+    be.create(texturedSmallSprite);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('a TEXTURED effect can still warn via reach alone when genuinely sub-pixel', () => {
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const texturedTinyReach = def({
+      id: 'textured-tiny-reach-1',
+      startSize: { min: 0.15, max: 0.24 },
+      startSpeed: { min: 1, max: 2 },
+      startLifetime: { min: 1, max: 1.5 },
+      render: { blend: 'normal', texture: 'some-texture-guid' },
+    });
+    be.create(texturedTinyReach);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).not.toContain('sprite ≈'); // sprite half skipped for textured effects
+    expect(warn.mock.calls[0][0]).toContain('plume reach ≈');
+  });
+
+  it('does not warn for an effect with no id (nothing stable to dedupe against)', () => {
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    be.create(def({ id: undefined, startSize: { min: 0.1, max: 0.2 }, startSpeed: { min: 3.5, max: 6 } }));
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('a zero-speed, gravity-driven effect (a waterfall) does not read as sub-pixel', () => {
+    // startSpeed alone says "reach 0" — but a strong gravity pull still carries the plume a real
+    // distance even at zero launch speed. Big untextured sprite too, so this exercises both halves.
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const waterfall = def({
+      id: 'waterfall-1',
+      startSize: { min: 0.5, max: 1 }, // × 64 default texture = 64px — plainly visible
+      startSpeed: { min: 0, max: 0 },
+      startLifetime: { min: 2, max: 2.5 },
+      gravity: [0, 150, 0], // 2D: +Y falls
+    });
+    be.create(waterfall);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('an id is un-warned once fixed, and re-warns if edited back into sub-pixel territory', () => {
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const bad = def({ id: 'iterate-1', startSize: { min: 0.1, max: 0.2 }, startSpeed: { min: 3.5, max: 6 } });
+    const fixed = def({ id: 'iterate-1', startSize: { min: 0.5, max: 1 }, startSpeed: { min: 60, max: 120 } });
+
+    const h = be.create(bad);
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    be.setDef(h, fixed); // live edit in the Particle Editor makes it visible again
+    expect(warn).toHaveBeenCalledTimes(1); // setDef on a now-clean def doesn't itself warn
+
+    be.setDef(h, bad); // edited back into sub-pixel territory
+    expect(warn).toHaveBeenCalledTimes(2); // re-armed, not silently suppressed forever
+  });
+});
+
 // The mock's committed/commitCalls getters live on the outer PixiParticleObject, not on its
 // container (which is what getContainer returns). Reach the object the backend stored for a handle
 // via its private entries map.
@@ -170,3 +279,27 @@ function getObj(be: PixiParticleBackend, h: { id: number }): { committed: number
   const entry = (be as any).entries.get(h.id);
   return entry.obj;
 }
+
+describe('a textured 2D emitter waits HIDDEN, bounded (#338 close-out F4)', () => {
+  // The 2D backend has the SAME defect the 3D one was fixed for: build() constructs the render
+  // object AND a CpuParticleSim together, and the texture `.then` calls build() again — so a cold
+  // sprite discards every live particle and resets the clock, on screen. Fixing the 3D path and
+  // the sub-emitter path while leaving this one is how the second instance survives a sweep.
+  //
+  // ⚠️ These run headless (`typeof window === 'undefined'` in the node env), which is exactly the
+  // "nothing will ever arrive" case — so they pin that the emitter is NOT left hidden there, which
+  // is the failure mode that would break every 2D particle in a headless/test render.
+  it('is not left hidden when no texture load can run (headless)', () => {
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const h = be.create(def({ render: { blend: 'additive', texture: 'some-guid' } } as Partial<ParticleEffectDef>));
+    expect(be.getContainer(h).visible, 'headless has no loader — reveal rather than hide forever').toBe(true);
+  });
+
+  it('an untextured 2D emitter is never hidden', () => {
+    const f = makeFactory();
+    const be = new PixiParticleBackend(f.make as never);
+    const h = be.create(def());
+    expect(be.getContainer(h).visible).toBe(true);
+  });
+});

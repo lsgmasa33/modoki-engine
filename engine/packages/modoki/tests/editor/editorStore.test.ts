@@ -14,8 +14,9 @@ vi.mock('../../src/editor/undo/undoManager', () => ({
 }));
 
 // Must import after mocks are set up
-const { useEditorStore } = await import('../../src/editor/store/editorStore');
+const { useEditorStore, lsBool, lsEnum } = await import('../../src/editor/store/editorStore');
 const { get2DDirtyVersion } = await import('../../src/editor/store/canvas2DDirty');
+const { DEVICE_PRESETS, makeCustomPreset } = await import('../../src/editor/scene/devicePresets');
 
 beforeEach(() => {
   pushedSelections = [];
@@ -379,6 +380,82 @@ describe('editorStore', () => {
     });
   });
 
+  describe('gizmo mode/space/pivot + particlePreview persistence (#399)', () => {
+    // This env has no localStorage — install a stub for the duration of each test (same
+    // pattern as the sceneViewMode/animationViewMode positive control above). Records
+    // [key, value] PAIRS, not just keys: a mutation test (deliberately corrupting the write
+    // to `localStorage.setItem('editor:gizmoMode', 'BOGUS')`) showed a keys-only assertion
+    // passes even when the persisted VALUE is wrong (close-out review finding #2).
+    function withLocalStorageStub(run: (writes: [string, string][]) => void) {
+      const writes: [string, string][] = [];
+      const stub = { getItem: () => null, setItem: (k: string, v: string) => { writes.push([k, v]); }, removeItem: () => {} };
+      const g = globalThis as { localStorage?: unknown };
+      const had = 'localStorage' in g;
+      const prev = g.localStorage;
+      g.localStorage = stub;
+      try { run(writes); }
+      finally { if (had) g.localStorage = prev; else delete g.localStorage; }
+    }
+
+    it('setGizmoMode/Space/Pivot each persist their own key AND value', () => {
+      withLocalStorageStub((writes) => {
+        useEditorStore.getState().setGizmoMode('rotate');
+        useEditorStore.getState().setGizmoSpace('local');
+        useEditorStore.getState().setGizmoPivot('center');
+        expect(writes).toEqual([
+          ['editor:gizmoMode', 'rotate'],
+          ['editor:gizmoSpace', 'local'],
+          ['editor:gizmoPivot', 'center'],
+        ]);
+      });
+    });
+
+    it('setParticlePreview persists true/false as "1"/"0"', () => {
+      withLocalStorageStub((writes) => {
+        useEditorStore.getState().setParticlePreview(true);
+        expect(useEditorStore.getState().particlePreview).toBe(true);
+        useEditorStore.getState().setParticlePreview(false);
+        expect(writes).toEqual([['editor:particlePreview', '1'], ['editor:particlePreview', '0']]);
+      });
+    });
+
+    // The tests above only exercise the WRITE half. The bug #399 fixes is the READ half — the
+    // initial state computed at STORE-CREATION time (module load), before any React render —
+    // which the store-level tests above never touch (the store is already constructed by the
+    // time they run). `lsBool`/`lsEnum` are the exact functions the initial-state block calls,
+    // so test them directly rather than reconstructing the store (see the export's doc comment
+    // for why re-importing the module is the wrong way to do this in this shared test file).
+    it('lsBool/lsEnum restore a valid persisted value and fall back to the default otherwise', () => {
+      // Unlike `withLocalStorageStub` above (a write-only recorder — `getItem` always returns
+      // null), this needs a REAL get/set round trip to exercise the restore path.
+      const values = new Map<string, string>();
+      const stub = {
+        getItem: (k: string) => (values.has(k) ? values.get(k)! : null),
+        setItem: (k: string, v: string) => void values.set(k, v),
+        removeItem: (k: string) => void values.delete(k),
+      };
+      const g = globalThis as { localStorage?: unknown };
+      const had = 'localStorage' in g;
+      const prev = g.localStorage;
+      g.localStorage = stub;
+      try {
+        localStorage.setItem('k1', '1');
+        expect(lsBool('k1', false)).toBe(true);
+        expect(lsBool('missing', false)).toBe(false);
+        expect(lsBool('missing', true)).toBe(true);
+
+        localStorage.setItem('k2', 'rotate');
+        expect(lsEnum('k2', ['translate', 'rotate', 'scale'] as const, 'translate')).toBe('rotate');
+        // A foreign/stale value (an older build's different enum member, or corrupted storage)
+        // must fall back, not propagate — GizmoToolbar can only render a known mode.
+        localStorage.setItem('k3', 'BOGUS');
+        expect(lsEnum('k3', ['pivot', 'center'] as const, 'pivot')).toBe('pivot');
+      } finally {
+        if (had) g.localStorage = prev; else delete g.localStorage;
+      }
+    });
+  });
+
   describe('gameViewSize and gameRect', () => {
     it('setGameViewSize updates dimensions', () => {
       const { setGameViewSize } = useEditorStore.getState();
@@ -394,6 +471,112 @@ describe('editorStore', () => {
       setGameRect(rect);
 
       expect(useEditorStore.getState().gameRect).toEqual(rect);
+    });
+  });
+
+  describe('animationViewMode (#369 — the agent-drivable Animation view)', () => {
+    it("defaults to 'dopesheet', matching the panel's old local state", () => {
+      expect(useEditorStore.getState().animationViewMode).toBe('dopesheet');
+    });
+
+    it('switches between the two views', () => {
+      useEditorStore.getState().setAnimationViewMode('curves');
+      expect(useEditorStore.getState().animationViewMode).toBe('curves');
+      useEditorStore.getState().setAnimationViewMode('dopesheet');
+      expect(useEditorStore.getState().animationViewMode).toBe('dopesheet');
+    });
+
+    it('writes nothing to localStorage, unlike sceneViewMode', () => {
+      // Deliberate: the view reset to 'dopesheet' on every panel mount before it moved into the
+      // store, and a view restored days later changes what a fresh editor shows. Asserted rather
+      // than left implicit because the neighbouring setter DOES persist, so copying it is the
+      // likely accident. This env has no localStorage, so a stub is installed — a bare
+      // `getItem(...) === null` assertion would pass vacuously against the missing global,
+      // proving nothing about the setter.
+      const before = useEditorStore.getState().sceneViewMode;
+      const writes: string[] = [];
+      const stub = { getItem: () => null, setItem: (k: string) => { writes.push(k); }, removeItem: () => {} };
+      const g = globalThis as { localStorage?: unknown };
+      const had = 'localStorage' in g;
+      const prev = g.localStorage;
+      g.localStorage = stub;
+      try {
+        useEditorStore.getState().setAnimationViewMode('curves');
+        expect(useEditorStore.getState().animationViewMode).toBe('curves');
+        expect(writes).toEqual([]);
+        // The control: the neighbouring setter DOES write, so an empty list above is the setter
+        // being quiet, not the stub being unreachable.
+        useEditorStore.getState().setSceneViewMode('ui');
+        expect(writes).toEqual(['editor:sceneViewMode']);
+      } finally {
+        if (had) g.localStorage = prev; else delete g.localStorage;
+        // Both globals restored: this file has no beforeEach for either, so the positive control
+        // above would otherwise leave every later test running in sceneViewMode 'ui'.
+        useEditorStore.setState({ sceneViewMode: before, animationViewMode: 'dopesheet' });
+      }
+    });
+  });
+
+  describe('gameViewDevice (#367 — the agent-drivable preview screen)', () => {
+    it('defaults to Free in portrait', () => {
+      expect(useEditorStore.getState().gameViewDevice.name).toBe('Free');
+      expect(useEditorStore.getState().gameViewOrientation).toBe('portrait');
+    });
+
+    it('sets the device and the orientation independently', () => {
+      const { setGameViewDevice } = useEditorStore.getState();
+      const iphone = DEVICE_PRESETS.find((p) => p.name === 'iPhone 16 Pro')!;
+      setGameViewDevice(iphone);
+      expect(useEditorStore.getState().gameViewDevice.name).toBe('iPhone 16 Pro');
+      expect(useEditorStore.getState().gameViewOrientation).toBe('portrait');
+
+      // Orientation alone must not disturb the device — this is what lets the toolbar toggle and
+      // the picker share one setter.
+      setGameViewDevice(undefined, 'landscape');
+      expect(useEditorStore.getState().gameViewDevice.name).toBe('iPhone 16 Pro');
+      expect(useEditorStore.getState().gameViewOrientation).toBe('landscape');
+    });
+
+    it('compares a custom preset BY VALUE, so re-setting the same size is a no-op', () => {
+      // A custom size arrives as a freshly built object every call. An identity check would treat
+      // each one as a change, journalling and re-rendering on a no-op.
+      const { setGameViewDevice } = useEditorStore.getState();
+      setGameViewDevice(makeCustomPreset(640, 480), 'portrait');
+      const first = useEditorStore.getState().gameViewDevice;
+      setGameViewDevice(makeCustomPreset(640, 480));
+      expect(useEditorStore.getState().gameViewDevice).toBe(first);
+
+      // A DIFFERENT size under the same name must still register as a change.
+      setGameViewDevice(makeCustomPreset(800, 600));
+      expect(useEditorStore.getState().gameViewDevice.logicalW).toBe(800);
+    });
+
+    it('mountedness is published by GameView, and defaults to NOT mounted', () => {
+      // The agent read-back reports this, and it must not default to an optimistic true: an
+      // unmounted GameView means none of the derived values (preview size, insets, letterbox)
+      // follow a device change, so a measurement attributed to the new screen was taken at the
+      // old one. It was first DERIVED from openPanels, which reports a tab that exists but has
+      // never been selected — FlexLayout renders tabs on demand — i.e. true in exactly the case
+      // the flag exists to catch.
+      expect(useEditorStore.getState().gameViewMounted).toBe(false);
+      useEditorStore.getState().setGameViewMounted(true);
+      expect(useEditorStore.getState().gameViewMounted).toBe(true);
+      useEditorStore.getState().setGameViewMounted(false);
+      expect(useEditorStore.getState().gameViewMounted).toBe(false);
+    });
+
+    it('the game AREA size is tracked separately from the device size', () => {
+      // These two must never be conflated: `gameViewSize` holds the DEVICE's logical size while a
+      // device is selected, so reading it as "how big is the panel" answers with the phone — and
+      // is wrong in precisely the transition it would be consulted for.
+      const { setGameViewDevice, setGameAreaSize, setGameViewSize } = useEditorStore.getState();
+      setGameAreaSize(365, 549);
+      const iphone = DEVICE_PRESETS.find((p) => p.name === 'iPhone 16 Pro')!;
+      setGameViewDevice(iphone, 'portrait');
+      setGameViewSize(iphone.logicalW, iphone.logicalH); // what GameView does for a fixed device
+      expect(useEditorStore.getState().gameViewSize).toEqual({ width: 402, height: 874 });
+      // The panel did not change size just because a device was picked.
+      expect(useEditorStore.getState().gameAreaSize).toEqual({ width: 365, height: 549 });
     });
   });
 

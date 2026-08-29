@@ -26,6 +26,23 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'Also `heldPointer` — the sustained modoki_pointer press currently held ({button,x,y,heldMs}), ' +
       'or null. Check it when the Game panel has stopped responding to drags: a press left held ' +
       'latches pointer input for the human as well as the agent, and nothing else reports it (#302). ' +
+      'Also `gameView` — WHICH SCREEN the Game panel is previewing at (device name, orientation, '
+      + 'logical + physical size, dpr, safe-area insets). Read it before quoting any layout '
+      + 'measurement: the same HUD is correct on one device and broken on another, so a number '
+      + 'with no screen attached to it is unfalsifiable. Set it with modoki_game_view_device. ' +
+      'Also `animationViewMode` (dopesheet|curves) — WHICH of the Animation panel\'s two views is '
+      + 'showing, and therefore which interaction handles exist at all. `animationView` carries the '
+      + 'same answer WITH the two qualifiers an empty handle list needs: `panelMounted` (an '
+      + 'Animation tab that exists but was never SELECTED does not mount, and then NEITHER view '
+      + 'publishes handles) and, in curves, a note that tangent handles need an ACTIVE TRACK as '
+      + 'well as the view. Read these before concluding a clip has no tangents. Set the view with '
+      + 'modoki_animation_view_mode. ' +
+      'Also `spriteEditorSelection` (guid|null) — which slice is selected in the open Sprite ' +
+      'Editor; its resize/pivot handles only exist for that slice, and it opens with none ' +
+      'selected, so an empty `modoki_handles editor=sprite` is otherwise ambiguous. Set with ' +
+      'action:select-sprite-slice. Also `editingSkinAsset` + `skinMode` (rig|parts|weights) for ' +
+      'the Skin editor — open one with action:open-skin-editor, switch mode with ' +
+      'action:set-skin-mode. ' +
       'The companion to get_scene_state (which reads the ECS world): this reads the EDITOR. ' +
       'Requires a connected editor renderer.',
     {},
@@ -72,7 +89,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'drag — before/after hold only the TRS fields that moved, e.g. {x,y,z}; a MULTI-SELECT drag is ' +
       'ONE event shaped `{entities:[guid], members:[{entity, before, after}]}` instead, so read ' +
       '`members` — `payload.entity` is undefined there). !scene-load `{path, ' +
-      'entityCount}`, !save `{path, entities}`, !gizmo `{mode|space}`. ' +
+      'entityCount}`, !save `{path, entities}`, !gizmo `{mode|space}`, !sceneviewmode `{mode}`, ' +
+      '!gameviewdevice `{device, orientation}`, !animationviewmode `{mode}`. ' +
       'A trait-field !edit ALSO carries a structured `detail: {trait, field, entities[guid], old[], ' +
       'new[]}` (index-aligned arrays; length-1 for a single edit, N for a multi-select — so "zeroed ' +
       'gravityScale on 3 crates" is machine-readable, not just a label). !undo/!redo echo the ' +
@@ -422,6 +440,84 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     async ({ mode }) => editorAction('set-scene-view-mode', { mode }),
   );
   tool(
+    'modoki_animation_view_mode',
+    "Set which view the Animation editor's timeline area shows: 'dopesheet' (keyframe TIMING — "
+      + "diamonds) or 'curves' (keyframe VALUES + easing — a graph). Exactly ONE is mounted, and "
+      + 'they publish DIFFERENT interaction handles, so this decides what modoki_handles can even '
+      + "see: `curves:key:*` and the tangent handles (`curves:tan:in|out:*`, kind 'tangent') exist "
+      + "in Curves ONLY. The default is 'dopesheet', so `modoki_handles editor=curves` returns an "
+      + 'empty list until you call this — which reads as "this clip has no tangents", not "wrong '
+      + 'view". ⚠️ NECESSARY BUT NOT SUFFICIENT for TANGENT handles: those are published for '
+      + 'the ACTIVE track only, and with nothing selected that resolves only when exactly ONE '
+      + 'numeric curve is visible. On a clip with two or more numeric tracks kind:tangent stays '
+      + 'EMPTY after this call — select a track too (modoki_handles {editor:"chrome", kind:"row"} '
+      + 'lists animation.trackList.row.<i>, data-ui-state "selected" marks the active one, then '
+      + 'modoki_tap_handle). Measured: 1-track clip 2 tangents, 2-track clip 0. A tangent is also '
+      + 'legitimately absent on the first key (no in) and last key (no out), on a stepped key, and '
+      + 'on any non-numeric track, which is never drawn at all. Settable before a clip is open. '
+      + 'Does NOT open or reload a clip (that is modoki_open_animation_editor, which also resets '
+      + 'the playhead) and touches no keyframe data. Returns editor state, which reports the '
+      + 'result as `animationViewMode` plus an `animationView` carrying panelMounted and these '
+      + 'caveats.',
+    {
+      mode: z.enum(['dopesheet', 'curves']).describe(
+        "'dopesheet' = keyframe timing; 'curves' = value/easing graph, and the ONLY view with "
+        + 'tangent handles. Anything else is refused, never coerced.',
+      ),
+    },
+    async ({ mode }) => editorAction('set-animation-view-mode', { mode }),
+  );
+
+  // ── GameView device simulation (#367) ──
+  tool(
+    'modoki_game_view_devices',
+    'List the device presets the Game panel can preview at, plus the one selected now. Each row '
+      + 'carries the LOGICAL size (CSS points — the space layout math runs in), the PHYSICAL size '
+      + '(device pixels), the dpr, and safe-area insets for both orientations. Read this instead of '
+      + 'hardcoding a device table. Rows are PORTRAIT — landscape is a flip applied on selection, '
+      + 'not a separate row, so pass `orientation` to modoki_game_view_device. Changes nothing.',
+    {},
+    async () => getJson('/api/game-view-devices'),
+  );
+  tool(
+    'modoki_game_view_device',
+    'Set WHICH SCREEN the Game panel previews at. The device picker is a popup trusted input '
+      + 'cannot operate, so this is the only way an agent can change it — without it every layout '
+      + 'check measures whatever device the human last left selected. Pass `device` (a name from '
+      + "modoki_game_view_devices; 'Free' fills the panel) OR logicalWidth+logicalHeight for a size "
+      + 'the catalog lacks — both together is refused as ambiguous. An unknown name is refused with '
+      + 'the real list, never fuzzy-matched: previewing a screen other than the one you named makes '
+      + 'every later measurement wrong. A custom size gets ZERO safe-area insets '
+      + "(safeAreaBasis:'custom-none') — there is no device to look them up from, so do not read "
+      + 'those zeros as "no notch". Returns the resolved selection, which modoki_get_editor_state '
+      + 'also reports as `gameView`. Editor-session state — nothing is written to disk, and a real '
+      + 'device is unaffected.',
+    {
+      device: z.string().optional().describe(
+        "A preset NAME from modoki_game_view_devices, e.g. 'iPhone 16 Pro', or 'Free' to fill the "
+        + 'panel. Matched exactly (case-insensitively). Mutually exclusive with logicalWidth/Height.',
+      ),
+      orientation: z.enum(['portrait', 'landscape']).optional().describe(
+        'Presets are authored portrait and flipped by this. Settable on its own; defaults to leaving '
+        + 'the current orientation unchanged.',
+      ),
+      logicalWidth: z.number().optional().describe(
+        'Explicit width in LOGICAL pixels (CSS points), 1-8192, for a size the catalog lacks. '
+        + 'Requires logicalHeight. Taken literally — an explicit size defaults to portrait, so these '
+        + 'are the numbers you get; pass orientation:landscape alongside to rotate them. Named '
+        + '`logical` because a bare `width` would be ambiguous with the physical (backbuffer) size '
+        + 'this tool also reports.',
+      ),
+      logicalHeight: z.number().optional().describe('Explicit height in LOGICAL pixels, 1-8192. Requires logicalWidth.'),
+      dpr: z.number().optional().describe(
+        'Device pixel ratio for a custom size, 0.5-4 (default 1); physical = logical x dpr. A dpr '
+        + 'whose product with either dimension is fractional is REFUSED rather than rounded — the '
+        + 'read-back derives dpr from the physical size, so rounding would report a dpr you did not ask for.',
+      ),
+    },
+    async (p) => editorAction('set-game-view-device', p),
+  );
+  tool(
     'modoki_collider_edit',
     'Toggle Collider2D vertex-edit mode (the toolbar "Points" button) for the selected ' +
       "entity. Pair with modoki_scene_view_mode 'ui' + a selected entity that has an editable " +
@@ -444,12 +540,24 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_open_sprite_editor',
     'Open the Sprite slicer modal on a texture (the Texture Inspector "Sprite Editor" button). ' +
-      'Selects the texture + opens the modal, so its slice-handle providers appear ' +
-      "(modoki_handles editor=sprite — the selected sprite's 8 corner/edge handles + pivot). " +
+      'Selects the texture + opens the modal. ⚠️ It opens with NOTHING selected, and the 8 ' +
+      "corner/edge handles + pivot only exist for the SELECTED slice — so modoki_handles " +
+      "editor=sprite returns an empty list right after this call; that is the normal case, not " +
+      'a bug (#373). Call modoki_select_sprite_slice next. ' +
       "Pass the texture's served path (e.g. '/assets/textures/sheet.png'). Returns editor state.",
     { path: z.string().describe("The texture's served path, e.g. '/assets/textures/ui.png'."),
       name: z.string().optional().describe('Display label for the editor (default: the filename stem).') },
     async ({ path, name }) => editorAction('open-sprite-editor', { path, name }),
+  );
+  tool(
+    'modoki_select_sprite_slice',
+    'Select (or deselect) a slice in the currently-open Sprite Editor — normally a click on a ' +
+      "rect or its row in the Sprites list. This is what makes a slice's 8 resize handles + " +
+      "pivot appear in modoki_handles editor=sprite: the modal opens with nothing selected and " +
+      'had no other route to change that (#373). Returns editor state, which reports the result ' +
+      'as `spriteEditorSelection`.',
+    { guid: z.string().nullable().optional().describe('The slice guid to select (from the Sprite Editor / asset manifest), or omit/null to deselect.') },
+    async ({ guid }) => editorAction('select-sprite-slice', { guid: guid ?? null }),
   );
   tool(
     'modoki_open_nine_slice_editor',
@@ -459,6 +567,27 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     { path: z.string().describe("The texture's served path, e.g. '/assets/textures/ui.png'."),
       name: z.string().optional().describe('Display label for the editor (default: the filename stem).') },
     async ({ path, name }) => editorAction('open-nine-slice-editor', { path, name }),
+  );
+  tool(
+    'modoki_open_skin_editor',
+    'Open the Skin (2D rig) editor panel on a .rig2d.json asset — normally an Assets-panel ' +
+      'double-click or the Texture Inspector "Auto Rig" button. There was previously NO agent ' +
+      "route to open this panel at all (#373). Once open, modoki_handles editor=skin lists its " +
+      "bone-joint handles in skinMode 'rig' or 'weights' — NOT 'parts' (modoki_set_skin_mode). " +
+      "Pass the rig's served path (e.g. '/assets/characters/hero.rig2d.json'). Returns editor state.",
+    { path: z.string().describe("The rig's served path, e.g. '/assets/characters/hero.rig2d.json'."),
+      name: z.string().optional().describe('Display label for the panel tab (default: the filename stem).') },
+    async ({ path, name }) => editorAction('open-skin-editor', { path, name }),
+  );
+  tool(
+    'modoki_set_skin_mode',
+    "Switch the open Skin editor's sub-mode: 'rig' (add/select/move/rotate bones), 'parts' " +
+      "(reposition each part's source mesh — NO bone-joint handles), or 'weights' (paint the " +
+      "selected bone's per-vertex influence). modoki_handles editor=skin reports bone-joint " +
+      "handles in 'rig' AND 'weights' — only 'parts' hides them. The toolbar buttons carry " +
+      '`data-ui-id="skin.mode.*"` and are chrome-tappable too; this is the direct route. Returns editor state.',
+    { mode: z.enum(['parts', 'rig', 'weights']) },
+    async ({ mode }) => editorAction('set-skin-mode', { mode }),
   );
   tool(
     'modoki_focus_entity',

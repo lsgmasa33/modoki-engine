@@ -33,7 +33,110 @@ Mixing CocoaPods and SPM produces duplicate-framework conflicts. Any SDK that ha
 
 ### iOS SPM static-linking gotcha
 
-SPM static linking **strips plugin classes that have no external framework dependencies**. `capacitor-game-debug` hits this — it must be registered manually in `MyViewController`, plus an Xcode file reference from the App target to the plugin source (project-relative path in the pbxproj, no copy). Edit the package source only.
+SPM static linking **strips plugin classes that have no external framework dependencies**. The class compiles and links, then is simply absent at runtime, so Capacitor reports `"GameDebug" plugin is not implemented on ios`. `capacitor-game-debug` and `capacitor-modoki-ota` both hit this — each must be registered manually in `MyViewController` (`bridge?.registerPluginInstance(...)`, which keeps the class alive), plus an Xcode file reference from the App target to the plugin source (project-relative path in the pbxproj, no copy). Edit the package source only.
+
+⚠️ **Only the game-debug half is generated.** `engine/plugins/healNativeConfig.ts` writes the pbxproj reference and the fenced registration block for `GameDebugPlugin` in every project; it contains **no OTA wiring at all**. `capacitor-modoki-ota`'s pbxproj refs and its `ModokiOtaPlugin` registration are **hand-maintained, in `games/ota-test` only** — the heal is deliberately fenced rather than whole-file precisely because that project hand-extends `MyViewController.swift` with an OTA boot hook (see the comment at `healNativeConfig.ts:596`). So regenerating that project's iOS — `cap add ios`, or deleting `ios/` after a native-config problem — restores the GameDebug wiring and **silently drops OTA**. Re-add it by hand and verify the plugin registers.
+
+⚠️ **Those plugins' `package.json` therefore declares `"capacitor": { "android": … }` with NO `ios` entry, and that is DELIBERATE.** The App target already compiles the `.swift` directly; adding an `ios` entry makes `cap sync ios` *also* add the SPM package, so the plugin class lands in two modules — **one `@objc` runtime class name with two implementations**. (What that then does at runtime has not been observed: the ObjC runtime resolves one name to one implementation, so expect a duplicate-class warning and a nondeterministic winner rather than, say, two `NWListener`s both binding :9095. The defect is the duplication; the symptom is unverified.)
+
+**The reading that misleads:** `npx cap sync ios` reports one fewer plugin than `cap sync android` (5 vs 6 on a typical project), because the count cannot see the pbxproj road. That gap is expected, not a defect — it was filed as one in #368, where the proposed one-line fix would have broken every iOS build it meant to repair. Guarded by `engine/tests/architecture/capacitorPlatformDeclarations.test.ts`.
+
+`capacitor-modoki-iap` is the contrasting case: it goes through SPM normally and correctly declares both platforms, and it is verified working (real store sandboxes on hardware, 2026-08-12). Note its own `Package.swift` header is deliberately agnostic about *why* — do not read it as a rule that "a system framework import is enough to keep the class"; that causal claim is untested.
+
+`capacitor-litert-lm` is a THIRD case, and the one most easily got wrong. Its
+`ios/Sources/LitertLmPlugin/LitertLmPlugin.swift` is a **complete ~380-line MediaPipe
+implementation** (`import MediaPipeTasksGenAI`, real `LlmInference` model loading and streaming) —
+**not a stub**, despite a stale comment at the top of its `Package.swift` still calling it one. What
+actually blocks iOS is narrower: **`Package.swift` declares only `capacitor-swift-pm`, while
+`CapacitorLitertLm.podspec` declares `MediaPipeTasksGenAI` + `MediaPipeTasksGenAIC`.** So an SPM
+build of that target cannot resolve `import MediaPipeTasksGenAI` and fails to compile, and the
+podspec is not a "fallback" here — it is the only iOS path whose dependencies resolve. Declaring
+`"ios"` on this package without first adding the MediaPipe dependency to `Package.swift` turns a
+green `npm run verify` into a broken `cap sync ios` build on `games/llm-test`.
+
+### The SceneDelegate trap — a silently dead iOS debug bridge (#368)
+
+`MyViewController` is what registers `GameDebugPlugin` into the bridge, and `Main.storyboard` names
+it via `customClass="MyViewController"`. **A `SceneDelegate` that builds its window in code
+overrides the storyboard entirely:**
+
+```swift
+window?.rootViewController = CAPBridgeViewController()   // ← storyboard never consulted
+```
+
+`MyViewController` is then never instantiated, the registration never runs, and the plugin — which
+IS compiled into the binary via the pbxproj reference — is never wired in. Use `MyViewController()`.
+
+**The failure is invisible everywhere you would look.** No crash, no render fault: the WebView loads
+and the game draws perfectly. The only symptom is `[debug-bridge] startServer failed: "GameDebug"
+plugin is not implemented on ios` in the JS console — which reaches **no device log**, because the
+plugin logs via `print()` (stdout) and its single `NSLog` is inside `triggerFault`. From the host it
+presents only as `ECONNREFUSED :9095`, indistinguishable from "the app is not running". Reading it
+needs Xcode's console or `device_console_logs`, and the latter needs the very bridge that is down.
+
+**How 9 projects got it at once.** The file comes from Capacitor's own iOS template — nothing here
+CREATES one (`healIosSceneDelegateBridgeVC` only repoints an existing file, never writes a new one),
+so `cap add ios` is what introduces it. `e2973d940` scaffolded native for **ten** projects in one
+run and verified them **on Android hardware only** — iOS was generated and never launched — and
+`games/iap-test` inherited it later.
+
+⚠️ **The emission rule is NOT understood, and this doc will not pretend otherwise.** That single run,
+same tool, produced a `SceneDelegate.swift` for eight projects and none for `demos/3d-physics-demo`
+or `games/chess` (which also have no `UIApplicationSceneManifest`). Nor does that run account for
+every file: there are **ten** tracked `SceneDelegate.swift` today — those eight, plus `games/iap-test`,
+plus `demos/postfx-demo`, which predates the run entirely and is where the trap was first found and
+fixed. Three separate origins, one unexplained split. Capacitor 8.5's templates — both
+`ios-spm-template.tar.gz` and `ios-pods-template.tar.gz` — DO ship the file today, so new projects
+get it and the heal covers them. But whatever made two projects in one batch differ is unexplained:
+treat "which projects get a SceneDelegate" as an open question, and rely on the heal + guard rather
+than on predicting it. Every *other* heal made them look correct: `healNativeConfig`
+wrote a right `MyViewController.swift` and a right pbxproj ref into projects whose SceneDelegate
+bypassed all of it.
+
+`demos/postfx-demo` hit and fixed this locally on 2026-08-05 and left a comment predicting exactly
+this spread. A per-project comment cannot enforce anything on projects that do not exist yet, so it
+is now enforced in two places instead: **`healIosSceneDelegateBridgeVC` repoints it** on project
+open / native build, and **`engine/tests/architecture/sceneDelegateBridgeVC.test.ts`** fails the gate
+on committed state.
+
+Measured on the iPhone 8 (iOS 16.7.16), 2026-08-27: with the base VC, port 9095 refused; after the
+one-word change, `device_connect` succeeded, `getStatus` reported `running: true, port: 9095`, and
+`getDeviceIp` returned the LAN IP. ⚠️ That last point matters — the debug menu's "WiFi is down" was
+this same bug, not a network fault: `getDeviceIp()` was rejecting because the plugin was absent.
+**So `wifiIPv4()`'s hardcoded `en0` is NOT the bug** — it returned the right address the moment the
+plugin was registered, and an Android-parity rewrite of it was reasoned out and deliberately not
+shipped. That is the verified claim, and the only one.
+
+**Separately — now HARDENED, 2026-08-27.** `wifiIPv4()` used to force-dereference
+`interface.ifa_addr.pointee`, and `getifaddrs(3)` may hand back an interface with NO address
+(normal for `awdl0`, an unconfigured tunnel, a downed cellular link). Swift imports `ifa_addr` as an
+implicitly-unwrapped optional, so that compiled cleanly and would have TRAPPED on such an entry —
+crashing `getDeviceIp()`, which the debug menu's Device tab calls. The loop inspects every interface
+before deciding which one it wants, so one address-less entry anywhere in the list was enough.
+
+⚠️ **The obvious form of the fix HANGS**, which is why it is spelled out here. `wifiIPv4()` advances
+its cursor on the LAST line of the loop body, so a bare `guard … else { continue }` never advances
+and the `while let cur = ptr` spins forever — trading a crash for an unkillable hang, on precisely
+the interface list that triggered it. The shipped form advances first:
+`guard let addr = interface.ifa_addr else { ptr = interface.ifa_next; continue }`.
+
+**What is and is not verified.** Verified on the iPhone 8: it compiles, and `getDeviceIp()` still
+returns the LAN IP — so no regression on the path that is actually taken. NOT verified: the guarded
+branch itself, including its cursor advance, because no device we have produces an address-less
+interface. Its correctness rests on INSPECTION — both exits from the loop body assign
+`ptr = interface.ifa_next` before leaving — not on measurement.
+
+⚠️ **An earlier version of this paragraph claimed "five consecutive calls in 9 ms, so provably no
+hang". That proved nothing and the wording is kept here as the correction.** The hang can only occur
+on an interface with a NULL `ifa_addr`, which this device does not have, so the `else` branch never
+executes: build the plugin with the BAD `guard … else { continue }` form and the same five calls
+still return the same address in the same time. The observation is identical under both hypotheses —
+a check that cannot fail is not evidence. Guarding a condition you cannot reproduce means accepting
+an unexercised branch and SAYING so, rather than dressing inference as measurement.
+
+Note the cost of touching this file at all: it moves the plugin's content hash and forces a
+re-vendor across every consuming project (the `vendoredPluginFreshness` guard, #90 — that guard owns
+the count, so it is not repeated here), so batch such edits rather than drip them.
 
 ## SDK Plugins
 
@@ -301,7 +404,7 @@ Developer) by `healNativeConfig`, not from the Xcode/Gradle configuration (#112)
 `debugBuild: true` + a Release configuration is a *working* debug build, which is what a TestFlight
 QA build is. Reopen the project after flipping the flag so the heal runs. Absent Android meta-data
 reads as false. Detail:
-[debug-tools-mcp.md](./debug-tools-mcp.md) § "Debug vs Release".
+[debug-tools-mcp.md](./debug-tools-mcp.md) § "Native Debug Bridge" (the "Debug vs Release — ONE flag decides" note).
 
 ### MCP tools
 
@@ -324,10 +427,30 @@ Connection setup + full guide: `engine/tools/game-debug-mcp/CONNECTION.md`; leas
 resume-in-grace / expiry+takeover / not-owner / non-owner-drop-doesn't-re-arm) that
 `engine/tests/plugins/deviceLeaseGoldenVectors.test.ts` pins the TS authority to, and the
 `LeaseCoreTests.swift` / `LeaseCoreTest.java` templates replay against a pure `LeaseCore` port.
-**Follow-up:** wire the native test targets (a Package.swift test target + the Android `src/test`
-sourceSet + `org.json` testImpl) and refactor the plugins to delegate their arbitration to `LeaseCore`
-so the native tests cover the shipping code (which also lets the native grace drop its timer for the
-spec's timer-free lazy expiry).
+**Both native replays now RUN** (#376) — before that neither ever had, and the Swift one's fixture
+path was off by one directory, which is what an unrunnable test cannot tell you. They are wired to
+`npm run test:native` (`engine/scripts/test-native.mjs`), an **on-demand** gate: `npm run verify` is
+vitest and can run neither XCTest nor gradle, so their silence there is deliberate and each file's
+header says so.
+
+| replay | runner |
+|---|---|
+| `engine/tests/plugins/deviceLeaseGoldenVectors.test.ts` | vitest — in `npm run verify` |
+| `LeaseCoreTests.swift` | `swift test --package-path` the standalone `capacitor-game-debug/ios/Tests/Package.swift` |
+| `LeaseCoreTest.java` | gradle on `capacitor-game-debug/android/test-harness` (plain JVM — no AGP, no SDK, no emulator) |
+
+Both harnesses live **outside** the plugin's packed fileset on purpose, so adding them did not move
+the content hash or force a re-vendor. The iOS one is a separate package rather than a `testTarget`
+in the plugin's `Package.swift` because that package is iOS-only and pulls in capacitor-swift-pm —
+`swift test` cannot run it from a terminal at all — and because `ios/Tests/` is unshipped, so a
+`testTarget` in the shipped manifest would name a path the vendored tarball does not contain.
+
+⚠️ **A green native run proves the PORTS agree with the vectors, not the plugin.** `LeaseCore` still
+lives inside each test file while `GameDebugPlugin` keeps its own lease state behind a platform timer
+(`DispatchWorkItem` / `Handler.postDelayed`). **Follow-up:** extract `LeaseCore` into the shipping
+sources and have `evaluateLease`/`startLeaseGrace` delegate to it, which also lets the native grace
+drop its timer for the spec's timer-free lazy expiry — a behavioural native change, so it needs
+device verification, and #376 deliberately stopped short of it.
 
 ## Heal-on-open & project deps
 
@@ -361,7 +484,7 @@ It is called explicitly on open — **not** buried inside `ensureProjectDeps` �
 
 ### Dep + engine-plugin heal (`ensureProjectDeps` in `main.ts`)
 
-`ensureProjectDeps(projectRoot)` makes "Open Project" work for a project opened from **outside** the repo (or an in-repo game never installed). The repo root install only links in-repo game workspaces via `bootstrap-game-deps.mjs`; a standalone project needs its own `npm install` to create `node_modules` + workspace symlinks (e.g. `@<game>/app-services`), else Vite 500s on the unresolved import. It also **vendors engine-provided Capacitor plugins** (`capacitor-game-debug`, …) into the project as tarball COPIES packed from the editor's own engine (no symlink → DMG-safe), which can rewrite `package.json` (migrating off the old `file:../../engine` dir-symlink) and regenerate the gitignored tarball. It reinstalls only when `node_modules` is absent or the vendored plugin copies are stale, preferring `npm ci` unless vendoring just rewrote `package.json` (then `npm install`, since the lockfile is behind). Skips the editor's own tree and projects with nothing to install.
+`ensureProjectDeps(projectRoot)` makes "Open Project" work for a project opened from **outside** the repo (or an in-repo game never installed). The repo root install only links in-repo game workspaces via `bootstrap-game-deps.mjs`; a standalone project needs its own `npm install` to create `node_modules` + workspace symlinks (e.g. `@<game>/app-services`), else Vite 500s on the unresolved import. It also **vendors engine-provided Capacitor plugins** (`capacitor-game-debug`, …) into the project as tarball COPIES packed from the editor's own engine (no symlink → DMG-safe), which can rewrite `package.json` (migrating off the old `file:../../engine` dir-symlink) and regenerate the gitignored tarball. It reinstalls when `node_modules` is absent, the vendored plugin copies are stale, or one of the project's OWN `workspaces` packages (a game's own native plugin, e.g. `capacitor-applovin-max`) has no symlink inside an otherwise-present `node_modules` (`hasStaleWorkspaceLink`, `projectDeps.ts` — porting `bootstrap-game-deps.mjs`'s "don't trust node_modules existing" posture into this on-open heal), then also runs the project's `build:plugins` script if it declares one (non-fatally) — an install alone only restores the symlink, not a game-owned plugin's gitignored `dist/`. Prefers `npm ci` unless vendoring just rewrote `package.json` (then `npm install`, since the lockfile is behind). Skips the editor's own tree and projects with nothing to install.
 
 ### Pinned transitive deps — `overrides` for a vulnerability upstream won't fix
 

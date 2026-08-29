@@ -89,6 +89,18 @@ The menu bar (`File` / `Edit` / `View`, plus host-injected menus) is rendered by
 `components/MenuBar`. Keyboard: `Cmd/Ctrl+S` → Save All, `Cmd/Ctrl+Z` → undo,
 `Cmd/Ctrl+Shift+Z` → redo.
 
+⚠️ **"Save Layout" covers only the panel ARRANGEMENT above — not other session options** (#399).
+Toggles like Mute Audio, GameView's Show Colliders, SceneView's View ▾ menu (Grid/Colliders/
+layers), the Particle Editor's ground-plane toggle, and particle preview, and the gizmo
+mode/space/pivot, are separate `localStorage` keys (`editor:gizmoMode`, `editor:sceneViewOptions`,
+`editor/rendering/gameViewPrefs.ts`'s `editor:gameViewMuted`/`editor:gameViewShowColliders`,
+`editor/panels/particleEditorPrefs.ts`'s `editor:particleEditorShowFloor`, etc. — same
+`editor:`-prefixed convention as `editorStore.ts`'s `CAM_GIZMO_LS_KEY`/`showFocusGraph`), each
+read on mount and written on change, independent of the layout save/load flow. Adding a new
+persistent editor-only toggle: follow that convention (a small `load*`/`save*` pair beside the
+component, or an inline `localStorage.getItem`/`setItem` in a Zustand setter) rather than
+folding it into layout JSON — layout is FlexLayout's `Model`, not a general prefs bag.
+
 ### `createEditor()` — host configuration
 
 `editor/createEditor.tsx` is the factory the host (a game) calls to configure the
@@ -311,6 +323,96 @@ smuggle a shell metacharacter past a rule by omitting the field next to it. Noth
 written on any refusal. Caveat: `postprocessors` is a map, so a patch can add or update an
 entry but never delete one; and unknown *top-level* keys are dropped by `mergeProjectConfig`'s
 explicit key list (unknown keys nested inside a declared section survive).
+
+### Project Settings — what a FIELD carries beyond its input
+
+Three affordances on the generic `FieldControl`, each added because the form could not answer a
+question the person in front of it was actually asking.
+
+- **`help` lives behind a hover `(i)`, never inline** (#408). It used to print as permanent grey
+  text beside every label, and one of these strings — the Quality Tiers help in
+  `engine/app/editor/setup.ts` — is a ~230-character paragraph sitting next to a checkbox. The
+  `(i)` is the shared `Info` in `panels/fields.tsx`, which is also what the Tier matrix uses:
+  ONE definition, because the editor has exactly one convention for "explanation behind a hover"
+  and two copies would drift. It is a `<span>` inside a `Tooltip`, **not** a `title=` — Electron
+  renders native title tooltips not at all (silently absent, not merely ugly), which is why
+  every hover explanation in this editor goes through that component.
+
+- **A `path` field whose value looks like an image shows a THUMBNAIL and its pixel size.** Keyed
+  off the value's extension rather than a per-field opt-in (owner, 2026-08-29: "every path"), so
+  a preview appears wherever one is meaningful and an eighth image field cannot be forgotten.
+  The size is the point as much as the picture: three of these fields carry a hard requirement in
+  their own help text ("square, >=1024px", "ideally 2732²") that the dialog previously could not
+  check — you found out from a build, or from a blurry icon on a phone. Court's splash reads
+  2048² against a 2732² recommendation, and that was invisible until the preview said so.
+
+  The bytes come from **`GET /api/source-image`**, a new route, because these values point at
+  build INPUTS (`games/court/art/…`) that no asset manifest lists and therefore no `assetUrl()`
+  can reach. Its neighbour `/api/read-file` is utf-8 only — it would hand back a PNG as mojibake
+  rather than fail. It reuses `resolveSourcePath`'s project-root gate (a preview is not a reason
+  to widen a file-read gate) and allowlists image EXTENSIONS rather than sniffing, so "every path
+  field previews" cannot become "every path field is readable over HTTP" — `user.keystore.storeFile`
+  points at a signing key inside the project. The dialog fetches rather than pointing an `<img>` at
+  the URL, so *file not found*, *outside the project* and *not a readable image* stay three
+  distinguishable messages; `<img onError>` reports one indistinguishable failure for all three,
+  and they have different fixes. An `iconSource` naming a file somebody has since renamed used to
+  look identical to a correct one until the build failed.
+
+- **A `path` field is a DROP TARGET, and the copy rule is the owner's** (2026-08-29): a dropped
+  file is copied into the project — these values are committed, so an absolute path to one
+  machine is dead on every other clone (#394) — **except one that is already inside the project**,
+  which is referenced where it lies rather than duplicated beside itself. `POST /api/adopt-file`
+  makes that call, and `relativiseUnderProject` returning a relative path IS the inside-the-project
+  test, so the containment rule has one definition rather than a second copy that could disagree
+  with the picker's.
+
+  Deciding it needs the dropped file's SOURCE path, which a browser has not handed over since
+  Electron 32 removed `File.path` — hence `getPathForFile` (Electron's `webUtils`) in
+  `engine/electron/preload.ts`. It reads like a convenience and is not: with no path the question
+  is unanswerable. A host without a preload gets `''` and the drop always copies, which is the
+  safe direction — a redundant copy, never a dead reference. The renderer probes with the path
+  alone first and uploads the bytes only when the backend asks (a 400), so the common in-project
+  drop never base64s a 2732² splash. A re-drop of the same file is byte-compared and re-used
+  rather than minting `icon-1.png`; a DIFFERENT file of the same name is suffixed, never
+  overwritten (`planDroppedFileDest`, `plugins/backend/projectPaths.ts`).
+
+  Drags out of the **Assets panel** land in the same route via `assetPath`, and take the reference
+  branch whenever the asset root sits inside the project. When it does not, the route reads the
+  file itself rather than demanding bytes the renderer never had — an asset drag carries no `File`,
+  so the upload retry cannot fire and the editor would otherwise offer a drag that dead-ends.
+  ⚠️ **That disk read is allowed for an `assetPath` ONLY, never for the client-supplied `abs`.**
+  The two provenances are not equally trusted: the editor's own asset roots resolved the first,
+  while the second is whatever the caller said. Reading from `abs` makes the route an arbitrary-file
+  reader — `{abs: '~/.ssh/id_ed25519', name: 'x.png'}` copies that file to `art/x.png`, which
+  `/api/source-image` then serves back under an extension it trusts, and leaves the contents in the
+  project for a commit to pick up. (Written the wrong way first, during this feature's own
+  close-out, while fixing the dead-end above — widening a read gate as a side effect of fixing
+  something else is exactly the move the `/api/source-image` gate was careful to avoid.)
+
+  ⚠️ **`<fieldset disabled>` does NOT stop a drop, and both of this dialog's inert states are
+  built on it.** It disables form *controls* natively — which is exactly why the dialog uses it
+  instead of threading a `disabled` prop through twelve `case`s — but a `drop` handler on a plain
+  `<div>` is not a control. The per-field `disabledIf` wrapper also sets `pointerEvents:'none'` and
+  is safe by accident; the whole-form one (`configErrors`, the config file that did not parse) does
+  not, so a drop there copied a file into the project and edited a draft that Apply is disabled
+  for. The field therefore checks its own input at drop time — **`el.matches(':disabled')`, never
+  `el.disabled`**: the IDL property reflects the element's own attribute only and reads `false` for
+  an input disabled by an ancestor fieldset, so the obvious spelling is a silent no-op. That is the
+  same trap `tests/ui/projectSettingsDialog.test.tsx` recorded for its own assertions, and it was
+  written wrong here first; a unit test of the decision cannot catch it, because the defect is
+  entirely at the call site. The mount test in that file is the cover.
+
+  ⚠️ **`copyFolder` is contained before it reaches a path join.** It is a client-supplied body
+  field, and `planDroppedFileDest` sanitises only the *name* — so `copyFolder:
+  '../../../Library/LaunchAgents'` wrote outside the project, while the neighbouring
+  `/api/write-file` 403s the identical escape. Localhost is not a boundary here: the host parses a
+  POST body regardless of Content-Type, so a page in a browser can issue a no-preflight
+  cross-origin POST and never needs to read the reply, because the write is the payload.
+  The containment is **lexical** — `path.resolve` does not follow symlinks, so a link inside the
+  project pointing out would pass. That is the same strength as `/api/write-file`'s
+  `resolveSourcePath` beside it, i.e. the convention here rather than something this route
+  weakens, and no project in the repo contains such a link. Stated rather than left implied,
+  because "contained" reads stronger than it is.
 
 ---
 
@@ -671,6 +773,15 @@ Animation Editor's property picker and the scene validator:
   snapshot or churns the file. Independent of `readOnly` (a field can be read-only in the
   Inspector yet still authored and persisted).
 
+  ⚠️ **`hidden: true` is NOT a substitute — it hides the widget, and the serializer does not
+  read it** (#406). `UIScrollView.viewportWidth/Height` + `contentWidth/Height` and
+  `UIEntries.firstX/visibleX/poolSize/epoch` were hidden-only, so a `games/scroll-demo`
+  re-save wrote the editor's own measured UI viewport (410x312) into three committed scenes as
+  authored data. The two flags answer different questions — *may a human edit this?* vs *may
+  this reach disk?* — and an engine-written field needs BOTH.
+  `engine/tests/assets/runtimeOnlyFieldsOffDisk.test.ts` now fails on any committed scene or
+  prefab carrying a `runtimeOnly` field, which catches the leak from the other side.
+
 `registerTrait()` is keyed by the koota `Trait` object but also indexed `byName`; on
 re-registration — a script hot-reload re-imports a trait module and produces a **new**
 `Trait` object with the **same** name — it evicts the prior object first, so
@@ -861,6 +972,56 @@ sizes, and the preview publishes them so UI insets exactly as it would on that p
 show a notch bug at all. Always on, with the bands drawn over the frame. Mechanism, the
 per-orientation data, and what is measured vs published:
 [UI system](./ui-system.md) § "The editor simulates the safe area".
+
+### Driving the preview screen from an agent (#367)
+
+The selected device and orientation live in the **editor store** (`gameViewDevice` /
+`gameViewOrientation`), not in GameView-local state, so `modoki_game_view_device` can set them —
+the same lift `sceneViewMode` got, for the same reason: the device picker is a popup that trusted
+input cannot operate. Before it, every layout check an agent ran measured whatever device the human
+last left selected, and the per-device bug class (safe-area insets, panel-fit budgets) is precisely
+the one that needs the device changed repeatedly to be checked at all. `modoki_game_view_devices`
+lists the catalog; `modoki_get_editor_state` reports the current selection as `gameView`, so a
+measurement can be attributed to a screen size.
+
+Four things about that surface are load-bearing:
+
+- **`gameViewDevice` + `gameViewOrientation` are the source of truth; `gameViewSize`,
+  `gameViewSafeArea` and `gameRect` stay DERIVED** — GameView resolves them and publishes them
+  downward for SceneView's preview frame. Writing them from the setter as well would give each two
+  writers to keep in sync by hand.
+- **An explicit `{logicalWidth, logicalHeight}` is carried as a synthetic preset named `Custom`**,
+  so every `resolve*` helper and every GameView consumer handles it unbranched. `logicalW: 0` is
+  reserved by `FREE_PRESET` for "fill the panel", so a zero dimension is refused rather than
+  silently becoming Free.
+- **A custom size reports `safeAreaBasis: 'custom-none'`.** There is no device to look insets up
+  from, so its zeros are zeros *by construction* — and four bare zeros are indistinguishable from a
+  measured "this screen has no notch", which is the mis-authoring `devicePresets.ts` warns about.
+  A catalog preset reports `'preset'`, where a zero is a statement.
+- **A `dpr` that cannot round-trip is refused, not rounded.** `physical` is stored as
+  `round(logical × dpr)` and the read-back recovers dpr as `physical / logical`, so `{1, 1, dpr: 0.5}`
+  used to be accepted and answer `dpr: 1` — a wrong answer stated authoritatively. The combination is
+  now refused, naming the offending dimension. This is a round-trip guard, not a ban on fractional
+  dpr — 2.5 on an even dimension passes. But a real phone is not the example to reach for: Pixel 9
+  is 412×924 → 1080×2424, ~2.6214 wide and ~2.6234 tall, so it has **no single dpr** and
+  `{412, 924, 2.62}` is refused. That is exactly why the catalog stores physical sizes explicitly
+  rather than deriving them — pick such a screen by name.
+- **The read-back reports `panelMounted`, and `panelSize` when the device is `Free`.** The derived
+  values are written only by GameView's own effects, so with the Game tab unmounted the store's
+  device changes and nothing derived moves — a complete iPhone 16 Pro read-back while SceneView's
+  preview still shows the old size and zero insets. And `Free`, the default, has `logical: {0,0}`
+  by construction, so the field the docs tell you to read before quoting a measurement answered 0×0
+  in the most common case; `panelSize` carries the real one.
+- **An explicit size defaults the orientation to portrait, so its numbers are literal.** Found
+  against a live editor: orientation is sticky and presets are authored portrait and flipped, so
+  `{logicalWidth: 640, logicalHeight: 480}` sent while the panel sat in landscape previewed
+  **480×640**. The read-back said so honestly — never a false success — but "I asked for 640 wide
+  and got 480" is a trap worth not setting. Passing `orientation` alongside a custom size still
+  rotates it; that is an explicit request rather than a leftover.
+
+Not persisted to localStorage, unlike `sceneViewMode`: this reset to `Free` on every mount before it
+moved to the store, and a custom resolution silently restored days later is a measurement taken at a
+size nobody chose.
 
 ---
 
@@ -1193,6 +1354,40 @@ pans).
 
 Both views also register **interaction handles** (`registerHandleProvider`) so an agent can
 query and drag keys/tangents by id — see the Enact tooling in the repo `CLAUDE.md`.
+
+⚠️ **Exactly ONE view is mounted, and they do not publish the same handles** — `curves:key:*`
+and the tangent handles `curves:tan:in|out:*` (kind `'tangent'`) exist in Curves ALONE. So which
+view is showing decides what `modoki_handles` can see at all, and the default is Dopesheet:
+`modoki_handles editor=curves` comes back empty until the view is switched, which reads as *"this
+clip has no tangents"* rather than *"you are looking at the wrong view"*. The choice therefore
+lives in the **editor store** (`animationViewMode`), not in `AnimationEditor` local state, so it is
+agent-drivable — `modoki_animation_view_mode {mode}` sets it and `modoki_get_editor_state` reports
+it back (#369). Same move, and the same reason, as `sceneViewMode` gating the Collider2D handles.
+Setting it does not open, reload, or reset a clip; `modoki_open_animation_editor` does (it clears
+the loaded document and resets the playhead to 0), which is why the view is a separate call rather
+than a parameter on the open.
+
+⚠️ **The view is NECESSARY BUT NOT SUFFICIENT for the tangent handles, and that second gate cost
+this fix a wrong verdict.** `CurvesView` publishes `curves:tan:*` for the **active track only**
+(`if (ti !== s.activeTi) return`), and `activeTi` falls back to the sole visible curve — so with no
+track selected it resolves *only* when the clip has exactly one numeric track. Measured on a live
+editor: `fade-in.anim.json` (1 numeric track) gave 2 keyframe + **2 tangent** handles after the
+switch; `dialog-pop.anim.json` (2 numeric tracks), same view, nothing selected, gave 5 keyframe +
+**0 tangent**. The first measurement was taken as proof the fix worked, and it passes under both
+"curves is enough" and "curves plus a one-track clip is enough" — a reminder that a perturbation
+has to be able to come out the other way. Selecting a track is therefore part of the agent route:
+the `TrackList` rows carry `data-ui-id="animation.trackList.row.<i>"` with
+`data-ui-state="selected"` on the active one, so `modoki_handles {editor:'chrome', kind:'row'}`
+lists them and `modoki_tap_handle` picks one. They are **tagged rather than lifted into the store**
+on purpose — a tap runs `onSelect`, the same path a human takes (entity selection included), where
+an op writing a store field would have to reimplement it and could drift.
+
+`modoki_get_editor_state` reports both gates under `animationView`: `panelMounted` (an Animation
+tab that exists in the layout but was never SELECTED does not mount — FlexLayout renders tabs on
+demand — and then *neither* view publishes handles) and, in curves, the active-track caveat. A
+`kind:'tangent'` list is also legitimately empty on the first key (no in-tangent), the last key (no
+out-tangent), a stepped key, and any non-numeric track, which is never drawn at all. Lifting it also means the view now survives the panel being
+unmounted/reselected within a session; it is deliberately NOT persisted across launches.
 - **Architecture** — the edit logic is pure functions in `animation/recording.ts` /
   `animation/clipEdits.ts` (`planPaste`, `extractKeyBlock`, `applyBreakUnify`,
   `remapSelectionAfterRemoval/Reorder/Delete`, `groupSelection`), not component closures —

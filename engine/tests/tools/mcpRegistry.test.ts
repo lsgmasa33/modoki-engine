@@ -430,7 +430,18 @@ describe('the real registered surface', () => {
   // 18% of slack, which would have let ~8 new tools land without ever firing, i.e. exactly the
   // growth it claims to catch. A pin set above the real number is not a pin. Re-measure when you
   // raise it: `bytes` below is the number to use.
-  const DEFINITION_BYTES = 124_262;
+  // Re-measured 2026-08-27 (#367, +modoki_game_view_device/_devices and get_editor_state's
+  // `gameView` line). The two new tools account for ~2.3 KB of the ~4.9 KB jump — the rest was
+  // growth that had accumulated INSIDE the old headroom without ever re-pinning, which is the
+  // drift this ledger exists to surface. Re-measure on every raise, do not add to the old value.
+  // Re-measured 2026-08-27 again (#369, +modoki_animation_view_mode, get_editor_state's
+  // `animationViewMode` line, and the mounted-view note on modoki_handles' `editor` param):
+  // 129_199 -> 131_156, all of it that change. Then 131_156 -> 132_278 in the same issue's
+  // close-out: the review found the shipped descriptions named the VIEW as the whole precondition
+  // for tangent handles when an active track is a second gate, so three descriptions had to say
+  // so. Spent deliberately — a description that sends an agent to a confident wrong conclusion
+  // costs more than its bytes.
+  const DEFINITION_BYTES = 132_278;
   const DEFINITION_HEADROOM = 4_000;
 
   it(`the tool definitions stay near their recorded size (~${Math.round(DEFINITION_BYTES / 1000)} KB)`, () => {

@@ -11,7 +11,7 @@
 #
 # Usage:
 #   engine/scripts/resave-scenes.sh games/sling demos/forest-camp
-#   MODOKI_BACKEND_PORT=5180 engine/scripts/resave-scenes.sh games/sling   # a worker clone
+#   MODOKI_BACKEND_PORT=5180 engine/scripts/resave-scenes.sh games/sling   # override (no longer required)
 #
 # Afterwards ALWAYS review with:
 #   node engine/scripts/check-scene-churn.mjs <same projects>
@@ -31,13 +31,26 @@
 #    check-scene-churn.mjs catches the runtime-entity class, and compares the resource
 #    manifest by IDENTITY — a dropped ref the scene still references fails it (exit 1).
 #    Run it before you stage anything.
+#    ⚠️ A THIRD class it was blind to until #406: an engine-written trait field marked `hidden`
+#    but not `runtimeOnly` serializes, so a save bakes a LIVE measurement into authored data —
+#    games/scroll-demo took the editor's 410x312 device-preview size into three scenes while this
+#    gate said "0 semantic changes". It now reports those as GAINED; if you see one, the fix is
+#    usually the missing `runtimeOnly: true` in engine/app/ecs/registerTraits.ts, not a revert —
+#    unless the field is genuinely authored AND runtime-written, which the flag cannot fix (#409).
+#    check-prefab-churn.mjs got the same GAINED check, so the prefab sweep is covered too.
 #    Prefabs are covered by a sibling script, not this one: engine/scripts/resave-prefabs.sh
 #    (#125) — load-scene has no prefab equivalent, so prefabs round-trip through prefab-edit
 #    mode instead.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-PORT=${MODOKI_BACKEND_PORT:-5179}
+# PORT used to default to 5179 — the HUB's pinned port — so a bare run from a worker
+# clone drove the HUB's editor over HTTP instead of failing (#349). Derive from the
+# clone directory instead; unlike the launcher's "auto ports" degrade, an empty
+# result here would build a nonsense `http://127.0.0.1:` URL and fail confusingly
+# deep inside the curl loop below, so fail loud up front instead.
+PORT="${MODOKI_BACKEND_PORT:-$(node "$ROOT/engine/scripts/editorPorts.mjs" backend "$ROOT" || true)}"
+[ -n "$PORT" ] || { echo "[resave-scenes] '$(basename "$ROOT")' is not a known clone and MODOKI_BACKEND_PORT is unset — refusing to guess which editor to drive. Set MODOKI_BACKEND_PORT explicitly." >&2; exit 2; }
 BE="http://127.0.0.1:${PORT}"
 # Per clone, keyed on the backend port like every other editor-adjacent temp path here:
 # /tmp is machine-wide, so a bare name means two clones resaving at once overwrite each

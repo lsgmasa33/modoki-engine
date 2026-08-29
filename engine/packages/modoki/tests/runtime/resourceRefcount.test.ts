@@ -86,6 +86,7 @@ const GUIDS: Record<string, { guid: string; type: 'material' | 'mesh' | 'model' 
   '/sphere.mesh.json': { guid: '10000000-0000-4000-8000-000000000021', type: 'mesh' },
   '/tree.prefab.json': { guid: '10000000-0000-4000-8000-000000000030', type: 'prefab' },
   '/rock.prefab.json': { guid: '10000000-0000-4000-8000-000000000031', type: 'prefab' },
+  '/nested.prefab.json': { guid: '10000000-0000-4000-8000-000000000032', type: 'prefab' },
   '/env/sky.hdr':      { guid: '10000000-0000-4000-8000-000000000040', type: 'environment' },
 };
 const G = (path: string) => GUIDS[path].guid;
@@ -100,6 +101,13 @@ const fetchResponses: Record<string, any> = {
   '/sphere.mesh.json': { model: G('/island.glb'), mesh: 'sphere', postprocessor: 'none', material: G('/m1.mat.json') },
   '/tree.prefab.json': { version: 1, name: 'tree', rootLocalId: 1, entities: [] },
   '/rock.prefab.json': { version: 1, name: 'rock', rootLocalId: 1, entities: [] },
+  // version 2 = "this prefab nests another" (editor/scene/prefab.ts writes `nestedRefs.size > 0 ? 2 : 1`).
+  // The nested row's ref is a GUID like every other ref on disk — `acquirePrefab` does not
+  // recurse into nested rows today, so a PATH here would be inert AND wrong, and would quietly
+  // model a shape the serializer never writes the day transitive acquisition lands.
+  '/nested.prefab.json': { version: 2, name: 'nested', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: {} },
+      { localId: 2, name: 'Child', prefab: '10000000-0000-4000-8000-000000000030' }] },
   '/unknown.mat.json': { type: 'totally-bogus-material-type', color: 0x123456 },
   // '/bad.mat.json' intentionally absent → fetch returns ok:false (404 path).
 };
@@ -270,6 +278,23 @@ describe('refcount cache — prefab', () => {
     expect(getResourceStats().prefabs['/tree.prefab.json']).toBe(1);
   });
 
+  /** ⚠️ `version` is NOT a gate — the loader never reads it, and this test exists because the
+   *  repo briefly believed the opposite. #344 attributed an empty pooled grid to a prefab whose
+   *  `version` had been bumped to 2, and a guard was written pinning every committed prefab to 1
+   *  — but `fetchPrefab` (meshTemplateCache.ts) caches whatever parses, and `PrefabFile.version`
+   *  is typed `1 | 2` precisely because the editor WRITES 2 for a prefab that nests another
+   *  (`editor/scene/prefab.ts`: `nestedRefs.size > 0 ? 2 : 1`). Confirmed live on 2026-08-26:
+   *  games/space-console's spaceship prefab spawns byte-identically at 1 and at 2. */
+  it('caches a version-2 (nested) prefab exactly like a version-1 one — version is not a gate', async () => {
+    const { acquirePrefab, getCachedPrefab, getResourceStats } = await getCache();
+    await acquirePrefab(1, G('/nested.prefab.json'));
+    const doc = getCachedPrefab(G('/nested.prefab.json')) as { version: number; entities: unknown[] };
+    expect(doc).toBeDefined();
+    expect(doc.version).toBe(2);
+    expect(doc.entities).toHaveLength(2);
+    expect(getResourceStats().prefabs['/nested.prefab.json']).toBe(1);
+  });
+
   it('releasePrefab from last owner clears the cache entry', async () => {
     const { acquirePrefab, releasePrefab, getCachedPrefab } = await getCache();
     await acquirePrefab(1, G('/tree.prefab.json'));
@@ -310,6 +335,54 @@ describe('refcount cache — prefab', () => {
     const { invalidatePrefab } = await getCache();
     expect(() => invalidatePrefab('00000000-0000-4000-8000-0000000000ff')).not.toThrow();
     expect(() => invalidatePrefab('/never-cached.prefab.json')).not.toThrow();
+  });
+
+  /** #363 — the REAL `entryPrefabProvider`, against the REAL cache.
+   *
+   *  ⚠️ Every other test of that provider installs a FAKE one, which is verbatim the trap
+   *  `entryPrefabProvider.ts`'s own docstring already records: *"the prefab reads as permanently
+   *  uncached and the pool silently never spawns. Found by running it in a live editor; every
+   *  unit test faked this provider and so could not see it."* A fake cannot tell you that
+   *  `isCached` agrees with `spawnInstance` about what "cached" means, and that agreement is the
+   *  whole contract — a disagreement reports healthy while the pool starves, or spams a console
+   *  about a prefab that is working. */
+  describe('entryPrefabProvider.isCached (#363)', () => {
+    it('answers false before the acquire and true after — the same test spawnInstance gates on', async () => {
+      const { acquirePrefab, releasePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+
+      expect(entryPrefabProvider.isCached(G('/nested.prefab.json')), 'not acquired yet').toBe(false);
+      await acquirePrefab(1, G('/nested.prefab.json'));
+      expect(entryPrefabProvider.isCached(G('/nested.prefab.json')), 'cached after the acquire').toBe(true);
+      releasePrefab(1, G('/nested.prefab.json'));
+      expect(entryPrefabProvider.isCached(G('/nested.prefab.json')), 'released again').toBe(false);
+    });
+
+    it('an EMPTY entities array is not "cached" — it cannot spawn, so it must not report ready', async () => {
+      // `/tree.prefab.json` is `entities: []`. `spawnInstance` gates on `prefab?.entities` and
+      // would spawn nothing; a truthy `isCached` here would silence the warning for a prefab that
+      // renders an empty pool forever — the exact failure #363 exists to surface.
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/tree.prefab.json'));
+      expect(entryPrefabProvider.isCached(G('/tree.prefab.json'))).toBe(false);
+    });
+
+    it('CACHES a prefab at format version 2 — there is no version gate, and #344 said there was', async () => {
+      // ⚠️ Pinning a CORRECTION, not a behaviour anyone chose. #344's write-up (and #363's, and
+      // the now-deleted `prefabFormatVersion.test.ts`'s message) all stated that a `version` != 1
+      // "makes the prefab fail to cache — SILENTLY". No such gate exists: `fetchPrefab` fetches,
+      // parses and caches without ever reading `version`, and `editor/scene/prefab.ts` WRITES 2
+      // for any prefab containing nested-instance rows (`games/court/.../level-page.prefab.json`
+      // carries 25 such rows at version 1 and works). Acting on the theory has already cost two
+      // drive-by edits. If someone ever adds a real version gate, this test is where they find out
+      // it contradicts the serializer.
+      const { acquirePrefab, getCachedPrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/nested.prefab.json'));
+      expect((getCachedPrefab(G('/nested.prefab.json')) as { version?: number })?.version).toBe(2);
+      expect(entryPrefabProvider.isCached(G('/nested.prefab.json')), 'version 2 caches like any other').toBe(true);
+    });
   });
 });
 

@@ -96,4 +96,37 @@ describe('getAnimationClip', () => {
     cache.invalidateAnimationClip('anims/seed.anim.json');
     expect(cache.getAnimationClip('anims/seed.anim.json')).toBeNull(); // now re-fetches
   });
+
+  // `runtime/animation/**` had zero console.warn calls (QA-ANIM-0018): an Animator whose bank
+  // referenced a deleted/renamed-away clip GUID posed nothing, with no trace in the console — a
+  // parity gap against the 3D-material and 2D-sprite paths, which both warn once per unresolved
+  // guid via `resolveRefWarnOnce`.
+  it('warns once for a clip GUID absent from the manifest (parity with MeshCache/Sprite2D)', async () => {
+    const { cache } = await setup();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const guid = '99999999-2222-4333-8444-555555555555'; // never registered
+    expect(cache.getAnimationClip(guid)).toBeNull();
+    expect(cache.getAnimationClip(guid)).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain(guid);
+  });
+
+  it('forgets an unresolved guid once it resolves, so a later real deletion warns again', async () => {
+    const { manifest, cache } = await setup();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const guid = CLIP_JSON.id;
+    mockFetch(async () => ({ ok: true, json: async () => CLIP_JSON }));
+
+    expect(cache.getAnimationClip(guid)).toBeNull();       // transient miss — not registered yet
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    manifest.registerAsset(guid, 'anims/walk.anim.json', 'animation');
+    expect(cache.getAnimationClip(guid)).toBeNull();      // guid now resolves — kicks off the fetch
+    await flush();
+    expect(cache.getAnimationClip(guid)).not.toBeNull();  // loaded — and the guid is forgotten
+
+    manifest.clearManifest();                              // genuinely deleted later
+    expect(cache.getAnimationClip(guid)).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
 });

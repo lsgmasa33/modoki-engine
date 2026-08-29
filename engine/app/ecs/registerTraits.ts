@@ -727,7 +727,8 @@ export function registerAllTraits() {
       pitch: { type: 'number', min: 0.1, max: 4, step: 0.05, tooltip: 'Playback rate (1 = normal).' },
       loop: { type: 'boolean' },
       autoplay: { type: 'boolean', tooltip: 'Play automatically when the game starts.' },
-      crossfadeSec: { type: 'number', min: 0, step: 0.1, tooltip: 'Crossfade duration (s) when the clip changes while playing. 0 = hard cut.' },
+      crossfadeSec: { type: 'number', min: 0, step: 0.1, tooltip: 'Crossfade duration (s) when the clip changes while playing. 0 = hard cut. With a playlist this ALSO sets how early the next clip starts, so 0 means the swap only happens once the current clip has ended.' },
+      playlist: { type: 'enum', options: ['off', 'sequential', 'shuffle'], tooltip: 'Walk the clip bank instead of playing only Clip. The next clip starts crossfadeSec before this one ends (or right after it ends, if that window was missed). ⚠️ Leave Loop OFF — a looping clip never ends, so a playlist can never advance.' },
       playOnCue: { type: 'string', tooltip: 'Named cue that fires this as a one-shot (raised via cueSound). Empty = none.' },
       spatial: { type: 'boolean', tooltip: '3D positional audio — attenuates by distance from the AudioListener.' },
       refDistance: { type: 'number', min: 0, step: 0.5, section: 'Spatial', showWhen: { spatial: ['true'] }, tooltip: 'Distance at which volume is full.' },
@@ -777,14 +778,48 @@ export function registerAllTraits() {
   registerTrait({
     name: 'Time', trait: Time, category: 'resource',
     fields: {
-      // Pure runtime state — recomputed each frame by timeSystem, so runtimeOnly
-      // keeps them out of the serialized scene (no save churn). `timeScale` is
-      // the one authored knob and is intentionally NOT marked → it persists.
+      // ALL of Time is pure runtime state, so every field is `runtimeOnly` and none of it
+      // reaches a scene file. The cadence fields are recomputed each frame by timeSystem.
+      //
+      // `timeScale` was registered as "the one authored knob" and deliberately left unflagged
+      // until #410. Nothing ever AUTHORED it — no scene in games/ or demos/ sets it — while four
+      // purely TRANSIENT callers write it and none restore it: the
+      // `set-timescale` agent op, the `sim-step` op (which ends at 0 BY DESIGN, re-freezing the
+      // world on both the success and the timeout path), the on-device Time-tab slider, and
+      // `demos/video-demo`'s `demo.timeScale` UI action — a timeline SIGNAL track, so the value
+      // is authored in the timeline asset and the write itself is transient (the tour re-sets 1x
+      // at t=0, which is why a Stop mid-slow-mo never stranded a slowed clock). That fourth
+      // caller is a save-bake vector too, not a counter-example: it is the strongest argument
+      // for the flag, since it fires during ordinary PLAY rather than during inspection. An
+      // agent inspecting a stopped scene with two encouraged debug moves, followed by any save,
+      // baked `"timeScale": 0` into the scene — and that scene then SHIPS FROZEN. `setTimeScale`
+      // writes through koota's `updateEach`, so the `authoredWrites` stopped-write recorder never
+      // saw it either (it hooks `writeTraitField`); nor is it a system, so `runPipeline`'s
+      // skip-while-stopped gate does not cover it. Flagging it is the whole fix: the debug paths
+      // keep writing it freely, it simply stops being persistable.
+      //
+      // The flag stops NEW bakes; it does not heal an old one. Load and save are deliberately
+      // ASYMMETRIC: `runtimeOnly` gates the SERIALIZER, and nothing on the load side consults it
+      // — a plain scene entity's trait bag is spawned as-is (`loadSceneFile`'s first-pass
+      // `fieldData = traitData`, no per-field filter; the `isPersistentTraitField` gate further
+      // down is the prefab-OVERRIDE path only). So a scene already carrying `"timeScale": 0`
+      // still loads it and still boots frozen until something re-saves it. No committed scene or prefab carries the field today, so there is nothing to
+      // migrate — the only repo-wide hits are stale, gitignored build artifacts.
+      //
+      // Note this REMOVES a per-scene authored time scale, which the registration advertised and
+      // nothing used. If one is ever wanted, it belongs in the game's config resource, not here —
+      // a scene's pace is a designer balance knob, not frame-cadence state. Guarded corpus-wide by
+      // `tests/assets/runtimeOnlyFieldsOffDisk.test.ts` and behaviourally by
+      // `packages/modoki/tests/editor/timeResourceProvenance.test.ts`.
       delta: { type: 'number', readOnly: true, runtimeOnly: true },
       elapsed: { type: 'number', readOnly: true, runtimeOnly: true },
       frame: { type: 'number', readOnly: true, runtimeOnly: true },
       smoothedDelta: { type: 'number', readOnly: true, runtimeOnly: true },
       smoothedElapsed: { type: 'number', readOnly: true, runtimeOnly: true },
+      timeScale: {
+        type: 'number', readOnly: true, runtimeOnly: true,
+        tooltip: 'Live global time scale: 1 = normal, 0 = pause/time-stop, 0.3 = slow-mo, 2 = fast-forward. Runtime state, never saved — set it from the debug menu\'s Time tab or `modoki_set_timescale`, not here.',
+      },
     },
   });
 
@@ -927,8 +962,12 @@ export function registerAllTraits() {
       flexShrink: { type: 'number', step: 1, tooltip: 'How much this element shrinks when parent overflows.\n0 = don\'t shrink, 1 = shrink equally', ...S('Layout') },
       alignSelf: { type: 'enum', options: ['auto', 'flex-start', 'center', 'flex-end', 'stretch'], tooltip: 'Override parent alignItems for this element', ...S('Layout') },
       overflow: { type: 'enum', options: ['visible', 'hidden', 'scroll'], tooltip: 'What happens when children exceed bounds.\nvisible = no clipping, hidden = clip, scroll = scrollbar', ...S('Layout') },
+      scrollbarStyle: { type: 'enum', options: ['auto', 'tinted', 'hidden'], tooltip: 'How the scrollbar looks when overflow:scroll actually overflows.\nauto = the platform\'s own bar\ntinted = use the two colours below\nhidden = no bar (it still scrolls by drag)\n⚠️ Only applies when overflow is scroll.\n⚠️ hidden removes the only hint that content continues below.', ...S('Layout') },
+      scrollbarThumbColor: { type: 'color', tooltip: 'Scrollbar thumb colour. Only used when scrollbarStyle is "tinted".', ...S('Layout') },
+      scrollbarTrackColor: { type: 'color', tooltip: 'Scrollbar track colour. Only used when scrollbarStyle is "tinted".', ...S('Layout') },
       zIndex: { type: 'number', step: 1, tooltip: 'Stacking order among siblings', ...S('Layout') },
       rotation: { type: 'number', step: 1, tooltip: 'Tilt in degrees, clockwise. 0 = square.\nRotates about the ANCHOR PIVOT (the point that sits on the anchor point), so the anchor stays put as the angle changes; an unanchored or stretched element turns about its centre.\n\u26a0\ufe0f A non-zero rotation creates a stacking context, which traps the zIndex of everything inside it \u2014 tilt the card, not the layer holding it.\n\u26a0\ufe0f The editor selection overlay stays axis-aligned; the render is still correct.', ...S('Layout') },
+      scale: { type: 'number', step: 0.05, tooltip: 'Uniform scale. 1 = natural size.\nScales the RENDER, not the layout \u2014 the box keeps its laid-out size, so siblings do not reflow and text scales with the card (unlike keying width/height).\nScales about the ANCHOR PIVOT, so the anchor stays put as it grows; an unanchored or stretched element scales about its centre.\n\u26a0\ufe0f A scale other than 1 creates a stacking context, which traps the zIndex of everything inside it \u2014 scale the card, not the layer holding it.\n\u26a0\ufe0f The editor selection overlay stays at the unscaled rect; the render is still correct.', ...S('Layout') },
       pointerThrough: { type: 'boolean', tooltip: 'Never take the pointer — taps fall through to whatever is BEHIND this element.\nChildren keep their own (a button inside stays clickable).\nFor a decorative container drawn over something that must stay tappable.\nNOTE: on an overflow:scroll box this gives up scrolling it.', ...S('Layout') },
 
       // ── Child Layout section (Unity LayoutGroup — arranges THIS element's children) ──
@@ -1106,10 +1145,30 @@ export function registerAllTraits() {
       // ⚠️ Engine-written state and the game-written scrollTo request. HIDDEN rather than shown
       // read-only: an author editing scrollY would have it overwritten on the next scroll event,
       // which is a field that looks authored and is not.
-      scrollX: { type: 'number', hidden: true }, scrollY: { type: 'number', hidden: true },
-      viewportWidth: { type: 'number', hidden: true }, viewportHeight: { type: 'number', hidden: true },
-      contentWidth: { type: 'number', hidden: true }, contentHeight: { type: 'number', hidden: true },
-      scrollToX: { type: 'number', hidden: true }, scrollToY: { type: 'number', hidden: true },
+      //   `runtimeOnly` is the half that keeps them OFF DISK, and `hidden` cannot stand in for it
+      // (#406): hidden is an Inspector-display flag, while `serializeScene` skips `runtimeOnly`.
+      // Without it a save baked the LIVE measurement into the authored scene — a scroll-demo
+      // re-save wrote viewportWidth/Height + contentWidth/Height as 410x312, the editor's own
+      // measured UI viewport, into three committed scenes. Court authors two scroll views and
+      // ships, so the same save would have put one editor's viewport size into a shipping scene.
+      //   ⚠️ Known cost, accepted: the device WorldTab derives read-only as
+      // `hint.readOnly || hint.runtimeOnly` and does not filter `hidden`, so the scrollTo*
+      // REQUEST fields below can no longer be poked by hand in the on-device overlay. They are
+      // game-written requests, not measurements, so that surface was a real (if narrow) way to
+      // drive a scroll. It is not the only one — the `ui.scrollTo` action does the same job and is
+      // reachable from `device_dispatch_action` (games/scroll-demo authors two buttons on it) —
+      // and keeping a pending request off disk is worth more than the poke.
+      //   ⚠️ `scrollToBehavior` is the per-request half of the motion decision and belongs in THIS
+      // list; the authored `scrollBehavior` above must never be flagged. They were one field until
+      // #409, so a request with no `behavior` defaulted to 'instant', overwrote an author's
+      // 'smooth' for good, and the next save wrote the overwrite out as authored data. Flagging
+      // the authored field could not fix that — it would have deleted the author's choice
+      // instead — which is why the request got a field of its own.
+      scrollX: { type: 'number', hidden: true, runtimeOnly: true }, scrollY: { type: 'number', hidden: true, runtimeOnly: true },
+      viewportWidth: { type: 'number', hidden: true, runtimeOnly: true }, viewportHeight: { type: 'number', hidden: true, runtimeOnly: true },
+      contentWidth: { type: 'number', hidden: true, runtimeOnly: true }, contentHeight: { type: 'number', hidden: true, runtimeOnly: true },
+      scrollToX: { type: 'number', hidden: true, runtimeOnly: true }, scrollToY: { type: 'number', hidden: true, runtimeOnly: true },
+      scrollToBehavior: { type: 'enum', options: ['', 'instant', 'smooth'], hidden: true, runtimeOnly: true },
     },
   });
 
@@ -1130,16 +1189,24 @@ export function registerAllTraits() {
       gapY: { type: 'number', min: 0, tooltip: 'Gap between entries vertically, px.' },
       overscan: { type: 'number', min: 0, step: 1, tooltip: 'Entries kept beyond the viewport per edge, on top of the visible+1 floor. This is a FLOOR — the engine raises it to cover measured scroll travel, because a fixed value blanks on a fling (measured on a Galaxy A23: a hard fling traverses up to 4.56 entries between pool updates).' },
       source: { type: 'string', tooltip: 'Name of the registered entry source that fills an entry.' },
-      // Game-written data extent and the invalidation counter — not authored.
+      // Data extent — hidden from the Inspector, AUTHORED, and also refreshed at runtime by the
+      // game (`games/court/runtime/systems.ts` writes `countX: pages` every tick as levels
+      // unlock). Persisting them anyway is the deliberate call, and it is why these two alone
+      // keep no `runtimeOnly`: the value is needed at LOAD, before any system has run, so
+      // flagging them would delete authored data — court's pager reads countX 9 and
+      // scroll-demo's strip countY 5000 straight out of the scene. Do not read the absence of
+      // the flag as "nothing writes this".
       countX: { type: 'number', hidden: true }, countY: { type: 'number', hidden: true },
-      epoch: { type: 'number', hidden: true },
+      // Engine-written invalidation counter — `runtimeOnly` so a save cannot freeze a live epoch
+      // into the file (see UIScrollView's block for the failure this class produced, #406).
+      epoch: { type: 'number', hidden: true, runtimeOnly: true },
       // Game-written scroll request in ENTRY coordinates, consumed and cleared by the system.
-      scrollToEntryX: { type: 'number', hidden: true }, scrollToEntryY: { type: 'number', hidden: true },
+      scrollToEntryX: { type: 'number', hidden: true, runtimeOnly: true }, scrollToEntryY: { type: 'number', hidden: true, runtimeOnly: true },
       // Engine-written window state. Hidden rather than read-only for the same reason as
       // UIScrollView's: an author editing firstY would have it overwritten next frame.
-      firstX: { type: 'number', hidden: true }, firstY: { type: 'number', hidden: true },
-      visibleX: { type: 'number', hidden: true }, visibleY: { type: 'number', hidden: true },
-      poolSize: { type: 'number', hidden: true },
+      firstX: { type: 'number', hidden: true, runtimeOnly: true }, firstY: { type: 'number', hidden: true, runtimeOnly: true },
+      visibleX: { type: 'number', hidden: true, runtimeOnly: true }, visibleY: { type: 'number', hidden: true, runtimeOnly: true },
+      poolSize: { type: 'number', hidden: true, runtimeOnly: true },
     },
   });
 
@@ -1151,10 +1218,13 @@ export function registerAllTraits() {
     name: 'UIEntry', trait: UIEntry, category: 'component', componentCategory: 'UI',
     priority: 63.95,
     fields: {
-      x: { type: 'number', hidden: true }, y: { type: 'number', hidden: true },
-      index: { type: 'number', hidden: true }, slot: { type: 'number', hidden: true },
-      viewGuid: { type: 'string', hidden: true }, kind: { type: 'string', hidden: true },
-      live: { type: 'boolean', hidden: true },
+      // Every field is `runtimeOnly` as well as hidden: a pooled entry is Transient today, so the
+      // serializer never reaches one — but that is a property of WHERE it is spawned (inside a
+      // system tick), not of the trait, and this makes the trait itself unable to reach disk.
+      x: { type: 'number', hidden: true, runtimeOnly: true }, y: { type: 'number', hidden: true, runtimeOnly: true },
+      index: { type: 'number', hidden: true, runtimeOnly: true }, slot: { type: 'number', hidden: true, runtimeOnly: true },
+      viewGuid: { type: 'string', hidden: true, runtimeOnly: true }, kind: { type: 'string', hidden: true, runtimeOnly: true },
+      live: { type: 'boolean', hidden: true, runtimeOnly: true },
     },
   });
 

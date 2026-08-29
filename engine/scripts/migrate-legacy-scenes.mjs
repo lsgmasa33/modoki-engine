@@ -38,6 +38,8 @@
 
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { backendUrlForClone } from './editorPorts.mjs';
 
 const git = (...args) => execFileSync('git', args, { encoding: 'utf8' });
 const postTo = (backend) => async (path, body) => {
@@ -218,7 +220,20 @@ const committed = (p) => JSON.parse(git('show', `HEAD:${p}`));
  *  it is the safety-critical half, and a guard nobody has watched fail is not known to work
  *  (`engine/tests/plugins/migrateLegacyScenes.test.ts`). */
 async function main() {
-  const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(/\/$/, '');
+  // MODOKI_BACKEND used to default to a literal 'http://127.0.0.1:5179' — the HUB's pinned
+  // port — so a bare run from a worker clone silently drove the HUB's editor over HTTP
+  // instead of the caller's own (#349). Derive from the clone directory instead (this
+  // script lives at engine/scripts/, two levels below the repo root); an unknown clone with
+  // no explicit MODOKI_BACKEND gets a loud error rather than a wrong-clone default.
+  const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
+  const BACKEND = (process.env.MODOKI_BACKEND || backendUrlForClone(repoRoot))?.replace(/\/$/, '');
+  if (!BACKEND) {
+    console.error(
+      `[migrate-legacy-scenes] '${repoRoot}' is not a known clone and MODOKI_BACKEND is unset — ` +
+        `refusing to guess which editor to drive. Set MODOKI_BACKEND=http://127.0.0.1:<port> explicitly.`,
+    );
+    process.exit(2);
+  }
   const APPLY = process.argv.includes('--apply');
   const PROJECT = process.argv.slice(2).find((a) => !a.startsWith('--'));
   const post = postTo(BACKEND);

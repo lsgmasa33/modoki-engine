@@ -18,6 +18,7 @@ import { markUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
 import { spriteEpoch } from '../core/textureRefs';
 import { resolveUIFontFamily, resetFontRefWarnings } from './fontFamilyRef';
 import { scrollSnapChildStyle } from './scrollViewDom';
+import { NO_BEHAVIOR_REQUEST } from '../traits/UIScrollView';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
 import type { World } from 'koota';
 import type { UIActionBinding } from './bindings';
@@ -40,8 +41,9 @@ export interface UINodeData {
   marginLeft: number; marginLeftUnit: string;
   minWidth: number; minWidthUnit: string; maxWidth: number; maxWidthUnit: string;
   minHeight: number; minHeightUnit: string; maxHeight: number; maxHeightUnit: string;
-  alignSelf: string; zIndex: number; rotation: number;
+  alignSelf: string; zIndex: number; rotation: number; scale: number;
   overflow: string; isVisible: boolean; pointerThrough: boolean;
+  scrollbarStyle: string; scrollbarThumbColor: number; scrollbarTrackColor: number;
   // ── Style ──
   backgroundColor: number; backgroundOpacity: number;
   borderRadius: number; borderWidth: number; borderColor: number; borderOpacity: number;
@@ -100,7 +102,7 @@ export interface UINodeData {
    *  `UINode` writes it into the trait on every DOM scroll event without dirtying the tree. If it
    *  rode down in the projection, every scroll event would change this node, `nodesEqual` would
    *  fail, and the whole "a scroll frame costs nothing" property would be gone. */
-  scroll?: { axis: string; snap: string; snapStop: string; overscroll: string; scrollbar: string; wheel: string; scrollToX: number; scrollToY: number; scrollBehavior: string };
+  scroll?: { axis: string; snap: string; snapStop: string; overscroll: string; scrollbar: string; wheel: string; scrollToX: number; scrollToY: number; scrollToBehavior: string; scrollBehavior: string };
   /** True when this node is a pooled `UIEntries` entry. Its only job here is to name the SNAP
    *  TARGETS of an enclosing scroll view — see `stampSnapTargets`. */
   isEntry?: boolean;
@@ -353,11 +355,29 @@ function buildTree(world: World): UINodeData[] | null {
         minHeight: ui.minHeight || 0, minHeightUnit: ui.minHeightUnit || 'px',
         maxHeight: ui.maxHeight || 0, maxHeightUnit: ui.maxHeightUnit || 'px',
         alignSelf: ui.alignSelf || 'auto', zIndex: ui.zIndex || 0, rotation: ui.rotation || 0,
+        // `?? 1`, NOT `|| 1`: 0 is a legitimate authored scale (a pop-in clip's first keyframe),
+        // and `||` would silently promote it to full size — the animation would start already-open.
+        scale: ui.scale ?? 1,
         overflow: ui.overflow, isVisible: ui.isVisible,
         pointerThrough: ui.pointerThrough === true,
+        scrollbarStyle: ui.scrollbarStyle || 'auto',
+        scrollbarThumbColor: ui.scrollbarThumbColor ?? 0x888888,
+        scrollbarTrackColor: ui.scrollbarTrackColor ?? 0xdddddd,
         backgroundColor: ui.backgroundColor || 0, backgroundOpacity: ui.backgroundOpacity || 0,
         borderRadius: ui.borderRadius || 0, borderWidth: ui.borderWidth || 0,
-        borderColor: ui.borderColor || 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,
+        // `??`, not `||`, for the same reason as `scale` above: 0 is PURE BLACK, a legitimate
+        // authored colour, and `||` silently repainted it as the 0x333333 default. `textColor`
+        // two lines down already had this right. (`fontSize: ui.fontSize || 16` below is the same
+        // SHAPE but not the same bug — no scene authors `fontSize: 0`, and the trait default is
+        // 16, so that fallback is unreachable for a real trait. Left alone deliberately.)
+        //
+        // ⚠️ This change is VISIBLE, not theoretical: eleven elements in
+        // `games/alien-animal/runtime/assets/scenes/alien-animal.scene.json` author
+        // `borderColor: 0` with a non-zero `borderWidth` (Credits Button/Panel, Close Button,
+        // the seven Clip buttons, Cycle Button). They rendered #333333 before and render #000000
+        // now — i.e. what their author actually asked for. Called out because "a one-character
+        // fix" and "eleven borders in a shipped project got darker" are the same edit.
+        borderColor: ui.borderColor ?? 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,
         text: ui.text || '', fontFamily: resolveUIFontFamily(ui.fontFamily as string, ui.systemFont as string),
         fontSize: ui.fontSize || 16, fontSizeUnit: ui.fontSizeUnit || 'px', fontWeight: ui.fontWeight || 'normal',
         fontStyle: ui.fontStyle || 'normal', textColor: ui.textColor ?? 0xffffff, textOpacity: ui.textOpacity ?? 1,
@@ -454,6 +474,9 @@ function buildTree(world: World): UINodeData[] | null {
           axis: sv.axis ?? 'y', snap: sv.snap ?? 'none', snapStop: sv.snapStop ?? 'normal',
           overscroll: sv.overscroll ?? 'auto', scrollbar: sv.scrollbar ?? 'auto', wheel: sv.wheel ?? 'native',
           scrollToX: sv.scrollToX ?? -1, scrollToY: sv.scrollToY ?? -1,
+          // Both halves of the motion decision ride down: the transient per-request override and
+          // the authored default it falls back to (#409). `pendingScrollTo` resolves the pair.
+          scrollToBehavior: sv.scrollToBehavior ?? NO_BEHAVIOR_REQUEST,
           scrollBehavior: sv.scrollBehavior ?? 'instant',
         };
       }

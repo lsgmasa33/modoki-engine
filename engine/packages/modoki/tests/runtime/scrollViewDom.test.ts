@@ -26,7 +26,8 @@ import { scrollViewStyle, scrollSnapChildStyle, pendingScrollTo, clearScrollRequ
 
 const base = (over: Partial<ScrollViewNodeData> = {}): ScrollViewNodeData => ({
   axis: 'y', snap: 'none', snapStop: 'normal', overscroll: 'auto', scrollbar: 'auto',
-  scrollToX: NO_SCROLL_REQUEST, scrollToY: NO_SCROLL_REQUEST, scrollBehavior: 'instant', ...over,
+  scrollToX: NO_SCROLL_REQUEST, scrollToY: NO_SCROLL_REQUEST, scrollToBehavior: '',
+  scrollBehavior: 'instant', ...over,
 });
 
 describe('scrollViewStyle', () => {
@@ -89,6 +90,24 @@ describe('pendingScrollTo', () => {
     expect(pendingScrollTo(base({ scrollToY: 1, scrollBehavior: 'smooth' }))!.behavior).toBe('smooth');
     expect(pendingScrollTo(base({ scrollToY: 1, scrollBehavior: 'nonsense' }))!.behavior).toBe('instant');
   });
+
+  /** #409 — the per-request behaviour and the authored default were ONE field, so every request
+   *  rewrote the author's choice and the next save baked it into the scene. These pin the two
+   *  roles apart at the point where they meet. */
+  it('lets a request OVERRIDE the authored default, in both directions', () => {
+    const smoothAuthored = base({ scrollToY: 1, scrollBehavior: 'smooth' });
+    expect(pendingScrollTo({ ...smoothAuthored, scrollToBehavior: 'instant' })!.behavior).toBe('instant');
+    const instantAuthored = base({ scrollToY: 1, scrollBehavior: 'instant' });
+    expect(pendingScrollTo({ ...instantAuthored, scrollToBehavior: 'smooth' })!.behavior).toBe('smooth');
+  });
+
+  it('falls back to the AUTHORED behaviour when the request names none', () => {
+    // `''` is "no override" — not "instant". A view authored 'smooth' moves smoothly for a
+    // request that said nothing, which is the only reading that leaves the authored field
+    // meaning anything.
+    expect(pendingScrollTo(base({ scrollToY: 1, scrollBehavior: 'smooth', scrollToBehavior: '' }))!.behavior)
+      .toBe('smooth');
+  });
 });
 
 describe('clearScrollRequest', () => {
@@ -105,6 +124,18 @@ describe('clearScrollRequest', () => {
     testWorld.query(UIScrollView).updateEach(([v]: any[]) => { sv = v; });
     expect(sv.scrollToY).toBe(NO_SCROLL_REQUEST);
     expect(dirtySpy).toHaveBeenCalled();
+  });
+
+  it('consumes the per-request behaviour with the request, leaving the AUTHORED one alone', () => {
+    // Both halves of #409: the override is part of the request and must not outlive it (or it
+    // would keep steering later requests that named no behaviour), and the authored default is
+    // not the engine's to touch.
+    testWorld.spawn(UIScrollView({ scrollToY: 4800, scrollToBehavior: 'smooth', scrollBehavior: 'instant' }));
+    clearScrollRequest('view-guid');
+    let sv: any;
+    testWorld.query(UIScrollView).updateEach(([v]: any[]) => { sv = v; });
+    expect(sv.scrollToBehavior).toBe('');
+    expect(sv.scrollBehavior).toBe('instant');
   });
 
   it('does nothing — and does NOT dirty — when there is no request pending', () => {

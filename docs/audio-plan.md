@@ -158,7 +158,7 @@ Commits `25f3b2f` + `633abcf` (review fixes).
   (the Audio Inspector's Apply button, which passes the path) evicted nothing and the game
   kept playing the pre-conversion buffer until an editor restart. The batch/agent re-import
   paths did not call it at all. Both fixed in #304's close-out; the chain and the shared
-  event behind it are in [editor.md](editor.md) § "An asset preview keyed on the PATH".
+  event behind it are in [editor.md](editor.md) § "The asset Inspector" (rule 3, the preview keyed on the PATH).
 
 - **Pipeline parity with textures** — the scanner bakes the `audio` block (loadType
   always; format+ext once converted) into the manifest, serves the `~audio.<ext>`
@@ -218,6 +218,68 @@ trait fields controlled by built-in actions** — and every game gets it for fre
   `UIBinding` highlight watching `crossfadeSec`, sliders → `audio.setBusVolume`, SFX →
   `audio.playOneShot`. **`setup.ts` is empty no-ops; the per-game `mixStore` is
   deleted.** No game code, no `AudioDemoManager` — the logic went into the engine.
+- **`AudioSource.playlist` WALKS that bank** (2026-08-28) — `'off'` (default, unchanged
+  behaviour) | `'sequential'` | `'shuffle'`. Until this, nothing walked the bank at all: a
+  source plays the ONE guid in `clip`, so a twelve-track bank shipped twelve tracks and played
+  the first, and every game wanting background music wrote the same loop (games/court did,
+  for half a day, before this replaced it).
+  - ⚠️ **TWO triggers, and the second is not optional.** The cross-fade trigger fires BEFORE the
+    clip ends — `remainingSec <= crossfadeSec` — because waiting for the end is too late: by then
+    there is no live voice left to fade OUT, so there is nothing to cross-fade and the next clip
+    starts at full volume against silence. So the AUTHORED crossfade decides both how long the
+    blend is and when it starts, one number with no second knob to keep in step.
+    But that is a WINDOW that must be observed on a frame, and it can be missed:
+    - at the trait default **`crossfadeSec: 0` the window is the single instant
+      `remaining === 0`**, which a 60 Hz tick essentially never samples;
+    - even at 1.5 s, anything that stops rAF across a clip boundary — a phone backgrounding the
+      app, a long asset hitch — steps straight over it.
+
+    Missing it used to be **permanent**: the finished source set `playing = false`, the playlist
+    block is gated on `playing`, and `autoplayed` already held the id so autoplay could not
+    re-fire. One missed window ended the music for the session, with `playing: false` in the
+    Inspector and no warning. So a clip that HAS ended now advances unconditionally — no
+    threshold, no latch — and a non-playlist source still falls silent as it always did.
+    Pinned by `audioPlaylistSystem.test.ts` at `crossfadeSec` 0 **and** 1.5.
+  - Needed `AudioHandle.remainingSec()`: a media element has a real playhead (`currentTime`),
+    a buffer node exposes none, so its position comes off the AUDIO clock — the same clock the
+    fade ramps run on, so the two agree.
+  - ⚠️ **A playlist source must not `loop`.** A looping clip never runs out, and
+    `remainingSec()` returns `null` for one precisely so nothing mistakes it for a clip about
+    to end. `audioSystem` warns ONCE when both are set, because the bank looks perfectly valid
+    in the Inspector and nothing else would ever say why only clip one plays.
+  - ⚠️ **`null` means "not knowable yet", never 0** — a stream reports it until metadata loads,
+    and record mode has no audio clock. Read as 0 it swaps on the first frame of every clip.
+  - ⚠️ **The in-flight latch clears on the remaining time climbing back, never on `clip`
+    matching what was asked for.** The system writes that field itself, so it matches on the
+    very next frame while the engine is still winding up the new voice and the handle still
+    reports the OLD clip's remainder — below the threshold. Comparing the clip made the latch a
+    no-op and the playlist tore through the bank in a handful of frames.
+  - **`'shuffle'` still opens on the authored `clip`.** `buildOrder` rotates the shuffled order so
+    the current clip is at the front — right for a hot reload, which must not restart the music —
+    so a cold boot always begins with whatever the scene authored and only the ORDER AFTER it
+    varies. Deliberate (the scene picks the opener), but it is not what "shuffle" implies; making
+    the first track random too is a one-line change to `buildOrder`.
+  - The shuffle is the ONE entry in the determinism guard's `ALLOW_RANDOM`. Cosmetic by
+    construction — a playlist order reaches no game state, journal event or replay — and routing
+    it through the seeded RNG would be actively WRONG: it would consume the stream gameplay
+    draws from, so which track plays would change which level is generated.
+  - `runtime/audio/playlist.ts` · `engine/tests/framework/audioPlaylist.test.ts`.
+- **`ui.click` — a built-in button-click cue** (2026-08-28). `applyBindings` raises it once per
+  bound `click`; a game opts in by authoring ONE `AudioSource` with `playOnCue: 'ui.click'`, and
+  a game that authors none hears nothing.
+  - ⚠️ It lives at the BINDING layer because **a game cannot see every button**. Court put its
+    click on its own chrome dispatcher and the settings panel stayed silent — those rows open and
+    close through plain `set` bindings authored in the scene, so no game code runs there at all.
+    Any per-button fix is a list somebody maintains, and it goes stale on the first button added.
+  - `runtime/ui/` may not import `runtime/audio/` (both L2), so it is **inverted by
+    registration**: `registerAudioControls` installs it via `setUIClickCue`, the same shape as
+    `setAudioWorldPositionResolver`. Unregistered → silent.
+  - Only `'click'`: `change` fires continuously during a slider drag, `submit` is a keystroke.
+- **An interactive control swallows its own click** (2026-08-28) — `range` and text `input` stop
+  propagation, as the toggle branch always did. Without it a slider inside the canonical
+  dismiss-on-backdrop panel closes that panel on every adjustment, which is exactly what Court's
+  volume sliders did. `engine/tests/ui/uiInteractiveClickIsolation.test.tsx` pins it, with a plain
+  `div` as the control that still DOES reach the backdrop.
 - **Named clip bank on `AudioSource`** (`AudioSource.clips` — a **JSON-string**
   `[{"key","ref"}]`) — a source owns several playable sounds keyed by a **stable
   string** (Unity's "AudioSource + array of AudioClips indexed by name").

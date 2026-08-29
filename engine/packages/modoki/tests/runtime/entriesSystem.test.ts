@@ -67,6 +67,7 @@ function makeProvider() {
   const spawned: number[] = [];
   return {
     spawned,
+    isCached: () => true,
     rootSize: () => ({ width: 0, height: ENTRY_H }),
     spawnInstance: (world: any, _guid: string, opts: { parentId: number; guidSeed: string }) => {
       const root = world.spawn(UIElement({ height: ENTRY_H }), RenderableUI(),
@@ -411,7 +412,10 @@ describe('entriesSystem', () => {
 
     const sv = view.get(UIScrollView) as any;
     expect(sv.scrollToY).toBe(42 * ENTRY_H);      // entries -> px, using the size the system resolved
-    expect(sv.scrollBehavior).toBe('smooth');
+    expect(sv.scrollToBehavior).toBe('smooth');
+    // ⚠️ The per-request behaviour rides `scrollToBehavior`; the AUTHORED `scrollBehavior` is
+    // untouched by a request (#409) — it used to be the field the request was stored on.
+    expect(sv.scrollBehavior).toBe('instant');
     // Cleared immediately: leaving it set would re-issue the same scroll every frame and pin
     // the view in place.
     const en = view.get(UIEntries) as any;
@@ -603,7 +607,7 @@ describe('entriesSystem', () => {
     const { sys, src, view } = await setup();
     const api = await import('../../src/runtime/ui/scrollApi');
     src.registerEntrySource('test.rows', () => ({ members: {} }));
-    sys.setEntryPrefabProvider({ rootSize: () => ({ width: 0, height: 0 }), spawnInstance: () => 0 });
+    sys.setEntryPrefabProvider({ isCached: () => false, rootSize: () => ({ width: 0, height: 0 }), spawnInstance: () => 0 });
 
     api.scrollToEntry('view-guid', { y: 42 });
     sys.entriesSystem(testWorld);
@@ -634,6 +638,146 @@ describe('entriesSystem', () => {
     sys.entriesSystem(testWorld);
     sys.entriesSystem(testWorld);
     expect(warn.mock.calls.filter(c => String(c[0]).includes('renders blank'))).toHaveLength(1);
+  });
+
+  // ── #363: a prefab that NEVER caches must say so, not retry silently forever ──
+  //
+  // The cost of the silence, measured: Court #344 set `"version": 2` on `level-tile.prefab.json`,
+  // the loader declined to cache it, `spawnInstance` returned 0 on every frame forever, and the
+  // pooled level selector rendered an empty grid. Nothing went red — `npm run verify` green at
+  // 8,462 tests, all 40 of the feature's own tests green, `validatePrefabData` green — because
+  // every one of them reads the prefab FILE, and the file was well-formed. The console was empty.
+
+  /** A provider that is cached only once `cached.value` flips — the transient/permanent seam. */
+  function stubProvider(cached: { value: boolean }, size = { width: 0, height: ENTRY_H }) {
+    const spawns: string[] = [];
+    return {
+      spawns,
+      isCached: () => cached.value,
+      rootSize: () => (cached.value ? size : { width: 0, height: 0 }),
+      spawnInstance: (_w: any, guid: string) => { spawns.push(guid); return 0; },
+    };
+  }
+
+  it('warns once the entry prefab has been uncached for 120 consecutive ticks', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src } = await setup();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.setEntryPrefabProvider(stubProvider({ value: false }));
+
+    for (let i = 0; i < 119; i++) sys.entriesSystem(testWorld);
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('STILL not cached'))).toHaveLength(0);
+
+    sys.entriesSystem(testWorld);   // the 120th
+    const calls = warn.mock.calls.filter(c => String(c[0]).includes('STILL not cached'));
+    expect(calls).toHaveLength(1);
+    // The message must name the view and the prefab — a bare "a prefab is not cached" sends the
+    // reader back to the same hunt this exists to end.
+    expect(String(calls[0][0])).toContain('view-guid');
+    expect(String(calls[0][0])).toContain(PREFAB);
+    // ⚠️ And it must NOT resurrect the `version` theory. An earlier draft told the author to check
+    // that the prefab's `version` is 1; no such gate exists in the loader, and the editor's
+    // serializer writes 2 for a prefab with nested-instance rows — so that advice would have had
+    // people break a legitimate format marker. See resourceRefcount.test.ts § entryPrefabProvider.
+    expect(String(calls[0][0]).toLowerCase(), 'the disproved version theory must not come back').not.toContain('version');
+  });
+
+  it('stays SILENT for a transient miss — the normal first frames of a scene load', async () => {
+    // The whole point of the retry is that "not cached yet" is normal while the scene loads.
+    // A diagnostic that cannot tell that from a permanent miss is worse than none.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src } = await setup();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    const cached = { value: false };
+    sys.setEntryPrefabProvider(stubProvider(cached));
+
+    for (let i = 0; i < 119; i++) sys.entriesSystem(testWorld);
+    cached.value = true;                                   // the asset lands
+    for (let i = 0; i < 200; i++) sys.entriesSystem(testWorld);
+
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('STILL not cached'))).toHaveLength(0);
+  });
+
+  it('RESETS the count on a cache hit, so two short misses never sum to a false alarm', async () => {
+    // ⚠️ Mutation-pinned. The test above cannot tell "reset to 0" from "stop counting" — both
+    // leave it silent — so on its own it lets `return 0` be weakened to `return prior`. A cache
+    // that comes and goes (a scene swap re-acquiring, an eviction) would then accumulate across
+    // unrelated gaps and warn about a prefab that is working.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src } = await setup();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    const cached = { value: false };
+    sys.setEntryPrefabProvider(stubProvider(cached));
+
+    for (let i = 0; i < 100; i++) sys.entriesSystem(testWorld);   // 100 uncached
+    cached.value = true;
+    sys.entriesSystem(testWorld);                                  // one hit — resets
+    cached.value = false;
+    for (let i = 0; i < 100; i++) sys.entriesSystem(testWorld);   // 100 more: 200 in total
+
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('STILL not cached'))).toHaveLength(0);
+  });
+
+  it('warns ONCE, not on every tick past the threshold', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src } = await setup();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.setEntryPrefabProvider(stubProvider({ value: false }));
+
+    for (let i = 0; i < 400; i++) sys.entriesSystem(testWorld);
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('STILL not cached'))).toHaveLength(1);
+  });
+
+  // ⚠️ **BOTH entrances, and they are genuinely different code paths.** An uncached prefab makes
+  // the view blank two ways, and a diagnostic driven by pool starvation would only ever see one:
+  //
+  //   entryHeight: 0  ("read it from the prefab") -> rootSize 0 -> stride 0 -> EMPTY_WINDOW ->
+  //                   a plan of ZERO slots, so `ensurePool` is never asked to spawn at all.
+  //   entryHeight: N  (authored) -> a full plan -> `ensurePool` DOES ask, and is handed 0 on
+  //                   every frame forever.
+  //
+  // The first is the one that reads most like "the feature is broken", and it is the one with no
+  // starved pool to observe. `setup()`'s own default is `entryHeight: 0`, so the pair below names
+  // both explicitly rather than leaning on it — an earlier version passed `{ entryHeight: 0 }`
+  // believing it was overriding something, and ran the same configuration twice.
+  it('warns via the ZERO-PLAN entrance, where the pool is never even asked to spawn', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src } = await setup({ entryHeight: 0, entryHeightUnit: 'px' });
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    const p = stubProvider({ value: false });
+    sys.setEntryPrefabProvider(p);
+
+    for (let i = 0; i < 120; i++) sys.entriesSystem(testWorld);
+
+    // The load-bearing half: any future rewrite that diagnoses from a STARVED POOL fails here,
+    // because there is no starved pool to see.
+    expect(p.spawns, 'spawnInstance is never called in this entrance').toHaveLength(0);
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('STILL not cached'))).toHaveLength(1);
+  });
+
+  it('warns via the STARVED-POOL entrance too, where spawnInstance is asked and refused', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src } = await setup({ entryHeight: ENTRY_H, entryHeightUnit: 'px' });
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    const p = stubProvider({ value: false });
+    sys.setEntryPrefabProvider(p);
+
+    for (let i = 0; i < 120; i++) sys.entriesSystem(testWorld);
+
+    expect(p.spawns.length, 'this entrance DOES ask, and keeps being refused').toBeGreaterThan(0);
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('STILL not cached'))).toHaveLength(1);
+  });
+
+  it('counts pipeline TICKS, not scroll-event drives', async () => {
+    // The scroll drive re-enters the same code path to remove a frame of latency; counting it
+    // would make the threshold depend on how hard the player is flicking.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src } = await setup();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.setEntryPrefabProvider(stubProvider({ value: false }));
+
+    for (let i = 0; i < 400; i++) sys.entriesSystem(testWorld, { fromScroll: true });
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('STILL not cached'))).toHaveLength(0);
   });
 
   it('does nothing without a provider rather than throwing', async () => {

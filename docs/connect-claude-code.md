@@ -557,6 +557,59 @@ This is a **Percept doctrine violation**: the status surface reported CONFIGURED
 > (the C8 nonce). The nonce makes a foreign endpoint provably not-ours, so a collision surfaces as
 > "in use by another editor" instead of a silent green. The sticky CDP port (item 5) also landed.
 
+#### The same doctrine violation, the other way round: `cdpEnabled` read the ENV (#356)
+
+The section above fixed reporting a pref as if the port had **bound**. `cdpEnabled` kept a second
+instance of the same class for months afterwards, one level further back: it reported whether main
+had been **told** about CDP, not whether Chromium was opening a port at all.
+
+**Mechanism.** `launch-editor.sh` passes the port to Chromium as an **argv flag**
+(`--remote-debugging-port=$CDP_PORT`) and never `export`s `MODOKI_CDP_PORT`. The dev branch of
+`resolveCdpConfig` read `env.MODOKI_CDP_PORT`. So whenever the launcher *derived* the port — a bare
+`launch-editor.sh`, which is the common case — Chromium got CDP and main did not know:
+
+```
+$ env -u MODOKI_CDP_PORT engine/scripts/launch-editor.sh games/3d-test
+[launch-editor]   CDP:  http://127.0.0.1:9225
+$ curl -s 127.0.0.1:5182/api/identity
+{…,"cdpEnabled":false,"cdpPort":null,"cdpReachable":false,"cdpOurs":false}   # all four wrong
+```
+
+An agent reading that field concluded raw CDP was unavailable and fell back to
+`modoki_capture_viewport` — which does **not** force a render, and is exactly the tool the CDP
+escape hatch exists to replace for render-on-demand and stale-frame bugs.
+
+**The fix.** `resolveCdpConfig` takes a `switchPort` — the value Chromium actually received, read
+from its own command line via `app.commandLine.getSwitchValue('remote-debugging-port')`. An
+observation outranks the env (a request) and the pref (a preference), in both branches.
+
+**Why not just `export MODOKI_CDP_PORT` from the launcher** — it was one line, and it is the wrong
+line. It would make main report the *request* accurately, and a variable set with no endpoint behind
+it lies in the other direction. The doctrine is "report what IS", and the command line is the only
+thing on that path that IS.
+
+Three edges the review turned up, all fixed in the same change:
+
+- **Reporting and appending must key off DIFFERENT tests.** `enabled` keys off *validity* (an
+  unparseable switch names no port we can honestly report); `openSwitch` keys off *presence*,
+  because `--remote-debugging-port=abc` still occupies the flag. Collapsing them would append a
+  **second** flag whose winner nobody has measured. Never create the duplicate and the question
+  never has to be answered.
+- **A port we did not choose must not enter the sticky memo.** `rememberCdpPort` now also requires
+  `CDP.openSwitch`. Otherwise one hand-typed `Modoki.app --remote-debugging-port=9350` writes
+  `{port:9350, ours:true}`, and every later double-click launch sticks on 9350 forever — the app
+  silently stops using its own default, healing only on an eventual collision.
+- **`isValidCdpPort` was looser than Chromium's parser**, accepting `'1e3'`, `'0x2400'` and
+  `' 9223'` where `base::StringToInt` takes 0 and an ephemeral port. It now matches the
+  `^[0-9]+$` rule `launch-editor.sh` already claimed to mirror — and it matters more now, because
+  this validator judges an observation rather than only our own env.
+
+**Known, NOT fixed:** unchecking "renderer debugging (CDP)" in the packaged AI panel is a silent
+dead end when the app was launched from a CLI carrying the switch. `app.relaunch()` restarts on
+`process.argv`, which still has it, so the box comes back checked and the handler reported `ok`.
+This pre-dates #356 via `MODOKI_CDP_PORT`; #356 adds a second trigger. Left for the owner: what the
+toggle *should* do when an outer launch forces CDP on is a UX call, not a defect with one answer.
+
 #### The per-launch NONCE
 
 C8's "is this endpoint ours?" stacked two HEURISTICS, each with a documented false edge: an

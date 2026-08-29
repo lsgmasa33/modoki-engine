@@ -109,7 +109,7 @@ import { portCandidates, readLastPort, writeLastPort, parseBackendPort } from '.
 import { buildMcpServerEntry, buildChromeDevtoolsEntry, mergeMcpConfig, isMcpStale, mcpChromePort, isMcpTokenForeign, ensureMcpGitignored, detectClaudeCli, atomicWriteFileSync, healMcpPort, resolveMcpTarget, mcpHasModoki, mcpBackendRaw, gitTrackedState, ensureProjectClaudeMd } from './connectClaude';
 import { ensureToken } from './instanceToken';
 import { vendorEnginePlugins, writeVendorMarker, type VendorResult } from '../plugins/vendorPlugins';
-import { composeDepsInstallError } from './projectDeps';
+import { composeDepsInstallError, hasStaleWorkspaceLink } from './projectDeps';
 import { healNativeConfig } from '../plugins/healNativeConfig';
 import { setupAutoUpdate, checkForUpdatesInteractive, isUpdateInstalling } from './autoUpdate';
 import { restoreZoom, handleZoom, setUiPrefsDir } from './zoom';
@@ -253,7 +253,11 @@ async function installProjectDeps(cwd: string, opts: { preferCi: boolean }): Pro
  *
  * Skips when: the project has no package.json, it's the editor repo itself (its
  * deps are already managed), it has nothing to install (no deps/workspaces), or
- * node_modules already exists (cheap heuristic — avoids reinstalling every open).
+ * node_modules already exists AND none of the project's own workspace packages
+ * are missing from it (hasStaleWorkspaceLink — the #215/#326 class: node_modules
+ * present but one workspace symlink stale, which a bare existence check misses).
+ * Still a cheap heuristic overall — avoids reinstalling every open in the common
+ * case where nothing is actually wrong.
  */
 /** Heal a project's native config on open — idempotent, dep-INDEPENDENT: writes a
  *  machine-local android/local.properties, syncs iOS DEVELOPMENT_TEAM from
@@ -284,7 +288,7 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   const pkgPath = path.join(projectRoot, 'package.json');
   if (!fs.existsSync(pkgPath)) return; // not an npm project
 
-  let pkg: { dependencies?: object; devDependencies?: object; workspaces?: unknown };
+  let pkg: { dependencies?: object; devDependencies?: object; workspaces?: unknown; scripts?: Record<string, string> };
   try {
     pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
   } catch {
@@ -303,7 +307,10 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   // and point the dep at it (no symlink; dmg-safe). This may rewrite package.json
   // (migrating off the old file:../../engine dir-symlink) and/or regenerate the
   // gitignored tarball, in which case node_modules must be (re)built.
-  let needsInstall = !fs.existsSync(path.join(projectRoot, 'node_modules'));
+  // The plain existence check misses the #215 class: node_modules present overall but one of
+  // THIS project's own workspace packages missing from it (see hasStaleWorkspaceLink's comment).
+  let needsInstall = !fs.existsSync(path.join(projectRoot, 'node_modules'))
+    || hasStaleWorkspaceLink(projectRoot, pkg, fs);
   let vendorResult: VendorResult | null = null;
   let vendorError: string | null = null;
   try {
@@ -341,6 +348,24 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   // detect a stale extraction (D3).
   if (vendorResult) writeVendorMarker(projectRoot, vendorResult.expectedVendor);
   console.log(`[modoki-electron] dependencies installed for ${projectRoot}`);
+
+  // `npm install` only creates the WORKSPACE SYMLINK for a project-owned native plugin (e.g.
+  // games/court's capacitor-applovin-max) — it does not build it. Those plugins ship their JS
+  // only in a gitignored `dist/` (bootstrap-game-deps.mjs's own comment on this exact class), so
+  // an install that stops here can leave the symlink restored and the import still unresolved:
+  // `Failed to resolve import "capacitor-applovin-max"`, now AFTER a log line that reads as
+  // success. bootstrap-game-deps.mjs already runs `build:plugins` after every install for
+  // exactly this reason; this ports that, non-fatally (a broken plugin build shouldn't block
+  // opening the rest of the project, same posture as a vendoring failure above).
+  if (pkg.scripts?.['build:plugins']) {
+    console.log(`[modoki-electron] building plugins for ${projectRoot} …`);
+    try {
+      const code = await runNpm(projectRoot, ['run', 'build:plugins', '--if-present']);
+      if (code !== 0) throw new Error(`npm run build:plugins exited with code ${code}`);
+    } catch (e) {
+      console.warn(`[modoki-electron] build:plugins failed (continuing): ${e instanceof Error ? e.message : e}`);
+    }
+  }
 }
 
 // The Vite dev-server origin the renderer loads from. Resolved at startup:
@@ -394,6 +419,11 @@ const CDP = resolveCdpConfig({
   // Sticky ladder (§12.2 item 5): last launch's port + whether it bound ours, so a 9222
   // collision advances instead of dead-ending. Packaged only (dev's port is launcher-pinned).
   memo: app.isPackaged ? readCdpPortMemo(app.getPath('userData')) : null,
+  // What Chromium ACTUALLY got, read from its own command line rather than from our env
+  // (#356). This is read BEFORE the appendSwitch below, so in the packaged app it sees only
+  // a switch that came from the OS/CLI — never our own. `getSwitchValue` returns '' when
+  // absent, which isValidCdpPort rejects.
+  switchPort: app.commandLine.getSwitchValue('remote-debugging-port'),
 });
 if (CDP.openSwitch) {
   app.commandLine.appendSwitch('remote-debugging-port', String(CDP.port));
@@ -901,9 +931,10 @@ function refreshInstanceToken(): void {
  *  of reload (not earlier) so the OLD renderer can't consume it first. */
 let pendingOpenProjectSettings = false;
 
-/** The OBSERVED CDP state — never the pref alone. `cdpEnabled` only means "we asked
- *  Chromium for the port"; it can fail to bind silently, or the port can belong to a
- *  DIFFERENT editor (see probeCdp). Everything user- or agent-facing must key off this,
+/** The OBSERVED CDP state — never the pref alone. `cdpEnabled` only means "Chromium was
+ *  asked for the port" (since #356, read off its own command line, so a launcher-derived
+ *  port no longer reports as disabled); it can still fail to bind silently, or the port can
+ *  belong to a DIFFERENT editor (see probeCdp). Everything user- or agent-facing keys off this,
  *  so we never again report a green CDP that is really someone else's renderer.
  *  Short TTL: the panel polls ~2.5s and identity is hit per MCP process, so one probe
  *  serves them all without hammering the endpoint. */
@@ -931,6 +962,13 @@ async function cdpStatus(): Promise<CdpStatus> {
  *  cdpMemoVerdict keeps a TRANSIENT probe timeout from advancing off a good port. */
 function rememberCdpPort(probe: CdpProbe): void {
   if (!app.isPackaged || !healedAfterMount || !CDP.enabled) return;
+  // ⚠️ Never memoise a port we did not CHOOSE (#356 review). The memo answers "which port should
+  // the ladder try next time", and since the port can now come from an observed `--remote-debugging-port`,
+  // one hand-typed launch (`Modoki.app --remote-debugging-port=9350`) would otherwise write
+  // {port:9350, ours:true} and every later double-click launch would stick on 9350 forever — the
+  // app silently stops using its own default, and only a collision ever heals it. `openSwitch` is
+  // exactly "main picked this port and opened it", so it is the right thing to gate on.
+  if (!CDP.openSwitch) return;
   const verdict = cdpMemoVerdict(probe);
   if (verdict === null || _cdpMemoWrittenOurs === verdict) return;
   _cdpMemoWrittenOurs = verdict;
@@ -1789,6 +1827,18 @@ app.whenReady().then(async () => {
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
+  });
+
+  // PlayerPrefs durability (#335): Chromium's localStorage-backed LevelDB store commits to
+  // disk only on a clean shutdown, so a SIGKILL right after `flush()` resolves can still lose
+  // the write. `session.flushStorageData()` is a real, main-process-only hook that forces that
+  // commit — PlayerPrefs' Electron/web backend calls this after every write reaches
+  // `localStorage`, shrinking the loss window to "the one write in flight" (docs/player-prefs.md
+  // § Gotchas).
+  ipcMain.handle('modoki:flush-storage-data', (e) => {
+    if (!fromMainFrame(e)) return { ok: false, error: 'untrusted frame' };
+    mainWindow?.webContents.session.flushStorageData();
+    return { ok: true };
   });
 
   ipcMain.handle('modoki:set-cdp-enabled', (e, enabled: boolean) => {

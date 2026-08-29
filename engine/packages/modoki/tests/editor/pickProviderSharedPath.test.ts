@@ -75,4 +75,24 @@ describe('SceneView pick providers share the pointer handler\'s own code path', 
     const defs = [...src.matchAll(/function pickEntityAtViewportPoint\(/g)];
     expect(defs.length).toBe(2);
   });
+
+  // #337 — the "ui" preview mode's paint-order arbiter (`resolvePreviewPickAt`, `uiPreviewPick.ts`)
+  // is a THIRD picture of the same rule: it must be both the registered pick provider (so
+  // `modoki_tap` prediction agrees with a real click) AND the function driving the capture-phase
+  // pointerdown handler that redirects a real click — otherwise the two could disagree and #337
+  // would just move from real clicks to synthetic taps instead of being fixed.
+  it('the "ui" preview arbiter is registered at a higher priority than the 2D overlay', () => {
+    const names = registeredProviderNames();
+    expect(names).toContain('resolvePreviewPickAt');
+    expect(src).toMatch(/registerPickProvider\(resolvePreviewPickAt, 'scene-view', 20\)/);
+  });
+
+  it('the "ui" preview arbiter\'s pointerdown handler calls the SAME identifier as its registration', () => {
+    const fnStart = src.indexOf('function UIEditorOverlay(');
+    expect(fnStart).toBeGreaterThan(-1);
+    const nextTopLevelFn = src.indexOf('\nfunction ', fnStart + 1);
+    const body = src.slice(fnStart, nextTopLevelFn > -1 ? nextTopLevelFn : src.length);
+    expect(body).toMatch(/registerPickProvider\(resolvePreviewPickAt, 'scene-view', 20\)/);
+    expect(body).toMatch(/resolvePreviewPickAt\(e\.clientX, e\.clientY\)/);
+  });
 });

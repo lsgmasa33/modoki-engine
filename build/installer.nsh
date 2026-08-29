@@ -1,34 +1,27 @@
 ; Custom NSIS include, auto-picked up by electron-builder (nsis.include defaults to
 ; build/installer.nsh — see electron-builder.yml's nsis: block, which sets no override).
 ;
-; Grants regular Users write access to ONE subfolder of the install tree:
-; resources/app.asar.unpacked/node_modules/.vite-temp. Everything else under the install
-; directory stays as restrictive as the OS/installer normally makes it — this is a scoped
-; exception, not a blanket loosening.
+; This used to grant regular Users write access to one subfolder of the install tree —
+; resources/app.asar.unpacked/node_modules/.vite-temp — for an admin-elevated per-machine
+; install (anyone who browses the installer to `C:\Program Files\...`; `nsis.perMachine` is
+; false, but `allowToChangeInstallationDirectory` lets a user pick an elevation-requiring path
+; anyway). Vite's default `bundle` config loader used to write its compiled config there on
+; every `vite build`, and that directory is read-only to the running, unelevated app (bug
+; vSlzfZLr7pIX5Yw0RSSe, docs/windows.md "Packaged-app bugs" #5).
 ;
-; Why this exists (bug vSlzfZLr7pIX5Yw0RSSe, docs/windows.md "Packaged-app bugs" #5): Vite's
-; default `bundle` config loader esbuild-bundles vite.config.ts and writes the result to
-; `<nearest node_modules>/.vite-temp/<hash>.mjs` on every `vite build` — hardcoded, with no
-; CLI flag or env var to redirect it (read straight from
-; node_modules/vite/dist/node/chunks/node.js's loadConfigFromBundledFile). For an admin-
-; elevated per-machine install (anyone who browses the installer to `C:\Program Files\...`
-; — `nsis.perMachine` is false, but `allowToChangeInstallationDirectory` lets a user pick an
-; elevation-requiring path anyway), that directory is read-only to the running, UNELEVATED
-; app, so every `vite build` crashed with EPERM before the config even loaded — see the
-; commit history around vSlzfZLr7pIX5Yw0RSSe for the two things that were tried and reverted
-; (`--configLoader runner` breaks build-time dynamic imports; `--configLoader native` can't
-; resolve this repo's extension-less imports).
+; REMOVED (#326, 2026-08-27): the write itself is gone at the source — a packaged editor now
+; ships an esbuild-bundled `engine/vite.config.cjs` (`engine/scripts/stage-vite-config.cjs`,
+; `chooseViteConfig()`), and Vite's CJS config-loader branch compiles it in memory instead of
+; writing to disk, so `.vite-temp` is never created. Measured on this exact scenario: a real
+; Build press (`demos/forest-camp`, which has a rigged model — the case a wrong re-fix like
+; `--configLoader runner` would break) from a packaged editor installed to `C:\Program Files\
+; Modoki Editor` with this grant removed produced zero files under `.vite-temp` and no EPERM.
+; See `engine/scripts/build-web.mjs`'s comment on the `vite build` call for the fuller history
+; of what was tried and reverted before this.
 ;
-; The INSTALLER runs elevated exactly when it needs to (UAC.nsh, already wired by
-; electron-builder's nsis target) — that is the one moment with the rights to grant this.
-; customInstall fires from installSection.nsh AFTER installApplicationFiles, so $INSTDIR is
-; fully populated by the time this runs.
+; Left as an empty include (rather than deleted) because electron-builder's nsis.include
+; defaults to this exact path with no config change needed — removing the file would be a
+; second, easy-to-miss place this class of bug could quietly come back from if a future
+; customInstall need is added here without re-reading this comment first.
 !macro customInstall
-  CreateDirectory "$INSTDIR\resources\app.asar.unpacked\node_modules\.vite-temp"
-  ; S-1-5-32-545 = BUILTIN\Users — the well-known SID, not the localized group name (avoids
-  ; breaking on a non-English Windows install). (OI)(CI) = Object Inherit + Container
-  ; Inherit, so files vite writes INSIDE this folder (a fresh timestamped .mjs per build)
-  ; inherit the grant automatically. M = Modify (read/write/delete/execute) — enough for a
-  ; scratch temp dir, short of Full Control.
-  nsExec::ExecToLog 'icacls "$INSTDIR\resources\app.asar.unpacked\node_modules\.vite-temp" /grant *S-1-5-32-545:(OI)(CI)M /T'
 !macroend

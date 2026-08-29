@@ -67,12 +67,18 @@ the occlusion check could see, because `occluded:false` does not mean the same t
   engine has no business deciding what a game considers clickable. A game registers its own
   provider to opt in; only the editor's `scene-view` surface ships one today (its SceneView
   pointer-handler picking, hoisted into a shared function both the handler and the provider call).
-  `scene-view` registers **two** — the 2D canvas overlay and the 3D viewport, which overlap on
-  screen — so `registerPickProvider` takes an explicit `priority` (higher consulted first,
-  registration order breaking ties) and the 2D overlay declares that it sits on top. Before #80
-  this could not bite, because a 2D `scene-view` aim was refused for want of bounds before any
-  picker ran; the order it fell back on was React effect mount order, which is not guaranteed to
-  match z-order. State the priority rather than relying on mount timing.
+  `scene-view` registers **two in general, three while the SceneView's "ui" preview mode is
+  mounted** — the 2D canvas overlay (priority 10) and the 3D viewport, which overlap on screen —
+  so `registerPickProvider` takes an explicit `priority` (higher consulted first, registration
+  order breaking ties) and the 2D overlay declares that it sits on top. Before #80 this could not
+  bite, because a 2D `scene-view` aim was refused for want of bounds before any picker ran; the
+  order it fell back on was React effect mount order, which is not guaranteed to match z-order.
+  State the priority rather than relying on mount timing. The "ui" preview mode's paint-order
+  arbiter (`uiPreviewPick.ts`, #337) registers a THIRD, at priority **20** — above the 2D overlay
+  — because its answer is a strict superset: it already runs the 2D overlay's own `pick2D` for any
+  canvas in the combined DOM+canvas paint stack, then additionally reconciles that against real UI
+  elements sharing the same preview, so it must be asked first or its reconciliation would never
+  run.
 
 Reporting the scope is what stops the weaker check from being read as the stronger one; a bare
 `occluded:false` on `'canvas'` would be a false clean bill of health. The `'entity'` scope also
@@ -671,7 +677,7 @@ enumerated. The warning says exactly what is known and no more.
       DOM events, never OS-level trusted input, a strictly weaker fidelity position than the editor
       twins above. (It also carried a private-API PixiJS v8 poke for canvas ops; that was **inert** —
       the global it read was never assigned — and is now deleted. See #93 and
-      [docs/debug-tools-mcp.md](debug-tools-mcp.md) § "Synthetic input: which canvas gets it".) Full
+      [docs/debug-tools-mcp.md](debug-tools-mcp.md) § "Device debugging" (the "Synthetic input: which canvas gets it" note).) Full
       route research + phased plan:
       **[docs/trusted-device-input.md](trusted-device-input.md)**
       (issue #32). Phase 0 (make the gap HONEST — every reply states the mechanism it used) has

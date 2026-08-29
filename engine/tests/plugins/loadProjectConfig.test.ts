@@ -130,6 +130,9 @@ describe('loadProjectUserConfig', () => {
       device: { iosDeviceId: 'ABC-123', iosDevicectlId: 'DEF-456', androidDeviceId: '192.168.1.5:5555' },
       sdk: { javaHome: '/opt/jdk', androidHome: '/opt/sdk', gcloudPath: '/opt/homebrew/bin/gcloud' },
       build: { appleTeamId: 'ABCDE12345', webBucket: 'gs://b/y', webCdnUrlMap: 'lb', webCdnBackendBucket: 'bb', webDeployCommand: 'echo hi' },
+      // #370. Fake values on purpose — this asserts the section ROUND-TRIPS, and a real upload-key
+      // path/password in a committed test would be exactly the leak `verify:publish` hunts for.
+      keystore: { storeFile: '/nope/fake-upload.jks', storePassword: 'pw', keyAlias: 'upload', keyPassword: 'pw2' },
     };
     writeProjectUserConfig(next, root);
     expect(loadProjectUserConfig(root)).toEqual(next);

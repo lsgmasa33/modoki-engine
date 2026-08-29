@@ -79,6 +79,11 @@ beforeEach(async () => {
         // from them. A correct omission rule must tell these apart.
         { traits: { EntityAttributes: { name: 'DefaultLight', guid: 'g-dl' }, Light: {} } },
         { traits: { EntityAttributes: { name: 'TunedLight', guid: 'g-tl' }, Light: { intensity: 2.5, shadowMapSize: 4096 } } },
+        // A third case the first two cannot express: fields EXPLICITLY PRESENT on disk at exactly
+        // their schema default. "Absent" and "present at default" collapse into the same live state
+        // on load, so the serializer cannot tell them apart and drops both — see the #405 describe
+        // at the foot of this file for why that is the decided behaviour rather than a bug.
+        { traits: { EntityAttributes: { name: 'SpelledOutLight', guid: 'g-sl' }, Light: { kind: 'directional', intensity: 1, shadowBias: -0.0003, shadowMapSize: 2048 } } },
       ],
     },
   };
@@ -172,5 +177,82 @@ describe('omitting defaults is LOSSLESS — save → load → save', () => {
     // And saving again produces the same file — omission must not oscillate.
     const second = await ser.serializeScene();
     expect(second.entities).toEqual(first.entities);
+  });
+});
+
+/** #405 — a field the file SPELLS OUT at its default is dropped too, and that is the decided
+ *  behaviour, not an oversight.
+ *
+ *  Reported as a bug: an editor save of `games/court/main.scene.json` produced a ~1100-line diff
+ *  across 33 entities, dropping 44 hand-authored default-valued fields (`AudioSource.bus: 'sfx'`,
+ *  `UIAnchor.pivotY: 0`, `UIElement.text: ''`, …), and two Court tests that read the scene JSON RAW
+ *  failed. The proposed fix was to never strip a value present on disk.
+ *
+ *  It was declined, because it reverses the 2026-07-31 call this file's banner records — a field
+ *  written out is a field FROZEN at the default of its save day — and because the two premises did
+ *  not hold. The churn was one-time, not per-edit: the scene had been hand-authored (its
+ *  `"version": 13` is a number no code emits), and the save merely brought it to what the serializer
+ *  has always produced. And the failing assertions were reading "the FILE spells this out" while
+ *  claiming to test "the value is X" — `traitFieldOrDefault` fixes them and is strictly stronger,
+ *  since it also fails when the ENGINE default moves.
+ *
+ *  What was genuinely missing is the guarantee below. The drop must be lossless BY DEFAULTS, not by
+ *  silence: nothing else in this file distinguishes "absent on disk" from "present at default", and
+ *  those are exactly the two inputs #405 is about. */
+describe('#405 — a field PRESENT on disk at its default is dropped, losslessly', () => {
+  it('drops it, exactly as if the file had never spelled it out', async () => {
+    const sceneMod = await import('../../src/runtime/scene/SceneManager');
+    const ser = await import('../../src/editor/scene/serialize');
+    sceneMod.sceneManager.resetForTesting();
+    await sceneMod.sceneManager.loadScene(SCENE_PATH);
+    ser.setCurrentScenePath(SCENE_PATH);
+
+    const saved = await ser.serializeScene();
+    const spelled = saved.entities.find((e) => e.name === 'SpelledOutLight')!.traits.Light as Record<string, unknown>;
+    const absent = saved.entities.find((e) => e.name === 'DefaultLight')!.traits.Light as Record<string, unknown>;
+
+    // All four were authored on disk. All four equal the schema default. All four go.
+    expect(spelled).toEqual({});
+    // …and the entity that never spelled them out serializes IDENTICALLY. This equality is the
+    // whole decision: the file stops recording which of the two an author happened to type, so a
+    // later change to a trait default reaches BOTH — which is the property being bought.
+    expect(spelled).toEqual(absent);
+  });
+
+  it('the value survives the round trip — the drop costs the SCENE nothing', async () => {
+    const sceneMod = await import('../../src/runtime/scene/SceneManager');
+    const ser = await import('../../src/editor/scene/serialize');
+    sceneMod.sceneManager.resetForTesting();
+    await sceneMod.sceneManager.loadScene(SCENE_PATH);
+    ser.setCurrentScenePath(SCENE_PATH);
+    const first = await ser.serializeScene();
+
+    fetchResponses[SCENE_PATH] = first;
+    sceneMod.sceneManager.resetForTesting();
+    await sceneMod.sceneManager.loadScene(SCENE_PATH);
+
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    let live: Record<string, unknown> | undefined;
+    getCurrentWorld().query(EntityAttributes, Light).updateEach(([ea, light]: Record<string, unknown>[]) => {
+      if (ea.name === 'SpelledOutLight') live = { ...light };
+    });
+    // Every dropped field is back at the value the file used to state. A raw-JSON reader sees a
+    // difference here and the GAME does not — which is why the fix for #405 belonged in the two
+    // tests doing raw reads, not in the serializer.
+    expect(live).toEqual({ kind: 'directional', intensity: 1, shadowBias: -0.0003, shadowMapSize: 2048 });
+  });
+
+  it('a NON-default value is still written, however ordinary it looks', async () => {
+    // The other side of the boundary, and the assertion that stops a future "just write everything"
+    // or "just write nothing" from passing this describe vacuously.
+    const sceneMod = await import('../../src/runtime/scene/SceneManager');
+    const ser = await import('../../src/editor/scene/serialize');
+    sceneMod.sceneManager.resetForTesting();
+    await sceneMod.sceneManager.loadScene(SCENE_PATH);
+    ser.setCurrentScenePath(SCENE_PATH);
+
+    const saved = await ser.serializeScene();
+    const tuned = saved.entities.find((e) => e.name === 'TunedLight')!.traits.Light as Record<string, unknown>;
+    expect(tuned).toEqual({ intensity: 2.5, shadowMapSize: 4096 });
   });
 });

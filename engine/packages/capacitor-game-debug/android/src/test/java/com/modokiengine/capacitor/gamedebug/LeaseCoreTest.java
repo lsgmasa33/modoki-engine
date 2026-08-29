@@ -1,14 +1,21 @@
 // Golden-vector parity test for the Android lease port (code-review T5).
 //
-// Replays ../test-vectors/lease-golden-vectors.json against a pure LeaseCore and asserts every reply
+// Replays test-vectors/lease-golden-vectors.json against a pure LeaseCore and asserts every reply
 // matches the shared contract the TS DeviceLeaseAuthority is pinned to
 // (engine/tests/plugins/deviceLeaseGoldenVectors.test.ts). Catches a native divergence from the spec.
 //
-// STATUS: needs the Android module's unit-test source set wired (this file lives under src/test/java)
-// plus `testImplementation 'org.json:json:20231013'` (JVM unit tests don't get the android org.json
-// stub). LeaseCore below is the RECOMMENDED extraction target — GameDebugPlugin.evaluateLease/
-// startLeaseGrace should delegate to it (a pure, clock-injected, timer-free arbiter mirroring the TS
-// spec's lazy expiry) so this test covers the shipping code, not a copy.
+// HOW IT RUNS: `npm run test:native` (engine/scripts/test-native.mjs), an ON-DEMAND gate — `npm run
+// verify` is vitest and cannot run gradle. The runner drives android/test-harness, a plain JVM
+// gradle project that points its test source set here; the real android module is an AGP library
+// that only builds inside a consuming app, and ships no test sources anyway (see that build.gradle).
+// #376 wired this; before then the file had never executed once.
+//
+// SCOPE — read this before trusting a green run. LeaseCore below is a PORT of the spec, not the
+// shipping arbiter: GameDebugPlugin.evaluateLease/startLeaseGrace still hold their own lease state
+// with a Handler-scheduled grace timer. So this proves the spec is portable to Java and pins the
+// contract; it does NOT prove the shipping plugin obeys it. The extraction that would fix that —
+// evaluateLease/startLeaseGrace delegating to a pure, clock-injected, timer-free LeaseCore — is a
+// behavioural native change needing device verification, deliberately left out of #376.
 
 package com.modokiengine.capacitor.gamedebug;
 
@@ -19,6 +26,7 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 
 public class LeaseCoreTest {
@@ -72,13 +80,31 @@ public class LeaseCoreTest {
         return e.optBoolean("resumed", false) ? "ok+resumed" : "ok";
     }
 
+    /** Locate test-vectors/lease-golden-vectors.json by walking UP from the working directory.
+     *  Not a fixed relative path: the working dir depends on which gradle project runs this
+     *  (the AGP module, or android/test-harness), and a test that cannot run cannot tell you it
+     *  guessed wrong — which is exactly how the iOS twin sat broken. */
+    private static Path goldenVectorsPath() {
+        Path dir = Paths.get("").toAbsolutePath();
+        for (int i = 0; i < 8 && dir != null; i++) {
+            Path candidate = dir.resolve("test-vectors/lease-golden-vectors.json");
+            if (Files.exists(candidate)) return candidate;
+            dir = dir.getParent();
+        }
+        throw new IllegalStateException(
+            "test-vectors/lease-golden-vectors.json not found above " + Paths.get("").toAbsolutePath());
+    }
+
     @Test
     public void goldenVectors() throws Exception {
-        // Android unit tests run with the module dir (android/) as the working dir.
-        String json = new String(Files.readAllBytes(Paths.get("../test-vectors/lease-golden-vectors.json")));
+        String json = new String(Files.readAllBytes(goldenVectorsPath()));
         JSONObject fixture = new JSONObject(json);
         LeaseCore core = new LeaseCore(fixture.getLong("graceMs"));
         JSONArray steps = fixture.getJSONArray("steps");
+        // The TS twin asserts these; this did not, so an emptied fixture replayed zero steps and
+        // reported PASS — measured. This gate is the only one that runs this file.
+        assertEquals("fixture graceMs must be positive", true, fixture.getLong("graceMs") > 0);
+        assertEquals("fixture has no steps — this test would check nothing", true, steps.length() > 0);
 
         for (int i = 0; i < steps.length(); i++) {
             JSONObject s = steps.getJSONObject(i);

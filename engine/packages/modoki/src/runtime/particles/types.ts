@@ -527,3 +527,75 @@ export function defaultParticleEffect(): ParticleEffectDef {
     render: { blend: 'additive' },
   };
 }
+
+/** How many frames a fresh emitter may stay HIDDEN waiting for its declared sprite texture (#338).
+ *
+ *  ## Why hide at all
+ *
+ *  `build()` constructs the render objects AND a new `CpuParticleSim` together, and
+ *  `loadTextureFor` calls it a SECOND time when the texture arrives — because a sprite texture
+ *  changes the material (textured quad vs. the radial soft-circle alpha), so the billboard cannot
+ *  simply be re-pointed. That second build discards every live particle and resets the sim clock
+ *  to 0, which the owner observed as particles "spawning for 1-2 frames, resetting, and
+ *  continuing". It only bites the FIRST activation: `loadTexture3D` is async even on a cache HIT,
+ *  but a hit resolves on a microtask (before the next rAF), so a warm texture rebuilds before
+ *  anything is drawn. A COLD one takes a frame or two, and that rebuild is visible.
+ *
+ *  So a fresh emitter that DECLARES a texture starts hidden: the throwaway build and its reset
+ *  happen off-screen, and the emitter is revealed on the rebuild that has the texture. One
+ *  visible start, no reset, and the sim the player sees begins at t=0 (a burst authored at 0
+ *  still fires on the frame they first see).
+ *
+ *  ## Why the wait is BOUNDED
+ *
+ *  Hiding until the texture lands is right for a showcase, and wrong for gameplay VFX: a hit
+ *  spark or explosion that shows NOTHING while a large/cold KTX2 transcodes reads as a dropped
+ *  effect. So the wait is capped — past the budget the emitter is revealed untextured and picks
+ *  up its sprite when the load completes.
+ *
+ *  ⚠️ **Revealing untextured is NOT a mild degradation, and calling it one is what made this
+ *  budget too small.** An earlier version of this comment described the fallback as "the radial
+ *  soft-circle fallback it would have drawn anyway". It would not: an effect that declares a
+ *  sprite never draws the fallback in steady state, and the fallback is much BRIGHTER per
+ *  particle — a full-quad radial alpha at opacity 1, where an authored fire/dust sprite is mostly
+ *  near-transparent. Measured on `demos/particle-demo` served over the network (per-frame mean
+ *  luma from a CDP screencast): the Fireball station reads 69 untextured at 61 particles and 49
+ *  textured at 292 — roughly 15x the light per particle — and the 40k GPU Nebula pool reaches
+ *  **241 of 255, a full-screen white wash**. That is issue #338's "burst": not extra particles,
+ *  the wrong material. So the budget must be long enough that a cold FETCH normally wins it.
+ *
+ *  ⚠️ **Be precise about what that degradation actually is, because an earlier version of this
+ *  comment overstated it.** It said "degrades to a texture pop rather than to silence". It does
+ *  not: past the budget the emitter is visible, and the late arrival still runs `build()`, which
+ *  discards every live particle and zeroes `simTime` — so what the player sees is a full RESET,
+ *  on screen. That is the owner's original "spawn for 1-2 frames, reset, continue" report,
+ *  surviving on exactly the slow/cold-texture case this budget exists for. The budget still buys
+ *  the right thing (something rather than nothing), but it does not make the reset a pop.
+ *
+ *  Removing the reset means letting the sim survive a render rebuild — `CpuParticleSim` holds its
+ *  `out` as a plain reference, so a `setOutputs()` plus a render-only rebuild path would do it.
+ *  Deliberately NOT done here: it widens a close-out fix into a lifecycle change that wants its
+ *  own review, and the path only fires when a texture takes longer than the budget.
+ *
+ *  ## Milliseconds, not frames — the unit was the bug
+ *
+ *  ⚠️ This was `TEXTURE_WAIT_BUDGET_FRAMES = 6` on the reasoning that "the cost being bounded is a
+ *  RENDERING concern, so a slower device drawing slower frames should get proportionally longer to
+ *  load". That is backwards. What is being waited on is a network FETCH plus a KTX2 transcode, and
+ *  neither has anything to do with the frame rate — a 120 Hz desktop gets 50 ms and a 30 Hz phone
+ *  gets 200 ms for the *same* download. Six frames is also simply too few: on the deployed
+ *  `modoki-engine.com/particle-demo`, cold, the sprite landed ~120 ms after the emitter was
+ *  created and the budget expired at ~80 ms, so the very first station flashed on every cold load
+ *  in a fresh Chrome window. That is the whole of #338's reopen.
+ *
+ *  1500 ms is chosen to lose the race only when the network is genuinely broken: it is ~12x the
+ *  measured cold-fetch latency, and the wait is paid at most ONCE per texture per session (a
+ *  second emitter on the same sprite hits the cache and resolves on a microtask, invisibly). The
+ *  trade it makes is explicit: a gameplay VFX whose sprite has never been fetched can be silent
+ *  for up to 1.5 s on its first use, rather than flashing white for that long and then resetting.
+ *
+ *  Wall-clock via `rawNow()` (the sanctioned clock wrapper), so `setManualNow`/`advanceManual`
+ *  drive it deterministically in tests and the determinism guard stays satisfied. It is a
+ *  presentation deadline, never game state.
+ */
+export const TEXTURE_WAIT_BUDGET_MS = 1500;

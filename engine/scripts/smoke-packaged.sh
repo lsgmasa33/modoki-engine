@@ -41,7 +41,7 @@ TMPBASE="$(node "$PATHS" tmpdir)"
 #
 # …and a distinct BASENAME from test-packaged.sh, which builds at
 # `modoki-pkg-test-<clone>`. Sharing the per-clone name would be a WITHIN-clone collision
-# in place of the cross-clone one: `editor:main:packaged` is test-packaged.sh `exec`ing a
+# in place of the cross-clone one: `editor:packaged` is test-packaged.sh `exec`ing a
 # long-lived interactive editor out of that dir, and this script reaps packaged apps and
 # `rm -rf "$OUT"`s before it builds — so a smoke run would delete the app the owner is
 # sitting in front of. Different job, different dir.

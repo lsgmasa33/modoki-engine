@@ -17,6 +17,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { loadProjectConfig } from './load-project-config';
 import { detect as detectTool } from '../toolchain';
 import type { ProjectConfig } from '../project-config';
@@ -157,7 +158,7 @@ const ARCHIVE_WARN_TEXT =
  *  archive`, same `method: app-store-connect` export — release-to-store is a button in
  *  App Store Connect afterwards). There is no build-time signal to refuse on that would
  *  not also block the workflow in daily use. See
- *  docs/debug-tools-mcp.md § "Debug vs Release". */
+ *  docs/debug-tools-mcp.md § "Native Debug Bridge" (the "Debug vs Release" note). */
 const ARCHIVE_WARN_PHASE_BLOCK = [
   '/* Begin PBXShellScriptBuildPhase section */',
   `\t\t${GD_UUID.archiveWarnPhase} /* ${ARCHIVE_WARN_PHASE_NAME} */ = {`,
@@ -254,6 +255,61 @@ const ANDROID_WARN_BLOCK = [
   '    }',
   '}',
   ANDROID_WARN_END,
+].join('\n');
+
+/** ── Android release signing (#370) ────────────────────────────────────────────────────────────
+ *
+ *  Until this block existed, NO project in the repo set a `signingConfig`, so a release build was
+ *  signed in debug mode and Play rejected it at upload — after the build had reported success.
+ *
+ *  **Why it is APPENDED rather than inserted into `android { }`.** Re-opening the `android`
+ *  extension later in the same script is legal Groovy-DSL and merges into the existing config
+ *  (`signingConfigs`/`buildTypes` are NamedDomainObjectContainers, so naming `release` creates or
+ *  configures it). Appending a fenced block therefore needs no anchor inside a file every project
+ *  hand-edits — the same reason {@link ANDROID_WARN_BLOCK} appends. An inserter that had to find
+ *  `buildTypes {` would bail on any project that had moved it, which is the failure mode a heal
+ *  can least afford.
+ *
+ *  **Why it is inert without the properties file.** A fresh clone, another machine or CI has no
+ *  upload key, and failing Gradle CONFIGURATION there would break `assembleDebug` for every clone
+ *  that never signs anything — which is most of them. So the whole block is behind
+ *  `if (file.exists())`, and a machine without a key keeps building debug exactly as before. The
+ *  release path's own `keystoreRefusal` (./releaseBuild.ts) is what turns "no key" into a loud, actionable
+ *  refusal, and it fires before Gradle is ever invoked. */
+const ANDROID_SIGNING_BEGIN = '// modoki:release-signing-begin — generated; the key comes from project.user.json (user.keystore)';
+const ANDROID_SIGNING_END = '// modoki:release-signing-end';
+const ANDROID_SIGNING_BLOCK = [
+  ANDROID_SIGNING_BEGIN,
+  '// keystore.properties is GENERATED (and gitignored) by the release build from the per-machine',
+  '// project.user.json. Nothing secret is in THIS file, so it stays committed and portable.',
+  "def modokiKeystoreFile = rootProject.file('keystore.properties')",
+  'if (modokiKeystoreFile.exists()) {',
+  '    def modokiKeystore = new Properties()',
+  '    // withReader(UTF-8), NOT withInputStream: Properties.load(InputStream) decodes ISO-8859-1',
+  '    // by contract, while the generator writes UTF-8. A non-ASCII password — or a keystore path',
+  '    // under a non-ASCII directory — round-trips as mojibake and Gradle then reports "Keystore',
+  '    // was tampered with, or password was incorrect", which points at the key, not the encoding.',
+  "    modokiKeystoreFile.withReader('UTF-8') { modokiKeystore.load(it) }",
+  '    android {',
+  '        signingConfigs {',
+  '            release {',
+  "                storeFile file(modokiKeystore['storeFile'])",
+  "                storePassword modokiKeystore['storePassword']",
+  "                keyAlias modokiKeystore['keyAlias']",
+  "                keyPassword modokiKeystore['keyPassword']",
+  '            }',
+  '        }',
+  '        buildTypes {',
+  '            release {',
+  '                // Without this a release bundle is signed in DEBUG mode, and Play rejects it',
+  '                // with "You uploaded an APK or Android App Bundle that was signed in debug',
+  '                // mode" — a failure that only appears at upload time.',
+  '                signingConfig signingConfigs.release',
+  '            }',
+  '        }',
+  '    }',
+  '}',
+  ANDROID_SIGNING_END,
 ].join('\n');
 
 /** Does this project depend on the game-debug bridge? Gates every game-debug
@@ -1039,6 +1095,149 @@ function healAndroidArchiveWarning(projectRoot: string, debugBuild: boolean): st
   return `${debugBuild ? 'added' : 'removed'} the Gradle release-build "Debug build is ON" warning (#112)`;
 }
 
+/** Keep {@link ANDROID_SIGNING_BLOCK} in sync in `android/app/build.gradle` (#370).
+ *
+ *  Always re-derived from the current constant rather than presence-checked, for the reason
+ *  {@link healIosArchiveWarning} spells out: a "it's already there, done" check pins whatever text
+ *  the project was healed with, so editing the block later would leave every existing project on
+ *  the old version. Re-deriving stays idempotent — identical output means nothing is written.
+ *
+ *  ⚠️ **Skips a project that already configures `signingConfigs` by hand**, outside our fence.
+ *  `games/iap-test` is exactly that (#196 wired its Play upload key before this engine path
+ *  existed), and healing over it would give the file two `signingConfigs.release` definitions —
+ *  the second silently winning. A hand-written config that already reads the same
+ *  `keystore.properties` needs nothing from us; one that reads something else is a deliberate
+ *  choice this heal has no business overriding. */
+function healAndroidReleaseSigning(projectRoot: string): string | undefined {
+  const gradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  if (!fs.existsSync(gradle)) return undefined;
+  const orig = fs.readFileSync(gradle, 'utf8');
+  // CRLF-safe, like the Crashlytics heals next door: this block is LF-joined, and appending it
+  // straight onto a CRLF gradle file inserts bare-LF lines into a CRLF file. Normalize, edit,
+  // restore. (The CRLF guard in healNativeConfig.test.ts caught exactly this.)
+  const { lf, restore } = eolSafe(orig);
+  const fenceRe = new RegExp(`\\n*${escapeRe(ANDROID_SIGNING_BEGIN)}[\\s\\S]*?${escapeRe(ANDROID_SIGNING_END)}\\n?`);
+  const hasFence = fenceRe.test(lf);
+
+  // A hand-written signingConfigs OUTSIDE our fence owns this project — leave it alone.
+  //
+  // Comments are stripped before the test, in both directions. A `signingConfigs {` sitting inside
+  // a `/* … */` block or behind a `//` would otherwise read as a real hand-written config, and the
+  // project would silently never get release signing — producing `app-release-unsigned.apk` while
+  // the build's success message points at the signed path. (The inverse, a real config the regex
+  // fails to see, appends a second `signingConfigs.release` that quietly wins over the author's.)
+  const codeOnly = lf
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+  if (!hasFence && /(^|\n)\s*signingConfigs\s*\{/.test(codeOnly)) return undefined;
+
+  const text = hasFence
+    ? lf.replace(fenceRe, '\n\n' + ANDROID_SIGNING_BLOCK + '\n')
+    : lf.replace(/\n*$/, '\n') + '\n' + ANDROID_SIGNING_BLOCK + '\n';
+  if (text === lf) return undefined;
+  fs.writeFileSync(gradle, restore(text));
+  return `${hasFence ? 'synced' : 'added'} the Gradle release signing config (#370)`;
+}
+
+/** The keystore-ignore block every `android/.gitignore` must carry (#370). */
+const ANDROID_GITIGNORE_KEYSTORE_BLOCK = [
+  '# Keystore files',
+  '# UNCOMMENTED deliberately (#370). The Android template ships these commented out, which means a',
+  '# keystore dropped in this folder is COMMITTED by default — into a repo whose snapshot is published',
+  '# publicly. An upload key in git is a signing-identity compromise, not a tidiness problem.',
+  '# The real key for this project lives OUTSIDE the repo (~/.modoki/keystores/); these lines are',
+  '# defence in depth for anyone who later puts one here by habit.',
+  '*.jks',
+  '*.keystore',
+  '',
+  '# Signing config — absolute paths + passwords for the upload key. NEVER committed.',
+  '# app/build.gradle reads it if present and silently skips release signing if absent, so a fresh',
+  '# clone still builds debug without it.',
+  'keystore.properties',
+].join('\n');
+
+/** Uncomment the keystore-ignore lines in `android/.gitignore`, and add `keystore.properties` (#370).
+ *
+ *  **Why this is a HEAL and not a one-time sweep.** The file is generated by `cap add`, from
+ *  Capacitor's copy of the upstream Android template — which ships `#*.jks` / `#*.keystore`
+ *  COMMENTED OUT. So fixing the 21 existing projects by hand fixes exactly those 21: the very next
+ *  `Add Android Target…` writes the unsafe version again, and the failure is silent until someone
+ *  drops a `.jks` in that folder and `git add` sweeps a signing identity into a repo whose snapshot
+ *  is published publicly. A heal is the only thing that holds.
+ *
+ *  Idempotent: no-op once the uncommented lines and `keystore.properties` are all present. Matches
+ *  the commented block loosely (by the `#*.jks` line) because the surrounding comment wording has
+ *  varied across template versions, and anchoring on the exact sentence is how a heal quietly stops
+ *  firing after an upstream reword. */
+function healAndroidGitignoreKeystore(projectRoot: string): string | undefined {
+  const file = path.join(projectRoot, 'android', '.gitignore');
+  if (!fs.existsSync(file)) return undefined;
+  const orig = fs.readFileSync(file, 'utf8');
+  const { lf, restore } = eolSafe(orig);
+
+  // Already right — the common case on every open after the first. Compared against the canonical
+  // block (not "are the three entries present somewhere"), so a project healed by an OLDER engine
+  // picks up an edited block instead of being pinned to the text it first got.
+  //
+  // ⚠️ Modulo the ISSUE NUMBER in the block's first comment. `games/iap-test` carries this same
+  // block referencing #196, because it wired its Play upload key before the engine had a release
+  // path at all — and that provenance is worth more than uniformity. Comparing literally made the
+  // heal treat that file as unhealed, and the converge pass below then appended a SECOND copy of
+  // the block while orphaning the #196 comment lines. Normalising the number means a correct file
+  // is recognised whichever issue introduced it.
+  const unIssue = (t: string) => t.replace(/\(#\d+\)/g, '(#N)');
+  if (unIssue(lf).includes(unIssue(ANDROID_GITIGNORE_KEYSTORE_BLOCK))) return undefined;
+
+  // CONVERGE, don't patch. Earlier versions branched on the file's shape — pristine template vs.
+  // everything else — and a file where somebody had hand-uncommented only `*.jks` matched neither
+  // branch's assumptions, so it took the append path and grew a SECOND `*.jks`, a second
+  // "# Keystore files" header and an orphan `#*.keystore`, on every single project open. Stripping
+  // every keystore-related line first means a half-edited file, a pristine one and an
+  // already-healed one all reduce to the same input, and the block goes back where the old one was.
+  const lines = lf.split('\n');
+  // Every line the canonical block itself contains counts as ours to replace — derived FROM the
+  // constant rather than re-listed, so editing the block cannot leave this predicate behind
+  // stripping the previous wording. Issue numbers normalised for the iap-test reason above.
+  const blockLines = new Set(
+    ANDROID_GITIGNORE_KEYSTORE_BLOCK.split('\n').map((l) => unIssue(l.trim())).filter(Boolean),
+  );
+  const isKeystoreLine = (l: string) => {
+    const t = l.trim();
+    return /^#?\*\.(jks|keystore)$/.test(t)
+      || /^#?keystore\.properties$/.test(t)
+      || /^# Uncomment the following lines? if you do not want to check your keystore files? in\.?$/.test(t)
+      || blockLines.has(unIssue(t));
+  };
+  let anchor = -1;
+  const kept: string[] = [];
+  for (const l of lines) {
+    if (isKeystoreLine(l)) { if (anchor === -1) anchor = kept.length; continue; }
+    kept.push(l);
+  }
+  // No keystore section anywhere → append at the end.
+  if (anchor === -1) anchor = kept.length;
+  // Collapse a blank line the strip may have stranded next to the insertion point, so repeated
+  // heals cannot accrete empty lines.
+  while (anchor > 0 && kept[anchor - 1].trim() === '' && kept[anchor]?.trim() === '') kept.splice(anchor, 1);
+  const block = ANDROID_GITIGNORE_KEYSTORE_BLOCK.split('\n');
+  const out = [...kept.slice(0, anchor), ...block, ...kept.slice(anchor)];
+  // Squeeze blank lines ONLY around the block we just inserted, never file-wide: a project's
+  // .gitignore may legitimately use several blank lines to group sections, and rewriting those is
+  // an edit in a region this heal has no business in — the #18 write-behind-your-back hazard, done
+  // to ourselves. Bounded to the inserted span plus one line either side.
+  const lo = Math.max(0, anchor - 1);
+  const hi = Math.min(out.length, anchor + block.length + 1);
+  const squeezed = [
+    ...out.slice(0, lo),
+    ...out.slice(lo, hi).join('\n').replace(/\n{3,}/g, '\n\n').split('\n'),
+    ...out.slice(hi),
+  ];
+  const text = squeezed.join('\n').replace(/\n*$/, '\n');
+  if (text === lf) return undefined;
+  fs.writeFileSync(file, restore(text));
+  return 'uncommented the keystore ignores + added keystore.properties in android/.gitignore (#370)';
+}
+
 /** Remove a top-level Info.plist key AND its value element. Inverse of
  *  {@link setPlistKey}; no-op when the key is absent. */
 function removePlistKey(text: string, key: string): string {
@@ -1057,6 +1256,70 @@ function removePlistKey(text: string, key: string): string {
  *  target. Idempotent (skips whatever's already present); only for a project that
  *  depends on capacitor-game-debug AND lives inside the modoki repo. Bails without
  *  writing if any pbxproj anchor is missing (never leaves a partial edit). */
+/** Point a scene-based iOS app's `SceneDelegate` at `MyViewController`, not the base
+ *  `CAPBridgeViewController` (#368).
+ *
+ *  A `SceneDelegate` that builds its window in code OVERRIDES `Main.storyboard`, whose
+ *  `customClass="MyViewController"` is otherwise what gets our `registerPluginInstance` call to
+ *  run. With the base VC there, `MyViewController` is never instantiated, `GameDebugPlugin` is
+ *  never registered, and the iOS debug bridge is silently dead — the game renders perfectly and
+ *  only the JS console says `"GameDebug" plugin is not implemented on ios`, which reaches no
+ *  device log. From the host it looks exactly like "the app is not running" (ECONNREFUSED :9095).
+ *
+ *  ⚠️ This heal exists because the OTHER heals hid the bug. `healIosGameDebugWiring` writes a
+ *  correct `MyViewController.swift` and a correct pbxproj reference, so every artifact this file
+ *  owns looked right in 9 projects whose SceneDelegate bypassed all of it. Capacitor's own iOS
+ *  template is where the file comes from (nothing in this repo writes one), so we cannot fix it
+ *  upstream — we can only heal what it generated. */
+function healIosSceneDelegateBridgeVC(projectRoot: string): string | undefined {
+  const sd = path.join(projectRoot, 'ios', 'App', 'App', 'SceneDelegate.swift');
+  if (!fs.existsSync(sd)) return undefined;   // storyboard path — the VC comes from Main.storyboard
+  if (!fs.existsSync(path.join(projectRoot, 'ios', 'App', 'App', 'MyViewController.swift'))) return undefined;
+
+  // ⚠️ On disk is NOT enough — the class must be COMPILED INTO THE TARGET, or repointing here
+  // turns a recoverable failure into an unrecoverable one: today's symptom is a silently dead
+  // debug bridge (the app builds, runs and renders); naming a type Swift cannot see makes the
+  // App target fail to COMPILE. Never trade a dead bridge for a dead build.
+  //
+  // `healIosGameDebugWiring` normally guarantees the Sources entry and runs before this — but it
+  // has early returns (no pbxproj, and notably no resolvable plugin source), so "the file exists"
+  // and "the file is in the build" are different questions. Ask the one that matters. When this
+  // bails, the guard test still fails the gate on the committed state, so the bug stays visible
+  // rather than becoming silent again.
+  const pbxPath = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  if (!fs.existsSync(pbxPath)) return undefined;
+  if (!/MyViewController\.swift in Sources/.test(fs.readFileSync(pbxPath, 'utf8'))) {
+    // SPEAK, don't return undefined. The other bails above are genuine "nothing to do"; this one
+    // is "something is wrong and I am refusing to act", and staying silent is what lets #368
+    // recur invisibly. The guard test is NOT the safety net here — it reads `git ls-files`, so it
+    // covers tracked in-repo projects only, and the project that lands in this branch is exactly
+    // the one it cannot see: a game scaffolded or copied OUT of the repo, or an Xcode 16
+    // `PBXFileSystemSynchronizedRootGroup` project, which has no Sources phase entries at all for
+    // `healIosGameDebugWiring`'s anchors to find.
+    return '⚠️ SceneDelegate.swift still builds CAPBridgeViewController, and MyViewController.swift '
+      + 'is not in the App target\'s Sources phase — repointing it would break the BUILD, so this was '
+      + 'left alone. The iOS debug bridge stays dead until the pbxproj is wired (#368).';
+  }
+  const orig = fs.readFileSync(sd, 'utf8');
+  // GLOBAL: a delegate with two assignments (an `if #available` fork, say) must have BOTH
+  // repointed. A non-global replace rewrites the first, returns the success note, and leaves the
+  // other branch with a dead bridge — a half-fix that reports as a whole one, and that the guard
+  // test then fails on forever with nothing to auto-repair it.
+  const re = /(rootViewController\s*=\s*)CAPBridgeViewController(\s*\()/g;
+  if (!re.test(orig)) return undefined;
+  // No `re.lastIndex` reset needed: `String.prototype.replace` with a global regex resets it
+  // itself, and `re` is function-local so nothing carries between calls.
+  try {
+    fs.writeFileSync(sd, orig.replace(re, '$1MyViewController$2'));
+  } catch (e) {
+    // Never throw from here: this runs mid-chain on project OPEN, and an uncaught write error
+    // aborts every heal AFTER it (the Android debug-build metadata among them) while reporting
+    // only the write failure. A read-only file should cost this one heal, not the rest.
+    return `⚠️ could not repoint SceneDelegate.swift (${(e as Error).message}) — the iOS debug bridge stays dead until it is fixed by hand (#368)`;
+  }
+  return 'SceneDelegate.swift: rootViewController CAPBridgeViewController → MyViewController (else GameDebugPlugin never registers — #368)';
+}
+
 function healIosGameDebugWiring(projectRoot: string, debugBuild: boolean): string | undefined {
   if (!usesGameDebug(projectRoot)) return undefined;
   const iosApp = path.join(projectRoot, 'ios', 'App');
@@ -1615,6 +1878,313 @@ function decideBuildWrite(
   return { write: true };
 }
 
+/** Resolve the effective build number this heal pass writes to the native files.
+ *
+ *  With `app.buildNumberAuto` FALSE, `app.buildNumber` passes straight through. TRUE — the
+ *  "Auto" checkbox — the typed value is IGNORED and the number is derived from
+ *  `git rev-list --count HEAD` of the project's repo, keeping the typed value as a FLOOR —
+ *  so a store-forced jump still wins without turning auto off, and both stores keep seeing one
+ *  number that only moves up (the never-lower guard below stays the last line of defence either
+ *  way). A project copied out of its repo has no git; that falls back to the config value with
+ *  a note rather than failing the whole heal. */
+export function resolveBuildNumber(projectRoot: string, cfg: ProjectConfig): { value: number; note?: string } {
+  if (!cfg.app.buildNumberAuto) return { value: cfg.app.buildNumber };
+  const floor = cfg.app.buildNumber;
+  let count: number | null = null;
+  try {
+    const r = spawnSync('git', ['-C', projectRoot, 'rev-list', '--count', 'HEAD'], {
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    if (r.status === 0 && r.stdout) {
+      const n = parseInt(String(r.stdout).trim(), 10);
+      if (Number.isInteger(n) && n >= 0) count = n;
+    }
+  } catch {
+    // fall through to the fallback below
+  }
+  if (count === null) {
+    return {
+      value: floor,
+      note: 'build number source is git commits, but no commit count could be read (not a git repo, or git failed) — using app.buildNumber',
+    };
+  }
+  // The floor wins when the owner typed a jump past the count (or the count is somehow lower).
+  if (floor >= count) {
+    return { value: floor, note: `build number ${floor} = app.buildNumber floor (git reports ${count} commits)` };
+  }
+  return { value: count, note: `build number ${count} derived from git commit count` };
+}
+
+/** The bundle id a config may legally contribute to native files — same shape rule as
+ *  {@link validateBuildConfig}'s BUILD_FIELD_RULES. An invalid id is REFUSED here (with a note)
+ *  rather than written everywhere: garbage in a pbxproj breaks the build in four files at once,
+ *  and the settings save already validates the field on its own path. */
+function usableIdentity(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const v = value.trim();
+  return /^[A-Za-z0-9._-]+$/.test(v) ? v : undefined;
+}
+
+/** Escape a value for XML CHARACTER DATA (`<string>here</string>`, `<key>` bodies).
+ *
+ *  ⚠️ Unlike {@link usableIdentity}'s bundle id, `app.appName` is a DISPLAY name and must stay
+ *  free text — "Rock & Roll" is a legitimate app name, and restricting the charset to make the
+ *  writes below safe would be fixing the wrong end. It has no `BUILD_FIELD_RULES` pattern behind
+ *  it either, so it arrives here exactly as typed. Unescaped, a single `&` makes `strings.xml`
+ *  fatally malformed (AAPT2: "not well-formed (invalid token)") and `Info.plist` unparseable —
+ *  from a value the owner typed into Project Settings, written by a heal that runs on every
+ *  open/build, into two COMMITTED files. */
+function xmlText(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/** Escape a value for an Android `<string>` resource — XML escaping PLUS the AAPT2-specific
+ *  rules plain XML does not have. An unescaped apostrophe is a hard build error ("Apostrophe not
+ *  preceded by \\"), and a leading `@` or `?` would be read as a resource reference rather than
+ *  as text. "Cat's Court" is the case that makes this not hypothetical. */
+function androidResText(value: string): string {
+  const escaped = xmlText(value).replace(/(["'\\])/g, '\\$1');
+  return /^[@?]/.test(escaped) ? `\\${escaped}` : escaped;
+}
+
+/** Replace with a LITERAL string — never a replacement PATTERN.
+ *
+ *  ⚠️ Why a replacer FUNCTION rather than `text.replace(re, `$1${v}$2`)`: in a replacement
+ *  string `$&`, `$1`, `` $` `` and `$'` are substitution directives, so a value containing one is
+ *  INJECTED rather than inserted. An app name of "Court $& Co" turned `<string name="app_name">`
+ *  into a nested duplicate of itself and, in `Info.plist`, swallowed the preceding `<key>` line
+ *  outright — structural corruption of a committed file from a plausible display name. A
+ *  function replacer has no such syntax. */
+function replaceAllIfMatches(text: string, re: RegExp, value: string): { text: string; changed: boolean } {
+  const next = text.replace(re, (_m, open: string, close: string) => `${open}${value}${close}`);
+  return { text: next, changed: next !== text };
+}
+
+/** Sync `app.appId` / `app.appName` into every native file that carries them.
+ *
+ *  These were WRITE-ONCE before this heal existed: `cap add` baked them into the pbxproj,
+ *  build.gradle, strings.xml, Info.plist and capacitor.config.json at scaffold time, and
+ *  `ensureCapacitorConfig` deliberately never clobbers an existing file — so changing Project
+ *  Settings afterwards changed NOTHING anywhere (the audit that added this, 2026-08-25).
+ *
+ *  ⚠️ **A changed appId is a NEW app to both stores** — previously uploaded builds and installed
+ *  updates no longer connect to it. That trade-off belongs to the owner, so the heal performs it
+ *  but says so loudly every time it rewrites an id. A name change is cosmetic and only noted.
+ *
+ *  Per-file, diff-before-write (a matching file is left byte-identical):
+ *   - capacitor.config.json   → `appId` / `appName`
+ *   - android/app/build.gradle → `applicationId "…"` (NOT `namespace` — that is the code
+ *     package and renaming it strands MainActivity's package path)
+ *   - android strings.xml      → `package_name` + `custom_url_scheme` (id),
+ *     `app_name` + `title_activity_main` (name); AndroidManifest labels reference these
+ *   - iOS pbxproj              → `PRODUCT_BUNDLE_IDENTIFIER` (every build configuration);
+ *     Info.plist's CFBundleIdentifier reads it via `$(PRODUCT_BUNDLE_IDENTIFIER)`
+ *   - iOS Info.plist           → `CFBundleDisplayName` (name) */
+export function healAppIdentity(projectRoot: string, appId: unknown, appName: unknown): string[] {
+  const notes: string[] = [];
+  const id = usableIdentity(appId);
+  const name = typeof appName === 'string' && appName.trim() ? appName.trim() : undefined;
+  if (appId != null && id === undefined) notes.push(`REFUSED to sync app.appId ${JSON.stringify(appId)}: not a valid bundle id (letters, digits, dots, dashes, underscores only).`);
+  if (!id && !name) return notes;
+
+  /** The app's PREVIOUS bundle id — the anchor that keeps the rewrite scoped. The pbxproj may
+   *  legitimately carry OTHER targets' ids (`com.x.y.widget` for an extension) and a gradle
+   *  file may carry flavour ids (`com.x.y.free`); replacing every occurrence would silently
+   *  rename those to the app's id and break their embedding. Only values equal to the old id
+   *  move. Sourced from capacitor.config.json — the same file `cap add` baked the native
+   *  ids FROM — so when it is unreadable there is no safe anchor and the id half is SKIPPED
+   *  with a note rather than guessed. */
+  let oldId: string | undefined;
+  let idChangedFrom: string | undefined;
+  let idSkipNoted = false;
+
+  /** Per-file guard: one unreadable/unwritable file must not abort the heals AFTER identity
+   *  (orientation, game-mode, crashlytics…) the way a throw through main()'s outer catch
+   *  would — partial state plus a generic "heal skipped" note hid both the failure and what
+   *  it prevented. Each file reports its own failure; the pass continues. */
+  const guarded = (label: string, fn: () => void): boolean => {
+    try {
+      fn();
+      return true;
+    } catch (e) {
+      notes.push(`${label} sync failed (${e instanceof Error ? e.message : String(e)}) — remaining identity files were still attempted`);
+      return false;
+    }
+  };
+
+  /** Set when an ID-BEARING native file (gradle / pbxproj) failed to sync. Gates the anchor —
+   *  see the capacitor.config.json banner below. `appName` is unaffected: it anchors nothing, so
+   *  a failed name write costs only that file and is retried on its own next pass. */
+  let idWriteFailed = false;
+
+  // capacitor.config.json — parsed + rewritten as JSON so any shape survives; this file IS
+  // machine-generated (ensureCapacitorConfig writes JSON.stringify(…, null, 2)), so comparing
+  // SERIALIZED forms is fair: only a real field change produces a diff.
+  //
+  // ⚠️ READ HERE, WRITTEN LAST — the two halves are deliberately split around the native files.
+  // This file is the ANCHOR: `oldId` is what scopes every rewrite below, and it is recoverable
+  // from nowhere else. Writing the new id here FIRST (as this did) means a gradle or pbxproj
+  // write that then fails — which `guarded` catches by design, so the pass continues — leaves the
+  // anchor on the NEW id while those files still hold the OLD one. The next pass reads the new
+  // id, its scoped regex matches nothing, and it reports no change: the divergence is permanent
+  // and SILENT, and the per-file guard that made the failure survivable is exactly what made it
+  // unrecoverable. Committing the anchor last, and only when the id-bearing writes SUCCEEDED,
+  // makes a partial failure retryable instead.
+  const capPath = path.join(projectRoot, 'capacitor.config.json');
+  let capJson: Record<string, unknown> | undefined;
+  guarded('capacitor.config.json', () => {
+    if (!fs.existsSync(capPath)) return;
+    try {
+      const json = JSON.parse(fs.readFileSync(capPath, 'utf8')) as Record<string, unknown>;
+      if (typeof json.appId === 'string' && json.appId) oldId = json.appId;
+      capJson = json;
+    } catch {
+      notes.push('capacitor.config.json exists but does not parse — identity not synced there');
+    }
+  });
+
+  /** Commit the anchor. Called only after every native file has had its turn — see the banner
+   *  above for why the ordering is load-bearing rather than incidental. */
+  const writeCapacitorConfig = (): void => {
+    guarded('capacitor.config.json', () => {
+      const json = capJson;
+      if (!json) return;
+      const before = JSON.stringify(json, null, 2) + '\n';
+      if (id && json.appId !== id && idWriteFailed) {
+        notes.push(
+          'capacitor.config.json appId left at the OLD id because an id-bearing native file '
+          + 'failed to sync — it is the anchor those rewrites are scoped to, so advancing it now '
+          + 'would strand them permanently. Fix the failure above; the next open/build retries.',
+        );
+      } else if (id && json.appId !== id) {
+        if (typeof json.appId === 'string' && json.appId) idChangedFrom = json.appId;
+        json.appId = id;
+      }
+      if (name && json.appName !== name) json.appName = name;
+      const out = JSON.stringify(json, null, 2) + '\n';
+      if (out !== before) {
+        fs.writeFileSync(capPath, out);
+        notes.push('synced capacitor.config.json identity');
+      }
+    });
+  };
+
+  /** Scoped id replacement for gradle/pbxproj. Returns whether anything moved. */
+  const replaceScoped = (text: string, re: RegExp, to: string): { text: string; changed: boolean } => {
+    const next = text.replace(re, to);
+    return { text: next, changed: next !== text };
+  };
+  /** Emit once, not per file, when the old id could not be anchored. */
+  const noteIdSkipped = (): void => {
+    // ⚠️ This ALSO blocks the anchor, and that is the point — the invariant the anchor gate has
+    // to express is "did the id LAND?", not "did anything throw?". Reaching here is the second,
+    // NON-throwing way for the id rewrite to not happen: with no `oldId` there is nothing to
+    // scope on, so gradle/pbxproj are skipped and `guarded()` still returns true. Gating the
+    // anchor on exceptions alone let that case commit the new id anyway, which is exactly the
+    // permanent silent divergence this whole ordering exists to prevent, reached through the
+    // other door. Concretely: a capacitor.config.json that PARSES but carries no `appId` leaves
+    // gradle on the old id, advances the anchor to the new one, and every later pass then
+    // searches for an id the file does not contain, finds nothing, and reports NOTHING.
+    idWriteFailed = true;
+    if (idSkipNoted) return;
+    idSkipNoted = true;
+    notes.push('cannot determine this project\'s previous bundle id (capacitor.config.json missing or unreadable) — applicationId/PRODUCT_BUNDLE_IDENTIFIER NOT rewritten; fix or restore capacitor.config.json first');
+  };
+
+  // Android half.
+  const gradle = path.join(projectRoot, 'android', 'app', 'build.gradle');
+  if (!guarded('build.gradle', () => {
+    if (!fs.existsSync(gradle)) return;
+    const orig = fs.readFileSync(gradle, 'utf8');
+    let text = orig;
+    if (id) {
+      if (!oldId) noteIdSkipped();
+      else {
+        const r = replaceScoped(text, new RegExp(`applicationId\\s+"${oldId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`, 'g'), `applicationId "${id}"`);
+        if (r.changed) {
+          text = r.text;
+          idChangedFrom = idChangedFrom ?? oldId;
+          notes.push('synced applicationId (build.gradle)');
+        }
+      }
+    }
+    if (text !== orig) fs.writeFileSync(gradle, text);
+  })) idWriteFailed = true;
+  const strings = path.join(projectRoot, 'android', 'app', 'src', 'main', 'res', 'values', 'strings.xml');
+  guarded('strings.xml', () => {
+    if (!fs.existsSync(strings)) return;
+    const orig = fs.readFileSync(strings, 'utf8');
+    let text = orig;
+    // Every write below goes through `replaceAllIfMatches` (a literal replacer, never a
+    // replacement PATTERN) and an escaper. The id needs neither in principle — `usableIdentity`
+    // already bars `$`, `&` and `<` — but routing it the same way makes the safe path the ONLY
+    // path here, rather than a property of one field a later edit could forget.
+    if (id) {
+      // package_name / custom_url_scheme ARE the app id by definition — no scoping needed.
+      text = replaceAllIfMatches(text, /(<string name="package_name">)[^<]*(<\/string>)/g, androidResText(id)).text;
+      text = replaceAllIfMatches(text, /(<string name="custom_url_scheme">)[^<]*(<\/string>)/g, androidResText(id)).text;
+    }
+    if (name) {
+      text = replaceAllIfMatches(text, /(<string name="app_name">)[^<]*(<\/string>)/g, androidResText(name)).text;
+      text = replaceAllIfMatches(text, /(<string name="title_activity_main">)[^<]*(<\/string>)/g, androidResText(name)).text;
+    }
+    if (text !== orig) {
+      fs.writeFileSync(strings, text);
+      notes.push('synced strings.xml identity (app_name/package_name)');
+    }
+  });
+
+  // iOS half.
+  const pbx = path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+  if (!guarded('pbxproj', () => {
+    if (!fs.existsSync(pbx)) return;
+    const orig = fs.readFileSync(pbx, 'utf8');
+    if (id) {
+      if (!oldId) noteIdSkipped();
+      else {
+        const esc = oldId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const r = replaceScoped(orig, new RegExp(`PRODUCT_BUNDLE_IDENTIFIER = ${esc};`, 'g'), `PRODUCT_BUNDLE_IDENTIFIER = ${id};`);
+        if (r.changed) {
+          fs.writeFileSync(pbx, r.text);
+          idChangedFrom = idChangedFrom ?? oldId;
+          notes.push('synced PRODUCT_BUNDLE_IDENTIFIER (pbxproj)');
+        }
+      }
+    }
+  })) idWriteFailed = true;
+  const plist = path.join(projectRoot, 'ios', 'App', 'App', 'Info.plist');
+  guarded('Info.plist', () => {
+    if (!fs.existsSync(plist) || !name) return;
+    const orig = fs.readFileSync(plist, 'utf8');
+    const { text, changed } = replaceAllIfMatches(
+      orig,
+      /(<key>CFBundleDisplayName<\/key>\s*<string>)[^<]*(<\/string>)/g,
+      // Plain XML here, NOT `androidResText` — a plist has no AAPT2 apostrophe rule, and
+      // backslash-escaping an apostrophe would put the backslash in the displayed name.
+      xmlText(name),
+    );
+    if (changed) {
+      fs.writeFileSync(plist, text);
+      notes.push('synced CFBundleDisplayName (Info.plist)');
+    }
+  });
+
+  // The anchor, committed only now that every native file has had its turn.
+  writeCapacitorConfig();
+
+  if (idChangedFrom) {
+    notes.push(
+      `WARNING: bundle id changed ${idChangedFrom} -> ${id} — to both stores this is a NEW app; ` +
+      'previously uploaded builds and installed updates no longer connect to it.',
+    );
+  }
+  return notes;
+}
+
 /** Sync the Android marketing version + build number from `app.version` / `app.buildNumber`.
  *
  *  ⚠️ **`versionCode` is never LOWERED.** Play refuses a `versionCode` it has already seen and
@@ -1849,11 +2419,17 @@ export function healNativeConfig(projectRoot: string): HealResult {
     if (ams) notes.push(ams);
     // App version + build number → both platforms' native version fields (#199). Nothing
     // managed these before, so every project shipped the scaffolder's hardcoded 1 — and a
-    // duplicate build number is refused SILENTLY by both stores.
-    const av = healAndroidVersion(projectRoot, cfg.app.version, cfg.app.buildNumber);
+    // duplicate build number is refused SILENTLY by both stores. `buildNumberAuto` decides
+    // whether the number comes from the typed field or the repo's commit count.
+    const bn = resolveBuildNumber(projectRoot, cfg);
+    if (bn.note) notes.push(bn.note);
+    const av = healAndroidVersion(projectRoot, cfg.app.version, bn.value);
     if (av) notes.push(av);
-    const iv = healIosVersion(projectRoot, cfg.app.version, cfg.app.buildNumber);
+    const iv = healIosVersion(projectRoot, cfg.app.version, bn.value);
     if (iv) notes.push(iv);
+    // App identity → EVERY native file that carries it. Write-once at `cap add` before this:
+    // changing Project Settings afterwards silently changed nothing anywhere.
+    for (const n of healAppIdentity(projectRoot, cfg.app.appId, cfg.app.appName)) notes.push(n);
     // Orientation + status bar → native Info.plist / AndroidManifest.
     const io = healIosOrientationStatusBar(projectRoot, cfg.capacitor);
     if (io) notes.push(io);
@@ -1872,6 +2448,14 @@ export function healNativeConfig(projectRoot: string): HealResult {
     // Android half of the same concern (#282) — likewise independent of build.debugBuild.
     const dsa = healAndroidCrashlytics(projectRoot);
     if (dsa) notes.push(dsa);
+    // Release signing (#370) — unconditional, and deliberately NOT gated on this machine having an
+    // upload key. The block is inert without `android/keystore.properties`, so healing it in
+    // everywhere means the gradle side is already correct the first time anyone configures a key,
+    // rather than needing a second project-open to appear.
+    const rs = healAndroidReleaseSigning(projectRoot);
+    if (rs) notes.push(rs);
+    const gi = healAndroidGitignoreKeystore(projectRoot);
+    if (gi) notes.push(gi);
     // game-debug heals — only for a project that depends on the bridge. Every one of
     // these keys on build.debugBuild and NOTHING else (#112): the Xcode/Gradle
     // configuration means optimization + symbols, never "is this a debug build".
@@ -1884,6 +2468,9 @@ export function healNativeConfig(projectRoot: string): HealResult {
       // AFTER the wiring — it may have just scaffolded MyViewController.swift.
       const r = healIosGameDebugRegistration(projectRoot, debugBuild);
       if (r) notes.push(r);
+      // AFTER the wiring too: it may have just scaffolded the MyViewController this points at.
+      const sd = healIosSceneDelegateBridgeVC(projectRoot);
+      if (sd) notes.push(sd);
       const s = healIosRemoveReleaseStripPhase(projectRoot);
       if (s) notes.push(s);
       const am = healAndroidDebugBuildMetaData(projectRoot, debugBuild);

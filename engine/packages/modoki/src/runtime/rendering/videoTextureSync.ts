@@ -37,13 +37,25 @@
  *       `NodeMaterialObserver.equals` dereference null on every later frame.
  *
  *  The rule this file must never break: **no material is ever handed back to the renderer
- *  with a map REMOVED.** */
+ *  with a map REMOVED.**
+ *
+ *  ## What a texture's lifetime is tied to
+ *
+ *  The `VideoTexture` follows the **element**, never the material. A material swapping identity
+ *  under a live binding — a light-mask variant, a re-resolved `.mat.json` — re-derives the clone
+ *  and carries the SAME texture across (`rebindMaterial`). Tying the two together cost a GPU
+ *  texture create+destroy per frame whenever the material identity oscillated (#352).
+ *
+ *  Two same-element paths still dispose, both deliberately: a slot SHAPE change, and a
+ *  replacement material with no `map` slot (a file-shader `NodeMaterial`) — the second is a
+ *  refusal to bind rather than a rebuild, so there is nothing to carry the texture onto. */
 
 import * as THREE from 'three/webgpu';
 import type { World } from 'koota';
 import { VideoPlayer } from '../traits/VideoPlayer';
 import { videoElementFor } from '../video/videoSystem';
-import { markDerived } from './derivedMaterials';
+import { cloneDerived } from './derivedMaterials';
+import { inheritMaskBase } from './lightMaskVariants';
 
 /** What we hold per (surface, entity). */
 interface Bound {
@@ -137,6 +149,43 @@ function release(b: Bound): void {
   b.texture.dispose();
 }
 
+/** The material under a LIVE binding changed identity — a light-mask variant swapped, or a
+ *  different `.mat.json` resolved — while the video ELEMENT stayed the same. Re-derive the clone
+ *  from whatever is on the slot now and move the EXISTING `VideoTexture` onto it (#352).
+ *
+ *  Why this is not `release()` + rebuild, which is what it used to be: a texture's lifetime
+ *  belongs to the element, not to the material. The old path disposed the `VideoTexture` from
+ *  inside a branch that had already established `existing.element === el` — it threw away a
+ *  texture it had just proved was still valid. Invisible for a one-shot change, ruinous for a
+ *  repeating one: `maskForObject` picks the nearest lights with no hysteresis
+ *  (`autoLightCap.ts`), so an object crossing an equidistance boundary alternates between two
+ *  CACHED variants indefinitely, and an identity test against one remembered material cannot
+ *  tell "one I have already seen" from "a brand new one". Measured at 10 texture create+destroy
+ *  pairs over 10 alternating frames, on the mid/low tier where the automatic cap engages.
+ *
+ *  The material clone is deliberately NOT reused. The material genuinely changed, so cloning the
+ *  new one is the correct answer and costs a JS object; copying individual lighting properties
+ *  onto the old clone instead would be a hand-maintained list of "fields we carry" that goes
+ *  stale the first time a variant grows another one. */
+function rebindMaterial(b: Bound, next: MapMaterial): void {
+  // Nothing to hand back — our clone is NOT in the slot, `next` is, which is how we got here. So
+  // the header's rule is untouched: no material is handed to the renderer map-free, and
+  // `b.original` was never mutated. The superseded clone is simply dropped.
+  //
+  // Disposing a material does not dispose its textures in three, so `b.texture` survives this
+  // even though the clone still references it.
+  b.clone.dispose();
+  const clone = cloneDerived(next, next) as MapMaterial;
+  inheritMaskBase(clone, next);
+  clone.map = b.texture;      // the whole point: the same texture, not a fresh one
+  clone.needsUpdate = true;
+  b.original = next;
+  b.clone = clone;
+  setMaterialAt(b.mesh, b.slot, clone);
+  // `texture`, `element` and the rVFC pump are left alone. The pump closes over `b`, and `b` is
+  // mutated IN PLACE rather than replaced, so uploads carry on uninterrupted across the swap.
+}
+
 /** Bind/unbind video textures for one render surface. Call once per frame, AFTER
  *  `syncRenderables` (it reads the objects that call creates). */
 export function syncVideoTextures(
@@ -168,16 +217,42 @@ export function syncVideoTextures(
       // arrangement Tint and MaterialInstance already rely on for THEIR per-entity clones.
       const current = materialAt(existing.mesh, existing.slot);
       if (current !== existing.clone) {
-        // `null` means the SHAPE changed under us — the slot we recorded no longer exists
-        // (single ⇄ array). Re-asserting into that would be worse than doing nothing: with a
-        // single-material binding it would overwrite a freshly-assigned material ARRAY with
-        // our one stale clone, and with an array binding it would silently no-op and leave a
-        // binding nothing can ever restore. Drop it and re-derive the target from what the
-        // mesh actually looks like now.
-        if (current === null || current !== existing.original) {
-          // Either the shape changed, or the material REF did (a different .mat.json) — our
-          // clone is stale either way. Rebuild from the current base rather than pinning the
-          // old look forever.
+        if (current === null) {
+          // The SHAPE changed under us — the slot we recorded no longer exists (single ⇄
+          // array). Re-asserting into that would be worse than doing nothing: with a
+          // single-material binding it would overwrite a freshly-assigned material ARRAY with
+          // our one stale clone, and with an array binding it would silently no-op and leave a
+          // binding nothing can ever restore. Drop it and re-derive the target from what the
+          // mesh actually looks like now.
+          //
+          // One of TWO same-element paths that still dispose the texture (the other is the
+          // map-less replacement below). Both are scoping calls rather than oversights:
+          // carrying the texture would mean re-plumbing the rVFC pump, which closes over the
+          // `Bound` record the rebuild below replaces. A mesh does not oscillate between single
+          // and array, so this costs one texture, once — and the churn #352 is about needs a
+          // REPEATING trigger.
+          release(existing);
+          table.delete(id);
+        } else if (current !== existing.original && 'map' in current) {
+          // The material REF changed — a light-mask variant swapped, or a different `.mat.json`
+          // resolved. The clone is stale; the TEXTURE is not, because the element is unchanged
+          // (we are inside that very check). Re-derive one, carry the other (#352).
+          //
+          // `'map' in current` is not decoration: this path SKIPS `videoTargetOf`, which is where
+          // that guard otherwise lives (a material with no map slot is not a video target, and
+          // forcing `.map` onto one would invent a property three never monitors). Without the
+          // check, the shortcut would accept a material the full path declines.
+          rebindMaterial(existing, current as MapMaterial);
+          continue;
+        } else if (current !== existing.original) {
+          // Map-less replacement — fall through to the full teardown + re-derive, which declines
+          // to bind at `videoTargetOf` exactly as it would have before this shortcut existed.
+          //
+          // Reachable, not theoretical: `loaders/fileShaderBuilder.ts` builds a bare
+          // `new NodeMaterial()` for a file-shader `.mat.json`, and TSL textures ride nodes
+          // rather than PBR slots — so it has no `map`. A video screen whose material ref
+          // resolves to one lands here, and disposing is right: there is no slot to carry the
+          // texture ONTO, so this is a refusal to bind, not a rebuild.
           release(existing);
           table.delete(id);
         } else {
@@ -199,13 +274,25 @@ export function syncVideoTextures(
     // A private clone, never the shared material we found — see the header and
     // docs/video.md § Gotchas (#192).
     //
-    // `markDerived` is what keeps the base alive while this clone is bound (#318). Only `.map` is
-    // replaced below; every other slot the base carries (normal/roughness/emissive…) is still a
-    // SHARED reference, so a `.mat.json` re-import that retires the base would otherwise let the
-    // sweep free it — releasing textures this clone is drawing with. Staleness needs no fix here:
-    // `syncMaterial` re-binds a video entity's resolved material (it is neither tinted, instanced
-    // nor masked), so the `current !== existing.original` branch above already rebuilds.
-    const clone = markDerived(target.material.clone(), target.material) as MapMaterial;
+    // `cloneDerived` rather than a bare `.clone()`, and both halves of it matter here (#325).
+    //
+    // The STAMP keeps the base alive while this clone is bound (#318). Only `.map` is replaced
+    // below; every other slot the base carries (normal/roughness/emissive…) is still a SHARED
+    // reference, so a `.mat.json` re-import that retires the base would otherwise let the sweep
+    // free it — releasing textures this clone is drawing with.
+    //
+    // The rest of `cloneDerived` is what makes a LIGHT-MASKED video screen correct. The material
+    // we find on the mesh is whatever `applyLightMask` settled on, and once masking is active that
+    // is a VARIANT — so a bare `.clone()` both JSON-round-tripped the base Material parked in its
+    // `userData` and dropped the `lightsNode`/`customProgramCacheKey` that make the variant
+    // distinct, leaving the screen lit by every light and colliding with the base's pipeline key.
+    // The original comment here asserted a video entity "is neither tinted, instanced nor masked";
+    // the first two hold, the third never did.
+    const clone = cloneDerived(target.material, target.material) as MapMaterial;
+    // Answer `baseOf` with the variant's OWN base, not with this clone — see `inheritMaskBase` for
+    // why video inherits where a tint clone self-references, and what mints a material per frame
+    // if it does not.
+    inheritMaskBase(clone, target.material);
     clone.map = texture;
     clone.needsUpdate = true;
     const bound: Bound = {

@@ -241,3 +241,135 @@ export function filterDevices(query: string, presets: DevicePreset[] = DEVICE_PR
     return terms.every((t) => hay.includes(t));
   });
 }
+
+// ── Agent-facing resolution (#367) ─────────────────────────────────────────
+// `modoki_game_view_device` picks a preview screen by NAME or by an explicit pixel size. The
+// decision logic lives here rather than in the op so it is unit-testable without an editor —
+// `docs/editor.md` § Panels: a panel's decisions belong in a plain .ts module beside it.
+
+/** Bounds on a CUSTOM size. Not taste: `logicalW: 0` is how `FREE_PRESET` says "fill the panel"
+ *  (`isFree` in GameView), so a 0 would silently become Free rather than the size asked for — the
+ *  §0 rank-1 false success. The upper bound keeps `physical = logical × dpr` inside a backbuffer
+ *  a GPU will actually allocate; at the ceiling that is 8192 × 4 = 32768 px. */
+export const CUSTOM_SIZE_MIN = 1;
+export const CUSTOM_SIZE_MAX = 8192;
+export const CUSTOM_DPR_MIN = 0.5;
+export const CUSTOM_DPR_MAX = 4;
+
+/** Why a reported safe-area quartet reads the way it does.
+ *
+ *  `'preset'` — the catalog's authored insets for this device and orientation. Zeros here are a
+ *  STATEMENT (an iPhone SE with the status bar hidden really reports 0), not an absence.
+ *  `'custom-none'` — an explicit pixel size has no device behind it, so there is nothing to look
+ *  up and the quartet is zeros BY CONSTRUCTION. Reported rather than left implicit because
+ *  `devicePresets.ts`'s header warns at length that an invented inset mis-authors a layout that
+ *  then looks perfect in the editor; four bare zeros are indistinguishable from a measurement. */
+export type SafeAreaBasis = 'preset' | 'custom-none';
+
+/** The name a custom-size preset carries. Flat rather than `Custom 800x600`: the read-back
+ *  carries the numbers, so encoding them in the name would be a second copy to drift. */
+export const CUSTOM_PRESET_NAME = 'Custom';
+
+/** The full read-back for a selected preview screen — what the setter returns and what
+ *  `modoki_get_editor_state` reports, so a measurement can be attributed to a screen size. */
+export interface DeviceSelection {
+  device: string;
+  category: DeviceCategory;
+  orientation: Orientation;
+  /** CSS points — the space ALL layout math runs in. */
+  logical: { w: number; h: number };
+  /** Device pixels — the render backbuffer target. */
+  physical: { w: number; h: number };
+  dpr: number;
+  safeArea: SafeAreaPx;
+  safeAreaBasis: SafeAreaBasis;
+  /** `Free` fills the panel, so its logical size is whatever the panel currently is — the
+   *  0×0 in `logical`/`physical` means "no fixed size", not "zero pixels". */
+  free: boolean;
+}
+
+/** Build the read-back block for a preset under an orientation. */
+export function describeDeviceSelection(p: DevicePreset, orientation: Orientation): DeviceSelection {
+  return {
+    device: p.name,
+    category: p.category,
+    orientation,
+    logical: resolveLogicalSize(p, orientation),
+    physical: resolvePhysicalSize(p, orientation),
+    dpr: presetDpr(p),
+    safeArea: resolveSafeArea(p, orientation),
+    safeAreaBasis: p.name === CUSTOM_PRESET_NAME ? 'custom-none' : 'preset',
+    free: p.logicalW <= 0,
+  };
+}
+
+/** Exact (case-insensitive) lookup by name. Returns undefined rather than guessing — §5 of
+ *  `docs/mcp-tool-conventions.md`: a caller who names a screen that does not exist is told so with
+ *  the real list, because silently previewing a DIFFERENT screen than asked for is worse than
+ *  failing. Case-insensitive is not fuzzy matching: no two presets differ only by case (asserted
+ *  in `devicePresets.test.ts`), so it cannot resolve to a screen other than the one named. */
+export function findPresetByName(name: string, presets: DevicePreset[] = DEVICE_PRESETS): DevicePreset | undefined {
+  const want = name.trim().toLowerCase();
+  return presets.find((p) => p.name.toLowerCase() === want);
+}
+
+/** A synthetic preset for an explicit pixel size — the shape a catalog entry has, so every
+ *  `resolve*` helper and every GameView consumer handles it with no branch of its own.
+ *
+ *  `width`/`height` are LOGICAL (CSS points), which is the space layout runs in; `dpr` (default 1)
+ *  derives the physical backbuffer. The names say `logical` on the tool's parameters for the same
+ *  reason — §2, one name one meaning: a bare `width` means two different things in this file. */
+export function makeCustomPreset(logicalW: number, logicalH: number, dpr = 1): DevicePreset {
+  return {
+    name: CUSTOM_PRESET_NAME,
+    category: 'General',
+    logicalW, logicalH,
+    physicalW: Math.round(logicalW * dpr),
+    physicalH: Math.round(logicalH * dpr),
+    safeArea: NO_SAFE_AREA,
+  };
+}
+
+/** Validate an explicit custom size. Returns the offending detail as a STRING (the `why` an op
+ *  turns into a refusal), or null when it is usable. */
+export function validateCustomSize(logicalW: unknown, logicalH: unknown, dpr: unknown): string | null {
+  for (const [label, v] of [['logicalWidth', logicalW], ['logicalHeight', logicalH]] as const) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) return `${label} must be a finite number — got ${JSON.stringify(v)}`;
+    if (!Number.isInteger(v)) return `${label} must be a whole number of logical (CSS) pixels — got ${v}`;
+    if (v < CUSTOM_SIZE_MIN || v > CUSTOM_SIZE_MAX) {
+      return `${label} must be between ${CUSTOM_SIZE_MIN} and ${CUSTOM_SIZE_MAX} — got ${v}`
+        + (v <= 0 ? ` (0 is how the 'Free' preset says "fill the panel", so it cannot mean a size)` : '');
+    }
+  }
+  if (dpr !== undefined) {
+    if (typeof dpr !== 'number' || !Number.isFinite(dpr)) return `dpr must be a finite number — got ${JSON.stringify(dpr)}`;
+    if (dpr < CUSTOM_DPR_MIN || dpr > CUSTOM_DPR_MAX) return `dpr must be between ${CUSTOM_DPR_MIN} and ${CUSTOM_DPR_MAX} — got ${dpr}`;
+    // ⚠️ **The dpr must ROUND-TRIP, or the read-back contradicts the call.** `makeCustomPreset`
+    // stores `physical = round(logical * dpr)` and `presetDpr` recovers it as `physical / logical`,
+    // so a dpr whose product is fractional comes back as a DIFFERENT number than the one passed:
+    // `{1, 1, dpr: 0.5}` was accepted and answered `dpr: 1`, and `{3, 3, dpr: 0.5}` answered
+    // `0.666…`, while the tool's description promises `physical = logical x dpr`. Telling the agent
+    // a dpr it did not ask for is the §0 rank-2 class (a wrong answer stated authoritatively), so
+    // the combination is refused rather than silently rounded. Tolerance, not `Number.isInteger`,
+    // because 1.1 * 10 is 11.000000000000002 in IEEE754 and that is a round-trip, not a failure.
+    //
+    // ⚠️ This is NOT a ban on fractional dpr — 2.5 on any even dimension passes. But do not reach
+    // for a real phone's dpr as the example: Pixel 9 is 412x924 -> 1080x2424, i.e. ~2.6214 wide and
+    // ~2.6234 tall, and `{412, 924, 2.62}` IS refused here (412 x 2.62 = 1079.44). A device whose
+    // two axes disagree on dpr cannot be expressed as one custom `dpr` at all — that is why the
+    // CATALOG stores physical sizes explicitly instead of deriving them. Pick such a screen by
+    // NAME, not by custom size.
+    const fractional = ([['logicalWidth', logicalW], ['logicalHeight', logicalH]] as const)
+      .filter(([, v]) => Math.abs((v as number) * dpr - Math.round((v as number) * dpr)) > 1e-9);
+    if (fractional.length) {
+      const [label, v] = fractional[0];
+      return `dpr ${dpr} on ${label} ${v} gives a fractional physical size (${(v as number) * dpr}px), `
+        + 'which cannot round-trip: the read-back would report a different dpr than the one passed. '
+        + 'Pick a dpr whose product with BOTH dimensions is a whole number of device pixels — or, if '
+        + 'you are after a real phone, select it by NAME: a device whose two axes imply slightly '
+        + "different ratios (Pixel 9 is ~2.6214 x ~2.6234) has no single dpr, which is why the "
+        + 'catalog stores its physical size explicitly.';
+    }
+  }
+  return null;
+}

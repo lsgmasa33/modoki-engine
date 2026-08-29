@@ -282,6 +282,21 @@ indistinguishable from one that shipped fine until someone plays it.
 
 ## Gotchas
 
+**A recycled entity index must not inherit the previous entity's decoder (#336).** `videoSystem`'s
+`live`/`pending`/`progress`/`readyUrls`/`failed` all persist across frames keyed by `entity.id()`,
+which strips koota's generation — and the `seen`-set sweep that releases a dead entity's state runs
+at the END of a pass, so a despawn+respawn landing between two passes never gets one. The
+`existing.clip !== vp.clip` hard-swap self-heals a *different* clip; a **same-clip** respawn (a
+prefab re-instantiated, two players streaming one intro) does not, and the newcomer silently
+adopted the dead entity's decoder, download progress and sticky failure. Fixed with an `owner` map
+(id → packed entity) checked at the top of the reconcile — the maps stay id-keyed because
+`videoElementFor`/`seekEntityVideo` are a public addressing contract the texture surfaces,
+`UIVideoMount` and the `video.*` actions all call with a masked id. `owner` is dropped on a world
+swap but NOT on `stopWorldVideo`, so a sticky download failure still survives Stop→Play as
+intended. Background and the general rule:
+[engine-concepts.md](engine-concepts.md) § Entity. Regression test:
+`tests/video/videoSystemIdReuse.test.ts`.
+
 **`playsInline` and `crossOrigin` are both mandatory, and both fail silently.** Without
 `playsInline`, iOS hijacks playback into a native fullscreen player. Without
 `crossOrigin='anonymous'`, a remote clip taints the canvas and cannot become a texture at all.
@@ -322,19 +337,53 @@ clip stops — is wrong twice:
 `videoTextureSync` therefore binds a private clone: the shared original is never mutated, and the
 clone is swapped out whole and disposed rather than having its map cleared. The cost is one extra
 pipeline per video surface — the same trade `Tint` and `MaterialInstance` already make for their own
-per-entity clones. Two consequences worth knowing:
+per-entity clones. Consequences worth knowing:
 
 - It runs **last** in the frame, so it re-asserts its clone against `syncMaterial`'s per-frame
   re-bind of a resolved `.mat.json`; if the material *ref* genuinely changed, it rebuilds the clone
-  from the new base instead of pinning the old look.
+  from the new base instead of pinning the old look — **carrying the existing `VideoTexture` onto
+  it** rather than minting a new one (next bullet).
 - If the slot **shape** changes under a live binding (single ⇄ material array) the binding is dropped
   and re-derived, never re-asserted — writing into a slot that no longer exists would clobber a
   freshly-assigned array, or strand a binding nothing could restore.
+- **A texture's lifetime follows the ELEMENT, never the material (#352).** A material swapping
+  identity under a live binding re-derives the *clone* and keeps the *texture*
+  (`rebindMaterial`). The two used to be freed together, from inside a branch that had already
+  established the element was unchanged — so the module threw away a texture it had just proved
+  was still valid. Harmless for a one-shot change and ruinous for a repeating one: `maskForObject`
+  picks the nearest lights with no hysteresis, so an object crossing an equidistance boundary
+  alternates between two **cached** variants indefinitely, and an identity test against one
+  remembered material cannot tell "one I have already seen" from "a brand new one". That measured
+  **10 GPU texture create+destroy pairs over 10 alternating frames** — ~60/sec at 60 fps, on the
+  mid/low tier where the automatic light cap engages. Pinned by
+  `tests/video/videoTextureSync.test.ts` § "the texture follows the ELEMENT".
+  The flap itself is a separate defect in the light selection (#353); this fix makes a selection
+  change cost a clone instead of a texture whether or not it repeats.
+  ⚠️ **Two** same-element paths still dispose, both deliberately. A slot **shape** change
+  (previous bullet) — carrying there would mean re-plumbing the rVFC pump, which closes over the
+  binding record a shape change replaces, and a mesh does not oscillate between single and array,
+  so it costs one texture, once. And a replacement material with **no `map` slot**: a file-shader
+  `.mat.json` resolves to a bare `NodeMaterial` (`loaders/fileShaderBuilder.ts`) whose textures
+  ride TSL nodes rather than PBR slots, so there is nothing to carry the texture *onto* — that
+  path is a refusal to bind, not a rebuild.
 - The clone is stamped `markDerived` (#318). Only `.map` is replaced, so every other slot the base
   carries — normal, roughness, emissive — is still a **shared** texture reference; without the stamp
   a `.mat.json` re-import lets `sweepRetiredMaterials` free the base (no *mesh* binds it any more —
   the clone does) and release textures this clone is drawing with. Mechanism:
   `docs/textures.md` § "The CLONES are the other half".
+- **A light-masked video screen needs more than the stamp (#325).** Once masking is active, the
+  material this module finds on the mesh is a light-mask VARIANT, so it clones through
+  `cloneDerived` and calls `inheritMaskBase`. A bare `.clone()` — which is what shipped for months —
+  dropped the variant's `lightsNode` and `customProgramCacheKey`, so the screen rendered lit by
+  every light, **silently ignoring the mask it was authored with**, and collided with the base's
+  pipeline key (the #136 failure). It also JSON-round-tripped the base Material parked in
+  `userData`, serialising a whole material graph — `THREE.Texture: Unable to serialize Texture.` for
+  a compressed one.
+  ⚠️ Nothing authored reaches this today: video-demo's screens are default-material primitives, and
+  `scene3DSync`'s primitive branch only masks a primitive with an explicit `.mat.json`. It becomes
+  reachable the moment a video screen is a GLB `Renderable3D`, or a primitive with a material and a
+  `renderingLayerMask`. Reasoning about who owns the slot: `docs/rendering.md`
+  § "Rendering-layer light masks".
 
 The 2D twin is unaffected: PixiJS has no such observer, and it swaps `sprite.texture` rather than a
 material property.

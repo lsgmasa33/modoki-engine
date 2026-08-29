@@ -112,6 +112,71 @@ describe('Zone2D triggers — declarative + despawn', () => {
     occ.destroy(); tw.step(1);
     expect(phases).toEqual(['enter', 'exit']);
   });
+
+  // QA-ZONE-0003: `runZoneTriggers`' cross-frame occupancy state used to be keyed by
+  // `entity.id()`, which strips koota's generation. A despawn immediately followed by a respawn
+  // that reclaims the SAME index (a scene hot-reload, or Play→Stop→Play landing between two
+  // frames) then collided in the `.id()`-keyed map: the diff went BLIND — the dead occupant's
+  // exit and the new occupant's enter both vanished, because the stripped key made them look
+  // like the SAME still-present occupant. Fixed by keying on the packed entity (`.valueOf()`,
+  // generation included) instead. This test forces the collision deterministically: koota's
+  // entity index is a LIFO free list, so destroying `occ` and immediately spawning a same-shape
+  // replacement reclaims the exact freed index — asserted below, so the test fails loudly rather
+  // than silently passing if that free-list behavior ever changes.
+  it('a same-index respawn (occupant despawn+recreate in one step) still fires exit AND enter, never a silent swap', () => {
+    tw = createTestWorld({ systems: [ZONE2D] });
+    tw.spawn(Transform({ x: 0, y: 0, sx: 4, sy: 4 }), Zone2D({ shape: 'box' }));
+    const occ1 = tw.spawn(Transform({ x: 0, y: 0 }), ZoneOccupant);
+    const phases: string[] = [];
+    zone2DEvents.onZone((_z, _o, p) => phases.push(p), tw.world);
+    tw.step(1);
+    expect(phases).toEqual(['enter']);
+
+    occ1.destroy();
+    const occ2 = tw.spawn(Transform({ x: 0, y: 0 }), ZoneOccupant); // reclaims occ1's freed index
+    expect(occ2.id()).toBe(occ1.id());       // precondition: the index really was reused
+    expect(occ2.valueOf()).not.toBe(occ1.valueOf()); // but the packed entity (generation) differs
+    tw.step(1);
+
+    // runZoneTriggers fires all enters before all exits within one diff — order aside, the point
+    // is BOTH transitions survive: occ2's enter and occ1's exit, never silently absorbed into
+    // "nothing changed" by a collided key.
+    expect(phases).toEqual(['enter', 'enter', 'exit']);
+  });
+
+  // Close-out review (opus-reviewer) on the fix above: keying `ZoneState` by the packed entity
+  // restores the event COUNT, but `routeZone` originally still resolved each event's JOURNAL
+  // identity via `entityRef(deadHandle)` — and koota's `has()`/`get()` (which `entityRef` calls)
+  // do NOT check generation, only `isAlive()` does. So the dead occupant's synthesized exit was
+  // journaled under the RECLAIMED index's new (live) occupant's guid — the exit's `phase` count
+  // was right, but its NAMED IDENTITY was silently swapped. The `phases: string[]` test above
+  // cannot see this at all: it passes identically whether the exit names occ1 or occ2. This test
+  // reads the journal payload itself, mirroring `physicsContactEvents.refOf`'s fix for the same
+  // class of bug.
+  it('a same-index respawn never journals the exit under the LIVE replacement\'s guid', () => {
+    tw = createTestWorld({ systems: [ZONE2D] });
+    tw.spawn(Transform({ x: 0, y: 0, sx: 4, sy: 4 }), Zone2D({ shape: 'box' }));
+    const occ1 = tw.spawn(Transform({ x: 0, y: 0 }), ZoneOccupant, EntityAttributes({ guid: 'guid-occ1', name: 'occ1' }));
+    tw.step(1); // enter for occ1
+
+    occ1.destroy();
+    const occ2 = tw.spawn(Transform({ x: 0, y: 0 }), ZoneOccupant, EntityAttributes({ guid: 'guid-occ2', name: 'occ2' }));
+    expect(occ2.id()).toBe(occ1.id()); // precondition: the index really was reused
+    tw.step(1); // occ1's exit + occ2's enter, in one diff
+
+    const zoneEvents = tw!.events({ type: '@zone' }).map((e) => e.payload as { zone: unknown; other: string | number; phase: string });
+    const exit = zoneEvents.find((e) => e.phase === 'exit');
+    const enter2 = zoneEvents.filter((e) => e.phase === 'enter').at(-1); // occ2's enter (the 2nd one)
+    // occ2's OWN enter correctly names it — entityRef resolves a live entity's guid directly.
+    expect(enter2?.other).toBe('guid-occ2');
+    // occ1's exit must NOT claim to be occ2 (the misattribution this test guards): koota's
+    // has()/get() don't check generation, so entityRef(deadHandle) would otherwise silently
+    // resolve occ2's guid for occ1's own exit — reading as "occ2 entered and exited the same
+    // tick", which is false. `refOf` falls back to the CACHED numeric id instead: honestly
+    // anonymous rather than confidently wrong.
+    expect(exit?.other).not.toBe('guid-occ2');
+    expect(typeof exit?.other).toBe('number');
+  });
 });
 
 describe('Zone triggers — 2D/3D channel isolation', () => {

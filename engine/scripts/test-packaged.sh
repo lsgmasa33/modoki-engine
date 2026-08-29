@@ -82,8 +82,26 @@ BIN="$(node "$PATHS" "$OUT" bin)"
 # a literal /tmp: the app opens it as a native process and MSYS never rewrites env vars.
 export MODOKI_VITE_LOG="${MODOKI_VITE_LOG:-$(node "$PATHS" tmpdir)/modoki-vite-packaged-$(basename "$REPO").log}"
 
+# PIN the backend port too — this script MUST set it, because nothing downstream will.
+# It never had its own default: two now-deleted clone-named npm entry points
+# (`editor:main:packaged` / `editor:ai:packaged`) each prefixed a literal
+# `MODOKI_BACKEND_PORT=`, and this file simply inherited it. #349 removed those (one
+# clone's lane baked
+# into a script every clone runs), which would have left this launching with NO pin at
+# all — and main.ts's sticky-then-scan starts its candidate list at 5179, so a packaged
+# editor on a WORKER clone would have gone hunting for the HUB's port. That is the very
+# bug #349 fixes, re-created one layer down.
+#
+# Derive from the clone directory, same source of truth as launch-editor.sh. An unknown
+# clone yields empty, which leaves the pin unset and lets main.ts pick — the correct
+# degrade for a scratch clone, and identical to the pre-#349 behaviour of running this
+# script directly rather than through npm.
+BACKEND_PORT="${MODOKI_BACKEND_PORT:-$(node "$REPO/engine/scripts/editorPorts.mjs" backend "$REPO" || true)}"
+[ -n "$BACKEND_PORT" ] && export MODOKI_BACKEND_PORT="$BACKEND_PORT"
+
 echo "[test-packaged] launching packaged app${PROJECT:+ on $MODOKI_PROJECT}…"
 echo "[test-packaged]   app:      $BIN   (outside repo → faithful resolution)"
+echo "[test-packaged]   backend:  ${BACKEND_PORT:-auto (unknown clone — main.ts picks)}"
 echo "[test-packaged]   vite log: $MODOKI_VITE_LOG"
 echo "[test-packaged]   main-process logs stream below. Ctrl-C to stop."
 echo "──────────────────────────────────────────────────────────────"

@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, allowOccludedParam, entitySpec, modifierEnum, pointSpec } from '../shapes.js';
+import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, allowOccludedParam, makeEntitySpec, modifierEnum, makePointSpec } from '../shapes.js';
 
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, evalRenderer, editorAction } = ctx;
@@ -42,7 +42,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       // Inspector has no kebab menu at all), and being the docstring example is exactly how a
       // wrong selector propagates — it was copied into a QA case brief before anyone checked.
       selector: z.string().optional().describe("CSS selector to aim at, e.g. '[data-ui-id=\"inspector.header.delete\"]'. Overrides x/y."),
-      entity: entitySpec.optional(),
+      entity: makeEntitySpec().optional(),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button (default 'left')."),
       clickCount: z.number().optional().describe('1 = single (default), 2 = double-click.'),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
@@ -65,8 +65,8 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'move. For HTML5 drag-and-drop ' +
       '(asset→slot, reparent) use modoki_dnd, NOT this. Requires the Electron editor.',
     {
-      from: pointSpec.describe('Drag origin: {entity} | {selector} | {x,y}.'),
-      to: pointSpec.describe('Drag destination: {entity} | {selector} | {x,y}.'),
+      from: makePointSpec().describe('Drag origin: {entity} | {selector} | {x,y}.'),
+      to: makePointSpec().describe('Drag destination: {entity} | {selector} | {x,y}.'),
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button (default 'left')."),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, held for the WHOLE drag as a real keyDown/keyUp around the gesture — so a listener tracking the modifier's LEVEL (the 3D gizmo's snap) sees it down for every intermediate move.`),
@@ -99,7 +99,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       x: z.number().optional().describe('Page CSS x. Required unless `selector` is given.'),
       y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
       selector: z.string().optional().describe('CSS selector to aim at (resolved server-side). Overrides x/y.'),
-      entity: entitySpec.optional(),
+      entity: makeEntitySpec().optional(),
       button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
       allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Applies to \`action:'down'\` only — a move/up is delivered to whatever captured the press, so what sits under the destination cannot stop it.`),
@@ -118,7 +118,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       x: z.number().optional().describe('Page CSS x. Required unless `selector` is given.'),
       y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
       selector: z.string().optional().describe('CSS selector to aim at. Overrides x/y.'),
-      entity: entitySpec.optional(),
+      entity: makeEntitySpec().optional(),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
       allowOccluded: allowOccludedParam,
     },
@@ -141,7 +141,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       x: z.number().optional().describe('Page CSS x. Required unless `selector` is given.'),
       y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
       selector: z.string().optional().describe('CSS selector to aim at. Overrides x/y.'),
-      entity: entitySpec.optional(),
+      entity: makeEntitySpec().optional(),
       deltaX: z.number().optional().describe('Horizontal wheel delta (default 0). At least ONE of deltaX/deltaY must be non-zero — a zero-delta scroll is REFUSED, not dispatched as a silent no-op.'),
       deltaY: z.number().optional().describe('Vertical wheel delta; positive = content down. Default 0, but a call with neither delta non-zero is REFUSED (~120 ≈ one wheel tick).'),
       modifiers: z.array(modifierEnum)
@@ -286,7 +286,16 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   // ── dnd — HTML5 drag-and-drop synthesis (dev + DMG) ──
   // An endpoint must actually AIM somewhere: a `{}` (or a typo'd key, which strict now catches)
   // used to reach the relay as an unaimed drag and be reported as a completed one.
-  const dndEndpoint = z.object({
+  //
+  // A FACTORY, not a shared const: `from` and `to` need their own schema INSTANCE. When both
+  // params pointed at the same ZodEffects object, `zod-to-json-schema` deduped it into
+  // `to: {"$ref": "#/properties/from"}` in the advertised inputSchema (measured — reproduced the
+  // exact `$ref` with a script against this schema). A client that does not resolve JSON Schema
+  // `$ref` reads `to`'s type as unknown and falls back to a string, so every real call failed zod
+  // validation with "Expected object, received string at to" — the object never actually reached
+  // this file broken; the ADVERTISEMENT of its shape was wrong. Two structurally-identical but
+  // reference-distinct schemas stop the dedup and each gets its own inline `type: object`.
+  const makeDndEndpoint = () => z.object({
     selector: z.string().optional(),
     x: z.number().optional(),
     y: z.number().optional(),
@@ -313,11 +322,11 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'with a warning saying exactly that. Do not rest a verdict on a covered drop. Works in dev ' +
       'AND the DMG.',
     {
-      // STRICT + refined, unlike the shared `pointSpec` (which carries an `entity` this route
+      // STRICT + refined, unlike the shared `makePointSpec` (which carries an `entity` this route
       // cannot honour — see the description). An all-optional inline object accepted `{}` and a
       // misspelled `selecter`, both of which reach the relay as "no aim at all" (S3.6).
-      from: dndEndpoint.describe('Drag SOURCE: {selector} (preferred — resolved server-side, cannot go stale) or {x,y} CSS px.'),
-      to: dndEndpoint.describe('Drop TARGET: {selector} (preferred) or {x,y} CSS px.'),
+      from: makeDndEndpoint().describe('Drag SOURCE: {selector} (preferred — resolved server-side, cannot go stale) or {x,y} CSS px.'),
+      to: makeDndEndpoint().describe('Drop TARGET: {selector} (preferred) or {x,y} CSS px.'),
     },
     async ({ from, to }) => editorAction('dom-dnd', { from, to }),
   );
@@ -339,7 +348,24 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'empty list: it names what IS live (`byEditor`/`byKind` + a hint), so a typo\'d filter cannot ' +
       'read as a correct negative answer. Works in dev AND the DMG.',
     {
-      editor: z.string().optional().describe('Filter to one editor, e.g. "collider2d", "dopesheet", "skin".'),
+      editor: z.string().optional().describe(
+        'Filter to one editor, e.g. "collider2d", "dopesheet", "skin". The editor\'s view must be '
+        + 'MOUNTED for its handles to exist at all: "dopesheet" and "curves" are the Animation '
+        + 'panel\'s two views and only ONE is mounted — set it with modoki_animation_view_mode. '
+        + 'Within "curves", kind:"tangent" needs an ACTIVE TRACK on top of the view (empty on any '
+        + 'clip with 2+ numeric tracks until one is selected — see modoki_get_editor_state '
+        + '`animationView`). "collider2d" needs modoki_scene_view_mode \'ui\' + '
+        + 'modoki_collider_edit, AND the SceneView 2D layer toggle left on — a human can turn it '
+        + 'off with no agent-readable state or route back on yet (#373 part 2; the toolbar button '
+        + 'is chrome-tappable at data-ui-id "sceneView.toolbar.layer.show2D" with data-ui-state '
+        + '"on"/"off", but blindly tapping it can turn 2D OFF if that was never the problem — '
+        + 'check the state first). "sprite" (open with action:open-sprite-editor) additionally '
+        + 'needs a slice SELECTED (action:select-sprite-slice) — check modoki_get_editor_state '
+        + '`spriteEditorSelection` rather than assuming none, since a session an agent joins after '
+        + 'a human may already have one selected. "skin" needs action:open-skin-editor, and '
+        + 'kind:"bone-joint" additionally needs skinMode "rig" or "weights" — NOT "parts" — see '
+        + 'modoki_get_editor_state `skinMode`.',
+      ),
       kind: z.string().optional().describe('Filter to one handle kind, e.g. "collider-vertex", "keyframe", "bone-joint".'),
       ids: z.string().optional().describe('Comma-separated handle ids to restrict to.'),
     },

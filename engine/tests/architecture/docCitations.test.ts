@@ -433,6 +433,130 @@ function headingIds(absDoc: string): Set<string> {
   return ids;
 }
 
+/** Rule 4: a `<doc>.md § "Quoted Title"` citation names a heading that doc really defines.
+ *
+ *  Rule 3 above checks only NUMBERED sections, and says so — which leaves every doc that titles
+ *  its headings instead of numbering them (`CLAUDE.md`, `art.md`, `hints.md`, the game-local docs)
+ *  unchecked. The quoted form is the commoner one: ~95 citations at the time this was added, and
+ *  #328 compressed `games/court/CLAUDE.md` by 135 lines with two other docs citing its section
+ *  TITLES — a rename there would have dangled silently, because rule 1 checks the path and rule 3
+ *  skips unnumbered docs. That gap had to be closed by hand during that change, which is the
+ *  argument for closing it here.
+ *
+ *  Matching is SUBSTRING, not equality: a citation legitimately quotes a fragment of a long
+ *  heading — `§ "The hint system"` -> `## The hint system — the standard is not negotiable`, and
+ *  `§ "BOARD space is Pixi…"` -> `## The split, now that the migration is done: BOARD space is
+ *  Pixi…`. Prefix matching was tried first and produced false offenders on the second shape.
+ *  Markup and leading sigils are stripped before comparing (`## ⚠️ Foo` is cited as `§ "Foo"`).
+ */
+const TITLE_CITE = /([A-Za-z0-9_./-]+\.md)\)?[^\n§]{0,60}§\s*[""]([^""\n]{4,80})[""]/g;
+
+/** Normalize a heading or a cited title so prefix comparison ignores markup and sigils. */
+function normHeading(t: string): string {
+  return t
+    .replace(/[`*_]/g, '')
+    .replace(/^[^\p{L}\p{N}]+/u, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function headingTitles(absDoc: string): string[] {
+  const out: string[] = [];
+  for (const line of fs.readFileSync(absDoc, 'utf8').split('\n')) {
+    const m = /^#{1,4}\s+(.*\S)\s*$/.exec(line);
+    if (m) out.push(normHeading(m[1]));
+  }
+  return out;
+}
+
+/** Titled section citations that dangle TODAY, ratcheted so no NEW one can land (#328).
+ *
+ *  ⚠️ **EMPTY, and it must stay that way — the burn-down is done (#329).** All eleven original
+ *  entries were repointed rather than deleted, per `docs/doc-conventions.md`: "if the citation
+ *  reads as a live pointer, repoint it instead, because that is the defect and not the exception."
+ *
+ *  What #329 found, which is worth knowing before adding an entry here: **the sections had NOT
+ *  been "renamed substantially or folded away" — nine of the eleven pointed at material that was
+ *  right there**, written as a **bold lead-in** rather than as a `#### heading`. This guard only
+ *  reads headings, so an accurate citation of a bold-styled section dangles. Those were repointed
+ *  to the enclosing real heading with the specific phrase kept in prose
+ *  (`§ "How it works" (the "A stranded synthetic press" note)`) — the house style already used by
+ *  the ABSORBED_BY table above. The other two were not citation defects at all: one was a line
+ *  naming TWO docs before the `§` (the regex attributes it to the first, a human reads the
+ *  second), and one was a code comment QUOTING a known-bad citation as a historical example,
+ *  which rule 4 cannot tell from a live one.
+ *
+ *  So before ratcheting anything: check whether the target exists as non-heading text, and whether
+ *  the citing line names more than one `.md`. Adding an entry to get a rename past the gate is
+ *  explicitly forbidden by `docs/doc-conventions.md`; this list only ever shrinks, and the
+ *  meta-test below fails if an entry stops dangling.
+ */
+const KNOWN_DANGLING_TITLES: ReadonlyArray<{ doc: string; title: string }> = [];
+
+function isKnownDangling(citedDocRel: string, rawTitle: string): boolean {
+  const want = normHeading(rawTitle);
+  return KNOWN_DANGLING_TITLES.some(
+    (e) => citedDocRel.endsWith(e.doc) && normHeading(e.title) === want,
+  );
+}
+
+describe('cited doc SECTION TITLES resolve (#328)', () => {
+  it('every `<doc>.md § "Title"` names a heading that doc defines', () => {
+    if (!hasFullDocsTree()) return; // OSS snapshot trims docs/plans + games.
+
+    const offenders: string[] = [];
+    let checked = 0;
+
+    for (const abs of repoFiles()) {
+      const relFile = rel(abs);
+      if (isNonCitingSource(relFile)) continue;
+      if (relFile === 'engine/tests/architecture/docCitations.test.ts') continue; // this file
+      const text = fs.readFileSync(abs, 'utf8');
+
+      for (const m of text.matchAll(TITLE_CITE)) {
+        const [, citedPath, rawTitle] = m;
+        const candidates = [
+          path.resolve(path.dirname(abs), citedPath),
+          path.join(repoRoot, citedPath),
+        ];
+        const target = candidates.find((c) => fs.existsSync(c) && c.endsWith('.md'));
+        if (!target) continue; // rule 1 owns unresolvable paths.
+        const want = normHeading(rawTitle);
+        if (want.length < 4) continue;
+        checked++;
+        if (isKnownDangling(rel(target), rawTitle)) continue;
+        if (!headingTitles(target).some((h) => h.includes(want))) {
+          const line = text.slice(0, m.index).split('\n').length;
+          offenders.push(`${relFile}:${line} cites ${rel(target)} § "${rawTitle}" — no such heading`);
+        }
+      }
+    }
+
+    expect(checked, 'no titled section citations found — the matcher is broken').toBeGreaterThan(10);
+    expect(
+      [...new Set(offenders)].sort(),
+      'these citations name a section TITLE that does not exist. Either the heading was renamed '
+        + '(repoint the citation in the same commit) or the section was folded away — see '
+        + 'docs/doc-conventions.md.',
+    ).toEqual([]);
+  });
+
+  it('every KNOWN_DANGLING_TITLES entry still dangles — fixed ones must be removed', () => {
+    if (!hasFullDocsTree()) return;
+    const stale: string[] = [];
+    for (const e of KNOWN_DANGLING_TITLES) {
+      const abs = path.join(repoRoot, e.doc);
+      if (!fs.existsSync(abs)) continue; // rule 1 owns missing docs.
+      const want = normHeading(e.title);
+      if (headingTitles(abs).some((h) => h.includes(want))) {
+        stale.push(`${e.doc} § "${e.title}" resolves now — drop it from KNOWN_DANGLING_TITLES`);
+      }
+    }
+    expect(stale.sort(), 'the ratchet only goes one way').toEqual([]);
+  });
+});
+
 describe('cited doc SECTIONS resolve', () => {
   it('every `<doc>.md § N` names a heading that doc defines', () => {
     if (!hasFullDocsTree()) return; // OSS snapshot trims docs/plans + games; nothing to check.

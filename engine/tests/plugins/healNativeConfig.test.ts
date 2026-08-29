@@ -4,12 +4,30 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { healNativeConfig, androidSdkDirValue } from '../../plugins/healNativeConfig';
 // Read the floors from the schema rather than hardcoding them: this file asserts the WIRING
 // (the default reaches the heal at all). The floor VALUES are pinned, deliberately and with
 // their rationale, in tests/architecture/buildTargetFloor.test.ts — duplicating them here
 // would mean a reviewed floor change had to be edited in two places.
 import { DEFAULT_PROJECT_CONFIG } from '../../project-config';
+
+/** Strip the #370 release-signing fence from an `app/build.gradle` before comparing it.
+ *
+ *  Several tests below assert a WHOLE-FILE no-op ("leaves the project ALONE on junk values"), which
+ *  is a deliberately strong assertion and worth keeping strong. But `healAndroidReleaseSigning`
+ *  writes its block on every project unconditionally — it is not gated on the thing those tests are
+ *  about — so a literal comparison would now fail for a reason unrelated to what each one guards.
+ *
+ *  Stripping ONLY the fence keeps the rest of the assertion byte-exact: if the version heal (or any
+ *  other) touched a single character it still fails. The signing block has its own tests, so this
+ *  removes nothing from the suite's coverage — it stops one heal from masking every other one. */
+function withoutSigningBlock(text: string): string {
+  // Replaced with a single '\n', not '' — the block is APPENDED after a blank separator line, so
+  // swallowing every newline before it would also eat the file's own trailing newline and report a
+  // one-character diff on a file the heal left alone.
+  return text.replace(/\n*\/\/ modoki:release-signing-begin[\s\S]*?\/\/ modoki:release-signing-end\n?/, '\n');
+}
 
 let root: string;
 let savedToolchainDir: string | undefined;
@@ -635,7 +653,8 @@ describe('healNativeConfig — Android Crashlytics gradle wiring (#282)', () => 
     const beforeTop = readTop(); const beforeApp = readApp();
     healNativeConfig(root);
     expect(readTop()).toBe(beforeTop);
-    expect(readApp()).toBe(beforeApp);
+    // #370's signing block is written for every project and is not what this test is about.
+    expect(withoutSigningBlock(readApp())).toBe(beforeApp);
   });
 
   it('migrates 3d-test\'s shape (classpath + apply-plugin hand-edited, NDK absent) to exactly one of each, no duplicates', () => {
@@ -926,6 +945,89 @@ describe('healNativeConfig — iOS game-debug wiring (Task 3)', () => {
     // resolves to the actual planted swift file
     const m = relLine!.match(/path = "([^"]+)"/);
     expect(fs.existsSync(path.resolve(path.join(root, 'ios', 'App'), m![1]))).toBe(true);
+  });
+
+  // #368 — the SceneDelegate trap. A scene-based app builds its window in code, overriding the
+  // storyboard's customClass, so MyViewController never runs and GameDebugPlugin is never
+  // registered: the game renders perfectly and the iOS debug bridge is silently dead.
+  const SCENE_DELEGATE = (vc: string) => `import UIKit
+import Capacitor
+
+class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        window = UIWindow(windowScene: windowScene)
+        window?.rootViewController = ${vc}()
+        window?.makeKeyAndVisible()
+    }
+}
+`;
+  const SD = ['ios', 'App', 'App', 'SceneDelegate.swift'];
+  const readSd = () => fs.readFileSync(path.join(root, ...SD), 'utf8');
+
+  it('repoints a SceneDelegate off the base CAPBridgeViewController (#368)', () => {
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    fs.writeFileSync(path.join(root, ...SD), SCENE_DELEGATE('CAPBridgeViewController'));
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(readSd()).toContain('rootViewController = MyViewController()');
+    expect(notes).toContain('SceneDelegate.swift');
+  });
+
+  it('leaves an already-correct SceneDelegate alone (no churn, no duplicate note)', () => {
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    const good = SCENE_DELEGATE('MyViewController');
+    fs.writeFileSync(path.join(root, ...SD), good);
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(readSd()).toBe(good);
+    expect(notes).not.toContain('SceneDelegate.swift');
+  });
+
+  it('repoints EVERY assignment, not just the first (#368 close-out)', () => {
+    // A non-global regex rewrites one branch, emits the success note, and leaves the other with a
+    // dead bridge — a half-fix reported as a whole one, which the guard test then fails on forever
+    // with nothing able to auto-repair it.
+    scaffoldIos(); writeConfig(''); writeGameDebugDep(); writeEngineGameDebugSwift();
+    fs.writeFileSync(path.join(root, ...SD), `import UIKit
+import Capacitor
+
+class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        window = UIWindow(windowScene: windowScene)
+        if #available(iOS 17.0, *) {
+            window?.rootViewController = CAPBridgeViewController()
+        } else {
+            window?.rootViewController = CAPBridgeViewController()
+        }
+        window?.makeKeyAndVisible()
+    }
+}
+`);
+    healNativeConfig(root);
+    const out = readSd();
+    expect(out).not.toContain('CAPBridgeViewController()');
+    expect(out.match(/rootViewController = MyViewController\(\)/g)).toHaveLength(2);
+  });
+
+  it('does NOT repoint when MyViewController is not compiled into the target', () => {
+    // The safety interlock. On-disk is not enough: repointing at a class Swift cannot see trades
+    // a silently dead debug bridge (the app still builds and runs) for a BROKEN BUILD. Here the
+    // engine plugin is absent, so the wiring heal bails before adding the Sources entry — and
+    // MyViewController.swift exists only because a PREVIOUS heal left it behind.
+    scaffoldIos(); writeConfig(''); writeGameDebugDep();   // no engine/ planted → wiring bails
+    fs.writeFileSync(path.join(root, ...MVC), '// left over from an earlier heal\n');
+    fs.writeFileSync(path.join(root, ...SD), SCENE_DELEGATE('CAPBridgeViewController'));
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(readPbx()).not.toContain('MyViewController.swift in Sources');
+    expect(readSd()).toContain('rootViewController = CAPBridgeViewController()');
+    // …and it SAYS so. A silent refusal is how #368 recurs invisibly: the guard test reads
+    // `git ls-files`, so it cannot see the projects that land in this branch — one scaffolded or
+    // copied OUT of the repo, or an Xcode 16 synchronized-group project with no Sources entries.
+    expect(notes).toContain('would break the BUILD');
   });
 
   it('is idempotent — a second pass changes nothing', () => {
@@ -1911,7 +2013,7 @@ describe('healNativeConfig — orientation + status bar', () => {
       writeNative(viaVar);
       writeAppCfg({ version: '1.0', buildNumber: 8 });
       const r = healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(viaVar);
+      expect(withoutSigningBlock(fs.readFileSync(gradlePath(), 'utf8'))).toBe(viaVar);
       expect(r.notes.join(' ')).toContain('versionCode is present but not in a form this heal can read');
     });
 
@@ -1945,7 +2047,7 @@ describe('healNativeConfig — orientation + status bar', () => {
       writeNative();
       writeAppCfg({ version: 'banana', buildNumber: 'lots' });
       healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+      expect(withoutSigningBlock(fs.readFileSync(gradlePath(), 'utf8'))).toBe(GRADLE);
       expect(fs.readFileSync(pbxPath(), 'utf8')).toBe(PBX);
     });
 
@@ -1953,7 +2055,7 @@ describe('healNativeConfig — orientation + status bar', () => {
       writeNative();
       writeAppCfg({ version: '1.0', buildNumber: 0 });
       healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+      expect(withoutSigningBlock(fs.readFileSync(gradlePath(), 'utf8'))).toBe(GRADLE);
     });
 
     /** The defaults are chosen to match what `cap add` scaffolds, so adopting the feature
@@ -1965,7 +2067,7 @@ describe('healNativeConfig — orientation + status bar', () => {
       healNativeConfig(root);
       expect(DEFAULT_PROJECT_CONFIG.app.version).toBe('1.0');
       expect(DEFAULT_PROJECT_CONFIG.app.buildNumber).toBe(1);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+      expect(withoutSigningBlock(fs.readFileSync(gradlePath(), 'utf8'))).toBe(GRADLE);
       expect(fs.readFileSync(pbxPath(), 'utf8')).toBe(PBX);
     });
   });
@@ -2010,14 +2112,14 @@ describe('healNativeConfig — orientation + status bar', () => {
       writeGradle();
       writeBuildCfg({ appleTeamId: '', androidMinSdk: 'banana' });
       healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+      expect(withoutSigningBlock(fs.readFileSync(gradlePath(), 'utf8'))).toBe(GRADLE);
     });
 
     it('leaves the project ALONE on an out-of-range value (0)', () => {
       writeGradle();
       writeBuildCfg({ appleTeamId: '', androidMinSdk: 0 });
       healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toBe(GRADLE);
+      expect(withoutSigningBlock(fs.readFileSync(gradlePath(), 'utf8'))).toBe(GRADLE);
     });
 
     it('does nothing when the project has no android/variables.gradle', () => {
@@ -2062,5 +2164,694 @@ describe('healNativeConfig — orientation + status bar', () => {
       expect(fs.readFileSync(pbx, 'utf8')).not.toContain('15.0');
       expect(fs.readFileSync(gradle, 'utf8')).not.toContain('minSdkVersion = 24');
     });
+  });
+
+  /** `app.buildNumberAuto = true` — the owner asked to stop hand-bumping the build
+   *  number per store upload. The commit count is derived per heal pass; `app.buildNumber`
+   *  stays as a FLOOR, and the never-lower guard keeps its role as the last line of defence. */
+  describe('build number source = git commits', () => {
+    const GRADLE = [
+      'android {',
+      '    defaultConfig {',
+      '        versionCode 1',
+      '        versionName "1.0"',
+      '    }',
+      '}',
+      '',
+    ].join('\n');
+    const PBX = [
+      'buildSettings = {',
+      '\tCURRENT_PROJECT_VERSION = 1;',
+      '\tMARKETING_VERSION = 1.0;',
+      '};',
+      '',
+    ].join('\n');
+    const gradlePath = () => path.join(root, 'android', 'app', 'build.gradle');
+    const pbxPath = () => path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    function writeNative(gradle = GRADLE, pbx = PBX) {
+      fs.mkdirSync(path.dirname(gradlePath()), { recursive: true });
+      fs.writeFileSync(gradlePath(), gradle);
+      fs.mkdirSync(path.dirname(pbxPath()), { recursive: true });
+      fs.writeFileSync(pbxPath(), pbx);
+    }
+    function writeCfg(app: Record<string, unknown>) {
+      fs.writeFileSync(path.join(root, 'project.config.json'), JSON.stringify({ app, build: {}, capacitor: {} }));
+    }
+    /** A REAL temp git repo with `commits` commits — rev-list --count against it is the
+     *  production code path end-to-end, not a mock of git's output shape. `-c commit.gpgsign=false`
+     *  because a machine with signing configured globally would otherwise fail every commit
+     *  here silently (count 0) and flake the derivation test; each call's status is asserted
+     *  so a fixture-setup failure is loud, never a vacuous pass. */
+    function gitRepoWithCommits(commits: number) {
+      const run = (args: string[]) => {
+        const r = spawnSync('git', ['-C', root, '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8' });
+        if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed (${r.status}): ${r.stderr}`);
+        return r;
+      };
+      run(['init']);
+      run(['config', 'user.email', 'test@example.com']);
+      run(['config', 'user.name', 'Test']);
+      for (let i = 0; i < commits; i++) {
+        fs.writeFileSync(path.join(root, `f${i}.txt`), String(i));
+        run(['add', `f${i}.txt`]);
+        run(['commit', '-m', `c${i}`]);
+      }
+    }
+
+    it('derives the build number from the commit count', () => {
+      writeNative();
+      gitRepoWithCommits(7);
+      writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 7');
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('CURRENT_PROJECT_VERSION = 7;');
+      expect(r.notes.join(' ')).toContain('derived from git commit count');
+    });
+
+    it('keeps app.buildNumber as a FLOOR above the commit count', () => {
+      writeNative();
+      gitRepoWithCommits(3);
+      writeCfg({ version: '1.0', buildNumber: 10, buildNumberAuto: true });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 10');
+      expect(r.notes.join(' ')).toContain('floor');
+    });
+
+    it('the never-lower guard still wins over a derived number', () => {
+      // The native project already uploaded at 50; the repo only has 3 commits. Writing 3
+      // would be exactly the silent Play rejection this whole heal exists to prevent.
+      writeNative(GRADLE.replace('versionCode 1', 'versionCode 50'), PBX.replace('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 50;'));
+      gitRepoWithCommits(3);
+      writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 50');
+      expect(r.notes.join(' ')).toContain('REFUSED to lower Android versionCode 50');
+    });
+
+    it('falls back to app.buildNumber (with a note) outside a git repo', () => {
+      writeNative();
+      writeCfg({ version: '1.0', buildNumber: 4, buildNumberAuto: true });
+      const r = healNativeConfig(root); // root is a bare tmpdir — no .git anywhere
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 4');
+      expect(r.notes.join(' ')).toContain('no commit count could be read');
+    });
+
+    /** The `floor >= count` boundary. At floor === count the two branches return the SAME
+     *  number, so only the note tells them apart — which is why a mutation to `floor > count`
+     *  survived the whole suite. Pinned on the note, since that is the only observable. */
+    it('at floor === count it reports the FLOOR, not a derived number', () => {
+      writeNative();
+      gitRepoWithCommits(7);
+      writeCfg({ version: '1.0', buildNumber: 7, buildNumberAuto: true });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 7');
+      expect(r.notes.join(' ')).toContain('floor');
+      expect(r.notes.join(' ')).not.toContain('derived from git commit count');
+    });
+
+    it('auto OFF (the default) passes the typed value straight through', () => {
+      writeNative();
+      gitRepoWithCommits(30);
+      writeCfg({ version: '1.0', buildNumber: 2 }); // no buildNumberAuto field at all
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 2');
+      expect(r.notes.join(' ')).not.toContain('commit');
+    });
+  });
+
+  /** App identity heal — appId/appName were WRITE-ONCE at `cap add`: changing Project
+   *  Settings afterwards silently changed nothing in any native file (audit, 2026-08-25). */
+  describe('app identity (appId/appName) reaches every native file', () => {
+    const CAP = JSON.stringify({ appId: 'com.old.id', appName: 'Old Name', webDir: 'dist' }, null, 2) + '\n';
+    const GRADLE = [
+      'android {',
+      '    namespace "com.other.code"', // must NEVER move — renaming strands MainActivity's package
+      '    defaultConfig {',
+      '        applicationId "com.old.id"',
+      '    }',
+      '}',
+      '',
+    ].join('\n');
+    const STRINGS = [
+      '<?xml version=\'1.0\' encoding=\'utf-8\'?>',
+      '<resources>',
+      '    <string name="app_name">Old Name</string>',
+      '    <string name="title_activity_main">Old Name</string>',
+      '    <string name="package_name">com.old.id</string>',
+      '    <string name="custom_url_scheme">com.old.id</string>',
+      '</resources>',
+      '',
+    ].join('\n');
+    const PBX = [
+      'buildSettings = {',
+      '\tPRODUCT_BUNDLE_IDENTIFIER = com.old.id;',
+      '};',
+      'buildSettings = {',
+      '\tPRODUCT_BUNDLE_IDENTIFIER = com.old.id;',
+      '};',
+      '',
+    ].join('\n');
+    const PLIST = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+      '<plist version="1.0">',
+      '<dict>',
+      '\t<key>CFBundleDisplayName</key>',
+      '\t<string>Old Name</string>',
+      '</dict>',
+      '</plist>',
+      '',
+    ].join('\n');
+
+    const capPath = () => path.join(root, 'capacitor.config.json');
+    const gradlePath = () => path.join(root, 'android', 'app', 'build.gradle');
+    const stringsPath = () => path.join(root, 'android', 'app', 'src', 'main', 'res', 'values', 'strings.xml');
+    const pbxPath = () => path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    const plistPath = () => path.join(root, 'ios', 'App', 'App', 'Info.plist');
+    function writeNative() {
+      fs.mkdirSync(path.dirname(gradlePath()), { recursive: true });
+      fs.writeFileSync(gradlePath(), GRADLE);
+      fs.mkdirSync(path.dirname(stringsPath()), { recursive: true });
+      fs.writeFileSync(stringsPath(), STRINGS);
+      fs.mkdirSync(path.dirname(pbxPath()), { recursive: true });
+      fs.writeFileSync(pbxPath(), PBX);
+      fs.mkdirSync(path.dirname(plistPath()), { recursive: true });
+      fs.writeFileSync(plistPath(), PLIST);
+      fs.writeFileSync(capPath(), CAP);
+    }
+    function writeCfg(app: Record<string, unknown>) {
+      fs.writeFileSync(path.join(root, 'project.config.json'), JSON.stringify({ app, build: {}, capacitor: {} }));
+    }
+
+    it('syncs a changed appId/appName into ALL five files', () => {
+      writeNative();
+      writeCfg({ appId: 'com.new.id', appName: 'New Name' });
+      const r = healNativeConfig(root);
+      const all = [capPath(), gradlePath(), stringsPath(), pbxPath()].map((p) => fs.readFileSync(p, 'utf8')).join('\n')
+        + fs.readFileSync(plistPath(), 'utf8');
+      expect(all).not.toContain('com.old.id');
+      expect(all).not.toContain('Old Name');
+      expect(all.match(/com\.new\.id/g)!.length).toBeGreaterThanOrEqual(5); // cap cfg, gradle, strings ×2, pbx ×2
+      expect(all).toContain('New Name');
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('namespace "com.other.code"'); // untouched
+      expect(r.notes.join(' ')).toContain('WARNING: bundle id changed com.old.id -> com.new.id');
+    });
+
+    it('is a byte-identical no-op when everything already matches', () => {
+      writeNative();
+      writeCfg({ appId: 'com.old.id', appName: 'Old Name' });
+      healNativeConfig(root);
+      const once = [capPath(), gradlePath(), stringsPath(), pbxPath(), plistPath()]
+        .map((p) => fs.readFileSync(p, 'utf8')).join('|');
+      healNativeConfig(root);
+      expect([capPath(), gradlePath(), stringsPath(), pbxPath(), plistPath()]
+        .map((p) => fs.readFileSync(p, 'utf8')).join('|')).toBe(once);
+      expect(once).toContain('com.old.id'); // sanity: nothing rewrote it anyway
+    });
+
+    it('REFUSES an invalid bundle id instead of writing garbage into four files', () => {
+      writeNative();
+      writeCfg({ appId: 'not valid! id', appName: 'Fine Name' });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('"com.old.id"');
+      expect(r.notes.join(' ')).toContain('REFUSED to sync app.appId');
+    });
+
+    it('a name-only change does NOT fire the new-app warning', () => {
+      writeNative();
+      writeCfg({ appId: 'com.old.id', appName: 'Renamed' });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(plistPath(), 'utf8')).toContain('<string>Renamed</string>');
+      expect(r.notes.join(' ')).not.toContain('WARNING');
+    });
+
+    /** The rewrite is SCOPED to the old id: an extension target (`com.x.y.widget`) or a
+     *  gradle flavour (`com.x.y.free`) deliberately carries a DIFFERENT id in the same file,
+     *  and a blind replace-all would rename it to the app's id, breaking its embedding. */
+    it('does NOT touch sibling targets/flavour ids that differ from the app id', () => {
+      writeNative();
+      // An extension target + a flavour id alongside the app's own.
+      fs.writeFileSync(pbxPath(), PBX + 'buildSettings = {\n\tPRODUCT_BUNDLE_IDENTIFIER = com.old.id.widget;\n};\n');
+      fs.writeFileSync(gradlePath(), GRADLE.replace(
+        '    }',
+        '    }\n    productFlavors {\n        free {\n            applicationId "com.old.id.free"\n        }\n    }',
+      ));
+      writeCfg({ appId: 'com.new.id', appName: 'Old Name' });
+      const r = healNativeConfig(root);
+      const pbx = fs.readFileSync(pbxPath(), 'utf8');
+      expect(pbx).toContain('PRODUCT_BUNDLE_IDENTIFIER = com.new.id;');   // app configs moved
+      expect(pbx).toContain('PRODUCT_BUNDLE_IDENTIFIER = com.old.id.widget;'); // extension survived
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('applicationId "com.old.id.free"'); // flavour survived
+      expect(r.notes.join(' ')).toContain('WARNING: bundle id changed com.old.id -> com.new.id');
+    });
+
+    /** Without capacitor.config.json there is NO anchor for which pbxproj/gradle ids are the
+     *  APP's (vs an extension's), so the id half must be SKIPPED with a note — never guessed.
+     *  The name half needs no anchor and still syncs. */
+    it('skips the id rewrite (with a note) when no old-id anchor exists, name still syncs', () => {
+      writeNative();
+      fs.rmSync(capPath());
+      writeCfg({ appId: 'com.new.id', appName: 'Renamed' });
+      const r = healNativeConfig(root);
+      // gradle + pbxproj carry the app id AND sibling/flavour ids — no anchor, no rewrite.
+      const unanchored = fs.readFileSync(gradlePath(), 'utf8') + fs.readFileSync(pbxPath(), 'utf8');
+      expect(unanchored).not.toContain('com.new.id');
+      expect(unanchored).toContain('com.old.id');
+      // strings.xml keys ARE the app id by name — no anchor needed there.
+      expect(fs.readFileSync(stringsPath(), 'utf8')).toContain('package_name">com.new.id<');
+      expect(fs.readFileSync(plistPath(), 'utf8')).toContain('<string>Renamed</string>');
+      expect(r.notes.join(' ')).toContain('cannot determine this project\'s previous bundle id');
+      expect(r.notes.join(' ')).not.toContain('WARNING: bundle id changed');
+    });
+
+    /** Per-file guard: one unreadable file must not abort the heals AFTER identity through
+     *  main()'s outer catch — that skipped orientation/game-mode/crashlytics with a generic
+     *  note naming neither the failure nor what it prevented. */
+    it('a failing identity file does not abort the rest of the heal pass', () => {
+      writeNative();
+      // Make ONE file unreadable-as-file (a directory where Info.plist belongs).
+      fs.rmSync(plistPath());
+      fs.mkdirSync(plistPath());
+      writeCfg({ appId: 'com.old.id', appName: 'Renamed' });
+      const r = healNativeConfig(root);
+      expect(fs.readFileSync(stringsPath(), 'utf8')).toContain('Renamed'); // later files still healed
+      expect(r.notes.join(' ')).toContain('Info.plist sync failed');
+    });
+
+    /** ⚠️ `app.appName` is a DISPLAY name with no `BUILD_FIELD_RULES` pattern behind it (unlike
+     *  `app.appId`, which is charset-restricted) — and it must stay free text, because "Rock &
+     *  Roll" is a real app name. So it has to be ESCAPED at these two write sites, and it was
+     *  not: the value went into `strings.xml` and `Info.plist` raw. Every case below produced a
+     *  structurally broken COMMITTED file from a name the owner typed into Project Settings,
+     *  written by a heal that runs on every open/build. */
+    describe('appName is escaped, not injected', () => {
+      /** Parse as XML the strict way `AAPT2`/`plutil` do — a bare `&` or `<` must FAIL here.
+       *  DOMParser reports a parsererror element rather than throwing. */
+      function xmlIsWellFormed(text: string): boolean {
+        const doc = new DOMParser().parseFromString(text, 'application/xml');
+        return doc.getElementsByTagName('parsererror').length === 0;
+      }
+
+      it('an ampersand does not make strings.xml and Info.plist malformed', () => {
+        writeNative();
+        writeCfg({ appId: 'com.old.id', appName: 'Rock & Roll' });
+        healNativeConfig(root);
+        const strings = fs.readFileSync(stringsPath(), 'utf8');
+        const plist = fs.readFileSync(plistPath(), 'utf8');
+        expect(xmlIsWellFormed(strings), `strings.xml is malformed XML:\n${strings}`).toBe(true);
+        expect(xmlIsWellFormed(plist), `Info.plist is malformed XML:\n${plist}`).toBe(true);
+        // Escaped on the way in, so it PARSES BACK to exactly what the owner typed.
+        expect(new DOMParser().parseFromString(plist, 'application/xml')
+          .getElementsByTagName('string')[0].textContent).toBe('Rock & Roll');
+        expect(strings).toContain('&amp;');
+      });
+
+      /** `$&`, `$1`, `` $` `` and `$'` are SUBSTITUTION DIRECTIVES in a `String.replace`
+       *  replacement string. Built with a template literal, a name containing one is injected
+       *  rather than inserted — this exact input nested `<string name="app_name">` inside
+       *  itself and, in the plist, swallowed the preceding `<key>` line. */
+      it('a dollar sequence is inserted literally, not interpreted as a replacement pattern', () => {
+        writeNative();
+        writeCfg({ appId: 'com.old.id', appName: 'Court $& Co' });
+        healNativeConfig(root);
+        const strings = fs.readFileSync(stringsPath(), 'utf8');
+        const plist = fs.readFileSync(plistPath(), 'utf8');
+        expect(xmlIsWellFormed(strings), `strings.xml is malformed XML:\n${strings}`).toBe(true);
+        expect(xmlIsWellFormed(plist), `Info.plist is malformed XML:\n${plist}`).toBe(true);
+        // The structural tell of the injection: the key line eaten, or the tag duplicated.
+        expect(plist).toContain('<key>CFBundleDisplayName</key>');
+        expect(strings.match(/<string name="app_name">/g)!.length).toBe(1);
+        expect(new DOMParser().parseFromString(plist, 'application/xml')
+          .getElementsByTagName('string')[0].textContent).toBe('Court $& Co');
+      });
+
+      /** AAPT2-only rule, which plain XML escaping does not cover: an unescaped apostrophe in a
+       *  `<string>` resource is a hard build error ("Apostrophe not preceded by \\"). The plist
+       *  must NOT get that backslash — it would show up in the displayed name. */
+      it('an apostrophe is backslash-escaped for AAPT2 in strings.xml but NOT in the plist', () => {
+        writeNative();
+        writeCfg({ appId: 'com.old.id', appName: "Cat's Court" });
+        healNativeConfig(root);
+        expect(fs.readFileSync(stringsPath(), 'utf8')).toContain("Cat\\'s Court");
+        expect(fs.readFileSync(plistPath(), 'utf8')).toContain("<string>Cat's Court</string>");
+      });
+
+      it('stays idempotent — escaping an already-escaped file rewrites nothing', () => {
+        writeNative();
+        writeCfg({ appId: 'com.old.id', appName: 'Rock & Roll' });
+        healNativeConfig(root);
+        const once = [stringsPath(), plistPath()].map((p) => fs.readFileSync(p, 'utf8')).join('|');
+        healNativeConfig(root);
+        expect([stringsPath(), plistPath()].map((p) => fs.readFileSync(p, 'utf8')).join('|')).toBe(once);
+      });
+    });
+
+    /** ⚠️ capacitor.config.json is the ANCHOR — `oldId` scopes every gradle/pbxproj rewrite and
+     *  is recoverable from nowhere else. It used to be written FIRST, so a native write that
+     *  then failed (which `guarded` catches by design, to keep the pass going) advanced the
+     *  anchor to the NEW id while those files still held the OLD one. The next pass then matched
+     *  nothing and reported no change: permanent, silent divergence. It is committed LAST now,
+     *  which makes a partial failure retryable instead. */
+    // ⚠️ The fault is a READ-ONLY file, not a directory-in-its-place like the per-file-guard
+    // test above uses. Aimed at the pbxproj, that trick never reaches this code: EARLIER heals
+    // (DEVELOPMENT_TEAM, crashlytics, game-debug) read the same pbxproj with no per-file guard
+    // of their own, so the whole pass aborts through main()'s outer catch with a bare
+    // "heal skipped: EISDIR" — measured. A read-only file lets every reader succeed and fails
+    // only the WRITE, which is exactly the partial failure this test is about.
+    // Skipped on Windows, where a mode bit does not make a file unwritable the same way.
+    it.skipIf(process.platform === 'win32')(
+      'leaves the anchor on the OLD id when a native write fails, so the next pass retries', () => {
+      writeNative();
+      fs.chmodSync(pbxPath(), 0o444);
+      writeCfg({ appId: 'com.new.id', appName: 'Old Name' });
+      const first = healNativeConfig(root);
+      expect(first.notes.join(' ')).toContain('pbxproj sync failed');
+      expect(
+        JSON.parse(fs.readFileSync(capPath(), 'utf8')).appId,
+        'the anchor must NOT advance past a failed native write — advancing it strands the ' +
+          'files that did not get rewritten, unrecoverably',
+      ).toBe('com.old.id');
+
+      // Repair the fault; the retry must now complete, which it could not do from a lost anchor.
+      fs.chmodSync(pbxPath(), 0o644);
+      healNativeConfig(root);
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('PRODUCT_BUNDLE_IDENTIFIER = com.new.id;');
+      expect(JSON.parse(fs.readFileSync(capPath(), 'utf8')).appId).toBe('com.new.id');
+    });
+
+    /** Coverage hole found by mutation-testing: the gradle branch and the pbxproj branch each
+     *  carry their OWN `if (!oldId) noteIdSkipped()`, but `noteIdSkipped` is shared and fires
+     *  once — so deleting either branch's guard left the other still emitting the note, and the
+     *  suite could not tell whether a given branch's check existed at all.
+     *
+     *  ⚠️ CONTENT cannot distinguish them, which is why the first attempt at this test failed to
+     *  catch the mutation: a branch that fell back to `oldId ?? id` would rewrite the new id TO
+     *  the new id — a no-op in the file no matter what is seeded. The note is the only
+     *  observable, so each branch is ISOLATED instead: remove the other platform's folder
+     *  entirely, and whichever note survives can only have come from the branch under test. */
+    /** ⚠️ The anchor gate must express "did the id LAND?", not "did anything throw?".
+     *
+     *  There are TWO ways the id rewrite does not happen, and only one of them throws. This is
+     *  the other: a `capacitor.config.json` that PARSES but carries no `appId` leaves `oldId`
+     *  undefined, so gradle/pbxproj skip via `noteIdSkipped()` and return NORMALLY —
+     *  `guarded()` reports success. Gating the anchor on exceptions alone committed the new id
+     *  anyway, and every later pass then searched gradle for an id the file does not contain,
+     *  found nothing, and reported nothing: the divergence is permanent AND silent from pass 2
+     *  onward, which is worse than the bug the ordering fix was written for.
+     *
+     *  Note the two anchor tests below cannot see this — they `rmSync` the cap file, which
+     *  leaves `capJson` undefined so `writeCapacitorConfig` returns early and the anchor cannot
+     *  advance under any predicate. The file has to be PRESENT and appId-less. */
+    it('a cap config that parses but has NO appId does not advance the anchor either', () => {
+      writeNative();
+      fs.writeFileSync(capPath(), JSON.stringify({ appName: 'Old Name', webDir: 'dist' }, null, 2) + '\n');
+      writeCfg({ appId: 'com.new.id', appName: 'Old Name' });
+
+      const first = healNativeConfig(root);
+      expect(first.notes.join(' ')).toContain('cannot determine this project\'s previous bundle id');
+      expect(fs.readFileSync(gradlePath(), 'utf8'), 'gradle was not rewritten').toContain('applicationId "com.old.id"');
+      expect(
+        JSON.parse(fs.readFileSync(capPath(), 'utf8')).appId,
+        'the anchor must NOT be minted from a rewrite that never happened — doing so makes every '
+          + 'later pass search for an id the native files do not contain, silently',
+      ).toBeUndefined();
+
+      // Pass 2 must still SAY something rather than going quiet on a broken project.
+      const second = healNativeConfig(root);
+      expect(
+        second.notes.join(' '),
+        'the second pass must keep reporting the problem, not fall silent',
+      ).toContain('cannot determine this project\'s previous bundle id');
+    });
+
+    it('the GRADLE branch refuses to guess an anchor on its own (iOS absent)', () => {
+      writeNative();
+      fs.rmSync(capPath());                                 // no anchor
+      fs.rmSync(path.join(root, 'ios'), { recursive: true }); // pbxproj branch cannot emit
+      writeCfg({ appId: 'com.new.id', appName: 'Old Name' });
+      const r = healNativeConfig(root);
+      expect(r.notes.join(' ')).toContain('cannot determine this project\'s previous bundle id');
+      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('applicationId "com.old.id"');
+    });
+
+    it('the PBXPROJ branch refuses to guess an anchor on its own (Android absent)', () => {
+      writeNative();
+      fs.rmSync(capPath());                                     // no anchor
+      fs.rmSync(path.join(root, 'android'), { recursive: true }); // gradle branch cannot emit
+      writeCfg({ appId: 'com.new.id', appName: 'Old Name' });
+      const r = healNativeConfig(root);
+      expect(r.notes.join(' ')).toContain('cannot determine this project\'s previous bundle id');
+      expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('PRODUCT_BUNDLE_IDENTIFIER = com.old.id;');
+    });
+  });
+});
+
+describe('healNativeConfig — Android release signing + keystore ignores (#370)', () => {
+  const APP_GRADLE = ['android', 'app', 'build.gradle'];
+  const GITIGNORE = ['android', '.gitignore'];
+  const readGradle = () => fs.readFileSync(path.join(root, ...APP_GRADLE), 'utf8');
+  const readIgnore = () => fs.readFileSync(path.join(root, ...GITIGNORE), 'utf8');
+
+  const PLAIN_GRADLE = [
+    "apply plugin: 'com.android.application'",
+    '',
+    'android {',
+    '    namespace = "com.example.app"',
+    '    buildTypes {',
+    '        release {',
+    '            minifyEnabled false',
+    '        }',
+    '    }',
+    '}',
+    '',
+  ].join('\n');
+
+  /** What Capacitor's `cap add android` actually writes — the upstream Android template's
+   *  keystore lines, COMMENTED OUT. This fixture is the whole reason the heal exists. */
+  const TEMPLATE_IGNORE = [
+    '# Built application files',
+    '*.apk',
+    '*.aab',
+    '',
+    '# Keystore files',
+    '# Uncomment the following lines if you do not want to check your keystore files in.',
+    '#*.jks',
+    '#*.keystore',
+    '',
+    '# External native build folder',
+    '.externalNativeBuild',
+    '',
+  ].join('\n');
+
+  function writeAndroid(gradle = PLAIN_GRADLE, ignore = TEMPLATE_IGNORE) {
+    fs.mkdirSync(path.join(root, 'android', 'app'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...APP_GRADLE), gradle);
+    fs.writeFileSync(path.join(root, ...GITIGNORE), ignore);
+    writeConfig('');
+  }
+
+  it('adds the signing block, reading keystore.properties', () => {
+    writeAndroid();
+    healNativeConfig(root);
+    const g = readGradle();
+    expect(g).toContain('modoki:release-signing-begin');
+    expect(g).toContain("rootProject.file('keystore.properties')");
+    expect(g).toContain('signingConfig signingConfigs.release');
+  });
+
+  it('the block is INERT without keystore.properties — a keyless clone still builds debug', () => {
+    // The single most important property of this heal. Failing Gradle CONFIGURATION on a machine
+    // with no upload key would break `assembleDebug` for every clone that never signs anything,
+    // which is most of them (and CI). So the whole block sits behind an exists() check.
+    writeAndroid();
+    healNativeConfig(root);
+    const block = /modoki:release-signing-begin([\s\S]*?)modoki:release-signing-end/.exec(readGradle())![1];
+    expect(block).toContain('if (modokiKeystoreFile.exists()) {');
+    // and every signing statement is INSIDE that guard, not before it
+    expect(block.indexOf('if (modokiKeystoreFile.exists())')).toBeLessThan(block.indexOf('signingConfigs'));
+  });
+
+  it('is idempotent — a second pass writes nothing', () => {
+    writeAndroid();
+    healNativeConfig(root);
+    const afterFirst = readGradle();
+    healNativeConfig(root);
+    expect(readGradle()).toBe(afterFirst);
+    expect((readGradle().match(/modoki:release-signing-begin/g) ?? []).length).toBe(1);
+  });
+
+  it('REPLACES a stale block rather than leaving the project on the old text', () => {
+    // Same distinguishing case the Crashlytics dSYM heal documents: a presence check ("it's there,
+    // done") passes every other test here while pinning whatever text the project was first healed
+    // with, so a later fix to the block never reaches an existing project.
+    writeAndroid();
+    healNativeConfig(root);
+    const aged = readGradle().replace('signingConfig signingConfigs.release', 'signingConfig signingConfigs.OLD');
+    fs.writeFileSync(path.join(root, ...APP_GRADLE), aged);
+    expect(readGradle()).toContain('signingConfigs.OLD'); // the fixture is what we think it is
+
+    healNativeConfig(root);
+    expect(readGradle()).not.toContain('signingConfigs.OLD');
+    expect((readGradle().match(/modoki:release-signing-begin/g) ?? []).length).toBe(1);
+  });
+
+  it('SKIPS a project that configures signingConfigs by hand (games/iap-test)', () => {
+    // iap-test wired its Play upload key before this engine path existed (#196). Healing over it
+    // would leave TWO signingConfigs.release definitions in one file, the second silently winning.
+    const handWritten = PLAIN_GRADLE.replace('android {', [
+      'android {',
+      '    signingConfigs {',
+      '        release {',
+      "            storeFile file('/somewhere/else.jks')",
+      '        }',
+      '    }',
+    ].join('\n'));
+    writeAndroid(handWritten);
+    healNativeConfig(root);
+    expect(readGradle()).toBe(handWritten);
+    expect(readGradle()).not.toContain('modoki:release-signing-begin');
+  });
+
+  it('keeps a CRLF gradle file on CRLF', () => {
+    writeAndroid(PLAIN_GRADLE.replace(/\n/g, '\r\n'));
+    healNativeConfig(root);
+    expect(readGradle()).toContain('modoki:release-signing-begin');
+    expect(/[^\r]\n/.test(readGradle()), 'no bare-LF line was inserted').toBe(false);
+  });
+
+  it('uncomments the template keystore ignores and adds keystore.properties', () => {
+    // The regression this prevents: `cap add` regenerates .gitignore from the upstream template,
+    // where these lines are COMMENTED OUT — so a .jks dropped in that folder is committed by
+    // default, into a repo whose snapshot is published publicly.
+    writeAndroid();
+    expect(readIgnore()).toContain('#*.jks'); // the fixture is the unsafe upstream shape
+    healNativeConfig(root);
+    const ig = readIgnore();
+    expect(ig).toMatch(/^\*\.jks$/m);
+    expect(ig).toMatch(/^\*\.keystore$/m);
+    expect(ig).toMatch(/^keystore\.properties$/m);
+    expect(ig).not.toContain('#*.jks');
+    // exactly one "# Keystore files" header, not the template's plus ours
+    expect((ig.match(/^# Keystore files$/gm) ?? []).length).toBe(1);
+  });
+
+  it('the .gitignore heal is idempotent and preserves unrelated lines', () => {
+    writeAndroid();
+    healNativeConfig(root);
+    const afterFirst = readIgnore();
+    healNativeConfig(root);
+    expect(readIgnore()).toBe(afterFirst);
+    expect(readIgnore()).toContain('.externalNativeBuild');
+    expect(readIgnore()).toContain('*.aab');
+  });
+
+  it('appends the ignores to a .gitignore that has no keystore section at all', () => {
+    writeAndroid(PLAIN_GRADLE, '*.apk\n');
+    healNativeConfig(root);
+    expect(readIgnore()).toContain('*.apk');
+    expect(readIgnore()).toMatch(/^\*\.jks$/m);
+    expect(readIgnore()).toMatch(/^keystore\.properties$/m);
+  });
+
+  it('leaves an ALREADY-correct .gitignore byte-identical', () => {
+    writeAndroid();
+    healNativeConfig(root);
+    const healed = readIgnore();
+    // A fresh project whose file already carries the block (a clone of a healed repo) must not be
+    // rewritten on open — that is the #18 write-behind-your-back hazard.
+    fs.writeFileSync(path.join(root, ...GITIGNORE), healed);
+    healNativeConfig(root);
+    expect(readIgnore()).toBe(healed);
+  });
+});
+
+describe('healNativeConfig — #370 review findings', () => {
+  const APP_GRADLE = ['android', 'app', 'build.gradle'];
+  const GITIGNORE = ['android', '.gitignore'];
+  const readGradle = () => fs.readFileSync(path.join(root, ...APP_GRADLE), 'utf8');
+  const readIgnore = () => fs.readFileSync(path.join(root, ...GITIGNORE), 'utf8');
+  const GRADLE = "apply plugin: 'com.android.application'\n\nandroid {\n    namespace = \"x\"\n}\n";
+  function write(gradle = GRADLE, ignore = '*.apk\n') {
+    fs.mkdirSync(path.join(root, 'android', 'app'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...APP_GRADLE), gradle);
+    fs.writeFileSync(path.join(root, ...GITIGNORE), ignore);
+    writeConfig('');
+  }
+
+  it('the Gradle block reads keystore.properties as UTF-8, not the ISO-8859-1 default', () => {
+    // `Properties.load(InputStream)` decodes ISO-8859-1 by contract while the generator writes
+    // UTF-8, so a non-ASCII password or path became mojibake and Gradle blamed the keystore.
+    write();
+    healNativeConfig(root);
+    // ⚠️ Assert on CODE, not on the file: the generated block's own comment explains why
+    // `withInputStream` is wrong, so a bare `not.toContain('withInputStream')` fails on the
+    // warning against it. (The same comments-vs-code trap `androidSerialBlock()` documents.)
+    const code = readGradle().split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    expect(code).toContain("withReader('UTF-8') { modokiKeystore.load(it) }");
+    expect(code).not.toContain('withInputStream');
+  });
+
+  it('skips a project whose signingConfigs is real, but NOT one that is only in a comment', () => {
+    // False positive on a commented-out block = that project silently never gets release signing,
+    // and the build then emits app-release-unsigned.apk while reporting the signed path.
+    write(GRADLE.replace('android {', '/* android {\n    signingConfigs { release { } }\n} */\nandroid {'));
+    healNativeConfig(root);
+    expect(readGradle(), 'a commented signingConfigs must not block the heal').toContain('modoki:release-signing-begin');
+
+    // …and a REAL one still wins.
+    fs.writeFileSync(path.join(root, ...APP_GRADLE), GRADLE.replace('android {', 'android {\n    signingConfigs { release { } }'));
+    const before = readGradle();
+    healNativeConfig(root);
+    expect(readGradle()).toBe(before);
+  });
+
+  it('a line-comment signingConfigs does not block the heal either', () => {
+    write(GRADLE.replace('android {', '// signingConfigs {\nandroid {'));
+    healNativeConfig(root);
+    expect(readGradle()).toContain('modoki:release-signing-begin');
+  });
+
+  it('converges a HALF-uncommented .gitignore instead of appending a duplicate', () => {
+    // Somebody uncomments only *.jks by hand. The old code matched neither the all-present
+    // early-out nor the adjacent-commented-pair regex, so it appended the whole block — a second
+    // *.jks, a second header, and the orphan #*.keystore left behind, on EVERY project open.
+    write(GRADLE, '# Keystore files\n# Uncomment the following lines if you do not want to check your keystore files in.\n*.jks\n#*.keystore\n\n.externalNativeBuild\n');
+    healNativeConfig(root);
+    const ig = readIgnore();
+    expect((ig.match(/^\*\.jks$/gm) ?? []).length, 'exactly one *.jks').toBe(1);
+    expect((ig.match(/^# Keystore files$/gm) ?? []).length, 'exactly one header').toBe(1);
+    expect(ig).not.toContain('#*.keystore');
+    expect(ig).toMatch(/^\*\.keystore$/m);
+    expect(ig).toMatch(/^keystore\.properties$/m);
+    expect(ig, 'unrelated lines survive').toContain('.externalNativeBuild');
+    // and it settles — a second pass writes nothing
+    const after = ig;
+    healNativeConfig(root);
+    expect(readIgnore()).toBe(after);
+  });
+
+  it('does NOT reflow blank lines elsewhere in the file', () => {
+    // The squeeze that normalises spacing around the inserted block used to run file-wide, so any
+    // run of 2+ blank lines a project used to group its sections was silently rewritten on the
+    // first heal — an edit in a region this heal has no business in (#18, self-inflicted).
+    write(GRADLE, 'a\n\n\n\nb\n\n# Keystore files\n#*.jks\n#*.keystore\n\n\n\nz\n');
+    healNativeConfig(root);
+    const ig = readIgnore();
+    expect(ig, 'the 3 blank lines between a and b are untouched').toContain('a\n\n\n\nb');
+    expect(ig).toMatch(/^\*\.jks$/m);
+    expect(ig).toContain('z');
+  });
+
+  it('recognises an already-correct block that cites a DIFFERENT issue number', () => {
+    // games/iap-test carries this block referencing #196, because it wired its upload key before
+    // the engine had a release path. A literal comparison treated that as unhealed and appended a
+    // second copy while orphaning the #196 comments. Provenance is worth keeping.
+    write();
+    healNativeConfig(root);
+    const healed = readIgnore();
+    fs.writeFileSync(path.join(root, ...GITIGNORE), healed.replace('(#370)', '(#196)'));
+    const aged = readIgnore();
+    healNativeConfig(root);
+    expect(readIgnore(), 'a #196-cited block is left byte-identical').toBe(aged);
   });
 });

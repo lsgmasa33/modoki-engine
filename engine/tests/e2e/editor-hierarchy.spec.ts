@@ -117,7 +117,11 @@ test('Create Prefab serializes the subtree and POSTs a .prefab.json (write inter
   await expect.poll(() => write).not.toBeNull();
   expect(write!.path).toMatch(/\/games\/3d-test\/assets\/prefabs\/CenterCube\.prefab\.json$/);
   const prefab = JSON.parse(write!.content!);
-  expect(prefab.version).toBe(1);
+  // 2 since #379. The serializer used to stamp 1 on a flat prefab (`nestedRefs.size > 0 ? 2 : 1`),
+  // a rule that could DECREASE the field; it now always writes the current format version. The
+  // literal is deliberate here — this spec asserts the BYTES that reached disk, so importing the
+  // constant would let a wrong constant vouch for itself.
+  expect(prefab.version).toBe(2);
   expect(prefab.name).toBe('CenterCube');
 });
 

@@ -46,23 +46,55 @@ export function makeFireOnZone(OnZoneTrait: Parameters<Entity['has']>[0]): FireO
   };
 }
 
-/** Route ONE zone/occupant transition to all three sinks. The journal payload uses `entityRef`
- *  (stable GUID when the entity has one, else its numeric id) so a trace survives scene hot-
- *  reloads — `entityRef` is despawn-safe (a synthesized exit may hand it a dead handle). */
+/** One member of `ZoneState` — the live handle PLUS its numeric id, cached at the moment this
+ *  entry was recorded (when the entity was known alive, sampled fresh from this frame's query).
+ *  The cache is what `refOf` falls back to once the handle may have gone dead AND had its index
+ *  reclaimed by an unrelated entity — see `refOf`'s own comment. */
+interface ZoneMember { entity: Entity; id: number }
+
+/** Stable Percept/journal reference for a zone-state member: its GUID when the handle is STILL
+ *  alive (`entityRef` does its own live-handle probe — `has()`/`get()`), else the id CACHED when
+ *  this entry was recorded. Mirrors `physicsContactEvents.refOf` exactly, and for the same reason
+ *  (QA-ZONE-0003, review follow-up): koota's `has()`/`get()` do not check generation, only
+ *  `isAlive()` does — so calling `entityRef(deadHandle)` on a handle whose index has been
+ *  RECLAIMED by a new entity silently resolves to the NEW entity's guid/name, misattributing the
+ *  exit. Reproduced live: a same-tick despawn+respawn produced a `@zone` journal entry with the
+ *  zone/other roles inverted, both naming entities that were still alive — the exit belonged to
+ *  the DEAD pair, not to them. The cached `id` avoids re-deriving anything from the handle. */
+function refOf(m: ZoneMember): string | number {
+  return m.entity.isAlive() ? entityRef(m.entity) : m.id;
+}
+
+/** Route ONE zone/occupant transition to all three sinks. The journal payload uses `refOf`
+ *  (despawn-safe — see its own comment); `bus`/`fire` still receive the raw `Entity` handles,
+ *  matching `physicsContactEvents.routePair`'s same accepted trade-off for a synthesized exit
+ *  (`makeFireOnZone` already guards `zone.isAlive()` before dispatching). */
 function routeZone(
-  world: World, zone: Entity, other: Entity,
+  world: World, zone: ZoneMember, other: ZoneMember,
   phase: ZonePhase, bus: ZoneEventBus, fire: FireOnZone, journalType: string,
 ): void {
-  emit(journalType, { zone: entityRef(zone), other: entityRef(other), phase }, world);
-  bus.__emitZone(world, zone, other, phase);
-  fire(zone, other, phase);
+  emit(journalType, { zone: refOf(zone), other: refOf(other), phase }, world);
+  bus.__emitZone(world, zone.entity, other.entity, phase);
+  fire(zone.entity, other.entity, phase);
 }
 
 /** Per-world occupancy: which occupants were inside each zone last frame, keeping the zone +
  *  occupant `Entity` handles so a transition can still be routed after either despawns. Kept
  *  per CHANNEL ('2d' / '3d') so a scene running both dimensions doesn't have one system's diff
- *  clobber the other's membership (their zone ids share one world but live in separate maps). */
-type ZoneState = Map<number, { entity: Entity; occ: Map<number, Entity> }>;
+ *  clobber the other's membership (their zone ids share one world but live in separate maps).
+ *
+ *  KEYED BY THE PACKED ENTITY (`Entity` used directly as a `number`, NOT `entity.id()`) —
+ *  QA-ZONE-0003: this state persists ACROSS frames, and koota's `entity.id()` strips the
+ *  generation (`Number.prototype.id` masks to `ENTITY_ID_MASK`), while `has()`/`get()` do the
+ *  same — only `isAlive()` checks generation. A despawn immediately followed by a respawn that
+ *  reclaims the same index (a scene hot-reload, or Play→Stop→Play) then collides in an
+ *  `.id()`-keyed map: `prev`/`next` share the stripped key, so the diff goes BLIND (no exit for
+ *  the dead pair, no enter for the new one) — measured live, reproducibly, with a same-frame
+ *  teardown+rebuild. The packed entity number carries the generation, so a reclaimed index is a
+ *  genuinely different key and the diff sees a real exit + a real enter. Every other id-keyed
+ *  cache in this codebase (`entityIndex.ts`, `transformPropagationSystem.ts`, …) is rebuilt every
+ *  frame and never holds a value across a despawn, which is why they don't share this hazard. */
+type ZoneState = Map<number, { member: ZoneMember; occ: Map<number, ZoneMember> }>;
 const stateByWorld = new WeakMap<World, Map<string, ZoneState>>();
 
 function stateFor(world: World, channel: string): { all: Map<string, ZoneState>; state: ZoneState } {
@@ -94,31 +126,33 @@ export function runZoneTriggers(
 
   const next: ZoneState = new Map();
   for (const z of zones) {
-    const zid = z.entity.id();
-    const occ = new Map<number, Entity>();
+    const zid = z.entity.valueOf(); // packed (generation-carrying) — see ZoneState's doc comment
+    const occ = new Map<number, ZoneMember>();
     for (const o of occupants) {
-      const oid = o.entity.id();
+      const oid = o.entity.valueOf();
       if (oid === zid) continue;
-      if (z.contains(o.x, o.y, o.z)) occ.set(oid, o.entity);
+      // `.id()` cached HERE, while `o.entity` is known alive (freshly sampled this tick) — see
+      // `refOf`'s comment for why this must never be re-derived from the handle later.
+      if (z.contains(o.x, o.y, o.z)) occ.set(oid, { entity: o.entity, id: o.entity.id() });
     }
-    next.set(zid, { entity: z.entity, occ });
+    next.set(zid, { member: { entity: z.entity, id: z.entity.id() }, occ });
   }
 
   // Enters — in `next` but not `prev`.
   for (const [zid, cur] of next) {
     const before = prev.get(zid);
-    for (const [oid, oEnt] of cur.occ) {
+    for (const [oid, oMember] of cur.occ) {
       if (before && before.occ.has(oid)) continue;
-      routeZone(world, cur.entity, oEnt, 'enter', bus, fire, journalType);
+      routeZone(world, cur.member, oMember, 'enter', bus, fire, journalType);
     }
   }
   // Exits — in `prev` but not `next`. Covers occupant-left, occupant-despawn, AND zone-despawn
   // (a removed zone is absent from `next`, so every prior occupant of it exits).
   for (const [zid, before] of prev) {
     const cur = next.get(zid);
-    for (const [oid, oEnt] of before.occ) {
+    for (const [oid, oMember] of before.occ) {
       if (cur && cur.occ.has(oid)) continue;
-      routeZone(world, before.entity, oEnt, 'exit', bus, fire, journalType);
+      routeZone(world, before.member, oMember, 'exit', bus, fire, journalType);
     }
   }
 

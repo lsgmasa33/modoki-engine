@@ -55,6 +55,10 @@ interface Pending {
 // Keyed by entity ID, not by the Entity object: koota hands out a fresh Entity
 // wrapper per query iteration, so an object key would never match on the next frame
 // (every clip would be recreated every frame, and none ever released).
+//
+// The id is the MASKED index — `entity.id()` strips koota's generation — and every map below
+// holds state ACROSS frames, so a reclaimed index would otherwise hand a new entity the dead
+// one's decoder. `owner` is what makes that detectable; see its own comment.
 const live = new Map<number, Live>();
 const pending = new Map<number, Pending>();
 /** Download progress per entity (0..1). Written by the async fetch, COPIED into the
@@ -68,6 +72,23 @@ const readyUrls = new Map<number, { clip: string; url: string }>();
  *  every ~4s, forever, on a CORS failure). A failure is sticky until the clip changes,
  *  so recovery is an explicit act rather than an accident. */
 const failed = new Map<number, string>();
+
+/** Which PACKED entity (`entity.valueOf()` — generation included) currently owns each id's slot
+ *  in the maps above. #336, the sibling of QA-ZONE-0003: koota's `entity.id()` masks the
+ *  generation off, and its entity index is a LIFO free list, so a despawn immediately followed by
+ *  a same-shape respawn reclaims the exact freed index. The `seen`-set sweep that would have
+ *  released the dead entity's state runs at the END of a pass, so a despawn+respawn landing
+ *  BETWEEN two passes never gets one — the reconcile just reads `live.get(id)` and concludes
+ *  "already mine". The `existing.clip !== vp.clip` hard-swap below self-heals a DIFFERENT clip;
+ *  a SAME-clip respawn (a prefab re-instantiated, two players streaming one intro) inherits the
+ *  dead entity's decoder, progress and sticky download failure instead of starting its own.
+ *
+ *  Why an ownership check rather than the zone fix's packed KEY: video's id is also a public
+ *  ADDRESSING contract — `videoElementFor`/`seekEntityVideo` are called by the 3D and 2D texture
+ *  surfaces, by `UIVideoMount` off the UI tree's `entityId`, and by the `video.*` actions, all of
+ *  which hold a masked id and nothing else. Re-keying the maps would have to re-key that whole
+ *  chain. Keying stays as it is; only the TRUST changes. */
+const owner = new Map<number, number>();
 
 /** Resolver injected by the app: GUID → playable URL. Kept as an injection rather
  *  than an import so this module doesn't pull the loader stack (and so a test can
@@ -121,6 +142,17 @@ function release(entityId: number): void {
   live.delete(entityId);
 }
 
+/** Drop EVERY trace of an id — the handle and the download, plus the bookkeeping `release`
+ *  deliberately leaves behind (`progress`/`readyUrls`/`failed` outlive a Stop so a sticky
+ *  download failure isn't retried on the next Play). Used only when the id's owner changed:
+ *  the new entity must inherit nothing, sticky failure included. */
+function forget(entityId: number): void {
+  release(entityId);
+  progress.delete(entityId);
+  readyUrls.delete(entityId);
+  failed.delete(entityId);
+}
+
 /** Tear down every clip (leaving Play, scene swap, world teardown). */
 export function stopWorldVideo(): void {
   for (const e of [...live.keys()]) release(e);
@@ -129,7 +161,15 @@ export function stopWorldVideo(): void {
 
 // A scene swap invalidates every entity handle — drop them all rather than leak
 // elements pointing at a world that no longer exists.
-onWorldSwap(() => { stopWorldVideo(); });
+//
+// `owner` is dropped here but NOT in `stopWorldVideo`, and the difference matters. Leaving Play
+// keeps the same world, so an entity's packed value is unchanged and its sticky download failure
+// should survive to the next Play (that is what `failed` is for). A swap replaces the world, and
+// index spaces are PER-WORLD — a new entity can be handed the same packed value an old one had,
+// which would match a stale `owner` entry and skip the purge, silently inheriting the previous
+// scene's `failed`/`progress`/`readyUrls`. Clearing here makes every entity in the new world
+// first-sight, so it inherits nothing.
+onWorldSwap(() => { stopWorldVideo(); owner.clear(); });
 
 export function videoSystem(world: World): void {
   // "Not playing → no video." Mirrors skeletal animation and audio: a stopped editor
@@ -147,6 +187,10 @@ export function videoSystem(world: World): void {
 
   world.query(VideoPlayer).updateEach(([vp], entity) => {
     const id = entity.id();
+    // A reclaimed index (see `owner`): purge the previous occupant's state before reading any of
+    // it. On an entity's FIRST sight there is nothing to purge, so this is a no-op then.
+    const packed = entity.valueOf();
+    if (owner.get(id) !== packed) { forget(id); owner.set(id, packed); }
     // Captured once per pass: event payloads carry the stable GUID, never the runtime
     // id, which is reassigned on every scene hot-reload.
     const entityGuid = entity.get(EntityAttributes)?.guid;
@@ -293,6 +337,9 @@ export function videoSystem(world: World): void {
   for (const e of [...progress.keys()]) if (!seen.has(e)) progress.delete(e);
   for (const e of [...readyUrls.keys()]) if (!seen.has(e)) readyUrls.delete(e);
   for (const e of [...failed.keys()]) if (!seen.has(e)) failed.delete(e);
+  // Ownership outlives nothing else — an id whose entity is gone must not keep claiming it, or
+  // a LATER respawn on that index would match the dead owner and skip its purge.
+  for (const e of [...owner.keys()]) if (!seen.has(e)) owner.delete(e);
 }
 
 /** Seek an entity's live clip, if it has one. Used by the declarative `video.seek` /
@@ -307,6 +354,7 @@ export function __resetVideoSystem(): void {
   progress.clear();
   readyUrls.clear();
   failed.clear();
+  owner.clear();
   resolveUrl = (guid) => guid;
   resolveSource = null;
   download = null;

@@ -13,6 +13,7 @@
  * passes. `repoLayoutGuard.test.ts` is the tripwire against exactly that.
  */
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
@@ -74,6 +75,16 @@ export function hasSkills(): boolean {
   return fs.existsSync(path.join(REPO_ROOT, '.claude', 'skills'));
 }
 
+/** True when this checkout carries the Claude subagent definitions (`.claude/agents/`).
+ *
+ *  Separate from `hasSkills()` even though both live under `.claude/` and the snapshot ships
+ *  neither: skills and agents are independently deletable, and a guard that reads
+ *  `.claude/agents/**` should say so rather than borrow a predicate about a sibling
+ *  directory. Same reasoning as `hasPublishScripts()` vs `hasPrivateTooling()` above. */
+export function hasAgentDefinitions(): boolean {
+  return fs.existsSync(path.join(REPO_ROOT, '.claude', 'agents'));
+}
+
 /** True when the `oss/` publish overlay (the workflows rewritten onto the public repo by
  *  `scripts/publish-engine-oss.sh`) is present in this checkout. */
 export function hasOssOverlay(): boolean {
@@ -112,4 +123,61 @@ export function hasInternalGames(): boolean {
  *  precisely so the choice between loose and strict is visible at the call site. */
 export function hasAnyProject(): boolean {
   return discoverProjects(REPO_ROOT).length > 0;
+}
+
+/** True when at least one project carries a COMMITTED vendored plugin tarball
+ *  (`<project>/plugins/*.tgz`).
+ *
+ *  Narrower than `hasAnyProject()`, and the CI snapshot is what separates them:
+ *  `scripts/publish-engine-oss.sh` deletes `ios android packages plugins` from every demo it
+ *  stages AND strips every `file:` dependency from its package.json, so the snapshot has
+ *  projects and no vendored plugins at all. #375's guards open those tarballs and assert they
+ *  opened at least one, so on the loose predicate they would fail the public gate for having
+ *  nothing to check.
+ *
+ *  ⚠️ It reads the TARBALLS, not the dependency specs those guards iterate — deliberately. A
+ *  predicate computed from the guard's own join is self-disabling: rename what
+ *  `listEnginePlugins()` reports, or move the `file:` pin into `devDependencies`, and the
+ *  premise silently goes false, the guards skip, and `npm run verify` stays green with #375's
+ *  check dead. Reading a different fact means that breakage lands as a RED "checked nothing"
+ *  instead. Same lesson as `hasInternalGames()` above, one notch over. */
+export function hasVendoredPluginTarballs(): boolean {
+  return discoverProjects(REPO_ROOT).some((p) => {
+    try {
+      return fs.readdirSync(path.join(p.dir, 'plugins')).some((f) => f.endsWith('.tgz'));
+    } catch {
+      return false; // no plugins/ dir — the snapshot's state, and a legitimate project's
+    }
+  });
+}
+
+/** True when at least one TRACKED iOS Xcode project (`project.pbxproj`) exists.
+ *
+ *  Narrower than `hasAnyProject()` on purpose, and the CI snapshot is exactly what separates
+ *  them: `scripts/publish-engine-oss.sh` deletes `ios android packages plugins` from every
+ *  demo it stages, so the snapshot HAS projects and has no native at all. A test that walks
+ *  pbxproj content therefore finds nothing there while `hasAnyProject()` still reads true.
+ *
+ *  ⚠️ **Tracked, via `git ls-files` — deliberately NOT `fs.existsSync`.** Its consumers grep
+ *  the INDEX (`git grep`), so an on-disk check would gate on a different question than the one
+ *  the assertion asks, which is the `hasAnyProject`/`hasInternalGames` mistake this file is a
+ *  monument to, moved one notch over. The reachable failure: a user of the public snapshot
+ *  scaffolds a project and runs a native build, `healNativeConfig.ts` writes a NEW UNTRACKED
+ *  pbxproj, an on-disk predicate flips true while `git grep` still sees nothing — and the
+ *  guarded test goes red on the public gate, the exact outcome the gating exists to prevent.
+ *
+ *  Returns false rather than throwing when git cannot answer (absent, or not a checkout); the
+ *  consumers' own `git grep` fails the same way in that case, so both go quiet together
+ *  instead of disagreeing. */
+export function hasNativeProjects(): boolean {
+  try {
+    const out = execFileSync('git', ['ls-files', '--', '*/ios/App/App.xcodeproj/project.pbxproj'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return out.trim() !== '';
+  } catch {
+    return false;
+  }
 }

@@ -43,6 +43,7 @@ export const COVERED_BY_SMOKE: readonly string[] = [
   'modoki_load_scene', 'modoki_set_selection', 'modoki_play_control', 'modoki_history',
   'modoki_tap', 'modoki_focus', 'modoki_dispatch_action', 'modoki_set_timescale', 'modoki_journal',
   'modoki_hit_regions', 'modoki_profiler',
+  'modoki_game_view_device', 'modoki_animation_view_mode',
 ];
 
 /** MUTATING tools no live tier reaches, each with the reason it cannot be swept.
@@ -75,6 +76,9 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   modoki_open_particle_editor: "opens a panel over the human's layout",
   modoki_open_sprite_editor: "opens a panel over the human's layout",
   modoki_open_nine_slice_editor: "opens a panel over the human's layout",
+  modoki_open_skin_editor: "opens a panel over the human's layout",
+  modoki_select_sprite_slice: "needs a live Sprite Editor session open on the human's texture",
+  modoki_set_skin_mode: "needs a live Skin editor session open on the human's rig",
   modoki_focus_entity: "moves the human's camera",
   modoki_set_playhead: 'scrubs a live animation/timeline',
   modoki_pose_clip: "poses the human's LIVE world and opens a preview envelope over it. Verified by hand on this clone instead (#288 Phase 4): open a clip, pose at two different t, read a trait back at each — Circle 2D x went 2413.96 (authored) -> 2320.39 (t=0.9) -> 1143.25 (t=0.2) -> 2413.96 after exit. A single pose could coincide with the authored value; two cannot",

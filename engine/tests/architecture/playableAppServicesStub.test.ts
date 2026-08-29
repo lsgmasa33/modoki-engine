@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { hasInternalGames } from '../helpers/repoLayout';
 
@@ -51,7 +51,12 @@ function requiredNames(): Map<string, string[]> {
     .filter((f) => /\.tsx?$/.test(f))
     // The app-services package DEFINES these names; it is not a consumer of the stub.
     .filter((f) => !f.includes('/packages/'))
-    .filter((f) => !f.includes('/tests/'));
+    .filter((f) => !f.includes('/tests/'))
+    // `git ls-files` lists what is TRACKED, which includes a file deleted in the working tree but
+    // not yet staged — an ordinary mid-refactor state. Reading it threw ENOENT and the guard died
+    // with a stack trace instead of an answer, which reads as a broken test rather than as a file
+    // that is on its way out. Skipping it is right: a deleted file imports nothing.
+    .filter((f) => existsSync(path.join(repoRoot, f)));
 
   const out = new Map<string, string[]>();
   const add = (name: string, where: string) => {

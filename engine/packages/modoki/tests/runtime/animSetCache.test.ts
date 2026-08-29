@@ -3,16 +3,33 @@ import {
   resolveAnimSetParams, setAnimSet, getAnimSet, invalidateAnimSet, clearAnimSetCache,
   ANIMSET_DEFAULTS,
 } from '../../src/runtime/loaders/animSetCache';
+import { clearManifest, newGuid } from '../../src/runtime/loaders/assetManifest';
 
 // The cache lazily fetches on a miss. Stub fetch so a cold lookup is deterministic
 // (rejects) instead of hitting the network; the seed path (setAnimSet) needs no fetch.
 beforeEach(() => {
   clearAnimSetCache();
+  clearManifest();
   vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('no network in test'))));
 });
 afterEach(() => {
   vi.unstubAllGlobals();
   clearAnimSetCache();
+});
+
+// Close-out sweep of QA-ANIM-0018 (animationClipCache's fix): every sibling `*Cache` module
+// shared the same `isGuid(ref) ? resolveRef(ref) : ref` cache-key helper, silently returning
+// undefined for a guid absent from the manifest with no warning at all.
+describe('animSetCache — unresolved guid warns once (parity with animationClipCache)', () => {
+  it('warns once for a guid absent from the manifest', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const guid = newGuid();
+    expect(getAnimSet(guid)).toBeNull();
+    expect(getAnimSet(guid)).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain(guid);
+    warn.mockRestore();
+  });
 });
 
 describe('animSetCache.resolveAnimSetParams', () => {

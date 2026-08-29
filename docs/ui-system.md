@@ -46,7 +46,20 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `flexShrink`, per-edge `padding*`/`margin*` (each with its own `*Unit`),
   `minWidth`/`maxWidth`/`minHeight`/`maxHeight`, `alignSelf`, `zIndex`, `rotation` (see below),
   `overflow`
-  (`visible | hidden | scroll`), `isVisible`, `pointerThrough` (see below).
+  (`visible | hidden | scroll`), `scrollbarStyle` (`auto | tinted | hidden`) with
+  `scrollbarThumbColor`/`scrollbarTrackColor`, `isVisible`, `pointerThrough` (see below).
+
+  **The scrollbar skin is `scrollbar-color` + `scrollbar-width` and nothing else**, because these
+  are INLINE styles and `::-webkit-scrollbar` is a pseudo-element that cannot be written inline at
+  all (`scrollViewDom.ts` records the same limit where it hides a scroll view's bar). So you get a
+  thumb colour, a track colour and a coarse width — no shape, corner or arrow control. The skin is
+  gated on `overflow: 'scroll'`, so a tint authored on an element that never scrolls does nothing
+  rather than sitting in the Inspector pretending to.
+  ⚠️ **`UIScrollView.scrollbar` says the same thing and WINS** — both emit `scrollbar-width: none`
+  for their hidden case and the scroll view's style is merged after, so on an element carrying a
+  `UIScrollView` that trait decides whether a bar exists and `scrollbarStyle` only tints it.
+  ⚠️ `'hidden'` removes an **affordance**, not just a decoration: with no bar, nothing on screen
+  says the content continues below the fold. Use it only where something else already does.
 
   ⚠️ **Match `gapUnit` to the unit the CHILDREN are sized in.** `gap` was px-only until
   2026-08-07, and a `flexWrap: 'wrap'` container whose items scale (`vh`/`vmin`/`%`) while its
@@ -352,6 +365,37 @@ Two costs, both real:
 - ⚠️ **The editor's selection overlay stays axis-aligned.** `resolveAnchorRect` measures an
   unrotated rect, so a tilted element's outline and gizmo box do not follow the tilt. Cosmetic —
   the render is correct — and deliberately out of scope.
+
+### Scale (`UIElement.scale`)
+
+`scale` is a **uniform** scale about the anchor pivot; 1 is natural size. It rides the same composer
+as `rotation` (`applyRotationStyle` in `ui/anchorCss.ts`) and inherits every rule above: it composes
+onto the anchor's pivot translate rather than replacing it, it takes the same pivot-derived
+`transform-origin` so the anchored point does not move as the element grows, and it creates the same
+stacking context. Uniform scale and rotation commute about a shared origin, so the order the two are
+appended in does not matter.
+
+**It scales the RENDER, not the layout.** The element's box keeps its laid-out size, so siblings do
+not reflow and nothing shifts underneath a growing card. That is the reason the field exists at all
+rather than keying `width`/`height`: those *do* reflow, and they leave text at its original size, so
+a "pop" authored that way reads as a box stretching around stationary words.
+
+Why it exists (#340): Court's level-win dialog snapped on screen with no transition, and the fix had
+to be an **authored keyframe clip** rather than a tween in code (owner's standing rule — timing and
+easing are data the owner retunes in the editor, not numbers an agent picks in a `.ts`).
+`UIElement.opacity` was already keyable, but a fade alone reads as soft; a dialog wants to arrive.
+No keyable property in the UI layer could express that. The worked example is
+`games/court/runtime/assets/anim/dialog-pop.anim.json` — a scale track 0.8 → 1.06 → 1.0 against an
+opacity track, played by an `Animator` authored on the card.
+
+⚠️ **Identity is 1, and it is checked against 1, not against falsy.** `scale: 0` is a legitimate
+authored value (a pop-in's first keyframe) and must emit `scale(0)`; a `|| 1` anywhere on this path
+would silently promote it and the animation would start already open. The projection in
+`uiTreeStore.ts` uses `?? 1` for exactly this reason. An element left at 1 emits no transform at
+all, so everything that predates the field is byte-identical and gains no stacking context.
+
+⚠️ Like `rotation`, the editor's selection overlay stays at the **unscaled** rect — `resolveAnchorRect`
+measures layout, and this deliberately does not change layout.
 
 **An offset means a different thing per axis, and the axis decides — not the field.**
 On a **non-stretched** axis the anchor is a single *point*, so an offset **moves** the
@@ -733,6 +777,41 @@ And **the 2-D grid is genuinely heavy**: 229 DOM entities is ~7× the strip's, a
 p95 at 66 ms. That is the cost of a grid on a Mali-G57, not a defect — but it is the number to
 weigh before making Court's page a scrolling grid rather than a pager.
 
+### Focus follows the ENTRY across recycling — measured
+
+`games/scroll-demo`'s `row.prefab.json` authors `UIFocusable` for one reason: nothing else in the
+repo does. Court's selector is pointer-driven and uses no focus nav, so the engine's
+focus-on-recycle re-target (`runtime/ui/entriesFocus.ts`) had zero live callers before this — the
+same "an API nothing calls" shape as `scrollTo`'s buttons, one layer up.
+
+`uiFocusSystem` autofocuses the first row on Play, and as you scroll the focus ring stays on the
+same **Entry N** while hopping between pooled entities. Measured in the editor 2026-08-22 — a
+wheel up from `scrollTop` 363 to 123 moved the ring from entity **22 to 24** with its label still
+reading `Entry 1`, while entity 22 went on to show `Entry 0`. That second half is the bug being
+prevented: without the re-target the ring would have sat on entity 22 and the player would have
+been on `Entry 0` believing they were on `Entry 1`.
+
+### Status (#250, #316, #321)
+
+Built as the live verification harness for #250 and kept as `games/scroll-demo`. All three of the
+plan's cases are authored and were measured in a running editor (2026-08-21) — and authoring the
+two new ones is what found three engine defects the vertical strip could not expose: the
+collapsing content box, a resize that never re-laid-out, and `scroll-snap-align` that no code ever
+applied. All three were then flung on a Galaxy A23 with real touch input — no blank frames on any
+shape, and a defect that only a device could show: the overscan raise fed itself, so a grid nobody
+was touching re-drove its pool on 102 of 154 frames (see "Measured on the low-end target" above).
+`wheel` and `scrollbar` were authored on the pager on 2026-08-22 (#321) and measured in the editor
+the same day: a trusted 480px wheel advances the pager **exactly one page** (410px) and three
+gestures in a row land +1, +1, +1 with a reverse flick at -1, while the identical wheel on the
+strip travels 363px freely — the half that proves the `'native'` default survived. And the two
+boxes read `clientWidth == offsetWidth` (pager, `scrollbar: 'hidden'`) against **447 vs 462**
+(strip, the `'auto'` default): the 15px a classic desktop scrollbar steals, measured on the same
+machine in the same session rather than quoted.
+
+The Court migration landed on 2026-08-21 (#316) — Court's level selector is a pager over this same
+mechanism, with a 5x5 page as the entry, and wiring its arrows to `scrollToEntry` immediately
+found two engine defects this harness had not.
+
 `entryWidth`/`entryHeight` of **`0` means "read it from the prefab root"**, so a fixed-size entry
 is not a second copy of a number the prefab already states; `%` resolves against the viewport,
 which is how a pager is expressed.
@@ -761,6 +840,16 @@ coordinates (the system converts, since it is what resolves entry size); the dec
 `ui.scrollTo` action does the same from a button with no game code. Both are exercised by
 `games/scroll-demo`'s strip scene — two authored buttons, one `instant` and one `smooth` — and,
 since #316, by Court's level-selector arrows, which is the first caller in a SHIPPING game.
+
+⚠️ **The per-request `behavior` and the authored default are TWO fields, and must stay two**
+(#409). `UIScrollView.scrollBehavior` is authored; the request rides the `runtimeOnly`
+`scrollToBehavior` and is consumed with the rest of the request by `clearScrollRequest`.
+`scrollToEntry` used to store the request ON the authored field, so a call that named no
+`behavior` — which defaulted to `'instant'` — permanently destroyed an author's `'smooth'`, and
+the next save wrote the overwrite into the scene as authored data. Marking the field `runtimeOnly`
+could not fix that; it would have deleted the author's choice instead. Consequence at the call
+site: **omitting `behavior` is not the same as passing `'instant'`** — the request then moves the
+way the view was authored to move.
 
 ⚠️ **OMIT the axis the view does not scroll — `0` is a REAL request, not "no request".** The
 sentinel is `-1`. Court asked for `{x: page, y: 0}` on an `axis: 'x'` view; that converted to
@@ -814,6 +903,35 @@ rebuild and is never per-frame.
   `__uiEntriesRow` per pooled row. See "the DOM shape" below for why the row layer exists.
 - **The entry prefab root needs `RenderableUI`**, or the entry renders nothing while looking
   perfect in `get_scene_state`.
+- ⚠️ **A prefab the loader never caches leaves the view BLANK, and since #363 it says so.** "Not
+  cached yet" is normal for the first frames of a scene load, so `spawnInstance` returns `0` and
+  the system retries — but a *permanent* miss is indistinguishable from a transient one at that
+  return value, and used to be retried silently forever with no throw, warn or log. The provider
+  is now asked `isCached` directly (a zero `rootSize` cannot answer it — an unsized prefab root is
+  a legitimate `0`), and `UNCACHED_WARN_TICKS` consecutive pipeline ticks of "no" warns once per
+  view, naming the prefab and the causes that were verified against the loader: a GUID that is not
+  the one the file declares as its `id`, a prefab unreachable from the scene's `resources`, or a
+  fetch that failed. It is exactly the diagnostic #344 lacked — Court's level selector rendered an
+  empty grid with `npm run verify` green at 8,462 tests, because every one of those tests reads the
+  prefab FILE and the file was well-formed.
+  ⚠️ **#344's recorded cause — "a `version: 2` makes the loader decline to cache" — is not real,
+  and the belief had spread to four places.** `fetchPrefab` (`meshTemplateCache.ts`) fetches,
+  parses and caches without ever inspecting `version`; `editor/scene/prefab.ts` *wrote* `2` for
+  any prefab holding nested-instance rows; and `games/court/.../level-page.prefab.json` carried 25
+  nested rows at version `1` and worked. (Both of those are stated in the past tense on purpose:
+  #379 made every writer stamp `PREFAB_FORMAT_VERSION` unconditionally and migrated the fleet, so
+  `level-page.prefab.json` now reads `2` like everything else. The argument is unaffected — it was
+  never about which value, only that no value gates loading.) **Confirmed live** (#365): with `level-tile.prefab.json`
+  set to `2` and the editor restarted cold, the selector rendered its full 100 tiles at rects
+  byte-identical to the version-1 control, with nothing logged. `prefabFormatVersion.test.ts`,
+  which required every committed prefab to be `1` citing that mechanism, is **deleted** — it
+  guarded a non-entrance and contradicted the serializer, so any editor re-save of a nested prefab
+  would have turned `npm run verify` red telling the author to undo what the editor had just done.
+  What actually emptied #344's grid is **still unestablished, and probably not a defect at all**:
+  the reported commit was checked out and booted COLD, and it rendered the grid in full. The
+  symptom belongs to one editor session, not to a tree — most likely the prefab cache serving the
+  pre-restructure doc under a live editor. See [prefabs.md](./prefabs.md) and #365 before acting on
+  the version theory again.
 - ⚠️ **`axis` PINS the cross axis, and it has to.** `UIElement.overflow: 'scroll'` is a both-axes
   CSS property, so an `axis: 'x'` view scrolled vertically too — and on any platform with CLASSIC
   scrollbars (desktop web, the Electron editor) the second scrollbar STEALS cross-axis space from

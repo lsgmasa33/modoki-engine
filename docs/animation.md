@@ -74,7 +74,12 @@ the ONE decoder, shared by the play loop, the resource collector, and the tree-s
 as `AudioSource.clips`); `clip` is the **active clip NAME** (empty → first entry), so switching
 tracks at runtime is `entity.set(Animator, { clip: 'walk' })` — mirroring `SkeletalAnimator` /
 `SpriteAnimator`. `resolveActiveClip(anim)` maps the active name → its `.anim.json` GUID + per-clip
-overrides; `activeClip` (runtimeOnly) mirrors what's actually playing. The active `clip` is a name,
+overrides; `activeClip` (runtimeOnly) names the clip the Animator has SELECTED.
+
+⚠️ **It is not evidence the clip is playing.** `activeClip` and `fadeElapsed` both advance even
+when the clip FAILED TO LOAD, so reading them back to confirm an animation fix reports success on a
+clip that never arrived — two bugs survived months that way. **Verify by reading the target
+entity's live `Transform`**, which only moves if something is actually driving it. The active `clip` is a name,
 NOT a fetchable ref, so the `.anim.json` GUIDs are collected from the `clips` bank explicitly in
 `collectResourceRefsFromEntities` + the tree-shaker's `probeTraitRefs` (Animator has no entry in
 `REF_FIELDS_BY_TRAIT`). Runtime switch API: the `engine.playClip` action (by name, guarded

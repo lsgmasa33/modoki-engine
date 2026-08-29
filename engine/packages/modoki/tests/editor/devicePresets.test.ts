@@ -6,6 +6,7 @@ import {
   DEVICE_PRESETS, FREE_PRESET, DEVICE_CATEGORY_ORDER, type DevicePreset,
   resolveLogicalSize, resolvePhysicalSize, presetDpr, presetLabel, filterDevices,
   resolveSafeArea, safeAreaCssVars,
+  findPresetByName, makeCustomPreset, validateCustomSize, describeDeviceSelection,
 } from '../../src/editor/scene/devicePresets';
 
 const devices = DEVICE_PRESETS.filter((p) => p.logicalW > 0);
@@ -207,5 +208,115 @@ describe('devicePresets — safe area', () => {
     for (const name of Object.keys(safeAreaCssVars({ top: 1, right: 1, bottom: 1, left: 1 }))) {
       expect(css, name).toContain(`var(${name},`);
     }
+  });
+});
+
+/** The agent-facing resolution behind `modoki_game_view_device` (#367). These are the decisions
+ *  the op makes — kept in the module so they are testable without an editor, and tested here
+ *  because the failure they guard against is silent: previewing a DIFFERENT screen than the one
+ *  asked for makes every measurement taken afterwards wrong, with nothing to indicate it. */
+describe('agent device resolution (#367)', () => {
+  it('resolves a preset by name, case-insensitively', () => {
+    expect(findPresetByName('iPhone 16 Pro')?.name).toBe('iPhone 16 Pro');
+    expect(findPresetByName('iphone 16 pro')?.name).toBe('iPhone 16 Pro');
+    expect(findPresetByName('  Free  ')?.name).toBe('Free');
+  });
+
+  it('returns undefined for a near miss rather than the nearest match', () => {
+    // The whole point of refusing: 'iPhone 16 Pr' must NOT resolve to 'iPhone 16 Pro'.
+    expect(findPresetByName('iPhone 16 Pr')).toBeUndefined();
+    expect(findPresetByName('iPhone')).toBeUndefined();
+    expect(findPresetByName('')).toBeUndefined();
+  });
+
+  it('no two presets differ only by case — which is what makes the lookup unambiguous', () => {
+    const lower = DEVICE_PRESETS.map((p) => p.name.toLowerCase());
+    expect(new Set(lower).size).toBe(lower.length);
+  });
+
+  it('a custom preset derives physical from logical x dpr, and defaults dpr to 1', () => {
+    expect(makeCustomPreset(640, 480)).toMatchObject({ logicalW: 640, logicalH: 480, physicalW: 640, physicalH: 480 });
+    expect(makeCustomPreset(640, 480, 2)).toMatchObject({ physicalW: 1280, physicalH: 960 });
+    expect(presetDpr(makeCustomPreset(400, 800, 3))).toBeCloseTo(3);
+  });
+
+  it('a custom preset carries NO safe-area insets, in both orientations', () => {
+    const c = makeCustomPreset(640, 480);
+    for (const o of ['portrait', 'landscape'] as const) {
+      expect(resolveSafeArea(c, o)).toEqual({ top: 0, right: 0, bottom: 0, left: 0 });
+    }
+  });
+
+  it('rejects a zero dimension — 0 is how Free says "fill the panel"', () => {
+    // The sharpest case here: without this, {logicalWidth: 0} would silently become Free and
+    // report success, and a caller would attribute a full-panel measurement to a 0-wide screen.
+    expect(validateCustomSize(0, 480, undefined)).toMatch(/Free/);
+    expect(validateCustomSize(640, 0, undefined)).toMatch(/between/);
+  });
+
+  it('rejects non-integer, non-finite and out-of-range sizes, naming the offending param', () => {
+    expect(validateCustomSize(640.5, 480, undefined)).toMatch(/logicalWidth.*whole number/);
+    expect(validateCustomSize(NaN, 480, undefined)).toMatch(/logicalWidth.*finite/);
+    expect(validateCustomSize(640, undefined, undefined)).toMatch(/logicalHeight.*finite/);
+    expect(validateCustomSize(99999, 480, undefined)).toMatch(/logicalWidth.*8192/);
+  });
+
+  it('accepts a usable size, and bounds dpr', () => {
+    expect(validateCustomSize(640, 480, undefined)).toBeNull();
+    expect(validateCustomSize(640, 480, 0.5)).toBeNull();
+    expect(validateCustomSize(8192, 8192, 4)).toBeNull();
+    expect(validateCustomSize(640, 480, 0)).toMatch(/dpr.*between/);
+    expect(validateCustomSize(640, 480, 8)).toMatch(/dpr.*between/);
+  });
+
+  it('refuses a dpr that cannot ROUND-TRIP, rather than silently rounding it away', () => {
+    // The read-back recovers dpr as physical/logical, and physical is rounded — so `{1,1,0.5}`
+    // used to be accepted and answer `dpr: 1`, and `{3,3,0.5}` answered 0.666…, both contradicting
+    // the call. Telling the agent a dpr it did not ask for is worse than refusing the combination.
+    expect(validateCustomSize(1, 1, 0.5)).toMatch(/fractional physical size/);
+    expect(validateCustomSize(3, 3, 0.5)).toMatch(/fractional physical size/);
+    // The refusal names the offending dimension, so the caller knows which one to change.
+    expect(validateCustomSize(640, 481, 0.5)).toMatch(/logicalHeight/);
+    // A dpr that DOES round-trip on both axes stays accepted — this is a round-trip guard, not a
+    // ban on fractional dpr (real devices have them: Pixel 9 is ~2.62).
+    expect(validateCustomSize(400, 800, 2.5)).toBeNull();
+  });
+
+  it('every accepted custom size reports back the dpr it was given', () => {
+    // The property the refusal above exists to protect, asserted end-to-end rather than trusted.
+    for (const [w, h, dpr] of [[640, 480, 1], [640, 480, 0.5], [400, 800, 2.5], [402, 874, 3]] as const) {
+      expect(validateCustomSize(w, h, dpr), `${w}x${h}@${dpr} should be accepted`).toBeNull();
+      expect(presetDpr(makeCustomPreset(w, h, dpr)), `${w}x${h}@${dpr} must round-trip`).toBeCloseTo(dpr, 9);
+    }
+  });
+
+  it('describes a preset selection with the orientation applied', () => {
+    const p = find('iPhone 16 Pro');
+    const portrait = describeDeviceSelection(p, 'portrait');
+    const landscape = describeDeviceSelection(p, 'landscape');
+    expect(portrait.logical).toEqual({ w: p.logicalW, h: p.logicalH });
+    // Landscape is a FLIP of the size...
+    expect(landscape.logical).toEqual({ w: p.logicalH, h: p.logicalW });
+    expect(landscape.physical).toEqual({ w: p.physicalH, h: p.physicalW });
+    // ...but a LOOKUP for the insets: rotating the portrait quartet would invent a top inset
+    // this device does not have in landscape. See SafeAreaSet's docblock.
+    expect(portrait.safeArea.top).toBeGreaterThan(0);
+    expect(landscape.safeArea.top).toBe(0);
+    expect(portrait.free).toBe(false);
+  });
+
+  it("distinguishes a preset's authored zeros from a custom size's zeros-by-construction", () => {
+    // Four bare zeros are indistinguishable from a measurement, which is why the basis is
+    // reported: an iPhone SE really DOES report 0 with the status bar hidden, while a custom
+    // size has no device to look anything up from.
+    expect(describeDeviceSelection(find('iPhone SE'), 'portrait')).toMatchObject({
+      safeArea: { top: 0, right: 0, bottom: 0, left: 0 }, safeAreaBasis: 'preset',
+    });
+    expect(describeDeviceSelection(makeCustomPreset(640, 480), 'portrait').safeAreaBasis).toBe('custom-none');
+  });
+
+  it('marks Free as free, with no fixed size', () => {
+    const d = describeDeviceSelection(FREE_PRESET, 'portrait');
+    expect(d).toMatchObject({ device: 'Free', free: true, logical: { w: 0, h: 0 }, dpr: 1 });
   });
 });

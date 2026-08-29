@@ -29,6 +29,8 @@ import { gpuPassScope } from '../core/gpuTimings';
 // determinism guard, and the live-compile hold is a real-time deadline, not sim time.
 import { rawNow } from '../core/clock';
 import { createLiveCompileGate } from './liveCompileGate';
+import { armScenePaint, markScenePainted, abandonScenePaint } from './scenePaintSignal';
+import { isPrecompileActive, endAllPrecompiles } from './postfx/precompileSession';
 import { getRenderSettings, getEffectiveThreeSettings, getActiveTierOverrides } from './renderSettings';
 import { maskPostFXRequest } from './qualityTier';
 import { onForceResize } from './resizeBus';
@@ -39,18 +41,14 @@ import { createBlobShadowSyncState, syncBlobShadows, disposeBlobShadowSyncState 
 import { viewGroundFocus } from './shadowFollow';
 import { PARTICLE_LAYER } from './layers';
 import { areDebugHandlesEnabled } from '../core/debugHandles';
-import { NPRPostFX } from '../traits/NPRPostFX';
-import { BloomPostFX } from '../traits/BloomPostFX';
-import { VignettePostFX } from '../traits/VignettePostFX';
-import { DepthOfFieldPostFX } from '../traits/DepthOfFieldPostFX';
-import { AmbientOcclusionPostFX } from '../traits/AmbientOcclusionPostFX';
 import { Camera as CameraTrait } from '../traits/Camera';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { PostFXStack } from './postfx/PostFXStack';
 import { planStages, planFxaaEnabled, stackSignature } from './postfx/stackPlan';
-import type { BloomStageConfig, VignetteStageConfig, DofStageConfig, AoStageConfig, PostFXRequest } from './postfx/stackPlan';
+import type { PostFXRequest } from './postfx/stackPlan';
+import { scanPostFXTraits } from './postfx/postFXTraitScan';
 import { SuperSampleRebuildDebouncer } from './npr/ssRebuildDebounce';
-import { nprConfigFromTrait, type NprTraitSnapshot } from './npr/nprConfigFromTrait';
+import { nprConfigFromTrait } from './npr/nprConfigFromTrait';
 
 /** Draw-call batching (#154 P4b) — built, correct, tested, and DEFAULT OFF because it was
  *  measured to be worthless on the project it was built for.
@@ -179,6 +177,11 @@ export default function Scene3D() {
 
     bringUp().catch(e => {
       console.error('[Scene3D] Renderer creation failed (no WebGPU or WebGL2):', e);
+      // No renderer ⇒ no frame will ever be submitted, so release anyone waiting on the paint
+      // signal now rather than making them sit out its 5 s ceiling (#334). Without this, a device
+      // with neither WebGPU nor WebGL2 would show the loading overlay for five seconds before
+      // revealing a surface that was never going to draw.
+      abandonScenePaint();
     });
 
     function startRenderLoop() {
@@ -415,6 +418,16 @@ export default function Scene3D() {
         onSettled: () => markRenderDirty(),
         onError: (e) => console.warn('[Scene3D] live-scene compile failed:', e),
       });
+      // The same hold, for the post-FX stack's own stage quads (#323). A separate instance rather
+      // than a second job on `liveCompile` because they are armed by different events — see the
+      // note at its `tick` call. Same contract: hold the submit while the compile is in flight,
+      // release at the ceiling, and a stale generation cannot release a newer hold.
+      const stackCompile = createLiveCompileGate({
+        maxHoldMs: LIVE_COMPILE_MAX_HOLD_MS,
+        now: rawNow,
+        onSettled: () => markRenderDirty(),
+        onError: (e) => console.warn('[Scene3D] post-FX stage compile failed:', e),
+      });
       const dirtyUnsubs = [
         addDirtyListener(markRenderDirty),  // trait writes through the helper API
         onStructureDirty(markRenderDirty),  // entity create / delete / reparent
@@ -468,34 +481,13 @@ export default function Scene3D() {
         endProfilerSample();
         endProfilerSample(); // 'sync'
 
-        // Read NPR singleton — first entity with NPRPostFX, if any. The trait→config
-        // mapping + signature are the pure `nprConfigFromTrait`/`nprConfigSignature`
-        // (npr/nprConfigFromTrait.ts) so the loop and its unit tests share one code path.
-        let nprEnabled = false;
-        // Holder (not a bare `let`): TS control-flow would narrow a closure-assigned
-        // `let` back to its `null` initializer; a property on an object isn't narrowed
-        // that way, so the truthiness check below correctly yields the snapshot.
-        const nprHold: { snap: NprTraitSnapshot | null } = { snap: null };
-        world.query(NPRPostFX).updateEach(([fx]: [NprTraitSnapshot & { enabled: boolean }]) => {
-          if (nprEnabled) return; // singleton — first wins
-          nprEnabled = fx.enabled;
-          // Copy out of the trait (updateEach reuses the row) into a plain snapshot.
-          nprHold.snap = {
-            fillMode: fx.fillMode,
-            depthThreshold: fx.depthThreshold,
-            normalThreshold: fx.normalThreshold,
-            colorThreshold: fx.colorThreshold,
-            lineThickness: fx.lineThickness,
-            lineStrength: fx.lineStrength,
-            grayscaleGamma: fx.grayscaleGamma,
-            grayscaleLift: fx.grayscaleLift,
-            fxaa: fx.fxaa,
-            fxaaEdgeThreshold: fx.fxaaEdgeThreshold,
-            fxaaEdgeThresholdMin: fx.fxaaEdgeThresholdMin,
-            fxaaBlendStrength: fx.fxaaBlendStrength,
-            superSampleScale: fx.superSampleScale,
-          };
-        });
+        // ONE read of the post-FX singleton traits, through the shared scan (#324b). The five
+        // per-trait query blocks that used to live here moved to `postfx/postFXTraitScan.ts`
+        // because the shader prewarm needs the same answer — "does this world get a stack" — and
+        // a second copy of the trait list there would go stale the first time a sixth post-FX
+        // trait is added. Add a trait THERE, not here.
+        const fxScan = scanPostFXTraits(world);
+        const nprEnabled = fxScan.npr !== null;
 
         // Camera.clearColor → NPR background. The composite shader covers every
         // pixel, so without piping this in the swapchain stays whatever the NPR
@@ -509,52 +501,6 @@ export default function Scene3D() {
           });
         }
 
-        let bloomFound = false;
-        let bloomEnabled = false;
-        const bloomCfg: BloomStageConfig = { strength: 0.8, radius: 0.6, threshold: 0 };
-        world.query(BloomPostFX).updateEach(([fx]: [BloomStageConfig & { enabled: boolean }]) => {
-          if (bloomFound) return; // singleton — first entity wins
-          bloomFound = true;
-          bloomEnabled = fx.enabled;
-          bloomCfg.strength = fx.strength;
-          bloomCfg.radius = fx.radius;
-          bloomCfg.threshold = fx.threshold;
-        });
-
-        let vignetteFound = false;
-        let vignetteEnabled = false;
-        const vignetteCfg: VignetteStageConfig = { intensity: 0.4, smoothness: 0.5 };
-        world.query(VignettePostFX).updateEach(([fx]: [VignetteStageConfig & { enabled: boolean }]) => {
-          if (vignetteFound) return; // singleton — first entity wins
-          vignetteFound = true;
-          vignetteEnabled = fx.enabled;
-          vignetteCfg.intensity = fx.intensity;
-          vignetteCfg.smoothness = fx.smoothness;
-        });
-
-        let dofFound = false;
-        let dofEnabled = false;
-        const dofCfg: DofStageConfig = { focusDistance: 10, focalLength: 1, bokehScale: 1 };
-        world.query(DepthOfFieldPostFX).updateEach(([fx]: [DofStageConfig & { enabled: boolean }]) => {
-          if (dofFound) return; // singleton — first entity wins
-          dofFound = true;
-          dofEnabled = fx.enabled;
-          dofCfg.focusDistance = fx.focusDistance;
-          dofCfg.focalLength = fx.focalLength;
-          dofCfg.bokehScale = fx.bokehScale;
-        });
-
-        let aoFound = false;
-        let aoEnabled = false;
-        const aoCfg: AoStageConfig = { radius: 0.25, intensity: 1 };
-        world.query(AmbientOcclusionPostFX).updateEach(([fx]: [AoStageConfig & { enabled: boolean }]) => {
-          if (aoFound) return; // singleton — first entity wins
-          aoFound = true;
-          aoEnabled = fx.enabled;
-          aoCfg.radius = fx.radius;
-          aoCfg.intensity = fx.intensity;
-        });
-
         // Phase 3: ONE request describes every enabled effect — NPR is just
         // another stage now, so `NPRPostFX` + `BloomPostFX` compose instead of
         // NPR winning and bloom being skipped. `ssScale` is a parameter because
@@ -562,7 +508,7 @@ export default function Scene3D() {
         // value (to detect intent) and the currently-applied value (to hold the
         // rebuild off until the drag settles) — and FXAA's legality depends on
         // it (F7), so both must be derived from the same scale.
-        const nprSnap = nprEnabled && nprHold.snap ? nprConfigFromTrait(nprHold.snap, clearColor) : null;
+        const nprSnap = fxScan.npr ? nprConfigFromTrait(fxScan.npr, clearColor) : null;
         const buildReq = (ssScale: number): PostFXRequest => {
           const req: PostFXRequest = {};
           if (nprSnap) {
@@ -587,10 +533,10 @@ export default function Scene3D() {
               };
             }
           }
-          if (aoEnabled) req.ao = aoCfg;
-          if (dofEnabled) req.dof = dofCfg;
-          if (bloomEnabled) req.bloom = bloomCfg;
-          if (vignetteEnabled) req.vignette = vignetteCfg;
+          if (fxScan.ao) req.ao = fxScan.ao;
+          if (fxScan.dof) req.dof = fxScan.dof;
+          if (fxScan.bloom) req.bloom = fxScan.bloom;
+          if (fxScan.vignette) req.vignette = fxScan.vignette;
           // ⚠️ MASK AT THE SOURCE, not at the call site. The active tier drops effects per
           // effect, and `buildReq` is called TWICE — once for `liveReq`, and again below for
           // `effectiveReq` while an SS-scale change is still settling. Masking only the first
@@ -617,6 +563,21 @@ export default function Scene3D() {
         // config could drop NPR and GTAO and stay recognisably itself, but couldn't say so.
         // The mask itself is applied inside `buildReq` — see the warning there for why it cannot
         // live here.
+        // ⚠️ NEVER submit while a stage precompile owns `renderer.render` (#323).
+        //
+        // `stackCompile.tick()` returning false is NOT proof the compile finished:
+        // `liveCompileGate`'s ceiling releases the FRAME without waiting for the compile — its
+        // documented, deliberate design. A frame that got past the ceiling with the compile still
+        // mid-`await` would call `postfxStack.render()` through a STUBBED renderer: nothing drawn,
+        // and then `markScenePainted()` firing over a blank canvas and lifting the loading
+        // overlay. That is #334's bug, arrived at from the other side.
+        //
+        // Asking is also what ENDS a stale session: past its own (shorter) ceiling
+        // `isPrecompileActive` restores the renderer and answers false, so this can hold at most
+        // `PRECOMPILE_MAX_HOLD_MS` and the in-flight compile stops on its next check. Placed
+        // before the branch because a stack disposed mid-compile routes the very next frame down
+        // the plain `renderer.render(scene, camera)` path, which is stubbed just the same.
+        if (isPrecompileActive(renderer, rawNow())) return;
         const hasStages = planStages(liveReq).length > 0;
         // Tearing down an EXISTING stack matters as much as not building one: a live demotion
         // happens on a device that is already struggling, and a retained stack would keep its
@@ -640,6 +601,9 @@ export default function Scene3D() {
             postfxCamera = activeCamera;
             ssRebuild = new SuperSampleRebuildDebouncer(liveSs);
             lastStackSig = stackSignature(liveReq);
+            // A new stack means new stage materials and new render targets, so new pipelines
+            // (#323). Arm on EVERY construction, not on the world swap — see the `tick` call.
+            stackCompile.arm();
           } else {
             // F9: feed the live SS-scale target to the debouncer every frame. It
             // returns true only once the value has settled — so a slider drag
@@ -660,6 +624,7 @@ export default function Scene3D() {
                 postfxStack.dispose();
                 postfxStack = new PostFXStack(renderer, scene, activeCamera, effectiveReq);
                 postfxCamera = activeCamera;
+                stackCompile.arm(); // #323 — see the sibling call above
               }
               // Only mark the sig applied once the SS-scale is in sync with the
               // pipeline — otherwise a still-settling SS change would latch the
@@ -673,6 +638,22 @@ export default function Scene3D() {
           // is the point: the pipelines it builds are exactly the ones the first draw would
           // otherwise build SYNCHRONOUSLY, and that is the stall.
           if (liveCompile.tick(() => compileLiveScene(renderer, scene, activeCamera, () => postfxStack!.compileSceneAsync()))) return;
+          // …and the stack's OWN stage quads (#323), on its OWN gate.
+          //
+          // ⚠️ This deliberately does NOT ride `liveCompile`, and the reason is measured, not
+          // stylistic: the two are armed by different events. `liveCompile` arms on a WORLD SWAP;
+          // a `PostFXStack` is constructed on whatever frame the stage set first becomes non-empty
+          // and RECONSTRUCTED whenever it changes (an SS-scale settle, a camera-object swap,
+          // `postfx.showOnly`). Those do not coincide. Measured locally with
+          // `tools-scratch/boot-stall/pipeattrib.mjs`: on `demos/particle-demo` the swap precedes
+          // the Scene3D mount so `liveCompile` never arms at all, and on `demos/postfx-demo` the
+          // Director's first beat rebuilds the stack ~700 ms after the swap's compile had already
+          // settled — in both cases every stage quad still built synchronously inside a frame.
+          //
+          // Ordered AFTER the scene pass on purpose: that is the proven, larger win, and this
+          // newer half reaches further into three's private structure. Its own gate means a
+          // rejection here cannot release or unwind the scene compile's hold.
+          if (stackCompile.tick(() => postfxStack!.compileStagesAsync())) return;
           // The CPU span and the GPU span are separate measurements of the same call and both are
           // wanted: `submit-postfx` is how long the main thread spent HERE (on postfx-demo that
           // was a median 37 ms — CPU blocking on GPU backpressure), while `gpuPassScope` claims
@@ -688,6 +669,12 @@ export default function Scene3D() {
           gpuPassScope('scene', () => renderer.render(scene, activeCamera));
           endProfilerSample();
         }
+        // A real frame of the swapped-in scene reached the GPU (#334). Reached ONLY on a path that
+        // submitted — every early return above (capture guard, idle gate, and crucially
+        // `liveCompile.tick`'s hold) skips it, which is exactly what makes this a readiness signal
+        // rather than another frame count. `GameShell` awaits it before hiding the loading overlay,
+        // so the HUD can no longer appear over an unpainted canvas. See `scenePaintSignal.ts`.
+        markScenePainted();
       }
       // Prewarm the already-current scene before the first render. The runtime
       // game mounts Scene3D BEFORE the scene loads, so the registerBeforeSwap hook
@@ -722,6 +709,14 @@ export default function Scene3D() {
           readRenderTargetPixels?(rt: THREE.RenderTarget, x: number, y: number, w: number, h: number, buf: Uint8Array): void;
         };
         capturing = true;
+        // ⚠️ Take the renderer back before capturing (#323). `capturing` parks the live LOOP, but
+        // nothing stops a capture STARTING while a stage precompile holds `renderer.render`
+        // stubbed — and a capture that runs through the stub reads back an untouched buffer, i.e.
+        // silently wrong pixels handed to `modoki_capture_viewport` / `render_scene`. Ending the
+        // session restores the real renderer immediately; the in-flight compile sees its session
+        // is no longer alive on its next `await` and stops rather than issuing real draws into
+        // our target. Costing the optimisation to keep a capture truthful is the obvious trade.
+        endAllPrecompiles(renderer);
         // Reuse the pooled RT/canvas/camera; (re)allocate only on first use or a
         // size change.
         if (!captureRT || captureRT.width !== w || captureRT.height !== h) {
@@ -887,6 +882,7 @@ export default function Scene3D() {
         blendOriginId = -1;
         lastApplied.valid = false;
         liveCompile.arm(); // compile the NEW scene's pipelines before its first frame (#238)
+        armScenePaint();   // …and don't let the DOM overlay hide before that frame lands (#334)
         markRenderDirty(); // render the freshly-swapped scene even while stopped
       });
 
@@ -998,6 +994,9 @@ export default function Scene3D() {
         // engine-review/runtime-rendering-3d.md F2.
         step('renderer.dispose', () => renderer.dispose());
         step('domElement.remove', () => renderer.domElement.remove());
+        // This surface can no longer paint — release any DOM-level waiter (#334). Last, so a
+        // waiter is only released once the teardown it is waiting behind has actually finished.
+        step('abandonScenePaint', abandonScenePaint);
       };
     }
 

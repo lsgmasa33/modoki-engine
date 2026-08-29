@@ -5,11 +5,20 @@
 // (engine/tests/plugins/deviceLeaseGoldenVectors.test.ts). A native divergence from the spec fails
 // here instead of silently shipping.
 //
-// STATUS: this test needs a Swift-package/XCTest target wired for capacitor-game-debug to run (the
-// plugin package ships without one today). `LeaseCore` below is the RECOMMENDED extraction target —
-// GameDebugPlugin.evaluateLease/startLeaseGrace should delegate to it (a pure, clock-injected,
-// timer-free arbiter that mirrors the TS spec's lazy expiry), so this test covers the shipping code
-// rather than a copy. Until then it documents + checks the parity contract for the port.
+// HOW IT RUNS: `npm run test:native` (engine/scripts/test-native.mjs), an ON-DEMAND gate — `npm run
+// verify` is vitest and cannot run XCTest. The runner is `swift test --package-path ios/Tests`,
+// driven by the standalone ios/Tests/Package.swift; the plugin's own Package.swift deliberately
+// declares no testTarget (the reasons are in that file). #376 wired this; before then the file had
+// never executed once — and the fixture path below was off by one directory, which is exactly what
+// an unrunnable test cannot tell you.
+//
+// SCOPE — read this before trusting a green run. `LeaseCore` below is a PORT of the spec, not the
+// shipping arbiter: GameDebugPlugin.evaluateLease/startLeaseGrace still hold their own lease state
+// with a DispatchWorkItem grace timer. So this proves the spec is portable to Swift and pins the
+// contract; it does NOT prove the shipping plugin obeys it. Making it do so is the extraction this
+// comment has always recommended — evaluateLease/startLeaseGrace delegating to a pure,
+// clock-injected, timer-free LeaseCore mirroring the TS spec's lazy expiry — and that is a
+// behavioural native change needing device verification, deliberately left out of #376.
 
 import XCTest
 
@@ -72,11 +81,15 @@ final class LeaseCoreTests: XCTestCase {
     private struct Fixture: Decodable { let graceMs: Int; let steps: [Step] }
 
     func testGoldenVectors() throws {
-        // …/ios/Tests/GameDebugPluginTests/LeaseCoreTests.swift → …/test-vectors/lease-golden-vectors.json
-        let url = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("test-vectors/lease-golden-vectors.json")
+        let url = try Self.goldenVectorsURL()
         let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
+
+        // The TS twin (deviceLeaseGoldenVectors.test.ts) asserts these; these two did not, so an
+        // emptied or truncated fixture replayed zero steps and reported PASS — measured. The gate
+        // these live in is the ONLY one that runs them, so a fixture nobody validates is the whole
+        // check.
+        XCTAssertGreaterThan(fixture.graceMs, 0, "fixture graceMs must be positive")
+        XCTAssertGreaterThan(fixture.steps.count, 0, "fixture has no steps — this test would check nothing")
 
         var core = LeaseCore(graceMs: fixture.graceMs)
         for (i, s) in fixture.steps.enumerated() {
@@ -98,6 +111,23 @@ final class LeaseCoreTests: XCTestCase {
                 XCTFail("unknown op \(s.op)")
             }
         }
+    }
+
+    /// Locate test-vectors/lease-golden-vectors.json by walking UP from this source file.
+    /// Not a fixed number of `deletingLastPathComponent()` calls: that is what silently broke here
+    /// (it stripped three components and landed in ios/), and an unrunnable test cannot report it.
+    private static func goldenVectorsURL() throws -> URL {
+        var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        for _ in 0..<8 {
+            let candidate = dir.appendingPathComponent("test-vectors/lease-golden-vectors.json")
+            if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path { break }
+            dir = parent
+        }
+        throw NSError(domain: "LeaseCoreTests", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "test-vectors/lease-golden-vectors.json not found above \(#filePath)",
+        ])
     }
 
     private func expectedReply(_ e: Expect) -> LeaseCore.Reply {

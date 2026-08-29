@@ -103,6 +103,71 @@ Trails keep a per-particle position-history ring; sub-emitters are depth-1 (a ch
 and sub-emitters are stripped — it's driven purely by injected bursts at the parent's birth/death
 events).
 
+⚠️ **A fresh emitter that declares a sprite texture starts HIDDEN, and this is not cosmetic (#338).**
+`build()` constructs the render objects **and** a new `CpuParticleSim` together, and
+`loadTextureFor` calls it a **second** time when the texture arrives — a sprite texture changes the
+material (textured quad vs. the radial soft-circle alpha), so the billboard cannot simply be
+re-pointed. That second build **discards every live particle and resets the sim clock to 0**,
+which the owner saw as particles "spawning for 1-2 frames, resetting, and continuing".
+
+It only bites the FIRST activation, and the reason is worth knowing: `loadTexture3D` is async even
+on a cache **hit**, but a hit resolves on a microtask — before the next rAF — so a warm texture
+rebuilds before anything is drawn. A **cold** one takes a frame or two, and that rebuild is
+visible. Which is also why restarting always looked clean.
+
+So the throwaway build happens off-screen and the emitter is revealed on the rebuild that has the
+texture: one visible start, no reset, and the sim the player sees begins at t=0 (a burst authored
+at 0 still fires on the frame they first see). **The wait is BOUNDED** —
+`TEXTURE_WAIT_BUDGET_MS` (1500 ms of wall clock, read through `rawNow()`), spent before the play
+gate so a paused emitter cannot be stranded by it. Hiding until the texture lands is right for a
+showcase and wrong for gameplay VFX: a hit spark showing *nothing* while a large or cold KTX2
+transcodes reads as a dropped effect, so past the budget the emitter is revealed untextured and
+picks up its sprite on arrival. A failed load reveals too — a 404 must never hide an emitter
+forever, and neither may a ref that `setDef` swaps away mid-load (that path starts no replacement
+load, so it reveals on the way out). A `setDef` that swaps to a NEW sprite re-arms the wait, because
+the rebuild it triggers is untextured.
+
+⚠️ **This budget was `TEXTURE_WAIT_BUDGET_FRAMES = 6` and both the number and the UNIT were wrong —
+that is the whole of #338's reopen.** The reasoning for frames was "a slower device drawing slower
+frames should get proportionally longer to load", which is backwards: what is being waited on is a
+network fetch plus a transcode, and neither cares about the frame rate (a 120 Hz desktop got 50 ms,
+a 30 Hz phone 200 ms, for the same download). Measured on the deployed
+`modoki-engine.com/particle-demo`, cold, in a fresh Chrome window: the sprite landed **~120 ms**
+after the emitter was created and the budget expired at **~80 ms**, so the very first station
+flashed on every cold load — invisible from the editor and from any warm reload, because a cached
+texture resolves on a microtask. See the reveal-is-not-a-degradation note below for why losing that
+race is so loud.
+
+⚠️ **Revealing untextured is the WRONG MATERIAL, not a lesser one — and describing it as a mild
+degradation is what let the budget stay too small.** An effect that declares a sprite never draws
+the radial fallback in steady state, and the fallback is far brighter per particle: a full-quad
+`radialAlpha()` at opacity 1, where an authored fire or dust sprite is mostly near-transparent.
+Measured on `demos/particle-demo` with texture responses held back at the server (CDP screencast →
+`ffmpeg signalstats` per-frame mean luma): the Fireball station reads **69 untextured at 61
+particles** and **49 textured at 292** — roughly 15x the light per particle — and the 40k GPU Nebula
+pool reaches **241 of 255, a full-screen white wash**. Before/after over the same experiment: 434
+untextured-visible frames and peak luma 241 → **0 frames and peak 121** (Nebula's own legitimate
+steady state) with an 800 ms delay, while a 3000 ms delay still falls back rather than hiding
+forever. That is #338's "burst": not extra particles, the wrong material.
+
+⚠️ **What the budget still does NOT buy:** past it, the late texture arrival still rebuilds, so the
+player sees the full reset rather than a texture pop. The budget trades *silence* for *a visible
+reset*, which is better but is not "no artifact" — removing it means letting the sim survive a
+render rebuild (`CpuParticleSim` holds `out` by reference, so a `setOutputs()` would do it), which
+is a lifecycle change deliberately left for its own change. The deadline is checked before the play
+gate (a paused emitter whose load went stale would otherwise be hidden forever) and in `update()`,
+never inside `advance()`, which `seek()`/`prewarm()` call in a loop — the old counter there measured
+sim steps and a single scrub spent the whole budget. A wall-clock deadline is immune to that by
+construction, since a synchronous loop spends no real time.
+
+⚠️ **`buildChildRender()` rebuilds a sub-emitter child's `sim` as well as its render**, despite the
+name — so the identical defect exists one level down, and a late child texture deletes every
+particle the parent has injected. The child gets the same bounded hidden-wait. Latent today (no
+sub-emitter child in the repo declares a sprite) and reachable the moment one does, which for a
+spark or debris child is an entirely ordinary thing to author. Related: the texture rebuild also
+discards the sim `create()` built **including its prewarm**, so `prewarm` + a texture is re-applied
+after the rebuild rather than silently lost.
+
 ### The GPU sim
 
 `GpuComputeBackend` holds all state in `instancedArray` storage buffers (`pos`, `vel`, a packed
@@ -115,6 +180,53 @@ The render mesh is an `InstancedBufferGeometry` whose per-instance state comes f
 (`.element(instanceIndex)`), not vertex attributes, sidestepping WebGPU's 8-vertex-buffer cap;
 over-life size/opacity/color are sampled from small baked LUT textures (`gpuLut.ts`). Compute is
 dispatched against the renderer that actually draws the mesh, captured via `onBeforeRender`.
+
+⚠️ **That capture creates an ordering hole, and a fresh pool must therefore stay HIDDEN for its
+first frames (#338).** The renderer is only obtainable from `onBeforeRender` — i.e. from a DRAW —
+so the first draw necessarily happens *before* the first `update()` that can dispatch anything.
+Drawing `maxParticles` instances there renders them against buffers the init kernel has not filled:
+on `demos/particle-demo`'s 40k Nebula that is a **full-screen white wash** for the station's opening
+frames. (Not zeroed buffers — zeros give `meta.z = 0` → `scaleNode = 0` → nothing drawn. What reads
+back is stale/recycled pool memory, drawn additively at 40k instances.) So **`build()`** starts the mesh at
+`instanceCount = 0` — `build()`, not `create()`, because it is also the texture-load and `setDef`
+rebuild path, and each of those mints fresh buffers that must be hidden again. `ensurePoolReady()`
+then uploads the over-life LUTs explicitly rather than letting the first draw do it lazily, and
+reveals the pool only after `REVEAL_DELAY_FRAMES` (`gpuPoolReveal.ts`).
+
+⚠️ **The pool waits for its declared SPRITE as well as for its buffers, and until #338's reopen it
+did not.** The CPU backends have held a textured emitter hidden since the first #338 pass; this one
+had no such gate at all, and revealed as soon as `computeInit` completed whatever the texture was
+doing. It is the worst place for the gap, because every effect the router sends here is a `fillPool`
+one — Nebula is 40,000 particles in a single frame — so the untextured build is the 241/255 white
+wash measured above. `revealPool()` therefore has TWO conditions (`!e.mesh || e.awaitingTexture`),
+and the frame backstop in `ensurePoolReady()` is what retries it: the `onSubmittedWorkDone` promise
+fires once, so a reveal blocked there would strand the pool if the counter were not still running
+underneath. Every exit — arrival, failure, a `setDef` that swaps the ref away, the deadline — clears
+`awaitingTexture`, for the same reason the CPU twin does.
+
+⚠️ **Readiness runs even while PAUSED**, before `update()`'s play gate. `seek()` deliberately does
+NOT reveal directly — it steps the buffers itself, but doing so in the same JS call as the dispatch
+is a ZERO-frame boundary, and a one-frame boundary is on the measured disproved list; it restarts
+the countdown and lets `ensurePoolReady` finish. Both matter for the
+Particle Editor, which stops driving `update()` when paused: without them, any structural edit made
+while paused left the preview EMPTY until the user pressed Play. The editor also calls
+`update(handle, 0)` while paused so readiness can converge with no simulation advancing.
+
+**The reveal is driven by a readiness SIGNAL, not by a timer.** `revealWhenGpuWorkDone` takes
+`backend.device.queue.onSubmittedWorkDone()` immediately after the init dispatch — `finishCompute`
+submits each compute group's own command buffer, so that promise resolves once the dispatch has
+actually completed on the device. It cannot fire too early, and it self-tunes across GPUs.
+`REVEAL_DELAY_FRAMES` remains only as a **backstop** for the paths that signal cannot reach: the
+WebGL fallback (no `backend.device`), a lost device, or a browser without the method.
+
+⚠️ **The backstop's value has a cautionary history worth keeping.** It was first bisected on two
+devices and reported as "exactly 3 on both" — which was wrong, not because the measurement was
+sloppy but because **the failure is intermittent and the bisect ran one take per value**. Re-running
+a single build pinned at 3 gave one flash in four takes. The value is now 6 (double the observed
+edge), verified 5/5 by repeated takes. **Never conclude from one run here**, in either direction.
+Method: `screenrecord` a timeline pass → `ffmpeg signalstats` per-frame `YAVG` → compare a station's
+entry against its own steady-state luma, and lock the screen orientation first (black side-bars in
+landscape dilute the mean and make takes incomparable).
 
 ### Shared-math discipline
 
@@ -140,6 +252,57 @@ push `speedScale`, and `update` on the **visual delta** scaled by `playbackSpeed
 
 ## Gotchas
 
+- **2D vs 3D units — the CPU sim is unit-agnostic; EVERY length-dimensioned field means something
+  different per backend, not just `startSize`.** The 3D backends read the sim's output as **metres**
+  (world units); the Pixi 2D backend reads the exact same numbers as **Canvas2D design pixels**
+  (`pixiParticleMap.ts` — position and size both live under the single canvas-slot scale, so the
+  result is device-independent). That covers `startSize` (a TEXTURE MULTIPLIER: rendered height =
+  `startSize × textureHeight` in design px — a 64×128 strip at `startSize: 0.2` renders ~26 design
+  px tall; authoring `startSize: 28` "as pixels" renders the texture at 28× — a full-screen wash) —
+  and identically `startSpeed` (design px/s), `gravity`/`forces` (design px/s²), `shape.radius`/
+  `size`/`points` (design px), and `collision.planePoint`/radius/extents (design px). `drag` is a
+  unitless s⁻¹ rate and does NOT need converting. **There is no auto-conversion** — porting a
+  metre-authored effect to 2D means multiplying every one of those fields by a chosen
+  pixels-per-metre factor `L` (`startSize` is the odd one out: multiply by `L / textureHeightPx`
+  instead). Get one of these wrong (most often: reusing a 3D asset's numbers unchanged in a
+  Canvas2D-parented emitter) and the effect still SIMULATES correctly — it just renders at a
+  fraction of a pixel, indistinguishable from nothing. `PixiParticleBackend` warns once per effect
+  id to the console when an effect looks sub-pixel in 2D (`warnIfSubPixel2D` in
+  `pixiParticleBackend.ts` — a cheap heuristic on `startSize`/`startSpeed`/`startLifetime`, not a
+  hard error), but nothing else signals it: no thrown error, particle count stays nonzero,
+  `modoki_diagnose` reports no issues. **The sprite-size half of that heuristic only applies to
+  the DEFAULT soft-circle texture** — a `render.texture` effect's real size isn't known until the
+  async load completes, so a textured effect is judged on plume reach alone (worse recall, but no
+  false positive on a real sprite sheet authored bigger than the 64px default — confirmed against
+  `games/court`'s shipped win-sequence confetti). The 3D backends are the opposite of all of the
+  above — every one of these fields there IS world units, unscaled.
+- **2D silently ignores `render.mode: 'mesh'` (and trails/sub-emitters).** The Pixi backend only
+  ever draws billboard sprites (`pixiParticleObject.ts`) — a Canvas2D-routed emitter using a
+  mesh-mode 3D effect (`meshPrimitive`/`meshLit`) still renders, just as the default soft-circle
+  sprite instead. Same asset, categorically different look per backend, with no warning.
+- ⚠️ **`render.aspect` COMPOUNDS with the texture's own shape — it is not a correction for it.**
+  The mapping is `scaleX = size × aspect`, `scaleY = size` (`pixiParticleMap.ts`), and both are
+  multipliers on the texture's OWN pixel dimensions. So `aspect` below 1 on an already-tall
+  texture multiplies the tallness: a 64×128 strip at `aspect: 0.5` renders **1:4**, not 1:2.
+  This is what made Court's first confetti invisible (#333) — `startSize: 0.15–0.24` read as
+  "19–31 design px" counting only the height, while the width was 4.8–7.7 px, i.e. a rotating
+  hairline. **Compute BOTH axes before believing a size**: `w = startSize × texW × aspect`,
+  `h = startSize × texH`. `aspect: 1` means "render the texture undistorted", not "square".
+- ⚠️ **2D `noise.frequency` is in DESIGN PIXELS, so the usable values are ~100× smaller than
+  they look.** `accumNoise` (`simSpec.ts`) feeds the particle's raw POSITION into the sine, so the
+  spatial wavelength is `2π / frequency` px: `0.9` is a **7 px** wavelength — every particle
+  jitters — while a visible flutter wants `~0.02` (a ~310 px sway). The 3D backends pass world
+  units, where `0.9` is the sane end of the range; the number does not transfer between spaces.
+  Pair it with `strength`, which is an acceleration in px/s² (peak `2 × strength`).
+- **Untextured 2D particles render as soft round blobs** — the default texture is a radial
+  alpha falloff (`pixiParticleObject.ts`), so "plain coloured squares" is not what you get.
+  Confetti/paper effects need a real strip texture (`render.texture`), authored near-white so
+  `startColor` multiplies it cleanly.
+- **2D `render.renderOrder` must exceed the canvas's whole paint rank.** A Canvas2D slot sorts
+  children by zIndex, and every Renderable2D's zIndex is a DENSE rank over ALL entities
+  (`computePaintOrder`: orderInLayer primary, hierarchy DFS tiebreak) — on a real board that
+  runs well past 100, so `renderOrder: 100` lands mid-board and the effect draws behind cells.
+  Use ~1e6 (Scene2D's own "above every sprite" idiom is 1e9).
 - **CPU is deterministic; GPU is not headless-testable.** Only the CPU sim can be driven headless
   with a fixed seed. GPU↔CPU parity is maintained *by construction* via `simSpec.ts` transcription,
   not by a test — so edits to the shared math must touch both sides. `simSpec.ts`, `emitterShapes.ts`,

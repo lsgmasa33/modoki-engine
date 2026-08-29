@@ -35,8 +35,15 @@ public final class OtaCoreSelfTest {
       String json = new String(Files.readAllBytes(root.resolve(file)));
       @SuppressWarnings("unchecked")
       Map<String, Object> parsed = (Map<String, Object>) MinimalJson.parse(json);
+      checkConstants(file, parsed);
       @SuppressWarnings("unchecked")
       List<Object> scenarios = (List<Object>) parsed.get("scenarios");
+      // PER FILE, not over the total: with two vector files, emptying one still left the total
+      // positive and both replays reported green — measured, on the first version of this check.
+      if (scenarios == null || scenarios.isEmpty()) {
+        System.err.println("no scenarios in " + file + " — this self-test would check nothing");
+        System.exit(1);
+      }
       for (Object rawObj : scenarios) {
         @SuppressWarnings("unchecked")
         Map<String, Object> raw = (Map<String, Object>) rawObj;
@@ -50,6 +57,28 @@ public final class OtaCoreSelfTest {
       System.exit(1);
     }
     System.out.println("All " + total + " OTA golden-vector scenarios passed.");
+  }
+
+  /** The vector files declare `constants`, and until this was added NOTHING read them: the fixture
+   *  could say maxAttempts:4 while both implementations used 3, and all 27 scenarios still passed
+   *  (measured, 2026-08-27). Twin of OtaCoreTests.testFixtureConstantsMatchImplementation. */
+  private static void checkConstants(String file, Map<String, Object> parsed) {
+    Object raw = parsed.get("constants");
+    if (!(raw instanceof Map)) return;
+    @SuppressWarnings("unchecked")
+    Map<String, Object> constants = (Map<String, Object>) raw;
+    expectConstant(file, "maxAttempts", constants, OtaCore.MAX_ATTEMPTS);
+    expectConstant(file, "requiredConfirms", constants, OtaCore.REQUIRED_CONFIRMS);
+  }
+
+  private static void expectConstant(String file, String key, Map<String, Object> constants, int actual) {
+    Object v = constants.get(key);
+    if (!(v instanceof Number)) return;
+    int expected = ((Number) v).intValue();
+    if (expected != actual) {
+      failures++;
+      System.err.println("FAIL " + file + " constants." + key + ": fixture=" + expected + " impl=" + actual);
+    }
   }
 
   private static void runScenario(Map<String, Object> raw) {

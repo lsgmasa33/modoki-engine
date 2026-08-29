@@ -2,12 +2,13 @@ import React, { Component, lazy, Suspense, useEffect, useRef, useState } from 'r
 import type { ErrorInfo, ReactNode } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend } from '@modoki/engine/runtime';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint } from '@modoki/engine/runtime';
 import { App as CapacitorApp } from '@capacitor/app';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
 import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
 import LoadingOverlay from './ui/components/LoadingOverlay';
+import { dismissBootSplash, hasBootSplash, BOOT_SPLASH_TIMEOUT_MS } from './ui/bootSplash';
 import { initWorldSync } from './ecs/init';
 import { runPipeline } from './ecs/pipeline';
 import { GAMES } from 'virtual:modoki-games';
@@ -151,7 +152,54 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
    *  A ref rather than state: it is read inside the load effect and must never re-run it. */
   const no3DTierLoopRef = useRef(false);
 
-  useEffect(() => subscribeOtaGate(setOtaGate), []);
+  useEffect(() => subscribeOtaGate((gate) => {
+    // An OTA gate must be SEEN. The boot splash outranks every boot surface by z-index, so a
+    // download that starts before the game is ready would otherwise show a still launch image for
+    // however long the download takes — indistinguishable from a hang, on exactly the slow
+    // connection where it lasts longest.
+    if (gate) dismissBootSplash();
+    setOtaGate(gate);
+  }), []);
+
+  // ⚠️ The boot splash outranks EVERY other surface by z-index, so any path that ends with the
+  // user looking at the app has to take it down — otherwise a real, explained failure is a static
+  // launch image forever. Three nets, because the success path alone is not enough:
+  //
+  //  1. any `error` state (the unknown-gameId early return below never reaches the try/catch,
+  //     and `gameId` comes from the URL hash — a stale bookmark or a deep link reaches it);
+  //  2. a hard TIMEOUT, which is the only thing that covers a render-time throw caught by
+  //     `<ErrorBoundary>` (its fallback renders inside this component, i.e. UNDER the splash) and
+  //     a boot that simply never completes — the two rAFs the load path awaits do not fire in a
+  //     backgrounded tab;
+  //  3. the success and OTA paths, below.
+  useEffect(() => { if (error) dismissBootSplash(); }, [error]);
+
+  // Hand the NATIVE splash over to the web boot splash as soon as the latter is on screen, rather
+  // than holding it until the game is ready.
+  //
+  // ⚠️ This is what makes the authored splash visible on Android at all. From API 31 the platform
+  // draws its OWN splash — an icon on a solid colour — and ignores the generated drawables
+  // entirely (measured on an S22, API 34); a full-bleed image is not expressible there, by
+  // platform design. So the art has to come from the web layer, and it cannot if the native
+  // splash covers the web view until the game has already painted.
+  //
+  // Phase 3b held it until fully-booted so nobody saw an unstyled white web view. That reason is
+  // gone: the web view's FIRST PAINT is now the boot splash, the same artwork. The hold therefore
+  // stays in place for any project that has no boot splash to hand over to — which is the
+  // `hasBootSplash()` condition, not a nicety.
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform() || !hasBootSplash()) return;
+    import('@capacitor/splash-screen')
+      .then((m) => m.SplashScreen.hide())
+      .catch((e) => {
+        if (isPluginUnimplemented(e)) console.log('[GameShell] no SplashScreen plugin — early hide skipped');
+        else console.warn('[GameShell] early SplashScreen.hide failed (non-fatal):', e);
+      });
+  }, []);
+  useEffect(() => {
+    const t = window.setTimeout(dismissBootSplash, BOOT_SPLASH_TIMEOUT_MS);
+    return () => window.clearTimeout(t);
+  }, []);
 
   useEffect(() => {
     const def = findGame(gameId);
@@ -177,6 +225,11 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
     setError(null);
 
     let cancelled = false;
+    /** Cancel token for the awaits that park on something OTHER than a promise this body owns —
+     *  today the render-readiness wait (#334), which would otherwise hold its 5 s timer alive
+     *  after a game change. `cancelled` still guards every resumption point; this makes the
+     *  waiter itself let go rather than merely being ignored when it lands. */
+    const abortBoot = new AbortController();
     const isFirstLoad = !initializedRef.current;
 
     // Show overlay for game-to-game transitions. For first load, the opaque
@@ -386,10 +439,38 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
           if (cancelled) return;
         }
 
-        // Wait for two render frames after the world swap so syncRenderables
-        // populates meshes and the renderer paints them. Without this, the
-        // overlay hides before meshes appear, exposing the empty sky background
-        // for a few frames (race between swap and first populated render).
+        // ⭐ WAIT FOR THE RENDERER TO ACTUALLY PAINT THIS SCENE (#334).
+        //
+        // This used to be the two-rAF wait alone, with a comment naming the very failure it then
+        // shipped: two frames is a HEURISTIC, and `liveCompileGate` holds `Scene3D`'s submit for
+        // as long as the post-swap live compile takes — 300 ms to 1 s on a mid-tier Android, i.e.
+        // tens of frames. So the overlay hid, and the game's permanent HUD (title text, D-pad)
+        // appeared over a flat dark canvas with nothing 3D drawn. Measured on a Galaxy A23 cold-
+        // booting `demos/forest-camp`. The owner's verdict on seeing it: render NOTHING rather
+        // than a half state.
+        //
+        // `waitForScenePaint` resolves on the first frame `Scene3D` actually SUBMITS after the
+        // swap, so the hold and the overlay are finally the same decision. It resolves instantly
+        // when that frame already landed (the ordinary trivial-compile case — no added delay), and
+        // it is bounded by its own 5 s ceiling, mirroring the render-level hold's, so a renderer
+        // that never draws cannot leave the overlay up forever.
+        //
+        // ⚠️ GATED ON `no3D` — the same condition that decides whether `Scene3D` is rendered at
+        // all (`config.disable3D || !Scene3D`). A project with no 3D surface has nothing to arm or
+        // mark the signal, so awaiting it there would buy a 5 s stall on every boot. And on
+        // `bootScenePath`, because no scene load means no world swap means nothing armed.
+        if (!no3D && bootScenePath) {
+          const paint = await waitForScenePaint({ signal: abortBoot.signal });
+          if (paint === 'timeout') {
+            console.warn('[GameShell] renderer did not paint the loaded scene before the readiness ceiling — revealing the game anyway');
+          }
+          if (cancelled) return;
+        }
+        // …and THEN two render frames, as before: `syncRenderables` must place whatever
+        // `onSceneReady` just spawned (content generated at runtime is not in the scene at swap
+        // time, so the paint above cannot have included it), and the submitted frame has to reach
+        // the swapchain. Kept as well as the wait above, not replaced by it — they cover different
+        // halves of "there is something under the overlay".
         await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
         if (cancelled) return;
 
@@ -430,6 +511,12 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
             });
         }
 
+        // The WEB boot splash, on the same "fully booted" signal as the native one above — the two
+        // are the same artwork, so the handoff is one continuous image rather than a cut to dark
+        // navy. A no-op wherever no boot splash was injected (dev, editor, playable, or a project
+        // that has authored no splash).
+        dismissBootSplash();
+
         activeGameIdRef.current = gameId;
         initializedRef.current = true;
         setInitialized(true);
@@ -437,13 +524,16 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
       } catch (e) {
         if (!cancelled) {
           console.error('[GameShell] Failed to load game:', e);
+          // Take the splash down so the error is SEEN: it outranks every boot surface by z-index,
+          // so leaving it up turns an explained failure into an apparent hang.
+          dismissBootSplash();
           setError(String(e));
           setTransitioning(false);
         }
       }
     })();
 
-    return () => { cancelled = true; };
+    return () => { cancelled = true; abortBoot.abort(); };
     // ⚠️ `[gameId]` ONLY — see the `configReadyRef`/`initializedRef` note above (#267). This
     // effect writes `configReady` and `initialized`; listing either here makes it re-run
     // itself and double-drive every registration in the body.

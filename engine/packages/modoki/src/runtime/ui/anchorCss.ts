@@ -16,7 +16,8 @@ import { STRETCH_X, STRETCH_Y, type AnchorData } from './anchorLayout';
 
 export type AnchorCssData = AnchorData & { zIndex?: number };
 
-/** Compose a UIElement's tilt onto whatever transform the anchor already wrote (#234).
+/** Compose a UIElement's tilt AND scale onto whatever transform the anchor already wrote
+ *  (#234 tilt, #340 scale).
  *
  *  Must run AFTER `applyAnchorStyle`, and appends rather than assigns: the anchor's pivot
  *  `translate()` is what POSITIONS the element, so replacing it would move the element instead of
@@ -29,17 +30,31 @@ export type AnchorCssData = AnchorData & { zIndex?: number };
  *  origin stays at the centre; an element with no anchor at all is in flow layout and likewise
  *  rotates about its centre.
  *
- *  A zero angle writes NOTHING — not `rotate(0deg)`, not an origin. Every element that predates
- *  this field must emit byte-identical CSS, and a stray transform would hand it a stacking context
- *  it never had (see the trait's warning). */
-export function applyRotationStyle(style: CSSProperties, degrees: number, a?: AnchorCssData): void {
-  if (!degrees) return;
+ *  **Scale honours the same pivot**, for the same reason: a dialog that pops in must grow out of
+ *  the point it is anchored by, or it slides across the screen as it grows. Uniform scale and
+ *  rotation commute about a shared origin, so the order the two are appended in cannot matter.
+ *
+ *  An IDENTITY transform writes NOTHING — not `rotate(0deg)`, not `scale(1)`, not an origin. Every
+ *  element that predates these fields must emit byte-identical CSS, and a stray transform would
+ *  hand it a stacking context it never had (see the trait's warning). That is also why `scale`
+ *  defaults to 1 and is checked against 1 rather than falsy: `scale: 0` is a legitimate authored
+ *  value (a pop-in clip's first keyframe) and must still emit `scale(0)`. */
+export function applyRotationStyle(
+  style: CSSProperties, degrees: number, a?: AnchorCssData, scale = 1,
+): void {
+  const tilted = !!degrees;
+  const scaled = scale !== 1;
+  if (!tilted && !scaled) return;
   if (a) {
     const ox = STRETCH_X.includes(a.anchor) ? 50 : a.pivotX * 100;
     const oy = STRETCH_Y.includes(a.anchor) ? 50 : a.pivotY * 100;
     style.transformOrigin = `${ox}% ${oy}%`;
   }
-  style.transform = style.transform ? `${style.transform} rotate(${degrees}deg)` : `rotate(${degrees}deg)`;
+  const parts: string[] = [];
+  if (tilted) parts.push(`rotate(${degrees}deg)`);
+  if (scaled) parts.push(`scale(${scale})`);
+  const composed = parts.join(' ');
+  style.transform = style.transform ? `${style.transform} ${composed}` : composed;
 }
 
 /** The CSS expression for ONE safe-area edge: the editor's simulated inset if a device

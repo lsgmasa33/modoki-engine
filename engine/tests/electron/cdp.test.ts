@@ -8,6 +8,7 @@ import {
   DEFAULT_CDP_PORT,
   resolveCdpPort,
   resolveCdpConfig,
+  isValidCdpPort,
   readCdpEnabled,
   writeCdpEnabled,
   probeCdp,
@@ -122,6 +123,103 @@ describe('resolveCdpConfig', () => {
   it('DEV ignores the memo entirely (the launcher owns the port)', () => {
     const c = resolveCdpConfig({ isPackaged: false, prefEnabled: false, env: {}, memo: { port: 9224, ours: false } });
     expect(c.port).toBe(DEFAULT_CDP_PORT); // reported default, memo not consulted
+  });
+
+  // ── Observed switch beats the environment (#356) ──
+  //
+  // `launch-editor.sh` passes --remote-debugging-port as an argv FLAG and never exports
+  // MODOKI_CDP_PORT, so a bare launch gives Chromium a live endpoint with nothing in main's
+  // env. Reading the env there reported `cdpEnabled:false` for CDP that was genuinely bound.
+  // These pin the direction of the fix: `switchPort` is an OBSERVATION and outranks both the
+  // env (a request) and the pref (a preference).
+  it('dev + observed switch, NOTHING in the env → enabled on the observed port (#356)', () => {
+    const c = resolveCdpConfig({ isPackaged: false, prefEnabled: false, env: {}, switchPort: '9223' });
+    expect(c.enabled).toBe(true);
+    expect(c.port).toBe(9223);
+    expect(c.openSwitch).toBe(false); // still the launcher's arg, not ours to re-open
+  });
+
+  it('the observed switch WINS over a disagreeing MODOKI_CDP_PORT — Chromium bound the switch', () => {
+    const c = resolveCdpConfig({ isPackaged: false, prefEnabled: false, env: { MODOKI_CDP_PORT: '9999' }, switchPort: '9223' });
+    expect(c.port).toBe(9223); // the env asked for 9999; 9223 is what is actually listening
+    expect(c.enabled).toBe(true);
+  });
+
+  it('an INVALID observed switch fails CLOSED to the env/pref path, never to a bogus port', () => {
+    for (const bad of ['', '0', 'nope', '70000', '-5']) {
+      const c = resolveCdpConfig({ isPackaged: false, prefEnabled: false, env: {}, switchPort: bad });
+      expect(c.enabled, `switchPort=${JSON.stringify(bad)}`).toBe(false);
+      expect(c.port, `switchPort=${JSON.stringify(bad)}`).toBe(DEFAULT_CDP_PORT);
+    }
+  });
+
+  it('an absent switch leaves DEV exactly as it was (no switch, no env → disabled)', () => {
+    for (const absent of [undefined, null]) {
+      const c = resolveCdpConfig({ isPackaged: false, prefEnabled: false, env: {}, switchPort: absent });
+      expect(c.enabled).toBe(false);
+    }
+  });
+
+  // Packaged reads the switch BEFORE appending its own, so anything observed came from the
+  // OS/CLI. Reporting it is right; re-appending a second value is not — the FIRST is what binds.
+  it('packaged + a switch already on the command line → enabled, but does NOT re-append it', () => {
+    const c = resolveCdpConfig({ isPackaged: true, prefEnabled: false, env: {}, switchPort: '9310' });
+    expect(c.enabled).toBe(true);
+    expect(c.port).toBe(9310);
+    expect(c.openSwitch).toBe(false);
+  });
+
+  it('packaged with NO observed switch is unchanged — the pref still opens it', () => {
+    const c = resolveCdpConfig({ isPackaged: true, prefEnabled: true, env: {}, switchPort: '' });
+    expect(c.enabled).toBe(true);
+    expect(c.openSwitch).toBe(true);
+    expect(c.port).toBe(DEFAULT_CDP_PORT);
+  });
+
+  it('accepts a NUMBER switchPort, not just a string (the widened half of the contract)', () => {
+    const c = resolveCdpConfig({ isPackaged: false, prefEnabled: false, env: {}, switchPort: 9223 });
+    expect(c.enabled).toBe(true);
+    expect(c.port).toBe(9223);
+  });
+
+  // ⚠️ The one input where REPORTING and APPENDING must disagree. A present-but-junk switch names
+  // no port we can report (Chromium parses it as 0 and takes an ephemeral one), so `enabled` falls
+  // back to the pref — but the flag IS on the command line, so appending a second value would
+  // create a duplicate whose winner nobody has measured. Never create one.
+  it('packaged + a PRESENT but INVALID switch → does not append a SECOND flag', () => {
+    for (const junk of ['abc', '0', '70000', '-5', '1e3', '0x2400', ' 9223']) {
+      const c = resolveCdpConfig({ isPackaged: true, prefEnabled: true, env: {}, switchPort: junk });
+      expect(c.openSwitch, `switchPort=${JSON.stringify(junk)}`).toBe(false);
+      // Still reports the pref-driven default rather than a port we cannot vouch for.
+      expect(c.port, `switchPort=${JSON.stringify(junk)}`).toBe(DEFAULT_CDP_PORT);
+    }
+  });
+
+  it('an observed port is NOT fed to the sticky ladder — the ladder is for ports WE pick', () => {
+    // Pairs with rememberCdpPort's `!CDP.openSwitch` guard: openSwitch false here is what stops a
+    // hand-typed --remote-debugging-port from being written into the memo and stuck on forever.
+    const c = resolveCdpConfig({ isPackaged: true, prefEnabled: true, env: {}, switchPort: '9350', memo: { port: 9224, ours: true } });
+    expect(c.port).toBe(9350);   // reported, because that IS what is bound
+    expect(c.openSwitch).toBe(false); // but never memoised — main gates the write on this
+  });
+});
+
+describe('isValidCdpPort — decimal digits only, matching Chromium\'s parser (#356 review)', () => {
+  it('accepts plain decimal, as a string or a number', () => {
+    for (const ok of ['9222', '1', '65535', 9222, 1, 65535]) expect(isValidCdpPort(ok), String(ok)).toBe(true);
+  });
+
+  it('rejects what Number() would silently accept but base::StringToInt does not', () => {
+    // Each of these previously passed and would have had main report a port Chromium never bound.
+    for (const bad of ['1e3', '0x2400', ' 9223', '9223 ', '+9223', '9223.0']) {
+      expect(isValidCdpPort(bad), JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it('still rejects the out-of-range and empty cases', () => {
+    for (const bad of ['0', '70000', '-5', '', ' ', null, undefined, {}, []]) {
+      expect(isValidCdpPort(bad), JSON.stringify(bad)).toBe(false);
+    }
   });
 });
 

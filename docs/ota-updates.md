@@ -378,6 +378,12 @@ The pure state machine is replayed by **both** platforms against the same shared
 `ota-gate-vectors-phase3.json` (quarantine), 27 scenarios total. A native divergence between
 Swift and Java fails there instead of shipping.
 
+**Both replays are legs of `npm run test:native`** (`engine/scripts/test-native.mjs`) — the
+on-demand native gate, added in #376. Until then they existed only as the two hand-typed recipes
+below, so they ran when somebody remembered; the runner reports a leg it cannot run on this machine
+as a loud SKIP rather than a silent absence. `npm run verify` is vitest and can run neither, so
+their silence there is deliberate. The equivalent by hand:
+
 ```
 cd engine/packages/capacitor-modoki-ota/core && swift test
 cd engine/packages/capacitor-modoki-ota && javac -d /tmp/x \
@@ -388,6 +394,19 @@ cd engine/packages/capacitor-modoki-ota && javac -d /tmp/x \
 Both harnesses have been sanity-checked by deliberately sabotaging a constant and
 confirming the suite catches it — they are real assertions, not passing scaffolding. The
 JS client has its own unit suite (`engine/packages/modoki/tests/runtime/ota/`).
+
+Two gaps found while wiring the runner (2026-08-27), one closed and one open:
+
+- **Closed.** The vector files declare a `constants` block (`maxAttempts`, `requiredConfirms`) that
+  NOTHING read: setting `maxAttempts: 4` in the fixture left both implementations on 3 and all 27
+  scenarios still passed. Both replays now assert the fixture's constants against `OtaCore`'s own
+  (`testFixtureConstantsMatchImplementation` / `checkConstants`), and that check was verified to go
+  red under exactly that edit.
+- **Open.** `OtaZipTests.testRoundTripAgainstNodeProducedZip` XCTSkips unless `/tmp/ota-test.zip`
+  exists, and its header's regeneration command is elided (`...`). So the cross-tool ZIP check —
+  the one that proves `OtaZip` parses authentic ZIP structure rather than its own writer's output —
+  does not run in the gate. Restoring the exact fixture command, or building it in-test, would
+  close it.
 
 `games/ota-test` is the committed device-verification fixture (both native targets, a
 full-screen "OTA TEST vN" scene so a glance at the phone identifies the running bundle).

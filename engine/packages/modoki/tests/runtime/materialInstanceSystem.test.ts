@@ -334,6 +334,42 @@ describe('materialInstanceSystem', () => {
     expect((mesh.material as { opacity: number }).opacity).toBeCloseTo(0.5, 9);
   });
 
+  it('a same-index respawn clones from its OWN baked array, not the dead entity\'s (#336)', () => {
+    // `_defaultBaseCache` is keyed by `entity.id()` — the masked index, generation stripped — and
+    // is cached "forever" (re-reading `mesh.material` after a clone is bound would thrash it).
+    // "Forever" outlives the entity: koota's free list is LIFO, so a despawn immediately followed
+    // by a same-shape respawn reclaims the exact index, and the cache handed the NEWCOMER the dead
+    // entity's material array to clone from. Found sweeping #336's pattern; fixed by stamping the
+    // koota generation on the entry, the same idiom the physics systems use for `BodyRec`.
+    const world = newWorld();
+    spawnTime(world);
+    const ov = [{ target: 'roughness', kind: 'prop' as const, source: { type: 'constant' as const, value: 0.1 } }];
+
+    const deadSlot = makeMaterial({ roughness: 0.5, tag: 'dead' });
+    const a = world.spawn(MaterialInstance({ overrides: ov }), Renderable3DPrimitive({ material: '' }));
+    fakeObjects.set(a.id(), [meshWith([deadSlot, makeMaterial({ roughness: 0.5 })])]);
+    materialInstanceSystem(world);
+
+    a.destroy();
+    const liveSlot = makeMaterial({ roughness: 0.5, tag: 'live' });
+    const b = world.spawn(MaterialInstance({ overrides: ov }), Renderable3DPrimitive({ material: '' }));
+    // Precondition: the index really was reused, but the packed entity differs. Asserted so this
+    // fails loudly rather than passing vacuously if koota's free list stops being LIFO.
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+    const bMesh = meshWith([liveSlot, makeMaterial({ roughness: 0.5 })]);
+    fakeObjects.set(b.id(), [bMesh]);
+    materialInstanceSystem(world);
+
+    // `b`'s clone must derive from ITS OWN slots. Before the fix `resolvePropBase` returned the
+    // cached dead array, so `b` rendered a clone of the previous entity's materials.
+    const clone = bMesh.material as { tag?: string }[];
+    expect(Array.isArray(clone)).toBe(true);
+    expect(clone[0].tag).toBe('live');
+    expect(clone[0]).not.toBe(liveSlot);          // still a clone, not the base itself
+    expect(liveSlot.roughness).toBe(0.5);         // base untouched
+  });
+
   it('drives a prop from a time source and keeps ONE clone across frames', () => {
     const world = newWorld();
     spawnTime(world, 0.1);

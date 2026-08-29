@@ -115,7 +115,7 @@ export function isUsable(d: AndroidDevice): boolean {
  *
  *  Format, which the parse depends on:
  *    List of devices attached
- *    ASJ6R19826001453   device usb:2-1.4.3 model:MRD_LX3 device:HWMRD transport_id:3
+ *    FAKESERIAL0Y6001   device usb:2-1.4.3 model:MRD_LX3 device:HWMRD transport_id:3
  *    RFDEADBEEF2        unauthorized usb:2-1.1
  *    emulator-5554      device product:sdk_gphone64_arm64 model:sdk_gphone64_arm64
  *

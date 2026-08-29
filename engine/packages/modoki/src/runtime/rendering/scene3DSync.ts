@@ -46,6 +46,7 @@ import {
   getRenderSettings, resolveToneMapping, getEffectiveThreeSettings, getActiveTierOverrides,
 } from './renderSettings';
 import { tierShadowMapSize, tierAllowsIBL, tierAmbientBoost, tierExposureBoost, shadowBiasScale } from './qualityTier';
+import { worldWillUseStack } from './postfx/postFXTraitScan';
 import { armAutoLightCap, autoCapMaskFor, isAutoLightCapEngaged } from './autoLightCapFrame';
 import { armShadowCasterCap, shadowCasterAllowed } from './shadowCasterCapFrame';
 import { casterTypeOf, keptShadowCasters, type ShadowCaster } from './shadowCasterCap';
@@ -66,7 +67,7 @@ import {
   beginLightMaskFrame, getMaskedMaterial, isLightMaskingActive, maskNeedsVariant, baseOf, retireVariantsOf,
   DEFAULT_RENDERING_LAYER_MASK, type MaskedLight, type LightingFactory,
 } from './lightMaskVariants';
-import { markDerived, collectDerivedChain, retireDerivedMaterial, retiredDerivedMaterials, retiredDerivedCount, disposeRetiredDerivedMaterial } from './derivedMaterials';
+import { cloneDerived, collectDerivedChain, retireDerivedMaterial, retiredDerivedMaterials, retiredDerivedCount, disposeRetiredDerivedMaterial } from './derivedMaterials';
 import { getActiveRenderer } from '../core/activeRenderer';
 import { setActiveRenderer } from '../loaders/textureResolver';
 import { PARTICLE_LAYER } from './layers';
@@ -131,7 +132,13 @@ function tintedMaterial(basePath: string, color: number, amount: number): THREE.
     retireDerivedMaterial(stale, () => stale.dispose());
     _tintMaterials.delete(key);
   }
-  const clone = markDerived(base.clone(), base);
+  // `cloneDerived`, not a bare `.clone()` (#325) — a TSL/file-shader base parks real
+  // `THREE.Texture` objects at `userData.textures`, which `Material.copy()` would JSON-round-trip
+  // into this clone one serialised texture at a time. A tint clone must not carry that list anyway:
+  // it is a texture-OWNERSHIP record, and both readers (`disposeMaterial` and `materialTextures`,
+  // the latter behind the `onAssetInvalidated('texture')` listener) walk `materialCache` — i.e.
+  // BASES only, never a clone.
+  const clone = cloneDerived(base, base);
   (clone as unknown as { color?: THREE.Color }).color?.setHex(color);
   (clone as unknown as { nprColorPreserve: number }).nprColorPreserve = amount;
   _tintMaterials.set(key, { clone, base });
@@ -1509,7 +1516,9 @@ function syncMaterial(
 function lightMaskFor(renderableMask: number, obj: THREE.Object3D): number {
   if (!isAutoLightCapEngaged()) return renderableMask;
   const p = obj.matrixWorld.elements;
-  return autoCapMaskFor(renderableMask, p[12], p[13], p[14]);
+  // `obj` doubles as the hysteresis identity (#353) — the same Object3D every frame for a given
+  // entity, so its previously-kept local lights are remembered across frames.
+  return autoCapMaskFor(renderableMask, p[12], p[13], p[14], obj);
 }
 
 function applyLightMask(obj: THREE.Object3D, mask: number): void {
@@ -2590,7 +2599,12 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
   // when the tier's caps would actually restrict something (`high` never can — its caps are 0 =
   // unlimited), so the common path is untouched. When it engages it also ARMS masking, since the
   // scene itself may have authored nothing.
-  const capEngaged = armAutoLightCap(_maskedLights, getActiveTierOverrides());
+  // `state` doubles as the hysteresis memory's per-surface key (#353 review) — SceneView and the
+  // Game panel's `Scene3D` each own their own `RenderState` and their own `THREE.Light` instances
+  // for the same scene, so a shared memory would see two different light sets alternate every
+  // call and permanently invalidate itself. One `RenderState` per surface (see its own header
+  // note) makes it the identity already at hand here.
+  const capEngaged = armAutoLightCap(_maskedLights, getActiveTierOverrides(), state);
   beginLightMaskFrame(_maskedLights, anyRenderableMasked || capEngaged);
 
   // ── GLB meshes (Renderable3D) ─────────────────────────
@@ -3464,27 +3478,12 @@ function sidePinnedVariants(material: THREE.Material): THREE.Side[] {
  *  the key — and `_listeners` in particular MUST NOT be shared, or a dispose on either material
  *  would fire the other's handlers. */
 export function pinnedSideClone(material: THREE.Material, side: THREE.Side): THREE.Material {
-  // ⚠️ `Material.copy()` deep-copies `userData` with `JSON.parse(JSON.stringify(...))`, and #136's
-  // light-mask variants park the BASE MATERIAL object in there (`baseOf`). So a naive
-  // `material.clone()` serialises an entire material graph — textures included — during the exact
-  // phase this code exists to make cheap, and a compressed texture cannot be serialised at all, so
-  // it logs `THREE.Texture: Unable to serialize Texture.` per clone and yields garbage. Measured
-  // on `demos/postfx-demo`: 18 such warnings the first time this shipped. `userData` is one of the
-  // properties `getMaterialCacheKey()` explicitly SKIPS, so an empty one on the clone is free.
-  const savedUserData = material.userData;
-  let clone: THREE.Material;
-  material.userData = {};
-  // Stamped HERE, at the clone site (#318) — `pinnedSideClone` has two callers (the live
-  // compile's stand-ins and the prewarm's side-pinned variants) and the sweep learns a clone
-  // holds its base only from this stamp. Same line, as `materialCloneStamp.test.ts` requires.
-  try { clone = markDerived(material.clone(), material); } finally { material.userData = savedUserData; }
-  const src = material as unknown as Record<string, unknown>;
-  const dst = clone as unknown as Record<string, unknown>;
-  for (const key of Object.keys(src)) {
-    if (/^(is[A-Z]|_)/.test(key)) continue;
-    if (Object.prototype.hasOwnProperty.call(dst, key)) continue;
-    dst[key] = src[key];
-  }
+  // The `userData`-suppressing clone and the own-property carry that used to live here are now
+  // `cloneDerived` (#325) — the prewarm was the FIRST site to need them, and videoTextureSync
+  // turned out to be the second, having hit the identical trap independently. Read that function's
+  // header for the two failure modes; the stand-ins' own stamping requirement (#318) is satisfied
+  // inside it, on the clone line, exactly as `materialCloneStamp.test.ts` requires.
+  const clone = cloneDerived(material, material);
   clone.side = side;
   return clone;
 }
@@ -3605,6 +3604,37 @@ async function prewarmShadersForWorldInner(
   // throwaway scene still dies.
   registerRenderSurface(prewarmScene);
   let count = 0;
+
+  /** Will the incoming world be drawn through a post-FX stack? If so, EVERY per-(mesh, material)
+   *  placeholder below is provably worthless and this pass places none of them (#324b).
+   *
+   *  Two independent reasons, either of which alone is fatal, both measured rather than argued:
+   *  the placeholders compile in the CANVAS render context at call depth 0 while the stack draws
+   *  the scene through its own pass at depth 1 (`context.id` keys the node-builder cache — see
+   *  docs/rendering.md sharp edge 3), and the materials the render actually binds are
+   *  per-(material, light-selection) variant CLONES that `applyLightMask` mints from live
+   *  `THREE.Light` instances a pre-swap copy cannot reproduce, and whose cache the swap disposes
+   *  anyway. Measured on `demos/postfx-demo` with `nodeprobe.mjs` (2026-08-26): the prewarm builds
+   *  9 node-builder states in `ctx 0` costing 163 ms, the live post-swap compile builds 22 in the
+   *  stack's `ctx 4`, and the overlap between the two sets is ZERO.
+   *
+   *  ⚠️ **This is a SKIP, not a delete.** The F4 placeholder below is forced on regardless (see its
+   *  note), because the first-compile race it guards has nothing to do with post-FX and everything
+   *  to do with a normal material being the renderer's first compile. What the world loses here is
+   *  covered by `compileLiveScene`, which runs after the swap through the stack's own pass — the
+   *  only half that CAN be right under a stack.
+   *
+   *  ⚠️ The predicate deliberately shares `Scene3D`'s trait enumeration rather than re-listing the
+   *  post-FX traits (`postfx/postFXTraitScan.ts`). A second list here would silently stop matching
+   *  the moment a sixth post-FX trait is added — and it would fail in the expensive direction:
+   *  reporting "no stack" for a world that gets one, so this pass resumes paying for placeholders
+   *  nothing reads. */
+  const willUseStack = worldWillUseStack(world, {
+    isWebGPU: (renderer as { isWebGPURenderer?: boolean }).isWebGPURenderer === true,
+  });
+  /** Read at each walk below. Named rather than inlined as `!willUseStack` so the reason a walk is
+   *  skipped is legible at the walk. */
+  const walkPlaceholders = !willUseStack;
 
   // Lights are disposed at the end of this call; everything else the prewarm mints outlives it
   // (see `_prewarmRetained`). GLB template geometries/materials are SHARED and never disposed here.
@@ -3775,7 +3805,7 @@ async function prewarmShadersForWorldInner(
     }
   });
 
-  world.query(Renderable3D).updateEach(([rend]: [{ isVisible: boolean; mesh: string; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
+  if (walkPlaceholders) world.query(Renderable3D).updateEach(([rend]: [{ isVisible: boolean; mesh: string; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
     if (!rend.isVisible || !rend.mesh) return;
     // Shadow flags join the dedupe key (#238): they are part of the pipeline key, not a uniform,
     // so two entities sharing a (mesh, material) pair but differing in what they cast or receive
@@ -3795,7 +3825,7 @@ async function prewarmShadersForWorldInner(
     count += place(template.geometry, material, mirrored, (o) => applyShadowFlags(o, rend.castShadow, rend.receiveShadow));
   });
 
-  world.query(Renderable3DPrimitive).updateEach(([rend]: [{ isVisible: boolean; mesh: string; size: number; color: number; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
+  if (walkPlaceholders) world.query(Renderable3DPrimitive).updateEach(([rend]: [{ isVisible: boolean; mesh: string; size: number; color: number; material: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
     if (!rend.isVisible) return;
     const mirrored = isMirrored(entity.id());
     if (skip(`p|${rend.mesh}|${rend.material}|${shadowFlagsKey(rend.castShadow, rend.receiveShadow)}|${mirrored ? 'm' : ''}`)) return;
@@ -3848,7 +3878,7 @@ async function prewarmShadersForWorldInner(
   /** Rigs placed. Counted separately from `count` on purpose — see the F4 note below. */
   let rigCount = 0;
   const overridesByParent = new Map<number, { node: string; materials: Record<string, string> | undefined; visible: boolean }[]>();
-  world.query(SkinnedMeshRenderer).updateEach(([r]: [{ node: string; materials: Record<string, string>; visible: boolean }], entity) => {
+  if (walkPlaceholders) world.query(SkinnedMeshRenderer).updateEach(([r]: [{ node: string; materials: Record<string, string>; visible: boolean }], entity) => {
     const parentId = entity.has(EntityAttributes) ? entity.get(EntityAttributes)!.parentId : 0;
     if (!parentId) return;
     const list = overridesByParent.get(parentId) ?? [];
@@ -3856,7 +3886,7 @@ async function prewarmShadersForWorldInner(
     overridesByParent.set(parentId, list);
   });
 
-  world.query(SkinnedModel).updateEach(([sm]: [{ isVisible: boolean; model: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
+  if (walkPlaceholders) world.query(SkinnedModel).updateEach(([sm]: [{ isVisible: boolean; model: string; castShadow: 'auto' | 'on' | 'off'; receiveShadow: boolean }], entity) => {
     if (!sm.isVisible || !sm.model || deactivatedEntities.has(entity.id())) return;
     // Overrides join the dedupe key alongside the shadow flags, for the same reason they do on
     // Renderable3D: two entities sharing a rig but rebinding different materials need both
@@ -3907,8 +3937,23 @@ async function prewarmShadersForWorldInner(
   // and re-triggers the WGSL `unresolved type 'OutputType'` bug this prewarm exists
   // to prevent. Add a throwaway 1-tri standard mesh so a plain material is always
   // compiled first. Cost is one trivial compile per scene swap; harmless if NPR is off.
+  //
+  // ⚠️ **Also forced whenever a post-FX stack is coming** (#324b). `willUseStack` skipped every
+  // walk above, so `count` is 0 by construction there and this branch would fire anyway — the
+  // condition names the second reason explicitly rather than leaning on that coincidence, because
+  // the coincidence is exactly the kind a later refactor breaks silently. Under a stack this
+  // placeholder is the ONLY thing the pre-swap half compiles, and that is the point: it costs one
+  // trivial plain-material compile and it is what keeps the renderer's first compile a NORMAL
+  // material rather than the stack's MRT/NPR pass.
+  //
+  // It keeps the scene-global mirrors (lights, environment, fog) set up above, deliberately rather
+  // than by omission: those mirrors are what make this build exercise the LIT graph. Measured
+  // 2026-08-26 on `games/3d-test` — a bare, environment-free warm build costs ~1 ms and primes
+  // NOTHING (the next real lit build still cost 25.6 ms), whereas the first lit+env build costs
+  // ~24 ms and every later lit build then costs ~5 ms. So under a stack this placeholder is also
+  // what absorbs that one-time premium on behalf of `compileLiveScene`.
   let placeholderMesh: THREE.Mesh | undefined;
-  if (count === 0) {
+  if (count === 0 || willUseStack) {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
     geo.computeVertexNormals();

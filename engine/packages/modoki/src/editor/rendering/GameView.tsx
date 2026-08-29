@@ -10,11 +10,12 @@ import { setAudioMuted, isAudioMuted } from '../../runtime/audio/audioService';
 import { enterPlay, stopPlay, pausePlay } from '../scene/playMode';
 import { useEditorStore } from '../store/editorStore';
 import { computeDeviceLetterbox } from '../scene/sceneViewMath';
-import { FREE_PRESET, resolveLogicalSize, resolveSafeArea, safeAreaCssVars, type DevicePreset } from '../scene/devicePresets';
+import { resolveLogicalSize, resolveSafeArea, safeAreaCssVars, type DevicePreset } from '../scene/devicePresets';
 import DevicePicker from './DevicePicker';
 import SafeAreaOverlay from './SafeAreaOverlay';
 import { DebugMenu } from '../../runtime/debug';
 import { VideoOverlay } from '../../runtime/video/VideoOverlay';
+import { saveGameViewMuted, loadGameViewShowColliders, saveGameViewShowColliders, resolveInitialGameViewMute } from './gameViewPrefs';
 
 // ── Main GameView ───────────────────────────────────────
 
@@ -24,20 +25,37 @@ interface GameViewProps {
 
 export default function GameView({ uiLayer }: GameViewProps) {
   const playState = useSyncExternalStore(onPlayStateChange, getPlayState);
-  const [preset, setPreset] = useState<DevicePreset>(FREE_PRESET);
-  const [orientation, setOrientation] = useState<'portrait' | 'landscape'>('portrait');
-  const [showColliders, setShowColliders] = useState(isShowColliders2D());
+  // The device preset + orientation live in the STORE, not in local state, so an agent can set
+  // them (`set-game-view-device` / `modoki_game_view_device`, #367) — the picker is a popup that
+  // trusted input cannot operate, so a session's layout check used to measure whatever device the
+  // human last left selected. Everything below reads them exactly as it read the useState pair.
+  const preset = useEditorStore((s) => s.gameViewDevice);
+  const orientation = useEditorStore((s) => s.gameViewOrientation);
+  const setGameViewDevice = useEditorStore((s) => s.setGameViewDevice);
+  const setGameViewMounted = useEditorStore((s) => s.setGameViewMounted);
+  const setGameAreaSize = useEditorStore((s) => s.setGameAreaSize);
+  const setPreset = useCallback((p: DevicePreset) => setGameViewDevice(p), [setGameViewDevice]);
+  // Persisted across reloads (#399) — the runtime flag itself (`isShowColliders2D()`) starts
+  // false on every fresh module load, so it can't be the source of truth for the initial
+  // React state; apply the persisted value to the runtime once on mount instead.
+  const [showColliders, setShowColliders] = useState(loadGameViewShowColliders);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { setShowColliders2D(showColliders); }, []);
   const toggleColliders = useCallback(() => {
     const next = !isShowColliders2D();
     setShowColliders2D(next);
     setShowColliders(next);
+    saveGameViewShowColliders(next);
   }, []);
-  // Unity-style "Mute Audio" — silences all game audio during editing/preview.
-  const [muted, setMuted] = useState(isAudioMuted());
+  // Unity-style "Mute Audio" — silences all game audio during editing/preview. Persisted
+  // across a RELOAD (#399) but not stomped on a same-session remount — see
+  // `resolveInitialGameViewMute`'s doc comment for why that distinction matters.
+  const [muted, setMuted] = useState(() => resolveInitialGameViewMute(isAudioMuted, setAudioMuted));
   const toggleMute = useCallback(() => {
     const next = !isAudioMuted();
     setAudioMuted(next);
     setMuted(next);
+    saveGameViewMuted(next);
   }, []);
   const containerRef = useRef<HTMLDivElement>(null);
   const gameAreaRef = useRef<HTMLDivElement>(null);
@@ -59,6 +77,38 @@ export default function GameView({ uiLayer }: GameViewProps) {
   // itself from `gameViewSize` and has no access to the device picker, which lives here.
   // The setter no-ops on an unchanged quartet, so this is safe to run every render.
   useEffect(() => { setGameViewSafeArea(safeArea); }, [safeArea, setGameViewSafeArea]);
+
+  // Publish MOUNTEDNESS — the agent read-back reports it, and this component is the only place
+  // the fact exists. It cannot be inferred from `openPanels`: that is every tab NODE in the
+  // FlexLayout model with no selection test, and FlexLayout defaults `tabEnableRenderOnDemand`,
+  // so an unclicked Game tab sharing a tabset EXISTS without ever mounting. Deriving it there
+  // reported "mounted" for exactly the case the flag exists to catch (#367 close-out review).
+  useEffect(() => {
+    setGameViewMounted(true);
+    return () => setGameViewMounted(false);
+  }, [setGameViewMounted]);
+
+  // Measure the game AREA in real CSS px, always — device selected or not. Separate from
+  // `gameViewSize` below, which holds the DEVICE's logical size whenever one is picked: reading
+  // that as "how big is the panel" answers with the phone, and is stale in precisely the
+  // transition it would be consulted for (iPhone 16 Pro -> Free returned 402x874 as the panel
+  // size; a cold editor returned the fabricated {800,450} default).
+  useEffect(() => {
+    const el = gameAreaRef.current;
+    if (!el) return;
+    const publish = () => setGameAreaSize(el.clientWidth, el.clientHeight);
+    publish();
+    // Deferred to the next frame for the same reason the observers below are: a synchronous
+    // setState inside the RO callback can re-lay-out within the same RO cycle.
+    let pending = false;
+    const ro = new ResizeObserver(() => {
+      if (pending) return;
+      pending = true;
+      requestAnimationFrame(() => { pending = false; publish(); });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [setGameAreaSize]);
 
   // Track effective size
   useEffect(() => {
@@ -126,7 +176,10 @@ export default function GameView({ uiLayer }: GameViewProps) {
     return () => ro.disconnect();
   }, [isFree, deviceW, deviceH, setStoreGameRect]);
 
-  const toggleOrientation = useCallback(() => setOrientation(o => o === 'portrait' ? 'landscape' : 'portrait'), []);
+  const toggleOrientation = useCallback(
+    () => setGameViewDevice(undefined, useEditorStore.getState().gameViewOrientation === 'portrait' ? 'landscape' : 'portrait'),
+    [setGameViewDevice],
+  );
 
   return (
     <div ref={containerRef} style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', background: '#0f0f23' }}>

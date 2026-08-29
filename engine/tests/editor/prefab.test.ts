@@ -6,7 +6,7 @@ import { Transform, Renderable3D, PrefabInstance, EntityAttributes } from '@modo
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { getEntityTraits, readTraitData, getAllEntities } from '@modoki/engine/runtime';
 import { getTraitByName } from '@modoki/engine/runtime';
-import { serializePrefab, instantiatePrefab, type PrefabFile } from '@modoki/engine/editor';
+import { serializePrefab, instantiatePrefab, PREFAB_FORMAT_VERSION, type PrefabFile } from '@modoki/engine/editor';
 import {
   buildPrefabEditScene,
   SCAFFOLD_PREFIX,
@@ -102,7 +102,12 @@ describe('serializePrefab', () => {
 
     const prefab = serializePrefab(parent.id());
     expect(prefab).not.toBeNull();
-    expect(prefab!.version).toBe(1);
+    // 2, not 1, and this expectation CHANGED in #379: the serializer used to derive the version
+    // from the document's content (`nestedRefs.size > 0 ? 2 : 1`), so a flat prefab like this one
+    // was stamped 1. That rule could DECREASE the field — removing a prefab's last nested
+    // instance rewrote 2 back to 1 — which is not something a format version may do. Every writer
+    // now stamps PREFAB_FORMAT_VERSION regardless of content.
+    expect(prefab!.version).toBe(PREFAB_FORMAT_VERSION);
     expect(prefab!.entities.length).toBe(2);
     expect(prefab!.rootLocalId).toBe(1);
 

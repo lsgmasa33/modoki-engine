@@ -7,14 +7,31 @@ import {
   getSpriteAnim, resolveSpriteClip, activeSpriteClip, spriteAnimHasClip,
   setSpriteAnim, invalidateSpriteAnim, clearSpriteAnimCache,
 } from '../../src/runtime/loaders/spriteAnimCache';
+import { clearManifest, newGuid } from '../../src/runtime/loaders/assetManifest';
 
 beforeEach(() => {
   clearSpriteAnimCache();
+  clearManifest();
   vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('no network in test'))));
 });
 afterEach(() => {
   vi.unstubAllGlobals();
   clearSpriteAnimCache();
+});
+
+// Close-out sweep of QA-ANIM-0018 (animationClipCache's fix): every sibling `*Cache` module
+// shared the same `isGuid(ref) ? resolveRef(ref) : ref` cache-key helper, silently returning
+// undefined for a guid absent from the manifest with no warning at all.
+describe('spriteAnimCache — unresolved guid warns once (parity with animationClipCache)', () => {
+  it('warns once for a guid absent from the manifest', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const guid = newGuid();
+    expect(getSpriteAnim(guid)).toBeNull();
+    expect(getSpriteAnim(guid)).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain(guid);
+    warn.mockRestore();
+  });
 });
 
 describe('spriteAnimCache', () => {

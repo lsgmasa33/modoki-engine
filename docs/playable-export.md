@@ -60,7 +60,7 @@ removes nothing" below for the two that were not, and why they are gone rather t
 - **Wiring**: the resolved booleans become `__MODOKI_MODULE_RENDER3D__` / `…_RENDER2D__` / … Vite defines
   (`vite.config.ts`), which flag-gate the renderers' lazy imports in `App.tsx` (`Scene3D`/`Game`) so Rolldown
   DCEs the excluded SDK — the same mechanism the debug menu + journal use.
-- **UI**: **Project Settings → Rendering & Physics → Engine Modules** — a tri-state **Auto | On | Off** per
+- **UI**: **Project Settings → General → Developer → Engine modules** — a tri-state **Auto | On | Off** per
   module (`ModuleTogglesEditor`, the `'module-toggles'` field), persisted through `/api/project-settings`.
 - **Also readable at runtime, by the editor itself.** `resolveModules` isn't build-only anymore: the running
   editor's dev-server backend exposes `GET /api/build-modules`, which reuses this exact resolution (real

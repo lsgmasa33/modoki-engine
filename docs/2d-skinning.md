@@ -323,6 +323,16 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   Once a rig exists, open a scene with a `SkinnedSprite2D` + `Bone2D` children; select a
   bone in the Hierarchy or by clicking its joint in SceneView; pose it with the gizmo
   (works while stopped) and the mesh deforms live in both viewports.
+  ⚠️ **A stroke's pointer samples are SWEPT, not stamped** (#392,
+  `panels/skinPaintGesture.ts` `advancePaintStroke`/`paintStrokeCenters`, on top of the
+  engine-level `runtime/core/segmentSweep.ts` `sweepSegment` — #393): `paintAt` stamps a disc
+  per center, and pointer input is sampled once per event, so a fast flick used to advance
+  several brush diameters between two samples and paint dotted/banded instead of solid — the
+  same tunnelling class already fixed in `games/wordweave`'s `cellsAlong` (#386). Each move
+  now interpolates from the last point actually painted to the new sample at a step of
+  `radius * 0.25`, and `paintAt` computes `skinMats`/`dverts` once per part and CHAINS
+  `paintWeights` over the swept centers rather than re-deriving them per center — the naive
+  per-center fix would multiply the expensive part of the call by the sample count.
 - **Planned:** scene-scoped rig+texture refcounting, tree-shaker rig→texture dep-follow,
   atlas/sliced-sprite UV remap, alpha-outline tessellation (grid+cull already gives an
   artifact-free mesh in the meantime).

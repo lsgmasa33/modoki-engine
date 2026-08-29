@@ -430,6 +430,27 @@ const DECLS: Record<string, Decl> = {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-scene-view-mode', mutating: true, persists: 'session',
     minimalArgs: { mode: '3d' },
   },
+  modoki_animation_view_mode: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-animation-view-mode',
+    mutating: true, persists: 'session',
+    minimalArgs: { mode: 'dopesheet' },
+    notes: "Editor-session state (which of the Animation panel's two timeline views is mounted), "
+      + 'not clip data and not on disk. It gates which interaction handles exist at all — the '
+      + 'tangent handles are published by CurvesView alone (#369).',
+  },
+  modoki_game_view_devices: {
+    kind: 'read', method: 'GET', route: '/api/game-view-devices',
+    notes: 'The catalog is relayed from the renderer (editor/scene/devicePresets.ts), never copied '
+      + 'here — a second table goes stale the first time a device is added.',
+  },
+  modoki_game_view_device: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-game-view-device',
+    mutating: true, persists: 'session',
+    minimalArgs: { device: 'Free' },
+    notes: "Editor-session state (the Game panel's preview size), not scene data and not on disk. "
+      + 'Split from modoki_game_view_devices on §4: the read half is a GET, and a mutating op '
+      + 'reached by GET has its refusal read as a success.',
+  },
   modoki_collider_edit: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-collider-edit', mutating: true, persists: 'session',
     minimalArgs: { on: true },
@@ -445,6 +466,22 @@ const DECLS: Record<string, Decl> = {
   modoki_open_nine_slice_editor: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'open-nine-slice-editor',
     mutating: true, aim: 'asset', minimalArgs: { path: '/assets/textures/probe.png' },
+  },
+  modoki_select_sprite_slice: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'select-sprite-slice',
+    mutating: true, persists: 'session', minimalArgs: {},
+    notes: "Editor-session state (SpriteEditor.tsx's `spriteEditorSelection`) — the modal opens with "
+      + 'nothing selected, so its resize/pivot handles are otherwise unreachable by an agent (#373).',
+  },
+  modoki_open_skin_editor: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'open-skin-editor',
+    mutating: true, aim: 'asset', minimalArgs: { path: '/assets/characters/probe.rig2d.json' },
+  },
+  modoki_set_skin_mode: {
+    kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-skin-mode',
+    mutating: true, persists: 'session', minimalArgs: { mode: 'rig' },
+    notes: "'parts' hides every bone-joint handle — 'rig' or 'weights' is required for "
+      + 'modoki_handles editor=skin to report anything (#373).',
   },
   modoki_focus_entity: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'focus-entity',

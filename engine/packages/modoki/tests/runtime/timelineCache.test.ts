@@ -9,6 +9,7 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { getTimeline, loadTimelineNow, invalidateTimeline, setTimeline, clearTimelineCache } from '../../src/runtime/loaders/timelineCache';
 import { normalizeTimeline } from '../../src/runtime/timeline/types';
+import { clearManifest, newGuid } from '../../src/runtime/loaders/assetManifest';
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
 // text() as well as json(): the loaders read the body as TEXT so they can spot Vite's index.html
@@ -27,6 +28,7 @@ beforeEach(() => {
   fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
   warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  clearManifest();
 });
 afterEach(() => {
   clearTimelineCache();
@@ -141,5 +143,18 @@ describe('timelineCache — a GUID-loaded timeline is invalidated BY PATH', () =
 
     expect(getTimeline(GUID)?.name).toBe('BEFORE');
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Close-out sweep of QA-ANIM-0018 (animationClipCache's fix): every sibling `*Cache` module
+// shared the same `isGuid(ref) ? resolveRef(ref) : ref` cache-key helper, silently returning
+// undefined for a guid absent from the manifest with no warning at all.
+describe('timelineCache — unresolved guid warns once (parity with animationClipCache)', () => {
+  it('warns once for a guid absent from the manifest', () => {
+    const guid = newGuid();
+    expect(getTimeline(guid)).toBeNull();
+    expect(getTimeline(guid)).toBeNull();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0][0])).toContain(guid);
   });
 });

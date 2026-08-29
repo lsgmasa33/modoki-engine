@@ -48,13 +48,16 @@ import {
   waitForEditorJournal,
   getResolvedRender3d,
   probeKeyReach,
+  DEVICE_PRESETS, findPresetByName, makeCustomPreset, validateCustomSize,
+  describeDeviceSelection, presetDpr, resolveLogicalSize, resolvePhysicalSize, resolveSafeArea,
+  type DevicePreset, type Orientation,
   type PrefabFile,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
   getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity, findUnrenderable2D,
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, getParticleEffect, mountedSurfaces,
-  getTimeline, normalizeTimeline, getGuidForPath, getAssetType, getPresentationScale,
+  getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
   getAllTraits, PRIMITIVE_NAMES, PRIMITIVE_SPRITE_NAMES, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
@@ -124,6 +127,87 @@ function gpuFields(): { gpu?: ReturnType<typeof getGpuFaultState> } {
 }
 
 /** The whole editor UI state in one read — the "get all UI state" payload. */
+/** The Game panel's selected screen, plus the two editor-session facts the preset itself cannot
+ *  know. Both were review findings on #367, and BOTH were got wrong on the first attempt — the
+ *  wrong versions are recorded here because each looked obviously right:
+ *
+ *  - **`panelMounted`** — read from `gameViewMounted`, which GameView sets from its own mount
+ *    effect. It was first DERIVED from `openPanels.includes('game')`, which is wrong: `openPanels`
+ *    is every tab NODE in the FlexLayout model with no selection test, and FlexLayout defaults
+ *    `tabEnableRenderOnDemand: true`, so a Game tab that shares a tabset and has never been
+ *    clicked exists without mounting. That version answered `mounted: true` for exactly the case
+ *    the field exists to catch — asserting the panel was live, with authority, while none of the
+ *    derived values had moved. Worse than not reporting it at all.
+ *
+ *    Why it matters: `gameViewSize`/`gameViewSafeArea`/`gameRect` are written ONLY by GameView's
+ *    effects. Unmounted, the store's device changes and NOTHING derived follows, so a measurement
+ *    attributed to the new screen was taken at the old one.
+ *
+ *  - **`panelSize`** — read from `gameAreaSize`, measured by an always-on ResizeObserver. It first
+ *    read `gameViewSize`, which means something different: while a FIXED device is selected that
+ *    holds the DEVICE's logical size. So `iPhone 16 Pro` then `Free` answered `panelSize:
+ *    {402, 874}` — the phone just left, presented as the panel's size — and a cold editor answered
+ *    the fabricated `{800, 450}` default. Stale in precisely the transition it was added for.
+ *
+ *    Reported only when `free`, because a fixed device's `logical` IS the answer; and only when
+ *    mounted, because nothing has measured the area otherwise.
+ */
+function describeGameView() {
+  const s = useEditorStore.getState();
+  const sel = describeDeviceSelection(s.gameViewDevice, s.gameViewOrientation);
+  const panelMounted = s.gameViewMounted;
+  return {
+    ...sel,
+    ...(sel.free && panelMounted
+      ? { panelSize: { w: s.gameAreaSize.width, h: s.gameAreaSize.height } }
+      : {}),
+    panelMounted,
+    ...(panelMounted ? {} : {
+      panelNote: 'The Game panel is NOT mounted, so nothing derived from this selection has moved — '
+        + 'the preview size, safe-area insets and letterbox rect all still describe the previous '
+        + 'state. Open (and SELECT) the Game tab before attributing any layout measurement to this '
+        + 'screen: an unselected tab does not mount.',
+    }),
+  };
+}
+
+/** What the Animation panel is SHOWING, with the two qualifiers an empty handle list needs.
+ *
+ *  `mode` alone is not enough to explain `modoki_handles editor=curves` coming back empty, and
+ *  reporting it alone repeats the mistake `describeGameView` above had to fix one commit earlier:
+ *
+ *  - **`panelMounted`** — FlexLayout mounts only the SELECTED tab, so neither view's handle
+ *    provider is registered when the Animation tab has never been clicked. `mode` would still
+ *    read 'curves'.
+ *  - **`tangentsNeedActiveTrack`** — CurvesView publishes tangent handles for the ACTIVE track
+ *    only (`CurvesView.tsx`), and `activeTi` resolves with no selection ONLY when exactly one
+ *    curve is visible. So on a clip with two or more numeric tracks, switching to Curves is
+ *    necessary and NOT sufficient, and the empty list reads as "this clip has no tangents".
+ *    Measured, not reasoned: 1-track clip -> 2 keyframe + 2 tangent; 2-track clip, same view,
+ *    nothing selected -> 5 keyframe + 0 tangent.
+ */
+function describeAnimationView() {
+  const s = useEditorStore.getState();
+  const mounted = s.animationPanelMounted;
+  return {
+    mode: s.animationViewMode,
+    panelMounted: mounted,
+    ...(mounted ? {} : {
+      panelNote: 'The Animation panel is NOT mounted, so neither view is showing and NEITHER '
+        + "publishes handles — modoki_handles editor=dopesheet|curves is empty for that reason, "
+        + 'not because the clip is empty. FlexLayout mounts only the SELECTED tab, so open AND '
+        + 'select the Animation tab (modoki_open_animation_editor does both when it opens a clip).',
+    }),
+    ...(s.animationViewMode === 'curves' ? {
+      tangentsNeedActiveTrack: 'Tangent handles (curves:tan:in|out:*) are published for the ACTIVE '
+        + 'track only. With no track selected that resolves only when exactly ONE numeric curve is '
+        + 'visible — so on a multi-track clip kind:tangent is empty until you select a track: '
+        + 'modoki_handles {editor:"chrome", kind:"row"} lists animation.trackList.row.<i> '
+        + '(data-ui-state "selected" marks the active one), then modoki_tap_handle it.',
+    } : {}),
+  };
+}
+
 function readEditorState() {
   const s = useEditorStore.getState();
   return {
@@ -142,6 +226,21 @@ function readEditorState() {
     gizmoMode: s.gizmoMode,
     gizmoSpace: s.gizmoSpace,
     sceneViewMode: s.sceneViewMode,
+    // Which view the Animation editor is showing ('dopesheet' | 'curves'). Reported because the
+    // two views publish DIFFERENT interaction handles, so without it "why does modoki_handles
+    // editor=curves return nothing" is answerable only from a screenshot — an empty list is
+    // otherwise indistinguishable from a clip with no tangents (#369). Set with
+    // modoki_animation_view_mode. Kept as a FLAT scalar as well as inside `animationView` below:
+    // it is the single most-read field here, and every caller written against it stays correct.
+    animationViewMode: s.animationViewMode,
+    // The same answer WITH its qualifiers — see describeAnimationView. `animationViewMode` alone
+    // cannot explain an empty handle list; this can.
+    animationView: describeAnimationView(),
+    // Which screen the Game panel is previewing at. Reported so a layout measurement can be
+    // ATTRIBUTED to a screen size — without it, "the HUD overlaps the notch" is unfalsifiable,
+    // since the reader cannot tell which device produced it (#367). Set with
+    // modoki_game_view_device; the full catalog is modoki_game_view_devices.
+    gameView: describeGameView(),
     // Which panel owns the KEYBOARD ('scene' | 'hierarchy' | 'animation-editor' | …), or null.
     // Readable as DATA on purpose: the focus ring is a CSS box-shadow, so without this the
     // question "which panel would this key go to?" would only be answerable from a screenshot —
@@ -158,6 +257,21 @@ function readEditorState() {
     // can tell a stale editor from a working one by looking. (docs/editor-hmr.md)
     ...hmrFields(),
     colliderEditMode: s.colliderEditMode,
+    // Which slice is selected in the open Sprite Editor (guid, or null). The editor's
+    // resize/pivot handles only exist for the selected slice, so without this an empty
+    // `modoki_handles editor=sprite` list is indistinguishable from "no slices" (#373). Set with
+    // `select-sprite-slice`, reset to null on every `open-sprite-editor` call and by the modal's
+    // own mount/unmount — but NOT gated on the modal being open right now: `select-sprite-slice`
+    // will happily set this with no Sprite Editor mounted at all, same as `animationViewMode`
+    // before `animationView.panelMounted` was added to qualify it. So a non-null value here is
+    // NOT proof the modal is open; check `textureEditorRequest`/that a modal-opening call
+    // preceded it, or expect the same class of gap `animationView` was added to close.
+    spriteEditorSelection: s.spriteEditorSelection,
+    // Which .rig2d.json is open in the Skin editor (null = none), and which of its three
+    // modes (rig/parts/weights) is active — 'parts' hides every `skin:bone:*` handle. Set
+    // with `open-skin-editor` / `set-skin-mode` (#373).
+    editingSkinAsset: s.editingSkinAsset,
+    skinMode: s.skinMode,
     fps: Math.round(getCurrentFPS()),
     // Liveness, NOT run mode. `playState`/`runMode`/`advancing` above only say what the
     // editor INTENDS to do; they read "playing"/true even when the rAF chain is dead and
@@ -283,11 +397,18 @@ function resolveLiveId(ref: { id?: number; guid?: string } | undefined): number 
 /** Validate that `path` names a real asset of `expected` type before opening an editor on it.
  *  The open-*-editor ops used to mount a panel at ANY string path and return editor state
  *  (success), so a typo'd/wrong-type path silently produced a panel with no handles and no
- *  error — indistinguishable from "not mounted". Now a bad path is an actionable failure. (C7 re-audit.) */
+ *  error — indistinguishable from "not mounted". Now a bad path is an actionable failure. (C7 re-audit.)
+ *
+ *  ⚠️ The type check here used to call `getAssetType(path)`, but that function is
+ *  guid-KEYED (`guidToEntry.get(guid)`) — a path is never a key in that map, so `type` was
+ *  ALWAYS undefined and the mismatch branch could never throw (#373 close-out review: caught
+ *  because `modoki_open_skin_editor {path:'/assets/textures/ui.png'}` opened the Skin editor on
+ *  a PNG with a clean success). `getAssetEntry` indexes BOTH guid and path, so it actually
+ *  resolves what this asserts against. */
 function requireAssetPath(path: string | undefined, expected: string, op: string): void {
   if (typeof path !== 'string' || !path) throw new Error(`${op} requires { path } — the asset's served URL (see modoki_list_assets).`);
   if (!getGuidForPath(path)) throw new Error(`${op}: no asset found at "${path}" — it resolves to no manifest entry (typo, or wrong path). Find it with modoki_list_assets.`);
-  const type = getAssetType(path);
+  const type = getAssetEntry(path)?.type;
   if (type && type !== expected) throw new Error(`${op}: "${path}" is a ${type}, not a ${expected} — this editor only opens ${expected} assets.`);
 }
 
@@ -921,6 +1042,157 @@ export function registerEditorAgentOps(): void {
     if (p.mode === '3d' || p.mode === 'ui') useEditorStore.getState().setSceneViewMode(p.mode);
     return readEditorState();
   });
+
+  // ── Animation editor: Dopesheet vs Curves (#369) ──
+  // The SAME defect one panel over from `set-scene-view-mode`, and for the same reason: exactly one
+  // of the two views is mounted, and they do NOT publish the same interaction handles. `curves:key:*`
+  // and `curves:tan:in|out:*` (kind 'tangent') exist in CurvesView alone, so while the view lived in
+  // AnimationEditor-local `useState` — defaulting to 'dopesheet' — tangent editing was reachable only
+  // if the human happened to have left the panel in Curves. `modoki_handles editor=curves` then
+  // returned nothing, which reads as "this clip has no tangents" rather than "wrong view".
+  //
+  // A SEPARATE op rather than a `view` param on `open-animation-editor`, which was the cheaper
+  // option on the issue: `openAnimationEditor` nulls `editingAnimationClip` and resets the playhead
+  // to 0, so re-opening to switch view would throw away the loaded document and the scrub position
+  // an agent had just set. Switching views mid-inspection is a real intent, not a sub-step of
+  // opening, so it gets its own call. Setting it BEFORE opening a clip is fine — the store holds it
+  // and the panel mounts into it.
+  registerAgentOp('set-animation-view-mode', (params) => {
+    const p = (params ?? {}) as { mode?: unknown };
+    if (p.mode !== 'dopesheet' && p.mode !== 'curves') {
+      // Refused, not ignored: `set-scene-view-mode` above silently drops a bad mode and returns a
+      // state read that looks like success, which is §0's readiness lie. An agent that typo'd
+      // 'curve' would be told nothing and then read an empty handle list as "no tangents".
+      return {
+        ok: false,
+        error: `mode must be 'dopesheet' or 'curves' — got ${JSON.stringify(p.mode)}`,
+        options: ['dopesheet', 'curves'],
+        // The CURRENT view rides along: a refusal that omits it makes the caller spend a second
+        // call to learn the state it did not change.
+        animationViewMode: useEditorStore.getState().animationViewMode,
+      };
+    }
+    useEditorStore.getState().setAnimationViewMode(p.mode);
+    return { ...readEditorState(), ok: true };
+  });
+
+  // ── GameView device simulation (#367) ──
+  // The device picker is a popup that trusted input cannot operate, and the orientation toggle is
+  // a toolbar button in a panel an agent may not even have on screen — so before these ops the one
+  // knob deciding WHAT SIZE the game is previewed at was human-only, and every layout check a
+  // session ran measured whatever device the human last left selected. The per-device bug class
+  // (#271/#272 safe-area insets, Court's panel-fit budget #358) is precisely the class that needs
+  // the device changed, repeatedly, to be checked at all.
+  //
+  // Two ops, not one, and deliberately so: `game-view-devices` ANSWERS a question and
+  // `set-game-view-device` DOES something. docs/mcp-tool-conventions.md §4 — a mutating op reached
+  // by GET has its refusal read as a success, because `getJson` does not run `isFailureBody`.
+  registerAgentOp('game-view-devices', () => {
+    const s = useEditorStore.getState();
+    return {
+      ok: true,
+      current: describeDeviceSelection(s.gameViewDevice, s.gameViewOrientation),
+      // The catalog itself, resolved in PORTRAIT (how the table is authored) — landscape is a flip
+      // applied at selection time, not a second set of entries, so listing both would double the
+      // payload to say the same thing. `orientation` on the setter is what chooses.
+      presets: DEVICE_PRESETS.map((p) => ({
+        name: p.name,
+        category: p.category,
+        logical: resolveLogicalSize(p, 'portrait'),
+        physical: resolvePhysicalSize(p, 'portrait'),
+        dpr: presetDpr(p),
+        safeArea: { portrait: resolveSafeArea(p, 'portrait'), landscape: resolveSafeArea(p, 'landscape') },
+        free: p.logicalW <= 0,
+      })),
+      note: "Sizes are LOGICAL (CSS points) unless named physical; layout math runs in logical space. "
+        + "Set one with modoki_game_view_device {device, orientation}, or give an explicit "
+        + '{logicalWidth, logicalHeight} for a size the catalog does not carry.',
+    };
+  });
+
+  registerAgentOp('set-game-view-device', (params) => {
+    const p = (params ?? {}) as {
+      device?: unknown; orientation?: unknown;
+      logicalWidth?: unknown; logicalHeight?: unknown; dpr?: unknown;
+    };
+    const store = useEditorStore.getState();
+    const names = DEVICE_PRESETS.map((d) => d.name);
+
+    let orientation: Orientation | undefined;
+    if (p.orientation !== undefined) {
+      if (p.orientation !== 'portrait' && p.orientation !== 'landscape') {
+        return {
+          ok: false,
+          error: `orientation must be 'portrait' or 'landscape' — got ${JSON.stringify(p.orientation)}`,
+          options: ['portrait', 'landscape'],
+        };
+      }
+      orientation = p.orientation;
+    }
+
+    const wantsCustom = p.logicalWidth !== undefined || p.logicalHeight !== undefined || p.dpr !== undefined;
+    // Both addresses at once is AMBIGUOUS, not resolved by precedence: a caller who gave two
+    // answers does not know which screen they got, and picking for them is §0's rank-1 class.
+    if (wantsCustom && p.device !== undefined) {
+      return {
+        ok: false,
+        error: 'give EITHER device (a catalog preset by name) OR logicalWidth+logicalHeight (an '
+          + 'explicit size) — not both. Which screen you meant cannot be inferred from the pair.',
+      };
+    }
+
+    let device: DevicePreset | undefined;
+    if (wantsCustom) {
+      const bad = validateCustomSize(p.logicalWidth, p.logicalHeight, p.dpr);
+      if (bad) return { ok: false, error: `custom size refused: ${bad}` };
+      device = makeCustomPreset(p.logicalWidth as number, p.logicalHeight as number, (p.dpr as number | undefined) ?? 1);
+      // An explicit size is taken LITERALLY: default it to portrait so the numbers asked for are
+      // the numbers previewed. Presets are authored portrait and flipped by the orientation, and
+      // orientation is sticky — so without this, `{logicalWidth:640, logicalHeight:480}` sent while
+      // the panel happened to be in landscape previews 480x640. The read-back would say so
+      // honestly, but "I asked for 640 wide and got 480" is a trap worth not setting. Passing
+      // `orientation` alongside a custom size still rotates it — that is an explicit request.
+      orientation ??= 'portrait';
+    } else if (p.device !== undefined) {
+      if (typeof p.device !== 'string') {
+        return { ok: false, error: `device must be a preset NAME (a string) — got ${typeof p.device}`, options: names };
+      }
+      // No fuzzy match, by rule (§5): previewing a DIFFERENT screen than the one named is worse
+      // than failing, because every measurement taken after it is attributed to the wrong device.
+      device = findPresetByName(p.device);
+      if (!device) {
+        return {
+          ok: false,
+          error: `no device preset named ${JSON.stringify(p.device)}. Names are matched exactly `
+            + '(case-insensitively) and NOT fuzzy-matched — a near miss would silently preview a '
+            + 'different screen. Use "Free" to fill the panel, or pass logicalWidth+logicalHeight '
+            + 'for a size the catalog does not carry.',
+          options: names,
+        };
+      }
+    }
+
+    if (device === undefined && orientation === undefined) {
+      return {
+        ok: false,
+        error: 'nothing to set: pass device (a preset name), or logicalWidth+logicalHeight for an '
+          + 'explicit size, or orientation. A call with none of them would report success for a '
+          + 'no-op. Read the current selection with modoki_get_editor_state (gameView) or '
+          + 'modoki_game_view_devices.',
+      };
+    }
+
+    store.setGameViewDevice(device, orientation);
+    return {
+      ok: true,
+      ...describeGameView(),
+      // §8: persistence is stated, never guessed. This is EDITOR-SESSION state — it is not scene
+      // data, nothing is written to disk, and it resets to Free when the editor restarts.
+      saved: false,
+      note: 'Preview-only editor state — the project is unchanged and nothing was written to disk. '
+        + 'A real device is unaffected (device_* drives hardware, which already IS its resolution).',
+    };
+  });
   // Set the KEYBOARD SCOPE — which panel the keymap dispatcher resolves chords against
   // (focus-scope refactor P7). Without this, an agent's only way to steer a keypress was
   // to tap something first and hope the click landed in the right panel; after scoping
@@ -1004,6 +1276,11 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('open-sprite-editor', (params) => {
     const p = (params ?? {}) as { path?: string; name?: string };
     requireAssetPath(p.path, 'texture', 'open-sprite-editor');
+    // The modal's own mount effect resets `spriteEditorSelection` to null, but a call on a path
+    // that is ALREADY open re-triggers no mount (TextureAssetView's `setSpriteEditorOpen(true)`
+    // is a no-op on an already-true boolean) — so without this, joining a session the human
+    // already had open would report whatever THEY had selected as if this call selected it.
+    useEditorStore.getState().setSpriteEditorSelection(null);
     useEditorStore.getState().requestTextureEditor(p.path!, 'sprite', p.name);
     return readEditorState();
   });
@@ -1012,6 +1289,43 @@ export function registerEditorAgentOps(): void {
     requireAssetPath(p.path, 'texture', 'open-nine-slice-editor');
     useEditorStore.getState().requestTextureEditor(p.path!, 'nineslice', p.name);
     return readEditorState();
+  });
+  // Select a slice in the currently-open Sprite Editor, so its 8 resize handles + pivot
+  // register (`spriteEditorSelection` — #373: the modal opens with nothing selected, and
+  // there was no route to change that). `guid: null` (or omitted) deselects.
+  registerAgentOp('select-sprite-slice', (params) => {
+    const p = (params ?? {}) as { guid?: string | null };
+    useEditorStore.getState().setSpriteEditorSelection(p.guid ?? null);
+    return readEditorState();
+  });
+  // Open the Skin (2D rig) editor on a .rig2d.json — normally reached from the Assets panel
+  // double-click or the Texture Inspector's "Auto Rig". Neither `editingSkinAsset` (which
+  // asset is open) nor `skinMode` (rig/parts/weights — `bone-joint` handles are gone in
+  // 'parts') had an agent route at all (#373); this is the missing "open the panel" half —
+  // once open, the mode buttons carry `data-ui-id="skin.mode.*"` and are chrome-tappable.
+  registerAgentOp('open-skin-editor', (params) => {
+    const p = (params ?? {}) as { path?: string; name?: string };
+    requireAssetPath(p.path, 'rig2d', 'open-skin-editor');
+    const name = p.name ?? p.path!.split('/').pop()?.replace(/\.rig2d\.json$/i, '') ?? p.path!;
+    useEditorStore.getState().openSkinEditor({ path: p.path!, type: 'rig2d', name });
+    return readEditorState();
+  });
+  registerAgentOp('set-skin-mode', (params) => {
+    const p = (params ?? {}) as { mode?: unknown };
+    if (p.mode !== 'parts' && p.mode !== 'rig' && p.mode !== 'weights') {
+      // Refused, not ignored (the set-animation-view-mode precedent, NOT set-scene-view-mode's
+      // silent drop): a typo'd mode here would otherwise read as ok:true with nothing changed,
+      // and the caller would go on to read an empty/wrong bone-joint handle list as "no rig",
+      // not "the mode never switched". Current mode rides along so a refusal costs no 2nd call.
+      return {
+        ok: false,
+        error: `mode must be 'parts', 'rig', or 'weights' — got ${JSON.stringify(p.mode)}`,
+        options: ['parts', 'rig', 'weights'],
+        skinMode: useEditorStore.getState().skinMode,
+      };
+    }
+    useEditorStore.getState().setSkinMode(p.mode);
+    return { ...readEditorState(), ok: true };
   });
 
   // Open a .anim.json in the Animation editor and BIND it to an entity, exactly as a

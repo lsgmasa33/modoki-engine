@@ -13,9 +13,13 @@
  *     `flush()` (before quit / on background) to push pending writes to the platform.
  *     ⚠️ `flush()` is NOT an fsync on any backend: it resolves once the platform has
  *     ACCEPTED the write, and the platform decides when that reaches the platter.
- *     On web/Electron, Chromium commits the localStorage area on a CLEAN SHUTDOWN, so
- *     a SIGKILL loses a flushed write — measured, and waiting does not help (see
- *     docs/player-prefs.md § Gotchas for the three-arm measurement).
+ *     On a PLAIN web tab, Chromium commits the localStorage area on a CLEAN SHUTDOWN, so
+ *     a SIGKILL loses every write since the last one — measured, and waiting does not
+ *     help. Under ELECTRON specifically, the loss window is narrower: main forces a
+ *     commit (`session.flushStorageData()`) after every drained batch, so a SIGKILL
+ *     only risks the write(s) currently in flight, not everything since the last clean
+ *     shutdown (see docs/player-prefs.md § Gotchas for the three-arm measurement, both
+ *     before and after this).
  *
  *  Shape mirrors the engine's other singletons (audioService, sceneManager): a
  *  module singleton games `import { PlayerPrefs } from '@modoki/engine/runtime'` and
@@ -141,6 +145,18 @@ function drain(): Promise<void> {
         }
       }),
     );
+    // Push this batch the rest of the way to disk if the backend has a lever for that
+    // (Electron's LocalStorageBackend — see backends.ts). One call per drained batch, not
+    // per key: it's a step beyond `set`/`remove`, not a per-write requirement. Guarded the
+    // same way a per-key write is: a rejection here must NOT poison `writeChain` — an
+    // unguarded `await` sat here for one revision and, since every later `writeChain.then`
+    // propagates a rejected chain WITHOUT running its callback, a single throwing
+    // `flush()` would have silently ended persistence for the rest of the session.
+    try {
+      await backend.flush?.();
+    } catch (err) {
+      console.warn('[PlayerPrefs] backend.flush() failed — writes above are still recorded', err);
+    }
   });
   return writeChain;
 }
@@ -275,10 +291,12 @@ function getNamespace(): string {
  *
  * NOTE this still is not an fsync — `false` means "the platform ACCEPTED it", not "it is on the
  * platter", and that holds on EVERY backend, not just the native one: Android's
- * `SharedPreferences.apply()` is async-to-disk, and on web/Electron Chromium commits the
- * localStorage area only on a clean shutdown, so a SIGKILL loses a flushed write. This function
- * therefore separates "the backend rejected it" from "the backend took it" — never "it is safe".
- * See docs/player-prefs.md § Gotchas.
+ * `SharedPreferences.apply()` is async-to-disk, and on a plain web tab Chromium commits the
+ * localStorage area only on a clean shutdown — Electron narrows that window (see the
+ * `LocalStorageBackend.flush` doc comment in backends.ts) but does not close it, since
+ * `session.flushStorageData()` itself is fire-and-forget with no completion signal to await.
+ * This function therefore separates "the backend rejected it" from "the backend took it" —
+ * never "it is safe". See docs/player-prefs.md § Gotchas.
  */
 function hasPendingWrite(key: string): boolean {
   return dirty.has(key);

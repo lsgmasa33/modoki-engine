@@ -5,7 +5,10 @@
  *  agent that was fatal, not merely annoying: `skin:bone:N` joints are the only handles
  *  SkinCanvas registers, so `drag_handle` could never produce a stroke at all. */
 import { describe, it, expect } from 'vitest';
-import { paintPressIntent, promotesToStroke, PAINT_DRAG_SLOP } from '../../src/editor/panels/skinPaintGesture';
+import {
+  paintPressIntent, promotesToStroke, paintStrokeCenters, advancePaintStroke,
+  PAINT_DRAG_SLOP, PAINT_SWEEP_STEP_FRACTION,
+} from '../../src/editor/panels/skinPaintGesture';
 
 const press = (paintSubTool: string, jointHit: number, selBone: number) =>
   paintPressIntent({ paintSubTool, jointHit, selBone });
@@ -86,5 +89,69 @@ describe('promotesToStroke', () => {
 
   it('is symmetric in sign — a leftward drag is as much a drag as a rightward one', () => {
     for (const d of [3, 7, 50]) expect(promotesToStroke(d, 0)).toBe(promotesToStroke(-d, 0));
+  });
+});
+
+describe('paintStrokeCenters', () => {
+  it('a slow move (under one step) paints only the endpoint, like today', () => {
+    // Brush radius 40 → step 10. A 5px move stays under one step.
+    const out = paintStrokeCenters({ x: 0, y: 0 }, { x: 5, y: 0 }, 40);
+    expect(out).toEqual([{ x: 5, y: 0 }]);
+  });
+
+  it('a fast flick across several radii is interpolated into multiple centers ending at the endpoint', () => {
+    // #392's repro shape: the cursor advances several brush diameters between two samples.
+    const radius = 40;
+    const out = paintStrokeCenters({ x: 0, y: 0 }, { x: 400, y: 0 }, radius);
+    expect(out.length).toBeGreaterThan(1);
+    expect(out[out.length - 1]).toEqual({ x: 400, y: 0 });
+    // No gap between consecutive centers wider than the step (radius * fraction).
+    const step = radius * PAINT_SWEEP_STEP_FRACTION;
+    let prevX = 0;
+    for (const c of out) {
+      expect(c.x - prevX).toBeLessThanOrEqual(step + 1e-6);
+      prevX = c.x;
+    }
+  });
+
+  it('opening a stroke (prev === null) paints only the press point', () => {
+    expect(paintStrokeCenters(null, { x: 12, y: 34 }, 40)).toEqual([{ x: 12, y: 34 }]);
+  });
+});
+
+describe('advancePaintStroke', () => {
+  // This is the seam SkinCanvas.tsx actually calls, once per pointer-down/move — reverting the
+  // panel to a single stamp per move (re-introducing #392) means it simply stops calling this
+  // function, which `paintStrokeCenters`'s own tests above cannot catch on their own (they never
+  // simulate a SEQUENCE of samples through a carried-forward state).
+  it('opens a stroke at the press point, then chains each subsequent move with no gap across the whole sequence', () => {
+    const radius = 40;
+    const step = radius * PAINT_SWEEP_STEP_FRACTION;
+    const samples = [{ x: 0, y: 0 }, { x: 200, y: 0 }, { x: 440, y: 0 }]; // press + two big jumps
+    let state: ReturnType<typeof advancePaintStroke>['state'] | null = null;
+    const allCenters: Array<{ x: number; y: number }> = [];
+    for (const to of samples) {
+      const step1 = advancePaintStroke(state, to, radius);
+      allCenters.push(...step1.centers);
+      state = step1.state;
+    }
+    // The press point is painted exactly once, as the very first center of the whole chain.
+    expect(allCenters[0]).toEqual({ x: 0, y: 0 });
+    // The chain ends exactly at the last sample.
+    expect(allCenters[allCenters.length - 1]).toEqual({ x: 440, y: 0 });
+    // No gap wider than the step ANYWHERE across the concatenated chain — including at the
+    // boundary between what two separate `advancePaintStroke` calls produced, which is exactly
+    // the seam a per-move-only test cannot see.
+    for (let i = 1; i < allCenters.length; i++) {
+      expect(allCenters[i].x - allCenters[i - 1].x).toBeLessThanOrEqual(step + 1e-6);
+    }
+    // State carries forward the true last point, not e.g. a stale one from an earlier sample.
+    expect(state).toEqual({ last: { x: 440, y: 0 } });
+  });
+
+  it('state === null opens a stroke — the whole answer is the press point', () => {
+    const { centers, state } = advancePaintStroke(null, { x: 12, y: 34 }, 40);
+    expect(centers).toEqual([{ x: 12, y: 34 }]);
+    expect(state).toEqual({ last: { x: 12, y: 34 } });
   });
 });

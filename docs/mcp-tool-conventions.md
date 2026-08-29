@@ -51,6 +51,20 @@ Corollaries:
   `args` currently runs the step with no arguments (S1.batch).
 - A tool with all-optional params and a destructive interpretation of `{}` is a hazard by
   construction (§7).
+- **A shared zod schema object used for TWO sibling params dedupes into a `$ref` in the advertised
+  inputSchema — even for a bare `z.boolean()`, not just objects.** `zod-to-json-schema` (what
+  builds the JSON a client sees) does this by REFERENCE, not by structural shape, so it bit
+  `modoki_dnd`'s `from`/`to` (a whole object collapsed to `{"$ref":"#/properties/from"}`), then
+  `modoki_drag`'s shared `pointSpec.allowOccluded` one field deeper after the first fix, then
+  `modoki_mutate_scene`'s `entity` field shared across three `discriminatedUnion` variants — three
+  instances of one mistake, the last two found only by writing the guard. A client that doesn't
+  resolve `$ref` reads that field as untyped and can encode it wrong (a real object arg failing
+  validation as "Expected object, received string"). **Every param a tool shares across two or
+  more sibling slots (`from`/`to`, union variants, …) must be built by a FACTORY FUNCTION called
+  fresh at each use site** (`makeEntitySpec`/`makePointSpec`/`makeDndEndpoint` in `shapes.ts`), all
+  the way down — a factory whose OWN fields still reference a shared const just moves the bug one
+  level deeper. Guarded: `engine/tests/tools/mcpSchemaNoRef.test.ts` walks every registered tool's
+  real schema and fails on any `$ref` found anywhere in it.
 
 ## 2. One name, one meaning
 

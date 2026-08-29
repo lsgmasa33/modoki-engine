@@ -35,6 +35,7 @@ import { getWebGPUSupported } from './gpuDetect';
 import { getRenderSettings, getEffectivePixiSettings } from './renderSettings';
 import { registerPointerPassthrough } from '../core/pointerBlockers';
 import { createRendererRecovery, type RendererRecovery } from './rendererRecovery';
+import { areDebugHandlesEnabled } from '../core/debugHandles';
 
 /** Resolve the PixiJS renderer backend the Canvas2D layer will actually use:
  *  honor an explicit `pixi.backend` render-setting ('webgpu'/'webgl'), else fall
@@ -747,7 +748,32 @@ export class Canvas2DPool {
 // surfaces don't collide with GameView's slots (Phase 0c).
 export const defaultPool = new Canvas2DPool();
 
-export function initPool(): Promise<void> { return defaultPool.initPool(); }
+export function initPool(): Promise<void> {
+  // Mirrors Scene3D.tsx's `window.__3d` — same gate, same reason: without a live
+  // handle on the 2D/PixiJS surface, an agent inspecting a Canvas2D entity's texture bindings,
+  // filters or container tree had to reach into this module's internals (`canvas2DPool.getApp()`)
+  // directly, which only a source read could discover. `pool` (not a single `app`) because this
+  // pool holds one Application PER Canvas2D entity slot — `getApp()` on it is the "first
+  // initialized" convenience the workaround already used; `getSlot(entityId).app` reaches a
+  // specific one.
+  //
+  // ⚠️ GameView ONLY, same as `window.__3d` — the SAME caveat CLAUDE.md already documents for
+  // it ("window.__3d is the runtime GameView, NOT the editor SceneView"). `defaultPool` backs
+  // ONLY the runtime/`Game.tsx` GameView; the editor SceneView's 2D surface is a SEPARATE
+  // `Canvas2DPool` instance (`editor/rendering/editorScene2D.ts`) that never assigns this handle
+  // — a 2D render bug on the SceneView (the render-on-demand surface where these bugs live, per
+  // CLAUDE.md's own rendering-debug rules) will read as `window.__2d.getApp() === null` here,
+  // which means "wrong surface", not "not rendering".
+  //
+  // `typeof window` guard: unlike Scene3D.tsx's assignment (inside a component that only ever
+  // mounts client-side), `initPool` is a free function reachable from `runtime/index.ts` by
+  // anything, including a Node-side caller with no DOM — an unguarded `window` there throws
+  // ReferenceError instead of returning the promise this function promises to return.
+  if (typeof window !== 'undefined' && (import.meta.env.DEV || areDebugHandlesEnabled())) {
+    (window as any).__2d = { pool: defaultPool, getApp: () => defaultPool.getApp() };
+  }
+  return defaultPool.initPool();
+}
 export function getApp(): Application | null { return defaultPool.getApp(); }
 export function allocate(entityId: number): Canvas2DSlot | null { return defaultPool.allocate(entityId); }
 export function mount(entityId: number): Canvas2DSlot | null { return defaultPool.mount(entityId); }

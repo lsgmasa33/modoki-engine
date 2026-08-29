@@ -8,11 +8,11 @@
 import { getCurrentWorld, findEntityByGuid } from '../core/ecs/world';
 import { markUIDirty } from '../core/uiDirty';
 import { getTraitByName } from '../core/ecs/traitRegistry';
-import { NO_SCROLL_REQUEST } from '../traits/UIScrollView';
+import { NO_SCROLL_REQUEST, NO_BEHAVIOR_REQUEST } from '../traits/UIScrollView';
 
 export interface ScrollViewNodeData {
   axis: string; snap: string; snapStop: string; overscroll: string; scrollbar: string;
-  scrollToX: number; scrollToY: number; scrollBehavior: string;
+  scrollToX: number; scrollToY: number; scrollToBehavior: string; scrollBehavior: string;
 }
 
 /** CSS for the scroll BOX itself. `UIElement.overflow` is a separate authored field and is
@@ -100,7 +100,7 @@ export function writeScrollState(guid: string, state: Partial<{
  * right and Court now follows it — but a rule whose violation is UNRECOVERABLE and silent is a
  * trap, so the clear no longer depends on the caller having got it right.
  */
-export function clearScrollRequest(guid: string): void {
+export function clearScrollRequest(guid: string, appliedBehavior?: string): void {
   const meta = getTraitByName('UIScrollView');
   if (!meta || !guid) return;
   const world = getCurrentWorld();
@@ -111,6 +111,19 @@ export function clearScrollRequest(guid: string): void {
   const patch: Record<string, unknown> = {};
   if (cur.scrollToX !== NO_SCROLL_REQUEST) patch.scrollToX = NO_SCROLL_REQUEST;
   if (cur.scrollToY !== NO_SCROLL_REQUEST) patch.scrollToY = NO_SCROLL_REQUEST;
+  // The per-request behaviour is part of the request, so it is consumed with it — otherwise a
+  // single 'smooth' request would keep steering every later one that named no behaviour, which is
+  // the AUTHORED default's job (#409).
+  //
+  // ⚠️ Cleared only when the LIVE value is still the one that was applied, which the caller passes
+  // in. The decision to clear is made from the projection SNAPSHOT, but this reads the trait live,
+  // and the two can disagree: a new `scrollToEntry` writes `scrollToBehavior` IMMEDIATELY, while
+  // its `scrollToX/Y` arrive a frame later via `entriesSystem`. So a request arming 'smooth'
+  // between the tree rebuild and React flushing the previous request's effect would have had its
+  // behaviour wiped by that effect and silently fallen back to the authored default. The `-1`
+  // sentinels above need no such guard — a new request never writes them.
+  const behaviorMatches = appliedBehavior === undefined || cur.scrollToBehavior === appliedBehavior;
+  if (behaviorMatches && cur.scrollToBehavior !== NO_BEHAVIOR_REQUEST) patch.scrollToBehavior = NO_BEHAVIOR_REQUEST;
   if (Object.keys(patch).length === 0) return;
   entity.set(meta.trait, { ...cur, ...patch });
   // ⚠️ This one DOES dirty, unlike its siblings in this file, and the asymmetry is the point.
@@ -137,8 +150,12 @@ export function pendingScrollTo(s: ScrollViewNodeData): { left?: number; top?: n
   const hasX = s.scrollToX !== NO_SCROLL_REQUEST;
   const hasY = s.scrollToY !== NO_SCROLL_REQUEST;
   if (!hasX && !hasY) return null;
+  // Per-request override first, authored default second (#409). `''` is "no override" — the
+  // request field is transient and `runtimeOnly`, `scrollBehavior` is the author's, and the two
+  // used to be the SAME field, which is how a request destroyed an authored 'smooth'.
+  const motion = s.scrollToBehavior || s.scrollBehavior;
   const out: { left?: number; top?: number; behavior: ScrollBehavior } = {
-    behavior: s.scrollBehavior === 'smooth' ? 'smooth' : 'instant',
+    behavior: motion === 'smooth' ? 'smooth' : 'instant',
   };
   if (hasX) out.left = s.scrollToX;
   if (hasY) out.top = s.scrollToY;

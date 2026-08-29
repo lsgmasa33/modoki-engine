@@ -53,9 +53,20 @@ const REQUIRED: Array<{ file: string; ids: string[]; why: string }> = [
       'sceneView.toolbar.gizmo.', 'sceneView.toolbar.gizmo.space', 'sceneView.toolbar.collider-points',
       'sceneView.toolbar.viewOptions3d', 'sceneView.toolbar.viewOptionsUi',
       'sceneView.toolbar.fx-preview', 'sceneView.toolbar.grid', 'sceneView.toolbar.colliders',
-      'sceneView.toolbar.focus', 'sceneView.toolbar.colliders2d',
+      'sceneView.toolbar.focus', 'sceneView.toolbar.colliders2d', 'sceneView.toolbar.layer.',
     ],
-    why: 'the viewport toolbar — gizmo mode/space, collider point editing, and the "View" dropdown (FX/Grid/Colliders in 3D, FX/Focus/Colliders in 2D).',
+    why: 'the viewport toolbar — gizmo mode/space, collider point editing, the "View" dropdown (FX/Grid/Colliders in 3D, FX/Focus/Colliders in 2D), and the 3D/2D/UI layer toggles (#373).',
+  },
+  {
+    // spriteEditor.cancel/.save predate this change and are only 2 dot-segments — LEGACY_2SEG
+    // below exempts them from the namespacing check rather than leaving them unguarded, because
+    // this file's own findReferences.footer.close entry argues a modal's EXIT is load-bearing:
+    // while the modal is open every other handle reports occluded, so an untagged Close/Cancel
+    // traps an agent inside it. This modal opens via `useOverlay(true, 'sprite-editor')` and is
+    // exactly that shape — and three QA cases already address these two ids by selector.
+    file: 'panels/SpriteEditor.tsx',
+    ids: ['spriteEditor.cancel', 'spriteEditor.save', '`spriteEditor.slice.${s.guid}`'],
+    why: 'each row in the Sprites list — the only tap-based route to select a slice (#373).',
   },
   {
     file: 'panels/SceneViewGizmo.tsx',
@@ -226,9 +237,15 @@ describe('data-ui-id tagging has not rotted', () => {
     expect(read('components/ContextMenu.tsx')).toContain("data-ui-disabled={item.disabled ? 'true' : undefined}");
   });
 
+  // Ids that predate the <panel>.<region>.<name> convention (2 dot-segments) — exempted from the
+  // check below rather than left out of REQUIRED entirely, since dropping them from REQUIRED
+  // would leave them unguarded. Renaming them is real churn: `qa/cases/**` and `qa/knowledge.md`
+  // already address both by selector.
+  const LEGACY_2SEG = new Set(['spriteEditor.cancel', 'spriteEditor.save']);
+
   it('every tagged id is dot-namespaced as <panel>.<region>.<name>', () => {
     // Coherence: an agent should be able to guess `assets.toolbar.*` from `hierarchy.toolbar.*`.
-    const statics = REQUIRED.flatMap((r) => r.ids).filter((id) => !id.startsWith('`'));
+    const statics = REQUIRED.flatMap((r) => r.ids).filter((id) => !id.startsWith('`') && !LEGACY_2SEG.has(id));
     expect(statics.length).toBeGreaterThan(15); // this check is worthless if the list is empty
     for (const id of statics) {
       expect(id.split('.').length, `"${id}" should have at least 3 dot segments`).toBeGreaterThanOrEqual(3);

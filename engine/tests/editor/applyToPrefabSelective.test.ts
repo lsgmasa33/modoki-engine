@@ -8,6 +8,7 @@ import { getTraitByName } from '@modoki/engine/runtime';
 import {
   instantiatePrefab,
   applyToPrefabSelective,
+  PREFAB_FORMAT_VERSION,
   type PrefabFile,
 } from '@modoki/engine/editor';
 
@@ -110,6 +111,15 @@ describe('applyToPrefabSelective', () => {
     expect(childTransform.x).toBe(99);             // selected — applied
     expect(childTransform.y).toBe(0);              // not edited — base
     expect(childRenderable.material).toBe('base.mat.json'); // edited but NOT selected — base preserved
+
+    // ...and the file is stamped with the CURRENT format version (#379 close-out). This is the
+    // scenario verbatim: `makePrefab()` is a legacy `version: 1` document, and a value-only apply
+    // rewrites the whole thing with today's serializer semantics. `applyOverridesToPrefab` is the
+    // fourth writer of this field and used to stamp nothing at all, leaving a v2-written file
+    // claiming v1 — the #379 dishonesty in the other direction. It survived that issue's sweep
+    // because the sweep grepped for the token `version`, which a writer that never mentions it
+    // cannot match.
+    expect(writtenJson!.version).toBe(PREFAB_FORMAT_VERSION);
   });
 
   it('does nothing when the selected set is empty', async () => {

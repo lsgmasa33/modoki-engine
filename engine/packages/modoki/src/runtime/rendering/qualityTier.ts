@@ -187,6 +187,12 @@ export interface TierRenderOverrides {
   maxDirectional: number;
   /** Most POINT+SPOT ("local") lights an object may be lit by. 0 = unlimited. */
   maxLocal: number;
+  /** Fraction in [0, 1) a challenger light must beat the incumbent SELECTION by before it
+   *  replaces it (#353) — passed straight through to `LightCaps.hysteresisMargin`. Undefined (or
+   *  0) is a no-op: `maxDirectional`/`maxLocal` alone flap on a near tie that evolves across
+   *  frames as an object or a light animates, because index-based tie-breaking only ever
+   *  catches an EXACT tie. See that field's own doc for what the number trades off. */
+  hysteresisMargin?: number;
   /** Most lights that may RENDER A SHADOW MAP this frame. **0 = unlimited.** (#229)
    *
    *  The sibling of `maxDirectional`/`maxLocal`, and NOT covered by them: those cap how many
@@ -323,6 +329,18 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
     // IBL saving on FRAME RATE, which is where it actually lands.
     pixelRatioCap: 1, antialias: false, shadows: false, shadowMapCeiling: 512, postFX: NO_POSTFX,
     maxDirectional: 1, maxLocal: 1,
+    // 0.15 (#353) — run against the SHIPPED code with two of postfx-demo's real point-light
+    // positions (8 units apart; no scene has an overlapping multi-light bucket today, so the
+    // near-tie itself is synthetic geometry, not an authored one): a stationary object hovering
+    // ~2cm from the exact equidistance/equi-effectiveness tie flapped the selection 12 times over
+    // 30 frames at margin 0, 0 times at 0.15. A genuine crossing DOES cost some handoff lag while
+    // the gap sits inside the margin band — that is the mechanism working as designed, not a side
+    // effect — but a challenger that clears the margin hands off on the exact same frame it would
+    // at margin 0 (verified: the frame-by-frame trace matches once the gap exceeds ~15%). A
+    // starting point, not a final one — see `LightCaps.hysteresisMargin`'s doc for what it trades
+    // off, and retune by watching a moving light in the editor if a scene's own geometry needs a
+    // different value.
+    hysteresisMargin: 0.15,
     // Inert while `shadows: false` above holds, and set to the honest value anyway rather than 0:
     // a project that turns shadows back on at `low` (its tier config is its own to tune) must not
     // silently inherit "unlimited" from a row that had no reason to think about it.
@@ -415,6 +433,7 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
   mid: {
     pixelRatioCap: 1.5, antialias: false, shadows: true, shadowMapCeiling: 1024, postFX: NO_POSTFX,
     maxDirectional: 2, maxLocal: 3,   // enforced per frame — see above
+    hysteresisMargin: 0.15,           // #353 — see `low`'s row for the measurement
     // ⚠️ **1 IS A DELIBERATE BEHAVIOUR CHANGE**, in the same spirit as `low`'s `targetFps: 30`
     // below: `0` would be authorable-and-inert, and this issue exists precisely because there was
     // nothing between "all shadows off" and "every caster renders a full map". At ~3.6 ms per
@@ -472,6 +491,12 @@ export const TIER_SETTINGS: Record<QualityTier, TierRenderOverrides> = {
 export const UNCLAMPED_OVERRIDES: TierRenderOverrides = {
   pixelRatioCap: Infinity, antialias: true, shadows: true, shadowMapCeiling: 0, postFX: ALL_POSTFX,
   maxDirectional: 0, maxLocal: 0, maxShadowCasters: 0,
+  // Explicitly 0 (a no-op — `clampMargin` treats it exactly as absent) rather than omitted, so
+  // this object lists EVERY field and `hasEveryField` can therefore check every field. It was
+  // omitted while the value was tier-only; now that a project can author it as a default (#403),
+  // an authored config that happens to lack it must fall through to the project's value rather
+  // than be waved past as "complete".
+  hysteresisMargin: 0,
   ibl: true, iblOffAmbientBoost: 1, iblOffExposure: 1,
   // `0` (not `Infinity`) is the identity for these two, because both fields carry the "0 = no cap"
   // sentinel rather than a numeric ceiling — `applyTierToTargetFps`/`applyTierToPixi` widen it to
@@ -499,12 +524,107 @@ export function configCount(authored: AuthoredTiers | undefined): number {
   return 1 + (authored?.mid ? 1 : 0) + (authored?.low ? 1 : 0);
 }
 
+/** The DEFAULT-tier fields a project may author directly (#403), as a patch over
+ *  {@link UNCLAMPED_OVERRIDES}.
+ *
+ *  ⚠️ **THESE SEVEN USED TO BE TIER-ONLY, AND THE ASYMMETRY WAS THE BUG.** Every other field in
+ *  `TierRenderOverrides` has a project-level twin the author can set for the default tier
+ *  (`pixelRatioCap`, `antialias`, `shadows`, `targetFps`, the two `pixi` fields); these seven
+ *  existed *only* inside an authored `mid`/`low`, with the default hardcoded here. So the Project
+ *  Settings tier matrix could offer "cap shadow maps at 1024 on a weak device" and had no way to
+ *  say "cap them at 1024, full stop" — the author could degrade a value they could not set.
+ *
+ *  Partial, and every absent key means "keep the engine identity": a project that authors none of
+ *  them resolves byte-identically to before, which is what made this safe to add to a system with
+ *  22 seeded configs in the fleet. */
+/** The default-authorable fields, as a VALUE — the single source both the type below and the
+ *  runtime read (`projectTierDefaults`, renderSettings.ts) are derived from.
+ *
+ *  ⚠️ A list, not a hand-written union plus a hand-written object literal, because those two were
+ *  the same list written twice and nothing compared them: a ninth field added to the type, the
+ *  config and the matrix would have been silently dropped by the reader — an authored field
+ *  nothing parses, which is the failure this whole change exists to remove. Deriving both from
+ *  here makes that unrepresentable rather than merely tested for.
+ *
+ *  ⚠️ `textureMaxSize` is deliberately ABSENT even though it is a `TierRenderOverrides` field: it
+ *  is honoured by the BUILD, not the runtime, and the build only emits a downscaled variant for a
+ *  cap a `mid`/`low` tier names. See the `textureMaxSize` row in `editor/panels/qualityTiersModel.ts`. */
+export const TIER_DEFAULT_FIELDS = [
+  'ibl', 'iblOffAmbientBoost', 'iblOffExposure', 'shadowMapCeiling',
+  'maxDirectional', 'maxLocal', 'hysteresisMargin', 'maxShadowCasters',
+] as const satisfies readonly (keyof TierRenderOverrides)[];
+
+export type TierDefaultField = (typeof TIER_DEFAULT_FIELDS)[number];
+
+export type TierDefaultOverrides = Readonly<Partial<Pick<TierRenderOverrides, TierDefaultField>>>;
+
+/** The own keys of `o` whose value is not `undefined`. Generic on purpose — an eighth
+ *  default-tier field is covered the moment it is added to {@link TierDefaultOverrides}, where a
+ *  hand-written key list here would go stale invisibly. */
+function definedOnly<T extends object>(o: T): Partial<T> {
+  const out: Partial<T> = {};
+  for (const k of Object.keys(o) as (keyof T)[]) {
+    if (o[k] !== undefined) out[k] = o[k];
+  }
+  return out;
+}
+
+/** Memo for {@link baseOverrides}, keyed on the DEFAULTS object. `getActiveTierOverrides()` runs
+ *  per frame, so merging the project's authored defaults over the identity on every read would
+ *  allocate — the same GC pressure, on the same weak hardware, that {@link completed} exists to
+ *  avoid. Safe because `renderSettings` REPLACES `settings.three` on every `setRenderSettings`
+ *  rather than mutating it in place, so a stale base cannot outlive the config it was built from. */
+const defaultBases = new WeakMap<object, TierRenderOverrides>();
+
+/** The unclamped identity with the project's authored DEFAULT-tier fields applied — the base every
+ *  tier resolves against.
+ *
+ *  ⚠️ **A PROJECT THAT CHANGED NOTHING GETS `UNCLAMPED_OVERRIDES` ITSELF, BY REFERENCE.** Not a
+ *  nicety: callers compare this object by identity to mean "the default config" (and the tier
+ *  suite asserts `toBe(UNCLAMPED_OVERRIDES)` for a project with no tiers), so returning a
+ *  value-identical COPY would be a silent behaviour change for every project on the day these
+ *  fields were added — which is exactly what "each defaults to the engine identity" promises does
+ *  not happen. Both the absent-defaults case and the all-identity case therefore short-circuit. */
+function baseOverrides(defaults: TierDefaultOverrides | undefined): TierRenderOverrides {
+  if (!defaults) return UNCLAMPED_OVERRIDES;
+  let base = defaultBases.get(defaults);
+  if (!base) {
+    // Through `definedOnly`, NOT a bare spread: an EXPLICIT `undefined` in the patch would
+    // otherwise clobber the identity, and "the project did not author this field" must mean
+    // unclamped — never `undefined`, which is the `Math.min(x, undefined) === NaN` shape that
+    // {@link complete} exists to absorb one level down.
+    const patch = definedOnly(defaults);
+    base = isIdentityPatch(patch) ? UNCLAMPED_OVERRIDES : { ...UNCLAMPED_OVERRIDES, ...patch };
+    defaultBases.set(defaults, base);
+  }
+  return base;
+}
+
+/** Does every field in this patch already equal the engine identity? Compared field-by-field
+ *  against {@link UNCLAMPED_OVERRIDES} rather than by a "did the project write a config" flag,
+ *  and that distinction is the whole point: **no `project.config.json` contains these keys** (the
+ *  files stay minimal, recording only what a project chose), but `mergeProjectConfig` overlays the
+ *  defaults before anything reaches the engine — so the RESOLVED config every project hands us
+ *  carries all of them, present and at their identity values. Presence therefore answers nothing;
+ *  only "does any of them differ" does. */
+function isIdentityPatch(patch: Partial<TierRenderOverrides>): boolean {
+  for (const k of Object.keys(patch) as (keyof TierRenderOverrides)[]) {
+    if (patch[k] !== UNCLAMPED_OVERRIDES[k]) return false;
+  }
+  return true;
+}
+
 /** The overrides in force for a tier, given what the project authored.
  *
  *  Falls DOWN, never up: a `low` on a project that only authored `mid` gets `mid`, because the
  *  author's most conservative config is the closest thing to what they meant. Reaching for the
  *  unclamped default there would hand the weakest hardware the settings the author was explicitly
  *  degrading away from.
+ *
+ *  `defaults` (#403) is what the project authored for the DEFAULT tier — see
+ *  {@link TierDefaultOverrides}. It replaces the hardcoded identity as the base a `mid`/`low`
+ *  config is completed against, so a tier that omits a field inherits the PROJECT's default for it
+ *  rather than the engine's. Omit it and every resolution is exactly what it was before.
  *
  *  ⚠️ A consequence worth stating rather than discovering: on a project that has authored NOTHING,
  *  every tier resolves to the same unclamped default — so **pinning `qualityTier: 'low'` does
@@ -514,20 +634,29 @@ export function configCount(authored: AuthoredTiers | undefined): number {
 export function resolveTierOverrides(
   tier: QualityTier,
   authored: AuthoredTiers | undefined,
+  defaults?: TierDefaultOverrides,
 ): TierRenderOverrides {
-  if (tier === 'high') return UNCLAMPED_OVERRIDES;
-  if (tier === 'mid') return complete(authored?.mid);
-  return complete(authored?.low ?? authored?.mid);
+  const base = baseOverrides(defaults);
+  if (tier === 'high') return base;
+  if (tier === 'mid') return complete(authored?.mid, base);
+  return complete(authored?.low ?? authored?.mid, base);
 }
 
-/** Memo for {@link complete}, keyed on the AUTHORED object. `getActiveTierOverrides()` is called
- *  per frame by the render loop (`reconcileToneExposure`, `syncLights`), so completing by spread on
- *  every read would allocate two objects per frame per call site — GC pressure on precisely the
- *  weak hardware these tiers exist for. A `WeakMap` makes the steady state allocation-free and
- *  drops the entry with the config. */
-const completed = new WeakMap<object, TierRenderOverrides>();
+/** Memo for {@link complete}, keyed on the AUTHORED object and then on the BASE it was completed
+ *  against. `getActiveTierOverrides()` is called per frame by the render loop
+ *  (`reconcileToneExposure`, `syncLights`), so completing by spread on every read would allocate
+ *  two objects per frame per call site — GC pressure on precisely the weak hardware these tiers
+ *  exist for. A `WeakMap` makes the steady state allocation-free and drops the entry with the
+ *  config.
+ *
+ *  ⚠️ **KEYED ON BOTH, NOT JUST THE CONFIG (#403).** The completion now depends on the project's
+ *  authored defaults as well as on the config, so a single-level memo would serve the FIRST base a
+ *  config was ever seen with — silently, and forever after, on a project that later changed a
+ *  default. Two levels cost one extra lookup per frame and cannot go stale that way. */
+const completed = new WeakMap<object, WeakMap<object, TierRenderOverrides>>();
 
-/** Fill in fields an authored config does not carry, from {@link UNCLAMPED_OVERRIDES}.
+/** Fill in fields an authored config does not carry, from the project's resolved default base
+ *  (which is {@link UNCLAMPED_OVERRIDES} unless the project authored defaults of its own — #403).
  *
  *  ⚠️ **THIS IS NOT DEFENSIVE PADDING — 22 project configs are missing fields RIGHT NOW.** A4
  *  seeded the fleet with the ten fields that existed then, and the seed is idempotent (it skips a
@@ -540,16 +669,23 @@ const completed = new WeakMap<object, TierRenderOverrides>();
  *  Absent means UNCLAMPED, never "0"/"false": a config written before a field existed cannot have
  *  meant to clamp it. `postFX` is merged one level deeper for the same reason — a partial
  *  `{npr:false}` must not read as "every other effect off". */
-function complete(o: TierRenderOverrides | undefined): TierRenderOverrides {
-  if (!o) return UNCLAMPED_OVERRIDES;
-  let full = completed.get(o);
+function complete(o: TierRenderOverrides | undefined, base: TierRenderOverrides): TierRenderOverrides {
+  if (!o) return base;
+  let byBase = completed.get(o);
+  if (!byBase) {
+    byBase = new WeakMap();
+    completed.set(o, byBase);
+  }
+  let full = byBase.get(base);
   if (!full) {
     // A config that already carries every field is returned AS ITSELF, not copied. That keeps the
     // identity `resolveTierOverrides` has always had (its tests assert `toBe`, and a caller may
     // reasonably compare references to detect "same config"), and means the completion path only
-    // exists for the configs that actually need it.
-    full = hasEveryField(o) ? o : { ...UNCLAMPED_OVERRIDES, ...o, postFX: { ...ALL_POSTFX, ...o.postFX } };
-    completed.set(o, full);
+    // exists for the configs that actually need it. Such a config overrides every field the base
+    // could have supplied, so the base is irrelevant to it — which is why this stays correct under
+    // the two-level memo.
+    full = hasEveryField(o) ? o : { ...base, ...o, postFX: { ...base.postFX, ...o.postFX } };
+    byBase.set(base, full);
   }
   return full;
 }

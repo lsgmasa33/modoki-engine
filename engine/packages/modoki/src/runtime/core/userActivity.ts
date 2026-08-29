@@ -15,7 +15,7 @@
  *  digits; the governor moved `cpuMs` only 5.6 → 8.4 ms. The distinction matters because a
  *  governor story implies the sample recovers once clocks ramp, and it does not: the interval
  *  belongs to the display. Full measurement, and the second half of the fix this signal is only
- *  one half of, in `docs/rendering.md` § "an idle window is not evidence".
+ *  one half of, in `docs/rendering.md` § "Quality tiers" (the "AN IDLE WINDOW IS NOT EVIDENCE EITHER" rule).
  *
  *  The owner's rule (2026-08-20): **an idle window is not evidence, in either direction** — the
  *  same rule already applied to scene-load frames (`armTierCalibration`), rather than a

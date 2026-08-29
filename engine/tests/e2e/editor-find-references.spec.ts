@@ -29,6 +29,7 @@
 
 import { test, expect } from '@playwright/test';
 import { gotoEmptyEditor, gotoEditorWithScene } from './helpers';
+import { pickHostProject } from './hostProject';
 
 /** Category groups collapse by default, so seed the expanded set to get rows.
  *  Mirrors `gotoEditorWithAssets` in editor-assets.spec.ts. */
@@ -48,6 +49,11 @@ async function gotoEditorWithAssets(page: import('@playwright/test').Page) {
 }
 
 test('Assets → Find References opens the dialog and it settles on an answer', async ({ page }) => {
+  // Unlike the Hierarchy half below (which loads a fixture scene through the test
+  // bridge, project-independent), this half browses whatever project the editor opens
+  // by default — a release snapshot of the public OSS repo publishes with NO projects
+  // (games/ and demos/ both absent). See hostProject.ts for the pick and why it can't throw.
+  test.skip(!pickHostProject(), 'Assets → Find References: this snapshot ships no project for the Assets panel to list');
   await gotoEditorWithAssets(page);
 
   await page.locator('[data-asset-path]').first().click({ button: 'right' });

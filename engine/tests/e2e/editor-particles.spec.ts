@@ -22,7 +22,7 @@ import { test, expect } from '@playwright/test';
 import fs from 'fs';
 import path from 'path';
 import { gotoEditorWithScene, idByName, traitField } from './helpers';
-import { discoverProjects } from '../../scripts/projectRoots.mjs';
+import { pickHostProject } from './hostProject';
 
 const SCENE = '/tests/e2e/fixtures/e2e-particle.scene.json';
 // Minted once for this fixture — NOT the confetti GUID. Kept stable so the scene
@@ -30,17 +30,10 @@ const SCENE = '/tests/e2e/fixtures/e2e-particle.scene.json';
 const PARTICLE_GUID = 'e78aaf22-bd6b-4eec-86a1-34fe9863566a';
 
 // A `<root>/<name>/runtime/assets` dir maps to the URL `/<root>/<name>/assets`
-// (vite-asset-scanner). games/ is PREFERRED over demos/ deliberately: both work,
-// but demos/ is the published set — a crash between beforeAll and afterAll would
-// strand `__e2e_particle__` inside a project that gets snapshotted to a public repo.
-// Where there is a private project to use, use it. (Same pattern as editor-model-import.spec.ts.)
-const HOST = (() => {
-  const projects = discoverProjects(process.cwd()) as { root: string; name: string; dir: string }[];
-  const host = projects.find((p) => p.root === 'games') ?? projects[0];
-  if (!host) throw new Error('editor-particles: no project found to host the generated particle asset');
-  return host;
-})();
-const ABS_DIR = path.join(HOST.dir, 'runtime/assets/__e2e_particle__');
+// (vite-asset-scanner). See hostProject.ts for the pick and why it can't throw.
+const HOST = pickHostProject();
+test.skip(!HOST, 'editor-particles: this snapshot ships no project to host the generated particle asset');
+const ABS_DIR = HOST ? path.join(HOST.dir, 'runtime/assets/__e2e_particle__') : '';
 
 const PARTICLE_JSON = {
   version: 1,
@@ -62,12 +55,19 @@ const PARTICLE_JSON = {
 };
 
 test.beforeAll(async () => {
+  // The file-level test.skip above covers the tests, but whether Playwright still runs a
+  // beforeAll/afterAll when every test in the file is skipped is a semantic this repo cannot
+  // observe from a clone (which always HAS a project). Guard explicitly: with no host,
+  // ABS_DIR is '' and mkdirSync('') throws — which would turn a clean skip into a failure on
+  // exactly the project-less snapshot this change exists for.
+  if (!HOST) return;
   fs.rmSync(ABS_DIR, { recursive: true, force: true });
   fs.mkdirSync(ABS_DIR, { recursive: true });
   fs.writeFileSync(path.join(ABS_DIR, 'e2e.particle.json'), JSON.stringify(PARTICLE_JSON, null, 2));
 });
 
 test.afterAll(() => {
+  if (!HOST) return;
   fs.rmSync(ABS_DIR, { recursive: true, force: true });
 });
 

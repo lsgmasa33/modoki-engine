@@ -47,6 +47,29 @@ native plugins → `dist/`) **and** `engine/scripts/bootstrap-game-deps.mjs`, wh
 `dist/` is what makes `npm test` / the editor fail with `Failed to resolve import
 "capacitor-<x>"`. See the Two Clones section of `CLAUDE.md`.
 
+The chain also runs `engine/scripts/stamp-plugin-builds.mjs` immediately after `build:plugins`
+(#395). `build:plugins` builds each plugin's `dist/` directly and wrote no **build stamp**, so the
+next caller of `ensurePluginBuilt` (the editor on open, the vendorer, a test) read a perfectly
+current `dist/` as STALE and rebuilt it — deleting and recreating `dist/` *inside the repo* while
+other processes were importing it. Under `npm run verify` that raced the app lane's
+`await import('capacitor-game-debug')` and failed the suite with exactly the resolve error above —
+once. It never reproduced on a re-run, because by then the rebuild had written the stamp. The
+stamp is source-derived and shares `pluginSourceHash` with `ensurePluginBuilt`, so the two cannot
+disagree about what counts as a build input.
+
+Two properties make that stamp safe rather than merely convenient, and both are easy to break:
+
+- **It stamps only the workspaces `build:plugins` names**, parsed out of the script — NOT the set
+  `listEnginePlugins` discovers. Those two are allowed to diverge (`pluginBuildCoverage.test.ts`
+  says so: a plugin used solely by a game reaches it as a vendored `.tgz` and needs no workspace
+  build). Stamping the discovered set would vouch for a plugin this install never built — and a
+  stale `dist/` left over from an earlier build would then be trusted **forever**, since the stamp
+  is computed from the plugin's CURRENT sources. That is the #90 failure the stamp exists to
+  prevent: a tarball whose name is current and whose bytes are stale.
+- **The `&&` chaining** means a failed build never reaches the stamper. Note npm does *not* abort
+  at the first failing workspace — later ones still build — but the overall exit is non-zero, so
+  nothing is stamped and the successful siblings simply pay one redundant rebuild.
+
 ⚠️ **That same error can mean a HALF-built `dist/`, not a missing one — and the install will
 have told you it succeeded.** A plugin's `build` is `tsc && rollup`, so a `tsc` failure leaves
 `dist/esm` present and `dist/plugin.cjs.js` (the `main` entry) absent; `bootstrap-game-deps.mjs`
@@ -177,6 +200,33 @@ git ls-files 'games/*/ios/**' 'games/*/android/**' | git check-ignore --stdin
 `@capacitor/assets` during the native build. That combination is only safe because the build
 **skips regeneration when nothing changed** (`engine/plugins/iconAssets.ts`).
 
+**Where the source image comes from, and the trap in it.** `app.iconSource` in
+`<project>/project.config.json` is a **project-relative** path (absolute is honoured too). When it
+is **empty — the scaffolder's default — the build falls back to the repo-root `build/icon.png`,
+which is the Modoki EDITOR's own icon**, so an unconfigured project silently ships Modoki's panda
+as its app icon and looks authored. ⚠️ **`<project>/assets/icon.png` is NOT the source**, however
+much it reads like one: `generate-icons.mjs` COPIES the resolved source there because that is
+`@capacitor/assets`' input convention, and `games/*/assets/` + `demos/*/assets/` are **gitignored**.
+Editing that file changes nothing and is overwritten on the next run — put the master somewhere
+tracked (`games/court/art/icon-app-master.png` is the worked example) and point `iconSource` at it.
+
+**Keep the committed value project-relative** (#394). `project.config.json` is tracked, so
+`/Users/<name>/Projects/modoki/games/court/art/…` is dead on every other clone, dead on `win`, and
+dead in a copied-out `games/<id>` (#29) — besides being a home path in a file `demos/`' publish
+scan hard-fails on. Project Settings' **Browse…** can only ever return an absolute path, so
+`/api/pick-path` relativises one that resolves under the project root (`relativiseUnderProject`,
+symlinked ancestors included) and keeps absolute only what genuinely escapes — which is right for
+the `user.sdk.*` fields, since those live in the gitignored `project.user.json`, and wrong here.
+Two routes still reach an absolute value in this field: **picking a file that lives outside the
+project** (it has no relative form) and typing one in. Neither is refused — the build honours an
+absolute `iconSource` — so instead the dialog shows an inline warning under any `committedPath`
+field holding a non-portable value (`committedPathWarning`: absolute, `~`, a drive letter, a `\`
+separator, or a `..` segment that escapes the project). The gate imports that same predicate rather
+than restating it, and
+`tests/architecture/trackedConfigPaths.test.ts` fails the gate before one reaches a commit. That
+guard reads the schema, so a new `type: 'path'` field outside `user.*` (#396's splash source) has
+to be listed in it or the guard goes red.
+
 Two things went wrong before it did:
 
 - The step ran on **every** native build, rewriting every tracked mipmap/splash PNG each time,
@@ -197,6 +247,134 @@ source image. Regeneration happens when any of those change, or when the generat
 been deleted (a sentinel file is checked, so a wiped `res/` still comes back). Content-hashing
 means repointing `app.iconSource` at a byte-identical file is correctly a no-op, while editing
 an image in place is not.
+
+⚠️ **Everything #396/#397 added is in that stamp too** — the splash master and its dark twin, the
+title wordmark, the three icon-variant overrides, the badge artwork, the two placement numbers, the
+badge flag, the **orientation** (it decides where the overlays go, so it changes the output with
+every source file byte-identical), and a `SPLASH_PIPELINE_VERSION` for changes to our own
+post-processing, which no source file can express. This is not belt-and-braces: `iconStep` **drops
+itself from the build plan** on a stamp match, so an input the hash cannot see does not merely take
+an extra build to appear — it never appears, until someone deletes `.cache/icon-stamp-*` by hand.
+One case per input in `tests/plugins/iconAssets.test.ts`.
+
+### The splash: authored, not derived from the icon (#396)
+
+**`app.splashSource`** is the native launch screen — shown before the web view has booted at all,
+and NOT an in-game title card. Empty means what every project shipped before this: the splash is
+derived from `app.iconSource`, i.e. the app icon centred on white. `app.splashDarkSource` fills the
+iOS `-dark` slots and the Android `drawable-night-*` buckets, which had existed all along holding
+the light art; unset, it reuses the light splash.
+
+The generation half is smaller than it looks: `@capacitor/assets` has always read
+`assets/splash.png` and `assets/splash-dark.png` as first-class inputs and cover-crops them into
+every bucket. Nothing had ever put a file there — `generate-icons.mjs` staged only `assets/icon.png`
+— so every project's splash was its icon **by default rather than by design**.
+
+⚠️ **The staging directory is gitignored scratch that SURVIVES between builds**, so clearing
+`splashSource` has to actively delete `assets/splash*.png`; otherwise "remove the custom splash"
+regenerates the old one and appears to do nothing.
+
+**Both platforms COVER-FILL, so a splash is always shown cropped** — and on iOS the crop happens at
+RUNTIME, not at generation: `LaunchScreen.storyboard` shows a single square 2732² image with
+`contentMode="scaleAspectFill"`, which on a 19.5:9 phone leaves only **the central ~45% of the
+width** visible. `engine/scripts/splashLayout.mjs` derives that crop-safe box (the intersection of
+every crop the project's orientation allows) and the title and badge are placed inside it, per
+bucket, against that bucket's own dimensions. Nothing can rescue subject matter authored into the
+corners of the master, so compose around the centre column. `tests/plugins/splashLayout.test.ts`
+pins the derivation.
+
+**The title is composited, never painted into the art.** An image generator mangles lettering often
+enough that the one element which must be perfect cannot be trusted to it, and typesetting it at
+build time keeps `splashTitleWidthPct` / `splashTitleOffsetPct` tunable without regenerating
+artwork. `app.splashBadge` adds the small "Made by Modoki Engine" mark at the bottom of the safe
+box — **default OFF** (owner, 2026-08-28), so nothing already shipped grows a mark it did not have.
+The badge ships as two committed PNGs and picks cream or navy per image by **measuring** the mean
+luminance underneath it; its artwork is rebuilt by `engine/scripts/make-splash-badge.mjs`, whose
+output is committed precisely because it typesets through the system's fonts and would otherwise
+differ per machine.
+
+⚠️ **A real splash is enormous under sharp's defaults, and this is worth knowing before you author
+one.** `@capacitor/assets` writes PNGs with default options, which do almost nothing on a
+photographic image: Court's painted 2732² master came out at **17.6 MB per iOS slot** against 22 MB
+raw, and its first real generation produced **163 MB of committed binaries**. The panda-on-white it
+replaced compressed to nothing, so nothing had ever exercised this. `compressionLevel: 9` +
+`effort: 10` takes the same image to 4.2 MB **losslessly** (163 MB → 41 MB overall), and that
+re-encode runs for every splash of a project with a custom master, overlays or not.
+
+### ⚠️ On Android the generated splash buckets are NEVER DRAWN — the system splash is
+
+Measured on a Galaxy S22 (API 34), and it is not an old-device edge case: **at `minSdkVersion 31`
+this is every supported Android device.** The launch theme inherits `Theme.SplashScreen`, and from
+API 31 the platform draws its own splash and ignores `android:windowBackground` unless it is a
+single colour, so all 26
+`drawable-*` splash PNGs are dead weight in the APK and the player saw **the app icon on black**.
+
+**And the art cannot be moved there.** Google's splash-screen documentation is explicit — *"Set a
+single window background color with no transparency"*, *"The window background consists of a single
+opaque color"*. There is no documented opt-out; `windowSplashScreenAnimatedIcon` is an ICON
+(circularly masked, 240 dp with an icon background or 288 dp without); and the only image slot,
+`windowSplashScreenBrandingImage`, is 200x80 dp at the bottom, absent from the AndroidX compat
+library, and recommended against by Google. A full-bleed painted launch screen is **not achievable
+as the system splash on Android 12+**, by platform design.
+
+So the launch screen is split across two surfaces, and both halves are needed:
+
+1. **Colour** — `androidSplashTheme.mjs` samples the splash master's EDGE RING and writes it into
+   the launch theme (both the AndroidX and the platform spelling of the attribute). The icon then
+   sits on the game's own colour rather than black. The edge, not the whole image: what fills the
+   perimeter of the frame that follows is the master's border, and averaging the whole thing
+   returns a colour that appears nowhere — for Court, the wood averaged with the cream page.
+2. **Art** — the WEB boot splash below, which is why `App.tsx` hands the native splash over as soon
+   as that has painted rather than holding it until the game is ready.
+
+Verified on device: home → icon on Court's wood → the painted splash with its title and badge →
+the game. ⚠️ The dead `drawable-*` buckets are still generated and still committed (~16 MB on
+Court) — a project that lowered its floor below API 31 would need them, so removing them is an
+owner call rather than a cleanup.
+
+### The WEB boot splash — the same image as the loading screen
+
+The splash art is also emitted as `boot-splash.webp` and injected into `index.html` as a fixed,
+full-bleed element (`engine/plugins/bootSplash.ts`), so the browser paints the game's launch image
+from its **first paint** instead of the four hardcoded dark-navy surfaces that used to fill boot
+(white → `#0f0f23` → a "Loading..." string → the spinner overlay). It is injected into the HTML
+rather than rendered by React on purpose: the window being closed is precisely the one React is not
+alive for. `App.tsx` fades it out on the same "fully booted" signal that hides the native splash —
+so on device the native splash hands over to the identical composition rather than cutting to dark
+— and also whenever something must be seen underneath it (a boot error, an OTA download's
+progress), since a launch image outranking an error would turn an explained failure into a hang.
+Build-only, and skipped for the editor shell and for a playable.
+
+⚠️ **The native splash is handed over as soon as the boot splash has painted**, not when the game
+is ready — `hasBootSplash()` gates it, so a project with no boot splash keeps the old
+hold-until-booted behaviour. Phase 3b held it so nobody saw an unstyled white web view; that reason
+is gone now that the web view's first paint IS the artwork. On Android this is what makes the
+authored splash visible at all (see above). **There is deliberately no minimum display time**
+(owner, 2026-08-28: *"faster load is more important"*) — the splash is as brief as the boot is, and
+that is the intent, not a defect to tune out.
+
+### Icon variants — dark, tinted, monochrome (#397)
+
+`@capacitor/assets@3.0.5` emits one `universal` 1024 entry with no `appearances` and an
+`ic_launcher.xml` with no `<monochrome>`, so iOS 18's dark and tinted icons and Android 13's themed
+icon were all missing. `engine/scripts/iconVariants.mjs` writes them **after** the generator has
+run: both files it edits (the iOS `AppIcon.appiconset/Contents.json` and Android's
+`mipmap-anydpi-v26/ic_launcher*.xml`) sit INSIDE the running platform's product directory, so the
+#236 snapshot-and-restore never sees them — provided this keeps running after the restore, not
+before it. The XML edit is idempotent, because it runs on every build.
+
+Each variant is **derived by default and overridable per project** (`app.iconDarkSource`,
+`iconTintedSource`, `iconMonochromeSource`). ⚠️ **The derivations are fallbacks, not answers.** They
+take a finished painting and try to recover a mark from it, which is the wrong direction: Court's
+derived monochrome kept the region cells and the wood grain and gave a themed launcher a
+knight-shaped smudge. Any project whose icon is artwork rather than a flat mark should author that
+one — `games/court/art/make-icon-monochrome.mjs` is the worked example, and its header records why
+the obvious "the knight is the bright bit" key does not work.
+
+**Judging any of this needs a contact sheet, not a file browser.** `engine/scripts/review-icons.mjs
+--project <dir>` composites the real generated output at true size over both a light and a dark
+ground, simulates the Android adaptive mask at the real inset, shows the tinted variant under a
+tint, and shows each splash as a device crops it.
 
 **The generator does not stay inside the platform it is given** (#236). Measured on
 `forest-camp`: `generate --android` also rewrites `ios/App/App.xcodeproj/project.pbxproj`,
@@ -688,9 +866,13 @@ itself evidence (the killer already exited). Do not "simplify" the pattern back.
 
 Three loops, three jobs — don't conflate them:
 
-- **`editor:main` / `editor:ai` (+ `MODOKI_BACKEND_PORT=5181 …` for ai2)** — the **HMR dev loop**.
-  Vite dev server + Electron; edit a file, see it in ~200ms. This is for *building* the software and
-  is your default.
+- **`npm run editor:dev`** — the **HMR dev loop**. Vite dev server + Electron; edit a file, see it in
+  ~200ms. This is for *building* the software and is your default. It works unchanged in every clone:
+  the backend port comes from the clone DIRECTORY via `engine/scripts/editorPorts.mjs`, so no
+  `MODOKI_BACKEND_PORT=…` prefix is needed (#349 — that prefix used to be mandatory on every worker
+  clone, and forgetting it aimed the launch at the hub's 5179). The old clone-named `editor:main` /
+  `editor:ai` scripts were deleted with #349 — a per-clone NAME cannot be right in a repo every clone
+  shares, which is the same mistake as the per-clone port default they carried.
 - **`npm run test:packaged` / `smoke:packaged`** — the **faithful packaged loop**. Both run
   `electron-builder --dir` to produce the REAL `Modoki Editor.app` (asar packed, workspace symlinks
   dereferenced, devDeps pruned) — it is **the DMG minus code-signing + dmg-packaging** (the only slow
@@ -709,9 +891,12 @@ Three loops, three jobs — don't conflate them:
     editor lane** — so a throwaway smoke build could silently answer an agent's `modoki_*` calls
     (#68). `engine/tests/architecture/clonePortHardcoding.test.ts` now fails any packaged-app
     spawner that doesn't derive a port.
-  - **Per-clone MCP-targetable packaged editor**: `editor:main:packaged` / `editor:ai:packaged` (or
-    `MODOKI_BACKEND_PORT=<port> bash engine/scripts/test-packaged.sh games/<id>`) build the `.app` and
-    launch it on the clone's pinned backend port — the packaged app honors `MODOKI_BACKEND_PORT`, so
+  - **Per-clone MCP-targetable packaged editor**: `npm run editor:packaged` (or
+    `bash engine/scripts/test-packaged.sh games/<id>`) builds the `.app` and
+    launches it on the clone's pinned backend port — which `test-packaged.sh` now derives from the
+    clone directory itself (#349). It has to: the pin used to arrive only as a literal prefix on the
+    two npm entries, so running the script directly, or from ai2/ai3/qa, left `main.ts`'s
+    sticky-then-scan to pick — and that list *starts at 5179*. The packaged app honors `MODOKI_BACKEND_PORT`, so
     `MODOKI_BACKEND=http://127.0.0.1:<port>` drives it exactly like the dev editor. It uses the SAME
     port as that clone's dev editor, so run one **or** the other per clone, not both (the packaged app
     pins the port and refuses to drift). The launch stops the local dev editor + any packaged app
@@ -968,9 +1153,12 @@ config loader esbuild-bundles the config, then `loadConfigFromBundledFile` branc
 
 So `engine/scripts/stage-vite-config.cjs` (a `beforePack` stager) esbuild-bundles `vite.config.ts`
 into a gitignored `engine/vite.config.cjs` shipped in the bundle, and `chooseViteConfig()`
-(`engine/scripts/viteConfigChoice.mjs`) hands Vite that one when it exists. Regenerated on every
-pack, so it cannot drift; chosen by file existence rather than an env var, so a dev clone (no
-`.cjs`) and a packaged app (always one) cannot disagree.
+(`engine/scripts/viteConfigChoice.mjs`) hands Vite that one when the engine is running **packaged**
+(not by whether a `.cjs` happens to exist — a stray one left behind by an interrupted pack would
+otherwise make a dev clone silently build against a frozen snapshot, and a packaged app whose
+`.cjs` never got staged would otherwise silently fall back to the writing config with nothing
+said). Deciding on packaged-ness makes a stray `.cjs` in a clone inert and a missing one in a
+packaged app loud instead.
 
 ⚠️ **Bundling to CJS empties `import.meta`, and this plugin graph is full of self-locating modules.**
 Three already branch to `__filename`/`__dirname` when it is absent — and `native-dynamic-import.ts`
@@ -998,8 +1186,8 @@ walks up to the same `node_modules` anyway. Both classes are pinned by
    the build where the bundle is invalid, and a build that dies mid-config-load leaves the file. The
    persistent breaks measured on the v0.5.1/v0.5.2 rcs were the other two writers in the table.
    The fix is still worth having (no write at all, and it removes the Windows EPERM at its source —
-   see `docs/windows.md`, where the installer grant STAYS until Windows verifies it) but do not
-   re-derive the causal story from this paragraph: **re-measure**, per QA-PKG-0009 step 7.
+   confirmed on Windows, grant removed entirely, see `docs/windows.md`) but do not re-derive the
+   causal story from this paragraph: **re-measure**, per QA-PKG-0009 step 7.
 2. **A broken seal does not strand users.** Measured against the real GitHub feed with the published
    signed `v0.4.0` (feed latest `v0.4.1`): a seal-broken app still launches, its main binary still
    reports a Developer ID signature so the ad-hoc skip in `autoUpdate.ts` never fires, the check
@@ -1127,7 +1315,20 @@ Two notes worth carrying:
   its tarball. Expect a re-vendor after a docs-only plugin edit.
 - To re-vendor **without** building: `node engine/scripts/vendor-plugins.mjs games/<id>`, then
   `npm install` in the project. `engine/tests/architecture/vendoredPluginFreshness.test.ts` fails
-  `npm test` on a project whose pin has gone stale.
+  `npm test` on a project whose pin has gone stale — and, since #375, on a tarball whose NAME is
+  current while its BYTES are not. That second check OPENS the `.tgz` and compares it to the plugin
+  source file by file; the name check alone let an interrupted re-vendor, a merge that took the new
+  `package.json` with the old `plugins/*.tgz`, or a `git checkout <old-sha> -- <project>/plugins/`
+  pass green and ship the previous native code. It compares the shipped set MINUS `dist/` — the same
+  set the tarball's NAME is computed over. `dist/` is deliberately out of scope: it is gitignored,
+  rebuilt per clone, and the vendorer already refuses to re-pack on a dist-only change (the
+  "toolchain-drift churn killer" test), so failing on one would demand a re-vendor of all 21
+  tarballs plus 21 lockfiles for a tsc patch bump — the exact churn that decision exists to
+  prevent. Two halves of one system cannot hold opposite positions on the same input. A third check hashes each tarball and compares it to the `integrity` its
+  project's `package-lock.json` records (driven off the lockfile, so a project that drops the dep
+  from `package.json` while the lock keeps it is still seen) — a re-vendor can rewrite a tarball under an UNCHANGED name
+  (the name omits `dist/` by design), and a lockfile not refreshed in the same commit breaks
+  `npm ci` in CI and in every fresh clone while a warm `node_modules` hides it locally.
 - **Re-vendoring is NOT automatic on an ordinary build** — it only runs on project open/scaffold,
   or when `ensureCapacitorDeps` detects a missing dep. So editing `engine/packages/capacitor-<x>/**`
   mid-session and then just re-running a build silently builds against the STALE vendored copy.
@@ -1328,7 +1529,7 @@ Three caveats, none of which the install step can fix for you:
   has already run something on.
 - **It does NOT buy trusted input.** That needs a WebDriverAgent XCUITest bundle, and Xcode refuses
   the iPhone 8 as a TEST destination — six theories tested and disproved, see
-  [trusted-device-input.md](./trusted-device-input.md) § "iOS 16 devices". Getting there is `go-ios`
+  [trusted-device-input.md](./trusted-device-input.md) § "WebDriverAgent lifecycle" (the "iOS 16 devices" entry). Getting there is `go-ios`
   territory and an owner decision, not something to re-diagnose.
 
 The intended split, per [plans/low-end-device-support.md](./plans/low-end-device-support.md):
@@ -1381,7 +1582,7 @@ says so rather than reporting a failure** (measured 2026-08-19, iPhone 8 / iOS 1
 `processcontrol failed: instruments service
 "com.apple.instruments.remoteserver.DVTSecureSocketProxy" unavailable`, exit 1. That is the SAME
 dead instruments stack that stops WebDriverAgent on that phone and hides it from `xctrace` — see
-[trusted-device-input.md](./trusted-device-input.md) § "iOS 16 devices"; do not re-diagnose it, and
+[trusted-device-input.md](./trusted-device-input.md) § "WebDriverAgent lifecycle" (the "iOS 16 devices" entry); do not re-diagnose it, and
 note that mounting the Developer Disk Image is not the fix (`ios image auto` reports one is already
 mounted and the launch fails identically).
 
@@ -1506,9 +1707,61 @@ non-reproducible and churns a committed file on every build (the write-behind-yo
 CLAUDE.md). The owner bumps it, in the same change as the native edit it ships — a native change
 that is not bumped never reaches the device.
 
+### `app.buildNumberAuto` — derive it from the commit count (2026-08-25)
+
+Hand-bumping per upload is exactly the chore this checkbox removes. With **Auto build number**
+checked in Project Settings (General → App Identity), the typed `app.buildNumber` is IGNORED and
+the effective number is derived from `git rev-list --count HEAD` of the project's repo at every
+open/build, with the typed value kept as a **FLOOR** (`max` of the two) — so a store-forced jump
+typed by hand still wins, and the never-lower guard keeps its role as the last line of defence
+either way. The native files always see ONE resolved number; how it was derived never leaks into
+them.
+
+⚠️ **Typing that floor means unchecking Auto first.** `app.buildNumber`'s input carries
+`disabledIf: { key: 'app.buildNumberAuto', is: 'true' }`, which is a real native `disabled` — not
+dimming — so while Auto is on the field cannot be focused or typed into. The escape hatch is
+three steps: **uncheck Auto, type the higher number, re-check Auto**, which is what the field's own
+help text says. (This paragraph used to claim the floor could be raised *without* turning auto off;
+it never could, and the help text added in the same commit contradicted it.) The floor survives the
+round-trip because `buildNumber` is stored independently of `buildNumberAuto` — that is precisely
+why the field is greyed out rather than hidden.
+
+Two known wrinkles, both absorbed by the floor + never-lower pair rather than by cleverness:
+commit counts differ between clones (`main` vs a worker branch), and the count is shared by every
+game in the repo. Only store uploads care about the absolute value, and only monotonicity matters
+there. A project copied OUT of its repo (no git) falls back to `app.buildNumber` with a note.
+
+⚠️ **Auto mode re-introduces committed-file churn on purpose.** The rationale above rejects a
+self-incrementing build number because it churns committed native files on every build — auto does
+exactly that (the count moves with every merged commit, so whichever clone builds first rewrites
+`versionCode`/`CURRENT_PROJECT_VERSION`). That is accepted noise here, not an accident: the churn
+is the number staying TRUE instead of drifting stale, and merge conflicts from two concurrent
+builds resolve to the higher value either way. The #18 rule still applies — don't sweep these into
+unrelated commits.
+
 The defaults (`"1.0"` / `1`) are exactly what `cap add` scaffolds, so adopting these fields rewrote
 nothing: running the heal across all 20 projects touched **one file**, `games/iap-test`'s pbxproj,
 raising the lagging iOS counter to its Android value.
+
+## The app identity (`app.appId` / `app.appName`)
+
+Synced into **every** native file that carries them by `healNativeConfig` on open/build — they were
+WRITE-ONCE before 2026-08-25: `cap add` baked them in at scaffold time, `ensureCapacitorConfig`
+never clobbers an existing `capacitor.config.json`, so changing Project Settings afterwards
+silently changed nothing anywhere (a device app kept its old identity forever).
+
+| field | lands in |
+|---|---|
+| `app.appId` | `capacitor.config.json` · gradle `applicationId` · strings.xml `package_name` + `custom_url_scheme` · pbxproj `PRODUCT_BUNDLE_IDENTIFIER` (Info.plist's `CFBundleIdentifier` reads it via `$(PRODUCT_BUNDLE_IDENTIFIER)`) |
+| `app.appName` | `capacitor.config.json` · strings.xml `app_name` + `title_activity_main` (AndroidManifest labels reference these) · Info.plist `CFBundleDisplayName` |
+
+Deliberately NOT touched: gradle `namespace` (the code package — renaming it strands MainActivity),
+and `CFBundleName` (stays `$(PRODUCT_NAME)`).
+
+⚠️ **A changed appId is a NEW app to both stores** — previously uploaded builds and installed
+updates no longer connect to it. The heal performs the change but logs a WARNING naming both ids
+every time it rewrites one; an id that fails the bundle-id shape check is REFUSED outright rather
+than written into four files at once.
 
 ## The shipped platform floors (`build.iosMinVersion` / `build.androidMinSdk`)
 
@@ -1617,6 +1870,148 @@ interaction device.
 
 **Why this is written down**: both devices are permanently out of the shipping floor, so this is
 not a one-off — it is the standing procedure for every future campaign that wants the low end.
+
+## Release builds (#370)
+
+Until #370 the native pipeline was **dev-install-only on both platforms**: Android ran
+`assembleDebug` + `adb install`, iOS ran `xcodebuild -configuration Debug` + a device install, and
+no project set a `signingConfig`. Nothing shippable had ever come out of it — which was fine until
+`games/court` and `games/wordweave` needed to ship.
+
+**Build → iOS Release (App Store .ipa)** and **Build → Android Release (Play AAB)** are the entry
+points; over HTTP it is `GET /api/build?platform=ios|android&variant=release`, and over MCP it is
+`modoki_build {platform, variant:'release'}`. An **absent `variant` still means `debug`**, so every
+caller that predates this is unchanged.
+
+A release build **installs nothing and deploys nowhere.** It leaves a file:
+
+| platform | artifact |
+|---|---|
+| Android | `android/app/build/outputs/bundle/release/app-release.aab` (Play) + `.../apk/release/app-release.apk` |
+| iOS | `ios/App/build/ipa/*.ipa`, from an `xcodebuild archive` + `-exportArchive` |
+
+The APK is not redundant. It is the only way to `adb install` and actually TEST the build that
+ships — and for Google Sign-In (#360) that is not optional, because sign-in matches on the signing
+CERTIFICATE and a debug build cannot exercise the release one at all.
+
+Both variants share everything up to the compile — the web bundle, the OTA manifest, icons,
+`cap sync`, the dep heal, the version heal. Only the compile step and the device requirement
+differ, which is why `variant` is a separate parameter rather than two more `BUILD_PLATFORMS`
+values: a release build must never miss a check the debug build gets.
+
+### The Android upload key
+
+Release signing reads `android/keystore.properties`, which the release build **generates** from the
+gitignored, per-machine `games/<id>/project.user.json`:
+
+```jsonc
+{ "keystore": {
+    "storeFile": "/Users/you/.modoki/keystores/com.apiary.court-upload.jks",
+    "storePassword": "…", "keyAlias": "upload", "keyPassword": "…" } }
+```
+
+Edit it in **Project Settings → Android → Android release signing**, or create a key with:
+
+```bash
+keytool -genkeypair -v -keystore ~/.modoki/keystores/<appId>-upload.jks \
+  -alias upload -keyalg RSA -keysize 2048 -validity 10000
+```
+
+⚠️ **The upload key is ONE key across every machine.** Play matches the AAB against the key the app
+was enrolled with and rejects any other, so a second machine **copies the same `.jks`** — it does
+not generate its own. This is the opposite of `~/.android/debug.keystore`, which is legitimately
+per-machine (and whose per-machine-ness causes `INSTALL_FAILED_UPDATE_INCOMPATIBLE` across
+machines). Keep the file OUTSIDE the repo.
+
+A release Android build **refuses** when the key is missing or the `.jks` is not on disk, naming
+what to set. That refusal is the point: Gradle happily builds an unsigned release AAB and reports
+success, and Play then rejects it at **upload** time with "signed in debug mode" — a failure
+discovered long after the build looked fine.
+
+⚠️ **`modoki_project_settings action=get` REDACTS the two keystore passwords** (`••••••••`), and
+`action=set` drops that sentinel rather than writing it. The route itself returns them — the Project
+Settings dialog needs them — but an agent asking for `appId` should not pull a signing password into
+its transcript. `storeFile` and `keyAlias` stay readable, so "why did the release build refuse" is
+still diagnosable. The `set` half is what makes this safe: without it a get → edit → set round-trip
+would write the sentinel in as the literal password.
+
+`healAndroidReleaseSigning` writes the `signingConfigs.release` block into
+`android/app/build.gradle` (a fenced, re-derived block), and it is **inert without
+`keystore.properties`** — a keyless clone or CI still builds debug exactly as before.
+`games/iap-test` configures signing by hand (#196) and the heal deliberately skips it.
+
+⚠️ **`healAndroidGitignoreKeystore` exists because `cap add` regenerates `android/.gitignore` from
+the upstream Android template, where `#*.jks` / `#*.keystore` are COMMENTED OUT.** A keystore
+dropped in that folder would be committed by default — into a repo whose snapshot is published
+publicly. Fixing the existing projects by hand fixes exactly those projects; the heal is what holds
+for the next one.
+
+### The iOS archive
+
+`build.iosExportMethod` (committed, Project Settings → iOS → Signing) becomes the `method` in a
+generated `ios/App/build/exportOptions.plist`. `app-store-connect` is the shipping path;
+`ad-hoc`/`development` produce an .ipa installable on registered devices, for testing the
+release-signed build before it goes near a store. The Team ID is `build.appleTeamId` — for Court and
+wordweave that is the **Apiary publisher team**, not the dev one — the two ids, and which projects
+are the exceptions, are in the root `CLAUDE.md` § "App Identity". The literal is deliberately not
+repeated here: `docs/` is the publish switch for modoki-engine.com, and `verify:publish` aborts on a
+real Team ID reaching it.
+
+⚠️ The generated plist and the archive live under `ios/App/build/`, which every project's
+`ios/.gitignore` already covers — they carry the Apple Team ID, a `PRIVATE_BUILD_FIELDS` value.
+`verify:publish` is the backstop, not the defence; do not relocate them.
+
+⚠️ `manageAppVersionAndBuildNumber` is pinned **false**. Xcode's default is true, which lets the
+export rewrite `CFBundleVersion` — silently overwriting the number the version heal just wrote from
+`app.buildNumber` (see § "The app version + build number" above), so the build would ship a number
+the project never chose.
+
+### What still has to happen by hand
+
+**Play App Signing and the Firebase SHA-1s are console work, not build work.** Google Sign-In
+matches an app by package name + signing certificate SHA-1, and with Play App Signing there are
+**three** certificates: debug, the upload key, and the **app signing key Google generates and
+re-signs every install with**. Registering only the first two makes sign-in work in every test
+anyone runs and fail for every single person who installs from Play. All three fingerprints belong
+in the Firebase console, and the third only exists once the app is enrolled in Play App Signing —
+i.e. after the first AAB upload.
+
+⚠️ **Adding a FINGERPRINT does not need a rebuild. Enabling the PROVIDER does.** The two look like
+the same console visit and are not:
+
+| console change | reaches the app how | rebuild? |
+|---|---|---|
+| Register another certificate SHA-1 | server-side only — nothing cert-derived is in the artifact | **no** |
+| Enable the Google provider (mints the web OAuth client) | `default_web_client_id`, a compiled string resource | **yes** |
+
+The `com.google.gms.google-services` plugin turns `google-services.json` into Android string
+resources, and **the set it emits depends on what the JSON contains** — do not memorise a fixed
+list. (4.4.4 knows ten: `default_web_client_id`, `gcm_defaultSenderId`, `google_api_key`,
+`google_app_id`, `google_crash_reporting_api_key`, `google_storage_bucket`, `project_id`,
+`firebase_database_url`, `ga_trackingId`, `google_maps_key`. Court's release build emits seven; its
+older *debug* build emitted six, missing `default_web_client_id`, because it predates the web client
+being added.) **The invariant that actually holds is narrower and stable: no emitted resource is
+derived from `certificate_hash`.**
+
+Measured on Court, 2026-08-28, against the real artifacts — and deliberately using the
+fingerprints that were ALREADY in the JSON when the artifact was built, since grepping for a
+newly-added one passes whether the claim is true or false:
+
+- `google-services.json` is not packaged in the APK or the AAB at all.
+- The pre-existing fingerprints and their Android client ids: **0 occurrences** in either archive
+  (whole-archive decompressed byte grep, plus `res/raw/`, uppercase and colon-separated forms).
+- The web client id: **1 occurrence** — the control that proves the grep can find what IS shipped.
+
+So a build that already shipped does not need rebuilding for a fingerprint. ⚠️ **What was measured
+is "no rebuild required", not "works instantly"** — nobody signed in on a Play-installed build after
+registering, because Court was rebuilt anyway and destroyed the counterfactual. Google's propagation
+for a newly registered SHA-1 (minutes to hours) and Credential Manager's client-side credential
+caching both sit between registration and a working sign-in, and neither was measured.
+
+Committing the regenerated `google-services.json` is still right — the source of truth should match
+the console — it is just not what unblocks sign-in. (This section exists because the opposite was
+asserted first, reasoned from the shape of the JSON rather than from what the plugin emits, and it
+cost a build-and-upload cycle.)
 
 ## iOS build notes
 

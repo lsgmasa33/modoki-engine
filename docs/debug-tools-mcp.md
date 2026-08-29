@@ -295,7 +295,7 @@ Two replies say more than `ok`, and both are cases where a bare `ok` would over-
 until the app is force-stopped. That is what made this bug expensive to find: the d-pad kept working
 (it tracks its own `pointerId`s), so "drag is broken but buttons are fine" read as a product bug.
 Two defences now exist, and neither excuses skipping the `up`: a real finger reclaims a stranded
-synthetic gesture ([input.md](input.md) § "A stranded synthetic press"), and dropping the lease sends
+synthetic gesture ([input.md](input.md) § "How it works" — the "A stranded synthetic press" note), and dropping the lease sends
 the `up` for you. (`tap_handle`/`drag_handle` aren't ported — the game UIRenderer emits no
 `data-ui-id`.) Full tool table: [`CONNECTION.md`](../engine/tools/game-debug-mcp/CONNECTION.md).
 
@@ -802,8 +802,10 @@ same actions + state a person has in the editor. They relay to the renderer over
   to `get_scene_state`). `modoki_get_console_logs` — renderer console + uncaught errors.
 - **Eval live renderer state:** `modoki_eval` — run JS in the editor RENDERER and get the value back
   (the editor twin of `device_eval`). For reading/poking live state a file read can't see — a global
-  (`window.__3d`), `devicePixelRatio`, a React fiber value, WGSL validation, dispatching a bridge
-  event. Runs as an **async** function body (`return x`; `await` is allowed — see below); return a
+  (`window.__3d` for the Three.js GameView, `window.__2d` for the PixiJS one — both GameView ONLY,
+  not the editor SceneView, which has its own separate surface), `devicePixelRatio`, a React fiber
+  value, WGSL validation, dispatching a bridge event. Runs as an **async** function body (`return x`;
+  `await` is allowed — see below); return a
   PROJECTION for anything large/circular. This
   is what removed most of the "stand up a raw CDP client" cases below. *(Electron editor only.)*
   - **`await` works on BOTH eval surfaces** (`modoki_eval` and `device_eval`) — the body is compiled
@@ -1095,7 +1097,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*99 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*105 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -1108,6 +1110,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_editor_journal` | GET `/api/editor-journal` | session · **IMPURE READ** (an optional arg destroys state) | editor | — | *(no args)* |
 | `modoki_eval_api` | GET `/api/eval-api` | read-only | editor + renderer | — | *(no args)* |
 | `modoki_find_references` | GET `/api/find-references` | read-only | project | asset | `{"target":"/assets/scenes/main.scene.json"}` |
+| `modoki_game_view_devices` | GET `/api/game-view-devices` | read-only | editor | — | *(no args)* |
 | `modoki_get_asset_meta` | GET `/api/read-meta` | read-only | project | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_get_console_logs` | GET `/api/console-logs` | read-only | editor | — | *(no args)* |
 | `modoki_get_editor_state` | GET `/api/editor-state` | read-only | editor | — | *(no args)* |
@@ -1189,11 +1192,13 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
+| `modoki_animation_view_mode` | POST `/api/editor-action` `set-animation-view-mode` | session | editor | — | `{"mode":"dopesheet"}` |
 | `modoki_collider_edit` | POST `/api/editor-action` `set-collider-edit` | session | editor | — | `{"on":true}` |
 | `modoki_dispatch_action` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | — | `{"name":"probe"}` |
 | `modoki_eval` | POST `/api/eval` | no persistence | editor + renderer | — | `{"code":"return 1 + 1;"}` |
 | `modoki_exit_pose_envelope` | POST `/api/editor-action` `exit-pose-envelope` | live | editor + scene | — | *(no args)* |
 | `modoki_focus_entity` | POST `/api/editor-action` `focus-entity` | no persistence | editor + scene | entity | *(no args)* |
+| `modoki_game_view_device` | POST `/api/editor-action` `set-game-view-device` | session | editor | — | `{"device":"Free"}` |
 | `modoki_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
 | `modoki_history` | POST `/api/editor-action` *(op = your `action`)* | live | editor | — | `{"action":"undo"}` |
 | `modoki_hit_regions` | GET `/api/hit-regions` | session | editor + renderer | — | `{"action":"read"}` |
@@ -1204,6 +1209,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_open_animation_editor` | POST `/api/editor-action` `open-animation-editor` | session | editor + scene | asset | `{"path":"/assets/animations/probe.anim.json"}` |
 | `modoki_open_nine_slice_editor` | POST `/api/editor-action` `open-nine-slice-editor` | no persistence | editor | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_open_particle_editor` | POST `/api/editor-action` `open-particle-editor` | no persistence | editor | asset | `{"path":"/assets/particles/probe.particle.json"}` |
+| `modoki_open_skin_editor` | POST `/api/editor-action` `open-skin-editor` | no persistence | editor | asset | `{"path":"/assets/characters/probe.rig2d.json"}` |
 | `modoki_open_sprite_editor` | POST `/api/editor-action` `open-sprite-editor` | no persistence | editor | asset | `{"path":"/assets/textures/probe.png"}` |
 | `modoki_persistence` | POST `/api/persistence` | no persistence | editor | — | *(no args)* |
 | `modoki_play_clip` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | entity | `{"guid":"00000000-0000-0000-0000-000000000000","clip":"Idle"}` |
@@ -1212,8 +1218,10 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_profiler` | GET `/api/profiler` *(method varies)* | session | editor + renderer | — | *(no args)* |
 | `modoki_project_settings` | GET `/api/project-settings` *(method varies)* | file | project | — | `{"action":"get"}` |
 | `modoki_scene_view_mode` | POST `/api/editor-action` `set-scene-view-mode` | session | editor | — | `{"mode":"3d"}` |
+| `modoki_select_sprite_slice` | POST `/api/editor-action` `select-sprite-slice` | session | editor | — | *(no args)* |
 | `modoki_set_playhead` | POST `/api/editor-action` `set-playhead` | session | editor | — | `{"t":0}` |
 | `modoki_set_selection` | POST `/api/editor-action` `set-selection` | session | editor | entity | *(no args)* |
+| `modoki_set_skin_mode` | POST `/api/editor-action` `set-skin-mode` | session | editor | — | `{"mode":"rig"}` |
 | `modoki_set_timescale` | POST `/api/editor-action` `set-timescale` | no persistence | editor + renderer | — | `{"scale":1}` |
 | `modoki_watch` | GET `/api/watch/list` *(both varies)* | session | editor + renderer | — | `{"action":"list"}` |
 
@@ -1661,9 +1669,27 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
   a modal that only mounts when its tab/asset is active is a separate OS layer `sendInputEvent` can't
   touch): `modoki_scene_view_mode {3d|ui}` (REQUIRED before Collider2D editing — its vertex handles
   only live in `ui`/2D mode), `modoki_collider_edit {on}` (the toolbar "Points" toggle),
-  `modoki_open_particle_editor` / `modoki_open_sprite_editor` / `modoki_open_nine_slice_editor` (pass
-  the asset's served path — mounts the panel/modal so its handle providers register). `get_editor_state`
-  now reports `sceneViewMode`/`colliderEditMode`.
+  `modoki_animation_view_mode {dopesheet|curves}` (the Animation panel shows exactly ONE of its two
+  views, and only **Curves** publishes `curves:key:*` and the tangent handles `curves:tan:in|out:*` —
+  the default is Dopesheet, so `modoki_handles editor=curves` is empty until you switch, which reads
+  as "this clip has no tangents"; it does NOT open or reload a clip, unlike
+  `modoki_open_animation_editor`). ⚠️ **Curves is necessary but NOT sufficient for `kind:'tangent'`**
+  — those are published for the ACTIVE TRACK only, which with nothing selected resolves solely when
+  exactly one numeric curve is visible, so a 2+-track clip stays empty. Select a track as well:
+  `modoki_handles {editor:'chrome', kind:'row'}` lists `animation.trackList.row.<i>`
+  (`data-ui-state:'selected'` marks the active one) → `modoki_tap_handle`. `get_editor_state`'s
+  `animationView` reports both this and `panelMounted`.
+  Also `modoki_open_particle_editor` / `modoki_open_sprite_editor` / `modoki_open_nine_slice_editor`
+  (pass the asset's served path — mounts the panel/modal so its handle providers register).
+  ⚠️ `modoki_open_sprite_editor` is NECESSARY but NOT SUFFICIENT: the modal opens with NOTHING
+  selected, and its 8 resize handles + pivot only exist for the SELECTED slice — call
+  `modoki_select_sprite_slice {guid}` next, or `modoki_handles editor=sprite` reads as "no slices"
+  when it actually means "nothing picked yet" (#373). Also `modoki_open_skin_editor` (a .rig2d.json
+  path) for the Skin editor — its `bone-joint` handles exist in skinMode `rig` OR `weights`, NOT
+  `parts` (`modoki_set_skin_mode`).
+  `get_editor_state` reports `sceneViewMode`/`colliderEditMode`/`animationViewMode`/
+  `spriteEditorSelection`/`editingSkinAsset`/`skinMode`, plus the qualified `animationView`
+  (`panelMounted` + the active-track caveat).
 - **Canonical loop:** open the editor/sub-mode → `modoki_handles` to discover geometry → `drag_handle`/
   `tap_handle` (or `dnd`) to act → verify via Percept (`get_scene_state`/`watch`/`get_layout_bounds`)
   → `modoki_history undo` to revert. Registry twin of `screenBounds.ts`:

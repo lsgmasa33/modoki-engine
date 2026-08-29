@@ -27,6 +27,7 @@ import { uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
 import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
+import { UI_PAINT_ATTR } from './uiPaintMarker';
 import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo } from './scrollViewDom';
 import { scrollByEntry } from './scrollApi';
 import { driveEntriesFromScroll } from './entriesSystem';
@@ -58,7 +59,7 @@ const AnimatedText = React.memo(function AnimatedText(
     // a steps() timing on the one-shot, and the -cycle-hard keyframe for the loop.
     const fade = perCharFade !== false;
     return (
-      <span aria-label={text} style={{ display: 'inline-block', whiteSpace: 'pre-wrap' }}>
+      <span aria-label={text} {...{ [UI_PAINT_ATTR]: 'text' }} style={{ display: 'inline-block', whiteSpace: 'pre-wrap' }}>
         {chars.map((ch, i) => {
           const delay = i * perCharStagger;
           const anim = perCharLoop
@@ -76,7 +77,7 @@ const AnimatedText = React.memo(function AnimatedText(
   // number is then vmin, not pixels. `em` resolves against the element's own COMPUTED font size,
   // so it is correct for every unit and needs no resolution step at all.
   if (amp) (style as Record<string, string>)['--ui-amp'] = `${amp}em`;
-  return <span style={style}>{text}</span>;
+  return <span {...{ [UI_PAINT_ATTR]: 'text' }} style={style}>{text}</span>;
 });
 
 /** Convert a numeric value + unit string to a CSS value. Returns undefined if value is 0/falsy.
@@ -200,6 +201,32 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     boxSizing: 'border-box',
   };
 
+  // ── Scrollbar skin ──
+  // Only the STANDARDS properties, because these are inline styles: `::-webkit-scrollbar` is a
+  // pseudo-element and cannot be written here at all (`scrollViewDom.ts` records the same limit
+  // where it hides a scroll view's bar). `scrollbar-color` + `scrollbar-width` is therefore the
+  // entire available surface — thumb, track, coarse width; no shape, corner or arrow control.
+  //
+  // Gated on `overflow: 'scroll'` so the fields cannot have an effect on an element that never
+  // scrolls: an authored value that quietly does nothing somewhere else is the "field nothing
+  // reads" trap, and this keeps the one visible consequence tied to the one field that causes it.
+  //
+  // ⚠️ **`UIScrollView.scrollbar` says the same thing and WINS.** Both it and
+  // `scrollbarStyle: 'hidden'` emit `scrollbar-width: none`, and `scrollViewStyle` is merged
+  // BELOW this block — so on an element carrying a `UIScrollView`, that trait decides whether a
+  // bar exists and this one only tints it. `scrollbarStyle: 'tinted'` on a `scrollbar: 'hidden'`
+  // view therefore sets `scrollbar-color` on a bar that never renders. Authoring both is the
+  // author's mistake to make, but nothing errors, so it is stated here and in the trait docs
+  // rather than left to be discovered.
+  if (node.overflow === 'scroll') {
+    if (node.scrollbarStyle === 'hidden') {
+      style.scrollbarWidth = 'none';
+    } else if (node.scrollbarStyle === 'tinted') {
+      style.scrollbarWidth = 'thin';
+      style.scrollbarColor = `${hexToColor(node.scrollbarThumbColor)} ${hexToColor(node.scrollbarTrackColor)}`;
+    }
+  }
+
   // ── Focus ring ──
   // Data-driven outline drawn when this element is the focused nav target. Kept as a
   // non-layout `outline` (+offset) so it never shifts the flexbox box. Pointer/touch
@@ -315,10 +342,10 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     applyAnchorStyle(style, node.anchor);
   }
 
-  // ── Rotation (#234) ──
+  // ── Rotation (#234) + scale (#340) ──
   // AFTER the anchor, because it composes onto the anchor's pivot translate rather than replacing
   // it. Applies to anchored and flow-laid-out elements alike; the pivot rules live in anchorCss.
-  applyRotationStyle(style, node.rotation, node.anchor);
+  applyRotationStyle(style, node.rotation, node.anchor, node.scale);
 
   // Scroll-view CSS (snap + overscroll). Deliberately does NOT set `overflow` — that stays
   // `UIElement.overflow`, which the author already knows, so one visible consequence keeps one
@@ -561,6 +588,10 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
             }
           }
           : undefined}
+        // Same contract as the range below and the toggle further down: focusing a text field is
+        // not a click on whatever sits behind it. Latent rather than reported — no shipped game
+        // has yet put a text input inside a dismiss-on-backdrop panel — but it is the same bug.
+        onClick={(e: React.MouseEvent) => e.stopPropagation()}
         data-entity-id={node.entityId}
       />
     );
@@ -607,6 +638,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         onChange={node.action?.bindings?.length
           ? (e: React.ChangeEvent<HTMLInputElement>) => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: Number(e.target.value) })
           : undefined}
+        // A click that lands on an interactive control has been CONSUMED by it, and must not also
+        // read as a click on an ancestor. Without this a slider inside the canonical
+        // click-the-backdrop-to-dismiss panel closes that panel on every adjustment — reported on
+        // games/court's settings sliders, which dismissed the dialog mid-drag. The toggle branch
+        // below has always done this; `range` and the text input above simply never did.
+        onClick={(e: React.MouseEvent) => e.stopPropagation()}
         data-entity-id={node.entityId}
       />
     );
@@ -716,7 +753,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // `rendering.web.sizeMode` — matching Scene3D, which clamps the 3D buffer on the
       // same surface. The editor branch above (renderCanvas2D, SceneView.tsx) deliberately
       // does NOT pass it — the editor viewport sizes itself / uses device presets.
-      : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode /></Suspense> : null);
+      //
+      // pointerThrough must be threaded explicitly: Canvas2DMount's own wrapper div hardcodes
+      // `pointerEvents: 'auto'` unless told otherwise, and a DOM ancestor set to `none` does not
+      // stop a descendant set to `auto` from receiving pointer events — so the outer `style`
+      // above (which already reflects `node.pointerThrough`) can't reach through to it on its own.
+      : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode pointerThrough={node.pointerThrough} /></Suspense> : null);
     return (
       <div ref={scrollRef} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
         {nineSliceLayer}
@@ -886,8 +928,10 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
     const req = pendingScrollTo(scroll);
     if (!req) return;
     el.scrollTo(req as ScrollToOptions);
-    clearScrollRequest(guid);
-  }, [ref, guid, scroll?.scrollToX, scroll?.scrollToY, scroll?.scrollBehavior]); // eslint-disable-line react-hooks/exhaustive-deps
+    // Hand back the override this effect actually consumed, so a request armed AFTER the snapshot
+    // this effect is holding does not get its behaviour cleared out from under it (#409).
+    clearScrollRequest(guid, scroll.scrollToBehavior);
+  }, [ref, guid, scroll?.scrollToX, scroll?.scrollToY, scroll?.scrollToBehavior]); // eslint-disable-line react-hooks/exhaustive-deps
 }
 
 export const UINode = React.memo(UINodeInner);

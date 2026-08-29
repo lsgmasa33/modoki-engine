@@ -38,6 +38,9 @@ const TEST_DIRS = [
 const ALLOWED = new Set([
   path.join(REPO_ROOT, 'engine', 'tests', 'helpers', 'repoLayout.ts'),
   path.join(REPO_ROOT, 'engine', 'tests', 'architecture', 'projectPresencePredicate.test.ts'),
+  // The e2e host-project pick — the one legitimate `discoverProjects` call under e2e/. See the
+  // E2E_* describe block below for why every OTHER spec is forbidden from making it.
+  path.join(REPO_ROOT, 'engine', 'tests', 'e2e', 'hostProject.ts'),
 ]);
 
 /** Inline computations of project presence — the shapes that have actually appeared. */
@@ -82,5 +85,38 @@ describe('project-presence is asked in exactly one place (#98)', () => {
     }
     expect(offenders, 'inline project-presence checks (use hasInternalGames() / hasAnyProject())')
       .toEqual([]);
+  });
+});
+
+/** A Playwright spec fails DIFFERENTLY from a vitest test, and the difference cost a release.
+ *
+ *  A vitest file that computes project presence wrongly fails that one test. A Playwright spec
+ *  that derives a project at MODULE SCOPE and throws kills COLLECTION for the entire run — every
+ *  spec, not just its own. On v0.5.2 that produced `only 0 tests were DISCOVERED, expected at
+ *  least 55` from `runCompleteReporter`, on the release publish, after the tag was already cut.
+ *  The three specs were not wrong about anything a dev clone can see: they only ever fail where
+ *  no project exists, which is exactly the release snapshot of the public repo (`games/` and
+ *  `demos/` both absent — only the `ci/main` publish uses `--with-demos`).
+ *
+ *  So specs do not get to ask the question at all. `pickHostProject()` answers it, returns null
+ *  instead of throwing, and the spec `test.skip`s on null. This guard is what keeps the fourth
+ *  variant from being written — the same reasoning as the inline-predicate guard above, applied
+ *  to the one file shape where the blast radius is the whole suite. */
+describe('e2e specs never discover projects themselves (#326 follow-up)', () => {
+  const E2E_DIR = path.join(REPO_ROOT, 'engine', 'tests', 'e2e');
+
+  it('no spec under engine/tests/e2e calls discoverProjects — pickHostProject() does', () => {
+    const offenders: string[] = [];
+    let scanned = 0;
+    for (const file of walkTests(E2E_DIR)) {
+      if (ALLOWED.has(file)) continue;
+      scanned++;
+      if (/\bdiscoverProjects\s*\(/.test(fs.readFileSync(file, 'utf8'))) {
+        offenders.push(path.relative(REPO_ROOT, file));
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Non-vacuous: if the walk ever stops finding e2e files, the check above passes for free.
+    expect(scanned).toBeGreaterThan(5);
   });
 });

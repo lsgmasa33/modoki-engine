@@ -418,9 +418,55 @@ is stored in the parent prefab file as a single *reference row* — one
 `PrefabEntity` carrying the child `prefab` GUID plus its own
 `overrides`/`added`/`removed`/`removedTraits` — mirroring how a scene stores an
 instance. The child's members are **not** listed; they expand from the child
-file at load. Files that contain a nested row are written as `version: 2` (flat
-prefabs stay `version: 1`; the nested fields are optional, so a v1 file is a
-valid v2 file — no migration).
+file at load.
+
+Every file this serializer writes carries `PREFAB_FORMAT_VERSION` (currently **2**),
+stamped unconditionally — see `editor/scene/prefab.ts`. It used to be derived from
+the document's content (`nestedRefs.size > 0 ? 2 : 1`, so flat prefabs stayed at 1),
+and that rule was replaced in #379 because it could **decrease**: deleting a prefab's
+last nested instance rewrote `2` back to `1`, which is not something a format version
+may do. v1 and v2 share the same shape — the nested fields are optional — so a v1 file
+still loads unchanged and no migration exists or is needed.
+
+⚠️ **Nothing on the loading path READS `version`, and writing that down is the
+point of this paragraph.** `fetchPrefab` (`runtime/loaders/meshTemplateCache.ts`)
+fetches, parses and caches; there is no version comparison anywhere between the
+file and a spawned instance, and `getCachedPrefab` is a map lookup. The field is
+a marker for the SERIALIZER, and no consumer acts on it. (It used to record
+*whether the file nests*; since #379 it records only *which serializer wrote it*.)
+
+Say so plainly, because the gap where this sentence used to be is what produced
+the defect: #344 read a version marker with no stated consumer, inferred that an
+unexpected value must gate loading, and that inference was then written as fact
+into a commit message, two game docs, a guard test and three issues (#363, #364,
+#365) before anybody observed it. Two independent measurements killed it —
+`games/space-console`'s nested spaceship prefab spawns byte-identically at 1 and
+at 2 across all three of its scenes, and Court's flat level tile at `version: 2`
+renders its full pooled 25-tile grid with no console warning.
+
+⚠️ **Those two measurements can no longer be repeated from the repo as it stands.**
+#379 migrated every tracked prefab to 2, so there is no flat-vs-nested or 1-vs-2
+contrast left on disk to re-run them against. They are recorded here as the evidence
+that settled #344 — reproduce them by hand-editing a copy, not by looking for a v1
+file. `version` is
+now guarded by **nothing**: `prefabFormatVersion.test.ts` was deleted (owner,
+2026-08-27) rather than narrowed to "2 only on a prefab that really nests
+another". The narrowed rule was written and green, and the reason it went is
+worth keeping — the mistake it caught is one both measurements had just proved
+**harmless**, so it was a red gate with no failure mode behind it, on a field no
+code reads.
+
+**What emptied #344's grid is therefore still unidentified — and there is very
+likely nothing to find.** `ec48f2586`, the commit reported as broken, was checked
+out and the editor booted COLD against it: the selector rendered 100 tiles and
+100 visible numbers, and nothing on the prefab-loading path has changed since. So
+the symptom does not belong to any committed tree. The file is also
+byte-identical across the "broken" and "fixed" commits apart from that one
+number, so the A/B was confounded — most likely by the prefab cache, which
+serves the doc it read at scene load: restructure a `.prefab.json` under a live
+editor and instances keep spawning from the OLD copy until something forces a
+re-read. **If a pooled view renders empty, restart the editor before believing
+the file.**
 
 - **`rootInstanceId` semantics are unchanged**: it is the ECS id of the
   *innermost* instance root an entity belongs to. Nesting is expressed purely

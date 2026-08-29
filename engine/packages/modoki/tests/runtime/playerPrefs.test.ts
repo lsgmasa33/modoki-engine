@@ -213,6 +213,63 @@ describe('PlayerPrefs — per-key atomicity', () => {
     expect(writes).toContain('mk:g1:b');
     expect(writes).toContain('-mk:g1:a');
   });
+
+  it('calls backend.flush() once per drained batch, after the writes it covers (#335)', async () => {
+    const events: string[] = [];
+    const spy: PrefsBackend = {
+      getAll: async () => ({}),
+      set: async (k) => { events.push(`set:${k}`); },
+      remove: async () => {},
+      flush: async () => { events.push('flush'); },
+    };
+    await PlayerPrefs.init({ namespace: 'g1', backend: spy });
+    PlayerPrefs.set('a', 1);
+    PlayerPrefs.set('b', 2);
+    await PlayerPrefs.flush();
+    expect(events).toEqual(['set:mk:g1:a', 'set:mk:g1:b', 'flush']); // one flush, after both sets
+
+    events.length = 0;
+    PlayerPrefs.set('c', 3);
+    await PlayerPrefs.flush();
+    expect(events).toEqual(['set:mk:g1:c', 'flush']); // a later, separate batch — flush() again
+
+    events.length = 0;
+    await PlayerPrefs.flush(); // nothing dirty — drain() short-circuits, no flush() call
+    expect(events).toEqual([]);
+  });
+
+  it('a backend with no flush() (e.g. InMemory/Preferences) drains without error', async () => {
+    const backend = new InMemoryBackend(); // has no `flush` method at all
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+    PlayerPrefs.set('a', 1);
+    await expect(PlayerPrefs.flush()).resolves.toBeUndefined();
+  });
+
+  it('a rejecting backend.flush() never poisons writeChain — later writes still land (#335 review)', async () => {
+    const store = new Map<string, string>();
+    let failFlushOnce = true;
+    const backend: PrefsBackend = {
+      getAll: async (prefix) => {
+        const out: Record<string, string> = {};
+        for (const [k, v] of store) if (k.startsWith(prefix)) out[k] = v;
+        return out;
+      },
+      set: async (k, v) => { store.set(k, v); },
+      remove: async (k) => { store.delete(k); },
+      flush: async () => {
+        if (failFlushOnce) { failFlushOnce = false; throw new Error('flushStorageData IPC gone'); }
+      },
+    };
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+
+    PlayerPrefs.set('a', 1); // this batch's flush() throws
+    await PlayerPrefs.flush(); // must resolve anyway — the throw is caught, not propagated
+    expect(store.get('mk:g1:a')).toBe(JSON.stringify({ v: 1, d: 1 })); // the SET itself still landed
+
+    PlayerPrefs.set('b', 2); // a later, independent batch
+    await PlayerPrefs.flush(); // must not be wedged by the earlier rejection
+    expect(store.get('mk:g1:b')).toBe(JSON.stringify({ v: 1, d: 2 }));
+  });
 });
 
 describe('PlayerPrefs — determinism', () => {

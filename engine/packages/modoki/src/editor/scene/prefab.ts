@@ -61,12 +61,34 @@ export interface PrefabEntity {
   nestedOverrides?: NestedOverridePaths;
 }
 
+/** The format version this serializer writes. Every writer stamps THIS — never a value derived
+ *  from the document's content (#379).
+ *
+ *  The rule it replaced was `nestedRefs.size > 0 ? 2 : 1`, i.e. "2 once the prefab actually
+ *  nests one". That reads as a minimum-reader floor rather than a format version, and it can
+ *  DECREASE: delete a prefab's last nested instance and the next save rewrote `2` back to `1`.
+ *  A format marker that goes backwards is worse than none — the day a v3 ships with a real
+ *  migration ladder, such a file claims a serializer that never touched it and gets migrated as
+ *  something it is not. Two of the writers here (`mergeRiggedPrefab`, and the nested-instance
+ *  path) already treated it monotonically, so the codebase disagreed with itself.
+ *
+ *  FOUR call sites write it — `serializePrefab`, `mergeRiggedPrefab`, the nested-instance path,
+ *  and `applyOverridesToPrefab`. The last was missed by #379's first pass precisely because it
+ *  never mentioned `version` at all, so a grep for the token could not find it.
+ *
+ *  Scenes are the precedent: `engine/scripts/migrate-legacy-scenes.mjs` pins one number and
+ *  triggers on `(doc.version ?? 0) < 12`, never on what the document contains. */
+export const PREFAB_FORMAT_VERSION = 2;
+
 export interface PrefabFile {
   /** Stable UUID — written once at save, never changes across renames/moves. */
   id?: string;
-  /** v1: flat prefab. v2: may contain nested-instance rows (`PrefabEntity.prefab`).
-   *  Both share the same shape — the nested fields are optional, so a v1 file is a
-   *  valid v2 file and no migration is needed. */
+  /** The format version the file was WRITTEN by — {@link PREFAB_FORMAT_VERSION}, always, for
+   *  anything this serializer produces. Not a capability floor and not content-derived.
+   *
+   *  v1 and v2 share the same shape (the nested-instance fields are optional), so a v1 file
+   *  still loads unchanged and nothing on the loading path inspects this at all (#365). `1`
+   *  survives in the type for documents written before #379 that nobody has re-saved. */
   version: 1 | 2;
   name: string;
   rootLocalId: number;
@@ -300,9 +322,9 @@ export function serializePrefab(
 
   return {
     id: existingId ?? newGuid(),
-    // v2 only when the prefab actually nests another — keeps flat prefabs at v1
-    // (no churn). Both versions share the same shape (nested fields are optional).
-    version: nestedRefs.size > 0 ? 2 : 1,
+    // The format version this serializer writes, unconditionally — see PREFAB_FORMAT_VERSION
+    // for why this must not be derived from `nestedRefs` (#379).
+    version: PREFAB_FORMAT_VERSION,
     name: opts?.name ?? tree[0].name,
     // The root's ASSIGNED id, not a hardcoded 1 — with a preserve map it keeps whatever the
     // file already used, and every `parentId: <root>` in the entity rows is remapped through
@@ -412,7 +434,15 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
 
   return {
     id: fresh.id ?? existing.id,
-    version: Math.max(fresh.version, existing.version) as 1 | 2,
+    // The merge output is written by THIS serializer, so it carries this serializer's version
+    // rather than the older of the two inputs' (#379) — but never DOWNGRADES. `existing` is
+    // whatever is on disk, which the `1 | 2` type does not actually constrain: the day a v3
+    // ladder ships, re-importing a rigged model over a v3 file would otherwise stamp it `2`
+    // and invite the ladder to re-migrate a document it already migrated.
+    // ⚠️ Preserving the higher number is a floor, not a full answer — such a merge still
+    // writes v2-era semantics into a file labelled v3. Whoever adds a v3 owes this call site a
+    // real decision (most likely: refuse the merge loudly rather than guess).
+    version: Math.max(PREFAB_FORMAT_VERSION, existing.version) as 1 | 2,
     name: fresh.name,
     rootLocalId: fresh.rootLocalId,
     entities: [...mergedSkeleton, ...mergedUser],
@@ -1614,7 +1644,7 @@ function insertAddedSubtree(
       removedTraits: node.removedTraits,
       nestedOverrides: node.nestedOverrides,
     });
-    if (prefab.version < 2) prefab.version = 2;
+    if (prefab.version < PREFAB_FORMAT_VERSION) prefab.version = PREFAB_FORMAT_VERSION;
     return;
   }
 
@@ -1724,6 +1754,14 @@ export async function applyToPrefabSelective(
   // pristine clone is the `before` snapshot for undo (oldPrefab itself isn't mutated,
   // but cloning guards against any aliasing into the cache).
   const newPrefab: PrefabFile = JSON.parse(JSON.stringify(oldPrefab));
+  // Stamp the format version: this rewrites the WHOLE document with today's serializer
+  // semantics, so leaving a legacy `1` on it would be the #379 dishonesty in the other
+  // direction — a v2-written file claiming v1. Found by the #379 close-out review, which
+  // caught that the sweep for writers grepped for the token `version` and so could not see
+  // a writer whose defect is that it never mentions it.
+  newPrefab.version = PREFAB_FORMAT_VERSION;
+  // NOT stamped on the undo snapshot: `installPrefabSnapshot` replays the BEFORE bytes, and
+  // those must be what was actually on disk, version included.
   const prefabBefore: PrefabFile = JSON.parse(JSON.stringify(oldPrefab));
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return NOOP_APPLY;

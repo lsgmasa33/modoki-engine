@@ -6,7 +6,7 @@
  *  bound to. Use this for EVERY numeric preset select in an asset inspector — a select whose
  *  `value` matches no `<option>` silently displays its FIRST option and misreports the
  *  setting. Rule, history and the static guard that enforces it:
- *  docs/editor.md § "The asset Inspector — two rules that have each failed three times".
+ *  docs/editor.md § "The asset Inspector — three rules that have each failed repeatedly".
  *
  *  Returns the SAME array reference when nothing needs adding, so a caller can rely on
  *  identity, and never mutates the shared constant it is handed. */

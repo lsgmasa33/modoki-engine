@@ -28,19 +28,14 @@ import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
 import { gotoEmptyEditor } from './helpers';
-import { discoverProjects } from '../../scripts/projectRoots.mjs';
+import { pickHostProject } from './hostProject';
 
 // Host the generated fixtures inside a real project's asset root so the dev server serves
-// them. games/ is PREFERRED over demos/ for the same reason as editor-particles.spec.ts: a
-// crash between beforeAll and afterAll must not strand a fixture inside the published set.
-const HOST = (() => {
-  const projects = discoverProjects(process.cwd()) as { root: string; name: string; dir: string }[];
-  const host = projects.find((p) => p.root === 'games') ?? projects[0];
-  if (!host) throw new Error('editor-unfocused-field-commits: no project found to host the fixtures');
-  return host;
-})();
-const ABS_DIR = path.join(HOST.dir, 'runtime/assets/__e2e_fields__');
-const URL_DIR = `/${HOST.root}/${HOST.name}/assets/__e2e_fields__`;
+// them. See hostProject.ts for the pick and why it can't throw.
+const HOST = pickHostProject();
+test.skip(!HOST, 'editor-unfocused-field-commits: this snapshot ships no project to host the fixtures');
+const ABS_DIR = HOST ? path.join(HOST.dir, 'runtime/assets/__e2e_fields__') : '';
+const URL_DIR = HOST ? `/${HOST.root}/${HOST.name}/assets/__e2e_fields__` : '';
 const SHEET_URL = `${URL_DIR}/sheet.png`;
 const PARTICLE_URL = `${URL_DIR}/e2e-fields.particle.json`;
 
@@ -80,12 +75,21 @@ const PARTICLE_JSON = {
 };
 
 test.beforeAll(() => {
+  // The file-level test.skip above covers the tests, but whether Playwright still runs a
+  // beforeAll/afterAll when every test in the file is skipped is a semantic this repo cannot
+  // observe from a clone (which always HAS a project). Guard explicitly: with no host,
+  // ABS_DIR is '' and mkdirSync('') throws — which would turn a clean skip into a failure on
+  // exactly the project-less snapshot this change exists for.
+  if (!HOST) return;
   fs.rmSync(ABS_DIR, { recursive: true, force: true });
   fs.mkdirSync(ABS_DIR, { recursive: true });
   fs.writeFileSync(path.join(ABS_DIR, 'sheet.png'), png(64, 64));
   fs.writeFileSync(path.join(ABS_DIR, 'e2e-fields.particle.json'), JSON.stringify(PARTICLE_JSON, null, 2));
 });
-test.afterAll(() => { fs.rmSync(ABS_DIR, { recursive: true, force: true }); });
+test.afterAll(() => {
+  if (!HOST) return;
+  fs.rmSync(ABS_DIR, { recursive: true, force: true });
+});
 
 /** Tag the `<input>` whose label reads exactly `label` with `data-e2e-f="<label>"`.
  *  Matches the label's FIRST TEXT NODE, so a trailing hint marker (ParticleEditor's ⓘ) and a

@@ -12,7 +12,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { pluginHashInputs } from '../../plugins/vendorPlugins';
+import * as tar from 'tar';
+import { pluginHashInputs, compareTarballToSource, stampPluginBuild } from '../../plugins/vendorPlugins';
+import { buildPluginsWorkspaces, plannedStampDirs } from '../../scripts/stamp-plugin-builds.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const enginePkgs = path.join(repoRoot, 'engine', 'packages');
@@ -135,4 +137,288 @@ describe.skipIf(!esbuildOk())('vendor-plugins.mjs CLI runs (esbuild-bundled, no 
     const dep = JSON.parse(fs.readFileSync(path.join(tmp, 'package.json'), 'utf8')).dependencies[pluginName];
     expect(dep).toBe(`file:plugins/${tgz[0]}`);
   }, 130_000);
+});
+
+// ── The tarball's BYTES, not its name (#375) ──────────────────────────────────
+// `vendoredPluginFreshness` now opens each committed .tgz and compares it to the plugin source.
+// That guard is green on a healthy repo — which is exactly what a guard that checks NOTHING also
+// looks like, and this repo's recurring defect. So this drives compareTarballToSource with
+// deliberately drifted tarballs and asserts each kind of drift is actually reported. Real tar, real
+// gzip, a throwaway plugin dir — never the repo's own.
+describe('compareTarballToSource detects a tarball whose NAME is fine and whose BYTES are not', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tgz-drift-'));
+  afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  const pluginDir = path.join(tmp, 'plugin');
+  const tarball = path.join(tmp, 'fixture.tgz');
+
+  /** A minimal plugin whose shipped set is `ios/Sources/` + `dist/` (plus npm's always-shipped
+   *  package.json). No `src/`, so the dist is authoritative and its bytes ARE compared. */
+  function writePlugin(native: string, dist: string) {
+    fs.mkdirSync(path.join(pluginDir, 'ios', 'Sources'), { recursive: true });
+    fs.mkdirSync(path.join(pluginDir, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, 'package.json'), JSON.stringify({
+      name: 'capacitor-fixture', version: '1.0.0', files: ['ios/Sources/', 'dist/'],
+    }, null, 2));
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Sources', 'Plugin.swift'), native);
+    fs.writeFileSync(path.join(pluginDir, 'dist', 'plugin.js'), dist);
+    // Not shipped (not in `files`) — a change here must never read as drift.
+    fs.mkdirSync(path.join(pluginDir, 'ios', 'Tests'), { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Tests', 'PluginTests.swift'), '// tests\n');
+  }
+
+  /** Pack the plugin's shipped set the way npm pack lays it out: everything under `package/`. */
+  function pack() {
+    const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tgz-stage-'));
+    fs.cpSync(pluginDir, path.join(stage, 'package'), { recursive: true });
+    fs.rmSync(path.join(stage, 'package', 'ios', 'Tests'), { recursive: true, force: true });
+    tar.create({ file: tarball, sync: true, gzip: true, cwd: stage }, ['package']);
+    fs.rmSync(stage, { recursive: true, force: true });
+  }
+
+  it('reports NOTHING when the tarball matches (the baseline this rests on)', () => {
+    writePlugin('// v1 native\n', '// v1 js\n');
+    pack();
+    const r = compareTarballToSource(tarball, pluginDir);
+    expect(r.drift).toEqual([]);
+    // The fileset really was walked — an empty drift from an unread tarball looks identical.
+    expect(r.skipped.map((s) => s.path)).toContain('dist/plugin.js');
+  });
+
+  it('reports bytes-differ when the SOURCE moved on and the tarball did not — the #375 case', () => {
+    writePlugin('// v1 native\n', '// v1 js\n');
+    pack();
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Sources', 'Plugin.swift'), '// v2 native — the fix\n');
+    expect(compareTarballToSource(tarball, pluginDir).drift)
+      .toEqual([{ path: 'ios/Sources/Plugin.swift', kind: 'bytes-differ' }]);
+  });
+
+  it('stays SILENT on a changed dist — the toolchain-drift decision the vendorer already made', () => {
+    // dist/ is gitignored and rebuilt per clone; a tsc/rollup patch bump changes its bytes with no
+    // source change and no tarball rename (vendorPlugins.test.ts pins that: "does NOT re-pack when
+    // ONLY the built dist/ changes"). A guard that failed here would demand a re-vendor of all 21
+    // tarballs plus 21 lockfiles — the churn the vendorer exists to refuse.
+    writePlugin('// v1 native\n', '// v1 js\n');
+    pack();
+    fs.writeFileSync(path.join(pluginDir, 'dist', 'plugin.js'), '// built by a newer rollup\n');
+    fs.writeFileSync(path.join(pluginDir, 'dist', 'plugin.cjs.js'), '// a file the newer build emits\n');
+    expect(compareTarballToSource(tarball, pluginDir).drift).toEqual([]);
+  });
+
+  it('reports missing-from-tarball for a shipped file the tarball never got', () => {
+    writePlugin('// v1 native\n', '// v1 js\n');
+    pack();
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Sources', 'Extra.swift'), '// added after packing\n');
+    expect(compareTarballToSource(tarball, pluginDir).drift)
+      .toEqual([{ path: 'ios/Sources/Extra.swift', kind: 'missing-from-tarball' }]);
+  });
+
+  it('reports not-in-source for a tarball entry the plugin no longer has', () => {
+    writePlugin('// v1 native\n', '// v1 js\n');
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Sources', 'Doomed.swift'), '// deleted after packing\n');
+    pack();
+    fs.rmSync(path.join(pluginDir, 'ios', 'Sources', 'Doomed.swift'));
+    expect(compareTarballToSource(tarball, pluginDir).drift)
+      .toEqual([{ path: 'ios/Sources/Doomed.swift', kind: 'not-in-source' }]);
+  });
+
+  it('a NON-dist file differing only by CRLF IS drift — the exactness dist does not get', () => {
+    // The scoping half of the previous test. `.gitattributes` pins eol=lf for every extension the
+    // plugins ship, so a newline difference in shipped source is real drift, not a Windows
+    // checkout — and nothing measured that until this test.
+    writePlugin('// line one\n// line two\n', '// v1 js\n');
+    pack();
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Sources', 'Plugin.swift'), '// line one\r\n// line two\r\n');
+    expect(compareTarballToSource(tarball, pluginDir).drift)
+      .toEqual([{ path: 'ios/Sources/Plugin.swift', kind: 'bytes-differ' }]);
+  });
+
+  it('needs no local dist at all — the state of every CI machine before build:plugins', () => {
+    writePlugin('// v1 native\n', '// v1 js\n');
+    pack();
+    fs.rmSync(path.join(pluginDir, 'dist'), { recursive: true, force: true });
+    // The old stamp-gated version compared nothing here; the version after it reported all 12
+    // dist entries as `not-in-source`. Neither is right: dist is simply not this check's business.
+    expect(compareTarballToSource(tarball, pluginDir).drift).toEqual([]);
+  });
+
+  it('stays silent on a NON-shipped file — the scoping that keeps this from crying wolf', () => {
+    writePlugin('// v1 native\n', '// v1 js\n');
+    pack();
+    fs.writeFileSync(path.join(pluginDir, 'ios', 'Tests', 'PluginTests.swift'), '// edited tests\n');
+    expect(compareTarballToSource(tarball, pluginDir).drift).toEqual([]);
+  });
+});
+
+// ── stampPluginBuild: the postinstall's stamp must mean what ensurePluginBuilt means (#395) ──
+// `build:plugins` builds every plugin dist directly and used to write no stamp, so the next
+// ensurePluginBuilt call judged a CURRENT dist stale and rebuilt it — deleting and recreating
+// dist/ in the repo while the app lane was importing it, which failed `npm run verify` with a
+// module-resolution error that never reproduced on a re-run. These pin the properties that make
+// the stamp trustworthy; a stamp that is merely PRESENT would "fix" the flake while vouching for
+// a stale dist, which is the quiet wrong build this must not become.
+describe('stampPluginBuild marks a built dist current (#395)', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-stamp-'));
+  afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  /** A plugin dir with sources and (optionally) a built dist. */
+  function makePlugin(name: string, opts: { dist?: boolean; src?: string } = {}): string {
+    const dir = path.join(tmp, name);
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name, version: '1.0.0' }));
+    fs.writeFileSync(path.join(dir, 'src', 'index.ts'), opts.src ?? 'export const a = 1;\n');
+    if (opts.dist !== false) {
+      fs.mkdirSync(path.join(dir, 'dist'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'dist', 'plugin.js'), '// built\n');
+    }
+    return dir;
+  }
+  const stampOf = (dir: string) =>
+    fs.readFileSync(path.join(dir, 'node_modules', '.modoki-buildstamp'), 'utf8').trim();
+
+  it('writes a stamp when a built dist exists', () => {
+    const dir = makePlugin('with-dist');
+    expect(stampPluginBuild(dir)).toBe(true);
+    expect(stampOf(dir)).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it('refuses to vouch for a dist that does not exist', () => {
+    const dir = makePlugin('no-dist', { dist: false });
+    expect(stampPluginBuild(dir)).toBe(false);
+    expect(fs.existsSync(path.join(dir, 'node_modules', '.modoki-buildstamp'))).toBe(false);
+  });
+
+  it('is SOURCE-derived, not a mere presence marker — editing src/ alone changes the stamp', () => {
+    // ONE plugin dir, perturbed in place. An earlier version of this test compared two DIFFERENT
+    // fixture dirs and was worthless: makePlugin writes the plugin NAME into package.json, and
+    // package.json is itself in DIST_BUILD_CONFIG_FILES, so the two stamps differed because of the
+    // name and the assertion could not attribute anything to src/. Nulling pluginSourceHash's src/
+    // walk — the mutant that makes a source edit invisible to staleness detection, i.e. exactly the
+    // silent-stale-build this guards — left that version GREEN.
+    const dir = makePlugin('src-perturbed', { src: 'export const a = 1;\n' });
+    expect(stampPluginBuild(dir)).toBe(true);
+    const before = stampOf(dir);
+
+    fs.writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const a = 2;\n');
+    expect(stampPluginBuild(dir)).toBe(true);
+    expect(stampOf(dir)).not.toBe(before);
+  });
+
+  it('a NEW file under src/ changes the stamp too — not just an edit to a known one', () => {
+    const dir = makePlugin('src-added');
+    stampPluginBuild(dir);
+    const before = stampOf(dir);
+    fs.writeFileSync(path.join(dir, 'src', 'extra.ts'), 'export const b = 2;\n');
+    stampPluginBuild(dir);
+    expect(stampOf(dir)).not.toBe(before);
+  });
+
+  it('refuses to vouch when there are no sources to hash (a packaged editor ships a prebuilt dist)', () => {
+    // pluginSourceHash returns null with no src/, and ensurePluginBuilt treats that shipped dist as
+    // authoritative — so there is nothing for this to vouch for and it must not write a stamp.
+    const dir = makePlugin('no-src');
+    fs.rmSync(path.join(dir, 'src'), { recursive: true, force: true });
+    expect(stampPluginBuild(dir)).toBe(false);
+    expect(fs.existsSync(path.join(dir, 'node_modules', '.modoki-buildstamp'))).toBe(false);
+  });
+
+  it('returns FALSE when the stamp could not actually be written', () => {
+    // writeBuildStamp is best-effort and swallows its errors (read-only node_modules, ENOSPC), so
+    // a `true` that only means "a write was attempted" makes the postinstall report work it did
+    // not do — and that log is the only signal anyone has that #395 is fixed. Forced portably by
+    // occupying the stamp path with a DIRECTORY, so writeFileSync fails with EISDIR.
+    const dir = makePlugin('unwritable-stamp');
+    fs.mkdirSync(path.join(dir, 'node_modules', '.modoki-buildstamp'), { recursive: true });
+    expect(stampPluginBuild(dir)).toBe(false);
+  });
+
+  it('returns FALSE when a STALE stamp survives a failed write — not merely when none exists', () => {
+    // Distinguishes `readBuildStamp(dir) === srcHash` from the weaker `readBuildStamp(dir) !== null`,
+    // which passes every other case here. A stale stamp left behind by a failed write is exactly the
+    // state that must not be reported as success: ensurePluginBuilt would compare it, disagree, and
+    // rebuild — fine — but the postinstall would have claimed the plugin was stamped when it is not.
+    const dir = makePlugin('stale-stamp-unwritable');
+    const stampPath = path.join(dir, 'node_modules', '.modoki-buildstamp');
+    fs.mkdirSync(path.dirname(stampPath), { recursive: true });
+    fs.writeFileSync(stampPath, 'staleaaaaaaaaaaa');
+    fs.chmodSync(stampPath, 0o444); // read-only: writeFileSync throws EPERM, content survives
+    try {
+      expect(stampPluginBuild(dir)).toBe(false);
+      expect(fs.readFileSync(stampPath, 'utf8')).toBe('staleaaaaaaaaaaa'); // the write really did fail
+    } finally {
+      fs.chmodSync(stampPath, 0o666); // else afterAll's rmSync cannot remove it on Windows
+    }
+  });
+
+  it('is deterministic — restamping identical sources yields the same value', () => {
+    const dir = makePlugin('stable');
+    stampPluginBuild(dir);
+    const first = stampOf(dir);
+    stampPluginBuild(dir);
+    expect(stampOf(dir)).toBe(first);
+  });
+});
+
+// ── The stamper may only vouch for what `build:plugins` actually built (#395) ─────────────
+// listEnginePlugins DISCOVERS every engine/packages/* declaring a `capacitor` field, while
+// build:plugins is a hand-written --workspace list, and the two are ALLOWED to diverge:
+// pluginBuildCoverage.test.ts states that scope deliberately ("a plugin used solely by a game
+// … is deliberately not required here"). Stamping the discovered set would vouch for a plugin
+// this install never built — and if such a plugin has a stale dist/ from an earlier build, the
+// stamp is computed from its CURRENT sources, ensurePluginBuilt short-circuits forever, and
+// packInto ships a tarball whose name is current and whose bytes are stale. That is the #90
+// failure the stamp machinery exists to prevent, so the derivation is the safety property.
+describe('stamp-plugin-builds derives its set from build:plugins, not from discovery (#395)', () => {
+  it('parses every --workspace out of the real build:plugins script', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    const script: string = pkg.scripts['build:plugins'];
+    const occurrences = (script.match(/--workspace/g) ?? []).length;
+    const parsed = buildPluginsWorkspaces(pkg);
+    expect(parsed.length).toBe(occurrences);
+    expect(occurrences).toBeGreaterThan(0);
+    for (const rel of parsed) {
+      expect(fs.existsSync(path.join(repoRoot, rel, 'package.json')), `${rel} should exist`).toBe(true);
+    }
+  });
+
+  it('yields nothing when build:plugins is absent or reshaped — stamping nothing beats stamping wrongly', () => {
+    expect(buildPluginsWorkspaces({ scripts: {} })).toEqual([]);
+    expect(buildPluginsWorkspaces({})).toEqual([]);
+    expect(buildPluginsWorkspaces({ scripts: { 'build:plugins': 'npm run build' } })).toEqual([]);
+  });
+
+  it('accepts both --workspace=x and --workspace x', () => {
+    expect(buildPluginsWorkspaces({ scripts: { 'build:plugins': 'npm run build --workspace=a --workspace b' } }))
+      .toEqual(['a', 'b']);
+  });
+
+  it('plans from build:plugins, NOT from the wider discovered set', () => {
+    // THE distinguishing assertion for #395's safety property. listEnginePlugins discovers 4 cap
+    // plugins under engine/packages; a stamper consulting discovery would return all 4 regardless
+    // of the script. Handing it a package.json naming ONE workspace must yield exactly ONE dir —
+    // a result the discovery-based stamper cannot produce. Today the two sets happen to be
+    // identical, so nothing else in the suite can tell them apart.
+    const discovered = fs.readdirSync(enginePkgs, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && fs.existsSync(path.join(enginePkgs, e.name, 'package.json')))
+      .filter((e) => {
+        try { return !!JSON.parse(fs.readFileSync(path.join(enginePkgs, e.name, 'package.json'), 'utf8')).capacitor; }
+        catch { return false; }
+      });
+    expect(discovered.length).toBeGreaterThan(1); // otherwise this test proves nothing
+
+    const planned = plannedStampDirs(repoRoot, {
+      scripts: { 'build:plugins': 'npm run build --workspace engine/packages/capacitor-game-debug' },
+    });
+    expect(planned.map((p) => p.rel)).toEqual(['engine/packages/capacitor-game-debug']);
+    expect(planned[0].dir).toBe(path.resolve(repoRoot, 'engine/packages/capacitor-game-debug'));
+  });
+
+  it('postinstall still runs the stamper — deleting the link reinstates #395 with every gate green', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    const postinstall: string = pkg.scripts.postinstall;
+    expect(postinstall).toContain('stamp-plugin-builds.mjs');
+    // Order is the correctness argument: a failed build must never reach the stamper.
+    expect(postinstall.indexOf('build:plugins')).toBeLessThan(postinstall.indexOf('stamp-plugin-builds.mjs'));
+    expect(postinstall.slice(postinstall.indexOf('build:plugins'), postinstall.indexOf('stamp-plugin-builds.mjs'))).toContain('&&');
+  });
 });

@@ -30,7 +30,12 @@ const src = fs.readFileSync(SRC, 'utf8');
 /** The `platform === 'android'` serial-resolution block, sliced out so the assertions below cannot
  *  be satisfied (or broken) by an unrelated mention of these names elsewhere in a 2600-line file. */
 function androidSerialBlock(): string {
-  const start = src.indexOf("if (platform === 'android') {");
+  // Matched as a PATTERN, not a literal: #370 added a `&& !isRelease` arm (a release build installs
+  // nothing, so it must not consult adb at all), which broke a literal anchor. The guard failed
+  // LOUDLY, as designed — but it failed for a reason that has nothing to do with what it protects,
+  // and a guard that cries wolf at every neighbouring edit is one somebody eventually deletes. Any
+  // further condition on the same `if` now keeps it aimed.
+  const start = src.search(/if \(platform === 'android'[^)]*\) \{/);
   expect(start, "the android serial-resolution block moved — re-aim this guard").toBeGreaterThan(-1);
   const end = src.indexOf('const adb = ', start);
   expect(end, 'the end anchor moved — re-aim this guard').toBeGreaterThan(start);

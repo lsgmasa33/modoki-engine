@@ -197,7 +197,7 @@ const VSYNC_INTERVALS_MS = [1000 / 60, 1000 / 120, 1000 / 90, 1000 / 144];
  *  decision works now.** `hasHeadroom` no longer reads `frameMs` or `vsyncBound` at all; it asks
  *  whether the engine's CPU fits the frame the NEXT tier targets. The cap still has to be pushed
  *  in, because `budgetMs`/`overBudget` are derived from it and promotion is floored on
- *  `!overBudget`. See `docs/rendering.md` § "an idle window is not evidence".
+ *  `!overBudget`. See `docs/rendering.md` § "Quality tiers" (the "AN IDLE WINDOW IS NOT EVIDENCE EITHER" rule).
  *
  *  A cap is a FRAME-DRIVER fact, not a display fact, so it is PUSHED IN rather than imported:
  *  `frameProfiler` is L0 core and the cap's owner (`frameDriver`, L2) may import downward but not

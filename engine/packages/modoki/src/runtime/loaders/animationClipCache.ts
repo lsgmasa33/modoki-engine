@@ -5,7 +5,8 @@
  * simply retries next frame. Clips are plain data — nothing to GPU-dispose.
  */
 
-import { resolveRef, isGuid, registerAsset } from './assetManifest';
+import { isGuid, registerAsset } from './assetManifest';
+import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { normalizeAnimationClip, type AnimationClipDef } from '../animation/types';
@@ -15,11 +16,18 @@ const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
 let generation = 0;
 
+// `runtime/animation/**` had ZERO console.warn calls for an unresolved ref, unlike its 3D
+// (`[MeshCache] Unknown asset guid: …`) and 2D-sprite siblings — an Animator whose bank
+// references a deleted/renamed-away clip GUID posed nothing, with no trace in the console.
+// `resolveRefWarnOnce` is the shared fix both those already use: warn once per guid, forget on
+// resolve so a later genuine break warns again (QA-ANIM-0018).
+const unknownGuidSeen = new Set<string>();
+
 /** Resolve a cache key. A GUID resolves through the manifest; the editor seeds /
  *  invalidates by file path directly (like particleCache). */
 function clipCacheKey(refOrPath: string): string | undefined {
   if (!refOrPath) return undefined;
-  return isGuid(refOrPath) ? resolveRef(refOrPath) : refOrPath;
+  return isGuid(refOrPath) ? resolveRefWarnOnce(refOrPath, 'animationClipCache', unknownGuidSeen) : refOrPath;
 }
 
 /** Resolve a clip ref to its parsed definition, or null if not yet loaded. */

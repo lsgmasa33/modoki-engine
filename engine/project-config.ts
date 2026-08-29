@@ -114,6 +114,11 @@ export interface TierOverridesConfig {
   };
   maxDirectional: number;
   maxLocal: number;
+  /** Fraction in [0, 1) a challenger light must beat the incumbent selection by before it
+   *  replaces it (#353). Mirrors `TierRenderOverrides.hysteresisMargin`
+   *  (runtime/rendering/qualityTier.ts) — undefined/0 disables it, matching today's plain
+   *  nearest/most-effective selection. */
+  hysteresisMargin?: number;
   /** Most lights that may render a shadow map this frame. **0 = unlimited** (#229). Mirrors
    *  `TierRenderOverrides.maxShadowCasters` (runtime/rendering/qualityTier.ts) — separate from
    *  `maxDirectional`/`maxLocal` (those cap how many lights SHADE a fragment; this caps how many
@@ -152,6 +157,65 @@ export interface ProjectConfig {
      *  ideally 1024×1024). The build generates all iOS AppIcon + Android mipmap
      *  sizes from it. Empty = use the bundled Modoki icon. */
     iconSource: string;
+    /** PROJECT-RELATIVE path to the source SPLASH image — the native launch screen, shown
+     *  before the web view has booted at all (NOT an in-game title card).
+     *
+     *  Empty = derived from {@link iconSource}, which is what every project shipped before
+     *  #396: the app icon centred on white, because `@capacitor/assets` fans a splash out of
+     *  the same master when it is given no splash of its own.
+     *
+     *  ⚠️ **Both platforms COVER-FILL this image, so its edges are always cropped.** iOS shows
+     *  one square 2732x2732 with `contentMode="scaleAspectFill"`, which on a 19.5:9 phone
+     *  leaves only the central ~45% of the WIDTH visible. Compose the art around that column —
+     *  `splashLayout.mjs` derives the exact safe box, and the generator places the title and
+     *  badge inside it, but nothing can rescue subject matter authored into the corners.
+     *  Ideal master: a large square (2732x2732), which crops gracefully in both directions. */
+    splashSource: string;
+    /** PROJECT-RELATIVE path to the DARK-MODE splash. Empty = reuse {@link splashSource}.
+     *
+     *  iOS has carried `-dark` slots in `Splash.imageset` and Android `drawable-night-*`
+     *  buckets all along; before #396 both were filled with the same light art, so dark mode
+     *  was a slot that existed and meant nothing. */
+    splashDarkSource: string;
+    /** PROJECT-RELATIVE path to a transparent PNG wordmark (the game's title) composited onto
+     *  the splash at build time. Empty = no title overlay.
+     *
+     *  Composited rather than painted into the splash master on purpose: an image generator
+     *  mangles lettering often enough that the title — the one element that must be perfect —
+     *  cannot be trusted to it, and typesetting it here means position and size stay tunable
+     *  without regenerating the art. */
+    splashTitleSource: string;
+    /** Title width, as a percentage of the splash's CROP-SAFE width (not the image's). A share
+     *  of the safe box is what lets one authored number hold across buckets of different
+     *  shapes; see `splashLayout.mjs`. */
+    splashTitleWidthPct: number;
+    /** Title's vertical offset from the centre of the crop-safe box, as a percentage of that
+     *  box's height. Negative is up. Clamped into the safe region, with a build log line when
+     *  clamping happens. */
+    splashTitleOffsetPct: number;
+    /** Composite a small "Made by Modoki Engine" mark at the bottom of the splash's crop-safe
+     *  region. Engine branding, so it is a boolean rather than an authored asset — the artwork
+     *  and its placement belong to the engine.
+     *
+     *  **Default FALSE** (owner, 2026-08-28): nothing already shipped grows a mark it did not
+     *  have, including the five published demos and anything released under Apiary. Opt in per
+     *  project. */
+    splashBadge: boolean;
+    /** PROJECT-RELATIVE path to a hand-authored **iOS 18 dark** app icon. Empty = derived from
+     *  {@link iconSource}. See {@link iconMonochromeSource} for why an override exists at all. */
+    iconDarkSource: string;
+    /** PROJECT-RELATIVE path to a hand-authored **iOS 18 tinted** app icon — a GREYSCALE image,
+     *  which iOS tints itself. Empty = derived from {@link iconSource} by a luminance ramp. */
+    iconTintedSource: string;
+    /** PROJECT-RELATIVE path to a hand-authored **Android 13+ monochrome** launcher layer: the
+     *  silhouette a themed-icon launcher tints. Empty = derived from {@link iconSource}.
+     *
+     *  ⚠️ **The derived version is a fallback, not an answer.** A monochrome layer derived from
+     *  a full-colour painting is usually wrong — Court's pale cream knight on painted wood
+     *  flattens to a low-contrast blob, and with no `<monochrome>` layer at all the launcher's
+     *  own fallback treatment does the same thing. Any project whose icon is a painting rather
+     *  than a flat mark should author this one. */
+    iconMonochromeSource: string;
     /** Marketing version — what a player sees in the store listing ("1.0", "2.3.1").
      *  Synced by `healAndroidVersion` into `versionName` and by `healIosVersion` into
      *  `MARKETING_VERSION` (which `Info.plist` reads as `CFBundleShortVersionString`
@@ -179,8 +243,19 @@ export interface ProjectConfig {
      *
      *  NOT auto-incremented, on purpose: a build number that changes itself makes builds
      *  non-reproducible and churns a committed file on every build (the #18
-     *  write-behind-your-back hazard). The owner bumps it. */
+     *  write-behind-your-back hazard). The owner bumps it — or flips {@link buildNumberAuto}
+     *  on and the heal derives it instead. */
     buildNumber: number;
+    /** AUTO build number. When TRUE, the typed {@link buildNumber} above is IGNORED and the
+     *  effective number is derived from `git rev-list --count HEAD` of the project's repo at
+     *  every open/build — no hand-bumping per store upload. The typed value still acts as a
+     *  FLOOR (`max` of the two) so a store-forced jump stays possible without turning auto off.
+     *  The native files always see ONE resolved number; how it was derived never leaks into them.
+     *
+     *  Commit counts differ between clones (main vs a worker branch) and are shared by every
+     *  game in the repo; both are absorbed by the never-lower guard, since only uploads care.
+     *  A project copied OUT of its repo (no git) falls back to {@link buildNumber} with a note. */
+    buildNumberAuto: boolean;
   };
   content: {
     /** Ordered build scene list (see {@link SceneEntry}). The first INCLUDED
@@ -221,6 +296,15 @@ export interface ProjectConfig {
      *  committed config, not project.user.json. The editor's heal-on-open syncs it
      *  into the iOS project's DEVELOPMENT_TEAM. Empty = leave the pbxproj as-is. */
     appleTeamId: string;
+    /** How a RELEASE iOS build exports its archive — the `method` in the generated
+     *  `-exportOptionsPlist` (#370). `app-store-connect` is the shipping path; `ad-hoc` and
+     *  `development` produce an .ipa installable on registered devices, for testing the
+     *  release-signed build before it goes near a store.
+     *
+     *  Committed, not private: unlike {@link appleTeamId} it names no account and reveals nothing —
+     *  it is a per-PROJECT intent ("this project ships to the App Store"), the same kind of value as
+     *  `webDeployMode`. Ignored entirely by a debug build. */
+    iosExportMethod: IosExportMethod;
     /** Minimum iOS version this project supports — the SINGLE source of truth for the
      *  floor, driving BOTH halves of it:
      *   - the JS bundle's syntax target (`build.target` in vite.config.ts → `ios<x>`/`safari<x>`)
@@ -345,6 +429,46 @@ export interface ProjectConfig {
       /** Upper bound on devicePixelRatio (perf vs sharpness). */
       pixelRatioCap: number;
       shadows: boolean;
+      /** May image-based lighting (an HDR `Environment`) light the scene at the DEFAULT tier?
+       *
+       *  ⚠️ One of SEVEN fields (#403) that used to exist ONLY inside an authored `mid`/`low`
+       *  config, with the default hardcoded in the engine's `UNCLAMPED_OVERRIDES`. That made the
+       *  Project Settings tier matrix asymmetric — the author could degrade IBL on a weak device
+       *  but could not turn it off for the project — so the engine's identity value became this
+       *  authored default, defaulting to the same value it hardcoded. A project that never touches
+       *  it is byte-identical to before. */
+      ibl: boolean;
+      /** Multiplier on AMBIENT light intensity while `ibl` is false, to put back the fill light the
+       *  environment was providing. Identity: `1`.
+       *
+       *  ⚠️ Default-authorable BECAUSE `ibl` is (#403), not for symmetry's sake: a project that
+       *  turns IBL off at the default tier would otherwise have its scene go dark and flat with the
+       *  compensation pinned at the engine's no-op. A knob you cannot act on is worse than none. */
+      iblOffAmbientBoost: number;
+      /** Multiplier on tone-mapping exposure while `ibl` is false — the second half of the same
+       *  compensation as `iblOffAmbientBoost`. Identity: `1`. */
+      iblOffExposure: number;
+      /** Ceiling on `Light.shadowMapSize` at the DEFAULT tier, in texels. **0 = no ceiling** —
+       *  the identity, and the value the engine hardcoded before #403. */
+      shadowMapCeiling: number;
+      /** Most DIRECTIONAL lights an object may be lit by at the DEFAULT tier. **0 = unlimited**
+       *  (the identity). Directional is where the light cost lives — forward shading pays the full
+       *  BRDF per light per fragment (#403; see `TierRenderOverrides.maxDirectional`). */
+      maxDirectional: number;
+      /** Most POINT+SPOT ("local") lights an object may be lit by at the DEFAULT tier.
+       *  **0 = unlimited** (the identity). */
+      maxLocal: number;
+      /** Fraction in [0, 1) a challenger light must beat the incumbent selection by before it
+       *  replaces it, at the DEFAULT tier. **0 = off** (the identity), matching today's plain
+       *  nearest/most-effective selection. Inert unless `maxDirectional`/`maxLocal` cap something
+       *  — it damps the selection flapping those caps can otherwise produce near a tie (#353). */
+      hysteresisMargin: number;
+      /** Most lights that may RENDER a shadow map per frame at the DEFAULT tier.
+       *  **0 = unlimited** (the identity). Separate from `maxDirectional`/`maxLocal` (which cap
+       *  how many lights SHADE a fragment) and from `shadowMapCeiling` (which caps a map's SIZE,
+       *  not how many are rendered) — a shadow map is a whole extra submit of the caster set for
+       *  the whole scene, once per frame (#229). */
+      maxShadowCasters: number;
       /** Quality tier (#121): 'auto' delegates to the device allowlist + on-device calibration;
        *  'low'/'mid'/'high' pin it. A tier CLAMPS the settings above — it never raises them — so
        *  'high' is exactly today's behaviour and the fields beside it stay authoritative.
@@ -504,6 +628,31 @@ export interface ProjectUserConfig {
     webCdnBackendBucket: string;
     webDeployCommand: string;
   };
+  /** The Android **upload key** a release AAB is signed with (#370). Lives here — gitignored,
+   *  per-checkout — for the same reason as `build` above: it is not this developer's *hardware*,
+   *  but it must never be committed. The passwords make that absolute, and the `storeFile` path is
+   *  per-machine besides.
+   *
+   *  ⚠️ Unlike the debug key, an upload key is **one key across every machine**: Play matches the
+   *  AAB's signature against the key the app was enrolled with and rejects anything else, so a
+   *  second machine must copy the SAME `.jks` rather than generate its own (the opposite of
+   *  `~/.android/debug.keystore`, which is legitimately per-machine — see
+   *  docs/build.md § "Release builds"). Keep the file OUTSIDE the repo; the convention is
+   *  `~/.modoki/keystores/<appId>-upload.jks`.
+   *
+   *  All-empty = "this machine has no upload key", which is a handled state everywhere: the
+   *  Gradle signing block is written but inert, a debug build is unaffected, and only a
+   *  `variant=release` Android build refuses (with a message naming what to set). */
+  keystore: {
+    /** Absolute path to the `.jks`/`.keystore` holding the upload key. */
+    storeFile: string;
+    /** Password for the keystore FILE. */
+    storePassword: string;
+    /** Alias of the key inside it. */
+    keyAlias: string;
+    /** Password for that KEY (often the same as `storePassword`). */
+    keyPassword: string;
+  };
 }
 
 /** Defaults for the committed project config. Used whenever project.config.json
@@ -513,6 +662,20 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     appId: 'com.modokiengine.prototype',
     appName: 'Puzzle Prototype',
     iconSource: '',
+    // Every splash/variant default is EMPTY or FALSE, so adopting these fields changes the
+    // generated output of no existing project: an empty source falls back to the icon-derived
+    // behaviour that shipped before #396/#397, and the badge is opt-in. The two numbers are
+    // inert while `splashTitleSource` is empty; 55% of the safe width a little above centre is
+    // where a wordmark sits on a launch screen.
+    splashSource: '',
+    splashDarkSource: '',
+    splashTitleSource: '',
+    splashTitleWidthPct: 55,
+    splashTitleOffsetPct: -8,
+    splashBadge: false,
+    iconDarkSource: '',
+    iconTintedSource: '',
+    iconMonochromeSource: '',
     // '1.0' / 1 are exactly what `cap add` scaffolds into versionName/versionCode and
     // MARKETING_VERSION/CURRENT_PROJECT_VERSION, so adopting these fields rewrites NOTHING
     // in any existing project (measured across all 20: every one is 1.0/1 bar iap-test,
@@ -521,6 +684,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     // wrong with starting at 1.0/1 — it was just unmanaged.
     version: '1.0',
     buildNumber: 1,
+    buildNumberAuto: false,
   },
   content: {
     scenes: [],
@@ -535,6 +699,10 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     webCdnBackendBucket: '',
     webDeployCommand: '',
     appleTeamId: '',
+    // The shipping path. A project that only ever wants a test .ipa sets 'ad-hoc'/'development';
+    // defaulting THERE instead would mean every project's first store build silently produced an
+    // artifact App Store Connect refuses.
+    iosExportMethod: 'app-store-connect',
     // 16.4 by owner decision (2026-08-04), deliberately dropping the iPhone 7 / 6s / SE1
     // era. Comfortably above the 15.4 runtime-API line (structuredClone / Array.at /
     // Object.hasOwn all land in 15.4), so no polyfills are needed at this floor.
@@ -565,7 +733,17 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   rendering: {
     targetFps: 60, // matches the frame driver's historical default cap
     tierSwitchMessage: '', // empty = the engine's own default copy
-    three: { backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true, qualityTier: 'auto', toneMapping: 'ACESFilmic', exposure: 1.2 },
+    // ⚠️ The six #403 fields below (ibl … maxShadowCasters) each default to the value the engine
+    // previously hardcoded in `UNCLAMPED_OVERRIDES` — the IDENTITY. That is what makes making
+    // them authorable a no-op for every project that does not touch them, which was the condition
+    // for adding them at all.
+    three: {
+      backend: 'auto', antialias: true, pixelRatioCap: 2, shadows: true,
+      ibl: true, iblOffAmbientBoost: 1, iblOffExposure: 1,
+      shadowMapCeiling: 0, maxDirectional: 0, maxLocal: 0,
+      hysteresisMargin: 0, maxShadowCasters: 0,
+      qualityTier: 'auto', toneMapping: 'ACESFilmic', exposure: 1.2,
+    },
     pixi: { backend: 'auto', antialias: true, resolution: 0, pixelRatioCap: 2 },
     web: { sizeMode: 'free', width: 1280, height: 720 },
   },
@@ -610,6 +788,14 @@ export const DEFAULT_PROJECT_USER_CONFIG: ProjectUserConfig = {
     webCdnUrlMap: '',
     webCdnBackendBucket: '',
     webDeployCommand: '',
+  },
+  // Same all-empty rationale, with more force: these are a SIGNING KEY's location and its two
+  // passwords. There is no committed fallback to fall through to and there must never be one.
+  keystore: {
+    storeFile: '',
+    storePassword: '',
+    keyAlias: '',
+    keyPassword: '',
   },
 };
 
@@ -695,6 +881,13 @@ export const QUALITY_TIERS = ['auto', 'low', 'mid', 'high'] as const;
 export const WEB_DEPLOY_MODES = ['none', 'gcs', 'custom'] as const;
 /** Ad-network MRAID/CTA conventions for the playable export. */
 export const PLAYABLE_NETWORKS = ['applovin', 'unity', 'ironsource', 'facebook', 'mintegral', 'generic'] as const;
+/** How a release iOS build exports its archive — `-exportOptionsPlist`'s `method` (#370).
+ *
+ *  ⚠️ `app-store-connect` is the CURRENT spelling and the default; Xcode called it `app-store`
+ *  before 15.3 and still accepts the old name, so both are listed — a project pinned to an older
+ *  Xcode can select `app-store` and it round-trips unchanged. */
+export const IOS_EXPORT_METHODS = ['app-store-connect', 'app-store', 'ad-hoc', 'development', 'enterprise'] as const;
+export type IosExportMethod = (typeof IOS_EXPORT_METHODS)[number];
 /** Whether a build emits per-tier texture LOD variants (#212) — 'auto' emits only when the
  *  payload is delivered OVER THE WIRE (a web build, or a native build that's actually an OTA
  *  publish); 'always'/'never' override that in either direction. See
@@ -768,6 +961,9 @@ export function mergeProjectConfig(
       // deploy/playable step silently picked a branch for it.
       webDeployMode: pick(p.build?.webDeployMode, WEB_DEPLOY_MODES, d.build.webDeployMode, 'build.webDeployMode'),
       playableNetwork: pick(p.build?.playableNetwork, PLAYABLE_NETWORKS, d.build.playableNetwork, 'build.playableNetwork'),
+      // #370: written verbatim into the generated exportOptions.plist, and xcodebuild rejects an
+      // unknown `method` with a message that reads like a signing problem — coerce, don't pass through.
+      iosExportMethod: pick(p.build?.iosExportMethod, IOS_EXPORT_METHODS, d.build.iosExportMethod, 'build.iosExportMethod'),
       textureTierVariants: pick(p.build?.textureTierVariants, TEXTURE_TIER_VARIANTS_MODES, d.build.textureTierVariants, 'build.textureTierVariants'),
     },
     capacitor: {
@@ -817,6 +1013,7 @@ export function mergeProjectUserConfig(partial: Partial<ProjectUserConfig> | nul
     device: { ...d.device, ...p.device },
     sdk: { ...d.sdk, ...p.sdk },
     build: { ...d.build, ...p.build },
+    keystore: { ...d.keystore, ...p.keystore },
   };
 }
 

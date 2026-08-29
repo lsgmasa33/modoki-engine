@@ -172,6 +172,34 @@ Note this is a *serializer* rule, not a format version: it changes what a save w
 what a load accepts, so no migration is involved and older fully-populated files keep
 loading unchanged.
 
+**A field the file SPELLS OUT at its default is dropped too** — "absent" and "present at
+default" are the same live state after a load, so the serializer cannot tell them apart and
+does not try. This is the decided behaviour, and it is the half that surprises people:
+`serializeScene` consults only the live world, never the document on disk, so an authored
+`bus: "sfx"` is indistinguishable from an unauthored one and both go. Keeping it would mean
+retaining the loaded document at save time (nothing does — `SceneManager` keeps only
+path/guid/`createdAt`/`baseScene`) and would make the output depend on what the file already
+held, so the same world saved from two starting points would produce two different files.
+
+⚠️ **The consequence for TESTS, which is how this actually bites: a raw
+`parsed.traits.X.y` read asserts "the file spells this out", not "the value is y."** It is
+correct only while the authored value happens to differ from the default. Route that class
+of read through **`traitFieldOrDefault(Trait, bag, field)`**
+(`runtime/core/ecs/traitSchema.ts`) — strictly stronger, since it also fails when the
+*engine* default moves under an unauthored field, and it throws on a misspelled field
+instead of quietly yielding `undefined`. Where a test compares two entities field-by-field,
+take the key set from **`soaSchema({ trait })`**, never from the authored keys: a key set
+derived from the same data the loop iterates thins out silently as fields default away.
+
+*(#405, 2026-08-28.* An editor save of `games/court/main.scene.json` dropped 44
+hand-authored default-valued fields across 33 entities and broke two Court tests doing
+exactly that raw read. Filed as a serializer bug proposing "never strip a value present on
+disk"; declined, because it reverses the 2026-07-31 decision above and because the churn was
+a **one-time normalization of a hand-authored file** — the scene carried `"version": 13`, a
+number no code emits — not the per-edit churn the report described. A second save is
+byte-stable, as `traitDefaultOmission.test.ts` has always asserted. The two tests were the
+defect and were fixed; that test file now also pins the present-at-default case directly.)*
+
 **Where it applies, and the one boundary between the two conventions:**
 
 - **Scene entities** — compacted, as above.
@@ -205,7 +233,7 @@ override.
 `meta.fields` is the *Inspector's* curated list: a persistent field owned by a custom
 Inspector section is deliberately absent from it (`Animator.clips`/`clip`,
 `SpriteAnimator.clip`, `AudioSource.clips`, `UIElement.flexWrap`,
-`EntityAttributes.editorFolder`, `Time.timeScale`, …). Every persistence path therefore
+`EntityAttributes.editorFolder`, …). Every persistence path therefore
 reads through `readTraitDataFull` (`runtime/core/ecs/entityUtils.ts`) and gates stored
 fields with `isPersistentTraitField` (`runtime/core/ecs/traitSchema.ts`) — the scene
 serializer, `serializePrefab`,
@@ -372,6 +400,54 @@ re-serialize and diff, which needs the trait schemas and a world; `check-scene-c
 what verifies a real re-save. It also parses `entities[].traits` rather than scanning text,
 because prefab `added[]` subtrees legitimately carry full trait data (defaults and blank refs
 included) and a text scan flags an already-migrated scene as legacy.
+
+**A third leak class — an engine-written field with no `runtimeOnly` flag (#406).** #406 measured
+`games/scroll-demo` as the last project holding present-at-default fields, and its sweep looked
+clean: 0 semantic changes, no new entities, `Transient` verified on the pooled entries. It was not.
+The re-save had written `UIScrollView.viewportWidth/Height` + `contentWidth/Height` as **410x312 —
+the editor's own measured UI viewport** — and `UIEntries.visibleX/visibleY/poolSize` into three
+committed scenes, because those fields were marked `hidden` (an Inspector-display flag) but never
+`runtimeOnly` (the flag `serializeScene` actually reads). `games/court` authors two scroll views and
+ships, so its next save would have put one editor's viewport size into a shipping scene.
+
+Two gaps let it through, and both are now closed:
+- `check-scene-churn.mjs` compared only fields present in **both** versions, so a field *appearing*
+  was invisible. It now reports `GAINED` — a field the committed file did not spell out can only be
+  emitted because it no longer holds its default, i.e. a live value on authored data. The
+  exemptions are per FIELD (`EntityAttributes.guid`/`.parentId`, `PrefabInstance.rootInstanceId` —
+  all minted by the serializer), **not per trait**: exempting `EntityAttributes` wholesale also
+  silenced `isActive`, which the Director's activation track writes live, so a sweep baking a
+  permanently-deactivated entity into a scene would still have printed "0 semantic changes". A
+  field *disappearing* stays unreported — indistinguishable from default-compaction without the
+  trait schemas. **`check-prefab-churn.mjs` had the identical hole** and got the identical fix: its
+  comment argued a gained field was "a default made explicit", which is the reasoning this whole
+  entry disproves. Its minted set is different (a template has no instance row, and
+  `serializePrefab` emits `EntityAttributes` inline as `{name, parentId, guid}` for every row).
+- `engine/tests/assets/runtimeOnlyFieldsOffDisk.test.ts` fails `npm test` on any committed scene or
+  prefab holding a `runtimeOnly` field, walking `traits`, `overrides[localId]` and `added[]`
+  subtrees alike, across all 142 project + template files (enumerated by extension under
+  `runtime/assets`, not by a `scenes/`+`prefabs/` allowlist — 52 of them, the GLB-wrapper prefabs
+  carrying `Animator`/`SkeletalAnimator`, live elsewhere). This is the cheap half of the
+  canonicality check the marker guard says it cannot afford: proving a scene byte-exact needs a
+  world, but proving no field on disk is one the serializer would never emit needs only the
+  registry. **Its reach is engine traits only** — a game's own `runtimeOnly` field (sling's
+  `Enemy.hpBarId`) is registered by that game's runtime and is invisible to a vitest run.
+
+The rule for a trait author: `hidden` and `runtimeOnly` answer different questions — *may a human
+edit this?* vs *may this reach disk?* — and an engine-written read-back needs both
+(docs/editor.md § FieldHint).
+
+**The flag cannot fix the third shape (#409, FIXED):** a field that is genuinely AUTHORED and also
+written at runtime. `UIScrollView.scrollBehavior` is an authored enum, and `scrollApi.scrollToEntry`
+used to overwrite it with the per-request behaviour — so one `ui.scrollTo` destroyed the author's
+default (a request naming no behaviour defaulted to `'instant'`) and the next save wrote the
+request out as authored data. Flagging it would have deleted authored data instead. **The fix is
+two fields for the two roles**: a `runtimeOnly` `scrollToBehavior` carries the request and is
+consumed with it by `clearScrollRequest`, while the authored `scrollBehavior` is what
+`pendingScrollTo` falls back to when the request names none (`''`). The lesson generalises: when a
+runtime write lands on authored data, ask whether the write is a *different role* wearing the same
+field — `runtimeOnly` can only separate disk from memory, never two meanings of one value. The
+`GAINED` check above is what noticed it.
 
 **Prefabs needed their own route (#125), and are now swept too** — see "Re-saving legacy
 prefabs" below.
@@ -740,13 +816,14 @@ is therefore scoped to same-file collisions deliberately, and says so in its own
   any entity without `EntityAttributes`, and this one has none, so it landed in a shared
   **base** just as readily.
 
-  A scene may still **author** its own Time — hosting the resource in a shared base scene
-  is a supported setup, and it is why `timeScale` is deliberately not marked `runtimeOnly`.
-  A Time that came from a file carries no `Transient` tag and serializes normally.
-  **Provenance is the only workable discriminator**: an authored Time sitting at the
-  default `timeScale` is byte-identical to the materialized one, so no value-based rule
-  could tell them apart without deleting the authored one. (`Input` needs no tag — it is
-  simply not in the trait registry.) Gate:
+  A scene may still **author** its own Time entity — hosting the resource in a shared base
+  scene is a supported setup, and it is why the `Transient` tag is needed at all. A Time
+  that came from a file carries no `Transient` tag and serializes normally — but as of
+  #410, every field on `Time` including `timeScale` is `runtimeOnly`, so an authored Time
+  serializes as `"Time": {}`. **Provenance is the only workable discriminator**: an
+  authored Time is now byte-identical to the materialized one *at every value*, not just
+  the default, so no value-based rule could ever tell them apart without deleting the
+  authored one. (`Input` needs no tag — it is simply not in the trait registry.) Gate:
   `engine/packages/modoki/tests/editor/timeResourceProvenance.test.ts`.
 - **An entity SPAWNED BY A SYSTEM is tagged `Transient` at the spawn site, so it is never
   saved** (#124). Same provenance principle as the Time singleton, generalized: `spawnEntity`
@@ -954,7 +1031,18 @@ staging world. `SceneManager`:
 Each snapshotted field is the union of the trait's koota `.schema` keys and its
 registered `meta.fields` keys (not `meta.fields` alone, which is a curated Inspector
 subset) — otherwise a field absent from the Inspector's curated set (e.g.
-`Time.timeScale`) would silently reset to its schema default across every swap.
+`AnimationLibrary.animSets`, an AoS field `snapshotFieldNames` itself cites) would
+silently reset to its schema default across every swap. `snapshotFieldNames`
+deliberately ignores `runtimeOnly` too — a **carried** entity's live runtime state
+(a kept base's `Time`, a `Persistent` entity mid-tween) must not be reset by the
+swap that preserves it. ⚠️ That says nothing about the materialized `Time`
+singleton, which is carried by NEITHER route: `snapshotPersistentEntities` collects
+roots via `world.query(Persistent)` and via `EntityAttributes.sourceScene ∈
+keptBaseGuids`, and the materialized Time has no `Persistent` tag and no
+`EntityAttributes` at all — so a swap respawns it at `timeScale: 1`. A Time authored
+in the PRIMARY scene is not carried either (its `sourceScene` is never a kept-base
+guid). A debug slow-mo therefore survives a swap only in the kept-BASE setup, which
+no committed scene exercises today.
 
 > Persistent entities must be **ECS-pure** — trait data only. Anything held in a
 > closure, an in-flight tween, or a Web Audio node is lost on swap, since that

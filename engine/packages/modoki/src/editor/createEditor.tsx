@@ -420,7 +420,7 @@ export async function awaitRendererReady(
 export interface ProjectSettingsField {
   key: string;
   label: string;
-  type: 'text' | 'number' | 'checkbox' | 'select' | 'combo' | 'string-list' | 'physics-layers' | 'path' | 'scene-list' | 'module-toggles' | 'quality-tiers' | 'readonly-text';
+  type: 'text' | 'number' | 'checkbox' | 'select' | 'combo' | 'string-list' | 'physics-layers' | 'path' | 'scene-list' | 'module-toggles' | 'quality-tiers' | 'readonly-text' | 'password';
   /** Options for `select` fields, and suggestions for a `combo` (free-text +
    *  datalist) field — the stored value is the option's `value`. */
   options?: { value: string; label: string }[];
@@ -428,6 +428,13 @@ export interface ProjectSettingsField {
   help?: string;
   /** For `path` fields — whether the Browse… button picks a file or a folder. */
   pathMode?: 'file' | 'folder';
+  /** For `path` fields — this value is COMMITTED (it lands in the tracked
+   *  `project.config.json`, not the gitignored `project.user.json`), so it must be
+   *  project-relative: an absolute path is dead on every other clone and in a copied-out
+   *  game (#394). The picker relativises what it can, but the field is also a text box and
+   *  a file outside the project has no relative form — so a machine-local value gets an
+   *  inline warning here, at the control that produced it, rather than only at the gate. */
+  committedPath?: boolean;
   /** `readonly-text` renders a disabled input showing the current value — for a
    *  setting that's DERIVED (e.g. `ota.publicKey`, written by a dedicated flow
    *  like the OTA Keys dialog), never hand-typed. Still persisted through the
@@ -436,6 +443,12 @@ export interface ProjectSettingsField {
    *  `key` (a dot-path into the settings object) is one of `in`. Used e.g. to
    *  show the GCS/CDN fields only in the matching web-deploy mode. */
   showIf?: { key: string; in: string[] };
+  /** Conditional EDITABILITY: grey the control out while the value at `key`
+   *  equals `is` (compared as String(), so a checkbox's `true` matches `'true'`),
+   *  without hiding it. Used when an override makes the field inert but the
+   *  stored value still matters — e.g. the build number under the auto
+   *  checkbox: hidden entirely, you could not see what floor you'd fall back to. */
+  disabledIf?: { key: string; is: string };
 }
 
 /** One group of fields inside a Project Settings tab. */

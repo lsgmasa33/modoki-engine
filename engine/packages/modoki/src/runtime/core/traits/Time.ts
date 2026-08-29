@@ -11,7 +11,17 @@ import { trait } from 'koota';
  *     time-stop is instant (smooth × 0 = 0) instead of coasting to a halt.
  *
  *  Consumers should read via the accessors `getSimDelta` (gameplay: raw × scale)
- *  and `getVisualDelta` (presentation: smoothed × scale), NOT the raw fields. */
+ *  and `getVisualDelta` (presentation: smoothed × scale), NOT the raw fields.
+ *
+ *  Every field here is RUNTIME state and none of it is serialized — including
+ *  `timeScale`, which is flagged `runtimeOnly` like the rest (#410). Its only
+ *  writers are transient (the `set-timescale`/`sim-step` agent ops, the device
+ *  Time tab, the test harness, and `demos/video-demo`'s timeline signal track —
+ *  which authors the value in the TIMELINE asset, not here), and `sim-step`
+ *  deliberately
+ *  leaves the world at 0, so a persistable `timeScale` meant an ordinary debug
+ *  move plus any save could ship a scene frozen. A per-SCENE authored pace, if
+ *  ever wanted, belongs in the game's config resource. */
 export const Time = trait({
   delta: 0,           // gameplay delta this frame: rawClampedDelta × timeScale (Unity deltaTime)
   elapsed: 0,         // total seconds since start (scaled accumulation)

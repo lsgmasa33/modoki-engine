@@ -5,7 +5,8 @@
  * returns null until it resolves (the per-frame sync simply retries next frame).
  */
 
-import { resolveRef, isGuid, registerAsset } from './assetManifest';
+import { isGuid, registerAsset } from './assetManifest';
+import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { defaultParticleEffect, type ParticleEffectDef, type CollisionConfig } from '../particles/types';
@@ -14,6 +15,8 @@ import { particleDefProvider } from '../particles/particleDefProvider';
 const cache = new Map<string, ParticleEffectDef>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
+// Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here.
+const unknownGuidSeen = new Set<string>();
 
 // Bumped on clearParticleCache() to invalidate in-flight fetches (mirrors
 // meshTemplateCache's cacheGeneration). A fetch that resolves after a scene
@@ -151,7 +154,7 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
  *  resolver for stored references), this internal helper does not reject paths. */
 function particleCacheKey(refOrPath: string): string | undefined {
   if (!refOrPath) return undefined;
-  return isGuid(refOrPath) ? resolveRef(refOrPath) : refOrPath;
+  return isGuid(refOrPath) ? resolveRefWarnOnce(refOrPath, 'particleCache', unknownGuidSeen) : refOrPath;
 }
 
 /** Directly seed/override a cached effect by path or GUID (editor live-preview + post-save). */

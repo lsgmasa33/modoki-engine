@@ -42,7 +42,13 @@ export type ToolContext = {
    *  Pass `checkFailure:true` for a MUTATING GET (`?action=`/`?clear=` — where `ok` IS a success
    *  flag, not an answer). Without it, `modoki_journal {action:'start'}` missing its `type` reported
    *  the route's `{ok:false, reason:…}` refusal as a successful call (measured live, Phase 6). */
-  getJson: (path: string, timeoutMs?: number, checkFailure?: boolean) => Promise<ToolResult>;
+  /** `transform` (#370) rewrites the parsed body just before it is encoded — and is applied to a
+   *  4xx body too, so a failure envelope cannot carry what the transform exists to remove. Added so
+   *  a tool can REDACT a secret without dropping to raw `call`: doing that loses the unreachable-
+   *  backend envelope, the SPA-fallthrough guard (a dev server answers a missing /api route with
+   *  index.html, 200) and the `ensureIdentity` wrong-clone banner — three guarantees that are
+   *  invisible until the day they matter. */
+  getJson: (path: string, timeoutMs?: number, checkFailure?: boolean, transform?: (body: unknown) => unknown) => Promise<ToolResult>;
   /** POST = "do this" → `ok` is a SUCCESS FLAG, so this DOES run `isFailureBody` (C7).
    *  `what` labels the failure envelope in the CALLER's terms (§5): without it a refusal reads
    *  "POST /api/scene-mutate on the editor backend", which describes our plumbing rather than the
@@ -124,7 +130,10 @@ export function createToolContext(config: { backend: string; token?: string }): 
             // reader on modoki-qa (5183) to work-ai2's editor. A hint that confidently names the
             // wrong port is worse than no hint, so state the convention and point at the one
             // source that cannot be stale: the launch banner.
-            'per-clone backend ports: main=5179, work-ai=5180, work-ai2=5181, work-ai3=5182, work-qa=5183 — set MODOKI_BACKEND (or env.MODOKI_BACKEND in .claude/settings.local.json) to YOUR clone\'s port',
+            // …and having said that, this line then enumerated all five ports itself — correct
+            // on the day it was written and one more copy to keep in step (#349 found four such
+            // copies, two already stale). The convention now has ONE authored home; cite it.
+            'each clone pins its own backend port (engine/scripts/editorPorts.mjs; docs/clones-and-ports.md § RULE 2) — set MODOKI_BACKEND (or env.MODOKI_BACKEND in .claude/settings.local.json) to YOUR clone\'s port',
             'the launch banner prints the port it actually bound — trust it over any table',
           ],
         });
@@ -268,11 +277,13 @@ export function createToolContext(config: { backend: string; token?: string }): 
    *  with no check that refusal reached the agent as a SUCCESSFUL call (measured live against the
    *  editor on 5181, Phase 6). Opt in per call site rather than flipping the default, because the
    *  two families genuinely disagree about what `ok` means. */
-  async function getJson(path: string, timeoutMs?: number, checkFailure?: boolean): Promise<ToolResult> {
+  async function getJson(
+    path: string, timeoutMs?: number, checkFailure?: boolean, transform?: (body: unknown) => unknown,
+  ): Promise<ToolResult> {
     try {
       await ensureIdentity();
       const { status, body } = await call(path, undefined, timeoutMs);
-      if (status >= 400) return httpFailure(`read ${path} from the editor backend`, status, body);
+      if (status >= 400) return httpFailure(`read ${path} from the editor backend`, status, transform ? transform(body) : body);
       if (htmlFallthrough(body)) return noSuchRoute(path);
       if (checkFailure) {
         const failure = isFailureBody(body);
@@ -285,7 +296,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
           });
         }
       }
-      return ok(body);
+      return ok(transform ? transform(body) : body);
     } catch (e) {
       return unreachable(e);
     }

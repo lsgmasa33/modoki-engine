@@ -29,9 +29,16 @@ interface Canvas2DMountProps {
    *  device presets). Defaulting off means a new call site can never accidentally shrink the
    *  editor viewport by inheriting a game's `max` config. */
   applyWebSizeMode?: boolean;
+  /** Mirror `UIElement.pointerThrough` onto the mounted canvas's own wrapper div. Default false
+   *  (the historical `pointerEvents: 'auto'`). A DOM ancestor set to `none` does NOT stop a
+   *  descendant set to `auto` from receiving pointer events — so an author's `pointerThrough` on
+   *  the Canvas2D node never reached this div, which was harmless while every Canvas2D sat UNDER
+   *  the DOM chrome. It stops being harmless the moment one is stacked ABOVE the chrome (a
+   *  full-screen FX canvas would otherwise swallow every tap meant for the HUD underneath it). */
+  pointerThrough?: boolean;
 }
 
-export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markScene2DDirty, viewZoom = 1, applyWebSizeMode = false }: Canvas2DMountProps) {
+export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markScene2DDirty, viewZoom = 1, applyWebSizeMode = false, pointerThrough = false }: Canvas2DMountProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const updateSizeRef = useRef<(() => void) | null>(null);
   // Re-measure the backing when the editor viewport zoom changes (the ResizeObserver can't see a
@@ -171,7 +178,7 @@ export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markSc
       // pointerEvents:'auto' surface (alongside the Pixi pick overlay) so an empty 2D-miss click
       // falls through to the real UI/Three.js underneath instead of hitting the Canvas2D wrapper.
       data-canvas2d-mount
-      style={{ width: '100%', height: '100%', overflow: 'hidden', pointerEvents: 'auto' }}
+      style={{ width: '100%', height: '100%', overflow: 'hidden', pointerEvents: pointerThrough ? 'none' : 'auto' }}
     />
   );
 }

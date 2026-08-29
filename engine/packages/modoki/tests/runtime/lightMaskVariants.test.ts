@@ -16,12 +16,15 @@ import {
   DEFAULT_RENDERING_LAYER_MASK,
   beginLightMaskFrame,
   getMaskedMaterial,
+  inheritMaskBase,
+  baseOf,
   isLightMaskingActive,
   lightsForMask,
   getLightMaskStats,
   resetLightMaskVariants,
   type LightingFactory,
 } from '../../src/runtime/rendering/lightMaskVariants';
+import { markDerived, cloneDerived } from '../../src/runtime/rendering/derivedMaterials';
 
 /** Records the light list every createNode call received. */
 function stubFactory(): LightingFactory & { calls: THREE.Light[][] } {
@@ -411,5 +414,107 @@ describe('teardown', () => {
 
     expect(disposed).toHaveBeenCalled();
     expect(getLightMaskStats()).toEqual({ variants: 0, lights: 0, active: false });
+  });
+});
+
+describe('cloning a base that is ITSELF a derived clone (#325 sweep)', () => {
+  /** `applyLightMask` hands `getMaskedMaterial` whatever it recovered from the mesh, and for a
+   *  TINTED or MaterialInstanced mesh that is a `markDerived` clone — whose `userData.__derivedBase`
+   *  holds a MATERIAL. `Material.copy()` deep-copies userData with JSON.parse(JSON.stringify(...)),
+   *  and `JSON.stringify` calls `toJSON()` on anything that has one, so a bare `.clone()` here
+   *  serialises that whole material graph — textures included — every time a tinted mesh is masked.
+   *
+   *  Detected at the mechanism rather than through a symptom: the round-trip is exactly "was
+   *  `toJSON` called on the parked material", which is true or false with nothing in between. */
+  it('does not serialise the Material parked in the base\'s userData', () => {
+    const f = stubFactory();
+    beginLightMaskFrame(
+      [{ light: new THREE.SpotLight(), mask: 0b01 }, { light: new THREE.PointLight(), mask: 0b10 }],
+      true,
+    );
+    const trueBase = new THREE.MeshStandardMaterial();
+    trueBase.map = new THREE.Texture();
+    // What `tintedMaterial` / `materialInstanceClones` bind to a mesh.
+    const derivedClone = markDerived(trueBase.clone(), trueBase);
+    const serialised = vi.spyOn(trueBase, 'toJSON');
+
+    const variant = getMaskedMaterial(derivedClone, 0b01, f);
+
+    expect(variant).not.toBeNull();
+    expect(serialised).not.toHaveBeenCalled();
+  });
+
+  it('leaves the base\'s own userData intact after cloning through it', () => {
+    // `cloneDerived` suppresses `userData` on the SOURCE for the duration of the clone and restores
+    // it in a `finally`. If that restore regressed, the base would silently lose its own
+    // `__derivedBase` stamp — unstamping it for the retirement sweep, which is #318 all over again.
+    const f = stubFactory();
+    beginLightMaskFrame(
+      [{ light: new THREE.SpotLight(), mask: 0b01 }, { light: new THREE.PointLight(), mask: 0b10 }],
+      true,
+    );
+    const trueBase = new THREE.MeshStandardMaterial();
+    const derivedClone = markDerived(trueBase.clone(), trueBase);
+
+    getMaskedMaterial(derivedClone, 0b01, f);
+
+    expect(derivedClone.userData.__derivedBase).toBe(trueBase);
+  });
+});
+
+describe('the fixed point videoTextureSync depends on (#325)', () => {
+  /** The `settles` case in `videoTextureSync.test.ts` hand-feeds the variant back onto the mesh,
+   *  which ASSUMES the half that could actually break: that `getMaskedMaterial`'s cache lookup hits
+   *  on a stable key. This drives the real cache instead — `baseOf` → `getMaskedMaterial` → assign,
+   *  the way `applyLightMask` does it — over a material standing in for a bound video clone.
+   *
+   *  Keyed on `${base.uuid}|${sel}`: inheriting the base keeps that key constant, so every frame
+   *  after the first is a HIT and `variants` never grows. If the clone answered `baseOf` with
+   *  ITSELF, each frame would key on a fresh uuid, miss, and mint another variant — the unbounded
+   *  loop, visible here as a rising variant count. */
+  it('re-deriving from a clone that INHERITED the base hits the cache every frame', () => {
+    const f = stubFactory();
+    beginLightMaskFrame(
+      [{ light: new THREE.SpotLight(), mask: 0b01 }, { light: new THREE.PointLight(), mask: 0b10 }],
+      true,
+    );
+    const base = new THREE.MeshStandardMaterial();
+    const variant = getMaskedMaterial(base, 0b01, f)!;
+
+    // Stand in for the video clone: cloned off the variant, inheriting the variant's own base.
+    const videoClone = variant.clone();
+    inheritMaskBase(videoClone, variant);
+
+    expect(getLightMaskStats().variants).toBe(1);
+    for (let frame = 0; frame < 10; frame++) {
+      expect(getMaskedMaterial(baseOf(videoClone), 0b01, f)).toBe(variant);
+    }
+    expect(getLightMaskStats().variants).toBe(1);
+  });
+
+  it('…and WITHOUT inheritMaskBase the same loop grows the cache every frame', () => {
+    // The distinguishing half, so the test above cannot pass for an unrelated reason (a cache that
+    // hit for everything would satisfy it just as well).
+    //
+    // ⚠️ Note what does NOT reproduce it: a bare `variant.clone()`. `Material.copy()` JSON-copies
+    // `userData`, and the flattened `__lightMaskBase` document KEEPS `uuid` as a string — so
+    // `baseOf` returns a plain object that still keys to `${base.uuid}|${sel}` and the lookup hits
+    // anyway. That accident is the only reason #325 was a wrong-lighting bug rather than a
+    // per-frame leak. `cloneDerived` suppresses `userData` and therefore REMOVES the accident,
+    // which is precisely why `inheritMaskBase` has to put the base back deliberately.
+    const f = stubFactory();
+    beginLightMaskFrame(
+      [{ light: new THREE.SpotLight(), mask: 0b01 }, { light: new THREE.PointLight(), mask: 0b10 }],
+      true,
+    );
+    const base = new THREE.MeshStandardMaterial();
+    let current: THREE.Material = getMaskedMaterial(base, 0b01, f)!;
+
+    for (let frame = 0; frame < 5; frame++) {
+      const orphan = cloneDerived(current, current);   // no inheritMaskBase → baseOf(orphan) is itself
+      current = getMaskedMaterial(baseOf(orphan), 0b01, f)!;
+    }
+
+    expect(getLightMaskStats().variants).toBeGreaterThan(5);
   });
 });

@@ -244,3 +244,18 @@ describe('getParticleEffect load:false (peek)', () => {
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 });
+
+// Close-out sweep of QA-ANIM-0018 (animationClipCache's fix): every sibling `*Cache` module
+// shared the same `isGuid(ref) ? resolveRef(ref) : ref` cache-key helper, silently returning
+// undefined for a guid absent from the manifest with no warning at all.
+describe('particleCache — unresolved guid warns once (parity with animationClipCache)', () => {
+  it('warns once for a guid absent from the manifest', async () => {
+    const { cache, manifest } = await setup();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const guid = manifest.newGuid();
+    expect(cache.getParticleEffect(guid)).toBeNull();
+    expect(cache.getParticleEffect(guid)).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain(guid);
+  });
+});

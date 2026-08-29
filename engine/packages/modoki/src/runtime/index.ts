@@ -22,7 +22,12 @@ export {
   setNameTransform, transformName,
   type TraitMeta, type FieldHint, type FieldType,
 } from './core/ecs/traitRegistry';
-export { traitFieldOrDefault } from './core/ecs/traitSchema';
+// `soaSchema` is exported alongside `traitFieldOrDefault` because the two answer one question
+// together: a test comparing two authored entities field-by-field needs the trait's DECLARED key
+// set (this) and a default-aware read for each key (that). Deriving the key set from the authored
+// JSON instead is the trap — `serializeScene` omits a field holding its default, so a field
+// defaulted on BOTH sides drops out of the union and is then compared by nothing, silently (#405).
+export { traitFieldOrDefault, soaSchema } from './core/ecs/traitSchema';
 export {
   registerEntrySource, unregisterEntrySource, getEntrySource, getEntrySourceNames,
   type EntryCoord, type EntryContent, type EntryResolver,
@@ -98,9 +103,9 @@ export { isTouchDevice, readFormFactor, readPlatform } from './core/formFactor';
 export {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
   PrefabInstance, ModelSource, Paused, Persistent, markPersistent, Transient, Time, Input,
-  UIElement, type UILengthUnit, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, NO_SCROLL_REQUEST,
+  UIElement, type UILengthUnit, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, NO_SCROLL_REQUEST, NO_BEHAVIOR_REQUEST,
   type UIEntryPrefab, type UIEntryLengthUnit,
-  type UIScrollAxis, type UIScrollSnap, type UIScrollSnapStop, type UIScrollOverscroll, type UIScrollBehavior, UIAnchor,
+  type UIScrollAxis, type UIScrollSnap, type UIScrollSnapStop, type UIScrollOverscroll, type UIScrollBehavior, type UIScrollBehaviorRequest, UIAnchor,
   TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, TOUCH_ATTR, TOUCH_OPACITY_ATTR, UI_ROOT_ATTR,
   type TouchControlAction, type TouchControlShowOn, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, type MaterialParamOverride, type MaterialParamSource, ParticleEmitter, FlameMesh, BlobShadow,
   Animator, SpriteAnimator, defaultSpriteClip, clampAngle,
@@ -488,6 +493,12 @@ export {
 export { onQualityTierChange, resetQualityTierChangeListeners } from './rendering/tierChangeNotify';
 export type { QualityTierChangeListener } from './rendering/tierChangeNotify';
 export { playerTierStore, type PlayerTierStore } from './core/playerTierStore';
+// First-real-frame readiness (#334) — the DOM layer's "is there anything under the loading
+// overlay yet" signal. A leaf with no three.js import, so it costs a 2D-only build nothing.
+export {
+  waitForScenePaint, isScenePaintPending, SCENE_PAINT_MAX_WAIT_MS, resetScenePaintSignal,
+  armScenePaint, markScenePainted, abandonScenePaint, type ScenePaintOutcome,
+} from './rendering/scenePaintSignal';
 export type { RenderSettings, ThreeRenderSettings, PixiRenderSettings, WebRenderSettings } from './rendering/renderSettings';
 export { getWorldTransform3D, getWorldMatrix3D, getParentWorldMatrix3D, worldToLocal3D, hasParent } from './core/ecs/worldTransform';
 export type { WorldTransform3D } from './core/ecs/worldTransform';

@@ -14,10 +14,10 @@ describe('parseAdbDevices', () => {
   it('parses the `-l` long format, pulling model: and transport_id: out of the trailing key-values', () => {
     const out = [
       'List of devices attached',
-      'ASJ6R19826001453   device usb:2-1.4.3 model:MRD_LX3 device:HWMRD transport_id:3',
+      'FAKESERIAL0Y6001   device usb:2-1.4.3 model:MRD_LX3 device:HWMRD transport_id:3',
     ].join('\n');
     expect(parseAdbDevices(out)).toEqual([
-      { serial: 'ASJ6R19826001453', state: 'device', model: 'MRD_LX3', transportId: '3' },
+      { serial: 'FAKESERIAL0Y6001', state: 'device', model: 'MRD_LX3', transportId: '3' },
     ]);
   });
 

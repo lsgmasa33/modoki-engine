@@ -44,7 +44,7 @@
 
 import * as THREE from 'three';
 import { onWorldSwap } from '../core/ecs/world';
-import { markDerived, retireDerivedMaterial } from './derivedMaterials';
+import { markDerived, cloneDerived, retireDerivedMaterial } from './derivedMaterials';
 
 /** Layer 0. Both `Light.renderingLayerMask` and a renderable's default to this, so masks are
  *  opt-in: an unauthored scene behaves exactly as it did before the feature existed. */
@@ -229,7 +229,14 @@ export function getMaskedMaterial(
   const existing = variants.get(key);
   if (existing) return existing.material;
 
-  const material = base.clone() as LightsNodeMaterial;
+  // `cloneDerived`, not a bare `.clone()` — this site has the SAME userData trap it polices
+  // elsewhere (#325 sweep). `base` here is whatever `applyLightMask` recovered, and for a tinted or
+  // MaterialInstanced mesh that is a `markDerived` clone — whose `userData.__derivedBase` holds a
+  // MATERIAL. `Material.copy()` would deep-copy that through `JSON.parse(JSON.stringify(...))`,
+  // serialising a whole material graph (and logging `Unable to serialize Texture.` for a compressed
+  // one) every time a tinted mesh is also masked. The stamping it does is redundant with the
+  // `markDerived` below and deliberately left there: that call is what the module's own tests pin.
+  const material = cloneDerived(base, base) as LightsNodeMaterial;
   // Shared per selection, NOT built per material — see `lightsNodes` for why a second node over
   // the same shadow-casting light duplicates that light's shadow pass.
   material.lightsNode = lightsNodeFor(sel, selected, factory);
@@ -303,6 +310,30 @@ export function retireVariantsOf(base: THREE.Material): void {
   }
   // The lights nodes are deliberately left alone — they are keyed by light SELECTION, shared
   // across every base, and own the shadow state a rebuilt variant will bind straight back to.
+}
+
+/** Give `clone` the same light-mask base `source` answers with, so `baseOf(clone)` keeps resolving
+ *  to the material a variant must be re-derived FROM.
+ *
+ *  For a clone that is layered OUTSIDE masking — one taken of whatever `applyLightMask` settled on,
+ *  rather than one masking will later derive from. `videoTextureSync` is the case (#325): without
+ *  this its clone answers `baseOf` with itself, so the next frame's `applyLightMask` mints a
+ *  variant keyed on the CLONE's uuid, `videoTextureSync` sees an unrecognised material and rebuilds,
+ *  and the two mint a fresh material and a fresh pipeline at each other forever. Inheriting the
+ *  base keeps the variant-cache key stable, so the lookup hits and both systems settle.
+ *
+ *  ⚠️ This is the OPPOSITE of what a tint clone wants, and the difference is not stylistic. A tint
+ *  clone answers `baseOf` with ITSELF so masking derives from it and the variant keeps the tint —
+ *  correct there because a tint clone is cached and outlives the frame. A video clone is per-binding
+ *  and OWNS the `VideoTexture` it disposes on unbind, so letting the shared variant cache clone it
+ *  would leave cached variants sampling a disposed texture and grow that cache per entity. Video
+ *  therefore composes the other way round: it clones the variant and carries the mask's own
+ *  properties across (`cloneDerived`). What makes that safe is ordering — `syncVideoTextures` runs
+ *  after the renderable pass, so video always gets the last word on the slot. */
+export function inheritMaskBase(clone: THREE.Material, source: THREE.Material): void {
+  // No `base === clone` guard: every caller passes a freshly minted clone, so `baseOf(source)`
+  // cannot be it. A guard here would read as a live safety net for a case that cannot occur.
+  clone.userData = { ...clone.userData, [BASE_KEY]: baseOf(source) };
 }
 
 /** The material `m` was derived from, or `m` itself when it is not a variant. Callers hand this

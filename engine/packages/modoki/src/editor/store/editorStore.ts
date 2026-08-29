@@ -13,6 +13,7 @@ import { setAnimationClip } from '../../runtime/loaders/animationClipCache';
 import type { AnimationClipDef } from '../../runtime/animation/types';
 import { setTimeline } from '../../runtime/loaders/timelineCache';
 import type { TimelineDef } from '../../runtime/timeline/types';
+import { FREE_PRESET, type DevicePreset, type Orientation } from '../scene/devicePresets';
 
 // Toast auto-dismiss state, module-scoped (F5): a newer toast clears the prior
 // timer so N rapid toasts don't leave N zombie timers, and the id is a monotonic
@@ -32,6 +33,27 @@ function loadCamGizmoShown(): Set<string> {
 }
 function saveCamGizmoShown(s: Set<string>): void {
   try { localStorage.setItem(CAM_GIZMO_LS_KEY, JSON.stringify([...s])); } catch { /* storage full/blocked */ }
+}
+
+// Small typed readers for the `editor:*`-prefixed localStorage prefs below (gizmo mode/space/
+// pivot, particle preview) — same "editor-only display preference, not scene data" rationale as
+// CAM_GIZMO_LS_KEY above, just for values that aren't a per-guid set.
+// Exported (not just module-scope) so the "restores from localStorage / falls back for a
+// foreign value" logic — the actual READ half of the persistence fix — is directly
+// unit-testable. The store's initial-state block below only runs ONCE at module load, before
+// any test can install a localStorage stub, so testing it via the constructed store would
+// need `vi.resetModules()` — which desyncs this file's OTHER dynamic re-imports (spriteAnim/
+// particle/animation/timeline caches) from the statically-imported singletons editorStore.ts
+// itself uses, corrupting unrelated tests. Testing the pure functions directly avoids that.
+export function lsBool(key: string, fallback: boolean): boolean {
+  if (typeof localStorage === 'undefined') return fallback;
+  const v = localStorage.getItem(key);
+  return v === null ? fallback : v === '1';
+}
+export function lsEnum<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  if (typeof localStorage === 'undefined') return fallback;
+  const v = localStorage.getItem(key);
+  return v !== null && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
 }
 
 export interface SelectedAsset {
@@ -88,6 +110,35 @@ interface EditorState {
    *  SceneView-local state into the store so it's agent-drivable (set-scene-view-mode)
    *  — the mode selector is a native <select> that trusted input can't operate. */
   sceneViewMode: '3d' | 'ui';
+  /** Which view the Animation editor's timeline area is showing: the Dopesheet (keyframe
+   *  TIMING, diamonds) or Curves (keyframe VALUES + easing, a graph). Lifted from
+   *  AnimationEditor-local state into the store so it is agent-drivable
+   *  (`set-animation-view-mode` / `modoki_animation_view_mode`, #369) — the same move
+   *  `sceneViewMode` above records.
+   *
+   *  It is not cosmetic: exactly ONE of the two views is mounted, and each publishes its own
+   *  interaction handles. `curves:tan:in|out:*` (kind 'tangent') exist ONLY in Curves, so with
+   *  no way to set this, tangent editing was unreachable unless the human happened to have left
+   *  the panel in Curves — and the default is 'dopesheet'. `modoki_handles editor=curves`
+   *  correctly returned nothing, which reads as "this clip has no tangents".
+   *
+   *  Deliberately NOT persisted to localStorage, unlike `sceneViewMode`: it reset to
+   *  'dopesheet' on every panel mount before it moved here, and restoring a view days later
+   *  would change what a fresh editor shows. Lifting it DOES make the choice survive the panel
+   *  being unmounted/reselected within a session, which the local `useState` did not — that is
+   *  the same continuity `sceneViewMode` has, and the better behaviour. */
+  animationViewMode: 'dopesheet' | 'curves';
+  /** Whether the Animation panel is actually MOUNTED and running its effects.
+   *
+   *  Same requirement, and the same reason, as `gameViewMounted` below: FlexLayout defaults
+   *  `tabEnableRenderOnDemand: true`, so an Animation tab that EXISTS in the layout but has never
+   *  been selected does not mount — and `openPanels` reports it anyway, which is exactly the
+   *  derivation #367 rejected as wrong. Without this the agent surface answers
+   *  `animationViewMode:'curves'` for an editor showing no Animation view at all, and neither
+   *  view's handle provider is registered, so `modoki_handles editor=curves` is empty for a
+   *  reason the payload cannot express. Written by AnimationEditor's mount effect; nothing else
+   *  may set it. */
+  animationPanelMounted: boolean;
   /** Which FlexLayout panel owns the keyboard ('scene' | 'hierarchy' | 'animation-editor' | …),
    *  or null when nothing has been engaged yet. Set on capture-phase mousedown (click-to-focus).
    *
@@ -113,6 +164,45 @@ interface EditorState {
   openPanels: string[];
   /** Opt-in: simulate + render ParticleEmitter effects live in the 3D SceneView */
   particlePreview: boolean;
+  /** The Game panel's selected device preset, and the orientation it is viewed in. Lifted from
+   *  GameView-local state into the store so they are agent-drivable (`set-game-view-device` /
+   *  `modoki_game_view_device`, #367) — the same move `sceneViewMode` above records, and for the
+   *  same reason: the device picker is a popup an agent's trusted input cannot operate, so any
+   *  layout check a session runs used to measure whatever device the human last left selected.
+   *
+   *  These two are the SOURCE OF TRUTH. `gameViewSize`/`gameViewSafeArea`/`gameRect` below stay
+   *  DERIVED — GameView resolves them from this pair and publishes them downward for SceneView.
+   *  Writing them from the setter as well would give each two writers to keep in sync by hand.
+   *
+   *  A custom resolution (no catalog entry) is carried as a synthetic preset named 'Custom' with
+   *  `NO_SAFE_AREA`, so every `resolve*` helper and every GameView consumer works on it unbranched.
+   *
+   *  Deliberately NOT persisted to localStorage, unlike `sceneViewMode`: this reset to `Free` on
+   *  every mount before it moved here, and a custom resolution silently restored days later is a
+   *  measurement taken at a size nobody chose. */
+  gameViewDevice: DevicePreset;
+  gameViewOrientation: Orientation;
+  /** Whether the GameView component is actually MOUNTED and running its effects.
+   *
+   *  ⚠️ **Not derivable from `openPanels`, and the first attempt at this got it wrong.**
+   *  `openPanels` is every TAB NODE in the FlexLayout model, with no selection test — and
+   *  FlexLayout defaults `tabEnableRenderOnDemand: true`, so a Game tab sharing a tabset with
+   *  another panel and never clicked EXISTS without ever mounting. Inferring mountedness from the
+   *  layout therefore reported `true` for exactly the case the flag was added to catch, which is
+   *  worse than not reporting it: `set-game-view-device` would answer a complete iPhone 16 Pro
+   *  read-back, assert the panel was live, and none of the derived values below would have moved.
+   *
+   *  So GameView publishes it itself, from an effect with cleanup — the only place the fact is
+   *  actually known. */
+  gameViewMounted: boolean;
+  /** The Game panel's game AREA in real CSS px, measured whether or not a device is selected.
+   *
+   *  Deliberately NOT `gameViewSize`, which means something different: while a FIXED device is
+   *  selected GameView writes the DEVICE's logical size there, so reading it as "how big is the
+   *  panel" answers with the phone. That is stale in precisely the transition it would be consulted
+   *  for — switching iPhone 16 Pro -> Free returned 402x874 as the panel size, and on a cold editor
+   *  it returned the fabricated `{800, 450}` default. This one is always the panel. */
+  gameAreaSize: { width: number; height: number };
   gameViewSize: { width: number; height: number };
   /** Safe-area insets (logical px) of the Game panel's selected device preset. Written by
    *  GameView, which owns the device picker; read by SceneView's UI preview frame so BOTH
@@ -178,6 +268,14 @@ interface EditorState {
    *  this; TextureAssetView opens the matching modal when its `path` matches, then clears
    *  it. Enables headless open (agent parity), same rationale as openParticleEditor. */
   textureEditorRequest: { path: string; kind: 'sprite' | 'nineslice'; nonce: number } | null;
+
+  /** Which slice is selected in the currently-open Sprite Editor (guid, or null = none).
+   *  Was component-local `useState` in SpriteEditor.tsx with no store field and no agent op —
+   *  since the modal's resize/pivot handles only exist for the SELECTED slice, and it opens
+   *  fresh with nothing selected, `modoki_handles editor=sprite` returned an empty list in the
+   *  NORMAL case, indistinguishable from "no slices" (#373). Set with `select-sprite-slice`;
+   *  reset to null by SpriteEditor itself on mount/unmount, matching the modal's own lifetime. */
+  spriteEditorSelection: string | null;
 
   /** .spriteanim asset currently open in the SpriteAnim Editor (null = none). */
   editingSpriteAnimAsset: SelectedAsset | null;
@@ -278,14 +376,26 @@ interface EditorState {
   closeOtaKeys: () => void;
   setGizmoMode: (mode: 'translate' | 'rotate' | 'scale') => void;
   setColliderEditMode: (on: boolean) => void;
+  setSpriteEditorSelection: (guid: string | null) => void;
   setShowFocusGraph: (on: boolean) => void;
   setSceneViewMode: (mode: '3d' | 'ui') => void;
+  /** Set the Animation editor's timeline view. No-ops (and does not journal) on a re-set. */
+  setAnimationViewMode: (mode: 'dopesheet' | 'curves') => void;
+  /** Set from AnimationEditor's mount effect + its cleanup. Nothing else may call it. */
+  setAnimationPanelMounted: (mounted: boolean) => void;
   setFocusedPanel: (panel: string | null) => void;
   setOpenPanels: (ids: string[]) => void;
   setGizmoSpace: (space: 'local' | 'world') => void;
   setGizmoPivot: (pivot: 'pivot' | 'center') => void;
   setUnlockedGhostSelKey: (key: string | null) => void;
   setParticlePreview: (on: boolean) => void;
+  /** Set the Game panel's device preset and/or its orientation. Omitting either leaves it alone,
+   *  so the orientation toggle and the picker are one setter. No-ops (and does not journal) when
+   *  neither actually changes. */
+  setGameViewDevice: (device?: DevicePreset, orientation?: Orientation) => void;
+  /** Set from GameView's mount effect + its cleanup. Nothing else may call it. */
+  setGameViewMounted: (mounted: boolean) => void;
+  setGameAreaSize: (width: number, height: number) => void;
   setGameViewSize: (width: number, height: number) => void;
   setGameViewSafeArea: (insets: EditorState['gameViewSafeArea']) => void;
   setGameRect: (rect: EditorState['gameRect']) => void;
@@ -443,16 +553,23 @@ export const useEditorStore = create<EditorState>((set, get) => {
   selectedEntityIds: [],
   selectedAsset: null,
   selectedAssets: [],
-  gizmoMode: 'translate',
-  gizmoSpace: 'world',
-  gizmoPivot: 'pivot',
+  gizmoMode: lsEnum('editor:gizmoMode', ['translate', 'rotate', 'scale'] as const, 'translate'),
+  gizmoSpace: lsEnum('editor:gizmoSpace', ['world', 'local'] as const, 'world'),
+  gizmoPivot: lsEnum('editor:gizmoPivot', ['pivot', 'center'] as const, 'pivot'),
   unlockedGhostSelKey: null,
   colliderEditMode: false,
+  spriteEditorSelection: null,
   showFocusGraph: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:showFocusGraph') === '1'),
   sceneViewMode: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:sceneViewMode') === 'ui') ? 'ui' : '3d',
+  animationViewMode: 'dopesheet',
+  animationPanelMounted: false,
   focusedPanel: null,
   openPanels: [],
-  particlePreview: false,
+  particlePreview: lsBool('editor:particlePreview', false),
+  gameViewDevice: FREE_PRESET,
+  gameViewOrientation: 'portrait',
+  gameViewMounted: false,
+  gameAreaSize: { width: 0, height: 0 },
   gameViewSize: { width: 800, height: 450 },
   gameViewSafeArea: { top: 0, right: 0, bottom: 0, left: 0 },
   gameRect: { left: 0, top: 0, width: 800, height: 450 },
@@ -584,8 +701,18 @@ export const useEditorStore = create<EditorState>((set, get) => {
   // 2D scene keeps drawing the PREVIOUS gizmo until some unrelated redraw fires — the mode
   // toggle looked like a no-op. Mark dirty here so translate/rotate/scale (and world/local)
   // repaint immediately. 3D uses its own gate (useEditorStore.subscribe(markViewportDirty)).
-  setGizmoMode: (mode) => { if (get().gizmoMode !== mode) editorEmit('!gizmo', { mode }); set({ gizmoMode: mode }); mark2DDirty(); },
+  setGizmoMode: (mode) => {
+    if (get().gizmoMode !== mode) editorEmit('!gizmo', { mode });
+    set({ gizmoMode: mode });
+    if (typeof localStorage !== 'undefined') localStorage.setItem('editor:gizmoMode', mode);
+    mark2DDirty();
+  },
   setColliderEditMode: (on) => set({ colliderEditMode: on }),
+  setSpriteEditorSelection: (guid) => {
+    if (get().spriteEditorSelection === guid) return;
+    editorEmit('!spriteeditorselection', { guid });
+    set({ spriteEditorSelection: guid });
+  },
   setShowFocusGraph: (on) => {
     if (typeof localStorage !== 'undefined') localStorage.setItem('editor:showFocusGraph', on ? '1' : '0');
     set({ showFocusGraph: on });
@@ -597,6 +724,12 @@ export const useEditorStore = create<EditorState>((set, get) => {
     if (typeof localStorage !== 'undefined') localStorage.setItem('editor:sceneViewMode', mode);
     mark2DDirty();
   },
+  setAnimationViewMode: (mode) => {
+    if (get().animationViewMode === mode) return;
+    editorEmit('!animationviewmode', { mode });
+    set({ animationViewMode: mode });
+  },
+  setAnimationPanelMounted: (mounted) => { if (get().animationPanelMounted !== mounted) set({ animationPanelMounted: mounted }); },
   /** Click-to-focus. Journals `!focus` on a real SCOPE CHANGE only — a commit point, so the
    *  stream stays sparse (never per-keystroke), and it is what makes "why did my key go there?"
    *  answerable from data instead of a re-run. Focus is NOT undoable: it is transient chrome, and
@@ -620,10 +753,47 @@ export const useEditorStore = create<EditorState>((set, get) => {
     if (prev.length === next.length && prev.every((id, i) => id === next[i])) return;
     set({ openPanels: next });
   },
-  setGizmoSpace: (space: 'local' | 'world') => { if (get().gizmoSpace !== space) editorEmit('!gizmo', { space }); set({ gizmoSpace: space }); mark2DDirty(); },
-  setGizmoPivot: (pivot: 'pivot' | 'center') => { if (get().gizmoPivot !== pivot) editorEmit('!gizmo', { pivot }); set({ gizmoPivot: pivot }); mark2DDirty(); },
+  setGizmoSpace: (space: 'local' | 'world') => {
+    if (get().gizmoSpace !== space) editorEmit('!gizmo', { space });
+    set({ gizmoSpace: space });
+    if (typeof localStorage !== 'undefined') localStorage.setItem('editor:gizmoSpace', space);
+    mark2DDirty();
+  },
+  setGizmoPivot: (pivot: 'pivot' | 'center') => {
+    if (get().gizmoPivot !== pivot) editorEmit('!gizmo', { pivot });
+    set({ gizmoPivot: pivot });
+    if (typeof localStorage !== 'undefined') localStorage.setItem('editor:gizmoPivot', pivot);
+    mark2DDirty();
+  },
   setUnlockedGhostSelKey: (key: string | null) => set({ unlockedGhostSelKey: key }),
-  setParticlePreview: (on: boolean) => set({ particlePreview: on }),
+  setParticlePreview: (on: boolean) => {
+    set({ particlePreview: on });
+    if (typeof localStorage !== 'undefined') localStorage.setItem('editor:particlePreview', on ? '1' : '0');
+  },
+  setGameViewDevice: (device, orientation) => {
+    const cur = get();
+    // Compare the preset by VALUE, not by identity: a custom size arrives as a freshly built
+    // synthetic preset every call, so an identity check would journal + re-render on a no-op.
+    const nextDevice = device ?? cur.gameViewDevice;
+    const nextOrientation = orientation ?? cur.gameViewOrientation;
+    const sameDevice = nextDevice === cur.gameViewDevice
+      || (nextDevice.name === cur.gameViewDevice.name
+        && nextDevice.logicalW === cur.gameViewDevice.logicalW
+        && nextDevice.logicalH === cur.gameViewDevice.logicalH
+        && nextDevice.physicalW === cur.gameViewDevice.physicalW
+        && nextDevice.physicalH === cur.gameViewDevice.physicalH);
+    if (sameDevice && nextOrientation === cur.gameViewOrientation) return;
+    editorEmit('!gameviewdevice', { device: nextDevice.name, orientation: nextOrientation });
+    set({ gameViewDevice: nextDevice, gameViewOrientation: nextOrientation });
+  },
+  setGameViewMounted: (mounted) => { if (get().gameViewMounted !== mounted) set({ gameViewMounted: mounted }); },
+  // Identity-compared: written from a ResizeObserver, so a fresh object per callback would
+  // re-notify every subscriber on frames where nothing moved.
+  setGameAreaSize: (width, height) => {
+    const cur = get().gameAreaSize;
+    if (cur.width === width && cur.height === height) return;
+    set({ gameAreaSize: { width, height } });
+  },
   setGameViewSize: (width, height) => set({ gameViewSize: { width, height } }),
   // Identity-compared before writing: this is set from a render-time value in GameView, and
   // a fresh object every render would re-notify every subscriber (SceneView's preview frame
@@ -724,7 +894,11 @@ export const useEditorStore = create<EditorState>((set, get) => {
   setActiveSkinPart: (idx) => set({ activeSkinPart: Math.max(-1, idx | 0) }), // -1 = none selected
   toggleSkinPreviewPart: (idx) => set((s) => ({ skinPreviewHidden: s.skinPreviewHidden.includes(idx) ? s.skinPreviewHidden.filter((i) => i !== idx) : [...s.skinPreviewHidden, idx] })),
   setSkinPreviewHidden: (indices) => set({ skinPreviewHidden: indices }),
-  setSkinMode: (mode) => set({ skinMode: mode }),
+  setSkinMode: (mode) => {
+    if (get().skinMode === mode) return;
+    editorEmit('!skinmode', { mode });
+    set({ skinMode: mode });
+  },
   setSkinBoneTool: (tool) => set({ skinBoneTool: tool }),
   setSkinWeightTool: (tool) => set({ skinWeightTool: tool }),
   setSkinPaint: (patch) => set((s) => ({ skinPaint: { ...s.skinPaint, ...patch } })),

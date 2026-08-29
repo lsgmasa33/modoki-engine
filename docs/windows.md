@@ -224,18 +224,10 @@ real Windows hardware:
        requires every relative import under `engine/` to carry a real extension for Node's
        native ESM resolution — this repo's plugin tree does not, so `native` fails to even
        load `vite.config.ts`.
-     - **The mitigation that shipped, and is still in place: grant write access to just that
-       one subfolder, from the installer, which runs elevated exactly when it needs to.**
-       `build/installer.nsh` (picked up automatically — `nsis.include` defaults to that path,
-       no config change needed) hooks electron-builder's `customInstall` macro (fires after all
-       files are extracted) to `CreateDirectory` the `.vite-temp` folder and
-       `icacls … /grant *S-1-5-32-545:(OI)(CI)M` (BUILTIN\Users, Modify, inherited to files
-       created inside) on it — nothing else in the install tree is touched. This is the shape
-       to reach for when a write genuinely cannot be avoided (a third-party tool hardcodes the
-       path): a scoped, install-time exception, not a runtime workaround and not a blanket
-       loosening of the whole install directory.
-     - **The write has since been removed at its source, on macOS (#326).** Vite's default
-       `bundle` config loader (`loadConfigFromBundledFile` in
+     - **A mitigation shipped for a while — an installer-time ACL grant on just that one
+       subfolder — and has since been REMOVED (#326, 2026-08-27): the write it was
+       compensating for is gone at the source, on both platforms.** Vite's default `bundle`
+       config loader (`loadConfigFromBundledFile` in
        `node_modules/vite/dist/node/chunks/node.js`) only takes the disk-write path — bundle,
        write to `.vite-temp/…mjs`, import, unlink — for an ESM config; a `.cjs` config is
        hooked into `require.extensions` and compiled in memory, writing nothing at all.
@@ -247,11 +239,17 @@ real Windows hardware:
        branch and never writes `.vite-temp` — verified on a packaged, ad-hoc-resealed macOS
        `.app`: Build → Web from its own menu, then `codesign --verify --deep --strict` exit 0,
        zero files added to the bundle, no `.vite-temp` anywhere.
-     - ⚠️ **This is UNVERIFIED ON WINDOWS — measured only on macOS.** The installer grant
-       above STAYS until a session on the `win` clone confirms that an elevated
-       `C:\Program Files` install can complete a build with the grant removed. Pulling it based
-       on the macOS measurement would be exactly the hypothesis-fix-from-a-Mac this repo's
-       Windows rule forbids: the macOS run cannot observe an elevated install tree at all.
+     - **Confirmed on Windows too, with the grant actually removed (not just theorized).**
+       `build/installer.nsh`'s `customInstall` macro (`CreateDirectory` +
+       `icacls … /grant *S-1-5-32-545:(OI)(CI)M`) was emptied and the installer rebuilt; a
+       fresh install to `C:\Program Files\Modoki Editor` (an admin-elevated per-machine path —
+       the discriminating one) launched pointed at `demos/forest-camp` (chosen for its rigged
+       model, the exact case `--configLoader runner` breaks) and pressed a real Build → Web:
+       the compile completed (rigged GLB optimized, no runner-closed error), `.vite-temp` was
+       never created at all, and no EPERM anywhere. `installer.nsh` now ships with an
+       intentionally empty `customInstall` — kept as a stub, not deleted, because
+       `nsis.include`'s implicit default pickup of this exact path is itself worth guarding
+       against going stale (`packagingManifest.test.ts`).
 
 ## Process control
 
@@ -333,6 +331,27 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
     is empirically nil. `os.cpus().length` cannot answer (it reports LOGICAL cores), and the
     PowerShell `Get-CimInstance Win32_Processor` query that can costs ~1.9s per vitest launch —
     noise inside `verify`, but it would double a single-file run.
+- **`testTimeout` is 60s on Windows, 20s everywhere else — in BOTH vitest configs**
+  ([engine/vite.config.ts](../engine/vite.config.ts) for the app lane,
+  [engine/packages/modoki/vitest.config.ts](../engine/packages/modoki/vitest.config.ts) for the
+  engine lane). There are exactly two, they run CONCURRENTLY as verify.mjs's two lanes, and a
+  ceiling raised in only one of them just moves which lane goes red — the engine config holds the
+  larger share of the repo's test files. (Per-leg counts deliberately not quoted here; they live in
+  `engine/scripts/verify.mjs`'s header, and copying them is how the old figure went stale.) Raising
+  one config and grepping only the file you edited is how the second gets missed; sweep repo-wide
+  for `testTimeout:`. The 20s ceiling was itself a Windows
+  accommodation (cold esbuild transforms of the three.js + engine graph); it stopped being enough.
+  The worker cap above removed the *contention* that made `qaCaseReferences` time out, but not the
+  margin: measured 2026-08-28 on the `win` clone it runs **8.1s idle** — up from the 4.6s in the
+  table above — and still exceeded **35s** inside the app lane, failing 2 of 3 `npm run verify`
+  runs. It walks the whole QA corpus off disk, so it grows with the suite it checks; a budget set
+  on faster hardware was always going to be the binding constraint here first.
+  - Deliberately **not** a global raise. On a machine where 20s is generous, a 60s ceiling turns a
+    real hang into a long wait instead of a failure — and the cost of that is paid on the boxes
+    most likely to notice a hang at all.
+  - This is the contention bullet above *acted on* rather than restated: tests nearest the ceiling
+    fail as timeouts, which is indistinguishable from a regression until somebody re-runs idle.
+    Raising the Windows ceiling is what stops that re-run being the routine cost of the gate.
 - **A PowerShell CIM query costs SECONDS — never run one you can prove will match nothing.**
   `Win32_Processor` above is ~1.9s; `Get-CimInstance Win32_Process` is worse, because it is a cold
   PowerShell start *plus* a full enumeration of every process on the box. Worked example (#313):
@@ -386,8 +405,10 @@ one measurement on Windows did.
 ## Devices
 
 A debug APK built on one machine will **not** install over one built on another —
-`INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match`, because each clone generates its own
-debug keystore. Uninstalling first destroys that app's on-device data, so ask before you do. The
+`INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match`, because the debug keystore is one per
+MACHINE (`~/.android/debug.keystore`; no project sets a `signingConfig`) — so this is a Mac-vs-Windows
+split, not a per-clone one. Uninstalling first destroys that app's on-device data, so ask before you
+do. The
 gradle step succeeds and only the install step fails, which reads like a Windows build bug and is
 not one.
 

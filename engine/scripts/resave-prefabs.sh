@@ -18,7 +18,7 @@
 #
 # Usage:
 #   engine/scripts/resave-prefabs.sh games/sling demos/forest-camp
-#   MODOKI_BACKEND_PORT=5181 engine/scripts/resave-prefabs.sh games/sling   # a worker clone
+#   MODOKI_BACKEND_PORT=5181 engine/scripts/resave-prefabs.sh games/sling   # override (no longer required)
 #
 # Afterwards ALWAYS review with:
 #   node engine/scripts/check-prefab-churn.mjs <same projects>
@@ -37,7 +37,13 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-PORT=${MODOKI_BACKEND_PORT:-5179}
+# PORT used to default to 5179 — the HUB's pinned port — so a bare run from a worker
+# clone drove the HUB's editor over HTTP instead of failing (#349). Derive from the
+# clone directory instead; unlike the launcher's "auto ports" degrade, an empty
+# result here would build a nonsense `http://127.0.0.1:` URL and fail confusingly
+# deep inside the curl loop below, so fail loud up front instead.
+PORT="${MODOKI_BACKEND_PORT:-$(node "$ROOT/engine/scripts/editorPorts.mjs" backend "$ROOT" || true)}"
+[ -n "$PORT" ] || { echo "[resave-prefabs] '$(basename "$ROOT")' is not a known clone and MODOKI_BACKEND_PORT is unset — refusing to guess which editor to drive. Set MODOKI_BACKEND_PORT explicitly." >&2; exit 2; }
 BE="http://127.0.0.1:${PORT}"
 # Per clone, keyed on the backend port — /tmp is machine-wide, so a bare name lets two
 # clones sweeping at once overwrite each other's launch output, and this file is only ever
@@ -51,11 +57,13 @@ EXCLUDED="games/chess games/llm-test"
 
 [ $# -gt 0 ] || { echo "usage: $0 <project>... (e.g. games/sling)" >&2; exit 2; }
 
-# Say which editor this will drive, up front. MODOKI_BACKEND_PORT defaults to 5179 — the MAIN
-# clone's port — so running this from a worker clone without setting it launches an editor on
-# a port that is not this clone's lane (measured: it did exactly that here on the first run).
-# The launcher is repo-scoped so it can't kill a SIBLING clone's editor, but it can squat the
-# port that clone expects to bind, and every later MCP call aimed at 5181 then finds nothing.
+# Say which editor this will drive, up front. PORT above is now DERIVED from the clone
+# directory (editorPorts.mjs) rather than defaulting to 5179 — the MAIN clone's port — which
+# used to mean running this from a worker clone without an explicit MODOKI_BACKEND_PORT
+# launched an editor on a port that was not this clone's lane (measured: it did exactly that
+# here on the first run). The launcher is repo-scoped so it can't kill a SIBLING clone's
+# editor, but it could still squat the port that clone expects to bind, leaving every later
+# MCP call aimed at that port finding nothing.
 echo "[resave-prefabs] driving backend ${BE} (clone: ${ROOT##*/}, branch: $(git -C "$ROOT" branch --show-current 2>/dev/null))"
 
 fail=0

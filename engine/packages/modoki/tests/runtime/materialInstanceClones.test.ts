@@ -258,3 +258,61 @@ describe('applyPropOverride (real THREE materials)', () => {
     expect(m.material).not.toBe(base);
   });
 });
+
+describe('cloning a TSL/file-shader base — the userData round-trip (#325)', () => {
+  /** `fileShaderBuilder` parks real `THREE.Texture` objects at `userData.textures`, the convention
+   *  for NodeMaterial/TSL builds whose `texture(tex)` nodes expose no enumerable slot. A bare
+   *  `.clone()` sends that array through `Material.copy()`'s
+   *  `JSON.parse(JSON.stringify(userData))` — serialising every texture into the clone
+   *  (`THREE.Texture: Unable to serialize Texture.` for a compressed one, a base64 data URL for an
+   *  uncompressed one). `cloneDerived` suppresses it.
+   *
+   *  Suppression is also the CORRECT answer, not merely the cheap one: `userData.textures` is a
+   *  texture-OWNERSHIP record, and both readers (`disposeMaterial`, `materialTextures`) walk
+   *  `materialCache` — bases only. A clone claiming to own the base's textures is a lie. */
+  it('does not serialise, or inherit, the base\'s parked textures', () => {
+    const base = new THREE.MeshStandardMaterial();
+    const parked = new THREE.Texture();
+    base.userData.textures = [parked];
+    let serialised = 0;
+    (parked as unknown as { toJSON: () => unknown }).toJSON = () => { serialised++; return {}; };
+
+    const m = mesh(base);
+    applyPropOverride(1, [m], base, 'roughness', 0.25);
+
+    const clone = m.material as THREE.MeshStandardMaterial;
+    expect(clone).not.toBe(base);
+    expect(serialised).toBe(0);
+    expect(clone.userData.textures).toBeUndefined();
+    // Only the derived-base stamp — nothing inherited from the base.
+    expect(Object.keys(clone.userData)).toEqual(['__derivedBase']);
+    expect(clone.userData.__derivedBase).toBe(base);
+  });
+
+  it('leaves the BASE\'s own userData intact — the suppression is restored', () => {
+    // `cloneDerived` empties the SOURCE's userData for the duration of the clone and restores it in
+    // a `finally`. A regressed restore would strip the base's texture-ownership list, so
+    // `disposeMaterial` would silently leak every texture a TSL material owns.
+    const base = new THREE.MeshStandardMaterial();
+    const parked = new THREE.Texture();
+    base.userData.textures = [parked];
+
+    applyPropOverride(1, [mesh(base)], base, 'roughness', 0.25);
+
+    expect(base.userData.textures).toEqual([parked]);
+  });
+
+  it('keeps .map shared by reference, exactly as a bare clone did', () => {
+    // The property carry must not deep-copy or re-own a texture slot: `ownMap` is what clones a map
+    // per instance, and it keys off `userData._miOwnsMap` which a fresh clone must NOT start with.
+    const base = new THREE.MeshStandardMaterial();
+    base.map = new THREE.Texture();
+
+    const m = mesh(base);
+    applyPropOverride(1, [m], base, 'roughness', 0.25);
+
+    const clone = m.material as THREE.MeshStandardMaterial;
+    expect(clone.map).toBe(base.map);
+    expect(clone.userData._miOwnsMap).toBeUndefined();
+  });
+});

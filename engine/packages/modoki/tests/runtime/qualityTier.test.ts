@@ -23,6 +23,7 @@ import {
   ALL_POSTFX, NO_POSTFX, POSTFX_EFFECTS,
   buildTierResolveInput, readCachedProbeVerdict,
   type TierRenderOverrides, type AuthoredTiers, type PostFXMask,
+  type TierDefaultOverrides,
 } from '../../src/runtime/rendering/qualityTier';
 import {
   BUDGET_30FPS_MS, recordFrame, resetFrameProfile, setProfilerFrameCap, getFrameProfile,
@@ -1607,6 +1608,85 @@ describe('resolveTierOverrides — a config written before a field existed (#202
     const low = preFieldConfig();
     expect(resolveTierOverrides('low', { low })).toBe(resolveTierOverrides('low', { low }));
   });
+});
+
+describe('resolveTierOverrides — the project`s authored DEFAULT-tier fields (#403)', () => {
+  /** A patch whose every field IS the engine identity. The shape a project has the day these
+   *  fields were added: the keys exist in its resolved config, and none of them changes anything. */
+  const identity: TierDefaultOverrides = {
+    ibl: true, iblOffAmbientBoost: 1, iblOffExposure: 1, shadowMapCeiling: 0,
+    maxDirectional: 0, maxLocal: 0, hysteresisMargin: 0, maxShadowCasters: 0,
+  };
+
+  it('an all-identity patch resolves UNCLAMPED_OVERRIDES ITSELF — adding the fields changed nothing', () => {
+    // ⚠️ THE GUARANTEE THAT MADE THIS SAFE TO ADD. Every project in the fleet carries these keys
+    // at their identity values now; if that produced a value-identical COPY rather than the shared
+    // object, every identity comparison in the engine would flip on the day of the change — a
+    // silent behaviour change for 22 configs, from a feature whose whole premise is that it is a
+    // no-op until authored. `toBe`, deliberately, not `toEqual`: a copy passes `toEqual`.
+    expect(resolveTierOverrides('high', undefined, identity)).toBe(UNCLAMPED_OVERRIDES);
+    expect(resolveTierOverrides('low', undefined, identity)).toBe(UNCLAMPED_OVERRIDES);
+  });
+
+  it('omitting the patch entirely is the same as passing an all-identity one', () => {
+    expect(resolveTierOverrides('high', undefined)).toBe(resolveTierOverrides('high', undefined, identity));
+  });
+
+  it('a NON-identity default reaches the resolved overrides at every tier', () => {
+    // The actual feature: before #403 these seven could only be set inside a `mid`/`low` config,
+    // so a project could degrade a value it had no way to author for the default tier.
+    const defaults: TierDefaultOverrides = { ...identity, shadowMapCeiling: 1024, ibl: false };
+    expect(resolveTierOverrides('high', undefined, defaults).shadowMapCeiling).toBe(1024);
+    expect(resolveTierOverrides('high', undefined, defaults).ibl).toBe(false);
+    // …and a tier that authors NOTHING inherits it, rather than snapping back to the engine value.
+    expect(resolveTierOverrides('low', {}, defaults).shadowMapCeiling).toBe(1024);
+  });
+
+  it('an authored tier still WINS over the project default for a field it carries', () => {
+    // Direction matters: the default is a base, not an override. A `low` that says 512 means 512,
+    // whatever the project's default is — otherwise authoring a degradation would be impossible.
+    const defaults: TierDefaultOverrides = { ...identity, shadowMapCeiling: 2048 };
+    const low = { ...TIER_SETTINGS.low, shadowMapCeiling: 512 };
+    expect(resolveTierOverrides('low', { low }, defaults).shadowMapCeiling).toBe(512);
+  });
+
+  it('a PARTIAL tier config falls back to the PROJECT default, not the engine identity', () => {
+    // The seam the two-level completion exists for. A config written before a field existed (or
+    // hand-edited) inherits what THIS project chose for its default tier — reaching past it to the
+    // engine's own value would hand the weakest hardware a setting the author never asked for.
+    const defaults: TierDefaultOverrides = { ...identity, maxDirectional: 4, maxShadowCasters: 2 };
+    const partial = { pixelRatioCap: 1 } as TierRenderOverrides;
+    const resolved = resolveTierOverrides('low', { low: partial }, defaults);
+    expect(resolved.maxDirectional).toBe(4);
+    expect(resolved.maxShadowCasters).toBe(2);
+    expect(resolved.pixelRatioCap).toBe(1); // still the tier's own authored field
+  });
+
+  it('re-resolving with the SAME defaults object allocates nothing new', () => {
+    const defaults: TierDefaultOverrides = { ...identity, maxLocal: 2 };
+    const low = preFieldConfigFor();
+    expect(resolveTierOverrides('low', { low }, defaults))
+      .toBe(resolveTierOverrides('low', { low }, defaults));
+  });
+
+  it('the SAME tier config resolved against DIFFERENT defaults gives different results', () => {
+    // ⚠️ THE FAILURE A SINGLE-LEVEL MEMO WOULD CAUSE. Keyed on the config alone, the completion
+    // would be cached against whichever base it first met and then served forever — so a project
+    // that changed a default would keep rendering with the old one, silently, until reload. This
+    // is the distinguishing observation for that: same config object, two bases, both read.
+    const low = preFieldConfigFor();
+    const a: TierDefaultOverrides = { ...identity, maxLocal: 2 };
+    const b: TierDefaultOverrides = { ...identity, maxLocal: 7 };
+    expect(resolveTierOverrides('low', { low }, a).maxLocal).toBe(2);
+    expect(resolveTierOverrides('low', { low }, b).maxLocal).toBe(7);
+  });
+
+  /** A config missing the fields a project may now default-author, so completion has to run. */
+  function preFieldConfigFor(): TierRenderOverrides {
+    const c = { ...TIER_SETTINGS.low } as Partial<TierRenderOverrides>;
+    delete c.maxLocal; delete c.maxShadowCasters; delete c.maxDirectional;
+    return c as TierRenderOverrides;
+  }
 });
 
 describe('applyTierToThree — the `0 = uncapped` sentinel (close-out finding)', () => {

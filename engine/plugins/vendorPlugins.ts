@@ -26,6 +26,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { gunzipSync } from 'node:zlib';
 import { npmSpawnSpec } from '../toolchain';
 
 export interface VendorOptions {
@@ -303,6 +304,160 @@ export function pluginContentHash(pluginDir: string): string {
   return h.digest('hex').slice(0, 8);
 }
 
+/** ─── Tarball BYTES verification (#375) ────────────────────────────────────────────────
+ *
+ *  `pluginContentHash` answers "what SHOULD the committed tarball be called". It says nothing
+ *  about what the tarball CONTAINS: it reads the source directory, and nothing in the repo ever
+ *  opened the `.tgz`. So a tarball whose NAME is current and whose BYTES are stale passed every
+ *  check — and that is precisely the state #90 exists to prevent, the one where "the gradle build
+ *  succeeds, the APK installs, the app launches, and it silently contains the PREVIOUS native
+ *  code". Reachable without malice: an interrupted `vendor-plugins.mjs` that rewrote the dep spec
+ *  before the pack landed, a merge that took the new package.json and the old plugins/*.tgz, a
+ *  `git checkout <old-sha> -- <project>/plugins/`.
+ *
+ *  This opens the tarball and compares it to the source, file by file. */
+
+/** One way a committed tarball disagrees with the plugin source. */
+export interface TarballDrift {
+  /** Plugin-relative POSIX path (the tar entry minus its `package/` prefix). */
+  path: string;
+  kind: 'missing-from-tarball' | 'not-in-source' | 'bytes-differ';
+}
+
+export interface TarballComparison {
+  drift: TarballDrift[];
+  /** Plugin-relative paths in the tarball that were NOT compared, and why. Surfaced rather than
+   *  swallowed so a caller can report what the run did not cover — a check that quietly skips
+   *  part of its subject is the failure mode this whole guard is about. Today that is `dist/`
+   *  (see compareTarballToSource). */
+  skipped: { path: string; reason: string }[];
+}
+
+/** Read a `.tgz` into `plugin-relative path → bytes`, dropping the leading `package/` component
+ *  npm pack adds. Directories and non-file entries are skipped.
+ *
+ *  Hand-rolled rather than `import 'tar'`, which IS a root dependency but must not appear here:
+ *  this module is esbuild-bundled to a TEMP FILE with `packages: 'external'` (loadVendorPlugins.mjs)
+ *  so `vendor-plugins.mjs` and `build-web.mjs` can run it from plain Node — and from /tmp a
+ *  third-party specifier does not resolve. A `tar` import compiles, typechecks and passes every unit
+ *  test, then kills the CLI vendoring path with ERR_MODULE_NOT_FOUND. (Measured: it did, and
+ *  vendorPluginsIntegration's CLI smoke test is what said so.) node: builtins only, therefore. */
+function readTarball(tarballPath: string): Map<string, Buffer> {
+  const out = new Map<string, Buffer>();
+  const buf = gunzipSync(fs.readFileSync(tarballPath));
+  const BLOCK = 512;
+  /** A pax/GNU-longname override for the NEXT file entry, if one preceded it. */
+  let pendingName: string | null = null;
+
+  for (let off = 0; off + BLOCK <= buf.length; ) {
+    const header = buf.subarray(off, off + BLOCK);
+    // Two consecutive zero blocks end the archive; one is enough to stop reading.
+    if (header.every((b) => b === 0)) break;
+
+    const cstr = (start: number, len: number) => {
+      const raw = header.subarray(start, start + len);
+      const end = raw.indexOf(0);
+      return raw.subarray(0, end === -1 ? raw.length : end).toString('utf8');
+    };
+    const octal = (start: number, len: number) => {
+      // A size field with the high bit set is GNU base-256 (binary), not octal — parseInt would
+      // return NaN → 0, and the reader would then walk into file DATA and desync, silently
+      // returning wrong entries. npm pack never produces one (it needs an 8GB+ member), so this
+      // is a landmine rather than a bug: make it loud instead of leaving it silent.
+      if (header[start] & 0x80) throw new Error(`${tarballPath}: base-256 tar header field at ${start} is unsupported`);
+      return parseInt(cstr(start, len).trim() || '0', 8) || 0;
+    };
+
+    const name = cstr(0, 100);
+    const size = octal(124, 12);
+    const type = String.fromCharCode(header[156] || 0x30);
+    const prefix = cstr(345, 155);
+    const dataStart = off + BLOCK;
+    const data = buf.subarray(dataStart, dataStart + size);
+    off = dataStart + Math.ceil(size / BLOCK) * BLOCK;
+
+    if (type === 'L') { // GNU long name — applies to the following entry
+      pendingName = data.toString('utf8').replace(/\0+$/, '');
+      continue;
+    }
+    if (type === 'x' || type === 'X') { // pax extended header — "<len> path=<value>\n"
+      const m = /(?:^|\n)\d+ path=([^\n]*)\n/.exec(data.toString('utf8'));
+      if (m) pendingName = m[1];
+      continue;
+    }
+    if (type === 'g') continue; // global pax header — not per-entry
+
+    const full = pendingName ?? (prefix ? `${prefix}/${name}` : name);
+    pendingName = null;
+    // Regular files only — '0' is the ustar typeflag, and an old-style NUL flag was normalized to
+    // it when `type` was read. A directory/symlink/hardlink entry has nothing to compare.
+    if (type !== '0') continue;
+    const rel = full.replace(/^\.?\//, '').replace(/^package\//, '');
+    if (!rel || rel.endsWith('/')) continue;
+    out.set(rel, Buffer.from(data));
+  }
+  return out;
+}
+
+/** Compare a committed tarball's CONTENTS against the plugin source directory (#375).
+ *
+ *  Scope — the shipped fileset MINUS `dist/`, which is exactly the set the tarball's NAME is
+ *  computed over (pluginHashInputs). Both directions where the shipped set is exactly
+ *  enumerable: a missing entry and a differing entry are both drift. This is the set that
+ *  carries the native code, and it is what #375's scenarios move — an interrupted re-vendor, a
+ *  merge taking the new package.json with the old tarball, a checkout of an old plugins/ dir.
+ *
+ *  ⚠️ **`dist/` is deliberately NOT compared, and this cost two attempts to get right.**
+ *  Comparing it looks obviously correct — dist IS shipped, and a stale dist IS stale bytes. But
+ *  the repo has already decided the opposite, deliberately and with a test: `matchesFilesEntry`
+ *  excludes dist from the identity hash so "a toolchain-only drift can't rename the tarball",
+ *  and `vendorPlugins.test.ts`'s "does NOT re-pack when ONLY the built dist/ changes
+ *  (toolchain-drift churn killer)" pins it. dist/ is gitignored and rebuilt per clone, so a
+ *  patch bump of tsc or rollup changes its bytes with no source change and no rename. A guard
+ *  that failed on that would demand a re-vendor of all 21 tarballs plus 21 lockfiles — the exact
+ *  churn the vendorer refuses to cause. Two components of one system cannot hold opposite
+ *  positions on the same input, so this one yields.
+ *
+ *  A plugin whose `files` cannot be resolved by literal prefix (a glob, or no `files` at all)
+ *  gets the one-way check only: every tarball entry must match source. Claiming a file is
+ *  "missing from the tarball" needs an exact expected set, and we do not have one — mirroring
+ *  the conservative fallback pluginHashInputs takes. */
+export function compareTarballToSource(tarballPath: string, pluginDir: string): TarballComparison {
+  const entries = readTarball(tarballPath);
+  const files = readPackageFiles(pluginDir);
+  const canEnumerateExpected = !!files && !files.some(hasGlobMeta);
+  const isDistPath = (rel: string) => rel === 'dist' || rel.startsWith('dist/');
+  const drift: TarballDrift[] = [];
+  const skipped: { path: string; reason: string }[] = [];
+
+  // tarball → source
+  for (const [rel, bytes] of entries) {
+    if (isDistPath(rel)) { skipped.push({ path: rel, reason: 'dist/ is derived — see the header' }); continue; }
+    const abs = path.join(pluginDir, rel);
+    if (!fs.existsSync(abs)) { drift.push({ path: rel, kind: 'not-in-source' }); continue; }
+    // Exact bytes, no newline normalization: `.gitattributes` pins `eol=lf` for every extension
+    // the plugins ship, so a Windows checkout has the same bytes a macOS one packed.
+    if (!bytes.equals(fs.readFileSync(abs))) drift.push({ path: rel, kind: 'bytes-differ' });
+  }
+
+  // source → tarball (only when the shipped set is exactly enumerable)
+  if (canEnumerateExpected) {
+    const expected = allSourceInputs(pluginDir)
+      .filter((rel) => !isDistPath(rel) && (isAlwaysShipped(rel) || matchesFilesEntry(rel, files)));
+    for (const rel of expected) {
+      if (entries.has(rel)) continue;
+      // A symlink is a file to allSourceInputs but a type-'2' tar entry readTarball skips, so it
+      // would read as missing. No engine plugin ships one today; this keeps that from becoming a
+      // mystery red the day one does.
+      if (fs.lstatSync(path.join(pluginDir, rel)).isSymbolicLink()) continue;
+      drift.push({ path: rel, kind: 'missing-from-tarball' });
+    }
+  }
+
+  drift.sort((a, b) => a.path.localeCompare(b.path) || a.kind.localeCompare(b.kind));
+  return { drift, skipped };
+}
+
 /** Build inputs that determine `dist/` — hashed to detect a STALE dist. Excludes
  *  the native dirs (ios/android ship as-is, they don't feed the JS build) and
  *  anything generated. Returns null when the plugin ships WITHOUT sources (the
@@ -359,6 +514,35 @@ function writeBuildStamp(pluginDir: string, stamp: string): void {
     fs.mkdirSync(path.dirname(buildStampPath(pluginDir)), { recursive: true });
     fs.writeFileSync(buildStampPath(pluginDir), stamp);
   } catch { /* best-effort: a missing stamp only costs one extra rebuild */ }
+}
+
+/** Stamp `pluginDir`'s already-built `dist/` as CURRENT for its sources.
+ *
+ *  The root `build:plugins` postinstall builds every engine plugin's dist directly
+ *  (`npm run build --workspace ...`) and, before #395, wrote no stamp. So the FIRST
+ *  thing to call ensurePluginBuilt after an install always judged a perfectly current
+ *  dist stale and rebuilt it — deleting and recreating dist/ in the repo while other
+ *  processes were importing it. In `npm run verify` that raced the app lane's
+ *  `await import('capacitor-game-debug')` and failed the suite with a module-resolution
+ *  error that never reproduced on a second run (the rebuild had written a stamp by then).
+ *
+ *  This is the ONLY other writer of the stamp, and it deliberately reuses
+ *  pluginSourceHash + writeBuildStamp rather than recomputing the hash: a second
+ *  implementation that drifted from ensurePluginBuilt's would vouch for a stale dist,
+ *  which is a quiet wrong build in place of a loud flake.
+ *
+ *  Returns false (and stamps nothing) when there is no dist to vouch for, or no sources
+ *  to hash (a packaged editor, where the shipped dist is authoritative anyway). */
+export function stampPluginBuild(pluginDir: string): boolean {
+  if (!fs.existsSync(path.join(pluginDir, 'dist'))) return false;
+  const srcHash = pluginSourceHash(pluginDir);
+  if (srcHash === null) return false;
+  writeBuildStamp(pluginDir, srcHash);
+  // writeBuildStamp is best-effort and SWALLOWS its errors (read-only node_modules, ENOSPC),
+  // so `true` must mean "a stamp is on disk and reads back correctly", not "a write was
+  // attempted". Otherwise the postinstall reports work it did not do, and the only signal
+  // anyone has that #395 is fixed is a lie.
+  return readBuildStamp(pluginDir) === srcHash;
 }
 
 /** Ensure the plugin's built `dist/` exists AND is CURRENT for its sources (it
