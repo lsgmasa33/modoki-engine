@@ -46,3 +46,43 @@ export function relativiseUnderProject(projectRoot: string, chosenAbs: string): 
   const inside = rel !== '' && !escapes && !path.isAbsolute(rel);
   return inside ? rel.split(path.sep).join('/') : chosen;
 }
+
+/** Where a file DROPPED on a Project Settings path field should land, and whether its bytes
+ *  actually have to be written.
+ *
+ *  The owner's rule (2026-08-29): copy a dropped file into the project, but **do not copy one
+ *  that is already inside it** — that would leave a second copy of `art/splash-master.png` next
+ *  to the first and make the field point at the duplicate. The "already inside" half is decided
+ *  by the CALLER (it has the source path); this function is only reached once a copy is needed,
+ *  and answers the naming question.
+ *
+ *  `probe` reports what already sits at a candidate path:
+ *   - `'absent'`   — free, write there.
+ *   - `'same'`     — byte-identical file already there. Re-use it and write NOTHING. This is the
+ *                    common case of dropping the same PNG twice (once on the icon field, once on
+ *                    the splash-title field, or simply re-dropping after a mistake), and without
+ *                    it every re-drop would mint `icon-1.png`, `icon-2.png`… each a full copy.
+ *   - `'different'` — a DIFFERENT file owns the name; suffix and try again, never overwrite.
+ *
+ *  Pure (all I/O is in `probe`) so the naming policy is unit-testable without a filesystem — the
+ *  same split as `planImports` in the Assets panel. */
+export function planDroppedFileDest(
+  folder: string,
+  fileName: string,
+  probe: (rel: string) => 'absent' | 'same' | 'different',
+): { path: string; write: boolean } {
+  // A dropped name is OS-supplied, so it can carry separators or `..` on some hosts. Keep the
+  // leaf only: the destination folder is ours to choose, not the drop's.
+  const leaf = fileName.split(/[/\\]/).pop() || 'file';
+  const dir = folder.replace(/^\/+|\/+$/g, '');
+  const dot = leaf.lastIndexOf('.');
+  const stem = dot > 0 ? leaf.slice(0, dot) : leaf;
+  const ext = dot > 0 ? leaf.slice(dot) : '';
+  for (let i = 0; ; i++) {
+    const candidate = `${dir ? `${dir}/` : ''}${i === 0 ? stem : `${stem}-${i}`}${ext}`;
+    const state = probe(candidate);
+    if (state === 'absent') return { path: candidate, write: true };
+    if (state === 'same') return { path: candidate, write: false };
+    // 'different' — the name is taken by other bytes; try the next suffix.
+  }
+}

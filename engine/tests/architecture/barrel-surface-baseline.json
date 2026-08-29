@@ -69,6 +69,7 @@
   "MaterialInstance",
   "MockStoreBackend",
   "ModelSource",
+  "NO_BEHAVIOR_REQUEST",
   "NO_ENTRY_REQUEST",
   "NO_SCROLL_REQUEST",
   "NPRPostFX",

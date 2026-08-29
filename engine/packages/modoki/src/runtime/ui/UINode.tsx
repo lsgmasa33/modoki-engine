@@ -928,8 +928,10 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
     const req = pendingScrollTo(scroll);
     if (!req) return;
     el.scrollTo(req as ScrollToOptions);
-    clearScrollRequest(guid);
-  }, [ref, guid, scroll?.scrollToX, scroll?.scrollToY, scroll?.scrollBehavior]); // eslint-disable-line react-hooks/exhaustive-deps
+    // Hand back the override this effect actually consumed, so a request armed AFTER the snapshot
+    // this effect is holding does not get its behaviour cleared out from under it (#409).
+    clearScrollRequest(guid, scroll.scrollToBehavior);
+  }, [ref, guid, scroll?.scrollToX, scroll?.scrollToY, scroll?.scrollToBehavior]); // eslint-disable-line react-hooks/exhaustive-deps
 }
 
 export const UINode = React.memo(UINodeInner);

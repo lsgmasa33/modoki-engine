@@ -9,7 +9,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { relativiseUnderProject } from '../../plugins/backend/projectPaths';
+import { relativiseUnderProject, planDroppedFileDest } from '../../plugins/backend/projectPaths';
 
 describe('relativiseUnderProject (#394)', () => {
   it('relativises a file inside the project', () => {
@@ -89,5 +89,58 @@ describe('relativiseUnderProject (#394)', () => {
       expect(relativiseUnderProject(projectRoot, path.join(projectRoot, 'art', 'aliased.png')))
         .toBe('art/aliased.png');
     });
+  });
+});
+
+/** The naming half of the Project Settings drop (#408 follow-up). The owner's rule is "copy a
+ *  dropped file in, but not one that is already in the project" — the already-inside half is
+ *  `relativiseUnderProject` above; this is what happens once a copy IS needed. */
+describe('planDroppedFileDest', () => {
+  const probeFrom = (state: Record<string, 'same' | 'different'>) =>
+    (rel: string) => state[rel] ?? 'absent';
+
+  it('writes to the requested folder when the name is free', () => {
+    expect(planDroppedFileDest('art', 'icon.png', probeFrom({})))
+      .toEqual({ path: 'art/icon.png', write: true });
+  });
+
+  it('RE-USES a byte-identical file already there instead of copying again', () => {
+    // Dropping the same PNG on the icon field and then the splash-title field, or simply
+    // re-dropping after a mis-click. Without this every re-drop mints another full copy.
+    expect(planDroppedFileDest('art', 'icon.png', probeFrom({ 'art/icon.png': 'same' })))
+      .toEqual({ path: 'art/icon.png', write: false });
+  });
+
+  it('never overwrites a DIFFERENT file that owns the name', () => {
+    expect(planDroppedFileDest('art', 'icon.png', probeFrom({ 'art/icon.png': 'different' })))
+      .toEqual({ path: 'art/icon-1.png', write: true });
+  });
+
+  it('keeps suffixing past several different files, and still re-uses a match further along', () => {
+    const state = { 'art/icon.png': 'different', 'art/icon-1.png': 'different', 'art/icon-2.png': 'same' } as const;
+    expect(planDroppedFileDest('art', 'icon.png', probeFrom(state)))
+      .toEqual({ path: 'art/icon-2.png', write: false });
+  });
+
+  it('keeps only the LEAF of an OS-supplied name', () => {
+    // The name comes from the drop, not from us. A separator or a `..` in it must not steer the
+    // write out of the destination folder.
+    expect(planDroppedFileDest('art', '../../etc/passwd.png', probeFrom({})))
+      .toEqual({ path: 'art/passwd.png', write: true });
+    expect(planDroppedFileDest('art', 'C:\\Users\\x\\icon.png', probeFrom({})))
+      .toEqual({ path: 'art/icon.png', write: true });
+  });
+
+  it('handles a name with no extension, and a dotfile', () => {
+    expect(planDroppedFileDest('art', 'LICENSE', probeFrom({ 'art/LICENSE': 'different' })))
+      .toEqual({ path: 'art/LICENSE-1', write: true });
+    // A leading dot is not an extension separator — `.gitignore` must not become `-1.gitignore`.
+    expect(planDroppedFileDest('art', '.gitignore', probeFrom({ 'art/.gitignore': 'different' })))
+      .toEqual({ path: 'art/.gitignore-1', write: true });
+  });
+
+  it('normalises the destination folder rather than doubling its slashes', () => {
+    expect(planDroppedFileDest('/art/', 'icon.png', probeFrom({})).path).toBe('art/icon.png');
+    expect(planDroppedFileDest('', 'icon.png', probeFrom({})).path).toBe('icon.png');
   });
 });

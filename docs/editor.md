@@ -324,6 +324,96 @@ written on any refusal. Caveat: `postprocessors` is a map, so a patch can add or
 entry but never delete one; and unknown *top-level* keys are dropped by `mergeProjectConfig`'s
 explicit key list (unknown keys nested inside a declared section survive).
 
+### Project Settings — what a FIELD carries beyond its input
+
+Three affordances on the generic `FieldControl`, each added because the form could not answer a
+question the person in front of it was actually asking.
+
+- **`help` lives behind a hover `(i)`, never inline** (#408). It used to print as permanent grey
+  text beside every label, and one of these strings — the Quality Tiers help in
+  `engine/app/editor/setup.ts` — is a ~230-character paragraph sitting next to a checkbox. The
+  `(i)` is the shared `Info` in `panels/fields.tsx`, which is also what the Tier matrix uses:
+  ONE definition, because the editor has exactly one convention for "explanation behind a hover"
+  and two copies would drift. It is a `<span>` inside a `Tooltip`, **not** a `title=` — Electron
+  renders native title tooltips not at all (silently absent, not merely ugly), which is why
+  every hover explanation in this editor goes through that component.
+
+- **A `path` field whose value looks like an image shows a THUMBNAIL and its pixel size.** Keyed
+  off the value's extension rather than a per-field opt-in (owner, 2026-08-29: "every path"), so
+  a preview appears wherever one is meaningful and an eighth image field cannot be forgotten.
+  The size is the point as much as the picture: three of these fields carry a hard requirement in
+  their own help text ("square, >=1024px", "ideally 2732²") that the dialog previously could not
+  check — you found out from a build, or from a blurry icon on a phone. Court's splash reads
+  2048² against a 2732² recommendation, and that was invisible until the preview said so.
+
+  The bytes come from **`GET /api/source-image`**, a new route, because these values point at
+  build INPUTS (`games/court/art/…`) that no asset manifest lists and therefore no `assetUrl()`
+  can reach. Its neighbour `/api/read-file` is utf-8 only — it would hand back a PNG as mojibake
+  rather than fail. It reuses `resolveSourcePath`'s project-root gate (a preview is not a reason
+  to widen a file-read gate) and allowlists image EXTENSIONS rather than sniffing, so "every path
+  field previews" cannot become "every path field is readable over HTTP" — `user.keystore.storeFile`
+  points at a signing key inside the project. The dialog fetches rather than pointing an `<img>` at
+  the URL, so *file not found*, *outside the project* and *not a readable image* stay three
+  distinguishable messages; `<img onError>` reports one indistinguishable failure for all three,
+  and they have different fixes. An `iconSource` naming a file somebody has since renamed used to
+  look identical to a correct one until the build failed.
+
+- **A `path` field is a DROP TARGET, and the copy rule is the owner's** (2026-08-29): a dropped
+  file is copied into the project — these values are committed, so an absolute path to one
+  machine is dead on every other clone (#394) — **except one that is already inside the project**,
+  which is referenced where it lies rather than duplicated beside itself. `POST /api/adopt-file`
+  makes that call, and `relativiseUnderProject` returning a relative path IS the inside-the-project
+  test, so the containment rule has one definition rather than a second copy that could disagree
+  with the picker's.
+
+  Deciding it needs the dropped file's SOURCE path, which a browser has not handed over since
+  Electron 32 removed `File.path` — hence `getPathForFile` (Electron's `webUtils`) in
+  `engine/electron/preload.ts`. It reads like a convenience and is not: with no path the question
+  is unanswerable. A host without a preload gets `''` and the drop always copies, which is the
+  safe direction — a redundant copy, never a dead reference. The renderer probes with the path
+  alone first and uploads the bytes only when the backend asks (a 400), so the common in-project
+  drop never base64s a 2732² splash. A re-drop of the same file is byte-compared and re-used
+  rather than minting `icon-1.png`; a DIFFERENT file of the same name is suffixed, never
+  overwritten (`planDroppedFileDest`, `plugins/backend/projectPaths.ts`).
+
+  Drags out of the **Assets panel** land in the same route via `assetPath`, and take the reference
+  branch whenever the asset root sits inside the project. When it does not, the route reads the
+  file itself rather than demanding bytes the renderer never had — an asset drag carries no `File`,
+  so the upload retry cannot fire and the editor would otherwise offer a drag that dead-ends.
+  ⚠️ **That disk read is allowed for an `assetPath` ONLY, never for the client-supplied `abs`.**
+  The two provenances are not equally trusted: the editor's own asset roots resolved the first,
+  while the second is whatever the caller said. Reading from `abs` makes the route an arbitrary-file
+  reader — `{abs: '~/.ssh/id_ed25519', name: 'x.png'}` copies that file to `art/x.png`, which
+  `/api/source-image` then serves back under an extension it trusts, and leaves the contents in the
+  project for a commit to pick up. (Written the wrong way first, during this feature's own
+  close-out, while fixing the dead-end above — widening a read gate as a side effect of fixing
+  something else is exactly the move the `/api/source-image` gate was careful to avoid.)
+
+  ⚠️ **`<fieldset disabled>` does NOT stop a drop, and both of this dialog's inert states are
+  built on it.** It disables form *controls* natively — which is exactly why the dialog uses it
+  instead of threading a `disabled` prop through twelve `case`s — but a `drop` handler on a plain
+  `<div>` is not a control. The per-field `disabledIf` wrapper also sets `pointerEvents:'none'` and
+  is safe by accident; the whole-form one (`configErrors`, the config file that did not parse) does
+  not, so a drop there copied a file into the project and edited a draft that Apply is disabled
+  for. The field therefore checks its own input at drop time — **`el.matches(':disabled')`, never
+  `el.disabled`**: the IDL property reflects the element's own attribute only and reads `false` for
+  an input disabled by an ancestor fieldset, so the obvious spelling is a silent no-op. That is the
+  same trap `tests/ui/projectSettingsDialog.test.tsx` recorded for its own assertions, and it was
+  written wrong here first; a unit test of the decision cannot catch it, because the defect is
+  entirely at the call site. The mount test in that file is the cover.
+
+  ⚠️ **`copyFolder` is contained before it reaches a path join.** It is a client-supplied body
+  field, and `planDroppedFileDest` sanitises only the *name* — so `copyFolder:
+  '../../../Library/LaunchAgents'` wrote outside the project, while the neighbouring
+  `/api/write-file` 403s the identical escape. Localhost is not a boundary here: the host parses a
+  POST body regardless of Content-Type, so a page in a browser can issue a no-preflight
+  cross-origin POST and never needs to read the reply, because the write is the payload.
+  The containment is **lexical** — `path.resolve` does not follow symlinks, so a link inside the
+  project pointing out would pass. That is the same strength as `/api/write-file`'s
+  `resolveSourcePath` beside it, i.e. the convention here rather than something this route
+  weakens, and no project in the repo contains such a link. Stated rather than left implied,
+  because "contained" reads stronger than it is.
+
 ---
 
 ## Panels

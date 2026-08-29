@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { backendFetch } from '../backend/editorBackend';
+import { fileToBase64 } from './fileBytes';
 import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
 import {
@@ -133,20 +134,6 @@ async function readMeta(assetPath: string): Promise<ModelMeta> {
     if (res.ok) return await res.json();
   } catch { /* ignore */ }
   return {};
-}
-
-// Read a browser File as base64 (no data: prefix) for POST /api/write-file.
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string; // "data:<mime>;base64,XXXX"
-      const comma = result.indexOf(',');
-      resolve(comma >= 0 ? result.slice(comma + 1) : result);
-    };
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
 }
 
 // The asset tree root ("/") and intermediate nodes (e.g. "/games") are virtual —

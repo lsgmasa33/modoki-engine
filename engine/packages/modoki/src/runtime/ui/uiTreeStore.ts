@@ -18,6 +18,7 @@ import { markUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
 import { spriteEpoch } from '../core/textureRefs';
 import { resolveUIFontFamily, resetFontRefWarnings } from './fontFamilyRef';
 import { scrollSnapChildStyle } from './scrollViewDom';
+import { NO_BEHAVIOR_REQUEST } from '../traits/UIScrollView';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
 import type { World } from 'koota';
 import type { UIActionBinding } from './bindings';
@@ -101,7 +102,7 @@ export interface UINodeData {
    *  `UINode` writes it into the trait on every DOM scroll event without dirtying the tree. If it
    *  rode down in the projection, every scroll event would change this node, `nodesEqual` would
    *  fail, and the whole "a scroll frame costs nothing" property would be gone. */
-  scroll?: { axis: string; snap: string; snapStop: string; overscroll: string; scrollbar: string; wheel: string; scrollToX: number; scrollToY: number; scrollBehavior: string };
+  scroll?: { axis: string; snap: string; snapStop: string; overscroll: string; scrollbar: string; wheel: string; scrollToX: number; scrollToY: number; scrollToBehavior: string; scrollBehavior: string };
   /** True when this node is a pooled `UIEntries` entry. Its only job here is to name the SNAP
    *  TARGETS of an enclosing scroll view — see `stampSnapTargets`. */
   isEntry?: boolean;
@@ -473,6 +474,9 @@ function buildTree(world: World): UINodeData[] | null {
           axis: sv.axis ?? 'y', snap: sv.snap ?? 'none', snapStop: sv.snapStop ?? 'normal',
           overscroll: sv.overscroll ?? 'auto', scrollbar: sv.scrollbar ?? 'auto', wheel: sv.wheel ?? 'native',
           scrollToX: sv.scrollToX ?? -1, scrollToY: sv.scrollToY ?? -1,
+          // Both halves of the motion decision ride down: the transient per-request override and
+          // the authored default it falls back to (#409). `pendingScrollTo` resolves the pair.
+          scrollToBehavior: sv.scrollToBehavior ?? NO_BEHAVIOR_REQUEST,
           scrollBehavior: sv.scrollBehavior ?? 'instant',
         };
       }

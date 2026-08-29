@@ -25,7 +25,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
-import { relativiseUnderProject } from './projectPaths';
+import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
 import { readMetaSidecar, writeMetaSidecar } from '../meta-sidecar';
 import { readFontAxes } from '../font-instance';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash } from '../asset-fs-ops';
@@ -417,6 +417,14 @@ function engineSrcRoot(ctx: BackendContext): string | null {
   const dir = path.join(ctx.editorRoot, 'engine', 'packages', 'modoki', 'src');
   return fs.existsSync(dir) ? dir : null;
 }
+
+/** Extensions `/api/source-image` will serve, and what it calls them. An allowlist rather than a
+ *  sniff — see the route. `.svg` is served as `image/svg+xml`, which an <img> renders inertly
+ *  (no script, no external fetches), unlike an <object>/<iframe> embed. */
+const IMAGE_CONTENT_TYPES: Record<string, string> = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
+  '.gif': 'image/gif', '.bmp': 'image/bmp', '.avif': 'image/avif', '.svg': 'image/svg+xml',
+};
 
 /** Resolve a client-supplied source path (the /@fs/<abs> form, or relative to
  *  the project root) to an absolute path, gated to within one of the allowed
@@ -2033,6 +2041,148 @@ async function describeUnresolvedAgainstLiveWorld(
       kind: 'raw', contentType: 'text/plain; charset=utf-8', body: fs.readFileSync(r.abs, 'utf-8'),
       headers: { 'Cache-Control': 'no-store', 'X-Writable': String(r.writable) },
     };
+  }
+
+  // ── GET /api/source-image?path= (M) ── the BYTES of an image that lives in the project but
+  // NOT in an asset root, so the Project Settings preview can show it (#408 follow-up).
+  //
+  // The seven `app.icon*Source` / `app.splash*Source` fields point at build INPUTS — Court's are
+  // in `games/court/art/` — which no asset manifest lists and therefore no `assetUrl()` can
+  // reach. `/api/read-file` is the neighbouring route and is utf-8 only: it would hand back a PNG
+  // as mojibake rather than fail, which is worse than not having a route at all.
+  //
+  // Gated by the SAME `resolveSourcePath` as `/api/read-file` — inside the project (or the
+  // read-only engine source), never anywhere else on the machine. A preview is not a reason to
+  // widen a file-read gate, so an absolute path outside the project gets a 403 and the dialog
+  // says so in place, which is more than it could say before.
+  if (urlPath === '/api/source-image' && method === 'GET') {
+    const requested = query.get('path') || '';
+    const contentType = IMAGE_CONTENT_TYPES[path.extname(requested).toLowerCase()];
+    // Extension allowlist, not sniffing: this route exists to feed an <img>, and the response is
+    // served from the same origin as the editor, so handing back an arbitrary file under a
+    // guessed content type is a capability nobody asked for.
+    if (!contentType) return json({ error: 'not an image path' }, 400);
+    const r = resolveSourcePath(ctx, requested);
+    if (!r) return json({ error: 'path outside the project' }, 403);
+    if (!fs.existsSync(r.abs) || !fs.statSync(r.abs).isFile()) return json({ error: 'not found' }, 404);
+    return {
+      kind: 'raw', contentType, body: fs.readFileSync(r.abs),
+      // no-store, not an ETag: the file this serves is edited OUTSIDE the editor (it is art,
+      // repainted in another tool), and a stale preview of an icon is exactly the lie this
+      // feature exists to remove.
+      headers: { 'Cache-Control': 'no-store' },
+    };
+  }
+
+  // ── POST /api/adopt-file {assetPath|abs, name?, content?} (M) ── turn a DROPPED file into a
+  // value a Project Settings path field can store, copying it into the project only if it is not
+  // already there (owner, 2026-08-29).
+  //
+  // Three inputs, because a drop arrives in three shapes:
+  //   `assetPath` — a drag out of the Assets panel; already in the project by construction.
+  //   `abs`       — an OS drag whose source path the Electron preload could resolve.
+  //   `content`   — the dropped bytes, base64. The only one always present, and the fallback
+  //                 when there is no `abs` (a browser-hosted editor has no `webUtils`).
+  // A path INSIDE the project is referenced where it lies; anything else is copied to
+  // `copyFolder` and referenced there. The returned path is project-relative in both cases —
+  // these fields are committed, and an absolute one is dead on every other clone (#394).
+  if (urlPath === '/api/adopt-file' && method === 'POST') {
+    try {
+      const { assetPath, abs, name, content, copyFolder = 'art' } = (body ?? {}) as {
+        assetPath?: string; abs?: string; name?: string; content?: string; copyFolder?: string;
+      };
+      // Two provenances, and they are NOT equally trusted. An `assetPath` was resolved by the
+      // editor's own asset roots; an `abs` is whatever the caller said. Only the first may be READ
+      // from disk — see the byte-sourcing below.
+      const assetAbs = assetPath ? ctx.resolveAssetPath(assetPath) : null;
+      const sourceAbs = assetAbs ?? (abs || null);
+      if (sourceAbs) {
+        const rel = relativiseUnderProject(ctx.projectRoot, sourceAbs);
+        // relativiseUnderProject returns the input unchanged when it escapes, so "did it
+        // relativise" IS the inside-the-project test — one definition, not a second copy of the
+        // containment rule that could disagree with the one the picker already uses.
+        if (!path.isAbsolute(rel)) return json({ path: rel, copied: false });
+      }
+      // The bytes, from whichever side has them. An ASSET drag carries no `File`, so the renderer
+      // has nothing to upload on the 400 — and an asset root can sit outside the project root, so
+      // "outside" is reachable from a drag the editor itself offered. The server can just read it.
+      let bytes: Buffer;
+      if (typeof content === 'string') {
+        bytes = Buffer.from(content, 'base64');
+        // ⚠️ This catches "decoded to NOTHING", which is not the same as "was valid base64" —
+        // Node's decoder SKIPS invalid characters rather than failing, so a partly-corrupt string
+        // still yields plausible garbage bytes and only an entirely-invalid one is caught. The
+        // only producer is `fileToBase64`, so that gap costs nothing today; what this stops is the
+        // route reporting a successful copy over a 0-byte file. (An intentionally empty file
+        // arrives as `content: ''` and is still allowed.)
+        if (content.length > 0 && bytes.length === 0) return json({ error: 'content decoded to no bytes' }, 400);
+      } else if (assetAbs && fs.existsSync(assetAbs) && fs.statSync(assetAbs).isFile()) {
+        // ⚠️ `assetAbs`, NEVER `sourceAbs`. Reading from a client-supplied `abs` would turn this
+        // route into an arbitrary-file reader: `{abs: '~/.ssh/id_ed25519', name: 'x.png'}` copies
+        // that file to `art/x.png`, which `/api/source-image` then serves back under an extension
+        // it trusts — and leaves a private key sitting in the project where a commit can pick it
+        // up. An asset path is different in kind: the editor's own roots resolved it, and the drag
+        // that produces one came from a panel showing the file already.
+        bytes = fs.readFileSync(assetAbs);
+      } else {
+        // The renderer's cue to upload — see the two-step in PathField.adopt. Load-bearing status.
+        return json({ error: 'file is outside the project and no bytes were sent' }, 400);
+      }
+      // ⚠️ CONTAIN `copyFolder` BEFORE it reaches a path join. `name` is sanitised inside
+      // `planDroppedFileDest` (leaf only) and has a test; the FOLDER had neither, and it is a
+      // client-supplied body field — so `copyFolder: '../../../../Library/LaunchAgents'` wrote
+      // outside the project entirely. The neighbouring `/api/write-file` 403s exactly this escape;
+      // this route being weaker than the one beside it is the whole bug. It matters more than a
+      // localhost-only route sounds: the host parses a POST body regardless of Content-Type, so a
+      // page in the owner's browser can issue a no-preflight cross-origin POST here — it cannot
+      // read the reply, and does not need to, because the WRITE is the payload.
+      // LEXICAL containment — `path.resolve` does not follow symlinks, so a symlink inside the
+      // project pointing out would pass. That is the same strength as the neighbouring
+      // `/api/write-file`/`resolveSourcePath`, i.e. the convention here rather than a gap this
+      // route opens; no project in the repo contains such a link. Said plainly because the
+      // sentence above could otherwise be read as promising more.
+      const folderAbs = path.resolve(ctx.projectRoot, copyFolder);
+      const folderRel = path.relative(ctx.projectRoot, folderAbs);
+      if (folderRel.startsWith('..') || path.isAbsolute(folderRel)) {
+        return json({ error: 'copyFolder escapes the project' }, 403);
+      }
+      const leafName = name || (sourceAbs ? path.basename(sourceAbs) : 'dropped-file');
+      const plan = planDroppedFileDest(folderRel.split(path.sep).join('/'), leafName, (rel) => {
+        const candidate = path.join(ctx.projectRoot, rel);
+        if (!fs.existsSync(candidate)) return 'absent';
+        try {
+          return fs.readFileSync(candidate).equals(bytes) ? 'same' : 'different';
+        } catch {
+          return 'different';
+        }
+      });
+      if (plan.write) {
+        const destAbs = path.join(ctx.projectRoot, plan.path);
+        // Second containment check, on the RESOLVED destination. The check above is the one that
+        // fires; this one holds even if the naming policy is later changed to something that can
+        // introduce a segment of its own, which is exactly the kind of edit that silently reopens
+        // a hole in a caller three files away.
+        const destRel = path.relative(ctx.projectRoot, destAbs);
+        if (destRel.startsWith('..') || path.isAbsolute(destRel)) {
+          return json({ error: 'destination escapes the project' }, 403);
+        }
+        fs.mkdirSync(path.dirname(destAbs), { recursive: true });
+        ctx.markEditorWrite(destAbs, crypto.createHash('sha1').update(bytes).digest('hex'));
+        const tmpPath = `${destAbs}.tmp`;
+        try {
+          fs.writeFileSync(tmpPath, bytes);
+          fs.renameSync(tmpPath, destAbs);
+        } catch (writeErr) {
+          // Leave no half-written `.tmp` behind for the asset scanner to find: the write already
+          // failed, and a stray sibling of the file you dropped is a worse outcome than the error.
+          try { fs.unlinkSync(tmpPath); } catch { /* nothing to clean up */ }
+          throw writeErr;
+        }
+      }
+      return json({ path: plan.path, copied: plan.write });
+    } catch (e) {
+      return json({ error: String(e) }, 500);
+    }
   }
 
   // ── POST /api/write-meta {path, meta} (M) ──

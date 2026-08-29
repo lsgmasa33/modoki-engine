@@ -437,12 +437,17 @@ The rule for a trait author: `hidden` and `runtimeOnly` answer different questio
 edit this?* vs *may this reach disk?* — and an engine-written read-back needs both
 (docs/editor.md § FieldHint).
 
-**The flag cannot fix the third shape, and #409 is it:** a field that is genuinely AUTHORED and
-also written at runtime. `UIScrollView.scrollBehavior` is an authored enum that
-`scrollApi.scrollToEntry` overwrites with the per-request behaviour, so one `ui.scrollTo` destroys
-the author's default and the next save writes the request out. Flagging it would delete authored
-data instead; the fix is a separate request field, which is a behaviour decision. The `GAINED`
-check above is what notices it in the meantime.
+**The flag cannot fix the third shape (#409, FIXED):** a field that is genuinely AUTHORED and also
+written at runtime. `UIScrollView.scrollBehavior` is an authored enum, and `scrollApi.scrollToEntry`
+used to overwrite it with the per-request behaviour — so one `ui.scrollTo` destroyed the author's
+default (a request naming no behaviour defaulted to `'instant'`) and the next save wrote the
+request out as authored data. Flagging it would have deleted authored data instead. **The fix is
+two fields for the two roles**: a `runtimeOnly` `scrollToBehavior` carries the request and is
+consumed with it by `clearScrollRequest`, while the authored `scrollBehavior` is what
+`pendingScrollTo` falls back to when the request names none (`''`). The lesson generalises: when a
+runtime write lands on authored data, ask whether the write is a *different role* wearing the same
+field — `runtimeOnly` can only separate disk from memory, never two meanings of one value. The
+`GAINED` check above is what noticed it.
 
 **Prefabs needed their own route (#125), and are now swept too** — see "Re-saving legacy
 prefabs" below.

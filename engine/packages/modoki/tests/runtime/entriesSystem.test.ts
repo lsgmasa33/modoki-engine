@@ -412,7 +412,10 @@ describe('entriesSystem', () => {
 
     const sv = view.get(UIScrollView) as any;
     expect(sv.scrollToY).toBe(42 * ENTRY_H);      // entries -> px, using the size the system resolved
-    expect(sv.scrollBehavior).toBe('smooth');
+    expect(sv.scrollToBehavior).toBe('smooth');
+    // ⚠️ The per-request behaviour rides `scrollToBehavior`; the AUTHORED `scrollBehavior` is
+    // untouched by a request (#409) — it used to be the field the request was stored on.
+    expect(sv.scrollBehavior).toBe('instant');
     // Cleared immediately: leaving it set would re-issue the same scroll every frame and pin
     // the view in place.
     const en = view.get(UIEntries) as any;

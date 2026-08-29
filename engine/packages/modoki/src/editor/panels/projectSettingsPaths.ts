@@ -39,3 +39,50 @@ export function committedPathWarning(
     + 'dead on every other clone and in a copied-out project. Move the file inside the project '
     + 'folder and pick it again.';
 }
+
+/** Extensions the dialog will try to PREVIEW. Deliberately the same list the backend's
+ *  `/api/source-image` will serve — a value this says is an image and that route refuses would
+ *  show a permanent "cannot preview" under a perfectly good icon. */
+const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|avif|svg)$/i;
+
+/** The path a `path` field should show a thumbnail of, or `null` for a field with nothing to
+ *  show.
+ *
+ *  Keyed off the VALUE's extension rather than a schema flag (owner, 2026-08-29: "every path"),
+ *  so a preview appears wherever one is meaningful without seven fields having to opt in and an
+ *  eighth being forgotten. A field holding a `.jks` or a folder simply never matches, and a field
+ *  holding nothing matches nothing — so the widened rule cannot make a non-image field noisier. */
+export function imagePreviewPath(field: { type: string }, value: unknown): string | null {
+  if (field.type !== 'path') return null;
+  if (typeof value !== 'string') return null;
+  const v = value.trim();
+  return v !== '' && IMAGE_EXT_RE.test(v) ? v : null;
+}
+
+/** Whether a `path` field should accept a drag at all.
+ *
+ *  ⚠️ **A drop is NOT stopped by the thing that makes the rest of this dialog inert.** Both inert
+ *  states are `<fieldset disabled>` — the per-field `disabledIf` wrapper and the whole-form one
+ *  used when `configErrors` says the config file did not parse. That primitive disables form
+ *  CONTROLS natively, which is the whole reason the dialog uses it instead of threading a
+ *  `disabled` prop through twelve `case`s; but a `drop` handler on a plain `<div>` is not a form
+ *  control, so it stays live. The per-field wrapper happens to also set `pointerEvents:'none'` and
+ *  is safe by accident; the whole-form one does not, and a drop there would COPY A FILE INTO THE
+ *  PROJECT and edit a draft the user is explicitly forbidden from saving — a disk write in the one
+ *  state the dialog exists to declare untrustworthy.
+ *
+ *  So `disabled` is read from the field's own input at drop time — via `:disabled`, whichever
+ *  wrapper supplied it — rather than passed down. Same reasoning as that `Field` docblock: derive
+ *  inertness from the ONE native mechanism, so a wrapper nobody has added yet is covered too.
+ *
+ *  ⚠️ The caller must probe with `el.matches(':disabled')`, NOT `el.disabled`. The IDL property
+ *  reflects the element's own content attribute only, and reads `false` for an input disabled by
+ *  an ancestor `<fieldset disabled>` — which is every case in this dialog. This function takes the
+ *  answer as a boolean precisely so that probe has one place to be right; it was written wrong the
+ *  first time and the unit tests could not have caught it. */
+export function shouldAcceptSettingsDrop(disabled: boolean, types: readonly string[]): boolean {
+  if (disabled) return false;
+  // Claim only what this field can consume, so an entity drag over the dialog keeps its own
+  // cursor instead of being promised a drop that does nothing.
+  return types.includes('Files') || types.includes('application/editor-asset');
+}

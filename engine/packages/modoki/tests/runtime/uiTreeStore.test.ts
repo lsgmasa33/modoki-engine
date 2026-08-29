@@ -555,7 +555,7 @@ describe('stampSnapTargets', () => {
   const node = (over: Record<string, unknown> = {}): any =>
     ({ entityId: 1, children: [], ...over });
   const SCROLL = { axis: 'x', snap: 'start', snapStop: 'always', overscroll: 'contain',
-    scrollToX: -1, scrollToY: -1, scrollBehavior: 'instant' };
+    scrollToX: -1, scrollToY: -1, scrollToBehavior: '', scrollBehavior: 'instant' };
 
   it('stamps the ENTRIES, not the engine-owned layers between them', async () => {
     const { stampSnapTargets } = await getModule();

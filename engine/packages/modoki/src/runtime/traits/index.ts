@@ -43,7 +43,7 @@ export { UIFocusable } from './UIFocusable';
 export { UIToggle } from './UIToggle';
 export { UIEntry } from './UIEntry';
 export { UIEntries, type UIEntryPrefab, type UIEntryLengthUnit } from './UIEntries';
-export { UIScrollView, NO_SCROLL_REQUEST, type UIScrollAxis, type UIScrollSnap, type UIScrollSnapStop, type UIScrollOverscroll, type UIScrollBehavior } from './UIScrollView';
+export { UIScrollView, NO_SCROLL_REQUEST, NO_BEHAVIOR_REQUEST, type UIScrollAxis, type UIScrollSnap, type UIScrollSnapStop, type UIScrollOverscroll, type UIScrollBehavior, type UIScrollBehaviorRequest } from './UIScrollView';
 export {
   TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, TOUCH_ATTR, TOUCH_OPACITY_ATTR, UI_ROOT_ATTR,
   type TouchControlAction, type TouchControlShowOn,

@@ -62,6 +62,34 @@ export function Tooltip({ text, children, style }: { text: string; children: Rea
   );
 }
 
+/** The little (i) that carries a field's or row's explanation. A SPAN inside the {@link Tooltip},
+ *  not a `title=` — Electron does not render native title tooltips at all (they are silently
+ *  absent, not merely ugly), so every hover explanation in this editor goes through this component.
+ *
+ *  ⚠️ It lives HERE rather than beside its first caller (QualityTiersEditor) because it is now the
+ *  editor's ONE convention for "explanation behind a hover": #408 moved Project Settings onto it
+ *  after its `help` strings — one of them a ~230-character paragraph — were printed inline beside
+ *  every label. A second copy would let the two drift, and the half that drifts is the one nobody
+ *  is looking at. */
+export function Info({ text }: { text: string }) {
+  return (
+    <Tooltip text={text} style={{ marginLeft: 6, display: 'inline-flex', verticalAlign: 'middle' }}>
+      <span
+        aria-label="details"
+        // A checkbox field renders this INSIDE its <label>, so a click here would toggle the
+        // setting. `cursor:'help'` invites exactly that click, and reaching for an explanation
+        // must not change the thing being explained.
+        onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}
+        style={{
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          width: 14, height: 14, borderRadius: '50%', border: '1px solid #555',
+          color: '#666', fontSize: 9, lineHeight: 1, userSelect: 'none',
+        }}
+      >i</span>
+    </Tooltip>
+  );
+}
+
 /** Placeholder shown for fields whose value differs across a multi-selection. */
 export const MIXED_PLACEHOLDER = '----';
 

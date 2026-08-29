@@ -1118,22 +1118,23 @@ export function registerAllTraits() {
       // measured UI viewport, into three committed scenes. Court authors two scroll views and
       // ships, so the same save would have put one editor's viewport size into a shipping scene.
       //   ⚠️ Known cost, accepted: the device WorldTab derives read-only as
-      // `hint.readOnly || hint.runtimeOnly` and does not filter `hidden`, so the four scrollTo*
+      // `hint.readOnly || hint.runtimeOnly` and does not filter `hidden`, so the scrollTo*
       // REQUEST fields below can no longer be poked by hand in the on-device overlay. They are
       // game-written requests, not measurements, so that surface was a real (if narrow) way to
       // drive a scroll. It is not the only one — the `ui.scrollTo` action does the same job and is
       // reachable from `device_dispatch_action` (games/scroll-demo authors two buttons on it) —
       // and keeping a pending request off disk is worth more than the poke.
-      //   ⚠️ But that workaround DIRTIES THE SCENE, and this is not the field to fix it on:
-      // `scrollApi.scrollToEntry` persists the per-request behaviour onto the AUTHORED
-      // `scrollBehavior` above (`runtime/ui/scrollApi.ts`), so one 'smooth' request overwrites the
-      // author's default for good and the next save writes it out. Flagging `scrollBehavior`
-      // cannot fix that — it is genuinely authored — so the request needs its own field. Tracked
-      // separately as #409; `check-scene-churn.mjs` reports it as GAINED in the meantime.
+      //   ⚠️ `scrollToBehavior` is the per-request half of the motion decision and belongs in THIS
+      // list; the authored `scrollBehavior` above must never be flagged. They were one field until
+      // #409, so a request with no `behavior` defaulted to 'instant', overwrote an author's
+      // 'smooth' for good, and the next save wrote the overwrite out as authored data. Flagging
+      // the authored field could not fix that — it would have deleted the author's choice
+      // instead — which is why the request got a field of its own.
       scrollX: { type: 'number', hidden: true, runtimeOnly: true }, scrollY: { type: 'number', hidden: true, runtimeOnly: true },
       viewportWidth: { type: 'number', hidden: true, runtimeOnly: true }, viewportHeight: { type: 'number', hidden: true, runtimeOnly: true },
       contentWidth: { type: 'number', hidden: true, runtimeOnly: true }, contentHeight: { type: 'number', hidden: true, runtimeOnly: true },
       scrollToX: { type: 'number', hidden: true, runtimeOnly: true }, scrollToY: { type: 'number', hidden: true, runtimeOnly: true },
+      scrollToBehavior: { type: 'enum', options: ['', 'instant', 'smooth'], hidden: true, runtimeOnly: true },
     },
   });
 

@@ -106,9 +106,20 @@ export const UIScrollView = trait({
    *  disagree with the value. The renderer scrolls, then writes -1 back. */
   scrollToX: -1,
   scrollToY: -1,
-  /** How a `scrollTo*` request moves. 'smooth' hands off to the browser, whose duration is
-   *  UA-defined and NOT tunable — that is a property of the CSS backend, and the reason no
-   *  `duration`/`easing` fields exist yet. */
+  /** Per-request motion override. `''` means "no override" — the request then moves the way the
+   *  AUTHORED `scrollBehavior` below says. Cleared alongside the `scrollToX/Y` sentinels.
+   *
+   *  ⚠️ This field exists because the request used to be stored on `scrollBehavior` itself
+   *  (#409). One `scrollToEntry` with no `behavior` defaulted to `'instant'` and overwrote an
+   *  authored `'smooth'` for good, and the next save wrote that overwrite out as authored data —
+   *  a transient parameter living on a persistent field. Two roles, two fields: **never write a
+   *  request onto `scrollBehavior`.** */
+  scrollToBehavior: '' as UIScrollBehaviorRequest,
+
+  // ── Authored again (it sits here so the field order committed scenes already carry is kept) ──
+  /** How a `scrollTo*` request moves when the request itself names no behaviour. 'smooth' hands
+   *  off to the browser, whose duration is UA-defined and NOT tunable — that is a property of the
+   *  CSS backend, and the reason no `duration`/`easing` fields exist yet. */
   scrollBehavior: 'instant' as UIScrollBehavior,
 });
 
@@ -119,6 +130,12 @@ export type UIScrollSnapStop = 'normal' | 'always';
 export type UIScrollOverscroll = 'auto' | 'contain' | 'none';
 export type UIScrollScrollbar = 'auto' | 'hidden';
 export type UIScrollBehavior = 'instant' | 'smooth';
+/** A per-request behaviour, or `''` for "fall back to the authored `scrollBehavior`". */
+export type UIScrollBehaviorRequest = UIScrollBehavior | '';
 
 /** Sentinel for "no scroll request pending" on `scrollToX`/`scrollToY`. */
 export const NO_SCROLL_REQUEST = -1;
+
+/** Sentinel for "this request names no behaviour" on `scrollToBehavior` — the authored
+ *  `scrollBehavior` is then what moves the view. */
+export const NO_BEHAVIOR_REQUEST = '';

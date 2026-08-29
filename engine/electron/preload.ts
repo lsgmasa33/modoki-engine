@@ -10,7 +10,7 @@
  *      response, scene-changed / manifest-updated notifications).
  */
 
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 
 // Renderer → main request/response channels the editor may `invoke`. Whitelisted so
 // the bridge never exposes arbitrary ipcRenderer.invoke to the renderer. These back
@@ -41,6 +41,23 @@ contextBridge.exposeInMainWorld('__modokiElectron', {
     electron: process.versions.electron,
     chrome: process.versions.chrome,
     node: process.versions.node,
+  },
+  /** The absolute path of a file the user DROPPED (or picked), or '' when Chromium has no path
+   *  for it. `File.path` carried this until Electron 32 removed it, and `webUtils` is the
+   *  sanctioned replacement — it is preload-only, so there is no way to read it from the
+   *  renderer without a bridge like this one.
+   *
+   *  It reads like a convenience and is not: without it a drop hands the renderer bytes and a
+   *  filename only, and "is this file already inside the project?" — the question that decides
+   *  whether Project Settings COPIES a dropped image or just references it (owner, 2026-08-29) —
+   *  becomes unanswerable. A browser-hosted editor has no preload and gets '' here, so every
+   *  caller must still handle the no-path case rather than treating this as guaranteed. */
+  getPathForFile: (file: File): string => {
+    try {
+      return webUtils.getPathForFile(file);
+    } catch {
+      return '';
+    }
   },
   /** Renderer → main request/response for the whitelisted channels above. */
   invoke: (channel: string, payload?: unknown): Promise<unknown> =>

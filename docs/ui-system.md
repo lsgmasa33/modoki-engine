@@ -841,6 +841,16 @@ coordinates (the system converts, since it is what resolves entry size); the dec
 `games/scroll-demo`'s strip scene — two authored buttons, one `instant` and one `smooth` — and,
 since #316, by Court's level-selector arrows, which is the first caller in a SHIPPING game.
 
+⚠️ **The per-request `behavior` and the authored default are TWO fields, and must stay two**
+(#409). `UIScrollView.scrollBehavior` is authored; the request rides the `runtimeOnly`
+`scrollToBehavior` and is consumed with the rest of the request by `clearScrollRequest`.
+`scrollToEntry` used to store the request ON the authored field, so a call that named no
+`behavior` — which defaulted to `'instant'` — permanently destroyed an author's `'smooth'`, and
+the next save wrote the overwrite into the scene as authored data. Marking the field `runtimeOnly`
+could not fix that; it would have deleted the author's choice instead. Consequence at the call
+site: **omitting `behavior` is not the same as passing `'instant'`** — the request then moves the
+way the view was authored to move.
+
 ⚠️ **OMIT the axis the view does not scroll — `0` is a REAL request, not "no request".** The
 sentinel is `-1`. Court asked for `{x: page, y: 0}` on an `axis: 'x'` view; that converted to
 `scrollToY: 0`, and because `clearScrollRequest` used to clear only the VIEW's axis it could never

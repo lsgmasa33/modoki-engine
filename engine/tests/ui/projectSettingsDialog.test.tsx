@@ -41,7 +41,10 @@ vi.mock('../../packages/modoki/src/editor/createEditor', () => {
           fields: [
             { key: 'app.appId', label: 'Bundle ID', type: 'text' },
             { key: 'app.appName', label: 'App name', type: 'text' },
-            { key: 'build.debugBuild', label: 'Debug build', type: 'checkbox' },
+            { key: 'build.debugBuild', label: 'Debug build', type: 'checkbox', help: 'ships the debug bridge' },
+            // A `path` field, for the drop test below. Its value has NO image extension on
+            // purpose, so no preview fetch fires and the other tests here are untouched.
+            { key: 'app.iconSource', label: 'App icon', type: 'path', pathMode: 'file' },
           ],
         }],
       },
@@ -55,13 +58,21 @@ vi.mock('../../packages/modoki/src/editor/createEditor', () => {
   return { getProjectSettings: () => schema };
 });
 
+const backendPostJson = vi.fn(async () => new Response(JSON.stringify({ path: 'art/dropped.png', copied: true }), { status: 200 }));
+vi.mock('../../packages/modoki/src/editor/backend/editorBackend', () => ({
+  backendPostJson: (...args: unknown[]) => backendPostJson(...(args as [])),
+  // Never reached: the path field's value carries no image extension, so no preview is requested.
+  backendFetch: async () => new Response('{}', { status: 404 }),
+  backendUrl: (p: string) => p,
+}));
+
 import ProjectSettingsDialog from '../../packages/modoki/src/editor/panels/ProjectSettingsDialog';
 
-const HEALTHY = { app: { appId: 'com.modokiengine.sling', appName: 'Sling' }, build: { debugBuild: false } };
+const HEALTHY = { app: { appId: 'com.modokiengine.sling', appName: 'Sling', iconSource: 'art/icon' }, build: { debugBuild: false } };
 /** What GET returns when the file exists but does not parse: the ENGINE DEFAULTS, plus
  *  the marker saying so. The identity here is the real measured one from #26. */
 const MALFORMED = {
-  app: { appId: 'com.modokiengine.prototype', appName: 'Puzzle Prototype' },
+  app: { appId: 'com.modokiengine.prototype', appName: 'Puzzle Prototype', iconSource: 'art/icon' },
   build: { debugBuild: false },
   configErrors: [{ file: 'project.config.json', message: 'project.config.json exists but is not valid JSON (SyntaxError: …).' }],
 };
@@ -208,5 +219,81 @@ describe('ProjectSettingsDialog — an unrecognised config VALUE (#25 follow-up)
     const { findByDisplayValue, queryByTestId } = render(<ProjectSettingsDialog />);
     await findByDisplayValue('Sling');
     expect(queryByTestId('config-warnings')).toBeNull();
+  });
+});
+
+/** A drop on a `path` field, which `<fieldset disabled>` does NOT stop by itself.
+ *
+ *  That primitive disables form CONTROLS; a `drop` handler lives on a plain `<div>` and is not
+ *  one. The per-field `disabledIf` wrapper also sets `pointerEvents:'none'` and is safe by
+ *  accident — the whole-form wrapper above does not, so this is the state where a drop would COPY
+ *  A FILE INTO THE PROJECT and edit a draft that Apply is disabled for.
+ *
+ *  This has to be a MOUNT, not a unit test of the decision function: the defect the guard exists
+ *  for was entirely at the CALL SITE. It was first written as `inputRef.current?.disabled`, which
+ *  is always `false` for an input disabled by an ancestor fieldset (the same trap this file's
+ *  header docblock already recorded), and every unit test of the decision passed regardless. */
+describe('ProjectSettingsDialog — a path field as a drop target', () => {
+  // jsdom implements no DataTransfer, so this is the shape the handler actually reads: `types`
+  // to decide, `getData` for the Assets-panel payload, `files` for an OS drag.
+  const fileDrag = () => ({
+    types: ['Files'],
+    files: [new File(['x'], 'dropped.png', { type: 'image/png' })],
+    getData: () => '',
+    dropEffect: 'none',
+  });
+  const dropZone = (container: HTMLElement) =>
+    container.querySelector('[data-ui-id="projectSettings.app.iconSource"]')!.closest('div')!.parentElement!;
+
+  it('accepts a file drag when the form is healthy, and the drop reaches the backend', async () => {
+    load = async () => structuredClone(HEALTHY);
+    const { container, findByDisplayValue } = render(<ProjectSettingsDialog />);
+    await findByDisplayValue('com.modokiengine.sling');
+    const over = new Event('dragover', { bubbles: true, cancelable: true });
+    Object.defineProperty(over, 'dataTransfer', { value: fileDrag() });
+    fireEvent(dropZone(container), over);
+    // Claiming the drag is the visible half — it is what promises the user a drop.
+    expect(over.defaultPrevented).toBe(true);
+
+    // And the POSITIVE half. Without it the pair is satisfied by a component that refuses every
+    // drop: `return;` as the first line of onDrop keeps the refusal test green, so the accept
+    // test is the only thing that can tell "guarded" from "broken".
+    const drop = new Event('drop', { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, 'dataTransfer', { value: fileDrag() });
+    fireEvent(dropZone(container), drop);
+    await waitFor(() => expect(backendPostJson).toHaveBeenCalled());
+  });
+
+  it('the (i) does not toggle the checkbox it explains', async () => {
+    // A checkbox field renders `Info` INSIDE its <label>, and `cursor:'help'` invites the click.
+    // Reaching for an explanation must not change the setting being explained.
+    load = async () => structuredClone(HEALTHY);
+    const { container, findByDisplayValue } = render(<ProjectSettingsDialog />);
+    await findByDisplayValue('com.modokiengine.sling');
+    const box = container.querySelector('input[type=checkbox]') as HTMLInputElement;
+    const info = container.querySelector('[aria-label="details"]') as HTMLElement;
+    expect(info, 'no (i) rendered — the checkbox field needs a `help` string for this to mean anything').not.toBeNull();
+    expect(box.checked).toBe(false);
+    fireEvent.click(info);
+    expect(box.checked).toBe(false);
+  });
+
+  it('REFUSES the same drag while the form is inert, so nothing is copied into the project', async () => {
+    load = async () => structuredClone(MALFORMED);
+    const { container, findByDisplayValue } = render(<ProjectSettingsDialog />);
+    const icon = await findByDisplayValue('art/icon');
+    expect(icon.matches(':disabled')).toBe(true);
+
+    const over = new Event('dragover', { bubbles: true, cancelable: true });
+    Object.defineProperty(over, 'dataTransfer', { value: fileDrag() });
+    fireEvent(dropZone(container), over);
+    expect(over.defaultPrevented).toBe(false);
+
+    const drop = new Event('drop', { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, 'dataTransfer', { value: fileDrag() });
+    fireEvent(dropZone(container), drop);
+    await waitFor(() => expect(backendPostJson).not.toHaveBeenCalled());
+    // The write is the damage; the unchanged field is only the symptom.
+    expect((icon as HTMLInputElement).value).toBe('art/icon');
   });
 });

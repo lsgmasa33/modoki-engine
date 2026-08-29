@@ -457,8 +457,8 @@ describe('serializeScene — runtimeOnly fields never reach the file', () => {
       return Object.keys(fields).filter((f) => fields[f]?.runtimeOnly).sort();
     };
     expect(flaggedSet('UIScrollView')).toEqual(
-      ['contentHeight', 'contentWidth', 'scrollToX', 'scrollToY', 'scrollX', 'scrollY',
-        'viewportHeight', 'viewportWidth'].sort(),
+      ['contentHeight', 'contentWidth', 'scrollToBehavior', 'scrollToX', 'scrollToY',
+        'scrollX', 'scrollY', 'viewportHeight', 'viewportWidth'].sort(),
     );
     expect(flaggedSet('UIEntries')).toEqual(
       ['epoch', 'firstX', 'firstY', 'poolSize', 'scrollToEntryX', 'scrollToEntryY',
@@ -472,6 +472,11 @@ describe('serializeScene — runtimeOnly fields never reach the file', () => {
     // scene is where the value comes from at load. Flagging them would delete authored data.
     expect(flaggedSet('UIEntries')).not.toContain('countX');
     expect(flaggedSet('UIEntries')).not.toContain('countY');
+    // `scrollBehavior` is the AUTHORED motion default and must stay off the flagged list, however
+    // much it looks like a sibling of the `scrollToBehavior` above it (#409). Flagging it would
+    // delete the author's choice on the next save — the reason the per-request half is a separate
+    // field at all.
+    expect(flaggedSet('UIScrollView')).not.toContain('scrollBehavior');
   });
 
   /** The test above pins WHICH fields are flagged. This one pins that the flag WORKS, asking the

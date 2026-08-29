@@ -12,10 +12,14 @@
  *  over 86 frames. There is deliberately no `duration`/`easing`: smooth duration is UA-defined
  *  and untunable, and an authored field that moves nothing is a lie with a tooltip. The owned
  *  backend that would have made them tunable is DECLINED — see UIScrollView's banner.
+ *
+ *  OMITTING `behavior` is not the same as passing `'instant'`: the request then moves the way the
+ *  view's AUTHORED `UIScrollView.scrollBehavior` says. That default used to be overwritten by
+ *  every request (#409) — see `scrollToEntry`'s ⚠️.
  */
 import { getTraitByName } from '../core/ecs/traitRegistry';
 import { getCurrentWorld, findEntityByGuid } from '../core/ecs/world';
-import type { UIScrollBehavior } from '../traits/UIScrollView';
+import { NO_BEHAVIOR_REQUEST, type UIScrollBehavior } from '../traits/UIScrollView';
 
 /** Sentinel shared with the trait defaults: "no request pending". */
 export const NO_ENTRY_REQUEST = -1;
@@ -50,9 +54,14 @@ export function scrollToEntry(
     scrollToEntryX: Number.isFinite(at.x) ? Math.max(0, Math.floor(at.x as number)) : NO_ENTRY_REQUEST,
     scrollToEntryY: Number.isFinite(at.y) ? Math.max(0, Math.floor(at.y as number)) : NO_ENTRY_REQUEST,
   });
+  // ⚠️ The per-request behaviour goes on `scrollToBehavior`, NEVER on the authored
+  // `scrollBehavior` (#409). Storing it there meant one request with no `behavior` — which
+  // defaulted to `'instant'` — permanently overwrote an author's `'smooth'`, and the next save
+  // baked the overwrite into the scene as authored data. `''` clears any previous override, so a
+  // request that names no behaviour moves the way the AUTHOR said it should.
   const sv = v.entity.get(v.svMeta.trait) as Record<string, unknown>;
-  const behavior = opts.behavior ?? 'instant';
-  if (sv.scrollBehavior !== behavior) v.entity.set(v.svMeta.trait, { ...sv, scrollBehavior: behavior });
+  const behavior = opts.behavior ?? NO_BEHAVIOR_REQUEST;
+  if (sv.scrollToBehavior !== behavior) v.entity.set(v.svMeta.trait, { ...sv, scrollToBehavior: behavior });
   return true;
 }
 

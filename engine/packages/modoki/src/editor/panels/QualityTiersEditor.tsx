@@ -26,7 +26,7 @@
  *  `qualityTiersModel.ts` and are unit-tested there; this file only renders them. */
 
 import React from 'react';
-import { Tooltip, BufferedNumberInput } from './fields';
+import { Info, BufferedNumberInput } from './fields';
 import {
   type TierRenderOverrides,
   type PostFXEffect,
@@ -84,24 +84,6 @@ const addBtn: React.CSSProperties = {
   color: '#999', cursor: 'pointer', fontFamily: 'monospace', fontSize: 11,
   textTransform: 'none', letterSpacing: 0, width: '100%',
 };
-
-/** The little (i) that carries a row's measurement. A SPAN inside the Tooltip, not a `title=` —
- *  Electron does not render native title tooltips at all (they are silently absent, not merely
- *  ugly), so every hover explanation in this editor goes through this component. */
-function Info({ text }: { text: string }) {
-  return (
-    <Tooltip text={text} style={{ marginLeft: 6, display: 'inline-flex', verticalAlign: 'middle' }}>
-      <span
-        aria-label="details"
-        style={{
-          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-          width: 14, height: 14, borderRadius: '50%', border: '1px solid #555',
-          color: '#666', fontSize: 9, lineHeight: 1, userSelect: 'none',
-        }}
-      >i</span>
-    </Tooltip>
-  );
-}
 
 /** One cell of a TIER column. `undefined` cfg means the tier is not authored — the cell is inert
  *  rather than absent, so the row keeps its shape and a setting never appears to move between
