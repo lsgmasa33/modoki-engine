@@ -887,6 +887,20 @@ rebuild and is never per-frame.
   `entity.set`, bypassing the `markUIDirty` hook, so a scroll frame that does not move the window
   costs one field write. Routing it through a dirtying helper rebuilds the whole tree at fling
   frequency.
+- **The editor mounts `UIRenderer` TWICE, and the measurement is keyed by GUID (#413).** One in
+  the Game panel, one in SceneView's UI preview — two real React trees over one ECS world, so a
+  scroll view has two DOM elements, two `ResizeObserver`s, and ONE `UIScrollView` slot to write.
+  The element inside a hidden dock tab measures 0x0, and with `entryWidth` authored in `%` a zero
+  viewport makes every entry zero-wide, the window empty and the pool zero-slot — a blank view
+  with **every diagnostic silent**, because the prefab is cached and the source is registered.
+  Court's calendar and level selector both sat blank on this. `push()` therefore refuses to record
+  a measurement from an element that generates no box (`readScrollMeasurement`): a zero-extent view
+  can display no entries either way, so declining costs nothing, while accepting it destroys the
+  only good measurement. ⚠️ The device-size gap this used to warn about can't actually happen —
+  SceneView sizes its preview from GameView's own size, so both mounts share one logical device
+  size by construction; the residual hazard is a MIXED measurement instead — a real viewport from
+  one mount paired with `scrollX: 0` from the other while the two trees disagree on scroll offset,
+  which can still land the pool's window outside the visible band and blank the view.
 - **A parked entry reads as DESTROYED to Percept and Enact** — not listed, not aimable, subtree
   included. This is NOT the same as `isVisible: false`, which stays addressable.
 - **Every pooled instance shares the prefab's authored `sortOrder`**, so ties fall to koota

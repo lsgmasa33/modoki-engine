@@ -28,7 +28,7 @@ import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
 import { UI_PAINT_ATTR } from './uiPaintMarker';
-import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo } from './scrollViewDom';
+import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo, readScrollMeasurement } from './scrollViewDom';
 import { scrollByEntry } from './scrollApi';
 import { driveEntriesFromScroll } from './entriesSystem';
 
@@ -897,11 +897,11 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
     const el = ref.current;
     if (!el || !scroll || !guid) return;
     const push = () => {
-      const changed = writeScrollState(guid, {
-        scrollX: Math.round(el.scrollLeft), scrollY: Math.round(el.scrollTop),
-        viewportWidth: el.clientWidth, viewportHeight: el.clientHeight,
-        contentWidth: el.scrollWidth, contentHeight: el.scrollHeight,
-      });
+      // #413: an element with no box (a hidden editor dock tab) must not overwrite the other
+      // mount's real measurement — see `readScrollMeasurement`.
+      const measured = readScrollMeasurement(el);
+      if (!measured) return;
+      const changed = writeScrollState(guid, measured);
       // Re-drive the pool NOW, in the same frame the browser is painting this offset in — a
       // `scroll` event lands before rAF, so the projection still picks it up this frame. Waiting
       // for the next pipeline tick costs a frame, and that frame is what makes a fast scroll go

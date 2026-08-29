@@ -22,7 +22,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (n: string) => (n === 'UIScrollView' ? { name: n, trait: UIScrollView } : undefined),
 }));
 
-import { scrollViewStyle, scrollSnapChildStyle, pendingScrollTo, clearScrollRequest, type ScrollViewNodeData } from '../../src/runtime/ui/scrollViewDom';
+import { scrollViewStyle, scrollSnapChildStyle, pendingScrollTo, clearScrollRequest, readScrollMeasurement, type ScrollViewNodeData } from '../../src/runtime/ui/scrollViewDom';
 
 const base = (over: Partial<ScrollViewNodeData> = {}): ScrollViewNodeData => ({
   axis: 'y', snap: 'none', snapStop: 'normal', overscroll: 'auto', scrollbar: 'auto',
@@ -107,6 +107,42 @@ describe('pendingScrollTo', () => {
     // meaning anything.
     expect(pendingScrollTo(base({ scrollToY: 1, scrollBehavior: 'smooth', scrollToBehavior: '' }))!.behavior)
       .toBe('smooth');
+  });
+});
+
+describe('readScrollMeasurement (#413)', () => {
+  it('is null for a 0×0 source — the hidden-tab case', () => {
+    expect(readScrollMeasurement({
+      clientWidth: 0, clientHeight: 0, scrollLeft: 0, scrollTop: 0, scrollWidth: 0, scrollHeight: 0,
+    })).toBeNull();
+  });
+
+  it('returns exactly the six measured fields for a real box, with scrollX ROUNDED', () => {
+    expect(readScrollMeasurement({
+      clientWidth: 434, clientHeight: 393, scrollLeft: 87.4, scrollTop: 0, scrollWidth: 2170, scrollHeight: 393,
+    })).toEqual({
+      scrollX: 87, scrollY: 0, viewportWidth: 434, viewportHeight: 393, contentWidth: 2170, contentHeight: 393,
+    });
+  });
+
+  it('is non-null when only ONE dimension is nonzero — a genuinely one-dimensional box is still a real measurement, so the check is deliberately OR, not AND', () => {
+    expect(readScrollMeasurement({
+      clientWidth: 434, clientHeight: 0, scrollLeft: 0, scrollTop: 0, scrollWidth: 434, scrollHeight: 0,
+    })).not.toBeNull();
+    expect(readScrollMeasurement({
+      clientWidth: 0, clientHeight: 393, scrollLeft: 0, scrollTop: 0, scrollWidth: 0, scrollHeight: 393,
+    })).not.toBeNull();
+  });
+
+  it('is null for negative or NaN dimensions', () => {
+    // `NaN > 0` is already false, so this should hold without special-casing — pinned here so a
+    // future rewrite to `!== 0` (which WOULD read NaN as measurable) fails this test.
+    expect(readScrollMeasurement({
+      clientWidth: NaN, clientHeight: NaN, scrollLeft: 0, scrollTop: 0, scrollWidth: 0, scrollHeight: 0,
+    })).toBeNull();
+    expect(readScrollMeasurement({
+      clientWidth: -1, clientHeight: -1, scrollLeft: 0, scrollTop: 0, scrollWidth: 0, scrollHeight: 0,
+    })).toBeNull();
   });
 });
 

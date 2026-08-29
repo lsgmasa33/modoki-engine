@@ -143,6 +143,64 @@ export function clearScrollRequest(guid: string, appliedBehavior?: string): void
   markUIDirty();
 }
 
+/** Structural shape of the DOM properties `readScrollMeasurement` reads — not `HTMLElement`, so a
+ *  plain object can stand in for the element in a test with no DOM. */
+export interface ScrollMeasurementSource {
+  clientWidth: number; clientHeight: number;
+  scrollLeft: number; scrollTop: number;
+  scrollWidth: number; scrollHeight: number;
+}
+
+/** ⚠️ **Refuse to RECORD a measurement from an element that generates no box (#413).** The trait
+ *  holds ONE measurement, keyed by guid, but the editor mounts `UIRenderer` TWICE — once in
+ *  GameView, once in SceneView's UI-mode preview — so one entity has two DOM elements and two
+ *  ResizeObservers writing the same slot. `UIRenderer` already knows this: `consumePendingActivation`
+ *  is idempotent "so two mounted UIRenderers activate once" — the scroll measurement never got that
+ *  treatment.
+ *
+ *  The element sitting inside a hidden editor dock tab measures 0×0 and overwrote the visible one's
+ *  real 434. With `entryWidth` authored in `%`, a zero viewport makes every entry zero-wide, the
+ *  window empty and the pool zero-slot — so the view renders blank while the prefab is cached and
+ *  the source registered, i.e. with every existing diagnostic silent.
+ *
+ *  A zero-extent view can display no entries either way, so declining the write costs nothing; the
+ *  cost of ACCEPTING it is losing the only good measurement. Returns `null` (rather than a partial
+ *  measurement) when the element generates no box, so the caller has one thing to check.
+ *
+ *  Two facts replace the old "known limitation" paragraph, which was both wrong and incomplete:
+ *
+ *  - The "both trees visible at different DEVICE sizes" case that paragraph warned about **cannot
+ *    occur**: `SceneView.tsx:2323` sizes its preview frame from `gameViewSize`, which only
+ *    GameView's effects write (`engine/app/editor/agentEditorOps.ts:142`). Both mounts render the
+ *    same logical device size by construction — a measured 434 vs 435 is scrollbar/rounding, not a
+ *    device gap.
+ *  - The residual hazard is a **MIXED** measurement, not two viewports, and it is pre-existing
+ *    rather than introduced here: the returned object also carries `scrollX`/`scrollY` from
+ *    whichever element fired it. With both trees visible, the SceneView mount sits at
+ *    `scrollLeft: 0` while the player has scrolled GameView to page N; any resize on the SceneView
+ *    side (a device-preset change, a splitter drag) fires its RO, now passes this guard, and writes
+ *    `scrollX: 0` beside a real viewport — so `driveEntriesFromScroll` re-plans the window at page 0
+ *    while the GameView DOM is still at page N. Far enough out, that lands outside the pooled band
+ *    and the view IS blank. Scoping the measurement to one owning tree is the real fix; this guard
+ *    does not attempt it.
+ *
+ *  Caveat: jsdom reports `clientWidth: 0` for everything, so a future jsdom test of the entries DOM
+ *  path records no viewport at all — assert against `readScrollMeasurement` directly rather than
+ *  through a mounted node.
+ */
+export function readScrollMeasurement(el: ScrollMeasurementSource): {
+  scrollX: number; scrollY: number;
+  viewportWidth: number; viewportHeight: number;
+  contentWidth: number; contentHeight: number;
+} | null {
+  if (!(el.clientWidth > 0) && !(el.clientHeight > 0)) return null;
+  return {
+    scrollX: Math.round(el.scrollLeft), scrollY: Math.round(el.scrollTop),
+    viewportWidth: el.clientWidth, viewportHeight: el.clientHeight,
+    contentWidth: el.scrollWidth, contentHeight: el.scrollHeight,
+  };
+}
+
 /** What a pending request means for `Element.scrollTo`, or null when nothing is pending.
  *  Pure, so the request semantics (the -1 sentinel, per-axis independence) are unit-testable
  *  without a DOM. */
