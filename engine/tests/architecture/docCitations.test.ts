@@ -152,6 +152,39 @@ function isNonCitingSource(relFile: string): boolean {
  *  site, where `docs/guide/*.md` really lives at `site/docs/guide/*.md`. */
 const DOC_ROOTS = ['', 'site'];
 
+/** Roots a `docs/…` path cited BY `relFile` may resolve under.
+ *
+ *  A PROJECT may carry its OWN `docs/` folder — `games/wordweave/docs/feel.md` — and its
+ *  `CLAUDE.md` cites it project-relatively as `docs/feel.md`, exactly as that file writes every
+ *  other path. Resolving only against the repo root would make every correct link into a project's
+ *  own docs an offender, since the literal substring `docs/feel.md` is unavoidable in a working
+ *  relative link. This is the same project-relative rule `rootsFor` applies to source paths.
+ *
+ *  Siblings are deliberately excluded, for `rootsFor`'s reason: most projects would come to have a
+ *  `docs/feel.md`, so allowing them would let one project cite a doc only another has and still
+ *  pass — green on the exact mistake the rule exists to catch.
+ *
+ *  ⚠️ KNOWN BLIND SPOT, measured and deliberately accepted. This is a UNION, so a citation passes
+ *  if the name resolves under EITHER root — and a project doc whose name collides with a repo-root
+ *  one (`architecture.md`, `build.md`, `rendering.md`, `save.md`) is therefore satisfied by the
+ *  root twin even when the project's own file is gone. Verified: deleting
+ *  `games/wordweave/docs/architecture.md` leaves this rule GREEN, while deleting `docs/feel.md`
+ *  (no root twin) fails it correctly.
+ *
+ *  Both stricter rules were tried and both are WRONG, which is why the union stands. Ordering the
+ *  roots fixes nothing — `.some()` asks "does this exist anywhere", so which root answers first is
+ *  invisible to a boolean. Resolving a project's citations against the project ALONE breaks real,
+ *  correct ones: `games/wordweave/runtime/screen.ts` cites the engine's `docs/editor.md`, and a
+ *  path relative to `runtime/` cannot express a repo-root doc readably.
+ *
+ *  So the collision case is covered where it can be — by the PROJECT, in its own test, asserting
+ *  the docs its `CLAUDE.md` points at exist (see `games/wordweave/tests/docs.test.ts`). A guard
+ *  that cannot tell two identical strings apart is the wrong place to fix an ambiguity in them. */
+function docRootsFor(relFile: string): string[] {
+  const m = /^((?:games|demos)\/[^/]+)\//.exec(relFile);
+  return m ? [...DOC_ROOTS, m[1]] : DOC_ROOTS;
+}
+
 /** True only where the FULL `docs/` tree is present.
  *
  *  The OSS snapshot trims docs as well as games: `docs/plans/`, `docs/reviews/`, and the three
@@ -192,10 +225,41 @@ describe('cited doc paths resolve (#194)', () => {
       if (exempt.has(relFile) || isNonCitingSource(relFile)) continue;
       const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
       lines.forEach((line, i) => {
-        for (const m of line.match(/docs\/[A-Za-z0-9._/-]+\.md/g) ?? []) {
-          const cited = m.replace(/[.,)]+$/, '');
+        // The match keeps any PREFIX the citation carries, because a `docs/…` tail can be the end
+        // of a longer, perfectly good relative path — `docs/projects.md` cites
+        // `../games/wordweave/docs/feel.md`, and reading only the `docs/feel.md` tail out of it
+        // asks whether a file exists at the repo root that was never claimed to be there.
+        for (const m of line.match(/(?:[A-Za-z0-9._-]+\/)*docs\/[A-Za-z0-9._/-]+\.md/g) ?? []) {
+          const full = m.replace(/[.,)]+$/, '');
+          const cited = full.slice(full.indexOf('docs/'));
           if (historical.has(cited)) continue;
-          if (DOC_ROOTS.some((r) => exists(r ? `${r}/${cited}` : cited))) continue;
+          // A prefixed citation is relative to the CITING file's own directory. `path.relative`
+          // back to a repo-relative path so `exists` (which is repo-root-anchored) can answer.
+          if (full !== cited) {
+            const resolved = path.relative(
+              repoRoot, path.resolve(path.dirname(path.join(repoRoot, relFile)), full),
+            );
+            const ok = !resolved.startsWith('..') && exists(resolved);
+            // ⚠️ An EXPLICITLY relative citation (`./` or `../`) is judged only by that
+            // resolution — it names a path, and a path that does not exist is wrong however many
+            // other files share its tail. Falling through to the root union here was the whole
+            // defect this branch was added to fix, restored one line later: a bogus
+            // `../games/wordweave/docs/rendering.md` in `docs/projects.md` passed, satisfied by
+            // the repo-root `docs/rendering.md` twin. Unlike the documented bare-name blind spot
+            // below, nothing about this case is ambiguous.
+            //
+            // A NON-relative prefix keeps the fallback: `docs/multi-ai-cli-support.md` writes
+            // `site/docs/guide/ai-assistants.md` repo-anchored, which resolves under a root rather
+            // than beside the citing file.
+            if (/^\.\.?\//.test(full)) {
+              if (ok) continue;
+              if (!offenders.has(full)) offenders.set(full, new Set());
+              offenders.get(full)!.add(`${relFile}:${i + 1}`);
+              continue;
+            }
+            if (ok) continue;
+          }
+          if (docRootsFor(relFile).some((r) => exists(r ? `${r}/${cited}` : cited))) continue;
           if (!offenders.has(cited)) offenders.set(cited, new Set());
           offenders.get(cited)!.add(`${relFile}:${i + 1}`);
         }
@@ -302,6 +366,7 @@ function citingMarkdownFiles(): string[] {
     if (!r.endsWith('.md')) return false;
     if (isNonCitingSource(r)) return false;
     if (r.startsWith('docs/')) return true;
+    if (/^(?:games|demos)\/[^/]+\/docs\//.test(r)) return true;
     return r === 'CLAUDE.md' || r.endsWith('/CLAUDE.md') || r === 'AGENTS.md' || r.endsWith('/AGENTS.md');
   });
 }

@@ -78,7 +78,21 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   else in-memory (SSR / private-mode). Each backend maps one logical key to one atomic
   single-entry write.
 - **Namespacing.** Every key is stored under `mk:<namespace>:<logical>` — the app uses the
-  `gameId`, so two games on the same device/browser can't collide.
+  `gameId`, so two games on the same device/browser can't collide. **That guarantee has two parts,
+  and only one is closed.** `init()` is `async`: it captures the prefix, awaits
+  `backend.getAll(prefix)`, then hydrates. Unserialized, a second `init()` could swap the namespace
+  and clear the cache inside that await, and the first call's continuation then poured its rows into
+  the second call's cache — g2's saved data readable *and re-writable* under g3's namespace, since
+  `set()` marks the key dirty and `fullKey()` uses the *current* prefix. **The init-vs-init path is
+  fixed (#428):** `init()` queues on its own promise chain (mirroring the write pipeline below), so
+  an overlapped call is **queued, never superseded and never rejected**, and no two `init()` bodies
+  interleave. Queuing rather than bailing is what keeps `discardedPending` meaningful — the second
+  call runs a *real* swap from the first's finished state instead of reporting `[]` because the
+  first already cleared `dirty`. **The write-side path is still open (#438):** `namespace` is
+  assigned and `cache`/`dirty` cleared *before* the `getAll` await, so a synchronous `set()`/`del()`
+  from an outgoing game's in-flight callback — e.g. an async auth/sync handler that resolves during
+  the swap — lands in the *incoming* namespace's cache for that entire round-trip, with no second
+  `init()` call needed to reach it.
 - **Envelope.** Each value persists as `{ v: SCHEMA_VERSION, d: <document> }`. The version
   guards the on-disk format (not the game's data shape) so a future migration is possible; a
   corrupt/unparseable entry fails soft to `undefined`, never a throw.

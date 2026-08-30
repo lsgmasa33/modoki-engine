@@ -73,6 +73,11 @@ const dirty = new Set<string>();
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 /** Serializes all backend writes so `flush()` can await a stable point. */
 let writeChain: Promise<void> = Promise.resolve();
+/** Serializes `init()` calls — see `init()`'s doc comment for why an overlapped call is
+ *  queued rather than raced or superseded. Mirrors `writeChain`'s shape: each `.then()`
+ *  callback attached here must itself never reject (see `init()`'s wrapper below), so a
+ *  failing `init()` never poisons the chain for the next queued caller. */
+let initChain: Promise<void> = Promise.resolve();
 
 // ── Keys ──────────────────────────────────────────────────────────
 function sanitizeNamespace(ns: string): string {
@@ -207,8 +212,31 @@ export interface PlayerPrefsInitResult {
  *     it only ever lived in the throwaway `'default'`-namespace cache this call is
  *     about to clear, and nothing was ever sent to a backend. That's a caller bug
  *     (writing before init), not a backend rejection — see docs/player-prefs.md
- *     § Gotchas, "every signal says success". */
-async function init(opts: PlayerPrefsInitOptions = {}): Promise<PlayerPrefsInitResult> {
+ *     § Gotchas, "every signal says success".
+ *
+ *  ⚠️ **SERIALIZED on `initChain` — an overlapped call is QUEUED, never superseded or
+ *  rejected out.** Without this, a second `init()` (a new `gameId` landing while a first
+ *  `init()` is still parked in `await backend.getAll(...)`) can finish first, and the
+ *  FIRST call's continuation then resumes and pours ITS rows into the SECOND call's
+ *  cache/namespace — cross-contaminating two games' stores (#428). Serializing means the
+ *  whole body below — the pre-swap convergence loop, the `backend`/`namespace` swap, the
+ *  `cache`/`dirty` clear, and the hydration loop — runs to completion for one caller
+ *  before the NEXT QUEUED CALLER'S BODY even starts: no two `init()` *bodies* interleave.
+ *  This is also what keeps `discardedPending` honest for the queued call: it runs a REAL
+ *  swap from the previous call's already-finished state, rather than reporting `[]`
+ *  because an interleaved call already cleared `dirty` out from under it. A caller whose
+ *  own turn throws (e.g. `backend.getAll` rejects) still rejects to ITS OWN caller and
+ *  leaves `hydrated` false — see the comment below — but must not poison the chain for the
+ *  next queued `init()`; see the wrapper just below `doInit`.
+ *
+ *  ⚠️ **This does NOT mean `hydrated`/`namespace`/`cache`/`dirty` are never observed
+ *  half-swapped.** They are — by every SYNCHRONOUS caller (`get`/`set`/`has`/`del`/`keys`/
+ *  `pendingKeys`), for the entire `await backend.getAll(prefix)` round-trip below: `namespace`
+ *  is assigned and `cache`/`dirty` are cleared BEFORE that await, so a synchronous `set()`
+ *  racing the swap lands in the INCOMING namespace's cache, not the outgoing one's. What this
+ *  fix closes is only the init-vs-init interleave (#428); the write-during-swap window is a
+ *  separate, still-open gap — see #438. */
+async function doInit(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInitResult> {
   // On a game swap (re-init with a new namespace), persist the previous game's
   // pending writes BEFORE we clear the cache — otherwise debounced writes are lost.
   const wasHydrated = hydrated;
@@ -290,6 +318,44 @@ async function init(opts: PlayerPrefsInitOptions = {}): Promise<PlayerPrefsInitR
   }
   hydrated = true;
   return { discardedPending };
+}
+
+/** Public `init()` — queues onto `initChain` so overlapping calls run one at a time.
+ *  See `doInit`'s doc comment for why.
+ *
+ *  Mirrors the `writeChain` idiom in `drain()`: `run` is THIS call's own turn and is
+ *  what gets returned (and rejects to this caller if `doInit` throws), while
+ *  `initChain` is advanced to a version that always resolves — `run.then(noop, noop)` —
+ *  so a rejection never poisons the chain for the next queued caller.
+ *
+ *  ⚠️ **ACCEPTED COST — a caller can be wedged behind an `init()` that never settles.**
+ *  Before this fix a hung `backend.getAll()` (a dead native bridge, a browser storage API that
+ *  never resolves) wedged only ITS OWN caller. Now `run = initChain.then(() => doInit(opts))`
+ *  means a hung `doInit` also wedges every `init()` call queued behind it, for the rest of the
+ *  process — there is no timeout here, deliberately (see below). `App.tsx`'s boot effect awaits
+ *  `init()` with no timeout of its own either, feeding `setConfigReady`, so the practical
+ *  consequence of a hang is a LoadingOverlay that never clears for the game the user actually
+ *  asked for. This is accepted, not overlooked: a timeout here would mean racing ahead with
+ *  `hydrated`/`namespace`/`cache` in an unknown state relative to a `doInit` that might still
+ *  complete later and clobber it — trading a visible hang for the silent cross-contamination
+ *  this whole mechanism exists to prevent. Do not add one without solving that.
+ *
+ *  ⚠️ **ACCEPTED COST — a rapid swap now pays for a cancelled init it used to skip.** Even on
+ *  the healthy path, queuing means a cancelled game's `doInit` still runs to completion (a full
+ *  `getAll`) before the wanted one starts, and because it leaves `hydrated === true`, the wanted
+ *  `doInit` then takes the `wasHydrated` branch and pays a pre-swap convergence `flush()` it
+ *  would previously have skipped (its own `dirty` is typically empty, so this is usually cheap,
+ *  but it is a real await it didn't used to take). A rapid g1→g2→g3 swap costs g3's boot one
+ *  extra `getAll` plus one extra `flush()` versus the unserialized code. This is the price of
+ *  `discardedPending` staying honest (see `doInit`'s doc comment) — do not "optimize" it back
+ *  into skipping a queued call's body, that reintroduces #428. */
+function init(opts: PlayerPrefsInitOptions = {}): Promise<PlayerPrefsInitResult> {
+  const run = initChain.then(() => doInit(opts));
+  initChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
 }
 
 /** Read a value. Returns a fresh copy (parsed from cache) — mutating it never
@@ -442,7 +508,15 @@ export const PlayerPrefs = {
 // ── Test seam ─────────────────────────────────────────────────────
 // Standalone export (not on the public `PlayerPrefs` object) so it never leaks into
 // game-author autocomplete — mirrors the engine's `__resetManagersForTesting` pattern.
-/** Reset all module state to a fresh in-memory backend. Call in `afterEach`. */
+/** Reset all module state to a fresh in-memory backend. Call in `afterEach`.
+ *
+ *  ⚠️ This resets `initChain` to a fresh `Promise.resolve()` — it does NOT cancel whatever
+ *  `doInit` a test left running on the OLD chain. A test that starts an `init()` and abandons
+ *  it (never awaits/releases its gate) leaves that call's `run` still chained to the pre-reset
+ *  `initChain`; nothing here stops it from resolving later and mutating module state
+ *  concurrently with the NEXT test's own `init()` calls — reintroducing the #428 race across a
+ *  test boundary. This reset only guarantees a clean *chain*, not that every previously-queued
+ *  call has actually finished. */
 export function resetPlayerPrefsForTest(): void {
   if (flushTimer != null) {
     clearTimeout(flushTimer);
@@ -454,4 +528,5 @@ export function resetPlayerPrefsForTest(): void {
   cache.clear();
   dirty.clear();
   writeChain = Promise.resolve();
+  initChain = Promise.resolve();
 }

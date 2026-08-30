@@ -54,12 +54,16 @@ export function emitVideoEnd(p: VideoEventPayload): void {
   fire(ended, p);
 }
 
-export function emitVideoSkip(p: VideoEventPayload): void {
+/** @param announceEnd - Whether to also emit `@video.end` (default true, preserving every
+ *  existing caller's behaviour). `video.skip`'s action handler passes `false` when it has
+ *  already claimed the end via `claimVideoEndEmit` — the reconcile announced it first, so
+ *  bundling a second `@video.end` here would double-fire. */
+export function emitVideoSkip(p: VideoEventPayload, announceEnd = true): void {
   emit('@video.skip', p);
   fire(skipped, p);
   // A skip is also an END for anyone who only cares that the cutscene is over —
   // otherwise every listener would have to subscribe to both to avoid hanging.
-  emitVideoEnd(p);
+  if (announceEnd) emitVideoEnd(p);
 }
 
 /** Drop every subscriber (world teardown / tests). */

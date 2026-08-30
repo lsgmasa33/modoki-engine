@@ -34,13 +34,26 @@ interface Live {
   clip: string;
   /** True once `autoplay` has been honoured, so it fires once rather than every frame. */
   autoplayed: boolean;
-  /** `@video.start` is emitted on the first frame the clip actually plays — not at
-   *  handle creation, which can precede playback by a whole download. */
+  /** `@video.start` is emitted on the first frame the RECONCILE asks the clip to play — not
+   *  at handle creation, which can precede playback by a whole download, and not on the first
+   *  frame the clip actually RENDERS a picture. Guards one playback, not the `Live` entry's
+   *  whole lifetime: `seekEntityVideo` clears it on a rewind to 0, so a replayed clip (same
+   *  GUID, same `Live` entry) fires `@video.start` again. A mid-clip pause/resume or seek
+   *  leaves it set — that's the same playback continuing.
+   *
+   *  ⚠️ #431: `LiveVideoHandle.attemptPlay()` can have `element.play()` rejected by the
+   *  autoplay policy (it sets a private `blocked` flag) and `retryBlockedPlay()` later starts
+   *  the real playback without going through this system at all — so on an unmuted cold-boot
+   *  cutscene, `@video.start` fires here while nothing renders, and no second start fires when
+   *  the gesture unblocks it. Not fixed here: `blocked` is private to `LiveVideoHandle` and
+   *  isn't on the `VideoHandle` interface, so closing this needs a contract change. */
   startEmitted: boolean;
   /** `@video.end` is emitted from the RECONCILE, when the handle is first observed to have
    *  ended — not from the element's `ended` event. The event is a promptness hint that can be
    *  missed entirely (see `LiveVideoHandle.ended`); a game listening for `@video.end` to
-   *  advance a cutscene must not be able to hang on a lost DOM event. */
+   *  advance a cutscene must not be able to hang on a lost DOM event. Guards one observed end,
+   *  not the `Live` entry's whole lifetime: the reconcile re-arms it the moment `handle.ended`
+   *  goes false again, so a rewind-and-replay of the SAME clip fires `@video.end` again too. */
   endEmitted: boolean;
 }
 
@@ -305,7 +318,16 @@ export function videoSystem(world: World): void {
 
     if (vp.playing) {
       l.handle.play();
-      if (!l.startEmitted) { l.startEmitted = true; emitVideoStart({ entity: entityGuid, clip: vp.clip }); }
+      // `LiveVideoHandle.play()` early-returns on a finished clip (`if (this.ended) return;`),
+      // but the end-emit below re-arms `startEmitted` the moment `@video.end` fires — so
+      // `playing = true` on a still-ended clip with NO intervening seek would otherwise
+      // announce a start for a playback that can never happen, and its paired `@video.end`
+      // can't fire again to close it out (the end was already observed). That is the cutscene
+      // hang #426 set out to remove.
+      if (!l.startEmitted && !l.handle.ended) {
+        l.startEmitted = true;
+        emitVideoStart({ entity: entityGuid, clip: vp.clip });
+      }
     } else l.handle.pause();
 
     // Live-applied fields. The end-fade is a MULTIPLIER computed from the element's own
@@ -323,7 +345,19 @@ export function videoSystem(world: World): void {
     // Both keyed off `handle.ended`, which reads the ELEMENT rather than trusting the event.
     if (l.handle.ended) {
       if (vp.playing) vp.playing = false;
-      if (!l.endEmitted) { l.endEmitted = true; emitVideoEnd({ entity: entityGuid, clip: l.clip }); }
+      if (!l.endEmitted) {
+        l.endEmitted = true;
+        // Re-arm the START too: a finished clip can only resume via a seek (`play()` refuses
+        // one), and that resume is a NEW playback wherever it starts from. Without this,
+        // `video.seek` to mid-clip out of the ended state re-arms `endEmitted` (the `else`
+        // below) and emits a second `@video.end` with no `@video.start` to pair it — a game
+        // counting start/end pairs drifts.
+        l.startEmitted = false;
+        emitVideoEnd({ entity: entityGuid, clip: l.clip });
+      }
+    } else {
+      // Re-arm: `endEmitted` guards ONE observed end, not the whole `Live` entry's lifetime.
+      l.endEmitted = false;
     }
   });
 
@@ -345,7 +379,30 @@ export function videoSystem(world: World): void {
 /** Seek an entity's live clip, if it has one. Used by the declarative `video.seek` /
  *  `video.stop` / `video.skip` actions, which act on an ENTITY rather than a handle. */
 export function seekEntityVideo(entityId: number, seconds: number): void {
-  live.get(entityId)?.handle.seek(seconds);
+  const l = live.get(entityId);
+  if (!l) return;
+  l.handle.seek(seconds);
+  // A rewind to the start begins a NEW playback, so `@video.start` must fire again for it.
+  // Only the start: `endEmitted` re-arms itself from the reconcile's `handle.ended` edge.
+  if (seconds <= 0) l.startEmitted = false;
+}
+
+/** Claim this entity's `@video.end` announcement for the current playback, latching the guard so
+ *  the reconcile does not announce it a second time. Returns false when the end was ALREADY
+ *  announced — the caller must then stay silent.
+ *
+ *  Exists for `video.skip`, which announces the end itself so a game waiting on "the cutscene is
+ *  over" fires exactly once whether the clip was watched or dismissed. Without this claim, a skip
+ *  pressed AFTER the clip already ended emits a second, unpaired `@video.end`.
+ *
+ *  An entity with no live handle claims successfully: a skip must always announce (that is the
+ *  softlock this action exists to prevent), and there is no guard to double-fire against. */
+export function claimVideoEndEmit(entityId: number): boolean {
+  const l = live.get(entityId);
+  if (!l) return true;
+  if (l.endEmitted) return false;
+  l.endEmitted = true;
+  return true;
 }
 
 /** Test hook — drop all state. */

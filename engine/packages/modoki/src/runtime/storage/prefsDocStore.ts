@@ -1,5 +1,5 @@
 /**
- * A single-document view over [PlayerPrefs](../../../../../docs/player-prefs.md) — one key, read /
+ * A single-document view over [PlayerPrefs](../../../../../../docs/player-prefs.md) — one key, read /
  * write / flush.
  *
  * ── Why this exists in `storage/` rather than next to its consumer ─────────────

@@ -18,7 +18,7 @@ import type { Entity } from 'koota';
 import { registerUIAction } from '../core/actionRegistry';
 import { VideoPlayer } from '../traits/VideoPlayer';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
-import { seekEntityVideo } from '../video/videoSystem';
+import { seekEntityVideo, claimVideoEndEmit } from '../video/videoSystem';
 import { emitVideoSkip } from '../video/VideoEvents';
 
 function patch(target: Entity | undefined, fields: Partial<{ playing: boolean; clip: string }>): void {
@@ -47,7 +47,13 @@ export function registerVideoControls(): void {
     // that only listens for "the cutscene is over" fires exactly once whether the
     // player watched it or dismissed it — otherwise a skip would hang that listener
     // forever, which is the classic way a skippable cutscene softlocks a game.
-    emitVideoSkip({ entity: target.get(EntityAttributes)?.guid, clip: v?.clip ?? '' });
+    //
+    // But the reconcile may have already announced the end itself (the clip finished
+    // playing before the Skip button was pressed) — `claimVideoEndEmit` consults and
+    // latches the SAME guard, so a skip on an already-ended clip fires `@video.skip`
+    // without a second, unpaired `@video.end`.
+    const announceEnd = claimVideoEndEmit(target.id());
+    emitVideoSkip({ entity: target.get(EntityAttributes)?.guid, clip: v?.clip ?? '' }, announceEnd);
     seekEntityVideo(target.id(), 0);
     patch(target, { playing: false });
   });

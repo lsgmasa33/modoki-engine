@@ -147,7 +147,7 @@ function counterFields(): { counters?: CounterStat[] } {
 }
 
 /** Rows returned before any filter is applied. **Summary-first**
- *  ([docs/debug-tools-mcp.md](../../../../../docs/debug-tools-mcp.md)): the full marker tree in
+ *  ([docs/debug-tools-mcp.md](../../../../../../docs/debug-tools-mcp.md)): the full marker tree in
  *  every response would blow the budget on a payload nobody read, and the worst handful by self
  *  time is what answers the question anyway. Ask `getMarkerAggregate()` for the whole thing. */
 export const DEFAULT_MARKER_ROWS = 8;

@@ -216,6 +216,46 @@ otherwise make the budget advisory. Backends are swappable behind a `CacheBacken
 web backend is the Cache API (already excluded from iCloud backup on iOS, which is an App Store
 review requirement).
 
+**The index and the backend must never disagree, so every removal deletes from the backend FIRST
+and drops the index entry only once that succeeds** (#429). `delete(key)` always had that ordering;
+`clear()` did not — it deleted in an unguarded loop and only then called `index.clear()`, so one
+rejected delete (an I/O error, or the Cache API evicting an entry mid-iteration) abandoned the
+bookkeeping entirely: the keys already deleted stayed in the index, and `saveIndex()` never ran, so
+the persisted index kept them too. `clear()` now drops each entry as its delete succeeds, keeps
+going past a failure (one unevictable key must not strand the whole cache), persists the index in a
+`finally`, and rethrows at the end naming the keys that survived — an incomplete clear the caller
+never hears about is how the index starts lying. The rethrown error also carries the first
+underlying failure as `cause`, and caps the inlined key list at 5 (`(+N more)`) so a large cache
+with a broken storage layer doesn't produce a message as long as the cache itself.
+
+**The same defect existed in two more places — `get()` and `doFetch`'s eviction loop — found on
+adversarial re-review of the #429 fix.** `get()` drops a ghost index entry (`urlFor` returning
+undefined for a key the index still lists) without persisting the drop, so the ghost survives in
+storage and reappears on the next `loadIndex()`. And `doFetch`'s eviction loop — the method
+`setVideoDownloader` actually wires — deletes each eviction victim from the backend and the
+in-memory index per-key-safely, but a rejection partway through the loop used to propagate before
+`saveIndex()` ever ran: the victims already deleted were gone from the backend AND the in-memory
+index, while the *persisted* index still claimed them. Reloading resurrects those ghosts,
+`usedBytes()` over-reports what's actually on disk, and `planAdmission` refuses a download that
+would genuinely fit. Both are now the same shape as `clear()`'s fix: persist whatever was actually
+freed before the failure propagates. `doFetch` still aborts the fetch on an eviction failure — it
+genuinely cannot proceed if it couldn't free the space — only the bookkeeping changed.
+`pipeline.ts:114` calls `reconcile()` fire-and-forget on boot, so this self-heals, but there's a
+real window where an admission decision can see the inflated index before the repair lands.
+
+⚠️ **Nothing calls `clear()` today** — no caller in `engine/`, `games/` or `demos/`, and
+`ActiveVideoCache` (`videoCacheSlot.ts`) does not expose it, so `modoki_diagnose` cannot reach it
+either. The cache is managed entirely by LRU eviction against the budget. So `clear()` itself is
+public API hardened ahead of a caller; if a "clear downloaded videos" affordance is ever wanted (a
+settings screen, an agent op), the ordering it needs is already right.
+
+**The lesson worth keeping is the ranking, not the fix.** #429 was filed against `clear()`, so the
+first pass fixed `clear()` — the one method in the file with *zero* callers — and walked straight
+past the identical defect in `doFetch`, the one method production actually drives. Only the
+adversarial re-review caught that. When a bug report names a method, the pattern is the finding and
+the named method is just where someone happened to notice it: sweep the file before believing the
+report scoped the work.
+
 **CORS is load-bearing, not a nicety.** A clip that becomes a GPU texture needs
 `crossOrigin='anonymous'`, so the host must send `Access-Control-Allow-Origin` **on the final
 response**. Measured, because this is easy to get wrong:
@@ -404,10 +444,48 @@ muted video autoplays everywhere. A tap on "Play Level" **is** that gesture. Onl
 autoplay-with-sound is genuinely constrained, and that is a constraint on cutscene placement rather
 than a bug to fix.
 
-**A skip must also fire the end event.** `emitVideoSkip` emits `@video.skip` **and** `@video.end`,
-so a game waiting on "the cutscene is over" fires exactly once whether the player watched it or
-dismissed it. Without that, a skip hangs the listener — the classic way a skippable cutscene
-softlocks a game.
+**A skip must also fire the end event — but only ONCE.** `emitVideoSkip` emits `@video.skip` and,
+by default, `@video.end`, so a game waiting on "the cutscene is over" fires exactly once whether the
+player watched it or dismissed it. Without that, a skip hangs the listener — the classic way a
+skippable cutscene softlocks a game. But a skip pressed AFTER the clip already ended must not
+double-fire `@video.end` — `video.skip`'s handler calls `claimVideoEndEmit(entityId)` first, which
+consults and latches the SAME `Live.endEmitted` guard the reconcile uses, and passes the result as
+`emitVideoSkip`'s `announceEnd` argument. An entity with no live handle always claims successfully
+(a skip must always announce; there is no guard to double-fire against).
+
+**`@video.start` / `@video.end` are per PLAYBACK, not per clip (#426).** Their once-guards live on
+the entity's `Live` entry, which is only recreated when the clip GUID *changes* — so guards that
+were never re-armed made a replay of the SAME clip silent, and the softlock above came back through
+the front door. The live path is a looping Director video track: on lap 2 the timeline dispatches
+`video.stop` + `video.setClip` with an unchanged guid, `video.stop` only seeks to 0 and pauses, and
+a same-guid `setClip` is a no-op in the reconcile. The two guards re-arm at *different* moments,
+and the asymmetry is deliberate:
+
+| Guard | Re-armed by | Why there |
+|---|---|---|
+| `endEmitted` | the reconcile, whenever `handle.ended` is observed false | it guards ONE observed end; a rising edge is the only reading that survives a seek off the end |
+| `startEmitted` | `seekEntityVideo` on a rewind to `<= 0`, **and** at the moment `@video.end` is emitted | a rewind restarts playback mid-clip; the end-emit covers the other half — a finished clip can only resume via a seek, wherever that seek lands |
+
+Both halves are load-bearing. Without the end-emit half, a `video.seek` to *mid-clip* out of a
+finished clip re-arms `endEmitted` and emits a second `@video.end` with no `@video.start` to pair
+it. The start-emit is also gated on `!handle.ended`: `play()`
+refuses a finished clip, but the end-emit half re-arms `startEmitted` right after `@video.end`
+fires — so `playing = true` on a still-ended clip with no intervening seek would otherwise
+announce a start for a playback that can never happen, whose paired end can't fire again.
+
+⚠️ **Do not count start/end as matched PAIRS — they are not, by design.** Each event is
+individually correct ("this playback was asked to begin", "this clip was observed to finish"), and
+the two counts legitimately diverge: a `video.stop` mid-clip re-arms the start but emits no end,
+because an *abandoned* playback never finished. Gate on the events; don't keep a balance.
+
+⚠️ **A start means "the reconcile asked it to play", not "pixels moved"** — an autoplay-blocked
+clip announces a start that never renders, and emits no second start when the gesture unblocks it.
+That gap is **#431**, and it needs a `VideoHandle` contract change rather than a guard.
+
+⚠️ **Never write `VideoPlayer` from an `onStart`/`onEnd` handler.** Both fire from *inside*
+`updateEach`, and koota writes its trait snapshot back after the callback — so the write is
+silently discarded and the obvious "chain the next clip when this one ends" handler does nothing at
+all. Defer to the next tick, or drive it from an action. That is **#432**.
 
 **The overlay binds no keyboard handler, on purpose.** Which key skips a cutscene (or whether any
 key does) is a game's call, not the engine's; a game binds its key to the `video.skip` action. Raw

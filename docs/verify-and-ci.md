@@ -309,9 +309,23 @@ helpers; orchestration that resists extraction): [editor.md](./editor.md) § Pan
 ## Test structure
 
 Tests live under `engine/tests/` and `engine/packages/modoki/tests/`, split by subsystem; `ls`
-them rather than trusting a listing here. Run a subset by path:
-`npx vitest run --config engine/vite.config.ts <path>` (the `--config` is required — without it a
-game's tests fail with `__MODOKI_MODULE_RENDER2D__ is not defined`).
+them rather than trusting a listing here. **The two trees are separate vitest projects, and which
+one a path lives in decides how you run it:**
+
+```bash
+npx vitest run --config engine/vite.config.ts <path>   # engine/tests/** and games'/demos' tests
+npm --prefix engine/packages/modoki test -- <path>     # engine/packages/modoki/tests/**
+```
+
+The `--config` on the first is required — without it a game's tests fail with
+`__MODOKI_MODULE_RENDER2D__ is not defined`.
+
+⚠️ **Pointing the root config at a package test finds NOTHING and exits 0** — `engine/vite.config.ts`
+carries `exclude: ['**/node_modules/**', 'packages/**', '**/release/**']`, so
+`npx vitest run --config engine/vite.config.ts engine/packages/modoki/tests/video/` prints
+`No test files found` and reads as "the file is broken" rather than "wrong runner". Both suites run
+under `npm run verify`, so this only bites while iterating on one file — which is exactly when a
+silent empty run is most expensive. Surfaced by the #426 review, which lost a pass to it.
 
 ### Source-scanning guards, and the ONE comment scanner they share
 

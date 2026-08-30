@@ -35,22 +35,32 @@ describe('atlas default-document parity (#423)', () => {
     expect(s).toMatch(/body:\s*\(guid\)\s*=>\s*\(\{\s*id:\s*guid,\s*\.\.\.defaultAtlasSource\(\)\s*\}\)/);
   });
 
-  it('AtlasAssetView.tsx sources DEFAULT_DOC + its coalescing fallbacks from defaultAtlasSource', () => {
+  it('AtlasAssetView.tsx sources DEFAULT_DOC from atlasPersist\'s DEFAULT_ATLAS_DOC (itself defaultAtlasSource)', () => {
+    // #430 moved the fetch-handler's per-field fallback normalization out of the component and
+    // into atlasPersist.ts's `normalizeAtlasBody` (decision logic belongs in a plain .ts module
+    // per CLAUDE.md § Panels) — so the parity guard below moved with it. AtlasAssetView.tsx
+    // itself now just re-points its local DEFAULT_DOC alias at the extracted constant.
     const s = src('editor/panels/assetViews/AtlasAssetView.tsx');
+    expect(s).toMatch(/DEFAULT_ATLAS_DOC,/); // imported from ./atlasPersist
+    expect(s).toMatch(/const DEFAULT_DOC = DEFAULT_ATLAS_DOC/);
+  });
+
+  it('atlasPersist.ts sources DEFAULT_ATLAS_DOC + its coalescing fallbacks from defaultAtlasSource', () => {
+    const s = src('editor/panels/assetViews/atlasPersist.ts');
     expect(s).toMatch(/import\s*\{\s*defaultAtlasSource\s*\}\s*from\s*'\.\.\/\.\.\/\.\.\/runtime\/loaders\/spriteAtlas'/);
-    expect(s).toMatch(/const DEFAULT_DOC: AtlasSourceDoc = defaultAtlasSource\(\)/);
+    expect(s).toMatch(/const DEFAULT_ATLAS_DOC: AtlasSourceDoc = defaultAtlasSource\(\)/);
     // Edit `defaultAtlasSource()` in spriteAtlas.ts, not this file, to change the per-field
-    // fetch-handler fallbacks (pageSize/padding/extrude) — they must read DEFAULT_DOC, not
+    // fetch-handler fallbacks (pageSize/padding/extrude) — they must read DEFAULT_ATLAS_DOC, not
     // repeat 1024/2/1.
     expect(s).not.toMatch(/pageSize:\s*typeof d\.pageSize === 'number' \? d\.pageSize : 1024/);
     expect(s).not.toMatch(/padding:\s*typeof d\.padding === 'number' \? d\.padding : 2/);
     expect(s).not.toMatch(/extrude:\s*typeof d\.extrude === 'number' \? d\.extrude : 1/);
-    // Positive side of the guard above: the fallback must actually READ DEFAULT_DOC, not just
-    // avoid the old literal — a fallback disagreeing with the factory (e.g. `: 512`) would still
-    // pass the not.toMatch checks alone.
-    expect(s).toMatch(/pageSize:.*DEFAULT_DOC\.pageSize/);
-    expect(s).toMatch(/padding:.*DEFAULT_DOC\.padding/);
-    expect(s).toMatch(/extrude:.*DEFAULT_DOC\.extrude/);
+    // Positive side of the guard above: the fallback must actually READ DEFAULT_ATLAS_DOC, not
+    // just avoid the old literal — a fallback disagreeing with the factory (e.g. `: 512`) would
+    // still pass the not.toMatch checks alone.
+    expect(s).toMatch(/pageSize:.*DEFAULT_ATLAS_DOC\.pageSize/);
+    expect(s).toMatch(/padding:.*DEFAULT_ATLAS_DOC\.padding/);
+    expect(s).toMatch(/extrude:.*DEFAULT_ATLAS_DOC\.extrude/);
   });
 
   it('reimport-atlas.ts\'s readAtlasSource sources its fallback values from defaultAtlasSource', () => {

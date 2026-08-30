@@ -11,11 +11,18 @@ class FakeBackend implements CacheBackend {
   store = new Map<string, Blob>();
   writes = 0;
   deletes: string[] = [];
+  /** Keys whose `delete` should reject instead of succeeding — models an I/O error or
+   *  an entry being evicted out from under us mid-clear. */
+  failDelete = new Set<string>();
   async keys() { return [...this.store.keys()]; }
   async urlFor(key: string) { return this.store.has(key) ? `blob:fake/${key}` : undefined; }
   async sizeOf(key: string) { return this.store.get(key)?.size; }
   async write(key: string, data: Blob) { this.writes++; this.store.set(key, data); }
-  async delete(key: string) { this.deletes.push(key); this.store.delete(key); }
+  async delete(key: string) {
+    if (this.failDelete.has(key)) throw new Error(`fake delete failure: ${key}`);
+    this.deletes.push(key);
+    this.store.delete(key);
+  }
 }
 
 /** A localStorage stand-in. */
@@ -146,6 +153,63 @@ describe('fetchAndStore', () => {
   });
 });
 
+describe('doFetch eviction failure (#429 second pass)', () => {
+  // Regression: a rejection partway through the eviction loop used to propagate before
+  // saveIndex() ran, so a victim already deleted from the backend AND the in-memory
+  // index stayed claimed by the PERSISTED index — a ghost that reappears on reload and
+  // inflates usedBytes() past what's actually on disk.
+  it('persists the index when eviction fails partway through, leaving no ghost entry', async () => {
+    const storage = memStorage();
+    vi.stubGlobal('fetch', mockFetch(30 * MB));
+    const c = new VideoCache({ backend, budgetBytes: 100 * MB, storage });
+    await c.fetchAndStore('a', 'https://cdn/a.mp4');
+    await c.fetchAndStore('b', 'https://cdn/b.mp4');
+    await c.fetchAndStore('cc', 'https://cdn/c.mp4');
+
+    backend.failDelete.add('b');
+    vi.stubGlobal('fetch', mockFetch(60 * MB));
+    // Evicting 'a' then 'b' is required to fit 'd'; 'b' rejects mid-loop.
+    await expect(c.fetchAndStore('d', 'https://cdn/d.mp4')).rejects.toThrow();
+
+    expect(backend.store.has('a')).toBe(false); // actually evicted before the failure
+    expect(backend.store.has('b')).toBe(true);  // delete rejected — still there
+
+    const inMemoryKeys = c.entries().map((e) => e.key).sort();
+    expect(inMemoryKeys).toEqual(['b', 'cc']); // no ghost 'a' in memory
+
+    const persisted = JSON.parse(storage._map.get('modoki.videoCache.index.v1')!) as Record<string, unknown>;
+    expect(Object.keys(persisted).sort()).toEqual(inMemoryKeys); // and none persisted either
+
+    // The real harm this pins: a fresh instance over the SAME persisted storage must
+    // not over-report usage — a ghost 'a' would have inflated it by 30 MB and made
+    // planAdmission refuse a download that actually fits.
+    const c2 = new VideoCache({ backend, budgetBytes: 100 * MB, storage });
+    expect(c2.usedBytes()).toBe(backend.store.get('b')!.size + backend.store.get('cc')!.size);
+  });
+});
+
+describe('get() drops a stale index entry', () => {
+  // Regression: get() deleted the in-memory entry for a key the backend no longer has,
+  // but never persisted the drop — so the ghost survived in storage and reappeared on
+  // the next loadIndex().
+  it('persists the drop, so a fresh instance over the same storage does not resurrect it', async () => {
+    const storage = memStorage();
+    vi.stubGlobal('fetch', mockFetch(5 * MB));
+    const c = new VideoCache({ backend, budgetBytes: 100 * MB, storage });
+    await c.fetchAndStore('k1', 'https://cdn/x.mp4');
+
+    backend.store.delete('k1'); // the backend loses it without telling the cache
+    expect(await c.get('k1')).toBeUndefined();
+    expect(c.entries()).toHaveLength(0);
+
+    const persisted = JSON.parse(storage._map.get('modoki.videoCache.index.v1')!) as Record<string, unknown>;
+    expect(Object.keys(persisted)).toHaveLength(0);
+
+    const c2 = new VideoCache({ backend, budgetBytes: 100 * MB, storage });
+    expect(c2.entries()).toHaveLength(0);
+  });
+});
+
 describe('reconcile', () => {
   it('drops index entries whose bytes the browser evicted behind our back', async () => {
     // Storage can be reclaimed at any time without telling us. A stale index would
@@ -221,5 +285,103 @@ describe('delete / clear', () => {
     await c.clear();
     expect(c.usedBytes()).toBe(0);
     expect(backend.store.size).toBe(0);
+  });
+
+  describe('clear() with a failing delete', () => {
+    // Regression for #429: an uncaught throw used to abort clear() before
+    // index.clear()/saveIndex() ran, so every key deleted BEFORE the throw was gone
+    // from the backend but still claimed by the (unpersisted) index.
+    const setUpThreeEntries = async (storage: ReturnType<typeof memStorage>) => {
+      vi.stubGlobal('fetch', mockFetch(5 * MB));
+      const c = new VideoCache({ backend, budgetBytes: 100 * MB, storage });
+      await c.fetchAndStore('a', 'https://cdn/a.mp4');
+      await c.fetchAndStore('b', 'https://cdn/b.mp4');
+      await c.fetchAndStore('cc', 'https://cdn/c.mp4');
+      return c;
+    };
+
+    it('deletes every OTHER key and rejects, leaving the failing key genuinely still cached', async () => {
+      const storage = memStorage();
+      const c = await setUpThreeEntries(storage);
+      backend.failDelete.add('b');
+
+      // Matches the aggregate message specifically — a bare /b/ would also match the
+      // fake's own `fake delete failure: b`, so it doesn't by itself prove the
+      // aggregate error (with the failed-count prefix) is what's actually thrown.
+      await expect(c.clear()).rejects.toThrow(/video cache clear: failed to delete 1 entry: b/);
+
+      expect(backend.store.has('a')).toBe(false);
+      expect(backend.store.has('cc')).toBe(false);
+      expect(backend.store.has('b')).toBe(true); // still in the backend → index keeping it is correct
+
+      const keys = c.entries().map((e) => e.key);
+      expect(keys).toEqual(['b']);
+
+      // The persisted index must match the in-memory one — this is the bug: the old
+      // code never reached saveIndex() after the throw.
+      const persisted = JSON.parse(storage._map.get('modoki.videoCache.index.v1')!) as Record<string, unknown>;
+      expect(Object.keys(persisted)).toEqual(['b']);
+    });
+
+    it('all deletes succeeding empties both the index and the persisted index', async () => {
+      const storage = memStorage();
+      const c = await setUpThreeEntries(storage);
+
+      await expect(c.clear()).resolves.toBeUndefined();
+
+      expect(c.entries()).toHaveLength(0);
+      expect(backend.store.size).toBe(0);
+      const persisted = JSON.parse(storage._map.get('modoki.videoCache.index.v1')!) as Record<string, unknown>;
+      expect(Object.keys(persisted)).toHaveLength(0);
+    });
+
+    it('a failure on the FIRST key does not stop the rest from being cleared', async () => {
+      const storage = memStorage();
+      const c = await setUpThreeEntries(storage);
+      backend.failDelete.add('a');
+
+      await expect(c.clear()).rejects.toThrow();
+
+      expect(backend.store.has('b')).toBe(false);
+      expect(backend.store.has('cc')).toBe(false);
+      expect(c.entries().map((e) => e.key)).toEqual(['a']);
+    });
+
+    it('entries()/usedBytes() after a partial clear report only what actually remains', async () => {
+      const storage = memStorage();
+      const c = await setUpThreeEntries(storage);
+      backend.failDelete.add('cc');
+
+      await expect(c.clear()).rejects.toThrow();
+
+      expect(c.usedBytes()).toBe(5 * MB); // only 'cc' remains
+      expect(c.entries()).toHaveLength(1);
+      expect(c.entries()[0].key).toBe('cc');
+    });
+
+    it('the aggregated error carries the first underlying failure as cause, and caps the inlined key list', async () => {
+      const storage = memStorage();
+      vi.stubGlobal('fetch', mockFetch(1 * MB));
+      const c = new VideoCache({ backend, budgetBytes: 100 * MB, storage });
+      const keys = ['k0', 'k1', 'k2', 'k3', 'k4', 'k5', 'k6'];
+      for (const k of keys) await c.fetchAndStore(k, `https://cdn/${k}.mp4`);
+      for (const k of keys) backend.failDelete.add(k);
+
+      let caught: unknown;
+      try {
+        await c.clear();
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      const err = caught as Error;
+      expect(err.cause).toBeInstanceOf(Error);
+      expect((err.cause as Error).message).toMatch(/fake delete failure/);
+      // 7 failures, only the first 5 inlined, the rest folded into a count.
+      expect(err.message).toContain('failed to delete 7 entries');
+      expect(err.message).toContain('(+2 more)');
+      for (const k of keys.slice(0, 5)) expect(err.message).toContain(k);
+      for (const k of keys.slice(5)) expect(err.message).not.toContain(k);
+    });
   });
 });

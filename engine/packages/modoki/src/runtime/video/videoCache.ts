@@ -145,7 +145,7 @@ export class VideoCache {
   /** A cached clip's local URL, touching its LRU position. Undefined when not cached. */
   async get(key: string): Promise<string | undefined> {
     const url = await this.backend.urlFor(key);
-    if (!url) { this.index.delete(key); return undefined; }
+    if (!url) { this.index.delete(key); this.saveIndex(); return undefined; }
     const e = this.index.get(key);
     if (e) { e.lastUsed = this.now(); this.saveIndex(); }
     return url;
@@ -193,9 +193,21 @@ export class VideoCache {
     });
     if (!plan.ok) throw new Error(`video cache refused ${key}: ${explainRefusal(plan, this.budget)}`);
 
-    for (const victim of plan.evict) {
-      await this.backend.delete(victim);
-      this.index.delete(victim);
+    try {
+      for (const victim of plan.evict) {
+        await this.backend.delete(victim);
+        this.index.delete(victim);
+      }
+    } catch (err) {
+      // A rejection here (mid-loop, not the last victim) used to abort doFetch before
+      // the saveIndex() below ever ran: the first victim was gone from the backend AND
+      // the in-memory index, but the PERSISTED index still claimed it. That ghost entry
+      // survives a reload, inflates usedBytes() past what actually exists on disk, and
+      // makes planAdmission refuse a download that would genuinely fit. Persist whatever
+      // we actually freed before propagating — the fetch still can't proceed (we could
+      // not make room), but the index must not lie about what's left.
+      this.saveIndex();
+      throw err;
     }
 
     await this.backend.write(key, blob);
@@ -232,9 +244,43 @@ export class VideoCache {
   }
 
   async clear(): Promise<void> {
-    for (const k of [...this.index.keys()]) await this.backend.delete(k);
-    this.index.clear();
-    this.saveIndex();
+    // Mirror delete()'s ordering PER KEY — index.delete only after the backend
+    // delete succeeds — so a mid-loop throw leaves index and backend consistent for
+    // everything already processed, instead of the whole clear aborting with stale
+    // index entries for keys that are actually gone.
+    //
+    // Keep going past a failure: one unevictable key (an I/O error, an entry the
+    // browser is mid-evicting) must not strand every other key in the cache. Collect
+    // the failures and rethrow at the end so the caller still learns the clear was
+    // incomplete.
+    const failed: string[] = [];
+    let firstErr: unknown;
+    try {
+      for (const k of [...this.index.keys()]) {
+        try {
+          await this.backend.delete(k);
+          this.index.delete(k);
+        } catch (err) {
+          failed.push(k);
+          firstErr ??= err;
+        }
+      }
+    } finally {
+      // Persist whatever we actually managed, even on the way out — this is the bug
+      // being fixed: the old code never reached saveIndex() after a throw.
+      this.saveIndex();
+    }
+    if (failed.length) {
+      // Cap the inlined key list — a 500-entry cache with a broken storage layer must
+      // not produce a 500-key message. The full count is already in the message, so
+      // nothing is lost, just not spelled out.
+      const shown = failed.slice(0, 5).join(', ');
+      const more = failed.length > 5 ? ` (+${failed.length - 5} more)` : '';
+      throw new Error(
+        `video cache clear: failed to delete ${failed.length} ${failed.length === 1 ? 'entry' : 'entries'}: ${shown}${more}`,
+        { cause: firstErr },
+      );
+    }
   }
 }
 

@@ -66,4 +66,13 @@ describe('serializeAtlasDoc', () => {
   it('writes a clean document when the file had nothing extra', () => {
     expect(JSON.parse(serializeAtlasDoc({}, edited))).toEqual(edited);
   });
+
+  // #423/#430-adjacent: confirm losing the atlas's own `id` GUID is impossible through this
+  // path specifically (not just "the texture block survives") — `next` already carries the raw
+  // doc's `id` (the load effect always seeds `doc.id` from what it read), so this is the
+  // ordinary edit round-trip, not a passthrough-only case like the `texture` block above.
+  it('the id GUID survives an edit round-trip', () => {
+    const out = JSON.parse(serializeAtlasDoc(onDisk, { ...edited, id: onDisk.id, padding: 9 }));
+    expect(out.id).toBe(onDisk.id);
+  });
 });
