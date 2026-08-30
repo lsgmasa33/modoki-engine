@@ -187,6 +187,22 @@ const BOUNDED = /\|\s*(head|tail|wc|grep|rg|jq|less|awk|sed|cut|sort|uniq|column
 
 const BASH_RULES = [
   {
+    id: 'help',
+    // `--help` (any CLI, anywhere in the segment — it's a flag, not a command name) or `man <topic>`
+    // (anchored to the START of the segment, like `cat` below — `man` is only ever the invoked
+    // command itself, never a flag, so anchoring it avoids matching the plain English word "man" in
+    // an unrelated quoted string, e.g. `echo "see the man page"` or a commit message mentioning one).
+    // Both print a fixed, often long, reference dump that's rarely read in full. Deliberately NOT
+    // matching `-h` alone: too many tools overload it for "human-readable" (`ls -h`, `du -h`,
+    // `sort -h`), which would false-positive constantly.
+    // Checked FIRST (before gitlog/gitdiff/install below): `--help` is strictly more specific than
+    // any of those shapes, and only this rule's advice ("pipe to head/grep") actually applies to a
+    // help dump — `git log --help` matching `gitlog` instead would nudge `-n 20`, which is nonsense
+    // for a command that isn't printing history.
+    re: /(^|\s)--help\b|^\s*(?:(?:sudo|time|env)\s+|\w+=\S+\s+)*man\s+\S/,
+    fix: 'pipe through `| head -40` or `| grep` for the flag you need',
+  },
+  {
     id: 'cat',
     // Anchored to the start of the segment (optionally after `sudo`/`time`/`env` or a leading
     // `VAR=val` assignment) so `echo "please cat this file"` doesn't false-positive on `cat`

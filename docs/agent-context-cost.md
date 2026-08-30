@@ -61,10 +61,12 @@ segment already piped through a bounding filter (`head`, `tail`, `wc`, `grep`/`r
 `awk`, `sed`, `cut`, `sort`, `uniq`, `column`, `xargs`), redirected to `/dev/null`, or redirected to
 a file, is treated as bounded regardless of which rule below would otherwise match.
 
-Each segment is checked against a fixed rule set:
+Each segment is checked against a fixed rule set, **in this order** — a segment is reported under
+the first rule that matches, so order matters whenever two rules could both match the same segment:
 
 | id | trips on | suggested fix |
 |---|---|---|
+| `help` | `--help` (any CLI) or `man <topic>` | pipe through `head -40`/`grep` for the flag you need |
 | `cat` | `cat <file>` with no pipe | pipe through `head -100` / `sed -n`, or use Read with offset/limit |
 | `gitlog` | `git log` with no `-n`/`-<N>`/`--max-count` | add `-n 20` (`--oneline` where the body isn't needed) |
 | `gitdiff` | `git diff`/`git show` with no `--stat`/`--name-only`/`--name-status`/`--shortstat` | scope with `--stat`/`--name-only` first |
@@ -72,6 +74,28 @@ Each segment is checked against a fixed rule set:
 | `install` | `npm ci/install/i`, `yarn install`, `pnpm i(nstall)` | pipe through `tail -20` |
 | `build` | `npm run build` | pipe through `tail -40` |
 | `logcat` | `adb … logcat` with no `-t <N>`/`-d` | add `-d -t 200` |
+
+`help` is checked FIRST, ahead of `gitlog`/`gitdiff`/`install`, because it is strictly more
+specific and its advice is the only one that fits a help dump — without this, `git log --help`
+would report under `gitlog` and nudge `-n 20`, which is meaningless for a command that never
+prints history at all.
+
+`help`'s `man` half is anchored to the START of the segment (like `cat` above) — `man` is only
+ever an invoked command, never a flag, so anchoring it avoids matching the plain English word
+"man" inside an unrelated quoted string (a commit message, an echoed sentence). Its `--help` half
+deliberately matches only the long form, never bare `-h` — too many tools overload `-h` for
+"human-readable" (`ls -h`, `du -h`, `sort -h`), which would false-positive on ordinary usage
+constantly.
+
+⚠️ **`help` still has two known, accepted false-positive edges — not worth a regex fight given the
+hook only ever warns.** (1) Unlike `man`, `--help` genuinely can appear anywhere in a real
+invocation (`npm run build --help`), so it can't be start-anchored the way `man` is — a quoted
+sentence that merely *mentions* `--help` (`git commit -m "add --help output"`) still trips it. (2)
+`splitSegments` splits on newline too, so a heredoc commit body makes every line its own "segment
+start" — a `man`-anchored line inside a `git commit -F- <<EOF … EOF` body (e.g. a body line reading
+"man pages were wrong") still trips the anchor, same as it always could for the `cat` rule above.
+Worst case either way: at most two spurious nudges, which also spend the `help` rule's per-session
+anti-nag budget, so a later genuine `--help`/`man` call in the same session may go unwarned.
 
 **Deliberately excluded: `npm test`, `npm run verify` (and its `verify:*` variants), and
 `npx vitest run`/`vitest run`.** These are the sanctioned gate commands (CLAUDE.md § Tests) — they

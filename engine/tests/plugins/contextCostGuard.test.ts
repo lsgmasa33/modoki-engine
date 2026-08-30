@@ -268,6 +268,8 @@ describe('context-cost-guard — Bash path', () => {
       ['npm install', /install/],
       ['npm run build', /build/],
       ['adb logcat', /logcat/],
+      ['ccusage --help', /help/],
+      ['man git', /help/],
     ];
     for (const [cmd, expected] of cases) {
       const r = runGuard('Bash', { command: cmd });
@@ -276,8 +278,57 @@ describe('context-cost-guard — Bash path', () => {
     }
   });
 
+  it('does not treat -h as --help — too many tools overload it for human-readable output', () => {
+    for (const cmd of ['ls -h', 'du -sh .', 'sort -h']) {
+      const r = runGuard('Bash', { command: cmd });
+      expectNeverBlocks(r);
+      expect(r.stdout, cmd).toBe('');
+    }
+  });
+
+  it('anchors `man` to the segment start so the plain word does not false-positive mid-sentence', () => {
+    // Regression: an earlier version matched bare `man` anywhere in the segment, so a quoted
+    // sentence merely CONTAINING the English word "man" (a commit message, an echoed string)
+    // wrongly tripped the rule. `man` is only ever a command name, never a flag, so it must be
+    // anchored like `cat` is.
+    for (const cmd of ['git commit -m "see man bash for details"', 'echo "run man page if confused"', 'man']) {
+      const r = runGuard('Bash', { command: cmd });
+      expectNeverBlocks(r);
+      expect(r.stdout, cmd).toBe('');
+    }
+    for (const cmd of ['man git', 'sudo man ls']) {
+      const r = runGuard('Bash', { command: cmd });
+      expectNeverBlocks(r);
+      expect(r.parsed?.systemMessage, cmd).toMatch(/help/);
+    }
+  });
+
+  it('does not loosen `man` to a bare word boundary — words merely containing "man" stay silent', () => {
+    // Guards against the tempting-but-wrong "simplification" `(^|\s)man\b` or `\bman\b`, which
+    // would pass every OTHER test in this file while making `manifest`/`human`/`find -name man*`
+    // all warn. This is deliberately a word list, not a regex-shape assertion, so it fails if
+    // the implementation regex changes in a way that reintroduces the false positive.
+    for (const cmd of ['npm run manifest', 'echo manifest.json', 'ls -la human/', "find . -name 'man*'"]) {
+      const r = runGuard('Bash', { command: cmd });
+      expectNeverBlocks(r);
+      expect(r.stdout, cmd).toBe('');
+    }
+  });
+
+  it('checks `help` before `gitlog`/`gitdiff`/`install` — their advice does not apply to a help dump', () => {
+    // `git log --help` / `git diff --help` / `npm install --help` are all more specifically
+    // "print --help text" than "an unbounded git log/diff/install" — the earlier rules' fixes
+    // (`-n 20`, `--stat`, `| tail -20`) are nonsense advice for a command that never touches
+    // history/diff/registry output at all.
+    for (const cmd of ['git log --help', 'git diff --help', 'npm install --help']) {
+      const r = runGuard('Bash', { command: cmd });
+      expectNeverBlocks(r);
+      expect(r.parsed?.systemMessage, cmd).toMatch(/help/);
+    }
+  });
+
   it('does not warn when the same command is piped through a bounding filter', () => {
-    for (const cmd of ['cat some/big/file.txt | head -100', 'git log | wc -l', 'ls -laR / | head -50']) {
+    for (const cmd of ['cat some/big/file.txt | head -100', 'git log | wc -l', 'ls -laR / | head -50', 'ccusage --help | head -40']) {
       const r = runGuard('Bash', { command: cmd });
       expectNeverBlocks(r);
       expect(r.stdout, cmd).toBe('');
