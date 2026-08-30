@@ -19,8 +19,11 @@ const handles: Array<{ url: string; disposed: boolean; playing: boolean }> = [];
 vi.mock('../../src/runtime/video/videoService', () => ({
   applyTimeScale: () => {},
   videoFadeGain: () => 1,
-  playVideo: (opts: { url: string }) => {
-    const rec = { url: opts.url, disposed: false, playing: false };
+  playVideo: (opts: { url: string; timeMode?: 'diegetic' | 'presentation' }) => {
+    const rec = {
+      url: opts.url, disposed: false, playing: false,
+      timeMode: opts.timeMode ?? 'diegetic' as 'diegetic' | 'presentation',
+    };
     handles.push(rec);
     return {
       element: { currentTime: 0, duration: 10, style: {} } as unknown as HTMLVideoElement,
@@ -28,8 +31,14 @@ vi.mock('../../src/runtime/video/videoService', () => ({
       pause: () => { rec.playing = false; },
       seek: () => {},
       setVolume: () => {}, setMuted: () => {}, setRate: () => {},
+      setLoop: () => {},
+      // Models `setTimeMode` by mutating `rec.timeMode`, not a no-op — this test doesn't
+      // exercise timeMode itself, but a mock that can't move this field at all would silently
+      // pass a `videoSystem` bug that skips the call.
+      setTimeMode: (mode: 'diegetic' | 'presentation') => { rec.timeMode = mode; },
       get ended() { return false; },
-      timeMode: 'diegetic' as const,
+      get playing() { return rec.playing; },
+      get timeMode() { return rec.timeMode; },
       dispose: () => { rec.disposed = true; },
     };
   },

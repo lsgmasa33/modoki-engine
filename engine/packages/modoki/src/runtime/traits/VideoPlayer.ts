@@ -24,7 +24,7 @@ import { trait } from 'koota';
  *  LOGIC depends on must not be derived from video playback position. */
 export const VideoPlayer = trait({
   clip: '',                   // GUID → resolved variant URL via the manifest
-  loop: false as boolean,
+  loop: false as boolean,     // live: changing this at runtime reaches the element immediately
   autoplay: false as boolean, // play on spawn / scene load (when the game is playing)
   muted: false as boolean,    // a muted clip is exempt from the autoplay gesture rule
   volume: 1 as number,        // 0..1, multiplied into the bus gain
@@ -33,8 +33,16 @@ export const VideoPlayer = trait({
   // the target the fade descends FROM, so it stays readable in the Inspector and a
   // seek backwards restores it instead of leaving the clip permanently silenced.
   fadeOutSec: 0 as number,
+  // NOT live: the audio-graph route is established once, at handle creation
+  // (`attachMediaElementToBus` in `videoService.ts`). Changing this after the clip has
+  // started does nothing to a clip already playing — it only takes effect the next time
+  // this entity's handle is RECREATED: a `clip` change, the entity despawning, leaving
+  // Play, or a scene swap. `video.stop` does NOT recreate the handle (it is a seek(0) +
+  // pause — see `videoControls.ts`), so stopping and replaying the SAME clip does not
+  // pick up a new `bus`.
   bus: 'sfx' as 'master' | 'music' | 'sfx' | 'ui',
-  // How playback rate follows the engine timeScale. See the trait doc above.
+  // How playback rate follows the engine timeScale. See the trait doc above. Live:
+  // changing this at runtime reapplies the rate immediately.
   timeMode: 'diegetic' as 'diegetic' | 'presentation',
   // Base playback rate BEFORE timeScale is folded in (1 = normal).
   rate: 1 as number,

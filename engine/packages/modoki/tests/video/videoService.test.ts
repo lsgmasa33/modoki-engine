@@ -237,4 +237,50 @@ describe('a clip that reaches its end (#the iPhone 8 loop)', () => {
     h.seek(0);
     expect(h.ended).toBe(false);
   });
+
+  it('setLoop(true) un-strands a clip that already ended, and it actually resumes', async () => {
+    // Reproduces the real path: the element's `ended` EVENT fires (not `atEnd`'s static
+    // stub), latching the private `endedEvent` flag that only `seek()` used to clear. A real
+    // element also stops (`paused` becomes true) the moment it reaches its end — model that
+    // explicitly, since jsdom's synthetic event dispatch below does not do it for us.
+    const h = playVideo({ url: 'a.mp4' });
+    await flush();
+    Object.defineProperty(h.element, 'paused', { value: true, configurable: true });
+    h.element.dispatchEvent(new Event('ended'));
+    expect(h.ended).toBe(true);
+
+    h.setLoop(true);
+    // The getter's own `!element.loop` term would already say false here even with the bug —
+    // the bug is that `endedEvent` stays latched underneath it. This is the real assertion.
+    expect(h.ended).toBe(false);
+
+    const before = playCalls;
+    h.play();
+    await flush();
+    // Before the fix, `play()`'s `if (this.ended) return;` refused this call outright and
+    // `playCalls`/`paused` never moved — asserting only `element.loop === true` would have
+    // missed that the clip stayed stranded.
+    expect(playCalls).toBeGreaterThan(before);
+    expect(h.element.paused).toBe(false);
+  });
+});
+
+describe('setTimeMode re-applies the rate live', () => {
+  it('diegetic -> presentation immediately returns to 1x, without another applyTimeScale call', () => {
+    const h = playVideo({ url: 'a.mp4', timeMode: 'diegetic' });
+    applyTimeScale(0.5);
+    expect(h.element.playbackRate).toBe(0.5);
+
+    h.setTimeMode('presentation');
+    expect(h.element.playbackRate).toBe(1);
+  });
+
+  it('presentation -> diegetic immediately re-applies the CURRENT timeScale', () => {
+    const h = playVideo({ url: 'a.mp4', timeMode: 'presentation' });
+    applyTimeScale(0.5);
+    expect(h.element.playbackRate).toBe(1);
+
+    h.setTimeMode('diegetic');
+    expect(h.element.playbackRate).toBe(0.5);
+  });
 });

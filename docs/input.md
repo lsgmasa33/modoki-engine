@@ -58,6 +58,9 @@ deterministic sim free of live DOM reads.
 - `runtime/input/touchControlSource.ts` — the touch-control modality: ONE delegated pointer-listener
   set over the runtime UI tree, per-`pointerId` so several controls hold at once and a thumb can
   slide between them. See "On-screen touch controls" below.
+- `runtime/input/gestureSource.ts` — the multi-touch modality: pan/pinch/tap derived from every live
+  pointer, tracked independently of `pointerSource`'s single primary touch. See "Multi-touch gestures"
+  below.
 - `runtime/core/formFactor.ts` — L0: `readPlatform`/`readFormFactor`/`isTouchDevice`. The single
   source of truth for "is this a handheld?", shared by the renderer's quality tier (`deviceCaps`)
   and by touch-control visibility.
@@ -129,7 +132,8 @@ source swap), which would otherwise gate a live pad off forever.
 
 **Pointer source (tap/drag).** Tracks the single active pointer — the mouse, or the *primary* touch of
 a multi-touch gesture (the first `pointerId` down owns the gesture; later pointers are ignored until it
-lifts, so a second finger can't hijack an in-progress drag). It reports a `PointerFrame` on
+lifts, so a second finger can't hijack an in-progress drag — that primary-touch rule is exactly what
+"Multi-touch gestures" below explains gestureSource had to work AROUND rather than change). It reports a `PointerFrame` on
 `out.pointer`: `x`/`y` (viewport CSS px, raw `clientX/clientY`), `down` (level), and `dragX`/`dragY`
 (delta from where the current press started — 0 while up). Unlike axes/held it is **not OR-merged**
 (one pointer, authoritative), so `beginSample` leaves it alone and only the down-**edge**
@@ -161,7 +165,9 @@ selection, not the running game, and must never claim its pointer. A game's own 
 
 **A stranded synthetic press, and why a real finger reclaims it (#299).** The primary-touch rule —
 the first pointer down owns the gesture, later pointers are ignored until it lifts — assumes the
-owning press eventually lifts. A press from the **device debug bridge** need not: `device_pointer
+owning press eventually lifts. (This section is about `pointerSource` specifically; `gestureSource`
+listens to the same events on an independent list and is not affected either way — see "Multi-touch
+gestures" below.) A press from the **device debug bridge** need not: `device_pointer
 {action:'down'}` holds across calls BY DESIGN, so an agent that never sends the matching `up` leaves
 `activeId` latched with no live pointer behind it, and nothing recovers it (`blur`/`visibilitychange`
 /play-start resets do not fire in a running shipped game). From then on every `pointerdown` — the
@@ -700,6 +706,88 @@ owner then played it on that phone.
 dispatch at the canvas), and an unbalanced synthetic press additionally strands
 `pointerSource.activeId`, which killed real dragging until a cold relaunch. Both are #299; until
 that is fixed, an on-device pass for anything DOM-shaped is not evidence.
+
+## Multi-touch gestures — pan, pinch, tap
+
+A fourth source, `input/gestureSource.ts`, derives pan/pinch/tap from **every** live pointer — the
+shape of the whole hand — where `pointerSource` above tracks only the one primary touch. It reports
+a `GestureFrame` (`core/inputActions.ts`) on `Input.gesture`, read via the accessors `gesture`/
+`pinching`/`pinchScale`/`pinchScaleDelta`/`panDelta`/`gestureTapped`/`gestureTapPos` (`traits/Input.ts`).
+
+**Why a second source, not a change to `pointerSource`.** The primary-touch latch above — first
+`pointerId` down owns the gesture, later ones ignored until it lifts — is load-bearing (it's why "walk
+while you orbit" works at all, see "Two thumbs at once" above), and the per-pointerId design it
+replaced was removed deliberately. A pinch needs exactly the fingers that rule discards, so
+`gestureSource` keeps its own list and listens to the same `window` events **independently** — sources
+are independent listeners, so nothing here perturbs `pointerSource`. `touchControlSource` is the
+existing precedent for tracking pointers per id.
+
+**The tap/pan state machine (one finger).** Full diagram in the file's own header comment; the
+contract:
+- a move past the slop radius promotes to PAN immediately — a flick must not wait out the tap window;
+- an `up` inside the tap window and inside the slop is a TAP;
+- a move after the tap window has already elapsed (a held, then dragged, finger) also promotes to PAN;
+- pan resumes from the point the slop was **crossed**, not the press origin, so engaging pan does not
+  jump the content by the slop radius.
+
+A second finger going down abandons any pan/tap candidacy and starts a PINCH; lifting back to one
+finger ENDS the gesture rather than resuming a pan — a released pinch must not fling the content with
+whatever the remaining finger does next.
+
+**The two thresholds** — `DEFAULT_TAP_MAX_MS` (250 ms) and `DEFAULT_TAP_SLOP_PX` (10, in **CSS px**,
+not a game's design-space px, because finger slop is a property of the screen, not of whatever
+reference resolution a game letterboxes into — 10 sits between Android's 8 dp touch slop and iOS's
+~10 pt). Both are feel knobs: `configureGestures({tapMaxMs, tapSlopPx})` retunes them,
+`getGestureConfig()` reads the live values, and a game is expected to author its own rather than
+inherit these.
+
+**No wall clock.** Timing comes from `e.timeStamp` on the pointer events themselves — never
+`performance.now()` — so the file stays clear of the determinism guard. That's sufficient because the
+one case a timer would otherwise be needed for (a finger held motionless past the tap window) has
+nothing to pan: the promotion is only ever *observed* on the next move or up event, and both carry a
+timestamp.
+
+**Scaling.** `panX`/`panY` are a magnitude, presentation-scaled once in `inputSystem` exactly like
+`pointerDrag`'s `dragX`/`dragY` (see "Presentation-invariant input" above). `pinchScale`/
+`pinchScaleDelta` are **ratios** — already scale-invariant — and are deliberately left unscaled.
+
+⚠️ **A sentinel timestamp inverts under subtraction.** The first implementation parked `downT` at
+`+Infinity` to mark "not a fresh press" after a pinch ended with one finger still down. `t - Infinity`
+is `-Infinity`, which *is* less than the tap window, so a finger surviving a lifted pinch emitted a
+phantom tap. It is now an explicit `tapEligible` flag, cleared whenever the current press is not fresh
+(a second finger arriving, or a leftover finger after the gesture ends). Caught by
+`gestureSource.test.ts`'s `'a second finger abandons a tap candidacy'`.
+
+**The verification gap.** `modoki_pointer`/`device_pointer` are single-pointer and cannot drive a real
+two-finger gesture, so a game consuming `pinching`/`pinchScale` needs a debug action that sets its own
+state directly, plus an on-hardware check before trusting the feel — the same evidence gap "Two
+thumbs at once" above flags for the d-pad's own two-finger case.
+
+### Pinching with a mouse (owner, 2026-08-30)
+
+A desktop has one cursor, so **`Shift`/`Ctrl`/`Alt` + left-drag stands in for a two-finger pinch**.
+Two circles are drawn: the one under the cursor is finger A, and finger B is A **mirrored through the
+anchor** — the point the drag started at. Drag away from the anchor to zoom in, back toward it to zoom
+out.
+
+⚠️ **Mirroring is not cosmetic — it is what keeps the zoom centre still.** The centroid of a point and
+its own mirror IS the anchor, exactly, on every frame, so a consumer zooming about `centerX/centerY`
+zooms about the point you pressed. A stationary second finger would drag the centroid along with the
+cursor and the view would slide while you zoomed.
+
+The two synthetic fingers are pushed into the **same `live` list real touches use**, so `spread()`,
+`centroid()` and `sample()` have no emulation-aware branch. There is one code path, which is what
+stops the emulation from drifting away from the behaviour it stands in for.
+
+⚠️ **The pinch does not ARM until the fingers separate by `EMULATED_PINCH_SEED_PX` (24).** Both start
+on the anchor, so the initial spread is 0 and a scale ratio against it would be undefined; arming at a
+real separation gives `pinchStartDist` an honest divisor.
+
+Dev-only by default (`import.meta.env.DEV`), overridable either way with
+`configureGestures({ mouseEmulation })`. ⚠️ On macOS `Ctrl`+click is also a right-click, so prefer
+`Shift` there. And note the modifier does **not** hide the drag from `pointerSource` — it still sees
+an ordinary primary press, so a game that drags on the primary pointer must gate that on
+`!pinching`, exactly as it must for a real two-finger pinch.
 
 ## Gotchas
 

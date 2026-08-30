@@ -753,7 +753,10 @@ export function registerAllTraits() {
         tooltip: 'Muted video is exempt from the browser autoplay rule; a clip WITH sound needs a user gesture first.',
       },
       volume: { type: 'number', min: 0, max: 1, step: 0.05 },
-      bus: { type: 'enum', options: ['master', 'music', 'sfx', 'ui'], tooltip: 'Mix bus for the video\'s audio track.' },
+      bus: {
+        type: 'enum', options: ['master', 'music', 'sfx', 'ui'],
+        tooltip: 'Mix bus for the video\'s audio track. NOT live — takes effect on a clip change, entity despawn, leaving Play, or a scene swap, not on a clip already playing.',
+      },
       rate: { type: 'number', min: 0.1, max: 4, step: 0.05, tooltip: 'Playback rate before timeScale (1 = normal).' },
       timeMode: {
         type: 'enum', options: ['diegetic', 'presentation'],

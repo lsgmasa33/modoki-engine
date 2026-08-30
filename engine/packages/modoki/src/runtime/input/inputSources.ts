@@ -18,6 +18,7 @@ import { keyboardSource } from './keyboardSource';
 import { gamepadSource } from './gamepadSource';
 import { pointerSource } from './pointerSource';
 import { touchControlSource } from './touchControlSource';
+import { gestureSource } from './gestureSource';
 import { registerInputPromptSources } from './inputPromptSources';
 
 export interface InputSource {
@@ -185,6 +186,8 @@ registerSource(keyboardSource);
 registerSource(gamepadSource);
 registerSource(pointerSource);
 registerSource(touchControlSource);
+// Multi-touch pan/pinch/tap. Independent of pointerSource's primary-touch latch — see its header.
+registerSource(gestureSource);
 
 /** App-scope Manager: attaches all sources on register, detaches on unregister.
  *  Replaces the old keyboard-only `inputManagerDef`. */

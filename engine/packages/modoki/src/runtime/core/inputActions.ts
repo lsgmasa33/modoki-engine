@@ -73,12 +73,70 @@ export interface PointerFrame {
  *  state each source ORs into; `pressed`/`released` are the edges the inputSystem
  *  derives by diffing `held` against the previous frame (see `computeEdges`).
  *  `pointer` is authoritative (see `PointerFrame`), not OR-merged. */
+
+/** A multi-touch GESTURE snapshot — pan, pinch and tap, derived from ALL live pointers.
+ *
+ *  Separate from `PointerFrame` on purpose. `pointerSource` latches the FIRST pointerId and
+ *  ignores every later one (its primary-touch rule), which is what makes "walk while you orbit"
+ *  work and was removed once already; a pinch needs the fingers that rule discards. So
+ *  `gestureSource` observes the same `window` events independently and reports here, and the two
+ *  never contend: one owns the primary gesture, the other owns the shape of the whole hand.
+ *
+ *  EDGES (`tapped`, `pinchStarted`, `pinchEnded`) and DELTAS (`panX/panY`, `pinchScaleDelta`) are
+ *  per-frame and cleared by `beginSample`, so a frame on which the source does not run — input
+ *  suppressed by the host gate, or no source registered at all — reports no gesture rather than
+ *  repeating the last one.
+ *
+ *  Coordinates are viewport CSS px, matching `PointerFrame`. `panX/panY` are a MAGNITUDE and are
+ *  presentation-scaled once in `inputSystem`, exactly like `dragX/dragY`; `pinchScale` is a RATIO
+ *  and is therefore already zoom-invariant with nothing to scale. */
+export interface GestureFrame {
+  /** How many pointers are down right now (blocked ones excluded). */
+  pointerCount: number;
+  /** A one-finger pan is in progress — the gesture cleared the tap window or the slop radius. */
+  panning: boolean;
+  /** Pan movement THIS FRAME, presentation-scaled. Zero unless panning or pinching.
+   *  While pinching this is the CENTROID's movement, so two fingers pan and zoom at once. */
+  panX: number;
+  panY: number;
+  /** Two or more pointers are down and the pinch is live. */
+  pinching: boolean;
+  /** Edge: the frame the pinch began / ended. */
+  pinchStarted: boolean;
+  pinchEnded: boolean;
+  /** Spread RATIO against the distance the pinch STARTED at (1 = unchanged). Absolute, so a
+   *  consumer can drive zoom from the gesture's origin without accumulating drift. */
+  pinchScale: number;
+  /** Spread ratio against the PREVIOUS frame (1 = unchanged) — the incremental form, for a
+   *  consumer that multiplies into a zoom it already holds. 1 while not pinching. */
+  pinchScaleDelta: number;
+  /** Centroid of the live pointers, viewport CSS px. Meaningless while `pointerCount` is 0. */
+  centerX: number;
+  centerY: number;
+  /** Edge: a tap COMPLETED this frame — one finger, released inside the tap window, never having
+   *  travelled past the slop radius. See `gestureSource` for the two thresholds. */
+  tapped: boolean;
+  /** Where the tap went down (not where it came up; they differ by at most the slop radius). */
+  tapX: number;
+  tapY: number;
+}
+
+export function makeGesture(): GestureFrame {
+  return {
+    pointerCount: 0, panning: false, panX: 0, panY: 0,
+    pinching: false, pinchStarted: false, pinchEnded: false,
+    pinchScale: 1, pinchScaleDelta: 1, centerX: 0, centerY: 0,
+    tapped: false, tapX: 0, tapY: 0,
+  };
+}
+
 export interface InputFrame {
   axes: AxisMap;
   held: FlagMap;
   pressed: FlagMap;
   released: FlagMap;
   pointer: PointerFrame;
+  gesture: GestureFrame;
   lastDevice: InputDevice;
 }
 
@@ -98,7 +156,7 @@ export function makeFlags(): FlagMap {
 }
 
 export function createInputFrame(): InputFrame {
-  return { axes: makeAxes(), held: makeFlags(), pressed: makeFlags(), released: makeFlags(), pointer: makePointer(), lastDevice: 'none' };
+  return { axes: makeAxes(), held: makeFlags(), pressed: makeFlags(), released: makeFlags(), pointer: makePointer(), gesture: makeGesture(), lastDevice: 'none' };
 }
 
 /** Zero the per-sample state (axes + held) before re-sampling all sources into the
@@ -109,6 +167,22 @@ export function createInputFrame(): InputFrame {
 export function beginSample(frame: InputFrame): void {
   for (const a of AXES) frame.axes[a] = 0;
   for (const d of DIGITAL) frame.held[d] = false;
+  // The WHOLE gesture frame is cleared, edges and levels alike, because a frame on which
+  // `gestureSource` does not run must report NO gesture rather than repeating the last one.
+  //
+  // ⚠️ This deliberately differs from `pointer`, which is left latched. The difference is that a
+  // suppressed frame still drains each source (`inputSources.drain` calls `reset()`), so the
+  // gesture source's own finger list is already gone — leaving `pinching: true` published from it
+  // would advertise a pinch that nothing is tracking. Consumers gate real behaviour on `pinching`
+  // (wordweave suppresses its whole spelling drag on it), so a latched one is a stuck game, not a
+  // cosmetic stale read: hold an editor panel's focus and the board stops accepting input.
+  const g = frame.gesture;
+  g.pointerCount = 0;
+  g.panning = false; g.panX = 0; g.panY = 0;
+  g.pinching = false; g.pinchStarted = false; g.pinchEnded = false;
+  g.pinchScale = 1; g.pinchScaleDelta = 1;
+  g.centerX = 0; g.centerY = 0;
+  g.tapped = false;
 }
 
 /** Derive the pointer down-edge into `frame.pointer.pressed`/`.released` from the

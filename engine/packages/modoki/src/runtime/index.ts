@@ -562,10 +562,16 @@ export {
   pointerPredictedPos, pointerVelocity, setPointerLeadMs, getPointerLeadMs,
   POINTER_LEAD_MS_DEFAULT, POINTER_LEAD_MS_ANDROID_60HZ,
   setPointerLeadGate, getPointerLeadGate, pointerLeadGateFactor, POINTER_LEAD_GATE_DEFAULTS,
+  // Gesture accessors — multi-touch pan / pinch / tap, from `gestureSource`.
+  gesture as inputGesture, pinching, pinchScale, pinchScaleDelta, panDelta,
+  gestureTapped, gestureTapPos,
 } from './traits/Input';
 export {
   setPointerFilterParams, getPointerFilterParams,
 } from './input/pointerSource';
+export {
+  configureGestures, getGestureConfig, DEFAULT_TAP_MAX_MS, DEFAULT_TAP_SLOP_PX, EMULATED_PINCH_SEED_PX,
+} from './input/gestureSource';
 export {
   createOneEuroFilter, oneEuroAlpha, POINTER_FILTER_DEFAULTS, type OneEuroParams,
 } from './input/oneEuroFilter';
@@ -696,6 +702,7 @@ export {
   AXES, DIGITAL, applyDeadzone, clampAxes, computeEdges, computePointerEdge, createInputFrame, beginSample,
   makeAxes, makeFlags, makePointer,
   type Axis, type DigitalAction, type InputDevice, type InputFrame, type AxisMap, type FlagMap, type PointerFrame,
+  type GestureFrame,
 } from './core/inputActions';
 export {
   vecEcsToPhys, vecPhysToEcs, angEcsToPhys, angPhysToEcs, lenToPhys, packCollisionGroups,

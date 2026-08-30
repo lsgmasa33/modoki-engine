@@ -1060,7 +1060,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
           style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: safeAreaInert ? 'default' : 'pointer', fontSize: '11px', marginBottom: 2, ...(safeAreaInert ? { opacity: 0.4 } : {}) }}>
           <input type="checkbox" checked={mx ? false : (val as boolean)} disabled={safeAreaInert}
             ref={(el) => { if (el) el.indeterminate = mx; }}
-            onChange={(e) => write(key, e.target.checked)} />
+            onChange={(e) => write(key, e.target.checked)}
+            data-ui-id={`inspector.field.${meta.name}.${key}`} />
           <FieldLabel label={key} hint={safeAreaHint} style={{ color: '#bbb' }} />
         </label>
       );

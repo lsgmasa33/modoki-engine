@@ -15,6 +15,7 @@ interface MockHandle {
   element: { currentTime: number; duration: number; loop: boolean; ended: boolean; style: Record<string, unknown> };
   playing: boolean;
   endedEvent: boolean;
+  timeMode: 'diegetic' | 'presentation';
 }
 let mock: MockHandle | undefined;
 
@@ -26,14 +27,25 @@ let mock: MockHandle | undefined;
 //      LOOPING clip, which must never read as ended.
 //   3. `seek()` clamps to `[0, duration]` and clears `endedEvent` only when `t < duration` — a
 //      seek TO the duration (or past it) must not un-end the clip.
+//
+// ⚠️ What this mock does NOT model: the real element pauses ITSELF at the end (native `paused`
+// flips true, then `onEnded` calls `handle.pause()`) — here `rec.playing` only ever changes from
+// an explicit `play()`/`pause()` call, so `mock!.element.ended = true` alone (as several tests
+// below do) leaves `rec.playing` still `true` underneath the `ended()` mask. That means this
+// mock reaches "started" (`handle.playing` true) ONE RECONCILE PASS SOONER than production would
+// after a real pause — the `videoSystem(world!)` call counts below (e.g. "a second pass is
+// needed") encode the #431 observation lag against THIS mock's latency, not necessarily
+// production's. Don't lift a pass count from this file into a real-handle test (like
+// `videoSystemLiveContract.test.ts`) without re-checking it against the real element.
 vi.mock('../../src/runtime/video/videoService', () => ({
   applyTimeScale: () => {},
   videoFadeGain: () => 1,
-  playVideo: (opts: { url: string; loop?: boolean }) => {
+  playVideo: (opts: { url: string; loop?: boolean; timeMode?: 'diegetic' | 'presentation' }) => {
     const rec: MockHandle = {
       element: { currentTime: 0, duration: 10, loop: !!opts.loop, ended: false, style: {} },
       playing: false,
       endedEvent: false,
+      timeMode: opts.timeMode ?? 'diegetic',
     };
     mock = rec;
     const ended = () => rec.endedEvent || (!rec.element.loop && rec.element.ended);
@@ -55,8 +67,16 @@ vi.mock('../../src/runtime/video/videoService', () => ({
         if (t < rec.element.duration) { rec.endedEvent = false; rec.element.ended = false; }
       },
       setVolume: () => {}, setMuted: () => {}, setRate: () => {},
+      setLoop: (loop: boolean) => { rec.element.loop = loop; },
+      // Mutates the tracked field rather than a no-op, so a test CAN model a timeMode change —
+      // a mock that swallows this call silently passes a `videoSystem` bug that skips it.
+      setTimeMode: (mode: 'diegetic' | 'presentation') => { rec.timeMode = mode; },
       get ended() { return ended(); },
-      timeMode: 'diegetic' as const,
+      // Mirrors `LiveVideoHandle.playing` (`!paused && !blocked && !ended`): this fake element
+      // has no autoplay-policy `blocked` state, so `rec.playing` (set by `play()`/`pause()`
+      // below) alone stands in for `!paused`.
+      get playing() { return rec.playing && !ended(); },
+      get timeMode() { return rec.timeMode; },
       dispose: () => {},
     };
   },
@@ -99,6 +119,10 @@ describe('videoSystem — replay re-arms start/end (#426)', () => {
   it('a stop + replay of the SAME clip fires @video.start a second time', () => {
     const e = world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
     videoSystem(world!);
+    // #431: `@video.start` now latches on OBSERVED playback, checked before this pass's own
+    // play() request — a fresh handle's first successful play() is only observed one pass
+    // later, so a second pass is needed to reach "started" before this test's own concern.
+    videoSystem(world!);
     expect(starts).toBe(1);
 
     // "video.stop" is seek(0) + pause, driven by the action layer — reproduced directly here.
@@ -108,11 +132,17 @@ describe('videoSystem — replay re-arms start/end (#426)', () => {
 
     e.set(VideoPlayer, { playing: true });
     videoSystem(world!);
+    // #431: this resume goes through a genuine pause (rec.playing flipped false above), so —
+    // like the fresh handle at the top of this test — the new play() request is only OBSERVED
+    // as started on the pass after this one.
+    videoSystem(world!);
     expect(starts).toBe(2);
   });
 
   it('a clip that ends, is rewound, and plays again fires @video.end a second time', () => {
     const e = world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
+    videoSystem(world!);
+    // #431: see the comment in the previous test.
     videoSystem(world!);
     expect(starts).toBe(1);
 
@@ -136,6 +166,8 @@ describe('videoSystem — replay re-arms start/end (#426)', () => {
   it('a mid-clip pause -> resume fires @video.start only ONCE', () => {
     const e = world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
     videoSystem(world!);
+    // #431: see the first test in this file.
+    videoSystem(world!);
     expect(starts).toBe(1);
 
     e.set(VideoPlayer, { playing: false });
@@ -148,6 +180,8 @@ describe('videoSystem — replay re-arms start/end (#426)', () => {
   it('a mid-clip seek does NOT re-arm @video.start', () => {
     const e = world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
     videoSystem(world!);
+    // #431: see the first test in this file.
+    videoSystem(world!);
     expect(starts).toBe(1);
 
     seekEntityVideo(e.id(), 5);
@@ -159,6 +193,8 @@ describe('videoSystem — replay re-arms start/end (#426)', () => {
   // still count as a new playback — both the second start AND its paired second end.
   it('a second @video.end pairs with a second @video.start on a mid-clip (non-zero) seek', () => {
     const e = world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
+    videoSystem(world!);
+    // #431: see the first test in this file.
     videoSystem(world!);
     expect(starts).toBe(1);
 
@@ -184,6 +220,8 @@ describe('videoSystem — replay re-arms start/end (#426)', () => {
   it('playing = true on an ended clip with no seek emits NO start', () => {
     const e = world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
     videoSystem(world!);
+    // #431: see the first test in this file.
+    videoSystem(world!);
     expect(starts).toBe(1);
 
     mock!.element.ended = true;
@@ -204,6 +242,8 @@ describe('videoSystem — replay re-arms start/end (#426)', () => {
   it('@video.end fires exactly once across several reconcile passes while ended stays true', () => {
     world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
     videoSystem(world!);
+    // #431: see the first test in this file.
+    videoSystem(world!);
     expect(starts).toBe(1);
 
     mock!.element.ended = true;
@@ -219,6 +259,8 @@ describe('videoSystem — replay re-arms start/end (#426)', () => {
   // expressible with the mock's `element.loop`/`element.ended` split (B1).
   it('a looping clip fires @video.start once and @video.end never', () => {
     world!.spawn(VideoPlayer({ clip: CLIP, playing: true, loop: true }));
+    videoSystem(world!);
+    // #431: see the first test in this file.
     videoSystem(world!);
     expect(starts).toBe(1);
     expect(mock!.element.loop).toBe(true);
@@ -253,6 +295,8 @@ describe('videoSystem — video.stop + video.setClip re-arms via the real action
         EntityAttributes({ guid }),
         VideoPlayer({ clip: CLIP, playing: true }),
       );
+      videoSystem(world!);
+      // #431: see the first test in this file.
       videoSystem(world!);
       expect(starts).toBe(1);
 
@@ -323,6 +367,8 @@ describe('videoSystem — video.skip closes the @video.end pairing hole (#426 fi
       const guid = 'video-skip-ended-guid';
       world!.spawn(EntityAttributes({ guid }), VideoPlayer({ clip: CLIP, playing: true }));
       videoSystem(world!);
+      // #431: see the first test in this file.
+      videoSystem(world!);
       expect(starts).toBe(1);
 
       mock!.element.ended = true;
@@ -342,6 +388,8 @@ describe('videoSystem — video.skip closes the @video.end pairing hole (#426 fi
     await withVideoControls(() => {
       const guid = 'video-skip-playing-guid';
       world!.spawn(EntityAttributes({ guid }), VideoPlayer({ clip: CLIP, playing: true }));
+      videoSystem(world!);
+      // #431: see the first test in this file.
       videoSystem(world!);
       expect(starts).toBe(1);
       expect(mock!.element.ended).toBe(false);

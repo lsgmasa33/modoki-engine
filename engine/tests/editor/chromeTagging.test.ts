@@ -110,17 +110,20 @@ const REQUIRED: Array<{ file: string; ids: string[]; why: string }> = [
       + 'reports occluded and Enact refuses the aim, so an untagged Close means a trapped agent.',
   },
   {
-    // Two Inspector call sites construct the same-shaped id independently: the generic
-    // `hint.type:'number'` branch (NumberField) and the bounded UI-anchor size branch
-    // (BufferedNumberInput) both key off `meta.name` (the trait); VecField's per-axis
-    // BufferedNumberInput keys off its own `traitName` prop instead, since VecField has
-    // no `meta` in scope. Without a stable id here a QA case has to aim by the stale
-    // `value` DOM attribute, which stops matching the moment the field changes (bug
-    // y9WMNPkT0DivkxZKJDWU — QA-INSP-0010 aimed a `NumberField` selector at a value that
-    // could never render, because the case assumed the OTHER widget backed the field).
+    // Three Inspector call sites construct the same-shaped id independently: the generic
+    // `hint.type:'number'` branch (NumberField), the bounded UI-anchor size branch
+    // (BufferedNumberInput), and the `hint.type:'boolean'` checkbox branch all key off
+    // `meta.name` (the trait); VecField's per-axis BufferedNumberInput keys off its own
+    // `traitName` prop instead, since VecField has no `meta` in scope. Without a stable id
+    // here a QA case has to aim by the stale `value`/`checked` DOM attribute, which stops
+    // matching the moment the field changes (bug y9WMNPkT0DivkxZKJDWU — QA-INSP-0010 aimed a
+    // `NumberField` selector at a value that could never render, because the case assumed the
+    // OTHER widget backed the field). The boolean branch had NO id at all until the checkbox
+    // was tagged to match — see `qa/cases/video/loop-flip-applies-live.md`, which drives
+    // `VideoPlayer.loop`'s checkbox by this exact id.
     file: 'panels/Inspector.tsx',
     ids: ['`inspector.field.${meta.name}.${key}`', '`inspector.field.${traitName}.${f.key}`'],
-    why: 'per-field ids for every Inspector number input (NumberField and BufferedNumberInput alike), so a case can aim by stable id instead of a value-dependent CSS selector.',
+    why: 'per-field ids for every Inspector NUMBER input (NumberField and BufferedNumberInput alike) AND every BOOLEAN checkbox — same template, both branches — so a case can aim by stable id instead of a value-dependent CSS selector.',
   },
   {
     // The two asset editors the 2026-08-20 QA batch drives. Both carried ZERO tags while

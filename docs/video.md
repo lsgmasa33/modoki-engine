@@ -176,7 +176,23 @@ does not.
 
 Both freeze at a time-stop, because a time-stop should stop everything. Only slow-mo distinguishes
 them: dragging a screen in the world to 0.3× is right, and dragging cutscene dialogue to 0.3× is
-almost certainly not.
+almost certainly not. `timeMode` is itself live (below) — flipping it on a running clip reapplies
+the effective rate immediately, it does not wait for the clip's next play.
+
+### Which `VideoPlayer` fields are live
+
+Most fields are live-applied every reconcile pass, the moment the trait changes: `playing`,
+`muted`, `volume`, `rate`, `fadeOutSec`, `loop` and `timeMode` all reach the element (or its
+computed rate) on the same frame the Inspector or a game writes them (#433 fixed `loop` and
+`timeMode`, which were create-time-only until then).
+
+`bus` is the one exception, and stays create-time only: the audio route is wired once, when the
+handle is created (`attachMediaElementToBus` in `videoService.ts`), so changing `bus` on an
+already-playing clip does nothing until this entity's handle is next RECREATED — a `clip` change,
+the entity despawning, leaving Play, or a scene swap. `video.stop` does **not** recreate the
+handle (it is a seek-to-0 + pause, `actions/videoControls.ts`), so stopping and replaying the same
+clip keeps the old `bus`. `clip` itself always takes effect, because changing it recreates the
+handle outright.
 
 ### Ending a clip: the last frame, and `fadeOutSec`
 
@@ -196,7 +212,9 @@ holds near full volume for most of the ramp, which is the opposite of what a fad
 not start on its own in a browser; `videoService` records the rejection and retries on the first
 gesture (sharing the audio subsystem's unlock signal), so the clip shows its first frame until
 then. A clip that must move immediately has to be `muted: true` — which also makes `fadeOutSec`
-moot. This is browser policy, not an engine choice.
+moot. This is browser policy, not an engine choice. **`@video.start` announces nothing while
+blocked** — see "`@video.start` means observed playback, not a request" below for what the event
+does and when it fires once the gesture arrives.
 
 ## Remote delivery
 
@@ -468,24 +486,49 @@ and the asymmetry is deliberate:
 
 Both halves are load-bearing. Without the end-emit half, a `video.seek` to *mid-clip* out of a
 finished clip re-arms `endEmitted` and emits a second `@video.end` with no `@video.start` to pair
-it. The start-emit is also gated on `!handle.ended`: `play()`
-refuses a finished clip, but the end-emit half re-arms `startEmitted` right after `@video.end`
-fires — so `playing = true` on a still-ended clip with no intervening seek would otherwise
-announce a start for a playback that can never happen, whose paired end can't fire again.
+it. The start-emit is also gated on `!handle.ended` **and** on `handle.playing` being OBSERVED
+true (see the next paragraph) — `play()` refuses a finished clip, but the end-emit half re-arms
+`startEmitted` right after `@video.end` fires, so `playing = true` on a still-ended clip with no
+intervening seek would otherwise announce a start for a playback that can never happen, whose
+paired end can't fire again.
 
 ⚠️ **Do not count start/end as matched PAIRS — they are not, by design.** Each event is
 individually correct ("this playback was asked to begin", "this clip was observed to finish"), and
 the two counts legitimately diverge: a `video.stop` mid-clip re-arms the start but emits no end,
 because an *abandoned* playback never finished. Gate on the events; don't keep a balance.
 
-⚠️ **A start means "the reconcile asked it to play", not "pixels moved"** — an autoplay-blocked
-clip announces a start that never renders, and emits no second start when the gesture unblocks it.
-That gap is **#431**, and it needs a `VideoHandle` contract change rather than a guard.
+**`@video.start` means observed playback, not a request (#431, fixed).** The reconcile checks
+`handle.playing` (`!paused && !blocked && !ended`) *before* that same pass's own `handle.play()`
+call, and only latches `startEmitted`/emits the start once that check reads true. A real
+`element.play()` flips `paused` synchronously and rejects its promise (if the autoplay policy
+blocks it) only later — so checking after `play()` would still read "playing" for one frame on a
+clip that is about to be blocked. Checking before means: a genuine play request is observed
+started on the FOLLOWING reconcile pass, one frame later than the request — the accepted cost of
+correctness — and a blocked request announces nothing until the clip genuinely starts, however
+that happens (including via `retryBlockedPlay()`'s gesture-unlock retry, which runs outside this
+system entirely).
 
-⚠️ **Never write `VideoPlayer` from an `onStart`/`onEnd` handler.** Both fire from *inside*
-`updateEach`, and koota writes its trait snapshot back after the callback — so the write is
-silently discarded and the obvious "chain the next clip when this one ends" handler does nothing at
-all. Defer to the next tick, or drive it from an action. That is **#432**.
+### A handler may write `VideoPlayer` now (#432, fixed)
+
+koota's `world.query(T).updateEach(cb)` snapshots each entity's trait into a local before `cb`
+runs and writes that snapshot back UNCONDITIONALLY once `cb` returns — so a handler invoked
+*synchronously* from inside the callback (an `onStart`/`onEnd` listener fired by `emitVideoStart`/
+`emitVideoEnd`) could call `entity.set(VideoPlayer, ...)` and have the write silently clobbered by
+koota's own post-callback write-back of the stale pre-callback snapshot. The obvious "chain the
+next clip when this one ends" handler did nothing at all.
+
+The fix is a collect-then-flush split, not a guard: `videoSystem` pushes each `@video.start`/
+`@video.end` into a local array *during* the `world.query(VideoPlayer).updateEach(...)` pass and
+only calls `emitVideoStart`/`emitVideoEnd` on them once that call returns — past koota's
+write-back for every entity in the query, not just the one that fired. **A handler MAY write
+`VideoPlayer` now**, on the entity that fired the event or any other.
+
+This is the same invariant `timelineSystem.ts` states explicitly in its own pass split ("PASS 1 —
+collect... never emit/dispatch/set-on-other-entities inside the query") and that
+`zone2DSystem.ts`/`zone3DSystem.ts` already follow (occupant/zone samples are collected during
+their queries; `runZoneTriggers` emits after both queries close) — video is the third system to
+need it, not the first. **Issue #445** tracks the two known sites that do NOT yet follow it (both
+in physics); it is not a video-specific pattern.
 
 **The overlay binds no keyboard handler, on purpose.** Which key skips a cutscene (or whether any
 key does) is a game's call, not the engine's; a game binds its key to the `video.skip` action. Raw
