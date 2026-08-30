@@ -369,8 +369,13 @@ describe('context-cost-guard — failure modes', () => {
 });
 
 describe('context-cost-guard — settings registration', () => {
-  it('is registered on both Bash and Read, and claim-guard.mjs is still registered on Bash', () => {
-    const settings = JSON.parse(fs.readFileSync(path.join(repoRoot, '.claude/settings.json'), 'utf8'));
+  // `.claude/` is deliberately excluded from the public OSS snapshot (see
+  // engine/scripts/claim-guard.mjs), so this file is absent there — skip rather than crash.
+  const settingsPath = path.join(repoRoot, '.claude/settings.json');
+  it.skipIf(!fs.existsSync(settingsPath))(
+    'is registered on both Bash and Read, and claim-guard.mjs is still registered on Bash',
+    () => {
+    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
     const preToolUse = settings.hooks.PreToolUse as Array<{ matcher: string; hooks: Array<{ command: string }> }>;
 
     const bashEntry = preToolUse.find((e) => e.matcher === 'Bash');
@@ -382,5 +387,7 @@ describe('context-cost-guard — settings registration', () => {
     const readEntry = preToolUse.find((e) => e.matcher === 'Read');
     expect(readEntry).toBeDefined();
     expect(readEntry!.hooks.some((h) => h.command.includes('context-cost-guard.mjs'))).toBe(true);
-  });
+    },
+  );
 });
+
