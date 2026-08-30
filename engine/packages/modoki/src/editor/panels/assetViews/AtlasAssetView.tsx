@@ -12,6 +12,7 @@ import { persistAtlasDoc } from './atlasPersist';
 import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { getAssetEntry, getGuidForPath, type AtlasCacheBlock } from '../../../runtime/loaders/assetManifest';
+import { defaultAtlasSource } from '../../../runtime/loaders/spriteAtlas';
 import { resolveAtlasPageUrl } from '../../../runtime/loaders/textureResolver';
 import { markScene2DDirty } from '../../../runtime/rendering/Scene2D';
 import { TEXTURE_MAX_SIZES } from '../../../runtime/loaders/textureSettings';
@@ -30,7 +31,7 @@ interface AtlasSourceDoc {
   maxPages?: number;
 }
 
-const DEFAULT_DOC: AtlasSourceDoc = { members: [], pageSize: 1024, padding: 2, extrude: 1 };
+const DEFAULT_DOC: AtlasSourceDoc = defaultAtlasSource();
 
 /** Serialize an edit WITHOUT dropping anything the file already carried.
  *
@@ -86,9 +87,9 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
         setDoc({
           id: d.id, version: d.version,
           members: Array.isArray(d.members) ? d.members.filter((m): m is string => typeof m === 'string') : [],
-          pageSize: typeof d.pageSize === 'number' ? d.pageSize : 1024,
-          padding: typeof d.padding === 'number' ? d.padding : 2,
-          extrude: typeof d.extrude === 'number' ? d.extrude : 1,
+          pageSize: typeof d.pageSize === 'number' ? d.pageSize : DEFAULT_DOC.pageSize,
+          padding: typeof d.padding === 'number' ? d.padding : DEFAULT_DOC.padding,
+          extrude: typeof d.extrude === 'number' ? d.extrude : DEFAULT_DOC.extrude,
           ...(typeof d.maxPages === 'number' ? { maxPages: d.maxPages } : {}),
         });
       })

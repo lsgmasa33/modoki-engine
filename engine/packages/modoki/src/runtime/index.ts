@@ -59,7 +59,7 @@ export {
 } from './core/faultProvider';
 export {
   PlayerPrefs, InMemoryBackend, LocalStorageBackend, PreferencesBackend, selectDefaultBackend,
-  type JsonValue, type PlayerPrefsInitOptions, type PrefsBackend,
+  type JsonValue, type PlayerPrefsInitOptions, type PlayerPrefsInitResult, type PrefsBackend,
 } from './storage';
 export { createPrefsDocStore, type PrefsDocStore } from './storage/prefsDocStore';
 // In-app purchases (#196). `reconcile()` MUST run once per launch before the player can buy

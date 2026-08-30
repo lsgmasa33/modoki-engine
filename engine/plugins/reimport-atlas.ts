@@ -14,7 +14,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { packAtlas, type PackInput, type AtlasSource, type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
+import { packAtlas, defaultAtlasSource, type PackInput, type AtlasSource, type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 import {
   resolveTextureSettings, TEXTURE_MAX_SIZES,
   type TextureImportSettings, type TextureMaxSize,
@@ -56,13 +56,14 @@ interface ResolvedMember {
 /** Read + normalize the authored `.atlas.json`. */
 function readAtlasSource(absPath: string): AtlasSource {
   const raw = JSON.parse(fs.readFileSync(absPath, 'utf-8')) as Partial<AtlasSource>;
+  const defaults = defaultAtlasSource();
   return {
     id: typeof raw.id === 'string' ? raw.id : '',
-    version: 1,
+    version: defaults.version,
     members: Array.isArray(raw.members) ? raw.members.filter((m): m is string => typeof m === 'string') : [],
-    pageSize: typeof raw.pageSize === 'number' && raw.pageSize > 0 ? raw.pageSize : 1024,
-    padding: typeof raw.padding === 'number' && raw.padding >= 0 ? raw.padding : 2,
-    extrude: typeof raw.extrude === 'number' && raw.extrude >= 0 ? raw.extrude : 1,
+    pageSize: typeof raw.pageSize === 'number' && raw.pageSize > 0 ? raw.pageSize : defaults.pageSize,
+    padding: typeof raw.padding === 'number' && raw.padding >= 0 ? raw.padding : defaults.padding,
+    extrude: typeof raw.extrude === 'number' && raw.extrude >= 0 ? raw.extrude : defaults.extrude,
     ...(typeof raw.maxPages === 'number' ? { maxPages: raw.maxPages } : {}),
     ...(raw.texture ? { texture: raw.texture } : {}),
   };

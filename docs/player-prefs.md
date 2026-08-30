@@ -43,6 +43,7 @@ import { PlayerPrefs } from '@modoki/engine/runtime';
 type JsonValue = null | boolean | number | string | JsonValue[] | { [k: string]: JsonValue };
 
 await PlayerPrefs.init({ namespace, backend })   // hydrate the cache once at boot (app does this)
+                                                  // → { discardedPending: string[] } (see Gotchas)
 PlayerPrefs.get<T>(key): T | undefined           // sync, returns a fresh copy
 PlayerPrefs.set<T>(key, value): void             // sync into cache; atomic durable write is debounced
 PlayerPrefs.has(key): boolean
@@ -166,6 +167,53 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   before the fix). **"Authoritative" holds only at a STABLE point — after an awaited `flush()`**,
   the same qualifier `hasPendingWrite` already carries: `drain()` empties `dirty` BEFORE awaiting the
   backend calls, so mid-drain `pendingKeys()` under-reports a write that is genuinely in flight.
+
+- ⚠️ **`init()` DISCARDS whatever a failed flush re-queued — it now REPORTS this instead of
+  silently dropping it (#421).** `init()` clears `cache`/`dirty` unconditionally to hydrate the new
+  namespace/game, and the swap PROCEEDS regardless — a quota-exceeded phone must not hard-block an
+  OTA sub-game switch. But `dirty` can be non-empty when it does, in two distinct ways, and `init()`
+  now `console.error`s the discarded keys and returns them as `discardedPending` (sorted) on both:
+  - **A real game swap** (`init()` re-called while already hydrated): the pre-swap step drains to
+    CONVERGENCE, not `flush()`'s bounded two drains — `flush()` alone snapshots `dirty` before
+    awaiting the backend, so a `set()` landing during its second drain is never attempted by anyone
+    and would otherwise be reported as "rejected" when it was never even tried (#421 review). If the
+    loop converges, anything still `dirty` was genuinely **rejected by the backend** (quota, native
+    I/O). If it hits its cap (`MAX_PRESWAP_FLUSHES`) still changing, the message says explicitly that
+    some keys may have been attempted-and-rejected and others may never have been attempted — it
+    does not claim either. Either way, the outgoing game's last write to that key is lost.
+  - **The very first `init()` call**: no flush runs on this path at all, so a dirty key here was
+    `set()` *before* `init()` ever ran — it only ever lived in the throwaway `'default'`-namespace
+    cache `init()` is about to clear, and nothing was ever sent to a backend. This is the "every
+    signal says success" case above (a caller bug — writing before `init()`), not a rejection, and
+    the message says so — do not conflate the two in a message, that conflation is what cost two
+    review rounds on #422's sibling issue.
+  Both callers (`App.tsx`'s `GameShell` boot effect, `editor/setup.ts`'s `createGameEditor`) log the
+  discarded keys with the outgoing/incoming game context `init()` itself doesn't have. Neither
+  routes this through the event journal — a game swap is a two-world atomic swap, and the journal is
+  per-world, so the record would land in the world being discarded.
+
+  ⚠️ **A `getAll()` rejection leaves `hydrated` correctly `false`, not stale-`true`.** `init()` sets
+  `hydrated = false` immediately after clearing `cache`/`dirty`, before the `await backend.getAll()`
+  — so a throw there is answered as "not hydrated" (the true state for the new namespace) rather
+  than carrying over the PREVIOUS namespace's `true`. `agentBridge.ts`'s `prefsUnhydrated()` gates
+  every prefs read/write on this flag; before this, a throwing `getAll()` left it stale-true and a
+  caller got `keys: []` for a store it never actually opened, indistinguishable from a genuinely
+  empty one.
+
+  ⚠️ **`GameShell` is the only in-process seam that reaches the swap case — File → Open Project in
+  the Electron editor cannot, and neither can the web-served editor, for two different reasons.**
+  #421 named "File → Open Project in the editor" as a discard seam; it is not one. In the Electron
+  editor, `setProject` ends with `mainWindow.webContents.reloadIgnoringCache()`
+  (`engine/electron/main.ts`), so `createGameEditor` always runs in a FRESH renderer with
+  `hydrated === false` and the pre-swap flush never executes there. In the web-served editor there
+  is no in-process "Open Project" action at all to begin with — `EditorApp`'s `React.lazy(() =>
+  createGameEditor())` is a module-level constant evaluated once per page load
+  (`engine/app/App.tsx`), and the project a dev server serves is fixed by `MODOKI_PROJECT` at server
+  start; "File → Open Project" itself is an Electron-only native menu item (`onOpenProject` in
+  `engine/electron/main.ts`), absent from the web build. Either way, `createGameEditor` can only
+  ever hit the write-before-`init()` case. The live swap seams are an **OTA sub-game switch** and
+  **hash navigation between two baked games**, both re-entering `GameShell`'s `[gameId]` boot effect
+  in a live process.
 
 - **No cross-key transaction.** Two values that must stay consistent belong in **one** key.
 - **JSON only.** `undefined` deletes the key. A top-level function/symbol or a cyclic value is

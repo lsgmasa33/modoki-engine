@@ -10,6 +10,7 @@ import { registerCreatableAsset } from './creatableAssets';
 import { defaultAnimationClip } from '../../runtime/animation/types';
 import { defaultParticleEffect } from '../../runtime/particles/types';
 import { defaultAssetData } from '../../runtime/assets/assetSchemas';
+import { defaultAtlasSource } from '../../runtime/loaders/spriteAtlas';
 import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newScene, saveScene, setCurrentScenePath } from '../scene/serialize';
@@ -126,7 +127,7 @@ export function registerBuiltinCreatableAssets(): void {
     assetType: 'atlas',
     prompt: 'Create Sprite Atlas',
     order: 7,
-    body: (guid) => ({ id: guid, version: 1, members: [], pageSize: 1024, padding: 2, extrude: 1 }),
+    body: (guid) => ({ id: guid, ...defaultAtlasSource() }),
     onCreated: ({ path, name }) => useEditorStore.getState().selectAsset({ path, type: 'atlas', name }),
   });
 }

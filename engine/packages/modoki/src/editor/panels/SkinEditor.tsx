@@ -252,7 +252,18 @@ export default function SkinEditor() {
         savedMarkRef.current?.(json);
         loadSkinDef(json);
       })
-      .catch((e) => { if (cancelled) return; console.warn('[SkinEditor] load failed', e); const fb: Rig2DFile = { bones: [], mesh: { verts: [], uvs: [], tris: [] }, skinIndices: [], skinWeights: [] }; savedMarkRef.current?.(fb); loadSkinDef(fb); });
+      .catch((e) => {
+        if (cancelled) return;
+        console.error('[SkinEditor] load failed', e);
+        // Deliberately EMPTY, not `defaultRig2DFile()` (unlike ParticleEditor/AnimationEditor/
+        // TimelineEditor's load-failure fallbacks) — owner's call, #423 item 2. A rig that failed
+        // to load should LOOK empty: a phantom `root` bone would suggest the file has content it
+        // does not, and the human could then save that fabricated bone over the broken file. Do
+        // not "fix" this to match the peers.
+        const fb: Rig2DFile = { bones: [], mesh: { verts: [], uvs: [], tris: [] }, skinIndices: [], skinWeights: [] };
+        savedMarkRef.current?.(fb);
+        loadSkinDef(fb);
+      });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [asset?.path, nonce]);

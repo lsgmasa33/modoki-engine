@@ -40,6 +40,14 @@ export interface AtlasSource {
   texture?: TextureImportSettings;
 }
 
+/** The default `.atlas.json` document (minus `id`, minted by the caller). Shared by the
+ *  "Create Atlas" button, the Atlas inspector's initial doc + per-field read fallbacks,
+ *  and the build-time reimport handler's read-side defaults — see #423. `id` is left out
+ *  because every call site mints its own GUID at a different point. */
+export function defaultAtlasSource(): Omit<AtlasSource, 'id'> {
+  return { version: 1, members: [], pageSize: 1024, padding: 2, extrude: 1 };
+}
+
 /** One packed member's placement: which page + the INNER content rect (excludes the
  *  extrude border, which the compositor draws into the surrounding gutter). */
 export interface PackedFrame {

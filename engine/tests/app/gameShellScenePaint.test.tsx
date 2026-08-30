@@ -43,7 +43,7 @@ vi.mock('@modoki/engine/runtime', () => ({
   appServices: () => ({ attribution: { init: vi.fn() }, ads: { init: vi.fn(), cleanup: vi.fn() } }),
   clearAppServices: vi.fn(),
   getCurrentWorld: vi.fn(() => ({})),
-  PlayerPrefs: { init: vi.fn(async () => {}), flush: vi.fn(async () => {}) },
+  PlayerPrefs: { init: vi.fn(async () => ({ discardedPending: [] })), flush: vi.fn(async () => {}) },
   selectDefaultBackend: vi.fn(() => 'memory'),
   audioDispose: vi.fn(),
   audioResume: vi.fn(),

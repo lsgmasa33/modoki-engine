@@ -287,7 +287,13 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // Scene3D, so this await must stay ahead of it — move it after and a player's chosen tier
         // silently reads as null on every launch, falling back to the project setting with no
         // error anywhere.
-        await PlayerPrefs.init({ namespace: gameId, backend: selectDefaultBackend() });
+        const prefsInit = await PlayerPrefs.init({ namespace: gameId, backend: selectDefaultBackend() });
+        if (prefsInit.discardedPending.length > 0) {
+          console.error(
+            `[App] PlayerPrefs.init() discarded pending write(s) while swapping from ` +
+              `"${prevGameId || '(none)'}" to "${gameId}": ${prefsInit.discardedPending.join(', ')}`,
+          );
+        }
         if (cancelled) return;
         if (def.resetPhase) setActiveResetPhase(def.resetPhase);
 

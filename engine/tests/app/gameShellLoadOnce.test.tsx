@@ -19,7 +19,7 @@ import React from 'react';
 //    vi.hoisted so they exist before the mocks are hoisted above the imports). ──
 const spies = vi.hoisted(() => ({
   attributionInit: vi.fn(),
-  playerPrefsInit: vi.fn(async () => {}),
+  playerPrefsInit: vi.fn(async () => ({ discardedPending: [] })),
   loadScene: vi.fn(async () => {}),
   clearAppServices: vi.fn(),
   resolveTierForNo3DProject: vi.fn(async () => {}),

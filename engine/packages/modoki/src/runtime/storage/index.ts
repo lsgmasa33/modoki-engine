@@ -6,7 +6,10 @@ import './playerTierProvider';
 // launch-blocking boot ramp probe from re-running on every launch (#188).
 import './probeVerdictProvider';
 
-export { PlayerPrefs, resetPlayerPrefsForTest, type JsonValue, type PlayerPrefsInitOptions } from './playerPrefs';
+export {
+  PlayerPrefs, resetPlayerPrefsForTest,
+  type JsonValue, type PlayerPrefsInitOptions, type PlayerPrefsInitResult,
+} from './playerPrefs';
 export {
   type PrefsBackend, InMemoryBackend, LocalStorageBackend, PreferencesBackend,
   selectDefaultBackend,

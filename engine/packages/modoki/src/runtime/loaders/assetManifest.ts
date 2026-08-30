@@ -561,7 +561,12 @@ export function resolveRef(ref: string): string | undefined {
       pathRefSeen.add(ref);
       console.error(
         `[assetManifest] path reference no longer supported — use a GUID: ${ref}\n` +
-        `  (Re-save the owning scene/asset in the editor, or re-run scripts/migrate-to-guids.mjs.)`,
+        `  An asset reference must be the asset's stable GUID, not a literal path — use its ` +
+        `\`id\` field (or its .meta.json sidecar GUID for a binary). Re-saving the owning ` +
+        `scene/asset does NOT fix this (the serializer only flags a stray path, it doesn't ` +
+        `rewrite it) — in the editor, re-pick the asset in the Inspector's reference field ` +
+        `(drag it from the Assets panel, or use the picker) to write a GUID. See ` +
+        `docs/scene-loading.md § "Resource cache with refcounting" for the convention.`,
       );
     }
     return undefined;

@@ -39,4 +39,24 @@ describe('rig2d create-flow parity (#417)', () => {
     );
     expect(src).not.toMatch(/bones:\s*\[\s*\{\s*name:\s*'root'/);
   });
+
+  // #423 item 2 — the LOAD-FAILURE fallback (not `newRig`) is a SEPARATE, deliberate divergence
+  // from the peer editors (ParticleEditor/AnimationEditor/TimelineEditor all route load-failure
+  // through their factory). The owner decided: keep this one EMPTY on purpose, so a future
+  // "consistency" sweep does not silently swap it for `defaultRig2DFile()`. Positive assertion
+  // (not just "does not contain the old literal") so a change to `defaultRig2DFile()`'s shape
+  // cannot alter this fallback without the assertion moving too.
+  it('SkinEditor load-failure fallback stays the deliberate empty-bones shape, and logs via console.error', () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, '../../src/editor/panels/SkinEditor.tsx'),
+      'utf8',
+    );
+    expect(src).toMatch(
+      /console\.error\('\[SkinEditor\] load failed', e\);[\s\S]{0,800}?const fb: Rig2DFile = \{ bones: \[\], mesh: \{ verts: \[\], uvs: \[\], tris: \[\] \}, skinIndices: \[\], skinWeights: \[\] \};/,
+    );
+    // It must NOT route through the shared factory — that would silently undo the owner's call.
+    // (Narrow to the actual fallback ASSIGNMENT, not the explanatory comment above it, which
+    // names `defaultRig2DFile()` on purpose to say why it is NOT used.)
+    expect(src).not.toMatch(/const fb: Rig2DFile = defaultRig2DFile\(\)/);
+  });
 });

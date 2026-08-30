@@ -279,10 +279,20 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
   //     writing into the save a web build reads. `@editor` is a suffix the game's own namespace
   //     can never produce, so the two stores can't collide.
   if (chosenGameId) {
-    await PlayerPrefs.init({
+    const prefsInit = await PlayerPrefs.init({
       namespace: `${chosenGameId}@editor`,
       backend: selectDefaultBackend(),
     });
+    // `createGameEditor()` runs once per page load (memoized by `React.lazy`), so there is no
+    // "previous game" to name at this call site — File → Open Project reloads the page (see
+    // CLAUDE.md § Editor Hot Reload), so `PlayerPrefs` was never hydrated for another game in
+    // this process. Name the game being opened; that's the whole context this site has.
+    if (prefsInit.discardedPending.length > 0) {
+      console.error(
+        `[EditorApp] PlayerPrefs.init() discarded pending write(s) opening "${chosenGameId}" in the ` +
+          `editor: ${prefsInit.discardedPending.join(', ')}`,
+      );
+    }
   }
 
   // 2. setGameConfig before registerAll (which reads nameTransform).

@@ -36,6 +36,23 @@ export function assetTypeFromPath(path: string): string {
   return 'unknown';
 }
 
+/** The `SelectedAsset.type` to use when navigating TO a path — e.g. "Locate in Assets",
+ *  "Open in editor", Find References. Prefers the live asset MANIFEST's own type
+ *  (`getAssetEntry`) over `assetTypeFromPath`'s classifier, falling back to the classifier
+ *  only when the manifest has no entry for the path.
+ *
+ *  The two deliberately disagree for a scanner-only import source like `.obj`/`.dae`:
+ *  `assetTypeFromPath` reports 'unknown' (correct for the tree-shaker/asset-pipeline
+ *  question it answers — see its own docstring), but the manifest types it 'model' (the
+ *  Assets panel offers "Import Model" for it, per `vite-asset-scanner.ts`'s EXT_TYPE). A
+ *  call site that stuffs `assetTypeFromPath`'s answer into `SelectedAsset.type` sends the
+ *  Inspector a type it has no importer section for (#423) — dead for exactly the files
+ *  clicking the SAME path in the Assets tree renders correctly. The manifest is the same
+ *  source the Assets tree itself reads from, so this makes both routes to one file agree. */
+export function selectedAssetTypeFor(path: string): string {
+  return getAssetEntry(path)?.type ?? assetTypeFromPath(path);
+}
+
 /** Friendly name for an asset path — basename without its (possibly double)
  *  extension. e.g. "/m/CubeMaterial.mat.json" → "CubeMaterial", "island.glb" → "island". */
 export function assetDisplayName(path: string): string {
@@ -174,7 +191,7 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
   const locateAsset = () => {
     if (!targetPath) return;
     const name = targetPath.substring(targetPath.lastIndexOf('/') + 1);
-    selectAsset({ path: targetPath, type: assetTypeFromPath(targetPath), name });
+    selectAsset({ path: targetPath, type: selectedAssetTypeFor(targetPath), name });
   };
   // Open in the game's asset editor panel: select the asset (retargets a
   // selection-driven panel like the Level Editor) THEN dock/focus that panel.
@@ -182,7 +199,7 @@ export function AssetRefField({ label, value, onChange, overrideColor = false, a
   const openInPanel = () => {
     if (!targetPath || !editorPanel) return;
     const name = targetPath.substring(targetPath.lastIndexOf('/') + 1);
-    selectAsset({ path: targetPath, type: assetTypeFromPath(targetPath), name });
+    selectAsset({ path: targetPath, type: selectedAssetTypeFor(targetPath), name });
     openPanel(editorPanel);
   };
 

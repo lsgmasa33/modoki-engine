@@ -237,8 +237,13 @@ async function settle(tx: StoreTransaction, source: 'purchase' | 'recovery'): Pr
  * Is the config this settle STARTED with still the active one?
  *
  * ⚠️ A settle spans awaits that can last minutes — the platform sheet, Face ID, a parent approving
- * Ask-to-Buy. `resetIap()` can run in that window (a game swap: the editor's Open Project, or an
- * OTA sub-game module), and `settleInner` holds the OLD config in a closure. Its ledger store
+ * Ask-to-Buy. `resetIap()` can run in that window — a live in-process game swap: an OTA sub-game
+ * switch, or hash navigation between two baked games. Both re-enter `GameShell`'s `[gameId]` boot
+ * effect, which calls `unregisterGameSystems()` (→ `resetIap()`) at `App.tsx:247` and re-inits
+ * PlayerPrefs at `:290`. ⚠️ NOT the editor's File → Open Project, which this comment used to cite:
+ * Electron's `setProject` ends in `webContents.reloadIgnoringCache()` and the web-served editor has
+ * no in-process project switch at all, so neither editor surface reaches this window (#421).
+ * `settleInner` holds the OLD config in a closure. Its ledger store
  * closes over a PlayerPrefs KEY, not a namespace snapshot, and `PlayerPrefs.init()` re-namespaces a
  * module-level global for the incoming game — so a late write would land in the NEXT game's
  * namespace and clobber its ledger with this game's grant.
@@ -376,7 +381,8 @@ async function settleInner(
 
   // Last point before the hook writes persistent storage — see `stillActive`. Without this, the
   // `alreadyGranted` path has NO check between the catalog lookup and the hook, so a config swap
-  // (resetIap()+PlayerPrefs.init(), e.g. File → Open Project) landing mid-`await` lets the hook
+  // (resetIap()+PlayerPrefs.init() — an OTA sub-game switch or hash navigation between baked games,
+  // NOT the editor's Open Project; see `stillActive`'s own doc) landing mid-`await` lets the hook
   // write into ANOTHER game's PlayerPrefs namespace — not merely a wasted call.
   if (!stillActive(c)) return tornDown(tx, source);
 

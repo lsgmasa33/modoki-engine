@@ -16,7 +16,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { backendFetch } from '../backend/editorBackend';
-import { assetTypeFromPath } from './AssetRefField';
+import { selectedAssetTypeFor } from './AssetRefField';
 import { getAllEntities } from '../../runtime/core/ecs/entityUtils';
 import { hasUnsavedChanges } from '../scene/serialize';
 import { formatChainStep, originBadge, type FindReferencesResultLike, type RefHitLike, type RefNodeLike } from './findReferencesFormat';
@@ -99,7 +99,7 @@ export default function FindReferencesDialog() {
   const navigateTo = (node: RefNodeLike) => {
     setNavNote(null);
     if (node.kind === 'asset') {
-      selectAsset({ path: node.path, type: assetTypeFromPath(node.path), name: node.name });
+      selectAsset({ path: node.path, type: selectedAssetTypeFor(node.path), name: node.name });
       close();
       return;
     }

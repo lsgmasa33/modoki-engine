@@ -240,6 +240,12 @@ the prerequisite for PixiJS `ParticleContainer` batching and a 2D draw-call win.
 The authored source (`AtlasSource` — `id`, `members`, `pageSize`, `padding`,
 `extrude`, optional `maxPages`/`texture`) is committed; all derived bookkeeping
 lives in the `.meta.json` sidecar's `atlasCache` block, never in the source.
+Its DEFAULTS have one home — `defaultAtlasSource()` in `runtime/loaders/spriteAtlas.ts`
+— read by the Create-Atlas button, the Atlas inspector (initial doc *and* per-field
+read fallbacks) and the build-time reimport handler. They were inlined in all four
+places until #423; a source-level guard (`tests/editor/atlasCreateParity.test.ts`)
+now fails if a consumer goes back to its own literal, because two constants that
+agree today are indistinguishable to a runtime assertion.
 
 - **Packer (pure)** — `runtime/loaders/spriteAtlas.ts` `packAtlas()` is a
   MaxRects **Best-Short-Side-Fit** bin-packer with zero THREE/DOM/sharp/Vite

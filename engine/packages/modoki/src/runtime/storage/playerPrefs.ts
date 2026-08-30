@@ -53,6 +53,10 @@ interface Envelope {
 /** Coalesce burst writes; `flush()` bypasses this for immediate durability. */
 const WRITE_DEBOUNCE_MS = 150;
 
+/** Cap on the pre-swap convergence loop in `init()` (see its call site) — bounds a pathological
+ *  case where writes keep landing every drain forever, without claiming unbounded retry. */
+const MAX_PRESWAP_FLUSHES = 5;
+
 // ── Module state ──────────────────────────────────────────────────
 let backend: PrefsBackend = new InMemoryBackend();
 let namespace = 'default';
@@ -169,23 +173,114 @@ export interface PlayerPrefsInitOptions {
   backend?: PrefsBackend;
 }
 
+/** The result of `init()` — see the `discardedPending` field. */
+export interface PlayerPrefsInitResult {
+  /** Logical keys whose durable write never landed and that this `init()` discarded.
+   *  Empty on the ordinary path. Non-empty in two DISTINCT ways — see `init`'s doc
+   *  comment — never conflate them in a message: a real game swap (`hydrated` was
+   *  true) means the pre-swap convergence loop was still not clean when it hit its
+   *  cap, or every key it attempted was rejected by the backend; a first `init()`
+   *  (`hydrated` was false) means these were written before `init()` ever ran and
+   *  never reached a backend at all. Sorted (siblings that expose a pending set —
+   *  `pendingKeys()`, the `player-prefs-*` agent ops — all sort; this matches). */
+  discardedPending: string[];
+}
+
 /** Hydrate the in-memory cache from the backend. Call once at boot (safe to re-call
- *  on a game/namespace swap — it re-hydrates for the new namespace). */
-async function init(opts: PlayerPrefsInitOptions = {}): Promise<void> {
+ *  on a game/namespace swap — it re-hydrates for the new namespace).
+ *
+ *  Resolves to `{ discardedPending }` — the logical keys this call discarded whose
+ *  durable write never landed. This is NOT a refusal: `init()` always completes the
+ *  swap (a quota-exceeded phone must not hard-block an OTA sub-game switch), but a
+ *  non-empty `discardedPending` is real data loss the caller should surface, not
+ *  silently swallow — see the two callers in `App.tsx` / `editor/setup.ts`.
+ *
+ *  The set means something DIFFERENT depending on `hydrated` at entry:
+ *   - `hydrated === true` (an actual game/namespace swap): the loop just below drains
+ *     to CONVERGENCE (not `flush()`'s bounded two drains — see the loop's own comment
+ *     for why that matters), so what's left in `dirty` is either a key the backend
+ *     never stopped rejecting, or — if the loop hit `MAX_PRESWAP_FLUSHES` still
+ *     changing — a key that may never have been attempted at all. The message below
+ *     says which.
+ *   - `hydrated === false` (the very first `init()` call): no flush runs on this
+ *     path at all, so a dirty key here was `set()` before `init()` was ever called —
+ *     it only ever lived in the throwaway `'default'`-namespace cache this call is
+ *     about to clear, and nothing was ever sent to a backend. That's a caller bug
+ *     (writing before init), not a backend rejection — see docs/player-prefs.md
+ *     § Gotchas, "every signal says success". */
+async function init(opts: PlayerPrefsInitOptions = {}): Promise<PlayerPrefsInitResult> {
   // On a game swap (re-init with a new namespace), persist the previous game's
   // pending writes BEFORE we clear the cache — otherwise debounced writes are lost.
-  if (hydrated) await flush();
+  const wasHydrated = hydrated;
+  let converged = true;
+  if (hydrated) {
+    // `flush()` drains at most twice, and `drain()` snapshots `dirty` into a local array
+    // BEFORE awaiting the backend calls (see `drain()`) — so a `set()` landing during the
+    // SECOND drain is never attempted by anyone, and a plain `await flush()` here would
+    // return with it still dirty and get discarded below as a false "rejected" report.
+    // Loop `flush()` itself until the pending SET stops changing: a key the backend keeps
+    // rejecting is re-queued identically (no progress ⇒ stop, correctly reported as
+    // rejected), while a key merely written mid-drain gets its own attempt on the next
+    // pass. Compare set CONTENTS, not size — a rejected key plus a newly arrived one keeps
+    // the size equal while the set has changed. Capped, not unbounded — see `flush()`'s own
+    // doc comment for why an unbounded retry is the wrong shape (a key the backend keeps
+    // rejecting forever must not spin `init()` forever).
+    // `null` rather than a string sentinel: a real signature is a space-joined sorted key list,
+    // and keys `''` + `'none'` would join to exactly `' none'` — a collision that would call the
+    // first pass converged. `null` is unrepresentable as a signature.
+    let prev: string | null = null;
+    converged = false;
+    for (let i = 0; i < MAX_PRESWAP_FLUSHES; i++) {
+      await flush();
+      const sig = pendingKeys().sort().join(' ');
+      if (sig === '' || sig === prev) { converged = true; break; }
+      prev = sig;
+    }
+  }
 
   if (opts.backend) backend = opts.backend;
   if (opts.namespace !== undefined) namespace = sanitizeNamespace(opts.namespace);
 
-  // Drop any in-flight writes' bookkeeping for the previous namespace/cache.
+  // Drop any in-flight writes' bookkeeping for the previous namespace/cache. Capture
+  // whatever is STILL in `dirty` first — `dirty.clear()` below would otherwise discard
+  // it with nothing inspecting it. See the two cases in the doc comment above.
   if (flushTimer != null) {
     clearTimeout(flushTimer);
     flushTimer = null;
   }
+  const discardedPending = pendingKeys().sort();
   cache.clear();
   dirty.clear();
+  // The store genuinely is NOT hydrated for the new namespace between here and the
+  // `hydrated = true` below — if `backend.getAll()` throws, this must stay `false` rather
+  // than keep the PREVIOUS namespace's `true`, which would answer reads/writes for a store
+  // under the new namespace this process never actually opened (see `agentBridge.ts`'s
+  // `prefsUnhydrated()`, which gates on exactly this flag).
+  hydrated = false;
+
+  if (discardedPending.length > 0) {
+    if (wasHydrated && converged) {
+      console.error(
+        `[PlayerPrefs] game swap discarded ${discardedPending.length} pending write(s) the backend ` +
+          `did not accept during the pre-swap flush: ${discardedPending.join(', ')} — the outgoing ` +
+          `game's last write to these keys is lost (possible causes: quota exceeded, a native I/O error)`,
+      );
+    } else if (wasHydrated) {
+      console.error(
+        `[PlayerPrefs] game swap discarded ${discardedPending.length} pending write(s) after ` +
+          `${MAX_PRESWAP_FLUSHES} pre-swap flush attempt(s) still saw new writes arriving: ` +
+          `${discardedPending.join(', ')} — some may have been attempted and rejected by the backend, ` +
+          `others may never have been attempted at all; the outgoing game's last write to these keys ` +
+          `is lost`,
+      );
+    } else {
+      console.error(
+        `[PlayerPrefs] init() discarded ${discardedPending.length} write(s) made before init() was ` +
+          `called: ${discardedPending.join(', ')} — these never reached a backend and are lost; ` +
+          `call PlayerPrefs.init() before writing`,
+      );
+    }
+  }
 
   const prefix = keyPrefix();
   const raw = await backend.getAll(prefix);
@@ -194,6 +289,7 @@ async function init(opts: PlayerPrefsInitOptions = {}): Promise<void> {
     cache.set(full.slice(prefix.length), str);
   }
   hydrated = true;
+  return { discardedPending };
 }
 
 /** Read a value. Returns a fresh copy (parsed from cache) — mutating it never

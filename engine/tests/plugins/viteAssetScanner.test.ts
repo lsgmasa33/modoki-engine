@@ -71,6 +71,15 @@ describe('detectType', () => {
   it('classifies a .hdr as an environment asset', () => {
     expect(detectType('/games/x/assets/env/studio.hdr', '.hdr')).toBe('environment');
   });
+  /** `.obj`/`.dae` → 'model' is the whole premise `selectedAssetTypeFor.test.ts` mocks — that
+   *  test only asserts what the Inspector does GIVEN a 'model' type, it never asserts the
+   *  scanner actually produces one. Without this pin, dropping `.obj`/`.dae` from EXT_TYPE
+   *  would make `selectedAssetTypeFor` silently return 'unknown' and the Assets panel's
+   *  source-model badge would go dead, with every existing test staying green (#423). */
+  it('classifies .obj and .dae as source models (selectedAssetTypeFor depends on this)', () => {
+    expect(detectType('/games/x/assets/models/chair.obj', '.obj')).toBe('model');
+    expect(detectType('/games/x/assets/models/chair.dae', '.dae')).toBe('model');
+  });
   /** Regression: `.meta.local.json` (the gitignored machine-local byte-stats half of the
    *  sidecar split — see meta-sidecar.ts) does NOT end with `.meta.json`, so before #54's
    *  catch-all removal it fell through and got classified as a scene. The scanner then

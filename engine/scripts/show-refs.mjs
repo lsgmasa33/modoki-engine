@@ -3,7 +3,8 @@
  *  resolved to their current paths via assets.manifest.json.
  *
  *  Useful when diffing broken refs — bare GUIDs in a scene file are inscrutable
- *  without this tool. Run after the migration to spot dangling refs.
+ *  without this tool. Run it any time you suspect a stale or dangling ref (after
+ *  moving/deleting an asset, for instance).
  *
  *  Usage:
  *    node scripts/show-refs.mjs path/to/scene-or-prefab.json
