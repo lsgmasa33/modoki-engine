@@ -66,6 +66,14 @@ export function emitVideoSkip(p: VideoEventPayload, announceEnd = true): void {
   if (announceEnd) emitVideoEnd(p);
 }
 
+/** A play request the browser refused (autoplay policy). JOURNAL ONLY — deliberately no bus
+ *  subscription: this is a diagnostic so a silent cutscene is findable, not a control channel.
+ *  Whether a game should be able to REACT to a blocked clip (skip it, show a tap-to-play
+ *  prompt) is a real design question and is not decided here (#447).  */
+export function emitVideoBlocked(p: VideoEventPayload): void {
+  emit('@video.blocked', p);
+}
+
 /** Drop every subscriber (world teardown / tests). */
 export function clearVideoEventHandlers(): void {
   started.clear();

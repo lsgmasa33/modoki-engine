@@ -78,6 +78,57 @@ discipline as `animationSystem` and `zoneTriggerCore`).
 - **The sim isn't running** (stopped/paused editor, `timeScale = 0`) — `getSimDelta` returns 0, so
   the whole system is inert. See below.
 
+### Muting a track
+
+`muted` is re-read every frame (not a read-once authored field), and it means the track **contributes
+nothing** — for a stateful track that means its effect is reconciled **OFF immediately**, the instant
+the flag flips, matching what the editor scrub already does. `applyDirectorFrame` detects the FLIP
+(mute is not a time edge, so `crossed()` can't express it) via a small memo keyed on
+`(world epoch, root id + generation, timeline GUID, track id)` and fires the off-edge right then,
+not at the clip's authored end.
+
+⚠️ **"Immediately" means "on the Director's next applied frame", which is not the same as "now".**
+`applyDirectorFrame` only runs for a Director that clears PASS 1 — playing, not paused, active in
+the hierarchy, and not a slaved child whose parent's clip has ended. Mute a control track on a
+Director in any of those states and the spawned prefab stays in the world until playback resumes.
+That is the issue's headline harm surviving in exactly the state a shipped game is most likely to be
+in when a flag is toggled from script, so if you mute from code, do not treat it as a despawn.
+
+Per track kind:
+
+- **`control` (prefab)** — muting despawns the tracked instance immediately; unmuting mid-span
+  respawns it if the playhead is still inside the clip (agrees with `previewControlAt`'s scrub
+  reconcile, which has always worked this way).
+- **`control` (particle, with a `duration`)** — muting pauses the emitter immediately; unmuting
+  mid-span restarts it. A duration-less impulse clip has no off state either way.
+- **`video`** — muting pauses immediately (the same dispatch the clip's own end makes). **Unmuting
+  does NOT restart the clip** — deliberately asymmetric with the control track: a video is a playback
+  with a *position*, not a presence, so restarting it mid-span would show the wrong part of the
+  cutscene, and there's no scrub twin here to disagree with (`previewControlAt` only reconciles
+  `control` tracks).
+- **`signal` / `audio` / `animation`** — these are stateless IMPULSES (a marker dispatch, a one-shot
+  cue, an `engine.playClip` trigger); there is nothing to turn off, so muting has no off-edge and
+  unmuting fires no retroactive catch-up for an edge the playhead already passed.
+- **`control` (subdirector)** — unchanged, and NOT the same case as above: muting a subdirector track
+  means the *parent* stops driving the child, so the child runs free on its own clock instead of
+  freezing (see the sub-director section below). This was already correct and already documented.
+
+**`applyTimelineState`'s pose path keeps its blanket `if (track.muted) continue`, and that is
+deliberately NOT touched by the above.** The reason is scope, not category: `applyTimelineState` is
+**one** implementation shared by real Play and the editor scrub, so unlike the edge path it *cannot*
+drift between the two surfaces — and drift is what #446 was. Whatever it does, it does consistently.
+
+For a keyframe `animation` track that is also the right answer on its merits: a pose has no stored
+*base* to restore, so "contributes nothing" has no off value.
+
+⚠️ **An `activation` track is arguably a different case, and this is an open question, not a settled
+one.** Muting one mid-span leaves `EntityAttributes.isActive` frozen at whatever the track last
+wrote, and unlike a pose there IS a natural off value — what `desired` would be with this track
+excluded. That is the same strand-the-effect shape #446 fixed on the edge path. It was left alone
+because both surfaces already agree, so changing it is a behaviour decision rather than a drift fix.
+**Tracked as #452 — do not "complete" the reconcile here without reading it**; it lays out both
+options and why handing the entity back needs somewhere to read the authored value FROM. (#446)
+
 ### Determinism (headless-verifiable)
 
 The playhead advances on **`getSimDelta`** (raw × `timeScale`, `0` when the sim isn't running), so

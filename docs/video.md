@@ -76,7 +76,7 @@ why `VideoImportSettings` has no format knob.
 | `runtime/video/videoCache{,Policy}.ts` | LRU cache against a budget; `videoCachePolicy` is the pure admission/eviction planner |
 | `runtime/video/VideoOverlay.tsx` | Fullscreen cutscene layer — **adopts** the element, never creates one |
 | `runtime/video/UIVideoMount.tsx` | UI binding — the element mounted into a UI node's box, with the host-priority rule |
-| `runtime/video/VideoEvents.ts` | `@video.start` / `@video.end` / `@video.skip` on the journal + an event bus |
+| `runtime/video/VideoEvents.ts` | `@video.start` / `@video.end` / `@video.skip` on the journal + an event bus, plus `@video.blocked` (journal-only, #447) |
 | `runtime/rendering/videoTextureSync.ts` | 3D binding — `THREE.VideoTexture` onto a material, per `RenderState` |
 | `runtime/rendering/videoTextureSync2D.ts` | 2D binding — a Pixi `VideoSource` texture onto a Sprite, per renderer |
 | `runtime/actions/videoControls.ts` | Declarative `video.play/pause/toggle/stop/skip/seek/setClip` |
@@ -507,6 +507,35 @@ started on the FOLLOWING reconcile pass, one frame later than the request — th
 correctness — and a blocked request announces nothing until the clip genuinely starts, however
 that happens (including via `retryBlockedPlay()`'s gesture-unlock retry, which runs outside this
 system entirely).
+
+**A blocked play request is reported once, via `@video.blocked` (#431 gap closed by #447).**
+Post-#431 a blocked clip correctly emits no `@video.start` — but that also means a play request the
+browser refuses is otherwise COMPLETELY silent: no `@video.start`, and if a Director pauses the
+clip at a span's end before it ever plays, no `@video.end` either, so a cutscene that never played
+leaves no trace at all. `videoSystem` reads `handle.autoplayBlocked` (mirrors the `@video.start`
+check: read BEFORE this pass's own `handle.play()` call, since the flag is only set once the play
+promise rejects, a microtask later) and, the first time it reads true for a given `Live` entry,
+`console.warn`s once naming the clip and journals `@video.blocked`. It is **journal-only —
+deliberately no event-bus subscription**, because this is a diagnostic for finding a silent
+cutscene, not a control channel a game reacts to; whether a game should be able to respond to a
+blocked clip (skip it, show a tap-to-play prompt) is a real design question #447 does not decide.
+The report is guarded by its own once-flag (`blockedReported`), separate from `startEmitted` —
+cleared on EITHER edge out of the refused state: the handle unblocking, or `playing` going false at
+the end of a span. Both are needed. `handle.pause()` does not clear `blocked` (only a successful
+`attemptPlay` does), so on a device that never receives a gesture the unblock edge never fires, and
+without the span-end reset the first refused cutscene would latch the flag and every later one on
+that entity would be silent — the exact failure this exists to surface.
+
+⚠️ **A refusal is reported one pass after the request, so a span shorter than two reconcile passes
+is still silent.** The flag is only set once the `play()` promise rejects — a microtask later — and
+is read BEFORE the next pass's own `play()` (mirroring the `@video.start` ordering above), so a
+clip whose trait says `playing` for a single frame is refused and paused without ever being read as
+blocked. That is the same one-pass latency `@video.start` accepts, not a separate defect, but it
+means the diagnostic covers a Director-length span rather than every conceivable request. This is reported from `videoSystem`/`videoService`, not from
+`timelineSystem`'s video track, on purpose: the timeline dispatches video actions through the
+action registry specifically to stay decoupled from (and DCE-able without) the video subsystem, and
+reporting from the video side covers every caller — autoplay, game code, `video.play` — not just a
+Director-driven clip.
 
 ### A handler may write `VideoPlayer` now (#432, fixed)
 

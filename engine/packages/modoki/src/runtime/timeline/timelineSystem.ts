@@ -87,6 +87,18 @@ function crossed(prev: number, cur: number, t: number, loop: boolean, duration: 
   return t > prev && t <= cur;
 }
 
+/** Is `t` inside a clip's span — `[start, start+duration)`, or `[start, ∞)` for a duration-less
+ *  impulse clip? Matches how `previewControlAt` computes `end` for a PREFAB clip (its scrub twin),
+ *  so a mute reconcile and the scrub agree on what "inside" means (#446).
+ *
+ *  ⚠️ It does NOT match the scrub's PARTICLE `end`, which widens a duration-less clip to
+ *  `clip.start + PARTICLE_IMPULSE_SCRUB_S` so scrubbing onto a one-shot burst still reveals it.
+ *  That divergence is harmless only because the particle mute path additionally gates on
+ *  `duration !== undefined`; drop that gate and the two surfaces disagree again. */
+function insideClipSpan(t: number, clip: { start: number; duration?: number }): boolean {
+  return t >= clip.start && (clip.duration === undefined || t < clip.start + clip.duration);
+}
+
 /** The index of the clip block active at time `t` on an animation track: the last block whose
  *  `start <= t`, still within its `duration` when one is authored (else it holds until the next). */
 function activeClipIndexAt(track: AnimationTrackDef, t: number): number {
@@ -349,6 +361,7 @@ export function previewControlAt(world: World, rootId: number, def: TimelineDef,
 export function clearPreviewControls(): void {
   for (const [key, id] of listControlSpawns()) { deleteEntity(id); deleteControlSpawn(key); }
   resetScrubParticleReflect(); // drop scrub particle-span on/off memory on teardown
+  _trackMutedEpoch++; _trackMuted.clear();  // drop the mute-transition memo too (#446)
 }
 
 // ── Control track (prefab spawn/despawn) ──────────────────────────────────────────────────────
@@ -425,6 +438,45 @@ export function clearTimelineWarnings(): void {
   _warnedSelfDeact.clear();
 }
 onWorldSwap(() => clearTimelineWarnings());
+
+/** Per (timeline asset, director instance, track) mute state as of the PREVIOUS frame, so
+ *  `applyDirectorFrame` can detect the mute FLIP — muting is not a time edge, so `crossed()`
+ *  cannot express it and the flip itself is the event that turns a stateful track's effect
+ *  off (#446).
+ *
+ *  Absent = never seen, deliberately DISTINCT from `false`: a track authored muted from the start
+ *  must not be read as "just muted" on its first frame and fire an off-edge for something that
+ *  was never on. **That invariant is only as good as the key**, and two within-scene routes broke
+ *  an earlier `${rootId}:${trackId}` version of it (both measured, review of #446):
+ *
+ *   - **Entity-id recycling.** koota reuses an id immediately, so a Director destroyed after one
+ *     unmuted frame left `2:vid -> false` behind, and a BRAND NEW Director spawning onto id 2 with
+ *     that track authored `muted:true` read it as a flip and paused a video it never started. No
+ *     world swap is involved, so the `onWorldSwap` reset below cannot cover it — the same hazard
+ *     the warn-once sets above carry, one step worse. Hence `generation()` in the key.
+ *   - **A timeline swap on one Director.** Reassigning `Director.timeline` from a def whose track
+ *     `vid` is unmuted to one whose `vid` is muted read as a flip for the same reason. Hence
+ *     `def.id` in the key — see `trackMuteKey` for why that is the asset GUID and emphatically
+ *     NOT the def object's identity.
+ *
+ *  ⚠️ The inner key still contains a world-local entity id, so the `onWorldSwap` reset stays. */
+const _trackMuted = new Map<string, boolean>();
+let _trackMutedEpoch = 0;   // bumped on world swap / preview teardown — see `trackMuteKey`
+onWorldSwap(() => { _trackMutedEpoch++; _trackMuted.clear(); });
+
+/** Key for {@link _trackMuted}, and every part of it is load-bearing:
+ *   - `epoch` — invalidates everything on a world swap / preview teardown without a walk.
+ *   - `rootId` + `generation()` — the id ALONE is recycled onto an unrelated entity within one
+ *     scene, which is how a new Director inherited the previous occupant's mute state.
+ *   - `def.id` — the timeline asset's stable GUID, NOT the def object's identity. An edit in the
+ *     Timeline panel (including the mute toggle itself) re-normalizes and REPLACES the def object,
+ *     so object identity would make every mute edit look like a first sighting and detect no flip
+ *     at all — measured: it broke all six behavioural tests. The GUID is stable across an edit and
+ *     differs across a genuine `Director.timeline` reassignment, which is the case that needs to
+ *     read as "never seen" rather than as a flip. */
+function trackMuteKey(p: Pending, trackId: string): string {
+  return `${_trackMutedEpoch}:${p.rootId}:${p.entity.generation()}:${p.def.id}:${trackId}`;
+}
 
 /** Memoized "does this timeline have ANY sub-director control clip?" A `.timeline.json` is immutable
  *  once loaded (a re-import replaces the def object), so a WeakMap keyed on the def is a stable,
@@ -594,9 +646,19 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
   if (p.justStarted) routeSequence(world, p.entity, 'start');
   opts.poseFor(p.rootId, p.def, p.cur);
   for (const track of p.def.tracks) {
-    if (track.muted) continue;
+    // Detect the mute FLIP for this track (see `_trackMuted`'s doc comment) — muting is not a time
+    // edge, so `crossed()` can't express it; the flip itself is the event a stateful track (control,
+    // video) needs to turn its effect off immediately, matching the editor scrub (#446).
+    const trackKey = trackMuteKey(p, track.id);
+    const prevMuted = _trackMuted.get(trackKey);
+    const justMuted = track.muted === true && prevMuted === false;
+    const justUnmuted = !track.muted && prevMuted === true;
+    _trackMuted.set(trackKey, track.muted === true);
     switch (track.type) {
       case 'signal': {
+        // STATELESS impulse (a marker dispatch) — nothing to turn off, so a mute has no off-edge
+        // and an unmute has no catch-up. Keep the blanket skip.
+        if (track.muted) break;
         // Resolve the track's OWN target (relative name-path from the Director root) —
         // same as every other track kind. A bare dispatch to p.entity (the Director) would
         // silently ignore `track.target`, so a signal aimed at a descendant (e.g. a UI label)
@@ -613,6 +675,9 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         break;
       }
       case 'audio':
+        // STATELESS impulse (a one-shot cue) — same reasoning as signal above: no off-edge, no
+        // unmute catch-up.
+        if (track.muted) break;
         for (const c of track.cues) {
           if (crossed(p.prev, p.cur, c.t, p.loop, p.duration, p.justStarted, p.advanced)) {
             cueClip(c.clip, { bus: c.bus as 'master' | 'music' | 'sfx' | 'ui' | undefined, volume: c.volume, pitch: c.pitch }, world);
@@ -621,6 +686,9 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         }
         break;
       case 'animation': {
+        // STATELESS trigger (`engine.playClip` is a one-shot cue, like audio) — no off-edge, no
+        // unmute catch-up.
+        if (track.muted) break;
         // Keyframe Animators are posed by pose(); skeletal/sprite are triggered here (Play) or
         // seeked by pose() (preview → skeletalTrigger false, skip).
         if (!opts.skeletalTrigger) break;
@@ -649,16 +717,53 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         for (let ci = 0; ci < track.clips.length; ci++) {
           const clip = track.clips[ci];
           if (clip.subdirector) {
+            // Muting a subdirector clip means the PARENT stops driving the child (docs/timeline.md
+            // :152) — the child then runs on its own clock instead of freezing. This is existing,
+            // documented behaviour, unrelated to the new muted handling below: preserve it as-is.
+            if (track.muted) continue;
             if (opts.driveSubdirectors) driveSubdirector(world, p, index, opts, track, clip, visited, driven);
             continue;
           }
           const key = `${p.rootId}:${track.id}:${ci}`;
+          // Computed BEFORE the unmute reconcile below, which must not fire on top of the very
+          // edge it stands in for: an unmute landing exactly on `atStart` would otherwise run
+          // spawn → destroy → spawn in one frame, journaling `@control spawn` TWICE at the same
+          // tick with no despawn between. That breaks the journal's role as the deterministic
+          // verification trace and re-runs every side effect inside the prefab. (Reachable any
+          // time an author unmutes near a clip boundary, and on a looping Director every frame
+          // where `advanced >= duration` makes `crossed` true for everything.)
           const atStart = crossed(p.prev, p.cur, clip.start, p.loop, p.duration, p.justStarted, p.advanced);
           const atEnd = clip.duration !== undefined && crossed(p.prev, p.cur, clip.start + clip.duration, p.loop, p.duration, p.justStarted, p.advanced);
           if (clip.particle) {
+            // Only a clip WITH a duration has an off state — an impulse clip (no duration) never
+            // fires `atEnd` either, muted or not, so there is nothing for a mute to turn off.
+            if (track.muted) {
+              if (justMuted && clip.duration !== undefined && insideClipSpan(p.cur, clip)) {
+                controlParticle(world, p.entity, resolvedTarget ?? -1, 'pause');
+              }
+              continue; // skip this clip's normal edges while muted
+            }
+            if (justUnmuted && !atStart && clip.duration !== undefined && insideClipSpan(p.cur, clip)) {
+              controlParticle(world, p.entity, resolvedTarget ?? -1, 'restart');
+            }
             if (atStart) controlParticle(world, p.entity, resolvedTarget ?? -1, 'restart');
             if (atEnd) controlParticle(world, p.entity, resolvedTarget ?? -1, 'pause');
           } else {
+            // Prefab clip — PRESENCE is the truth (controlSpawnRegistry already holds it), so the
+            // span test is only needed to keep the JOURNAL balanced: `controlDespawn` emits
+            // `@control despawn` on the edge whether or not anything was actually spawned (see its
+            // doc comment — that parity is what makes the journal a reliable headless trace even
+            // with an unloadable prefab), so a mute inside the span must journal the despawn even
+            // when nothing is present, or a `spawn` would sit in the trace with no partner.
+            if (track.muted) {
+              if (justMuted && (hasControlSpawn(key) || insideClipSpan(p.cur, clip))) {
+                controlDespawn(world, p.entity, key);
+              }
+              continue; // skip this clip's normal edges while muted
+            }
+            if (justUnmuted && !atStart && insideClipSpan(p.cur, clip) && !hasControlSpawn(key)) {
+              controlSpawn(world, p.entity, key, clip.prefab ?? '', parentId, `control:${dirRef}:${track.id}:${ci}`, clip.transform);
+            }
             if (atStart) controlSpawn(world, p.entity, key, clip.prefab ?? '', parentId, `control:${dirRef}:${track.id}:${ci}`, clip.transform);
             if (atEnd) controlDespawn(world, p.entity, key);
           }
@@ -678,6 +783,21 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         const entity = index.byId.get(targetId) as unknown as Entity | undefined;
         if (!entity) break;
         for (const clip of track.clips) {
+          if (track.muted) {
+            // Muting pauses immediately (#446), matching the editor scrub — same dispatch the end
+            // edge makes below. NO duration gate here, unlike the particle clip above: a
+            // duration-less VIDEO clip is not an impulse, it plays on to the media's own end, so
+            // it is exactly the clip shape a mute most needs to stop. `insideClipSpan` already
+            // reads a missing duration as `[start, ∞)`.
+            if (justMuted && insideClipSpan(p.cur, clip)) {
+              dispatchGameAction('video.pause', { target: entity });
+            }
+            continue; // skip this clip's normal edges while muted
+          }
+          // Deliberate asymmetry with the control track: on UNMUTE we do NOT restart the clip. A
+          // video is a playback with a POSITION, not a presence — restarting it mid-span would show
+          // the wrong part of the cutscene, and unlike the control track there's no scrub twin to
+          // disagree with (`previewControlAt` skips non-`control` tracks entirely).
           if (crossed(p.prev, p.cur, clip.start, p.loop, p.duration, p.justStarted, p.advanced)) {
             // Rewind BEFORE setting the clip. On a looping Director (or a re-entered span) the
             // element is mid-playback and `setClip` with the same GUID is a no-op in the video

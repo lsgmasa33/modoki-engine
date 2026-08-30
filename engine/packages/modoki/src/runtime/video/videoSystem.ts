@@ -24,7 +24,7 @@ import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { getPlayState } from '../core/playState';
 import { onWorldSwap } from '../core/ecs/world';
 import { playVideo, applyTimeScale, videoFadeGain, type VideoHandle } from './videoService';
-import { emitVideoStart, emitVideoEnd, type VideoEventPayload } from './VideoEvents';
+import { emitVideoStart, emitVideoEnd, emitVideoBlocked, type VideoEventPayload } from './VideoEvents';
 import { getTimeScale } from '../core/getTime';
 
 /** Live handle per entity, plus the clip it was created for (so a `clip` change is
@@ -58,6 +58,13 @@ interface Live {
    *  not the `Live` entry's whole lifetime: the reconcile re-arms it the moment `handle.ended`
    *  goes false again, so a rewind-and-replay of the SAME clip fires `@video.end` again too. */
   endEmitted: boolean;
+  /** `@video.blocked` is announced ONCE per refused PLAY REQUEST, not once per frame — the
+   *  reconcile calls `play()` every frame while the trait says `playing`, so an unguarded report
+   *  would spam the console for the whole span. Cleared on either edge out of that state: the
+   *  handle unblocking (a gesture got it running), or `playing` going false (the span ended) —
+   *  see the reset beside `handle.pause()`. Both are needed, because a `pause()` leaves `blocked`
+   *  set, so the unblock edge alone never fires on a device that never receives a gesture. */
+  blockedReported: boolean;
 }
 
 /** A clip being downloaded before it can play. Tracked separately from `live` so the
@@ -210,6 +217,8 @@ export function videoSystem(world: World): void {
   // too, so the handler's write is the last one and sticks. Declared per-call (not module
   // scope) so it can't leak state across worlds or a re-entrant call.
   const emits: Array<{ kind: 'start' | 'end'; payload: VideoEventPayload }> = [];
+  // Same #432 reason as `emits` above: deferred past `updateEach`'s post-callback write-back.
+  const blocked: VideoEventPayload[] = [];
 
   world.query(VideoPlayer).updateEach(([vp], entity) => {
     const id = entity.id();
@@ -315,7 +324,10 @@ export function videoSystem(world: World): void {
           live.get(id)?.handle.pause();
         },
       });
-      l = { handle, clip: vp.clip, autoplayed: false, startEmitted: false, endEmitted: false };
+      l = {
+        handle, clip: vp.clip, autoplayed: false, startEmitted: false, endEmitted: false,
+        blockedReported: false,
+      };
       live.set(id, l);
       // A bundled/streamed clip never downloads, so it is loaded by definition.
       // Without this it would report 0 forever and any bound progress bar would stick.
@@ -330,6 +342,19 @@ export function videoSystem(world: World): void {
     }
 
     if (vp.playing) {
+      // #447: a refused play request is otherwise COMPLETELY silent — post-#431 a blocked clip
+      // correctly emits no `@video.start`, and if a timeline pauses it at the span end it never
+      // emits `@video.end` either, so a cutscene that never played leaves no trace at all. Read
+      // BEFORE this pass's own `play()` for the same reason the start check is (see below): the
+      // flag is only set when the play PROMISE rejects, a microtask after `play()` returns.
+      if (l.handle.autoplayBlocked) {
+        if (!l.blockedReported) {
+          l.blockedReported = true;
+          console.warn(`[video] playback of clip ${vp.clip} was refused by the browser (autoplay policy) — it is waiting for a user gesture.`);
+          blocked.push({ entity: entityGuid, clip: vp.clip });
+        }
+      } else l.blockedReported = false;
+
       // #431: the OBSERVED-playback check runs BEFORE `l.handle.play()` is called below, and
       // that ordering is the fix, not incidental — resist "cleaning it up" into a single
       // check-and-play. A real `element.play()` sets `element.paused = false` SYNCHRONOUSLY as
@@ -355,7 +380,16 @@ export function videoSystem(world: World): void {
         emits.push({ kind: 'start', payload: { entity: entityGuid, clip: vp.clip } });
       }
       l.handle.play();
-    } else l.handle.pause();
+    } else {
+      l.handle.pause();
+      // #447: re-arm on the way OUT of a play request too, not only when the handle unblocks.
+      // `pause()` does NOT clear `blocked` — only a SUCCESSFUL `attemptPlay` does — so on a
+      // device where no gesture ever arrives, `autoplayBlocked` stays true across the gap
+      // between two spans. Without this reset the latch set by the first refused span would
+      // still be set for the second, and every later cutscene on this entity would be silent:
+      // exactly the failure #447 exists to make findable.
+      l.blockedReported = false;
+    }
 
     // Live-applied fields. The end-fade is a MULTIPLIER computed from the element's own
     // clock, never a write back into `vp.volume` — that field is the authored target the
@@ -399,6 +433,7 @@ export function videoSystem(world: World): void {
     if (e.kind === 'start') emitVideoStart(e.payload);
     else emitVideoEnd(e.payload);
   }
+  for (const p of blocked) emitVideoBlocked(p);
 
   // Entities that lost the trait (or were despawned) leak their decoder otherwise.
   for (const e of [...live.keys()]) {

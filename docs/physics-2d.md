@@ -236,7 +236,7 @@ green on enter, reverts on exit, and logs a `zone` journal event).
 The enter/exit fan-out is dimension-agnostic and lives in ONE module,
 `runtime/physics/physicsContactEvents.ts` (`collectContactEvents` / `routeContactEvents` /
 `routePair` /
-`synthesizeContactExits` / `makeFireOnCollision`), used by BOTH `physics2DSystem` and
+`collectContactExits` / `routeContactExits` / `makeFireOnCollision`), used by BOTH `physics2DSystem` and
 `physics3DSystem` — only the injected event bus + `OnCollision` trait differ, so a fix to the
 correctness-critical enter/exit balance can't silently miss a dimension. The bus itself comes from
 `runtime/physics/physicsEventBus.ts` (`createPhysicsEventBus` → two instances, `Physics2DEvents`
@@ -255,10 +255,14 @@ read by `captureManifold*` at DRAIN time (it is gone after the next `world.step`
 comes from the ECS velocities AFTER the pull — see the substep note above.
 
 Two removal subtleties: Rapier emits **no stop event** when a collider is freed/rebuilt, so
-`synthesizeContactExits` walks the still-overlapping pairs and fires the missing `exit` **before**
+`collectContactExits` walks the still-overlapping pairs and stages the missing `exit` **before**
 the free — otherwise a despawn-inside-a-trigger (or a geometry rebuild) leaves a subscriber's
-overlap state stuck 'entered'. And a `concave`/compound collider can fire **multiple** events per
-logical contact (one per convex piece / child collider) — dedupe by entity id if it matters.
+overlap state stuck 'entered'. `collectContactExits` is called from inside the body-reconcile
+`updateEach` (both dimensions), so it only COLLECTS; routing (which reaches game code) is deferred
+to `routeContactExits`, called once the query closes (#445 — `updateEach` clobbers a write a
+handler makes synchronously to a queried trait). And a `concave`/compound collider can fire
+**multiple** events per logical contact (one per convex piece / child collider) — dedupe by entity
+id if it matters.
 
 ### Contact index (Percept — "what is this body touching NOW?")
 

@@ -293,3 +293,94 @@ describe('#431 — @video.start fires on OBSERVED playback, not on request', () 
     }
   });
 });
+
+describe('#447 — a refused play request is reported once', () => {
+  it('reported once, not per frame', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    playBehaviour = 'block';
+    world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
+
+    for (let i = 0; i < 5; i++) {
+      videoSystem(world!);
+      await flush();
+    }
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain(CLIP);
+    // The #431 contract still holds: a blocked clip never announces a start.
+    expect(starts).toBe(0);
+  });
+
+  it('re-armed after an unblock', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    playBehaviour = 'block';
+    const e = world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
+    videoSystem(world!);
+    await flush();
+
+    playBehaviour = 'allow';
+    videoSystem(world!); // requests play() again — succeeds this pass
+    await flush();
+    videoSystem(world!); // observes the successful play() (#431)
+    expect(starts).toBe(1);
+
+    // Force a second refusal on the now-playing element, via the public surface: pause it
+    // (as a game legitimately might) then ask to play again while blocked.
+    playBehaviour = 'block';
+    const el = videoElementFor(e.id())!;
+    Object.defineProperty(el, 'paused', { value: true, configurable: true });
+    e.set(VideoPlayer, { playing: false });
+    videoSystem(world!);
+    await flush();
+    e.set(VideoPlayer, { playing: true });
+    videoSystem(world!); // requests play() again — rejected this pass, not yet observed
+    await flush();
+    videoSystem(world!); // observes the refusal (see the #447 comment on read-before-play ordering)
+
+    expect(console.warn).toHaveBeenCalledTimes(2);
+  });
+
+  it('journal event', async () => {
+    const { setCurrentWorld, getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const { journalEvents } = await import('../../src/runtime/core/journal');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const priorWorld = getCurrentWorld();
+    try {
+      setCurrentWorld(world!);
+      playBehaviour = 'block';
+      world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
+      videoSystem(world!); // requests play() — rejected this pass, not yet observed
+      await flush();
+      videoSystem(world!); // observes the refusal and journals it
+
+      const events = journalEvents({ type: '@video.blocked' }, world!);
+      expect(events.length).toBe(1);
+      expect((events[0].payload as { clip: string }).clip).toBe(CLIP);
+    } finally {
+      setCurrentWorld(priorWorld);
+    }
+  });
+
+  it('re-armed for a SECOND refused span, with no gesture in between', async () => {
+    // The regression opus-reviewer found: `handle.pause()` leaves `blocked` set (only a
+    // SUCCESSFUL play clears it), so on a device where no gesture ever arrives the "handle
+    // unblocked" edge never fires. Latching only on that edge left every cutscene after the
+    // first one completely silent — the failure #447 exists to make findable.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    playBehaviour = 'block';
+    const e = world!.spawn(VideoPlayer({ clip: CLIP, playing: true }));
+
+    videoSystem(world!); await flush();
+    videoSystem(world!);                       // observes the refusal → report #1
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    e.set(VideoPlayer, { playing: false });    // a Director pausing at the span's end
+    videoSystem(world!); await flush();
+
+    e.set(VideoPlayer, { playing: true });     // second span, still no gesture
+    videoSystem(world!); await flush();
+    videoSystem(world!);
+
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+});

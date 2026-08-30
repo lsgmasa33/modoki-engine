@@ -37,7 +37,7 @@ import { createPhysicsWorldRegistry } from './physicsWorldRegistry';
 import { meshColliderProvider } from './meshColliderProvider';
 import { buildMeshColliderDescs } from './meshColliderGeometry';
 import { physics3DEvents } from './Physics3DEvents';
-import { makeFireOnCollision, collectContactEvents, routeContactEvents, synthesizeContactExits, refOf, type ColliderInfo, type DrainedPair } from './physicsContactEvents';
+import { makeFireOnCollision, collectContactEvents, routeContactEvents, collectContactExits, routeContactExits, refOf, type ColliderInfo, type DrainedPair, type ContactExitPair } from './physicsContactEvents';
 import { physicsSubsteps, substepFraction, substepLerp } from './physicsSubstep';
 import { dropEntityFromContactIndex } from './physicsContactIndex';
 import { emit, isVerboseCaptureActive } from '../core/journal';
@@ -556,8 +556,12 @@ function createBody(
 // The declarative OnCollision3D dispatcher, bound to this dimension's trait (shared core).
 const fireOnCollision = makeFireOnCollision(OnCollision3D);
 
-function removeBody(st: PhysicsWorldState3D, world: World, rec: BodyRec3D): void {
-  synthesizeContactExits(rec.colliderHandles, world, st.colliders, st.world.narrowPhase, physics3DEvents, fireOnCollision);
+/** COLLECT `exit` pairs for anything still overlapping THIS body's colliders, BEFORE they are
+ *  freed, then free the body — the 3D twin of physics2DSystem's `removeBody`, see there for the
+ *  H1 / double-exit reasoning. ROUTING is the CALLER's job and must wait for the reconcile query
+ *  to close (`collectContactExits`, #445). */
+function removeBody(st: PhysicsWorldState3D, world: World, rec: BodyRec3D, exits: ContactExitPair[]): void {
+  collectContactExits(rec.colliderHandles, st.colliders, st.world.narrowPhase, exits);
   // Rapier's removeRigidBody auto-removes this body's joints, invalidating their handles.
   // Drop the referencing JointRecs from our map here (map-only, NO getImpulseJoint — a stale
   // handle could resolve to a reused-index sibling). The reconciler recreates them next pass.
@@ -619,8 +623,8 @@ function soloColliderSig(entity: Entity, tf: TfData3): string {
   return `${entity.id()}:${entity.generation()}:${px}:${py}:${pz}:${prx}:${pry}:${prz}:${ws.sx}:${ws.sy}:${ws.sz}:${colliderGeomSig(entity)}`;
 }
 
-function removeSoloCollider(st: PhysicsWorldState3D, world: World, rec: SoloColliderRec): void {
-  synthesizeContactExits(rec.colliderHandles, world, st.colliders, st.world.narrowPhase, physics3DEvents, fireOnCollision);
+function removeSoloCollider(st: PhysicsWorldState3D, world: World, rec: SoloColliderRec, exits: ContactExitPair[]): void {
+  collectContactExits(rec.colliderHandles, st.colliders, st.world.narrowPhase, exits);
   for (const h of rec.colliderHandles) {
     const col = st.world.getCollider(h);
     if (col) st.world.removeCollider(col, true);   // wakeUp any body it was touching
@@ -882,6 +886,11 @@ export function physics3DSystem(world: World): void {
   const seen = _seenBodies; seen.clear();
   const childrenByParent = collectCompoundChildren(world);
 
+  // #445: collected inside the query below and routed AFTER it closes — routing reaches game code
+  // (`OnCollision3D`, bus subscribers), and a handler's `entity.set` on a queried trait would be
+  // clobbered by `updateEach`'s write-back.
+  const exits: ContactExitPair[] = [];
+
   // ── Reconcile + push (ECS → Rapier) ──
   world.query(Transform, RigidBody3D).updateEach(([tf, rb]: [TfData3, RbData3], entity) => {
     const id = entity.id();
@@ -890,7 +899,7 @@ export function physics3DSystem(world: World): void {
     const children = childrenByParent.get(id) ?? EMPTY_CHILDREN;
     const sig = bodySig(rb, entity, children);
     let rec = st.bodies.get(id);
-    if (rec && (rec.sig !== sig || rec.entityGen !== gen)) { removeBody(st, world, rec); rec = undefined; }
+    if (rec && (rec.sig !== sig || rec.entityGen !== gen)) { removeBody(st, world, rec, exits); rec = undefined; }
     if (!rec) { createBody(st, id, gen, tf, rb, entity, children, cfg, sig); return; }
 
     // Material / filter / layer edits apply to the live collider(s) IN PLACE — no rebuild.
@@ -924,10 +933,11 @@ export function physics3DSystem(world: World): void {
       }
     }
   });
+  routeContactExits(world, exits, physics3DEvents, fireOnCollision);
 
   // ── Cleanup despawned/detached bodies ──
   for (const [id, rec] of st.bodies) {
-    if (!seen.has(id)) removeBody(st, world, rec);
+    if (!seen.has(id)) removeBody(st, world, rec, exits);
   }
 
   // ── Solo (parentless) static colliders: a Collider3D with no RigidBody3D and no body parent
@@ -943,7 +953,7 @@ export function physics3DSystem(world: World): void {
       const tf = child.get(Transform) as TfData3;
       const sig = soloColliderSig(child, tf);
       let rec = st.soloColliders.get(cid);
-      if (rec && (rec.sig !== sig || rec.entityGen !== gen)) { removeSoloCollider(st, world, rec); rec = undefined; }
+      if (rec && (rec.sig !== sig || rec.entityGen !== gen)) { removeSoloCollider(st, world, rec, exits); rec = undefined; }
       if (!rec) {
         const handles = attachSoloCollider(st, child, cfg);
         // No handles ⇒ shape invalid / mesh not yet loaded (makeColliderDesc warned once) — leave
@@ -962,8 +972,9 @@ export function physics3DSystem(world: World): void {
   // Drop solo colliders that are no longer solo (despawned, gained their own body, or their parent
   // became one — in which case the body pass already re-adopted them as compound children).
   for (const [, rec] of st.soloColliders) {
-    if (!seenSolo.has(rec.entityId)) removeSoloCollider(st, world, rec);
+    if (!seenSolo.has(rec.entityId)) removeSoloCollider(st, world, rec, exits);
   }
+  routeContactExits(world, exits, physics3DEvents, fireOnCollision);
 
   // ── Reconcile joints (after bodies exist, before stepping) ──
   reconcileJoints(st, world, cfg);

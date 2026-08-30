@@ -20,7 +20,7 @@
  *    `__emitContact`/`__emitZone` (member calls); `timelineEvents.__emitStart`/`__emitEnd`/
  *    `__emitMarker`; `emitVideoStart`/`emitVideoEnd`/`emitVideoSkip` (`video/VideoEvents`);
  *    `cueClip` (`audio/audioCues`); `fireOnCollision`/`fireOnSequence`; and two verified
- *    one-hop-resolved siblings, `synthesizeContactExits`/`routeContactEvents`
+ *    one-hop-resolved siblings, `routeContactExits`/`routeContactEvents`
  *    (`physicsContactEvents.ts`) — both call `routePair`, which calls `bus.__emitSensor`/
  *    `__emitCollision` AND the injected `fire` (OnCollision) callback, so a call to either IS a
  *    fan-out even though this guard never opens their (different-file) body to see that. Plus a
@@ -34,13 +34,17 @@
  *    body to a function DEFINED IN THE SAME FILE (a top-level `function` or a
  *    `const x = (...) => ...`) is followed into that function's body, recursively (cycle-
  *    guarded), looking for a seed match. This is what catches the physics violation: the
- *    `updateEach` body calls `removeBody` (same file), which calls `synthesizeContactExits`
- *    (a seed name) — two hops, both resolved. A call reaching into a DIFFERENT file that is
+ *    `updateEach` body calls `removeBody` (same file), which used to call the routing half
+ *    directly (#445) — two hops, both resolved. `collectContactExits`, what `removeBody` calls
+ *    today, is deliberately NOT a seed: it only reads the narrow-phase into an array, and the
+ *    routing it was split away from now runs after the query closes. A call reaching into a DIFFERENT file that is
  *    not itself a seed name is invisible to this guard; the two pre-resolved physics helpers
  *    above are how that gap is closed for the one call chain known to need it, without making
  *    every guard hit require a fragile cross-file body walk.
  *
- *  ALLOWLIST: exactly the two known violations (#445, unfixed — see each entry), matched by
+ *  ALLOWLIST: EMPTY — #445 removed its two entries when the physics reconcile stopped routing
+ *  synthesized exits from inside its query. A stale entry fails this suite by design, so an
+ *  entry added here is a debt with an expiry, not a permanent exemption. Entries are matched by
  *  (file, the DIRECT call made from inside the `updateEach` body that starts the offending
  *  chain) so a new, unrelated violation in the same file still surfaces. Mirrors
  *  `editorStoreActionsReachable.test.ts`'s `knownOrphans`: an allowlist entry that stops
@@ -64,14 +68,16 @@ const SEED_NAMES = new Set([
   'cueClip',
   'fireOnCollision',
   'fireOnSequence',
-  'synthesizeContactExits',
+  'routeContactExits',
   'routeContactEvents',
 ]);
+// NOT seeds, on purpose: `collectContactExits` (collects into an array, fans out to nobody) and
+// `emitVideoBlocked` (journal-only — same reasoning as bare `emit`, see the file banner).
 
 /** A human note appended to the reported chain for a seed that is itself a one-hop stand-in for
  *  a fan-out this guard does not open the (different-file) body of — see the file banner. */
 const SEED_NOTES = new Map<string, string>([
-  ['synthesizeContactExits', '__emitCollision/__emitSensor (via routePair, physicsContactEvents.ts) '
+  ['routeContactExits', '__emitCollision/__emitSensor (via routePair, physicsContactEvents.ts) '
     + '+ fireOnCollision -> dispatchGameAction'],
   ['routeContactEvents', '__emitCollision/__emitSensor (via routePair, physicsContactEvents.ts) '
     + '+ fireOnCollision -> dispatchGameAction'],
@@ -92,21 +98,7 @@ const SEED_PATTERN = /^(fire|route)[A-Z]/;
  *  from inside the offending `updateEach` body). Do NOT add to this to make a red build green:
  *  the fix is #445's, and a new match here needs its own investigation, not a suppression. */
 interface AllowlistEntry { file: string; rootCall: string; reason: string }
-const ALLOWLIST: AllowlistEntry[] = [
-  {
-    file: 'packages/modoki/src/runtime/physics/physics2DSystem.ts',
-    rootCall: 'removeBody',
-    reason: '#445: the body-reconcile query rebuilds a body on a structural/generation change by '
-      + 'calling removeBody(st, world, rec) INSIDE world.query(Transform, RigidBody2D).updateEach(...) '
-      + '— removeBody synthesizes contact exits (H1) before freeing colliders, which fans out. Known, '
-      + 'awaiting a fix; NOT an approved pattern.',
-  },
-  {
-    file: 'packages/modoki/src/runtime/physics/physics3DSystem.ts',
-    rootCall: 'removeBody',
-    reason: '#445: same shape as physics2DSystem.ts — see that entry.',
-  },
-];
+const ALLOWLIST: AllowlistEntry[] = [];
 
 interface Violation { file: string; line: number; chain: string[] }
 

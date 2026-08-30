@@ -81,6 +81,10 @@ export interface VideoHandle {
    *  unreachable in tests, and a real element that hasn't buffered a frame yet still counts
    *  as "playing" for this contract's purposes: it is not autoplay-blocked and not paused). */
   readonly playing: boolean;
+  /** True when the last `play()` request was refused (autoplay policy, almost always) and the
+   *  clip is waiting for a gesture. Distinct from `paused`: the game ASKED for playback and did
+   *  not get it. `videoSystem` reports this once per refused play REQUEST — see `@video.blocked`. */
+  readonly autoplayBlocked: boolean;
   dispose(): void;
 }
 
@@ -134,6 +138,10 @@ class LiveVideoHandle implements VideoHandle {
   get playing(): boolean {
     return !this.element.paused && !this.blocked && !this.ended;
   }
+  /** True when the last `play()` request was refused (autoplay policy, almost always) and the
+   *  clip is waiting for a gesture. Distinct from `paused`: the game ASKED for playback and did
+   *  not get it. `videoSystem` reports this once per refused play REQUEST — see `@video.blocked`. */
+  get autoplayBlocked(): boolean { return this.blocked && !this.disposed; }
   /** Base rate the game asked for, before timeScale is folded in. */
   private baseRate = 1;
   /** True when a `play()` was rejected by the autoplay policy and is awaiting a gesture. */
