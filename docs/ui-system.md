@@ -1526,6 +1526,76 @@ Pixi `.then()`, is where this belongs. Pinned by `fontTexturePixi.test.ts` § "a
 mid-load must not leave its texture in the cache", which asserts the cache entry, the
 `Assets.unload`, and the contract on both provider classes.
 
+##### The other edge of that contract: a texture destroyed before it is returned (#481)
+
+Immediate-invoke has a second-order consequence, and it cuts the opposite way. The **dynamic**
+(canvas) path in `getDynamicFontTexturePixi` mints a `Texture`, caches it, then registers a
+disposer that evicts it and `destroy(true)`s it. On an already-disposed provider that disposer
+runs **synchronously, before the `return`** — so the function could hand its caller a corpse in
+the same call, and `Scene2D`'s `if (!ptex) continue` did not catch it: **a destroyed `Texture` is
+still truthy.** It went into `makeMtsdfPixiShader` and a `Mesh` that the same pass renders,
+against a `TextureSource` whose GPU teardown had already run.
+
+Guarded on both sides, because they are different contracts: the producer returns `null` when the
+texture it just minted is already destroyed (and evicts a destroyed cache hit, so the function is
+total rather than trusting the disposer's evict-before-destroy ordering forever), and the consumer
+reads `destroyed` as not-ready — `if (!ptex || ptex.destroyed) continue`, the same posture #455's
+fix took in `videoTextureSync2D.detach`.
+
+**Both paths, and the second one is not merely latent.** The dynamic (canvas) path above is the
+one #481 filed, and it *is* latent — every disposer also removes the provider from the `providers`
+map and Scene2D only obtains one via `getLoadedFont`, so no disposed provider has a route to it.
+The **baked/image** path had the same two holes and a describable route:
+
+- Its cache hit (`const existing = cache.get(key)`) returned without a `destroyed` check.
+- Its disposer is registered *inside* the async `.then()`, so on an already-disposed provider it
+  evicts the entry cached one line earlier, and the code then wakes every waiter into an empty
+  cache. **That one is NOT a defect, and the close-out initially "fixed" it and was wrong** — the
+  episode is recorded here because the wrong fix is the intuitive one:
+
+  > Settling those waiters with `wake: false` looks right (there is no texture to draw, same as
+  > the `.catch` path) and is a regression. `waiters` is keyed by the font **GUID**, so it
+  > outlives the provider *instance* while the cache entry does not: the set can hold a waiter
+  > belonging to the live **successor**, because `invalidateFont` disposes P1 and re-acquires P2
+  > under the same guid, and a repaint in that window queues P2's `markDirty` behind P1's
+  > still-in-flight load. Not waking strands that renderer — reproducing the very
+  > "texts are not rendered until I click the entity" bug the waiters set was added to fix. The
+  > `.catch` may settle without waking only because no successor is stranded there; the analogy
+  > between the two paths is false.
+  >
+  > The feared load/unload storm cannot happen either: a woken repaint resolves its provider via
+  > `getLoadedFont(guid)`, and every disposal path deletes from `providers` in the same
+  > synchronous block, so the retry gets the live P2 or no provider at all — never the disposed
+  > P1. Bounded at one iteration.
+
+  The code carries this as a **do-not-change** comment rather than a guard, because the correct
+  behaviour here is the absence of one.
+
+The route into the cache-hit hole runs through `Assets`, not through a disposed provider:
+**`Assets.unload` destroys a texture's source EAGERLY but removes the cache entry asynchronously**
+— measured on a live renderer 2026-08-10 and documented on `evictSourcelessEntry` in
+`pixiTextureLoad.ts`. A re-acquire of the same guid landing in that window (a baked↔dynamic mode
+flip with an unchanged asset hash yields the same `?v=` url) can therefore repopulate this
+module's own cache with a texture the in-flight teardown then destroys. That shim protects
+`Assets.cache`; `fontTexturePixi`'s map is its own, and was not covered by it.
+
+Two entity-level consumers, not one: `Scene2D.tsx`'s per-page loop **and** its readiness gate
+(`if (!getFontTexturePixi(provider, 0, …)) return`), which decides whether the entity renders at
+all. Only the loop was guarded at first. A corpse passing the gate admits the entity to
+`activeIds` and stamps `meshFrameKey` while every page is then skipped — the string renders as
+nothing, and for a **baked** provider that is permanent rather than transient, because
+`BakedFontProvider.atlasVersion` is `readonly = 0` and the loop's "rebuilds on atlasVersion bump"
+consolation can never fire for it.
+
+⚠️ `fontTextureThree.ts` is deliberately untouched and carries a comment saying so. It has the
+same *shape* and none of the hazard: THREE exposes no `.destroyed`/`.disposed` flag, and
+`dispose()` only drops the renderer's cached `WebGLTexture` while `.image` survives, so the next
+bind re-uploads. Porting the Pixi guard there would blank text that renders correctly today.
+
+The test's fake mirrors `BakedFontProvider.addDisposable`'s real disposed-branch exactly. A fake
+that queued the callback instead would have modelled behaviour the real provider does not have,
+and vouched for the bug.
+
 ---
 
 ## Image-ref gotcha (production builds drop source PNGs)

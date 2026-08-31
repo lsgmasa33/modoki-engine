@@ -245,6 +245,26 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         if (prevGameId && prevGameId !== gameId) {
           const prevDef = findGame(prevGameId);
           if (prevDef?.unregisterSystems) await prevDef.unregisterSystems();
+          // ⚠️ CANCELLATION CHECK BEFORE THE DESTRUCTIVE HALF, and it is load-bearing since #511
+          // gave `clearAppServices()` a real teardown (it calls the outgoing game's
+          // `ads.cleanup()`, not just `registered = {}`). A→B→A while B is suspended on the
+          // await above — the exact path this effect's header comment documents as hit for real
+          // — resumes here with `cancelled` already set, and A's re-entry has ALREADY taken the
+          // `activeGameIdRef.current === gameId` early return (that ref is written only on the
+          // success path below). So without this line B's dead continuation tears down the ads
+          // of the game that is once again live, and nothing re-registers them: A's
+          // `adRevenuePaid` listener is gone for the rest of the session and every impression
+          // stops reporting revenue, silently. Harmless before #511, because dropping the
+          // registry left the native listeners alone and both games import `./ads` directly.
+          //
+          // The tierBoot module is imported HERE, above the check, so that no `await` remains
+          // between the check and the end of this block — an await after it would reopen the same
+          // hole one step later (the swap-back landing during the dynamic import, teardown already
+          // done, `cancelled` observed too late).
+          const tierBoot = no3DTierLoopRef.current
+            ? await import('@modoki/engine/runtime/rendering/tierBoot')
+            : null;
+          if (cancelled) return;
           clearAppServices(); // drop the previous game's services before the next registers
           // ⚠️ AND THE 2D TIER-CALIBRATION LOOP, which the no-3D boot path below registers on the
           // frame driver (#203). It was exported with a teardown and never given one: swapping a
@@ -253,10 +273,8 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
           // the session. Stopped unconditionally here and restarted below only if the NEW game
           // needs it, so the pair is symmetric rather than conditional at both ends — a
           // conditional teardown is what produced the leak.
-          if (no3DTierLoopRef.current) {
-            const { stopTierCalibrationForNo3DProject } =
-              await import('@modoki/engine/runtime/rendering/tierBoot');
-            stopTierCalibrationForNo3DProject();
+          if (tierBoot) {
+            tierBoot.stopTierCalibrationForNo3DProject();
             no3DTierLoopRef.current = false;
           }
         }

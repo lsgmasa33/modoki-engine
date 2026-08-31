@@ -1813,7 +1813,14 @@ export class Scene2DRenderer {
         if (!provider) return;
         // Page-0 texture readiness gates the entity (baked atlas still loading, or a
         // dynamic provider before its first page). Per-page textures fetched below.
-        if (!getFontTexturePixi(provider, 0, () => this.markDirty())) return;
+        // ⚠️ `.destroyed` as well as null — a destroyed Pixi Texture is truthy (#481), and this
+        // gate is the one that decides the entity is renderable AT ALL. Letting a corpse through
+        // here admits the entity to `activeIds` and stamps `meshFrameKey`, while the per-page
+        // guard below then skips every page: the string renders as nothing. For a BAKED provider
+        // that is permanent, not transient — `atlasVersion` is `readonly = 0`, so the
+        // "rebuilds on atlasVersion/textDirty bump" consolation below cannot fire for it.
+        const gate = getFontTexturePixi(provider, 0, () => this.markDirty());
+        if (!gate || gate.destroyed) return;
 
         this.activeIds.add(id);
 
@@ -1861,7 +1868,11 @@ export class Scene2DRenderer {
           slot.pageMeshes = []; slot.textShaders = []; slot.pageNums = [];
           for (const { page, geo } of buildTextGeometryByPage(layout.quads)) { // Y-down, top-origin UVs (Pixi native)
             const ptex = getFontTexturePixi(provider, page, () => this.markDirty());
-            if (!ptex) continue; // page texture not ready — rebuilds on atlasVersion/textDirty bump
+            // A destroyed Texture is still truthy — `!ptex` alone would miss the contract hole
+            // where a just-minted texture is torn down inside the same call (#481, an
+            // already-disposed provider's addDisposable running synchronously). Same posture as
+            // #455's fix in videoTextureSync2D.detach: "destroyed but truthy" reads as not-ready.
+            if (!ptex || ptex.destroyed) continue; // page texture not ready — rebuilds on atlasVersion/textDirty bump
             // Pixi MeshGeometry wants a Uint32Array index buffer.
             const indices = geo.indices instanceof Uint32Array ? geo.indices : new Uint32Array(geo.indices);
             const geometry = new MeshGeometry({ positions: geo.positions, uvs: geo.uvs, indices });

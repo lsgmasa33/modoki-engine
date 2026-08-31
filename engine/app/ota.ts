@@ -102,6 +102,13 @@ export async function checkAppOtaUpdate(): Promise<boolean> {
   if (gateState?.phase === 'ready-to-restart') return false;
 
   const { ota } = projectConfig;
+  // Gated on `enabled`, NOT on `ota.publicKey` — which defaults to `''`. That is the shape #510
+  // was (a guard on a different field than the one being used), and it is safe here only because
+  // `publicKey` never crosses the native bridge: it is consumed by `verifyReleaseSignature` in
+  // `runtime/ota/otaClient.ts` (JS — NOT the `capacitor-modoki-ota` plugin, which only handles the
+  // `native:` side), which returns false on a blank key instead of throwing, so the outcome is a
+  // `signature-invalid` refusal. `vite-asset-scanner.ts` also checks it at build time. If this key
+  // ever starts being passed to a plugin call, it needs its own guard.
   if (!ota.enabled) return true;
   if (!Capacitor.isNativePlatform()) return true; // no OTA mechanism to hand this to on web
 

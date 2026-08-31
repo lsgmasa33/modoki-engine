@@ -67,7 +67,29 @@ export function appServices(): AppServices {
   return registered;
 }
 
-/** Drop all registered services (on game swap, so a previous game's services don't leak). */
+/** Drop all registered services (on game swap, so a previous game's services don't leak).
+ *
+ * Order matters: capture the outgoing registry, clear `registered` FIRST, THEN run cleanup on
+ * the capture. That way a cleanup that throws — or that re-enters the registry (e.g. by calling
+ * `registerAppServices` itself) — always finds `registered` already empty, never a half-cleared
+ * one. A game swap is the path that made this matter: `App.tsx` calls `clearAppServices()` before
+ * the next game registers, but until #511 nothing here ever called `ads.cleanup()`, so the
+ * outgoing game's AppLovin MAX listeners survived under the next game. The only other caller of
+ * `cleanup()` is App.tsx's `[]`-deps unmount effect, which still runs after this — safe, because
+ * every game's `cleanup()`/`cleanupAds` is idempotent (it loops an already-emptied array and
+ * resets flags), so a second call after a swap already cleaned up is a no-op. */
 export function clearAppServices(): void {
+  const { ads } = registered;
   registered = {};
+  try {
+    ads?.cleanup();
+  } catch (e) {
+    // A game's cleanup must never break the swap — same posture as registerAppServices above.
+    // But it is WARNED, not silently eaten: a throwing cleanup leaves the outgoing game's
+    // listeners registered, which is #511's exact symptom, and swallowing without a word would
+    // reproduce the bug in a form nothing can observe. ⚠️ This cannot see an async failure —
+    // Capacitor's `remove()` returns a Promise, so a rejecting one escapes as an unhandled
+    // rejection rather than reaching here. A game's cleanup should stay synchronous and total.
+    console.warn('[appServices] a game ads.cleanup() threw during swap; its listeners may survive:', e);
+  }
 }

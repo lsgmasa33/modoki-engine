@@ -155,6 +155,26 @@ const { shown } = await ApplovinMax.showInterstitial();
 await ApplovinMax.showMediationDebugger();
 ```
 
+⚠️ **A blank `adUnitId` is a CRASH, not a no-op** (#510). Loading or showing an ad with an
+empty id throws on the native **main thread** — outside any JS `try/catch` — and terminates the app.
+So a game's ad wrapper must gate on **the unit id it is about to pass**, per entry point; gating on
+the SDK key alone is not enough, because a configured key with unfilled unit ids is exactly the
+half-configured state that reaches the SDK.
+
+⚠️ **Check the plugin signature — not every ad call takes an id, and the rule only bites on the
+ones that do.** **Read the plugin's `definitions.ts` for the call you are adding** rather than trusting a list
+here — this one has already been wrong once, and a hand-maintained enumeration in a doc whose
+thesis is "check the signature" is precisely what goes stale. As of writing, `loadInterstitial`,
+`loadRewardedAd`, `showBanner` and `showMRec` take an `adUnitId`, and those guards are crash
+guards; `showInterstitial`/`showRewardedAd` take only `{ placement }` and
+`hideBanner`/`showMediationDebugger` take nothing at all, so no blank id can reach the SDK through
+them — guarding those on the unit id is still right, but it is a *behavioural* "we never loaded
+one, so there is nothing to show", not a crash guard. Stating it as one (this doc did, briefly)
+teaches the next wrapper author to look for the wrong thing. `games/court/packages/app-services/src/ads.ts` is the
+reference shape (a `unit(kind)` accessor + a guard on every call that takes an id);
+`games/3d-test`'s had the warning in its banner and the check on the key only, which is how #510
+was filed. `hideBanner`/`showMediationDebugger` take no id and need no such guard.
+
 ### `capacitor-adjust` — Adjust (SDK v5)
 
 Attribution, event tracking, ad-revenue, IDFA/ADID, ATT, purchase verification.
@@ -210,7 +230,7 @@ Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine
 
 ### Key files
 
-- `engine/packages/modoki/src/runtime/core/appServices.ts` — the registry: `registerAppServices(services)` (merge-registers), `appServices()` (read the current set), `clearAppServices()` (drop them on game swap). Interfaces `CrashlyticsService` (`recordError`/`log`), `AdsService` (`init`/`cleanup`), `AttributionService` (`init`).
+- `engine/packages/modoki/src/runtime/core/appServices.ts` — the registry: `registerAppServices(services)` (merge-registers), `appServices()` (read the current set), `clearAppServices()` (tear down and drop them on game swap — see below). Interfaces `CrashlyticsService` (`recordError`/`log`), `AdsService` (`init`/`cleanup`), `AttributionService` (`init`).
 - `engine/packages/modoki/src/runtime/core/gameDefinition.ts` — the `GameDefinition.registerAppServices?()` hook a project implements.
 - `games/3d-test/packages/app-services/src/index.ts` — a game's implementation: `register()` calls `registerAppServices({ crashlytics, ads, attribution })`, wiring its own `crashlytics.ts` / `ads.ts` / `attribution.ts` into the engine surface.
 - `engine/app/App.tsx` — the shell that drives the lifecycle.
@@ -221,7 +241,7 @@ Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine
 
 The engine sees only the **small hook surface** — `crashlytics.recordError/log`, `ads.init/cleanup`, `attribution.init`. A game's package keeps its full API (`showInterstitial`, `logEvent`, `setUserProperty`, …) for the game itself to import and call directly; the engine never sees those. On game bootstrap `App.tsx` calls, in order: `def.registerAppServices()` (the game populates the registry), then — **only on `Capacitor.isNativePlatform()`** — `appServices().attribution?.init()` and `appServices().ads?.init()`. Ads are cleaned up (`appServices().ads?.cleanup()`) on unmount. Crashlytics is pull-driven: `gameStore` logs screen breadcrumbs via `appServices().crashlytics?.log(...)`, `ErrorBoundary` reports a React subtree crash through `reportReactError`, and the global capture below reports everything else.
 
-**Every hook is optional and every unregistered hook is a silent no-op** (callers use `?.`) — which is also the correct web/editor behaviour, since the underlying Capacitor plugins stub out off-device anyway. On a game switch `App.tsx` calls `clearAppServices()` **before** the next game's `registerAppServices()`, so a previous game's ad/attribution SDKs don't leak into the next game. Native SDK init is no longer wired in `main.tsx` — that comment there points here. The game package is also the dogfood stand-in for a future Modoki-hosted npm package (see `docs/modoki-package-manager.md`).
+**Every hook is optional and every unregistered hook is a silent no-op** (callers use `?.`) — which is also the correct web/editor behaviour, since the underlying Capacitor plugins stub out off-device anyway. On a game switch `App.tsx` calls `clearAppServices()` **before** the next game's `registerAppServices()`, so a previous game's ad/attribution SDKs don't leak into the next game. ⚠️ **That sentence described an intention, not the code, until #511**: `clearAppServices()` was `registered = {}` and nothing more, while the only caller of `AdsService.cleanup()` was `App.tsx`'s `[]`-deps *unmount* effect — so a swap dropped the registry and left the outgoing game's AppLovin MAX listeners live under the next game, double-counting ad revenue. It now captures the outgoing `ads`, clears the registry **first** (so a cleanup that throws or re-enters finds it empty, never half-cleared), then calls `cleanup()` inside a `try/catch` — a game's teardown must never break the swap. A game's `cleanup()` must therefore be **idempotent**, because the unmount effect can still run after a swap already cleaned up. The lesson generalises: **a teardown hook that exists and is called by nothing is indistinguishable from no hook at all** (same family as #506's `stopCloudSync`). Native SDK init is no longer wired in `main.tsx` — that comment there points here. The game package is also the dogfood stand-in for a future Modoki-hosted npm package (see `docs/modoki-package-manager.md`).
 
 ### Global JS error capture (#275)
 

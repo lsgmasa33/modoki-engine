@@ -301,3 +301,65 @@ describe('GameShell recovery paths', () => {
     await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull());
   });
 });
+
+describe('a cancelled swap does not tear down the game that is live again (#511 continuation)', () => {
+  it('A→B→A while B is suspended on unregisterSystems must NOT call clearAppServices', async () => {
+    // Control game B's `unregisterSystems` promise by hand, so the effect body can be parked
+    // mid-teardown (right after `await prevDef.unregisterSystems()`) and resumed later.
+    let resolveUnregisterB!: () => void;
+    const unregisterSystemsB = vi.fn(() => new Promise<void>((resolve) => { resolveUnregisterB = resolve; }));
+    const registerSystemsA = vi.fn(async () => {});
+    const registerAppServicesA = vi.fn(async () => {});
+    const defA: GameDefinition = {
+      id: 'game-a',
+      name: 'game-a',
+      registerSystems: registerSystemsA,
+      registerAppServices: registerAppServicesA,
+      unregisterSystems: unregisterSystemsB, // A is the OUTGOING game being torn down on A→B
+      loadConfig: async () => ({
+        assetManifest: '/assets.manifest.json',
+        scenePath: '/scene.json',
+        disable3D: true,
+      } as never),
+    };
+    if (!registerDynamicGame(defA)) throw new Error('test setup: could not register game "game-a"');
+    makeGame('game-b');
+
+    const { rerender } = render(React.createElement(GameShell, { gameId: 'game-a' }));
+    await waitFor(() => expect(spies.loadScene).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull());
+
+    // A→B: parks inside the async body right after `await prevDef.unregisterSystems()`
+    // (game A's `unregisterSystems`, since A is the OUTGOING game here) — before it reaches
+    // `clearAppServices()`.
+    rerender(React.createElement(GameShell, { gameId: 'game-b' }));
+    await waitFor(() => expect(unregisterSystemsB).toHaveBeenCalledTimes(1));
+
+    // B→A: cancels B's in-flight run (`cancelled = true` in B's effect cleanup) before B's
+    // continuation has resumed.
+    rerender(React.createElement(GameShell, { gameId: 'game-a' }));
+
+    // Now let B's suspended continuation resume. It must see `cancelled` and return before
+    // reaching `clearAppServices()` — which would otherwise tear down game A, now live again.
+    resolveUnregisterB();
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(spies.clearAppServices).not.toHaveBeenCalled();
+  });
+
+  it('an UNCANCELLED A→B swap DOES call clearAppServices exactly once (control)', async () => {
+    makeGame('game-a');
+    makeGame('game-b');
+
+    const { rerender } = render(React.createElement(GameShell, { gameId: 'game-a' }));
+    await waitFor(() => expect(spies.loadScene).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull());
+
+    rerender(React.createElement(GameShell, { gameId: 'game-b' }));
+    await waitFor(() => expect(spies.loadScene).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull());
+
+    expect(spies.clearAppServices).toHaveBeenCalledTimes(1);
+  });
+});
