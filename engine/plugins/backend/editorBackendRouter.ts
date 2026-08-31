@@ -750,7 +750,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           byKind,
           hint: res.handles.length
             ? 'Counts only. Pass editor=<name>, kind=<name>, or ids=[…] for handle geometry (x/y/rect).'
-            : 'No handles: open the relevant editor + enter its sub-mode first (e.g. scene_view_mode ui + collider_edit on).',
+            : 'No handles: open the relevant editor + enter its sub-mode first (e.g. set_scene_view_mode ui + set_collider_edit on).',
         });
       }
       // A FILTERED call that matched NOTHING used to return `{count:0, editors:[], handles:[]}`
@@ -776,7 +776,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           byKind,
           hint: live.length
             ? `no handle matches ${asked}. Live now: editor ∈ {${live.join(', ')}}, kind ∈ {${Object.keys(byKind).join(', ')}} — check the spelling, or drop the filter for counts.`
-            : `no handle matches ${asked}, and NO editor is currently exposing handles: open the relevant editor + enter its sub-mode first (e.g. scene_view_mode ui + collider_edit on).`,
+            : `no handle matches ${asked}, and NO editor is currently exposing handles: open the relevant editor + enter its sub-mode first (e.g. set_scene_view_mode ui + set_collider_edit on).`,
         });
       }
       return json(res);

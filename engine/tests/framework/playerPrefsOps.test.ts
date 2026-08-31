@@ -503,3 +503,116 @@ describe('clear: pendingWrites is sorted even when the dirty order is not alphab
     expect(r.pendingWrites).toEqual(['alpha', 'zeta']); // sorted, not insertion/dirty order
   });
 });
+
+describe('player-prefs-write: a swap landing DURING the op\'s own await is caught, not just a stale entry-time sample (#454 C)', () => {
+  // The entry-time `isSwapInFlight()` check above refuses a swap that is ALREADY in flight when
+  // the op starts. It cannot see one that starts (or starts AND finishes) while the op is
+  // parked inside one of its own `await PlayerPrefs.flush()` calls — the pending-write readback
+  // that follows would then answer against whatever namespace is installed by the time it runs,
+  // not the one this op captured at entry. `swapGeneration()` is the fix: `doInit` bumps it (and
+  // sets `isSwapInFlight()`) at its very FIRST line, before it ever touches the write this op is
+  // draining, so the op can tell a swap started even though — as here — that swap's own body is
+  // itself queued behind this op's in-flight batch and cannot complete until this op's gate is
+  // released.
+  //
+  // Constructing a swap that both OPENS and fully CLOSES strictly inside the op's await proved
+  // impossible to build against the real, serialized `init()`: any swap on an already-hydrated
+  // store must itself call `flush()` before it can install, and `flush()` shares this op's OWN
+  // `writeChain` — so a concurrent swap cannot finish before this op's gated write settles. What
+  // IS achievable, and is exactly what `swapGeneration()` is FOR, is a swap that starts (bumping
+  // the generation) while the op is parked — proving the post-await check catches it via the
+  // generation counter rather than relying on a stale isSwapInFlight() sample that could,
+  // structurally, have already flipped back to false by the time a caller resumes.
+  it('a swap starting while the flush action is parked mid-write is refused, not reported as success', async () => {
+    resetPlayerPrefsForTest();
+
+    let releaseWrite: () => void = () => {};
+    const writeGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    let writeStarted: () => void = () => {};
+    const writeStartedPromise = new Promise<void>((resolve) => { writeStarted = resolve; });
+    const store = new Map<string, string>();
+    const gated: PrefsBackend = {
+      getAll: async (prefix) => {
+        const out: Record<string, string> = {};
+        for (const [k, v] of store) if (k.startsWith(prefix)) out[k] = v;
+        return out;
+      },
+      set: async (k, v) => { writeStarted(); await writeGate; store.set(k, v); },
+      remove: async (k) => { store.delete(k); },
+    };
+    await PlayerPrefs.init({ namespace: 'unit-c', backend: gated });
+    PlayerPrefs.set('coins', 5); // dirty, not yet drained
+
+    // The op's OWN internal `await PlayerPrefs.flush()` (the 'flush' action) is what parks here.
+    const opPromise = write({ action: 'flush' });
+    await writeStartedPromise; // the op's flush() is now genuinely mid-write
+
+    // A swap to another namespace, started independently of this op. `doInit` sets
+    // `swapInFlight`/bumps `swapEpoch` at its very first line — before `doInitBody` ever
+    // reaches its own `flush()` call, which is what then queues behind the op's in-flight
+    // write above. So the generation moves even though this swap cannot itself COMPLETE until
+    // the write gate below is released.
+    const swap = PlayerPrefs.init({ namespace: 'unit-c-2', backend: new InMemoryBackend() });
+    // Give `initChain`/`doInit` a couple of microtask turns to reach that first line.
+    await Promise.resolve(); await Promise.resolve();
+
+    releaseWrite(); // let the op's own write settle
+    const result = await opPromise;
+
+    // Degrades to durability-unknown, not a false success — the readback below can no longer be
+    // trusted to answer for THIS namespace once a swap has started. This test proves the check
+    // FIRES when a swap starts mid-await; whether THIS PARTICULAR swap would have corrupted the
+    // readback is NOT what this test establishes (see the block header above for why that
+    // stronger case could not be constructed against the real, serialized `init()`).
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('PARTIAL');
+    expect(result.durability).toBe('unknown');
+    expect(String(result.error)).toMatch(/swap/i);
+
+    await swap; // let the swap finish so it doesn't leak into the next test
+  });
+
+  it('a delete whose durable remove already landed is reported PARTIAL/durability-unknown, not as if nothing happened (#454 C, review finding 2)', async () => {
+    resetPlayerPrefsForTest();
+
+    let releaseRemove: () => void = () => {};
+    const removeGate = new Promise<void>((resolve) => { releaseRemove = resolve; });
+    let removeStarted: () => void = () => {};
+    const removeStartedPromise = new Promise<void>((resolve) => { removeStarted = resolve; });
+    const store = new Map<string, string>();
+    const gated: PrefsBackend = {
+      getAll: async (prefix) => {
+        const out: Record<string, string> = {};
+        for (const [k, v] of store) if (k.startsWith(prefix)) out[k] = v;
+        return out;
+      },
+      set: async (k, v) => { store.set(k, v); },
+      remove: async (k) => { removeStarted(); await removeGate; store.delete(k); },
+    };
+    await PlayerPrefs.init({ namespace: 'unit-c2', backend: gated });
+    PlayerPrefs.set('coins', 5);
+    await PlayerPrefs.flush(); // durably set, so the delete below hits a real backend.remove()
+
+    // The op's OWN internal `await PlayerPrefs.flush()` (inside the `delete` action) is what
+    // parks here, mid-`backend.remove()`.
+    const opPromise = write({ action: 'delete', key: 'coins' });
+    await removeStartedPromise; // the durable remove is now genuinely in flight
+
+    // A swap to another namespace, started independently of this op.
+    const swap = PlayerPrefs.init({ namespace: 'unit-c2-2', backend: new InMemoryBackend() });
+    await Promise.resolve(); await Promise.resolve();
+
+    releaseRemove(); // let the durable remove settle — it really lands
+    const result = await opPromise;
+    await swap; // let the swap finish so it doesn't leak into the next test
+
+    // The delete really landed — the store no longer holds the key.
+    expect(store.has('mk:unit-c2:coins')).toBe(false);
+    // And the reply never implies nothing happened: it's PARTIAL/durability-unknown, not
+    // NOT_AVAILABLE_HERE (which at entry means "nothing was done" — here it would be a lie).
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('PARTIAL');
+    expect(result.deleted).toBe(true);
+    expect(result.durability).toBe('unknown');
+  });
+});

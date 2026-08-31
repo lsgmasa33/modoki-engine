@@ -1533,6 +1533,27 @@ export async function acquireMesh(sceneId: SceneId, meshRef: string): Promise<vo
   // Fetch the .mesh.json (cached). After this, meshAssetCache has the entry.
   await fetchMeshAsset(meshPath);
 
+  // Released mid-load → drop the result, mirroring riggedModelCache.ts:177 and
+  // audioBufferCache.ts:206. releaseAllForScene is synchronous and can land
+  // inside this await (SceneManager aborts an in-flight load and releases its
+  // sceneId at sceneManager.ts:279-280; that abort doesn't reach this fetch,
+  // which isn't abortable) — and once it has, nothing will ever call
+  // releaseAllForScene for this sceneId again, so any hold re-added below would
+  // pin the geometry, material and textures for the process lifetime. Evict the
+  // owner-less cache entry too (releaseMeshByPath's wasLast branch already did
+  // this; fetchMeshAsset just repopulated it on resume) — but only if nobody
+  // else owns it, so a second, still-live scene acquiring the same mesh
+  // concurrently keeps its entry.
+  // NOTE: this does not cover fetchMeshAsset loading model templates inside
+  // this same await — geometry can already be resident with no owner at all by
+  // the time we bail here. That's a separate, pre-existing situation (see the
+  // F6 comment on the sync render-path resolver) and is tracked separately,
+  // not fixed here.
+  if (!meshAssetOwners.get(meshPath)?.has(sceneId)) {
+    if (!meshAssetOwners.get(meshPath)?.size) meshAssetCache.delete(meshPath);
+    return;
+  }
+
   const asset = meshAssetCache.get(meshPath);
   if (!asset || asset === MESH_FAILED) return; // load failed; nothing to transitively acquire
 

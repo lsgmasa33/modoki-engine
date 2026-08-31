@@ -1072,7 +1072,7 @@ per-orientation data, and what is measured vs published:
 ### Driving the preview screen from an agent (#367)
 
 The selected device and orientation live in the **editor store** (`gameViewDevice` /
-`gameViewOrientation`), not in GameView-local state, so `modoki_game_view_device` can set them —
+`gameViewOrientation`), not in GameView-local state, so `modoki_set_game_view_device` can set them —
 the same lift `sceneViewMode` got, for the same reason: the device picker is a popup that trusted
 input cannot operate. Before it, every layout check an agent ran measured whatever device the human
 last left selected, and the per-device bug class (safe-area insets, panel-fit budgets) is precisely
@@ -1484,7 +1484,7 @@ view is showing decides what `modoki_handles` can see at all, and the default is
 `modoki_handles editor=curves` comes back empty until the view is switched, which reads as *"this
 clip has no tangents"* rather than *"you are looking at the wrong view"*. The choice therefore
 lives in the **editor store** (`animationViewMode`), not in `AnimationEditor` local state, so it is
-agent-drivable — `modoki_animation_view_mode {mode}` sets it and `modoki_get_editor_state` reports
+agent-drivable — `modoki_set_animation_view_mode {mode}` sets it and `modoki_get_editor_state` reports
 it back (#369). Same move, and the same reason, as `sceneViewMode` gating the Collider2D handles.
 Setting it does not open, reload, or reset a clip; `modoki_open_animation_editor` does (it clears
 the loaded document and resets the playhead to 0), which is why the view is a separate call rather

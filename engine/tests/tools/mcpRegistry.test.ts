@@ -40,6 +40,7 @@ import {
   clearRegistry,
 } from '../../tools/modoki-mcp/src/registry';
 import { loadSurface, sumSchemaBytes, type Surface } from './mcpSurface';
+import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
 
 const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../tools/modoki-mcp/src');
 const read = (rel: string) => fs.readFileSync(path.join(SRC, rel), 'utf-8');
@@ -138,6 +139,23 @@ describe('the real registered surface', () => {
       expect(typeof entry.handler, `${name} must be callable`).toBe('function');
       expect(entry.shape, `${name} must expose its zod shape for batch validation`).toBeTypeOf('object');
     }
+  });
+
+  // Claude Code advertises this whole surface DEFERRED — names only, schemas fetched on demand —
+  // so the tool NAME is the entire interface at pick time and the only thing that can say "this
+  // writes". #483 renamed three view-mode tools to `set_*` for that reason; a later sweep found
+  // two more sitting on `set-*` ops without the prefix (the gizmo-mode and collider-edit-mode
+  // setters), which is why this is a guard now instead of prose: the discriminator is the
+  // backend OP, so a new `set-*` op cannot ship under a non-`set_` name.
+  // Deliberate exemptions, so a reader does not "fix" them: the `asset`-kind family
+  // (`modoki_particle_set`, `modoki_timeline_set`, `modoki_anim_set_clip`) is subject-first by
+  // design so siblings sort together, and its names match their ops exactly;
+  // `modoki_select_sprite_slice` is a genuine `select-` verb, not a setter.
+  it('a tool whose backend op is `set-*` is NAMED `modoki_set_*`', () => {
+    const offenders = Object.entries(CONTRACTS)
+      .filter(([name, c]) => typeof c.op === 'string' && c.op.startsWith('set-') && !name.startsWith('modoki_set_'))
+      .map(([name, c]) => `${name} (op ${c.op})`);
+    expect(offenders).toEqual([]);
   });
 
   /** Parameters documented NOWHERE — neither `.describe()` on the zod field nor a mention in the

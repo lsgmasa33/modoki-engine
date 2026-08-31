@@ -52,6 +52,7 @@ PlayerPrefs.keys(): string[]
 PlayerPrefs.clear(): void                         // empties THIS game's namespace
 PlayerPrefs.isHydrated(): boolean                 // true once init() has hydrated the cache
 PlayerPrefs.isSwapInFlight(): boolean             // true while an init() swap is mid-flight (see Gotchas)
+PlayerPrefs.swapGeneration(): number              // opaque token — capture before your own await, compare after (see Gotchas)
 PlayerPrefs.hasPendingWrite(key): boolean         // a write the backend has NOT accepted (see Gotchas)
 PlayerPrefs.pendingKeys(): string[]               // the authoritative pending set (see Gotchas — NOT keys().filter(hasPendingWrite))
 await PlayerPrefs.flush()                         // resolve once pending writes are durable
@@ -237,6 +238,19 @@ if (score > best) PlayerPrefs.set('bestScore', score);
     finished — never offered to a flush at all, and discarded by the synchronous install the
     instant it runs. Reported through its own message (`reportRaced`) that says exactly this,
     rather than blaming the backend the way the first bullet's message would.
+    **Two shapes reach this message, not one (#454 B).** The second is a key that was pending
+    *before* the window, LANDED durably during it, and was then re-set before the window closed:
+    it is back in the pending set at install time and, by set membership alone, is
+    indistinguishable from a key the backend never accepted — so it used to be reported as
+    discarded, blaming a backend that had in fact accepted the write. `drain()` records every
+    accepted key into a `windowLanded` set while a window is open, which is what tells the two
+    apart; `discardedPending` (the caller-visible union) was already correct and is unchanged by
+    this — only the console attribution moved. `windowLanded` tracks the LATEST attempt for a
+    key, not "ever landed" (review finding 1) — a key that lands, is re-set, and whose re-write
+    is then genuinely rejected goes back to being reported as discarded, not raced. There are
+    therefore four outcomes for a pre-window key, not two: never lands (discarded); lands and
+    stays landed (reported nowhere); lands and is re-set with the re-write still pending (raced);
+    lands, is re-set, and the re-write is rejected (discarded again).
   Both callers (`App.tsx`'s `GameShell` boot effect, `editor/setup.ts`'s `createGameEditor`) log the
   discarded keys with the outgoing/incoming game context `init()` itself doesn't have. Neither
   routes this through the event journal — a game swap is a two-world atomic swap, and the journal is
@@ -297,9 +311,42 @@ cannot see the failure (see `hasPendingWrite` above) — such a write reports PA
 
 ALL FOUR actions — `set`/`delete`/`clear`/`flush` — are refused with `NOT_AVAILABLE_HERE` while a
 game/namespace swap is in flight (`PlayerPrefs.isSwapInFlight()` — see Gotchas, #438), `flush`
-included. A round-4 fix exempted `flush` on the theory that draining whatever the outgoing store
-already owes is harmless — but a `flush` that is still draining when the install runs settles
-*after* the swap, so `PlayerPrefs.pendingKeys()` (read to decide the reply) answers against the
+included. ⚠️ **That refusal is an INTERVAL, not a sample (#454 C).** The entry-time check only
+answers for the instant the op started; a swap landing during one of the op's own
+`await PlayerPrefs.flush()` calls would let the `pendingKeys()`/`hasPendingWrite()` readback
+answer against the INCOMING namespace and report a clean success for writes belonging to the
+outgoing store. So the op captures `PlayerPrefs.swapGeneration()` alongside the namespace at entry
+and re-checks it after **every** internal flush, degrading the reply if it moved.
+
+**This post-flush check does NOT refuse (#454, review finding 2).** By the time it can fire, the
+mutation has already happened — the cache write landed, and a durable write was at least
+attempted against the outgoing namespace — so `NOT_AVAILABLE_HERE` (which at entry truthfully
+means "nothing was done") would be a lie here; worse, a caller retrying a `delete` whose durable
+remove already landed would then see `NOT_FOUND: nothing was deleted` and conclude its delete
+never happened. Instead it reports `PARTIAL` with `durability:'unknown'`, merging in whichever
+facts that action already knows are true (`deleted:true`, `cleared:<n>`, etc.) but never a
+`saved`/`pendingWrites` field — those are exactly what's unknown. The check is also deliberately
+**conservative**: it fires whenever a swap started during the await, even in cases where the
+readback would in fact still have been truthful (the swap may be parked behind this op's own
+`writeChain` and not yet installed) — over-reporting "unknown" is the safe direction, claiming a
+durability we could not observe is not.
+
+It is a generation counter rather than a second `isSwapInFlight()` sample because a swap that
+opens *and closes* entirely inside the op's await leaves that flag back at `false` by the time the
+op resumes — a re-sampled flag structurally cannot see it, and a monotonic counter can. The
+counter's justification is defence-in-depth plus a genuinely reachable case: two queued `init()`
+calls where one completes entirely inside this op's own await (`initChain` serializes them, so the
+first can finish before the second even starts). A swap that both opens and fully closes *inside a
+single `init()`'s own body* while parked behind this op's `writeChain` proved impossible to
+construct against the real, serialized `init()` — any swap on an already-hydrated store must
+itself call `flush()` before it can install, and that `flush()` shares this op's own `writeChain`,
+so it cannot finish before this op's own gated write settles. Don't present that unconstructible
+case as the driver for the counter; the review's own regression test records that it could not be
+built.
+
+A round-4 fix exempted `flush` on the theory that draining whatever the outgoing store already
+owes is harmless — but a `flush` that is still draining when the install runs settles *after* the
+swap, so `PlayerPrefs.pendingKeys()` (read to decide the reply) answers against the
 already-installed INCOMING namespace instead: a write that never landed anywhere reported
 `{ok:true, flushed:true, pendingWrites:[]}`, a false success. The same reasoning applies to
 `set`/`delete`/`clear`: even where the write itself durably lands in the OUTGOING backend, this op

@@ -620,6 +620,278 @@ describe('PlayerPrefs — backend-failure resilience', () => {
   });
 });
 
+describe('PlayerPrefs — swap-window residuals (#454)', () => {
+  it('a backend swap under the SAME namespace re-queues the key — the RETRY follows the game, the value does not (#454 A)', async () => {
+    // Pins drain()'s rejection-handler guard: `if (namespace === batchNamespace)` is
+    // NAMESPACE-only, deliberately — a same-game reload that swaps only the BACKEND (like
+    // App.tsx's `init({namespace: gameId, backend: selectDefaultBackend()})`) is NOT detected
+    // by it, so the key re-queues and the retry is issued against the new backend.
+    //
+    // ⚠️ Read the `remove:` assertion at the bottom before believing the name: what follows the
+    // game is the retry ATTEMPT, not the outgoing write's value. The install cleared `cache`
+    // and repopulated it from the incoming backend long before this rejection settled, so the
+    // retry is a no-op against that game's own store. That is the whole reason this branch is
+    // harmless — not that anything was preserved. See drain()'s doc comment (#454 A).
+    //
+    // To exercise the guard for real (not just trivially, since the namespace value never
+    // changes here) the write has to still be IN FLIGHT — inside drain()'s own
+    // `Promise.all`, already claimed out of `dirty` — at the exact instant the swap installs
+    // backend2. Only then does the eventual rejection settle with `backend` already pointing
+    // at the new store while `namespace` reads the same as `batchNamespace`. Fake timers fire
+    // the debounce directly (a SINGLE, un-retried drain() batch) rather than going through
+    // `flush()`'s own built-in two-drain retry, which would otherwise consume the re-queue
+    // against the new backend before this test gets a chance to observe it.
+    vi.useFakeTimers();
+    try {
+      let releaseGetAll: () => void = () => {};
+      const getAllGate = new Promise<void>((resolve) => { releaseGetAll = resolve; });
+      let getAllStarted: () => void = () => {};
+      const getAllStartedPromise = new Promise<void>((resolve) => { getAllStarted = resolve; });
+
+      let releaseSet: () => void = () => {};
+      const setGate = new Promise<void>((resolve) => { releaseSet = resolve; });
+      let setStarted: () => void = () => {};
+      const setStartedPromise = new Promise<void>((resolve) => { setStarted = resolve; });
+
+      const backend1: PrefsBackend = {
+        getAll: async () => ({}),
+        // Blocks until released, then always rejects — the outgoing store's write is still
+        // in flight when the swap installs backend2.
+        set: async () => { setStarted(); await setGate; throw new Error('rejected — settles after the swap (simulated)'); },
+        remove: async () => {},
+      };
+
+      const store2 = new Map<string, string>();
+      const backend2Attempts: string[] = [];
+      const backend2: PrefsBackend = {
+        getAll: async (prefix) => {
+          getAllStarted();
+          await getAllGate;
+          const out: Record<string, string> = {};
+          for (const [k, v] of store2) if (k.startsWith(prefix)) out[k] = v;
+          return out;
+        },
+        // `install`'s `cache.clear()` (in doInitBody) wipes 'k'\'s cached VALUE the instant it
+        // runs, regardless of the write still being in flight against backend1 — `cache` and
+        // `dirty` are cleared together by design (see the ⚠️ comment above the install block).
+        // So the re-queue this test is pinning is a `dirty`-only signal: the retry that reaches
+        // backend2 reads `cache.get('k')` as absent and calls `remove`, not `set` — which is
+        // the correct, unsurprising behaviour for a key whose last known good value the process
+        // no longer holds. What #454 A guarantees is that backend2 is asked about 'k' AT ALL,
+        // rather than the write vanishing with nothing retried against the new store.
+        set: async (k, v) => { backend2Attempts.push(`set:${k}`); store2.set(k, v); },
+        remove: async (k) => { backend2Attempts.push(`remove:${k}`); store2.delete(k); },
+      };
+
+      await PlayerPrefs.init({ namespace: 'g1', backend: backend1 });
+
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      // Same namespace, NEW backend — a reload, not a game swap.
+      const initPromise = PlayerPrefs.init({ namespace: 'g1', backend: backend2 });
+      await getAllStartedPromise; // doInitBody is parked awaiting backend2.getAll()
+
+      PlayerPrefs.set('k', 1); // schedules the 150ms debounce (WRITE_DEBOUNCE_MS, private to the module)
+      await vi.advanceTimersByTimeAsync(200); // fires ONE drain() against backend1
+      await setStartedPromise; // backend1.set('k', …) is now in flight, blocked on setGate
+
+      releaseGetAll(); // let the swap install run — 'k' is invisible to it (in-flight, not dirty)
+      await initPromise;
+      // Nothing was ever "discarded" by the swap itself — the write was in flight, not pending.
+      expect(errorSpy).not.toHaveBeenCalled();
+
+      releaseSet(); // now let the in-flight write settle — AFTER backend2 is already installed
+      // Let drain()'s catch handler (namespace===batchNamespace re-queue) run its microtasks.
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+      // The guard is namespace-only (#454 A): `namespace` is unchanged ('g1' → 'g1'), so the
+      // rejection handler re-queues even though `backend` has moved on to backend2 — the key is
+      // retried against the store the game now reads from, rather than the retry being dropped.
+      expect(PlayerPrefs.pendingKeys()).toContain('k');
+      expect(backend2Attempts).toEqual([]); // nothing has retried against the new backend yet
+
+      // A subsequent flush() retries against the CURRENT backend, not the outgoing one.
+      await PlayerPrefs.flush();
+      // A `remove`, not a `set`: the value did not survive the install's `cache.clear()`. This
+      // is the assertion that keeps the test name honest — the RETRY reached backend2, and it
+      // carried nothing, which is exactly the no-op the doc comment describes.
+      expect(backend2Attempts).toEqual(['remove:mk:g1:k']);
+      expect(PlayerPrefs.pendingKeys()).not.toContain('k'); // and is no longer stuck retrying
+
+      errorSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a pre-window key that LANDED during the window and was then RE-SET is reported as RACED, not discarded (#454 B)', async () => {
+    // The defect this closes: `doInitBody` used to fold `preWindowPending ∩ fullPending`
+    // straight into `reportDiscarded`, which is right for a key the backend never accepted —
+    // but wrong for a key that landed durably during the window and was then overwritten
+    // during the SAME window: that key is back in the pending set too, indistinguishable by
+    // membership alone, yet the truth is "raced a re-write", not "the backend refused it".
+    let setMode: 'reject' | 'succeed' = 'reject';
+    let getAllCount = 0;
+    let getAllStarted: () => void = () => {};
+    const getAllStartedPromise = new Promise<void>((resolve) => { getAllStarted = resolve; });
+    let releaseGetAll: () => void = () => {};
+    const getAllGate = new Promise<void>((resolve) => { releaseGetAll = resolve; });
+    const store = new Map<string, string>();
+    const backend: PrefsBackend = {
+      getAll: async (prefix) => {
+        getAllCount++;
+        // Only the SECOND call (the swap under test) parks on the gate — the FIRST call is
+        // this test's own initial hydration and must complete immediately, or `await
+        // getAllStartedPromise` below would resolve against the wrong call entirely.
+        if (getAllCount === 2) {
+          getAllStarted();
+          await getAllGate;
+        }
+        const out: Record<string, string> = {};
+        for (const [k, v] of store) if (k.startsWith(prefix)) out[k] = v;
+        return out;
+      },
+      set: async (k, v) => {
+        if (k.endsWith(':k') && setMode === 'reject') throw new Error('rejected (simulated)');
+        store.set(k, v);
+      },
+      remove: async (k) => { store.delete(k); },
+    };
+
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+    PlayerPrefs.set('k', 1);
+    // Genuinely rejected and left pending — this is the state BEFORE the window opens.
+    await PlayerPrefs.flush();
+    expect(PlayerPrefs.pendingKeys()).toContain('k');
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Re-init (same namespace is fine — the window mechanics don't care) triggers the
+    // pre-swap convergence loop first: it retries 'k' against the still-rejecting backend,
+    // converges (same rejected key both passes), and THEN opens the window right before
+    // taking the pre-window pending snapshot — so 'k' is genuinely part of `preWindowPending`.
+    const initPromise = PlayerPrefs.init({ namespace: 'g1', backend });
+    await getAllStartedPromise; // doInitBody is parked awaiting getAll() — the window is open
+
+    // Now, DURING the window: let 'k' land durably (a flush issued directly, not through
+    // doInitBody), then immediately re-set it before the window closes.
+    setMode = 'succeed';
+    await PlayerPrefs.flush(); // lands 'k' — drain() records it into `windowLanded`
+    PlayerPrefs.set('k', 2); // re-set during the SAME window, left dirty (not flushed again)
+
+    releaseGetAll(); // let the swap install run
+    const result = await initPromise;
+
+    // `discardedPending` is UNCHANGED — still the install-time union.
+    expect(result.discardedPending).toEqual(['k']);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const message = errorSpy.mock.calls[0]?.[0] as string;
+    expect(message).toContain('k');
+    // The attribution is RACED, not discarded — the backend never refused anything here.
+    expect(message).not.toContain('did not accept');
+    expect(message).toMatch(/written by the outgoing/);
+
+    errorSpy.mockRestore();
+  });
+
+  it('a pre-window key that landed, was re-set, and was then REJECTED is discarded again — not raced (#454 B, review finding 1)', async () => {
+    // The defect this closes: `windowLanded.add(k)` on a successful write was never undone, so
+    // `windowLanded` meant "did this key EVER land in the window" rather than "did its MOST
+    // RECENT attempt land". A key that landed, was re-set, and whose re-write was then genuinely
+    // REJECTED by the backend was still in `landed` at install time and got routed to
+    // `reportRaced` — whose message says "this is NOT a backend failure". It IS one here.
+    let setMode: 'reject' | 'succeed' = 'reject';
+    let getAllCount = 0;
+    let getAllStarted: () => void = () => {};
+    const getAllStartedPromise = new Promise<void>((resolve) => { getAllStarted = resolve; });
+    let releaseGetAll: () => void = () => {};
+    const getAllGate = new Promise<void>((resolve) => { releaseGetAll = resolve; });
+    const store = new Map<string, string>();
+    const backend: PrefsBackend = {
+      getAll: async (prefix) => {
+        getAllCount++;
+        // Only the SECOND call (the swap under test) parks on the gate — the FIRST call is
+        // this test's own initial hydration and must complete immediately.
+        if (getAllCount === 2) {
+          getAllStarted();
+          await getAllGate;
+        }
+        const out: Record<string, string> = {};
+        for (const [k, v] of store) if (k.startsWith(prefix)) out[k] = v;
+        return out;
+      },
+      set: async (k, v) => {
+        if (k.endsWith(':k') && setMode === 'reject') throw new Error('rejected (simulated)');
+        store.set(k, v);
+      },
+      remove: async (k) => { store.delete(k); },
+    };
+
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+    PlayerPrefs.set('k', 1);
+    // Genuinely rejected and left pending — this is the state BEFORE the window opens.
+    await PlayerPrefs.flush();
+    expect(PlayerPrefs.pendingKeys()).toContain('k');
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Re-init opens the window right before taking the pre-window pending snapshot, so 'k' is
+    // genuinely part of `preWindowPending`.
+    const initPromise = PlayerPrefs.init({ namespace: 'g1', backend });
+    await getAllStartedPromise; // doInitBody is parked awaiting getAll() — the window is open
+
+    // DURING the window: let 'k' land durably, re-set it, then flip the backend back to
+    // rejecting and drive one more flush so the re-write is genuinely refused before the
+    // window closes.
+    setMode = 'succeed';
+    await PlayerPrefs.flush(); // lands 'k' — drain() records it into `windowLanded`
+    PlayerPrefs.set('k', 2); // re-set during the SAME window
+    setMode = 'reject';
+    await PlayerPrefs.flush(); // the re-write is rejected — `windowLanded.delete('k')` must fire
+
+    releaseGetAll(); // let the swap install run
+    const result = await initPromise;
+
+    expect(result.discardedPending).toEqual(['k']);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const message = errorSpy.mock.calls[0]?.[0] as string;
+    expect(message).toContain('k');
+    // Discarded, not raced — the backend genuinely refused the re-write.
+    expect(message).toContain('did not accept');
+    expect(message).not.toMatch(/written by the outgoing/);
+
+    errorSpy.mockRestore();
+  });
+
+  // Kept as the "plain case is unaffected" guard for #454 B: a pre-window key that NEVER
+  // lands (the backend keeps rejecting it right through the window) must still be reported as
+  // discarded, with the "did not accept" wording — this is the pre-existing #421 test above,
+  // re-asserted here as the sibling of the RACED test just above it.
+  it('a pre-window key that never lands is still reported as discarded, not raced (#454 B sibling)', async () => {
+    const store = new Map<string, string>();
+    const rejecting: PrefsBackend = {
+      getAll: async (prefix) => {
+        const out: Record<string, string> = {};
+        for (const [k, v] of store) if (k.startsWith(prefix)) out[k] = v;
+        return out;
+      },
+      set: async () => { throw new Error('QuotaExceeded (simulated)'); },
+      remove: async (k) => { store.delete(k); },
+    };
+    await PlayerPrefs.init({ namespace: 'g1', backend: rejecting });
+    PlayerPrefs.set('a', 1);
+    await PlayerPrefs.flush();
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = await PlayerPrefs.init({ namespace: 'g2' });
+
+    expect(result.discardedPending).toEqual(['a']);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const message = errorSpy.mock.calls[0]?.[0] as string;
+    expect(message).toContain('did not accept');
+    expect(message).not.toMatch(/written by the outgoing/);
+    errorSpy.mockRestore();
+  });
+});
+
 describe('PlayerPrefs — namespace edge cases', () => {
   it('an empty-string namespace resets to the default (not the prior namespace)', async () => {
     const backend = new InMemoryBackend();

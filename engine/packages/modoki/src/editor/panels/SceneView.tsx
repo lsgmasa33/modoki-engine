@@ -407,7 +407,7 @@ function SceneBreadcrumb({ onExitPrefab }: { onExitPrefab: () => void }) {
 export default function SceneView() {
   const hmrEpoch = useHmrEpoch();
   // Mode lives in the editor store (init from localStorage there) so it's agent-drivable
-  // (`set-scene-view-mode` / `modoki_scene_view_mode`). The setter persists to localStorage +
+  // (`set-scene-view-mode` / `modoki_set_scene_view_mode`). The setter persists to localStorage +
   // marks 2D dirty.
   //
   // The <select> below carries `data-ui-id="sceneView.toolbar.mode"` so it can at least be

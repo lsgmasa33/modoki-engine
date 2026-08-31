@@ -31,9 +31,44 @@ console.log('list_traits → schemaAvailable:', tj.schemaAvailable, ' traitCount
 if (tj.traits) throw new Error('bare list_traits leaked full trait schemas');
 
 // ...and the drill-down returns exactly one schema.
+//
+// GUARDED, and the guard is load-bearing (#459). This file is ONE linear script with no top-level
+// catch, so an unguarded read here does not fail this case — it kills every case below it, and the
+// runner sees a stack trace instead of a verdict. That is not hypothetical: while #459 stands,
+// `list_traits` serves only the open project's GAME traits, `Transform` is absent, and this line
+// threw — silently taking with it the 13 call sites that are the ONLY live coverage of
+// `modoki_set_game_view_device` and `modoki_set_animation_view_mode` (both `COVERED_BY_SMOKE` in
+// `liveCoverage.ts`, hence deliberately excluded from the T3 sweep). The sweep still printed
+// `0 DEFECT`, so the surface looked verified when two tools had been exercised by nothing.
+// Skipping instead keeps the rest of the run alive and still fails the verdict (F12) — a skipped
+// case can never pass. Do NOT "simplify" this back to a bare read.
 const one = await client.callTool({ name: 'modoki_list_traits', arguments: { name: 'Transform' } });
 const oj = JSON.parse(text(one));
-console.log('list_traits(name=Transform) → fields:', Object.keys(oj.traits.Transform.fields || {}).join(','));
+const transformFields = oj?.traits?.Transform?.fields;
+// The bare call above is the independent witness: it already listed every trait name the pushed
+// schema carries. Only attribute a missing drill-down schema to #459 when Transform is genuinely
+// absent from THAT list — otherwise this is a different failure (a 400/isError envelope, or a
+// filter that returned {traits:{}} despite the bare call including Transform) and blaming #459
+// would point F12's remediation ("relaunch on games/3d-test") at the wrong fix.
+const bareTraitNames = Object.values(tj.byCategory || {}).flat();
+const transformInBareCall = bareTraitNames.includes('Transform');
+if (!transformFields) {
+  const reason = !transformInBareCall
+    ? `list_traits(name=Transform) returned no schema — bare list_traits reported traitCount=${tj.traitCount}`
+      + ` (${bareTraitNames.join(', ') || 'nothing'}). Engine traits missing from the pushed schema: see #459.`
+    : `list_traits(name=Transform) returned no schema even though the bare call listed Transform`
+      + ` among ${bareTraitNames.length} traits — drill-down failed for an UNKNOWN reason (not #459).`
+      + ` Raw response: ${text(one).slice(0, 200)}`;
+  skipped.push(`list_traits drill-down — ${reason}`);
+  console.log(`list_traits(name=Transform) SKIPPED — ${reason}`);
+} else {
+  // The case's own contract: the drill-down returns EXACTLY one schema, not "at least Transform".
+  const drillDownKeys = Object.keys(oj.traits);
+  if (drillDownKeys.length !== 1 || drillDownKeys[0] !== 'Transform') {
+    throw new Error(`list_traits(name=Transform) must return exactly {traits:{Transform}} — got keys [${drillDownKeys.join(', ')}]`);
+  }
+  console.log('list_traits(name=Transform) → fields:', Object.keys(transformFields).join(','));
+}
 
 // Every tool result must be parseable JSON — including a capped one, which is why the
 // size cap emits an `{elided:true}` envelope rather than slicing the blob (result.ts).
@@ -228,8 +263,16 @@ const PRECOND = {
     ok: Array.isArray(mountedSurfaces) && mountedSurfaces.includes('scene-view'),
     need: `the SceneView tab to be MOUNTED (open/select it in the editor) — mounted now: ${(mountedSurfaces ?? []).join(', ') || 'none'}`,
   },
+  // `set_game_view_device`'s panelMounted/panelSize assertions are only meaningful with the Game
+  // tab MOUNTED — per agentEditorOps.ts, FlexLayout only mounts the SELECTED tab, so a layout with
+  // the Game tab closed or a re-docked layout with it unselected reports `panelMounted: false` and
+  // omits `panelSize` even for Free, which is correct behaviour, not a defect.
+  gameView: {
+    ok: Array.isArray(mountedSurfaces) && (mountedSurfaces.includes('game-2d') || mountedSurfaces.includes('game-3d')),
+    need: `the Game tab to be OPEN and SELECTED (open/select it in the editor) — mounted now: ${(mountedSurfaces ?? []).join(', ') || 'none'}`,
+  },
 };
-const CASE_NEEDS = { UC3: ['cube', 'sceneView'], UC5: ['prefab', 'coneFree'], UC6: ['particle'], UC8: ['scene'] };
+const CASE_NEEDS = { UC3: ['cube', 'sceneView'], UC5: ['prefab', 'coneFree'], UC6: ['particle'], UC8: ['scene'], gameViewDevice: ['gameView'] };
 
 /** True when `uc`'s preconditions all hold. Otherwise pushes ONE skip reason — naming the open
  *  project AND scene, since either can be the cause — and logs it, so the F12 verdict at the end
@@ -243,7 +286,8 @@ function preconditionsFor(uc) {
   return false;
 }
 const canUC3 = preconditionsFor('UC3'), canUC5 = preconditionsFor('UC5'),
-      canUC6 = preconditionsFor('UC6'), canUC8 = preconditionsFor('UC8');
+      canUC6 = preconditionsFor('UC6'), canUC8 = preconditionsFor('UC8'),
+      canGameViewDevice = preconditionsFor('gameViewDevice');
 
 // ── Real use cases (plan Usability 1) ────────────────────────────────────────
 // Each of these is a workflow written the way an agent would naturally write it, and each one
@@ -888,6 +932,11 @@ await withCleanup(async () => {
   if (b.isError) throw new Error(`the 2-step create batch failed: ${text(b)}`);
   const guids = (JSON.parse(text(b)).steps ?? []).map((st) => st.result?.guid);
   if (guids.length !== 2 || guids.some((g) => !g)) throw new Error(`expected two created guids, got ${JSON.stringify(guids)}`);
+  // Assigned as soon as the guids are known to be real, NOT at the end of this function — cleanup
+  // "must undo exactly as many creates as landed, even when the check failed part-way" (see :79-81).
+  // A late assignment leaves `smokeGuids` at `[]` for every assertion below that throws, and the
+  // cleanup loop then runs zero times, leaking these entities into the human's live scene.
+  smokeGuids = guids;
   const alive = async () => {
     const out = [];
     for (const g of guids) {
@@ -910,7 +959,6 @@ await withCleanup(async () => {
   if (j(await alive()) !== 'true,false') throw new Error('redo is not per step either');
   await client.callTool({ name: 'modoki_history', arguments: { action: 'redo' } });
   if (j(await alive()) !== 'true,true') throw new Error('the second redo did not restore the second entity');
-  smokeGuids = guids;
   console.log('UC9 undo/redo inside a batch is PER STEP (2 creates, one undo removes one) ✓');
 }, async () => {
   // Undo both creates back off the stack — the scene ends as it started.
@@ -961,14 +1009,14 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
   });
 }
 
-// ── modoki_game_view_device (#367) ───────────────────────────────────────────
+// ── modoki_set_game_view_device (#367) ───────────────────────────────────────────
 // Smoke-covered rather than declared un-sweepable: the Game panel's preview size is editor-session
 // state, fully restorable, and nothing in the human's project changes. What only a live call can
 // prove is that `set-game-view-device` is on the /api/editor-action allowlist AND registered in the
 // renderer — a tool can be perfect on both static tiers and 400 on every call (modoki_prefab did,
 // for months). The read-back is asserted from modoki_get_editor_state, i.e. from a DIFFERENT route
 // than the write, so a setter that answered cheerfully without reaching the store would fail here.
-{
+if (canGameViewDevice) {
   const catalog = JSON.parse(text(await client.callTool({ name: 'modoki_game_view_devices', arguments: {} })));
   if (!Array.isArray(catalog.presets) || catalog.presets.length === 0) throw new Error('game_view_devices returned no presets');
   if (!catalog.current || typeof catalog.current.device !== 'string') throw new Error('game_view_devices must report the CURRENT selection, not just the catalog');
@@ -979,7 +1027,7 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     if (!target) throw new Error('the catalog carries no non-Free preset to test with');
 
     const set = JSON.parse(text(await client.callTool({
-      name: 'modoki_game_view_device', arguments: { device: target.name, orientation: 'landscape' },
+      name: 'modoki_set_game_view_device', arguments: { device: target.name, orientation: 'landscape' },
     })));
     if (set.device !== target.name) throw new Error(`set did not resolve the named device: ${JSON.stringify(set)}`);
     // Landscape is a FLIP, not a catalog row — so the logical size must come back swapped. This is
@@ -1000,7 +1048,7 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     // by whatever orientation the panel happened to be left in. Measured against a live editor
     // before this defaulted — it came back 480x640.
     const custom = JSON.parse(text(await client.callTool({
-      name: 'modoki_game_view_device', arguments: { logicalWidth: 640, logicalHeight: 480, dpr: 2 },
+      name: 'modoki_set_game_view_device', arguments: { logicalWidth: 640, logicalHeight: 480, dpr: 2 },
     })));
     if (custom.orientation !== 'portrait') throw new Error(`an explicit size must default to portrait so its numbers are literal, got ${custom.orientation}`);
     if (custom.logical.w !== 640 || custom.logical.h !== 480) throw new Error(`custom size did not take: ${JSON.stringify(custom.logical)}`);
@@ -1010,17 +1058,17 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     if (custom.safeAreaBasis !== 'custom-none') throw new Error(`a custom size must report safeAreaBasis:'custom-none', got ${custom.safeAreaBasis}`);
 
     // An unknown name is refused WITH the real list, never fuzzy-matched onto a nearby screen.
-    const unknown = await client.callTool({ name: 'modoki_game_view_device', arguments: { device: 'iPhone 16 Pruo' } });
+    const unknown = await client.callTool({ name: 'modoki_set_game_view_device', arguments: { device: 'iPhone 16 Pruo' } });
     if (!unknown.isError) throw new Error('an unknown device name must be refused, not fuzzy-matched');
     if (!/iPhone 16 Pro/.test(text(unknown))) throw new Error('the refusal must list the real preset names');
 
     // Two addresses at once is ambiguous — refused rather than resolved by precedence.
-    const both = await client.callTool({ name: 'modoki_game_view_device', arguments: { device: 'Free', logicalWidth: 100, logicalHeight: 100 } });
+    const both = await client.callTool({ name: 'modoki_set_game_view_device', arguments: { device: 'Free', logicalWidth: 100, logicalHeight: 100 } });
     if (!both.isError) throw new Error('device + an explicit size together must be refused as ambiguous');
 
     // A dpr that cannot round-trip is refused rather than silently rounded: the read-back derives
     // dpr from the ROUNDED physical size, so accepting this would answer a dpr nobody asked for.
-    const badDpr = await client.callTool({ name: 'modoki_game_view_device', arguments: { logicalWidth: 3, logicalHeight: 3, dpr: 0.5 } });
+    const badDpr = await client.callTool({ name: 'modoki_set_game_view_device', arguments: { logicalWidth: 3, logicalHeight: 3, dpr: 0.5 } });
     if (!badDpr.isError) throw new Error('a dpr whose product is fractional must be refused, not rounded away');
 
     // The Game panel's mounted-ness is reported: the store accepts a device whether or not GameView
@@ -1033,7 +1081,7 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     if (custom.panelMounted !== true) throw new Error(`panelMounted must be true with the Game panel open — got ${custom.panelMounted}`);
     // Free reports the real measured panel area; a fixed device does not (its `logical` IS the size).
     if (custom.panelSize !== undefined) throw new Error('panelSize must be omitted for a fixed device — logical is the answer there');
-    const freeBack = JSON.parse(text(await client.callTool({ name: 'modoki_game_view_device', arguments: { device: 'Free' } })));
+    const freeBack = JSON.parse(text(await client.callTool({ name: 'modoki_set_game_view_device', arguments: { device: 'Free' } })));
     if (!freeBack.panelSize || !(freeBack.panelSize.w > 0) || !(freeBack.panelSize.h > 0)) {
       throw new Error(`Free must report a MEASURED panelSize, not the device it just left: ${JSON.stringify(freeBack.panelSize)}`);
     }
@@ -1042,16 +1090,16 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
       throw new Error('panelSize returned the PREVIOUS device size — it is reading gameViewSize, not the measured area');
     }
 
-    console.log(`game_view_device sets by name, by explicit size, and refuses an unknown one ✓ (${catalog.presets.length} presets)`);
+    console.log(`set_game_view_device sets by name, by explicit size, and refuses an unknown one ✓ (${catalog.presets.length} presets)`);
   }, async () => {
     await client.callTool({
-      name: 'modoki_game_view_device',
+      name: 'modoki_set_game_view_device',
       arguments: { device: before.device === 'Custom' ? 'Free' : before.device, orientation: before.orientation },
     });
   });
 }
 
-// ── modoki_animation_view_mode (#369) ────────────────────────────────────────
+// ── modoki_set_animation_view_mode (#369) ────────────────────────────────────────
 // Smoke-covered, not declared un-sweepable: the Animation panel's view is editor-session state and
 // the case restores whatever it found. What only a live call proves is that
 // `set-animation-view-mode` is BOTH on the /api/editor-action allowlist and registered in the
@@ -1068,7 +1116,7 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     // the store's setter early-returns on an unchanged value, so asserting the current value back
     // would be true whether or not the op reached it.
     const target = before === 'curves' ? 'dopesheet' : 'curves';
-    await client.callTool({ name: 'modoki_animation_view_mode', arguments: { mode: target } });
+    await client.callTool({ name: 'modoki_set_animation_view_mode', arguments: { mode: target } });
     // Read back through the OTHER route: the op returns its own state read, so asserting on its
     // reply alone cannot separate "reached the store" from "echoed the argument".
     const st1 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
@@ -1076,7 +1124,7 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
       throw new Error(`the view did not change: asked ${target}, editor-state says ${st1.animationViewMode}`);
     }
     // And back, so both arms are exercised rather than only the one that happened to differ.
-    await client.callTool({ name: 'modoki_animation_view_mode', arguments: { mode: before } });
+    await client.callTool({ name: 'modoki_set_animation_view_mode', arguments: { mode: before } });
     const st2 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
     if (st2.animationViewMode !== before) throw new Error(`the view did not switch back to ${before}`);
 
@@ -1086,15 +1134,15 @@ console.log('batch pre-flight refuses an unknown arg key and lists the real ones
     // route, which no tool call can reach — it is covered by the T1/T2 tiers, not here. Both exist
     // because the failure is silent either way: a typo'd mode that reports success leaves the caller
     // reading an empty `modoki_handles editor=curves` as "this clip has no tangents".
-    const bad = await client.callTool({ name: 'modoki_animation_view_mode', arguments: { mode: 'curve' } });
+    const bad = await client.callTool({ name: 'modoki_set_animation_view_mode', arguments: { mode: 'curve' } });
     if (!bad.isError) throw new Error("an unknown view mode must be refused, not ignored");
     // ...and the refusal must not have moved the view on its way out.
     const st3 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
     if (st3.animationViewMode !== before) throw new Error('a refused mode changed the view anyway');
 
-    console.log(`animation_view_mode switches dopesheet<->curves and refuses an unknown mode \u2713 (was ${before})`);
+    console.log(`set_animation_view_mode switches dopesheet<->curves and refuses an unknown mode \u2713 (was ${before})`);
   }, async () => {
-    await client.callTool({ name: 'modoki_animation_view_mode', arguments: { mode: before } });
+    await client.callTool({ name: 'modoki_set_animation_view_mode', arguments: { mode: before } });
   });
 }
 

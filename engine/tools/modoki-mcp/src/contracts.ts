@@ -423,14 +423,14 @@ const DECLS: Record<string, Decl> = {
       + 'reloads the return scene. None of the three is undoable — they are scene swaps and a '
       + 'file write, matching load-scene and create respectively.',
   },
-  modoki_gizmo: {
+  modoki_set_gizmo: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-gizmo', mutating: true, persists: 'session',
   },
-  modoki_scene_view_mode: {
+  modoki_set_scene_view_mode: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-scene-view-mode', mutating: true, persists: 'session',
     minimalArgs: { mode: '3d' },
   },
-  modoki_animation_view_mode: {
+  modoki_set_animation_view_mode: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-animation-view-mode',
     mutating: true, persists: 'session',
     minimalArgs: { mode: 'dopesheet' },
@@ -443,7 +443,7 @@ const DECLS: Record<string, Decl> = {
     notes: 'The catalog is relayed from the renderer (editor/scene/devicePresets.ts), never copied '
       + 'here — a second table goes stale the first time a device is added.',
   },
-  modoki_game_view_device: {
+  modoki_set_game_view_device: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-game-view-device',
     mutating: true, persists: 'session',
     minimalArgs: { device: 'Free' },
@@ -451,7 +451,7 @@ const DECLS: Record<string, Decl> = {
       + 'Split from modoki_game_view_devices on §4: the read half is a GET, and a mutating op '
       + 'reached by GET has its refusal read as a success.',
   },
-  modoki_collider_edit: {
+  modoki_set_collider_edit: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-collider-edit', mutating: true, persists: 'session',
     minimalArgs: { on: true },
   },
@@ -585,7 +585,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'mutate', method: 'POST', route: '/api/player-prefs',
     mutating: true, persists: 'file', requires: ['editor'],
     minimalArgs: { action: 'flush' },
-    notes: "persists:'file' means the PLATFORM prefs store (localStorage / @capacitor/preferences), not a project file — it is the only Persists value that says 'survives the session', which is the fact that matters. set/delete flush before replying, so saved:true means the backend ACCEPTED the write; a rejected one is reported PARTIAL rather than ok, because the value stays in the cache and a read-back cannot see the failure. action is REQUIRED (§1) and action:'clear' additionally requires confirm:true (§8). ALL FOUR actions, flush included, are refused NOT_AVAILABLE_HERE while a game/namespace swap is in flight (#438) — a write or flush that settles after the install cannot truthfully report where it landed. On its OWN route rather than the /api/editor-action relay: that relay's routing key is `action`, and it strips it before relaying, so a tool with an `action` param has it silently DROPPED — measured here, and now refused outright by editorAction().",
+    notes: "persists:'file' means the PLATFORM prefs store (localStorage / @capacitor/preferences), not a project file — it is the only Persists value that says 'survives the session', which is the fact that matters. set/delete flush before replying, so saved:true means the backend ACCEPTED the write; a rejected one is reported PARTIAL rather than ok, because the value stays in the cache and a read-back cannot see the failure. action is REQUIRED (§1) and action:'clear' additionally requires confirm:true (§8). ALL FOUR actions, flush included, are refused NOT_AVAILABLE_HERE while a game/namespace swap is in flight (#438) — a write or flush that settles after the install cannot truthfully report where it landed. A swap that STARTS during the op's own flush is a different case (#454) and is NOT a refusal — the mutation already happened, so it reports PARTIAL with durability:'unknown' rather than NOT_AVAILABLE_HERE, which at entry means nothing was done. On its OWN route rather than the /api/editor-action relay: that relay's routing key is `action`, and it strips it before relaying, so a tool with an `action` param has it silently DROPPED — measured here, and now refused outright by editorAction().",
   },
   modoki_set_timescale: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-timescale',

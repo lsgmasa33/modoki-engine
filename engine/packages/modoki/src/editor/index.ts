@@ -18,7 +18,7 @@ export {
 } from '../runtime/scene/entityCreateSpecs';
 export { buildUiCreateSpecs, type UiPreset } from '../runtime/ui/uiAuthoring';
 export { enterPlay, stopPlay, pausePlay, resetPlayMode } from './scene/playMode';
-// GameView device simulation. Exported for the agent ops behind `modoki_game_view_device` /
+// GameView device simulation. Exported for the agent ops behind `modoki_set_game_view_device` /
 // `modoki_game_view_devices` (#367) — the catalog is the single source of truth for what screens
 // exist, so an op that hardcoded a table would go stale on the next device added.
 export {

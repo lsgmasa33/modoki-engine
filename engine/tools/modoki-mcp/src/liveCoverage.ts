@@ -43,7 +43,7 @@ export const COVERED_BY_SMOKE: readonly string[] = [
   'modoki_load_scene', 'modoki_set_selection', 'modoki_play_control', 'modoki_history',
   'modoki_tap', 'modoki_focus', 'modoki_dispatch_action', 'modoki_set_timescale', 'modoki_journal',
   'modoki_hit_regions', 'modoki_profiler',
-  'modoki_game_view_device', 'modoki_animation_view_mode',
+  'modoki_set_game_view_device', 'modoki_set_animation_view_mode',
 ];
 
 /** MUTATING tools no live tier reaches, each with the reason it cannot be swept.
@@ -70,9 +70,9 @@ export const LIVE_UNCOVERED: Readonly<Record<string, string>> = {
   modoki_anim_add_key: 'edits a live animation clip',
   modoki_timeline_set: 'replaces a live timeline',
   modoki_timeline_add_clip: 'edits a live timeline',
-  modoki_collider_edit: 'enters a viewport sub-mode the human is not in',
-  modoki_gizmo: "changes the human's gizmo mode mid-session",
-  modoki_scene_view_mode: "switches the human's viewport mode",
+  modoki_set_collider_edit: 'enters a viewport sub-mode the human is not in',
+  modoki_set_gizmo: "changes the human's gizmo mode mid-session",
+  modoki_set_scene_view_mode: "switches the human's viewport mode",
   modoki_open_particle_editor: "opens a panel over the human's layout",
   modoki_open_sprite_editor: "opens a panel over the human's layout",
   modoki_open_nine_slice_editor: "opens a panel over the human's layout",

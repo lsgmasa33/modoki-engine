@@ -78,14 +78,37 @@ const dirty = new Set<string>();
  *  during the window rather than accept one the install is about to discard (#438). */
 let swapInFlight = false;
 /** Epoch counter for the CURRENT `swapInFlight` window — incremented each time `doInit` sets
- *  `swapInFlight = true`. Exists only so `resetPlayerPrefsForTest` can't be fooled by a STALE
- *  `doInit` call left parked mid-`getAll` by a prior test: that call's `finally` block only
- *  clears `swapInFlight` if its captured token still matches this counter, so a newer swap
+ *  `swapInFlight = true`. Originally existed only so `resetPlayerPrefsForTest` can't be fooled by
+ *  a STALE `doInit` call left parked mid-`getAll` by a prior test: that call's `finally` block
+ *  only clears `swapInFlight` if its captured token still matches this counter, so a newer swap
  *  (started by the new test, after the reset) is never incorrectly cleared by the old one
- *  settling later. Production is unaffected — `initChain` serializes real `doInit` calls, so
- *  there is never more than one epoch in flight there. Test-isolation-only, not a production
- *  race (see `doInit`'s comment). */
+ *  settling later. Production was unaffected by THAT role — `initChain` serializes real `doInit`
+ *  calls, so there is never more than one epoch in flight there. Test-isolation-only, not a
+ *  production race (see `doInit`'s comment).
+ *
+ *  ⚠️ It now has a SECOND, production role too (#454 C, via `PlayerPrefs.swapGeneration()`): a
+ *  caller that awaits something of its own (e.g. `agentBridge.ts`'s `player-prefs-write` op
+ *  awaiting `flush()`) can capture this counter before the await and compare after, to learn
+ *  whether a swap window opened in between — including one that opened AND closed entirely
+ *  inside the await, which a re-sampled `isSwapInFlight()` structurally cannot see (that flag is
+ *  already back to `false` by the time the caller resumes). See `swapGeneration()`'s own doc
+ *  comment for the contract. */
 let swapEpoch = 0;
+/** Non-null only while a swap window is open (`doInitBody` sets it just before taking the
+ *  pre-window pending snapshot; both exit paths null it again) — so the ordinary non-swapping
+ *  path pays nothing for it. Exists to answer a question set membership alone cannot (#454 B): a
+ *  pre-window key that (1) was pending before the window, (2) landed durably during it, and (3)
+ *  was then re-set during it ends up back in the post-window pending set indistinguishable, by
+ *  membership alone, from a key that never landed at all — yet `PlayerPrefsInitResult`'s doc
+ *  comment says those two must never be conflated in the console reporting (one is a plain
+ *  discard, the other RACED a re-write against a write that already succeeded). `drain()` adds a
+ *  key here the instant its write is accepted by the backend and removes it again if a LATER
+ *  attempt for that same key (inside the same window) is then rejected — so membership answers
+ *  "did this key's MOST RECENT attempt inside the window land?", not "did it ever land". That
+ *  lets `doInitBody` tell "landed then re-set" apart from "never landed" when it closes the
+ *  window, and also correctly re-discards a key that landed, was re-set, and whose re-write was
+ *  then genuinely refused by the backend before the window closed (#454 B, review finding 1). */
+let windowLanded: Set<string> | null = null;
 
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 /** Serializes all backend writes so `flush()` can await a stable point. */
@@ -165,7 +188,24 @@ function scheduleFlush(): void {
  *  full key is built from `batchNamespace`, the backend call goes to `batchBackend`, and a
  *  rejection is only re-queued into `dirty` if `namespace` is STILL `batchNamespace` by the time
  *  it settles; otherwise the write is lost (the outgoing store no longer exists in this process)
- *  and that's logged instead of silently discarded or misdirected. */
+ *  and that's logged instead of silently discarded or misdirected.
+ *
+ *  ⚠️ **That re-queue guard is NAMESPACE-ONLY, deliberately (#454 A) — and it does NOT mean the
+ *  write survives.** `init()` can swap the BACKEND while keeping the same namespace (`App.tsx`'s
+ *  `init({namespace: gameId, backend: selectDefaultBackend()})`, a same-game reload), and this
+ *  guard does not detect that: the namespace matches, so the key re-queues. But by then the
+ *  install has already done `cache.clear()` and repopulated from the INCOMING backend's `getAll`,
+ *  so the re-queued key no longer carries the outgoing write's value — the next drain resolves
+ *  `cache.get(k)` against the incoming cache and either re-sets the value that store already
+ *  holds or, more usually, issues a `remove` for a key it does not hold. Both are no-ops against
+ *  that same game's own store. Do not read this branch as "the pending write follows the game
+ *  into its new backend": the VALUE is gone either way, and only the retry attempt follows.
+ *
+ *  It stays namespace-only because the namespace is what answers the question the guard is
+ *  actually asking — *is there still a store in this process to retry against?* — and because
+ *  the else-branch's `console.error` would otherwise fire on a backend-only swap and report the
+ *  store as having "already swapped to" the very namespace it started in: a message that
+ *  misdescribes what happened, to buy a behaviour change that is a no-op either way. */
 function drain(): Promise<void> {
   writeChain = writeChain.then(async () => {
     if (dirty.size === 0) return;
@@ -180,7 +220,19 @@ function drain(): Promise<void> {
         try {
           if (env !== undefined) await batchBackend.set(full, env);
           else await batchBackend.remove(full);
+          // Record the landing for whoever has a swap window open (#454 B) — but only if this
+          // batch's namespace is the one the window is watching. A batch belonging to a namespace
+          // the store has already swapped away from is not a landing in THIS window; without the
+          // guard a late-settling batch from an OLDER namespace could mark a key "landed" against
+          // a window that opened for an entirely different game.
+          if (windowLanded && batchNamespace === namespace) windowLanded.add(k);
         } catch (err) {
+          // Symmetric with the `add` above (#454 B): `windowLanded` answers "did this key's MOST RECENT
+          // attempt inside the window land?", not "did it ever land". A key that landed earlier in the
+          // window and was then re-set and REJECTED is a backend failure, and must go back to being
+          // reported as discarded — leaving the stale landing here routed it to `reportRaced`, whose
+          // message says "this is NOT a backend failure" about a write the backend had just refused.
+          if (windowLanded && batchNamespace === namespace) windowLanded.delete(k);
           if (namespace === batchNamespace) {
             dirty.add(k); // re-queue for a later flush; never poison the chain
             console.warn(`[PlayerPrefs] write for "${k}" failed — will retry on next flush`, err);
@@ -305,11 +357,15 @@ export interface PlayerPrefsInitResult {
  *  the await) and reported through a dedicated "raced the swap" message — never blamed on the
  *  backend, since it was never offered to a flush. If the debounce fires WHILE the await is
  *  still pending, `drain()` sends it straight to the outgoing backend and it is persisted
- *  durably to the outgoing namespace, reported nowhere (an ordinary successful write that
- *  happens to have raced the swap, not a loss). Either outcome is acceptable; what's fixed is
- *  that neither one can contaminate the INCOMING namespace. It is not queued or replayed into
- *  the incoming store; doing that would need another `await` and therefore another window. The
- *  init-vs-init interleave (#428) is unaffected by this change. */
+ *  durably to the outgoing namespace, reported nowhere — UNLESS (#454 B) the outgoing game
+ *  writes to that same key AGAIN before the window closes: then the pre-window key is back in
+ *  `dirty`, and that re-write is exactly the "raced the swap" case above, reported through the
+ *  same message via `windowLanded` (see its doc comment) rather than silently as before. So
+ *  there are three outcomes, not two: never lands (discarded), lands and stays landed (reported
+ *  nowhere), lands and then gets re-set (raced). Every outcome above is acceptable; what's fixed
+ *  is that none of them can contaminate the INCOMING namespace. Nothing is queued or replayed
+ *  into the incoming store; doing that would need another `await` and therefore another window.
+ *  The init-vs-init interleave (#428) is unaffected by this change. */
 async function doInit(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInitResult> {
   swapInFlight = true;
   const myEpoch = ++swapEpoch;
@@ -321,7 +377,9 @@ async function doInit(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInitResu
     // already started a fresh swap (see `swapEpoch`'s doc comment). In production there is
     // only ever one epoch in flight (`initChain` serializes real callers), so this is always
     // a no-op there.
-    if (myEpoch === swapEpoch) swapInFlight = false;
+    if (myEpoch === swapEpoch) {
+      swapInFlight = false;
+    }
   }
 }
 
@@ -393,10 +451,17 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
     }
   }
 
-  // A key reported here was NEVER offered to the pre-swap flush loop above — it was written by
-  // the OUTGOING game after that loop finished, while this call was still awaiting
-  // `nextBackend.getAll()`. It is not a backend rejection (there was nothing for a backend to
-  // reject) — a distinct message so a debugger doesn't go hunting a phantom storage failure.
+  // A key reported here fits one of TWO shapes, both raced the swap window rather than being
+  // rejected by a backend:
+  //   - the original shape: the key was NEVER offered to the pre-swap flush loop above — it was
+  //     written by the OUTGOING game after that loop finished, while this call was still awaiting
+  //     `nextBackend.getAll()`.
+  //   - added for #454 B: a key pending BEFORE the window whose write LANDED durably during the
+  //     window and was then RE-WRITTEN by the outgoing game before the window closed — the
+  //     landing means it was never a backend rejection either, it's the re-write that raced the
+  //     install.
+  // Neither is a backend rejection (there was nothing for a backend to reject) — a distinct
+  // message so a debugger doesn't go hunting a phantom storage failure.
   function reportRaced(raced: string[], outgoingNamespace: string): void {
     if (raced.length === 0) return;
     console.error(
@@ -408,24 +473,77 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
     );
   }
 
-  // The pre-window pending set — keys the pre-swap flush loop above genuinely failed to land
-  // (rejected by the backend, or never attempted before it hit its cap). Captured AFTER
-  // `flushTimer` is cleared and BEFORE the `await` below, so nothing can drain it out from
-  // under us during the window (see the ⚠️ above `doInit`).
-  const preWindowPending = pendingKeys().sort();
-  const preWindowPendingSet = new Set(preWindowPending);
-
-  let raw: Record<string, string>;
+  // Open the landing-tracking window (#454 B) here, immediately before the pre-window snapshot
+  // it's paired with, so the two are read as one unit. Ordering between these two synchronous
+  // statements does not matter — there is no `await` between them, and a landing can only be
+  // recorded from a `drain()` continuation, which cannot run between two synchronous statements.
+  // See `windowLanded`'s doc comment for what it's for.
+  //
+  // `myWindow` is held in a LOCAL, and the module global is only ever touched through an
+  // `windowLanded === myWindow` identity check, rather than gated on the epoch the way
+  // `swapInFlight` is in `doInit`'s `finally` (#454, review finding 3). A stale `doInit` left
+  // parked mid-`getAll` by a prior test (see `resetPlayerPrefsForTest`'s own ⚠️) can resume
+  // AFTER a newer swap has already opened its own window: an epoch check alone can't tell the
+  // two `doInit` calls' windows apart (the epoch only guards `swapInFlight`), so without the
+  // identity check the stale call would consume the LIVE window's `landed` set for its own
+  // report and null it out — silently disabling the current swap's #454 B reclassification.
+  const myWindow = new Set<string>();
+  windowLanded = myWindow;
   try {
-    // Everything up to here reads/writes only the OUTGOING `backend`/`namespace` — this is
-    // the write-during-swap window (#438). `cache`/`dirty`/`hydrated` are untouched, so any
-    // synchronous `set()`/`del()`/`clear()` racing this await lands in the outgoing store.
-    raw = await nextBackend.getAll(prefix);
-  } catch (err) {
-    // Fail loud (owner ruling, #438): install the INCOMING namespace anyway, but leave it
-    // explicitly unhydrated and empty — matches the pre-#438 failure shape, so
-    // `agentBridge.ts`'s `prefsUnhydrated()` keeps refusing reads/writes for the new
-    // namespace rather than silently answering out of the old game's store.
+    // The pre-window pending set — keys the pre-swap flush loop above genuinely failed to land
+    // (rejected by the backend, or never attempted before it hit its cap). Captured AFTER
+    // `flushTimer` is cleared and BEFORE the `await` below, so nothing can drain it out from
+    // under us during the window (see the ⚠️ above `doInit`).
+    const preWindowPending = pendingKeys().sort();
+    const preWindowPendingSet = new Set(preWindowPending);
+
+    let raw: Record<string, string>;
+    try {
+      // Everything up to here reads/writes only the OUTGOING `backend`/`namespace` — this is
+      // the write-during-swap window (#438). `cache`/`dirty`/`hydrated` are untouched, so any
+      // synchronous `set()`/`del()`/`clear()` racing this await lands in the outgoing store.
+      raw = await nextBackend.getAll(prefix);
+    } catch (err) {
+      // Fail loud (owner ruling, #438): install the INCOMING namespace anyway, but leave it
+      // explicitly unhydrated and empty — matches the pre-#438 failure shape, so
+      // `agentBridge.ts`'s `prefsUnhydrated()` keeps refusing reads/writes for the new
+      // namespace rather than silently answering out of the old game's store.
+      const outgoingNamespace = namespace;
+      const fullPending = pendingKeys().sort();
+      const fullPendingSet = new Set(fullPending);
+      const racedPending = fullPending.filter((k) => !preWindowPendingSet.has(k));
+      backend = nextBackend;
+      namespace = nextNamespace;
+      cache.clear();
+      dirty.clear();
+      hydrated = false;
+      // Close the landing-tracking window and reclassify (#454 B) — same shape as the
+      // successful-install path below; see the comment there for the reasoning.
+      const landed = windowLanded === myWindow ? myWindow : new Set<string>();
+      if (windowLanded === myWindow) windowLanded = null;
+      const preWindowStillPending = preWindowPending.filter((k) => fullPendingSet.has(k));
+      const landedThenReSet = preWindowStillPending.filter((k) => landed.has(k));
+      reportDiscarded(preWindowStillPending.filter((k) => !landed.has(k)));
+      reportRaced([...racedPending, ...landedThenReSet].sort(), outgoingNamespace);
+      throw err;
+    }
+
+    // Synchronous install — no `await` between here and `hydrated = true`, so there is no
+    // window for a caller to observe a partially-swapped state. Capture whatever is STILL
+    // pending against the outgoing store (the full pending set, including anything that raced
+    // the await above) before `dirty.clear()` would otherwise discard it with nothing inspecting
+    // it. The difference between this full set and `preWindowPending` is exactly the raced writes.
+    //
+    // ⚠️ Deliberately `dirty`-only, NOT anything wider. A `drain()` batch that is mid-flight at
+    // this exact instant (taken out of `dirty` for its own `Promise.all`, not yet settled — see
+    // `drain()`'s doc comment) is invisible here, matching `pendingKeys()`'s own documented
+    // "authoritative only after an awaited `flush()`" caveat. That write's eventual settlement is
+    // NOT silently lost: `drain()` captures its own `batchNamespace`/`batchBackend` locals, so a
+    // late SUCCESS lands durably in the outgoing store (nothing to report), and a late REJECTION
+    // after this install has already swapped `namespace` away fires drain()'s own "already
+    // swapped" `console.error` — see `drain()`'s catch branch. Folding that in-flight state into
+    // THIS snapshot was tried (#438 round 4) and reported a write that goes on to succeed as
+    // discarded — a false loss report; reverted.
     const outgoingNamespace = namespace;
     const fullPending = pendingKeys().sort();
     const fullPendingSet = new Set(fullPending);
@@ -434,60 +552,42 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
     namespace = nextNamespace;
     cache.clear();
     dirty.clear();
-    hydrated = false;
-    // Same filter as the successful-install path below: a pre-window key that genuinely LANDED
-    // during the window (e.g. a debounce or an explicit flush() drained it against the outgoing
-    // backend before this call threw) is durably stored, not lost, and must not be reported as
-    // discarded just because it appears in the pre-window snapshot.
-    reportDiscarded(preWindowPending.filter((k) => fullPendingSet.has(k)));
-    reportRaced(racedPending, outgoingNamespace);
-    throw err;
+    // Populate from a freshly-cleared cache (not layered on top of whatever was already
+    // there) — clearing immediately before repopulating from `raw` means a key that survived
+    // in the old cache but is absent from the incoming namespace's `getAll` result cannot
+    // leak through.
+    for (const [full, str] of Object.entries(raw)) {
+      if (readEnvelope(str) === undefined) continue; // skip corrupt entries
+      cache.set(full.slice(prefix.length), str);
+    }
+    hydrated = true;
+    // Close the landing-tracking window and reclassify (#454 B). Set membership alone (whether a
+    // pre-window key is still in `fullPendingSet`) cannot distinguish a key that never landed from
+    // one that landed durably during the window and was then RE-SET during it — both end up back in
+    // the pending set, and the first pass here used to pass both to `reportDiscarded`. That's wrong
+    // for the second case: the outgoing game's write did NOT fail, it was superseded by a later
+    // write from the same outgoing game that then genuinely raced the swap install — the truth is
+    // "raced", not "discarded". `windowLanded` (populated by `drain()` for exactly this window)
+    // is what tells the two apart; membership can't. `discardedPending`/`fullPending` themselves are
+    // UNCHANGED — they stay the install-time union, already correct — only the console attribution
+    // below is reclassified.
+    const landed = windowLanded === myWindow ? myWindow : new Set<string>();
+    if (windowLanded === myWindow) windowLanded = null;
+    const preWindowStillPending = preWindowPending.filter((k) => fullPendingSet.has(k));
+    const landedThenReSet = preWindowStillPending.filter((k) => landed.has(k));
+    reportDiscarded(preWindowStillPending.filter((k) => !landed.has(k)));
+    reportRaced([...racedPending, ...landedThenReSet].sort(), outgoingNamespace);
+    // The caller-visible "these writes are lost" list spans BOTH causes — see
+    // `PlayerPrefsInitResult.discardedPending`'s doc comment.
+    const discardedPending = fullPending;
+    return { discardedPending };
+  } finally {
+    // Backstop only — both exit paths above already null this out via the identity check when
+    // they run. This catches an unexpected throw elsewhere in the try block that neither exit
+    // path handles, so it can't leak a window for the next `doInit` (real or stale-parked) to
+    // inherit.
+    if (windowLanded === myWindow) windowLanded = null;
   }
-
-  // Synchronous install — no `await` between here and `hydrated = true`, so there is no
-  // window for a caller to observe a partially-swapped state. Capture whatever is STILL
-  // pending against the outgoing store (the full pending set, including anything that raced
-  // the await above) before `dirty.clear()` would otherwise discard it with nothing inspecting
-  // it. The difference between this full set and `preWindowPending` is exactly the raced writes.
-  //
-  // ⚠️ Deliberately `dirty`-only, NOT anything wider. A `drain()` batch that is mid-flight at
-  // this exact instant (taken out of `dirty` for its own `Promise.all`, not yet settled — see
-  // `drain()`'s doc comment) is invisible here, matching `pendingKeys()`'s own documented
-  // "authoritative only after an awaited `flush()`" caveat. That write's eventual settlement is
-  // NOT silently lost: `drain()` captures its own `batchNamespace`/`batchBackend` locals, so a
-  // late SUCCESS lands durably in the outgoing store (nothing to report), and a late REJECTION
-  // after this install has already swapped `namespace` away fires drain()'s own "already
-  // swapped" `console.error` — see `drain()`'s catch branch. Folding that in-flight state into
-  // THIS snapshot was tried (#438 round 4) and reported a write that goes on to succeed as
-  // discarded — a false loss report; reverted.
-  const outgoingNamespace = namespace;
-  const fullPending = pendingKeys().sort();
-  const fullPendingSet = new Set(fullPending);
-  const racedPending = fullPending.filter((k) => !preWindowPendingSet.has(k));
-  backend = nextBackend;
-  namespace = nextNamespace;
-  cache.clear();
-  dirty.clear();
-  // Populate from a freshly-cleared cache (not layered on top of whatever was already
-  // there) — clearing immediately before repopulating from `raw` means a key that survived
-  // in the old cache but is absent from the incoming namespace's `getAll` result cannot
-  // leak through.
-  for (const [full, str] of Object.entries(raw)) {
-    if (readEnvelope(str) === undefined) continue; // skip corrupt entries
-    cache.set(full.slice(prefix.length), str);
-  }
-  hydrated = true;
-  // Report only the pre-window keys that are STILL pending at install time — a key that was
-  // pending before the window and then genuinely LANDED during it (e.g. the outgoing backend
-  // recovered and flushed it) is durably stored, not lost, and must not be reported as
-  // discarded just because it appears in the pre-window snapshot. `discardedPending` below is
-  // NOT filtered this way — it is the install-time union and already correct.
-  reportDiscarded(preWindowPending.filter((k) => fullPendingSet.has(k)));
-  reportRaced(racedPending, outgoingNamespace);
-  // The caller-visible "these writes are lost" list spans BOTH causes — see
-  // `PlayerPrefsInitResult.discardedPending`'s doc comment.
-  const discardedPending = fullPending;
-  return { discardedPending };
 }
 
 /** Public `init()` — queues onto `initChain` so overlapping calls run one at a time.
@@ -601,6 +701,24 @@ function isSwapInFlight(): boolean {
   return swapInFlight;
 }
 
+/** An opaque, monotonically-increasing token — meaningless in absolute terms, never compare it to
+ *  a literal. Its ONLY sanctioned use is capture-before-await / compare-after-await: a caller that
+ *  is about to `await` something of its own (e.g. `agentBridge.ts`'s `player-prefs-write` op
+ *  awaiting its own `flush()`) captures this beforehand, then after the await checks whether it's
+ *  still the same value. A change means a swap window opened at some point during the await —
+ *  including one that opened AND CLOSED entirely inside it, which `isSwapInFlight()` structurally
+ *  cannot see (by the time the caller resumes, that flag is already back to `false`). #454 C is
+ *  exactly this: a re-sampled `isSwapInFlight()` after the await is a SAMPLE, not a guarantee, and
+ *  a swap that both starts and finishes inside the caller's own await defeats it; this counter
+ *  catches that case because it never resets.
+ *
+ *  `resetPlayerPrefsForTest` also bumps it (see `swapEpoch`'s doc comment) — harmless here, since
+ *  a caller comparing across a test-boundary reset is exactly the "something changed" signal this
+ *  is for. */
+function swapGeneration(): number {
+  return swapEpoch;
+}
+
 /** The namespace these keys live under — the sanitized `init({namespace})`, or `'default'`
  *  before init.
  *
@@ -681,6 +799,7 @@ export const PlayerPrefs = {
   flush,
   isHydrated,
   isSwapInFlight,
+  swapGeneration,
   namespace: getNamespace,
   hasPendingWrite,
   pendingKeys,
@@ -707,6 +826,7 @@ export function resetPlayerPrefsForTest(): void {
   namespace = 'default';
   hydrated = false;
   swapInFlight = false;
+  windowLanded = null; // belt-and-braces, same reasoning as `doInit`'s `finally` above (#454 B)
   // Bump the epoch so a stale `doInit` left parked mid-`getAll` by a PRIOR test (see the ⚠️
   // above) can never clear `swapInFlight` out from under a swap the NEXT test genuinely
   // starts — its captured token from before this reset no longer matches. Test-isolation

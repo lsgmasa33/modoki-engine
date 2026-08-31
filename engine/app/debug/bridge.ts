@@ -11,6 +11,7 @@
 
 import { makeDeviceEvalApi } from './deviceEvalApi';
 import { setConsoleSource } from './consoleSource';
+import { describeElement } from './domResolve';
 import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
 import { setJournalEnabled } from '@modoki/engine/runtime';
@@ -264,7 +265,11 @@ interface DomResolution {
   matched?: string | null; hitTarget?: string | null; occluded?: boolean; error?: string;
 }
 
-type Aim = { x: number; y: number; label: string } | { error: string };
+// `hitTarget` is set ONLY by the selector branch of `resolveAim` — a raw x/y aim never claimed
+// anything was under it, so there is nothing for a later re-check to have drifted FROM. `undefined`
+// (not resolved by selector) and `null` (selector resolved, but nothing was there) are both real,
+// distinct answers; see `aimDriftSuffix` below, which is the sole reader of this field.
+type Aim = { x: number; y: number; label: string; hitTarget?: string | null } | { error: string };
 
 /** Resolve a CSS selector to a viewport point (+ occlusion) via the shared runtime op — reused so a
  *  device tap/drag can aim by selector, occlusion-checked server-side, with no screenshot round-trip. */
@@ -287,11 +292,39 @@ async function resolveAim(params: Record<string, unknown>, selKey: string, xKey:
     if (r.occluded) {
       return { error: `Error: ${JSON.stringify(selector)} (${r.matched}) is occluded by ${r.hitTarget} — not aiming there` };
     }
-    return { x: r.x, y: r.y, label: `${selector}→${r.hitTarget}` };
+    return { x: r.x, y: r.y, label: `${selector}→${r.hitTarget}`, hitTarget: r.hitTarget };
   }
   const screenInfo = params.screenInfo as { imgW: number; imgH: number; nativeW: number; nativeH: number } | undefined;
   const { x, y } = screenshotToCSS(params[xKey] as number, params[yKey] as number, screenInfo);
   return { x, y, label: `css(${Math.round(x)},${Math.round(y)})` };
+}
+
+/** #486 finding C: `resolveAim`'s selector branch crosses a dynamic import PLUS a round trip through
+ *  the shared agent-op registry (`resolve-dom-point`) before it ever returns — real async hops, not
+ *  a same-tick lookup. `layoutSettle.ts` exists because that window is not instantaneous: #261
+ *  measured 0–1 frames of settle after a dock change, which is exactly long enough for the element
+ *  under a resolved point to no longer be the one the resolution named. `handleHover`/`handleScroll`
+ *  then dispatch at the OLD coordinates and, without this, would still label the reply with the
+ *  PRE-await `hitTarget` — a claim that can go stale in the gap.
+ *
+ *  `dispatchTapAt` already draws the shape this follows: re-check after the gap, and say plainly
+ *  what you can no longer stand behind rather than silently keep the old claim. This is the same
+ *  honesty extended to an aim that is USED, not pressed.
+ *
+ *  Deliberately a WARNING, not a refusal — matching `modoki_dnd`'s documented behavior for a
+ *  compromised aim (#260). The event has already been (or is about to be) dispatched at real
+ *  coordinates; refusing to report success would discard a gesture that in fact landed. Comparing
+ *  against `describeElement` is not optional: it is the SAME function `hitTarget` came from
+ *  (`domResolve.ts`), so "did it change" is a like-for-like comparison — `describeEl` in this file
+ *  is a different, differently-formatted function, and diffing across the two would report drift
+ *  that never happened. */
+function aimDriftSuffix(aim: { hitTarget?: string | null }, nowEl: Element | null): string {
+  if (aim.hitTarget === undefined) return ''; // a pixel aim claimed nothing, so nothing can have drifted
+  const now = describeElement(nowEl);
+  if (now === (aim.hitTarget ?? null)) return '';
+  return ` — ⚠ the element under this aim CHANGED between resolving it and acting on it: resolved `
+    + `${aim.hitTarget}, acted on ${now ?? 'nothing'}. The layout moved in that window; re-aim before `
+    + `resting a verdict on this.`;
 }
 
 /** Resolve-ONLY twin of `resolveAim`, for the trusted-CDP route (#32 Phase 1): the backend needs a
@@ -501,6 +534,15 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   showMarker(to.x, to.y, 'cyan', `to(${Math.round(to.x)},${Math.round(to.y)})`);
   showDragLine(from.x, from.y, to.x, to.y);
 
+  // #486 finding C: `fromAim` was resolved before any of the above — re-check what's under `from`
+  // right before acting on it, and fold the verdict into BOTH replies below. A drag resolves two
+  // aims at two different instants and reports them as one gesture; this covers the one that is
+  // actually USED to pick/drive the drag (`from`, via `grabEl`/`pickCanvasAt`). Computed once,
+  // independently of `grabEl`'s own selection (which prefers `fromSelector`'s `querySelector` over
+  // `elementFromPoint`) — this must always compare against what `elementFromPoint` says NOW, the
+  // same kind of read `hitTarget` came from.
+  const driftAtFrom = aimDriftSuffix(fromAim, document.elementFromPoint(from.x, from.y));
+
   // DOM-element-targeted drag: move DOM chrome (a debug widget, slider) by dispatching the pointer
   // sequence ON the grabbed element — the world path below dispatches on the canvas, which never
   // reaches a DOM element's React handlers. Auto-engaged when the grab lands on a non-canvas element
@@ -515,7 +557,7 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   const domMode = explicitDom === true || (explicitDom !== false && !!grabEl && grabEl.tagName !== 'CANVAS' && !grabEl.closest('canvas') && !grabEl.querySelector('canvas'));
   if (domMode) {
     if (!grabEl) return `Error: no element to drag at ${typeof params.fromSelector === 'string' ? JSON.stringify(params.fromSelector) : `(${Math.round(from.x)},${Math.round(from.y)})`}`;
-    return withMechanismSuffix(`${await domDrag(grabEl, from, to, steps, delayMs)}${superseded}`);
+    return withMechanismSuffix(`${await domDrag(grabEl, from, to, steps, delayMs)}${driftAtFrom}${superseded}`);
   }
 
   // World-space drag: dispatch a real pointer sequence ON the canvas under the GRAB point so it
@@ -538,7 +580,7 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   }
   canvas.dispatchEvent(new PointerEvent('pointerup', ptrInit(to.x, to.y)));
   _log(`[debug-bridge] DRAG → canvas:${how}`);
-  return withMechanismSuffix(`ok (canvas:${how}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})${superseded}`);
+  return withMechanismSuffix(`ok (canvas:${how}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})${driftAtFrom}${superseded}`);
 }
 
 function handleConsoleLogs(params: Record<string, unknown>): ReturnType<typeof consoleRing.query> {
@@ -1080,7 +1122,7 @@ export async function handleHover(params: Record<string, unknown>): Promise<stri
   el.dispatchEvent(new PointerEvent('pointerenter', { ...base, bubbles: false }));
   el.dispatchEvent(new PointerEvent('pointermove', base));
   el.dispatchEvent(new MouseEvent('mousemove', { clientX: aim.x, clientY: aim.y, bubbles: true, cancelable: true }));
-  return withMechanismSuffix(`ok (hover ${el.tagName.toLowerCase()}) @ ${aim.label}`);
+  return withMechanismSuffix(`ok (hover ${el.tagName.toLowerCase()}) @ ${aim.label}${aimDriftSuffix(aim, el)}`);
 }
 
 /** Scroll: dispatch a wheel event at the resolved point (defaults to viewport center). */
@@ -1089,11 +1131,18 @@ export async function handleScroll(params: Record<string, unknown>): Promise<str
   const p = hasAim ? params : { ...params, x: window.innerWidth / 2, y: window.innerHeight / 2 };
   const aim = await resolveAim(p, 'selector', 'x', 'y');
   if ('error' in aim) return aim.error;
-  const el = document.elementFromPoint(aim.x, aim.y) ?? document.scrollingElement ?? document.body;
+  const hit = document.elementFromPoint(aim.x, aim.y);
+  const el = hit ?? document.scrollingElement ?? document.body;
   const dx = (params.dx as number) ?? 0;
   const dy = (params.dy as number) ?? 0;
   el.dispatchEvent(new WheelEvent('wheel', { clientX: aim.x, clientY: aim.y, deltaX: dx, deltaY: dy, bubbles: true, cancelable: true }));
-  return withMechanismSuffix(`ok (scroll dx=${dx} dy=${dy}) @ ${aim.label}`);
+  // `hit` is passed even when NULL, deliberately. For a SELECTOR aim a null hit is the loudest
+  // drift there is — the resolution named an element, nothing is under that point any more, and
+  // the wheel just went to the scrollingElement/body fallback instead: precisely the false claim
+  // this suffix exists to stop (`@ selector→X` on an event X never saw). `aimDriftSuffix` already
+  // returns '' for a pixel aim, and returns '' when the resolution ALSO found nothing there, so
+  // passing the fallback element instead would be the only way to manufacture a wrong answer here.
+  return withMechanismSuffix(`ok (scroll dx=${dx} dy=${dy}) @ ${aim.label}${aimDriftSuffix(aim, hit)}`);
 }
 
 // --- Message Router ---

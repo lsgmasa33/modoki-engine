@@ -211,7 +211,7 @@ describe('devicePresets — safe area', () => {
   });
 });
 
-/** The agent-facing resolution behind `modoki_game_view_device` (#367). These are the decisions
+/** The agent-facing resolution behind `modoki_set_game_view_device` (#367). These are the decisions
  *  the op makes — kept in the module so they are testable without an editor, and tested here
  *  because the failure they guard against is silent: previewing a DIFFERENT screen than the one
  *  asked for makes every measurement taken afterwards wrong, with nothing to indicate it. */

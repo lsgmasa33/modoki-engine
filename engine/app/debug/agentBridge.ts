@@ -1545,9 +1545,53 @@ registerAgentOp('player-prefs-write', async (params) => {
   // whatever `PlayerPrefs.namespace()` would report afterward. Re-reading it after the await
   // would name the wrong (incoming) namespace for a write that actually landed in this one.
   const namespace = PlayerPrefs.namespace();
+  // Captured alongside `namespace`, same reasoning — see `swapGeneration()`'s doc comment in
+  // playerPrefs.ts. `isSwapInFlight()` above is a SAMPLE taken at entry; a swap that starts (and
+  // possibly finishes) during one of this op's own `await PlayerPrefs.flush()` calls below is
+  // invisible to a re-sampled `isSwapInFlight()` if it also closes before this op resumes, so the
+  // generation counter is what actually catches it (#454 C).
+  const swapGen = PlayerPrefs.swapGeneration();
+  // Called after every internal `await PlayerPrefs.flush()` below, right before the
+  // `pendingKeys()`/`hasPendingWrite()` readback that follows it — a swap that lands mid-await
+  // means that readback would answer against the INCOMING namespace, not the one this op is
+  // reporting about. `isSwapInFlight()` is checked too (not just the generation) so a swap that
+  // is STILL open when this op resumes is caught by the cheaper, more direct signal; the
+  // generation check is what catches the swap that already opened AND closed inside the await.
+  // The issue (#454) names only the `flush` action, but `clear`/`delete`/`set` have the exact
+  // same shape of bug at their own flush sites — a single shared helper called at every one of
+  // them is less error-prone than reimplementing this check per call site.
+  //
+  // This check is deliberately CONSERVATIVE — it fires whenever a swap started during the
+  // await, including cases where the readback would in fact still have been truthful (the swap
+  // may be parked behind this op's own `writeChain` and not yet installed). Over-reporting
+  // "unknown" is the safe direction; claiming a durability we could not observe is not.
+  //
+  // Unlike the entry-time `isSwapInFlight()` refusal above, this fires AFTER the mutation has
+  // already happened — the cache write landed, and the durable write was at least attempted
+  // against `namespace`. So it does NOT return `NOT_AVAILABLE_HERE` (which at entry truthfully
+  // means "nothing was done"; here it would mean "everything was done, I just won't tell you" —
+  // worse than the false success it replaced, since a caller retrying a `delete` whose durable
+  // remove already landed would then get `NOT_FOUND: nothing was deleted` and conclude its
+  // delete never happened). Instead it reports `PARTIAL` with `durability:'unknown'` — the
+  // shape `contracts.ts` already defines for "the cache change happened, the durable outcome
+  // could not be confirmed" — merging in whichever facts THIS action already knows are true.
+  const swapUnverifiableAfterFlush = (known: Record<string, unknown>) =>
+    (PlayerPrefs.swapGeneration() !== swapGen || PlayerPrefs.isSwapInFlight())
+      ? {
+          ok: false as const,
+          code: 'PARTIAL' as const,
+          namespace,
+          ...known,
+          durability: 'unknown' as const,
+          error: `a game/namespace swap STARTED while this op was awaiting its own flush (it may or may not have completed) — the write was applied to the live cache and its durable write was attempted against "${namespace}", but the pending-write readback that decides this reply can no longer be trusted to answer for "${namespace}", so whether the backend ACCEPTED it is unknown`,
+          hint: `Treat this as durability-unknown, NOT as a failure — do not simply retry, since the same op against the incoming namespace would report on a different store. Once the swap has settled, "${namespace}" is only inspectable by re-opening the game that owns it.`,
+        }
+      : null;
 
   if (p.action === 'flush') {
     await PlayerPrefs.flush();
+    const swapUnverifiable = swapUnverifiableAfterFlush({ flushed: true });
+    if (swapUnverifiable) return swapUnverifiable;
     // A flush that RESOLVES is not a flush that landed: `drain()` catches a rejected backend write,
     // re-queues the key into `dirty`, and settles fulfilled so later writes are not poisoned —
     // while `cache` keeps the value, so `get()` still returns it. Re-reading the pending set is the
@@ -1587,6 +1631,8 @@ registerAgentOp('player-prefs-write', async (params) => {
     }
     PlayerPrefs.clear();
     await PlayerPrefs.flush();
+    const clearSwapUnverifiable = swapUnverifiableAfterFlush({ cleared: keys.length, keys });
+    if (clearSwapUnverifiable) return clearSwapUnverifiable;
     // Same rejection possibility as `flush`/`set`/`delete` — a clear queues every key as a delete,
     // and any of those backend.remove() calls can be rejected (quota, native I/O) and re-queued.
     const stillPending = PlayerPrefs.pendingKeys().sort();
@@ -1636,6 +1682,8 @@ registerAgentOp('player-prefs-write', async (params) => {
       // if it was merely debounced, it also completes the removal this delete call asked for.
       if (PlayerPrefs.hasPendingWrite(p.key)) {
         await PlayerPrefs.flush();
+        const deleteNoopSwapUnverifiable = swapUnverifiableAfterFlush({ key: p.key, deleted: true, alreadyRemoved: true });
+        if (deleteNoopSwapUnverifiable) return deleteNoopSwapUnverifiable;
         if (PlayerPrefs.hasPendingWrite(p.key)) {
           return {
             ok: false, code: 'PARTIAL', namespace, key: p.key, deleted: true, saved: false,
@@ -1659,6 +1707,8 @@ registerAgentOp('player-prefs-write', async (params) => {
     }
     PlayerPrefs.delete(p.key);
     await PlayerPrefs.flush();
+    const deleteSwapUnverifiable = swapUnverifiableAfterFlush({ key: p.key, deleted: true });
+    if (deleteSwapUnverifiable) return deleteSwapUnverifiable;
     // Mirrors the `set` path's check below. `deleted: true` stays true even in the PARTIAL shape —
     // the cache removal DID happen, `get()`/`has()` on this key now behave as if it's gone. It's
     // `saved` that's false: the durable remove was rejected, so the key is still on disk and will
@@ -1695,6 +1745,8 @@ registerAgentOp('player-prefs-write', async (params) => {
   // or to move on, and a debounced write that a reload or a scene swap eats would look like the
   // set never happened. The flush also surfaces a backend rejection, which the debounce would hide.
   await PlayerPrefs.flush();
+  const setSwapUnverifiable = swapUnverifiableAfterFlush({ key: p.key });
+  if (setSwapUnverifiable) return setSwapUnverifiable;
   const pending = PlayerPrefs.hasPendingWrite(p.key);
   if (pending) {
     return {
@@ -1787,14 +1839,67 @@ registerAgentOp('load-scene', async (params) => {
     };
   }
   const before = sceneManager.getCurrent()?.path ?? null;
+  const loading = sceneManager.loadScene(p.path);
+  // SceneManager allocates THIS attempt's id into `nextLoad` synchronously, before loadScene's
+  // first await (SceneManager.ts:286-288) — so reading it here, between the call and the await,
+  // names OUR load specifically, not whichever load happens to win a later swap (#486 finding A).
+  const myId = sceneManager.getNext()?.id ?? null;
   try {
-    await sceneManager.loadScene(p.path);
+    await loading;
   } catch (e) {
-    return { ok: false, error: `load-scene FAILED for "${p.path}": ${(e as Error).message}. The previous scene is still loaded.`, current: sceneManager.getCurrent()?.path ?? null };
+    const cur = sceneManager.getCurrent();
+    if (cur?.path === before) {
+      return { ok: false, error: `load-scene FAILED for "${p.path}": ${(e as Error).message}. The previous scene is still loaded.`, current: cur?.path ?? null };
+    }
+    // A DIFFERENT load's world got swapped in while this one was failing — "the previous scene is
+    // still loaded" would be false right next to `current` naming a third scene.
+    return {
+      ok: false,
+      error: `load-scene FAILED for "${p.path}": ${(e as Error).message}. The active scene is now "${cur?.path ?? 'null'}" — the previous scene is NOT what is loaded, because another load swapped it in while this one was failing.`,
+      current: cur?.path ?? null,
+    };
   }
-  const after = sceneManager.getCurrent()?.path ?? null;
-  // loadScene resolves void, so "did it work?" is only answerable by looking. A path that does not
-  // exist would otherwise resolve quietly and report a swap that never happened (conventions §0).
+  const cur = sceneManager.getCurrent();
+  const after = cur?.path ?? null;
+  if (myId !== null && cur !== null) {
+    if (cur.id === myId) {
+      // Our load won the swap — unchanged success reply.
+      return { ok: true, current: after, previous: before, entityCount: getAllEntities().length };
+    }
+    // ⚠️ `> myId`, NOT `!== myId`. Scene ids come from a monotonic `this.nextSceneId++`
+    // (sceneManager.ts:286), so only an id GREATER than ours is evidence that a LATER load won
+    // the swap. A different-but-SMALLER id means nothing newer ever installed and our own load
+    // simply never became primary — and reporting THAT as "a later scene load won" would assert
+    // from evidence that only says "the current id is not mine", which is the same shape of
+    // over-claim this fix exists to remove. That case falls through to the original path check
+    // below and keeps its original message. (A genuinely bad path throws at sceneManager.ts:325
+    // and is answered by the catch above; this is belt-and-braces for any resolve-without-
+    // installing path, which is what the original `after !== p.path` check was written for.)
+    if (cur.id > myId) {
+      // Superseded. `loadScene` still resolved successfully for us (sceneManager.ts:896, "a
+      // superseded load skips straight to resolving"), so this is not our load failing and it
+      // says nothing about whether `p.path` exists.
+      if (cur.path === p.path) {
+        // The same requested path won, so the caller's requested end state IS true — just not
+        // because of THIS op's load. `entityCount` is deliberately omitted: it would be a live
+        // read of a world this op did not load.
+        return {
+          ok: true, current: after, previous: before,
+          note: `a concurrent load of "${p.path}" won the swap — this op's own load was superseded, but the requested scene is active.`,
+        };
+      }
+      return {
+        ok: false,
+        superseded: true,
+        current: after,
+        previous: before,
+        error: `load-scene for "${p.path}" was superseded — a LATER scene load won the swap, and "${after ?? 'null'}" is now the active scene. This op's own load did not fail; this says nothing about whether "${p.path}" exists in this build.`,
+      };
+    }
+  }
+  // Reached when `myId` could not be read (`getNext()` already cleared by the time we looked), or
+  // when our load resolved without ever becoming primary and nothing newer installed either. The
+  // original path comparison is the only check that does not depend on `myId` — message unchanged.
   if (after !== p.path) {
     return { ok: false, error: `load-scene did not switch to "${p.path}" — the active scene is ${after ?? 'null'}. Check the path exists in this build.`, current: after, previous: before };
   }
@@ -1855,6 +1960,23 @@ registerAgentOp('sim-step', (params) => {
       done = true;
       clearTimeout(timer);
       unregisterFrameCallback(key);
+      if (getCurrentWorld() !== world) {
+        // A scene load swapped in a DIFFERENT world mid-step and destroyed this one (the two-world
+        // atomic swap). Querying it further — getTime/setTimeScale below both do a koota
+        // query/queryFirst — can throw on a destroyed world, and a throw here would skip `resolve`
+        // entirely: the op would never reply at all (#486 finding B). So: touch `world` no further.
+        resolve({
+          ok: false,
+          worldReplaced: true,
+          stepped: seen, requested: frames,
+          error: `the world was REPLACED during this step — a scene load swapped it out and destroyed `
+            + `it, so this step's numbers cannot be attributed to the world it started on. "stepped" `
+            + `(${seen}) counts frames the frame driver ran GLOBALLY, including the incoming world's `
+            + `frames, not frames run on the destroyed one. Nothing was left unfrozen: the only world `
+            + `this op unfroze is the one that was destroyed, so the live world's timeScale is untouched.`,
+        });
+        return;
+      }
       setTimeScale(world, 0);   // ALWAYS re-freeze, including on the timeout path
       const advancedMs = Math.round((elapsedOf() - startElapsed) * 1000);
       if (timedOut) {
@@ -1871,7 +1993,12 @@ registerAgentOp('sim-step', (params) => {
     };
     const timer = setTimeout(() => finish(true), timeoutMs);
     // Priority 100: after ECS and both renderers, so a frame is counted only once its work is done.
-    registerFrameCallback(key, () => { if (++seen >= frames) finish(false); }, 100);
+    registerFrameCallback(key, () => {
+      // Bail out immediately on a world swap rather than burning the rest of the timeout budget —
+      // this is what turns a 20s wait into an honest answer on the very frame the swap happens.
+      if (getCurrentWorld() !== world) { finish(false); return; }
+      if (++seen >= frames) finish(false);
+    }, 100);
     setTimeScale(world, scale);
   });
 });

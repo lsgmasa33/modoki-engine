@@ -494,8 +494,8 @@ whole conversation's cache) doesn't fire on a sub-second blip.
   loaded ([mcp-tool-conventions.md](./mcp-tool-conventions.md) § 2a), so five self-describing
   `open_*` names carry more free information than one
   generic `open_editor` whose mode enum costs a round-trip to discover. The view-mode group is also
-  incoherent on its own terms — three different `mode` enums, and `game_view_device` isn't a view
-  mode at all.
+  incoherent on its own terms — three different `mode` enums, and `set_game_view_device` isn't a
+  view mode at all.
 - **Trimming descriptions for size.** Under deferral a description is paid only when its schema is
   fetched, so shrinking it saves near-nothing — and conventions §11 already says a description "is
   read far more often than this file."

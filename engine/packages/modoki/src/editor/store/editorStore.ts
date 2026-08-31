@@ -113,7 +113,7 @@ interface EditorState {
   /** Which view the Animation editor's timeline area is showing: the Dopesheet (keyframe
    *  TIMING, diamonds) or Curves (keyframe VALUES + easing, a graph). Lifted from
    *  AnimationEditor-local state into the store so it is agent-drivable
-   *  (`set-animation-view-mode` / `modoki_animation_view_mode`, #369) — the same move
+   *  (`set-animation-view-mode` / `modoki_set_animation_view_mode`, #369) — the same move
    *  `sceneViewMode` above records.
    *
    *  It is not cosmetic: exactly ONE of the two views is mounted, and each publishes its own
@@ -166,7 +166,7 @@ interface EditorState {
   particlePreview: boolean;
   /** The Game panel's selected device preset, and the orientation it is viewed in. Lifted from
    *  GameView-local state into the store so they are agent-drivable (`set-game-view-device` /
-   *  `modoki_game_view_device`, #367) — the same move `sceneViewMode` above records, and for the
+   *  `modoki_set_game_view_device`, #367) — the same move `sceneViewMode` above records, and for the
    *  same reason: the device picker is a popup an agent's trusted input cannot operate, so any
    *  layout check a session runs used to measure whatever device the human last left selected.
    *

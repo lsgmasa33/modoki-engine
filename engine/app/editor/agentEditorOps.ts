@@ -230,7 +230,7 @@ function readEditorState() {
     // two views publish DIFFERENT interaction handles, so without it "why does modoki_handles
     // editor=curves return nothing" is answerable only from a screenshot — an empty list is
     // otherwise indistinguishable from a clip with no tangents (#369). Set with
-    // modoki_animation_view_mode. Kept as a FLAT scalar as well as inside `animationView` below:
+    // modoki_set_animation_view_mode. Kept as a FLAT scalar as well as inside `animationView` below:
     // it is the single most-read field here, and every caller written against it stays correct.
     animationViewMode: s.animationViewMode,
     // The same answer WITH its qualifiers — see describeAnimationView. `animationViewMode` alone
@@ -239,7 +239,7 @@ function readEditorState() {
     // Which screen the Game panel is previewing at. Reported so a layout measurement can be
     // ATTRIBUTED to a screen size — without it, "the HUD overlaps the notch" is unfalsifiable,
     // since the reader cannot tell which device produced it (#367). Set with
-    // modoki_game_view_device; the full catalog is modoki_game_view_devices.
+    // modoki_set_game_view_device; the full catalog is modoki_game_view_devices.
     gameView: describeGameView(),
     // Which panel owns the KEYBOARD ('scene' | 'hierarchy' | 'animation-editor' | …), or null.
     // Readable as DATA on purpose: the focus ring is a CSS box-shadow, so without this the
@@ -1105,7 +1105,7 @@ export function registerEditorAgentOps(): void {
         free: p.logicalW <= 0,
       })),
       note: "Sizes are LOGICAL (CSS points) unless named physical; layout math runs in logical space. "
-        + "Set one with modoki_game_view_device {device, orientation}, or give an explicit "
+        + "Set one with modoki_set_game_view_device {device, orientation}, or give an explicit "
         + '{logicalWidth, logicalHeight} for a size the catalog does not carry.',
     };
   });

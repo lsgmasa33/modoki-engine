@@ -243,7 +243,7 @@ export function filterDevices(query: string, presets: DevicePreset[] = DEVICE_PR
 }
 
 // ── Agent-facing resolution (#367) ─────────────────────────────────────────
-// `modoki_game_view_device` picks a preview screen by NAME or by an explicit pixel size. The
+// `modoki_set_game_view_device` picks a preview screen by NAME or by an explicit pixel size. The
 // decision logic lives here rather than in the op so it is unit-testable without an editor —
 // `docs/editor.md` § Panels: a panel's decisions belong in a plain .ts module beside it.
 

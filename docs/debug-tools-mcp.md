@@ -830,7 +830,7 @@ same actions + state a person has in the editor. They relay to the renderer over
   with `modoki_tap`/`modoki_drag`, read `get_scene_state`, then stop (reverts the authored snapshot).
 - **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/ui/camera/light/
   particle — identical to the Hierarchy menu), `modoki_duplicate_entity`, `modoki_delete_entities`,
-  `modoki_reparent_entity`, `modoki_set_selection`, `modoki_gizmo`, `modoki_focus_entity`,
+  `modoki_reparent_entity`, `modoki_set_selection`, `modoki_set_gizmo`, `modoki_focus_entity`,
   `modoki_history {undo|redo}`. `modoki_prefab {instantiate|create|detach|overrides|apply|revert}`.
   `modoki_set_transform` sets position/rotation/scale in ONE call (partial merge) and — unlike a
   plain `setTrait` — routes a prefab INSTANCE's edit into its overrides instead of being silently
@@ -1196,14 +1196,10 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
-| `modoki_animation_view_mode` | POST `/api/editor-action` `set-animation-view-mode` | session | editor | — | `{"mode":"dopesheet"}` |
-| `modoki_collider_edit` | POST `/api/editor-action` `set-collider-edit` | session | editor | — | `{"on":true}` |
 | `modoki_dispatch_action` | POST `/api/editor-action` `dispatch-action` | no persistence | editor + renderer | — | `{"name":"probe"}` |
 | `modoki_eval` | POST `/api/eval` | no persistence | editor + renderer | — | `{"code":"return 1 + 1;"}` |
 | `modoki_exit_pose_envelope` | POST `/api/editor-action` `exit-pose-envelope` | live | editor + scene | — | *(no args)* |
 | `modoki_focus_entity` | POST `/api/editor-action` `focus-entity` | no persistence | editor + scene | entity | *(no args)* |
-| `modoki_game_view_device` | POST `/api/editor-action` `set-game-view-device` | session | editor | — | `{"device":"Free"}` |
-| `modoki_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
 | `modoki_history` | POST `/api/editor-action` *(op = your `action`)* | live | editor | — | `{"action":"undo"}` |
 | `modoki_hit_regions` | GET `/api/hit-regions` | session | editor + renderer | — | `{"action":"read"}` |
 | `modoki_input_watch` | GET `/api/input-watch/read` *(both varies)* | session | editor + renderer | — | `{"action":"read"}` |
@@ -1221,9 +1217,13 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_pose_clip` | POST `/api/editor-action` `pose-clip` | live | editor + scene | — | `{"t":0}` |
 | `modoki_profiler` | GET `/api/profiler` *(method varies)* | session | editor + renderer | — | *(no args)* |
 | `modoki_project_settings` | GET `/api/project-settings` *(method varies)* | file | project | — | `{"action":"get"}` |
-| `modoki_scene_view_mode` | POST `/api/editor-action` `set-scene-view-mode` | session | editor | — | `{"mode":"3d"}` |
 | `modoki_select_sprite_slice` | POST `/api/editor-action` `select-sprite-slice` | session | editor | — | *(no args)* |
+| `modoki_set_animation_view_mode` | POST `/api/editor-action` `set-animation-view-mode` | session | editor | — | `{"mode":"dopesheet"}` |
+| `modoki_set_collider_edit` | POST `/api/editor-action` `set-collider-edit` | session | editor | — | `{"on":true}` |
+| `modoki_set_game_view_device` | POST `/api/editor-action` `set-game-view-device` | session | editor | — | `{"device":"Free"}` |
+| `modoki_set_gizmo` | POST `/api/editor-action` `set-gizmo` | session | editor | — | *(no args)* |
 | `modoki_set_playhead` | POST `/api/editor-action` `set-playhead` | session | editor | — | `{"t":0}` |
+| `modoki_set_scene_view_mode` | POST `/api/editor-action` `set-scene-view-mode` | session | editor | — | `{"mode":"3d"}` |
 | `modoki_set_selection` | POST `/api/editor-action` `set-selection` | session | editor | entity | *(no args)* |
 | `modoki_set_skin_mode` | POST `/api/editor-action` `set-skin-mode` | session | editor | — | `{"mode":"rig"}` |
 | `modoki_set_timescale` | POST `/api/editor-action` `set-timescale` | no persistence | editor + renderer | — | `{"scale":1}` |
@@ -1673,9 +1673,9 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
   handle is `offScreen`, `modoki_scroll` the panel until it's aimable rather than silently missing.
 - **Openers/mode-setters that unblock editors trusted input can't reach** (a native `<select>` popup or
   a modal that only mounts when its tab/asset is active is a separate OS layer `sendInputEvent` can't
-  touch): `modoki_scene_view_mode {3d|ui}` (REQUIRED before Collider2D editing — its vertex handles
-  only live in `ui`/2D mode), `modoki_collider_edit {on}` (the toolbar "Points" toggle),
-  `modoki_animation_view_mode {dopesheet|curves}` (the Animation panel shows exactly ONE of its two
+  touch): `modoki_set_scene_view_mode {3d|ui}` (REQUIRED before Collider2D editing — its vertex handles
+  only live in `ui`/2D mode), `modoki_set_collider_edit {on}` (the toolbar "Points" toggle),
+  `modoki_set_animation_view_mode {dopesheet|curves}` (the Animation panel shows exactly ONE of its two
   views, and only **Curves** publishes `curves:key:*` and the tangent handles `curves:tan:in|out:*` —
   the default is Dopesheet, so `modoki_handles editor=curves` is empty until you switch, which reads
   as "this clip has no tangents"; it does NOT open or reload a clip, unlike

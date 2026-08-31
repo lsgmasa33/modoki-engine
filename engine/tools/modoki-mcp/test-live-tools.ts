@@ -140,11 +140,21 @@ const ENV_CODES = new Set(['NOT_FOUND', 'NO_RENDERER', 'REQUIRES_SAVE', 'AMBIGUO
 // 3-value `playState` — see editorBackendRouter.ts's own comment on why). While Playing the ergonomic
 // call succeeds normally, which is correct behaviour, not a defect — so fetch `runMode` up front to
 // gate that one expectation on the state actually observed THIS run, rather than assuming stopped.
-const editorStateForGate = JSON.parse(
-  (await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })).content
-    .map((c) => (c as { text?: string }).text ?? '').join(''),
-) as { runMode?: string; playState?: string };
-const observedRunMode = editorStateForGate.runMode ?? editorStateForGate.playState;
+let observedRunMode: string | undefined;
+let editorStateBody = '';
+try {
+  editorStateBody = (await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })).content
+    .map((c) => (c as { text?: string }).text ?? '').join('');
+  const editorStateForGate = JSON.parse(editorStateBody) as { runMode?: string; playState?: string };
+  observedRunMode = editorStateForGate.runMode ?? editorStateForGate.playState;
+} catch (e) {
+  // Same V3 shape as the sweep loop's own "returned HTML, not JSON" check below, but this call runs
+  // BEFORE the sweep and outside its per-tool try/catch — a throw here used to kill the whole T3
+  // tier with zero rows reported. Degrade instead: every downstream use of `observedRunMode` already
+  // treats it as optional (a `when()` gate and two `!== 'playing'`/`=== 'stopped'` comparisons), so
+  // `undefined` just means those state-gated expectations don't fire this run.
+  console.error(`[live] WARNING: could not read the run-mode gate from modoki_get_editor_state (${e instanceof Error ? e.message : String(e)}) — proceeding with observedRunMode=undefined, so run-mode-gated expectations will not fire this run. Response was: ${editorStateBody.slice(0, 200)}`);
+}
 
 /** Tools whose ergonomic call legitimately REFUSES depending on the editor/project state, matched
  *  on the refusal text. Being explicit is the point: without this the sweep either flags three

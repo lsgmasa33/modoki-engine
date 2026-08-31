@@ -29,14 +29,14 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'Also `gameView` — WHICH SCREEN the Game panel is previewing at (device name, orientation, '
       + 'logical + physical size, dpr, safe-area insets). Read it before quoting any layout '
       + 'measurement: the same HUD is correct on one device and broken on another, so a number '
-      + 'with no screen attached to it is unfalsifiable. Set it with modoki_game_view_device. ' +
+      + 'with no screen attached to it is unfalsifiable. Set it with modoki_set_game_view_device. ' +
       'Also `animationViewMode` (dopesheet|curves) — WHICH of the Animation panel\'s two views is '
       + 'showing, and therefore which interaction handles exist at all. `animationView` carries the '
       + 'same answer WITH the two qualifiers an empty handle list needs: `panelMounted` (an '
       + 'Animation tab that exists but was never SELECTED does not mount, and then NEITHER view '
       + 'publishes handles) and, in curves, a note that tangent handles need an ACTIVE TRACK as '
       + 'well as the view. Read these before concluding a clip has no tangents. Set the view with '
-      + 'modoki_animation_view_mode. ' +
+      + 'modoki_set_animation_view_mode. ' +
       'Also `spriteEditorSelection` (guid|null) — which slice is selected in the open Sprite ' +
       'Editor; its resize/pivot handles only exist for that slice, and it opens with none ' +
       'selected, so an empty `modoki_handles editor=sprite` is otherwise ambiguous. Set with ' +
@@ -422,7 +422,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
 
   // ── gizmo / focus ──
   tool(
-    'modoki_gizmo',
+    'modoki_set_gizmo',
     'Set the SceneView transform gizmo mode (translate/rotate/scale) and/or space (world/local).',
     {
       mode: z.enum(['translate', 'rotate', 'scale']).optional(),
@@ -431,7 +431,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     async (p) => editorAction('set-gizmo', p),
   );
   tool(
-    'modoki_scene_view_mode',
+    'modoki_set_scene_view_mode',
     "Set the SceneView viewport mode: '3d' (Three.js) or 'ui' (the 2D/UI overlay). The " +
       "toolbar selector is a native <select> that trusted input can't drive, so use this. " +
       "'ui' mode is REQUIRED to edit Collider2D vertices (with set-collider-edit) and to see " +
@@ -440,7 +440,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     async ({ mode }) => editorAction('set-scene-view-mode', { mode }),
   );
   tool(
-    'modoki_animation_view_mode',
+    'modoki_set_animation_view_mode',
     "Set which view the Animation editor's timeline area shows: 'dopesheet' (keyframe TIMING — "
       + "diamonds) or 'curves' (keyframe VALUES + easing — a graph). Exactly ONE is mounted, and "
       + 'they publish DIFFERENT interaction handles, so this decides what modoki_handles can even '
@@ -475,12 +475,12 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       + 'carries the LOGICAL size (CSS points — the space layout math runs in), the PHYSICAL size '
       + '(device pixels), the dpr, and safe-area insets for both orientations. Read this instead of '
       + 'hardcoding a device table. Rows are PORTRAIT — landscape is a flip applied on selection, '
-      + 'not a separate row, so pass `orientation` to modoki_game_view_device. Changes nothing.',
+      + 'not a separate row, so pass `orientation` to modoki_set_game_view_device. Changes nothing.',
     {},
     async () => getJson('/api/game-view-devices'),
   );
   tool(
-    'modoki_game_view_device',
+    'modoki_set_game_view_device',
     'Set WHICH SCREEN the Game panel previews at. The device picker is a popup trusted input '
       + 'cannot operate, so this is the only way an agent can change it — without it every layout '
       + 'check measures whatever device the human last left selected. Pass `device` (a name from '
@@ -518,9 +518,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     async (p) => editorAction('set-game-view-device', p),
   );
   tool(
-    'modoki_collider_edit',
+    'modoki_set_collider_edit',
     'Toggle Collider2D vertex-edit mode (the toolbar "Points" button) for the selected ' +
-      "entity. Pair with modoki_scene_view_mode 'ui' + a selected entity that has an editable " +
+      "entity. Pair with modoki_set_scene_view_mode 'ui' + a selected entity that has an editable " +
       'collider (polygon/polyline/concave); then modoki_handles editor=collider2d lists its ' +
       'draggable vertices. Returns editor state.',
     { on: z.boolean().describe('true enters collider vertex-edit mode on the selected entity, false leaves it.') },

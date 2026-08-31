@@ -89,23 +89,48 @@ that reads the same at that width is a coin flip, and §0 ranks a wrong action a
 
 Audit of the whole surface, 2026-08-31 (24 lexically-similar pairs examined; most are fine —
 `get_scene_state`/`get_editor_state`, the five `open_*_editor`, and the read/write pairs all carry
-their distinction in the name). **Four do not:**
+their distinction in the name). **Four did not** — the first is now fixed, the other three are a
+recorded decision (both below):
 
 | pair | why it is a coin flip | severity |
 |---|---|---|
-| `game_view_devices` (read) vs `game_view_device` (**mutating**) | one character — a plural — separates a list from a write | **highest**: the boundary crossed is read↔mutate |
+| `game_view_devices` (read) vs `game_view_device` (**mutating**) — *fixed, see below* | one character — a plural — separated a list from a write | **highest**: the boundary crossed is read↔mutate |
 | `eval` (**mutating**) vs `eval_api` (read) | `_api` reads as "eval, via the API"; it is the **discovery/list** call. Both servers | high |
 | `create_asset` vs `create_registered_asset` | "registered" names an implementation fact, not the difference an agent picks on (scaffold-with-defaults vs the Assets panel's "New X" kinds) | medium |
 | `focus` (keyboard/panel focus) vs `focus_entity` (camera framing) | bare `focus` does not say *what* is focused | low |
 
-Related inconsistency, same audit: `set_skin_mode` carries the `set_` prefix its siblings
-`scene_view_mode` and `animation_view_mode` do not, though all three are mutating setters.
+Related inconsistency, same audit: `set_skin_mode` carried the `set_` prefix its siblings
+`scene_view_mode` and `animation_view_mode` did not, though all three are mutating setters.
 
-⚠️ **None of these is fixed, because every fix is a RENAME** — a breaking change to the contracts
-table, the generated catalog, `liveCoverage`, and every doc and test naming the tool, which is the
-same cost that made §7 decline splitting `watch` and the journals. They are recorded so a *new*
-tool does not add a fifth, and so a future rename pass has its list ready. **When naming a new
-tool, the test is: could an agent seeing only this name and its neighbours pick wrong?**
+**The rule that audit produced — a mutating setter is named `set_*`** (#483, landed 2026-08-31).
+`scene_view_mode`, `animation_view_mode`, `game_view_device`, `gizmo` and `collider_edit` were
+renamed to `set_scene_view_mode`, `set_animation_view_mode`, `set_game_view_device`, `set_gizmo` and
+`set_collider_edit`, joining `set_transform`, `set_selection`, `set_timescale`, `set_playhead` and
+`set_skin_mode`. That also **dissolves the highest-severity row above**: a plural is no longer what
+separates the list from the write — `set_` is, and `game_view_devices` is left unambiguously the
+read. The split itself was always correct (§4 — the read half is a GET); only the naming was.
+
+**The rule is a GUARD, not prose** (`mcpRegistry.test.ts`, "a tool whose backend op is `set-*` is
+NAMED `modoki_set_*`"). The discriminator is the backend op, so a new `set-*` op cannot ship under
+a non-`set_` name. That mechanism exists because the issue's own list was **incomplete**: it named
+three tools, and the close-out sweep found `gizmo` (op `set-gizmo`) and `collider_edit` (op
+`set-collider-edit`) — `gizmo` nine lines above the renames, in the same file. A rule
+carried only by prose is a rule the next audit re-discovers.
+
+Two families are deliberately OUT of scope, so nobody "fixes" them into the guard:
+- **The `asset`-kind writers** — `particle_set`, `timeline_set`, `anim_set_clip`, `anim_add_key`,
+  `timeline_add_clip`. These are **subject-first on purpose** (`anim_*`, `timeline_*`, `particle_*`)
+  so a family sorts together in a name-only list, which is the same deferral pressure the `set_`
+  rule serves. Their names match their ops exactly, and their ops are not `set-*`.
+- **`select_sprite_slice`** — a genuine `select-` verb, not a setter.
+
+⚠️ **The other three rows stay UNFIXED, and that is a decision, not a backlog.** All three fail
+**recoverably** — you get the wrong read, notice, and call the right tool — and there is no observed
+instance of an agent picking wrong; the audit is theoretical risk, while every fix is a RENAME
+touching the contracts table, the generated catalog, `liveCoverage`, and every doc and test naming
+the tool. That is the same cost that made §7 decline splitting `watch` and the journals. They stay
+recorded so a *new* tool does not add a fifth. **When naming a new tool, the test is: could an agent
+seeing only this name and its neighbours pick wrong?**
 - **`position`** — documented as "World position" on `set_transform` while writing `Transform.x/y/z`,
   which is **local**. Every parented entity silently lands somewhere else, reported as success (S1).
 
