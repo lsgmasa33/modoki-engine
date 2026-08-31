@@ -334,6 +334,63 @@ describe('checkForUpdate', () => {
     expect(native.stageUpdate).not.toHaveBeenCalled();
   });
 
+  // #509: `pending` means STAGED-AND-WAITING-FOR-RESTART, not running — reporting it as
+  // `up-to-date` let a concurrent caller tear down a mandatory gate the FIRST caller had
+  // legitimately armed, because the pending version wasn't running yet either.
+  it('reports pending-restart (not up-to-date) when the target is already staged but not active', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: true, minEngineApi: 1 }, privateKey);
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(release));
+    const native = mockNative({
+      getState: vi.fn().mockResolvedValue({
+        stateJSON: JSON.stringify({ active: { shell: 'v1' }, pending: { shell: 'v2' } }),
+      }),
+    });
+
+    const result = await checkForUpdate({ baseUrl: 'https://x', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native });
+
+    expect(result).toEqual({ outcome: 'pending-restart', version: 'v2', mandatory: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(1); // never fetched a manifest, same short-circuit as up-to-date
+    expect(native.stageUpdate).not.toHaveBeenCalled();
+    expect(native.stageUpdateDelta).not.toHaveBeenCalled();
+  });
+
+  // Brick regression: `pending` also stays set for TWO launches AFTER a restart actually
+  // serves it (promotion to `active` needs two confirmBoots — OtaCore.requiredConfirms). If
+  // this case were also reported as `pending-restart`, a mandatory gate would hold FOREVER
+  // on the very update the device is already running — the app never boots and a restart
+  // just repeats the same launch. `bootAttempts >= 1` is what the native boot hook sets
+  // BEFORE the WebView loads when it serves the pending bundle, so it's the discriminator.
+  it('reports up-to-date (not pending-restart) when the pending version is already being served (bootAttempts >= 1)', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: true, minEngineApi: 1 }, privateKey);
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(release));
+    const native = mockNative({
+      getState: vi.fn().mockResolvedValue({
+        stateJSON: JSON.stringify({ active: { shell: 'v1' }, pending: { shell: 'v2' }, bootAttempts: { shell: 1 } }),
+      }),
+    });
+
+    const result = await checkForUpdate({ baseUrl: 'https://x', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native });
+
+    expect(result).toEqual({ outcome: 'up-to-date' });
+  });
+
+  it('reports up-to-date (not pending-restart) when active already matches, even if pending also holds a stale value', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: true, minEngineApi: 1 }, privateKey);
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(release));
+    const native = mockNative({
+      getState: vi.fn().mockResolvedValue({
+        stateJSON: JSON.stringify({ active: { shell: 'v2' }, pending: { shell: 'v1' } }),
+      }),
+    });
+
+    const result = await checkForUpdate({ baseUrl: 'https://x', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native });
+
+    expect(result).toEqual({ outcome: 'up-to-date' });
+  });
+
   it('refuses to re-stage a version this device already quarantined (Phase 3a)', async () => {
     // The regression this locks: before the `rejected` list existed, revert() erased all
     // memory of the failure, so this exact call re-staged the known-bad bundle — forever.
@@ -412,14 +469,19 @@ describe('checkForUpdate', () => {
     expect(result).toEqual({ outcome: 'staged', version: 'v2', mandatory: false });
   });
 
-  it('reports up-to-date when the target version is already pending (avoids re-downloading mid-attempt)', async () => {
+  it('reports pending-restart (not up-to-date) when the target version is already pending (avoids re-downloading mid-attempt, #509)', async () => {
+    // #509: `pending` means staged-and-waiting-for-a-restart, NOT running — this case still
+    // avoids a redundant re-download (no manifest fetch below), but must NOT be conflated with
+    // `up-to-date`, whose caller-side meaning is "nothing to wait for". See the dedicated
+    // pending-restart tests above for the outcome's full contract.
     const { privateKey, publicKey } = makeKeypair();
     const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1 }, privateKey);
     const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(release));
     const native = mockNative({ getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' }, pending: { shell: 'v2' } }) }) });
 
     const result = await checkForUpdate({ baseUrl: 'https://x', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native });
-    expect(result).toEqual({ outcome: 'up-to-date' });
+    expect(result).toEqual({ outcome: 'pending-restart', version: 'v2', mandatory: false });
+    expect(fetchImpl).toHaveBeenCalledTimes(1); // never fetched a manifest — same short-circuit as before
   });
 
   it('rejects a release with an invalid signature and never stages anything', async () => {

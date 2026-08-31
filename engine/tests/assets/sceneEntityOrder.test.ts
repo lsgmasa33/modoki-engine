@@ -25,7 +25,17 @@ const REPO = path.resolve(__dirname, '../../..');
 /** Path segments that mark a file as a build-output COPY of a source scene, not the
  *  authored file itself — a stale duplicate would double-report or false-positive on
  *  content the real fix already fixed. */
-const EXCLUDED_SEGMENTS = ['/node_modules/', '/dist/', '/android/', '/ios/', '/build/'];
+/*  `/ads/` is the `--target playable` output dir (`games/<id>/ads/`), gitignored at
+ *  `.gitignore:7` and tracked nowhere in the repo — so it holds a COPY of scenes this
+ *  guard already checks at their authored path, frozen at whatever the export ran on.
+ *  Without it here the gate goes red on any clone that has ever run a playable build,
+ *  citing files git does not even know about; the hub stays green only because it has
+ *  not run one. `/subgame-dist/` (`.gitignore:8`) is the sibling build-output dir under the
+ *  same roots and is listed for the same reason — the sibling guard in
+ *  `engine/tests/architecture/claudeMdBudget.test.ts` already excludes both. It is not
+ *  established that a subgame build ever emits a `.scene.json`; it is here so the next
+ *  person does not rediscover this the way `/ads/` was rediscovered. */
+const EXCLUDED_SEGMENTS = ['/node_modules/', '/dist/', '/android/', '/ios/', '/build/', '/ads/', '/subgame-dist/'];
 
 /** Where authored scenes and prefabs live: games, demos, the scaffolder template, and the
  *  engine's own test fixtures. */

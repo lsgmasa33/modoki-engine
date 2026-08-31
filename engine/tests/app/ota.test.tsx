@@ -151,3 +151,51 @@ describe('#437 checkAppOtaUpdate / the blocking gate', () => {
     expect(remove).toHaveBeenCalledTimes(1);
   });
 });
+
+// #509: `pending` means "staged, waiting for a restart" — NOT "already running". A concurrent
+// call that sees `pending === target` (because a SIBLING call staged it first) must hold the
+// mandatory gate exactly like the call that actually staged it, not treat it as up-to-date and
+// tear the gate down out from under the sibling.
+describe('#509 pending-restart must hold a mandatory gate the same as staged', () => {
+  it('mandatory pending-restart resolves false and leaves the gate at ready-to-restart', async () => {
+    const ota = await freshOta();
+    h.addListener.mockResolvedValue({ remove: vi.fn(async () => {}) });
+    h.checkForUpdate.mockResolvedValueOnce({ outcome: 'pending-restart', mandatory: true, version: 'v1' });
+
+    const snapshots: unknown[] = [];
+    ota.subscribeOtaGate((s) => snapshots.push(s));
+
+    const result = await ota.checkAppOtaUpdate();
+
+    expect(result).toBe(false);
+    expect(snapshots[snapshots.length - 1]).toEqual({ phase: 'ready-to-restart', version: 'v1' });
+  });
+
+  it('non-mandatory pending-restart resolves true and clears the gate', async () => {
+    const ota = await freshOta();
+    h.addListener.mockResolvedValue({ remove: vi.fn(async () => {}) });
+    h.checkForUpdate.mockResolvedValueOnce({ outcome: 'pending-restart', mandatory: false, version: 'v1' });
+
+    const snapshots: unknown[] = [];
+    ota.subscribeOtaGate((s) => snapshots.push(s));
+
+    const result = await ota.checkAppOtaUpdate();
+
+    expect(result).toBe(true);
+    expect(snapshots[snapshots.length - 1]).toBe(null);
+  });
+
+  // ⚠️ **A third test lived here and was DELETED for being vacuous — do not re-add it.** It mocked
+  // `checkForUpdate` → `{outcome:'up-to-date'}` and asserted `true` + a cleared gate, claiming to
+  // lock the brick-regression half of #509. It locked nothing: that mapping is already covered
+  // above, and reverting the entire `bootAttempts` discriminator left it green. The half it claimed
+  // to cover is only reachable through `checkForUpdate`'s REAL native-state parsing, which this file
+  // mocks away wholesale — so it belongs in `otaClient.test.ts`, where it now lives.
+  //
+  // The COMPOSED seam — two overlapping `checkAppOtaUpdate()` calls against one shared fake native
+  // whose `getState()` reflects its own `activate()` — lives in `otaGateSeam.test.tsx`, which does
+  // NOT mock `@modoki/engine/runtime` and so runs the real `checkForUpdate`. That split is
+  // deliberate: this file owns outcome → gate, `otaClient.test.ts` owns native state → outcome, and
+  // neither can see a bug that lives in the composition (#509 was exactly one). Add a mapping case
+  // here; add a race case there.
+});

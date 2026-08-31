@@ -36,6 +36,7 @@ export { Transient } from '../core/traits/Transient';
 export { Time } from '../core/traits/Time';
 export { HapticSettings } from './HapticSettings';
 export { AudioSettings } from './AudioSettings';
+export { UISettings } from './UISettings';
 export { Input } from './Input';
 export { UIElement, type UILengthUnit } from './UIElement';
 export { UIBinding } from './UIBinding';

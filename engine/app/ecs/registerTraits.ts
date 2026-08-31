@@ -3,7 +3,7 @@
 
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
-  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, Mask2D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, AudioSettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
+  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, Mask2D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, AudioSettings, UISettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
   UIElement, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
@@ -857,6 +857,14 @@ export function registerAllTraits() {
     fields: {
       sfxVoiceLimit: { type: 'number', min: 0, max: 64, step: 1, tooltip: 'Max concurrent fire-and-forget one-shots on the sfx bus; past it the OLDEST is stolen. Music is never capped, entity AudioSource voices are never stolen (a looping ambience would be the oldest voice forever), and the ui bus is uncapped. 0 or less = uncapped.' },
       sfxStealFadeSec: { type: 'number', min: 0, max: 1, step: 0.005, tooltip: 'Seconds a STOLEN one-shot ramps to silence before stopping. 0 = a hard cut, which clicks — an instant stop is an amplitude discontinuity on every steal. The 10ms default is below the threshold where a fade reads AS a fade, so it still stops abruptly, just cleanly.' },
+    },
+  });
+
+  registerTrait({
+    name: 'UISettings', trait: UISettings, category: 'resource',
+    fields: {
+      inputLockMinMs: { type: 'number', min: 0, max: 5000, step: 10, tooltip: 'Minimum time, ms, a UI input stays locked after a discrete activation (click, submit, a toggle\'s change), stopping a double tap from firing an action twice. The real gate is the action\'s own promise settling — this is only the floor for a synchronous action that settles instantly. 0 disables the floor (action-completion only), the escape hatch for a rapid-fire button. Must be ≤ Input Lock Max Ms — a smaller max is clamped up to this value.' },
+      inputLockMaxMs: { type: 'number', min: 100, max: 60000, step: 100, tooltip: 'Safety valve, ms. If the lock has been held longer than this, it is force-released (with a console warning) on the next acquire attempt, so a hung async handler cannot brick the UI permanently. Must be ≥ Input Lock Min Ms — a smaller value here is clamped up to the floor.' },
     },
   });
 

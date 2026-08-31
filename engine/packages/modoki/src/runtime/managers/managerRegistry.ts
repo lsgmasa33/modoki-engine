@@ -245,6 +245,25 @@ export async function initGameManagersFor(gameId: string | null, scenePath: stri
   if (pending.length) await Promise.all(pending);
 }
 
+/** Every in-flight manager `init()` promise across ALL scopes (app/game/scene),
+ *  or null when none are pending. The tracked promises swallow their own errors
+ *  (see `activate`), so the returned promise never rejects.
+ *
+ *  At the point SceneManager calls this (just before destroying the old world in
+ *  `loadScene`), it is normally a no-op: `disposeActiveSceneManagers` has already
+ *  awaited + deactivated scene managers (clearing their `initPromise`), and a
+ *  `gameChanged` swap has already awaited + deactivated game managers, with
+ *  `initGameManagersFor` running only AFTER the destroy. So a non-null result
+ *  here means an init was launched by a *different*, superseded `loadScene` call
+ *  (#468) — plus the app-scoped case of a manager registered just before a swap. */
+export function pendingManagerInits(): Promise<void> | null {
+  const pending: Promise<void>[] = [];
+  for (const entry of managers.values()) {
+    if (entry.active && entry.initPromise) pending.push(entry.initPromise);
+  }
+  return pending.length ? Promise.all(pending).then(() => {}) : null;
+}
+
 /** Registered manager names + scope/active state (for debugging). */
 export function getRegisteredManagers(): string[] {
   return [...managers.values()].map((e) => `${e.def.name} (${e.scope}${e.active ? ', active' : ''})`);

@@ -71,9 +71,39 @@ import {
 import {
   disposeActiveSceneManagers, initSceneManagersFor,
   disposeActiveGameManagers, initGameManagersFor, getActiveGameId,
+  pendingManagerInits,
 } from '../managers/managerRegistry';
 
 export type SceneState = 'loading' | 'ready' | 'active' | 'unloading';
+
+/** Upper bound, in ms, on how long a superseded world's destroy (#468, see below) may be
+ *  deferred behind an in-flight manager init. `managerRegistry.ts`'s `activate()` clears
+ *  `entry.initPromise` in a `.finally`, so a `Promise` that never SETTLES (a genuine hang, not
+ *  a rejection — those are swallowed) leaves `initPromise` non-null forever; `pendingManagerInits`
+ *  then collects it on EVERY later swap, so every later `oldWorld.destroy()` would chain behind
+ *  it and never run — koota caps total worlds at 16, so that leaks a world slot on every
+ *  subsequent scene swap and the engine breaks after ~16 of them.
+ *
+ *  This is a structural safety bound, not a feel knob — it does not belong on a config resource
+ *  (CLAUDE.md's single-source-of-truth table reserves code constants for exactly this: a
+ *  genuine invariant, not a tunable). Past this bound we deliberately accept the ORIGINAL #468
+ *  hazard (a hung manager's `init()` can write into an already-destroyed world) rather than
+ *  leak a world slot on every subsequent swap — the leak compounds forever, the hazard does
+ *  not (it only bites the one hung manager, which is already broken). Mirrors the same trade
+ *  `UISettings.inputLockMaxMs` makes for the UI input lock (#466): a safety valve must never be
+ *  allowed to block forever, even though that means occasionally accepting the thing it exists
+ *  to prevent.
+ *
+ *  The bound exists to stop an UNBOUNDED wait (a never-settling init leaking a world slot on
+ *  every later swap), not to be tight — by the time this fires, `disposeActiveSceneManagers`
+ *  has already awaited every scene-scoped init, so what's left pending here is essentially only
+ *  a SUPERSEDED load's game-scoped init (save-game sync, an SDK init) still running. On a bad
+ *  connection that can plausibly exceed 10s, and firing early destroys the world out from under
+ *  it — reintroducing the #468 crash the deferral exists to prevent, now with a warning instead
+ *  of silence. A longer bound is strictly safer: lengthening it only holds one dead world
+ *  longer, shortening it risks the hazard above. 30s is comfortably past any plausible real
+ *  init while still bounding the leak. */
+export const WORLD_DESTROY_DEFER_MAX_MS = 30_000;
 
 export interface Scene {
   readonly id: SceneId;
@@ -879,8 +909,47 @@ class SceneManagerImpl implements SceneManager {
       // Free the old world's slot in koota's worldId pool. koota caps total
       // worlds at 16; without this, every scene swap permanently consumes a
       // slot and the engine breaks after ~16 swaps.
-      if (oldWorld !== promotedWorld) {
+      const destroyOldWorld = () => {
         try { oldWorld.destroy(); } catch (e) { console.warn('[SceneManager] Failed to destroy old world:', e); }
+      };
+      if (oldWorld !== promotedWorld) {
+        // #468: a SUPERSEDED load's game-scoped manager can still be inside an
+        // async init() holding `ctx.world === oldWorld` — its own load already
+        // passed `initGameManagersFor` before this later load committed its swap,
+        // and (see the comment below) nothing re-activates or awaits it from
+        // here. Defer the destroy until every in-flight manager init has
+        // settled, so that init never writes into an already-destroyed world.
+        // NOT awaited — a slow init (an LLM download is the documented case)
+        // must not block THIS load; the koota worldId slot is simply freed a
+        // little later, as soon as it is safe.
+        //
+        // Bounded, not open-ended: a manager init that never SETTLES (a hang, not a rejection —
+        // rejections are swallowed by `activate()`) would otherwise leave `pendingManagerInits()`
+        // non-null forever, chaining every LATER swap's destroy behind it and leaking a koota
+        // world slot on each one. Race against `WORLD_DESTROY_DEFER_MAX_MS` and destroy anyway
+        // when the timeout wins — see that constant's comment for the deliberate trade.
+        const inFlight = pendingManagerInits();
+        if (inFlight) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timeout = new Promise<void>((resolve) => {
+            timer = setTimeout(() => {
+              console.warn(
+                `[SceneManager] old world destroy deferred past ${WORLD_DESTROY_DEFER_MAX_MS}ms `
+                + `waiting on an in-flight manager init — destroying anyway (see WORLD_DESTROY_DEFER_MAX_MS).`,
+              );
+              resolve();
+            }, WORLD_DESTROY_DEFER_MAX_MS);
+          });
+          void Promise.race([inFlight, timeout]).then(() => {
+            // Clear the timer either way — if `inFlight` won the race, an armed timer left
+            // behind would otherwise keep e.g. a test's fake-timer clock (or, in a headless
+            // Node run, the process itself) alive for no reason.
+            if (timer !== undefined) clearTimeout(timer);
+            destroyOldWorld();
+          });
+        } else {
+          destroyOldWorld();
+        }
       }
 
       // 11. Fire per-scene callbacks for dynamic entity spawning, then activate
@@ -897,15 +966,17 @@ class SceneManagerImpl implements SceneManager {
       //
       // This guard closes the SCENE-scoped tier: a superseded tail can no longer
       // rewrite `activeScenePath` or spawn scene managers into the newer load's
-      // world. A residual remains for the GAME-scoped tier when the game did NOT
-      // change: `gameChanged` is computed from `activeGameId`, which the superseded
-      // load already set before it got here, so the NEWER load also sees
+      // world. For the GAME-scoped tier when the game did NOT change:
+      // `gameChanged` is computed from `activeGameId`, which the superseded load
+      // already set before it got here, so the NEWER load also sees
       // `gameChanged === false` and skips both `disposeActiveGameManagers` and
-      // `initGameManagersFor` for it — meaning nothing re-activates the game
-      // managers, and the superseded load's own game-manager `init()` may still be
-      // in flight when its world is destroyed above, so that manager can spawn
-      // into a destroyed world and stay `active` holding a dead world reference.
-      // Not fixed here — tracked as TODO(#435-residual).
+      // `initGameManagersFor` for it — nothing re-activates or awaits the
+      // superseded load's game manager here. What no longer happens (#468): that
+      // manager's `init()` can no longer spawn into a DESTROYED world, because
+      // the destroy above is deferred behind every in-flight manager init. What
+      // remains, deliberately, not a bug: the manager stays `active` holding a
+      // world that is no longer current — identical to the ordinary in-game-swap
+      // outcome, since game managers survive in-game swaps by design.
       if (this.primaryId === id) {
         this.fireSceneCallbacks(path);
 

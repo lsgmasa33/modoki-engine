@@ -112,6 +112,46 @@ describe('getDeviceWdaSession', () => {
     const f: WdaFetch = async () => { throw new Error('ECONNREFUSED'); };
     expect(await getDeviceWdaSession({ host: '10.0.0.5', fetchImpl: f })).toBeNull();
   });
+
+  it('a different host does not get the previous device\'s session (#519)', async () => {
+    const f1 = fakeFetch({ '/status': OK, '/session': { sessionId: 'S-IPAD', value: null } });
+    const s1 = await getDeviceWdaSession({ host: '10.0.0.5', fetchImpl: f1 });
+    expect(s1?.sessionId).toBe('S-IPAD');
+    const f2 = fakeFetch({ '/status': OK, '/session': { sessionId: 'S-AIR', value: null } });
+    const s2 = await getDeviceWdaSession({ host: '10.0.0.9', fetchImpl: f2 });
+    expect(s2?.sessionId).toBe('S-AIR');
+    expect(s2?.baseUrl).toContain('10.0.0.9');
+    expect(f2.calls.some((c) => c.url.endsWith('/session'))).toBe(true);
+  });
+
+  it('the same host DOES reuse the cached session — a guard against a legitimate reuse', async () => {
+    const f = fakeFetch({ '/status': OK, '/session': { sessionId: 'S9', value: null } });
+    const s1 = await getDeviceWdaSession({ host: '10.0.0.5', fetchImpl: f });
+    const s2 = await getDeviceWdaSession({ host: '10.0.0.5', fetchImpl: f });
+    expect(s2).toBe(s1);
+    expect(f.calls.filter((c) => c.url.endsWith('/session') && c.method !== 'DELETE').length).toBe(1);
+  });
+
+  it('a call with no host drops the cached session rather than handing it over (#519)', async () => {
+    const f1 = fakeFetch({ '/status': OK, '/session': { sessionId: 'S9', value: null } });
+    await getDeviceWdaSession({ host: '10.0.0.5', fetchImpl: f1 });
+    const noHost = await getDeviceWdaSession({ fetchImpl: fakeFetch({}) });
+    expect(noHost).toBeNull();
+    // Prove the cache was actually CLEARED, not merely bypassed: the next call for the SAME host
+    // must rediscover rather than hand back the stale S9 session.
+    const f2 = fakeFetch({ '/status': OK, '/session': { sessionId: 'S-NEW', value: null } });
+    const s3 = await getDeviceWdaSession({ host: '10.0.0.5', fetchImpl: f2 });
+    expect(s3?.sessionId).toBe('S-NEW');
+  });
+
+  it('a different port on the same host does not share a session', async () => {
+    const f1 = fakeFetch({ '/status': OK, '/session': { sessionId: 'S-8100', value: null } });
+    const s1 = await getDeviceWdaSession({ host: '10.0.0.5', port: 8100, fetchImpl: f1 });
+    expect(s1?.sessionId).toBe('S-8100');
+    const f2 = fakeFetch({ '/status': OK, '/session': { sessionId: 'S-8101', value: null } });
+    const s2 = await getDeviceWdaSession({ host: '10.0.0.5', port: 8101, fetchImpl: f2 });
+    expect(s2?.sessionId).toBe('S-8101');
+  });
 });
 
 // ── Routing ───────────────────────────────────────────────────────────────────

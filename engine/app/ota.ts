@@ -141,7 +141,13 @@ export async function checkAppOtaUpdate(): Promise<boolean> {
     });
     console.log('[GameShell] OTA checkForUpdate result:', result);
 
-    if (result.outcome === 'staged' && result.mandatory) {
+    // #509: a mandatory update this call did NOT stage, because a CONCURRENT call already staged it,
+    // is still a mandatory update this launch must not boot past. `pending` is durable native state;
+    // `outcome` is a fact about this call. Asking the per-call question to answer the durable one is
+    // what let a game-swap re-check tear the gate down and boot behind it.
+    const mandatoryHold =
+      (result.outcome === 'staged' || result.outcome === 'pending-restart') && result.mandatory;
+    if (mandatoryHold) {
       setGateIfCurrent({ phase: 'ready-to-restart', version: result.version });
       return false;
     }

@@ -123,6 +123,19 @@ describe('NavigationManager', () => {
     expect(loadScene).not.toHaveBeenCalled();
   });
 
+  it('engine.loadScene / engine.navigateBack return a thenable (#466: applyBindings\' trackLockPromise tracks it)', () => {
+    // `applyBindings` holds the global input lock open until a 'call' handler's RETURNED
+    // promise settles. These two built-ins used to `void` the promise instead of returning it,
+    // so the lock lifted on the 300ms floor alone and a double-tap could fire loadScene twice
+    // (#435/#468). Assert the action registry actually gets a thenable back, not just that the
+    // underlying navigation happened.
+    const loadResult = dispatchUIAction('engine.loadScene', { payload: '/scenes/Menu.json' });
+    expect(loadResult).toBeInstanceOf(Promise);
+
+    const backResult = dispatchUIAction('engine.navigateBack');
+    expect(backResult).toBeInstanceOf(Promise);
+  });
+
   it('exposes canGoBack as a UI read source', async () => {
     expect(getReadValue('canGoBack')).toBe(false);
     currentPath = '/scenes/A.json';

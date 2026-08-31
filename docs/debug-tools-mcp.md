@@ -340,6 +340,31 @@ host — a first-wins plugin refuses an extra client by dropping the socket with
 byte-for-byte what a dead device end looks like through a forward — so `explainConnectFailure` names
 both rather than guessing, and the connect no longer keeps its hardware claim when it fails.
 
+⚠️ **The #164 release is guarded on a generation counter, and the guard is one line from being
+silently disabled (#506).** `connect()` ends with
+`if (landed !== 'connected' && generation === this.sessionGeneration) this.releaseClaim();`, and
+`sessionGeneration` is bumped by `disconnect()` **as well as** by `connect()`. Since `connect()`
+calls `await this.disconnect()` at its own head, **the capture must sit BELOW that teardown.** Move
+it back above — which reads like a harmless tidy-up, since "bump at the head of every connect" is
+what the field originally meant — and the capture is stale on *every* connect rather than only a
+raced one, so the comparison can never be true and #164's release never fires again.
+
+Nothing errors when that happens. Failed connects simply stop handing the hardware back, the
+machine-wide claim stands, and the retry is refused as busy **naming this very clone** — so the
+caller's own dead attempt looks exactly like a sibling clone hogging the phone, which is the single
+most misleading shape this subsystem can fail in. `deviceConnectionReentrancy.test.ts` carries a
+regression test whose only job is to fail if the capture moves.
+
+**A superseded continuation must never reclaim the adb forward.** The same #506 fix originally
+unwound a superseded rediscovery with `adbRunner.removeForward(port, serial)`, which review caught
+before it shipped. `port` is the per-clone host-port **constant** and `removeForward` is
+host-port-scoped, with an ownership check that *passes* for a same-manager supersede — so the loser
+tore out the **winner's** live tunnel. The end state is the worst kind: manager, claims file and
+editor panel all report `connected` while every `device_*` call fails, the reconnect loop retries a
+dead port forever, and the claim is still held so no sibling clone can take the phone either.
+Reclaiming a forward belongs to whoever OWNS the session — `disconnect()` already does it for its
+own — never to a stale continuation.
+
 **When the OPEN PROJECT ships `build.debugBuild: false`, the message says so first (#239)** — that
 flag means no TCP server was compiled in, which explains "nothing is listening" outright, and the
 advice below (reopen the project so heal syncs the flag) *cannot work* while the flag is off,

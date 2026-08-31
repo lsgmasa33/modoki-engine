@@ -198,8 +198,7 @@ type DeviceListReply = {
   note?: string;
 };
 
-/** Which device the lease currently points at, as a comparable key ("adb" / "192.168.1.5:8095"),
- *  or null when nothing is connected.
+/** WHY the lease is stamped onto a measurement at all.
  *
  *  `adbScreenInfo` converts screenshot pixels to device pixels for `device_tap`/`device_drag`, and
  *  it was only invalidated by taking ANOTHER screenshot. So a lease that changed in between — the
@@ -208,21 +207,39 @@ type DeviceListReply = {
  *  it landed somewhere else entirely and reported success. Stamping the dims with the lease they
  *  were measured under makes that detectable rather than silent, and covers the human path too
  *  (this MCP is not told when the panel reconnects). */
+/** Pure: turn a status reply into a comparable lease key, or null when nothing is connected.
+ *  Exported so it can be unit-tested directly and so `leaseAdbTarget()` (#471) can derive its own
+ *  key from the SAME reply it read `useAdb`/`serial` from, rather than a second, later fetch.
+ *
+ *  #471 (this fix): `serial` (#149) IS carried on an adb lease's `target`, so two adb leases on
+ *  this machine now key distinctly (`adb:SERIAL_A` vs `adb:SERIAL_B`) instead of colliding on the
+ *  literal string 'adb'. The remaining honest limit: a USB phone physically swapped WITHOUT the
+ *  lease being reconnected still reports the OLD serial — the status route only knows what it
+ *  resolved at connect time, not what's plugged in right now. A serial-less adb lease (a status
+ *  shape that doesn't carry one) degrades to the constant key `'adb:'`, i.e. today's pre-#149
+ *  behaviour — no worse than before, just no longer the *only* case. */
+export function statusLeaseKey(s: DeviceStatusReply | null | undefined): string | null {
+  if (s?.state !== 'connected' || !s.target) return null;
+  return s.target.useAdb ? `adb:${s.target.serial ?? ''}` : `${s.target.host}:${s.target.port}`;
+}
+
+/** Which device the lease currently points at, as a comparable key
+ *  (`adb:R5CT30…` / `192.168.1.5:8095`), or null when nothing is connected or the backend is
+ *  unreachable. One status fetch; the key shape itself is `statusLeaseKey` above. */
 async function leaseKey(): Promise<string | null> {
   try {
-    const s = (await backendGet('/api/device/status')) as DeviceStatusReply;
-    if (s?.state !== 'connected' || !s.target) return null;
-    // NOTE the honest limit here (independent review, 2026-07-30). This used to read
-    // `t.serial ?? t.deviceId` and claim it closed the USB-device-swap case — but neither field
-    // exists on `DeviceConnectStatus` (see DEVICE_STATUS_TARGET_FIELDS below, drift-guarded), so
-    // every adb lease keyed to the literal string 'adb:' and the check it feeds could never fire.
-    // A guard that cannot fire is worse than none: its comment tells the next reader the case is
-    // covered. The status route does not carry a device identity, so the stamp cannot distinguish
-    // two adb leases; say so rather than imply otherwise. Swapping the USB phone WITHOUT
-    // reconnecting can still leave the previous device's capture dims live — to close that
-    // properly the lease has to report a serial, which is a deviceConnection change, not one here.
-    return s.target.useAdb ? 'adb' : `${s.target.host}:${s.target.port}`;
+    return statusLeaseKey((await backendGet('/api/device/status')) as DeviceStatusReply);
   } catch { return null; }
+}
+
+/** The measured dims are only usable if the lease did not move during the capture (#471). `before`
+ *  is the lease key read BEFORE the (1-3s) capture, `after` is read AFTER — stamping `after` onto
+ *  dims measured under `before` would launder a stale entry into one that looks fresh. Two
+ *  `null`s ("unknown" on both sides) do NOT count as a match — a naive `before === after` gets
+ *  this wrong, since `null === null` is true in JS but neither read actually observed a lease. */
+export function screenInfoIfLeaseHeld<T>(before: string | null, after: string | null, dims: T): (T & { lease: string }) | null {
+  if (before === null || before !== after) return null;
+  return { ...dims, lease: before };
 }
 
 /** The adb screenshot dims IF they were measured under the lease that is live right now.
@@ -358,12 +375,17 @@ async function leaseUsesAdb(): Promise<boolean> {
  *  because a lease that changed between two separate fetches (the human reconnecting mid-call)
  *  could answer the two questions inconsistently. Used only by `device_screenshot`'s adb branch,
  *  which is the one place that needs to hand a serial down to `adbAvailable`/`adbScreencap`; every
- *  other adb gate in this file only needs the boolean and keeps using `leaseUsesAdb()` above. */
-async function leaseAdbTarget(): Promise<{ useAdb: boolean; serial?: string }> {
+ *  other adb gate in this file only needs the boolean and keeps using `leaseUsesAdb()` above.
+ *
+ *  `lease` (#471) is `statusLeaseKey()` of this SAME reply — so the serial handed to
+ *  `adbScreencap` and the key stamped onto the pre-capture measurement provably describe the same
+ *  lease, rather than the key being re-read after the 1-3s capture (during which the lease can
+ *  move to a different device). */
+async function leaseAdbTarget(): Promise<{ useAdb: boolean; serial?: string; lease: string | null }> {
   try {
     const s = (await backendGet('/api/device/status')) as DeviceStatusReply;
-    return { useAdb: s?.target?.useAdb === true, serial: s?.target?.serial };
-  } catch { return { useAdb: false }; }
+    return { useAdb: s?.target?.useAdb === true, serial: s?.target?.serial, lease: statusLeaseKey(s) };
+  } catch { return { useAdb: false, lease: null }; }
 }
 
 // ── Backend HTTP helpers ─────────────────────────────────────
@@ -1275,12 +1297,21 @@ export function registerTools(server: McpServer) {
         const adbTarget = await leaseAdbTarget();
         if (adbTarget.useAdb && await adbAvailable(adbTarget.serial)) {
           const cap = await adbScreencap(savePath, inline, adbTarget.serial);
-          adbScreenInfo = { imgW: cap.imgW, imgH: cap.imgH, nativeW: cap.nativeW, nativeH: cap.nativeH, lease: (await leaseKey()) ?? 'adb' };
+          // The lease can move DURING the 1-3s capture — a claim is machine-wide, so any sibling clone's
+          // device_connect can take it (#471). Stamping the POST-capture key onto PRE-capture dims would
+          // launder a stale entry into one that passes currentScreenInfo's guard, so re-read and discard
+          // the measurement when it moved. `adbScreenInfo = null` is the established "we don't know" answer.
+          adbScreenInfo = screenInfoIfLeaseHeld(adbTarget.lease, await leaseKey(), {
+            imgW: cap.imgW, imgH: cap.imgH, nativeW: cap.nativeW, nativeH: cap.nativeH,
+          });
           // Same VITEST guard as `renderScreenshot` — this branch needs adb + an adb lease, so no
           // test reaches it TODAY, but it is the identical defect and one adb-path test away from
           // opening Preview windows during `npm test`.
           if (process.platform === 'darwin' && !process.env.VITEST) void pExecFile('open', ['-a', 'Preview', cap.path]).catch(() => {}); // fire-and-forget (macOS)
-          const info = `[adb] ${cap.imgW}x${cap.imgH} (from ${cap.nativeW}x${cap.nativeH}). Use these pixel coordinates for device_tap/device_drag.`;
+          const info = adbScreenInfo
+            ? `[adb] ${cap.imgW}x${cap.imgH} (from ${cap.nativeW}x${cap.nativeH}). Use these pixel coordinates for device_tap/device_drag.`
+            : `[adb] ${cap.imgW}x${cap.imgH} (from ${cap.nativeW}x${cap.nativeH}). ⚠️  The device lease changed DURING this capture — ` +
+              `these pixels are NOT a valid aim space for device_tap/device_drag, and the image may be of the PREVIOUS device. Re-take the screenshot.`;
           return inline
             ? { content: [{ type: 'image' as const, data: cap.base64, mimeType: cap.mimeType }, { type: 'text' as const, text: info }] }
             : { content: [{ type: 'text' as const, text: describeScreenshot(info, cap.path, cap.bytes) }] };

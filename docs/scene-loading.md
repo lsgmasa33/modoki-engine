@@ -86,7 +86,7 @@ entries) can't strand an owner.
 **Editor live-preview caches** (particle defs in `particleCache.ts`) are plain data, cleared via
 `clearParticleCache()` from `disposeAllCachedResources()` on full teardown.
 
-### The mid-load release window (#488)
+### The mid-load release window (#488, #520)
 
 `acquireModel`/`acquireMesh` both add the caller's `sceneId` owner **before** awaiting their load
 (`loadModelTemplates`/`fetchMeshAsset`), so the owner is visible to a concurrent
@@ -96,7 +96,14 @@ cached — after which the resumed load repopulates the cache with owner-less ge
 will ever release again (`invalidateModel` doesn't bump `cacheGeneration`, only wholesale teardown
 does, so `loadModelTemplates`'s generation guard doesn't catch this).
 
-Three sites were suspected under #488; only one is fixed.
+Three sites were suspected under #488; only one is fixed. **#520 then found the window was not
+specific to geometry** — the same shape existed for two more resource KINDS, and both are now
+fixed. What made it easy to miss: the `cacheGeneration` guards inside the loaders read as if they
+already covered this. They do not, and the comment on the GLB one said so in as many words ("teardown
+/ scene-swap") until #520 corrected it. **Only `disposeAllCachedResources` bumps that counter;
+`releaseAllForScene` never does.** So a generation check is not a substitute for an owner check, and
+a site that has only the former is unguarded.
+
 
 - **Fixed — `acquireModel`'s own window.** A post-await guard (mirroring `acquireMesh`'s existing
   one) checks, after the load resolves: was *my* `sceneId` released while I was awaiting (`!has`),
@@ -116,6 +123,18 @@ Three sites were suspected under #488; only one is fixed.
   time this guard runs — so "is the owner set now empty" can never free something a live scene owns.
   A per-scene `cacheGeneration` bump was considered and rejected: it would invalidate in-flight
   loads belonging to other, unrelated live scenes.
+
+- **Fixed (#520) — `acquireMaterial` and `acquirePrefab`.** Same shape as `acquireModel`'s window
+  and the same `!has` + `!size` guard, so the reasoning above carries over unchanged. The one
+  difference worth knowing is the disposal answer: `acquireModel` calls `invalidateModel`, which
+  disposes; `acquireMaterial` calls **`invalidateMaterial`, which RETIRES** — it moves the instance
+  to `retiredMaterials` for the render sweep to free once no live surface binds it, rather than
+  disposing it where it stands. That is #317's rule, and it applies here for the same reason it
+  applies everywhere else: the outgoing scene can still be on screen for a frame or two after the
+  swap, and `disposeMaterial` would also release the material's shared textures out from under it.
+  `acquirePrefab` just deletes from `prefabCache` — parsed JSON, no GPU resource, and
+  `fetchPrefab`'s `finally` has already cleared `prefabLoadPromises` by the time the guard runs, so
+  there is no stale promise left to short-circuit the next fetch.
 
 - **Won't-fix — `acquireMesh`'s transitive model window.** `acquireMesh` adds its own MESH owner
   before its await and already guards that window (the `:1552`-area check). But it also
@@ -173,7 +192,14 @@ authored intent — so this is purely about making a scene diff readable, and ab
 **The rule lives in ONE place: `orderEntitiesForSave` in
 `runtime/core/ecs/entityOrder.ts`** (#500). `serializeScene` writes with it, `buildEntityTree`
 (the Hierarchy panel) sorts with it, and `engine/tests/assets/sceneEntityOrder.test.ts` asserts
-every committed scene file is already in it. It is a leaf module precisely so the guard can
+every committed scene file is already in it. ⚠️ **"Committed" is the guard's premise but not how
+it finds files** — it walks the filesystem under `games/`/`demos/` and subtracts
+`EXCLUDED_SEGMENTS`, so a gitignored BUILD-OUTPUT copy of a scene reads to it as an authored file.
+`/ads/` (the `--target playable` output) had to be added to that list after the gate went red on
+seven `games/3d-test/ads/**.scene.json` files git does not track — stale export copies of scenes
+the guard already checks at their authored path. Anything that emits a scene copy into a new
+directory needs the same entry, or every clone that has run that build gets a red gate while the
+hub, which has not, stays green. It is a leaf module precisely so the guard can
 share it — a test that re-implemented the sort would drift from what actually gets written, and
 then agree with itself while disagreeing with the editor.
 
@@ -1069,7 +1095,10 @@ single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistenc
    `onWorldSwap`, which editor panels read `loadedScenes` from, so the rebuild must
    happen first or a base's Hierarchy label falls back to its raw guid. Then
    `releaseAllForScene(id)` for every `toDrop` scene id drops its refcounts; then
-   `oldWorld.destroy()` frees the koota slot.
+   `oldWorld.destroy()` frees the koota slot — deferred (not awaited) behind any
+   in-flight manager `init()` (`pendingManagerInits()`, #468) so a manager still
+   writing into the old world during its async init never writes into an
+   already-destroyed one.
 9. **Post-swap tail — guarded by `this.primaryId === id`.** Scene callbacks
    (`registerSceneCallback`) fire for dynamic spawning, then this scene's managers
    activate: the previous scene's (and, on a game change, the previous game's)
@@ -1090,15 +1119,17 @@ single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistenc
    an abort through. `primaryId` is reassigned at every swap, so inequality alone is
    the "superseded" signal.
 
-   **Known and deliberately not fixed here (tracked as `TODO(#435-residual)` in the
-   source): this closes only the SCENE-scoped half of the tail.** When the game did
+   **This guard closes only the SCENE-scoped half of the tail.** When the game did
    NOT change, `gameChanged` is computed from `activeGameId`, which the superseded
    load already wrote before reaching this guard — so the newer load also computes
    `gameChanged === false` and skips both `disposeActiveGameManagers` and
-   `initGameManagersFor` for it. Nothing then re-activates the game-scoped managers,
-   and the superseded load's own game-manager `init()` can still be in flight when
-   its world is destroyed in step 8, so that manager can spawn into an already-
-   destroyed world and stay `active` holding a dead world reference.
+   `initGameManagersFor` for it. Nothing re-activates or awaits the superseded
+   load's game-scoped manager here. What no longer happens (#468): its `init()`
+   can no longer write into an already-destroyed world, because step 8's destroy
+   is deferred behind every in-flight manager init. What remains, deliberately,
+   not a bug: the manager stays `active` holding a world that is no longer
+   current — identical to the ordinary in-game-swap outcome, since game managers
+   survive in-game swaps by design.
 
 On **failure or abort**, the staging world is destroyed and its resources released —
 the current scene (and its whole chain) is left completely untouched.

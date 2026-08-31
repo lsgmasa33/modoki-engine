@@ -68,8 +68,20 @@ class NavigationManagerImpl implements ManagerDef {
   }
 
   actions = {
-    'engine.loadScene': ({ payload }: UIActionContext) => { void this.loadScene(payload); },
-    'engine.navigateBack': () => { void this.back(); },
+    // Return (not `void`) the promise — `applyBindings`' `trackLockPromise` (#466) duck-types
+    // a 'call' handler's return value and holds the global input lock open until it settles.
+    // `void`-ing it made these two built-ins the one gap in the owner's "wait for the button
+    // action to be done" ruling: with nothing to await, the lock lifted on the 300ms floor
+    // alone, so a Play button bound to `engine.loadScene`, tapped at t=0 and t=350ms against a
+    // ~2s load, fired the load TWICE — the exact overlapping-load race #435/#468 exist to
+    // contain. `UIActionHandler` is `=> unknown`, so returning the promise here is legal.
+    // ⚠️ Honest caveat: the lock is released by `bindings.ts`'s `onWorldSwap` hook at the scene
+    // SWAP, not when this promise finally resolves — `loadScene`'s own promise settles slightly
+    // AFTER the swap it triggers. So this covers the pre-swap window (chain resolution,
+    // resource acquisition), which is where a double-tap actually lands, not the post-swap
+    // tail. That's intended, not a shortcut: a new scene should start with fresh input.
+    'engine.loadScene': ({ payload }: UIActionContext) => this.loadScene(payload),
+    'engine.navigateBack': () => this.back(),
   };
 
   init(): void {

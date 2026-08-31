@@ -98,6 +98,9 @@ export { HapticSettings } from './traits/HapticSettings';
 export {
   AudioSettings, AUDIO_SETTINGS_DEFAULT_LIMIT, AUDIO_SETTINGS_DEFAULT_STEAL_FADE,
 } from './traits/AudioSettings';
+export {
+  UISettings, UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS, UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS,
+} from './traits/UISettings';
 // Host platform / form factor — the single source of truth for "is this a handheld?", asked
 // by the renderer's quality tier AND by on-screen touch controls.
 export { isTouchDevice, readFormFactor, readPlatform } from './core/formFactor';

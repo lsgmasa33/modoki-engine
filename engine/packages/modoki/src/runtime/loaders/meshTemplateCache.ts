@@ -521,9 +521,13 @@ export function loadModelTemplates(
       try {
         const model = gltf.scene;
 
-        // Disposed (teardown / scene-swap) while this GLB was loading → promote
-        // nothing, dispose everything we just parsed, and bail. Without this the
-        // templates below would land in the now-cleared cache with no owner. (F11)
+        // Disposed (disposeAllCachedResources — full teardown, NOT a scene swap;
+        // releaseAllForScene does not bump cacheGeneration) while this GLB was
+        // loading → promote nothing, dispose everything we just parsed, and
+        // bail. Without this the templates below would land in the
+        // now-cleared cache with no owner. (F11) The scene-swap case (an
+        // aborted load whose owner was released mid-await) is handled instead
+        // by acquireModel's post-await owner guard (#520).
         if (gen !== cacheGeneration) {
           const droppedTex = new Set<string>();
           model.traverse((child) => {
@@ -1665,6 +1669,24 @@ export async function acquireMaterial(sceneId: SceneId, matRef: string): Promise
   if (!matPath || !matPath.endsWith('.mat.json')) return;
   addOwner(materialOwners, matPath, sceneId);
   await fetchMaterial(matPath);
+
+  // Released mid-load → discard the result, mirroring the post-await guards in
+  // `acquireMesh` and `acquireModel`. releaseAllForScene is synchronous and can
+  // land inside the await above (SceneManager aborts an in-flight load at
+  // SceneManager.ts:279 and releases its sceneId at :280; that abort doesn't
+  // reach fetchMaterial, which isn't abortable) — and every LATER
+  // releaseAllForScene for this sceneId is a no-op, because those only visit
+  // paths whose owner set still contains the id, which is exactly what this one
+  // just drained. (SceneManager.ts:926 really does re-release these ids from the
+  // aborted load's catch — it simply cannot see the entry fetchMaterial is about
+  // to re-seat.) So without this the material, and every texture it holds, is
+  // pinned until app teardown. Retire rather than dispose (#317) — a live mesh
+  // may still bind it for a frame or two after the swap. Only if nobody else
+  // owns it, so a second, still-live scene sharing the load keeps its entry. (#520)
+  if (!materialOwners.get(matPath)?.has(sceneId)) {
+    if (!materialOwners.get(matPath)?.size) invalidateMaterial(matPath);
+    return;
+  }
 }
 
 /** Release a .mat.json material for a scene. Disposes when refcount hits zero. */
@@ -1689,6 +1711,19 @@ export async function acquirePrefab(sceneId: SceneId, prefabRef: string): Promis
   if (!prefabPath) return;
   addOwner(prefabOwners, prefabPath, sceneId);
   await fetchPrefab(prefabPath);
+
+  // Released mid-load → discard the result, same shape as acquireMaterial above,
+  // and see that comment for why a later releaseAllForScene cannot recover this
+  // (#520). fetchPrefab isn't abortable either, so SceneManager's abort at
+  // SceneManager.ts:279 does not reach it. A plain cache delete is the whole
+  // disposal answer here — parsed JSON, no GPU resource — and fetchPrefab's
+  // `finally` has already cleared prefabLoadPromises by the time this runs, so
+  // there is no resolved promise left to short-circuit the next fetch. Only if
+  // nobody else owns it, so a second, still-live scene sharing the load keeps it.
+  if (!prefabOwners.get(prefabPath)?.has(sceneId)) {
+    if (!prefabOwners.get(prefabPath)?.size) prefabCache.delete(prefabPath);
+    return;
+  }
 }
 
 // ── Environment (HDR) ────────────────────────────────────

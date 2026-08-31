@@ -87,7 +87,8 @@ crash a game the player is already looking at:
 
 `up-to-date` · `no-release-for-bundle` · `signature-invalid` · `engine-api-too-old` ·
 `manifest-invalid` · `no-bundle-zip-in-manifest` · `version-rejected` · `staged` (carries
-`mandatory: boolean`, mirroring `release.mandatory`)
+`mandatory: boolean`, mirroring `release.mandatory`) · `pending-restart` (target is already
+`pending` natively but never served — carries `version` + `mandatory`; see #509 below)
 
 **Called from the app shell, not game code** (`engine/app/App.tsx` → `engine/app/ota.ts`),
 BEFORE the scene loads — deliberately, so the blocking gate below has a call site that runs
@@ -108,14 +109,15 @@ actionable, BEFORE the manifest fetch — with `{version, mandatory}`, so a call
 blocking UI for the WHOLE download instead of only after it completes. `engine/app/ota.ts`
 wires both into a tiny pub/sub `OtaGateState` (`'downloading'` with live progress, or
 `'ready-to-restart'`) that `App.tsx` subscribes to: `checkAppOtaUpdate()` resolves `false`
-when a mandatory update just finished staging, and the caller must never load the scene for
+when a mandatory update just finished staging **on this call, or is already staged
+(`pending-restart`) and awaiting a restart**, and the caller must never load the scene for
 the rest of that app launch — `LoadingOverlay` (now with a `progress` prop: a determinate bar
 when `bytesTotal>0`, an indeterminate sliding one otherwise) shows the download, then
 `OtaRestartGate` takes over as a dead end ("Please close and reopen the app to continue.") —
 never a mid-session hot-swap, which would bypass the two-boot confirm the watchdog is built
-around. A routine (non-mandatory) release, any error, or nothing-to-do all resolve `true` —
-boot proceeds normally, staging (if any) continues in the background exactly as before Phase
-3b.
+around. A routine (non-mandatory) release, any error, or a target already `active`/genuinely
+`up-to-date` all resolve `true` — boot proceeds normally, staging (if any) continues in the
+background exactly as before Phase 3b.
 
 **`ready-to-restart` is sticky and terminal (#437).** Once `setGate` has been called with
 `{phase: 'ready-to-restart', ...}`, a subsequent `setGate(null)` is refused regardless of
@@ -132,6 +134,46 @@ call is never cancelled. Two guards close that race:
   `'ready-to-restart'`** — without it, a re-entrant call would find nothing left to stage,
   resolve `true`, and let `App.tsx` load a scene and run the whole game underneath a gate the
   user cannot dismiss.
+
+**A staged mandatory update outlives the call that staged it (#509).** The two guards above
+close the re-entrancy race for a call that finds nothing left to stage — but a re-entrant call
+CAN still find something: call A arms the gate and is mid-download when call B (the same
+`[gameId]` boot effect, re-running on a game swap) starts. The `ready-to-restart` guard doesn't
+stop it — the gate is only `'downloading'` at that point — and B's `++otaCheckGeneration` makes
+every later gate write from A a permanent no-op. A then `activate()`s, writing `pending[bundle]`;
+B's `checkForUpdate` sees `pending === target`, and under the old code that collapsed to
+`up-to-date`, so B resolved `true` and cleared the gate out from under A — the game booted past
+a mandatory update. The shape is #501's: the code asked *"did THIS call stage something
+mandatory?"* to answer *"is there a mandatory update this launch must not boot past?"* — the
+second question is about durable native state, not a per-call return value. Severity, so nobody
+re-derives it: native serves the `pending` bundle on the next cold start regardless, so the
+torn-down gate cost one session on the old bundle, not a brick.
+
+⚠️ **The trap in the fix** — `pending === target` is NOT the same as "waiting for a restart",
+because `pending` survives the restart until two `confirmBoot`s across two launches promote it
+to `active` (`OtaCore.requiredConfirms = 2`). Gating on `pending` alone would hold
+`ready-to-restart` on the first two launches actually RUNNING the mandatory update — a permanent
+brick, the exact failure `version-rejected`'s own contract warns against. `bootAttempts` is the
+discriminator: `activate()` clears it when it writes `pending`, and the native boot hook
+increments it when it SERVES the pending bundle, before the WebView loads — so 0/absent means
+"staged, never run" (`pending-restart`) and `>= 1` means "running it now" (`up-to-date`). It was
+already in the `state.json` blob `getState()` returns, just missing from the TS `NativeState`
+interface, so this needed no native change. `release.mandatory` is already in hand at the
+short-circuit (the release is fetched and verified earlier in `checkForUpdate`), which is why
+`pending-restart` carries it with no extra fetch.
+
+⚠️ **The native boot hook is now a HARD PREREQUISITE for any OTA-enabled project, and omitting it
+bricks the app rather than degrading it.** The hook is a MANUAL per-game integration — one line in
+`games/ota-test/ios/App/App/MyViewController.swift:21` (`OtaBootHook.run(name:)`) and one in the
+Android `MainActivity.java:15` (`OtaPlugin.runBootHook(...)`) — and `engine/plugins/healNativeConfig.ts`
+does **not** install it. A project that sets `ota.enabled` in `project.config.json` and forgets that
+line still stages perfectly well: the plugin methods work, `activate()` writes `pending`, the gate
+arms. But nothing ever increments `bootAttempts`, so `checkForUpdate` returns `pending-restart` on
+every launch and a MANDATORY release holds `ready-to-restart` forever — an app that can never boot
+again. Before #509 the same misconfiguration merely reported `up-to-date` and ran the old bundle, so
+this is a failure mode the discriminator INTRODUCED at the far end of the range it protects.
+`games/ota-test` is the only OTA-enabled project today and it is wired correctly; check this line
+first when a second project adopts OTA.
 
 **The native splash is also dismissed on this same "fully booted" render** (`App.tsx`, right
 alongside `confirmBoot`) — `@capacitor/splash-screen` is now in the engine's required-plugin

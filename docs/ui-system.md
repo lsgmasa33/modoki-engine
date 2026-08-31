@@ -203,6 +203,35 @@ Scene navigation (`engine.loadScene` / `engine.navigateBack`) is **not** here �
 in `NavigationManager`, which owns the history stack (see
 [Managers & Systems](./managers-and-systems.md)).
 
+#### Global input lock (#466)
+
+`applyBindings` guards every **discrete activation** (`click`, `submit`, a `UIToggle`'s
+`change`) with a single **global** lock: while one is being handled, EVERY other discrete
+activation anywhere in the UI is swallowed whole — before the click cue, so a blocked
+second tap makes no sound. Not per-button: a fast tap on a different button is also
+swallowed, by design.
+
+The real gate is the action **completing** — every promise a `kind:'call'` binding's
+handler returns is awaited before the lock releases — not a timer; `UISettings`'s
+`inputLockMinMs` (default 300ms) is only a floor under that, for a synchronous handler
+that settles instantly. `0` disables the floor entirely (action-completion only), the
+escape hatch for a rapid-fire button. A safety valve, `inputLockMaxMs` (default 10000ms),
+force-releases a lock that outlives it and `console.warn`s the still-pending action(s), so
+a hung async handler can't brick the UI permanently.
+
+A **continuous** event stream passes `continuous: true` to `applyBindings` and is exempt both
+ways: it neither takes nor respects the lock. Two streams qualify, not one: a range slider's
+`change` (fires on every pixel of drag — locking it would freeze the slider mid-drag) and a
+controlled text input's `change` (fires once per KEYSTROKE — locking it would DROP characters,
+since the binding write is what produces the field's value, so a swallowed keystroke is lost,
+not merely delayed). The Enter/`submit` handler and a `UIToggle`'s `change` stay discrete.
+
+⚠️ A `call` handler must not synchronously trigger a second **discrete** activation (e.g. call
+`applyBindings` itself, or another path that re-enters it, for a different `click`/`submit`/toggle
+event) — the lock the outer activation just acquired is still held, so the re-entrant call is
+silently swallowed. No such caller exists in-tree today; this is a trap for game code to avoid,
+not a live defect.
+
 ### `UIToggle` — an on/off switch
 
 Add it beside `UIElement` and the entity renders as a switch: a track with a knob at one
@@ -1662,6 +1691,7 @@ verified against the game's `game.ts`/`runtime/setup.ts` and `app/App.tsx`.)
 | Tree build + dirty flag | `runtime/ui/uiTreeStore.ts` (`buildTree`, `markUIDirty`, `uiTreeProjection`) |
 | Selector hook | `runtime/ui/useUIEntities.ts` |
 | Action registry + engine built-ins | `runtime/core/actionRegistry.ts`, `runtime/actions/engineActions.ts` |
+| Global input lock + its authored settings | `runtime/ui/bindings.ts` (`applyBindings`), `runtime/traits/UISettings.ts` |
 | Binding resolver | `runtime/ui/bindingResolver.ts` |
 | Anchor math | `runtime/ui/anchorLayout.ts` |
 | Focus nav (trait / system / manager) | `runtime/traits/UIFocusable.ts`, `runtime/ui/uiFocusSystem.ts`, `runtime/ui/focusManager.ts` |

@@ -216,4 +216,146 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
     // those same calls, per fireSceneCallbacks' own contract).
     expect(namesInCurrentWorld()).toEqual(['B']);
   });
+
+  // #468: a game-scoped manager's async init, launched by a load that is later
+  // superseded, must not write into the world that same load's OWN destroy
+  // step already tore down. The superseding load sees `gameChanged === false`
+  // (the superseded load already set `activeGameId`) so it correctly skips
+  // both dispose and re-init for game managers — nothing re-activates or
+  // awaits the still-hanging init from there. The fix defers `oldWorld.destroy()`
+  // behind any in-flight manager init instead of racing it.
+  it('#468: a game manager\'s async init resumes before its world is destroyed', async () => {
+    const { sceneManager, managers, getCurrentWorld } = await setup();
+
+    // Load O fully first (no game, nothing hangs here).
+    await sceneManager.loadScene('/sceneO.json', { preloaded: sceneOf('O') as never });
+
+    const namesInCurrentWorld = (): string[] => {
+      const names: string[] = [];
+      getCurrentWorld().query(EntityAttributes).updateEach(([ea]: [{ name: string }]) => names.push(ea.name));
+      return names;
+    };
+
+    let resolveHang: () => void = () => {};
+    const hang = new Promise<void>((resolve) => { resolveHang = resolve; });
+    let capturedWorld: unknown;
+    let initStarted = false;
+    let destroyedBeforeResume = false;
+    const spy: { destroy?: ReturnType<typeof vi.spyOn> } = {};
+    managers.registerManager({
+      name: 'gameMgr', scope: 'game', games: ['G'],
+      init: async (ctx) => {
+        capturedWorld = ctx.world;
+        initStarted = true; // signals A's tail has reached initGameManagersFor
+        await hang;
+        // If the world was already destroyed by the time we resume, the
+        // pre-#468 code let this happen; the fix must keep it alive.
+        destroyedBeforeResume = (spy.destroy?.mock.calls.length ?? 0) > 0;
+      },
+    });
+
+    // Load A (not awaited): explicit gameId → gameChanged is true, so A's tail
+    // activates gameMgr against its own (freshly-promoted) world once it swaps.
+    const pA = sceneManager.loadScene('/sceneA.json', { preloaded: sceneOf('A') as never, gameId: 'G' });
+    await vi.waitFor(() => { if (!namesInCurrentWorld().includes('A')) throw new Error('A has not swapped in yet'); });
+    await vi.waitFor(() => { if (!initStarted) throw new Error('gameMgr init has not started yet'); });
+
+    const worldA = getCurrentWorld();
+    spy.destroy = vi.spyOn(worldA, 'destroy');
+
+    // Load B (not awaited), same gameId → B computes `gameChanged === false`
+    // (A already set activeGameId to 'G'), so B skips both
+    // disposeActiveGameManagers and initGameManagersFor for gameMgr — nothing
+    // re-activates or awaits its still-hanging init. B's own oldWorld is worldA,
+    // so this is exactly the #468 race: B's destroy step must defer behind
+    // gameMgr's in-flight init instead of destroying worldA out from under it.
+    const pB = sceneManager.loadScene('/sceneB.json', { preloaded: sceneOf('B') as never, gameId: 'G' });
+    await vi.waitFor(() => { if (!namesInCurrentWorld().includes('B')) throw new Error('B has not swapped in yet'); });
+
+    resolveHang();
+    await Promise.all([pA, pB]);
+    // B's deferred `oldWorld.destroy()` is fire-and-forget (not awaited by
+    // loadScene, so as not to block B on a slow init) — flush until it runs.
+    await vi.waitFor(() => { if (spy.destroy!.mock.calls.length === 0) throw new Error('destroy has not run yet'); });
+
+    // The regression: the world was still alive when gameMgr's init resumed.
+    expect(destroyedBeforeResume).toBe(false);
+    // gameMgr's ctx.world is the load-A world it was activated against, not
+    // whatever the newer load promoted.
+    expect(capturedWorld).toBe(worldA);
+    // The koota worldId slot is still freed — no world leak.
+    expect(spy.destroy).toHaveBeenCalled();
+  });
+
+  // Regression for the review of the #468 fix above: `activate()` clears `entry.initPromise`
+  // in a `.finally`, so an init that NEVER settles (a genuine hang, distinct from the resolved
+  // `hang` promise above) leaves `pendingManagerInits()` non-null FOREVER — every LATER swap's
+  // `oldWorld.destroy()` would then chain behind it and never run, leaking a koota world slot
+  // (capped at 16) on every subsequent swap. `WORLD_DESTROY_DEFER_MAX_MS` bounds the defer:
+  // past it, destroy runs anyway and a warning names the situation.
+  it('bounds the destroy-defer: a manager init that never settles does not block later world destroys forever', async () => {
+    vi.useFakeTimers();
+    try {
+      const { sceneManager, managers, getCurrentWorld } = await setup();
+      const { WORLD_DESTROY_DEFER_MAX_MS } = await import('../../src/runtime/scene/SceneManager');
+
+      const namesInCurrentWorld = (): string[] => {
+        const names: string[] = [];
+        getCurrentWorld().query(EntityAttributes).updateEach(([ea]: [{ name: string }]) => names.push(ea.name));
+        return names;
+      };
+
+      // `vi.waitFor`'s default polling is timer-driven, which deadlocks once fake timers are
+      // active (nothing advances its own poll timer) — flush microtasks directly instead. Every
+      // condition here (the swap, `initStarted`) is reached via a chain of plain `await`s with
+      // no real timer of its own, so spinning the microtask queue is sufficient.
+      async function flushUntil(pred: () => boolean, maxTicks = 500): Promise<void> {
+        for (let i = 0; i < maxTicks && !pred(); i++) await Promise.resolve();
+        if (!pred()) throw new Error('condition not met after flushing microtasks');
+      }
+
+      let initStarted = false;
+      const spy: { destroy?: ReturnType<typeof vi.spyOn> } = {};
+      managers.registerManager({
+        name: 'hungMgr', scope: 'game', games: ['G'],
+        init: () => {
+          initStarted = true;
+          return new Promise<void>(() => {}); // never settles — a genuine hang, not a rejection
+        },
+      });
+
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      // Load A: gameChanged → activates hungMgr against world A, whose init hangs forever. NOT
+      // awaited — `initGameManagersFor` awaits the manager's raw init promise directly (not the
+      // swallowing wrapper), so `pA` itself would never settle.
+      const pA = sceneManager.loadScene('/sceneA.json', { preloaded: sceneOf('A') as never, gameId: 'G' });
+      pA.catch(() => {});
+      await flushUntil(() => namesInCurrentWorld().includes('A') && initStarted);
+
+      const worldA = getCurrentWorld();
+      spy.destroy = vi.spyOn(worldA, 'destroy');
+
+      // Load B, same gameId → gameChanged is false (A already set activeGameId), so B skips
+      // re-activating/awaiting hungMgr — its still-hanging init just sits there, exactly the
+      // #468 shape, except this init never resumes on its own. B itself is NOT gated on
+      // hungMgr (it's untouched this swap), so its own promise settles normally.
+      const pB = sceneManager.loadScene('/sceneB.json', { preloaded: sceneOf('B') as never, gameId: 'G' });
+      await pB;
+      expect(namesInCurrentWorld()).toContain('B');
+
+      // Not yet destroyed — still deferred behind the hung init.
+      expect(spy.destroy).not.toHaveBeenCalled();
+
+      // Advance past the bound; the timeout side of the race should win and destroy anyway.
+      await vi.advanceTimersByTimeAsync(WORLD_DESTROY_DEFER_MAX_MS + 1);
+
+      expect(spy.destroy).toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(String(WORLD_DESTROY_DEFER_MAX_MS)));
+
+      warn.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

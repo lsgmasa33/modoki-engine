@@ -190,7 +190,11 @@ export type OtaCheckResult =
    *  treat this as "no update available" and let the player keep playing the working
    *  bundle — blocking here is what turns a stale app into a permanent brick. */
   | { outcome: 'version-rejected'; version: string }
-  | { outcome: 'staged'; version: string; delta?: boolean; mandatory: boolean };
+  | { outcome: 'staged'; version: string; delta?: boolean; mandatory: boolean }
+  /** The target version is already STAGED natively (`pending`) and is waiting for a restart to be
+   *  served — the device is NOT running it yet. Distinct from `up-to-date` (which means `active`
+   *  already IS the target) precisely so a mandatory gate can hold. */
+  | { outcome: 'pending-restart'; version: string; mandatory: boolean };
 
 /** Browser-safe base64url decode — this module runs in the WebView shell, where
  *  `Buffer` does not exist (unlike Node, where the test suite happens to run it). Uses
@@ -324,14 +328,25 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
   const state = parseNativeState(stateJSON);
   const currentActive = state?.active?.[opts.bundleName];
   const currentPending = state?.pending?.[opts.bundleName];
-  if (currentActive === targetVersion || currentPending === targetVersion) {
-    return { outcome: 'up-to-date' };
+  if (currentActive === targetVersion) return { outcome: 'up-to-date' };
+  if (currentPending === targetVersion) {
+    // ⚠️ `pending` alone does NOT mean "waiting for a restart" — it survives the restart, because
+    // promotion to `active` needs TWO confirmBoots across TWO launches (OtaCore.requiredConfirms).
+    // `bootAttempts` is the discriminator: `activate()` clears it when staging, and the native boot
+    // hook increments it when it SERVES the pending bundle, before the WebView loads. So 0 means
+    // this device has never run the staged version and a restart is genuinely owed; >= 1 means we
+    // are running it right now, and holding a mandatory gate here would block the game forever on
+    // the very update it has already applied.
+    const alreadyServed = (state?.bootAttempts?.[opts.bundleName] ?? 0) > 0;
+    if (alreadyServed) return { outcome: 'up-to-date' };
+    return { outcome: 'pending-restart', version: targetVersion, mandatory: release.mandatory };
   }
 
-  // Quarantine gate (Phase 3a). Checked AFTER the up-to-date short-circuit above, so a
-  // version that somehow reached `active` despite being listed still reports up-to-date —
-  // `rejected` vetoes STAGING, never a bundle that is already booting fine (mirrors
-  // OtaCore's boot-side rule; see ota-gate-vectors-phase3.json).
+  // Quarantine gate (Phase 3a). Checked AFTER the up-to-date/pending-restart short-circuits
+  // above, so a version that somehow reached `active` (or is already `pending`) despite being
+  // listed still reports up-to-date/pending-restart — `rejected` vetoes STAGING, never a bundle
+  // that is already booting fine or already staged (mirrors OtaCore's boot-side rule; see
+  // ota-gate-vectors-phase3.json).
   if (state?.rejected?.[opts.bundleName]?.includes(targetVersion)) {
     return { outcome: 'version-rejected', version: targetVersion };
   }
@@ -444,6 +459,12 @@ interface NativeState {
   /** Phase 3a quarantine — versions this device proved bad. Absent on a state.json
    *  written by a Phase 1/2 binary, hence optional. */
   rejected?: Record<string, string[]>;
+  /** Per-bundle launch count since a pending version was last SERVED. `activate()` clears
+   *  this when it writes `pending` (staging), and the native boot hook increments it when
+   *  it actually serves the pending bundle, before the WebView loads — so 0/absent means
+   *  "staged, never run" and >= 1 means "we are running the pending version right now".
+   *  The discriminator that distinguishes those two `pending === target` cases below. */
+  bootAttempts?: Record<string, number>;
 }
 
 function parseNativeState(json: string): NativeState | null {

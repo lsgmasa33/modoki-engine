@@ -578,7 +578,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         value={inputValue}
         placeholder={node.placeholder}
         onChange={node.action?.bindings?.length
-          ? (e: React.ChangeEvent<HTMLInputElement>) => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: e.target.value })
+          // continuous: true — this fires once per KEYSTROKE on a controlled input, not a
+          // discrete activation. Locking it would swallow every character typed within the
+          // input-lock window after the first, and since this binding write IS what produces
+          // the field's value, those keystrokes are LOST, not merely delayed (#466 follow-up:
+          // typing "hello" would land only "h"). See uiInputLock.test.ts's typing regression.
+          ? (e: React.ChangeEvent<HTMLInputElement>) => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: e.target.value, continuous: true })
           : undefined}
         onKeyDown={node.action?.bindings?.length
           ? (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -636,7 +641,9 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         step={node.rangeStep || 1}
         value={sliderValue}
         onChange={node.action?.bindings?.length
-          ? (e: React.ChangeEvent<HTMLInputElement>) => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: Number(e.target.value) })
+          // continuous: true — this 'change' fires repeatedly during a drag, not a discrete
+          // activation, so it must not take (or be blocked by) the global input lock (#466).
+          ? (e: React.ChangeEvent<HTMLInputElement>) => applyBindings(node.action!.bindings, 'change', { selfGuid: node.guid, eventValue: Number(e.target.value), continuous: true })
           : undefined}
         // A click that lands on an interactive control has been CONSUMED by it, and must not also
         // read as a click on an ancestor. Without this a slider inside the canonical

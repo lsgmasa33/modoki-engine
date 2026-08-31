@@ -408,6 +408,34 @@ build, the per-machine signing, and the expiry rule.
   chosen. A live agent answers in **72-227 ms** over the same LAN, so the budget is an order of
   magnitude above the real thing while capping the failure case.
 
+- **The cached WDA session is keyed by the target it was opened against** (#519). `getDeviceWdaSession`
+  used to open with a bare `if (cached) return cached;` — one line *before* `opts.host` was even
+  read — so the caller's requested device was never compared against the device the cached session
+  was built for. A lease moving from the iPad to the iPhone Air handed the new caller the **old**
+  phone's session, and every `device_tap`/`device_drag` on the trusted path drove the wrong physical
+  handset with no error anywhere.
+
+  This is the **third instance of one class**, and the first two are already documented above:
+  `deviceCdp.ts` needed exactly this for `cachedPackage` (#142) and again for `cachedSerial` (#149).
+  `deviceWda.ts` simply never got the equivalent key. Worse than #471, which mis-*scaled* a tap on
+  the right device; this drove a different device entirely.
+
+  The key is `baseUrl`, read off the cached `WdaSession` itself rather than held in a parallel
+  module variable — a separate `cachedHost`/`cachedPort` pair can drift out of sync with the session
+  it describes, and the session's own field cannot. (`deviceCdp.ts` needs separate variables only
+  because `cachedPackage`/`cachedSerial` are not fields on its session object. Do not "make them
+  consistent".)
+
+  **Two directions, not one — the second is the one that reads as unrelated.** A *different* host
+  drops the stale session and rediscovers. But `host` also goes **undefined** exactly when the lease
+  moves to an adb/USB (Android) device, and the old early return handed that caller the stale iOS
+  session too. So the no-host path clears the cache as well as returning null: "there is no iOS
+  target" must not be answerable from a session belonging to a phone this machine no longer holds.
+
+  **No network teardown of the superseded session.** By the time the mismatch is noticed the lease on
+  that device is already gone, so reaching for it is both wrong and a hang risk on the input hot
+  path. Dropping the reference is the whole teardown.
+
 ## WDA also captures the screen — the out-of-app screenshot (#102)
 
 The iOS **native** capture (`GameDebug.captureScreen`, the default path) is faithful, but it is the

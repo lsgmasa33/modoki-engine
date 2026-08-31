@@ -701,7 +701,9 @@ describe('UINode input branch', () => {
     expect(input.value).toBe('Ada');
 
     fireEvent.change(input, { target: { value: 'Bob' } });
-    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'change', { selfGuid: 'g1', eventValue: 'Bob' });
+    // continuous: true — a controlled text input's 'change' fires once per keystroke, so it
+    // must not take (or be blocked by) the global input lock (#466), or characters get dropped.
+    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'change', { selfGuid: 'g1', eventValue: 'Bob', continuous: true });
 
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'submit', expect.objectContaining({ selfGuid: 'g1' }));
@@ -734,7 +736,9 @@ describe('UINode range branch', () => {
     expect(input.step).toBe('2');
 
     fireEvent.change(input, { target: { value: '8' } });
-    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'change', { selfGuid: 'g1', eventValue: 8 });
+    // continuous: true — a range slider's 'change' fires per pixel of drag, so it must not
+    // take (or be blocked by) the global input lock (#466). See bindings/uiInputLock.test.ts.
+    expect(h.applyBindings).toHaveBeenCalledWith(node.action!.bindings, 'change', { selfGuid: 'g1', eventValue: 8, continuous: true });
   });
 
   it('clamps a non-finite stored value to rangeMin', () => {
