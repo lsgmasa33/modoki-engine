@@ -34,6 +34,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { hasNativeProjects } from '../helpers/repoLayout';
+import { discoverProjects } from '../../scripts/projectRoots.mjs';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 const PKG_DIR = 'engine/packages';
@@ -295,5 +296,206 @@ describe('capacitor plugin platform declarations', () => {
       }
     }
     expect(missing, `files[] promises a file the package does not ship: ${missing.join(', ')}`).toEqual([]);
+  });
+});
+
+/** ----------------------------------------------------------------------------------------------
+ *  Guard #2: a CONSUMING project's committed `ios/App/CapApp-SPM/Package.swift` must declare
+ *  every capacitor dependency in its `package.json` that ships a real SPM iOS implementation.
+ *
+ *  `capacitor-modoki-iap` was missing from `games/court`'s committed manifest for the entire life
+ *  of the IAP feature (#371) — `cap sync ios` silently re-added it on every build, so it was never
+ *  a SHIPPED defect, but it left a committed file permanently re-modified after every iOS build.
+ *  That churn is exactly the class #236 and #368 both fought (see the header above for #368's
+ *  half of this file), and it is exactly the kind of diff a broad `git add` sweeps into an
+ *  unrelated commit in a tree that also contains publishable demos (see this repo's CLAUDE.md,
+ *  "Stage paths EXPLICITLY", #18).
+ *
+ *  This is the mirror image of the guard above: that one checks a PLUGIN PACKAGE's own manifest
+ *  against its own platform claim; this one checks a GAME/DEMO's committed SPM manifest against
+ *  what its package.json says it depends on.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Capacitor dependency names worth checking against a consuming project's committed
+ *  Package.swift: `@capacitor/…`, `@capacitor-community/…`, and bare `capacitor-…` packages —
+ *  this repo's own plugin/product naming convention. Deliberately NOT `@capacitor-firebase/…`
+ *  (or any other capacitor-flavoured scope) — those reach iOS through Firebase's own SPM path,
+ *  a different convention this guard has nothing to say about. */
+const CAPACITOR_DEP_RE = /^(@capacitor(-community)?\/|capacitor-)/;
+
+/** The SPM package/product name Capacitor derives from an npm package name: drop the `@scope/`
+ *  slash, split the whole remainder (scope words AND name words) on `-`, capitalize every
+ *  segment, join. Pinned below against every entry `games/court`'s committed Package.swift
+ *  actually has — including `@capacitor/splash-screen` -> `CapacitorSplashScreen`, where the
+ *  SCOPE contributes the leading `Capacitor`, not a literal prefix tacked on separately. */
+export function expectedSpmName(depName: string): string {
+  return depName
+    .replace(/^@/, '')
+    .split(/[/-]/)
+    .filter(Boolean)
+    .map((seg) => seg[0].toUpperCase() + seg.slice(1))
+    .join('');
+}
+
+/** Is `depName` declared (as its expected SPM name) in `packageSwiftText`, with comments
+ *  stripped first? Comments stripped for the same reason as `missingSpmDeps` above: a name
+ *  mentioned only in prose — e.g. a "TODO: add CapacitorModokiIap" left over from #371 — must
+ *  not read as a real declaration. */
+export function isSpmDepDeclared(depName: string, packageSwiftText: string): boolean {
+  return stripSwiftComments(packageSwiftText).includes(expectedSpmName(depName));
+}
+
+/** Resolve a dependency's OWN package.json so its `capacitor.ios` claim can be read — first the
+ *  project's installed copy, falling back to the in-repo package source for a monorepo project
+ *  that hasn't been `npm install`ed (the same node_modules/engine-packages duality
+ *  `compiledIntoAppTarget` above documents). `null` when neither resolves: an unresolvable dep is
+ *  SKIPPED, not flagged — this guard only knows what to expect once it can read the dependency's
+ *  own platform block, and a package outside this repo's `engine/packages` (a raw npm capacitor
+ *  plugin with no vendored copy) is legitimately out of its reach. */
+function resolveDepPackageJson(projDir: string, depName: string): { capacitor?: { ios?: unknown } } | null {
+  const bare = depName.replace(/^@[^/]+\//, '');
+  for (const candidate of [
+    path.join(projDir, 'node_modules', depName, 'package.json'),
+    path.join(repoRoot, PKG_DIR, bare, 'package.json'),
+  ]) {
+    if (fs.existsSync(candidate)) {
+      try { return JSON.parse(fs.readFileSync(candidate, 'utf8')); } catch { return null; }
+    }
+  }
+  return null;
+}
+
+/** Every capacitor dep in `projDir`'s package.json that genuinely ships an SPM iOS
+ *  implementation — i.e. its OWN package.json declares `capacitor.ios` truthy.
+ *
+ *  Deriving scope from `capacitor.ios` (rather than an allowlist naming every real plugin) is
+ *  what makes the android-only plugins fall out AUTOMATICALLY instead of needing to be listed
+ *  here by hand: `capacitor-game-debug`, `capacitor-modoki-ota` and `capacitor-litert-lm` declare
+ *  android-only ON PURPOSE (see this file's header — SPM's static linker strips a plugin class
+ *  with no external framework dependency, so they're compiled into the App target via a pbxproj
+ *  reference instead), and a project depending on one of them is correctly never expected to
+ *  name it in Package.swift. */
+function iosSpmDeps(projDir: string): string[] {
+  const pkgJsonPath = path.join(projDir, 'package.json');
+  if (!fs.existsSync(pkgJsonPath)) return [];
+  const deps = Object.keys(JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8')).dependencies ?? {});
+  return deps
+    .filter((d) => CAPACITOR_DEP_RE.test(d))
+    .filter((d) => !!resolveDepPackageJson(projDir, d)?.capacitor?.ios);
+}
+
+/** Every `games/*`/`demos/*` project that has committed an SPM manifest — the set this guard
+ *  covers. `id` is the `<root>/<name>` form used by `KNOWN_MISSING` below. */
+function spmProjects(): { id: string; dir: string; manifest: string }[] {
+  return discoverProjects(repoRoot)
+    .map((p) => ({
+      id: `${p.root}/${p.name}`,
+      dir: p.dir,
+      manifest: path.join(p.dir, 'ios/App/CapApp-SPM/Package.swift'),
+    }))
+    .filter((p) => fs.existsSync(p.manifest));
+}
+
+/** #342's parked exception (commit `e34e8d8fe`, "park AppLovin out of the NATIVE build, not just
+ *  out of the code"): `games/court` deliberately omits `capacitor-applovin-max` from its
+ *  committed Package.swift even though the package itself declares `capacitor.ios` and would
+ *  otherwise be expected here.
+ *
+ *  An explicit, EXACT-MATCH exception — NOT a permissive "ignore this pair forever" filter. The
+ *  second test below asserts the entry is STILL absent, so that when #342 unblocks and
+ *  `CapacitorApplovinMax` legitimately returns to the manifest, THIS repo's own test fails loudly
+ *  (the exception no longer matches reality) and forces someone to delete the entry — rather than
+ *  quietly tolerating either state forever. */
+const KNOWN_MISSING: ReadonlyArray<{ project: string; dep: string }> = [
+  { project: 'games/court', dep: 'capacitor-applovin-max' },
+];
+
+describe('committed Package.swift vs package.json — every SPM-iOS capacitor dep is declared (#371)', () => {
+  // Gated for the same reason as 'sees the pbxproj road it is meant to police' above: the public
+  // OSS snapshot deletes `ios android packages plugins` from every demo it stages, so there is
+  // nothing here to check and asserting otherwise would go red on the public gate only.
+  it.skipIf(!hasNativeProjects())('finds projects to check — a vacuous pass is a failure', () => {
+    // Floor well under the real count (21 as of 2026-08-31), so only a broken scan trips it.
+    const projects = spmProjects();
+    expect(projects.length).toBeGreaterThanOrEqual(10);
+    expect(projects.some((p) => iosSpmDeps(p.dir).length > 0)).toBe(true);
+  });
+
+  it.skipIf(!hasNativeProjects())(
+    'every SPM-iOS capacitor dep in package.json is declared in Package.swift',
+    () => {
+      const offenders: string[] = [];
+      for (const proj of spmProjects()) {
+        const manifestText = fs.readFileSync(proj.manifest, 'utf8');
+        for (const dep of iosSpmDeps(proj.dir)) {
+          if (KNOWN_MISSING.some((k) => k.project === proj.id && k.dep === dep)) continue;
+          if (!isSpmDepDeclared(dep, manifestText)) {
+            offenders.push(
+              `${proj.id}: ${dep} (expected "${expectedSpmName(dep)}") is not declared in ` +
+                `${path.relative(repoRoot, proj.manifest)} — package.json depends on it and its ` +
+                `own package.json declares capacitor.ios, so \`cap sync ios\` will re-add it on ` +
+                `every build (#371).`,
+            );
+          }
+        }
+      }
+      expect(offenders, offenders.join('; ')).toEqual([]);
+    },
+  );
+
+  it.skipIf(!hasNativeProjects())(
+    'the #342 AppLovin exception is still real — asserted, not just assumed',
+    () => {
+      for (const { project, dep } of KNOWN_MISSING) {
+        const proj = spmProjects().find((p) => p.id === project);
+        expect(proj, `${project}: expected to still have a committed Package.swift`).toBeTruthy();
+        if (!proj) continue;
+        const manifestText = fs.readFileSync(proj.manifest, 'utf8');
+        expect(
+          isSpmDepDeclared(dep, manifestText),
+          `${project}: ${dep} (${expectedSpmName(dep)}) is now declared in Package.swift — #342 ` +
+            `must have unblocked AppLovin's native build. Delete this KNOWN_MISSING entry (see ` +
+            `commit e34e8d8fe) rather than loosening this assertion.`,
+        ).toBe(false);
+      }
+    },
+  );
+
+  describe('expectedSpmName — the derivation, pinned against every entry in games/court/Package.swift', () => {
+    it.each([
+      ['@capacitor/app', 'CapacitorApp'],
+      ['@capacitor/haptics', 'CapacitorHaptics'],
+      ['@capacitor/keyboard', 'CapacitorKeyboard'],
+      ['@capacitor/preferences', 'CapacitorPreferences'],
+      ['@capacitor/splash-screen', 'CapacitorSplashScreen'],
+      ['capacitor-appsflyer', 'CapacitorAppsflyer'],
+      ['capacitor-modoki-iap', 'CapacitorModokiIap'],
+    ])('%s -> %s', (dep, expected) => {
+      expect(expectedSpmName(dep)).toBe(expected);
+    });
+  });
+
+  // Mirrors `missingSpmDeps — the rule itself, on fixtures` above: exercised on in-memory
+  // strings, not the live repo, so a broken rule cannot hide behind repo content that happens
+  // to already satisfy it (this file's own #368 postmortem, a few hundred lines up, is the
+  // reason this pattern is standard here).
+  describe('isSpmDepDeclared — the rule itself, on fixtures (it is vacuous against the repo)', () => {
+    it('a dependency the manifest never declares is flagged', () => {
+      const spm = '.package(name: "CapacitorApp", path: "../../../node_modules/@capacitor/app")';
+      expect(isSpmDepDeclared('capacitor-modoki-iap', spm)).toBe(false);
+    });
+
+    it('a dependency named only in a COMMENT does not count as declared', () => {
+      const commented =
+        '// TODO: add CapacitorModokiIap once the IAP feature lands\n' +
+        '.package(name: "CapacitorApp", path: "../../../node_modules/@capacitor/app")';
+      expect(isSpmDepDeclared('capacitor-modoki-iap', commented)).toBe(false);
+    });
+
+    it('a real declaration satisfies it', () => {
+      const spm =
+        '.package(name: "CapacitorModokiIap", path: "../../../node_modules/capacitor-modoki-iap")';
+      expect(isSpmDepDeclared('capacitor-modoki-iap', spm)).toBe(true);
+    });
   });
 });

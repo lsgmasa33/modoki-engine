@@ -9,7 +9,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  persistAtlasDoc, classifyAtlasLoad, canPersistAtlasDoc,
+  persistAtlasDocIfUnchanged, classifyAtlasLoad, canPersistAtlasDoc,
   DEFAULT_ATLAS_DOC, type AtlasSourceDoc, type AtlasLoadState,
 } from './atlasPersist';
 import { backendFetch } from '../../backend/editorBackend';
@@ -57,6 +57,14 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
    *  `path` prop rather than trusting `loadState` alone — see `canPersistAtlasDoc`'s header for
    *  why state alone cannot close the A→B selection-change window (review findings 1 + 3). */
   const loadedPath = useRef<string | null>(null);
+  /** The exact file text this panel last READ from disk for `path`. The write path compares the
+   *  file's CURRENT text against this immediately before writing (#439): the panel serializes the
+   *  whole document, so writing on top of a document that changed underneath — a `git checkout`
+   *  under a live editor, CLAUDE.md's documented hazard — silently reverts whatever changed.
+   *  Nothing notifies this panel of a same-path content change (`assetsVersion` is keyed on the
+   *  asset PATH SET, see assetSetSignature.ts), so the check must happen at write time, not via a
+   *  subscription. */
+  const loadedText = useRef<string | null>(null);
   /** 'loading' until the fetch below settles, 'failed' on a bad response/network error, 'ok'
    *  once `doc`/`rawDoc` hold a real (or genuinely empty) atlas. Every control that writes is
    *  gated on this — see `update()` and the `disabled=` props below (#430): editing on top of a
@@ -74,8 +82,11 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
   // `assetsVersion`/`blockVersion` are read so the preview recomputes after a re-pack
   // re-registers the atlas entry; reference them to satisfy the deps lint without effect.
   void assetsVersion; void blockVersion;
+  const [diskConflict, setDiskConflict] = useState(false);
 
-  // Load the authored `.atlas.json` (served as a normal project asset file).
+  // Load the authored `.atlas.json` (served as a normal project asset file). Fetches as text
+  // (rather than `.json()`) so the exact bytes can be kept in `loadedText` — the write path's
+  // compare-and-swap baseline (#439) — even though this effect itself only needs the parsed doc.
   useEffect(() => {
     const ac = new AbortController();
     // Drop the previous atlas's document before loading this one — the ref is passthrough data
@@ -85,11 +96,17 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
     // let you edit + overwrite the new file with) the previous atlas's content.
     rawDoc.current = {};
     loadedPath.current = null;
+    loadedText.current = null;
     setDoc(DEFAULT_DOC);
     setLoadState('loading');
+    let fetchedText: string | null = null;
     backendFetch(path, { signal: ac.signal })
-      .then((r) => (r.ok ? r.json().then((body: unknown) => classifyAtlasLoad({ kind: 'ok', body }))
-        : classifyAtlasLoad({ kind: 'httpError' })))
+      .then((r) => (r.ok ? r.text().then((text) => {
+        fetchedText = text;
+        let body: unknown;
+        try { body = JSON.parse(text); } catch { return classifyAtlasLoad({ kind: 'networkError' }); }
+        return classifyAtlasLoad({ kind: 'ok', body });
+      }) : classifyAtlasLoad({ kind: 'httpError' })))
       .catch((err) => {
         if (ac.signal.aborted || (err as { name?: string })?.name === 'AbortError') return null;
         return classifyAtlasLoad({ kind: 'networkError' });
@@ -99,11 +116,17 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
         if (result.loadState === 'failed') { setLoadState('failed'); return; }
         rawDoc.current = result.raw;
         loadedPath.current = path;
+        loadedText.current = fetchedText;
         setDoc(result.doc);
         setLoadState('ok');
+        setDiskConflict(false);
       });
     return () => ac.abort();
   }, [path, reloadNonce]);
+
+  // A path change means the user picked a different asset — any lingering "changed on disk"
+  // banner belongs to the PREVIOUS atlas and must not carry over (#439).
+  useEffect(() => { setDiskConflict(false); }, [path]);
 
   // Persist a change to the `.atlas.json` (discrete controls — no debounce). Empty
   // member slots are kept while editing; the packer ignores blanks.
@@ -131,7 +154,31 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
     // entry), so it reports through the write-failure reporter rather than reportUndoFailure.
     // The write+report itself lives in atlasPersist.ts (#308 close-out) so it's unit-testable
     // without mounting this component.
-    void persistAtlasDoc(path, serializeAtlasDoc(rawDoc.current, next));
+    const content = serializeAtlasDoc(rawDoc.current, next);
+    // Compare-and-swap (#439): re-read the file immediately before writing and only write if it
+    // still matches what this panel last read. The panel writes the WHOLE document on every
+    // control interaction, so writing on top of a document that changed underneath — a `git
+    // checkout` under a live editor — would silently revert whatever changed. On conflict, do NOT
+    // write; instead bump `reloadNonce` to re-read the truth from disk and show the user why the
+    // panel just changed under them.
+    const loadedTextAtWrite = loadedText.current;
+    void persistAtlasDocIfUnchanged(path, content, loadedTextAtWrite, async (p) => {
+      try {
+        const r = await backendFetch(p);
+        return r.ok ? await r.text() : null;
+      } catch {
+        return null;
+      }
+    }).then((outcome) => {
+      if (outcome === 'written') {
+        // This write is now what's on disk — keep the CAS baseline current so the NEXT write
+        // compares against it rather than the pre-edit text.
+        loadedText.current = content;
+      } else if (outcome === 'conflict') {
+        setDiskConflict(true);
+        setReloadNonce((n) => n + 1);
+      }
+    });
   }, [path, loadState, doc]);
 
   const setMember = (i: number, v: string) => update({ members: doc.members.map((m, j) => (j === i ? v : m)) });
@@ -190,12 +237,14 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
 
   return (
     <>
-      {loadState !== 'ok' && (
+      {(loadState !== 'ok' || diskConflict) && (
         <div data-ui-id="assetView.atlas.loadBanner" style={{ color: '#e0a06c', fontSize: '10px', lineHeight: 1.4, marginBottom: 8, padding: '3px 5px', background: '#3a2e1e', border: '1px solid #5a452a', borderRadius: 3, display: 'flex', alignItems: 'center', gap: 6 }}>
           <span style={{ flex: 1 }}>
-            {loadState === 'loading'
-              ? `Loading ${fileLabel}…`
-              : `⚠ Could not load ${fileLabel} — editing disabled so it is not overwritten.`}
+            {diskConflict
+              ? `⚠ ${fileLabel} changed on disk — your edit was not applied. Reloaded from disk.`
+              : loadState === 'loading'
+                ? `Loading ${fileLabel}…`
+                : `⚠ Could not load ${fileLabel} — editing disabled so it is not overwritten.`}
           </span>
           {/* Kept mounted (not `failed`-only) so a load that HANGS — rather than failing outright,
               e.g. the dev server accepting the socket mid-restart with no timeout set on the

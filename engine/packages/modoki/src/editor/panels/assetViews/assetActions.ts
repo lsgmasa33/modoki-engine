@@ -6,7 +6,7 @@
  *  `assetInspectorCoverage.test.ts` pins it against `ASSET_TYPES` in both directions.
  *
  *  Why that guard exists (three measured drifts, none caught by a test):
- *  docs/editor.md § "The asset Inspector — three rules that have each failed repeatedly". */
+ *  docs/editor.md § "The asset Inspector — six rules that have each failed repeatedly". */
 import type { AssetType } from '../../../runtime/loaders/assetManifest';
 
 export const ASSET_TYPES_WITH_ACTIONS: readonly AssetType[] = [

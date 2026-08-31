@@ -136,4 +136,84 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
     await sceneManager.loadScene('/chess.json', { preloaded: sceneOf('chess') as never, gameId: 'chess' });
     expect(init).not.toHaveBeenCalled();
   });
+
+  // #435: an overlapping loadScene during another load's post-swap tail must not let the
+  // superseded (stale) load rewrite the module-global active-scene state or spawn its
+  // manager into the world the NEWER load already promoted.
+  it('#435: a stale post-swap tail does not activate its scene-manager against a newer world', async () => {
+    const { sceneManager, managers, getCurrentWorld } = await setup();
+
+    // Load O fully first (no manager registered yet, so nothing can hang here).
+    await sceneManager.loadScene('/sceneO.json', { preloaded: sceneOf('O') as never });
+
+    // Register a scene manager for O AFTER O is already active: registerManager
+    // self-activates synchronously against the currently-active scene (see
+    // managerRegistry.ts's registerManager), so entry.active/entry.initPromise are
+    // set immediately — init() itself won't settle until we resolve `hang` below.
+    // This is the "controllable window": disposeActiveSceneManagers awaits this
+    // in-flight initPromise before it can dispose O's manager, and that await is
+    // exactly where a second loadScene can start and finish underneath the first.
+    let resolveHang: () => void = () => {};
+    const hang = new Promise<void>((resolve) => { resolveHang = resolve; });
+    managers.registerManager({ name: 'mgrO', scenes: ['O'], init: () => hang });
+
+    const mgrAInit = vi.fn();
+    managers.registerManager({ name: 'mgrA', scenes: ['A'], init: mgrAInit });
+
+    const mgrBCtx: { world?: unknown; scenePath?: string } = {};
+    managers.registerManager({
+      name: 'mgrB', scenes: ['B'],
+      init: (ctx) => { mgrBCtx.world = ctx.world; mgrBCtx.scenePath = ctx.scenePath; },
+    });
+
+    const namesInCurrentWorld = (): string[] => {
+      const names: string[] = [];
+      getCurrentWorld().query(EntityAttributes).updateEach(([ea]: [{ name: string }]) => names.push(ea.name));
+      return names;
+    };
+
+    // Load A (not awaited): its swap runs through a couple of internal awaits
+    // (chain resolution etc.) before reaching the atomic swap (primaryId → A,
+    // currentWorld → worldA), then it hits `disposeActiveSceneManagers` for O's
+    // still-hanging manager and yields BEFORE reaching its own guarded
+    // fireSceneCallbacks/init block (this.primaryId === id check). `this.nextLoad`
+    // is only cleared once that swap commits — so B must not be issued before
+    // then, or step 1 of loadScene(B) would abort A's still-in-flight call
+    // outright instead of overlapping it.
+    const pA = sceneManager.loadScene('/sceneA.json', { preloaded: sceneOf('A') as never });
+    await vi.waitFor(() => { if (!namesInCurrentWorld().includes('A')) throw new Error('A has not swapped in yet'); });
+
+    // Load B (not awaited) while A's tail is stuck above. B's own swap and dispose
+    // call both run synchronously up to the SAME hang (mgrO is still active from
+    // A's perspective too), so B's swap (primaryId → B, currentWorld → worldB)
+    // commits before either tail resumes.
+    const pB = sceneManager.loadScene('/sceneB.json', { preloaded: sceneOf('B') as never });
+
+    // B's own swap (unrelated to the hang — it reaches disposeActiveSceneManagers
+    // only AFTER its atomic swap commits) needs its own handful of internal
+    // awaits to run first. Wait for it to actually commit BEFORE releasing the
+    // hang, so the guard check A performs once it resumes is guaranteed to see B
+    // as primary — otherwise A (needing fewer remaining ticks to resume than B
+    // needs to finish its own swap) can race ahead and reach its guard check
+    // while primaryId is still A's, defeating the whole point of this test.
+    await vi.waitFor(() => { if (!namesInCurrentWorld().includes('B')) throw new Error('B has not swapped in yet'); });
+
+    // Release the shared hang: both A's and B's disposeActiveSceneManagers calls
+    // unblock. A's tail then re-checks `this.primaryId === id` for A and finds B
+    // is now primary, so it must skip fireSceneCallbacks/initSceneManagersFor for
+    // A entirely — mgrA.init must never run, and B's manager must be the one that
+    // sees the live world.
+    resolveHang();
+    await Promise.all([pA, pB]);
+
+    expect(mgrAInit).not.toHaveBeenCalled();
+    expect(mgrBCtx.scenePath).toBe('/sceneB.json');
+    expect(mgrBCtx.world).toBe(getCurrentWorld());
+
+    // The live world holds only B's entity — a stale A tail that ran
+    // initSceneManagersFor/fireSceneCallbacks against the promoted world would be
+    // the only way this observably drifted (dynamic entity spawning fires through
+    // those same calls, per fireSceneCallbacks' own contract).
+    expect(namesInCurrentWorld()).toEqual(['B']);
+  });
 });

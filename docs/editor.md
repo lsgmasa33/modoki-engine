@@ -528,6 +528,14 @@ called fresh on each open (`discoverScenes` in `SceneListEditor.tsx` — deliber
 unmemoized, documented as such) and a one-shot read at boot (`createEditor()`) need
 nothing. The rule bites *memoized* or *render-time* reads inside a long-lived panel.
 
+**`assetsVersion` tracks the asset PATH SET, not file contents.** `createEditor.tsx` only
+bumps it when `assetSetSignature()` changes, and that signature is
+`assets.map(a => a.path).sort().join('|')` — paths only, deliberately (see the function's own
+header). So a same-path CONTENT change on disk (a re-import, a `git checkout`) bumps nothing,
+and **a panel holding a parsed copy of a file's body cannot rely on `assetsVersion` to learn
+that the file changed underneath it** — see the asset Inspector's fourth rule below for what
+that gap costs a panel that also WRITES the whole file.
+
 ### A list built from `getAllAssets()` must be SORTED, not left in map order
 
 `getAllAssets()` returns `guidToEntry` in **Map insertion order**, and `registerAsset`
@@ -1146,7 +1154,7 @@ asset-binding bug above was found. The check is permissive on purpose — any re
 outside `editorStore.ts` counts, including from a test — and it excludes its own file from
 the corpus, since naming an orphan in an allowlist would otherwise launder it.
 
-### The asset Inspector — three rules that have each failed repeatedly
+### The asset Inspector — six rules that have each failed repeatedly
 
 The Inspector's asset view (`Inspector.tsx`) is the door to everything above: it renders a
 per-kind branch, and for any kind it does not recognise it prints "No actions for `<type>`
@@ -1277,6 +1285,33 @@ frames are read off the manifest; a video streams from its URL). A test in
 `tests/plugins/reimportNotify.test.ts` asserted the OLD filter, on the stated grounds that a clip
 is "not a GPU cache the renderer keys by path"; `audioBufferCache` is keyed by path, so that
 premise was simply false and the test was defending the bug.
+
+**6. A panel that writes the WHOLE document must prove it still has the whole document.**
+`AtlasAssetView` serializes and writes the entire `.atlas.json` on every control interaction,
+from a copy it read when the panel opened. Nothing tells it the file changed underneath —
+`assetsVersion` is keyed on paths, not content (see § "A panel that reads `getAllAssets()` must
+subscribe to `assetsVersion`" above) — so a `.atlas.json` altered on disk while the panel is
+open (a `git checkout` under a live editor, which CLAUDE.md names as a real hazard) was silently
+reverted by the next padding nudge, with nothing erroring (#439). The write is now a
+**compare-and-swap**: `persistAtlasDocIfUnchanged` (`assetViews/atlasPersist.ts`) re-reads the
+file immediately before writing and refuses if it no longer matches what the panel read,
+surfacing a "changed on disk" banner and re-reading the truth instead. A failed or unknown
+re-read refuses too — "we don't know what is on disk" must never authorize a whole-file
+overwrite.
+
+Why this panel and not its siblings: the parked-write panels (`ParticleEditor`,
+`SpriteAnimEditor`, `AnimationEditor`, `TimelineEditor`, `SkinEditor`) go through
+`useParkedAssetDoc` and write on Save All (see [mcp-persistence.md](./mcp-persistence.md)
+§ "5. The dirty-asset registry — the ONE path from an asset edit to disk"); `AtlasAssetView`
+reads and writes the file directly instead, and that asymmetry is what makes it the one panel
+exposed to this hazard.
+
+Why it stayed invisible: `AtlasAssetView`'s own header notes the page preview "refreshes after a
+Re-pack via the watcher's manifest broadcast" — and it does. **Derived** data (the `.meta.json`
+pages/frames block, surfaced through the manifest) refreshed correctly, while the **authored**
+source document did not. A panel that visibly updates is the worst place to hide a stale read.
+(#439's sibling #430, on the failed-READ half of the same panel, has no separate write-up here —
+it shipped with code + tests + one QA case only.)
 
 ### Animation Editor
 

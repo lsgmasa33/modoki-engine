@@ -15,6 +15,7 @@ vi.mock('../../src/editor/panels/assetOps', () => ({
 
 import {
   persistAtlasDoc, classifyAtlasLoad, canPersistAtlasDoc, DEFAULT_ATLAS_DOC,
+  atlasWriteIsSafe, persistAtlasDocIfUnchanged,
 } from '../../src/editor/panels/assetViews/atlasPersist';
 import { useEditorStore } from '../../src/editor/store/editorStore';
 
@@ -147,5 +148,116 @@ describe('canPersistAtlasDoc', () => {
 
   it('refuses when loadedPath is null (no load has landed yet) regardless of loadState', () => {
     expect(canPersistAtlasDoc('ok', null, '/a.atlas.json')).toBe(false);
+  });
+});
+
+/** #439 — the compare-and-swap write guard. The panel writes the WHOLE `.atlas.json` document on
+ *  every control interaction; nothing reliably notifies it of a same-path content change on disk
+ *  (a `git checkout` under a live editor, CLAUDE.md's documented hazard), so the guarantee has to
+ *  sit on the WRITE: re-read immediately before writing, and refuse if the file no longer matches
+ *  what was last read. */
+describe('atlasWriteIsSafe', () => {
+  it('is safe when the current text still matches what was loaded', () => {
+    expect(atlasWriteIsSafe('{"members":[]}\n', '{"members":[]}\n')).toBe(true);
+  });
+
+  it('refuses when the current text differs from what was loaded', () => {
+    expect(atlasWriteIsSafe('{"members":[]}\n', '{"members":["a"]}\n')).toBe(false);
+  });
+
+  // `loadedText === null` means this panel never successfully read the file (or dropped its
+  // baseline on a path change) — there's nothing to compare against, so "safe" cannot be true.
+  it('refuses when loadedText is null', () => {
+    expect(atlasWriteIsSafe(null, '{"members":[]}\n')).toBe(false);
+  });
+
+  // `currentText === null` means the re-read ITSELF failed (network error, file gone, etc.) — we
+  // don't know what's on disk, and "we don't know" must never be treated as "go ahead and
+  // overwrite the whole document". Refusing is the only answer that can't silently destroy data.
+  it('refuses when currentText is null (the re-read failed)', () => {
+    expect(atlasWriteIsSafe('{"members":[]}\n', null)).toBe(false);
+  });
+
+  it('refuses when both are null', () => {
+    expect(atlasWriteIsSafe(null, null)).toBe(false);
+  });
+});
+
+describe('persistAtlasDocIfUnchanged', () => {
+  it('writes when the on-disk text still matches loadedText, and returns "written"', async () => {
+    writeAssetFileSpy.mockResolvedValue(true);
+    const readCurrent = vi.fn(async () => '{"members":[]}\n');
+
+    const outcome = await persistAtlasDocIfUnchanged(
+      '/a.atlas.json', '{"members":["x"]}\n', '{"members":[]}\n', readCurrent,
+    );
+
+    expect(outcome).toBe('written');
+    expect(readCurrent).toHaveBeenCalledWith('/a.atlas.json');
+    expect(writeAssetFileSpy).toHaveBeenCalledWith('/a.atlas.json', '{"members":["x"]}\n');
+  });
+
+  // The ticket's own repro: a `.atlas.json` whose `members` changed on disk (e.g. a `git
+  // checkout` landing under a live editor) must NOT be overwritten by a subsequent padding nudge
+  // the panel queued against the stale baseline it read before the checkout.
+  it('#439 repro: members changed on disk under a live editor — a later padding nudge is refused, not written', async () => {
+    const onDiskAfterCheckout = '{"members":["from-git-checkout"],"padding":1}\n';
+    const readCurrent = vi.fn(async () => onDiskAfterCheckout);
+    const staleLoadedText = '{"members":["original"],"padding":1}\n';
+    const paddingNudgeContent = '{"members":["original"],"padding":2}\n';
+
+    const outcome = await persistAtlasDocIfUnchanged(
+      '/court.atlas.json', paddingNudgeContent, staleLoadedText, readCurrent,
+    );
+
+    expect(outcome).toBe('conflict');
+    expect(writeAssetFileSpy).not.toHaveBeenCalled();
+  });
+
+  it('returns "conflict" and never writes when the on-disk text changed', async () => {
+    const readCurrent = vi.fn(async () => '{"members":["changed"]}\n');
+
+    const outcome = await persistAtlasDocIfUnchanged(
+      '/a.atlas.json', '{"members":["x"]}\n', '{"members":[]}\n', readCurrent,
+    );
+
+    expect(outcome).toBe('conflict');
+    expect(writeAssetFileSpy).not.toHaveBeenCalled();
+  });
+
+  it('returns "conflict" and never writes when the re-read resolves null', async () => {
+    const readCurrent = vi.fn(async () => null);
+
+    const outcome = await persistAtlasDocIfUnchanged(
+      '/a.atlas.json', '{"members":["x"]}\n', '{"members":[]}\n', readCurrent,
+    );
+
+    expect(outcome).toBe('conflict');
+    expect(writeAssetFileSpy).not.toHaveBeenCalled();
+  });
+
+  // The re-read must never propagate a throw out of the write path — an unhandled rejection here
+  // would crash the panel's write handler instead of just refusing the write.
+  it('returns "conflict" and never writes when the re-read throws', async () => {
+    const readCurrent = vi.fn(async () => { throw new Error('network down'); });
+
+    const outcome = await persistAtlasDocIfUnchanged(
+      '/a.atlas.json', '{"members":["x"]}\n', '{"members":[]}\n', readCurrent,
+    );
+
+    expect(outcome).toBe('conflict');
+    expect(writeAssetFileSpy).not.toHaveBeenCalled();
+  });
+
+  it('returns "failed" when the write itself is rejected', async () => {
+    writeAssetFileSpy.mockResolvedValue(false);
+    const readCurrent = vi.fn(async () => '{"members":[]}\n');
+
+    const outcome = await persistAtlasDocIfUnchanged(
+      '/a.atlas.json', '{"members":["x"]}\n', '{"members":[]}\n', readCurrent,
+    );
+
+    expect(outcome).toBe('failed');
+    expect(writeAssetFileSpy).toHaveBeenCalledWith('/a.atlas.json', '{"members":["x"]}\n');
   });
 });

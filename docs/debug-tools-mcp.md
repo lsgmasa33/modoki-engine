@@ -1580,7 +1580,9 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
     screen rect. Prefer `guid`: runtime ids are reassigned on every scene reload. A `name` matching
     several entities is **refused**, not first-matched.
     - ⚠️ **A 2D/3D aim REQUIRES `surface`** (`game-3d` | `game-2d` | `scene-view`) — a UI aim
-      refuses it. One entity is often on screen more than once: with the Scene and Game panels both
+      accepts it too, and it becomes REQUIRED once that entity resolves to more than one DOM node
+      (the editor mounts a UI renderer in both the Scene panel's preview frame and the Game panel).
+      One entity is often on screen more than once: with the Scene and Game panels both
       open, `Scene3D` and `SceneView` each measure every 3D entity through their own camera
       (measured: `47x45 at (755,312)` vs `496x372 at (76,-63)`, same id, both `onScreen`). It is
       required **even when only one viewport has it**, because otherwise the call succeeds without
@@ -1699,6 +1701,17 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
   → `modoki_history undo` to revert. Registry twin of `screenBounds.ts`:
   `runtime/rendering/interactionHandles.ts` + `app/debug/handlesDump.ts`; raw modalities in
   `engine/electron/rendererOps.ts`; DnD synth in `engine/app/debug/domDnd.ts`.
+
+### Aiming — why `surface` is mandatory, and what `occlusionScope` can actually see
+
+The rationale lives in exactly two places already — the `entity`-aiming bullets above (this
+section, "A 2D/3D aim REQUIRES `surface`" and "`occlusionScope` qualifies `occluded`") and,
+canonically, [docs/enact.md](enact.md) (`### `surface` — WHICH on-screen copy of the entity`,
+`### A covered aim is refused on EVERY scope (2026-08-19)`). This heading exists only so the trimmed tool
+descriptions in `engine/tools/modoki-mcp/src/shapes.ts` — paid on every `tools/list` request, see
+`docs/mcp-response-budget.md` § "Definition surface" for the measured cost — have a stable link
+(#456) to the "why" they no longer carry in full. Read those two locations — this section carries
+no separate content of its own.
 
 ## Electron CDP (when the MCP/Percept surface can't answer)
 

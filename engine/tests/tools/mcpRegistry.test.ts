@@ -28,6 +28,9 @@ import { fileURLToPath } from 'node:url';
 // v4 `z`, proving nothing about the v3 semantics `modoki_batch` actually runs against. Surfaced
 // by issue #23 (TS2740 — two structurally different ZodType implementations).
 import { z } from '../../tools/modoki-mcp/node_modules/zod';
+// Same reasoning as the zod import above: the MCP package's OWN copy, not whatever the repo root
+// hoists (or lacks). Used only by the definition-surface ledger (#456) to walk NESTED schemas.
+import { zodToJsonSchema } from '../../tools/modoki-mcp/node_modules/zod-to-json-schema';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 import {
   registerTool,
@@ -36,7 +39,7 @@ import {
   toolCount,
   clearRegistry,
 } from '../../tools/modoki-mcp/src/registry';
-import { loadSurface, type Surface } from './mcpSurface';
+import { loadSurface, sumSchemaBytes, type Surface } from './mcpSurface';
 
 const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../tools/modoki-mcp/src');
 const read = (rel: string) => fs.readFileSync(path.join(SRC, rel), 'utf-8');
@@ -464,17 +467,43 @@ describe('the real registered surface', () => {
   // `modoki_write_player_prefs`'s description (runtime.ts) — flush is no longer exempt, so the
   // text describing the refusal changed shape but stayed roughly the same length. No new
   // un-repinned drift since the round-4 re-pin above.
-  const DEFINITION_BYTES = 136_741;
+  //
+  // 2026-08-31 (#456): the count above only ever summed TOP-LEVEL param descriptions — it never
+  // descended into a nested object param (`entity`, `from`, `to`), so every byte of prose living
+  // INSIDE those sub-shapes was invisible to this ledger. Same shape as the recorded lesson in
+  // 2005ab324 ("a diff gate is blind in whichever direction its loop does not iterate"): a pin
+  // that cannot see where the growth concentrates cannot catch it. Measured 15,527 bytes of
+  // pin-blind nested prose, concentrated almost entirely in the aim tools' `entity` param — which
+  // is exactly where issue #456's duplication lived. The fix serializes each tool's shape with
+  // `zodToJsonSchema` and recursively sums EVERY `description` string plus every property name in
+  // the result, so a `.describe()` nested at any depth is counted.
+  //
+  // That change alone made the measured number JUMP even though the surface got smaller: nested
+  // prose (and nested property names) that was always there, inside `entity`/`from`/`to` sub-
+  // objects, is now counted for the first time — on top of the same trim from #456 (removing
+  // ~7 KB of duplicated aim-tool prose, moved to docs/debug-tools-mcp.md § Aiming). Old
+  // (top-level-only) count: 132_278. New (recursive) count after the #456 trim: 143_859. Do not
+  // read the jump as growth — measure with `DEFINITION_HEADROOM` set deeply negative to read the
+  // real number off the failure message before ever re-pinning.
+  // Merged into main 2026-08-31: combines #438 round 5's 10-byte wording change with #456's
+  // recursive-sum switch and trim. Re-ran the pin test post-merge — 143_859 + the 4_000 headroom
+  // still covers the combined surface, so the number did not need bumping again.
+  const DEFINITION_BYTES = 143_859;
   const DEFINITION_HEADROOM = 4_000;
+
+  // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger
+  // only ever drives it against the REAL 105-tool surface, which cannot exercise every branch (a
+  // scan found zero live tuples/oneOf/not/patternProperties/$defs). See the "sumSchemaBytes walk"
+  // describe block below for coverage the real surface can't provide, and `mcpSurface.ts` for the
+  // walk itself and the full reasoning behind which containers it descends into.
 
   it(`the tool definitions stay near their recorded size (~${Math.round(DEFINITION_BYTES / 1000)} KB)`, () => {
     let bytes = 0;
     for (const name of s.names) {
       const entry = getTool(name)!;
       bytes += entry.description.length;
-      for (const [param, field] of Object.entries(entry.shape)) {
-        bytes += param.length + ((field as { description?: string }).description?.length ?? 0);
-      }
+      const schema = zodToJsonSchema(z.object(entry.shape));
+      bytes += sumSchemaBytes(schema);
     }
     const ceiling = DEFINITION_BYTES + DEFINITION_HEADROOM;
     expect(
@@ -496,6 +525,132 @@ describe('the real registered surface', () => {
     for (const name of s.names) {
       expect(() => z.object(getTool(name)!.shape), name).not.toThrow();
     }
+  });
+});
+
+describe('sumSchemaBytes walk (#456 close-out)', () => {
+  // The definitions ledger above drives `sumSchemaBytes` against the REAL 105-tool surface, and a
+  // scan of every served schema found `tuples:0, oneOf:0, not:0, patternProperties:0, $defs:0` —
+  // none of those branches has ever executed against real traffic. `DEFINITION_BYTES` staying pinned
+  // at 143_859 proves the walk is STABLE on today's surface; it proves nothing about whether the
+  // array-aware / oneOf / not / patternProperties branches are actually CORRECT, since nothing here
+  // has ever forced them to run. These tests drive `zodToJsonSchema` output built to exercise each
+  // branch on purpose, and assert the SUMMED byte count — not merely "greater than zero", which
+  // would pass on a half-working walker just as easily as a correct one.
+
+  it('sums description bytes inside a z.tuple() — the array-valued `items` case', () => {
+    // This is the regression that matters most: `#456`'s bug was exactly this shape, one level
+    // deeper. The OLD walker's `if (n.items) bytes += sumSchemaBytes(n.items)` recursed into
+    // `n.items` fine for an object-valued `items` (a `z.array()`), but `zodToJsonSchema` emits a
+    // z.tuple()'s `items` as an ARRAY of per-position sub-schemas — `sumSchemaBytes` on an array it
+    // does not recognize as an array falls through every `typeof !== 'object'`-adjacent branch and
+    // returns 0, so a tuple's element descriptions were invisible before the array-aware `if
+    // (Array.isArray(node))` branch was added.
+    const tuple = z.tuple([
+      z.number().describe('x coordinate, in design pixels'),
+      z.number().describe('y coordinate, in design pixels'),
+    ]);
+    const schema = zodToJsonSchema(z.object({ point: tuple }));
+    const expected = 'point'.length
+      + 'x coordinate, in design pixels'.length
+      + 'y coordinate, in design pixels'.length;
+    expect(sumSchemaBytes(schema)).toBe(expected);
+  });
+
+  it('sums description bytes across a z.union() (`anyOf`)', () => {
+    // A union of bare primitives collapses to a `type: [...]` array rather than `anyOf` (nothing
+    // to recurse into) — object-shaped members force `zodToJsonSchema` to actually emit `anyOf`.
+    const union = z.union([
+      z.object({ path: z.string().describe('a literal path') }),
+      z.object({ id: z.number().describe('a numeric id') }),
+    ]).describe('either a path or an id');
+    const schema = zodToJsonSchema(z.object({ target: union }));
+    const expected = 'target'.length
+      + 'either a path or an id'.length
+      + 'path'.length + 'a literal path'.length
+      + 'id'.length + 'a numeric id'.length;
+    expect(sumSchemaBytes(schema)).toBe(expected);
+  });
+
+  it('sums description bytes inside a z.record() (`additionalProperties`)', () => {
+    const record = z.record(z.string().describe('one override value')).describe('name -> override map');
+    const schema = zodToJsonSchema(z.object({ overrides: record }));
+    const expected = 'overrides'.length + 'name -> override map'.length + 'one override value'.length;
+    expect(sumSchemaBytes(schema)).toBe(expected);
+  });
+
+  it('sums description bytes through a z.object nested 2+ levels deep', () => {
+    // `.describe()` sets metadata on the node it is called on; calling it twice on the SAME
+    // instance overwrites rather than accumulates (`inner.describe('middle inner wrapper')`
+    // replaces whatever description `inner` already carried) — so this deliberately gives `inner`
+    // its description only once, at the depth it is actually read from.
+    const inner = z.object({ deep: z.string().describe('deeply nested prose') });
+    const middle = z.object({ inner: inner.describe('middle inner wrapper') }).describe('middle');
+    const schema = zodToJsonSchema(z.object({ outer: middle }));
+    const expected = 'outer'.length + 'inner'.length + 'deep'.length
+      + 'middle'.length + 'middle inner wrapper'.length + 'deeply nested prose'.length;
+    expect(sumSchemaBytes(schema)).toBe(expected);
+  });
+
+  it('does not double-count a schema referenced under two different keys', () => {
+    // Two INDEPENDENTLY-BUILT instances of the same shape (the `makeEntitySpec()` factory pattern
+    // `shapes.ts` actually uses) — not the same object reused twice, which `zodToJsonSchema`
+    // instead collapses to a `$ref` and is a different (and separately real) gap: this walker does
+    // not resolve `$ref`/`$defs`, so a `$ref`'d property's prose would be invisible rather than
+    // doubled. That gap is out of scope here; this test pins the factory case the real surface
+    // actually uses.
+    const makeShared = () => z.object({ value: z.string().describe('shared leaf prose') });
+    const schema = zodToJsonSchema(z.object({ a: makeShared(), b: makeShared() }));
+    const oneOccurrence = 'value'.length + 'shared leaf prose'.length;
+    expect(sumSchemaBytes(schema)).toBe('a'.length + 'b'.length + oneOccurrence * 2);
+  });
+
+  it('sums description bytes under hand-built `oneOf`/`not`/`patternProperties`/`propertyNames` nodes', () => {
+    // The installed zod-to-json-schema (v3.25, checked in `node_modules`) never actually EMITS
+    // `oneOf`, `not`, `patternProperties`, or `propertyNames` from any zod construct — grepping its
+    // source for `oneOf` turns up only an unrelated internal check, and the real 105-tool surface
+    // scan (#456) found zero live instances of any of them. So there is no zod shape that can drive
+    // these branches through `zodToJsonSchema`; the fixture is a JSON-Schema-shaped object built by
+    // hand instead. `sumSchemaBytes` takes `unknown`, not a zod-shaped type, specifically because it
+    // is meant to walk whatever a compliant JSON Schema hands it — including containers this
+    // library's CURRENT version cannot itself produce, since a future bump could start emitting
+    // them (draft 2020-12 uses `prefixItems`+`patternProperties` far more than draft-07 does).
+    const schema = {
+      type: 'object',
+      properties: {
+        variant: {
+          oneOf: [
+            { type: 'string', description: 'variant as a string' },
+            { type: 'number', description: 'variant as a number' },
+          ],
+          not: { type: 'null', description: 'explicitly never null' },
+        },
+        bag: {
+          patternProperties: {
+            '^opt_': { type: 'string', description: 'one option value' },
+          },
+          propertyNames: { description: 'must start with opt_' },
+        },
+      },
+    };
+    const expected = 'variant'.length + 'bag'.length // top-level property NAMES
+      + 'variant as a string'.length + 'variant as a number'.length // oneOf entries
+      + 'explicitly never null'.length // not
+      + '^opt_'.length + 'one option value'.length // patternProperties: pattern KEY + value description
+      + 'must start with opt_'.length; // propertyNames
+    expect(sumSchemaBytes(schema)).toBe(expected);
+  });
+
+  it('terminates on a schema built from independently-defined but structurally identical branches', () => {
+    // Not a literal cyclic reference (zod/zodToJsonSchema does not hand this walker one), but a
+    // sanity check that recursion through every whitelisted container bottoms out rather than
+    // looping — a walk that recurses into a container it does not also consume would spin forever
+    // on a deep-enough schema instead of failing fast.
+    let node: z.ZodTypeAny = z.string().describe('leaf');
+    for (let i = 0; i < 25; i++) node = z.object({ child: node }).describe(`level ${i}`);
+    const schema = zodToJsonSchema(z.object({ root: node }));
+    expect(() => sumSchemaBytes(schema)).not.toThrow();
+    expect(sumSchemaBytes(schema)).toBeGreaterThan(0);
   });
 });
 

@@ -136,6 +136,11 @@ setCurrentWorld(new)
 App-scoped managers are untouched by swaps — they init/dispose only at
 `registerManager`/`unregisterManager`.
 
+The `init new *-scoped managers` steps above only run while the load that reached
+them is still the live primary — a superseded `loadScene` call skips them instead
+of racing the newer one. See [scene-loading.md](./scene-loading.md) § "SceneManager API" step 9 for the
+guard and its known residual.
+
 ### Method access: singleton, not service-locator
 
 A Manager is a plain singleton; `registerManager` only wires its *lifecycle +

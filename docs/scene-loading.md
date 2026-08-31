@@ -959,7 +959,10 @@ Two consequences worth knowing:
 single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistence)):
 
 1. **Cancel in-flight load** — aborts the previous preload and releases its
-   acquired resources (cancel-and-replace; only one preload runs at a time).
+   acquired resources (cancel-and-replace; only one preload runs **up to the atomic
+   swap** — step 8 clears `nextLoad`, so a load issued during a previous call's
+   post-swap tail (step 9) finds nothing to abort and runs concurrently with that
+   tail. See step 9 for what guards that window instead of `AbortController`.)
 2. **Resolve the chain** (`resolveSceneChain`) and diff it against the currently loaded
    chain: `kept` (carried), `toLoad` (spawned from file), `toDrop` (torn down).
 3. **Allocate** a fresh `SceneId` per `toLoad` entry + one `AbortController`.
@@ -979,7 +982,35 @@ single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistenc
    happen first or a base's Hierarchy label falls back to its raw guid. Then
    `releaseAllForScene(id)` for every `toDrop` scene id drops its refcounts; then
    `oldWorld.destroy()` frees the koota slot.
-9. **Scene callbacks** (`registerSceneCallback`) fire for dynamic spawning.
+9. **Post-swap tail — guarded by `this.primaryId === id`.** Scene callbacks
+   (`registerSceneCallback`) fire for dynamic spawning, then this scene's managers
+   activate: the previous scene's (and, on a game change, the previous game's)
+   managers are disposed via `disposeActiveSceneManagers`/`disposeActiveGameManagers`,
+   then the new scene's/game's managers are activated via
+   `initSceneManagersFor`/`initGameManagersFor` (game-scoped only when the game
+   changed). **This whole tail runs only while `this.primaryId === id`** — i.e. only
+   while THIS load is still the live primary (#435). `fireSceneCallbacks` and
+   `init*ManagersFor` both read `getCurrentWorld()` internally, so a load superseded
+   mid-tail (see step 1) would otherwise rewrite the module-global
+   `activeScenePath`/`activeGameId` back to ITS OWN path and spawn manager entities
+   into the OTHER call's now-active world — unowned there, and never disposed. A
+   superseded load skips the tail and resolves without running it.
+
+   The guard is a `primaryId` comparison rather than the `AbortController` used by
+   the pre-swap checks above, because `nextLoad` (and the abort path with it) is
+   cleared at the swap in step 8 — past that point there is nothing left to signal
+   an abort through. `primaryId` is reassigned at every swap, so inequality alone is
+   the "superseded" signal.
+
+   **Known and deliberately not fixed here (tracked as `TODO(#435-residual)` in the
+   source): this closes only the SCENE-scoped half of the tail.** When the game did
+   NOT change, `gameChanged` is computed from `activeGameId`, which the superseded
+   load already wrote before reaching this guard — so the newer load also computes
+   `gameChanged === false` and skips both `disposeActiveGameManagers` and
+   `initGameManagersFor` for it. Nothing then re-activates the game-scoped managers,
+   and the superseded load's own game-manager `init()` can still be in flight when
+   its world is destroyed in step 8, so that manager can spawn into an already-
+   destroyed world and stay `active` holding a dead world reference.
 
 On **failure or abort**, the staging world is destroyed and its resources released —
 the current scene (and its whole chain) is left completely untouched.

@@ -169,7 +169,7 @@ with a default `limit` and a `hint`:
     { "id": 12, "guid": "…", "name": "Island", "parentId": null, "layer": "3d",
       "traits": ["Transform", "Renderable3D", "ModelSource"] }
   ],
-  "hint": "Names-only index. Drill down: full=1 (all field values), trait=Transform, id=N, name=<substr>, where=\"Transform.y > 3\", limit=N."
+  "hint": "Index only — trait NAMES, no values. Drill down: full=1 (all field values), trait=<Trait>, id=<n>, name=<substr>, where=\"Transform.y > 3\". Enrichers: world=1, bounds=1, contacts=1, resources=1."
 }
 ```
 
@@ -231,7 +231,8 @@ Both were flat full dumps of things the agent almost never needs in full.
 ```
 
 `folder` (path prefix) and `name` (substring) filters are available, and the `type` filter is
-applied **server-side** (previously it fetched all 320 and filtered in `index.ts:310-315`).
+applied **server-side** — in `summarizeAssets` (`engine/tools/modoki-mcp/src/summarize.ts`), called
+from `modoki_list_assets` in `engine/tools/modoki-mcp/src/tools/scene.ts`.
 
 **`list_traits`** (10,703 → ~200 tokens) defaults to trait **names** only; `name=<Trait>` fetches
 one trait's full field schema. The usage pattern is: know what exists, then fetch one schema before
@@ -345,8 +346,11 @@ These were the concrete waste sources, now resolved:
   of throwing, and brought both `tools/` packages under `npm run verify` typecheck (neither was
   before).
 
-- **`list_assets`'s `type` filter was applied client-side**, after fetching all 320 assets
-  (`index.ts:310-315`). Moved server-side alongside the new `folder`/`name` filters.
+- **`list_assets`'s `type` filter was applied client-side**, after fetching all 320 assets (once
+  `index.ts:310-315`; the tools split into `src/tools/*.ts` since, so it's now `summarizeAssets` in
+  `engine/tools/modoki-mcp/src/summarize.ts`, called from `modoki_list_assets` in
+  `engine/tools/modoki-mcp/src/tools/scene.ts`). Moved server-side alongside the new `folder`/`name`
+  filters.
 
 **Not a bug — `enact-handles`'s `editor` filter.** `?editor=chrome` once returned byte-identical
 output to the unfiltered call, which looked like a silently-ignored filter. It isn't: the filter is
@@ -369,6 +373,62 @@ default shape, (b) the drill-down params, (c) a size warning where the full dump
 
 The governing principle, so a newly added tool inherits it: **summary first, drill down on demand;
 producers stay full-fidelity, boundaries summarize.**
+
+## Definition surface — paid on every request, not just the big ones
+
+Everything above budgets **responses**. Nothing budgeted the tool **definitions** themselves —
+`tools/list`'s advertised schema — until #456, and that surface is paid on **every single request**
+a session makes, not once per session like a response.
+
+**Method** (re-run 2026-08-31 to close out #456's review): drive `npx tsx src/index.ts` from
+`engine/tools/modoki-mcp` over stdio via the `@modelcontextprotocol/sdk` `StdioClientTransport` +
+`Client.listTools()`, with `MODOKI_BACKEND=http://127.0.0.1:1` (`listTools` never touches the
+backend). Size = `JSON.stringify(result.tools).length`.
+
+| | chars | ~tok at chars/4 |
+|---|---|---|
+| `tools/list`, 105 tools, before the trim | 198,643 | ~49.7k |
+| `tools/list`, 105 tools, after the trim | 190,319 | ~47.6k |
+
+Three independent measurements of the "after" figure landed within 0.06% of each other (190,213 /
+190,319 / 190,329) — different serialization boundaries around the same payload, not disagreement
+about the surface. 190,319 is this doc's number of record; re-derive it with the method above rather
+than trusting any of the three by eye.
+
+⚠️ Same caveat as "How the numbers were measured" above: **no BPE tokenizer is installed on this
+machine**, and that section's own measurements show chars/4 **understating** a brace/quote-heavy
+JSON payload by 27–38%. Treat every figure here as a **floor**, not the real cost.
+
+**~14,372 chars of duplicated entity/point-spec prose REMAIN, and only ~1,800 of it is the PRICE of
+the no-`$ref` rule** — the rest is NOT recoverable by touching `makeEntitySpec`. Counted as: every
+description string belonging to `makeEntitySpec()`/`makePointSpec()` (`src/shapes.ts`) that appears
+2+ times on the surface, weighted by `(copies − 1) × length`. The entity spec is used at 6 call
+sites — `modoki_tap`, `modoki_pointer`, `modoki_hover`, `modoki_scroll`, and `modoki_drag` TWICE
+(`from` and `to`) — and `zodToJsonSchema` is invoked **per tool**, so it can only dedupe schema
+reused BY REFERENCE *within one tool's own shape*; it has no visibility across tools at all. That
+means **5 of those 6 copies are cross-tool inlining**, inherent to per-tool JSON-Schema
+serialization and unaffected by whether `makeEntitySpec` is a factory or a shared `const` — turning
+it into a `const` would not merge them, because there is no single schema object shared across
+`modoki_tap` and `modoki_drag` for `zod-to-json-schema` to recognize. Only the 6th copy —
+`modoki_drag`'s `to` duplicating its own `from`, both inside the SAME tool via `makePointSpec` — is
+what a shared `const` would actually collapse, and that is priced at ~1,800 chars below. So: ~1,800
+chars is the no-`$ref` rule's real cost; the remaining ~12,500 is cross-tool duplication a shared
+const cannot touch.
+
+**`makeEntitySpec()` in `engine/tools/modoki-mcp/src/shapes.ts` is a factory function, not a shared
+`const` schema, for a correctness reason, not a byte-savings one.** `zod-to-json-schema` dedupes a
+by-reference (shared-object) schema WITHIN one tool's shape into a `$ref`, which broke `modoki_dnd`
+(see the comment at `src/shapes.ts` and the guard `engine/tests/tools/mcpSchemaNoRef.test.ts`) — a
+client that does not resolve JSON-Schema `$ref` saw an untyped field and mis-encoded it. That is why
+nobody should "optimize" the factory into a shared const, independent of what it would or would not
+save in bytes.
+
+**Declined: a briefer `entity` description for `modoki_drag`'s `to` endpoint.** Only `modoki_drag`
+pays the entity-spec blob TWICE — once for `from`, once for `to` — via `makePointSpec`. Giving `to`
+a shorter description than `from` would save ~1,800 chars. Declined: it would add a second
+entity-spec shape to `shapes.ts` that a future tool could reach for wrongly — the same class of
+cleverness the `$ref`-avoidance comment above already warns against. One entity-spec shape, always
+the same wording, is worth more than 1,800 chars.
 
 ## Open / deferred
 

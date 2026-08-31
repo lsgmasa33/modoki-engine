@@ -14,8 +14,18 @@
  *         held by the old scene get disposed
  *  7. Resolve the promise
  *
- *  Concurrency: cancel-and-replace. Only one preload in flight; calling
- *  loadScene() while another is loading aborts the in-flight load.
+ *  Concurrency: cancel-and-replace, but ONLY up to the swap. Before step 6, one
+ *  preload is in flight and calling loadScene() aborts it (nine `signal.aborted`
+ *  checks, one after every await). At the swap `nextLoad` is cleared, so from
+ *  there on there is nothing left to abort THROUGH: a loadScene() issued during
+ *  the post-swap tail finds nothing to cancel and runs concurrently with it.
+ *  The tail is guarded instead by `this.primaryId === id` — primaryId is
+ *  reassigned at every swap, so inequality IS the "superseded" signal — which
+ *  gates the re-activation half (fireSceneCallbacks / init*ManagersFor) because
+ *  those rewrite module-global manager state and read getCurrentWorld() (#435).
+ *  Dispose/release/destroy in the tail stay unguarded on purpose: they act on the
+ *  world and path from BEFORE this load, which no newer load touches.
+ *  See docs/scene-loading.md § SceneManager API step 9 for the known residual.
  *
  *  Failure: if any step fails, release the next-scene's acquired resources and
  *  reject the promise. The current scene is untouched.
@@ -873,15 +883,41 @@ class SceneManagerImpl implements SceneManager {
         try { oldWorld.destroy(); } catch (e) { console.warn('[SceneManager] Failed to destroy old world:', e); }
       }
 
-      // 11. Fire per-scene callbacks for dynamic entity spawning
-      this.fireSceneCallbacks(path);
+      // 11. Fire per-scene callbacks for dynamic entity spawning, then activate
+      // this scene's managers — but ONLY if this load is still the live primary.
+      // `this.nextLoad` was cleared at the swap above, so it can no longer signal
+      // "abort me" to a load that starts during this tail; a second loadScene()
+      // issued while the awaits below are pending finds nothing to cancel and
+      // swaps its own world in concurrently. If we didn't check here, this call
+      // would then rewrite activeScenePath back to ITS path and spawn manager
+      // entities via getCurrentWorld() into the OTHER call's now-active world
+      // (#435) — both `fireSceneCallbacks` and `init*ManagersFor` read
+      // getCurrentWorld() internally, so they're only safe to run while `id` is
+      // still `this.primaryId`. A superseded load skips straight to resolving.
+      //
+      // This guard closes the SCENE-scoped tier: a superseded tail can no longer
+      // rewrite `activeScenePath` or spawn scene managers into the newer load's
+      // world. A residual remains for the GAME-scoped tier when the game did NOT
+      // change: `gameChanged` is computed from `activeGameId`, which the superseded
+      // load already set before it got here, so the NEWER load also sees
+      // `gameChanged === false` and skips both `disposeActiveGameManagers` and
+      // `initGameManagersFor` for it — meaning nothing re-activates the game
+      // managers, and the superseded load's own game-manager `init()` may still be
+      // in flight when its world is destroyed above, so that manager can spawn
+      // into a destroyed world and stay `active` holding a dead world reference.
+      // Not fixed here — tracked as TODO(#435-residual).
+      if (this.primaryId === id) {
+        this.fireSceneCallbacks(path);
 
-      // Activate the new game's game-scoped managers (only when the game changed;
-      // an in-game swap keeps them running), then the new scene's scene-scoped
-      // managers. Awaited so async init (e.g. entity spawning) completes before
-      // loadScene resolves.
-      if (gameChanged) await bootSpanAsync('game-managers-init', () => initGameManagersFor(nextGameId, path));
-      await bootSpanAsync('scene-managers-init', () => initSceneManagersFor(path), path);
+        // Activate the new game's game-scoped managers (only when the game changed;
+        // an in-game swap keeps them running), then the new scene's scene-scoped
+        // managers. Awaited so async init (e.g. entity spawning) completes before
+        // loadScene resolves.
+        if (gameChanged) await bootSpanAsync('game-managers-init', () => initGameManagersFor(nextGameId, path));
+        if (this.primaryId === id) {
+          await bootSpanAsync('scene-managers-init', () => initSceneManagersFor(path), path);
+        }
+      }
 
       // 12. Done
     } catch (err) {

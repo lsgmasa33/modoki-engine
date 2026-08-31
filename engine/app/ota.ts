@@ -54,6 +54,19 @@ type GateListener = (state: OtaGateState | null) => void;
 const gateListeners = new Set<GateListener>();
 
 function setGate(state: OtaGateState | null): void {
+  // A `null` write must never dismiss a mandatory "restart to continue" screen (#437) — that
+  // screen is the terminal state for this launch, and clearing it leaves a dead-end shell with
+  // no gate and no content.
+  //
+  // ⚠️ This is DEFENSIVE, and currently unreachable — do not read it as load-bearing. Measured by
+  // mutation during #437's close-out: deleting this line fails NO test, because the two guards
+  // below already close every path to it. `setGate` has exactly one caller (`setGateIfCurrent`,
+  // itself generation-guarded), so a stale call's `null` is dropped on the generation check; and a
+  // FRESH call cannot get here either, since `checkAppOtaUpdate` short-circuits on entry once the
+  // gate is terminal. It is kept because it is two lines and it protects the one failure that
+  // actually hurts (a mandatory screen vanishing) against a FUTURE second caller of `setGate` —
+  // not because anything today depends on it.
+  if (state === null && gateState?.phase === 'ready-to-restart') return;
   gateState = state;
   gateListeners.forEach((l) => l(state));
 }
@@ -73,17 +86,38 @@ export function subscribeOtaGate(listener: GateListener): () => void {
  *  never load the scene for the rest of this app launch; `subscribeOtaGate` reports
  *  `'ready-to-restart'` from that point on, and only a manual app restart (native
  *  boot hook re-derives what to serve from state.json) moves things forward. */
+// #437: the App.tsx boot effect can re-run `checkAppOtaUpdate()` (a `[gameId]` re-run) before an
+// in-flight call returns, and that in-flight call is never cancelled — it just keeps writing
+// `setGate` from an epoch nobody wants anymore. Same idiom as `loaders/fontLoader.ts` /
+// `loaders/timelineCache.ts` / `app/editor/setup.ts`'s `deviceListGeneration`: bump a generation
+// per call, and refuse every gate write once a newer call has started.
+let otaCheckGeneration = 0;
+
 export async function checkAppOtaUpdate(): Promise<boolean> {
+  // `ready-to-restart` is terminal for this app launch (see setGate's backstop and this
+  // function's doc comment): once a mandatory update has staged, NOTHING may boot behind that
+  // screen. The `[gameId]` boot effect in App.tsx can call this again after the gate is up — a
+  // game swap — and without this the second call would find nothing to do, return `true`, and
+  // let App.tsx load a scene underneath a gate the user cannot dismiss (#437 review finding 3).
+  if (gateState?.phase === 'ready-to-restart') return false;
+
   const { ota } = projectConfig;
   if (!ota.enabled) return true;
   if (!Capacitor.isNativePlatform()) return true; // no OTA mechanism to hand this to on web
 
+  const myGeneration = ++otaCheckGeneration;
+  const setGateIfCurrent = (state: OtaGateState | null): void => {
+    if (myGeneration !== otaCheckGeneration) return; // superseded — a newer check owns the gate now
+    setGate(state);
+  };
+
+  let listenerHandle: { remove: () => Promise<void> } | undefined;
   try {
     const m = await import('capacitor-modoki-ota');
     let armed = false; // true once onWillStage has told us THIS update is mandatory
-    const listenerHandle = await m.ModokiOta.addListener('otaProgress', (e) => {
+    listenerHandle = await m.ModokiOta.addListener('otaProgress', (e) => {
       console.log('[GameShell] OTA progress:', e);
-      if (armed) setGate({ phase: 'downloading', version: e.version, progress: e });
+      if (armed) setGateIfCurrent({ phase: 'downloading', version: e.version, progress: e });
     });
 
     const result = await checkForUpdate({
@@ -95,22 +129,27 @@ export async function checkAppOtaUpdate(): Promise<boolean> {
       onWillStage: (info) => {
         if (!info.mandatory) return;
         armed = true;
-        setGate({ phase: 'downloading', version: info.version, progress: null });
+        setGateIfCurrent({ phase: 'downloading', version: info.version, progress: null });
       },
     });
     console.log('[GameShell] OTA checkForUpdate result:', result);
-    void listenerHandle.remove();
 
     if (result.outcome === 'staged' && result.mandatory) {
-      setGate({ phase: 'ready-to-restart', version: result.version });
+      setGateIfCurrent({ phase: 'ready-to-restart', version: result.version });
       return false;
     }
-    setGate(null); // un-arm: either nothing mandatory happened, or staging failed downstream
+    setGateIfCurrent(null); // un-arm: either nothing mandatory happened, or staging failed downstream
     return true;
   } catch (e) {
     console.warn('[GameShell] OTA checkForUpdate failed (non-fatal):', e);
-    setGate(null);
+    setGateIfCurrent(null);
     return true;
+  } finally {
+    // The catch above is a routine path, not exceptional — a project without the OTA native
+    // plugin rejects `import('capacitor-modoki-ota')` on every launch — so the listener must be
+    // removed on that path too, not just after a normal return. `void`-ed: a failure to remove
+    // must not mask whatever error is already propagating.
+    void listenerHandle?.remove();
   }
 }
 

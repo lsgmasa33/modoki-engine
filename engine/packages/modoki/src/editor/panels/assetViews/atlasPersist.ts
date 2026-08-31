@@ -108,3 +108,40 @@ export function classifyAtlasLoad(outcome: AtlasLoadOutcome):
 export function canPersistAtlasDoc(loadState: AtlasLoadState, loadedPath: string | null, path: string): boolean {
   return loadState === 'ok' && loadedPath === path;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Compare-and-swap write guard (#439).
+//
+// The panel writes the WHOLE document on every control interaction. Nothing reliably notifies
+// this panel of a same-path content change on disk (`assetsVersion` is keyed on the asset PATH
+// SET — see assetSetSignature.ts's header — not content), so a `git checkout` under a live
+// editor (CLAUDE.md's documented hazard) can change the file's content at the same path with no
+// signal reaching this panel. The next edit would then serialize on top of a stale read and
+// silently revert whatever changed. The guarantee has to sit on the WRITE: re-read the file
+// immediately before writing, and refuse to write if it no longer matches what was last read.
+
+/** Whether the file on disk still holds what the panel read, i.e. whether a whole-document
+ *  write is safe. `currentText === null` means the re-read itself failed. */
+export function atlasWriteIsSafe(loadedText: string | null, currentText: string | null): boolean {
+  return loadedText !== null && currentText !== null && loadedText === currentText;
+}
+
+/** Re-read `path` and write `content` only if the file still matches `loadedText` (#439).
+ *  Returns 'written' | 'conflict' | 'failed'. Takes the reader as a parameter so a test can
+ *  drive it without a backend. */
+export async function persistAtlasDocIfUnchanged(
+  path: string,
+  content: string,
+  loadedText: string | null,
+  readCurrent: (path: string) => Promise<string | null>,
+): Promise<'written' | 'conflict' | 'failed'> {
+  let currentText: string | null;
+  try {
+    currentText = await readCurrent(path);
+  } catch {
+    currentText = null;
+  }
+  if (!atlasWriteIsSafe(loadedText, currentText)) return 'conflict';
+  const ok = await persistAtlasDoc(path, content);
+  return ok ? 'written' : 'failed';
+}

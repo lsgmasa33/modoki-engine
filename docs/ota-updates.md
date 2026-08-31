@@ -117,6 +117,22 @@ around. A routine (non-mandatory) release, any error, or nothing-to-do all resol
 boot proceeds normally, staging (if any) continues in the background exactly as before Phase
 3b.
 
+**`ready-to-restart` is sticky and terminal (#437).** Once `setGate` has been called with
+`{phase: 'ready-to-restart', ...}`, a subsequent `setGate(null)` is refused regardless of
+caller — clearing it would leave a dead-end shell with no gate and no content, so the
+`OtaRestartGate` is the last screen for the rest of this app launch, full stop. This matters
+because `checkAppOtaUpdate()` can be re-entered: `App.tsx`'s `[gameId]` boot effect can call it
+again (a game swap) while an earlier call is still awaiting `checkForUpdate`, and the earlier
+call is never cancelled. Two guards close that race:
+- **A per-call generation counter** (`otaCheckGeneration`, bumped once per `checkAppOtaUpdate()`
+  call) makes every gate write from a superseded call a no-op — the same epoch idiom as
+  `loaders/fontLoader.ts`, `loaders/timelineCache.ts`, and `app/editor/setup.ts`'s
+  `deviceListGeneration`.
+- **`checkAppOtaUpdate()` short-circuits to `false` on entry once the gate is already
+  `'ready-to-restart'`** — without it, a re-entrant call would find nothing left to stage,
+  resolve `true`, and let `App.tsx` load a scene and run the whole game underneath a gate the
+  user cannot dismiss.
+
 **The native splash is also dismissed on this same "fully booted" render** (`App.tsx`, right
 alongside `confirmBoot`) — `@capacitor/splash-screen` is now in the engine's required-plugin
 set (self-heals into every native project's `package.json` the same way `@capacitor/app`/
