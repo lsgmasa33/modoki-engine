@@ -16,6 +16,8 @@ import {
   RENDERER_READY_TIMEOUT_MS,
   RENDERER_READY_SOFT_TIMEOUT_MS,
 } from '../../src/editor/createEditor';
+import type { SceneLoadOutcome } from '../../src/editor/scene/serialize';
+import { sceneManager } from '../../src/runtime/scene/SceneManager';
 import { registerAsset, clearManifest } from '../../src/runtime/loaders/assetManifest';
 
 describe('lastSceneKey (per-project scoping)', () => {
@@ -279,7 +281,7 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
 
   it('canonicalizes a candidate and loads the canonical path', async () => {
     const canonicalize = vi.fn(async () => CANON);
-    const load = vi.fn(async () => true);
+    const load = vi.fn(async (): Promise<SceneLoadOutcome> => 'loaded');
     expect(await loadFirstScene([BUNDLE], { canonicalize, load })).toBe(CANON);
     expect(canonicalize).toHaveBeenCalledWith(BUNDLE);
     expect(load).toHaveBeenCalledTimes(1);
@@ -288,7 +290,7 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
 
   it('falls back to the RAW candidate when the canonical path fails to load', async () => {
     const canonicalize = vi.fn(async () => CANON);
-    const load = vi.fn(async (p: string) => p === BUNDLE); // canonical fails, raw loads
+    const load = vi.fn(async (p: string): Promise<SceneLoadOutcome> => (p === BUNDLE ? 'loaded' : 'failed')); // canonical fails, raw loads
     expect(await loadFirstScene([BUNDLE], { canonicalize, load })).toBe(BUNDLE);
     expect(load).toHaveBeenNthCalledWith(1, CANON);
     expect(load).toHaveBeenNthCalledWith(2, BUNDLE);
@@ -305,9 +307,9 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
   it('advances to the next candidate when a candidate THROWS (SPA html fallback)', async () => {
     const STALE = '/@fs/C:/Users/x/Desktop/test/runtime/assets/scenes/main.json';
     const canonicalize = vi.fn(async (p: string) => p);
-    const load = vi.fn(async (p: string) => {
+    const load = vi.fn(async (p: string): Promise<SceneLoadOutcome> => {
       if (p === STALE) throw HTML_ERR; // dev server served index.html
-      return true;
+      return 'loaded';
     });
     expect(await loadFirstScene([STALE, CANON], { canonicalize, load })).toBe(CANON);
     expect(load).toHaveBeenNthCalledWith(1, STALE);
@@ -316,7 +318,7 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
 
   it('returns null (does not reject) when EVERY candidate throws', async () => {
     const canonicalize = vi.fn(async (p: string) => p);
-    const load = vi.fn(async () => { throw HTML_ERR; });
+    const load = vi.fn(async (): Promise<SceneLoadOutcome> => { throw HTML_ERR; });
     await expect(loadFirstScene([BUNDLE, CANON], { canonicalize, load })).resolves.toBeNull();
     expect(load).toHaveBeenCalledTimes(2);
   });
@@ -330,7 +332,7 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const canonicalize = vi.fn(async (p: string) => p);
-      const load = vi.fn(async (p: string) => p === CANON);
+      const load = vi.fn(async (p: string): Promise<SceneLoadOutcome> => (p === CANON ? 'loaded' : 'failed'));
       expect(await loadFirstScene([BUNDLE, CANON], { canonicalize, load })).toBe(CANON);
       expect(err).not.toHaveBeenCalled();
     } finally {
@@ -347,7 +349,7 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const canonicalize = vi.fn(async (p: string) => p);
-      const load = vi.fn(async () => true);
+      const load = vi.fn(async (): Promise<SceneLoadOutcome> => 'loaded');
       expect(await loadFirstScene([], { canonicalize, load })).toBeNull();
       expect(load).not.toHaveBeenCalled();
       expect(err).not.toHaveBeenCalled();
@@ -362,7 +364,7 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const canonicalize = vi.fn(async (p: string) => p);
-      const load = vi.fn(async () => false);
+      const load = vi.fn(async (): Promise<SceneLoadOutcome> => 'failed');
       expect(await loadFirstScene([BUNDLE, CANON], { canonicalize, load })).toBeNull();
       expect(err).toHaveBeenCalledTimes(1);
       const msg = String(err.mock.calls[0]?.[0]);
@@ -375,23 +377,23 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
 
   it('falls back to the RAW candidate when the CANONICAL one throws', async () => {
     const canonicalize = vi.fn(async () => CANON);
-    const load = vi.fn(async (p: string) => {
+    const load = vi.fn(async (p: string): Promise<SceneLoadOutcome> => {
       if (p === CANON) throw HTML_ERR;
-      return true;
+      return 'loaded';
     });
     expect(await loadFirstScene([BUNDLE], { canonicalize, load })).toBe(BUNDLE);
   });
 
   it('survives a THROWING canonicalize by using the raw candidate', async () => {
     const canonicalize = vi.fn(async () => { throw new Error('network down'); });
-    const load = vi.fn(async () => true);
+    const load = vi.fn(async (): Promise<SceneLoadOutcome> => 'loaded');
     expect(await loadFirstScene([BUNDLE], { canonicalize, load })).toBe(BUNDLE);
     expect(load).toHaveBeenCalledWith(BUNDLE);
   });
 
   it('does NOT double-load when the candidate is already canonical', async () => {
     const canonicalize = vi.fn(async (p: string) => p); // already canonical
-    const load = vi.fn(async () => false);
+    const load = vi.fn(async (): Promise<SceneLoadOutcome> => 'failed');
     expect(await loadFirstScene([CANON], { canonicalize, load })).toBeNull();
     expect(load).toHaveBeenCalledTimes(1); // no raw-fallback retry (canonical === candidate)
   });
@@ -399,7 +401,7 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
   it('advances to the next candidate when both canonical and raw fail', async () => {
     const canonicalize = vi.fn(async (p: string) => `${p}#canon`);
     const order: string[] = [];
-    const load = vi.fn(async (p: string) => { order.push(p); return p === '/b.json#canon'; });
+    const load = vi.fn(async (p: string): Promise<SceneLoadOutcome> => { order.push(p); return p === '/b.json#canon' ? 'loaded' : 'failed'; });
     expect(await loadFirstScene(['/a.json', '/b.json'], { canonicalize, load })).toBe('/b.json#canon');
     // a canonical, a raw, then b canonical (succeeds → stops before b raw).
     expect(order).toEqual(['/a.json#canon', '/a.json', '/b.json#canon']);
@@ -407,7 +409,7 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
 
   it('stops at the first success without touching later candidates', async () => {
     const canonicalize = vi.fn(async (p: string) => p);
-    const load = vi.fn(async () => true);
+    const load = vi.fn(async (): Promise<SceneLoadOutcome> => 'loaded');
     expect(await loadFirstScene([CANON, '/other.json'], { canonicalize, load })).toBe(CANON);
     expect(canonicalize).toHaveBeenCalledTimes(1);
     expect(load).toHaveBeenCalledTimes(1);
@@ -415,9 +417,76 @@ describe('loadFirstScene (boot loop: canonicalize → load, raw fallback)', () =
 
   it('returns null when no candidate loads (→ initWorld/empty-camera path)', async () => {
     const canonicalize = vi.fn(async (p: string) => p);
-    const load = vi.fn(async () => false);
+    const load = vi.fn(async (): Promise<SceneLoadOutcome> => 'failed');
     expect(await loadFirstScene(['/a.json', '/b.json'], { canonicalize, load })).toBeNull();
     expect(await loadFirstScene([], { canonicalize, load })).toBeNull();
+  });
+
+  /** #495: a candidate that comes back 'superseded' (another load — an agent op, a rapid
+   *  second boot — won the swap first) must STOP the fallback walk, not treat it as a miss
+   *  and try the next candidate. Continuing would load a THIRD scene over whichever one
+   *  actually won. */
+  it('stops the walk on a "superseded" candidate — does NOT try the next one', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    try {
+      const canonicalize = vi.fn(async (p: string) => p);
+      const load = vi.fn(async (): Promise<SceneLoadOutcome> => 'superseded');
+      expect(await loadFirstScene([BUNDLE, CANON], { canonicalize, load })).toBeNull();
+      expect(load).toHaveBeenCalledTimes(1); // never reached the second candidate
+      expect(info).toHaveBeenCalledTimes(1);
+      expect(String(info.mock.calls[0]?.[0])).toContain(BUNDLE);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  /** #495, the half that is NOT about stopping the walk: what a supersede RESOLVES TO.
+   *  `null` means "no candidate loaded" to this function's caller, which answers it by running
+   *  `config.initWorld()` and `setCurrentScenePath(candidates[last])` — destroying the world the
+   *  WINNING load just installed and then naming a scene that is not loaded. That is strictly
+   *  worse than the reporting bug #495 is about, so a supersede must resolve to the scene that
+   *  actually won whenever there is one. `null` survives only for "nothing is loaded at all",
+   *  which is precisely when initWorld IS the right answer. */
+  it('a superseded candidate resolves to the scene that actually WON, not null (#495)', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const cur = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 9, path: '/winner.scene.json', state: 'active' } as never);
+    try {
+      const canonicalize = vi.fn(async (p: string) => p);
+      const load = vi.fn(async (): Promise<SceneLoadOutcome> => 'superseded');
+      expect(await loadFirstScene([BUNDLE, CANON], { canonicalize, load })).toBe('/winner.scene.json');
+      expect(String(info.mock.calls[0]?.[0])).toContain('/winner.scene.json');
+    } finally {
+      info.mockRestore();
+      cur.mockRestore();
+    }
+  });
+
+  it('a supersede with NOTHING active still resolves null — initWorld is the right answer there (#495)', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const cur = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue(null as never);
+    try {
+      const canonicalize = vi.fn(async (p: string) => p);
+      const load = vi.fn(async (): Promise<SceneLoadOutcome> => 'superseded');
+      expect(await loadFirstScene([BUNDLE], { canonicalize, load })).toBeNull();
+    } finally {
+      info.mockRestore();
+      cur.mockRestore();
+    }
+  });
+
+  it('a "superseded" RAW-candidate retry also stops the walk', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    try {
+      const canonicalize = vi.fn(async () => CANON);
+      const load = vi.fn(async (p: string): Promise<SceneLoadOutcome> => (p === CANON ? 'failed' : 'superseded'));
+      expect(await loadFirstScene([BUNDLE, '/other.json'], { canonicalize, load })).toBeNull();
+      expect(load).toHaveBeenNthCalledWith(1, CANON);
+      expect(load).toHaveBeenNthCalledWith(2, BUNDLE);
+      expect(load).toHaveBeenCalledTimes(2); // never reached '/other.json'
+      expect(info).toHaveBeenCalledTimes(1);
+    } finally {
+      info.mockRestore();
+    }
   });
 });
 

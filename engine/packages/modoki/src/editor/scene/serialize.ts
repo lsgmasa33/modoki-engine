@@ -963,6 +963,18 @@ export async function saveScene(opts: {
   return { saved: false, path: target, reason: 'write-failed' };
 }
 
+/** Monotonic load counter — the newest `loadScene` call owns the progress modal.
+ *  See the epoch guard inside loadScene. */
+let _loadEpoch = 0;
+
+/** `loadScene`'s outcome. `'superseded'` covers BOTH ways a load can lose to a newer one:
+ *  cancelled early (SceneManager aborts the in-flight load — rejects with AbortError) and
+ *  superseded in the winner's TAIL (`sceneManager.ts:885-900` — nothing left to cancel, so the
+ *  loser's own `sceneManager.loadScene` resolves successfully and throws nothing). Neither case
+ *  is `'failed'`: this op's own load did not fail, and it says nothing about whether the path
+ *  exists. See the doc comment on `loadScene` for why this can't just be a boolean. */
+export type SceneLoadOutcome = 'loaded' | 'superseded' | 'failed';
+
 /** Load a scene from a JSON file. Delegates to SceneManager which handles the
  *  full async preload + atomic swap + refcount lifecycle. The editor wrapper
  *  layers on the editor-only concerns: tracking the current scene path and
@@ -972,16 +984,21 @@ export async function saveScene(opts: {
  *  derives the game from a `/games/<id>/` path segment, but the editor boots the
  *  canonical working-copy path (`/assets/scenes/x.json`, gap #2) which carries no
  *  such segment — so the editor boot passes the project's game id explicitly.
- *  Subsequent in-editor scene opens omit it and inherit the active game. */
-/** Monotonic load counter — the newest `loadScene` call owns the progress modal.
- *  See the epoch guard inside loadScene. */
-let _loadEpoch = 0;
-
+ *  Subsequent in-editor scene opens omit it and inherit the active game.
+ *
+ *  Returns a `SceneLoadOutcome`, not a boolean — `false` is the WRONG answer for a superseded
+ *  load, for every caller that inspects it. `loadFirstScene`'s `tryLoad` (createEditor.tsx)
+ *  treats a miss as "try the NEXT boot candidate", so a superseded load reported as `false`
+ *  would load a THIRD scene over the winner. And `agentEditorOps.ts`'s `load-scene` turns
+ *  `false` into "load-scene FAILED for X — the scene was not loaded (does the path exist?)",
+ *  which is exactly the wrong-diagnosis bug fixed on the runtime twin (`agentBridge.ts`) in
+ *  #486 finding A — a superseded load's own request did not fail, and this says nothing about
+ *  whether the path exists. */
 export async function loadScene(
   scenePath: string,
   gameId?: string,
   opts?: { probing?: boolean },
-): Promise<boolean> {
+): Promise<SceneLoadOutcome> {
   // Epoch guard: SceneManager cancels an in-flight load when a newer one starts
   // (boot autoload vs an agent/menu open, or rapid scene switches). The aborted
   // load's `finally` must NOT clear the progress modal the WINNING load is
@@ -1000,6 +1017,18 @@ export async function loadScene(
         if (epoch === _loadEpoch) setSceneLoadStatus({ active: true, loaded, total });
       },
     });
+    if (epoch !== _loadEpoch) {
+      // Superseded in the WINNER'S TAIL (sceneManager.ts:885-900): our own `sceneManager.loadScene`
+      // resolved successfully — nothing threw, so the `catch` below never sees this case — but a
+      // newer `loadScene` call already won. Running the writes below now would stomp the winner:
+      // `setCurrentScenePath` would persist OUR path over the winner's (localStorage too, so the
+      // next editor launch would reopen the wrong scene), `swapHistory` would rebind the undo
+      // stack to OUR scene while the winner's world is live (the exact stale-id hazard per-scene
+      // history keying exists to prevent), and `editorEmit('!scene-load', …)` would journal our
+      // path against the winner's live entity count — corrupting the record `modoki_editor_journal`
+      // answers "who changed this" from. So: none of it runs.
+      return 'superseded';
+    }
     setCurrentScenePath(scenePath); // persists to localStorage for next editor launch
     setCurrentBaseScene(sceneManager.getCurrentBaseScene());
     // Swap to THIS scene's own undo history (empty on first visit) instead of
@@ -1016,23 +1045,23 @@ export async function loadScene(
     // Editor Percept (V2): the human opened a scene — correlate later game/edit events to it.
     editorEmit('!scene-load', { path: scenePath, entityCount });
     console.log(`[Editor] Loaded scene: ${entityCount} entities from ${scenePath}`);
-    return true;
+    return 'loaded';
   } catch (e) {
-    // An AbortError means a newer load superseded this one (by design — see the
-    // epoch guard above); it's expected, not a failure worth a red console error.
-    if ((e as Error)?.name !== 'AbortError') {
-      // `probing`: the caller is walking a CANDIDATE LIST (editor boot) and a miss here is a
-      // normal step, not a failure — the next candidate is expected to load. Logging it at
-      // `error` made a healthy self-healing boot look broken, and because
-      // `smoke-packaged.sh` / `assert-app-renders.sh` fail on ANY renderer console error, a
-      // stale remembered scene path could fail a packaging gate for a reason unrelated to the
-      // commit under test (#91). The genuine "nothing loaded at all" error is raised ONCE by
-      // loadFirstScene after every candidate has missed.
-      const msg = `[Editor] Failed to load scene: ${e}`;
-      if (opts?.probing) console.warn(`${msg} (trying the next boot candidate…)`);
-      else console.error(msg);
-    }
-    return false;
+    // An AbortError means a newer load superseded this one — CANCELLED early, by design (see
+    // the epoch guard above); it's expected, not a failure worth a red console error, and it's
+    // the same outcome as the tail-supersede case above: this op's own load did not fail.
+    if ((e as Error)?.name === 'AbortError') return 'superseded';
+    // `probing`: the caller is walking a CANDIDATE LIST (editor boot) and a miss here is a
+    // normal step, not a failure — the next candidate is expected to load. Logging it at
+    // `error` made a healthy self-healing boot look broken, and because
+    // `smoke-packaged.sh` / `assert-app-renders.sh` fail on ANY renderer console error, a
+    // stale remembered scene path could fail a packaging gate for a reason unrelated to the
+    // commit under test (#91). The genuine "nothing loaded at all" error is raised ONCE by
+    // loadFirstScene after every candidate has missed.
+    const msg = `[Editor] Failed to load scene: ${e}`;
+    if (opts?.probing) console.warn(`${msg} (trying the next boot candidate…)`);
+    else console.error(msg);
+    return 'failed';
   } finally {
     // Only the latest load owns the modal — a superseded load must not hide the
     // winner's progress bar (its `finally` can run after the winner set active).

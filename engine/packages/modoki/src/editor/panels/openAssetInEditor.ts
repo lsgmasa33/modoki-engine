@@ -70,8 +70,11 @@ export async function openAssetInEditor(asset: SelectedAsset): Promise<void> {
     }
     case 'scene': {
       const { loadScene } = await import('../scene/serialize');
-      const ok = await loadScene(path);
-      if (ok) console.log(`[openAssetInEditor] Opened scene: ${path}`);
+      const outcome = await loadScene(path);
+      if (outcome === 'loaded') console.log(`[openAssetInEditor] Opened scene: ${path}`);
+      // 'superseded' is not a failure to the user — another load (an agent op, a rapid
+      // second click) already won the swap, so this open simply did nothing.
+      else if (outcome === 'superseded') console.log(`[openAssetInEditor] Scene open for ${path} was superseded by another load.`);
       return;
     }
     case 'particle':

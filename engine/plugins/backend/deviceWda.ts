@@ -43,7 +43,7 @@
  * Each of those still gets the loud synthetic banner, so the weaker mechanism is never quiet.
  */
 
-import { decodeAimReply, resolveAimViaDevice, STALE_APP_REASON, type RouteOutcome } from './deviceAim';
+import { decodeAimReply, resolveAimViaDevice, aimAsResolved, STALE_APP_REASON, type RouteOutcome } from './deviceAim';
 // TYPE-ONLY, and it must stay that way: `wdaLauncher` is loaded through a dynamic import below so
 // an iOS-free session never pays for it. A type import is erased, so this costs nothing at runtime.
 import type { LeaseHardware } from './wdaLauncher';
@@ -285,7 +285,7 @@ export async function tryDeviceWdaInput(method: string, params: Record<string, u
       if (r.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
       if (r.kind === 'refusal') return { handled: true, reply: r.error };
       await wdaTap(session, r.aim.x, r.aim.y);
-      return { handled: true, reply: `ok (wda touch) css(${Math.round(r.aim.x)},${Math.round(r.aim.y)}) @ ${r.aim.label} [input:${TRUSTED_WDA_MECHANISM}]` };
+      return { handled: true, reply: `ok (wda touch) css(${Math.round(r.aim.x)},${Math.round(r.aim.y)}) @ ${aimAsResolved(r.aim.label)} [input:${TRUSTED_WDA_MECHANISM}]` };
     }
     // drag
     const from = await resolveAimViaDevice(deps, params, 'fromSelector', 'fromX', 'fromY');

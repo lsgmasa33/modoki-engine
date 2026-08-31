@@ -23,7 +23,8 @@ import { getCurrentWorld, spawnEntity } from '../runtime/core/ecs/world';
 import { Camera } from '../runtime/traits/Camera';
 import { Transform } from '../runtime/core/traits/Transform';
 import { EntityAttributes } from '../runtime/core/traits/EntityAttributes';
-import { loadScene, setCurrentScenePath, setScenePersistenceProject, lastSceneKey } from './scene/serialize';
+import { loadScene, setCurrentScenePath, setScenePersistenceProject, lastSceneKey, type SceneLoadOutcome } from './scene/serialize';
+import { sceneManager } from '../runtime/scene/SceneManager';
 import { registerSelectionRestore } from './store/selectionRestore';
 import { registerLastAnimationClipPersistence, restoreLastAnimationClip } from './animation/lastAnimationClip';
 import { setEditorProjectScope } from './projectScopedKey';
@@ -220,10 +221,10 @@ export async function canonicalBootScenePath(
  *  collaborators — exported for unit testing. */
 export async function loadFirstScene(
   candidates: string[],
-  deps: { canonicalize: (p: string) => Promise<string>; load: (p: string) => Promise<boolean> },
+  deps: { canonicalize: (p: string) => Promise<string>; load: (p: string) => Promise<SceneLoadOutcome> },
 ): Promise<string | null> {
   // A candidate that THROWS must not abort the fallback chain. `load` rejects (it
-  // does not merely return false) whenever the host serves something that isn't the
+  // does not merely resolve 'failed') whenever the host serves something that isn't the
   // scene JSON — most commonly the dev server's SPA index.html fallback, which makes
   // JSON.parse throw `Unexpected token '<'`. That escaped this loop, so the very
   // fallback the loop exists to provide never ran and editor boot died on the first
@@ -231,13 +232,35 @@ export async function loadFirstScene(
   // on a DIFFERENT Windows drive — Vite's html-fallback middleware refuses such
   // paths (vitejs/vite#12816, closed as not-planned), so it 404s to index.html while
   // the project's own `/assets/...` candidate right behind it would have loaded.
-  const tryLoad = async (p: string): Promise<boolean> => {
+  const tryLoad = async (p: string): Promise<SceneLoadOutcome> => {
     try {
       return await deps.load(p);
     } catch (err) {
       console.warn(`[Editor] Scene at ${p} failed to load, trying next fallback…`, err);
-      return false;
+      return 'failed';
     }
+  };
+  // A load reported 'superseded' by ANOTHER load winning the swap first (e.g. an agent/menu
+  // open racing this boot walk) must STOP the candidate loop, not continue to the next
+  // candidate — continuing would load a THIRD scene over whichever one actually won.
+  //
+  // ⚠️ It returns the scene that ACTUALLY won, not `null`. `null` means "no candidate loaded" to
+  // this function's caller, and that caller answers it by running `config.initWorld()` (or
+  // spawning an empty camera scene) and calling `setCurrentScenePath(candidates[last])` — which
+  // on a supersede would destroy the world the winning load just installed and then name a scene
+  // that is not loaded. That is strictly worse than the reporting bug this whole change is about,
+  // so a supersede must resolve to a truthful non-null path whenever one exists. `null` survives
+  // only for the genuine "nothing is loaded at all" case, which is exactly when `initWorld` IS
+  // the right answer. Read from `sceneManager` rather than `getCurrentScenePath()`: the editor's
+  // tracked path is written by the winner's own tail and can still be the pre-swap value at this
+  // instant, and naming a stale scene here would be the same class of untruth as the bug.
+  const onSuperseded = (candidate: string): string | null => {
+    const active = sceneManager.getCurrent()?.path ?? null;
+    console.info(
+      `[Editor] Scene load for ${candidate} was superseded by another load; `
+      + `"${active ?? 'null'}" is the scene that actually won.`,
+    );
+    return active;
   };
   for (const candidate of candidates) {
     // Canonicalization is best-effort: fall back to the raw candidate if it throws.
@@ -247,8 +270,14 @@ export async function loadFirstScene(
     } catch {
       // canonical is already `candidate` (the declaration default).
     }
-    if (await tryLoad(canonical)) return canonical;
-    if (canonical !== candidate && (await tryLoad(candidate))) return candidate;
+    const canonicalOutcome = await tryLoad(canonical);
+    if (canonicalOutcome === 'loaded') return canonical;
+    if (canonicalOutcome === 'superseded') return onSuperseded(canonical);
+    if (canonical !== candidate) {
+      const rawOutcome = await tryLoad(candidate);
+      if (rawOutcome === 'loaded') return candidate;
+      if (rawOutcome === 'superseded') return onSuperseded(candidate);
+    }
     console.warn(`[Editor] Scene not found at ${candidate}, trying next fallback…`);
   }
   // EVERY candidate missed — that IS a real failure, and it is the only one worth an `error`.

@@ -75,22 +75,19 @@ describe('T3 live coverage is declared, total, and honest', () => {
    *  This check is TEXT-based (does the tool name appear anywhere in test-smoke.mjs), which is a
    *  weak proxy for "a real, EXECUTING case exists" — a bare mention in a comment, or in an argument
    *  list of a step whose batch never runs, would satisfy it too. That gap is exactly what
-   *  `modoki_set_selection` below exploits, and why its exemption spells out that the trap is real.
+   *  `modoki_set_selection` exploited: its only occurrence was inside a batch pre-flight-REFUSED
+   *  case, so the step never executed.
    *
    *  KNOWN_UNCOVERED is a holding pen, not a home: each entry silences this guard for one specific
    *  tool, so each earns its place with a written reason and the issue tracking the fix. Found
-   *  2026-08-31 in #483's close-out review — verified by hand that neither name has a real call site.
+   *  2026-08-31 in #483's close-out review — verified by hand that neither name has a real call
+   *  site. #496 emptied the pen: `modoki_dispatch_action` had no call site at all, and
+   *  `modoki_set_selection`'s one occurrence never ran — both now have real, executing cases in
+   *  test-smoke.mjs (the dispatch_action one gated on a Play window, since a stopped sim refuses a
+   *  real action and a bogus one identically). The map stays here, empty, for the next tool that
+   *  needs a temporary exemption — it is not itself the fix.
    */
-  const KNOWN_UNCOVERED: Readonly<Record<string, string>> = {
-    // Zero occurrences of 'modoki_dispatch_action' in test-smoke.mjs at all — COVERED_BY_SMOKE's
-    // claim is simply false. See #496.
-    modoki_dispatch_action: 'no call site of any kind in test-smoke.mjs — see #496',
-    // One TEXT occurrence (in the batch pre-flight-refusal case), but the assertion there is that
-    // the batch is REFUSED before any step runs — the modoki_set_selection step never executes.
-    // A bare grep match is NOT coverage; this exemption is about the call never EXECUTING. Fixing
-    // it means adding a real, executing call, not just a second textual mention. See #496.
-    modoki_set_selection: 'its one occurrence is inside a pre-flight-REFUSED batch step that never runs — see #496',
-  };
+  const KNOWN_UNCOVERED: Readonly<Record<string, string>> = {};
 
   it('every COVERED_BY_SMOKE entry has a real call site in test-smoke.mjs (or a written exemption)', () => {
     const smokeSrc = readFileSync(join(__dirname, '../../tools/modoki-mcp/test-smoke.mjs'), 'utf8');

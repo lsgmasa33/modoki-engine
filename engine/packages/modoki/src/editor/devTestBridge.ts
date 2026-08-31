@@ -8,7 +8,7 @@ import { useEditorStore } from './store/editorStore';
 import { getAllEntities, readTraitData, deleteEntity } from '../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../runtime/core/ecs/traitRegistry';
 import { importModel } from './scene/modelImport';
-import { loadScene } from './scene/serialize';
+import { loadScene, type SceneLoadOutcome } from './scene/serialize';
 import { isSkeletalPreviewing } from '../runtime/core/skeletalPreview';
 import { previewTimelineAt } from '../runtime/timeline/timelineSystem';
 import { getCurrentWorld } from '../runtime/core/ecs/world';
@@ -25,11 +25,11 @@ export interface EditorTestBridge {
   /** The raw Zustand store (read selectedEntityId, gizmoMode, etc.). */
   store: typeof useEditorStore;
   getAllEntities: typeof getAllEntities;
-  /** Load a scene by path into the live editor world (returns true on success).
-   *  E2E setup uses this instead of seeding the project-namespaced
-   *  `modoki-last-scene:<project>` localStorage key, so fixture loading is
+  /** Load a scene by path into the live editor world — 'loaded' on success, 'superseded' when a
+   *  newer load won the swap first, 'failed' otherwise. E2E setup uses this instead of seeding
+   *  the project-namespaced `modoki-last-scene:<project>` localStorage key, so fixture loading is
    *  independent of which project the dev server happens to open. */
-  loadScene(scenePath: string): Promise<boolean>;
+  loadScene(scenePath: string): Promise<SceneLoadOutcome>;
   /** Name of the currently selected entity, or null if none. */
   selectedEntityName(): string | null;
   /** Read a single trait field off an entity (for asserting edits landed). */

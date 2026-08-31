@@ -62,6 +62,7 @@ import {
   getAllTraits, PRIMITIVE_NAMES, PRIMITIVE_SPRITE_NAMES, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
+  sceneManager,
 } from '@modoki/engine/runtime';
 
 // ── Reads ─────────────────────────────────────────────────────────────────
@@ -1503,9 +1504,27 @@ export function registerEditorAgentOps(): void {
     const { path } = p;
     if (!path) throw new Error('load-scene requires { path }');
     guardUnsaved('load-scene', p.discardUnsaved ?? p.force);
-    const ok = await loadScene(path);
-    if (!ok) throw new Error(`load-scene FAILED for ${path} — the scene was not loaded (does the path exist?).`);
-    return { ok, ...readEditorState() };
+    const outcome = await loadScene(path);
+    if (outcome === 'failed') throw new Error(`load-scene FAILED for ${path} — the scene was not loaded (does the path exist?).`);
+    if (outcome === 'superseded') {
+      // A LATER load won the swap while ours was in flight (sceneManager.ts:885-900) — our own
+      // load did not fail, and this says nothing about whether `path` exists. Mirrors the
+      // runtime twin's wording (agentBridge.ts's `load-scene`, #486 finding A).
+      return {
+        ok: false,
+        superseded: true,
+        // `sceneManager.getCurrent()`, NOT `getCurrentScenePath()`. The editor's tracked path is
+        // written by the WINNING load's own tail, so at this instant it can still hold the
+        // pre-swap value — and naming a scene that is not the live world is the same class of
+        // untruth this reply exists to correct. The scene manager is the authority on which world
+        // is actually active.
+        error: `load-scene for "${path}" was superseded — a LATER scene load won the swap, and `
+          + `"${sceneManager.getCurrent()?.path ?? 'null'}" is now the active scene. This op's own `
+          + `load did not fail; this says nothing about whether "${path}" exists.`,
+        ...readEditorState(),
+      };
+    }
+    return { ok: true, ...readEditorState() };
   });
   registerAgentOp('new-scene', (params) => {
     const p = (params ?? {}) as { discardUnsaved?: boolean; force?: boolean };

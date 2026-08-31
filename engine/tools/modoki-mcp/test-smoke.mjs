@@ -1201,6 +1201,101 @@ if (canGameViewDevice) {
   });
 }
 
+// ── modoki_set_selection (#496) ───────────────────────────────────────────────
+// COVERED_BY_SMOKE claimed this was smoke-covered, but its only occurrence (the batch pre-flight
+// case near :977) is a step inside a batch asserted to be REFUSED before any step runs — that
+// step never EXECUTES. This is the first real, executing call.
+//
+// Gated on UC3's `cube` precondition — it already guarantees exactly one entity named 'cube' in
+// the open scene, and CUBE_GUID (captured in the precondition probe above) is a real guid to aim
+// at. There is no `name` param on this tool (that gap is exactly what UC8 found, see :302-303), so
+// aiming is by guid.
+if (canUC3) {
+  const before = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} }))).selection;
+  await withCleanup(async () => {
+    await client.callTool({ name: 'modoki_set_selection', arguments: { guid: CUBE_GUID } });
+    // Read back through the OTHER route (get_editor_state), not the op's own reply — an op that
+    // echoes its argument back is not evidence it reached the store.
+    const st = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+    if (st.selection?.entityId == null || !st.selection.entityIds?.length) {
+      throw new Error(`set_selection did not take: ${JSON.stringify(st.selection)}`);
+    }
+    // Confirm the SELECTED id really IS the cube, not merely that something got selected —
+    // resolve the cube's live id by guid (a different route again) and compare.
+    const cubeNow = JSON.parse(text(await client.callTool({ name: 'modoki_get_scene_state', arguments: { guid: CUBE_GUID } })));
+    const cubeId = (cubeNow.entities ?? [])[0]?.id;
+    if (cubeId == null || st.selection.entityId !== cubeId) {
+      throw new Error(`set_selection selected id ${st.selection.entityId}, but the cube's live id is ${cubeId}`);
+    }
+    console.log(`set_selection selects by guid, read back via get_editor_state ✓ (entityId: ${st.selection.entityId})`);
+  }, async () => {
+    // Restore exactly what was selected before — an asset selection, an entity selection, or
+    // nothing (a bare call CLEARS the selection, per the tool's own contract note).
+    if (before?.asset) {
+      await client.callTool({ name: 'modoki_set_selection', arguments: { asset: before.asset } });
+    } else if (before?.entityIds?.length) {
+      await client.callTool({ name: 'modoki_set_selection', arguments: { entityIds: before.entityIds } });
+    } else {
+      await client.callTool({ name: 'modoki_set_selection', arguments: {} });
+    }
+  });
+}
+
+// ── modoki_dispatch_action (#496) ─────────────────────────────────────────────
+// COVERED_BY_SMOKE claimed this was smoke-covered too, but there was no call site of any kind.
+// This is the first real one.
+//
+// ⚠️ Measured live, and load-bearing for this case's shape: dispatch-action refuses IDENTICALLY
+// whether the sim is STOPPED or the action name is bogus.
+//   stopped + real action ('haptics.toggle') → {"ok":false,"dispatched":false,"reason":"not
+//     playing — press Play first","simRunning":false}
+//   stopped + a bogus name                   → the BYTE-IDENTICAL refusal
+//   playing + real action                    → {"dispatched":true,"simRunning":true}
+//   playing + a bogus name                   → {"ok":false,"dispatched":false,"reason":"unknown
+//     action '…'","known":[...]}
+// So a stopped-only call proves NOTHING — it cannot tell a dead route from a stopped editor. This
+// case must run inside a PLAY window, where the two arms actually diverge. Do not "simplify" this
+// back to a stopped-only call.
+await withCleanup(async () => {
+  const actions = JSON.parse(text(await client.callTool({ name: 'modoki_list_actions', arguments: {} })));
+  if (!Array.isArray(actions.actions) || actions.actions.length === 0) {
+    throw new Error(`list_actions returned no actions: ${JSON.stringify(actions)}`);
+  }
+  // ENGINE-level actions, present regardless of which project is open.
+  if (!actions.actions.some((a) => a.name === 'haptics.toggle')) {
+    throw new Error(`list_actions is missing the engine-level 'haptics.toggle' action: ${JSON.stringify(actions.actions.map((a) => a.name))}`);
+  }
+
+  await client.callTool({ name: 'modoki_play_control', arguments: { action: 'play' } });
+
+  // A real, inert, self-cancelling action — chosen so dispatching it TWICE nets to zero and this
+  // case has nothing to restore beyond leaving Play mode.
+  for (let i = 0; i < 2; i++) {
+    const r = JSON.parse(text(await client.callTool({ name: 'modoki_dispatch_action', arguments: { name: 'haptics.toggle' } })));
+    if (r.dispatched !== true) throw new Error(`dispatch_action did not dispatch a real action while PLAYING: ${JSON.stringify(r)}`);
+  }
+
+  // The half that actually catches a dead route: an unknown name must be refused BY NAME, with a
+  // `known` list — not merely refused-somehow (a stopped-sim refusal would pass a bare isError
+  // check too, and would not distinguish this tool from one that 400s on every call).
+  const bogusRaw = await client.callTool({
+    name: 'modoki_dispatch_action', arguments: { name: 'modoki.smoke.definitelyNotARealAction' },
+  });
+  if (!bogusRaw.isError) throw new Error(`a bogus action name must be refused, not silently accepted: ${text(bogusRaw)}`);
+  const bogusErr = JSON.parse(text(bogusRaw)).error;
+  if (!/unknown action 'modoki\.smoke\.definitelyNotARealAction'/.test(bogusErr?.why ?? '')) {
+    throw new Error(`the refusal must NAME the unknown action, got: ${JSON.stringify(bogusErr)}`);
+  }
+  if (!Array.isArray(bogusErr?.got?.known) || bogusErr.got.known.length === 0) {
+    throw new Error(`the refusal must carry a \`known\` action list, got: ${JSON.stringify(bogusErr)}`);
+  }
+
+  console.log(`dispatch_action dispatches a real action while PLAYING and names an unknown one ✓ (${actions.actions.length} actions known)`);
+}, async () => {
+  // stop reverts the world to its authored snapshot — nothing else here needs undoing.
+  await client.callTool({ name: 'modoki_play_control', arguments: { action: 'stop' } });
+});
+
 await client.close();
 
 // F12 — a SKIPPED case used to leave the verdict at a cheerful `SMOKE OK`, so the run reported

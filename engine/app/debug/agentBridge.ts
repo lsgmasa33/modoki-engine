@@ -108,6 +108,7 @@ import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve'
 import { readConsoleSource } from './consoleSource';
 import { chromeHandles } from './chromeHandles';
 import { computeDiagnostics } from './diagnose';
+import { makeSchemaPusher } from './schemaPusher';
 import {
   startCapture, stopCapture, clearCapture, getCapture, readPerfProfile,
   resetProfilerMarkers, resetMarkerAggregate, resetFrameProfile, type MarkerSample,
@@ -2186,22 +2187,6 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
   }
 }
 
-/** Push the trait-registry schema via `send`, retrying until the registry is
- *  populated (app trait registration may not have run yet). Returns a starter. */
-function makeSchemaPusher(send: (schema: ReturnType<typeof buildSceneSchema>) => void) {
-  let tries = 0;
-  const pushOnce = (): boolean => {
-    try {
-      const schema = buildSceneSchema();
-      if (Object.keys(schema.traits).length === 0) return false; // not ready yet
-      send(schema);
-      return true;
-    } catch { return false; }
-  };
-  const tick = () => { if (pushOnce() || tries++ > 40) return; setTimeout(tick, 200); };
-  return { start: () => { tries = 0; tick(); }, pushOnce };
-}
-
 export function initAgentBridge(): void {
   const hot = import.meta.hot;
   const bridge = (window as unknown as { __modokiElectron?: { bridge?: ElectronBridge } }).__modokiElectron?.bridge;
@@ -2231,7 +2216,14 @@ export function initAgentBridge(): void {
     // for an Electron bridge this is ALWAYS the case, dev or packaged. See
     // sceneReloadSource for why the Vite HMR path must NOT also drive reloads here.
     if (reloadSource === 'bridge') {
-      bridge.on('scene-changed', (data) => { void handleSceneChanged(data as { urlPath: string; kind: SceneChangedKind }); });
+      bridge.on('scene-changed', (data) => {
+        void handleSceneChanged(data as { urlPath: string; kind: SceneChangedKind });
+        // #459: a scene swap can bring scene-scoped traits in/out (see
+        // games/3d-test/runtime/PlaybackManager.ts, scope: 'scene'), so re-arm
+        // the pusher the same way the Vite path does on vite:afterUpdate. Cheap:
+        // the signature check inside the pusher suppresses a no-op resend.
+        pusher.start();
+      });
     }
     if (!hot) {
       // Packaged build (no Vite HMR): main also drives manifest updates. In dev,

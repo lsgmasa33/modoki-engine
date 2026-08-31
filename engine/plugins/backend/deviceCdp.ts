@@ -46,7 +46,7 @@ import { execFileSync } from 'child_process';
 import { adbArgs, adbBinary, forwardOwner } from './androidDevices';
 
 import {
-  decodeAimReply, resolveAimViaDevice, STALE_APP_REASON,
+  decodeAimReply, resolveAimViaDevice, aimAsResolved, STALE_APP_REASON,
   type RouteOutcome, type AimOutcome,
 } from './deviceAim';
 
@@ -644,7 +644,7 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
         // After the aim resolves (a refused aim dispatches nothing, so it must steal nothing).
         const supersededTap = await releaseHeldBeforeTrustedGesture(deps);
         await cdpTap(counting, r.aim.x, r.aim.y);
-        return { handled: true, reply: `ok (cdp touch) css(${Math.round(r.aim.x)},${Math.round(r.aim.y)}) @ ${r.aim.label} [input:${TRUSTED_CDP_MECHANISM}]${supersededTap}` };
+        return { handled: true, reply: `ok (cdp touch) css(${Math.round(r.aim.x)},${Math.round(r.aim.y)}) @ ${aimAsResolved(r.aim.label)} [input:${TRUSTED_CDP_MECHANISM}]${supersededTap}` };
       }
       case 'drag': {
         const from = await resolveAimViaDevice(deps, params, 'fromSelector', 'fromX', 'fromY');
@@ -671,7 +671,7 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
         if (r.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
         if (r.kind === 'refusal') return { handled: true, reply: r.error };
         await cdpHover(counting, r.aim.x, r.aim.y);
-        return { handled: true, reply: `ok (cdp hover) @ ${r.aim.label} [input:${TRUSTED_CDP_MECHANISM}]` };
+        return { handled: true, reply: `ok (cdp hover) @ ${aimAsResolved(r.aim.label)} [input:${TRUSTED_CDP_MECHANISM}]` };
       }
       case 'scroll': {
         const r = await resolveAimViaDevice(deps, params, 'selector', 'x', 'y', true);
@@ -680,7 +680,7 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
         const dx = (params.dx as number) ?? 0;
         const dy = (params.dy as number) ?? 0;
         await cdpScroll(counting, r.aim.x, r.aim.y, dx, dy);
-        return { handled: true, reply: `ok (cdp scroll dx=${dx} dy=${dy}) @ ${r.aim.label} [input:${TRUSTED_CDP_MECHANISM}]` };
+        return { handled: true, reply: `ok (cdp scroll dx=${dx} dy=${dy}) @ ${aimAsResolved(r.aim.label)} [input:${TRUSTED_CDP_MECHANISM}]` };
       }
       default:
         return { handled: false, reason: null };
