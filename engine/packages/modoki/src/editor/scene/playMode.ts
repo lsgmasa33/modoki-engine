@@ -54,6 +54,17 @@ let _undoBarrier = 0;
  *  so Stop closes only what we opened — never a capture a human/MCP opened manually. Without
  *  this, the process-global capture would leak past Stop into edit mode + later worlds. */
 let _autoOpenedContact = false;
+/** True for the duration of an in-flight `enterPlay()` call — set synchronously at the top,
+ *  before the first await, cleared in a `finally`. `getPlayState()` still reads `'stopped'`
+ *  for most of that window (it only flips to `'playing'` at the very end), so this is what
+ *  lets `stopPlay()` tell "Play is starting" apart from "genuinely stopped" (#470). */
+let _entering = false;
+/** Set by a `stopPlay()` that arrived while `_entering` was true — a Stop pressed during Play
+ *  startup, which would otherwise be silently swallowed by `stopPlay`'s own `'stopped'` early
+ *  return (issue #470). `enterPlay()` checks this once it reaches `'playing'` and, if set,
+ *  immediately runs the real `stopPlay()` revert. Cleared on every `enterPlay()` exit so a
+ *  stale request can never kill a LATER Play press. */
+let _stopRequested = false;
 
 /**
  * Which SCENE the Play snapshot belongs to, and the path the Stop-revert reloads it under.
@@ -89,55 +100,100 @@ function currentSceneKey(): string | null {
 
 /** Enter Play: snapshot the authored world, then start the simulation. */
 export async function enterPlay(): Promise<void> {
-  if (getPlayState() === 'playing') return;
+  if (getPlayState() === 'playing') { _stopRequested = false; return; }
   // Resume from Pause without re-snapshotting (the snapshot from the original
   // Play press still represents the authored state to revert to).
-  if (getPlayState() === 'paused') { setPlayState('playing'); editorEmit('!play', { resume: true }); return; }
-  // A Timeline-panel preview session may hold preview-mutated world state; revert it to the
-  // authored snapshot FIRST so Play captures authored data (not the previewed camera/text).
-  if (hasTimelinePreviewSession()) await endTimelinePreviewSession({ restore: true });
-  // Snapshot only — NO `assignGuids`. Play must not write authored data (its whole
-  // contract is that Stop discards every play-mode mutation); minted guids land in
-  // the snapshot JSON, not the live world. Do not pass { assignGuids: true } here.
-  _snapshot = await serializeScene();
-  _snapshotPath = currentSceneKey();
-  // A5: snapshot every base in the chain too, so Stop can restore authored base
-  // state (see `_baseSnapshots`'s own doc comment). No-op cost when there is no
-  // base (the common case, and every project before this plan) — empty map.
-  _baseSnapshots = new Map();
-  for (const entry of sceneManager.getLoadedScenes().values()) {
-    if (entry.role !== 'base') continue;
-    // Defensive per-base catch: if a base fails to serialize, skip ITS A5 restore
-    // rather than block Play entirely (its authored state then just isn't restored
-    // on Stop). This used to fire routinely for a base containing a prefab instance
-    // — Phase 12's A8/A9 safety guard — which is now gone, both bugs being fixed;
-    // sling's Base.json snapshots normally. Kept for resilience, not for that guard.
-    try {
-      _baseSnapshots.set(entry.guid, await serializeScene({ scene: { path: entry.path, guid: entry.guid } }));
-    } catch (e) {
-      console.warn(`[Editor] A5 base snapshot skipped for "${entry.path}": ${(e as Error).message}`);
+  if (getPlayState() === 'paused') {
+    _stopRequested = false;
+    setPlayState('playing');
+    editorEmit('!play', { resume: true });
+    return;
+  }
+  // Refuse re-entry: a SECOND enterPlay() arriving while one is already mid-startup
+  // (getPlayState() still reads 'stopped' for that whole window, same as the premise
+  // of `_entering` itself) must not start a second startup — two concurrent runs would
+  // both serialize/mutate/flip state independently, and whichever's `finally` clears
+  // `_entering` first lets the other's stale tail still land afterwards (adversarial
+  // review of #470: a Play double-click followed by Stop left `_snapshot === null`
+  // while `playState === 'playing'` — Stop then had nothing to revert). Deliberately
+  // does NOT touch `_stopRequested`: a Stop that arrives after this refusal is still
+  // meant for the call that IS in flight, and that call's own tail (or its `finally`)
+  // is exactly what consumes it — clearing it here would swallow the very Stop #470
+  // was written to stop swallowing.
+  if (_entering) return;
+  // Set synchronously, before the first await, so a Stop that arrives while we're
+  // mid-startup (getPlayState() still reads 'stopped' below) can tell "Play is
+  // starting" apart from "genuinely stopped" — see `_entering`'s doc comment (#470).
+  _entering = true;
+  try {
+    // A Timeline-panel preview session may hold preview-mutated world state; revert it to the
+    // authored snapshot FIRST so Play captures authored data (not the previewed camera/text).
+    if (hasTimelinePreviewSession()) await endTimelinePreviewSession({ restore: true });
+    // Snapshot only — NO `assignGuids`. Play must not write authored data (its whole
+    // contract is that Stop discards every play-mode mutation); minted guids land in
+    // the snapshot JSON, not the live world. Do not pass { assignGuids: true } here.
+    _snapshot = await serializeScene();
+    _snapshotPath = currentSceneKey();
+    // A5: snapshot every base in the chain too, so Stop can restore authored base
+    // state (see `_baseSnapshots`'s own doc comment). No-op cost when there is no
+    // base (the common case, and every project before this plan) — empty map.
+    _baseSnapshots = new Map();
+    for (const entry of sceneManager.getLoadedScenes().values()) {
+      if (entry.role !== 'base') continue;
+      // Defensive per-base catch: if a base fails to serialize, skip ITS A5 restore
+      // rather than block Play entirely (its authored state then just isn't restored
+      // on Stop). This used to fire routinely for a base containing a prefab instance
+      // — Phase 12's A8/A9 safety guard — which is now gone, both bugs being fixed;
+      // sling's Base.json snapshots normally. Kept for resilience, not for that guard.
+      try {
+        _baseSnapshots.set(entry.guid, await serializeScene({ scene: { path: entry.path, guid: entry.guid } }));
+      } catch (e) {
+        console.warn(`[Editor] A5 base snapshot skipped for "${entry.path}": ${(e as Error).message}`);
+      }
     }
+    // Mark the undo barrier at the real Play press (not the paused→playing resume
+    // above) so Stop can drop only during-Play edits.
+    _undoBarrier = undoDepth();
+    // AI-panel opt-in: open the Tier-2 @contact journal watch BEFORE the sim starts, so a
+    // physics trace is captured from the first frame (no agent journal action:start needed).
+    // Reads the cached flag synchronously (the panel primes it) to avoid a backend round-trip on
+    // the Play path; only a cold first Play (panel never opened) pays a single fetch. Open it ONLY
+    // when it isn't already active — so we don't take ownership of (and later close) a capture a
+    // human/MCP opened manually. Stop closes only what WE opened (_autoOpenedContact).
+    const aiSettings = getCachedAiSettings() ?? await fetchAiSettings();
+    if (aiSettings.captureContactOnLaunch && !isVerboseCaptureActive('@contact')) {
+      setVerboseCapture('@contact', true);
+      _autoOpenedContact = true;
+    }
+    setPlayState('playing');
+    editorEmit('!play', {});
+    // A Stop pressed during the startup window above (getPlayState() still read 'stopped',
+    // so stopPlay() couldn't act on it directly) is queued in `_stopRequested`. Honor it now
+    // by running the real revert path — same snapshot reload, base restore, and undo
+    // truncation a Stop pressed after Play would have gotten (#470).
+    if (_stopRequested) {
+      _stopRequested = false;
+      await stopPlay();
+    }
+  } finally {
+    _entering = false;
+    // Belt-and-braces clear, not a duplicate of the consume above: a SECOND stopPlay() can
+    // still land here — e.g. arriving while the tail's own `await stopPlay()` is itself mid-
+    // revert (`_entering` is still true then, so `stopPlay()`'s 'stopped' branch queues again)
+    // — with nothing left in this function to consume it. And if startup THREW before ever
+    // reaching 'playing', any queued stop was never a stop for a real Play and must not survive
+    // to poison the next one. Safe either way: a legitimately queued stop was already consumed
+    // above, before this runs.
+    _stopRequested = false;
   }
-  // Mark the undo barrier at the real Play press (not the paused→playing resume
-  // above) so Stop can drop only during-Play edits.
-  _undoBarrier = undoDepth();
-  // AI-panel opt-in: open the Tier-2 @contact journal watch BEFORE the sim starts, so a
-  // physics trace is captured from the first frame (no agent journal action:start needed).
-  // Reads the cached flag synchronously (the panel primes it) to avoid a backend round-trip on
-  // the Play path; only a cold first Play (panel never opened) pays a single fetch. Open it ONLY
-  // when it isn't already active — so we don't take ownership of (and later close) a capture a
-  // human/MCP opened manually. Stop closes only what WE opened (_autoOpenedContact).
-  const aiSettings = getCachedAiSettings() ?? await fetchAiSettings();
-  if (aiSettings.captureContactOnLaunch && !isVerboseCaptureActive('@contact')) {
-    setVerboseCapture('@contact', true);
-    _autoOpenedContact = true;
-  }
-  setPlayState('playing');
-  editorEmit('!play', {});
 }
 
 /** Pause: freeze the simulation, keep the (mutated) play world. */
 export function pausePlay(): void {
+  // Refuse during Play startup — deliberately, matching enterPlay's own re-entrant-Play
+  // refusal, NOT queued like Stop. A dropped Stop lost authored data (#470); a dropped
+  // Pause just leaves the sim running, so there's nothing here worth queuing (#513).
+  if (_entering) return;
   if (getPlayState() === 'playing') { setPlayState('paused'); editorEmit('!pause', {}); }
 }
 
@@ -158,7 +214,14 @@ export async function stopPlay(): Promise<void> {
     editorEmit('!stop', { fromPreview: rm });
     return;
   }
-  if (getPlayState() === 'stopped') return;
+  if (getPlayState() === 'stopped') {
+    // A genuine no-op UNLESS an enterPlay() is currently mid-startup — getPlayState() still
+    // reads 'stopped' for most of that window (issue #470). In that case queue the Stop so
+    // enterPlay's tail can honor it once it reaches 'playing', instead of silently discarding
+    // a Stop the user believes took effect.
+    if (_entering) _stopRequested = true;
+    return;
+  }
   setPlayState('stopped');
   closeAutoContactCapture(); // if this Play auto-opened @contact, close it — don't leak into edit mode
   editorEmit('!stop', {});

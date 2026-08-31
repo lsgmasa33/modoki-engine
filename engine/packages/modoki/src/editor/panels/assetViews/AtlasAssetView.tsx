@@ -9,9 +9,10 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  persistAtlasDocIfUnchanged, classifyAtlasLoad, canPersistAtlasDoc,
+  createAtlasWriteQueue, classifyAtlasLoad, canPersistAtlasDoc,
   DEFAULT_ATLAS_DOC, type AtlasSourceDoc, type AtlasLoadState,
 } from './atlasPersist';
+import { writeAssetFileIfMatch } from '../assetOps';
 import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { getAssetEntry, getGuidForPath, type AtlasCacheBlock } from '../../../runtime/loaders/assetManifest';
@@ -84,6 +85,31 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
   void assetsVersion; void blockVersion;
   const [diskConflict, setDiskConflict] = useState(false);
 
+  // Single-flight, latest-wins write queue for THIS panel instance (#469 review finding 1). One
+  // `update()` per keystroke would otherwise issue one server `ifMatch` write per keystroke —
+  // fine on its own, but a second write firing before the first's response lands carries the
+  // SAME pre-write baseline as the first, and the atomic server route correctly 409s it as a
+  // (self-inflicted) conflict; the panel can't tell that apart from a real disk change and
+  // discards the edit. Created once per mount via a lazy initializer (not per-`update` call) so
+  // every write from this panel funnels through the SAME queue. See `createAtlasWriteQueue`'s own
+  // header for why this is correct combined WITH the server-side CAS, not a substitute for it.
+  // Kept fresh every render (not just at the queue's one-time creation below) so a job already
+  // chained onto the queue reads the panel's CURRENT path, not whatever path was in scope when
+  // the queue was constructed — see `createAtlasWriteQueue`'s `getCurrentPath` header (review
+  // finding 2).
+  const currentPathRef = useRef(path);
+  currentPathRef.current = path;
+  const writeQueueRef = useRef<ReturnType<typeof createAtlasWriteQueue> | null>(null);
+  if (writeQueueRef.current === null) {
+    writeQueueRef.current = createAtlasWriteQueue(writeAssetFileIfMatch, {
+      getLoadedText: () => loadedText.current,
+      getCurrentPath: () => currentPathRef.current,
+      onWritten: (content) => { loadedText.current = content; },
+      onConflict: () => { setDiskConflict(true); setReloadNonce((n) => n + 1); },
+    });
+  }
+  const writeQueue = writeQueueRef.current;
+
   // Load the authored `.atlas.json` (served as a normal project asset file). Fetches as text
   // (rather than `.json()`) so the exact bytes can be kept in `loadedText` — the write path's
   // compare-and-swap baseline (#439) — even though this effect itself only needs the parsed doc.
@@ -155,31 +181,20 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
     // The write+report itself lives in atlasPersist.ts (#308 close-out) so it's unit-testable
     // without mounting this component.
     const content = serializeAtlasDoc(rawDoc.current, next);
-    // Compare-and-swap (#439): re-read the file immediately before writing and only write if it
-    // still matches what this panel last read. The panel writes the WHOLE document on every
+    // Compare-and-swap (#439), made ATOMIC server-side (#469) and SERIALIZED client-side (#469
+    // #469 review finding 1): write only if the file on disk still hashes to what this panel last
+    // read, checked and written as ONE operation in the route handler, and never more than one
+    // write from THIS panel in flight at once. The panel writes the WHOLE document on every
     // control interaction, so writing on top of a document that changed underneath — a `git
-    // checkout` under a live editor — would silently revert whatever changed. On conflict, do NOT
-    // write; instead bump `reloadNonce` to re-read the truth from disk and show the user why the
-    // panel just changed under them.
-    const loadedTextAtWrite = loadedText.current;
-    void persistAtlasDocIfUnchanged(path, content, loadedTextAtWrite, async (p) => {
-      try {
-        const r = await backendFetch(p);
-        return r.ok ? await r.text() : null;
-      } catch {
-        return null;
-      }
-    }).then((outcome) => {
-      if (outcome === 'written') {
-        // This write is now what's on disk — keep the CAS baseline current so the NEXT write
-        // compares against it rather than the pre-edit text.
-        loadedText.current = content;
-      } else if (outcome === 'conflict') {
-        setDiskConflict(true);
-        setReloadNonce((n) => n + 1);
-      }
-    });
-  }, [path, loadState, doc]);
+    // checkout` under a live editor, or a second edit racing this one — would silently revert
+    // whatever changed. `writeQueue` reads `loadedText.current` itself at the moment each queued
+    // write actually issues (not here), so a write chained behind an earlier one picks up that
+    // earlier write's own new baseline rather than a stale one. On a GENUINE conflict, the queue's
+    // `onConflict` callback bumps `reloadNonce` to re-read the truth from disk and show the user
+    // why the panel just changed under them; a write superseded by a newer one before it starts
+    // collapses into the newer one silently — see `createAtlasWriteQueue`'s header.
+    writeQueue.enqueue(path, content);
+  }, [path, loadState, doc, writeQueue]);
 
   const setMember = (i: number, v: string) => update({ members: doc.members.map((m, j) => (j === i ? v : m)) });
   const addMember = () => update({ members: [...doc.members, ''] });

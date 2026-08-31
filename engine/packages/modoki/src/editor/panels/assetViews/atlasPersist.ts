@@ -9,6 +9,7 @@
 import { writeAssetFile } from '../assetOps';
 import { reportWriteFailed } from './persist';
 import { defaultAtlasSource } from '../../../runtime/loaders/spriteAtlas';
+import { sha256Hex } from '../../utils/contentHash';
 
 /** Write an atlas document's serialized content to `path` and report (console + toast) if the
  *  write did not land. Fire-and-forget by design — the caller does not await this, matching the
@@ -110,38 +111,142 @@ export function canPersistAtlasDoc(loadState: AtlasLoadState, loadedPath: string
 }
 
 // ---------------------------------------------------------------------------------------------
-// Compare-and-swap write guard (#439).
+// Compare-and-swap write guard (#439, made atomic by #469).
 //
 // The panel writes the WHOLE document on every control interaction. Nothing reliably notifies
 // this panel of a same-path content change on disk (`assetsVersion` is keyed on the asset PATH
 // SET — see assetSetSignature.ts's header — not content), so a `git checkout` under a live
 // editor (CLAUDE.md's documented hazard) can change the file's content at the same path with no
 // signal reaching this panel. The next edit would then serialize on top of a stale read and
-// silently revert whatever changed. The guarantee has to sit on the WRITE: re-read the file
-// immediately before writing, and refuse to write if it no longer matches what was last read.
+// silently revert whatever changed. The guarantee has to sit on the WRITE.
+//
+// #439's original fix did this as a client-side read → compare → write, which closed the
+// `git checkout` race but opened a NARROWER one of its own kind: two rapid edits (e.g. two
+// clicks of the Padding stepper) both capture the same `loadedText`, both re-read the same
+// unchanged baseline, both pass the compare, and both write — the second silently overwrites
+// the first. #469 moves the compare-and-write into ONE server-side operation
+// (`POST /api/write-file`'s `ifMatch` precondition) so there is no gap between them for a
+// second write to land in. This function now just hashes what it read and hands the
+// precondition to the server; it no longer re-reads the file itself.
 
-/** Whether the file on disk still holds what the panel read, i.e. whether a whole-document
- *  write is safe. `currentText === null` means the re-read itself failed. */
-export function atlasWriteIsSafe(loadedText: string | null, currentText: string | null): boolean {
-  return loadedText !== null && currentText !== null && loadedText === currentText;
-}
-
-/** Re-read `path` and write `content` only if the file still matches `loadedText` (#439).
- *  Returns 'written' | 'conflict' | 'failed'. Takes the reader as a parameter so a test can
- *  drive it without a backend. */
+/** Re-read-and-write `path` with `content`, but only if the file on disk still hashes to
+ *  `loadedText` (#439, #469). Returns 'written' | 'conflict' | 'failed'. `loadedText === null`
+ *  means this panel has no baseline to write against (never loaded, or a load failed) — refuse
+ *  without even asking the server. Takes the conditional writer as a parameter (rather than a
+ *  reader, as #439's version did) so a test can drive it without a backend; production passes
+ *  `writeAssetFileIfMatch`. */
 export async function persistAtlasDocIfUnchanged(
   path: string,
   content: string,
   loadedText: string | null,
-  readCurrent: (path: string) => Promise<string | null>,
+  writeIfMatch: (path: string, content: string, expectedSha256: string) => Promise<'written' | 'conflict' | 'failed'>,
 ): Promise<'written' | 'conflict' | 'failed'> {
-  let currentText: string | null;
-  try {
-    currentText = await readCurrent(path);
-  } catch {
-    currentText = null;
+  if (loadedText === null) return 'conflict';
+  const expectedSha256 = await sha256Hex(loadedText);
+  const outcome = await writeIfMatch(path, content, expectedSha256);
+  // Match `persistAtlasDoc`'s own reporting (#308): a write that failed for a reason OTHER than
+  // the precondition (network error, a non-409 rejection) must still surface — silently keeping
+  // the optimistic `doc` state while the disk write never landed is the exact lie #308 fixed.
+  // A 'conflict' is reported differently (the caller's disk-conflict banner + reload), not here.
+  if (outcome === 'failed') reportWriteFailed(path, 'the atlas write was rejected');
+  return outcome;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Client-side write serialization (#469 review finding 1).
+//
+// The server-side `ifMatch` precondition (#469) closed the two-rapid-edits race by making the
+// compare-and-write ATOMIC — but it did not, on its own, stop the panel from ISSUING two writes
+// at once. `AtlasAssetView.update()` fires on every control interaction with no debounce, and
+// each write captures `loadedText` at the moment it's QUEUED. Two edits that fire before the
+// first write's response lands (fast typing into a `<input type=number>`, or a held stepper
+// arrow at auto-repeat rate) both carry the SAME pre-write `ifMatch`. The server has already
+// written the first by the time the second arrives, so the second correctly 409s — but that
+// 409 is SELF-INFLICTED, not a real third-party change, and the panel cannot tell the
+// difference: it discards the second edit and reloads from disk, under a banner that falsely
+// claims the file "changed on disk". Under the OLD client-side CAS (#439) this raced too, but
+// benignly — last-write-wins, and since every write is the FULL document, the last write already
+// carries the earlier edit. #469 turned that benign race into active data loss.
+//
+// #469's own review dismissed client-side serialization as "a cheaper mitigation that narrows
+// the window without closing it, and should not be mistaken for a fix" — true of serialization
+// INSTEAD OF a server CAS (it would still lose to a genuine external writer, e.g. `git
+// checkout`). Combined WITH the server CAS, the two are complementary, not redundant: this queue
+// removes the SELF-inflicted false conflicts (our own writes racing each other) by only ever
+// having one write in flight; the server precondition still catches the genuine third-party
+// change the atomic CAS exists for (#439's actual data-loss class). Neither alone is sufficient.
+
+/** A single-flight, latest-wins write queue for one `AtlasAssetView` instance.
+ *
+ *  `enqueue(path, content)` never issues a write itself — it records `{path, content}` as the
+ *  most recently requested write and chains a link onto the queue's promise, so the actual
+ *  writes always run ONE AT A TIME, in order. If a second `enqueue` call lands while the first's
+ *  write is still in flight, the first's own queued link (not yet started) finds the pending job
+ *  already overwritten by the second and does nothing — it was superseded before it ever ran.
+ *  Collapsing to the newest is deliberate and safe: every write is the FULL serialized document,
+ *  so the newest one already carries whatever the superseded one would have written.
+ *
+ *  `getLoadedText()` is called at the moment a queued write actually ISSUES, not when it was
+ *  enqueued — so a write chained behind an earlier one picks up whatever baseline that earlier
+ *  write left behind (via `onWritten`), rather than the stale baseline that was current when it
+ *  was queued. Reading `loadedText` eagerly at enqueue time would just move the staleness bug
+ *  from "two writes race" to "the second write's precondition is already wrong before it's ever
+ *  sent" — same failure, one queue-hop later.
+ *
+ *  **Path-aware (review finding 2).** `Inspector.tsx` mounts `AtlasAssetView` with no
+ *  `key={asset.path}`, so a selection change (atlas A → atlas B) is a prop change on the SAME
+ *  instance — this queue, and any job already chained onto it, survives the switch. A job
+ *  queued for A that hasn't issued yet by the time the panel moves to B must not run against B's
+ *  `getLoadedText()`/`onConflict` at all: `getCurrentPath()` is checked right before the job
+ *  issues, and a mismatch DROPS the job outright (no write, no conflict report) rather than
+ *  writing A's content against B's baseline or reporting a false conflict on B. */
+export function createAtlasWriteQueue(
+  writeIfMatch: (path: string, content: string, expectedSha256: string) => Promise<'written' | 'conflict' | 'failed'>,
+  callbacks: {
+    /** The panel's current CAS baseline. Called fresh for every write this queue actually issues. */
+    getLoadedText: () => string | null;
+    /** The path the panel is showing RIGHT NOW. Called fresh for every job this queue is about to
+     *  issue — a job whose own `path` no longer matches belongs to an asset the panel has since
+     *  navigated away from and is dropped (review finding 2). */
+    getCurrentPath: () => string;
+    /** A write landed — the caller should advance its baseline to `content` (this queue does not
+     *  hold that state itself; `AtlasAssetView`'s `loadedText` ref is the single source of it). */
+    onWritten: (content: string) => void;
+    /** A GENUINE conflict came back from the server (the file changed underneath for a reason
+     *  other than this queue's own in-flight write) — never fired for a superseded/collapsed job,
+     *  and never fired for a job dropped because the panel has moved to a different path. */
+    onConflict: () => void;
+  },
+): { enqueue: (path: string, content: string) => void } {
+  let pending: { path: string; content: string } | null = null;
+  let chain: Promise<void> = Promise.resolve();
+
+  function enqueue(path: string, content: string): void {
+    pending = { path, content };
+    chain = chain.then(async () => {
+      const job = pending;
+      if (!job) return; // superseded — a later enqueue() already claimed this link's turn
+      // Claim it BEFORE awaiting the write, so an enqueue() that fires WHILE this write is in
+      // flight queues a genuinely NEW job rather than being silently folded into this one.
+      pending = null;
+      // The panel has since moved to a different asset — this job's baseline/conflict target
+      // both belong to the OLD path, so neither writing nor reporting against the new one is
+      // correct. Drop it silently (review finding 2).
+      if (job.path !== callbacks.getCurrentPath()) return;
+      const outcome = await persistAtlasDocIfUnchanged(job.path, job.content, callbacks.getLoadedText(), writeIfMatch);
+      if (outcome === 'written') callbacks.onWritten(job.content);
+      else if (outcome === 'conflict') callbacks.onConflict();
+    }).catch((err) => {
+      // A link that THROWS (rather than resolving to 'failed') would otherwise leave `chain`
+      // permanently rejected — every `chain.then(...)` chained by a LATER enqueue() would then
+      // never run at all, silently ending persistence for the rest of this mount, plus an
+      // unhandled rejection (review finding 3). `persistAtlasDocIfUnchanged` already reports a
+      // 'failed' outcome through `reportWriteFailed`; a hard throw (e.g. `sha256Hex` rejecting in
+      // a non-secure context) has no `path`/`content` to report through that same path here, so
+      // it goes to console instead — the point is keeping the chain alive, not double-reporting.
+      console.error('[AtlasAssetView] write queue link threw, chain recovered:', err);
+    });
   }
-  if (!atlasWriteIsSafe(loadedText, currentText)) return 'conflict';
-  const ok = await persistAtlasDoc(path, content);
-  return ok ? 'written' : 'failed';
+
+  return { enqueue };
 }

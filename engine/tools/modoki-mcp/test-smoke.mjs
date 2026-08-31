@@ -1436,28 +1436,9 @@ if (canUC3) {
       // Park the write. `particle_set` must report `saved:false` — persistence is manual, and if
       // the edit went straight to disk there would be nothing for save_all to flush and this case
       // would be theatre (the UC6 assertion, made here because THIS case depends on it).
-      //
-      // ⚠️ BOUNDED RETRY, and it is not papering over this case's own flakiness — it is working
-      // around a REAL defect found while writing it (#503): `create_asset` rebuilds the
-      // BACKEND manifest inline (which is why UC10 can list the asset in the same batch), but
-      // `particle-set`'s existence check is `getGuidForPath` in the RENDERER, whose manifest
-      // arrives on a later push. So for ~1s after a create, every asset-def write op refuses with
-      // "no particle asset exists at …" — and its hint says "create it first with
-      // modoki_create_asset", which is exactly what was just done. Measured: refused immediately,
-      // `{ok:true,saved:false}` after 1.5s.
-      //
-      // Retrying is safe HERE and nowhere else in this file: the refusal states that nothing was
-      // applied and nothing was parked, so a refused call has no effect to repeat. A `sleep`
-      // instead would be the UC10 mistake — this fails LOUDLY, naming the race, if it never lands.
-      let parked, lastRefusal;
-      for (let attempt = 0; attempt < 12; attempt++) {
-        const r = await client.callTool({ name: 'modoki_particle_set', arguments: { path: SAVE_PART, def: probeDef } });
-        if (!r.isError) { parked = JSON.parse(text(r)); break; }
-        lastRefusal = text(r);
-        if (!/no particle asset exists/.test(lastRefusal)) throw new Error(`save_all: particle_set refused for an unexpected reason: ${lastRefusal.slice(0, 400)}`);
-        await new Promise((res) => setTimeout(res, 250));
-      }
-      if (!parked) throw new Error(`save_all: the renderer never saw the probe asset create_asset had already written (#503) — ${lastRefusal?.slice(0, 300)}`);
+      const r = await client.callTool({ name: 'modoki_particle_set', arguments: { path: SAVE_PART, def: probeDef } });
+      if (r.isError) throw new Error(`save_all: particle_set refused the probe write create_asset had just made: ${text(r).slice(0, 400)}`);
+      const parked = JSON.parse(text(r));
       if (parked.saved !== false) throw new Error(`save_all: particle_set reported saved=${parked.saved} — the write must be PARKED for this case to have anything to flush`);
       const dirty = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
       if (!(dirty.dirtyAssetPaths ?? []).includes(SAVE_PART)) {

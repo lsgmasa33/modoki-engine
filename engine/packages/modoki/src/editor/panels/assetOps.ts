@@ -172,6 +172,35 @@ export async function writeAssetFile(filePath: string, content: string, encoding
   } catch { return false; }
 }
 
+/** Write a text file via /api/write-file, but ONLY if the file on disk still hashes to
+ *  `expectedSha256` (#469) — a server-side conditional write (an `ifMatch` precondition),
+ *  so the compare-and-the-write happen as ONE atomic operation in the route handler instead
+ *  of this client doing a read → compare → write with a gap another write can land in. See
+ *  `editorBackendRouter.ts`'s `/api/write-file` handler for the atomicity guarantee and its
+ *  documented residual limit. `expectedSha256` must be the lowercase hex SHA-256 of the
+ *  expected current file content — see `contentHash.ts`'s `sha256Hex`, which both sides
+ *  agree on.
+ *
+ *  Deliberately a SIBLING of `writeAssetFile`, not a new parameter on it: that function
+ *  returns a bare boolean many callers rely on, and this one distinguishes a rejected
+ *  precondition ('conflict') from every other kind of failure ('failed') — a distinction a
+ *  boolean can't carry. */
+export async function writeAssetFileIfMatch(
+  filePath: string,
+  content: string,
+  expectedSha256: string,
+): Promise<'written' | 'conflict' | 'failed'> {
+  try {
+    const res = await backendFetch('/api/write-file', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: filePath, content, ifMatch: expectedSha256 }),
+    });
+    if (res.ok) return 'written';
+    if (res.status === 409) return 'conflict';
+    return 'failed';
+  } catch { return 'failed'; }
+}
+
 /** Trash ONE asset via /api/delete-asset. */
 export async function deleteAssetFile(assetPath: string): Promise<boolean> {
   try {

@@ -350,6 +350,13 @@ function writeDataUrlToTemp(dataUrl: unknown): string {
   return file;
 }
 
+/** Strip a leading UTF-8 BOM (EF BB BF), if present. `/api/write-file`'s `ifMatch` precondition
+ *  hashes the raw file buffer — this makes that agree with the browser's `Response.text()`,
+ *  which strips a leading BOM as part of decoding (#490 review finding 2). */
+function stripUtf8Bom(buf: Buffer): Buffer {
+  return (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) ? buf.subarray(3) : buf;
+}
+
 /** Atomic JSON write: tmp file + rename. (Mirrors the scanner's helper; kept
  *  local to avoid an import cycle.) */
 function writeJsonAtomic(absPath: string, data: unknown): void {
@@ -2434,11 +2441,11 @@ async function describeUnresolvedAgainstLiveWorld(
     }
   }
 
-  // ── POST /api/write-file {path, content, encoding?} (M) ── write any file
+  // ── POST /api/write-file {path, content, encoding?, ifMatch?} (M) ── write any file
   // under an asset root. Suppresses the watcher hot-reload for the editor's own save.
   if (urlPath === '/api/write-file' && method === 'POST') {
     try {
-      const { path: filePath, content, encoding } = (body ?? {}) as { path: string; content: unknown; encoding?: string };
+      const { path: filePath, content, encoding, ifMatch } = (body ?? {}) as { path: string; content: unknown; encoding?: string; ifMatch?: string };
       // Resolve the write target. Normally an asset URL (/assets/…, /games/…)
       // via resolveAssetPath. But a flat project's scenes load through Vite's
       // /@fs/<abs> form, so the editor may hold a /@fs path (e.g. saving the
@@ -2456,6 +2463,33 @@ async function describeUnresolvedAgainstLiveWorld(
         absPath = ctx.resolveAssetPath(filePath);
       }
       if (!absPath) return { kind: 'raw', status: 403, contentType: 'application/json', body: '{}' };
+      // Optional `ifMatch` precondition (#469) — a server-side conditional write, so a
+      // compare-and-swap caller (AtlasAssetView's #439 CAS guard was the motivating one) gets
+      // the compare and the write as ONE atomic operation instead of doing its own
+      // read-then-write with a gap a second write can land in between. Absent `ifMatch` ⇒
+      // unconditional write, exactly as before — every existing caller is unaffected.
+      //
+      // ⚠️ ATOMICITY IS THE ENTIRE POINT: this precondition read + hash + compare happens with
+      // the SYNCHRONOUS fs API and NO `await` between the compare and the write below. Node is
+      // single-threaded, so a synchronous span cannot be interleaved by another in-flight
+      // request — an `await` anywhere in this span (e.g. a refactor to `fs.promises.readFile`)
+      // would reopen exactly the race this endpoint exists to close. This closes SAME-PROCESS
+      // races (every editor panel); a genuinely external writer (another process, `git
+      // checkout`) can still land between the hash check and the write at the OS level — a much
+      // narrower window than before, and not what #469 is about.
+      if (ifMatch !== undefined) {
+        let currentBytes: Buffer | null;
+        try { currentBytes = fs.readFileSync(absPath); } catch { currentBytes = null; }
+        // A leading UTF-8 BOM is stripped before hashing so this agrees with the CLIENT side
+        // (#490 review finding 2): the browser's `Response.text()` (what `AtlasAssetView` reads
+        // `loadedText` from) strips a leading BOM as part of decoding, so a BOM'd file — a
+        // Windows-authored `.atlas.json`, say — would otherwise hash differently here than the
+        // panel's own baseline FOREVER, 409ing on every write with no way to ever succeed.
+        const currentHash = currentBytes === null ? null : crypto.createHash('sha256').update(stripUtf8Bom(currentBytes)).digest('hex');
+        if (currentHash === null || currentHash !== ifMatch) {
+          return json({ ok: false, conflict: true, reason: 'if-match' }, 409);
+        }
+      }
       // Materialize the exact bytes once so the self-write guard can fingerprint
       // them (the F9 late-rename fallback) and we write the identical buffer.
       const bytes = encoding === 'base64'

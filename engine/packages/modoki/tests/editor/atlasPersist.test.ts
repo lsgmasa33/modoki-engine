@@ -7,6 +7,7 @@
  *  matching the rest of the suite's convention (`assetUndo.test.ts`). */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import crypto from 'crypto';
 
 const writeAssetFileSpy = vi.fn();
 vi.mock('../../src/editor/panels/assetOps', () => ({
@@ -15,9 +16,10 @@ vi.mock('../../src/editor/panels/assetOps', () => ({
 
 import {
   persistAtlasDoc, classifyAtlasLoad, canPersistAtlasDoc, DEFAULT_ATLAS_DOC,
-  atlasWriteIsSafe, persistAtlasDocIfUnchanged,
+  persistAtlasDocIfUnchanged, createAtlasWriteQueue,
 } from '../../src/editor/panels/assetViews/atlasPersist';
 import { useEditorStore } from '../../src/editor/store/editorStore';
+import { sha256Hex } from '../../src/editor/utils/contentHash';
 
 let consoleSpies: Array<{ mockRestore: () => void }> = [];
 const spyConsole = (level: 'error' | 'warn') => {
@@ -151,113 +153,292 @@ describe('canPersistAtlasDoc', () => {
   });
 });
 
-/** #439 — the compare-and-swap write guard. The panel writes the WHOLE `.atlas.json` document on
- *  every control interaction; nothing reliably notifies it of a same-path content change on disk
- *  (a `git checkout` under a live editor, CLAUDE.md's documented hazard), so the guarantee has to
- *  sit on the WRITE: re-read immediately before writing, and refuse if the file no longer matches
- *  what was last read. */
-describe('atlasWriteIsSafe', () => {
-  it('is safe when the current text still matches what was loaded', () => {
-    expect(atlasWriteIsSafe('{"members":[]}\n', '{"members":[]}\n')).toBe(true);
-  });
-
-  it('refuses when the current text differs from what was loaded', () => {
-    expect(atlasWriteIsSafe('{"members":[]}\n', '{"members":["a"]}\n')).toBe(false);
-  });
-
-  // `loadedText === null` means this panel never successfully read the file (or dropped its
-  // baseline on a path change) — there's nothing to compare against, so "safe" cannot be true.
-  it('refuses when loadedText is null', () => {
-    expect(atlasWriteIsSafe(null, '{"members":[]}\n')).toBe(false);
-  });
-
-  // `currentText === null` means the re-read ITSELF failed (network error, file gone, etc.) — we
-  // don't know what's on disk, and "we don't know" must never be treated as "go ahead and
-  // overwrite the whole document". Refusing is the only answer that can't silently destroy data.
-  it('refuses when currentText is null (the re-read failed)', () => {
-    expect(atlasWriteIsSafe('{"members":[]}\n', null)).toBe(false);
-  });
-
-  it('refuses when both are null', () => {
-    expect(atlasWriteIsSafe(null, null)).toBe(false);
-  });
-});
-
+/** #439, made atomic by #469 — the compare-and-swap write guard. The panel writes the WHOLE
+ *  `.atlas.json` document on every control interaction; nothing reliably notifies it of a
+ *  same-path content change on disk (a `git checkout` under a live editor, CLAUDE.md's
+ *  documented hazard, or a second rapid edit racing this one — the #469 regression), so the
+ *  guarantee has to sit on the WRITE. `persistAtlasDocIfUnchanged` now hashes what it read and
+ *  hands the precondition to an injected conditional writer — the compare-and-write happen as
+ *  ONE server-side operation, so there is no gap for a second write to land in. */
 describe('persistAtlasDocIfUnchanged', () => {
-  it('writes when the on-disk text still matches loadedText, and returns "written"', async () => {
-    writeAssetFileSpy.mockResolvedValue(true);
-    const readCurrent = vi.fn(async () => '{"members":[]}\n');
+  it('writes when the precondition matches the loaded baseline, and returns "written"', async () => {
+    const writeIfMatch = vi.fn(async () => 'written' as const);
+    const loadedText = '{"members":[]}\n';
+    const expected = await sha256Hex(loadedText);
 
     const outcome = await persistAtlasDocIfUnchanged(
-      '/a.atlas.json', '{"members":["x"]}\n', '{"members":[]}\n', readCurrent,
+      '/a.atlas.json', '{"members":["x"]}\n', loadedText, writeIfMatch,
     );
 
     expect(outcome).toBe('written');
-    expect(readCurrent).toHaveBeenCalledWith('/a.atlas.json');
-    expect(writeAssetFileSpy).toHaveBeenCalledWith('/a.atlas.json', '{"members":["x"]}\n');
+    expect(writeIfMatch).toHaveBeenCalledWith('/a.atlas.json', '{"members":["x"]}\n', expected);
   });
 
-  // The ticket's own repro: a `.atlas.json` whose `members` changed on disk (e.g. a `git
-  // checkout` landing under a live editor) must NOT be overwritten by a subsequent padding nudge
-  // the panel queued against the stale baseline it read before the checkout.
-  it('#439 repro: members changed on disk under a live editor — a later padding nudge is refused, not written', async () => {
-    const onDiskAfterCheckout = '{"members":["from-git-checkout"],"padding":1}\n';
-    const readCurrent = vi.fn(async () => onDiskAfterCheckout);
+  // The ticket's own repro (#439, and its own regression #469): a `.atlas.json` whose `members`
+  // changed on disk (e.g. a `git checkout` under a live editor, or a second racing write) must
+  // NOT be overwritten by a subsequent padding nudge the panel queued against a stale baseline.
+  // Here the server is the one deciding "changed", so the seam under test is: did this function
+  // hash the STALE `loadedText` (not the new content) and hand the writer's verdict through
+  // unchanged?
+  it('#439 repro: hashes the STALE loaded text (not the new content), and passes the writer\'s conflict through untouched', async () => {
+    const writeIfMatch = vi.fn(async () => 'conflict' as const);
     const staleLoadedText = '{"members":["original"],"padding":1}\n';
     const paddingNudgeContent = '{"members":["original"],"padding":2}\n';
+    const expectedIfMatch = await sha256Hex(staleLoadedText);
 
     const outcome = await persistAtlasDocIfUnchanged(
-      '/court.atlas.json', paddingNudgeContent, staleLoadedText, readCurrent,
+      '/court.atlas.json', paddingNudgeContent, staleLoadedText, writeIfMatch,
     );
 
     expect(outcome).toBe('conflict');
-    expect(writeAssetFileSpy).not.toHaveBeenCalled();
+    expect(writeIfMatch).toHaveBeenCalledWith('/court.atlas.json', paddingNudgeContent, expectedIfMatch);
+    // Never hashes the OUTGOING content as the precondition — that would always "match" itself
+    // and defeat the guard entirely.
+    expect(expectedIfMatch).not.toBe(await sha256Hex(paddingNudgeContent));
   });
 
-  it('returns "conflict" and never writes when the on-disk text changed', async () => {
-    const readCurrent = vi.fn(async () => '{"members":["changed"]}\n');
+  it('returns "conflict" without even asking the writer when loadedText is null (no baseline)', async () => {
+    const writeIfMatch = vi.fn(async () => 'written' as const);
 
     const outcome = await persistAtlasDocIfUnchanged(
-      '/a.atlas.json', '{"members":["x"]}\n', '{"members":[]}\n', readCurrent,
+      '/a.atlas.json', '{"members":["x"]}\n', null, writeIfMatch,
     );
 
     expect(outcome).toBe('conflict');
-    expect(writeAssetFileSpy).not.toHaveBeenCalled();
+    expect(writeIfMatch).not.toHaveBeenCalled();
   });
 
-  it('returns "conflict" and never writes when the re-read resolves null', async () => {
-    const readCurrent = vi.fn(async () => null);
+  it('returns "failed" and reports (console error + toast) when the writer reports "failed"', async () => {
+    const error = spyConsole('error');
+    const writeIfMatch = vi.fn(async () => 'failed' as const);
 
     const outcome = await persistAtlasDocIfUnchanged(
-      '/a.atlas.json', '{"members":["x"]}\n', '{"members":[]}\n', readCurrent,
-    );
-
-    expect(outcome).toBe('conflict');
-    expect(writeAssetFileSpy).not.toHaveBeenCalled();
-  });
-
-  // The re-read must never propagate a throw out of the write path — an unhandled rejection here
-  // would crash the panel's write handler instead of just refusing the write.
-  it('returns "conflict" and never writes when the re-read throws', async () => {
-    const readCurrent = vi.fn(async () => { throw new Error('network down'); });
-
-    const outcome = await persistAtlasDocIfUnchanged(
-      '/a.atlas.json', '{"members":["x"]}\n', '{"members":[]}\n', readCurrent,
-    );
-
-    expect(outcome).toBe('conflict');
-    expect(writeAssetFileSpy).not.toHaveBeenCalled();
-  });
-
-  it('returns "failed" when the write itself is rejected', async () => {
-    writeAssetFileSpy.mockResolvedValue(false);
-    const readCurrent = vi.fn(async () => '{"members":[]}\n');
-
-    const outcome = await persistAtlasDocIfUnchanged(
-      '/a.atlas.json', '{"members":["x"]}\n', '{"members":[]}\n', readCurrent,
+      '/a.atlas.json', '{"members":["x"]}\n', '{"members":[]}\n', writeIfMatch,
     );
 
     expect(outcome).toBe('failed');
-    expect(writeAssetFileSpy).toHaveBeenCalledWith('/a.atlas.json', '{"members":["x"]}\n');
+    expect(error).toHaveBeenCalledTimes(1);
+    const toast = useEditorStore.getState().toast;
+    expect(toast).not.toBeNull();
+    expect(toast!.kind).toBe('warn');
+  });
+
+  it('a "conflict" from the writer is passed through with no failure report', async () => {
+    const error = spyConsole('error');
+    const writeIfMatch = vi.fn(async () => 'conflict' as const);
+
+    const outcome = await persistAtlasDocIfUnchanged(
+      '/a.atlas.json', '{"members":["x"]}\n', '{"members":[]}\n', writeIfMatch,
+    );
+
+    expect(outcome).toBe('conflict');
+    expect(error).not.toHaveBeenCalled();
+    expect(useEditorStore.getState().toast).toBeNull();
+  });
+});
+
+/** A fake `/api/write-file` `ifMatch` route: hashes its own current content the same way the
+ *  real server hashes the file on disk, and only writes if the caller's `ifMatch` matches. Lets
+ *  these tests drive `persistAtlasDocIfUnchanged`/`createAtlasWriteQueue` against something that
+ *  behaves like the real atomic route without a backend.
+ *
+ *  The compare-then-write below is deliberately done with Node's SYNCHRONOUS `crypto`, exactly
+ *  matching the real route's own atomicity guarantee (`editorBackendRouter.ts`'s "no `await`
+ *  between the compare and the write" comment) — using the async `sha256Hex` here would open a
+ *  window this fake doesn't actually have in production, and would make these tests report a
+ *  race that the real server's synchronous check prevents. */
+function makeFakeServer(initial: string) {
+  let content = initial;
+  const hashSync = (text: string) => crypto.createHash('sha256').update(Buffer.from(text, 'utf-8')).digest('hex');
+  const writeIfMatch = vi.fn(async (_path: string, newContent: string, expectedSha256: string) => {
+    if (hashSync(content) !== expectedSha256) return 'conflict' as const;
+    content = newContent;
+    return 'written' as const;
+  });
+  return { writeIfMatch, get content() { return content; } };
+}
+
+/** #469 review finding 1 — the fix converts fast typing into a false conflict that DISCARDS the
+ *  user's edit. `AtlasAssetView.update()` used to capture `loadedText` and call
+ *  `persistAtlasDocIfUnchanged` directly, once per keystroke, with nothing serializing the calls.
+ *  Two edits firing before the first write's response lands both carry the SAME pre-write
+ *  `ifMatch`; the atomic server route (correctly) lets only one land and 409s the other — but
+ *  that 409 is SELF-inflicted, not a real third-party change, and the panel cannot tell the
+ *  difference: it discards the losing edit and reloads from disk. `createAtlasWriteQueue` fixes
+ *  this by keeping only one write in flight per panel; a superseded write collapses into the
+ *  next one instead of racing it. */
+describe('createAtlasWriteQueue (#469 review finding 1)', () => {
+  it('reproduces the bug at the primitive level: two same-baseline writes issued in parallel spuriously conflict, with no external change involved', async () => {
+    // This is exactly the call pattern AtlasAssetView.update() used PRE-fix: both writes capture
+    // the same pre-write baseline and are issued without anything serializing them.
+    const server = makeFakeServer('{"padding":0}\n');
+    const staleBaseline = '{"padding":0}\n';
+
+    const [outcomeA, outcomeB] = await Promise.all([
+      persistAtlasDocIfUnchanged('/a.atlas.json', '{"padding":1}\n', staleBaseline, server.writeIfMatch),
+      persistAtlasDocIfUnchanged('/a.atlas.json', '{"padding":12}\n', staleBaseline, server.writeIfMatch),
+    ]);
+
+    // Nothing external ever touched the file — both writes came from THIS panel — yet one of
+    // them is reported as a conflict, which is exactly the false-conflict bug review finding 1
+    // describes. (The queue below exists so this call pattern never happens.)
+    expect([outcomeA, outcomeB].sort()).toEqual(['conflict', 'written']);
+  });
+
+  it('serializes two same-tick writes so both land, in order, with no false conflict — the fix', async () => {
+    const server = makeFakeServer('{"padding":0}\n');
+    let loadedText = '{"padding":0}\n';
+    const onConflict = vi.fn();
+    const queue = createAtlasWriteQueue(server.writeIfMatch, {
+      getLoadedText: () => loadedText,
+      getCurrentPath: () => '/a.atlas.json',
+      onWritten: (content) => { loadedText = content; },
+      onConflict,
+    });
+
+    // Fire both "keystrokes" in the same tick — no await between them, exactly like two rapid
+    // `onChange` calls on a number input.
+    queue.enqueue('/a.atlas.json', '{"padding":1}\n');
+    queue.enqueue('/a.atlas.json', '{"padding":12}\n');
+
+    // Let the queue's chained microtasks/macrotasks drain.
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(onConflict).not.toHaveBeenCalled();
+    // The final content is the LATEST edit — every write is the full document, so it already
+    // carries whatever the superseded one would have written.
+    expect(server.content).toBe('{"padding":12}\n');
+    expect(loadedText).toBe('{"padding":12}\n');
+  });
+
+  it('collapses a write superseded before it starts — the middle of three rapid edits is skipped, not raced', async () => {
+    const server = makeFakeServer('{"padding":0}\n');
+    let loadedText = '{"padding":0}\n';
+    const onConflict = vi.fn();
+    const queue = createAtlasWriteQueue(server.writeIfMatch, {
+      getLoadedText: () => loadedText,
+      getCurrentPath: () => '/a.atlas.json',
+      onWritten: (content) => { loadedText = content; },
+      onConflict,
+    });
+
+    queue.enqueue('/a.atlas.json', '{"padding":1}\n');
+    queue.enqueue('/a.atlas.json', '{"padding":12}\n');
+    queue.enqueue('/a.atlas.json', '{"padding":128}\n');
+
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(onConflict).not.toHaveBeenCalled();
+    expect(server.content).toBe('{"padding":128}\n');
+    // writeIfMatch is called EXACTLY once: all three `enqueue()` calls above run synchronously,
+    // with no `await` between them, so `pending` is overwritten twice before the queue's first
+    // chained link ever gets a turn to run — that link reads `pending` as the LATEST job
+    // (padding:128) and the second/third links then find `pending` already claimed (`null`) and
+    // do nothing. `toBeLessThanOrEqual(2)` (the loose form this replaces) would also pass if the
+    // middle edit had instead RACED the first write and produced a second call — asserting the
+    // exact count is what actually proves the middle edit was skipped, not raced.
+    expect(server.writeIfMatch.mock.calls.length).toBe(1);
+  });
+
+  it('a GENUINE third-party conflict still surfaces exactly as before — the queue never masks a real disk change', async () => {
+    const server = makeFakeServer('{"padding":0}\n');
+    const onConflict = vi.fn();
+    const onWritten = vi.fn();
+    // loadedText never advances (simulating: this panel's baseline is stale relative to disk,
+    // e.g. a `git checkout` happened underneath it) — every write against it must conflict.
+    const staleForever = '{"padding":-1}\n';
+    const queue = createAtlasWriteQueue(server.writeIfMatch, {
+      getLoadedText: () => staleForever,
+      getCurrentPath: () => '/a.atlas.json',
+      onWritten,
+      onConflict,
+    });
+
+    queue.enqueue('/a.atlas.json', '{"padding":1}\n');
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(onWritten).not.toHaveBeenCalled();
+    expect(onConflict).toHaveBeenCalledTimes(1);
+    expect(server.content).toBe('{"padding":0}\n'); // untouched
+  });
+
+  // Review finding 2 — `Inspector.tsx` mounts `AtlasAssetView` with no `key={asset.path}`, so a
+  // selection change (atlas A → atlas B) is a prop change on the SAME instance: this queue, and
+  // any job already chained onto it for A, survive the switch. A job for A that hasn't issued
+  // yet when the panel moves to B must not run against B's baseline/conflict target at all.
+  it('drops a queued write whose path no longer matches the panel\'s current path, once the panel has moved on', async () => {
+    const server = makeFakeServer('{"padding":0}\n');
+    let loadedText = '{"padding":0}\n';
+    let currentPath = '/a.atlas.json';
+    const onConflict = vi.fn();
+    const queue = createAtlasWriteQueue(server.writeIfMatch, {
+      getLoadedText: () => loadedText,
+      getCurrentPath: () => currentPath,
+      onWritten: (content) => { loadedText = content; },
+      onConflict,
+    });
+
+    queue.enqueue('/a.atlas.json', '{"padding":1}\n');
+    // Let the first write actually land before the selection changes.
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(server.content).toBe('{"padding":1}\n');
+
+    // User selects atlas B — a second edit for A (e.g. a stepper click that was already queued
+    // just before the selection changed) is enqueued after the switch.
+    currentPath = '/b.atlas.json';
+    queue.enqueue('/a.atlas.json', '{"padding":2}\n');
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Dropped, not written, and not reported as a conflict against B: A's file is untouched,
+    // the server was never even asked, and B never gets a false "changed on disk" banner.
+    expect(server.content).toBe('{"padding":1}\n');
+    expect(server.writeIfMatch.mock.calls.length).toBe(1);
+    expect(onConflict).not.toHaveBeenCalled();
+  });
+
+  // Review finding 3 — `chain = chain.then(async () => {...})` with no `.catch` meant a link that
+  // THROWS (rather than resolving to 'failed') left `chain` permanently rejected: every
+  // subsequent `chain.then(...)` from a LATER `enqueue()` would then never run, silently ending
+  // persistence for the life of the mount. The fix is a `.catch` on the link itself, so the chain
+  // recovers and the next queued write still issues.
+  it('a link that throws does not break the chain — the next enqueued write still issues', async () => {
+    const error = spyConsole('error');
+    const server = makeFakeServer('{"padding":0}\n');
+    let loadedText = '{"padding":0}\n';
+    const onConflict = vi.fn();
+    let calls = 0;
+    const throwingWriteIfMatch = vi.fn(async (path: string, content: string, expectedSha256: string) => {
+      calls += 1;
+      if (calls === 1) throw new Error('boom');
+      return server.writeIfMatch(path, content, expectedSha256);
+    });
+    const queue = createAtlasWriteQueue(throwingWriteIfMatch, {
+      getLoadedText: () => loadedText,
+      getCurrentPath: () => '/a.atlas.json',
+      onWritten: (content) => { loadedText = content; },
+      onConflict,
+    });
+
+    queue.enqueue('/a.atlas.json', '{"padding":1}\n'); // this link throws
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+
+    queue.enqueue('/a.atlas.json', '{"padding":2}\n'); // must still issue despite the prior throw
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(server.content).toBe('{"padding":2}\n');
+    expect(loadedText).toBe('{"padding":2}\n');
+    expect(onConflict).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalled(); // the throw is still reported, not swallowed silently
   });
 });

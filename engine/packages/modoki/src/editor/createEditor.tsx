@@ -784,10 +784,9 @@ export function createEditor(options: EditorOptions): React.ComponentType {
       // `--scene` override: setCurrentScenePath fires first with the OVERRIDE's path, so the
       // prior value has to be put back explicitly rather than just left alone.
       //
-      // Only the PER-PROJECT key is restored. The unscoped legacy `modoki-last-scene` is a
-      // "scene currently open" proxy for SceneView's prefab-return and devTestBridge, so it must
-      // keep tracking the scene actually loaded — rewinding that one would send prefab-return to
-      // a scene the user is not in.
+      // Only the PER-PROJECT key is restored (#478: the unscoped `modoki-last-scene` this
+      // comment used to carve out for SceneView's prefab-return and devTestBridge is gone —
+      // both now read the scoped key too, so there is nothing else to keep in sync here).
       const cameFromOverride = resolvedOverride != null && (loadedPath === resolvedOverride || loadedPath === canonicalOverride);
       if (cameFromOverride) {
         if (lastScene) localStorage.setItem(LAST_SCENE_KEY, lastScene);

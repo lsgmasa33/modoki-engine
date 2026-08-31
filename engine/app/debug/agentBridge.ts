@@ -2201,9 +2201,11 @@ export function initAgentBridge(): void {
 
   // ── Electron: also serve the main-hosted backend over IPC (ELECTRON_PLAN
   //    Phase 2). Schema push + request answering are required so main's backend
-  //    can type-check and run /api/scene-state. Under dev the page is Vite-served,
-  //    so scene-reload + manifest stay on the live HMR socket below (avoids a
-  //    double reload); in a packaged build (no `hot`) main drives those too. ──
+  //    can type-check and run /api/scene-state. Scene reload is driven off this
+  //    bridge whenever it exists (dev or packaged — see sceneReloadSource, which
+  //    avoids a double reload against Vite's own HMR socket below); manifest
+  //    updates are ALSO driven off this bridge whenever it exists (#503 — see the
+  //    `manifest-updated` handler below for why dev is included). ──
   if (bridge) {
     const pusher = makeSchemaPusher((schema) => bridge.send('schema', schema));
     pusher.start();
@@ -2220,14 +2222,28 @@ export function initAgentBridge(): void {
         void handleSceneChanged(data as { urlPath: string; kind: SceneChangedKind });
       });
     }
-    if (!hot) {
-      // Packaged build (no Vite HMR): main also drives manifest updates. In dev,
-      // init.ts handles Vite's `asset-manifest-updated` instead — don't double up.
-      bridge.on('manifest-updated', (data) => {
-        try { loadManifestJson(data as Parameters<typeof loadManifestJson>[0]); }
-        catch (e) { console.warn('[agentBridge] manifest update failed:', e); }
-      });
-    }
+    // Registered whenever the Electron bridge exists — dev included (#503). Unlike
+    // scene reloads above, this one is NOT `if (!hot)`-gated: `/api/create-asset`
+    // (and friends) is served by MAIN's backend, so main's `rebuildManifest()`
+    // broadcast reaches this renderer ONLY over this IPC channel. In dev, Vite's
+    // own chokidar watcher eventually notices the same file and fires
+    // `asset-manifest-updated` (handled in init.ts), but that copy is ~1s late
+    // (debounce + FS latency) — long enough for an agent's very next
+    // `particle-set`/`anim-set-clip`/`timeline-set` call to bounce off a stale
+    // `pathToGuid` map with "no asset exists at <path>". Staying on this channel
+    // in dev closes that window instead of waiting on Vite's slower copy.
+    //
+    // Must stay ADDITIVE (no `{ prune: true }`): `createEditor.tsx` loads WITH
+    // prune as the sole authority that a missing guid means a DELETED asset: a
+    // second, possibly-stale IPC payload treated as a full rescan could delete a
+    // guid that was only briefly absent from IT, not from the project. Loaded
+    // additively (as here, and in init.ts), a late/stale payload can at worst
+    // transiently re-add a just-deleted guid, which the next pruning load from
+    // Vite corrects — never the other way around.
+    bridge.on('manifest-updated', (data) => {
+      try { loadManifestJson(data as Parameters<typeof loadManifestJson>[0]); }
+      catch (e) { console.warn('[agentBridge] manifest update failed:', e); }
+    });
   }
 
   if (!hot) return;

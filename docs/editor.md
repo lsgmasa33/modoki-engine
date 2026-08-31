@@ -1151,6 +1151,17 @@ runtime) safe: those writes only ever happen while playing, and Stop throws them
 they reach disk. Transitions emit `!play`/`!pause`/`!stop` to the editor journal (see
 [debug-tools-mcp.md](./debug-tools-mcp.md) "Percept").
 
+**Stop pressed during Play's startup window is queued, not dropped (#470).** `enterPlay` awaits
+several times (ending a Timeline preview session, `serializeScene()` for the primary and each base)
+before the final `setPlayState('playing')`, and `getPlayState()` still reads `'stopped'` for that
+whole window — so a Stop landing there used to hit `stopPlay`'s own `'stopped'` early-return and do
+nothing, silently. `enterPlay` now sets an in-flight latch synchronously before its first await; a
+Stop that arrives while it's set is queued instead of dropped, and `enterPlay`'s tail runs the real
+`stopPlay()` revert once it reaches `'playing'`. A second `enterPlay()` arriving in that same window
+is refused outright (returns without doing anything) rather than starting a concurrent snapshot —
+two independent in-flight Plays could otherwise race their `finally` clears and leave the editor
+`'playing'` with no snapshot left to revert.
+
 ## Selection restore across world swaps
 
 koota entity ids are scoped to their owning world, so a `SceneManager` world swap (scene
@@ -1381,11 +1392,20 @@ from a copy it read when the panel opened. Nothing tells it the file changed und
 subscribe to `assetsVersion`" above) — so a `.atlas.json` altered on disk while the panel is
 open (a `git checkout` under a live editor, which CLAUDE.md names as a real hazard) was silently
 reverted by the next padding nudge, with nothing erroring (#439). The write is now a
-**compare-and-swap**: `persistAtlasDocIfUnchanged` (`assetViews/atlasPersist.ts`) re-reads the
-file immediately before writing and refuses if it no longer matches what the panel read,
-surfacing a "changed on disk" banner and re-reading the truth instead. A failed or unknown
-re-read refuses too — "we don't know what is on disk" must never authorize a whole-file
-overwrite.
+**compare-and-swap**: `persistAtlasDocIfUnchanged` (`assetViews/atlasPersist.ts`) hashes what the
+panel loaded and hands that as a precondition to `POST /api/write-file`'s optional `ifMatch` field
+(a sha256 hex of the expected current content). The server compares against the file's actual
+current hash and only then writes — synchronously, with no `await` between the compare and the
+write — so there is no gap left for a second write to land in. A mismatch (or the file not
+existing) 409s with no write, surfaced as a "changed on disk" banner and a re-read of the truth.
+`ifMatch` is optional and absent means an unconditional write, unchanged for every other caller
+(#439's original fix did the compare client-side — read, compare, then write as two separate
+calls — which closed the `git checkout` race but left a narrower one open between two rapid edits;
+#469 moved the compare-and-write into that one atomic server-side operation). The server CAS alone
+still lets the panel ISSUE two overlapping writes and self-inflict a false conflict on the second
+(fast typing, a held stepper); `createAtlasWriteQueue` (`atlasPersist.ts`) fixes that by keeping
+only one write from this panel in flight at a time, collapsing to the latest — without it, fast
+input produces exactly the "changed on disk" false positive the CAS was meant to prevent.
 
 Why this panel and not its siblings: the parked-write panels (`ParticleEditor`,
 `SpriteAnimEditor`, `AnimationEditor`, `TimelineEditor`, `SkinEditor`) go through

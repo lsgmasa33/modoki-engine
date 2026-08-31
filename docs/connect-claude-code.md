@@ -813,7 +813,7 @@ while CLAUDE.md RULE 2 has several running at once. Measured with two live edito
 
 | Shared thing | Consequence |
 |---|---|
-| `Local Storage` (LevelDB) | **single-writer**: the FIRST editor takes the lock, later ones get NOTHING. `editor:sceneViewMode`, `modoki-last-scene`, `modoki.anim.trackListW`, `modoki.buildSupportDismissed` silently stop persisting — no error anywhere |
+| `Local Storage` (LevelDB) | **single-writer**: the FIRST editor takes the lock, later ones get NOTHING. `editor:sceneViewMode`, `modoki-last-scene:<project>`, `modoki.anim.trackListW`, `modoki.buildSupportDismissed` silently stop persisting — no error anywhere |
 | `GPUCache` / `DawnWebGPUCache` | both processes hold `data_0..3` + `index` open; Chromium's disk_cache expects one process (suspicious for a WebGPU/TSL engine, not proven to cause a specific failure) |
 | `logs/main.log` | interleaved across clones |
 | `backend-port.json` (C5 sticky port) | `MODOKI_MULTI` does **not** pin a port (`launch-editor.sh:32`), so MULTI editors read/write one file and the sticky port degrades to whoever launched last |

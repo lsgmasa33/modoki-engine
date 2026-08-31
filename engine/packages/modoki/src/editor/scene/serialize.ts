@@ -735,8 +735,6 @@ export function collectResourceRefs(entities: SerializedEntity[]): ResourceRef[]
 
 let _currentScenePath: string | null = null;
 
-const LAST_SCENE_KEY = 'modoki-last-scene';
-
 /** Per-project localStorage key for the "last opened scene", scoped by project
  *  name so one project's scene path never leaks into another's (which would 404).
  *  Single source of truth for BOTH the writer (setCurrentScenePath) and the reader
@@ -749,6 +747,9 @@ export function lastSceneKey(configName: string | undefined): string {
 // the per-project key that createEditor restores from on the next launch.
 let _sceneProject: string | undefined;
 export function setScenePersistenceProject(name: string | undefined) { _sceneProject = name; }
+/** The active project's name, for a caller that needs to derive `lastSceneKey` itself
+ *  (prefab-edit's exit fallback) rather than persisting through this module. */
+export function getScenePersistenceProject(): string | undefined { return _sceneProject; }
 
 // Base-scene ref of the currently-loaded scene (base-scene persistence). Mirrors
 // _currentScenePath: not a live-world value, so it must be tracked as editor
@@ -763,11 +764,19 @@ export function getCurrentScenePath() { return _currentScenePath; }
 export function setCurrentScenePath(path: string | null) {
   _currentScenePath = path;
   if (path) {
-    // Global key: legacy readers (SceneView prefab-return, devTestBridge fixtures).
-    localStorage.setItem(LAST_SCENE_KEY, path);
-    // Per-project key: what createEditor restores on startup. Writing it HERE (on
-    // every scene switch, not just at boot) is the fix that makes the editor reopen
-    // the scene you were last on, not the project default.
+    // Per-project key: what createEditor restores on startup, AND what prefab-edit's
+    // exit fallback reads (`exitPrefabEditing`, scene/prefabEdit.ts). Writing it HERE
+    // (on every scene switch, not just at boot) is the fix that makes the editor
+    // reopen the scene you were last on, not the project default.
+    //
+    // #478: this used to ALSO write an unscoped `modoki-last-scene` key, kept for two
+    // "legacy readers" — SceneView's prefab-return fallback and devTestBridge. Neither
+    // exists any more (devTestBridge's own comment says E2E setup calls `loadScene()`
+    // directly instead; `exitPrefabEditing` now reads the scoped key below), so the
+    // unscoped key had exactly one reader left and it was wrong: global across every
+    // project sharing this origin, so a boot with no scene loaded still held the
+    // PREVIOUS project's path and prefab-return would try to load it. Deleted rather
+    // than fixed in place — see `lastSceneKey`.
     localStorage.setItem(lastSceneKey(_sceneProject), path);
   }
 }

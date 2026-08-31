@@ -9,7 +9,7 @@
 
 import type { PrefabFile } from './prefab';
 import { serializePrefab, writePrefabFile, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
-import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, type SerializedEntity } from './serialize';
+import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { swapHistory } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
@@ -396,7 +396,13 @@ export async function savePrefabEdit(): Promise<boolean> {
  *  stuck in a prefab-edit mode with no prefab world). */
 export async function exitPrefabEditing(): Promise<string | null> {
   const { prefabReturnScenePath, closePrefabEditor } = useEditorStore.getState();
-  const stored = typeof localStorage !== 'undefined' ? localStorage.getItem('modoki-last-scene') : null;
+  // #478: was the UNSCOPED `modoki-last-scene` key — global across every project sharing this
+  // origin, so a boot with no scene loaded still held the PREVIOUS project's path and this would
+  // try to load it (a cross-project path that resolves to nothing). Read the same per-project key
+  // `setCurrentScenePath` writes (scene/serialize.ts) instead.
+  const stored = typeof localStorage !== 'undefined'
+    ? localStorage.getItem(lastSceneKey(getScenePersistenceProject()))
+    : null;
   // ⚠️ A synthetic `/__prefab-edit__/…` path is not a FILE — loading it 404s ("no asset at … the
   // dev server answered with index.html") and strands the editor in the prefab world with no scene.
   // `resolveReturnScene` keeps one out of the store in the first place; this skips it whichever

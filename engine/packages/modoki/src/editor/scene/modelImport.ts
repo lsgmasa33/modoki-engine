@@ -17,6 +17,7 @@ import { convertSourceToGLB, needsGLBConversion } from './convertToGLB';
 import { extractRigBones, type RigBoneInfo } from './rigBones';
 import { useEditorStore } from '../store/editorStore';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { sha256Hex } from '../utils/contentHash';
 
 async function writeAssetFile(path: string, content: string): Promise<boolean> {
   try {
@@ -58,16 +59,12 @@ async function writeAssetFileOrAbort(path: string, content: string): Promise<voi
   if (!await writeAssetFile(path, content)) throw new ImportWriteAborted(path);
 }
 
-/** SHA-256 hex of a string, via SubtleCrypto. Used to derive stable, content-
- *  addressed filenames for extracted textures so re-imports of the same source
- *  bytes land on the same path — and so the existing `.meta.json` sidecar
- *  (which carries the guid) survives and external material refs don't dangle. */
-async function sha256Hex(text: string): Promise<string> {
-  const buf = new TextEncoder().encode(text);
-  const digest = await crypto.subtle.digest('SHA-256', buf);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0')).join('');
-}
+// SHA-256 hex of a string, for stable content-addressed filenames of extracted textures — so
+// re-imports of the same source bytes land on the same path and the existing `.meta.json`
+// sidecar (which carries the guid) survives and external material refs don't dangle. This used
+// to be a byte-identical local copy of `contentHash.ts`'s `sha256Hex` (#490 review finding 4);
+// consolidated into the one place per that module's own docstring ("so any future
+// conditional-write caller hashes the same way").
 
 /** base64-encode bytes in chunks (avoids arg-count blowups from
  *  `String.fromCharCode(...wholeArray)` on multi-megabyte texture PNGs).
