@@ -315,6 +315,12 @@ function disposeSlot(slot: Slot) {
     const tex = slot.hasFrame ? (mesh.texture as Texture | undefined) : undefined;
     mesh.destroy();
     geo?.destroy();
+    // ⚠️ BARE `destroy()` ON PURPOSE — Pixi's `Shader.destroy(destroyPrograms = false)` leaves the
+    // shared program alone, and `ensureSpriteMaterial` caches ONE program per material GUID that
+    // every entity using that material holds a Shader built from. Changing this to `destroy(true)`
+    // would free a GlProgram that other live Meshes STILL IN THE GRAPH point at, from inside the
+    // pass that renders them — the #455 class, with a worse blast radius than the mask that found
+    // it. Same for the text shaders below.
     slot.matShader?.destroy();
     if (tex && tex !== Texture.WHITE) tex.destroy(false);
     if (slot.textureUrl) releaseSpriteTexture(slot.textureUrl);

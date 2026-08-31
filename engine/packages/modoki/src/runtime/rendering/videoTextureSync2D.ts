@@ -115,7 +115,13 @@ function release(b: Bound): void {
   b.source.autoUpdate = false;
   (b.source as { resource?: HTMLVideoElement }).resource = undefined;
   if (!b.sprite.destroyed) {
-    b.sprite.texture = b.previousTexture;
+    // ⚠️ `previousTexture` was captured at BIND time and can have been DESTROYED since — Scene2D
+    // swaps a slot's framed wrapper on a LIVE sprite and destroys the old one (the re-slice branch
+    // in `Scene2D.tsx`, `oldTex.destroy(false)`), which leaves this holding a corpse. Restoring it
+    // blind puts a destroyed texture on an in-graph sprite that the `pool.renderAll` at the end of
+    // this same pass then renders — the #455 class. EMPTY is the honest fallback: the sprite shows
+    // nothing for a frame instead of taking the renderer down with it.
+    b.sprite.texture = b.previousTexture.destroyed ? Texture.EMPTY : b.previousTexture;
   }
   // `destroy(true)` — take the source down with the wrapper. Safe (and required, or the
   // VideoSource leaks) precisely BECAUSE this source is ours alone: unlike a sprite slot,
