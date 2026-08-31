@@ -1504,6 +1504,40 @@ export async function acquireModel(sceneId: SceneId, glbRef: string, postprocess
   } else {
     await loadModelTemplates(glbPath, undefined, postprocessorId);
   }
+
+  // Post-await guard, mirroring acquireMesh's (#485, :1552). releaseAllForScene is
+  // synchronous and can land inside the load above; the owner we added at :1487 is
+  // gone by the time we resume, and nothing will ever release this sceneId again.
+  //
+  // ⚠️ The OUTER check ("was I released") is currently subsumed by the inner one
+  // ("does anyone still own it") and no test can tell them apart — an empty owner set
+  // trivially implies not-a-member, and this guard is the function's last statement, so
+  // the early `return` changes nothing. Verified by mutation: deleting the outer check
+  // leaves the whole suite green, deleting the inner one turns the second-live-scene
+  // test red. It is kept deliberately — it states the question this guard is actually
+  // asking, mirrors `acquireMesh`'s established shape, and stops being redundant the
+  // moment anything is added after it. Do not "simplify" it away on the strength of a
+  // green suite; the suite cannot see this one.
+  if (!modelOwners.get(glbPath)?.has(sceneId)) {
+    if (!modelOwners.get(glbPath)?.size) {
+      // Re-seat the snapshot releaseModelByPath deleted (:1522) so invalidateModel
+      // finds the LOD siblings without depending on manifest state.
+      //
+      // ⚠️ This only CHANGES anything when the manifest no longer carries the model's
+      // lodPaths — otherwise invalidateModel's manifest fallback (:432-434) finds the
+      // siblings on its own and the re-seat is a no-op. Its test has to clear the
+      // manifest to reach the branch at all: re-registering the asset does NOT drop a
+      // previously-registered modelCache block (assetManifest.ts:299-311 preserves it
+      // when the type is unchanged), so a test that merely re-registers goes green
+      // whether or not this line is here. Whether production can reach that state is
+      // NOT established — treat the line as defensive, and do not read its test as
+      // proof that the manifest is ever actually gone here.
+      if (lodPaths && lodPaths.length > 0) modelLodSnapshots.set(glbPath, [...lodPaths]);
+      invalidateModel(glbPath);
+      modelLodSnapshots.delete(glbPath);
+    }
+    return;
+  }
 }
 
 /** Release a GLB model for a scene. Disposes mesh templates when refcount hits zero. */
@@ -1546,9 +1580,11 @@ export async function acquireMesh(sceneId: SceneId, meshRef: string): Promise<vo
   // concurrently keeps its entry.
   // NOTE: this does not cover fetchMeshAsset loading model templates inside
   // this same await — geometry can already be resident with no owner at all by
-  // the time we bail here. That's a separate, pre-existing situation (see the
-  // F6 comment on the sync render-path resolver) and is tracked separately,
-  // not fixed here.
+  // the time we bail here. Triaged under #488: that's site 1 (acquireMesh's
+  // MODEL owner, as opposed to its MESH owner above), and it's won't-fix — see
+  // docs/scene-loading.md for why. Site 2 (acquireModel's own post-await
+  // window) IS fixed, at acquireModel's post-await guard above. Site 3 (the F6
+  // sync render-path resolver) is working-as-designed. All three closed on #488.
   if (!meshAssetOwners.get(meshPath)?.has(sceneId)) {
     if (!meshAssetOwners.get(meshPath)?.size) meshAssetCache.delete(meshPath);
     return;

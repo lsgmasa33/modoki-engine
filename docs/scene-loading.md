@@ -86,6 +86,59 @@ entries) can't strand an owner.
 **Editor live-preview caches** (particle defs in `particleCache.ts`) are plain data, cleared via
 `clearParticleCache()` from `disposeAllCachedResources()` on full teardown.
 
+### The mid-load release window (#488)
+
+`acquireModel`/`acquireMesh` both add the caller's `sceneId` owner **before** awaiting their load
+(`loadModelTemplates`/`fetchMeshAsset`), so the owner is visible to a concurrent
+`releaseAllForScene` while the load is still in flight. `releaseAllForScene` is synchronous, so it
+can land inside that await window, remove the owner it just saw, and dispose whatever was already
+cached — after which the resumed load repopulates the cache with owner-less geometry that nothing
+will ever release again (`invalidateModel` doesn't bump `cacheGeneration`, only wholesale teardown
+does, so `loadModelTemplates`'s generation guard doesn't catch this).
+
+Three sites were suspected under #488; only one is fixed.
+
+- **Fixed — `acquireModel`'s own window.** A post-await guard (mirroring `acquireMesh`'s existing
+  one) checks, after the load resolves: was *my* `sceneId` released while I was awaiting (`!has`),
+  and if so, is the owner set now completely empty (`!size`)? Both are required — `!has` alone
+  would invalidate a model a second, still-live scene shares (a keep-direction bug: dropping data a
+  live scene owns); `!size` alone would never distinguish "I was released but someone else still
+  holds it" from "I still hold it", though in `acquireModel`'s current position — the guard is the
+  function's last statement, nothing runs after it — the two conditions happen to evaluate to the
+  same boolean on every reachable path, since an empty owner set trivially implies the caller isn't
+  a member and a non-empty set containing the caller trivially implies the set is non-empty. Keep
+  both anyway: it's the same shape as `acquireMesh`'s established guard, and a future edit that adds
+  code after the check would restore the distinction. On a positive hit, the guard invalidates via
+  `invalidateModel`, which is the complete disposal answer (geometry, cache entries, hierarchy
+  cache, in-flight `loading` entries, dependent `meshAssetCache` entries, LOD siblings, and it
+  broadcasts `emitAssetInvalidated` before disposing). Because the owner is added before the await,
+  every other concurrent `acquireModel` for the same path has *also* already added its owner by the
+  time this guard runs — so "is the owner set now empty" can never free something a live scene owns.
+  A per-scene `cacheGeneration` bump was considered and rejected: it would invalidate in-flight
+  loads belonging to other, unrelated live scenes.
+
+- **Won't-fix — `acquireMesh`'s transitive model window.** `acquireMesh` adds its own MESH owner
+  before its await and already guards that window (the `:1552`-area check). But it also
+  transitively adds a MODEL owner — for the `.glb` the mesh references — **after** its own await,
+  inside a second, nested await (`loadModelTemplates` for the model). A release landing in that
+  inner window can strand owner-less model geometry the same way site 2 could. The safe variant of
+  this guard would need to check whether the GLOBAL owner set for that model path is empty (not
+  just this mesh's), because by the time the inner await resumes, no ordering guarantee ties this
+  mesh's own release to another concurrent acquirer's owner-add the way `acquireModel`'s guard could
+  rely on — so it would fire essentially never, at real cost in code complexity and cognitive load,
+  for the sake of covering an already-bounded leak. The orphaned model self-heals: `loading` retains
+  its resolved promise for the model path, so the NEXT `acquireModel`/`acquireMesh` for that path
+  reuses the cached, owner-less entry and re-adopts it under a fresh `sceneId` rather than
+  re-fetching — the leak is a bounded window, not a permanent one, and a fix riskier than the defect
+  it prevents was declined.
+
+- **Working as designed — the F6 sync render-path resolver.** The synchronous render path resolves
+  a `meshAssetCache` entry directly (not through `acquire*`) to avoid re-fetching every frame; this
+  is deliberate (see the F6 comment at the resolver) and evicting an owner-less entry there would
+  make that path re-fetch on every frame it's asked to resolve one. Not a leak in the refcount
+  sense — the entry is content cache, not a GPU-resource owner — and closing it would regress F6's
+  reason for existing.
+
 ## Scene manifest format
 
 The current scene file version is **12** (`SceneFile.version`), stamped from

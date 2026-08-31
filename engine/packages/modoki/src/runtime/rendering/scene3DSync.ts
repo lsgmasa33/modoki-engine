@@ -62,7 +62,7 @@ import { getVisualDelta, getTime } from '../core/getTime';
 import { getPlayState } from '../core/playState';
 import { isSkeletalPreviewing, skeletalPreviewDelta } from '../core/skeletalPreview';
 import { getSkeletalSeek, hasSkeletalSeeks, clearSkeletalSeeks } from '../core/skeletalSeek';
-import { createPrimitiveMesh } from '../loaders/primitives';
+import { createPrimitiveMesh, isPrimitive, PRIMITIVE_NAMES } from '../loaders/primitives';
 import {
   beginLightMaskFrame, getMaskedMaterial, isLightMaskingActive, maskNeedsVariant, baseOf, retireVariantsOf,
   DEFAULT_RENDERING_LAYER_MASK, type MaskedLight, type LightingFactory,
@@ -80,10 +80,35 @@ const _activeLightIds = new Set<number>();
 const _maskedLights: MaskedLight[] = [];
 const _activeRenderIds = new Set<number>();
 const _defaultMaterial = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.5, metalness: 0 });
+/** #482: names already warned about via an unresolvable `Renderable3DPrimitive.mesh` — one
+ *  console.warn per bad name per world, not one per frame. Shared by both sites that can
+ *  discover the name is bad: the create path (no mesh exists yet) and the rebuild gate (a mesh
+ *  exists but its KIND changed to a name we don't recognize).
+ *
+ *  Reset on `onWorldSwap` below, like `derivedMaterials.ts`/`lightMaskVariants.ts` reset THEIR
+ *  process-globals — a module-global with no reset here specifically broke reproduction: the
+ *  editor runs two render surfaces on one world (SceneView + the Game panel's Scene3D) sharing
+ *  this dedupe so only one ever reported, and reloading the editor to reproduce "why is my
+ *  primitive invisible" warned nothing because the name was already in the set from before. */
+const _warnedUnknownPrimitives = new Set<string>();
+onWorldSwap(() => { _warnedUnknownPrimitives.clear(); });
+function warnUnknownPrimitiveOnce(id: number, meshName: string): void {
+  if (_warnedUnknownPrimitives.has(meshName)) return;
+  _warnedUnknownPrimitives.add(meshName);
+  // "first seen on entity N", not "entity N has" — this fires ONCE per name, so a later frame
+  // with the SAME bad name on a DIFFERENT entity (koota reuses ids LIFO, so `id` can already
+  // belong to something else by the time anyone reads this line) must not be read as naming the
+  // entity that's currently broken.
+  console.warn(
+    `Renderable3DPrimitive has unknown mesh '${meshName}' (first seen on entity ${id}); expected one of: ${PRIMITIVE_NAMES.join(', ')}`,
+  );
+}
 
 // Materials created inline for specific entities (not from caches) are tracked PER RENDER STATE,
 // as `RenderState.ownedMaterials` — only those are safe to dispose when reassigned or at teardown;
-// shared cache materials, the primitive placeholder sentinel and `_defaultMaterial` must not be.
+// shared cache materials and the primitive placeholder sentinel must not be. `_defaultMaterial`
+// itself is never bound directly either (#480) — `syncMaterial` clones it per entity and owns
+// the clone, so the module-level instance stays untouched and is safe only as a clone SOURCE.
 //
 // ⚠️ Per-state, not module-global, because THE EDITOR RUNS TWO OF THESE on one world (SceneView +
 // the Game panel's Scene3D) and each mints its OWN inline materials. A shared set let one loop's
@@ -1362,9 +1387,10 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
  *    - **`primitives._placeholderMaterial`**, the module-level sentinel a primitive holds while its
  *      authored material is still loading (or forever, if the ref does not resolve) — documented
  *      at its definition as "must never be disposed";
- *    - **`_defaultMaterial`**, the module-level fallback `syncMaterial` binds for an empty ref.
- *  All three are process-wide singletons or cache entries, so one panel unmounting broke them for
- *  every panel. Ownership is the only safe discriminator, and it is already tracked. */
+ *    - **`_defaultMaterial`**, the module-level fallback for an empty ref — `syncMaterial` never
+ *      binds it directly (#480), only a per-entity CLONE that IS owned and disposed normally.
+ *  All but the last are process-wide singletons or cache entries, so one panel unmounting broke
+ *  them for every panel. Ownership is the only safe discriminator, and it is already tracked. */
 export function disposeRenderState(state: RenderState, scene: THREE.Scene) {
   for (const [id, obj] of state.ecsObjects) {
     scene.remove(obj);
@@ -1450,26 +1476,78 @@ function syncMaterial(
   isInstanced = false,
   isMasked = false,
   castMode: 'auto' | 'on' | 'off' = 'auto',
+  // #480 (narrowed by review — see below): true for a caller whose EMPTY-ref material is written
+  // into IN PLACE by something else in the same pass (the primitive colour block's
+  // `color.setHex`), so an empty ref must not hand it the shared `_defaultMaterial` singleton.
+  // False (the default) for every other caller — a GLB (`Renderable3D`) mesh with no override
+  // never has anything write into its material (Tint/MaterialInstance bind their OWN clones), so
+  // it keeps binding the shared singleton exactly as before #480.
+  mintsPrivateDefault = false,
 ): void {
   const targets = materialTargetsOf(obj);
   const prevMat = state.ecsMaterials.get(id);
   if (prevMat !== curMat) {
-    state.ecsMaterials.set(id, curMat);
-    // Resolve the new material once (a `.mat.json` GUID, or the engine default
-    // when empty), then fan it out to every target. A mesh renderer references a
-    // MATERIAL only — never a texture directly (textures live on the .mat.json).
-    const newMat: THREE.Material | undefined = curMat
-      ? (resolveMaterial(curMat) ?? undefined)
-      : _defaultMaterial;
+    // Resolve the new material once (a `.mat.json` GUID, the engine default for most empty-ref
+    // callers, or a fresh per-entity clone of it for `mintsPrivateDefault` — see below), then fan
+    // it out to every target. A mesh renderer references a MATERIAL only — never a texture
+    // directly (textures live on the .mat.json).
+    let newMat: THREE.Material | undefined;
+    if (curMat) {
+      newMat = resolveMaterial(curMat) ?? undefined;
+    } else if (mintsPrivateDefault) {
+      // #480: clone rather than bind the shared `_defaultMaterial` singleton — the PRIMITIVE
+      // colour block (the only caller that passes `mintsPrivateDefault`) writes straight into
+      // `material.color`, so two primitives whose refs clear to '' in the same frame would
+      // otherwise fight over one object, with the pollution outliving both. The clone is tracked
+      // as OWNED so the existing lifecycle (the retirement handoff below, `disposeRenderState`)
+      // frees it exactly like any other inline material.
+      //
+      // ⚠️ CONFINED TO `mintsPrivateDefault` ON PURPOSE — an earlier version of this fix made the
+      // clone unconditional and broke two things measured on real entities:
+      //  - `applyInstancedBatching` (instancedBatching.ts) keys on `${geo.uuid}|${mat.uuid}`; 8
+      //    identical GLB entities sharing `_defaultMaterial` went from
+      //    `{considered:8,batched:8,groups:1,drawCallsSaved:7}` to
+      //    `{considered:8,batched:0,skipped:{"below-threshold":8}}` once each held its own clone.
+      //  - a light-masked GLB with an empty ref would mint a PER-ENTITY light-mask variant
+      //    (`cloneDerived` stamps `__derivedBase`, so `baseOf(clone)` is the clone ITSELF —
+      //    `lightMaskVariants.ts` shares variants by base identity, so a distinct base per entity
+      //    means a distinct variant per entity in a cache with an explicit "must not grow per
+      //    entity" test). A `Renderable3DPrimitive` can never reach this: `masked` there is
+      //    `!!rend.material && …`, so an empty-ref PRIMITIVE is never masked in the first place —
+      //    which is what makes confining the clone to primitives safe from this specific risk too.
+      // `cloneDerived`, not a bare `.clone()` — every material clone bound to a live mesh must
+      // go through it (materialCloneStamp.test.ts), and it is also what lets this clone
+      // participate in the same retire/refresh bookkeeping as every other derived material.
+      newMat = cloneDerived(_defaultMaterial, _defaultMaterial);
+      state.ownedMaterials.add(newMat);
+      // Force the primitive colour block to re-apply `rend.color` this frame: it only calls
+      // `setHex` when the cached colour differs from the authored one, and a fresh clone starts
+      // at `_defaultMaterial`'s grey — which can equal a stale `ecsColors` entry left over from
+      // before the ref cleared, so the authored colour would otherwise never get written.
+      state.ecsColors.delete(id);
+    } else {
+      newMat = _defaultMaterial;
+    }
+    // Record the ref only once it actually resolved (#479): while `newMat` stays undefined (a
+    // `.mat.json` load still in flight, or MATERIAL_FAILED), leaving `prevMat !== curMat` true
+    // makes this branch re-run — and retry — every following frame, for EVERY entity kind,
+    // including tinted / MaterialInstance / light-masked ones the `else if` below skips.
+    // Recording the ref immediately would make an unresolved ref look "handled" when nothing
+    // was ever bound.
+    if (newMat) state.ecsMaterials.set(id, curMat);
     // Collect candidate owned materials rather than disposing inline: when `newMat` is not
     // yet resolved (async .mat.json load still in flight, or MATERIAL_FAILED), `t.material`
     // is left pointing at the old material below, and disposing it out from under a mesh
     // still in the scene corrupts that frame's render (#477). Freed below, once we know
     // whether anything still binds it.
-    const toFree = new Set<THREE.Material>();
+    // Lazily allocated (#479): this branch can now run every frame for an entity whose ref
+    // never resolves, and an owned material needing to be freed here is rare — an
+    // unconditional `new Set()` is exactly the per-frame GC churn `syncRenderablesChurn`
+    // polices, same reasoning as the lazy allocation in the branch below.
+    let toFree: Set<THREE.Material> | undefined;
     for (const t of targets) {
       const oldMat = t.material as THREE.Material;
-      if (oldMat && state.ownedMaterials.has(oldMat)) toFree.add(oldMat);
+      if (oldMat && state.ownedMaterials.has(oldMat)) (toFree ??= new Set()).add(oldMat);
       // Only 'auto' re-derives cast from the new material's transparency — an explicit
       // 'on'/'off' override (#183) must survive a material swap, not be clobbered here.
       if (newMat) { t.material = newMat; if (castMode === 'auto') t.castShadow = !newMat.transparent; }
@@ -1478,19 +1556,21 @@ function syncMaterial(
     // assigned to every target that held it. `newMat === undefined` leaves it bound
     // everywhere (nothing to free yet — no replacement resolved this frame; the polling
     // branch below closes the leak once the async load lands).
-    for (const m of toFree) {
-      if (targets.some((t) => t.material === m)) {
-        // Still bound — no replacement landed. NOT ours to free now, but nor can we simply
-        // leave it: syncMaterial is not the only writer of `t.material` (applyLightMask #136,
-        // materialInstanceSystem), and for a masked/instanced entity the polling branch below
-        // never runs, so nobody would ever come back for it. Hand it to the per-frame sweep,
-        // which frees it once NOTHING binds it — whoever did the rebinding (#477).
+    if (toFree) {
+      for (const m of toFree) {
+        if (targets.some((t) => t.material === m)) {
+          // Still bound — no replacement landed. NOT ours to free now, but nor can we simply
+          // leave it: syncMaterial is not the only writer of `t.material` (applyLightMask #136,
+          // materialInstanceSystem), and for a masked/instanced entity the polling branch below
+          // never runs, so nobody would ever come back for it. Hand it to the per-frame sweep,
+          // which frees it once NOTHING binds it — whoever did the rebinding (#477).
+          state.ownedMaterials.delete(m);
+          retireDerivedMaterial(m, () => m.dispose());
+          continue;
+        }
         state.ownedMaterials.delete(m);
-        retireDerivedMaterial(m, () => m.dispose());
-        continue;
+        m.dispose();
       }
-      state.ownedMaterials.delete(m);
-      m.dispose();
     }
   } else if (!isTinted && !isInstanced && !isMasked && curMat) {
     // .mat.json path unchanged but the async load may have finished since
@@ -2717,6 +2797,10 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       const tinted = !instanced && entity.has(Tint);
       const lightMask = lightMaskFor(rend.renderingLayerMask, obj);
       const masked = maskNeedsVariant(lightMask);
+      // `mintsPrivateDefault` intentionally omitted (defaults to false, #480 review) — nothing
+      // writes into a GLB's material in place (Tint/MaterialInstance bind their OWN clones), so
+      // an empty ref keeps binding the shared `_defaultMaterial`, exactly as before #480. See the
+      // parameter's doc comment on `syncMaterial` for the batching regression this avoids.
       syncMaterial(obj, id, rend.material || '', state, tinted, instanced, masked, rend.castShadow);
       // Per-entity Tint: bind a tinted clone of the resolved material. Passing
       // isTinted above stops syncMaterial from re-binding the base each frame, so
@@ -2751,7 +2835,28 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
     // is baked in createPrimitiveMesh, so a size change can't be applied via
     // scale (that would also affect children) — geometry has to be rebuilt.
     const sizeChanged = obj && ecsSizes.get(id) !== rend.size;
-    if (obj && (ecsSprites.get(id) !== rend.mesh || sizeChanged)) {
+    const kindChanged = obj && ecsSprites.get(id) !== rend.mesh;
+    // Short-circuited so `isPrimitive` is called ONLY when the kind actually changed — matching
+    // the original evaluation order (several tests mock `loaders/primitives` with just
+    // `createPrimitiveMesh`, no `isPrimitive`/`PRIMITIVE_NAMES`, because their scenarios never
+    // touch a kind change; calling it unconditionally here broke those mocks for no behavioural
+    // gain — `obj &&` below already makes `meshKnown` irrelevant whenever `kindChanged` is falsy).
+    const meshKnown = !kindChanged || isPrimitive(rend.mesh);
+    // #482: a kind change to a name `isPrimitive` doesn't recognize (a hand-edited scene, or a
+    // primitive kind renamed since the scene was authored) must not warn silently — warn once,
+    // but leave the entity rendering whatever it already has; below, the rebuild gate skips it.
+    if (kindChanged && !meshKnown) warnUnknownPrimitiveOnce(id, rend.mesh);
+    // #482: do not free the OLD mesh until the replacement is actually in hand — the same
+    // ordering discipline as #477. An UNKNOWN name is INERT here, full stop, regardless of what
+    // else changed: no rebuild, no free, the old mesh (if any) is kept exactly as it was. This
+    // gate used to read `sizeChanged || (kindChanged && meshKnown)`, which let a size change
+    // paired with an unknown name (or a later size edit on an entity ALREADY stuck on an unknown
+    // name — `ecsSprites` is deliberately not updated for one, so `kindChanged` stays true
+    // forever) fall through the `sizeChanged` half and tear down anyway: geometry disposed, maps
+    // cleared, then the create path's null check fires and the entity vanishes permanently with
+    // nothing left to warn about (`warnUnknownPrimitiveOnce` had already fired for that name on
+    // the frame the kind changed). Gating the ENTIRE condition on `meshKnown` closes every route.
+    if (obj && meshKnown && (sizeChanged || kindChanged)) {
       scene.remove(obj);
       // Dispose owned geometry from the previous mesh so size churn doesn't leak.
       if (ownsGeometry.has(id) && (obj as THREE.Mesh).geometry) {
@@ -2782,19 +2887,41 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       // Skip the default material when an override is set — avoids the
       // create-then-immediately-dispose churn we'd otherwise pay on every spawn.
       const hasOverride = !!rend.material;
-      obj = createPrimitiveMesh(rend.mesh, rend.size, rend.color, hasOverride)!;
+      const built = createPrimitiveMesh(rend.mesh, rend.size, rend.color, hasOverride);
+      // #482: `rend.mesh` names a shape `createPrimitiveMesh` doesn't recognize (a hand-edited
+      // scene, or a primitive kind renamed since the scene was authored). Do not free anything —
+      // there is nothing to free here, this is the "no mesh exists yet" path — and do not throw:
+      // warn once per bad name and leave the entity unrendered rather than crash the frame.
+      if (!built) {
+        warnUnknownPrimitiveOnce(id, rend.mesh);
+        return;
+      }
+      obj = built;
+      // #479: whether the ref is SETTLED as of this creation frame — an empty ref always is (the
+      // primitive owns the default material `createPrimitiveMesh` just minted); a non-empty one
+      // is settled only once `resolveMaterial` actually returns something.
+      let materialSettled = true;
       if (!hasOverride) {
         // Track the primitive's default material as owned (safe to dispose)
         state.ownedMaterials.add((obj as THREE.Mesh).material as THREE.Material);
       } else if (rend.material) {
         const resolved = resolveMaterial(rend.material);
         if (resolved) (obj as THREE.Mesh).material = resolved;
+        else materialSettled = false;
       }
       scene.add(obj);
       ecsObjects.set(id, obj);
       ecsSprites.set(id, rend.mesh);
       ecsColors.set(id, rend.color);
-      ecsMaterials.set(id, rend.material || '');
+      // Record the ref only once it is SETTLED (#479) — recording an unresolved ref here is the
+      // fourth door into the same defect `syncMaterial`'s own branch 1 closes: `syncMaterial`
+      // runs later in this very callback and would see `ecsMaterials` already equal to `curMat`
+      // and take the unchanged-ref `else if`, which is SKIPPED for a masked/instanced/tinted
+      // entity — so a primitive SPAWNED with a not-yet-resolved ref would never bind it, staying
+      // on `primitives._placeholderMaterial` (`visible: false`) forever instead of just looking
+      // stale. Leaving it unset here makes `syncMaterial` take branch 1 and retry every frame
+      // until the load lands, same as everywhere else.
+      if (materialSettled) ecsMaterials.set(id, rend.material || '');
       ecsSizes.set(id, rend.size);
       ownsGeometry.add(id);
     }
@@ -2816,7 +2943,9 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
     // into, and a shared (material, mask) variant would fight it.
     const lightMask = lightMaskFor(rend.renderingLayerMask, obj);
     const masked = !!rend.material && maskNeedsVariant(lightMask);
-    syncMaterial(obj as THREE.Mesh, id, rend.material || '', state, false, instanced, masked, rend.castShadow);
+    // `mintsPrivateDefault: true` — the colour block right below writes into an empty-ref
+    // primitive's material in place, so it must never be the shared `_defaultMaterial` (#480).
+    syncMaterial(obj as THREE.Mesh, id, rend.material || '', state, false, instanced, masked, rend.castShadow, true);
 
     // Update color when changed (only applies to the default material, not a .mat.json). A
     // single default-material primitive is NOT a supported MaterialInstance prop base (its
