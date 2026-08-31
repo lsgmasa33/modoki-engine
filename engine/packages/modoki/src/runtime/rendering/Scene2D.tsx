@@ -2149,12 +2149,14 @@ export class Scene2DRenderer {
       this.entityShaders.clear();
       this._materialTexLoading.clear();
       // 2D-material programs are world-lifecycle — clear UNCONDITIONALLY (not renderer-count
-      // gated like the texture net): clearSpriteMaterialCache only empties Maps (never
-      // destroys a GlProgram/GpuProgram), and every live per-entity Shader holds its OWN
-      // program reference, so wiping the shared cache can't strand the other viewport — both
-      // just recompile (a Pixi cache hit) next frame. Gating this on liveRenderers<=1 was the
-      // bug that left an EDITED .shader.json serving its stale compiled program on hot-reload
-      // whenever both GameView + SceneView were live (the default editor).
+      // gated like the texture net): clearSpriteMaterialCache never destroys a GlProgram/
+      // GpuProgram, and every live per-entity Shader holds its OWN program reference, so wiping
+      // the shared cache can't strand the other viewport's already-drawn frame. It ALSO bumps a
+      // generation that supersedes any in-flight compile — what keeps a sibling safe from THAT
+      // is that the clear fires the pending waiters (#523), not that it's maps-only. Gating this
+      // on liveRenderers<=1 was the bug that left an EDITED .shader.json serving its stale
+      // compiled program on hot-reload whenever both GameView + SceneView were live (the default
+      // editor).
       clearSpriteMaterialCache();
       this.activeIds.clear();
       this.prevCanvasIds.clear();
@@ -2220,7 +2222,9 @@ export class Scene2DRenderer {
     this.flushPendingMaskDestroy();
     this.entityShaders.clear();
     this._materialTexLoading.clear();
-    // Unconditional (see onWorldSwap): safe with a sibling renderer live — only empties Maps.
+    // Unconditional (see onWorldSwap): safe with a sibling renderer live because the clear wakes
+    // pending waiters, not because it's maps-only — this call site NEEDS that wake, since below
+    // only re-dirties the instance that's going away, not the surviving sibling.
     clearSpriteMaterialCache();
     this.activeIds.clear();
     this.activeMaskIds.clear();
