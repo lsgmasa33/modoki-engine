@@ -52,7 +52,7 @@ import { clearDeform2DBuffers } from '../animation/deform2DBuffers';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_2D, PRIORITY_EDITOR_2D } from './frameDriver';
 import { sceneManager } from '../scene/SceneManager';
 import { isImagePath, isVideoRef, resolveImageUrl, resolvePrimitiveShape, getWorldTransform2D, resolveSprite, type ResolvedSprite } from './renderUtils';
-import { syncVideoTextures2D, disposeVideoTextures2D } from './videoTextureSync2D';
+import { syncVideoTextures2D, disposeVideoTextures2D, flushPendingVideoDestroy2D } from './videoTextureSync2D';
 /** Shared empty result for the video pass when the module is excluded — a fresh [] per frame
  *  would allocate for a subsystem that isn't even in the build. */
 const EMPTY_IDS: number[] = [];
@@ -1134,8 +1134,12 @@ export class Scene2DRenderer {
 
   renderFrame() {
     // Deferred mask teardown queued by the previous frame (#455) — must run BEFORE anything
-    // renders, and never in the same pass as the destroy itself.
+    // renders, and never in the same pass as the destroy itself. The video queue drains here
+    // too, for the same reason: both sit ABOVE the idle-frame skip below, so a clip that ends
+    // right as the sim goes idle still gets its detached decoder + GPU texture freed instead
+    // of stranded until the surface tears down (#476 follow-up).
     this.flushPendingMaskDestroy();
+    if (__MODOKI_MODULE_VIDEO__) flushPendingVideoDestroy2D(this);
     const world = getCurrentWorld();
     if (!traitsCached) cacheTraits();
     if (!traitsCached) return;

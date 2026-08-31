@@ -1461,15 +1461,36 @@ function syncMaterial(
     const newMat: THREE.Material | undefined = curMat
       ? (resolveMaterial(curMat) ?? undefined)
       : _defaultMaterial;
+    // Collect candidate owned materials rather than disposing inline: when `newMat` is not
+    // yet resolved (async .mat.json load still in flight, or MATERIAL_FAILED), `t.material`
+    // is left pointing at the old material below, and disposing it out from under a mesh
+    // still in the scene corrupts that frame's render (#477). Freed below, once we know
+    // whether anything still binds it.
+    const toFree = new Set<THREE.Material>();
     for (const t of targets) {
       const oldMat = t.material as THREE.Material;
-      if (oldMat && state.ownedMaterials.has(oldMat)) {
-        state.ownedMaterials.delete(oldMat);
-        oldMat.dispose();
-      }
+      if (oldMat && state.ownedMaterials.has(oldMat)) toFree.add(oldMat);
       // Only 'auto' re-derives cast from the new material's transparency — an explicit
       // 'on'/'off' override (#183) must survive a material swap, not be clobbered here.
       if (newMat) { t.material = newMat; if (castMode === 'auto') t.castShadow = !newMat.transparent; }
+    }
+    // INVARIANT (#477): an owned material is freed only once a replacement is actually
+    // assigned to every target that held it. `newMat === undefined` leaves it bound
+    // everywhere (nothing to free yet — no replacement resolved this frame; the polling
+    // branch below closes the leak once the async load lands).
+    for (const m of toFree) {
+      if (targets.some((t) => t.material === m)) {
+        // Still bound — no replacement landed. NOT ours to free now, but nor can we simply
+        // leave it: syncMaterial is not the only writer of `t.material` (applyLightMask #136,
+        // materialInstanceSystem), and for a masked/instanced entity the polling branch below
+        // never runs, so nobody would ever come back for it. Hand it to the per-frame sweep,
+        // which frees it once NOTHING binds it — whoever did the rebinding (#477).
+        state.ownedMaterials.delete(m);
+        retireDerivedMaterial(m, () => m.dispose());
+        continue;
+      }
+      state.ownedMaterials.delete(m);
+      m.dispose();
     }
   } else if (!isTinted && !isInstanced && !isMasked && curMat) {
     // .mat.json path unchanged but the async load may have finished since
@@ -1484,10 +1505,34 @@ function syncMaterial(
     // base; only the per-frame re-bind is suppressed.
     const resolved = resolveMaterial(curMat);
     if (resolved) {
+      // BACKSTOP, not the live path (#477). Today this frees nothing: the only site that
+      // marks a material owned is the primitive branch, and branch 1 above always takes an
+      // owned material OUT of `ownedMaterials` — disposing it when a replacement resolved,
+      // else handing it to the retirement sweep — so by the time we get here `has(oldMat)`
+      // is false. It is kept, and gated on `ownedMaterials`, for two reasons: a future
+      // second insertion site would otherwise silently leak here, and the gate is what
+      // stops us double-freeing a material the sweep now owns. Assign the replacement
+      // BEFORE freeing, same collect-then-check-then-free shape as above.
+      // Lazily allocated: this branch runs every frame for every non-tinted/non-instanced/
+      // non-masked renderable carrying a `.mat.json`, and an owned material needing to be
+      // freed here is rare — an unconditional `new Set()` was hundreds of Sets/frame of GC
+      // churn on the path `syncRenderablesChurn` polices.
+      let toFree: Set<THREE.Material> | undefined;
       for (const t of targets) {
+        const oldMat = t.material as THREE.Material;
+        if (oldMat !== resolved && oldMat && state.ownedMaterials.has(oldMat)) {
+          (toFree ??= new Set()).add(oldMat);
+        }
         if (t.material !== resolved) t.material = resolved;
         // See the 'auto'-only guard above.
         if (castMode === 'auto') t.castShadow = !resolved.transparent; // keep in sync even once the ref settles
+      }
+      if (toFree) {
+        for (const m of toFree) {
+          if (targets.some((t) => t.material === m)) continue;
+          state.ownedMaterials.delete(m);
+          m.dispose();
+        }
       }
     }
   }
@@ -2711,6 +2756,15 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       // Dispose owned geometry from the previous mesh so size churn doesn't leak.
       if (ownsGeometry.has(id) && (obj as THREE.Mesh).geometry) {
         (obj as THREE.Mesh).geometry.dispose();
+      }
+      // The owned MATERIAL needs the same care as the geometry above, and for the #477 reason:
+      // nothing binds it once this mesh is dropped, and no later pass would come back for it —
+      // `disposeRenderState` only walks `ecsObjects`, which no longer holds this mesh. Retire it
+      // rather than disposing inline; this runs mid-pass, in the frame callback that also renders.
+      const discardedMat = (obj as THREE.Mesh).material as THREE.Material;
+      if (discardedMat && state.ownedMaterials.has(discardedMat)) {
+        state.ownedMaterials.delete(discardedMat);
+        retireDerivedMaterial(discardedMat, () => discardedMat.dispose());
       }
       ecsObjects.delete(id);
       ecsSprites.delete(id);

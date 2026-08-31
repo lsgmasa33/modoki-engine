@@ -133,13 +133,20 @@ export function collectDerivedChain(m: THREE.Material, out: Set<THREE.Material>)
   }
 }
 
-/** Clones evicted from their cache while a live mesh may still bind them.
+/** Clones evicted from their cache while a live mesh may still bind them — OR an engine-owned
+ *  (non-clone) material orphaned by a foreign rebind (#477): `syncMaterial` may leave its own
+ *  owned default material still bound with no replacement resolved yet, and a LATER writer of
+ *  `t.material` in the same frame (`applyLightMask`, `materialInstanceSystem`) can rebind that
+ *  target to something else without ever telling `syncMaterial`. Nobody would come back to free
+ *  it, so it is retired here too, alongside actual clones — this queue is "unbind me once
+ *  nothing points at me", not "clones only".
  *
- *  Same shape and same reason as `retiredMaterials` for bases: the cache that owned the clone
- *  cannot know whether a mesh is drawing it right now, and disposing on the spot is the #317
- *  use-after-free one level out. The value is the owner's dispose step — for a tint clone that is
- *  a bare `dispose()`, for a MaterialInstance clone it also frees the per-instance map the clone
- *  owns outright, and for a light-mask variant it drops the module's `owned` entry too. */
+ *  Same shape and same reason as `retiredMaterials` for bases: the cache/system that owned the
+ *  material cannot know whether a mesh is drawing it right now, and disposing on the spot is the
+ *  #317 use-after-free one level out. The value is the owner's dispose step — for a tint clone
+ *  that is a bare `dispose()`, for a MaterialInstance clone it also frees the per-instance map
+ *  the clone owns outright, for a light-mask variant it drops the module's `owned` entry too, and
+ *  for an orphaned owned material (#477) it is likewise a bare `dispose()`. */
 const retiredDerived = new Map<THREE.Material, () => void>();
 
 /** Queue `clone` for freeing once the sweep establishes that nothing binds it. Idempotent: a

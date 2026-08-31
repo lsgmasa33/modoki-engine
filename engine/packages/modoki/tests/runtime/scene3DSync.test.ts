@@ -1134,4 +1134,189 @@ describe('scene3DSync', () => {
       expect((basic as unknown as { envMapIntensity?: number }).envMapIntensity).toBeUndefined();
     });
   });
+
+  // #477: an owned material must be freed only once a replacement is actually assigned to
+  // every target that held it — never while a mesh still in the scene points at it. Driven
+  // through the REAL ECS world, THREE objects, and material cache (like
+  // materialCloneInvalidation.test.ts), because a mocked resolveMaterial can't distinguish
+  // "not yet resolved" from "resolved to the same reference" the way the real async load can.
+  describe('syncMaterial owned-material lifecycle (#477)', () => {
+    const MAT_GUID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const MAT_PATH = '/games/g/assets/mat/rock.mat.json';
+    const settle = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
+
+    async function loadReal() {
+      // Earlier describes in this file `vi.doMock` several specifiers we need for real here
+      // (meshTemplateCache, traits, primitives, …) — `vi.doMock` outlives `vi.resetModules()`,
+      // so without this a later test picks up a stub {} module instead of the real one.
+      vi.doUnmock('../../src/runtime/loaders/meshTemplateCache');
+      vi.doUnmock('../../src/runtime/loaders/primitives');
+      vi.doUnmock('../../src/runtime/rendering/renderUtils');
+      vi.doUnmock('../../src/runtime/traits');
+      vi.doUnmock('../../src/runtime/core/traits/EntityAttributes');
+      vi.doUnmock('../../src/runtime/core/ecs/transformPropagationSystem');
+      vi.doUnmock('../../src/runtime/loaders/riggedModelCache');
+      vi.doUnmock('../../src/runtime/loaders/textureResolver');
+      vi.doUnmock('../../src/three/traits/Light');
+      vi.doUnmock('../../src/three/traits/Environment');
+      vi.doUnmock('three/examples/jsm/utils/SkeletonUtils.js');
+      const THREE = await import('three');
+      const { createWorld } = await import('koota');
+      const { clearManifest, registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+      const { resolveMaterial, disposeAllCachedResources } = await import('../../src/runtime/loaders/meshTemplateCache');
+      const { Transform, Renderable3D, Renderable3DPrimitive } = await import('../../src/runtime/traits');
+      const { createRenderState, syncRenderables, syncSceneRenderables3D } = await import('../../src/runtime/rendering/scene3DSync');
+      const { retiredDerivedMaterials } = await import('../../src/runtime/rendering/derivedMaterials');
+      return {
+        THREE, createWorld, clearManifest, registerAsset, resolveMaterial, disposeAllCachedResources,
+        Transform, Renderable3D, Renderable3DPrimitive, createRenderState, syncRenderables, syncSceneRenderables3D,
+        retiredDerivedMaterials,
+      };
+    }
+
+    function stubMaterialFetch(mod: Awaited<ReturnType<typeof loadReal>>) {
+      mod.clearManifest();
+      mod.registerAsset(MAT_GUID, MAT_PATH, 'material');
+      vi.stubGlobal('fetch', vi.fn(async () => ({
+        ok: true, status: 200, statusText: 'OK',
+        text: async () => JSON.stringify({ version: 1, id: MAT_GUID, type: 'pbr' }),
+      } as never)));
+    }
+
+    it('does not free the owned default material while its replacement has not resolved yet', async () => {
+      const mod = await loadReal();
+      stubMaterialFetch(mod);
+      const world = mod.createWorld();
+      const scene = new mod.THREE.Scene();
+      const state = mod.createRenderState();
+      const e = world.spawn(mod.Transform(), mod.Renderable3DPrimitive({ mesh: 'cube', material: '' }));
+
+      mod.syncRenderables(world, scene, state);
+      const mesh = state.ecsObjects.get(e.id()) as InstanceType<typeof mod.THREE.Mesh>;
+      const oldMat = mesh.material as InstanceType<typeof mod.THREE.Material>;
+      expect(state.ownedMaterials.has(oldMat), 'the inline default is marked owned').toBe(true);
+      const disp = vi.spyOn(oldMat, 'dispose');
+
+      // Assign a material GUID whose async load has not landed yet — resolveMaterial
+      // (called internally by syncMaterial) returns undefined this tick.
+      e.set(mod.Renderable3DPrimitive, { material: MAT_GUID });
+      mod.syncRenderables(world, scene, state);
+
+      expect(mesh.material, 'still the original — nothing to replace it with yet').toBe(oldMat);
+      expect(disp, 'must not dispose a material still bound to a live mesh').not.toHaveBeenCalled();
+      // Ownership moves OUT of `ownedMaterials` and into the retirement queue the moment it is
+      // kept alive unresolved (#477 fix) — not because it leaked, but so a later FOREIGN rebind
+      // (applyLightMask, materialInstanceSystem) that never revisits syncMaterial still gets it
+      // freed by the per-frame sweep. Assert it moved, not that it vanished.
+      expect(state.ownedMaterials.has(oldMat), 'no longer owned directly — handed to the sweep').toBe(false);
+      expect(mod.retiredDerivedMaterials().has(oldMat), 'tracked in the retirement queue instead').toBe(true);
+    });
+
+    it('frees it once the async load lands and a real replacement is assigned (no leak)', async () => {
+      const mod = await loadReal();
+      stubMaterialFetch(mod);
+      const world = mod.createWorld();
+      const scene = new mod.THREE.Scene();
+      const state = mod.createRenderState();
+      const e = world.spawn(mod.Transform(), mod.Renderable3DPrimitive({ mesh: 'cube', material: '' }));
+
+      // syncSceneRenderables3D, not the bare syncRenderables — production wiring always runs
+      // the per-frame sweep at the end of a full sync, and once a still-bound owned material is
+      // handed to the retirement queue (#477 fix) the sweep is the ONLY thing that frees it.
+      mod.syncSceneRenderables3D(world, scene, state);
+      const mesh = state.ecsObjects.get(e.id()) as InstanceType<typeof mod.THREE.Mesh>;
+      const oldMat = mesh.material as InstanceType<typeof mod.THREE.Material>;
+      const disp = vi.spyOn(oldMat, 'dispose');
+
+      e.set(mod.Renderable3DPrimitive, { material: MAT_GUID });
+      mod.syncSceneRenderables3D(world, scene, state); // unresolved — kept alive, per the previous test
+
+      // Discriminating frame-1 check: without the fix this frame would already have disposed
+      // (or reassigned away from) the old material even though nothing replaced it yet.
+      expect(mesh.material, 'frame 1: still the old material — nothing to replace it with').toBe(oldMat);
+      expect(disp, 'frame 1: must not have disposed yet').not.toHaveBeenCalled();
+
+      await settle();
+      mod.syncSceneRenderables3D(world, scene, state); // polling branch: the load has landed
+
+      const newMat = mod.resolveMaterial(MAT_GUID)!;
+      expect(mesh.material, 'now bound to the resolved replacement').toBe(newMat);
+      expect(disp, 'freed exactly once, now that nothing binds it').toHaveBeenCalledTimes(1);
+      expect(state.ownedMaterials.has(oldMat), 'no leak — untracked once freed').toBe(false);
+    });
+
+    // The "ordinary path" case (a `.mat.json` already resolved BEFORE the GUID is assigned, so
+    // `newMat` is available synchronously on the same frame) was dropped from this block: it
+    // disposes-then-reassigns within one tick either way, so it cannot discriminate pre-fix from
+    // post-fix code — the bug this block guards against only shows up when a replacement is
+    // NOT yet available. Keeping a test that passes regardless is exactly the weak-test failure
+    // mode this rewrite is fixing; the two tests below cover the frames that DO differ.
+
+    it('an owned material orphaned by a foreign rebind (applyLightMask, materialInstanceSystem) is freed by the sweep, not leaked (#477 defect)', async () => {
+      const mod = await loadReal();
+      stubMaterialFetch(mod);
+      const world = mod.createWorld();
+      const scene = new mod.THREE.Scene();
+      const state = mod.createRenderState();
+      const e = world.spawn(mod.Transform(), mod.Renderable3DPrimitive({ mesh: 'cube', material: '' }));
+
+      mod.syncSceneRenderables3D(world, scene, state);
+      const mesh = state.ecsObjects.get(e.id()) as InstanceType<typeof mod.THREE.Mesh>;
+      const oldMat = mesh.material as InstanceType<typeof mod.THREE.Material>;
+      expect(state.ownedMaterials.has(oldMat), 'the inline default is marked owned').toBe(true);
+      const disp = vi.spyOn(oldMat, 'dispose');
+
+      // Assign a material GUID whose async load has not landed yet — syncMaterial keeps the
+      // owned default bound (nothing to replace it with) and, per the fix, hands it to the
+      // retirement queue rather than trusting the polling branch (which never runs again for
+      // this entity once something else rebinds the mesh below).
+      e.set(mod.Renderable3DPrimitive, { material: MAT_GUID });
+      mod.syncSceneRenderables3D(world, scene, state);
+      expect(mesh.material, 'still the owned default this frame').toBe(oldMat);
+      expect(disp, 'not disposed while still bound').not.toHaveBeenCalled();
+
+      // Simulate a FOREIGN rebind in the same frame family — exactly what applyLightMask does
+      // to a masked entity's mesh, and what materialInstanceSystem does once its own GUID
+      // resolves: it assigns `t.material` directly, without going through syncMaterial at all.
+      const foreign = new mod.THREE.MeshStandardMaterial();
+      mesh.material = foreign;
+
+      // The sweep (run at the end of syncSceneRenderables3D) should now see nothing bound to
+      // `oldMat` and free it — pre-fix, `oldMat` was left un-freed in `ownedMaterials` and
+      // untracked anywhere else, so nothing ever came back for it.
+      mod.syncSceneRenderables3D(world, scene, state);
+
+      expect(disp, 'the orphaned owned material is freed by the sweep').toHaveBeenCalledTimes(1);
+      expect(state.ownedMaterials.has(oldMat), 'no longer tracked as owned').toBe(false);
+    });
+
+    it('a primitive recreate (size change) retires its discarded owned material instead of leaking it', async () => {
+      const mod = await loadReal();
+      const world = mod.createWorld();
+      const scene = new mod.THREE.Scene();
+      const state = mod.createRenderState();
+      // No material ref — the inline default material is owned, same as the other cases above.
+      const e = world.spawn(mod.Transform(), mod.Renderable3DPrimitive({ mesh: 'cube', size: 1, material: '' }));
+
+      mod.syncSceneRenderables3D(world, scene, state);
+      const mesh = state.ecsObjects.get(e.id()) as InstanceType<typeof mod.THREE.Mesh>;
+      const oldMat = mesh.material as InstanceType<typeof mod.THREE.Material>;
+      expect(state.ownedMaterials.has(oldMat), 'the inline default is marked owned').toBe(true);
+      const disp = vi.spyOn(oldMat, 'dispose');
+
+      // Forces the recreate branch: geometry is rebuilt, the old mesh (and the material bound to
+      // it) is discarded, and nothing else in the scene points at `oldMat` afterward.
+      e.set(mod.Renderable3DPrimitive, { size: 2 });
+      mod.syncSceneRenderables3D(world, scene, state);
+
+      const newMesh = state.ecsObjects.get(e.id()) as InstanceType<typeof mod.THREE.Mesh>;
+      expect(newMesh, 'a fresh mesh was created').not.toBe(mesh);
+      expect(state.ownedMaterials.has(oldMat), 'the discarded material is no longer tracked as owned').toBe(false);
+
+      // One more frame for the retirement sweep to actually free it (mirrors the foreign-rebind
+      // case above — retiring hands it to the sweep, it doesn't dispose inline).
+      mod.syncSceneRenderables3D(world, scene, state);
+      expect(disp, 'the discarded material is freed by the sweep, not leaked').toHaveBeenCalledTimes(1);
+    });
+  });
 });

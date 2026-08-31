@@ -16,7 +16,7 @@ import { createWorld, type World } from 'koota';
 import { Texture, type Sprite } from 'pixi.js';
 import { VideoPlayer } from '../../src/runtime/traits/VideoPlayer';
 import {
-  syncVideoTextures2D, disposeVideoTextures2D, videoTextureCount2D,
+  syncVideoTextures2D, disposeVideoTextures2D, videoTextureCount2D, flushPendingVideoDestroy2D,
 } from '../../src/runtime/rendering/videoTextureSync2D';
 
 // videoSystem owns the elements; this suite is about what the RENDERER does with one.
@@ -67,7 +67,14 @@ beforeEach(() => {
   surface = {};
   elements.clear();
 });
-afterEach(() => { disposeVideoTextures2D(surface); vi.restoreAllMocks(); });
+afterEach(() => {
+  disposeVideoTextures2D(surface);
+  // koota allocates world IDs from a pool of 16 and `createWorld` THROWS once it is exhausted
+  // (see the identical comment in videoTextureSync.test.ts, which hit this first) — so a suite
+  // that only ever creates worlds has a hard ceiling on its own test count.
+  world.destroy();
+  vi.restoreAllMocks();
+});
 
 describe('binding', () => {
   it('puts a video-backed texture on the entity sprite', () => {
@@ -268,5 +275,118 @@ describe('release', () => {
 
     sp.destroyed = true;
     expect(() => disposeVideoTextures2D(surface)).not.toThrow();
+  });
+});
+
+describe('deferred GPU teardown (#476)', () => {
+  // `syncVideoTextures2D` runs mid-pass in Scene2D — after the sprite pass, before
+  // `pool.renderAll`/`renderer.render`. Destroying a VideoSource's GPU state in that same
+  // pass is the #455 bug class, so the texture destroy is queued and only flushed at the
+  // TOP of the NEXT call, once a full render has happened in between.
+
+  it('a stopped clip detaches the sprite immediately but defers the texture destroy', () => {
+    const e = world.spawn(VideoPlayer({ clip: 'c1', playing: true }));
+    elements.set(e.id(), fakeElement());
+    const sp = fakeSprite();
+    syncVideoTextures2D(world, surface, () => sp);
+    const videoTexture = sp.texture;
+
+    elements.delete(e.id());                       // clip stopped
+    syncVideoTextures2D(world, surface, () => sp);
+
+    expect(sp.texture).not.toBe(videoTexture);      // detached immediately
+    expect(videoTexture.destroyed).toBe(false);     // but NOT torn down yet
+  });
+
+  it('destroys the deferred texture on the NEXT sync call for that surface, without growing the queue', () => {
+    const e = world.spawn(VideoPlayer({ clip: 'c1', playing: true }));
+    elements.set(e.id(), fakeElement());
+    const sp = fakeSprite();
+    syncVideoTextures2D(world, surface, () => sp);
+    const videoTexture = sp.texture;
+
+    elements.delete(e.id());                       // clip stopped
+    syncVideoTextures2D(world, surface, () => sp);
+    expect(videoTexture.destroyed).toBe(false);
+
+    syncVideoTextures2D(world, surface, () => sp);  // next frame: flush
+    expect(videoTexture.destroyed).toBe(true);
+
+    // Repeated calls afterward must not re-destroy or accumulate anything.
+    expect(() => syncVideoTextures2D(world, surface, () => sp)).not.toThrow();
+    expect(() => syncVideoTextures2D(world, surface, () => sp)).not.toThrow();
+  });
+
+  it('defers the destroy on the rebind path too (clip swap / new Sprite)', () => {
+    const e = world.spawn(VideoPlayer({ clip: 'c1', playing: true }));
+    elements.set(e.id(), fakeElement());
+    const sp = fakeSprite();
+    syncVideoTextures2D(world, surface, () => sp);
+    const first = sp.texture;
+
+    elements.set(e.id(), fakeElement());            // clip swapped -> new element
+    syncVideoTextures2D(world, surface, () => sp);
+
+    expect(sp.texture).not.toBe(first);
+    expect(first.destroyed).toBe(false);             // deferred, not destroyed yet
+
+    syncVideoTextures2D(world, surface, () => sp);   // next frame: flush
+    expect(first.destroyed).toBe(true);
+  });
+
+  it('defers the destroy when Scene2D rebuilds the slot (new Sprite)', () => {
+    const e = world.spawn(VideoPlayer({ clip: 'c1', playing: true }));
+    elements.set(e.id(), fakeElement());
+    let sp = fakeSprite();
+    syncVideoTextures2D(world, surface, () => sp);
+    const first = sp.texture;
+
+    sp = fakeSprite();                               // Scene2D rebuilt the slot
+    syncVideoTextures2D(world, surface, () => sp);
+
+    expect(first.destroyed).toBe(false);
+
+    syncVideoTextures2D(world, surface, () => sp);
+    expect(first.destroyed).toBe(true);
+  });
+
+  it('flushPendingVideoDestroy2D alone drains a queued destroy — the idle-skip path (#476 follow-up)', () => {
+    // Scene2D's renderFrame returns early on an idle+clean frame BEFORE it ever reaches
+    // syncVideoTextures2D, so a clip that stops right before the sim goes idle must not
+    // depend on another syncVideoTextures2D call to free its texture — only on this flush,
+    // called unconditionally at the top of renderFrame, above that idle skip.
+    const e = world.spawn(VideoPlayer({ clip: 'c1', playing: true }));
+    elements.set(e.id(), fakeElement());
+    const sp = fakeSprite();
+    syncVideoTextures2D(world, surface, () => sp);
+    const videoTexture = sp.texture;
+
+    elements.delete(e.id());                       // clip stopped
+    syncVideoTextures2D(world, surface, () => sp);  // detaches, queues the destroy
+    expect(videoTexture.destroyed).toBe(false);
+
+    flushPendingVideoDestroy2D(surface);            // NO syncVideoTextures2D call in between
+    expect(videoTexture.destroyed).toBe(true);
+
+    expect(() => flushPendingVideoDestroy2D(surface)).not.toThrow(); // repeat: empty queue, no-op
+  });
+
+  it('flushPendingVideoDestroy2D no-ops on a surface with no bindings yet', () => {
+    expect(() => flushPendingVideoDestroy2D({})).not.toThrow();
+  });
+
+  it('disposeVideoTextures2D destroys pending textures immediately instead of leaking them', () => {
+    const e = world.spawn(VideoPlayer({ clip: 'c1', playing: true }));
+    elements.set(e.id(), fakeElement());
+    const sp = fakeSprite();
+    syncVideoTextures2D(world, surface, () => sp);
+    const videoTexture = sp.texture;
+
+    elements.delete(e.id());                        // clip stopped -> destroy queued
+    syncVideoTextures2D(world, surface, () => sp);
+    expect(videoTexture.destroyed).toBe(false);
+
+    disposeVideoTextures2D(surface);
+    expect(videoTexture.destroyed).toBe(true);
   });
 });

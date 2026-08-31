@@ -54,8 +54,17 @@ type FrameCallbackVideo = HTMLVideoElement & {
   cancelVideoFrameCallback?: (h: number) => void;
 };
 
+/** Per-surface state: the live binding table plus textures whose GPU teardown is deferred
+ *  one frame (see `detach`/the flush at the top of `syncVideoTextures2D`). Kept per-surface,
+ *  not module-global, so a surface that stops rendering can't strand another surface's queue,
+ *  and `disposeVideoTextures2D` can drain exactly its own. */
+interface SurfaceState {
+  table: Map<number, Bound>;
+  pendingDestroy: Texture[];
+}
+
 /** Per-surface binding table, keyed by the Scene2DRenderer instance. */
-const bindings = new WeakMap<object, Map<number, Bound>>();
+const bindings = new WeakMap<object, SurfaceState>();
 
 function makeTexture(el: HTMLVideoElement): { texture: Texture; source: VideoSource } {
   const source = new VideoSource({
@@ -96,7 +105,17 @@ function driveUploads(b: Bound): void {
   b.rvfcHandle = el.requestVideoFrameCallback(pump);
 }
 
-function release(b: Bound): void {
+/** Undo the bind, EXCEPT the final GPU teardown of `b.texture` — the caller queues that
+ *  separately (see `syncVideoTextures2D`'s flush and `disposeVideoTextures2D`). Splitting
+ *  it out is hardening, not a bug fix: `detach` runs from inside `syncVideoTextures2D`,
+ *  which Scene2D calls mid-pass (after the sprite pass, before `pool.renderAll(...)` →
+ *  `renderer.render(...)`), and `texture.destroy(true)` is a real GPU teardown of the
+ *  `VideoSource` — destroying one inside the pass about to render it is the #455 bug
+ *  class. Not observed to fail here, since this function re-points the sprite off the
+ *  doomed texture BEFORE any destroy — but a render that reaches for state Pixi just
+ *  freed is exactly the class of bug #455 was, so the destroy is deferred one frame
+ *  regardless of whether this particular call site could reach it this frame. */
+function detach(b: Bound): void {
   // ORDER IS LOAD-BEARING. `VideoSource.destroy()` ends with
   //   resource.pause(); resource.src = ''; resource.load();
   // on whatever element it still holds — i.e. it would tear down the ONE element that
@@ -106,7 +125,7 @@ function release(b: Bound): void {
   //     attached — destroy() calls `_configureAutoUpdate()`, which dereferences the
   //     resource unless `_autoUpdate` is already false to short-circuit it.
   //  2. Detach the resource, so destroy()'s cleanup block finds nothing to kill.
-  //  3. Destroy — now purely GPU-side.
+  //  3. Destroy — now purely GPU-side. (Queued by the caller; see above.)
   b.cancelled = true;
   if (b.rvfcHandle) {
     const el = b.element as FrameCallbackVideo;
@@ -123,10 +142,30 @@ function release(b: Bound): void {
     // nothing for a frame instead of taking the renderer down with it.
     b.sprite.texture = b.previousTexture.destroyed ? Texture.EMPTY : b.previousTexture;
   }
-  // `destroy(true)` — take the source down with the wrapper. Safe (and required, or the
-  // VideoSource leaks) precisely BECAUSE this source is ours alone: unlike a sprite slot,
-  // nothing here borrows from the shared Assets cache.
-  b.texture.destroy(true);
+}
+
+/** Flush a surface's deferred video-texture destroys. By the time this runs, a full render
+ *  pass has completed since the textures were queued (`detach`, below) — so nothing in the
+ *  display graph or the batcher still names these sources, and the GPU teardown is safe.
+ *
+ *  Called from TWO places, deliberately: the top of `syncVideoTextures2D` (the common case,
+ *  once the queue was filled during THAT same call last frame) and the top of Scene2D's
+ *  `renderFrame`, ABOVE the idle-frame skip — mirroring `flushPendingMaskDestroy` there for
+ *  the same reason. Without the second call site, a clip that ends right before the sim
+ *  goes idle queues its texture and then never reaches `syncVideoTextures2D` again (that idle
+ *  skip returns before line 2035), stranding a pinned decoder + its GPU texture until the
+ *  surface is torn down. No-ops cleanly when the surface has no state yet (nothing was ever
+ *  bound, so nothing can be pending). */
+export function flushPendingVideoDestroy2D(surface: object): void {
+  const state = bindings.get(surface);
+  if (!state || state.pendingDestroy.length === 0) return;
+  for (const tex of state.pendingDestroy) {
+    // `destroy(true)` — take the source down with the wrapper. Safe (and required, or the
+    // VideoSource leaks) precisely BECAUSE this source is ours alone: unlike a sprite slot,
+    // nothing here borrows from the shared Assets cache.
+    tex.destroy(true);
+  }
+  state.pendingDestroy.length = 0;
 }
 
 /** Bind/unbind video textures for one 2D surface. Call once per frame from
@@ -144,8 +183,15 @@ export function syncVideoTextures2D(
   surface: object,
   spriteFor: (entityId: number) => Sprite | null,
 ): number[] {
-  let table = bindings.get(surface);
-  if (!table) { table = new Map(); bindings.set(surface, table); }
+  let state = bindings.get(surface);
+  if (!state) { state = { table: new Map(), pendingDestroy: [] }; bindings.set(surface, state); }
+  const { table, pendingDestroy } = state;
+
+  // Flush LAST frame's deferred destroys, first thing. Usually a no-op here: `renderFrame`
+  // already flushed this surface's queue before the idle-skip check, at the top of its own
+  // pass — see `flushPendingVideoDestroy2D`. Kept here too so this function stays correct
+  // standalone (tests, or any future caller that doesn't route through Scene2D's flush).
+  flushPendingVideoDestroy2D(surface);
 
   const seen = new Set<number>();
 
@@ -161,7 +207,11 @@ export function syncVideoTextures2D(
     // Rebind when EITHER end moved: a clip swap gives a new element, and a Scene2D slot
     // rebuild (ref/kind change) gives a new Sprite whose texture is EMPTY again.
     if (existing && existing.element === el && existing.sprite === sprite) continue;
-    if (existing) { release(existing); table.delete(id); }
+    if (existing) {
+      detach(existing);
+      pendingDestroy.push(existing.texture);
+      table.delete(id);
+    }
 
     const { texture, source } = makeTexture(el);
     const previousTexture = sprite.texture ?? Texture.EMPTY;
@@ -176,22 +226,35 @@ export function syncVideoTextures2D(
 
   // Clips that stopped, entities that lost the trait or were despawned.
   for (const [id, b] of [...table]) {
-    if (!seen.has(id)) { release(b); table.delete(id); }
+    if (!seen.has(id)) {
+      detach(b);
+      pendingDestroy.push(b.texture);
+      table.delete(id);
+    }
   }
 
   return [...table.keys()];
 }
 
-/** Drop every binding for a surface (viewport stop / world swap). */
+/** Drop every binding for a surface (viewport stop / world swap). Destroys immediately
+ *  rather than deferring — both call sites run outside a render pass: `stop()` tears the
+ *  surface down (nothing will render it again), and the `onWorldSwap` handler runs between
+ *  frames, before the new world's first `renderFrame` — so there is no in-flight pass for a
+ *  same-frame destroy to corrupt either way. */
 export function disposeVideoTextures2D(surface: object): void {
-  const table = bindings.get(surface);
-  if (!table) return;
-  for (const b of table.values()) release(b);
-  table.clear();
+  const state = bindings.get(surface);
+  if (!state) return;
+  for (const b of state.table.values()) {
+    detach(b);
+    b.texture.destroy(true); // `destroy(true)` — see the note in `flushPendingVideoDestroy2D`.
+  }
+  for (const tex of state.pendingDestroy) tex.destroy(true);
+  state.table.clear();
+  state.pendingDestroy.length = 0;
   bindings.delete(surface);
 }
 
 /** Test/inspection hook — how many bindings a surface holds. */
 export function videoTextureCount2D(surface: object): number {
-  return bindings.get(surface)?.size ?? 0;
+  return bindings.get(surface)?.table.size ?? 0;
 }
