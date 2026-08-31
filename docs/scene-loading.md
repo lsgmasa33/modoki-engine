@@ -163,25 +163,60 @@ stability on disk" below.
 
 ### The `entities` ARRAY ORDER is the Hierarchy's display order
 
-`serializeScene` writes parents before their children, siblings by `sortOrder`, with the
-**GUID** as the tiebreak and the name as a last resort (`orderedInfos` in `serialize.ts`).
-It used to follow live ECS-id order, which made a save churn: a delete+undo respawns the
-entity at a new id, so the next save emitted byte-identical data in a different array order
-(`3d2372741`). Nothing loads order-sensitively — `sortOrder` carries the authored intent —
-so this is purely about making a scene diff readable, and about letting "`git status` is
-clean" mean something after a save.
+Parents before their children, siblings by `sortOrder`, with the **GUID** as the tiebreak and
+the name as a last resort. It used to follow live ECS-id order, which made a save churn: a
+delete+undo respawns the entity at a new id, so the next save emitted byte-identical data in a
+different array order (`3d2372741`). Nothing loads order-sensitively — `sortOrder` carries the
+authored intent — so this is purely about making a scene diff readable, and about letting
+"`git status` is clean" mean something after a save.
 
-**The committed files have now been re-saved to match (`957fd9d7e`, #268), so a save no
-longer reorders anything.** They used to predate the fix, which made the FIRST save of any
-project rewrite its scene with a one-time contentless reorder; every project was opened and
-every scene loaded and saved through this serializer, and the 48 files that moved were
-verified against HEAD as parsed data keyed by guid — same entity set, no entity whose content
-differs, identical top-level fields, order only.
+**The rule lives in ONE place: `orderEntitiesForSave` in
+`runtime/core/ecs/entityOrder.ts`** (#500). `serializeScene` writes with it, `buildEntityTree`
+(the Hierarchy panel) sorts with it, and `engine/tests/assets/sceneEntityOrder.test.ts` asserts
+every committed scene file is already in it. It is a leaf module precisely so the guard can
+share it — a test that re-implemented the sort would drift from what actually gets written, and
+then agree with itself while disagreeing with the editor.
 
-⚠️ **So a reorder diff is now a FINDING.** Nothing routine produces one any more, which
-inverts the old advice: don't read such a diff as expected churn, report it. Still true, and
-the reason the guid-keyed comparison is worth keeping in hand: don't treat a post-save
-`git status` as evidence of a *content* change without comparing as parsed data first.
+⚠️ **A reorder diff is a FINDING** — don't read one as expected churn, report it. And don't
+treat a post-save `git status` as evidence of a *content* change without comparing as parsed
+data first.
+
+⚠️ **A prefab-instance root's sort keys are NOT all in its scene entry** — this is the trap for
+anything that reasons about write order by reading the FILE (a guard, a normalizer script, a
+review):
+
+| key | plain entity | prefab-instance root |
+|---|---|---|
+| guid | `traits.EntityAttributes.guid` | **top-level `entry.guid`** — never baked into `EntityAttributes`, since it is never an override. The loader stamps it into the live world as a minimal `EntityAttributes({guid: entry.guid})`, and that is what `guidForId` reads back at save. |
+| sortOrder | `traits.EntityAttributes.sortOrder` | **the prefab template's root value, overridden by `entry.overrides[rootLocalId].EntityAttributes.sortOrder`.** A captured root's `EntityAttributes` on disk is minimal (`{parentId?, editorFolder?}`) — `sortOrder` is not written there at all. |
+
+Reading only `traits.EntityAttributes` scores every prefab root as guid `''` and `sortOrder` 0 —
+*self-consistently*, which is what makes it dangerous: a guard and a normalizer sharing the
+mistake AGREE with each other and both disagree with the editor. Both halves were got wrong
+while fixing #500. The `sortOrder` half reordered five scene files the editor had written
+correctly (`Warp.scene.json`'s `Mars_planet`, real `sortOrder` 91 via an override, moved from
+index 15 to index 3) and the guard then certified the damage as canonical.
+
+⚠️ **Content comparison cannot catch this.** A reorder is content-preserving by construction, so
+"same entity set, no entity whose content differs, identical top-level fields" stays true while
+the order is wrong. That check — the one this section used to recommend — proves the rewrite lost
+nothing; it says nothing about whether the new order is the one the editor will write. The only
+sound check is against the serializer's actual keys.
+
+### How the "already normalized" claim went stale
+
+#268 (`957fd9d7e`) re-saved 48 files, and this section then claimed a save no longer reorders
+anything. By #500 that was false again: `engine/templates/starter` and
+`engine/tests/fixtures/testbed` had drifted back out of order — so **every project scaffolded
+from the template shipped pre-armed with a whole-file diff** for whoever first opened and saved
+it. Court's was measured at 903 changed lines for a one-field edit.
+
+The lesson is not "re-normalize more carefully". A one-time sweep asserts a property at a moment
+in time and nothing holds it there; the files drifted back because nothing could notice. The
+guard test is what makes this section's claim checkable, so the next drift fails a gate instead
+of surfacing as a mystery diff months later. It **skips any file whose prefab keys it cannot
+resolve rather than assuming a value** — a guard that guesses an input is a wrong oracle, and a
+wrong oracle fails the file the editor just wrote correctly.
 
 **Three files were deliberately left un-normalized**, because their re-save is not order-only
 — `games/3d-test/…/skinned-test.scene.json` (a prefab-instance `added` child gains

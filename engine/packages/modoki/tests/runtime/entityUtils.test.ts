@@ -437,16 +437,33 @@ describe('buildEntityTree', () => {
     expect(buildEntityTree([])).toEqual([]);
   });
 
-  it('sorts by sortOrder then by id', async () => {
+  it('sorts by sortOrder, then guid, then name (NOT ecs id)', async () => {
     const { buildEntityTree } = await getUtils();
+    // Same sortOrder, no guid: the tiebreak falls through to NAME. id order (1,2,3) and
+    // name order ('A','B','C') would agree if named the old way, so name each entity the
+    // OPPOSITE of its id — only a real name-based sort produces the expected order.
     const entities = [
-      { id: 3, name: 'C', traits: [], parentId: 0, sortOrder: 0 },
-      { id: 1, name: 'A', traits: [], parentId: 0, sortOrder: 0 },
+      { id: 1, name: 'C', traits: [], parentId: 0, sortOrder: 0 },
       { id: 2, name: 'B', traits: [], parentId: 0, sortOrder: 0 },
+      { id: 3, name: 'A', traits: [], parentId: 0, sortOrder: 0 },
     ];
 
     const tree = buildEntityTree(entities as any);
-    expect(tree.map(e => e.id)).toEqual([1, 2, 3]);
+    expect(tree.map(e => e.id)).toEqual([3, 2, 1]);
+  });
+
+  it('sorts by guid before name when both are present and disagree', async () => {
+    const { buildEntityTree } = await getUtils();
+    // Same sortOrder, distinct guids that sort in the OPPOSITE order of both id and name —
+    // guid must win over the name fallback.
+    const entities = [
+      { id: 1, name: 'A', guid: 'guid-c', traits: [], parentId: 0, sortOrder: 0 },
+      { id: 2, name: 'B', guid: 'guid-b', traits: [], parentId: 0, sortOrder: 0 },
+      { id: 3, name: 'C', guid: 'guid-a', traits: [], parentId: 0, sortOrder: 0 },
+    ];
+
+    const tree = buildEntityTree(entities as any);
+    expect(tree.map(e => e.id)).toEqual([3, 2, 1]);
   });
 });
 

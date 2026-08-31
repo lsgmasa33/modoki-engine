@@ -4,6 +4,7 @@ import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { onWorldSwap } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, COMPONENT_CATEGORY_ORDER } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
 import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, reRootPrefabInstanceSubtree, moveEntityToScene, type EntitySnapshot } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
@@ -386,9 +387,14 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
             let newSort: number;
             if (collides) {
               if (eaMeta) {
+                // This list is renumbered i*10 below, so it decides where the dropped
+                // entity lands. Sort by the SAME rule the panel displays (compareSiblings:
+                // sortOrder, then guid, then name) — sorting by ecs id here while the panel
+                // shows guid order meant that on a sortOrder collision this list reshuffled
+                // at drop-time and the entity landed in a slot the user never saw.
                 const siblings = getAllEntities()
                   .filter(e => e.parentId === targetParent && e.id !== id)
-                  .sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+                  .sort(compareSiblings<EntityInfo>((e) => e.guid ?? ''));
                 // Renumber as ONE undoable entry (snapshot old sorts → restore on
                 // undo). Previously a raw writeTraitField loop bypassed undo, so
                 // Cmd+Z left every sibling rewritten (Hierarchy F1). Pushed before

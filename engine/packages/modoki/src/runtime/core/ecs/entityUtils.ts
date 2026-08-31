@@ -9,6 +9,7 @@ import { Transient } from '../traits/Transient';
 import { isSimRunning } from '../playState';
 import { inSystemTick } from '../systemTick';
 import { noteAuthoredWriteWhileStopped } from './authoredWrites';
+import { compareSiblings } from './entityOrder';
 // Re-exported for backward compatibility — every existing caller imports these from here.
 // The implementation lives in `renderDirty.ts` (a side-effect-free L0 module) so a module
 // that only needs the dirty signal (e.g. `loaders/assetManifest.ts`) doesn't have to import
@@ -488,7 +489,15 @@ function dropParkedEntries(entities: EntityInfo[]): EntityInfo[] {
   return entities.filter((e) => !hidden(e.id));
 }
 
-/** Build a tree from flat entity list. Sorted by sortOrder. */
+/** Build a tree from flat entity list. Siblings are ordered by `compareSiblings` —
+ *  `sortOrder`, then guid, then name — the SAME rule the serializer writes the scene
+ *  file with, so the panel's order and the file's order agree (that agreement is the
+ *  stated point of QA-HIER-0002, and it was not actually true while this sorted by ecs
+ *  id: equal sortOrder is ordinary, not an edge case).
+ *
+ *  The tiebreak used to be `a.id - b.id`, which made the displayed order depend on load
+ *  history — ids are reassigned by a delete+undo or a duplicate+delete, so the panel
+ *  reshuffled entities the human never touched. The guid does not move. */
 export function buildEntityTree(entities: EntityInfo[]): EntityInfo[] {
   const byId = new Map<number, EntityInfo>();
   for (const e of entities) {
@@ -503,7 +512,7 @@ export function buildEntityTree(entities: EntityInfo[]): EntityInfo[] {
     }
   }
   const sortChildren = (list: EntityInfo[]) => {
-    list.sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+    list.sort(compareSiblings<EntityInfo>((e) => e.guid ?? ''));
     for (const e of list) {
       if (e.children && e.children.length > 0) sortChildren(e.children);
     }

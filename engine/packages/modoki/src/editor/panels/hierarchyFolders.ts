@@ -10,6 +10,7 @@
  *  scene-backed and the marker is dropped. */
 
 import type { EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 
 /** Prune the entity tree to nodes matching `pred`, KEEPING every ancestor of a match
  *  so the surviving rows still read as a tree. A node survives iff it matches OR one
@@ -93,7 +94,11 @@ export function buildHierarchyFolders(roots: EntityInfo[], extraPaths: Iterable<
   for (const p of extraPaths) { const f = normalizeFolderPath(p); if (f) ensure(f); }
   const sortNode = (n: HierarchyFolder) => {
     n.children.sort((a, b) => a.name.localeCompare(b.name));
-    n.roots.sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+    // Folder roots get re-sorted HERE, discarding buildEntityTree's ordering for any
+    // root carrying an editorFolder — so this must use the same rule (sortOrder, then
+    // guid, then name) or the panel and the scene file disagree for a folder whose
+    // roots collide on sortOrder.
+    n.roots.sort(compareSiblings<EntityInfo>((e) => e.guid ?? ''));
     n.children.forEach(sortNode);
   };
   topFolders.sort((a, b) => a.name.localeCompare(b.name));

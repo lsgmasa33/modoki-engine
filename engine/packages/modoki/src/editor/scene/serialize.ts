@@ -2,6 +2,7 @@
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
 import { getAllEntities, readTraitData, findEntity, deleteEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
+import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
 import { Transient } from '../../runtime/core/traits/Transient';
 import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
@@ -375,65 +376,30 @@ export async function serializeScene(opts?: {
   };
 
   /** The order entities are WRITTEN in — the Hierarchy's display order, made fully
-   *  stable (QA-HIER-0002).
+   *  stable (QA-HIER-0002). The rule itself lives in `runtime/core/ecs/entityOrder.ts`,
+   *  shared verbatim with `buildEntityTree` (the panel) and the guard test over the
+   *  committed scene files; see that module for why the tiebreak is the guid and not an
+   *  ecs id, and for the churn it removes.
    *
-   *  It used to be live-world iteration order, which follows runtime ECS ids. Those are
-   *  reassigned by a delete+undo (the entity respawns at a new id) or a duplicate+delete,
-   *  so the next save re-emitted IDENTICAL data in a different order. Measured on
-   *  `games/anim-bug`: same guid set, zero entities whose content differed, and
-   *  `main.scene.json` still MODIFIED — one entity had moved within the array. That is
-   *  semantically harmless (sortOrder carries the authored intent), and it is exactly the
-   *  CLAUDE.md #18 hazard: a running editor writing to `games/**` with a contentless diff
-   *  that rides into an unrelated commit because nobody reads it. It also makes
-   *  "git status is clean" unusable as a QA cleanup check for any case touching entity
-   *  lifecycle.
-   *
-   *  Parents before their children, siblings by `sortOrder` — i.e. what the Hierarchy
-   *  shows (the owner's call: match the file to the panel, so a scene diff is readable).
-   *  The tiebreak is the GUID, not the ecs id `buildEntityTree` uses: colliding
-   *  sortOrders are ordinary (legacy entities all sit at 0) and an id tiebreak would
-   *  reintroduce exactly the churn this removes. Name is the last resort, for the
-   *  un-guidable entity `guidForId` returns '' for.
+   *  The guid passed here is `guidForId` — the LIVE lookup, which falls back to the
+   *  pre-pass's freshly-minted guids. A newly created entity's guid is not on its
+   *  `EntityInfo` record yet, so reading `info.guid` instead would sort every new
+   *  entity as '' and put it in a position the next save disagrees with.
    *
    *  This supersedes the Phase 3 (scene-loading.md) choice to reproduce ECS-ID order on
    *  the carry-respawn path: the written order no longer depends on how the scene was
    *  loaded at all, so a carried save and a cold-loaded save agree by construction rather
    *  than by keeping two paths in step. */
-  const orderedInfos = ((): typeof entityInfos => {
-    const present = new Set(entityInfos.map((e) => e.id));
-    const childrenOf = new Map<number, typeof entityInfos>();
-    const roots: typeof entityInfos = [];
-    for (const info of entityInfos) {
-      // A parent outside this scene's slice (a base-owned parent, an excluded
-      // transient) makes the entity a root here — the same rule buildEntityTree uses.
-      if (info.parentId && present.has(info.parentId)) {
-        const list = childrenOf.get(info.parentId);
-        if (list) list.push(info); else childrenOf.set(info.parentId, [info]);
-      } else {
-        roots.push(info);
-      }
-    }
-    const bySortThenGuid = (a: typeof entityInfos[number], b: typeof entityInfos[number]) =>
-      a.sortOrder - b.sortOrder
-      || guidForId(a.id).localeCompare(guidForId(b.id))
-      || a.name.localeCompare(b.name);
-    const out: typeof entityInfos = [];
-    const visit = (list: typeof entityInfos) => {
-      for (const info of [...list].sort(bySortThenGuid)) {
-        out.push(info);
-        const kids = childrenOf.get(info.id);
-        if (kids) visit(kids);
-      }
-    };
-    visit(roots);
-    // Belt-and-braces: a parent cycle would strand entities. Append anything the walk
-    // did not reach rather than silently DROPPING it from the saved scene.
-    if (out.length !== entityInfos.length) {
-      const emitted = new Set(out.map((e) => e.id));
-      for (const info of entityInfos) if (!emitted.has(info.id)) out.push(info);
-    }
-    return out;
-  })();
+  const orderedInfos = orderEntitiesForSave(entityInfos, (info) => ({
+    // A parent outside this scene's slice (a base-owned parent, an excluded transient)
+    // is not among `entityInfos`, so `orderEntitiesForSave` treats the entity as a root
+    // here — the same rule buildEntityTree uses.
+    key: info.id,
+    parentKey: info.parentId || null,
+    sortOrder: info.sortOrder,
+    name: info.name,
+    guid: guidForId(info.id),
+  }));
 
   const nestedOverridesByTop = new Map<number, NestedOverridePaths>();
   for (const ni of nestedInstances) {

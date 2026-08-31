@@ -5,6 +5,43 @@
   "resources": [],
   "entities": [
     {
+      "name": "HUD",
+      "traits": {
+        "RenderableUI": true,
+        "EntityAttributes": {
+          "name": "HUD",
+          "parentId": "",
+          "layer": "ui",
+          "guid": "59fde71b-9c7c-4f11-89c2-2f989071c198"
+        },
+        "UIElement": {
+          "width": 100,
+          "height": 100,
+          "justifyContent": "center",
+          "alignItems": "center"
+        },
+        "UIAnchor": {}
+      }
+    },
+    {
+      "name": "Title",
+      "traits": {
+        "RenderableUI": true,
+        "EntityAttributes": {
+          "name": "Title",
+          "parentId": "59fde71b-9c7c-4f11-89c2-2f989071c198",
+          "layer": "ui",
+          "guid": "3e96fdc7-b4ed-48ef-9a30-7c4acc65323f"
+        },
+        "UIElement": {
+          "text": "Tpl Canon",
+          "fontSize": 48,
+          "fontWeight": "bold",
+          "textAlign": "center"
+        }
+      }
+    },
+    {
       "name": "Main Camera",
       "traits": {
         "Transform": {
@@ -60,43 +97,6 @@
           "color": 16774368,
           "intensity": 1.4,
           "castShadow": true
-        }
-      }
-    },
-    {
-      "name": "HUD",
-      "traits": {
-        "RenderableUI": true,
-        "EntityAttributes": {
-          "name": "HUD",
-          "parentId": "",
-          "layer": "ui",
-          "guid": "59fde71b-9c7c-4f11-89c2-2f989071c198"
-        },
-        "UIElement": {
-          "width": 100,
-          "height": 100,
-          "justifyContent": "center",
-          "alignItems": "center"
-        },
-        "UIAnchor": {}
-      }
-    },
-    {
-      "name": "Title",
-      "traits": {
-        "RenderableUI": true,
-        "EntityAttributes": {
-          "name": "Title",
-          "parentId": "59fde71b-9c7c-4f11-89c2-2f989071c198",
-          "layer": "ui",
-          "guid": "3e96fdc7-b4ed-48ef-9a30-7c4acc65323f"
-        },
-        "UIElement": {
-          "text": "Tpl Canon",
-          "fontSize": 48,
-          "fontWeight": "bold",
-          "textAlign": "center"
         }
       }
     }
