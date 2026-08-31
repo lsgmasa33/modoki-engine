@@ -56,7 +56,11 @@ beforeEach(() => {
   resetRenderSettings();
   runBootRampProbe.mockReset();
   runBootRampProbe.mockResolvedValue(fakeMeasurement());
-  probeVerdictStore.provide({ read: () => null, write: vi.fn<(v: CachedProbeVerdict | null) => void>() });
+  probeVerdictStore.provide({
+    read: () => null,
+    write: vi.fn<(v: CachedProbeVerdict | null) => void>(),
+    session: () => undefined,
+  });
   setRenderSettings({
     ...BASE,
     three: { ...BASE.three, qualityTier: 'auto', tiers: TWO_CONFIGS as never },

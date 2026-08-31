@@ -55,10 +55,35 @@ export interface CachedProbeVerdict {
   final: boolean;
 }
 
+/** Opaque session token — capture it beside `read()`, hand it back to `write()`. Never inspect
+ *  or compare it yourself; only the provider knows what it means.
+ *
+ *  Exists because a probe run spans SECONDS of `await`s (a dynamic import, up to three ramp
+ *  passes, a 2500ms in-launch budget), and a sub-game swap (hash navigation, an OTA sub-game
+ *  switch) can re-namespace the underlying store entirely inside that span — so a `write()` that
+ *  resumes after the swap would land the OUTGOING game's samples in the INCOMING game's
+ *  namespace. `rendering/` cannot see swaps itself (it may not import `storage/`), so it captures
+ *  this before the awaits and hands it back unexamined; the storage-side provider is the only
+ *  thing that knows how to compare it.
+ *
+ *  ⚠️ For the design consequence of dropping a write here (a device that swaps sub-games on every
+ *  boot never settles) see `docs/rendering.md` § "The boot ramp probe". */
+export type ProbeStoreSession = unknown;
+
 export interface ProbeVerdictStore {
   read(): CachedProbeVerdict | null;
-  /** null clears the cache, forcing a re-probe on the next launch. */
-  write(verdict: CachedProbeVerdict | null): void;
+  /** null clears the cache, forcing a re-probe on the next launch.
+   *
+   *  `session`, when supplied, must be a value `session()` returned BEFORE the caller's own
+   *  awaits — see `ProbeStoreSession`. A write whose session no longer matches is DROPPED. */
+  write(verdict: CachedProbeVerdict | null, session?: ProbeStoreSession): void;
+  /** Capture before an await, pass to `write()` after it.
+   *
+   *  Optional for backward compatibility: this member was ADDED to the interface after the seam
+   *  was already public (exported from `runtime/index.ts`), so a game or a partial mock built
+   *  against the old shape may implement only `{read, write}`. A store without it simply gets the
+   *  pre-guard behaviour — `tierResolve.ts` captures no session and `write()` never drops. */
+  session?(): ProbeStoreSession;
 }
 
 export const probeVerdictStore = createProviderSlot<ProbeVerdictStore>('probeVerdictStore');

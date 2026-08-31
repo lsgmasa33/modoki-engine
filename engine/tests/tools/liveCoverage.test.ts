@@ -79,22 +79,27 @@ describe('T3 live coverage is declared, total, and honest', () => {
    *  case, so the step never executed.
    *
    *  KNOWN_UNCOVERED is a holding pen, not a home: each entry silences this guard for one specific
-   *  tool, so each earns its place with a written reason and the issue tracking the fix. Found
-   *  2026-08-31 in #483's close-out review — verified by hand that neither name has a real call
-   *  site. #496 emptied the pen once: `modoki_dispatch_action` had no call site at all, and
-   *  `modoki_set_selection`'s one occurrence never ran — both now have real, executing cases in
-   *  test-smoke.mjs (the dispatch_action one gated on a Play window, since a stopped sim refuses a
-   *  real action and a bogus one identically). #496 was reopened for the same defect on
-   *  `modoki_save_all`: its only two occurrences in test-smoke.mjs (UC7, :856 and :871) are a step
-   *  inside a batch the case ASSERTS never runs (`notRun`) — the same "mentioned but never executed"
-   *  shape as the two above.
+   *  tool, so each earns its place with a written reason and the issue tracking the fix. It is
+   *  EMPTY, and the type is kept so the next gap has somewhere honest to sit rather than being
+   *  quietly absorbed. Found 2026-08-31 in #483's close-out review; #496 emptied it in three
+   *  passes, each the same defect wearing a different hat:
+   *    • `modoki_dispatch_action` — no call site at all. Now a real case, gated on a PLAY window,
+   *      because a stopped sim refuses a real action and a bogus name identically.
+   *    • `modoki_set_selection` — its one occurrence was a step in a batch asserted to be REFUSED
+   *      at pre-flight, so it never executed. Now selects by guid and reads back.
+   *    • `modoki_save_all` — its two occurrences were a step in UC7's mid-batch-failure case and
+   *      the assertion that it lands in `notRun`, i.e. the case PROVES it does not run. Now a real
+   *      case that saves to an explicit probe path and reads the written file back from disk
+   *      through `modoki_validate_scene`. The probe path keeps the PRIMARY save off any committed
+   *      file; it cannot redirect the `extraSaved` loop (other dirty scenes in a base chain go to
+   *      their own real paths), so the case fails loudly and names them instead.
+   *
+   *  ⚠️ The lesson, for whoever is tempted to add the next entry: all three passed this grep. A
+   *  name appearing in test-smoke.mjs is necessary and NOT sufficient, and the only check that
+   *  distinguishes them is a human reading the call site. This guard stops the debt growing; it
+   *  cannot audit what is already claimed.
    */
-  const KNOWN_UNCOVERED: Readonly<Record<string, string>> = {
-    modoki_save_all: 'the only route to disk. A real case must dirty a probe entity, call save_all, '
-      + 'verify dirtyAssetPaths empties, then restore the probe — deferred because a failure mid-case '
-      + "would leave modified files in the human's working tree (CLAUDE.md #18). Tracked in #496 "
-      + '(reopened).',
-  };
+  const KNOWN_UNCOVERED: Readonly<Record<string, string>> = {};
 
   it('every COVERED_BY_SMOKE entry has a real call site in test-smoke.mjs (or a written exemption)', () => {
     const smokeSrc = readFileSync(join(__dirname, '../../tools/modoki-mcp/test-smoke.mjs'), 'utf8');

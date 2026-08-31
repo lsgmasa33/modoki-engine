@@ -450,6 +450,30 @@ An op registered in `agentEditorOps.ts` whose handler reaches nothing from `edit
   `src/liveCoverage.ts` with the reason each is un-sweepable, and a CI-safe guard asserts the split
   stays total: every tool is swept, smoke-covered, or listed. A gap list nothing checks is a gap list
   that grows.
+- **A `COVERED_BY_SMOKE` entry is a CLAIM, and the guard that keeps it honest is TEXT-based** (#496).
+  `liveCoverage.test.ts` asserts every listed name appears in `test-smoke.mjs` — that proves the name
+  is present, not that anything runs it. Necessary, not sufficient: three entries
+  (`modoki_dispatch_action`, `modoki_set_selection`, `modoki_save_all`) passed that grep with no
+  executing case behind them. Watch for two shapes: a name inside a batch step the case asserts is
+  REFUSED before it runs, and a name in an assertion that the step landed in `notRun` — a case that
+  PROVES the tool did not run still satisfies a grep for it. Only a human reading the call site
+  distinguishes these; the guard stops the debt growing, it cannot audit what is already claimed.
+  Adding a name to the bucket silences the sweep and buys nothing.
+- **A live smoke case that SAVES must leave the working tree clean** (#496) — it runs against the
+  human's real project (CLAUDE.md #18). ⚠️ Passing an explicit `path` does not make it safe, two ways,
+  both measured. (a) A save-as writes the CURRENT scene's own guid into the new file, so the probe and
+  the real scene briefly share one guid; the dev asset scanner auto-heals a guid collision by keeping
+  the lexicographically-first path's id and REWRITING the other file
+  (`engine/plugins/vite-asset-scanner.ts`, `buildManifest(..., heal=true)`) — the first green run of
+  the save_all case re-minted the guid of the committed `tropical-island.scene.json` while reporting
+  SMOKE OK. Keep the probe out of the manifest entirely: `detectType` classifies a plain `.json` as a
+  scene only by the `.scene.json` suffix or the legacy `/scenes/` directory, and as a material only
+  under `/materials/` — anywhere else it is not an asset at all, so it carries no guid to collide.
+  (b) `path` redirects only the PRIMARY scene — `saveAll`'s `extraSaved` loop
+  (`engine/packages/modoki/src/editor/scene/serialize.ts`) writes every other dirty loaded scene to
+  its own real path, which no argument redirects and no precondition can see. A case that saves must
+  inspect `extraSaved` and fail loudly naming those files. General rule: verify a smoke case with
+  `git status` after the run, not its own ✓.
 - **A refusal the sweep expects is declared too** (`EXPECTED_REFUSALS`, matched on the refusal text
   with the reason it is correct). Without that, the sweep either flags three correct refusals every
   run — and gets ignored — or blanket-accepts `REFUSED_BY_OP` and stops seeing a real one. A stale

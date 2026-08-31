@@ -165,6 +165,20 @@ branch, and the post-`finish()` `entitled.add()` in `settleInner` all follow it 
 branch was the gap closed on top of #434's first fix — an early return there used to hand back the
 module-global `entitled` by reference, which could already be the incoming game's `Set`.
 
+**The instance-level twin: `disposed`, guarding state a constructor's own async round-trip
+established (#487).** `stillActive(c)` answers "is this still the live *session*" — no help when
+the object being torn down is the instance itself. `CapacitorStoreBackend`'s constructor calls
+`iap().addListener('purchasesUpdated', …)` and stores the unsubscribe handle in that promise's
+`.then()`; a `dispose()` landing inside that native bridge round-trip used to null a binding that
+was still `null`, and the resumed `.then()` went on to install an unsubscribe nobody would ever
+call — the native listener outlived the game swap and drove the module-level `reconcile()` against
+whatever `cfg` was live by then. The fix is a `private disposed` flag checked in BOTH halves of the
+window: the `.then()` calls `h.remove()` directly instead of storing the handle, and the listener
+callback itself bails. Both checks are needed because **the native listener is live from the moment
+`addListener` is INVOKED, not from when its promise settles** — guarding only the handle-storage
+half leaves the callback free to fire, and drive `reconcile()`, in the exact gap the flag exists to
+close.
+
 ⚠️ **`settling.delete()` in `settle()`'s own `finally` is deliberately UNGUARDED — do not add a
 `stillActive`-style check there.** `resetIap()` clears `cfg` and `entitled` but deliberately does
 NOT clear `settling`, so a settle for the same transaction id restarting in the next session still
@@ -439,6 +453,7 @@ Kept because each is a class, not an incident.
 | Ledger held 300 coins; screen showed 0 | `entity.set(UIElement, …)` does not dirty the UI projection — **data-correct is not pixels-correct** |
 | `withInterruption` skipped the wrapper at `'none'`, so the device toggle could never arm | an optimisation for the state every build starts in |
 | A game swap landing during an await could write entitlements into the NEXT game's live `Set` (#434) — `stillActive(c)` was checked before the await but not immediately before the write that followed it | a check that guards the wrong moment |
+| `dispose()` existed and was called, but raced the constructor's own `addListener` round-trip, so the native listener still outlived the swap (#487) | a teardown that cannot see the setup it is undoing |
 
 Two shapes recur. **A correct mechanism with a missing consumer** (rows 4, 5) — when touching this
 subsystem, sweep the *chain*, not the change. And **a check that cannot fail** (rows 1, 10): if a

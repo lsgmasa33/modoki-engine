@@ -1312,6 +1312,251 @@ if (canUC3) {
   }
 }
 
+// ── modoki_save_all (#496, reopened) ─────────────────────────────────────────
+// The third tool COVERED_BY_SMOKE claimed and nothing executed, and the worst of the three: it is
+// the ONLY route from a live edit to disk. Its two prior occurrences were both in UC7 — a step in
+// a batch the case asserts fails BEFORE reaching it, plus the assertion that it lands in `notRun`.
+// A grep-based guard cannot tell that from a real call site, which is how it survived the pass
+// that fixed set_selection and dispatch_action.
+//
+// ⚠️ WHY THIS SAVES TO AN EXPLICIT PROBE PATH, AND WHY THAT IS NOT A WEAKER TEST.
+// A bare `save_all` writes the LIVE WORLD over the open scene FILE — the human's committed
+// `games/<id>/assets/scenes/*.json`, in a working tree this harness must leave clean (CLAUDE.md
+// #18). Worse, it is unconditional: `saveScene` does not check the dirty flag, and the serializer
+// re-emits the whole file, so even a "no-op" save lands as a large diff (#500). The `path` param
+// exists precisely so a save can name its own target, so the case uses it: the ONLY files this
+// writes are two probes it created, and the human's scene is never opened for writing at all.
+//
+// ⚠️⚠️ AND WHY THE PROBE SCENE IS `/assets/mcp-smoke-save.json` — NOT `.scene.json`, and NOT in
+// the scenes folder. This is a scar, measured on the first green run of this case, which left
+// `games/3d-test/.../tropical-island.scene.json` MODIFIED with a brand-new `id`:
+//   a save-as writes the CURRENT scene's own guid into the new file, so the probe and the human's
+//   scene briefly share one guid. The dev asset scanner auto-HEALS a guid collision by keeping
+//   the lexicographically-first path's id and REWRITING the other file's (vite-asset-scanner.ts,
+//   `buildManifest(…, heal=true)`) — and `mcp-smoke-save` sorts before `tropical-island`, so the
+//   healer re-minted the guid of the committed scene. Every ref to that scene by guid would have
+//   broken, from a smoke test that reported OK.
+//   The fix is to keep the probe OUT of the manifest entirely: `detectType` classifies a plain
+//   `.json` as a scene only via the `.scene.json` suffix or the legacy `/scenes/` directory
+//   convention, so a plain `.json` elsewhere under the asset root is not an asset at all — no
+//   guid, nothing to collide with. `saveScene` writes whatever path it is handed, and
+//   `validate_scene` reads by path, so nothing else cares about the extension.
+//   Do NOT "tidy" this path to `/assets/scenes/mcp-smoke-save.scene.json`.
+//
+// It still exercises both halves of what `save-all` does, which is the whole point — but they are
+// observed with DIFFERENT strength, and the difference is worth knowing before trusting this case:
+//   • the SCENE serialize + write — verified FROM DISK via `modoki_validate_scene`, a different
+//     route that does `fs.readFileSync` + `JSON.parse` on the path. This one does not rest on the
+//     op's own word. (It proves existence + parseability, not content: a save that wrote `{}`
+//     would pass. The stale-probe precheck removes the "it was already there" escape.)
+//   • the PARKED-ASSET flush (`flushDirtyAssets`) — observed only through the editor's OWN
+//     bookkeeping (`savedAssets`, `dirtyAssetPaths`, `read_asset_def.unsaved`), because
+//     `read_asset_def` reads the LIVE CACHE by design and no route in the surface reads a particle
+//     def from disk. So a flush that cleared the registry and reported success while the bytes
+//     never landed would pass this half — narrower than it sounds (the realistic regression, the
+//     #259 "flush never runs at all", IS caught), but it is not a disk proof and must not be
+//     described as one.
+//
+// ⚠️ The save-as also repoints the human's scene GUID at the probe IN MEMORY: `saveScene` calls
+// `registerAsset(scene.id, <probe path>, 'scene')`, and `registerAsset` drops the old path→guid
+// entry. Nothing on disk changes (the probe carries no guid of its own — see above), and the
+// cleanup's `load_scene` re-registers the real path. But if that reload ever fails, the editor is
+// left with the human's scene guid resolving to a file this case is about to trash.
+{
+  const st0 = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+  // Both probes sit at fixed locations under the asset ROOT, which every project has, so this runs
+  // on whatever project is open without assuming a folder layout. The scene probe's location is
+  // load-bearing, not a convenience — see the warning above. Named `mcp-smoke-save` so a leftover
+  // is identifiable as this case's.
+  const SAVE_SCENE = '/assets/mcp-smoke-save.json';   // see the extension/folder warning above
+  const SAVE_PART = '/assets/particles/mcp-smoke-save.particle.json';
+
+  // Four preconditions, each of which is about NOT damaging the human's editor — reported through
+  // the SKIPPED mechanism (F12), never forced past.
+  const blockers = [];
+  if (!SCENE) blockers.push('no resolvable scenePathRef — there would be nothing to restore the editor to after the save-as re-points it');
+  // `pre` is the snapshot taken at the TOP of this run, not now: by this point the suite's own
+  // cases have left the live world dirty by design, so `st0.unsavedChanges` is expected to be true
+  // and says nothing about the human. What matters is that the editor was CLEAN when we arrived,
+  // because the cleanup below reloads the scene from disk and that discards the live world.
+  if (pre.unsavedChanges) blockers.push('the editor already had unsaved live-world changes when this run STARTED — the cleanup reload would destroy them');
+  // `saveScene` refuses outside 'stopped' (it would bake preview/runtime state into an authored
+  // file). A refusal here is the tool being right, and would read as save_all being broken.
+  if (st0.runMode !== 'stopped') blockers.push(`runMode is '${st0.runMode}', not 'stopped' — a save is correctly refused outside stopped`);
+  // `flushDirtyAssets` runs FIRST and unconditionally inside save-all, and it flushes EVERY parked
+  // doc — not just ours. If the human (or an earlier case) has one parked, this call would commit
+  // their pending edit to disk as a side effect. That is exactly the kind of write this harness
+  // must not make on their behalf.
+  const parkedAlready = (st0.dirtyAssetPaths ?? []).filter((p) => p !== SAVE_PART);
+  if (parkedAlready.length) blockers.push(`the editor has parked asset writes this save would flush to disk on the human's behalf: ${parkedAlready.join(', ')}`);
+
+  if (blockers.length) {
+    const reason = blockers.join('; ');
+    skipped.push(`save_all — ${reason}`);
+    console.log(`save_all SKIPPED — ${reason}`);
+  } else {
+    // A leftover from a previous run would make "the save wrote it" unfalsifiable — the file would
+    // already be there. Same precheck UC10/UC11 make, for the same reason.
+    // A leftover from a previous run would make "the save wrote it" unfalsifiable — the file would
+    // already be there. Each probe is checked through the route that can SEE it: the particle is a
+    // real asset (manifest), the probe scene deliberately is NOT (see above), so it is checked by
+    // the same from-disk read the assertion below uses.
+    // `isError` is NOT the same as "absent": /api/validate-scene answers 404 for a missing file but
+    // 500 for one that fails JSON.parse, so a TRUNCATED leftover from a killed run would otherwise
+    // read as a clean project. Only a not-found is proof there is nothing there.
+    const staleScene = await client.callTool({ name: 'modoki_validate_scene', arguments: { path: SAVE_SCENE } });
+    const staleWhy = staleScene.isError ? (JSON.parse(text(staleScene)).error?.why ?? '') : '';
+    if (!staleScene.isError || !/not found/i.test(staleWhy)) {
+      throw new Error(`save_all cannot run: something already exists at ${SAVE_SCENE} — a previous run left a probe behind. Trash it and re-run. (${staleScene.isError ? staleWhy.slice(0, 200) : 'it reads as a valid scene'})`);
+    }
+    const stale = JSON.parse(text(await client.callTool({ name: 'modoki_list_assets', arguments: { type: 'particle', name: 'mcp-smoke-save' } })));
+    // A summarized reply has no `assets` key at all, and reading that absence as "nothing there"
+    // is the UC10 trap — so an unreadable answer is a failure, not a pass.
+    if (!Array.isArray(stale.assets)) {
+      throw new Error(`save_all precheck: list_assets returned no \`assets\` array (summarized? ${JSON.stringify(stale).slice(0, 200)}) — cannot tell a leftover probe from a clean project`);
+    }
+    if (stale.assets.length) {
+      throw new Error(`save_all cannot run: ${stale.assets.map((a) => a.path).join(', ')} already exists — a previous run left a probe behind. Trash it and re-run.`);
+    }
+    const made = JSON.parse(text(await client.callTool({ name: 'modoki_create_asset', arguments: { type: 'particle', path: SAVE_PART } })));
+    if (!made.ok) throw new Error(`save_all could not scaffold its probe particle: ${JSON.stringify(made).slice(0, 300)}`);
+    await withCleanup(async () => {
+      // The def comes from `modoki_asset_schema`, not from reading the file back. ⚠️ Measured:
+      // `read_asset_def` PEEKS the live cache and deliberately does not fetch, so a
+      // freshly-scaffolded asset nothing has loaded is a refusal ("not in the live particle
+      // cache") — correct behaviour, and it fails this case before it starts. `asset_schema`'s
+      // `example` is `defaultParticleEffect()`, the same generator `/api/create-asset` scaffolds
+      // from, so the def stays valid without this file hand-carrying a copy of the schema.
+      const schema = JSON.parse(text(await client.callTool({ name: 'modoki_asset_schema', arguments: { type: 'particle' } })));
+      if (!schema?.example) throw new Error(`save_all could not get a valid particle example: ${JSON.stringify(schema).slice(0, 300)}`);
+      // Carry the scaffolded GUID through: the parked def is what reaches disk, so dropping `id`
+      // would save the probe under a different identity than the one create_asset registered.
+      const probeDef = { ...schema.example, id: made.id, maxParticles: 496 };
+
+      // Park the write. `particle_set` must report `saved:false` — persistence is manual, and if
+      // the edit went straight to disk there would be nothing for save_all to flush and this case
+      // would be theatre (the UC6 assertion, made here because THIS case depends on it).
+      //
+      // ⚠️ BOUNDED RETRY, and it is not papering over this case's own flakiness — it is working
+      // around a REAL defect found while writing it (#503): `create_asset` rebuilds the
+      // BACKEND manifest inline (which is why UC10 can list the asset in the same batch), but
+      // `particle-set`'s existence check is `getGuidForPath` in the RENDERER, whose manifest
+      // arrives on a later push. So for ~1s after a create, every asset-def write op refuses with
+      // "no particle asset exists at …" — and its hint says "create it first with
+      // modoki_create_asset", which is exactly what was just done. Measured: refused immediately,
+      // `{ok:true,saved:false}` after 1.5s.
+      //
+      // Retrying is safe HERE and nowhere else in this file: the refusal states that nothing was
+      // applied and nothing was parked, so a refused call has no effect to repeat. A `sleep`
+      // instead would be the UC10 mistake — this fails LOUDLY, naming the race, if it never lands.
+      let parked, lastRefusal;
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const r = await client.callTool({ name: 'modoki_particle_set', arguments: { path: SAVE_PART, def: probeDef } });
+        if (!r.isError) { parked = JSON.parse(text(r)); break; }
+        lastRefusal = text(r);
+        if (!/no particle asset exists/.test(lastRefusal)) throw new Error(`save_all: particle_set refused for an unexpected reason: ${lastRefusal.slice(0, 400)}`);
+        await new Promise((res) => setTimeout(res, 250));
+      }
+      if (!parked) throw new Error(`save_all: the renderer never saw the probe asset create_asset had already written (#503) — ${lastRefusal?.slice(0, 300)}`);
+      if (parked.saved !== false) throw new Error(`save_all: particle_set reported saved=${parked.saved} — the write must be PARKED for this case to have anything to flush`);
+      const dirty = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+      if (!(dirty.dirtyAssetPaths ?? []).includes(SAVE_PART)) {
+        throw new Error(`save_all: the probe write did not park (dirtyAssetPaths=${JSON.stringify(dirty.dirtyAssetPaths)}) — nothing to flush`);
+      }
+      // Applying the def loaded it into the live cache, so the peek answers now — and it must say
+      // the write is UNSAVED. That is the state save_all has to change.
+      const pending = JSON.parse(text(await client.callTool({ name: 'modoki_read_asset_def', arguments: { path: SAVE_PART } })));
+      if (pending?.unsaved !== true || pending?.def?.maxParticles !== 496) {
+        throw new Error(`save_all: the parked edit is not readable as pending: ${JSON.stringify(pending).slice(0, 300)}`);
+      }
+
+      // ── the call under test ──
+      const saved = JSON.parse(text(await client.callTool({ name: 'modoki_save_all', arguments: { path: SAVE_SCENE } })));
+      if (!saved.ok) throw new Error(`save_all did not report a write: ${JSON.stringify(saved).slice(0, 400)}`);
+      if (saved.scenePath !== SAVE_SCENE) throw new Error(`save_all wrote ${saved.scenePath}, not the path it was given (${SAVE_SCENE})`);
+      // The asset half is REPORTED — `savedAssets` is the only place a caller can see which parked
+      // docs a save committed, and it was added because `saved:false` had been the last word on a
+      // parked edit. A save that flushed it silently is a regression in its own right.
+      if (!(saved.savedAssets ?? []).includes(SAVE_PART)) {
+        throw new Error(`save_all did not name the flushed asset doc: savedAssets=${JSON.stringify(saved.savedAssets)}`);
+      }
+      // ⚠️ `path` REDIRECTS ONLY THE PRIMARY SCENE. After the primary saves, `saveAll` loops every
+      // OTHER loaded scene in the chain and writes each dirty one to ITS OWN real path
+      // (serialize.ts, the `extraSaved` loop) — so on a project whose open scene declares a
+      // `baseScene`, a base dirtied by an earlier case in this run reaches a COMMITTED file that
+      // no `path` argument can redirect.
+      //
+      // This is DETECTION, not prevention, and deliberately so: nothing in the tool surface
+      // exposes the loaded-scene chain (`readEditorState` reports `unsavedChanges` and
+      // `dirtyAssetPaths`, but no per-scene dirty list), so there is no precondition that could
+      // see it coming. `extraSaved` is precisely the "committed files this save also wrote"
+      // channel, and discarding it is what would turn real damage into a printed ✓. Fail loudly
+      // and NAME the files, so whoever hits it knows exactly what to restore.
+      if (saved.extraSaved?.length) {
+        const paths = saved.extraSaved.map((e) => e.path ?? e).join(', ');
+        throw new Error(
+          `save_all ALSO wrote ${saved.extraSaved.length} other loaded scene(s) to their own committed paths: ${paths}. `
+          + 'Those are real project files this case cannot redirect — check `git status` and restore them '
+          + '(git checkout -- <path>). Run the smoke on a project whose open scene has no base-scene chain.',
+        );
+      }
+
+      // Read back through OTHER routes — an op that echoes its own success is not evidence.
+      const after = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+      if ((after.dirtyAssetPaths ?? []).includes(SAVE_PART)) {
+        throw new Error(`save_all left the probe parked: dirtyAssetPaths=${JSON.stringify(after.dirtyAssetPaths)}`);
+      }
+      if (after.unsavedChanges !== false) throw new Error(`save_all reported ok but the editor still has unsaved changes: ${JSON.stringify(after.unsavedChanges)}`);
+      if (after.scenePathRef !== SAVE_SCENE) throw new Error(`save_all did not re-point the scene at ${SAVE_SCENE} (now ${after.scenePathRef}) — the tool documents that "the scene keeps it for later saves"`);
+      // The asset's own view of itself, through the route the write tools point their callers at.
+      // `unsaved:true` here after a reported save is the exact silent-loss shape manual
+      // persistence exists to make visible.
+      const flushed = JSON.parse(text(await client.callTool({ name: 'modoki_read_asset_def', arguments: { path: SAVE_PART } })));
+      if (flushed?.unsaved !== false) throw new Error(`save_all reported the asset flushed, but read_asset_def still calls it unsaved: ${JSON.stringify(flushed).slice(0, 300)}`);
+
+      // THE DISK PROOF, and the assertion this whole case exists for. Everything above is the
+      // editor's own account of itself; `/api/validate-scene` does `fs.existsSync` +
+      // `fs.readFileSync` + `JSON.parse` on the path (editorBackendRouter.ts) and 404s when the
+      // file is not there. So this is the one read that can tell a real write from a route that
+      // reports success and touches nothing — the `modoki_prefab` failure mode this issue is about.
+      const onDisk = await client.callTool({ name: 'modoki_validate_scene', arguments: { path: SAVE_SCENE } });
+      if (onDisk.isError) throw new Error(`save_all reported ok, but the file is NOT on disk — validate_scene could not read ${SAVE_SCENE}: ${text(onDisk)}`);
+      const vj = JSON.parse(text(onDisk));
+      if (vj.path !== SAVE_SCENE) throw new Error(`validate_scene answered about ${vj.path}, not ${SAVE_SCENE}`);
+      console.log(`save_all writes the scene to an explicit path (verified on disk) and flushes ${saved.savedAssets.length} parked asset doc(s) ✓`);
+    }, async () => {
+      // 1. Put the editor back on the human's scene FIRST, so it is never left pointing at a file
+      //    the next step deletes. Conditional: if the case failed before the save, the path was
+      //    never re-pointed and a reload would only discard live state for nothing — and it would
+      //    be REFUSED anyway, since the suite leaves the world dirty by design.
+      const now = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+      if (now.scenePathRef === SAVE_SCENE) {
+        const back = JSON.parse(text(await client.callTool({ name: 'modoki_load_scene', arguments: { path: SCENE } })));
+        const restored = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+        if (restored.scenePathRef !== SCENE) {
+          throw new Error(`save_all failed to restore the human's scene ${SCENE} (now ${restored.scenePathRef}): ${JSON.stringify(back).slice(0, 300)}`);
+        }
+        console.log('save_all restores the original scene ✓');
+      }
+      // 2. Drop any parked write still outstanding (the case failed between particle_set and the
+      //    save), so the next save_all by anyone does not commit it — the UC6 lesson.
+      if ((now.dirtyAssetPaths ?? []).includes(SAVE_PART)) {
+        await client.callTool({ name: 'modoki_discard_asset_edits', arguments: { paths: [SAVE_PART] } });
+      }
+      // 3. Trash both probes. `delete_asset` on an absent path is `trashed:0`, not an error, so
+      //    this is safe on every failure path.
+      const sweptRaw = await client.callTool({ name: 'modoki_delete_asset', arguments: { paths: [SAVE_SCENE, SAVE_PART] } });
+      // A REFUSED delete must fail the run. `trashed > 0` alone is silently false on an error
+      // envelope (403 outside allowed dirs, 500 from a throwing moveToTrash), which would end the
+      // suite at `SMOKE OK` with both probes still in the human's project — and the NEXT run would
+      // then blame its own precheck on "a previous run", pointing at the wrong run.
+      if (sweptRaw.isError) throw new Error(`save_all could not trash its probes — they are STILL in the project (${SAVE_SCENE}, ${SAVE_PART}): ${text(sweptRaw).slice(0, 300)}`);
+      const swept = JSON.parse(text(sweptRaw));
+      if (swept.trashed > 0) console.log(`save_all trashed its ${swept.trashed} probe file(s) ✓`);
+    });
+  }
+}
+
 await client.close();
 
 // F12 — a SKIPPED case used to leave the verdict at a cheerful `SMOKE OK`, so the run reported

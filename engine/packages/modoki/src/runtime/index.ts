@@ -345,7 +345,7 @@ export { getShadowCasterCapStats } from './rendering/shadowCasterCapFrame';
 // reason: verifying that a light selection REACHED the renderer needs the running instance, and a
 // direct `/@fs/` import from a debug eval can land on a second copy of the module.
 export { getLightMaskStats } from './rendering/lightMaskVariants';
-export { probeVerdictStore, type ProbeVerdictStore, type CachedProbeVerdict } from './core/probeVerdictStore';
+export { probeVerdictStore, type ProbeVerdictStore, type CachedProbeVerdict, type ProbeStoreSession } from './core/probeVerdictStore';
 export { registerMaterialType, getMaterialBuilder, getRegisteredMaterialTypes, type MaterialBuilder } from './loaders/materialTypes';
 export { registerCustomShader, unregisterCustomShader, getCustomShader, getCustomShaderSchema, getRegisteredShaderNames, type CustomShaderBuild } from './loaders/customShaders';
 export { mergeParamDefaults, coerceParamValue, fetchShaderManifest, type ShaderParam, type ShaderParamType, type ShaderParamSchema, type ShaderManifest } from './loaders/shaderSchema';

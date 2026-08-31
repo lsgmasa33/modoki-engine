@@ -130,6 +130,7 @@ describe('choosePlayerQualityTier(null) — "Auto" must NOT discard the boot pro
     probeVerdictStore.provide({
       read: () => ({ fingerprint, deviceClass: 'middle', samples: [], final: true }),
       write: () => {},
+      session: () => undefined,
     });
     setRenderSettings({ three: { qualityTier: 'auto' } });
 
@@ -169,6 +170,7 @@ describe('a player pin is not an ASSESSMENT — the promotion ceiling must not l
     probeVerdictStore.provide({
       read: () => ({ fingerprint, deviceClass: 'middle', samples: [], final: true }),
       write: () => {},
+      session: () => undefined,
     });
     setRenderSettings({ three: { qualityTier: 'auto' } });
     // Launch 2: the stored pin is read before anything else and the probe never runs, so the

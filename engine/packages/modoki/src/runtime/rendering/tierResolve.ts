@@ -342,6 +342,18 @@ async function resolveProbeClass(
   });
 
   const store = probeVerdictStore.get();
+  // `session()` is `?`-optional on `ProbeVerdictStore` precisely so this runtime guard has a type
+  // to agree with: it's a member ADDED after the seam was already public (exported from
+  // `runtime/index.ts`), so a game or a partial mock built against the old shape may implement
+  // only `{read, write}`. Without the `typeof` guard that would throw `TypeError: store.session is
+  // not a function` right here — OUTSIDE the `try` below, which would fail the whole boot ("Failed
+  // to load game") instead of degrading to the pre-guard behaviour.
+  //
+  // Captured HERE, before every `await` below (a dynamic import, up to three ramp passes, the
+  // 2500ms in-launch budget) — a sub-game swap re-namespaces the store underneath those awaits,
+  // and this session is what lets `store.write()` refuse to land the outgoing game's samples in
+  // the incoming game's namespace. See `ProbeStoreSession`'s doc comment in `core/probeVerdictStore.ts`.
+  const storeSession = typeof store?.session === 'function' ? store.session() : undefined;
   const cached = store?.read();
   const forThisDevice = cached && cached.fingerprint === fingerprint ? cached : null;
   // SETTLED means never probe again. An UNSETTLED record means the opposite — probe once more and
@@ -492,7 +504,7 @@ async function resolveProbeClass(
     // could never settle. That conjunct gates the in-launch shortcut; it must not gate this.
     const settled = final || (toStore.length >= PROBE_SAMPLE_TARGET && storedClass !== 'unknown');
     if (storedClass !== 'unknown' && toStore.length > 0) {
-      store?.write({ fingerprint, deviceClass: storedClass, samples: [...toStore], final: settled });
+      store?.write({ fingerprint, deviceClass: storedClass, samples: [...toStore], final: settled }, storeSession);
     }
     return deviceClass === 'unknown' ? fallback() : { deviceClass, cpuLimited };
   } catch (e) {

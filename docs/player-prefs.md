@@ -354,6 +354,17 @@ cannot truthfully report so once the swap has moved the namespace out from under
 refused during the same window — a read answers truthfully about the (still fully hydrated)
 outgoing store, since there is nothing for it to settle across.
 
+**A second production consumer of `swapGeneration()` — `probeVerdictProvider`'s `write()` (#487)
+— shows the other shape this pattern takes.** `agentBridge.ts`'s check above fires AFTER the
+mutation has already happened, so it can only degrade the reply (`PARTIAL`, `durability:'unknown'`);
+it cannot undo a write already attempted. The probe-verdict check fires BEFORE its write, so it CAN
+refuse outright, and does — a verdict whose captured namespace or generation no longer matches is
+dropped, not stored. Dropping is safe there specifically because the cost is one re-probe next
+launch; a durable-write consumer rarely has that option. **The generalizable fact: what a
+post-await session check should DO depends on whether the mutation it's guarding has already
+happened** — refuse before, degrade after. See `docs/rendering.md` § "The boot ramp probe" for the
+probe's own mechanics; this is only the `swapGeneration()`-consumer shape of it.
+
 `action` is required on the WRITE tool (the read takes only an optional `key`), and
 `action:'clear'` additionally requires `confirm:true` — one rule on both surfaces, and on the device
 the target is a real player's save data on an installed app.

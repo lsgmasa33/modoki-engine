@@ -2307,6 +2307,23 @@ device, at boot, and the tier it produces does not change mid-play; demotion sta
   launches each pay one** where previously only the first did. A pre-refinement cached record has
   no `samples` and is rejected on read, so an already-launched device re-probes — deliberately.
 
+  ⚠️ **A verdict write is DROPPED outright if a sub-game swap re-namespaced `PlayerPrefs` while the
+  probe ran (#487)** — hash navigation or an OTA sub-game switch can re-run `PlayerPrefs.init()`
+  with a new namespace inside the probe's own awaits (a dynamic import, up to three ramp passes, the
+  2500ms in-launch budget), and the samples this probe collected were read from the OUTGOING game's
+  namespace. Landing them anyway would overwrite the incoming game's record — possibly with
+  `final:true` (never probe again) for a fingerprint computed against the *outgoing* viewport. The
+  mechanism is an opaque session token on the `ProbeVerdictStore` seam (`ProbeStoreSession` in
+  `core/probeVerdictStore.ts`): `rendering/` captures it before its awaits and hands it back
+  unexamined, and the comparison lives entirely in the storage-side provider — the only layer
+  allowed to see `PlayerPrefs` at all, since `rendering/` may not import `storage/`. **The design
+  consequence worth writing down:** after such a swap the INCOMING game's tier is already resolved
+  (`resolveActiveTier` early-outs for it), so nothing re-probes and nothing gets cached on that same
+  boot — the dropped verdict is not replaced by a fresh one until the next launch. The "one cheap
+  re-probe next launch" bargain this buys assumes a swap is OCCASIONAL; a device that swaps sub-games
+  on every boot never settles, and pays the blocking probe forever by a different route than the bug
+  this mechanism fixes.
+
   "No launch pays more than one" is enforced by `shareTierResolution` (`probeReentrancy.ts`), and
   it is a *different* guard from the recursion flag beside it: that one stops a call arriving from
   INSIDE the probe, this one stops two surfaces arriving from outside it in the same tick, before
