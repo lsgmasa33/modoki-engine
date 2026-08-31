@@ -1226,6 +1226,15 @@ describe('classifySceneChange — animation (C7)', () => {
     expect(classifySceneChange('/games/x/assets/prefabs/tree.prefab.json')).toBe('prefab');
   });
 
+  it("broadcasts an .animset.json as 'animset' — the EXTERNAL-write half of #74's sixth instance", () => {
+    // `invalidateAnimSet` was never callerless (the Inspector's AnimSetAssetView drives it), so
+    // an animset edited in the editor always invalidated. What was dead was every write from
+    // OUTSIDE: `modoki_write_asset`, or the user's own Claude Code editing the file directly —
+    // this function had no case, so the verdict fell through to null and nothing was broadcast,
+    // and `animSetCache` served the pre-edit clip params (speed/loop/fade) forever.
+    expect(classifySceneChange('/games/x/assets/models/rig.animset.json')).toBe('animset');
+  });
+
   it('does not mistake a sibling animation-ish asset for a clip', () => {
     // .animset.json / .spriteanim.json are different types with their own caches — a wrong
     // 'animation' here would invalidate a clip that was never loaded (harmless) but a wrong

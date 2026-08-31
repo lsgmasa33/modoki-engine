@@ -16,6 +16,14 @@ const MINIMAL_RIG: Rig2DFile = {
   skinWeights: [1],
 };
 
+const flush = () => new Promise((r) => setTimeout(r, 0));
+// text() as well as json(): the loaders read the body as TEXT so they can spot Vite's index.html
+// SPA fallback and report a MISSING asset instead of a JSON syntax error.
+const okResponse = (body: unknown) => {
+  const text = JSON.stringify(body);
+  return { ok: true, status: 200, statusText: 'OK', text: () => Promise.resolve(text), json: () => Promise.resolve(body) };
+};
+
 beforeEach(() => {
   clearRig2DCache();
   clearManifest();
@@ -61,6 +69,36 @@ describe('rig2dCache', () => {
     expect(getRig2D('c.rig2d.json')).not.toBeNull();
     invalidateRig2D('c.rig2d.json');
     expect(getRig2D('c.rig2d.json')).toBeNull();
+  });
+
+  it('invalidateRig2D mid-flight refuses a fetch that resolves with the OLD def (#487 item 8)', async () => {
+    let resolveOld: (v: unknown) => void = () => {};
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((r) => { resolveOld = r; })));
+
+    expect(getRig2D('race.rig2d.json')).toBeNull();   // kicks off the in-flight load
+    invalidateRig2D('race.rig2d.json');                 // re-import lands mid-flight
+
+    resolveOld(okResponse({ ...MINIMAL_RIG, sprite: 'STALE' }));
+    await flush();
+
+    // Genuinely EMPTY (peek, no new fetch) — not merely shadowed by a fresher value.
+    expect(getRig2D('race.rig2d.json', { load: false })).toBeNull();
+  });
+
+  // THE DECISIVE case (#499): `generation` is module-wide, so a per-key `invalidateRig2D` that
+  // bumped it would refuse every OTHER key's in-flight load too. Must FAIL against the
+  // module-wide-`generation++` version and PASS once invalidation is scoped per path.
+  it('invalidating an UNRELATED rig while A is in flight leaves A cacheable', async () => {
+    let resolveA: (v: unknown) => void = () => {};
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((r) => { resolveA = r; })));
+
+    expect(getRig2D('cross.a.rig2d.json')).toBeNull(); // kicks off A's load
+    invalidateRig2D('cross.b.rig2d.json');               // UNRELATED path
+
+    resolveA(okResponse({ ...MINIMAL_RIG, sprite: 'a-sprite' }));
+    await flush();
+
+    expect(getRig2D('cross.a.rig2d.json')?.sprite).toBe('a-sprite'); // must be cached
   });
 });
 

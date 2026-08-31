@@ -34,6 +34,20 @@
  *  its caller staying correct: that dependency is what made this an iPhone-killer the first time. */
 let probing = 0;
 
+/** Scopes `probing` to one probe *session*, so that a probe left parked (still awaiting) across
+ *  {@link resetProbeInFlightForTest} cannot decrement a count that belongs to a probe started
+ *  AFTER the reset. Bumped by the reset only.
+ *
+ *  ⚠️ `Math.max(0, probing - 1)` was considered and rejected: it stops the counter going negative,
+ *  but a pre-reset probe's stale `finally` would still fire and decrement the POST-reset session's
+ *  count to 0 while that later probe is still running — reopening the recursion window mid-probe,
+ *  which is the exact failure this module exists to prevent. Generation-scoping makes a stale
+ *  decrement a no-op instead of a wrong one.
+ *
+ *  With this in place `probing` cannot go negative by construction: every decrement is paired with
+ *  an increment from its OWN generation, and a decrement from any other generation is dropped. */
+let generation = 0;
+
 /** Is a boot probe currently running? While true, tier resolution must NOT start another one. */
 export function isProbeInFlight(): boolean {
   return probing > 0;
@@ -45,11 +59,12 @@ export function isProbeInFlight(): boolean {
  *  must never block rendering), and a flag left stuck `true` by a throw would permanently disable
  *  probing for the process — a silent, once-per-install failure that no test would notice. */
 export async function withProbeInFlight<T>(fn: () => Promise<T>): Promise<T> {
+  const gen = generation;
   probing += 1;
   try {
     return await fn();
   } finally {
-    probing -= 1;
+    if (gen === generation) probing -= 1;
   }
 }
 
@@ -85,5 +100,8 @@ export function shareTierResolution(run: () => Promise<void>): Promise<void> {
 /** Test seam only. */
 export function resetProbeInFlightForTest(): void {
   probing = 0;
+  // New session: any probe still parked from before this call now decrements a generation nobody
+  // is counting, instead of this one's.
+  generation += 1;
   sharedResolution = null;
 }

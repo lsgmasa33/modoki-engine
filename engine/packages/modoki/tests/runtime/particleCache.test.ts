@@ -172,6 +172,41 @@ describe('setParticleEffect / invalidateParticleEffect', () => {
     expect(cache.getParticleEffect('fx/x.particle.json')!.maxParticles).toBe(555);
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
+
+  it('invalidateParticleEffect mid-flight refuses a fetch that resolves with the OLD def (#487 item 8)', async () => {
+    const { cache } = await setup();
+    let resolveOld: (v: unknown) => void = () => {};
+    const fetchFn = vi.fn(() => new Promise((r) => { resolveOld = r; }));
+    vi.stubGlobal('fetch', fetchFn);
+
+    expect(cache.getParticleEffect('fx/race.particle.json')).toBeNull(); // kicks off the in-flight load
+    cache.invalidateParticleEffect('fx/race.particle.json');               // re-import lands mid-flight
+
+    resolveOld(await completeResponse({ ok: true, json: async () => ({ version: 1, maxParticles: 999 }) }));
+    await flush();
+
+    // Genuinely EMPTY (peek, no new fetch) — not merely shadowed by a fresher value.
+    expect(cache.getParticleEffect('fx/race.particle.json', { load: false })).toBeNull();
+  });
+
+  // THE DECISIVE case (#499): `generation` is module-wide, so a per-key `invalidateParticleEffect`
+  // that bumped it would refuse every OTHER key's in-flight load too. Must FAIL against the
+  // module-wide-`generation++` version and PASS once invalidation is scoped per path.
+  it('invalidating an UNRELATED effect while A is in flight leaves A cacheable', async () => {
+    const { cache } = await setup();
+    let resolveA: (v: unknown) => void = () => {};
+    const fetchFn = vi.fn(() => new Promise((r) => { resolveA = r; }));
+    vi.stubGlobal('fetch', fetchFn);
+
+    expect(cache.getParticleEffect('fx/cross.a.particle.json')).toBeNull(); // kicks off A's load
+    cache.invalidateParticleEffect('fx/cross.b.particle.json');               // UNRELATED path
+
+    resolveA(await completeResponse({ ok: true, json: async () => ({ version: 1, maxParticles: 7 }) }));
+    await flush();
+
+    expect(cache.getParticleEffect('fx/cross.a.particle.json')?.maxParticles).toBe(7); // must be cached
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('clearParticleCache (scene swap)', () => {

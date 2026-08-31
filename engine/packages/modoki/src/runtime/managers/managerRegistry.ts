@@ -40,7 +40,15 @@ interface Entry {
    *  `disposeActiveSceneManagers` await a pending init before disposing, so we
    *  never dispose a half-initialized manager. */
   initPromise: Promise<void> | null;
+  /** Identifies ONE activation of this entry, so a dispose sweep that awaited
+   *  across a re-entrant activate/deactivate can tell "the activation I started
+   *  with" from "a later one that reused the same entry" — the entry reference
+   *  alone can't distinguish those two activations. Bumped in `activate()`;
+   *  0 until first activated. */
+  activationId: number;
 }
+
+let nextActivationId = 1;
 
 const managers = new Map<string, Entry>();
 /** The scene whose scene-scoped managers are currently active. */
@@ -69,6 +77,7 @@ function addActions(def: ManagerDef): string[] {
 function activate(entry: Entry, scenePath: string): void | Promise<void> {
   if (entry.active) return;
   entry.active = true;
+  entry.activationId = nextActivationId++;
   entry.actionNames = addActions(entry.def);
   const r = entry.def.init?.({ world: getCurrentWorld(), scenePath });
   if (r && typeof (r as Promise<unknown>).then === 'function') {
@@ -104,7 +113,7 @@ export function registerManager(def: ManagerDef): void {
   const existing = managers.get(def.name);
   if (existing) { deactivate(existing); managers.delete(def.name); }
 
-  const entry: Entry = { def, scope, active: false, actionNames: [], initPromise: null };
+  const entry: Entry = { def, scope, active: false, actionNames: [], initPromise: null, activationId: 0 };
   managers.set(def.name, entry);
 
   if (scope === 'app') {
@@ -141,15 +150,32 @@ export function unregisterManagers(names: string[]): void {
  *
  *  Awaits any in-flight scene-manager init first, so a manager registered mid-
  *  scene (e.g. editor game-switch) whose async init is still running is never
- *  disposed half-initialized. */
+ *  disposed half-initialized.
+ *
+ *  Snapshots which activation of each entry it OWNS before awaiting, and
+ *  deactivates only those activations afterward — a manager (re)activated
+ *  DURING that await belongs to the INCOMING scene, not the outgoing one, and
+ *  must survive this sweep. An entry unregistered during the await is already
+ *  inactive (`unregisterManager` deactivated it), so the snapshot skips it.
+ *
+ *  ⚠️ Known residual, stated rather than fixed: a `registerManager` landing INSIDE
+ *  the await activates against `activeScenePath`, which is still the OUTGOING
+ *  scene (only `initSceneManagersFor` moves it, and SceneManager runs that after
+ *  this) — so that manager belongs to the outgoing scene yet survives this sweep.
+ *  It is caught by the next swap. Distinguishing it would need a second key on top
+ *  of the activation id, and the old re-iterate-the-map behaviour traded this for
+ *  the worse bug above: tearing down the INCOMING scene's live managers. */
 export async function disposeActiveSceneManagers(ctx?: ManagerContext): Promise<void> {
+  const owned: Array<[Entry, number]> = [];
   const pending: Promise<void>[] = [];
   for (const entry of managers.values()) {
-    if (entry.scope === 'scene' && entry.active && entry.initPromise) pending.push(entry.initPromise);
+    if (entry.scope !== 'scene' || !entry.active) continue;
+    owned.push([entry, entry.activationId]);
+    if (entry.initPromise) pending.push(entry.initPromise);
   }
   if (pending.length) await Promise.all(pending);
-  for (const entry of managers.values()) {
-    if (entry.scope === 'scene' && entry.active) deactivate(entry, ctx);
+  for (const [entry, id] of owned) {
+    if (entry.active && entry.activationId === id) deactivate(entry, ctx);
   }
 }
 
@@ -179,15 +205,24 @@ export function getActiveGameId(): string | null {
  *
  *  Awaits any in-flight game-manager init first, mirroring
  *  `disposeActiveSceneManagers`, so a manager whose async init is still running
- *  is never disposed half-initialized. */
+ *  is never disposed half-initialized.
+ *
+ *  Same activation-token snapshot as `disposeActiveSceneManagers` — see its
+ *  comment: a manager (re)activated during the await belongs to the incoming
+ *  game, not the outgoing one. (The SceneManager `gameChanged`/`activeGameId`
+ *  ordering bug tracked as TODO(#435-residual) there is a separate defect —
+ *  not this one.) */
 export async function disposeActiveGameManagers(ctx?: ManagerContext): Promise<void> {
+  const owned: Array<[Entry, number]> = [];
   const pending: Promise<void>[] = [];
   for (const entry of managers.values()) {
-    if (entry.scope === 'game' && entry.active && entry.initPromise) pending.push(entry.initPromise);
+    if (entry.scope !== 'game' || !entry.active) continue;
+    owned.push([entry, entry.activationId]);
+    if (entry.initPromise) pending.push(entry.initPromise);
   }
   if (pending.length) await Promise.all(pending);
-  for (const entry of managers.values()) {
-    if (entry.scope === 'game' && entry.active) deactivate(entry, ctx);
+  for (const [entry, id] of owned) {
+    if (entry.active && entry.activationId === id) deactivate(entry, ctx);
   }
 }
 

@@ -24,6 +24,12 @@
  * Deliberately source-parsing rather than importing: importing the plugin into the app test program
  * is the exact thing the type split exists to avoid. Same idiom as this repo's other architecture
  * guards (reapScoping, determinismGuard, testTypecheckCoverage, barrelSurface).
+ *
+ * A second gap, found by mutation this session: deleting `if (type === 'animset') return 'animset';`
+ * from `classifySceneChange` while leaving `'animset'` in the `LiveReloadKind` union left every test
+ * below green — a union member with no branch in `classifySceneChange` silently falls through to
+ * `return null` (no broadcast, ever) and nothing here noticed. The added test below closes that by
+ * requiring every union member to appear in an explicit `type === '<kind>'` branch.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -64,6 +70,27 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
     expect(inClassify.length, 'classifySceneChange should return several kinds').toBeGreaterThan(2);
     for (const kind of inClassify) expect(PRODUCER).toContain(kind);
     expect(returned.length).toBeGreaterThan(0);
+  });
+
+  it('every kind in the union has an explicit branch in classifySceneChange', () => {
+    // Every current member (scene, prefab, animation, timeline, particle, spriteanim, rig2d) is
+    // returned from its own `type === '<kind>'` comparison — none of them reach `classifySceneChange`
+    // by falling through a default/else. If a future kind legitimately needs another route, it must
+    // be added to this exception list explicitly, not silently exempted.
+    const NO_DIRECT_COMPARISON: string[] = [];
+    const classifyBody = producerSrc.slice(producerSrc.indexOf('export function classifySceneChange'));
+    const fnBody = classifyBody.slice(0, classifyBody.indexOf('\n}'));
+    const missing = PRODUCER.filter(
+      (k) => !NO_DIRECT_COMPARISON.includes(k) && !new RegExp(`type === '${k}'`).test(fnBody),
+    );
+    expect(
+      missing,
+      'These LiveReloadKind members have no `type === \'<kind>\'` branch in classifySceneChange, so ' +
+        'a file of that kind falls through to `return null` — no broadcast ever fires, and the asset ' +
+        'silently keeps its pre-edit contents forever. Add an explicit branch (or, if it genuinely ' +
+        'reaches classifySceneChange by another route, add it to NO_DIRECT_COMPARISON above with a ' +
+        'comment saying how).',
+    ).toEqual([]);
   });
 
   it('every kind is HANDLED — a cache invalidator, or an explicit scene-reload kind', () => {

@@ -64,6 +64,33 @@ public class ModokiIapPlugin extends Plugin {
     private PluginCall awaitingPurchase;
     private String awaitingProductId;
 
+    /**
+     * Release the parked purchase slot for `call` and close its bridge lifecycle.
+     *
+     * ⚠️ MUST run BEFORE resolve/reject. `MessageHandler.sendResponseMessage` reads
+     * `isKeptAlive()` to decide whether to `release()` the call, and copies the same value into
+     * the response's `save` field — so clearing the flag afterwards changes nothing.
+     *
+     * The slot is only cleared if `call` still owns it, so a settle that lost a race cannot wipe
+     * a newer purchase's parking.
+     *
+     * ⚠️ On Android today the keep-alive is INERT rather than a leak, and #514 was filed on the
+     * opposite reading — do not re-diagnose it. `Bridge.callPluginMethod` saves a call only if it
+     * is kept-alive at the moment the plugin METHOD RETURNS (Bridge.java:842-845), and this call
+     * is parked several async hops later, so it never reaches `savedCalls`; `native-bridge.js`
+     * deletes a promise call's JS callback on settle whatever `save` says. This exists because
+     * the lifecycle should be closed where the call is settled — and because the day someone
+     * parks synchronously (a ProductDetails cache would do it), the flag stops being inert and
+     * every settle path here is already correct.
+     */
+    private void unpark(PluginCall call) {
+        if (awaitingPurchase == call) {
+            awaitingPurchase = null;
+            awaitingProductId = null;
+        }
+        call.setKeepAlive(false);
+    }
+
     private final PurchasesUpdatedListener purchasesUpdatedListener = (billingResult, purchases) -> {
         int code = billingResult.getResponseCode();
         Log.i(TAG, "onPurchasesUpdated: code=" + code + " msg=" + billingResult.getDebugMessage()
@@ -73,7 +100,7 @@ public class ModokiIapPlugin extends Plugin {
 
         if (code == BillingClient.BillingResponseCode.USER_CANCELED) {
             if (call != null) {
-                awaitingPurchase = null;
+                unpark(call);
                 JSObject r = new JSObject();
                 r.put("transaction", JSObject.NULL);
                 call.resolve(r);
@@ -83,7 +110,7 @@ public class ModokiIapPlugin extends Plugin {
 
         if (code != BillingClient.BillingResponseCode.OK || purchases == null) {
             if (call != null) {
-                awaitingPurchase = null;
+                unpark(call);
                 rejectWithBilling(call, "purchase failed: " + billingResult.getDebugMessage(), billingResult);
             }
             return;
@@ -130,8 +157,7 @@ public class ModokiIapPlugin extends Plugin {
             // Leaving it parked is safe: a genuine cancel arrives as USER_CANCELED above, and a
             // genuine failure as the non-OK branch — both of which do clear the slot.
             if (match != null) {
-                awaitingPurchase = null;
-                awaitingProductId = null;
+                unpark(call);
                 JSObject r = new JSObject();
                 r.put("transaction", serialize(match));
                 call.resolve(r);
@@ -473,7 +499,7 @@ public class ModokiIapPlugin extends Plugin {
                         BillingFlowParams.newBuilder().setProductDetailsParamsList(flow).build()
                     );
                     if (launch.getResponseCode() != BillingClient.BillingResponseCode.OK) {
-                        awaitingPurchase = null;
+                        unpark(call);
                         rejectWithBilling(call, "could not open the purchase sheet: " + launch.getDebugMessage(), launch);
                     }
                 }

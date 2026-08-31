@@ -94,6 +94,25 @@ fabricate a `ManagerContext` that is then ignored (#37). `TimeManager` and `Navi
 both do this. The registry is unaffected — it keeps calling through `ManagerDef` and keeps
 passing a real `ctx`.
 
+**`init` may return a promise, but no shipped manager does.** `disposeActiveSceneManagers`/
+`disposeActiveGameManagers` track a returned promise (`Entry.initPromise`) and await it before
+disposing, so an in-flight init is never torn down half-finished, and `initSceneManagersFor`/
+`initGameManagersFor` await it too, so `loadScene` doesn't resolve until init settles. That
+ordering has **no producer today**: every engine manager (`TimeManager`, `NavigationManager`,
+`physics2DEventsManager`, `physics3DEventsManager`, `zone2DEventsManager`,
+`zone3DEventsManager`, `timelineEventsManager`, `inputSourcesManager`) is synchronous, and the
+two managers doing real async work — `games/chess/runtime/ChessManager.ts` and
+`games/llm-test/runtime/LLMManager.ts` — declare `init(): void` and fire-and-forget
+(`void this.initLLM()`) *deliberately*: returning that promise would block `loadScene` on an LLM
+model download. So a manager that fires-and-forgets its async work is invisible to the dispose
+ordering above — the registry has no way to know it's still initializing — and if it holds
+world-bound state, its own async continuation must re-check "is my activation still current"
+before touching that state, since a scene swap mid-flight can dispose it without waiting.
+`disposeActiveSceneManagers`/`disposeActiveGameManagers` also each snapshot which activation of
+an entry they own (`Entry.activationId`) before awaiting any pending init, so a manager
+(re)activated *during* that await — belonging to the incoming scene/game — isn't swept into the
+outgoing scene's/game's teardown (#487 item 5).
+
 ### Scope: three tiers — scene by default, game and app opt-in
 
 Scene-default makes the safe choice the default — a Manager's state can't leak

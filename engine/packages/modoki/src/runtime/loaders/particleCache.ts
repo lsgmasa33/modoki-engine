@@ -22,6 +22,15 @@ const unknownGuidSeen = new Set<string>();
 // meshTemplateCache's cacheGeneration). A fetch that resolves after a scene
 // swap must not repopulate the cache or re-register a stale guid→path mapping.
 let generation = 0;
+/** Per-PATH invalidation epoch, checked alongside `generation` by every in-flight load.
+ *
+ *  `generation` is module-wide and belongs to `clearParticleCache` (the whole cache is gone). A
+ *  per-key `invalidateParticleEffect` must NOT refuse an in-flight load of a DIFFERENT key: this
+ *  cache is driven by the editor's file watcher, so an author saving one effect would otherwise
+ *  make a concurrent load of an unrelated effect silently drop it. Cleared wholesale by
+ *  `clearParticleCache`, so it cannot outgrow the cache it shadows. */
+const keyEpoch = new Map<string, number>();
+const epochOf = (path: string): number => keyEpoch.get(path) ?? 0;
 
 /** Migrate a legacy collision config (infinite horizontal plane at `planeY`, no `shape`)
  *  to the explicit `plane` collider so old assets upgrade on their next save. */
@@ -119,14 +128,16 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const gen = generation; // capture to detect a cache clear during the async load
+    const ep = epochOf(path); // capture to detect a per-key invalidation during the async load
     const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
       .then((r) => {
         return parseAssetJson(r, path);
       })
       .then((json) => {
-        // A scene swap (clearParticleCache) happened mid-flight: drop the result
-        // so we don't repopulate a stale path or re-register an old guid→path.
-        if (gen !== generation) return;
+        // A scene swap (clearParticleCache) or a per-key invalidation of THIS path happened
+        // mid-flight: drop the result so we don't repopulate a stale path or re-register an
+        // old guid→path.
+        if (gen !== generation || ep !== epochOf(path)) return;
         // An editor live-preview edit (setParticleEffect) landed while we were
         // fetching: it already seeded the cache, so don't clobber it with disk.
         if (cache.has(path)) return;
@@ -138,7 +149,7 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
         cache.set(path, normalizeParticleDef(json as Partial<ParticleEffectDef>));
       })
       .catch((e) => {
-        if (gen === generation) failed.add(path);
+        if (gen === generation && ep === epochOf(path)) failed.add(path);
         console.warn(`[particleCache] failed to load ${path}:`, e);
       })
       .finally(() => loading.delete(path));
@@ -169,6 +180,12 @@ export function setParticleEffect(refOrPath: string, def: ParticleEffectDef): vo
 export function invalidateParticleEffect(refOrPath: string): void {
   const path = particleCacheKey(refOrPath);
   if (!path) return;
+  // An in-flight load is carrying the PRE-import bytes — refuse it, or it re-caches the stale def
+  // on top of the fresh one. Precedent: fontLoader.invalidateFontFace. Bumped PER-KEY (not the
+  // module-wide `generation`, which is `clearParticleCache`'s): this cache is driven by the
+  // editor's file watcher, so invalidating one effect must not also refuse an in-flight load of a
+  // DIFFERENT effect.
+  keyEpoch.set(path, epochOf(path) + 1);
   cache.delete(path);
   failed.delete(path);
   loading.delete(path);
@@ -179,6 +196,7 @@ export function invalidateParticleEffect(refOrPath: string): void {
  *  repopulating the cache. Particle defs are plain data — nothing to GPU-dispose. */
 export function clearParticleCache(): void {
   generation++;
+  keyEpoch.clear();
   cache.clear();
   loading.clear();
   failed.clear();

@@ -5,6 +5,8 @@ import {
 } from '../../src/runtime/loaders/animSetCache';
 import { clearManifest, newGuid } from '../../src/runtime/loaders/assetManifest';
 
+const flush = () => new Promise((r) => setTimeout(r, 0));
+
 // The cache lazily fetches on a miss. Stub fetch so a cold lookup is deterministic
 // (rejects) instead of hitting the network; the seed path (setAnimSet) needs no fetch.
 beforeEach(() => {
@@ -103,5 +105,55 @@ describe('animSetCache lazy fetch', () => {
     expect(resolveAnimSetParams('run.animset.json', 'Run')).toEqual({
       speed: 1.25, loop: true, fadeDuration: 0,
     });
+  });
+});
+
+describe('animSetCache — invalidateAnimSet mid-flight bumps generation (#487 item 8)', () => {
+  it('refuses a fetch that resolves with the OLD def AFTER invalidateAnimSet ran mid-flight', async () => {
+    let resolveOld: (v: unknown) => void = () => {};
+    const fetchMock = vi.fn(() => new Promise((r) => { resolveOld = r; }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    expect(getAnimSet('race.animset.json')).toBeNull(); // kicks off the in-flight load
+    invalidateAnimSet('race.animset.json');               // re-import lands mid-flight — must bump generation
+
+    const stale = { id: 'stale', clips: [{ name: 'Stale' }] };
+    resolveOld({ ok: true, text: () => Promise.resolve(JSON.stringify(stale)), json: () => Promise.resolve(stale) } as any);
+    await flush();
+
+    // No `{load:false}` peek exists on this cache (unlike its siblings) — prove the cache is
+    // genuinely EMPTY, not merely holding something that happens to look absent, by resolving a
+    // SECOND, FRESH fetch and confirming that's what wins: a populated cache would answer from
+    // it and never start fetch #2 at all.
+    const fresh = { id: 'fresh', clips: [{ name: 'Fresh' }] };
+    fetchMock.mockImplementationOnce(() => Promise.resolve({ ok: true, text: () => Promise.resolve(JSON.stringify(fresh)), json: () => Promise.resolve(fresh) } as any));
+    expect(getAnimSet('race.animset.json')).toBeNull(); // still cold → kicks fetch #2
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(getAnimSet('race.animset.json')?.id).toBe('fresh'));
+  });
+
+  it('keep-direction: with no invalidation in between, the same load still caches normally', async () => {
+    const def = { id: 'ok', clips: [{ name: 'Ok' }] };
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, text: () => Promise.resolve(JSON.stringify(def)), json: () => Promise.resolve(def) } as any)));
+    expect(getAnimSet('keep.animset.json')).toBeNull();
+    await vi.waitFor(() => expect(getAnimSet('keep.animset.json')?.id).toBe('ok'));
+  });
+
+  // THE DECISIVE case (#499): `generation` is module-wide, so a per-key `invalidateAnimSet` that
+  // bumped it would refuse every OTHER key's in-flight load too. Must FAIL against the
+  // module-wide-`generation++` version and PASS once invalidation is scoped per path.
+  it('invalidating an UNRELATED animset while A is in flight leaves A cacheable', async () => {
+    let resolveA: (v: unknown) => void = () => {};
+    const fetchMock = vi.fn(() => new Promise((r) => { resolveA = r; }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    expect(getAnimSet('cross.a.animset.json')).toBeNull(); // kicks off A's load
+    invalidateAnimSet('cross.b.animset.json');               // UNRELATED path
+
+    const aDef = { id: 'a-def', clips: [{ name: 'A' }] };
+    resolveA({ ok: true, text: () => Promise.resolve(JSON.stringify(aDef)), json: () => Promise.resolve(aDef) } as any);
+    await vi.waitFor(() => expect(getAnimSet('cross.a.animset.json')?.id).toBe('a-def'));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1); // no spurious re-fetch of A
   });
 });

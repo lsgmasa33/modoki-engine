@@ -252,4 +252,135 @@ describe('managerRegistry', () => {
     expect(names.some((s) => s.startsWith('a'))).toBe(true);
     expect(names.some((s) => s.startsWith('b'))).toBe(true);
   });
+
+  // ── activation-token race (#487 item 5) ─────────────────────────────────────
+  // disposeActiveSceneManagers/disposeActiveGameManagers each await pending
+  // inits, THEN re-walk `managers.values()` deactivating every active entry of
+  // that scope. A manager activated DURING that await belongs to the INCOMING
+  // scene/game, not the outgoing one, and must not be swept up in it.
+
+  it('does not dispose a manager activated during the sweep\'s await (scene scope)', async () => {
+    const disposeSlow = vi.fn();
+    const disposeLate = vi.fn();
+    let resolveInit!: () => void;
+    const initGate = new Promise<void>((r) => { resolveInit = r; });
+
+    await initSceneManagersFor('/scenes/A.json');
+    registerManager({
+      name: 'slow',
+      init: async () => { await initGate; },
+      dispose: disposeSlow,
+    });
+
+    // Start disposing the outgoing scene's managers; 'slow' is mid-init.
+    const disposed = disposeActiveSceneManagers();
+
+    // While that dispose is awaiting, the INCOMING scene activates a second
+    // manager sharing the registry's Map — it must survive the sweep above.
+    await initSceneManagersFor('/scenes/B.json');
+    registerManager({ name: 'late', dispose: disposeLate });
+
+    resolveInit();
+    await disposed;
+
+    expect(disposeSlow).toHaveBeenCalledOnce();   // the outgoing manager IS disposed
+    expect(disposeLate).not.toHaveBeenCalled();   // the incoming one is NOT
+    expect(getRegisteredManagers().find((s) => s.startsWith('late'))).toContain('active');
+  });
+
+  it('still waits for the async init to settle before disposing (keep direction)', async () => {
+    const order: string[] = [];
+    let resolveInit!: () => void;
+    const initGate = new Promise<void>((r) => { resolveInit = r; });
+
+    await initSceneManagersFor('/scenes/A.json');
+    registerManager({
+      name: 'slow',
+      init: async () => { await initGate; order.push('init-done'); },
+      dispose: () => { order.push('dispose'); },
+    });
+
+    const disposed = disposeActiveSceneManagers();
+    resolveInit();
+    await disposed;
+
+    expect(order).toEqual(['init-done', 'dispose']); // dispose never precedes init
+  });
+
+  it('does not dispose a manager activated during the sweep\'s await (game scope)', async () => {
+    const disposeSlow = vi.fn();
+    const disposeLate = vi.fn();
+    let resolveInit!: () => void;
+    const initGate = new Promise<void>((r) => { resolveInit = r; });
+
+    await initGameManagersFor('space-console', '/games/space-console/scenes/Station.json');
+    registerManager({
+      name: 'slow-g',
+      scope: 'game',
+      init: async () => { await initGate; },
+      dispose: disposeSlow,
+    });
+
+    const disposed = disposeActiveGameManagers();
+
+    await initGameManagersFor('chess', '/games/chess/scenes/chess.json');
+    registerManager({ name: 'late-g', scope: 'game', dispose: disposeLate });
+
+    resolveInit();
+    await disposed;
+
+    expect(disposeSlow).toHaveBeenCalledOnce();
+    expect(disposeLate).not.toHaveBeenCalled();
+    expect(getRegisteredManagers().find((s) => s.startsWith('late-g'))).toContain('active');
+  });
+
+  // ── activation-token re-use (SAME entry, not a new one) ─────────────────────
+  // The two tests above prove the OWNED-ARRAY snapshot excludes a brand-new
+  // entry activated during the await. They can't tell "the entry reference
+  // alone" from "the activation id" apart, because a new Entry never differs
+  // in id from what it was snapshotted with (it was never snapshotted at all).
+  // This one re-activates the SAME Entry object with a NEW activationId while
+  // the outer sweep is still suspended on an unrelated manager, so only the id
+  // comparison (not `entry.active` alone) can tell the two activations apart.
+
+  it('does not dispose a re-activated entry whose sweep already fired once (activationId)', async () => {
+    const disposeE = vi.fn();
+    let resolveFInit!: () => void;
+    const fGate = new Promise<void>((r) => { resolveFInit = r; });
+
+    await initSceneManagersFor('/scenes/A.json');
+    registerManager({ name: 'e', dispose: disposeE }); // sync init -> settles immediately
+    registerManager({ name: 'f', init: () => fGate }); // keeps the outer sweep suspended
+
+    // Outer sweep: snapshots [e, idA] and [f, idF], then awaits both. 'f' never
+    // settles until resolveFInit() below, so this stays suspended for the rest
+    // of the test.
+    const outerSweep = disposeActiveSceneManagers();
+
+    // Drop 'f' from the registry entirely (its own dispose() runs synchronously
+    // — deactivate() never waits on a pending init). The outer sweep's `pending`
+    // still holds the ORIGINAL fGate promise object, so it stays suspended.
+    unregisterManager('f');
+
+    // A full, non-suspending cycle on the SAME 'e' Entry: by now 'e' has nothing
+    // pending (its sync init already settled), and 'f' is gone from the map, so
+    // this dispose call finds nothing to await and runs to completion
+    // synchronously — disposing 'e' for real (idA still matches) and clearing
+    // `active`.
+    disposeActiveSceneManagers();
+    expect(disposeE).toHaveBeenCalledOnce();
+
+    // Re-activate the SAME Entry object for the incoming scene: a NEW
+    // activationId, same identity.
+    await initSceneManagersFor('/scenes/B.json');
+    expect(getRegisteredManagers().find((s) => s.startsWith('e'))).toContain('active');
+
+    // Let the outer sweep resume: it still holds 'e' at the OLD activationId.
+    resolveFInit();
+    await outerSweep;
+
+    // The outer sweep must not have torn down the incoming scene's 'e'.
+    expect(disposeE).toHaveBeenCalledOnce();
+    expect(getRegisteredManagers().find((s) => s.startsWith('e'))).toContain('active');
+  });
 });

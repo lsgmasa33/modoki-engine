@@ -15,6 +15,7 @@ import {
   playHaptic, configureHaptics, setHapticBackend, disposeHaptics,
   registerHapticPatterns, clearHapticPatterns, resolveHapticPattern, hapticPatternNames,
   ENGINE_HAPTIC_PATTERNS, NoopHapticBackend, cancelPendingHaptics,
+  hapticLatencySamples, clearHapticLatency,
   type HapticBackend, type HapticPreset,
 } from '@modoki/engine/runtime';
 import { createTestWorld, registerHapticControls, HapticSettings } from '@modoki/engine/runtime';
@@ -220,6 +221,54 @@ describe('the journal event — the only headless verification route', () => {
  *  handler expected an object) and stay green: authoring a pattern silently played `'select'`,
  *  and `haptics.set` did nothing at all. Found 2026-08-11 building the neighbouring `quality.set`.
  *  Dispatch through the registry with the shapes bindings.ts really delivers, or this rots again. */
+/** A backend whose `play` doesn't resolve until the test says so — models a bridge round-trip a
+ *  teardown/backend-swap can land inside. */
+class DeferredBackend implements HapticBackend {
+  readonly canVibrate = true;
+  release!: () => void;
+  private readonly gate = new Promise<void>((r) => { this.release = r; });
+  async play(_preset: HapticPreset): Promise<void> { await this.gate; }
+}
+
+describe('bridge-latency samples are scoped to a backend session', () => {
+  // fire()'s success handler resolves on the far side of the bridge round-trip. If a teardown or
+  // backend swap lands while that round-trip is still in flight, the resumed handler must not push
+  // a sample measured through a session nobody is scoring any more.
+  beforeEach(() => clearHapticLatency());
+
+  it('drops the sample if disposeHaptics() lands before the bridge call resolves', async () => {
+    const deferred = new DeferredBackend();
+    setHapticBackend(deferred);
+    playHaptic('impact.light');
+    disposeHaptics();
+    deferred.release();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(hapticLatencySamples()).toEqual([]);
+  });
+
+  it('drops the sample if setHapticBackend() swaps backends before it resolves', async () => {
+    const deferred = new DeferredBackend();
+    setHapticBackend(deferred);
+    playHaptic('impact.light');
+    setHapticBackend(new RecordingBackend());
+    deferred.release();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(hapticLatencySamples()).toEqual([]);
+  });
+
+  it('KEEP direction: with no teardown in between, the sample IS recorded', async () => {
+    const deferred = new DeferredBackend();
+    setHapticBackend(deferred);
+    playHaptic('impact.light');
+    deferred.release();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(hapticLatencySamples()).toHaveLength(1);
+  });
+});
+
 describe('the declarative actions (hapticControls)', () => {
   beforeEach(() => {
     registerHapticControls();

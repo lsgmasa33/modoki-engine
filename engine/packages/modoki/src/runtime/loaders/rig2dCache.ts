@@ -44,6 +44,15 @@ const sourceCache = new Map<string, Rig2DFile>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
 let generation = 0;
+/** Per-PATH invalidation epoch, checked alongside `generation` by every in-flight load.
+ *
+ *  `generation` is module-wide and belongs to `clearRig2DCache` (the whole cache is gone). A
+ *  per-key `invalidateRig2D` must NOT refuse an in-flight load of a DIFFERENT key: this cache is
+ *  driven by the editor's file watcher, so an author saving one rig would otherwise make a
+ *  concurrent load of an unrelated rig silently drop it. Cleared wholesale by `clearRig2DCache`,
+ *  so it cannot outgrow the cache it shadows. */
+const keyEpoch = new Map<string, number>();
+const epochOf = (path: string): number => keyEpoch.get(path) ?? 0;
 // Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here.
 const unknownGuidSeen = new Set<string>();
 
@@ -71,12 +80,13 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const gen = generation;
+    const ep = epochOf(path);
     const p = fetch(assetUrl(path))
       .then((r) => {
         return parseAssetJson(r, path);
       })
       .then((json) => {
-        if (gen !== generation) return;       // scene swap mid-flight
+        if (gen !== generation || ep !== epochOf(path)) return; // scene swap or per-key invalidation mid-flight
         if (cache.has(path)) return;          // editor live-preview seeded it
         const id = (json as Rig2DFile)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'rig2d');
@@ -84,7 +94,7 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
         cache.set(path, normalizeRig2D(json as Rig2DFile));
       })
       .catch((e) => {
-        if (gen === generation) failed.add(path);
+        if (gen === generation && ep === epochOf(path)) failed.add(path);
         console.warn(`[rig2dCache] failed to load ${path}:`, e);
       })
       .finally(() => loading.delete(path));
@@ -117,6 +127,12 @@ export function setRig2D(refOrPath: string, def: Rig2DFile): void {
 export function invalidateRig2D(refOrPath: string): void {
   const path = rig2dCacheKey(refOrPath);
   if (!path) return;
+  // An in-flight load is carrying the PRE-import bytes — refuse it, or it re-caches the stale def
+  // on top of the fresh one. Precedent: fontLoader.invalidateFontFace. Bumped PER-KEY (not the
+  // module-wide `generation`, which is `clearRig2DCache`'s): this cache is driven by the editor's
+  // file watcher, so invalidating one rig must not also refuse an in-flight load of a DIFFERENT
+  // rig.
+  keyEpoch.set(path, epochOf(path) + 1);
   cache.delete(path);
   sourceCache.delete(path);
   failed.delete(path);
@@ -126,6 +142,7 @@ export function invalidateRig2D(refOrPath: string): void {
 /** Drop ALL cached rigs (scene swap / full resource disposal / test teardown). */
 export function clearRig2DCache(): void {
   generation++;
+  keyEpoch.clear();
   cache.clear();
   sourceCache.clear();
   loading.clear();

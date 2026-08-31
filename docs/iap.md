@@ -485,6 +485,17 @@ someone re-attaches it and unknowingly tests against a stale product list.
   fails.
 - **One `BillingClient`, ever.** Building one per call produced four concurrent clients at boot; the
   plugin holds a single client with queued callers and reconnects rather than replacing.
+- **The `purchase()` call is parked, not answered directly** — Play reports the outcome through
+  `purchasesUpdatedListener`, not through `launchBillingFlow`'s return, so `purchase()` stashes the
+  call in `awaitingPurchase`/`awaitingProductId` and marks it `setKeepAlive(true)`. Every one of the
+  four places that can settle it (cancel, a non-OK/null delivery, a matched delivery, a launch
+  failure) routes through one `unpark()` helper, which clears both fields and the keep-alive flag
+  together, before resolve/reject. **Invariant: a settle path never touches `awaitingPurchase`,
+  `awaitingProductId`, or `setKeepAlive` directly — always through `unpark()`.** ⚠️ On Android today
+  that keep-alive flag is inert rather than a leak (`Bridge.java` only saves a kept-alive call at
+  the moment the plugin method *returns*, and this call is parked several async hops later) — #514
+  was filed on the opposite reading; see the docblock on `unpark()` for the full trace through
+  Capacitor's bridge.
 - Release builds swallow JS console logs unless `loggingBehavior: "production"` is set.
 
 **`games/iap-test`'s upload history**, so a later reader can date a device behaviour to a build:

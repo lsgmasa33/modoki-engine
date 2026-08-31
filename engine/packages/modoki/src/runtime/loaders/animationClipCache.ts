@@ -15,6 +15,15 @@ const cache = new Map<string, AnimationClipDef>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
 let generation = 0;
+/** Per-PATH invalidation epoch, checked alongside `generation` by every in-flight load.
+ *
+ *  `generation` is module-wide and belongs to `clearAnimationClipCache` (the whole cache is gone).
+ *  A per-key `invalidateAnimationClip` must NOT refuse an in-flight load of a DIFFERENT key: this
+ *  cache is driven by the editor's file watcher, so an author saving one clip would otherwise make
+ *  a concurrent load of an unrelated clip silently drop it. Cleared wholesale by
+ *  `clearAnimationClipCache`, so it cannot outgrow the cache it shadows. */
+const keyEpoch = new Map<string, number>();
+const epochOf = (path: string): number => keyEpoch.get(path) ?? 0;
 
 // `runtime/animation/**` had ZERO console.warn calls for an unresolved ref, unlike its 3D
 // (`[MeshCache] Unknown asset guid: …`) and 2D-sprite siblings — an Animator whose bank
@@ -46,19 +55,20 @@ export function getAnimationClip(ref: string, opts?: { load?: boolean }): Animat
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const gen = generation;
+    const ep = epochOf(path);
     const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
       .then((r) => {
         return parseAssetJson(r, path);
       })
       .then((json) => {
-        if (gen !== generation) return;       // scene swap mid-flight
+        if (gen !== generation || ep !== epochOf(path)) return; // scene swap or per-key invalidation mid-flight
         if (cache.has(path)) return;          // editor live-preview seeded it
         const id = (json as Partial<AnimationClipDef>)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'animation');
         cache.set(path, normalizeAnimationClip(json as Partial<AnimationClipDef>));
       })
       .catch((e) => {
-        if (gen === generation) failed.add(path);
+        if (gen === generation && ep === epochOf(path)) failed.add(path);
         console.warn(`[animationClipCache] failed to load ${path}:`, e);
       })
       .finally(() => loading.delete(path));
@@ -79,6 +89,12 @@ export function setAnimationClip(refOrPath: string, def: AnimationClipDef): void
 export function invalidateAnimationClip(refOrPath: string): void {
   const path = clipCacheKey(refOrPath);
   if (!path) return;
+  // An in-flight load is carrying the PRE-import bytes — refuse it, or it re-caches the stale def
+  // on top of the fresh one. Precedent: fontLoader.invalidateFontFace. Bumped PER-KEY (not the
+  // module-wide `generation`, which is `clearAnimationClipCache`'s): this cache is driven by the
+  // editor's file watcher, so invalidating one clip must not also refuse an in-flight load of a
+  // DIFFERENT clip.
+  keyEpoch.set(path, epochOf(path) + 1);
   cache.delete(path);
   failed.delete(path);
   loading.delete(path);
@@ -87,6 +103,7 @@ export function invalidateAnimationClip(refOrPath: string): void {
 /** Drop ALL cached clips (scene swap / full resource disposal). */
 export function clearAnimationClipCache(): void {
   generation++;
+  keyEpoch.clear();
   cache.clear();
   loading.clear();
   failed.clear();

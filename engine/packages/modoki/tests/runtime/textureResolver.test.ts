@@ -368,6 +368,65 @@ describe('shared texture cache (F3 — dedup + refcount)', () => {
     expect(url).toContain(PATH + '~uastc.ktx2');
     ktxSpy.mockRestore();
   });
+
+  // #487 item 7 — a still-loading entry evicted by invalidateTexture retires itself lazily,
+  // once its promise resolves (see the `retired` docblock). If a FULL teardown
+  // (`disposeAllSharedTextures`) runs in the gap, it disposes+clears `retired` before that late
+  // resolve fires — the resolve then re-inserted the texture into the map the teardown just
+  // emptied: not merely stale, a straight GPU leak, since NOTHING (no material, no refcount)
+  // will ever call `releaseTexture3D` on it again.
+  describe('invalidateTexture racing a full teardown (in-flight load retired late, #487 item 7)', () => {
+    it('a load still pending at teardown time disposes on late resolve instead of resurrecting `retired`', async () => {
+      registerAsset(GUID, PATH, 'texture');
+      let resolveLoad!: (t: THREE.Texture) => void;
+      loadAsyncSpy.mockImplementationOnce(() => new Promise<THREE.Texture>((res) => { resolveLoad = res; }) as never);
+
+      const pending = loadTexture3D(GUID); // starts the load; entry.texture stays null
+      // loadTexture3D reaches loadAsync only after the (already-resolved) caps gate's `.then`
+      // chain — flush those microtasks so `resolveLoad` is actually assigned before we race it.
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      const remove = vi.spyOn(THREE.Cache, 'remove').mockImplementation(() => {});
+      invalidateTexture(GUID); // in-flight branch: evicted from texCache, queued to retire on resolve
+      remove.mockRestore();
+
+      disposeAllSharedTextures(); // full teardown runs BEFORE the load resolves
+      expect(getSharedTextureStats()).toEqual({ count: 0, refs: 0 });
+
+      const tex = new THREE.Texture();
+      const disp = vi.spyOn(tex, 'dispose');
+      resolveLoad(tex);
+      await pending;
+      await Promise.resolve(); // flush the `.then` that runs the late-retire/dispose logic
+
+      expect(disp).toHaveBeenCalledTimes(1);              // disposed, not resurrected
+      expect(getSharedTextureStats()).toEqual({ count: 0, refs: 0 }); // still zero — nothing came back
+    });
+
+    it('KEEP: with no teardown in between, a late resolve still retires normally and the refcount frees it', async () => {
+      registerAsset(GUID, PATH, 'texture');
+      let resolveLoad!: (t: THREE.Texture) => void;
+      loadAsyncSpy.mockImplementationOnce(() => new Promise<THREE.Texture>((res) => { resolveLoad = res; }) as never);
+
+      const pending = loadTexture3D(GUID);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      const remove = vi.spyOn(THREE.Cache, 'remove').mockImplementation(() => {});
+      invalidateTexture(GUID);
+      remove.mockRestore();
+
+      const tex = new THREE.Texture();
+      const disp = vi.spyOn(tex, 'dispose');
+      resolveLoad(tex);
+      await pending;
+      await Promise.resolve(); // flush the late-retire `.then`
+
+      expect(disp).not.toHaveBeenCalled();                // retired, not disposed — still "live"
+      expect(getSharedTextureStats()).toEqual({ count: 1, refs: 1 }); // retired-but-referenced
+
+      releaseTexture3D(tex); // the one outstanding ref (from the original loadTexture3D call)
+      expect(disp).toHaveBeenCalledTimes(1);
+      expect(getSharedTextureStats()).toEqual({ count: 0, refs: 0 });
+    });
+  });
 });
 
 describe('getTextureSettings', () => {

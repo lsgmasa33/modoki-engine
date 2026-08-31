@@ -75,6 +75,7 @@ import {
   invalidateParticleEffect,
   invalidateSpriteAnim,
   invalidateRig2D,
+  invalidateAnimSet,
   findEntityByGuid,
   getCachedPrefab,
   getAllAssets,
@@ -2037,7 +2038,7 @@ const handleOp = runAgentOp;
  *  in `engine/plugins/vite-asset-scanner.ts` (the producer) — kept as a local union rather than
  *  a type import because the plugin is a Node module and the app tsconfig has no node types.
  *  Keep the two in sync; a new kind that lands here without a branch below is simply ignored. */
-type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d';
+type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset';
 
 /**
  * Kinds whose ONLY stale thing is a cached asset definition → drop that entry and stop. Never a
@@ -2062,6 +2063,11 @@ const ASSET_CACHE_INVALIDATORS: Partial<Record<SceneChangedKind, (urlPath: strin
   particle: invalidateParticleEffect,
   spriteanim: invalidateSpriteAnim,
   rig2d: invalidateRig2D,
+  // Sixth, and a different shape from the five: `invalidateAnimSet` was never callerless — the
+  // Inspector's AnimSetAssetView drives it — so only EXTERNAL writes were unserved. That is why
+  // `liveReloadKinds.test.ts` stayed green through it: `animset` was missing from BOTH unions, so
+  // the cross-check agreed with itself. `invalidatorsAreReachable.test.ts` asks from the other end.
+  animset: invalidateAnimSet,
 };
 
 /** The file on disk for `urlPath` just changed, so its cached def is being dropped — any

@@ -39,6 +39,15 @@ const cache = new Map<string, SpriteAnimDef>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
 let generation = 0;
+/** Per-PATH invalidation epoch, checked alongside `generation` by every in-flight load.
+ *
+ *  `generation` is module-wide and belongs to `clearSpriteAnimCache` (the whole cache is gone). A
+ *  per-key `invalidateSpriteAnim` must NOT refuse an in-flight load of a DIFFERENT key: this cache
+ *  is driven by the editor's file watcher, so an author saving one sprite-anim set would otherwise
+ *  make a concurrent load of an unrelated set silently drop it. Cleared wholesale by
+ *  `clearSpriteAnimCache`, so it cannot outgrow the cache it shadows. */
+const keyEpoch = new Map<string, number>();
+const epochOf = (path: string): number => keyEpoch.get(path) ?? 0;
 // Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here.
 const unknownGuidSeen = new Set<string>();
 
@@ -93,19 +102,20 @@ export function getSpriteAnim(ref: string, opts?: { load?: boolean }): SpriteAni
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const gen = generation;
+    const ep = epochOf(path);
     const p = fetch(assetUrl(path))
       .then((r) => {
         return parseAssetJson(r, path);
       })
       .then((json) => {
-        if (gen !== generation) return;       // scene swap mid-flight
+        if (gen !== generation || ep !== epochOf(path)) return; // scene swap or per-key invalidation mid-flight
         if (cache.has(path)) return;          // editor live-preview seeded it
         const id = (json as Partial<SpriteAnimDef>)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'spriteanim');
         cache.set(path, normalizeSpriteAnim(json as Partial<SpriteAnimDef>));
       })
       .catch((e) => {
-        if (gen === generation) failed.add(path);
+        if (gen === generation && ep === epochOf(path)) failed.add(path);
         console.warn(`[spriteAnimCache] failed to load ${path}:`, e);
       })
       .finally(() => loading.delete(path));
@@ -151,6 +161,12 @@ export function setSpriteAnim(refOrPath: string, def: Partial<SpriteAnimDef>): v
 export function invalidateSpriteAnim(refOrPath: string): void {
   const path = spriteAnimCacheKey(refOrPath);
   if (!path) return;
+  // An in-flight load is carrying the PRE-import bytes — refuse it, or it re-caches the stale def
+  // on top of the fresh one. Precedent: fontLoader.invalidateFontFace. Bumped PER-KEY (not the
+  // module-wide `generation`, which is `clearSpriteAnimCache`'s): this cache is driven by the
+  // editor's file watcher, so invalidating one set must not also refuse an in-flight load of a
+  // DIFFERENT set.
+  keyEpoch.set(path, epochOf(path) + 1);
   cache.delete(path);
   failed.delete(path);
   loading.delete(path);
@@ -159,6 +175,7 @@ export function invalidateSpriteAnim(refOrPath: string): void {
 /** Drop ALL cached sets (scene swap / full resource disposal). */
 export function clearSpriteAnimCache(): void {
   generation++;
+  keyEpoch.clear();
   cache.clear();
   loading.clear();
   failed.clear();

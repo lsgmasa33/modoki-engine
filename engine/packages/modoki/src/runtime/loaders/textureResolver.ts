@@ -423,6 +423,16 @@ const texCache = new Map<string, TexCacheEntry>();
  *  decrement the NEW entry and dispose a texture that is very much in use. */
 const retired = new Map<THREE.Texture, TexCacheEntry>();
 
+/** Bumped by `disposeAllSharedTextures`. Exists because an `invalidateTexture` eviction of a
+ *  still-loading entry retires it lazily — the load's `.then` runs whenever it resolves, which
+ *  can be AFTER a full teardown has already cleared `retired`. Without this, that late resolve
+ *  would re-insert into the cleared map a texture nothing will ever call `releaseTexture3D` on
+ *  (its material is gone too) — worse than a stale entry, a GPU leak invisible to
+ *  `getSharedTextureStats()` right after the teardown that was supposed to zero it.
+ *  ⚠️ `disposeAllSharedTextures` has no production caller today (only the `runtime/index.ts`
+ *  barrel re-export and tests) — this guards the MECHANISM, not an observed device leak. */
+let sharedTextureGeneration = 0;
+
 function texCacheKey(url: string, isKtx: boolean, flipY?: boolean): string {
   // KTX2 is always bottom-origin (applyTextureSettings forces flipY=false), so flipY
   // doesn't differentiate the resulting texture there — keep those calls on ONE entry.
@@ -548,6 +558,9 @@ export function disposeAllSharedTextures(): void {
   // skipped them would leak exactly the textures an editor session re-imported.
   for (const t of retired.keys()) t.dispose();
   retired.clear();
+  // Bump AFTER clearing: any invalidateTexture eviction still in flight at this point
+  // must find the generation changed when it resolves (see the field's docblock).
+  sharedTextureGeneration++;
 }
 
 /** Drop the shared cache's textures for a ref's variants so a subsequent load
@@ -597,12 +610,22 @@ export function invalidateTexture(ref: string): void {
   // instance, and destroying it under the renderer is the use-after-free described on
   // `retired`. The last releaseTexture3D frees it — which arrives via disposeMaterial when the
   // material re-resolves, so the two invalidations are order-independent by construction.
+  const gen = sharedTextureGeneration;
   for (const [key, entry] of texCache) {
     if (!urls.has(entry.url)) continue;
     texCache.delete(key);
     if (entry.texture) retired.set(entry.texture, entry);
-    // Still loading: retire it once it resolves, or its refs could never be freed.
-    else entry.promise.then((t) => { retired.set(t, entry); }).catch(() => { /* load failed — nothing to free */ });
+    // Still loading: retire it once it resolves, or its refs could never be freed. But if
+    // `disposeAllSharedTextures` runs a FULL teardown before this resolves, `retired` has
+    // already been cleared and disposed — a live session never calls that mid-scene (see its
+    // docblock), so no material can still be binding this texture, and re-inserting it here
+    // would resurrect an entry the teardown intentionally emptied with nothing left to ever
+    // free it (a straight GPU leak). Dispose it instead: exactly what the teardown would have
+    // done to it had the load finished in time.
+    else entry.promise.then((t) => {
+      if (sharedTextureGeneration !== gen) { t.dispose(); return; }
+      retired.set(t, entry);
+    }).catch(() => { /* load failed — nothing to free */ });
   }
   // THREE.Cache holds decoded image bytes only when Cache.enabled (it isn't, today);
   // evict for parity in case it's ever turned on.

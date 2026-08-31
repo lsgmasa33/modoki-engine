@@ -59,6 +59,15 @@ const cache = new Map<string, AnimSetDef>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
 let generation = 0;
+/** Per-PATH invalidation epoch, checked alongside `generation` by every in-flight load.
+ *
+ *  `generation` is module-wide and belongs to `clearAnimSetCache` (the whole cache is gone). A
+ *  per-key `invalidateAnimSet` must NOT refuse an in-flight load of a DIFFERENT key: this cache is
+ *  driven by the editor's file watcher, so an author saving one animset would otherwise make a
+ *  concurrent load of an unrelated animset silently drop it. Cleared wholesale by
+ *  `clearAnimSetCache`, so it cannot outgrow the cache it shadows. */
+const keyEpoch = new Map<string, number>();
+const epochOf = (path: string): number => keyEpoch.get(path) ?? 0;
 // Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here,
 // same as animationClipCache before its fix.
 const unknownGuidSeen = new Set<string>();
@@ -86,19 +95,20 @@ export function getAnimSet(ref: string): AnimSetDef | null {
   if (failed.has(path)) return null;
   if (!loading.has(path)) {
     const gen = generation;
+    const ep = epochOf(path);
     const p = fetch(assetUrl(path))
       .then((r) => {
         return parseAssetJson(r, path);
       })
       .then((json) => {
-        if (gen !== generation) return;       // scene swap mid-flight
+        if (gen !== generation || ep !== epochOf(path)) return; // scene swap or per-key invalidation mid-flight
         if (cache.has(path)) return;          // editor live-preview seeded it
         const id = (json as Partial<AnimSetDef>)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'animset');
         cache.set(path, normalizeAnimSet(json as Partial<AnimSetDef>));
       })
       .catch((e) => {
-        if (gen === generation) failed.add(path);
+        if (gen === generation && ep === epochOf(path)) failed.add(path);
         console.warn(`[animSetCache] failed to load ${path}:`, e);
       })
       .finally(() => loading.delete(path));
@@ -141,6 +151,12 @@ export function setAnimSet(refOrPath: string, def: Partial<AnimSetDef>): void {
 export function invalidateAnimSet(refOrPath: string): void {
   const path = animSetCacheKey(refOrPath);
   if (!path) return;
+  // An in-flight load is carrying the PRE-import bytes — refuse it, or it re-caches the stale def
+  // on top of the fresh one. Precedent: fontLoader.invalidateFontFace. Bumped PER-KEY (not the
+  // module-wide `generation`, which is `clearAnimSetCache`'s): this cache is driven by the
+  // editor's file watcher, so invalidating one animset must not also refuse an in-flight load of
+  // a DIFFERENT animset.
+  keyEpoch.set(path, epochOf(path) + 1);
   cache.delete(path);
   failed.delete(path);
   loading.delete(path);
@@ -149,6 +165,7 @@ export function invalidateAnimSet(refOrPath: string): void {
 /** Drop ALL cached animsets (scene swap / full resource disposal). */
 export function clearAnimSetCache(): void {
   generation++;
+  keyEpoch.clear();
   cache.clear();
   loading.clear();
   failed.clear();
