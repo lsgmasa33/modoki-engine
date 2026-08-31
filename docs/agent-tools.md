@@ -143,8 +143,9 @@ your own registration call as well (as Court does) is belt-and-braces, not the o
 
 ## How they reach the agent — and why it is a poll
 
-The MCP server polls `/api/game-tools` (5s while a backend answers, 30s while none does) and
-sends the MCP `tools/list_changed` notification when the surface moves.
+The MCP server polls `/api/game-tools` (5s while a backend answers **or while any tool is still
+held**, 30s only once the surface is actually empty) and sends the MCP `tools/list_changed`
+notification when the surface moves.
 
 **A fetch at startup would not work**, and this is the load-bearing design point: the MCP server
 is spawned with the Claude *session*, while the editor is launched later and swapped between
@@ -154,8 +155,21 @@ session, and the tools would be permanently invisible.
 Two consequences worth knowing:
 
 - **Tools appear a few seconds after the editor opens**, not instantly.
-- **They are removed when the backend stops answering.** A tool that stayed advertised after its
-  editor was gone would answer 504 forever, which is worse than being absent.
+- **They are removed after 3 consecutive misses (~15s), not the first one** — a miss being *either*
+  a poll the backend does not answer *or* a 200 whose tool list has gone empty. Both happen during
+  the page reload a game `.ts` save triggers, so both get the grace; a **non-empty** change still
+  reconciles at once, because a changed schema must reach the client immediately. A tool that
+  stayed advertised after its editor was gone would answer 504 forever, which is worse than being
+  absent — but a single miss must not tear the surface down. **A project SWAP pays that same ~15s**:
+  the outgoing project's tools stay advertised until the grace expires, and a call to one in that
+  window is REFUSED by the renderer (the name is gone from its registry) rather than doing something
+  wrong. ⚠️ **Register a game's tools in ONE synchronous batch**, as Court and Wordweave both do —
+  the grace covers a shrink to *zero*, so a registry observed mid-population (tools split across an
+  `await` or two lifecycle points) would churn the surface on every reload. That grace exists
+  because a
+  teardown emits `tools/list_changed`, and `tools` renders first in the prompt-cache prefix, so it
+  invalidates the whole conversation cache: see
+  [mcp-response-budget.md](./mcp-response-budget.md) § "Definition surface under tool deferral".
 
 The poll compares a **fingerprint of the declarations**, not the registry's `version` counter
 alone. That counter is per-renderer and resets to 0 on the page reload that every game `.ts` save

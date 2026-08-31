@@ -430,6 +430,36 @@ entity-spec shape to `shapes.ts` that a future tool could reach for wrongly — 
 cleverness the `$ref`-avoidance comment above already warns against. One entity-spec shape, always
 the same wording, is worth more than 1,800 chars.
 
+## Definition surface under tool deferral (measured 2026-08-31)
+
+The section above states the definition surface is *"paid on every request rather than once per
+session."* **In Claude Code that premise is now false.** All 148 `modoki_*` + `device_*` tools
+arrive **deferred** — the client advertises names only and fetches a tool's schema on demand via
+tool search (the API's `defer_loading` + `tool_search_tool_*` mechanism). Schemas are appended when
+fetched, not swapped, so fetching one does not invalidate the cache.
+
+**Measured floor:** the 148 names cost **4,665 chars (~1.5-2.3k tokens)** against a **248,755-char**
+full surface (`modoki` 190,718 across 105 tools + `game-debug` 58,037 across 43). A session using
+ten tools pays roughly 9k, not 90k.
+
+**The premise still holds for Cursor and Codex CLI** — `npm run sync:agent-configs` hands them the
+byte-identical 3-server set (`.cursor/mcp.json`, `.codex/config.toml`), and neither is known to
+defer. **So the ledger's pin stays** — it guards the non-deferring clients, and this section is not
+a licence to let the surface grow.
+
+**Method + caveat:** measured with the same `StdioClientTransport` + `Client.listTools()` recipe as
+the section above; `chars/4` understates these payloads by 27-38% per that section's own finding, so
+the ~85-100k full-surface figure is an estimate with a stated method, not a measurement. No BPE
+tokenizer is installed on this machine and `count_tokens` is a billed API call.
+
+Plan: [mcp-definition-surface.md](./plans/mcp-definition-surface.md), issue #475. The larger cost is
+`tools/list` **churn** — the `tools` block renders first in the cache prefix, so changing it
+invalidates tools + system + the whole message history — not the surface's size. Measured
+2026-08-31: opening a project added 7 `court_*` tools to a live session's list and closing it
+removed them, so **every open, close and project swap costs one invalidation**. (The *reload* flap
+is by contrast rare — two sub-second route outages per game-code edit against a 5 s poll.) See the
+plan's measurement section before optimizing for size here.
+
 ## Open / deferred
 
 These were evaluated with real BPE-tokenizer figures and are **not implemented**. The

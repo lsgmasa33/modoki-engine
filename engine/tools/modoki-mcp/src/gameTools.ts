@@ -44,6 +44,22 @@ type ToolDecl = {
 const POLL_OK_MS = 5_000;
 const POLL_DOWN_MS = 30_000;
 
+/** Consecutive misses required before `removeAll()` fires — for EITHER of two doors: the backend
+ *  answering non-200, or a 200 that shrinks the tool list to empty. Both happen on a page reload
+ *  (game-code edit): the renderer goes down and back through a handful of polls, and while it is
+ *  back up but before `setup()` has run `registerCourtAgentTools()`, `/api/game-tools` answers 200
+ *  with `{tools: []}` — a SUCCESS carrying an empty surface, not an unreachable poll. Reacting on
+ *  the FIRST miss turns the blip into a `tools/list_changed` — and `tools` renders first in the
+ *  prompt-cache prefix, so that one notification invalidates the whole conversation cache.
+ *
+ *  ⚠️ ONE counter, shared by both doors — so this is 3 misses of either kind COMBINED, not 3 per
+ *  door: `504, 504, 200{tools:[]}` tears down on that first empty poll. That is deliberate. A
+ *  reload is ONE disturbance that can present through both doors as the renderer goes down and
+ *  comes back, and three consecutive unhealthy polls is the signal regardless of which door each
+ *  one used; separate counters would double the window for the mixed case, which is the common
+ *  one. Do not "fix" this into two counters without re-measuring a real reload. */
+const UNREACHABLE_GRACE_POLLS = 3;
+
 /** Rebuild a zod shape from the JSON declaration.
  *
  *  Returns null — refusing the WHOLE tool — on any param type it does not recognise, rather than
@@ -108,6 +124,9 @@ export function createGameToolSync(server: McpServer, ctx: ToolContext): GameToo
   let lastRefused: Record<string, string> = {};
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
+  /** Consecutive unreachable polls seen so far. Reset on any successful fetch, so the grace window
+   *  is always UNREACHABLE_GRACE_POLLS FULL polls, not a rolling count since the last teardown. */
+  let consecutiveFailures = 0;
 
   /** Tear the whole tail down.
    *
@@ -124,6 +143,27 @@ export function createGameToolSync(server: McpServer, ctx: ToolContext): GameToo
     lastPrint = '';
   }
 
+  /** Shared unreachable-poll handling for both exits below: count the failure, and only tear down
+   *  once the grace window is exhausted. Reports what is ACTUALLY still registered — during the
+   *  grace window the tools are still live, and `[]` would be a lie to a caller asking "what do I
+   *  have right now". */
+  function onUnreachable(): { reachable: boolean; registered: string[]; refused: Record<string, string> } {
+    consecutiveFailures++;
+    if (registered.size && consecutiveFailures >= UNREACHABLE_GRACE_POLLS) removeAll();
+    return { reachable: false, registered: [...registered.keys()], refused: lastRefused };
+  }
+
+  /** The shrink-to-zero twin of `onUnreachable()`: the backend answered — reliably 200, so this is
+   *  NOT an unreachable poll — but with no tools, while some are still registered. Shares the
+   *  counter and threshold so a genuine reload (`0 tools` sandwiched between real answers) gets the
+   *  same grace as a transport blip. Does not need the `registered.size &&` guard `onUnreachable()`
+   *  has: the call site already tested `registered.size > 0` before reaching here. */
+  function onTransientEmpty(): { reachable: boolean; registered: string[]; refused: Record<string, string> } {
+    consecutiveFailures++;
+    if (consecutiveFailures >= UNREACHABLE_GRACE_POLLS) removeAll();
+    return { reachable: true, registered: [...registered.keys()], refused: lastRefused };
+  }
+
   async function refresh(): Promise<{ reachable: boolean; registered: string[]; refused: Record<string, string> }> {
     const refused: Record<string, string> = {};
     let decls: ToolDecl[];
@@ -131,20 +171,28 @@ export function createGameToolSync(server: McpServer, ctx: ToolContext): GameToo
       const { status, body } = await ctx.call('/api/game-tools', undefined, 4_000);
       // No editor, an older editor without the route, or a renderer that is not up yet. All three
       // mean "no game tools right now", which is a normal state — not an error to report at every
-      // poll. Drop whatever we had so the advertised surface never outlives the editor that
-      // backed it: a tool that answers 504 forever is worse than one that is absent.
-      if (status !== 200 || !body || typeof body !== 'object') {
-        if (registered.size) removeAll();
-        return { reachable: false, registered: [], refused: lastRefused };
-      }
+      // poll. Once the grace window is exhausted, drop whatever we had so the advertised surface
+      // never outlives the editor that backed it: a tool that answers 504 forever is worse than
+      // one that is absent — but a single blip (a page reload) must not churn the tool list.
+      if (status !== 200 || !body || typeof body !== 'object') return onUnreachable();
       decls = Array.isArray((body as { tools?: unknown }).tools) ? ((body as { tools: ToolDecl[] }).tools) : [];
     } catch {
-      if (registered.size) removeAll();
-      return { reachable: false, registered: [], refused: lastRefused };
+      return onUnreachable();
     }
+
+    // A successful fetch — even one that turns out to have an unchanged fingerprint below — is
+    // proof the editor answered, so the grace window resets here rather than after the reconcile.
+    // But only on a TOOL-BEARING answer: resetting on an empty 200 too would defeat the very grace
+    // window `onTransientEmpty()` exists to give the shrink-to-zero transition below.
+    if (decls.length > 0) consecutiveFailures = 0;
 
     const print = fingerprint(decls);
     if (print === lastPrint) return { reachable: true, registered: [...registered.keys()], refused: lastRefused };
+
+    // A 200 with an empty tool list while some are still registered is the reload gap described
+    // above (setup() hasn't called registerCourtAgentTools() yet) — give it the same grace as an
+    // unreachable poll rather than tearing down immediately.
+    if (decls.length === 0 && registered.size > 0) return onTransientEmpty();
 
     // Reconcile wholesale rather than diffing. The surface is a handful of tools, and a
     // remove-then-add is the only way a CHANGED schema (same name, new params) actually reaches
@@ -212,13 +260,18 @@ export function createGameToolSync(server: McpServer, ctx: ToolContext): GameToo
     try {
       reachable = (await refresh()).reachable;
     } catch { /* a poll must never throw into the timer */ }
-    schedule(reachable ? POLL_OK_MS : POLL_DOWN_MS);
+    // Keep the fast cadence while tools are still held, even mid-grace-window, so a genuine
+    // recovery is prompt and the ~15s grace window stays ~15s rather than stretching toward 65s.
+    // Only back off once the surface is actually empty — nothing left to watch closely for.
+    schedule(reachable || registered.size ? POLL_OK_MS : POLL_DOWN_MS);
   }
 
   return {
     refresh,
     start: () => { stopped = false; schedule(0); },
-    stop: () => { stopped = true; if (timer) clearTimeout(timer); timer = null; removeAll(); },
+    // An explicit stop is not a poll failure — tear down immediately, and reset the grace counter
+    // so a later start() begins its own unreachable run from zero.
+    stop: () => { stopped = true; if (timer) clearTimeout(timer); timer = null; consecutiveFailures = 0; removeAll(); },
     active: () => [...registered.keys()],
   };
 }
