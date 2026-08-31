@@ -1230,13 +1230,19 @@ if (canUC3) {
     console.log(`set_selection selects by guid, read back via get_editor_state ✓ (entityId: ${st.selection.entityId})`);
   }, async () => {
     // Restore exactly what was selected before — an asset selection, an entity selection, or
-    // nothing (a bare call CLEARS the selection, per the tool's own contract note).
+    // nothing (a bare call CLEARS the selection, per the tool's own contract note). Checked, not
+    // ignored: if the previously-selected ids no longer resolve, the restore fails silently and
+    // the human's selection is left on the probe entity while the run still prints SMOKE OK.
+    let restore;
     if (before?.asset) {
-      await client.callTool({ name: 'modoki_set_selection', arguments: { asset: before.asset } });
+      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { asset: before.asset } });
     } else if (before?.entityIds?.length) {
-      await client.callTool({ name: 'modoki_set_selection', arguments: { entityIds: before.entityIds } });
+      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { entityIds: before.entityIds } });
     } else {
-      await client.callTool({ name: 'modoki_set_selection', arguments: {} });
+      restore = await client.callTool({ name: 'modoki_set_selection', arguments: {} });
+    }
+    if (restore.isError) {
+      console.warn(`  ⚠ set_selection cleanup failed to restore the prior selection: ${text(restore)}`);
     }
   });
 }
@@ -1256,45 +1262,55 @@ if (canUC3) {
 // So a stopped-only call proves NOTHING — it cannot tell a dead route from a stopped editor. This
 // case must run inside a PLAY window, where the two arms actually diverge. Do not "simplify" this
 // back to a stopped-only call.
-await withCleanup(async () => {
+{
+  // Preconditions read through the SKIPPED mechanism, not a throw — this case is LAST in a linear
+  // script with no top-level catch, so a thrown precondition here would skip client.close() too.
   const actions = JSON.parse(text(await client.callTool({ name: 'modoki_list_actions', arguments: {} })));
-  if (!Array.isArray(actions.actions) || actions.actions.length === 0) {
-    throw new Error(`list_actions returned no actions: ${JSON.stringify(actions)}`);
-  }
+  const missingActions = !Array.isArray(actions.actions) || actions.actions.length === 0;
   // ENGINE-level actions, present regardless of which project is open.
-  if (!actions.actions.some((a) => a.name === 'haptics.toggle')) {
-    throw new Error(`list_actions is missing the engine-level 'haptics.toggle' action: ${JSON.stringify(actions.actions.map((a) => a.name))}`);
-  }
+  const missingHaptics = !missingActions && !actions.actions.some((a) => a.name === 'haptics.toggle');
+  if (missingActions || missingHaptics) {
+    const reason = missingActions
+      ? `list_actions returned no actions: ${JSON.stringify(actions)}`
+      : `list_actions is missing the engine-level 'haptics.toggle' action: ${JSON.stringify(actions.actions.map((a) => a.name))}`;
+    skipped.push(`dispatch_action — ${reason}`);
+    console.log(`dispatch_action SKIPPED — ${reason}`);
+  } else {
+    await withCleanup(async () => {
+      await client.callTool({ name: 'modoki_play_control', arguments: { action: 'play' } });
 
-  await client.callTool({ name: 'modoki_play_control', arguments: { action: 'play' } });
+      // `haptics.toggle` returns early (no-op) when the open scene authors no `HapticSettings`
+      // entity, which is the common case — so dispatching it twice usually changes nothing on
+      // disk or in the world. `dispatched:true` here proves the dispatch ROUTE and the Play gate
+      // (a stopped sim refuses identically to a bogus name — see below), not that state changed.
+      // The bogus-name arm below carries the real weight of this case.
+      for (let i = 0; i < 2; i++) {
+        const r = JSON.parse(text(await client.callTool({ name: 'modoki_dispatch_action', arguments: { name: 'haptics.toggle' } })));
+        if (r.dispatched !== true) throw new Error(`dispatch_action did not dispatch a real action while PLAYING: ${JSON.stringify(r)}`);
+      }
 
-  // A real, inert, self-cancelling action — chosen so dispatching it TWICE nets to zero and this
-  // case has nothing to restore beyond leaving Play mode.
-  for (let i = 0; i < 2; i++) {
-    const r = JSON.parse(text(await client.callTool({ name: 'modoki_dispatch_action', arguments: { name: 'haptics.toggle' } })));
-    if (r.dispatched !== true) throw new Error(`dispatch_action did not dispatch a real action while PLAYING: ${JSON.stringify(r)}`);
-  }
+      // The half that actually catches a dead route: an unknown name must be refused BY NAME, with a
+      // `known` list — not merely refused-somehow (a stopped-sim refusal would pass a bare isError
+      // check too, and would not distinguish this tool from one that 400s on every call).
+      const bogusRaw = await client.callTool({
+        name: 'modoki_dispatch_action', arguments: { name: 'modoki.smoke.definitelyNotARealAction' },
+      });
+      if (!bogusRaw.isError) throw new Error(`a bogus action name must be refused, not silently accepted: ${text(bogusRaw)}`);
+      const bogusErr = JSON.parse(text(bogusRaw)).error;
+      if (!/unknown action 'modoki\.smoke\.definitelyNotARealAction'/.test(bogusErr?.why ?? '')) {
+        throw new Error(`the refusal must NAME the unknown action, got: ${JSON.stringify(bogusErr)}`);
+      }
+      if (!Array.isArray(bogusErr?.got?.known) || bogusErr.got.known.length === 0) {
+        throw new Error(`the refusal must carry a \`known\` action list, got: ${JSON.stringify(bogusErr)}`);
+      }
 
-  // The half that actually catches a dead route: an unknown name must be refused BY NAME, with a
-  // `known` list — not merely refused-somehow (a stopped-sim refusal would pass a bare isError
-  // check too, and would not distinguish this tool from one that 400s on every call).
-  const bogusRaw = await client.callTool({
-    name: 'modoki_dispatch_action', arguments: { name: 'modoki.smoke.definitelyNotARealAction' },
-  });
-  if (!bogusRaw.isError) throw new Error(`a bogus action name must be refused, not silently accepted: ${text(bogusRaw)}`);
-  const bogusErr = JSON.parse(text(bogusRaw)).error;
-  if (!/unknown action 'modoki\.smoke\.definitelyNotARealAction'/.test(bogusErr?.why ?? '')) {
-    throw new Error(`the refusal must NAME the unknown action, got: ${JSON.stringify(bogusErr)}`);
+      console.log(`dispatch_action dispatches a real action while PLAYING and names an unknown one ✓ (${actions.actions.length} actions known)`);
+    }, async () => {
+      // stop reverts the world to its authored snapshot — nothing else here needs undoing.
+      await client.callTool({ name: 'modoki_play_control', arguments: { action: 'stop' } });
+    });
   }
-  if (!Array.isArray(bogusErr?.got?.known) || bogusErr.got.known.length === 0) {
-    throw new Error(`the refusal must carry a \`known\` action list, got: ${JSON.stringify(bogusErr)}`);
-  }
-
-  console.log(`dispatch_action dispatches a real action while PLAYING and names an unknown one ✓ (${actions.actions.length} actions known)`);
-}, async () => {
-  // stop reverts the world to its authored snapshot — nothing else here needs undoing.
-  await client.callTool({ name: 'modoki_play_control', arguments: { action: 'stop' } });
-});
+}
 
 await client.close();
 

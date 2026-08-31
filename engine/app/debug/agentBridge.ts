@@ -2218,11 +2218,6 @@ export function initAgentBridge(): void {
     if (reloadSource === 'bridge') {
       bridge.on('scene-changed', (data) => {
         void handleSceneChanged(data as { urlPath: string; kind: SceneChangedKind });
-        // #459: a scene swap can bring scene-scoped traits in/out (see
-        // games/3d-test/runtime/PlaybackManager.ts, scope: 'scene'), so re-arm
-        // the pusher the same way the Vite path does on vite:afterUpdate. Cheap:
-        // the signature check inside the pusher suppresses a no-op resend.
-        pusher.start();
       });
     }
     if (!hot) {
@@ -2245,7 +2240,10 @@ export function initAgentBridge(): void {
   const pusher = makeSchemaPusher((schema) => { hot.send('modoki:schema', schema); schemaPushed = true; });
   pusher.start();
   hot.on('vite:afterUpdate', () => { schemaPushed = false; pusher.start(); });
-  hot.on('vite:ws:connect', () => { if (!schemaPushed) pusher.start(); });
+  // Reconnect (server restart drops the dev server's cache): force a resend even if the
+  // trait set is unchanged — a plain start() would find the same signature already sent
+  // and send nothing, leaving the freshly-restarted server with no schema at all.
+  hot.on('vite:ws:connect', () => { if (!schemaPushed) pusher.start({ force: true }); });
 
   // 2. Answer request ops from the dev server.
   hot.on('modoki:request', async (msg: { id: number; op: string; params?: unknown }) => {

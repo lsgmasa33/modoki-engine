@@ -81,13 +81,20 @@ describe('T3 live coverage is declared, total, and honest', () => {
    *  KNOWN_UNCOVERED is a holding pen, not a home: each entry silences this guard for one specific
    *  tool, so each earns its place with a written reason and the issue tracking the fix. Found
    *  2026-08-31 in #483's close-out review — verified by hand that neither name has a real call
-   *  site. #496 emptied the pen: `modoki_dispatch_action` had no call site at all, and
+   *  site. #496 emptied the pen once: `modoki_dispatch_action` had no call site at all, and
    *  `modoki_set_selection`'s one occurrence never ran — both now have real, executing cases in
    *  test-smoke.mjs (the dispatch_action one gated on a Play window, since a stopped sim refuses a
-   *  real action and a bogus one identically). The map stays here, empty, for the next tool that
-   *  needs a temporary exemption — it is not itself the fix.
+   *  real action and a bogus one identically). #496 was reopened for the same defect on
+   *  `modoki_save_all`: its only two occurrences in test-smoke.mjs (UC7, :856 and :871) are a step
+   *  inside a batch the case ASSERTS never runs (`notRun`) — the same "mentioned but never executed"
+   *  shape as the two above.
    */
-  const KNOWN_UNCOVERED: Readonly<Record<string, string>> = {};
+  const KNOWN_UNCOVERED: Readonly<Record<string, string>> = {
+    modoki_save_all: 'the only route to disk. A real case must dirty a probe entity, call save_all, '
+      + 'verify dirtyAssetPaths empties, then restore the probe — deferred because a failure mid-case '
+      + "would leave modified files in the human's working tree (CLAUDE.md #18). Tracked in #496 "
+      + '(reopened).',
+  };
 
   it('every COVERED_BY_SMOKE entry has a real call site in test-smoke.mjs (or a written exemption)', () => {
     const smokeSrc = readFileSync(join(__dirname, '../../tools/modoki-mcp/test-smoke.mjs'), 'utf8');

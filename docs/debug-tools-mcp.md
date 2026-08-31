@@ -797,6 +797,19 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
   and `list_traits {name:'Transform'}` for the one field schema you need before a `setTrait` (an unknown
   name errors with a did-you-mean rather than an empty object). `all:true` on either forces the full dump.
 
+  ⚠️ **`list_traits` answers from a schema the RENDERER pushes, not from a live query** — so it can be
+  stale in a way no other read is, and it fails by being confidently incomplete rather than by
+  erroring. It served an incomplete registry for months (#459) — not a race: game traits register
+  before engine traits, DETERMINISTICALLY, but with an awaited dynamic import in the gap (a game's
+  own `editorPanels()` hook). The pusher stopped at the first non-empty registry, so opening a game
+  with a slow hook could serve only its game traits forever. `games/sling` is the only game with such
+  a hook and answered with its own 8 traits and `NOT_FOUND` for `Transform` while 94 entities in the
+  loaded scene carried it; `games/3d-test`, which has no hook, always answered with the complete 83.
+  The pusher (`engine/app/debug/schemaPusher.ts`) now polls for the full boot window instead of
+  settling early, re-sending on every trait-set change. **If a trait you can see on an entity is
+  missing here, that is this class of bug again — compare against `get_scene_state`, which reads the
+  live world.**
+
 **Full editor parity (do/see everything a human can — dev AND the DMG).** These give the agent the
 same actions + state a person has in the editor. They relay to the renderer over the SAME bridge
 (Vite HMR in dev, Electron IPC in the DMG), so they behave identically in both:
