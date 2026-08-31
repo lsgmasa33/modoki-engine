@@ -456,3 +456,259 @@ describe('spending', () => {
     expect(balanceOf(COINS.id)).toBe(0);
   });
 });
+
+describe('a failure must name the RIGHT cause, not merely fail (#487, #499)', () => {
+  /** Capture the `[iap] …` trace. It is the only place the structured payload is observable, and
+   *  the payload IS the fix in #499 — asserting the outcome alone would pass on the old code. */
+  function captureIapLog(): { lines: string[]; restore: () => void } {
+    const lines: string[] = [];
+    const original = { log: console.log, warn: console.warn, error: console.error };
+    const grab = (fn: (...a: unknown[]) => void) => (...a: unknown[]) => {
+      if (typeof a[0] === 'string' && a[0].startsWith('[iap] ')) lines.push(a[0]);
+      else fn(...a);
+    };
+    console.log = grab(original.log as never);
+    console.warn = grab(original.warn as never);
+    console.error = grab(original.error as never);
+    return {
+      lines,
+      restore: () => { console.log = original.log; console.warn = original.warn; console.error = original.error; },
+    };
+  }
+
+  /**
+   * An error shaped the way Capacitor ACTUALLY hands a `call.reject(msg, code, err, data)` to JS.
+   *
+   * ⚠️ **`data` is NOT flattened onto the Error, and a fixture that pretends otherwise is worse
+   * than no test.** iOS wraps it as `["data": data]` (`PluginCallResult.swift`,
+   * `init(message:code:error:data:)`); Android does `errorResult.put("data", data)`
+   * (`PluginCall.java`, the 4-arg `reject`); `native-bridge.js` then copies only that payload's
+   * TOP-LEVEL keys onto the Error. So `code` is an own property and the plugin's `storeError` sits
+   * one level down, under `data`.
+   *
+   * This helper exists because the first version of these tests asserted the flattened shape, and
+   * `describeStoreError` read the same flattened shape — so both were wrong together, the
+   * assertions were green, and deleting the fix still broke them "correctly". A fake that models
+   * behaviour the real dependency does not have makes the guard defend the bug. Verified against
+   * the vendored Capacitor sources, not from memory.
+   */
+  function capacitorRejection(message: string, code: string, storeError: unknown): Error {
+    return Object.assign(new Error(message), { errorMessage: message, code, data: { storeError } });
+  }
+
+  /** The payload of the one `[iap] <type> {…}` line, parsed back out of the trace. */
+  function payloadOf(lines: string[], type: string): Record<string, unknown> {
+    const line = lines.find((l) => l.startsWith(`[iap] ${type} `));
+    if (!line) throw new Error(`no journal line for ${type}; saw:\n${lines.join('\n')}`);
+    return JSON.parse(line.slice(`[iap] ${type} `.length)) as Record<string, unknown>;
+  }
+
+  it('a game swap inside ledger.flush() reports a TORN-DOWN session, not a storage fault (#487 item 3)', async () => {
+    // Both arms decline to finish, so the money outcome is identical and an outcome-only assertion
+    // cannot tell them apart — the whole defect is the ATTRIBUTION. Without the check,
+    // `confirmDurable` reads back through PlayerPrefs, which is namespaced to whatever game is live
+    // NOW, misses a write the backend actually took, and journals `iap.durability-unconfirmed` at
+    // ERROR level, blaming storage quota or native I/O for a swap.
+    resetIap();
+    const s = new FlakyStore();
+    const d = new MemStore();
+    let flushEntered = false;
+    let release!: () => void;
+    d.flush = () => new Promise<void>((res) => { flushEntered = true; release = res; });
+    configureIap({ backend: s, store: d, products: CATALOG });
+
+    const pending = purchase(COINS.id);
+    while (!flushEntered) await Promise.resolve();
+
+    resetIap();                       // the game swaps out while the ledger write is in flight
+    // ⚠️ Model the actual consequence of the swap, not just its timing. `confirmDurable` reads back
+    // through PlayerPrefs, which the incoming game has RE-NAMESPACED — so the read-back misses a
+    // write the backend genuinely took. Without this the test is green either way: a LATER
+    // `stillActive` (the grant-hook one) also reports "torn down", so the assertion below cannot
+    // tell whether the post-flush check exists. Verified by deleting the check: this fails, and
+    // without this line it does not.
+    d.backendAccepted = false;
+    release();
+    const r = await pending;
+
+    expect(r.outcome).toBe('failed');
+    // The distinguishing observation: the torn-down wording, NOT 'grant not durable'.
+    expect(r.error).toContain('torn down');
+    expect(r.error).not.toContain('durable');
+    expect(s.finished).toEqual([]);   // and still nothing finished, which is what keeps it safe
+  });
+
+  it('restorePurchases never names another game\'s entitlements, and reports the REFRESHED ones with no swap (#487 item 4)', async () => {
+    // `entitled` is REASSIGNED by configureIap/resetIap, so the post-await read can name the
+    // INCOMING game's purchases as this restore's result. Journal-only — and the journal is the one
+    // record anyone consults when a player says a restore did not return what they own.
+    resetIap();
+    const sA = new FlakyStore();
+    let unfinishedEntered = false;
+    let release!: (txs: StoreTransaction[]) => void;
+    sA.entitlements = async () => [{ transactionId: 'tx-a', productId: 'perk.a' }];
+    sA.unfinished = () => new Promise<StoreTransaction[]>((res) => { unfinishedEntered = true; release = res; });
+    configureIap({ backend: sA, store: new MemStore(), products: CATALOG });
+
+    const cap = captureIapLog();
+    try {
+      const pending = restorePurchases();
+      while (!unfinishedEntered) await Promise.resolve();
+
+      // The swap: game B configures and owns something entirely different.
+      resetIap();
+      const sB = new FlakyStore();
+      sB.entitlements = async () => [{ transactionId: 'tx-b', productId: 'perk.b' }];
+      configureIap({ backend: sB, store: new MemStore(), products: CATALOG });
+      await refreshEntitlements();
+
+      release([]);
+      await pending;
+
+      // Never B's, and never a set at all: by now A's own refreshed Set has been dropped on the
+      // floor by the swap, so there is no truthful list left to name — say the session was torn
+      // down instead. A restore reporting nothing BECAUSE IT WAS TORN DOWN is a different event
+      // from one reporting nothing because the player owns nothing, and this line is what a
+      // "restore did not return what I own" report gets read against.
+      const swapped = payloadOf(cap.lines, 'iap.restore.finished');
+      expect(swapped.tornDown).toBe(true);
+      expect(swapped.entitlements).toBeUndefined();
+      expect(JSON.stringify(swapped)).not.toContain('perk.b');
+
+      // ── The other half, and the reason a plain capture-before is NOT the fix here ──
+      // `reconcile()` calls `refreshEntitlements()`, which REPLACES `entitled` on its happy path.
+      // With no swap, the trace must report the set the restore just refreshed TO.
+      //
+      // ⚠️ The store must now report something `entitled` does NOT already hold, or this assertion
+      // passes under both hypotheses: with B's set left at `perk.b`, a capture-before at the top of
+      // `restorePurchases` would snapshot `perk.b` and read identically. Re-pointing it to `perk.c`
+      // is what makes the observation distinguishing — a pre-await snapshot answers `['perk.b']`.
+      sB.entitlements = async () => [{ transactionId: 'tx-c', productId: 'perk.c' }];
+      cap.lines.length = 0;
+      await restorePurchases();
+      expect(payloadOf(cap.lines, 'iap.restore.finished').entitlements).toEqual(['perk.c']);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('a rejected purchase journals the store\'s structured classification, not just its prose (#499)', async () => {
+    // `localizedDescription` alone reads identically for a user cancel, an ASD/AMS account fault
+    // and a network failure — which is why the owner-reported failure could not be named without a
+    // device session. The native plugins now carry domain/code/underlying through Capacitor's
+    // reject payload, which the bridge copies onto the Error as own properties.
+    const bridgeError = capacitorRejection('purchase failed: Request Canceled', 'storekit.systemError', {
+      domain: 'StoreKit.StoreKitError', code: 3, description: 'Request Canceled',
+      underlying: { domain: 'ASDErrorDomain', code: 509, description: 'No account' },
+    });
+    store.purchase = async () => { throw bridgeError; };
+
+    const cap = captureIapLog();
+    let r;
+    try {
+      r = await purchase(COINS.id);
+      const p = payloadOf(cap.lines, 'iap.purchase.failed');
+      expect(p.code).toBe('storekit.systemError');
+      expect(p.detail).toMatchObject({ domain: 'StoreKit.StoreKitError', underlying: { domain: 'ASDErrorDomain', code: 509 } });
+    } finally {
+      cap.restore();
+    }
+    // `PurchaseResult.error` is the only channel that reaches a caller, so the classification has
+    // to survive into it too — otherwise a game's own failure reporting is back to bare prose.
+    expect(r.error).toContain('storekit.systemError');
+  });
+
+  it('reads the ANDROID payload shape too, not just the iOS one (#499)', async () => {
+    // The two producers put different things in `storeError`: iOS a string domain with a nested
+    // `underlying` chain, Android `{domain:'BillingResponseCode', code:<int>, description}` with no
+    // nesting, and a numeric code where iOS has a symbolic one. `describeStoreError` is the single
+    // reader for both, so a shape-specific assumption in it would leave one platform silently
+    // undiagnosable — and Android is the platform whose per-device iteration costs a Play upload.
+    store.purchase = async () => {
+      throw capacitorRejection('purchase failed: Item already owned (code 7)', 'billing.7', {
+        domain: 'BillingResponseCode', code: 7, description: 'Item already owned',
+      });
+    };
+
+    const cap = captureIapLog();
+    try {
+      const r = await purchase(COINS.id);
+      const p = payloadOf(cap.lines, 'iap.purchase.failed');
+      expect(p.code).toBe('billing.7');
+      expect(p.detail).toEqual({ domain: 'BillingResponseCode', code: 7, description: 'Item already owned' });
+      expect(r.error).toContain('billing.7');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('a restore with IAP unconfigured is journalled as unconfigured, NOT as torn down (#487 item 4)', async () => {
+    // Three outcomes share "reported no entitlements" and they are not the same event: the player
+    // owns nothing, the session was torn down mid-restore, and IAP was never configured. The last
+    // is the boot-race path, and collapsing it into `tornDown` would send a reader hunting a game
+    // swap that never happened. Guarding on `cfg` directly rather than through `activeCfg()` is
+    // what keeps them distinct — that accessor journals as a side effect, and a `c && …` guard
+    // built from it silently switches itself off in exactly this case.
+    resetIap();
+
+    const cap = captureIapLog();
+    try {
+      const results = await restorePurchases();
+      expect(results).toEqual([]);
+      const p = payloadOf(cap.lines, 'iap.restore.finished');
+      expect(p.notConfigured).toBe(true);
+      expect(p.tornDown).toBeUndefined();
+      expect(p.entitlements).toBeUndefined();
+      // And the side-effecting accessor is not consulted twice for the one restore.
+      expect(cap.lines.filter((l) => l.startsWith('[iap] iap.not-configured')).length).toBe(1);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('the FINISH path carries the classification too, not just purchase (#499)', async () => {
+    // The close-out sweep taught the Android plugin to classify `consume`/`acknowledge` failures,
+    // and these journal sites went on printing `String(e)` — so `billing.6` arrived and was thrown
+    // away one line short of the log. A producer with no consumer is this repo's most-repeated
+    // defect, and adding the field is not the same as wiring it.
+    //
+    // These are `warn`-level and deliberately non-fatal (the grant is what matters; the next launch
+    // re-delivers and retries), which is exactly why they are easy to leave unwired: nothing fails.
+    store.outstanding = [{ transactionId: 'tx-fin', productId: COINS.id }];
+    store.finish = async () => {
+      throw capacitorRejection('consume failed: Server error (code 6)', 'billing.6', {
+        domain: 'BillingResponseCode', code: 6, description: 'Server error',
+      });
+    };
+
+    const cap = captureIapLog();
+    try {
+      await reconcile();
+      const p = payloadOf(cap.lines, 'iap.finish-failed');
+      expect(p.code).toBe('billing.6');
+      expect(p.detail).toMatchObject({ domain: 'BillingResponseCode', code: 6 });
+    } finally {
+      cap.restore();
+    }
+    // Non-fatal is preserved: the grant landed even though the finish did not.
+    expect(balanceOf(COINS.id)).toBe(COINS.grant);
+  });
+
+  it('an error with no structured payload still journals cleanly (#499)', async () => {
+    // The web stub, a native binary predating #499, and any throw from outside the bridge carry
+    // neither field. `describeStoreError` must degrade, not emit `code: undefined` noise or throw.
+    store.purchaseThrows = true;
+
+    const cap = captureIapLog();
+    try {
+      const r = await purchase(COINS.id);
+      const p = payloadOf(cap.lines, 'iap.purchase.failed');
+      expect(p.error).toContain('simulated store error');
+      expect('code' in p).toBe(false);
+      expect('detail' in p).toBe(false);
+      expect(r.error).toBe('Error: simulated store error');   // unchanged, no trailing `[undefined]`
+    } finally {
+      cap.restore();
+    }
+  });
+});

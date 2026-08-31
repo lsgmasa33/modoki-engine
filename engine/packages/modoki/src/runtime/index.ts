@@ -71,6 +71,7 @@ export {
   configureIap, resetIap, restorePurchases, refreshEntitlements, isEntitled,
   purchase as iapPurchase, reconcile as iapReconcile, spend as iapSpend,
   balanceOf as iapBalanceOf, productInfo as iapProductInfo,
+  describeStoreError as iapDescribeStoreError,
   IapLedger, NoopStoreBackend, LocalVerifier, MockStoreBackend, pickStoreBackend,
   type ConfigureIapOptions, type StoreBackend, type IapLedgerStore, type PurchaseVerifier,
   type ProductKind, type IapProduct, type IapProductInfo, type StoreTransaction,

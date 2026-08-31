@@ -520,6 +520,7 @@
   "hostCanvasUnder",
   "hostCanvases",
   "iapBalanceOf",
+  "iapDescribeStoreError",
   "iapProductInfo",
   "iapPurchase",
   "iapReconcile",

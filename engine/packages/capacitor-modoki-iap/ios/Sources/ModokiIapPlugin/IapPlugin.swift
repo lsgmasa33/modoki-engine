@@ -80,6 +80,93 @@ public class ModokiIapPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    // MARK: - Error reporting
+
+    /// Is this thrown error a cancel?
+    ///
+    /// StoreKit reports the ordinary cancel as a `.userCancelled` *result*, handled above — but it
+    /// can also THROW one, and the two must land on the same JS outcome. A cancel that arrives as
+    /// a rejection would be reported as `iap.purchase.failed` and reach `purchase_failed`
+    /// analytics, which the design says a cancel must never do (#499).
+    ///
+    /// `SKError.paymentCancelled` is checked too: the StoreKit 1 error still surfaces through the
+    /// StoreKit 2 API when the underlying purchase is serviced by the older stack.
+    private func isCancellation(_ error: Error) -> Bool {
+        if let skError = error as? StoreKitError, case .userCancelled = skError { return true }
+        let ns = error as NSError
+        return ns.domain == SKErrorDomain && ns.code == SKError.Code.paymentCancelled.rawValue
+    }
+
+    /// A stable, machine-readable classification for the journal — the thing `localizedDescription`
+    /// cannot give. `"Request Canceled"` reads identically for a real cancel, an account/sandbox
+    /// problem in `ASDErrorDomain`/`AMSErrorDomain`, and a network failure; these do not.
+    private func classify(_ error: Error) -> String {
+        if let skError = error as? StoreKitError {
+            switch skError {
+            case .unknown: return "storekit.unknown"
+            case .userCancelled: return "storekit.userCancelled"
+            case .networkError: return "storekit.networkError"
+            case .systemError: return "storekit.systemError"
+            case .notAvailableInStorefront: return "storekit.notAvailableInStorefront"
+            case .notEntitled: return "storekit.notEntitled"
+            @unknown default: return "storekit.unhandled"
+            }
+        }
+        if let purchaseError = error as? Product.PurchaseError {
+            switch purchaseError {
+            case .invalidQuantity: return "purchase.invalidQuantity"
+            case .productUnavailable: return "purchase.productUnavailable"
+            case .purchaseNotAllowed: return "purchase.purchaseNotAllowed"
+            case .ineligibleForOffer: return "purchase.ineligibleForOffer"
+            case .invalidOfferIdentifier: return "purchase.invalidOfferIdentifier"
+            case .invalidOfferPrice: return "purchase.invalidOfferPrice"
+            case .invalidOfferSignature: return "purchase.invalidOfferSignature"
+            case .missingOfferParameters: return "purchase.missingOfferParameters"
+            @unknown default: return "purchase.unhandled"
+            }
+        }
+        let ns = error as NSError
+        return "\(ns.domain):\(ns.code)"
+    }
+
+    /// The diagnostic payload the catch-all used to throw away: domain, code, and the chain of
+    /// underlying errors. **This is what makes the next occurrence self-diagnosing** instead of
+    /// needing a device session to reproduce (#499).
+    ///
+    /// ⚠️ A `StoreKitError` bridged to `NSError` keeps NEITHER the `URLError` of `.networkError`
+    /// nor the error inside `.systemError` — Swift's synthesized bridge drops the associated value
+    /// and `NSUnderlyingErrorKey` is empty. The `ASDErrorDomain`/`AMSErrorDomain` code that names
+    /// the actual account or sandbox fault lives there and nowhere else, so unwrap the enum
+    /// explicitly before falling back to `userInfo`.
+    private func errorDetail(_ error: Error, depth: Int = 0) -> [String: Any] {
+        let ns = error as NSError
+        var out: [String: Any] = [
+            "domain": ns.domain,
+            "code": ns.code,
+            "description": ns.localizedDescription
+        ]
+        if let reason = ns.localizedFailureReason, !reason.isEmpty {
+            out["failureReason"] = reason
+        }
+        // Bounded: an underlying chain is normally 1-2 deep, and the payload is serialized as JSON
+        // into a journal line, not a crash report.
+        guard depth < 3 else { return out }
+
+        var nested: Error?
+        if let skError = error as? StoreKitError {
+            switch skError {
+            case .networkError(let urlError): nested = urlError
+            case .systemError(let underlying): nested = underlying
+            default: break
+            }
+        }
+        if nested == nil { nested = ns.userInfo[NSUnderlyingErrorKey] as? Error }
+        if let nested {
+            out["underlying"] = errorDetail(nested, depth: depth + 1)
+        }
+        return out
+    }
+
     // MARK: - Methods
 
     @objc func isAvailable(_ call: CAPPluginCall) {
@@ -106,7 +193,16 @@ public class ModokiIapPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
                 call.resolve(["products": payload])
             } catch {
-                call.reject("failed to load products: \(error.localizedDescription)")
+                // Same treatment as `purchase()`'s catch, and for the same reason (#499): an empty
+                // shelf reads identically whether the device is offline, the Paid Applications
+                // Agreement lapsed, or the account is in a bad sandbox state — and the shelf is
+                // where a player notices first. The domain/code is what tells them apart.
+                call.reject(
+                    "failed to load products: \(error.localizedDescription)",
+                    classify(error),
+                    error,
+                    ["storeError": errorDetail(error)]
+                )
             }
         }
     }
@@ -153,7 +249,24 @@ public class ModokiIapPlugin: CAPPlugin, CAPBridgedPlugin {
                     call.reject("unknown purchase result")
                 }
             } catch {
-                call.reject("purchase failed: \(error.localizedDescription)")
+                // A THROWN cancel is still a cancel. Falling through to the generic arm would
+                // report it as a failure — including to `purchase_failed` analytics, which the
+                // design says a cancel must never reach (#499).
+                if isCancellation(error) {
+                    call.resolve(["transaction": NSNull()])
+                    return
+                }
+                // Carry the domain, code and underlying chain through, because
+                // `localizedDescription` alone does not distinguish a real failure from a cancel:
+                // an ASD/AMS account or sandbox fault reports the same `"Request Canceled"` string
+                // a user cancel does, and the owner-reported failure of #499 was unnameable for
+                // exactly this reason.
+                call.reject(
+                    "purchase failed: \(error.localizedDescription)",
+                    classify(error),
+                    error,
+                    ["storeError": errorDetail(error)]
+                )
             }
         }
     }

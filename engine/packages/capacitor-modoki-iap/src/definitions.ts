@@ -106,6 +106,30 @@ export interface ModokiIapPlugin {
    * `.pending` (Ask-to-Buy awaiting a guardian) carries **no transaction at all** — the purchase
    * arrives later, as a re-delivery, which `unfinished()` then reports. Reporting that as a cancel
    * would tell the player their purchase failed when it is merely waiting for a parent.
+   *
+   * ── When it DOES reject (#499) ────────────────────────────────────────────────
+   * A rejection carries a diagnosis, not just prose, because `localizedDescription` alone cannot
+   * distinguish the cases that matter: `"Request Canceled"` is what iOS says for a real user
+   * cancel, for an `ASDErrorDomain`/`AMSErrorDomain` account or sandbox fault, AND for some
+   * network failures. An owner-reported failure was unnameable for exactly that reason.
+   *
+   * A caller sees:
+   *   - `error.code` — a stable classification, e.g. `storekit.networkError`,
+   *     `purchase.purchaseNotAllowed`, `billing.6`, or `<NSError domain>:<code>` as a fallback.
+   *   - `error.data.storeError` — `{ domain, code, description, failureReason?, underlying? }`,
+   *     the underlying chain nested up to three deep. On iOS this is unwrapped from the
+   *     `StoreKitError` enum's ASSOCIATED VALUE, which the NSError bridge otherwise drops.
+   *
+   * ⚠️ **Note the two different depths — this is not a typo, and getting it wrong fails silently.**
+   * `call.reject(message, code, error, data)` does NOT flatten `data`: iOS wraps it as
+   * `["data": data]` and Android does `errorResult.put("data", data)`, and only then does
+   * `native-bridge.js` copy the payload's TOP-LEVEL keys onto the Error. So `code` is an own
+   * property and `storeError` is one level down. Reading it at the top level yields `undefined` on
+   * every call with no error anywhere. Use the engine's `describeStoreError` rather than reaching
+   * in by hand.
+   *
+   * ⚠️ Both are best-effort: treat them as optional. An older native binary predating #499 and
+   * the web stub carry neither.
    */
   purchase(options: {
     productId: string;

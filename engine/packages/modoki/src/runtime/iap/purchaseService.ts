@@ -58,6 +58,60 @@ function journal(type: string, payload?: unknown, level: 'info' | 'warn' | 'erro
   emit(type, payload, w, level);
 }
 
+/**
+ * Pull the STRUCTURED half out of a rejected native call — the half `String(e)` throws away.
+ *
+ * A store failure's `localizedDescription` is not a diagnosis. `"Request Canceled"` is the same
+ * sentence for a real user cancel, an `ASDErrorDomain`/`AMSErrorDomain` account or sandbox fault,
+ * and a network failure — which is exactly why the owner-reported failure in #499 could not be
+ * named without a device session. The native plugins carry the domain, code and underlying chain
+ * through Capacitor's reject payload; this is the reader for it.
+ *
+ * ⚠️ **The two fields live at DIFFERENT depths, and getting that wrong fails silently.**
+ * `call.reject(message, code, error, data)` does NOT flatten `data`: iOS wraps it as
+ * `["data": data]` (`PluginCallResult.swift`, `init(message:code:error:data:)`) and Android does
+ * `errorResult.put("data", data)` (`PluginCall.java`, the 4-arg `reject`). Only then does
+ * `native-bridge.js` copy the payload's TOP-LEVEL keys onto the rejected `Error`. So the wire shape
+ * is `{ message, errorMessage, code, data: { storeError } }` — `code` is an own property, and
+ * `storeError` is one level down. Reading it at the top level yields `undefined` on every call,
+ * with no error anywhere: the fix ships, the journal looks fine, and the diagnostic is silently
+ * absent. That is exactly the bug this function had when it was written, caught in review.
+ *
+ * Everything is optional by construction: an older native binary predating #499, the web stub, the
+ * mock backend, and any throw from outside the bridge carry neither field and must journal cleanly.
+ */
+/**
+ * Journal a store rejection at `warn`, WITH its classification.
+ *
+ * ⚠️ Exists because a structured reject payload that nothing reads is a producer with no consumer —
+ * this repo's most-repeated defect, and one #499 walked straight back into: the native plugins were
+ * taught to classify `consume`/`acknowledge`/`finish` failures, and every one of these call sites
+ * went on journalling `String(e)`, so a `billing.6` arrived and was thrown away one line short of
+ * the log. Adding a field is not the same as wiring it — route every store rejection through here,
+ * and there is a test asserting these sites carry `code`.
+ */
+function journalStoreFailure(
+  type: string,
+  payload: Record<string, unknown>,
+  e: unknown,
+  level: 'warn' | 'error' = 'warn',
+): void {
+  const d = describeStoreError(e);
+  journal(type, { ...payload, error: d.message, code: d.code, detail: d.detail }, level);
+}
+
+export function describeStoreError(e: unknown): { message: string; code?: string; detail?: unknown } {
+  const message = String(e);
+  if (typeof e !== 'object' || e === null) return { message };
+  const r = e as { code?: unknown; data?: { storeError?: unknown } };
+  const detail = typeof r.data === 'object' && r.data !== null ? r.data.storeError : undefined;
+  return {
+    message,
+    ...(typeof r.code === 'string' && r.code !== '' ? { code: r.code } : {}),
+    ...(detail !== undefined ? { detail } : {}),
+  };
+}
+
 interface IapConfig {
   backend: StoreBackend;
   ledger: IapLedger;
@@ -167,7 +221,7 @@ export function resetIap(): void {
   } catch (e) {
     // Teardown must not throw: it runs from `unregisterGameSystems()`, and a failure here would
     // abort the swap and leave the NEXT game half-registered.
-    journal('iap.dispose-failed', { error: String(e) }, 'warn');
+    journalStoreFailure('iap.dispose-failed', {}, e);
   }
   cfg = null;
   entitled = new Set();
@@ -312,7 +366,7 @@ async function settleInner(
       c.ledger.markFinished(tx.transactionId);
       void c.ledger.flush();
     } catch (e) {
-      journal('iap.finish-failed', { transactionId: tx.transactionId, error: String(e) }, 'warn');
+      journalStoreFailure('iap.finish-failed', { transactionId: tx.transactionId }, e);
     }
     return { outcome: 'failed', productId: tx.productId, transactionId: tx.transactionId, error: 'revoked' };
   }
@@ -331,7 +385,7 @@ async function settleInner(
     await c.backend.acknowledge(tx);
   } catch (e) {
     // Non-fatal: the grant is what matters, and the next launch re-delivers and retries this.
-    journal('iap.acknowledge-failed', { transactionId: tx.transactionId, error: String(e) }, 'warn');
+    journalStoreFailure('iap.acknowledge-failed', { transactionId: tx.transactionId }, e);
   }
 
   const product = c.catalog.get(tx.productId);
@@ -366,6 +420,14 @@ async function settleInner(
     const units = product.kind === 'consumable' ? (product.grant ?? 1) : 0;
     c.ledger.recordGrant(tx.transactionId, tx.productId, units);
     await c.ledger.flush();
+
+    // ⚠️ `confirmDurable` reads back through `PlayerPrefs`, which is namespaced to whatever game is
+    // live NOW — not to the one this settle started in. A swap inside the `flush()` above would
+    // make that read-back miss a write the backend actually took, and the path would then journal
+    // `iap.durability-unconfirmed` at ERROR level, blaming storage quota or native I/O for a fault
+    // that is really a torn-down session (#487 item 3). The money outcome is the same either way —
+    // both decline to finish — but only one of them is true. Ask the question before reading.
+    if (!stillActive(c)) return tornDown(tx, source);
 
     // INVARIANT 1's guard. If the write did not survive the round trip, stop here — the transaction
     // stays unfinished and the store hands it back next launch. Finishing now is the one action
@@ -449,7 +511,7 @@ async function settleInner(
     journal('iap.finished', { productId: tx.productId, transactionId: tx.transactionId });
   } catch (e) {
     // Granted but not finished — the safe side of the window. Next launch re-delivers and retries.
-    journal('iap.finish-failed', { transactionId: tx.transactionId, error: String(e) }, 'warn');
+    journalStoreFailure('iap.finish-failed', { transactionId: tx.transactionId }, e);
   }
 
   // Re-checked here, not just before `finish()` above: `.add()` below DOES mutate whatever Set
@@ -484,8 +546,12 @@ export async function purchase(productId: string): Promise<PurchaseResult> {
   try {
     tx = await c.backend.purchase(productId);
   } catch (e) {
-    journal('iap.purchase.failed', { productId, error: String(e) }, 'error');
-    return { outcome: 'failed', productId, error: String(e) };
+    const d = describeStoreError(e);
+    journal('iap.purchase.failed', { productId, error: d.message, code: d.code, detail: d.detail }, 'error');
+    // The code rides along in the string because `PurchaseResult.error` is the only channel that
+    // reaches a caller, and it is documented as log-only — so a game's own failure reporting can
+    // name the store's classification without the engine growing a field nobody reads.
+    return { outcome: 'failed', productId, error: d.code ? `${d.message} [${d.code}]` : d.message };
   }
 
   if (!tx) {
@@ -527,7 +593,7 @@ export async function refreshEntitlements(): Promise<ReadonlySet<string>> {
     // global — by the time the catch runs, `entitled` may already be the INCOMING game's live Set,
     // and handing that back to the outgoing caller by reference (#434's failure shape, on the
     // failure half this time) would let it read another game's entitlements as its own.
-    journal('iap.entitlements-failed', { error: String(e) }, 'warn');
+    journalStoreFailure('iap.entitlements-failed', {}, e);
     if (!stillActive(c)) return startedWith;
   }
   return entitled;
@@ -551,7 +617,7 @@ export async function reconcile(): Promise<PurchaseResult[]> {
   try {
     pending = await c.backend.unfinished();
   } catch (e) {
-    journal('iap.reconcile-failed', { error: String(e) }, 'error');
+    journalStoreFailure('iap.reconcile-failed', {}, e, 'error');
     return [];
   }
 
@@ -572,7 +638,34 @@ export async function reconcile(): Promise<PurchaseResult[]> {
  */
 export async function restorePurchases(): Promise<PurchaseResult[]> {
   journal('iap.restore.started');
+  // ⚠️ `cfg` directly, NOT `activeCfg()`. That accessor journals `iap.not-configured` as a side
+  // effect, and `reconcile()` calls it a line later — so going through it here emits the same
+  // warning twice on the documented boot-race path. Worse, it would make the guard below a
+  // skip-gate computed from the very thing it guards: with no config it is `null`, the
+  // `c && …` short-circuits, and the swap check silently switches itself off.
+  const c = cfg;
   const results = await reconcile();
+  // ⚠️ `entitled` is REASSIGNED by `configureIap`/`resetIap`, and `reconcile()` spans a purchase
+  // settle — the platform sheet, Face ID, Ask-to-Buy — so it can outlive the session. Reading it
+  // blind would journal the INCOMING game's entitlements as this restore's result (#487 item 4).
+  //
+  // ⚠️ A capture-before is NOT the fix here, unlike in `refreshEntitlements`: `reconcile()` calls
+  // `refreshEntitlements()`, which REPLACES `entitled` on its happy path, so a pre-await snapshot
+  // would report the set from BEFORE the restore — the one number this trace exists to not report.
+  // And by the time a swap has happened, this session's own refreshed Set has already been dropped
+  // on the floor; there is no truthful set left to name. So say THAT, which is the more useful
+  // diagnostic anyway: a restore that reports nothing because it was torn down is a different
+  // event from one that reports nothing because the player owns nothing.
+  if (!c) {
+    // Never configured — `reconcile()` already warned and did nothing. Not the same event as a
+    // teardown, and it must not be reported as one.
+    journal('iap.restore.finished', { recovered: 0, notConfigured: true }, 'warn');
+    return results;
+  }
+  if (!stillActive(c)) {
+    journal('iap.restore.finished', { recovered: results.length, tornDown: true }, 'warn');
+    return results;
+  }
   journal('iap.restore.finished', { recovered: results.length, entitlements: [...entitled] });
   return results;
 }

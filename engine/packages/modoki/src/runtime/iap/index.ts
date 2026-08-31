@@ -30,4 +30,8 @@ export {
   configureIap, resetIap, type ConfigureIapOptions,
   purchase, reconcile, restorePurchases, refreshEntitlements,
   isEntitled, balanceOf, spend, productInfo,
+  // Exported for GAMES, not for the engine: a game catches the rejection of `productInfo()` itself
+  // (Court's shelf does), and would otherwise be back to `String(err)` — the exact blindness #499
+  // removed one layer down. One reader of the plugins' reject payload, not two spellings of it.
+  describeStoreError,
 } from './purchaseService';

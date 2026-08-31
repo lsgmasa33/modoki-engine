@@ -189,6 +189,34 @@ on teardown, so a next-session entry can be added right after, and only a genera
 stale `finally` from deleting the NEW entry. Same shape, opposite requirement, because exactly one of
 the two teardown functions clears its set: check which before copying either fix elsewhere.
 
+**Two more sites, closed under the same rule (#487 items 3+4).** Both are post-await reads rather
+than writes, which is why #434's sweep walked past them, and both were reporting a plausible
+falsehood rather than corrupting anything:
+
+- **`confirmDurable` after `ledger.flush()`.** `confirmDurable` reads back through PlayerPrefs, which
+  the incoming game has already RE-NAMESPACED, so a swap inside the flush makes the read-back miss a
+  write the backend genuinely took. The path then journalled `iap.durability-unconfirmed` at ERROR
+  level — blaming storage quota or native I/O for a torn-down session. The money outcome was never
+  in doubt (both arms decline to finish, which is the conservative direction); only the attribution
+  was wrong, and an error-level journal line that names the wrong subsystem is how a session gets
+  spent chasing PlayerPrefs. One `stillActive(c)` between the two now returns `tornDown` instead.
+- **`restorePurchases`'s entitlement trace.** `reconcile()` spans a settle and so can outlive the
+  session, and `entitled` is reassigned — so `[...entitled]` could name the INCOMING game's
+  purchases as this restore's result. ⚠️ **The obvious fix — capture the Set before the await — is
+  wrong here**, and this is the interesting part: `reconcile()` itself calls `refreshEntitlements()`,
+  which REPLACES `entitled` on its happy path, so a pre-await snapshot reports the set from *before*
+  the restore, which is precisely the number this trace exists not to report. And once a swap has
+  happened, this session's own refreshed Set has already been dropped on the floor — there is no
+  truthful list left to name. So the swap case journals `tornDown: true` at `warn` instead of a set:
+  a restore reporting nothing *because it was torn down* is a different event from one reporting
+  nothing because the player owns nothing, and that line is what a "restore did not give me back
+  what I own" report gets read against.
+
+  The general lesson, worth more than either fix: **a capture-before is not automatically the answer
+  to a post-await read.** It is right when the await cannot legitimately change the value
+  (`refreshEntitlements`), and wrong when the awaited work is *supposed* to change it. Ask which
+  before copying the pattern.
+
 ### `StoreBackend` — the port that makes any of this testable
 
 The interface is the only thing that differs between a phone and a headless test. It also earns its
@@ -262,6 +290,73 @@ failure modes it exists to catch. `confirmDurable()` therefore consults
 read-back. Get this wrong and `settle()` concludes "durable", calls `finish()`, and the store stops
 re-delivering a purchase whose record vanishes on the next launch — the player's money, with no
 recovery path, which is the exact failure invariant 1 exists to prevent.
+
+### A rejection carries a diagnosis, not just prose (#499)
+
+`call.reject(message)` alone is not enough on either platform, because the message is the one thing
+that does NOT distinguish the cases. Both plugins pass Capacitor's full reject payload:
+
+| Field | iOS | Android |
+|---|---|---|
+| `error.code` | `storekit.networkError`, `purchase.purchaseNotAllowed`, … falling back to `<NSError domain>:<code>` | `billing.<BillingResponseCode>` |
+| `error.data.storeError` | `{ domain, code, description, failureReason?, underlying? }`, nested up to 3 deep | `{ domain: 'BillingResponseCode', code, description }` |
+
+**Read it through `describeStoreError` (exported to games as `iapDescribeStoreError`), never by
+hand.** The two fields live at different depths and the mistake is silent:
+
+⚠️ **`call.reject(message, code, error, data)` does NOT flatten `data`.** iOS wraps it as
+`["data": data]` (`PluginCallResult.swift`, `init(message:code:error:data:)`); Android does
+`errorResult.put("data", data)` (`PluginCall.java`, the 4-arg `reject`); only then does
+`native-bridge.js` copy that payload's TOP-LEVEL keys onto the rejected `Error`. So `code` is an own
+property and `storeError` is one level down. **The first cut of #499 read `err.storeError` and
+shipped a producer whose payload the reader could not see** — the fix landed, the journal looked
+correct, and the entire diagnostic was `undefined` on every call. Worse, the unit test asserted the
+same flattened shape, so the fake and the implementation were wrong *together*: the assertions were
+green, and mutation-testing the fix still broke them "correctly". Caught in review, not by the
+tests. The fixture builder in `iapFailurePaths.test.ts` now states the wire shape in one place, with
+the Capacitor sources cited.
+
+⚠️ **On iOS the underlying error is unwrapped from the `StoreKitError` enum's ASSOCIATED VALUE, not
+from `NSError.userInfo`.** Swift's synthesized NSError bridge of a Swift enum keeps neither the
+`URLError` inside `.networkError` nor the error inside `.systemError`, and `NSUnderlyingErrorKey` is
+empty — so the `ASDErrorDomain`/`AMSErrorDomain` code that names the actual account or sandbox fault
+lives *only* there. Reading `userInfo` alone looks like it works and reports nothing.
+
+**Coverage: every reject that carries a store RESULT is structured; the rest have nothing to
+classify.** iOS carries both fields from `purchase()` and `products()`. On Android the rule is
+mechanical — **if a `BillingResult` is in scope at the reject, it goes through `rejectWithBilling`**
+(`grep -n 'rejectWithBilling(' ` on the plugin lists the definition plus every call site, which is
+the check to re-run rather than trusting a number here; a hand-maintained count is exactly what
+goes stale, and the first draft of this paragraph said "six" because it counted the definition).
+What stays bare prose is app-side refusal with no store result behind it — `productId is required`,
+`unknown product`, `no subscription offer available`, `a purchase is already in progress`,
+`purchaseToken is required`.
+
+⚠️ **"Is a `BillingResult` in scope" is the test, not "does the message sound like validation" —
+and the difference is not cosmetic.** `unknown product` sat in that bare list while its `if` was
+`responseCode != OK || list.isEmpty()`, with the `BillingResult` right there in the lambda. So a
+`SERVICE_UNAVAILABLE(2)` or `NETWORK_ERROR(12)` — the store simply not answering — was reported as
+"unknown product: coins_100", telling the player and the log that a product visible on the shelf
+does not exist. On the *purchase* path, where unlike `consume`/`acknowledge` the payload is actually
+read. The two disjuncts are now separate branches: a non-OK response rejects as "could not look up
+…" with the code attached, and only the OK-but-empty case keeps the "unknown product" prose — its
+response code is `OK(0)`, so attaching it as a classification would name a success. Caught by the
+close-out review *after* this paragraph had already blessed the site as validation, which is the
+lesson: a doc that ratifies a miss stops the next sweep from finding it.
+
+⚠️ **Treat both fields as optional on the JS side.** An older native binary predating #499, the web
+stub, and any throw from outside the bridge carry neither; `describeStoreError` omits them rather
+than journalling `undefined`, and there is a test for that degraded shape specifically — it is the
+case that actually ships first, since JS updates OTA and native does not.
+
+⚠️ **A classified reject that nothing reads is a producer with no consumer** — the defect this repo
+repeats most, and #499 walked back into it: the plugins were taught to classify `consume`/
+`acknowledge`/`finish` failures while every one of those journal sites still printed `String(e)`, so
+a `billing.6` arrived and was discarded one line short of the log. Nothing failed, because those
+paths are deliberately non-fatal. **Every store rejection now goes through `journalStoreFailure`**
+(`iap.finish-failed`, `iap.acknowledge-failed`, `iap.entitlements-failed`, `iap.reconcile-failed`,
+`iap.dispose-failed`), with a test asserting the finish path carries `code`. Route new ones through
+it rather than calling `journal` with `String(e)`.
 
 ⚠️ **The decision rests on "a subscription unlocks nothing outside the app"** — no server-granted
 content, no single player spanning both stores. Those two are exactly what on-device verification
@@ -454,12 +549,30 @@ Kept because each is a class, not an incident.
 | `withInterruption` skipped the wrapper at `'none'`, so the device toggle could never arm | an optimisation for the state every build starts in |
 | A game swap landing during an await could write entitlements into the NEXT game's live `Set` (#434) — `stillActive(c)` was checked before the await but not immediately before the write that followed it | a check that guards the wrong moment |
 | `dispose()` existed and was called, but raced the constructor's own `addListener` round-trip, so the native listener still outlived the swap (#487) | a teardown that cannot see the setup it is undoing |
+| Every purchase failure on iOS reported `"Request Canceled"` — the catch-all rejected with `localizedDescription` alone, discarding the domain, code and underlying error (#499) | **a diagnostic that erases the difference it exists to report** |
+| A *thrown* `StoreKitError.userCancelled` fell into that same generic arm, so a player who backed out was reported as a failure — and reached `purchase_failed` analytics, which the design says a cancel must never do (#499) | one outcome with two code paths, only one of them handled |
 
-Two shapes recur. **A correct mechanism with a missing consumer** (rows 4, 5) — when touching this
+Three shapes recur. **A correct mechanism with a missing consumer** (rows 4, 5) — when touching this
 subsystem, sweep the *chain*, not the change. And **a check that cannot fail** (rows 1, 10): if a
 guard has never been observed rejecting anything, assume it does not work. The first row is the one
 to remember — it was found only by tracing the durability claim through four files into the
 storage backend, and every test and every device run had been green with it in place.
+
+The third, added by #499: **an error path that reports without classifying.** A failure that always
+says the same thing is indistinguishable from a failure that always happens for the same reason, and
+the cost is paid later, by whoever has to reproduce it on a phone. The owner hit a reproducible
+purchase failure whose journal line — `error: "Error: purchase failed: Request Canceled"` — was
+compatible with a user cancel, an `ASDErrorDomain`/`AMSErrorDomain` account or sandbox fault, and a
+network drop, all at once. The native plugins now carry `domain`/`code`/`underlying` through
+Capacitor's reject payload, `iap.purchase.failed` journals them, and the classification rides into
+`PurchaseResult.error`. **The test to apply when writing any error branch: could two causes that
+need different fixes produce the same line here?**
+
+⚠️ The fix for it had the same defect one layer up, which is worth more than the fix: the JS reader
+looked for the payload at the wrong depth, so a carefully-built diagnostic was assembled natively,
+serialized, and dropped on arrival — and the test asserted the reader's own wrong shape, so nothing
+went red. See § "A rejection carries a diagnosis" above. **A fake that models behaviour the real
+dependency does not have makes the guard defend the bug.**
 
 ---
 

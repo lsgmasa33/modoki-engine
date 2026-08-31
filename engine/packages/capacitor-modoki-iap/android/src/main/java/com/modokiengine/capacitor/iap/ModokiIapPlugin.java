@@ -84,7 +84,7 @@ public class ModokiIapPlugin extends Plugin {
         if (code != BillingClient.BillingResponseCode.OK || purchases == null) {
             if (call != null) {
                 awaitingPurchase = null;
-                call.reject("purchase failed: " + billingResult.getDebugMessage() + " (code " + code + ")");
+                rejectWithBilling(call, "purchase failed: " + billingResult.getDebugMessage(), billingResult);
             }
             return;
         }
@@ -240,7 +240,10 @@ public class ModokiIapPlugin extends Plugin {
                     + " msg=" + result.getDebugMessage() + " draining=" + batch.size());
                 for (Pending p : batch) {
                     if (ok) p.block.run(client);
-                    else p.call.reject("billing unavailable: " + result.getDebugMessage());
+                    // Structured too, and this is the one that matters most for the shelf: every
+                    // method reaches the store through this queue, so `products()` — whose failure
+                    // Court reports as `store_products_failed` — has no other reject path (#499).
+                    else rejectWithBilling(p.call, "billing unavailable: " + result.getDebugMessage(), result);
                 }
             }
 
@@ -267,6 +270,29 @@ public class ModokiIapPlugin extends Plugin {
     }
 
     @PluginMethod
+    /**
+     * Reject with a DIAGNOSIS, not just prose (#499).
+     *
+     * `getDebugMessage()` alone reads the same for a store outage, a lapsed merchant agreement and
+     * a developer-error config fault — and on the shelf path it is the only record of which it was.
+     *
+     * ⚠️ Capacitor does NOT flatten the `data` argument onto the JS Error: the 4-arg
+     * `PluginCall.reject` does `errorResult.put("data", data)`, and `native-bridge.js` copies only
+     * the payload's top-level keys across. So JS sees `error.code` as an own property and this
+     * detail one level down at `error.data.storeError` — which is where `describeStoreError` in
+     * the engine reads it. Change the nesting here and that reader goes silently blind.
+     */
+    private void rejectWithBilling(PluginCall call, String message, BillingResult result) {
+        int code = result.getResponseCode();
+        JSObject detail = new JSObject();
+        detail.put("domain", "BillingResponseCode");
+        detail.put("code", code);
+        detail.put("description", result.getDebugMessage());
+        JSObject data = new JSObject();
+        data.put("storeError", detail);
+        call.reject(message + " (code " + code + ")", "billing." + code, null, data);
+    }
+
     public void products(PluginCall call) {
         List<String> inapp = stringList(call, "inapp");
         List<String> subs = stringList(call, "subs");
@@ -378,7 +404,22 @@ public class ModokiIapPlugin extends Plugin {
                 QueryProductDetailsParams.newBuilder().setProductList(products).build(),
                 (billingResult, result) -> {
                     List<ProductDetails> list = result.getProductDetailsList();
-                    if (billingResult.getResponseCode() != BillingClient.BillingResponseCode.OK || list.isEmpty()) {
+                    // ⚠️ These two are DIFFERENT failures and must not share a message (#499). A
+                    // non-OK response means the store did not answer — SERVICE_UNAVAILABLE(2) or
+                    // NETWORK_ERROR(12) are the common ones — and calling that "unknown product"
+                    // tells the player and the log that a product they can see on the shelf does
+                    // not exist, which is the exact misdiagnosis this issue exists to kill. It is
+                    // also the worst place for it: this is the PURCHASE path, so unlike
+                    // consume/acknowledge the structured payload is actually read.
+                    if (billingResult.getResponseCode() != BillingClient.BillingResponseCode.OK) {
+                        rejectWithBilling(call, "could not look up " + productId + ": "
+                            + billingResult.getDebugMessage(), billingResult);
+                        return;
+                    }
+                    // OK but nothing returned: genuinely not offered here. The response code is
+                    // OK(0), so attaching it as a classification would be worse than the prose —
+                    // it names a success. Matches the iOS arm, which also rejects with prose alone.
+                    if (list.isEmpty()) {
                         call.reject("unknown product: " + productId);
                         return;
                     }
@@ -433,7 +474,7 @@ public class ModokiIapPlugin extends Plugin {
                     );
                     if (launch.getResponseCode() != BillingClient.BillingResponseCode.OK) {
                         awaitingPurchase = null;
-                        call.reject("could not open the purchase sheet: " + launch.getDebugMessage());
+                        rejectWithBilling(call, "could not open the purchase sheet: " + launch.getDebugMessage(), launch);
                     }
                 }
             );
@@ -506,7 +547,7 @@ public class ModokiIapPlugin extends Plugin {
                         if (c == BillingClient.BillingResponseCode.OK || c == BillingClient.BillingResponseCode.ITEM_NOT_OWNED) {
                             call.resolve();
                         } else {
-                            call.reject("consume failed: " + billingResult.getDebugMessage());
+                            rejectWithBilling(call, "consume failed: " + billingResult.getDebugMessage(), billingResult);
                         }
                     }
                 );
@@ -538,7 +579,7 @@ public class ModokiIapPlugin extends Plugin {
                 if (c == BillingClient.BillingResponseCode.OK || c == BillingClient.BillingResponseCode.ITEM_NOT_OWNED) {
                     call.resolve();
                 } else {
-                    call.reject("acknowledge failed: " + billingResult.getDebugMessage());
+                    rejectWithBilling(call, "acknowledge failed: " + billingResult.getDebugMessage(), billingResult);
                 }
             }
         );
