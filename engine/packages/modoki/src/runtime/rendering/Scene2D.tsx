@@ -33,7 +33,7 @@ import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Assets, Conta
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
 import { getAllTraits } from '../core/ecs/traitRegistry';
-import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text2D, TextAnimation, GroupAlpha } from '../traits';
+import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text2D, TextAnimation, GroupAlpha, Mask2D } from '../traits';
 import { MaterialInstance } from '../traits/MaterialInstance';
 import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from './text/textAnimate';
 import { getTime } from '../core/getTime';
@@ -65,6 +65,9 @@ import { coerceParamValue } from '../loaders/shaderSchema';
 import { register2DMaterialShaderMap, isEntity2DMaterialDirty } from './sprite2DMaterialBroker';
 import { computePaintOrder } from './paintOrder';
 import { computeGroupAlpha } from './groupAlpha';
+import { computeMaskGroups } from './maskGroups';
+import { buildMaskRamp } from './maskRamp';
+import { maskOffsetWorld } from './maskPlacement';
 import { findCanvasAncestor as resolveCanvasAncestor, Orphan2DTracker } from './canvas2DRouting';
 import {
   createParticleSync2DState, syncParticles2D, releaseCanvas2DEmitters, disposeParticleSync2DState,
@@ -72,7 +75,7 @@ import {
 } from './particleSync2D';
 import { addDirtyListener, onStructureDirty, readTraitData } from '../core/ecs/entityUtils';
 import { isSimRunning, onPlayStateChange } from '../core/playState';
-import { Canvas2DPool, defaultPool } from './canvas2DPool';
+import { Canvas2DPool, defaultPool, type Canvas2DSlot } from './canvas2DPool';
 import { registerBoundsProvider, type BoundsSurface, type EntityScreenBounds } from '../core/screenBounds';
 import { ensurePixiKtxTranscoder } from '../loaders/pixiKtxTranscoder';
 
@@ -262,6 +265,28 @@ function readTextureOverrides(entity: any): Map<string, string> | undefined {
   return out;
 }
 
+/** Record the scale that maps a mask Sprite's texture onto the authored half-extents.
+ *
+ *  A texture whose size is not yet known (an async sprite load still in flight — `Texture.EMPTY`
+ *  is 0x0 or 1x1) would divide to a garbage factor, so this leaves the base at 1 and lets the
+ *  next rebuild fix it once the bitmap has landed; `makeSprite` calls `markDirty` on load, which
+ *  is what brings that frame around. */
+function setMaskBaseScale(slot: MaskSlot, sp: Sprite, d: MaskData) {
+  const tw = sp.texture?.width ?? 0;
+  const th = sp.texture?.height ?? 0;
+  slot.baseScaleX = tw > 1 ? (d.width * 2) / tw : 1;
+  slot.baseScaleY = th > 1 ? (d.height * 2) / th : 1;
+}
+
+/** Whether two sparse entityId → maskId maps agree. Both are SPARSE (only masked entities
+ *  appear), so the common case — no masks anywhere, or a stable set — is a size check against
+ *  two empty maps and returns immediately. */
+function sameGrouping(a: ReadonlyMap<number, number>, b: ReadonlyMap<number, number>): boolean {
+  if (a.size !== b.size) return false;
+  for (const [id, mask] of a) if (b.get(id) !== mask) return false;
+  return true;
+}
+
 function disposeSlot(slot: Slot) {
   slot.obj.removeFromParent();
   // Skinned mesh: a Container holding one Mesh per rig part. Release each part's shared
@@ -339,6 +364,72 @@ interface RenderSnap {
   colliderSig: string;
   /** PixiJS blend mode string (from Renderable2D.blendMode). */
   blend: string;
+}
+
+/** A `Mask2D`'s authored fields plus its resolved WORLD transform, copied flat for the frame.
+ *  Flat copies rather than the koota trait object because both are recycled: the trait row and
+ *  `getWorldTransform2D`'s return are each shared storage that the next read overwrites. */
+interface MaskData {
+  mode: 'rect' | 'texture';
+  width: number; height: number; pivotX: number; pivotY: number;
+  cornerRadius: number; feather: number; sprite: string;
+  /** The clip rect's centre, in the mask entity's own LOCAL space (design px) — see Mask2D's
+   *  `offsetX`/`offsetY` doc. Applied on top of the entity's WORLD transform below, not composed
+   *  into it, so the entity itself can stay at identity while the rect sits elsewhere. */
+  offsetX: number; offsetY: number;
+  x: number; y: number; rz: number; sx: number; sy: number;
+}
+
+/** Per-`Mask2D`-entity render state (#449).
+ *
+ *  The PixiJS tree this renderer builds is otherwise FLAT — every display object goes straight
+ *  onto its Canvas2D slot container — but a Pixi mask applies to ONE display object, so masking a
+ *  subtree needs a real container to hang it on. Each enabled `Mask2D` gets exactly one:
+ *  `container` holds every display object the mask clips, and `maskObj` is what clips them.
+ *
+ *  ⚠️ `container` stays at IDENTITY transform. Children already carry fully-composed WORLD
+ *  transforms (see the `getWorldTransform2D` writes below), so a container that transformed
+ *  anything would apply it twice. It exists only to be something a mask can attach to.
+ *
+ *  ⚠️ A masked group therefore becomes a contiguous z-BAND: `sortableChildren` sorts within the
+ *  container, and the container itself sorts among its siblings by the mask entity's own paint
+ *  index. Entities outside the group cannot interleave with entities inside it. That is a real
+ *  authoring constraint, documented on the trait.
+ *
+ *  `kind` records which Pixi pipe the mask resolved to, because it decides teardown: Pixi picks
+ *  `AlphaMask` for a `Sprite` and `StencilMask` for any other `Container`, tested in that order
+ *  (`pixi.js/lib/rendering/init.mjs` registers `AlphaMask, ColorMask, StencilMask`). An alpha mask
+ *  owns a generated or loaded Texture that has to be released; a stencil `Graphics` does not.
+ *
+ *  `sig` is the geometry+mode signature the mask object was last built from — rebuilding is
+ *  expensive for the alpha path (it rasterises a ramp), so it happens only when this changes, or
+ *  (texture mode) when `forceAll` fires while the sprite is still showing an unsized placeholder
+ *  bitmap (`stillPlaceholder`, below). Deliberately excludes `offsetX`/`offsetY`/the compensation
+ *  factor — nothing the rebuild reads depends on them; they only feed the per-frame placement
+ *  writes further down, so folding them in would rasterise a fresh ramp on every Inspector drag. */
+interface MaskSlot {
+  container: Container;
+  maskObj: Graphics | Sprite;
+  kind: 'stencil' | 'alpha';
+  sig: string;
+  canvasId: number;
+  /** Sprite-texture URL retained for an alpha mask in `texture` mode, '' otherwise. Released on
+   *  rebuild and on dispose so the shared sprite-texture refcount balances. */
+  textureUrl: string;
+  /** A Texture this slot GENERATED (the feathered ramp) and therefore owns outright. Distinct
+   *  from `textureUrl`, which names a shared, refcounted asset this slot merely borrows. */
+  ownedTexture: Texture | null;
+  /** Scale that maps the mask OBJECT's intrinsic size onto the authored half-extents, before the
+   *  entity's own world scale is applied.
+   *
+   *  ⚠️ This exists because Pixi implements `sprite.width = n` AS A SCALE against the texture's
+   *  pixel size — so the per-frame `scale.set(worldScale)` below would silently undo the sizing
+   *  done at build, and an alpha mask would collapse to its raw texture dimensions. (Measured:
+   *  the crossword's 984x751 design-px clip shrank to the ~256px ramp and masked away all but a
+   *  sliver of the grid, with every unit test and the typecheck green.) A `Graphics` mask draws
+   *  its geometry in design units already and keeps 1. */
+  baseScaleX: number;
+  baseScaleY: number;
 }
 
 /** Per-entity snapshot for the SkinnedSprite2D (mesh) pass — mirrors RenderSnap but
@@ -492,6 +583,23 @@ export class Scene2DRenderer {
    *  entities actually faded appear, so a scene with no GroupAlpha keeps an empty map and
    *  every read falls through to 1. */
   private groupAlphaOf = new Map<number, number>();
+  /** entityId → the `Mask2D` entity clipping it (#449). SPARSE, exactly like `groupAlphaOf`: a
+   *  scene with no mask keeps an empty map and every lookup falls through to "no mask". */
+  private maskGroupOf = new Map<number, number>();
+  /** maskId → its nearest ANCESTOR mask, so mask containers nest and their clips INTERSECT. */
+  private parentMaskOf = new Map<number, number>();
+  /** maskId → its live container + mask object. Persists across frames; entries are built on
+   *  first sight and dropped by the end-of-frame sweep when the mask entity goes away. */
+  private readonly maskSlots = new Map<number, MaskSlot>();
+  /** Mask entity ids seen THIS frame — the sweep's liveness set, mirroring `activeIds`. */
+  private readonly activeMaskIds = new Set<number>();
+  /** `${maskId}|${sprite}` keys that already logged the unresolved-texture-ref warning, so a
+   *  `texture`-mode mask with a bad `sprite` ref warns ONCE rather than on every `forceAll`
+   *  rebuild. Keyed on the REF too, not just the mask id (round 2, Fix 5) — keying on id alone
+   *  missed two cases: an author fixes bad GUID A then mistypes GUID B (no warning, since A
+   *  already "used up" the warn-once slot), and koota recycling a deleted mask's id onto a new
+   *  mask that also happens to have a bad ref (no warning, inherited from the dead entity). */
+  private readonly warnedMaskIds = new Set<string>();
   private readonly canvasOfEntity = new Map<number, number>();   // entityId → canvas2D entityId (cached)
   private readonly canvasEntityIds = new Set<number>();          // all Canvas2D entity IDs this frame
   private readonly canvasCompensate = new Map<number, { x: number; y: number }>();  // canvasEntityId → shape compensation
@@ -613,6 +721,242 @@ export class Scene2DRenderer {
     const result = resolveCanvasAncestor(entityId, this.parentOfEntity, this.canvasEntityIds, this.ancestorPath);
     for (const id of this.ancestorPath) this.canvasOfEntity.set(id, result ?? 0);
     return result;
+  }
+
+  /** The container a display object belongs in: its mask group's, or the canvas's when unmasked.
+   *
+   *  Every pass routes its `addChild` through here so the five of them cannot drift — the sprite,
+   *  material, skinned-mesh and text passes each used to name `canvasSlot.container` directly, and
+   *  a mask that only some of them honoured would clip a rig but not its label. */
+  private containerFor(canvasSlot: Canvas2DSlot, entityId: number): Container {
+    const maskId = this.maskGroupOf.get(entityId);
+    if (maskId === undefined) return canvasSlot.container;
+    const ms = this.maskSlots.get(maskId);
+    // No slot yet (or the mask lost its canvas) ⇒ fall back to the canvas container rather than
+    // dropping the object. An unmasked frame is a cosmetic miss; a missing parent is invisible
+    // content, and the mask slot is normally built earlier in this same frame.
+    return ms ? ms.container : canvasSlot.container;
+  }
+
+  /** Build/refresh one container + mask object per enabled `Mask2D` (#449).
+   *
+   *  ⚠️ Ordering is load-bearing twice over. It runs AFTER canvas slots are allocated (a mask
+   *  needs the container it hangs under) and BEFORE the renderable passes (they look their mask
+   *  container up through `containerFor`). Within itself it walks masks OUTERMOST-FIRST, so a
+   *  nested mask's parent container already exists when it is parented — the nesting is what
+   *  makes overlapping masks intersect instead of the innermost simply winning. */
+  private syncMaskSlots(maskDataOf: ReadonlyMap<number, MaskData>, forceAll: boolean) {
+    if (maskDataOf.size === 0) return;
+
+    // Depth = how many masks enclose this one. `parentMaskOf` is a strict-ancestor chain and
+    // `computeMaskGroups` guarantees it is acyclic, but the bound is kept anyway: this runs every
+    // frame on scene data an author can edit, and a hang here takes the whole render loop with it.
+    const depthOf = (id: number): number => {
+      let d = 0;
+      for (let p = this.parentMaskOf.get(id); p !== undefined && d <= maskDataOf.size; p = this.parentMaskOf.get(p)) d++;
+      return d;
+    };
+    const ordered = [...maskDataOf.keys()].sort((a, b) => depthOf(a) - depthOf(b));
+
+    for (const maskId of ordered) {
+      const d = maskDataOf.get(maskId)!;
+      const canvasId = this.findCanvasAncestor(maskId);
+      // A mask outside every Canvas2D clips nothing, because the things it would clip are
+      // themselves unrenderable. Drop any slot it had rather than leaving an orphan container.
+      if (canvasId == null) { this.disposeMaskSlot(maskId); continue; }
+      const canvasSlot = this.pool.getSlot(canvasId);
+      if (!canvasSlot) { this.disposeMaskSlot(maskId); continue; }
+
+      this.activeMaskIds.add(maskId);
+      const comp = this.canvasCompensate.get(canvasId) ?? this._oneComp;
+      // `texture` mode also depends on state that isn't a MaskData field: the sprite's slice
+      // epoch (bumped by a re-import/re-slice — same source ordinary sprite slots key on, see
+      // `builtEpoch !== spriteEpoch` below) and whether the GUID currently resolves at all (a bad
+      // ref that later resolves, or vice versa). Neither is folded into `stillPlaceholder` —
+      // that only covers an in-flight ASYNC load of an already-resolved sprite — so without this
+      // a re-slice or a fixed/broken ref would never trigger a rebuild (round 2, Fix 2).
+      const texSig = d.mode === 'texture' ? `${getSpriteEpoch(d.sprite)}|${resolveSprite(d.sprite) ? 1 : 0}` : '';
+      const sig = `${d.mode}|${d.width}|${d.height}|${d.pivotX}|${d.pivotY}|${d.cornerRadius}|${d.feather}|${d.sprite}|${texSig}`;
+
+      let slot = this.maskSlots.get(maskId);
+      if (!slot) {
+        const container = new Container();
+        container.sortableChildren = true;
+        slot = { container, maskObj: new Graphics(), kind: 'stencil', sig: '', canvasId, textureUrl: '', ownedTexture: null, baseScaleX: 1, baseScaleY: 1 };
+        this.maskSlots.set(maskId, slot);
+      }
+
+      // Rebuild the mask object only when its SHAPE changed — the alpha path rasterises a ramp
+      // (~50k iterations) and does a fresh GPU upload, which is far too expensive to redo on every
+      // `forceAll` frame (an editor trait write or gizmo drag on ANY entity, not just this mask).
+      // `forceAll` alone earns a rebuild in exactly ONE case: a `texture`-mode mask's sprite is
+      // still showing the unsized/placeholder texture (`Texture.EMPTY`, or a 0/1px bitmap) an
+      // async load hasn't landed for yet — `makeSprite` calls `markDirty()` on that load, which
+      // raises `_externalDirty` → `forceAll` on the very next frame, so this still gets rebuilt
+      // once the real bitmap (and its size, for `setMaskBaseScale`) is available.
+      const stillPlaceholder = slot.kind === 'alpha' && (() => {
+        const tex = (slot.maskObj as Sprite).texture;
+        return !tex || tex === Texture.EMPTY || tex.width <= 1 || tex.height <= 1;
+      })();
+      if (slot.sig !== sig || (forceAll && stillPlaceholder)) {
+        this.rebuildMaskObject(slot, d, maskId);
+        slot.sig = sig;
+        this.dirtyCanvases.add(canvasId);
+      }
+
+      // Re-home the container if its canvas or its enclosing mask changed.
+      const parentMaskId = this.parentMaskOf.get(maskId);
+      const parentSlot = parentMaskId !== undefined ? this.maskSlots.get(parentMaskId) : undefined;
+      const wantParent = parentSlot ? parentSlot.container : canvasSlot.container;
+      if (slot.container.parent !== wantParent) {
+        slot.container.removeFromParent();
+        wantParent.addChild(slot.container);
+        this.dirtyCanvases.add(canvasId);
+        if (slot.canvasId !== canvasId) this.dirtyCanvases.add(slot.canvasId); // the canvas it left redraws too
+        slot.canvasId = canvasId;
+      }
+
+      // The group's z-band: the mask entity's own paint index places the WHOLE group among its
+      // siblings (see MaskSlot's doc — entities outside cannot interleave with those inside).
+      const paint = this.paintOrderOf.get(maskId) ?? 0;
+      if (slot.container.zIndex !== paint) { slot.container.zIndex = paint; this.dirtyCanvases.add(canvasId); }
+
+      // Place the mask object itself. It lives INSIDE the container it masks (the ordinary Pixi
+      // arrangement — Pixi marks a mask non-renderable), and the container is identity, so the
+      // mask is positioned in the same fully-composed WORLD design space as the children.
+      //
+      // `offsetX`/`offsetY` (Mask2D's escape from the "moving the entity moves everything it
+      // clips" trap) are authored in the mask entity's own LOCAL space, so they need the SAME
+      // rotate+scale that carries a local vector into world space before adding it to the
+      // entity's world position — a bare `d.x + d.offsetX` would be right only for an unrotated,
+      // unit-scale mask.
+      const { ox, oy } = maskOffsetWorld(d.offsetX, d.offsetY, d.rz, d.sx, d.sy, comp.x, comp.y);
+      const wantX = d.x + ox, wantY = d.y + oy;
+      const obj = slot.maskObj;
+      const px = obj.position.x, py = obj.position.y;
+      if (px !== wantX || py !== wantY || obj.rotation !== d.rz) this.dirtyCanvases.add(canvasId);
+      obj.position.set(wantX, wantY);
+      obj.rotation = d.rz;
+      obj.scale.set(slot.baseScaleX * d.sx * comp.x, slot.baseScaleY * d.sy * comp.y);
+    }
+  }
+
+  /** Build the cheap hard-edged path: a `Graphics` rounded-rect, resolved to a `StencilMask`. Its
+   *  own method because two callers reach it — the ordinary `feather: 0` rect mask, and a
+   *  `texture`-mode mask whose sprite ref hasn't resolved and whose feather is 0 too (see the
+   *  fallback below), which has no business paying for an alpha ramp it can't even source from. */
+  private buildStencilMask(slot: MaskSlot, d: MaskData) {
+    const g = new Graphics();
+    const { ox, oy } = computePivotOffset(d.width, d.height, d.pivotX, d.pivotY);
+    const r = Math.max(0, Math.min(d.cornerRadius, Math.min(d.width, d.height)));
+    g.roundRect(ox, oy, d.width * 2, d.height * 2, r);
+    g.fill(0xffffff);
+    slot.container.addChild(g);
+    slot.maskObj = g; slot.kind = 'stencil';
+    slot.baseScaleX = 1; slot.baseScaleY = 1; // geometry is already in design units
+    slot.container.mask = g;
+  }
+
+  /** (Re)build a mask slot's mask object for the shape `d` describes, releasing whatever the slot
+   *  held before. Which Pixi pipe this lands in is decided ENTIRELY by the object's class:
+   *  `Sprite` ⇒ AlphaMask (soft, a filter pass), anything else ⇒ StencilMask (hard, cheap).
+   *  `maskId` is only for `warnedMaskIds` — throttling the unresolved-ref warning below to once per
+   *  mask entity PER REF, rather than once per rebuild. */
+  private rebuildMaskObject(slot: MaskSlot, d: MaskData, maskId: number) {
+    slot.maskObj.removeFromParent();
+    slot.maskObj.destroy();
+    if (slot.textureUrl) { releaseSpriteTexture(slot.textureUrl); slot.textureUrl = ''; }
+    if (slot.ownedTexture) { slot.ownedTexture.destroy(true); slot.ownedTexture = null; }
+
+    const wantsAlpha = d.mode === 'texture' || d.feather > 0;
+    if (!wantsAlpha) { this.buildStencilMask(slot, d); return; }
+
+    if (d.mode === 'texture') {
+      const resolved = resolveSprite(d.sprite);
+      if (resolved) {
+        const sp = this.makeSprite(resolved, slot.container); // retains the texture + handles async load
+        sp.anchor.set(d.pivotX, d.pivotY);
+        // The authored half-extents drive the size regardless of the source bitmap's dimensions:
+        // a mask is a SHAPE, and letting the image's pixel size decide its extent would make the
+        // clip silently depend on which PNG got dropped in. Recorded as a BASE scale rather than
+        // written to `.width`, which the per-frame world-scale write would overwrite.
+        setMaskBaseScale(slot, sp, d);
+        slot.maskObj = sp; slot.kind = 'alpha'; slot.textureUrl = resolved.url;
+        slot.container.mask = sp;
+        return;
+      }
+      // Unresolvable GUID ⇒ fall through rather than leaving the subtree unmasked — a mask that
+      // vanishes on a bad ref shows content that was meant to be clipped, which reads as a
+      // rendering bug somewhere else entirely. Warn once per mask entity PER REF, not once per
+      // rebuild — this ref stays unresolved across every `forceAll` frame until an author fixes
+      // it, and keying on the ref too means a later mistyped ref still warns.
+      const warnKey = `${maskId}|${d.sprite}`;
+      if (!this.warnedMaskIds.has(warnKey)) {
+        console.warn(`[Scene2D] Mask2D texture ref did not resolve: ${d.sprite}`);
+        this.warnedMaskIds.add(warnKey);
+      }
+      // A hard edge doesn't need an alpha ramp it has no source image for — fall through to the
+      // cheap Graphics stencil instead. The trait's own default is `sprite: ''`, so switching
+      // `mode` to 'texture' in the Inspector before picking a sprite hits this every time.
+      if (d.feather <= 0) { this.buildStencilMask(slot, d); return; }
+    }
+
+    // The feathered ramp is rasterised analytically (`buildMaskRamp`, a rounded-box SDF) rather
+    // than by blurring a rect: no dependency on Canvas2D `filter`, deterministic, and unit-tested
+    // as a pure function. It goes through a canvas because Pixi's Texture source wants an image
+    // element, not a bare ImageData; `createImageData` + `set` also avoids the ImageData
+    // constructor's array-type overloads.
+    const ramp = buildMaskRamp(d.width, d.height, d.cornerRadius, d.feather);
+    const cv = document.createElement('canvas');
+    cv.width = ramp.width; cv.height = ramp.height;
+    const ctx = cv.getContext('2d');
+    if (!ctx) {
+      // No 2D context (a headless or context-starved host) — there is no bitmap to rasterise the
+      // feather into. `Texture.WHITE` used to stand in here, but it's 1×1 and `setMaskBaseScale`'s
+      // `tw > 1` guard leaves `baseScale` at 1 for a 1px texture — so it clipped the WHOLE subtree
+      // to nothing, the opposite of "shows too much rather than too little". Fall back to the
+      // hard-edged Graphics stencil instead: it needs no texture at all, so the mask still clips
+      // to the right RECT — it just loses the feather. Losing softness is a far better failure
+      // than losing the content.
+      console.warn('[Scene2D] Mask2D feather ramp: no 2D context; falling back to an unfeathered mask');
+      this.buildStencilMask(slot, d);
+      return;
+    }
+    const img = ctx.createImageData(ramp.width, ramp.height);
+    img.data.set(ramp.data);
+    ctx.putImageData(img, 0, 0);
+    const tex = Texture.from(cv);
+    const sp = new Sprite(tex);
+    sp.anchor.set(d.pivotX, d.pivotY);
+    setMaskBaseScale(slot, sp, d);
+    slot.container.addChild(sp);
+    // This texture was generated right above (the no-context case returned early into the
+    // stencil fallback instead), so unlike a loaded sprite texture it's owned outright here.
+    slot.maskObj = sp; slot.kind = 'alpha'; slot.ownedTexture = tex;
+    slot.container.mask = sp;
+  }
+
+  /** Tear one mask group down: unmask, detach, destroy the container WITHOUT its children, and
+   *  release whatever texture the mask object held.
+   *
+   *  ⚠️ `{ children: false }` is the load-bearing half. The container's children are live display
+   *  objects owned by entity slots that may well still exist — destroying them here would take
+   *  out sprites whose entities are perfectly alive, and they would come back only on a full
+   *  rebuild. They are re-homed to the canvas container by `containerFor` on the next frame. */
+  private disposeMaskSlot(maskId: number) {
+    const slot = this.maskSlots.get(maskId);
+    if (!slot) return;
+    slot.container.mask = null;
+    for (const child of [...slot.container.children]) {
+      if (child !== slot.maskObj) child.removeFromParent();
+    }
+    slot.maskObj.destroy();
+    if (slot.textureUrl) releaseSpriteTexture(slot.textureUrl);
+    if (slot.ownedTexture) slot.ownedTexture.destroy(true);
+    slot.container.removeFromParent();
+    slot.container.destroy({ children: false });
+    this.maskSlots.delete(maskId);
+    this.dirtyCanvases.add(slot.canvasId);
   }
 
   private makeSprite(resolved: ResolvedSprite, container: Container): Sprite {
@@ -775,10 +1119,11 @@ export class Scene2DRenderer {
     // (1) Idle whole-frame skip — while the sim is stopped/paused, 2D only changes
     // via paths that set _externalDirty, so idle + clean ⇒ no ECS scan, no render.
     if (!isSimRunning() && !this._externalDirty && !previewing2D && !previewChanged2D) return;
-    const forceAll = this._externalDirty; // external edit / load / resize / swap ⇒ redraw all
+    let forceAll = this._externalDirty; // external edit / load / resize / swap ⇒ redraw all
     this._externalDirty = false;
 
     this.activeIds.clear();
+    this.activeMaskIds.clear();
     this.parentOfEntity.clear();
     this.sortOrderOfEntity.clear();
     this.canvasOfEntity.clear();
@@ -812,6 +1157,43 @@ export class Scene2DRenderer {
       if (g.alpha !== 1) groupAlphaOfEntity.set(entity.id(), g.alpha);
     });
     this.groupAlphaOf = computeGroupAlpha(groupAlphaOfEntity, this.parentOfEntity);
+    // 2D masking (#449): which Mask2D clips which entity, and how masks nest. Same sparse-walk
+    // shape as the group alpha above and skipped entirely when nothing carries the trait — a
+    // scene with no mask pays one `.size` check. `isEnabled: false` is dropped HERE rather than
+    // at draw time, so a disabled mask contributes no group at all and its would-be children
+    // route straight to the canvas container, which is what "disabled" has to mean.
+    const maskIds = new Set<number>();
+    const maskDataOf = new Map<number, MaskData>();
+    world.query(Transform, Mask2D).updateEach(([tf, m]: any[], entity: any) => {
+      if (!m.isEnabled) return;
+      const mid = entity.id();
+      maskIds.add(mid);
+      // ⚠️ `getWorldTransform2D` returns a SHARED module singleton (see renderUtils' alias
+      // hazard note) — copy the six numbers out NOW. Holding the object would leave every mask
+      // in this map pointing at whichever entity happened to be read last.
+      const mwt = getWorldTransform2D(mid, tf);
+      maskDataOf.set(mid, {
+        mode: m.mode === 'texture' ? 'texture' : 'rect',
+        width: m.width, height: m.height, pivotX: m.pivotX, pivotY: m.pivotY,
+        cornerRadius: m.cornerRadius, feather: m.feather, sprite: m.sprite,
+        offsetX: m.offsetX, offsetY: m.offsetY,
+        x: mwt.x, y: mwt.y, rz: mwt.rz, sx: mwt.sx, sy: mwt.sy,
+      });
+    });
+    const masking = computeMaskGroups(maskIds, this.parentOfEntity);
+    // ⚠️ A change in WHICH mask clips an entity has to force a full redraw, and this is the only
+    // place that can notice. Every pass below early-returns on an unchanged per-entity snapshot
+    // and only re-parents AFTER that guard, so an entity that entered or left a mask without
+    // otherwise changing — a mask toggled off, a subtree reparented, a level rebuilt — would keep
+    // its old container forever and render clipped by a mask that no longer owns it.
+    //
+    // Folded into `forceAll` rather than threaded as a field through the sprite/material/skinned/
+    // text snapshots: four parallel `changed` tests is four chances to miss one, and this costs a
+    // single full redraw on a frame where group membership moved, which is a scene-build event
+    // rather than a per-frame one. Compared BEFORE step 2 so the flag reaches every consumer.
+    if (!sameGrouping(this.maskGroupOf, masking.groupOf)) forceAll = true;
+    this.maskGroupOf = masking.groupOf;
+    this.parentMaskOf = masking.parentMaskOf;
 
     // Step 2: Collect Canvas2D entity IDs and set up their pool slots + scaler. A
     // canvas is dirty when its scaler output changed (resize / referenceWidth /
@@ -851,6 +1233,11 @@ export class Scene2DRenderer {
         }
       },
     );
+
+    // Mask groups (#449): one container + mask object per enabled Mask2D. MUST run after the
+    // canvas slots above (a mask needs a container to hang under) and before every renderable
+    // pass below (each routes its addChild through `containerFor`, which reads these slots).
+    this.syncMaskSlots(maskDataOf, forceAll);
 
     // Step 3: Query all Renderable2D entities, find their Canvas2D ancestor, and —
     // when their render inputs changed since last frame — redraw.
@@ -996,10 +1383,11 @@ export class Scene2DRenderer {
         this.dirtyCanvases.add(canvasId);
         if (snap && snap.canvasId !== canvasId) this.dirtyCanvases.add(snap.canvasId); // left a canvas → it redraws too
 
-        // Ensure display object is in the right container
-        if (displaySlot.obj.parent !== canvasSlot.container) {
+        // Ensure display object is in the right container — its mask group's when one clips it.
+        const wantParent = this.containerFor(canvasSlot, id);
+        if (displaySlot.obj.parent !== wantParent) {
           displaySlot.obj.removeFromParent();
-          canvasSlot.container.addChild(displaySlot.obj);
+          wantParent.addChild(displaySlot.obj);
         }
         // Stack by hierarchy paint order (sortableChildren re-sorts on render).
         displaySlot.obj.zIndex = paint;
@@ -1145,7 +1533,7 @@ export class Scene2DRenderer {
         if (!slot) {
           const shader = makePixiShaderInstance(program, tex, undefined, extraTextures);
           const mesh = new Mesh({ geometry: buildMaterialQuad(rend.width, rend.height, px, py), texture: tex, shader });
-          canvasSlot.container.addChild(mesh);
+          this.containerFor(canvasSlot, id).addChild(mesh);
           if (!preRetained) for (const u of newUrls) retainSpriteTexture(u);
           slot = { kind: 'material', obj: mesh, spriteRef: rend.material, textureUrl: texUrl, hasFrame: matHasFrame, builtEpoch: 0, meshVersion: -1, matShader: shader, matGuid: rend.material, matSig, materialTexUrls: matTexUrls };
           this.slots.set(id, slot);
@@ -1155,7 +1543,7 @@ export class Scene2DRenderer {
 
         // Ensure parented to the right canvas (an entity can move between canvases).
         const mesh = slot.obj as Mesh;
-        if (mesh.parent !== canvasSlot.container) { mesh.removeFromParent(); canvasSlot.container.addChild(mesh); }
+        { const wp = this.containerFor(canvasSlot, id); if (mesh.parent !== wp) { mesh.removeFromParent(); wp.addChild(mesh); } }
 
         const comp = this.canvasCompensate.get(canvasId) || { x: 1, y: 1 };
         const wt = getWorldTransform2D(id, tf);
@@ -1290,7 +1678,7 @@ export class Scene2DRenderer {
             meshes.push(mesh);
             partUrls.push(part.url);
           }
-          canvasSlot.container.addChild(container);
+          this.containerFor(canvasSlot, id).addChild(container);
           slot = { kind: 'mesh', obj: container, meshes, partUrls, spriteRef: ss.rig, textureUrl: '', hasFrame: false, builtEpoch: 0, meshVersion: -1, meshFrameKey: sig };
           this.slots.set(id, slot);
         }
@@ -1316,7 +1704,7 @@ export class Scene2DRenderer {
 
         const container = slot.obj as Container;
         const meshes = slot.meshes ?? [];
-        if (container.parent !== canvasSlot.container) { container.removeFromParent(); canvasSlot.container.addChild(container); }
+        { const wp = this.containerFor(canvasSlot, id); if (container.parent !== wp) { container.removeFromParent(); wp.addChild(container); } }
 
         // Re-upload each part's deformed positions only when the skin version advanced.
         if (slot.meshVersion !== deform) {
@@ -1413,7 +1801,7 @@ export class Scene2DRenderer {
           const style = textStyle2D(t);
           if (!slot) {
             const container = new Container();
-            canvasSlot.container.addChild(container);
+            this.containerFor(canvasSlot, id).addChild(container);
             slot = { kind: 'text', obj: container, spriteRef: t.font, textureUrl: '', hasFrame: false, builtEpoch: 0, meshVersion: -1, meshFrameKey: layoutHash, pageMeshes: [], textShaders: [], textW: layout.width, textH: layout.height };
             this.slots.set(id, slot);
           }
@@ -1506,7 +1894,7 @@ export class Scene2DRenderer {
         this.dirtyCanvases.add(canvasId);
         if (snap && snap.canvasId !== canvasId) this.dirtyCanvases.add(snap.canvasId);
 
-        if (container.parent !== canvasSlot.container) { container.removeFromParent(); canvasSlot.container.addChild(container); }
+        { const wp = this.containerFor(canvasSlot, id); if (container.parent !== wp) { container.removeFromParent(); wp.addChild(container); } }
 
         if (!snap || snap.styleHash !== styleHash) { const style = textStyle2D(t); for (const s of slot.textShaders ?? []) updateMtsdfPixiStyle(s, style); }
 
@@ -1562,6 +1950,17 @@ export class Scene2DRenderer {
         this.lastRender.delete(id);
         this.lastMeshRender.delete(id);
         this.lastTextRender.delete(id);
+      }
+    }
+
+    // Drop mask groups whose Mask2D entity went away, was disabled, or lost its canvas (#449).
+    // Runs AFTER the entity sweep above so a mask and its children disappearing together tear
+    // down in dependency order. Children that OUTLIVE their mask are not destroyed with it — see
+    // `disposeMaskSlot` — and `forceAll` was already raised this frame by the grouping change, so
+    // they re-home to the canvas container on this very frame rather than blinking out for one.
+    if (this.maskSlots.size) {
+      for (const maskId of [...this.maskSlots.keys()]) {
+        if (!this.activeMaskIds.has(maskId)) this.disposeMaskSlot(maskId);
       }
     }
 
@@ -1676,6 +2075,17 @@ export class Scene2DRenderer {
       if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures2D(this);
       for (const slot of this.slots.values()) disposeSlot(slot);
       this.slots.clear();
+      // Mask groups (#449) — after the entity slots, mirroring `stop()`'s order and its own
+      // comment: each releases its own texture, and `disposeMaskSlot` deliberately does NOT
+      // destroy the container's children (already destroyed/detached above). Left out of this
+      // block before — koota recycles entity ids across the swap, so a stale mask slot here would
+      // alias the new world's recycled id onto a dead Texture.
+      for (const maskId of [...this.maskSlots.keys()]) this.disposeMaskSlot(maskId);
+      this.maskSlots.clear();
+      this.activeMaskIds.clear();
+      this.maskGroupOf.clear();
+      this.parentMaskOf.clear();
+      this.warnedMaskIds.clear();
       this.entityShaders.clear();
       this._materialTexLoading.clear();
       // 2D-material programs are world-lifecycle — clear UNCONDITIONALLY (not renderer-count
@@ -1739,11 +2149,21 @@ export class Scene2DRenderer {
     if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures2D(this);   // before disposeSlot — see the onWorldSwap note
     for (const slot of this.slots.values()) disposeSlot(slot);
     this.slots.clear();
+    // Mask groups (#449) — after the entity slots, mirroring the per-frame sweep's order. Each
+    // releases its own texture, and `disposeMaskSlot` deliberately does NOT destroy the
+    // container's children: by this point they are already destroyed and detached above, and a
+    // `{ children: true }` here would double-destroy them.
+    for (const maskId of [...this.maskSlots.keys()]) this.disposeMaskSlot(maskId);
+    this.maskSlots.clear();
     this.entityShaders.clear();
     this._materialTexLoading.clear();
     // Unconditional (see onWorldSwap): safe with a sibling renderer live — only empties Maps.
     clearSpriteMaterialCache();
     this.activeIds.clear();
+    this.activeMaskIds.clear();
+    this.maskGroupOf.clear();
+    this.parentMaskOf.clear();
+    this.warnedMaskIds.clear();
     this.prevCanvasIds.clear();
     this.parentOfEntity.clear();
     this.canvasOfEntity.clear();

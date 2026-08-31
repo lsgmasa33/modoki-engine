@@ -113,21 +113,66 @@ Per track kind:
   means the *parent* stops driving the child, so the child runs free on its own clock instead of
   freezing (see the sub-director section below). This was already correct and already documented.
 
-**`applyTimelineState`'s pose path keeps its blanket `if (track.muted) continue`, and that is
-deliberately NOT touched by the above.** The reason is scope, not category: `applyTimelineState` is
-**one** implementation shared by real Play and the editor scrub, so unlike the edge path it *cannot*
-drift between the two surfaces — and drift is what #446 was. Whatever it does, it does consistently.
+**`applyTimelineState`'s pose path is now PER-TYPE, not a blanket `if (track.muted) continue`** —
+that changed with #452. A keyframe `animation` track keeps the blanket skip: a pose has no stored
+*base* to restore, so "contributes nothing" has no off value, and this is the right answer on its
+merits (not scope leftover). An `activation` track DOES have a natural base — the entity's authored
+`EntityAttributes.isActive` — so it is still processed while muted, to reconcile that base back in.
 
-For a keyframe `animation` track that is also the right answer on its merits: a pose has no stored
-*base* to restore, so "contributes nothing" has no off value.
+**Muting an activation track hands the entity back to its authored `isActive`** (#452), completing
+#446's "a muted track contributes nothing" contract for the one track kind #446 had to skip. Every
+activation track in one timeline's `def.tracks` is swept into a per-TARGET decision before any of
+them writes `isActive` — the sweep completing before any write is what makes the captured base
+authoritative, not the absence of other writers.
 
-⚠️ **An `activation` track is arguably a different case, and this is an open question, not a settled
-one.** Muting one mid-span leaves `EntityAttributes.isActive` frozen at whatever the track last
-wrote, and unlike a pose there IS a natural off value — what `desired` would be with this track
-excluded. That is the same strand-the-effect shape #446 fixed on the edge path. It was left alone
-because both surfaces already agree, so changing it is a behaviour decision rather than a drift fix.
-**Tracked as #452 — do not "complete" the reconcile here without reading it**; it lays out both
-options and why handing the entity back needs somewhere to read the authored value FROM. (#446)
+**Only a track that actually DRIVES the entity captures a base — an unmuted one.** A track authored
+`muted:true` from the start never drives the entity, so it must never capture and must never hand
+anything back either: nothing was ever captured, so there is nothing to restore (mirroring the mute
+memo's own absent/false distinction). Capturing on sight regardless of mute state was tried and was
+wrong — it let a track that never drove the entity license a hand-back it had no business making.
+
+**The capturing pass OWNS the base, and only that owner hands it back.** The base is keyed on world
+epoch + the resolved target entity's id + generation, plus the owning Director+timeline
+(`rootId:rootGeneration:def.id`) recorded alongside the value. `EntityAttributes.isActive` is not
+exclusively written by one track — a second activation track on the same target, a second Director,
+or game code can all write it too — so a bare per-target key is not enough: without the owner, a
+MUTED track on one Director could restore a base an UNMUTED track on a *different* Director is
+actively driving, because both resolve to the same target entity. A non-owner's muted track leaves
+the entry alone rather than deleting it, so the real owner still finds it.
+
+**"An unmuted track always wins over a muted one, regardless of track order" holds WITHIN one
+timeline's `def.tracks`** — that is where the per-target sweep-then-decide runs. Across two
+Directors it does not automatically hold: each runs its own `applyTimelineState` pass, and the
+owner guard above is what keeps one Director's mute from reaching into another's.
+
+**Residual, pre-existing ambiguity, not something #452 introduced:** if two Directors both drive one
+entity's activation while unmuted, and the OWNER Director is then muted, its hand-back can still
+race the other Director's write for a frame — which one poses last inside that frame decides.
+Contested multi-Director activation on one entity was already undefined at HEAD (each Director
+writes its own `desired` every frame with no defined ordering between Directors), so this is that
+same ambiguity surfacing at a mute boundary, not a new defect.
+
+**#452 also changed WHEN the self-deactivation warning fires** (owner, 2026-08-30). An activation
+track pointing at its own Director switches that Director off, which freezes it permanently — the
+engine warns once and emits `@timeline-selfdeact` so the soft-lock is never silent. That check now
+runs ONCE per target against the winning `desired` (the last unmuted track) instead of once per
+track. The only observable difference: where two unmuted tracks both target the Director root and an
+earlier one says OFF while a later one says ON, the old code warned and the new code does not — the
+entity never actually ends up deactivated there, so the warning described a freeze that never
+happened. It now fires exactly when the soft-lock is real. Deliberate: a warning that cries wolf is
+one that gets ignored.
+
+**This is an editor-scrub authoring toggle in practice, not a shipped-build lever** (owner,
+2026-08-30) — which is why it does not carry the shipped-build warning the control-track section
+above does. An author flips `muted` while scrubbing a cutscene in the Timeline panel; it is not a
+runtime feature-flag pattern the way muting a control track from script might be.
+
+One nested-timeline note: if Director A's activation track had deactivated Director B's entity,
+MUTING A's track reactivates B — the hand-back restores B's authored `isActive` — and B **resumes
+from wherever its playhead FROZE**, not from where it would be had it kept running (see "DISABLE"
+above: deactivation freezes, it does not stop). This is accepted, not a bug. In the editor it is
+additionally a non-issue in practice: `timelinePreview.ts` snapshots and reverts the whole world on
+preview stop, so the frozen-resume is a preview artifact there, not persisted state.
 
 ### Determinism (headless-verifiable)
 

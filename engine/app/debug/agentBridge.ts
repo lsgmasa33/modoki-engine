@@ -1516,6 +1516,34 @@ registerAgentOp('player-prefs-write', async (params) => {
   }
   const refusal = prefsUnhydrated();
   if (refusal) return refusal;
+  // Distinct from `prefsUnhydrated()` above: `isHydrated()` stays `true` for the whole swap
+  // window (it's truthfully describing the OUTGOING store — see `doInit`'s doc comment in
+  // playerPrefs.ts). ALL FOUR actions are refused here, `flush` included (#438 round 5 — a round
+  // 4 `flush` exemption reasoned that draining the outgoing store is "harmless", but a `flush`
+  // that is still draining when the install runs settles AFTER the swap: `PlayerPrefs.pendingKeys()`
+  // read below would then answer against the INCOMING (already-empty) namespace, so a write that
+  // never landed anywhere reports `{ok:true, flushed:true, pendingWrites:[]}` — a false success by
+  // construction, not a harmless drain. A `set`/`delete`/`clear` has the same problem one layer up:
+  // even where the write itself durably lands in the OUTGOING backend, this op cannot truthfully
+  // report so once the swap has moved the namespace out from under it. Reads are left alone (see
+  // `player-prefs-read` above) because a read during the window answers truthfully about the
+  // outgoing store — there is nothing for it to settle across.
+  if (PlayerPrefs.isSwapInFlight()) {
+    return {
+      ok: false,
+      code: 'NOT_AVAILABLE_HERE',
+      error: 'A game/namespace swap is in progress (PlayerPrefs.init() is mid-flight) — a ' +
+        `${p.action} right now could settle AFTER the swap installs the incoming namespace, so ` +
+        'this op cannot truthfully report where (or whether) it landed.',
+      hint: 'Retry once the swap finishes (isSwapInFlight() returns false).',
+    };
+  }
+  // Captured HERE, before this op's own internal `await`s (flush/clear below) — not re-read at
+  // reply time. If a swap starts DURING one of those awaits (a separate, later `init()` call),
+  // the write already in flight resolves against whatever `drain()` captured as its OWN
+  // `batchNamespace`/`batchBackend` locals at the moment it started — i.e. THIS namespace, not
+  // whatever `PlayerPrefs.namespace()` would report afterward. Re-reading it after the await
+  // would name the wrong (incoming) namespace for a write that actually landed in this one.
   const namespace = PlayerPrefs.namespace();
 
   if (p.action === 'flush') {

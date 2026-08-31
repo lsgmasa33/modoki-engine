@@ -345,6 +345,102 @@ describe('teardown', () => {
     expect(s.finished).toEqual([]);  // and the transaction must not be finished either
     expect(r.outcome).toBe('failed');
   });
+
+  it('a game swap during refreshEntitlements() does not overwrite the incoming game\'s entitlements (#434)', async () => {
+    // `entitled` is REASSIGNED (not mutated) by `configureIap`/`resetIap`, so game A's stale
+    // continuation must not be allowed to publish its own read over game B's live Set.
+    resetIap();
+    const sA = new FlakyStore();
+    let entitlementsEntered = false;
+    let release!: (txs: StoreTransaction[]) => void;
+    sA.entitlements = () => new Promise<StoreTransaction[]>((res) => { entitlementsEntered = true; release = res; });
+    configureIap({ backend: sA, store: new MemStore(), products: CATALOG });
+
+    const pending = refreshEntitlements();
+    while (!entitlementsEntered) await Promise.resolve();
+
+    // The swap: game B configures and populates its OWN entitlements before A's read resolves.
+    resetIap();
+    const sB = new FlakyStore();
+    sB.entitlements = async () => [{ transactionId: 'tx-b', productId: 'perk.b' }];
+    configureIap({ backend: sB, store: new MemStore(), products: CATALOG });
+    await refreshEntitlements();
+    expect(isEntitled('perk.b')).toBe(true);
+
+    // A's read finally lands, naming a product that belongs to A, not B.
+    release([{ transactionId: 'tx-a', productId: 'coins.100' }]);
+    await pending;
+
+    // B's live entitlements must be untouched by A's late write.
+    expect(isEntitled('perk.b')).toBe(true);
+    expect(isEntitled('coins.100')).toBe(false);
+  });
+
+  it('a game swap during a refreshEntitlements() that THROWS does not hand the outgoing caller the incoming game\'s live set', async () => {
+    // Mirror image of the success-path #434 test above: the catch branch used to `return entitled`
+    // unconditionally, and `entitled` is REASSIGNED (not mutated) by `configureIap`/`resetIap` — so
+    // by the time the catch ran, `entitled` could already be game B's live Set, handed to A's caller
+    // by reference.
+    resetIap();
+    const sA = new FlakyStore();
+    let entitlementsEntered = false;
+    let reject!: (e: Error) => void;
+    sA.entitlements = () => new Promise<StoreTransaction[]>((_res, rej) => { entitlementsEntered = true; reject = rej; });
+    configureIap({ backend: sA, store: new MemStore(), products: CATALOG });
+
+    const pending = refreshEntitlements();
+    while (!entitlementsEntered) await Promise.resolve();
+
+    // The swap: game B configures and populates its OWN entitlements before A's read rejects.
+    resetIap();
+    const sB = new FlakyStore();
+    sB.entitlements = async () => [{ transactionId: 'tx-b', productId: 'perk.b' }];
+    configureIap({ backend: sB, store: new MemStore(), products: CATALOG });
+    await refreshEntitlements();
+    expect(isEntitled('perk.b')).toBe(true);
+
+    // A's read finally rejects, naming no product that belongs to B.
+    reject(new Error('simulated entitlement failure'));
+    const result = await pending;
+
+    // A's caller must not receive B's live set, by value or by reference.
+    expect(result.has('perk.b')).toBe(false);
+    // B's live entitlements must be untouched by A's failed read.
+    expect(isEntitled('perk.b')).toBe(true);
+  });
+
+  it('a game swap during the post-finish entitlement write does not leak into the incoming game (#434)', async () => {
+    // Non-consumable only: the write under test is gated on `product.kind !== 'consumable'`, so a
+    // consumable fixture would pass whether or not the guard exists.
+    resetIap();
+    const NOADS_A: IapProduct = { id: 'noads.a', kind: 'non-consumable' };
+    const sA = new FlakyStore();
+    sA.purchaseResult = { transactionId: 'tx-noads-a', productId: NOADS_A.id };
+    let finishEntered = false;
+    let release!: () => void;
+    sA.finish = () => new Promise<void>((res) => { finishEntered = true; release = res; });
+    configureIap({ backend: sA, store: new MemStore(), products: [NOADS_A] });
+
+    const pending = purchase(NOADS_A.id);
+    while (!finishEntered) await Promise.resolve();
+
+    // The swap: game B configures and populates its OWN entitlements before A's finish() resolves.
+    resetIap();
+    const sB = new FlakyStore();
+    sB.entitlements = async () => [{ transactionId: 'tx-b', productId: 'perk.b' }];
+    configureIap({ backend: sB, store: new MemStore(), products: CATALOG });
+    await refreshEntitlements();
+    expect(isEntitled('perk.b')).toBe(true);
+
+    // A's finish() finally lands — the finish genuinely happened for A, so A's caller is owed its
+    // real result; only the entitlement CACHE write is what must be dropped.
+    release();
+    const r = await pending;
+
+    expect(r.outcome).toBe('granted');
+    expect(isEntitled('perk.b')).toBe(true);
+    expect(isEntitled(NOADS_A.id)).toBe(false);
+  });
 });
 
 describe('spending', () => {

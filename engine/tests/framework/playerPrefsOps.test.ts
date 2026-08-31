@@ -385,6 +385,102 @@ describe('clear: the "accepted for all" message is honest when the backend actua
   });
 });
 
+describe('player-prefs-write refuses mid-swap; player-prefs-read does not (#438)', () => {
+  /** A backend whose `getAll` parks on a gate the test controls, and signals — via `entered`
+   *  — the instant it is actually reached, so the test can wait until `init()` is genuinely
+   *  parked mid-`getAll` before probing the ops. Mirrors the idiom in
+   *  `playerPrefsInit.test.ts`'s `gatedBackend` (kept local here rather than shared, since
+   *  that helper isn't exported and this file reaches PlayerPrefs through a different
+   *  import path). */
+  function gatedBackend(): { backend: PrefsBackend; entered: () => Promise<void>; release: () => void } {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let enterCount = 0;
+    const enterSignals: Array<() => void> = [];
+    const backend: PrefsBackend = {
+      getAll: async () => {
+        enterCount++;
+        enterSignals.forEach((fn) => fn());
+        await gate;
+        return {};
+      },
+      set: async () => {},
+      remove: async () => {},
+    };
+    const entered = (): Promise<void> => {
+      if (enterCount > 0) return Promise.resolve();
+      return new Promise<void>((resolve) => { enterSignals.push(resolve); });
+    };
+    return { backend, entered, release };
+  }
+
+  beforeEach(async () => {
+    resetPlayerPrefsForTest();
+    await PlayerPrefs.init({ namespace: 'unit-swap', backend: new InMemoryBackend() });
+  });
+
+  it('a write during a parked init() is refused, and a read still succeeds', async () => {
+    const { backend: slow, entered, release } = gatedBackend();
+    const swap = PlayerPrefs.init({ namespace: 'unit-swap-2', backend: slow });
+    await entered(); // init() is now genuinely parked mid-flight inside getAll()
+
+    expect(PlayerPrefs.isSwapInFlight()).toBe(true);
+
+    const writeResult = await write({ action: 'set', key: 'coins', value: 10 });
+    expect(writeResult.ok).toBe(false);
+    expect(writeResult.code).toBe('NOT_AVAILABLE_HERE');
+    expect(String(writeResult.error)).toMatch(/swap/);
+
+    // Reads are deliberately NOT refused during the window — this pins that a later change
+    // can't over-tighten the refusal to reads too.
+    const readResult = await read();
+    expect(readResult.ok).toBe(true);
+
+    release();
+    await swap;
+  });
+
+  // DISCRIMINATOR (#438 round 5) — a round-4 fix exempted `flush` from this guard on the theory
+  // that draining the OUTGOING store mid-swap is harmless (it's what the pre-swap convergence
+  // loop in `doInit` itself does). It is not: a `flush` that is still draining when the install
+  // runs settles AFTER the swap, so `PlayerPrefs.pendingKeys()` (read to decide the reply)
+  // answers against the already-installed INCOMING namespace — a write that never landed
+  // anywhere reports a false `{ok:true, flushed:true, pendingWrites:[]}`. ALL FOUR actions must
+  // be refused.
+  it('ALL FOUR actions — set/delete/clear/flush — are refused with NOT_AVAILABLE_HERE mid-swap', async () => {
+    PlayerPrefs.set('coins', 1); // pending
+
+    const { backend: slow, entered, release } = gatedBackend();
+    const swap = PlayerPrefs.init({ namespace: 'unit-swap-2', backend: slow });
+    await entered(); // init() is now genuinely parked mid-flight inside getAll()
+
+    expect(PlayerPrefs.isSwapInFlight()).toBe(true);
+
+    const flushResult = await write({ action: 'flush' });
+    expect(flushResult.ok).toBe(false);
+    expect(flushResult.code).toBe('NOT_AVAILABLE_HERE');
+
+    const setResult = await write({ action: 'set', key: 'k', value: 1 });
+    expect(setResult.ok).toBe(false);
+    expect(setResult.code).toBe('NOT_AVAILABLE_HERE');
+
+    const deleteResult = await write({ action: 'delete', key: 'coins' });
+    expect(deleteResult.ok).toBe(false);
+    expect(deleteResult.code).toBe('NOT_AVAILABLE_HERE');
+
+    const clearResult = await write({ action: 'clear', confirm: true });
+    expect(clearResult.ok).toBe(false);
+    expect(clearResult.code).toBe('NOT_AVAILABLE_HERE');
+
+    release();
+    await swap;
+
+    // Once the swap has finished, flush is no longer refused.
+    const flushAfter = await write({ action: 'flush' });
+    expect(flushAfter.ok).toBe(true);
+  });
+});
+
 describe('clear: pendingWrites is sorted even when the dirty order is not alphabetical', () => {
   class ReverseRejectingBackend implements PrefsBackend {
     async getAll(): Promise<Record<string, string>> {

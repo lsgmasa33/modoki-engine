@@ -90,6 +90,18 @@ let entitled = new Set<string>();
  *
  * Idempotency in the LEDGER is not enough because the destructive step is in the STORE. This set
  * is the missing mutual exclusion: one settle per transaction id at a time.
+ *
+ * ⚠️ **`settling.delete()` in `settle()`'s `finally` is deliberately UNGUARDED — do not add a
+ * `stillActive`-style generation check there.** `resetIap()` clears `cfg` and `entitled` but
+ * deliberately does NOT clear `settling` (see its comment), precisely so that if a settle for the
+ * same transaction id starts again in the next session, `settle()`'s in-flight check at the top
+ * still sees it as busy and the stale `finally` releasing it later is CORRECT — not a leak. Adding
+ * a generation guard here would make the stale `finally` a no-op and leave the marker stuck,
+ * permanently blocking that transaction id from ever settling again. Court's `storeInFlight` is the
+ * mirror image and needs the OPPOSITE fix: `resetStoreUi` DOES clear its set on teardown, so a
+ * next-session entry can be added right after, and only a generation check stops the stale
+ * `finally` from deleting the NEW entry. Same shape, opposite requirement — because one of the two
+ * teardown functions clears its set and the other doesn't; check that before applying either fix.
  */
 const settling = new Set<string>();
 
@@ -251,6 +263,12 @@ async function settle(tx: StoreTransaction, source: 'purchase' | 'recovery'): Pr
  * Aborting is safe precisely because of invariant 1: nothing has been granted or finished at either
  * check, so the transaction stays unfinished and the next launch recovers it normally. Losing a
  * settle to a game swap costs one relaunch; writing into another game's save data does not undo.
+ *
+ * ⚠️ This applies to `entitled` too, not just the ledger (#434) — `refreshEntitlements()` and the
+ * post-`finish()` `entitled.add()` both write module state after an await, and `entitled` is
+ * REASSIGNED rather than mutated across a swap, so a late write there lands in the INCOMING game's
+ * live Set. The rule is general: check `stillActive(c)` immediately before every write to module
+ * state that follows an await capable of outliving the session — not only before the await.
  */
 function stillActive(c: IapConfig): boolean {
   return cfg === c;
@@ -434,7 +452,16 @@ async function settleInner(
     journal('iap.finish-failed', { transactionId: tx.transactionId, error: String(e) }, 'warn');
   }
 
-  if (product.kind !== 'consumable') entitled.add(tx.productId);
+  // Re-checked here, not just before `finish()` above: `.add()` below DOES mutate whatever Set
+  // `entitled` currently names — but `configureIap`/`resetIap` REASSIGN (never mutate) that binding
+  // on a swap, so `stillActive(c)` is what tells the two cases apart. Still active means no swap
+  // landed during the `finish()` await, so `entitled` still names THIS session's own Set and the
+  // mutation is safe; not active means a swap already reassigned `entitled` to the INCOMING game's
+  // live Set, and `stillActive(c)` skips the write rather than mutating an orphan. Dropping the
+  // write in that case is safe: `entitled` is rebuilt wholesale from the store on the next
+  // `refreshEntitlements()`, so nothing durable is lost, only a cache entry this session no longer
+  // owns.
+  if (product.kind !== 'consumable' && stillActive(c)) entitled.add(tx.productId);
 
   return {
     outcome: alreadyGranted ? 'already-owned' : 'granted',
@@ -477,14 +504,31 @@ export async function purchase(productId: string): Promise<PurchaseResult> {
 export async function refreshEntitlements(): Promise<ReadonlySet<string>> {
   const c = activeCfg();
   if (!c) return entitled;
+  // Snapshot BEFORE the await — see the catch branch below. `entitled` is REASSIGNED, not mutated,
+  // by `configureIap`/`resetIap`, so this binding stays this session's own Set even after the
+  // module has moved on to the next game's.
+  const startedWith = entitled;
   try {
     const active = await c.backend.entitlements();
-    entitled = new Set(active.map((t) => t.productId));
+    // `entitled` is REASSIGNED (not mutated) by `configureIap`/`resetIap`, so a game swap landing
+    // during this await leaves this closure holding the OLD session while the module has already
+    // moved on to the next game's live Set. Publishing here would replace that Set wholesale with
+    // this game's entitlements. `stillActive` already exists for exactly this window (see its doc);
+    // return the locally-computed set — the truthful answer for THIS caller — without touching the
+    // module state that now belongs to another game.
+    const freshlyRead = new Set(active.map((t) => t.productId));
+    if (!stillActive(c)) return freshlyRead;
+    entitled = freshlyRead;
     journal('iap.entitlements', { productIds: [...entitled] });
   } catch (e) {
     // Keep the previous set rather than revoking on a transient read failure — briefly stale beats
-    // wrongly locking a paying player out of what they bought.
+    // wrongly locking a paying player out of what they bought. But if a game swap landed in the
+    // `await` above, "the previous set" must mean THIS session's own `startedWith`, not the module
+    // global — by the time the catch runs, `entitled` may already be the INCOMING game's live Set,
+    // and handing that back to the outgoing caller by reference (#434's failure shape, on the
+    // failure half this time) would let it read another game's entitlements as its own.
     journal('iap.entitlements-failed', { error: String(e) }, 'warn');
+    if (!stillActive(c)) return startedWith;
   }
   return entitled;
 }

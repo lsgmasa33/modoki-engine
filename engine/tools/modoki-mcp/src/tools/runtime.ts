@@ -265,7 +265,13 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'still shows it while nothing survives a restart. Such a write is reported as PARTIAL, never ' +
       'as success.\n\n' +
       'An un-hydrated store refuses every action, writes included: a set before PlayerPrefs.init() ' +
-      'lands in a throwaway in-memory cache that init() then CLEARS.',
+      'lands in a throwaway in-memory cache that init() then CLEARS.\n\n' +
+      'ALL FOUR actions, flush included, are refused while a game/namespace swap is in flight ' +
+      '(PlayerPrefs.isSwapInFlight()) — a write or flush that is still settling when the install ' +
+      'runs can land in (or answer about) the OUTGOING namespace after this op has already moved ' +
+      'on, so it cannot truthfully report where or whether it landed; retry once the swap ' +
+      'finishes. modoki_player_prefs reads are NOT refused during the same window — a read ' +
+      'answers truthfully about the (still fully hydrated) outgoing store.',
     {
       action: z.enum(['set', 'delete', 'clear', 'flush'])
         .describe('REQUIRED. set = write one key (needs key + value). delete = remove one key (needs key; a key that is not there is REFUSED with the real key list, not a silent no-op). clear = remove EVERY key in the namespace (needs confirm:true). flush = force pending debounced writes out and report any the backend rejected.'),

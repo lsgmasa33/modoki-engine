@@ -54,7 +54,7 @@ import { beginDeform2DFrame } from '../animation/deform2DBuffers';
 import { resolveClipByName } from '../animation/animClipBank';
 import { animationAssetProvider } from '../animation/assetProviders';
 function getAnimationClip(ref: string) { return animationAssetProvider.get()?.getAnimationClip(ref) ?? null; }
-import type { TimelineDef, AnimationTrackDef, AnimationClipBlock, ControlTrackDef, ControlClipBlock } from './types';
+import type { TimelineDef, AnimationTrackDef, AnimationClipBlock, ControlTrackDef, ControlClipBlock, ActivationTrackDef } from './types';
 
 /** Scrub window (seconds) an IMPULSE particle control clip (no duration) is treated as "on" so a
  *  scrub onto it reveals the burst. Editor-preview affordance only — forward Play/preview fires the
@@ -170,18 +170,62 @@ function scrubAnimator(entity: Entity, clipName: string, localT: number): void {
  *  animators are NOT scrubbed (v1); their clip is triggered on the boundary by the system. */
 export function applyTimelineState(world: World, rootId: number, def: TimelineDef, t: number, index?: EntityIndex): void {
   const idx = index ?? buildEntityIndex(world);
+
+  // Identifies THIS pass (one Director's timeline, this call) as an `_activationBase` owner — see
+  // that map's doc comment for why a captured base must be owned by the pass that captured it.
+  const rootEntity = idx.byId.get(rootId) as unknown as Entity | undefined;
+  const owner = `${rootId}:${rootEntity?.generation() ?? 0}:${def.id}`;
+
+  // PHASE 1 — SWEEP every activation track into a per-TARGET decision before anything is written
+  // (#452). Two hazards this closes:
+  //  - a base captured mid-loop from an entity another activation track already wrote this pass
+  //    (the sweep completes, and captures, before phase 2 writes a single `isActive`);
+  //  - track-order dependence for a doubly-targeted entity — an unmuted track must always win over
+  //    a muted one regardless of which appears first in `def.tracks`.
+  // `track` here tracks the LAST unmuted track seen for this target (last-track-wins, matching the
+  // pre-#452 single-unmuted-track behaviour), and is also what the self-deactivation warning below
+  // names.
+  interface ActivationDecision { hasUnmuted: boolean; desired: boolean; track: ActivationTrackDef; hasMuted: boolean }
+  const activationDecisions = new Map<number, ActivationDecision>(); // targetId -> decision
   for (const track of def.tracks) {
-    if (track.muted) continue;
+    if (track.type !== 'activation') continue;
     const targetId = resolveTrackTarget(idx, rootId, track.target);
     if (targetId === null) continue;
     const entity = idx.byId.get(targetId) as unknown as Entity | undefined;
     if (!entity) continue;
-    if (track.type === 'animation') {
-      const clip = activeClipAt(track, t);
-      if (clip && clip.scrub !== false && entity.has(Animator)) scrubAnimator(entity, clip.clip, t - clip.start);
-    } else if (track.type === 'activation') {
-      const desired = track.spans.some((s) => t >= s.start && t < s.end);
-      const cur = entity.get(EntityAttributes) as Record<string, unknown> | undefined;
+    const cur = entity.get(EntityAttributes) as Record<string, unknown> | undefined;
+    let decision = activationDecisions.get(targetId);
+    if (!decision) { decision = { hasUnmuted: false, desired: false, track, hasMuted: false }; activationDecisions.set(targetId, decision); }
+    if (track.muted) {
+      decision.hasMuted = true;
+      // A muted track never captures a base — it never DRIVES the entity, so it must never license
+      // a hand-back either (see _activationBase's doc comment: absent means "never captured", and
+      // a track authored muted:true from the start must stay absent forever, not capture-on-sight).
+    } else {
+      decision.hasUnmuted = true;
+      decision.desired = track.spans.some((s) => t >= s.start && t < s.end);
+      decision.track = track; // last unmuted track wins — matches today's single-unmuted-track semantics
+      // Capture the pre-timeline base the FIRST time this TARGET is driven by an UNMUTED track this
+      // sweep, before either this or any other activation track in `def.tracks` writes it — see
+      // _activationBase's doc comment for why this sweep-before-write ordering (and this pass's
+      // `owner`) is what makes the base authoritative.
+      if (cur) {
+        const key = activationBaseKey(targetId, entity.generation());
+        if (!_activationBase.has(key)) _activationBase.set(key, { value: cur.isActive === true, owner });
+      }
+    }
+  }
+
+  // PHASE 2 — APPLY: an unmuted track (if any) always wins for its target; only when NO unmuted
+  // activation track targets an entity does a muted one hand it back to its captured base.
+  for (const [targetId, decision] of activationDecisions) {
+    const entity = idx.byId.get(targetId) as unknown as Entity | undefined;
+    if (!entity) continue;
+    const cur = entity.get(EntityAttributes) as Record<string, unknown> | undefined;
+    if (!cur) continue;
+    if (decision.hasUnmuted) {
+      const desired = decision.desired;
+      const track = decision.track;
       // SELF-DEACTIVATION IS A ONE-WAY DOOR — say so, loudly, once. An activation track whose
       // target resolves to its OWN Director root (target "" is the root) switches the Director's
       // entity off; a deactivated entity FREEZES its Director (see timelineSystem's PASS 1), so
@@ -191,7 +235,16 @@ export function applyTimelineState(world: World, rootId: number, def: TimelineDe
       // activation tracks mean something different depending on who they point at. But a SILENT
       // soft-lock is exactly the failure class this subsystem keeps getting bitten by, so it is
       // reported instead. Author the track against the object being shown/hidden, not the Director.
-      if (cur && cur.isActive !== desired && !desired && targetId === rootId && !_warnedSelfDeact.has(rootId)) {
+      //
+      // ⚠️ #452 CHANGED WHEN THIS FIRES, deliberately (owner, 2026-08-30). It is now evaluated ONCE
+      // per target against the WINNING `desired` — the last unmuted track — instead of once per
+      // track. Where two unmuted tracks both target the Director root and an earlier one says OFF
+      // while a later one says ON, HEAD warned and this does not: the entity never actually ends up
+      // deactivated there, so that warning was a false alarm about a freeze that never happened.
+      // The warning now fires exactly when the soft-lock really occurs, and `track` names the track
+      // that produced the winning `desired`. Kept noisy-when-real over noisy-always on purpose — a
+      // warning that cries wolf is a warning that gets ignored.
+      if (cur.isActive !== desired && !desired && targetId === rootId && !_warnedSelfDeact.has(rootId)) {
         _warnedSelfDeact.add(rootId);
         console.warn(
           `[timeline] activation track "${track.name}" targets its OWN Director (entity ${rootId}) and is ` +
@@ -201,8 +254,42 @@ export function applyTimelineState(world: World, rootId: number, def: TimelineDe
         );
         emit('@timeline-selfdeact', { director: rootId, track: track.name, t });
       }
-      if (cur && cur.isActive !== desired) entity.set(EntityAttributes, { ...cur, isActive: desired });
+      if (cur.isActive !== desired) entity.set(EntityAttributes, { ...cur, isActive: desired });
+    } else if (decision.hasMuted) {
+      // MUTED HAND-BACK (#452): a muted activation track must not freeze the entity at whatever it
+      // last wrote — hand it back to the base captured in phase 1, completing #446's "a muted track
+      // contributes nothing" contract for this track kind. Absent = never captured, deliberately
+      // distinct from a captured `false` (mirrors `_trackMuted`'s absent/false distinction) — a
+      // track authored `muted:true` from the start never drove the entity, so there is nothing to
+      // hand back and this does nothing.
+      const key = activationBaseKey(targetId, entity.generation());
+      const base = _activationBase.get(key);
+      // OWNERSHIP GUARD: only the pass that CAPTURED this base may hand it back. Without this, a
+      // muted track on Director B could restore a base an UNMUTED track on Director A is actively
+      // driving — a base is per-target, but two Directors can target the same entity, and B muting
+      // must not reach into A's territory. A non-owner leaves the entry alone (does NOT delete it)
+      // so the actual owner still finds it on its own pass this frame or the next.
+      if (base !== undefined && base.owner === owner) {
+        if (cur.isActive !== base.value) entity.set(EntityAttributes, { ...cur, isActive: base.value });
+        _activationBase.delete(key); // bounded map; a later unmute re-captures from the restored value.
+        // ⚠️ NOT bounded against every leak: a track that RETARGETS mid-playback, or whose target is
+        // destroyed and never respawned, leaves ITS entry alive (and the former target un-restored)
+        // until the next `onWorldSwap`/`clearPreviewControls` sweep clears the whole map. Not fixed
+        // here — see the review note on #452.
+      }
     }
+  }
+
+  // Animation tracks: unrelated to activation, kept as their own pass (a keyframe pose has no
+  // stored "base" to restore, so a muted animation track stays a blanket skip).
+  for (const track of def.tracks) {
+    if (track.type !== 'animation' || track.muted) continue;
+    const targetId = resolveTrackTarget(idx, rootId, track.target);
+    if (targetId === null) continue;
+    const entity = idx.byId.get(targetId) as unknown as Entity | undefined;
+    if (!entity) continue;
+    const clip = activeClipAt(track, t);
+    if (clip && clip.scrub !== false && entity.has(Animator)) scrubAnimator(entity, clip.clip, t - clip.start);
   }
 }
 
@@ -361,7 +448,7 @@ export function previewControlAt(world: World, rootId: number, def: TimelineDef,
 export function clearPreviewControls(): void {
   for (const [key, id] of listControlSpawns()) { deleteEntity(id); deleteControlSpawn(key); }
   resetScrubParticleReflect(); // drop scrub particle-span on/off memory on teardown
-  _trackMutedEpoch++; _trackMuted.clear();  // drop the mute-transition memo too (#446)
+  _trackMutedEpoch++; _trackMuted.clear(); _activationBase.clear();  // drop the mute-transition memos too (#446, #452)
 }
 
 // ── Control track (prefab spawn/despawn) ──────────────────────────────────────────────────────
@@ -462,7 +549,7 @@ onWorldSwap(() => clearTimelineWarnings());
  *  ⚠️ The inner key still contains a world-local entity id, so the `onWorldSwap` reset stays. */
 const _trackMuted = new Map<string, boolean>();
 let _trackMutedEpoch = 0;   // bumped on world swap / preview teardown — see `trackMuteKey`
-onWorldSwap(() => { _trackMutedEpoch++; _trackMuted.clear(); });
+onWorldSwap(() => { _trackMutedEpoch++; _trackMuted.clear(); _activationBase.clear(); });
 
 /** Key for {@link _trackMuted}, and every part of it is load-bearing:
  *   - `epoch` — invalidates everything on a world swap / preview teardown without a walk.
@@ -476,6 +563,52 @@ onWorldSwap(() => { _trackMutedEpoch++; _trackMuted.clear(); });
  *     read as "never seen" rather than as a flip. */
 function trackMuteKey(p: Pending, trackId: string): string {
   return `${_trackMutedEpoch}:${p.rootId}:${p.entity.generation()}:${p.def.id}:${trackId}`;
+}
+
+/** Per-TARGET-ENTITY authored `EntityAttributes.isActive`, captured before an UNMUTED activation
+ *  track writes it this pass, so muting can hand the entity BACK to it instead of freezing it at
+ *  whatever the track last wrote (#452) — completes #446's "muted contributes nothing" contract
+ *  for the activation track, which was skipped by #446's blanket mute guard.
+ *
+ *  Keyed by the TARGET, not the track: `EntityAttributes.isActive` is a property of the entity,
+ *  and more than one activation track (in one timeline, or even across two Directors) can target
+ *  the same entity. `applyTimelineState` sweeps every activation track into a per-target decision
+ *  BEFORE writing anything (see PHASE 1 there), which is what makes the captured value authoritative
+ *  — it is not that `isActive` has no other writer, it's that the capture always runs before the
+ *  first write in this pass. "Unmuted beats muted" holds WITHIN one timeline's tracks: an unmuted
+ *  activation track always wins for its target regardless of track order; only when NO unmuted
+ *  activation track (in THAT def) targets the entity does a muted one in that def hand it back.
+ *
+ *  ONLY an unmuted track ever captures — a track authored `muted:true` never drives the entity, so
+ *  it must never capture and must never hand back either. Absent therefore means "never captured
+ *  by any unmuted track", deliberately DISTINCT from a captured `false` (mirrors `_trackMuted`'s
+ *  absent/false distinction above).
+ *
+ *  `owner` records WHICH pass captured the value — `${rootId}:${rootGeneration}:${def.id}`, i.e.
+ *  one Director's one timeline. Only that owner may hand the base back (checked at the hand-back
+ *  site): two Directors can target the same entity's activation, and without this a MUTED track on
+ *  one Director could restore a base an UNMUTED track on the OTHER Director is actively driving —
+ *  contested activation across Directors is otherwise undefined (see the residual-ambiguity note at
+ *  the hand-back site), but a muted track reaching into a different Director's territory is not that
+ *  ambiguity, it is a bug (#452 round 3). A non-owner leaves the entry untouched rather than deleting
+ *  it, so the real owner still finds it.
+ *
+ *  Restored on mute (by the owner only), then DELETED — bounded map, and a later unmute re-captures
+ *  from the restored value. ⚠️ NOT bounded against every leak: see the hand-back site for the
+ *  retarget/destroyed-target case this doesn't cover.
+ *
+ *  Shares `_trackMutedEpoch` with `_trackMuted` (one epoch, one world-swap reset). */
+const _activationBase = new Map<string, { value: boolean; owner: string }>();
+
+/** Key for {@link _activationBase} — world epoch + the resolved target entity's id + generation.
+ *  Deliberately NOT `trackMuteKey`'s key (no root id, no def id, no track id): the base belongs to
+ *  the TARGET entity, not to any one track, which is what lets two activation tracks on the same
+ *  target share one captured value instead of the second one capturing the first one's write.
+ *  `generation()` guards the same id-recycling hazard `trackMuteKey` documents above, but on the
+ *  TARGET half of the key this time — a destroyed-and-respawned target recycling the id must not
+ *  inherit the previous occupant's base. */
+function activationBaseKey(targetId: number, targetGeneration: number): string {
+  return `${_trackMutedEpoch}:${targetId}:${targetGeneration}`;
 }
 
 /** Memoized "does this timeline have ANY sub-director control clip?" A `.timeline.json` is immutable

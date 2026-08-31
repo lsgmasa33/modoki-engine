@@ -69,6 +69,7 @@
   "MAX_RECOVERY_ATTEMPTS",
   "MAX_REPORTED_GPU_ERRORS",
   "MAX_SHADER_POINT_LIGHTS",
+  "Mask2D",
   "MaterialInstance",
   "MockStoreBackend",
   "ModelSource",

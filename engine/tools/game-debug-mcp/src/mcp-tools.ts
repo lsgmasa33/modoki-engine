@@ -932,7 +932,13 @@ export function registerTools(server: McpServer) {
       '`set` and `delete` FLUSH before replying, so `saved:true` means the backend accepted the ' +
       'durable write rather than merely that the in-memory cache changed — a rejected write keeps ' +
       'its value in the cache, so a read-back still shows it while nothing survives a restart. ' +
-      'Such a write is reported PARTIAL, never as success.',
+      'Such a write is reported PARTIAL, never as success.\n\n' +
+      'ALL FOUR actions, flush included, are refused while a game/namespace swap is in flight — ' +
+      'a write or flush that is still settling when the install runs can land in (or answer ' +
+      'about) the OUTGOING namespace after this op has already moved on, so it cannot truthfully ' +
+      'report where or whether it landed; retry once the swap finishes. device_player_prefs reads ' +
+      'are NOT refused during the same window — a read answers truthfully about the (still fully ' +
+      'hydrated) outgoing store.',
     {
       action: z.enum(['set', 'delete', 'clear', 'flush'])
         .describe('REQUIRED. set = write one key (needs key + value). delete = remove one key (needs key; a key that is not there is REFUSED with the real key list, not a silent no-op). clear = remove EVERY key in the namespace (needs confirm:true). flush = force pending debounced writes out and report any the backend rejected.'),

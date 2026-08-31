@@ -3,7 +3,7 @@
 
 import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
 import {
-  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, AudioSettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
+  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, Mask2D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, AudioSettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
   UIElement, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
@@ -168,6 +168,24 @@ export function registerAllTraits() {
     priority: 33.4,
     fields: {
       alpha: { type: 'number', min: 0, max: 1, step: 0.01, tooltip: 'Fades this entity AND every descendant in the 2D layer (#211). Multiplies with Renderable2D.opacity rather than replacing it, and nested groups multiply together — same model as Unity CanvasGroup. Put it on a bare hierarchy node to fade a whole subtree that the node itself does not draw.' },
+    },
+  });
+
+  registerTrait({
+    name: 'Mask2D', trait: Mask2D, category: 'component', componentCategory: 'Rendering',
+    priority: 33.45,
+    fields: {
+      mode: { type: 'enum', options: ['rect', 'texture'], tooltip: "rect: an authored rectangle (width/height/pivot/cornerRadius/feather). texture: the alpha channel of Sprite, for shapes a rect can't describe." },
+      isEnabled: { type: 'boolean', tooltip: 'Off = no clip at all — lets a mask be authored once and toggled without removing the entity.' },
+      width: { type: 'number', step: 0.01, group: 'Size', tooltip: 'HALF-extent, matching Renderable2D — the masked rect is width * 2 wide. rect mode only.' },
+      height: { type: 'number', step: 0.01, group: 'Size', tooltip: 'HALF-extent — see width. rect mode only.' },
+      pivotX: { type: 'number', step: 0.05, min: 0, max: 1, group: 'Pivot' },
+      pivotY: { type: 'number', step: 0.05, min: 0, max: 1, group: 'Pivot' },
+      cornerRadius: { type: 'number', min: 0, step: 1, tooltip: 'Corner radius in design pixels. rect mode only.' },
+      feather: { type: 'number', min: 0, step: 0.5, tooltip: 'Soft-edge width in design pixels. 0 = hard-edged stencil mask (cheap); >0 = soft alpha ramp (costs a filter pass — see the trait doc comment).' },
+      sprite: { type: 'string', accept: ['sprite'], tooltip: 'Alpha mask sprite (texture mode only). GUID-only — never a literal path.' },
+      offsetX: { type: 'number', step: 1, group: 'Offset', tooltip: "Clip rect centre relative to this entity's own origin, in its local space (design px). Keep the entity's Transform at identity and use this to place the rect instead — moving the entity would displace every descendant it clips." },
+      offsetY: { type: 'number', step: 1, group: 'Offset', tooltip: 'See offsetX — same local-space offset, Y axis.' },
     },
   });
 

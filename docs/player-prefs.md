@@ -51,6 +51,7 @@ PlayerPrefs.delete(key): void                    // also: set(key, undefined)
 PlayerPrefs.keys(): string[]
 PlayerPrefs.clear(): void                         // empties THIS game's namespace
 PlayerPrefs.isHydrated(): boolean                 // true once init() has hydrated the cache
+PlayerPrefs.isSwapInFlight(): boolean             // true while an init() swap is mid-flight (see Gotchas)
 PlayerPrefs.hasPendingWrite(key): boolean         // a write the backend has NOT accepted (see Gotchas)
 PlayerPrefs.pendingKeys(): string[]               // the authoritative pending set (see Gotchas — NOT keys().filter(hasPendingWrite))
 await PlayerPrefs.flush()                         // resolve once pending writes are durable
@@ -88,11 +89,40 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   an overlapped call is **queued, never superseded and never rejected**, and no two `init()` bodies
   interleave. Queuing rather than bailing is what keeps `discardedPending` meaningful — the second
   call runs a *real* swap from the first's finished state instead of reporting `[]` because the
-  first already cleared `dirty`. **The write-side path is still open (#438):** `namespace` is
-  assigned and `cache`/`dirty` cleared *before* the `getAll` await, so a synchronous `set()`/`del()`
-  from an outgoing game's in-flight callback — e.g. an async auth/sync handler that resolves during
-  the swap — lands in the *incoming* namespace's cache for that entire round-trip, with no second
-  `init()` call needed to reach it.
+  first already cleared `dirty`. **The write-side path is closed too (#438):** the OUTGOING
+  `namespace`/`backend`/`cache`/`dirty` stay live for the *entire* `await backend.getAll(prefix)`
+  round-trip — the incoming namespace/backend are computed into locals and installed in one
+  synchronous block right after the await, with no `await` in between. So a synchronous
+  `set()`/`del()`/`clear()` racing the window — e.g. an outgoing game's async auth/sync handler
+  resolving mid-swap — still lands in the *outgoing* namespace, never contaminating the incoming
+  one. `isHydrated()` deliberately stays `true` throughout the window: it is truthfully describing
+  the outgoing store, which has genuinely been read from its backend. Two `dirty`-only pending-key
+  snapshots are taken to tell what happened to a write that raced the window — one just before the
+  await (`preWindowPending`), one at install time (`fullPending`). **`fullPending` does NOT
+  include everything in `preWindowPending`** — a pre-window key that lands successfully during the
+  window (the outgoing backend accepts it before the install runs) drops out of `dirty` and so out
+  of `fullPending`, which is exactly why the discarded report filters `preWindowPending` down to
+  `preWindowPending.filter(k => fullPendingSet.has(k))` rather than reporting the raw snapshot: only a
+  pre-window key STILL pending at install is genuinely lost, reported via `reportDiscarded`. A key
+  that appears in `fullPending` but was NOT in `preWindowPending` was written during the window
+  itself, after the pre-swap flush loop had already finished, and never offered to a flush at all —
+  that's a raced write, reported via `reportRaced`. Neither snapshot sees a `drain()` batch that is
+  genuinely mid-flight (taken out of `dirty` for its own `Promise.all`, not yet settled) at the
+  instant either snapshot is taken — that write's eventual settlement is handled by `drain()`
+  itself, not by `discardedPending`: a late success lands durably in the outgoing store (nothing
+  to report); a late rejection, arriving after the swap has already moved `namespace` away, is
+  reported through `drain()`'s own "already swapped" `console.error` instead — `drain()` captures
+  `batchNamespace`/`batchBackend` locals at the start of each batch precisely so a rejection
+  settling after a swap is reported as lost rather than silently re-queued against the incoming
+  namespace/backend. If `getAll()` throws, the incoming namespace is still installed, but
+  explicitly empty and unhydrated (see the `getAll()`-rejection gotcha below) — this is a fail-loud
+  path, not a silent one. **Callers cannot write during the window either:**
+  `PlayerPrefs.isSwapInFlight()` reports `true` for the duration, and `agentBridge.ts`'s
+  `player-prefs-write` op refuses with `NOT_AVAILABLE_HERE` — ALL FOUR actions, `flush` included,
+  since any of them can settle after the install and answer for a namespace it no longer owns —
+  rather than accept an op it cannot truthfully report on. `player-prefs-read` is NOT refused,
+  since a read during the window answers truthfully about the (still fully hydrated) outgoing
+  store.
 - **Envelope.** Each value persists as `{ v: SCHEMA_VERSION, d: <document> }`. The version
   guards the on-disk format (not the game's data shape) so a future migration is possible; a
   corrupt/unparseable entry fails soft to `undefined`, never a throw.
@@ -185,8 +215,9 @@ if (score > best) PlayerPrefs.set('bestScore', score);
 - ⚠️ **`init()` DISCARDS whatever a failed flush re-queued — it now REPORTS this instead of
   silently dropping it (#421).** `init()` clears `cache`/`dirty` unconditionally to hydrate the new
   namespace/game, and the swap PROCEEDS regardless — a quota-exceeded phone must not hard-block an
-  OTA sub-game switch. But `dirty` can be non-empty when it does, in two distinct ways, and `init()`
-  now `console.error`s the discarded keys and returns them as `discardedPending` (sorted) on both:
+  OTA sub-game switch. But `dirty` can be non-empty when it does, for up to THREE distinct reasons,
+  and `init()` now `console.error`s the discarded keys — through a message specific to each reason —
+  and returns the union as `discardedPending` (sorted):
   - **A real game swap** (`init()` re-called while already hydrated): the pre-swap step drains to
     CONVERGENCE, not `flush()`'s bounded two drains — `flush()` alone snapshots `dirty` before
     awaiting the backend, so a `set()` landing during its second drain is never attempted by anyone
@@ -201,6 +232,11 @@ if (score > best) PlayerPrefs.set('bestScore', score);
     signal says success" case above (a caller bug — writing before `init()`), not a rejection, and
     the message says so — do not conflate the two in a message, that conflation is what cost two
     review rounds on #422's sibling issue.
+  - **A write that raced the swap window (#438):** written by the outgoing game *during* the
+    `await backend.getAll(prefix)` round-trip, after the pre-swap flush loop above had already
+    finished — never offered to a flush at all, and discarded by the synchronous install the
+    instant it runs. Reported through its own message (`reportRaced`) that says exactly this,
+    rather than blaming the backend the way the first bullet's message would.
   Both callers (`App.tsx`'s `GameShell` boot effect, `editor/setup.ts`'s `createGameEditor`) log the
   discarded keys with the outgoing/incoming game context `init()` itself doesn't have. Neither
   routes this through the event journal — a game swap is a two-world atomic swap, and the journal is
@@ -258,6 +294,19 @@ nothing survives.
 `set`/`delete` flush before replying, so `saved:true` means the backend accepted the durable write;
 a rejected write (quota, native I/O error) keeps its value in the cache, so a read-back structurally
 cannot see the failure (see `hasPendingWrite` above) — such a write reports PARTIAL, never success.
+
+ALL FOUR actions — `set`/`delete`/`clear`/`flush` — are refused with `NOT_AVAILABLE_HERE` while a
+game/namespace swap is in flight (`PlayerPrefs.isSwapInFlight()` — see Gotchas, #438), `flush`
+included. A round-4 fix exempted `flush` on the theory that draining whatever the outgoing store
+already owes is harmless — but a `flush` that is still draining when the install runs settles
+*after* the swap, so `PlayerPrefs.pendingKeys()` (read to decide the reply) answers against the
+already-installed INCOMING namespace instead: a write that never landed anywhere reported
+`{ok:true, flushed:true, pendingWrites:[]}`, a false success. The same reasoning applies to
+`set`/`delete`/`clear`: even where the write itself durably lands in the OUTGOING backend, this op
+cannot truthfully report so once the swap has moved the namespace out from under it. Reads are NOT
+refused during the same window — a read answers truthfully about the (still fully hydrated)
+outgoing store, since there is nothing for it to settle across.
+
 `action` is required on the WRITE tool (the read takes only an optional `key`), and
 `action:'clear'` additionally requires `confirm:true` — one rule on both surfaces, and on the device
 the target is a real player's save data on an installed app.

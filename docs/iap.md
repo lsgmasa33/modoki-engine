@@ -151,6 +151,30 @@ consumeAsync:        code=6  Server error   (2ms later, same token)
 Idempotency in the ledger cannot fix this because **the destructive step is in the store**. A
 `settling` set provides mutual exclusion per transaction id; the loser reports `already-owned`.
 
+### A game swap can outlive an await — check `stillActive()` right before the WRITE (#434)
+
+A settle spans awaits that can last minutes (a platform sheet, Face ID, a parent approving
+Ask-to-Buy), and `resetIap()`/`configureIap()` can run in that window — the editor's Open Project, or
+an OTA sub-game module. `entitled` (the module's live entitlement `Set`) is **REASSIGNED, not
+mutated**, across that swap, so a write that only checked `stillActive(c)` *before* an await can still
+land in the INCOMING game's live `Set` if the check does not happen again *after* it. **The rule is
+general, stated in `stillActive`'s own doc comment in `purchaseService.ts`: check `stillActive(c)`
+immediately before every write to module state that follows an await capable of outliving the
+session — not only before the await.** `refreshEntitlements()`'s happy path, its failure/catch
+branch, and the post-`finish()` `entitled.add()` in `settleInner` all follow it now; the failure
+branch was the gap closed on top of #434's first fix — an early return there used to hand back the
+module-global `entitled` by reference, which could already be the incoming game's `Set`.
+
+⚠️ **`settling.delete()` in `settle()`'s own `finally` is deliberately UNGUARDED — do not add a
+`stillActive`-style check there.** `resetIap()` clears `cfg` and `entitled` but deliberately does
+NOT clear `settling`, so a settle for the same transaction id restarting in the next session still
+sees it busy via `settle()`'s in-flight check, and the stale `finally` releasing it later is correct,
+not a leak. Court's `storeInFlight` (`games/court/runtime/systems.ts`) is the mirror image and needs
+the OPPOSITE fix — a generation check IS required there — because `resetStoreUi` DOES clear its set
+on teardown, so a next-session entry can be added right after, and only a generation check stops the
+stale `finally` from deleting the NEW entry. Same shape, opposite requirement, because exactly one of
+the two teardown functions clears its set: check which before copying either fix elsewhere.
+
 ### `StoreBackend` — the port that makes any of this testable
 
 The interface is the only thing that differs between a phone and a headless test. It also earns its
@@ -414,6 +438,7 @@ Kept because each is a class, not an incident.
 | Two concurrent `purchase()` calls orphaned a `PluginCall` — its promise hung forever | same slot, no occupancy check |
 | Ledger held 300 coins; screen showed 0 | `entity.set(UIElement, …)` does not dirty the UI projection — **data-correct is not pixels-correct** |
 | `withInterruption` skipped the wrapper at `'none'`, so the device toggle could never arm | an optimisation for the state every build starts in |
+| A game swap landing during an await could write entitlements into the NEXT game's live `Set` (#434) — `stillActive(c)` was checked before the await but not immediately before the write that followed it | a check that guards the wrong moment |
 
 Two shapes recur. **A correct mechanism with a missing consumer** (rows 4, 5) — when touching this
 subsystem, sweep the *chain*, not the change. And **a check that cannot fail** (rows 1, 10): if a

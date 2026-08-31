@@ -452,7 +452,19 @@ describe('the real registered surface', () => {
   // for tangent handles when an active track is a second gate, so three descriptions had to say
   // so. Spent deliberately — a description that sends an agent to a confident wrong conclusion
   // costs more than its bytes.
-  const DEFINITION_BYTES = 132_278;
+  // Re-measured 2026-08-30 (#438, round 4 fixes): 132_278 -> 136_731. CORRECTED (round 5): this
+  // change's own contribution, measured directly (pre-change surface 136_238, post-change
+  // 136_731), was 493 bytes — the round-4 comment's original "~200-250 bytes" estimate was never
+  // actually measured against the pre-change number and undercounted it. The remaining ~4.0 KB
+  // (136_238 - 132_278 = 3_960, not the "~4.2 KB" the round-4 comment claimed) is pre-existing
+  // drift that had accumulated inside the old 4_000-byte headroom across unrelated work since the
+  // last re-pin, never re-measured until now — not attributable to #438.
+  // Re-measured again 2026-08-30 (#438, round 5 — this round's OWN defect-2/3 fixes): 136_731 ->
+  // 136_741, all 10 bytes of it this round's rewording of the mid-swap-refusal justification on
+  // `modoki_write_player_prefs`'s description (runtime.ts) — flush is no longer exempt, so the
+  // text describing the refusal changed shape but stayed roughly the same length. No new
+  // un-repinned drift since the round-4 re-pin above.
+  const DEFINITION_BYTES = 136_741;
   const DEFINITION_HEADROOM = 4_000;
 
   it(`the tool definitions stay near their recorded size (~${Math.round(DEFINITION_BYTES / 1000)} KB)`, () => {

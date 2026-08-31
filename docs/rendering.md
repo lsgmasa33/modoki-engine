@@ -3743,6 +3743,94 @@ consequences the pool now handles explicitly, each with a mutation-verified test
 - **A baked font's SOURCE file is not always shipped.** `Text2D` needs only `~atlas.png` + `~metrics.json`; the `.ttf` ships only when a DOM consumer names the family. See [build.md](./build.md) § "Converted assets" — including the blind spot where a CSS-named family needs `shipSource: 'always'`.
 - **Per-page meshes + dynamic packing** — one Pixi `Mesh` per atlas PAGE the text touches (a dynamic CJK provider spills glyphs across pages; a baked / single-page font is one mesh), all children of the slot `Container` so the anchor pivot + transform apply to the whole block. Geometry rebuilds only when the layout hash changes (text/font/size/wrap/spacing/`atlasVersion`); the shader updates only on a style-hash change; placement writes only when the transform moves. Atlas textures are FONT-owned (freed on scene teardown), never disposed by the slot. Per-glyph animation recomputes page positions from the base quads each frame while the sim runs (frozen when stopped, like skeletal animation).
 
+### 2D masking — `Mask2D` (#449)
+
+Clip a 2D subtree to a rect or a texture. `Mask2D` on an entity clips **that entity and every
+descendant**; nested masks **intersect**.
+
+| Field | Meaning |
+|---|---|
+| `mode` | `'rect'` (authored box) or `'texture'` (alpha from `sprite`) |
+| `offsetX` / `offsetY` | the rect's centre relative to the mask entity's own origin, design px |
+| `width` / `height` | **HALF-extents**, matching `Renderable2D`'s convention |
+| `pivotX` / `pivotY` | same pivot convention as `Renderable2D` |
+| `cornerRadius` | rect only; clamped to `min(width, height)` |
+| `feather` | design px of soft edge. `0` = hard |
+| `sprite` | texture mode: an asset **GUID**, never a path |
+| `isEnabled` | `false` ⇒ contributes no group at all; descendants route to the canvas unclipped |
+
+**Which Pixi pipe you land in is decided by the mask object's CLASS**, not by anything we choose:
+`AlphaMask.test` is `mask instanceof Sprite` and `StencilMask.test` is `mask instanceof Container`,
+registered `AlphaMask, ColorMask, StencilMask` in `pixi.js/lib/rendering/init.mjs` and tested in
+that order. So `feather: 0` builds a `Graphics` (stencil — cheap, hard-edged) and anything soft or
+textured builds a `Sprite` (alpha — a filter pass). That is a real cost difference worth knowing
+before feathering a mask that did not need it.
+
+**How it works against a flat tree.** `Scene2D` otherwise puts every display object straight onto
+its Canvas2D container, but a Pixi mask applies to ONE display object — so each enabled `Mask2D`
+gets a real sub-`Container` (`MaskSlot`), and `containerFor` routes all five `addChild` sites
+(sprite/graphics, material mesh, skinned mesh, text) into it. Ancestor resolution is
+`maskGroups.ts` (`computeMaskGroups`), the same sparse walk as `computeGroupAlpha` and lazy the
+same way: no `Mask2D` in the scene ⇒ empty maps and ~zero per-frame cost.
+
+- ⚠️ **The sub-container stays at IDENTITY.** Children already carry fully-composed WORLD
+  transforms, so a container that transformed anything would apply it twice.
+- ⚠️ **A masked group is a contiguous z-BAND.** It sorts among its siblings by the mask entity's
+  own paint index; entities outside cannot interleave with entities inside.
+- ⚠️ **Put the mask on a STATIC parent, never on the entity that moves the content.** Mask geometry
+  comes from the mask entity's own world transform, so a mask on a pan/zoom root pans and zooms
+  with what it is meant to clip and clips nothing. Wordweave inserts `CrosswordClip` above
+  `CrosswordRoot` for exactly this reason.
+- ⚠️ **Position the rect with `offsetX`/`offsetY`, and leave the mask entity's `Transform` at
+  identity.** A mask can only clip a subtree by BEING that subtree's ancestor, so moving the mask
+  ENTITY translates everything it clips. Measured: `CrosswordClip` placed at the panel centre moved
+  every crossword cell by exactly that centre — cell 32 read world (787.9, 1031.2) for a local
+  (247.9, 515.6), landing the grid outside its own mask. The offset fields exist to remove that
+  class; the mask rect moves, the subtree does not. This is separate from the warning above and
+  both apply.
+- ⚠️ **A change of mask MEMBERSHIP forces a full redraw**, folded into `forceAll`. Every pass
+  early-returns on an unchanged per-entity snapshot and re-parents only *after* that guard, so an
+  entity entering or leaving a mask without otherwise changing would otherwise keep its old
+  container forever.
+- ⚠️ **`disposeMaskSlot` destroys the container with `{ children: false }`.** Its children are live
+  display objects owned by entity slots that may outlive the mask; they re-home on the next frame.
+
+**The feather ramp is generated, not blurred.** `maskRamp.ts` rasterises a rounded-box SDF into an
+alpha buffer (pure, no DOM, unit-tested), so there is no dependency on Canvas2D `filter` and the
+result is deterministic. Coverage is `clamp01(-sdf / feather)`: **0 exactly on the authored edge**,
+1 at `feather` inside. ⚠️ It was briefly the straddled `clamp01(0.5 - sdf/feather)` — half the ramp
+outside the rect — which cannot be rasterised into a buffer sized to the rect: measured live at
+`feather: 90`, alpha ran 255 → 133 and hard-stopped, a 52%-opacity seam where the fade should have
+finished. Small feathers hid it entirely with every test green. A clip must not paint outside its
+own rect.
+
+⚠️ **`sprite.width = n` is a SCALE against the texture size in Pixi**, so a mask Sprite's sizing is
+kept as `MaskSlot.baseScaleX/Y` and multiplied into the per-frame world-scale write. Writing
+`.width` directly is silently undone the next frame — measured: wordweave's 984×751 clip collapsed
+to the 256px ramp and masked away all but a sliver of the grid.
+
+**What is NOT clipped, and it is not obvious:**
+
+- ⚠️ **Particles — DELIBERATELY, and this is the standing rule** (owner, 2026-08-30, #453).
+  The 2D particle path resolves its container straight from the canvas pool, so an emitter under a
+  `Mask2D` renders **unclipped**. That is not an oversight to fix later: the motivating SHAPE is a
+  travelling effect that crosses a clip boundary — a particle that flies from OUTSIDE a clipped
+  panel INTO it — and clipping it would erase the arc that carries the meaning. (Wordweave's #450
+  flying letters are the non-particle instance of this shape: `Text2D` glyphs parented to the host
+  canvas, not particles, so this rule doesn't actually apply to them — #450 is cited for the shape,
+  not as a particle example.) So the trait's "every descendant" contract reads **every
+  descendant except particles**. If you need a particle confined to a panel, mask the panel's
+  CONTENT and keep the emitter out of the story — do not reach for `Mask2D`.
+- The **collider debug overlay** (`zIndex = 1e9`) also bypasses the mask, deliberately — a debug
+  overlay you cannot see because it got clipped is a worse debug overlay.
+
+Rect mode ships with a real consumer (wordweave's crossword). **Texture mode is covered by unit
+tests only** — no game exercises it yet.
+
+⚠️ **`Mask2D` does not support `Canvas2D.scaleMode: 'fill'`.** Under `fill` the compensation makes
+the mask rect's extent shrink while the content it clips is positioned uncompensated, so the clip
+lands wrong. No project uses `fill` today (swept: 64 `contain`, 11 `fitW`, 5 `fitH`, 0 `fill`).
+
 ## Shipped web build: canvas sizing (`rendering.web.sizeMode`)
 
 How the STANDALONE web game's layer container (`App.tsx`'s `.game-wrapper`) is sized in the
