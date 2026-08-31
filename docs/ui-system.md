@@ -506,6 +506,23 @@ in `runtime/ui/uiTreeStore.ts` (`buildTree()`): it queries all
 any node whose parent chain doesn't terminate within `nodes.size` hops is treated as a
 root and logged in dev (so the editor can flag a bad `parentId`).
 
+⚠️ **`sortOrder` is NOT the stacking authority for anything that authors `UIAnchor.zIndex`.**
+`sortOrder` decides DOM order among siblings (`buildTree`'s `sortChildren`, ascending — later
+siblings paint over earlier ones). But `UIAnchor.zIndex` is copied onto the node and written by
+`anchorCss.ts` as a real CSS `z-index` alongside `position: absolute`, and **CSS z-index beats DOM
+order** — `sortOrder` is only the tiebreak between elements at the SAME z-index. Two root-level
+anchored elements therefore stack purely by `zIndex`, whatever their `sortOrder` says.
+
+This bites because a scene can carry two ordering tables that disagree, and only one of them is
+real. Court's modal group is the worked example (2026-08-31): by `sortOrder` it reads
+`AccountModal` 39 → `ConflictModal` 41 → `BusyOverlay` 42 → `StoreModal` 43, with the store on top;
+by `zIndex` — what actually paints — `StoreModal` (50) is the BOTTOM of that group and
+`ConflictModal` (55) and `BusyOverlay` (56) are above everything. A session diagnosing a stacking
+bug there read the `sortOrder` column, "fixed" it by authoring a higher `sortOrder`, watched the
+correct behaviour on device, and concluded the edit had worked — when the pre-existing `zIndex`
+had always guaranteed it and the edit changed nothing. **Read the `zIndex` column, and when you
+assert a stacking fix, verify it by perturbing the value you actually changed.**
+
 ---
 
 ## Projection & the dirty flag (no per-frame work)
