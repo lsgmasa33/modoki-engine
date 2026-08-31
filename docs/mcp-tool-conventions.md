@@ -78,6 +78,34 @@ Violations that produced this rule:
   disagrees by a constant it cannot see, and the honest reading of that is "my edit did not land" (F8).
 - **`onScreen`** — "inside the viewport" for 2D/3D, but merely "has non-zero size" for UI entities,
   so a UI element parked far off-screen reports `onScreen:true` (S1 `get_layout_bounds`).
+
+### 2a. The TOOL name is the whole interface when schemas are deferred
+
+**A tool's name must distinguish it from its neighbours without its description**, because an agent
+often cannot see the description. Claude Code advertises this surface **deferred** — names only,
+schemas fetched on demand ([mcp-response-budget.md](./mcp-response-budget.md) § "Definition surface
+under tool deferral") — so a name is chosen from a list of ~148 strings and nothing else. A pair
+that reads the same at that width is a coin flip, and §0 ranks a wrong action above an unclear one.
+
+Audit of the whole surface, 2026-08-31 (24 lexically-similar pairs examined; most are fine —
+`get_scene_state`/`get_editor_state`, the five `open_*_editor`, and the read/write pairs all carry
+their distinction in the name). **Four do not:**
+
+| pair | why it is a coin flip | severity |
+|---|---|---|
+| `game_view_devices` (read) vs `game_view_device` (**mutating**) | one character — a plural — separates a list from a write | **highest**: the boundary crossed is read↔mutate |
+| `eval` (**mutating**) vs `eval_api` (read) | `_api` reads as "eval, via the API"; it is the **discovery/list** call. Both servers | high |
+| `create_asset` vs `create_registered_asset` | "registered" names an implementation fact, not the difference an agent picks on (scaffold-with-defaults vs the Assets panel's "New X" kinds) | medium |
+| `focus` (keyboard/panel focus) vs `focus_entity` (camera framing) | bare `focus` does not say *what* is focused | low |
+
+Related inconsistency, same audit: `set_skin_mode` carries the `set_` prefix its siblings
+`scene_view_mode` and `animation_view_mode` do not, though all three are mutating setters.
+
+⚠️ **None of these is fixed, because every fix is a RENAME** — a breaking change to the contracts
+table, the generated catalog, `liveCoverage`, and every doc and test naming the tool, which is the
+same cost that made §7 decline splitting `watch` and the journals. They are recorded so a *new*
+tool does not add a fifth, and so a future rename pass has its list ready. **When naming a new
+tool, the test is: could an agent seeing only this name and its neighbours pick wrong?**
 - **`position`** — documented as "World position" on `set_transform` while writing `Transform.x/y/z`,
   which is **local**. Every parented entity silently lands somewhere else, reported as success (S1).
 

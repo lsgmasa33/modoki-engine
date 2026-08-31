@@ -452,13 +452,56 @@ the section above; `chars/4` understates these payloads by 27-38% per that secti
 the ~85-100k full-surface figure is an estimate with a stated method, not a measurement. No BPE
 tokenizer is installed on this machine and `count_tokens` is a billed API call.
 
-Plan: [mcp-definition-surface.md](./plans/mcp-definition-surface.md), issue #475. The larger cost is
-`tools/list` **churn** — the `tools` block renders first in the cache prefix, so changing it
-invalidates tools + system + the whole message history — not the surface's size. Measured
-2026-08-31: opening a project added 7 `court_*` tools to a live session's list and closing it
-removed them, so **every open, close and project swap costs one invalidation**. (The *reload* flap
-is by contrast rare — two sub-second route outages per game-code edit against a 5 s poll.) See the
-plan's measurement section before optimizing for size here.
+Issue #475. The larger cost is `tools/list` **churn** — the `tools` block renders first in the
+cache prefix, so changing it invalidates tools + system + the whole message history — not the
+surface's size. Measured 2026-08-31: opening a project added 7 `court_*` tools to a live session's
+list and closing it removed them, so **every open, close and project swap costs one invalidation**.
+(The *reload* flap is by contrast rare — two sub-second route outages per game-code edit against a
+5 s poll, and only about 1-in-10 of those lands on a poll at all.)
+
+**The reload flap's fix:** `engine/tools/modoki-mcp/src/gameTools.ts` polls `/api/game-tools` and
+reconciled wholesale (`removeAll()` then re-register) on the first bad answer. That now requires
+**3 consecutive misses**, through **both** doors a reload can take. The first pass guarded only the
+*unreachable* door (non-200 / non-object body) — measured to barely fire: 138 polls across two
+forced reloads produced **zero** non-200s. The door a reload actually uses is a 200 carrying an
+empty tool list (`{"version":0,"tools":[]}`) — the agent bridge answers before the game's `setup()`
+re-registers its tools. Both doors now share the same grace, so a spurious teardown (which costs a
+whole conversation's cache) doesn't fire on a sub-second blip.
+
+**Declined, and why, so none of these get re-proposed:**
+- **`$defs`/`$ref` dedup of the shared aim shapes.** Forbidden by conventions §1 and guarded by
+  `mcpSchemaNoRef.test.ts` — a shared-object schema gets collapsed to a bare `$ref` with no `type`,
+  which a client that doesn't resolve `$ref` mis-encodes. Moot besides: ~12.5k of the ~14.4k
+  duplicated chars is *cross-tool* inlining (the `entity` spec repeated across `modoki_tap`,
+  `modoki_drag`, etc.) — `zod-to-json-schema` runs per tool and cannot dedupe across tools no matter
+  how the shape is authored.
+- **`MODOKI_MCP_PROFILE=core|full`** (a slim tool set for non-deferring clients). No beneficiary:
+  every Claude surface defers — main session AND subagents, confirmed by a probe subagent quoting
+  its own system-reminder — and the owner uses no non-deferring client. Would also have weakened
+  three real guards: the contract↔registry totality check (both directions), `liveCoverage.test.ts`'s
+  swept/smoke/listed totality, and the size ledger's shrink floor.
+- **The stable-pair redesign** (`modoki_game_tools` + `modoki_game_tool_call`, mirroring
+  `game-debug`'s discover/invoke pair, so opening/closing a project never changes `tools/list` at
+  all). The frequent transition (the reload flap) was already fixed above; what's left is the
+  deliberate one — a human opening/closing a project, observed ~4× in a long session. Its saving
+  can't be sized from inside a session (no access to `cache_read_input_tokens`), and the pair would
+  cost real discoverability (a name like `court_load_level` is visible today; behind the pair an
+  agent must ask before it knows there's anything to ask about). Declined in favour of the free
+  behavioural fix in CLAUDE.md § Editor ("don't churn the editor"). **Reopens if project swaps rise
+  to ~10+ per session.**
+- **The `open_*_editor` and view-mode tool merges.** §7-legal (identical `kind`/`method`/`route`),
+  but deferral inverts the benefit: the tool *name* is the whole interface when nothing else is
+  loaded ([mcp-tool-conventions.md](./mcp-tool-conventions.md) § 2a), so five self-describing
+  `open_*` names carry more free information than one
+  generic `open_editor` whose mode enum costs a round-trip to discover. The view-mode group is also
+  incoherent on its own terms — three different `mode` enums, and `game_view_device` isn't a view
+  mode at all.
+- **Trimming descriptions for size.** Under deferral a description is paid only when its schema is
+  fetched, so shrinking it saves near-nothing — and conventions §11 already says a description "is
+  read far more often than this file."
+
+See [mcp-tool-conventions.md](./mcp-tool-conventions.md) § 2a for the tool-name audit this same work
+produced.
 
 ## Open / deferred
 
