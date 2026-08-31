@@ -101,6 +101,94 @@ persistent editor-only toggle: follow that convention (a small `load*`/`save*` p
 component, or an inline `localStorage.getItem`/`setItem` in a Zustand setter) rather than
 folding it into layout JSON — layout is FlexLayout's `Model`, not a general prefs bag.
 
+#### Remembering an ASSET PATH is not the same as remembering a toggle (#473)
+
+A toggle is a value. A remembered **path** is a reference into a project, and the editor's
+`localStorage` is not project-scoped by nature: **one clone serves every project it opens from the
+same origin** (the Vite port derives from the clone DIRECTORY, not the project —
+`engine/scripts/editorPorts.mjs`), and asset URLs carry **no project segment** — a rig in
+`games/skin-test` is served at `/assets/rigs/zombie.rig2d.json`, because a flat project's
+`runtime/assets` maps to `/assets` (`findAssetRoots`, `plugins/vite-asset-scanner.ts`).
+
+So a path remembered under project A is a *valid-looking* URL in project B, where it addresses B's
+asset root, matches nothing, and takes the dev server's SPA fallback — `200 index.html`. That is
+the mechanism behind **#460**: the human opened a rig in `skin-test`, opened a different project
+next, and was told their `.rig2d.json` was **corrupt JSON** about a file that was present and
+untouched. `editor-layout` is global too, so the Skin panel travels along and the load fires with
+nothing rig-related having been clicked. (#460 fixed only the message — the honest text now names
+the path; #473 is why the fetch happened at all.)
+
+**Two guards, covering different failures. A remembered path that can SOURCE a node or a write
+target needs the first; only a path that names an ASSET can have the second:**
+
+| Guard | Covers | How |
+|---|---|---|
+| **Project-scoped key** | another project's path | `projectScopedKey(base)` → `<base>:<project>`, with `setEditorProjectScope(config.name)` injected in `createEditor` |
+| **Manifest existence check** | THIS project's asset, since deleted/renamed/moved | `getGuidForPath(path)` at restore — **refuse, never delete** (below) |
+
+⚠️ **The second guard does not apply to FOLDER paths** — `getGuidForPath` addresses assets, and a
+folder is not one. `pendingFolders` gets an equivalent from the Assets panel's own reconcile
+(`Assets.tsx`, on every scan); `currentFolder` has none, so within one project a folder deleted
+since it was remembered is still the default write target and the next Import re-creates it via
+`/api/write-file`. Known and accepted: the blast radius is one import landing in a folder that
+reappears, versus gating panel state on an async scan. Say so rather than assuming the table
+covers it.
+
+The manifest check is not redundant: a scoped key cannot see a rig that was renamed under a live
+editor — routine across a branch switch. It is the same refusal the `open-skin-editor` agent op
+already makes; the restore path bypassed it by calling the store setter directly.
+
+⚠️ **That check refuses; it must never DELETE the remembered entry** — the first cut of #473 did,
+and it was wrong. `ensureManifestLoaded` swallows a failed fetch and returns `null`: it warns, boot
+continues, and it clears its own memo so the next attempt retries. So a dev server restarting
+mid-boot leaves EVERY path unresolvable for one launch, indistinguishable at this call site from a
+genuinely deleted asset — and dropping there converts a transient, self-healing failure into
+permanent loss of the human's memory, inside a loader written specifically to be recoverable.
+Keeping a stale entry costs nothing once a miss is silent: nothing opens, nothing warns, it
+re-checks for free next launch, and it starts working again if the asset comes back.
+
+Current users: `panels/lastSkinRig.ts`, `animation/lastAnimationClip.ts`, and
+`panels/assetFolderState.ts` (`expanded`, `pendingFolders`, `currentFolder` — its `typeFilter`
+and `viewMode` stay global, being preferences rather than paths).
+
+**Deliberately NOT scoped, and the distinction is the useful part — a SOURCE set versus a LOOKUP
+set.** `pendingFolders` *sources* tree nodes, so a foreign entry becomes a clickable folder: that
+is the whole defect. An expand/collapse set is only ever *consulted*, so a foreign entry matches
+nothing and renders nothing. So `editor:scripts:expanded:v2` (`ScriptTree.tsx`) and the
+`editor:hierarchy:*` sets (`Hierarchy.tsx`) stay global — cosmetic at worst. `engineExpanded`
+stays global for a different reason: it holds `/modoki/assets` paths, and the engine's built-ins
+are identical in every project by construction. Assets' own `expanded` was scoped anyway, for
+consistency with the two path keys beside it in the same module rather than out of necessity.
+
+Scenes solve the same problem separately and predate the helper (`lastSceneKey` in
+`scene/serialize.ts`, plus a self-heal to `config.scenePath` — its comment names this exact leak),
+which is precisely why the rig key should never have shipped global: **the fix already existed two
+lines from the call site.**
+
+⚠️ **The remembered folder is the one that WRITES.** `defaultTargetFolder` returns it whenever it
+matches `ASSET_ROOT_RE` (`panels/assetRoots.ts`), and that regex tests a path's SHAPE, not its
+existence — `/assets/rigs` is shaped identically in every project. Unscoped, browsing there in one
+project made the next project's Import / paste / New Folder default there too, and
+`/api/write-file` creates the directory on demand: it silently CREATED a folder the human never
+opened. Worth stating because these are the instances of this leak that do not merely fail loudly.
+
+`pendingFolders` is sharper still, and scoping `currentFolder` alone would not have closed it. It
+holds folders created but not yet backed by any asset, and the Assets reconcile prunes only
+entries the scan COVERS — so a folder carried in from another project is never pruned, renders as
+a phantom node in this project's tree, and the moment the human clicks it and imports, the folder
+becomes real. The node the user clicks is the vector, not the remembered target.
+
+⚠️ **The scope value is `config.name`, a display name, not an identity.** Nothing enforces
+uniqueness and an empty one collapses to `default`, so two projects sharing a name share a key.
+The manifest check bounds the damage to "opens THIS project's file at that path" rather than the
+#460 error, and `lastSceneKey` already carries the identical exposure — so this is a known limit,
+not an open defect. Related accepted cost: entries are never pruned, so renaming a project orphans
+its old ones (~100 bytes each).
+
+⚠️ The clip memory looks like it was already safe because restore skips a mismatched `scenePath` —
+it was not. Scene paths are flat too, so several projects share `/assets/scenes/main.scene.json`
+and the guard passes; it is also skipped outright when the persisted `scenePath` is null.
+
 ### `createEditor()` — host configuration
 
 `editor/createEditor.tsx` is the factory the host (a game) calls to configure the

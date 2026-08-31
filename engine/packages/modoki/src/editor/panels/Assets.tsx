@@ -63,6 +63,7 @@ import { useExpandedSet } from './useExpandedSet';
 import {
   useExpanded, usePendingFolders, useTypeFilter, useViewMode,
   setExpanded, setPendingFolders, setTypeFilter, setViewMode,
+  getCurrentFolder, setCurrentFolder,
 } from './assetFolderState';
 
 
@@ -553,7 +554,8 @@ function countAll(node: FolderNode): number {
 
 // ─── Main component ──────────────────────────────────────────────────
 
-const LS_CURRENT_FOLDER = 'editor:assets:currentFolder';
+// The current-folder memory lives in assetFolderState.ts with the panel's other persisted
+// path state (#473) — it is per-project there, and testable without mounting this panel.
 
 export default function Assets() {
   const [assets, setAssets] = useState<AssetEntry[]>([]);
@@ -605,23 +607,13 @@ export default function Assets() {
   // folder row, or selected a file inside one). Imports, paste, and New Folder
   // default here so new content lands where the user is looking, instead of the
   // first asset root. Persisted so it survives editor restarts.
-  const currentFolderRef = useRef<string | null>(
-    (() => { try { return localStorage.getItem(LS_CURRENT_FOLDER); } catch { return null; } })(),
-  );
-  const setCurrentFolder = useCallback((path: string | null) => {
-    currentFolderRef.current = path;
-    try {
-      if (path) localStorage.setItem(LS_CURRENT_FOLDER, path);
-      else localStorage.removeItem(LS_CURRENT_FOLDER);
-    } catch { /* ignore */ }
-  }, []);
   // Resolve the default target folder for new content: the current folder when
   // it's under a writable asset root (this holds for freshly-created EMPTY
   // folders too — they have no assets but are valid targets; /api/write-file
   // creates the dir on demand), else the folder of the selected asset, else the
   // first writable asset root.
   const defaultTargetFolder = useCallback((): string => {
-    const cur = currentFolderRef.current;
+    const cur = getCurrentFolder();
     if (cur && ASSET_ROOT_RE.test(cur)) return cur;
     if (selected) return splitAssetPath(selected).dir || '/';
     return firstFromEntries(assets) ?? '/';

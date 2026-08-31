@@ -26,6 +26,7 @@ import { EntityAttributes } from '../runtime/core/traits/EntityAttributes';
 import { loadScene, setCurrentScenePath, setScenePersistenceProject, lastSceneKey } from './scene/serialize';
 import { registerSelectionRestore } from './store/selectionRestore';
 import { registerLastAnimationClipPersistence, restoreLastAnimationClip } from './animation/lastAnimationClip';
+import { setEditorProjectScope } from './projectScopedKey';
 import { registerLastSkinRigPersistence, restoreLastSkinRig } from './panels/lastSkinRig';
 import { registerBuiltinCreatableAssets } from './panels/builtinCreatableAssets';
 import { ensureManifestLoaded, loadManifestJson, getGuidForPath, resolveGuidToPath, isGuid, getAllAssets } from '../runtime/loaders/assetManifest';
@@ -614,6 +615,16 @@ export function createEditor(options: EditorOptions): React.ComponentType {
   // Animation, …). Idempotent — safe if createEditor() ever runs twice in a session.
   registerBuiltinCreatableAssets();
 
+  // Scope the editor's "what was I last editing" localStorage memories to this project: one
+  // origin serves every project in a clone, and asset URLs carry no project segment, so an
+  // unscoped key re-opens project A's rig/clip into project B — where it hits the dev server's
+  // SPA fallback and reports a present, valid file as broken (#473, the root cause behind #460).
+  // Same treatment `setScenePersistenceProject` gives scenes.
+  //
+  // Placed first for readability, NOT because anything downstream requires it: every consumer
+  // resolves its key per read/write, so ordering against the register calls below is not an
+  // invariant and must not be relied on as one (`projectScopedKey`'s own header says why).
+  setEditorProjectScope(options.config.name);
   // Subscribe to world swaps to restore the editor's selection across scene loads
   registerSelectionRestore();
   // Mirror the open animation clip to localStorage (restored below once the scene loads).

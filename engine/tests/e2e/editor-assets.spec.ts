@@ -16,22 +16,43 @@ import { pickHostProject } from './hostProject';
 // absent). See hostProject.ts for the pick and why it can't throw.
 test.skip(!pickHostProject(), 'editor-assets: this snapshot ships no project for the Assets panel to list');
 
-/** Category groups are collapsed by default (empty `expanded` set). Seed the
- *  type-keyed expanded set + section header + folder root so asset rows are actually
- *  rendered in a fresh browser context. Keys mirror Assets.tsx: the expanded set lives
- *  under 'editor:assets:expanded:v2' and category groups key on the asset TYPE name
- *  (ASSET_TYPE_ORDER); '@@assets-section' is the v2 top-level "Assets" header. */
+/** Category groups are collapsed by default (empty `expanded` set), so a fresh browser context
+ *  renders no asset rows at all. These are the group keys to open: category groups key on the
+ *  asset TYPE name (ASSET_TYPE_ORDER), '@@assets-section' is the v2 top-level "Assets" header,
+ *  and '/' is the folder root. Applied by `expandAssetGroups` below. */
+const EXPANDED_GROUPS = [
+  'scene', 'prefab', 'model', 'mesh', 'material', 'texture', 'sprite', 'atlas',
+  'animation', 'animset', 'particle', 'shader', 'environment', 'font', 'script', 'layout',
+  '@@assets-section', '/',
+];
+
+/** Expand every category group so the panel renders rows.
+ *
+ *  ⚠️ Do NOT go back to seeding `editor:assets:expanded:v2` in an `addInitScript`. That key is
+ *  PER-PROJECT since #473 (`assetFolderState.ts`), and the scope suffix is the open project's
+ *  name — which an init script, running before boot, cannot know. A seed written to the bare key
+ *  is never read AND is deleted as a pre-#473 legacy value, so the groups stay collapsed, no
+ *  `[data-asset-path]` row ever renders, and every test in this file times out. Drive the store's
+ *  own setter after boot instead: it is the real API, and it needs no knowledge of the key. */
+async function expandAssetGroups(page: Page) {
+  await page.evaluate(async (types) => {
+    // Runtime URL served by the Vite dev server, NOT a module specifier tsc can resolve — held
+    // in a variable so it stays a dynamic import and typechecking doesn't try to follow it.
+    const url = '/packages/modoki/src/editor/panels/assetFolderState.ts';
+    const m = await import(/* @vite-ignore */ url) as {
+      setExpanded: (u: (prev: Set<string>) => Set<string>) => void;
+    };
+    m.setExpanded(() => new Set(types));
+  }, EXPANDED_GROUPS);
+}
+
 async function gotoEditorWithAssets(page: Page) {
+  // viewMode is a PREFERENCE and stays global, so it can still be seeded pre-boot.
   await page.addInitScript(() => {
-    const types = [
-      'scene', 'prefab', 'model', 'mesh', 'material', 'texture', 'sprite', 'atlas',
-      'animation', 'animset', 'particle', 'shader', 'environment', 'font', 'script', 'layout',
-      '@@assets-section', '/',
-    ];
     localStorage.setItem('editor:assets:viewMode', 'category');
-    localStorage.setItem('editor:assets:expanded:v2', JSON.stringify(types));
   });
   await gotoEmptyEditor(page);
+  await expandAssetGroups(page);
   // The default FlexLayout shows the Game tab in the bottom tabset; activate the
   // Assets tab so the panel (and its asset rows) actually mount.
   await page.locator('.flexlayout__tab_button', { hasText: 'Assets' }).click();

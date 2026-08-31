@@ -45,6 +45,13 @@ vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
 }));
 vi.mock('../../src/editor/scene/serialize', () => ({ getCurrentScenePath: () => scenePath }));
 
+/** Paths the manifest knows about. Restore refuses anything else — a clip deleted or renamed
+ *  since it was remembered would otherwise re-open onto the dev server's SPA fallback (#473). */
+let knownPaths = new Set<string>(['/assets/animations/demo.anim.json']);
+vi.mock('../../src/runtime/loaders/assetManifest', () => ({
+  getGuidForPath: (p: string) => (knownPaths.has(p) ? 'guid-for-' + p : undefined),
+}));
+
 const openAnimationEditor = vi.fn();
 vi.mock('../../src/editor/store/editorStore', () => ({
   useEditorStore: Object.assign(
@@ -54,11 +61,13 @@ vi.mock('../../src/editor/store/editorStore', () => ({
 }));
 
 const { restoreLastAnimationClip } = await import('../../src/editor/animation/lastAnimationClip');
+const { setEditorProjectScope, projectScopedKey } = await import('../../src/editor/projectScopedKey');
 
-const KEY = 'editor:lastAnimationClip';
-const persist = (animatorGuid: string | null) => localStorage.setItem(KEY, JSON.stringify({
-  path: '/assets/animations/demo.anim.json', name: 'Demo', animatorGuid, scenePath: '/assets/scenes/empty.json',
-}));
+const KEY_BASE = 'editor:lastAnimationClip';
+const persist = (animatorGuid: string | null, path = '/assets/animations/demo.anim.json') =>
+  localStorage.setItem(projectScopedKey(KEY_BASE), JSON.stringify({
+    path, name: 'Demo', animatorGuid, scenePath: '/assets/scenes/empty.json',
+  }));
 
 beforeEach(() => {
   localStorage.clear();
@@ -66,6 +75,8 @@ beforeEach(() => {
   scenePath = '/assets/scenes/empty.json';
   guidToId = { 'sphere-guid': 3 };
   hasAnimator = { 3: true };
+  knownPaths = new Set(['/assets/animations/demo.anim.json']);
+  setEditorProjectScope('Skin Test');
 });
 
 describe('restoreLastAnimationClip', () => {
@@ -98,7 +109,37 @@ describe('restoreLastAnimationClip', () => {
 
   it('returns false with nothing saved / bad JSON', () => {
     expect(restoreLastAnimationClip()).toBe(false);
-    localStorage.setItem(KEY, '{not json');
+    localStorage.setItem(projectScopedKey(KEY_BASE), '{not json');
     expect(restoreLastAnimationClip()).toBe(false);
+  });
+
+  // #473: the same-scene guard does NOT cover a project switch — scene paths are flat, so two
+  // projects share `/assets/scenes/empty.json` and the guard passes. Only the scoped key stops it.
+  it('does not restore another project\'s clip, even when both use the same scene path', () => {
+    persist('sphere-guid');
+    setEditorProjectScope('3D Test');
+    expect(restoreLastAnimationClip()).toBe(false);
+    expect(openAnimationEditor).not.toHaveBeenCalled();
+    // …and it is still there for the project that owns it.
+    setEditorProjectScope('Skin Test');
+    expect(restoreLastAnimationClip()).toBe(true);
+  });
+
+  it('refuses a remembered clip the manifest no longer knows (deleted/renamed since)', () => {
+    persist('sphere-guid', '/assets/animations/gone.anim.json');
+    expect(restoreLastAnimationClip()).toBe(false);
+    expect(openAnimationEditor).not.toHaveBeenCalled();
+  });
+
+  // Refuse, never delete: a failed manifest fetch resolves to null and makes every path look
+  // absent for one launch, so dropping would make a transient failure permanent.
+  it('keeps the entry when the manifest is empty, and restores once it comes back', () => {
+    persist('sphere-guid');
+    knownPaths = new Set();
+    expect(restoreLastAnimationClip()).toBe(false);
+    expect(localStorage.getItem(projectScopedKey(KEY_BASE))).not.toBeNull();
+
+    knownPaths = new Set(['/assets/animations/demo.anim.json']);
+    expect(restoreLastAnimationClip()).toBe(true);
   });
 });

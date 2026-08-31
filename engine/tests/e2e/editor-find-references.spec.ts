@@ -33,17 +33,30 @@ import { pickHostProject } from './hostProject';
 
 /** Category groups collapse by default, so seed the expanded set to get rows.
  *  Mirrors `gotoEditorWithAssets` in editor-assets.spec.ts. */
+/** ⚠️ `editor:assets:expanded:v2` is PER-PROJECT since #473 — its real key carries the open
+ *  project's name, which an `addInitScript` (pre-boot) cannot know, and a seed written to the
+ *  bare key is deleted as a pre-#473 legacy value. Drive the store's setter after boot instead.
+ *  Kept in step with `editor-assets.spec.ts`'s copy. */
 async function gotoEditorWithAssets(page: import('@playwright/test').Page) {
+  // viewMode is a PREFERENCE and stays global, so it can still be seeded pre-boot.
   await page.addInitScript(() => {
+    localStorage.setItem('editor:assets:viewMode', 'category');
+  });
+  await gotoEmptyEditor(page);
+  await page.evaluate(async () => {
     const types = [
       'scene', 'prefab', 'model', 'mesh', 'material', 'texture', 'sprite', 'atlas',
       'animation', 'animset', 'particle', 'shader', 'environment', 'font', 'script', 'layout',
       '@@assets-section', '/',
     ];
-    localStorage.setItem('editor:assets:viewMode', 'category');
-    localStorage.setItem('editor:assets:expanded:v2', JSON.stringify(types));
+    // Runtime URL served by the Vite dev server, NOT a module specifier tsc can resolve — held
+    // in a variable so it stays a dynamic import and typechecking doesn't try to follow it.
+    const url = '/packages/modoki/src/editor/panels/assetFolderState.ts';
+    const m = await import(/* @vite-ignore */ url) as {
+      setExpanded: (u: (prev: Set<string>) => Set<string>) => void;
+    };
+    m.setExpanded(() => new Set(types));
   });
-  await gotoEmptyEditor(page);
   await page.locator('.flexlayout__tab_button', { hasText: 'Assets' }).click();
   await page.locator('[data-asset-path]').first().waitFor({ state: 'visible', timeout: 30_000 });
 }
