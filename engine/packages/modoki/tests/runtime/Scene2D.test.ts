@@ -85,6 +85,7 @@ function mockDeps() {
       kind = 'graphics';
       clear = vi.fn(() => this);
       rect = vi.fn(() => this);
+      roundRect = vi.fn(() => this);
       circle = vi.fn(() => this);
       moveTo = vi.fn(() => this);
       lineTo = vi.fn(() => this);
@@ -1274,6 +1275,42 @@ describe('Scene2D.renderFrame', () => {
       scene2d.renderFrame();
       expect(obj.clear).toHaveBeenCalledTimes(2);     // now redrawn
     });
+
+    it('retries a slot that owes a redraw (redrawOwed) even while the sim is stopped and nothing is dirty (#455)', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const { setPlayState } = await import('../../src/runtime/core/playState');
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'square' });
+
+      scene2d.renderFrame(); // frame 1: allocates the slot; its Application init is async
+      const slot = pool.getSlot(canvas.id())!;
+      await slot.ready;
+      // `renderAll` skips a slot whose canvas is still 1x1 (unsized) — give it a real size so the
+      // GPU render pass is actually reached.
+      slot.canvas.width = 320;
+      slot.canvas.height = 480;
+      const render = (slot.app as any).renderer.render as ReturnType<typeof vi.fn>;
+
+      // A genuinely dirty, now-initialized frame — the first real GPU render.
+      spawnChild(world, traits, canvas.id(), { sprite: 'square' }, 1);
+      scene2d.renderFrame(); // frame 2: renders for real
+      expect(render).toHaveBeenCalledTimes(1);
+
+      // Force the next render to throw, then dirty the canvas again (still running) so renderAll
+      // actually reaches — and fails on — this slot, arming `redrawOwed`.
+      render.mockImplementationOnce(() => { throw new Error('boom'); });
+      spawnChild(world, traits, canvas.id(), { sprite: 'square' }, 2);
+      scene2d.renderFrame(); // frame 3: render throws, redrawOwed = true
+      expect(render).toHaveBeenCalledTimes(2);
+
+      setPlayState('stopped');
+      render.mockClear();
+      // Nothing new is dirty and the sim is stopped — without reading `hasRedrawOwed` above the
+      // idle skip, renderFrame would return before `pool.renderAll` is ever reached and this
+      // assertion would fail.
+      scene2d.renderFrame(); // frame 4
+      expect(render).toHaveBeenCalledTimes(1);
+    });
   });
 });
 
@@ -1415,5 +1452,98 @@ describe('Scene2DRenderer 2D-particle-preview render gate (Phase 4)', () => {
     child.set(traits.Transform, { ...child.get(traits.Transform), x: 99 });
     scene2d.renderFrame();           // no provider, stopped, clean ⇒ skip (unchanged behavior)
     expect(obj._x).toBe(0);
+  });
+});
+
+// A mask's display object destroy is DEFERRED by one frame (#455): destroying it in the SAME
+// pass that disposes the mask slot makes the `renderAll` at the end of that pass throw (Pixi's
+// AlphaMaskPipe holds a bind group whose resource just went null). Pinning the ordering
+// invariant directly, rather than the render-throw symptom, since jsdom's null 2D context
+// already forces the stencil path (no `ownedTexture`) and the ordering matters either way.
+describe('Mask2D teardown deferral (#455)', () => {
+  it('a disposed mask object is not destroyed until the frame AFTER the one that disposes it', async () => {
+    const { traits, scene2d, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    const mask = world.spawn(
+      traits.Transform({}),
+      traits.Mask2D({ isEnabled: true, width: 50, height: 50 }),
+      traits.EntityAttributes({ name: 'mask', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+    );
+    // A real child so the mask group isn't empty.
+    spawnChild(world, traits, mask.id(), { sprite: 'square' }, 0);
+
+    scene2d.renderFrame();  // frame 1: mask slot built
+
+    const renderer = (scene2d as unknown as { defaultRenderer: any }).defaultRenderer;
+    const slot = renderer.maskSlots.get(mask.id());
+    expect(slot).toBeDefined();
+    const maskObj = slot.maskObj;
+    expect(maskObj.destroyed).toBe(false);
+
+    // Disable the mask → disposeMaskSlot runs this frame.
+    mask.set(traits.Mask2D, { ...mask.get(traits.Mask2D), isEnabled: false });
+    scene2d.renderFrame();  // frame 2: disposes the slot — must NOT destroy maskObj yet
+    expect(renderer.maskSlots.has(mask.id())).toBe(false); // slot itself is gone
+    expect(maskObj.destroyed).toBe(false);                 // but its display object survives this frame
+
+    scene2d.renderFrame();  // frame 3: the deferred queue flushes at the TOP of this frame
+    expect(maskObj.destroyed).toBe(true);
+  });
+
+  it('a SHAPE change (not just disable) also defers the outgoing mask object destroy', async () => {
+    const { traits, scene2d, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    const mask = world.spawn(
+      traits.Transform({}),
+      traits.Mask2D({ isEnabled: true, width: 50, height: 50 }),
+      traits.EntityAttributes({ name: 'mask', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+    );
+    spawnChild(world, traits, mask.id(), { sprite: 'square' }, 0);
+
+    scene2d.renderFrame();  // frame 1: mask slot built
+
+    const renderer = (scene2d as unknown as { defaultRenderer: any }).defaultRenderer;
+    const slot = renderer.maskSlots.get(mask.id());
+    expect(slot).toBeDefined();
+    const oldMaskObj = slot.maskObj;
+    expect(oldMaskObj.destroyed).toBe(false);
+
+    // Change the SHAPE (width) so `sig !== slot.sig` and `rebuildMaskObject` runs, rather than
+    // disabling/removing the mask entirely.
+    mask.set(traits.Mask2D, { ...mask.get(traits.Mask2D), width: 60 });
+    scene2d.renderFrame();  // frame 2: rebuildMaskObject runs — must NOT destroy oldMaskObj yet
+    expect(oldMaskObj.destroyed).toBe(false);
+    const newSlot = renderer.maskSlots.get(mask.id());
+    expect(newSlot.maskObj).not.toBe(oldMaskObj); // a fresh mask object was built
+
+    scene2d.renderFrame();  // frame 3: the deferred queue flushes at the TOP of this frame
+    expect(oldMaskObj.destroyed).toBe(true);
+  });
+
+  it('stop() drains the deferred-destroy queue without another renderFrame (no leak)', async () => {
+    const { traits, scene2d, world } = await setup();
+    const canvas = spawnCanvas(world, traits);
+    const mask = world.spawn(
+      traits.Transform({}),
+      traits.Mask2D({ isEnabled: true, width: 50, height: 50 }),
+      traits.EntityAttributes({ name: 'mask', parentId: canvas.id(), sortOrder: 0, layer: '2d' }),
+    );
+    spawnChild(world, traits, mask.id(), { sprite: 'square' }, 0);
+
+    scene2d.startScene2D();
+    scene2d.renderFrame();  // frame 1: mask slot built
+
+    const renderer = (scene2d as unknown as { defaultRenderer: any }).defaultRenderer;
+    const slot = renderer.maskSlots.get(mask.id());
+    const oldMaskObj = slot.maskObj;
+
+    // Disable the mask → disposeMaskSlot queues the deferred destroy this frame.
+    mask.set(traits.Mask2D, { ...mask.get(traits.Mask2D), isEnabled: false });
+    scene2d.renderFrame();  // frame 2: queues the destroy, does NOT flush it
+    expect(oldMaskObj.destroyed).toBe(false);
+
+    // Tear the renderer down WITHOUT another renderFrame — stop() must drain the queue itself.
+    scene2d.stopScene2D();
+    expect(oldMaskObj.destroyed).toBe(true);
   });
 });

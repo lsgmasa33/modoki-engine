@@ -591,6 +591,17 @@ export class Scene2DRenderer {
   /** maskId → its live container + mask object. Persists across frames; entries are built on
    *  first sight and dropped by the end-of-frame sweep when the mask entity goes away. */
   private readonly maskSlots = new Map<number, MaskSlot>();
+  /** Mask display objects + generated ramp textures whose destroy is DEFERRED by one frame (#455).
+   *
+   *  ⚠️ Destroying a mask's Sprite / owned ramp texture in the SAME pass as the `pool.renderAll`
+   *  at the end of it leaves PixiJS's `AlphaMaskPipe` holding a bind group whose resource is now
+   *  null, and `renderer.render()` throws mid-pass. `renderAll` swallows that throw — but the
+   *  aborted render has already CLEARED the surface, so the canvas presents a BLANK frame and then
+   *  never redraws, because the per-frame dirty set was consumed by the failed attempt. Measured on
+   *  a wordweave level advance, which builds the new crossword clip and disposes the old one in one
+   *  frame: dispose at t+3ms, render throws at t+4ms, canvas blank until an unrelated edit.
+   *  Flushed at the TOP of the next renderFrame, by which time that render has completed. */
+  private readonly pendingMaskDestroy: Array<{ obj: Container; tex: Texture | null }> = [];
   /** Mask entity ids seen THIS frame — the sweep's liveness set, mirroring `activeIds`. */
   private readonly activeMaskIds = new Set<number>();
   /** `${maskId}|${sprite}` keys that already logged the unresolved-texture-ref warning, so a
@@ -864,9 +875,11 @@ export class Scene2DRenderer {
    *  mask entity PER REF, rather than once per rebuild. */
   private rebuildMaskObject(slot: MaskSlot, d: MaskData, maskId: number) {
     slot.maskObj.removeFromParent();
-    slot.maskObj.destroy();
+    // DEFERRED, not destroyed here — see `pendingMaskDestroy`. Destroying the outgoing mask object
+    // and its ramp texture in this pass makes the render at the end of it throw (#455).
+    this.pendingMaskDestroy.push({ obj: slot.maskObj, tex: slot.ownedTexture });
+    slot.ownedTexture = null;
     if (slot.textureUrl) { releaseSpriteTexture(slot.textureUrl); slot.textureUrl = ''; }
-    if (slot.ownedTexture) { slot.ownedTexture.destroy(true); slot.ownedTexture = null; }
 
     const wantsAlpha = d.mode === 'texture' || d.feather > 0;
     if (!wantsAlpha) { this.buildStencilMask(slot, d); return; }
@@ -936,6 +949,17 @@ export class Scene2DRenderer {
     slot.container.mask = sp;
   }
 
+  /** Destroy the mask objects/textures queued by the previous frame (#455). Called at the TOP of
+   *  renderFrame and from the renderer's own teardown — never mid-pass, which is the whole point. */
+  private flushPendingMaskDestroy() {
+    if (this.pendingMaskDestroy.length === 0) return;
+    for (const p of this.pendingMaskDestroy) {
+      if (!p.obj.destroyed) p.obj.destroy();
+      if (p.tex) p.tex.destroy(true);
+    }
+    this.pendingMaskDestroy.length = 0;
+  }
+
   /** Tear one mask group down: unmask, detach, destroy the container WITHOUT its children, and
    *  release whatever texture the mask object held.
    *
@@ -950,9 +974,11 @@ export class Scene2DRenderer {
     for (const child of [...slot.container.children]) {
       if (child !== slot.maskObj) child.removeFromParent();
     }
-    slot.maskObj.destroy();
+    // DEFERRED, not destroyed here — see `pendingMaskDestroy` (#455).
+    slot.maskObj.removeFromParent();
+    this.pendingMaskDestroy.push({ obj: slot.maskObj, tex: slot.ownedTexture });
+    slot.ownedTexture = null;
     if (slot.textureUrl) releaseSpriteTexture(slot.textureUrl);
-    if (slot.ownedTexture) slot.ownedTexture.destroy(true);
     slot.container.removeFromParent();
     slot.container.destroy({ children: false });
     this.maskSlots.delete(maskId);
@@ -982,6 +1008,11 @@ export class Scene2DRenderer {
         // a ref change disposes the slot (sp.destroy()) + makes a FRESH Sprite, so an
         // in-flight load for the OLD url always resolves onto an already-destroyed object
         // and is dropped here; disposeSlot already released its refcount.
+        // ⚠️ Exception, one frame wide: a `texture`-mode MASK sprite's destroy is now DEFERRED
+        // (`pendingMaskDestroy`, #455), so a load landing in that window resolves onto a
+        // live-but-doomed detached sprite and this guard does NOT catch it. Consequence is
+        // benign — a spurious `markDirty` redraw on an object about to be destroyed anyway,
+        // never a wrong texture landing on screen.
         if (sp.destroyed) return;
         sp.texture = frameTexture(base, resolved);
         // The texture's size feeds the sprite's scale — force a redraw so the gate
@@ -1096,6 +1127,9 @@ export class Scene2DRenderer {
   }
 
   renderFrame() {
+    // Deferred mask teardown queued by the previous frame (#455) — must run BEFORE anything
+    // renders, and never in the same pass as the destroy itself.
+    this.flushPendingMaskDestroy();
     const world = getCurrentWorld();
     if (!traitsCached) cacheTraits();
     if (!traitsCached) return;
@@ -1115,6 +1149,11 @@ export class Scene2DRenderer {
     // would drop the one signal that says "everything on this surface must be drawn again",
     // leaving it blank behind a perfectly healthy context.
     if (this.pool.consumeRebuildFlag()) this._externalDirty = true;
+    // Same reasoning as the rebuild flag above, for the same reason it is read HERE and not below
+    // the skip: a slot whose last render THREW owes a redraw, and the idle skip returns before
+    // `renderAll` is reached, so while the sim is stopped/paused nothing would ever deliver it and
+    // the blank frame the aborted render presented would stand (#455).
+    if (this.pool.hasRedrawOwed()) this._externalDirty = true;
 
     // (1) Idle whole-frame skip — while the sim is stopped/paused, 2D only changes
     // via paths that set _externalDirty, so idle + clean ⇒ no ECS scan, no render.
@@ -2155,6 +2194,9 @@ export class Scene2DRenderer {
     // `{ children: true }` here would double-destroy them.
     for (const maskId of [...this.maskSlots.keys()]) this.disposeMaskSlot(maskId);
     this.maskSlots.clear();
+    // No further frame will run for this renderer, so the deferred queue has to drain here or the
+    // ramp textures it holds leak their GPU memory (#455).
+    this.flushPendingMaskDestroy();
     this.entityShaders.clear();
     this._materialTexLoading.clear();
     // Unconditional (see onWorldSwap): safe with a sibling renderer live — only empties Maps.

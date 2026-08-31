@@ -329,6 +329,33 @@ describe('canvas2DPool', () => {
       expect(() => pool.renderAll()).not.toThrow();
     });
 
+    it('a render that THREW is retried next frame even though nothing marked it dirty (#455)', async () => {
+      const pool = await getModule();
+      const s1 = pool.allocate(1)!;
+      s1.canvas.width = 320; s1.canvas.height = 480;
+      await s1.ready;
+      const render = s1.app.renderer.render as ReturnType<typeof vi.fn>;
+
+      // Baseline: a sized, initialized, allocated slot is SKIPPED when its entity isn't dirty.
+      pool.renderAll(new Set());
+      expect(render).not.toHaveBeenCalled();
+
+      // A dirty frame whose render throws — the throw must not escape renderAll.
+      render.mockImplementationOnce(() => { throw new TypeError("Cannot read properties of null (reading '0')"); });
+      expect(() => pool.renderAll(new Set([1]))).not.toThrow();
+      expect(render).toHaveBeenCalledTimes(1);
+
+      // The very next call, with the entity NOT in the dirty set, must still retry — the aborted
+      // render left the canvas blank and the failed attempt already consumed the dirty flag.
+      pool.renderAll(new Set());
+      expect(render).toHaveBeenCalledTimes(2);
+
+      // Once that retry succeeds, a following non-dirty call skips it again — not a permanent
+      // every-frame redraw.
+      pool.renderAll(new Set());
+      expect(render).toHaveBeenCalledTimes(2);
+    });
+
     it('shrink spares an unclaimed slot whose canvas is still in the DOM (F6 guard)', async () => {
       const pool = await getModule();
       const s1 = pool.allocate(1)!;

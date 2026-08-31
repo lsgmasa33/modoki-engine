@@ -114,6 +114,7 @@ const RETIRED_DOCS_NAMED_ON_PURPOSE: ReadonlyArray<{ cited: string; absorbedBy: 
   { cited: 'docs/cloud-editor-embedded-claude.md', absorbedBy: 'nothing — same' },
   { cited: 'docs/cloud-editor-typescript-editor-plan.md', absorbedBy: 'nothing — same' },
   { cited: 'docs/plans/cloud-teardown-and-migration-plan.md', absorbedBy: 'docs/site-hosting.md — landed (cloud cancelled, GCP torn down, load balancer retired); tracker deleted per doc-conventions.md' },
+  { cited: 'docs/plans/court-store-plan.md', absorbedBy: 'games/court/ads.md — §§ 2-4 folded in (the catalog, the standing rules, the grant hook); the condensed § "A guard whose premise can lie" carries three of the ten close-out-catalogue instances, the rest preserved only in git history' },
   { cited: 'docs/plans/court-art-direction.md', absorbedBy: 'games/court/art.md' },
   { cited: 'docs/plans/court-tray-readability-plan.md', absorbedBy: 'games/court/art.md' },
   { cited: 'games/court/art-direction.md', absorbedBy: 'games/court/art.md' },

@@ -99,6 +99,12 @@ export interface Canvas2DSlot {
   /** Consecutive frames this slot's renderer threw — distinguishes a one-frame
    *  teardown blip (swallowed silently) from a genuinely stuck renderer. */
   renderFailFrames?: number;
+  /** This slot's last render THREW, so it owes a redraw regardless of the per-frame dirty set
+   *  (#455). An aborted render has already CLEARED the surface, so the frame it presented is
+   *  blank — and Scene2D rebuilds `dirtyCanvases` from scratch every frame, so the failed attempt
+   *  consumed the only flag that would have redrawn it. Without this, ONE swallowed throw leaves
+   *  the canvas blank until something unrelated dirties it: a tap, an MCP call, a resize. */
+  redrawOwed?: boolean;
   /** Disposer for this canvas's pointer-PASSTHROUGH registration (`core/pointerBlockers.ts`).
    *  Held per slot so it is dropped when the slot is destroyed rather than leaking a registration
    *  for a dead canvas. */
@@ -341,12 +347,14 @@ export class Canvas2DPool {
       canvas: slot.canvas,
       antialias: pixi.antialias,
       backgroundAlpha: 0,
-      // LOAD-BEARING for F1's idle/skip render — do NOT drop. Scene2D skips
-      // renderer.render on idle/unchanged canvases (renderAll(dirtyIds)); a non-preserved
-      // back buffer would blank such a canvas the next time the browser recomposites its
-      // layer (scroll, ancestor transform/opacity, tab refocus, DPR/resize) with no fresh
-      // WebGL draw. Preserving the buffer keeps the last frame visible across recomposites.
-      // (See engine-review F8 — kept by design, superseded by F1.)
+      // LOAD-BEARING for F1's idle/skip render on WebGL — do NOT drop this without measuring.
+      // Scene2D skips renderer.render on idle/unchanged canvases (renderAll(dirtyIds)); without
+      // this flag a non-preserved WebGL back buffer would blank such a canvas the next time the
+      // browser recomposites its layer (scroll, ancestor transform/opacity, tab refocus,
+      // DPR/resize) with no fresh draw. (See engine-review F8 — kept by design, superseded by F1.)
+      // Retention was also measured to hold on WebGPU (#455), which has no such flag — so this
+      // is belt-and-braces for WebGL specifically, not the property the skip actually rests on.
+      // `renderAll`'s doc comment below is the single source of truth for that.
       preserveDrawingBuffer: true,
       width: slot.canvas.width || 1,
       height: slot.canvas.height || 1,
@@ -487,6 +495,9 @@ export class Canvas2DPool {
     slot.container.rotation = 0;
     if (slot.entityId !== null) this.entityMap.delete(slot.entityId);
     slot.entityId = null;
+    // A reused slot must not inherit the previous entity's render-failure state (#455).
+    slot.redrawOwed = false;
+    slot.renderFailFrames = 0;
   }
 
   /** Claim a slot for a Canvas2D ENTITY (Scene2D, per-frame). Get-or-create, mark
@@ -547,6 +558,20 @@ export class Canvas2DPool {
     return v;
   }
 
+  /** Does any live slot owe a redraw after a thrown render (`redrawOwed`)? NOT read-and-clear —
+   *  the flag is cleared by the successful render itself.
+   *
+   *  ⚠️ Scene2D must read this ABOVE its idle whole-frame skip, exactly like `consumeRebuildFlag`
+   *  above. The skip returns before `renderAll` is reached at all, so a slot that owes a redraw
+   *  while the sim is stopped/paused would never be asked to render again — leaving the blank
+   *  frame the aborted render presented on screen, which is the whole of #455. */
+  hasRedrawOwed(): boolean {
+    for (const slot of this.slots) {
+      if (slot.redrawOwed && slot.entityId !== null && slot.initialized) return true;
+    }
+    return false;
+  }
+
   /** Resize the canvas for an entity (pixel size, not CSS size).
    *
    *  ⚠️ **An unmapped entity used to `return` SILENTLY, and that is how a canvas ships stuck at its
@@ -591,14 +616,18 @@ export class Canvas2DPool {
   /** Render allocated & initialized slots. Called once per frame. When `dirtyIds`
    *  is given, only slots whose entity is in that set are GPU-rendered — Scene2D
    *  passes the set of Canvas2D entities whose content actually changed this frame,
-   *  so a static 2D layer pays no render pass (F1). With `preserveDrawingBuffer`,
-   *  the skipped canvas keeps its last frame on screen. Omit `dirtyIds` to render
+   *  so a static 2D layer pays no render pass (F1). A skipped canvas keeps its last
+   *  PRESENTED frame on screen — measured on both backends (#455 measured 17,000+
+   *  consecutive skipped frames on WebGPU with the content still on screen), so this
+   *  is not a `preserveDrawingBuffer`-only property. Omit `dirtyIds` to render
    *  every slot (back-compat). Always shrinks idle slots regardless of dirtiness. */
   renderAll(dirtyIds?: Set<number>): void {
     for (const slot of this.slots) {
       if (slot.entityId === null || !slot.initialized) continue;
       if (slot.canvas.width <= 1 || slot.canvas.height <= 1) continue;
-      if (dirtyIds && !dirtyIds.has(slot.entityId)) continue;
+      // `redrawOwed` OVERRIDES the dirty set: a slot whose last render threw has a cleared,
+      // undefined surface and must be retried, or it stays blank forever (#455).
+      if (dirtyIds && !dirtyIds.has(slot.entityId) && !slot.redrawOwed) continue;
       // A slot's Application can be mid-teardown during a world swap (a scene reload —
       // e.g. Apply-to-Prefab undo's loadScene — or a Canvas2DMount unmount), or lose its
       // WebGL context when its <canvas> leaves the DOM. The renderer object still exists
@@ -611,12 +640,14 @@ export class Canvas2DPool {
       try {
         renderer.render(slot.app.stage);
         slot.renderFailFrames = 0;
+        slot.redrawOwed = false;
       } catch (err) {
         // A canvas mid-teardown during a world swap (scene reload / Canvas2DMount unmount)
         // loses its WebGL context, so render() throws for a frame or two until the slot is
         // reclaimed. Swallow that transient SILENTLY. Only a renderer that fails for many
         // CONSECUTIVE frames is genuinely stuck — surface that, once, in dev.
         slot.renderFailFrames = (slot.renderFailFrames ?? 0) + 1;
+        slot.redrawOwed = true; // the aborted render left the surface blank — retry next frame (#455)
         if (import.meta.env?.DEV && slot.renderFailFrames === STUCK_RENDER_FRAMES && !this._stuckRenderWarned) {
           this._stuckRenderWarned = true;
           console.warn(`[canvas2DPool] canvas (entity ${slot.entityId}) has failed to render for ${STUCK_RENDER_FRAMES} consecutive frames — possible stuck renderer:`, err);
