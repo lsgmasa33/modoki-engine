@@ -18,6 +18,7 @@ import { resolveDirectorRootForTimeline } from './openAssetInEditor';
 import { fireDirtyListeners, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { Director } from '../../runtime/traits/Director';
 import { newGuid, registerAsset, getAllAssets } from '../../runtime/loaders/assetManifest';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import { previewTimelineAt, previewTimelineStep, previewControlAt, clearPreviewControls } from '../../runtime/timeline/timelineSystem';
@@ -215,10 +216,10 @@ export default function TimelineEditor() {
       return;
     }
     fetch(asset.path)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
+      .then((r) => parseAssetJson(r, asset.path))
       .then((json) => {
         if (cancelled) return;
-        const loaded = normalizeTimeline(json);
+        const loaded = normalizeTimeline(json as Partial<TimelineDef>);
         if (!loaded.id) loaded.id = newGuid();
         registerAsset(loaded.id, asset.path, 'timeline');
         savedMarkRef.current?.(loaded);

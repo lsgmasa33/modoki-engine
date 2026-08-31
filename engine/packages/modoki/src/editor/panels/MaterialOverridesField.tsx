@@ -15,6 +15,7 @@ import { type TraitMeta, getTraitByName } from '../../runtime/core/ecs/traitRegi
 import { writeTraitFieldPerEntityWithUndo as writeFieldPerEntity } from '../undo/entityActions';
 import type { MaterialParamOverride, MaterialParamSource } from '../../runtime/traits/MaterialInstance';
 import { resolveGuidToPath, resolveRef, isGuid } from '../../runtime/loaders/assetManifest';
+import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { listShaderOptions, optionValueForMaterial, resolveShaderSchema } from '../shaderCatalog';
 import { BufferedTextInput, BufferedNumberInput, inputStyle } from './fields';
 import { FieldLabel, DropdownField } from './assetViews/widgets';
@@ -76,8 +77,10 @@ function useShaderUniforms(guid: string): { uniforms: string[]; textures: string
     const path = isGuid(guid) ? (resolveGuidToPath(guid) ?? resolveRef(guid)) : guid;
     if (!path) return;
     fetch(path)
-      .then((r) => (r.ok ? r.json() : null))
-      .then(async (data: Record<string, unknown> | null) => {
+      .then((r) => parseAssetJson(r, path))
+      .catch((e) => { if (isMissingAsset(e)) return null; throw e; })
+      .then(async (json) => {
+        const data = json as Record<string, unknown> | null;
         if (!data || cancelled) return;
         // A 2D material GUID resolves to a `.shader.json` manifest DIRECTLY (the shader IS
         // the material), so its `params` are the uniform/texture names — no .mat.json indirection.

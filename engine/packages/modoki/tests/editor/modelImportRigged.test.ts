@@ -97,8 +97,8 @@ const mockFetch = vi.fn(async (url: string, opts?: any) => {
   if (url.startsWith('/api/read-meta')) return { ok: false } as any;       // no prior sidecar
   if (url === '/api/write-meta') { writtenMeta.push(JSON.parse(opts.body)); return { ok: true } as any; }
   if (url === '/api/write-file') { writtenFiles.push(JSON.parse(opts.body)); return { ok: true } as any; }
-  if (url === '/api/reimport') return { ok: true, json: async () => ({}) } as any;
-  return { ok: true, json: async () => ({}) } as any;
+  if (url === '/api/reimport') return { ok: true, json: async () => ({}), text: async () => '{}' } as any;
+  return { ok: true, json: async () => ({}), text: async () => '{}' } as any;
 });
 vi.stubGlobal('fetch', mockFetch);
 
@@ -216,8 +216,8 @@ describe('importModel — rigged (SkinnedModel) path', () => {
       if (url.startsWith('/api/read-meta')) return { ok: false } as any;
       if (url === '/api/write-meta') { writtenMeta.push(JSON.parse(opts.body)); return { ok: true } as any; }
       if (url === '/api/write-file') { writtenFiles.push(JSON.parse(opts.body)); return { ok: true } as any; }
-      if (url === matPath) return { ok: true, json: async () => ({ id: firstId }) } as any;
-      return { ok: true, json: async () => ({}) } as any;
+      if (url === matPath) return { ok: true, json: async () => ({ id: firstId }), text: async () => JSON.stringify({ id: firstId }) } as any;
+      return { ok: true, json: async () => ({}), text: async () => '{}' } as any;
     });
 
     await importModel('/games/x/assets/hero.glb', 'hero');

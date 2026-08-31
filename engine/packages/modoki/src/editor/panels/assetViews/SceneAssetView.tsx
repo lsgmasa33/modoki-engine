@@ -33,6 +33,7 @@ import { makeBaseSceneUndo } from './baseSceneUndo';
 import { AssetRefField, assetDisplayName } from '../AssetRefField';
 import { isGuid, resolveGuidToPath } from '../../../runtime/loaders/assetManifest';
 import { resolveSceneChain, type FetchSceneMeta } from '../../../runtime/scene/sceneChain';
+import { parseAssetJson, isMissingAsset } from '../../../runtime/loaders/assetFetch';
 
 /** Editor-side `FetchSceneMeta`: fetch the scene FILE for a path, or resolve a
  *  guid to a path via the asset manifest first. Mirrors SceneManager.loadScene's
@@ -42,8 +43,7 @@ const fetchSceneMetaForEditor: FetchSceneMeta = async (locator) => {
   if (!path) return null;
   try {
     const res = await fetch(path);
-    if (!res.ok) return null;
-    const data = await res.json() as { id?: string; baseScene?: string };
+    const data = await parseAssetJson(res, path) as { id?: string; baseScene?: string };
     const guid = data.id && isGuid(data.id) ? data.id : `path:${path}`;
     return { guid, path, baseScene: data.baseScene };
   } catch {
@@ -109,8 +109,10 @@ export function SceneAssetView({ path, name }: { path: string; name: string }) {
     setLoaded(false);
     setWarning(null);
     fetch(path, { signal: ac.signal })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data: { id?: string; baseScene?: string } | null) => {
+      .then((r) => parseAssetJson(r, path))
+      .catch((e) => { if (isMissingAsset(e)) return null; throw e; })
+      .then((json) => {
+        const data = json as { id?: string; baseScene?: string } | null;
         if (!data) return;
         setMyGuid(data.id && isGuid(data.id) ? data.id : null);
         setBaseScene(data.baseScene ?? '');

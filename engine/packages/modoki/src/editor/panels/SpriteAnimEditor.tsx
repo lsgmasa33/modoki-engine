@@ -17,6 +17,7 @@ import { spriteThumbStyle } from './SpritePicker';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { normalizeSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { defaultSpriteClip, type SpriteClip } from '../../runtime/traits/SpriteAnimator';
 import { defaultSpriteAnimData } from '../../runtime/assets/assetSchemas';
 import { spriteIndexFromStep } from '../../runtime/particles/types';
@@ -80,10 +81,10 @@ export default function SpriteAnimEditor() {
       return;
     }
     fetch(asset.path)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
+      .then((r) => parseAssetJson(r, asset.path))
       .then((json) => {
         if (cancelled) return;
-        const loaded = normalizeSpriteAnim(json);
+        const loaded = normalizeSpriteAnim(json as Parameters<typeof normalizeSpriteAnim>[0]);
         // Baseline is the doc WITH the minted id, never an id-less twin — that trick made the
         // autosave write the new id, and without an autosave it would park a write just for
         // OPENING a legacy asset. The scanner heals missing GUIDs already (buildManifest heal).

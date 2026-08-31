@@ -31,6 +31,19 @@ function isHtmlFallthrough(text: string): boolean {
   return /^\s*(<!doctype html|<html\b)/i.test(text);
 }
 
+/** Thrown by `parseAssetJson` for a MISSING asset — the dev server's SPA fallback, or a real
+ *  non-ok response (e.g. a plain 404 from a server that doesn't do SPA fallback: same condition,
+ *  reported honestly). Never thrown for a genuine parse failure — that keeps a plain `Error`, so
+ *  the two stay distinguishable without matching message text. Modeled on `isPluginUnimplemented`
+ *  in `engine/app/ota.ts`: a typed check survives a message reword; a string match doesn't. */
+export class MissingAssetError extends Error {}
+
+/** True when `e` is `parseAssetJson`'s missing-asset case (SPA fallback or non-ok response) —
+ *  never true for a real JSON parse failure or an unrelated error. */
+export function isMissingAsset(e: unknown): boolean {
+  return e instanceof MissingAssetError;
+}
+
 /** Parse an asset-JSON response, turning the dev server's SPA fallback into a MISSING-ASSET error.
  *
  *  WHY. Vite answers an unknown path with `200 index.html`, so `r.ok` is true and `r.json()` throws
@@ -49,10 +62,12 @@ function isHtmlFallthrough(text: string): boolean {
  *  same shape of fix; the two cannot share code because one runs in the browser and one in the MCP
  *  server process. */
 export async function parseAssetJson(res: Response, path: string): Promise<unknown> {
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${path}`);
+  // A non-ok response (a real 404, say, from a server without SPA fallback) is the SAME condition
+  // as the fallback case below, reported honestly — treat it as missing too.
+  if (!res.ok) throw new MissingAssetError(`${res.status} ${res.statusText} for ${path}`);
   const text = await res.text();
   if (isHtmlFallthrough(text)) {
-    throw new Error(
+    throw new MissingAssetError(
       `no asset at ${path} — the dev server answered with index.html (its SPA fallback), which `
       + `means the file does not exist. Check the ref/GUID, or create the asset.`,
     );
@@ -61,7 +76,8 @@ export async function parseAssetJson(res: Response, path: string): Promise<unkno
     return JSON.parse(text) as unknown;
   } catch (e) {
     // A REAL parse failure keeps its own message, plus the path — the original error said which
-    // token but never which file, and these loaders fetch many.
+    // token but never which file, and these loaders fetch many. Deliberately a plain Error, not
+    // MissingAssetError: a corrupt file must never be silently treated as an absent one.
     throw new Error(`${path} is not valid JSON: ${e instanceof Error ? e.message : String(e)}`, { cause: e });
   }
 }

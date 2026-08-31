@@ -18,6 +18,7 @@ import { particleBackend } from '../../runtime/particles/particleBackend';
 import { defaultParticleEffect, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType, type BlendMode, type ForceField, type MeshPrimitive, type SpriteMode, type SubEmitter, type CollisionConfig, type ColliderShape } from '../../runtime/particles/types';
 import { normalizeParticleDef } from '../../runtime/loaders/particleCache';
 import { newGuid, registerAsset } from '../../runtime/loaders/assetManifest';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { saveAssetDialog } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { applyWheelStep, useWheelStep } from './fields';
@@ -229,10 +230,10 @@ export default function ParticleEditor() {
       return;
     }
     fetch(asset.path)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
+      .then((r) => parseAssetJson(r, asset.path))
       .then((json) => {
         if (cancelled) return;
-        const loaded = normalizeParticleDef(json);
+        const loaded = normalizeParticleDef(json as Partial<ParticleEffectDef>);
         // Legacy/new effect with no in-file guid: assign + register one so scenes and sub-emitters
         // can reference it by guid (survives move/rename). The saved-baseline is the doc WITH the
         // id — deliberately not an id-less twin. That trick existed to make the autosave notice the

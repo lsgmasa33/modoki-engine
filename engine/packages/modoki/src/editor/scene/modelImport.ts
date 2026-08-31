@@ -16,6 +16,7 @@ import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { convertSourceToGLB, needsGLBConversion } from './convertToGLB';
 import { extractRigBones, type RigBoneInfo } from './rigBones';
 import { useEditorStore } from '../store/editorStore';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 
 async function writeAssetFile(path: string, content: string): Promise<boolean> {
   try {
@@ -109,8 +110,7 @@ async function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> 
 async function readExistingId(path: string): Promise<string | undefined> {
   try {
     const res = await fetch(path, { cache: 'no-store' });
-    if (!res.ok) return undefined;
-    const json = await res.json();
+    const json = await parseAssetJson(res, path) as { id?: unknown };
     return typeof json?.id === 'string' && isGuid(json.id) ? json.id : undefined;
   } catch { return undefined; }
 }
@@ -122,9 +122,8 @@ async function readExistingId(path: string): Promise<string | undefined> {
 async function readExistingMaterial(path: string): Promise<Record<string, unknown> | null> {
   try {
     const res = await fetch(path, { cache: 'no-store' });
-    if (!res.ok) return null;
-    const json = await res.json();
-    return json && typeof json === 'object' ? json : null;
+    const json = await parseAssetJson(res, path);
+    return json && typeof json === 'object' ? json as Record<string, unknown> : null;
   } catch { return null; }
 }
 

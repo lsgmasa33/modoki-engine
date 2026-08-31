@@ -12,6 +12,7 @@ import type { ShaderParam, ShaderParamType } from '../../../runtime/loaders/shad
 import { BufferedTextInput, inputStyle } from '../fields';
 import { NumberField } from './widgets';
 import { persistAssetEdit, useAssetViewRefresher, invalidateShaderFile } from './persist';
+import { parseAssetJson, isMissingAsset } from '../../../runtime/loaders/assetFetch';
 import { ParamField } from './MaterialAssetView';
 import { ShaderPreview } from '../ShaderPreview';
 
@@ -30,8 +31,9 @@ export function ShaderAssetView({ path }: { path: string }) {
   useEffect(() => {
     const ac = new AbortController();
     fetch(path, { signal: ac.signal })
-      .then((r) => (r.ok ? r.json() : null))
-      .then(setData)
+      .then((r) => parseAssetJson(r, path))
+      .catch((e) => { if (isMissingAsset(e)) return null; throw e; })
+      .then((data) => setData(data as Record<string, unknown> | null))
       .catch((e) => { if (e.name !== 'AbortError') setData(null); });
     return () => ac.abort();
   }, [path]);

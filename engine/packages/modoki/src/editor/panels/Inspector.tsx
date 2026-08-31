@@ -17,6 +17,7 @@ import { useEditorStore } from '../store/editorStore';
 import { getPrefabSource, getCachedPrefabSync, getOverrides } from '../scene/prefab';
 import { getEditorViewportCamera } from '../scene/sceneViewBus';
 import { instantiatePrefabAsync, setPrefabSource, type PrefabFile } from '../scene/prefab';
+import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { getModelPostprocessorIds } from '../../runtime/loaders/modelPostprocessorRegistry';
 import { isGuid, resolveGuidToPath, getAssetEntry } from '../../runtime/loaders/assetManifest';
 // Which anchors stretch which axis is decided ONCE, in anchorLayout — the same import
@@ -1360,7 +1361,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
               onClick={async () => {
                 try {
                   const res = await fetch(asset.path);
-                  const prefab: PrefabFile = await res.json();
+                  const prefab = await parseAssetJson(res, asset.path) as PrefabFile;
                   // Preload nested children before the sync expand (nested prefabs).
                   const rootId = await instantiatePrefabAsync(prefab);
                   setPrefabSource(rootId, asset.path);
@@ -1373,8 +1374,13 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
                     initialId: rootId,
                     respawn: async () => {
                       const r = await fetch(asset.path);
-                      if (!r.ok) return null;
-                      const p: PrefabFile = await r.json();
+                      let p: PrefabFile;
+                      try {
+                        p = await parseAssetJson(r, asset.path) as PrefabFile;
+                      } catch (e) {
+                        if (isMissingAsset(e)) return null;
+                        throw e;
+                      }
                       const id = await instantiatePrefabAsync(p);
                       setPrefabSource(id, asset.path);
                       return id;

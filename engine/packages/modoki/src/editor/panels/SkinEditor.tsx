@@ -18,6 +18,7 @@ import { backendFetch } from '../backend/editorBackend';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath, getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { wholeImageSpriteRef } from './spritePickerGroups';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
 import { coerceRigBones, defaultRig2DFile } from '../../runtime/skinning/rig2dTypes';
 import { generateGridMesh } from '../../runtime/skinning/rig2dTessellate';
@@ -244,13 +245,14 @@ export default function SkinEditor() {
       return;
     }
     fetch(asset.path)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
-      .then((json: Rig2DFile) => {
+      .then((r) => parseAssetJson(r, asset.path))
+      .then((json) => {
         if (cancelled) return;
-        if (!json.id) { json.id = newGuid(); }
-        registerAsset(json.id!, asset.path, 'rig2d');
-        savedMarkRef.current?.(json);
-        loadSkinDef(json);
+        const doc = json as Rig2DFile;
+        if (!doc.id) { doc.id = newGuid(); }
+        registerAsset(doc.id!, asset.path, 'rig2d');
+        savedMarkRef.current?.(doc);
+        loadSkinDef(doc);
       })
       .catch((e) => {
         if (cancelled) return;

@@ -18,6 +18,7 @@ import { useHmrEpoch } from '../input/hmrEpoch';
 import { findEntity, getStructureVersion } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newGuid, registerAsset, getGuidForPath } from '../../runtime/loaders/assetManifest';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import {
   defaultAnimationClip, normalizeAnimationClip,
@@ -309,10 +310,10 @@ export default function AnimationEditor() {
       return;
     }
     fetch(asset.path)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
+      .then((r) => parseAssetJson(r, asset.path))
       .then((json) => {
         if (cancelled) return;
-        const loaded = normalizeAnimationClip(json);
+        const loaded = normalizeAnimationClip(json as Partial<AnimationClipDef>);
         // The saved-baseline is the doc WITH the minted id, never an id-less twin: that trick
         // existed to make the autosave notice the new id and write it, and with the autosave gone
         // it would park a write merely for OPENING a legacy clip. The asset scanner already heals

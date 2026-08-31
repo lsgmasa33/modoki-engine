@@ -20,6 +20,7 @@ import { getRunMode } from '../../runtime/core/playState';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
+import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 
 /** Sentinel guid stamped on the prefab root in the synthetic edit scene so the
  *  save path can locate it after the loader reassigns ECS ids. Lives only in the
@@ -239,8 +240,7 @@ export async function openPrefabForEditing(asset: { path: string; name: string }
   let prefab: PrefabFile;
   try {
     const res = await fetch(asset.path);
-    if (!res.ok) { console.error(`[PrefabEdit] failed to fetch ${asset.path}`); return; }
-    prefab = await res.json();
+    prefab = await parseAssetJson(res, asset.path) as PrefabFile;
   } catch (e) {
     console.error('[PrefabEdit] fetch failed:', e);
     return;

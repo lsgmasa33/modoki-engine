@@ -10,6 +10,7 @@ import { pushAction } from '../../undo/undoManager';
 import type { AnimSetClipDef } from '../../../runtime/loaders/animSetCache';
 import { NumberField } from './widgets';
 import { persistAssetEdit, useAssetViewRefresher, invalidateAnimSetFile } from './persist';
+import { parseAssetJson, isMissingAsset } from '../../../runtime/loaders/assetFetch';
 
 export function AnimSetAssetView({ path }: { path: string }) {
   const [data, setData] = useState<{ source?: string; clips?: AnimSetClipDef[] } | null>(null);
@@ -19,8 +20,9 @@ export function AnimSetAssetView({ path }: { path: string }) {
   useEffect(() => {
     const ac = new AbortController();
     fetch(path, { signal: ac.signal })
-      .then(r => r.ok ? r.json() : null)
-      .then(setData)
+      .then(r => parseAssetJson(r, path))
+      .catch(e => { if (isMissingAsset(e)) return null; throw e; })
+      .then((data) => setData(data as { source?: string; clips?: AnimSetClipDef[] } | null))
       .catch(e => { if (e.name !== 'AbortError') setData(null); });
     return () => ac.abort();
   }, [path]);

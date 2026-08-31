@@ -9,6 +9,7 @@ import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWi
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
 import { instantiatePrefabAsync, setPrefabSource, detachPrefabInstance, reattachPrefabInstance, type PrefabFile } from '../scene/prefab';
+import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { focusEntityInSceneView, canFrameSelected } from '../scene/sceneViewBus';
 import { getCurrentScenePath } from '../scene/serialize';
 import { sceneManager } from '../../runtime/scene/SceneManager';
@@ -1474,8 +1475,13 @@ export default function Hierarchy() {
 
     try {
       const res = await fetch(path);
-      if (!res.ok) return;
-      const prefab: PrefabFile = await res.json();
+      let prefab: PrefabFile;
+      try {
+        prefab = await parseAssetJson(res, path) as PrefabFile;
+      } catch (e) {
+        if (isMissingAsset(e)) return;
+        throw e;
+      }
       // Preload nested children before the sync expand — otherwise a nested (v2)
       // prefab's children are silently dropped.
       const currentId = await instantiatePrefabAsync(prefab, parentId);
@@ -1488,8 +1494,13 @@ export default function Hierarchy() {
         initialId: currentId,
         respawn: async () => {
           const r = await fetch(path);
-          if (!r.ok) return null;
-          const p: PrefabFile = await r.json();
+          let p: PrefabFile;
+          try {
+            p = await parseAssetJson(r, path) as PrefabFile;
+          } catch (e) {
+            if (isMissingAsset(e)) return null;
+            throw e;
+          }
           const id = await instantiatePrefabAsync(p, parentId);
           setPrefabSource(id, path);
           selectEntity(id);
