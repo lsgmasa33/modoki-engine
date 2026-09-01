@@ -1,6 +1,5 @@
 package com.modokiengine.capacitor.audio;
 
-import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
@@ -15,9 +14,7 @@ import com.getcapacitor.annotation.CapacitorPlugin;
  * class exists only so the package is structurally complete (`cap sync` needs SOMETHING on both
  * platforms) and the shared `ModokiAudioPlugin` JS contract resolves the same shape everywhere.
  *
- * `configure()` is a no-op success. `shouldSilenceSecondaryAudio()` always answers `false` — this is the
- * honest default, since nothing here has any way to know otherwise — and `secondaryAudioHint` is
- * never emitted.
+ * `configure()` is a no-op success.
  */
 @CapacitorPlugin(name = "ModokiAudio")
 public class ModokiAudioPlugin extends Plugin {
@@ -25,12 +22,5 @@ public class ModokiAudioPlugin extends Plugin {
     @PluginMethod
     public void configure(PluginCall call) {
         call.resolve();
-    }
-
-    @PluginMethod
-    public void shouldSilenceSecondaryAudio(PluginCall call) {
-        JSObject r = new JSObject();
-        r.put("silence", false);
-        call.resolve(r);
     }
 }

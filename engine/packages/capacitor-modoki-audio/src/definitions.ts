@@ -5,19 +5,12 @@
  * iOS sets no audio session category anywhere in this repo, so every game inherits the default
  * `.soloAmbient` — which DEACTIVATES whatever another app (Apple Music, a podcast) was playing
  * the moment our own audio starts. The owner wants the opposite: let other apps' audio keep
- * playing, and duck our own music while it does.
+ * playing alongside ours.
  *
- * `.ambient` + `.mixWithOthers` is the category that mixes instead of interrupting. Once set,
- * iOS's *automatic* ducking (`.duckOthers`-style behaviour on THEIR side) is not something we
- * control — what this plugin adds is the signal the engine needs to duck ITS OWN music in
- * response: `AVAudioSession.silenceSecondaryAudioHintNotification`, Apple's purpose-built event
- * for exactly this case, plus a boot/foreground snapshot for the state the notification cannot
- * describe (it only reports transitions, never "what is true right now").
+ * `.ambient` + `.mixWithOthers` is the category that mixes instead of interrupting.
  *
  * Android carries no equivalent — audio there is 100% WebView (Web Audio) with no native audio
- * code, and Chromium owns focus. The Android/web sides of this plugin are permanent no-ops:
- * `shouldSilenceSecondaryAudio()` always resolves `{ silence: false }` and `secondaryAudioHint` is never
- * emitted.
+ * code, and Chromium owns focus. The Android/web side of this plugin is a permanent no-op.
  */
 
 /** The `AVAudioSession.Category` this plugin supports. Both mix with other apps' audio —
@@ -38,25 +31,4 @@ export interface ModokiAudioPlugin {
    * does not recognize.
    */
   configure(options: { category: AudioSessionCategory }): Promise<void>;
-
-  /**
-   * A BOOT/FOREGROUND SNAPSHOT of `AVAudioSession.sharedInstance().secondaryAudioShouldBeSilencedHint`
-   * — the documented companion of the hint notification, so snapshot and event answer the SAME
-   * question. Deliberately NOT `isOtherAudioPlaying`, which is broader and would duck on a
-   * transition no `.end` ever follows. Needed
-   * because `secondaryAudioHint` (below) only reports TRANSITIONS and cannot describe the state
-   * the app launched or foregrounded into. Always `{ silence: false }` on Android/web.
-   */
-  shouldSilenceSecondaryAudio(): Promise<{ silence: boolean }>;
-
-  /**
-   * Fires on `AVAudioSession.silenceSecondaryAudioHintNotification` — Apple's purpose-built
-   * signal for "another app's audio just started/stopped playing alongside yours". `silence:
-   * true` on `.begin` (duck our music now), `false` on `.end` (safe to come back up). Never
-   * emitted on Android/web.
-   */
-  addListener(
-    eventName: 'secondaryAudioHint',
-    listener: (event: { silence: boolean }) => void,
-  ): Promise<{ remove: () => Promise<void> }>;
 }

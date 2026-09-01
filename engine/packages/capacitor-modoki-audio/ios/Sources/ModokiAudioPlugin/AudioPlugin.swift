@@ -7,9 +7,8 @@ import AVFoundation
  *
  * iOS sets no audio session category anywhere in this repo, so every game inherits the default
  * `.soloAmbient` — which deactivates whatever another app (Apple Music, a podcast) was playing
- * the instant our own audio starts. This plugin sets a category that MIXES instead, and reports
- * Apple's own "duck me" signal so the engine can turn its own music down while another app's
- * audio is audible.
+ * the instant our own audio starts. This plugin sets a category that MIXES instead, so our own
+ * audio does not silence another app's.
  *
  * ⚠️ Every `AVAudioSession` call here is wrapped in do/catch and never traps. A failure to set
  * the category must degrade to the OS default (current behaviour), not crash the splash screen —
@@ -21,8 +20,7 @@ public class ModokiAudioPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "ModokiAudioPlugin"
     public let jsName = "ModokiAudio"
     public let pluginMethods: [CAPPluginMethod] = [
-        CAPPluginMethod(name: "configure", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "shouldSilenceSecondaryAudio", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "configure", returnType: CAPPluginReturnPromise)
     ]
 
     private static let allowedCategories = ["ambient", "playback"]
@@ -33,16 +31,6 @@ public class ModokiAudioPlugin: CAPPlugin, CAPBridgedPlugin {
     /// reasonable default is in place from the very first frame either way.
     public override func load() {
         applyCategory(.ambient)
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleSecondaryAudioHint(_:)),
-            name: AVAudioSession.silenceSecondaryAudioHintNotification,
-            object: AVAudioSession.sharedInstance()
-        )
-    }
-
-    deinit {
-        NotificationCenter.default.removeObserver(self)
     }
 
     private func applyCategory(_ category: AVAudioSession.Category) {
@@ -56,15 +44,6 @@ public class ModokiAudioPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
-    @objc private func handleSecondaryAudioHint(_ notification: Notification) {
-        guard let info = notification.userInfo,
-              let typeValue = info[AVAudioSessionSilenceSecondaryAudioHintTypeKey] as? UInt,
-              let type = AVAudioSession.SilenceSecondaryAudioHintType(rawValue: typeValue) else {
-            return
-        }
-        notifyListeners("secondaryAudioHint", data: ["silence": type == .begin])
-    }
-
     @objc func configure(_ call: CAPPluginCall) {
         guard let raw = call.getString("category"), Self.allowedCategories.contains(raw) else {
             call.reject("category must be one of: \(Self.allowedCategories.joined(separator: ", "))")
@@ -73,18 +52,5 @@ public class ModokiAudioPlugin: CAPPlugin, CAPBridgedPlugin {
         let category: AVAudioSession.Category = raw == "playback" ? .playback : .ambient
         applyCategory(category)
         call.resolve()
-    }
-
-    /// The SNAPSHOT half of the duck signal, and deliberately NOT `isOtherAudioPlaying`.
-    ///
-    /// `secondaryAudioShouldBeSilencedHint` is the documented companion of
-    /// `silenceSecondaryAudioHintNotification`, so the snapshot and the event stream answer the
-    /// SAME question. `isOtherAudioPlaying` is broader — it is true for any other audio, including
-    /// a mixable/non-primary app that never posts a `.begin`. Reading that here would let us duck
-    /// on a transition no `.end` ever follows, leaving our music silent for the whole foreground
-    /// session with the volume slider powerless to bring it back (it multiplies against a 0 duck
-    /// node). Found in review before it reached a device.
-    @objc func shouldSilenceSecondaryAudio(_ call: CAPPluginCall) {
-        call.resolve(["silence": AVAudioSession.sharedInstance().secondaryAudioShouldBeSilencedHint])
     }
 }

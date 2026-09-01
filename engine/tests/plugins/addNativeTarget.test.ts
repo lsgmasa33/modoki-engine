@@ -64,8 +64,8 @@ describe('ensureCapacitorDeps', () => {
     // one ships a JS proxy with no native impl → "plugin is not implemented on <platform>" at
     // launch. `@capacitor/haptics` joined the list when runtime/haptics/ landed, because the
     // engine imports it statically: "this game does not use haptics" is not a state the bundle
-    // can be in. `capacitor-modoki-audio` joined for the same reason (#548): useAudioDucking()
-    // is called unconditionally from App.tsx on every native platform.
+    // can be in. `capacitor-modoki-audio` joined for the same reason (#548): the iOS
+    // AVAudioSession category bridge, with android a structural no-op stub.
     expect(Object.keys(deps).sort()).toEqual(
       ['@capacitor/app', '@capacitor/cli', '@capacitor/core', '@capacitor/haptics', '@capacitor/ios', '@capacitor/keyboard', '@capacitor/preferences', '@capacitor/splash-screen', 'capacitor-game-debug', 'capacitor-modoki-audio'],
     );

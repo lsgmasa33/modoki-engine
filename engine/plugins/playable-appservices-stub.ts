@@ -142,14 +142,31 @@ export const serverTime = {
  * "this account has no save yet", which would invite the sync protocol to treat a creative as a
  * fresh device and try to CREATE one. Throwing means "could not read", which every caller already
  * handles as a failed sync that leaves local storage alone — the correct behaviour for a session
- * that lasts seconds and must never touch a real player's document.
+ * that lasts seconds and must never touch a real player's document. `listSaveIds` throws for the
+ * same reason and the same distinction (#532 C4b): an empty list would mean "this account has no
+ * documents", which is a claim this stub is in no position to make.
+ *
+ * ⚠️ **`deleteAllSaves` returns `false`, NOT the real function's "zero documents is success".**
+ * That rule is right for a real account that genuinely has nothing left to delete; here it would
+ * assert the same thing about an account this build cannot see at all, and `false` is what makes
+ * the caller ABORT rather than walk on to delete an auth user (`systems.ts`'s
+ * `beginAccountDelete`). Fails closed, exactly as `deleteSave` above already does.
+ *
+ * ⚠️ **The signatures MIRROR the real module, `groupId` included.** `playableAppServicesStub.test.ts`
+ * (#269) checks that every member a game CALLS exists here — it cannot check arity, so a stale
+ * signature would sit here looking correct and silently drop the argument that decides WHICH
+ * document is addressed.
  */
 export const cloudSave = {
-  async loadSave(_uid: string): Promise<never> {
+  async loadSave(_uid: string, _groupId: string): Promise<never> {
     throw new Error('A playable creative has no cloud save.');
   },
-  async pushSave(_uid: string, _doc: unknown): Promise<'ok' | 'conflict' | 'failed'> { return 'failed'; },
-  async deleteSave(_uid: string): Promise<boolean> { return false; },
+  async pushSave(_uid: string, _groupId: string, _doc: unknown): Promise<'ok' | 'conflict' | 'failed'> { return 'failed'; },
+  async deleteSave(_uid: string, _groupId: string): Promise<boolean> { return false; },
+  async listSaveIds(_uid: string): Promise<never> {
+    throw new Error('A playable creative has no cloud save.');
+  },
+  async deleteAllSaves(_uid: string): Promise<boolean> { return false; },
   isConflict(_e: unknown): boolean { return false; },
   __resetCloudSaveForTest(): void {},
 };

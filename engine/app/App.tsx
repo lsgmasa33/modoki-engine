@@ -3,7 +3,6 @@ import type { ErrorInfo, ReactNode } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
-import { useAudioDucking } from './useAudioDucking';
 import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint } from '@modoki/engine/runtime';
 import { App as CapacitorApp } from '@capacitor/app';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
@@ -787,7 +786,6 @@ function App() {
   }, []);
 
   useAudioResumeRearm();
-  useAudioDucking();
 
   // Editor route (omitted from game-only builds)
   if (!GAME_ONLY && hash === '#/editor' && EditorApp) {

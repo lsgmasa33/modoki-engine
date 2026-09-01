@@ -1,9 +1,6 @@
 /** Audio playback backend — a thin layer over the Web Audio API.
  *
  *  Graph:  source → sourceGain(volume) → [panner if spatial] → busGain → masterGain → mute → destination
- *  Music duck: buses.music → musicDuck → masterGain (sfx/ui buses connect straight to master,
- *  unaffected) — a separate node, mirroring `mute`, so ducking composes with the music bus's
- *  own volume instead of overwriting it. Auto-ducks music while another app's audio plays (#548).
  *  Buses:  master · music · sfx · ui   (music/sfx/ui feed master; 'master' IS masterGain)
  *
  *  Two source kinds, chosen per-clip by the asset's `loadType`:
@@ -70,7 +67,7 @@ export interface AudioHandle {
 }
 
 export interface AudioLogEntry {
-  op: 'play' | 'stop' | 'setBusVolume' | 'resume' | 'listener' | 'fade' | 'setMusicDucked';
+  op: 'play' | 'stop' | 'setBusVolume' | 'resume' | 'listener' | 'fade';
   clip?: string;
   bus?: BusName;
   volume?: number;
@@ -82,8 +79,6 @@ export interface AudioLogEntry {
    *  voice-cap steal are both invisible headlessly — the ramp is the whole behaviour, and
    *  a no-op `fade()` cannot tell an authored 250 ms from a hardcoded 10 ms. */
   durationSec?: number;
-  /** Duck state for an `op:'setMusicDucked'` entry. */
-  ducked?: boolean;
 }
 
 // ── Record mode (headless / tests) ────────────────────────────────
@@ -182,16 +177,11 @@ interface Graph {
   /** Global mute, between master and destination — independent of bus/source
    *  volumes so muting doesn't clobber them (Unity-style editor "Mute Audio"). */
   mute: GainNode;
-  /** Music-bus duck, between the music bus and master — independent of the music bus's
-   *  own volume (`setBusVolume('music', v)`, the settings slider) so ducking multiplies
-   *  onto it instead of overwriting it. See the file-header graph comment. */
-  musicDuck: GainNode;
   buses: Record<Exclude<BusName, 'master'>, GainNode>;
 }
 let graph: Graph | null = null;
 const active = new Set<LiveHandle>();
 let muted = false; // persists across graph (re)creation
-let musicDucked = false; // persists across graph (re)creation
 
 function graphOrNull(): Graph | null {
   if (graph) return graph;
@@ -202,13 +192,10 @@ function graphOrNull(): Graph | null {
   mute.connect(ctx.destination);
   const master = ctx.createGain();
   master.connect(mute);
-  const musicDuck = ctx.createGain();
-  musicDuck.gain.value = musicDucked ? 0 : 1;
-  musicDuck.connect(master);
   const mk = () => { const g = ctx.createGain(); g.connect(master); return g; };
   const musicBus = ctx.createGain();
-  musicBus.connect(musicDuck);
-  graph = { ctx, master, mute, musicDuck, buses: { music: musicBus, sfx: mk(), ui: mk() } };
+  musicBus.connect(master);
+  graph = { ctx, master, mute, buses: { music: musicBus, sfx: mk(), ui: mk() } };
   // Reapply the tracked bus mix to the fresh nodes (they start at gain 1) — the
   // same way `muted` is reapplied above. Without this, a graph recreated after
   // dispose() (error recovery / editor stop-restart) plays every bus at full
@@ -229,25 +216,6 @@ export function setAudioMuted(m: boolean): void {
   if (g) g.mute.gain.value = m ? 0 : 1;
 }
 export function isAudioMuted(): boolean { return muted; }
-
-/** Duck (fully silence) the music bus, independent of `setBusVolume('music', v)` — a
- *  separate node so the two compose rather than clobber each other (see `mute` above and
- *  the file-header graph comment). Backs auto-ducking Court's music while another app's
- *  audio plays (#548), decided by `shouldDuckMusic` in `audioSessionPolicy.ts`. Persists
- *  if the graph is recreated. */
-export function setMusicDucked(d: boolean): void {
-  const changed = d !== musicDucked;
-  musicDucked = d;
-  if (recording()) { log.push({ op: 'setMusicDucked', ducked: d }); return; }
-  // A no-op must not reach graphOrNull(): the ducking hook applies its policy on mount, and the
-  // usual answer is `false` — which was CONSTRUCTING the shared AudioContext at App mount, earlier
-  // than any prior path (previously first play or first gesture) and before any user gesture.
-  // Logging above still happens unconditionally so the record-mode log stays a faithful trace.
-  if (!changed) return;
-  const g = graphOrNull();
-  if (g) g.musicDuck.gain.value = d ? 0 : 1;
-}
-export function isMusicDucked(): boolean { return musicDucked; }
 
 function busNode(g: Graph, bus: BusName): GainNode {
   return bus === 'master' ? g.master : g.buses[bus];

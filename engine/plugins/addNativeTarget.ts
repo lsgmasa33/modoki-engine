@@ -78,8 +78,7 @@ function capDepRange(editorRoot: string, name: string, coreRange: string): strin
  *   - `@capacitor/keyboard`    → `useKeyboardShift`
  *   - `@capacitor/splash-screen` → App.tsx's `SplashScreen.hide()` once the game can be shown
  *     (docs/ota-updates.md Phase 3b). Its call is try/caught, so this one heals in lazily.
- *   - `capacitor-modoki-audio` → `useAudioDucking()`, called unconditionally from App.tsx on
- *     every native platform (#548) — the iOS audio-session ducking hint, with android a
+ *   - `capacitor-modoki-audio` → the iOS `AVAudioSession` category bridge (#548), with android a
  *     structural no-op stub. Same category as haptics: the import is static.
  *
  *  Omit one and the failure is SILENT until launch: the web build inlines the plugin's JS proxy
@@ -103,11 +102,10 @@ export const ENGINE_REQUIRED_CAP_PLUGINS = [
   '@capacitor/keyboard',
   '@capacitor/preferences',
   '@capacitor/splash-screen',
-  // useAudioDucking() (App.tsx) calls this unconditionally on every native platform (#548) — same
-  // category as haptics above, not opt-in. Vendored like capacitor-game-debug rather than pulled
-  // from the registry (see the `want` override below), so listing it here is what gets it a
-  // COMMITTED entry every native project must carry — that's what makes
-  // nativeProjectDeps.test.ts catch a project that omits it.
+  // The iOS AVAudioSession category bridge (#548) — same category as haptics above, not opt-in.
+  // Vendored like capacitor-game-debug rather than pulled from the registry (see the `want`
+  // override below), so listing it here is what gets it a COMMITTED entry every native project
+  // must carry — that's what makes nativeProjectDeps.test.ts catch a project that omits it.
   'capacitor-modoki-audio',
 ] as const;
 

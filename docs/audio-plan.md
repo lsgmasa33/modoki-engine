@@ -4,10 +4,10 @@ Status: **Phases 1–4 shipped** (`verify` green) — runtime audio subsystem +
 editor authoring (Audio Inspector) + the ffmpeg converter + mix helpers + the
 **declarative control layer** (engine-reconciled `AudioSource` + built-in `audio.*`
 actions), plus a fully-declarative demo game (`games/audio-demo`) and a Unity-style
-editor **Mute Audio** toggle, plus **iOS `AVAudioSession` category + auto-ducking**
-(#548, `verify` green, device verification **not yet performed** — see below). Only
-the **native backend** (deferred by design) and a couple of small polish items
-remain. Owner: solo.
+editor **Mute Audio** toggle, plus an **iOS `AVAudioSession` category**
+(#548, still **open** — device-tested and not yet shown to work; its auto-ducking half was
+removed after device testing — see below). Only the **native backend** (deferred by design)
+and a couple of small polish items remain. Owner: solo.
 
 ## Decisions (settled)
 
@@ -185,11 +185,10 @@ Commits `25f3b2f` + `633abcf` (review fixes).
   API (bus fades, ducking, mix snapshots — `fadeBusVolume`/`duckBus`/`captureBusMix`/
   `restoreBusMix`) was **frozen** and removed: it had no consumer beyond its own test.
   `setBusVolume` (used by the demo's mixer sliders) stays.
-  **Update (#548):** a consumer showed up — see "iOS audio session + auto-ducking"
-  below, which reintroduces exactly one scoped helper (`setAudioMusicDucked`, a
-  dedicated duck node) rather than restoring the frozen API wholesale. The freeze's
-  logic still holds for everything it didn't need: no `fadeBusVolume`, no
-  `captureBusMix`/`restoreBusMix`, because #548 still has no consumer for those.
+  **Update (#548):** a scoped helper (`setAudioMusicDucked`, a dedicated duck node) briefly
+  reintroduced part of this frozen space, then was removed again when device testing showed
+  the ducking it powered does not work — see "iOS audio session" below. The freeze holds again
+  for the whole API: no `fadeBusVolume`, no `duckBus`, no `captureBusMix`/`restoreBusMix`.
 - **Tests** — `tests/plugins/audioConvert.test.ts` (ffmpeg flag vectors),
   `audioCache.test.ts` (hash stability, loadType-invariant), `tests/runtime/
   audioMix.test.ts` (settings resolve, format mappings, `setBusVolume` record-mode
@@ -509,22 +508,21 @@ headless test drive the cap deterministically.
 
 Covered by `packages/modoki/tests/runtime/audioJournal.test.ts`.
 
-## iOS audio session + auto-ducking (#548)
+## iOS audio session (#548) — category only, ducking removed
 
 **The problem.** iOS set no `AVAudioSession` category anywhere in this repo, so every Modoki game
 inherited the platform default, `.soloAmbient` — which **deactivates** whatever another app (Apple
 Music, a podcast) was playing the instant our own audio started. The owner asked for the opposite:
-let other apps' audio keep playing, and duck our own music automatically while it does.
+let other apps' audio keep playing alongside ours.
 
 ### The session category
 
 `.ambient` + `.mixWithOthers` is the category that mixes instead of interrupting.
-`engine/packages/capacitor-modoki-audio/` is a new standalone Capacitor plugin (SPM, iOS-only,
-same pattern as every other plugin in this doc — see below) that sets it: `load()` applies the
-default the instant the app launches (before any playback), and `configure({category})` lets the
-game override it once `project.config.json` has been read on the JS side. **Every
-`AVAudioSession` call is do/catch-wrapped and degrades to the OS default rather than trapping** —
-a failed category set must not crash the splash screen.
+`engine/packages/capacitor-modoki-audio/` is a standalone Capacitor plugin (SPM, iOS-only, same
+pattern as every other plugin in this doc — see below) that sets it: `load()` applies the default
+the instant the app launches (before any playback), and `configure({category})` lets the game
+override it. **Every `AVAudioSession` call is do/catch-wrapped and degrades to the OS default
+rather than trapping** — a failed category set must not crash the splash screen.
 
 Two categories are exposed, both mixing with other apps: `'ambient'` (default) additionally
 silences our audio when the ring/silent switch is on — what a casual game normally wants —
@@ -534,68 +532,32 @@ silences our audio when the ring/silent switch is on — what a casual game norm
 a code constant, because whether a game's music should survive Silent Mode is a design call, not
 an engine invariant.
 
-Android has no equivalent and needs none — see "Android verdict" below.
+Android has no equivalent and needs none — audio there is 100% WebView (Web Audio), there is
+**zero** audio-focus code anywhere in this repo, and Chromium requests audio focus on our behalf
+with no handle Modoki holds to duck or release.
 
-### The duck node
+### Ducking was removed — measured, not a design preference
 
-The engine can't control what iOS does to *other* apps' audio once the category is set — what it
-*can* do is turn its own music down while another app's audio is audible, and that's the half
-this ships. `audioService.ts` inserts a **music-only duck node**: `buses.music → musicDuck →
-master` (sfx/ui buses connect straight to master, unaffected), exposed as
-`setAudioMusicDucked`/`isAudioMusicDucked` from the runtime barrel, mirroring the existing `mute`
-node's position and persistence-across-graph-recreation.
+#548 originally shipped a second half: auto-ducking the music bus (`setAudioMusicDucked`, a
+dedicated `musicDuck` gain node between `buses.music` and `master`) driven by a policy hook
+(`useAudioDucking`, `shouldDuckMusic`) reading `AVAudioSession.isOtherAudioPlaying` /
+`secondaryAudioShouldBeSilencedHint`. **It was removed entirely (owner, 2026-09-01)** after device
+testing showed it does not work:
 
-**Why a separate node and not a bus-volume write.** The obvious shortcut — drive the duck by
-calling the existing `setAudioBusVolume('music', 0)` — would clobber the player's own music-volume
-slider (`audio.setBusVolume`, backing the mixer UI): the slider and the duck would fight over the
-same number, and whichever wrote last would win. A dedicated gain node lets the two **multiply**
-instead — the duck attenuates whatever the slider has already set, and un-ducking restores exactly
-that value with no snapshot/restore bookkeeping needed. This is the load-bearing reason #548
-reintroduces a helper into the space Phase 3 froze (see the note above): the frozen bus-fade API
-was overwrite-shaped and would have reproduced the exact bug the duck node exists to avoid.
-Guarded structurally by `audioDuckingReachable.test.ts`'s third assertion — the hook must call
-`setAudioMusicDucked`, never `setAudioBusVolume`.
+- **WKWebView keeps its own `AVAudioSession`, separate from the app's** (WebKit bug 167788). A
+  Modoki game's audio is Web Audio, so it lives in WebKit's session — which means our own audio
+  reads back as "other audio" to the *app's* session, not as ours.
+- Measured on **two devices**: iPhone 8 / iOS 16.7.16 (Court) and iPhone Air / iOS 26.6
+  (audio-demo). On both, `isOtherAudioPlaying` **and** `secondaryAudioShouldBeSilencedHint`
+  reported `true` with nothing else playing, on a fresh launch, and stayed `true` with the
+  AudioContext suspended for 6 seconds — the OS was reporting our own (WebKit-owned) session back
+  to us as "other audio."
+- Consequence: enabling the duck silenced the game's **own** music at launch, permanently — the
+  owner heard SFX and no music, with no other app playing anything.
 
-### The policy: snapshot + hint, and why both
-
-The duck decision is a pure function, `shouldDuckMusic({otherAudioPlaying, isForeground})`
-(`runtime/audio/audioSessionPolicy.ts`) — no ECS, no Web Audio, no wall-clock, same discipline as
-`games/court/runtime/adPolicy.ts`. `isForeground` exists so a stale duck decision on resume is
-impossible to write: `otherAudioPlaying` while backgrounded can be arbitrarily old by the time the
-app resumes, and gating on foreground forces a fresh read on every foreground transition instead
-of replaying it.
-
-The glue hook, `engine/app/useAudioDucking.ts` (called from `App.tsx`, a sibling of
-`useAudioResumeRearm` rather than an extension of it — see the hook's own header), feeds the
-policy from **two** sources, and both are needed:
-
-- **`secondaryAudioHint`** — `AVAudioSession.silenceSecondaryAudioHintNotification`, Apple's
-  purpose-built signal for "another app's audio just started/stopped alongside yours". It reports
-  **transitions only** (`.begin`/`.end`), so on its own it cannot describe the state the app
-  launched or foregrounded into.
-- **`shouldSilenceSecondaryAudio()`** — a snapshot of
-  `AVAudioSession.sharedInstance().secondaryAudioShouldBeSilencedHint`, the notification's
-  documented companion, so snapshot and event stream answer the SAME question. Deliberately **not**
-  `isOtherAudioPlaying`, which is broader (true for any other audio, including a mixable app that
-  never posts a `.begin`) — reading that would duck on a transition no `.end` ever follows, leaving
-  music silent for the whole foreground session with the volume slider powerless against a zero
-  duck node. It is
-  taken on mount and again on every foreground, because a transition slept through while
-  backgrounded delivers no hint at all — the snapshot is the only way to recover the state on wake.
-
-Android/web: the plugin is a permanent no-op there (`shouldSilenceSecondaryAudio()` always
-resolves `{silence: false}`, `secondaryAudioHint` never fires), and the hook itself early-returns off
-native, so the browser/editor path carries no dead listeners.
-
-### Android verdict — measured, nothing to change
-
-The issue previously listed Android as unknown. Measured for #548: audio on Android is **100%
-WebView** (Web Audio — see the "Native (`@capacitor-community/native-audio`) deferred" decision
-above), there is **zero** audio-focus code anywhere in this repo (`grep -rn
-"AudioFocus\|AudioManager" engine/ games/` finds none), and Chromium requests audio focus on our
-behalf with no handle Modoki holds to duck or release. There is nothing to build here today. If
-that ever changes (a native audio backend lands), Android audio-focus handling starts from zero,
-not from a stub to fill in.
+There is no fix pending — the signal this half depended on cannot distinguish "another app is
+playing" from "our own WKWebView audio session exists," so there is nothing left to build here
+until/unless a different signal is found.
 
 ### Not a replacement for #489's re-arm
 
@@ -603,26 +565,22 @@ not from a stub to fill in.
 does not change what happens on a phone call, a Siri invocation, or an alarm, which still
 interrupt the audio session under **any** category. `useAudioResumeRearm`
 (`engine/app/useAudioResumeRearm.ts`) stays load-bearing for those; #548 and #489 are independent
-mechanisms that both run (`App.tsx` calls both hooks back to back).
+mechanisms.
 
-### Verification — NOT YET PERFORMED
+### Verification — the category itself is still NOT yet verified to work
 
-Code is green under `npm run verify` (`audioSessionPolicy.test.ts`,
-`audioDuckingReachable.test.ts`), but — like #489's re-arm above — no headless test or simulator
-reproduces a real `AVAudioSession` interruption, so the only real evidence is a phone. **This has
-not been done yet.** The procedure, in the style of #489's own device note:
+Code is green under `npm run verify`, but — like #489's re-arm — no headless test or simulator
+reproduces a real `AVAudioSession` interruption, so the only real evidence is a phone, and that
+evidence is not good yet: device-tested on the **iPhone Air / iOS 26.6**, with Music.app playing,
+launching the app **still stops** Music.app's playback. So **#548 stays open** — the category
+change alone has not been shown to achieve the mixing behaviour it is meant to produce. Re-test
+procedure:
 
 1. Start Apple Music (or Podcasts) playing.
-2. Launch the Modoki game (e.g. Court) — Apple Music should **keep playing**, the game's SFX
-   should be audible over it, and the game's own **music should be silent** (ducked).
-3. Stop Apple Music — the game's music should **return**.
-4. Background the game, then foreground it — the ducked/unducked state should **survive** the
-   transition (this exercises the foreground-triggered `shouldSilenceSecondaryAudio()` re-snapshot, not
-   just the hint).
-
-Re-test on the **iPhone 8 / iOS 16.7.16** device this repo already device-verifies audio on (see
-the #489 note above), record the result there with the same "device-verified (owner, ‹device›,
-‹date›)" phrasing once actually run.
+2. Launch the Modoki game (e.g. Court) — Apple Music should **keep playing**, the game's own audio
+   should be audible alongside it.
+3. Record the result with the same "device-verified (owner, ‹device›, ‹date›)" phrasing as #489's
+   own device note once the category is actually shown to work.
 
 ## Remaining
 
