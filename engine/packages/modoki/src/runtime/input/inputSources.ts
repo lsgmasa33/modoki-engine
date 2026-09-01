@@ -189,8 +189,19 @@ registerSource(touchControlSource);
 // Multi-touch pan/pinch/tap. Independent of pointerSource's primary-touch latch — see its header.
 registerSource(gestureSource);
 
-/** App-scope Manager: attaches all sources on register, detaches on unregister.
- *  Replaces the old keyboard-only `inputManagerDef`. */
+/** App-scope Manager: attaches all sources on register. Replaces the old
+ *  keyboard-only `inputManagerDef`.
+ *
+ *  Input sources are deliberately app-LIFETIME — one set of window-level
+ *  listeners for the whole process, not per-game or per-scene — so `dispose`
+ *  below is written for the `ManagerDef` contract and for
+ *  `__resetManagersForTesting`, but never runs in production: nothing ever
+ *  unregisters `'Input'` (#517).
+ *
+ *  ⚠️ Do NOT wire `unregisterManager('Input')` into an app-teardown path to
+ *  "fix" that. `registerAll()` (`engine/app/ecs/register.ts`) is guarded by a
+ *  once-only `registered` latch, so nothing would ever re-register the
+ *  sources afterward — input would go permanently dead. */
 // Disposer for the device-prompt read sources ({confirmPrompt} etc.), registered
 // alongside the sources so device-appropriate UI prompts are available app-lifetime.
 let disposePromptSources: (() => void) | null = null;

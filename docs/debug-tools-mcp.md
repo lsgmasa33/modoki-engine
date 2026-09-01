@@ -979,6 +979,21 @@ What that means per tool:
   renormalized, v1 promoted to v2 parts). Reporting that was a real trap: the float32 weights it
   handed back were read as the editor corrupting a rig on load (QA-ASSET-0015), and the actual disk
   churn was somewhere else entirely.
+  ⚠️ **A cache miss must re-check the cache after its disk fetch resolves, not just before it**
+  (#521). `anim-add-key` and `timeline-add-clip` (`engine/app/editor/agentEditorOps.ts`) fall back
+  to fetching the file from disk when the live cache doesn't have it yet — but a cache entry can
+  appear WHILE that fetch is in flight (the human opened the clip/timeline in its panel, or a
+  concurrent op for the same path landed), and that entry is newer than what just came off disk.
+  Both ops re-read the cache after the fetch and rebase onto it if present, falling back to the
+  fetched content only if the cache is still empty. Skipping that second check silently writes
+  `{disk contents at fetch time} + this op's own item` over the concurrent edit, and `save_all`
+  then persists the truncated document.
+  ⚠️ **A live cache entry wins over a FAILED or REJECTING disk fetch too**, not just over a
+  successful one — a missing/unreachable file no longer necessarily fails the op. Both ops catch a
+  rejecting `fetch` (network error, dev server down) the same as a `!res.ok` response, then peek
+  the cache before treating either as fatal: if the panel has the asset open (or a concurrent op
+  landed) the op composes onto that live entry instead of throwing, even though the disk read itself
+  never succeeded.
 - **`write_asset` / `create_asset` / `import_file` / `reimport_asset`** always write. They are
   explicit "write this file" tools, not live-state edits.
 - **The live-world entity/prefab tools** (`create_entity`, `duplicate_entity`, `delete_entities`,

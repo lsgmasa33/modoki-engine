@@ -30,6 +30,7 @@ import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
 import { UI_PAINT_ATTR } from './uiPaintMarker';
 import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo, readScrollMeasurement } from './scrollViewDom';
 import { scrollByEntry } from './scrollApi';
+import { useScrollAnchoring } from './scrollAnchor';
 import { driveEntriesFromScroll } from './entriesSystem';
 
 /** The CSS-animated text span, isolated in React.memo. The game UI re-renders every
@@ -153,6 +154,27 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   const scrollRef = React.useRef<HTMLDivElement | null>(null);
   useScrollView(node, scrollRef);
 
+  // Scroll anchoring (#531). Same before-any-early-return rule, and gated on the SAME one field
+  // that makes the box scroll at all rather than on `node.scroll` — the bug was found on a panel
+  // that carries no `UIScrollView` at all, just `overflow: 'scroll'`, so hanging this off the
+  // trait would have left the reported case unfixed. See scrollAnchor.ts for what it holds still.
+  //
+  // ⚠️ It takes the ELEMENT, not `scrollRef`: this call sits ABOVE the `isVisible` early return
+  // and a hidden-but-mounted node renders null, so an effect keyed on the (stable) ref object
+  // would run once against null and never re-attach when the box appeared.
+  const [scrollEl, setScrollEl] = React.useState<HTMLDivElement | null>(null);
+  // ⚠️ A virtualized view is EXCLUDED, by trait and not by child count. Its rows all live under
+  // one `__uiEntriesContent` wrapper whose `offsetTop` never moves, so anchoring degrades to
+  // restoring the raw number — and doing that with the browser's anchoring switched off is worse
+  // than leaving the box alone. See scrollAnchor.ts § "Where it does NOT apply".
+  const isScrollBox = node.overflow === 'scroll' && !node.isEntriesView;
+  const attachScroll = React.useCallback((el: HTMLDivElement | null) => {
+    scrollRef.current = el;
+    // Only a scroll box pays for the extra render; every other UI node keeps the plain ref.
+    if (isScrollBox) setScrollEl(el);
+  }, [isScrollBox]);
+  useScrollAnchoring(isScrollBox, scrollEl);
+
   // isVisible is authored (or flipped by a button's UIAction `kind:'set'` binding). A
   // state-driven visibility binding (UIBinding.visibleBinding) can additionally hide the element
   // from a store field — BOTH must be true to render. Play-time only (gated on `!onSelectEntity`,
@@ -219,6 +241,11 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // author's mistake to make, but nothing errors, so it is stated here and in the trait docs
   // rather than left to be discovered.
   if (node.overflow === 'scroll') {
+    // ⚠️ `overflow-anchor` is deliberately NOT set here. `useScrollAnchoring` owns it at runtime,
+    // because whether we may take the browser's anchoring away depends on something only the DOM
+    // knows: a box with one flow child (a `UIEntries` content wrapper) is one this file cannot
+    // anchor, and disabling the browser's mechanism there would be a regression. See
+    // scrollAnchor.ts § "Where it does NOT apply".
     if (node.scrollbarStyle === 'hidden') {
       style.scrollbarWidth = 'none';
     } else if (node.scrollbarStyle === 'tinted') {
@@ -767,7 +794,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // above (which already reflects `node.pointerThrough`) can't reach through to it on its own.
       : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode pointerThrough={node.pointerThrough} /></Suspense> : null);
     return (
-      <div ref={scrollRef} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
+      <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
         {nineSliceLayer}
         {videoLayer}
         {canvas2DContent}
@@ -794,7 +821,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   }
 
   return (
-    <div ref={scrollRef} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
+    <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs}>
       {nineSliceLayer}
       {videoLayer}
       {textContent}

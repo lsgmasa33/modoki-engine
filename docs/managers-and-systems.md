@@ -155,6 +155,18 @@ setCurrentWorld(new)
 App-scoped managers are untouched by swaps — they init/dispose only at
 `registerManager`/`unregisterManager`.
 
+⚠️ **In practice, nothing in production ever unregisters an app-scoped manager** — an app-scoped
+`dispose` is written for the `ManagerDef` contract and for `__resetManagersForTesting`
+(`managerRegistry.ts`), not for a teardown path that actually runs. `inputSourcesManager`
+(`'Input'`) is the live example: it declares `dispose`, but the window-level input listeners are
+one fixed set for the whole process. Wiring an `unregisterManager` call for one is not
+automatically the fix, either — `registerAll()` (`engine/app/ecs/register.ts`) is behind a
+once-only `registered` latch, so nothing would re-register the manager afterward; for `'Input'`
+that would leave input permanently dead. `engine/tests/architecture/appManagerDisposeReachable.test.ts`
+enforces the choice: a new app-scoped `ManagerDef` with a `dispose` must either have a real
+production `unregisterManager` caller or be listed in that test's `APP_LIFETIME_BY_DESIGN`
+allowlist with a verified reason (#517).
+
 The `init new *-scoped managers` steps above only run while the load that reached
 them is still the live primary — a superseded `loadScene` call skips them instead
 of racing the newer one. See [scene-loading.md](./scene-loading.md) § "SceneManager API" step 9 for the

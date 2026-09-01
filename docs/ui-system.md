@@ -61,6 +61,31 @@ Field groups (representative fields, verified against `UIElement.ts`):
   ⚠️ `'hidden'` removes an **affordance**, not just a decoration: with no bar, nothing on screen
   says the content continues below the fold. Use it only where something else already does.
 
+  **Scroll anchoring** (`runtime/ui/scrollAnchor.ts`, wired into `UINode`) keeps a
+  `overflow: 'scroll'` box's content still when its content SIZE changes — a child appearing,
+  vanishing, or changing height — the same job Chromium's own `overflow-anchor` does, done by us
+  so it happens on every engine. That split is why this class of bug was invisible in the editor:
+  Chromium and Firefox self-correct a scroll-position clamp when content shrinks, WebKit never
+  has, so a shipped iOS WKWebView could drift permanently while the same scene in the Electron
+  editor read as fine (#531 — Court's store shelf lost its purchase-target alignment after a
+  cancelled purchase, because the "Done" button unmounting while buying shrank the shelf and
+  nothing restored the clamped offset: `scrollTop` 303 -> 251, every row 52px lower, permanently).
+  See `scrollAnchor.ts`'s header comment for the mechanism and the two failure modes
+  (`isIntentfulScroll`) it has to tell apart.
+  ⚠️ **The hook owns `overflow-anchor` itself, at runtime, and only where it can act.**
+  `scrollAnchor.ts` sets `style.overflowAnchor = 'none'` only on a box with two or more flow
+  children — the condition under which it can actually anchor to something — rather than `UINode`
+  stamping it unconditionally. A box with exactly one flow child — notably any `UIEntries`
+  virtualized view, whose pooled rows all live under a single `__uiEntriesContent` wrapper — keeps
+  the BROWSER's anchoring instead: our mechanism would degrade to restoring the raw offset there,
+  and taking away Chromium's working behaviour to replace it with an inert one would be a
+  regression on Court's `LevelScroll` and `DailyScroll`.
+  ⚠️ **Known residual, measured separately from #531:** when the anchored child is itself the one
+  removed, the restore falls back to the first surviving child below it and lands within about one
+  flex `gap` of exact — measured 8px on Court's shelf, against ~111px of drift before the fix in
+  that same scenario. The primary case — content removed above or below the viewport while the
+  anchored child survives — is pixel-exact.
+
   ⚠️ **Match `gapUnit` to the unit the CHILDREN are sized in.** `gap` was px-only until
   2026-08-07, and a `flexWrap: 'wrap'` container whose items scale (`vh`/`vmin`/`%`) while its
   gaps do not has a viewport size below which an item silently reflows onto the next row — the
@@ -210,6 +235,15 @@ in `NavigationManager`, which owns the history stack (see
 activation anywhere in the UI is swallowed whole — before the click cue, so a blocked
 second tap makes no sound. Not per-button: a fast tap on a different button is also
 swallowed, by design.
+
+The click cue is gated on the **same** discrete/continuous predicate as the lock, not on
+the event name (#528) — it used to test `event === 'click'`, which silenced every
+`UIToggle` (a toggle activates through `'change'`, not `'click'`) while the lock correctly
+treated it as a press: two mechanisms meant to agree, disagreeing. **`submit` (Enter in a
+text field) is discrete and still takes the input lock like any other discrete
+activation, but is deliberately exempt from the cue** (owner, 2026-09-01) — Enter follows
+typing, where a tap sound reads as a keyboard click rather than a button press. Don't
+"unify" this away as an inconsistency; it's a deliberate exception, not a bug.
 
 The real gate is the action **completing** — every promise a `kind:'call'` binding's
 handler returns is awaited before the lock releases — not a timer; `UISettings`'s

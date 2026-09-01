@@ -62,7 +62,7 @@ import {
   getAllTraits, PRIMITIVE_NAMES, PRIMITIVE_SPRITE_NAMES, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
-  sceneManager,
+  sceneManager, assetUrl,
 } from '@modoki/engine/runtime';
 
 // ── Reads ─────────────────────────────────────────────────────────────────
@@ -2295,9 +2295,17 @@ export function registerEditorAgentOps(): void {
     }
     let clip = getAnimationClip(p.clipPath) as AnimationClipDef | null;
     if (!clip) {
-      const res = await fetch(p.clipPath, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`cannot load clip ${p.clipPath}`);
-      clip = normalizeAnimationClip(await res.json());
+      // Route through `assetUrl` like every other asset reader (`animationClipCache.ts` included) —
+      // a raw `fetch(path)` resolves to the wrong URL under a non-"/" BASE_URL (sub-path hosting,
+      // the packaged editor's custom scheme). Catch a REJECTING fetch (network error, dev server
+      // down) the same as a `!res.ok` one: either way it unwinds past the live-cache peek below,
+      // and the fetch is only a cache-miss fallback — the panel opening this clip, or a concurrent
+      // agent op for the same path landing mid-flight, can populate the live cache with content
+      // that is NEWER than (or simply present despite) whatever this fetch did or didn't get. #521.
+      const res = await fetch(assetUrl(p.clipPath), { cache: 'no-store' }).catch(() => null);
+      const live = getAnimationClip(p.clipPath) as AnimationClipDef | null;
+      if (!res?.ok && !live) throw new Error(`cannot load clip ${p.clipPath}`);
+      clip = live ?? normalizeAnimationClip(await res!.json());
     }
     // Deep-copy tracks/keys so we don't mutate the cached clip in place.
     const next: AnimationClipDef = { ...clip, tracks: clip.tracks.map((t) => ({ ...t, keys: [...t.keys] })) };
@@ -2348,9 +2356,17 @@ export function registerEditorAgentOps(): void {
     }
     let def = getTimeline(p.timelinePath) as TimelineDef | null;
     if (!def) {
-      const res = await fetch(p.timelinePath, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`cannot load timeline ${p.timelinePath}`);
-      def = normalizeTimeline(await res.json());
+      // Route through `assetUrl` like every other asset reader (`timelineCache.ts` included) — a
+      // raw `fetch(path)` resolves to the wrong URL under a non-"/" BASE_URL (sub-path hosting, the
+      // packaged editor's custom scheme). Catch a REJECTING fetch (network error, dev server down)
+      // the same as a `!res.ok` one: either way it unwinds past the live-cache peek below, and the
+      // fetch is only a cache-miss fallback — the panel opening this timeline, or a concurrent agent
+      // op for the same path landing mid-flight, can populate the live cache with content that is
+      // NEWER than (or simply present despite) whatever this fetch did or didn't get. #521.
+      const res = await fetch(assetUrl(p.timelinePath), { cache: 'no-store' }).catch(() => null);
+      const live = getTimeline(p.timelinePath) as TimelineDef | null;
+      if (!res?.ok && !live) throw new Error(`cannot load timeline ${p.timelinePath}`);
+      def = live ?? normalizeTimeline(await res!.json());
     }
     const target = p.target ?? '';
     const clone = JSON.parse(JSON.stringify(def)) as TimelineDef;

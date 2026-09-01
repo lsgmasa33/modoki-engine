@@ -106,6 +106,16 @@ export interface UINodeData {
   /** True when this node is a pooled `UIEntries` entry. Its only job here is to name the SNAP
    *  TARGETS of an enclosing scroll view — see `stampSnapTargets`. */
   isEntry?: boolean;
+  /** True when this node IS a virtualized view (it carries `UIEntries`), as opposed to being one
+   *  of its pooled rows.
+   *
+   *  ⚠️ Read by `useScrollAnchoring`, which must not touch such a box: a virtualized view holds
+   *  every row under one `__uiEntriesContent` wrapper whose `offsetTop` never moves (the offset
+   *  rides as PADDING inside it), so anchoring to it degrades into restoring the raw number
+   *  while the browser's own anchoring has been switched off — a regression. Published as a
+   *  trait fact rather than inferred from the child count, because a count is a proxy that one
+   *  authored header child silently breaks. */
+  isEntriesView?: boolean;
   /** `scroll-snap-align` + `scroll-snap-stop`, stamped by the enclosing scroll view.
    *
    *  ⚠️ It rides the NODE rather than being applied by the scroll view's own element because
@@ -236,7 +246,7 @@ function reconcileNode(node: UINodeData, nextPrev: Map<number, UINodeData>): UIN
 
 // Cache trait lookups (resolve once, reuse across frames)
 let _traitsCached = false;
-let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any, _toggleMeta: any, _touchMeta: any, _scrollMeta: any, _entryMeta: any;
+let _renderUIMeta: any, _uiElMeta: any, _attrMeta: any, _bindingMeta: any, _actionMeta: any, _anchorMeta: any, _canvas2dMeta: any, _textAnimMeta: any, _videoMeta: any, _toggleMeta: any, _touchMeta: any, _scrollMeta: any, _entryMeta: any, _entriesMeta: any;
 
 function cacheTraits() {
   const allTraits = getAllTraits();
@@ -252,6 +262,7 @@ function cacheTraits() {
   _toggleMeta = allTraits.find(m => m.name === 'UIToggle');
   _scrollMeta = allTraits.find(m => m.name === 'UIScrollView');
   _entryMeta = allTraits.find(m => m.name === 'UIEntry');
+  _entriesMeta = allTraits.find(m => m.name === 'UIEntries');
   _touchMeta = allTraits.find(m => m.name === 'TouchControl');
   _traitsCached = !!(_renderUIMeta && _uiElMeta);
 }
@@ -468,6 +479,8 @@ function buildTree(world: World): UINodeData[] | null {
       // way to avoid. Inert today (UIEntry is added once and never removed), and a landmine the
       // moment it is not.
       node.isEntry = !!(_entryMeta && entity.has(_entryMeta.trait));
+      // Same ALWAYS-written rule as `isEntry` directly above, and for the same `_scalarKeys` reason.
+      node.isEntriesView = !!(_entriesMeta && entity.has(_entriesMeta.trait));
       if (_scrollMeta && entity.has(_scrollMeta.trait)) {
         const sv = entity.get(_scrollMeta.trait) as any;
         node.scroll = {

@@ -64,16 +64,42 @@ describe('a bound click raises exactly one cue', () => {
 });
 
 describe('the events that are NOT a press', () => {
-  it('stays silent on change — a slider drag fires it continuously', () => {
-    // The reason this matters: dragging a volume slider emits `change` per pixel. Clicking on
-    // that would be a machine-gun, and it is the exact surface that prompted the cue.
-    applyBindings(call('change'), 'change', { selfGuid: 'g1', eventValue: 42 });
+  it('stays silent on a CONTINUOUS change — a slider drag fires it per pixel', () => {
+    // It is `continuous: true` that makes this silent, not the event name 'change' — a toggle's
+    // discrete 'change' (below) fires the same event name and DOES click (#528). Dragging a
+    // volume slider emits `change` per pixel; clicking on that would be a machine-gun, and it is
+    // the exact surface that prompted the cue.
+    applyBindings(call('change'), 'change', { selfGuid: 'g1', eventValue: 42, continuous: true });
     expect(cues()).toEqual([]);
   });
 
-  it('stays silent on submit — that is a keystroke', () => {
+  it('stays silent on submit — deliberately exempt, not a side effect (owner, 2026-09-01)', () => {
+    // 'submit' IS discrete by the shared predicate `isDiscrete` (it takes the input lock same as
+    // click), so this is NOT the same case as the continuous slider above — it is carved out on
+    // purpose in applyBindings because Enter in a text field follows typing, and a tap sound would
+    // read as a keyboard click rather than a button press. Keep this test: without it, a future
+    // reader could "unify" submit into the shared predicate and this would silently start clicking.
     applyBindings(call('submit'), 'submit', { selfGuid: 'g1', eventValue: 'text' });
     expect(cues()).toEqual([]);
+  });
+});
+
+describe('a toggle (#528)', () => {
+  it("a discrete 'change' (no continuous flag) raises the cue exactly once", () => {
+    // The regression this issue is about: UIToggle activates via 'change', not 'click', and the
+    // old `event === 'click'` test silenced it. This is the same call UINode.tsx's fire() makes
+    // for a toggle — no `continuous` flag, so it is a discrete activation.
+    applyBindings(call('change'), 'change', { selfGuid: 'g1', eventValue: true });
+    expect(cues()).toEqual(['ui.click']);
+  });
+
+  it("a discrete 'change' still respects the input lock", () => {
+    // The lock and the cue now share one predicate (#528) — a second discrete activation while
+    // the first is still locked must swallow the WHOLE event, cue included, same as a double
+    // click already did.
+    applyBindings(call('change'), 'change', { selfGuid: 'g1', eventValue: true });
+    applyBindings(call('change'), 'change', { selfGuid: 'g2', eventValue: false });
+    expect(cues()).toEqual(['ui.click']);
   });
 });
 

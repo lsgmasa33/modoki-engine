@@ -1,5 +1,9 @@
 /**
- * App-service registry (analytics / crashlytics / ads / attribution).
+ * App-service registry (crashlytics / ads / attribution).
+ *
+ * ⚠️ ANALYTICS IS NOT ONE — the registry has no `analytics` slot, and this header claimed
+ * one for a while. A game's own package owns analytics and calls it directly; Court's
+ * `packages/app-services/src/index.ts` header states the same absence.
  *
  * These are native-SDK wrappers (Firebase, AppLovin MAX, Adjust) that do NOT
  * belong in the engine — they are app/game concerns. A PROJECT provides concrete

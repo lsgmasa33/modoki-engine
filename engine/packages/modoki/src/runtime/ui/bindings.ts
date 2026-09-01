@@ -267,9 +267,13 @@ export function applyBindings(
     acquireLock(minMs, Math.max(minMs, maxMs));
   }
 
-  // Only 'click': 'change' fires continuously while a slider is dragged, and 'submit' is a
-  // keystroke, so neither is a press to acknowledge.
-  if (event === 'click') clickCue?.();
+  // Shared with the input lock above (#528) rather than testing the event name: the old
+  // `event === 'click'` test silenced every UIToggle, whose activation fires 'change', not
+  // 'click'. A slider drag and a per-keystroke text 'change' pass `continuous: true` and stay
+  // silent through `isDiscrete` same as the lock. `submit` IS discrete but is exempted here on
+  // purpose (owner, 2026-09-01) — Enter in a text field follows typing, and a tap sound would
+  // read as a keyboard click, not a button press. Don't "unify" it away.
+  if (isDiscrete && event !== 'submit') clickCue?.();
   // Resolve only the needed guids (early-break scan), shared by 'set' + 'call'.
   const byGuid = resolveGuids(world, needed);
 
