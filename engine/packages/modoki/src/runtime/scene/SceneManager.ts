@@ -19,10 +19,13 @@
  *  checks, one after every await). At the swap `nextLoad` is cleared, so from
  *  there on there is nothing left to abort THROUGH: a loadScene() issued during
  *  the post-swap tail finds nothing to cancel and runs concurrently with it.
- *  The tail is guarded instead by `this.primaryId === id` — primaryId is
- *  reassigned at every swap, so inequality IS the "superseded" signal — which
- *  gates the re-activation half (fireSceneCallbacks / init*ManagersFor) because
- *  those rewrite module-global manager state and read getCurrentWorld() (#435).
+ *  The tail is guarded instead by `!postSwapSuperseded && this.primaryId === id`,
+ *  which gates the re-activation half (fireSceneCallbacks / init*ManagersFor)
+ *  because those rewrite module-global manager state and read getCurrentWorld()
+ *  (#435). BOTH halves are needed: primaryId is reassigned at every swap, so
+ *  inequality is the "superseded by a newer LOAD" signal — but it does NOT catch
+ *  a mid-flight `unloadAll()`, which leaves primaryId naming this load until its
+ *  own tail, several awaits later (#542).
  *  Dispose/release/destroy in the tail stay unguarded on purpose: they act on the
  *  world and path from BEFORE this load, which no newer load touches.
  *  See docs/scene-loading.md § SceneManager API step 9 for this mechanism.
@@ -1110,7 +1113,32 @@ class SceneManagerImpl implements SceneManager {
       // remains, deliberately, not a bug: the manager stays `active` holding a
       // world that is no longer current — identical to the ordinary in-game-swap
       // outcome, since game managers survive in-game swaps by design.
-      if (this.primaryId === id) {
+      //
+      // #542: `primaryId === id` alone is not enough — it only catches a NEWER
+      // `loadScene()` overtaking this one (which also reassigns `primaryId`
+      // before nulling `nextLoad`). It does NOT catch a mid-flight `unloadAll()`,
+      // which leaves `primaryId` pointing at THIS load right up until its own
+      // tail, several awaits later. A load parked here while such a teardown is
+      // running would still call `initGameManagersFor`/`initSceneManagersFor`,
+      // which write `activeGameId`/`activeScenePath` SYNCHRONOUSLY at their own
+      // head — landing after `unloadAll`'s own reset writes (`initGameManagersFor
+      // (null, '')` / `initSceneManagersFor('')`) leaves that state pointing at a
+      // scene/game that is already torn down, even though this load's own
+      // `postSwapSuperseded` check further down correctly rejects it. Gate on
+      // `!postSwapSuperseded` too, at both checkpoints below, so a load already
+      // known to be superseded never performs those writes in the first place —
+      // it falls straight through to the final `if (postSwapSuperseded) throw`.
+      // Regression test: sceneManagerUnloadAll.test.ts's "#542" describe block.
+      //
+      // Re-latch here rather than trusting the checkpoint ~90 lines up. That value is fresh
+      // only because nothing between the two awaits (the drop-release loop, `pendingManagerInits`
+      // and the deferred-destroy wiring are all synchronous) — an invariant nothing enforces, so
+      // a future `await` inserted in that stretch would silently staleness this guard. LATCH,
+      // do not merely test: gating on a live `isPostSwapSuperseded()` without latching would let
+      // a load skip re-activation and still RESOLVE successfully, breaking the correspondence
+      // with step 12's unconditional `if (postSwapSuperseded) throw`.
+      if (this.isPostSwapSuperseded(enteredGeneration)) postSwapSuperseded = true;
+      if (!postSwapSuperseded && this.primaryId === id) {
         this.fireSceneCallbacks(path);
 
         // Activate the new game's game-scoped managers (only when the game changed;
@@ -1119,7 +1147,10 @@ class SceneManagerImpl implements SceneManager {
         // loadScene resolves.
         if (gameChanged) await bootSpanAsync('game-managers-init', () => initGameManagersFor(nextGameId, path));
         if (this.isPostSwapSuperseded(enteredGeneration)) postSwapSuperseded = true;
-        if (this.primaryId === id) {
+        // Re-check `postSwapSuperseded` here too (#542) — a teardown can start and
+        // flip it to true during the `initGameManagersFor` await just above,
+        // between the outer guard's check and this one.
+        if (!postSwapSuperseded && this.primaryId === id) {
           await bootSpanAsync('scene-managers-init', () => initSceneManagersFor(path), path);
           if (this.isPostSwapSuperseded(enteredGeneration)) postSwapSuperseded = true;
         }

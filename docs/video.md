@@ -212,9 +212,11 @@ holds near full volume for most of the ramp, which is the opposite of what a fad
 not start on its own in a browser; `videoService` records the rejection and retries on the first
 gesture (sharing the audio subsystem's unlock signal), so the clip shows its first frame until
 then. A clip that must move immediately has to be `muted: true` — which also makes `fadeOutSec`
-moot. This is browser policy, not an engine choice. **`@video.start` announces nothing while
-blocked** — see "`@video.start` means observed playback, not a request" below for what the event
-does and when it fires once the gesture arrives.
+moot. This is browser policy, not an engine choice. **Exception: a gesture that arrives during a
+time-stop is refused too** (#545) — starting a blocked clip's audio under a pause menu would be
+wrong regardless of the gesture — so the retry is deferred to the next `timeScale` transition
+instead. **`@video.start` announces nothing while blocked** — see "`@video.start` means observed
+playback, not a request" below for what the event does and when it fires once the gesture arrives.
 
 ## Remote delivery
 

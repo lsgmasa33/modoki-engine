@@ -145,6 +145,65 @@ describe('autoplay policy', () => {
     expect(playCalls).toBe(before);
     expect(h.element.paused).toBe(true);
   });
+
+  // #545: a gesture during a time-stop (e.g. a pause menu) used to retry a blocked clip
+  // with no time-stop check at all, starting it (and its audio) under the menu.
+  it('does not retry a blocked clip while time-stopped', async () => {
+    playBehaviour = 'block';
+    const h = playVideo({ url: 'a.mp4' });
+    await flush();
+
+    applyTimeScale(0);
+    playBehaviour = 'allow';
+    audioResume(); // gesture unlock, fired under a pause menu
+    await flush();
+
+    expect(h.element.paused).toBe(true);
+  });
+
+  // The naive one-line fix (early-return in `retryBlockedPlay` alone, leaving
+  // `applyRate`'s `!this.blocked` exclusion in place) fails exactly this case: `blocked`
+  // stays latched true across the time-stop with no later gesture guaranteed to come, so
+  // the clip never comes back. `applyRate` removing that exclusion is what makes leaving
+  // the time-stop retry it.
+  it('resumes a still-blocked clip once the time-stop lifts', async () => {
+    playBehaviour = 'block';
+    const h = playVideo({ url: 'a.mp4' });
+    await flush();
+
+    applyTimeScale(0);
+    playBehaviour = 'allow';
+    audioResume(); // still time-stopped: must not play yet (previous case)
+    await flush();
+    expect(h.element.paused).toBe(true);
+
+    applyTimeScale(1); // leaving the time-stop must retry the still-blocked clip
+    await flush();
+    expect(h.element.paused).toBe(false);
+  });
+
+  // Regression guard: `videoSystem` calls `setRate(...)` and `setTimeMode(...)` on every
+  // VideoPlayer entity EVERY FRAME, unconditionally — both funnel straight into
+  // `applyRate()`. If `applyRate()`'s resume condition ever drops its `!this.blocked`
+  // exclusion again, a blocked clip resumes an `element.play()` attempt on every single
+  // one of those per-frame calls instead of once, at the next real timeScale transition.
+  it('does not spam element.play() on a blocked clip across per-frame setRate/setTimeMode calls', async () => {
+    playBehaviour = 'block';
+    const h = playVideo({ url: 'a.mp4', timeMode: 'diegetic' });
+    await flush();
+    const callsAfterBlock = playCalls;
+    expect(callsAfterBlock).toBe(1);
+
+    // Model videoSystem's per-frame reconciliation at a STEADY timeScale (no transition).
+    for (let i = 0; i < 5; i++) {
+      h.setRate(1);
+      h.setTimeMode('diegetic');
+    }
+    await flush();
+
+    expect(playCalls).toBe(callsAfterBlock);
+    expect(h.element.paused).toBe(true);
+  });
 });
 
 describe('lifecycle', () => {

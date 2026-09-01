@@ -1099,14 +1099,16 @@ single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistenc
    in-flight manager `init()` (`pendingManagerInits()`, #468) so a manager still
    writing into the old world during its async init never writes into an
    already-destroyed one.
-9. **Post-swap tail — guarded by `this.primaryId === id`.** Scene callbacks
+9. **Post-swap tail — guarded by `!postSwapSuperseded && this.primaryId === id`
+   (#542, see below).** Scene callbacks
    (`registerSceneCallback`) fire for dynamic spawning, then this scene's managers
    activate: the previous scene's (and, on a game change, the previous game's)
    managers are disposed via `disposeActiveSceneManagers`/`disposeActiveGameManagers`,
    then the new scene's/game's managers are activated via
    `initSceneManagersFor`/`initGameManagersFor` (game-scoped only when the game
-   changed). **This whole tail runs only while `this.primaryId === id`** — i.e. only
-   while THIS load is still the live primary (#435). `fireSceneCallbacks` and
+   changed). **This whole re-activation half runs only while this load is BOTH still
+   the live primary (`this.primaryId === id`, #435) and not already known superseded
+   (`!postSwapSuperseded`, #542).** `fireSceneCallbacks` and
    `init*ManagersFor` both read `getCurrentWorld()` internally, so a load superseded
    mid-tail (see step 1) would otherwise rewrite the module-global
    `activeScenePath`/`activeGameId` back to ITS OWN path and spawn manager entities
@@ -1169,18 +1171,49 @@ single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistenc
    inside one of the post-swap awaits, by which point the counter is already
    back at zero.
 
-   **A post-swap supersede latches and rejects at the end; it does not skip the
-   tail's own work.** Hitting `isPostSwapSuperseded` only sets a
-   `postSwapSuperseded` flag, checked once the tail finishes — the dispose/
-   release/destroy work above still runs unconditionally (it acts on the OLD
-   world and path, which no newer load touches), and the `primaryId === id`
-   guard still separately decides whether re-activation runs. What changes is
-   only what the caller is told: the load rejects with an `AbortError` instead
-   of resolving, because the swap it thought it won has since been wiped by
+   **A post-swap supersede latches and rejects at the end — the dispose/
+   release/destroy work above still runs unconditionally either way** (it acts
+   on the OLD world and path, which no newer load touches). What changes is
+   what the caller is told: the load rejects with an `AbortError` instead of
+   resolving, because the swap it thought it won has since been wiped by
    `unloadAll()`'s own unconditional tail (below).
 
    **`unloadAll()`'s tail stays unconditional** — that is the ruling, not an
    oversight: teardown can never be undone by a load that raced in behind it.
+
+   **#542 — `primaryId === id` alone does not gate re-activation against a
+   MID-FLIGHT `unloadAll()`.** `unloadAll()` only nulls `primaryId` in its OWN
+   tail, after five awaits (see below) — so while it is still mid-flight,
+   `primaryId` keeps naming the load that is stuck here, and that load's outer
+   `if (this.primaryId === id)` guard alone still passes. Pre-fix, this let the
+   tail run `initGameManagersFor`/`initSceneManagersFor` for a load that
+   `isPostSwapSuperseded` had *already* flagged — both write their respective
+   module-global (`activeGameId`/`activeScenePath` in `managerRegistry.ts`)
+   **synchronously at their own head**, before any await. If that write landed
+   after `unloadAll()`'s own reset writes (`initGameManagersFor(null, '')` /
+   `initSceneManagersFor('')`, both driven through the same public surface —
+   see the `unloadAll()` note below), the module state was left pointing at a
+   scene/game that `unloadAll()` had already torn down and believed it had
+   reset — even though the racing load's own promise still correctly rejected
+   moments later via `isPostSwapSuperseded`. The fix adds `!postSwapSuperseded`
+   to both the outer guard and the inner one (right before
+   `initSceneManagersFor(path)`, since a teardown can start and flip the flag
+   during the `initGameManagersFor` await in between): a load already known to
+   be superseded now skips the re-activation writes entirely instead of
+   performing them and rejecting afterward. Reproduced deterministically in
+   `tests/runtime/sceneManagerUnloadAll.test.ts`'s "#542" describe block — a
+   three-manager interleaving (a scene-scoped manager shared by both the
+   load's and `unloadAll()`'s first `disposeActiveSceneManagers` call, a
+   game-scoped manager only the load activates, and a no-filter scene manager
+   only `unloadAll()`'s own `initSceneManagersFor('')` reactivates) that holds
+   the load back just long enough for `unloadAll()`'s `''` write to land first,
+   then releases the load to perform its own (pre-fix: stale) write. The
+   assertion is on the observable harm, not a private field:
+   `managerRegistry` exposes no `getActiveScenePath()`, so the test instead
+   registers a fresh scene-scoped manager filtered to the torn-down path and
+   asserts it does NOT self-activate (`registerManager`'s scope-'scene' branch
+   self-activates against the live `activeScenePath` — see
+   `docs/managers-and-systems.md`).
 
 On **failure or abort**, the staging world is destroyed and its resources released —
 the current scene (and its whole chain) is left completely untouched.

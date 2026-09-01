@@ -254,6 +254,11 @@ class LiveVideoHandle implements VideoHandle {
    *  deliberately — a gesture must not override the game's intent. */
   retryBlockedPlay(): void {
     if (this.disposed || !this.blocked || this.deliberatelyPaused || this.ended) return;
+    // Time-stopped (e.g. a pause menu): don't start a blocked clip (and its audio) under
+    // it. The retry comes from `applyTimeScale`, which calls this again on the next
+    // timeScale TRANSITION — NOT from `applyRate`, whose resume path excludes a blocked
+    // clip on purpose (it runs per frame via videoSystem's setRate/setTimeMode).
+    if (this.effectiveRate() <= 0) return;
     void this.attemptPlay();
   }
 
@@ -353,7 +358,15 @@ export function playVideo(spec: VideoPlaySpec): VideoHandle {
 export function applyTimeScale(timeScale: number): void {
   if (timeScale === currentTimeScale) return;
   currentTimeScale = timeScale;
-  for (const h of live) h.applyRate();
+  for (const h of live) {
+    h.applyRate();
+    // #545: a clip that was gesture-unlocked DURING a time-stop refused to start then
+    // (retryBlockedPlay's effectiveRate guard) and is still carrying `blocked`. Nothing
+    // else is guaranteed to retry it — a second gesture may never come — so a timeScale
+    // TRANSITION is where it gets its retry. Safe to call unconditionally: retryBlockedPlay
+    // self-guards on disposed/blocked/deliberatelyPaused/ended and on the rate still being 0.
+    h.retryBlockedPlay();
+  }
 }
 
 /** Stop and release every live clip (scene teardown / Stop). */

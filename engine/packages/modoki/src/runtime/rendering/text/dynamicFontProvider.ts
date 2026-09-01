@@ -84,6 +84,12 @@ const SCRATCH_GAP = 2;
  *  generation to fit this, so the page size is now the only thing atlasMax controls. */
 const SCRATCH_SIZE = 2048;
 
+/** How many consecutive failed generations still un-stick their batch for a retry. Structural,
+ *  not a feel knob: past this the font is treated as genuinely broken rather than transiently
+ *  failing, and its glyphs settle into stable tofu instead of being re-requested every frame.
+ *  Same reasoning as the first-overflow-only retry in `generateBatch`. */
+const MAX_FLUSH_RETRIES = 2;
+
 /** Transparent gutter (px) between packed cells. Cells are otherwise flush, so an
  *  OFFSET atlas sample — the drop shadow's `vUv - shadowOffset`, or a wide glow/outline
  *  — reads straight into the neighbouring glyph and paints a stray sliver (the reported
@@ -215,6 +221,10 @@ export class DynamicFontProvider implements FontProvider {
   private readonly requested = new Set<number>();
   private readonly pending = new Set<number>();
   private generating = false;
+  // Bounds the flush-failure re-queue below. See `flush()`'s catch for why an UNBOUNDED
+  // re-queue is a per-frame storm rather than a retry.
+  private flushFailures = 0;
+  private warnedFlushFail = false;
 
   private constructor(
     id: string,
@@ -256,7 +266,15 @@ export class DynamicFontProvider implements FontProvider {
   private get pageOffset(): number { return this.baked ? 1 : 0; }
 
   private async bytes(): Promise<Uint8Array> {
-    this.fontBytesPromise ??= this.loadFontBytes();
+    if (!this.fontBytesPromise) {
+      const promise = this.loadFontBytes();
+      this.fontBytesPromise = promise;
+      // Clear the memo on failure, so a transient font fetch failure doesn't leave this
+      // font permanently unable to generate another glyph for the session (#541). The
+      // `=== promise` guard is registered after assignment so a late rejection from an
+      // older attempt can never clear a newer in-flight one.
+      promise.catch(() => { if (this.fontBytesPromise === promise) this.fontBytesPromise = null; });
+    }
     return this.fontBytesPromise;
   }
 
@@ -339,12 +357,37 @@ export class DynamicFontProvider implements FontProvider {
   private async flush(): Promise<void> {
     if (this.generating || this.pending.size === 0) return;
     this.generating = true;
+    const batch = [...this.pending];
+    this.pending.clear();
     try {
-      const batch = [...this.pending];
-      this.pending.clear();
       await this.generateBatch(batch, /* pin */ false);
+      this.flushFailures = 0; // a working generation clears the budget
+      this.warnedFlushFail = false;
     } catch (e) {
-      console.warn(`[DynamicFontProvider] generation failed for ${this.id}:`, e);
+      // Un-stick THIS batch's codepoints from `requested` so a later `ensureGlyphs` call
+      // re-queues them instead of seeing "already requested" and skipping silently forever.
+      // Without this, a transient failure here (most commonly `bytes()` rejecting) defeats
+      // #541's retry: the memo clears, but nothing ever calls `bytes()` again for these
+      // codepoints because they never leave `requested`. Scoped to `batch` (captured before
+      // the await) rather than the whole `requested` set, so an unrelated batch that already
+      // succeeded stays resolved.
+      //
+      // ⚠️ BOUNDED, and the bound is the point — same rule as the scratch-overflow path below
+      // (~:424), whose comment already rejects the unbounded shape. `ensureGlyphs` runs per
+      // FRAME for any text whose layout hash changes every frame (a countdown, a score, a
+      // typewriter reveal), so an unconditional un-stick turns a PERMANENTLY failing font
+      // (a .ttf 404 after an OTA swap) into request → fail → delete → re-request at fetch
+      // latency for the life of the page — and #541's cleared `bytes()` memo re-fetches on
+      // every lap. Past the budget the codepoints stay in `requested` and render as tofu,
+      // which is stable and diagnosable, instead of storming behind one warning.
+      this.flushFailures += 1;
+      if (!this.warnedFlushFail) {
+        this.warnedFlushFail = true;
+        console.warn(`[DynamicFontProvider] generation failed for ${this.id}:`, e);
+      }
+      if (this.flushFailures <= MAX_FLUSH_RETRIES) {
+        for (const cp of batch) this.requested.delete(cp);
+      }
     } finally {
       this.generating = false;
     }

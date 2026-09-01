@@ -44,6 +44,21 @@ vi.mock('../../app/ota', () => ({
 vi.mock('capacitor-modoki-ota', () => ({
   ModokiOta: { listBundles: h.listBundles, confirmBoot: h.confirmBoot },
 }));
+// registerDynamicGame is wrapped (not stubbed) so getGames()/__resetGameRegistryForTest() below
+// still exercise the REAL registry — the wrap exists only so its invocationCallOrder can be
+// compared against the asset-manifest fetch's, to assert the merge happens before registration.
+vi.mock('../../app/gameRegistry', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../app/gameRegistry')>();
+  return { ...actual, registerDynamicGame: vi.fn(actual.registerDynamicGame) };
+});
+// loadManifestJson is wrapped (not stubbed), the same way, so its invocationCallOrder can be
+// compared against registerDynamicGame's — the fetch-order comparison alone would still pass a
+// refactor that starts the manifest fetch early but awaits its json()/merge AFTER registration;
+// this measures merge COMPLETION, not fetch initiation. See the (#540) ordering test below.
+vi.mock('@modoki/engine/runtime', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@modoki/engine/runtime')>();
+  return { ...actual, loadManifestJson: vi.fn(actual.loadManifestJson) };
+});
 
 afterEach(() => {
   vi.clearAllMocks();
@@ -59,13 +74,14 @@ afterEach(() => {
  *  a <script> tag whose "execution" (writing globalThis.__MODOKI_SUBGAME__ then firing
  *  onload) happens on the schedule the test controls via `scriptDelayMs`, so two bundles'
  *  scripts can be made to complete in a chosen (possibly reordered) sequence. */
-function mockBundleEnv(bundles: Record<string, { manifest: object; gameId: string; scriptDelayMs: number }>) {
+function mockBundleEnv(bundles: Record<string, { manifest: object; gameId: string; scriptDelayMs: number; assetsManifest?: object }>) {
   const fetchMock = vi.fn(async (url: string) => {
     for (const [path, b] of Object.entries(bundles)) {
       if (url === `${path}/subgame.json`) {
         return { ok: true, json: async () => b.manifest } as Response;
       }
       if (url === `${path}/assets.manifest.json`) {
+        if (b.assetsManifest) return { ok: true, json: async () => b.assetsManifest } as Response;
         return { ok: false, status: 404, json: async () => ({}) } as Response;
       }
     }
@@ -105,8 +121,8 @@ describe('subgameLoader — concurrency & error-visibility fixes', () => {
 
   it('loads two sub-games whose scripts complete OUT of insertion order without cross-attributing modules', async () => {
     mockBundleEnv({
-      '/bundle-a': { manifest: { schema: 1, engineApi: 1, sharedDeps: [], entry: 'subgame.js' }, gameId: 'game-a', scriptDelayMs: 30 },
-      '/bundle-b': { manifest: { schema: 1, engineApi: 1, sharedDeps: [], entry: 'subgame.js' }, gameId: 'game-b', scriptDelayMs: 5 },
+      '/bundle-a': { manifest: { schema: 1, engineApi: 1, sharedDeps: [], entry: 'subgame.js' }, gameId: 'game-a', scriptDelayMs: 30, assetsManifest: {} },
+      '/bundle-b': { manifest: { schema: 1, engineApi: 1, sharedDeps: [], entry: 'subgame.js' }, gameId: 'game-b', scriptDelayMs: 5, assetsManifest: {} },
     });
     h.listBundles.mockResolvedValue({
       bundles: [
@@ -152,6 +168,97 @@ describe('subgameLoader — concurrency & error-visibility fixes', () => {
     __resetGameRegistryForTest();
   });
 
+  it('merges the asset-manifest fragment BEFORE registering the game (#540)', async () => {
+    const fetchMock = mockBundleEnv({
+      '/bundle-a': {
+        manifest: { schema: 1, engineApi: 1, sharedDeps: [], entry: 'subgame.js' },
+        gameId: 'game-a',
+        scriptDelayMs: 0,
+        assetsManifest: { assets: {} },
+      },
+    });
+    h.listBundles.mockResolvedValue({ bundles: [{ name: 'bundle-a', version: 'v1', path: '/bundle-a' }] });
+
+    const { loadStagedSubgames } = await import('../../app/subgameLoader');
+    const { registerDynamicGame, getGames, __resetGameRegistryForTest } = await import('../../app/gameRegistry');
+    const { loadManifestJson } = await import('@modoki/engine/runtime');
+    __resetGameRegistryForTest();
+
+    await loadStagedSubgames();
+
+    expect(getGames().map((g) => g.id)).toEqual(['game-a']);
+
+    // Fetch-order check: still worth keeping, but not authoritative on its own — it measures
+    // when the manifest fetch STARTS, not when the merge finishes.
+    const manifestCallIndex = fetchMock.mock.calls.findIndex(([url]) => url === '/bundle-a/assets.manifest.json');
+    expect(manifestCallIndex).toBeGreaterThanOrEqual(0);
+    const manifestCallOrder = fetchMock.mock.invocationCallOrder[manifestCallIndex];
+    const registerCallOrder = (registerDynamicGame as unknown as { mock: { invocationCallOrder: number[] } }).mock.invocationCallOrder[0];
+    expect(manifestCallOrder).toBeLessThan(registerCallOrder);
+
+    // Authoritative: the MERGE (loadManifestJson) must have COMPLETED before registration —
+    // this is what a refactor that starts the fetch early but merges late would still catch.
+    const mergeCallOrder = (loadManifestJson as unknown as { mock: { invocationCallOrder: number[] } }).mock.invocationCallOrder[0];
+    expect(mergeCallOrder).toBeLessThan(registerCallOrder);
+    __resetGameRegistryForTest();
+  });
+
+  it('a gameId collision is caught BEFORE the manifest merge, so it never repoints the existing game\'s asset paths', async () => {
+    mockBundleEnv({
+      '/bundle-a': {
+        manifest: { schema: 1, engineApi: 1, sharedDeps: [], entry: 'subgame.js' },
+        gameId: 'game-a',
+        scriptDelayMs: 0,
+        assetsManifest: { assets: {} },
+      },
+    });
+    h.listBundles.mockResolvedValue({ bundles: [{ name: 'bundle-a', version: 'v1', path: '/bundle-a' }] });
+
+    const { loadStagedSubgames, subscribeSubgameLoadErrors } = await import('../../app/subgameLoader');
+    const { getGames, __resetGameRegistryForTest, registerDynamicGame } = await import('../../app/gameRegistry');
+    const { loadManifestJson } = await import('@modoki/engine/runtime');
+    __resetGameRegistryForTest();
+    // Simulate the baked game already occupying "game-a" — the collision this bundle must be
+    // refused for.
+    registerDynamicGame({ id: 'game-a', name: 'game-a', loadConfig: async () => ({ scenePath: '' }) } as never);
+
+    await loadStagedSubgames();
+
+    const errors: { bundleName: string; message: string }[] = [];
+    subscribeSubgameLoadErrors((e) => { errors.length = 0; errors.push(...e); })();
+    expect(errors).toHaveLength(1);
+    expect(errors[0].bundleName).toBe('bundle-a');
+    expect(errors[0].message).toMatch(/gameId collision/);
+    // The regression: loadManifestJson must never even be CALLED for the rejected bundle —
+    // calling it would repoint the already-registered game-a's asset paths (last-write-wins on
+    // a GUID) before the bundle is discarded.
+    expect(loadManifestJson).not.toHaveBeenCalled();
+    expect(getGames().map((g) => g.id)).toEqual(['game-a']);
+    __resetGameRegistryForTest();
+  });
+
+  it('a non-ok asset-manifest fetch is FATAL — the game is never registered, and reports through the VISIBLE error list (#540)', async () => {
+    mockBundleEnv({
+      '/bundle-a': { manifest: { schema: 1, engineApi: 1, sharedDeps: [], entry: 'subgame.js' }, gameId: 'game-a', scriptDelayMs: 0 },
+      // no assetsManifest given — mockBundleEnv's default responds 404 to assets.manifest.json
+    });
+    h.listBundles.mockResolvedValue({ bundles: [{ name: 'bundle-a', version: 'v1', path: '/bundle-a' }] });
+
+    const { loadStagedSubgames, subscribeSubgameLoadErrors } = await import('../../app/subgameLoader');
+    const { getGames, __resetGameRegistryForTest } = await import('../../app/gameRegistry');
+    __resetGameRegistryForTest();
+
+    await loadStagedSubgames();
+
+    const errors: { bundleName: string; message: string }[] = [];
+    subscribeSubgameLoadErrors((e) => { errors.length = 0; errors.push(...e); })();
+    expect(errors).toHaveLength(1);
+    expect(errors[0].bundleName).toBe('bundle-a');
+    expect(errors[0].message).toMatch(/assets\.manifest\.json fetch failed/);
+    expect(getGames()).toEqual([]); // never registered — a broken manifest is a broken bundle, not "no assets"
+    __resetGameRegistryForTest();
+  });
+
   /**
    * ⚠️ The confirmBoot REJECT path had no test, and that is what let a partial `app/ota` mock go
    * unnoticed: `subgameLoader` imports `isPluginUnimplemented` to decide whether a rejection is
@@ -169,7 +276,7 @@ describe('subgameLoader — concurrency & error-visibility fixes', () => {
   ])('survives a confirmBoot rejection: %s', async (_label, rejection, expectWarn) => {
     h.confirmBoot.mockRejectedValueOnce(rejection);
     mockBundleEnv({
-      '/bundle-a': { manifest: { schema: 1, engineApi: 1, sharedDeps: [], entry: 'subgame.js' }, gameId: 'game-a', scriptDelayMs: 0 },
+      '/bundle-a': { manifest: { schema: 1, engineApi: 1, sharedDeps: [], entry: 'subgame.js' }, gameId: 'game-a', scriptDelayMs: 0, assetsManifest: {} },
     });
     h.listBundles.mockResolvedValue({ bundles: [{ name: 'bundle-a', version: 'v1', path: '/bundle-a' }] });
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

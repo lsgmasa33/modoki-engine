@@ -21,6 +21,7 @@ import { needsGLBConversion, loadSourceModel, disposeSourceModel } from '../scen
 import { frameCameraToBoxFixed } from '../scene/sceneViewMath';
 import { applyRendererColorConfig } from '../../runtime/rendering/scene3DSync';
 import { useModelInvalidationEpoch, cacheBustReimport } from './useAssetInvalidationEpoch';
+import { collectMaterialResources, disposeOwnedResources } from './modelPreviewResources';
 
 interface Props {
   /** Source GLB URL — e.g. `/games/.../island.glb`. Suffixes are computed
@@ -66,12 +67,16 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     modelRoot: THREE.Group;
     /** Set only on the OBJ/FBX/DAE preview path — its meshes are ALSO in
      *  ownedGeometries/ownedMaterials, but disposeSourceModel additionally sweeps the
-     *  textures a freshly-parsed source model carries (sibling .mtl maps), which the
-     *  geometry/material dispose loops below never touch. */
+     *  textures a freshly-parsed source model carries (sibling .mtl maps). Calling it
+     *  alongside the geometry/material/texture dispose loops below is redundant, not
+     *  wrong: both target the same objects and dispose() is idempotent. */
     sourceRoot: THREE.Object3D | null;
     envTexture: THREE.Texture | null;
     ownedMaterials: Set<THREE.Material>;
     ownedGeometries: Set<THREE.BufferGeometry>;
+    /** THREE.Material.dispose() does not free the textures hanging off it (map,
+     *  normalMap, emissiveMap, …) — those leak unless collected and disposed separately. */
+    ownedTextures: Set<THREE.Texture>;
     raf: number | null;
     activeLevel: LodChoice;
     /** Render-on-demand flag (F7). The tick loop only submits a GPU frame when
@@ -151,7 +156,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
 
     stateRef.current = {
       renderer, scene, camera, controls, modelRoot, sourceRoot: null, envTexture,
-      ownedMaterials: new Set(), ownedGeometries: new Set(),
+      ownedMaterials: new Set(), ownedGeometries: new Set(), ownedTextures: new Set(),
       raf: null, activeLevel: hasLods ? 'auto' : 0,
       needsRender: true, // draw the first frame
     };
@@ -177,10 +182,10 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       if (s.raf !== null) cancelAnimationFrame(s.raf);
       s.controls.removeEventListener('change', onControlsChange);
       s.controls.dispose();
-      for (const g of s.ownedGeometries) g.dispose();
-      for (const m of s.ownedMaterials) m.dispose();
-      // Second dispose of shared geometry/materials is idempotent — this call's job is the
-      // texture sweep the loops above don't do (see the sourceRoot field comment).
+      disposeOwnedResources(s.ownedGeometries, s.ownedMaterials, s.ownedTextures);
+      // Redundant with the sweep above for the OBJ/FBX/DAE path (see the sourceRoot field
+      // comment) — kept because disposeSourceModel is the one place that also walks a
+      // freshly-parsed source model's own hierarchy, not just the sets collected from it.
       if (s.sourceRoot) { disposeSourceModel(s.sourceRoot); s.sourceRoot = null; }
       s.scene.environment = null;
       s.envTexture?.dispose();
@@ -207,12 +212,10 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     // Clear any previously loaded geometry/materials before fetching the next one.
     const clearModel = () => {
       while (s.modelRoot.children.length > 0) s.modelRoot.remove(s.modelRoot.children[0]);
-      for (const g of s.ownedGeometries) g.dispose();
-      for (const m of s.ownedMaterials) m.dispose();
-      s.ownedGeometries.clear();
-      s.ownedMaterials.clear();
-      // Second dispose of shared geometry/materials is idempotent — this call's job is the
-      // texture sweep the loops above don't do (see the sourceRoot field comment).
+      disposeOwnedResources(s.ownedGeometries, s.ownedMaterials, s.ownedTextures);
+      // Redundant with the sweep above for the OBJ/FBX/DAE path (see the sourceRoot field
+      // comment) — kept because disposeSourceModel is the one place that also walks a
+      // freshly-parsed source model's own hierarchy, not just the sets collected from it.
       if (s.sourceRoot) { disposeSourceModel(s.sourceRoot); s.sourceRoot = null; }
     };
 
@@ -241,7 +244,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     const prepMaterial = (mat: THREE.Material) => {
       const std = mat as THREE.MeshStandardMaterial;
       if (std.emissive) std.emissive.setScalar(0);
-      s.ownedMaterials.add(mat);
+      collectMaterialResources(s.ownedMaterials, s.ownedTextures, mat);
     };
     const collectMaterials = (m: THREE.Mesh) => {
       s.ownedGeometries.add(m.geometry);
@@ -252,11 +255,16 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
 
     const buildSingle = (gltf: { scene: THREE.Group }) => {
       const root = gltf.scene;
-      s.modelRoot.add(root);
+      // Collect FIRST and unconditionally: a cancelled run's parsed document must still be
+      // owned, or it leaks (#537 — this is the path that leaked).
       root.traverse((child) => {
         const m = child as THREE.Mesh;
         if (m.isMesh) collectMaterials(m);
       });
+      // ATTACHING is what must be conditional. The next effect run calls clearModel()
+      // synchronously before its own await, so a cancelled run adding here would leave BOTH
+      // models as children of modelRoot, rendering together until the next clear.
+      if (!cancelled) s.modelRoot.add(root);
     };
 
     const buildLodAuto = async () => {
@@ -266,10 +274,6 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       for (let i = 0; i < lodCount; i++) {
         const url = bust(assetUrl(sourceUrl + lodUrlSuffix(i)));
         const gltf = await (await getLoader()).loadAsync(url);
-        // Bail between LOD loads on cancellation. Any later LODs that would
-        // have run produce wasted bytes; the already-loaded gltf gets disposed
-        // by the cleanup-time clearModel() pass via ownedGeometries.
-        if (cancelled) return;
         const root = gltf.scene;
         // Switch distance: we don't know the model's lodDistances here without
         // an extra fetch; use linearly-spaced placeholders so orbit-back/forward
@@ -281,6 +285,17 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
           const m = child as THREE.Mesh;
           if (m.isMesh) collectMaterials(m);
         });
+        // Collect BEFORE bailing on cancellation: this LOD's geometries/materials/
+        // textures are now owned, so the next clearModel() disposes them WHEN THE EFFECT
+        // RE-RUNS. On unmount, the mount effect's cleanup runs first and already disposed
+        // + nulled state, so a late resolve here collects into sets nobody sweeps — CPU-side
+        // only, since the renderer is already gone. Only LATER LODs are skipped.
+        //
+        // Note: `lod` is attached to modelRoot BEFORE this loop's first await, unlike
+        // buildSingle's root. Don't "fix" that by symmetry — the next run's clearModel()
+        // detaches this same THREE.LOD group, so a cancelled run's later addLevel() calls
+        // land on an orphan, never visible.
+        if (cancelled) return;
       }
       frameCamera();
     };
@@ -321,8 +336,8 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
           const level = hasLods ? (lodChoice as number) : 0;
           const url = bust(hasLods ? assetUrl(sourceUrl + lodUrlSuffix(level)) : assetUrl(sourceUrl));
           const gltf = await (await getLoader()).loadAsync(url);
-          if (cancelled) return;
           buildSingle(gltf as { scene: THREE.Group });
+          if (cancelled) return;
           frameCamera();
         }
         if (cancelled) return;

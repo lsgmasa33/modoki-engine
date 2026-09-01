@@ -776,4 +776,132 @@ describe('applyBindings input lock — UI busy sources (#530)', () => {
       unregisterUIAction('test.busySlider');
     }
   });
+
+  // Regression for #543: `lockMaxMs`/`lockMinMs` used to be module-level caches, written ONLY by
+  // `acquireLock()`. The busy-source valve above consults them BEFORE any activation calls
+  // `acquireLock` — so a busy episode that starts before the session's first UNBLOCKED activation
+  // ran on the module DEFAULT the entire time, never learning the authored value, because the
+  // busy gate returns early and `acquireLock` is never reached. Fixed by reading `UISettings`
+  // fresh on every activation instead of caching (`readLockWindow`).
+  it('first activation of a busy episode uses the AUTHORED inputLockMaxMs, not a stale/default cache (#543)', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Prime the module's lock state to the DEFAULT window via an ordinary, non-busy click — this
+    // pins "what the module currently believes maxMs is" to a KNOWN value (the default) instead
+    // of depending on whatever an unrelated earlier test in this file happened to leave behind,
+    // which is exactly the kind of leftover state #543 is about.
+    registerUIAction('test.primeDefault', () => {});
+    applyBindings(call('test.primeDefault'), 'click', { selfGuid: 'prime-1' });
+    unregisterUIAction('test.primeDefault');
+
+    // Now author a NON-default ceiling and register a busy source that never settles on its own.
+    // No further acquireLock() call ever happens — the busy valve short-circuits `applyBindings`
+    // before `acquireLock` is reached — so pre-#543 the valve keeps consulting the stale cache
+    // primed above (the module default, 10000ms) instead of this authored 500ms.
+    world.spawn(UISettings({ inputLockMaxMs: 500 }));
+    registerUIBusySource('test.busyFirstSession', () => true);
+    let calls = 0;
+    registerUIAction('test.busyFirstSessionAction', () => { calls += 1; });
+    try {
+      applyBindings(call('test.busyFirstSessionAction'), 'click', { selfGuid: 'btn-first' }); // t=0
+      expect(calls).toBe(0);
+
+      advanceManual(300); // t=300 — still under the authored 500ms, same episode continues
+      applyBindings(call('test.busyFirstSessionAction'), 'click', { selfGuid: 'btn-first' });
+      expect(calls).toBe(0);
+
+      advanceManual(300); // t=600 — past the AUTHORED 500ms (but well under the stale 10000ms)
+      applyBindings(call('test.busyFirstSessionAction'), 'click', { selfGuid: 'btn-first' });
+      // Pre-#543: still consulting the stale/default 10000ms cache primed above → stays blocked
+      // (600 < 10000). Post-#543: reads the authored 500ms fresh → unblocks and warns.
+      expect(calls).toBe(1);
+      expect(warnSpy).toHaveBeenCalled();
+      expect(String(warnSpy.mock.calls[0][0])).toContain('test.busyFirstSession');
+    } finally {
+      unregisterUIAction('test.busyFirstSessionAction');
+      warnSpy.mockRestore();
+    }
+  });
+
+  // Regression for the defect found reviewing #543: the gap-restart threshold and the VALVE
+  // threshold were the same number, so once the valve started reading the AUTHORED ceiling, a
+  // game could author the valve into never firing. With `inputLockMaxMs: 500` and a human tap
+  // cadence of 800ms, every observation restarted the window (`800 > 500`) — `busyElapsed` never
+  // grew, input stayed blocked for the whole stall, and the warning never printed. The gap is now
+  // floored by BUSY_OBSERVATION_GAP_MS, independent of the authored ceiling.
+  it('a small authored inputLockMaxMs cannot make the busy valve unreachable at human tap cadence', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    world.spawn(UISettings({ inputLockMaxMs: 500, inputLockMinMs: 0 }));
+    registerUIBusySource('test.busyStuckSmallCeiling', () => true);
+    let calls = 0;
+    registerUIAction('test.smallCeilingAction', () => { calls += 1; });
+    try {
+      applyBindings(call('test.smallCeilingAction'), 'click', { selfGuid: 'btn-sc' }); // t=0
+      expect(calls).toBe(0);
+
+      // A REALISTIC retry cadence — 800ms apart, well above the authored 500ms ceiling. Pre-fix
+      // this restarted the window on every tap and the valve was unreachable forever; the old
+      // tests only passed because they polled at 20ms, which no human produces.
+      advanceManual(800);
+      applyBindings(call('test.smallCeilingAction'), 'click', { selfGuid: 'btn-sc' }); // t=800
+      // 800ms of CONTINUOUS observed busy is past the authored 500ms ceiling → valve rescues.
+      expect(calls).toBe(1);
+      expect(warnSpy).toHaveBeenCalled();
+      expect(String(warnSpy.mock.calls[0][0])).toContain('test.busyStuckSmallCeiling');
+    } finally {
+      unregisterUIAction('test.smallCeilingAction');
+      warnSpy.mockRestore();
+    }
+  });
+
+  // Regression for #543's second window: the cache also survived a world swap, so the first
+  // busy episode of the NEW world ran on the OUTGOING world's authored value until some later
+  // activation happened to call acquireLock() again.
+  it('after a world swap, the busy valve uses the NEW world\'s authored inputLockMaxMs, not the outgoing world\'s cached value (#543)', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // World A: author a LARGE ceiling and take one real, unblocked activation — pre-#543 this is
+    // what populates the module-level cache with A's value.
+    world.spawn(UISettings({ inputLockMaxMs: 5000 }));
+    registerUIAction('test.worldAAction', () => {});
+    applyBindings(call('test.worldAAction'), 'click', { selfGuid: 'btn-a' });
+    unregisterUIAction('test.worldAAction');
+
+    // Swap to a brand-new world — onWorldSwap resets lockHeld/busySince but (pre-#543) NOT the
+    // cached lockMaxMs, so the stale 5000ms from world A would survive the swap.
+    const worldA = world;
+    world = createWorld();
+    setCurrentWorld(world);
+    setManualNow(0);
+
+    // World B authors a SMALL ceiling. `inputLockMinMs: 0` avoids the (unrelated) min>max
+    // inversion clamp — the default floor (300ms) would otherwise clamp this ceiling UP to 300.
+    world.spawn(UISettings({ inputLockMaxMs: 50, inputLockMinMs: 0 }));
+    registerUIBusySource('test.worldBBusy', () => true);
+    let calls = 0;
+    registerUIAction('test.worldBAction', () => { calls += 1; });
+    try {
+      applyBindings(call('test.worldBAction'), 'click', { selfGuid: 'btn-b' }); // first activation in B
+      expect(calls).toBe(0);
+
+      // Poll in steps SMALLER than B's authored 50ms, each observed via an activation, so the
+      // busy window is credited continuously rather than tripping the unobserved-gap restart
+      // (see the gap-restart test above) — total elapsed still lands well under A's stale 5000ms.
+      advanceManual(20);
+      applyBindings(call('test.worldBAction'), 'click', { selfGuid: 'btn-b' }); // t=20
+      expect(calls).toBe(0);
+      advanceManual(20);
+      applyBindings(call('test.worldBAction'), 'click', { selfGuid: 'btn-b' }); // t=40
+      expect(calls).toBe(0);
+      advanceManual(20);
+      applyBindings(call('test.worldBAction'), 'click', { selfGuid: 'btn-b' }); // t=60
+      // Pre-#543: still on A's cached 5000ms → stays blocked (60 < 5000). Post-#543: reads B's
+      // freshly-authored 50ms → unblocks and warns.
+      expect(calls).toBe(1);
+      expect(warnSpy).toHaveBeenCalled();
+      expect(String(warnSpy.mock.calls[0][0])).toContain('test.worldBBusy');
+    } finally {
+      unregisterUIAction('test.worldBAction');
+      warnSpy.mockRestore();
+      worldA.destroy();
+    }
+  });
 });

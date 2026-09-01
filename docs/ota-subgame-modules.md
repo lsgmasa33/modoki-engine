@@ -200,7 +200,21 @@ specifically beyond the instance guard above catching it once loaded.
 
 **§3 dynamic GAMES.** Duplicate `id` between baked and sub-game → `registerDynamicGame`
 refuses loudly (returns `false`, `subgameLoader.ts` reports it), never last-write-wins. A 404
-`<script>` fails through `onerror` → rejection with the URL, never silently.
+`<script>` fails through `onerror` → rejection with the URL, never silently. `subgameLoader.ts`
+also probes this collision itself, SYNCHRONOUSLY and BEFORE fetching `assets.manifest.json` —
+`registerAsset` is last-write-wins on a GUID, so merging a fragment ahead of the id check would
+repoint the baked game's asset paths at the bundle's staged root before the bundle is refused,
+with no un-merge. `registerDynamicGame`'s own check afterward stays the authoritative claim; the
+probe is sufficient, not just narrowing, because sub-games load sequentially in a single
+memoized pass (`loadStagedSubgames()`'s loop awaits each bundle in turn, and `subgameLoader.ts`
+is the only production caller of `registerDynamicGame`) — nothing can register between the probe
+and the merge, so a same-id bundle is always caught by the probe.
+
+A non-ok or unparseable `assets.manifest.json` is **fatal**, not a warn-and-continue: the vite
+asset scanner writes that file unconditionally on every build, so a missing/broken one means a
+genuinely broken bundle. `subgameLoader.ts` reports it through the visible error list and leaves
+the sub-game **unregistered** — which also means it never reaches `confirmBoot`, so the bundle is
+never confirmed and rolls back.
 
 **§4 engine API.** Hand-edited `engineApi` "fixing" a rejection can't happen — it's stamped
 from the constant at build time in two independently-read places, not hand-written.

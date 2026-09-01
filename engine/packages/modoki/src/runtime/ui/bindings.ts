@@ -81,8 +81,6 @@ export interface ApplyBindingsOptions {
 
 let lockHeld = false;
 let lockAcquiredAt = 0;
-let lockMinMs = UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS;
-let lockMaxMs = UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS;
 let lockPendingCount = 0;
 let lockPendingNames: string[] = [];
 // Bumped by every acquireLock()/releaseLock() — a stale promise from an EARLIER lock (one that
@@ -96,27 +94,54 @@ let lockGen = 0;
 // The start of the busy window currently being credited toward the valve, or `null` when
 // nothing is busy right now. `null`, not `0` — the manual test clock legitimately starts at 0,
 // so `0` cannot double as "unset" without colliding with a real timestamp. Its OWN safety valve,
-// separate from `lockAcquiredAt`/`lockMaxMs` above: busy can begin from something that was never
+// separate from `lockAcquiredAt`/the authored window above: busy can begin from something that was never
 // itself a UI activation (Court's sign-in flow starts from a menu button, not a chrome tap), so
 // there may be no held lock at all to hang this off. See `isInputLockActive` for the valve logic.
 //
 // ⚠️ This is NOT "when the predicates first went continuously true" — `isInputLockActive` is only
 // ever called from a UI activation, so it can only credit busy time it actually OBSERVED. A busy
 // period that starts and ends with no activation in between (a background sync, a restored
-// StoreKit transaction) leaves `busySince` stale from an EARLIER episode; if a later, unrelated
-// episode is then measured against that stale timestamp, the valve force-releases immediately —
-// and silently, if `busyWarned` also survived from the earlier episode. `busyLastObserved` below
-// closes that gap: a gap since the last observation longer than `lockMaxMs` means there is no
-// evidence busy was continuous across it, so the window restarts instead of being credited.
+// StoreKit transaction) would leave credited time stale from an EARLIER episode; if a later,
+// unrelated episode inherited it, the valve would force-release immediately — and silently, if
+// `busyWarned` also survived. `busyLastObserved` below closes that gap: only the delta BETWEEN
+// two observations is credited, and only when it is under `BUSY_OBSERVATION_GAP_MS`; a longer
+// gap is evidence of nothing and starts a fresh episode.
 // Cost of this, accepted deliberately: the valve needs observations spaced closer together than
-// `lockMaxMs` to accumulate, so a sparse retry cadence (a user trying again less often than that)
-// restarts the window each time and DELAYS the rescue rather than denying it. The alternative —
+// `BUSY_OBSERVATION_GAP_MS` to accumulate. Below that cadence the rescue is merely DELAYED; a
+// user retrying consistently SLOWER than it restarts the window every time and is denied the
+// rescue outright — stated plainly because the comment here used to claim "delayed, never
+// denied", which is false above that cadence. Accepted because a >10s tap cadence is not
+// someone hammering a stuck button. The alternative —
 // crediting the unobserved gap anyway — silently force-released an unrelated, later operation,
 // which is the bug this replaced.
-let busySince: number | null = null;
+// How long a gap between two observations we still believe busy was continuous across, and so
+// still CREDIT toward the valve.
+//
+// ⚠️ THIS IS A HEURISTIC WITH A KNOWN AMBIGUOUS BAND, not a correct answer, because
+// `isInputLockActive` only samples at a discrete activation. One tap N seconds after the last
+// is INDISTINGUISHABLE between "still stalled, the user retried" (must credit, or the valve
+// never rescues) and "the old episode ended and an unrelated one began" (must not credit, or
+// the new one is force-released unprotected — the #530 defect). No threshold separates them;
+// the existing genuine-stall test retries every 3.3s expecting rescue, and a 5s idle between
+// episodes expects protection. Biased toward CREDITING deliberately: bricked input is the
+// severe failure, an unprotected new episode the milder one. The real fix is to observe the
+// busy predicates on a frame cadence instead of only at activations, which makes continuity
+// OBSERVED rather than inferred and retires this constant — tracked as #551.
+// Deliberately NOT the authored `inputLockMaxMs`. The two were the same number until #543, and
+// once the valve started reading the authored ceiling (rather than an un-updatable module
+// cache), a game could author the valve into NEVER FIRING: with `inputLockMaxMs: 500` and a
+// user tapping every 800ms, every observation restarted the window (`800 > 500`), so
+// `busyElapsed` never grew past the ceiling — input stayed blocked for the whole stall and the
+// warning never printed, because `busyWarned` is reset on the same line that would have let it
+// fire. This is mechanism, not feel, so it is a code constant (CLAUDE.md's single-source
+// table), and 10000 is the value this threshold effectively HAD before #543, when the busy
+// valve read a cache still holding UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS.
+const BUSY_OBSERVATION_GAP_MS = 10_000;
+
+let busyAccumulatedMs = 0;
 // The last time `isInputLockActive()` observed the busy set non-empty, or `null` when the last
-// observation (or world start) saw nothing busy. Used only to detect an unobserved gap — see
-// `busySince` above.
+// observation (or world start) saw nothing busy. Each observation credits the delta since this
+// one — see `busyAccumulatedMs` above.
 let busyLastObserved: number | null = null;
 // Guards the warning below to fire ONCE per stall, not on every activation while a source stays
 // stuck — mirrors `releaseLock()` clearing `lockPendingNames` so the other valve's warning can't
@@ -130,8 +155,8 @@ let busyWarned = false;
 // identically and can never drift apart.
 onWorldSwap(() => {
   releaseLock();
-  busySince = null; // a busy source registered by the outgoing world's manager must not carry a
-  // stuck-since timestamp into the next world's first activation
+  busyAccumulatedMs = 0; // a busy source registered by the outgoing world's manager must not
+  // carry credited stall time into the next world's first activation
   busyLastObserved = null;
   busyWarned = false;
 });
@@ -146,47 +171,58 @@ onWorldSwap(() => {
  *  nothing outstanding (a plain synchronous 'set'/'call' left the lock sitting held past
  *  `inputLockMaxMs` with `lockPendingCount === 0`, and the very next tap — however much later —
  *  hit the valve and warned about a handler that never existed). An idle lock is freed silently
- *  by the floor branch below instead. */
-function isInputLockActive(): boolean {
+ *  by the floor branch below instead.
+ *
+ *  Takes the authored window as a parameter rather than reading module state — see
+ *  `readLockWindow` below for why the two knobs are no longer cached at all. */
+function isInputLockActive(lockWindow: { minMs: number; maxMs: number }): boolean {
   // The busy-source gate (#530) goes FIRST, before `lockHeld` — a busy predicate can start
   // outside any UI activation at all (Court's sign-in begins from `beginSignIn`, not from a
   // chrome tap that took the lock), and the 300ms floor below may already have expired while the
   // underlying work continues. So this must block even an otherwise-idle lock.
   //
-  // ⚠️ It carries its OWN safety valve, mirroring `lockMaxMs` below — a naive
+  // ⚠️ It carries its OWN safety valve, mirroring `lockWindow.maxMs` below — a naive
   // `if (busyNames.length) return true` would let a predicate stuck true (a real Court case: the
   // account side can legitimately sit in 'working' for up to its own 60s watchdog) brick ALL UI
   // input FOREVER, reintroducing exactly the failure `inputLockMaxMs` exists to prevent. Track
-  // when busy first became true; once it has been continuously true past `lockMaxMs`, stop
+  // when busy first became true; once it has been continuously true past `lockWindow.maxMs`, stop
   // blocking and warn naming the stuck source(s), same wording family as the lock's own valve.
   const busyNames = getActiveUIBusySources();
   if (busyNames.length > 0) {
     const now = rawNow();
-    // A gap since the last observation longer than `lockMaxMs` means this call has no evidence
-    // busy was continuous across it — treat it as a NEW episode rather than crediting it with
-    // time nobody watched (see the comment on `busySince` above).
-    if (busySince === null || (busyLastObserved !== null && now - busyLastObserved > lockMaxMs)) {
-      busySince = now;
+    // ACCUMULATE observed-adjacent time; never measure from a single start timestamp. Using one
+    // `busySince` forced a choice between two bugs, and both were shipped and caught here:
+    // with the gap threshold at the AUTHORED ceiling, a user retrying slower than it restarted
+    // the window every time and the valve became unreachable; with the threshold at a flat 10s,
+    // a stale timestamp from an EARLIER finished episode was credited to a new unrelated one,
+    // force-releasing it on its first observation — the exact #530 defect the gap logic exists
+    // to prevent. Crediting only the deltas short enough to vouch for avoids both: a long gap
+    // contributes NOTHING (nobody watched it) and starts a fresh episode, while a normal retry
+    // cadence still accumulates toward the ceiling instead of resetting.
+    const delta = busyLastObserved === null ? 0 : now - busyLastObserved;
+    if (delta > BUSY_OBSERVATION_GAP_MS) {
+      busyAccumulatedMs = 0; // unobservable gap — treat as a new episode, credit none of it
       busyWarned = false;
+    } else {
+      busyAccumulatedMs += delta;
     }
     busyLastObserved = now;
-    const busyElapsed = now - busySince;
-    if (busyElapsed > lockMaxMs) {
+    if (busyAccumulatedMs > lockWindow.maxMs) {
       if (!busyWarned) {
         busyWarned = true;
         console.warn(
-          `[UI input lock] busy-source valve force-released after ${lockMaxMs}ms — stuck busy: `
+          `[UI input lock] busy-source valve force-released after ${lockWindow.maxMs}ms — stuck busy: `
           + busyNames.join(', '),
         );
       }
-      // Do not reset `busySince` here: the source(s) are still reporting busy, and resetting
-      // would re-arm a fresh `lockMaxMs` window on the very next check instead of recognizing
-      // this as the SAME ongoing stall. It resets only once nothing is busy, below.
+      // Do not reset the accumulator here: the source(s) are still reporting busy, and resetting
+      // would re-arm a fresh window on the very next check instead of recognizing this as the
+      // SAME ongoing stall. It resets only once nothing is busy, below.
     } else {
       return true;
     }
   } else {
-    busySince = null; // nothing busy right now — a later short busy period starts its own window
+    busyAccumulatedMs = 0; // nothing busy right now — a later busy period starts its own window
     busyLastObserved = null;
     busyWarned = false;
   }
@@ -194,9 +230,9 @@ function isInputLockActive(): boolean {
   if (!lockHeld) return false;
   const elapsed = rawNow() - lockAcquiredAt;
   if (lockPendingCount > 0) {
-    if (elapsed > lockMaxMs) {
+    if (elapsed > lockWindow.maxMs) {
       console.warn(
-        `[UI input lock] force-released after ${lockMaxMs}ms — a handler never settled: `
+        `[UI input lock] force-released after ${lockWindow.maxMs}ms — a handler never settled: `
         + `${lockPendingNames.length ? lockPendingNames.join(', ') : '(no call binding — a stuck set?)'}`,
       );
       releaseLock();
@@ -204,7 +240,7 @@ function isInputLockActive(): boolean {
     }
     return true; // an async 'call' handler hasn't settled yet, and still within the max-ms valve
   }
-  if (elapsed < lockMinMs) return true; // floor not elapsed yet
+  if (elapsed < lockWindow.minMs) return true; // floor not elapsed yet
   releaseLock(); // both gates satisfied — free it now rather than waiting to be asked again
   return false;
 }
@@ -216,14 +252,37 @@ function releaseLock(): void {
   lockGen += 1;
 }
 
-function acquireLock(minMs: number, maxMs: number): void {
+// Takes no window: since #543 nothing caches the authored knobs, so the acquire has nothing to
+// snapshot — `isInputLockActive` reads them fresh each time. See `readLockWindow`.
+function acquireLock(): void {
   lockHeld = true;
   lockAcquiredAt = rawNow();
-  lockMinMs = minMs;
-  lockMaxMs = maxMs;
   lockPendingCount = 0;
   lockPendingNames = [];
   lockGen += 1;
+}
+
+/** Read and clamp the authored lock window from `UISettings` — the SINGLE place either knob is
+ *  read. Previously `acquireLock` snapshotted these into module-level `lockMinMs`/`lockMaxMs`, but
+ *  the busy-source valve in `isInputLockActive` consults the window BEFORE any activation ever
+ *  calls `acquireLock` (a busy predicate can go true with no preceding tap), so that cache ran on
+ *  the module default for the whole first busy episode of a session, and on the PREVIOUS world's
+ *  value for the first episode after a world swap (#543). Reading fresh at evaluation time instead
+ *  of caching removes the staleness entirely — the cost is one extra `queryFirst` per discrete
+ *  activation, same as the one this replaces. */
+function readLockWindow(world: ReturnType<typeof getCurrentWorld>): { minMs: number; maxMs: number } {
+  const settings = world.queryFirst(UISettings)?.get(UISettings);
+  const minMs = settings?.inputLockMinMs ?? UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS;
+  const maxMs = settings?.inputLockMaxMs ?? UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS;
+  // Defend against an authored inversion (min > max) — the Inspector can't express a
+  // cross-field constraint, so `inputLockMinMs: 1000, inputLockMaxMs: 100` is legal input.
+  // Left unclamped, the valve's max-ms window would sit BELOW the floor, so a lock with
+  // nothing pending could never even reach a pending check. Clamp the ceiling up to the floor
+  // instead of clamping the floor down, so the floor — the value the owner is more likely
+  // tuning for feel — always wins. (The valve no longer fires on an idle lock at all —
+  // `isInputLockActive` only consults `maxMs` when `lockPendingCount > 0` — so this clamp
+  // is just keeping `maxMs >= minMs` sane, not suppressing a per-activation warning.)
+  return { minMs, maxMs: Math.max(minMs, maxMs) };
 }
 
 /** Register a 'call' binding's returned value against the held lock IF it's a thenable, so
@@ -335,20 +394,14 @@ export function applyBindings(
   const isDiscrete = !continuous;
   if (isDiscrete) {
     // Swallow the WHOLE event, before the click cue, so a blocked second tap makes no sound —
-    // the doubled sound was the original bug report's own proof the action ran twice.
-    if (isInputLockActive()) return;
-    const settings = world.queryFirst(UISettings)?.get(UISettings);
-    const minMs = settings?.inputLockMinMs ?? UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS;
-    const maxMs = settings?.inputLockMaxMs ?? UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS;
-    // Defend against an authored inversion (min > max) — the Inspector can't express a
-    // cross-field constraint, so `inputLockMinMs: 1000, inputLockMaxMs: 100` is legal input.
-    // Left unclamped, the valve's max-ms window would sit BELOW the floor, so a lock with
-    // nothing pending could never even reach a pending check. Clamp the ceiling up to the floor
-    // instead of clamping the floor down, so the floor — the value the owner is more likely
-    // tuning for feel — always wins. (The valve no longer fires on an idle lock at all —
-    // `isInputLockActive` only consults `lockMaxMs` when `lockPendingCount > 0` — so this clamp
-    // is just keeping `maxMs >= minMs` sane, not suppressing a per-activation warning.)
-    acquireLock(minMs, Math.max(minMs, maxMs));
+    // the doubled sound was the original bug report's own proof the action ran twice. Read the
+    // authored window ONCE here — both the busy-valve check and the acquire below share it,
+    // rather than each re-querying `UISettings` (#543).
+    // Named `lockWindow`, not `window`: a bare `window` here would shadow the DOM global
+    // inside `applyBindings`, and this is DOM-adjacent code.
+    const lockWindow = readLockWindow(world);
+    if (isInputLockActive(lockWindow)) return;
+    acquireLock();
   }
 
   // Shared with the input lock above (#528) rather than testing the event name: the old

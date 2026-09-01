@@ -22,6 +22,12 @@ let RAPIER: Rapier3D | null = null;
 let ready = false;
 let initPromise: Promise<void> | null = null;
 
+// A retry budget, not a tunable — this is mechanism (how many transient-failure retries
+// are worth the cost of a fresh dynamic import), not designer-facing feel, so it stays a
+// code constant rather than a config-resource field.
+const RAPIER_INIT_MAX_ATTEMPTS = 3;
+let failedAttempts = 0;
+
 /** Kick (or await) Rapier3D WASM load + initialization. Idempotent — safe every frame. */
 export function initRapier3D(): Promise<void> {
   // Physics3D excluded from this build (build.modules.physics3d=false / auto-detected
@@ -33,14 +39,49 @@ export function initRapier3D(): Promise<void> {
     return Promise.reject(new Error('[physics3D] Rapier3D was excluded from this build (build.modules.physics3d=false)'));
   }
   if (!initPromise) {
-    initPromise = import('@dimforge/rapier3d-compat').then((m) => {
+    const promise: Promise<void> = import('@dimforge/rapier3d-compat').then((m) => {
       const mod = m.default;
       // Suppress Rapier's one bogus init deprecation warning (see warnSuppress.ts) —
       // ref-counted so it composes safely with the 2D loader if both init at once.
       beginSuppressRapierInitWarning();
       return mod.init()
-        .then(() => { RAPIER = mod; ready = true; })
+        .then(() => { RAPIER = mod; ready = true; failedAttempts = 0; })
         .finally(() => { endSuppressRapierInitWarning(); });
+    });
+    initPromise = promise;
+    // A rejection is memoised as readily as a success, so left alone one transient init
+    // failure would leave physics dead for the rest of the session (#541). But clearing it
+    // unconditionally re-enters this branch on EVERY tick that sees a body (the caller has
+    // no backoff), issuing a fresh attempt at frame rate forever — so retry only up to
+    // RAPIER_INIT_MAX_ATTEMPTS, then leave the rejection memoised (fail fast for the rest of
+    // the session) and say so loudly, since `.catch` here would otherwise be the only thing
+    // that ever saw the error. The `=== promise` guard is registered after assignment so a
+    // late rejection from an older attempt can never clear a newer in-flight one.
+    //
+    // ⚠️ WHICH half the retry can actually rescue — MEASURED, not assumed (see
+    // docs/architecture.md § "A memoized promise must be cleared when it rejects"):
+    //   - `mod.init()` failing (WASM instantiate) IS retryable — the module is already
+    //     resolved in the module map, so a later attempt re-runs init() for real.
+    //   - `import(...)` itself failing is NOT. A failed module fetch is cached per specifier
+    //     by the module map, and re-calling import() with the SAME specifier never issues
+    //     another request — verified in Chromium, WebKit and Firefox. So for the case the
+    //     issue actually named (a chunk 404 after a deploy or OTA bundle swap) the retry
+    //     buys nothing and the WARNING below is the entire value. Retrying that would need a
+    //     cache-busted URL, which is not worth the machinery here.
+    promise.catch((err) => {
+      failedAttempts++;
+      if (failedAttempts < RAPIER_INIT_MAX_ATTEMPTS) {
+        console.warn(
+          `[physics3D] Rapier3D init failed (attempt ${failedAttempts}/${RAPIER_INIT_MAX_ATTEMPTS}), will retry:`,
+          err
+        );
+        if (initPromise === promise) initPromise = null;
+      } else {
+        console.error(
+          `[physics3D] Rapier3D init failed permanently after ${RAPIER_INIT_MAX_ATTEMPTS} attempts — physics will not start:`,
+          err
+        );
+      }
     });
   }
   return initPromise;

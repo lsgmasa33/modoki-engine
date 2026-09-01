@@ -276,14 +276,43 @@ true would otherwise brick input forever — the exact failure the lock's own va
 prevent. A throwing predicate degrades to "not busy" and logs once per throwing call, so one
 bad game-side read can't starve input either.
 
+**Both knobs are read fresh from `UISettings` on every discrete activation, never cached
+(#543).** They used to be snapshotted into module-level `lockMinMs`/`lockMaxMs` by
+`acquireLock()` — but the busy gate above is consulted BEFORE the acquire, and when it
+blocks, `applyBindings` returns early so `acquireLock()` is never reached. A busy episode
+beginning before the session's first unblocked activation therefore ran the valve on the
+module DEFAULT for its whole duration, with no path to learn the authored value while it
+kept blocking; the first episode after a world swap ran on the OUTGOING scene's value.
+`readLockWindow(world)` is now the single place either knob is read and clamped, so there
+is no cached copy for a swap or a first activation to leave stale.
+
 **The valve measures OBSERVED busy time, not wall-clock busy time**, because
 `isInputLockActive()` is only ever called from a discrete UI activation — it can only credit
 busy time it actually watched. A gap since the last observation longer than `inputLockMaxMs`
 means there is no evidence busy was continuous across it, so the window restarts instead of
 crediting time nobody watched (crediting it silently force-released an unrelated *later*
-operation under the previous approach — the bug this replaced). The consequence: a user
-retrying at a normal cadence trips the valve fine, but retries spaced further apart than
-`inputLockMaxMs` restart the window each time — so the rescue is **delayed, never denied**.
+operation under the previous approach — the bug this replaced).
+
+**The valve ACCUMULATES observed-adjacent time; it does not measure from a single start
+timestamp.** Each activation credits only the delta since the previous observation, and only
+when that delta is under `BUSY_OBSERVATION_GAP_MS` (10s, a code constant); a longer gap is
+evidence of nothing, credits zero, and starts a fresh episode. This replaced a `busySince`
+timestamp whose elapsed time could include arbitrary stretches nobody watched.
+
+⚠️ **The threshold is a heuristic with a known ambiguous band, and cannot be fixed by choosing a
+better number.** `isInputLockActive` only samples at a discrete activation, so one tap N seconds
+after the last is indistinguishable between *"still stalled, the user retried"* (must credit, or
+the valve never rescues and input stays bricked) and *"the old episode ended, an unrelated one
+began"* (must not credit, or the new operation is force-released unprotected — the #530 defect).
+The suite pins both sides: a genuine-stall test retries every 3.3s expecting rescue, and a 5s
+idle between episodes expects protection. It is biased toward **crediting**, deliberately —
+bricked input is the severe failure, an unprotected new episode the milder one.
+
+Both failure modes were shipped and caught in review before landing: tying the threshold to the
+authored `inputLockMaxMs` made the valve unreachable at any human tap cadence below the ceiling,
+and a flat 10s reintroduced #530's stale-episode force-release. The real fix is to observe the
+busy predicates on a frame cadence rather than only at activations, which makes continuity
+*observed* instead of inferred and retires the constant entirely — tracked as #551.
 
 A **continuous** event stream passes `continuous: true` to `applyBindings` and is exempt both
 ways: it neither takes nor respects the lock. Two streams qualify, not one: a range slider's

@@ -15,7 +15,7 @@ import { Capacitor } from '@capacitor/core';
 import { ENGINE_API_VERSION, loadManifestJson, type AssetManifestFile, type GameDefinition } from '@modoki/engine/runtime';
 import projectConfig from 'virtual:modoki-project-config';
 import { checkAppSubgameUpdates, isPluginUnimplemented } from './ota';
-import { registerDynamicGame } from './gameRegistry';
+import { registerDynamicGame, getGames } from './gameRegistry';
 
 export interface SubgameLoadError {
   bundleName: string;
@@ -131,22 +131,47 @@ async function loadOneSubgame(bundle: { name: string; version: string; path: str
   const originalLoadConfig = game.loadConfig;
   game.loadConfig = async () => ({ ...(await originalLoadConfig()), assetBaseUrl: baseUrl });
 
-  const registered = registerDynamicGame(game);
-  if (!registered) {
-    reportError(bundle.name, bundle.version, `gameId collision: "${mod.game.id}" is already registered`);
+  // Probe the collision BEFORE merging the manifest below. `registerDynamicGame` is still the
+  // authoritative claim (it runs after the merge), but by then the fragment has already been
+  // merged — and `registerAsset` is last-write-wins on a GUID, so a bundle that is about to be
+  // REFUSED for a duplicate id would first repoint the baked game's every asset path at this
+  // bundle's staged root, with no un-merge. See docs/ota-subgame-modules.md §3.
+  if (getGames().some((g) => g.id === game.id)) {
+    reportError(bundle.name, bundle.version, `gameId collision: "${game.id}" is already registered`);
     return;
   }
 
   // Merge this sub-game's own asset-manifest fragment, path-prefixed so its GUIDs
   // resolve against ITS OWN staged root rather than colliding with the shell's assets.
+  // Done BEFORE registerDynamicGame: registration is what makes App.tsx's findGame see
+  // this game as bootable, so the manifest must already be merged by then — otherwise a
+  // boot landing in the window between registration and this fetch resolving would
+  // resolve every asset against the SHELL's manifest instead (missing textures/audio).
+  // Fatal, not a warn-and-continue: vite-asset-scanner.ts writes assets.manifest.json
+  // unconditionally on every build, so a missing/unparseable manifest here means a
+  // genuinely broken bundle, not a legitimate "this sub-game has no assets" case.
   try {
     const manifestRes = await fetch(`${baseUrl}/assets.manifest.json`);
-    if (manifestRes.ok) {
-      const fragment: AssetManifestFile = await manifestRes.json();
-      loadManifestJson(fragment, { pathPrefix: baseUrl });
+    if (!manifestRes.ok) {
+      reportError(bundle.name, bundle.version, `assets.manifest.json fetch failed (${manifestRes.status})`);
+      return;
     }
+    const fragment: AssetManifestFile = await manifestRes.json();
+    loadManifestJson(fragment, { pathPrefix: baseUrl });
   } catch (e) {
-    console.warn(`[GameShell] sub-game "${bundle.name}" asset-manifest merge failed (non-fatal, assets may be missing):`, e);
+    reportError(bundle.name, bundle.version, `assets.manifest.json fetch/parse threw: ${e}`);
+    return;
+  }
+
+  // Authoritative claim. The probe above is sufficient, not just narrowing: sub-games load
+  // sequentially in one memoized pass (loadStagedSubgames()'s `for` loop awaits each
+  // loadOneSubgame() in turn, and this is the only production caller of registerDynamicGame),
+  // so nothing can register between the probe and this call — a same-id bundle is always
+  // caught by the probe, never by a race with the loser's manifest already merged.
+  const registered = registerDynamicGame(game);
+  if (!registered) {
+    reportError(bundle.name, bundle.version, `gameId collision: "${mod.game.id}" is already registered`);
+    return;
   }
 
   // Promote pending → active for this bundle. Deliberately a SINGLE confirmBoot call,
