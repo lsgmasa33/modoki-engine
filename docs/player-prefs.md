@@ -220,6 +220,15 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   exactly this for the pre-swap drain, and Court's `flushToStablePoint()` is the second instance.
   If a third appears, this belongs in the engine rather than in each caller.
 
+  ⚠️ **#558 is evidence for that move, though it does not yet trigger it.** A second clone, writing
+  account-deletion durability gates on a parallel branch, independently reached for the bare
+  `flush()` → `hasPendingWrite` → one-retry idiom and documented a mid-drain defence it did not
+  have — because the correct helper was game-private in a file it had not merged. The two met in a
+  clean auto-merge, `verify` was green, and the wrong gate shipped. The count of IMPLEMENTATIONS is
+  still two, so the rule above stands; but the failure mode it guards against is no longer
+  hypothetical, and the reason it happened is precisely that the safe version was not reachable from
+  the engine surface everyone reads.
+
 - ⚠️ **`keys()` cannot see a rejected DELETE — use `pendingKeys()`, not `keys().filter(hasPendingWrite)`.**
   `delete(key)` removes the key from `cache` (and so from `keys()`) in the same call that marks it
   `dirty`, so a key with a rejected `backend.remove()` is dirty and simultaneously absent from every
