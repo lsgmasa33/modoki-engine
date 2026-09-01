@@ -53,8 +53,13 @@ let nextActivationId = 1;
 const managers = new Map<string, Entry>();
 /** The scene whose scene-scoped managers are currently active. */
 let activeScenePath = '';
-/** The game whose game-scoped managers are currently active (null = no game,
- *  e.g. the menu / a prefab-edit world). Set by `initGameManagersFor`. */
+/** The game whose game-scoped managers are currently active. TWO writers, and the
+ *  second one is the whole of #539: `initGameManagersFor` sets it on success, and
+ *  `disposeActiveGameManagers` CLEARS it at its own head. So `null` carries two
+ *  meanings — "no game" (the menu, a prefab-edit world) and "a game teardown is in
+ *  flight" — and both readers below want the same answer for either: do not
+ *  auto-activate, and re-init on the next real game. A marker written only on
+ *  success is exactly the defect #539 fixed; do not restore that. */
 let activeGameId: string | null = null;
 
 function sceneMatches(def: ManagerDef, scenePath: string): boolean {
@@ -158,7 +163,8 @@ export function unregisterManagers(names: string[]): void {
  *  must survive this sweep. An entry unregistered during the await is already
  *  inactive (`unregisterManager` deactivated it), so the snapshot skips it.
  *
- *  ⚠️ Known residual, stated rather than fixed: a `registerManager` landing INSIDE
+ *  ⚠️ Known residual, stated rather than fixed (tracked as #554 — the same shape
+ *  #539 fixed one tier up, on `activeGameId`): a `registerManager` landing INSIDE
  *  the await activates against `activeScenePath`, which is still the OUTGOING
  *  scene (only `initSceneManagersFor` moves it, and SceneManager runs that after
  *  this) — so that manager belongs to the outgoing scene yet survives this sweep.
@@ -203,16 +209,39 @@ export function getActiveGameId(): string | null {
  *  when the active game is *changing*, just before the old world is destroyed
  *  (pass that old world via `ctx`). App- and scene-scoped managers are untouched.
  *
+ *  Clears `activeGameId` SYNCHRONOUSLY at the head, before the entry-collection
+ *  loop and before any await (#539, the #516 pattern one layer down: a marker
+ *  written only on success — `initGameManagersFor` — was read during a teardown
+ *  that started earlier). Without this, `getActiveGameId()` kept answering the
+ *  OUTGOING game for the whole await below, which had two bad readers:
+ *  `registerManager` would auto-activate a newly-registered manager against the
+ *  dead game (into a world about to be destroyed), and a re-entrant `loadScene`
+ *  back to the outgoing game mid-teardown would compute `gameChanged === false`
+ *  and skip `initGameManagersFor` entirely, permanently deactivating that game's
+ *  managers. Clearing it here closes both: `registerManager` now sees null and
+ *  defers activation to `initGameManagersFor`'s own sweep, and a re-entrant load
+ *  can see `gameChanged === true` and re-init.
+ *
+ *  ⚠️ **"can", not "will" — the second half is closed only for a load that NAMES its
+ *  game.** `SceneManager` computes `nextGameId` as `gameIdFromScenePath(path) ??
+ *  getActiveGameId()` and compares it against `getActiveGameId()`, so when the path
+ *  yields no game id the fallback makes `gameChanged` false by construction, before
+ *  and after this change alike. That covers the app shell (always passes
+ *  `opts.gameId`) and the editor, but NOT `NavigationManager.loadScene`, which passes
+ *  none — and in a shipped web build the resolved path is a hashed asset URL that
+ *  `gameIdFromScenePath` returns null for. Such a load is no worse off than before
+ *  the fix (it was equally stuck), and is now strictly more recoverable: the next
+ *  load that does name its game re-inits, where a stale id made that false forever.
+ *
  *  Awaits any in-flight game-manager init first, mirroring
  *  `disposeActiveSceneManagers`, so a manager whose async init is still running
  *  is never disposed half-initialized.
  *
  *  Same activation-token snapshot as `disposeActiveSceneManagers` — see its
  *  comment: a manager (re)activated during the await belongs to the incoming
- *  game, not the outgoing one. (The SceneManager `gameChanged`/`activeGameId`
- *  ordering bug tracked as TODO(#435-residual) there is a separate defect —
- *  not this one.) */
+ *  game, not the outgoing one. */
 export async function disposeActiveGameManagers(ctx?: ManagerContext): Promise<void> {
+  activeGameId = null;
   const owned: Array<[Entry, number]> = [];
   const pending: Promise<void>[] = [];
   for (const entry of managers.values()) {

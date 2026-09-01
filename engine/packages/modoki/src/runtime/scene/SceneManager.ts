@@ -1334,12 +1334,16 @@ class SceneManagerImpl implements SceneManager {
 
       // Reset the registry's active scope state so a subsequent loadScene (or a
       // post-teardown registerManager) doesn't see a stale activeGameId /
-      // activeScenePath. managerRegistry exposes no dedicated reset, so drive it
-      // through its existing public surface: initGameManagersFor(null) sets
-      // activeGameId = null and activates nothing (it early-returns on null);
-      // initSceneManagersFor('') sets activeScenePath = ''. The latter can spuriously
-      // (re)activate a scene manager that has no `scenes` filter (matches any path),
-      // so dispose scene managers once more afterward to leave everything inactive.
+      // activeScenePath. `activeGameId` is already null by here — `disposeActive-
+      // GameManagers` (#539) clears it synchronously at its own head, before the
+      // await above — so this call's `null` is a no-op restatement for that field;
+      // it still does the real work of clearing `activeScenePath` (managerRegistry
+      // exposes no dedicated reset, so drive it through its existing public
+      // surface: initGameManagersFor(null) activates nothing, it early-returns on
+      // null; initSceneManagersFor('') sets activeScenePath = ''). The latter can
+      // spuriously (re)activate a scene manager that has no `scenes` filter
+      // (matches any path), so dispose scene managers once more afterward to leave
+      // everything inactive.
       await initGameManagersFor(null, '');
       await initSceneManagersFor('');
       await disposeActiveSceneManagers({ world: oldWorld, scenePath: '' });

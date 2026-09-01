@@ -543,6 +543,12 @@ reintroduces one of these bugs:
 | `registeredGameIdRef` | which game owns registered engine state | **before the first registration** (`registerPostprocessors`), so a boot cancelled part-way is still known to own what it registered |
 | `teardownRef` | a teardown that started but whose destructive half is unfinished, plus its promise | before the teardown's first await; cleared when `clearAppServices()` has run |
 
+**The same rule holds one layer down, in the manager registry (#539).** `managerRegistry`'s own
+`activeGameId` had this exact defect — written only by `initGameManagersFor`, i.e. only on success,
+while `disposeActiveGameManagers` began the teardown several awaits earlier — and is now cleared at
+that teardown's head for the same reason this ref is. Mechanism and the one case it does not close:
+[managers-and-systems.md](managers-and-systems.md) § "Scope: three tiers".
+
 `teardownRef` holds the unregister **promise** rather than a boolean so a swap-back JOINS the
 teardown instead of repeating it — and is **cleared if that promise rejects**, because a
 memoized rejection would be re-joined by every later swap and no game would ever boot again

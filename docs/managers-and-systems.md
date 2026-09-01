@@ -127,6 +127,31 @@ lifetimes, each keyed on a different thing:
 | State | reset per scene — **cannot leak** | persists across a game's scenes | persists the whole session |
 | Use for | per-screen controllers, card spawning, **single-scene controllers with an expensive init** (e.g. the chess / llm-test LLM download) | a controller genuinely spanning a game's scenes (e.g. the space-console camera across Station↔Warp) | engine infrastructure (Time, Navigation) and global cross-game actions (return-to-hub) |
 
+**`activeGameId` is cleared when a game teardown STARTS, not just set when one succeeds (#539).**
+`initGameManagersFor` writes it on success, and `disposeActiveGameManagers` clears it to `null` at
+its own synchronous head. So `null` carries two meanings — "no game" (the menu, a prefab-edit
+world) and "a teardown is in flight" — and both readers want the same answer for either: don't
+auto-activate, and re-init on the next real game. Written only on success, it named the outgoing
+game for the whole teardown window, which has real awaits in it (`fireSceneCallbacks` among them):
+`registerManager` would activate a newly-registered manager into a world about to be destroyed, and
+a re-entrant `loadScene` back to the outgoing game computed `gameChanged === false`, skipped
+`initGameManagersFor`, and left that game running with its game-scoped managers **permanently
+deactivated**. Same rule the app shell's `activeGameIdRef` follows one layer up
+([architecture.md](architecture.md) § the `#516` ref table): *a marker read during teardown cannot
+be written only on success.*
+
+⚠️ **The re-entrant half is closed only for a load that NAMES its game.** `SceneManager` derives
+`nextGameId` as `gameIdFromScenePath(path) ?? getActiveGameId()` and compares it against
+`getActiveGameId()`, so a path yielding no game id makes `gameChanged` false by construction. The
+app shell (always passes `opts.gameId`) and the editor are covered; `NavigationManager.loadScene`
+passes none, and a shipped web build's hashed asset URL derives nothing. Such a load is no worse
+than before the fix, and recovers on the next load that does name its game.
+
+**The scene-scoped twin is a KNOWN residual, deliberately left — tracked as #554.** `activeScenePath` has the same
+shape and `disposeActiveSceneManagers` does *not* clear it — see that function's own doc comment.
+It runs on **every** swap rather than only on a game change, so the symmetric one-liner carries a
+different risk profile and wants its own change.
+
 **Why `game` is keyed on the active game, not on register.** The editor registers
 *every* game's systems up front, so "activate on register" would light up all
 games' game-scoped managers at once — which is how an LLM download once fired just

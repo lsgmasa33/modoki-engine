@@ -334,6 +334,81 @@ describe('managerRegistry', () => {
     expect(getRegisteredManagers().find((s) => s.startsWith('late-g'))).toContain('active');
   });
 
+  // ── activeGameId cleared at teardown head (#539) ────────────────────────────
+  // `disposeActiveGameManagers` used to write `activeGameId` only on the
+  // FOLLOWING `initGameManagersFor` (i.e. never, during its own await), so
+  // `getActiveGameId()` kept answering the OUTGOING game for the whole
+  // teardown window. Two readers cared: `registerManager` (auto-activates a
+  // newly-registered game-scoped manager against `activeGameId`) and a
+  // re-entrant `loadScene`'s `gameChanged` computation.
+
+  it('a manager registered mid-teardown is NOT auto-activated against the outgoing game', async () => {
+    let resolveInit!: () => void;
+    const initGate = new Promise<void>((r) => { resolveInit = r; });
+
+    await initGameManagersFor('space-console', '/games/space-console/scenes/Station.json');
+    // An in-flight async init on an already-active manager holds the dispose
+    // sweep's await open, giving us a window to register during teardown.
+    registerManager({
+      name: 'slow',
+      scope: 'game',
+      games: ['space-console'],
+      init: async () => { await initGate; },
+    });
+
+    const disposed = disposeActiveGameManagers();
+
+    // Registered WHILE the dispose above is still awaiting — matches the game
+    // being torn down.
+    const lateInit = vi.fn();
+    registerManager({ name: 'late', scope: 'game', games: ['space-console'], init: lateInit });
+    expect(lateInit).not.toHaveBeenCalled(); // must not activate against the dying game
+
+    resolveInit();
+    await disposed;
+
+    // The assertion that actually matters: registering mid-teardown DEFERS
+    // activation rather than losing it. `lateInit` not having fired proves
+    // nothing on its own — the sweep's `owned` snapshot excludes it either
+    // way, fix or no fix. What the doc comment above promises is that the
+    // NEXT `initGameManagersFor` for the same game picks it up.
+    await initGameManagersFor('space-console', '/games/space-console/scenes/Station.json');
+    expect(lateInit).toHaveBeenCalledOnce();
+  });
+
+  it('getActiveGameId() is null once teardown has begun, and a re-entrant initGameManagersFor re-activates', async () => {
+    let resolveInit!: () => void;
+    const initGate = new Promise<void>((r) => { resolveInit = r; });
+
+    const initA = vi.fn();
+    registerManager({ name: 'a-mgr', scope: 'game', games: ['A'], init: initA });
+    await initGameManagersFor('A', '/games/A/scenes/S.json');
+    expect(initA).toHaveBeenCalledOnce();
+    expect(getActiveGameId()).toBe('A');
+
+    // Hold the sweep open via a second in-flight init.
+    registerManager({ name: 'slow', scope: 'game', games: ['A'], init: async () => { await initGate; } });
+    const disposed = disposeActiveGameManagers();
+
+    expect(getActiveGameId()).toBeNull(); // cleared synchronously at the head, before the await
+
+    resolveInit();
+    await disposed;
+    expect(getActiveGameId()).toBeNull();
+
+    // A re-entrant A→B→A load would compute gameChanged = 'A' !== getActiveGameId().
+    // With activeGameId cleared, that is true, so SceneManager calls
+    // initGameManagersFor('A', ...) again — it must actually re-activate.
+    // NOTE: this tail drives the registry directly (`initGameManagersFor`, not
+    // `SceneManager.loadScene`) — it does not exercise the `gameChanged`
+    // computation itself. That seam is covered by the real `SceneManager`
+    // integration test in sceneManagerGameTeardown.test.ts ('#539: a re-entrant
+    // loadScene back to the outgoing game re-activates its game-scoped manager').
+    await initGameManagersFor('A', '/games/A/scenes/S.json');
+    expect(initA).toHaveBeenCalledTimes(2);
+    expect(getActiveGameId()).toBe('A');
+  });
+
   // ── activation-token re-use (SAME entry, not a new one) ─────────────────────
   // The two tests above prove the OWNED-ARRAY snapshot excludes a brand-new
   // entry activated during the await. They can't tell "the entry reference
