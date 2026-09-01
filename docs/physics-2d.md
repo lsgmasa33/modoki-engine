@@ -516,6 +516,11 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
 - **Init once at boot:** `await RAPIER.init()` before the pipeline's first run (app boot path; a
   global `beforeAll` in tests). Physics system no-ops until the module reports ready — same gate
   pattern as PixiJS `onInit`.
+- **`initRapier2D`/`initRapier3D` memoize the WASM init in a single-slot `initPromise`, and the
+  slot is CLEARED on failure so a transient import/init error can be retried** — a successful init
+  stays memoized forever, because `initPromise` itself is the memoization and there is no separate
+  ready-check short-circuit at the call site. Same class as #522 (`sharedRegistry.ts`); see the
+  `.catch` in `rapierLoader.ts`/`rapier3DLoader.ts` for the rationale rather than restating it here.
 - **Per-koota-World Rapier world:** the Rapier world is keyed by the **koota World** in a module
   `Map`, created lazily on the first physics tick. `SceneManager` creates a **fresh koota world per
   scene load** and destroys the old one, so the physics world is effectively scene-scoped for free.

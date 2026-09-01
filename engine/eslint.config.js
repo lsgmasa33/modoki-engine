@@ -32,7 +32,7 @@ const L1_FOLDERS = ['traits'];
  *  bucket into these (and the other feature folders below); `systems/` no longer exists. */
 const L2_FOLDERS = [
   'animation', 'audio', 'iap', 'input', 'particles', 'physics', 'rendering',
-  'skinning', 'storage', 'timeline', 'ui', 'zones',
+  'skinning', 'storage', 'sync', 'timeline', 'ui', 'zones',
 ];
 const L3_FOLDERS = ['actions', 'assets', 'debug', 'harness', 'loaders', 'managers', 'ota', 'scene', 'store'];
 

@@ -86,7 +86,7 @@ entries) can't strand an owner.
 **Editor live-preview caches** (particle defs in `particleCache.ts`) are plain data, cleared via
 `clearParticleCache()` from `disposeAllCachedResources()` on full teardown.
 
-### The mid-load release window (#488, #520)
+### The mid-load release window (#488, #520, #552)
 
 `acquireModel`/`acquireMesh` both add the caller's `sceneId` owner **before** awaiting their load
 (`loadModelTemplates`/`fetchMeshAsset`), so the owner is visible to a concurrent
@@ -96,9 +96,9 @@ cached — after which the resumed load repopulates the cache with owner-less ge
 will ever release again (`invalidateModel` doesn't bump `cacheGeneration`, only wholesale teardown
 does, so `loadModelTemplates`'s generation guard doesn't catch this).
 
-Three sites were suspected under #488; only one is fixed. **#520 then found the window was not
-specific to geometry** — the same shape existed for two more resource KINDS, and both are now
-fixed. What made it easy to miss: the `cacheGeneration` guards inside the loaders read as if they
+Three sites were suspected under #488; only one was fixed then, and a fourth was found later
+(#552). **#520 then found the window was not specific to geometry** — the same shape existed for
+two more resource KINDS, and both are now fixed. What made it easy to miss: the `cacheGeneration` guards inside the loaders read as if they
 already covered this. They do not, and the comment on the GLB one said so in as many words ("teardown
 / scene-swap") until #520 corrected it. **Only `disposeAllCachedResources` bumps that counter;
 `releaseAllForScene` never does.** So a generation check is not a substitute for an owner check, and
@@ -136,20 +136,32 @@ a site that has only the former is unguarded.
   `fetchPrefab`'s `finally` has already cleared `prefabLoadPromises` by the time the guard runs, so
   there is no stale promise left to short-circuit the next fetch.
 
-- **Won't-fix — `acquireMesh`'s transitive model window.** `acquireMesh` adds its own MESH owner
-  before its await and already guards that window (the `:1552`-area check). But it also
-  transitively adds a MODEL owner — for the `.glb` the mesh references — **after** its own await,
-  inside a second, nested await (`loadModelTemplates` for the model). A release landing in that
-  inner window can strand owner-less model geometry the same way site 2 could. The safe variant of
-  this guard would need to check whether the GLOBAL owner set for that model path is empty (not
-  just this mesh's), because by the time the inner await resumes, no ordering guarantee ties this
-  mesh's own release to another concurrent acquirer's owner-add the way `acquireModel`'s guard could
-  rely on — so it would fire essentially never, at real cost in code complexity and cognitive load,
-  for the sake of covering an already-bounded leak. The orphaned model self-heals: `loading` retains
-  its resolved promise for the model path, so the NEXT `acquireModel`/`acquireMesh` for that path
-  reuses the cached, owner-less entry and re-adopts it under a fresh `sceneId` rather than
-  re-fetching — the leak is a bounded window, not a permanent one, and a fix riskier than the defect
-  it prevents was declined.
+- **Fixed (#552) — `acquireMesh`'s transitive model window.** `acquireMesh` adds its own MESH owner
+  before its await and guards that window. But it also transitively adds a MODEL owner — for the
+  `.glb` the mesh references — and then awaits `loadModelTemplates` for it. A release landing in
+  that inner window strands owner-less model geometry the same way site 2 could. It now carries the
+  same `!has` + `!size` guard as `acquireModel`, re-seating the LOD snapshot before `invalidateModel`
+  and deleting it after (the snapshot is what lets `invalidateModel` find LOD siblings without the
+  manifest; `releaseModelByPath` deletes it mid-await, and the pre-await re-seat at the top of the
+  block cannot restore it).
+
+  **This bullet said "won't-fix" until #552, on two arguments that did not survive being tested.**
+  The first was that the guard "would fire essentially never" because it must check whether the
+  GLOBAL owner set is empty rather than just this mesh's — but that global check IS `!size`, the
+  same condition `acquireModel` already uses, and a test that holds `loadModelTemplates` open and
+  releases the scene inside it fires the guard on the first try, on both the single-model and the
+  LOD path.
+
+  The second argument was that the leak self-heals: `loading` retains its resolved promise, so the
+  NEXT `acquireModel`/`acquireMesh` for that path re-adopts the owner-less entry under a fresh
+  `sceneId` instead of re-fetching. **That mechanism is real — but it bounds nothing on its own.**
+  It heals only a path that is acquired again; a model whose scene aborted mid-parse and is never
+  loaded again keeps its geometry resident for the process lifetime, freeable by nothing, because
+  `releaseAllForScene` iterates owner maps and there is no owner to find. "Bounded window" was true
+  of the paths that recur and false of the ones that do not, and the distinction is invisible in
+  `getResourceStats()`, which counts owners only — the leak reads as zero there, which is why it
+  went unmeasured for so long. Assert on residency (`getTemplatesForModel`, `getModelHierarchy`)
+  when testing this class.
 
 - **Working as designed — the F6 sync render-path resolver.** The synchronous render path resolves
   a `meshAssetCache` entry directly (not through `acquire*`) to avoid re-fetching every frame; this

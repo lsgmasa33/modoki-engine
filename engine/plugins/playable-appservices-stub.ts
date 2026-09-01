@@ -88,6 +88,12 @@ export const auth = {
   async signInWithGoogle() { return PLAYABLE_NO_AUTH; },
   async deleteAuthUser() { return PLAYABLE_NO_AUTH; },
   async currentUser() { return null; },
+  // Close-out R1 (`games/court/runtime/systems.ts`) — the SAME `ok:true, user:null` a playable's
+  // `currentUser()` above answers, in the shape `currentUserResult()`'s callers need: a playable
+  // is never native, so there is no plugin call that could fail here, and "nobody is signed in" is
+  // the only genuine answer — never the deferred `ok:false` a real transient plugin failure would
+  // produce.
+  async currentUserResult() { return { ok: true as const, user: null }; },
   async signOut(): Promise<void> {},
   async onAuthChanged(_cb: unknown): Promise<() => void> { return () => {}; },
   classifyAuthError(_e: unknown) { return 'not-configured' as const; },

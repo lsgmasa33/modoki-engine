@@ -91,6 +91,8 @@ export const UNIT_FIELD_MAPS: Record<string, Record<string, string>> = {
     paddingRight: 'paddingRightUnit', paddingBottom: 'paddingBottomUnit',
     marginTop: 'marginTopUnit', marginRight: 'marginRightUnit',
     marginBottom: 'marginBottomUnit', marginLeft: 'marginLeftUnit',
+    minWidth: 'minWidthUnit', maxWidth: 'maxWidthUnit',
+    minHeight: 'minHeightUnit', maxHeight: 'maxHeightUnit',
   },
   UIAnchor: { top: 'topUnit', right: 'rightUnit', bottom: 'bottomUnit', left: 'leftUnit' },
 };

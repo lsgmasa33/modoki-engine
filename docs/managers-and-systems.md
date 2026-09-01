@@ -96,9 +96,13 @@ passing a real `ctx`.
 
 **`init` may return a promise, but no shipped manager does.** `disposeActiveSceneManagers`/
 `disposeActiveGameManagers` track a returned promise (`Entry.initPromise`) and await it before
-disposing, so an in-flight init is never torn down half-finished, and `initSceneManagersFor`/
-`initGameManagersFor` await it too, so `loadScene` doesn't resolve until init settles. That
-ordering has **no producer today**: every engine manager (`TimeManager`, `NavigationManager`,
+disposing, so an in-flight init is never torn down half-finished; `initSceneManagersFor`/
+`initGameManagersFor` await it too, so `loadScene` doesn't resolve until init settles; and, since
+#518, `registerManager`/`unregisterManager` honour it as well — but by *deferring* rather than
+awaiting, via `deactivateWhenInitSettles`, because both are synchronous public API called from a
+game's `setup.ts` and can't ripple an `await` into every game's setup. (Before #518 they called
+`deactivate()` synchronously and could tear a manager down mid-init.) That ordering has **no
+producer today**: every engine manager (`TimeManager`, `NavigationManager`,
 `physics2DEventsManager`, `physics3DEventsManager`, `zone2DEventsManager`,
 `zone3DEventsManager`, `timelineEventsManager`, `inputSourcesManager`) is synchronous, and the
 two managers doing real async work — `games/chess/runtime/ChessManager.ts` and
@@ -112,6 +116,22 @@ before touching that state, since a scene swap mid-flight can dispose it without
 an entry they own (`Entry.activationId`) before awaiting any pending init, so a manager
 (re)activated *during* that await — belonging to the incoming scene/game — isn't swept into the
 outgoing scene's/game's teardown (#487 item 5).
+
+**The `registerManager`/`unregisterManager` deferral creates a contract worth stating plainly.**
+Manager defs are module-level singletons passed to `registerManager` *by identity*
+(`games/llm-test/runtime/setup.ts`, `games/chess/runtime/setup.ts`,
+`games/space-console/runtime/setup.ts`, `engine/app/ecs/register.ts`), so on a re-register the
+old entry and the new entry share ONE def object. Before #518, `dispose(old)` always ran before
+`init(new)`; now, whenever `initPromise` is non-null, `dispose(old)` runs AFTER `init(new)` has
+already completed — on the SAME instance, tearing down what the successor just built.
+`actionOwner` (keyed on `Entry.activationId`) closes this for UIAction *names* only — a deferred
+teardown releases only the names it still owns, not ones a newer activation has since claimed —
+but nothing guards the manager's own fields or any other named global its `dispose()` releases
+(`LLMManager.dispose()`'s `this.generation++; this.llmService = null; clearMessages()` is exactly
+that shape). **A manager whose `init()` returns a promise must tolerate its own `dispose()`
+running after a successor's `init()` on the same def instance.** Like the ordering above, this
+has no live producer either — the sweep of shipped `ManagerDef`s above still holds — so #518 is
+future-proofing this invariant ahead of the first async `init()`, not fixing an observed bug.
 
 ### Scope: three tiers — scene by default, game and app opt-in
 
@@ -147,10 +167,22 @@ app shell (always passes `opts.gameId`) and the editor are covered; `NavigationM
 passes none, and a shipped web build's hashed asset URL derives nothing. Such a load is no worse
 than before the fix, and recovers on the next load that does name its game.
 
-**The scene-scoped twin is a KNOWN residual, deliberately left — tracked as #554.** `activeScenePath` has the same
-shape and `disposeActiveSceneManagers` does *not* clear it — see that function's own doc comment.
-It runs on **every** swap rather than only on a game change, so the symmetric one-liner carries a
-different risk profile and wants its own change.
+**The scene-scoped twin is an ACCEPTED trade — ruled, not merely unfixed (#554, owner,
+2026-09-01).** `activeScenePath` has the identical shape and `disposeActiveSceneManagers` does
+*not* clear it, so a `registerManager` landing inside its await activates against the OUTGOING
+scene path.
+
+**Why that is not worth the symmetric one-liner, when the game-scoped one was:** the stray manager
+is caught by the very next swap, and — unlike the game tier — there is **no permanent dead state**
+to be caught in. `initGameManagersFor` is gated on `gameChanged`, which is what let a re-entrant
+A→B→A skip re-activation *for the rest of the session*; `initSceneManagersFor` has no such gate and
+re-activates unconditionally on every swap, so the failure self-heals in one swap. Against that,
+the fix would touch the hottest path in the registry (every scene swap in every game, not just a
+game change) and would change the `scenePath` an app-scoped manager's `init()` receives mid-swap
+from the outgoing path to `''` — a contract change for anything reading `ctx.scenePath`.
+
+⚠️ **Do not "complete" #539 by fixing this one without a new ruling.** It looks like an obvious
+loose end, and it is the loose end on purpose.
 
 **Why `game` is keyed on the active game, not on register.** The editor registers
 *every* game's systems up front, so "activate on register" would light up all

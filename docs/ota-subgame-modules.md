@@ -47,6 +47,17 @@ Lazy entries exist so eagerly importing `three/webgpu`/`pixi.js` in the shell do
 register when the shell's own lazy import resolves; `ensure()` forces them for a sub-game that
 declares them as a dependency.
 
+**A failed lazy load can be retried (#522).** `ensure()` memoizes an in-flight load per key in a
+`pending` map so two overlapping callers share one `import()`, and that entry is now cleared when
+the load *settles* (`.finally`), whether it resolved or rejected. Before #522 it was never cleared
+at all — the file held no `pending.delete`/`pending.clear` on any path. That went unnoticed
+because a *resolved* entry is harmless: `modules[key]`, checked first, short-circuits a repeat
+call before the map is ever consulted. So the map only misbehaved on the failure path, where
+one rejected dynamic import (a flaky chunk fetch, a mid-deploy asset swap) stayed memoized for
+the life of the process — every later `ensure()` for that key re-awaited the same dead rejection,
+leaving every sub-game that declares the dep unbootable until an app restart, even though the
+browser itself would have permitted the retry.
+
 **Sub-game side** — classic library-externalization via Rollup, same primitive already used
 in `engine/packages/capacitor-modoki-ota/rollup.config.mjs` (`external` + `output.globals`):
 

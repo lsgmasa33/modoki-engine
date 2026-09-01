@@ -1,29 +1,56 @@
-/** A FAILED Rapier3D WASM load must not poison physics for the rest of the session (#541),
- *  and a load that keeps failing must not retry at frame rate forever, silently (#541 follow-up).
+/** rapier3DLoader.ts — the 3D half of the retry rule `rapierLoaderRetry.test.ts` states for 2D.
  *
- *  Same shape and same rule as `rapierLoaderRetry.test.ts` (the 2D twin) and
- *  `threeLoaderModulesRetry.test.ts` — `initRapier3D()` memoises `initPromise`, and a
- *  rejected one must be dropped rather than kept, or one transient chunk-fetch/init failure
- *  leaves `isRapier3DReady()` false and the same rejection re-firing every tick that sees a
- *  3D body for the rest of the session.
+ *  ⚠️ **Its own file for the reason that one gives: the assertion is about the FIRST import of the
+ *  module**, so a sibling test resolving the loader first would memoise success and make this
+ *  vacuous. The 2D file cannot simply grow a 3D `describe` for the same reason.
  *
- *  The follow-up trap: dropping the memo unconditionally makes a PERMANENT failure re-enter
- *  the dynamic `import()` on every tick forever, with the rejection handled silently — physics
- *  dies with zero console output. So retries are capped at `RAPIER_INIT_MAX_ATTEMPTS`, each
- *  rejection warns, and the terminal one errors loudly exactly once.
+ *  A failed WASM import/init must not poison `initPromise` for the rest of the process: before the
+ *  fix it was assigned once and never reset, so one flaky dynamic import (a network blip, a
+ *  mid-deploy asset swap) memoised the REJECTION and every later `initRapier3D()` re-awaited the
+ *  same dead promise forever — 3D physics dead for the session even though the browser would
+ *  happily retry. Reset lives in a `.catch` (not `.finally`) so a failed attempt retries while a
+ *  SUCCESSFUL init stays memoised; `initPromise` IS the memo, there is no separate ready-check.
  *
- *  This lives in its OWN file so the assertion is about the FIRST import of the module — a
- *  sibling test resolving it first would memoise success and make this vacuous. Each `it` here
- *  gets its OWN fresh loader module AND its own freshly (re-)mocked `@dimforge/rapier3d-compat`
- *  via `vi.doMock` + `vi.resetModules()` — `vi.resetModules()` alone does not force a module
- *  that already resolved successfully in an earlier test to re-run its (mocked) import.
+ *  Both halves of the rule are pinned here: the RESET (a transient failure retries) and the CAP
+ *  (#541's `RAPIER_INIT_MAX_ATTEMPTS`, so a PERMANENT failure stops re-entering `import()` on every
+ *  tick and says so loudly exactly once). #541's follow-up landed on `main` covering 2D only; the
+ *  3D loader carries the identical code and had nothing pinning it until this file.
  */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-import { describe, it, expect, vi } from 'vitest';
+beforeEach(() => {
+  vi.resetModules();
+});
 
-/** Fresh loader module + a freshly (re-)mocked rapier3d-compat that fails while
- *  `calls <= failUntilCall`, then succeeds. Returns a `calls()` accessor so each test can
- *  assert on ITS OWN import count without cross-test pollution. */
+describe('initRapier3D — retry after a failed import/init', () => {
+  it('rejects on first failure, retries and succeeds on second call, memoizes after success', async () => {
+    let calls = 0;
+    // See `rapierLoaderRetry.test.ts` for why the failure is decided fresh inside `mod.init()`
+    // on every call, rather than at the (cached, single-eval) import() factory.
+    vi.doMock('@dimforge/rapier3d-compat', () => ({
+      default: { init: vi.fn(() => { calls++; return calls === 1 ? Promise.reject(new Error('network blip')) : Promise.resolve(); }) },
+    }));
+    vi.doMock('../../src/runtime/core/warnSuppress', () => ({
+      beginSuppressRapierInitWarning: vi.fn(),
+      endSuppressRapierInitWarning: vi.fn(),
+    }));
+
+    const { initRapier3D, isRapier3DReady } = await import('../../src/runtime/physics/rapier3DLoader');
+
+    await expect(initRapier3D()).rejects.toThrow('network blip');
+    expect(isRapier3DReady()).toBe(false);
+
+    await expect(initRapier3D()).resolves.toBeUndefined();
+    expect(isRapier3DReady()).toBe(true);
+    expect(calls).toBe(2); // retried — mod.init() ran a SECOND time
+
+    await initRapier3D();
+    expect(calls).toBe(2); // successful init stays memoized — no third init() call
+  });
+});
+
+/** Fresh loader module with a mock that fails the first `failUntilCall` imports — mirrors
+ *  `rapierLoaderRetry.test.ts`'s helper of the same name, against the 3D package. */
 async function freshLoader(failUntilCall: number) {
   let calls = 0;
   vi.resetModules();
@@ -36,92 +63,35 @@ async function freshLoader(failUntilCall: number) {
   return { ...mod, calls: () => calls };
 }
 
-describe('rapier3DLoader — a rejected initPromise is not memoised (#541)', () => {
-  it('drops the memo on failure so the next tick retries, and a success stays memoised', async () => {
-    const { initRapier3D, isRapier3DReady, getRapier3D, calls } = await freshLoader(1);
-
-    expect(isRapier3DReady()).toBe(false);
-
-    // Vitest wraps a factory throw in its own "error when mocking a module" message, so
-    // assert on the REJECTION, not on the text (same as threeLoaderModulesRetry.test.ts).
-    await expect(initRapier3D()).rejects.toThrow();
-    expect(isRapier3DReady()).toBe(false);
-
-    await initRapier3D();
-    expect(isRapier3DReady()).toBe(true);
-    expect(getRapier3D()).toBeDefined();
-    expect(calls()).toBe(2); // re-imported exactly once, not on every call
-
-    expect(initRapier3D()).toBe(initRapier3D());
-    await initRapier3D();
-    expect(calls()).toBe(2);
-  });
-
+describe('initRapier3D — the retry CAP (#541 follow-up, 3D half)', () => {
   it('caps retries at RAPIER_INIT_MAX_ATTEMPTS and warns, then errors loudly exactly once', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const { initRapier3D, isRapier3DReady, calls } = await freshLoader(Infinity); // never resolves
 
-      // The caller (physics3DSystem.ts) re-enters `initRapier3D()` on EVERY tick that sees a
-      // body with no backoff of its own — call it more times than the cap.
+      // The caller re-enters on EVERY tick that sees a body, with no backoff of its own — call it
+      // more times than the cap, exactly as the physics system would.
       for (let i = 0; i < 6; i++) {
         await expect(initRapier3D()).rejects.toThrow();
       }
 
-      // Capped: the underlying import factory ran exactly RAPIER_INIT_MAX_ATTEMPTS times, not
-      // once per call (6 calls above, only 3 imports).
-      // ⚠️ MOCK-ONLY NUMBER. In a real browser three attempts against a failing
-      // import() produce ONE module fetch, not three: a failed module fetch is cached per
-      // specifier and re-calling import() issues no further request (measured in Chromium,
-      // WebKit and Firefox — see docs/architecture.md). vitest re-invokes a factory that
-      // threw, which the real loader does not. What this pins is the CAP, not import behaviour.
-
+      // ⚠️ MOCK-ONLY NUMBER, same caveat the 2D file states: in a real browser three attempts
+      // against a failing `import()` produce ONE module fetch, because a failed module fetch is
+      // cached per specifier. vitest re-invokes a factory that threw; the real loader does not.
+      // What this pins is the CAP, not import behaviour.
       expect(calls()).toBe(3);
       expect(isRapier3DReady()).toBe(false);
 
-      // The first two rejections (still under the cap) warn and retry; the third is terminal.
+      // The first two rejections (under the cap) warn and retry; the third is terminal.
       expect(warnSpy).toHaveBeenCalledTimes(2);
       expect(errorSpy).toHaveBeenCalledTimes(1);
       expect(String(errorSpy.mock.calls[0][0])).toMatch(/Rapier3D init failed permanently/);
 
-      // Further calls past the cap must return the SAME memoised rejection — no further
-      // import, no further console.error.
-      await expect(initRapier3D()).rejects.toThrow();
+      // Past the cap the memoised rejection is returned as-is — no further import, no second error.
       await expect(initRapier3D()).rejects.toThrow();
       expect(calls()).toBe(3);
       expect(errorSpy).toHaveBeenCalledTimes(1);
-    } finally {
-      warnSpy.mockRestore();
-      errorSpy.mockRestore();
-    }
-  });
-
-  it('a success after one transient failure still works, and a fresh run gets the full retry budget', async () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      const { initRapier3D, isRapier3DReady, getRapier3D, calls } = await freshLoader(1);
-
-      await expect(initRapier3D()).rejects.toThrow();
-      await initRapier3D();
-      expect(isRapier3DReady()).toBe(true);
-      expect(getRapier3D()).toBeDefined();
-      expect(calls()).toBe(2);
-
-      // One retry under the cap warns once; success means the terminal error never fires —
-      // the failed-attempt counter must not have been left sitting near the cap.
-      expect(warnSpy).toHaveBeenCalledTimes(1);
-      expect(errorSpy).not.toHaveBeenCalled();
-
-      // A later, independent run (a fresh module instance, standing in for the counter having
-      // been reset to 0 on success rather than carried over) gets the FULL retry budget again
-      // rather than being penalised by the earlier transient failure.
-      const fresh = await freshLoader(Infinity);
-      for (let i = 0; i < 3; i++) {
-        await expect(fresh.initRapier3D()).rejects.toThrow();
-      }
-      expect(fresh.calls()).toBe(3); // got all RAPIER_INIT_MAX_ATTEMPTS, not fewer
     } finally {
       warnSpy.mockRestore();
       errorSpy.mockRestore();

@@ -19,6 +19,7 @@ import { spriteEpoch } from '../core/textureRefs';
 import { resolveUIFontFamily, resetFontRefWarnings } from './fontFamilyRef';
 import { scrollSnapChildStyle } from './scrollViewDom';
 import { NO_BEHAVIOR_REQUEST } from '../traits/UIScrollView';
+import { findLengthUnitSuspects, formatLengthUnitWarning, lengthUnitWarningKey } from './lengthUnitWarning';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
 import type { World } from 'koota';
 import type { UIActionBinding } from './bindings';
@@ -167,6 +168,7 @@ function ensureInitialized() {
     // dangling GUID and independently needs the diagnostic (#231).
     resetFontRefWarnings();
     _prevById = new Map(); // drop old-scene refs so they're never reused
+    _warnedLengthUnitMismatches.clear();
     useUITreeStore.setState({ tree: [] });
   });
 }
@@ -177,6 +179,13 @@ function ensureInitialized() {
 const _nodes = new Map<number, UINodeData>();
 const _parentMap = new Map<number, number>();
 const _sortMap = new Map<number, number>();
+
+/** Warned-once guard for `lengthUnitWarning` (#529/#549). This projection re-runs on
+ *  every UI-dirty rebuild, so this dedupes; the key is entity+field+UNITS (see
+ *  `lengthUnitWarningKey`), not the offending values — a resize drag rewrites the
+ *  values on every pointermove, so keying on them re-warned hundreds of times mid-drag.
+ *  Cleared on world swap, same as `_prevById`. */
+const _warnedLengthUnitMismatches = new Set<string>();
 
 // Previous frame's emitted nodes, keyed by entityId. buildTree reconciles the
 // freshly-built tree against this so an entity whose data (and whole subtree) is
@@ -509,11 +518,36 @@ function buildTree(world: World): UINodeData[] | null {
 
       _nodes.set(id, node);
 
+      let attr: any;
       if (_attrMeta && entity.has(_attrMeta.trait)) {
-        const attr = entity.get(_attrMeta.trait) as any;
+        attr = entity.get(_attrMeta.trait) as any;
         node.guid = attr.guid || '';
         _parentMap.set(id, attr.parentId || 0);
         _sortMap.set(id, attr.sortOrder || 0);
+      }
+
+      // #529/#549: width/height default their unit to '%' while minWidth/maxWidth/
+      // minHeight/maxHeight default theirs to 'px' — a relative size clamped by an
+      // unauthored-unit min/max most likely meant to clamp in the SAME relative unit
+      // and instead clamped to a few pixels (Court's `RulesClose`). Deliberately done
+      // HERE, in the tree-build pass, and not in UINode's render: a node inside a
+      // hidden subtree never reaches UINode at all — an `isVisible:false` ancestor's
+      // CHILDREN still get a node built here (this loop skips only `deactivatedEntities`,
+      // per the comment above — `isVisible` hides only that one element's own
+      // renderable) — but UINode's `!node.isVisible` early-return means a render-time
+      // check would silently miss every element inside a closed dialog. That's the
+      // exact #529 case: the How-to-Play dialog is closed until a player opens it. Only
+      // `node` is needed here, not EntityAttributes — kept outside the `attr` block above
+      // so an element that never got attributes still gets checked, falling back to the
+      // raw entity id for its label.
+      if (import.meta.env?.DEV) {
+        for (const suspect of findLengthUnitSuspects(node)) {
+          const key = lengthUnitWarningKey(id, suspect);
+          if (!_warnedLengthUnitMismatches.has(key)) {
+            _warnedLengthUnitMismatches.add(key);
+            console.warn(formatLengthUnitWarning(attr?.name || node.guid || String(id), suspect));
+          }
+        }
       }
     },
   );

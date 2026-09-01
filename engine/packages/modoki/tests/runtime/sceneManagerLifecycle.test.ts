@@ -15,7 +15,7 @@
  *  post-swap resource ownership observable via `getResourceStats()`, so it
  *  swaps `global.fetch` in for its own duration only and restores it after. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { trait } from 'koota';
 import { completeResponse } from '../stubs/assetResponse';
 
@@ -48,12 +48,43 @@ beforeEach(async () => {
   if (meta) (meta as { trait: unknown }).trait = Persistent;
 });
 
+/**
+ * The current test's `getCurrentWorld`, captured so `afterEach` can release the world it leaves
+ * behind.
+ *
+ * ⚠️ **koota caps a PROCESS at 16 worlds, and this file creates at least one per test.** Every
+ * `loadScene` mints one; a swap mints another. Most tests here let the last one live, which was
+ * free while the file was small and stopped being free the moment it grew past the cap — the
+ * failure is `Error: Koota: Too many worlds created. The maximum is 16.` on whichever tests happen
+ * to run 17th onward, so it reads as "these four tests are broken" rather than "the file leaks".
+ *
+ * It surfaced in a MERGE: #518 added four tests on a worker branch while `main` added more to the
+ * same file, each side under the cap alone. Releasing per test is the fix rather than rationing
+ * `it`s, because the next person to add one must not have to know the budget.
+ *
+ * `vi.resetModules()` gives each test its own module graph, so the world module — and therefore
+ * `getCurrentWorld` — is a different instance every time. It has to be captured here, not imported
+ * once at the top.
+ */
+let releaseWorld: (() => void) | null = null;
+
+afterEach(() => {
+  // Best-effort: several tests already destroy their own worlds explicitly (that IS the assertion
+  // in the deferred-teardown cases), and a double destroy must not fail the test that passed.
+  try { releaseWorld?.(); } catch { /* already destroyed by the test itself */ }
+  releaseWorld = null;
+});
+
 async function setup() {
   const scene = await import('../../src/runtime/scene/SceneManager');
   scene.sceneManager.resetForTesting();
   const managers = await import('../../src/runtime/managers/managerRegistry');
   managers.__resetManagersForTesting();
   const world = await import('../../src/runtime/core/ecs/world');
+  releaseWorld = () => {
+    const w = world.getCurrentWorld() as { destroy?: () => void } | null;
+    w?.destroy?.();
+  };
   return { sceneManager: scene.sceneManager, managers, getCurrentWorld: world.getCurrentWorld };
 }
 
@@ -731,5 +762,147 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
       global.fetch = realFetch;
       managers.unregisterManager('mgrA');
     }
+  });
+});
+
+describe('managerRegistry — register/unregister against an in-flight init (#518)', () => {
+  // `deactivateWhenInitSettles` chains several `.then`/`.finally` hops onto the tracked init
+  // promise (see `activate`'s `tracked` and the deferred-teardown `.then`), so a settle needs more
+  // than a couple of bare `await Promise.resolve()` ticks to be observed — spin until it lands.
+  async function flushUntil(pred: () => boolean, maxTicks = 50): Promise<void> {
+    for (let i = 0; i < maxTicks && !pred(); i++) await Promise.resolve();
+    if (!pred()) throw new Error('condition not met after flushing microtasks');
+  }
+
+  it('a re-register does not dispose the previous manager mid-init', async () => {
+    // `registerManager`'s `if (existing) { ...; }` replacement path, and `unregisterManager`, must
+    // honour a pending `init()` the same way disposeActiveSceneManagers / disposeActiveGameManagers
+    // / initSceneManagersFor already do — a manager must never be torn down half-built.
+    const { managers } = await setup();
+    let settleInit: (() => void) | undefined;
+    const hang = new Promise<void>((r) => { settleInit = r; });
+    let initSettled = false;
+    const dispose = vi.fn();
+
+    managers.registerManager({
+      name: 'dup', scope: 'app',
+      init: () => hang.then(() => { initSettled = true; }),
+      dispose,
+    });
+    // The first manager's init is still pending here.
+    expect(initSettled).toBe(false);
+
+    // Re-register the same name while that init is in flight.
+    managers.registerManager({ name: 'dup', scope: 'app', init: () => {}, dispose: vi.fn() });
+
+    // THE ASSERTION: the old manager must not have been disposed while its init was in flight.
+    expect(dispose).not.toHaveBeenCalled();
+
+    settleInit!();
+    await hang;
+    await flushUntil(() => dispose.mock.calls.length > 0);
+
+    // The deferred teardown fires once the init settles.
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('a deferred teardown does not strip the action names a newer manager owns (#518)', async () => {
+    // The guard that makes the obvious fix wrong. `void entry.initPromise.then(() => deactivate(entry))`
+    // resolves AFTER registerManager has already installed a new entry under the same name, and
+    // deactivate() ends with `for (const n of entry.actionNames) unregisterUIAction(n)` — so a naive
+    // deferred teardown on the OLD entry would strip action names the NEW manager now owns, silently.
+    // The fix is ownership-checked via `actionOwner`, keyed by `activationId`.
+    const { managers } = await setup();
+    const { hasUIAction } = await import('../../src/runtime/core/actionRegistry');
+    let settleInit: (() => void) | undefined;
+    const hang = new Promise<void>((r) => { settleInit = r; });
+    const oldDispose = vi.fn(); // marks when the OLD entry's deferred teardown has actually run
+
+    managers.registerManager({
+      name: 'dup2', scope: 'app',
+      actions: { sharedAction: () => 'old' },
+      init: () => hang,
+      dispose: oldDispose,
+    });
+    expect(hasUIAction('sharedAction')).toBe(true);
+
+    // Replace it while its init is still hanging. The new one claims the SAME action name.
+    managers.registerManager({
+      name: 'dup2', scope: 'app',
+      actions: { sharedAction: () => 'new' },
+      init: () => {},
+    });
+    expect(hasUIAction('sharedAction')).toBe(true);
+
+    // Let the OLD manager's init settle — the moment a deferred teardown would fire. Flush until
+    // the OLD entry's dispose has actually run, not just a couple of arbitrary ticks — otherwise a
+    // slow-to-fire deferred teardown could pass this test for the wrong reason (it never happened
+    // in time to be observed).
+    settleInit!();
+    await hang;
+    await flushUntil(() => oldDispose.mock.calls.length > 0);
+
+    // THE ASSERTION: the live manager still owns its action.
+    expect(hasUIAction('sharedAction')).toBe(true);
+  });
+
+  it('unregisterManager defers dispose until a pending init settles, then disposes it', async () => {
+    // The issue names both entry points; REPRO A above only covers registerManager's replace path.
+    const { managers } = await setup();
+    let settleInit: (() => void) | undefined;
+    const hang = new Promise<void>((r) => { settleInit = r; });
+    const dispose = vi.fn();
+
+    managers.registerManager({ name: 'unreg', scope: 'app', init: () => hang, dispose });
+
+    managers.unregisterManager('unreg');
+    // Not yet disposed — its init is still in flight.
+    expect(dispose).not.toHaveBeenCalled();
+
+    settleInit!();
+    await hang;
+    await flushUntil(() => dispose.mock.calls.length > 0);
+
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('a manager with a synchronous init is still disposed immediately (deferral does not become the default)', async () => {
+    const { managers } = await setup();
+    const disposeA = vi.fn();
+    const disposeB = vi.fn();
+
+    managers.registerManager({ name: 'sync', scope: 'app', init: () => {}, dispose: disposeA });
+    // Re-register with a sync init — no `initPromise`, so the old one must go immediately, not on
+    // a microtask.
+    managers.registerManager({ name: 'sync', scope: 'app', init: () => {}, dispose: disposeB });
+    expect(disposeA).toHaveBeenCalledTimes(1);
+
+    managers.unregisterManager('sync');
+    expect(disposeB).toHaveBeenCalledTimes(1);
+  });
+
+  it('the deferred teardown disposes the superseded manager exactly once', async () => {
+    const { managers } = await setup();
+    let settleInit: (() => void) | undefined;
+    const hang = new Promise<void>((r) => { settleInit = r; });
+    const dispose = vi.fn();
+
+    managers.registerManager({ name: 'once', scope: 'app', init: () => hang, dispose });
+    managers.registerManager({ name: 'once', scope: 'app', init: () => {}, dispose: vi.fn() });
+    expect(dispose).not.toHaveBeenCalled();
+
+    settleInit!();
+    await hang;
+    await flushUntil(() => dispose.mock.calls.length > 0);
+
+    // Pin "exactly once", not just "at least once by the time the FIRST call is observed" — a
+    // second dispose landing on a later microtask would still slip past a bare assertion taken
+    // right here. Flush a generous number of additional microtask turns, then a macrotask too
+    // (a stray `.then()`/`setTimeout` hop would otherwise land after this function returns and go
+    // unobserved), before reading the count.
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(dispose).toHaveBeenCalledTimes(1);
   });
 });

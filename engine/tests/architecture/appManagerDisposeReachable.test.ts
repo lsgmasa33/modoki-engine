@@ -342,11 +342,18 @@ function countScannerAccountedRefs(src: string): number {
  *  `implements ManagerDef` directly and IS caught by the class scanner). */
 const NOT_A_MANAGER_DECLARATION: Record<string, { count: number; reason: string }> = {
   'engine/packages/modoki/src/runtime/managers/managerRegistry.ts': {
-    count: 6,
+    count: 5,
     reason:
-      "the registry's own type signatures — `Entry.def`, `sceneMatches`/`gameMatches`/`addActions`/" +
+      "the registry's own type signatures — `Entry.def`, `sceneMatches`/`gameMatches`/" +
       '`registerManager` params, and `registerManagers(defs: ManagerDef[])` — accept/hold a ' +
-      '`ManagerDef`, they do not declare one.',
+      '`ManagerDef`, they do not declare one. ' +
+      // ⚠️ 6 → 5 when #518 met this guard in a merge, and NOT by tuning a number to green:
+      // `addActions` used to be the sixth, taking `(def: ManagerDef)`. #518 changed it to
+      // `(entry: Entry)` so it can read `entry.pendingInit`, which removed the reference. This
+      // guard was written on `main` against the OLD signature while #518 changed it on a worker
+      // branch — each side green alone, red only once merged. That is this allowlist's structural
+      // hazard, not a one-off: it freezes a MEASUREMENT of code another branch is free to change.
+      'ADDING to this count needs the same scrutiny as adding a file — say which reference and why.',
   },
   'engine/packages/modoki/src/runtime/zones/zoneEventBus.ts': {
     count: 1,

@@ -1588,7 +1588,10 @@ export async function acquireMesh(sceneId: SceneId, meshRef: string): Promise<vo
   // MODEL owner, as opposed to its MESH owner above), and it's won't-fix — see
   // docs/scene-loading.md for why. Site 2 (acquireModel's own post-await
   // window) IS fixed, at acquireModel's post-await guard above. Site 3 (the F6
-  // sync render-path resolver) is working-as-designed. All three closed on #488.
+  // sync render-path resolver) is working-as-designed. A fourth window — this
+  // function's OWN transitive-model acquisition below, reached whenever a
+  // release lands inside THAT await rather than this one — is fixed at its own
+  // post-await guard below (#552).
   if (!meshAssetOwners.get(meshPath)?.has(sceneId)) {
     if (!meshAssetOwners.get(meshPath)?.size) meshAssetCache.delete(meshPath);
     return;
@@ -1626,6 +1629,21 @@ export async function acquireMesh(sceneId: SceneId, meshRef: string): Promise<vo
         await Promise.allSettled(lodPaths.map(p => loadModelTemplates(p, undefined, asset.postprocessor || 'none')));
       } else {
         await loadModelTemplates(modelPath, undefined, asset.postprocessor || 'none');
+      }
+
+      // Post-await guard, mirroring acquireModel's (#488 site 2, :1512). releaseAllForScene
+      // is synchronous and can land inside the awaits above; the owner added at :1613 is
+      // gone by the time we resume, and nothing will ever release this sceneId again. Both
+      // conditions are load-bearing — see the note at acquireModel's mirror of this guard.
+      if (!modelOwners.get(modelPath)?.has(sceneId)) {
+        if (!modelOwners.get(modelPath)?.size) {
+          // Re-seat the snapshot releaseModelByPath deleted so invalidateModel finds the
+          // LOD siblings without depending on manifest state.
+          if (lodPaths && lodPaths.length > 0) modelLodSnapshots.set(modelPath, [...lodPaths]);
+          invalidateModel(modelPath);
+          modelLodSnapshots.delete(modelPath);
+        }
+        return;
       }
     }
   }

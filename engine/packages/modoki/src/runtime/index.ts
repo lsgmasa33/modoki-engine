@@ -62,6 +62,16 @@ export {
   type JsonValue, type PlayerPrefsInitOptions, type PlayerPrefsInitResult, type PrefsBackend,
 } from './storage';
 export { createPrefsDocStore, type PrefsDocStore } from './storage/prefsDocStore';
+// The cloud-sync contract (#532) — a game declares its sync-guaranteed groups against this and
+// binds a `GroupStore` per group (`createPrefsDocStore` above is the usual single-key one).
+export {
+  defineSyncGroup, emptyMarks, neverSynced, decideGroup, hasLocalWrites, scopeMarksToAccount,
+  runGroupSync, runCloudSync, resolveGroupFork,
+  type AnySyncGroup, type CloudGroup, type ConflictChoice, type ForkPolicy, type GroupAtomicity,
+  type GroupDecision, type GroupMarks, type GroupOutcome, type GroupStore, type GroupTransport,
+  type LocalGroup, type ResolveForkOptions, type RunSyncOptions, type RunSyncResult,
+  type SyncGroupSpec,
+} from './sync';
 // In-app purchases (#196). `reconcile()` MUST run once per launch before the player can buy
 // anything — it is the recovery pass for a purchase interrupted by a crash or force-close.
 // Generic verbs are prefixed on the way out — the barrel is one flat namespace shared with every

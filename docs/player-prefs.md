@@ -204,6 +204,22 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   irreversible on "is it saved?" must use this; a read-back is self-confirming. Still not an fsync —
   `false` means the platform accepted it, not that it is on the platter.
 
+  ⚠️ **ONE `await flush()` is not enough when anything else in the app also flushes — and Court
+  measured that the hard way (#532 F17).** `drain()` does `const keys = [...dirty]; dirty.clear();`
+  and only THEN awaits the backend, so `dirty` is empty for the whole duration of a batch while
+  every write in it is still in flight — the same qualifier `pendingKeys()` carries below. `flush()`
+  drains at most twice, so a CONCURRENT flush can leave it resolving mid-drain, where
+  `hasPendingWrite` reads `false` for a write the backend is about to reject. A game with any
+  fire-and-forget `void flush()` on its write path has that concurrency by construction (Court's
+  `noteDurableWrite()` fires one after every player write). Measured: a gate written this way
+  credited coins for a REJECTED write and logged nothing.
+
+  **So an irreversible step needs a STABLE point, not a flush: loop `await flush()` until the
+  pending SET stops changing** (compare CONTENTS, not size — a rejected key plus a newly arrived one
+  keeps the size equal), capped rather than unbounded. `doInitBody` in `playerPrefs.ts` already does
+  exactly this for the pre-swap drain, and Court's `flushToStablePoint()` is the second instance.
+  If a third appears, this belongs in the engine rather than in each caller.
+
 - ⚠️ **`keys()` cannot see a rejected DELETE — use `pendingKeys()`, not `keys().filter(hasPendingWrite)`.**
   `delete(key)` removes the key from `cache` (and so from `keys()`) in the same call that marks it
   `dirty`, so a key with a rejected `backend.remove()` is dirty and simultaneously absent from every

@@ -94,6 +94,37 @@ Field groups (representative fields, verified against `UIElement.ts`):
   row) needed 98.95px of a 98.26px row on a short window and drew 4-wide by 7 rows deep. Mixed
   units are only safe where the row COUNT carries no meaning.
 
+  ⚠️ **`min*`/`max*` default to `px` while `width`/`height` default to `%` — and until #549 you
+  could not SEE which.** `minWidth`/`maxWidth`/`minHeight`/`maxHeight` default their unit to
+  `'px'`; `width`/`height` (and every `padding*`/`margin*`) default theirs to `'%'`. So authoring
+  `width: 5.4` beside `maxWidth: 3.5` — the obvious reading being "5.4% wide, never more than
+  3.5% wide" — clamps to 3.5 **pixels**. Nothing errors and the element silently collapses;
+  Court's `RulesClose` shipped that way and drew its label entirely outside itself (#529).
+
+  The defaults are deliberately NOT aligned: of the 50 authored `min*`/`max*` values in the repo
+  that rely on the px default, ~47 are genuinely pixels (`maxWidth: 460`, the `minWidth: 44` tap
+  targets), so flipping them would break the many to rescue the few — and would break scenes
+  authored outside this repo. What was actually broken is that the four `*Unit` companions were
+  read by the renderer (`UINode.tsx`, `canvas2DLayout.ts`) but registered in **no trait metadata**,
+  so the Inspector never showed them and no author could change one; the value fields' tooltips
+  meanwhile asserted "(px)", false at the 114 sites using `vh`/`%`/`vmin`. #549 registered them and
+  added them to `UNIT_FIELD_MAPS`, so they now render inline with their value like every other
+  length. **Every non-px value in the repo predating that was set by an agent or by hand-editing
+  JSON** — a good illustration of the CLAUDE.md rule that a field the renderer reads and the author
+  cannot reach is worse than no field at all.
+
+  A dev-only warning (`runtime/ui/lengthUnitWarning.ts`) now flags an axis sized in a relative unit
+  whose own `min*`/`max*` is left in px at a value `<= 20`. ⚠️ It lives in **`uiTreeStore`'s
+  tree-build pass, not in `UINode`'s render**, and must stay there: `UINodeInner` early-returns on
+  `!node.isVisible` before recursing into children, so a render-time check cannot see inside a
+  closed dialog — which is exactly where the two entities that motivated this warning (Court's
+  `RulesClose`/`RulesLine4`, both inside the How-to-Play dialog) sat unnoticed until #529 reached a
+  device. `tests/runtime/uiTreeLengthUnitWarning.test.ts` pins that by spawning a suspect under a
+  hidden parent. **Both of those entities were fixed on `main` by #529** (which removed their
+  size fields entirely), so a fresh sweep of the corpus now finds **zero live positives** — this
+  warning ships as a **preventative guard for the next one**, not as an active catch.
+
+
   ⚠️ **`fontSize` carries a unit too, since #245 — and it did NOT until then.** It was unitless px
   while every other length had a unit, so an element whose HEIGHT comes from its text could not
   scale while its container could: there was always a viewport size below which such content

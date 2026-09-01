@@ -12,12 +12,18 @@
  *
  *  Animator is the case that surfaced it, but the class is wider — every SoA field
  *  currently absent from its `meta.fields` was at risk on both prefab paths:
- *  `AudioSource.clips` (a whole clip bank), `Renderable2D.orderInLayer`,
- *  `Text3D`/`Text2D.opacity`+`outlineOpacity`, `Time.timeScale`,
- *  `EntityAttributes.editorFolder`, `UIElement.flexWrap` + the four min/max unit
- *  fields, `SpriteAnimator.clip`. All nine are authored values, none runtime
- *  read-back — which is why keying persistence on the schema is right, not merely
- *  more permissive.
+ *  `AudioSource.clips` (a whole clip bank), `Text3D`/`Text2D.opacity`+`outlineOpacity`,
+ *  `Time.timeScale`, `EntityAttributes.editorFolder`, `SpriteAnimator.clip`. All
+ *  are authored values, none runtime read-back — which is why keying persistence on
+ *  the schema is right, not merely more permissive. (`UIElement`'s four min/max unit
+ *  fields — `minWidthUnit`/`maxWidthUnit`/`minHeightUnit`/`maxHeightUnit` — used to be
+ *  in this same "absent from meta.fields" class too; #549 registered them in the
+ *  Inspector, so they are no longer an example here, but this schema-keyed
+ *  persistence is still what carried them safely in the meantime. `Renderable2D.
+ *  orderInLayer`, `VideoPlayer.fadeOutSec` and `UIElement.flexWrap` were three more
+ *  siblings of the same gap — all three registered since, so they too are no longer
+ *  examples of a field missing from `meta.fields`, only of why this schema-keyed
+ *  persistence had to exist in the meantime.)
  *
  *  Live symptom that produced this test (2026-07-31, `games/3d-test/runtime/assets/
  *  scenes/skinned-test.json`): a load→save REMOVED `entities[10](Cone).overrides.1

@@ -367,6 +367,7 @@ export function registerAllTraits() {
       flipY: { type: 'boolean', tooltip: 'Mirror vertically about the pivot' },
       blendMode: { type: 'enum', options: ['normal', 'add', 'multiply', 'screen'], tooltip: 'Compositing mode. add = additive glow (on dark backdrops); multiply = darken; screen = lighten; normal = source-over alpha.' },
       isVisible: { type: 'boolean', tooltip: 'Show this renderer. Independent of the entity on/off (EntityAttributes.isActive, which also cascades to children).' },
+      orderInLayer: { type: 'number', step: 1, tooltip: 'Draw order within the 2D layer (higher = in front).' },
     },
   });
 
@@ -771,6 +772,10 @@ export function registerAllTraits() {
         tooltip: 'Muted video is exempt from the browser autoplay rule; a clip WITH sound needs a user gesture first.',
       },
       volume: { type: 'number', min: 0, max: 1, step: 0.05 },
+      fadeOutSec: {
+        type: 'number', min: 0, step: 0.1,
+        tooltip: 'Seconds of audio fade at the end of a non-looping clip. 0 = a hard cut.',
+      },
       bus: {
         type: 'enum', options: ['master', 'music', 'sfx', 'ui'],
         tooltip: 'Mix bus for the video\'s audio track. NOT live — takes effect on a clip change, entity despawn, leaving Play, or a scene swap, not on a clip already playing.',
@@ -1004,6 +1009,7 @@ export function registerAllTraits() {
       // stays LIVE even when anchored — needed to stack a runtime-variable list
       // (leaderboard/inventory) you can't hand-anchor. Do NOT fold back into Layout.
       flexDirection: { type: 'enum', options: ['row', 'column'], tooltip: 'Layout direction for children.\nrow = horizontal, column = vertical', ...S('Child Layout', { sectionDivider: true }) },
+      flexWrap: { type: 'enum', options: ['nowrap', 'wrap'], tooltip: 'Whether children wrap onto additional rows/columns when they no longer fit.', ...S('Child Layout') },
       justifyContent: { type: 'enum', options: ['flex-start', 'center', 'flex-end', 'space-between', 'space-around'], tooltip: 'How children are distributed along the main axis', ...S('Child Layout') },
       alignItems: { type: 'enum', options: ['flex-start', 'center', 'flex-end', 'stretch'], tooltip: 'How children are aligned on the cross axis', ...S('Child Layout') },
       gap: { type: 'number', step: 1, tooltip: 'Space between children', ...S('Child Layout') },
@@ -1061,10 +1067,14 @@ export function registerAllTraits() {
       imageMode: { type: 'enum', options: ['cover', 'contain', 'fill', 'none'], tooltip: 'How the image fills the element', ...S('Image') },
 
       // ── Size Constraints section (collapsed by default) ──
-      minWidth: { type: 'number', step: 1, tooltip: 'Minimum width (px). 0 = none', ...S('Size Constraints', { sectionDefaultOpen: false }), sectionDivider: true },
-      maxWidth: { type: 'number', step: 1, tooltip: 'Maximum width (px). 0 = none', ...S('Size Constraints') },
-      minHeight: { type: 'number', step: 1, tooltip: 'Minimum height (px). 0 = none', ...S('Size Constraints') },
-      maxHeight: { type: 'number', step: 1, tooltip: 'Maximum height (px). 0 = none', ...S('Size Constraints') },
+      minWidth: { type: 'number', step: 1, tooltip: 'Minimum width, in minWidthUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints', { sectionDefaultOpen: false }), sectionDivider: true },
+      minWidthUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for minWidth. Default px.', ...S('Size Constraints') },
+      maxWidth: { type: 'number', step: 1, tooltip: 'Maximum width, in maxWidthUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints') },
+      maxWidthUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for maxWidth. Default px.', ...S('Size Constraints') },
+      minHeight: { type: 'number', step: 1, tooltip: 'Minimum height, in minHeightUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints') },
+      minHeightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for minHeight. Default px.', ...S('Size Constraints') },
+      maxHeight: { type: 'number', step: 1, tooltip: 'Maximum height, in maxHeightUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints') },
+      maxHeightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for maxHeight. Default px.', ...S('Size Constraints') },
 
       // ── Margin section (collapsed by default) ──
       marginTop: { type: 'number', step: 1, tooltip: 'Outer spacing top', ...S('Margin', { sectionDefaultOpen: false }) },

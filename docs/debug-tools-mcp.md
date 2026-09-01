@@ -365,6 +365,48 @@ dead port forever, and the claim is still held so no sibling clone can take the 
 Reclaiming a forward belongs to whoever OWNS the session — `disconnect()` already does it for its
 own — never to a stale continuation.
 
+**`disconnect()`'s teardown order satisfies three pulls at once (#527/#506).** Every write to
+manager state (`client`, `transport`, `target`, `claimedDeviceId`, …) happens **before** the one
+`await client.disconnect()`, so a teardown suspended there can never clobber a newer `connect()`'s
+already-published session — before #527 the nulling ran only after that await resolved, so a
+resumed teardown wiped whatever a newer connect had installed by then, orphaning a lease socket
+`disconnect()` could never reach again (it only ever hangs up `this.client`). The machine-wide
+**claim**, though, is held ACROSS the hangup on purpose — `releaseDevice()` runs only after it. An
+early release would empty the claims file while `DeviceLeaseAuthority` still records this guid as
+live owner, so a sibling passes the #149 claim gate and reaches `{ok:false, reason:'busy'}` —
+documented as needing a human, not a retry — for up to `REQUEST_TIMEOUT_MS` (5s) plus
+`LEASE_GRACE_MS` (5s). Holding the claim instead refuses the sibling at the claim level, naming the
+clone that holds it — the good failure #149 exists to produce. `adbRunner.removeForward` runs
+after the hangup but *before* the claim is handed back: a sibling that re-claimed and re-forwarded
+the same host port to the same serial would otherwise pass `removeForward`'s ownership check, and
+a later removal here would strip its live rule instead of ours.
+
+The release is additionally gated on **ownership**, not merely on holding a claim id:
+`releaseDevice` drops by `(deviceId, pid)`, not by guid, and every `DeviceConnectionManager`
+session in the backend shares one pid — so a stale continuation holding the *old* `claimId` in a
+local can still call `releaseDevice(claimId)` after a newer `connect()` on the same manager has
+re-claimed that same device. `disconnect()` guards this with `this.claimedDeviceId !== claimId`
+(a newer claim → skip), not a generation check — a generation check is wrong here because a second
+bare `disconnect()` (no reconnect after) has its own `claimId` already null and would wrongly skip
+releasing a still-valid claim.
+
+⚠️ **#527's own premise turned out to be wrong, and it is worth recording so it doesn't get
+re-hunted.** The issue blamed the un-gated publish of `this.transport`/`this.client`/`this.target`
+in `connectInner` (before its own `await client.connect()`) — but that shape is already safe: a
+second `connect()` landing while the first is suspended there is handled, because the second's
+head `await this.disconnect()` hangs up the first's mid-handshake client. The real defect was in
+`disconnect()`'s field-write ordering, above. The negative result is pinned as a regression test —
+`deviceConnectionReentrancy.test.ts` › "two racing connect() calls (#527)" › "a second connect()
+landing mid-handshake leaves no orphaned socket" — precisely so this shape does not get
+re-investigated.
+
+Also: `connect()` now **joins** an in-flight identical request rather than starting a second
+attempt (keyed by `connectRequestKey`) — the trigger, per the `sessionGeneration` docblock, is an
+agent retrying a slow `device_connect`. Scoped to an identical request on purpose; a differing
+request (a genuine re-target) still races straight through. The key treats an *omitted*
+`useAdb`/`serial`/`port` as distinct from every explicit value (including explicit `null`/`''`),
+because `connectInner` branches on `=== undefined` for each of those fields.
+
 **When the OPEN PROJECT ships `build.debugBuild: false`, the message says so first (#239)** — that
 flag means no TCP server was compiled in, which explains "nothing is listening" outright, and the
 advice below (reopen the project so heal syncs the flag) *cannot work* while the flag is off,

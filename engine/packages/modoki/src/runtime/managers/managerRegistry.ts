@@ -51,6 +51,11 @@ interface Entry {
 let nextActivationId = 1;
 
 const managers = new Map<string, Entry>();
+/** Which entry's `activationId` currently owns each registered action name.
+ *  `deactivate` only unregisters an action it still owns per this map — a
+ *  deferred teardown (see `deactivateWhenInitSettles`) can resolve after a
+ *  newer entry has already claimed the same name, and must not strip it. */
+const actionOwner = new Map<string, number>();
 /** The scene whose scene-scoped managers are currently active. */
 let activeScenePath = '';
 /** The game whose game-scoped managers are currently active. TWO writers, and the
@@ -72,10 +77,16 @@ function gameMatches(def: ManagerDef, gameId: string): boolean {
   return def.games.includes(gameId);
 }
 
-/** Register a manager's owned actions and return their names. */
-function addActions(def: ManagerDef): string[] {
+/** Register a manager's owned actions and return their names. Records
+ *  ownership by `entry.activationId` so `deactivate` can tell its own
+ *  actions from ones a newer entry has since claimed. */
+function addActions(entry: Entry): string[] {
+  const def = entry.def;
   const names = def.actions ? Object.keys(def.actions) : [];
-  for (const [name, handler] of Object.entries(def.actions ?? {})) registerUIAction(name, handler);
+  for (const [name, handler] of Object.entries(def.actions ?? {})) {
+    registerUIAction(name, handler);
+    actionOwner.set(name, entry.activationId);
+  }
   return names;
 }
 
@@ -83,7 +94,7 @@ function activate(entry: Entry, scenePath: string): void | Promise<void> {
   if (entry.active) return;
   entry.active = true;
   entry.activationId = nextActivationId++;
-  entry.actionNames = addActions(entry.def);
+  entry.actionNames = addActions(entry);
   const r = entry.def.init?.({ world: getCurrentWorld(), scenePath });
   if (r && typeof (r as Promise<unknown>).then === 'function') {
     // Track the in-flight init (errors swallowed here so the tracked promise
@@ -102,10 +113,37 @@ function activate(entry: Entry, scenePath: string): void | Promise<void> {
 function deactivate(entry: Entry, ctx?: ManagerContext): void {
   if (!entry.active) return;
   try { entry.def.dispose?.(ctx); } catch (e) { console.warn(`[managers] dispose failed: ${entry.def.name}`, e); }
-  for (const n of entry.actionNames) unregisterUIAction(n);
+  for (const n of entry.actionNames) {
+    if (actionOwner.get(n) !== entry.activationId) continue; // a newer entry claimed it — not ours to remove
+    actionOwner.delete(n);
+    unregisterUIAction(n);
+  }
   entry.actionNames = [];
   entry.initPromise = null;
   entry.active = false;
+}
+
+/** Tear `entry` down, but never mid-init. `registerManager`/`unregisterManager` are synchronous
+ *  public API called from a game's `setup.ts`, so they cannot `await entry.initPromise` the way
+ *  `disposeActiveSceneManagers` and friends do — they defer instead. Safe to defer only because
+ *  `deactivate` is ownership-checked (see `actionOwner`): by the time this resolves a NEW entry may
+ *  own this entry's action names, and stripping them would silently disarm a live manager.
+ *
+ *  ⚠️ Manager defs are module-level singletons passed by identity, so on a re-register
+ *  `oldEntry.def === newEntry.def`. Deferring this teardown changes WHEN it runs relative to the
+ *  replacement's own init: it used to always run `dispose(old)` before `init(new)`; now, whenever
+ *  `initPromise` is non-null, `dispose(old)` runs AFTER `init(new)` has already completed — on the
+ *  SAME instance, tearing down what the successor just built. `actionOwner` closes this for
+ *  UIAction NAMES only; nothing guards the manager's own fields or any other named global its
+ *  `dispose()` releases. A manager whose `init()` returns a promise MUST tolerate its own
+ *  `dispose()` running after a successor's `init()` on the same def instance — e.g.
+ *  `LLMManager.dispose()` (`this.generation++; this.llmService = null; clearMessages()`). */
+function deactivateWhenInitSettles(entry: Entry, ctx?: ManagerContext): void {
+  const pending = entry.initPromise;
+  if (!pending) { deactivate(entry, ctx); return; }
+  // `pending` is the tracked promise from `activate()`, which swallows its own errors — it never
+  // rejects, so a plain `.then` (no `.catch`) is correct here.
+  void pending.then(() => deactivate(entry, ctx));
 }
 
 /** Register a manager. App-scoped managers activate immediately and stay active
@@ -116,7 +154,7 @@ function deactivate(entry: Entry, ctx?: ManagerContext): void {
 export function registerManager(def: ManagerDef): void {
   const scope = def.scope ?? 'scene';
   const existing = managers.get(def.name);
-  if (existing) { deactivate(existing); managers.delete(def.name); }
+  if (existing) { deactivateWhenInitSettles(existing); managers.delete(def.name); }
 
   const entry: Entry = { def, scope, active: false, actionNames: [], initPromise: null, activationId: 0 };
   managers.set(def.name, entry);
@@ -139,7 +177,7 @@ export function registerManagers(defs: ManagerDef[]): void {
 export function unregisterManager(name: string): void {
   const entry = managers.get(name);
   if (!entry) return;
-  deactivate(entry);
+  deactivateWhenInitSettles(entry);
   managers.delete(name);
 }
 
@@ -163,8 +201,13 @@ export function unregisterManagers(names: string[]): void {
  *  must survive this sweep. An entry unregistered during the await is already
  *  inactive (`unregisterManager` deactivated it), so the snapshot skips it.
  *
- *  ⚠️ Known residual, stated rather than fixed (tracked as #554 — the same shape
- *  #539 fixed one tier up, on `activeGameId`): a `registerManager` landing INSIDE
+ *  ⚠️ Known residual, and an ACCEPTED one — #554, closed wontfix by owner ruling
+ *  2026-09-01. Same shape #539 fixed one tier up on `activeGameId`, deliberately
+ *  NOT fixed here: `initSceneManagersFor` has no `sceneChanged` gate (its
+ *  game-scoped twin does), so this self-heals on the very next swap instead of
+ *  stranding a scene for the session, and clearing `activeScenePath` here would
+ *  hand a mid-swap app-scoped manager `scenePath: ''`. Don't "complete" #539 with
+ *  it. See docs/managers-and-systems.md. A `registerManager` landing INSIDE
  *  the await activates against `activeScenePath`, which is still the OUTGOING
  *  scene (only `initSceneManagersFor` moves it, and SceneManager runs that after
  *  this) — so that manager belongs to the outgoing scene yet survives this sweep.
@@ -302,6 +345,7 @@ export function getRegisteredManagers(): string[] {
 export function __resetManagersForTesting(): void {
   for (const entry of managers.values()) deactivate(entry);
   managers.clear();
+  actionOwner.clear();
   activeScenePath = '';
   activeGameId = null;
 }
