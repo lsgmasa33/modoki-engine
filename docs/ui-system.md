@@ -253,6 +253,38 @@ escape hatch for a rapid-fire button. A safety valve, `inputLockMaxMs` (default 
 force-releases a lock that outlives it and `console.warn`s the still-pending action(s), so
 a hung async handler can't brick the UI permanently.
 
+**The completion gate is a silent opt-in, and that is arguably why #530 went unnoticed.**
+It works by duck-typing a `call` handler's return value (`trackLockPromise`) — only a
+thenable holds the lock open. A game whose handlers are synchronous wrappers (Court's
+`registerUIAction(name, () => fireTap(target))`, returning `void`) gets nothing from it:
+no error, no warning, no failing test — the lock just falls back to the `inputLockMinMs`
+floor as if the handler had always been instant.
+
+**A third gate (#530): a registered busy predicate.** `registerUIBusySource(name, isBusy)`
+(`runtime/core/uiBusySources.ts`, re-exported from the runtime barrel) lets a game tell the
+lock that some asynchronous state it owns should keep input blocked, without rewriting its
+handlers to return promises. It is a predicate the engine ASKS at activation time, not a
+`begin`/`end` pair the game TELLS — a push/pop scope leaks if the operation throws between
+the two calls, and Court's `beginSignIn` is a bare fire-and-forget async IIFE with no
+`finally`, so a throw between `begin` and `end` would have bricked every button in the game
+until its own 60s watchdog finally fired. `isInputLockActive` consults this gate first, even
+when no lock is currently held — the busy period can start outside any UI activation at all
+(a sign-in flow kicked off from a menu button, not a chrome tap).
+
+**It carries its own safety valve, mirroring `inputLockMaxMs`**, because a predicate stuck
+true would otherwise brick input forever — the exact failure the lock's own valve exists to
+prevent. A throwing predicate degrades to "not busy" and logs once per throwing call, so one
+bad game-side read can't starve input either.
+
+**The valve measures OBSERVED busy time, not wall-clock busy time**, because
+`isInputLockActive()` is only ever called from a discrete UI activation — it can only credit
+busy time it actually watched. A gap since the last observation longer than `inputLockMaxMs`
+means there is no evidence busy was continuous across it, so the window restarts instead of
+crediting time nobody watched (crediting it silently force-released an unrelated *later*
+operation under the previous approach — the bug this replaced). The consequence: a user
+retrying at a normal cadence trips the valve fine, but retries spaced further apart than
+`inputLockMaxMs` restart the window each time — so the rescue is **delayed, never denied**.
+
 A **continuous** event stream passes `continuous: true` to `applyBindings` and is exempt both
 ways: it neither takes nor respects the lock. Two streams qualify, not one: a range slider's
 `change` (fires on every pixel of drag — locking it would freeze the slider mid-drag) and a
@@ -1726,6 +1758,7 @@ verified against the game's `game.ts`/`runtime/setup.ts` and `app/App.tsx`.)
 | Selector hook | `runtime/ui/useUIEntities.ts` |
 | Action registry + engine built-ins | `runtime/core/actionRegistry.ts`, `runtime/actions/engineActions.ts` |
 | Global input lock + its authored settings | `runtime/ui/bindings.ts` (`applyBindings`), `runtime/traits/UISettings.ts` |
+| UI-busy-source registry (the lock's third gate) | `runtime/core/uiBusySources.ts` (`registerUIBusySource`) |
 | Binding resolver | `runtime/ui/bindingResolver.ts` |
 | Anchor math | `runtime/ui/anchorLayout.ts` |
 | Focus nav (trait / system / manager) | `runtime/traits/UIFocusable.ts`, `runtime/ui/uiFocusSystem.ts`, `runtime/ui/focusManager.ts` |

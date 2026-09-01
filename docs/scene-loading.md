@@ -1111,7 +1111,8 @@ single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistenc
    mid-tail (see step 1) would otherwise rewrite the module-global
    `activeScenePath`/`activeGameId` back to ITS OWN path and spawn manager entities
    into the OTHER call's now-active world — unowned there, and never disposed. A
-   superseded load skips the tail and resolves without running it.
+   superseded load skips just this re-activation half of the tail; dispose/release/
+   destroy (below) still run unconditionally either way.
 
    The guard is a `primaryId` comparison rather than the `AbortController` used by
    the pre-swap checks above, because `nextLoad` (and the abort path with it) is
@@ -1131,6 +1132,56 @@ single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistenc
    current — identical to the ordinary in-game-swap outcome, since game managers
    survive in-game swaps by design.
 
+   **Teardown vs. a racing load — unload wins (#535).** `unloadAll()` is
+   authoritative: a `loadScene()` that races it must never win, and must never
+   silently resolve having actually lost. Two mechanisms cover the two ways a
+   teardown can race a load:
+   - **`teardownInFlight`** — a counter (not a boolean, so overlapping
+     `unloadAll()` calls can't clear each other's flag), incremented at
+     `unloadAll()`'s head before any await and decremented in a `finally` after
+     its tail. `loadScene()` checks it FIRST, before doing any work: if
+     non-zero, a teardown already owns the world and the load rejects
+     immediately with an `AbortError`.
+   - **`teardownGeneration`** — bumped at the same head. `loadScene()` captures
+     it at entry and compares the current value against the captured one at
+     every checkpoint, catching a teardown that starts (or starts and fully
+     settles) while the load is already mid-flight.
+
+   **Pre-swap and post-swap checkpoints are guarded differently, because past
+   the swap there is nothing left to abort through.** Before step 8, the
+   checkpoints go through `isSuperseded`, which can consult
+   `controller.signal.aborted` because the load is still `this.nextLoad` and
+   `unloadAll()` aborts it directly (step 1's mechanism). ⚠️ In fact, PRE-swap,
+   `controller.signal.aborted` is the ONLY arm of `isSuperseded` that can
+   currently fire — a pre-swap load always owns `this.nextLoad` (it relinquishes
+   that only at the swap, and a newer load aborts the controller before
+   overwriting it), so wherever the generation comparison could differ here, the
+   abort has already happened first. The generation half of `isSuperseded` is
+   kept as defence-in-depth for if that `nextLoad` invariant ever changes, not
+   because it is doing live work today (mutation-confirmed: gutting
+   `isSuperseded` to `return controller.signal.aborted;` leaves every lifecycle
+   test green). After the swap, `nextLoad` is cleared (see step 1's note above)
+   — the `AbortController` is no longer reachable by anything — so the four
+   post-swap checkpoints use `isPostSwapSuperseded` instead, which reads
+   `teardownInFlight` and `teardownGeneration` directly. THERE the generation
+   half is genuinely load-bearing, not redundant with the counter: it is the
+   only thing that catches an `unloadAll()` that starts AND fully completes
+   inside one of the post-swap awaits, by which point the counter is already
+   back at zero.
+
+   **A post-swap supersede latches and rejects at the end; it does not skip the
+   tail's own work.** Hitting `isPostSwapSuperseded` only sets a
+   `postSwapSuperseded` flag, checked once the tail finishes — the dispose/
+   release/destroy work above still runs unconditionally (it acts on the OLD
+   world and path, which no newer load touches), and the `primaryId === id`
+   guard still separately decides whether re-activation runs. What changes is
+   only what the caller is told: the load rejects with an `AbortError` instead
+   of resolving, because the swap it thought it won has since been wiped by
+   `unloadAll()`'s own unconditional tail (below).
+
+   **`unloadAll()`'s tail stays unconditional** — that is the ruling, not an
+   oversight: teardown can never be undone by a load that raced in behind it.
+
 On **failure or abort**, the staging world is destroyed and its resources released —
 the current scene (and its whole chain) is left completely untouched.
 
@@ -1147,6 +1198,11 @@ scene's own** per-scene undo history (`swapHistory(scenePath)` — empty on firs
 visit, restored when you return to a previously-open scene), rather than
 dropping undo globally.
 `unloadAll()` and `resetForTesting()` exist for shutdown + deterministic tests.
+`unloadAll()` is also the authoritative "unload wins" side of the #535 race
+described in step 9 above — it bumps `teardownInFlight`/`teardownGeneration` at
+its own head so any `loadScene()` racing it rejects rather than silently
+winning; `resetForTesting()` additionally resets both back to zero so a test
+run starts from a clean slate.
 
 ## Persistent entities
 

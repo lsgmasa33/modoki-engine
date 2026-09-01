@@ -692,6 +692,11 @@ export { registerInputPromptSources } from './input/inputPromptSources';
 // sibling of the game canvas) claims exclusive ownership of pointer gestures that
 // start on it, so `pointerSource` never latches them as a game gesture.
 export { registerPointerBlocker, registerPointerPassthrough, isPointerBlocked } from './core/pointerBlockers';
+// UI-busy sources (#530) — a game registers a predicate once at manager init so the global UI
+// input lock (`runtime/ui/bindings.ts`) can keep blocking discrete activations while game-owned
+// async state (a sign-in, a purchase) is in flight, without every 'call' handler having to return
+// a promise. See `core/uiBusySources.ts` for the full design rationale.
+export { registerUIBusySource } from './core/uiBusySources';
 // Input WATCH (#134) — a game publishes what its OWN hit-test resolved a press to, which is the
 // one thing no engine-side observer can compute for a canvas game. Safe to call unconditionally:
 // it is a no-op until an agent opens a watch window.

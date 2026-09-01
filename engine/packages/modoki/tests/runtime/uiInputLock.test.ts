@@ -17,6 +17,7 @@ import { registerUIAction, unregisterUIAction } from '../../src/runtime/core/act
 import { setPlayState } from '../../src/runtime/core/playState';
 import { UISettings, UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS, UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS } from '../../src/runtime/traits/UISettings';
 import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
+import { registerUIBusySource, clearUIBusySources } from '../../src/runtime/core/uiBusySources';
 
 registerTrait({ name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: {} });
 registerTrait({ name: 'UIElement', trait: UIElement, category: 'component', fields: {} });
@@ -37,6 +38,7 @@ describe('applyBindings input lock', () => {
     setPlayState('playing');
     world.destroy();
     restoreRealClock();
+    clearUIBusySources();
   });
 
   it('swallows a second click on the SAME button inside the window — handler and cue fire once', () => {
@@ -539,6 +541,239 @@ describe('applyBindings input lock', () => {
     } finally {
       unregisterUIAction('test.lockEqual');
       warnSpy.mockRestore();
+    }
+  });
+});
+
+// #530 — a game registers a busy PREDICATE (`core/uiBusySources.ts`) instead of every 'call'
+// handler returning a promise. `applyBindings`' completion gate (`trackLockPromise`) is a silent
+// opt-in: a synchronous wrapper like Court's `() => fireTap(target)` returns `void`, so that gate
+// does nothing for it — only this predicate-based gate can cover a game whose handlers never
+// return anything.
+describe('applyBindings input lock — UI busy sources (#530)', () => {
+  let world: ReturnType<typeof createWorld>;
+
+  beforeEach(() => {
+    world = createWorld();
+    setCurrentWorld(world);
+    setPlayState('playing');
+    setManualNow(0);
+  });
+  afterEach(() => {
+    setPlayState('playing');
+    world.destroy();
+    restoreRealClock();
+    clearUIBusySources();
+  });
+
+  it('a busy source swallows a discrete activation on a DIFFERENT button — the lock is global', () => {
+    let busy = true;
+    registerUIBusySource('test.busy', () => busy);
+    let calls = 0;
+    registerUIAction('test.busyOther', () => { calls += 1; });
+    try {
+      applyBindings(call('test.busyOther'), 'click', { selfGuid: 'btn-other' });
+      expect(calls).toBe(0); // swallowed — busy, even though this action never took the lock itself
+      busy = false;
+      applyBindings(call('test.busyOther'), 'click', { selfGuid: 'btn-other' });
+      expect(calls).toBe(1);
+    } finally {
+      unregisterUIAction('test.busyOther');
+    }
+  });
+
+  it('blocks even with NO preceding activation — no lock has ever been held', () => {
+    registerUIBusySource('test.busyIdle', () => true);
+    let calls = 0;
+    registerUIAction('test.busyIdleAction', () => { calls += 1; });
+    try {
+      // No applyBindings call happened before this one — `lockHeld` is false.
+      applyBindings(call('test.busyIdleAction'), 'click', { selfGuid: 'btn-1' });
+      expect(calls).toBe(0);
+    } finally {
+      unregisterUIAction('test.busyIdleAction');
+    }
+  });
+
+  it('activations work again once the predicate goes false', () => {
+    let busy = true;
+    registerUIBusySource('test.busyToggle', () => busy);
+    let calls = 0;
+    registerUIAction('test.busyToggleAction', () => { calls += 1; });
+    try {
+      applyBindings(call('test.busyToggleAction'), 'click', { selfGuid: 'btn-1' });
+      expect(calls).toBe(0);
+      busy = false;
+      applyBindings(call('test.busyToggleAction'), 'click', { selfGuid: 'btn-1' });
+      expect(calls).toBe(1);
+    } finally {
+      unregisterUIAction('test.busyToggleAction');
+    }
+  });
+
+  it('the disposer actually removes the source — activations work even while the predicate would still return true', () => {
+    const dispose = registerUIBusySource('test.busyDisposed', () => true);
+    let calls = 0;
+    registerUIAction('test.busyDisposedAction', () => { calls += 1; });
+    try {
+      applyBindings(call('test.busyDisposedAction'), 'click', { selfGuid: 'btn-1' });
+      expect(calls).toBe(0);
+      dispose();
+      applyBindings(call('test.busyDisposedAction'), 'click', { selfGuid: 'btn-1' });
+      expect(calls).toBe(1); // the predicate STILL returns true — only disposal freed it
+    } finally {
+      unregisterUIAction('test.busyDisposedAction');
+    }
+  });
+
+  it('safety valve: a predicate stuck true past inputLockMaxMs stops blocking and warns, naming the source', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    registerUIBusySource('test.busyStuck', () => true);
+    let calls = 0;
+    registerUIAction('test.busyStuckAction', () => { calls += 1; });
+    try {
+      // Poll repeatedly, each step well under lockMaxMs apart, so the window is actually
+      // OBSERVED continuously — a single distant re-check can no longer be credited as a
+      // continuous stall (see the gap-restart test below for why).
+      for (let i = 0; i < 5; i += 1) {
+        applyBindings(call('test.busyStuckAction'), 'click', { selfGuid: 'btn-1' });
+        advanceManual(UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS / 5);
+      }
+      expect(calls).toBe(0);
+
+      advanceManual(1); // just past the accumulated max
+      applyBindings(call('test.busyStuckAction'), 'click', { selfGuid: 'btn-1' });
+      expect(calls).toBe(1); // the valve stopped blocking despite the source staying busy
+      expect(warnSpy).toHaveBeenCalled();
+      expect(String(warnSpy.mock.calls[0][0])).toContain('test.busyStuck');
+    } finally {
+      unregisterUIAction('test.busyStuckAction');
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('valve reset: repeated short busy periods, each under inputLockMaxMs, never trip the valve', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let busy = false;
+    registerUIBusySource('test.busyIntermittent', () => busy);
+    let calls = 0;
+    registerUIAction('test.busyIntermittentAction', () => { calls += 1; });
+    try {
+      // Several short busy windows, each well under the max, with idle gaps between them — a
+      // timestamp set once and never reset would accumulate elapsed time ACROSS these windows and
+      // eventually trip the valve even though no single window is anywhere near it.
+      for (let i = 0; i < 5; i += 1) {
+        busy = true;
+        applyBindings(call('test.busyIntermittentAction'), 'click', { selfGuid: 'btn-1' });
+        expect(calls).toBe(i); // swallowed while busy
+        advanceManual(UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS / 2);
+        busy = false;
+        advanceManual(1); // idle tick — resets the busy-since window
+        applyBindings(call('test.busyIntermittentAction'), 'click', { selfGuid: 'btn-1' });
+        expect(calls).toBe(i + 1); // fires normally, no valve involved
+        advanceManual(UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS + 1); // clear the floor for the next round
+      }
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      unregisterUIAction('test.busyIntermittentAction');
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('an UNOBSERVED gap between busy episodes restarts the valve window instead of crediting it', () => {
+    // Regression for the latent defect found in adversarial review of #530: `isInputLockActive`
+    // is only ever consulted from an activation, so a busy period that starts and ends with NO
+    // activation in between leaves `busySince` stale. If a LATER, unrelated busy episode were
+    // measured against that stale timestamp, the valve would force-release immediately — the
+    // very first tap of the new episode gets zero busy protection.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let busy = false;
+    registerUIBusySource('test.busyGap', () => busy);
+    let calls = 0;
+    registerUIAction('test.busyGapAction', () => { calls += 1; });
+    try {
+      // Episode 1 begins and is OBSERVED once via an activation.
+      busy = true;
+      applyBindings(call('test.busyGapAction'), 'click', { selfGuid: 'btn-1' });
+      expect(calls).toBe(0); // swallowed — busySince is now set to t=0
+
+      // Episode 1 ends with NO activation observing the change — nothing calls
+      // isInputLockActive() while not-busy, so busySince is never cleared.
+      busy = false;
+      advanceManual(UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS * 3); // a long unobserved gap
+
+      // Episode 2 begins, from something with no relation to episode 1 (e.g. a background sync).
+      busy = true;
+      applyBindings(call('test.busyGapAction'), 'click', { selfGuid: 'btn-1' });
+
+      // The buggy version measures this against the STALE busySince (elapsed >> lockMaxMs) and
+      // force-releases immediately, letting the handler fire with zero busy protection.
+      expect(calls).toBe(0); // still blocked — episode 2 gets its own fresh window
+      expect(warnSpy).not.toHaveBeenCalled(); // and no spurious "stuck" warning either
+    } finally {
+      unregisterUIAction('test.busyGapAction');
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('a GENUINE stall still trips the valve when observed repeatedly across it', () => {
+    // Complement to the gap test above: when activations DO keep observing a single continuous
+    // stall, the window must still accumulate normally and force-release exactly once.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    registerUIBusySource('test.busyGenuineStall', () => true);
+    let calls = 0;
+    registerUIAction('test.busyGenuineStallAction', () => { calls += 1; });
+    try {
+      // Repeated activations, each well under lockMaxMs apart, spanning past lockMaxMs in total.
+      for (let i = 0; i < 4; i += 1) {
+        applyBindings(call('test.busyGenuineStallAction'), 'click', { selfGuid: 'btn-1' });
+        advanceManual(UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS / 3);
+      }
+      expect(calls).toBe(0); // still swallowed — total elapsed has now crossed the max
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      // One more activation, now past the accumulated max — the valve force-releases and warns.
+      applyBindings(call('test.busyGenuineStallAction'), 'click', { selfGuid: 'btn-1' });
+      expect(calls).toBe(1);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+
+      // A further activation while still stuck must not warn AGAIN.
+      advanceManual(UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS + 1);
+      applyBindings(call('test.busyGenuineStallAction'), 'click', { selfGuid: 'btn-1' });
+      expect(calls).toBe(2);
+      expect(warnSpy).toHaveBeenCalledTimes(1); // still just the one warning
+    } finally {
+      unregisterUIAction('test.busyGenuineStallAction');
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('a throwing predicate is treated as not-busy, logs, and does not break the activation path', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    registerUIBusySource('test.busyThrows', () => { throw new Error('boom'); });
+    let calls = 0;
+    registerUIAction('test.busyThrowsAction', () => { calls += 1; });
+    try {
+      applyBindings(call('test.busyThrowsAction'), 'click', { selfGuid: 'btn-1' });
+      expect(calls).toBe(1); // a throwing predicate must not brick the activation
+      expect(errorSpy).toHaveBeenCalled();
+      expect(String(errorSpy.mock.calls[0][0])).toContain('test.busyThrows');
+    } finally {
+      unregisterUIAction('test.busyThrowsAction');
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('a continuous binding stays exempt while busy — same exemption as the lock itself', () => {
+    registerUIBusySource('test.busyContinuous', () => true);
+    let sliderCalls = 0;
+    registerUIAction('test.busySlider', () => { sliderCalls += 1; });
+    try {
+      applyBindings(call('test.busySlider', 'change'), 'change', { selfGuid: 'slider-1', eventValue: 1, continuous: true });
+      applyBindings(call('test.busySlider', 'change'), 'change', { selfGuid: 'slider-1', eventValue: 2, continuous: true });
+      expect(sliderCalls).toBe(2); // a continuous stream never consults the lock or the busy gate
+    } finally {
+      unregisterUIAction('test.busySlider');
     }
   });
 });

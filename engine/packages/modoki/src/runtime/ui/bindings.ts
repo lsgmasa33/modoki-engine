@@ -26,6 +26,7 @@ import { markUIDirty } from './uiTreeStore';
 import { isSimRunning } from '../core/playState';
 import { dispatchUIAction, type UIActionPayload } from '../core/actionRegistry';
 import { rawNow } from '../core/clock';
+import { getActiveUIBusySources } from '../core/uiBusySources';
 import {
   UISettings, UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS, UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS,
 } from '../traits/UISettings';
@@ -71,6 +72,12 @@ export interface ApplyBindingsOptions {
 // common synchronous case where completion is instant. Both knobs are authored on the
 // `UISettings` resource trait, not code constants (CLAUDE.md's authored-values rule): the
 // right value is a feel call, not a fixed constant.
+//
+// A THIRD gate (#530): a game can register a busy PREDICATE (`core/uiBusySources.ts`) instead of
+// making every handler return a promise — the completion gate above is a silent opt-in (a
+// non-thenable return is simply ignored), and a game whose `call` handlers are all synchronous
+// wrappers (Court's `() => fireTap(target)`) gets nothing from it. `isInputLockActive` consults
+// both.
 
 let lockHeld = false;
 let lockAcquiredAt = 0;
@@ -86,6 +93,36 @@ let lockPendingNames: string[] = [];
 // feature exists to prevent. See trackLockPromise and its regression test.
 let lockGen = 0;
 
+// The start of the busy window currently being credited toward the valve, or `null` when
+// nothing is busy right now. `null`, not `0` — the manual test clock legitimately starts at 0,
+// so `0` cannot double as "unset" without colliding with a real timestamp. Its OWN safety valve,
+// separate from `lockAcquiredAt`/`lockMaxMs` above: busy can begin from something that was never
+// itself a UI activation (Court's sign-in flow starts from a menu button, not a chrome tap), so
+// there may be no held lock at all to hang this off. See `isInputLockActive` for the valve logic.
+//
+// ⚠️ This is NOT "when the predicates first went continuously true" — `isInputLockActive` is only
+// ever called from a UI activation, so it can only credit busy time it actually OBSERVED. A busy
+// period that starts and ends with no activation in between (a background sync, a restored
+// StoreKit transaction) leaves `busySince` stale from an EARLIER episode; if a later, unrelated
+// episode is then measured against that stale timestamp, the valve force-releases immediately —
+// and silently, if `busyWarned` also survived from the earlier episode. `busyLastObserved` below
+// closes that gap: a gap since the last observation longer than `lockMaxMs` means there is no
+// evidence busy was continuous across it, so the window restarts instead of being credited.
+// Cost of this, accepted deliberately: the valve needs observations spaced closer together than
+// `lockMaxMs` to accumulate, so a sparse retry cadence (a user trying again less often than that)
+// restarts the window each time and DELAYS the rescue rather than denying it. The alternative —
+// crediting the unobserved gap anyway — silently force-released an unrelated, later operation,
+// which is the bug this replaced.
+let busySince: number | null = null;
+// The last time `isInputLockActive()` observed the busy set non-empty, or `null` when the last
+// observation (or world start) saw nothing busy. Used only to detect an unobserved gap — see
+// `busySince` above.
+let busyLastObserved: number | null = null;
+// Guards the warning below to fire ONCE per stall, not on every activation while a source stays
+// stuck — mirrors `releaseLock()` clearing `lockPendingNames` so the other valve's warning can't
+// repeat either, just without an actual release to hang the reset off (the source is still busy).
+let busyWarned = false;
+
 // Reset on world/scene swap — a lock held by the previous world's action must not carry over
 // and brick the next one. Top-level, matching UINode.tsx:109 / uiValues.ts:56 / focusManager
 // precedent (registered once at module load, not lazily). Routed through releaseLock() (not a
@@ -93,6 +130,10 @@ let lockGen = 0;
 // identically and can never drift apart.
 onWorldSwap(() => {
   releaseLock();
+  busySince = null; // a busy source registered by the outgoing world's manager must not carry a
+  // stuck-since timestamp into the next world's first activation
+  busyLastObserved = null;
+  busyWarned = false;
 });
 
 /** Is the lock currently blocking a new discrete activation? A CHECK, not a passive read: an
@@ -107,6 +148,49 @@ onWorldSwap(() => {
  *  hit the valve and warned about a handler that never existed). An idle lock is freed silently
  *  by the floor branch below instead. */
 function isInputLockActive(): boolean {
+  // The busy-source gate (#530) goes FIRST, before `lockHeld` — a busy predicate can start
+  // outside any UI activation at all (Court's sign-in begins from `beginSignIn`, not from a
+  // chrome tap that took the lock), and the 300ms floor below may already have expired while the
+  // underlying work continues. So this must block even an otherwise-idle lock.
+  //
+  // ⚠️ It carries its OWN safety valve, mirroring `lockMaxMs` below — a naive
+  // `if (busyNames.length) return true` would let a predicate stuck true (a real Court case: the
+  // account side can legitimately sit in 'working' for up to its own 60s watchdog) brick ALL UI
+  // input FOREVER, reintroducing exactly the failure `inputLockMaxMs` exists to prevent. Track
+  // when busy first became true; once it has been continuously true past `lockMaxMs`, stop
+  // blocking and warn naming the stuck source(s), same wording family as the lock's own valve.
+  const busyNames = getActiveUIBusySources();
+  if (busyNames.length > 0) {
+    const now = rawNow();
+    // A gap since the last observation longer than `lockMaxMs` means this call has no evidence
+    // busy was continuous across it — treat it as a NEW episode rather than crediting it with
+    // time nobody watched (see the comment on `busySince` above).
+    if (busySince === null || (busyLastObserved !== null && now - busyLastObserved > lockMaxMs)) {
+      busySince = now;
+      busyWarned = false;
+    }
+    busyLastObserved = now;
+    const busyElapsed = now - busySince;
+    if (busyElapsed > lockMaxMs) {
+      if (!busyWarned) {
+        busyWarned = true;
+        console.warn(
+          `[UI input lock] busy-source valve force-released after ${lockMaxMs}ms — stuck busy: `
+          + busyNames.join(', '),
+        );
+      }
+      // Do not reset `busySince` here: the source(s) are still reporting busy, and resetting
+      // would re-arm a fresh `lockMaxMs` window on the very next check instead of recognizing
+      // this as the SAME ongoing stall. It resets only once nothing is busy, below.
+    } else {
+      return true;
+    }
+  } else {
+    busySince = null; // nothing busy right now — a later short busy period starts its own window
+    busyLastObserved = null;
+    busyWarned = false;
+  }
+
   if (!lockHeld) return false;
   const elapsed = rawNow() - lockAcquiredAt;
   if (lockPendingCount > 0) {

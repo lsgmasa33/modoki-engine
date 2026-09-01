@@ -763,6 +763,7 @@
   "registerSystem",
   "registerTrait",
   "registerUIAction",
+  "registerUIBusySource",
   "registerVideoControls",
   "releaseAllForScene",
   "releaseAudioForScene",
