@@ -3,8 +3,9 @@
  *  `useAudioResumeRearm()` (`engine/app/useAudioResumeRearm.ts`) lives in its own module
  *  specifically so `audioResumeRearm.test.tsx` can drive it without mounting the whole app shell
  *  (`App` itself is not exported and drags in routing + the lazy editor chunk). That split is
- *  exactly the shape that has bitten this repo before (#517, #225, and `appTeardownReachable.test.ts`
- *  above): a hook that works in isolation proves nothing about whether the shipped app ever calls
+ *  exactly the shape that has bitten this repo before (#517, #225, and the since-reverted
+ *  `appTeardownReachable.test.ts` — deleted with `teardownAll()` in `2d6d72b46`, recoverable via
+ *  `git show`): a hook that works in isolation proves nothing about whether the shipped app ever calls
  *  it. Delete the `useAudioResumeRearm();` line from `App.tsx` and every existing gate — including
  *  `audioResumeRearm.test.tsx` — stays green while shipped audio never re-arms after an iOS
  *  interruption, which is the exact #489 symptom the hook was written to fix.
