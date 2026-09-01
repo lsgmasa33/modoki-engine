@@ -19,7 +19,7 @@ import { audioDispose } from '@modoki/engine/runtime';
 import { VideoOverlay } from '@modoki/engine/runtime';
 import { useKeyboardShift } from './hooks/useKeyboardShift';
 import { onTierSwitchOverlay } from '@modoki/engine/runtime';
-import { checkAppOtaUpdate, isPluginUnimplemented, subscribeOtaGate, type OtaGateState } from './ota';
+import { checkAppOtaUpdate, confirmShellBoot, isPluginUnimplemented, subscribeOtaGate, type OtaGateState } from './ota';
 import OtaRestartGate from './ui/components/OtaRestartGate';
 import { loadStagedSubgames } from './subgameLoader';
 import { findGame as findGameInRegistry } from './gameRegistry';
@@ -599,18 +599,12 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // failure here must never block the game the player is already looking at, and
         // web has no OTA mechanism to confirm anything for (ModokiOtaWeb no-ops it
         // anyway, but skip the dynamic import entirely rather than pay for it on web).
-        if (Capacitor.isNativePlatform()) {
-          import('capacitor-modoki-ota')
-            .then((m) => m.ModokiOta.confirmBoot({ name: 'shell' }))
-            .catch((e) => {
-              // A project without the OTA native plugin rejects this on EVERY launch, so a warn
-              // here files a Crashlytics issue per session for a non-event. A real confirmBoot
-              // failure still warns — on a project that ships OTA it is what the rollback
-              // watchdog keys on. See `isPluginUnimplemented`.
-              if (isPluginUnimplemented(e)) console.log('[GameShell] no OTA plugin on this platform — confirmBoot skipped');
-              else console.warn('[GameShell] OTA confirmBoot failed (non-fatal):', e);
-            });
-        }
+        // ⚠️ NOT an unconditional confirm. `checkAppOtaUpdate()` above can have staged and
+        // activated a new version DURING this launch, so `pending` may name a version that is
+        // not the one rendering — confirming it credits the new bundle with the old one's
+        // successful boot. `confirmShellBoot` decides that and names the version it confirms;
+        // see its doc comment (found by #553's close-out sweep).
+        if (Capacitor.isNativePlatform()) void confirmShellBoot();
 
         // Dismiss the native splash on this SAME "fully booted" signal (Phase 3b) —
         // previously nothing called this, so the splash dismissed on Capacitor's own

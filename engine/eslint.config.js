@@ -190,6 +190,14 @@ export default tseslint.config(
   {
     ignores: [
       '**/dist/**',
+      // Sub-game bundle output (games/<id>/subgame-dist/, `engine/scripts/build-subgame.mjs`).
+      // Gitignored, but `**/dist/**` does not match it — so running the DOCUMENTED sub-game
+      // build (docs/ota-subgame-modules.md § 2) left 1657 lint errors in the tree, almost all
+      // of them from vendored basis/ktx transcoder blobs, and took `npm run verify` red for
+      // anyone who had ever built one. Exactly the failure the `ads/` entry below already warns
+      // about: this list has to agree with .gitignore or the gate breaks for a reason nobody
+      // wrote down. Found during #553's close-out, by building a sub-game for a device test.
+      '**/subgame-dist/**',
       '**/node_modules/**',
       // Project scaffold template — copied to new projects with placeholder tokens
       // substituted; not part of the engine build graph (also out of tsconfig).

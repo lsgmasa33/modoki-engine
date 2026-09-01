@@ -166,6 +166,67 @@ export async function checkAppOtaUpdate(): Promise<boolean> {
   }
 }
 
+/** Whether this launch's "fully booted" signal is evidence about the version that is PENDING
+ *  — and if so, which version, so the confirm can NAME it.
+ *
+ *  ⚠️ Pure and separately tested because the answer is not "always yes", which is what
+ *  `App.tsx` assumed. Found by #553's close-out sweep: `checkAppOtaUpdate()` runs BEFORE this
+ *  signal in the same boot effect, and for a ROUTINE (non-mandatory) update it stages and
+ *  `activate()`s the new version mid-launch — setting `pending` to a version that is NOT the
+ *  one rendering. An unconditional confirm then credits vNew with a successful boot of vOld,
+ *  so vNew reached `active` after ONE boot of itself instead of the two `requiredConfirms`
+ *  exists to demand ("a single rendered frame is not proof against a bundle that crashes later
+ *  in a gameplay path" — OtaCore.swift). A MANDATORY update is unaffected: the gate returns
+ *  early and this signal never fires.
+ *
+ *  `bootAttempts` is the discriminator, and it is the same one `otaClient.ts`'s
+ *  `alreadyServed` check already relies on and documents: `activate()` clears it when staging,
+ *  and the native boot hook increments it when it SERVES the pending bundle, before the WebView
+ *  loads. So `> 0` means we are running the pending version right now.
+ *
+ *  Exported for tests — `App.tsx` is a `.tsx` and the DECISION belongs in a plain `.ts` module
+ *  beside it (docs/editor.md § Panels). */
+export function decideShellConfirm(stateJSON: string, bundleName: string):
+  | { confirm: true; version?: string }
+  | { confirm: false; reason: string } {
+  let state: { pending?: Record<string, string>; bootAttempts?: Record<string, number> } | null;
+  try {
+    state = stateJSON && stateJSON !== 'null' ? JSON.parse(stateJSON) : null;
+  } catch {
+    // Unparseable state is the native side's problem, not ours; confirm unversioned and let
+    // OtaCore's own corrupt-state contract decide (it treats it exactly like "no state").
+    return { confirm: true };
+  }
+  const pending = state?.pending?.[bundleName];
+  // Nothing staged: the confirm is a documented no-op. Kept rather than skipped so a project
+  // with no pending version still exercises the same call path (and the same logging).
+  if (!pending) return { confirm: true };
+  if ((state?.bootAttempts?.[bundleName] ?? 0) > 0) return { confirm: true, version: pending };
+  return { confirm: false, reason: `pending ${pending} has not been served yet — this boot is the previous version` };
+}
+
+/** Runs the shell's boot confirm, naming the version when this launch can attribute it.
+ *  Best-effort and native-only, exactly as the inline version in `App.tsx` was. */
+export async function confirmShellBoot(): Promise<void> {
+  const { ota } = projectConfig;
+  try {
+    const m = await import('capacitor-modoki-ota');
+    const { stateJSON } = await m.ModokiOta.getState();
+    const decision = decideShellConfirm(stateJSON, ota.bundleName);
+    if (!decision.confirm) {
+      console.log(`[GameShell] OTA confirmBoot skipped — ${decision.reason}`);
+      return;
+    }
+    await m.ModokiOta.confirmBoot({ name: ota.bundleName, ...(decision.version ? { version: decision.version } : {}) });
+  } catch (e) {
+    // A project without the OTA native plugin rejects this on EVERY launch, so a warn here
+    // files a Crashlytics issue per session for a non-event. A real confirmBoot failure still
+    // warns — on a project that ships OTA it is what the rollback watchdog keys on.
+    if (isPluginUnimplemented(e)) console.log('[GameShell] no OTA plugin on this platform — confirmBoot skipped');
+    else console.warn('[GameShell] OTA confirmBoot failed (non-fatal):', e);
+  }
+}
+
 /** OTA Phase 4 (docs/ota-subgame-modules.md) — stages any new versions of every
  *  sub-game bundle the release names, so `subgameLoader.ts`'s subsequent `listBundles()`
  *  call sees them. Deliberately does NOT surface `result.mandatory` for a sub-game the

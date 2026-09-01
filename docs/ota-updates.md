@@ -175,6 +175,23 @@ this is a failure mode the discriminator INTRODUCED at the far end of the range 
 `games/ota-test` is the only OTA-enabled project today and it is wired correctly; check this line
 first when a second project adopts OTA.
 
+⚠️ **The shell's confirm is NOT unconditional, and the reason is subtle** (found by #553's
+close-out sweep, 2026-09-01). `App.tsx`'s boot effect calls `checkAppOtaUpdate()` and then, on
+the "fully booted" signal, confirms. For a **routine (non-mandatory)** release those two happen
+in the SAME launch: the check stages vNew and `activate()`s it, which writes `pending = vNew`
+and clears `confirmedBoots` — so `pending` now names a version that is **not** the one
+rendering. An unconditional `confirmBoot({name})` promotes whatever is pending, crediting vNew
+with vOld's successful boot. vNew then reached `active` after **one** boot of itself instead of
+the two `requiredConfirms` exists to demand. A MANDATORY release was never affected: the gate
+returns early and this signal never fires.
+
+`engine/app/ota.ts`'s `decideShellConfirm` (pure, unit-tested) gates it on the same
+discriminator `checkForUpdate`'s `alreadyServed` check already uses — `bootAttempts > 0` means
+the native hook SERVED the pending bundle before the WebView loaded, so this launch's frame
+really is evidence about it. When it is, the confirm NAMES that version, so the native side
+re-checks the attribution rather than trusting the caller. Same defect class as #553 (a
+promotion decoupled from the version being promoted), one level up.
+
 **The native splash is also dismissed on this same "fully booted" render** (`App.tsx`, right
 alongside `confirmBoot`) — `@capacitor/splash-screen` is now in the engine's required-plugin
 set (self-heals into every native project's `package.json` the same way `@capacitor/app`/
@@ -432,9 +449,21 @@ below on the bundleName restriction; publishing a sub-game bundle is still a man
 ## Testing
 
 The pure state machine is replayed by **both** platforms against the same shared vectors —
-`ota-golden-vectors.json` (boot/confirm/revert, plus `resetForNewBinary`) and
-`ota-gate-vectors-phase3.json` (quarantine), 27 scenarios total. A native divergence between
-Swift and Java fails there instead of shipping.
+`ota-golden-vectors.json` (boot/confirm/revert, plus `resetForNewBinary`),
+`ota-gate-vectors-phase3.json` (quarantine) and `ota-subgame-vectors-553.json` (the sub-game
+load-failure dispositions and the versioned confirm), 40 scenarios total. A native divergence
+between Swift and Java fails there instead of shipping.
+
+⚠️ **A device observation about OTA proves nothing until you pin which bundle is running.** The
+app boots a PUBLISHED shell bundle, not your working tree, so a phone can be internally
+consistent and describe code that is months old — #553's first three device runs all measured a
+shell predating #540 and every conclusion had to be retracted. Before trusting any result:
+rebuild the shell from your branch and install it, then grep the built bundle for a string your
+branch added or removed and confirm the running bundle's filename in logcat matches what the
+build emitted. Then cold starts only (`am start -W` reporting `LaunchState: COLD`, empty `pidof`
+beforehand — `monkey` on a live process merely foregrounds it and yields no boot logs), full
+`logcat -d` to a file rather than `-t` (which truncates past the startup window on a chatty
+device), and assert a positive control before believing any negative result.
 
 **Both replays are legs of `npm run test:native`** (`engine/scripts/test-native.mjs`) — the
 on-demand native gate, added in #376. Until then they existed only as the two hand-typed recipes

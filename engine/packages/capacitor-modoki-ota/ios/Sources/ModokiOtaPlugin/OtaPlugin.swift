@@ -155,6 +155,8 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
     CAPPluginMethod(name: "confirmBoot", returnType: CAPPluginReturnPromise),
     CAPPluginMethod(name: "getState", returnType: CAPPluginReturnPromise),
     CAPPluginMethod(name: "listBundles", returnType: CAPPluginReturnPromise),
+    CAPPluginMethod(name: "beginBundleLoad", returnType: CAPPluginReturnPromise),
+    CAPPluginMethod(name: "reportBundleLoadFailure", returnType: CAPPluginReturnPromise),
   ]
 
   /// Emits `otaProgress` (Phase 3a — plumbing only, no UI consumes this yet). Safe to
@@ -382,7 +384,9 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
     OtaPaths.stateLock.lock()
     defer { OtaPaths.stateLock.unlock() }
     let json = try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8)
-    let resultJSON = OtaCore.confirm(fromJSON: json, name: name)
+    // `version` is optional: the SHELL has none to name (its boot hook is the sole
+    // authority over what got served), a sub-game always passes one. See OtaCore.confirm.
+    let resultJSON = OtaCore.confirm(fromJSON: json, name: name, version: call.getString("version"))
     do {
       try resultJSON.write(to: OtaPaths.stateFilePath, atomically: true, encoding: .utf8)
       call.resolve(["ok": true])
@@ -397,10 +401,83 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
     call.resolve(["stateJSON": json])
   }
 
-  /// OTA Phase 4 (docs/ota-subgame-modules.md) — every bundle with content
-  /// actually on disk, `active` preferred over `pending` for the same name. See the
-  /// TS `listBundles` doc comment (definitions.ts) for why `pending` counts as
-  /// loadable here (unlike the shell, a sub-game has no boot-hook promotion path).
+  /// `folderExists` probe for a SUB-GAME bundle — deliberately NOT the one `OtaBootHook.run`
+  /// uses.
+  ///
+  /// ⚠️ The shell's probe additionally requires `index.html`, because a shell bundle is what
+  /// the WebView serves. A sub-game bundle has no `index.html` at all — it is `subgame.json`
+  /// + `subgame.js`, script-loaded into the shell's already-running page. Reusing the shell's
+  /// predicate here would make EVERY sub-game look absent, and `boot()` answers an absent
+  /// pending folder with an immediate revert: every staged sub-game would be silently thrown
+  /// away on its first load. Same directory check `listBundles` uses.
+  private static func versionFolderExists(_ name: String, _ version: String) -> Bool {
+    var isDir: ObjCBool = false
+    let dir = OtaPaths.versionDir(name: name, version: version)
+    return FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir) && isDir.boolValue
+  }
+
+  private func resolveTarget(_ target: OtaTarget) -> [String: Any] {
+    switch target {
+    case .embedded:
+      // For a SUB-GAME there is no embedded copy — a sub-game is script-loaded, never
+      // shipped in the app binary — so `.embedded` means "nothing loadable for this name".
+      return ["target": "none"]
+    case let .version(name, version):
+      return ["target": "version", "name": name, "version": version,
+              "path": OtaPaths.versionDir(name: name, version: version).path]
+    }
+  }
+
+  /// #553 — the sub-game counterpart of the shell's native boot hook. Decides which version
+  /// of `name` to load and COUNTS THE ATTEMPT before the caller loads anything, so a bundle
+  /// that takes the page down with it still burns an attempt and is eventually reverted.
+  ///
+  /// ⚠️ Uses the very same `OtaCore.boot()` the shell does, which is the point: `pending` is
+  /// preferred over `active`, so the version that loads is the version a subsequent
+  /// `confirmBoot` promotes. `listBundles()` orders them the other way round and MUST NOT be
+  /// used to decide what to load — that inversion is exactly the #553 defect.
+  @objc func beginBundleLoad(_ call: CAPPluginCall) {
+    guard let name = call.getString("name") else { call.reject("beginBundleLoad requires name"); return }
+    OtaPaths.stateLock.lock()
+    defer { OtaPaths.stateLock.unlock() }
+    let json = try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8)
+    let (target, newState) = OtaCore.boot(fromJSON: json, name: name, folderExists: Self.versionFolderExists)
+    if let newState {
+      try? OtaCore.serialize(newState).write(to: OtaPaths.stateFilePath, atomically: true, encoding: .utf8)
+    }
+    call.resolve(resolveTarget(target))
+  }
+
+  /// #553/#550 — records what a failed load of a SPECIFIC version proves, and returns the
+  /// version to fall back to this launch. `disposition` is one of `fatal` / `transient` /
+  /// `notEvidence`; see OtaCore's `OtaLoadFailure` for why they are not interchangeable.
+  ///
+  /// ⚠️ The returned fallback must never be confirmed by the caller — it is the version being
+  /// replaced, and crediting a confirm to it is the #553 defect itself.
+  @objc func reportBundleLoadFailure(_ call: CAPPluginCall) {
+    guard let name = call.getString("name"), let version = call.getString("version") else {
+      call.reject("reportBundleLoadFailure requires name, version"); return
+    }
+    guard let disposition = OtaLoadFailure(rawValue: call.getString("disposition") ?? "") else {
+      call.reject("reportBundleLoadFailure requires disposition of fatal|transient|notEvidence"); return
+    }
+    OtaPaths.stateLock.lock()
+    defer { OtaPaths.stateLock.unlock() }
+    let json = try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8)
+    let (target, newState) = OtaCore.loadFailed(
+      state: OtaCore.parseState(json), name: name, version: version,
+      disposition: disposition, folderExists: Self.versionFolderExists
+    )
+    if let newState {
+      try? OtaCore.serialize(newState).write(to: OtaPaths.stateFilePath, atomically: true, encoding: .utf8)
+    }
+    call.resolve(resolveTarget(target))
+  }
+
+  /// OTA Phase 4 (docs/ota-subgame-modules.md) — every bundle with content actually on
+  /// disk. ⚠️ DISCOVERY ONLY: `active` is preferred over `pending` here, which is the
+  /// opposite of what loading needs — use `beginBundleLoad` to decide what to load (#553).
+  /// See the TS doc comment in definitions.ts.
   @objc func listBundles(_ call: CAPPluginCall) {
     let json = try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8)
     guard let state = OtaCore.parseState(json) else { call.resolve(["bundles": []]); return }

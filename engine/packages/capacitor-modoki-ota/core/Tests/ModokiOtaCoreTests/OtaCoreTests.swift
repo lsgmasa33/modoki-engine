@@ -26,6 +26,7 @@ final class OtaCoreTests: XCTestCase {
   static let vectorFiles = [
     "test-vectors/ota-golden-vectors.json",
     "test-vectors/ota-gate-vectors-phase3.json",
+    "test-vectors/ota-subgame-vectors-553.json",
   ]
 
   /// The vector files declare `constants` — and until this was added, NOTHING read them, so the
@@ -163,7 +164,35 @@ final class OtaCoreTests: XCTestCase {
 
       case "confirm":
         let state = OtaCore.parseState(stateJSONString)
-        let resultState = OtaCore.confirm(state: state, name: bundle)
+        // `version` is absent in every Phase 1 vector (the shell's unversioned confirm) and
+        // present in the #553 ones — the SAME call must serve both, so the back-compat path
+        // is exercised by the existing corpus rather than asserted separately.
+        let resultState = OtaCore.confirm(state: state, name: bundle, version: raw["version"] as? String)
+        assertStateMatches(resultState, expect["state"] as? [String: Any], name)
+
+      case "loadFailed":
+        let state = OtaCore.parseState(stateJSONString)
+        let dispositionRaw = raw["disposition"] as! String
+        guard let disposition = OtaLoadFailure(rawValue: dispositionRaw) else {
+          XCTFail("\(name): unknown disposition \(dispositionRaw)"); continue
+        }
+        let (target, resultState) = OtaCore.loadFailed(
+          state: state, name: bundle, version: raw["version"] as! String,
+          disposition: disposition, folderExists: folderExists
+        )
+        let expectTarget = expect["target"] as! [String: Any]
+        switch expectTarget["kind"] as! String {
+        case "embedded":
+          XCTAssertEqual(target, .embedded, "\(name): expected embedded target")
+        case "version":
+          XCTAssertEqual(
+            target,
+            .version(name: expectTarget["name"] as! String, version: expectTarget["version"] as! String),
+            "\(name): target mismatch"
+          )
+        default:
+          XCTFail("\(name): unknown expect.target.kind")
+        }
         assertStateMatches(resultState, expect["state"] as? [String: Any], name)
 
       case "resetForNewBinary":

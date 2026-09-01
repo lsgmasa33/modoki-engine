@@ -159,11 +159,162 @@ the single global `__MODOKI_SUBGAME__`, which `loadOneSubgame` immediately reads
 two bundles loading in parallel would race that one global (a real bug a fresh-eyes code
 review caught: a dynamically-injected `<script>` executes as soon as its OWN download
 completes, not in insertion order, so the second bundle's script could clobber the first's
-read before it happened). Per bundle: fetch `subgame.json` → `ensure(sharedDeps)` (also
-wrapped so a failure here reports through the visible error list rather than propagating
-unhandled) → load `subgame.js` via `<script>` tag → engine-API check (§4, against BOTH
-`subgame.json` and the module's own export) → `loadManifestJson(fragment, {pathPrefix})` →
-`registerDynamicGame()` → `confirmBoot()`.
+read before it happened). Per bundle NAME: `beginBundleLoad(name)` (§3a — which version, and count the attempt) →
+fetch `subgame.json` → `ensure(sharedDeps)` (also wrapped so a failure here reports through
+the visible error list rather than propagating unhandled) → load `subgame.js` via `<script>`
+tag → engine-API check (§4, against BOTH `subgame.json` and the module's own export) →
+`loadManifestJson(fragment, {pathPrefix})` → `registerDynamicGame()` →
+`confirmBoot({name, version})`.
+
+## 3a. The sub-game watchdog — which version loads, and what happens when it doesn't
+
+⚠️ **`listBundles()` is DISCOVERY ONLY. It prefers `active` over `pending`, which is the
+opposite of what loading needs — never use its `version`/`path` to decide what to run.**
+
+That inversion was #553, and it is worth stating because the old code read as obviously
+correct. `loadStagedSubgames` stages updates and then lists, in one pass:
+`checkAppSubgameUpdates()` → `checkForUpdate` → `activate({name, version: vNew})`, which sets
+`pending[name] = vNew`; then `listBundles()` returns **vOld**, because active is preferred;
+then the loader ran vOld, it loaded fine, and called an unconditional `confirmBoot({name})`
+— which promotes whatever is *pending*. Two launches of that and **vNew was `active` having
+never once executed**. When it was finally served and correctly refused (the fatal manifest
+check below), it was already promoted, and a sub-game had no attempt counter, no `revert()`
+and no quarantine to demote it with: offline, the game was refused on every launch forever.
+Device-verified on a Galaxy S22, 2026-09-01 — and note the shell bundle must be rebuilt from
+the branch before any of this is measurable, see ota-updates.md's Testing section.
+
+The fix routes sub-games through the **same `OtaCore.boot()` state machine the shell uses** —
+it was never broken for sub-games, it was simply never called with a sub-game name (the
+native boot hook is invoked twice in the repo, both with the shell name).
+
+| Step | Native call | What it does |
+|---|---|---|
+| Decide | `beginBundleLoad({name})` | `OtaCore.boot()`: **`pending` preferred over `active`**, and `bootAttempts` incremented BEFORE the load — so a bundle that takes the page down with it still burns an attempt and is reverted after `maxAttempts` |
+| Succeed | `confirmBoot({name, version})` | `version` must equal `pending[name]` or the confirm is a no-op — promotion can no longer be credited to a version that did not run |
+| Fail | `reportBundleLoadFailure({name, version, disposition})` | applies the revert/quarantine and returns the version to fall back to this launch |
+
+**⚠️ `folderExists` is NOT the shell's predicate.** The shell's additionally requires
+`index.html`, because a shell bundle is what the WebView serves; a sub-game bundle has no
+`index.html` at all. Reusing it would make every sub-game look absent, and `boot()` answers an
+absent *pending* folder with an immediate revert — every staged sub-game silently discarded on
+its first load.
+
+**The fallback is loaded but NEVER confirmed.** It is the version being replaced; confirming
+it is the original defect. Exactly one retry: the fallback is `active`, which by construction
+already loaded successfully `requiredConfirms` times.
+
+### Dispositions — the load-bearing part
+
+A refusal's *disposition* decides whether the version is blocked on this device forever, so it
+is not a severity ranking. `loadOneSubgame` returns one per refusal; `OtaCore.loadFailed`
+applies it.
+
+| Disposition | Refusals | Effect |
+|---|---|---|
+| `fatal` | a non-ok or unparseable `subgame.json` · `<script>` `onerror` · a module with no `game.id` · **a missing/unparseable `assets.manifest.json`** | reverts to the previous version **and quarantines**, immediately — no attempts burned (#550) |
+| `transient` | `ensure(sharedDeps)` failed · **a `fetch` that REJECTED** (as opposed to returning non-ok) for either JSON file · **a script that assigned no module** (see below) | for a PENDING version: costs one attempt; three exhaust and quarantine, as for the shell. For an ACTIVE one: clears `active` immediately, never quarantining — see the ⚠️ below. A retry is genuinely possible rather than merely hoped for — §1's #522 note: `ensure()` clears its `pending` entry when a load SETTLES, so a rejected dynamic import is no longer memoized for the life of the process |
+| `notEvidence` | `engineApi` mismatch (either check) · `gameId` collision · `__MODOKI_SHARED__` missing | gives the attempt back, **never quarantines** |
+
+⚠️ **Two splits in that table are load-bearing and were both wrong in the first draft** (caught by review, 2026-09-01):
+
+- **A script that loads but assigns nothing must ESCALATE — it was `notEvidence`, which refunds the attempt.** A `<script>` whose
+  code THROWS at evaluation fires `load`, not `error` — so the loader resolves and simply finds
+  the global unassigned. That is a *crashing bundle*, the likeliest real breakage there is. It
+  shared a branch with the `engineApi` mismatch, so it refunded its own attempt: `bootAttempts`
+  never passed 1, `boot()`'s exhaustion revert could never fire, and `checkForUpdate`
+  short-circuits `up-to-date` on a still-pending version. Refused every launch, forever, never
+  quarantined — the exact state this whole mechanism exists to remove. It is now `transient`
+  rather than `fatal`, because the evidence is **ambiguous**: `subgameBuild.ts` puts the global
+  assignment at the END of the module graph, so any module-scope throw lands here — including
+  ones that are facts about the DEVICE (an `AudioContext` built at import, a `navigator.gpu`
+  probe, a blocked `localStorage`). Quarantine is permanent, so `transient` escalates without
+  betting a good bundle on one launch. #550's fail-fast is not in tension: that was about a
+  MISSING manifest, which is unambiguous.
+- **A `fetch` that REJECTS is transport, not content.** A missing file returns a clean 404
+  through Capacitor's local scheme (device-verified), so non-ok *is* evidence about the bytes; a
+  rejection is a WebView-loader `TypeError` and says nothing about them. Charging it `fatal`
+  quarantines a perfectly good published version on one blip — permanently, because `rejected`
+  survives `resetForNewBinary` and nothing in the codebase un-quarantines. `transient` still
+  costs an attempt and still quarantines after `maxAttempts`; a genuinely dead file just has to
+  prove it three times.
+
+**Why `fatal` quarantines** (owner ruling, 2026-09-01 — #550 left it open). The bundle zip is
+SHA-256-verified before the atomic rename, so re-staging fetches *identical* broken bytes:
+retrying cannot help. And without the quarantine, `checkForUpdate` re-stages the same bundle
+on every launch — `pending` was cleared, the feed still advertises it, and nothing vetoes it —
+an unbounded re-download loop, worse on mobile data than the bug being fixed. The shell's
+existing fail-fast precedent (a *vanished folder* → revert without quarantine) deliberately
+does not apply: that is a transient disk event, this is hash-verified published content.
+
+**Why `notEvidence` must never quarantine.** `rejected` is deliberately preserved across
+`resetForNewBinary`. An `engineApi` mismatch is a fact about the pair (bundle, host) and only
+the host is going to change — quarantining it would permanently block a bundle that the *next*
+app binary would run perfectly. A `gameId` collision is likewise about this shell's registry,
+not the bundle's bytes.
+
+### Verified on hardware
+
+Galaxy S22 (`SM-S901U1`), `com.example.otatest` debug build from this branch, **offline** (wifi +
+data disabled, so the release feed could not stage or rescue anything), cold starts only
+(`am start -W` reporting `LaunchState: COLD`), full `logcat -d` to file, 2026-09-01.
+
+Provenance pinned first, three ways: the built bundle contains `beginBundleLoad` and no longer
+contains the pre-fix comment; the APK carries that same `index-eN-kFHre.js`; and the running
+bundle logs that byte-identical filename. Positive control asserted before any negative result.
+
+| Run | Start state | Served | Refusal | `confirmBoot` | End state |
+|---|---|---|---|---|---|
+| control | `pending: v1` (intact) | v1 | none | `{name, version: "v1"}` | `bootAttempts: 1`, `confirmedBoots: 1` |
+| **#553** | `active: v1`, `pending: v2` (no manifest) | **v2 first**, then the v1 fallback | `assets.manifest.json fetch failed (404)` → `disposition: "fatal"` | **none** | `active: v1`, `pending: {}`, **`rejected: ["v2"]`** |
+| stability | (as above) | v1 only | none | `{name, version: "v1"}` | unchanged |
+| `notEvidence` | `active: v1`, `pending: v2` (engineApi 99) | v2, then v1 | `engineApi mismatch` → `disposition: "notEvidence"` | none | **`rejected: {}`**, `pending: v2` survives, attempt given back |
+
+**Second pass, after review changed the native side** (same method, shell rebuilt again and
+re-pinned — the running bundle was `index-8ztQvoGn.js`, and the earlier runs are NOT evidence
+about this code):
+
+| Run | Start state | Refusal → disposition | End state |
+|---|---|---|---|
+| **active slot** | `active: v2`, whose `subgame.js` THROWS at evaluation | `did not assign globalThis.__MODOKI_SUBGAME__` → `transient` | **`active: {}`** — cleared, and `rejected: {}` |
+| #553 re-run | `active: v1`, `pending: v2` (no manifest) | 404 → `fatal` | `active: v1`, pending cleared, `rejected: ["v2"]` |
+
+The first row is the one worth having, because it is **self-discriminating**: the escalation it
+tests is native, and the previous plugin would have left `active: v2` untouched. It also
+exercises the `!mod` split and its `transient` mapping end to end — the message and the
+disposition in that row exist only in the post-review code.
+
+Three things that were the whole point: **v2 is fetched before v1** (timestamps 41 ms apart —
+pending really is preferred); the fallback loads but is **never confirmed**; and the broken version
+is reverted and quarantined **on the first launch**, where the pre-fix behaviour took two launches
+to promote it and then never recovered. The shell's own `confirmBoot` still logs as
+`{"name":"shell"}` with no version, confirming the argument is genuinely optional.
+
+⚠️ **The fallback load evaluates a second module graph in the live page.** `loadBundleByName`
+loads the fallback for ANY non-null disposition, and most refusals happen *after* `loadScriptTag`
+resolved — an unassigned module, a missing `game.id`, both `assets.manifest.json` outcomes, the
+module `engineApi` mismatch and the `gameId` collision, so the failed version's IIFE has already run
+when the fallback's is appended; neither `<script>` is ever removed. Nothing shipped today has an
+observable module-scope side effect that would double up (the sub-game bundle inlines its graph
+with only the SHARED set externalized), so this is a known consequence rather than a live defect —
+but a sub-game that registers something at module scope against a shared singleton would do it
+twice, and the integration test for it does not exist yet.
+
+⚠️ **`bootAttempts` is a PENDING-ONLY counter, so the dispositions are not symmetric across the
+two slots.** "Costs one attempt, quarantines after `maxAttempts`" describes the `pending` slot
+only. An `active` version has nothing to count and nothing to exhaust — so `OtaCore.loadFailed`
+escalates it a different way: any failure that is not `notEvidence` clears `active` outright
+(never quarantining, since a version that loaded `requiredConfirms` times and then stopped is
+evidence about this DEVICE), which lets `checkForUpdate` re-stage and heal. Getting this wrong is
+easy and silent: while the `active` branch fired on `fatal` alone, a persistently failing active
+bundle was refused on every launch forever with no counter, no revert and no quarantine — the
+same never-escalates shape, one branch over. Caught by review, not by the gate.
+
+**Still out of scope, same as the shell:** a version that loads cleanly twice, is promoted, and
+only then breaks in a gameplay path. Promotion requires `requiredConfirms` successful loads;
+runtime crash-loop detection is not built. The one concession sub-games get is that a `fatal`
+failure of an *already-active* version clears `active` (the game is simply not offered) —
+without quarantining, because a version that loaded twice and then broke is evidence about
+this device's disk, not about what was published.
 
 ## 4. Engine-API version contract
 
@@ -224,8 +375,13 @@ and the merge, so a same-id bundle is always caught by the probe.
 A non-ok or unparseable `assets.manifest.json` is **fatal**, not a warn-and-continue: the vite
 asset scanner writes that file unconditionally on every build, so a missing/broken one means a
 genuinely broken bundle. `subgameLoader.ts` reports it through the visible error list and leaves
-the sub-game **unregistered** — which also means it never reaches `confirmBoot`, so the bundle is
-never confirmed and rolls back.
+the sub-game **unregistered**, so it never reaches `confirmBoot`.
+
+⚠️ This paragraph used to end "so the bundle is never confirmed **and rolls back**". There was no
+rollback — that was #553. Refusing to confirm only withholds a *promotion*; it demotes nothing,
+and by the time a bad bundle was finally served it had already been promoted on the previous
+version's successful loads. The rollback now exists, and it is §3a's `reportBundleLoadFailure`,
+not a property of declining to confirm.
 
 **§4 engine API.** Hand-edited `engineApi` "fixing" a rejection can't happen — it's stamped
 from the constant at build time in two independently-read places, not hand-written.

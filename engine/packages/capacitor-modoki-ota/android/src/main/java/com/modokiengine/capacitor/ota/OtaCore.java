@@ -28,6 +28,11 @@ public final class OtaCore {
 
   public enum TargetKind { EMBEDDED, VERSION }
 
+  /** See OtaCore.swift's OtaLoadFailure doc — same three claims, must behave identically.
+   *  FATAL quarantines immediately (#550), TRANSIENT costs one attempt, NOT_EVIDENCE gives
+   *  the attempt back and must never quarantine. */
+  public enum LoadFailure { FATAL, TRANSIENT, NOT_EVIDENCE }
+
   public static final class Target {
     public final TargetKind kind;
     public final String name;
@@ -178,13 +183,7 @@ public final class OtaCore {
   private static BootResult revert(State state, String name, boolean quarantine, FolderExists folderExists) {
     State s = state.copy();
     String badVersion = s.pending.get(name);
-    if (quarantine && badVersion != null) {
-      java.util.List<String> list = s.rejected.get(name);
-      if (list == null) list = new java.util.ArrayList<>();
-      if (!list.contains(badVersion)) list.add(badVersion);
-      while (list.size() > MAX_REJECTED_PER_BUNDLE) list.remove(0);
-      s.rejected.put(name, list);
-    }
+    if (quarantine && badVersion != null) addRejected(s, name, badVersion);
     s.pending.remove(name);
     s.bootAttempts.remove(name);
     s.confirmedBoots.remove(name);
@@ -196,13 +195,61 @@ public final class OtaCore {
     return new BootResult(Target.embedded(), s);
   }
 
+  /** See OtaCore.swift's addRejected doc — only ever called for a PENDING version. */
+  private static void addRejected(State s, String name, String version) {
+    java.util.List<String> list = s.rejected.get(name);
+    if (list == null) list = new java.util.ArrayList<>();
+    if (!list.contains(version)) list.add(version);
+    while (list.size() > MAX_REJECTED_PER_BUNDLE) list.remove(0);
+    s.rejected.put(name, list);
+  }
+
+  // ---- Load failure (sub-game bundles — #553/#550) ----
+
+  /** See OtaCore.swift's loadFailed doc — same contract, must behave identically.
+   *  Returns the version to fall back to THIS launch; the caller must NOT confirm it. */
+  public static BootResult loadFailed(State state, String name, String version, LoadFailure disposition, FolderExists folderExists) {
+    if (state == null) return new BootResult(Target.embedded(), null);
+    State s = state.copy();
+
+    if (version != null && version.equals(s.pending.get(name))) {
+      if (disposition == LoadFailure.FATAL) {
+        return revert(s, name, true, folderExists);
+      } else if (disposition == LoadFailure.NOT_EVIDENCE) {
+        int attempts = s.bootAttempts.getOrDefault(name, 0) - 1;
+        if (attempts > 0) s.bootAttempts.put(name, attempts); else s.bootAttempts.remove(name);
+      }
+      // TRANSIENT: the attempt boot() counted stands; exhaustion still reverts + quarantines.
+    } else if (version != null && version.equals(s.active.get(name)) && disposition != LoadFailure.NOT_EVIDENCE) {
+      // Promoted-then-broken. Drop it, but never quarantine — see addRejected. TRANSIENT must
+      // escalate here too: bootAttempts is a PENDING-only counter, so the "costs an attempt,
+      // quarantines after maxAttempts" argument does not hold for an active version, and
+      // without this it would be refused every launch forever. See OtaCore.swift.
+      s.active.remove(name);
+      return new BootResult(Target.embedded(), s);
+    }
+
+    String activeVersion = s.active.get(name);
+    if (activeVersion != null && !activeVersion.equals(version) && folderExists.check(name, activeVersion)) {
+      return new BootResult(Target.version(name, activeVersion), s);
+    }
+    return new BootResult(Target.embedded(), s);
+  }
+
   // ---- Confirm ----
 
   public static State confirm(State state, String name) {
+    return confirm(state, name, null);
+  }
+
+  /** See OtaCore.swift's confirm(state:name:version:) doc — `version`, when non-null, must
+   *  equal `pending[name]` or the confirm is a no-op. This is the #553 fix. */
+  public static State confirm(State state, String name, String version) {
     if (state == null) return null;
     State s = state.copy();
     String pendingVersion = s.pending.get(name);
     if (pendingVersion == null) return s;
+    if (version != null && !version.equals(pendingVersion)) return s;
     int confirms = s.confirmedBoots.getOrDefault(name, 0) + 1;
     if (confirms >= REQUIRED_CONFIRMS) {
       s.active.put(name, pendingVersion);

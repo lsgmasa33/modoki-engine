@@ -1481,8 +1481,12 @@ registerAgentOp('player-prefs-read', (params) => {
       // key can be pending and simultaneously ABSENT from `keys` (a DELETE the backend rejected:
       // `PlayerPrefs.delete` removes it from the cache immediately, so `keys` never has it). So
       // this list can legitimately contain a key this same response's `keys` array does not —
-      // that's the point, not a bug. This op does not flush, so mid-drain it can also UNDER-report
-      // a write that is genuinely in flight — see `pendingKeys()`'s doc comment.
+      // that's the point, not a bug. ⚠️ It no longer under-reports mid-drain (#559): this op does
+      // not flush, but `pendingKeys()` now reports writes a drain has taken and not yet settled, so
+      // an in-flight write appears here rather than reading as landed. This op is the ONE caller
+      // whose behaviour that changed — every other reader samples after an awaited flush — and the
+      // change is strictly toward truth. The old comment told an agent debugging a money path to
+      // distrust exactly the list it can now rely on.
       pendingWrites: PlayerPrefs.pendingKeys().sort(),
     };
   }

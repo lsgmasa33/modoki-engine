@@ -24,6 +24,7 @@ public final class OtaCoreSelfTest {
   private static final String[] VECTOR_FILES = {
     "test-vectors/ota-golden-vectors.json",
     "test-vectors/ota-gate-vectors-phase3.json",
+    "test-vectors/ota-subgame-vectors-553.json",
   };
 
   public static void main(String[] args) throws Exception {
@@ -127,8 +128,25 @@ public final class OtaCoreSelfTest {
       check(name, "target", expected, result.target);
       checkState(name, expect.get("state"), result.state);
     } else if ("confirm".equals(op)) {
-      OtaCore.State result = OtaCore.confirm(state, bundle);
+      // `version` absent = the shell's unversioned confirm (every Phase 1 vector); present =
+      // the #553 versioned one. One call serves both, so back-compat rides the same corpus.
+      OtaCore.State result = OtaCore.confirm(state, bundle, (String) raw.get("version"));
       checkState(name, expect.get("state"), result);
+    } else if ("loadFailed".equals(op)) {
+      String dispositionRaw = (String) raw.get("disposition");
+      OtaCore.LoadFailure disposition;
+      if ("fatal".equals(dispositionRaw)) disposition = OtaCore.LoadFailure.FATAL;
+      else if ("transient".equals(dispositionRaw)) disposition = OtaCore.LoadFailure.TRANSIENT;
+      else if ("notEvidence".equals(dispositionRaw)) disposition = OtaCore.LoadFailure.NOT_EVIDENCE;
+      else throw new RuntimeException("unknown disposition " + dispositionRaw);
+      OtaCore.BootResult result = OtaCore.loadFailed(state, bundle, (String) raw.get("version"), disposition, folderExists);
+      @SuppressWarnings("unchecked")
+      Map<String, Object> expectTarget = (Map<String, Object>) expect.get("target");
+      OtaCore.Target expected = "embedded".equals(expectTarget.get("kind"))
+        ? OtaCore.Target.embedded()
+        : OtaCore.Target.version((String) expectTarget.get("name"), (String) expectTarget.get("version"));
+      check(name, "target", expected, result.target);
+      checkState(name, expect.get("state"), result.state);
     } else if ("resetForNewBinary".equals(op)) {
       String currentBinaryVersion = (String) raw.get("currentBinaryVersion");
       OtaCore.State result = OtaCore.resetForNewBinary(state, currentBinaryVersion);

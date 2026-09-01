@@ -70,6 +70,57 @@ const cache = new Map<string, string>();
 /** Logical keys awaiting a backend write. A dirty key absent from `cache` ⇒ remove. */
 const dirty = new Set<string>();
 
+/**
+ * Keys a drain has taken OUT of `dirty` but whose backend call has not settled yet (#559).
+ *
+ * ⚠️ **Without this, `hasPendingWrite`/`pendingKeys` under-report for the whole duration of every
+ * batch.** `drain()` does `const keys = [...dirty]; dirty.clear();` and only THEN awaits the
+ * backend, so a write that is still in flight — and may be about to be REJECTED — read as durable.
+ * That defeats the one signal those accessors exist to provide: `get()` re-reads the optimistic
+ * cache and therefore cannot fail, so `hasPendingWrite` is the only thing that separates "stored"
+ * from "queued while the cache lies about it" (#196, where the distinction is real money).
+ *
+ * A `Set`, not a refcount. `drain()` chains on `writeChain` and returns it, so batches are strictly
+ * SERIALIZED — two can never be in flight at once, and `keys` is `[...dirty]`, deduped by
+ * construction. A key therefore cannot be in flight twice, and a count could never exceed 1.
+ *
+ * ⚠️ An earlier version of this used a refcount and justified it as protecting the swap case — a
+ * stale batch settling after `inFlight.clear()` and deleting an entry a NEW batch made for the same
+ * key. That justification was wrong in both directions (#559 review): serialization means the
+ * overlap cannot arise in production, and where it CAN (a test's `resetPlayerPrefsForTest` re-arming
+ * `writeChain` under an unsettled batch) the refcount gave no protection anyway — the clear zeroes
+ * the count, so the stale `unmarkInFlight` computes `0 - 1` and takes the delete branch, removing
+ * exactly the entry it was supposed to preserve. Dead sophistication with a false explanation, in a
+ * file where the comments are the primary artifact.
+  */
+const inFlight = new Set<string>();
+
+function markInFlight(key: string): void {
+  inFlight.add(key);
+}
+
+/**
+ * The keys QUEUED for a future drain — `dirty` alone, deliberately excluding in-flight writes.
+ *
+ * ⚠️ **Not a weaker `pendingKeys()`; a DIFFERENT QUESTION, and the swap classification needs this
+ * one.** `pendingKeys()`/`hasPendingWrite` answer "has the backend accepted this write yet", so
+ * they must include in-flight writes (#559). `doInit`'s discard report answers "which writes were
+ * queued and never offered to a flush at all" — and an in-flight write WAS offered. Folding
+ * in-flight state into that snapshot was tried in #438 round 4 and reported a write that goes on to
+ * SUCCEED as discarded, a false loss report; it was reverted then, and widening the shared accessor
+ * silently reintroduced it until this split (#559). What caught it was the four swap-window tests
+ * from `b7a360573` (#454) — worth knowing, because nothing else in the suite would have, and the
+ * reintroduction was invisible to typecheck, lint and every Court test.
+ */
+function queuedKeys(): string[] {
+  return [...dirty];
+}
+
+/** Symmetric with `markInFlight`. A delete of an entry a swap already cleared is a no-op. */
+function unmarkInFlight(key: string): void {
+  inFlight.delete(key);
+}
+
 /** `true` for the duration of `doInit`'s body (set at the top, cleared in a `finally` so both
  *  the success and throw paths clear it) — a namespace/backend swap is in flight. Separate from
  *  `hydrated`, which deliberately stays `true` through the window describing the OUTGOING store
@@ -211,6 +262,10 @@ function drain(): Promise<void> {
     if (dirty.size === 0) return;
     const keys = [...dirty];
     dirty.clear();
+    // #559 — the keys leave `dirty` here and their backend calls have not run yet, so from this
+    // point until each one settles the in-flight ledger is the ONLY thing that can report them as
+    // still pending. Marked before the first `await`, cleared in each key's `finally` below.
+    for (const k of keys) markInFlight(k);
     const batchNamespace = namespace;
     const batchBackend = backend;
     await Promise.all(
@@ -248,6 +303,13 @@ function drain(): Promise<void> {
               err,
             );
           }
+        } finally {
+          // #559 — placed after the catch's `dirty.add(k)` for readability only. ⚠️ This is NOT
+          // load-bearing, and an earlier comment here claimed it was ("clearing this first would
+          // leave a window in which a still-unresolved write belongs to neither"). There is no such
+          // window in either ordering: `catch` and `finally` run in the same synchronous turn with
+          // no `await` between them, so no observer can sample the intermediate state.
+          unmarkInFlight(k);
         }
       }),
     );
@@ -494,7 +556,7 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
     // (rejected by the backend, or never attempted before it hit its cap). Captured AFTER
     // `flushTimer` is cleared and BEFORE the `await` below, so nothing can drain it out from
     // under us during the window (see the ⚠️ above `doInit`).
-    const preWindowPending = pendingKeys().sort();
+    const preWindowPending = queuedKeys().sort();   // #559 — see queuedKeys()
     const preWindowPendingSet = new Set(preWindowPending);
 
     let raw: Record<string, string>;
@@ -509,13 +571,21 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
       // `agentBridge.ts`'s `prefsUnhydrated()` keeps refusing reads/writes for the new
       // namespace rather than silently answering out of the old game's store.
       const outgoingNamespace = namespace;
-      const fullPending = pendingKeys().sort();
+      const fullPending = queuedKeys().sort();   // #559 — see queuedKeys()
       const fullPendingSet = new Set(fullPending);
       const racedPending = fullPending.filter((k) => !preWindowPendingSet.has(k));
       backend = nextBackend;
       namespace = nextNamespace;
       cache.clear();
       dirty.clear();
+      // #559 — describes the OUTGOING store, same as `dirty` above. ⚠️ DEFENSIVE, and NOT covered
+      // by a test: the pre-swap flush loop above means the ledger is normally already empty by the
+      // time this runs, so deleting this line leaves the whole suite green. It earns its place only
+      // for a write dirtied DURING the swap's `getAll` await (the #438 race), where a batch can
+      // still be settling at install. Kept because a stale entry here would report the OUTGOING
+      // store's write as pending against the INCOMING one, which is the wrong answer to the
+      // question `hasPendingWrite` asks.
+      inFlight.clear();
       hydrated = false;
       // Close the landing-tracking window and reclassify (#454 B) — same shape as the
       // successful-install path below; see the comment there for the reasoning.
@@ -536,8 +606,11 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
     //
     // ⚠️ Deliberately `dirty`-only, NOT anything wider. A `drain()` batch that is mid-flight at
     // this exact instant (taken out of `dirty` for its own `Promise.all`, not yet settled — see
-    // `drain()`'s doc comment) is invisible here, matching `pendingKeys()`'s own documented
-    // "authoritative only after an awaited `flush()`" caveat. That write's eventual settlement is
+    // `drain()`'s doc comment) is invisible here — which is exactly what `queuedKeys()` below
+    // means, and why this reads it rather than `pendingKeys()`. ⚠️ This used to cite
+    // `pendingKeys()`'s "authoritative only after an awaited flush" caveat; #559 deleted that
+    // caveat (it reports in-flight writes now), so the pointer would land on text saying the
+    // opposite. See `queuedKeys()`'s own doc for why the two are different questions. That write's eventual settlement is
     // NOT silently lost: `drain()` captures its own `batchNamespace`/`batchBackend` locals, so a
     // late SUCCESS lands durably in the outgoing store (nothing to report), and a late REJECTION
     // after this install has already swapped `namespace` away fires drain()'s own "already
@@ -545,13 +618,15 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
     // THIS snapshot was tried (#438 round 4) and reported a write that goes on to succeed as
     // discarded — a false loss report; reverted.
     const outgoingNamespace = namespace;
-    const fullPending = pendingKeys().sort();
+    const fullPending = queuedKeys().sort();   // #559 — see queuedKeys()
     const fullPendingSet = new Set(fullPending);
     const racedPending = fullPending.filter((k) => !preWindowPendingSet.has(k));
     backend = nextBackend;
     namespace = nextNamespace;
     cache.clear();
     dirty.clear();
+    inFlight.clear();   // #559 — see the identical clear on the failure path above, incl. why it
+                        // is defensive and uncovered.
     // Populate from a freshly-cleared cache (not layered on top of whatever was already
     // there) — clearing immediately before repopulating from `raw` means a key that survived
     // in the old cache but is absent from the incoming namespace's `getAll` result cannot
@@ -740,7 +815,9 @@ function getNamespace(): string {
  * writes are not poisoned. Meanwhile `cache` keeps the value, so `get()` happily returns it. Every
  * signal a caller normally has says the write succeeded.
  *
- * So: `await flush()` then `hasPendingWrite(key)` is the only way to learn that it did not.
+ * So: `await flush()` then `hasPendingWrite(key)` is the only way to learn that it did not — and
+ * since #559 ONE awaited flush is enough, because an in-flight write is still reported as pending.
+ * A caller no longer needs to flush repeatedly to defeat a mid-drain sample.
  *
  * This exists for the purchase ledger (#196), where the distinction is money. Its durability check
  * read the value back through `get()` and therefore could not fail: it was re-reading the
@@ -759,7 +836,9 @@ function getNamespace(): string {
  * never "it is safe". See docs/player-prefs.md § Gotchas.
  */
 function hasPendingWrite(key: string): boolean {
-  return dirty.has(key);
+  // #559 — the UNION of "queued" and "in flight". Reading `dirty` alone under-reported for the
+  // whole duration of every batch; see `inFlight`'s own doc comment.
+  return dirty.has(key) || inFlight.has(key);
 }
 
 /**
@@ -773,19 +852,26 @@ function hasPendingWrite(key: string): boolean {
  * filter, and it's exactly the trap `pendingKeys()` exists to route around by reading
  * `dirty` directly instead of reconstructing it from `cache`.
  *
- * ⚠️ **"Authoritative" holds only at a STABLE point — after an awaited `flush()`**, exactly
- * how `hasPendingWrite`'s own doc frames it ("`await flush()` then `hasPendingWrite(key)`").
- * Mid-drain it UNDER-reports: `drain()` does `const keys = [...dirty]; dirty.clear();` and
- * only then awaits the backend calls, so `dirty` (and so `pendingKeys()`) is empty for the
- * whole duration of a batch, even though every one of those writes is still in flight and
- * could be about to be rejected.
+ * ⚠️ **It no longer under-reports mid-drain (#559) — do not re-add that caveat.** This used to
+ * read `dirty` alone, which `drain()` empties BEFORE awaiting the backend, so for the whole
+ * duration of every batch each write in it reported as landed even though none had been accepted
+ * and one might be about to be rejected. It now reads the union of `dirty` and the in-flight
+ * ledger, so a write is pending from the moment it is queued until the backend settles it. Two
+ * money defects came out of the old behaviour (Court #532 F17, #558); the game-side flush-until-
+ * stable workaround could not close it either, because both of its samples can land mid-drain and
+ * agree.
+ *
+ * ⚠️ `queuedKeys()` is the DIFFERENT question — "queued and never offered to a flush" — and the
+ * swap-discard classification needs that one, not this. See its doc comment before using either.
  *
  * Same caveats as `hasPendingWrite` apply per-key: "pending" means "the backend has not
  * ACCEPTED it", not "it is unsynced to disk" — see that doc comment for what `flush()`
  * resolving does and doesn't guarantee.
  */
 function pendingKeys(): string[] {
-  return [...dirty];
+  // #559 — union, for the reason on `hasPendingWrite`. De-duplicated: a key re-set while its own
+  // earlier write is still in flight is legitimately in BOTH sets, and must appear once.
+  return [...new Set([...dirty, ...inFlight])];
 }
 
 export const PlayerPrefs = {
@@ -834,6 +920,7 @@ export function resetPlayerPrefsForTest(): void {
   swapEpoch++;
   cache.clear();
   dirty.clear();
+  inFlight.clear();
   writeChain = Promise.resolve();
   initChain = Promise.resolve();
 }

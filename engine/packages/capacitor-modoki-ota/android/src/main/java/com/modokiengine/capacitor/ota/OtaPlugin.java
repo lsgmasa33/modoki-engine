@@ -266,7 +266,9 @@ public class OtaPlugin extends Plugin {
     }
     try {
       synchronized (STATE_LOCK) {
-        OtaCore.State state = OtaCore.confirm(readState(getContext()), name);
+        // `version` is optional: the SHELL has none to name (its boot hook is the sole
+        // authority over what got served), a sub-game always passes one. See OtaCore.confirm.
+        OtaCore.State state = OtaCore.confirm(readState(getContext()), name, call.getString("version"));
         writeState(getContext(), state != null ? state : new OtaCore.State());
       }
       JSObject ret = new JSObject();
@@ -289,10 +291,10 @@ public class OtaPlugin extends Plugin {
   }
 
   /**
-   * OTA Phase 4 (docs/ota-subgame-modules.md) — every bundle with content actually
-   * on disk, `active` preferred over `pending` for the same name. See the TS
-   * `listBundles` doc comment (definitions.ts) for why `pending` counts as loadable here
-   * (unlike the shell, a sub-game has no boot-hook promotion path of its own).
+   * OTA Phase 4 (docs/ota-subgame-modules.md) — every bundle with content actually on
+   * disk. ⚠️ DISCOVERY ONLY: `active` is preferred over `pending` here, which is the
+   * opposite of what loading needs — use beginBundleLoad to decide what to load (#553).
+   * See the TS doc comment in definitions.ts.
    */
   @PluginMethod
   public void listBundles(PluginCall call) {
@@ -310,6 +312,101 @@ public class OtaPlugin extends Plugin {
     } catch (Exception e) {
       call.reject("listBundles failed: " + e.getMessage(), e);
     }
+  }
+
+  /**
+   * #553 — the sub-game counterpart of the shell's native boot hook. Decides which version
+   * of `name` to load and COUNTS THE ATTEMPT before the caller loads anything, so a bundle
+   * that takes the page down with it still burns an attempt and is eventually reverted.
+   *
+   * Uses the same OtaCore.boot() the shell does: `pending` is preferred over `active`, so
+   * the version that loads is the version a subsequent confirmBoot promotes. listBundles()
+   * orders them the other way and MUST NOT decide what to load — that is the #553 defect.
+   */
+  @PluginMethod
+  public void beginBundleLoad(PluginCall call) {
+    String name = call.getString("name");
+    if (name == null) {
+      call.reject("beginBundleLoad requires name");
+      return;
+    }
+    try {
+      OtaCore.BootResult result;
+      synchronized (STATE_LOCK) {
+        result = OtaCore.boot(readState(getContext()), name, subgameFolderExists());
+        if (result.state != null) writeState(getContext(), result.state);
+      }
+      call.resolve(targetToJs(result.target));
+    } catch (Exception e) {
+      call.reject("beginBundleLoad failed: " + e.getMessage(), e);
+    }
+  }
+
+  /**
+   * #553/#550 — records what a failed load of a SPECIFIC version proves, and returns the
+   * version to fall back to this launch. See OtaCore.LoadFailure for why the three
+   * dispositions are not interchangeable severities.
+   *
+   * The returned fallback must never be confirmed by the caller — it is the version being
+   * replaced, and crediting a confirm to it is the #553 defect itself.
+   */
+  @PluginMethod
+  public void reportBundleLoadFailure(PluginCall call) {
+    String name = call.getString("name");
+    String version = call.getString("version");
+    String dispositionRaw = call.getString("disposition");
+    if (name == null || version == null) {
+      call.reject("reportBundleLoadFailure requires name, version");
+      return;
+    }
+    OtaCore.LoadFailure disposition;
+    if ("fatal".equals(dispositionRaw)) disposition = OtaCore.LoadFailure.FATAL;
+    else if ("transient".equals(dispositionRaw)) disposition = OtaCore.LoadFailure.TRANSIENT;
+    else if ("notEvidence".equals(dispositionRaw)) disposition = OtaCore.LoadFailure.NOT_EVIDENCE;
+    else {
+      call.reject("reportBundleLoadFailure requires disposition of fatal|transient|notEvidence");
+      return;
+    }
+    try {
+      OtaCore.BootResult result;
+      synchronized (STATE_LOCK) {
+        result = OtaCore.loadFailed(readState(getContext()), name, version, disposition, subgameFolderExists());
+        if (result.state != null) writeState(getContext(), result.state);
+      }
+      call.resolve(targetToJs(result.target));
+    } catch (Exception e) {
+      call.reject("reportBundleLoadFailure failed: " + e.getMessage(), e);
+    }
+  }
+
+  /**
+   * folderExists probe for a SUB-GAME bundle — deliberately NOT the one runBootHook uses.
+   *
+   * The shell's probe additionally requires index.html, because a shell bundle is what the
+   * WebView serves. A sub-game bundle has no index.html at all — it is subgame.json +
+   * subgame.js, script-loaded into the shell's already-running page. Reusing the shell's
+   * predicate here would make EVERY sub-game look absent, and boot() answers an absent
+   * pending folder with an immediate revert: every staged sub-game would be silently thrown
+   * away on its first load. Same directory check listBundles uses.
+   */
+  private OtaCore.FolderExists subgameFolderExists() {
+    final Context context = getContext();
+    return (n, v) -> versionDir(context, n, v).isDirectory();
+  }
+
+  private JSObject targetToJs(OtaCore.Target target) {
+    JSObject ret = new JSObject();
+    if (target.kind == OtaCore.TargetKind.EMBEDDED) {
+      // A sub-game has no embedded copy (it is script-loaded, never in the app binary), so
+      // EMBEDDED means "nothing loadable for this name".
+      ret.put("target", "none");
+      return ret;
+    }
+    ret.put("target", "version");
+    ret.put("name", target.name);
+    ret.put("version", target.version);
+    ret.put("path", versionDir(getContext(), target.name, target.version).getAbsolutePath());
+    return ret;
   }
 
   private void appendStagedBundles(JSArray bundles, java.util.Set<String> seen, Map<String, String> versions) {

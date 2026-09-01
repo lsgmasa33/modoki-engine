@@ -204,39 +204,58 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   irreversible on "is it saved?" must use this; a read-back is self-confirming. Still not an fsync —
   `false` means the platform accepted it, not that it is on the platter.
 
-  ⚠️ **ONE `await flush()` is not enough when anything else in the app also flushes — and Court
-  measured that the hard way (#532 F17).** `drain()` does `const keys = [...dirty]; dirty.clear();`
-  and only THEN awaits the backend, so `dirty` is empty for the whole duration of a batch while
-  every write in it is still in flight — the same qualifier `pendingKeys()` carries below. `flush()`
-  drains at most twice, so a CONCURRENT flush can leave it resolving mid-drain, where
-  `hasPendingWrite` reads `false` for a write the backend is about to reject. A game with any
-  fire-and-forget `void flush()` on its write path has that concurrency by construction (Court's
-  `noteDurableWrite()` fires one after every player write). Measured: a gate written this way
-  credited coins for a REJECTED write and logged nothing.
+  ⚠️ **A write that is IN FLIGHT is reported as pending (#559) — one awaited `flush()` is enough.**
+  This was not always true, and the history matters because two money defects came out of it.
+  `drain()` does `const keys = [...dirty]; dirty.clear();` and only THEN awaits the backend, and
+  both accessors used to read `dirty` alone — so for the whole duration of every batch each write
+  in it reported as landed, even though none had been accepted and one might be about to be
+  rejected. Court hit it twice (#532 F17, where a gate credited coins for a rejected write and
+  logged nothing; #558, the same shape in account deletion) and worked around it game-side with a
+  flush-until-stable loop, which could not close it either: under a repeating concurrent flush BOTH
+  of that loop's samples land mid-drain and agree — measured 8/8 from a 1 ms to a 100 ms churn
+  cadence. **No caller could have fixed this**, because "a drain is in flight" is private to
+  `playerPrefs.ts`. The store now keeps an in-flight ledger and the accessors read the union of it
+  and `dirty`, so a write is pending from the moment it is queued until the backend settles it.
 
-  **So an irreversible step needs a STABLE point, not a flush: loop `await flush()` until the
-  pending SET stops changing** (compare CONTENTS, not size — a rejected key plus a newly arrived one
-  keeps the size equal), capped rather than unbounded. `doInitBody` in `playerPrefs.ts` already does
-  exactly this for the pre-swap drain, and Court's `flushToStablePoint()` is the second instance.
-  If a third appears, this belongs in the engine rather than in each caller.
+  ⚠️ **`pendingKeys()` and `queuedKeys()` answer DIFFERENT questions — do not merge them.**
+  `pendingKeys()`/`hasPendingWrite` mean "has the backend accepted this yet", so they must include
+  in-flight writes. `queuedKeys()` means "queued and never offered to a flush at all", which is what
+  `init()`'s swap-discard report needs — an in-flight write WAS offered. Folding in-flight state
+  into that report was tried in #438 round 4 and announced a write that goes on to SUCCEED as
+  discarded; it was reverted then, and widening the shared accessor silently reintroduced it during
+  #559 until the two were split. The four #454 swap tests are what caught it.
 
-  ⚠️ **#558 is evidence for that move, though it does not yet trigger it.** A second clone, writing
-  account-deletion durability gates on a parallel branch, independently reached for the bare
-  `flush()` → `hasPendingWrite` → one-retry idiom and documented a mid-drain defence it did not
-  have — because the correct helper was game-private in a file it had not merged. The two met in a
-  clean auto-merge, `verify` was green, and the wrong gate shipped. The count of IMPLEMENTATIONS is
-  still two, so the rule above stands; but the failure mode it guards against is no longer
-  hypothetical, and the reason it happened is precisely that the safe version was not reachable from
-  the engine surface everyone reads.
+  ⚠️ **The lesson from #559, which generalises past this module: a documented gap becomes a
+  licence.** The under-report was known for months and had a TEST pinning it — titled "pinning
+  KNOWN behaviour the doc now qualifies, not a bug" (#422). That test did not merely fail to stop
+  the two money defects that followed; **both of them cited its framing as evidence the behaviour
+  was intended**, and each built a game-side workaround on top of it instead of questioning it. A
+  caveat written honestly, by someone who understood the mechanism, is still the thing that made
+  four months of nobody re-litigating it feel reasonable.
+
+  The second half is about where evidence has to come from. #559's severity was set by REASONING —
+  a claim that Court's wipe path churned once per frame, which made the false-confirm look live in
+  production. It was false (`coinsCache` is assigned outside the suppression guard, so the branch
+  re-enters once per cache-nulling, not per frame), and it was corrected only when someone read the
+  code rather than the argument. Reasoning set the priority; observation corrected it. Several other
+  claims in the same change went the same way, always prose asserting a mechanism, never wrong code.
+  **When a durability claim decides what gets built, measure it before it sets.**
+
+  **An irreversible step still wants `await flush()` then `hasPendingWrite`** — that pair is the
+  durability check, and it is sound again. A repeated-flush loop is now only a RETRY convenience
+  (each turn re-attempts a rejected write), not a correctness requirement. Court's
+  `flushToStablePoint()` is retained on that reduced basis.
 
 - ⚠️ **`keys()` cannot see a rejected DELETE — use `pendingKeys()`, not `keys().filter(hasPendingWrite)`.**
   `delete(key)` removes the key from `cache` (and so from `keys()`) in the same call that marks it
   `dirty`, so a key with a rejected `backend.remove()` is dirty and simultaneously absent from every
   cache-derived view. `pendingKeys()` reads `dirty` directly and is the only source that sees it
   (#422 — the agent-facing `player-prefs` ops reported `pendingWrites: []` for exactly this case
-  before the fix). **"Authoritative" holds only at a STABLE point — after an awaited `flush()`**,
-  the same qualifier `hasPendingWrite` already carries: `drain()` empties `dirty` BEFORE awaiting the
-  backend calls, so mid-drain `pendingKeys()` under-reports a write that is genuinely in flight.
+  before the fix). ⚠️ It reads the union of `dirty` and the in-flight ledger, NOT `dirty` alone, and
+  the "authoritative only at a stable point" qualifier this bullet used to carry is gone with #559 —
+  see the bullet above. Do not re-add it; a reader who takes the two bullets together would
+  otherwise conclude a bare `await flush()` is still unsound and rebuild the game-side loop #559
+  exists to retire.
 
 - ⚠️ **`init()` DISCARDS whatever a failed flush re-queued — it now REPORTS this instead of
   silently dropping it (#421).** `init()` clears `cache`/`dirty` unconditionally to hydrate the new

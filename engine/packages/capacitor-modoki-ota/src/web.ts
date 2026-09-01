@@ -26,4 +26,10 @@ export class ModokiOtaWeb extends WebPlugin implements ModokiOtaPlugin {
   async listBundles(): Promise<{ bundles: { name: string; version: string; path: string }[] }> {
     return { bundles: [] };
   }
+  async beginBundleLoad(): Promise<{ target: 'none' }> {
+    return { target: 'none' }; // nothing is staged on web — there is no staging mechanism
+  }
+  async reportBundleLoadFailure(): Promise<{ target: 'none' }> {
+    return { target: 'none' }; // no state to revert, and no fallback version on disk
+  }
 }

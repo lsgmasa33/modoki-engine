@@ -1,0 +1,524 @@
+{
+  "_comment": "Sub-game load-failure vectors (#553/#550) — the demotion path a sub-game bundle never had. Replayed by BOTH platforms (OtaCoreTests.swift and OtaCoreSelfTest.java) alongside the Phase 1 golden vectors and the Phase 3a gate vectors; all three must produce identical results.",
+  "_why": "#553: `listBundles()` preferred `active` over `pending`, so a sub-game update was promoted to `active` on the strength of two successful loads of the version it REPLACES, having never once executed. Device-verified offline on a Galaxy S22, 2026-09-01. The fix is two-sided and both sides are specified here: `confirm` may name the version it is confirming (a mismatch is a no-op), and `loadFailed` gives a sub-game the revert/quarantine the shell has had since Phase 3a. Disposition semantics are the load-bearing part — see OtaCore.swift's OtaLoadFailure doc. Three later scenarios cover the ACTIVE slot: `bootAttempts` is a PENDING-only counter, so a `transient` failure of an already-promoted version has nothing to count and nothing to exhaust — it must clear `active` (never quarantine) or it would be refused every launch forever with no escalation, which is the very shape this file exists to prevent.",
+  "constants": {
+    "maxAttempts": 3,
+    "requiredConfirms": 2
+  },
+  "scenarios": [
+    {
+      "name": "fatal_pending_reverts_to_active_and_QUARANTINES",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v2",
+      "disposition": "fatal",
+      "state": {
+        "active": {
+          "subgame": "v1"
+        },
+        "pending": {
+          "subgame": "v2"
+        },
+        "bootAttempts": {
+          "subgame": 1
+        },
+        "confirmedBoots": {
+          "subgame": 1
+        }
+      },
+      "folderExists": {
+        "subgame/v1": true,
+        "subgame/v2": true
+      },
+      "expect": {
+        "target": {
+          "kind": "version",
+          "name": "subgame",
+          "version": "v1"
+        },
+        "state": {
+          "active": {
+            "subgame": "v1"
+          },
+          "rejected": {
+            "subgame": [
+              "v2"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "fatal_pending_with_no_active_falls_back_to_embedded_and_QUARANTINES",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v1",
+      "disposition": "fatal",
+      "state": {
+        "pending": {
+          "subgame": "v1"
+        },
+        "bootAttempts": {
+          "subgame": 1
+        }
+      },
+      "folderExists": {
+        "subgame/v1": true
+      },
+      "expect": {
+        "target": {
+          "kind": "embedded"
+        },
+        "state": {
+          "rejected": {
+            "subgame": [
+              "v1"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "transient_keeps_the_attempt_and_does_NOT_quarantine",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v2",
+      "disposition": "transient",
+      "state": {
+        "active": {
+          "subgame": "v1"
+        },
+        "pending": {
+          "subgame": "v2"
+        },
+        "bootAttempts": {
+          "subgame": 1
+        }
+      },
+      "folderExists": {
+        "subgame/v1": true,
+        "subgame/v2": true
+      },
+      "expect": {
+        "target": {
+          "kind": "version",
+          "name": "subgame",
+          "version": "v1"
+        },
+        "state": {
+          "active": {
+            "subgame": "v1"
+          },
+          "pending": {
+            "subgame": "v2"
+          },
+          "bootAttempts": {
+            "subgame": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "notEvidence_GIVES_THE_ATTEMPT_BACK_and_never_quarantines",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v2",
+      "disposition": "notEvidence",
+      "state": {
+        "active": {
+          "subgame": "v1"
+        },
+        "pending": {
+          "subgame": "v2"
+        },
+        "bootAttempts": {
+          "subgame": 1
+        }
+      },
+      "folderExists": {
+        "subgame/v1": true,
+        "subgame/v2": true
+      },
+      "expect": {
+        "target": {
+          "kind": "version",
+          "name": "subgame",
+          "version": "v1"
+        },
+        "state": {
+          "active": {
+            "subgame": "v1"
+          },
+          "pending": {
+            "subgame": "v2"
+          }
+        }
+      }
+    },
+    {
+      "name": "notEvidence_decrements_a_higher_attempt_count_rather_than_clearing_it",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v2",
+      "disposition": "notEvidence",
+      "state": {
+        "active": {
+          "subgame": "v1"
+        },
+        "pending": {
+          "subgame": "v2"
+        },
+        "bootAttempts": {
+          "subgame": 3
+        }
+      },
+      "folderExists": {
+        "subgame/v1": true,
+        "subgame/v2": true
+      },
+      "expect": {
+        "target": {
+          "kind": "version",
+          "name": "subgame",
+          "version": "v1"
+        },
+        "state": {
+          "active": {
+            "subgame": "v1"
+          },
+          "pending": {
+            "subgame": "v2"
+          },
+          "bootAttempts": {
+            "subgame": 2
+          }
+        }
+      }
+    },
+    {
+      "name": "fatal_on_an_ALREADY_ACTIVE_version_clears_it_WITHOUT_quarantine",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v2",
+      "disposition": "fatal",
+      "state": {
+        "active": {
+          "subgame": "v2"
+        }
+      },
+      "folderExists": {
+        "subgame/v2": true
+      },
+      "expect": {
+        "target": {
+          "kind": "embedded"
+        },
+        "state": {}
+      }
+    },
+    {
+      "name": "fatal_pending_whose_active_fallback_folder_is_gone_ends_at_embedded",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v2",
+      "disposition": "fatal",
+      "state": {
+        "active": {
+          "subgame": "v1"
+        },
+        "pending": {
+          "subgame": "v2"
+        },
+        "bootAttempts": {
+          "subgame": 2
+        }
+      },
+      "folderExists": {
+        "subgame/v2": true
+      },
+      "expect": {
+        "target": {
+          "kind": "embedded"
+        },
+        "state": {
+          "rejected": {
+            "subgame": [
+              "v2"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "a_failure_naming_a_version_that_is_neither_pending_nor_active_changes_NOTHING",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v9",
+      "disposition": "fatal",
+      "state": {
+        "active": {
+          "subgame": "v1"
+        },
+        "pending": {
+          "subgame": "v2"
+        },
+        "bootAttempts": {
+          "subgame": 1
+        }
+      },
+      "folderExists": {
+        "subgame/v1": true,
+        "subgame/v2": true
+      },
+      "expect": {
+        "target": {
+          "kind": "version",
+          "name": "subgame",
+          "version": "v1"
+        },
+        "state": {
+          "active": {
+            "subgame": "v1"
+          },
+          "pending": {
+            "subgame": "v2"
+          },
+          "bootAttempts": {
+            "subgame": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "loadFailed_never_touches_another_bundles_bookkeeping",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v2",
+      "disposition": "fatal",
+      "state": {
+        "active": {
+          "shell": "v20",
+          "subgame": "v1"
+        },
+        "pending": {
+          "shell": "v21",
+          "subgame": "v2"
+        },
+        "bootAttempts": {
+          "shell": 2,
+          "subgame": 1
+        }
+      },
+      "folderExists": {
+        "shell/v20": true,
+        "shell/v21": true,
+        "subgame/v1": true,
+        "subgame/v2": true
+      },
+      "expect": {
+        "target": {
+          "kind": "version",
+          "name": "subgame",
+          "version": "v1"
+        },
+        "state": {
+          "active": {
+            "shell": "v20",
+            "subgame": "v1"
+          },
+          "pending": {
+            "shell": "v21"
+          },
+          "bootAttempts": {
+            "shell": 2
+          },
+          "rejected": {
+            "subgame": [
+              "v2"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "loadFailed_on_a_null_state_is_embedded_and_stays_null",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v1",
+      "disposition": "fatal",
+      "state": null,
+      "folderExists": {},
+      "expect": {
+        "target": {
+          "kind": "embedded"
+        },
+        "state": null
+      }
+    },
+    {
+      "name": "confirm_naming_the_pending_version_promotes_it",
+      "op": "confirm",
+      "bundle": "subgame",
+      "version": "v2",
+      "state": {
+        "active": {
+          "subgame": "v1"
+        },
+        "pending": {
+          "subgame": "v2"
+        },
+        "bootAttempts": {
+          "subgame": 2
+        },
+        "confirmedBoots": {
+          "subgame": 1
+        }
+      },
+      "expect": {
+        "state": {
+          "active": {
+            "subgame": "v2"
+          }
+        }
+      }
+    },
+    {
+      "name": "confirm_naming_a_DIFFERENT_version_than_pending_is_a_NO_OP",
+      "op": "confirm",
+      "bundle": "subgame",
+      "version": "v1",
+      "state": {
+        "active": {
+          "subgame": "v1"
+        },
+        "pending": {
+          "subgame": "v2"
+        },
+        "bootAttempts": {
+          "subgame": 1
+        },
+        "confirmedBoots": {
+          "subgame": 1
+        }
+      },
+      "expect": {
+        "state": {
+          "active": {
+            "subgame": "v1"
+          },
+          "pending": {
+            "subgame": "v2"
+          },
+          "bootAttempts": {
+            "subgame": 1
+          },
+          "confirmedBoots": {
+            "subgame": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "confirm_naming_a_different_version_does_not_even_count_toward_promotion",
+      "op": "confirm",
+      "bundle": "subgame",
+      "version": "v1",
+      "state": {
+        "active": {
+          "subgame": "v1"
+        },
+        "pending": {
+          "subgame": "v2"
+        }
+      },
+      "expect": {
+        "state": {
+          "active": {
+            "subgame": "v1"
+          },
+          "pending": {
+            "subgame": "v2"
+          }
+        }
+      }
+    },
+    {
+      "name": "transient_on_an_ACTIVE_version_ALSO_clears_it_bootAttempts_is_pending_only",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v2",
+      "disposition": "transient",
+      "state": {
+        "active": {
+          "subgame": "v2"
+        }
+      },
+      "folderExists": {
+        "subgame/v2": true
+      },
+      "expect": {
+        "target": {
+          "kind": "embedded"
+        },
+        "state": {}
+      }
+    },
+    {
+      "name": "notEvidence_on_an_ACTIVE_version_leaves_it_alone_it_is_about_the_HOST",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v2",
+      "disposition": "notEvidence",
+      "state": {
+        "active": {
+          "subgame": "v2"
+        }
+      },
+      "folderExists": {
+        "subgame/v2": true
+      },
+      "expect": {
+        "target": {
+          "kind": "embedded"
+        },
+        "state": {
+          "active": {
+            "subgame": "v2"
+          }
+        }
+      }
+    },
+    {
+      "name": "clearing_a_failed_ACTIVE_version_never_quarantines_it",
+      "op": "loadFailed",
+      "bundle": "subgame",
+      "version": "v2",
+      "disposition": "transient",
+      "state": {
+        "active": {
+          "subgame": "v2"
+        },
+        "rejected": {
+          "subgame": [
+            "v0"
+          ]
+        }
+      },
+      "folderExists": {
+        "subgame/v2": true
+      },
+      "expect": {
+        "target": {
+          "kind": "embedded"
+        },
+        "state": {
+          "rejected": {
+            "subgame": [
+              "v0"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

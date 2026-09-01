@@ -65,27 +65,76 @@ export interface ModokiOtaPlugin {
   /** Call once this session reaches its OWN "fully booted" signal (this app's is
    *  `initialized` in App.tsx). A no-op if nothing is pending for `name`. Promotion to
    *  `active` requires TWO separate successful calls across TWO separate app launches —
-   *  never assume a single call promotes anything. */
-  confirmBoot(options: { name: string }): Promise<{ ok: boolean }>;
+   *  never assume a single call promotes anything.
+   *
+   *  `version` names the version this confirm is EVIDENCE ABOUT; if it is not the one
+   *  currently pending, the call is a no-op. ⚠️ This argument is the #553 fix. Promotion
+   *  used to be decoupled from the version being promoted, so a sub-game could load the OLD
+   *  version, succeed, confirm — twice — and promote a NEW version that had never once run.
+   *  Omitting it is correct ONLY for the shell, whose native boot hook is the sole authority
+   *  over what got served and already prefers `pending`. A sub-game must always pass it. */
+  confirmBoot(options: { name: string; version?: string }): Promise<{ ok: boolean }>;
+
+  /** #553 — decides which version of `name` to load AND records the attempt, before the
+   *  caller loads anything. The sub-game counterpart of the shell's native cold-start boot
+   *  hook, running the very same `OtaCore.boot()` decision.
+   *
+   *  ⚠️ Use THIS, never `listBundles()`, to decide what to load. `listBundles` prefers
+   *  `active` over `pending`; this prefers `pending` over `active`, which is what makes a
+   *  subsequent `confirmBoot` evidence about the version that actually ran. It also counts
+   *  the attempt up front, so a bundle that takes the page down with it still burns one and
+   *  is reverted after `maxAttempts` — the watchdog a sub-game bundle never had.
+   *
+   *  `{ target: 'none' }` means nothing is loadable for this name (no staged version, or the
+   *  watchdog just reverted the last one and there is no fallback). A sub-game has no
+   *  embedded copy, so 'none' really does mean "don't offer this game this launch". */
+  beginBundleLoad(options: { name: string }): Promise<
+    { target: 'none' } | { target: 'version'; name: string; version: string; path: string }
+  >;
+
+  /** #553/#550 — records what a failed load of a SPECIFIC version proves, and returns the
+   *  version to fall back to for the rest of THIS launch.
+   *
+   *  - `'fatal'` — the published bytes are broken (unreadable `subgame.json`, a script that
+   *    will not load, a missing/unparseable `assets.manifest.json`, a module with no
+   *    `game.id`). Reverts immediately AND quarantines: the zip was hash-verified at stage
+   *    time, so re-staging fetches the identical broken bytes, and without the quarantine
+   *    `checkForUpdate` re-downloads it on every single launch (owner ruling, 2026-09-01).
+   *  - `'transient'` — may not recur (a shared-dependency fetch failed). Costs one attempt.
+   *  - `'notEvidence'` — ⚠️ says nothing about the bundle: an `engineApi` mismatch or a
+   *    `gameId` collision. Gives the attempt back and NEVER quarantines — `rejected` survives
+   *    a binary update, so quarantining a version mismatch would permanently block a bundle
+   *    the next app binary would run perfectly.
+   *
+   *  ⚠️ The returned fallback must NEVER be passed to `confirmBoot` — it is the version being
+   *  replaced, and crediting a confirm to it is the #553 defect itself. */
+  reportBundleLoadFailure(options: {
+    name: string;
+    version: string;
+    disposition: 'fatal' | 'transient' | 'notEvidence';
+  }): Promise<{ target: 'none' } | { target: 'version'; name: string; version: string; path: string }>;
 
   /** Debug/inspection only — the raw state.json contents (or the literal string "null"
    *  if absent/corrupt), e.g. for a debug-menu tab. Never parse this for control flow. */
   getState(): Promise<{ stateJSON: string }>;
 
-  /** OTA Phase 4 (docs/ota-subgame-modules.md) — every bundle this device has
-   *  content for on disk, `active` preferred over `pending` for the SAME name.
-   *  DELIBERATELY does not distinguish active/pending the way `getState` does: a
-   *  sub-game bundle has no boot-hook promotion path of its own (unlike the shell,
-   *  `pending` only promotes to `active` via a native boot hook that decides what the
-   *  WKWebView/WebView serves at COLD START — meaningless for something dynamically
-   *  script-loaded inside an already-running page), so a `pending` sub-game is already
-   *  safe to treat as loadable within the same session it was staged — a broken one
-   *  fails the engine-API check or the script tag's `onerror`, never the app's boot.
-   *  `path` is an absolute native filesystem path — pass it to
-   *  `Capacitor.convertFileSrc()` to get a script-loadable URL. Includes EVERY bundle
-   *  with content on disk, including the one this running instance itself drives —
-   *  native has no notion of "self", so filtering that out (the caller already knows
-   *  its own `ota.bundleName`) is the CALLER's job. */
+  /** OTA Phase 4 (docs/ota-subgame-modules.md) — every bundle this device has content for
+   *  on disk. **DISCOVERY ONLY — this is not how you decide what to load.**
+   *
+   *  ⚠️ `active` is preferred over `pending` for the same name, which is the OPPOSITE of what
+   *  loading a sub-game needs. This comment used to argue that a `pending` sub-game "is
+   *  already safe to treat as loadable within the same session it was staged"; that holds
+   *  only on a FIRST install, where the name has no `active` version. On an UPDATE the
+   *  ordering here means the pending version is precisely the one that does NOT load — so
+   *  the old version loaded, succeeded, and called `confirmBoot`, and two of those promoted
+   *  the new version to `active` having never executed once. Device-verified on a Galaxy S22
+   *  (#553). Use {@link beginBundleLoad} to decide what to load; use this only to enumerate
+   *  which bundle NAMES have content on disk.
+   *
+   *  `path` is an absolute native filesystem path — pass it to `Capacitor.convertFileSrc()`
+   *  to get a script-loadable URL. Includes EVERY bundle with content on disk, including the
+   *  one this running instance itself drives — native has no notion of "self", so filtering
+   *  that out (the caller already knows its own `ota.bundleName`) is the CALLER's job. */
   listBundles(): Promise<{ bundles: { name: string; version: string; path: string }[] }>;
 
   /** Progress ticks emitted by `stageUpdate`/`stageUpdateDelta` while they run — see

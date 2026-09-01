@@ -351,7 +351,7 @@ describe('PlayerPrefs — backend-failure resilience', () => {
     expect(PlayerPrefs.pendingKeys()).toContain('k'); // authoritative: still pending
   });
 
-  it('pendingKeys() under-reports MID-DRAIN — pinning KNOWN behaviour the doc now qualifies, not a bug (#422)', async () => {
+  it('pendingKeys() reports a MID-DRAIN write as still pending — it used to under-report, which was a bug, not a documented quirk (#422 -> #559)', async () => {
     // `drain()` does `const keys = [...dirty]; dirty.clear();` and only THEN awaits the backend
     // calls, so `dirty` — and so `pendingKeys()` — is empty for the entire duration of a batch,
     // even though every one of those writes is genuinely still in flight. This mechanic is
@@ -383,15 +383,38 @@ describe('PlayerPrefs — backend-failure resilience', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    // Mid-drain: the write is genuinely in flight (blocked on `gate`), but `dirty` has already
-    // been emptied — this is the under-report the doc comments now describe.
-    expect(PlayerPrefs.pendingKeys()).toEqual([]);
+    // ⚠️ **THIS EXPECTATION WAS INVERTED BY #559, and the old one was wrong — not merely
+    // superseded.** The title this test used to carry, kept as the scar:
+    //
+    //     "pendingKeys() under-reports MID-DRAIN — pinning KNOWN behaviour the doc now qualifies,
+    //      not a bug (#422)"
+    //
+    // A defect with a guard posted on it. It did not merely permit #532 F17 and #558 — both CITED
+    // this test's framing as evidence the behaviour was intended, which is how a documented gap
+    // becomes a licence. If you are here to relax this assertion, that is the history to beat. It used to assert `[]` here and called that "known behaviour the doc
+    // qualifies". It was a defect with a test defending it: mid-drain the write is genuinely in
+    // flight and about to be REJECTED, and reporting it as landed defeats the only signal these
+    // accessors exist to give. `get()` re-reads the optimistic cache and cannot fail, so
+    // `hasPendingWrite`/`pendingKeys` are the sole way to tell "stored" from "queued while the
+    // cache lies" — the distinction #196 added them for, where it is real money.
+    //
+    // Documenting the gap did not shrink it: Court then hit it twice (#532 F17 — a gate credited
+    // coins for a rejected write and logged nothing; #558 — the same shape in account deletion) and
+    // built a flush-until-stable loop game-side that could not close it either, because under a
+    // repeating concurrent flush BOTH of that loop's samples land mid-drain and agree. No caller
+    // could fix this: "a drain is in flight" is private to the module.
+    expect(
+      PlayerPrefs.pendingKeys(),
+      'a write still in flight has not been accepted, so it is still pending',
+    ).toEqual(['k']);
+    expect(PlayerPrefs.hasPendingWrite('k')).toBe(true);
 
     releaseGate();
     await flushPromise;
 
-    // The blocked write has now resolved — and rejected — so it was re-queued into `dirty`.
-    // `pendingKeys()` is authoritative again now that we're at a stable point (post-flush).
+    // The blocked write has now resolved — and rejected — so it was re-queued into `dirty`. Since
+    // #559 there is no longer a window in which it read as durable, so this is a continuation of
+    // the state above rather than a recovery from a temporary lie.
     expect(PlayerPrefs.pendingKeys()).toContain('k');
   });
 
@@ -905,5 +928,97 @@ describe('PlayerPrefs — namespace edge cases', () => {
     // The empty namespace maps to 'default', not 'realGame'.
     expect(Object.keys(await backend.getAll('mk:default:'))).toEqual(['mk:default:x']);
     expect(PlayerPrefs.get('score')).toBeUndefined();
+  });
+});
+
+/**
+ * #559 — `hasPendingWrite`/`pendingKeys` must not UNDER-REPORT a write that is still in flight.
+ *
+ * The defect: `drain()` does `const keys = [...dirty]; dirty.clear();` and only THEN awaits the
+ * backend, and both accessors read `dirty` alone. So for the whole duration of a batch every write
+ * in it reports as landed, even though none of them has been accepted yet — and if the backend then
+ * REJECTS one, the caller has already been told it was durable.
+ *
+ * ⚠️ **Why this is a correctness bug and not a documentation nit.** `hasPendingWrite`'s entire
+ * reason for existing is that `get()` re-reads the optimistic cache and so cannot fail — it is the
+ * one signal that separates "stored" from "queued while the cache lies about it", and #196 built it
+ * because the distinction is real money. A signal that reads `false` while the write is in flight
+ * does not answer the question it was added to answer.
+ *
+ * Court hit this twice (#532 F17, #558) and worked around it game-side with a flush-until-stable
+ * loop, which does not close the hole either: under a repeating concurrent flush BOTH of that
+ * loop's samples can be mid-drain and agree. No game-side loop can fix it, because no game-side
+ * code can observe "a drain is in flight" — that is this module's private state.
+ */
+describe('PlayerPrefs — an in-flight write is still pending (#559)', () => {
+  /** Holds the drain's await open until released, so the test can observe mid-drain state. */
+  class GatedBackend implements PrefsBackend {
+    private readonly inner = new InMemoryBackend();
+    readonly started: Promise<void>;
+    private announceStarted!: () => void;
+    private release!: () => void;
+    private readonly gate: Promise<void>;
+    constructor(private readonly suffix: string, private readonly reject: boolean) {
+      this.started = new Promise((r) => { this.announceStarted = r as () => void; });
+      this.gate = new Promise((r) => { this.release = r as () => void; });
+    }
+    releaseWrite(): void { this.release(); }
+    getAll(prefix: string) { return this.inner.getAll(prefix); }
+    async set(fullKey: string, value: string): Promise<void> {
+      if (!fullKey.endsWith(this.suffix)) return this.inner.set(fullKey, value);
+      this.announceStarted();
+      await this.gate;
+      if (this.reject) throw new Error('simulated: backend write rejected');
+      return this.inner.set(fullKey, value);
+    }
+    async remove(fullKey: string): Promise<void> { return this.inner.remove(fullKey); }
+  }
+
+  it('reports a write as pending WHILE the backend call is outstanding', async () => {
+    const be = new GatedBackend('money', false);
+    await PlayerPrefs.init({ namespace: 'inflight-a', backend: be });
+    PlayerPrefs.set('money', { coins: 100 });
+
+    const flushed = PlayerPrefs.flush();
+    await be.started;   // the drain has taken the key and is awaiting the backend
+
+    expect(
+      PlayerPrefs.hasPendingWrite('money'),
+      'a write the backend has not accepted yet is still pending, not durable',
+    ).toBe(true);
+    expect(PlayerPrefs.pendingKeys()).toContain('money');
+
+    be.releaseWrite();
+    await flushed;
+    expect(PlayerPrefs.hasPendingWrite('money')).toBe(false);
+  });
+
+  // Two sampled points, not "at any point" — an earlier title claimed the latter, which is neither
+  // observable nor asserted. What this pins is that the write reads as pending BOTH while the
+  // backend call is outstanding and after the rejection re-queues it, so there is no transition
+  // between them at which it read as durable.
+  it('a REJECTED in-flight write reads as pending both mid-flight and after the rejection', async () => {
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      const be = new GatedBackend('money', true);
+      await PlayerPrefs.init({ namespace: 'inflight-b', backend: be });
+      PlayerPrefs.set('money', { coins: 100 });
+
+      const flushed = PlayerPrefs.flush();
+      await be.started;
+      expect(PlayerPrefs.hasPendingWrite('money')).toBe(true);
+
+      be.releaseWrite();
+      await flushed;
+      // Re-queued by drain()'s catch, so it is still pending after the flush too. The point of the
+      // test is that there was no WINDOW in between where it read as durable.
+      expect(
+        PlayerPrefs.hasPendingWrite('money'),
+        'a rejected write must never report durable',
+      ).toBe(true);
+    } finally {
+      console.warn = warn;
+    }
   });
 });
