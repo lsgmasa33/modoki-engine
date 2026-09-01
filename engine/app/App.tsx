@@ -10,11 +10,12 @@ import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
 import LoadingOverlay from './ui/components/LoadingOverlay';
 import { dismissBootSplash, hasBootSplash, BOOT_SPLASH_TIMEOUT_MS } from './ui/bootSplash';
 import { initWorldSync } from './ecs/init';
+import { teardownAll } from './ecs/register';
 import { runPipeline } from './ecs/pipeline';
 import { GAMES } from 'virtual:modoki-games';
 import type { GameDefinition } from '@modoki/engine/runtime';
 import { setActiveResetPhase } from './ui/components/ErrorBoundary';
-import { audioDispose, audioResume } from '@modoki/engine/runtime';
+import { audioResume } from '@modoki/engine/runtime';
 import { VideoOverlay } from '@modoki/engine/runtime';
 import { useKeyboardShift } from './hooks/useKeyboardShift';
 import { onTierSwitchOverlay } from '@modoki/engine/runtime';
@@ -129,6 +130,44 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
   const [tierSwitchMessage, setTierSwitchMessage] = useState<string | null>(null);
   const activeGameIdRef = useRef<string | null>(null);
   /**
+   * A game whose teardown has STARTED but whose destructive half has not finished (#516).
+   *
+   * ⚠️ `activeGameIdRef` cannot answer this, and that gap is the bug. It is written only on the
+   * success path, so between "A's systems are unregistered" and "B is loaded" it still says A —
+   * and an A→B→A swap-back therefore took the `activeGameIdRef.current === gameId` early return
+   * and re-registered nothing, leaving A on screen with its systems, projections and managers
+   * gone for the rest of the session while the loading overlay was dismissed over the top.
+   *
+   * So a teardown publishes itself here BEFORE its first await, and `activeGameIdRef` is nulled
+   * at the same moment: a half-torn-down game is not loaded, and must not be treated as loaded.
+   *
+   * ⚠️ It holds the unregister PROMISE, not a boolean, because the re-entry must JOIN the
+   * teardown rather than repeat it. `unregisterSystems` is a `GameDefinition` hook, and the
+   * once-per-load contract documented on `configReadyRef` above is exactly the rule that a
+   * second call would break — while merely skipping it would race the still-running first call
+   * against the re-registration below it.
+   */
+  const teardownRef = useRef<{ gameId: string; systems: Promise<unknown> } | null>(null);
+  /**
+   * Which game currently OWNS registered engine state — systems, projections, managers,
+   * app-services — as opposed to which one finished booting.
+   *
+   * ⚠️ The two are not the same, and using the second for the first is #516's other half. A boot
+   * cancelled AFTER `registerSystems()` has run leaves that game's systems live while it never
+   * reaches the success path, so a guard written on success alone names nobody, the next swap
+   * tears down nothing, and the incoming game boots on top of the outgoing one's still-running
+   * systems. Written immediately BEFORE the first registration and cleared only when a
+   * teardown's destructive half has completed.
+   *
+   * ⚠️ "Registered state" starts at `registerPostprocessors`, the first hook below that registers
+   * anything — not at `registerSystems`. So a boot cancelled between the two leaves this naming a
+   * game that owns postprocessors but no systems, and the next swap will call its
+   * `unregisterSystems`. That is safe because every shipped `unregisterGameSystems` opens with an
+   * `if (!registered) return;` latch, and it is the right bias: naming a game that owes nothing
+   * costs a no-op call, while failing to name one that does is #516.
+   */
+  const registeredGameIdRef = useRef<string | null>(null);
+  /**
    * Mirrors of `configReady` / `initialized` for the LOAD EFFECT to read (#267).
    *
    * ⚠️ THE EFFECT BELOW SETS BOTH OF THOSE STATE VALUES MID-BODY, so reading the state
@@ -209,10 +248,16 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
     }
     if (activeGameIdRef.current === gameId) {
       // Already the loaded game, so there is no transition in progress — and saying so is
-      // load-bearing, not tidiness. A→B→A while B is still in flight cancels B's run before
-      // it can reach either `setTransitioning(false)` below, and lands here, where the old
-      // early return left `transitioning` stuck TRUE for the rest of the session: the
-      // opaque LoadingOverlay covers a game that is running perfectly well underneath.
+      // load-bearing, not tidiness: the old early return left `transitioning` stuck TRUE for
+      // the rest of the session, an opaque LoadingOverlay over a game running perfectly well
+      // underneath.
+      //
+      // ⚠️ This guard NO LONGER catches the A→B→A swap-back (#516). `activeGameIdRef` is nulled
+      // the moment A's teardown starts, so a game that is mid-teardown is not "already loaded"
+      // and the swap-back falls through to finish the teardown and re-boot it. Reaching here
+      // now means what it says — the game is loaded and intact — which is the only reading that
+      // makes `return` safe. Restoring the old "written on success only" behaviour would put
+      // #516 straight back: A on screen, systems gone, overlay dismissed.
       setTransitioning(false);
       return; // no-op re-render
     }
@@ -241,26 +286,64 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // Tear down previous game's systems before registering the new game's.
         // Without this, projection systems from prior games keep running and
         // operating on the wrong world state.
-        const prevGameId = activeGameIdRef.current;
-        if (prevGameId && prevGameId !== gameId) {
+        // A teardown already in flight names the previous game even after `activeGameIdRef` has
+        // been nulled — and it makes the block below run even when the incoming game IS that
+        // game (the A→B→A case), because A is in pieces and owed the rest of its teardown before
+        // it can be booted again.
+        // ⚠️ SECOND reachability of the `prevGameId === gameId` skip below, beyond the
+        // parked-boot case the tests cover: a teardown that REJECTED nulls `teardownRef` but
+        // leaves `registeredGameIdRef` naming a fully registered game, and the error screen's
+        // `#/` link does not unmount GameShell (it falls back to `GAMES[0]`), so that tap is a
+        // real gameId change back to the game that owns everything. It re-boots without
+        // `clearAppServices()`. Benign today — every shipped `registerGameSystems` is latched,
+        // `registerFrameCallback` is Map-keyed, and pre-fix that navigation stuck on the error
+        // screen forever — but it is the branch to re-examine if a game's register half ever
+        // stops being idempotent.
+        const pendingTeardown = teardownRef.current;
+        const prevGameId = pendingTeardown?.gameId ?? registeredGameIdRef.current;
+        if (prevGameId && (pendingTeardown !== null || prevGameId !== gameId)) {
           const prevDef = findGame(prevGameId);
-          if (prevDef?.unregisterSystems) await prevDef.unregisterSystems();
+          // Start the teardown, or join one a cancelled run already started. Publishing it
+          // BEFORE the await is what makes the swap-back see a game that is not loaded; awaiting
+          // the SAME promise is what keeps the hook called exactly once.
+          let systems = pendingTeardown?.systems;
+          if (!systems) {
+            systems = Promise.resolve(prevDef?.unregisterSystems ? prevDef.unregisterSystems() : undefined);
+            activeGameIdRef.current = null;
+            teardownRef.current = { gameId: prevGameId, systems };
+          }
+          try {
+            await systems;
+          } catch (e) {
+            // ⚠️ A REJECTED teardown must not be memoized. `teardownRef` holds the promise so a
+            // re-entry can join it, and a rejection would otherwise be joined forever: every
+            // later swap re-awaits the same dead promise, rethrows A's original failure, and NO
+            // GAME EVER BOOTS AGAIN — with the error text naming a game the player left long
+            // ago. Reachable, not theoretical: every real `unregisterSystems` is
+            // `() => import('./runtime/setup').then(...)`, a dynamic chunk import, which rejects
+            // on a chunk 404 after a deploy or on a flaky network — exactly the OTA sub-game
+            // seam this effect serves. Clearing the record restores the pre-#516 behaviour of
+            // retrying the teardown on the next swap; the throw still surfaces the failure.
+            teardownRef.current = null;
+            throw e;
+          }
           // ⚠️ CANCELLATION CHECK BEFORE THE DESTRUCTIVE HALF, and it is load-bearing since #511
           // gave `clearAppServices()` a real teardown (it calls the outgoing game's
           // `ads.cleanup()`, not just `registered = {}`). A→B→A while B is suspended on the
           // await above — the exact path this effect's header comment documents as hit for real
-          // — resumes here with `cancelled` already set, and A's re-entry has ALREADY taken the
-          // `activeGameIdRef.current === gameId` early return (that ref is written only on the
-          // success path below). So without this line B's dead continuation tears down the ads
-          // of the game that is once again live, and nothing re-registers them: A's
-          // `adRevenuePaid` listener is gone for the rest of the session and every impression
-          // stops reporting revenue, silently. Harmless before #511, because dropping the
-          // registry left the native listeners alone and both games import `./ads` directly.
+          // — resumes here with `cancelled` already set. Without this line B's dead continuation
+          // would tear down the ads of a game whose boot is being restarted right now, racing
+          // the re-entry's own teardown-and-re-register of the same services.
+          //
+          // Returning here is not a leak, and that is what #516 changed: `teardownRef` is still
+          // set, so the swap-back JOINS this teardown and performs the destructive half itself
+          // before booting. Previously that re-entry hit an early return, nothing finished the
+          // teardown, and the game stayed on screen with its systems gone.
           //
           // The tierBoot module is imported HERE, above the check, so that no `await` remains
-          // between the check and the end of this block — an await after it would reopen the same
-          // hole one step later (the swap-back landing during the dynamic import, teardown already
-          // done, `cancelled` observed too late).
+          // between the check and the end of this block — an await after it would reopen the
+          // hole one step later (the swap-back landing during the dynamic import, teardown
+          // already done, `cancelled` observed too late).
           const tierBoot = no3DTierLoopRef.current
             ? await import('@modoki/engine/runtime/rendering/tierBoot')
             : null;
@@ -277,8 +360,19 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
             tierBoot.stopTierCalibrationForNo3DProject();
             no3DTierLoopRef.current = false;
           }
+          // The destructive half is done, so nothing is owed any more. Cleared HERE rather than
+          // on the success path far below: everything after this point is the NEW game's boot,
+          // and a failure there must not make the next swap re-tear-down a game that is already
+          // fully torn down.
+          teardownRef.current = null;
+          registeredGameIdRef.current = null;
         }
         if (cancelled) return;
+        // ⚠️ Claim ownership BEFORE the first registration, not after the last. Everything below
+        // registers engine state, and any of it can be cancelled part-way — a game that got as
+        // far as `registerSystems` owns systems whether or not it ever finishes booting, and the
+        // next swap has to know that in order to tear them down.
+        registeredGameIdRef.current = gameId;
         if (def.registerPostprocessors) await def.registerPostprocessors();
         if (cancelled) return;
         if (def.registerSystems) await def.registerSystems();
@@ -630,10 +724,35 @@ function App() {
   // Run ECS pipeline every frame (needed by both game and editor for Scene3D rendering)
   useGameLoop(runPipeline);
 
-  // Cleanup native SDK listeners + audio context on unmount (prevents
-  // accumulation on HMR and error-boundary recovery).
+  // App-scoped teardown on unmount, and the ONE production trigger for it (#534).
+  //
+  // `teardownAll()` is the inverse of the `registerAll()` GameShell's boot effect runs: it drops
+  // the eight app Managers, disposes audio in the order service → buffers → context, clears the
+  // LateUpdate registry, and RE-ARMS the registration latch so the next boot registers for real.
+  // Before it existed this line called `audioDispose()` under a comment claiming it disposed the
+  // audio CONTEXT — it disposed only the node graph, so the accumulation the comment named was
+  // never actually prevented. `teardownAll()` does what that comment always said.
+  //
+  // ⚠️ WHEN THIS FIRES — AND WHY IT IS NOT YET ENOUGH (measured, #534 close-out). In a shipped
+  // web/native build, never: one `createRoot` (main.tsx), never unmounted. In DEV it fires exactly
+  // once, during StrictMode's mount → unmount → remount — but that cycle is SYNCHRONOUS within the
+  // commit, while both `registerAll()` call sites (GameShell's boot effect here, and
+  // `editor/setup.ts` via a React.lazy factory) sit downstream of awaits. So it always arrives
+  // before anything is registered and `teardownAll()` returns at its own `if (!registered)`.
+  // Instrumented in `tests/app/appTeardownStrictMode.test.tsx`: called once, latch false, every
+  // time, in both routes. This is therefore the right ENTRY POINT and not yet a working trigger;
+  // `disposeAudioContext` still does not run. A trigger that fires after registration is the
+  // remaining work — see #534.
+  //
+  // ⚠️ THE RE-REGISTER IS NOT HERE — it is in GameShell's `[gameId]` effect, and it is gated by
+  // TWO refs, not one: the `activeGameIdRef` early return, and `isFirstLoad = !initializedRef`,
+  // which is what actually wraps the `initWorldSync()` call. A completed boot sets both on
+  // adjacent lines. So whoever lands a real trigger must handle both — an earlier attempt here
+  // added an `isAppRegistered()` clause to the early return alone, which fell through to an
+  // `isFirstLoad` of false and re-registered nothing. It was removed rather than left as a guard
+  // that reads like protection and is not (#534 close-out).
   useEffect(() => {
-    return () => { appServices().ads?.cleanup(); audioDispose(); };
+    return () => { appServices().ads?.cleanup(); teardownAll(); };
   }, []);
 
   // OTA Phase 4 (docs/ota-subgame-modules.md) — discover + load any sub-game

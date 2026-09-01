@@ -303,50 +303,29 @@ describe('GameShell recovery paths', () => {
 });
 
 describe('a cancelled swap does not tear down the game that is live again (#511 continuation)', () => {
-  it('A→B→A while B is suspended on unregisterSystems must NOT call clearAppServices', async () => {
-    // Control game B's `unregisterSystems` promise by hand, so the effect body can be parked
-    // mid-teardown (right after `await prevDef.unregisterSystems()`) and resumed later.
-    let resolveUnregisterB!: () => void;
-    const unregisterSystemsB = vi.fn(() => new Promise<void>((resolve) => { resolveUnregisterB = resolve; }));
-    const registerSystemsA = vi.fn(async () => {});
-    const registerAppServicesA = vi.fn(async () => {});
-    const defA: GameDefinition = {
-      id: 'game-a',
-      name: 'game-a',
-      registerSystems: registerSystemsA,
-      registerAppServices: registerAppServicesA,
-      unregisterSystems: unregisterSystemsB, // A is the OUTGOING game being torn down on A→B
-      loadConfig: async () => ({
-        assetManifest: '/assets.manifest.json',
-        scenePath: '/scene.json',
-        disable3D: true,
-      } as never),
-    };
-    if (!registerDynamicGame(defA)) throw new Error('test setup: could not register game "game-a"');
-    makeGame('game-b');
-
-    const { rerender } = render(React.createElement(GameShell, { gameId: 'game-a' }));
-    await waitFor(() => expect(spies.loadScene).toHaveBeenCalledTimes(1), { timeout: 5000 });
-    await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull());
-
-    // A→B: parks inside the async body right after `await prevDef.unregisterSystems()`
-    // (game A's `unregisterSystems`, since A is the OUTGOING game here) — before it reaches
-    // `clearAppServices()`.
-    rerender(React.createElement(GameShell, { gameId: 'game-b' }));
-    await waitFor(() => expect(unregisterSystemsB).toHaveBeenCalledTimes(1));
-
-    // B→A: cancels B's in-flight run (`cancelled = true` in B's effect cleanup) before B's
-    // continuation has resumed.
-    rerender(React.createElement(GameShell, { gameId: 'game-a' }));
-
-    // Now let B's suspended continuation resume. It must see `cancelled` and return before
-    // reaching `clearAppServices()` — which would otherwise tear down game A, now live again.
-    resolveUnregisterB();
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
-
-    expect(spies.clearAppServices).not.toHaveBeenCalled();
-  });
+  // The A→B→A-while-suspended case that used to live here ('A→B→A while B is suspended on
+  // unregisterSystems must NOT call clearAppServices') is DELETED, not rewritten in place.
+  //
+  // Under the pre-#516 code that expectation was the real #511 invariant. Under the #516 fix
+  // it is no longer true ON PURPOSE: the swap-back JOINS the interrupted teardown and performs
+  // the destructive half itself before re-registering A, so `clearAppServices` legitimately
+  // DOES fire once on this path — the old "torn down and never rebuilt" bug this repo used to
+  // ship is exactly what made "no clearAppServices" look like the invariant, when the actual
+  // bug was that A was left torn down with nothing left to call it. The test only kept passing
+  // after #516 landed because its two `setTimeout(0)` ticks happened to land before the
+  // re-entrant continuation's own `await import('tierBoot')` resolved — a timing accident, not
+  // a passing assertion (50×5ms ticks report `clearAppServices` called once and fail).
+  //
+  // What the design now guarantees on this exact path — B's dead continuation does not call
+  // `clearAppServices` (the real #511 invariant, which survives), `clearAppServices` fires
+  // EXACTLY ONCE for A across the whole sequence, and it lands BEFORE A's re-registration — is
+  // already pinned, word for word, by `gameShellSwapCancel.test.tsx`'s
+  // "clearAppServices (the destructive half) runs exactly once for A, and BEFORE A
+  // re-registers" (under 'GameShell A→B→A once-per-load contract (#516)'), which uses the same
+  // A-tears-itself-down-then-rejoins shape and asserts both the count and the exact
+  // `['registerSystems:A', 'clearAppServices', 'registerSystems:A']` ordering. Keeping a second,
+  // differently-named case here for the same scenario would just be two names for one
+  // assertion, so it isn't rewritten — it's removed.
 
   it('an UNCANCELLED A→B swap DOES call clearAppServices exactly once (control)', async () => {
     makeGame('game-a');

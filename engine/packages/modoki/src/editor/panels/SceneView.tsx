@@ -28,6 +28,7 @@ import {
   createRenderState, disposeRenderState, attachInvalidationListener,
   makeWebGPURenderer, computeActiveFrameFit, applyOrthoFrustum,
 } from '../../runtime/rendering/scene3DSync';
+import { disposeVideoTextures } from '../../runtime/rendering/videoTextureSync';
 import { registerRenderSurface } from '../../runtime/rendering/materialBroker';
 import {
   registerFrameCallback, unregisterFrameCallback,
@@ -3787,6 +3788,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // detach the shared bone proxy first so it isn't left dangling under a disposed
       // group across the swap (mirrors the effect-cleanup detach at teardown).
       if (boneProxy.parent) boneProxy.parent.remove(boneProxy);
+      // Before the meshes go: release() restores each mesh's previous material slot.
+      if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures(renderState);
       disposeRenderState(renderState, scene);
       for (const [, outline] of outlineMeshes) { scene.remove(outline); outline.geometry.dispose(); (outline.material as THREE.Material).dispose(); }
       outlineMeshes.clear();
@@ -4844,6 +4847,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       scene.remove(groupProxy); // multi-select group-gizmo pivot proxy
       scene.remove(gizmoHelper); // F5: explicit detach, independent of scene.clear() below
       gizmo.dispose();
+      // Before the meshes go: release() restores each mesh's previous material slot.
+      if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures(renderState);
       disposeRenderState(renderState, scene);
       disposeParticleSyncState(particleState, scene);
       disposeFlameMeshSyncState(flameState, scene);

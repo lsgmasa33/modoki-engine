@@ -192,16 +192,25 @@ registerSource(gestureSource);
 /** App-scope Manager: attaches all sources on register. Replaces the old
  *  keyboard-only `inputManagerDef`.
  *
- *  Input sources are deliberately app-LIFETIME — one set of window-level
- *  listeners for the whole process, not per-game or per-scene — so `dispose`
- *  below is written for the `ManagerDef` contract and for
- *  `__resetManagersForTesting`, but never runs in production: nothing ever
- *  unregisters `'Input'` (#517).
+ *  `dispose` is now REACHABLE but still does not run. `teardownAll()`
+ *  (`engine/app/ecs/register.ts`) unregisters `'Input'` with the other seven
+ *  Managers and re-arms the latch, so #517's objection — wire this and nothing
+ *  re-registers the sources, leaving input permanently dead — no longer holds:
+ *  that was a property of the LATCH, not of this manager. But the only thing
+ *  that calls `teardownAll()` is `App`'s unmount, which in practice fires only
+ *  during StrictMode's boot cycle, before anything is registered. So input
+ *  sources remain app-lifetime in every real run (#534), and `'Input'` is still
+ *  listed in `appManagerDisposeReachable.test.ts`'s allowlist.
  *
- *  ⚠️ Do NOT wire `unregisterManager('Input')` into an app-teardown path to
- *  "fix" that. `registerAll()` (`engine/app/ecs/register.ts`) is guarded by a
- *  once-only `registered` latch, so nothing would ever re-register the
- *  sources afterward — input would go permanently dead. */
+ *  What makes that safe is the pairing of `detachAll()` here with `attachAll()`
+ *  in `init` — the source ARRAY is untouched, so re-attaching finds all five
+ *  sources still registered.
+ *
+ *  ⚠️ `unregisterSource()` is a different matter and is deliberately NOT on any
+ *  teardown path. The five built-ins above are registered as a MODULE-EVAL side
+ *  effect, so unregistering one splices it out of an array nothing will refill:
+ *  irreversible for the process, and strictly worse than dropping the manager.
+ *  It stays public for sources a GAME registers and owns. */
 // Disposer for the device-prompt read sources ({confirmPrompt} etc.), registered
 // alongside the sources so device-appropriate UI prompts are available app-lifetime.
 let disposePromptSources: (() => void) | null = null;

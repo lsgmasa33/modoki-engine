@@ -19,6 +19,7 @@ import { registerBoundsProvider } from '../core/screenBounds';
 import { computeEntityScreenBounds } from './entityScreenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
 import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, compileLiveScene, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
+import { disposeVideoTextures } from './videoTextureSync';
 import { registerRenderSurface } from './materialBroker';
 import { onRendererLost } from '../core/activeRenderer';
 import { createRendererRecovery } from './rendererRecovery';
@@ -864,6 +865,8 @@ export default function Scene3D() {
       // On world swap, drop all cached Three.js objects (entity IDs are world-scoped).
       // Sync functions will rebuild from queries on the next frame.
       const unsubSwap = onWorldSwap(() => {
+        // Before the meshes go: release() restores each mesh's previous material slot.
+        if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures(renderState);
         disposeRenderState(renderState, scene);
         disposeParticleSyncState(particleState, scene);
         disposeFlameMeshSyncState(flameState, scene);
@@ -975,6 +978,7 @@ export default function Scene3D() {
         // Tear down skinned entries (stop mixers, dispose per-clone skeleton
         // boneTextures) — consistent with the world-swap path. Without this,
         // unmount relied on renderer.dispose() reclaiming the GPU context.
+        step('disposeVideoTextures', () => { if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures(renderState); });
         step('disposeRenderState', () => disposeRenderState(renderState, scene));
         // Don't dispose scene.environment — it's owned by meshTemplateCache's
         // envCache (refcounted by SceneManager). Just detach.

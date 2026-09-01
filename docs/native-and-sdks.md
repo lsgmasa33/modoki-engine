@@ -224,6 +224,54 @@ await LitertLm.sendMessage({ conversationId, message }); // tokens stream via 't
 
 **Model download is split by platform** (`games/llm-test/runtime/services/ModelDownloader.ts`): on **Android** `LitertLm.downloadModel` fetches via `HttpURLConnection` into app internal storage and returns the local file path (skipped if `isModelDownloaded` reports it present); on **web** the plugin's `downloadModel`/`isModelDownloaded` are no-ops — the game instead `fetch`es the model with a streaming reader for progress, stores it in the `caches.open('llm-models')` Cache API, and hands MediaPipe a `URL.createObjectURL(blob)`. Web's `loadModel` lazy-imports `@mediapipe/tasks-genai` (and its wasm fileset from jsdelivr) so the bundle isn't paid for off-web.
 
+## Removing a plugin listener — `remove()` is NOT idempotent
+
+⚠️ **Calling `.remove()` twice on one `PluginListenerHandle` silently evicts somebody ELSE's
+listener.** `@capacitor/core`'s `WebPlugin.removeListener` is, verbatim:
+
+```js
+const index = listeners.indexOf(listenerFunc);
+this.listeners[eventName].splice(index, 1);
+```
+
+There is no `index === -1` guard, so a stale remove does `splice(-1, 1)` — which deletes the
+**last** entry in that event's array. Nothing throws and nothing logs. The victim is whichever
+listener registered most recently, i.e. usually the newest one, i.e. the one somebody is
+actively waiting on.
+
+**This bites the moment a handle has two paths to removal**, which is exactly what a teardown
+that can reach an in-flight operation creates: `dispose()` removes the handle, and then the
+operation's own `finally` removes it again. Concretely (#525): a dispose lands mid-load, a fresh
+service starts a new load and registers its `loadProgress` listener, the first load's promise
+then settles and its `finally` evicts the NEW listener — and that load's progress sits at 0 for
+a multi-GB download with nothing erroring anywhere.
+
+**The shape that is safe** — the Set membership is the arbiter, so the two paths are mutually
+exclusive, and `games/llm-test/runtime/services/CapacitorLLMService.ts` is the worked example:
+
+```ts
+private activeListeners = new Set<PluginListenerHandle>();
+// ... register:  this.activeListeners.add(handle);
+// ... teardown:  for (const h of this.activeListeners) h.remove(); this.activeListeners.clear();
+// ... finally:   if (this.activeListeners.delete(handle)) handle.remove();
+```
+
+Two rules follow, and the second is the one that gets skipped:
+
+1. **Never remove a handle a teardown can also reach without a membership check.** A bare
+   `handle.remove()` in a `finally` is correct only while nothing else can remove that handle.
+2. **Every listener a class registers goes in the same registry.** The asymmetric version —
+   one kind of listener tracked, another kept as a bare local — is its own defect with the
+   polarity reversed: `dispose()` cannot reach the untracked one, so a teardown mid-operation
+   leaves it registered until that operation settles. Fixing that by adding it to the registry
+   while leaving its `finally` unconditional trades the leak for the double-remove above.
+
+A repo-wide sweep (2026-09-01) found no remaining reachable double-remove. The near misses are
+single-path only by accident and are worth knowing: `games/court/packages/app-services/src/auth.ts`'s
+`onAuthChanged` unsubscriber and `games/court/runtime/cloudSyncWiring.ts`'s registered closures both
+do a bare `void handle.remove()` with no guard and no null-out — safe today because each has exactly
+one caller that drains exactly once, and unsafe the moment a second caller appears.
+
 ## App-service registry
 
 Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine concerns** — they wrap native SDKs (Firebase, AppLovin MAX, Adjust) that the engine must never depend on. So the engine ships only a tiny hook surface and lets each project plug its own implementations in. This is the seam that keeps the SDK code out of the engine bundle (and out of games that don't want ads).

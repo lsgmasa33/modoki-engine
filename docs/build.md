@@ -1481,6 +1481,19 @@ both embed a profile containing the device UDID. **It is deterministic per bundl
 it reads as "works sometimes": nearly every project here has 2 frameworks, and only `3d-test`
 carries the Firebase/Google set.
 
+⚠️ **THE `court` CONTROL IS STALE — Court is no longer a 2-framework bundle** (measured
+2026-09-01, `games/court` on `work-qa`). A `cap sync ios` now reports **11 Capacitor plugins**
+and the built `App.app/Frameworks` holds **16**: absl, AppsFlyerLib, Capacitor, Cordova,
+FBAEMKit, FBSDKCoreKit, FBSDKCoreKit_Basics, FBSDKLoginKit, FirebaseAnalytics,
+FirebaseFirestoreInternal, GoogleAdsOnDeviceConversion, GoogleAppMeasurement,
+GoogleAppMeasurementIdentitySupport, grpc, grpcpp, openssl_grpc. So the `court` row in the table
+above no longer describes today's Court, and **the "2 vs 6" contrast that carried the whole nested-frameworks
+conclusion has lost its low end** — the conclusion may still hold, but this table no longer
+evidences it. What was NOT re-measured: whether go-ios now fails on Court. That install went
+straight to `ideviceinstaller` (SUCCESS, InstallComplete 100%, iPhone 8 16.7.16) precisely
+because 16 frameworks is well past the failing case, so nobody has re-run the go-ios arm.
+**Re-measure before quoting this table as a control again.**
+
 `ios install` zips the `.app` and lets `installd` extract it (note the `.ipa.app` in the error
 path); that round-trip is what breaks the signature's resource seal, and more nested signed code
 means more seal to preserve. libimobiledevice does not use that path. Three dead ends already ruled

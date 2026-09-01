@@ -17,7 +17,7 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { lodUrlSuffix } from '../../runtime/loaders/modelSettings';
 import { getKTX2Loader } from '../../runtime/loaders/textureResolver';
-import { needsGLBConversion, loadSourceModel } from '../scene/convertToGLB';
+import { needsGLBConversion, loadSourceModel, disposeSourceModel } from '../scene/convertToGLB';
 import { frameCameraToBoxFixed } from '../scene/sceneViewMath';
 import { applyRendererColorConfig } from '../../runtime/rendering/scene3DSync';
 import { useModelInvalidationEpoch, cacheBustReimport } from './useAssetInvalidationEpoch';
@@ -64,6 +64,11 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     camera: THREE.PerspectiveCamera;
     controls: OrbitControls;
     modelRoot: THREE.Group;
+    /** Set only on the OBJ/FBX/DAE preview path — its meshes are ALSO in
+     *  ownedGeometries/ownedMaterials, but disposeSourceModel additionally sweeps the
+     *  textures a freshly-parsed source model carries (sibling .mtl maps), which the
+     *  geometry/material dispose loops below never touch. */
+    sourceRoot: THREE.Object3D | null;
     envTexture: THREE.Texture | null;
     ownedMaterials: Set<THREE.Material>;
     ownedGeometries: Set<THREE.BufferGeometry>;
@@ -145,7 +150,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     scene.add(modelRoot);
 
     stateRef.current = {
-      renderer, scene, camera, controls, modelRoot, envTexture,
+      renderer, scene, camera, controls, modelRoot, sourceRoot: null, envTexture,
       ownedMaterials: new Set(), ownedGeometries: new Set(),
       raf: null, activeLevel: hasLods ? 'auto' : 0,
       needsRender: true, // draw the first frame
@@ -174,6 +179,9 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       s.controls.dispose();
       for (const g of s.ownedGeometries) g.dispose();
       for (const m of s.ownedMaterials) m.dispose();
+      // Second dispose of shared geometry/materials is idempotent — this call's job is the
+      // texture sweep the loops above don't do (see the sourceRoot field comment).
+      if (s.sourceRoot) { disposeSourceModel(s.sourceRoot); s.sourceRoot = null; }
       s.scene.environment = null;
       s.envTexture?.dispose();
       s.renderer.dispose();
@@ -203,6 +211,9 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       for (const m of s.ownedMaterials) m.dispose();
       s.ownedGeometries.clear();
       s.ownedMaterials.clear();
+      // Second dispose of shared geometry/materials is idempotent — this call's job is the
+      // texture sweep the loops above don't do (see the sourceRoot field comment).
+      if (s.sourceRoot) { disposeSourceModel(s.sourceRoot); s.sourceRoot = null; }
     };
 
     // Built on first use, not up front: three's GLTFLoader/meshopt/KTX2 modules are imported
@@ -288,14 +299,9 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     // imported. (LODs never apply pre-import, so this path ignores lodChoice.)
     const buildFromSource = async () => {
       const obj = await loadSourceModel(sourceUrl);
-      if (cancelled) {
-        obj.traverse((child) => {
-          const m = child as THREE.Mesh;
-          if (m.isMesh) { m.geometry?.dispose(); const mm = m.material; (Array.isArray(mm) ? mm : [mm]).forEach((x) => x?.dispose()); }
-        });
-        return;
-      }
+      if (cancelled) { disposeSourceModel(obj); return; }
       s.modelRoot.add(obj);
+      s.sourceRoot = obj;
       obj.traverse((child) => {
         const m = child as THREE.Mesh;
         if (m.isMesh) collectMaterials(m);

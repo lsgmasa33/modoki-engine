@@ -305,7 +305,7 @@ async function settle(tx: StoreTransaction, source: 'purchase' | 'recovery'): Pr
  * ⚠️ A settle spans awaits that can last minutes — the platform sheet, Face ID, a parent approving
  * Ask-to-Buy. `resetIap()` can run in that window — a live in-process game swap: an OTA sub-game
  * switch, or hash navigation between two baked games. Both re-enter `GameShell`'s `[gameId]` boot
- * effect, which calls `unregisterGameSystems()` (→ `resetIap()`) at `App.tsx:247` and re-inits
+ * effect, which calls `unregisterGameSystems()` (→ `resetIap()`) at `App.tsx:301` and re-inits
  * PlayerPrefs at `:290`. ⚠️ NOT the editor's File → Open Project, which this comment used to cite:
  * Electron's `setProject` ends in `webContents.reloadIgnoringCache()` and the web-served editor has
  * no in-process project switch at all, so neither editor surface reaches this window (#421).

@@ -4,9 +4,9 @@
  *  browser/network-bound and exercised manually; these cover the deterministic
  *  logic that drives material fidelity and routing. */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import * as THREE from 'three';
-import { needsGLBConversion, toStandardMaterial, IMPORTABLE_MODEL_EXTS, stripClipPrefixes } from '../../src/editor/scene/convertToGLB';
+import { needsGLBConversion, toStandardMaterial, IMPORTABLE_MODEL_EXTS, stripClipPrefixes, disposeSourceModel } from '../../src/editor/scene/convertToGLB';
 
 /** Build clip-like objects with just a mutable name (stripClipPrefixes only
  *  touches `.name`). */
@@ -32,6 +32,29 @@ describe('stripClipPrefixes (C9 — per-clip)', () => {
     const a = clips('Walk', 'Run');
     stripClipPrefixes(a);
     expect(a.map((c) => c.name)).toEqual(['Walk', 'Run']);
+  });
+});
+
+describe('disposeSourceModel', () => {
+  // Regression for ModelPreview's hand-rolled cleanup, which disposed geometry and material
+  // but never the textures a freshly-parsed source model (OBJ/FBX + sibling .mtl maps) carries.
+  it('disposes geometry, material, AND every texture on the material', () => {
+    const geometry = new THREE.BufferGeometry();
+    const map = new THREE.Texture();
+    const material = new THREE.MeshStandardMaterial({ map });
+    const mesh = new THREE.Mesh(geometry, material);
+    const root = new THREE.Group();
+    root.add(mesh);
+
+    const geoSpy = vi.spyOn(geometry, 'dispose');
+    const matSpy = vi.spyOn(material, 'dispose');
+    const texSpy = vi.spyOn(map, 'dispose');
+
+    disposeSourceModel(root);
+
+    expect(geoSpy).toHaveBeenCalled();
+    expect(matSpy).toHaveBeenCalled();
+    expect(texSpy).toHaveBeenCalled();
   });
 });
 

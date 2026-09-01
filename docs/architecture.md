@@ -520,15 +520,38 @@ StrictMode is inert. So a game hook whose side effect must not repeat still want
 latch for the dev path (`games/court`'s AppsFlyer wrapper is the worked example); what the
 fix removes is the double-drive that reached PLAYERS.
 
-**The game-SWITCH path has two failure modes that outlive the switch**, both fixed alongside
-the above and both worth knowing before you touch the early-return guard. Switching A→B and
-back to A while B is still loading cancels B's run before it reaches either
-`setTransitioning(false)`, and lands on the `activeGameIdRef.current === gameId` guard — which
-must therefore clear `transitioning` itself, or the opaque loading overlay covers a game that
-is running perfectly well underneath, for the rest of the session. And `error` gates the whole
-render tree, so it is cleared at the start of every new load: it had no path back to `null`
-at all, which meant one unknown gameId left the error screen up even after a later game
-loaded successfully behind it.
+**The game-SWITCH path has failure modes that outlive the switch**, all worth knowing before
+you touch the early-return guard. Switching A→B and back to A while B is still loading cancels
+B's run before it reaches either `setTransitioning(false)`, so the guard must clear
+`transitioning` itself or the opaque loading overlay covers a game that is running perfectly
+well underneath, for the rest of the session. And `error` gates the whole render tree, so it is
+cleared at the start of every new load: it had no path back to `null` at all, which meant one
+unknown gameId left the error screen up even after a later game loaded successfully behind it.
+
+⚠️ **A cancelled swap must not leave a game half-torn-down, and telling "loaded" apart from
+"owns registered state" is what makes that work (#516).** The same A→B→A path unregisters A's
+systems at the top of the effect, before its first await. `activeGameIdRef` was written only on
+the success path, so it still said "A" while A was in pieces, the swap-back took the
+early-return guard, and **A stayed on screen with its systems, projections and managers gone
+for the rest of the session** — with the loading overlay dismissed over the top, so nothing
+looked wrong. Three refs now carry three different facts, and collapsing any two of them
+reintroduces one of these bugs:
+
+| Ref | Answers | Written |
+|---|---|---|
+| `activeGameIdRef` | which game is loaded AND intact — the early-return guard | on success; **nulled when a teardown starts** |
+| `registeredGameIdRef` | which game owns registered engine state | **before the first registration** (`registerPostprocessors`), so a boot cancelled part-way is still known to own what it registered |
+| `teardownRef` | a teardown that started but whose destructive half is unfinished, plus its promise | before the teardown's first await; cleared when `clearAppServices()` has run |
+
+`teardownRef` holds the unregister **promise** rather than a boolean so a swap-back JOINS the
+teardown instead of repeating it — and is **cleared if that promise rejects**, because a
+memoized rejection would be re-joined by every later swap and no game would ever boot again
+(the hooks are dynamic `import()`s, so a chunk 404 after a deploy reaches this) — `unregisterSystems` is a hook, and calling it twice is
+exactly what the once-per-load contract above forbids. The teardown block therefore runs even
+when the incoming game IS the previous one: A is owed the rest of its teardown before it can be
+booted again. Booting it again — rather than resuming it in place — is the deliberate choice:
+the path is a mis-tap, and a full re-boot is the only option that cannot leave a second kind of
+half-done swap behind. Pinned by `engine/tests/app/gameShellSwapCancel.test.tsx`.
 
 The rule that follows, for anyone editing that effect: **its dependency array is `[gameId]`
 and nothing else.** State the effect writes is mirrored into refs (`configReadyRef`,

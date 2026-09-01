@@ -152,9 +152,17 @@ function findClassManagers(src: string, file: string): AppManagerWithDispose[] {
   const out: AppManagerWithDispose[] = [];
   for (const { className, openIdx, closeIdx } of scanClassDecls(src)) {
     const body = src.slice(openIdx, closeIdx + 1);
-    if (!/scope\s*=\s*'app'(\s+as\s+const)?/.test(body)) continue;
-    if (!/dispose\s*\(/.test(body)) continue;
-    const nameMatch = body.match(/name\s*=\s*'([^']+)'/);
+    // Quote-agnostic: a `scope = "app"` in double quotes is the same declaration, and a
+    // single-quote-only regex would drop the whole manager silently (#534).
+    if (!/scope\s*=\s*['"]app['"](\s+as\s+const)?/.test(body)) continue;
+    // ⚠️ `dispose(` OR `dispose =` — a CLASS-FIELD ARROW (`dispose = () => { ... }`) is a real
+    // ManagerDef dispose and the `dispose\s*\(` form alone is blind to it (#534, recorded during
+    // #517's close-out). And the census does NOT backstop this: the census counts `ManagerDef`
+    // TYPE references, and such a class still writes `implements ManagerDef`, so `scanClassDecls`
+    // finds it, the census counts it as accounted, and only this predicate decides whether it is
+    // ever checked for reachability. A member-shape gap is invisible to a declaration-form census.
+    if (!/dispose\s*[(=]/.test(body)) continue;
+    const nameMatch = body.match(/name\s*=\s*['"]([^'"]+)['"]/);
     if (!nameMatch) {
       throw new Error(
         `Found an app-scoped class ManagerDef (${className}) with a dispose in ${file} but ` +
@@ -244,38 +252,51 @@ function scanForMatch(dir: string, re: RegExp): boolean {
 
 /**
  * App-scoped managers with a `dispose` that nothing in production calls `unregisterManager` for,
- * each with the VERIFIED reason it's fine — this is a list of managers confirmed app-lifetime by
- * design, NOT a list of exemptions. Adding a name here without verifying (by reading the register/
+ * each with the VERIFIED reason it's fine — a list of managers confirmed app-lifetime by design,
+ * NOT a list of exemptions. Adding a name here without verifying (by reading the register/
  * unregister call sites, same as this file's own scan) defeats the guard: it makes the test green
  * while the underlying defect — a disposer nothing ever reaches — still exists.
+ *
+ * ⚠️ #534 BUILT THE TEARDOWN PATH AND THESE THREE STILL BELONG HERE. That is not the outcome the
+ * work expected, so the measurement is recorded rather than the conclusion. `teardownAll()`
+ * (engine/app/ecs/register.ts) exists, unregisters all three by name, re-arms the latch, and IS
+ * called — from `App`'s unmount cleanup (App.tsx). So the source grep below now finds a production
+ * `unregisterManagers([...])` caller, and this list can be emptied with the guard still green.
+ * It was, briefly. It is back because the guard passing is not the same as the disposers running:
+ *
+ *   `registerAll()` has exactly two call sites — `ecs/init.ts` (via GameShell's boot effect) and
+ *   `editor/setup.ts` (via a React.lazy factory) — and BOTH are downstream of awaits. The only
+ *   thing that unmounts `App` is React StrictMode's mount → unmount → remount, which is
+ *   SYNCHRONOUS within the commit. So the teardown always runs BEFORE either registration can
+ *   complete. Measured, not reasoned: instrumenting `teardownAll` in
+ *   `tests/app/appTeardownStrictMode.test.tsx` shows it called exactly once, with `registered ===
+ *   false`. Nothing to tear down, every time. Nothing else unmounts the root (one `createRoot` in
+ *   main.tsx, no `.unmount()` anywhere in the repo).
+ *
+ * So `dispose` on these three still never runs in production, and emptying this list would assert
+ * something false — the same inert-guard shape #517's close-out found in this very file, one level
+ * up. The entry point is real and re-arms correctly; what is still missing is a trigger that can
+ * fire while anything is registered. The candidates are the A→B→A game swap (#516) and an error
+ * boundary raised above `GameShell` — see #534.
+ *
+ * DELETE THIS LIST when such a trigger lands, and verify it the way the above was verified: assert
+ * `teardownAll` observes `registered === true`, not merely that it was called.
  */
 const APP_LIFETIME_BY_DESIGN: Record<string, string> = {
   // Window-level input listeners (keyboard/gamepad/pointer/touch-control/gesture) are one fixed
-  // set for the whole process, not per-game — deliberately app-lifetime, not a leak. `dispose`
-  // exists for the `ManagerDef` contract and for `__resetManagersForTesting` only; nothing in
-  // production unregisters 'Input'. Wiring `unregisterManager('Input')` into a teardown path would
-  // be a NEW bug, not a fix: `registerAll()` (engine/app/ecs/register.ts) is guarded by a
-  // once-only `registered` latch, so nothing would ever re-register the sources afterward and
-  // input would go permanently dead. See the comment above `inputSourcesManager` (#517).
-  Input: 'engine/packages/modoki/src/runtime/input/inputSources.ts — verified app-lifetime, #517',
-  // Registered once in registerAll() (engine/app/ecs/register.ts) alongside 'Input', behind the
-  // same once-only `registered` latch — nothing re-registers 'engine.time' afterward, and nothing
-  // in production calls unregisterManager('engine.time') / unregisterManager(timeManager.name).
-  // Its dispose() unsubscribes the onPlayStateChange/onWorldSwap listeners it installed in init()
-  // and unregisters its three read sources (deltaTime, timeSinceGameStart, timeSinceSceneLoad) —
-  // process-global state that is correctly app-lifetime, same shape as 'Input'. Widened scan added
-  // this entry (the class form of ManagerDef was previously invisible to the guard) — #517 follow-up.
+  // set for the whole process. `dispose` exists for the `ManagerDef` contract and for
+  // `__resetManagersForTesting`; `teardownAll()` would call it, but never does with 'Input'
+  // registered — see the block above (#517, re-measured #534).
+  Input: 'engine/packages/modoki/src/runtime/input/inputSources.ts — verified app-lifetime, #517/#534',
+  // dispose() unsubscribes the onPlayStateChange/onWorldSwap listeners init() installed and drops
+  // its three read sources (deltaTime, timeSinceGameStart, timeSinceSceneLoad) — process-global
+  // state, same shape as 'Input'.
   'engine.time':
-    'engine/packages/modoki/src/runtime/managers/TimeManager.ts — verified app-lifetime, #517',
-  // Same story as 'engine.time': registered once in registerAll() behind the same latch, nothing
-  // in production calls unregisterManager('engine.navigation') / unregisterManager(navigationManager.name).
-  // Its dispose() unregisters the 'canGoBack' read source and clears the history stack — again
-  // process-global state, correctly app-lifetime. Widened scan added this entry — #517 follow-up.
+    'engine/packages/modoki/src/runtime/managers/TimeManager.ts — verified app-lifetime, #517/#534',
+  // dispose() drops the 'canGoBack' read source and clears the history stack — again process-global.
   'engine.navigation':
-    'engine/packages/modoki/src/runtime/managers/NavigationManager.ts — verified app-lifetime, #517',
-};
-
-// ── CENSUS: every textual `ManagerDef` reference must be accounted for (#517 follow-up 2) ────────
+    'engine/packages/modoki/src/runtime/managers/NavigationManager.ts — verified app-lifetime, #517/#534',
+};// ── CENSUS: every textual `ManagerDef` reference must be accounted for (#517 follow-up 2) ────────
 //
 // The two scanners above only recognize two specific declaration SHAPES. Any OTHER shape — a
 // sub-interface (`interface FooManager extends ManagerDef`) with `class X implements FooManager`,
