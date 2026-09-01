@@ -53,6 +53,69 @@ git fetch origin && git merge origin/work-ai      # or origin/work-ai2, origin/w
 git fetch origin && git merge origin/main
 ```
 
+### Who resolves a conflict — the worker, before it pushes
+
+**A conflict belongs to whoever has the context.** Measured 2026-09-01 over the last 40 hub merges:
+**24 needed manual resolution**, and every one was resolved on `main` by the clone that wrote
+neither side. The top conflict sources were `.agent-memory/MEMORY.md` (10 — now generated, so this
+class is gone), `games/court/runtime/systems.ts` (6) and `engine/app/debug/agentBridge.ts` (3).
+
+The cause is drift: workers were running far behind main (`work-ai` 52 commits, `work-ai2` 25,
+`win` 475), so every worker's `npm run verify` was green against a stale engine, and the first time
+the two sides met was on `main` in front of the person least able to judge them.
+
+So the last step before a push is:
+
+```bash
+# From a worker clone, immediately before pushing:
+git fetch origin && git merge origin/main
+npm run verify          # ← NOT optional: see below
+git push origin <branch>
+```
+
+⚠️ **For a worker, merging main IS re-testing.** `CLAUDE.md`'s "merging is not re-testing" is about
+the HUB receiving work a worker already verified. It inverts here: pulling main in runs *your* tests
+against everyone else's engine changes for the first time, and that combination has never been
+tested by anyone. Merge at **push time** only — `/close-out` is already the push trigger, and five
+clones re-verifying on every main update is a real cost multiplier.
+
+⚠️ **Being fully current with main is NOT a precondition for pushing.** With six clones, main can
+move between your merge and your push. The hub merge is still there as the fallback, which makes a
+stale merge base harmless rather than a race nobody can win — do not loop trying to win it.
+
+Two things this also buys, beyond cheaper conflicts:
+- **A worker receives a privacy scrub instead of re-leaking around it.** A branch forked before a
+  scrub still carries the real value, and git presents it as the newer side; merging main in takes
+  the scrubbed version.
+- **It manufactures the fast-forwards** that let the hub skip `verify` (next section).
+
+### The hub skips `verify` on a fast-forward — but never `verify:publish`
+
+```bash
+# From the hub, before merging:
+git fetch origin
+git merge-base --is-ancestor HEAD origin/work-ai && echo "fast-forward — verify can be skipped"
+```
+
+A fast-forward means main's HEAD was already an ancestor of the branch tip, so the merged tree is
+**byte-identical** to the tree the worker verified at close-out — nothing of main's is new to the
+branch, so there is no untested combination and `verify` would re-test the same bytes.
+
+⚠️ **`npm run verify:publish` still runs EVERY time, fast-forward or not.** A worker never runs it,
+so the hub is the *only* place a private value (Apple Team ID, real device UDID, internal `gs://`
+bucket) is caught before it reaches a PUBLIC repo — twice a leak has ridden a worker branch this
+far. A fast-forward carries a leak exactly as happily as a merge commit. It scans the WORKING TREE,
+so it answers about what you are about to push, not about HEAD.
+
+Three bounds on the saving, so it is not oversold:
+- **Only the FIRST merge of a batch can be a fast-forward.** Once it lands, main has moved and the
+  next branch is behind again.
+- **It fires only because of the rule above.** With workers never merging main in, **0 of the last
+  9 hub merges were fast-forwards** — the skip would have applied zero times.
+- **A fast-forward proves the trees match, not that the tip was verified.** It cannot tell that a
+  commit was pushed *after* a green close-out. That is the worker's discipline, not something the
+  hub can check.
+
 ## The two concrete rules (everything else follows from these)
 
 Each clone is a fully independent repo that happens to share one machine. Nothing in git

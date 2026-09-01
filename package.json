@@ -34,6 +34,7 @@
     "clean:packaged-cache": "node engine/scripts/clean-packaged-cache.mjs",
     "migrate:private-config": "node engine/scripts/migrate-private-config.mjs",
     "sync:agent-configs": "node engine/scripts/sync-agent-configs.mjs",
+    "gen:memory-index": "node scripts/gen-memory-index.mjs",
     "docs:api": "typedoc",
     "build": "node engine/scripts/build-web.mjs",
     "typecheck": "tsc -b engine && tsc -p engine/tsconfig.test.json && npm --prefix engine/packages/modoki run typecheck && npm --prefix engine/tools/modoki-mcp run typecheck && npm --prefix engine/tools/game-debug-mcp run typecheck",
