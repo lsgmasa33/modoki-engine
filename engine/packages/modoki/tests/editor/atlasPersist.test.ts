@@ -301,15 +301,17 @@ describe('createAtlasWriteQueue (#469 review finding 1)', () => {
     queue.enqueue('/a.atlas.json', '{"padding":1}\n');
     queue.enqueue('/a.atlas.json', '{"padding":12}\n');
 
-    // Let the queue's chained microtasks/macrotasks drain.
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    // Let the queue's chained microtasks/macrotasks drain. A fixed tick count is not safe here:
+    // each link hops through a real async `crypto.subtle.digest` (#469's sha256 precondition),
+    // and CI runners vary in how many event-loop turns that takes — GH's windows-latest runner in
+    // particular needs more than the 2-3 ticks that always sufficed on Linux/macOS, which turned
+    // this exact wait into a reproducible (not flaky) red on Windows. Poll for the actual outcome
+    // instead of guessing a tick count.
+    await vi.waitFor(() => { expect(server.content).toBe('{"padding":12}\n'); });
 
     expect(onConflict).not.toHaveBeenCalled();
     // The final content is the LATEST edit — every write is the full document, so it already
     // carries whatever the superseded one would have written.
-    expect(server.content).toBe('{"padding":12}\n');
     expect(loadedText).toBe('{"padding":12}\n');
   });
 
@@ -328,13 +330,10 @@ describe('createAtlasWriteQueue (#469 review finding 1)', () => {
     queue.enqueue('/a.atlas.json', '{"padding":12}\n');
     queue.enqueue('/a.atlas.json', '{"padding":128}\n');
 
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    // Poll instead of a fixed tick count — see the wait above for why (#469 review, Windows CI).
+    await vi.waitFor(() => { expect(server.content).toBe('{"padding":128}\n'); });
 
     expect(onConflict).not.toHaveBeenCalled();
-    expect(server.content).toBe('{"padding":128}\n');
     // writeIfMatch is called EXACTLY once: all three `enqueue()` calls above run synchronously,
     // with no `await` between them, so `pending` is overwritten twice before the queue's first
     // chained link ever gets a turn to run — that link reads `pending` as the LATEST job
@@ -360,11 +359,10 @@ describe('createAtlasWriteQueue (#469 review finding 1)', () => {
     });
 
     queue.enqueue('/a.atlas.json', '{"padding":1}\n');
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    // Poll instead of a fixed tick count — see the wait above for why (#469 review, Windows CI).
+    await vi.waitFor(() => { expect(onConflict).toHaveBeenCalledTimes(1); });
 
     expect(onWritten).not.toHaveBeenCalled();
-    expect(onConflict).toHaveBeenCalledTimes(1);
     expect(server.content).toBe('{"padding":0}\n'); // untouched
   });
 
@@ -385,17 +383,20 @@ describe('createAtlasWriteQueue (#469 review finding 1)', () => {
     });
 
     queue.enqueue('/a.atlas.json', '{"padding":1}\n');
-    // Let the first write actually land before the selection changes.
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
-    expect(server.content).toBe('{"padding":1}\n');
+    // Let the first write actually land before the selection changes. Poll instead of a fixed
+    // tick count — see the wait in the earlier test for why (#469 review, Windows CI).
+    await vi.waitFor(() => { expect(server.content).toBe('{"padding":1}\n'); });
 
     // User selects atlas B — a second edit for A (e.g. a stepper click that was already queued
     // just before the selection changed) is enqueued after the switch.
     currentPath = '/b.atlas.json';
     queue.enqueue('/a.atlas.json', '{"padding":2}\n');
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    // Nothing observable changes when a job is correctly dropped, so there is no positive signal
+    // to poll for — give the chain a generous real-time margin instead (well past a single link's
+    // worth of async hops, including the sha256 digest) rather than a fixed, easy-to-undercount
+    // tick number.
+    await new Promise((r) => setTimeout(r, 30));
+    await new Promise((r) => setTimeout(r, 30));
 
     // Dropped, not written, and not reported as a conflict against B: A's file is untouched,
     // the server was never even asked, and B never gets a false "changed on disk" banner.
@@ -428,15 +429,15 @@ describe('createAtlasWriteQueue (#469 review finding 1)', () => {
     });
 
     queue.enqueue('/a.atlas.json', '{"padding":1}\n'); // this link throws
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    // Poll instead of a fixed tick count — see the wait earlier in this describe block for why
+    // (#469 review, Windows CI): this test has an extra async hop over the others (the throwing
+    // link's own recovery through `.catch`), which is exactly what made a fixed 2-3 ticks land
+    // short on windows-latest while it always cleared in time on Linux/macOS.
+    await vi.waitFor(() => { expect(throwingWriteIfMatch).toHaveBeenCalledTimes(1); });
 
     queue.enqueue('/a.atlas.json', '{"padding":2}\n'); // must still issue despite the prior throw
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    await vi.waitFor(() => { expect(server.content).toBe('{"padding":2}\n'); });
 
-    expect(server.content).toBe('{"padding":2}\n');
     expect(loadedText).toBe('{"padding":2}\n');
     expect(onConflict).not.toHaveBeenCalled();
     expect(error).toHaveBeenCalled(); // the throw is still reported, not swallowed silently
