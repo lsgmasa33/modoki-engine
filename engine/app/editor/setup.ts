@@ -17,7 +17,7 @@ import { PlayerPrefs, selectDefaultBackend, setGameConfig, setPhysicsLayers } fr
 import type { GameConfig, EditorPanelDef } from '@modoki/engine/runtime';
 import projectConfig from 'virtual:modoki-project-config';
 import {
-  CAPACITOR_ORIENTATIONS, STATUS_BAR_STYLES, KEYBOARD_RESIZE_MODES, WEB_DEPLOY_MODES, WEB_SIZE_MODES,
+  CAPACITOR_ORIENTATIONS, STATUS_BAR_STYLES, AUDIO_SESSION_CATEGORIES, KEYBOARD_RESIZE_MODES, WEB_DEPLOY_MODES, WEB_SIZE_MODES,
   PLAYABLE_NETWORKS, IOS_CONTENT_MODES, ANDROID_SCHEMES, GPU_BACKENDS, QUALITY_TIERS, TONE_MAPPINGS,
   TEXTURE_TIER_VARIANTS_MODES,
   IOS_EXPORT_METHODS,
@@ -468,6 +468,10 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
                   light: 'Light text (dark bg)',
                   dark: 'Dark text (light bg)',
                 }), showIf: { key: 'capacitor.statusBarHidden', in: ['false'] } },
+                { key: 'capacitor.audioSessionCategory', label: 'Audio session category (iOS)', type: 'select', options: labeled(AUDIO_SESSION_CATEGORIES, {
+                  ambient: 'Ambient — mix with other apps, mute on Ring/Silent switch',
+                  playback: 'Playback — mix with other apps, keep playing when silenced',
+                }), help: '\'ambient\' (default) lets other apps\' audio (e.g. Apple Music) keep playing alongside ours, and obeys the Ring/Silent switch like a casual game normally should. \'playback\' keeps our audio going even when the ringer is silenced, for a game whose music is the point. No Android equivalent — Chromium owns audio focus there.' },
               ],
             },
             {

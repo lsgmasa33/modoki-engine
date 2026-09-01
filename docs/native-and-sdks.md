@@ -205,6 +205,35 @@ await GameDebug.startServer({ port: 9095 });
 const { running, connected } = await GameDebug.getStatus();
 ```
 
+### `capacitor-modoki-audio` — `AVAudioSession` category + ducking hint (#548)
+
+Engine-level plugin under `engine/packages/` (like `capacitor-game-debug`/`capacitor-litert-lm`,
+not per-game). Sets the `AVAudioSession` category so other apps' audio (Music, podcasts) isn't
+killed the instant ours starts, and surfaces Apple's "another app's audio just started/stopped"
+hint so the engine can duck its own music. Full mechanism, the duck-node design and the device
+verification procedure: [audio-plan.md](./audio-plan.md) § "iOS audio session + auto-ducking".
+
+```typescript
+import { ModokiAudio } from 'capacitor-modoki-audio';
+
+await ModokiAudio.configure({ category: 'ambient' }); // or 'playback'
+const { silence } = await ModokiAudio.shouldSilenceSecondaryAudio();
+await ModokiAudio.addListener('secondaryAudioHint', ({ silence }) => { /* duck/unduck */ });
+```
+
+**Android/web are permanent no-ops** — `shouldSilenceSecondaryAudio()` always resolves `{silence: false}`,
+`secondaryAudioHint` never fires. Not a stub to fill in later: Android audio is 100% WebView with
+no audio-focus concept to bridge (measured for #548, see the doc above).
+
+⚠️ **The SPM static-linker question this plugin's own `Package.swift` header raises is
+UNTESTED.** It imports only `AVFoundation`, a system framework — the same dependency-free shape
+that got `capacitor-game-debug` stripped by SPM's static linker (see above). `capacitor-modoki-iap`
+imports `StoreKit`, also a system framework, and resolves fine, but nothing has confirmed *why*, so
+this package's header explicitly declines to assume a system-framework import is enough to survive
+linking. **This can only be settled by a device build.** If the plugin class turns out to be
+stripped, the fallback is the same one `capacitor-game-debug` uses: compile the plugin directly
+into the App target with manual registration in `MyViewController.swift`, rather than via SPM.
+
 ### `capacitor-litert-lm` — on-device LLM
 
 On-device LLM inference (used by the `llm-test` game), with **one TS surface, two engines behind it**: Capacitor's `registerPlugin` routes each call to the native Android implementation (`LitertLmPlugin.kt` — LiteRT-LM Kotlin SDK) or, on web, to `LitertLmWeb` (`src/web.ts` — MediaPipe `@mediapipe/tasks-genai`, Gemma running via WebGPU). The definitions (`src/definitions.ts`) are the contract both sides implement.

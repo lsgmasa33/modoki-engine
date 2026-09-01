@@ -649,10 +649,14 @@ export {
   play as audioPlay, stopAll as audioStopAll, resume as audioResume, dispose as audioDispose,
   setBusVolume as setAudioBusVolume, updateListener as updateAudioListener,
   setAudioMuted, isAudioMuted,
+  setMusicDucked as setAudioMusicDucked, isMusicDucked as isAudioMusicDucked,
   crossfade as crossfadeAudio,
   getAudioLog, clearAudioLog, setAudioRecordMode,
   type BusName, type AudioPlaySpec, type AudioHandle, type AudioLogEntry,
 } from './audio/audioService';
+export {
+  shouldDuckMusic, type AudioSessionInputs,
+} from './audio/audioSessionPolicy';
 // Video subsystem — playback core (HTMLVideoElement lifetime, timeScale coupling,
 // autoplay-block recovery). Its SOUND routes onto the audio bus above.
 export {

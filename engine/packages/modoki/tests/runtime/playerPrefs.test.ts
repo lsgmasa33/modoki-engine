@@ -389,9 +389,12 @@ describe('PlayerPrefs — backend-failure resilience', () => {
     //     "pendingKeys() under-reports MID-DRAIN — pinning KNOWN behaviour the doc now qualifies,
     //      not a bug (#422)"
     //
-    // A defect with a guard posted on it. It did not merely permit #532 F17 and #558 — both CITED
-    // this test's framing as evidence the behaviour was intended, which is how a documented gap
-    // becomes a licence. If you are here to relax this assertion, that is the history to beat. It used to assert `[]` here and called that "known behaviour the doc
+    // A defect with a guard posted on it. #532 F17 and #558 both landed three days after this test
+    // (`7630bed04`, 2026-08-29) and each built a game-side workaround ON TOP of the behaviour it
+    // pinned rather than questioning it — neither fixed the layer that could close it. ⚠️ An earlier
+    // version of this comment said both defects "cited" this test's framing; a repo-wide grep finds
+    // no such citation, so that is withdrawn. If you are here to relax this assertion, three days
+    // is the history to beat. It used to assert `[]` here and called that "known behaviour the doc
     // qualifies". It was a defect with a test defending it: mid-drain the write is genuinely in
     // flight and about to be REJECTED, and reporting it as landed defeats the only signal these
     // accessors exist to give. `get()` re-reads the optimistic cache and cannot fail, so

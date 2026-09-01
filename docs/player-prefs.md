@@ -226,18 +226,27 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   #559 until the two were split. The four #454 swap tests are what caught it.
 
   ⚠️ **The lesson from #559, which generalises past this module: a documented gap becomes a
-  licence.** The under-report was known for months and had a TEST pinning it — titled "pinning
-  KNOWN behaviour the doc now qualifies, not a bug" (#422). That test did not merely fail to stop
-  the two money defects that followed; **both of them cited its framing as evidence the behaviour
-  was intended**, and each built a game-side workaround on top of it instead of questioning it. A
-  caveat written honestly, by someone who understood the mechanism, is still the thing that made
-  four months of nobody re-litigating it feel reasonable.
+  licence.** The under-report was pinned by a TEST asserting it as intended — titled "pinning KNOWN
+  behaviour the doc now qualifies, not a bug" (#422, `7630bed04`, 2026-08-29). Both money defects
+  that followed (#532 C3b's F17 and #558) landed on 2026-09-01 and each built a game-side workaround
+  ON TOP of the documented behaviour rather than questioning it; neither fixed the layer that could
+  actually close it.
+
+  ⚠️ Two corrections to an earlier draft of this paragraph, both caught in review and both worth
+  keeping as the scar. It said the gap was known for **"months"** and that **"four months"** of
+  nobody re-litigating it was made to feel reasonable — the real interval is **three days**
+  (`7630bed04` → `681176252`), an unmeasured figure asserted in the very paragraph arguing that
+  claims must be measured, and shipped into `docs/**`, which is a publish surface. It also said both
+  defects **"cited"** the test's framing; a repo-wide grep finds no such citation in either commit,
+  so that is downgraded to what is actually visible — they worked around the behaviour rather than
+  challenging it. Three days was enough. The lesson does not need the number inflated, and inflating
+  it is the failure it describes.
 
   The second half is about where evidence has to come from. #559's severity was set by REASONING —
   a claim that Court's wipe path churned once per frame, which made the false-confirm look live in
-  production. It was false (`coinsCache` is assigned outside the suppression guard, so the branch
-  re-enters once per cache-nulling, not per frame), and it was corrected only when someone read the
-  code rather than the argument. Reasoning set the priority; observation corrected it. Several other
+  production. It was false — and the CORRECTION was then partly false too, in the other direction,
+  so the same sentence needed fixing twice before it was right. It was only ever settled by someone
+  reading the code rather than the argument, three times running. Reasoning set the priority; observation corrected it. Several other
   claims in the same change went the same way, always prose asserting a mechanism, never wrong code.
   **When a durability claim decides what gets built, measure it before it sets.**
 

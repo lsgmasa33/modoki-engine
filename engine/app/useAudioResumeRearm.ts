@@ -33,7 +33,11 @@ export function useAudioResumeRearm() {
     if (Capacitor.isNativePlatform()) {
       void CapacitorApp.addListener('appStateChange', ({ isActive }) => {
         if (isActive) audioResume();
-      }).then((h) => { if (cancelled) h.remove(); else appListener = h; });
+      }).then((h) => { if (cancelled) h.remove(); else appListener = h; })
+      // A rejected registration must not become an unhandledrejection: globalErrors.ts
+      // reports those to Crashlytics, so an absent/stripped plugin would file one per
+      // launch. Same treatment as capacitorStore.ts's listener (see its .catch).
+      .catch(() => {});
     }
     return () => {
       cancelled = true;

@@ -3,6 +3,7 @@ import type { ErrorInfo, ReactNode } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
+import { useAudioDucking } from './useAudioDucking';
 import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint } from '@modoki/engine/runtime';
 import { App as CapacitorApp } from '@capacitor/app';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
@@ -760,7 +761,21 @@ function App() {
     if (Capacitor.isNativePlatform()) {
       void CapacitorApp.addListener('appStateChange', ({ isActive }) => {
         if (!isActive) flush();
-      }).then((h) => { if (cancelled) h.remove(); else appListener = h; });
+      }).then((h) => { if (cancelled) h.remove(); else appListener = h; })
+        // A rejected registration must not become an unhandledrejection: globalErrors.ts reports
+        // those to Crashlytics, so an absent/stripped plugin would file one per launch. Same
+        // treatment as capacitorStore.ts's listener (see its .catch).
+        //
+        // But this one is NOT swallowed silently, unlike the siblings. A rejection here means the
+        // background-flush listener never registered, so pending PlayerPrefs writes stop being
+        // flushed on background — save-data loss on an OS kill, which is worse than the noise the
+        // catch exists to suppress. Degraded rather than dead (visibilitychange/pagehide above are
+        // registered unconditionally and cover most native background transitions), so it warns
+        // rather than throws.
+        .catch((e: unknown) => {
+          console.warn('[modoki] appStateChange listener failed to register — PlayerPrefs will not '
+            + 'flush on background; relying on visibilitychange/pagehide', e);
+        });
     }
     return () => {
       cancelled = true;
@@ -772,6 +787,7 @@ function App() {
   }, []);
 
   useAudioResumeRearm();
+  useAudioDucking();
 
   // Editor route (omitted from game-only builds)
   if (!GAME_ONLY && hash === '#/editor' && EditorApp) {
