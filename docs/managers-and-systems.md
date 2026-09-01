@@ -155,53 +155,43 @@ setCurrentWorld(new)
 App-scoped managers are untouched by swaps — they init/dispose only at
 `registerManager`/`unregisterManager`.
 
-App-scoped managers are unregistered by exactly one thing: **`teardownAll()`**
-(`engine/app/ecs/register.ts`), the inverse of `registerAll()`. It drops all eight Managers
-`registerAll` installs, disposes audio in the order service → buffers → context, clears the
-LateUpdate registry, and **re-arms the registration latch** so the next `registerAll()` genuinely
-re-registers. Its entry point is `App`'s unmount cleanup (`App.tsx`).
+**App-scoped managers are never unregistered in production, and that is by design (#534).**
 
-⚠️ **That entry point is not yet an effective TRIGGER, and the gap is the remaining #534 work.**
-Nothing unmounts `App` in a shipped build (one `createRoot`, never torn down), and in dev the only
-unmount is React StrictMode's mount → unmount → remount — which is *synchronous within the commit*,
-while both `registerAll()` call sites (`ecs/init.ts` via GameShell's boot effect, `editor/setup.ts`
-via a React.lazy factory) sit downstream of awaits. So the teardown always arrives before anything
-is registered and returns at its own `if (!registered)`. Measured, not reasoned: instrumenting it in
-`engine/tests/app/appTeardownStrictMode.test.tsx` shows it called exactly once with
-`registered === false`, in both routes. **`disposeAudioContext` and the other teardown halves are
-therefore reachable on paper and still do not run.** A trigger that fires *after* registration is
-what closes this — the candidates are #516's A→B→A game swap and an error boundary raised above
-`GameShell`.
+There is no `teardownAll()`. One was built — the exact inverse of `registerAll()`, dropping all
+eight Managers, disposing audio in the order service → buffers → context, clearing the LateUpdate
+registry and re-arming the latch — wired to `App`'s unmount cleanup, tested, and then **removed**,
+because the measurement showed there is nothing for it to serve.
 
-⚠️ **The re-arm is the load-bearing half, not the teardown.** #517 declined to wire
-`unregisterManager('Input')` and documented why: `registered` was a once-only latch, so tearing a
-manager down left nothing to bring it back, and for `'Input'` that meant permanently dead input
-rather than a leak fixed. That was a property of the latch, never of the managers. Clearing it is
-what made the whole class safe — — but note that `APP_LIFETIME_BY_DESIGN` in
-`engine/tests/architecture/appManagerDisposeReachable.test.ts` still carries `'Input'`,
-`'engine.time'` and `'engine.navigation'`, because of the trigger gap above. Emptying it is the
-signal that #534 is finished, not a step on the way there.
+⚠️ **Every end-of-lifetime in this architecture is a REALM DEATH, not a teardown.** The OS kills
+the process on mobile; the tab closes on web; restart and OTA go through `location.reload()`
+(`engine.reload`, `runtime/actions/engineActions.ts`); and even the editor's project switch — the
+most teardown-shaped thing here — is a `webContents.reload()` (`setProject`,
+`engine/electron/main.ts`). None of those leave a realm behind, so none of them want a teardown.
+There is one `createRoot` (`main.tsx`) and no `.unmount()` anywhere in the repo.
 
-⚠️ **The teardown and the re-register live in DIFFERENT components**, and a trigger must satisfy
-both gates. `teardownAll()` runs from `App`'s cleanup; the re-register runs one component down in
-`GameShell`'s `[gameId]` boot effect, gated by **two** refs — the `activeGameIdRef` early return and
-`isFirstLoad = !initializedRef.current`, which is what actually wraps the `initWorldSync()` call. A
-completed boot writes both on adjacent lines, so relaxing only the first re-enters the effect and
-still registers nothing. An `isAppRegistered()` clause on the early return alone was tried and
-removed for exactly that reason.
+Two consequences worth stating, so neither is re-filed as a defect:
 
-**Two guards, neither redundant, and neither sufficient.** `appManagerDisposeReachable.test.ts`
-proves each app-scoped manager reaches a teardown; `appTeardownReachable.test.ts` proves that
-teardown is itself called. Both are TEXTUAL scans, so neither can ask whether the call ever runs with
-something registered — which is why the allowlist stays populated until a real trigger lands. A third
-guard of the same kind would not help.
+- **`APP_LIFETIME_BY_DESIGN` in `engine/tests/architecture/appManagerDisposeReachable.test.ts` is
+  permanent**, not a backlog. `'Input'`, `'engine.time'` and `'engine.navigation'` have a `dispose`
+  that production never reaches, and that is correct. Do not empty the list by wiring a new
+  teardown path — that was tried, measured and reverted.
+- **In-session teardown is a different problem and DOES belong here.** A scene swap or an editor
+  world swap keeps the realm alive, so a missed `dispose` there is an ordinary leak. Two were fixed
+  under #534 (3D video textures across the four `Scene3D`/`SceneView` teardown sites, and
+  `ModelPreview`'s source models). Scene-scoped resources are covered by
+  [scene-loading.md](scene-loading.md).
 
-**Scene lifetime is a separate lifetime.** `teardownAll()` deliberately does **not** call
-`SceneManager.unloadAll()`; a shutdown composes `await sceneManager.unloadAll()` then
-`teardownAll()`. ⚠️ Whoever writes that composer inherits #535's "unload wins" semantic: a
-`loadScene` in flight when `unloadAll` starts **rejects with `AbortError`** where it used to resolve,
-so the composer must swallow `AbortError` specifically — never blanket-catch — following the
-precedent in `runtime/ui/bindings.ts`.
+**When this would change:** only a **soft restart** — tearing down and re-registering in place
+instead of reloading, e.g. to pick up new remote config without a visible reload. That is a real
+feature if it is ever wanted, and the bar for it is exhaustiveness: anything the teardown misses
+silently survives into the next session, which is a worse failure than the reload flash it saves.
+The removed implementation is in git at `bc0fa7242` if it is ever wanted back.
+
+**Scene lifetime is a separate lifetime**, and it is the one that genuinely gets torn down:
+`SceneManager.unloadAll()` runs while the realm lives on. ⚠️ Anything that composes with it
+inherits #535's "unload wins" semantic — a `loadScene` in flight when `unloadAll` starts **rejects
+with `AbortError`** where it used to resolve, so the caller must swallow `AbortError` specifically,
+never blanket-catch, following the precedent in `runtime/ui/bindings.ts`.
 
 The `init new *-scoped managers` steps above only run while the load that reached
 them is still the live primary — a superseded `loadScene` call skips them instead

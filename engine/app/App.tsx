@@ -2,6 +2,7 @@ import React, { Component, lazy, Suspense, useEffect, useRef, useState } from 'r
 import type { ErrorInfo, ReactNode } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
+import { useAudioResumeRearm } from './useAudioResumeRearm';
 import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint } from '@modoki/engine/runtime';
 import { App as CapacitorApp } from '@capacitor/app';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
@@ -10,12 +11,11 @@ import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
 import LoadingOverlay from './ui/components/LoadingOverlay';
 import { dismissBootSplash, hasBootSplash, BOOT_SPLASH_TIMEOUT_MS } from './ui/bootSplash';
 import { initWorldSync } from './ecs/init';
-import { teardownAll } from './ecs/register';
 import { runPipeline } from './ecs/pipeline';
 import { GAMES } from 'virtual:modoki-games';
 import type { GameDefinition } from '@modoki/engine/runtime';
 import { setActiveResetPhase } from './ui/components/ErrorBoundary';
-import { audioResume } from '@modoki/engine/runtime';
+import { audioDispose } from '@modoki/engine/runtime';
 import { VideoOverlay } from '@modoki/engine/runtime';
 import { useKeyboardShift } from './hooks/useKeyboardShift';
 import { onTierSwitchOverlay } from '@modoki/engine/runtime';
@@ -724,35 +724,20 @@ function App() {
   // Run ECS pipeline every frame (needed by both game and editor for Scene3D rendering)
   useGameLoop(runPipeline);
 
-  // App-scoped teardown on unmount, and the ONE production trigger for it (#534).
+  // Cleanup native SDK listeners + the audio node graph on unmount.
   //
-  // `teardownAll()` is the inverse of the `registerAll()` GameShell's boot effect runs: it drops
-  // the eight app Managers, disposes audio in the order service → buffers → context, clears the
-  // LateUpdate registry, and RE-ARMS the registration latch so the next boot registers for real.
-  // Before it existed this line called `audioDispose()` under a comment claiming it disposed the
-  // audio CONTEXT — it disposed only the node graph, so the accumulation the comment named was
-  // never actually prevented. `teardownAll()` does what that comment always said.
+  // ⚠️ THIS EFFECTIVELY NEVER RUNS, and that is by design rather than an oversight (#534). In a
+  // shipped web/native build there is one `createRoot` (main.tsx) that is never unmounted; in dev
+  // the only unmount is StrictMode's mount -> unmount -> remount, which is SYNCHRONOUS within the
+  // commit and therefore lands before either `registerAll()` site (both sit downstream of awaits).
   //
-  // ⚠️ WHEN THIS FIRES — AND WHY IT IS NOT YET ENOUGH (measured, #534 close-out). In a shipped
-  // web/native build, never: one `createRoot` (main.tsx), never unmounted. In DEV it fires exactly
-  // once, during StrictMode's mount → unmount → remount — but that cycle is SYNCHRONOUS within the
-  // commit, while both `registerAll()` call sites (GameShell's boot effect here, and
-  // `editor/setup.ts` via a React.lazy factory) sit downstream of awaits. So it always arrives
-  // before anything is registered and `teardownAll()` returns at its own `if (!registered)`.
-  // Instrumented in `tests/app/appTeardownStrictMode.test.tsx`: called once, latch false, every
-  // time, in both routes. This is therefore the right ENTRY POINT and not yet a working trigger;
-  // `disposeAudioContext` still does not run. A trigger that fires after registration is the
-  // remaining work — see #534.
-  //
-  // ⚠️ THE RE-REGISTER IS NOT HERE — it is in GameShell's `[gameId]` effect, and it is gated by
-  // TWO refs, not one: the `activeGameIdRef` early return, and `isFirstLoad = !initializedRef`,
-  // which is what actually wraps the `initWorldSync()` call. A completed boot sets both on
-  // adjacent lines. So whoever lands a real trigger must handle both — an earlier attempt here
-  // added an `isAppRegistered()` clause to the early return alone, which fell through to an
-  // `isFirstLoad` of false and re-registered nothing. It was removed rather than left as a guard
-  // that reads like protection and is not (#534 close-out).
+  // So do NOT grow this into an app teardown. #534 built exactly that -- a `teardownAll()`
+  // inverting `registerAll()` -- and it was removed once measured: every end-of-lifetime in this
+  // architecture is a REALM DEATH, not a teardown (process kill on mobile, tab close on web,
+  // `location.reload()` for restart/OTA, `webContents.reload()` for the editor's project switch).
+  // Nothing survives those to be cleaned up. `docs/managers-and-systems.md` carries the reasoning.
   useEffect(() => {
-    return () => { appServices().ads?.cleanup(); teardownAll(); };
+    return () => { appServices().ads?.cleanup(); audioDispose(); };
   }, []);
 
   // OTA Phase 4 (docs/ota-subgame-modules.md) — discover + load any sub-game
@@ -792,24 +777,7 @@ function App() {
     };
   }, []);
 
-  // Unlock the AudioContext on the first user gesture (mobile/WebView autoplay
-  // policy suspends it until then). One-shot: the listeners remove themselves.
-  useEffect(() => {
-    const unlock = () => {
-      audioResume();
-      for (const evt of ['pointerdown', 'touchstart', 'keydown']) {
-        window.removeEventListener(evt, unlock);
-      }
-    };
-    for (const evt of ['pointerdown', 'touchstart', 'keydown']) {
-      window.addEventListener(evt, unlock, { once: false });
-    }
-    return () => {
-      for (const evt of ['pointerdown', 'touchstart', 'keydown']) {
-        window.removeEventListener(evt, unlock);
-      }
-    };
-  }, []);
+  useAudioResumeRearm();
 
   // Editor route (omitted from game-only builds)
   if (!GAME_ONLY && hash === '#/editor' && EditorApp) {

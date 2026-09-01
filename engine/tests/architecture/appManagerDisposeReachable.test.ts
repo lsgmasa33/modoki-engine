@@ -257,36 +257,30 @@ function scanForMatch(dir: string, re: RegExp): boolean {
  * unregister call sites, same as this file's own scan) defeats the guard: it makes the test green
  * while the underlying defect — a disposer nothing ever reaches — still exists.
  *
- * ⚠️ #534 BUILT THE TEARDOWN PATH AND THESE THREE STILL BELONG HERE. That is not the outcome the
- * work expected, so the measurement is recorded rather than the conclusion. `teardownAll()`
- * (engine/app/ecs/register.ts) exists, unregisters all three by name, re-arms the latch, and IS
- * called — from `App`'s unmount cleanup (App.tsx). So the source grep below now finds a production
- * `unregisterManagers([...])` caller, and this list can be emptied with the guard still green.
- * It was, briefly. It is back because the guard passing is not the same as the disposers running:
+ * ⚠️ THESE THREE ARE PERMANENT, and #534 is the reason to stop re-litigating them. That issue
+ * built the missing inverse — a `teardownAll()` unregistering all three by name and re-arming the
+ * latch — wired it to `App`'s unmount cleanup, and then REMOVED it, because the measurement showed
+ * the trigger could never fire with anything registered and, more fundamentally, that this
+ * architecture has no surviving-realm shutdown for such a path to serve:
  *
- *   `registerAll()` has exactly two call sites — `ecs/init.ts` (via GameShell's boot effect) and
- *   `editor/setup.ts` (via a React.lazy factory) — and BOTH are downstream of awaits. The only
- *   thing that unmounts `App` is React StrictMode's mount → unmount → remount, which is
- *   SYNCHRONOUS within the commit. So the teardown always runs BEFORE either registration can
- *   complete. Measured, not reasoned: instrumenting `teardownAll` in
- *   `tests/app/appTeardownStrictMode.test.tsx` shows it called exactly once, with `registered ===
- *   false`. Nothing to tear down, every time. Nothing else unmounts the root (one `createRoot` in
- *   main.tsx, no `.unmount()` anywhere in the repo).
+ *   Every end-of-lifetime here is a REALM DEATH. The OS kills the process on mobile; the tab
+ *   closes on web; restart and OTA go through `location.reload()` (`engine.reload`,
+ *   runtime/actions/engineActions.ts); even the editor's project switch is a `webContents.reload()`
+ *   (`setProject`, engine/electron/main.ts). None of them leave a realm behind, so none of them
+ *   want a teardown. There is one `createRoot` (main.tsx) and no `.unmount()` anywhere in the repo.
  *
- * So `dispose` on these three still never runs in production, and emptying this list would assert
- * something false — the same inert-guard shape #517's close-out found in this very file, one level
- * up. The entry point is real and re-arms correctly; what is still missing is a trigger that can
- * fire while anything is registered. The candidates are the A→B→A game swap (#516) and an error
- * boundary raised above `GameShell` — see #534.
- *
- * DELETE THIS LIST when such a trigger lands, and verify it the way the above was verified: assert
- * `teardownAll` observes `registered === true`, not merely that it was called.
+ * So `dispose` on these three is unreachable in production BY DESIGN, not by omission, and this
+ * list is the honest record of that rather than a backlog. Do NOT empty it by wiring a new
+ * teardown path; that was tried, measured and reverted. It would only become emptiable if a SOFT
+ * restart is ever built (tear down and re-register in place, instead of reloading) — and then the
+ * bar is to assert the teardown observes `registered === true`, not merely that it was called.
+ * Reasoning: docs/managers-and-systems.md.
  */
 const APP_LIFETIME_BY_DESIGN: Record<string, string> = {
   // Window-level input listeners (keyboard/gamepad/pointer/touch-control/gesture) are one fixed
   // set for the whole process. `dispose` exists for the `ManagerDef` contract and for
-  // `__resetManagersForTesting`; `teardownAll()` would call it, but never does with 'Input'
-  // registered — see the block above (#517, re-measured #534).
+  // `__resetManagersForTesting`. Nothing in production unregisters it, and nothing should — see
+  // the block above (#517, re-measured and settled in #534).
   Input: 'engine/packages/modoki/src/runtime/input/inputSources.ts — verified app-lifetime, #517/#534',
   // dispose() unsubscribes the onPlayStateChange/onWorldSwap listeners init() installed and drops
   // its three read sources (deltaTime, timeSinceGameStart, timeSinceSceneLoad) — process-global

@@ -95,8 +95,17 @@ AudioListener trait ─┘        │
   own-only stream), and a scene-scoped refcounted `audioBufferCache` wired into
   `releaseAllForScene` + `disposeAllCachedResources`. `loadType` lives in the
   clip's `.meta.json` (read via `getAudioLoadType`, default `buffer`).
-- **App wiring** — `App.tsx` resumes the context on first user gesture and
-  disposes on teardown. The old oscillator `services/audio.ts` is deleted.
+- **App wiring** — `App.tsx` calls `useAudioResumeRearm()`
+  (`engine/app/useAudioResumeRearm.ts`), which keeps a persistent gesture listener
+  (pointerdown/touchstart/keydown) and re-arms on foreground (`visibilitychange`,
+  native `appStateChange`) to resume the context, disposing on teardown; a single
+  first-gesture resume isn't enough because an iOS audio-session interruption
+  (e.g. a Music.app takeover) can suspend the context long after it (#489). The
+  old oscillator `services/audio.ts` is deleted.
+  **Device-verified** (owner, iPhone 8 / iOS 16.7.16, 2026-09-01): play Music.app,
+  stop it, foreground Court — audio returns with **no relaunch**. Re-test that way;
+  no simulator or headless test reproduces an audio-session interruption, so this
+  path's only real evidence is a phone.
 - **Tests** — `tests/runtime/audioSystem.test.ts` (record mode: autoplay, cues,
   play-state gating, scene-swap teardown, Transform-less sources) + buffer-cache
   refcount tests.
@@ -499,10 +508,6 @@ Covered by `packages/modoki/tests/runtime/audioJournal.test.ts`.
 - **Native backend** — `@capacitor-community/native-audio` behind `audioService`,
   **deferred by design** — only if measured device latency demands it (all targets
   are WebView, so Web Audio covers 100% today).
-- **Editor gesture-unlock (small)** — the game shell (`App.tsx`) resumes the
-  AudioContext on first gesture, but `EditorApp` does not, so a context suspended
-  mid-session stays silent until an editor relaunch. Add `audioResume()` on first
-  gesture in the editor shell.
 - **World-space spatial** ✅ SHIPPED — spatial positions now read each entity's
   **world** position, so nested rigs are spatialized correctly. `audioSystem` exposes
   `setAudioWorldPositionResolver` and stays **THREE-free**: the app injects a resolver

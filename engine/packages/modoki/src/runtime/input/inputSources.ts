@@ -192,19 +192,19 @@ registerSource(gestureSource);
 /** App-scope Manager: attaches all sources on register. Replaces the old
  *  keyboard-only `inputManagerDef`.
  *
- *  `dispose` is now REACHABLE but still does not run. `teardownAll()`
- *  (`engine/app/ecs/register.ts`) unregisters `'Input'` with the other seven
- *  Managers and re-arms the latch, so #517's objection — wire this and nothing
- *  re-registers the sources, leaving input permanently dead — no longer holds:
- *  that was a property of the LATCH, not of this manager. But the only thing
- *  that calls `teardownAll()` is `App`'s unmount, which in practice fires only
- *  during StrictMode's boot cycle, before anything is registered. So input
- *  sources remain app-lifetime in every real run (#534), and `'Input'` is still
- *  listed in `appManagerDisposeReachable.test.ts`'s allowlist.
+ *  `dispose` is UNREACHABLE in production, and that is settled rather than pending (#534). #517
+ *  declined to wire `unregisterManager('Input')` because the registration latch was once-only, so
+ *  a teardown would leave input permanently dead. #534 built the missing inverse — a
+ *  `teardownAll()` that dropped this manager and re-armed the latch — and then removed it: this
+ *  architecture never ends an app lifetime while the realm survives (mobile kills the process, web
+ *  closes the tab, restart/OTA and the editor's project switch both go through a reload), so
+ *  there was nothing for it to serve. `'Input'` therefore stays in
+ *  `appManagerDisposeReachable.test.ts`'s allowlist permanently.
  *
- *  What makes that safe is the pairing of `detachAll()` here with `attachAll()`
- *  in `init` — the source ARRAY is untouched, so re-attaching finds all five
- *  sources still registered.
+ *  `dispose` still earns its keep: it satisfies the `ManagerDef` contract and runs under
+ *  `__resetManagersForTesting`, and `detachAll()` pairs with `attachAll()` in `init` — the source
+ *  ARRAY is untouched, so a re-attach finds all five sources still registered. That pairing is
+ *  what would make this manager safe to tear down if a SOFT restart is ever built.
  *
  *  ⚠️ `unregisterSource()` is a different matter and is deliberately NOT on any
  *  teardown path. The five built-ins above are registered as a MODULE-EVAL side
