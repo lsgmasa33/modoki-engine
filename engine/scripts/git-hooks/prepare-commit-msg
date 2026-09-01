@@ -1,0 +1,25 @@
+#!/bin/sh
+# Prepend the current branch name to commit messages, e.g. "[work-ai] fix thing".
+# Skips merges, amends, and messages that already start with "[branch]".
+# Installed into .git/hooks/ by engine/scripts/install-git-hooks.mjs
+# (npm run hooks:install, or automatically via the `prepare` npm script).
+
+COMMIT_MSG_FILE=$1
+COMMIT_SOURCE=$2
+
+# Only touch normal commits (skip merge, squash, amend, template-from-file, etc.)
+if [ -n "$COMMIT_SOURCE" ] && [ "$COMMIT_SOURCE" != "message" ]; then
+  exit 0
+fi
+
+BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)
+[ -z "$BRANCH" ] && exit 0
+[ "$BRANCH" = "main" ] && exit 0   # hub branch — not worth tagging every commit
+
+FIRST_LINE=$(head -n1 "$COMMIT_MSG_FILE")
+case "$FIRST_LINE" in
+  "[$BRANCH]"*) exit 0 ;;  # already tagged
+esac
+
+sed -i.bak "1s/^/[$BRANCH] /" "$COMMIT_MSG_FILE"
+rm -f "$COMMIT_MSG_FILE.bak"
