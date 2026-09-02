@@ -6,6 +6,7 @@ import { parseFontFilename, type FontInfo } from './fontNaming';
 import { assetUrl, withCacheBust } from './assetUrl';
 import { getAllAssets, getAssetEntry, resolveRef, onFontInvalidated, type FontManifestBlock } from './assetManifest';
 import { isGuid } from '../core/assetRefRules';
+import { createTeardownToken } from '../core/liveness';
 
 export { parseFontFilename, type FontInfo };
 
@@ -28,11 +29,11 @@ const loading = new Map<string, Promise<string>>();
  *  bug this map exists for (#276). */
 const faces = new Map<string, FontFace>();
 
-/** Bumped by every invalidation/teardown. A load captures it before awaiting and refuses
- *  to register if it changed: otherwise a load of the OLD bytes that was still in flight
- *  when the re-import landed resolves afterwards and re-registers the stale face on top
- *  of the fresh one. Mirrors fontAtlasLoader's generation guard. */
-let generation = 0;
+/** Teardown liveness — no per-key epoch: every invalidation/teardown invalidates wholesale. A
+ *  load captures it before awaiting and refuses to register if it changed: otherwise a load of
+ *  the OLD bytes that was still in flight when the re-import landed resolves afterwards and
+ *  re-registers the stale face on top of the fresh one. Mirrors fontAtlasLoader's liveness guard. */
+const liveness = createTeardownToken();
 
 /** Drop the {@link FontInfo} a path contributed to {@link loadedFonts} (and the family
  *  key if that was its last variant). Called before a re-load so the reload re-registers
@@ -69,12 +70,12 @@ async function doLoadFont(path: string): Promise<string> {
     style: info.style,
   });
 
-  const gen = generation;
+  const stillLive = liveness.capture();
   await face.load();
   // Invalidated (or torn down) while this was in flight: these are the OLD bytes and a
   // reload for the new ones is already running. Registering now would put the stale face
   // back on top — last-added wins, so it would silently beat the fresh one.
-  if (gen !== generation) return info.family;
+  if (!stillLive()) return info.family;
   document.fonts.add(face);
   // Delete the superseded face only AFTER its replacement is registered, so live text
   // never falls back to a system font for a frame. The ordering lives here, in the one
@@ -171,7 +172,7 @@ export function invalidateFontFace(path: string): void {
   // re-import and stranding the font on the stale face until an editor restart. `faces`
   // survives a failed reload precisely because the old face is still registered.
   if (!faces.has(path) && !loading.has(path)) return;
-  generation++;          // any in-flight load is now carrying the OLD bytes — refuse it
+  liveness.invalidateAll();  // any in-flight load is now carrying the OLD bytes — refuse it
   loading.delete(path);
   loadedPaths.delete(path);
   void loadFont(path).catch(e => {
@@ -199,7 +200,7 @@ export function disposeAllFontFaces(): void {
   loadedFonts.clear();
   loading.clear();
   familyWarned.clear();
-  generation++;          // invalidate every in-flight load
+  liveness.invalidateAll();  // invalidate every in-flight load
 }
 
 /** Load all font assets from an asset list. Typically called with the result of /api/scan-assets.

@@ -385,3 +385,83 @@ describe('delete / clear', () => {
     });
   });
 });
+
+/** A `clear()` landing mid-download must not leave the entry behind (#573).
+ *
+ *  `doFetch` awaits three times — the fetch, the body read, and `backend.write` — and only then
+ *  seats `index` and PERSISTS it. "Clear the video cache" is a user-facing storage action, so the
+ *  window is entirely ordinary: a download in flight while someone frees space. Without the guard
+ *  the clear reports success and the entry reappears in both the backend and the saved index,
+ *  surviving a reload — the one thing the user explicitly asked to be rid of.
+ */
+/** `delete(key)` landing mid-download must stale THAT key and nothing else (#573).
+ *
+ *  The per-key twin of the `clear()` case below. Two things are pinned, and the second is a
+ *  regression the first version of this guard introduced:
+ *   - the deleted key's download does not re-seat the entry the user just removed;
+ *   - an UNRELATED key's download is untouched — which is the whole reason `invalidateKey` exists
+ *     rather than `invalidateAll`. ⚠️ Both downloads are gated here on purpose: an earlier version
+ *     gated only the doomed one, and the survivor finished BEFORE the delete even ran, so the
+ *     assertion passed just as happily with `invalidateAll()` in place of `invalidateKey()`.
+ *   - and a fresh request for the deleted key starts a NEW download rather than coalescing onto
+ *     the staled one — staling without dropping the `inFlight` entry turned the next
+ *     `fetchAndStore` into a permanent cache miss.
+ */
+describe('VideoCache — a delete(key) during a download of that key', () => {
+  it('stales only that key, and a later request re-downloads it', async () => {
+    const backend = new FakeBackend();
+    const cache = new VideoCache({ backend, budgetBytes: 100 * MB, storage: memStorage() });
+    vi.stubGlobal('fetch', mockFetch(1 * MB));
+
+    // BOTH writes gated, so neither can quietly finish before the delete lands.
+    let releaseWrites: () => void = () => {};
+    const gate = new Promise<void>((r) => { releaseWrites = r; });
+    const realWrite = backend.write.bind(backend);
+    backend.write = async (k: string, d: Blob) => { await gate; await realWrite(k, d); };
+
+    const doomed = cache.fetchAndStore('gone', 'https://example.test/gone.mp4');
+    const survivor = cache.fetchAndStore('kept', 'https://example.test/kept.mp4');
+    await new Promise((r) => setTimeout(r, 0)); // both downloads now parked in write
+    await cache.delete('gone');
+    releaseWrites();
+
+    expect(await doomed).toBeUndefined();
+    expect(await survivor, 'an unrelated key must be untouched by invalidateKey').toBeDefined();
+    expect(cache.entries().map((e) => e.key)).toEqual(['kept']);
+
+    // The regression: the staled job must not be left registered for the next caller to inherit.
+    backend.write = realWrite;
+    const retry = await cache.fetchAndStore('gone', 'https://example.test/gone.mp4');
+    expect(retry, 'a request after the delete starts a FRESH download').toBeDefined();
+  });
+});
+
+describe('VideoCache — a clear() during a download', () => {
+  it('does not re-seat the downloaded entry after the cache was cleared', async () => {
+    const backend = new FakeBackend();
+    const storage = memStorage();
+    const cache = new VideoCache({ backend, budgetBytes: 100 * MB, storage });
+    vi.stubGlobal('fetch', mockFetch(1 * MB));
+
+    // Hold the download inside its final await, which is where the real window lives.
+    let releaseWrite: () => void = () => {};
+    const writeGate = new Promise<void>((r) => { releaseWrite = r; });
+    const realWrite = backend.write.bind(backend);
+    backend.write = async (k: string, d: Blob) => { await writeGate; await realWrite(k, d); };
+
+    const job = cache.fetchAndStore('clip', 'https://example.test/clip.mp4');
+    // Let the download actually GET in flight — `fetchAndStore` awaits a cache lookup before
+    // `doFetch` even starts, so clearing immediately would land before the download captured its
+    // token and prove nothing. The real cadence is a clear arriving during a live download.
+    await new Promise((r) => setTimeout(r, 0));
+    await cache.clear();   // the user frees space while the download is still writing
+    releaseWrite();
+    const url = await job;
+
+    expect(url).toBeUndefined();              // the caller is told there is no cached copy
+    expect(cache.entries()).toEqual([]);      // …and the index agrees
+    expect(backend.store.has('clip')).toBe(false); // …and the bytes are gone, not orphaned
+    const persisted = JSON.parse(storage._map.get('modoki.videoCache.index.v1') ?? '{}') as Record<string, unknown>;
+    expect(persisted).toEqual({});            // …and nothing survives a reload
+  });
+});

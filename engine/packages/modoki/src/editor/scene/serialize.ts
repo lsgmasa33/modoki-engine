@@ -30,6 +30,7 @@ import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { hasDirtyAssets, getDirtyAssetPaths, flushDirtyAssets, type FlushResult } from './dirtyAssets';
+import { createSupersessionToken } from '../../runtime/core/liveness';
 
 // ── Types ───────────────────────────────────────────────
 
@@ -770,8 +771,20 @@ async function writeFileToServer(filePath: string, content: string): Promise<boo
 // The edit-version at the last successful save / load / new. Anything past it is work that
 // exists ONLY in the live world. (C7)
 let _savedAtEditVersion = 0;
-/** Mark the live world as matching disk (a successful save, or a fresh load/new). */
-export function markSceneSaved(): void { _savedAtEditVersion = getEditVersion(); }
+/** Mark the live world as matching disk (a successful save, or a fresh load/new).
+ *
+ *  `atEditVersion` is the version the written CONTENT was serialized at, and an async caller MUST
+ *  pass it. Defaulting to `getEditVersion()` is only correct when the world became the disk state
+ *  synchronously — a load, a new scene, a prefab-edit exit — because then "now" and "what was
+ *  written" are the same moment. `saveScene` is not that: it serializes, then awaits a disk write
+ *  (and on the Save-As path, a NATIVE MODAL a human can leave open indefinitely). Reading the
+ *  version after those awaits records edits made DURING them as though they had been written,
+ *  which is a silent data-loss bug — `hasUnsavedChanges()` then answers false, and per its own
+ *  doc comment below that is the flag the game-code-reload gate reads before force-reloading the
+ *  editor and discarding the live world. See docs/async-lifetime.md. */
+export function markSceneSaved(atEditVersion?: number): void {
+  _savedAtEditVersion = atEditVersion ?? getEditVersion();
+}
 /** Is there live-world work not on disk? Used to stop load_scene/new_scene silently
  *  DESTROYING it — that reported {ok:true} while the entity you just created was gone from
  *  the world, the file, and the undo stack, with nothing anywhere saying why.
@@ -890,6 +903,11 @@ export async function saveScene(opts: {
   // to the live world so subsequent refs resolve and the next save is stable.
   const scene = await serializeScene({ assignGuids: true });
   const content = JSON.stringify(scene, null, 2);
+  // The version `content` actually represents. Captured HERE — after serializeScene, which mints
+  // guids into the live world and so moves the version itself, and before the disk write, which is
+  // the deferral an edit can land inside. Every `markSceneSaved` below is handed this rather than
+  // re-reading the version on the other side of an await; see markSceneSaved's doc comment.
+  const savedAtEditVersion = getEditVersion();
 
   const knownPath = explicitPath || _currentScenePath;
   if (knownPath) {
@@ -901,7 +919,7 @@ export async function saveScene(opts: {
       if (knownPath !== _currentScenePath) setCurrentScenePath(knownPath);
       editorEmit('!save', { path: knownPath, entities: scene.entities.length }); // Editor Percept (V2)
       console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${knownPath}`);
-      markSceneSaved();
+      markSceneSaved(savedAtEditVersion);
       return { saved: true, path: knownPath, reason: 'ok' };
     }
     console.error(`[Editor] Failed to save scene to ${knownPath}`);
@@ -931,7 +949,7 @@ export async function saveScene(opts: {
     setCurrentScenePath(target); // persists, so the next Save All goes straight to it
     editorEmit('!save', { path: target, entities: scene.entities.length }); // Editor Percept (V2)
     console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${target}`);
-    markSceneSaved();
+    markSceneSaved(savedAtEditVersion);
     return { saved: true, path: target, reason: 'ok' };
   }
   console.error(`[Editor] Failed to save scene to ${target}`);
@@ -940,7 +958,37 @@ export async function saveScene(opts: {
 
 /** Monotonic load counter — the newest `loadScene` call owns the progress modal.
  *  See the epoch guard inside loadScene. */
-let _loadEpoch = 0;
+const loadEpoch = createSupersessionToken();
+
+/** The current scene-load generation, for a caller that must survive its OWN await and then ask
+ *  "did a scene load happen while I was gone?".
+ *
+ *  Exported rather than kept private for the same reason `PlayerPrefs.swapGeneration()` is (#454 C):
+ *  a re-sampled "is a load in flight" flag structurally CANNOT see a load that started and finished
+ *  entirely inside the caller's await — it reads false on both sides. Only a monotonic count can.
+ *  `playMode.enterPlay` is the first consumer: it snapshots the world across two awaits, and a load
+ *  landing in between leaves it holding a snapshot of a scene that is no longer loaded.
+ *
+ *  ⚠️ Counts LOADS, not scene paths — a reload of the SAME path still moves it, which is the point;
+ *  comparing `currentScenePath()` would miss exactly that case. See docs/async-lifetime.md. */
+export function sceneLoadGeneration(): number { return loadEpoch.current; }
+
+/** How many `loadScene` calls are between their entry and their `finally`.
+ *
+ *  The counterpart to {@link sceneLoadGeneration}, and BOTH are needed — this is the
+ *  "use both" case docs/async-lifetime.md describes. A generation captured at the top of an
+ *  operation cannot see a load that was ALREADY in flight when that operation began: the epoch
+ *  bumped before the capture, so it reads equal on both sides. Only a live in-flight count can
+ *  answer "is one running right now". Mirrors `SceneManager.teardownInFlight`, which exists for
+ *  exactly this reason one layer down.
+ *
+ *  ⚠️ SCOPE: this counts loads through THIS wrapper only. `applyPrefabUndo` and
+ *  `prefabEdit.openPrefabForEditing` swap the world by calling `sceneManager.loadScene` directly
+ *  and touch neither this nor the epoch. A caller that needs "is the world being swapped at all"
+ *  must also consult `sceneManager.getNext()` — `playMode`'s `aSceneSwapIsHappening()` is the
+ *  worked example. */
+let _loadsInFlight = 0;
+export function isSceneLoadInFlight(): boolean { return _loadsInFlight > 0; }
 
 /** `loadScene`'s outcome. `'superseded'` covers BOTH ways a load can lose to a newer one:
  *  cancelled early (SceneManager aborts the in-flight load — rejects with AbortError) and
@@ -979,8 +1027,13 @@ export async function loadScene(
   // load's `finally` must NOT clear the progress modal the WINNING load is
   // driving, and its late onProgress must not write stale counts — so only the
   // latest epoch touches sceneLoadStatus.
-  const epoch = ++_loadEpoch;
+  const stillLive = loadEpoch.begin();
   const setSceneLoadStatus = useEditorStore.getState().setSceneLoadStatus;
+  // Inside nothing yet, but immediately before the `try` whose `finally` decrements it — so the
+  // pairing holds however the body exits. (Kept below the store read deliberately: an increment
+  // above a statement that could throw would leak the count, and the `finally` comment would be
+  // a lie.)
+  _loadsInFlight += 1;
   try {
     setPlayState('stopped'); // a scene load always returns the editor to edit mode
     setSceneLoadStatus({ active: true, loaded: 0, total: 0 });
@@ -989,10 +1042,10 @@ export async function loadScene(
       // Resources acquire in parallel; each completion (on a cold cache, a finished
       // bake) advances the bar. The SceneLoadModal only shows past a ~400ms delay.
       onProgress: (loaded, total) => {
-        if (epoch === _loadEpoch) setSceneLoadStatus({ active: true, loaded, total });
+        if (stillLive()) setSceneLoadStatus({ active: true, loaded, total });
       },
     });
-    if (epoch !== _loadEpoch) {
+    if (!stillLive()) {
       // Superseded in the WINNER'S TAIL (sceneManager.ts:885-900): our own `sceneManager.loadScene`
       // resolved successfully — nothing threw, so the `catch` below never sees this case — but a
       // newer `loadScene` call already won. Running the writes below now would stomp the winner:
@@ -1038,9 +1091,12 @@ export async function loadScene(
     else console.error(msg);
     return 'failed';
   } finally {
+    // Load-bearing: if anything above throws, this must still return to zero, or every later
+    // reader of `isSceneLoadInFlight()` would believe a load is running forever.
+    _loadsInFlight -= 1;
     // Only the latest load owns the modal — a superseded load must not hide the
     // winner's progress bar (its `finally` can run after the winner set active).
-    if (epoch === _loadEpoch) useEditorStore.getState().setSceneLoadStatus({ active: false });
+    if (stillLive()) useEditorStore.getState().setSceneLoadStatus({ active: false });
   }
 }
 

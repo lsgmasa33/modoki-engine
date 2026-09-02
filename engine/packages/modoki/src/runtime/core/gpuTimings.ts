@@ -43,6 +43,7 @@
 
 import { getActiveRenderer } from './activeRenderer';
 import { PROFILE_WINDOW_FRAMES, summarizeStat, type FrameStat } from './frameProfiler';
+import { createTeardownToken } from './liveness';
 
 /** Distinct pass labels retained. A label is authored by engine code (`gpuPassScope`), not
  *  derived from scene data, so this is a guard against a runaway caller rather than an expected
@@ -131,7 +132,7 @@ let armedRenderer: unknown = null;
 let resolveInFlight = false;
 let resolveStartedAtFrame = 0;
 let errors = 0;
-/** Generation token for the measurement session. Bumped by every event that invalidates results
+/** Teardown liveness for the measurement session. Invalidated by every event that stales results
  *  already in flight: enable, disable, reset, and a renderer swap.
  *
  *  ── WHY A TOKEN AND NOT A FLAG CHECK IN `drain` ────────────────────────────────────────────
@@ -145,9 +146,11 @@ let errors = 0;
  *  a latch that now belongs to a newer resolve, letting two run concurrently against one pool and
  *  double-drain it.
  *
- *  Same mechanism, and the same reasoning, as `frameDriver`'s `loopGen`: make the stale-result
+ *  The same TOKEN as `frameDriver`'s rAF chain — though note that one is a
+ *  supersession token (a re-arm wins) and this is a teardown token (an invalidate wins); both now
+ *  come from `runtime/core/liveness.ts`, and `loopGen` no longer exists: make the stale-result
  *  class unrepresentable rather than guarding each site that could publish one. */
-let generation = 0;
+const liveness = createTeardownToken();
 
 const totalSamples = new Float64Array(PROFILE_WINDOW_FRAMES);
 const sampleFrameIds = new Float64Array(PROFILE_WINDOW_FRAMES);
@@ -223,7 +226,7 @@ function arm(): void {
     // which the new counter will eventually reach and mis-attribute, and its `resolveStartedAtFrame`
     // would be compared against the new renderer's much lower `info.frame` — leaving the
     // stuck-resolve escape permanently un-trippable.
-    generation++;
+    liveness.invalidateAll();
     resolveInFlight = false;
     pendingRanges = [];
     status = 'pending';
@@ -257,7 +260,7 @@ function disarm(): void {
   try { if (r?.backend) r.backend.trackTimestamp = false; } catch { /* teardown must not throw */ }
   // Retire anything in flight: a resolve landing after the caller turned timing OFF would write
   // into the rings, so a later re-enable would open with samples from before the disable.
-  generation++;
+  liveness.invalidateAll();
   purgePool();
   armedRenderer = null;
   resolveInFlight = false;
@@ -387,13 +390,13 @@ export function pollGpuTimings(): void {
   if (typeof resolve !== 'function') return;
   resolveInFlight = true;
   resolveStartedAtFrame = readRenderInfo()?.frame ?? 0;
-  // Capture the generation. A disable / reset / renderer swap between here and the landing makes
-  // this result describe a session the caller has already ended — see `generation`.
-  const gen = generation;
+  // Capture liveness. A disable / reset / renderer swap between here and the landing makes this
+  // result describe a session the caller has already ended — see `liveness`.
+  const stillLive = liveness.capture();
   Promise.resolve(resolve.call(renderer, 'render'))
-    .then(() => { if (gen === generation) drain(renderer); })
-    .catch(() => { if (gen === generation) errors++; })
-    .finally(() => { if (gen === generation) resolveInFlight = false; });
+    .then(() => { if (stillLive()) drain(renderer); })
+    .catch(() => { if (stillLive()) errors++; })
+    .finally(() => { if (stillLive()) resolveInFlight = false; });
 }
 
 /** Read the pool's resolved uid -> ms map, group it by frame, and record the completed frames.
@@ -603,7 +606,7 @@ export function resetGpuTimings(): void {
   // flight describes what came before, so retire it rather than letting it land in the fresh
   // window and flip `status` back to 'active' carrying the previous action's samples — and purge
   // what three has already resolved but we have not consumed, or the next drain files it anyway.
-  generation++;
+  liveness.invalidateAll();
   purgePool();
   resolveInFlight = false;
   if (enabled && status === 'active') status = 'pending';

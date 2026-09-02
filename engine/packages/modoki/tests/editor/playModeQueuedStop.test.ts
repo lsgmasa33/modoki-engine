@@ -29,6 +29,8 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
     getCurrent: () => (currentPath === null ? null : { path: currentPath }),
     getLoadedScenes: () => new Map(),
+    // enterPlay consults this to refuse Play while a swap is pre-swap in flight (#573).
+    getNext: () => null,
     loadScene: (p: string, o: unknown) => loadScene(p, o as never),
   },
 }));
@@ -42,9 +44,17 @@ const serializeScene = vi.fn(async () => {
   return SCENE;
 });
 let filePath: string | null = '/assets/scenes/main.scene.json';
+// The scene-load counter enterPlay samples on both sides of its snapshot awaits. A test bumps it
+// to model a load landing in that window; left alone it never moves, so every existing case here
+// behaves exactly as before.
+let loadGeneration = 0;
+let loadInFlight = false;
 vi.mock('../../src/editor/scene/serialize', () => ({
   serializeScene: (...args: unknown[]) => serializeScene(...(args as [])),
   getCurrentScenePath: () => filePath,
+  sceneLoadGeneration: () => loadGeneration,
+  // A load already in flight when Play is pressed is the other half of the guard (#573).
+  isSceneLoadInFlight: () => loadInFlight,
 }));
 
 vi.mock('../../src/editor/scene/timelinePreview', () => ({
@@ -70,6 +80,8 @@ beforeEach(() => {
   currentPath = '/assets/scenes/main.scene.json';
   filePath = '/assets/scenes/main.scene.json';
   setPlayState('stopped');
+  loadGeneration = 0;
+  loadInFlight = false;
 });
 
 describe('Stop queued during an in-flight enterPlay (#470)', () => {
@@ -253,5 +265,64 @@ describe('pausePlay() refusal during Play startup (#513)', () => {
     expect(getPlayState()).toBe('playing');
     pausePlay();
     expect(getPlayState()).toBe('paused');
+  });
+});
+
+/** A scene LOAD landing inside enterPlay's snapshot window must cancel Play (#573).
+ *
+ *  `_entering` refuses a concurrent PLAY. Nothing refused a concurrent LOAD — and enterPlay awaits
+ *  several times while snapshotting (`serializeScene()`, a per-base `serializeScene()`,
+ *  `fetchAiSettings()`). Both the File menu and the agent `load-scene` op reach a load inside that
+ *  window, which is the production cadence here. The result was worse than a lost Play: Play would
+ *  arm itself with `_snapshot`/`_snapshotPath` describing a scene that is no longer loaded, so the
+ *  eventual Stop would reload THAT scene over the one the human is now looking at — a revert to the
+ *  wrong world, presented as a normal Stop.
+ */
+describe('a scene load during enterPlay\'s snapshot window (#573)', () => {
+  it('cancels Play instead of arming a Stop that would restore the wrong scene', async () => {
+    const playPromise = enterPlay(); // stalls inside serializeScene()
+    await vi.waitFor(() => expect(resolveSerialize).not.toBeNull());
+
+    loadGeneration += 1; // a scene load lands while the snapshot is being taken
+
+    resolveSerialize!();
+    await playPromise;
+
+    // Without the guard this reads 'playing': Play starts holding a snapshot of a dead scene.
+    expect(getPlayState(), 'Play must not start against a superseded snapshot').toBe('stopped');
+  });
+
+  it('refuses Play outright when a load is ALREADY in flight', async () => {
+    // The other side of the same defect, and the nastier one. A load already running when Play is
+    // pressed has ALREADY bumped the generation, so the capture reads equal on both sides and the
+    // generation check passes. If that load is a reload of the SAME path, stopPlay's
+    // `snapPath !== path` guard does not fire either — so Stop would restore the pre-reload world
+    // over the reloaded one, which is exactly what the generation check exists to prevent.
+    loadInFlight = true;
+    await enterPlay();
+    expect(getPlayState(), 'Play must not start on top of an in-flight load').toBe('stopped');
+    expect(serializeScene, 'and must refuse BEFORE doing any snapshot work').not.toHaveBeenCalled();
+
+    // ⚠️ The refusal must not leak `_entering`. The first version of this guard sat AFTER the
+    // latch was set, so its early return skipped the `finally` and wedged Play for the rest of
+    // the session. That regression was caught only by the NEXT test timing out — which disappears
+    // the moment anyone runs this case in isolation (`-t`). Pin it here instead: once the load
+    // lands, Play must work.
+    loadInFlight = false;
+    const second = enterPlay();
+    await vi.waitFor(() => expect(resolveSerialize).not.toBeNull());
+    resolveSerialize!();
+    await second;
+    expect(getPlayState(), 'a refusal must leave Play usable afterwards').toBe('playing');
+    await stopPlay(); // leave the module stopped — these cases share playMode's state
+  });
+
+  it('still enters Play normally when no load intervenes', async () => {
+    // The positive case. Without it, the assertion above is satisfied by a Play that never starts.
+    const playPromise = enterPlay();
+    await vi.waitFor(() => expect(resolveSerialize).not.toBeNull());
+    resolveSerialize!();
+    await playPromise;
+    expect(getPlayState()).toBe('playing');
   });
 });

@@ -16,6 +16,7 @@ under **[plans/](./plans/)**; point-in-time reviews in **[reviews/](./reviews/)*
 | [architecture.md](./architecture.md) | Core engine architecture — koota world registry, traits, three render layers, frame driver, Zustand bridge, game decoupling |
 | [managers-and-systems.md](./managers-and-systems.md) | The engine's five logic roles — System, Manager, Projection, Store, Trait — and the first-class Manager primitive |
 | [architecture-layers.md](./architecture-layers.md) | The runtime's L0–L3 layer contract — what each layer may import, why ESM cycles make it a correctness rule, the registration-inversion pattern, and how to add a subsystem without breaking it |
+| [async-lifetime.md](./async-lifetime.md) | **Normative** — post-await liveness: capture a token before the first DEFERRAL (an `await`, but equally a `.then`, a `queueMicrotask`, a `setTimeout`, a callback) and re-check it before every write that follows one. The five sanctioned tokens and when each applies, the latch rule, why an identity token can wear a number, why a check crosses a call boundary as a check and never as a counter, the `runtime/core/liveness.ts` helper for the epoch/generation pair, and the deliberate gaps |
 | [repo-structure.md](./repo-structure.md) | The full annotated repo tree — every top-level and `engine/` subdirectory with its inline comments |
 
 ## Rendering & Assets

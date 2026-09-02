@@ -18,7 +18,7 @@ import type { SceneData } from '../../runtime/loaders/loadSceneFile';
 import { getPlayState, setPlayState, getRunMode, setRunMode } from '../../runtime/core/playState';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX } from './prefabEditWorld';
-import { serializeScene, getCurrentScenePath, type SceneFile, type SerializedEntity } from './serialize';
+import { serializeScene, getCurrentScenePath, sceneLoadGeneration, isSceneLoadInFlight, type SceneFile, type SerializedEntity } from './serialize';
 import { undoDepth, truncateUndoTo } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { hasTimelinePreviewSession, endTimelinePreviewSession } from './timelinePreview';
@@ -99,6 +99,23 @@ function currentSceneKey(): string | null {
 }
 
 /** Enter Play: snapshot the authored world, then start the simulation. */
+/** Is the live world being swapped out from under us, by ANY route?
+ *
+ *  ⚠️ Two signals, because neither alone is enough — and the second was missed on the first pass.
+ *  `isSceneLoadInFlight()`/`sceneLoadGeneration()` count only loads through the EDITOR WRAPPER
+ *  (`serialize.loadScene`). Several paths swap the world by calling `sceneManager.loadScene`
+ *  DIRECTLY and touch neither: `undo/applyPrefabUndo.ts`'s snapshot restore and
+ *  `prefabEdit.openPrefabForEditing` are both same-path reloads, which is the case
+ *  `stopPlay`'s `snapPath !== path` guard also cannot see — so Play would arm with a snapshot of
+ *  the pre-restore world and Stop would put it back over the undone one.
+ *
+ *  `sceneManager.getNext()` is non-null exactly while a load is pre-swap (it is relinquished AT
+ *  the swap), which is the window that matters here: past the swap the world is already the new
+ *  one, so a snapshot taken then is of the right world. See docs/async-lifetime.md. */
+function aSceneSwapIsHappening(): boolean {
+  return isSceneLoadInFlight() || sceneManager.getNext() !== null;
+}
+
 export async function enterPlay(): Promise<void> {
   if (getPlayState() === 'playing') { _stopRequested = false; return; }
   // Resume from Pause without re-snapshotting (the snapshot from the original
@@ -121,10 +138,29 @@ export async function enterPlay(): Promise<void> {
   // is exactly what consumes it — clearing it here would swallow the very Stop #470
   // was written to stop swallowing.
   if (_entering) return;
+  // ⚠️ The generation ALONE is one-sided, and the missing half is the nastier case. A load already
+  // in flight when Play is pressed has ALREADY bumped the epoch, so the capture above reads equal
+  // on both sides and the check below passes — Play then arms with a snapshot of the pre-swap
+  // world. When that load is a reload of the SAME path, `stopPlay`'s `snapPath !== path` guard does
+  // not fire either, so Stop restores the stale world over the reloaded one: the exact outcome this
+  // guard exists to prevent, entered from the other side. So refuse up front too — this is
+  // docs/async-lifetime.md's "Both? Use both."
+  if (aSceneSwapIsHappening()) {
+    console.warn('[Editor] Play refused — a scene load is still in flight. Try again once it lands.');
+    return;
+  }
+
   // Set synchronously, before the first await, so a Stop that arrives while we're
   // mid-startup (getPlayState() still reads 'stopped' below) can tell "Play is
   // starting" apart from "genuinely stopped" — see `_entering`'s doc comment (#470).
   _entering = true;
+  // Which scene we are snapshotting. `_entering` refuses a concurrent PLAY, but nothing refuses a
+  // concurrent scene LOAD — the menu and the agent `load-scene` op both reach one while the awaits
+  // below are in flight. A load landing there leaves `_snapshot`/`_snapshotPath`/`_baseSnapshots`
+  // describing a scene that is no longer loaded, and Stop would then restore it OVER the scene the
+  // human is now looking at. Counting loads rather than comparing the path is deliberate: a reload
+  // of the SAME path is just as fatal here and a path comparison cannot see it.
+  const enteredLoadGeneration = sceneLoadGeneration();
   try {
     // A Timeline-panel preview session may hold preview-mutated world state; revert it to the
     // authored snapshot FIRST so Play captures authored data (not the previewed camera/text).
@@ -150,6 +186,17 @@ export async function enterPlay(): Promise<void> {
       } catch (e) {
         console.warn(`[Editor] A5 base snapshot skipped for "${entry.path}": ${(e as Error).message}`);
       }
+    }
+    // A scene load landed while we were snapshotting: everything captured above describes a world
+    // that is gone. Refuse to enter Play rather than arm a Stop that would restore the wrong scene.
+    // Bail BEFORE `setPlayState('playing')` — past that point Play is externally visible and the
+    // snapshot is already load-bearing. The `finally` clears `_entering` and any queued Stop.
+    if (sceneLoadGeneration() !== enteredLoadGeneration || aSceneSwapIsHappening()) {
+      console.warn('[Editor] Play cancelled — a scene load landed while the snapshot was being taken.');
+      _snapshot = null;
+      _snapshotPath = null;
+      _baseSnapshots = new Map();
+      return;
     }
     // Mark the undo barrier at the real Play press (not the paused→playing resume
     // above) so Stop can drop only during-Play edits.

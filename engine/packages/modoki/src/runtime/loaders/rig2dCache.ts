@@ -14,6 +14,7 @@ import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { normalizeRig2D, type Rig2DFile, type ParsedRig2D } from '../skinning/rig2dTypes';
 import { parseAssetJson } from './assetFetch';
+import { createTeardownToken } from '../core/liveness';
 
 export {
   type Rig2DBone, type Rig2DPart, type Rig2DFile, type ParsedRig2DPart, type ParsedRig2D,
@@ -43,16 +44,14 @@ const cache = new Map<string, ParsedRig2D>();
 const sourceCache = new Map<string, Rig2DFile>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
-let generation = 0;
-/** Per-PATH invalidation epoch, checked alongside `generation` by every in-flight load.
+/** Teardown liveness, captured per PATH before each load and re-checked after.
  *
- *  `generation` is module-wide and belongs to `clearRig2DCache` (the whole cache is gone). A
- *  per-key `invalidateRig2D` must NOT refuse an in-flight load of a DIFFERENT key: this cache is
- *  driven by the editor's file watcher, so an author saving one rig would otherwise make a
- *  concurrent load of an unrelated rig silently drop it. Cleared wholesale by `clearRig2DCache`,
- *  so it cannot outgrow the cache it shadows. */
-const keyEpoch = new Map<string, number>();
-const epochOf = (path: string): number => keyEpoch.get(path) ?? 0;
+ *  `invalidateAll()` is `clearRig2DCache`'s (the whole cache is gone). A per-key `invalidateRig2D`
+ *  must NOT refuse an in-flight load of a DIFFERENT key — this cache is driven by the editor's
+ *  file watcher, so an author saving one rig would otherwise make a concurrent load of an
+ *  unrelated rig silently drop it — so it calls `invalidateKey` alone. Cleared wholesale by
+ *  `clearRig2DCache`, so the per-key map cannot outgrow the cache it shadows. */
+const liveness = createTeardownToken<string>();
 // Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here.
 const unknownGuidSeen = new Set<string>();
 
@@ -79,14 +78,13 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
   // caller had already decided to answer with a refusal.
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
-    const gen = generation;
-    const ep = epochOf(path);
+    const stillLive = liveness.capture(path);
     const p = fetch(assetUrl(path))
       .then((r) => {
         return parseAssetJson(r, path);
       })
       .then((json) => {
-        if (gen !== generation || ep !== epochOf(path)) return; // scene swap or per-key invalidation mid-flight
+        if (!stillLive()) return; // scene swap or per-key invalidation mid-flight
         if (cache.has(path)) return;          // editor live-preview seeded it
         const id = (json as Rig2DFile)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'rig2d');
@@ -94,7 +92,7 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
         cache.set(path, normalizeRig2D(json as Rig2DFile));
       })
       .catch((e) => {
-        if (gen === generation && ep === epochOf(path)) failed.add(path);
+        if (stillLive()) failed.add(path);
         console.warn(`[rig2dCache] failed to load ${path}:`, e);
       })
       .finally(() => loading.delete(path));
@@ -129,10 +127,10 @@ export function invalidateRig2D(refOrPath: string): void {
   if (!path) return;
   // An in-flight load is carrying the PRE-import bytes — refuse it, or it re-caches the stale def
   // on top of the fresh one. Precedent: fontLoader.invalidateFontFace. Bumped PER-KEY (not the
-  // module-wide `generation`, which is `clearRig2DCache`'s): this cache is driven by the editor's
+  // module-wide `invalidateAll()`, which is `clearRig2DCache`'s): this cache is driven by the editor's
   // file watcher, so invalidating one rig must not also refuse an in-flight load of a DIFFERENT
   // rig.
-  keyEpoch.set(path, epochOf(path) + 1);
+  liveness.invalidateKey(path);
   cache.delete(path);
   sourceCache.delete(path);
   failed.delete(path);
@@ -141,8 +139,7 @@ export function invalidateRig2D(refOrPath: string): void {
 
 /** Drop ALL cached rigs (scene swap / full resource disposal / test teardown). */
 export function clearRig2DCache(): void {
-  generation++;
-  keyEpoch.clear();
+  liveness.invalidateAll();
   cache.clear();
   sourceCache.clear();
   loading.clear();

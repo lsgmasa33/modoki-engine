@@ -32,6 +32,7 @@ import {
 import {
   UISettings, UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS, UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS,
 } from '../traits/UISettings';
+import { createTeardownToken } from '../core/liveness';
 
 // UIActionEvent/UIActionKind/UIActionBinding are the UIAction trait's own schema — defined in
 // traits/UIAction.ts and re-exported here (not the reverse) so every existing import of these
@@ -85,13 +86,13 @@ let lockHeld = false;
 let lockAcquiredAt = 0;
 let lockPendingCount = 0;
 let lockPendingNames: string[] = [];
-// Bumped by every acquireLock()/releaseLock() — a stale promise from an EARLIER lock (one that
-// force-released via the max-ms valve, or was reset by a world swap) must not decrement the
+// Invalidated by every acquireLock()/releaseLock() — a stale promise from an EARLIER lock (one
+// that force-released via the max-ms valve, or was reset by a world swap) must not decrement the
 // pending count of whichever lock is current when it finally settles. Without this, an old
 // promise settling after a NEW activation has acquired its own lock silently releases that new
 // lock early, while its own async handler is still in flight — the exact double-fire this
 // feature exists to prevent. See trackLockPromise and its regression test.
-let lockGen = 0;
+const lockLiveness = createTeardownToken();
 
 // Busy-window continuity (#530's valve) is now OBSERVED, not inferred: `pollUIBusyContinuity`
 // (registered as a per-frame system, `app/ecs/pipeline.ts`) polls the busy predicates every
@@ -178,7 +179,7 @@ function releaseLock(): void {
   lockHeld = false;
   lockPendingCount = 0;
   lockPendingNames = [];
-  lockGen += 1;
+  lockLiveness.invalidateAll();
 }
 
 // Takes no window: since #543 nothing caches the authored knobs, so the acquire has nothing to
@@ -188,7 +189,7 @@ function acquireLock(): void {
   lockAcquiredAt = rawNow();
   lockPendingCount = 0;
   lockPendingNames = [];
-  lockGen += 1;
+  lockLiveness.invalidateAll();
 }
 
 /** Read and clamp the authored lock window from `UISettings` — the SINGLE place either knob is
@@ -228,12 +229,12 @@ function trackLockPromise(result: unknown, actionName: string): void {
   lockPendingCount += 1;
   lockPendingNames.push(actionName);
   // Captured at registration: if this promise outlives ITS lock (force-released by the max-ms
-  // valve, or cleared by a world swap) and settles after a NEW lock has been acquired, the
-  // generation will have moved on and this decrement must be a no-op — it belongs to a lock
-  // that is already gone, not to whichever lock happens to be current.
-  const gen = lockGen;
+  // valve, or cleared by a world swap) and settles after a NEW lock has been acquired, liveness
+  // will have moved on and this decrement must be a no-op — it belongs to a lock that is already
+  // gone, not to whichever lock happens to be current.
+  const stillLive = lockLiveness.capture();
   const settle = () => {
-    if (gen !== lockGen) return;
+    if (!stillLive()) return;
     lockPendingCount = Math.max(0, lockPendingCount - 1);
     // Prune this action's name too — not just the count — so the max-ms valve's warning
     // (#1's primary diagnostic now) names only what's STILL pending. splice the first matching

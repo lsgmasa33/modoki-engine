@@ -11,6 +11,7 @@
  *  caller must NOT proceed to load the scene this launch — see its doc comment. */
 import { Capacitor, ExceptionCode } from '@capacitor/core';
 import { checkForUpdate, fetchRelease } from '@modoki/engine/runtime';
+import { createSupersessionToken } from '@modoki/engine/runtime/core/liveness';
 import type { OtaProgressEvent } from 'capacitor-modoki-ota';
 import projectConfig from 'virtual:modoki-project-config';
 
@@ -88,10 +89,13 @@ export function subscribeOtaGate(listener: GateListener): () => void {
  *  boot hook re-derives what to serve from state.json) moves things forward. */
 // #437: the App.tsx boot effect can re-run `checkAppOtaUpdate()` (a `[gameId]` re-run) before an
 // in-flight call returns, and that in-flight call is never cancelled — it just keeps writing
-// `setGate` from an epoch nobody wants anymore. Same idiom as `loaders/fontLoader.ts` /
-// `loaders/timelineCache.ts` / `app/editor/setup.ts`'s `deviceListGeneration`: bump a generation
-// per call, and refuse every gate write once a newer call has started.
-let otaCheckGeneration = 0;
+// `setGate` from an attempt nobody wants anymore. Start a new attempt per call, and refuse every
+// gate write once a newer call has started — the same shape as `app/editor/setup.ts`'s
+// `deviceListEpoch`. ⚠️ NOT the same as `loaders/fontLoader.ts` / `loaders/timelineCache.ts`,
+// which this comment used to claim: those are `createTeardownToken` — they bump when the cache is
+// CLEARED, not when a new attempt starts, so an outstanding load survives a newer one there and
+// loses here. The two read alike and answer different questions; see docs/async-lifetime.md.
+const otaCheckEpoch = createSupersessionToken();
 
 export async function checkAppOtaUpdate(): Promise<boolean> {
   // `ready-to-restart` is terminal for this app launch (see setGate's backstop and this
@@ -112,9 +116,9 @@ export async function checkAppOtaUpdate(): Promise<boolean> {
   if (!ota.enabled) return true;
   if (!Capacitor.isNativePlatform()) return true; // no OTA mechanism to hand this to on web
 
-  const myGeneration = ++otaCheckGeneration;
+  const stillLive = otaCheckEpoch.begin();
   const setGateIfCurrent = (state: OtaGateState | null): void => {
-    if (myGeneration !== otaCheckGeneration) return; // superseded — a newer check owns the gate now
+    if (!stillLive()) return; // superseded — a newer check owns the gate now
     setGate(state);
   };
 

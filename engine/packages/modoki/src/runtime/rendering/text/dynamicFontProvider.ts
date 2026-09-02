@@ -416,6 +416,11 @@ export class DynamicFontProvider implements FontProvider {
     // settling into stable tofu the way a single over-large batch always did.
     const protect = new Set(cps);
     for (let i = 0; i < cps.length; i += cap) {
+      // A dispose() between chunks (e.g. a scene swap tearing down this font mid-batch) must
+      // stop the batch here rather than keep paying generator passes for a provider nothing
+      // will ever read again — see the `disposed` re-check inside generateChunk for the write
+      // side of the same guard.
+      if (this.disposed) return;
       await this.generateChunk(cps.slice(i, i + cap), pin, protect);
     }
   }
@@ -431,6 +436,12 @@ export class DynamicFontProvider implements FontProvider {
       padding: SCRATCH_GAP,
       textureSize: [SCRATCH_SIZE, SCRATCH_SIZE],
     });
+    // `dispose()` can land while `generateMsdf` is in flight (this provider's font/atlas is
+    // being torn down — a scene swap, a hot-reload). `dispose()` already cleared glyphMap/
+    // kern/pages/ctxs; writing into them here would resurrect state into a disposed provider
+    // nothing owns any more (glyphMap.set/kern.set below, `this.ctxs[cell.page]`, `this.blit`
+    // touching a canvas array that dispose() just emptied). Bail before any of that.
+    if (this.disposed) return;
     // Seeded from a bake, EVERY batch is checked (the baseline is the bake). Un-seeded, the
     // first batch establishes the baseline and later ones are checked against it.
     if (this.baked) this.checkSameFont(result.metrics);

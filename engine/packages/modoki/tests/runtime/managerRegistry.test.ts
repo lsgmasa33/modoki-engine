@@ -242,6 +242,42 @@ describe('managerRegistry', () => {
     expect(getRegisteredManagers().filter((s) => s.startsWith('dup'))).toHaveLength(1);
   });
 
+  /** A deferred teardown must not tear down the activation that SUPERSEDED it (#573).
+   *
+   *  When the outgoing entry has an `initPromise` in flight, its teardown is deferred until that
+   *  promise settles. Manager defs are module-level singletons passed by IDENTITY, so on a
+   *  re-register `oldEntry.def === newEntry.def` — meaning the deferred `dispose(old)` lands after
+   *  `init(new)` has already run, on the same instance, destroying what the successor just built.
+   *
+   *  Production cadence: `registerManager` is called with a module-level def during boot and again
+   *  on a game swap, and any manager with an async `init()` (entity spawning, a service handshake)
+   *  leaves exactly this window open. `disposeActiveSceneManagers` already guarded its own await
+   *  with `entry.activationId`; this path was the one missing it.
+   */
+  it('a deferred teardown superseded by a re-register does not dispose its successor', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => { release = r; });
+    const dispose = vi.fn();
+    // ONE def object, registered twice — the identity case the deferral docblock describes.
+    const def: ManagerDef = { name: 'deferred', scope: 'app', init: () => gate, dispose };
+
+    registerManager(def); // activation 1 — init parked on `gate`
+    registerManager(def); // activation 2 — activation 1's teardown is deferred until `gate` settles
+    expect(dispose).not.toHaveBeenCalled(); // nothing has settled yet
+
+    release();
+    // A macrotask turn, NOT a couple of `await Promise.resolve()` — `activate()` wraps the init in
+    // `Promise.resolve(r).then(…).finally(…)` and this teardown adds another `.then`, so the chain
+    // is several microtask hops deep. Two ticks landed BEFORE the continuation ran, which made an
+    // earlier version of this test pass with the fix removed: it was asserting on a teardown that
+    // had not happened yet, not on one that was correctly skipped.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Without the def-identity check, activation 1's continuation disposes the live instance here.
+    expect(dispose).not.toHaveBeenCalled();
+    expect(getRegisteredManagers().filter((n) => n.startsWith('deferred'))).toHaveLength(1);
+  });
+
   it('registerManagers registers a list', () => {
     const defs: ManagerDef[] = [
       { name: 'a', scope: 'app' },

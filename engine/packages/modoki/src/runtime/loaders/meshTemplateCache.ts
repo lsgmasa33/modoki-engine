@@ -26,6 +26,7 @@ import { loadTexture3D, releaseTexture3D, isSharedTexture, isRetiredTexture, res
 import { clearParticleCache } from './particleCache';
 import { fireDirtyListeners } from '../core/ecs/entityUtils';
 import { emitAssetInvalidated, onAssetInvalidated } from '../core/assetInvalidation';
+import { createTeardownToken } from '../core/liveness';
 import { clearAnimationClipCache } from './animationClipCache';
 import { clearTimelineCache } from './timelineCache';
 import { clearControlSpawns } from '../timeline/controlSpawnRegistry';
@@ -333,8 +334,12 @@ export function decomposeLocalTransform(
 }
 
 
-/** Generation counter — incremented on full disposal to invalidate in-flight async loads. */
-let cacheGeneration = 0;
+/** Teardown token (`runtime/core/liveness.ts`) — invalidated wholesale on full disposal, to
+ *  invalidate in-flight async loads. A SEPARATE, second token from the owner-set
+ *  (`modelOwners`/`meshAssetOwners`/`materialOwners`/`prefabOwners`/`envOwners`) answering a
+ *  different question — see `disposeAllCachedResources`'s and `releaseAllForScene`'s comments for
+ *  why the two must not be merged. */
+const cacheToken = createTeardownToken();
 
 /** Dispose a Three.js material and its textures (material.dispose() alone
  *  doesn't free textures). Walks both:
@@ -509,12 +514,12 @@ export function loadModelTemplates(
   const key = applyPostprocessorHooks ? `${path}:${postprocessorId}` : path;
   if (loading.has(key)) return loading.get(key)!;
 
-  // Snapshot the cache generation so a GLB that resolves AFTER a
-  // disposeAllCachedResources (which clears cache/loading and bumps the
-  // generation) doesn't `cache.set` owner-less geometry into the freshly-cleared
+  // Snapshot cache liveness so a GLB that resolves AFTER a
+  // disposeAllCachedResources (which clears cache/loading and invalidates the
+  // token) doesn't `cache.set` owner-less geometry into the freshly-cleared
   // map — it would survive until the NEXT teardown as a stranded GPU leak. Mirrors
   // the material + HDR + rigged-cache guards. (F11)
-  const gen = cacheGeneration;
+  const stillLive = cacheToken.capture();
 
   const promise = new Promise<void>((resolve, reject) => {
     const onGltf = async (gltf: { scene: THREE.Group }) => {
@@ -522,13 +527,13 @@ export function loadModelTemplates(
         const model = gltf.scene;
 
         // Disposed (disposeAllCachedResources — full teardown, NOT a scene swap;
-        // releaseAllForScene does not bump cacheGeneration) while this GLB was
+        // releaseAllForScene does not invalidate cacheToken) while this GLB was
         // loading → promote nothing, dispose everything we just parsed, and
         // bail. Without this the templates below would land in the
         // now-cleared cache with no owner. (F11) The scene-swap case (an
         // aborted load whose owner was released mid-await) is handled instead
         // by acquireModel's post-await owner guard (#520).
-        if (gen !== cacheGeneration) {
+        if (!stillLive()) {
           const droppedTex = new Set<string>();
           model.traverse((child) => {
             const m = child as THREE.Mesh;
@@ -1144,7 +1149,7 @@ function fetchMaterial(matPath: string): Promise<void> {
   if (materialCache.has(matPath)) return Promise.resolve();
   if (materialLoadPromises.has(matPath)) return materialLoadPromises.get(matPath)!;
 
-  const gen = cacheGeneration; // capture to detect disposal during async load
+  const stillLive = cacheToken.capture(); // capture to detect disposal during async load
 
   const promise = (async () => {
     try {
@@ -1260,7 +1265,7 @@ function fetchMaterial(matPath: string): Promise<void> {
       }
 
       // If cache was disposed while we were loading, discard this material
-      if (gen !== cacheGeneration) { disposeMaterial(mat); return; }
+      if (!stillLive()) { disposeMaterial(mat); return; }
       // An invalidate mid-flight clears `materialLoadPromises`, so a SECOND fetch for this path
       // can already have landed here — `fetchMaterial` dedupes on that map alone. Retire the
       // incumbent instead of letting `set` silently orphan it: orphaned, it is unreachable to
@@ -1317,7 +1322,7 @@ function fetchMaterial(matPath: string): Promise<void> {
  *  down this file is exactly the caller that would otherwise free textures out from under a live
  *  clone. */
 export function disposeAllCachedResources() {
-  cacheGeneration++; // invalidate in-flight async material fetches
+  cacheToken.invalidateAll(); // invalidate in-flight async material fetches
 
   const disposedGeo = new Set<string>();
   const disposedMat = new Set<string>();
@@ -1366,7 +1371,7 @@ export function disposeAllCachedResources() {
   retiredMaterialPaths.clear();
 
   // Dispose any cached HDR environments and clear env owners — they're tied
-  // to the same cacheGeneration / scene lifetime as everything else here.
+  // to the same cacheToken / scene lifetime as everything else here.
   for (const [, tex] of envCache) tex.dispose();
   envCache.clear();
   envLoadPromises.clear();
@@ -1789,6 +1794,36 @@ export async function acquireEnvironment(sceneId: SceneId, hdrRef: string): Prom
   if (!hdrPath) return;
   addOwner(envOwners, hdrPath, sceneId);
   await fetchEnvironment(hdrPath);
+
+  // Released mid-load → discard the result, mirroring the post-await guards in
+  // acquireMesh/acquireModel/acquireMaterial/acquirePrefab above. releaseAllForScene is
+  // synchronous and can land inside the await (SceneManager aborts an in-flight load and
+  // releases its sceneId; that abort doesn't reach fetchEnvironment, which isn't abortable)
+  // — and every LATER releaseAllForScene for this sceneId is a no-op, because it only visits
+  // paths whose owner set still contains the id, which is exactly what this one just drained.
+  // invalidateEnvironment retires rather than deletes outright (#315) — a live render surface
+  // may still bind the just-cached texture for a frame or two after the swap. Only if nobody
+  // else owns it, so a second, still-live scene sharing the load keeps its entry.
+  //
+  // ⚠️ Currently SUBSUMED by fetchEnvironment's own inner check (`!envOwners.has(hdrPath)`,
+  // ~:1904) for every path this function can actually reach: `releaseAllForScene` itself calls
+  // `releaseEnvironmentByPath` (not just a bookkeeping removal), so a mid-load release already
+  // retires/evicts the cache entry directly — this guard's `return` is never observably
+  // different from falling through. Kept anyway, mirroring `acquireModel`'s own documented
+  // outer/inner redundancy (:1521-1529 above): it states the right invariant, matches the other
+  // four acquire* functions' shape, and stops being redundant the moment anything is added
+  // after it (e.g. a future transitive-dependency acquire on this path). Not provable red/green
+  // by a unit test today — see acquireEnvironmentMidLoadGuard.test.ts for why.
+  //
+  // `envCache.has(hdrPath)` gates the invalidate call: `invalidateEnvironment` announces via
+  // `emitAssetInvalidated`, which fires the dirty-listener wake unconditionally — calling it when
+  // the inner check already disposed-and-never-cached the arriving texture would wake every
+  // listener for a state change that never happened (resourceRefcount.test.ts's "no dirty signal
+  // when nothing was applied" pins exactly this for the inner-guard-only path).
+  if (!envOwners.get(hdrPath)?.has(sceneId)) {
+    if (!envOwners.get(hdrPath)?.size && envCache.has(hdrPath)) invalidateEnvironment(hdrPath);
+    return;
+  }
 }
 
 /** Release an HDR environment for a scene. Disposes the texture on last release. */
@@ -1863,9 +1898,9 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
   if (envCache.has(hdrPath)) return Promise.resolve();
   if (envLoadPromises.has(hdrPath)) return envLoadPromises.get(hdrPath)!;
 
-  // Snapshot the generation BEFORE the async load so a release-mid-load (or a
+  // Snapshot liveness BEFORE the async load so a release-mid-load (or a
   // full disposeAllCachedResources) is observable when the texture arrives.
-  const gen = cacheGeneration;
+  const stillLive = cacheToken.capture();
 
   const promise = (async () => {
     // Load the converted variant (`~env.hdr` downscaled Radiance, or `~ultrahdr.jpg`
@@ -1886,7 +1921,7 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
           // If the cache was disposed or the owner released this HDR mid-load,
           // dispose the just-loaded texture instead of leaving it owner-less in
           // the cache forever.
-          if (gen !== cacheGeneration || !envOwners.has(hdrPath)) {
+          if (!stillLive() || !envOwners.has(hdrPath)) {
             texture.dispose();
             resolve();
             return;

@@ -10,6 +10,7 @@
     "./runtime/rendering/tierBoot": "./src/runtime/rendering/tierBoot.ts",
     "./runtime/rendering/Game": "./src/runtime/rendering/Game.tsx",
     "./runtime/debug": "./src/runtime/debug/index.ts",
+    "./runtime/core/liveness": "./src/runtime/core/liveness.ts",
     "./editor": "./src/editor/index.ts",
     "./editor/rendering": "./src/editor/rendering/index.ts",
     "./three": "./src/three/index.ts",

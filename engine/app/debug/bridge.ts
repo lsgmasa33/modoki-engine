@@ -15,6 +15,7 @@ import { describeElement } from './domResolve';
 import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
 import { setJournalEnabled } from '@modoki/engine/runtime';
+import { createSupersessionToken, createTeardownToken } from '@modoki/engine/runtime/core/liveness';
 import {
   safeStringify,
   handleEval as evalCode,
@@ -82,6 +83,13 @@ const _err = (...args: unknown[]) => console.error(...args);
 
 // Screen info from the last native screenshot — used for iOS tap coordinate mapping.
 let lastScreenInfo: LastScreenInfo | null = null;
+// A retried `screenshot` request (the MCP client times out and re-sends while the native
+// `GameDebug.captureScreen()` for the FIRST request is still in flight) can resolve out of order —
+// the newer request's response can land before the older one's. Without this, the older, in-flight
+// call's `await` resumes last and overwrites `lastScreenInfo` with stale dimensions (e.g. from
+// before a device rotation the newer capture already reflects), corrupting tap-coordinate mapping
+// until the next screenshot. A newer request always wins.
+const screenshotEpoch = createSupersessionToken();
 
 // Console capture ring buffer.
 const consoleRing = createConsoleRing(MAX_CONSOLE_LOGS);
@@ -748,16 +756,16 @@ let heldPointer: { button: number; x: number; y: number; target: Element; how: H
  *  aim landed on a DOM UI element and the press went there instead (#299). */
 type HeldHow = CanvasPick['how'] | 'dom';
 
-/** Bumped by every `releaseHeldPointer` call, i.e. every point at which a held press was supposed
- *  to end. `handlePointer` samples it on entry and re-checks after its awaits, because a `down`
- *  whose lease died WHILE it was resolving its aim would otherwise set `heldPointer` AFTER the
- *  disconnect handler's release had already run and found nothing to release — leaving a press
+/** Invalidated by every `releaseHeldPointer` call, i.e. every point at which a held press was
+ *  supposed to end. `handlePointer` captures it on entry and re-checks after its awaits, because a
+ *  `down` whose lease died WHILE it was resolving its aim would otherwise set `heldPointer` AFTER
+ *  the disconnect handler's release had already run and found nothing to release — leaving a press
  *  nothing can ever lift, which is exactly the state these defences exist to make unreachable.
  *  The window is one async hop (`resolveSelectorPoint`'s dynamic import), and the consequence is
- *  the unrecoverable one, so it is worth a counter. Counting releases rather than disconnects
+ *  the unrecoverable one, so it is worth a token. Invalidating on releases rather than disconnects
  *  keeps the whole mechanism reachable from `releaseHeldPointer` alone — nothing needs a
  *  test-only seam to exercise it. */
-let leaseEpoch = 0;
+const leaseLiveness = createTeardownToken();
 
 /** Release a press left held, by dispatching its matching `pointerup` at the held point (#299).
  *
@@ -770,7 +778,7 @@ let leaseEpoch = 0;
  *
  *  Returns a description of what it released, or null if nothing was held. */
 export function releaseHeldPointer(): string | null {
-  leaseEpoch++; // counted even with nothing held — that is the case `handlePointer` must notice
+  leaseLiveness.invalidateAll(); // invalidated even with nothing held — `handlePointer` must notice that case too
   return dropHeldPress('lease');
 }
 
@@ -796,18 +804,18 @@ function heldLossNote(): string {
     + `released for you — ${why}. Send a fresh down.`;
 }
 
-/** The DISPATCH half of a release, without the `leaseEpoch` bump.
+/** The DISPATCH half of a release, without invalidating `leaseLiveness`.
  *
- *  The split keeps `leaseEpoch` meaning exactly one thing: "a release happened because the agent
- *  can no longer send the `up`". `handlePointer` re-checks it after its awaits to catch a `down`
- *  whose lease died mid-resolve, and self-releases the press it just latched. A SUPERSEDE is not
- *  that — the lease is alive and the agent is actively driving — so routing it through the
- *  exported `releaseHeldPointer` (which bumps the counter even with nothing held, deliberately)
- *  would overload the signal.
+ *  The split keeps `leaseLiveness` meaning exactly one thing: "a release happened because the
+ *  agent can no longer send the `up`". `handlePointer` re-checks it after its awaits to catch a
+ *  `down` whose lease died mid-resolve, and self-releases the press it just latched. A SUPERSEDE
+ *  is not that — the lease is alive and the agent is actively driving — so routing it through the
+ *  exported `releaseHeldPointer` (which invalidates even with nothing held, deliberately) would
+ *  overload the signal.
  *
  *  ⚠️ The concrete consequence is NOT demonstrated, and this comment is deliberately weaker than
- *  its first draft. A `down` that entered before such a bump and latched after it would read the
- *  changed epoch and cancel itself — a stranded-gesture shape invented by the fix for the old one.
+ *  its first draft. A `down` that entered before such an invalidation and latched after it would
+ *  read it as stale and cancel itself — a stranded-gesture shape invented by the fix for the old one.
  *  The transport makes that reachable in principle: the `message` listener is async with no queue,
  *  so two requests genuinely interleave. But a single agent drives the lease sequentially, and no
  *  test here pins it — every attempt raced the wrong way, because `handleTap`'s own 50 ms hold
@@ -860,7 +868,7 @@ function mkButtonedPointerEvent(type: string, x: number, y: number, button: numb
 // backend and asserts on the MCP tool's relayed payload cannot exercise them; jsdom lets this
 // module import cleanly (measured), so a direct call is the honest way to cover them.
 export async function handlePointer(params: Record<string, unknown>): Promise<string> {
-  const epochOnEntry = leaseEpoch;
+  const stillLive = leaseLiveness.capture();
   const action = params.action as string;
   if (action !== 'down' && action !== 'move' && action !== 'up') {
     return `Error: pointer action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`;
@@ -935,7 +943,7 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
   // The lease died while this call was resolving its aim, so the disconnect handler's release ran
   // before there was anything to release. Release it here instead of returning a held press nobody
   // can ever lift.
-  if (heldPointer && leaseEpoch !== epochOnEntry) {
+  if (heldPointer && !stillLive()) {
     releaseHeldPointer();
     _log(`[debug-bridge] POINTER ${action} → ${where}, then released: the lease dropped mid-call`);
     return withMechanismSuffix(`ok (${action} ${where}, button ${buttonName}, held:false) @ ${aim.label} — the lease dropped during this call, so the press was released rather than left held`);
@@ -1259,13 +1267,19 @@ async function initNativeBridge() {
       // iOS screenshot: native capture via drawHierarchy (captures WebGL on iOS)
       // Android screenshots are handled by adb screencap in the MCP server
       if (method === 'screenshot') {
+        const stillLatest = screenshotEpoch.begin();
         const result = await GameDebug.captureScreen();
-        lastScreenInfo = {
-          imageWidth: result.imageWidth,
-          imageHeight: result.imageHeight,
-          screenWidth: result.screenWidth,
-          screenHeight: result.screenHeight,
-        };
+        // Superseded by a retried/newer screenshot request that already resolved — do not let this
+        // stale capture overwrite the newer one's `lastScreenInfo`. This request's OWN response
+        // still goes out below regardless; only the shared coordinate-mapping state is guarded.
+        if (stillLatest()) {
+          lastScreenInfo = {
+            imageWidth: result.imageWidth,
+            imageHeight: result.imageHeight,
+            screenWidth: result.screenWidth,
+            screenHeight: result.screenHeight,
+          };
+        }
         await GameDebug.sendResponse({
           id,
           result: safeStringify({
@@ -1309,7 +1323,7 @@ async function initNativeBridge() {
     } else {
       _log('[debug-bridge] MCP client disconnected');
       // Never leave a press the agent can no longer release (#299) — see `releaseHeldPointer`.
-      const released = releaseHeldPointer(); // bumps `leaseEpoch` — see there
+      const released = releaseHeldPointer(); // invalidates `leaseLiveness` — see there
       if (released) _log(`[debug-bridge] released a pointer left held by the dropped lease: ${released}`);
     }
   });

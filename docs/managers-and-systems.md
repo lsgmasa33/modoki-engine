@@ -237,6 +237,11 @@ Two consequences worth stating, so neither is re-filed as a defect:
   under #534 (3D video textures across the four `Scene3D`/`SceneView` teardown sites, and
   `ModelPreview`'s source models). Scene-scoped resources are covered by
   [scene-loading.md](scene-loading.md).
+- **This ruling decides which liveness token a site needs.** Because app scope has no teardown, the
+  `disposed`-boolean token is rarer here than it looks and a *supersession* epoch is usually the
+  right answer; scene scope is where teardown is real, and both apply. The convention —
+  capture before the first `await`, re-check before every write after one — and the five sanctioned
+  tokens are in [async-lifetime.md](async-lifetime.md).
 
 **When this would change:** only a **soft restart** — tearing down and re-registering in place
 instead of reloading, e.g. to pick up new remote config without a visible reload. That is a real

@@ -2,6 +2,7 @@
  *  Replaces multiple independent rAF loops to guarantee deterministic execution order:
  *  ECS pipeline (0) → Three.js render (10) → PixiJS render (20). */
 
+import { createSupersessionToken, type LivenessCheck } from '../core/liveness';
 import { rawNow } from '../core/clock';
 import { recordFrame, setProfilerFrameCap } from '../core/frameProfiler';
 import { beginProfilerFrame, endProfilerFrame, profileScope } from '../core/profilerMarkers';
@@ -56,10 +57,16 @@ let lastFrameTime = 0;
  *  a positive refCount (callers believe frames are pumping) with a dead chain renders
  *  the editor alive-but-frozen, with no exception and no log. */
 let loopArmed = false;
-/** Generation token for the armed chain. A re-arm bumps it so any older `frame()`
- *  continuation that was actually still pending retires itself instead of running a
- *  second, duplicate loop (which would double-step every system). */
-let loopGen = 0;
+/** Liveness token for the armed chain. A re-arm supersedes it, so any older `frame()`
+ *  continuation that was actually still pending retires itself instead of running a second,
+ *  duplicate loop (which would double-step every system). `disarmLoop` supersedes it too — with
+ *  nothing — which retires the in-flight continuation as well as cancelling the pending id.
+ *
+ *  ⚠️ The check is THREADED as a value through `makeFrame`/`runFrame` rather than re-read from
+ *  module scope, per docs/async-lifetime.md: carrying a raw number across a call boundary and
+ *  re-comparing it in the callee is the one liveness shape no per-file scan can see, which is
+ *  exactly what this was before #573 and why the architecture guard could not see it. */
+const loopLiveness = createSupersessionToken();
 /** Timestamp of the most recent EXECUTED frame; 0 if none has run since the chain was armed.
  *  Deliberately NOT touched by `armLoop()`: the watchdog re-arms a stalled chain, and if a
  *  re-arm reset this clock the health report would flicker back to "running" every couple of
@@ -117,16 +124,18 @@ function rebuildSorted() {
   dirty = false;
 }
 
-/** Build the rAF callback for generation `gen`. Only the CURRENT generation keeps
- *  rescheduling itself, so re-arming a chain that turns out to still be alive costs one
- *  wasted frame rather than permanently double-stepping every registered system. */
-function makeFrame(gen: number) {
-  const frame = (now: DOMHighResTimeStamp) => { runFrame(now, gen, frame); };
+/** Build the rAF callback bound to ONE chain, identified by the `stillCurrent` check it closes
+ *  over. Only the current chain keeps rescheduling itself, so re-arming one that turns out to
+ *  still be alive costs one wasted frame rather than permanently double-stepping every registered
+ *  system. The check travels as a value rather than being re-read from module scope — see
+ *  `loopLiveness` and docs/async-lifetime.md. */
+function makeFrame(stillCurrent: LivenessCheck) {
+  const frame = (now: DOMHighResTimeStamp) => { runFrame(now, stillCurrent, frame); };
   return frame;
 }
 
-function runFrame(now: DOMHighResTimeStamp, gen: number, self: FrameRequestCallback) {
-  if (gen !== loopGen) return; // superseded chain — retire silently
+function runFrame(now: DOMHighResTimeStamp, stillCurrent: LivenessCheck, self: FrameRequestCallback) {
+  if (!stillCurrent()) return; // superseded chain — retire silently
   rafId = requestAnimationFrame(self);
   // Read through `rawNow()` rather than storing the rAF timestamp, so this shares ONE clock
   // with `armedAt` and the watchdog. They agree in the browser anyway, but under an injected
@@ -219,16 +228,16 @@ function runFrame(now: DOMHighResTimeStamp, gen: number, self: FrameRequestCallb
 /** Arm a fresh rAF chain, superseding any previous one. Idempotent in effect: the old
  *  generation retires itself on its next tick. */
 function armLoop() {
-  loopGen++;
+  const stillCurrent = loopLiveness.begin();
   loopArmed = true;
   // Grace period for the new chain; `lastFrameAt` is left alone on purpose (see its docs).
   armedAt = rawNow();
-  rafId = requestAnimationFrame(makeFrame(loopGen));
+  rafId = requestAnimationFrame(makeFrame(stillCurrent));
   startWatchdog();
 }
 
 function disarmLoop() {
-  loopGen++; // invalidate the in-flight continuation as well as cancelling the pending id
+  loopLiveness.begin(); // supersede the in-flight continuation as well as cancelling the pending id
   loopArmed = false;
   cancelAnimationFrame(rafId);
   stopWatchdog();

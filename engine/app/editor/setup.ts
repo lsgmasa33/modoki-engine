@@ -14,6 +14,7 @@ import {
 } from '@modoki/engine/editor';
 import { GameView } from '@modoki/engine/editor/rendering';
 import { PlayerPrefs, selectDefaultBackend, setGameConfig, setPhysicsLayers } from '@modoki/engine/runtime';
+import { createSupersessionToken } from '@modoki/engine/runtime/core/liveness';
 import type { GameConfig, EditorPanelDef } from '@modoki/engine/runtime';
 import projectConfig from 'virtual:modoki-project-config';
 import {
@@ -121,12 +122,12 @@ async function loadDeviceTarget(): Promise<void> {
  *  this the slower-but-older response lands last and overwrites the newer listing — the menu then
  *  shows devices that were correct two seconds ago. Only `deviceList` needs it: `deviceTarget` is
  *  re-read from disk, so a stale one cannot disagree with what the build will use. */
-let deviceListGeneration = 0;
+const deviceListEpoch = createSupersessionToken();
 
 async function refreshDeviceTargets(): Promise<void> {
-  const generation = ++deviceListGeneration;
+  const stillLive = deviceListEpoch.begin();
   const [list] = await Promise.all([fetchDeviceList(), loadDeviceTarget()]);
-  if (generation !== deviceListGeneration) return; // a newer refresh already answered
+  if (!stillLive()) return; // a newer refresh already answered
   deviceList = list;
   republishBuildMenu?.();
 }

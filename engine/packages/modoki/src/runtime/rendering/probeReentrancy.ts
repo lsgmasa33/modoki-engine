@@ -25,6 +25,8 @@
  *  already-resolved tier; this guards the window BEFORE any tier exists, which is precisely when
  *  the recursion happens. */
 
+import { createTeardownToken } from '../core/liveness';
+
 /** A COUNT, not a boolean.
  *
  *  ⚠️ A bare flag is wrong the moment two probes can overlap: the first to finish clears it in its
@@ -34,9 +36,10 @@
  *  its caller staying correct: that dependency is what made this an iPhone-killer the first time. */
 let probing = 0;
 
+
 /** Scopes `probing` to one probe *session*, so that a probe left parked (still awaiting) across
  *  {@link resetProbeInFlightForTest} cannot decrement a count that belongs to a probe started
- *  AFTER the reset. Bumped by the reset only.
+ *  AFTER the reset. Invalidated by the reset only.
  *
  *  ⚠️ `Math.max(0, probing - 1)` was considered and rejected: it stops the counter going negative,
  *  but a pre-reset probe's stale `finally` would still fire and decrement the POST-reset session's
@@ -45,8 +48,12 @@ let probing = 0;
  *  decrement a no-op instead of a wrong one.
  *
  *  With this in place `probing` cannot go negative by construction: every decrement is paired with
- *  an increment from its OWN generation, and a decrement from any other generation is dropped. */
-let generation = 0;
+ *  a liveness check from its OWN session, and a decrement from any other session is dropped.
+ *
+ *  ⚠️ `resetProbeInFlightForTest()` is this token's ONLY invalidator — nothing in production bumps
+ *  it, so the guard cannot fire outside a test. Correct as written, but it means this is NOT a
+ *  precedent for a production race guard. See docs/async-lifetime.md. */
+const sessionLiveness = createTeardownToken();
 
 /** Is a boot probe currently running? While true, tier resolution must NOT start another one. */
 export function isProbeInFlight(): boolean {
@@ -59,12 +66,12 @@ export function isProbeInFlight(): boolean {
  *  must never block rendering), and a flag left stuck `true` by a throw would permanently disable
  *  probing for the process — a silent, once-per-install failure that no test would notice. */
 export async function withProbeInFlight<T>(fn: () => Promise<T>): Promise<T> {
-  const gen = generation;
+  const stillLive = sessionLiveness.capture();
   probing += 1;
   try {
     return await fn();
   } finally {
-    if (gen === generation) probing -= 1;
+    if (stillLive()) probing -= 1;
   }
 }
 
@@ -91,17 +98,33 @@ let sharedResolution: Promise<void> | null = null;
  *  which is worse than the recursion it replaced. */
 export function shareTierResolution(run: () => Promise<void>): Promise<void> {
   if (sharedResolution) return sharedResolution;
+  // Identity token: capture the promise THIS call is about to install, so the `finally` below can
+  // tell "I am still the shared run" from "something replaced me while I was in flight" (a
+  // `resetProbeInFlightForTest()` nulling the slot, followed by a fresh `shareTierResolution` call,
+  // both landing before this run settles). Nulling unconditionally would clear the NEWER promise
+  // out of the slot on the OLDER run's finally, forcing yet another surface to re-run the probe.
+  //
+  // ⚠️ Same caveat as `sessionLiveness` above: the only thing that can currently replace
+  // `sharedResolution` while an older run is still in flight is `resetProbeInFlightForTest()` —
+  // the early return one line up means two production calls can never both reach past it before
+  // either has installed its promise, and nothing else in production nulls this slot. Correct as
+  // written, and kept for the same reason `acquireModel`'s own outer/inner-redundant guard is kept
+  // (`meshTemplateCache.ts` ~:1521) — it states the right invariant and stops being unreachable the
+  // moment a second caller or a mid-flight reset is added — but this is not a proven production
+  // race today. See docs/async-lifetime.md.
+  //
   // `finally`, for the same reason as `withProbeInFlight`: a rejected resolution must not leave a
   // permanently-settled promise in the slot, or every later surface would await a failure forever.
-  sharedResolution = run().finally(() => { sharedResolution = null; });
-  return sharedResolution;
+  const ownPromise: Promise<void> = run().finally(() => { if (sharedResolution === ownPromise) sharedResolution = null; });
+  sharedResolution = ownPromise;
+  return ownPromise;
 }
 
 /** Test seam only. */
 export function resetProbeInFlightForTest(): void {
   probing = 0;
-  // New session: any probe still parked from before this call now decrements a generation nobody
+  // New session: any probe still parked from before this call now decrements a session nobody
   // is counting, instead of this one's.
-  generation += 1;
+  sessionLiveness.invalidateAll();
   sharedResolution = null;
 }

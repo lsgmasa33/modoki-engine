@@ -218,10 +218,13 @@ caller — clearing it would leave a dead-end shell with no gate and no content,
 because `checkAppOtaUpdate()` can be re-entered: `App.tsx`'s `[gameId]` boot effect can call it
 again (a game swap) while an earlier call is still awaiting `checkForUpdate`, and the earlier
 call is never cancelled. Two guards close that race:
-- **A per-call generation counter** (`otaCheckGeneration`, bumped once per `checkAppOtaUpdate()`
-  call) makes every gate write from a superseded call a no-op — the same epoch idiom as
-  `loaders/fontLoader.ts`, `loaders/timelineCache.ts`, and `app/editor/setup.ts`'s
-  `deviceListGeneration`.
+- **A per-call supersession token** (`otaCheckEpoch`, `createSupersessionToken` from
+  `runtime/core/liveness.ts`, `begin()` called once per `checkAppOtaUpdate()` call) makes every gate
+  write from a superseded call a no-op — the same shape as `app/editor/setup.ts`'s
+  `deviceListEpoch`. ⚠️ Not the same as `loaders/fontLoader.ts` / `loaders/timelineCache.ts`, which
+  this once claimed: those are `createTeardownToken` — they bump when the cache is CLEARED, not when
+  a new attempt starts, so an outstanding load survives a newer one there and loses here. The two
+  read alike and answer different questions; see [async-lifetime.md](./async-lifetime.md).
 - **`checkAppOtaUpdate()` short-circuits to `false` on entry once the gate is already
   `'ready-to-restart'`** — without it, a re-entrant call would find nothing left to stage,
   resolve `true`, and let `App.tsx` load a scene and run the whole game underneath a gate the

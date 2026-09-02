@@ -30,6 +30,7 @@
  *  no wall clock, per the repo's determinism rules. */
 
 import { buildSceneSchema } from '@modoki/engine/runtime';
+import { createSupersessionToken } from '@modoki/engine/runtime/core/liveness';
 
 type Schema = ReturnType<typeof buildSceneSchema>;
 
@@ -97,12 +98,12 @@ export function makeSchemaPusher(
   let tries = 0;
   let budget = maxTicks;
   let lastSentSignature: string | undefined;
-  /** Bumped by every `start()`. A tick chain captures the value it was armed with and
-   *  stops when it no longer matches, so a re-arm REPLACES the running chain instead of
-   *  racing a second one alongside it. Without this, `vite:afterUpdate` firing while a
-   *  chain is still polling leaves two chains running, and they accumulate with each
-   *  update. */
-  let generation = 0;
+  /** Begun by every `start()`. A tick chain is threaded the liveness check it was armed
+   *  with, and stops once that check goes false, so a re-arm REPLACES the running chain
+   *  instead of racing a second one alongside it. Without this, `vite:afterUpdate` firing
+   *  while a chain is still polling leaves two chains running, and they accumulate with
+   *  each update. */
+  const pushEpoch = createSupersessionToken();
 
   const pushOnce = (): boolean => {
     try {
@@ -118,8 +119,8 @@ export function makeSchemaPusher(
     }
   };
 
-  const runTick = (mine: number) => {
-    if (mine !== generation) return; // superseded by a newer start()
+  const runTick = (stillLive: () => boolean) => {
+    if (!stillLive()) return; // superseded by a newer start()
     pushOnce();
     if (tries >= budget) {
       // The never-published edge: nothing has EVER been sent and the normal budget just ran
@@ -130,7 +131,7 @@ export function makeSchemaPusher(
       else return;
     }
     tries += 1;
-    scheduleTimer(() => runTick(mine), intervalMs);
+    scheduleTimer(() => runTick(stillLive), intervalMs);
   };
 
   return {
@@ -138,8 +139,7 @@ export function makeSchemaPusher(
       if (startOptions?.force) lastSentSignature = undefined;
       tries = 0;
       budget = maxTicks;
-      generation += 1;
-      runTick(generation);
+      runTick(pushEpoch.begin());
     },
     pushOnce,
   };

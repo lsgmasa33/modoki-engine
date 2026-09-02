@@ -204,3 +204,48 @@ describe('frameDriver FPS capping', () => {
     stopFrameDriver();
   });
 });
+
+/** A SUPERSEDED rAF chain retires itself instead of running a second, duplicate loop (#573).
+ *
+ *  This is the only behaviour `runFrame`'s liveness check exists for, and nothing covered it: the
+ *  existing cases drive only the CURRENT chain's callback, so deleting the check outright left
+ *  them green. A duplicate live chain double-steps every registered system — every physics tick,
+ *  every animation advance, twice per frame — which is why the check is there.
+ *
+ *  Production cadence: `armLoop` runs again while a chain is already armed. The frame-driver
+ *  watchdog does exactly that when it decides a chain has stalled, and a re-arm racing an
+ *  in-flight callback is precisely the case it cannot avoid.
+ */
+describe('frameDriver — a superseded chain', () => {
+  it('retires an OLD chain\'s callback instead of double-stepping', async () => {
+    const armed: Array<(t: number) => void> = [];
+    vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation((cb) => {
+      armed.push(cb as (t: number) => void);
+      return armed.length;
+    });
+    vi.spyOn(globalThis, 'cancelAnimationFrame').mockImplementation(() => {});
+
+    const { registerFrameCallback, startFrameDriver, stopFrameDriver, setTargetFPS } = await getDriver();
+    setTargetFPS(0); // uncapped — so a fired frame always runs the callback
+
+    let ticks = 0;
+    registerFrameCallback('test', () => ticks++, 0);
+
+    startFrameDriver();
+    const oldChain = armed[0];              // chain 1's callback
+    expect(oldChain).toBeDefined();
+
+    // Re-arm: stop then start is the ordinary route to a second chain.
+    stopFrameDriver();
+    startFrameDriver();
+    const armedAfterRearm = armed.length;
+
+    // The OLD chain's callback finally fires — it was already queued when the re-arm happened.
+    oldChain(1000);
+
+    expect(ticks, 'a retired chain must not step the systems').toBe(0);
+    expect(armed.length, 'and must not reschedule itself').toBe(armedAfterRearm);
+
+    stopFrameDriver();
+  });
+});

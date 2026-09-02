@@ -7,6 +7,8 @@
  *  chunk loads. No wall-clock (determinism guard) — entries carry a monotonic seq,
  *  not a timestamp. */
 
+import { createTeardownToken } from '../core/liveness';
+
 export type ConsoleLevel = 'log' | 'info' | 'warn' | 'error';
 
 export interface ConsoleEntry {
@@ -46,15 +48,20 @@ let originalError: ((...args: unknown[]) => void) | null = null;
 // render, and unlike rAF it exists headless and unlike a timer it is not swallowed by fake
 // timers in tests.
 let notifyScheduled = false;
-/** Bumped by the test reset, so a flush queued before it cannot fire against the new state. */
-let notifyGeneration = 0;
+/** Invalidated by the test reset, so a flush queued before it cannot fire against the new state.
+ *
+ *  ⚠️ That reset is its ONLY invalidator — nothing in production bumps this token, so this guard
+ *  cannot fire outside a test. That is correct here (the drain has no production teardown to race)
+ *  but it means this is NOT a precedent for a production race guard: cite
+ *  `runtime/scene/SceneManager.ts` or a loader cache for that. See docs/async-lifetime.md. */
+const notifyLiveness = createTeardownToken();
 function bump(): void {
   version++;
   if (notifyScheduled) return;
   notifyScheduled = true;
-  const generation = notifyGeneration;
+  const stillLive = notifyLiveness.capture();
   queueMicrotask(() => {
-    if (generation !== notifyGeneration) return; // reset between schedule and drain
+    if (!stillLive()) return; // reset between schedule and drain
     notifyScheduled = false;
     for (const l of listeners) {
       // Per-listener, and NOT optional. The loop used to run inside `record()`, which
@@ -136,7 +143,7 @@ export function subscribeConsole(listener: () => void): () => void {
 
 /** Test-only: reset the capture (unwrap can't be undone, but clear state). */
 export function __resetConsoleCaptureForTest(): void {
-  notifyGeneration++;
+  notifyLiveness.invalidateAll();
   notifyScheduled = false;
   buffer.length = 0;
   seq = 0;

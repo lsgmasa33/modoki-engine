@@ -27,6 +27,7 @@ import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { clearControlSpawns } from '../../runtime/timeline/controlSpawnRegistry';
 import { serializeScene, getCurrentScenePath, type SceneFile } from './serialize';
 import { getEditVersion } from '../undo/undoManager';
+import { createTeardownToken } from '../../runtime/core/liveness';
 
 /** Authored-world snapshot captured at the first ▶ of a preview session, plus the scene path it
  *  belongs to (so a scene swap mid-preview can't revert the wrong scene). */
@@ -37,9 +38,9 @@ let _snapPath: string | null = null;
 let _snapEditVersion = 0;
 /** In-flight `begin`, so concurrent openers share ONE snapshot — see beginTimelinePreviewSession. */
 let _pending: Promise<void> | null = null;
-/** Bumped by every session END, so a `begin` that was already awaiting cannot seat its snapshot
- *  after the envelope it belonged to was exited. */
-let _beginEpoch = 0;
+/** Invalidated by every session END, so a `begin` that was already awaiting cannot seat its
+ *  snapshot after the envelope it belonged to was exited. */
+const beginLiveness = createTeardownToken();
 
 export { setTimelinePreviewActive };
 
@@ -184,7 +185,7 @@ export function hasTimelinePreviewSession(): boolean {
 export async function beginTimelinePreviewSession(): Promise<void> {
   if (_snap) return;
   if (_pending) return _pending;
-  const epoch = _beginEpoch;
+  const stillLive = beginLiveness.capture();
   // ⚠️ Sample the edit-version BEFORE the await, not after. `serializeScene()` is async, and an
   // authored edit landing during it may or may not be in `snap` — but folding its bump into the
   // baseline unconditionally makes `previewHasAuthoredEdits()` answer FALSE, which is the unsafe
@@ -196,7 +197,7 @@ export async function beginTimelinePreviewSession(): Promise<void> {
     const snap = await serializeScene();
     const path = getCurrentScenePath();
     // Only seat it if no session end intervened (see endTimelinePreviewSession).
-    if (!_snap && epoch === _beginEpoch) { _snap = snap; _snapPath = path; _snapEditVersion = version; }
+    if (!_snap && stillLive()) { _snap = snap; _snapPath = path; _snapEditVersion = version; }
   })().finally(() => { _pending = null; });
   return _pending;
 }
@@ -214,7 +215,7 @@ export async function endTimelinePreviewSession(opts: { restore: boolean; rebind
   // 'stopped', where the next save serializes the posed world into the scene file and says "Scene
   // saved". Exiting during that window is not exotic: it is pressing ⏹ or switching clips within
   // the tens of ms a real scene takes to serialize.
-  _beginEpoch += 1;
+  beginLiveness.invalidateAll();
   setTimelinePreviewActive(false);
   clearSkeletalSeeks();
   clearControlSpawns(); // preview-spawned prefabs are discarded by the snapshot reload below

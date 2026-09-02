@@ -29,6 +29,7 @@ import { getKTX2Loader, ensureKtx2Caps } from './textureResolver';
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
 import { takeParsedGltf, disposePendingGltf } from './parsedGltfHandoff';
 import { notifyModelTemplatesLoaded } from './modelLoadNotify';
+import { createTeardownToken } from '../core/liveness';
 
 export interface RiggedModel {
   /** The parsed GLB scene graph — bones, SkinnedMeshes, materials. Cloned per
@@ -51,9 +52,9 @@ const cache = new Map<string, RiggedModel>();
 const loadPromises = new Map<string, Promise<void>>();
 const owners = new Map<string, Set<SceneId>>();
 
-// Bumped on full dispose so a load that resolves AFTER teardown disposes its
-// result instead of leaving an owner-less entry in the cache forever.
-let generation = 0;
+// Teardown liveness — no per-key epoch: only full dispose invalidates, so a load that resolves
+// AFTER teardown disposes its result instead of leaving an owner-less entry in the cache forever.
+const liveness = createTeardownToken();
 
 // Constructed lazily on first load (not at module scope) so importing this
 // module is side-effect-free — matches meshTemplateCache, and keeps callers that
@@ -163,7 +164,7 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
   if (cache.has(path)) { disposePendingGltf(path); return Promise.resolve(); }
   if (loadPromises.has(path)) return loadPromises.get(path)!;
 
-  const gen = generation;
+  const stillLive = liveness.capture();
   // Try the derived variant first; on failure, fall back to the raw source so a
   // missing/mis-based variant (e.g. project served in a different URL context
   // than it was imported in) never leaves the model invisible.
@@ -174,7 +175,7 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
     // the editor import handoff). `loadedFrom` is just the log label.
     const finishLoad = (gltf: { scene: THREE.Group; animations?: THREE.AnimationClip[] }, loadedFrom: string) => {
       // Disposed (teardown) or released mid-load → drop the result.
-      if (gen !== generation || !owners.has(path)) {
+      if (!stillLive() || !owners.has(path)) {
         const tmp: RiggedModel = { prototype: gltf.scene, animations: gltf.animations ?? [] };
         disposePrototype(tmp);
         resolve();
@@ -403,7 +404,7 @@ export function getBoneNames(modelRef: string): string[] {
 
 /** Dispose ALL cached rigged models (full teardown / world reset). */
 export function disposeAllRiggedModels(): void {
-  generation++;
+  liveness.invalidateAll();
   for (const model of cache.values()) disposePrototype(model);
   cache.clear();
   loadPromises.clear();

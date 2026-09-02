@@ -132,18 +132,46 @@ function deactivate(entry: Entry, ctx?: ManagerContext): void {
  *  ⚠️ Manager defs are module-level singletons passed by identity, so on a re-register
  *  `oldEntry.def === newEntry.def`. Deferring this teardown changes WHEN it runs relative to the
  *  replacement's own init: it used to always run `dispose(old)` before `init(new)`; now, whenever
- *  `initPromise` is non-null, `dispose(old)` runs AFTER `init(new)` has already completed — on the
- *  SAME instance, tearing down what the successor just built. `actionOwner` closes this for
- *  UIAction NAMES only; nothing guards the manager's own fields or any other named global its
- *  `dispose()` releases. A manager whose `init()` returns a promise MUST tolerate its own
- *  `dispose()` running after a successor's `init()` on the same def instance — e.g.
- *  `LLMManager.dispose()` (`this.generation++; this.llmService = null; clearMessages()`). */
+ *  `initPromise` is non-null, the deferred `dispose(old)` would land AFTER `init(new)` has already
+ *  completed — on the SAME instance, tearing down what the successor just built.
+ *
+ *  ✅ CLOSED (#573). `actionOwner` closed this for UIAction NAMES only, and for a while nothing
+ *  guarded the manager's own fields or any other named global its `dispose()` released — so the
+ *  rule was that a manager whose `init()` returns a promise had to TOLERATE its own `dispose()`
+ *  running after a successor's `init()` (e.g. `LLMManager.dispose()`, which nulls `llmService` and
+ *  clears messages). It no longer has to: the continuation below drops a superseded teardown by
+ *  checking whether a DIFFERENT, live entry now holds this same def instance. ⚠️ The check is on
+ *  the def, NOT on `entry.activationId` — `registerManager` builds a fresh Entry for the
+ *  replacement, so the old entry's activationId never moves and comparing it guards nothing.
+ *  Managers may still tolerate a late dispose defensively; nothing depends on them doing so. */
 function deactivateWhenInitSettles(entry: Entry, ctx?: ManagerContext): void {
   const pending = entry.initPromise;
   if (!pending) { deactivate(entry, ctx); return; }
+  // The identity token, captured BEFORE the deferral — the same guard
   // `pending` is the tracked promise from `activate()`, which swallows its own errors — it never
   // rejects, so a plain `.then` (no `.catch`) is correct here.
-  void pending.then(() => deactivate(entry, ctx));
+  void pending.then(() => {
+    // Identity token — and it has to be about the DEF, not this entry.
+    //
+    // `registerManager` builds a BRAND-NEW Entry for the replacement (its body reads
+    // `deactivateWhenInitSettles(existing)` … `const entry: Entry = {…}`), so `entry` in this
+    // closure is the OLD object and its `activationId` never moves afterwards. Comparing that
+    // field against a captured copy of itself is always equal and guards nothing — that was tried
+    // here first, and a test written around it passed with the check REMOVED, which is how the
+    // no-op was caught.
+    //
+    // What is genuinely shared is `def`: manager singletons are passed by identity, so
+    // `oldEntry.def === newEntry.def`, and `deactivate` calls `entry.def.dispose?.()` on that
+    // shared instance — destroying the state the successor's `init()` just built. `actionOwner`
+    // closed this for UIAction names only.
+    //
+    // Dropping the WHOLE deactivate is right, not merely the dispose: the action names it would
+    // release are already ownership-checked against `actionOwner`, and the successor has claimed
+    // them. See docs/async-lifetime.md ("identity against a captured reference").
+    const current = managers.get(entry.def.name);
+    if (current && current !== entry && current.def === entry.def && current.active) return;
+    deactivate(entry, ctx);
+  });
 }
 
 /** Register a manager. App-scoped managers activate immediately and stay active

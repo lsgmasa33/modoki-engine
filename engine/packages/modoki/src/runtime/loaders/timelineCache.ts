@@ -10,20 +10,20 @@ import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { normalizeTimeline, type TimelineDef } from '../timeline/types';
+import { createTeardownToken } from '../core/liveness';
 
 const cache = new Map<string, TimelineDef>();
 const loading = new Map<string, Promise<void>>();
 const failed = new Set<string>();
-let generation = 0;
-/** Per-PATH invalidation epoch, checked alongside `generation` by every in-flight load.
+/** Teardown liveness, captured per PATH before each load and re-checked after.
  *
- *  `generation` is module-wide and belongs to `clearTimelineCache` (the whole cache is gone). A
- *  per-key `invalidateTimeline` must NOT refuse an in-flight load of a DIFFERENT key: this cache
- *  is driven by the editor's file watcher, so an author saving one timeline would otherwise make
- *  a concurrent scene load silently drop an unrelated one. Cleared wholesale by
- *  `clearTimelineCache`, so it cannot outgrow the cache it shadows. */
-const keyEpoch = new Map<string, number>();
-const epochOf = (path: string): number => keyEpoch.get(path) ?? 0;
+ *  `invalidateAll()` is `clearTimelineCache`'s (the whole cache is gone). A per-key
+ *  `invalidateTimeline` must NOT refuse an in-flight load of a DIFFERENT key — this cache is
+ *  driven by the editor's file watcher, so an author saving one timeline would otherwise make a
+ *  concurrent scene load silently drop an unrelated one — so it calls `invalidateKey` alone.
+ *  Cleared wholesale by `clearTimelineCache`, so the per-key map cannot outgrow the cache it
+ *  shadows. */
+const liveness = createTeardownToken<string>();
 // Parity fix, close-out sweep of QA-ANIM-0018: an unresolved guid used to fail silently here.
 const unknownGuidSeen = new Set<string>();
 
@@ -49,21 +49,20 @@ export function getTimeline(ref: string, opts?: { load?: boolean }): TimelineDef
   // caller had already decided to answer with a refusal.
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
-    const gen = generation;
-    const ep = epochOf(path);
+    const stillLive = liveness.capture(path);
     const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
       .then((r) => {
         return parseAssetJson(r, path);
       })
       .then((json) => {
-        if (gen !== generation || ep !== epochOf(path)) return; // scene swap or per-key invalidation mid-flight
+        if (!stillLive()) return; // scene swap or per-key invalidation mid-flight
         if (cache.has(path)) return;          // editor live-preview seeded it
         const id = (json as Partial<TimelineDef>)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'timeline');
         cache.set(path, normalizeTimeline(json as Partial<TimelineDef>));
       })
       .catch((e) => {
-        if (gen === generation && ep === epochOf(path)) failed.add(path);
+        if (stillLive()) failed.add(path);
         console.warn(`[timelineCache] failed to load ${path}:`, e);
       })
       .finally(() => loading.delete(path));
@@ -93,13 +92,12 @@ export async function loadTimelineNow(refOrPath: string): Promise<TimelineDef | 
  *  swallows it with no retry — so a refusal here must retry itself instead of surfacing null. */
 const LOAD_TIMELINE_NOW_MAX_ATTEMPTS = 3;
 async function loadTimelineNowAttempt(path: string, attempt: number): Promise<TimelineDef | null> {
-  const gen = generation;
-  const ep = epochOf(path);
+  const stillLive = liveness.capture(path);
   try {
     const r = await fetch(assetUrl(path), ASSET_FETCH_INIT);
     // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
     const json = (await parseAssetJson(r, path)) as Partial<TimelineDef>;
-    if (gen !== generation || ep !== epochOf(path)) {
+    if (!stillLive()) {
       if (attempt >= LOAD_TIMELINE_NOW_MAX_ATTEMPTS) {
         console.warn(`[timelineCache] ${path} was invalidated ${attempt} times while loading; giving up — its refs will be missing from the scene's resource manifest`);
         return null;
@@ -114,7 +112,7 @@ async function loadTimelineNowAttempt(path: string, attempt: number): Promise<Ti
     cache.set(path, def);
     return def;
   } catch (e) {
-    if (gen === generation && ep === epochOf(path)) failed.add(path);
+    if (stillLive()) failed.add(path);
     console.warn(`[timelineCache] failed to load ${path}:`, e);
     return null;
   }
@@ -134,10 +132,10 @@ export function invalidateTimeline(refOrPath: string): void {
   if (!path) return;
   // An in-flight load is carrying the PRE-import bytes — refuse it, or it re-caches the stale def
   // on top of the fresh one. Precedent: fontLoader.invalidateFontFace. Bumped PER-KEY (not the
-  // module-wide `generation`, which is `clearTimelineCache`'s): this cache is driven by the
+  // module-wide `invalidateAll()`, which is `clearTimelineCache`'s): this cache is driven by the
   // editor's file watcher, so invalidating one timeline must not also refuse an in-flight load of
   // a DIFFERENT timeline.
-  keyEpoch.set(path, epochOf(path) + 1);
+  liveness.invalidateKey(path);
   cache.delete(path);
   failed.delete(path);
   loading.delete(path);
@@ -145,8 +143,7 @@ export function invalidateTimeline(refOrPath: string): void {
 
 /** Drop ALL cached timelines (scene swap / full resource disposal). */
 export function clearTimelineCache(): void {
-  generation++;
-  keyEpoch.clear();
+  liveness.invalidateAll();
   cache.clear();
   loading.clear();
   failed.clear();

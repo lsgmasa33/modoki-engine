@@ -10,7 +10,7 @@
 import type { PrefabFile } from './prefab';
 import { serializePrefab, writePrefabFile, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
 import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
-import { swapHistory } from '../undo/undoManager';
+import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
 import type { SceneData, SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
@@ -365,6 +365,12 @@ export async function savePrefabEdit(): Promise<boolean> {
     name: previous.name,
   });
   if (!prefab) { console.error('[PrefabEdit] serialize produced no prefab'); return false; }
+  // The version `prefab` represents, captured BEFORE the write. `writePrefabFile` is a real fetch
+  // to the dev server, and the human keeps working during it — a bone drag or an agent op lands as
+  // an ordinary `pushAction`. Re-reading the version after the await would fold that edit into the
+  // saved baseline without it ever being written; see markSceneSaved's doc comment for why that is
+  // data loss and not a cosmetic flag (#573).
+  const savedAtEditVersion = getEditVersion();
   const ok = await writePrefabFile(editingPrefab.guid, prefab);
   if (!ok) return false;
   // Refresh the editor's prefab cache to the just-saved version AND invalidate the
@@ -381,7 +387,7 @@ export async function savePrefabEdit(): Promise<boolean> {
   // was stale when it was byte-identical to the live world. Reported by the owner — "I think I
   // saved it before you said it's stale, maybe we have a bug" — and confirmed by diffing the file
   // against the world rather than by trusting the flag, which is the only way to see it.
-  markSceneSaved();
+  markSceneSaved(savedAtEditVersion);
   console.log(`[PrefabEdit] saved "${prefab.name}" (${prefab.entities.length} entities)`);
   return true;
 }

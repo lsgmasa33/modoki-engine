@@ -47,10 +47,10 @@
  *     counter alone is blind to — a load that starts fresh AFTER `unloadAll()`'s
  *     head has already bumped its generation would otherwise capture the
  *     post-bump value and sail through every checkpoint unaffected.
- *   - `teardownGeneration` is bumped at the same HEAD. `loadScene()` captures it
- *     at entry (`enteredGeneration`) and every `signal.aborted` checkpoint above
- *     (`isSuperseded`) also compares the CURRENT generation against the
- *     CAPTURED one. ⚠️ Pre-swap this comparison is currently redundant: a load
+ *   - `teardownToken` (a `runtime/core/liveness.ts` `TeardownToken`) is invalidated at the same
+ *     HEAD. `loadScene()` captures it (`enteredGeneration`) and every `signal.aborted` checkpoint
+ *     above (`isSuperseded`) also re-checks the CAPTURED check. ⚠️ Pre-swap this comparison is
+ *     currently redundant: a load
  *     already mid-flight when `unloadAll()` starts also has `this.nextLoad`
  *     aborted directly by the same HEAD, so `controller.signal.aborted` is
  *     already true by the time the checkpoint runs — the generation arm cannot
@@ -72,7 +72,7 @@
  *  the swap clears `nextLoad`, so from there on there is nothing left for a
  *  racing `unloadAll()` to abort THROUGH. That window is covered by a SEPARATE
  *  pair of checkpoints (`isPostSwapSuperseded`, checked after each of the four
- *  post-swap awaits) that read `teardownInFlight`/`teardownGeneration` directly
+ *  post-swap awaits) that read `teardownInFlight`/the teardown token's generation directly
  *  instead of going through `isSuperseded` — the counter catches an `unloadAll()`
  *  in flight right now, the generation catches one that started AND FULLY
  *  SETTLED inside one of those awaits (so the counter is already back at zero by
@@ -87,6 +87,7 @@
 
 import { createWorld, type World, type Entity } from 'koota';
 import { setCurrentWorld, getCurrentWorld, spawnEntity } from '../core/ecs/world';
+import { createTeardownToken, type LivenessCheck } from '../core/liveness';
 import { getAllTraits } from '../core/ecs/traitRegistry';
 import { resolveKootaSchema } from './sceneSchema';
 import { resolveSceneChain, type SceneRef, type FetchSceneMeta } from './sceneChain';
@@ -268,15 +269,18 @@ class SceneManagerImpl implements SceneManager {
   // a `finally` after its tail; a counter rather than a boolean so overlapping
   // `unloadAll()` calls can't clear each other's flag. `loadScene()` checks it
   // FIRST, before any work, rejecting immediately if a teardown already owns the
-  // world. `teardownGeneration` is bumped at the same head; `loadScene()` captures
-  // it at entry and re-checks it at every `signal.aborted` checkpoint (pre-swap)
+  // world. `teardownToken` — a `runtime/core/liveness.ts` `TeardownToken` (composed, not
+  // substituted: this class keeps its own AbortController, in-flight counter and post-swap
+  // latch, and sources just the generation from the helper) — is invalidated at the same head;
+  // `loadScene()` captures it at entry and re-checks it at every `signal.aborted` checkpoint
+  // (pre-swap)
   // and at every post-swap checkpoint (`isPostSwapSuperseded`), catching a
   // teardown that starts WHILE it is already mid-flight — including one that
   // starts AND fully settles inside a post-swap await, which leaves
   // `teardownInFlight` back at zero by the time the load resumes and only the
   // generation comparison can still catch.
   private teardownInFlight = 0;
-  private teardownGeneration = 0;
+  private teardownToken = createTeardownToken();
   // Both registries below are APP-LIFETIME singletons owned by their registrant's
   // lifecycle, NOT scene-scoped — `unloadAll` deliberately does not blanket-clear them
   // (the beforeSwap hooks are register/unregister-paired in the Scene2D/Scene3D React
@@ -366,8 +370,8 @@ class SceneManagerImpl implements SceneManager {
     return { id: this.nextLoad.id, path: this.nextLoad.path, state: 'loading' };
   }
 
-  /** True once `unloadAll()` has bumped `teardownGeneration` past the value this
-   *  load captured at its own entry — i.e. a teardown started AFTER this load
+  /** True once `unloadAll()` has invalidated the `teardownToken` past the capture this
+   *  load took at its own entry — i.e. a teardown started AFTER this load
    *  did. Composes with the existing `signal.aborted` checkpoints (#535 — unload
    *  wins) rather than forming a parallel checkpoint set. Does NOT cover a
    *  teardown that was already in flight before this load started — that's
@@ -382,22 +386,22 @@ class SceneManagerImpl implements SceneManager {
    *  every lifecycle test green. Kept anyway as defence-in-depth in case the
    *  `nextLoad` invariant above ever changes — see `isPostSwapSuperseded` for
    *  where the generation arm actually is load-bearing (post-swap). */
-  private isSuperseded(controller: AbortController, enteredGeneration: number): boolean {
-    return controller.signal.aborted || this.teardownGeneration !== enteredGeneration;
+  private isSuperseded(controller: AbortController, enteredGeneration: LivenessCheck): boolean {
+    return controller.signal.aborted || !enteredGeneration();
   }
 
   /** Post-swap counterpart to `isSuperseded` (#535 defect 1). Past the atomic
    *  swap, `this.nextLoad` has already been cleared, so `controller.signal` can
    *  no longer be aborted THROUGH by a racing `unloadAll()` — checking it here
-   *  would always read false and never fire. Read `teardownInFlight`/
-   *  `teardownGeneration` directly instead: the counter catches a teardown that
+   *  would always read false and never fire. Read `teardownInFlight` directly and
+   *  re-check the captured `teardownToken` liveness instead: the counter catches a teardown that
    *  is running RIGHT NOW, the generation catches one that started and fully
    *  settled while this load was parked in one of the post-swap awaits (so the
    *  counter is already back at zero again). Does not gate the tail's own
    *  work — see the class docblock — only whether the caller's promise should
    *  reject instead of resolving. */
-  private isPostSwapSuperseded(enteredGeneration: number): boolean {
-    return this.teardownInFlight > 0 || this.teardownGeneration !== enteredGeneration;
+  private isPostSwapSuperseded(enteredGeneration: LivenessCheck): boolean {
+    return this.teardownInFlight > 0 || !enteredGeneration();
   }
 
   /** Load a scene file. Cancels any in-flight load. Resolves when the swap is
@@ -413,12 +417,12 @@ class SceneManagerImpl implements SceneManager {
     if (this.teardownInFlight > 0) {
       throw new DOMException('Aborted', 'AbortError');
     }
-    // Captured before any await, compared against `this.teardownGeneration` at
+    // Captured before any await, re-checked at
     // every checkpoint below via `isSuperseded`. A load already mid-flight when a
-    // teardown STARTS sees the bump and supersedes itself; a load that starts
-    // fresh after a teardown has already fully settled captures the post-bump
-    // value here and is unaffected by it for the rest of its life.
-    const enteredGeneration = this.teardownGeneration;
+    // teardown STARTS sees the invalidation and supersedes itself; a load that starts
+    // fresh after a teardown has already fully settled captures the post-invalidation
+    // check here and is unaffected by it for the rest of its life.
+    const enteredGeneration = this.teardownToken.capture();
     // Boot timeline (#238): the whole load, plus a span per phase below. Always on — a cold boot
     // has nobody there to switch a profiler on, and the boot stall is only reproducible cold.
     const loadSpan = beginBootSpan('scene-load', path);
@@ -1214,7 +1218,7 @@ class SceneManagerImpl implements SceneManager {
     sceneId: SceneId,
     sceneData: SceneData,
     controller: AbortController,
-    enteredGeneration: number,
+    enteredGeneration: LivenessCheck,
   ): Promise<SceneResourceRef[]> {
     const seen = new Set<string>();
     const allRefs: SceneResourceRef[] = [];
@@ -1305,17 +1309,17 @@ class SceneManagerImpl implements SceneManager {
    *  dispose against the CURRENT (still-alive) world before swapping in the empty
    *  one, then clear both active scopes. */
   async unloadAll(): Promise<void> {
-    // Unload wins (#535): mark a teardown in flight AND bump the generation, both
+    // Unload wins (#535): mark a teardown in flight AND invalidate the teardown token, both
     // at the HEAD, before any await — alongside the existing `nextLoad` abort
     // below. `teardownInFlight` is what `loadScene()` checks at ITS entry (a load
     // that starts anywhere in the awaits below sees it non-zero and rejects
-    // immediately, before doing any work); `teardownGeneration` is what a load
-    // ALREADY mid-flight sees change at its next `signal.aborted` checkpoint. The
+    // immediately, before doing any work); the teardown token's invalidation is what a load
+    // ALREADY mid-flight sees at its next `signal.aborted` checkpoint. The
     // `finally` below is load-bearing: if anything in the body throws, the counter
     // must still return to zero, or every `loadScene()` after would reject
     // forever — a worse bug than the race being fixed here.
     this.teardownInFlight++;
-    this.teardownGeneration++;
+    this.teardownToken.invalidateAll();
     try {
       if (this.nextLoad) {
         this.nextLoad.controller.abort();
@@ -1353,7 +1357,7 @@ class SceneManagerImpl implements SceneManager {
       // authoritative and is never undone by a load that raced in behind it
       // (#535, unload wins): a `loadScene()` racing any of the awaits above either
       // already rejected at its entry (`teardownInFlight`) or will reject at its
-      // next checkpoint (`teardownGeneration`), so nothing here needs to check
+      // next checkpoint (the teardown token's invalidation), so nothing here needs to check
       // `this.primaryId` before clearing it.
       for (const sceneId of this.loadedScenes.keys()) releaseAllForScene(sceneId);
       this.loadedScenes.clear();
@@ -1376,7 +1380,7 @@ class SceneManagerImpl implements SceneManager {
     this.nextLoad = null;
     this.basesWithPrefabInstance.clear();
     this.teardownInFlight = 0;
-    this.teardownGeneration = 0;
+    this.teardownToken.invalidateAll();
   }
 }
 

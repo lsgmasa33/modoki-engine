@@ -31,6 +31,7 @@
  *  in Phase 2; app-shell init/flush wiring in Phase 3. */
 
 import { InMemoryBackend, type PrefsBackend } from './backends';
+import { createSupersessionToken } from '../core/liveness';
 
 /** A plain JSON-serializable value. No functions, class instances, Map/Set, or cycles. */
 export type JsonValue =
@@ -128,23 +129,24 @@ function unmarkInFlight(key: string): void {
  *  from "mid-swap", e.g. `agentBridge.ts`'s `player-prefs-write` op, which must refuse a write
  *  during the window rather than accept one the install is about to discard (#438). */
 let swapInFlight = false;
-/** Epoch counter for the CURRENT `swapInFlight` window — incremented each time `doInit` sets
- *  `swapInFlight = true`. Originally existed only so `resetPlayerPrefsForTest` can't be fooled by
+/** Supersession token (`runtime/core/liveness.ts`) for the CURRENT `swapInFlight` window —
+ *  `begin()` is called each time `doInit` sets `swapInFlight = true`, bumping its counter.
+ *  Originally existed only so `resetPlayerPrefsForTest` can't be fooled by
  *  a STALE `doInit` call left parked mid-`getAll` by a prior test: that call's `finally` block
- *  only clears `swapInFlight` if its captured token still matches this counter, so a newer swap
+ *  only clears `swapInFlight` if its captured check still passes, so a newer swap
  *  (started by the new test, after the reset) is never incorrectly cleared by the old one
  *  settling later. Production was unaffected by THAT role — `initChain` serializes real `doInit`
- *  calls, so there is never more than one epoch in flight there. Test-isolation-only, not a
+ *  calls, so there is never more than one attempt in flight there. Test-isolation-only, not a
  *  production race (see `doInit`'s comment).
  *
  *  ⚠️ It now has a SECOND, production role too (#454 C, via `PlayerPrefs.swapGeneration()`): a
  *  caller that awaits something of its own (e.g. `agentBridge.ts`'s `player-prefs-write` op
- *  awaiting `flush()`) can capture this counter before the await and compare after, to learn
+ *  awaiting `flush()`) can capture this token's counter before the await and compare after, to learn
  *  whether a swap window opened in between — including one that opened AND closed entirely
  *  inside the await, which a re-sampled `isSwapInFlight()` structurally cannot see (that flag is
  *  already back to `false` by the time the caller resumes). See `swapGeneration()`'s own doc
  *  comment for the contract. */
-let swapEpoch = 0;
+const swapToken = createSupersessionToken();
 /** Non-null only while a swap window is open (`doInitBody` sets it just before taking the
  *  pre-window pending snapshot; both exit paths null it again) — so the ordinary non-swapping
  *  path pays nothing for it. Exists to answer a question set membership alone cannot (#454 B): a
@@ -430,16 +432,16 @@ export interface PlayerPrefsInitResult {
  *  The init-vs-init interleave (#428) is unaffected by this change. */
 async function doInit(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInitResult> {
   swapInFlight = true;
-  const myEpoch = ++swapEpoch;
+  const stillCurrentSwap = swapToken.begin();
   try {
     return await doInitBody(opts);
   } finally {
     // Only clear if no NEWER swap has started since — guards against a stale call left
     // parked mid-`getAll` by a prior test settling after `resetPlayerPrefsForTest` has
-    // already started a fresh swap (see `swapEpoch`'s doc comment). In production there is
-    // only ever one epoch in flight (`initChain` serializes real callers), so this is always
+    // already started a fresh swap (see `swapToken`'s doc comment). In production there is
+    // only ever one attempt in flight (`initChain` serializes real callers), so this is always
     // a no-op there.
-    if (myEpoch === swapEpoch) {
+    if (stillCurrentSwap()) {
       swapInFlight = false;
     }
   }
@@ -787,11 +789,11 @@ function isSwapInFlight(): boolean {
  *  a swap that both starts and finishes inside the caller's own await defeats it; this counter
  *  catches that case because it never resets.
  *
- *  `resetPlayerPrefsForTest` also bumps it (see `swapEpoch`'s doc comment) — harmless here, since
+ *  `resetPlayerPrefsForTest` also bumps it (see `swapToken`'s doc comment) — harmless here, since
  *  a caller comparing across a test-boundary reset is exactly the "something changed" signal this
  *  is for. */
 function swapGeneration(): number {
-  return swapEpoch;
+  return swapToken.current;
 }
 
 /** The namespace these keys live under — the sanitized `init({namespace})`, or `'default'`
@@ -913,11 +915,11 @@ export function resetPlayerPrefsForTest(): void {
   hydrated = false;
   swapInFlight = false;
   windowLanded = null; // belt-and-braces, same reasoning as `doInit`'s `finally` above (#454 B)
-  // Bump the epoch so a stale `doInit` left parked mid-`getAll` by a PRIOR test (see the ⚠️
+  // Bump the token so a stale `doInit` left parked mid-`getAll` by a PRIOR test (see the ⚠️
   // above) can never clear `swapInFlight` out from under a swap the NEXT test genuinely
-  // starts — its captured token from before this reset no longer matches. Test-isolation
-  // only; see `swapEpoch`'s doc comment.
-  swapEpoch++;
+  // starts — its captured check from before this reset no longer passes. Test-isolation
+  // only; see `swapToken`'s doc comment.
+  swapToken.begin();
   cache.clear();
   dirty.clear();
   inFlight.clear();

@@ -25,6 +25,7 @@ import { getCurrentWorld } from '../core/ecs/worldRegistry';
 import { onWorldSwap } from '../core/ecs/world';
 import { pickHapticBackend, type HapticBackend } from './backends';
 import { resolveHapticPattern } from './patterns';
+import { createTeardownToken } from '../core/liveness';
 
 let backend: HapticBackend | null = null;
 function activeBackend(): HapticBackend {
@@ -33,10 +34,10 @@ function activeBackend(): HapticBackend {
 }
 
 /** Test seam — swap in a fake backend, or force a re-pick. A sample measured through the outgoing
- *  backend must not be attributed to the incoming one, so this bumps the latency generation too. */
+ *  backend must not be attributed to the incoming one, so this invalidates latency liveness too. */
 export function setHapticBackend(b: HapticBackend | null): void {
   backend = b;
-  latencyGeneration += 1;
+  latencyLiveness.invalidateAll();
 }
 
 /** Runtime gates, pushed in from `HapticSettings` by the haptics system each frame. Held as
@@ -68,11 +69,11 @@ export function hapticLatencyMean(): number | null {
  *  can all land inside that round-trip — without this, the resumed handler pushes a sample it
  *  measured through the OLD backend into an array a new session already owns, and
  *  `hapticLatencyMean()` reports it as the new session's bridge latency. */
-let latencyGeneration = 0;
+const latencyLiveness = createTeardownToken();
 
 export function clearHapticLatency(): void {
   latencies.length = 0;
-  latencyGeneration += 1;
+  latencyLiveness.invalidateAll();
 }
 
 /** Timers for beats not yet fired, so teardown can cancel them rather than buzzing into the next
@@ -85,7 +86,7 @@ function fire(preset: Parameters<HapticBackend['play']>[0], measure: boolean): v
   // measurement. It measures the BRIDGE, never game state, so nothing here feeds the simulation.
   const t0 = measure ? rawNow() : 0;
   const b = activeBackend();
-  const gen = latencyGeneration;
+  const stillLive = latencyLiveness.capture();
   // BOTH handlers, deliberately. The stock Capacitor backend swallows its own failures, but a
   // custom backend is free to reject, and a bare `.then()` would leave that as an UNHANDLED
   // rejection — which breaks the "never throws into game code" contract just as surely as a
@@ -95,7 +96,7 @@ function fire(preset: Parameters<HapticBackend['play']>[0], measure: boolean): v
       if (!measure) return;
       // A teardown/backend-swap landed while this beat was in flight — this sample was measured
       // through a session nobody is scoring any more, so drop it rather than mis-attribute it.
-      if (gen !== latencyGeneration) return;
+      if (!stillLive()) return;
       latencies.push(rawNow() - t0);
       if (latencies.length > LATENCY_SAMPLES) latencies.shift();
     },
@@ -150,7 +151,7 @@ onWorldSwap(() => cancelPendingHaptics());
  *  re-picked on next use. Does NOT clear registered patterns — that is `clearHapticPatterns`. */
 export function disposeHaptics(): void {
   cancelPendingHaptics();
-  clearHapticLatency(); // already bumps `latencyGeneration` — no separate bump needed here
+  clearHapticLatency(); // already invalidates latency liveness — no separate invalidation needed here
   enabled = true;
   masterIntensity = 1;
   backend = null;
