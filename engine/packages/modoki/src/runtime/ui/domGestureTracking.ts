@@ -82,8 +82,9 @@ function onEnd(e?: TouchEvent): void {
 
 /** Wire the listeners. Idempotent, and a no-op headlessly. A game calls this once from its own
  *  register hook (Court: `registerGameSystems`) — kept explicit rather than a module-load side
- *  effect, matching this file's siblings (`safeArea.ts` has no listeners at all;
- *  `scrollAnchor.ts` wires from a React effect): an unconditional `addEventListener` at import
+ *  effect, matching this file's siblings (`scrollAnchor.ts` wires from a React effect;
+ *  `safeArea.ts` wires its own single `visibilitychange` listener lazily, from the first real
+ *  registration, rather than at import — #592): an unconditional `addEventListener` at import
  *  time would fire in every embedding context that imports this module, wanted or not.
  *
  *  ⚠️ `wired` is a plain boolean, not refcounted, unlike its sibling `core/pointerBlockers.ts`

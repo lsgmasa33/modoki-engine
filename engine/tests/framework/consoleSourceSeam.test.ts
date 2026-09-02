@@ -9,7 +9,7 @@
  *  The device condition is reproduced honestly rather than by mocking a phone: `installConsoleCapture()`
  *  is simply never called (which is what `initAgentBridge()`'s `if (!hot && !bridge) return;` does
  *  on a production build), and the ring is published through `consoleSource` exactly as
- *  `patchConsole()` does.
+ *  `installDeviceConsoleCapture()` does (it was `bridge.ts`'s `patchConsole()` until #591).
  */
 
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';

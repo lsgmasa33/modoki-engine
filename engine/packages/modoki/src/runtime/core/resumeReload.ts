@@ -227,13 +227,15 @@ export function createResumeReloadHandler(deps: ResumeReloadDeps): ResumeReloadH
       if (reloading) return;
       // Announce the armed threshold on the FIRST background edge, not at mount.
       //
-      // ⚠️ Measured on an S22 (2026-09-02): a mount-time log is INVISIBLE on device. The debug
-      // bridge installs its console capture from an async dynamic import
-      // (`main.tsx`'s `import('./debug/bridge').then(...)`), so everything logged before that
-      // chunk resolves — every boot-time line in the app — never reaches `device_console_logs`.
-      // A background edge is by definition long after boot, so this one lands. Without it the
-      // only signal that the trigger is armed at all, and at WHICH threshold, is unreadable on
-      // the platform the feature actually ships to.
+      // ⚠️ Measured on an S22 (2026-09-02): a mount-time log was INVISIBLE on device, because the
+      // debug bridge installed its console capture from an async dynamic import
+      // (`main.tsx`'s `import('./debug/bridge').then(...)`) that React's mount could beat.
+      // #591 FIXED that mechanism — `main.tsx` now installs the capture eagerly
+      // (`./installDeviceConsoleCapture`), re-verified on the same S22 — so a mount-time line
+      // WOULD be captured today and this no longer has to be a background-edge log to be read.
+      // It stays on the background edge anyway, deliberately: a background edge is long after
+      // boot on every platform, which keeps this diagnostic readable without depending on the
+      // engine's boot-order guarantees holding. Do not "restore" it to mount without re-measuring.
       if (!announced) {
         announced = true;
         log(`armed — will reload on a resume after ${Math.round(deps.thresholdMs() / 1000)}s away`);

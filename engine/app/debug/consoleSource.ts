@@ -4,7 +4,9 @@
  *  THE BUG THIS EXISTS TO CLOSE. There are two console rings in this app, each correct on its own
  *  surface, and `diagnose` read the one that a shipped build never fills:
  *
- *    - `bridge.ts`      → `consoleRing`   (`patchConsole()`)          — populated ON DEVICE
+ *    - `deviceConsoleCapture.ts` → `consoleRing` (`installDeviceConsoleCapture()`) — ON DEVICE
+ *      (it lived in `bridge.ts` as `patchConsole()` until #591 moved it out so `main.tsx` could
+ *      install it eagerly instead of racing the bridge chunk's dynamic import)
  *    - `agentBridge.ts` → `consoleBuffer` (`installConsoleCapture()`) — populated IN THE EDITOR
  *
  *  `installConsoleCapture()` is called from `initAgentBridge()`, *after* `if (!hot && !bridge)

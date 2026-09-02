@@ -10,21 +10,19 @@
  */
 
 import { makeDeviceEvalApi } from './deviceEvalApi';
-import { setConsoleSource } from './consoleSource';
 import { describeElement } from './domResolve';
 import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
 import { setJournalEnabled } from '@modoki/engine/runtime';
 import { createSupersessionToken, createTeardownToken } from '@modoki/engine/runtime/core/liveness';
+import { consoleRing, installDeviceConsoleCapture, unpatchedLog } from './deviceConsoleCapture';
 import {
   safeStringify,
   handleEval as evalCode,
   screenshotToCSS as toCSS,
-  createConsoleRing,
   clampEvalTimeout,
   DEVICE_EVAL_TIMEOUT_MS,
   DEVICE_EVAL_MAX_TIMEOUT_MS,
-  MAX_CONSOLE_LOGS,
   type LastScreenInfo,
   type ScreenInfoParam,
 } from './bridgeHelpers';
@@ -64,16 +62,22 @@ function withMechanismSuffix(reply: string): string {
   return reply.startsWith('Error:') ? reply : `${reply} [input:${INPUT_MECHANISM}]`;
 }
 
-// Original console for bridge's own logging (avoids feedback loop)
-const _log = console.log.bind(console);
+// The bridge's OWN logging, deliberately kept OUT of `consoleRing` (avoids a feedback loop, and
+// stops 25 chatter call sites evicting the 200-entry ring that `device_console_logs` reads).
+// ⚠️ Imported, NOT `console.log.bind(console)` here: since #591 installs the capture eagerly from
+// `main.tsx`, `console.log` is ALREADY the ring wrapper by the time this module evaluates, so a
+// local bind would capture the wrapper and put every `[debug-bridge]` line into the ring. See
+// `unpatchedLog`'s comment in ./deviceConsoleCapture.ts.
+const _log = unpatchedLog;
 /** The ERROR twin of `_log`. Separate because a bridge that failed to start must not report it at
  *  `log` level: on a device the only readable channel is logcat/OSLog, and a `console.log` line
  *  there is indistinguishable from ordinary chatter — see `initDebugBridge`'s note on #164 for the
  *  hour that cost.
  *
- *  LATE-bound (a wrapper, not a `.bind()` like `_log`) on purpose: `patchConsole` replaces
- *  `console.error` with a wrapper that ALSO pushes into `consoleRing`, and every `_err` call site
- *  fires after that runs. A `.bind()` captures the pre-patch function and so reaches logcat only.
+ *  It reads live `console.error` (NOT `unpatchedLog`'s error twin) on purpose, and that is the whole
+ *  difference between the two: `_log` must stay out of `consoleRing`, `_err` must land IN it.
+ *  `installDeviceConsoleCapture` replaces `console.error` with a wrapper that also pushes into the
+ *  ring, so a failure reported through `_err` is readable via `device_console_logs`.
  *  That distinction is invisible for a boot failure — if the server never binds, nothing can read
  *  the ring anyway — but it is not for the port-lifecycle failure, which is RECOVERABLE: a later
  *  foreground can succeed, and then `device_console_logs` is reachable again with a gap it cannot
@@ -90,58 +94,6 @@ let lastScreenInfo: LastScreenInfo | null = null;
 // before a device rotation the newer capture already reflects), corrupting tap-coordinate mapping
 // until the next screenshot. A newer request always wins.
 const screenshotEpoch = createSupersessionToken();
-
-// Console capture ring buffer.
-const consoleRing = createConsoleRing(MAX_CONSOLE_LOGS);
-
-// --- Console Capture ---
-
-function patchConsole() {
-  const levels = ['log', 'warn', 'error', 'info'] as const;
-  for (const level of levels) {
-    const original = console[level].bind(console);
-    console[level] = (...args: unknown[]) => {
-      original(...args);
-      consoleRing.push(level, args);
-    };
-  }
-  // An uncaught error or a rejected promise never reaches `console.*`, so the patch above cannot
-  // see it — and a failed dynamic import or a throw deep in scene/resource loading is exactly the
-  // kind of thing worth diagnosing on a phone. `agentBridge` records these for the editor; the
-  // device had no equivalent, so its ring was silent on the whole class (#157).
-  // Each wrapped in try/catch for the same reason `agentBridge`'s twin is ("never let capture break
-  // logging"), and it matters MORE here: this handler runs INSIDE the window error handler, so a
-  // throw while describing an error becomes another error event. `e.error` is attacker-shaped in the
-  // general case — a value whose `stack` getter throws, or a Proxy — and `String(e.message)` can
-  // throw on an object with a hostile `toString`. Without the guard the entry is lost AND an
-  // exception escapes into the host, at precisely the moment something is already going wrong.
-  if (typeof window !== 'undefined') {
-    window.addEventListener('error', (e) => {
-      try {
-        const where = e.filename ? ` (${e.filename}:${e.lineno}:${e.colno})` : '';
-        const msg = e.error instanceof Error ? (e.error.stack || e.error.message) : String(e.message);
-        consoleRing.push('error', [`[uncaught] ${msg}${where}`]);
-      } catch { /* ignore — a capture failure must never amplify the error it is reporting */ }
-    });
-    window.addEventListener('unhandledrejection', (e) => {
-      try {
-        const r = (e as PromiseRejectionEvent).reason;
-        const msg = r instanceof Error ? (r.stack || r.message) : String(r);
-        consoleRing.push('error', [`[unhandledrejection] ${msg}`]);
-      } catch { /* ignore */ }
-    });
-  }
-  // Publish the ring so `diagnose` / the `console-logs` op can READ what this surface captured.
-  // Without this the device captured faithfully and nothing could reach it — see consoleSource.ts.
-  setConsoleSource(() => consoleRing.entries.map((e) => ({
-    // The ring carries 'info' as a distinct level; the reader's vocabulary has three. Fold it into
-    // 'log' rather than dropping the entry — losing a line to a vocabulary mismatch is the same
-    // class of silent omission this whole seam exists to end.
-    level: e.level === 'info' ? 'log' : e.level,
-    ts: e.timestamp,
-    text: e.args.join(' '),
-  })));
-}
 
 // --- Command Handlers ---
 
@@ -1350,7 +1302,11 @@ export function initDebugBridge() {
   if (initialized) return;
   initialized = true;
 
-  patchConsole();
+  // `main.tsx`'s eager `./installDeviceConsoleCapture` side-effect import already calls this on
+  // every build that reaches here (#591) — this call stays anyway so `initDebugBridge` does not
+  // DEPEND on that having fired. `installDeviceConsoleCapture()` is idempotent, so the two never
+  // double-wrap.
+  installDeviceConsoleCapture();
 
   if (Capacitor.isNativePlatform()) {
     _log('[debug-bridge] Initializing native bridge');

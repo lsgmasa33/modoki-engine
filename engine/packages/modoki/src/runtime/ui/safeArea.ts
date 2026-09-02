@@ -74,6 +74,70 @@ let refreshFrameId: ReturnType<typeof requestAnimationFrame> | null = null;
  *  frames instead of 60. */
 const REFRESH_MS = 250;
 
+/** How long after a registration/resume signal the throttled self-refresh (below) stays
+ *  armed, ms. #592: the Android bar-hide this refresh exists for (#273) settles once, a
+ *  beat after the signal — not continuously for the rest of the session — so polling past
+ *  this window is pure ongoing cost (a forced synchronous layout, see `getSafeAreaInsets`'s
+ *  own doc) for zero remaining benefit. Generous relative to `REFRESH_MS` (20 refreshes)
+ *  because the settle time is observed, not measured precisely across devices; if a device
+ *  turns up where the transition lands later, widen this rather than removing the bound —
+ *  the fallback is a stuck stale value (#273 again, see `getSafeAreaInsets`'s doc), not a
+ *  crash, so a too-short window is a correctness bug to fix with a bigger number, not a
+ *  reason to give up on bounding it. */
+const POLL_WINDOW_MS = 5000;
+
+/** `rawNow()` timestamp the self-refresh keeps polling until. Re-armed by every EXTERNAL
+ *  registration — `measureSafeAreaInsets` (mount, a resize, a scene swap's fresh root) and a
+ *  `visibilitychange` resume — the moments the bar-hide can occur. Past this the cached value
+ *  is still returned (see `getSafeAreaInsets`); it simply stops re-measuring on its own until
+ *  the next such signal.
+ *
+ *  ⚠️ **The self-refresh's OWN re-measure must NOT re-arm this, or the window never closes**
+ *  (found in review, #592): the deferred rAF callback below used to call the same
+ *  `measureSafeAreaInsets` a real registration calls, which re-armed the window on every
+ *  refresh and made it stay open indefinitely — the exact bug #592 was written to fix,
+ *  reintroduced by the fix. `applyMeasurement` (below) is the measurement with no arming,
+ *  used by both the public entry point (which arms first) and the self-refresh (which must
+ *  not). */
+let pollArmedUntil = -Infinity;
+
+/** Set once the `visibilitychange` listener (below) has been added, so a burst of
+ *  registrations wires it at most once per module instance. */
+let visibilityListenerWired = false;
+
+/** #592: platform-agnostic on purpose, matching this file's existing no-Capacitor-dependency
+ *  design (see the file header) — `document.visibilitychange` already answers "resumed" on
+ *  every shell this runs in (a browser tab, and a Capacitor WebView backgrounding/foregrounding
+ *  pauses/resumes the same way) without threading `App.addListener('resume', ...)` through an
+ *  otherwise L0 module.
+ *
+ *  Wired LAZILY from `measureSafeAreaInsets`'s first real registration, not at module import
+ *  time — `domGestureTracking.ts`'s header warns against exactly the alternative ("an
+ *  unconditional `addEventListener` at import time would fire in every embedding context that
+ *  imports this module, wanted or not"). `resetSafeAreaInsets` removes it, for the same
+ *  test-isolation reason it tears down every other piece of this module's state; the
+ *  `import.meta.hot.dispose` below (mirroring `editor/store/canvas2DDirty.ts`'s own HMR
+ *  cleanup, and already an established pattern in shipped `runtime/**` code — see
+ *  `rendering/postfx/PostFXStack.ts`) is what actually stops a Vite HMR re-evaluation of this
+ *  module from leaving the OLD instance's listener on `document` forever (found in review,
+ *  #592 follow-up: lazy wiring alone only changes WHEN the first listener is added, not
+ *  whether an old one survives a hot reload). Stripped by Vite in a production build, so this
+ *  is a dev-only no-op there, never a runtime dependency. */
+function wireVisibilityResume(): void {
+  if (visibilityListenerWired) return;
+  if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+  document.addEventListener('visibilitychange', onVisibilityChange);
+  visibilityListenerWired = true;
+}
+
+function onVisibilityChange(): void {
+  if (document.visibilityState === 'visible') pollArmedUntil = rawNow() + POLL_WINDOW_MS;
+}
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => { resetSafeAreaInsets(); });
+}
+
 /** Read the current insets, re-measuring if the cache has gone stale.
  *
  *  ⚠️ **The refresh is not belt-and-braces — a resize alone MISSES the common Android
@@ -109,54 +173,92 @@ const REFRESH_MS = 250;
  *  SIGNATURE survived a scene reload and matched against already-reset authored state: there
  *  is no signature here, nothing is skipped, and the caller's own per-frame cadence is what
  *  still drives every read — this only moves WHEN the expensive part of one particular read
- *  runs, never whether the read happens. */
+ *  runs, never whether the read happens.
+ *
+ *  ⚠️ **The self-refresh is BOUNDED to a window after a registration/resume, not indefinite
+ *  (#592).** The case it exists for (#273's Android bar-hide) settles once, shortly after
+ *  mount or a resume from background — not continuously for the rest of a play session — so
+ *  polling forever after that point is ongoing forced-layout cost for zero remaining benefit
+ *  (measured: 3-4x/sec continuously, stalling the iPhone 8's touch-scroll compositor, #579
+ *  follow-up). Past `pollArmedUntil` this returns the last-measured value without scheduling
+ *  another refresh; an external `measureSafeAreaInsets` registration and a `visibilitychange`
+ *  resume both re-arm it. **The refresh below must re-measure through `applyMeasurement`, not
+ *  `measureSafeAreaInsets`** — the public entry point re-arms the window, and calling it from
+ *  here would make every self-refresh extend its own window, so the poll would never actually
+ *  stop (the bug this section exists to prevent, caught in review). */
 export function getSafeAreaInsets(): SafeAreaInsets {
-  if (root && rawNow() - lastMeasuredAt > REFRESH_MS && !refreshQueued) {
-    // ⚠️ A DETACHED root must not be measured. `UIRenderer`'s callback ref returns early on
-    // unmount (it has other teardown to skip), so it never hands this module a null — the
-    // reference here simply goes stale, still pointing at a removed node. `getComputedStyle`
-    // on one answers empty strings and `clientHeight` 0, so the refresh would quietly rewrite
-    // every inset to ZERO and the layout would jump with no device change.
-    //
-    // Reachable two ways: in the editor both viewports mount a UIRenderer, so closing the one
-    // that registered last detaches this root while the other is still on screen; in a shipped
-    // game the tree empties for a beat across a scene swap. Keeping the LAST GOOD value is the
-    // right answer either way — a device's insets do not change because some UI unmounted.
-    if (root.isConnected) {
-      refreshQueued = true;
-      const target = root;
-      refreshFrameId = requestAnimationFrame(() => {
-        refreshQueued = false;
-        refreshFrameId = null;
-        // ⚠️ A NEWER registration may have replaced `root` since this was scheduled (the
-        // editor's two-viewport case, above) — found in review (#579 follow-up). An identity
-        // check against the captured reference, not a generation counter: the thing that gets
-        // replaced here is the root itself, not a version of it (docs/async-lifetime.md's
-        // "Identity against a captured reference" row). Without it, a stale `target` that is
-        // still connected re-points `root` BACK to itself (undoing the newer registration), and
-        // a stale `target` that got disconnected nulls out whatever the newer registration set —
-        // both are the same bug: acting on behalf of a registration this callback no longer
-        // speaks for.
-        if (root !== target) return;
-        if (target.isConnected) measureSafeAreaInsets(target);
-        else root = null;
-      });
-    } else {
-      root = null;
-    }
+  // ⚠️ A DETACHED root must not be measured, and this cleanup runs UNCONDITIONALLY — never
+  // gated by the poll window below (found in review, #592 follow-up). `root.isConnected` is a
+  // cheap DOM flag read, not a forced layout, so there is no cost reason to skip it once the
+  // window has closed; skipping it left a detached root (and the whole DOM subtree it drags
+  // with it) referenced by this module forever once the window elapsed with no further
+  // registration — e.g. a scene swap to a UI-less scene more than `POLL_WINDOW_MS` after the
+  // last registration used to release the old root on the very next read; now it wouldn't,
+  // without this branch running independently of whether a refresh may also be scheduled.
+  //
+  // `UIRenderer`'s callback ref returns early on unmount (it has other teardown to skip), so it
+  // never hands this module a null — the reference here simply goes stale, still pointing at a
+  // removed node. `getComputedStyle` on one answers empty strings and `clientHeight` 0, so
+  // measuring it would quietly rewrite every inset to ZERO with no device change. Reachable two
+  // ways: in the editor both viewports mount a UIRenderer, so closing the one that registered
+  // last detaches this root while the other is still on screen; in a shipped game the tree
+  // empties for a beat across a scene swap. Keeping the LAST GOOD value is the right answer
+  // either way — a device's insets do not change because some UI unmounted.
+  if (root && !root.isConnected) {
+    root = null;
+  } else if (root && rawNow() - lastMeasuredAt > REFRESH_MS && !refreshQueued && rawNow() < pollArmedUntil) {
+    refreshQueued = true;
+    const target = root;
+    refreshFrameId = requestAnimationFrame(() => {
+      refreshQueued = false;
+      refreshFrameId = null;
+      // ⚠️ A NEWER registration may have replaced `root` since this was scheduled (the
+      // editor's two-viewport case, above) — found in review (#579 follow-up). An identity
+      // check against the captured reference, not a generation counter: the thing that gets
+      // replaced here is the root itself, not a version of it (docs/async-lifetime.md's
+      // "Identity against a captured reference" row). Without it, a stale `target` that is
+      // still connected re-points `root` BACK to itself (undoing the newer registration), and
+      // a stale `target` that got disconnected nulls out whatever the newer registration set —
+      // both are the same bug: acting on behalf of a registration this callback no longer
+      // speaks for.
+      if (root !== target) return;
+      // ⚠️ `applyMeasurement`, NOT `measureSafeAreaInsets` — see `pollArmedUntil`'s own doc
+      // (#592). This is the self-refresh re-measuring itself, not a new registration; calling
+      // the arming entry point here would re-open the poll window on every refresh and the
+      // window would never close.
+      if (target.isConnected) applyMeasurement(target);
+      else root = null;
+    });
   }
   return insets;
 }
 
 /** Measure the insets from `root`'s cascade and cache them. Called by UIRenderer; not
- *  part of the game-facing surface.
+ *  part of the game-facing surface. This is the EXTERNAL registration entry point — a real
+ *  mount, resize, or scene-swap fresh root — as opposed to the self-refresh's own re-measure
+ *  (`applyMeasurement`, below), which must not be confused with a registration (#592, see
+ *  `pollArmedUntil`'s doc for why that distinction is load-bearing). */
+export function measureSafeAreaInsets(el: HTMLElement | null): void {
+  // #592: a real registration re-arms the bounded self-refresh window (see `POLL_WINDOW_MS`) —
+  // this is the "mount" signal alongside `visibilitychange`'s "resume" one. `el === null` (a
+  // detach) arms nothing new; there is no root left to poll. Wiring the resume listener here
+  // (rather than at module load) means it activates only once something has actually
+  // registered a root, not merely because this module was imported.
+  if (el) { pollArmedUntil = rawNow() + POLL_WINDOW_MS; wireVisibilityResume(); }
+  applyMeasurement(el);
+}
+
+/** The measurement itself, shared by `measureSafeAreaInsets` (above, which arms the poll
+ *  window first) and the self-refresh's deferred rAF callback (`getSafeAreaInsets`, which
+ *  must NOT arm it — see `pollArmedUntil`'s doc, #592). Not exported: every external caller
+ *  goes through `measureSafeAreaInsets`.
  *
  *  Measures a hidden probe rather than reading the `--ui-sa-*` custom properties
  *  directly, for two reasons: a custom property resolves to the literal token (`"68px"`
  *  or, on device, nothing at all — the var is unset and only the `env()` fallback
  *  applies), and only laying it out as a real length makes the browser resolve the
  *  fallback chain. `padding` also clamps negatives to 0 for free. */
-export function measureSafeAreaInsets(el: HTMLElement | null): void {
+function applyMeasurement(el: HTMLElement | null): void {
   root = el;
   lastMeasuredAt = rawNow();
   if (!el || typeof getComputedStyle !== 'function') { insets = { ...ZERO }; return; }
@@ -221,9 +323,16 @@ export function resetSafeAreaInsets(): void {
   insets = { ...ZERO };
   root = null;
   lastMeasuredAt = -Infinity;
+  pollArmedUntil = -Infinity;
   // A refresh scheduled by a torn-down session must not fire against whatever registers next —
   // cancel the real callback, not just the flag that gates scheduling a new one (found in
   // review, #579 follow-up).
   if (refreshFrameId !== null) { cancelAnimationFrame(refreshFrameId); refreshFrameId = null; }
   refreshQueued = false;
+  // #592: undo `wireVisibilityResume` too, so a fresh test/session re-wires its own listener
+  // rather than accumulating one per registration across a shared module registry.
+  if (visibilityListenerWired && typeof document !== 'undefined') {
+    document.removeEventListener('visibilitychange', onVisibilityChange);
+  }
+  visibilityListenerWired = false;
 }

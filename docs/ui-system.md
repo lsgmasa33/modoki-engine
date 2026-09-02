@@ -521,6 +521,20 @@ A **detached** root is skipped rather than measured: a removed node answers empt
 and `clientHeight` 0, so refreshing off one would silently zero every inset when a viewport
 unmounts.
 
+⚠️ **The self-refresh is BOUNDED to a short window after a mount/resume, not indefinite (#592).**
+The Android transition it exists for settles once, shortly after the signal — not continuously for
+the rest of a play session — so `safeArea.ts` arms a `POLL_WINDOW_MS` (5s) window on every EXTERNAL
+registration (`measureSafeAreaInsets` — a mount, a resize) and on a `visibilitychange` resume, and
+stops scheduling further refreshes once it elapses (the last-measured value keeps being returned).
+⚠️ **The self-refresh's OWN re-measure deliberately does NOT re-arm the window** — an early version
+of the fix called the same arming entry point from inside the deferred refresh, which re-opened the
+window on every refresh and left the poll running at its original rate forever (caught in review,
+before this landed); the internal re-measure goes through a separate, non-arming path. Platform-
+agnostic on purpose — it listens for the DOM `visibilitychange` event rather than threading
+Capacitor's `App.addListener('resume', ...)` through this otherwise Capacitor-free, L0-ish module,
+and it wires that listener lazily (on the first real registration, at most once per module
+instance, removed by `resetSafeAreaInsets`) rather than unconditionally at import time.
+
 ⚠️ **The preset numbers are mostly PUBLISHED, not measured**, and they model the
 **physical** insets — the notch/Dynamic Island and the home indicator, i.e. what a
 full-screen game sees with the status bar hidden. A device with no notch reports 0 there

@@ -1603,23 +1603,51 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
 
   **On DEVICE it read the wrong buffer entirely, and the window was never what hid boot errors
   (#157).** There are two console rings — `bridge.ts`'s `consoleRing` (populated on device by
-  `patchConsole()`) and `agentBridge.ts`'s `consoleBuffer` (populated in the editor by
-  `installConsoleCapture()`) — and `diagnose` read the second. That call sits *after*
-  `initAgentBridge()`'s `if (!hot && !bridge) return;`, and a shipped build has no
-  `import.meta.hot` while a phone has no Electron bridge, so on every real device the buffer stayed
-  empty for the life of the process. Measured on a Samsung SM-S901U1: the ring held 5 errors
-  including a `[frameDriver]` stall, and `device_diagnose` answered `ok:true, consoleErrors:0,
-  "No issues detected."` A clean device diagnose was **structurally guaranteed, not observed** — on
-  the one surface CLAUDE.md tells you to run it first, because the Android screenshot is black on
-  WebGPU. The writer now publishes its ring through `app/debug/consoleSource.ts` and the reader asks
-  for it, preferring its own buffer whenever `consoleHooked` (so the editor path is unchanged).
-  Deliberately a seam and NOT a second `installConsoleCapture()`: hoisting that call would patch
-  `console.*` twice on device and carry a second copy of every line, on exactly the low-end hardware
-  whose frame budget is #154. Two things fixed alongside it, both required before a device boot error
-  is actually *readable*: the device now captures `[uncaught]` errors and `[unhandledrejection]`s
-  (those listeners lived only in the skipped block, so a failed dynamic import or a throw in scene
-  loading was silent), and `safeStringify` no longer renders an `Error` as `{}` — `console.error(err)`
-  is the usual way to report a failure, and it was reaching `diagnose` as an empty object.
+  `installDeviceConsoleCapture()`, in `app/debug/deviceConsoleCapture.ts`) and `agentBridge.ts`'s
+  `consoleBuffer` (populated in the editor by its own, identically-shaped `installConsoleCapture()`)
+  — and `diagnose` read the second. That call sits *after* `initAgentBridge()`'s `if (!hot &&
+  !bridge) return;`, and a shipped build has no `import.meta.hot` while a phone has no Electron
+  bridge, so on every real device the buffer stayed empty for the life of the process. Measured on a
+  Samsung SM-S901U1: the ring held 5 errors including a `[frameDriver]` stall, and `device_diagnose`
+  answered `ok:true, consoleErrors:0, "No issues detected."` A clean device diagnose was
+  **structurally guaranteed, not observed** — on the one surface CLAUDE.md tells you to run it
+  first, because the Android screenshot is black on WebGPU. The writer now publishes its ring
+  through `app/debug/consoleSource.ts` and the reader asks for it, preferring its own buffer
+  whenever `consoleHooked` (so the editor path is unchanged). Deliberately a seam and NOT a second
+  `installConsoleCapture()`: hoisting that call would patch `console.*` twice on device and carry a
+  second copy of every line, on exactly the low-end hardware whose frame budget is #154. Two things
+  fixed alongside it, both required before a device boot error is actually *readable*: the device
+  now captures `[uncaught]` errors and `[unhandledrejection]`s (those listeners lived only in the
+  skipped block, so a failed dynamic import or a throw in scene loading was silent), and
+  `safeStringify` no longer renders an `Error` as `{}` — `console.error(err)` is the usual way to
+  report a failure, and it was reaching `diagnose` as an empty object.
+
+  **The device ring's install itself used to race App.tsx's mount (#591), fixed since.**
+  `installDeviceConsoleCapture()` used to be reachable only through `initDebugBridge()`, behind
+  `main.tsx`'s ASYNC dynamic `import('./debug/bridge')` — React could mount, and run its own mount
+  effects, before that chunk was guaranteed to have resolved, so whether a boot-time log was
+  captured depended on chunk-load speed (the same build caught it on an iPad mini 5 and missed it on
+  a Galaxy S22). `main.tsx` now installs it EAGERLY, from a side-effect import
+  (`./installDeviceConsoleCapture`) placed above `./App.tsx`, so it runs before React's mount effects
+  deterministically rather than racing them — a mount-time line is captured on every launch now, so
+  its absence is finally evidence of something rather than a coin flip. Device-verified on a Galaxy
+  S22 (2026-09-03) with a TEMPORARY probe line added to the installer for the measurement — the
+  shipped build logs nothing at install time, so do not expect a `[console-capture]` line in a real
+  ring and do not read its absence as the install having failed.
+  ⚠️ **It does NOT reach a module-eval log inside App.tsx's graph** — measured on the same run, and
+  the reason is bundling, not source order: rolldown emits the installer in a shared chunk the entry
+  imports after chunks from App.tsx's own graph. The very first lines of a boot still belong to
+  `device_native_logs` (logcat/OSLog), not to this ring.
+
+  **The bridge's OWN `[debug-bridge]` chatter is deliberately NOT in this ring**, and that is load-
+  bearing rather than tidiness: one line per `device_tap`/`drag`/`pointer`/`press_key`/`type_text`
+  would let ~200 input ops evict the entire 200-entry ring — the tool doing the reading would erase
+  what you came to read. `bridge.ts`'s `_log` therefore goes through `unpatchedLog` (a pristine
+  `console.log` bound before the patch) and reaches logcat/OSLog only; `_err` stays on live
+  `console.error` on purpose, so bridge FAILURES do land in the ring. Verified on a Galaxy A23
+  (2026-09-03): zero `[debug-bridge]` lines in the ring, app logs all present. ⚠️ This broke once
+  already — the #591 eager install inverted the binding order and put the chatter IN the ring, which
+  read as success in the first device measurement. `deviceConsoleCaptureInstallOrder.test.ts` pins it.
 - **Console:** `modoki_get_console_logs` returns the **last 50** plus three numbers that do NOT mean the
   same thing: `count` (what came back), `total` (what matched `level=`/`since=`), and
   `ringTotal`+`byLevel` (the WHOLE 500-entry ring, regardless of the filter). That last part is the

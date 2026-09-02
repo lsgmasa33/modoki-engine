@@ -9,7 +9,19 @@ import './index.css'
 // and it must stay ABOVE `./App.tsx`: imports are hoisted and evaluated in source order before any
 // statement below runs, so calling the installer as main.tsx's first statement would still let
 // App.tsx's whole module graph execute uncovered. See ./installErrorCapture.ts.
+// ⚠️ Kept ABOVE the device console capture below, deliberately: `installGlobalErrorHandlers`'
+// contract (runtime/core/globalErrors.ts) is "call it early, BEFORE anything else touches
+// console.warn", so it takes the inner position and the device ring wraps outside it. #591 briefly
+// had these the other way round, which inverted a nesting the engine documents as intentional.
 import './installErrorCapture'
+// Device console capture (#591). A SIDE-EFFECT import, and it must stay ABOVE `./App.tsx` for the
+// same reason the one above does: imports evaluate before any statement below runs, so this is what
+// captures React's mount effects — the case #591 filed. A call in this file's own body would be too
+// late (it runs after every import), and the debug bridge's own dynamic import below is later still
+// and RACY — the same build captured a mount-time log on one device and not another depending on how
+// fast that chunk happened to load. It does NOT reach a module-eval log inside App.tsx's graph
+// (chunking reorders that; device-measured). See ./installDeviceConsoleCapture.ts.
+import './installDeviceConsoleCapture'
 import App from './App.tsx'
 import { Capacitor } from '@capacitor/core'
 import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, setTierFrameCapEnabled, setTierCalibrationEnabled, setBootProbeAllowed, readPerfProfile, setProfilerEnabled } from '@modoki/engine/runtime'
