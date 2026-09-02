@@ -3287,7 +3287,11 @@ async function describeUnresolvedAgainstLiveWorld(
     const name = query.get('name') || 'default';
     if (!OTA_SAFE_TOKEN.test(name)) return json({ ok: false, error: `name must match ${OTA_SAFE_TOKEN}` }, 400);
     try {
-      const out = execFileSync('node', ['engine/scripts/ota-keygen.mjs', name], { cwd: ctx.editorRoot || ctx.projectRoot, encoding: 'utf8' });
+      // `--repo-root` explicitly, the SAME expression `/api/ota/keys` above reads back with —
+      // before this, the two agreed only because this call happened to invoke the script by a
+      // cwd-relative path (`cwd` set, no `--repo-root`), which desyncs the moment either side's
+      // path resolution changes (#582's "Related" finding).
+      const out = execFileSync('node', ['engine/scripts/ota-keygen.mjs', name, '--repo-root', ctx.editorRoot || ctx.projectRoot], { cwd: ctx.editorRoot || ctx.projectRoot, encoding: 'utf8' });
       const publicKey = out.match(/^\s*(\S+)\s*$/m)?.[1] ?? null;
       return json({ ok: true, name, publicKey, log: out });
     } catch (e) {

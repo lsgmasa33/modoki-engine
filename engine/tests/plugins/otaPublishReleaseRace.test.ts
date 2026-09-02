@@ -14,6 +14,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { execFileSync, spawnSync } from 'child_process';
+import { mergeProjectConfig, pruneProjectConfig, DEFAULT_PROJECT_CONFIG, type RawProjectConfig } from '../../project-config';
 
 const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -119,6 +120,23 @@ process.stderr.write('fake gcloud: unhandled command ' + argv.join(' ') + '\\n')
 process.exit(1);
 `;
 
+/** Reads the public half of a keypair written by ota-keygen.mjs (or writeKeyPair below). */
+function readKeyPublicKey(rootDir: string, name = 'default'): string {
+  return (JSON.parse(fs.readFileSync(path.join(rootDir, 'build', 'ota-keys', `${name}.json`), 'utf8')) as { publicKey: string }).publicKey;
+}
+
+/** Writes a scratch project.config.json with just an `ota` block — everything these tests'
+ *  guards read. `projectDir` is an ABSOLUTE path (never relative to a `--repo-root` a test
+ *  might override), so a test that changes `--repo-root` doesn't accidentally relocate where
+ *  the project config is looked for. */
+function writeProjectConfig(projectDir: string, ota: { enabled?: boolean; baseUrl?: string; publicKey?: string; bundleName: string; engineApi?: number }): string {
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({
+    ota: { enabled: true, baseUrl: '', engineApi: 1, ...ota },
+  }));
+  return projectDir;
+}
+
 function runNode(cwd: string, env: NodeJS.ProcessEnv, args: string[]): { status: number; stdout: string; stderr: string } {
   // spawnSync, not execFileSync — execFileSync throws (and its catch-block-only branch
   // above USED to discard stderr on every SUCCESSFUL run, returning '' regardless of what
@@ -172,7 +190,35 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     fs.rmSync(distDir, { recursive: true, force: true });
   });
 
-  function publish(name: string, version: string, envOverrides: NodeJS.ProcessEnv = {}, extraArgs: string[] = []) {
+  // `--project` defaults to a scratch project KEYED BY NAME (`games/testproj-<name>`), whose
+  // `ota.bundleName` is written to equal that same `name` and whose `ota.publicKey` is the
+  // just-generated signing key's public half — so every EXISTING call in this file (which
+  // uses "shell"/"sling" as two arbitrary bundle names to exercise release.json merge
+  // mechanics, not real sub-game semantics) keeps satisfying #582's new identity guards
+  // automatically, with no per-test config to hand-maintain. Pass `projectOverride: null` to
+  // omit --project entirely, or a path/ota-block to test the guards themselves.
+  function publish(
+    name: string, version: string, envOverrides: NodeJS.ProcessEnv = {}, extraArgs: string[] = [],
+    projectOverride?: string | null,
+  ) {
+    let projectArgs: string[] = [];
+    if (projectOverride !== null) {
+      const projectDir = projectOverride ?? path.join(repoRoot, 'games', `testproj-${name}`);
+      if (!fs.existsSync(path.join(projectDir, 'project.config.json'))) {
+        // The signing key this call will actually resolve lives under whichever repo root the
+        // script ends up using — the test's own `repoRoot` by default, or an overridden
+        // `--repo-root` in extraArgs (several tests here point key resolution elsewhere). If
+        // no key exists there yet (a test deliberately pointing --repo-root somewhere with NO
+        // key), the script's own key-existence check fails before ever consulting this
+        // project's publicKey — so a placeholder is fine in that case.
+        const repoRootFlagIdx = extraArgs.indexOf('--repo-root');
+        const effectiveKeyRoot = repoRootFlagIdx >= 0 ? extraArgs[repoRootFlagIdx + 1] : repoRoot;
+        let publicKey = 'placeholder-no-key-at-effective-root';
+        try { publicKey = readKeyPublicKey(effectiveKeyRoot); } catch { /* see comment above */ }
+        writeProjectConfig(projectDir, { bundleName: name, publicKey });
+      }
+      projectArgs = ['--project', projectDir];
+    }
     return runNode(repoRoot, {
       ...process.env,
       PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
@@ -183,6 +229,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
       'engine/scripts/ota-publish.mjs',
       '--dist', distDir, '--bucket', 'gs://fakebucket/testprefix',
       '--name', name, '--version', version, '--engine-api', '1', '--key', 'default',
+      ...projectArgs,
       ...extraArgs,
     ]);
   }
@@ -423,6 +470,10 @@ describe('ota-publish.mjs mandatory stickiness', () => {
   });
 
   function publish(version: string, extraArgs: string[] = [], engineApi = '1') {
+    const projectDir = path.join(repoRoot, 'games', 'testproj-shell');
+    if (!fs.existsSync(path.join(projectDir, 'project.config.json'))) {
+      writeProjectConfig(projectDir, { bundleName: 'shell', publicKey: readKeyPublicKey(repoRoot) });
+    }
     return runNode(repoRoot, {
       ...process.env,
       PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
@@ -431,6 +482,7 @@ describe('ota-publish.mjs mandatory stickiness', () => {
       'engine/scripts/ota-publish.mjs',
       '--dist', distDir, '--bucket', 'gs://fakebucket/testprefix',
       '--name', 'shell', '--version', version, '--engine-api', engineApi, '--key', 'default',
+      '--project', projectDir,
       ...extraArgs,
     ]);
   }
@@ -472,7 +524,10 @@ describe('ota-publish.mjs mandatory stickiness', () => {
     const first = publish('v1', ['--mandatory'], '1');
     expect(first.status).toBe(0);
 
-    // A second bundle name published alongside, at a HIGHER engine-api, with neither flag.
+    // A second bundle name published alongside, at a HIGHER engine-api, with neither flag —
+    // its own scratch project (bundleName "sling"), matching this "sling" --name.
+    const slingProjectDir = path.join(repoRoot, 'games', 'testproj-sling');
+    writeProjectConfig(slingProjectDir, { bundleName: 'sling', publicKey: readKeyPublicKey(repoRoot) });
     const second = runNode(repoRoot, {
       ...process.env,
       PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
@@ -481,6 +536,7 @@ describe('ota-publish.mjs mandatory stickiness', () => {
       'engine/scripts/ota-publish.mjs',
       '--dist', distDir, '--bucket', 'gs://fakebucket/testprefix',
       '--name', 'sling', '--version', 'v1', '--engine-api', '2', '--key', 'default',
+      '--project', slingProjectDir,
     ]);
     expect(second.status).toBe(0);
 
@@ -538,7 +594,13 @@ describe('ota-publish.mjs version-collision guard', () => {
     fs.rmSync(distDir, { recursive: true, force: true });
   });
 
+  // Same name-keyed scratch-project default as the race-condition describe above (this block
+  // also publishes both "shell" and "sling" as arbitrary bundle-name test doubles).
   function publish(name: string, version: string, envOverrides: NodeJS.ProcessEnv = {}) {
+    const projectDir = path.join(repoRoot, 'games', `testproj-${name}`);
+    if (!fs.existsSync(path.join(projectDir, 'project.config.json'))) {
+      writeProjectConfig(projectDir, { bundleName: name, publicKey: readKeyPublicKey(repoRoot) });
+    }
     return runNode(repoRoot, {
       ...process.env,
       PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
@@ -548,6 +610,7 @@ describe('ota-publish.mjs version-collision guard', () => {
       'engine/scripts/ota-publish.mjs',
       '--dist', distDir, '--bucket', 'gs://fakebucket/testprefix',
       '--name', name, '--version', version, '--engine-api', '1', '--key', 'default',
+      '--project', projectDir,
     ]);
   }
 
@@ -609,5 +672,199 @@ describe('ota-publish.mjs version-collision guard', () => {
     const result = publish('sling', 'v1');
     expect(result.status).toBe(0);
     expect(result.stderr).toMatch(/WARNING: manifest verification is NOT enabled for: shell/);
+  });
+});
+
+/** #582: ota-publish.mjs's own publish-identity guards — the by-hand path the editor's
+ *  `/api/ota/publish` route's refusal message sends a human to (a sub-game publish) used to
+ *  have NEITHER the signing-key guard nor a dist-kind guard the route itself enforces. Reuses
+ *  the same fake-gcloud harness (FAKE_GCLOUD_SRC + runNode are module-scoped above). */
+describe('ota-publish.mjs publish-identity guards (#582)', () => {
+  let repoRoot: string;
+  let binDir: string;
+  let bucketDir: string;
+  let distDir: string;
+  let projectDir: string;
+  let realPublicKey: string;
+
+  beforeEach(() => {
+    repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-repo-'));
+    fs.mkdirSync(path.join(repoRoot, 'engine', 'scripts'), { recursive: true });
+    fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
+    fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
+
+    binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-guards-'));
+    if (process.platform === 'win32') {
+      fs.writeFileSync(path.join(binDir, 'gcloud.cjs'), FAKE_GCLOUD_SRC);
+      fs.writeFileSync(path.join(binDir, 'gcloud.cmd'), `@node "%~dp0gcloud.cjs" %*\r\n`);
+    } else {
+      const gcloudPath = path.join(binDir, 'gcloud');
+      fs.writeFileSync(gcloudPath, FAKE_GCLOUD_SRC);
+      fs.chmodSync(gcloudPath, 0o755);
+    }
+
+    bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-guards-'));
+    distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-dist-'));
+    fs.writeFileSync(path.join(distDir, 'index.html'), '<html>guards-test</html>');
+
+    const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+    realPublicKey = readKeyPublicKey(repoRoot);
+
+    projectDir = path.join(repoRoot, 'games', 'testproj');
+    writeProjectConfig(projectDir, { bundleName: 'shell', publicKey: realPublicKey });
+  });
+
+  afterEach(() => {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+    fs.rmSync(binDir, { recursive: true, force: true });
+    fs.rmSync(bucketDir, { recursive: true, force: true });
+    fs.rmSync(distDir, { recursive: true, force: true });
+  });
+
+  /** Bucket dir starts empty (mkdtempSync); any successful gcloud write creates
+   *  `<bucketDir>/fakebucket/...` — so its absence proves nothing reached the bucket. */
+  function bucketIsEmpty(): boolean {
+    return !fs.existsSync(path.join(bucketDir, 'fakebucket'));
+  }
+
+  function publish(name: string, extraArgs: string[] = [], dist = distDir) {
+    return runNode(repoRoot, {
+      ...process.env,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+      FAKE_GCS_BUCKET_DIR: bucketDir,
+    }, [
+      'engine/scripts/ota-publish.mjs',
+      '--dist', dist, '--bucket', 'gs://fakebucket/testprefix',
+      '--name', name, '--version', 'v1', '--engine-api', '1', '--key', 'default',
+      ...extraArgs,
+    ]);
+  }
+
+  it('a) omitting --project exits non-zero and touches nothing in the bucket', () => {
+    const result = publish('shell');
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/--project is required/);
+    expect(bucketIsEmpty()).toBe(true);
+  });
+
+  it('b) a --project whose project.config.json does not exist exits non-zero with a distinct message', () => {
+    const missingProjectDir = path.join(repoRoot, 'games', 'nope');
+    const result = publish('shell', ['--project', missingProjectDir]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/project\.config\.json not found/);
+    expect(bucketIsEmpty()).toBe(true);
+  });
+
+  it('b-bis) an ota block with NO bundleName key (what pruneProjectConfig actually writes for the ' +
+    'placeholder default) publishes successfully under --name shell — the regression case', () => {
+    // Build the fixture through the repo's OWN writer, not by hand — this is the seam the
+    // regression hid in. This is exactly what `/api/project-settings` does
+    // (editorBackendRouter.ts): merge a patch onto the resolved config, then PRUNE it against
+    // the pre-edit on-disk file + DEFAULT_PROJECT_CONFIG. `DEFAULT_PROJECT_CONFIG.ota.bundleName`
+    // is "shell", and the on-disk file below never had an `ota` key at all, so pruning a
+    // resolved config whose bundleName is left at that same default omits the key entirely —
+    // an absent `bundleName` means "the default", not "malformed".
+    const noNameDir = path.join(repoRoot, 'games', 'testproj-no-bundlename');
+    fs.mkdirSync(noNameDir, { recursive: true });
+    const onDisk = {} as RawProjectConfig; // no `ota` key at all before this "save"
+    const resolved = mergeProjectConfig({
+      ota: { enabled: true, baseUrl: 'https://storage.googleapis.com/fakebucket/testprefix', publicKey: realPublicKey, bundleName: 'shell', engineApi: 1 },
+    });
+    const pruned = pruneProjectConfig(resolved as unknown as RawProjectConfig, onDisk, DEFAULT_PROJECT_CONFIG as unknown as RawProjectConfig);
+    fs.writeFileSync(path.join(noNameDir, 'project.config.json'), JSON.stringify(pruned));
+
+    // Prove the fixture actually exercises the regression: the written file must genuinely
+    // have no `ota.bundleName` key, or this test proves nothing if prune's behavior ever changes.
+    const writtenOta = (pruned as { ota?: Record<string, unknown> }).ota;
+    expect(writtenOta).toBeDefined();
+    expect(Object.prototype.hasOwnProperty.call(writtenOta, 'bundleName')).toBe(false);
+
+    const result = publish('shell', ['--project', noNameDir]);
+    expect(result.status).toBe(0);
+  });
+
+  it('b-ter) an ota.bundleName PRESENT but malformed (not a non-empty string) is refused with the config-defect message', () => {
+    const badNameDir = path.join(repoRoot, 'games', 'testproj-bad-bundlename');
+    writeProjectConfig(badNameDir, { bundleName: 42 as unknown as string, publicKey: realPublicKey });
+    const result = publish('shell', ['--project', badNameDir]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/ota\.bundleName is present but not a non-empty string/);
+    expect(bucketIsEmpty()).toBe(true);
+  });
+
+  it('h) ota.enabled explicitly false refuses before any upload', () => {
+    const disabledDir = path.join(repoRoot, 'games', 'testproj-disabled');
+    writeProjectConfig(disabledDir, { enabled: false, bundleName: 'shell', publicKey: realPublicKey });
+    const result = publish('shell', ['--project', disabledDir]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/ota\.enabled is not true/);
+    expect(bucketIsEmpty()).toBe(true);
+  });
+
+  it('i) ota.enabled ABSENT (defaults to false) also refuses before any upload', () => {
+    const noEnabledDir = path.join(repoRoot, 'games', 'testproj-no-enabled');
+    fs.mkdirSync(noEnabledDir, { recursive: true });
+    fs.writeFileSync(path.join(noEnabledDir, 'project.config.json'), JSON.stringify({ ota: { bundleName: 'shell', publicKey: realPublicKey } }));
+    const result = publish('shell', ['--project', noEnabledDir]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/ota\.enabled is not true/);
+    expect(bucketIsEmpty()).toBe(true);
+  });
+
+  it('c) an ota.publicKey that does NOT match the signing key refuses before any upload', () => {
+    const mismatchProjectDir = path.join(repoRoot, 'games', 'testproj-mismatch');
+    writeProjectConfig(mismatchProjectDir, { bundleName: 'shell', publicKey: 'not-the-real-key' });
+    const result = publish('shell', ['--project', mismatchProjectDir]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/does NOT match/);
+    expect(bucketIsEmpty()).toBe(true);
+  });
+
+  it('d) an empty ota.publicKey refuses with the project-public-key-empty message', () => {
+    const emptyKeyProjectDir = path.join(repoRoot, 'games', 'testproj-empty-key');
+    writeProjectConfig(emptyKeyProjectDir, { bundleName: 'shell', publicKey: '' });
+    const result = publish('shell', ['--project', emptyKeyProjectDir]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/ota\.publicKey is EMPTY/);
+    expect(bucketIsEmpty()).toBe(true);
+  });
+
+  it('e) --name subgame-x with a plain dist (no subgame.json) is refused', () => {
+    const result = publish('subgame-x', ['--project', projectDir]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/does not match/);
+    expect(bucketIsEmpty()).toBe(true);
+  });
+
+  it('f) --name subgame-x with a real subgame-dist (subgame.json present) publishes successfully — ' +
+    'a verbatim port of the route\'s equality guard would have wrongly refused this', () => {
+    const subgameDistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-subgame-dist-'));
+    try {
+      fs.writeFileSync(path.join(subgameDistDir, 'index.html'), '<html>subgame</html>');
+      fs.writeFileSync(path.join(subgameDistDir, 'subgame.json'), JSON.stringify({ engineApi: 1 }));
+      const result = publish('subgame-x', ['--project', projectDir], subgameDistDir);
+      expect(result.status).toBe(0);
+      const release = JSON.parse(fs.readFileSync(path.join(bucketDir, 'fakebucket', 'testprefix', 'release.json'), 'utf8'));
+      expect(release.bundles).toEqual({ 'subgame-x': 'v1' });
+    } finally {
+      fs.rmSync(subgameDistDir, { recursive: true, force: true });
+    }
+  });
+
+  it('g) --name shell (matching the project\'s own bundleName) with a subgame-dist is refused', () => {
+    const subgameDistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-subgame-dist-shell-'));
+    try {
+      fs.writeFileSync(path.join(subgameDistDir, 'index.html'), '<html>subgame</html>');
+      fs.writeFileSync(path.join(subgameDistDir, 'subgame.json'), JSON.stringify({ engineApi: 1 }));
+      const result = publish('shell', ['--project', projectDir], subgameDistDir);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/matches.*own ota\.bundleName/);
+      expect(bucketIsEmpty()).toBe(true);
+    } finally {
+      fs.rmSync(subgameDistDir, { recursive: true, force: true });
+    }
   });
 });

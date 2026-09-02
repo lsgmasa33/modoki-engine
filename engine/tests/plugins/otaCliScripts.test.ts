@@ -142,11 +142,53 @@ describe('ota-keygen.mjs', () => {
     const b = JSON.parse(fs.readFileSync(path.join(repoRoot, 'build', 'ota-keys', 'b.json'), 'utf8'));
     expect(a.publicKey).not.toBe(b.publicKey);
   });
+
+  // #582's "Related" finding: `/api/ota/keygen` passes `--repo-root` explicitly now, the same
+  // value `/api/ota/keys` reads back with — before that flag existed the two agreed only
+  // because the route happened to invoke this script by a cwd-relative path. Prove the
+  // override actually takes effect (mirrors the publish-side "--repo-root points key
+  // resolution somewhere else" test in otaPublishReleaseRace.test.ts) rather than being
+  // silently ignored in favor of import.meta.url's own guess.
+  it('--repo-root writes the key under THAT root, not the script\'s own default root', () => {
+    const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-keygen-other-root-'));
+    try {
+      const { status } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['--repo-root', otherRoot]);
+      expect(status).toBe(0);
+      expect(fs.existsSync(path.join(otherRoot, 'build', 'ota-keys', 'default.json'))).toBe(true);
+      // If --repo-root were silently ignored, the key would land at the script's own default
+      // root (the scratch repo it actually lives in) instead.
+      expect(fs.existsSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'))).toBe(false);
+    } finally {
+      fs.rmSync(otherRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('a bare trailing --repo-root fails with a message, not a TypeError stack', () => {
+    const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['--repo-root']);
+    expect(status).toBe(1);
+    expect(stderr).toMatch(/--repo-root requires a directory argument/);
+    expect(stderr).not.toMatch(/TypeError/);
+    // And it wrote nothing anywhere: a flag that decides WHERE the private key lands must not
+    // fall back to the default root when its own value is missing.
+    expect(fs.existsSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'))).toBe(false);
+  });
+
+  it('a positional name plus --repo-root still names the file <name>.json (backward-compatible parsing)', () => {
+    const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-keygen-other-root-named-'));
+    try {
+      const { status } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['prod', '--repo-root', otherRoot]);
+      expect(status).toBe(0);
+      expect(fs.existsSync(path.join(otherRoot, 'build', 'ota-keys', 'prod.json'))).toBe(true);
+    } finally {
+      fs.rmSync(otherRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('ota-embed-manifest.mjs', () => {
   let repoRoot: string;
   let distDir: string;
+  let projectDir: string;
   beforeEach(() => {
     repoRoot = makeScratchRepo();
     distDir = path.join(repoRoot, 'dist');
@@ -154,12 +196,17 @@ describe('ota-embed-manifest.mjs', () => {
     fs.writeFileSync(path.join(distDir, 'index.html'), '<html></html>');
     fs.mkdirSync(path.join(distDir, 'assets'), { recursive: true });
     fs.writeFileSync(path.join(distDir, 'assets', 'app.js'), 'console.log(1);');
+    // #582's sibling guard: `--project <dir>` is required and its `ota.bundleName` must match
+    // `--name`. `distDir` lives at `<repoRoot>/dist`, so a `--project <repoRoot>` keeps it
+    // INSIDE the project for the happy-path cases below.
+    projectDir = repoRoot;
+    fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({ ota: { bundleName: 'shell' } }));
   });
   afterEach(() => fs.rmSync(repoRoot, { recursive: true, force: true }));
 
   it('writes ota-embedded-manifest.json into dist/ with the fixed "embedded" version sentinel', () => {
     const { status } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
-      ['--dist', distDir, '--name', 'shell', '--engine-api', '1']);
+      ['--dist', distDir, '--name', 'shell', '--engine-api', '1', '--project', projectDir]);
     expect(status).toBe(0);
     const manifestPath = path.join(distDir, 'ota-embedded-manifest.json');
     expect(fs.existsSync(manifestPath)).toBe(true);
@@ -172,22 +219,56 @@ describe('ota-embed-manifest.mjs', () => {
 
   it('does NOT include a hash of its own output file (hashes BEFORE writing)', () => {
     runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
-      ['--dist', distDir, '--name', 'shell', '--engine-api', '1']);
+      ['--dist', distDir, '--name', 'shell', '--engine-api', '1', '--project', projectDir]);
     const manifest = JSON.parse(fs.readFileSync(path.join(distDir, 'ota-embedded-manifest.json'), 'utf8'));
     expect(manifest.files['ota-embedded-manifest.json']).toBeUndefined();
   });
 
   it('rejects a non-positive-integer --engine-api', () => {
     const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
-      ['--dist', distDir, '--name', 'shell', '--engine-api', '0']);
+      ['--dist', distDir, '--name', 'shell', '--engine-api', '0', '--project', projectDir]);
     expect(status).not.toBe(0);
     expect(stderr).toMatch(/--engine-api/);
   });
 
   it('rejects a missing --dist directory', () => {
     const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
-      ['--dist', path.join(repoRoot, 'nope'), '--name', 'shell', '--engine-api', '1']);
+      ['--dist', path.join(repoRoot, 'nope'), '--name', 'shell', '--engine-api', '1', '--project', projectDir]);
     expect(status).not.toBe(0);
     expect(stderr).toMatch(/dist dir not found/);
+  });
+
+  it('#582: rejects a missing --project', () => {
+    const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
+      ['--dist', distDir, '--name', 'shell', '--engine-api', '1']);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/--project is required/);
+  });
+
+  it('#582: rejects --name not matching the project\'s resolved bundleName', () => {
+    const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
+      ['--dist', distDir, '--name', 'other', '--engine-api', '1', '--project', projectDir]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/does not match/);
+  });
+
+  it('#582: rejects a --dist outside --project', () => {
+    const outsideDist = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-embed-outside-dist-'));
+    try {
+      fs.writeFileSync(path.join(outsideDist, 'index.html'), '<html></html>');
+      const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
+        ['--dist', outsideDist, '--name', 'shell', '--engine-api', '1', '--project', projectDir]);
+      expect(status).not.toBe(0);
+      expect(stderr).toMatch(/is not inside --project/);
+    } finally {
+      fs.rmSync(outsideDist, { recursive: true, force: true });
+    }
+  });
+
+  it('#582: an absent ota.bundleName resolves to the default ("shell") and succeeds under --name shell', () => {
+    fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({ ota: {} }));
+    const { status } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
+      ['--dist', distDir, '--name', 'shell', '--engine-api', '1', '--project', projectDir]);
+    expect(status).toBe(0);
   });
 });

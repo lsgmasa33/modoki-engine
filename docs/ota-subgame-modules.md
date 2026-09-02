@@ -110,18 +110,32 @@ games/<id>/subgame-dist/
   assets/**             # its own converted assets
 ```
 
-**Publishing needs no tool change to `ota-publish.mjs`** — it already hashes whatever `dist`
-directory it's given, so a sub-game bundle is just another `bundles/<name>` entry with
-`--dist games/<id>/subgame-dist` instead of `--dist games/<id>/dist`. **What is NOT built
-yet: automated end-to-end sub-game publish.** The editor's `Publish OTA Update…` dialog and
-the `/api/ota/publish` route always run `build-web.mjs` (the normal shell build) and always
-publish the currently-open project's own `dist/` — never `build-subgame.mjs`/`subgame-dist/`.
-The route now explicitly refuses a `bundleName` that doesn't match the open project's own
-`ota.bundleName` (rather than silently publishing plain shell content under a different
-bundle's identity — a real bug a code review caught: see ota-updates.md's Gotchas). Publishing
-a sub-game today means running `build-subgame.mjs` + `ota-publish.mjs` by hand, the way
-`games/ota-subgame-test` was verified; wiring that into the editor/route is a real follow-up,
-not done.
+**Publishing a sub-game module is a hand invocation of `ota-publish.mjs`, and it now enforces
+its own identity guards on that dist** (#582) — it already hashes whatever `dist` directory
+it's given, so a sub-game bundle is just another `bundles/<name>` entry with `--dist
+games/<id>/subgame-dist` instead of `--dist games/<id>/dist`, but `--project` is now REQUIRED
+and must point at the **shell project whose app receives the release** (the one that will
+`fetch`/verify it at runtime), e.g.:
+
+```
+node engine/scripts/ota-publish.mjs \
+  --dist games/ota-subgame-test/subgame-dist --bucket gs://modoki-ota/ota-test \
+  --name ota-subgame-test --version v1 --engine-api 1 --key default \
+  --project games/ota-test
+```
+
+The dist must be a REAL `subgame-dist/` (i.e. `build-subgame.mjs`'s output, containing
+`subgame.json`) — the script refuses a plain shell `dist/` published under a sub-game name (see
+ota-updates.md's #582 Gotchas entry for why, and why that guard is not simply the route's
+bundleName-equality check ported over). **What is NOT built yet: automated end-to-end sub-game
+publish.** The editor's `Publish OTA Update…` dialog and the `/api/ota/publish` route always
+run `build-web.mjs` (the normal shell build) and always publish the currently-open project's
+own `dist/` — never `build-subgame.mjs`/`subgame-dist/`. The route explicitly refuses a
+`bundleName` that doesn't match the open project's own `ota.bundleName` (rather than silently
+publishing plain shell content under a different bundle's identity — a real bug a code review
+caught: see ota-updates.md's Gotchas). Publishing a sub-game today means running
+`build-subgame.mjs` + `ota-publish.mjs` by hand, the way `games/ota-subgame-test` was verified;
+wiring that into the editor/route is a real follow-up, not done.
 
 **Asset paths.** The scanner emits root-absolute paths (`/assets/x.png`), which would collide
 across sub-games. `loadManifestJson(json, opts?: {pathPrefix})` in `assetManifest.ts` prefixes

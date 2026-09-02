@@ -33,9 +33,9 @@ quarantined on that device.
 |---|---|
 | `engine/scripts/ota/schema.mjs` | `release.json` / `manifest.json` schemas + `signingPayload` (sorted-key canonical JSON, so a signature is stable regardless of field order) |
 | `engine/scripts/ota/signing.mjs` | Ed25519 via Node's built-in `node:crypto`; keys are raw 32-byte values, base64url via JWK export — so a public key bakes into an app as one string constant |
-| `engine/scripts/ota-publish.mjs` | CLI: hash a `dist/`, upload content-addressed files + `bundle.zip`, merge/re-sign `release.json` |
+| `engine/scripts/ota-publish.mjs` | CLI: hash a `dist/`, upload content-addressed files + `bundle.zip`, merge/re-sign `release.json`. Requires `--project <dir>` (#582) — reads that project's `project.config.json` to enforce the signing-key-identity + dist-kind guards itself |
 | `engine/scripts/ota-keygen.mjs` | CLI: mint a signing keypair (refuses to overwrite — see Gotchas) |
-| `engine/scripts/ota-embed-manifest.mjs` | CLI: write `ota-embedded-manifest.json` into a built `dist/`, enabling delta on a fresh install |
+| `engine/scripts/ota-embed-manifest.mjs` | CLI: write `ota-embedded-manifest.json` into a built `dist/`, enabling delta on a fresh install. Requires `--project <dir>` (#582) — refuses a `--name` that doesn't match the project's resolved `ota.bundleName`, and a `--dist` outside `--project` |
 | `engine/packages/modoki/src/runtime/ota/otaClient.ts` | `checkForUpdate` — fetch, verify, diff, delegate to native. All the trusted decisions |
 | `engine/packages/capacitor-modoki-ota/core/Sources/ModokiOtaCore/OtaCore.swift` | The pure boot/confirm/revert state machine (iOS) — every decision, zero I/O |
 | `.../android/src/main/java/…/OtaCore.java` | The Java port of the same state machine — must behave identically |
@@ -498,10 +498,15 @@ wrapped by a safety-railed pipeline reachable two ways:
 Both surfaces hit `GET /api/ota/publish` (SSE, `engine/plugins/vite-asset-scanner.ts`) which:
 (1) builds **fresh** from the currently-open project's `project.config.json` via
 `build-web.mjs` — never accepts a stale pre-built `dist/`; (2) verifies/sets bucket CORS as a
-non-fatal preflight; (3) runs `ota-publish.mjs`. The route deliberately carries **no
-version-collision guard of its own** — that decision belongs entirely to `ota-publish.mjs`
-(see "Republishing a version string" below, and the #577 Gotchas entry for what happened when
-the route had a second, weaker one). `GET /api/ota/status` and `POST /api/ota/keygen` are plain JSON, served
+non-fatal preflight; (3) runs `ota-publish.mjs --project <projectRoot>`. The route deliberately
+carries **no version-collision guard of its own** — that decision belongs entirely to
+`ota-publish.mjs` (see "Republishing a version string" below, and the #577 Gotchas entry for
+what happened when the route had a second, weaker one). It DOES keep its own early
+signing-key-identity check (`otaSigningKeyRefusal`, imported from
+`engine/scripts/ota/publishGuards.mjs`) as a fast HTTP 400 before the SSE stream opens and the
+multi-minute build starts — but `ota-publish.mjs` enforces the SAME check itself now (#582), so
+the route's copy can never refuse anything the script would allow; see the #582 Gotchas entry.
+`GET /api/ota/status` and `POST /api/ota/keygen` are plain JSON, served
 from the transport-agnostic `editorBackendRouter.ts` so they also work in a packaged Electron
 editor. `engine/plugins/backend/gcloud.ts` holds the shared, Vite-import-free helpers both
 routes need: `resolveGcloudDir` (locates the `gcloud` CLI even in a Finder-launched packaged
@@ -512,7 +517,13 @@ it touches a `bash -c` string).
 
 **This pipeline only ever builds and publishes the shell bundle** — see the Gotchas entry
 below on the bundleName restriction; publishing a sub-game bundle is still a manual
-`build-subgame.mjs` + `ota-publish.mjs` invocation, not wired into the UI/MCP surface.
+`build-subgame.mjs` + `ota-publish.mjs` invocation, not wired into the UI/MCP surface. That
+by-hand path is guarded identically to the route now (#582): `ota-publish.mjs` requires
+`--project <dir>` and reads its `project.config.json` itself to enforce both the signing-key
+guard above and a dist-kind guard (a plain shell `dist/` may only publish under the project's
+own `ota.bundleName`; a `subgame-dist/` — `build-subgame.mjs`'s output — may only publish under
+a DIFFERENT name). See the #582 Gotchas entry for why that guard is not a port of the route's
+`otaPublishBundleNameAllowed`.
 
 **Republishing a version string: identical is fine, different is refused.** `ota-publish.mjs`
 owns this decision — it is the **only** collision guard in the repo, and it decides by CONTENT
@@ -650,6 +661,65 @@ rather than "an upload got partway". `release.json` is still written after every
   resolutions with nothing enforcing they agree. The script now accepts `--repo-root`, and
   the route passes its own `buildCwd` through explicitly, so both sides always resolve the
   signing key from the same value.
+- **The by-hand publish path had neither publish-identity guard** (#582, fixed 2026-09-02).
+  `otaPublishBundleNameAllowed` and `otaSigningKeyRefusal` lived ONLY in the `/api/ota/publish`
+  route — but that route's own refusal message sends a human to `build-subgame.mjs` + a manual
+  `ota-publish.mjs` invocation for exactly the case its bundleName guard blocks (a sub-game
+  publish), and the CLI enforced neither guard. `otaSigningKeyRefusal` moved to
+  `engine/scripts/ota/publishGuards.mjs` and is now imported by BOTH surfaces (the route
+  re-exports it unchanged for its existing callers/tests) — this is NOT another #577 (that
+  duplicate ran a DIFFERENT, weaker decision procedure FIRST and refused a case the real one
+  allowed; this is the identical pure function over the identical inputs, so the route's copy
+  can never refuse anything the script would allow — it stays only for a fast HTTP 400 before
+  the SSE stream). `otaPublishBundleNameAllowed` was deliberately **not** ported — it's a
+  strict equality guard that's correct only because the route always builds a plain shell
+  `dist/`; porting it into the CLI verbatim would refuse the sub-game publish the route sends
+  people here for. `ota-publish.mjs` instead gained a NEW guard, `otaBundleDistKindRefusal`
+  (same module): the dist's KIND (plain shell vs. a `subgame-dist/`, detected by
+  `subgame.json`'s presence) must match the identity it's published under. `--project <dir>` is
+  now a required flag, read for exactly these two checks (never for bucket/version/engine-api,
+  which stay explicit args) — an unreadable/malformed `project.config.json` aborts loudly
+  rather than degrading to "unguarded". `engine/scripts/ota-keygen.mjs` also gained an explicit
+  `--repo-root` (mirroring `ota-publish.mjs`'s own flag), and `/api/ota/keygen` now passes it as
+  `ctx.editorRoot || ctx.projectRoot` — the SAME expression `/api/ota/keys` reads back with —
+  closing a latent desync the two used to avoid only by the route invoking the script with a
+  cwd-relative path.
+  ⚠️ **`otaBundleDistKindRefusal` is weaker than it can sound**: it pins the dist's kind to the
+  SHAPE of the identity (plain shell vs. subgame-dist), not to a SPECIFIC sub-game's identity —
+  `subgame.json` carries no name, and neither the guard nor its caller ever checks that
+  `--dist` belongs to `--project`, so `--dist games/A/subgame-dist --name B` is allowed. Still
+  strictly better than the prior no-guard state, and left that way deliberately: a sub-game
+  publish legitimately pairs a sub-game's own dist with the shell project it's staged from.
+- **The regression the #582 fix itself introduced, plus two siblings** (fixed 2026-09-02).
+  `ota-publish.mjs`'s new `ota.bundleName` check refused a config with the `ota` block PRESENT
+  but no `bundleName` key — but `pruneProjectConfig` (called on every Project Settings save)
+  omits a field equal to its default when the on-disk file didn't already carry that key, and
+  the default `ota.bundleName` IS `"shell"`. So a project that enabled OTA through Project
+  Settings and left the bundle name at its placeholder got a perfectly valid config that this
+  guard nonetheless refused — AFTER the build ran and the bucket's CORS policy was overwritten,
+  blaming a valid config as malformed. Fixed by resolving an absent `bundleName` to
+  `OTA_DEFAULT_BUNDLE_NAME` (a second authored copy of `DEFAULT_PROJECT_CONFIG.ota.bundleName`,
+  since a `.mjs` script can't import the TS module that defines it; a guard test asserts the
+  two stay equal) before the identity checks run, so only a bundleName that is PRESENT but not
+  a non-empty string is treated as a genuine config defect. `publicKey` keeps the opposite
+  treatment on purpose: its default `''` means "unset" and must still refuse.
+  Two siblings found in the same review: (1) `ota-publish.mjs` never checked `ota.enabled` at
+  all, so a hand publish for a project that opted OUT of OTA in Project Settings (the route
+  itself refuses this with a 400) would still write a real, inert `release.json` entry into
+  the shared bucket — fixed with the same `enabled` refusal the route has, `enabled` defaulting
+  to `false` so an absent field correctly means "not enabled" (no default-resolution subtlety
+  there, unlike `bundleName`). (2) `ota-embed-manifest.mjs` had the same route-only-guard shape
+  as the original #582 bug: the route always pairs `--dist <projectRoot>/dist` with
+  `--name cfg.ota.bundleName` from ONE project, but the script itself validated only that
+  `--dist` existed and `--name` was non-empty — mixing project A's dist with project B's name
+  would embed a manifest describing another app's files, silently forcing every OTA check on
+  that install into a whole-zip download forever (the delta path fails against the wrong
+  manifest). Fixed with the same `--project <dir>` + resolved-bundleName-match treatment as
+  `ota-publish.mjs` (importing `OTA_DEFAULT_BUNDLE_NAME`, not re-deriving it), PLUS a
+  containment check (`--dist` must resolve inside `--project`) that `ota-publish.mjs`
+  deliberately does NOT have — a sub-game publish legitimately pairs a sub-game's dist with the
+  shell project it's staged from, but an embedded manifest always describes the shipping app's
+  own dist, so the containment check is valid there and would be wrong here.
 - **A sub-game's script-load ordering race** (fixed 2026-07-26). `subgameLoader.ts` used to
   load every staged sub-game concurrently (`Promise.all`); now sequential — see
   ota-subgame-modules.md §3 for why concurrent loading raced a single shared global.

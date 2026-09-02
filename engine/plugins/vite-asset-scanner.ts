@@ -507,23 +507,11 @@ export function otaPublishBundleNameAllowed(requestedBundleName: string, project
   return requestedBundleName === projectOtaBundleName;
 }
 
-/** Why an OTA publish must be REFUSED on the signing key, or null when the key is usable.
- *
- *  `keyPublicKey` is the public half of `build/ota-keys/<name>.json`; `projectPublicKey` is
- *  `project.config.json` `ota.publicKey`, the value baked into the SHIPPED BINARY and the only key
- *  `verifyReleaseSignature` accepts. The preflight used to check merely that the key FILE existed
- *  (independent review, 2026-07-30), so publishing with a non-matching key produced a well-formed,
- *  signed release that every installed app silently refused while the tool reported success — and
- *  `/api/ota/status` then confirmed the version as live. Pure, so the invariant is unit-testable
- *  without gcloud, a bucket, or a real publish (the same reason its two siblings here are pure). */
-export function otaSigningKeyRefusal(
-  keyPublicKey: string | null | undefined,
-  projectPublicKey: string | null | undefined,
-): 'no-key-public-half' | 'project-public-key-empty' | 'mismatch' | null {
-  if (!keyPublicKey) return 'no-key-public-half';
-  if (!projectPublicKey) return 'project-public-key-empty';
-  return keyPublicKey === projectPublicKey ? null : 'mismatch';
-}
+// otaSigningKeyRefusal moved to engine/scripts/ota/publishGuards.mjs (#582) — it now runs in
+// TWO places (this route's own early check below, and ota-publish.mjs itself, the by-hand path
+// this route's refusal message sends a human to), so it lives once and both import it.
+export { otaSigningKeyRefusal } from '../scripts/ota/publishGuards.mjs';
+import { otaSigningKeyRefusal } from '../scripts/ota/publishGuards.mjs';
 
 /** The build steps for a `playable` target: the single-file inliner build (VITE_PLAYABLE=1 →
  *  games/<id>/ads/index.html) then reveal the ads/ dir. No favicon/deploy/native — the one HTML IS
@@ -2144,7 +2132,7 @@ export function assetScannerPlugin(): Plugin {
           const projectDist = path.join(projectRoot, 'dist');
           const otaEmbedStep: BuildStep | null = cfg.ota.enabled ? {
             label: 'Embedding OTA manifest...',
-            cmd: `node engine/scripts/ota-embed-manifest.mjs --dist ${JSON.stringify(projectDist)} --name ${JSON.stringify(cfg.ota.bundleName)} --engine-api ${cfg.ota.engineApi}`,
+            cmd: `node engine/scripts/ota-embed-manifest.mjs --dist ${JSON.stringify(projectDist)} --name ${JSON.stringify(cfg.ota.bundleName)} --engine-api ${cfg.ota.engineApi} --project ${JSON.stringify(projectRoot)}`,
             cwd: buildCwd,
           } : null;
           // Resolved once: `null` means the icons are already current for that platform,
@@ -2884,6 +2872,14 @@ export function assetScannerPlugin(): Plugin {
           // and `/api/ota/status` then CONFIRMED the version as published. A release that no
           // device can install, reported as a successful ship, is the worst failure this route
           // has: it is remote, silent, and looks fine from here.
+          //
+          // #582: `ota-publish.mjs` (spawned below) now enforces this SAME refusal from the same
+          // pure `otaSigningKeyRefusal` — this is NOT the #577 duplicate-guard shape. #577's
+          // duplicate was a DIFFERENT decision procedure (existence vs content) that ran FIRST
+          // and refused a case the real guard allows. This is the identical pure function over
+          // the identical two inputs (the same key file, the same project.config.json), so it
+          // cannot refuse anything ota-publish.mjs would allow — it stays here only to return a
+          // clean HTTP 400 before the SSE stream opens and the multi-minute build starts.
           {
             let keyPub: string | null;
             try {
@@ -3022,7 +3018,7 @@ export function assetScannerPlugin(): Plugin {
             const mandatoryFlag = mandatoryParam === true ? ' --mandatory' : mandatoryParam === false ? ' --no-mandatory' : '';
             const publish = await runStep(
               'Publishing OTA bundle...',
-              `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} --bucket ${JSON.stringify(bucket)} --name ${JSON.stringify(bundleName)} --version ${JSON.stringify(version)} --engine-api ${cfg.ota.engineApi} --key ${JSON.stringify(keyName)} --repo-root ${JSON.stringify(buildCwd)}${mandatoryFlag}`,
+              `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} --bucket ${JSON.stringify(bucket)} --name ${JSON.stringify(bundleName)} --version ${JSON.stringify(version)} --engine-api ${cfg.ota.engineApi} --key ${JSON.stringify(keyName)} --repo-root ${JSON.stringify(buildCwd)} --project ${JSON.stringify(projectRoot)}${mandatoryFlag}`,
               buildCwd,
               gcloudEnv,
             );

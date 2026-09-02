@@ -11,8 +11,8 @@
  *  the same file this script writes).
  *
  *  Usage:
- *    node engine/scripts/ota-keygen.mjs [name]
- *  `name` defaults to "default" — the key file is build/ota-keys/<name>.json.
+ *    node engine/scripts/ota-keygen.mjs [name] [--repo-root <dir>]
+ *  `name` defaults to "default" — the key file is <repo-root>/build/ota-keys/<name>.json.
  *  Refuses to overwrite an existing key file (a silent regenerate would orphan
  *  every app build that already has the old public key baked in).
  */
@@ -22,8 +22,36 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { generateKeypair } from './ota/signing.mjs';
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const name = process.argv[2] || 'default';
+const defaultRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+// `--repo-root` mirrors ota-publish.mjs's own flag (see its comment) — it lets a caller that
+// already computed its own repo root (`/api/ota/keygen` uses `ctx.editorRoot || ctx.projectRoot`,
+// the SAME value `/api/ota/keys` reads back with) pass that value through, instead of this
+// script independently re-deriving one from `import.meta.url`. Before this flag existed the
+// route passed only `cwd`, so the two agreed only because the route happened to invoke this
+// script by a cwd-relative path — any future path change on either side could silently desync
+// writer and reader. Parsing stays backward compatible with the old positional-only usage: pull
+// `--repo-root <path>` out of argv first, then the key `name` is the first remaining non-flag
+// argument (defaulting to "default").
+const rawArgs = process.argv.slice(2);
+let repoRoot = defaultRepoRoot;
+const positional = [];
+for (let i = 0; i < rawArgs.length; i++) {
+  if (rawArgs[i] === '--repo-root') {
+    // A bare trailing `--repo-root` would otherwise reach `path.resolve(undefined)` and die with
+    // a TypeError stack — for a flag whose entire job is to decide WHERE the private key lands,
+    // say what's wrong instead of crashing.
+    const value = rawArgs[++i];
+    if (!value) {
+      console.error('[ota-keygen] --repo-root requires a directory argument.');
+      process.exit(1);
+    }
+    repoRoot = path.resolve(value);
+    continue;
+  }
+  positional.push(rawArgs[i]);
+}
+const name = positional[0] || 'default';
 const keyDir = path.join(repoRoot, 'build', 'ota-keys');
 const keyPath = path.join(keyDir, `${name}.json`);
 

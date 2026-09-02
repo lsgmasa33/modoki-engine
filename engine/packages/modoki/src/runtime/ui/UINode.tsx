@@ -949,9 +949,31 @@ function useScrollView(node: UINodeData, ref: React.RefObject<HTMLDivElement | n
     el.addEventListener('scroll', push, { passive: true });
     // The geometry stands on the viewport size, so measure it rather than assuming the authored
     // width/height resolved to what we think (percentages, flex, safe-area insets).
+    //
+    // ⚠️ **Observing `el` alone is not enough — `contentHeight`/`contentWidth` (`scrollHeight`/
+    // `scrollWidth`) can change with NO resize of `el` itself.** A row mounting/unmounting inside a
+    // `flexShrink:0` scroll box (Court's store shelf: `syncStoreChrome` toggles row `isVisible` every
+    // frame the modal is open) changes the CONTENT height while the box's own border box, capped by
+    // an authored `maxHeight`, never moves — exactly the case `scrollAnchor.ts`'s own header warns
+    // about for the identical reason ("Court's panel stayed 585px tall while its content went 888 ->
+    // 836"). Left unfixed, a consumer reading `contentHeight` for a "is there more to scroll"
+    // affordance (`docs/ui-system.md`'s own stated use case) can go stale exactly while it matters —
+    // scrolled to the bottom, a row mounts, there IS more below now, and the number does not move
+    // until some OTHER event happens to fire a `scroll`. Mirrors `scrollAnchor.ts`'s own fix for
+    // this: watch every direct child too, and re-observe on any child-list mutation.
     const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(push) : null;
-    ro?.observe(el);
-    return () => { el.removeEventListener('scroll', push); ro?.disconnect(); };
+    const observeAll = () => {
+      if (!ro) return;
+      ro.disconnect();
+      ro.observe(el);
+      for (const child of Array.from(el.children)) ro.observe(child);
+    };
+    observeAll();
+    const mo = typeof MutationObserver !== 'undefined'
+      ? new MutationObserver(() => { observeAll(); push(); })
+      : null;
+    mo?.observe(el, { childList: true });
+    return () => { el.removeEventListener('scroll', push); ro?.disconnect(); mo?.disconnect(); };
   }, [ref, guid, scroll ? 1 : 0]);           // eslint-disable-line react-hooks/exhaustive-deps
 
   // One-shot scrollTo request. Keyed on the request VALUES, so re-requesting the same offset

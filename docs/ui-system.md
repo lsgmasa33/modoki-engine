@@ -86,6 +86,15 @@ Field groups (representative fields, verified against `UIElement.ts`):
   that same scenario. The primary case — content removed above or below the viewport while the
   anchored child survives — is pixel-exact.
 
+  ⚠️ **A third failure mode, orthogonal to `isIntentfulScroll`'s two impostors (#579):** `restore()`
+  writes `scrollTop` directly, and nothing stopped it firing while the PLAYER'S OWN FINGER was mid-
+  drag on the same box — a content-size change (a row mounting/unmounting under `syncStoreChrome`,
+  say) racing a live touch gesture reads as "I scrolled down and it snapped back on release", a
+  genuine competition over the same `scrollTop` rather than a resize bug. The hook now tracks a
+  live `pointerdown`→`pointerup`/`pointercancel` gesture (`window`-level release listeners, a
+  same-shape-as-`scheduleResync` safety timeout in case neither fires) and DEFERS any pending
+  restore until the gesture ends, rather than fighting it. See `scrollAnchor.ts`'s header comment.
+
   ⚠️ **Match `gapUnit` to the unit the CHILDREN are sized in.** `gap` was px-only until
   2026-08-07, and a `flexWrap: 'wrap'` container whose items scale (`vh`/`vmin`/`%`) while its
   gaps do not has a viewport size below which an item silently reflows onto the next row — the

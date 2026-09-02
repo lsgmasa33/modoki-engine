@@ -264,6 +264,68 @@ export function useScrollAnchoring(enabled: boolean, el: HTMLDivElement | null):
     let alive = new Set<HTMLElement>();
     let resyncTimer: ReturnType<typeof setTimeout> | null = null;
 
+    // ⚠️ **A real touch/drag in progress must never be fought.** `restore()` writes `scrollTop`
+    // directly (#531's whole point), and the observers that trigger it fire from CONTENT changes —
+    // a row mounting/unmounting (`syncStoreChrome` toggles `UIElement.isVisible` on Court's store
+    // rows every frame the modal is open, in response to an async price fetch answering or a
+    // purchase changing ownership) has no relationship to whether the player's finger is on the
+    // glass *right now*. A restore landing mid-gesture competes with the browser's own live touch
+    // tracking for the same `scrollTop`, which is what "I dragged down and it snapped back on
+    // release" actually is (#579) — not a resize bug, a TIMING collision between this file's own
+    // fix for #531 and an unrelated live gesture. Deferring the write until the gesture ends keeps
+    // #531's guarantee (content-shift correction still happens) without ever contending with a scroll
+    // the user is actively performing.
+    //
+    // ⚠️ **`touchstart`/`touchend`, NOT `pointerdown`/`pointerup`, for the TOUCH case — this is not
+    // a style choice.** Once this box lets the browser scroll it natively (which it must — this is
+    // a real `overflow:'scroll'` box, unlike the game canvas, which sets `touch-action:'none'` and
+    // is why `pointerSource.ts`'s OWN doc can call `pointercancel` "rarely hit" THERE), the browser
+    // reclaims the touch as a pan almost immediately and fires `pointercancel` — ending the POINTER
+    // gesture within the first few px, while the player's finger is still very much down and the
+    // drag/momentum that actually races `restore()` is still to come. Tracking via Pointer Events
+    // here would disarm itself about one frame into every real touch scroll (found in review, #579
+    // close-out — a jsdom probe driving `pointerdown` then `pointercancel` mid-drag reproduced the
+    // exact "snaps back" symptom with the gesture guard nominally still on). Touch Events have no
+    // such reclaim-cancellation: `touchmove`/`touchend` keep firing for the physical touch
+    // regardless of who is driving the scroll, as long as the listener is passive (it is) — so
+    // `touchend` genuinely means "the finger lifted", the moment the bug report describes ("as soon
+    // as I let it go"). Pointer Events are kept as the SECONDARY path, for mouse/pen — input kinds
+    // that are never reclaimed this way, and the only kind `modoki_drag`'s synthetic gestures (used
+    // to verify this file live, in the Electron editor, from an agent session) can produce — with
+    // `pointerType === 'touch'` explicitly excluded so it can never re-arm the very race this guards
+    // against on a REAL touch device that also happens to dispatch a stray pointer event.
+    let gestureActive = false;
+    let pendingRestore = false;
+    let gestureSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+    // A missing end event (app backgrounded mid-touch, or any other event this file did not
+    // anticipate) must not wedge `gestureActive` true FOREVER — that would silently bring #531 back
+    // for the rest of the session, the exact "a false answer here must never be permanent" shape
+    // `scheduleResync` already guards against a few lines down. No real scroll gesture runs
+    // anywhere near this long; it exists only as a backstop.
+    const GESTURE_SAFETY_MS = 5000;
+    const onGestureStart = () => {
+      gestureActive = true;
+      if (gestureSafetyTimer !== null) clearTimeout(gestureSafetyTimer);
+      gestureSafetyTimer = setTimeout(onGestureEnd, GESTURE_SAFETY_MS);
+    };
+    const onGestureEnd = () => {
+      if (gestureSafetyTimer !== null) { clearTimeout(gestureSafetyTimer); gestureSafetyTimer = null; }
+      if (!gestureActive) return;
+      gestureActive = false;
+      if (pendingRestore) { pendingRestore = false; restore(); }
+    };
+    const onPointerGestureStart = (e: PointerEvent) => { if (e.pointerType !== 'touch') onGestureStart(); };
+    const onPointerGestureEnd = (e: PointerEvent) => { if (e.pointerType !== 'touch') onGestureEnd(); };
+    // `touchstart`/`pointerdown` on the element itself (only a press that starts HERE begins a
+    // gesture on this box); the end events on `window` — the release can land off-element once a
+    // real drag is under way, and pointer capture is not assumed.
+    el.addEventListener('touchstart', onGestureStart, { passive: true });
+    window.addEventListener('touchend', onGestureEnd, { passive: true });
+    window.addEventListener('touchcancel', onGestureEnd, { passive: true });
+    el.addEventListener('pointerdown', onPointerGestureStart, { passive: true });
+    window.addEventListener('pointerup', onPointerGestureEnd, { passive: true });
+    window.addEventListener('pointercancel', onPointerGestureEnd, { passive: true });
+
     // ⚠️ Reads each child's box ONCE. The obvious spelling measures the whole list for
     // `pickAnchor` and then measures the tail again to record it — 2N layout reads per axis on
     // every scroll event, against `useScrollView`'s stated #251 constraint that a scroll frame
@@ -308,11 +370,27 @@ export function useScrollAnchoring(enabled: boolean, el: HTMLDivElement | null):
      * so a rAF would re-baseline ahead of the restore it is meant to defer to. A timeout runs
      * after rendering, by which point a real observer-driven restore has already re-baselined
      * and this finds nothing to do.
+     *
+     * ⚠️ **Must decline to run while a restore is DEFERRED behind a live gesture (`pendingRestore`),
+     * or it destroys the very state the deferred restore needs (#579 close-out).** The deferred
+     * `restore()` reads `state.candidates`/`rawOffset` as they stood at the moment of the content
+     * change — the pre-mutation anchor — to compute where to put the box back. Every native
+     * `scroll` event the browser fires WHILE that restore is pending disagrees with the still-stale
+     * `state.contentSize` (nothing has updated it, on purpose), so `remember()`'s `isIntentfulScroll`
+     * check fails and calls straight back in here — and this function used to happily rebaseline
+     * onto the CURRENT (already-drifted) position on every one of them, so by the time the gesture
+     * ends and the deferred `restore()` finally runs, `wanted` computes to wherever the box already
+     * sits and `shouldApply` is false: a correction that was deferred, not merely delayed, silently
+     * became a correction that never happens — reproduced by a jsdom probe (10 rows removed to 9
+     * mid-gesture with one intervening `scroll` event: `scrollTop` settled at 305, not the correct
+     * 240, i.e. #531's own symptom, WITH the gesture guard nominally engaged). Declining here simply
+     * leaves the stale baseline in place until the pending `restore()` runs and sets it properly.
      */
     const scheduleResync = () => {
-      if (resyncTimer !== null) return;
+      if (resyncTimer !== null || pendingRestore) return;
       resyncTimer = setTimeout(() => {
         resyncTimer = null;
+        if (pendingRestore) return;   // armed while this was queued — the pending restore owns it now
         axes.forEach((axis, i) => {
           const state = held[i];
           if (axis.max(el) <= 0) return;
@@ -362,13 +440,20 @@ export function useScrollAnchoring(enabled: boolean, el: HTMLDivElement | null):
       });
     };
 
-    const ro = new ResizeObserver(restore);
+    // The gesture guard above wraps both observers here, not inside `restore()` itself — `restore()`
+    // also runs synchronously from `syncFlow`'s callers below (the initial seed) where no gesture can
+    // possibly be live, and gating it there would need the same check anyway for no benefit.
+    const restoreUnlessGesturing = () => {
+      if (gestureActive) { pendingRestore = true; return; }
+      restore();
+    };
+    const ro = new ResizeObserver(restoreUnlessGesturing);
     const observeAll = () => {
       ro.disconnect();
       ro.observe(el);
       for (const child of Array.from(el.children)) ro.observe(child);
     };
-    const mo = new MutationObserver(() => { syncFlow(); observeAll(); restore(); });
+    const mo = new MutationObserver(() => { syncFlow(); observeAll(); restoreUnlessGesturing(); });
 
     // Seed the geometry BEFORE the first remember, or the very first scroll event would look
     // like a resize (contentSize starting at a value nothing measured) and be ignored.
@@ -380,9 +465,16 @@ export function useScrollAnchoring(enabled: boolean, el: HTMLDivElement | null):
     el.addEventListener('scroll', remember, { passive: true });
     return () => {
       el.removeEventListener('scroll', remember);
+      el.removeEventListener('touchstart', onGestureStart);
+      window.removeEventListener('touchend', onGestureEnd);
+      window.removeEventListener('touchcancel', onGestureEnd);
+      el.removeEventListener('pointerdown', onPointerGestureStart);
+      window.removeEventListener('pointerup', onPointerGestureEnd);
+      window.removeEventListener('pointercancel', onPointerGestureEnd);
       ro.disconnect();
       mo.disconnect();
       if (resyncTimer !== null) clearTimeout(resyncTimer);
+      if (gestureSafetyTimer !== null) clearTimeout(gestureSafetyTimer);
       el.style.overflowAnchor = '';
     };
   }, [el, enabled]);
