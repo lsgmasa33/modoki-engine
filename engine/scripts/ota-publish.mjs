@@ -40,7 +40,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildManifestFiles } from './ota/buildManifest.mjs';
-import { createManifest, createRelease, validateManifest, validateRelease } from './ota/schema.mjs';
+import { createManifest, createRelease, manifestHashPayload, validateManifest, validateRelease } from './ota/schema.mjs';
 import { signRelease } from './ota/signing.mjs';
 import { buildZipFromDir } from './ota/zip.mjs';
 
@@ -66,6 +66,15 @@ function parseArgs(argv) {
 function fail(msg) {
   console.error(`[ota-publish] ${msg}`);
   process.exit(1);
+}
+
+/** Mirrors engine/plugins/vite-asset-scanner.ts's `isGcloudObjectNotFoundError` — not
+ *  imported (that file is a Vite plugin module, not meant to be pulled into this
+ *  standalone CLI), but the two MUST agree: `gcloud storage cat`/`describe` report a
+ *  missing object as "not found: 404" or "matched no objects" on stderr, and that is the
+ *  ONLY stderr shape that means "safe to proceed" for the collision check below. */
+function isGcloudObjectNotFoundError(stderr) {
+  return /not found: 404|matched no objects or files/i.test(stderr);
 }
 
 async function main() {
@@ -115,6 +124,69 @@ async function main() {
   const manifestErrors = validateManifest(manifest);
   if (manifestErrors.length) fail(`Built an invalid manifest:\n  ${manifestErrors.join('\n  ')}`);
 
+  // Hash of the manifest's canonical serialization, chained into release.json's signed
+  // `manifests[name]` entry below so the signed release commits to this bundle's CONTENTS,
+  // not just its version pointer.
+  const manifestHash = createHash('sha256').update(manifestHashPayload(manifest), 'utf8').digest('hex');
+  console.log(`[ota-publish] Bundle manifest: sha256 ${manifestHash}.`);
+
+  // Refuse a version-string collision that would change what an already-published version
+  // MEANS — mirrors the editor's own `/api/ota/publish` route (engine/plugins/vite-asset-scanner.ts,
+  // "Step 2: refuse a version-string collision"). release.json only tracks the CURRENT live
+  // version, not history, so the versioned manifest object itself is the thing to check.
+  //
+  // Checked HERE, after `manifestHash` is computed (not before, as an earlier version of
+  // this guard did) — that ordering is load-bearing. A version's manifest.json is now
+  // uploaded LAST of everything for that version (see the upload block below), so "the
+  // versioned manifest.json exists" means "this version's contents were fully committed",
+  // and comparing hashes tells apart the two cases that "does a manifest exist" alone
+  // cannot:
+  //   - IDENTICAL contents → this is a RETRY of a publish that got this far before
+  //     (auth expiry, an exhausted precondition retry budget, a killed process, ... in the
+  //     release.json loop below, which runs AFTER this point). The original guard treated
+  //     any existing manifest as fatal and refused to retry the exact failure it was
+  //     written to protect against — repro confirmed a retry succeeded before this guard
+  //     existed and failed with "Version collision" after. ALLOW an identical retry.
+  //   - DIFFERENT contents → a genuine collision: republishing would change what this
+  //     version string means to every client that already fetched it. Refuse, as before.
+  console.log('[ota-publish] Checking for a version collision...');
+  const versionedManifestPath = `${bucket}/bundles/${name}/${version}/manifest.json`;
+  let existingManifestRaw = null;
+  try {
+    existingManifestRaw = execSync(`gcloud storage cat ${q(versionedManifestPath)}`, { stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8');
+  } catch (e) {
+    // A missing object is the ONLY stderr shape that means "safe to proceed" — anything
+    // else (auth expired, network blip, wrong bucket permissions) must NOT be silently
+    // treated as "no collision": that would let a publish proceed past the one guard that
+    // stops a version from being silently republished with different bytes. This is the
+    // null-conflates-absent-with-unknown trap: "could not check" and "definitely doesn't
+    // exist" must fail differently, or the guard fails open on exactly the errors (auth,
+    // network, permissions) it most needs to catch.
+    const stderr = e?.stderr?.toString() ?? '';
+    if (!isGcloudObjectNotFoundError(stderr)) {
+      fail(`Could not check for a version collision: ${stderr || e.message}`);
+    }
+    // else: genuinely doesn't exist yet — no collision, proceed to publish normally.
+  }
+  if (existingManifestRaw !== null) {
+    let existingManifestHash;
+    try {
+      const existingManifest = JSON.parse(existingManifestRaw);
+      existingManifestHash = createHash('sha256').update(manifestHashPayload(existingManifest), 'utf8').digest('hex');
+    } catch (e) {
+      // An existing object that can't even be parsed is "unknown", not "no collision" —
+      // same fail-closed reasoning as the fetch failure above.
+      fail(`Could not check for a version collision: existing manifest.json at ${versionedManifestPath} could not be parsed: ${e.message}`);
+    }
+    if (existingManifestHash === manifestHash) {
+      console.log(`[ota-publish] "${name}@${version}" already published with identical contents — resuming.`);
+    } else {
+      const m = version.match(/^v(\d+)$/);
+      const hint = m ? ` Try v${Number(m[1]) + 1}.` : '';
+      fail(`Version collision: "${name}@${version}" is already published under ${bucket} with DIFFERENT contents than this publish would produce. Publishing again would change what this version string means to every client that already fetched it.${hint}`);
+    }
+  }
+
   // Stage a flat, content-addressed copy: <hash> filename, no relative path —
   // this is what makes `bundles/<name>/<version>/files/` safe to upload with
   // ordinary rsync (two DIFFERENT source files that happen to hash the same
@@ -131,6 +203,7 @@ async function main() {
     // accumulates every version ever published; deleting would strand clients
     // still fetching an older manifest's hashes.
     execSync(`gcloud storage rsync --recursive ${q(stageDir)} ${q(`${bundlePrefix}/files`)}`, { stdio: 'inherit' });
+    execSync(`gcloud storage objects update ${q(`${bundlePrefix}/files/**`)} --cache-control="public, max-age=31536000, immutable"`, { stdio: 'inherit' });
 
     const manifestStageDir = mkdtempSync(path.join(tmpdir(), 'modoki-ota-manifest-'));
     try {
@@ -138,14 +211,19 @@ async function main() {
       const zipPath = path.join(manifestStageDir, 'bundle.zip');
       writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
       writeFileSync(zipPath, zip);
-      execSync(`gcloud storage cp ${q(manifestPath)} ${q(`${bundlePrefix}/manifest.json`)}`, { stdio: 'inherit' });
+      // Upload order is LOAD-BEARING for the version-collision guard above: that guard
+      // treats "manifest.json exists at this version's path" as "this version's contents
+      // were fully committed" — true only if manifest.json is the LAST object written for
+      // this version. `bundle.zip` before `manifest.json` (files/ above already went
+      // first); `release.json` stays last of ALL, further below — that ordering is
+      // separately load-bearing and untouched by this reordering.
       execSync(`gcloud storage cp ${q(zipPath)} ${q(`${bundlePrefix}/bundle.zip`)}`, { stdio: 'inherit' });
+      execSync(`gcloud storage objects update ${q(`${bundlePrefix}/bundle.zip`)} --cache-control="public, max-age=31536000, immutable"`, { stdio: 'inherit' });
+      execSync(`gcloud storage cp ${q(manifestPath)} ${q(`${bundlePrefix}/manifest.json`)}`, { stdio: 'inherit' });
+      execSync(`gcloud storage objects update ${q(`${bundlePrefix}/manifest.json`)} --cache-control="no-cache, max-age=0"`, { stdio: 'inherit' });
     } finally {
       rmSync(manifestStageDir, { recursive: true, force: true });
     }
-    execSync(`gcloud storage objects update ${q(`${bundlePrefix}/manifest.json`)} --cache-control="no-cache, max-age=0"`, { stdio: 'inherit' });
-    execSync(`gcloud storage objects update ${q(`${bundlePrefix}/bundle.zip`)} --cache-control="public, max-age=31536000, immutable"`, { stdio: 'inherit' });
-    execSync(`gcloud storage objects update ${q(`${bundlePrefix}/files/**`)} --cache-control="public, max-age=31536000, immutable"`, { stdio: 'inherit' });
   } finally {
     rmSync(stageDir, { recursive: true, force: true });
   }
@@ -219,7 +297,19 @@ async function main() {
     // (e.g. computed once before the loop) would reintroduce the bug under the exact
     // concurrent-publish race this loop exists to handle.
     const mandatory = args.mandatory !== undefined ? args.mandatory : (existingRelease?.mandatory ?? false);
-    const unsignedRelease = createRelease({ bundles, mandatory, minEngineApi });
+    // `manifests` merges the SAME way `bundles` does, for the same reason: this is the
+    // subtle bug to avoid here. If publishing bundle B naively wrote `{ [name]: manifestHash }`
+    // without spreading in `existingRelease?.manifests`, bundle A's already-shipped clients
+    // would silently stop having their manifest enforced — the field would just vanish from
+    // under them on someone else's publish. Then PRUNE any entry whose key is no longer in the
+    // merged `bundles` map, so a bundle removed from the release doesn't leave a stale hash
+    // behind that nothing will ever refresh.
+    const mergedManifests = { ...(existingRelease?.manifests ?? {}), [name]: manifestHash };
+    // Object.hasOwn, not `bundleName in bundles` — `in` also matches INHERITED properties
+    // (`toString`, `constructor`, ...), so a manifests entry literally named "toString"
+    // would survive the prune even though `bundles` has no such own key.
+    const manifests = Object.fromEntries(Object.entries(mergedManifests).filter(([bundleName]) => Object.hasOwn(bundles, bundleName)));
+    const unsignedRelease = createRelease({ bundles, mandatory, minEngineApi, manifests });
     const release = signRelease(unsignedRelease, keypair);
     const releaseErrors = validateRelease(release);
     if (releaseErrors.length) fail(`Built an invalid release:\n  ${releaseErrors.join('\n  ')}`);
@@ -247,6 +337,15 @@ async function main() {
 
     if (published) {
       console.log(`[ota-publish] Published ${name}@${version} — release.json now points ${name} → ${version}, mandatory=${mandatory}.`);
+      // Partial manifest coverage is otherwise invisible: this publish only ever writes
+      // `manifests[name]` for the bundle it's publishing, so on a bucket with several
+      // bundles, every OTHER bundle's `manifests` entry stays missing/unenforced
+      // indefinitely with nothing anywhere else to notice or warn about it.
+      const uncoveredBundles = Object.keys(bundles).filter((bundleName) => !Object.hasOwn(manifests, bundleName));
+      if (uncoveredBundles.length > 0) {
+        console.warn(`[ota-publish] WARNING: manifest verification is NOT enabled for: ${uncoveredBundles.join(', ')}.`);
+        console.warn('[ota-publish]          Republish each of those bundles to add its manifests[] entry to release.json.');
+      }
     }
   }
 }

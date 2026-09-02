@@ -19,6 +19,7 @@
  *  built-in `crypto` for the same reason, on the platform where that built-in exists. */
 
 import { ed25519 } from '@noble/curves/ed25519.js';
+import { sha256 } from '@noble/hashes/sha2.js';
 
 export interface OtaFileEntry {
   hash: string;
@@ -39,6 +40,10 @@ export interface OtaRelease {
   bundles: Record<string, string>;
   mandatory: boolean;
   minEngineApi: number;
+  /** sha256 of each bundle's CURRENT-version manifest, canonically serialized (#570,
+   *  additive — a release without it is still valid). See
+   *  {@link manifestHashPayload} and `checkForUpdate`'s `manifest-untrusted` outcome. */
+  manifests?: Record<string, string>;
   sig: string;
 }
 
@@ -110,6 +115,17 @@ export function validateRelease(release: unknown): string[] {
     fail('release.minEngineApi must be a positive integer');
   }
   if (typeof r.sig !== 'string' || !r.sig) fail('release.sig must be a non-empty string (base64url Ed25519 signature)');
+  if (r.manifests !== undefined) {
+    if (r.manifests == null || typeof r.manifests !== 'object' || Array.isArray(r.manifests)) {
+      fail('release.manifests must be an object keyed by bundle name');
+    } else {
+      for (const [name, hash] of Object.entries(r.manifests as Record<string, unknown>)) {
+        if (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) {
+          fail(`release.manifests["${name}"] must be a lowercase hex sha256 (64 chars)`);
+        }
+      }
+    }
+  }
   return errors;
 }
 
@@ -123,13 +139,46 @@ export function signingPayload(release: OtaRelease | Omit<OtaRelease, 'sig'>): s
 function sortKeysDeep(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeysDeep);
   if (value !== null && typeof value === 'object') {
-    const sorted: Record<string, unknown> = {};
+    // Object.create(null), NOT `{}` — MUST match engine/scripts/ota/schema.mjs's
+    // sortKeysDeep byte-for-byte, comment ported verbatim: a plain object literal's
+    // `__proto__` is an ACCESSOR inherited from Object.prototype, so `sorted['__proto__']
+    // = ...` would silently write through the setter (mutating `sorted`'s own prototype)
+    // instead of storing an own property, and that key would vanish from the
+    // JSON.stringify output entirely. That let two materially different documents (one
+    // with a top-level `__proto__` key, one without) canonicalize to byte-identical
+    // strings — a signature meant for one would vouch for the other. A null-prototype
+    // object has no inherited `__proto__` setter to intercept the assignment, so it
+    // becomes an ordinary own property like any other key. Output is unaffected for
+    // every document that doesn't use `__proto__` as a key: JSON.stringify only ever
+    // looks at own enumerable properties, never the prototype.
+    const sorted: Record<string, unknown> = Object.create(null);
     for (const key of Object.keys(value as Record<string, unknown>).sort()) {
       sorted[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
     }
     return sorted;
   }
   return value;
+}
+
+/** MUST match engine/scripts/ota/schema.mjs's `manifestHashPayload` byte-for-byte — the
+ *  canonical (sorted-key) JSON of a manifest, same treatment {@link signingPayload} gives
+ *  a release. Canonical rather than raw file bytes so this hash survives `res.json()`
+ *  round-tripping the manifest — the client never needs `res.text()`. */
+export function manifestHashPayload(manifest: OtaManifest): string {
+  return JSON.stringify(sortKeysDeep(manifest));
+}
+
+/** Lowercase-hex sha256 of a UTF-8 string, via `@noble/hashes` — a `dependencies` entry
+ *  alongside `@noble/curves` (see engine/packages/modoki/package.json), so this adds no
+ *  new library. Deliberately NOT `crypto.subtle.digest`: that is async (it would turn this
+ *  synchronous canonical-hash step into a promise for no benefit) and is gated on a secure
+ *  context, which is a property of however the host WebView is configured rather than
+ *  something this module can rely on. Exported (not module-private) so the canonicalization
+ *  parity test can assert this hashing path agrees with Node's `createHash('sha256')` on
+ *  the publisher side, instead of duplicating this exact logic in the test. */
+export function sha256Hex(s: string): string {
+  const bytes = sha256(new TextEncoder().encode(s));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 /** A single file to fetch individually by content hash (Phase 2 delta transfer) — as
@@ -195,6 +244,13 @@ export type OtaCheckResult =
   | { outcome: 'signature-invalid' }
   | { outcome: 'engine-api-too-old'; required: number; running: number }
   | { outcome: 'manifest-invalid'; errors: string[] }
+  /** The fetched manifest is well-formed (passed `validateManifest`) but its canonical
+   *  hash does NOT match the signed release's `manifests[bundleName]` entry — the bundle's
+   *  CONTENTS don't match what the release.json commits to. Distinct from
+   *  `manifest-invalid` (malformed shape): this manifest parses fine, it just isn't the
+   *  one the signature vouches for, which means the bucket served tampered or stale
+   *  bytes. Nothing is staged when this fires. */
+  | { outcome: 'manifest-untrusted'; version: string; expected: string; actual: string }
   | { outcome: 'no-bundle-zip-in-manifest' }
   /** The release's target version is one this device already PROVED bad — it exhausted
    *  its boot attempts and the watchdog reverted it (Phase 3a quarantine). Staging it
@@ -390,6 +446,22 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
 
   const manifestErrors = validateManifest(manifest);
   if (manifestErrors.length > 0) return { outcome: 'manifest-invalid', errors: manifestErrors };
+
+  // Chain the manifest into the SIGNED release (#570): release.json is Ed25519-signed
+  // and `manifests[bundleName]` is a field on it like any other, so an attacker with
+  // bucket write cannot alter/replace manifest.json without invalidating that signature.
+  // Checked here — after shape validation, before the engineApi gate below — so a
+  // tampered-but-well-formed manifest never reaches staging. Optional: an older
+  // release.json with no `manifests` field (or one missing this bundle) skips the check
+  // entirely, same non-breaking contract `validateRelease` gives the field.
+  const expectedManifestHash = release.manifests?.[opts.bundleName];
+  if (typeof expectedManifestHash === 'string') {
+    const actualManifestHash = sha256Hex(manifestHashPayload(manifest));
+    if (actualManifestHash !== expectedManifestHash) {
+      return { outcome: 'manifest-untrusted', version: targetVersion, expected: expectedManifestHash, actual: actualManifestHash };
+    }
+  }
+
   if (manifest.engineApi > opts.runningEngineApi) {
     return { outcome: 'engine-api-too-old', required: manifest.engineApi, running: opts.runningEngineApi };
   }
@@ -470,7 +542,28 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
 
 /** Fetches + validates a bundle's manifest.json, returning null (never throwing) on any
  *  failure — used for the delta path's BASE manifest, where failure means "fall back to
- *  whole-zip", not "fail the update". */
+ *  whole-zip", not "fail the update".
+ *
+ *  Deliberately UNVERIFIED against `release.manifests` (unlike the TARGET manifest in
+ *  `checkForUpdate` above): the signed release only commits to the CURRENT version's
+ *  manifest, and this function (and {@link tryFetchEmbeddedManifest}) supply the delta
+ *  BASE — either an older already-active version, or the manifest shipped inside the app
+ *  binary itself. A lying/tampered base manifest cannot forge the update's contents:
+ *  native verifies the whole staged tree against `files`, which is built from the
+ *  now-authenticated TARGET manifest. A bad base can only make that whole-tree
+ *  verification fail and fall back to the whole-zip path (see #556) — not an integrity
+ *  hole, just a wasted delta.
+ *
+ *  ⚠️ That "cannot forge contents" guarantee holds ONLY on a device whose native plugin is
+ *  #556-or-later. `OtaPlugin.swift`'s `stageUpdate` and `OtaPlugin.java`'s counterpart both
+ *  SKIP the staged-tree-vs-`files` verification entirely when `files` is absent from the
+ *  call (logging a loud warning and proceeding exactly as pre-#556 code did) — that's a
+ *  deliberate compatibility fallback for a caller built before #556, not a bug. But native
+ *  plugin code cannot itself be OTA-updated: an app installed with an older plugin binary
+ *  keeps running that older plugin FOREVER, regardless of how many JS-side OTA updates it
+ *  applies. So on such an already-installed app, a tampered/lying base manifest CAN still
+ *  force a stale local file to be copied into the new staged tree completely unverified —
+ *  the "native verifies the whole tree" backstop above simply isn't there to catch it. */
 async function tryFetchManifest(
   doFetch: typeof fetch,
   baseUrl: string,

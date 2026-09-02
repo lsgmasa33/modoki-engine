@@ -89,6 +89,23 @@ export function validateRelease(release) {
     fail('release.minEngineApi must be a positive integer');
   }
   if (typeof release.sig !== 'string' || !release.sig) fail('release.sig must be a non-empty string (base64url Ed25519 signature)');
+  // Optional (#570, additive — a release without it stays valid, same
+  // precedent as manifest.bundleZip above): the sha256 of each bundle's CURRENT-version
+  // manifest, canonically serialized (see manifestHashPayload below), so the signed
+  // release.json chains into the bundle's CONTENTS and not just its version pointer. A
+  // client that checks this can detect a manifest.json that was tampered with (or served
+  // stale) without needing its own signature.
+  if (release.manifests !== undefined) {
+    if (release.manifests == null || typeof release.manifests !== 'object' || Array.isArray(release.manifests)) {
+      fail('release.manifests must be an object keyed by bundle name');
+    } else {
+      for (const [name, hash] of Object.entries(release.manifests)) {
+        if (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) {
+          fail(`release.manifests["${name}"] must be a lowercase hex sha256 (64 chars)`);
+        }
+      }
+    }
+  }
   return errors;
 }
 
@@ -103,8 +120,10 @@ export function createManifest({ name, version, engineApi, files, bundleZip }) {
 
 /** Builds an UNSIGNED release object (no `sig` field yet — ./signing.mjs adds
  *  it over this object's canonical JSON, see signingPayload below). */
-export function createRelease({ bundles, mandatory, minEngineApi }) {
-  return { schema: SCHEMA_VERSION, bundles, mandatory, minEngineApi };
+export function createRelease({ bundles, mandatory, minEngineApi, manifests }) {
+  const release = { schema: SCHEMA_VERSION, bundles, mandatory, minEngineApi };
+  if (manifests && Object.keys(manifests).length > 0) release.manifests = manifests;
+  return release;
 }
 
 /** The exact byte sequence that gets signed / verified for a release: every
@@ -117,10 +136,31 @@ export function signingPayload(release) {
   return JSON.stringify(sortKeysDeep(unsigned));
 }
 
+/** The exact byte sequence hashed to produce a release's `manifests[name]` entry:
+ *  canonical (key-sorted) JSON of the manifest, same treatment signingPayload gives the
+ *  release itself. Canonical rather than raw file bytes because raw bytes would break if
+ *  anything ever reformats the JSON in the bucket (whitespace, key order); canonicalization
+ *  is already the trusted mechanism for the release signature, so reusing it here means the
+ *  client can hash the manifest it already parsed via res.json() instead of needing the raw
+ *  response text. */
+export function manifestHashPayload(manifest) {
+  return JSON.stringify(sortKeysDeep(manifest));
+}
+
 function sortKeysDeep(value) {
   if (Array.isArray(value)) return value.map(sortKeysDeep);
   if (value !== null && typeof value === 'object') {
-    const sorted = {};
+    // Object.create(null), NOT `{}` — a plain object literal's `__proto__` is an ACCESSOR
+    // inherited from Object.prototype, so `sorted['__proto__'] = ...` would silently write
+    // through the setter (mutating `sorted`'s own prototype) instead of storing an own
+    // property, and that key would vanish from the JSON.stringify output entirely. That
+    // let two materially different documents (one with a top-level `__proto__` key, one
+    // without) canonicalize to byte-identical strings — a signature meant for one would
+    // vouch for the other. A null-prototype object has no inherited `__proto__` setter to
+    // intercept the assignment, so it becomes an ordinary own property like any other key.
+    // Output is unaffected for every document that doesn't use `__proto__` as a key:
+    // JSON.stringify only ever looks at own enumerable properties, never the prototype.
+    const sorted = Object.create(null);
     for (const key of Object.keys(value).sort()) sorted[key] = sortKeysDeep(value[key]);
     return sorted;
   }

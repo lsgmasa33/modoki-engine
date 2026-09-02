@@ -34,6 +34,7 @@
     "@dimforge/rapier2d-compat": "^0.19.3",
     "@dimforge/rapier3d-compat": "^0.19.3",
     "@noble/curves": "^2.2.0",
+    "@noble/hashes": "^2.2.0",
     "@zappar/msdf-generator": "^1.2.4",
     "maxrects-packer": "^2.7.3",
     "poly-decomp-es": "^0.4.2"

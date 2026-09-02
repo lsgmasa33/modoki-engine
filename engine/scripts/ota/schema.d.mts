@@ -21,6 +21,9 @@ export interface OtaRelease {
   bundles: Record<string, string>;
   mandatory: boolean;
   minEngineApi: number;
+  /** sha256 of each bundle's CURRENT-version manifest, canonically serialized (Phase 2).
+   *  Optional — a release without it is still valid. */
+  manifests?: Record<string, string>;
   sig: string;
 }
 
@@ -39,5 +42,7 @@ export function createRelease(args: {
   bundles: Record<string, string>;
   mandatory: boolean;
   minEngineApi: number;
+  manifests?: Record<string, string>;
 }): OtaReleaseUnsigned;
 export function signingPayload(release: OtaRelease | OtaReleaseUnsigned): string;
+export function manifestHashPayload(manifest: OtaManifest): string;

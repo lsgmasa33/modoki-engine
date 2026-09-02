@@ -60,11 +60,11 @@ CDN/
   bundles/<name>/<version>/bundle.zip    # whole-bundle fallback
 ```
 
-`release.json` — `{schema, bundles: {shell: "v12", …}, mandatory, minEngineApi, sig}`.
+`release.json` — `{schema, bundles: {shell: "v12", …}, mandatory, minEngineApi, manifests?, sig}`.
 Per-bundle `manifest.json` — `{schema, name, version, engineApi, files: {"<path>": {hash, size}}, bundleZip?}`.
 
 Only `release.json` is signed; it is the single trusted root. Everything else is reached by
-content hash, so tampering with a file changes its address and fails verification.
+content hash **chained back to that root** — see § The trust chain.
 
 ### Signing
 
@@ -75,18 +75,92 @@ a previously-verified update), and Android's minSdk 31 predates native EdDSA (AP
 native verification would need a minSdk bump or a second hand-rolled curve implementation.
 One audited library shared by both platforms is strictly better.
 
+### The trust chain
+
+The signature answers *"which version should this device run"*. On its own that does **not**
+answer *"what is in that version"* — and every integrity check in the staging path verifies
+downloaded bytes against hashes that come out of `manifest.json`. So the release also commits
+to the manifest itself:
+
+```
+release.json  (Ed25519-signed)
+  └─ manifests[<name>] = sha256 of that bundle's CURRENT manifest.json
+       └─ manifest.files[<path>].hash  →  the staged tree, verified natively
+       └─ manifest.bundleZip.hash      →  the whole-zip download
+```
+
+`manifests` is a map of bundle name → the sha256 of that bundle's manifest, in lowercase hex.
+The hash is taken over the manifest's **canonical serialization** —
+`JSON.stringify(sortKeysDeep(manifest))`, the same canonicalization `signingPayload` uses for
+the release — not over the raw file bytes, so reformatting the JSON in the bucket cannot break
+an update. `signingPayload` has no field allowlist, so the map is covered by the existing
+signature with no new key material and no `schema` bump.
+
+**What this closes.** Exploiting the gap needs *write access to the bucket*, not a network
+position (HTTPS covers the wire). Such an attacker still cannot forge a version pointer — they
+lack the key — but before #570 they could rewrite an existing version's `manifest.json` plus
+the content-addressed files it names, and the client would stage it, verify it against the
+attacker's own hashes, and be satisfied. Now the manifest is pinned by the signature too.
+
+**The field is optional, and the client enforces it only when present.** It is optional purely
+for schema compatibility: both validators compare `schema` with exact equality, so bumping the
+version would make every already-shipped client reject every future release, permanently. (Same
+additive-compat reasoning as `manifest.bundleZip`.) An attacker cannot simply *strip* the field —
+`release.json` is signed, so removing it invalidates the signature.
+
+⚠️ **The residual risk is release REPLAY, and nothing covers it today.** There is no anti-rollback
+mechanism anywhere in the OTA path: `checkForUpdate` compares the target only against `active` /
+`pending` / `rejected`, and both `OtaCore`s treat versions as opaque strings with no ordering. So
+an attacker with bucket write can serve an older, validly-signed `release.json` they captured —
+including a pre-#570 one with no `manifests` field at all, which skips this check entirely and
+restores the exact gap #570 closed. This predates #570 and is not introduced by it, but it does
+bound what the manifest chain buys: it authenticates the contents of whatever release is served,
+not that the release served is the newest one.
+
+⚠️ **A publisher older than #570 disarms the guard for EVERY bundle in one publish.** A checkout,
+branch or tag predating this change re-signs `release.json` without the field and without
+spreading the existing map — validly signed, no error, every client silently back to unverified
+manifests. Tool-version skew, not a coding mistake, and nothing detects it.
+
+**Coverage is per-bundle and starts empty.** Publishing writes `manifests[<name>]` only for the
+bundle being published, so on a multi-bundle bucket every other bundle stays unenforced until it
+is next republished. `ota-publish` warns about the gap; nothing errors on it.
+
+**What is deliberately NOT verified this way.** The release commits to the *current* version's
+manifest only, so the delta path's **base** manifest — an older OTA version's, or the one
+embedded in the app binary — is not covered. On a **#556-or-later native plugin** that is not a
+hole: a lying base manifest cannot forge contents, because native verifies the whole staged tree
+against `files`, which comes from the now-authenticated *target* manifest, so the worst it can do
+is make verification fail and fall back to a whole-zip download.
+
+⚠️ That argument is conditional on the native binary, and **native cannot be OTA-updated**. Both
+plugins skip staged-tree verification entirely when `files` is absent (the pre-#556 legacy
+tolerance), and a plugin predating #556 ignores the parameter altogether. On an app already
+installed with such a binary, a tampered base manifest can still claim its hash for a path equals
+the target's — so that file is copied off local disk, never downloaded and never verified. #570
+does not reach that; only shipping a new native build does.
+
+⚠️ **Publishing merges `manifests` the same way it merges `bundles`.** Dropping another
+bundle's entry would silently switch that bundle's already-shipped clients back to unverified
+manifests — the failure would be invisible, since nothing errors when the field is simply
+absent.
+
 ### The client flow
 
 `checkForUpdate` (`otaClient.ts`) fetches `release.json`, verifies its signature, and
 short-circuits if the target version is already `active` or `pending`. It then enforces
 **two independent** engine-API gates — the release-level `release.minEngineApi` (checked
 here, before any manifest fetch) and the per-bundle `manifest.engineApi` (checked after
-fetching the target manifest) — before picking a **delta base** and calling native. Every
+fetching the target manifest) — before picking a **delta base** and calling native. The target
+manifest is checked against `release.manifests[<name>]` immediately after `validateManifest` and
+before the per-bundle `manifest.engineApi` gate (the release-level gate has already run, before
+the manifest was even fetched), so a tampered manifest is refused (`manifest-untrusted`) without
+ever reaching native. Every
 failure mode is a discriminated result, never a throw — an OTA check failing must never
 crash a game the player is already looking at:
 
 `up-to-date` · `no-release-for-bundle` · `signature-invalid` · `engine-api-too-old` ·
-`manifest-invalid` · `no-bundle-zip-in-manifest` · `version-rejected` · `staged` (carries
+`manifest-invalid` · `manifest-untrusted` · `no-bundle-zip-in-manifest` · `version-rejected` · `staged` (carries
 `mandatory: boolean`, mirroring `release.mandatory`) · `pending-restart` (target is already
 `pending` natively but never served — carries `version` + `mandatory`; see #509 below)
 
@@ -417,6 +491,22 @@ it touches a `bash -c` string).
 **This pipeline only ever builds and publishes the shell bundle** — see the Gotchas entry
 below on the bundleName restriction; publishing a sub-game bundle is still a manual
 `build-subgame.mjs` + `ota-publish.mjs` invocation, not wired into the UI/MCP surface.
+
+**Republishing a version string: identical is fine, different is refused.** The CLI carries the
+same collision guard the editor route has, but decides by CONTENT rather than by existence: it
+canonically hashes the already-published `manifest.json` and compares it to the one it just
+built. Equal → this is a retry of an identical publish, and it resumes. Different → it refuses,
+because the version string would silently come to mean something else. A probe that cannot read
+the existing object fails **loudly**; it is never read as "no collision".
+
+This matters more since #570 than it did before. A publish that fails partway (auth expiry, the
+precondition retry budget exhausted) used to be harmless to retry. Now a version whose
+`manifest.json` landed while its `release.json` entry did not could, under a naive
+existence-only guard, be permanently burned — you would be forced to bump the version and leave
+an orphan tree behind. Hashing instead of merely looking makes the retry the safe operation it
+should be. For the same reason `manifest.json` is uploaded **last**, after `files/` and
+`bundle.zip`, so that its presence genuinely means "this version's contents were committed"
+rather than "an upload got partway". `release.json` is still written after everything.
 
 ## Gotchas
 

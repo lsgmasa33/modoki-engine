@@ -5,6 +5,7 @@ import {
   checkForUpdate,
   fetchRelease,
   diffManifests,
+  manifestHashPayload,
   validateManifest,
   validateRelease,
   verifyReleaseSignature,
@@ -25,8 +26,12 @@ function makeKeypair() {
 
 function signRelease(unsigned: Omit<OtaRelease, 'sig'>, privateKey: Uint8Array): OtaRelease {
   // Mirrors signingPayload's sorted-key canonical JSON, done inline so the test doesn't
-  // depend on the module's internal (non-exported) sortKeysDeep helper.
-  const sorted = { bundles: unsigned.bundles, mandatory: unsigned.mandatory, minEngineApi: unsigned.minEngineApi, schema: unsigned.schema };
+  // depend on the module's internal (non-exported) sortKeysDeep helper. Key order below is
+  // alphabetical (bundles, mandatory, manifests, minEngineApi, schema) to match sortKeysDeep.
+  const sorted: Record<string, unknown> = { bundles: unsigned.bundles, mandatory: unsigned.mandatory };
+  if (unsigned.manifests !== undefined) sorted.manifests = unsigned.manifests;
+  sorted.minEngineApi = unsigned.minEngineApi;
+  sorted.schema = unsigned.schema;
   const payload = new TextEncoder().encode(JSON.stringify(sorted));
   const sig = ed25519.sign(payload, privateKey);
   return { ...unsigned, sig: toBase64url(sig) };
@@ -60,6 +65,35 @@ describe('validateRelease (TS port parity)', () => {
   it('rejects a missing sig', () => {
     const release = { schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1 };
     expect(validateRelease(release).some((e) => e.includes('sig'))).toBe(true);
+  });
+
+  it('accepts a release with no manifests field (back-compat)', () => {
+    const release = { schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1, sig: 'x'.repeat(10) };
+    expect(validateRelease(release)).toEqual([]);
+  });
+
+  it('accepts a well-formed manifests map', () => {
+    const release = { schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1, manifests: { shell: 'a'.repeat(64) }, sig: 'x'.repeat(10) };
+    expect(validateRelease(release)).toEqual([]);
+  });
+
+  it('rejects a manifests entry that is not a lowercase hex sha256', () => {
+    const release = { schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1, manifests: { shell: 'not-a-hash' }, sig: 'x'.repeat(10) };
+    expect(validateRelease(release).some((e) => e.includes('manifests'))).toBe(true);
+  });
+});
+
+describe('manifestHashPayload (TS port parity)', () => {
+  it('is stable regardless of key insertion order', () => {
+    const a: OtaManifest = { schema: 1, name: 'shell', version: 'v1', engineApi: 1, files: { 'a.js': { hash: 'a'.repeat(64), size: 1 } } };
+    const b: OtaManifest = { version: 'v1', files: { 'a.js': { size: 1, hash: 'a'.repeat(64) } }, name: 'shell', engineApi: 1, schema: 1 };
+    expect(manifestHashPayload(a)).toBe(manifestHashPayload(b));
+  });
+
+  it('produces a different payload when the manifest actually differs', () => {
+    const a: OtaManifest = { schema: 1, name: 'shell', version: 'v1', engineApi: 1, files: {} };
+    const b: OtaManifest = { schema: 1, name: 'shell', version: 'v2', engineApi: 1, files: {} };
+    expect(manifestHashPayload(a)).not.toBe(manifestHashPayload(b));
   });
 });
 
@@ -220,6 +254,82 @@ describe('checkForUpdate', () => {
     });
     expect(native.activate).toHaveBeenCalledWith({ name: 'shell', version: 'v2' });
     expect(native.stageUpdateDelta).not.toHaveBeenCalled();
+  });
+
+  it('stages an update whose manifest hash matches release.manifests', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const manifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v2', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      bundleZip: { hash: 'b'.repeat(64), size: 100 },
+    };
+    // `manifests[shell]` must be the ACTUAL sha256 hex of the manifest's canonical JSON —
+    // computed the same way otaClient.ts's (non-exported) sha256Hex does.
+    const { sha256 } = await import('@noble/hashes/sha2.js');
+    const expectedHash = Array.from(sha256(new TextEncoder().encode(manifestHashPayload(manifest))), (b) => b.toString(16).padStart(2, '0')).join('');
+    const release = signRelease(
+      { schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1, manifests: { shell: expectedHash } },
+      privateKey,
+    );
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(manifest));
+    const native = mockNative({ getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' } }) }) });
+
+    const result = await checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native,
+    });
+
+    expect(result).toEqual({ outcome: 'staged', version: 'v2', mandatory: false });
+    expect(native.stageUpdate).toHaveBeenCalled();
+  });
+
+  it('reports manifest-untrusted and stages nothing when the manifest hash does not match release.manifests', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const manifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v2', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      bundleZip: { hash: 'b'.repeat(64), size: 100 },
+    };
+    const wrongHash = 'f'.repeat(64);
+    const release = signRelease(
+      { schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1, manifests: { shell: wrongHash } },
+      privateKey,
+    );
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(manifest));
+    const native = mockNative({ getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' } }) }) });
+
+    const result = await checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native,
+    });
+
+    expect(result).toEqual({ outcome: 'manifest-untrusted', version: 'v2', expected: wrongHash, actual: expect.any(String) });
+    expect(native.stageUpdate).not.toHaveBeenCalled();
+    expect(native.stageUpdateDelta).not.toHaveBeenCalled();
+    expect(native.activate).not.toHaveBeenCalled();
+  });
+
+  it('stages normally when the release has no manifests field at all (back-compat)', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1 }, privateKey);
+    const manifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v2', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      bundleZip: { hash: 'b'.repeat(64), size: 100 },
+    };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(manifest));
+    const native = mockNative({ getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' } }) }) });
+
+    const result = await checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native,
+    });
+
+    expect(result).toEqual({ outcome: 'staged', version: 'v2', mandatory: false });
+    expect(native.stageUpdate).toHaveBeenCalled();
   });
 
   it('takes the delta path (not whole-zip) when the active version\'s manifest is fetchable', async () => {

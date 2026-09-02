@@ -13,7 +13,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 
 const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -58,7 +58,17 @@ if (group === 'storage' && cmd === 'objects' && rest[0] === 'update') {
 }
 
 if (group === 'storage' && cmd === 'cat') {
-  const localPath = toLocal(rest[0]);
+  const gcsUrl = rest[0];
+  const localPath = toLocal(gcsUrl);
+  // FAKE_GCS_MANIFEST_CAT_UNAUTHORIZED: force a non-404 failure specifically for a
+  // VERSIONED bundle manifest.json cat (release.json's own cat, matched separately below
+  // via FAKE_GCS_CAT_FAIL, is untouched by this flag) — used to test the version-collision
+  // guard's fail-loud branch: "could not check" must NOT be silently treated as "no
+  // collision" the way a genuine 404 is.
+  if (process.env.FAKE_GCS_MANIFEST_CAT_UNAUTHORIZED && /\\/bundles\\/.+\\/.+\\/manifest\\.json$/.test(gcsUrl)) {
+    process.stderr.write('ERROR: (gcloud.storage.cat) HTTPError 401: Unauthorized.\\n');
+    process.exit(1);
+  }
   if (!fs.existsSync(localPath)) { process.stderr.write('ERROR: (gcloud.storage.cat) not found: 404.\\n'); process.exit(1); }
   // FAKE_GCS_CAT_FAIL: simulate describe succeeding (the object exists) but the
   // subsequent cat failing/erroring — used to test that this is NOT treated as
@@ -110,13 +120,13 @@ process.exit(1);
 `;
 
 function runNode(cwd: string, env: NodeJS.ProcessEnv, args: string[]): { status: number; stdout: string; stderr: string } {
-  try {
-    const stdout = execFileSync('node', args, { cwd, env, encoding: 'utf8' });
-    return { status: 0, stdout, stderr: '' };
-  } catch (e) {
-    const err = e as { status?: number; stdout?: string; stderr?: string };
-    return { status: err.status ?? 1, stdout: err.stdout ?? '', stderr: err.stderr ?? '' };
-  }
+  // spawnSync, not execFileSync — execFileSync throws (and its catch-block-only branch
+  // above USED to discard stderr on every SUCCESSFUL run, returning '' regardless of what
+  // the child actually wrote there). Several assertions below need to read `console.warn`
+  // output (which goes to stderr) from a run that exits 0, so stderr must be captured on
+  // BOTH the success and failure path — spawnSync always returns both.
+  const result = spawnSync('node', args, { cwd, env, encoding: 'utf8' });
+  return { status: result.status ?? 1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
 }
 
 describe('ota-publish.mjs release.json optimistic concurrency', () => {
@@ -297,6 +307,64 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     expect(after).toBe(before);
   });
 
+  it('#570: preserves another bundle\'s manifests entry across a publish of a different bundle', () => {
+    const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+
+    const first = publish('shell', 'v1');
+    expect(first.status).toBe(0);
+    const afterFirst = JSON.parse(fs.readFileSync(path.join(bucketDir, 'fakebucket', 'testprefix', 'release.json'), 'utf8'));
+    expect(afterFirst.manifests.shell).toMatch(/^[0-9a-f]{64}$/);
+    const shellHash = afterFirst.manifests.shell;
+
+    // Publishing a DIFFERENT bundle must not touch "shell"'s already-published entry —
+    // the load-bearing merge this test guards against regressing.
+    const second = publish('sling', 'v1');
+    expect(second.status).toBe(0);
+    const afterSecond = JSON.parse(fs.readFileSync(path.join(bucketDir, 'fakebucket', 'testprefix', 'release.json'), 'utf8'));
+    expect(afterSecond.manifests.shell).toBe(shellHash);
+    expect(afterSecond.manifests.sling).toMatch(/^[0-9a-f]{64}$/);
+    expect(afterSecond.bundles).toEqual({ shell: 'v1', sling: 'v1' });
+  });
+
+  it('#570: prunes a manifests entry whose bundle is no longer in release.bundles (merge/prune mechanics only, fake hash)', () => {
+    const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+
+    // Seed a release.json directly (simulating a bundle that was removed from `bundles`
+    // by some other means, leaving a stale "ghost" entry in `manifests`) — `bundles` has
+    // only "shell", but `manifests` also carries an untracked "ghost" key.
+    //
+    // `manifests.shell` below is `'a'.repeat(64)` — a FAKE hash, deliberately not the real
+    // sha256 of any manifest.json. That is standing in ONLY to exercise the merge/prune
+    // MECHANICS this test is about (does a publish of a different bundle preserve "shell"'s
+    // entry while dropping "ghost"'s) — it is NOT an endorsement of a mismatched/stale
+    // manifest hash as a legitimate bucket state. A real bucket with `bundles.shell = 'v1'`
+    // and a `manifests.shell` that doesn't hash-match the ACTUAL v1 manifest.json is exactly
+    // the poisoned state the version-collision guard in ota-publish.mjs exists to prevent —
+    // every client on that bundle version would get `manifest-untrusted` permanently. This
+    // test seeds release.json directly, bypassing that guard, purely to isolate the
+    // merge/prune logic from real hashing and uploads.
+    const releaseDir = path.join(bucketDir, 'fakebucket', 'testprefix');
+    fs.mkdirSync(releaseDir, { recursive: true });
+    fs.writeFileSync(path.join(releaseDir, 'release.json'), JSON.stringify({
+      schema: 1,
+      bundles: { shell: 'v1' },
+      mandatory: false,
+      minEngineApi: 1,
+      manifests: { shell: 'a'.repeat(64), ghost: 'b'.repeat(64) },
+      sig: 'not-checked-by-this-fake', // this publish re-signs; the stale sig is never read back as valid
+    }));
+
+    const result = publish('sling', 'v1');
+    expect(result.status).toBe(0);
+
+    const release = JSON.parse(fs.readFileSync(path.join(releaseDir, 'release.json'), 'utf8'));
+    expect(release.bundles).toEqual({ shell: 'v1', sling: 'v1' });
+    expect(release.manifests.ghost).toBeUndefined();
+    expect(Object.keys(release.manifests).sort()).toEqual(['shell', 'sling']);
+  });
+
   it('--repo-root points key resolution somewhere else, and a key THERE is found and used', () => {
     const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-other-root-with-key-'));
     try {
@@ -420,5 +488,126 @@ describe('ota-publish.mjs mandatory stickiness', () => {
     expect(release.bundles).toEqual({ shell: 'v1', sling: 'v1' });
     expect(release.minEngineApi).toBe(2);
     expect(release.mandatory).toBe(true);
+  });
+});
+
+/** The version-collision guard (A1/A2, adversarial review round 2) — covers what the
+ *  `manifests` merge/prune tests above do NOT: the collision guard itself (retry-is-safe
+ *  vs genuine-collision vs cannot-check) and the unprotected-bundle warning. Each of these
+ *  was verified, per the review brief, to actually FAIL if its corresponding source fix is
+ *  reverted (checked manually by temporarily reverting each fix, running this file, then
+ *  restoring — `git diff --stat` on the source files is clean after). Reuses the same
+ *  fake-gcloud harness as the race-condition suite above (FAKE_GCLOUD_SRC + runNode are
+ *  module-scoped there). */
+describe('ota-publish.mjs version-collision guard', () => {
+  let repoRoot: string;
+  let binDir: string;
+  let bucketDir: string;
+  let distDir: string;
+
+  beforeEach(() => {
+    repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-collision-repo-'));
+    fs.mkdirSync(path.join(repoRoot, 'engine', 'scripts'), { recursive: true });
+    fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
+    fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
+
+    binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-collision-'));
+    if (process.platform === 'win32') {
+      fs.writeFileSync(path.join(binDir, 'gcloud.cjs'), FAKE_GCLOUD_SRC);
+      fs.writeFileSync(path.join(binDir, 'gcloud.cmd'), `@node "%~dp0gcloud.cjs" %*\r\n`);
+    } else {
+      const gcloudPath = path.join(binDir, 'gcloud');
+      fs.writeFileSync(gcloudPath, FAKE_GCLOUD_SRC);
+      fs.chmodSync(gcloudPath, 0o755);
+    }
+
+    bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-collision-'));
+    distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-collision-dist-'));
+    fs.writeFileSync(path.join(distDir, 'index.html'), '<html>collision-test</html>');
+
+    const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+  });
+
+  afterEach(() => {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+    fs.rmSync(binDir, { recursive: true, force: true });
+    fs.rmSync(bucketDir, { recursive: true, force: true });
+    fs.rmSync(distDir, { recursive: true, force: true });
+  });
+
+  function publish(name: string, version: string, envOverrides: NodeJS.ProcessEnv = {}) {
+    return runNode(repoRoot, {
+      ...process.env,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+      FAKE_GCS_BUCKET_DIR: bucketDir,
+      ...envOverrides,
+    }, [
+      'engine/scripts/ota-publish.mjs',
+      '--dist', distDir, '--bucket', 'gs://fakebucket/testprefix',
+      '--name', name, '--version', version, '--engine-api', '1', '--key', 'default',
+    ]);
+  }
+
+  it('A1: retrying an already-published version with IDENTICAL contents succeeds and logs it', () => {
+    const first = publish('shell', 'v1');
+    expect(first.status).toBe(0);
+
+    // Same name/version, same dist contents — this is what a retry after a failure in the
+    // release.json loop (which runs AFTER the manifest/zip/files upload) looks like. Before
+    // A1, the guard could not tell this apart from a genuine collision and refused it,
+    // permanently burning the version string on the exact failure class it exists to let a
+    // publisher recover from.
+    const second = publish('shell', 'v1');
+    expect(second.status).toBe(0);
+    expect(second.stdout).toMatch(/already published with identical contents — resuming/);
+  });
+
+  it('A1: re-publishing an already-published version with DIFFERENT contents is a genuine collision', () => {
+    const first = publish('shell', 'v1');
+    expect(first.status).toBe(0);
+
+    // Change what "shell@v1" would contain between the two publishes.
+    fs.writeFileSync(path.join(distDir, 'index.html'), '<html>DIFFERENT contents</html>');
+
+    const second = publish('shell', 'v1');
+    expect(second.status).not.toBe(0);
+    expect(second.stderr).toMatch(/Version collision/);
+  });
+
+  it('A1: a version-collision check that cannot be verified fails LOUDLY, not open', () => {
+    const first = publish('shell', 'v1');
+    expect(first.status).toBe(0);
+
+    // Simulate an auth/permissions failure reading the EXISTING versioned manifest.json —
+    // this is the one path where a wrong regex in isGcloudObjectNotFoundError (or any
+    // other "treat unknown as safe" bug) would silently disable the guard entirely, and
+    // nothing else in the suite pins it.
+    const second = publish('shell', 'v1', { FAKE_GCS_MANIFEST_CAT_UNAUTHORIZED: '1' });
+    expect(second.status).not.toBe(0);
+    expect(second.stderr).toMatch(/could not check for a version collision/i);
+  });
+
+  it('A2 + fix 4: a pre-#570 release.json (no manifests field) names the OTHER bundle as unprotected on publish', () => {
+    // Seed a release.json shaped like one written before #570 ever existed: `bundles` has
+    // two entries, `manifests` is entirely absent.
+    const releaseDir = path.join(bucketDir, 'fakebucket', 'testprefix');
+    fs.mkdirSync(releaseDir, { recursive: true });
+    fs.writeFileSync(path.join(releaseDir, 'release.json'), JSON.stringify({
+      schema: 1,
+      bundles: { shell: 'v1', sling: 'v1' },
+      mandatory: false,
+      minEngineApi: 1,
+      sig: 'stale-sig-not-checked-by-this-fake', // this publish re-signs; the fake never verifies it
+    }));
+
+    // Publishing "sling" only ever writes manifests["sling"] — "shell" has no bundle
+    // manifest.json in the bucket at all yet (it was never actually published by this
+    // test, only listed in bundles), so it stays uncovered and the warning must name it.
+    const result = publish('sling', 'v1');
+    expect(result.status).toBe(0);
+    expect(result.stderr).toMatch(/WARNING: manifest verification is NOT enabled for: shell/);
   });
 });
