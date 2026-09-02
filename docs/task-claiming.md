@@ -71,7 +71,36 @@ second both succeed, because GitHub has no compare-and-set here. If you find a f
 `wip/*` label already on an issue you were about to start, that session got there first —
 drop it, whatever your local state says.
 
-### 3. Release a claim you abandon
+### 3. Filing a bug: validate first, and say what you tried
+
+**A bug issue must record a validation attempt, and its outcome.** Between 2026-08-23 and
+2026-09-02, 244 issues were opened, 78 of them from `/close-out` sibling sweeps. 23
+self-declared "read-not-reproduced", and #487 shipped nine items whose own author flagged
+items 3-9 as unverified. The cost of an unvalidated finding does not disappear — it moves to
+the next session, which loads full context before discovering the bug is not real. This rule
+puts the cost on the filer, not the reader.
+
+This is **not** "reproduce or don't file" — a race that cannot be triggered on demand is still
+worth filing, and the sweep findings did include real defects (Court payout losses, #536/#555).
+The requirement is the attempt and the honest outcome, not a green repro.
+
+An issue's validation must land in one of three states:
+
+| Outcome | What it means | Worked line |
+|---|---|---|
+| **Observed** | You saw the defect happen, and can cite the evidence | "Observed: `modoki_journal` shows `payout.amount: -4` at tick 812 — see attached line." |
+| **Attempted, could not trigger** | You tried to make it fire and it didn't — this is a legitimate filing, not a weaker one | "Attempted: drove the interleaving 20x via `createTestWorld` at seed 7; could not reproduce the double-fire. Filing anyway because the code path is real and the race window is narrow." |
+| **Read-only** | You have not run it at all — allowed, but only when declared up front, with the reason | "Read-only (no evidence attempted) — this game has no running fixture on this clone; filing from the code path at `runtime/systems.ts:112`." |
+
+**The declaration goes on the FIRST LINE of the issue body, not buried** — a reader deciding
+whether to pick the ticket up must see it without scrolling past the mechanism and the "why it
+matters" first.
+
+The repo's own corpus already does part of this voluntarily — 23 issues in the window above
+said "read-not-reproduced" unprompted. This rule makes that universal, and adds the attempt:
+a read-only filing needs a *reason*, not just a disclaimer.
+
+### 4. Release a claim you abandon
 
 A stale claim is worse than no claim: it blocks every other clone indefinitely, and nothing
 expires it.
@@ -83,7 +112,7 @@ gh issue edit <N> --remove-label "wip/$(git branch --show-current)"
 Do this whenever you stop without landing — the owner redirects you, the task turns out to
 be blocked, or you were wrong about the scope.
 
-### 4. Keep the issue honest while you work
+### 5. Keep the issue honest while you work
 
 **An issue is a description written before the work — so the work is what tests it.** Comment
 on the issue when what you learn changes what it says. Three cases that always warrant one:
@@ -96,15 +125,15 @@ on the issue when what you learn changes what it says. Three cases that always w
 - **The scope moved.** Something split out into its own issue, or part of it turned out to be
   a different bug. Link both ways — an issue that quietly grew or shrank is unreviewable.
 - **You stopped without landing.** Say why, in the same breath as releasing the claim (step
-  3). "Blocked on X" is a useful issue; a silently unclaimed one just looks untouched.
+  4). "Blocked on X" is a useful issue; a silently unclaimed one just looks untouched.
 
-**This is not step 5.** Comment about the ISSUE — its premise, scope, status. The durable
+**This is not step 6.** Comment about the ISSUE — its premise, scope, status. The durable
 engineering knowledge still goes in the feature doc, because that is what survives the close.
 
 The cheap test: *if the owner read only this issue, would they believe something false?* If
 yes, comment. If it is merely more detail, it belongs in the doc or the commit message.
 
-### 5. Close it yourself when the work is done and verified
+### 6. Close it yourself when the work is done and verified
 
 Two halves, and you need both:
 
@@ -137,7 +166,7 @@ claim reads as still-owned in every `wip/*` query.
 branch — the merge into `main` is the owner's separate, deliberate act. If a branch is
 dropped or a change reverted, reopen the issue; do not assume closed means shipped.
 
-### 6. Write the incident record before the issue closes
+### 7. Write the incident record before the issue closes
 
 An Issue's value dies when it closes. Before landing a non-trivial fix, put the durable part
 — root cause, what the wrong theories were, the lesson — in the **feature doc** it belongs
