@@ -73,12 +73,16 @@ drop it, whatever your local state says.
 
 ### 3. Filing a bug: validate first, and say what you tried
 
-**A bug issue must record a validation attempt, and its outcome.** Between 2026-08-23 and
-2026-09-02, 244 issues were opened, 78 of them from `/close-out` sibling sweeps. 23
-self-declared "read-not-reproduced", and #487 shipped nine items whose own author flagged
-items 3-9 as unverified. The cost of an unvalidated finding does not disappear — it moves to
-the next session, which loads full context before discovering the bug is not real. This rule
-puts the cost on the filer, not the reader.
+**Any issue reporting a defect must record a validation attempt, and its outcome — whatever
+label it carries.** This is not scoped to the `bug` label: of 248 issues opened since
+2026-08-23, only 156 carry `bug` — 92 don't, and several of those are genuine defects filed
+under something else (#571 anti-rollback is `enhancement`; #574 is `needs-owner`; #572 carries
+only `court`). A defect filed as `enhancement` is still a defect. Of those same 248, at least
+78 came from `/close-out` sibling sweeps, 23 self-declared "read-not-reproduced", and #487
+shipped nine items whose own author flagged items 3-9 as unverified. The cost of an
+unvalidated finding does not disappear — it moves to the next session, which loads full
+context before discovering the bug is not real. This rule puts the cost on the filer, not
+the reader.
 
 This is **not** "reproduce or don't file" — a race that cannot be triggered on demand is still
 worth filing, and the sweep findings did include real defects (Court payout losses, #536/#555).
@@ -181,6 +185,15 @@ not evaporate into a closed ticket.
 ```bash
 gh issue create --title "..." --body "..."
 ```
+
+If the issue reports a defect, § 3 above applies: the body's **first line** must record the
+validation outcome — observed, attempted but could not trigger, or read-only with the reason.
+**`gh issue create` with `--title` and `--body`/`--body-file` consults no issue template** —
+`.github/ISSUE_TEMPLATE/bug.yml` only renders in the GitHub web New-Issue chooser (or via
+`gh issue create --template "Bug report"`). Since every issue in this repo is filed with the CLI
+recipe above, nothing mechanical prompts for the validation line — the filer writes it or it is
+absent. Verified against `gh issue create --help`, gh 2.92.0: `-T, --template name   Template name
+to use as starting body text`.
 
 Write the body the way the incident write-ups in the feature docs are written — the measured evidence,
 the file and line, what was ruled out — not a one-line summary. The detail is what makes an
