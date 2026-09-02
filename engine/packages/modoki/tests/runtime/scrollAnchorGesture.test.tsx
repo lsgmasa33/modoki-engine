@@ -86,6 +86,13 @@ describe('useScrollAnchoring — the gesture guard (#579)', () => {
 
   beforeEach(async () => {
     (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = FakeResizeObserver;
+    // Deterministic stand-in, not a timing claim: maps to the same 0ms macrotask `settle()` already
+    // waits on, so every existing scroll-then-settle in this file also flushes the deferred snapshot
+    // without needing to guess jsdom's own rAF cadence.
+    (globalThis as unknown as { requestAnimationFrame: (cb: FrameRequestCallback) => number })
+      .requestAnimationFrame = (cb) => setTimeout(() => cb(0), 0) as unknown as number;
+    (globalThis as unknown as { cancelAnimationFrame: (id: number) => void })
+      .cancelAnimationFrame = (id) => clearTimeout(id as unknown as ReturnType<typeof setTimeout>);
     vi.useRealTimers();
     let captured: HTMLDivElement | null = null;
     const onReady = (el: HTMLDivElement) => { captured = el; };
@@ -106,6 +113,23 @@ describe('useScrollAnchoring — the gesture guard (#579)', () => {
   it('CONTROL — no gesture: the #531 correction lands (300 -> 240)', async () => {
     await removeTopRow();
     expect(box.scrollTop).toBe(240);
+  });
+
+  it('restore() flushes a still-pending deferred snapshot rather than reading stale candidates (found in review of #579 follow-up — MutationObserver is a microtask and beats requestAnimationFrame)', async () => {
+    // A FRESH scroll whose snapshot flush is still pending (no settle yet) — then a content
+    // mutation lands before that rAF has any chance to fire. Without a flush at the top of
+    // `restore()`, it would read `state.candidates` from the OLD scroll position (300, from
+    // `beforeEach`) against the NEW `rawOffset` (120) it was just given — restoring to the wrong
+    // place. Row index 3 sits BELOW the new anchor (row 2, which starts exactly at 120), so
+    // removing it must not move the box at all.
+    await act(async () => {
+      box.scrollTop = 120;
+      box.dispatchEvent(new Event('scroll'));
+      box.removeChild(box.children[3]);
+      stamp();
+    });
+    await settle();
+    expect(box.scrollTop, 'removing a row below the anchor must not move the box').toBe(120);
   });
 
   it('a mouse drag defers the correction, and it STILL LANDS at release even with a scroll event in between (finding: scheduleResync must not clobber a pending restore)', async () => {
@@ -137,6 +161,25 @@ describe('useScrollAnchoring — the gesture guard (#579)', () => {
     await act(async () => { box.children[3].dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse' })); });
     await removeTopRow();
     expect(box.scrollTop, 'deferred, not applied').toBe(300);
+  });
+
+  it('does not read child layout geometry synchronously inside the scroll callback (WebKit compositor-stall fix)', async () => {
+    let reads = 0;
+    let readsAtDispatchReturn = -1;
+    Array.from(box.children).forEach((c, i) => {
+      Object.defineProperty(c, 'offsetTop', { configurable: true, get: () => { reads += 1; return i * ROW; } });
+    });
+    await act(async () => {
+      box.scrollTop = 250;
+      box.dispatchEvent(new Event('scroll'));
+      // Read the counter INSIDE the same act callback, before any microtask/macrotask runs — this
+      // is the synchronous continuation of the scroll dispatch, exactly the window that must stay
+      // read-free.
+      readsAtDispatchReturn = reads;
+    });
+    expect(readsAtDispatchReturn, 'no child geometry read synchronously inside the scroll callback').toBe(0);
+    await settle();
+    expect(reads, 'the deferred flush eventually reads the child geometry it needs').toBeGreaterThan(0);
   });
 
   it('a genuine mouse pointercancel still ends the gesture immediately — this is deliberate, not the touch bug', async () => {

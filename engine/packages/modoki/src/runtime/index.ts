@@ -415,6 +415,14 @@ export { UIRenderer } from './ui/UIRenderer';
 // should use `UIAnchor.safeArea` and never touch this — it exists for a game that has to
 // compute WITH the inset (a reserved bottom band, a board fitted into what is left).
 export { getSafeAreaInsets, resetSafeAreaInsets, type SafeAreaInsets } from './ui/safeArea';
+// Whether a native TOUCH gesture is live anywhere in the DOM, independent of the canvas-scoped
+// `Input` resource (which deliberately excludes a press starting on DOM chrome). Touch only —
+// see the module's own header for why mouse/pointer tracking was tried and dropped. For deferring
+// expensive synchronous work off a live touch-scroll gesture on UI chrome (#579) — see the
+// module's own header before reaching for this; most input should go through `Input` instead.
+export {
+  wireDomGestureTracking, unwireDomGestureTracking, isDomGestureActive, resetDomGestureTracking,
+} from './ui/domGestureTracking';
 export { registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams } from './core/actionRegistry';
 export type { UIActionContext, UIActionHandler, UIActionDef, UIActionPayload, DispatchOptions } from './core/actionRegistry';
 export { registerEngineActions } from './actions/engineActions';

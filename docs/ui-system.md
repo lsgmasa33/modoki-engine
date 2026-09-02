@@ -95,6 +95,36 @@ Field groups (representative fields, verified against `UIElement.ts`):
   same-shape-as-`scheduleResync` safety timeout in case neither fires) and DEFERS any pending
   restore until the gesture ends, rather than fighting it. See `scrollAnchor.ts`'s header comment.
 
+  ⚠️ **A fourth, UNRELATED mechanism that reads identically on old hardware (#579 follow-up):**
+  none of the above actually explained a freeze measured live on an iPhone 8 (iOS 16.7.16) —
+  `touchmove` kept firing the whole gesture; only the resulting scroll position stopped updating.
+  Root cause was `runtime/ui/safeArea.ts`'s `getSafeAreaInsets()`: past its own 250ms cache
+  throttle it re-measures by appending a hidden probe and reading `getComputedStyle()` on it — a
+  forced synchronous layout by construction, REGARDLESS of when in the frame it runs (confirmed:
+  deferring the call to `requestAnimationFrame`, the fix that class of problem usually takes,
+  only reduced the damage here — inserting a fresh element and immediately querying it forces a
+  layout for that element no matter the timing). Court calls it from six per-frame chrome-sync
+  functions that this codebase deliberately never gates on a dirty flag, so the forced reflow was
+  firing continuously — including with a modal or the menu covering the board entirely, where
+  none of it was visible. Cheap enough to be invisible on modern hardware; enough to desync
+  WebKit's native touch-scroll compositor on the iPhone 8. Fixed at the call site, not the
+  mechanism (which is still needed — see `safeArea.ts`'s own header for the real Android case it
+  exists for): Court's `boardSafeAreaInsets()` (`runtime/systems.ts`) skips the call while a
+  touch gesture is live anywhere on the page, reusing the last-read value.
+  ⚠️ **A first cut gated on VISIBILITY instead (`boardInputBlocker() || menuBlocking()`), and
+  adversarial review found it backwards for at least two of the six call sites**: `MenuIconBar`
+  is a child of `MenuRoot`, whose own visibility IS `menuT > 0` — the same condition
+  `menuBlocking()` reports — so that gate froze the icon row's inset for as long as the MENU
+  stayed open (i.e. exactly while it was on screen) and only read it live while hidden. A
+  per-consumer visibility gate would fix that inversion but not the actual bug: the store's own
+  chrome (`syncModalBannerInset`'s `storeModal` target) legitimately needs a live read for the
+  entire time the store is open, including while its list is being scrolled — visibility can
+  never tell "store open and static" apart from "store open and a finger is dragging its list",
+  and only the second is what the forced layout costs anything against. A GESTURE signal answers
+  the right question directly. See `boardSafeAreaInsets`'s own doc for the full argument,
+  including why this still isn't the memoization gate `syncPageAndButtons`'s header warns
+  against re-adding.
+
   ⚠️ **Match `gapUnit` to the unit the CHILDREN are sized in.** `gap` was px-only until
   2026-08-07, and a `flexWrap: 'wrap'` container whose items scale (`vh`/`vmin`/`%`) while its
   gaps do not has a viewport size below which an item silently reflows onto the next row — the

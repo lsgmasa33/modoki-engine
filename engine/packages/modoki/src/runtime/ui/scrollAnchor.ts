@@ -402,7 +402,49 @@ export function useScrollAnchoring(enabled: boolean, el: HTMLDivElement | null):
       }, 0);
     };
 
+    // ⚠️ **The child-geometry read itself must not run inside the `scroll` callback.** `snapshot`
+    // reads `offsetTop`/`offsetHeight` on every flow child (Court's shelf: up to 6), and doing that
+    // synchronously from a native `scroll` listener is a documented WebKit/WKWebView stall: a
+    // forced-layout read from inside the browser's own scroll-event dispatch can make the
+    // compositor stop delivering further scroll updates for the gesture, independent of any
+    // `requestAnimationFrame`/main-thread stall — both were checked live on an iPhone 8 and came
+    // back clean DURING the freeze (an empty rAF frame-gap log, zero `scrollTop` writes), so the
+    // stall was upstream of anything this file's own timing could see. Measured live: a touch-drag
+    // moved for ~100-150ms then stopped responding to further `touchmove` until the finger lifted.
+    // Deferring the read to `requestAnimationFrame` — after the browser's own layout pass for the
+    // frame, not inside its scroll dispatch — is the standard fix for this class of stall.
+    //
+    // Coalescing to one flush per axis per frame is a free side effect, not the point: `remember`
+    // still runs, and still classifies every `scroll` event synchronously (an offset/content-size
+    // read on `el` itself, not its children — the same cost `useScrollView`'s own `push` already
+    // pays every scroll event without issue). Only the PER-CHILD read moves. The flush always reads
+    // `state.rawOffset` as it stands at flush time, not a value captured when the frame was
+    // requested, so a flush landing after several more `scroll` events computes candidates for the
+    // CURRENT position — but "computes for" is not "is available to `restore()` by".
+    //
+    // ⚠️ **`restore()` MUST flush a pending snapshot before reading `state.candidates` — found in
+    // review, reproduced with a probe.** `restore()` is driven by the `MutationObserver` below,
+    // which delivers as a MICROTASK, strictly before the next `requestAnimationFrame` — so a
+    // content change landing between a `scroll` event and this file's own deferred flush reaches
+    // `restore()` while `state.candidates` still describes the PREVIOUS scroll position, not the
+    // one `state.rawOffset` was just updated to. That is #531's own jump wearing this fix's hat:
+    // removing a row entirely below the viewport moved the box by a full row height in the probe,
+    // for no reason but flush timing. `restore()` (below) flushes synchronously first — the read
+    // stays out of the `scroll` dispatch (the actual fix), and `restore()` never sees a candidate
+    // list older than the `rawOffset` it is being asked to restore against.
+    let snapshotFrame: ReturnType<typeof requestAnimationFrame> | null = null;
+    const snapshotDue = axes.map(() => false);
+    const flushSnapshots = () => {
+      if (snapshotFrame !== null) { cancelAnimationFrame(snapshotFrame); snapshotFrame = null; }
+      axes.forEach((axis, i) => {
+        if (!snapshotDue[i]) return;
+        snapshotDue[i] = false;
+        held[i].candidates = snapshot(axis, held[i].rawOffset);
+      });
+    };
+
     const remember = () => {
+      let needsFrame = false;
       axes.forEach((axis, i) => {
         const state = held[i];
         if (axis.max(el) <= 0) return;        // this axis does not scroll; nothing to hold
@@ -416,11 +458,18 @@ export function useScrollAnchoring(enabled: boolean, el: HTMLDivElement | null):
         state.applied = null;
         state.rawOffset = offset;
         state.contentSize = content;
-        state.candidates = snapshot(axis, offset);
+        snapshotDue[i] = true;
+        needsFrame = true;
       });
+      if (needsFrame && snapshotFrame === null) snapshotFrame = requestAnimationFrame(flushSnapshots);
     };
 
     const restore = () => {
+      // A pending deferred snapshot describes `state.rawOffset` as of the LAST scroll event, but
+      // `state.candidates` only catches up once the flush runs — and `restore` can be reached (via
+      // the MutationObserver below, a microtask) before that rAF fires. Flush first, always: see
+      // `flushSnapshots`'s own comment for the reproduced defect this guards.
+      flushSnapshots();
       axes.forEach((axis, i) => {
         const state = held[i];
         const max = axis.max(el);
@@ -475,6 +524,7 @@ export function useScrollAnchoring(enabled: boolean, el: HTMLDivElement | null):
       mo.disconnect();
       if (resyncTimer !== null) clearTimeout(resyncTimer);
       if (gestureSafetyTimer !== null) clearTimeout(gestureSafetyTimer);
+      if (snapshotFrame !== null) cancelAnimationFrame(snapshotFrame);
       el.style.overflowAnchor = '';
     };
   }, [el, enabled]);

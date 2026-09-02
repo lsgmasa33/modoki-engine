@@ -19,11 +19,24 @@ import { getSafeAreaInsets, measureSafeAreaInsets, resetSafeAreaInsets } from '.
 import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
 
 let root: HTMLElement;
+let cancelCount = 0;
+
+/** Deterministic stand-in for `requestAnimationFrame`, so a test can flush the deferred
+ *  re-measure (see `getSafeAreaInsets`'s own doc for why it is deferred) without depending on
+ *  jsdom's own rAF cadence. Maps to a 0ms macrotask, which `flushRaf` awaits. `cancelAnimationFrame`
+ *  is the matching `clearTimeout`, counted so a test can assert a REAL cancellation happened
+ *  (not just that a flag got cleared — see the `resetSafeAreaInsets` cancellation test below). */
+const flushRaf = async () => { await new Promise((r) => setTimeout(r, 0)); };
 
 beforeEach(() => {
   resetSafeAreaInsets();
   root = document.createElement('div');
   document.body.appendChild(root);
+  cancelCount = 0;
+  (globalThis as unknown as { requestAnimationFrame: (cb: FrameRequestCallback) => number })
+    .requestAnimationFrame = (cb) => setTimeout(() => cb(0), 0) as unknown as number;
+  (globalThis as unknown as { cancelAnimationFrame: (id: number) => void })
+    .cancelAnimationFrame = (id) => { cancelCount += 1; clearTimeout(id as unknown as ReturnType<typeof setTimeout>); };
 });
 afterEach(() => {
   root.remove();
@@ -124,7 +137,7 @@ describe('getSafeAreaInsets', () => {
    * `env()` changing fires no event, so there is nothing to subscribe to. The read throttles
    * itself on the sanctioned clock instead.
    */
-  it('re-measures when the cache goes stale, with NO resize to prompt it', () => {
+  it('re-measures when the cache goes stale, with NO resize to prompt it', async () => {
     setManualNow(0);
     root.style.setProperty('--ui-sa-bottom', '48px');
     measureSafeAreaInsets(root);
@@ -134,12 +147,30 @@ describe('getSafeAreaInsets', () => {
     root.style.setProperty('--ui-sa-bottom', '0px');
     // Within the throttle the cached value still stands...
     expect(getSafeAreaInsets().bottom).toBe(48);
-    // ...and past it, the read refreshes itself.
+    // ...and past it, the read schedules its own refresh (deferred one rAF — see the
+    // function's own doc for why) rather than forcing the layout inline...
     advanceManual(300);
+    expect(getSafeAreaInsets().bottom, 'still the stale value on the crossing call itself').toBe(48);
+    // ...which lands the moment that frame flushes, with nothing else prompting it.
+    await flushRaf();
     expect(getSafeAreaInsets().bottom).toBe(0);
   });
 
-  it('does not re-measure on every call — a per-frame caller must not force a style read per frame', () => {
+  it('does not append (or read) the probe synchronously on the call that crosses the throttle (WebKit compositor-stall fix, #579 follow-up)', async () => {
+    setManualNow(0);
+    root.style.setProperty('--ui-sa-top', '68px');
+    measureSafeAreaInsets(root);
+    let appends = 0;
+    const originalAppend = root.appendChild.bind(root);
+    root.appendChild = ((node: Node) => { appends += 1; return originalAppend(node); }) as typeof root.appendChild;
+    advanceManual(300);
+    const appendsOnCrossingCall = (() => { getSafeAreaInsets(); return appends; })();
+    expect(appendsOnCrossingCall, 'no probe append synchronously inside the crossing call').toBe(0);
+    await flushRaf();
+    expect(appends, 'the deferred refresh eventually appends the probe it needs').toBe(1);
+  });
+
+  it('does not re-measure on every call — a per-frame caller must not force a style read per frame', async () => {
     setManualNow(0);
     root.style.setProperty('--ui-sa-top', '68px');
     measureSafeAreaInsets(root);
@@ -149,6 +180,8 @@ describe('getSafeAreaInsets', () => {
       expect(getSafeAreaInsets().top).toBe(68);
     }
     advanceManual(100);
+    getSafeAreaInsets();                     // crosses the throttle — schedules the deferred refresh
+    await flushRaf();
     expect(getSafeAreaInsets().top).toBe(0);
   });
 
@@ -200,6 +233,71 @@ describe('getSafeAreaInsets', () => {
     document.body.appendChild(fresh);
     measureSafeAreaInsets(fresh);
     expect(getSafeAreaInsets().top).toBe(44);
+    fresh.remove();
+  });
+
+  /**
+   * A NEWER registration replacing `root` WHILE a deferred refresh for the OLD one is still
+   * queued must not be clobbered by that stale callback landing late (found in review, #579
+   * follow-up) — the editor's two-viewport case the surrounding code already names: closing one
+   * viewport's UIRenderer and opening another can interleave with an in-flight throttle window.
+   */
+  it('a newer root registered before a queued refresh fires is not clobbered by it', async () => {
+    setManualNow(0);
+    root.style.setProperty('--ui-sa-top', '68px');
+    measureSafeAreaInsets(root);                 // seeds root, lastMeasuredAt = 0
+    advanceManual(300);                           // past the throttle
+    getSafeAreaInsets();                          // schedules a deferred refresh FOR `root`
+
+    const fresh = document.createElement('div');
+    fresh.style.setProperty('--ui-sa-top', '44px');
+    document.body.appendChild(fresh);
+    measureSafeAreaInsets(fresh);                 // a newer registration lands before the flush
+    expect(getSafeAreaInsets().top, 'the newer registration is immediately live').toBe(44);
+
+    await flushRaf();                             // the STALE callback (for `root`) fires now
+    expect(getSafeAreaInsets().top, 'must still be the newer root — not re-pointed to the stale one').toBe(44);
+
+    // And the newer root's OWN throttle must be unaffected — it still self-refreshes normally.
+    fresh.style.setProperty('--ui-sa-top', '99px');
+    advanceManual(300);
+    getSafeAreaInsets();
+    await flushRaf();
+    expect(getSafeAreaInsets().top).toBe(99);
+
+    root.remove();
+    fresh.remove();
+  });
+
+  /**
+   * `resetSafeAreaInsets` must cancel a REAL in-flight `requestAnimationFrame`, not merely clear
+   * the flag that gates scheduling a new one — found in review (#579 follow-up). The flag-only
+   * version left `refreshQueued` stuck `true` forever (no test could ever schedule another
+   * refresh again in the SAME process) and left the stale callback able to fire later against
+   * whatever registers next.
+   */
+  it('resetSafeAreaInsets cancels a queued refresh, and a fresh registration can schedule its own', async () => {
+    setManualNow(0);
+    root.style.setProperty('--ui-sa-top', '68px');
+    measureSafeAreaInsets(root);
+    advanceManual(300);
+    getSafeAreaInsets();                          // queues a refresh
+    expect(cancelCount, 'nothing cancelled yet').toBe(0);
+
+    resetSafeAreaInsets();                        // teardown while the refresh is in flight
+    expect(cancelCount, 'the real callback must be cancelled, not just flagged').toBe(1);
+
+    // A fresh registration, immediately after reset, must be able to queue ITS OWN refresh —
+    // proof `refreshQueued` did not get stuck `true` by the reset.
+    const fresh = document.createElement('div');
+    fresh.style.setProperty('--ui-sa-top', '30px');
+    document.body.appendChild(fresh);
+    measureSafeAreaInsets(fresh);
+    fresh.style.setProperty('--ui-sa-top', '77px');
+    advanceManual(300);
+    getSafeAreaInsets();
+    await flushRaf();
+    expect(getSafeAreaInsets().top, 'the fresh registration refreshes normally after a reset').toBe(77);
     fresh.remove();
   });
 });

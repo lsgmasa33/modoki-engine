@@ -59,6 +59,15 @@ let insets: SafeAreaInsets = { ...ZERO };
 /** The UI root to re-measure from, remembered so a READ can refresh itself. */
 let root: HTMLElement | null = null;
 let lastMeasuredAt = -Infinity;
+/** Set while a deferred re-measure (below) is queued, so a burst of calls inside one throttle
+ *  window schedules exactly one `requestAnimationFrame`, not one per call. */
+let refreshQueued = false;
+/** The queued frame's id, so `resetSafeAreaInsets` can cancel a real in-flight callback rather
+ *  than merely clearing the flag that gates scheduling a NEW one — found in review (#579
+ *  follow-up): a reset with a refresh in flight otherwise left `refreshQueued` stuck `true`
+ *  (suppressing every future refresh) and left a stray callback able to run against whatever
+ *  the NEXT test/session registers. */
+let refreshFrameId: ReturnType<typeof requestAnimationFrame> | null = null;
 
 /** How stale a cached inset may get, ms. Small enough that a bar hiding is invisible to
  *  the eye, large enough that a per-frame caller pays one forced style read every ~15
@@ -79,9 +88,30 @@ const REFRESH_MS = 250;
  *  There is no event to listen for — `env()` changing fires nothing — so the read
  *  refreshes itself on a throttle rather than waiting to be told. `rawNow` is the
  *  sanctioned clock wrapper (`runtime/core/clock.ts`), so a manual clock in a headless
- *  test still controls it and the determinism guard stays satisfied. */
+ *  test still controls it and the determinism guard stays satisfied.
+ *
+ *  ⚠️ **The re-measure is DEFERRED one `requestAnimationFrame`, not run inline.**
+ *  `measureSafeAreaInsets` appends a probe and reads its computed style — a forced
+ *  synchronous layout, by construction (WebKit/browsers flush ALL pending layout before
+ *  answering a geometry/style query, not just this element's). Running that inline from
+ *  whichever per-frame caller happened to cross the 250ms mark meant it landed wherever
+ *  a caller's OWN pending DOM write had left layout dirty — device-profiled on an iPhone
+ *  8 (#579 follow-up): a Safari Timeline recording showed exactly this call forcing a
+ *  layout every ~250-300ms, continuously, including mid-drag on a scrolling list, where
+ *  it visibly stalled WebKit's native touch-scroll compositor on old/weak hardware. A
+ *  rAF callback runs AFTER the browser's own layout pass for the frame, so the flush this
+ *  forces is one the browser was about to do anyway rather than one pulled forward.
+ *
+ *  ⚠️ This is a TIMING change, not a memoization/signature gate — every call still reads
+ *  through to a value that self-refreshes with no external trigger (the #273 property this
+ *  file exists for), just up to one frame later than before. It cannot reintroduce the
+ *  class of bug `syncPageAndButtons` (Court, `systems.ts`) warns about, where a cached
+ *  SIGNATURE survived a scene reload and matched against already-reset authored state: there
+ *  is no signature here, nothing is skipped, and the caller's own per-frame cadence is what
+ *  still drives every read — this only moves WHEN the expensive part of one particular read
+ *  runs, never whether the read happens. */
 export function getSafeAreaInsets(): SafeAreaInsets {
-  if (root && rawNow() - lastMeasuredAt > REFRESH_MS) {
+  if (root && rawNow() - lastMeasuredAt > REFRESH_MS && !refreshQueued) {
     // ⚠️ A DETACHED root must not be measured. `UIRenderer`'s callback ref returns early on
     // unmount (it has other teardown to skip), so it never hands this module a null — the
     // reference here simply goes stale, still pointing at a removed node. `getComputedStyle`
@@ -92,8 +122,28 @@ export function getSafeAreaInsets(): SafeAreaInsets {
     // that registered last detaches this root while the other is still on screen; in a shipped
     // game the tree empties for a beat across a scene swap. Keeping the LAST GOOD value is the
     // right answer either way — a device's insets do not change because some UI unmounted.
-    if (root.isConnected) measureSafeAreaInsets(root);
-    else root = null;
+    if (root.isConnected) {
+      refreshQueued = true;
+      const target = root;
+      refreshFrameId = requestAnimationFrame(() => {
+        refreshQueued = false;
+        refreshFrameId = null;
+        // ⚠️ A NEWER registration may have replaced `root` since this was scheduled (the
+        // editor's two-viewport case, above) — found in review (#579 follow-up). An identity
+        // check against the captured reference, not a generation counter: the thing that gets
+        // replaced here is the root itself, not a version of it (docs/async-lifetime.md's
+        // "Identity against a captured reference" row). Without it, a stale `target` that is
+        // still connected re-points `root` BACK to itself (undoing the newer registration), and
+        // a stale `target` that got disconnected nulls out whatever the newer registration set —
+        // both are the same bug: acting on behalf of a registration this callback no longer
+        // speaks for.
+        if (root !== target) return;
+        if (target.isConnected) measureSafeAreaInsets(target);
+        else root = null;
+      });
+    } else {
+      root = null;
+    }
   }
   return insets;
 }
@@ -171,4 +221,9 @@ export function resetSafeAreaInsets(): void {
   insets = { ...ZERO };
   root = null;
   lastMeasuredAt = -Infinity;
+  // A refresh scheduled by a torn-down session must not fire against whatever registers next —
+  // cancel the real callback, not just the flag that gates scheduling a new one (found in
+  // review, #579 follow-up).
+  if (refreshFrameId !== null) { cancelAnimationFrame(refreshFrameId); refreshFrameId = null; }
+  refreshQueued = false;
 }
