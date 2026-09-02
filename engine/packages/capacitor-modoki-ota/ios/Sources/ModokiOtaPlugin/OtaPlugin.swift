@@ -68,6 +68,98 @@ enum OtaPaths {
     snapshotsDir.appendingPathComponent(versionFolderName(name: name, version: version))
   }
 
+  /// Lists every real (non-dot-prefixed) version-folder name currently in `snapshotsDir` —
+  /// shared across every bundle's `pruneVersions` call in one boot so the directory is only
+  /// listed once and reused, not re-listed per bundle.
+  static func listSnapshotFolders() -> [String] {
+    let entries = (try? FileManager.default.contentsOfDirectory(atPath: snapshotsDir.path)) ?? []
+    var onDisk: [String] = []
+    for entry in entries where !entry.hasPrefix(".") {
+      var isDir: ObjCBool = false
+      let path = snapshotsDir.appendingPathComponent(entry).path
+      guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { continue }
+      onDisk.append(entry)
+    }
+    return onDisk
+  }
+
+  /// Deletes on-disk version folders for `name` that `OtaCore.pruneVersions` says are safe
+  /// to reclaim (#563) — everything except the current `active`/`pending` version. The
+  /// caller MUST dispatch this off the boot critical path (a background queue) — it walks
+  /// and deletes a directory tree, and boot latency must never wait on housekeeping. Never
+  /// throws: a prune failure here must not fail boot.
+  ///
+  /// `onDisk` is EVERY folder in `snapshotsDir` — not just ones prefixed `"\(name)-"` — and
+  /// is handed to `OtaCore.pruneVersions`, which owns the (bundle names may contain
+  /// hyphens) disambiguation of which bundle each folder belongs to. Splitting on `name`'s
+  /// own prefix here would reintroduce exactly the bug that decision was moved into the
+  /// pure function to avoid (`ota` pruning could mistake `ota-test-v1` for its own). Passed
+  /// in (rather than listed here) so the boot hook can list `snapshotsDir` ONCE and reuse it
+  /// across every bundle's prune call in the same boot.
+  ///
+  /// `keepVersion` is the version `boot()` just chose as THIS launch's target — excluded
+  /// (by its FULL folder name) even if `pruneVersions` somehow returned it (defence in
+  /// depth; it never should, since `boot()` only ever targets `active`/`pending`, which
+  /// `pruneVersions` already protects). Only meaningful for the SHELL's own prune pass — a
+  /// sub-game's own active/pending folders are already protected by `pruneVersions` itself,
+  /// so callers pass `nil` for every other bundle name.
+  static func pruneVersions(name: String, state: OtaState?, keepVersion: String?, onDisk: [String]) {
+    let toPrune = OtaCore.pruneVersions(state: state, name: name, onDisk: onDisk)
+    let keepFolder = keepVersion.map { versionFolderName(name: name, version: $0) }
+    for folder in toPrune where folder != keepFolder {
+      try? FileManager.default.removeItem(at: snapshotsDir.appendingPathComponent(folder))
+    }
+  }
+
+  /// Reclaims a `.tmp-<name>-<version>-<uuid>` folder LEAKED by a process kill mid-stage
+  /// (`stageUpdate`/`stageUpdateDelta` build into one of these before the atomic rename —
+  /// each attempt uses a fresh UUID, so a killed attempt's tmp tree is otherwise never
+  /// revisited by anything). F1: a `.tmp-` dir is reclaimable only when no stage IN THIS
+  /// PROCESS currently owns it — checked via `isTmpDirInFlight`, NOT via "the app has just
+  /// started, so by construction no stage can be in flight". iOS's boot hook runs once per
+  /// app launch (unlike Android's `onCreate`, which can re-enter mid-process), but
+  /// `stageUpdate`/`stageUpdateDelta` are async network calls that can still be genuinely
+  /// running when this sweep executes on a background queue right after boot, so the same
+  /// guard is applied here for parity and because it is the ONLY correct reasoning either
+  /// way. A previous PROCESS's leaked tmp dirs are still safe to reclaim unconditionally:
+  /// the in-flight set starts empty every process launch, so a dir belonging to an earlier
+  /// process can never appear in it. Never throws — housekeeping only, same discipline as
+  /// `pruneVersions`.
+  static func pruneLeakedTmpFolders() {
+    let entries = (try? FileManager.default.contentsOfDirectory(atPath: snapshotsDir.path)) ?? []
+    for entry in entries where entry.hasPrefix(".tmp-") {
+      if isTmpDirInFlight(entry) { continue } // owned by a stage in THIS process
+      try? FileManager.default.removeItem(at: snapshotsDir.appendingPathComponent(entry))
+    }
+  }
+
+  /// Process-lifetime, lock-guarded set of `.tmp-` staging dir NAMES (last path component —
+  /// what `pruneLeakedTmpFolders` iterates) a stage on THIS process is currently writing
+  /// into (F1) — same reasoning and lifecycle as Android's `IN_FLIGHT_TMP_DIRS`. Entries are
+  /// added immediately BEFORE any write into the dir begins and removed in a `defer` block
+  /// that runs regardless of success/verification-failure/error, so an entry is always
+  /// removed exactly once staging for that dir is fully done.
+  private static var inFlightTmpDirNames = Set<String>()
+  private static let inFlightTmpDirsLock = NSLock()
+
+  static func markTmpDirInFlight(_ name: String) {
+    inFlightTmpDirsLock.lock()
+    defer { inFlightTmpDirsLock.unlock() }
+    inFlightTmpDirNames.insert(name)
+  }
+
+  static func unmarkTmpDirInFlight(_ name: String) {
+    inFlightTmpDirsLock.lock()
+    defer { inFlightTmpDirsLock.unlock() }
+    inFlightTmpDirNames.remove(name)
+  }
+
+  static func isTmpDirInFlight(_ name: String) -> Bool {
+    inFlightTmpDirsLock.lock()
+    defer { inFlightTmpDirsLock.unlock() }
+    return inFlightTmpDirNames.contains(name)
+  }
+
   private static var appSupportDir: URL {
     let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
       .appendingPathComponent("modoki-ota")
@@ -112,6 +204,7 @@ public enum OtaBootHook {
   public static func run(name: String) {
     OtaPaths.stateLock.lock()
     let target: OtaTarget
+    let stateAfterBoot: OtaState?
     do {
       defer { OtaPaths.stateLock.unlock() }
       let stateJSON = try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8)
@@ -129,6 +222,7 @@ public enum OtaBootHook {
       let (bootTarget, newState) = OtaCore.boot(state: parsedState, name: name, folderExists: folderExists)
       if let newState { try? OtaCore.serialize(newState).write(to: OtaPaths.stateFilePath, atomically: true, encoding: .utf8) }
       target = bootTarget
+      stateAfterBoot = newState ?? parsedState
     }
 
     switch target {
@@ -140,6 +234,46 @@ public enum OtaBootHook {
       KeyValueStore.standard["serverBasePath"] = nil as String?
     case let .version(n, v):
       KeyValueStore.standard["serverBasePath"] = OtaPaths.versionFolderName(name: n, version: v)
+    }
+
+    // Reclaim superseded version folders — #563. Dispatched to a background queue so it
+    // cannot add to boot latency; the target decision above is already final by the time
+    // this runs, and OtaPaths.pruneVersions never throws (a prune failure is housekeeping,
+    // not a reason to fail boot).
+    //
+    // Prune for EVERY bundle name the state mentions, not just the shell's own `name`
+    // (#563 was only half-delivered — sub-games stage into sibling `<subgame>-<version>`
+    // folders through this same client, and pruneVersions correctly refuses to touch a
+    // folder owned by a different bundle, so those folders were immortal). The union of
+    // active/pending/bootAttempts/confirmedBoots/rejected keys is every bundle this device
+    // has ever known about; `name` itself is added in case it isn't already a key (e.g. a
+    // fresh device that has never staged anything but the embedded shell). `keepVersion`
+    // (this launch's own target) only ever applies to the shell's own prune pass — a
+    // sub-game's own active/pending folders are already protected by pruneVersions itself.
+    //
+    // Note: a store update (`resetForNewBinary`) clears `active`/`pending`, which can leave
+    // a sub-game's on-disk folder temporarily unowned by any state entry. That's fine —
+    // this self-heals on the NEXT boot once JS re-stages the sub-game and its name
+    // reappears in state.
+    let keepVersion: String? = { if case let .version(_, v) = target { return v } else { return nil } }()
+    // F2: the union-over-every-state-map decision now lives in the pure, vector-tested
+    // OtaCore.bundlesToPrune — see its doc comment — rather than being rebuilt inline here
+    // where no test reaches it.
+    let allBundleNames = OtaCore.bundlesToPrune(state: stateAfterBoot, shellName: name)
+    DispatchQueue.global(qos: .utility).async {
+      // Listed once and reused across bundles rather than re-listing per bundle.
+      let onDisk = OtaPaths.listSnapshotFolders()
+      for bundleName in allBundleNames {
+        OtaPaths.pruneVersions(name: bundleName, state: stateAfterBoot, keepVersion: bundleName == name ? keepVersion : nil, onDisk: onDisk)
+      }
+      // Reclaim any `.tmp-` folder no stage in THIS process still owns — see
+      // pruneLeakedTmpFolders' doc comment. It is safe wherever it is called, NOT only in
+      // the boot hook: an in-flight stage is excluded by IN_FLIGHT_TMP_DIRS, and a previous
+      // process's dirs are unreachable because that set starts empty. The earlier
+      // "no stage can be in flight this early" reasoning was WRONG (this hook re-runs on
+      // Activity recreation on Android) and is what made the sweep able to delete a live
+      // staging tree; do not reintroduce it.
+      OtaPaths.pruneLeakedTmpFolders()
     }
   }
 }
@@ -191,6 +325,24 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
       call.reject("stageUpdate requires name, version, zipUrl, expectedZipHash")
       return
     }
+    // #556 legacy-caller tolerance: `files` is REQUIRED by our own TS definitions, but the
+    // JS calling us is itself delivered over OTA and can predate this native binary (a
+    // device staying on a pre-#556 shell bundle after a native update). Rejecting that
+    // caller bricks the device — no update can ever stage, so the boot hook keeps
+    // preferring the old OTA content forever, even over a freshly installed new binary.
+    // So: absent `files` (parseExpectedFiles returns nil) means "legacy caller" (skip
+    // verification, log loudly, proceed exactly as pre-#556 code did); a PRESENT-but-
+    // malformed `files` throws and still rejects below — a genuine bad payload.
+    let expectedFiles: [String: String]?
+    do {
+      expectedFiles = try Self.parseExpectedFiles(call)
+    } catch {
+      call.reject("stageUpdate: malformed files parameter: \(error.localizedDescription)")
+      return
+    }
+    if expectedFiles == nil {
+      print("[ModokiOta] stageUpdate called without 'files' — this is a pre-#556 JS bundle, so the staged tree is UNVERIFIED (#556).")
+    }
     let expectedSize = Int64(call.getInt("expectedZipSize") ?? 0)
 
     var progressTimer: DispatchSourceTimer?
@@ -207,14 +359,31 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
         call.reject("hash mismatch: expected \(expectedHash), got \(actualHash)"); return
       }
 
+      // Hoisted out of the `do` block so the `catch` below can clean it up — matches
+      // stageUpdateDelta's catch, which does the same (this was the odd one out: its two
+      // siblings, stageUpdateDelta here and Android's stageUpdate, both remove `tmpDir` on
+      // failure; this one didn't even have it in scope to do so).
+      let tmpDir = OtaPaths.snapshotsDir.appendingPathComponent(".tmp-\(name)-\(version)-\(UUID().uuidString)")
+      // F1: mark this tmp dir in-flight BEFORE any write into it begins, so a re-entrant
+      // boot-hook sweep (OtaPaths.pruneLeakedTmpFolders) never deletes a tree this stage is
+      // still writing into. Unmarked unconditionally once staging is fully done.
+      let tmpDirName = tmpDir.lastPathComponent
+      OtaPaths.markTmpDirInFlight(tmpDirName)
+      defer { OtaPaths.unmarkTmpDirInFlight(tmpDirName) }
       do {
         let entries = try OtaZip.unzip(data)
-        let tmpDir = OtaPaths.snapshotsDir.appendingPathComponent(".tmp-\(name)-\(version)-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
         for entry in entries {
           let entryPath = tmpDir.appendingPathComponent(entry.path)
           try FileManager.default.createDirectory(at: entryPath.deletingLastPathComponent(), withIntermediateDirectories: true)
           try entry.data.write(to: entryPath)
+        }
+        // #556: verify the staged tree matches the target manifest's file set/hashes
+        // EXACTLY before the atomic rename — the whole-zip hash above only proves the
+        // DOWNLOAD was intact, never that what got extracted to disk matches it. Skipped
+        // for a legacy (pre-#556) caller — see the `expectedFiles == nil` handling above.
+        if let expectedFiles {
+          try Self.verifyStagedTree(at: tmpDir, expected: expectedFiles)
         }
         let finalDir = OtaPaths.versionDir(name: name, version: version)
         try? FileManager.default.removeItem(at: finalDir) // a stale partial from an earlier interrupted attempt
@@ -222,6 +391,7 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
         self.emitProgress(name: name, version: version, bytesDone: Int64(data.count), bytesTotal: max(expectedSize, Int64(data.count)), filesDone: 1, filesTotal: 1)
         call.resolve(["ok": true])
       } catch {
+        try? FileManager.default.removeItem(at: tmpDir)
         call.reject("stage failed: \(error.localizedDescription)")
       }
     }
@@ -254,6 +424,21 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
           let copyPaths = call.getArray("copy", String.self) else {
       call.reject("stageUpdateDelta requires name, version, baseVersion, copy")
       return
+    }
+    // #556 legacy-caller tolerance — see stageUpdate's matching comment above: `files` is
+    // REQUIRED by our own TS definitions, but the JS calling us is itself delivered over
+    // OTA and can predate this native binary. Absent `files` means "legacy caller" (skip
+    // verification, log loudly, proceed exactly as pre-#556 code did); present-but-malformed
+    // throws and still rejects below — a genuine bad payload.
+    let expectedFiles: [String: String]?
+    do {
+      expectedFiles = try Self.parseExpectedFiles(call)
+    } catch {
+      call.reject("stageUpdateDelta: malformed files parameter: \(error.localizedDescription)")
+      return
+    }
+    if expectedFiles == nil {
+      print("[ModokiOta] stageUpdateDelta called without 'files' — this is a pre-#556 JS bundle, so the staged tree is UNVERIFIED (#556).")
     }
     struct DeltaDownload { let path: String; let url: URL; let hash: String; let size: Int64 }
     var downloads: [DeltaDownload] = []
@@ -299,6 +484,11 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     let tmpDir = OtaPaths.snapshotsDir.appendingPathComponent(".tmp-\(name)-\(version)-\(UUID().uuidString)")
+    // F1: mark this tmp dir in-flight BEFORE any write into it begins — see stageUpdate's
+    // matching comment above. Unmarked unconditionally once staging is fully done.
+    let tmpDirName = tmpDir.lastPathComponent
+    OtaPaths.markTmpDirInFlight(tmpDirName)
+    defer { OtaPaths.unmarkTmpDirInFlight(tmpDirName) }
     do {
       try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
 
@@ -313,37 +503,48 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
         reportFileDone(bytes: 0) // copies don't count toward bytesTotal — see comment above
       }
 
-      // Plugin methods already run off the main thread, so a blocking DispatchGroup here
-      // (rather than nesting async completion handlers) is safe and keeps the
-      // stage-then-activate ordering simple, matching the synchronous copy loop above.
-      let group = DispatchGroup()
-      var downloadError: Error?
+      // #562: SEQUENTIAL, not fanned out concurrently — matching Android's loop shape.
+      // The previous concurrent version launched every download at once and had each
+      // completion handler assign a shared `var downloadError` with no synchronisation, a
+      // real data race (`progressLock` a few lines above only ever guarded the progress
+      // counters, not this). Plugin methods already run off the main thread, so blocking
+      // on a semaphore per download here is safe and keeps stage-then-activate ordering
+      // simple, matching the synchronous copy loop above.
       for d in downloads {
-        group.enter()
+        let semaphore = DispatchSemaphore(value: 0)
+        var resultData: Data?
+        var resultResponse: URLResponse?
+        var resultError: Error?
         URLSession.shared.dataTask(with: d.url) { data, response, error in
-          defer { group.leave() }
-          if let error { downloadError = error; return }
-          guard let data, let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            downloadError = NSError(domain: "ModokiOta", code: 2, userInfo: [NSLocalizedDescriptionKey: "download failed: \(d.path)"])
-            return
-          }
-          let actualHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-          guard actualHash == d.hash.lowercased() else {
-            downloadError = NSError(domain: "ModokiOta", code: 3, userInfo: [NSLocalizedDescriptionKey: "hash mismatch: \(d.path)"])
-            return
-          }
-          do {
-            let dst = tmpDir.appendingPathComponent(d.path)
-            try FileManager.default.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try data.write(to: dst)
-            reportFileDone(bytes: Int64(data.count))
-          } catch {
-            downloadError = error
-          }
+          resultData = data
+          resultResponse = response
+          resultError = error
+          semaphore.signal()
         }.resume()
+        semaphore.wait()
+
+        if let resultError { throw resultError }
+        guard let data = resultData, let http = resultResponse as? HTTPURLResponse, http.statusCode == 200 else {
+          throw NSError(domain: "ModokiOta", code: 2, userInfo: [NSLocalizedDescriptionKey: "download failed: \(d.path)"])
+        }
+        let actualHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard actualHash == d.hash.lowercased() else {
+          throw NSError(domain: "ModokiOta", code: 3, userInfo: [NSLocalizedDescriptionKey: "hash mismatch: \(d.path)"])
+        }
+        let dst = tmpDir.appendingPathComponent(d.path)
+        try FileManager.default.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: dst)
+        reportFileDone(bytes: Int64(data.count))
       }
-      group.wait()
-      if let downloadError { throw downloadError }
+
+      // #556: verify the staged tree matches the target manifest's file set/hashes
+      // EXACTLY before the atomic rename — `copy` entries above are taken byte-for-byte
+      // off disk and hashed by nobody, and each `download` entry is only verified against
+      // its OWN hash, never against what's actually sitting in the tmp dir as a whole.
+      // Skipped for a legacy (pre-#556) caller — see the `expectedFiles == nil` handling above.
+      if let expectedFiles {
+        try Self.verifyStagedTree(at: tmpDir, expected: expectedFiles)
+      }
 
       let finalDir = OtaPaths.versionDir(name: name, version: version)
       try? FileManager.default.removeItem(at: finalDir) // a stale partial from an earlier interrupted attempt
@@ -414,6 +615,61 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
     var isDir: ObjCBool = false
     let dir = OtaPaths.versionDir(name: name, version: version)
     return FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir) && isDir.boolValue
+  }
+
+  /// Parses the `files` param (#556) — the target manifest's full path→hash map — common
+  /// to both `stageUpdate` and `stageUpdateDelta`. `nil` (never an empty-but-present
+  /// array) means the field is entirely ABSENT — a legacy pre-#556 caller (see
+  /// `stageUpdate`/`stageUpdateDelta`'s `expectedFiles == nil` handling). Throws when the
+  /// field IS present but an entry is malformed — that is a genuine bad payload, never
+  /// tolerated, and the caller must reject on it.
+  private static func parseExpectedFiles(_ call: CAPPluginCall) throws -> [String: String]? {
+    guard let filesArray = call.getArray("files") else { return nil }
+    var expected: [String: String] = [:]
+    for item in filesArray {
+      guard let obj = item as? JSObject, let path = obj["path"] as? String, let hash = obj["hash"] as? String else {
+        throw NSError(domain: "ModokiOta", code: 5, userInfo: [NSLocalizedDescriptionKey: "malformed entry in files[]"])
+      }
+      expected[path] = hash
+    }
+    return expected
+  }
+
+  /// Hashes every regular file under `dir`, keyed by its path RELATIVE to `dir` with
+  /// forward slashes (the same separator the manifest/`files` param uses on every
+  /// platform) — the "actual" half of `OtaCore.verifyStagedFiles`'s whole-tree check.
+  private static func hashesForTree(at dir: URL) throws -> [String: String] {
+    var result: [String: String] = [:]
+    let dirPath = dir.standardizedFileURL.path
+    guard let enumerator = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.isRegularFileKey]) else { return result }
+    for case let fileURL as URL in enumerator {
+      let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey])
+      guard values.isRegularFile == true else { continue }
+      var relPath = fileURL.standardizedFileURL.path
+      if relPath.hasPrefix(dirPath) { relPath = String(relPath.dropFirst(dirPath.count)) }
+      if relPath.hasPrefix("/") { relPath = String(relPath.dropFirst()) }
+      let data = try Data(contentsOf: fileURL)
+      result[relPath] = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+    return result
+  }
+
+  /// Verifies the tmp dir's ACTUAL contents against `expected` (#556) — called AFTER every
+  /// write into the tmp dir and BEFORE the atomic rename, on both `stageUpdate` and
+  /// `stageUpdateDelta`. Throws a descriptive error on any mismatch; the caller is
+  /// responsible for cleaning up the tmp dir and never renaming it into place.
+  private static func verifyStagedTree(at tmpDir: URL, expected: [String: String]) throws {
+    let actual = try hashesForTree(at: tmpDir)
+    switch OtaCore.verifyStagedFiles(expected: expected, actual: actual) {
+    case .ok:
+      return
+    case let .missing(path):
+      throw NSError(domain: "ModokiOta", code: 4, userInfo: [NSLocalizedDescriptionKey: "stage verification failed: missing file \(path)"])
+    case let .unexpected(path):
+      throw NSError(domain: "ModokiOta", code: 4, userInfo: [NSLocalizedDescriptionKey: "stage verification failed: unexpected file \(path)"])
+    case let .hashMismatch(path, expectedHash, actualHash):
+      throw NSError(domain: "ModokiOta", code: 4, userInfo: [NSLocalizedDescriptionKey: "stage verification failed: hash mismatch for \(path) (expected \(expectedHash), got \(actualHash))"])
+    }
   }
 
   private func resolveTarget(_ target: OtaTarget) -> [String: Any] {

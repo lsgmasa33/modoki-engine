@@ -1,0 +1,51 @@
+{
+  "_comment": "Shared spec for OtaCore.bundlesToPrune (Swift) / OtaCore.bundlesToPrune (Java) — F2, extracted from the boot-hook glue (OtaPlugin.java's runBootHook / OtaPlugin.swift's OtaBootHook.run) so the 'which bundle names need a prune pass after boot' decision is replayed by a shared vector file instead of living untested in native code. Deliberately NOT in the vectorFiles/VECTOR_FILES arrays the boot/confirm/loadFailed golden vectors use: this file has a different shape (state/shellName/expect.bundlesToPrune, no `op`, no `constants` block) and is replayed by its own loader/test function on each port (see OtaCoreTests.swift's testBundlesToPruneVectors, OtaCoreSelfTest.java's runBundlesToPruneVectors) — same convention as ota-prune-vectors.json. `expect.bundlesToPrune` is the SORTED union of active/pending/bootAttempts/confirmedBoots/rejected keys plus shellName itself. Both ports must produce byte-identical results on every scenario.",
+  "scenarios": [
+    {
+      "name": "bundle_only_in_bootAttempts_is_included",
+      "_comment": "sub-a appears in NO map except bootAttempts — must still be returned, proving the bootAttempts union isn't skipped.",
+      "state": { "active": {}, "pending": {}, "bootAttempts": { "sub-a": 1 }, "confirmedBoots": {}, "rejected": {} },
+      "shellName": "shell",
+      "expect": { "bundlesToPrune": ["shell", "sub-a"] }
+    },
+    {
+      "name": "bundle_only_in_confirmedBoots_is_included",
+      "_comment": "sub-b appears in NO map except confirmedBoots — must still be returned, proving the confirmedBoots union isn't skipped.",
+      "state": { "active": {}, "pending": {}, "bootAttempts": {}, "confirmedBoots": { "sub-b": 1 }, "rejected": {} },
+      "shellName": "shell",
+      "expect": { "bundlesToPrune": ["shell", "sub-b"] }
+    },
+    {
+      "name": "bundle_only_in_rejected_is_included",
+      "_comment": "sub-c appears in NO map except rejected — must still be returned, proving the rejected union isn't skipped.",
+      "state": { "active": {}, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": { "sub-c": ["v1"] } },
+      "shellName": "shell",
+      "expect": { "bundlesToPrune": ["shell", "sub-c"] }
+    },
+    {
+      "name": "shell_name_absent_from_every_map_is_still_included",
+      "_comment": "`shell` appears in NONE of the state's maps (only `other` is active) — it must still be included, since a fresh device that has never staged anything but the embedded shell still needs its own prune pass.",
+      "state": { "active": { "other": "v1" }, "pending": {}, "bootAttempts": {}, "confirmedBoots": {}, "rejected": {} },
+      "shellName": "shell",
+      "expect": { "bundlesToPrune": ["other", "shell"] }
+    },
+    {
+      "name": "null_state_returns_just_shell_name",
+      "state": null,
+      "shellName": "shell",
+      "expect": { "bundlesToPrune": ["shell"] }
+    },
+    {
+      "name": "union_across_every_map_deduplicated_and_sorted",
+      "state": {
+        "active": { "b-active": "v1" },
+        "pending": { "a-pending": "v1" },
+        "bootAttempts": { "b-active": 1, "c-boot": 1 },
+        "confirmedBoots": { "d-confirm": 1 },
+        "rejected": { "e-reject": ["v0"] }
+      },
+      "shellName": "shell",
+      "expect": { "bundlesToPrune": ["a-pending", "b-active", "c-boot", "d-confirm", "e-reject", "shell"] }
+    }
+  ]
+}

@@ -44,7 +44,11 @@ export default function PublishOtaDialog() {
 
   const [bundleName, setBundleName] = useState('shell');
   const [version, setVersion] = useState('');
-  const [mandatory, setMandatory] = useState(false);
+  // Tri-state, matching the server's sticky-mandatory contract (ota-publish.mjs):
+  // 'unchanged' sends no `mandatory` param (inherits the live release's value), 'set'
+  // sends 1, 'clear' sends 0. Defaults to 'unchanged' so a routine publish can never
+  // silently clear a live mandatory release.
+  const [mandatory, setMandatory] = useState<'unchanged' | 'set' | 'clear'>('unchanged');
   const [key, setKey] = useState('');
 
   const [publishing, setPublishing] = useState(false);
@@ -109,7 +113,8 @@ export default function PublishOtaDialog() {
     const qs = new URLSearchParams({ version: version.trim() });
     if (bundleName.trim()) qs.set('bundleName', bundleName.trim());
     if (key.trim()) qs.set('key', key.trim());
-    if (mandatory) qs.set('mandatory', '1');
+    if (mandatory === 'set') qs.set('mandatory', '1');
+    else if (mandatory === 'clear') qs.set('mandatory', '0');
 
     const es = backendEventSource(`/api/ota/publish?${qs}`);
     esRef.current = es;
@@ -194,11 +199,21 @@ export default function PublishOtaDialog() {
             <input data-ui-id="ota.publish.signingKey" data-ui-kind="field" data-ui-label="Signing key name" type="text" style={inputStyle} value={key} disabled={publishing}
               onChange={(e) => setKey(e.target.value)} placeholder="default" />
           </div>
-          <div style={{ display: 'flex', alignItems: 'flex-end' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#ddd', fontSize: 12 }}>
-              <input data-ui-id="ota.publish.mandatory" data-ui-kind="toggle" data-ui-label="Mandatory" data-ui-state={mandatory ? 'checked' : 'unchecked'} type="checkbox" checked={mandatory} disabled={publishing} onChange={(e) => setMandatory(e.target.checked)} />
-              Mandatory (blocks with a restart gate)
-            </label>
+          <div>
+            <div style={{ color: '#aaa', fontSize: 11, marginBottom: 3 }}>
+              Mandatory {!loading && (
+                <span style={{ color: '#666' }}>(currently: {release?.mandatory ? 'mandatory' : 'not mandatory'})</span>
+              )}
+            </div>
+            <select
+              data-ui-id="ota.publish.mandatory" data-ui-kind="select" data-ui-label="Mandatory" data-ui-state={mandatory}
+              style={inputStyle} value={mandatory} disabled={publishing}
+              onChange={(e) => setMandatory(e.target.value as 'unchanged' | 'set' | 'clear')}
+            >
+              <option value="unchanged">Leave unchanged</option>
+              <option value="set">Mandatory (blocks with a restart gate)</option>
+              <option value="clear">Not mandatory</option>
+            </select>
           </div>
         </div>
 

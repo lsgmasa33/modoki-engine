@@ -70,6 +70,20 @@ public class OtaPlugin extends Plugin {
    *  needed (no cross-process access to guard against). */
   private static final Object STATE_LOCK = new Object();
 
+  /** Process-lifetime, thread-safe set of `.tmp-` staging dirs (absolute path) a stage on
+   *  THIS process is currently writing into — see pruneVersionsAsync's leaked-`.tmp-` sweep
+   *  below (F1). `MainActivity.onCreate` (which reaches that sweep via runBootHook) has no
+   *  once-per-process guard and CAN re-run mid-process (a config change outside
+   *  configChanges, "Don't keep activities", the OS destroying a backgrounded Activity while
+   *  the process survives), and stageUpdate/stageUpdateDelta run on a bare `new Thread`
+   *  detached from the Activity lifecycle — so a stage can genuinely still be in flight when
+   *  a LATER onCreate re-runs the sweep, and deleting its `.tmp-` dir out from under it can
+   *  corrupt a tree that then gets renamed in as if it were good. Entries are added
+   *  immediately BEFORE any write into the dir begins and removed in a `finally` block that
+   *  runs regardless of success/verification-failure/exception, so an entry is always
+   *  removed exactly once staging for that dir is fully done. */
+  private static final java.util.Set<String> IN_FLIGHT_TMP_DIRS = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
   @PluginMethod
   public void stageUpdate(PluginCall call) {
     String name = call.getString("name");
@@ -77,9 +91,32 @@ public class OtaPlugin extends Plugin {
     String zipUrl = call.getString("zipUrl");
     String expectedHash = call.getString("expectedZipHash");
     Integer expectedSize = call.getInt("expectedZipSize"); // may be null on an older caller
+    // #556 legacy-caller tolerance: `files` is REQUIRED by our own TS definitions, but the
+    // JS calling us is itself delivered over OTA and can predate this native binary (a
+    // device staying on a pre-#556 shell bundle after a native update). Rejecting that
+    // caller bricks the device — no update can ever stage, so the boot hook keeps
+    // preferring the old OTA content forever, even over a freshly installed new binary.
+    // So: absent `files` means "legacy caller" (skip verification, log loudly, proceed
+    // exactly as pre-#556 code did); a PRESENT-but-malformed `files` is a genuine bad
+    // payload and still rejects below.
+    boolean filesFieldPresent = call.getArray("files") != null;
+    Map<String, String> expectedFiles;
+    try {
+      expectedFiles = parseExpectedFiles(call);
+    } catch (JSONException e) {
+      call.reject("stageUpdate: malformed files parameter: " + e.getMessage());
+      return;
+    }
     if (name == null || version == null || zipUrl == null || expectedHash == null) {
       call.reject("stageUpdate requires name, version, zipUrl, expectedZipHash");
       return;
+    }
+    if (!filesFieldPresent) {
+      Log.w(
+        "ModokiOta",
+        "stageUpdate called without 'files' — this is a pre-#556 JS bundle, so the staged " +
+        "tree is UNVERIFIED (#556)."
+      );
     }
     final long bytesTotal = expectedSize != null ? expectedSize : 0;
 
@@ -98,7 +135,18 @@ public class OtaPlugin extends Plugin {
         }
 
         tmpDir = new File(versionsDir(getContext()), ".tmp-" + name + "-" + version + "-" + UUID.randomUUID());
+        // F1: mark this tmp dir in-flight BEFORE any write into it begins — see
+        // IN_FLIGHT_TMP_DIRS' doc comment. Removed unconditionally in the `finally` below.
+        IN_FLIGHT_TMP_DIRS.add(tmpDir.getAbsolutePath());
         unzipInto(zipBytes, tmpDir);
+
+        // #556: verify the staged tree matches the target manifest's file set/hashes
+        // EXACTLY before the atomic rename — the whole-zip hash above only proves the
+        // DOWNLOAD was intact, never that what got extracted to disk matches it. Skipped
+        // for a legacy (pre-#556) caller — see the `filesFieldPresent` check above.
+        if (filesFieldPresent) {
+          verifyStagedTree(tmpDir, expectedFiles);
+        }
 
         File finalDir = versionDir(getContext(), name, version);
         deleteRecursively(finalDir); // a stale partial from an earlier interrupted attempt
@@ -113,6 +161,10 @@ public class OtaPlugin extends Plugin {
       } catch (Exception e) {
         if (tmpDir != null) deleteRecursively(tmpDir);
         call.reject("stageUpdate failed: " + e.getMessage(), e);
+      } finally {
+        // F1: staging for this dir is fully done (rename succeeded OR cleanup ran above) —
+        // it can never again be "currently in flight", so unmark it unconditionally.
+        if (tmpDir != null) IN_FLIGHT_TMP_DIRS.remove(tmpDir.getAbsolutePath());
       }
     }).start();
   }
@@ -138,9 +190,29 @@ public class OtaPlugin extends Plugin {
     String baseVersion = call.getString("baseVersion");
     JSArray copyArray = call.getArray("copy");
     JSArray downloadArray = call.getArray("download");
+    // #556 legacy-caller tolerance — see stageUpdate's matching comment above: `files` is
+    // REQUIRED by our own TS definitions, but the JS calling us is itself delivered over
+    // OTA and can predate this native binary. Absent `files` means "legacy caller" (skip
+    // verification, log loudly, proceed exactly as pre-#556 code did); present-but-malformed
+    // is a genuine bad payload and still rejects below.
+    boolean filesFieldPresent = call.getArray("files") != null;
+    Map<String, String> expectedFiles;
+    try {
+      expectedFiles = parseExpectedFiles(call);
+    } catch (JSONException e) {
+      call.reject("stageUpdateDelta: malformed files parameter: " + e.getMessage());
+      return;
+    }
     if (name == null || version == null || baseVersion == null || copyArray == null) {
       call.reject("stageUpdateDelta requires name, version, baseVersion, copy");
       return;
+    }
+    if (!filesFieldPresent) {
+      Log.w(
+        "ModokiOta",
+        "stageUpdateDelta called without 'files' — this is a pre-#556 JS bundle, so the " +
+        "staged tree is UNVERIFIED (#556)."
+      );
     }
 
     new Thread(() -> {
@@ -167,6 +239,9 @@ public class OtaPlugin extends Plugin {
         }
 
         tmpDir = new File(versionsDir(getContext()), ".tmp-" + name + "-" + version + "-" + UUID.randomUUID());
+        // F1: mark this tmp dir in-flight BEFORE any write into it begins — see
+        // IN_FLIGHT_TMP_DIRS' doc comment. Removed unconditionally in the `finally` below.
+        IN_FLIGHT_TMP_DIRS.add(tmpDir.getAbsolutePath());
         tmpDir.mkdirs();
 
         // Copies are already on disk (no network), so they only move filesDone — bytesTotal
@@ -216,6 +291,15 @@ public class OtaPlugin extends Plugin {
           }
         }
 
+        // #556: verify the staged tree matches the target manifest's file set/hashes
+        // EXACTLY before the atomic rename — copyPaths above are taken byte-for-byte off
+        // disk and hashed by nobody, and each download[] entry is only verified against
+        // its OWN hash, never against what's actually sitting in the tmp dir as a whole.
+        // Skipped for a legacy (pre-#556) caller — see the `filesFieldPresent` check above.
+        if (filesFieldPresent) {
+          verifyStagedTree(tmpDir, expectedFiles);
+        }
+
         File finalDir = versionDir(getContext(), name, version);
         deleteRecursively(finalDir); // a stale partial from an earlier interrupted attempt
         if (!tmpDir.renameTo(finalDir)) { // atomic on the same volume (both under versionsDir)
@@ -228,6 +312,10 @@ public class OtaPlugin extends Plugin {
       } catch (Exception e) {
         if (tmpDir != null) deleteRecursively(tmpDir);
         call.reject("stageUpdateDelta failed: " + e.getMessage(), e);
+      } finally {
+        // F1: staging for this dir is fully done (rename succeeded OR cleanup ran above) —
+        // it can never again be "currently in flight", so unmark it unconditionally.
+        if (tmpDir != null) IN_FLIGHT_TMP_DIRS.remove(tmpDir.getAbsolutePath());
       }
     }).start();
   }
@@ -431,6 +519,7 @@ public class OtaPlugin extends Plugin {
 
   public static void runBootHook(Context context, String name) {
     OtaCore.BootResult result;
+    OtaCore.State finalState;
     synchronized (STATE_LOCK) {
       OtaCore.State state = readState(context);
       // Detect a genuine Play Store update BEFORE deciding what to boot — see
@@ -443,7 +532,8 @@ public class OtaPlugin extends Plugin {
         return dir.isDirectory() && new File(dir, "index.html").exists();
       };
       result = OtaCore.boot(state, name, folderExists);
-      writeState(context, result.state != null ? result.state : new OtaCore.State());
+      finalState = result.state != null ? result.state : new OtaCore.State();
+      writeState(context, finalState);
     }
 
     SharedPreferences.Editor editor = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit();
@@ -453,6 +543,103 @@ public class OtaPlugin extends Plugin {
       editor.putString(PREFS_KEY_SERVER_PATH, versionDir(context, result.target.name, result.target.version).getAbsolutePath());
     }
     editor.apply();
+
+    // Reclaim superseded version folders — #563. Off the boot critical path (a background
+    // thread) so it cannot add to boot latency; `finalState` is the state just WRITTEN, so
+    // the decision is made against the final target. `keepTargetVersion` is defence in
+    // depth against deleting this launch's own target — pruneVersionsAsync must never
+    // throw out of this call: a prune failure is housekeeping, not a boot blocker.
+    //
+    // Prune for EVERY bundle name the state mentions, not just the shell's own `name`
+    // (#563 was only half-delivered — sub-games stage into sibling `<subgame>-<version>`
+    // folders through this same client, and pruneVersions correctly refuses to touch a
+    // folder owned by a different bundle, so those folders were immortal). `keepTargetVersion`
+    // only ever applies to the shell's own prune pass — a sub-game's own active/pending
+    // folders are already protected by pruneVersions itself.
+    //
+    // Note: a store update (`resetForNewBinary`) clears active/pending, which can leave a
+    // sub-game's on-disk folder temporarily unowned by any state entry. That's fine — this
+    // self-heals on the NEXT boot once JS re-stages the sub-game and its name reappears in
+    // state.
+    String keepTargetVersion = result.target.kind == OtaCore.TargetKind.VERSION ? result.target.version : null;
+    // F2: the union-over-every-state-map decision now lives in the pure, vector-tested
+    // OtaCore.bundlesToPrune — see its doc comment — rather than being rebuilt inline here
+    // where no test reaches it.
+    java.util.List<String> allBundleNames = OtaCore.bundlesToPrune(finalState, name);
+    pruneVersionsAsync(context, finalState, name, keepTargetVersion, allBundleNames);
+  }
+
+  /** Lists EVERY on-disk version folder — not just ones prefixed {@code name + "-"} — and
+   *  hands the full folder names to {@link OtaCore#pruneVersions} ONCE PER bundle name in
+   *  {@code allBundleNames}, which owns the (bundle names may contain hyphens)
+   *  disambiguation of which bundle each folder belongs to; splitting on a single
+   *  {@code name}'s own prefix here would reintroduce exactly the bug that decision was
+   *  moved into the pure function to avoid. The directory is listed ONCE and the listing
+   *  reused across every bundle's prune call. Deletes the ones it returns on a background
+   *  thread (#563). Never throws — caught and logged, since a prune failure must never fail
+   *  boot. A folder named {@code ".tmp-<name>-<version>-<uuid>"} (an in-progress stage)
+   *  never matches any known bundle's {@code "<bundle>-"} prefix, so it is never a candidate
+   *  for deletion via {@link OtaCore#pruneVersions} regardless — same guarantee the iOS port
+   *  gets from its explicit `!hasPrefix(".")` filter, kept here too for the same reason.
+   *  It IS a candidate for the separate leaked-`.tmp-` sweep below, which reclaims it only
+   *  when no stage in THIS process still owns it ({@code IN_FLIGHT_TMP_DIRS}) — NOT because
+   *  "this runs from the boot hook", which was the wrong premise that let the sweep delete a
+   *  live staging tree (onCreate re-runs on Activity recreation while a detached staging
+   *  thread keeps writing). {@code keepTargetVersion} only applies to {@code name} itself (the shell's
+   *  own launch target); every other bundle name in {@code allBundleNames} passes
+   *  {@code null}, since a sub-game's own active/pending folders are already protected by
+   *  {@code pruneVersions} itself. */
+  private static void pruneVersionsAsync(Context context, OtaCore.State state, String name, String keepTargetVersion, java.util.List<String> allBundleNames) {
+    new Thread(() -> {
+      try {
+        File[] children = versionsDir(context).listFiles();
+        java.util.List<String> onDisk = new java.util.ArrayList<>();
+        Map<String, File> dirsByName = new HashMap<>();
+        java.util.List<File> leakedTmpDirs = new java.util.ArrayList<>();
+        if (children != null) {
+          for (File child : children) {
+            if (!child.isDirectory()) continue;
+            if (child.getName().startsWith(".tmp-")) {
+              leakedTmpDirs.add(child);
+              continue;
+            }
+            if (child.getName().startsWith(".")) continue;
+            onDisk.add(child.getName());
+            dirsByName.put(child.getName(), child);
+          }
+        }
+        for (String bundleName : allBundleNames) {
+          java.util.List<String> toPrune = OtaCore.pruneVersions(state, bundleName, onDisk);
+          String keepFolder = bundleName.equals(name) && keepTargetVersion != null ? bundleName + "-" + keepTargetVersion : null;
+          for (String folder : toPrune) {
+            if (folder.equals(keepFolder)) continue; // never delete this launch's target
+            File dir = dirsByName.get(folder);
+            if (dir != null) deleteRecursively(dir);
+          }
+        }
+        // Reclaim any `.tmp-` folder leaked by a process kill mid-stage (stageUpdate /
+        // stageUpdateDelta build into one of these before the atomic rename — each attempt
+        // uses a fresh UUID, so a killed attempt's tmp tree is otherwise never revisited by
+        // anything). F1: a `.tmp-` dir is reclaimable only when no stage IN THIS PROCESS
+        // currently owns it — checked via IN_FLIGHT_TMP_DIRS, NOT via "the app has just
+        // started, so by construction no stage can be in flight": MainActivity.onCreate
+        // (which reaches this sweep through runBootHook) has no once-per-process guard and
+        // CAN re-run mid-process (a config change outside configChanges, "Don't keep
+        // activities", the OS destroying a backgrounded Activity while the process
+        // survives), and stageUpdate/stageUpdateDelta run on a bare `new Thread` detached
+        // from the Activity lifecycle — so a stage can genuinely still be writing into a
+        // `.tmp-` dir when a LATER onCreate re-runs this sweep. A previous PROCESS's leaked
+        // tmp dirs are still safe to reclaim unconditionally: IN_FLIGHT_TMP_DIRS starts
+        // empty every process launch, so a dir belonging to an earlier process can never
+        // appear in it.
+        for (File tmpDir : leakedTmpDirs) {
+          if (IN_FLIGHT_TMP_DIRS.contains(tmpDir.getAbsolutePath())) continue; // owned by a stage in THIS process
+          deleteRecursively(tmpDir);
+        }
+      } catch (Throwable t) {
+        Log.w("ModokiOta", "prune failed (non-fatal, housekeeping only)", t);
+      }
+    }).start();
   }
 
   /** The app-binary version `resetForNewBinary` compares against — same signal
@@ -467,6 +654,61 @@ public class OtaPlugin extends Plugin {
       return String.valueOf(info.versionCode);
     } catch (PackageManager.NameNotFoundException e) {
       return "unknown";
+    }
+  }
+
+  // ---- Stage verification (#556) ----
+
+  /** Parses the `files` param — the target manifest's full path→hash map — common to both
+   *  stageUpdate and stageUpdateDelta. Returns null ONLY when the field is entirely ABSENT
+   *  (a legacy pre-#556 caller — see stageUpdate/stageUpdateDelta's `filesFieldPresent`
+   *  handling). Throws JSONException when the field IS present but an entry is malformed —
+   *  that is a genuine bad payload, never tolerated, and the caller must reject on it. */
+  private static Map<String, String> parseExpectedFiles(PluginCall call) throws JSONException {
+    JSArray filesArray = call.getArray("files");
+    if (filesArray == null) return null;
+    Map<String, String> expected = new HashMap<>();
+    for (int i = 0; i < filesArray.length(); i++) {
+      JSONObject entry = filesArray.getJSONObject(i);
+      expected.put(entry.getString("path"), entry.getString("hash"));
+    }
+    return expected;
+  }
+
+  /** Hashes every regular file under `dir`, keyed by its path RELATIVE to `dir` with
+   *  forward slashes (the same separator the manifest/`files` param uses on every
+   *  platform) — the "actual" half of OtaCore.verifyStagedFiles's whole-tree check. */
+  private static Map<String, String> hashesForTree(File dir) throws Exception {
+    Map<String, String> result = new HashMap<>();
+    java.nio.file.Path dirPath = dir.toPath();
+    try (java.util.stream.Stream<java.nio.file.Path> stream = Files.walk(dirPath)) {
+      for (java.nio.file.Path path : (Iterable<java.nio.file.Path>) stream::iterator) {
+        if (!Files.isRegularFile(path)) continue;
+        String relPath = dirPath.relativize(path).toString().replace(File.separatorChar, '/');
+        result.put(relPath, sha256Hex(Files.readAllBytes(path)));
+      }
+    }
+    return result;
+  }
+
+  /** Verifies the tmp dir's ACTUAL contents against `expected` (#556) — called AFTER
+   *  every write into the tmp dir and BEFORE the atomic rename, on both stageUpdate and
+   *  stageUpdateDelta. Throws a descriptive IOException on any mismatch; the caller is
+   *  responsible for cleaning up the tmp dir and never renaming it into place. */
+  private static void verifyStagedTree(File tmpDir, Map<String, String> expected) throws Exception {
+    Map<String, String> actual = hashesForTree(tmpDir);
+    OtaCore.VerifyProblem problem = OtaCore.verifyStagedFiles(expected, actual);
+    if (problem == null) return;
+    switch (problem.kind) {
+      case MISSING:
+        throw new IOException("stage verification failed: missing file " + problem.path);
+      case UNEXPECTED:
+        throw new IOException("stage verification failed: unexpected file " + problem.path);
+      default:
+        throw new IOException(
+          "stage verification failed: hash mismatch for " + problem.path
+          + " (expected " + problem.expectedHash + ", got " + problem.actualHash + ")"
+        );
     }
   }
 

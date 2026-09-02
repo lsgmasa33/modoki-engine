@@ -53,6 +53,19 @@ public final class OtaCoreSelfTest {
       total += scenarios.size();
     }
 
+    // Its OWN loader/runner, deliberately separate from the loop above — this vector file
+    // has a different shape (expected/actual/expect, no op/bundle/state, no constants
+    // block) and is NOT in VECTOR_FILES; see that file's header comment.
+    total += runStageVerifyVectors(root);
+
+    // Same deal — state/bundle/onDisk/expect.prune, no `op`, no `constants`, NOT in
+    // VECTOR_FILES; see ota-prune-vectors.json's header comment.
+    total += runPruneVectors(root);
+
+    // Same deal — state/shellName/expect.bundlesToPrune, no `op`, no `constants`, NOT in
+    // VECTOR_FILES; see ota-bundles-to-prune-vectors.json's header comment (F2).
+    total += runBundlesToPruneVectors(root);
+
     if (failures > 0) {
       System.err.println(failures + " scenario(s) FAILED");
       System.exit(1);
@@ -198,6 +211,122 @@ public final class OtaCoreSelfTest {
     @SuppressWarnings("unchecked")
     OtaCore.State expected = stateFromJson((Map<String, Object>) expectStateRaw);
     check(scenarioName, "state", expected, actual);
+  }
+
+  // ---- Stage verification (#556) ----
+
+  /** Loads + replays ota-stage-verify-vectors.json against OtaCore.verifyStagedFiles.
+   *  Returns the scenario count so the caller can fold it into the final total. */
+  @SuppressWarnings("unchecked")
+  private static int runStageVerifyVectors(Path root) throws Exception {
+    String json = new String(Files.readAllBytes(root.resolve("test-vectors/ota-stage-verify-vectors.json")));
+    Map<String, Object> parsed = (Map<String, Object>) MinimalJson.parse(json);
+    List<Object> scenarios = (List<Object>) parsed.get("scenarios");
+    if (scenarios == null || scenarios.isEmpty()) {
+      System.err.println("no scenarios in ota-stage-verify-vectors.json — this self-test would check nothing");
+      System.exit(1);
+    }
+    for (Object rawObj : scenarios) {
+      Map<String, Object> raw = (Map<String, Object>) rawObj;
+      String name = (String) raw.get("name");
+      Map<String, String> expected = stringMap((Map<String, Object>) raw.get("expected"));
+      Map<String, String> actual = stringMap((Map<String, Object>) raw.get("actual"));
+      Map<String, Object> expect = (Map<String, Object>) raw.get("expect");
+      OtaCore.VerifyProblem result = OtaCore.verifyStagedFiles(expected, actual);
+      String kind = (String) expect.get("kind");
+      switch (kind) {
+        case "ok":
+          check(name, "verify", null, result);
+          break;
+        case "missing":
+          checkVerifyProblem(name, OtaCore.VerifyProblem.missing((String) expect.get("path")), result);
+          break;
+        case "unexpected":
+          checkVerifyProblem(name, OtaCore.VerifyProblem.unexpected((String) expect.get("path")), result);
+          break;
+        case "hashMismatch":
+          checkVerifyProblem(
+            name,
+            OtaCore.VerifyProblem.hashMismatch((String) expect.get("path"), (String) expect.get("expectedHash"), (String) expect.get("actualHash")),
+            result
+          );
+          break;
+        default:
+          throw new RuntimeException("unknown expect.kind " + kind);
+      }
+    }
+    return scenarios.size();
+  }
+
+  // ---- Prune (#563) ----
+
+  /** Loads + replays ota-prune-vectors.json against OtaCore.pruneVersions.
+   *  Returns the scenario count so the caller can fold it into the final total. */
+  @SuppressWarnings("unchecked")
+  private static int runPruneVectors(Path root) throws Exception {
+    String json = new String(Files.readAllBytes(root.resolve("test-vectors/ota-prune-vectors.json")));
+    Map<String, Object> parsed = (Map<String, Object>) MinimalJson.parse(json);
+    List<Object> scenarios = (List<Object>) parsed.get("scenarios");
+    if (scenarios == null || scenarios.isEmpty()) {
+      System.err.println("no scenarios in ota-prune-vectors.json — this self-test would check nothing");
+      System.exit(1);
+    }
+    for (Object rawObj : scenarios) {
+      Map<String, Object> raw = (Map<String, Object>) rawObj;
+      String name = (String) raw.get("name");
+      String bundle = (String) raw.get("bundle");
+      List<String> onDisk = new java.util.ArrayList<>();
+      for (Object v : (List<Object>) raw.get("onDisk")) onDisk.add((String) v);
+      Map<String, Object> expect = (Map<String, Object>) raw.get("expect");
+      List<String> expectedPrune = new java.util.ArrayList<>();
+      for (Object v : (List<Object>) expect.get("prune")) expectedPrune.add((String) v);
+
+      Object stateRaw = raw.get("state");
+      OtaCore.State state = stateRaw == null ? null : stateFromJson((Map<String, Object>) stateRaw);
+
+      List<String> result = OtaCore.pruneVersions(state, bundle, onDisk);
+      check(name, "prune", expectedPrune, result);
+    }
+    return scenarios.size();
+  }
+
+  // ---- Bundles to prune (F2) ----
+
+  /** Loads + replays ota-bundles-to-prune-vectors.json against OtaCore.bundlesToPrune.
+   *  Returns the scenario count so the caller can fold it into the final total. */
+  @SuppressWarnings("unchecked")
+  private static int runBundlesToPruneVectors(Path root) throws Exception {
+    String json = new String(Files.readAllBytes(root.resolve("test-vectors/ota-bundles-to-prune-vectors.json")));
+    Map<String, Object> parsed = (Map<String, Object>) MinimalJson.parse(json);
+    List<Object> scenarios = (List<Object>) parsed.get("scenarios");
+    if (scenarios == null || scenarios.isEmpty()) {
+      System.err.println("no scenarios in ota-bundles-to-prune-vectors.json — this self-test would check nothing");
+      System.exit(1);
+    }
+    for (Object rawObj : scenarios) {
+      Map<String, Object> raw = (Map<String, Object>) rawObj;
+      String name = (String) raw.get("name");
+      String shellName = (String) raw.get("shellName");
+      Map<String, Object> expect = (Map<String, Object>) raw.get("expect");
+      List<String> expected = new java.util.ArrayList<>();
+      for (Object v : (List<Object>) expect.get("bundlesToPrune")) expected.add((String) v);
+
+      Object stateRaw = raw.get("state");
+      OtaCore.State state = stateRaw == null ? null : stateFromJson((Map<String, Object>) stateRaw);
+
+      List<String> result = OtaCore.bundlesToPrune(state, shellName);
+      check(name, "bundlesToPrune", expected, result);
+    }
+    return scenarios.size();
+  }
+
+  private static void checkVerifyProblem(String scenarioName, OtaCore.VerifyProblem expected, OtaCore.VerifyProblem actual) {
+    boolean ok = actual != null && actual.kind == expected.kind && java.util.Objects.equals(actual.path, expected.path)
+      && java.util.Objects.equals(actual.expectedHash, expected.expectedHash) && java.util.Objects.equals(actual.actualHash, expected.actualHash);
+    if (!ok) {
+      failures++;
+      System.err.println("[" + scenarioName + "] verify mismatch:\n  expected: " + expected + "\n  actual:   " + actual);
+    }
   }
 
   private static void check(String scenarioName, String field, Object expected, Object actual) {

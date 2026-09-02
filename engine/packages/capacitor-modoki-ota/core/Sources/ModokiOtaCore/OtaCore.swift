@@ -52,6 +52,24 @@ public enum OtaLoadFailure: String, Equatable {
   case notEvidence
 }
 
+/// Result of comparing a staged tree's actual file hashes against the target manifest's
+/// expected ones (#556). Pure decision — the plugin does the file-system walk/hashing and
+/// hands both maps to `OtaCore.verifyStagedFiles`, then turns a non-`.ok` result into a
+/// thrown/rejected error before the atomic rename, exactly the shape as every other
+/// decision/I-O split in this file.
+///
+/// `stageUpdateDelta`'s `copy` entries are taken byte-for-byte off disk and hashed by
+/// NOBODY, and `stageUpdate` hashes only the whole zip, never the individual files it
+/// writes — so a locally-corrupt base file, or a bit-flip during extraction, was
+/// previously invisible until something downstream broke. This closes that hole with a
+/// single whole-tree check that covers both staging paths identically.
+public enum OtaStageVerifyResult: Equatable {
+  case ok
+  case missing(path: String)
+  case unexpected(path: String)
+  case hashMismatch(path: String, expected: String, actual: String)
+}
+
 /// All per-bundle-name maps, so bundles never interfere with each other's boot/confirm
 /// bookkeeping (an adversarial-review finding against a flat/scalar design).
 public struct OtaState: Equatable {
@@ -370,5 +388,116 @@ public enum OtaCore {
       s.confirmedBoots[name] = confirms
     }
     return s
+  }
+
+  // MARK: - Stage verification (#556)
+
+  /// Strict set-equality check between `expected` (the target manifest's path→hash map)
+  /// and `actual` (what the plugin actually hashed off the staged tmp dir). Hash
+  /// comparison is case-insensitive hex; when several problems exist, the ONE reported is
+  /// deterministic — paths are sorted lexicographically and the first problem in that
+  /// order wins, checking missing/unexpected/mismatch per path in the same pass. Both
+  /// this port and the Java twin must pick the same one, or a fixed input could report a
+  /// different failure per platform. See ota-stage-verify-vectors.json.
+  public static func verifyStagedFiles(expected: [String: String], actual: [String: String]) -> OtaStageVerifyResult {
+    let expectedLower = Dictionary(uniqueKeysWithValues: expected.map { ($0.key, $0.value.lowercased()) })
+    let actualLower = Dictionary(uniqueKeysWithValues: actual.map { ($0.key, $0.value.lowercased()) })
+    let allPaths = Set(expectedLower.keys).union(actualLower.keys).sorted()
+    for path in allPaths {
+      guard let expectedHash = expectedLower[path] else { return .unexpected(path: path) }
+      guard let actualHash = actualLower[path] else { return .missing(path: path) }
+      if expectedHash != actualHash { return .hashMismatch(path: path, expected: expectedHash, actual: actualHash) }
+    }
+    return .ok
+  }
+
+  // MARK: - Prune (#563)
+
+  /// Returns the FULL on-disk folder names (drawn from `onDisk`, which lists every version
+  /// folder actually present — for EVERY bundle, not just `name`) that are safe to delete
+  /// for `name`.
+  ///
+  /// Folders are flat and named `"<bundleName>-<version>"` (`OtaPaths.versionFolderName` /
+  /// the Java twin), and bundle names may themselves contain hyphens — so a folder's owning
+  /// bundle CANNOT be recovered by splitting on the first `name + "-"` the I/O layer
+  /// happens to be pruning. `ota` pruning against a disk that also holds `ota-test-v1` must
+  /// never mistake that folder for its own `test-v1`. This decision — which bundle a folder
+  /// belongs to — is made ONCE, here, in the pure function the shared vectors pin, rather
+  /// than re-derived (and able to drift) in each I/O half.
+  ///
+  /// Algorithm: `knownBundles` is every bundle name the state mentions (the keys of
+  /// `active`/`pending`/`bootAttempts`/`confirmedBoots`/`rejected`) plus `name` itself —
+  /// this covers a folder for a bundle this device once knew about even if `name` isn't in
+  /// that particular map. For each on-disk folder, every known bundle whose `"<bundle>-"`
+  /// is a prefix of the folder name is a candidate owner; the LONGEST candidate wins (so
+  /// `ota-test-v1` resolves to `ota-test`, not `ota`, whenever both are known bundles). A
+  /// folder with NO candidate owner belongs to a bundle this device knows nothing about and
+  /// is left alone. A folder whose owner isn't `name` is left alone too — it belongs to
+  /// another bundle's prune pass. Only once a folder is confirmed to belong to `name` is its
+  /// version (the remainder after the owner prefix) compared against `active[name]` /
+  /// `pending[name]`.
+  ///
+  /// `revert()` above only ever falls back to `active[name]`, and to `.embedded` only when
+  /// that folder is gone — it never reaches further back than that. So a version sitting
+  /// in `rejected`, or any other stale copy, is not reachable by any boot path anymore and
+  /// its folder is pure waste. `boot()` also already self-heals a missing active folder
+  /// (clears `active`, falls back to embedded, no quarantine), so even a wrong prune here
+  /// degrades gracefully rather than bricking anything.
+  ///
+  /// `state == nil` (unparseable/missing state.json) means every folder's status is
+  /// UNKNOWN, not "prunable" — pruning then would be destructive, so this returns empty.
+  ///
+  /// Sorted so both this port and the Java twin (`OtaCore.pruneVersions`) agree on order
+  /// and the shared vectors can assert exactly. See
+  /// ../../../test-vectors/ota-prune-vectors.json.
+  public static func pruneVersions(state: OtaState?, name: String, onDisk: [String]) -> [String] {
+    guard let state else { return [] }
+
+    var knownBundles = Set<String>()
+    knownBundles.formUnion(state.active.keys)
+    knownBundles.formUnion(state.pending.keys)
+    knownBundles.formUnion(state.bootAttempts.keys)
+    knownBundles.formUnion(state.confirmedBoots.keys)
+    knownBundles.formUnion(state.rejected.keys)
+    knownBundles.insert(name)
+
+    let active = state.active[name]
+    let pending = state.pending[name]
+
+    var toPrune: [String] = []
+    for folder in onDisk {
+      let candidates = knownBundles.filter { folder.hasPrefix($0 + "-") }
+      guard let owner = candidates.max(by: { $0.count < $1.count }), owner == name else { continue }
+      let version = String(folder.dropFirst(owner.count + 1))
+      if version != active && version != pending {
+        toPrune.append(folder)
+      }
+    }
+    return toPrune.sorted()
+  }
+
+  // MARK: - Bundles to prune (#563, pinned separately from pruneVersions itself)
+
+  /// Every bundle name a boot hook must run `pruneVersions` for after a boot — the SORTED
+  /// union of the keys of `state.active`/`pending`/`bootAttempts`/`confirmedBoots`/
+  /// `rejected`, plus `shellName` itself (always included, even when it appears in none of
+  /// those maps — a fresh device that has never staged anything but the embedded shell
+  /// still needs its own prune pass so a stale on-disk folder for it is reclaimable).
+  /// `state == nil` (fresh install / corrupt state.json) means nothing is known yet —
+  /// returns just `[shellName]`.
+  ///
+  /// Pulled out of the boot-hook glue (`OtaBootHook.run` here / Android's `runBootHook`)
+  /// into this pure function so it is replayed by the shared vectors
+  /// (ota-bundles-to-prune-vectors.json) instead of living untested in native glue.
+  public static func bundlesToPrune(state: OtaState?, shellName: String) -> [String] {
+    guard let state else { return [shellName] }
+    var names = Set<String>()
+    names.formUnion(state.active.keys)
+    names.formUnion(state.pending.keys)
+    names.formUnion(state.bootAttempts.keys)
+    names.formUnion(state.confirmedBoots.keys)
+    names.formUnion(state.rejected.keys)
+    names.insert(shellName)
+    return names.sorted()
   }
 }

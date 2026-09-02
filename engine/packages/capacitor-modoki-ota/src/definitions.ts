@@ -28,13 +28,34 @@ export interface ModokiOtaPlugin {
    *  bytes), verifies its SHA-256 against `expectedZipHash`, and unzips it into a
    *  staging folder that's atomically renamed into place only once fully written and
    *  verified. Throws (rejects) on any hash/network/zip-format failure — never leaves a
-   *  partial version folder where the boot watchdog's `folderExists` check would find it. */
+   *  partial version folder where the boot watchdog's `folderExists` check would find it.
+   *
+   *  `files` (#556) is the target manifest's full path→hash map. AFTER unzipping into the
+   *  tmp dir and BEFORE the atomic rename, native walks that dir, hashes every file it
+   *  wrote, and checks the result against `files` for STRICT set equality (no missing
+   *  file, no unexpected extra file, no hash mismatch) — the whole-zip hash this method
+   *  already verifies only proves the DOWNLOAD was intact, never that what got WRITTEN to
+   *  disk matches it file-by-file. Any mismatch throws; nothing is renamed into place.
+   *
+   *  ⚠️ `files` is REQUIRED here — our own JS must always send it — but BOTH native ports
+   *  tolerate its absence at the call boundary. That asymmetry is deliberate, not
+   *  an oversight: this TS file is itself shipped over OTA, so a device can be running a
+   *  JS bundle staged BEFORE #556 added this field against a native BINARY built AFTER
+   *  it. #556 originally made native reject a call missing `files`, which bricked such a
+   *  device on a real Galaxy A23 — `checkForUpdate` failed on every attempt, and since
+   *  the boot hook always prefers OTA-staged content over the embedded bundle, even
+   *  shipping a new app binary could never rescue it. So native treats an ABSENT `files`
+   *  as "pre-#556 legacy caller" (skips the whole-tree verification, logs loudly, stages
+   *  exactly as pre-#556 code did) and only rejects a `files` that is PRESENT but
+   *  malformed. Do not "fix" this by making the field optional here — the type staying
+   *  required is what keeps every FUTURE JS build sending it. */
   stageUpdate(options: {
     name: string;
     version: string;
     zipUrl: string;
     expectedZipHash: string;
     expectedZipSize: number;
+    files: { path: string; hash: string }[];
   }): Promise<{ ok: boolean }>;
 
   /** Phase 2 delta staging: builds the `version` folder for `name` WITHOUT downloading a
@@ -48,13 +69,27 @@ export interface ModokiOtaPlugin {
    *  Throws (rejects) if `baseVersion`'s folder (or embedded webDir) doesn't exist, or if
    *  any copy source path is missing from it — the CALLER (otaClient.ts) is responsible
    *  for falling back to `stageUpdate` when it can't get a base manifest to diff against
-   *  in the first place; this method does not itself fall back to a whole download. */
+   *  in the first place; this method does not itself fall back to a whole download.
+   *
+   *  `files` (#556) is the target manifest's full path→hash map — the same field
+   *  `stageUpdate` takes, and for the same reason: `copy` entries are taken byte-for-byte
+   *  off disk and are NOT individually hashed (each `download` entry already is, against
+   *  its own `hash`), so a locally-corrupt base file was previously invisible. AFTER every
+   *  copy AND download has been written into the tmp dir and BEFORE the atomic rename,
+   *  native walks the tmp dir, hashes every file, and checks STRICT set equality against
+   *  `files` — deliberately less invasive than threading a hash through `copy` itself
+   *  (which stays `string[]`), since verifying the whole tree already subsumes that. Any
+   *  mismatch throws; nothing is renamed into place.
+   *
+   *  ⚠️ Required here for the same reason and with the same native-side legacy-caller
+   *  exception as `stageUpdate` above — see its doc comment for the full contract. */
   stageUpdateDelta(options: {
     name: string;
     version: string;
     baseVersion: string;
     copy: string[];
     download: { path: string; url: string; hash: string; size: number }[];
+    files: { path: string; hash: string }[];
   }): Promise<{ ok: boolean }>;
 
   /** Marks `version` as the PENDING version for `name` — takes effect on the NEXT app

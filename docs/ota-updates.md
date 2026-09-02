@@ -219,12 +219,91 @@ If either base manifest can't be fetched (an older build with no embedded manife
 blip), it silently falls back to the whole-`bundle.zip` path. **Delta is an optimization,
 never a requirement for an update to succeed.**
 
+A **failed delta stage falls back the same way** (#556). This matters more than it looks:
+a delta's `copy` entries come off the local disk, so a device-local corruption can fail
+verification even though the PUBLISHED bytes are perfectly good — and re-staging genuinely
+might fix it, unlike the whole-zip case. Failing the update there would let one bad local
+file block a good published version. The fallback is reported through `onDeltaFallback`
+rather than swallowed, because it silently turns a small delta into a full bundle download
+and an unexplained bandwidth spike is undiagnosable after the fact.
+
+⚠️ `activate()` sits deliberately OUTSIDE that try. Inside it, a failed activate would fall
+through and re-download a whole bundle for a version that had already staged correctly —
+and the retry would hit the same failing activate anyway.
+
 ### Staging and activation
 
 Native downloads/copies into a `.tmp` directory and only renames it into place once every
 file has been written and hash-verified — a partial version folder must never be visible to
 the boot watchdog. `activate()` marks the version **pending**; it takes effect on the next
 launch. There is no mid-session swap.
+
+⚠️ **That sentence was aspirational until #556.** `copy` entries were taken byte-for-byte
+off disk and hashed by NOBODY — only `download` entries were verified, each against its own
+hash — and the whole-zip path hashed the zip but never the files it then wrote. Both paths
+now verify the **whole staged tree** against the target manifest before the rename: strict
+set equality plus a hash per file. Strict is provably safe rather than hopeful —
+`ota-publish.mjs` builds the zip from `Object.keys(files)` and `diffManifests` partitions
+that same key set into `copy`+`download`, so the staged set must equal the manifest's on
+both paths. The decision half is pure in `OtaCore` (case-insensitive hex, deterministic
+first-problem-by-sorted-path) so the two ports cannot report different failures for one
+input.
+
+Why it mattered: the quarantine ruling below rests on "a staged bundle's bytes are exactly
+what was published, so retrying fetches identical broken bytes." That premise simply did not
+hold on the delta path, and the honest fix was to close the hole rather than weaken the
+quarantine.
+
+⚠️ **The `files` parameter is a compatibility trap: making native REJECT its absence bricked
+a real device.** #556 made `files` required on `stageUpdate`/`stageUpdateDelta` and had
+native reject a call missing it. But **the JS calling these methods is itself delivered over
+OTA**, so it can be OLDER than the native binary that's running it — a device that had
+`shell-v26` staged before #556 shipped, then received a native update, was running post-#556
+native against pre-#556 JS. Measured on a real Galaxy A23: every `checkForUpdate` failed with
+`stageUpdateDelta requires name, version, baseVersion, copy, files`, and since the boot hook
+always prefers OTA-staged content over the freshly-installed embedded bundle, **no new app
+binary could ever rescue that device** — it was stuck on its pre-#556 version permanently.
+
+The fix: native tolerates an **absent** `files` (treats it as a pre-#556 legacy caller, skips
+the whole-tree verification, logs loudly, and stages exactly as pre-#556 code did) but still
+**rejects** a `files` that is present-but-malformed — that's a genuine bad payload, not a
+compatibility case. The TS definitions keep `files` required — our own JS must always send
+it; only the native runtime tolerates its absence, and only because a JS bundle published
+before the field existed cannot possibly send it. This is the mirror image of
+`isPluginUnimplemented` in `engine/app/subgameLoader.ts` (old native + new JS); this is new
+native + old JS. Any future required parameter added to either of these two methods needs the
+same tolerance on the native side, for the same reason.
+
+⚠️ **The staging contract is a COMPATIBILITY surface, because the JS that calls it ships over
+OTA and can be older than the native binary.** #556 made `files` a required native parameter and
+that bricked every device holding a pre-#556 bundle: `stageUpdateDelta requires ... files`, no
+update could stage, and a new app binary did not rescue it because the boot hook prefers staged
+content over embedded. Native now tolerates an absent `files` (skips verification, logs loudly);
+a malformed one still rejects. The TypeScript type keeps it REQUIRED — our own JS must always
+send it, and only the runtime tolerates a caller older than itself. Mirror of
+`isPluginUnimplemented` in `subgameLoader.ts`, which handles the opposite skew. **Every gate was
+green throughout: `verify` and `test:native` only ever pair new JS with new native, which is the
+one combination that cannot fail.**
+
+**Superseded version folders are reclaimed** (#563; device-verified on a Galaxy A23,
+2026-09-02 — a phone holding `shell-v20` alongside an `active` of `shell-v26` dropped the
+orphan on the next boot, 11 MB to 6.6 MB, while the unrelated bundle `ota-subgame-test-v1`
+was left untouched and `state.json` came back byte-identical; and on an iPhone 8, where
+`shell-v28` was reclaimed once `v29` went active). ⚠️ The reclaim lands on the boot AFTER a
+promotion, not the boot that promotes it — `confirmBoot` runs mid-session, long after the boot
+hook's prune has already decided, so the outgoing version is still `active` at prune time. One
+boot too few reads exactly like "pruning is broken". Nothing used to delete them, so every
+update permanently added a full bundle copy to device storage. Everything except `active`
+and `pending` is prunable — `revert()` falls back to `active`, and to embedded only if that
+is gone, so those two are the only folders the state machine can ever target. The prune runs
+off the boot critical path and can never throw out of boot.
+
+⚠️ **Version folders are flat and named `"<name>-<version>"`, and bundle names contain
+hyphens.** Splitting on the pruning bundle's own `name-` prefix made `ota` parse `ota-test-v1`
+as version `test-v1` and delete a LIVE folder belonging to another bundle. Ownership is
+therefore decided in `OtaCore` by **longest** known-bundle-name prefix, over every bundle
+appearing anywhere in state; a folder belonging to no known bundle is never touched. Note
+`folderExists` composes names the same ambiguous way — it is merely not destructive about it.
 
 ### The boot watchdog
 
@@ -448,11 +527,14 @@ below on the bundleName restriction; publishing a sub-game bundle is still a man
 
 ## Testing
 
-The pure state machine is replayed by **both** platforms against the same shared vectors —
+The pure decision layer is replayed by **both** platforms against the same shared vectors —
 `ota-golden-vectors.json` (boot/confirm/revert, plus `resetForNewBinary`),
-`ota-gate-vectors-phase3.json` (quarantine) and `ota-subgame-vectors-553.json` (the sub-game
-load-failure dispositions and the versioned confirm), 40 scenarios total. A native divergence
-between Swift and Java fails there instead of shipping.
+`ota-gate-vectors-phase3.json` (quarantine), `ota-subgame-vectors-553.json` (the sub-game
+load-failure dispositions and the versioned confirm), `ota-stage-verify-vectors.json` (#556's
+whole-tree staging check) and `ota-prune-vectors.json` (#563's folder reclamation, including
+the hyphenated-bundle-name ownership rule), 62 scenarios at the time of writing — the
+runner prints the live count, so trust that over this number. A native divergence between
+Swift and Java fails there instead of shipping.
 
 ⚠️ **A device observation about OTA proves nothing until you pin which bundle is running.** The
 app boots a PUBLISHED shell bundle, not your working tree, so a phone can be internally
@@ -489,11 +571,20 @@ Two gaps found while wiring the runner (2026-08-27), one closed and one open:
   scenarios still passed. Both replays now assert the fixture's constants against `OtaCore`'s own
   (`testFixtureConstantsMatchImplementation` / `checkConstants`), and that check was verified to go
   red under exactly that edit.
-- **Open.** `OtaZipTests.testRoundTripAgainstNodeProducedZip` XCTSkips unless `/tmp/ota-test.zip`
-  exists, and its header's regeneration command is elided (`...`). So the cross-tool ZIP check —
-  the one that proves `OtaZip` parses authentic ZIP structure rather than its own writer's output —
-  does not run in the gate. Restoring the exact fixture command, or building it in-test, would
-  close it.
+- **Closed (#565).** `OtaZipTests.testRoundTripAgainstNodeProducedZip` XCTSkipped unless
+  `/tmp/ota-test.zip` existed — and nothing ever created it, so the cross-tool ZIP check (the one
+  proving `OtaZip` parses authentic ZIP structure rather than its own writer's output) had never
+  run, while `test-native.mjs` still printed `PASS ios/ota-core`. Its header's regeneration command
+  was elided to `...`, so the fixture could not even be rebuilt from the instructions given.
+  `test-native.mjs` now BUILDS the fixture with the Node writer (`engine/scripts/ota/zip.mjs`) and
+  passes its path to that leg as `MODOKI_OTA_ZIP_FIXTURE`; the test falls back to
+  `/tmp/ota-test.zip` so a bare `swift test` still behaves as before, and the real regeneration
+  command is restored in the file's header. Verified by mutation, not by green: flipping one byte
+  of the generated zip turns the test red (`decompressionFailed("expected 240 bytes, got 15")`).
+
+  ⚠️ A fixture the runner is responsible for producing is **not** an environmental reason to skip,
+  so a failure to build it is recorded as FAIL — but only after the platform/tool checks, since on
+  a non-macOS runner the leg cannot run at all and must stay a SKIP.
 
 `games/ota-test` is the committed device-verification fixture (both native targets, a
 full-screen "OTA TEST vN" scene so a glance at the phone identifies the running bundle).

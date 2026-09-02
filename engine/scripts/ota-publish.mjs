@@ -14,7 +14,12 @@
  *  Usage:
  *    node engine/scripts/ota-publish.mjs \
  *      --dist games/<id>/dist --bucket gs://modoki-ota/<id> \
- *      --name shell --version v13 --engine-api 1 --key default [--mandatory]
+ *      --name shell --version v13 --engine-api 1 --key default [--mandatory | --no-mandatory]
+ *
+ *  `mandatory` is STICKY across publishes: `--mandatory` sets it true, `--no-mandatory`
+ *  clears it, and passing NEITHER flag inherits the existing release's `mandatory` value
+ *  (false if there is no existing release) rather than silently clearing a live mandatory
+ *  release on the next routine publish.
  *
  *  Layout written under the bucket:
  *    release.json                          (signed, no-cache)
@@ -43,10 +48,14 @@ const defaultRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)
 const q = (s) => JSON.stringify(s);
 
 function parseArgs(argv) {
-  const args = { mandatory: false, key: 'default' };
+  // `mandatory` starts `undefined` (not `false`) so the release-merge loop can tell
+  // "neither flag passed" (inherit the existing release's value) apart from an explicit
+  // `--no-mandatory` (clear it).
+  const args = { mandatory: undefined, key: 'default' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--mandatory') { args.mandatory = true; continue; }
+    if (a === '--no-mandatory') { args.mandatory = false; continue; }
     if (!a.startsWith('--')) continue;
     const key = a.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
     args[key] = argv[++i];
@@ -160,14 +169,42 @@ async function main() {
   for (let attempt = 1; attempt <= MAX_RELEASE_RETRIES && !published; attempt++) {
     let existingRelease = null;
     let generation = '0';
+    let describeSucceeded = false;
     try {
       const rawGeneration = execSync(`gcloud storage objects describe ${q(releasePath)} --format="value(generation)"`, { stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8').trim();
       if (!/^\d+$/.test(rawGeneration)) fail(`Unexpected generation value from gcloud: ${JSON.stringify(rawGeneration)}`);
       generation = rawGeneration;
+      describeSucceeded = true;
       const raw = execSync(`gcloud storage cat ${q(releasePath)}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
       existingRelease = JSON.parse(raw);
+      // Shape-check what JSON.parse handed back (F4): `null`, an array, or an object
+      // missing an object-typed `bundles` field all parse "successfully" — JSON.parse alone
+      // can't tell a malformed release from a well-formed one — and without this check the
+      // merge below (`{ ...(existingRelease?.bundles ?? {}), [name]: version }`) would
+      // silently treat any of those as "no bundles yet" and publish a release containing
+      // ONLY the bundle staged by THIS run, wiping every other bundle's entry that was
+      // actually live. Deliberately a `fail()` here, not a retry: a corrupt/malformed
+      // existing release is not the concurrent-write race the loop above already handles
+      // via --if-generation-match, so it must ABORT this publish attempt rather than being
+      // retried into an overwrite.
+      const releaseIsObject = typeof existingRelease === 'object' && existingRelease !== null && !Array.isArray(existingRelease);
+      const bundlesIsObject = releaseIsObject && typeof existingRelease.bundles === 'object' && existingRelease.bundles !== null && !Array.isArray(existingRelease.bundles);
+      if (!releaseIsObject || !bundlesIsObject) {
+        fail(`release.json exists (generation ${generation}) but its body is malformed (expected an object with an object "bundles" field, got ${JSON.stringify(existingRelease)}). Publishing now would drop every other bundle's entry. Aborting without writing.`);
+      }
     } catch {
-      // generation is already '0' (the declaration default).
+      // `describe` failing means release.json genuinely doesn't exist yet — this is
+      // the legitimate first-publish path, so fall back to generation '0' / no
+      // existing release. But if `describe` SUCCEEDED (the object exists) and only
+      // the subsequent `cat`/`JSON.parse` threw, that is NOT "no existing release" —
+      // `generation` would still hold the real value while `existingRelease` stays
+      // null, so the merge below would build a release containing ONLY this bundle
+      // and `--if-generation-match` would happily overwrite the real release.json
+      // with it. Treat that case as a hard error instead of silently reset.
+      if (describeSucceeded) {
+        fail(`release.json exists (generation ${generation}) but could not be read/parsed. Publishing now would drop every other bundle's entry. Aborting without writing.`);
+      }
+      generation = '0';
       if (attempt === 1) console.log('[ota-publish] No existing release.json — creating the first one.');
     }
 
@@ -175,7 +212,14 @@ async function main() {
     // minEngineApi is a compatibility floor, independent of `mandatory` (which is
     // only about apply-timing) — it can only ratchet up, never down, across publishes.
     const minEngineApi = Math.max(existingRelease?.minEngineApi ?? engineApi, engineApi);
-    const unsignedRelease = createRelease({ bundles, mandatory: !!args.mandatory, minEngineApi });
+    // `mandatory` is STICKY: an explicit --mandatory/--no-mandatory wins, and passing
+    // neither flag INHERITS the just-refetched existingRelease's value (false when there
+    // is none yet). Computed here, inside the retry loop, next to `bundles`/`minEngineApi`
+    // — `existingRelease` is refetched on every attempt, so inheriting from a stale read
+    // (e.g. computed once before the loop) would reintroduce the bug under the exact
+    // concurrent-publish race this loop exists to handle.
+    const mandatory = args.mandatory !== undefined ? args.mandatory : (existingRelease?.mandatory ?? false);
+    const unsignedRelease = createRelease({ bundles, mandatory, minEngineApi });
     const release = signRelease(unsignedRelease, keypair);
     const releaseErrors = validateRelease(release);
     if (releaseErrors.length) fail(`Built an invalid release:\n  ${releaseErrors.join('\n  ')}`);
@@ -200,9 +244,11 @@ async function main() {
     } finally {
       rmSync(releaseStageDir, { recursive: true, force: true });
     }
-  }
 
-  console.log(`[ota-publish] Published ${name}@${version} — release.json now points ${name} → ${version}.`);
+    if (published) {
+      console.log(`[ota-publish] Published ${name}@${version} — release.json now points ${name} → ${version}, mandatory=${mandatory}.`);
+    }
+  }
 }
 
 main().catch((err) => fail(err.stack || String(err)));

@@ -143,15 +143,28 @@ export interface OtaDeltaDownload {
 
 /** The native plugin surface this client depends on — a structural (not nominal) type so
  *  tests can pass a plain mock without importing `@capacitor/core`. */
+/** A single target-manifest file, as handed to native for whole-tree post-stage
+ *  verification (#556) — see `OtaNativePlugin.stageUpdate`/`stageUpdateDelta`. */
+export interface OtaFileRef {
+  path: string;
+  hash: string;
+}
+
 export interface OtaNativePlugin {
-  stageUpdate(opts: { name: string; version: string; zipUrl: string; expectedZipHash: string; expectedZipSize: number }): Promise<{ ok: boolean }>;
+  /** `files` (#556): the target manifest's full path→hash map. Native verifies the staged
+   *  tree against it (strict set equality) after writing, before the atomic rename — see
+   *  the plugin's own doc comment (definitions.ts) for why the whole-zip hash alone isn't
+   *  enough. */
+  stageUpdate(opts: { name: string; version: string; zipUrl: string; expectedZipHash: string; expectedZipSize: number; files: OtaFileRef[] }): Promise<{ ok: boolean }>;
   /** Phase 2 delta staging: copy `copy` (unchanged relative paths) from the
    *  already-on-disk `baseVersion` folder, download only `download` (new/changed files,
    *  each independently hash-verified) into the new `version` folder. Native must refuse
    *  to activate a folder built this way if any copy source is missing (self-heal to
    *  `stageUpdate`'s whole-zip path is the CALLER's job, not native's — see
-   *  `checkForUpdate`'s fallback). */
-  stageUpdateDelta(opts: { name: string; version: string; baseVersion: string; copy: string[]; download: OtaDeltaDownload[] }): Promise<{ ok: boolean }>;
+   *  `checkForUpdate`'s fallback). `files` (#556): same whole-tree verification as
+   *  `stageUpdate` — `copy` entries are never individually hashed, so this is what catches
+   *  a locally-corrupt base file. */
+  stageUpdateDelta(opts: { name: string; version: string; baseVersion: string; copy: string[]; download: OtaDeltaDownload[]; files: OtaFileRef[] }): Promise<{ ok: boolean }>;
   activate(opts: { name: string; version: string }): Promise<{ ok: boolean }>;
   getState(): Promise<{ stateJSON: string }>;
 }
@@ -264,6 +277,11 @@ export interface CheckForUpdateOptions {
    *  non-`staged` outcome — the caller is expected to un-arm its gate whenever the
    *  final outcome isn't `staged`, not rely on this ever being "undone". */
   onWillStage?: (info: { version: string; mandatory: boolean }) => void;
+  /** Called when a delta stage failed and the client fell back to a whole-bundle download
+   *  (#556). Optional, but worth wiring: this path silently turns a small delta into a full
+   *  download, and an unexplained bandwidth spike is precisely the thing nobody can diagnose
+   *  after the fact. */
+  onDeltaFallback?: (info: { version: string; reason: string }) => void;
 }
 
 export interface FetchReleaseOptions {
@@ -376,6 +394,11 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
     return { outcome: 'engine-api-too-old', required: manifest.engineApi, running: opts.runningEngineApi };
   }
 
+  // The target manifest's full path→hash map, handed to native so it can verify the
+  // staged tree against it (strict set equality) before the atomic rename — #556. Built
+  // once here and passed to whichever staging path actually runs.
+  const files: OtaFileRef[] = Object.entries(manifest.files).map(([path, e]) => ({ path, hash: e.hash }));
+
   // Delta path: diff against whatever's ALREADY on disk — an active OTA version if one
   // exists, otherwise the bundle embedded in the app binary itself (so even the very
   // FIRST update, on a fresh install, never needs a whole-bundle download). Either base
@@ -392,25 +415,53 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
       ...d,
       url: `${opts.baseUrl}/bundles/${opts.bundleName}/${targetVersion}/files/${d.hash}`,
     }));
-    await opts.native.stageUpdateDelta({
-      name: opts.bundleName,
-      version: targetVersion,
-      baseVersion,
-      copy,
-      download: downloadWithUrls,
-    });
-    await opts.native.activate({ name: opts.bundleName, version: targetVersion });
-    return { outcome: 'staged', version: targetVersion, delta: true, mandatory: release.mandatory };
+    // Delta is an optimization, not a requirement — #556 closes the hole in the #550
+    // quarantine ruling: a delta-staged bundle's `copy` entries are taken byte-for-byte
+    // off disk and hashed by nobody, so "re-staging would fetch identical broken bytes"
+    // (true for a whole-zip download) does NOT hold here — a locally corrupt base file
+    // can make native's own whole-tree verification (definitions.ts) throw even though
+    // the PUBLISHED bytes are perfectly good. Falling through to a whole-zip stage rather
+    // than failing the update outright means a bad local copy on this one device never
+    // blocks a good published version — same "optimization, not requirement" contract the
+    // base-manifest fetch above already has.
+    let deltaStaged = false;
+    try {
+      await opts.native.stageUpdateDelta({
+        name: opts.bundleName,
+        version: targetVersion,
+        baseVersion,
+        copy,
+        download: downloadWithUrls,
+        files,
+      });
+      deltaStaged = true;
+    } catch (err) {
+      // Reported, not swallowed — see `onDeltaFallback`.
+      opts.onDeltaFallback?.({ version: targetVersion, reason: err instanceof Error ? err.message : String(err) });
+      // fall through to whole-zip below
+    }
+    if (deltaStaged) {
+      // Deliberately OUTSIDE the try above: an `activate` failure is not a STAGING failure.
+      // Inside it, a failed activate would fall through and re-download the whole bundle for
+      // a version that had already staged correctly — and the retry would hit the same
+      // activate again anyway.
+      await opts.native.activate({ name: opts.bundleName, version: targetVersion });
+      return { outcome: 'staged', version: targetVersion, delta: true, mandatory: release.mandatory };
+    }
   }
 
   if (!manifest.bundleZip) return { outcome: 'no-bundle-zip-in-manifest' };
 
+  // No fallback here, deliberately: a whole-zip staging failure must reject and leave
+  // `activate()` uncalled — nothing staged, nothing activated, device stays on its
+  // working bundle. This is the caller's LAST resort; there is nowhere further to fall.
   await opts.native.stageUpdate({
     name: opts.bundleName,
     version: targetVersion,
     zipUrl: `${opts.baseUrl}/bundles/${opts.bundleName}/${targetVersion}/bundle.zip`,
     expectedZipHash: manifest.bundleZip.hash,
     expectedZipSize: manifest.bundleZip.size,
+    files,
   });
   await opts.native.activate({ name: opts.bundleName, version: targetVersion });
 

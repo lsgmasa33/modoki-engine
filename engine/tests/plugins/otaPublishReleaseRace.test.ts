@@ -60,6 +60,10 @@ if (group === 'storage' && cmd === 'objects' && rest[0] === 'update') {
 if (group === 'storage' && cmd === 'cat') {
   const localPath = toLocal(rest[0]);
   if (!fs.existsSync(localPath)) { process.stderr.write('ERROR: (gcloud.storage.cat) not found: 404.\\n'); process.exit(1); }
+  // FAKE_GCS_CAT_FAIL: simulate describe succeeding (the object exists) but the
+  // subsequent cat failing/erroring — used to test that this is NOT treated as
+  // "no existing release".
+  if (process.env.FAKE_GCS_CAT_FAIL) { process.stderr.write('ERROR: (gcloud.storage.cat) simulated transient failure.\\n'); process.exit(1); }
   process.stdout.write(fs.readFileSync(localPath));
   process.exit(0);
 }
@@ -244,6 +248,55 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     }
   });
 
+  it('a describe that succeeds but a cat that fails is a hard error, not "no existing release" (F1)', () => {
+    const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+
+    // First publish creates a real release.json with "shell" in it.
+    const first = publish('shell', 'v1');
+    expect(first.status).toBe(0);
+    const releaseJsonPath = path.join(bucketDir, 'fakebucket', 'testprefix', 'release.json');
+    const before = fs.readFileSync(releaseJsonPath, 'utf8');
+
+    // Second publish: describe will succeed (release.json exists) but cat is forced to
+    // fail — this must NOT be treated as "no existing release" (which would silently
+    // drop the "shell" bundle entry and overwrite release.json with only "sling").
+    const second = publish('sling', 'v1', { FAKE_GCS_CAT_FAIL: '1' });
+    expect(second.status).not.toBe(0);
+    expect(second.stderr).toMatch(/could not be read|could not be parsed|exists.*could not be read/i);
+
+    // release.json must be untouched.
+    const after = fs.readFileSync(releaseJsonPath, 'utf8');
+    expect(after).toBe(before);
+  });
+
+  it.each([
+    ['null', 'null'],
+    ['an empty object with no bundles field', '{}'],
+    ['an array', '[]'],
+  ])('a release.json body that is %s is a hard error, not "no bundles yet" (F4)', (_label, malformedBody) => {
+    const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+
+    // Plant a malformed release.json directly in the fake bucket — describe() will report
+    // it exists (generation '0', the fake's default), and cat() will return this body,
+    // which parses successfully but has the wrong SHAPE. Without the F4 shape check this
+    // would be silently treated as "no bundles yet" and overwritten with a release
+    // containing ONLY the bundle this publish is about to stage.
+    const releaseDir = path.join(bucketDir, 'fakebucket', 'testprefix');
+    fs.mkdirSync(releaseDir, { recursive: true });
+    fs.writeFileSync(path.join(releaseDir, 'release.json'), malformedBody);
+    const before = fs.readFileSync(path.join(releaseDir, 'release.json'), 'utf8');
+
+    const result = publish('sling', 'v1');
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/malformed/i);
+
+    // release.json must be untouched — the publish aborted rather than overwriting it.
+    const after = fs.readFileSync(path.join(releaseDir, 'release.json'), 'utf8');
+    expect(after).toBe(before);
+  });
+
   it('--repo-root points key resolution somewhere else, and a key THERE is found and used', () => {
     const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-other-root-with-key-'));
     try {
@@ -255,5 +308,117 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     } finally {
       fs.rmSync(otherRoot, { recursive: true, force: true });
     }
+  });
+});
+
+/** `mandatory` is STICKY across publishes (#564) — a routine publish with neither
+ *  --mandatory nor --no-mandatory must INHERIT the live release's mandatory value, not
+ *  silently clear it. Reuses the same fake-gcloud harness as the race-condition suite
+ *  above (FAKE_GCLOUD_SRC + runNode are module-scoped there). */
+describe('ota-publish.mjs mandatory stickiness', () => {
+  let repoRoot: string;
+  let binDir: string;
+  let bucketDir: string;
+  let distDir: string;
+
+  beforeEach(() => {
+    repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-mandatory-repo-'));
+    fs.mkdirSync(path.join(repoRoot, 'engine', 'scripts'), { recursive: true });
+    fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
+    fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
+
+    binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-mandatory-'));
+    if (process.platform === 'win32') {
+      fs.writeFileSync(path.join(binDir, 'gcloud.cjs'), FAKE_GCLOUD_SRC);
+      fs.writeFileSync(path.join(binDir, 'gcloud.cmd'), `@node "%~dp0gcloud.cjs" %*\r\n`);
+    } else {
+      const gcloudPath = path.join(binDir, 'gcloud');
+      fs.writeFileSync(gcloudPath, FAKE_GCLOUD_SRC);
+      fs.chmodSync(gcloudPath, 0o755);
+    }
+
+    bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-mandatory-'));
+    distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-mandatory-dist-'));
+    fs.writeFileSync(path.join(distDir, 'index.html'), '<html>mandatory-test</html>');
+
+    const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+  });
+
+  afterEach(() => {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+    fs.rmSync(binDir, { recursive: true, force: true });
+    fs.rmSync(bucketDir, { recursive: true, force: true });
+    fs.rmSync(distDir, { recursive: true, force: true });
+  });
+
+  function publish(version: string, extraArgs: string[] = [], engineApi = '1') {
+    return runNode(repoRoot, {
+      ...process.env,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+      FAKE_GCS_BUCKET_DIR: bucketDir,
+    }, [
+      'engine/scripts/ota-publish.mjs',
+      '--dist', distDir, '--bucket', 'gs://fakebucket/testprefix',
+      '--name', 'shell', '--version', version, '--engine-api', engineApi, '--key', 'default',
+      ...extraArgs,
+    ]);
+  }
+
+  function readRelease() {
+    return JSON.parse(fs.readFileSync(path.join(bucketDir, 'fakebucket', 'testprefix', 'release.json'), 'utf8'));
+  }
+
+  it('stays mandatory across a routine publish with neither flag (regression for #564)', () => {
+    const first = publish('v1', ['--mandatory']);
+    expect(first.status).toBe(0);
+    expect(readRelease().mandatory).toBe(true);
+
+    const second = publish('v2');
+    expect(second.status).toBe(0);
+    expect(second.stdout).toMatch(/mandatory=true/);
+    expect(readRelease().mandatory).toBe(true);
+  });
+
+  it('--no-mandatory explicitly clears a sticky mandatory release', () => {
+    const first = publish('v1', ['--mandatory']);
+    expect(first.status).toBe(0);
+    expect(readRelease().mandatory).toBe(true);
+
+    const second = publish('v2', ['--no-mandatory']);
+    expect(second.status).toBe(0);
+    expect(second.stdout).toMatch(/mandatory=false/);
+    expect(readRelease().mandatory).toBe(false);
+  });
+
+  it('a first-ever publish with neither flag defaults to false', () => {
+    const result = publish('v1');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toMatch(/mandatory=false/);
+    expect(readRelease().mandatory).toBe(false);
+  });
+
+  it('bundles still merge and minEngineApi still ratchets up while mandatory stays sticky', () => {
+    const first = publish('v1', ['--mandatory'], '1');
+    expect(first.status).toBe(0);
+
+    // A second bundle name published alongside, at a HIGHER engine-api, with neither flag.
+    const second = runNode(repoRoot, {
+      ...process.env,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+      FAKE_GCS_BUCKET_DIR: bucketDir,
+    }, [
+      'engine/scripts/ota-publish.mjs',
+      '--dist', distDir, '--bucket', 'gs://fakebucket/testprefix',
+      '--name', 'sling', '--version', 'v1', '--engine-api', '2', '--key', 'default',
+    ]);
+    expect(second.status).toBe(0);
+
+    const release = readRelease();
+    expect(release.bundles).toEqual({ shell: 'v1', sling: 'v1' });
+    expect(release.minEngineApi).toBe(2);
+    expect(release.mandatory).toBe(true);
   });
 });

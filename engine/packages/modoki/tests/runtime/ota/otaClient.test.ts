@@ -216,6 +216,7 @@ describe('checkForUpdate', () => {
       name: 'shell', version: 'v2',
       zipUrl: 'https://cdn.example.com/game/bundles/shell/v2/bundle.zip',
       expectedZipHash: 'b'.repeat(64), expectedZipSize: 100,
+      files: [{ path: 'index.html', hash: 'a'.repeat(64) }],
     });
     expect(native.activate).toHaveBeenCalledWith({ name: 'shell', version: 'v2' });
     expect(native.stageUpdateDelta).not.toHaveBeenCalled();
@@ -255,8 +256,75 @@ describe('checkForUpdate', () => {
       name: 'shell', version: 'v2', baseVersion: 'v1',
       copy: ['index.html'],
       download: [{ path: 'assets/new.js', hash: 'c'.repeat(64), size: 3, url: 'https://cdn.example.com/game/bundles/shell/v2/files/' + 'c'.repeat(64) }],
+      files: [{ path: 'index.html', hash: 'a'.repeat(64) }, { path: 'assets/new.js', hash: 'c'.repeat(64) }],
     });
     expect(native.activate).toHaveBeenCalledWith({ name: 'shell', version: 'v2' });
+  });
+
+  it('reports the delta fallback through onDeltaFallback instead of swallowing it (#556)', async () => {
+    // The fallback silently turns a small delta into a full bundle download. If the reason is
+    // swallowed, an unexplained bandwidth spike is undiagnosable after the fact.
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1 }, privateKey);
+    const baseManifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v1', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+    };
+    const targetManifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v2', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      bundleZip: { hash: 'd'.repeat(64), size: 100 },
+    };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(targetManifest))
+      .mockResolvedValueOnce(jsonResponse(baseManifest));
+    const native = mockNative({
+      getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' } }) }),
+      stageUpdateDelta: vi.fn().mockRejectedValue(new Error('stage verification failed: hash mismatch')),
+    });
+    const onDeltaFallback = vi.fn();
+
+    await checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native,
+      onDeltaFallback,
+    });
+
+    expect(onDeltaFallback).toHaveBeenCalledWith({
+      version: 'v2', reason: 'stage verification failed: hash mismatch',
+    });
+  });
+
+  it('does NOT re-download the whole bundle when the delta staged fine but activate threw (#556)', async () => {
+    // `activate` sits outside the delta try deliberately. Inside it, a failed activate would
+    // fall through and re-download a whole bundle for a version that had already staged
+    // correctly — and the retry would hit the same failing activate anyway.
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1 }, privateKey);
+    const baseManifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v1', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+    };
+    const targetManifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v2', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      bundleZip: { hash: 'd'.repeat(64), size: 100 },
+    };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(targetManifest))
+      .mockResolvedValueOnce(jsonResponse(baseManifest));
+    const native = mockNative({
+      getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' } }) }),
+      activate: vi.fn().mockRejectedValue(new Error('activate failed')),
+    });
+
+    await expect(checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native,
+    })).rejects.toThrow('activate failed');
+
+    expect(native.stageUpdateDelta).toHaveBeenCalledTimes(1);
+    expect(native.stageUpdate).not.toHaveBeenCalled();
   });
 
   it('takes the delta path against the EMBEDDED manifest on a fresh install (no active version yet)', async () => {
@@ -291,6 +359,7 @@ describe('checkForUpdate', () => {
       name: 'shell', version: 'v1', baseVersion: 'embedded',
       copy: ['index.html'],
       download: [{ path: 'assets/new.js', hash: 'e'.repeat(64), size: 5, url: 'https://cdn.example.com/game/bundles/shell/v1/files/' + 'e'.repeat(64) }],
+      files: [{ path: 'index.html', hash: 'a'.repeat(64) }, { path: 'assets/new.js', hash: 'e'.repeat(64) }],
     });
   });
 
@@ -318,7 +387,72 @@ describe('checkForUpdate', () => {
       name: 'shell', version: 'v1',
       zipUrl: 'https://cdn.example.com/game/bundles/shell/v1/bundle.zip',
       expectedZipHash: 'f'.repeat(64), expectedZipSize: 200,
+      files: [{ path: 'index.html', hash: 'a'.repeat(64) }],
     });
+  });
+
+  it('falls back to whole-zip and still resolves staged when stageUpdateDelta throws (#556)', async () => {
+    // The #550 quarantine ruling ("re-staging would fetch identical broken bytes") does NOT
+    // hold for delta staging: `copy` entries are taken byte-for-byte off disk and hashed by
+    // nobody, so a LOCALLY corrupt base file can make native's own whole-tree verification
+    // throw even though the published bytes are fine. Delta is an optimization, so this must
+    // fall through to a whole-zip stage rather than failing the update outright.
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1 }, privateKey);
+    const baseManifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v1', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+    };
+    const targetManifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v2', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      bundleZip: { hash: 'd'.repeat(64), size: 100 },
+    };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(targetManifest))
+      .mockResolvedValueOnce(jsonResponse(baseManifest));
+    const native = mockNative({
+      getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' } }) }),
+      stageUpdateDelta: vi.fn().mockRejectedValue(new Error('stage verification failed: hash mismatch')),
+    });
+
+    const result = await checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native,
+    });
+
+    expect(result).toEqual({ outcome: 'staged', version: 'v2', mandatory: false });
+    expect(native.stageUpdateDelta).toHaveBeenCalledTimes(1);
+    expect(native.stageUpdate).toHaveBeenCalledWith({
+      name: 'shell', version: 'v2',
+      zipUrl: 'https://cdn.example.com/game/bundles/shell/v2/bundle.zip',
+      expectedZipHash: 'd'.repeat(64), expectedZipSize: 100,
+      files: [{ path: 'index.html', hash: 'a'.repeat(64) }],
+    });
+    expect(native.activate).toHaveBeenCalledWith({ name: 'shell', version: 'v2' });
+  });
+
+  it('propagates and never calls activate when stageUpdate (whole-zip) throws — no fallback', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1 }, privateKey);
+    const targetManifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v1', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      bundleZip: { hash: 'f'.repeat(64), size: 200 },
+    };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(targetManifest))
+      .mockResolvedValueOnce(jsonResponse({}, false)); // embedded manifest 404s -> whole-zip path
+    const native = mockNative({
+      stageUpdate: vi.fn().mockRejectedValue(new Error('hash mismatch')),
+    });
+
+    await expect(checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native,
+    })).rejects.toThrow('hash mismatch');
+
+    expect(native.activate).not.toHaveBeenCalled();
   });
 
   it('reports up-to-date without fetching a manifest when active already matches', async () => {

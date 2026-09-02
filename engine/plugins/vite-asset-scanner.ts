@@ -2822,14 +2822,20 @@ export function assetScannerPlugin(): Plugin {
         // work identically in a packaged Electron editor, not just this dev server. Only
         // the SSE publish pipeline below stays host-owned, same as /api/build.
 
-        // GET /api/ota/publish?version=v18&mandatory=1[&bundleName=][&key=][&bucket=] (SSE stream)
+        // GET /api/ota/publish?version=v18[&mandatory=1|0][&bundleName=][&key=][&bucket=] (SSE stream)
+        // `mandatory` is tri-state: 1 sets it, 0 clears it, omitted inherits the existing
+        // release's value (sticky — see ota-publish.mjs's own header comment).
         // Wraps engine/scripts/ota-publish.mjs with the safety rails the plan doc calls
         // for: build FRESH from the current project.config.json (never accept a stale
         // pre-built dist/), refuse a version-string collision, verify/set bucket CORS.
         if ((req.url === '/api/ota/publish' || req.url?.startsWith('/api/ota/publish?')) && req.method === 'GET') {
           const url = new URL(req.url, 'http://localhost');
           const version = url.searchParams.get('version');
-          const mandatory = url.searchParams.get('mandatory') === '1';
+          // Tri-state, matching ota-publish.mjs's own sticky-mandatory contract:
+          // "1" sets it, "0" clears it, absent inherits the existing release's value —
+          // `mandatoryParam` is `undefined` in that last case, distinct from `false`.
+          const mandatoryRaw = url.searchParams.get('mandatory');
+          const mandatoryParam = mandatoryRaw === '1' ? true : mandatoryRaw === '0' ? false : undefined;
           const keyName = url.searchParams.get('key') || 'default';
           const cfg = loadProjectConfig(projectRoot);
           const bundleName = url.searchParams.get('bundleName') || cfg.ota.bundleName;
@@ -3037,7 +3043,7 @@ export function assetScannerPlugin(): Plugin {
 
             // Step 4: the actual publish.
             sendStatus('Publishing...');
-            const mandatoryFlag = mandatory ? ' --mandatory' : '';
+            const mandatoryFlag = mandatoryParam === true ? ' --mandatory' : mandatoryParam === false ? ' --no-mandatory' : '';
             const publish = await runStep(
               'Publishing OTA bundle...',
               `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} --bucket ${JSON.stringify(bucket)} --name ${JSON.stringify(bundleName)} --version ${JSON.stringify(version)} --engine-api ${cfg.ota.engineApi} --key ${JSON.stringify(keyName)} --repo-root ${JSON.stringify(buildCwd)}${mandatoryFlag}`,
@@ -3053,10 +3059,17 @@ export function assetScannerPlugin(): Plugin {
             // as success — and an OTA release is the one artifact you cannot quietly re-do.
             // (The misspelled-arg half of this is now caught by strict validation; this is the
             // half that needs the RESULT to be checkable.)
+            // `mandatory` is sticky now (inherited when the param is absent), so echo the
+            // INTENT this call passed — printing a resolved true/false here would print "false"
+            // for an inherit-and-stay-mandatory publish while the release stays mandatory, which
+            // is the exact silent-mismatch class this echo exists to prevent. ota-publish.mjs's
+            // own "Published ..." log line (above, in the streamed step output) carries the
+            // resulting effective value.
             sendStatus('DONE');
+            const mandatoryIntent = mandatoryParam === true ? 'set' : mandatoryParam === false ? 'cleared' : 'unchanged';
             send(
               `\n✅ Published — effective parameters: bundleName=${bundleName} version=${version} ` +
-              `mandatory=${mandatory ? 'true' : 'false'} key=${keyName} bucket=${bucket}. ` +
+              `mandatory=${mandatoryIntent} key=${keyName} bucket=${bucket}. ` +
               `Verify with modoki_ota_status.`,
             );
             res.end();

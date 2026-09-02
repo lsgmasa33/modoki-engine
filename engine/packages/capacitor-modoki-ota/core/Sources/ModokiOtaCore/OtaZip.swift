@@ -22,6 +22,13 @@ public enum OtaZipError: Error {
   case unsupportedCompressionMethod(UInt16)
   case truncated
   case decompressionFailed(String)
+  /// Zip-slip guard (F6): an entry name that would escape the destination directory a
+  /// caller extracts it into via "../" traversal (or an absolute path). ota-publish.mjs
+  /// never emits such a path, but this content still travels over the network, so defend
+  /// against it here — in the shared decoder, ahead of every caller — rather than trusting
+  /// the source. Mirrors Android's `unzipInto` guard (OtaPlugin.java), which lives in the
+  /// actual unzip function for the same reason.
+  case unsafeEntryPath(String)
 }
 
 public enum OtaZip {
@@ -93,6 +100,7 @@ public enum OtaZip {
     let nameStart = offset + 46
     guard nameStart + nameLength <= bytes.count else { throw OtaZipError.truncated }
     let name = String(decoding: bytes[nameStart..<nameStart + nameLength], as: UTF8.self)
+    guard isSafeEntryPath(name) else { throw OtaZipError.unsafeEntryPath(name) }
 
     let data = try readLocalEntry(
       bytes, localHeaderOffset: localHeaderOffset, method: method,
@@ -101,6 +109,23 @@ public enum OtaZip {
 
     let next = nameStart + nameLength + extraLength + commentLength
     return (Entry(path: name, data: data), next)
+  }
+
+  // MARK: - Zip-slip guard (F6)
+
+  /// An entry name is safe to join onto ANY destination directory only if it is relative
+  /// (no leading "/") and none of its "/"-separated components is ".." — the standard
+  /// zip-slip check, done once here in the shared decoder rather than re-derived per caller
+  /// against a specific destDir (unlike Android's `unzipInto`, which has one write site and
+  /// checks the resolved canonical path there instead; this decoder has no destDir to
+  /// resolve against, and structural rejection here covers every current and future
+  /// caller).
+  private static func isSafeEntryPath(_ path: String) -> Bool {
+    if path.hasPrefix("/") { return false }
+    for component in path.split(separator: "/", omittingEmptySubsequences: false) {
+      if component == ".." { return false }
+    }
+    return true
   }
 
   // MARK: - Local file header + payload
