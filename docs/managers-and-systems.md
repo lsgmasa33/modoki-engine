@@ -243,6 +243,66 @@ Two consequences worth stating, so neither is re-filed as a defect:
   capture before the first `await`, re-check before every write after one — and the five sanctioned
   tokens are in [async-lifetime.md](async-lifetime.md).
 
+### Reload-on-resume — the trigger the ruling implies (#574)
+
+If reload is the sanctioned restart, something has to *fire* it. `runtime/core/resumeReload.ts` +
+`app/useResumeReload.ts` reload the app when it is resumed after a long background, so a stale
+session is replaced rather than resumed. Off by default: **the threshold is authored data**
+(`runtime.reloadAfterBackgroundMinutes` in `project.config.json`, in the editor's Project Settings),
+because a reload only preserves what the GAME persists. Court and Wordweave each hand-rolled a
+mid-level serializer; `sling`, `chess`, `space-invader` and `alien-animal` persist nothing and would
+lose the session. Capped at 1 minute whenever `build.debugBuild` is on (owner, 2026-09-02) — a ten-minute wait per
+iteration means the trigger is exercised once and assumed correct thereafter.
+
+⚠️ **`games/court` commits `debugBuild: true`, so Court's EFFECTIVE threshold today is 1 minute,
+not the authored 10** — and it becomes 10 the day that flag is turned off for a release. The cap is
+deliberate and was the owner's call, but it means the authored number is not what runs, so a
+perturbation test on that field ("edit it, watch the behaviour move") will read as inert. The boot
+log says which value is armed whenever the two disagree; believe it over the config.
+
+Four things about it are load-bearing, and each exists because of a measured trap:
+
+- **`registerReloadBlocker` is NOT `registerUIBusySource`**, though the shape is identical. They
+  fail in *opposite* directions on a throwing predicate: a UI-busy source degrades to "not busy"
+  so one bad predicate cannot brick every button, while a reload blocker counts a throw as
+  BLOCKED, because declining costs nothing and reloading over an unknown state can strand a
+  purchase. Court's win screen is a blocker without being UI-busy.
+- **Blockers are sampled when we go to BACKGROUND, not only on resume.** "Away for N minutes"
+  cannot by itself tell *the player put the game down* from *the app deliberately sent the player
+  out and is waiting* — a rewarded video opening the App Store, an OAuth hop through Safari. Those
+  background the app by design and can exceed any threshold, and the SDK may have cleared its own
+  in-flight flag by the time we look, so a resume-only check sees nothing pending and then
+  destroys the realm its callback was about to land in.
+- **The reload swallows the resume that triggered it.** `appStateChange` is emitted
+  non-retained, and `bridge.reset()` clears every JS listener at navigation start — so the new
+  realm never sees it, and Court's cloud-sync `'resume'` would never fire. Hence the
+  `sessionStorage` breadcrumb (`markResumeReload`/`consumeResumeReload`). `App.getState()` cannot
+  substitute: it reports "active now", equally true on a cold launch.
+- **The EDITOR route never self-reloads** — it would discard unsaved scene edits with nobody
+  watching. Gated on the route, not on `__MODOKI_EDITOR__`, so the game route under `npm run dev`
+  stays testable.
+
+**Device-verified on a Galaxy S22 (Android 14, 2026-09-02).** A 72s background/resume destroyed the
+JS realm — an in-page marker was gone — while the native **PID was unchanged**, which is the
+realm-dies/process-lives semantic this whole feature rests on, observed rather than inferred. The
+control matters as much as the result: a **15s** cycle left the marker intact, ruling out Android
+having trimmed the WebView and establishing that the reload is genuinely threshold-gated.
+
+⚠️ **The feature was invisible on device until its log moved off the boot path**, and the cause is
+general: the debug bridge installs its console capture from an async dynamic import
+(`main.tsx`'s `import('./debug/bridge').then(...)`), so **no boot-time log reaches
+`device_console_logs`** — an absent line there reads as "that code never ran" when it may only mean
+"it ran too early to be seen" (#591). Hence the armed-threshold line fires on the first background
+edge, not at mount.
+
+⚠️ **A realm death is not a process death, and the guards in this repo confuse the two.** Every
+existing double-init latch — `ads.ts`, `attribution.ts`, `LLMManager.ts` — is a module `let`, and
+every comment reasoning about them reasons about StrictMode and game swaps. A reload destroys the
+realm while the native process, and every native SDK in it, lives on. Where a once-per-process
+guard is genuinely needed it must live **natively**; a `let` cannot see this. The defects that
+follow from getting it wrong are filed as #584-#588, and all of them predate this trigger — three
+shipped paths already reload (`engine.reload`, `EditorBootBoundary`, Court's post-wipe restart).
+
 **When this would change:** only a **soft restart** — tearing down and re-registering in place
 instead of reloading, e.g. to pick up new remote config without a visible reload. That is a real
 feature if it is ever wanted, and the bar for it is exhaustiveness: anything the teardown misses

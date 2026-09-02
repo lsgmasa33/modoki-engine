@@ -33,6 +33,7 @@ game just imports and calls it; there is no registration.
 | `runtime/storage/backends.ts` | `PrefsBackend` interface + `InMemoryBackend` / `LocalStorageBackend` / `PreferencesBackend` + `selectDefaultBackend()`. |
 | `runtime/storage/index.ts` | Re-exports; surfaced from `runtime/index.ts`. |
 | `engine/app/App.tsx` | Hydrates per game (`init({ namespace: gameId, backend: selectDefaultBackend() })`) and registers flush-on-background. |
+| `engine/app/useResumeReload.ts` | Flushes and then checks `pendingKeys()` before a resume-reload destroys the realm (#574) — see the first Gotcha. |
 | `engine/packages/modoki/tests/runtime/playerPrefs*.test.ts` | Core, backends, and save→reload→restore integration tests. |
 
 ## API
@@ -138,6 +139,16 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   outgoing namespace before clearing the cache.
 
 ## Gotchas
+
+- **`await flush()` resolving is NOT evidence the writes landed — check `pendingKeys()` after it.**
+  `drain()` catches every backend rejection, re-queues the key onto `dirty` and warns, precisely so
+  one failing write cannot poison `writeChain` for the rest of the session. The flush promise
+  therefore resolves identically whether everything landed or nothing did, and a caller that treats
+  it as a success signal is reading a value that cannot fail. The reload-on-resume trigger
+  (`runtime/core/resumeReload.ts`, #574) is the worked example: it flushes, then **declines to
+  reload** while `pendingKeys()` is non-empty, because reloading would destroy the realm holding
+  the re-queued writes. ⚠️ This is a weaker claim than durability even when it passes — empty
+  `pendingKeys()` means *the backend accepted them*, which the bullet below is about.
 
 - **Atomic ≠ durable, and `flush()` does NOT close that gap — it is not an fsync on ANY backend.**
   A crash right after `set()` can lose that write; it is never partially written. `flush()` gets the

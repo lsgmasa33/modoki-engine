@@ -553,6 +553,12 @@ export interface ProjectConfig {
      *  rather than a shared import. */
     engineApi: number;
   };
+  /** Runtime/lifecycle policy. Optional: absent means every knob here is at its off/default. */
+  runtime?: {
+    /** Minutes in the background after which a resume triggers a full app reload (#574).
+     *  0 or absent = disabled. */
+    reloadAfterBackgroundMinutes?: number;
+  };
 }
 
 /** The `build.*` fields that must never reach a PUBLIC repo — Apple's Team ID,
@@ -758,6 +764,14 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     publicKey: '',
     bundleName: 'shell',
     engineApi: 1,
+  },
+  // Present (not omitted) despite `runtime` being an optional field on the interface: giving it
+  // a default here — rather than leaving DEFAULT_PROJECT_CONFIG.runtime undefined — is what lets
+  // `pruneProjectConfig` compare a resolved 0 against a matching default and keep an unopted-in
+  // project's file free of a "runtime": {} it never asked for (see the invariant on
+  // pruneProjectConfig above).
+  runtime: {
+    reloadAfterBackgroundMinutes: 0,
   },
 };
 
@@ -1002,6 +1016,7 @@ export function mergeProjectConfig(
     },
     postprocessors: { ...d.postprocessors, ...p.postprocessors },
     ota: { ...d.ota, ...p.ota },
+    runtime: { ...d.runtime, ...p.runtime },
   };
 }
 

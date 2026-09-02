@@ -3,6 +3,7 @@ import type { ErrorInfo, ReactNode } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
+import { useResumeReload } from './useResumeReload';
 import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint } from '@modoki/engine/runtime';
 import { App as CapacitorApp } from '@capacitor/app';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
@@ -786,6 +787,13 @@ function App() {
   }, []);
 
   useAudioResumeRearm();
+
+  // Reload the app on resume after a long background (#574). A no-op unless the project authors
+  // `runtime.reloadAfterBackgroundMinutes`. Registered AFTER the flush effect above deliberately:
+  // Capacitor dispatches `appStateChange` in registration order, so the background flush is
+  // already queued by the time this samples the reload blockers. The trigger awaits its own
+  // `PlayerPrefs.flush()` before reloading regardless — this ordering is belt, not braces.
+  useResumeReload();
 
   // Editor route (omitted from game-only builds)
   if (!GAME_ONLY && hash === '#/editor' && EditorApp) {

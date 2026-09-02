@@ -710,6 +710,21 @@ export { registerUIBusySource } from './core/uiBusySources';
 // Polls the busy predicates every frame so #530's valve OBSERVES continuity instead of inferring
 // it across discrete UI activations (#551). Registered as a system in `app/ecs/pipeline.ts`.
 export { pollUIBusyContinuity } from './core/uiBusySources';
+// Reload-on-resume (#574) — the trigger that restarts the app after a long background, plus the
+// two guards it needs. `registerReloadBlocker` is NOT the same registry as `registerUIBusySource`
+// above: the two fail in opposite directions on a throwing predicate, and Court's win screen
+// blocks a reload without being UI-busy. `consumeResumeReload` exists because the reload swallows
+// the very `appStateChange` that triggered it, so the new realm has no other way to learn it was
+// resumed rather than cold-launched. See `core/resumeReload.ts` for the full reasoning.
+export {
+  registerReloadBlocker,
+  getActiveReloadBlockers,
+  markResumeReload,
+  consumeResumeReload,
+  createResumeReloadHandler,
+  type ResumeReloadDeps,
+  type ResumeReloadHandler,
+} from './core/resumeReload';
 // Input WATCH (#134) — a game publishes what its OWN hit-test resolved a press to, which is the
 // one thing no engine-side observer can compute for a canvas game. Safe to call unconditionally:
 // it is a no-op until an agent opens a watch window.
