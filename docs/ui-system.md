@@ -521,19 +521,37 @@ A **detached** root is skipped rather than measured: a removed node answers empt
 and `clientHeight` 0, so refreshing off one would silently zero every inset when a viewport
 unmounts.
 
-⚠️ **The self-refresh is BOUNDED to a short window after a mount/resume, not indefinite (#592).**
+⚠️ **The self-refresh is BOUNDED to a refresh budget after a mount/resume, not indefinite (#592).**
 The Android transition it exists for settles once, shortly after the signal — not continuously for
-the rest of a play session — so `safeArea.ts` arms a `POLL_WINDOW_MS` (5s) window on every EXTERNAL
-registration (`measureSafeAreaInsets` — a mount, a resize) and on a `visibilitychange` resume, and
-stops scheduling further refreshes once it elapses (the last-measured value keeps being returned).
-⚠️ **The self-refresh's OWN re-measure deliberately does NOT re-arm the window** — an early version
-of the fix called the same arming entry point from inside the deferred refresh, which re-opened the
-window on every refresh and left the poll running at its original rate forever (caught in review,
-before this landed); the internal re-measure goes through a separate, non-arming path. Platform-
-agnostic on purpose — it listens for the DOM `visibilitychange` event rather than threading
-Capacitor's `App.addListener('resume', ...)` through this otherwise Capacitor-free, L0-ish module,
-and it wires that listener lazily (on the first real registration, at most once per module
-instance, removed by `resetSafeAreaInsets`) rather than unconditionally at import time.
+the rest of a play session — so `safeArea.ts` arms a `POLL_REFRESH_BUDGET` (20) count of
+re-measures on every EXTERNAL registration (`measureSafeAreaInsets` — a mount, a resize) and on a
+`visibilitychange` resume. Each self-refresh actually performed spends one; once the budget is
+spent it stops scheduling further refreshes (the last-measured value keeps being returned). 20
+matches the OLD 5s/`REFRESH_MS` window's ceiling only for a per-frame reader (that reader used to
+reach 19, not a clean 20, and a slower reader — 1Hz, say — used to be capped by its own cadence at
+4, not by the window, and now spends the full 20 too); the separate RATE bound (one forced layout
+per 250ms, `REFRESH_MS`, #579's own concern) is unchanged by any of this.
+⚠️ **A COUNT, not a deadline — deliberately (#600).** An earlier version armed a wall-clock window
+instead, and a window is spent by TIME passing whether or not anything was measured: a consumer
+that suppresses reads for a while — Court's gesture gate skips this accessor for the whole
+duration of a touch — could have its window burned down to nothing while paying no cost, so its
+catch-up read at the end of the suppressed period arrived after the window had already closed and
+found nothing scheduled. A budget spent only by actual measurements does not have that failure
+mode: a suppressed reader's budget is still there when it resumes reading. ⚠️ **What that trade
+gives up is tracked as #606** — the deadline also guaranteed the poll was silent by wall-clock T
+after the signal *whatever the consumer did*, which kept a forced layout out of a scroll starting
+long after mount; Court's gate reopens on `touchend` while WebKit is still decelerating, so up to
+6 can now land in that ~1.5s (measured; 0 before). Whether that stalls the compositor the way
+#579's finger-down profile did is **unmeasured** — #606 carries the device measurement that would
+settle it, and says why both obvious mitigations were rejected. Don't patch it from analysis.
+⚠️ **The self-refresh's OWN re-measure deliberately does NOT re-arm the budget** — an early version
+of the fix called the same arming entry point from inside the deferred refresh, which topped the
+budget back up on every refresh and left the poll running at its original rate forever (caught in
+review, before this landed); the internal re-measure goes through a separate, non-arming path.
+Platform-agnostic on purpose — it listens for the DOM `visibilitychange` event rather than
+threading Capacitor's `App.addListener('resume', ...)` through this otherwise Capacitor-free,
+L0-ish module, and it wires that listener lazily (on the first real registration, at most once per
+module instance, removed by `resetSafeAreaInsets`) rather than unconditionally at import time.
 
 ⚠️ **The preset numbers are mostly PUBLISHED, not measured**, and they model the
 **physical** insets — the notch/Dynamic Island and the home indicator, i.e. what a

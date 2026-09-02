@@ -74,32 +74,74 @@ let refreshFrameId: ReturnType<typeof requestAnimationFrame> | null = null;
  *  frames instead of 60. */
 const REFRESH_MS = 250;
 
-/** How long after a registration/resume signal the throttled self-refresh (below) stays
- *  armed, ms. #592: the Android bar-hide this refresh exists for (#273) settles once, a
- *  beat after the signal — not continuously for the rest of the session — so polling past
- *  this window is pure ongoing cost (a forced synchronous layout, see `getSafeAreaInsets`'s
- *  own doc) for zero remaining benefit. Generous relative to `REFRESH_MS` (20 refreshes)
- *  because the settle time is observed, not measured precisely across devices; if a device
- *  turns up where the transition lands later, widen this rather than removing the bound —
- *  the fallback is a stuck stale value (#273 again, see `getSafeAreaInsets`'s doc), not a
- *  crash, so a too-short window is a correctness bug to fix with a bigger number, not a
- *  reason to give up on bounding it. */
-const POLL_WINDOW_MS = 5000;
-
-/** `rawNow()` timestamp the self-refresh keeps polling until. Re-armed by every EXTERNAL
- *  registration — `measureSafeAreaInsets` (mount, a resize, a scene swap's fresh root) and a
- *  `visibilitychange` resume — the moments the bar-hide can occur. Past this the cached value
- *  is still returned (see `getSafeAreaInsets`); it simply stops re-measuring on its own until
- *  the next such signal.
+/** How many self-refreshes a registration/resume signal arms. #592: the Android bar-hide this
+ *  refresh exists for (#273) settles once, a beat after the signal — not continuously for the
+ *  rest of the session — so polling past that settle point is pure ongoing cost (a forced
+ *  synchronous layout, see `getSafeAreaInsets`'s own doc) for zero remaining benefit. 20 matches
+ *  the ceiling the old 5s/`REFRESH_MS` window imposed — but **that equivalence holds only for a
+ *  PER-FRAME reader**, and even then the old window in fact reached 19, not a clean 20: its first
+ *  refresh could only land at t+256ms (a 60fps reader crosses the 250ms throttle a frame late),
+ *  leaving room for 19 more inside the remaining span, not 20. A reader slower than once-a-frame
+ *  used to be bounded by its OWN cadence rather than the window, and #600 changes that — measured
+ *  forced-layouts-per-signal, pre-fix → post-fix: 60fps reader 19 → 20 (near enough unchanged),
+ *  1Hz reader 4 → 20, 0.5Hz reader 2 → 20. See the ⚠️ below for why spending more for a slow
+ *  reader is the intended trade, not a regression.
  *
- *  ⚠️ **The self-refresh's OWN re-measure must NOT re-arm this, or the window never closes**
- *  (found in review, #592): the deferred rAF callback below used to call the same
- *  `measureSafeAreaInsets` a real registration calls, which re-armed the window on every
- *  refresh and made it stay open indefinitely — the exact bug #592 was written to fix,
- *  reintroduced by the fix. `applyMeasurement` (below) is the measurement with no arming,
- *  used by both the public entry point (which arms first) and the self-refresh (which must
- *  not). */
-let pollArmedUntil = -Infinity;
+ *  ⚠️ **This budget does NOT touch the RATE bound**, which is separate and unchanged: `rawNow() -
+ *  lastMeasuredAt > REFRESH_MS` (`getSafeAreaInsets`, below) plus the one-in-flight
+ *  `refreshQueued` guard still cap this at ONE forced layout per 250ms, however the caller drives
+ *  it — that is the bound #579 cares about (the WebKit touch-scroll compositor stall it measured
+ *  live), and nothing here loosens it.
+ *
+ *  ⚠️ **The COUNT is preserved for a per-frame reader; the SPAN is not, and that is the
+ *  deliberate trade.** The old window also confined those measurements to 5 seconds. A budget
+ *  does not: a consumer reading once a second rather than once a frame now spends its full 20
+ *  over ~20s instead of the 4 the old window's own 5s span let it reach (measured above), and one
+ *  suppressing reads entirely (Court's gesture gate, #600) can spend its first long after the
+ *  signal. That is the whole point — the poll has to outlast a suppressed period to catch up at
+ *  the end of one — and it stays bounded either way, because the cost that matters is the number
+ *  of forced layouts, not the wall-clock span they are spread across.
+ *
+ *  ⚠️ **That trade is not free, and the one place it is known to cost something is tracked as
+ *  #606**: the old window guaranteed the poll was SILENT by wall-clock T after the signal
+ *  whatever the consumer did, and that is what kept a forced layout out of a scroll starting long
+ *  after mount. Court's gate reopens on `touchend` while WebKit is still decelerating a momentum
+ *  scroll, so up to 6 of these can now land in that ~1.5s (measured; 0 before). Whether that
+ *  actually stalls the compositor the way #579's finger-down profile did is UNMEASURED — do not
+ *  "fix" it from analysis, see #606 for the device measurement that would settle it.
+ *
+ *  On SIZING this number: if a device turns up where
+ *  the transition lands later, widen this rather than removing the bound — the fallback is a
+ *  stuck stale value (#273 again, see `getSafeAreaInsets`'s doc), not a crash, so too small a
+ *  budget is a correctness bug to fix with a bigger number, not a reason to give up on bounding
+ *  it. */
+const POLL_REFRESH_BUDGET = 20;
+
+/** How many self-refreshes remain before the poll stops scheduling itself. Set (not
+ *  incremented) by every EXTERNAL registration — `measureSafeAreaInsets` (mount, a resize, a
+ *  scene swap's fresh root) and a `visibilitychange` resume — the moments the bar-hide can
+ *  occur. Past zero the cached value is still returned (see `getSafeAreaInsets`); it simply
+ *  stops re-measuring on its own until the next such signal.
+ *
+ *  ⚠️ **The self-refresh's OWN re-measure must NOT re-arm this, or the budget never runs out**
+ *  (found in review, #592, and this reasoning applies verbatim to a count): the deferred rAF
+ *  callback below used to call the same `measureSafeAreaInsets` a real registration calls,
+ *  which re-armed the budget on every refresh and made it top up forever — the exact bug #592
+ *  was written to fix, reintroduced by the fix. `applyMeasurement` (below) is the measurement
+ *  with no arming, used by both the public entry point (which arms first) and the self-refresh
+ *  (which must not).
+ *
+ *  ⚠️ **This is a COUNT, not a deadline, and that distinction is #600.** A wall-clock window is
+ *  spent by TIME passing, whether or not anything was measured — so a consumer that stops
+ *  reading for a while has its window burned down for free. Court's `boardSafeAreaInsets()`
+ *  (`games/court/runtime/systems.ts`) deliberately skips the accessor for the whole duration of
+ *  a live touch gesture (#579 follow-up); under the old `pollArmedUntil` deadline, a gesture
+ *  starting near a resume/mount and outlasting the window burned the entire window on ZERO
+ *  reads, so the catch-up read at the end of the gesture landed past a deadline that had already
+ *  passed and scheduled nothing — the stale value then stuck until the next mount/resize/resume.
+ *  A budget is spent by MEASUREMENTS instead, so a suppressed reader arrives at the end of its
+ *  gesture with the budget still intact and its next read catches up normally. */
+let refreshesLeft = 0;
 
 /** Set once the `visibilitychange` listener (below) has been added, so a burst of
  *  registrations wires it at most once per module instance. */
@@ -131,7 +173,7 @@ function wireVisibilityResume(): void {
 }
 
 function onVisibilityChange(): void {
-  if (document.visibilityState === 'visible') pollArmedUntil = rawNow() + POLL_WINDOW_MS;
+  if (document.visibilityState === 'visible') refreshesLeft = POLL_REFRESH_BUDGET;
 }
 
 if (import.meta.hot) {
@@ -175,26 +217,30 @@ if (import.meta.hot) {
  *  still drives every read — this only moves WHEN the expensive part of one particular read
  *  runs, never whether the read happens.
  *
- *  ⚠️ **The self-refresh is BOUNDED to a window after a registration/resume, not indefinite
- *  (#592).** The case it exists for (#273's Android bar-hide) settles once, shortly after
- *  mount or a resume from background — not continuously for the rest of a play session — so
- *  polling forever after that point is ongoing forced-layout cost for zero remaining benefit
+ *  ⚠️ **The self-refresh is BOUNDED to a refresh BUDGET armed by a registration/resume, not
+ *  indefinite (#592).** The case it exists for (#273's Android bar-hide) settles once, shortly
+ *  after mount or a resume from background — not continuously for the rest of a play session —
+ *  so polling forever after that point is ongoing forced-layout cost for zero remaining benefit
  *  (measured: 3-4x/sec continuously, stalling the iPhone 8's touch-scroll compositor, #579
- *  follow-up). Past `pollArmedUntil` this returns the last-measured value without scheduling
- *  another refresh; an external `measureSafeAreaInsets` registration and a `visibilitychange`
- *  resume both re-arm it. **The refresh below must re-measure through `applyMeasurement`, not
- *  `measureSafeAreaInsets`** — the public entry point re-arms the window, and calling it from
- *  here would make every self-refresh extend its own window, so the poll would never actually
- *  stop (the bug this section exists to prevent, caught in review). */
+ *  follow-up). Once `refreshesLeft` reaches zero this returns the last-measured value without
+ *  scheduling another refresh; an external `measureSafeAreaInsets` registration and a
+ *  `visibilitychange` resume both re-arm the budget. **#600: a COUNT rather than a deadline is
+ *  the point** — a consumer that stops reading for a while (Court's `boardSafeAreaInsets()`
+ *  skips this accessor for a whole touch gesture) spends nothing while it is not reading, so
+ *  its catch-up read still finds budget left however long the gesture ran, instead of arriving
+ *  after a wall-clock window that closed unspent. **The refresh below must re-measure through
+ *  `applyMeasurement`, not `measureSafeAreaInsets`** — the public entry point re-arms the
+ *  budget, and calling it from here would make every self-refresh top up its own budget, so the
+ *  poll would never actually stop (the bug this section exists to prevent, caught in review). */
 export function getSafeAreaInsets(): SafeAreaInsets {
   // ⚠️ A DETACHED root must not be measured, and this cleanup runs UNCONDITIONALLY — never
-  // gated by the poll window below (found in review, #592 follow-up). `root.isConnected` is a
+  // gated by the poll budget below (found in review, #592 follow-up). `root.isConnected` is a
   // cheap DOM flag read, not a forced layout, so there is no cost reason to skip it once the
-  // window has closed; skipping it left a detached root (and the whole DOM subtree it drags
-  // with it) referenced by this module forever once the window elapsed with no further
-  // registration — e.g. a scene swap to a UI-less scene more than `POLL_WINDOW_MS` after the
-  // last registration used to release the old root on the very next read; now it wouldn't,
-  // without this branch running independently of whether a refresh may also be scheduled.
+  // budget is spent; skipping it left a detached root (and the whole DOM subtree it drags with
+  // it) referenced by this module forever once the budget ran out with no further registration
+  // — e.g. a scene swap to a UI-less scene after `POLL_REFRESH_BUDGET` refreshes had already
+  // been spent used to release the old root on the very next read; now it wouldn't, without this
+  // branch running independently of whether a refresh may also be scheduled.
   //
   // `UIRenderer`'s callback ref returns early on unmount (it has other teardown to skip), so it
   // never hands this module a null — the reference here simply goes stale, still pointing at a
@@ -206,7 +252,7 @@ export function getSafeAreaInsets(): SafeAreaInsets {
   // either way — a device's insets do not change because some UI unmounted.
   if (root && !root.isConnected) {
     root = null;
-  } else if (root && rawNow() - lastMeasuredAt > REFRESH_MS && !refreshQueued && rawNow() < pollArmedUntil) {
+  } else if (root && rawNow() - lastMeasuredAt > REFRESH_MS && !refreshQueued && refreshesLeft > 0) {
     refreshQueued = true;
     const target = root;
     refreshFrameId = requestAnimationFrame(() => {
@@ -222,11 +268,17 @@ export function getSafeAreaInsets(): SafeAreaInsets {
       // both are the same bug: acting on behalf of a registration this callback no longer
       // speaks for.
       if (root !== target) return;
-      // ⚠️ `applyMeasurement`, NOT `measureSafeAreaInsets` — see `pollArmedUntil`'s own doc
+      // ⚠️ `applyMeasurement`, NOT `measureSafeAreaInsets` — see `refreshesLeft`'s own doc
       // (#592). This is the self-refresh re-measuring itself, not a new registration; calling
-      // the arming entry point here would re-open the poll window on every refresh and the
-      // window would never close.
-      if (target.isConnected) applyMeasurement(target);
+      // the arming entry point here would top up the poll budget on every refresh and it would
+      // never actually run out.
+      //
+      // The budget is spent HERE, immediately before the forced layout it pays for — not in
+      // `applyMeasurement`, which is also the external registration path and must not spend
+      // what it is meant to arm. A callback that bails above (stale identity) or below
+      // (disconnected target) forced no layout, so it spends nothing; `refreshQueued` already
+      // guarantees at most one of these is ever in flight, so this cannot over-spend.
+      if (target.isConnected) { refreshesLeft -= 1; applyMeasurement(target); }
       else root = null;
     });
   }
@@ -237,20 +289,20 @@ export function getSafeAreaInsets(): SafeAreaInsets {
  *  part of the game-facing surface. This is the EXTERNAL registration entry point — a real
  *  mount, resize, or scene-swap fresh root — as opposed to the self-refresh's own re-measure
  *  (`applyMeasurement`, below), which must not be confused with a registration (#592, see
- *  `pollArmedUntil`'s doc for why that distinction is load-bearing). */
+ *  `refreshesLeft`'s doc for why that distinction is load-bearing). */
 export function measureSafeAreaInsets(el: HTMLElement | null): void {
-  // #592: a real registration re-arms the bounded self-refresh window (see `POLL_WINDOW_MS`) —
-  // this is the "mount" signal alongside `visibilitychange`'s "resume" one. `el === null` (a
-  // detach) arms nothing new; there is no root left to poll. Wiring the resume listener here
-  // (rather than at module load) means it activates only once something has actually
-  // registered a root, not merely because this module was imported.
-  if (el) { pollArmedUntil = rawNow() + POLL_WINDOW_MS; wireVisibilityResume(); }
+  // #592: a real registration re-arms the bounded self-refresh budget (see
+  // `POLL_REFRESH_BUDGET`) — this is the "mount" signal alongside `visibilitychange`'s "resume"
+  // one. `el === null` (a detach) arms nothing new; there is no root left to poll. Wiring the
+  // resume listener here (rather than at module load) means it activates only once something
+  // has actually registered a root, not merely because this module was imported.
+  if (el) { refreshesLeft = POLL_REFRESH_BUDGET; wireVisibilityResume(); }
   applyMeasurement(el);
 }
 
 /** The measurement itself, shared by `measureSafeAreaInsets` (above, which arms the poll
- *  window first) and the self-refresh's deferred rAF callback (`getSafeAreaInsets`, which
- *  must NOT arm it — see `pollArmedUntil`'s doc, #592). Not exported: every external caller
+ *  budget first) and the self-refresh's deferred rAF callback (`getSafeAreaInsets`, which
+ *  must NOT arm it — see `refreshesLeft`'s doc, #592). Not exported: every external caller
  *  goes through `measureSafeAreaInsets`.
  *
  *  Measures a hidden probe rather than reading the `--ui-sa-*` custom properties
@@ -323,7 +375,7 @@ export function resetSafeAreaInsets(): void {
   insets = { ...ZERO };
   root = null;
   lastMeasuredAt = -Infinity;
-  pollArmedUntil = -Infinity;
+  refreshesLeft = 0;
   // A refresh scheduled by a torn-down session must not fire against whatever registers next —
   // cancel the real callback, not just the flag that gates scheduling a new one (found in
   // review, #579 follow-up).
