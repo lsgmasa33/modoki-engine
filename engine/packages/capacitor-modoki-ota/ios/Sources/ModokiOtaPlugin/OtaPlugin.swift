@@ -291,6 +291,7 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
     CAPPluginMethod(name: "listBundles", returnType: CAPPluginReturnPromise),
     CAPPluginMethod(name: "beginBundleLoad", returnType: CAPPluginReturnPromise),
     CAPPluginMethod(name: "reportBundleLoadFailure", returnType: CAPPluginReturnPromise),
+    CAPPluginMethod(name: "recordSeq", returnType: CAPPluginReturnPromise),
   ]
 
   /// Emits `otaProgress` (Phase 3a — plumbing only, no UI consumes this yet). Safe to
@@ -593,6 +594,22 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
       call.resolve(["ok": true])
     } catch {
       call.reject("confirmBoot failed: \(error.localizedDescription)")
+    }
+  }
+
+  /// #571 anti-rollback — persists `seq` as the device's new high-water mark. Called by
+  /// `checkForUpdate` right after signature verification, before any staging decision.
+  @objc func recordSeq(_ call: CAPPluginCall) {
+    guard let seq = call.getInt("seq") else { call.reject("recordSeq requires seq"); return }
+    OtaPaths.stateLock.lock()
+    defer { OtaPaths.stateLock.unlock() }
+    let state = OtaCore.parseState(try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8))
+    let newState = OtaCore.recordSeq(state, seq: seq)
+    do {
+      try OtaCore.serialize(newState).write(to: OtaPaths.stateFilePath, atomically: true, encoding: .utf8)
+      call.resolve(["ok": true])
+    } catch {
+      call.reject("recordSeq failed: \(error.localizedDescription)")
     }
   }
 

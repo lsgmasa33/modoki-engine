@@ -367,6 +367,28 @@ public class OtaPlugin extends Plugin {
     }
   }
 
+  /** #571 anti-rollback — persists `seq` as the device's new high-water mark. Called by
+   *  checkForUpdate right after signature verification, before any staging decision. */
+  @PluginMethod
+  public void recordSeq(PluginCall call) {
+    Integer seq = call.getInt("seq");
+    if (seq == null) {
+      call.reject("recordSeq requires seq");
+      return;
+    }
+    try {
+      synchronized (STATE_LOCK) {
+        OtaCore.State newState = OtaCore.recordSeq(readState(getContext()), seq);
+        writeState(getContext(), newState);
+      }
+      JSObject ret = new JSObject();
+      ret.put("ok", true);
+      call.resolve(ret);
+    } catch (Exception e) {
+      call.reject("recordSeq failed: " + e.getMessage(), e);
+    }
+  }
+
   @PluginMethod
   public void getState(PluginCall call) {
     try {
@@ -776,6 +798,7 @@ public class OtaPlugin extends Plugin {
       // Omit the key entirely when null (rather than writing JSON null) — matches how a
       // Phase 1/2-written state.json has no key at all; both read back as null below.
       if (state.lastSeenBinaryVersion != null) obj.put("lastSeenBinaryVersion", state.lastSeenBinaryVersion);
+      obj.put("highestSeenSeq", state.highestSeenSeq);
       return obj.toString();
     } catch (JSONException e) {
       throw new RuntimeException(e);
@@ -792,7 +815,10 @@ public class OtaPlugin extends Plugin {
       intMap(obj.optJSONObject("bootAttempts")),
       intMap(obj.optJSONObject("confirmedBoots")),
       stringListMap(obj.optJSONObject("rejected")),
-      lastSeenBinaryVersion
+      lastSeenBinaryVersion,
+      // Absent (a state.json written by a pre-#571 binary) parses as 0 — same
+      // "never seen anything" contract every other new field here follows.
+      obj.optInt("highestSeenSeq", 0)
     );
   }
 

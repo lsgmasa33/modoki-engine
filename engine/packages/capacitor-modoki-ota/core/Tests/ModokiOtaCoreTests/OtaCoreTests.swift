@@ -103,7 +103,10 @@ final class OtaCoreTests: XCTestCase {
       bootAttempts: intMap(obj, "bootAttempts"),
       confirmedBoots: intMap(obj, "confirmedBoots"),
       rejected: stringListMap(obj, "rejected"),
-      lastSeenBinaryVersion: obj["lastSeenBinaryVersion"] as? String
+      lastSeenBinaryVersion: obj["lastSeenBinaryVersion"] as? String,
+      // Absent (no vector fixture sets this yet) parses as 0 — same "never seen anything"
+      // contract OtaCore.parseState follows (#571).
+      highestSeenSeq: (obj["highestSeenSeq"] as? Int) ?? (obj["highestSeenSeq"] as? NSNumber)?.intValue ?? 0
     )
   }
 
@@ -326,5 +329,61 @@ final class OtaCoreTests: XCTestCase {
       let result = OtaCore.bundlesToPrune(state: state, shellName: shellName)
       XCTAssertEqual(result, expected, "\(name): bundlesToPrune mismatch")
     }
+  }
+
+  // MARK: - Anti-rollback (#571)
+
+  func testRecordSeqStartsFromNilState() {
+    let result = OtaCore.recordSeq(nil, seq: 5)
+    XCTAssertEqual(result.highestSeenSeq, 5)
+  }
+
+  func testRecordSeqAdvancesTheHighWaterMark() {
+    let state = OtaState(highestSeenSeq: 3)
+    let result = OtaCore.recordSeq(state, seq: 7)
+    XCTAssertEqual(result.highestSeenSeq, 7)
+  }
+
+  func testRecordSeqNeverRegresses() {
+    // The whole point: a call with a LOWER seq than what's already recorded must not move
+    // the high-water mark backwards — that would reopen the exact replay window it exists
+    // to close.
+    let state = OtaState(highestSeenSeq: 10)
+    let result = OtaCore.recordSeq(state, seq: 3)
+    XCTAssertEqual(result.highestSeenSeq, 10)
+  }
+
+  func testRecordSeqPreservesEveryOtherField() {
+    let state = OtaState(active: ["shell": "v1"], pending: ["shell": "v2"], rejected: ["shell": ["v0"]], highestSeenSeq: 1)
+    let result = OtaCore.recordSeq(state, seq: 9)
+    XCTAssertEqual(result.active, ["shell": "v1"])
+    XCTAssertEqual(result.pending, ["shell": "v2"])
+    XCTAssertEqual(result.rejected, ["shell": ["v0"]])
+    XCTAssertEqual(result.highestSeenSeq, 9)
+  }
+
+  func testHighestSeenSeqSurvivesSerializeParseRoundTrip() {
+    let state = OtaState(highestSeenSeq: 42)
+    let json = OtaCore.serialize(state)
+    let parsed = OtaCore.parseState(json)
+    XCTAssertEqual(parsed?.highestSeenSeq, 42)
+  }
+
+  func testHighestSeenSeqDefaultsToZeroWhenAbsentFromStateJSON() {
+    // A state.json written by a pre-#571 binary has no key at all — must parse as 0, not
+    // crash and not nil out the whole state (same contract every other new field follows).
+    let json = "{\"active\":{\"shell\":\"v1\"}}"
+    let parsed = OtaCore.parseState(json)
+    XCTAssertEqual(parsed?.highestSeenSeq, 0)
+  }
+
+  func testResetForNewBinaryPreservesHighestSeenSeq() {
+    // Mirrors `rejected`'s survival across a binary reset — see resetForNewBinary's doc
+    // comment: this is a fact about which release.json documents this DEVICE has already
+    // seen, not a reference to a snapshot a fresh binary invalidates.
+    let state = OtaState(active: ["shell": "v1"], lastSeenBinaryVersion: "1", highestSeenSeq: 12)
+    let result = OtaCore.resetForNewBinary(state, currentBinaryVersion: "2")
+    XCTAssertEqual(result?.highestSeenSeq, 12)
+    XCTAssertEqual(result?.active, [:]) // sanity: this branch DOES wipe active/pending as designed
   }
 }

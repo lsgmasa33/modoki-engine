@@ -149,9 +149,16 @@ export interface ModokiOtaPlugin {
     disposition: 'fatal' | 'transient' | 'notEvidence';
   }): Promise<{ target: 'none' } | { target: 'version'; name: string; version: string; path: string }>;
 
-  /** Debug/inspection only — the raw state.json contents (or the literal string "null"
-   *  if absent/corrupt), e.g. for a debug-menu tab. Never parse this for control flow. */
+  /** The raw state.json contents (or the literal string "null" if absent/corrupt) — e.g.
+   *  for a debug-menu tab, but also otaClient.ts's `checkForUpdate`, which parses `active`/
+   *  `pending`/`rejected`/`bootAttempts`/`highestSeenSeq` off this to decide what to do. */
   getState(): Promise<{ stateJSON: string }>;
+  /** #571 anti-rollback: persists `seq` as the device's new high-water mark, monotonically
+   *  — native takes `max(existing, seq)`, so this is safe to call with a `seq` that turns
+   *  out not to be an increase. Called by `checkForUpdate` right after signature
+   *  verification, before any staging decision — see otaClient.ts's `OtaNativePlugin` for
+   *  the full rationale (an up-to-date check, the common case, must still advance this). */
+  recordSeq(options: { seq: number }): Promise<{ ok: boolean }>;
 
   /** OTA Phase 4 (docs/ota-subgame-modules.md) — every bundle this device has content for
    *  on disk. **DISCOVERY ONLY — this is not how you decide what to load.**

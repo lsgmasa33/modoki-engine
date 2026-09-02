@@ -60,7 +60,7 @@ CDN/
   bundles/<name>/<version>/bundle.zip    # whole-bundle fallback
 ```
 
-`release.json` — `{schema, bundles: {shell: "v12", …}, mandatory, minEngineApi, manifests?, sig}`.
+`release.json` — `{schema, bundles: {shell: "v12", …}, mandatory, minEngineApi, manifests?, seq?, sig}`.
 Per-bundle `manifest.json` — `{schema, name, version, engineApi, files: {"<path>": {hash, size}}, bundleZip?}`.
 
 Only `release.json` is signed; it is the single trusted root. Everything else is reached by
@@ -108,14 +108,30 @@ version would make every already-shipped client reject every future release, per
 additive-compat reasoning as `manifest.bundleZip`.) An attacker cannot simply *strip* the field —
 `release.json` is signed, so removing it invalidates the signature.
 
-⚠️ **The residual risk is release REPLAY, and nothing covers it today.** There is no anti-rollback
-mechanism anywhere in the OTA path: `checkForUpdate` compares the target only against `active` /
-`pending` / `rejected`, and both `OtaCore`s treat versions as opaque strings with no ordering. So
-an attacker with bucket write can serve an older, validly-signed `release.json` they captured —
-including a pre-#570 one with no `manifests` field at all, which skips this check entirely and
-restores the exact gap #570 closed. This predates #570 and is not introduced by it, but it does
-bound what the manifest chain buys: it authenticates the contents of whatever release is served,
-not that the release served is the newest one.
+**Anti-rollback (#571) closes release REPLAY.** `release.json` carries an optional monotonic
+`seq`, bumped by `ota-publish.mjs` on every publish (`(existingRelease?.seq ?? 0) + 1`, recomputed
+inside the same `--if-generation-match` retry loop `bundles`/`mandatory`/`manifests` already use,
+so two racing publishes still produce two distinct, strictly increasing values). Each device
+persists the highest `seq` it has ever seen natively (`OtaState.highestSeenSeq`, a single
+device-wide counter — unlike every other `OtaState` field it is not per-bundle, because `seq` is a
+property of the release *document* as a whole). `checkForUpdate` refuses any release whose `seq` is
+lower than that high-water mark (`seq-rollback`), **before** any bundle-version comparison — so a
+replayed release is refused outright rather than merely folding into an unremarkable `up-to-date`.
+Recording happens on **every** signature-valid, non-rollback release, including an up-to-date one
+(`ModokiOtaPlugin.recordSeq`, called right after signature verification) — skipping that on the
+common up-to-date path would leave the high-water mark stuck at whatever it was when a bundle last
+actually staged, reopening the replay window for any release published while the device stayed
+current.
+
+An absent `seq` (a pre-#571 release, or one from a publisher predating this feature) is treated as
+`0` — the same additive-compat contract `manifests` uses, and it means a device that has already
+recorded `seq > 0` refuses a pre-#571 replay too, closing exactly the "restores the exact gap #570
+closed" flavor of the original issue. **This has a bootstrap limit, by design**: a device's very
+first-ever check has `highestSeenSeq = 0`, so it cannot yet detect a rollback — no different from
+`rejected` starting empty on a fresh install. And a publisher checkout predating #571 disarms this
+per-publish exactly like the `manifests`-disarming case above, for the same reason (an old
+publisher never sets `seq` at all, so the field stays absent going forward until re-published by a
+current publisher) — same tool-version-skew caveat, not a coding mistake.
 
 ⚠️ **A publisher older than #570 disarms the guard for EVERY bundle in one publish.** A checkout,
 branch or tag predating this change re-signs `release.json` without the field and without
@@ -159,10 +175,12 @@ ever reaching native. Every
 failure mode is a discriminated result, never a throw — an OTA check failing must never
 crash a game the player is already looking at:
 
-`up-to-date` · `no-release-for-bundle` · `signature-invalid` · `engine-api-too-old` ·
-`manifest-invalid` · `manifest-untrusted` · `no-bundle-zip-in-manifest` · `version-rejected` · `staged` (carries
-`mandatory: boolean`, mirroring `release.mandatory`) · `pending-restart` (target is already
-`pending` natively but never served — carries `version` + `mandatory`; see #509 below)
+`up-to-date` · `no-release-for-bundle` · `signature-invalid` · `seq-rollback` (release `seq` is
+below this device's recorded high-water mark — see § The trust chain's anti-rollback section) ·
+`engine-api-too-old` · `manifest-invalid` · `manifest-untrusted` · `no-bundle-zip-in-manifest` ·
+`version-rejected` · `staged` (carries `mandatory: boolean`, mirroring `release.mandatory`) ·
+`pending-restart` (target is already `pending` natively but never served — carries `version` +
+`mandatory`; see #509 below)
 
 **Called from the app shell, not game code** (`engine/app/App.tsx` → `engine/app/ota.ts`),
 BEFORE the scene loads — deliberately, so the blocking gate below has a call site that runs

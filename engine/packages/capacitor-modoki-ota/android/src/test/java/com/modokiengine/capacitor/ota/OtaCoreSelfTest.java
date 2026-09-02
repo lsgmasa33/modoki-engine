@@ -66,6 +66,10 @@ public final class OtaCoreSelfTest {
     // VECTOR_FILES; see ota-bundles-to-prune-vectors.json's header comment (F2).
     total += runBundlesToPruneVectors(root);
 
+    // #571 anti-rollback — self-contained checks, no vector file (a new, small pure
+    // function; see OtaCoreTests.swift's twin assertions for the same contract).
+    total += runRecordSeqChecks();
+
     if (failures > 0) {
       System.err.println(failures + " scenario(s) FAILED");
       System.exit(1);
@@ -177,7 +181,10 @@ public final class OtaCoreSelfTest {
     Map<String, Integer> confirmedBoots = intMap((Map<String, Object>) obj.getOrDefault("confirmedBoots", new HashMap<>()));
     Map<String, List<String>> rejected = stringListMap((Map<String, Object>) obj.getOrDefault("rejected", new HashMap<>()));
     String lastSeenBinaryVersion = (String) obj.get("lastSeenBinaryVersion");
-    return new OtaCore.State(active, pending, bootAttempts, confirmedBoots, rejected, lastSeenBinaryVersion);
+    // Absent (no vector fixture sets this yet) parses as 0 — same "never seen anything"
+    // contract OtaPlugin.java's jsonToState follows (#571).
+    int highestSeenSeq = obj.get("highestSeenSeq") instanceof Number ? ((Number) obj.get("highestSeenSeq")).intValue() : 0;
+    return new OtaCore.State(active, pending, bootAttempts, confirmedBoots, rejected, lastSeenBinaryVersion, highestSeenSeq);
   }
 
   @SuppressWarnings("unchecked")
@@ -327,6 +334,40 @@ public final class OtaCoreSelfTest {
       failures++;
       System.err.println("[" + scenarioName + "] verify mismatch:\n  expected: " + expected + "\n  actual:   " + actual);
     }
+  }
+
+  // ---- Anti-rollback (#571) ----
+
+  /** Twin of OtaCoreTests.swift's testRecordSeq/testHighestSeenSeq/testResetForNewBinaryPreservesHighestSeenSeq checks. */
+  private static int runRecordSeqChecks() {
+    check("recordSeq/fromNilState", "highestSeenSeq", 5, OtaCore.recordSeq(null, 5).highestSeenSeq);
+
+    OtaCore.State advanced = new OtaCore.State(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), null, 3);
+    check("recordSeq/advances", "highestSeenSeq", 7, OtaCore.recordSeq(advanced, 7).highestSeenSeq);
+
+    // Never regresses: a lower seq than what's already recorded must not move the
+    // high-water mark backwards — that would reopen the exact replay window it exists to close.
+    OtaCore.State high = new OtaCore.State(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), null, 10);
+    check("recordSeq/neverRegresses", "highestSeenSeq", 10, OtaCore.recordSeq(high, 3).highestSeenSeq);
+
+    // Preserves every other field.
+    Map<String, String> active = new HashMap<>();
+    active.put("shell", "v1");
+    Map<String, java.util.List<String>> rejected = new HashMap<>();
+    rejected.put("shell", java.util.Arrays.asList("v0"));
+    OtaCore.State withData = new OtaCore.State(active, new HashMap<>(), new HashMap<>(), new HashMap<>(), rejected, null, 1);
+    OtaCore.State recorded = OtaCore.recordSeq(withData, 9);
+    check("recordSeq/preservesActive", "active", active, recorded.active);
+    check("recordSeq/preservesRejected", "rejected", rejected, recorded.rejected);
+    check("recordSeq/preservesHighestSeenSeq", "highestSeenSeq", 9, recorded.highestSeenSeq);
+
+    // Survives a binary reset, same as `rejected` — see resetForNewBinary's doc comment.
+    OtaCore.State beforeReset = new OtaCore.State(active, new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), "1", 12);
+    OtaCore.State afterReset = OtaCore.resetForNewBinary(beforeReset, "2");
+    check("resetForNewBinary/preservesHighestSeenSeq", "highestSeenSeq", 12, afterReset.highestSeenSeq);
+    check("resetForNewBinary/stillWipesActive", "active", new HashMap<>(), afterReset.active);
+
+    return 8; // the number of check(...) calls above — keep in sync
   }
 
   private static void check(String scenarioName, String field, Object expected, Object actual) {

@@ -23,6 +23,9 @@ export class ModokiOtaWeb extends WebPlugin implements ModokiOtaPlugin {
   async getState(): Promise<{ stateJSON: string }> {
     return { stateJSON: 'null' };
   }
+  async recordSeq(): Promise<{ ok: boolean }> {
+    return { ok: false }; // no state.json to persist into on a platform with no OTA mechanism
+  }
   async listBundles(): Promise<{ bundles: { name: string; version: string; path: string }[] }> {
     return { bundles: [] };
   }

@@ -309,7 +309,14 @@ async function main() {
     // (`toString`, `constructor`, ...), so a manifests entry literally named "toString"
     // would survive the prune even though `bundles` has no such own key.
     const manifests = Object.fromEntries(Object.entries(mergedManifests).filter(([bundleName]) => Object.hasOwn(bundles, bundleName)));
-    const unsignedRelease = createRelease({ bundles, mandatory, minEngineApi, manifests });
+    // Anti-rollback (#571): a bare increment off the just-refetched `existingRelease`, same
+    // per-attempt recompute `bundles`/`minEngineApi`/`mandatory`/`manifests` already use —
+    // recomputing inside the retry loop is what keeps this correct under the concurrent-
+    // publish race `--if-generation-match` guards against (a losing attempt refetches the
+    // winner's `seq` and increments off THAT, so two racing publishes still produce two
+    // distinct, strictly increasing values rather than a duplicate).
+    const seq = (existingRelease?.seq ?? 0) + 1;
+    const unsignedRelease = createRelease({ bundles, mandatory, minEngineApi, manifests, seq });
     const release = signRelease(unsignedRelease, keypair);
     const releaseErrors = validateRelease(release);
     if (releaseErrors.length) fail(`Built an invalid release:\n  ${releaseErrors.join('\n  ')}`);
@@ -336,7 +343,7 @@ async function main() {
     }
 
     if (published) {
-      console.log(`[ota-publish] Published ${name}@${version} — release.json now points ${name} → ${version}, mandatory=${mandatory}.`);
+      console.log(`[ota-publish] Published ${name}@${version} — release.json now points ${name} → ${version}, mandatory=${mandatory}, seq=${seq}.`);
       // Partial manifest coverage is otherwise invisible: this publish only ever writes
       // `manifests[name]` for the bundle it's publishing, so on a bucket with several
       // bundles, every OTHER bundle's `manifests` entry stays missing/unenforced

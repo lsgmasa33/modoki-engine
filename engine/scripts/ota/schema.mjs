@@ -106,6 +106,15 @@ export function validateRelease(release) {
       }
     }
   }
+  // Optional (#571, additive — same non-breaking contract as `manifests` above): a
+  // monotonic counter, incremented by ota-publish.mjs on every publish, that lets a client
+  // refuse a validly-signed but OLDER release.json replayed by an attacker with bucket
+  // write. See docs/ota-updates.md "The trust chain" and otaClient.ts's `checkForUpdate`.
+  if (release.seq !== undefined) {
+    if (typeof release.seq !== 'number' || !Number.isInteger(release.seq) || release.seq < 0) {
+      fail('release.seq must be a non-negative integer');
+    }
+  }
   return errors;
 }
 
@@ -120,9 +129,10 @@ export function createManifest({ name, version, engineApi, files, bundleZip }) {
 
 /** Builds an UNSIGNED release object (no `sig` field yet — ./signing.mjs adds
  *  it over this object's canonical JSON, see signingPayload below). */
-export function createRelease({ bundles, mandatory, minEngineApi, manifests }) {
+export function createRelease({ bundles, mandatory, minEngineApi, manifests, seq }) {
   const release = { schema: SCHEMA_VERSION, bundles, mandatory, minEngineApi };
   if (manifests && Object.keys(manifests).length > 0) release.manifests = manifests;
+  if (seq !== undefined) release.seq = seq;
   return release;
 }
 

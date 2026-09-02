@@ -110,6 +110,9 @@ public final class OtaCore {
      *  resetForNewBinary. null = fresh install OR a pre-this-feature state.json — both
      *  must NOT trigger a reset. */
     public final String lastSeenBinaryVersion;
+    /** See OtaCore.swift's `highestSeenSeq` field doc (#571, anti-rollback) — a single
+     *  device-wide counter, NOT per-bundle like every other field here. */
+    public final int highestSeenSeq;
 
     public State() {
       this(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), null);
@@ -124,12 +127,17 @@ public final class OtaCore {
     }
 
     public State(Map<String, String> active, Map<String, String> pending, Map<String, Integer> bootAttempts, Map<String, Integer> confirmedBoots, Map<String, java.util.List<String>> rejected, String lastSeenBinaryVersion) {
+      this(active, pending, bootAttempts, confirmedBoots, rejected, lastSeenBinaryVersion, 0);
+    }
+
+    public State(Map<String, String> active, Map<String, String> pending, Map<String, Integer> bootAttempts, Map<String, Integer> confirmedBoots, Map<String, java.util.List<String>> rejected, String lastSeenBinaryVersion, int highestSeenSeq) {
       this.active = active;
       this.pending = pending;
       this.bootAttempts = bootAttempts;
       this.confirmedBoots = confirmedBoots;
       this.rejected = rejected;
       this.lastSeenBinaryVersion = lastSeenBinaryVersion;
+      this.highestSeenSeq = highestSeenSeq;
     }
 
     public State copy() {
@@ -137,7 +145,7 @@ public final class OtaCore {
       for (Map.Entry<String, java.util.List<String>> e : rejected.entrySet()) {
         rejectedCopy.put(e.getKey(), new java.util.ArrayList<>(e.getValue()));
       }
-      return new State(new HashMap<>(active), new HashMap<>(pending), new HashMap<>(bootAttempts), new HashMap<>(confirmedBoots), rejectedCopy, lastSeenBinaryVersion);
+      return new State(new HashMap<>(active), new HashMap<>(pending), new HashMap<>(bootAttempts), new HashMap<>(confirmedBoots), rejectedCopy, lastSeenBinaryVersion, highestSeenSeq);
     }
 
     @Override
@@ -145,15 +153,15 @@ public final class OtaCore {
       if (!(o instanceof State)) return false;
       State s = (State) o;
       return active.equals(s.active) && pending.equals(s.pending) && bootAttempts.equals(s.bootAttempts) && confirmedBoots.equals(s.confirmedBoots) && rejected.equals(s.rejected)
-        && java.util.Objects.equals(lastSeenBinaryVersion, s.lastSeenBinaryVersion);
+        && java.util.Objects.equals(lastSeenBinaryVersion, s.lastSeenBinaryVersion) && highestSeenSeq == s.highestSeenSeq;
     }
 
     @Override
-    public int hashCode() { return java.util.Objects.hash(active, pending, bootAttempts, confirmedBoots, rejected, lastSeenBinaryVersion); }
+    public int hashCode() { return java.util.Objects.hash(active, pending, bootAttempts, confirmedBoots, rejected, lastSeenBinaryVersion, highestSeenSeq); }
 
     @Override
     public String toString() {
-      return "State{active=" + active + ", pending=" + pending + ", bootAttempts=" + bootAttempts + ", confirmedBoots=" + confirmedBoots + ", rejected=" + rejected + ", lastSeenBinaryVersion=" + lastSeenBinaryVersion + "}";
+      return "State{active=" + active + ", pending=" + pending + ", bootAttempts=" + bootAttempts + ", confirmedBoots=" + confirmedBoots + ", rejected=" + rejected + ", lastSeenBinaryVersion=" + lastSeenBinaryVersion + ", highestSeenSeq=" + highestSeenSeq + "}";
     }
   }
 
@@ -167,12 +175,23 @@ public final class OtaCore {
   public static State resetForNewBinary(State state, String currentBinaryVersion) {
     if (state == null) return null;
     if (state.lastSeenBinaryVersion != null && !state.lastSeenBinaryVersion.equals(currentBinaryVersion)) {
-      return new State(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), state.rejected, currentBinaryVersion);
+      // `highestSeenSeq` survives a reset for the same reason `rejected` does — see
+      // OtaCore.swift's resetForNewBinary doc.
+      return new State(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), state.rejected, currentBinaryVersion, state.highestSeenSeq);
     }
     if (state.lastSeenBinaryVersion == null) {
-      return new State(state.active, state.pending, state.bootAttempts, state.confirmedBoots, state.rejected, currentBinaryVersion);
+      return new State(state.active, state.pending, state.bootAttempts, state.confirmedBoots, state.rejected, currentBinaryVersion, state.highestSeenSeq);
     }
     return state;
+  }
+
+  // ---- Anti-rollback (#571) ----
+
+  /** See OtaCore.swift's `recordSeq` doc — same contract, must behave identically:
+   *  monotonically bumps `highestSeenSeq` to `max(existing, seq)`, never regresses. */
+  public static State recordSeq(State state, int seq) {
+    State s = (state == null) ? new State() : state.copy();
+    return new State(s.active, s.pending, s.bootAttempts, s.confirmedBoots, s.rejected, s.lastSeenBinaryVersion, Math.max(s.highestSeenSeq, seq));
   }
 
   // ---- Boot ----

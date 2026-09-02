@@ -88,6 +88,13 @@ public struct OtaState: Equatable {
   /// (a fresh install has nothing to reset; an upgrading device's existing bookkeeping is
   /// still valid and must not be nuked just because this field was never populated before).
   public var lastSeenBinaryVersion: String?
+  /// #571 anti-rollback — the highest `release.json` `seq` this device has ever recorded.
+  /// A single device-wide counter, NOT per-bundle like every other field here: `seq` is a
+  /// property of the release DOCUMENT as a whole (one publish counter shared by every
+  /// bundle it lists), not of any one bundle's boot/confirm bookkeeping. `0` (not optional)
+  /// because a state.json written by a pre-#571 binary having "never recorded anything" is
+  /// indistinguishable from "recorded 0" for this check's purposes — see `recordSeq`.
+  public var highestSeenSeq: Int
 
   public init(
     active: [String: String] = [:],
@@ -95,7 +102,8 @@ public struct OtaState: Equatable {
     bootAttempts: [String: Int] = [:],
     confirmedBoots: [String: Int] = [:],
     rejected: [String: [String]] = [:],
-    lastSeenBinaryVersion: String? = nil
+    lastSeenBinaryVersion: String? = nil,
+    highestSeenSeq: Int = 0
   ) {
     self.active = active
     self.pending = pending
@@ -103,6 +111,7 @@ public struct OtaState: Equatable {
     self.confirmedBoots = confirmedBoots
     self.rejected = rejected
     self.lastSeenBinaryVersion = lastSeenBinaryVersion
+    self.highestSeenSeq = highestSeenSeq
   }
 }
 
@@ -150,7 +159,10 @@ public enum OtaCore {
       bootAttempts: intMap("bootAttempts"),
       confirmedBoots: intMap("confirmedBoots"),
       rejected: stringListMap("rejected"),
-      lastSeenBinaryVersion: obj["lastSeenBinaryVersion"] as? String
+      lastSeenBinaryVersion: obj["lastSeenBinaryVersion"] as? String,
+      // A state.json written by a pre-#571 binary has no key at all — parses as 0, same
+      // "absent means never seen anything" contract every other new field here follows.
+      highestSeenSeq: (obj["highestSeenSeq"] as? Int) ?? (obj["highestSeenSeq"] as? NSNumber)?.intValue ?? 0
     )
   }
 
@@ -162,6 +174,7 @@ public enum OtaCore {
       "confirmedBoots": state.confirmedBoots,
       "rejected": state.rejected,
       "lastSeenBinaryVersion": state.lastSeenBinaryVersion ?? NSNull(),
+      "highestSeenSeq": state.highestSeenSeq,
     ]
     let data = (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? Data()
     return String(data: data, encoding: .utf8) ?? "{}"
@@ -191,7 +204,11 @@ public enum OtaCore {
   public static func resetForNewBinary(_ state: OtaState?, currentBinaryVersion: String) -> OtaState? {
     guard var s = state else { return nil } // nothing to reset — boot() already treats nil as fresh/embedded
     if let lastSeen = s.lastSeenBinaryVersion, lastSeen != currentBinaryVersion {
-      s = OtaState(rejected: s.rejected, lastSeenBinaryVersion: currentBinaryVersion)
+      // `highestSeenSeq` survives a reset for the same reason `rejected` does: it is a fact
+      // about which release.json documents this DEVICE has already seen, not a reference to
+      // any snapshot a fresh binary invalidates — a new binary has no reason to become
+      // willing to accept a release it would otherwise recognize as a replay.
+      s = OtaState(rejected: s.rejected, lastSeenBinaryVersion: currentBinaryVersion, highestSeenSeq: s.highestSeenSeq)
     } else if s.lastSeenBinaryVersion == nil {
       s.lastSeenBinaryVersion = currentBinaryVersion
     }
@@ -387,6 +404,19 @@ public enum OtaCore {
     } else {
       s.confirmedBoots[name] = confirms
     }
+    return s
+  }
+
+  // MARK: - Anti-rollback (#571)
+
+  /// Monotonically bumps `state.highestSeenSeq` to `max(existing, seq)` — never regresses,
+  /// so this is safe to call with a `seq` that isn't actually an increase (a repeat check
+  /// against the same, or an older, release.json). `state == nil` (fresh install / corrupt
+  /// state.json) starts a fresh `OtaState()` — there is nothing else to preserve, mirroring
+  /// every other mutator here (`activate`, `confirm`, ...).
+  public static func recordSeq(_ state: OtaState?, seq: Int) -> OtaState {
+    var s = state ?? OtaState()
+    s.highestSeenSeq = max(s.highestSeenSeq, seq)
     return s
   }
 

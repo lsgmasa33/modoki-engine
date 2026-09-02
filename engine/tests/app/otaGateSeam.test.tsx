@@ -38,7 +38,7 @@ import { ed25519 } from '@noble/curves/ed25519.js';
 const h = vi.hoisted(() => ({
   isNativePlatform: vi.fn(() => true),
   ota: { enabled: true, baseUrl: 'https://cdn.example.test/game', publicKey: '', bundleName: 'shell', engineApi: 1 },
-  native: {} as Record<string, unknown>,
+  native: { recordSeq: vi.fn(async () => ({ ok: true })) } as Record<string, unknown>,
 }));
 
 vi.mock('@capacitor/core', () => ({

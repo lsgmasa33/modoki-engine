@@ -44,6 +44,13 @@ export interface OtaRelease {
    *  additive — a release without it is still valid). See
    *  {@link manifestHashPayload} and `checkForUpdate`'s `manifest-untrusted` outcome. */
   manifests?: Record<string, string>;
+  /** Monotonic publish counter (#571, additive — a release without it is treated as `0`),
+   *  bumped by `ota-publish.mjs` on every publish. `checkForUpdate` refuses a release whose
+   *  `seq` is lower than the highest this device has already recorded — closing the
+   *  anti-rollback gap #570 explicitly left open (a validly-signed but OLDER release.json,
+   *  replayed by an attacker with bucket write, is otherwise indistinguishable from a
+   *  legitimate one). See docs/ota-updates.md "The trust chain". */
+  seq?: number;
   sig: string;
 }
 
@@ -124,6 +131,11 @@ export function validateRelease(release: unknown): string[] {
           fail(`release.manifests["${name}"] must be a lowercase hex sha256 (64 chars)`);
         }
       }
+    }
+  }
+  if (r.seq !== undefined) {
+    if (typeof r.seq !== 'number' || !Number.isInteger(r.seq) || r.seq < 0) {
+      fail('release.seq must be a non-negative integer');
     }
   }
   return errors;
@@ -216,6 +228,14 @@ export interface OtaNativePlugin {
   stageUpdateDelta(opts: { name: string; version: string; baseVersion: string; copy: string[]; download: OtaDeltaDownload[]; files: OtaFileRef[] }): Promise<{ ok: boolean }>;
   activate(opts: { name: string; version: string }): Promise<{ ok: boolean }>;
   getState(): Promise<{ stateJSON: string }>;
+  /** #571 anti-rollback: persists `seq` as the device's new high-water mark, monotonically
+   *  — native takes `max(existing, seq)`, so this is safe to call with a `seq` that turns
+   *  out not to be an increase (a repeat check against the same release.json). Called by
+   *  `checkForUpdate` right after signature verification, BEFORE any up-to-date/staging
+   *  decision — an up-to-date check is the common case, and skipping it there would leave
+   *  the high-water mark stuck at its last-staged value while a device stays current for a
+   *  long stretch, reopening exactly the replay window this exists to close. */
+  recordSeq(opts: { seq: number }): Promise<{ ok: boolean }>;
 }
 
 /** Pure diff: which of `target`'s files are byte-identical (by content hash) to a file at
@@ -251,6 +271,13 @@ export type OtaCheckResult =
    *  one the signature vouches for, which means the bucket served tampered or stale
    *  bytes. Nothing is staged when this fires. */
   | { outcome: 'manifest-untrusted'; version: string; expected: string; actual: string }
+  /** #571 anti-rollback: the release's `seq` is LOWER than the highest this device has
+   *  already recorded — a validly-signed but stale release.json, most plausibly an
+   *  attacker with bucket write replaying an old capture (see docs/ota-updates.md "The
+   *  trust chain"). Checked before any bundle-version comparison, so a replay is refused
+   *  outright rather than merely reported as `up-to-date`. Nothing is staged when this
+   *  fires; the device stays on whatever it's already running. */
+  | { outcome: 'seq-rollback'; version: string; seq: number; highestSeenSeq: number }
   | { outcome: 'no-bundle-zip-in-manifest' }
   /** The release's target version is one this device already PROVED bad — it exhausted
    *  its boot attempts and the watchdog reverted it (Phase 3a quarantine). Staging it
@@ -400,6 +427,36 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
 
   const { stateJSON } = await opts.native.getState();
   const state = parseNativeState(stateJSON);
+
+  // Anti-rollback (#571). Checked before any bundle-version comparison below — a replayed
+  // release is refused wholesale, not merely folded into an `up-to-date` outcome that
+  // would (correctly, but silently) skip recording it. `highestSeenSeq` is read HERE, from
+  // the state fetched above, before `recordSeq` (if called) can advance it — so the
+  // comparison is always against what this device knew BEFORE this release was seen.
+  const releaseSeq = release.seq ?? 0;
+  const highestSeenSeq = state?.highestSeenSeq ?? 0;
+  if (releaseSeq < highestSeenSeq) {
+    return { outcome: 'seq-rollback', version: targetVersion, seq: releaseSeq, highestSeenSeq };
+  }
+  if (releaseSeq > highestSeenSeq) {
+    // Recorded unconditionally on every signature-valid, non-rollback release — including
+    // an up-to-date one. Skipping this on the up-to-date fast path (the common case) would
+    // leave the high-water mark stuck at whatever it was when a bundle last actually
+    // staged, so a device that stays current for a long stretch would still accept a
+    // replay of any release published in between — exactly the gap this exists to close.
+    // Swallowed on failure (disk full, IPC error): this function's contract is to never
+    // throw on an OTA check (an OTA check failing must never crash a game that's already
+    // running fine) — same reasoning as every other `catch` in this function. Losing one
+    // recordSeq write only delays the high-water mark's advance to the NEXT check; it does
+    // not weaken the rollback check itself, which still compares against whatever the
+    // native side actually has persisted.
+    try {
+      await opts.native.recordSeq({ seq: releaseSeq });
+    } catch {
+      // best-effort — see comment above
+    }
+  }
+
   const currentActive = state?.active?.[opts.bundleName];
   const currentPending = state?.pending?.[opts.bundleName];
   if (currentActive === targetVersion) return { outcome: 'up-to-date' };
@@ -609,6 +666,11 @@ interface NativeState {
    *  "staged, never run" and >= 1 means "we are running the pending version right now".
    *  The discriminator that distinguishes those two `pending === target` cases below. */
   bootAttempts?: Record<string, number>;
+  /** #571 anti-rollback — the highest release `seq` this device has ever recorded, a
+   *  single device-wide counter (not per-bundle: it is a property of `release.json` as a
+   *  whole, one publish counter shared by every bundle it lists). Absent on a state.json
+   *  written by a pre-#571 binary, hence optional; treated as `0`. */
+  highestSeenSeq?: number;
 }
 
 function parseNativeState(json: string): NativeState | null {

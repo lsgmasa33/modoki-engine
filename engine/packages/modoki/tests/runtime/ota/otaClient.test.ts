@@ -32,6 +32,7 @@ function signRelease(unsigned: Omit<OtaRelease, 'sig'>, privateKey: Uint8Array):
   if (unsigned.manifests !== undefined) sorted.manifests = unsigned.manifests;
   sorted.minEngineApi = unsigned.minEngineApi;
   sorted.schema = unsigned.schema;
+  if (unsigned.seq !== undefined) sorted.seq = unsigned.seq;
   const payload = new TextEncoder().encode(JSON.stringify(sorted));
   const sig = ed25519.sign(payload, privateKey);
   return { ...unsigned, sig: toBase64url(sig) };
@@ -80,6 +81,21 @@ describe('validateRelease (TS port parity)', () => {
   it('rejects a manifests entry that is not a lowercase hex sha256', () => {
     const release = { schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1, manifests: { shell: 'not-a-hash' }, sig: 'x'.repeat(10) };
     expect(validateRelease(release).some((e) => e.includes('manifests'))).toBe(true);
+  });
+
+  it('accepts a release with no seq field (back-compat)', () => {
+    const release = { schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1, sig: 'x'.repeat(10) };
+    expect(validateRelease(release)).toEqual([]);
+  });
+
+  it('accepts a non-negative integer seq', () => {
+    const release = { schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1, seq: 42, sig: 'x'.repeat(10) };
+    expect(validateRelease(release)).toEqual([]);
+  });
+
+  it('rejects a negative or non-integer seq', () => {
+    expect(validateRelease({ schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1, seq: -1, sig: 'x'.repeat(10) }).some((e) => e.includes('seq'))).toBe(true);
+    expect(validateRelease({ schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1, seq: 1.5, sig: 'x'.repeat(10) }).some((e) => e.includes('seq'))).toBe(true);
   });
 });
 
@@ -186,6 +202,7 @@ function mockNative(overrides: Partial<OtaNativePlugin> = {}): OtaNativePlugin {
     stageUpdateDelta: vi.fn().mockResolvedValue({ ok: true }),
     activate: vi.fn().mockResolvedValue({ ok: true }),
     getState: vi.fn().mockResolvedValue({ stateJSON: 'null' }),
+    recordSeq: vi.fn().mockResolvedValue({ ok: true }),
     ...overrides,
   };
 }
@@ -872,5 +889,108 @@ describe('checkForUpdate', () => {
     const result = await checkForUpdate({ baseUrl: 'https://x', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native });
     expect(result).toEqual({ outcome: 'no-bundle-zip-in-manifest' });
     expect(native.stageUpdate).not.toHaveBeenCalled();
+  });
+
+  // #571 anti-rollback.
+  describe('seq (anti-rollback, #571)', () => {
+    it('refuses a release whose seq is lower than the highest already recorded, staging nothing', async () => {
+      const { privateKey, publicKey } = makeKeypair();
+      const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1, seq: 3 }, privateKey);
+      const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(release));
+      const native = mockNative({
+        getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' }, highestSeenSeq: 10 }) }),
+      });
+
+      const result = await checkForUpdate({ baseUrl: 'https://x', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native });
+
+      expect(result).toEqual({ outcome: 'seq-rollback', version: 'v2', seq: 3, highestSeenSeq: 10 });
+      expect(fetchImpl).toHaveBeenCalledTimes(1); // never even fetched the manifest
+      expect(native.stageUpdate).not.toHaveBeenCalled();
+      expect(native.stageUpdateDelta).not.toHaveBeenCalled();
+      expect(native.recordSeq).not.toHaveBeenCalled();
+    });
+
+    it('treats an absent seq as 0, so it is refused once this device has recorded anything higher', async () => {
+      const { privateKey, publicKey } = makeKeypair();
+      // A pre-#571 release, with no `seq` field at all — replaying it must not disarm rollback
+      // protection just because it predates the field, matching #570's own manifests precedent.
+      const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1 }, privateKey);
+      const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(release));
+      const native = mockNative({
+        getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' }, highestSeenSeq: 1 }) }),
+      });
+
+      const result = await checkForUpdate({ baseUrl: 'https://x', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native });
+
+      expect(result).toEqual({ outcome: 'seq-rollback', version: 'v2', seq: 0, highestSeenSeq: 1 });
+    });
+
+    it('records the new high-water mark and proceeds when seq is higher than what was recorded', async () => {
+      const { privateKey, publicKey } = makeKeypair();
+      const release = signRelease({ schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1, seq: 7 }, privateKey);
+      const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(release));
+      const native = mockNative({
+        getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' }, highestSeenSeq: 2 }) }),
+      });
+
+      const result = await checkForUpdate({ baseUrl: 'https://x', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native });
+
+      expect(result).toEqual({ outcome: 'up-to-date' });
+      expect(native.recordSeq).toHaveBeenCalledWith({ seq: 7 });
+    });
+
+    it('advances the high-water mark even on an up-to-date check, closing the replay window for a later rollback', async () => {
+      // The gap this locks: recording only on the STAGING path would leave the high-water
+      // mark stuck at its last-staged value while a device stays current for a long stretch,
+      // during which an attacker could replay any release published in between.
+      const { privateKey, publicKey } = makeKeypair();
+      const release = signRelease({ schema: 1, bundles: { shell: 'v5' }, mandatory: false, minEngineApi: 1, seq: 9 }, privateKey);
+      const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(release));
+      const native = mockNative({
+        getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v5' } }) }), // no highestSeenSeq yet
+      });
+
+      const result = await checkForUpdate({ baseUrl: 'https://x', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native });
+
+      expect(result).toEqual({ outcome: 'up-to-date' });
+      expect(native.recordSeq).toHaveBeenCalledWith({ seq: 9 });
+    });
+
+    it('does not call recordSeq when seq exactly matches what is already recorded (nothing to advance)', async () => {
+      const { privateKey, publicKey } = makeKeypair();
+      const release = signRelease({ schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1, seq: 4 }, privateKey);
+      const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(release));
+      const native = mockNative({
+        getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' }, highestSeenSeq: 4 }) }),
+      });
+
+      const result = await checkForUpdate({ baseUrl: 'https://x', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native });
+
+      expect(result).toEqual({ outcome: 'up-to-date' });
+      expect(native.recordSeq).not.toHaveBeenCalled();
+    });
+
+    it('stages a genuinely newer release normally once its higher seq is recorded', async () => {
+      const { privateKey, publicKey } = makeKeypair();
+      const release = signRelease({ schema: 1, bundles: { shell: 'v2' }, mandatory: false, minEngineApi: 1, seq: 5 }, privateKey);
+      const manifest: OtaManifest = {
+        schema: 1, name: 'shell', version: 'v2', engineApi: 1,
+        files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+        bundleZip: { hash: 'b'.repeat(64), size: 100 },
+      };
+      const fetchImpl = vi.fn()
+        .mockResolvedValueOnce(jsonResponse(release))
+        .mockResolvedValueOnce(jsonResponse(manifest))
+        .mockResolvedValueOnce(jsonResponse({}, false)); // no base manifest -> whole-zip
+      const native = mockNative({
+        getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v1' }, highestSeenSeq: 4 }) }),
+      });
+
+      const result = await checkForUpdate({ baseUrl: 'https://x', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native });
+
+      expect(result).toEqual({ outcome: 'staged', version: 'v2', mandatory: false });
+      expect(native.recordSeq).toHaveBeenCalledWith({ seq: 5 });
+      expect(native.stageUpdate).toHaveBeenCalled();
+    });
   });
 });
