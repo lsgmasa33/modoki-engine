@@ -707,6 +707,9 @@ export { registerPointerBlocker, registerPointerPassthrough, isPointerBlocked } 
 // async state (a sign-in, a purchase) is in flight, without every 'call' handler having to return
 // a promise. See `core/uiBusySources.ts` for the full design rationale.
 export { registerUIBusySource } from './core/uiBusySources';
+// Polls the busy predicates every frame so #530's valve OBSERVES continuity instead of inferring
+// it across discrete UI activations (#551). Registered as a system in `app/ecs/pipeline.ts`.
+export { pollUIBusyContinuity } from './core/uiBusySources';
 // Input WATCH (#134) — a game publishes what its OWN hit-test resolved a press to, which is the
 // one thing no engine-side observer can compute for a canvas game. Safe to call unconditionally:
 // it is a no-op until an agent opens a watch window.

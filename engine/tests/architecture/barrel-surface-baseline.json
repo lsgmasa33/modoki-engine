@@ -703,6 +703,7 @@
   "pointerReleased",
   "pointerVelocity",
   "pollGpuTimings",
+  "pollUIBusyContinuity",
   "popScope",
   "previewTimelineAt",
   "previewTimelineStep",

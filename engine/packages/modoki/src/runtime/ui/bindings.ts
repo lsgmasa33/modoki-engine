@@ -26,7 +26,9 @@ import { markUIDirty } from './uiTreeStore';
 import { isSimRunning } from '../core/playState';
 import { dispatchUIAction, type UIActionPayload } from '../core/actionRegistry';
 import { rawNow } from '../core/clock';
-import { getActiveUIBusySources } from '../core/uiBusySources';
+import {
+  getActiveUIBusySources, getBusyAccumulatedMs, isBusyWarned, markBusyWarned, resetBusyContinuity,
+} from '../core/uiBusySources';
 import {
   UISettings, UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS, UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS,
 } from '../traits/UISettings';
@@ -91,62 +93,13 @@ let lockPendingNames: string[] = [];
 // feature exists to prevent. See trackLockPromise and its regression test.
 let lockGen = 0;
 
-// The start of the busy window currently being credited toward the valve, or `null` when
-// nothing is busy right now. `null`, not `0` — the manual test clock legitimately starts at 0,
-// so `0` cannot double as "unset" without colliding with a real timestamp. Its OWN safety valve,
-// separate from `lockAcquiredAt`/the authored window above: busy can begin from something that was never
-// itself a UI activation (Court's sign-in flow starts from a menu button, not a chrome tap), so
-// there may be no held lock at all to hang this off. See `isInputLockActive` for the valve logic.
-//
-// ⚠️ This is NOT "when the predicates first went continuously true" — `isInputLockActive` is only
-// ever called from a UI activation, so it can only credit busy time it actually OBSERVED. A busy
-// period that starts and ends with no activation in between (a background sync, a restored
-// StoreKit transaction) would leave credited time stale from an EARLIER episode; if a later,
-// unrelated episode inherited it, the valve would force-release immediately — and silently, if
-// `busyWarned` also survived. `busyLastObserved` below closes that gap: only the delta BETWEEN
-// two observations is credited, and only when it is under `BUSY_OBSERVATION_GAP_MS`; a longer
-// gap is evidence of nothing and starts a fresh episode.
-// Cost of this, accepted deliberately: the valve needs observations spaced closer together than
-// `BUSY_OBSERVATION_GAP_MS` to accumulate. Below that cadence the rescue is merely DELAYED; a
-// user retrying consistently SLOWER than it restarts the window every time and is denied the
-// rescue outright — stated plainly because the comment here used to claim "delayed, never
-// denied", which is false above that cadence. Accepted because a >10s tap cadence is not
-// someone hammering a stuck button. The alternative —
-// crediting the unobserved gap anyway — silently force-released an unrelated, later operation,
-// which is the bug this replaced.
-// How long a gap between two observations we still believe busy was continuous across, and so
-// still CREDIT toward the valve.
-//
-// ⚠️ THIS IS A HEURISTIC WITH A KNOWN AMBIGUOUS BAND, not a correct answer, because
-// `isInputLockActive` only samples at a discrete activation. One tap N seconds after the last
-// is INDISTINGUISHABLE between "still stalled, the user retried" (must credit, or the valve
-// never rescues) and "the old episode ended and an unrelated one began" (must not credit, or
-// the new one is force-released unprotected — the #530 defect). No threshold separates them;
-// the existing genuine-stall test retries every 3.3s expecting rescue, and a 5s idle between
-// episodes expects protection. Biased toward CREDITING deliberately: bricked input is the
-// severe failure, an unprotected new episode the milder one. The real fix is to observe the
-// busy predicates on a frame cadence instead of only at activations, which makes continuity
-// OBSERVED rather than inferred and retires this constant — tracked as #551.
-// Deliberately NOT the authored `inputLockMaxMs`. The two were the same number until #543, and
-// once the valve started reading the authored ceiling (rather than an un-updatable module
-// cache), a game could author the valve into NEVER FIRING: with `inputLockMaxMs: 500` and a
-// user tapping every 800ms, every observation restarted the window (`800 > 500`), so
-// `busyElapsed` never grew past the ceiling — input stayed blocked for the whole stall and the
-// warning never printed, because `busyWarned` is reset on the same line that would have let it
-// fire. This is mechanism, not feel, so it is a code constant (CLAUDE.md's single-source
-// table), and 10000 is the value this threshold effectively HAD before #543, when the busy
-// valve read a cache still holding UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS.
-const BUSY_OBSERVATION_GAP_MS = 10_000;
-
-let busyAccumulatedMs = 0;
-// The last time `isInputLockActive()` observed the busy set non-empty, or `null` when the last
-// observation (or world start) saw nothing busy. Each observation credits the delta since this
-// one — see `busyAccumulatedMs` above.
-let busyLastObserved: number | null = null;
-// Guards the warning below to fire ONCE per stall, not on every activation while a source stays
-// stuck — mirrors `releaseLock()` clearing `lockPendingNames` so the other valve's warning can't
-// repeat either, just without an actual release to hang the reset off (the source is still busy).
-let busyWarned = false;
+// Busy-window continuity (#530's valve) is now OBSERVED, not inferred: `pollUIBusyContinuity`
+// (registered as a per-frame system, `app/ecs/pipeline.ts`) polls the busy predicates every
+// frame and owns `busyAccumulatedMs`/`busyWarned` in `core/uiBusySources.ts` — this module only
+// reads them. This retires the old activation-sampled gap heuristic (#551): that version could
+// only sample busy state at a discrete UI activation, so it had to INFER continuity between
+// samples via a tuned gap threshold: correct with adjacent-frame polling, there is nothing left
+// to infer.
 
 // Reset on world/scene swap — a lock held by the previous world's action must not carry over
 // and brick the next one. Top-level, matching UINode.tsx:109 / uiValues.ts:56 / focusManager
@@ -155,10 +108,8 @@ let busyWarned = false;
 // identically and can never drift apart.
 onWorldSwap(() => {
   releaseLock();
-  busyAccumulatedMs = 0; // a busy source registered by the outgoing world's manager must not
+  resetBusyContinuity(); // a busy source registered by the outgoing world's manager must not
   // carry credited stall time into the next world's first activation
-  busyLastObserved = null;
-  busyWarned = false;
 });
 
 /** Is the lock currently blocking a new discrete activation? A CHECK, not a passive read: an
@@ -184,32 +135,14 @@ function isInputLockActive(lockWindow: { minMs: number; maxMs: number }): boolea
   // ⚠️ It carries its OWN safety valve, mirroring `lockWindow.maxMs` below — a naive
   // `if (busyNames.length) return true` would let a predicate stuck true (a real Court case: the
   // account side can legitimately sit in 'working' for up to its own 60s watchdog) brick ALL UI
-  // input FOREVER, reintroducing exactly the failure `inputLockMaxMs` exists to prevent. Track
-  // when busy first became true; once it has been continuously true past `lockWindow.maxMs`, stop
-  // blocking and warn naming the stuck source(s), same wording family as the lock's own valve.
+  // input FOREVER, reintroducing exactly the failure `inputLockMaxMs` exists to prevent.
+  // `pollUIBusyContinuity` (a per-frame system) owns tracking how long busy has been continuously
+  // true — this just reads the accumulated total.
   const busyNames = getActiveUIBusySources();
   if (busyNames.length > 0) {
-    const now = rawNow();
-    // ACCUMULATE observed-adjacent time; never measure from a single start timestamp. Using one
-    // `busySince` forced a choice between two bugs, and both were shipped and caught here:
-    // with the gap threshold at the AUTHORED ceiling, a user retrying slower than it restarted
-    // the window every time and the valve became unreachable; with the threshold at a flat 10s,
-    // a stale timestamp from an EARLIER finished episode was credited to a new unrelated one,
-    // force-releasing it on its first observation — the exact #530 defect the gap logic exists
-    // to prevent. Crediting only the deltas short enough to vouch for avoids both: a long gap
-    // contributes NOTHING (nobody watched it) and starts a fresh episode, while a normal retry
-    // cadence still accumulates toward the ceiling instead of resetting.
-    const delta = busyLastObserved === null ? 0 : now - busyLastObserved;
-    if (delta > BUSY_OBSERVATION_GAP_MS) {
-      busyAccumulatedMs = 0; // unobservable gap — treat as a new episode, credit none of it
-      busyWarned = false;
-    } else {
-      busyAccumulatedMs += delta;
-    }
-    busyLastObserved = now;
-    if (busyAccumulatedMs > lockWindow.maxMs) {
-      if (!busyWarned) {
-        busyWarned = true;
+    if (getBusyAccumulatedMs() > lockWindow.maxMs) {
+      if (!isBusyWarned()) {
+        markBusyWarned();
         console.warn(
           `[UI input lock] busy-source valve force-released after ${lockWindow.maxMs}ms — stuck busy: `
           + busyNames.join(', '),
@@ -217,14 +150,10 @@ function isInputLockActive(lockWindow: { minMs: number; maxMs: number }): boolea
       }
       // Do not reset the accumulator here: the source(s) are still reporting busy, and resetting
       // would re-arm a fresh window on the very next check instead of recognizing this as the
-      // SAME ongoing stall. It resets only once nothing is busy, below.
+      // SAME ongoing stall. It resets only once nothing is busy (owned by `pollUIBusyContinuity`).
     } else {
       return true;
     }
-  } else {
-    busyAccumulatedMs = 0; // nothing busy right now — a later busy period starts its own window
-    busyLastObserved = null;
-    busyWarned = false;
   }
 
   if (!lockHeld) return false;

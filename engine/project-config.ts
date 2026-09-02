@@ -405,13 +405,6 @@ export interface ProjectConfig {
     /** Status-bar content style → iOS UIStatusBarStyle. 'default' = OS decides,
      *  'light' = light text (dark bg), 'dark' = dark text (light bg). */
     statusBarStyle: 'default' | 'light' | 'dark';
-    /** iOS `AVAudioSession.Category`, set at launch via `capacitor-modoki-audio` (#548). Both
-     *  mix with other apps' audio instead of the OS default `.soloAmbient` silencing it —
-     *  'ambient' (default) additionally mutes ours when the ring/silent switch is on, which is
-     *  what a casual game normally wants; 'playback' keeps playing through it, for a game whose
-     *  music is the point. No Android equivalent — audio there is 100% WebView and Chromium owns
-     *  focus, so this field is inert on that platform. */
-    audioSessionCategory: (typeof AUDIO_SESSION_CATEGORIES)[number];
   };
   /** Renderer settings for the two engine render backends. */
   rendering: {
@@ -736,7 +729,6 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     orientation: 'auto',
     statusBarHidden: false,
     statusBarStyle: 'default',
-    audioSessionCategory: 'ambient',
   },
   rendering: {
     targetFps: 60, // matches the frame driver's historical default cap
@@ -903,9 +895,6 @@ export type IosExportMethod = (typeof IOS_EXPORT_METHODS)[number];
 export const TEXTURE_TIER_VARIANTS_MODES = ['auto', 'always', 'never'] as const;
 export const CAPACITOR_ORIENTATIONS = ['auto', 'portrait', 'landscape'] as const;
 export const STATUS_BAR_STYLES = ['default', 'light', 'dark'] as const;
-/** iOS `AVAudioSession.Category` this project's `capacitor-modoki-audio` plugin supports (#548).
- *  No Android equivalent — see `capacitor.audioSessionCategory`'s doc comment. */
-export const AUDIO_SESSION_CATEGORIES = ['ambient', 'playback'] as const;
 /** Capacitor `ios.preferredContentMode` (see addNativeTarget.ts). */
 export const IOS_CONTENT_MODES = ['mobile', 'desktop', 'recommended'] as const;
 /** Capacitor `server.androidScheme`. Capacitor itself tolerates a custom scheme, but this
@@ -985,7 +974,6 @@ export function mergeProjectConfig(
       // you wrote, so the log looks correct.
       orientation: pick(p.capacitor?.orientation, CAPACITOR_ORIENTATIONS, d.capacitor.orientation, 'capacitor.orientation'),
       statusBarStyle: pick(p.capacitor?.statusBarStyle, STATUS_BAR_STYLES, d.capacitor.statusBarStyle, 'capacitor.statusBarStyle'),
-      audioSessionCategory: pick(p.capacitor?.audioSessionCategory, AUDIO_SESSION_CATEGORIES, d.capacitor.audioSessionCategory, 'capacitor.audioSessionCategory'),
       iosContentMode: pick(p.capacitor?.iosContentMode, IOS_CONTENT_MODES, d.capacitor.iosContentMode, 'capacitor.iosContentMode'),
       androidScheme: pick(p.capacitor?.androidScheme, ANDROID_SCHEMES, d.capacitor.androidScheme, 'capacitor.androidScheme'),
       keyboardResize: pick(p.capacitor?.keyboardResize, KEYBOARD_RESIZE_MODES, d.capacitor.keyboardResize, 'capacitor.keyboardResize'),

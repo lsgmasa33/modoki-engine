@@ -294,8 +294,9 @@ floor as if the handler had always been instant.
 **A third gate (#530): a registered busy predicate.** `registerUIBusySource(name, isBusy)`
 (`runtime/core/uiBusySources.ts`, re-exported from the runtime barrel) lets a game tell the
 lock that some asynchronous state it owns should keep input blocked, without rewriting its
-handlers to return promises. It is a predicate the engine ASKS at activation time, not a
-`begin`/`end` pair the game TELLS — a push/pop scope leaks if the operation throws between
+handlers to return promises. It is a predicate the engine ASKS — polled every FRAME since #551
+(`pollUIBusyContinuity`, not just at a discrete activation) — not a `begin`/`end` pair the game
+TELLS — a push/pop scope leaks if the operation throws between
 the two calls, and Court's `beginSignIn` is a bare fire-and-forget async IIFE with no
 `finally`, so a throw between `begin` and `end` would have bricked every button in the game
 until its own 60s watchdog finally fired. `isInputLockActive` consults this gate first, even
@@ -304,8 +305,10 @@ when no lock is currently held — the busy period can start outside any UI acti
 
 **It carries its own safety valve, mirroring `inputLockMaxMs`**, because a predicate stuck
 true would otherwise brick input forever — the exact failure the lock's own valve exists to
-prevent. A throwing predicate degrades to "not busy" and logs once per throwing call, so one
-bad game-side read can't starve input either.
+prevent. A throwing predicate degrades to "not busy" and logs once per THROW STREAK (deduped via
+`erroredSinceRecovery`, cleared the moment the predicate stops throwing) rather than once per
+call — since #551 the predicate is polled every frame, so an un-deduped log would flood at ~60Hz
+instead of firing once; a bad game-side read still can't starve input either.
 
 **Both knobs are read fresh from `UISettings` on every discrete activation, never cached
 (#543).** They used to be snapshotted into module-level `lockMinMs`/`lockMaxMs` by
@@ -317,33 +320,27 @@ kept blocking; the first episode after a world swap ran on the OUTGOING scene's 
 `readLockWindow(world)` is now the single place either knob is read and clamped, so there
 is no cached copy for a swap or a first activation to leave stale.
 
-**The valve measures OBSERVED busy time, not wall-clock busy time**, because
-`isInputLockActive()` is only ever called from a discrete UI activation — it can only credit
-busy time it actually watched. A gap since the last observation longer than `inputLockMaxMs`
-means there is no evidence busy was continuous across it, so the window restarts instead of
-crediting time nobody watched (crediting it silently force-released an unrelated *later*
-operation under the previous approach — the bug this replaced).
+**The valve measures OBSERVED busy time, and continuity is now observed on a frame cadence, not
+inferred between discrete activations (#551).** `pollUIBusyContinuity()`
+(`runtime/core/uiBusySources.ts`) runs every frame as a system registered at `SYSTEM_PRIORITY.GAME`
+(`app/ecs/pipeline.ts`), and accumulates the delta between adjacent polls whenever the busy set is
+non-empty. `isInputLockActive()` in `bindings.ts` no longer tracks any of this itself — it just
+reads the accumulated total (`getBusyAccumulatedMs()`) and compares it to `lockWindow.maxMs`. This
+replaced an earlier version that could only sample the busy predicates at a discrete UI
+activation, so it had to INFER continuity between samples via a tuned gap threshold
+(`BUSY_OBSERVATION_GAP_MS`) — ambiguous by construction, because one tap N seconds after the last
+was indistinguishable between "still stalled" and "an unrelated new episode". Polling every frame
+removes that ambiguity: two polls are (almost always) genuinely adjacent frames, so the delta
+between them is a decidable fact, not a guess.
 
-**The valve ACCUMULATES observed-adjacent time; it does not measure from a single start
-timestamp.** Each activation credits only the delta since the previous observation, and only
-when that delta is under `BUSY_OBSERVATION_GAP_MS` (10s, a code constant); a longer gap is
-evidence of nothing, credits zero, and starts a fresh episode. This replaced a `busySince`
-timestamp whose elapsed time could include arbitrary stretches nobody watched.
-
-⚠️ **The threshold is a heuristic with a known ambiguous band, and cannot be fixed by choosing a
-better number.** `isInputLockActive` only samples at a discrete activation, so one tap N seconds
-after the last is indistinguishable between *"still stalled, the user retried"* (must credit, or
-the valve never rescues and input stays bricked) and *"the old episode ended, an unrelated one
-began"* (must not credit, or the new operation is force-released unprotected — the #530 defect).
-The suite pins both sides: a genuine-stall test retries every 3.3s expecting rescue, and a 5s
-idle between episodes expects protection. It is biased toward **crediting**, deliberately —
-bricked input is the severe failure, an unprotected new episode the milder one.
-
-Both failure modes were shipped and caught in review before landing: tying the threshold to the
-authored `inputLockMaxMs` made the valve unreachable at any human tap cadence below the ceiling,
-and a flat 10s reintroduced #530's stale-episode force-release. The real fix is to observe the
-busy predicates on a frame cadence rather than only at activations, which makes continuity
-*observed* instead of inferred and retires the constant entirely — tracked as #551.
+⚠️ **The pipeline does not always tick, though, so the poll-to-poll delta still needs a clamp.** A
+gap between two polls can exceed a normal frame (editor Pause, a backgrounded tab where rAF halts,
+a long synchronous stall like a scene load or shader compile) with nothing observed across it.
+`MAX_POLL_GAP_MS` (250ms, `uiBusySources.ts`, mirroring `timeSystem.ts`'s `MAX_DELTA` clamp for
+the same class of problem) treats a gap larger than that as unwatched: the accumulator resets to a
+fresh episode instead of crediting the full gap, so a real in-flight operation surviving a pause
+doesn't get force-released on the very next poll after resume — the #530 regression this clamp
+exists to prevent.
 
 A **continuous** event stream passes `continuous: true` to `applyBindings` and is exempt both
 ways: it neither takes nor respects the lock. Two streams qualify, not one: a range slider's

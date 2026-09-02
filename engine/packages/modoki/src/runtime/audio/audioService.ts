@@ -193,9 +193,7 @@ function graphOrNull(): Graph | null {
   const master = ctx.createGain();
   master.connect(mute);
   const mk = () => { const g = ctx.createGain(); g.connect(master); return g; };
-  const musicBus = ctx.createGain();
-  musicBus.connect(master);
-  graph = { ctx, master, mute, buses: { music: musicBus, sfx: mk(), ui: mk() } };
+  graph = { ctx, master, mute, buses: { music: mk(), sfx: mk(), ui: mk() } };
   // Reapply the tracked bus mix to the fresh nodes (they start at gain 1) — the
   // same way `muted` is reapplied above. Without this, a graph recreated after
   // dispose() (error recovery / editor stop-restart) plays every bus at full

@@ -205,33 +205,6 @@ await GameDebug.startServer({ port: 9095 });
 const { running, connected } = await GameDebug.getStatus();
 ```
 
-### `capacitor-modoki-audio` — `AVAudioSession` category (#548, open)
-
-Engine-level plugin under `engine/packages/` (like `capacitor-game-debug`/`capacitor-litert-lm`,
-not per-game). Sets the `AVAudioSession` category so other apps' audio (Music, podcasts) isn't
-killed the instant ours starts. Its auto-ducking half was removed (device testing showed the
-signal it relied on can't distinguish another app's audio from our own WKWebView-owned session).
-Full mechanism and device-verification status: [audio-plan.md](./audio-plan.md) § "iOS audio
-session".
-
-```typescript
-import { ModokiAudio } from 'capacitor-modoki-audio';
-
-await ModokiAudio.configure({ category: 'ambient' }); // or 'playback'
-```
-
-**Android/web are permanent no-ops.** Not a stub to fill in later: Android audio is 100% WebView
-with no audio-focus concept to bridge (measured for #548, see the doc above).
-
-⚠️ **The SPM static-linker question this plugin's own `Package.swift` header raises is
-UNTESTED.** It imports only `AVFoundation`, a system framework — the same dependency-free shape
-that got `capacitor-game-debug` stripped by SPM's static linker (see above). `capacitor-modoki-iap`
-imports `StoreKit`, also a system framework, and resolves fine, but nothing has confirmed *why*, so
-this package's header explicitly declines to assume a system-framework import is enough to survive
-linking. **This can only be settled by a device build.** If the plugin class turns out to be
-stripped, the fallback is the same one `capacitor-game-debug` uses: compile the plugin directly
-into the App target with manual registration in `MyViewController.swift`, rather than via SPM.
-
 ### `capacitor-litert-lm` — on-device LLM
 
 On-device LLM inference (used by the `llm-test` game), with **one TS surface, two engines behind it**: Capacitor's `registerPlugin` routes each call to the native Android implementation (`LitertLmPlugin.kt` — LiteRT-LM Kotlin SDK) or, on web, to `LitertLmWeb` (`src/web.ts` — MediaPipe `@mediapipe/tasks-genai`, Gemma running via WebGPU). The definitions (`src/definitions.ts`) are the contract both sides implement.

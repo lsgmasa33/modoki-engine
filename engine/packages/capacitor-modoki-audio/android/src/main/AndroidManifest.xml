@@ -1,5 +1,0 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Nothing to declare. Android audio is 100% WebView (Web Audio); this plugin exists here
-         only so the package is structurally complete on both platforms — see
-         ModokiAudioPlugin.java for why it is a permanent no-op on this platform. -->
-</manifest>

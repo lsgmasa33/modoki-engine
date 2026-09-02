@@ -4,10 +4,12 @@ Status: **Phases 1–4 shipped** (`verify` green) — runtime audio subsystem +
 editor authoring (Audio Inspector) + the ffmpeg converter + mix helpers + the
 **declarative control layer** (engine-reconciled `AudioSource` + built-in `audio.*`
 actions), plus a fully-declarative demo game (`games/audio-demo`) and a Unity-style
-editor **Mute Audio** toggle, plus an **iOS `AVAudioSession` category**
-(#548, still **open** — device-tested and not yet shown to work; its auto-ducking half was
-removed after device testing — see below). Only the **native backend** (deferred by design)
-and a couple of small polish items remain. Owner: solo.
+editor **Mute Audio** toggle, plus an **iOS `AVAudioSession` category**, tried and abandoned
+(#548 — **closed won't-do**: device-tested, shown not to work, and the only remaining path is a
+native audio backend the owner judged not worth the effort; its auto-ducking half was removed
+after device testing, and the plugin itself was removed once the category was shown inert — see
+below). Only the **native backend** (deferred by design) and a couple of small polish items
+remain. Owner: solo.
 
 ## Decisions (settled)
 
@@ -508,29 +510,35 @@ headless test drive the cap deterministically.
 
 Covered by `packages/modoki/tests/runtime/audioJournal.test.ts`.
 
-## iOS audio session (#548) — category only, ducking removed
+## iOS audio session (#548) — WON'T DO (owner, 2026-09-02)
 
 **The problem.** iOS set no `AVAudioSession` category anywhere in this repo, so every Modoki game
 inherited the platform default, `.soloAmbient` — which **deactivates** whatever another app (Apple
 Music, a podcast) was playing the instant our own audio started. The owner asked for the opposite:
 let other apps' audio keep playing alongside ours.
 
-### The session category
+### The session category (plugin since removed)
 
 `.ambient` + `.mixWithOthers` is the category that mixes instead of interrupting.
-`engine/packages/capacitor-modoki-audio/` is a standalone Capacitor plugin (SPM, iOS-only, same
-pattern as every other plugin in this doc — see below) that sets it: `load()` applies the default
-the instant the app launches (before any playback), and `configure({category})` lets the game
-override it. **Every `AVAudioSession` call is do/catch-wrapped and degrades to the OS default
-rather than trapping** — a failed category set must not crash the splash screen.
+`engine/packages/capacitor-modoki-audio/` was a standalone Capacitor plugin (SPM, iOS-only, same
+pattern as every other plugin in this doc) that set it: `load()` applied the default the instant
+the app launched (before any playback), and `configure({category})` let the game override it.
+**Every `AVAudioSession` call was do/catch-wrapped and degraded to the OS default rather than
+trapping** — a failed category set must not crash the splash screen.
 
-Two categories are exposed, both mixing with other apps: `'ambient'` (default) additionally
-silences our audio when the ring/silent switch is on — what a casual game normally wants —
-`'playback'` keeps playing through it, for a game whose music is the point. Authored as
-`capacitor.audioSessionCategory` in `project.config.json` (`engine/project-config.ts`,
-`AUDIO_SESSION_CATEGORIES = ['ambient', 'playback']`, default `'ambient'`) — a per-game knob, not
-a code constant, because whether a game's music should survive Silent Mode is a design call, not
-an engine invariant.
+Two categories were exposed, both mixing with other apps: `'ambient'` (default) additionally
+silenced our audio when the ring/silent switch was on — what a casual game normally wants —
+`'playback'` kept playing through it, for a game whose music is the point. Authored as
+`capacitor.audioSessionCategory` in `project.config.json` — a per-game knob, not a code constant,
+because whether a game's music should survive Silent Mode is a design call, not an engine
+invariant.
+
+**The plugin, the config field, and all its wiring were removed** once the measurements below
+showed the category has no observable effect (owner ruling, 2026-09-02 — see "RULING" below): the
+package `engine/packages/capacitor-modoki-audio/`, `capacitor.audioSessionCategory` /
+`AUDIO_SESSION_CATEGORIES` in `engine/project-config.ts`, its Project Settings field, and every
+project's dependency on it. Nothing above is buildable from the current tree — it is recorded here
+because the reasoning (and the dead end it documents) is the durable part.
 
 Android has no equivalent and needs none — audio there is 100% WebView (Web Audio), there is
 **zero** audio-focus code anywhere in this repo, and Chromium requests audio focus on our behalf
@@ -561,26 +569,67 @@ until/unless a different signal is found.
 
 ### Not a replacement for #489's re-arm
 
-⚠️ `.ambient` changes **whether** we get suspended by another app's audio taking over outright — it
-does not change what happens on a phone call, a Siri invocation, or an alarm, which still
-interrupt the audio session under **any** category. `useAudioResumeRearm`
+⚠️ Historical note, kept because the conclusion still holds: `.ambient` was *intended* to change
+**whether** another app's audio takes over outright (it did not, see above), and either way it
+never changed what happens on a phone call, a Siri invocation, or an alarm — those interrupt the
+audio session under **any** category. `useAudioResumeRearm`
 (`engine/app/useAudioResumeRearm.ts`) stays load-bearing for those; #548 and #489 are independent
 mechanisms.
 
-### Verification — the category itself is still NOT yet verified to work
+### Verification — HISTORICAL: what was measured, and why it stopped there
 
-Code is green under `npm run verify`, but — like #489's re-arm — no headless test or simulator
-reproduces a real `AVAudioSession` interruption, so the only real evidence is a phone, and that
-evidence is not good yet: device-tested on the **iPhone Air / iOS 26.6**, with Music.app playing,
-launching the app **still stops** Music.app's playback. So **#548 stays open** — the category
-change alone has not been shown to achieve the mixing behaviour it is meant to produce. Re-test
-procedure:
+⚠️ **Not executable any more — the plugin and the config field it describes no longer exist.**
+Kept because the measurement is the evidence behind the RULING above, not because anything here is
+to be re-run.
 
-1. Start Apple Music (or Podcasts) playing.
-2. Launch the Modoki game (e.g. Court) — Apple Music should **keep playing**, the game's own audio
-   should be audible alongside it.
-3. Record the result with the same "device-verified (owner, ‹device›, ‹date›)" phrasing as #489's
-   own device note once the category is actually shown to work.
+No headless test or simulator reproduces a real `AVAudioSession` interruption, so the only evidence
+was ever a phone. The acceptance test was: start Apple Music, then launch the game; Music should
+keep playing with the game's audio alongside it. Measured on the **iPhone Air / iOS 26.6**:
+launching the app **still stopped** Music.app's playback. Re-applying the category at runtime,
+after WebKit's own session already existed, did not change it either (next section). That is what
+closed the issue.
+
+### RULING: won't do (owner, 2026-09-02)
+
+Letting other apps' music keep playing **is not being pursued**. The estimate for the only path that
+could work — moving audio out of the WebView into a native backend — is ~2-4 weeks: a custom plugin
+on both platforms (`@capacitor-community/native-audio` covers none of buses, spatial, crossfade or
+pitch), Android audio-focus handling that does not exist yet, GUID→on-disk asset plumbing, and TWO
+backends maintained forever since web and the editor still need Web Audio. Weighed against a
+nice-to-have for a puzzle game, the owner declined.
+
+⚠️ **Do not reopen this by setting an `AVAudioSession` category.** Every app-side variant has been
+tried and measured — see below. If it is ever revisited, start with the one-hour spike: build a game
+with ALL audio disabled and launch it with Music.app playing. If Music survives, WebView audio is
+what takes the session and a native backend would fix it; if Music dies anyway, the WebView's mere
+presence takes it and a native backend buys nothing. That spike gates the whole feature and has not
+been run.
+
+### The obvious fix is TESTED and DEAD — it is not a timing problem (owner, 2026-09-02)
+
+The natural theory was that WebKit establishes its own media session when playback begins and
+overrides whatever we set at `load()`, so the category simply had to be applied LATER. That was
+tested directly on Court, iPhone Air / iOS 26.6: with the game's audio already playing (so WebKit's
+session definitely existed), `ModokiAudio.configure({category:'ambient'})` was re-applied at runtime
+— it succeeded in 7ms and did not disturb our own playback. Then Music.app was started and the game
+foregrounded. **Music.app still stopped.**
+
+So re-applying after the fact does not win either, and this is NOT a matter of ordering. Nor is it a
+"bug to work around": WKWebView owns its own audio session and does not take the app's category
+(WebKit 167788), so **no `AVAudioSession` configuration from the app side can make WebView audio
+mix** — which also means a third-party session plugin (e.g. Capawesome's) cannot help, since it does
+the same thing this one does.
+
+⚠️ **The only remaining path is architectural: move audio OUT of the WebView.** A native audio
+backend (`@capacitor-community/native-audio`) puts playback in a session the category actually
+governs. That backend is currently deferred by design — see this file's own note that "all targets
+(web + iOS + Android) are WebView/browser, so Web Audio covers 100% today". #548 is the first
+concrete reason to revisit that trade, and it is a large change, not a fix.
+
+What is observed instead today, and must not be mistaken for a ducking regression: starting
+Music.app suspends the game's `AudioContext` (the ordinary #489 interruption), the game goes silent,
+and the next user gesture resumes it via `useAudioResumeRearm`. That is the re-arm working, not the
+category failing to be set.
 
 ## Remaining
 

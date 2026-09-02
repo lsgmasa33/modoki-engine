@@ -17,13 +17,31 @@ import { registerUIAction, unregisterUIAction } from '../../src/runtime/core/act
 import { setPlayState } from '../../src/runtime/core/playState';
 import { UISettings, UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS, UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS } from '../../src/runtime/traits/UISettings';
 import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
-import { registerUIBusySource, clearUIBusySources } from '../../src/runtime/core/uiBusySources';
+import {
+  registerUIBusySource, clearUIBusySources, pollUIBusyContinuity, getBusyAccumulatedMs,
+  MAX_POLL_GAP_MS,
+} from '../../src/runtime/core/uiBusySources';
 
 registerTrait({ name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: {} });
 registerTrait({ name: 'UIElement', trait: UIElement, category: 'component', fields: {} });
 
 const call = (action: string, event: UIActionBinding['event'] = 'click'): UIActionBinding[] =>
   [{ event, kind: 'call', action }];
+
+// Advances the manual clock by `totalMs` in steps no larger than MAX_POLL_GAP_MS (uiBusySources.ts),
+// polling `pollUIBusyContinuity()` after each step — so a test simulating a large elapsed span
+// still credits it in full instead of tripping the pipeline-tick-gap clamp (a step of exactly
+// MAX_POLL_GAP_MS is safe: the clamp only fires on a gap STRICTLY GREATER than it). See the
+// dedicated clamp test below for what a genuine long gap between polls is FOR.
+const advanceAndPoll = (totalMs: number): void => {
+  let remaining = totalMs;
+  while (remaining > 0) {
+    const step = Math.min(remaining, MAX_POLL_GAP_MS);
+    advanceManual(step);
+    pollUIBusyContinuity();
+    remaining -= step;
+  }
+};
 
 describe('applyBindings input lock', () => {
   let world: ReturnType<typeof createWorld>;
@@ -632,16 +650,15 @@ describe('applyBindings input lock — UI busy sources (#530)', () => {
     let calls = 0;
     registerUIAction('test.busyStuckAction', () => { calls += 1; });
     try {
-      // Poll repeatedly, each step well under lockMaxMs apart, so the window is actually
-      // OBSERVED continuously — a single distant re-check can no longer be credited as a
-      // continuous stall (see the gap-restart test below for why).
-      for (let i = 0; i < 5; i += 1) {
-        applyBindings(call('test.busyStuckAction'), 'click', { selfGuid: 'btn-1' });
-        advanceManual(UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS / 5);
-      }
+      // Drive the accumulator via `pollUIBusyContinuity` — since #551 it, not `applyBindings`, is
+      // what OBSERVES continuity, once per simulated frame (in <=250ms steps — see
+      // `advanceAndPoll`), landing the accumulator at exactly lockMaxMs (not yet over).
+      pollUIBusyContinuity(); // t=0
+      advanceAndPoll(UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS); // accumulated == lockMaxMs
+      applyBindings(call('test.busyStuckAction'), 'click', { selfGuid: 'btn-1' });
       expect(calls).toBe(0);
 
-      advanceManual(1); // just past the accumulated max
+      advanceAndPoll(1); // just past the accumulated max
       applyBindings(call('test.busyStuckAction'), 'click', { selfGuid: 'btn-1' });
       expect(calls).toBe(1); // the valve stopped blocking despite the source staying busy
       expect(warnSpy).toHaveBeenCalled();
@@ -659,16 +676,19 @@ describe('applyBindings input lock — UI busy sources (#530)', () => {
     let calls = 0;
     registerUIAction('test.busyIntermittentAction', () => { calls += 1; });
     try {
-      // Several short busy windows, each well under the max, with idle gaps between them — a
-      // timestamp set once and never reset would accumulate elapsed time ACROSS these windows and
-      // eventually trip the valve even though no single window is anywhere near it.
+      // Several short busy windows, each well under the max, with an idle frame between them —
+      // the accumulator must reset every time a frame observes nothing busy, so elapsed time
+      // never accrues ACROSS windows even though no single window is anywhere near the ceiling.
       for (let i = 0; i < 5; i += 1) {
         busy = true;
+        pollUIBusyContinuity(); // frame observes the window start
         applyBindings(call('test.busyIntermittentAction'), 'click', { selfGuid: 'btn-1' });
         expect(calls).toBe(i); // swallowed while busy
         advanceManual(UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS / 2);
+        pollUIBusyContinuity(); // still busy — accumulates half the ceiling, well under it
         busy = false;
-        advanceManual(1); // idle tick — resets the busy-since window
+        advanceManual(1);
+        pollUIBusyContinuity(); // frame observes nothing busy — resets the accumulator
         applyBindings(call('test.busyIntermittentAction'), 'click', { selfGuid: 'btn-1' });
         expect(calls).toBe(i + 1); // fires normally, no valve involved
         advanceManual(UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS + 1); // clear the floor for the next round
@@ -680,59 +700,24 @@ describe('applyBindings input lock — UI busy sources (#530)', () => {
     }
   });
 
-  it('an UNOBSERVED gap between busy episodes restarts the valve window instead of crediting it', () => {
-    // Regression for the latent defect found in adversarial review of #530: `isInputLockActive`
-    // is only ever consulted from an activation, so a busy period that starts and ends with NO
-    // activation in between leaves `busySince` stale. If a LATER, unrelated busy episode were
-    // measured against that stale timestamp, the valve would force-release immediately — the
-    // very first tap of the new episode gets zero busy protection.
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    let busy = false;
-    registerUIBusySource('test.busyGap', () => busy);
-    let calls = 0;
-    registerUIAction('test.busyGapAction', () => { calls += 1; });
-    try {
-      // Episode 1 begins and is OBSERVED once via an activation.
-      busy = true;
-      applyBindings(call('test.busyGapAction'), 'click', { selfGuid: 'btn-1' });
-      expect(calls).toBe(0); // swallowed — busySince is now set to t=0
-
-      // Episode 1 ends with NO activation observing the change — nothing calls
-      // isInputLockActive() while not-busy, so busySince is never cleared.
-      busy = false;
-      advanceManual(UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS * 3); // a long unobserved gap
-
-      // Episode 2 begins, from something with no relation to episode 1 (e.g. a background sync).
-      busy = true;
-      applyBindings(call('test.busyGapAction'), 'click', { selfGuid: 'btn-1' });
-
-      // The buggy version measures this against the STALE busySince (elapsed >> lockMaxMs) and
-      // force-releases immediately, letting the handler fire with zero busy protection.
-      expect(calls).toBe(0); // still blocked — episode 2 gets its own fresh window
-      expect(warnSpy).not.toHaveBeenCalled(); // and no spurious "stuck" warning either
-    } finally {
-      unregisterUIAction('test.busyGapAction');
-      warnSpy.mockRestore();
-    }
-  });
-
   it('a GENUINE stall still trips the valve when observed repeatedly across it', () => {
-    // Complement to the gap test above: when activations DO keep observing a single continuous
-    // stall, the window must still accumulate normally and force-release exactly once.
+    // Continuity is now OBSERVED every frame (#551), not inferred between activations — a stall
+    // that a per-frame poll keeps watching accumulates normally and force-releases exactly once.
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     registerUIBusySource('test.busyGenuineStall', () => true);
     let calls = 0;
     registerUIAction('test.busyGenuineStallAction', () => { calls += 1; });
     try {
-      // Repeated activations, each well under lockMaxMs apart, spanning past lockMaxMs in total.
-      for (let i = 0; i < 4; i += 1) {
-        applyBindings(call('test.busyGenuineStallAction'), 'click', { selfGuid: 'btn-1' });
-        advanceManual(UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS / 3);
-      }
-      expect(calls).toBe(0); // still swallowed — total elapsed has now crossed the max
+      // Poll every simulated frame (in <=250ms steps — see `advanceAndPoll`), spanning past
+      // lockMaxMs in total.
+      pollUIBusyContinuity(); // t=0
+      advanceAndPoll(UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS); // accumulated == lockMaxMs, not yet OVER
+      applyBindings(call('test.busyGenuineStallAction'), 'click', { selfGuid: 'btn-1' });
+      expect(calls).toBe(0); // still swallowed — total elapsed has now reached the max
       expect(warnSpy).not.toHaveBeenCalled();
 
-      // One more activation, now past the accumulated max — the valve force-releases and warns.
+      // One more poll frame, now past the accumulated max — the valve force-releases and warns.
+      advanceAndPoll(1);
       applyBindings(call('test.busyGenuineStallAction'), 'click', { selfGuid: 'btn-1' });
       expect(calls).toBe(1);
       expect(warnSpy).toHaveBeenCalledTimes(1);
@@ -748,6 +733,35 @@ describe('applyBindings input lock — UI busy sources (#530)', () => {
     }
   });
 
+  it('a poll gap over MAX_POLL_GAP_MS resets the accumulator instead of crediting it in full (regression for #530 via #551)', () => {
+    // If the pipeline stops ticking for a stretch (editor Pause, a backgrounded tab, a long
+    // synchronous stall) and then resumes, the gap between the two polls that bracket it must
+    // NOT be credited in full — that would hand a still-in-flight operation more accumulated
+    // busy time than was ever actually observed, and could force-release it on the very next
+    // poll after resume. This is exactly the #530 defect the valve exists to prevent.
+    registerUIBusySource('test.busyPollGap', () => true);
+
+    pollUIBusyContinuity(); // t=0, first poll — nothing accumulated yet
+    expect(getBusyAccumulatedMs()).toBe(0);
+
+    // A gap just UNDER the threshold — e.g. an ordinary heavy synchronous stall — is still
+    // credited in full, not treated as unwatched.
+    advanceManual(MAX_POLL_GAP_MS - 1);
+    pollUIBusyContinuity();
+    expect(getBusyAccumulatedMs()).toBe(MAX_POLL_GAP_MS - 1);
+
+    // Simulate a large unwatched gap — e.g. a backgrounded tab where rAF halted — just OVER the
+    // threshold.
+    advanceManual(MAX_POLL_GAP_MS + 1);
+    pollUIBusyContinuity(); // the gap must NOT be credited
+    expect(getBusyAccumulatedMs()).toBe(0); // fresh episode, not the full gap
+
+    // The fresh episode still accumulates normally from here.
+    advanceManual(30);
+    pollUIBusyContinuity();
+    expect(getBusyAccumulatedMs()).toBe(30);
+  });
+
   it('a throwing predicate is treated as not-busy, logs, and does not break the activation path', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     registerUIBusySource('test.busyThrows', () => { throw new Error('boom'); });
@@ -760,6 +774,27 @@ describe('applyBindings input lock — UI busy sources (#530)', () => {
       expect(String(errorSpy.mock.calls[0][0])).toContain('test.busyThrows');
     } finally {
       unregisterUIAction('test.busyThrowsAction');
+      errorSpy.mockRestore();
+    }
+  });
+
+  // Since #551 the predicate is polled every FRAME, not once per discrete activation — an
+  // un-deduped `console.error` on a persistently-throwing predicate would flood the console at
+  // ~60Hz. `erroredSinceRecovery` (uiBusySources.ts) dedups it: logged once per THROW STREAK, not
+  // once per call. Deleting that mechanism entirely would still leave a single-poll test passing,
+  // so this drives several polls of the same throw streak and asserts the log fired exactly once.
+  it('a persistently-throwing predicate logs only ONCE across repeated polls of the same throw streak', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    registerUIBusySource('test.busyThrowsRepeatedly', () => { throw new Error('still broken'); });
+    try {
+      pollUIBusyContinuity();
+      pollUIBusyContinuity();
+      pollUIBusyContinuity();
+      pollUIBusyContinuity();
+      pollUIBusyContinuity();
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(String(errorSpy.mock.calls[0][0])).toContain('test.busyThrowsRepeatedly');
+    } finally {
       errorSpy.mockRestore();
     }
   });
@@ -804,12 +839,13 @@ describe('applyBindings input lock — UI busy sources (#530)', () => {
     try {
       applyBindings(call('test.busyFirstSessionAction'), 'click', { selfGuid: 'btn-first' }); // t=0
       expect(calls).toBe(0);
+      pollUIBusyContinuity(); // frame observes the episode start, t=0
 
-      advanceManual(300); // t=300 — still under the authored 500ms, same episode continues
+      advanceAndPoll(300); // t=300 — still under the authored 500ms, same episode continues
       applyBindings(call('test.busyFirstSessionAction'), 'click', { selfGuid: 'btn-first' });
       expect(calls).toBe(0);
 
-      advanceManual(300); // t=600 — past the AUTHORED 500ms (but well under the stale 10000ms)
+      advanceAndPoll(300); // t=600 — past the AUTHORED 500ms (but well under the stale 10000ms)
       applyBindings(call('test.busyFirstSessionAction'), 'click', { selfGuid: 'btn-first' });
       // Pre-#543: still consulting the stale/default 10000ms cache primed above → stays blocked
       // (600 < 10000). Post-#543: reads the authored 500ms fresh → unblocks and warns.
@@ -822,13 +858,10 @@ describe('applyBindings input lock — UI busy sources (#530)', () => {
     }
   });
 
-  // Regression for the defect found reviewing #543: the gap-restart threshold and the VALVE
-  // threshold were the same number, so once the valve started reading the AUTHORED ceiling, a
-  // game could author the valve into never firing. With `inputLockMaxMs: 500` and a human tap
-  // cadence of 800ms, every observation restarted the window (`800 > 500`) — `busyElapsed` never
-  // grew, input stayed blocked for the whole stall, and the warning never printed. The gap is now
-  // floored by BUSY_OBSERVATION_GAP_MS, independent of the authored ceiling.
-  it('a small authored inputLockMaxMs cannot make the busy valve unreachable at human tap cadence', () => {
+  it('a small authored inputLockMaxMs is honored regardless of activation cadence', () => {
+    // Since #551 the accumulator is driven by a per-frame poll, not by activation spacing — so
+    // an authored ceiling can no longer be starved by a slow (or absent) tap cadence the way the
+    // old activation-sampled gap heuristic could be.
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     world.spawn(UISettings({ inputLockMaxMs: 500, inputLockMinMs: 0 }));
     registerUIBusySource('test.busyStuckSmallCeiling', () => true);
@@ -837,13 +870,11 @@ describe('applyBindings input lock — UI busy sources (#530)', () => {
     try {
       applyBindings(call('test.smallCeilingAction'), 'click', { selfGuid: 'btn-sc' }); // t=0
       expect(calls).toBe(0);
+      pollUIBusyContinuity(); // frame observes the window start, t=0
 
-      // A REALISTIC retry cadence — 800ms apart, well above the authored 500ms ceiling. Pre-fix
-      // this restarted the window on every tap and the valve was unreachable forever; the old
-      // tests only passed because they polled at 20ms, which no human produces.
-      advanceManual(800);
+      // A human retry, 800ms later — well past the authored 500ms ceiling.
+      advanceAndPoll(800); // accumulated = 800, past the 500ms ceiling
       applyBindings(call('test.smallCeilingAction'), 'click', { selfGuid: 'btn-sc' }); // t=800
-      // 800ms of CONTINUOUS observed busy is past the authored 500ms ceiling → valve rescues.
       expect(calls).toBe(1);
       expect(warnSpy).toHaveBeenCalled();
       expect(String(warnSpy.mock.calls[0][0])).toContain('test.busyStuckSmallCeiling');
@@ -881,17 +912,15 @@ describe('applyBindings input lock — UI busy sources (#530)', () => {
     try {
       applyBindings(call('test.worldBAction'), 'click', { selfGuid: 'btn-b' }); // first activation in B
       expect(calls).toBe(0);
+      pollUIBusyContinuity(); // frame observes B's window start, t=0
 
-      // Poll in steps SMALLER than B's authored 50ms, each observed via an activation, so the
-      // busy window is credited continuously rather than tripping the unobserved-gap restart
-      // (see the gap-restart test above) — total elapsed still lands well under A's stale 5000ms.
+      // Poll a few frames, well under A's stale 5000ms but past B's authored 50ms.
       advanceManual(20);
-      applyBindings(call('test.worldBAction'), 'click', { selfGuid: 'btn-b' }); // t=20
-      expect(calls).toBe(0);
+      pollUIBusyContinuity(); // accumulated = 20
       advanceManual(20);
-      applyBindings(call('test.worldBAction'), 'click', { selfGuid: 'btn-b' }); // t=40
-      expect(calls).toBe(0);
+      pollUIBusyContinuity(); // accumulated = 40
       advanceManual(20);
+      pollUIBusyContinuity(); // accumulated = 60
       applyBindings(call('test.worldBAction'), 'click', { selfGuid: 'btn-b' }); // t=60
       // Pre-#543: still on A's cached 5000ms → stays blocked (60 < 5000). Post-#543: reads B's
       // freshly-authored 50ms → unblocks and warns.

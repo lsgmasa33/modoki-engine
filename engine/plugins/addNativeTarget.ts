@@ -78,8 +78,6 @@ function capDepRange(editorRoot: string, name: string, coreRange: string): strin
  *   - `@capacitor/keyboard`    → `useKeyboardShift`
  *   - `@capacitor/splash-screen` → App.tsx's `SplashScreen.hide()` once the game can be shown
  *     (docs/ota-updates.md Phase 3b). Its call is try/caught, so this one heals in lazily.
- *   - `capacitor-modoki-audio` → the iOS `AVAudioSession` category bridge (#548), with android a
- *     structural no-op stub. Same category as haptics: the import is static.
  *
  *  Omit one and the failure is SILENT until launch: the web build inlines the plugin's JS proxy
  *  from the EDITOR's node_modules, so the build succeeds, but `cap sync` runs in the project dir
@@ -102,11 +100,6 @@ export const ENGINE_REQUIRED_CAP_PLUGINS = [
   '@capacitor/keyboard',
   '@capacitor/preferences',
   '@capacitor/splash-screen',
-  // The iOS AVAudioSession category bridge (#548) — same category as haptics above, not opt-in.
-  // Vendored like capacitor-game-debug rather than pulled from the registry (see the `want`
-  // override below), so listing it here is what gets it a COMMITTED entry every native project
-  // must carry — that's what makes nativeProjectDeps.test.ts catch a project that omits it.
-  'capacitor-modoki-audio',
 ] as const;
 
 export interface ScaffoldResult {
@@ -155,15 +148,11 @@ export function ensureCapacitorDeps(projectRoot: string, platform: NativePlatfor
     '@capacitor/cli': range,
     [platformPkg(platform)]: range,
     ...Object.fromEntries(ENGINE_REQUIRED_CAP_PLUGINS.map((n) => [n, capDepRange(editorRoot, n, range)])),
-    // capacitor-game-debug and capacitor-modoki-audio are vendored engine plugins, not registry
-    // packages — capDepRange above would have no editor-pinned version to find for either and
-    // fall back to the (meaningless, for a local plugin) core Capacitor range. Both get a
-    // placeholder spec instead; vendorEnginePlugins rewrites it to file:plugins/<name>-<ver>.tgz
-    // (a copy) before install. capacitor-modoki-audio is ALSO in ENGINE_REQUIRED_CAP_PLUGINS
-    // (unlike capacitor-game-debug) so the committed-state guard covers it — this override just
-    // replaces the spread's capDepRange guess with the correct placeholder.
+    // capacitor-game-debug is a vendored engine plugin, not a registry package — capDepRange
+    // above would have no editor-pinned version to find and fall back to the (meaningless, for a
+    // local plugin) core Capacitor range. It gets a placeholder spec instead; vendorEnginePlugins
+    // rewrites it to file:plugins/<name>-<ver>.tgz (a copy) before install.
     'capacitor-game-debug': '*',
-    'capacitor-modoki-audio': '*',
   };
   let changed = false;
   for (const [name, spec] of Object.entries(want)) {
