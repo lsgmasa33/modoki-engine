@@ -288,12 +288,23 @@ realm-dies/process-lives semantic this whole feature rests on, observed rather t
 control matters as much as the result: a **15s** cycle left the marker intact, ruling out Android
 having trimmed the WebView and establishing that the reload is genuinely threshold-gated.
 
-⚠️ **The feature was invisible on device until its log moved off the boot path**, and the cause is
+**Also verified on iOS** — iPad mini 5 (`iPad11,1`, iOS 26.6.1, 2026-09-03), over WiFi. Identical
+result and identical control: 75s away destroyed the realm with Court's native PID unchanged
+(24314 before and after), 15s away left it intact. So the behaviour is the same on both platforms,
+which is worth knowing because the two get there through different Capacitor delegates.
+
+⚠️ **The feature was invisible on Android until its log moved off the boot path**, and the cause is
 general: the debug bridge installs its console capture from an async dynamic import
-(`main.tsx`'s `import('./debug/bridge').then(...)`), so **no boot-time log reaches
-`device_console_logs`** — an absent line there reads as "that code never ran" when it may only mean
-"it ran too early to be seen" (#591). Hence the armed-threshold line fires on the first background
-edge, not at mount.
+(`main.tsx`'s `import('./debug/bridge').then(...)`), so a boot-time log can miss
+`device_console_logs` entirely — an absent line there reads as "that code never ran" when it may
+only mean "it ran too early to be seen" (#591). Hence the armed-threshold line fires on the first
+background edge, not at mount.
+
+⚠️ **And it is a RACE, not a platform quirk** — the same mount-time line that never appeared on the
+S22 *does* appear on the iPad. Two async things (the bridge chunk resolving, React mounting) with
+no ordering between them, so the same build can log or not log depending on how fast the chunk
+loads. That is worse than a deterministic gap: a diagnostic you cannot trust to be absent for a
+reason. Do not "fix" a missing device log by concluding the code did not run.
 
 ⚠️ **A realm death is not a process death, and the guards in this repo confuse the two.** Every
 existing double-init latch — `ads.ts`, `attribution.ts`, `LLMManager.ts` — is a module `let`, and
