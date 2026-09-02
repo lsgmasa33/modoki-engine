@@ -108,33 +108,64 @@ const DOC_CITATION_EXEMPT: ReadonlyArray<{ file: string; reason: string }> = [
  *  So the rule is not "never name a deleted doc" — it is "naming one is a deliberate act you
  *  record here". Adding an entry is cheap; the list existing is what keeps the deletion visible
  *  instead of silent. If you find yourself adding an entry for a citation that reads as a live
- *  pointer ("see X for the details"), repoint it instead — that is the #194 defect, not history. */
-const RETIRED_DOCS_NAMED_ON_PURPOSE: ReadonlyArray<{ cited: string; absorbedBy: string }> = [
-  { cited: 'docs/cloud-editor.md', absorbedBy: 'nothing — cloud cancelled 2026-07-01, GCP torn down; the teardown plan (docs/plans/cloud-teardown-and-migration-plan.md) was itself the deletion record and is now deleted too, folded rationale living in docs/site-hosting.md' },
-  { cited: 'docs/cloud-editor-embedded-claude.md', absorbedBy: 'nothing — same' },
-  { cited: 'docs/cloud-editor-typescript-editor-plan.md', absorbedBy: 'nothing — same' },
-  { cited: 'docs/plans/cloud-teardown-and-migration-plan.md', absorbedBy: 'docs/site-hosting.md — landed (cloud cancelled, GCP torn down, load balancer retired); tracker deleted per doc-conventions.md' },
-  { cited: 'docs/plans/court-store-plan.md', absorbedBy: 'games/court/ads.md — §§ 2-4 folded in (the catalog, the standing rules, the grant hook); the condensed § "A guard whose premise can lie" carries three of the ten close-out-catalogue instances, the rest preserved only in git history' },
-  { cited: 'docs/plans/court-art-direction.md', absorbedBy: 'games/court/art.md' },
-  { cited: 'docs/plans/court-tray-readability-plan.md', absorbedBy: 'games/court/art.md' },
-  { cited: 'games/court/art-direction.md', absorbedBy: 'games/court/art.md' },
-  { cited: 'docs/plans/court-prototype-plan.md', absorbedBy: 'games/court/{hints,levels,tutorial}.md — each says which phases it absorbed' },
-  { cited: 'docs/plans/forest-camp-demo-plan.md', absorbedBy: 'demos/forest-camp/CLAUDE.md' },
-  { cited: 'docs/plans/engine-oss-public-repo.md', absorbedBy: 'docs/engine-oss-publishing.md (its own "Graduated from" line)' },
-  { cited: 'docs/plans/gcp-lb-retirement-plan.md', absorbedBy: 'docs/site-hosting.md § "Why a Worker"' },
-  { cited: 'docs/plans/scene-view-gizmo-plan.md', absorbedBy: 'docs/scene-view-gizmo.md (its own "Graduated from" line)' },
-  { cited: 'docs/plans/trusted-device-input-plan.md', absorbedBy: 'docs/trusted-device-input.md (its own "replaced" line)' },
-  { cited: 'docs/plans/advideo-playable-export-plan.md', absorbedBy: 'docs/playable-export.md; docs/bundle-new-tools.md names it as the origin of that playbook' },
-  { cited: 'docs/plans/low-end-device-support.md', absorbedBy: 'docs/rendering.md § "Quality tiers" (landed rationale — GPU identity, the boot ramp probe, the cpuLimited promotion licence) + docs/plans/texture-lod-by-tier.md (the unstarted remainder); the superseded plan is preserved in git at 4fc02890' },
-  { cited: 'docs/plans/per-group-sync.md', absorbedBy: 'docs/cloud-sync.md (the rulings, the ordering fix for the first-solve payout, the still-open narrowed-dialog note) + games/court/accounts.md/ads.md (the worked Court-specific detail, already current); #532 landed, tracker deleted per doc-conventions.md' },
+ *  pointer ("see X for the details"), repoint it instead — that is the #194 defect, not history.
+ *
+ *  `absorbedByPaths` is the CHECKED existence-claim(s) for each entry — usually the doc(s) that
+ *  entry's OWN `absorbedBy` prose names as still live, so a fold into a doc that was ITSELF later
+ *  deleted gets caught (#578) instead of silently reading as historical bookkeeping forever. (Three
+ *  "nothing — same" entries below are the one exception: they inherit the entry-above's target by
+ *  that word, rather than naming a path of their own.) It is a separate, explicit field rather than
+ *  something parsed out of `absorbedBy` — that prose is free-form ("X — landed…", "X + Y; the
+ *  superseded plan is preserved…", "games/court/{hints,levels,tutorial}.md"), and regex-guessing the
+ *  live target back out of it would be exactly the kind of "merely convenient, not obviously
+ *  correct" hole the comment on `DOC_CITATION_EXEMPT` above warns against.
+ *
+ *  ⚠️ NOT the same shape as `absorbedBy` itself — an entry whose prose STARTS "nothing" (no doc
+ *  directly absorbed this one) can still have a non-empty `absorbedByPaths`, when the prose goes on
+ *  to name a doc the rationale actually lives in ("nothing — … folded rationale living in
+ *  docs/site-hosting.md"). A secondary "named as provenance in X" / "X names it as the origin"
+ *  mention elsewhere in the prose is EXCLUDED whenever the entry already has a primary target next
+ *  to it (`docs/bundle-new-tools.md` on the advideo-playable-export entry; `games/court/menu.md` and
+ *  its siblings on the ui-scroll-view entry) — those are citing files, not fold targets, and
+ *  checking them would couple this list to churn in files this guard has no business tracking. The
+ *  ONE case a provenance mention IS included is the ONE case there is no primary target to check
+ *  instead: `docs/percept-plan.md` "never existed", so `docs/todo.md` — the only doc the prose names
+ *  that should currently exist — is the whole claim, not an addition to a fuller one. Every entry
+ *  below has at least one path for exactly this reason; see the "shape" test below.
+ *
+ *  A `docs/plans/*.md` tracker is a legitimate target (e.g. an unlanded plan proposing to create the
+ *  retired doc's replacement) — when that plan itself later lands and its tracker is deleted per
+ *  `doc-conventions.md`, THIS test is expected to go red on the entry pointing at it, exactly like
+ *  the "still absent" check below expects a revived `cited` doc to go red. That is the mechanism
+ *  working, not a false positive: fix the entry in the same commit that deletes the tracker. */
+const RETIRED_DOCS_NAMED_ON_PURPOSE: ReadonlyArray<{
+  cited: string; absorbedBy: string; absorbedByPaths: string[];
+}> = [
+  { cited: 'docs/cloud-editor.md', absorbedBy: 'nothing — cloud cancelled 2026-07-01, GCP torn down; the teardown plan (docs/plans/cloud-teardown-and-migration-plan.md) was itself the deletion record and is now deleted too, folded rationale living in docs/site-hosting.md', absorbedByPaths: ['docs/site-hosting.md'] },
+  { cited: 'docs/cloud-editor-embedded-claude.md', absorbedBy: 'nothing — same', absorbedByPaths: ['docs/site-hosting.md'] },
+  { cited: 'docs/cloud-editor-typescript-editor-plan.md', absorbedBy: 'nothing — same', absorbedByPaths: ['docs/site-hosting.md'] },
+  { cited: 'docs/plans/cloud-teardown-and-migration-plan.md', absorbedBy: 'docs/site-hosting.md — landed (cloud cancelled, GCP torn down, load balancer retired); tracker deleted per doc-conventions.md', absorbedByPaths: ['docs/site-hosting.md'] },
+  { cited: 'docs/plans/court-store-plan.md', absorbedBy: 'games/court/ads.md — §§ 2-4 folded in (the catalog, the standing rules, the grant hook); the condensed § "A guard whose premise can lie" carries three of the ten close-out-catalogue instances, the rest preserved only in git history', absorbedByPaths: ['games/court/ads.md'] },
+  { cited: 'docs/plans/court-art-direction.md', absorbedBy: 'games/court/art.md', absorbedByPaths: ['games/court/art.md'] },
+  { cited: 'docs/plans/court-tray-readability-plan.md', absorbedBy: 'games/court/art.md', absorbedByPaths: ['games/court/art.md'] },
+  { cited: 'games/court/art-direction.md', absorbedBy: 'games/court/art.md', absorbedByPaths: ['games/court/art.md'] },
+  { cited: 'docs/plans/court-prototype-plan.md', absorbedBy: 'games/court/{hints,levels,tutorial}.md — each says which phases it absorbed', absorbedByPaths: ['games/court/hints.md', 'games/court/levels.md', 'games/court/tutorial.md'] },
+  { cited: 'docs/plans/forest-camp-demo-plan.md', absorbedBy: 'demos/forest-camp/CLAUDE.md', absorbedByPaths: ['demos/forest-camp/CLAUDE.md'] },
+  { cited: 'docs/plans/engine-oss-public-repo.md', absorbedBy: 'docs/engine-oss-publishing.md (its own "Graduated from" line)', absorbedByPaths: ['docs/engine-oss-publishing.md'] },
+  { cited: 'docs/plans/gcp-lb-retirement-plan.md', absorbedBy: 'docs/site-hosting.md § "Why a Worker"', absorbedByPaths: ['docs/site-hosting.md'] },
+  { cited: 'docs/plans/scene-view-gizmo-plan.md', absorbedBy: 'docs/scene-view-gizmo.md (its own "Graduated from" line)', absorbedByPaths: ['docs/scene-view-gizmo.md'] },
+  { cited: 'docs/plans/trusted-device-input-plan.md', absorbedBy: 'docs/trusted-device-input.md (its own "replaced" line)', absorbedByPaths: ['docs/trusted-device-input.md'] },
+  { cited: 'docs/plans/advideo-playable-export-plan.md', absorbedBy: 'docs/playable-export.md; docs/bundle-new-tools.md names it as the origin of that playbook', absorbedByPaths: ['docs/playable-export.md'] },
+  { cited: 'docs/plans/low-end-device-support.md', absorbedBy: 'docs/rendering.md § "Quality tiers" (landed rationale — GPU identity, the boot ramp probe, the cpuLimited promotion licence) + docs/plans/texture-lod-by-tier.md (the unstarted remainder); the superseded plan is preserved in git at 4fc02890', absorbedByPaths: ['docs/rendering.md', 'docs/plans/texture-lod-by-tier.md'] },
+  { cited: 'docs/plans/per-group-sync.md', absorbedBy: 'docs/cloud-sync.md (the rulings, the ordering fix for the first-solve payout, the still-open narrowed-dialog note) + games/court/accounts.md/ads.md (the worked Court-specific detail, already current); #532 landed, tracker deleted per doc-conventions.md', absorbedByPaths: ['docs/cloud-sync.md', 'games/court/accounts.md', 'games/court/ads.md'] },
   // Not retired — NEVER WRITTEN. A plan proposing a doc it did not get to, or a code comment
   // that cited a write-up nobody ever wrote. The latter is its own small hazard: it reads exactly
   // like a live pointer, so an agent spends a search before concluding there is nothing to find.
-  { cited: 'docs/environment-maps.md', absorbedBy: 'nothing — never created; Phase 5 folded the HDR/UltraHDR pipeline into docs/textures.md § "Environment maps (HDR / UltraHDR)" instead of a standalone doc' },
-  { cited: 'docs/plans/asset-inspector-plan.md', absorbedBy: 'docs/textures.md + docs/model-pipeline.md — landed (all 5 phases); tracker deleted per doc-conventions.md' },
-  { cited: 'docs/profiler.md', absorbedBy: 'nothing: docs/plans/profiler.md proposes creating it as its own fold-in target' },
-  { cited: 'docs/percept-plan.md', absorbedBy: 'nothing — never existed. docs/todo.md § Deferred decisions names it as the provenance of the build-mode-enum entry, whose pointer in engine/app/main.tsx aimed here (#194)' },
-  { cited: 'docs/plans/ui-scroll-view-plan.md', absorbedBy: 'docs/ui-system.md § "Scroll views and recycled entries" — all 11 steps landed (#250 + #316); tracker deleted per doc-conventions.md (#319). Named as provenance in games/court/menu.md, games/court/runtime/levelSelect.ts, games/court/runtime/systems.ts (predictions the plan got wrong) and entriesLayout.test.ts (the step-0 spike history)' },
+  { cited: 'docs/environment-maps.md', absorbedBy: 'nothing — never created; Phase 5 folded the HDR/UltraHDR pipeline into docs/textures.md § "Environment maps (HDR / UltraHDR)" instead of a standalone doc', absorbedByPaths: ['docs/textures.md'] },
+  { cited: 'docs/plans/asset-inspector-plan.md', absorbedBy: 'docs/textures.md + docs/model-pipeline.md — landed (all 5 phases); tracker deleted per doc-conventions.md', absorbedByPaths: ['docs/textures.md', 'docs/model-pipeline.md'] },
+  { cited: 'docs/profiler.md', absorbedBy: 'nothing: docs/plans/profiler.md proposes creating it as its own fold-in target', absorbedByPaths: ['docs/plans/profiler.md'] },
+  { cited: 'docs/percept-plan.md', absorbedBy: 'nothing — never existed. docs/todo.md § Deferred decisions names it as the provenance of the build-mode-enum entry, whose pointer in engine/app/main.tsx aimed here (#194)', absorbedByPaths: ['docs/todo.md'] },
+  { cited: 'docs/plans/ui-scroll-view-plan.md', absorbedBy: 'docs/ui-system.md § "Scroll views and recycled entries" — all 11 steps landed (#250 + #316); tracker deleted per doc-conventions.md (#319). Named as provenance in games/court/menu.md, games/court/runtime/levelSelect.ts, games/court/runtime/systems.ts (predictions the plan got wrong) and entriesLayout.test.ts (the step-0 spike history)', absorbedByPaths: ['docs/ui-system.md'] },
 ];
 
 /** Directories whose mentions are not citations by this repo's own rules. */
@@ -288,6 +319,39 @@ describe('cited doc paths resolve (#194)', () => {
       .filter((e) => DOC_ROOTS.some((r) => exists(r ? `${r}/${e.cited}` : e.cited)))
       .map((e) => `${e.cited} — now exists; drop this entry (absorbed by: ${e.absorbedBy})`);
     expect(stale, 'RETIRED_DOCS_NAMED_ON_PURPOSE has entries that are no longer needed').toEqual([]);
+  });
+
+  it('every retired-doc entry\'s absorbedByPaths still exist (#578)', (ctx) => {
+    // Several absorbedByPaths targets live under games/** and demos/** (and docs/plans/**,
+    // docs/todo.md, docs/engine-oss-publishing.md) — all trimmed from the public OSS snapshot by
+    // publish-engine-oss.sh, same as the OTHER GATED test in this block (the one above this reads
+    // only `e.cited`, asserting ABSENCE — which the snapshot satisfies just as well, gated or not).
+    // Gate on BOTH here: the targets span the private docs tree AND games/, and hasFullDocsTree()
+    // alone would still fail on a snapshot-shaped checkout (no games/) while it happens to keep the
+    // full docs/ tree.
+    if (!hasFullDocsTree() || !hasInternalGames()) {
+      ctx.skip();
+      return;
+    }
+    // The free-text `absorbedBy` prose is honest bookkeeping, but nothing checked it: a fold into
+    // a doc that was itself later deleted (or renamed) would leave the ORIGINAL retirement entry
+    // green forever, pointing at a target that is now just as gone as the doc it absorbed.
+    //
+    // Shape floor, not a count: an entry whose absorbedByPaths silently emptied out (the "nothing"
+    // misreading the comment above warns against) is a hole this test can no longer see, however
+    // many OTHER entries still carry paths — a total-count floor measured wrong here (six "nothing"
+    // entries emptying dropped only 6 of 28 paths, comfortably clearing any floor loose enough to
+    // survive ordinary churn). Every entry has ≥1 path today for the reason stated above the array;
+    // this is what keeps that true.
+    const emptied = RETIRED_DOCS_NAMED_ON_PURPOSE
+      .filter((e) => e.absorbedByPaths.length === 0)
+      .map((e) => `${e.cited}: absorbedByPaths is empty (absorbedBy: ${e.absorbedBy})`);
+    expect(emptied, 'an entry\'s absorbedByPaths emptied out — it now guards nothing').toEqual([]);
+    const missing = RETIRED_DOCS_NAMED_ON_PURPOSE
+      .flatMap((e) => e.absorbedByPaths.map((docPath) => ({ entry: e, docPath })))
+      .filter(({ docPath }) => !exists(docPath))
+      .map(({ entry, docPath }) => `${entry.cited}: absorbedByPaths names "${docPath}", which does not exist (absorbedBy: ${entry.absorbedBy})`);
+    expect(missing, 'a doc named in absorbedByPaths no longer exists — repoint it or fold further').toEqual([]);
   });
 });
 
