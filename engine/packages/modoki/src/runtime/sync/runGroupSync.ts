@@ -413,8 +413,8 @@ async function pushAndPersist(
 export interface RunSyncResult {
   outcomes: Record<string, GroupOutcome>;
   /** Ids of the groups whose outcome is `fork` — the ones an `onFork: 'ask'` policy actually raised,
-   *  and the set a single dialog resolves together (one player choice, many groups — see F5 in
-   *  `docs/plans/per-group-sync.md`). */
+   *  and the set a single dialog resolves together (one player choice, many groups — see
+   *  `docs/cloud-sync.md` § "Fork policies"). */
   asking: string[];
 }
 

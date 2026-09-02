@@ -134,7 +134,8 @@ out of that same group, so the erasure is sound).
 `SyncGroupSpec.id` is the cloud document id and must stay stable for the group's life — renaming it
 orphans the old document, reachable by nothing. A game that deletes an account must enumerate its
 actual documents (a `list` over the account's collection) rather than trust a hardcoded set of
-group ids, for exactly this reason (see Court's `deleteAllSaves`/F23 in the tracker history).
+group ids, for exactly this reason (Court's `deleteAllSaves`; F23 in the retired tracker — see
+"`F<n>` citations" below).
 
 ### The four-case decision table
 
@@ -189,8 +190,8 @@ retry would silently destroy the other device's work. The one retryable case is 
 count is bounded (`maxAttempts`, default 3) — a rejected write and a misconfigured security rule are
 indistinguishable to the transport, and unbounded retries spin forever on a player's phone.
 
-Two races the loop guards explicitly, both found porting a working game onto this contract (see
-`docs/plans/per-group-sync.md`'s F9–F13 for the incident history):
+Two races the loop guards explicitly, both found porting Court — a working game — onto this
+contract (in the now-folded `per-group-sync` tracker; the rationale lives here):
 
 - **A game write landing during the network round trip.** `localMovedUnderUs` re-checks the store
   immediately before applying a content-*replacing* outcome (`take-server`, or a fork resolved by
@@ -260,6 +261,117 @@ a two-way question is how a dialog stops being read, and a whole-group merge is 
 field has a defined merge rule. Fields that need to survive regardless of the choice go through
 `merge`'s exemption path instead, on both arms.
 
+### Worked example: Court's three groups, and the rulings that shaped them
+
+Court declares `court.purchases` (`onFork: 'ask'`), `court.progress` (`onFork: 'ask'`) and
+`court.settings` (`onFork: 'take-newer'`) — `games/court/runtime/saveSync.ts`. It replaced a single
+document with one set of marks covering everything, and the shape of the three groups follows
+directly from a sequence of owner decisions (numbered rulings, cited by number from code and tests —
+keep the numbers stable):
+
+1. **Purchase-related values are one group** — entitlements, passes, the coin wallet, and the
+   purchased daily days. They must stay consistent together, so they share one document.
+2. **The purchased-day record moved out of daily progress into that group**; daily progress stays
+   pure (`assignments`, `completed`, `introSeen`, `bootMenuShownOn`, `salt`).
+4. **One dialog resolves every group that actually forked, with a single choice.** See Fork
+   policies above — `runCloudSync`'s `asking` list is the set that dialog answers for, never every
+   declared group. Court's dialog rows are authored per FIELD, not per group, so a group that did
+   not fork simply hides its rows rather than growing its own row pair.
+5. **Existing save data was dropped rather than migrated** — Court had not shipped publicly yet, so
+   there was no local migration, no cloud migration, no mixed-fleet window to protect. This is what
+   let the three-group cut land as three separate commits without pricing a migration for each.
+6. **The purchased-day receipt became `{dateKey: levelId}`** rather than a bare list, so it names
+   the puzzle it bought. Once the receipt and the day's puzzle assignment could travel through
+   different sync groups, a bought day resolved purely by re-deriving "today's puzzle" could hand
+   back a different puzzle than the one the receipt paid for; naming the puzzle in the receipt
+   dissolves the coupling instead of relocating it.
+7. **`solvePaid` (the first-solve payout marker) lives in the progress group**, beside the solves
+   it guards, not with the coins — see "Ordering as a substitute for atomicity" below for what
+   protects the payout now that the marker can no longer share a document with the wallet.
+8. **A group declares `multi-key` (and pays for the durability probe) honestly**, rather than
+   declaring `single-key` for a group that, mid-migration, genuinely still spans several keys —
+   see Single-key vs multi-key above.
+9. **A coin balance that moved off the seeded starting grant counts as dirty.** The pre-existing
+   rule excluded the wallet from "is this device dirty" entirely, which silently discarded a spend
+   made on a never-synced device on the next silent adopt. Under a purchases group, `coins` is that
+   group's *chosen* value, so a never-synced device that has spent or earned coins now raises the
+   purchases fork instead of losing the difference. Accepted deliberately: one more dialog, on a
+   question whose answer is usually "the cloud". `isFreshAndEmpty` for the purchases group is
+   therefore not "equals empty" but "no entitlements, no passes, no purchased days, no
+   `iapApplied`, no spend history, and coins still at the seeded starting grant" — read from the
+   game's own config, never a literal, or a retuned starting grant makes every fresh install read
+   dirty at once.
+
+   ⚠️ **That cost widened past where it was first priced, and was then closed.** A `Clear
+   progress`/forget-this-device wipe deliberately preserved entitlements, passes and `iapApplied`,
+   which left the purchases group non-empty and forced a fork on the very next sign-in — a money
+   dialog on a device with nothing left to lose, where "keep this device" would have pushed a
+   re-seeded starting wallet over the real cloud balance. **Fixed**: the wipe now deletes
+   `court.purchases` outright, so the group reads genuinely fresh-and-empty and the sign-in adopts
+   the cloud silently instead. Pinned by
+   `qa/cases/persistence/cloud-sync-clear-progress-adopts-silently.md` (QA-PREFS-0006).
+
+⚠️ **Ruling 3 is missing from this list on purpose, not by omission.** The retired tracker's ruling 3
+read *"mechanism first, regrouping second — the sync layer learns 'group' as a general contract
+before Court declares groups against it"* — a sequencing decision about the ORDER the work landed in,
+not a decision about the shape of what shipped, so it never carried a numbered citation anywhere and
+has nothing to fold in here. Recovered from git history (see "`F<n>` citations" below) rather than
+restated from memory.
+
+### `F<n>` citations — the retired #532 tracker's numbered findings
+
+Code comments, tests and these docs cite findings as `F1`, `F23`, `F1-bis`, and so on. Those numbers
+were minted by `docs/plans/per-group-sync.md`, the in-flight tracker for issue #532 that this "Worked
+example" section folds the rationale of — the tracker itself was deleted once it landed, per
+[doc-conventions](./doc-conventions.md)'s rule that a landed plan's tracker does not survive it. This
+document never adopted the `F<n>` numbering itself, so a live `F<n>` citation resolves to nothing
+here.
+
+The findings' CONTENT is not lost — it survives in the code banners and doc passages that cite it,
+which is what every existing citation is actually pointing a reader at. The tracker's own text is
+still recoverable from git history:
+
+```
+git log --diff-filter=D -- docs/plans/per-group-sync.md      # find the deleting commit <sha>
+git show <sha>^:docs/plans/per-group-sync.md                  # the tracker's last content, one commit before deletion
+```
+
+Do not repoint the ~90 existing `F<n>` citations at this subsection — they stay as historical
+markers naming which tracker finding a piece of code or prose descends from; this subsection exists
+so a reader hitting one for the first time knows where to look instead of assuming it is a dead link.
+
+### Ordering as a substitute for atomicity — Court's first-solve payout (ruling 7)
+
+A payout marker used to share ONE document with the coins it guarded against a double payment, so a
+torn write could never separate "the coins were paid" from "the payout already happened." Ruling 7
+moved the marker into the progress group, beside `solvedIds`/`daily.completed` — the guards it
+protects — which is right for the sync fork question but reopens the local-torn-write question the
+old co-location answered for free, since the marker no longer shares a document with the coins.
+
+**The fix is write ORDER, not a shared document**: write the guard and the marker together in one
+atomic write, confirm it durable, and only THEN credit the coins. A rejected write then records
+nothing and credits nothing, so a retry pays exactly once — strictly better than the old scheme,
+which merely stopped a *repeat* payout rather than preventing a *missed* one. The residual this
+does not cover — the progress document going missing *after* the coins already landed, so the
+marker disappears with it and a retry pays again — is accepted and recorded in a comment on
+`settleSolvePayout`, not silently absorbed. See `games/court/ads.md` § "A first-solve payout that
+can't repay itself (#490)" for the full account, and `games/court/tests/coinEconomy.test.ts`/
+`dailyPlay.test.ts` for the write-time property this pins.
+
+**The general lesson:** when a ruling moves a value out of the document that used to protect it
+against a torn write, look for an ordering fix before reaching for a second atomicity mechanism —
+"guard + marker in one write, confirmed durable, then the dependent side-effect" recovers the same
+guarantee without needing the two values to share a key.
+
+### Still open: the narrowed dialog has never been seen on a device
+
+When only some of a game's asking groups fork, the dialog narrows to the fields the forking groups
+own (Fork policies above). Court's version of this — hiding all five `court.progress` rows on a
+purchases-only fork, leaving only `Coins`/`NoAds` — is unit-tested with distinguishing assertions,
+but data-correct is not pixels-correct, and nobody has looked at the resulting layout on a device.
+`qa/cases/persistence/cloud-sync-purchases-only-fork-narrowed-dialog.md` (QA-PREFS-0007) is the case
+that exists to close this gap; it stays open until an owner has watched it happen.
+
 ## Gotchas
 
 - **A group is a versioning/transport unit, not a merge unit.** Don't reach for a second group just
@@ -282,8 +394,8 @@ field has a defined merge rule. Fields that need to survive regardless of the ch
   freshly-merged document as stale.
 - **A group's `store.read()` may legitimately seed a default as a side effect** (a new player's
   starting balance). `isFreshAndEmpty` must be written against what the seeded content looks like,
-  not against a hand-built "empty" fixture production never actually constructs — see the tracker's
-  F3 for the near-miss this produced in Court.
+  not against a hand-built "empty" fixture production never actually constructs — F3 in the retired
+  tracker (see "`F<n>` citations" above) is the near-miss this produced in Court.
 - **The transport's `load()` must throw on a read failure, never return `null`.** `null` means "no
   document for this group" and licenses a fresh-install `create`; conflating a read failure with
   "no document" lets an offline device conclude it's brand new and overwrite a real account.
