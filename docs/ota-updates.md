@@ -497,10 +497,11 @@ wrapped by a safety-railed pipeline reachable two ways:
 
 Both surfaces hit `GET /api/ota/publish` (SSE, `engine/plugins/vite-asset-scanner.ts`) which:
 (1) builds **fresh** from the currently-open project's `project.config.json` via
-`build-web.mjs` — never accepts a stale pre-built `dist/`; (2) refuses a version-string
-collision by checking whether `bundles/<name>/<version>/manifest.json` already exists, and
-suggests the next free `vN`; (3) verifies/sets bucket CORS as a non-fatal preflight; (4) runs
-`ota-publish.mjs`. `GET /api/ota/status` and `POST /api/ota/keygen` are plain JSON, served
+`build-web.mjs` — never accepts a stale pre-built `dist/`; (2) verifies/sets bucket CORS as a
+non-fatal preflight; (3) runs `ota-publish.mjs`. The route deliberately carries **no
+version-collision guard of its own** — that decision belongs entirely to `ota-publish.mjs`
+(see "Republishing a version string" below, and the #577 Gotchas entry for what happened when
+the route had a second, weaker one). `GET /api/ota/status` and `POST /api/ota/keygen` are plain JSON, served
 from the transport-agnostic `editorBackendRouter.ts` so they also work in a packaged Electron
 editor. `engine/plugins/backend/gcloud.ts` holds the shared, Vite-import-free helpers both
 routes need: `resolveGcloudDir` (locates the `gcloud` CLI even in a Finder-launched packaged
@@ -513,19 +514,21 @@ it touches a `bash -c` string).
 below on the bundleName restriction; publishing a sub-game bundle is still a manual
 `build-subgame.mjs` + `ota-publish.mjs` invocation, not wired into the UI/MCP surface.
 
-**Republishing a version string: identical is fine, different is refused.** The CLI carries the
-same collision guard the editor route has, but decides by CONTENT rather than by existence: it
-canonically hashes the already-published `manifest.json` and compares it to the one it just
-built. Equal → this is a retry of an identical publish, and it resumes. Different → it refuses,
-because the version string would silently come to mean something else. A probe that cannot read
-the existing object fails **loudly**; it is never read as "no collision".
+**Republishing a version string: identical is fine, different is refused.** `ota-publish.mjs`
+owns this decision — it is the **only** collision guard in the repo, and it decides by CONTENT
+rather than by existence: it canonically hashes the already-published `manifest.json` and
+compares it to the one it just built. Equal → this is a retry of an identical publish, and it
+resumes. Different → it refuses, because the version string would silently come to mean
+something else. A probe that cannot read the existing object fails **loudly**; it is never read
+as "no collision". Every surface — the editor dialog, the MCP tool, a human running the CLI —
+reaches that one guard.
 
 This matters more since #570 than it did before. A publish that fails partway (auth expiry, the
 precondition retry budget exhausted) used to be harmless to retry. Now a version whose
-`manifest.json` landed while its `release.json` entry did not could, under a naive
-existence-only guard, be permanently burned — you would be forced to bump the version and leave
-an orphan tree behind. Hashing instead of merely looking makes the retry the safe operation it
-should be. For the same reason `manifest.json` is uploaded **last**, after `files/` and
+`manifest.json` landed while its `release.json` entry did not would, under an existence-only
+guard, be permanently burned — you would be forced to bump the version and leave an orphan tree
+behind. Hashing instead of merely looking makes the retry the safe operation it should be. No
+existence-only guard survives anywhere in the pipeline (#577). For the same reason `manifest.json` is uploaded **last**, after `files/` and
 `bundle.zip`, so that its presence genuinely means "this version's contents were committed"
 rather than "an upload got partway". `release.json` is still written after everything.
 
@@ -617,15 +620,30 @@ rather than "an upload got partway". `release.json` is still written after every
   instead of silently losing the loser's write. Verified against a real GCS bucket AND with
   a deterministic fake-`gcloud` subprocess test that injects one race
   (`engine/tests/plugins/otaPublishReleaseRace.test.ts`).
-- **The version-collision check now distinguishes "never published" from "gcloud call
-  failed"** (fixed 2026-07-26). The `/api/ota/publish` preflight used to catch ANY
-  `gcloud storage cat` error and treat it as "no collision, proceed" — a transient
-  auth/network blip could let a publish past the one guard meant to stop a rejected version
-  from being silently republished. It now inspects stderr: only "not found: 404" / "matched
-  no objects or files" (the real "never published" cases) are treated as safe; anything else
-  fails the publish loudly with the actual error. The classification is
-  `isGcloudObjectNotFoundError` (`vite-asset-scanner.ts`), extracted the same way and
-  unit-tested alongside `otaPublishBundleNameAllowed`.
+- **The version-collision check distinguishes "never published" from "gcloud call failed"**
+  (fixed 2026-07-26). The preflight used to catch ANY `gcloud storage cat` error and treat it
+  as "no collision, proceed" — a transient auth/network blip could let a publish past the one
+  guard meant to stop a rejected version from being silently republished. It inspects stderr
+  instead: only "not found: 404" / "matched no objects or files" (the real "never published"
+  cases) are safe; anything else fails the publish loudly with the actual error. "Could not
+  check" and "definitely absent" are different answers, and conflating them fails **open** on
+  exactly the errors the guard most needs to catch. The classification is
+  `isGcloudObjectNotFoundError` in `engine/scripts/ota/gcloud.mjs`, unit-tested in
+  `engine/tests/plugins/ota/gcloud.test.ts`.
+- **Two guards disagreeing beat the better one** (#577, fixed 2026-09-02). #570 upgraded
+  `ota-publish.mjs`'s guard from existence to content — but the editor route kept its OWN
+  existence-only copy, and it ran *first*. So the fixed guard was unreachable from the editor
+  dialog and the MCP tool: a partially-failed publish still refused its own identical retry
+  with "Version collision", burning the version string through the primary workflow, while the
+  docs described the problem as solved. The route's check is deleted, not repaired — a guard
+  there would have to recompute what the publish would produce (hash `dist/`, build the zip,
+  build and canonicalize the manifest), i.e. re-implement the script, and the two
+  implementations drifting **is** the bug. `ota-publish.mjs`'s failure message carries the
+  `Try vN+1.` hint and reaches the dialog's log panel and its status line unchanged, so
+  removing the route's copy costs no affordance. The lesson generalizes: **fixing one of two
+  duplicated guards leaves the weaker one deciding**, and the duplication is what to remove.
+  A structural test in `engine/tests/plugins/viteAssetScanner.test.ts` now asserts the route
+  makes no `gcloud storage cat` manifest preflight.
 - **Key-path resolution is no longer duplicated** (fixed 2026-07-26). `ota-publish.mjs`
   used to always derive its own repo root from `import.meta.url`, independently of the
   `/api/ota/publish` route's OWN key-existence precheck (`editorRoot || projectRoot`) — two

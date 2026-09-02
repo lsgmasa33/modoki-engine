@@ -2,8 +2,9 @@
  *  the primary Build → OTA action. Shows what's LIVE on the bucket right now vs what
  *  this project would publish, collects a version string + mandatory flag, then drives
  *  GET /api/ota/publish (SSE) to completion. That endpoint already carries the safety
- *  rails (fresh build from the current project.config.json, version-collision refusal,
- *  CORS preflight) — this dialog is just the human-facing surface over it.
+ *  rails (fresh build from the current project.config.json, CORS preflight) and defers
+ *  the version-collision decision to engine/scripts/ota-publish.mjs (#577) — this dialog
+ *  is just the human-facing surface over it.
  *
  *  Gated by editorStore.otaPublishOpen (opened from Build → Publish OTA Update…). */
 
@@ -155,9 +156,10 @@ export default function PublishOtaDialog() {
       }}>
         <div style={{ color: '#fff', fontSize: 13, marginBottom: 4 }}>Publish OTA Update</div>
         <div style={{ color: '#888', fontSize: 11, marginBottom: 12 }}>
-          Builds fresh from the current project settings, refuses a version already
-          published, verifies bucket CORS, then publishes. Players on a routine (non-
-          mandatory) update pick it up next launch.
+          Builds fresh from the current project settings, verifies bucket CORS, then
+          publishes. Republishing the same version resumes if the contents match, and is
+          refused if they differ or if the bucket can't be read. Players on a routine
+          (non-mandatory) update pick it up next launch.
         </div>
 
         {!enabled && (
@@ -219,7 +221,17 @@ export default function PublishOtaDialog() {
 
         {(publishing || done || failed) && (
           <div style={{ marginBottom: 10 }}>
-            <div style={{ color: failed ? '#e74c3c' : done ? '#2ecc71' : '#ddd', fontSize: 12, marginBottom: 4 }}>
+            {/* `pre-wrap` so a multi-line failure keeps its breaks — a collision refusal ends
+             *  with `Try v19.` and used to collapse into one run-on paragraph. But bound the
+             *  height with it: on failure `statusLine` carries up to 1500 chars of the child's
+             *  interleaved stdout+stderr, and honouring every newline turns ~18 wrapped lines
+             *  into 40+. This container is a flex column with no `overflowY`, so an unbounded
+             *  status pushes the footer — including the Retry button — out of the modal on the
+             *  one screen whose whole purpose is retrying. Scroll it, like the log panel below. */}
+            <div style={{
+              color: failed ? '#e74c3c' : done ? '#2ecc71' : '#ddd', fontSize: 12, marginBottom: 4,
+              whiteSpace: 'pre-wrap', maxHeight: 160, overflowY: 'auto',
+            }}>
               {statusLine}
             </div>
             <div style={{

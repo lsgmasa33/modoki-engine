@@ -525,15 +525,6 @@ export function otaSigningKeyRefusal(
   return keyPublicKey === projectPublicKey ? null : 'mismatch';
 }
 
-/** Classifies a `gcloud storage cat`/`objects describe` failure's stderr: only a genuine
- *  "this object doesn't exist" is safe to treat as "no collision, proceed" — see
- *  ota-updates.md's Gotchas for why treating EVERY gcloud failure (including a transient
- *  auth/network error) as "no collision" was a real gap. Pure — extracted so the
- *  classification itself is unit-testable independent of ever calling gcloud. */
-export function isGcloudObjectNotFoundError(stderr: string): boolean {
-  return /not found: 404|matched no objects or files/i.test(stderr);
-}
-
 /** The build steps for a `playable` target: the single-file inliner build (VITE_PLAYABLE=1 →
  *  games/<id>/ads/index.html) then reveal the ads/ dir. No favicon/deploy/native — the one HTML IS
  *  the artifact. Pure — extracted from the /api/build handler so the routing is unit-testable. */
@@ -2827,7 +2818,8 @@ export function assetScannerPlugin(): Plugin {
         // release's value (sticky — see ota-publish.mjs's own header comment).
         // Wraps engine/scripts/ota-publish.mjs with the safety rails the plan doc calls
         // for: build FRESH from the current project.config.json (never accept a stale
-        // pre-built dist/), refuse a version-string collision, verify/set bucket CORS.
+        // pre-built dist/), verify/set bucket CORS. The version-collision decision
+        // belongs to ota-publish.mjs alone, not this route (#577) — see Step 3 below.
         if ((req.url === '/api/ota/publish' || req.url?.startsWith('/api/ota/publish?')) && req.method === 'GET') {
           const url = new URL(req.url, 'http://localhost');
           const version = url.searchParams.get('version');
@@ -2985,48 +2977,23 @@ export function assetScannerPlugin(): Plugin {
             if (aborted) return;
             if (!build.ok) { sendStatus(`FAILED:Building web assets\n${build.output.slice(-1500)}`); res.end(); return; }
 
-            // Step 2: refuse a version-string collision. release.json only tracks the
-            // CURRENT live version, not history, so check the versioned manifest object
-            // itself — a device that already rejected this version must never see it
-            // "successfully" republished with different bytes.
-            sendStatus('Checking for a version collision...');
-            const manifestPath = `${bucket}/bundles/${bundleName}/${version}/manifest.json`;
-            let manifestExists = false;
-            try {
-              execFileSync('gcloud', ['storage', 'cat', manifestPath], { env: gcloudEnv, stdio: ['ignore', 'ignore', 'pipe'] });
-              manifestExists = true;
-            } catch (e) {
-              // A missing object is the ONLY case that means "safe to proceed" — `gcloud
-              // storage cat` reports it as "not found: 404" or "matched no objects" on
-              // stderr. Anything else (auth expired, network blip, wrong bucket
-              // permissions) must NOT be silently treated as "no collision": that would
-              // let a publish proceed past the one guard that stops a device which
-              // already rejected this version string from being served it again under a
-              // "successful" republish. Fail loudly instead — the human re-runs once
-              // whatever's actually wrong (e.g. `gcloud auth login`) is fixed.
-              const stderr = (e as { stderr?: Buffer | string })?.stderr?.toString() ?? '';
-              if (isGcloudObjectNotFoundError(stderr)) {
-                // manifestExists is already false (the declaration default).
-              } else {
-                sendStatus(`FAILED:Could not check for a version collision\n${stderr || (e instanceof Error ? e.message : String(e))}`);
-                res.end();
-                return;
-              }
-            }
-            if (aborted) return;
-            if (manifestExists) {
-              const m = version.match(/^v(\d+)$/);
-              const hint = m ? ` Try v${Number(m[1]) + 1}.` : '';
-              sendStatus(`FAILED:Version collision\n"${bundleName}@${version}" is already published under ${bucket}. Publishing again would silently never reach any device that already rejected these bytes once.${hint}`);
-              res.end();
-              return;
-            }
-
-            // Step 3: verify/set bucket CORS (GCS sets none by default; `gcloud`/`curl`
+            // Step 2: verify/set bucket CORS (GCS sets none by default; `gcloud`/`curl`
             // ignore CORS entirely, so nothing catches a missing policy until a real
             // WebView fetch() fails — and checkForUpdate reports that as the generic
             // no-release-for-bundle, i.e. silently). Non-fatal: a permissions error here
             // shouldn't block publishing, just gets logged as a warning.
+            // ⚠️ This write now happens before the collision check INSIDE ota-publish.mjs
+            // (Step 3) — the route itself has no such check; #577 deleted it, it was not
+            // reordered. So a publish about to be refused for a genuine version collision
+            // has already REPLACED the bucket's whole CORS config (`--cors-file` is not a
+            // merge) with the `origin:['*']` policy below, clobbering any hand-tuned origin
+            // list. Accepted, not an oversight — but note the reason is NOT that moving CORS
+            // below Step 3 is impossible: Step 3 returns early on `!publish.ok`, so a refused
+            // publish would simply never reach the write. The real cost of moving it is a
+            // window where a BRAND-NEW bucket serves the just-published release with no CORS
+            // until the write lands, and a device polling in that window sees the generic
+            // no-release-for-bundle — i.e. a silent failure on the first publish, traded for
+            // a recoverable config clobber on a refused one. Worth revisiting, not settled.
             sendStatus('Verifying bucket CORS...');
             const bucketRoot = bucket.match(/^gs:\/\/[^/]+/)?.[0];
             if (bucketRoot) {
@@ -3041,7 +3008,16 @@ export function assetScannerPlugin(): Plugin {
             }
             if (aborted) return;
 
-            // Step 4: the actual publish.
+            // Step 3: the actual publish. This route has NO version-collision guard of its
+            // own on purpose — `ota-publish.mjs` is the single source of truth for that
+            // decision, and it decides by manifest CONTENT (identical bytes → a legitimate
+            // retry of a publish that died after upload; different bytes → refuse). This
+            // route used to duplicate that check by manifest EXISTENCE and, running first,
+            // never let the content-based guard get reached — refusing exactly the
+            // identical-contents retry it exists to allow (#577). A guard here would have to
+            // recompute what THIS publish would produce (hash dist/, build the zip, build
+            // the manifest, canonicalize) to compare against — i.e. re-implement the script
+            // — and the two implementations drifting is this bug. Don't re-add it.
             sendStatus('Publishing...');
             const mandatoryFlag = mandatoryParam === true ? ' --mandatory' : mandatoryParam === false ? ' --no-mandatory' : '';
             const publish = await runStep(

@@ -267,16 +267,19 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_ota_publish',
     'Publish an OTA update for the open project (docs/ota-updates.md): builds FRESH from the ' +
-      "current project.config.json (never a stale dist/), refuses a version string that's " +
-      "already published (suggests the next free vN), verifies/sets the bucket's CORS, then " +
-      'runs ota-publish.mjs. Requires ota.enabled + a signing key already generated ' +
+      "current project.config.json (never a stale dist/), verifies/sets the bucket's CORS, then " +
+      'runs ota-publish.mjs. Republishing a version string is decided by CONTENT, not by whether ' +
+      'the version exists: an already-published version with IDENTICAL contents RESUMES (so ' +
+      'retrying a publish that died partway is safe and expected), one with DIFFERENT contents is ' +
+      'refused with a next-free-vN hint, and a bucket that cannot be read fails loudly rather than ' +
+      'being read as "no collision". Requires ota.enabled + a signing key already generated ' +
       '(modoki_ota_keygen). Consumes the stream to completion — can take a minute+.\n\n' +
       'REFUSED when the editor has UNSAVED live-world changes: this builds from the scene FILE and ' +
       'ships the result to INSTALLED APPS, so unsaved work would be missing from a real release. ' +
       'Run modoki_save_all, or pass force:true to publish the on-disk state deliberately.',
     {
-      version: z.string().describe('New version string, e.g. "v18". Must not already be published for this bundleName.'),
-      mandatory: z.boolean().optional().describe('Mandatory update: blocks with a restart-to-continue gate instead of applying next launch.'),
+      version: z.string().describe('New version string, e.g. "v18". Reusing one already published for this bundleName is refused UNLESS the publish would produce byte-identical contents, in which case it resumes as a retry.'),
+      mandatory: z.boolean().optional().describe('Mandatory update: blocks with a restart-to-continue gate instead of applying next launch. true sets it, false CLEARS it, omitted INHERITS the current release\'s mandatory flag (sticky).'),
       bundleName: z.string().optional().describe('Must equal (or be omitted, defaulting to) this project\'s own project.config.json ota.bundleName — the server refuses any other value. This route always builds the CURRENTLY OPEN project as a normal web build and publishes it as itself; it does NOT build/publish a Phase 4 sub-game module bundle (that needs build-subgame.mjs + a manual publish, not this tool). To publish a sub-game, open ITS OWN project and call this tool there.'),
       key: z.string().optional().describe('Signing key name under build/ota-keys/<key>.json (default "default").'),
       bucket: z.string().optional().describe('gs://bucket[/prefix] override — only needed when ota.baseUrl is a custom CDN domain that cannot be reverse-derived to its gs:// form.'),
@@ -302,17 +305,22 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
         }
       }
       const qs = new URLSearchParams({ version });
-      if (mandatory) qs.set('mandatory', '1');
+      // Tri-state must round-trip: true → '1', false → '0', omitted → no param at all (the
+      // route reads absence as "inherit the existing release's value"). `if (mandatory)`
+      // silently collapsed false into "omitted", so mandatory:false shipped as inherited —
+      // an update meant to be routine could ship MANDATORY with no error anywhere.
+      if (mandatory !== undefined) qs.set('mandatory', mandatory ? '1' : '0');
       if (bundleName) qs.set('bundleName', bundleName);
       if (key) qs.set('key', key);
       if (bucket) qs.set('bucket', bucket);
       // 35 min, NOT 5 (independent review, 2026-07-30). A publish does strictly MORE than
       // modoki_build's 30-minute web build: the same build, then a `gcloud storage rsync` of the
       // whole dist plus a zip upload. On the client's abort the server SIGTERMs the active child,
-      // so the old 5-minute budget killed a slow-but-HEALTHY publish part-way — and because
-      // ota-publish.mjs uploads content → manifest.json → bundle.zip → release.json LAST, the
-      // interrupted state leaves a versioned manifest with no release: that version is poisoned,
-      // and the retry reads as "already published". The timeout must not be tighter than the work.
+      // so the old 5-minute budget killed a slow-but-HEALTHY publish part-way, leaving a partial
+      // upload behind. That is no longer poisonous — ota-publish.mjs uploads files/ → bundle.zip →
+      // manifest.json → release.json LAST (manifest.json moved to last in #570 so its presence
+      // means the contents were committed), and the collision guard compares manifest CONTENT, so
+      // an identical retry resumes (#577). Still: the timeout must not be tighter than the work.
       return consumeBuildStream(`/api/ota/publish?${qs}`, 35 * 60_000);
     },
   );

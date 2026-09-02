@@ -235,6 +235,27 @@ describe('§5 — classification: the code must match what actually went wrong',
     expect(s.requests.some((r) => r.path.startsWith('/api/ota/publish'))).toBe(true);
   });
 
+  // The `mandatory` query param is read as a TRI-STATE by the route (vite-asset-scanner.ts):
+  // '1' sets it, '0' clears it, ABSENT inherits the existing release's value — matching
+  // ota-publish.mjs's sticky-mandatory CLI contract. `if (mandatory) qs.set('mandatory', '1')`
+  // silently collapsed `mandatory:false` into "absent" (inherit), so an agent asking for a
+  // ROUTINE update on a currently-mandatory release shipped it mandatory anyway, with the success
+  // echo printing `mandatory=unchanged` and nothing contradicting the caller.
+  it('ota_publish sends the mandatory tri-state faithfully: true, false and omitted are THREE distinct wire states', async () => {
+    const s = (surface = loadSurface());
+    await s.call('modoki_ota_publish', { version: 'v10', mandatory: true, force: true });
+    expect(s.requests.find((r) => r.path.startsWith('/api/ota/publish'))!.path).toContain('mandatory=1');
+
+    const s2 = (surface = loadSurface());
+    await s2.call('modoki_ota_publish', { version: 'v10', mandatory: false, force: true });
+    expect(s2.requests.find((r) => r.path.startsWith('/api/ota/publish'))!.path).toContain('mandatory=0');
+
+    const s3 = (surface = loadSurface());
+    await s3.call('modoki_ota_publish', { version: 'v10', force: true });
+    const omittedPath = s3.requests.find((r) => r.path.startsWith('/api/ota/publish'))!.path;
+    expect(omittedPath).not.toContain('mandatory=');
+  });
+
   it('a no-op the caller asked to CHANGE is refused, not reported as done', async () => {
     const s = (surface = loadSurface());
     const e = envelope(s, await s.call('modoki_set_transform', { entity: { name: 'Capsule' }, space: 'local' }));

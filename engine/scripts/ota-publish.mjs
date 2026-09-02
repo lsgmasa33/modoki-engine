@@ -40,6 +40,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildManifestFiles } from './ota/buildManifest.mjs';
+import { isGcloudObjectNotFoundError } from './ota/gcloud.mjs';
 import { createManifest, createRelease, manifestHashPayload, validateManifest, validateRelease } from './ota/schema.mjs';
 import { signRelease } from './ota/signing.mjs';
 import { buildZipFromDir } from './ota/zip.mjs';
@@ -66,15 +67,6 @@ function parseArgs(argv) {
 function fail(msg) {
   console.error(`[ota-publish] ${msg}`);
   process.exit(1);
-}
-
-/** Mirrors engine/plugins/vite-asset-scanner.ts's `isGcloudObjectNotFoundError` — not
- *  imported (that file is a Vite plugin module, not meant to be pulled into this
- *  standalone CLI), but the two MUST agree: `gcloud storage cat`/`describe` report a
- *  missing object as "not found: 404" or "matched no objects" on stderr, and that is the
- *  ONLY stderr shape that means "safe to proceed" for the collision check below. */
-function isGcloudObjectNotFoundError(stderr) {
-  return /not found: 404|matched no objects or files/i.test(stderr);
 }
 
 async function main() {
@@ -131,9 +123,13 @@ async function main() {
   console.log(`[ota-publish] Bundle manifest: sha256 ${manifestHash}.`);
 
   // Refuse a version-string collision that would change what an already-published version
-  // MEANS — mirrors the editor's own `/api/ota/publish` route (engine/plugins/vite-asset-scanner.ts,
-  // "Step 2: refuse a version-string collision"). release.json only tracks the CURRENT live
-  // version, not history, so the versioned manifest object itself is the thing to check.
+  // MEANS. This script is the SINGLE SOURCE OF TRUTH for that decision, reached by every
+  // publishing surface (the editor's `/api/ota/publish` route, the MCP `modoki_ota_publish`
+  // tool, direct CLI use) — the editor route deliberately carries no collision guard of its
+  // own any more (#577: a duplicate existence-based guard there ran first and refused the
+  // exact identical-contents retry this guard exists to allow). release.json only tracks the
+  // CURRENT live version, not history, so the versioned manifest object itself is the thing
+  // to check.
   //
   // Checked HERE, after `manifestHash` is computed (not before, as an earlier version of
   // this guard did) — that ordering is load-bearing. A version's manifest.json is now

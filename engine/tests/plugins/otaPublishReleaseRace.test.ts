@@ -582,9 +582,9 @@ describe('ota-publish.mjs version-collision guard', () => {
     expect(first.status).toBe(0);
 
     // Simulate an auth/permissions failure reading the EXISTING versioned manifest.json —
-    // this is the one path where a wrong regex in isGcloudObjectNotFoundError (or any
-    // other "treat unknown as safe" bug) would silently disable the guard entirely, and
-    // nothing else in the suite pins it.
+    // this is the one path where a wrong regex in engine/scripts/ota/gcloud.mjs's
+    // isGcloudObjectNotFoundError (or any other "treat unknown as safe" bug) would silently
+    // disable the guard entirely, and nothing else in the suite pins it.
     const second = publish('shell', 'v1', { FAKE_GCS_MANIFEST_CAT_UNAUTHORIZED: '1' });
     expect(second.status).not.toBe(0);
     expect(second.stderr).toMatch(/could not check for a version collision/i);

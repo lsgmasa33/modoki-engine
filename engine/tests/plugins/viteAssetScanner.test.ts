@@ -20,7 +20,7 @@ import {
   handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
   isUnderAssetRoot,
   isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps,
-  otaPublishBundleNameAllowed, otaSigningKeyRefusal, isGcloudObjectNotFoundError,
+  otaPublishBundleNameAllowed, otaSigningKeyRefusal,
   otaPublishBuildStepEnv,
   type AssetRoot,
 } from '../../plugins/vite-asset-scanner';
@@ -1342,21 +1342,105 @@ describe('otaPublishBuildStepEnv (/api/ota/publish native-build env)', () => {
   });
 });
 
-describe('isGcloudObjectNotFoundError (version-collision preflight)', () => {
-  it('recognizes the "not found: 404" form (gcloud storage cat on a missing object)', () => {
-    expect(isGcloudObjectNotFoundError('ERROR: (gcloud.storage.cat) gs://bucket/x not found: 404.')).toBe(true);
+// #577: the /api/ota/publish route used to run its OWN version-collision check by manifest
+// EXISTENCE (a `gcloud storage cat .../manifest.json` preflight), and — running before
+// ota-publish.mjs's content-based check — that weaker guard short-circuited the stronger
+// one, permanently burning a version string for a publish that died after upload but
+// produced IDENTICAL bytes on retry. The route is an SSE handler that is not exported, so
+// this asserts against the route's source text directly. Deliberately brittle: it isolates
+// the handler body with stable anchors and fails LOUDLY (not vacuously) if either anchor
+// goes missing, so the test cannot silently stop checking anything.
+describe('/api/ota/publish route has no collision guard of its own (#577)', () => {
+  const source = fs.readFileSync(path.join(PROJECT_ROOT, 'engine/plugins/vite-asset-scanner.ts'), 'utf8');
+  const START_ANCHOR = "req.url === '/api/ota/publish'";
+  const END_ANCHOR = '})().finally(otaRelease.onPipelineEnd);';
+
+  /** The route is an SSE handler, not an exported function, so the only reachable check is
+   *  on its source text. Throws rather than returning empty when an anchor moves — a
+   *  region this cannot find must fail the suite, never silently shrink to nothing. */
+  const routeBody = (): string => {
+    const startIdx = source.indexOf(START_ANCHOR);
+    const endIdx = source.indexOf(END_ANCHOR);
+    if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+      throw new Error(
+        `#577 regression test: could not isolate the /api/ota/publish handler in ` +
+        `vite-asset-scanner.ts (start anchor ${JSON.stringify(START_ANCHOR)} ` +
+        `${startIdx === -1 ? 'MISSING' : 'ok'}, end anchor ${JSON.stringify(END_ANCHOR)} ` +
+        `${endIdx === -1 ? 'MISSING' : endIdx <= startIdx ? 'BEFORE START' : 'ok'}). The route was ` +
+        `moved or reworded. Re-point the anchors, then confirm the assertions below still cover ` +
+        `the intended region before trusting a green run.`,
+      );
+    }
+    return source.slice(startIdx, endIdx + END_ANCHOR.length);
+  };
+
+  /** Comment lines removed so the assertions below are about CODE only. Without this the
+   *  guard forbids DESCRIBING itself: a maintainer writing "do not re-add the `gcloud
+   *  storage cat .../manifest.json` preflight here" would turn the suite red with a message
+   *  telling them the code does the thing their comment says not to do — in a repo whose
+   *  convention is heavy explanatory comments, that lands fast. Deliberately conservative:
+   *  only lines whose trimmed form OPENS a comment are dropped, never a trailing `//` on a
+   *  line of code, because `'https://…'` inside a real call would take the code with it and
+   *  turn a false positive into a false NEGATIVE — the direction that actually costs.
+   *
+   *  Two known edges, neither worth code today (both checked against this file's real style):
+   *  a block comment whose continuation lines do NOT start with `*` keeps those lines, so
+   *  describing the preflight in that style still turns this red — fails SAFE, just noisy.
+   *  A line that opens `/*` and closes it before real code (`/* c8 ignore next *​/ execFile…`)
+   *  is dropped whole and WOULD evade both assertions — that is the false-negative shape to
+   *  watch; `^\s*\/\*.*\*\/\s*\S` currently matches nowhere in the plugin sources. */
+  const routeCode = (): string => routeBody()
+    .split('\n')
+    .filter((line) => !/^\s*(\/\/|\/\*|\*)/.test(line))
+    .join('\n');
+
+  it('isolates the route handler body between stable start/end anchors', () => {
+    expect(routeBody().length).toBeGreaterThan(0);
+    // The strip must not eat the body whole — a `routeCode()` of nothing would pass every
+    // assertion below for the wrong reason.
+    expect(routeCode()).toContain('ota-publish.mjs');
   });
 
-  it('recognizes the "matched no objects or files" form', () => {
-    expect(isGcloudObjectNotFoundError('ERROR: (gcloud.storage.cat) The following URLs matched no objects or files:\ngs://bucket/x')).toBe(true);
+  // ⚠️ Scope, stated honestly: this catches a re-add written INLINE in this route. It cannot
+  // see a guard hidden behind a helper — `engine/plugins/backend/gcloud.ts` already exists as
+  // the shared home for exactly this kind of call, and a preflight written as
+  // `if (await readGcsJson(bucket, …))` would put no matching text in this region at all.
+  // Nothing structural can cover that; the real defence there is the Step 3 comment and the
+  // #577 Gotchas entry in docs/ota-updates.md.
+  //
+  // Two order-independent assertions rather than one ordered regex, because the deleted code
+  // built `manifestPath` on a line ABOVE its `execFileSync('gcloud', […])` — a single
+  // `gcloud → storage → cat → manifest.json` pattern does NOT match the very code this
+  // guards against (verified by running one over the pre-fix source). A guard that only
+  // catches re-adds shaped like its own mutation test is not a guard.
+  it('never names a versioned manifest.json — nothing here may reason about one', () => {
+    expect(
+      routeCode().includes('manifest.json'),
+      '#577: the /api/ota/publish route must not reference a bundle manifest at all. It used to ' +
+      'build `bundles/<name>/<version>/manifest.json` for an EXISTENCE-based collision preflight ' +
+      'that ran BEFORE ota-publish.mjs and short-circuited that script\'s CONTENT-based guard, ' +
+      'permanently refusing a legitimate identical-bytes retry through the editor dialog and the ' +
+      'MCP tool. ota-publish.mjs is the single source of truth — see the Step 3 comment in the ' +
+      'route for why a guard here would just re-implement the script.',
+    ).toBe(false);
   });
 
-  it('does NOT treat an auth/network error as "not found" — the ambiguity fix', () => {
-    // Before this fix, ANY gcloud failure (including these) was silently treated as "no
-    // collision, proceed" — letting a publish past the guard meant to catch a version a
-    // device already rejected. See ota-updates.md's Gotchas.
-    expect(isGcloudObjectNotFoundError('ERROR: You do not currently have an active account selected.')).toBe(false);
-    expect(isGcloudObjectNotFoundError('ERROR: (gcloud.storage.cat) HTTPError 403: Permission denied')).toBe(false);
-    expect(isGcloudObjectNotFoundError('')).toBe(false);
+  it('never reads bucket objects — not via `cat`, `ls`, or `objects describe`', () => {
+    // `cat` is how the removed preflight worked, but existence is just as readable with
+    // `storage ls <version-prefix>/` or `storage objects describe`, and a re-add would
+    // plausibly reach for either — so all three are refused. Matches the arg-array form
+    // (`'storage', 'cat'`) and a bash-string form alike. The CORS step's legitimate
+    // `gcloud storage buckets update` must NOT be flagged; the baseline run proves it isn't.
+    const objectRead = /['"`\s]storage['"`,\s]+['"`]?(cat|ls|objects['"`,\s]+['"`]?describe)\b/i;
+    expect(
+      objectRead.test(routeCode()),
+      '#577: the /api/ota/publish route must not read bucket objects to decide anything. ' +
+      'An existence-only collision preflight (`gcloud storage cat`, or an `ls`/`objects ' +
+      'describe` standing in for it) ran BEFORE ota-publish.mjs and short-circuited its ' +
+      'content-based guard. Reading an object here to gate the publish reintroduces a second ' +
+      'guard that races the one in ota-publish.mjs — and the two drifting IS the bug. ' +
+      '(Setting CORS via `gcloud storage buckets update` is fine and is not matched.)',
+    ).toBe(false);
   });
 });
+
