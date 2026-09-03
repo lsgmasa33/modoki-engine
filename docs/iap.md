@@ -504,12 +504,38 @@ someone re-attaches it and unknowingly tests against a stale product list.
   stale-fire guard cannot rescue; **(b)** `handleOnDestroy()` drops anything posted, since an armed
   timer strongly holds the `PluginCall` → `Bridge` → `WebView` → `Activity`; **(c)** the fire path
   unparks BEFORE resolving, matching every other settle site.
-  ⚠️ **What the device session verified was the TIMER MECHANISM, not this arm site.** Parked
-  10:50:25.955 → fired 10:55:25.956 → JS promise resolved `{transaction:null}` → a second
-  `launchBillingFlow` launched → zero `already in progress`. That was the park-time build, because
-  the no-match branch needs Play to deliver an OK purchase list without the awaited product, which is
-  precisely why #583 was filed as a static-analysis finding and never reproduced. The arm site is
-  therefore covered by the source guards and by reasoning, not by a device trace — treat it as such.
+  ✅ **The whole chain is device-verified, arm site included — and #583 was reproduced, which it
+  never had been.** The issue shipped as static analysis because nobody could make Play deliver an
+  OK list without the awaited product. The recipe, measured on the A23 on 2026-09-03, is a
+  **licence tester's SLOW test instrument** (the sheet's payment-method row offers "approves in a
+  few minutes" alongside "always approves" — the latter settles instantly and is useless here):
+
+  1. Buy product A on the slow card -> `delivered: products=[A] state=2` (PENDING, `order=null`).
+     That delivery MATCHES A, so it settles A's own call normally.
+  2. Park a DIFFERENT product B while A is still pending.
+  3. A's approval lands as `delivered: products=[A] state=1` while B is awaited — the no-match
+     branch, reached for the first time on hardware.
+
+  ```
+  14:20:15.816  delivered: products=[court.coins.1000] state=2      <- PENDING, slow card
+  14:20:54.781  launchBillingFlow: court.coins.2500                 <- B parked
+  14:21:15.040  delivered: products=[court.coins.1000] state=1      <- A approves
+  14:21:15.042  delivery does not contain the awaited product (court.coins.2500)   <- ARM
+  14:26:15.045  purchase timeout: ... within 300000ms of the last non-matching one <- FIRE (+300003ms)
+  14:27:22.142  onPurchasesUpdated: code=1 parkedCall=FALSE         <- slot already free
+  ```
+
+  The last line is the load-bearing one: dismissing the sheet afterwards reported the slot as
+  already empty, from a different code path than the one that released it, so the FIELD was cleared
+  and not merely logged. The JS promise resolved `{transaction:null}`.
+
+  ⚠️ **And the game is RUNNING the whole time the sheet is up** — measured behind an open sheet in
+  the same session: `document.visibilityState` `"visible"`, `document.hidden` false, and **46
+  requestAnimationFrame ticks in 1010 ms**. `ProxyBillingActivity` is translucent, so the host
+  Activity pauses and never stops; the WebView keeps rendering and the main looper keeps delivering,
+  which is why a `Handler` timer fires normally there. Do not assume the app is suspended behind a
+  purchase sheet — it is live, and killable, with no background edge having fired (see the
+  PlayerPrefs consequence above).
 
 - ⚠️ **The precondition that DOES gate it is a Play LICENCE-TESTER account on a published app.**
   Court is on internal testing (#370), and the human confirmed the sheet shows the real price against
