@@ -27,6 +27,7 @@ vi.mock('../../packages/modoki/src/runtime/ui/UINode', () => ({
 }));
 
 import { UIRenderer } from '../../packages/modoki/src/runtime/ui/UIRenderer';
+import { resetSafeAreaInsets } from '../../packages/modoki/src/runtime/ui/safeArea';
 
 const node = () => ({ id: 1, children: [] } as unknown);
 
@@ -48,7 +49,9 @@ beforeEach(() => {
   restoreW = defineClient('clientWidth', 400);
   restoreH = defineClient('clientHeight', 800);
 });
-afterEach(() => { restoreW(); restoreH(); delete (globalThis as any).ResizeObserver; });
+// UIRenderer registers its container with safeArea (module state, #612) — drop it so a detached
+// container does not stay registered, with its probes and observer, across tests in this file.
+afterEach(() => { resetSafeAreaInsets(); restoreW(); restoreH(); delete (globalThis as any).ResizeObserver; });
 
 const vmin = (el: Element | null) => (el as HTMLElement | null)?.style.getPropertyValue('--ui-vmin');
 

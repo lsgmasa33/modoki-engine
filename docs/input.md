@@ -800,13 +800,17 @@ an ordinary primary press, so a game that drags on the primary pointer must gate
   deliberately EXCLUDES a press that starts on a pointer-block root (the DOM/UI chrome layer;
   `pointerDown(world)` is the game canvas's own gesture, not "is anything being touched
   anywhere"), so something that specifically needs to know a native TOUCH gesture is live on DOM
-  chrome (Court: deferring a forced-layout probe off a touch-scroll on a `UIScrollView` box)
-  cannot be answered by `Input` at all. That module owns the raw listeners itself, at engine
-  scope, and exposes `wireDomGestureTracking`/`unwireDomGestureTracking`/`isDomGestureActive` — a
-  game reads the accessor (fine; the guard only forbids adding a NEW raw listener in game code,
-  not reading an engine one) and calls the wire/unwire pair from its own register/unregister
-  hooks. Reach for `Input.pointer` first; this exists only for the DOM-chrome case that resource
-  cannot see.
+  chrome (Court's `relayoutBoardIfHostMoved`: deferring the every-frame `getBoundingClientRect`
+  re-measurement it uses to detect the board's host resizing/rotating, while a touch-scroll is
+  live on a DOM list like the store or the level selector, so it doesn't stall WebKit's
+  touch-scroll compositor the same way — the module's original motivating consumer, a
+  `getSafeAreaInsets()` forced-layout probe deferred the same way, was fixed in the mechanism
+  itself and no longer needs this gate, #612) cannot be answered by `Input` at all. That module
+  owns the raw listeners itself, at engine scope, and exposes
+  `wireDomGestureTracking`/`unwireDomGestureTracking`/`isDomGestureActive` — a game reads the
+  accessor (fine; the guard only forbids adding a NEW raw listener in game code, not reading an
+  engine one) and calls the wire/unwire pair from its own register/unregister hooks. Reach for
+  `Input.pointer` first; this exists only for the DOM-chrome case that resource cannot see.
 - **Touch needs `touch-action: none` on the game canvas.** The pointer source can only see a drag the
   browser lets it keep — on Android/iOS a touch over a scrollable/zoomable element is reclaimed for a
   scroll/pinch gesture, which fires `pointercancel` mid-drag (bands flash then vanish; the aim aborts).

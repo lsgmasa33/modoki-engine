@@ -42,6 +42,7 @@ import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
 import { transformPropagationSystem, deactivatedEntities } from '../../src/runtime/core/ecs/transformPropagationSystem';
 import { uiTreeProjection, markUIDirty } from '../../src/runtime/ui/uiTreeStore';
 import { UIRenderer } from '../../src/runtime/ui/UIRenderer';
+import { resetSafeAreaInsets } from '../../src/runtime/ui/safeArea';
 
 // jsdom lacks ResizeObserver (UIRenderer observes its container). Minimal no-op stub.
 class NoopRO { observe() {} disconnect() {} unobserve() {} }
@@ -62,6 +63,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // See pointerBlockRootsIntegration: UIRenderer registers with safeArea (#612); drop it so a
+  // detached container does not stay registered across tests in this file.
+  resetSafeAreaInsets();
   cleanup();
   world.destroy();
   deactivatedEntities.clear();

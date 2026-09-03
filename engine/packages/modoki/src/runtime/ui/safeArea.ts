@@ -17,16 +17,61 @@
  *  through the normal cascade, so this returns the simulated inset in the editor and the
  *  real one on the phone, with no branch and no way for the two to disagree.
  *
- *  The probe must live INSIDE the UI root for that to work: `--ui-sa-*` is set on the
+ *  The probes must live INSIDE the UI root for that to work: `--ui-sa-*` is set on the
  *  preview container, so a probe on `document.body` would sit outside the cascade and
  *  read a confident, wrong 0 in every editor preview.
  *
  *  Returns zeros before the UI layer has mounted (a headless test, a game with no UI, a
  *  system running before first paint). Zero is the honest answer there — it is what a
  *  device with no notch reports — and it degrades to the pre-safe-area behaviour rather
- *  than to something arbitrary. */
-
-import { rawNow } from '../core/clock';
+ *  than to something arbitrary.
+ *
+ *  ── How the value stays fresh: a PUSH signal, not a poll (#612) ──────────────────────
+ *
+ *  ⚠️ **The probes are SIZED BY the inset, and that is the whole mechanism.** An inset
+ *  changing fires no event of its own, and for four issues (#273 → #579 → #592 → #600)
+ *  this file's answer was to re-measure on a throttle from inside the read — a poll,
+ *  carrying a staleness throttle, a deferred measurement, an arming signal, a spend bound,
+ *  a root-identity check, and a gesture gate living in `games/court/` because the forced
+ *  layout it caused had to be kept out of a touch scroll. All of that is gone. When an
+ *  element's HEIGHT is `env(safe-area-inset-top)`, an inset change resizes that element,
+ *  and a `ResizeObserver` on it fires — so there IS a push signal, and the value is
+ *  written from the observer callback off layout the browser has already settled, with nothing
+ *  to bound. (The callback is not literally DOM-free: it makes a `getClientRects` call per entry
+ *  and reads the root's `clientWidth`/`clientHeight`. See `onProbeResize` for what each is for,
+ *  and for the one case where those reads can still cost a reflow.)
+ *
+ *  ⚠️ **Sizing the probe is load-bearing — the OBVIOUS implementation silently never
+ *  fires.** `ResizeObserver` reports the CONTENT box by default. The probe this file used
+ *  until #612 was deliberately `width:0; height:0` with the inset in its PADDING (that
+ *  shape kept it out of flow and clamped negatives to 0 for free), so its content box was
+ *  0×0 before and after, forever. Measured on the device this whole mechanism exists for
+ *  (Galaxy A23 / Android 13, Court, real WebView, driving the bars via `SystemBars`):
+ *  across three real inset transitions the SIZED probes fired every time with the correct
+ *  values (top 28→32, bottom 0→48, and back), while the padding-shaped probe fired exactly
+ *  once — its initial observation — and never on a change. Anyone re-shaping these probes
+ *  must either keep them sized, or observe `{box:'border-box'}` and read `borderBoxSize`,
+ *  NEVER `contentRect`. Bolting an observer onto the old shape would pass review, ship,
+ *  and fail on device with no error.
+ *
+ *  ⚠️ **`env(...)` carries an explicit `0px` fallback and the size is wrapped in `max(0px,
+ *  …)`. Both are guards, not decoration, and this is where a sized probe is MORE dangerous
+ *  than the padding one it replaces.** `padding` clamps a negative to 0 and cannot be
+ *  `auto`; `height` can be both. Measured in Chromium and WebKit: an `env()` the engine
+ *  does not know makes the whole declaration invalid, so height falls back to `auto` and
+ *  the probe reports ITS OWN CONTENT HEIGHT as the inset — a confident, wrong, non-zero
+ *  number (18px in the probe used to measure it). `max()` does not save that; the `0px`
+ *  fallback inside `env()` does, and was measured to give 0 in both engines. `overflow:
+ *  hidden` and the probes never being given content are the second belt.
+ *
+ *  ⚠️ Note this deliberately differs from `anchorCss.ts`'s `var(--ui-sa-<edge>,
+ *  env(safe-area-inset-<edge>))`, which has no inner fallback and does not need one: there
+ *  the expression sits inside `max(<padding>, …)` on a `padding` property, where an invalid
+ *  value drops the declaration and yields no padding — safe. Do not "align" the two.
+ *
+ *  The observer writes module state only — never the DOM, never React state — so it cannot
+ *  produce the "ResizeObserver loop completed with undelivered notifications" warning that
+ *  `UIRenderer`'s own observer has to rAF-defer around. */
 
 export interface SafeAreaInsets {
   /** Logical px. */
@@ -56,335 +101,316 @@ const ZERO: SafeAreaInsets = {
 };
 
 let insets: SafeAreaInsets = { ...ZERO };
-/** The UI root to re-measure from, remembered so a READ can refresh itself. */
+/** The UI root the probes live in, remembered so a read can tell a live root from a detached one. */
 let root: HTMLElement | null = null;
-let lastMeasuredAt = -Infinity;
-/** Set while a deferred re-measure (below) is queued, so a burst of calls inside one throttle
- *  window schedules exactly one `requestAnimationFrame`, not one per call. */
-let refreshQueued = false;
-/** The queued frame's id, so `resetSafeAreaInsets` can cancel a real in-flight callback rather
- *  than merely clearing the flag that gates scheduling a NEW one — found in review (#579
- *  follow-up): a reset with a refresh in flight otherwise left `refreshQueued` stuck `true`
- *  (suppressing every future refresh) and left a stray callback able to run against whatever
- *  the NEXT test/session registers. */
-let refreshFrameId: ReturnType<typeof requestAnimationFrame> | null = null;
 
-/** How stale a cached inset may get, ms. Small enough that a bar hiding is invisible to
- *  the eye, large enough that a per-frame caller pays one forced style read every ~15
- *  frames instead of 60. */
-const REFRESH_MS = 250;
+/** The two probes. Two, not four, because one element carries two edges: its WIDTH is one
+ *  horizontal inset and its HEIGHT one vertical inset, and `contentRect` delivers both in a
+ *  single observation. `probeTL` is top+left, `probeBR` is bottom+right.
+ *
+ *  ⚠️ **ONE root is probed at a time, module-globally — and in the EDITOR that root alternates.**
+ *  Both viewports mount a `UIRenderer` (SceneView's preview frame and GameView), each with its own
+ *  observer calling `measureSafeAreaInsets` with a DIFFERENT element, so every alternating resize
+ *  tears the probes off one root and rebuilds them on the other. That is correct and was true of
+ *  the old design too (`root` has always been last-registration-wins), and it is harmless because
+ *  both viewports publish the same `safeAreaCssVars(gameViewSafeArea)` — but it means "the UI root
+ *  has two probe children" holds for only ONE root at a time, and which one is not deterministic.
+ *  A test asserting probe presence on a specific root in the editor would flake. */
+let probeTL: HTMLElement | null = null;
+let probeBR: HTMLElement | null = null;
+let ro: ResizeObserver | null = null;
 
-/** How many self-refreshes a registration/resume signal arms. #592: the Android bar-hide this
- *  refresh exists for (#273) settles once, a beat after the signal — not continuously for the
- *  rest of the session — so polling past that settle point is pure ongoing cost (a forced
- *  synchronous layout, see `getSafeAreaInsets`'s own doc) for zero remaining benefit. 20 matches
- *  the ceiling the old 5s/`REFRESH_MS` window imposed — but **that equivalence holds only for a
- *  PER-FRAME reader**, and even then the old window in fact reached 19, not a clean 20: its first
- *  refresh could only land at t+256ms (a 60fps reader crosses the 250ms throttle a frame late),
- *  leaving room for 19 more inside the remaining span, not 20. A reader slower than once-a-frame
- *  used to be bounded by its OWN cadence rather than the window, and #600 changes that — measured
- *  forced-layouts-per-signal, pre-fix → post-fix: 60fps reader 19 → 20 (near enough unchanged),
- *  1Hz reader 4 → 20, 0.5Hz reader 2 → 20. See the ⚠️ below for why spending more for a slow
- *  reader is the intended trade, not a regression.
+/** The last measured raw edges and root box, kept separately from `insets` because the two are
+ *  refreshed by different signals and the percentages are derived from both.
  *
- *  ⚠️ **This budget does NOT touch the RATE bound**, which is separate and unchanged: `rawNow() -
- *  lastMeasuredAt > REFRESH_MS` (`getSafeAreaInsets`, below) plus the one-in-flight
- *  `refreshQueued` guard still cap this at ONE forced layout per 250ms, however the caller drives
- *  it — that is the bound #579 cares about (the WebKit touch-scroll compositor stall it measured
- *  live), and nothing here loosens it.
+ *  ⚠️ **The root box is read via `clientWidth`/`clientHeight`, never from a `contentRect`.** The
+ *  percentages have always been measured against those two properties (the PADDING box), and
+ *  `contentRect` is the CONTENT box — swapping them would be a silent semantic change on any root
+ *  that ever gains padding. Reading the same two properties the old code read keeps the
+ *  percentages bit-for-bit what they were.
  *
- *  ⚠️ **The COUNT is preserved for a per-frame reader; the SPAN is not, and that is the
- *  deliberate trade.** The old window also confined those measurements to 5 seconds. A budget
- *  does not: a consumer reading once a second rather than once a frame now spends its full 20
- *  over ~20s instead of the 4 the old window's own 5s span let it reach (measured above), and one
- *  suppressing reads entirely (Court's gesture gate, #600) can spend its first long after the
- *  signal. That is the whole point — the poll has to outlast a suppressed period to catch up at
- *  the end of one — and it stays bounded either way, because the cost that matters is the number
- *  of forced layouts, not the wall-clock span they are spread across.
- *
- *  ⚠️ **That trade is not free, and the one place it is known to cost something is tracked as
- *  #606**: the old window guaranteed the poll was SILENT by wall-clock T after the signal
- *  whatever the consumer did, and that is what kept a forced layout out of a scroll starting long
- *  after mount. Court's gate reopens on `touchend` while WebKit is still decelerating a momentum
- *  scroll, so up to 6 of these can now land in that ~1.5s (measured; 0 before). Whether that
- *  actually stalls the compositor the way #579's finger-down profile did is UNMEASURED — do not
- *  "fix" it from analysis, see #606 for the device measurement that would settle it.
- *
- *  On SIZING this number: if a device turns up where
- *  the transition lands later, widen this rather than removing the bound — the fallback is a
- *  stuck stale value (#273 again, see `getSafeAreaInsets`'s doc), not a crash, so too small a
- *  budget is a correctness bug to fix with a bigger number, not a reason to give up on bounding
- *  it. */
-const POLL_REFRESH_BUDGET = 20;
-
-/** How many self-refreshes remain before the poll stops scheduling itself. Set (not
- *  incremented) by every EXTERNAL registration — `measureSafeAreaInsets` (mount, a resize, a
- *  scene swap's fresh root) and a `visibilitychange` resume — the moments the bar-hide can
- *  occur. Past zero the cached value is still returned (see `getSafeAreaInsets`); it simply
- *  stops re-measuring on its own until the next such signal.
- *
- *  ⚠️ **The self-refresh's OWN re-measure must NOT re-arm this, or the budget never runs out**
- *  (found in review, #592, and this reasoning applies verbatim to a count): the deferred rAF
- *  callback below used to call the same `measureSafeAreaInsets` a real registration calls,
- *  which re-armed the budget on every refresh and made it top up forever — the exact bug #592
- *  was written to fix, reintroduced by the fix. `applyMeasurement` (below) is the measurement
- *  with no arming, used by both the public entry point (which arms first) and the self-refresh
- *  (which must not).
- *
- *  ⚠️ **This is a COUNT, not a deadline, and that distinction is #600.** A wall-clock window is
- *  spent by TIME passing, whether or not anything was measured — so a consumer that stops
- *  reading for a while has its window burned down for free. Court's `boardSafeAreaInsets()`
- *  (`games/court/runtime/systems.ts`) deliberately skips the accessor for the whole duration of
- *  a live touch gesture (#579 follow-up); under the old `pollArmedUntil` deadline, a gesture
- *  starting near a resume/mount and outlasting the window burned the entire window on ZERO
- *  reads, so the catch-up read at the end of the gesture landed past a deadline that had already
- *  passed and scheduled nothing — the stale value then stuck until the next mount/resize/resume.
- *  A budget is spent by MEASUREMENTS instead, so a suppressed reader arrives at the end of its
- *  gesture with the budget still intact and its next read catches up normally. */
-let refreshesLeft = 0;
-
-/** Set once the `visibilitychange` listener (below) has been added, so a burst of
- *  registrations wires it at most once per module instance. */
-let visibilityListenerWired = false;
-
-/** #592: platform-agnostic on purpose, matching this file's existing no-Capacitor-dependency
- *  design (see the file header) — `document.visibilitychange` already answers "resumed" on
- *  every shell this runs in (a browser tab, and a Capacitor WebView backgrounding/foregrounding
- *  pauses/resumes the same way) without threading `App.addListener('resume', ...)` through an
- *  otherwise L0 module.
- *
- *  Wired LAZILY from `measureSafeAreaInsets`'s first real registration, not at module import
- *  time — `domGestureTracking.ts`'s header warns against exactly the alternative ("an
- *  unconditional `addEventListener` at import time would fire in every embedding context that
- *  imports this module, wanted or not"). `resetSafeAreaInsets` removes it, for the same
- *  test-isolation reason it tears down every other piece of this module's state; the
- *  `import.meta.hot.dispose` below (mirroring `editor/store/canvas2DDirty.ts`'s own HMR
- *  cleanup, and already an established pattern in shipped `runtime/**` code — see
- *  `rendering/postfx/PostFXStack.ts`) is what actually stops a Vite HMR re-evaluation of this
- *  module from leaving the OLD instance's listener on `document` forever (found in review,
- *  #592 follow-up: lazy wiring alone only changes WHEN the first listener is added, not
- *  whether an old one survives a hot reload). Stripped by Vite in a production build, so this
- *  is a dev-only no-op there, never a runtime dependency. */
-function wireVisibilityResume(): void {
-  if (visibilityListenerWired) return;
-  if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
-  document.addEventListener('visibilitychange', onVisibilityChange);
-  visibilityListenerWired = true;
-}
-
-function onVisibilityChange(): void {
-  if (document.visibilityState === 'visible') refreshesLeft = POLL_REFRESH_BUDGET;
-}
+ *  Both the registration path and the observer refresh this — see `onProbeResize` for why the
+ *  observer cannot simply trust the registration's value (a rotation moves the root and the insets
+ *  together, and the observer wins the race by a frame). */
+let rawTop = 0, rawRight = 0, rawBottom = 0, rawLeft = 0;
+let rootW = 0, rootH = 0;
 
 if (import.meta.hot) {
   import.meta.hot.dispose(() => { resetSafeAreaInsets(); });
 }
 
-/** Read the current insets, re-measuring if the cache has gone stale.
+/** Read the current insets.
  *
- *  ⚠️ **The refresh is not belt-and-braces — a resize alone MISSES the common Android
- *  case, and this cost a real bug.** With `setDecorFitsSystemWindows(false)` the window
- *  keeps its size when the system bars hide, so ONLY the insets change and no
- *  ResizeObserver fires. Court's immersive mode hides the bars a beat after first paint,
- *  so the value captured at mount (bottom 48px, the nav bar) never refreshed: measured on
- *  a Galaxy A23 where the live inset was 0 while the game was still laying out against
- *  48. It lifted the ad band off the bottom edge AND shortened the paper (the same number
- *  feeds `designToHostPct`'s vertical span), which read as two unrelated bugs.
+ *  A plain field read plus one `isConnected` flag check — no throttle, no measurement, no
+ *  computed style, no layout, and therefore nothing a per-frame caller has to be careful about.
+ *  (Court makes six of these per frame.) That is the #612 change: this used to force a
+ *  synchronous layout on a 250ms throttle from inside the read, which is why Court wrapped it in
+ *  a touch-gesture gate (`boardSafeAreaInsets()`, deleted with the poll) and why #606 existed at
+ *  all. Freshness now comes from the observer in `measureSafeAreaInsets`, which fires when the
+ *  inset actually moves.
  *
- *  There is no event to listen for — `env()` changing fires nothing — so the read
- *  refreshes itself on a throttle rather than waiting to be told. `rawNow` is the
- *  sanctioned clock wrapper (`runtime/core/clock.ts`), so a manual clock in a headless
- *  test still controls it and the determinism guard stays satisfied.
- *
- *  ⚠️ **The re-measure is DEFERRED one `requestAnimationFrame`, not run inline.**
- *  `measureSafeAreaInsets` appends a probe and reads its computed style — a forced
- *  synchronous layout, by construction (WebKit/browsers flush ALL pending layout before
- *  answering a geometry/style query, not just this element's). Running that inline from
- *  whichever per-frame caller happened to cross the 250ms mark meant it landed wherever
- *  a caller's OWN pending DOM write had left layout dirty — device-profiled on an iPhone
- *  8 (#579 follow-up): a Safari Timeline recording showed exactly this call forcing a
- *  layout every ~250-300ms, continuously, including mid-drag on a scrolling list, where
- *  it visibly stalled WebKit's native touch-scroll compositor on old/weak hardware. A
- *  rAF callback runs AFTER the browser's own layout pass for the frame, so the flush this
- *  forces is one the browser was about to do anyway rather than one pulled forward.
- *
- *  ⚠️ This is a TIMING change, not a memoization/signature gate — every call still reads
- *  through to a value that self-refreshes with no external trigger (the #273 property this
- *  file exists for), just up to one frame later than before. It cannot reintroduce the
- *  class of bug `syncPageAndButtons` (Court, `systems.ts`) warns about, where a cached
- *  SIGNATURE survived a scene reload and matched against already-reset authored state: there
- *  is no signature here, nothing is skipped, and the caller's own per-frame cadence is what
- *  still drives every read — this only moves WHEN the expensive part of one particular read
- *  runs, never whether the read happens.
- *
- *  ⚠️ **The self-refresh is BOUNDED to a refresh BUDGET armed by a registration/resume, not
- *  indefinite (#592).** The case it exists for (#273's Android bar-hide) settles once, shortly
- *  after mount or a resume from background — not continuously for the rest of a play session —
- *  so polling forever after that point is ongoing forced-layout cost for zero remaining benefit
- *  (measured: 3-4x/sec continuously, stalling the iPhone 8's touch-scroll compositor, #579
- *  follow-up). Once `refreshesLeft` reaches zero this returns the last-measured value without
- *  scheduling another refresh; an external `measureSafeAreaInsets` registration and a
- *  `visibilitychange` resume both re-arm the budget. **#600: a COUNT rather than a deadline is
- *  the point** — a consumer that stops reading for a while (Court's `boardSafeAreaInsets()`
- *  skips this accessor for a whole touch gesture) spends nothing while it is not reading, so
- *  its catch-up read still finds budget left however long the gesture ran, instead of arriving
- *  after a wall-clock window that closed unspent. **The refresh below must re-measure through
- *  `applyMeasurement`, not `measureSafeAreaInsets`** — the public entry point re-arms the
- *  budget, and calling it from here would make every self-refresh top up its own budget, so the
- *  poll would never actually stop (the bug this section exists to prevent, caught in review). */
+ *  On device the observations landed ~105-108ms after the `SystemBars` call that moved the bars. ⚠️ Do
+ *  not read that as an observer latency, and do not compare it against the old 250ms throttle:
+ *  it is wall-clock from a JS call through a native round-trip and the bar's own animation, so
+ *  most of it is the bars moving, not the notification arriving. What the measurement actually
+ *  establishes is that the observation ARRIVES, unprompted, on the transition that matters —
+ *  which is the property the poll existed to provide and the only one being claimed here. */
 export function getSafeAreaInsets(): SafeAreaInsets {
-  // ⚠️ A DETACHED root must not be measured, and this cleanup runs UNCONDITIONALLY — never
-  // gated by the poll budget below (found in review, #592 follow-up). `root.isConnected` is a
-  // cheap DOM flag read, not a forced layout, so there is no cost reason to skip it once the
-  // budget is spent; skipping it left a detached root (and the whole DOM subtree it drags with
-  // it) referenced by this module forever once the budget ran out with no further registration
-  // — e.g. a scene swap to a UI-less scene after `POLL_REFRESH_BUDGET` refreshes had already
-  // been spent used to release the old root on the very next read; now it wouldn't, without this
-  // branch running independently of whether a refresh may also be scheduled.
+  // ⚠️ A DETACHED root is released here rather than measured. `UIRenderer`'s callback ref returns
+  // early on unmount (it has other teardown to skip), so it never hands this module a null — the
+  // reference simply goes stale, still pointing at a removed node. Reachable two ways: in the
+  // editor both viewports mount a UIRenderer, so closing the one that registered last detaches
+  // this root while the other is still on screen; in a shipped game the tree empties for a beat
+  // across a scene swap. Keeping the LAST GOOD value is the right answer either way — a device's
+  // insets do not change because some UI unmounted — and dropping the reference is what stops the
+  // whole removed subtree being retained by this module (found in review, #592 follow-up).
   //
-  // `UIRenderer`'s callback ref returns early on unmount (it has other teardown to skip), so it
-  // never hands this module a null — the reference here simply goes stale, still pointing at a
-  // removed node. `getComputedStyle` on one answers empty strings and `clientHeight` 0, so
-  // measuring it would quietly rewrite every inset to ZERO with no device change. Reachable two
-  // ways: in the editor both viewports mount a UIRenderer, so closing the one that registered
-  // last detaches this root while the other is still on screen; in a shipped game the tree
-  // empties for a beat across a scene swap. Keeping the LAST GOOD value is the right answer
-  // either way — a device's insets do not change because some UI unmounted.
-  if (root && !root.isConnected) {
-    root = null;
-  } else if (root && rawNow() - lastMeasuredAt > REFRESH_MS && !refreshQueued && refreshesLeft > 0) {
-    refreshQueued = true;
-    const target = root;
-    refreshFrameId = requestAnimationFrame(() => {
-      refreshQueued = false;
-      refreshFrameId = null;
-      // ⚠️ A NEWER registration may have replaced `root` since this was scheduled (the
-      // editor's two-viewport case, above) — found in review (#579 follow-up). An identity
-      // check against the captured reference, not a generation counter: the thing that gets
-      // replaced here is the root itself, not a version of it (docs/async-lifetime.md's
-      // "Identity against a captured reference" row). Without it, a stale `target` that is
-      // still connected re-points `root` BACK to itself (undoing the newer registration), and
-      // a stale `target` that got disconnected nulls out whatever the newer registration set —
-      // both are the same bug: acting on behalf of a registration this callback no longer
-      // speaks for.
-      if (root !== target) return;
-      // ⚠️ `applyMeasurement`, NOT `measureSafeAreaInsets` — see `refreshesLeft`'s own doc
-      // (#592). This is the self-refresh re-measuring itself, not a new registration; calling
-      // the arming entry point here would top up the poll budget on every refresh and it would
-      // never actually run out.
-      //
-      // The budget is spent HERE, immediately before the forced layout it pays for — not in
-      // `applyMeasurement`, which is also the external registration path and must not spend
-      // what it is meant to arm. A callback that bails above (stale identity) or below
-      // (disconnected target) forced no layout, so it spends nothing; `refreshQueued` already
-      // guarantees at most one of these is ever in flight, so this cannot over-spend.
-      if (target.isConnected) { refreshesLeft -= 1; applyMeasurement(target); }
-      else root = null;
-    });
-  }
+  // `isConnected` is a cheap DOM flag read, not a forced layout, so this costs nothing per frame.
+  if (root && !root.isConnected) releaseRoot();
   return insets;
 }
 
-/** Measure the insets from `root`'s cascade and cache them. Called by UIRenderer; not
- *  part of the game-facing surface. This is the EXTERNAL registration entry point — a real
- *  mount, resize, or scene-swap fresh root — as opposed to the self-refresh's own re-measure
- *  (`applyMeasurement`, below), which must not be confused with a registration (#592, see
- *  `refreshesLeft`'s doc for why that distinction is load-bearing). */
+/** Measure the insets from `el`'s cascade, and observe them from here on. Called by UIRenderer;
+ *  not part of the game-facing surface.
+ *
+ *  This is the registration entry point — a real mount, a resize, or a scene swap's fresh root.
+ *  It does three things: tears down any previous root's probes, installs fresh ones under `el`,
+ *  and takes ONE synchronous measurement so the value is correct before the first observation
+ *  arrives. The synchronous read is a forced layout, and the only one left in this module — paid
+ *  once per registration (bounded by mounts and resizes) instead of on a 250ms poll for the life
+ *  of the session. */
 export function measureSafeAreaInsets(el: HTMLElement | null): void {
-  // #592: a real registration re-arms the bounded self-refresh budget (see
-  // `POLL_REFRESH_BUDGET`) — this is the "mount" signal alongside `visibilitychange`'s "resume"
-  // one. `el === null` (a detach) arms nothing new; there is no root left to poll. Wiring the
-  // resume listener here (rather than at module load) means it activates only once something
-  // has actually registered a root, not merely because this module was imported.
-  if (el) { refreshesLeft = POLL_REFRESH_BUDGET; wireVisibilityResume(); }
+  // ⚠️ **A DETACHED `el` must be refused here, not measured** — this is the write path, and it is
+  // the one the old code guarded with its `if (root !== target) return` identity check inside the
+  // deferred refresh. That check went with the poll; this replaces it, and without it the
+  // invariant `getSafeAreaInsets` asserts ("a detached root is released rather than measured") is
+  // true only of the read.
+  //
+  // ⚠️ **This is DEFENCE IN DEPTH, not a live path — and the distinction is worth stating so the
+  // next reader does not delete it as dead code.** The hazard was real: `UIRenderer`'s observer
+  // rAF-defers its `update()`, so a container unmounting in the frame it mounted (a scene swap's
+  // empty-tree beat, an editor panel closing mid-resize) landed here with a removed node —
+  // `getComputedStyle` on a detached probe answers empty strings, so every inset is rewritten to
+  // 0 (#273's exact symptom), and in the editor's two-viewport case the LATE call re-points `root`
+  // at the dead node and tears the probes off the still-live viewport. `UIRenderer` now CANCELS
+  // that frame (`frameRef`), which closes the only production path anyone has found into here.
+  // This stays because it is the write path's half of an invariant the read path already asserts,
+  // and because it costs one flag read to keep the guarantee independent of a cancel in another
+  // file that a refactor could quietly drop.
+  if (el && !el.isConnected) return;
+  if (el !== root) releaseRoot();
+  root = el;
+  if (!el || typeof document === 'undefined' || typeof getComputedStyle !== 'function') {
+    rawTop = rawRight = rawBottom = rawLeft = 0;
+    rootW = rootH = 0;
+    insets = { ...ZERO };
+    return;
+  }
+  if (!probeTL) {
+    probeTL = makeProbe('top', 'left');
+    probeBR = makeProbe('bottom', 'right');
+    el.appendChild(probeTL);
+    el.appendChild(probeBR);
+    // Feature-detected, matching this file's siblings (`scrollAnchor.ts`, `UINode.tsx`): jsdom
+    // implements no ResizeObserver, so under test the synchronous path below is the whole
+    // mechanism. That is not a degraded mode to paper over — a test that means to exercise the
+    // PUSH path has to install a fake, and one that does not gets the same measurement the old
+    // code gave it.
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(onProbeResize);
+      ro.observe(probeTL);
+      ro.observe(probeBR);
+    }
+  } else if (probeTL.parentElement !== el) {
+    // The probes are PERSISTENT now (the old code created and removed one per measurement), and
+    // they live in a container React owns. Nothing today removes them — `UIRenderer` unmounts the
+    // whole container rather than clearing it, which comes back through this function as a NEW
+    // root — but a detached probe answers empty computed styles, so if that ever changes the
+    // symptom would be every inset silently reading 0. Re-attaching is one flag read and removes
+    // the failure mode entirely.
+    el.appendChild(probeTL);
+    el.appendChild(probeBR!);
+  }
   applyMeasurement(el);
 }
 
-/** The measurement itself, shared by `measureSafeAreaInsets` (above, which arms the poll
- *  budget first) and the self-refresh's deferred rAF callback (`getSafeAreaInsets`, which
- *  must NOT arm it — see `refreshesLeft`'s doc, #592). Not exported: every external caller
- *  goes through `measureSafeAreaInsets`.
+/** One probe: a zero-content box whose WIDTH is `hEdge`'s inset and HEIGHT is `vEdge`'s.
  *
- *  Measures a hidden probe rather than reading the `--ui-sa-*` custom properties
- *  directly, for two reasons: a custom property resolves to the literal token (`"68px"`
- *  or, on device, nothing at all — the var is unset and only the `env()` fallback
- *  applies), and only laying it out as a real length makes the browser resolve the
- *  fallback chain. `padding` also clamps negatives to 0 for free. */
-function applyMeasurement(el: HTMLElement | null): void {
-  root = el;
-  lastMeasuredAt = rawNow();
-  if (!el || typeof getComputedStyle !== 'function') { insets = { ...ZERO }; return; }
+ *  `position: fixed` + no content keeps it out of flow entirely, so it cannot affect the layout
+ *  it is measuring.
+ *
+ *  `visibility: hidden`, never `display: none`: a display-none element is not rendered, so it has
+ *  no box, and `ResizeObserver` reports 0x0 for it (measured) — indistinguishable from a real
+ *  zero inset by size alone. Note that is about the BOX, not the computed style: under
+ *  `display:none` `getComputedStyle().height` still answers the correct length (also measured),
+ *  which is exactly why `onProbeResize` discriminates on `getClientRects()` and on neither of
+ *  those. */
+function makeProbe(vEdge: 'top' | 'bottom', hEdge: 'left' | 'right'): HTMLElement {
   const probe = document.createElement('div');
-  // `position: fixed` + zero size keeps the probe out of flow entirely, so it cannot
-  // affect the layout it is measuring. `visibility: hidden` (not `display: none`) is
-  // required: a display-none element has no computed padding to read.
-  probe.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;'
-    + 'padding-top:var(--ui-sa-top, env(safe-area-inset-top));'
-    + 'padding-right:var(--ui-sa-right, env(safe-area-inset-right));'
-    + 'padding-bottom:var(--ui-sa-bottom, env(safe-area-inset-bottom));'
-    + 'padding-left:var(--ui-sa-left, env(safe-area-inset-left));';
-  el.appendChild(probe);
-  try {
-    const cs = getComputedStyle(probe);
-    /** One edge: the simulated var if one is set, else the resolved padding, else 0.
-     *
-     *  **The var is checked FIRST, and the order is load-bearing.** Both sources give the
-     *  same answer wherever both exist — the padding IS `var(--ui-sa-*, env(...))`, so a
-     *  set var resolves through it — and the padding alone would look sufficient. It is
-     *  not, because of how jsdom degrades: with all four paddings declared it reports
-     *  `paddingTop: "0"`, a perfectly PARSEABLE zero, rather than leaving the value
-     *  unresolved. A padding-first order therefore reads 0 and never consults the var, so
-     *  every editor-simulated inset silently vanished under test while the live path was
-     *  fine. (With only ONE padding declared jsdom hands back the raw `var(...)` string
-     *  instead, which is what made the first version look correct in isolation.)
-     *
-     *  The padding branch is the LIVE one on device: a shipped build sets no var, so the
-     *  lookup misses and `env(safe-area-inset-*)` resolves through the padding — measured
-     *  at top 68 on an iPhone Air. Neither branch is dead code. */
-    const edge = (padding: string, varName: string): number => {
-      const simulated = parseFloat(cs.getPropertyValue(varName));
-      if (Number.isFinite(simulated)) return simulated;
-      const resolved = parseFloat(padding);
-      return Number.isFinite(resolved) ? resolved : 0;
-    };
-    const top = edge(cs.paddingTop, '--ui-sa-top');
-    const right = edge(cs.paddingRight, '--ui-sa-right');
-    const bottom = edge(cs.paddingBottom, '--ui-sa-bottom');
-    const left = edge(cs.paddingLeft, '--ui-sa-left');
-    // `clientWidth`/`clientHeight` are the LAYOUT box — pre-transform, so this is the logical
-    // device size in an editor device preview and the viewport on hardware. Same space as the
-    // px insets above, which is the whole point (see the doc on the *Pct fields).
-    const w = el.clientWidth || 0;
-    const h = el.clientHeight || 0;
-    const pct = (v: number, total: number) => (total > 0 ? (v / total) * 100 : 0);
-    insets = {
-      top, right, bottom, left,
-      topPct: pct(top, h),
-      rightPct: pct(right, w),
-      bottomPct: pct(bottom, h),
-      leftPct: pct(left, w),
-    };
-  } finally {
-    probe.remove();
+  const len = (edge: string) => `max(0px, var(--ui-sa-${edge}, env(safe-area-inset-${edge}, 0px)))`;
+  probe.style.cssText = 'box-sizing:content-box;position:fixed;top:0;left:0;visibility:hidden;'
+    + 'pointer-events:none;overflow:hidden;'
+    + `width:${len(hEdge)};height:${len(vEdge)};`;
+  probe.setAttribute('data-modoki-safe-area-probe', `${vEdge}-${hEdge}`);
+  // `visibility:hidden` already keeps these out of the accessibility tree and out of
+  // `elementFromPoint`, so nothing in the repo can currently see them (swept: every DOM→entity
+  // mapper here is keyed on `data-entity-id`/`data-ui-id`, and hit testing skips hidden subtrees).
+  // This makes that guarantee explicit rather than emergent, so a future broad locator — a
+  // Playwright `getByRole`, a `:scope > *` — cannot start matching two nodes that are not UI.
+  probe.setAttribute('aria-hidden', 'true');
+  return probe;
+}
+
+/** The observer callback — the push path. Reads `contentRect` off the entries the browser has
+ *  already computed, so it forces no layout at all.
+ *
+ *  ⚠️ **An observation from a probe that is not being RENDERED reports 0×0, and writing that
+ *  through would rewrite every inset to a confident zero with no device change** — the same
+ *  failure the detached-root branch in `getSafeAreaInsets` exists to stop, arriving by the other
+ *  door. Measured in Chromium and WebKit, and the obvious guards do not work: `display:none` on
+ *  an ancestor fires 0×0 while `isConnected` stays **true** and `getComputedStyle().height` still
+ *  reports the correct `68px`, so neither can discriminate. (Detaching the root outright fires
+ *  nothing at all in either engine, so only the hidden case reaches here.)
+ *
+ *  `getClientRects().length` is the discriminator, and it is the right one specifically because
+ *  of what it does NOT reject: a genuine zero-inset device (a phone with no notch — the common
+ *  case) still has one rect, and so does a root that has no box yet, which `UIRenderer` measures
+ *  for on purpose ("a container can be measurable for insets before it has a non-zero box"). Only
+ *  a non-rendered subtree reports none. Called from inside a `ResizeObserver` callback, layout is
+ *  already settled, so this is a read rather than a forced reflow. */
+function onProbeResize(entries: ResizeObserverEntry[]): void {
+  let rendered = false;
+  for (const entry of entries) {
+    if (entry.target.getClientRects().length === 0) continue;
+    rendered = true;
+    if (entry.target === probeTL) { rawTop = entry.contentRect.height; rawLeft = entry.contentRect.width; }
+    else if (entry.target === probeBR) { rawBottom = entry.contentRect.height; rawRight = entry.contentRect.width; }
   }
+  // ⚠️ **Bail on an all-rejected batch — do NOT fall through to the root read below.** Skipping the
+  // raw edges is only half the guard: a `display:none` ancestor takes the root's box away too, so
+  // reading it here would put 0 into the percentage denominators and `recompose` would rewrite all
+  // four *Pct fields to a confident zero while the px insets correctly survived. That is worse than
+  // the bug it would be half-fixing, because **the percentages are the only fields Court reads** —
+  // all six of its call sites take `*Pct` — and `syncMenuIconBar` is change-gated, so a transient
+  // zero does not merely read wrong, it moves the icon bar and moves it back.
+  //
+  // Found in review of THIS guard's own follow-up fix: the root read was added below to stop a
+  // stale denominator and landed outside the protection three lines above it.
+  if (!rendered) return;
+  // ⚠️ **Re-read the root box HERE rather than trusting the one cached at registration.** A
+  // rotation moves the root AND the insets, and this observer is delivered FIRST — it is
+  // constructed inside `UIRenderer`'s `update()`, before `UIRenderer` constructs its own — while
+  // `UIRenderer` rAF-defers the registration that would refresh the cache. Measured: root
+  // 384×832 → 832×384 with a bottom inset of 48 arriving first yields `bottomPct` 5.77 where
+  // 12.5 is correct — 2.17x wrong. It self-corrects a frame later, but Court reads these
+  // percentages every frame at six sites, so the banner, board and narration band all pop for
+  // that frame.
+  //
+  // `clientWidth`/`clientHeight` inside a `ResizeObserver` callback normally read layout the
+  // browser has just settled, so this is usually a read rather than a forced reflow — and it
+  // happens once per real inset change, not per frame. ⚠️ Not a guarantee, though, and the
+  // caveat is this module's to own: an observer delivered EARLIER in the same cycle can dirty
+  // layout first. `Scene3D`'s observer synchronously sets `renderer.domElement.style.width` /
+  // `height`, and while this module's observer is constructed in a callback ref (layout phase) —
+  // so it wins on first mount — `releaseRoot()` + a fresh `new ResizeObserver` on every UI-tree
+  // empty→refill cycle moves it permanently AFTER `Scene3D`'s. In that ordering this read does
+  // force a reflow. Once per real inset change is a price worth paying for a correct
+  // denominator; a per-frame read here would not be.
+  if (root) { rootW = root.clientWidth || 0; rootH = root.clientHeight || 0; }
+  recompose();
+}
+
+/** The synchronous measurement, used by registration (and, where there is no ResizeObserver, by
+ *  everything).
+ *
+ *  Measures the probes rather than reading the `--ui-sa-*` custom properties directly, for two
+ *  reasons: a custom property resolves to the literal token (`"68px"` or, on device, nothing at
+ *  all — the var is unset and only the `env()` fallback applies), and only laying it out as a real
+ *  length makes the browser resolve the fallback chain. */
+function applyMeasurement(el: HTMLElement): void {
+  const csTL = getComputedStyle(probeTL!);
+  const csBR = getComputedStyle(probeBR!);
+  rawTop = edge(csTL.height, csTL, '--ui-sa-top');
+  rawLeft = edge(csTL.width, csTL, '--ui-sa-left');
+  rawBottom = edge(csBR.height, csBR, '--ui-sa-bottom');
+  rawRight = edge(csBR.width, csBR, '--ui-sa-right');
+  // `clientWidth`/`clientHeight` are the LAYOUT box — pre-transform, so this is the logical
+  // device size in an editor device preview and the viewport on hardware. Same space as the px
+  // insets above, which is the whole point (see the doc on the *Pct fields). `getBoundingClientRect`
+  // would be POST-transform and is the trap that doc describes — measured under `scale(0.5)`:
+  // computed height 68px, bounding rect 34.
+  rootW = el.clientWidth || 0;
+  rootH = el.clientHeight || 0;
+  recompose();
+}
+
+/** One edge: the simulated var if one is set, else the resolved length, else 0.
+ *
+ *  **The var is checked FIRST, and the order is load-bearing.** Both sources give the same answer
+ *  wherever both exist — the length IS `max(0px, var(--ui-sa-*, env(...)))`, so a set var resolves
+ *  through it — and the length alone would look sufficient. It is not, because jsdom does no
+ *  layout: measured, `cs.height` there is the raw token
+ *  `"max(0px, var(--ui-sa-top, env(safe-area-inset-top, 0px)))"`, never a px value. Without the
+ *  var branch every editor-simulated inset would read 0 under test while the live path was fine.
+ *
+ *  ⚠️ The hazard MOVED with the probe shape and the note here used to describe the old one. The
+ *  padding probe's failure was jsdom reporting a perfectly PARSEABLE `"0"`, which a length-first
+ *  order would have consumed silently; a sized probe's token `parseFloat`s to `NaN` instead, so
+ *  the fallback that actually catches it now is this function's own trailing `else 0` — a
+ *  louder, less treacherous failure, but a different one. Do not reason about this ordering from
+ *  the old note.
+ *
+ *  The length branch is the LIVE one on device: a shipped build sets no var, so the lookup misses
+ *  and `env(safe-area-inset-*)` resolves through the size — measured on a Galaxy A23 at top 32 /
+ *  bottom 48 with the system bars SHOWN, and top 28 / bottom 0 with them hidden (28 being the
+ *  physical cutout, which the status bar covers and exceeds). Neither branch is dead code. */
+function edge(length: string, cs: CSSStyleDeclaration, varName: string): number {
+  const simulated = parseFloat(cs.getPropertyValue(varName));
+  if (Number.isFinite(simulated)) return Math.max(0, simulated);
+  const resolved = parseFloat(length);
+  return Number.isFinite(resolved) ? Math.max(0, resolved) : 0;
+}
+
+/** Rebuild the public value from the raw edges and the last known root box. */
+function recompose(): void {
+  const pct = (v: number, total: number) => (total > 0 ? (v / total) * 100 : 0);
+  insets = {
+    top: rawTop, right: rawRight, bottom: rawBottom, left: rawLeft,
+    topPct: pct(rawTop, rootH),
+    rightPct: pct(rawRight, rootW),
+    bottomPct: pct(rawBottom, rootH),
+    leftPct: pct(rawLeft, rootW),
+  };
+}
+
+/** Drop the observer and the probes, leaving `insets` alone — a detached or replaced root does
+ *  not mean the device's insets changed.
+ *
+ *  ⚠️ **Reachable only from a READ or an explicit reset, so an unmount alone does not release.**
+ *  `UIRenderer`'s callback ref returns early on unmount without calling in here, so a game whose
+ *  UI goes away and whose last `getSafeAreaInsets()` predates that unmount retains `root`, both
+ *  probe nodes and a LIVE `ResizeObserver` on a detached subtree until something reads again or a
+ *  new root registers. The old design retained the `root` reference the same way but no nodes and
+ *  no observer, so this is a small step backwards, taken knowingly: every consumer that exists
+ *  reads every frame (Court, at six sites), the retained set is two divs, and the alternative is
+ *  a release entry point on the module's surface that `UIRenderer` must remember to call — a
+ *  second thing to keep in sync for a leak nothing has hit. Revisit if a consumer appears that
+ *  reads only occasionally. */
+function releaseRoot(): void {
+  ro?.disconnect();
+  ro = null;
+  probeTL?.remove();
+  probeBR?.remove();
+  probeTL = null;
+  probeBR = null;
+  root = null;
 }
 
 /** Reset to zeros — for teardown, and for tests that must not inherit another test's
  *  measurement (the cache is module state, and test files share a module registry). */
 export function resetSafeAreaInsets(): void {
+  releaseRoot();
   insets = { ...ZERO };
-  root = null;
-  lastMeasuredAt = -Infinity;
-  refreshesLeft = 0;
-  // A refresh scheduled by a torn-down session must not fire against whatever registers next —
-  // cancel the real callback, not just the flag that gates scheduling a new one (found in
-  // review, #579 follow-up).
-  if (refreshFrameId !== null) { cancelAnimationFrame(refreshFrameId); refreshFrameId = null; }
-  refreshQueued = false;
-  // #592: undo `wireVisibilityResume` too, so a fresh test/session re-wires its own listener
-  // rather than accumulating one per registration across a shared module registry.
-  if (visibilityListenerWired && typeof document !== 'undefined') {
-    document.removeEventListener('visibilitychange', onVisibilityChange);
-  }
-  visibilityListenerWired = false;
+  rawTop = rawRight = rawBottom = rawLeft = 0;
+  rootW = rootH = 0;
 }

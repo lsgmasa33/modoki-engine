@@ -6,10 +6,18 @@
  *  .ts`) by design: that input is meant to be handled by the DOM/React layer, not fed into
  *  gameplay. This exists for the opposite case — something that needs to know a NATIVE DOM
  *  gesture is live, regardless of which layer owns it, most commonly a touch-scroll on a
- *  `UIScrollView` box. The motivating case (#579): Court defers `getSafeAreaInsets()`'s forced-
- *  layout probe while a gesture is live, because forcing that layout mid-drag desynced WebKit's
- *  native touch-scroll compositor on old hardware — and the scroll views affected (a store item
- *  list, a level selector) are DOM chrome, exactly what `Input.pointer` cannot see.
+ *  `UIScrollView` box. The scroll views affected (a store item list, a level selector) are DOM
+ *  chrome, exactly what `Input.pointer` cannot see.
+ *
+ *  ⚠️ **The ORIGINAL motivating consumer is gone, and this module is not.** #579 added this so
+ *  Court could defer `getSafeAreaInsets()`'s forced-layout probe while a gesture was live —
+ *  forcing that layout mid-drag desynced WebKit's native touch-scroll compositor on old hardware.
+ *  #612 fixed that at its source: `safeArea.ts` is push-based and forces no layout at all, so
+ *  Court's `boardSafeAreaInsets()` wrapper was deleted. The LIVE consumer today is Court's
+ *  `relayoutBoardIfHostMoved` (`games/court/runtime/systems.ts`), which defers its own
+ *  `getBoundingClientRect` host re-measure for the same reason, against the same compositor.
+ *  Keep the #579 history: it is why this file is shaped the way it is, and `docs/input.md`'s
+ *  raw-listener exemption still points here.
  *
  *  ⚠️ **TOUCH ONLY — no mouse, and that is a correction, not the original design.** A first cut
  *  also tracked Pointer Events for mouse/pen (mirroring `scrollAnchor.ts`, where a real mouse
@@ -19,7 +27,8 @@
  *  the stated purpose — while costing something real, because `registerGameSystems` wires this
  *  in the EDITOR too, where the game runtime and the editor chrome share one `document`. Held
  *  mouse buttons are common there (orbiting SceneView, dragging a gizmo, scrubbing a slider), and
- *  each one froze `boardSafeAreaInsets`/`relayoutBoardIfHostMoved` for the duration — silently
+ *  each one froze `relayoutBoardIfHostMoved` (and, at the time, `boardSafeAreaInsets`) for the
+ *  duration — silently
  *  breaking the live-tuning loop `CLAUDE.md` § "Author values in the SCENE" depends on (a
  *  `boardCaptionGap` retune stopped moving the board until mouse-up). TOUCH is tracked via
  *  `touchstart`/`touchend`/`touchcancel` specifically (never `pointerdown`/`pointerup`) for the
@@ -34,8 +43,8 @@
  *  file's gestures are quick settle-and-release interactions. This file's motivating case is
  *  different by nature: browsing a long list (Court's level selector runs to hundreds of
  *  entries) with a finger down for MORE than a few seconds is completely ordinary. A timer that
- *  only measured "since the gesture started" would fire mid-browse, silently un-gate the forced-
- *  layout probe, and reproduce the original stall for the rest of that same touch. Resetting the
+ *  only measured "since the gesture started" would fire mid-browse, silently un-gate the deferred
+ *  re-measure, and reproduce the original stall for the rest of that same touch. Resetting the
  *  deadline on every `touchmove` makes it mean "no activity for `SAFETY_MS`", which only degrades
  *  when a finger is held stationary and dead — the case the timeout actually exists for. */
 

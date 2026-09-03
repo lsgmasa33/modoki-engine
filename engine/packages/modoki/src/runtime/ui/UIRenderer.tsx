@@ -30,6 +30,9 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
   const tree = useUIEntities();
   const [vpVars, setVpVars] = useState<Record<string, string>>({});
   const roRef = useRef<ResizeObserver | null>(null);
+  /** The queued `update()` frame, so the callback ref's cleanup can CANCEL it rather than let it
+   *  run against a container it has already torn down — see the note at the observer below. */
+  const frameRef = useRef<ReturnType<typeof requestAnimationFrame> | null>(null);
 
   // Rebuild the UI tree on Play/Stop so a TextAnimation on a UIElement toggles its
   // CSS animation with play state (UINode applies it only while isSimRunning).
@@ -73,6 +76,7 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
   const measureRef = useCallback((el: HTMLDivElement | null) => {
     roRef.current?.disconnect();
     roRef.current = null;
+    if (frameRef.current !== null) { cancelAnimationFrame(frameRef.current); frameRef.current = null; }
     unblockRef.current?.();
     unblockRef.current = null;
     if (!el) return;
@@ -90,12 +94,19 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
           '--ui-vmax': `${Math.max(vw, vh)}px`,
         });
       }
-      // Safe-area insets for GAME CODE (`runtime/ui/safeArea.ts`) — measured from THIS
-      // container's cascade, so it reads the editor preview's simulated inset and the
-      // device's real `env()` through one path. Measured here rather than on its own
-      // observer because every event that can change an inset (orientation, an editor
-      // device-preset change, a panel resize) already resizes this container. Outside
-      // the w/h > 0 guard on purpose: a container can be measurable for insets before it
+      // Safe-area insets for GAME CODE (`runtime/ui/safeArea.ts`) — REGISTERED from here, so the
+      // measurement happens inside THIS container's cascade and reads the editor preview's
+      // simulated inset and the device's real `env()` through one path.
+      //
+      // ⚠️ This call is the registration, NOT the whole freshness story, and the comment that
+      // used to sit here said it was — "every event that can change an inset already resizes this
+      // container". That is false, and it is the single belief that cost four issues (#273 → #579
+      // → #592 → #600): under `setDecorFitsSystemWindows(false)` an Android window keeps its size
+      // when the system bars hide, so the insets move and this observer never fires. Measured on a
+      // Galaxy A23: bottom 0→48 with zero `resize` events. `safeArea.ts` now owns its own observer
+      // on probes SIZED by the inset, which is what actually catches that case (#612).
+      //
+      // Outside the w/h > 0 guard on purpose: a container can be measurable for insets before it
       // has a non-zero box, and a stale inset is worse than an early-but-correct one.
       measureSafeAreaInsets(el);
     };
@@ -106,10 +117,21 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
     // notifications". rAF moves the read past layout settle. (Same guard as
     // UIResizeOverlay.)
     let pending = false;
+    // ⚠️ The queued frame is CANCELLED by this ref's cleanup (`frameRef`, above), not merely left
+    // to run against a disconnected observer. It re-enters `update()`, which registers this
+    // container with `safeArea.ts`; an unmount in the same frame as the mount (a scene swap's
+    // empty-tree beat, an editor panel closing mid-resize) would otherwise register a node that is
+    // already detached, and in the editor's two-viewport case that late registration steals the
+    // LIVE viewport's probes. `safeArea.ts` refuses a detached node defensively too — this stops
+    // one being sent at all.
     const ro = new ResizeObserver(() => {
       if (pending) return;
       pending = true;
-      requestAnimationFrame(() => { pending = false; update(); });
+      frameRef.current = requestAnimationFrame(() => {
+        pending = false;
+        frameRef.current = null;
+        update();
+      });
     });
     ro.observe(el);
     roRef.current = ro;

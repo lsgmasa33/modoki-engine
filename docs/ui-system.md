@@ -95,35 +95,29 @@ Field groups (representative fields, verified against `UIElement.ts`):
   same-shape-as-`scheduleResync` safety timeout in case neither fires) and DEFERS any pending
   restore until the gesture ends, rather than fighting it. See `scrollAnchor.ts`'s header comment.
 
-  ⚠️ **A fourth, UNRELATED mechanism that reads identically on old hardware (#579 follow-up):**
-  none of the above actually explained a freeze measured live on an iPhone 8 (iOS 16.7.16) —
-  `touchmove` kept firing the whole gesture; only the resulting scroll position stopped updating.
-  Root cause was `runtime/ui/safeArea.ts`'s `getSafeAreaInsets()`: past its own 250ms cache
-  throttle it re-measures by appending a hidden probe and reading `getComputedStyle()` on it — a
-  forced synchronous layout by construction, REGARDLESS of when in the frame it runs (confirmed:
-  deferring the call to `requestAnimationFrame`, the fix that class of problem usually takes,
-  only reduced the damage here — inserting a fresh element and immediately querying it forces a
-  layout for that element no matter the timing). Court calls it from six per-frame chrome-sync
-  functions that this codebase deliberately never gates on a dirty flag, so the forced reflow was
-  firing continuously — including with a modal or the menu covering the board entirely, where
-  none of it was visible. Cheap enough to be invisible on modern hardware; enough to desync
-  WebKit's native touch-scroll compositor on the iPhone 8. Fixed at the call site, not the
-  mechanism (which is still needed — see `safeArea.ts`'s own header for the real Android case it
-  exists for): Court's `boardSafeAreaInsets()` (`runtime/systems.ts`) skips the call while a
-  touch gesture is live anywhere on the page, reusing the last-read value.
-  ⚠️ **A first cut gated on VISIBILITY instead (`boardInputBlocker() || menuBlocking()`), and
-  adversarial review found it backwards for at least two of the six call sites**: `MenuIconBar`
-  is a child of `MenuRoot`, whose own visibility IS `menuT > 0` — the same condition
-  `menuBlocking()` reports — so that gate froze the icon row's inset for as long as the MENU
-  stayed open (i.e. exactly while it was on screen) and only read it live while hidden. A
-  per-consumer visibility gate would fix that inversion but not the actual bug: the store's own
-  chrome (`syncModalBannerInset`'s `storeModal` target) legitimately needs a live read for the
-  entire time the store is open, including while its list is being scrolled — visibility can
-  never tell "store open and static" apart from "store open and a finger is dragging its list",
-  and only the second is what the forced layout costs anything against. A GESTURE signal answers
-  the right question directly. See `boardSafeAreaInsets`'s own doc for the full argument,
-  including why this still isn't the memoization gate `syncPageAndButtons`'s header warns
-  against re-adding.
+  ⚠️ **A fourth, UNRELATED mechanism that read identically on old hardware — now RESOLVED, not
+  merely mitigated (#579 → #612):** none of the above actually explained a freeze measured live
+  on an iPhone 8 (iOS 16.7.16) — `touchmove` kept firing the whole gesture; only the resulting
+  scroll position stopped updating. Root cause was `runtime/ui/safeArea.ts`'s
+  `getSafeAreaInsets()`: past its own 250ms cache throttle it re-measured by appending a hidden
+  probe and reading `getComputedStyle()` on it — a forced synchronous layout by construction,
+  REGARDLESS of when in the frame it ran (confirmed: deferring the call to
+  `requestAnimationFrame`, the fix that class of problem usually takes, only reduced the damage
+  here — inserting a fresh element and immediately querying it forces a layout for that element
+  no matter the timing). Court called it from six per-frame chrome-sync functions that this
+  codebase deliberately never gates on a dirty flag, so the forced reflow fired continuously —
+  including with a modal or the menu covering the board entirely, where none of it was visible.
+  Cheap enough to be invisible on modern hardware; enough to desync WebKit's native touch-scroll
+  compositor on the iPhone 8.
+
+  **The #612 rewrite fixed the mechanism itself, so there is no call-site gate left to
+  describe.** `safeArea.ts` no longer forces a layout at all — `getSafeAreaInsets()` is a plain
+  field read (see "Game code reads the insets through `getSafeAreaInsets()`" below) — so Court's
+  gesture-gated wrapper (`boardSafeAreaInsets()`, which used to skip the call while a touch
+  gesture was live anywhere on the page) has been deleted, and all six chrome-sync call sites now
+  call the engine function directly. The `#579` history above is kept because it is why this
+  file's scroll-anchoring code looks the way it does; the bug itself is resolved at its source,
+  not routed around.
 
   ⚠️ **Match `gapUnit` to the unit the CHILDREN are sized in.** `gap` was px-only until
   2026-08-07, and a `flexWrap: 'wrap'` container whose items scale (`vh`/`vmin`/`%`) while its
@@ -511,47 +505,81 @@ it. It reports px **and percentages of the UI root**; use the percentages, becau
 px by your own `getBoundingClientRect` mixes a pre-transform inset with a post-transform box and
 is wrong in editor previews only.
 
-⚠️ **The read REFRESHES ITSELF on a throttle, and that is not defensive coding.** An inset can
-change with no resize to announce it: under `setDecorFitsSystemWindows(false)` an Android window
-keeps its size when the system bars hide, so only the insets move and no `ResizeObserver` fires
-— and `env()` changing fires no event of its own, so there is nothing to subscribe to. A value
-captured at mount stuck at a 48px nav-bar inset the device had already dropped to 0, which lifted
-Court's ad band off the bottom edge *and* shortened its paper (one number, two bug reports).
-A **detached** root is skipped rather than measured: a removed node answers empty computed styles
-and `clientHeight` 0, so refreshing off one would silently zero every inset when a viewport
-unmounts.
+**`getSafeAreaInsets()` is now a plain field read — no throttle, no measurement, no DOM access,
+and therefore nothing a per-frame caller has to be careful about (#612).** Freshness comes from a
+PUSH signal instead of a poll: two **persistent** probe elements live inside the UI root, and a
+`ResizeObserver` on them fires whenever an inset actually moves. The callback writes the new value
+straight off `contentRect` — no forced layout, nothing to bound, nothing to arm.
 
-⚠️ **The self-refresh is BOUNDED to a refresh budget after a mount/resume, not indefinite (#592).**
-The Android transition it exists for settles once, shortly after the signal — not continuously for
-the rest of a play session — so `safeArea.ts` arms a `POLL_REFRESH_BUDGET` (20) count of
-re-measures on every EXTERNAL registration (`measureSafeAreaInsets` — a mount, a resize) and on a
-`visibilitychange` resume. Each self-refresh actually performed spends one; once the budget is
-spent it stops scheduling further refreshes (the last-measured value keeps being returned). 20
-matches the OLD 5s/`REFRESH_MS` window's ceiling only for a per-frame reader (that reader used to
-reach 19, not a clean 20, and a slower reader — 1Hz, say — used to be capped by its own cadence at
-4, not by the window, and now spends the full 20 too); the separate RATE bound (one forced layout
-per 250ms, `REFRESH_MS`, #579's own concern) is unchanged by any of this.
-⚠️ **A COUNT, not a deadline — deliberately (#600).** An earlier version armed a wall-clock window
-instead, and a window is spent by TIME passing whether or not anything was measured: a consumer
-that suppresses reads for a while — Court's gesture gate skips this accessor for the whole
-duration of a touch — could have its window burned down to nothing while paying no cost, so its
-catch-up read at the end of the suppressed period arrived after the window had already closed and
-found nothing scheduled. A budget spent only by actual measurements does not have that failure
-mode: a suppressed reader's budget is still there when it resumes reading. ⚠️ **What that trade
-gives up is tracked as #606** — the deadline also guaranteed the poll was silent by wall-clock T
-after the signal *whatever the consumer did*, which kept a forced layout out of a scroll starting
-long after mount; Court's gate reopens on `touchend` while WebKit is still decelerating, so up to
-6 can now land in that ~1.5s (measured; 0 before). Whether that stalls the compositor the way
-#579's finger-down profile did is **unmeasured** — #606 carries the device measurement that would
-settle it, and says why both obvious mitigations were rejected. Don't patch it from analysis.
-⚠️ **The self-refresh's OWN re-measure deliberately does NOT re-arm the budget** — an early version
-of the fix called the same arming entry point from inside the deferred refresh, which topped the
-budget back up on every refresh and left the poll running at its original rate forever (caught in
-review, before this landed); the internal re-measure goes through a separate, non-arming path.
-Platform-agnostic on purpose — it listens for the DOM `visibilitychange` event rather than
-threading Capacitor's `App.addListener('resume', ...)` through this otherwise Capacitor-free,
-L0-ish module, and it wires that listener lazily (on the first real registration, at most once per
-module instance, removed by `resetSafeAreaInsets`) rather than unconditionally at import time.
+⚠️ **The probes are SIZED BY the inset, and that is the whole mechanism — the obvious
+implementation silently never fires.** `ResizeObserver` reports the CONTENT box by default. The
+previous probe was `width:0; height:0` with the inset in its PADDING (a shape chosen to stay out
+of flow and clamp negatives to 0 for free), so its content box was 0×0 before and after every
+transition, forever — bolting an observer onto it would pass review, ship, and fail on device with
+no error. Each new probe's `width`/`height` IS one edge's inset instead (one probe carries
+top+left, the other bottom+right — `contentRect` delivers both edges in one observation). Measured
+on the device this whole mechanism exists for (Galaxy A23 / Android 13, Court, real WebView, bars
+driven by `SystemBars`): `SystemBars.show()` (top 28→32px, bottom 0→48px) fired the sized probes'
+observer ~108ms later with the correct values; `SystemBars.hide()` (32→28, 48→0) fired them
+~105ms later; a background→resume cycle (Court re-applying immersive mode) fired them again.
+Across the whole session the sized probes fired 10 times; the old padding-shaped probe fired
+exactly **once** — its initial observation — and never on a change.
+
+⚠️ **That measurement corrects a claim this doc used to make here, and it is the sentence that
+kept this design unexplored across four issues (#273 → #579 → #592 → #600): "under
+`setDecorFitsSystemWindows(false)` an Android window keeps its size when the system bars hide, so
+only the insets move and no `ResizeObserver` fires."** The first half is true and now measured:
+`innerWidth`/`innerHeight` stayed a constant 384×832 through every transition above and **zero**
+`resize` events fired, so an observer on the UI ROOT genuinely never fires. The second half does
+not follow from the first and was false as stated — it is true only of an observer on the root,
+whose size genuinely does not change. A probe whose own size *is* the inset resizes exactly when
+the inset does, independent of whatever its ancestor does; the fix was never "make something else
+emit an event", it was "observe a different element."
+
+⚠️ **A sized probe is MORE dangerous than a padding one in one specific way.** `padding` clamps a
+negative to 0 and cannot be `auto`; `height` can be both. Measured in Chromium and WebKit: an
+`env()` name the engine does not know makes the whole size declaration invalid, so height falls
+back to `auto` and the probe reports its OWN content height as the inset — a confident, wrong,
+non-zero number, measured at 18px in both engines. `max()` does not save that; the guard is the
+explicit `0px` fallback *inside* `env(...)`, measured to give 0 in both engines. This deliberately
+differs from `anchorCss.ts`'s `var(--ui-sa-<edge>, env(safe-area-inset-<edge>))`, which has no
+inner fallback and needs none: there the expression sits inside `max(<padding>, …)` on a `padding`
+property, where an invalid value just drops the declaration and yields no padding — safe. Don't
+"align" the two.
+
+⚠️ **A probe whose ancestor is `display:none` reports a confident 0×0, and the callback has to
+reject it rather than write it through** — the same failure `getSafeAreaInsets` guards against on
+the read side (a detached root), arriving through the other door. Measured in both engines:
+`isConnected` stays **true** and `getComputedStyle().height` still reports the correct value, so
+neither can tell a hidden probe from a genuine zero-inset device. `getClientRects().length` is the
+discriminator: a real zero-inset device still has one rect, and so does a root with no box yet —
+only a non-rendered subtree reports none. Detaching the root outright fires nothing at all, in
+either engine, so only the hidden case reaches this guard.
+
+**One synchronous measurement still happens, but only at REGISTRATION** — a mount, a resize, or a
+scene swap handing the module a fresh root (`measureSafeAreaInsets`, called by `UIRenderer`) — to
+get a correct value in place before the first observation arrives. That forced layout is the only
+one left in this module, paid once per registration instead of on a 250ms poll for the life of the
+session.
+
+A **detached** root is refused on both sides. On the read side it is released rather than measured
+(a cheap `isConnected` flag check, not a forced layout): `UIRenderer`'s unmount path never hands
+this module a null, so the stale reference would otherwise keep pointing at a removed node —
+releasing it is also what stops the whole removed subtree being retained. On the **write** side
+`measureSafeAreaInsets` refuses a detached element outright, because `UIRenderer` rAF-defers the
+call that registers a root: a container unmounting in the frame it mounted (a scene swap's
+empty-tree beat, an editor panel closing mid-resize) otherwise lands a registration with a removed
+node, and `getComputedStyle` on a detached probe answers empty strings — every inset rewritten to
+0, which is #273's symptom exactly. `UIRenderer` also cancels that queued frame, so the two guards
+meet in the middle. The last known insets are kept either way: a device's insets do not change
+because some UI unmounted.
+
+⚠️ **The percentages are recomputed against the CURRENT root box on every observation, not against
+the one cached at registration** — a rotation moves the root and the insets together, and the probe
+observation is delivered a frame BEFORE `UIRenderer`'s rAF-deferred re-registration. Measured:
+384×832 → 832×384 with a bottom inset of 48 gives `bottomPct` 5.77 against the stale height where
+12.5 is correct. It self-corrects a frame later, but Court reads these percentages every frame at
+six sites, so the banner, board and narration band would all pop for that frame.
 
 ⚠️ **The preset numbers are mostly PUBLISHED, not measured**, and they model the
 **physical** insets — the notch/Dynamic Island and the home indicator, i.e. what a
