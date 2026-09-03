@@ -849,8 +849,14 @@ an npm `overrides` entry in the owning project's `package.json`. Two live cases:
 
 | Pin | Where | Pulled in by |
 |---|---|---|
-| `"uuid": "^11.1.1"` | every project that depends on `@capacitor/cli` — all of `games/*`, `demos/*`, and the repo root | `@capacitor/cli` → `xcode` → `uuid@^7.0.3` |
+| `"uuid": "^11.1.1"` | every manifest that declares `@capacitor/cli` — 23 today: most of `games/*`, all of `demos/*`, and the repo root | `@capacitor/cli` → `xcode` → `uuid@^7.0.3` |
 | `"nanoid": "^3.3.17"` | the repo root and `site/` | `vite`/`vitest`/`@vitejs/plugin-react`/`@vitest/coverage-v8` (root) and `vitepress` (site), each → `postcss` → `nanoid@^3.3.16` |
+
+⚠️ **"Most of `games/*`" is correct, not drift.** A project with no `@capacitor/cli` — `anim-bug`,
+`video-test`, `ota-subgame-test`, and `engine/templates/starter` today — needs no pin and must not be
+given one; the guard below requires the pin only where the CLI is declared. The two arrive together:
+`ensureCapacitorDeps` (`engine/plugins/addNativeTarget.ts`) writes the pin in the same heal that adds
+`@capacitor/cli`, so gaining a native target cannot reintroduce the gap.
 
 **Add the pin as soon as the project exists, not when the alert fires.** Both of these were caught
 by Dependabot *failing*, not by anyone noticing the gap: a `security_update_not_possible` job exits
@@ -859,6 +865,22 @@ Seven projects (`games/{skin-test,space-console,llm-test,text_demo,timeline-demo
 `demos/{forest-camp,particle-demo}`) were missing the `uuid` pin while this section claimed every
 project had it — the drift was invisible because the doc asserted the invariant instead of the
 re-check command below proving it (#177).
+
+**It recurred, and the same sentence explains why: nothing under `engine/tests/` proved it, so the
+re-check only ran when someone thought to run it.** `games/iap-test` carried no `overrides` block at
+all and resolved `uuid@7.0.3` — found during a 2026-09-03 Dependabot sweep, not by the re-check.
+What made it invisible a second time is worth knowing: its alert had been **dismissed** as
+`not_used` with the reason *"unfixable alone: xcode pins uuid ^7.0.3"*, which is false — an
+`overrides` pin is exactly the fix, and twelve sibling manifests (eleven `games/`+`demos/` projects,
+plus the repo root) had already cleared the identical alert that way. Note the dismissal's two
+halves fail differently: its REACHABILITY claim was sound (`xcode` calls only `uuid.v4()`, and
+GHSA-w5hq-g745-h8pq needs a caller-supplied `buf`), while its FIXABILITY claim in the same sentence
+was not. Judge the halves separately. A dismissal silences the only signal that would have flagged
+the gap, so the argument in one has to be checked against what the other manifests actually did.
+(#87 was reopened on 2026-09-03 so it can close as `fixed` rather than stand as "unfixable".) The invariant is
+now enforced by **`engine/tests/architecture/pinnedTransitiveDeps.test.ts`**, which fails `npm test`
+on either half: a lockfile that resolves a vulnerable version, or a `@capacitor/cli`-dependent
+`package.json` that declares no `uuid` pin.
 
 #### `uuid`
 
@@ -887,7 +909,10 @@ only top-level owners are the test/build toolchain, and in `site/` the sole path
 
 #### Re-checking the set
 
-Do this rather than trusting the table — that is the lesson of #177. Every lockfile at once:
+`engine/tests/architecture/pinnedTransitiveDeps.test.ts` now runs this on every `npm test`, so a
+green gate is the check — the command below is for when you want the answer *now*, mid-edit, without
+the suite. Either way, do this rather than trusting the table; that is the lesson of #177. Every
+lockfile at once:
 
 ```bash
 for f in $(git ls-files '*package-lock.json'); do

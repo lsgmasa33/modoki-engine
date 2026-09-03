@@ -118,6 +118,64 @@ describe('ensureCapacitorDeps', () => {
     const second = ensureCapacitorDeps(root, 'ios', editorRoot);
     expect(second.changed).toBe(false);
   });
+
+  // engine/tests/architecture/pinnedTransitiveDeps.test.ts requires every package.json that
+  // depends on @capacitor/cli to declare overrides.uuid — this scaffolder is the producer, so it
+  // must write the pin in the same call that adds @capacitor/cli, or a freshly-scaffolded project
+  // fails that guard on its very first commit.
+  it('pins overrides.uuid (^11.1.1) when it writes @capacitor/cli (docs/native-and-sdks.md § "Pinned transitive deps")', () => {
+    writePkg();
+    ensureCapacitorDeps(root, 'ios', editorRoot);
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    expect(pkg.dependencies['@capacitor/cli']).toBeDefined();
+    expect(pkg.overrides).toEqual({ uuid: '^11.1.1' });
+  });
+
+  it('preserves an existing overrides block (and its unrelated keys) when adding the uuid pin', () => {
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+      name: 'g',
+      dependencies: {},
+      overrides: { nanoid: '^3.3.17' },
+    }, null, 2) + '\n');
+    ensureCapacitorDeps(root, 'ios', editorRoot);
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    expect(pkg.overrides).toEqual({ nanoid: '^3.3.17', uuid: '^11.1.1' });
+  });
+
+  it('does not clobber an already-set overrides.uuid pin', () => {
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+      name: 'g',
+      dependencies: {},
+      overrides: { uuid: '^12.0.0' },
+    }, null, 2) + '\n');
+    ensureCapacitorDeps(root, 'ios', editorRoot);
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    expect(pkg.overrides).toEqual({ uuid: '^12.0.0' });
+  });
+
+  // The case that separates "pin when we ADD the cli" from "pin whenever the cli is PRESENT": a
+  // manifest already carrying every dependency the heal wants, so the dependency loop changes
+  // NOTHING. Keyed on `addedCli` this heals nobody, and because the file write is gated on
+  // `changed`, the pin would be computed and then thrown away. In this repo the tree-wide guard
+  // makes an unpinned cli unreachable, but a project scaffolded from the public snapshot has no
+  // guard — nativeProjectDeps.test.ts's header is the standing warning that a heal running only on
+  // our machines cannot protect a stranger.
+  it('pins an EXISTING @capacitor/cli project that has no pin, even when no dependency changes', () => {
+    const full = {
+      '@capacitor/app': '^8.1.0', '@capacitor/cli': '^8.3.0', '@capacitor/core': '^8.3.0',
+      '@capacitor/haptics': '^8.0.2', '@capacitor/ios': '^8.3.0', '@capacitor/keyboard': '^8.0.3',
+      '@capacitor/preferences': '^8.0.1', '@capacitor/splash-screen': '^8.0.1',
+      'capacitor-game-debug': '*',
+    };
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'g', dependencies: full }, null, 2) + '\n');
+    const res = ensureCapacitorDeps(root, 'ios', editorRoot);
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    // Reported as changed, and actually PERSISTED — the assertion that fails if `changed` is not
+    // set alongside the pin, which is the whole defect this case exists for.
+    expect(res.changed).toBe(true);
+    expect(pkg.overrides).toEqual({ uuid: '^11.1.1' });
+    expect(pkg.dependencies).toEqual(full); // no dependency was touched
+  });
 });
 
 describe('ensureCapacitorConfig', () => {

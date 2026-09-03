@@ -182,7 +182,7 @@ export function ensureCapacitorDeps(projectRoot: string, platform: NativePlatfor
     raw = JSON.stringify(seed, null, 2) + '\n';
     notesPre.push('created package.json');
   }
-  const pkg = JSON.parse(raw) as { dependencies?: Record<string, string> };
+  const pkg = JSON.parse(raw) as { dependencies?: Record<string, string>; overrides?: Record<string, unknown> };
   pkg.dependencies ??= {};
   const range = capacitorRange(editorRoot);
   const notes: string[] = [...notesPre];
@@ -204,6 +204,25 @@ export function ensureCapacitorDeps(projectRoot: string, platform: NativePlatfor
       pkg.dependencies[name] = spec;
       changed = true;
       notes.push(`added dependency ${name}`);
+    }
+  }
+  // `@capacitor/cli` -> `xcode` -> `uuid@^7.0.3` is vulnerable with no upstream fix (`xcode@latest`
+  // still pins `uuid@^7`) — docs/native-and-sdks.md § "Pinned transitive deps". The pin has to land
+  // in the same write that makes the project depend on the CLI, not wait for a human to add it by
+  // hand (`engine/tests/architecture/pinnedTransitiveDeps.test.ts` enforces it tree-wide).
+  //
+  // Keyed on the CLI being PRESENT, not on this call having just added it: a project that already
+  // declared `@capacitor/cli` without a pin must be healed too. In THIS repo the guard makes that
+  // state unreachable, but a project scaffolded from the public snapshot has no such guard — and
+  // nativeProjectDeps.test.ts's own header is the standing warning that "a heal that only runs on
+  // OUR machines cannot protect a stranger". Preserves any existing `overrides` object and keys,
+  // and never clobbers an already-set pin (a deliberate `^12` stays).
+  if ('@capacitor/cli' in pkg.dependencies) {
+    pkg.overrides ??= {};
+    if (pkg.overrides.uuid === undefined) {
+      pkg.overrides.uuid = '^11.1.1';
+      changed = true; // the write below is gated on `changed` — without this the pin is discarded
+      notes.push('added overrides.uuid pin (^11.1.1) — required by @capacitor/cli -> xcode -> uuid@^7.0.3');
     }
   }
   if (changed) {
