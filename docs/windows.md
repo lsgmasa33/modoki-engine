@@ -139,6 +139,14 @@ load-bearing and commented as such).
     failed on `ci/main` while the Mac gate stayed green. **The prescription above is what caught
     it** — the negative assertion alone would have gone quietly green on Windows; the companion
     "the scan is not vacuously passing" test is what made the breakage loud.
+  - A fourth instance landed 2026-09-03 (`consoleRingOptionsWiring`, from the #633/#626 close-out):
+    both of its offender lists are `path.relative()` output compared against forward-slash literals,
+    so `ci/main`'s `check (windows-latest)` went red on the merge that carried it while the authoring
+    clone's Mac gate — the only gate a worker runs — was structurally unable to see it. This one
+    failed LOUDLY for the reverse of the usual reason: it asserts the offender list EQUALS a named
+    set rather than that it is empty, so broken matching over-reports instead of going quiet. The
+    sweep that followed found `updateEachFanoutGuard`'s `ALLOWLIST` keyed the same way — latent only
+    because that list is empty today, fixed in the same commit.
 
 ## Never shell out to a platform binary whose shape you assumed
 

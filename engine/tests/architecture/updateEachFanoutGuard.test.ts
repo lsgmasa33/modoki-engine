@@ -57,6 +57,13 @@ import ts from 'typescript';
 const engineRoot = path.resolve(__dirname, '../..');
 const repoRoot = path.resolve(engineRoot, '..');
 
+/** Repo-relative POSIX path — `path.relative` yields backslashes on Windows, and `ALLOWLIST`
+ *  entries below are hand-authored with forward slashes. Un-normalised, a single allowlist entry
+ *  would go red on `ci/main`'s Windows leg while the Mac gate stayed green. */
+function relEngineRoot(file: string): string {
+  return path.relative(engineRoot, file).split(path.sep).join('/');
+}
+
 /** Bare-identifier calls that ARE the fan-out (or are verified — see the file banner — to
  *  reach one within their own, different-file body). Exact match only. */
 const SEED_NAMES = new Set([
@@ -228,7 +235,7 @@ function findViolations(): Violation[] {
       const cb = call.arguments[call.arguments.length - 1];
       if (!cb || !(ts.isArrowFunction(cb) || ts.isFunctionExpression(cb))) continue;
       const chain = findFanoutChain(cb.body, localFns, new Set());
-      if (chain) violations.push({ file: path.relative(engineRoot, file), line, chain });
+      if (chain) violations.push({ file: relEngineRoot(file), line, chain });
     }
   }
   return violations;

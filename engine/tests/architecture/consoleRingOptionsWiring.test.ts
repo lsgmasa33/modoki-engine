@@ -23,6 +23,11 @@ import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
  */
 
 const engineDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+
+/** Repo-relative POSIX path — `path.relative` yields backslashes on Windows, and the assertions
+ *  below compare against forward-slash literals. */
+const relPosix = (file: string) => path.relative(engineDir, file).split(path.sep).join('/');
+
 const APP_DIR = path.join(engineDir, 'app');
 const RUNTIME_SRC = path.join(engineDir, 'packages/modoki/src');
 const MAIN = path.join(APP_DIR, 'main.tsx');
@@ -77,7 +82,7 @@ describe('installConsoleRing() options wiring (F8)', () => {
       const src = fs.readFileSync(file, 'utf8');
       if (!src.includes('installConsoleRing')) continue;
       const stripped = stripComments(src);
-      const rel = path.relative(engineDir, file);
+      const rel = relPosix(file);
       assertScanIsSane(src, stripped, rel);
       for (const call of findInstallCalls(stripped)) {
         if (call.hasOptions) withOptions.push(rel);
@@ -92,7 +97,7 @@ describe('installConsoleRing() options wiring (F8)', () => {
       const src = fs.readFileSync(file, 'utf8');
       if (!src.includes('installConsoleRing')) continue;
       const stripped = stripComments(src);
-      const rel = path.relative(engineDir, file);
+      const rel = relPosix(file);
       assertScanIsSane(src, stripped, rel);
       for (const call of findInstallCalls(stripped)) {
         if (!call.hasOptions) noOptions.push(rel);
@@ -108,7 +113,7 @@ describe('installConsoleRing() options wiring (F8)', () => {
     for (const file of [AGENT_BRIDGE, RUNTIME_DEBUG_CONSOLE_CAPTURE]) {
       const src = fs.readFileSync(file, 'utf8');
       const stripped = stripComments(src);
-      const rel = path.relative(engineDir, file);
+      const rel = relPosix(file);
       assertScanIsSane(src, stripped, rel);
       const calls = findInstallCalls(stripped);
       expect(calls.length, `${rel}: expected exactly one installConsoleRing() call`).toBe(1);
@@ -135,7 +140,7 @@ describe('installConsoleRing() options wiring (F8)', () => {
 
   it('neither main.tsx nor App.tsx STATICALLY imports @modoki/engine/runtime/debug — only a dynamic import()/lazy() reaches its option-less caller', () => {
     for (const file of [MAIN, APP_TSX]) {
-      const rel = path.relative(engineDir, file);
+      const rel = relPosix(file);
       const specs = importSpecifiers(fs.readFileSync(file, 'utf8'), rel);
       expect(specs.some((s) => s.includes('runtime/debug')), `${rel}'s static imports: ${JSON.stringify(specs)}`).toBe(false);
     }
@@ -208,7 +213,7 @@ describe('installConsoleRing() options wiring (F8)', () => {
 
       while (queue.length > 0) {
         const file = queue.shift()!;
-        const rel = path.relative(engineDir, file);
+        const rel = relPosix(file);
         const src = fs.readFileSync(file, 'utf8');
         const stripped = stripComments(src);
         assertScanIsSane(src, stripped, rel);
@@ -224,8 +229,8 @@ describe('installConsoleRing() options wiring (F8)', () => {
             let cur = resolved;
             while (cameFrom.has(cur)) { cur = cameFrom.get(cur)!; trail.unshift(cur); }
             throw new Error(
-              `runtime/index.ts statically reaches ${path.relative(engineDir, resolved)} via: `
-              + trail.map((f) => path.relative(engineDir, f)).join(' -> '),
+              `runtime/index.ts statically reaches ${relPosix(resolved)} via: `
+              + trail.map((f) => relPosix(f)).join(' -> '),
             );
           }
           queue.push(resolved);
