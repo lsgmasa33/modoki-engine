@@ -72,7 +72,17 @@ Four contract points, each load-bearing:
 
 **Optional, and omitting it changes nothing.** `games/iap-test` passes no hook and does not need
 one: the fixture holds no game-side state at all, reading `iapBalanceOf()` straight off the ledger,
-so for it the ledger genuinely *is* the truth. `games/court` is the first caller for which it is not.
+so for it the ledger genuinely *is* the truth. `games/court` is the first caller for which it is
+not, and `games/wordweave` is the second (its coin-pack economy, close-out b51fbe4e8..ab562d9ab).
+
+⚠️ **Wordweave's hook DIVERGES from Court's shape on point 1 above, deliberately.** Court's grant
+hook has no early "already applied" return — its value writes span three keys (wallet /
+entitlements / passes), so a re-delivery must re-run all of them (see `courtOnGrantImpl`'s own
+banner, `games/court/runtime/systems.ts`). Wordweave has exactly ONE value (`coins`), living in the
+SAME object as the idempotency marker (`StoredPurchases.iapApplied`), under ONE `PlayerPrefs` key —
+so marker-present implies coins-present by construction, and `wordweaveOnGrant` takes an early
+already-applied return that would be unsafe for Court's multi-key shape. See `creditCoins`'s own
+banner (`games/wordweave/runtime/store.ts`) for exactly when that divergence would have to reverse.
 
 Proved by five rows in `iapCrashMatrix.test.ts` — a refusing hook, a throwing hook, the
 already-granted repair, many relaunches crediting once, and the no-hook default.
