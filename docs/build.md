@@ -89,7 +89,15 @@ A game with no `ios/`/`android/` yet is **auto-scaffolded on the first native bu
 `capacitor.config.json` + vendor plugins → `npm install` → web build → `npx cap add` → heal.
 It then continues into the build, pausing first only if the scaffold surfaces a warning you
 must act on (e.g. missing Firebase config). The explicit **Add … Target** menu items do just
-the scaffold. Manual CLI equivalent: `cd games/<id> && npx cap add ios|android`.
+the scaffold. **A folder left behind by an interrupted scaffold** (editor killed / dialog closed
+mid-`cap add`) **is detected as incomplete and repaired automatically on the next attempt**,
+rather than being permanently misread as "already scaffolded" (#581) —
+`isNativeTargetScaffolded` in `addNativeTarget.ts` is the authoritative check, not folder
+existence. Manual CLI equivalent: `cd games/<id> && npx cap add ios|android`, or
+`node engine/scripts/add-native-targets.mjs games/<id> [--force]` to drive the SAME pipeline from
+a terminal for one or many projects (`--all-missing` sweeps every project missing a platform;
+`--force` regenerates an already-complete target — refused together with `--all-missing`, since
+that combination could regenerate targets nobody asked to touch).
 
 `healNativeConfig` (`engine/plugins/healNativeConfig.ts`) runs on project open **and** at the
 start of every iOS/Android build — it syncs the project's `build.appleTeamId` into the iOS
@@ -472,8 +480,9 @@ starts second rewrites that dist while the first is still copying it, and the fa
   checks for an update**, with no local artifact to inspect first. One human doing two ordinary
   things in one window (start Build → iOS, then Publish OTA while it runs) reaches it.
 - **scaffold ↔ anything** → `npm install` + `cap add` into the project on top of the dist race;
-  two scaffolds for one platform also race the `existsSync(nativeDir)` gate that is supposed to
-  make the route a no-op.
+  two scaffolds for one platform also race the `isNativeTargetScaffolded` gate that is supposed to
+  make the route a no-op. (That gate checks for the platform's real project file, not just the
+  folder — a folder a killed scaffold left half-written is a *different* hazard, fixed in #581.)
 
 Refused, not queued: these run for minutes and nothing cancels one, so a queued SSE stream would sit
 silent and read as a wedged editor. The refusal is a `FAILED:` status naming what holds the slot

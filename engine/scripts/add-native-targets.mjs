@@ -19,9 +19,12 @@
  * second implementation of a sequence that must not diverge from the one that ships. If this
  * file ever grows its own `cap add` call, that divergence has happened.
  *
- * ⚠️ NOT idempotent-by-omission: a project that already has the platform folder is SKIPPED
- * rather than re-scaffolded, because `cap add` on an existing target overwrites hand-healed
- * native config. Use `--force` only when you mean to regenerate.
+ * ⚠️ NOT idempotent-by-omission: a project whose platform folder is already a COMPLETE target
+ * is SKIPPED rather than re-scaffolded, because `cap add` on an existing target overwrites
+ * hand-healed native config. An INCOMPLETE folder (left by an interrupted earlier scaffold,
+ * #581) is NOT skipped — it's removed and re-scaffolded automatically, same as the editor's
+ * "Add Native Target" action. Use `--force` only when you mean to regenerate a genuinely
+ * complete target.
  */
 
 import fs from 'node:fs';
@@ -49,6 +52,16 @@ const PLATFORMS = platIdx >= 0 ? [platArg] : ['android', 'ios'];
 for (const p of PLATFORMS) {
   if (p !== 'ios' && p !== 'android') { console.error(`unknown platform: ${p}`); process.exit(2); }
 }
+if (ALL && FORCE) {
+  console.error(
+    '--force cannot be combined with --all-missing: --all-missing discovers projects by which ' +
+    'platform is MISSING, and --force would then also regenerate any OTHER, already-complete ' +
+    'platform on each discovered project — e.g. a project missing only ios/ would have its ' +
+    'complete android/ force-removed too, though nobody asked for that. Pass explicit project ' +
+    'paths with --force instead of --all-missing.',
+  );
+  process.exit(2);
+}
 
 /** Engine test fixtures, not shipped games — excluded from `--all-missing` so a sweep does not
  *  generate native projects nobody will ever run. Name them explicitly to add one anyway. */
@@ -63,12 +76,13 @@ function discoverMissing() {
       if (FIXTURES.has(id)) continue;
       const proj = path.join(dir, id);
       if (!fs.existsSync(path.join(proj, 'project.config.json'))) continue;
-      if (PLATFORMS.some((p) => !fs.existsSync(path.join(proj, p)))) out.push(`${root}/${id}`);
+      if (PLATFORMS.some((p) => !isNativeTargetScaffolded(proj, p))) out.push(`${root}/${id}`);
     }
   }
   return out;
 }
 
+const { scaffoldNativeTarget, loadProjectConfig, isNativeTargetScaffolded } = await loadPluginModules();
 const specs = ALL ? discoverMissing() : argv.filter((a) => !a.startsWith('--') && a !== platArg);
 if (!specs.length) {
   console.error('usage: add-native-targets.mjs [--platform ios|android] [--dry-run] [--force] <project…> | --all-missing');
@@ -85,7 +99,7 @@ if (!specs.length) {
  *  `Cannot read properties of undefined (reading 'webDir')` — a raw config is not a ProjectConfig,
  *  it is the SPARSE OVERRIDE of one. */
 async function loadPluginModules() {
-  const stamp = `${process.pid}-${specs.length}`;
+  const stamp = `${process.pid}`;
   const load = async (rel, name) => {
     const outfile = path.join(os.tmpdir(), `modoki-${name}-${stamp}.mjs`);
     await build({
@@ -119,8 +133,6 @@ const makeRunShell = (projectRoot) => (label, cmd, cwd) => new Promise((resolve)
   proc.on('error', (e) => { console.error(`ERROR: ${e.message}`); resolve(false); });
 });
 
-const { scaffoldNativeTarget, loadProjectConfig } = await loadPluginModules();
-
 const results = [];
 for (const spec of specs) {
   const projectRoot = path.join(repoRoot, spec);
@@ -129,16 +141,25 @@ for (const spec of specs) {
   // The MERGED config, not the raw file — see loadPluginModules().
   const cfg = loadProjectConfig(projectRoot);
   for (const platform of PLATFORMS) {
-    if (fs.existsSync(path.join(projectRoot, platform)) && !FORCE) {
+    const complete = isNativeTargetScaffolded(projectRoot, platform);
+    if (complete && !FORCE) {
       results.push([spec, platform, 'skip: already present']);
       continue;
     }
-    if (DRY) { results.push([spec, platform, 'WOULD SCAFFOLD']); continue; }
+    if (DRY) {
+      results.push([spec, platform, complete ? 'WOULD FORCE-REMOVE + RESCAFFOLD' : 'WOULD SCAFFOLD']);
+      continue;
+    }
     console.log(`\n═══ ${spec} → ${platform}  (appId ${cfg.app?.appId ?? '(none)'}) ═══`);
     try {
+      // `force` here just tells scaffoldNativeTarget it's allowed to remove an ALREADY-complete
+      // folder (not just an incomplete leftover) — the removal itself, and the Firebase-survivor
+      // guard around it, live entirely inside scaffoldNativeTarget now (not duplicated here), so
+      // --force goes through the exact same code path as the automatic incomplete-folder repair.
       const { warnings } = await scaffoldNativeTarget({
         projectRoot, platform, buildCwd: repoRoot, cfg,
         send: (m) => console.log(m), runShell: makeRunShell(projectRoot),
+        force: FORCE,
       });
       for (const w of warnings) console.log(`⚠️  ${w}`);
       results.push([spec, platform, warnings.length ? `ok (${warnings.length} warning(s))` : 'ok']);

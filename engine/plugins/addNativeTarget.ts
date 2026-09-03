@@ -38,6 +38,50 @@ export function isPlausibleProjectDir(projectRoot: string): boolean {
     .some((m) => fs.existsSync(path.join(projectRoot, m)));
 }
 
+/** Is `<projectRoot>/<platform>` a COMPLETE native scaffold, not merely a folder that exists?
+ *  `cap add` extracts an entire platform template as ONE sequential tar stream — entries land on
+ *  disk in archive order, so only the LAST entry existing is a reliable "extraction fully
+ *  completed" signal. An early-archive file is NOT enough: `App.xcodeproj/project.pbxproj` is
+ *  entry 2 of 20 in the iOS template and `app/build.gradle` is entry 3 of 52 in the Android one
+ *  (measured against the pinned `@capacitor/cli` templates), so a kill partway through extraction
+ *  routinely leaves that file present while most of the template is still missing — checking it
+ *  alone false-positived on 40/58 (android) and 17/47 (ios) SIGKILL-interrupted extractions in
+ *  testing (#581 review). `debug.xcconfig` / `variables.gradle` are each the LAST entry in their
+ *  respective template and are present in every native project in this repo; requiring BOTH the
+ *  early and the late marker (rather than the tail alone) is defense-in-depth against a future
+ *  `@capacitor/cli` template reorder — re-verify these two paths when bumping its major version.
+ *
+ *  CAVEAT: `npx cap add ios --packagemanager CocoaPods` uses a DIFFERENT template
+ *  (`ios-pods-template.tar.gz`) that has no `debug.xcconfig` at all — a target scaffolded that
+ *  way would always read as incomplete here. Not reachable through this engine's own tooling
+ *  (`scaffoldNativeTarget` always calls plain `npx cap add ios`, and this repo forbids
+ *  CocoaPods-for-SDKs — see CLAUDE.md § Native SDK Pattern), but worth knowing if a CocoaPods iOS
+ *  project is ever hand-imported.
+ *
+ *  A folder that exists but fails this check is what a `cap add`/`cap sync` killed mid-run leaves
+ *  behind (#581) — plain `existsSync(<platform>/)` can't tell that apart from a real target, and
+ *  neither can Capacitor's OWN `cap add` (its `getProjectPlatformDirectory` check is the identical
+ *  existence-only proxy, one layer down — see `@capacitor/cli/dist/tasks/add.js`), so a stale
+ *  leftover folder makes `cap add` fatal every time until something removes it first (see the
+ *  repair step in scaffoldNativeTarget).
+ *
+ *  NOTE: this only certifies the TEMPLATE EXTRACTION finished. `cap add` continues past extraction
+ *  into writing the real bundle id/app name into the extracted files and running `cap sync` — a
+ *  kill in THAT window leaves a fully-extracted-but-still-templated project (bundle id still
+ *  `com.getcapacitor.myapp`), which this predicate reads as complete and does NOT repair. */
+export function isNativeTargetScaffolded(projectRoot: string, platform: NativePlatform): boolean {
+  const markers = platform === 'ios'
+    ? [
+        path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj'),
+        path.join(projectRoot, 'ios', 'debug.xcconfig'),
+      ]
+    : [
+        path.join(projectRoot, 'android', 'app', 'build.gradle'),
+        path.join(projectRoot, 'android', 'variables.gradle'),
+      ];
+  return markers.every((m) => fs.existsSync(m));
+}
+
 /** The @capacitor/<platform> package a target needs. */
 function platformPkg(platform: NativePlatform): string {
   return platform === 'ios' ? '@capacitor/ios' : '@capacitor/android';
@@ -258,8 +302,49 @@ export async function scaffoldNativeTarget(opts: {
   cfg: ProjectConfig;
   send: (msg: string) => void;
   runShell: (label: string, cmd: string, cwd: string) => Promise<boolean>;
+  /** Remove and regenerate an already-COMPLETE target too, not just an incomplete leftover left
+   *  by an interrupted run. Only the CLI's explicit `--force` flag ever sets this — a human typed
+   *  it, so the destructive intent is unambiguous; the editor never passes it. Still refused by
+   *  the Firebase-survivor guard below: --force means "regenerate", not "discard a config that
+   *  can't be regenerated". */
+  force?: boolean;
 }): Promise<{ warnings: string[] }> {
-  const { projectRoot, platform, buildCwd, cfg, send, runShell } = opts;
+  const { projectRoot, platform, buildCwd, cfg, send, runShell, force = false } = opts;
+  const platformDir = path.join(projectRoot, platform);
+  const alreadyComplete = isNativeTargetScaffolded(projectRoot, platform);
+  const willRemove = fs.existsSync(platformDir) && (force || !alreadyComplete);
+  // #581: `cap add` refuses outright if <platform>/ exists at all, complete or not — its own
+  // existence-only check (see isNativeTargetScaffolded's doc) can't tell a genuine target from
+  // one a killed `cap add`/`cap sync` left half-written; that folder gets removed below, right
+  // before `cap add` runs (step 4), so steps 1-3 (npm install, a full web build) never run
+  // against a project this function then decides isn't recoverable — and are never wasted
+  // destroying a working project if one of them fails first.
+  //
+  // The one case worth refusing outright is checked HERE, at entry, before any of steps 1-3: a
+  // Firebase config file inside the folder. Nothing user-authored belongs in a folder that fails
+  // isNativeTargetScaffolded under the ordinary (non-force) repair path — a kill during template
+  // extraction only ever leaves PRISTINE template files (step 3 below writes machine-derived
+  // config like android/local.properties into the same folder via healNativeConfig, but that's
+  // regenerated identically every run, not user content). Firebase config is the one exception
+  // that can plausibly land there out-of-band, and it's the ONLY thing a genuinely COMPLETE
+  // target's `force` removal could destroy for real, so the same guard covers both cases.
+  // Checking this before steps 1-3 also means a doomed run fails in seconds instead of holding
+  // the shared build slot through a multi-minute install first.
+  if (willRemove) {
+    const firebaseFiles = platform === 'ios'
+      ? [path.join(platformDir, 'App', 'App', 'GoogleService-Info.plist')]
+      : [path.join(platformDir, 'app', 'google-services.json')];
+    const survivor = firebaseFiles.find((f) => fs.existsSync(f));
+    if (survivor) {
+      const why = alreadyComplete
+        ? `${platform}/ is a complete target, but --force was requested and it`
+        : `${platform}/ is incomplete (an earlier scaffold was interrupted) but`;
+      throw new Error(
+        `${why} contains ${path.relative(projectRoot, survivor)} — move that file somewhere ` +
+        `safe, delete ${platform}/ by hand, then run this again.`,
+      );
+    }
+  }
   // 1. In-process scaffold: deps + capacitor.config.json + vendor plugins.
   for (const n of ensureCapacitorDeps(projectRoot, platform, buildCwd).notes) send(n);
   for (const n of ensureCapacitorConfig(projectRoot, cfg).notes) send(n);
@@ -270,6 +355,15 @@ export async function scaffoldNativeTarget(opts: {
   writeVendorMarker(projectRoot, v.expectedVendor); // record installed tarballs (D3)
   // 3. Web build → <project>/dist (cap add needs webDir to exist).
   if (!(await runShell('Building web assets', 'node engine/scripts/build-web.mjs --target native', buildCwd))) throw new Error('web build failed');
+  // The actual removal — deferred to HERE (right before cap add, after steps 1-3 already
+  // succeeded) rather than at entry, so a failure in npm install / the web build never costs a
+  // `force`-targeted project its native folder for nothing.
+  if (willRemove) {
+    send(force && alreadyComplete
+      ? `--force: removing existing ${platform}/ to regenerate it…`
+      : `Removing incomplete ${platform}/ left by an earlier interrupted scaffold…`);
+    fs.rmSync(platformDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 400 });
+  }
   // 4. cap add (project) — generates the native project with the capacitor.config identity baked in.
   if (!(await runShell(`cap add ${platform}`, `npx cap add ${platform}`, projectRoot))) throw new Error(`cap add ${platform} failed`);
   // 5. Heal native config (local.properties / DEVELOPMENT_TEAM) + flag missing Firebase.

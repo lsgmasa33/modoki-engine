@@ -75,7 +75,7 @@ import {
 } from './releaseBuild';
 import { PROJECT_USER_CONFIG_FILENAME } from '../project-config';
 import { iconIsUpToDate, iconStampValue } from './iconAssets';
-import { ensureCapacitorDeps, scaffoldNativeTarget, type NativePlatform } from './addNativeTarget';
+import { ensureCapacitorDeps, scaffoldNativeTarget, isNativeTargetScaffolded, type NativePlatform } from './addNativeTarget';
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
 import { writeBackendResult } from './backend/writeResult';
@@ -1656,9 +1656,12 @@ export function assetScannerPlugin(): Plugin {
           // The SAME slot /api/build and /api/ota/publish take (#173 close-out). The scaffold runs
           // the identical `build-web.mjs --target native` into the identical `<project>/dist`
           // (addNativeTarget.ts), and additionally `npm install`s and `cap add`s into the project —
-          // so racing a build corrupts dist, and racing ITSELF corrupts node_modules or leaves a
-          // half-written ios/ that this route's own `existsSync(nativeDir)` gate then reads as
-          // "already scaffolded". Nothing deduped two calls for the same platform before this.
+          // so racing a build corrupts dist, and racing ITSELF corrupts node_modules. Nothing
+          // deduped two calls for the same platform before this. This lock stops two scaffolds
+          // racing each other; it does nothing about ONE scaffold getting killed mid-`cap add` —
+          // that's #581, and the half-written folder it leaves behind is no longer read as
+          // "already scaffolded" (see isNativeTargetScaffolded + the repair step it drives in
+          // scaffoldNativeTarget, below).
           const scaffoldSlot = acquireBuild(`${platform} native scaffold`);
           if (!scaffoldSlot.ok) {
             send(`[native] ${scaffoldSlot.message}`);
@@ -1697,11 +1700,18 @@ export function assetScannerPlugin(): Plugin {
           (async () => {
             const TOTAL = 5;
             try {
-              if (fs.existsSync(nativeDir)) {
+              // #581: existsSync(nativeDir) alone can't tell a genuine target from a folder a
+              // killed `cap add`/`cap sync` left half-written — isNativeTargetScaffolded checks
+              // for the platform's real project file. An incomplete folder falls through into
+              // scaffoldNativeTarget below, which removes it and re-scaffolds cleanly.
+              if (isNativeTargetScaffolded(projectRoot, platform)) {
                 sendStatus(`FAILED:${platform}/ already exists`);
                 send(`This project already has a ${platform}/ folder — nothing to do.`);
                 res.end();
                 return;
+              }
+              if (fs.existsSync(nativeDir)) {
+                send(`Found an incomplete ${platform}/ folder from an earlier interrupted scaffold — repairing it.`);
               }
               // Progress is coarse-grained here (the shared helper streams its own
               // per-step `── label ──` lines); nudge the step bar around the phases.
@@ -2368,7 +2378,8 @@ export function assetScannerPlugin(): Plugin {
           // "Add Native Target" action) below, inside the SSE stream — then pause
           // if it surfaces a warning the user must act on (missing Firebase).
           const needsNativeScaffold =
-            (platform === 'ios' || platform === 'android') && !fs.existsSync(path.join(projectRoot, platform));
+            (platform === 'ios' || platform === 'android') &&
+            !isNativeTargetScaffolded(projectRoot, platform as NativePlatform);
 
           // iOS device builds need a target device: the xcodebuild -destination interpolates
           // the configured id (the devicectl install/launch steps interpolate the SEPARATE,
@@ -2596,7 +2607,11 @@ export function assetScannerPlugin(): Plugin {
             // Firebase config) so they can act before the build runs against it.
             if (needsNativeScaffold) {
               sendStatus(`Adding ${platform} target…`);
-              send(`\nThis project has no ${platform}/ folder yet — scaffolding it before building.`);
+              if (fs.existsSync(path.join(projectRoot, platform))) {
+                send(`\nFound an incomplete ${platform}/ folder from an earlier interrupted scaffold — repairing it before building.`);
+              } else {
+                send(`\nThis project has no ${platform}/ folder yet — scaffolding it before building.`);
+              }
               let warnings: string[];
               try {
                 ({ warnings } = await scaffoldNativeTarget({ projectRoot, platform: platform as NativePlatform, buildCwd, cfg, send, runShell: runScaffoldShell }));
