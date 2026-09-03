@@ -1,5 +1,7 @@
 package com.modokiengine.capacitor.iap;
 
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.webkit.WebView;
 
@@ -68,8 +70,42 @@ public class ModokiIapPlugin extends Plugin {
 
     /** The call awaiting launchBillingFlow's async result. Play delivers the purchase through the
      *  listener, not the launch call, so the call has to be parked. */
-    private PluginCall awaitingPurchase;
-    private String awaitingProductId;
+    private volatile PluginCall awaitingPurchase;
+    private volatile String awaitingProductId;
+
+    /** How long a parked purchase() may wait AFTER a non-matching purchasesUpdated delivery before
+     *  it is released as cancelled (#583).
+     *
+     *  ⚠️ Armed from the NO-MATCH branch only — never at park time. That distinction is the whole
+     *  safety argument, and an earlier draft got it wrong. Arming at park bounds every purchase,
+     *  including one whose Play sheet is legitimately still open (adding a card, awaiting
+     *  Ask-to-Buy); it then resolves `{transaction:null}`, which settles the JS promise, which
+     *  clears Court's `storeInFlight` — and `storeInFlight`'s own doc records that the last
+     *  omission in that area was a DOUBLE CHARGE. Measured on an A23 (2026-09-03): the park-time
+     *  variant fired with the sheet still on screen. Bounding only the case #583 actually describes
+     *  — an OK delivery that arrived without the awaited product — leaves a live sheet alone.
+     *
+     *  A real purchase completing after this fires is recovered by reconcile(), which the
+     *  purchasesUpdated listener drives in-process, not only at next launch. */
+    private static final long PARKED_PURCHASE_TIMEOUT_MS = 5 * 60_000L;
+
+    /** ⚠️ THREE different threads touch the parked slot — do not assume single-threading, and do not
+     *  believe a comment that names only one (two earlier drafts of this one were wrong).
+     *   - The PARK runs on a Play Billing worker: `queryProductDetailsAsync` submits to
+     *     `Executors.newFixedThreadPool(availableProcessors())` and invokes the callback directly
+     *     with no Handler post, and the park sits inside that callback. NOT main, and NOT
+     *     Capacitor's `HandlerThread("CapacitorPlugins")` (`Bridge.java:138`/`:854`), which only
+     *     carries purchase()'s outer body.
+     *   - `onPurchasesUpdated` and the WebViewListener run on MAIN.
+     *   - `unpark()` is reached from both.
+     *  Hence `volatile` on the two fields for visibility, and `lock` around the compound
+     *  check-and-park: an N-way pool means two purchase() calls really can read the slot as free at
+     *  the same instant, and the loser would park a call nothing can ever settle — the exact defect
+     *  #583 bounds, on the one path a stale-fire guard cannot rescue. */
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    /** The #583 timeout currently armed for `awaitingPurchase`, so unpark() can cancel it. Null
+     *  whenever nothing is parked. */
+    private Runnable awaitingPurchaseTimeout;
 
     /**
      * Release the parked purchase slot for `call` and close its bridge lifecycle.
@@ -79,7 +115,9 @@ public class ModokiIapPlugin extends Plugin {
      * the response's `save` field — so clearing the flag afterwards changes nothing.
      *
      * The slot is only cleared if `call` still owns it, so a settle that lost a race cannot wipe
-     * a newer purchase's parking.
+     * a newer purchase's parking. The same check gates cancelling the #583 timeout, for the same
+     * reason: a stale call unparking after a NEW purchase() has already taken the slot must not
+     * cancel that newer call's timeout.
      *
      * ⚠️ On Android today the keep-alive is INERT rather than a leak, and #514 was filed on the
      * opposite reading — do not re-diagnose it. `Bridge.callPluginMethod` saves a call only if it
@@ -91,11 +129,49 @@ public class ModokiIapPlugin extends Plugin {
      * every settle path here is already correct.
      */
     private void unpark(PluginCall call) {
-        if (awaitingPurchase == call) {
-            awaitingPurchase = null;
-            awaitingProductId = null;
+        synchronized (lock) {
+            // ⚠️ The timer cancel belongs INSIDE this identity check, not above it. A settle that
+            // lost a race must not cancel the timer belonging to the NEWER call that now holds the
+            // slot — that would restore #583 exactly. Pinned by iapParkedCallRelease.test.ts.
+            if (awaitingPurchase == call) {
+                if (awaitingPurchaseTimeout != null) {
+                    mainHandler.removeCallbacks(awaitingPurchaseTimeout);
+                    awaitingPurchaseTimeout = null;
+                }
+                awaitingPurchase = null;
+                awaitingProductId = null;
+            }
         }
         call.setKeepAlive(false);
+    }
+
+    /**
+     * Arm the #583 stranding bound. Called ONLY from the no-match branch of
+     * `onPurchasesUpdated` — see {@code PARKED_PURCHASE_TIMEOUT_MS} for why never at park time —
+     * and re-armed on each further non-matching delivery, so the window is measured from the last
+     * thing we heard rather than from the start of the purchase.
+     */
+    private void armStrandTimeout(PluginCall call, String productId) {
+        if (awaitingPurchaseTimeout != null) mainHandler.removeCallbacks(awaitingPurchaseTimeout);
+        awaitingPurchaseTimeout = () -> {
+            if (awaitingPurchase != call) return;
+            Log.i(TAG, "purchase timeout: no matching purchasesUpdated delivery for "
+                + productId + " within " + PARKED_PURCHASE_TIMEOUT_MS
+                + "ms of the last non-matching one — releasing as cancelled");
+            unpark(call);
+            JSObject r = new JSObject();
+            r.put("transaction", JSObject.NULL);
+            call.resolve(r);
+        };
+        mainHandler.postDelayed(awaitingPurchaseTimeout, PARKED_PURCHASE_TIMEOUT_MS);
+    }
+
+    /** Drop anything still posted so a pending #583 timer cannot pin this Activity's Bridge and
+     *  WebView in the main looper for the rest of its window. */
+    @Override
+    protected void handleOnDestroy() {
+        super.handleOnDestroy();
+        mainHandler.removeCallbacksAndMessages(null);
     }
 
     /**
@@ -234,6 +310,14 @@ public class ModokiIapPlugin extends Plugin {
             } else {
                 Log.i(TAG, "  delivery does not contain the awaited product (" + awaitingProductId
                     + ") — leaving the call parked rather than reporting a false cancel");
+                // #583: leaving it parked is right, leaving it parked FOREVER is not. Nothing else
+                // bounds this: if no later delivery ever matches, the slot stays occupied for the
+                // life of the process — the product refuses every purchase() with "already in
+                // progress", and in Court `storeInFlight` never clears, which also leaves the
+                // `court.purchase` reload blocker reading blocked and silently disables #574's
+                // resume-reload. unpark() cancels the timer the moment the call settles any other
+                // way.
+                armStrandTimeout(call, awaitingProductId);
             }
         }
     };
@@ -561,15 +645,25 @@ public class ModokiIapPlugin extends Plugin {
                     // hung FOREVER: a double-tapped Buy button left `await purchase(...)` pending
                     // for the life of the process. Play only runs one billing flow anyway, so
                     // refusing is both correct and what the store would do.
-                    if (awaitingPurchase != null) {
-                        call.reject("a purchase is already in progress (" + awaitingProductId + ")");
-                        return;
-                    }
                     // Register the reload listener BEFORE the call becomes reachable from it.
-                    // See ensureWebViewListener() for why this cannot live in load().
+                    // See ensureWebViewListener() for why this cannot live in load(). Deliberately
+                    // OUTSIDE the monitor below: it calls into the Bridge, and holding `lock`
+                    // across a foreign call is how deadlocks get written.
                     ensureWebViewListener();
-                    awaitingPurchase = call;
-                    awaitingProductId = productId;
+                    // ⚠️ Check-and-park is ONE atomic step. This runs on a Play Billing pool
+                    // thread (see the field comments), so two purchase() calls can reach here at
+                    // the same instant; unsynchronised, both would read the slot as free and the
+                    // loser would park a setKeepAlive(true) call reachable from nothing — the
+                    // "hung FOREVER" failure the comment above describes, which the guard was
+                    // added to prevent and which a non-atomic guard does not.
+                    synchronized (lock) {
+                        if (awaitingPurchase != null) {
+                            call.reject("a purchase is already in progress (" + awaitingProductId + ")");
+                            return;
+                        }
+                        awaitingPurchase = call;
+                        awaitingProductId = productId;
+                    }
                     call.setKeepAlive(true);
 
                     Log.i(TAG, "launchBillingFlow: product=" + productId + " type=" + type);

@@ -471,6 +471,46 @@ someone re-attaches it and unknowingly tests against a stale product list.
   `a19f2be8d`'s commit message that a debug-signed APK "genuinely cannot match the Play Console
   listing" is wrong — that symptom is explained by the missing `@PluginMethod` on `products()`, which
   failed every Android call however the APK was signed.
+- ⚠️ **A parked `purchase()` has a 5-minute native timeout (#583) — and it HAD to be native.** When
+  `purchasesUpdated` fires OK with a list that does not contain the awaited product, the call is
+  deliberately left parked (the delivery may be an unrelated Ask-to-Buy approval or a renewal).
+  Nothing bounded that, so a delivery that never matched left the slot occupied for the life of the
+  process: the product refused every later `purchase()` with "already in progress", and in Court
+  `storeInFlight` never cleared either — which made the `court.purchase` reload blocker read blocked
+  forever and **silently disabled the whole #574 resume-reload for the process**. `armStoreWatchdog`
+  does not help; by design it releases the SCREEN, not the purchase.
+  A JS-side timeout in `purchaseService.ts` would NOT have worked, and the fix is worth understanding
+  for that reason: the stuck resource is `awaitingPurchase`, a plugin FIELD. Settling the JS promise
+  clears `storeInFlight` but leaves the native slot parked, so the next `purchase()` still hits the
+  hard reject — one confusing "cancelled" followed by a permanent refusal that merely LOOKS fixed.
+  ⚠️ **It is armed from the NO-MATCH BRANCH ONLY — never at park time**, and that distinction is the
+  whole safety argument. A park-time draft shipped first and close-out review killed it: arming at
+  park bounds EVERY purchase, including one whose Play sheet is legitimately still open, and firing
+  resolves `{transaction:null}`, which settles the JS promise, which clears `storeInFlight` — whose
+  own doc records that the last omission in that area was a DOUBLE CHARGE. That was not theoretical:
+  the park-time build was measured on the A23 firing at 10:55:25 with the sheet still on screen.
+  Bounding only the case #583 describes — an OK delivery that arrived without the awaited product,
+  re-armed on each further non-matching one — leaves a live sheet alone. Cancelled in `unpark()`, the
+  single choke point every settle path routes through (including #586's reload release), with the
+  cancel INSIDE the `awaitingPurchase == call` identity check so a stale settle cannot cancel a newer
+  call's timer.
+  Three further things review forced, all pinned by `iapParkedCallRelease.test.ts` and each verified
+  by mutation (break it, watch exactly one test go red, restore):
+  **(a)** the check-and-park is `synchronized (lock)` and the two fields are `volatile` — the park runs
+  on a Play Billing THREAD POOL (`queryProductDetailsAsync` submits to
+  `Executors.newFixedThreadPool(availableProcessors())` and calls back directly, no Handler post), so
+  a non-atomic guard lets two `purchase()` calls both see the slot free and the loser parks a
+  `setKeepAlive(true)` call nothing can settle — the very defect #583 bounds, on the one path a
+  stale-fire guard cannot rescue; **(b)** `handleOnDestroy()` drops anything posted, since an armed
+  timer strongly holds the `PluginCall` → `Bridge` → `WebView` → `Activity`; **(c)** the fire path
+  unparks BEFORE resolving, matching every other settle site.
+  ⚠️ **What the device session verified was the TIMER MECHANISM, not this arm site.** Parked
+  10:50:25.955 → fired 10:55:25.956 → JS promise resolved `{transaction:null}` → a second
+  `launchBillingFlow` launched → zero `already in progress`. That was the park-time build, because
+  the no-match branch needs Play to deliver an OK purchase list without the awaited product, which is
+  precisely why #583 was filed as a static-analysis finding and never reproduced. The arm site is
+  therefore covered by the source guards and by reasoning, not by a device trace — treat it as such.
+
 - ⚠️ **The precondition that DOES gate it is a Play LICENCE-TESTER account on a published app.**
   Court is on internal testing (#370), and the human confirmed the sheet shows the real price against
   a licensed test account — a free test purchase. That is the documented Google condition, and it is

@@ -7,12 +7,13 @@
  *  `ModokiIapPlugin.java` parks the `purchase()` call in `awaitingPurchase` (+
  *  `awaitingProductId`) because Google Play reports the outcome through
  *  `purchasesUpdatedListener`, not through `purchase()` itself, and calls `call.setKeepAlive(true)`
- *  at the parking site. There are FIVE places that can settle that call — `USER_CANCELED`, a
- *  non-OK/null delivery, a matched delivery, a `launchBillingFlow` launch failure, and (since
+ *  at the parking site. There are SIX places that can settle that call — `USER_CANCELED`, a
+ *  non-OK/null delivery, a matched delivery, a `launchBillingFlow` launch failure, (since
  *  #586) a webview reload, which releases the slot from a `WebViewListener.onPageStarted`
  *  registered by `ensureWebViewListener()` at PARK time — NOT from `load()`, where the listener is
  *  silently discarded by `Bridge.Builder.create()`'s `setWebViewListeners` (device-proven on an
- *  S22, 2026-09-03; see docs/native-and-sdks.md). The original four each used to clear `awaitingPurchase` by hand, with
+ *  S22, 2026-09-03; see docs/native-and-sdks.md) — and (since #583) a bounded timeout for a call
+ *  left parked with no delivery ever matching it. The original four each used to clear `awaitingPurchase` by hand, with
  *  three of them leaving `awaitingProductId` stale and NONE of them clearing `setKeepAlive`. A future settle path copy-pasted from one of
  *  those sites inherits the same gap silently: nothing here throws, nothing here fails a runtime
  *  test, because the bug is a flag that is never read on the paths this repo currently exercises.
@@ -199,7 +200,7 @@ describe('ModokiIapPlugin: every purchase-call settle path clears the parked slo
     ).toBe(1);
   });
 
-  it('unpark() is called from exactly 5 real settle sites (comments/declaration excluded)', () => {
+  it('unpark() is called from exactly 6 real settle sites (comments/declaration excluded)', () => {
     // Counting the bare substring `unpark(` over the whole file is fooled by a prose comment
     // mentioning `unpark(call)` (inflates the count, masking a REMOVED call site) just as easily
     // as it is by the declaration — so only count lines that are themselves a statement calling
@@ -207,15 +208,199 @@ describe('ModokiIapPlugin: every purchase-call settle path clears the parked slo
     const callSites = countUnparkCallSites(source);
     expect(
       callSites,
-      `found ${callSites} real unpark() call sites in ModokiIapPlugin.java — expected exactly 5, `
+      `found ${callSites} real unpark() call sites in ModokiIapPlugin.java — expected exactly 6, `
         + 'the enumerated settle paths: USER_CANCELED, a non-OK/null delivery, a matched delivery, '
-        + 'a launchBillingFlow failure, and the webview-reload release in the '
-        + 'ensureWebViewListener() WebViewListener (#586). A different count means either a settle path is '
+        + 'a launchBillingFlow failure, the webview-reload release in the '
+        + 'ensureWebViewListener() WebViewListener (#586), and the parked-purchase timeout (#583). '
+        + 'A different count means either a settle path is '
         + 'clearing the parked call by hand instead of calling unpark(call) (fewer), or a genuine '
         + 'new settle path has appeared that this guard doesn\'t know about yet (more) — in the '
         + 'latter case, update this expectation and the enumeration above once you\'ve confirmed '
         + 'the new site really does route through unpark().',
-    ).toBe(5);
+    ).toBe(6);
+  });
+});
+
+describe('ModokiIapPlugin: a parked purchase() times out instead of waiting forever (#583)', () => {
+  // The trap this closes: `purchasesUpdated` firing OK with a purchase list that never contains
+  // the awaited product is left parked ON PURPOSE (an Ask-to-Buy approval or a subscription
+  // renewal delivered while an unrelated purchase is in flight). But if no later delivery ever
+  // matches, nothing released the slot.
+  //
+  // ⚠️ The timer is armed from the NO-MATCH BRANCH ONLY, never at park time. Close-out review
+  // caught the park-time draft: it bounds every purchase, including one whose Play sheet is
+  // legitimately still open, and resolving it settles the JS promise, which clears Court's
+  // `storeInFlight` — whose own doc records that the last omission there was a DOUBLE CHARGE.
+  // Several assertions below exist specifically to stop that draft coming back.
+
+  /** The body of the `if (awaitingPurchase == call) { ... }` identity guard inside unpark(). The
+   *  timer cancel must live IN here: a settle that lost a race must not cancel the NEWER call's
+   *  timer. Asserting against the whole unpark() body cannot tell the two apart. */
+  function extractUnparkIdentityGuard(src: string): string {
+    const body = extractUnparkBody(src);
+    const sig = 'if (awaitingPurchase == call) {';
+    const start = body.indexOf(sig);
+    if (start === -1) throw new Error('unpark() has no `if (awaitingPurchase == call) {` guard');
+    let depth = 1;
+    let i = start + sig.length;
+    const bodyStart = i;
+    for (; i < body.length && depth > 0; i++) {
+      if (body[i] === '{') depth++;
+      else if (body[i] === '}') depth--;
+    }
+    if (depth !== 0) throw new Error('unpark() identity-guard braces never balanced');
+    return body.slice(bodyStart, i - 1);
+  }
+
+  /** Body of `private void armStrandTimeout(...) { ... }`. */
+  function extractArmHelper(src: string): string {
+    const sig = 'private void armStrandTimeout(PluginCall call, String productId) {';
+    const start = src.indexOf(sig);
+    if (start === -1) {
+      throw new Error(`could not find "${sig}" — has the #583 arm helper been renamed or removed?`);
+    }
+    let depth = 1;
+    let i = start + sig.length;
+    const bodyStart = i;
+    for (; i < src.length && depth > 0; i++) {
+      if (src[i] === '{') depth++;
+      else if (src[i] === '}') depth--;
+    }
+    if (depth !== 0) throw new Error('armStrandTimeout braces never balanced');
+    return src.slice(bodyStart, i - 1);
+  }
+
+  it('arms ONLY from the no-match branch — never at park time', () => {
+    // ⚠️ Count EVERY call site, not one literal argument spelling. The first draft of this
+    // assertion pinned `armStrandTimeout(call, awaitingProductId);` exactly, and a mutation test
+    // proved a park-time arm written `armStrandTimeout(call, productId);` sailed straight through
+    // it — vacuous on the single regression it exists to stop.
+    const declLine = source.split('\n')
+      .findIndex((l) => l.includes('private void armStrandTimeout('));
+    const armSites = source.split('\n')
+      .map((l, i) => ({ l: l.trim(), i }))
+      .filter(({ l, i }) => i !== declLine && l.includes('armStrandTimeout(')
+        && !l.startsWith('//') && !l.startsWith('*'))
+      .map(({ i }) => i);
+    expect(
+      armSites.length,
+      `expected exactly one armStrandTimeout(...) call site (found ${armSites.length}, at lines `
+        + `${armSites.map((i) => i + 1).join(', ')}), in onPurchasesUpdated's no-match branch. `
+        + 'Arming anywhere else — at park time above all — bounds a purchase whose Play sheet is '
+        + 'still open and clears Court storeInFlight underneath it.',
+    ).toBe(1);
+
+    // The only postDelayed in the file must be the one inside the helper. A second one is how a
+    // park-time arm would come back.
+    expect(
+      countOccurrences(source, 'mainHandler.postDelayed('),
+      'more than one mainHandler.postDelayed( in ModokiIapPlugin.java — the #583 timer must be '
+        + 'armed in exactly one place (armStrandTimeout), so its arming condition stays reviewable.',
+    ).toBe(1);
+    expect(
+      extractArmHelper(source).includes('mainHandler.postDelayed('),
+      'the sole postDelayed is not inside armStrandTimeout — the arm has moved somewhere the '
+        + 'no-match-only invariant is no longer visible.',
+    ).toBe(true);
+
+    // Structural, not textual: the arm must live inside the purchasesUpdated LISTENER, and must
+    // not have drifted into purchase(). `statementLines` needs an exact whole-line match, so these
+    // anchor on declarations rather than on the two-line log statement in that branch.
+    const lineOf = (needle: string): number =>
+      source.split('\n').findIndex((l) => l.includes(needle));
+    const listenerAt = lineOf('private final PurchasesUpdatedListener purchasesUpdatedListener');
+    const purchaseAt = lineOf('public void purchase(PluginCall call)');
+    expect(listenerAt, 'purchasesUpdatedListener declaration not found').toBeGreaterThan(-1);
+    expect(purchaseAt, 'purchase(PluginCall) declaration not found').toBeGreaterThan(-1);
+    expect(
+      armSites[0] > listenerAt && armSites[0] < purchaseAt,
+      `armStrandTimeout is at line ${armSites[0] + 1}, outside the purchasesUpdated listener `
+        + `(declared line ${listenerAt + 1}, purchase() begins line ${purchaseAt + 1}). It must be `
+        + 'armed from the no-match branch of the delivery listener — arming inside purchase() is '
+        + 'the park-time draft that bounds a live Play sheet.',
+    ).toBe(true);
+  });
+
+  it('parks under the lock — a non-atomic check-and-park strands the loser', () => {
+    const parkLine = statementLines(source, 'awaitingPurchase = call;')[0];
+    const syncLines = statementLines(source, 'synchronized (lock) {');
+    expect(parkLine, 'no `awaitingPurchase = call;` parking statement').toBeGreaterThan(-1);
+    const enclosing = syncLines.filter((l) => l < parkLine).pop();
+    expect(
+      enclosing !== undefined && parkLine - enclosing < 8,
+      'the `awaitingPurchase = call;` park is not immediately inside a `synchronized (lock)` '
+        + 'block. purchase() runs on a Play Billing THREAD POOL, so an unsynchronised '
+        + 'check-and-park lets two calls both see the slot free; the loser parks a '
+        + 'setKeepAlive(true) call reachable from no field, which nothing — including the #583 '
+        + 'timeout, whose stale-fire guard bails — can ever settle.',
+    ).toBe(true);
+  });
+
+  it('cancels the armed timeout INSIDE unpark()\'s identity guard', () => {
+    const guard = extractUnparkIdentityGuard(source);
+    expect(
+      guard.includes('mainHandler.removeCallbacks(awaitingPurchaseTimeout)'),
+      'the timer cancel is not inside unpark()\'s `if (awaitingPurchase == call)` guard. Outside '
+        + 'it, a stale call settling after a NEW purchase took the slot cancels the NEWER call\'s '
+        + 'timer — restoring #583 exactly, on the path unpark()\'s own docblock claims to guard.',
+    ).toBe(true);
+  });
+
+  it('tears the handler down on destroy so a pending timer cannot pin the Activity', () => {
+    expect(
+      /protected\s+void\s+handleOnDestroy\s*\(/.test(source)
+        && source.includes('mainHandler.removeCallbacksAndMessages(null)'),
+      'no handleOnDestroy() dropping the posted timer. An armed timer strongly holds the '
+        + 'PluginCall (-> MessageHandler -> Bridge -> WebView -> Activity) and the plugin '
+        + 'instance, pinning a destroyed Activity in the main looper for the rest of its window.',
+    ).toBe(true);
+  });
+
+  it('the fire path resolves, unparks FIRST, and never rejects', () => {
+    const timeoutBody = extractArmHelper(source);
+    const unparkAt = timeoutBody.indexOf('unpark(call)');
+    const resolveAt = timeoutBody.indexOf('call.resolve(');
+    expect(unparkAt, 'the fire path does not call unpark(call)').toBeGreaterThan(-1);
+    expect(resolveAt, 'the fire path does not call call.resolve(...)').toBeGreaterThan(-1);
+    expect(
+      unparkAt < resolveAt,
+      'the fire path resolves BEFORE unparking. unpark()\'s own docblock says the order is '
+        + 'load-bearing (the keep-alive flag is read as the response is sent); every other settle '
+        + 'site unparks first and this must match.',
+    ).toBe(true);
+    expect(
+      timeoutBody.includes('call.reject('),
+      'the fire path rejects — that surfaces a spurious error for a purchase that may still be '
+        + 'succeeding. Resolve `transaction: null` like the USER_CANCELED arm.',
+    ).toBe(false);
+  });
+
+  it('guards against a stale fire: only acts if it is still the parked call', () => {
+    expect(
+      /if\s*\(\s*awaitingPurchase\s*!=\s*call\s*\)\s*return;/.test(extractArmHelper(source)),
+      'the #583 timeout fire path does not check `awaitingPurchase == call` before acting — a '
+        + 'stale fire would settle the WRONG call.',
+    ).toBe(true);
+  });
+
+  it('pins the timeout VALUE, and the docs that quote it', () => {
+    const m = source.match(/PARKED_PURCHASE_TIMEOUT_MS\s*=\s*([^;]+);/);
+    expect(m, 'PARKED_PURCHASE_TIMEOUT_MS declaration not found').not.toBeNull();
+    expect(
+      m![1].trim(),
+      'the #583 timeout value changed. It is quoted in prose in docs/iap.md; change both or '
+        + 'neither. Pinned because only the identifier was checked before, so 5 * 60_000L -> 0L '
+        + 'or -> 5 * 60_000_000L was a silent green.',
+    ).toBe('5 * 60_000L');
+
+    const iapDoc = fs.readFileSync(
+      path.join(REPO_ROOT, 'docs', 'iap.md'), 'utf8',
+    );
+    expect(
+      iapDoc.includes('300000ms') || iapDoc.includes('5-minute') || iapDoc.includes('5 minute'),
+      'docs/iap.md no longer states the #583 timeout window in a form matching the constant '
+        + '(5 * 60_000L = 300000ms). The number is shadowed in prose; keep them in sync.',
+    ).toBe(true);
   });
 });
 
