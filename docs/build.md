@@ -1554,7 +1554,7 @@ Three caveats, none of which the install step can fix for you:
   [trusted-device-input.md](./trusted-device-input.md) § "WebDriverAgent lifecycle" (the "iOS 16 devices" entry). Getting there is `go-ios`
   territory and an owner decision, not something to re-diagnose.
 
-The intended split, per [plans/low-end-device-support.md](./plans/low-end-device-support.md):
+The split, shipped as `planIosInstall` (#217, detailed below):
 **iOS 15/16 → go-ios** (`ios install`/`ios launch`, what the editor build now uses; the manual
 libimobiledevice recipe above still works as a fallback);
 **iOS 17+ → `xcrun devicectl … --console`**.

@@ -7,11 +7,36 @@ the running desktop editor — the `modoki` MCP **and** `chrome-devtools` over C
 config, so a DMG/exe user gets the same Claude-friendly authoring-and-verify loop that previously
 only worked from a cloned repo.
 
-It is the **cheap alternative** to the cloud embed: rather than host Claude server-side, the
+It is the **cheap alternative** to the cancelled cloud embed (below): rather than host Claude server-side, the
 user's own Claude Code connects to the running editor — ~1% of the cloud effort, ~90% of the
 value, for the audience that already has Claude Code. The MCP *tool
 behavior* it exposes (the failure-reporting contract, addressing, Percept/Enact/Watch/Journal) is
 documented in **[debug-tools-mcp.md](./debug-tools-mcp.md)**; this doc is the *wiring*.
+
+## What happened to the cloud editor
+
+**Cancelled 2026-07-01**, and the GCP footprint behind it was torn down. This doc is what
+replaced it: there is no server-side editor and no server-side Claude, and there has not been
+since that date. (The GCP *load balancer* retired on 2026-08-03 is a separate, later teardown —
+it fronted the public static site, not the cloud editor. [site-hosting.md](./site-hosting.md)
+covers that one and says nothing about this.)
+
+⚠️ **Its design docs are NOT in this branch's history, so the obvious recovery command finds
+nothing.** They were never merged — they live on the archive tags:
+
+```
+git show archive/feat-cloud-editor:docs/cloud-editor.md
+git show archive/feat-cloud-editor:docs/cloud-editor-typescript-editor-plan.md
+```
+
+Both tags `archive/feat-cloud-editor` and `archive/feat-cloud-editor-remote` carry them; the
+`feat/cloud-editor` branch itself is gone, so the tags are the only handle left. A third doc,
+`docs/cloud-editor-embedded-claude.md`, was cited but **exists in no commit on any ref** — it was
+never written, so there is nothing to recover and no point searching for it.
+
+The **teardown tracker** (`docs/plans/cloud-teardown-and-migration-plan.md`) is the one that WAS on
+this history, deleted in `c9ebdb38d`; `git log --diff-filter=D -- <path>` finds it, and it is
+worth reading because it was itself the record of what the teardown deleted.
 
 ## The gap this closes
 

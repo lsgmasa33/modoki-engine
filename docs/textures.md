@@ -403,6 +403,18 @@ pixels a device downloads and uploads.
 
 ## Environment maps (HDR / UltraHDR)
 
+> This section is where the HDR/UltraHDR pipeline lives. A standalone `docs/environment-maps.md`
+> was cited before it existed and never got written — the pipeline is here instead, so there is
+> nothing missing to go and find.
+>
+> Provenance, stated exactly because the tidy version of it is wrong: the asset-import work (the
+> `.meta.json` sidecar, the reimport registry, the Inspector asset views) came from
+> `docs/plans/asset-inspector-plan.md`, whose Phases 1-4b landed. Its **Phase 5 — "Docs + polish"
+> — never did**: the tracker was deleted in `c9ebdb38d` with all three of its items still
+> unchecked, the first being "fold this into the asset docs". This section was written by that
+> same commit, not by the phase that was supposed to write it. The model side is in
+> [model-pipeline.md](./model-pipeline.md).
+
 `.hdr` classifies as asset type `environment`, gets a GUID-only `.meta.json`, and goes through the
 same generic reimport/manifest/cache plumbing as every other asset type (reimport-registry, meta
 sidecar, `/api/reimport` + `/api/reimport-types`, cache-miss bake, its own `EnvironmentAssetView`
