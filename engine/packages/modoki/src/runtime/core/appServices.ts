@@ -78,10 +78,12 @@ export function appServices(): AppServices {
  * `registerAppServices` itself) — always finds `registered` already empty, never a half-cleared
  * one. A game swap is the path that made this matter: `App.tsx` calls `clearAppServices()` before
  * the next game registers, but until #511 nothing here ever called `ads.cleanup()`, so the
- * outgoing game's AppLovin MAX listeners survived under the next game. The only other caller of
- * `cleanup()` is App.tsx's `[]`-deps unmount effect, which still runs after this — safe, because
- * every game's `cleanup()`/`cleanupAds` is idempotent (it loops an already-emptied array and
- * resets flags), so a second call after a swap already cleaned up is a no-op. */
+ * outgoing game's AppLovin MAX listeners survived under the next game. `cleanup()` can now be
+ * reached a second time in the same realm — once here on a game swap, and again from the
+ * realm-shutdown task App.tsx's mount effect registers in place of the unmount handler it used to
+ * call `cleanup()` from (#587, `realmShutdown.ts`) — so it must still be idempotent. Safe, because
+ * every game's `cleanup()`/`cleanupAds` already is (it loops an already-emptied array and resets
+ * flags), so a second call after a swap already cleaned up is a no-op. */
 export function clearAppServices(): void {
   const { ads } = registered;
   registered = {};

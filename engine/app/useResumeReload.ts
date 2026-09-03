@@ -17,7 +17,7 @@
 import { useEffect } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
-import { PlayerPrefs, createResumeReloadHandler, getActiveReloadBlockers, markResumeReload } from '@modoki/engine/runtime';
+import { PlayerPrefs, createResumeReloadHandler, getActiveReloadBlockers, markResumeReload, shutdownRealmThenReload } from '@modoki/engine/runtime';
 import projectConfig from 'virtual:modoki-project-config';
 
 /** In a DEBUG build the threshold is capped here, because the shipping value is unusable to test
@@ -78,7 +78,11 @@ export function useResumeReload() {
       blockedBy: getActiveReloadBlockers,
       flush: () => PlayerPrefs.flush(),
       pendingKeys: () => PlayerPrefs.pendingKeys(),
-      reload: () => { window.location.reload(); },
+      // Dispatch the realm-shutdown tasks (native ad SDK teardown, #587) before tearing the realm
+      // down — same treatment as `engine.reload`, so a resume-triggered reload doesn't race it.
+      // Returns the promise (not `void`-ed) so `createResumeReloadHandler` can `await` it and its
+      // `catch` can still see a throw from either the teardown chain or `reload()` itself.
+      reload: () => shutdownRealmThenReload(() => window.location.reload()),
       markResumed: markResumeReload,
     });
 

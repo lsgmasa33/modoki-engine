@@ -733,6 +733,15 @@ export {
   type ResumeReloadDeps,
   type ResumeReloadHandler,
 } from './core/resumeReload';
+// Realm shutdown tasks (#587) — the seam that lets a reload destroy native SDK state (an AppLovin
+// banner/MREC/interstitial) before the reload destroys the JS realm. `runtime/**` cannot reach
+// `appServices()` (layering), so the app registers the task here and the reload sites
+// (`engine.reload`, `useResumeReload.ts`) only ever invoke the registry. See `core/realmShutdown.ts`.
+export {
+  registerRealmShutdownTask,
+  runRealmShutdownTasks,
+  shutdownRealmThenReload,
+} from './core/realmShutdown';
 // Input WATCH (#134) — a game publishes what its OWN hit-test resolved a press to, which is the
 // one thing no engine-side observer can compute for a canvas game. Safe to call unconditionally:
 // it is a no-op until an agent opens a watch window.

@@ -46,7 +46,18 @@ public class ModokiIapPlugin: CAPPlugin, CAPBridgedPlugin {
         updatesTask = Task { [weak self] in
             for await result in StoreKit.Transaction.updates {
                 guard let self, let t = self.verified(result) else { continue }
-                self.notifyListeners("purchasesUpdated", data: ["transactions": [self.serialize(t)]])
+                // retainUntilConsumed: true — a webview reload tears down the JS realm and its
+                // subscription along with it (#586); with no listener attached, CAPPlugin queues
+                // this event instead of dropping it, and drains it into the next realm's
+                // subscribe. It cannot double-deliver: retention only fires when the listener
+                // list is empty, so a delivery that DID have a listener is never retained. And a
+                // durable ledger keyed on `isProcessed` gives cross-realm idempotency regardless,
+                // so a queued-then-redelivered event is harmless even if this were somehow wrong.
+                self.notifyListeners(
+                    "purchasesUpdated",
+                    data: ["transactions": [self.serialize(t)]],
+                    retainUntilConsumed: true
+                )
             }
         }
     }

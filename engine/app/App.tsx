@@ -4,7 +4,7 @@ import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
 import { useResumeReload } from './useResumeReload';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint } from '@modoki/engine/runtime';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint, registerRealmShutdownTask, runRealmShutdownTasks } from '@modoki/engine/runtime';
 import { App as CapacitorApp } from '@capacitor/app';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
@@ -719,20 +719,30 @@ function App() {
   // Run ECS pipeline every frame (needed by both game and editor for Scene3D rendering)
   useGameLoop(runPipeline);
 
-  // Cleanup native SDK listeners + the audio node graph on unmount.
+  // Cleanup native SDK listeners + the audio node graph — registered as a REALM-SHUTDOWN task, not
+  // as unmount cleanup.
   //
-  // ⚠️ THIS EFFECTIVELY NEVER RUNS, and that is by design rather than an oversight (#534). In a
-  // shipped web/native build there is one `createRoot` (main.tsx) that is never unmounted; in dev
-  // the only unmount is StrictMode's mount -> unmount -> remount, which is SYNCHRONOUS within the
-  // commit and therefore lands before either `registerAll()` site (both sit downstream of awaits).
+  // ⚠️ An unmount-cleanup effect here EFFECTIVELY NEVER RUNS, and that is by design rather than an
+  // oversight (#534). In a shipped web/native build there is one `createRoot` (main.tsx) that is
+  // never unmounted; in dev the only unmount is StrictMode's mount -> unmount -> remount, which is
+  // SYNCHRONOUS within the commit and therefore lands before either `registerAll()` site (both sit
+  // downstream of awaits).
   //
   // So do NOT grow this into an app teardown. #534 built exactly that -- a `teardownAll()`
   // inverting `registerAll()` -- and it was removed once measured: every end-of-lifetime in this
   // architecture is a REALM DEATH, not a teardown (process kill on mobile, tab close on web,
   // `location.reload()` for restart/OTA, `webContents.reload()` for the editor's project switch).
   // Nothing survives those to be cleaned up. `docs/managers-and-systems.md` carries the reasoning.
+  //
+  // That REALM-DEATH ruling is exactly why this work moved off `useEffect`'s unmount and onto
+  // `registerRealmShutdownTask` (#587): a reload is a realm death that this component's unmount
+  // never sees, so a native ad SDK (AppLovin banner/MREC/interstitial) that was only torn down on
+  // unmount survived every reload — still refreshing and monetising with no JS listener attached,
+  // undercounting `ad_revenue`. `engine.reload` and `useResumeReload`'s reload path now both call
+  // `runRealmShutdownTasks()` before tearing the realm down, so this task actually runs on the path
+  // that matters. Still not a general app-teardown seam — one task, one job, same restraint as above.
   useEffect(() => {
-    return () => { appServices().ads?.cleanup(); audioDispose(); };
+    return registerRealmShutdownTask('app.cleanup', () => { appServices().ads?.cleanup(); audioDispose(); });
   }, []);
 
   // OTA Phase 4 (docs/ota-subgame-modules.md) — discover + load any sub-game
@@ -755,7 +765,17 @@ function App() {
     const flush = () => { void PlayerPrefs.flush(); };
     const onVisibility = () => { if (document.visibilityState === 'hidden') flush(); };
     document.addEventListener('visibilitychange', onVisibility);
-    window.addEventListener('pagehide', flush);
+    // `pagehide` fires both for a real page teardown AND for a bfcache/background transition
+    // (tab-switch, home-button on mobile Safari) — `event.persisted` is what tells them apart:
+    // true means the page may resume from the cache, false means it is actually going away. Only
+    // the false case is a realm death, so only it runs the shutdown tasks (native ad SDK teardown,
+    // #587) — running them on a mere backgrounding would tear down a still-live banner/interstitial
+    // that the player is about to see again, which is a regression, not a fix.
+    const onPageHide = (event: PageTransitionEvent) => {
+      flush();
+      if (event.persisted === false) void runRealmShutdownTasks();
+    };
+    window.addEventListener('pagehide', onPageHide);
     let appListener: { remove: () => void } | undefined;
     let cancelled = false; // cleanup may run before the async addListener resolves
     if (Capacitor.isNativePlatform()) {
@@ -780,7 +800,7 @@ function App() {
     return () => {
       cancelled = true;
       document.removeEventListener('visibilitychange', onVisibility);
-      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('pagehide', onPageHide);
       appListener?.remove();
       flush(); // final flush on teardown (HMR / error-boundary recovery)
     };

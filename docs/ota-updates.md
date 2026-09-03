@@ -418,6 +418,26 @@ a plain host with no device. The rules:
 - **Every fallback terminates at the embedded bundle** — missing/corrupt `state.json`, a
   missing active folder, a missing pending folder are all explicit, tested cases.
 - **`confirm()` is a no-op when nothing is pending**, so a normal launch can't wipe `active`.
+- **At most one confirm per counted boot attempt** (`confirmedBoots[name] >= bootAttempts[name]`
+  → no-op). Without it the bullet above was aspirational rather than enforced: a webview reload
+  gives a brand-new JS realm and so a second `confirmBoot`, but it does NOT re-enter the native
+  boot hook that counts an attempt — so one real launch plus a `location.reload()` satisfied
+  `requiredConfirms = 2` and promoted a bundle that had booted exactly once (#584). Keyed on the
+  attempt COUNTER rather than a per-process latch in the plugin, because a sub-game's attempt
+  genuinely *is* counted on a reload (`beginBundleLoad` runs again against re-executing JS) and
+  because Android can re-run `MainActivity.onCreate` — hence the boot hook — inside one process,
+  so “per process” is not “per boot” there.
+
+  ⚠️ **This fully closes the SHELL case and not the sub-game one.** The shell's attempt is
+  counted only in the native boot hook, which a reload never re-enters, so the shell genuinely
+  needs two separate launches to promote. A **sub-game is different**: `beginBundleLoad` counts
+  a real attempt on every reload and its bundle JS genuinely re-executes, so a sub-game can still
+  reach `active` after one cold launch plus one background/resume reload — `useResumeReload.ts`
+  (#574) makes that routine, not hypothetical. The watchdog still works in the sense that matters
+  most (a bundle that fails to *load* never confirms), but two rapid loads inside one process are
+  weaker evidence than two separate launches, which is what `requiredConfirms = 2` was written to
+  demand. Closing this needs native process identity, which is deliberately not what this fix
+  uses — left open on purpose, not overlooked.
 
 ### Quarantine (`rejected`)
 

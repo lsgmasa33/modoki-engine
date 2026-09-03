@@ -5,6 +5,7 @@
  *  no state, so they stay as plain built-ins registered once at startup. */
 
 import { registerUIAction } from '../core/actionRegistry';
+import { shutdownRealmThenReload } from '../core/realmShutdown';
 import { SkeletalAnimator } from '../traits/SkeletalAnimator';
 import { Animator } from '../traits/Animator';
 import { SpriteAnimator } from '../traits/SpriteAnimator';
@@ -26,9 +27,14 @@ export function registerEngineActions(): void {
   if (registered) return;
   registered = true;
 
-  // engine.reload — hard reload of the web view.
+  // engine.reload — hard reload of the web view. Dispatch the realm-shutdown tasks (native ad SDK
+  // teardown, #587) BEFORE tearing the realm down, so they run rather than race the reload.
+  // Fire-and-forget deliberately, unlike `resumeReload.ts`'s `deps.reload()`: a UIAction has no
+  // caller waiting to hear back and no `reloading` latch to un-stick on failure, so there is
+  // nothing an `await` here would let a `catch` do.
   registerUIAction('engine.reload', () => {
-    if (typeof window !== 'undefined') window.location.reload();
+    if (typeof window === 'undefined') return;
+    void shutdownRealmThenReload(() => window.location.reload());
   });
 
   // ui.scrollTo — move a scroll view to an entry, with no game code.

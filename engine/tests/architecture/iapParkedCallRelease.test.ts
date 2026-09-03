@@ -7,10 +7,13 @@
  *  `ModokiIapPlugin.java` parks the `purchase()` call in `awaitingPurchase` (+
  *  `awaitingProductId`) because Google Play reports the outcome through
  *  `purchasesUpdatedListener`, not through `purchase()` itself, and calls `call.setKeepAlive(true)`
- *  at the parking site. There are FOUR places that can settle that call — `USER_CANCELED`, a
- *  non-OK/null delivery, a matched delivery, and a `launchBillingFlow` launch failure — and each
- *  one used to clear `awaitingPurchase` by hand, with three of the four leaving `awaitingProductId`
- *  stale and NONE of them clearing `setKeepAlive`. A future settle path copy-pasted from one of
+ *  at the parking site. There are FIVE places that can settle that call — `USER_CANCELED`, a
+ *  non-OK/null delivery, a matched delivery, a `launchBillingFlow` launch failure, and (since
+ *  #586) a webview reload, which releases the slot from a `WebViewListener.onPageStarted`
+ *  registered by `ensureWebViewListener()` at PARK time — NOT from `load()`, where the listener is
+ *  silently discarded by `Bridge.Builder.create()`'s `setWebViewListeners` (device-proven on an
+ *  S22, 2026-09-03; see docs/native-and-sdks.md). The original four each used to clear `awaitingPurchase` by hand, with
+ *  three of them leaving `awaitingProductId` stale and NONE of them clearing `setKeepAlive`. A future settle path copy-pasted from one of
  *  those sites inherits the same gap silently: nothing here throws, nothing here fails a runtime
  *  test, because the bug is a flag that is never read on the paths this repo currently exercises.
  *
@@ -106,6 +109,30 @@ function countUnparkCallSites(src: string): number {
   return count;
 }
 
+/** Line indices of real STATEMENTS matching `stmt`, comments excluded — same reasoning as
+ *  `countUnparkCallSites`, and learned the same way: an earlier version of the #586 pin below used
+ *  `source.indexOf('ensureWebViewListener();')`, which a reviewer defeated by commenting the call
+ *  site OUT. `// ensureWebViewListener();` still contains the substring, so the guard stayed green
+ *  while the listener was never registered — the exact inert-mechanism defect #586 exists to stop. */
+function statementLines(src: string, stmt: string): number[] {
+  const hits: number[] = [];
+  let inBlockComment = false;
+  src.split('\n').forEach((rawLine, i) => {
+    const line = rawLine.trim();
+    if (inBlockComment) {
+      if (line.includes('*/')) inBlockComment = false;
+      return;
+    }
+    if (line.startsWith('/*')) {
+      if (!line.includes('*/')) inBlockComment = true;
+      return;
+    }
+    if (line.startsWith('//') || line.startsWith('*')) return;
+    if (line === stmt) hits.push(i);
+  });
+  return hits;
+}
+
 describe('ModokiIapPlugin: every purchase-call settle path clears the parked slot via unpark() (#514)', () => {
   it('has exactly one `awaitingPurchase = null`, and it lives inside unpark()', () => {
     const totalCount = countOccurrences(source, 'awaitingPurchase = null');
@@ -172,7 +199,7 @@ describe('ModokiIapPlugin: every purchase-call settle path clears the parked slo
     ).toBe(1);
   });
 
-  it('unpark() is called from exactly 4 real settle sites (comments/declaration excluded)', () => {
+  it('unpark() is called from exactly 5 real settle sites (comments/declaration excluded)', () => {
     // Counting the bare substring `unpark(` over the whole file is fooled by a prose comment
     // mentioning `unpark(call)` (inflates the count, masking a REMOVED call site) just as easily
     // as it is by the declaration — so only count lines that are themselves a statement calling
@@ -180,13 +207,72 @@ describe('ModokiIapPlugin: every purchase-call settle path clears the parked slo
     const callSites = countUnparkCallSites(source);
     expect(
       callSites,
-      `found ${callSites} real unpark() call sites in ModokiIapPlugin.java — expected exactly 4, `
+      `found ${callSites} real unpark() call sites in ModokiIapPlugin.java — expected exactly 5, `
         + 'the enumerated settle paths: USER_CANCELED, a non-OK/null delivery, a matched delivery, '
-        + 'and a launchBillingFlow failure. A different count means either a settle path is '
+        + 'a launchBillingFlow failure, and the webview-reload release in the '
+        + 'ensureWebViewListener() WebViewListener (#586). A different count means either a settle path is '
         + 'clearing the parked call by hand instead of calling unpark(call) (fewer), or a genuine '
         + 'new settle path has appeared that this guard doesn\'t know about yet (more) — in the '
         + 'latter case, update this expectation and the enumeration above once you\'ve confirmed '
         + 'the new site really does route through unpark().',
-    ).toBe(4);
+    ).toBe(5);
+  });
+});
+
+describe('ModokiIapPlugin: the reload listener is registered where it actually survives (#586)', () => {
+  // ⚠️ The first #586 fix registered this listener from `Plugin.load()` and was completely INERT.
+  // Capacitor's `Bridge` constructor calls `registerAllPlugins()` (`Bridge.java:231`), which is
+  // what runs `Plugin.load()`; `Bridge.Builder.create()` then calls `setWebViewListeners(...)`
+  // (`:1617`) eighteen lines later, and that setter REPLACES the list (`:1465`) instead of
+  // appending — so anything `load()` registered is discarded before the first navigation, and
+  // `BridgeWebViewClient.onPageStarted` walks a list that never contained it.
+  //
+  // Device-measured on a Galaxy S22 (2026-09-03), both halves, same reload path and same probe:
+  // registered in `load()` -> `onPageStarted` NEVER fired; registered post-construction -> fired
+  // 116ms after `[resume-reload] reloading after 80s away`. `load()` itself always ran (logged 1ms
+  // after "Registering plugin instance: ModokiIap") — it was never the problem.
+  //
+  // These two assertions are the regression pin. A future reader "tidying" the registration back
+  // into `load()` reintroduces a bug whose only symptom is silence, which is exactly the kind that
+  // survives a code review. Full write-up: docs/native-and-sdks.md.
+
+  it('does NOT override load() — a listener registered there is discarded before it can fire', () => {
+    expect(
+      /\n\s*public\s+void\s+load\s*\(\s*\)/.test(source),
+      'ModokiIapPlugin.java declares a load() override. Capacitor discards anything '
+        + 'addWebViewListener() registers there (Bridge.Builder.create() replaces the list right '
+        + 'after the constructor ran load()), so a reload listener registered in load() is inert — '
+        + 'device-proven on an S22. Register from a post-construction seam instead; '
+        + 'ensureWebViewListener() does it at park time.',
+    ).toBe(false);
+  });
+
+  it('calls ensureWebViewListener() exactly once, as a real statement — not from a comment', () => {
+    // Counted as a STATEMENT, deliberately. Commenting the call out leaves the substring in the
+    // file, and the first version of this test was defeated exactly that way: the listener would
+    // never register, every Android purchase after a resume-reload would reject with "already in
+    // progress" forever, and this guard stayed green. Reproducing that needs a Play-track build,
+    // so the guard is the only thing standing between that regression and a release.
+    const sites = statementLines(source, 'ensureWebViewListener();');
+    expect(
+      sites.length,
+      `found ${sites.length} real ensureWebViewListener() call statements in ModokiIapPlugin.java `
+        + '— expected exactly 1, at the parking site in purchase(). Zero means the listener is '
+        + 'never registered and #586 is inert again; more than one means registration has spread '
+        + 'and the instance-boolean guard is doing work the call sites should not need.',
+    ).toBe(1);
+  });
+
+  it('registers the listener BEFORE the call becomes reachable from it', () => {
+    const registerLine = statementLines(source, 'ensureWebViewListener();')[0];
+    const parkLine = statementLines(source, 'awaitingPurchase = call;')[0];
+    expect(registerLine, 'no ensureWebViewListener() statement').toBeGreaterThan(-1);
+    expect(parkLine, 'no `awaitingPurchase = call;` parking statement').toBeGreaterThan(-1);
+    expect(
+      registerLine < parkLine,
+      `ensureWebViewListener() is at line ${registerLine + 1} but the park is at line ${parkLine + 1}`
+        + ' — registration must come FIRST, or a reload landing in between finds a parked call with'
+        + ' no listener, which is the exact window #586 exists to close.',
+    ).toBe(true);
   });
 });

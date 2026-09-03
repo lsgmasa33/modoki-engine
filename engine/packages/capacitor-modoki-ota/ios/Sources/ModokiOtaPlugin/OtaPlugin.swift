@@ -588,9 +588,18 @@ public class ModokiOtaPlugin: CAPPlugin, CAPBridgedPlugin {
     let json = try? String(contentsOf: OtaPaths.stateFilePath, encoding: .utf8)
     // `version` is optional: the SHELL has none to name (its boot hook is the sole
     // authority over what got served), a sub-game always passes one. See OtaCore.confirm.
+    let before = OtaCore.parseState(json)
     let resultJSON = OtaCore.confirm(fromJSON: json, name: name, version: call.getString("version"))
     do {
       try resultJSON.write(to: OtaPaths.stateFilePath, atomically: true, encoding: .utf8)
+      // Makes a refused confirm (#584's guard firing) legible on device — otherwise it
+      // resolves identically to a credited one.
+      let after = OtaCore.parseState(resultJSON)
+      let pendingBefore = before?.pending[name]
+      let promoted = pendingBefore != nil && after?.pending[name] == nil
+      let credited = (after?.confirmedBoots[name] ?? 0) > (before?.confirmedBoots[name] ?? 0)
+      let outcome = promoted ? "promoted" : (credited ? "credited" : "refused")
+      print("[ModokiOta] confirmBoot \(name): \(outcome)")
       call.resolve(["ok": true])
     } catch {
       call.reject("confirmBoot failed: \(error.localizedDescription)")

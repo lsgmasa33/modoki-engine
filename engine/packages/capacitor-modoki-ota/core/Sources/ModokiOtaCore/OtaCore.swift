@@ -395,6 +395,19 @@ public enum OtaCore {
     guard var s = state else { return nil }
     guard let pendingVersion = s.pending[name] else { return s }
     if let version, version != pendingVersion { return s }
+    // A confirm is credited at most once per COUNTED boot attempt (#584). A webview
+    // reload gives a brand-new JS realm, so `confirmBoot` fires again — but it does NOT
+    // re-enter the native boot hook that counts an attempt, so without this guard one
+    // real launch plus a `location.reload()` satisfies `requiredConfirms = 2` and promotes
+    // a bundle that only ever booted once. `useResumeReload.ts` (#574) makes that reload
+    // routine rather than incidental, so this is not a hypothetical.
+    //
+    // Keyed on the attempt COUNTER, not a per-process latch in the plugin, because a
+    // sub-game's attempt genuinely IS counted on a reload (`beginBundleLoad` runs again
+    // against re-executing JS), and on Android `MainActivity.onCreate` — hence the boot
+    // hook — can re-run inside one process (see `OtaPlugin.java:75-82`), so "per process"
+    // is not "per boot" there either. The counter is correct in all three cases.
+    if (s.confirmedBoots[name] ?? 0) >= (s.bootAttempts[name] ?? 0) { return s }
     let confirms = (s.confirmedBoots[name] ?? 0) + 1
     if confirms >= requiredConfirms {
       s.active[name] = pendingVersion

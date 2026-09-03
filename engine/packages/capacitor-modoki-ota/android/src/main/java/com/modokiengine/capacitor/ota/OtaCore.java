@@ -305,6 +305,10 @@ public final class OtaCore {
     String pendingVersion = s.pending.get(name);
     if (pendingVersion == null) return s;
     if (version != null && !version.equals(pendingVersion)) return s;
+    // A confirm is credited at most once per counted boot attempt (#584) — see
+    // OtaCore.swift's confirm(state:name:version:) doc for the why, and for the three cases
+    // that rule out a per-process latch in the plugin instead.
+    if (s.confirmedBoots.getOrDefault(name, 0) >= s.bootAttempts.getOrDefault(name, 0)) return s;
     int confirms = s.confirmedBoots.getOrDefault(name, 0) + 1;
     if (confirms >= REQUIRED_CONFIRMS) {
       s.active.put(name, pendingVersion);

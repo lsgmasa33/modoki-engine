@@ -327,8 +327,16 @@ existing double-init latch — `ads.ts`, `attribution.ts`, `LLMManager.ts` — i
 every comment reasoning about them reasons about StrictMode and game swaps. A reload destroys the
 realm while the native process, and every native SDK in it, lives on. Where a once-per-process
 guard is genuinely needed it must live **natively**; a `let` cannot see this. The defects that
-follow from getting it wrong are filed as #584-#588, and all of them predate this trigger — three
-shipped paths already reload (`engine.reload`, `EditorBootBoundary`, Court's post-wipe restart).
+follow from getting it wrong were filed as #584-#588, and all of them predate this trigger — three
+shipped paths already reloaded before it (`engine.reload`, `EditorBootBoundary`, Court's post-wipe
+restart).
+
+**#584, #586, #587 and #588 are fixed on `work-ai2` (not yet merged to `main`); #585 (litert-lm) is open and iceboxed.** The native
+half of this — what `bridge.reset()` does and does not clear, why retained events drain exactly
+once, the per-process init each shipped game does, and a table of all five defects with their fixes
+— lives in [native-and-sdks.md](native-and-sdks.md) § "What a webview reload does and does not
+reset". Do not duplicate it here; this file owns the JS/realm side of the ruling, that one owns the
+native side.
 
 **When this would change:** only a **soft restart** — tearing down and re-registering in place
 instead of reloading, e.g. to pick up new remote config without a visible reload. That is a real

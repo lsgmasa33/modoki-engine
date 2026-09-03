@@ -30,6 +30,7 @@
 
 import { appServices, onAppServicesRegistered } from './appServices';
 import { rawNow } from './clock';
+import { peekResumeReload } from './resumeReload';
 
 /** `console.error` AND `console.warn` → a non-fatal Crashlytics ISSUE (grouped, alerted on).
  *
@@ -103,10 +104,136 @@ let installing = false;
  */
 let reporting = false;
 
+const SESSION_COUNTERS_KEY = 'modoki.globalErrors.sessionCounters';
+
+/**
+ * How long away from the foreground makes the NATIVE Crashlytics session likely to have rolled
+ * over, so a budget carried across the reload would be charged against a session that never spent
+ * it. Firebase's session timeout is 30 minutes; this matches it.
+ *
+ * ⚠️ **Bias this DOWN, never up.** The two ways to be wrong are not symmetric. Clearing too eagerly
+ * restores exactly the pre-persistence behaviour — a fresh budget per realm, which shipped for
+ * months and loses nothing. Keeping too eagerly means a brand-new native session starts with a
+ * spent budget and reports NOTHING for its whole life, silently, which is strictly worse than the
+ * bug the persistence was added to fix. When in doubt, clear.
+ */
+const CRASHLYTICS_SESSION_WINDOW_MS = 30 * 60_000;
+
+interface PersistedCounters { errorsSent: number; warnsSent: number; breadcrumbsSent: number }
+
+/**
+ * Read the three session budgets left behind by a PREVIOUS boot of this same realm (see the
+ * comment on `errorsSent` below for what "durable" means and does not mean here).
+ *
+ * ⚠️ Same shape and same caution as `resumeReload.ts`'s `markResumeReload`/`consumeResumeReload`:
+ * every access is try/catch'd, because a context that throws on `sessionStorage` (private mode,
+ * disabled site data) must fall back SILENTLY to today's in-memory-only behaviour. This module IS
+ * the thing that reports failures — it must never become a source of one itself. Any failure to
+ * read, or a value that does not parse as a finite number, is treated as "nothing persisted" (0),
+ * never as an error.
+ *
+ * ⚠️ MUST be declared (and `SESSION_COUNTERS_KEY` with it) above the module-level `errorsSent`
+ * init below, which calls this at module-evaluation time — a `const` referenced before its own
+ * declaration line throws (TDZ), and that throw was previously swallowed by this function's own
+ * try/catch, silently returning zero on every load. Caught by the reload test in
+ * `globalErrors.test.ts`; keep this above the `errorsSent`/`warnsSent`/`breadcrumbsSent` `let`s.
+ */
+function loadPersistedCounters(): PersistedCounters {
+  const zero: PersistedCounters = { errorsSent: 0, warnsSent: 0, breadcrumbsSent: 0 };
+  try {
+    // ⚠️ A budget only belongs to the next realm if the NATIVE session is still the same one.
+    // `peekResumeReload()` (never `consume` — that one-shot belongs to the resume-reload path)
+    // says how long the app was away. Past the window the native session has almost certainly
+    // rolled, and carrying a spent budget into a fresh session would silence it completely: Court
+    // routes every analytics event through `captureToCrashlytics('breadcrumb', …)`, so a long
+    // play session reaches `MAX_BREADCRUMBS_PER_SESSION` readily, and #574 then reloads on the
+    // next resume. Found in close-out review; the persistence shipped without it and this is the
+    // one direction in which persisting is WORSE than not persisting.
+    const away = peekResumeReload();
+    if (away && away.awayMs > CRASHLYTICS_SESSION_WINDOW_MS) {
+      // ⚠️ Clear the STORED value too, not just the in-memory one. `savePersistedCounters()` runs
+      // only when a capture is allowed, so a realm that drops the budget here and then charges
+      // NOTHING before its own next reload would leave the dead session's spent value in storage
+      // and hand it to the realm after that — which then files nothing for its whole life. That is
+      // the boot window, and "silences a whole session" is the direction this file's bias rule
+      // calls unacceptable. Found in close-out review.
+      clearPersistedCounters();
+      return zero;
+    }
+
+    const raw = sessionStorage.getItem(SESSION_COUNTERS_KEY);
+    if (raw == null) return zero;
+    const parsed = JSON.parse(raw) as Partial<PersistedCounters>;
+    // Clamped, not merely finite-checked: a hand-edited or corrupt key holding a huge value would
+    // disable reporting for this context, and a NEGATIVE one would disable the cap and let the
+    // budget run unbounded. Both are silent. `readCount` collapses either into a sane range.
+    const readCount = (v: unknown, cap: number): number =>
+      typeof v === 'number' && Number.isFinite(v) ? Math.min(Math.max(0, Math.trunc(v)), cap) : 0;
+    return {
+      errorsSent: readCount(parsed.errorsSent, MAX_ERRORS_PER_SESSION),
+      warnsSent: readCount(parsed.warnsSent, MAX_WARNS_PER_SESSION),
+      breadcrumbsSent: readCount(parsed.breadcrumbsSent, MAX_BREADCRUMBS_PER_SESSION),
+    };
+  } catch {
+    return zero;
+  }
+}
+
+/** Write the three session budgets back, so the NEXT boot of this realm (a reload) sees them.
+ *  Called every time one is charged in `allow()`. Failure is silent — see `loadPersistedCounters`. */
+function savePersistedCounters(): void {
+  try {
+    sessionStorage.setItem(SESSION_COUNTERS_KEY, JSON.stringify({ errorsSent, warnsSent, breadcrumbsSent }));
+  } catch {
+    /* private mode, disabled site data, or a context that throws on access — see above */
+  }
+}
+
+/** Test seam + `__resetGlobalErrorsForTest`: drop whatever was persisted, so a leftover budget
+ *  from one test/realm cannot leak into the next. Failure is silent — see `loadPersistedCounters`.
+ *
+ *  ⚠️ **`sessionStorage` survives `vi.resetModules()` within a vitest file**, so this is not
+ *  optional hygiene: a test file that charges past a cap across its cases and does NOT call
+ *  `__resetGlobalErrorsForTest` will see later cases silently drop reports, and the failure looks
+ *  like the code under test rather than like test bleed. Every current caller resets; a new one
+ *  must too. */
+function clearPersistedCounters(): void {
+  try {
+    sessionStorage.removeItem(SESSION_COUNTERS_KEY);
+  } catch {
+    /* nothing left to try */
+  }
+}
+
 const repeats = new Map<string, number>();
-let errorsSent = 0;
-let warnsSent = 0;
-let breadcrumbsSent = 0;
+/**
+ * ⚠️ **`errorsSent`/`warnsSent`/`breadcrumbsSent` are seeded from `sessionStorage` and DURABLE
+ * across a same-origin reload; `windowStart`/`windowCount` and `repeats` are deliberately NOT.**
+ *
+ * A webview reload re-runs this module from scratch, re-zeroing every `let` here — but native
+ * Crashlytics still counts it as ONE session (#588). Without persistence a cap whose name says
+ * "per session" is really per REALM, and #574's `useResumeReload.ts` made unattended reloads
+ * routine, which is what turns that from pedantry into a real volume multiplier. See
+ * `loadPersistedCounters`/`savePersistedCounters` above for the mechanism and its honest limits.
+ *
+ * `windowStart`/`windowCount` stay per-realm on purpose: it is a short WALL-CLOCK burst limiter
+ * (`BURST_WINDOW_MS` = 5s) and a reload takes far longer than that window is worth reasoning
+ * about — there is no meaningful "burst in progress" to resume. `repeats` also stays per-realm: it
+ * is a write per capture for a dedupe generation, and resetting it on reload merely makes the
+ * FIRST few repeats after a reload slightly more permissive, which is not worth a persistence path.
+ *
+ * ⚠️ **This is a strict improvement, not a guarantee — it does NOT make the budget "per session".**
+ * `resumeReload.ts:118-123` already notes that iOS can recycle the WKWebView content process while
+ * the app process lives, clearing `sessionStorage` while native state survives. When that happens
+ * here, the counters reset to 0 while native Crashlytics still counts one session — i.e. this
+ * degrades to exactly today's (unpersisted) behaviour, no worse. What it fixes is the common case:
+ * a same-origin JS reload (#574's resume-reload, a crash-loop) that leaves the webview's storage
+ * intact.
+ */
+const persistedCounters = loadPersistedCounters();
+let errorsSent = persistedCounters.errorsSent;
+let warnsSent = persistedCounters.warnsSent;
+let breadcrumbsSent = persistedCounters.breadcrumbsSent;
 let windowStart = 0;
 let windowCount = 0;
 
@@ -199,6 +326,7 @@ function allow(kind: CaptureKind, text: string): boolean {
   if (kind === 'error') errorsSent++;
   else if (kind === 'warn') warnsSent++;
   else breadcrumbsSent++;
+  savePersistedCounters();
   return true;
 }
 
@@ -281,6 +409,27 @@ export function reportReactError(error: unknown, componentStack?: string | null)
   captureToCrashlytics('error', `[react] ${describe(error)}${stack}`);
 }
 
+/**
+ * True when THIS boot is a same-origin reload rather than a fresh navigation.
+ *
+ * `performance.getEntriesByType('navigation')` is not a clock read — it is a one-shot descriptor
+ * of how the current document was loaded, resolved once at navigation and never advancing — so it
+ * does not touch the determinism guard's `performance.now()`/`Date.now()` rule. Guarded anyway:
+ * the entry can be absent on an older/embedded webview, and the array can be empty.
+ *
+ * ⚠️ Deliberately NOT `consumeResumeReload()` (`resumeReload.ts`) — that breadcrumb is a ONE-SHOT
+ * owned by the resume-reload consumer, and reading it here would consume it out from under that
+ * path. This asks the browser directly instead, which costs nothing and steps on nothing.
+ */
+function isReloadBoot(): boolean {
+  try {
+    const nav = performance.getEntriesByType?.('navigation')?.[0] as { type?: string } | undefined;
+    return nav?.type === 'reload';
+  } catch {
+    return false;
+  }
+}
+
 function flushQueue(): void {
   if (!appServices().crashlytics) return;
   const pending = queued;
@@ -309,6 +458,13 @@ export function installGlobalErrorHandlers(): void {
   installing = true;
   try {
     onAppServicesRegistered(flushQueue);
+
+    // A post-reload crash report otherwise shows a discontinuity in the breadcrumb trail with
+    // nothing explaining it. Routed through captureToCrashlytics like everything else, so it is
+    // subject to the same budgets — this is not a special unlimited channel.
+    if (isReloadBoot()) {
+      captureToCrashlytics('breadcrumb', '[reload] this boot followed a page reload, not a fresh navigation');
+    }
 
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
       window.addEventListener('error', (e: ErrorEvent) => {
@@ -372,5 +528,6 @@ export function __resetGlobalErrorsForTest(opts?: { clock?: () => number; uninst
   queueOverflowed = false;
   reporting = false;
   now = opts?.clock ?? rawNow;
+  clearPersistedCounters(); // else a leftover session budget leaks from one test/realm into the next
   if (opts?.uninstall) installed = false;
 }

@@ -443,6 +443,43 @@
       }
     },
     {
+      "name": "a_reload_confirm_within_one_load_attempt_is_a_noop",
+      "_why": "#584: confirm is a no-op once confirmedBoots[name] already equals bootAttempts[name] — the invariant is uniform across a versioned (sub-game) confirm and an unversioned one. NOT the reload case: a sub-game reload re-enters beginBundleLoad and DOES count a new attempt, so this state (one counted attempt, already fully credited) is not what a sub-game reload produces — see OtaCore.swift:398-410.",
+      "op": "confirm",
+      "bundle": "subgame",
+      "version": "v2",
+      "state": {
+        "active": {
+          "subgame": "v1"
+        },
+        "pending": {
+          "subgame": "v2"
+        },
+        "bootAttempts": {
+          "subgame": 1
+        },
+        "confirmedBoots": {
+          "subgame": 1
+        }
+      },
+      "expect": {
+        "state": {
+          "active": {
+            "subgame": "v1"
+          },
+          "pending": {
+            "subgame": "v2"
+          },
+          "bootAttempts": {
+            "subgame": 1
+          },
+          "confirmedBoots": {
+            "subgame": 1
+          }
+        }
+      }
+    },
+    {
       "name": "transient_on_an_ACTIVE_version_ALSO_clears_it_bootAttempts_is_pending_only",
       "op": "loadFailed",
       "bundle": "subgame",

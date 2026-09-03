@@ -1,6 +1,7 @@
 package com.modokiengine.capacitor.iap;
 
 import android.util.Log;
+import android.webkit.WebView;
 
 import androidx.annotation.NonNull;
 
@@ -21,6 +22,7 @@ import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
+import com.getcapacitor.WebViewListener;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 import java.util.ArrayList;
@@ -57,6 +59,11 @@ public class ModokiIapPlugin extends Plugin {
      */
     private static final String TAG = "ModokiIap";
 
+    /** Guards `ensureWebViewListener()` — one registration per plugin instance. A new
+     *  Activity builds a new Bridge AND a new plugin instance, so this resets with it,
+     *  which is correct: the new Bridge has its own listener list to be added to. */
+    private boolean webViewListenerRegistered = false;
+
     private BillingClient billing;
 
     /** The call awaiting launchBillingFlow's async result. Play delivers the purchase through the
@@ -89,6 +96,61 @@ public class ModokiIapPlugin extends Plugin {
             awaitingProductId = null;
         }
         call.setKeepAlive(false);
+    }
+
+    /**
+     * Release a parked purchase() call left behind by a webview reload (#586).
+     *
+     * A reload gives JS a brand-new realm, and `Bridge.reset()` — called from
+     * `BridgeWebViewClient.onPageStarted` right before this listener fires — clears
+     * `savedCalls` and every plugin's event listeners. It does NOT touch plugin fields, so
+     * `awaitingPurchase` keeps pointing at a call whose realm is gone, and every `purchase()`
+     * for that product hits the "already in progress" reject at `:536` forever after.
+     *
+     * `Bridge.addWebViewListener` survives every reset — the listener LIST is not cleared by
+     * `Bridge.reset()` — so one registration lasts the life of the plugin instance.
+     *
+     * ⚠️ **Registered here, at park time, and NOT from `load()` — a listener added in `load()` is
+     * silently DISCARDED.** `Bridge`'s constructor calls `registerAllPlugins()` (`Bridge.java:231`),
+     * which is what runs `Plugin.load()`; `Bridge.Builder.create()` then calls
+     * `bridge.setWebViewListeners(...)` (`:1617`) eighteen lines later, and that setter REPLACES
+     * the whole list (`:1465`) instead of appending to it. So anything `load()` registered is gone
+     * before the first navigation, and `BridgeWebViewClient.onPageStarted` — which iterates
+     * `bridge.getWebViewListeners()` — walks a list that never contained it.
+     *
+     * Device-measured on a Galaxy S22 (2026-09-03) with a probe on both sides: `load()` DID run
+     * (1ms after "Registering plugin instance: ModokiIap") and the listener WAS added, yet across a
+     * real resume-reload — `[resume-reload] reloading after 75s away`, same PID, plugin still
+     * serving calls afterwards — `onPageStarted` never reached it. The first version of this fix
+     * lived in `load()` and was therefore inert. Do not move it back.
+     *
+     * Park time is the right seam on both counts: a JS call cannot arrive until the bridge is
+     * fully built, so it is provably after that replacement; and the listener has nothing to do
+     * until a call is actually parked.
+     */
+    private void ensureWebViewListener() {
+        if (webViewListenerRegistered) return;
+        webViewListenerRegistered = true;
+        getBridge().addWebViewListener(new WebViewListener() {
+            @Override
+            public void onPageStarted(WebView webView) {
+                PluginCall call = awaitingPurchase;
+                if (call == null) return;
+                String productId = awaitingProductId;
+                Log.i(TAG, "onPageStarted: webview reloaded with a purchase parked (" + productId
+                    + ") — releasing it");
+                // unpark() BEFORE reject: see its own doc for why the order matters.
+                unpark(call);
+                try {
+                    call.reject("the webview reloaded while this purchase was in flight — the "
+                        + "purchase itself is unaffected and is recovered by reconcile()");
+                } catch (Exception e) {
+                    // `call` belongs to the realm that just went away; rejecting into it can
+                    // throw. That must not propagate into Capacitor's navigation path.
+                    Log.w(TAG, "onPageStarted: rejecting the stale parked call failed", e);
+                }
+            }
+        });
     }
 
     private final PurchasesUpdatedListener purchasesUpdatedListener = (billingResult, purchases) -> {
@@ -134,7 +196,15 @@ public class ModokiIapPlugin extends Plugin {
         }
         JSObject event = new JSObject();
         event.put("transactions", delivered);
-        notifyListeners("purchasesUpdated", event);
+        // retainUntilConsumed: true — a webview reload (#586) tears down the JS realm and its
+        // subscription along with it; with no listener attached, Plugin queues this event in
+        // `retainedEventArguments` (which `Bridge.reset()` does not clear) instead of dropping
+        // it, and it drains into the next realm's subscribe the moment that subscription is
+        // added. It cannot double-deliver: retention only happens when the listener list is
+        // empty, so an event that DID have a listener is never retained. And the durable
+        // ledger's `isProcessed` gives cross-realm idempotency regardless, so this is what
+        // removes the need to reorder the JS subscription in `capacitorStore.ts`.
+        notifyListeners("purchasesUpdated", event, true);
 
         if (call != null) {
             Purchase match = null;
@@ -319,6 +389,12 @@ public class ModokiIapPlugin extends Plugin {
         call.reject(message + " (code " + code + ")", "billing." + code, null, data);
     }
 
+    /** ⚠️ `@PluginMethod` is what puts this in `PluginHandle`'s method index — without it the
+     *  method exists but Capacitor cannot dispatch to it, and every JS call fails with
+     *  `"ModokiIap.products() is not implemented on android"`. It was missing from this method
+     *  alone (every sibling had it) since the plugin's first commit, so Court's shelf could never
+     *  price anything on Android and emitted `store_products_failed` on every open. */
+    @PluginMethod
     public void products(PluginCall call) {
         List<String> inapp = stringList(call, "inapp");
         List<String> subs = stringList(call, "subs");
@@ -489,6 +565,9 @@ public class ModokiIapPlugin extends Plugin {
                         call.reject("a purchase is already in progress (" + awaitingProductId + ")");
                         return;
                     }
+                    // Register the reload listener BEFORE the call becomes reachable from it.
+                    // See ensureWebViewListener() for why this cannot live in load().
+                    ensureWebViewListener();
                     awaitingPurchase = call;
                     awaitingProductId = productId;
                     call.setKeepAlive(true);

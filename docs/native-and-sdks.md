@@ -272,6 +272,209 @@ single-path only by accident and are worth knowing: `games/court/packages/app-se
 do a bare `void handle.remove()` with no guard and no null-out — safe today because each has exactly
 one caller that drains exactly once, and unsafe the moment a second caller appears.
 
+## What a webview reload does and does not reset (#547)
+
+`location.reload()` is this engine's restart primitive — the owner's 2026-09-02 ruling is that the
+app has **no teardown path**, so a full reload is the sanctioned route to clean state, and the route
+for AB tests, LiveOps and resuming after a long background (`useResumeReload.ts`, #574).
+⚠️ Only the last of those exists today — there is no LiveOps or A/B system in the engine
+(`docs/todo.md`); the other two are stated intent for a reload, not shipped consumers of one. The JS side
+of that is covered in [managers-and-systems.md](managers-and-systems.md) § "App-scoped managers are
+never unregistered in production" — **every end-of-lifetime here is a REALM DEATH, not a teardown.**
+
+This section is the other half: what happens NATIVELY, where the process outlives the realm.
+
+**The one-line rule: a realm death is not a process death.** A reload rebuilds every manager, system,
+store, cache and module `let`. It re-runs nothing native. Anything initialised once per process
+launch — `FirebaseApp.configure` in `AppDelegate`, Android's `FirebaseInitProvider`, a plugin's
+`load()` — survives untouched, and a JS latch (`let initialized = false`) cannot see the difference.
+**Where a once-per-process guard is genuinely needed, it must live natively.**
+
+### What Capacitor does on every navigation
+
+Both platforms call `bridge.reset()` at navigation START — `WebViewDelegationHandler.swift:45-48`,
+`BridgeWebViewClient.java:62-64`. It does exactly two things:
+
+1. clears its saved-call map (`savedCalls` on Android, `storedCalls` on iOS)
+2. calls `removeAllListeners()` on every plugin instance, emptying each one's JS listener list
+
+⚠️ **This contract is source-only — it is NOT in Capacitor's documentation**, so it can regress in a
+future version with no changelog entry. Anything depending on it should cite these lines.
+
+⚠️ **Navigation is not the only trigger.** iOS also calls `reset()` from
+`webViewWebContentProcessDidTerminate` (`WebViewDelegationHandler.swift:158-160`) — the WKWebView
+content process being recycled while the app process lives on. That is the concrete mechanism behind
+the `sessionStorage` caveat below and in `resumeReload.ts`: the JS realm and its storage can vanish
+without any navigation, and without the native side noticing at all.
+
+What `reset()` does **not** touch, all verified against the vendored sources (2026-09-03):
+
+- **Plugin fields.** A plugin's own state survives. This is a live bug source: `ModokiIapPlugin`'s
+  parked `purchase()` call is a field, not a saved call, so a reload used to strand it and reject
+  every later purchase for that product (#586).
+- **`retainedEventArguments`.** A separate map from `eventListeners`, so an event fired with
+  `retainUntilConsumed: true` while no listener is attached is **queued**, and drains when the next
+  realm subscribes (`Plugin.java:661-683` + `addEventListener` → `sendRetainedArgumentsForEvent`;
+  `CAPPlugin.m:82-93` is the same shape). This is the fix for a delivery landing in the reload
+  window — retention beats trying to subscribe earlier, because it closes the window instead of
+  narrowing it.
+- **`webViewListeners`.** `Bridge.addWebViewListener` registrations survive every reload, which is
+  what makes `WebViewListener.onPageStarted` the right seam for native-side reload cleanup on
+  Android. ⚠️ There is **no `handleOnPageStarted` on `Plugin`** — the lifecycle hooks stop at
+  `handleOnStart/Restart/Resume/Pause/Stop/Destroy/ActivityResult/NewIntent/ConfigurationChanged`.
+  iOS's nearest equivalent is `shouldOverrideLoad:` (`CAPPlugin.h:40`, dispatched per plugin from
+  `WebViewDelegationHandler.swift:80-87`), but it is **not** interchangeable: it is a *policy* hook,
+  so an observer must return `nil` to avoid altering navigation, and it fires inside
+  `decidePolicyFor` — i.e. **before** `reset()` (`:45-47`, in `didStartProvisionalNavigation`),
+  the opposite ordering to Android's `onPageStarted`, which runs after it. So a cleanup that needs
+  "the old realm is definitively gone" has no exact iOS twin.
+
+### Retained events are drained exactly once, ever
+
+`CAPPlugin.m:56-61` reads the retained array and then `removeObjectForKey:` — permanently. So an event emitted with
+`retainUntilConsumed: true` and consumed by the FIRST realm is gone for every later one. Firebase's
+`authStateChange` is emitted that way, which means **after a reload `onAuthChanged` never fires**
+until a genuine sign-in or sign-out. Court survives only because `cloudSyncWiring.ts`'s `seedUid`
+polls `currentUser()` on a backoff — a mitigation written for iOS keychain restore, with nothing
+naming reload as a case it covers. **Weaken that poll and cloud save goes permanently inert after
+every reload.**
+
+### Conversely: plugin listeners do NOT leak across reloads
+
+Worth recording because the widely-repeated opposite is stale. `reset()` gained
+`removeAllPluginListeners()` in [capacitor#7962](https://github.com/ionic-team/capacitor/commit/06aeea9);
+before that they genuinely did stack up. Anything written before that commit is wrong about this.
+
+### Per-process native init, per shipped project
+
+- `games/court` — `AppDelegate.swift:31` `FirebaseApp.configure(options:)`; Android via
+  `FirebaseInitProvider` at process start. **Unreachable from JS**: none of the four
+  `@capacitor-firebase/*` plugins exposes a JS-side init and Court calls none, so a reload can
+  neither re-run nor double-configure it, and it needs no guard. All four plugin implementations
+  also carry their own `if (FirebaseApp.app() == nil)` guard, the vendor's answer to the fatal
+  double-configure trap.
+- `games/3d-test` — same `AppDelegate` shape.
+- Plugin `load()` overrides run once per plugin INSTANCE. ⚠️ That is not the same as once per
+  process on Android: `BridgeActivity.onCreate` builds a fresh `Bridge` with fresh `PluginHandle`s,
+  so an Activity recreation runs `load()` again. Current `load()` overrides:
+  `IapPlugin.swift`'s StoreKit `Transaction.updates` observer, and (since #586)
+  `ModokiIapPlugin.java`'s `WebViewListener` registration.
+
+### Firestore snapshot listeners — a trap that is currently unreachable
+
+Capacitor's Android reset calls the **no-arg** `removeAllListeners()` (`Bridge.java:570-575` →
+`Plugin.java:765-767`, which only does `eventListeners.clear()`), so Firestore's own
+`removeAllListeners(PluginCall)` override is **never reached**. iOS is fine — `CapacitorBridge.swift`
+dispatches via `#selector(CAPPlugin.removeAllListeners(_:))`, which does hit the Swift override.
+
+**Inert today, and deliberately not "fixed":** there are zero `addDocumentSnapshotListener` /
+`addCollectionSnapshotListener` / `addCollectionGroupSnapshotListener` / `onSnapshot` call sites in
+`games/` or `engine/` — every Firestore
+call in `cloudSave.ts` is one-shot, and `cloudSave.ts:40` says so. It becomes a real per-reload leak
+— billed reads, battery, invisible — on the day Court adopts its first snapshot listener. That day,
+start here (#588).
+
+### The defects this boundary produced, and how each was addressed
+
+All five were found by reading the reload path end to end while building #574's trigger. They share
+one root: **a guard, a latch or a counter that assumes "restart" means a new process.** The first
+four are fixed on `work-ai2`; check `git log`/the issues for whether that has reached `main` yet.
+
+| # | Defect | Fix |
+|---|---|---|
+| #584 | A reload counted as an OTA boot-confirmation, so `requiredConfirms = 2` was satisfied by one real launch plus a refresh — the two-boot watchdog defeated by exactly the thing it excludes | `OtaCore.confirm` credits at most one confirm per counted boot attempt, in the pure core on both ports so the shared vectors hold them to one spec |
+| #586 | `ModokiIapPlugin`'s parked `purchase()` call is a plugin FIELD that `Bridge.reset()` never clears, so the next realm's purchase was rejected forever; and a `purchasesUpdated` delivery in the reload window was dropped | A `WebViewListener.onPageStarted` releases the stale slot — registered at PARK time, **not** from `load()`; see the ⚠️ below. `purchasesUpdated` is now emitted `retainUntilConsumed: true` on both platforms, so a delivery with no listener is queued and drains into the next realm |
+| #587 | `AdsService.cleanup()` hung off a React unmount that never commits, so banners/MRECs survived every reload still refreshing and monetising with no listener — undercounting `ad_revenue`; and one interstitial was orphaned per `loadInterstitial` | `registerRealmShutdownTask` / `runRealmShutdownTasks` — the app registers, the runtime invokes (the reload sites are in `runtime/**` and cannot reach `appServices()`); plus destroy-before-reassign for the interstitial |
+| #588 | Crashlytics rate-limit budgets are module state, so a cap named "per session" was really per realm while native counted one session | The three session budgets seed from `sessionStorage`; a `[reload]` breadcrumb now explains the discontinuity in a post-reload report |
+| #585 | litert-lm re-loads an already-ready model — Android never closes the old `Engine`, iOS peaks at 2× resident | **Open, iceboxed.** The JS guard that would prevent it is a realm-scoped `let`, which is exactly the class above |
+
+⚠️ **#587's Court-side wiring is DORMANT in every build today, and the fix's stated motivation is
+therefore fixed for nobody yet.** `maxEnabled()` requires `APP_CONFIG.applovin.sdkKey !== ''` and the
+shipped config has `sdkKey: ''`, so `initAds()` returns before it can
+`registerReloadBlocker('court.fullscreenAd', …)` or attach the `adHidden`/`adLoadFailed` listeners,
+and `cleanupAds()`'s three `destroy*` calls sit behind the same gate. Every test that exercises this
+forces the gate open with `vi.mock('./config', …)`. So the banner/MREC surviving a reload and
+under-counting `ad_revenue` — the defect #587 describes — cannot happen right now, and the first
+real exercise of the mechanism will be the day a key is added, with no device evidence behind it.
+The engine-side registry (`realmShutdown.ts`) IS live; it is the Court consumer that is gated off.
+Worth knowing before anyone reads #587 as "ads teardown is proven".
+
+⚠️ **#584's own commit message (`8406660ef`) states its residual BACKWARDS** — it says a sub-game's
+boot attempt is "not counted on a reload". The opposite is true and is what makes the residual real:
+`beginBundleLoad` re-runs on a reload and DOES increment (`OtaCore.java:225`, `OtaCore.swift:406`),
+which is precisely why the confirm guard cannot protect a sub-game. This file and
+[ota-updates.md](ota-updates.md) are correct; git history is the archive and that one sentence in it
+is wrong.
+
+⚠️ **A `WebViewListener` registered from `Plugin.load()` is silently DISCARDED — #586's first fix
+was inert because of it.** `Bridge`'s constructor calls `registerAllPlugins()` (`Bridge.java:231`),
+which is what runs `Plugin.load()`. `Bridge.Builder.create()` then calls
+`bridge.setWebViewListeners(...)` (`:1617`) eighteen lines later, and that setter **replaces** the
+whole list (`:1465`) rather than appending — so anything `load()` registered is gone before the
+first navigation, and `BridgeWebViewClient.onPageStarted`, which iterates
+`bridge.getWebViewListeners()`, walks a list that never contained it.
+
+Device-measured on a Galaxy S22 (2026-09-03), both halves of the fork, same build tooling and the
+same reload path (`[resume-reload] reloading after 80s away`, one process throughout):
+
+| Registered from | `onPageStarted` reached it? |
+|---|---|
+| `load()` | **No** — never fired across a real reload |
+| a `@PluginMethod` call (post-construction) | **Yes** — fired 116 ms after the reload line |
+
+`load()` itself was never the problem and DOES run — logged 1 ms after
+`Registering plugin instance: ModokiIap`. The original investigation looked for a missing `load()`
+because the only log in that code path sat inside `onPageStarted` **behind the parked-call guard**,
+so it could not print unless a purchase was already in flight — a probe that could not detect its
+own positive case. Register after construction instead; `ensureWebViewListener()` does it at park
+time, which is both provably late enough and exactly when the listener acquires a job.
+
+⚠️ **`products()` was unreachable on Android from the plugin's first commit — a missing
+`@PluginMethod`.** The method existed and compiled; without the annotation `PluginHandle` never
+indexes it, so every call failed with `"ModokiIap.products() is not implemented on android"`. Court's
+shelf could price nothing on Android and fired `store_products_failed` on every open. iOS carried its
+`CAPPluginMethod(name: "products")` entry all along, which is why it survived so long — the platform
+where IAP got the most use was the one that worked. `npm run verify` is vitest and compiles no Java,
+so nothing local could see it; `engine/tests/architecture/pluginMethodParity.test.ts` now holds the
+TS, Android and iOS method surfaces to the same set.
+
+⚠️ **#584's fix is complete for the shell only.** A sub-game's boot attempt IS counted on a reload
+(`beginBundleLoad` re-runs and its JS genuinely re-executes), so a sub-game bundle can still reach
+`active` after one cold launch plus one resume-reload. Bounded rather than alarming — a bundle that
+fails to LOAD still never confirms — but two rapid loads in one process are weaker evidence than the
+two separate launches `requiredConfirms = 2` was written to demand. Closing it needs native process
+identity, which this fix deliberately does not use. See `docs/ota-updates.md`.
+
+⚠️ **The pattern to check when adding any once-per-process guard:** if the latch is a module `let`, a
+`sessionStorage` key, or anything else living in the JS realm, it cannot see a realm death and will
+re-run. The close-out sweep for #587 enumerated them — `grep -rnE "^let [a-zA-Z]+ = false;"` over
+`engine/packages/modoki/src/runtime`, `engine/app` and `games/court/**` gives 123 module latches, 14
+of them named like once-per-process guards. Only those guarding NATIVE state are defects; a JS-only
+latch (`engineActions`, `register.ts`, `consoleCapture`, …) is CORRECT to reset, because the new
+realm genuinely must re-register. Where each of the three named ones stands:
+
+| Latch | Guards | Status |
+|---|---|---|
+| `ads.ts:initialized` | AppLovin (native) | **Covered** — #587's `app.cleanup` task tears the SDK down before the reload |
+| `attribution.ts:initialized`/`starting`/`attPrompted` | AppsFlyer + ATT (native) | **Open — #607.** Nothing tears it down: `AttributionService` declares only `init()`, so `runRealmShutdownTasks()` has nothing to call. Measured on an S22: two `initialize()` calls and two launch events posted in ONE process across a reload |
+| `llm-test/LLMManager.ts` | litert-lm engine (native) | **Open — #585**, iceboxed |
+
+`milestones.ts:started` looks like the same shape and is not: its `fired` ledger lives in
+`PlayerPrefs`, so a re-run is idempotent. That is the distinction to apply — not "is it a module
+`let`" but "does anything durable or native survive the realm that this latch is standing in for".
+
+### What still needs a device
+
+Written down because the source cannot settle them, and because "we checked" should mean a
+measurement:
+
+- Whether a reload produces any extra `session_start` in the Firebase console (expected: none).
+- A reload landing mid-`signInWithGoogle` on Android — `bridge.reset()` drops the saved
+  `PluginCall`, and its ordering against Firebase's own callback is a genuine race.
+- Whether Firestore's Swift `removeAllListeners(_ call: CAPPluginCall)` — non-optional — is safe
+  when Capacitor invokes it with nil. It runs on every navigation including three shipped reload
+  paths, so it is evidently surviving; the mechanism is unconfirmed.
+
 ## App-service registry
 
 Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine concerns** — they wrap native SDKs (Firebase, AppLovin MAX, Adjust) that the engine must never depend on. So the engine ships only a tiny hook surface and lets each project plug its own implementations in. This is the seam that keeps the SDK code out of the engine bundle (and out of games that don't want ads).
@@ -287,9 +490,9 @@ Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine
 
 ### How it works
 
-The engine sees only the **small hook surface** — `crashlytics.recordError/log`, `ads.init/cleanup`, `attribution.init`. A game's package keeps its full API (`showInterstitial`, `logEvent`, `setUserProperty`, …) for the game itself to import and call directly; the engine never sees those. On game bootstrap `App.tsx` calls, in order: `def.registerAppServices()` (the game populates the registry), then — **only on `Capacitor.isNativePlatform()`** — `appServices().attribution?.init()` and `appServices().ads?.init()`. Ads are cleaned up (`appServices().ads?.cleanup()`) on unmount. Crashlytics is pull-driven: `gameStore` logs screen breadcrumbs via `appServices().crashlytics?.log(...)`, `ErrorBoundary` reports a React subtree crash through `reportReactError`, and the global capture below reports everything else.
+The engine sees only the **small hook surface** — `crashlytics.recordError/log`, `ads.init/cleanup`, `attribution.init`. A game's package keeps its full API (`showInterstitial`, `logEvent`, `setUserProperty`, …) for the game itself to import and call directly; the engine never sees those. On game bootstrap `App.tsx` calls, in order: `def.registerAppServices()` (the game populates the registry), then — **only on `Capacitor.isNativePlatform()`** — `appServices().attribution?.init()` and `appServices().ads?.init()`. Ads are cleaned up (`appServices().ads?.cleanup()`) from a **realm-shutdown task**, not on unmount — `App.tsx` registers it via `registerRealmShutdownTask`, and all three reload sites (`engine.reload`, `useResumeReload`, Court's post-wipe restart) go through **`shutdownRealmThenReload()`** — use that seam rather than composing `runRealmShutdownTasks()` and the reload by hand; it owns the once-per-realm latch and re-arms it when the reload throws, which two of the three sites previously got wrong (#587). It used to hang off the unmount effect, which on this architecture never fires — see § "What a webview reload does and does not reset" above. Crashlytics is pull-driven: `gameStore` logs screen breadcrumbs via `appServices().crashlytics?.log(...)`, `ErrorBoundary` reports a React subtree crash through `reportReactError`, and the global capture below reports everything else.
 
-**Every hook is optional and every unregistered hook is a silent no-op** (callers use `?.`) — which is also the correct web/editor behaviour, since the underlying Capacitor plugins stub out off-device anyway. On a game switch `App.tsx` calls `clearAppServices()` **before** the next game's `registerAppServices()`, so a previous game's ad/attribution SDKs don't leak into the next game. ⚠️ **That sentence described an intention, not the code, until #511**: `clearAppServices()` was `registered = {}` and nothing more, while the only caller of `AdsService.cleanup()` was `App.tsx`'s `[]`-deps *unmount* effect — so a swap dropped the registry and left the outgoing game's AppLovin MAX listeners live under the next game, double-counting ad revenue. It now captures the outgoing `ads`, clears the registry **first** (so a cleanup that throws or re-enters finds it empty, never half-cleared), then calls `cleanup()` inside a `try/catch` — a game's teardown must never break the swap. A game's `cleanup()` must therefore be **idempotent**, because the unmount effect can still run after a swap already cleaned up. The lesson generalises: **a teardown hook that exists and is called by nothing is indistinguishable from no hook at all** (same family as #506's `stopCloudSync`). Native SDK init is no longer wired in `main.tsx` — that comment there points here. The game package is also the dogfood stand-in for a future Modoki-hosted npm package (see `docs/modoki-package-manager.md`).
+**Every hook is optional and every unregistered hook is a silent no-op** (callers use `?.`) — which is also the correct web/editor behaviour, since the underlying Capacitor plugins stub out off-device anyway. On a game switch `App.tsx` calls `clearAppServices()` **before** the next game's `registerAppServices()`, so a previous game's ad/attribution SDKs don't leak into the next game. ⚠️ **That sentence described an intention, not the code, until #511**: `clearAppServices()` was `registered = {}` and nothing more, while the only caller of `AdsService.cleanup()` was `App.tsx`'s `[]`-deps *unmount* effect — so a swap dropped the registry and left the outgoing game's AppLovin MAX listeners live under the next game, double-counting ad revenue. It now captures the outgoing `ads`, clears the registry **first** (so a cleanup that throws or re-enters finds it empty, never half-cleared), then calls `cleanup()` inside a `try/catch` — a game's teardown must never break the swap. A game's `cleanup()` must therefore be **idempotent**, because `cleanup()` is now reachable from two directions — `clearAppServices()` on a game swap, and the realm-shutdown task on a reload. The lesson generalises: **a teardown hook that exists and is called by nothing is indistinguishable from no hook at all** (same family as #506's `stopCloudSync`). Native SDK init is no longer wired in `main.tsx` — that comment there points here. The game package is also the dogfood stand-in for a future Modoki-hosted npm package (see `docs/modoki-package-manager.md`).
 
 ### Global JS error capture (#275)
 
@@ -301,10 +504,14 @@ failure in a system, or a rejected asset load reached nothing at all in producti
 closes that, and it is **deliberately ungated** — the same reason analytics may not ride the event
 journal, which `setJournalEnabled` switches off in a release build.
 
-- **`console.error` → `recordError` (a non-fatal ISSUE); `console.warn` → `log` (a BREADCRUMB).**
-  Two different Crashlytics concepts: an issue is grouped and alerted on, a breadcrumb is visible
-  only inside somebody else's report. A game warns on ordinary paths, and promoting those to alerting
-  issues buries the one report that is a real crash.
+- **`console.error` AND `console.warn` → `recordError` (a non-fatal ISSUE); only a genuine
+  breadcrumb takes `log`.** ⚠️ This doc said the opposite until 2026-09-03, and the code had already
+  moved: the owner **reversed the warn routing on 2026-08-20**, so a warn is now a separate BUDGET,
+  not a separate destination (`globalErrors.ts` — see the comment at its `deliver()`: *"'warn'
+  delivers as an ISSUE exactly like 'error' — it is a separate BUDGET, not a separate destination.
+  Only 'breadcrumb' takes the log path."*). The two Crashlytics concepts still differ — an issue is
+  grouped and alerted on, a breadcrumb is visible only inside somebody else's report — and the
+  reason warns get their own cap is so a warn flood cannot spend the crash budget.
 - ⚠️ **It is installed by a SIDE-EFFECT IMPORT above `./App.tsx`, not by a call.** ES imports are
   hoisted and evaluated before any statement of the importing module, so the installer written as
   `main.tsx`'s first statement still ran after App.tsx's whole module graph — leaving a top-level

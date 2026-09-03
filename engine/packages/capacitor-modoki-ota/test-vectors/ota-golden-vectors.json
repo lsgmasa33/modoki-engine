@@ -115,6 +115,49 @@
       }
     },
     {
+      "name": "confirm_a_SECOND_time_within_one_boot_attempt_is_a_noop",
+      "_why": "#584 repro: a webview reload re-fires the JS confirm without re-entering the native boot hook that counts an attempt. Without the guard this promotes to active:v13 off a single real boot.",
+      "op": "confirm",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12" },
+        "pending": { "shell": "v13" },
+        "bootAttempts": { "shell": 1 },
+        "confirmedBoots": { "shell": 1 }
+      },
+      "expect": {
+        "state": {
+          "active": { "shell": "v12" },
+          "pending": { "shell": "v13" },
+          "bootAttempts": { "shell": 1 },
+          "confirmedBoots": { "shell": 1 }
+        }
+      }
+    },
+    {
+      "name": "confirm_after_a_fresh_attempt_still_counts",
+      "op": "confirm",
+      "bundle": "shell",
+      "state": {
+        "active": { "shell": "v12" },
+        "pending": { "shell": "v13" },
+        "bootAttempts": { "shell": 2 },
+        "confirmedBoots": { "shell": 1 }
+      },
+      "expect": {
+        "state": { "active": { "shell": "v13" } }
+      }
+    },
+    {
+      "name": "confirm_with_no_counted_attempt_is_a_noop",
+      "op": "confirm",
+      "bundle": "shell",
+      "state": { "active": { "shell": "v12" }, "pending": { "shell": "v13" } },
+      "expect": {
+        "state": { "active": { "shell": "v12" }, "pending": { "shell": "v13" } }
+      }
+    },
+    {
       "name": "missing_active_folder_falls_back_to_embedded_and_clears_active",
       "op": "boot",
       "bundle": "shell",

@@ -32,6 +32,15 @@ let sink: { errors: string[]; logs: string[] };
 let svc: { recordError(m: string): void; log(m: string): void };
 
 beforeEach(() => {
+  // ⚠️ EVERY key, not just this module's. `__resetGlobalErrorsForTest()` clears
+  // `modoki.globalErrors.sessionCounters`, but the staleness tests below also write
+  // `modoki.resumeReload`, and `sessionStorage` survives `vi.resetModules()` within a file. A
+  // leftover 45-minute breadcrumb makes the persistence guard at
+  // 'a counter charged in one realm is still charged after a simulated reload' DROP the budget it
+  // exists to prove is kept — so that test would pass only by source order, and go red under
+  // `--sequence.shuffle.tests`. Caught in close-out review by copying that guard below the
+  // staleness tests and watching it fail (101 errors instead of 100).
+  sessionStorage.clear();
   realError = console.error;
   realWarn = console.warn;
   // ⚠️ BOUND TO THIS TEST'S OWN ARRAYS, not to the shared `sink` binding. `vi.resetModules()`
@@ -387,5 +396,217 @@ describe('globalErrors — install', () => {
     m.registerAppServices({ crashlytics: svc });
     console.error('once');
     expect(sink.errors).toHaveLength(1);
+  });
+});
+
+describe('globalErrors — session budget survives a reload (#588)', () => {
+  /**
+   * A webview reload destroys and re-zeroes this module's `let`s while native Crashlytics still
+   * counts it as ONE session — so a cap whose name says "per session" was really per REALM.
+   * `sessionStorage` survives a same-origin reload (it is what jsdom keeps across `vi.resetModules()`
+   * within one test file too), so re-importing the module with it intact is a faithful simulation of
+   * a reload.
+   */
+  it('a counter charged in one realm is still charged after a simulated reload', async () => {
+    // Step the injected clock so the pre-reload batch is not itself burst-capped (30/5s) — the
+    // budget under test here is the SESSION cap (100), not the burst window.
+    let t = 0;
+    const m1 = await load(() => t);
+    m1.registerAppServices({ crashlytics: svc });
+    for (let i = 0; i < 97; i++) {
+      if (i % 20 === 0) t += 6000;
+      m1.captureToCrashlytics('error', `pre-reload ${i}`);
+    }
+    expect(sink.errors).toHaveLength(97);
+
+    // Simulate a reload: re-import the module (a fresh `let errorsSent = 0` at the JS level) WITHOUT
+    // calling __resetGlobalErrorsForTest, so sessionStorage is the only thing carrying the count over.
+    vi.resetModules();
+    const g2 = await import('../../src/runtime/core/globalErrors');
+    const a2 = await import('../../src/runtime/core/appServices');
+    g2.installGlobalErrorHandlers();
+    a2.registerAppServices({ crashlytics: svc });
+
+    // 3 left of the 100-per-session budget — the reload did NOT refresh it to a fresh 100.
+    g2.captureToCrashlytics('error', 'post-reload A');
+    g2.captureToCrashlytics('error', 'post-reload B');
+    g2.captureToCrashlytics('error', 'post-reload C');
+    expect(sink.errors).toHaveLength(100);
+
+    g2.captureToCrashlytics('error', 'post-reload D — should be capped');
+    expect(sink.errors, 'the budget remembers the 97 already spent pre-reload').toHaveLength(100);
+  });
+
+  it('a throwing/absent sessionStorage falls back to in-memory behaviour and reporting still works', async () => {
+    vi.resetModules();
+    const original = Object.getOwnPropertyDescriptor(window, 'sessionStorage');
+    const throwing = new Proxy(
+      {},
+      {
+        get(): never { throw new Error('sessionStorage disabled'); },
+        set(): never { throw new Error('sessionStorage disabled'); },
+      },
+    );
+    Object.defineProperty(window, 'sessionStorage', { value: throwing, configurable: true });
+    try {
+      // Module top-level init reads sessionStorage while it is throwing — must not throw itself.
+      const g = await import('../../src/runtime/core/globalErrors');
+      const a = await import('../../src/runtime/core/appServices');
+      expect(() => g.installGlobalErrorHandlers()).not.toThrow();
+      a.registerAppServices({ crashlytics: svc });
+      expect(() => g.captureToCrashlytics('error', 'still works')).not.toThrow();
+      expect(sink.errors).toEqual(['still works']);
+    } finally {
+      if (original) Object.defineProperty(window, 'sessionStorage', original);
+    }
+  });
+
+  it('a budget carried past the native session window is DROPPED, not inherited', async () => {
+    // ⚠️ Found in close-out review; the persistence shipped without this and it is the one
+    // direction in which persisting is WORSE than not persisting. Crashlytics ends a session
+    // after ~30 min in the background, but `sessionStorage` survives as long as the webview
+    // content process does. So: spend the budget, go away longer than the session window, let
+    // #574 reload on resume — and the brand-new native session inherits a spent budget and ships
+    // NOTHING for its entire life, silently. Before the persistence the reload restored it.
+    let t = 0;
+    const m1 = await load(() => t);
+    m1.registerAppServices({ crashlytics: svc });
+    for (let i = 0; i < 100; i++) {
+      if (i % 20 === 0) t += 6000;
+      m1.captureToCrashlytics('error', `pre-reload ${i}`);
+    }
+    expect(sink.errors, 'the pre-reload session spent its whole budget').toHaveLength(100);
+
+    // The resume-reload breadcrumb the reload path leaves behind, with a gap well past the window.
+    sessionStorage.setItem('modoki.resumeReload', JSON.stringify({ awayMs: 45 * 60_000 }));
+
+    vi.resetModules();
+    const g2 = await import('../../src/runtime/core/globalErrors');
+    const a2 = await import('../../src/runtime/core/appServices');
+    // No second installGlobalErrorHandlers() — this test only needs the re-imported module's
+    // counters, and each extra install leaves another window listener on the shared jsdom window.
+    a2.registerAppServices({ crashlytics: svc });
+
+    g2.captureToCrashlytics('error', 'post-reload, new native session');
+    expect(
+      sink.errors.length,
+      'a new Crashlytics session must start with a fresh budget — inheriting the spent one '
+        + 'silences the whole session',
+    ).toBeGreaterThan(100);
+  });
+
+  it('does NOT drop the budget for a SHORT away gap — that is the case persistence exists for', async () => {
+    // The complement, and what keeps the staleness check from quietly undoing #588: a resume-reload
+    // inside the session window is the same native session, so the budget must still carry over.
+    let t = 0;
+    const m1 = await load(() => t);
+    m1.registerAppServices({ crashlytics: svc });
+    for (let i = 0; i < 100; i++) {
+      if (i % 20 === 0) t += 6000;
+      m1.captureToCrashlytics('error', `pre-reload ${i}`);
+    }
+    expect(sink.errors).toHaveLength(100);
+
+    sessionStorage.setItem('modoki.resumeReload', JSON.stringify({ awayMs: 2 * 60_000 }));
+
+    vi.resetModules();
+    const g2 = await import('../../src/runtime/core/globalErrors');
+    const a2 = await import('../../src/runtime/core/appServices');
+    a2.registerAppServices({ crashlytics: svc });
+
+    g2.captureToCrashlytics('error', 'post-reload, same native session');
+    expect(
+      sink.errors,
+      'a 2-minute gap is the same native session — the budget must still be spent',
+    ).toHaveLength(100);
+  });
+
+  it('a dropped stale budget is cleared from STORAGE, not just from memory', async () => {
+    // Realm A spends the budget -> long gap -> realm B drops it in memory and charges nothing ->
+    // realm C must still start fresh. If the drop were in-memory only, B never calls
+    // savePersistedCounters() (it only runs on an allowed capture), so the spent value survives in
+    // storage and C files nothing for its whole life. Found in close-out review.
+    let t = 0;
+    const mA = await load(() => t);
+    mA.registerAppServices({ crashlytics: svc });
+    for (let i = 0; i < 100; i++) {
+      if (i % 20 === 0) t += 6000;
+      mA.captureToCrashlytics('error', `A${i}`);
+    }
+    expect(sink.errors).toHaveLength(100);
+
+    // Realm B: long gap, drops the budget, charges NOTHING.
+    sessionStorage.setItem('modoki.resumeReload', JSON.stringify({ awayMs: 45 * 60_000 }));
+    vi.resetModules();
+    await import('../../src/runtime/core/globalErrors');
+    sessionStorage.removeItem('modoki.resumeReload');
+
+    // Realm C: an ordinary reload with no breadcrumb at all.
+    vi.resetModules();
+    const gC = await import('../../src/runtime/core/globalErrors');
+    const aC = await import('../../src/runtime/core/appServices');
+    aC.registerAppServices({ crashlytics: svc });
+    gC.captureToCrashlytics('error', 'C — must be reported');
+    expect(
+      sink.errors.length,
+      'realm C inherited the dead session\'s spent budget from storage',
+    ).toBeGreaterThan(100);
+  });
+
+  it('peeking the resume-reload breadcrumb does not consume it', async () => {
+    // globalErrors reads the breadcrumb to size the staleness check; the resume-reload consumer
+    // still owns it. If the peek removed it, the real consumer would see a cold launch instead.
+    sessionStorage.setItem('modoki.resumeReload', JSON.stringify({ awayMs: 1000 }));
+    vi.resetModules();
+    await import('../../src/runtime/core/globalErrors');
+    const rr = await import('../../src/runtime/core/resumeReload');
+    expect(
+      rr.consumeResumeReload(),
+      'globalErrors consumed the breadcrumb out from under the resume-reload path',
+    ).toEqual({ awayMs: 1000 });
+  });
+
+  it('__resetGlobalErrorsForTest clears the persisted values', async () => {
+    const m1 = await load();
+    m1.registerAppServices({ crashlytics: svc });
+    m1.captureToCrashlytics('error', 'charge one');
+    expect(sink.errors).toHaveLength(1);
+    expect(sessionStorage.getItem('modoki.globalErrors.sessionCounters')).not.toBeNull();
+
+    m1.__resetGlobalErrorsForTest();
+
+    expect(sessionStorage.getItem('modoki.globalErrors.sessionCounters')).toBeNull();
+  });
+});
+
+describe('globalErrors — [reload] breadcrumb at boot', () => {
+  it('emits a [reload] breadcrumb when the navigation type is reload', async () => {
+    sessionStorage.clear();
+    vi.resetModules();
+    const spy = vi.spyOn(performance, 'getEntriesByType').mockReturnValue([{ type: 'reload' }] as unknown as PerformanceEntryList);
+    try {
+      const g = await import('../../src/runtime/core/globalErrors');
+      const a = await import('../../src/runtime/core/appServices');
+      g.installGlobalErrorHandlers();
+      a.registerAppServices({ crashlytics: svc });
+      expect(sink.logs.some((m) => m.includes('[reload]'))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('does NOT emit a [reload] breadcrumb when the navigation type is navigate', async () => {
+    sessionStorage.clear();
+    vi.resetModules();
+    const spy = vi.spyOn(performance, 'getEntriesByType').mockReturnValue([{ type: 'navigate' }] as unknown as PerformanceEntryList);
+    try {
+      const g = await import('../../src/runtime/core/globalErrors');
+      const a = await import('../../src/runtime/core/appServices');
+      g.installGlobalErrorHandlers();
+      a.registerAppServices({ crashlytics: svc });
+      expect(sink.logs.some((m) => m.includes('[reload]'))).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

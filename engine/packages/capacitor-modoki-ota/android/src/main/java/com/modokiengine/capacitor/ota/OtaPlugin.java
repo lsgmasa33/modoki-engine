@@ -356,8 +356,17 @@ public class OtaPlugin extends Plugin {
       synchronized (STATE_LOCK) {
         // `version` is optional: the SHELL has none to name (its boot hook is the sole
         // authority over what got served), a sub-game always passes one. See OtaCore.confirm.
-        OtaCore.State state = OtaCore.confirm(readState(getContext()), name, call.getString("version"));
+        OtaCore.State before = readState(getContext());
+        OtaCore.State state = OtaCore.confirm(before, name, call.getString("version"));
         writeState(getContext(), state != null ? state : new OtaCore.State());
+        // Makes a refused confirm (#584's guard firing) legible on device — otherwise it
+        // resolves identically to a credited one.
+        String pendingBefore = before != null ? before.pending.get(name) : null;
+        boolean promoted = pendingBefore != null && (state == null || state.pending.get(name) == null);
+        boolean credited = (state != null ? state.confirmedBoots.getOrDefault(name, 0) : 0)
+          > (before != null ? before.confirmedBoots.getOrDefault(name, 0) : 0);
+        String outcome = promoted ? "promoted" : (credited ? "credited" : "refused");
+        Log.d("ModokiOta", "confirmBoot " + name + ": " + outcome);
       }
       JSObject ret = new JSObject();
       ret.put("ok", true);

@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   registerReloadBlocker,
@@ -8,9 +9,15 @@ import {
   __clearReloadBlockersForTest,
   type ResumeReloadDeps,
 } from '../../src/runtime/core/resumeReload';
+import {
+  registerRealmShutdownTask,
+  runRealmShutdownTasks,
+  __resetRealmShutdownForTest,
+} from '../../src/runtime/core/realmShutdown';
 
 afterEach(() => {
   __clearReloadBlockersForTest();
+  __resetRealmShutdownForTest();
   vi.restoreAllMocks();
 });
 
@@ -319,6 +326,60 @@ describe('resume-reload decision', () => {
     r.advance(11 * MINUTE);
     await r.handler.onResume();
     expect(reload).toHaveBeenCalledTimes(2);
+  });
+
+  it('is NOT wedged off permanently when reload() returns a REJECTED promise', async () => {
+    // Same recovery as the synchronous-throw case above, but for the async contract added when
+    // `useResumeReload.ts` started running realm-shutdown tasks before the actual
+    // `window.location.reload()` (#587): `deps.reload()` can now fail asynchronously, and the
+    // handler must `await` it for this `catch` to ever see that failure.
+    let boom = true;
+    const reload = vi.fn(() => (boom
+      ? Promise.reject(new Error('shutdown task failed'))
+      : Promise.resolve()));
+    const r = rig({ reload, markResumed: markResumeReload });
+
+    r.handler.onBackground();
+    r.advance(11 * MINUTE);
+    await expect(r.handler.onResume()).rejects.toThrow('shutdown task failed');
+
+    // Same two recovery behaviours as the sync case: the breadcrumb is taken back...
+    expect(consumeResumeReload()).toBeNull();
+
+    // ...and the latch is un-stuck, so a second resume edge still reloads.
+    boom = false;
+    r.handler.onBackground();
+    r.advance(11 * MINUTE);
+    await r.handler.onResume();
+    expect(reload).toHaveBeenCalledTimes(2);
+  });
+
+  it('re-arms the realm-shutdown seam when reload() fails, so a LATER reload still runs teardown', async () => {
+    // Mirrors the production wiring (`engine.reload`, `useResumeReload`): `deps.reload()` runs the
+    // realm-shutdown tasks and then the actual navigation. `runRealmShutdownTasks()`'s own latch
+    // means the shutdown task must not run a second time UNLESS the first reload attempt failed.
+    const shutdownTask = vi.fn();
+    registerRealmShutdownTask('task', shutdownTask);
+
+    let boom = true;
+    const reload = vi.fn(() => runRealmShutdownTasks().then(() => {
+      if (boom) throw new Error('navigation blocked');
+    }));
+    const r = rig({ reload, markResumed: markResumeReload });
+
+    r.handler.onBackground();
+    r.advance(11 * MINUTE);
+    await expect(r.handler.onResume()).rejects.toThrow('navigation blocked');
+    expect(shutdownTask).toHaveBeenCalledTimes(1);
+
+    boom = false;
+    r.handler.onBackground();
+    r.advance(11 * MINUTE);
+    await r.handler.onResume();
+
+    // Without `notifyRealmSurvived()` in the recovery `catch`, `runRealmShutdownTasks()`'s latch
+    // would still be spent from the failed attempt and this second call would be a no-op.
+    expect(shutdownTask).toHaveBeenCalledTimes(2);
   });
 
   it('ignores a background edge that arrives after the reload was committed', async () => {

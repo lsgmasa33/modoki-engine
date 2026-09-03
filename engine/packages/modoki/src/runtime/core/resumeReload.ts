@@ -22,6 +22,7 @@
  */
 
 import { createSupersessionToken } from './liveness';
+import { notifyRealmSurvived } from './realmShutdown';
 
 /** One registered blocker, keyed by its own disposer identity rather than by `name` — two
  *  subsystems may legitimately register the same name, and each disposer must remove only its
@@ -129,6 +130,28 @@ export function markResumeReload(awayMs: number): void {
   }
 }
 
+/**
+ * Read the breadcrumb WITHOUT removing it.
+ *
+ * The one-shot `consumeResumeReload()` below is the right default and stays the only way to
+ * *handle* a resume. This exists for a reader that needs to know how long the app was away but
+ * must NOT claim the resume — `globalErrors.ts` decides whether its persisted budgets belong to
+ * the same native Crashlytics session, and consuming the breadcrumb there would steal it from the
+ * real consumer. Peeking steps on nothing; a stale breadcrumb is impossible because the true
+ * consumer still removes it.
+ */
+export function peekResumeReload(): { awayMs: number } | null {
+  try {
+    const raw = sessionStorage.getItem(BREADCRUMB_KEY);
+    if (raw == null) return null;
+    const parsed: unknown = JSON.parse(raw);
+    const awayMs = (parsed as { awayMs?: unknown })?.awayMs;
+    return typeof awayMs === 'number' && Number.isFinite(awayMs) ? { awayMs } : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Read and REMOVE the breadcrumb. One-shot by construction: two consumers must not both think
  *  they are the one handling the resume, and a breadcrumb left behind would make every
  *  subsequent navigation in this context look like a resume-reload. */
@@ -166,8 +189,12 @@ export interface ResumeReloadDeps {
    *  `drain()` catches every write error and re-queues it (`storage/playerPrefs.ts`), so the
    *  flush promise resolves whether or not anything landed. */
   pendingKeys: () => string[];
-  /** `window.location.reload`. */
-  reload: () => void;
+  /** `window.location.reload`, or an async wrapper that runs teardown before it (e.g.
+   *  `runRealmShutdownTasks().finally(() => window.location.reload())`). Awaited by the caller so
+   *  a throw from either the teardown chain or `reload()` itself still reaches the `catch` below —
+   *  on a successful reload the returned promise never settles because the realm dies, which is
+   *  fine and deliberate. */
+  reload: () => void | Promise<void>;
   /** Usually `markResumeReload`. */
   markResumed: (awayMs: number) => void;
   log?: (msg: string) => void;
@@ -316,7 +343,13 @@ export function createResumeReloadHandler(deps: ResumeReloadDeps): ResumeReloadH
       log(`reloading after ${Math.round(awayMs / 1000)}s away`);
       deps.markResumed(awayMs);
       try {
-        deps.reload();
+        // Awaited, not fired and forgotten: `deps.reload()` can be an async wrapper that runs
+        // teardown before the actual `window.location.reload()`, so a throw may arrive
+        // asynchronously — from the shutdown-task chain or from `reload()` itself — well after
+        // this call returns. Awaiting is what lets it still reach this `catch`. On a SUCCESSFUL
+        // reload the awaited promise never settles because the realm dies mid-await, which is
+        // fine and deliberate.
+        await deps.reload();
       } catch (e) {
         // `reload()` threw, so the realm is NOT dying after all. Leaving `reloading` latched
         // would disable the trigger for the rest of this realm's life — a permanent-off state
@@ -328,8 +361,16 @@ export function createResumeReloadHandler(deps: ResumeReloadDeps): ResumeReloadH
         // ordinary navigation in this context look like a resume-reload (see
         // `consumeResumeReload`'s own warning) — a spurious cloud sync on the next scene swap.
         // Un-latching is what made the realm live long enough to see it, so the two belong
-        // together.
+        // together. And re-arm the realm-shutdown seam (`realmShutdown.ts`) for the same reason —
+        // now BELT-AND-BRACES for the shipped callers, since `shutdownRealmThenReload()` re-arms
+        // on the throwing route itself, but still load-bearing for any `deps.reload` that does its
+        // own teardown without going through that seam:
+        // `deps.reload()` on the `engine.reload`/`useResumeReload` path already ran
+        // `runRealmShutdownTasks()` before attempting the actual navigation, so its once-per-realm
+        // latch is spent — surviving with it stuck would mean a LATER reload in this realm skips
+        // teardown entirely. All three lines say "the realm survived after all".
         try { sessionStorage.removeItem(BREADCRUMB_KEY); } catch { /* see markResumeReload */ }
+        notifyRealmSurvived();
         throw e;
       }
     },
