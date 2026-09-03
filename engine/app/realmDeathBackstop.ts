@@ -4,7 +4,7 @@
  *  injected"). It must stay a plain `.ts` module, not `.tsx` — same house rule as that file and as
  *  `docs/editor.md`'s "editor `.ts` logic carries tests; editor `.tsx` does not".
  *
- *  WHY this exists: `App.tsx` installs a `pagehide` listener as a backstop for `#587`'s realm
+ *  WHY this exists: `useBackgroundFlush.ts` installs a `pagehide` listener as a backstop for `#587`'s realm
  *  shutdown tasks (native ad SDK teardown before a reload). `event.persisted === false` is supposed
  *  to mean "the page is actually going away, not just backgrounding into the bfcache" — but that
  *  gate was validated by an ANDROID measurement only, and `pagehide` firing on a mere backgrounding

@@ -32,7 +32,8 @@ game just imports and calls it; there is no registration.
 | `runtime/storage/playerPrefs.ts` | The singleton, the sync API, the envelope, and the debounced write pipeline. |
 | `runtime/storage/backends.ts` | `PrefsBackend` interface + `InMemoryBackend` / `LocalStorageBackend` / `PreferencesBackend` + `selectDefaultBackend()`. |
 | `runtime/storage/index.ts` | Re-exports; surfaced from `runtime/index.ts`. |
-| `engine/app/App.tsx` | Hydrates per game (`init({ namespace: gameId, backend: selectDefaultBackend() })`) and registers flush-on-background. |
+| `engine/app/App.tsx` | Hydrates per game (`init({ namespace: gameId, backend: selectDefaultBackend() })`). |
+| `engine/app/useBackgroundFlush.ts` | Registers flush-on-background. Its own module so the edge set can be pinned by a test without rendering the app shell. |
 | `engine/app/useResumeReload.ts` | Flushes and then checks `pendingKeys()` before a resume-reload destroys the realm (#574) — see the first Gotcha. |
 | `engine/packages/modoki/tests/runtime/playerPrefs*.test.ts` | Core, backends, and save→reload→restore integration tests. |
 
@@ -132,11 +133,31 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   parses a fresh object — no caller can mutate the cache — and the JSON contract is enforced
   at `set()` time). Writes are serialized on a promise chain so `flush()` has a stable point;
   a backend rejection (localStorage quota, native I/O) **re-queues the key and never poisons
-  the chain**.
+  the chain**, and the re-queuing drain **schedules its own retry** — backed off from 500 ms and
+  capped at 5 attempts, so a permanently-rejecting backend cannot spin at the debounce interval.
+  Hitting the cap is not permanent: the next `set()`/`del()`/`clear()` re-arms the budget. Before
+  #619 nothing scheduled that retry at all — `scheduleFlush()` is reached only from the three
+  mutators — so "will retry on next flush" promised a flush that might never come.
 - **Lifecycle.** `App.tsx` hydrates on each game load *before* scene load, so systems that
   read saved progress at spawn see it. It flushes on background — `visibilitychange` /
-  `pagehide` on web, Capacitor `App` `appStateChange` on native — and a game swap flushes the
-  outgoing namespace before clearing the cache.
+  `pagehide` on web, Capacitor `App` `appStateChange` **and `'pause'`** on native — and a game swap
+  flushes the outgoing namespace before clearing the cache. ⚠️ **`'pause'` is not redundant with
+  `appStateChange` on Android** (#619): `fireStatusChange(false)` has exactly one caller,
+  `BridgeActivity.onStop():118` (and it is gated on `activityDepth == 0`), so a *translucent* Activity
+  on top — Play Billing's `ProxyBillingActivity` is the one that bit us — pauses the host without
+  stopping it and produces **no BACKGROUND `appStateChange`**. ⚠️ Not "no `appStateChange` at all":
+  `fireStatusChange(true)` at `onResume():97` is UNCONDITIONAL, so dismissing it fires an
+  `isActive:true` with no `false` before it — see the unpaired-resume warning in
+  [native-and-sdks.md](./native-and-sdks.md) before writing any consumer that assumes the two pair up. `'pause'` comes from
+  `AppPlugin.handleOnPause()` and does fire — measured on the A23, not inferred: behind a translucent
+  Activity `pause` fires alone, with `appStateChange` and `visibilitychange` both silent
+  ([native-and-sdks.md](./native-and-sdks.md) has the table and the HOME-press control). On iOS it maps to `didEnterBackground`, which is *later*
+  than the `willResignActive` already driving `appStateChange(false)`, so there it is a harmless
+  duplicate — additive, never a replacement. Flushing on every pause is free when nothing is
+  pending — `drain()` short-circuits on `dirty.size === 0` before touching the backend — but not
+  while a write is failing: `flush()` also cancels the pending backed-off retry timer, so a burst
+  of pause edges with no intervening write spends the retry budget faster than its backoff
+  intends (more attempts sooner, then silence until the next write re-arms it).
 
 ## Gotchas
 

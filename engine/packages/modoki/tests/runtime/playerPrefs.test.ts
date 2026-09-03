@@ -646,6 +646,322 @@ describe('PlayerPrefs — backend-failure resilience', () => {
   });
 });
 
+describe('PlayerPrefs — backed-off self-scheduling retry (#619)', () => {
+  // #619: a Google Play billing sheet's translucent host Activity pauses without stopping, so no
+  // background-flush edge fires — the only other thing that could rescue a re-queued write. These
+  // pin that a re-queued write retries on its OWN, with no further set()/flush() call needed.
+
+  it('a re-queued write schedules its OWN retry — no further set()/flush() call needed', async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new Map<string, string>();
+      let failNext = true;
+      const flaky: PrefsBackend = {
+        getAll: async () => ({}),
+        set: async (k, v) => {
+          if (failNext) { failNext = false; throw new Error('QuotaExceeded (simulated)'); }
+          store.set(k, v);
+        },
+        remove: async (k) => { store.delete(k); },
+      };
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await PlayerPrefs.init({ namespace: 'g1', backend: flaky });
+
+      PlayerPrefs.set('a', 1);
+      await vi.advanceTimersByTimeAsync(200); // fires the 150ms debounce; attempt 1 rejects and re-queues
+      expect(store.has('mk:g1:a')).toBe(false); // not landed yet
+      expect(PlayerPrefs.pendingKeys()).toContain('a');
+
+      // No further set()/flush() call — only the module's own scheduled retry can land this.
+      await vi.advanceTimersByTimeAsync(600); // past RETRY_BASE_MS (500ms, private to the module)
+
+      expect(store.get('mk:g1:a')).toBe(JSON.stringify({ v: 1, d: 1 }));
+      expect(PlayerPrefs.pendingKeys()).not.toContain('a');
+      warnSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a permanently-rejecting backend stops retrying after the capped budget is spent', async () => {
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const alwaysFails: PrefsBackend = {
+        getAll: async () => ({}),
+        set: async () => { attempts++; throw new Error('QuotaExceeded (simulated)'); },
+        remove: async () => {},
+      };
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await PlayerPrefs.init({ namespace: 'g1', backend: alwaysFails });
+
+      PlayerPrefs.set('a', 1);
+      // Debounce (150ms) + the full backoff budget (0.5+1+2+4+8s ≈ 15.5s, MAX_RETRY_DRAINS=5,
+      // both private to the module) — advance well past all of it.
+      await vi.advanceTimersByTimeAsync(20000);
+      expect(attempts).toBe(6); // the original drain + 5 capped retries
+
+      attempts = 0;
+      await vi.advanceTimersByTimeAsync(60000); // advancing much further adds nothing more
+      expect(attempts).toBe(0);
+
+      warnSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a genuinely new write re-arms the retry budget after the cap', async () => {
+    vi.useFakeTimers();
+    try {
+      const attempts: Record<string, number> = {};
+      const alwaysFails: PrefsBackend = {
+        getAll: async () => ({}),
+        set: async (k) => {
+          attempts[k] = (attempts[k] ?? 0) + 1;
+          throw new Error('QuotaExceeded (simulated)');
+        },
+        remove: async () => {},
+      };
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await PlayerPrefs.init({ namespace: 'g1', backend: alwaysFails });
+
+      PlayerPrefs.set('a', 1);
+      await vi.advanceTimersByTimeAsync(20000); // exhausts the retry budget for 'a'
+      expect(attempts['mk:g1:a']).toBe(6);
+
+      PlayerPrefs.set('b', 2); // a genuinely new write, of a different key
+      await vi.advanceTimersByTimeAsync(20000);
+      // 'b' gets the FULL budget again — the cap 'a' hit did not carry over.
+      expect(attempts['mk:g1:b']).toBe(6);
+
+      warnSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resetPlayerPrefsForTest() leaves nothing armed — no retry fires after reset', async () => {
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const alwaysFails: PrefsBackend = {
+        getAll: async () => ({}),
+        set: async () => { attempts++; throw new Error('QuotaExceeded (simulated)'); },
+        remove: async () => {},
+      };
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await PlayerPrefs.init({ namespace: 'g1', backend: alwaysFails });
+
+      PlayerPrefs.set('a', 1);
+      await vi.advanceTimersByTimeAsync(200); // the original drain fails and arms a backed-off retry
+      expect(attempts).toBe(1);
+      expect(vi.getTimerCount()).toBeGreaterThan(0); // the retry timer is armed
+
+      resetPlayerPrefsForTest();
+      expect(vi.getTimerCount()).toBe(0); // both flushTimer and retryTimer are cancelled
+
+      // Advancing well past the whole backoff budget triggers nothing further against the old backend.
+      await vi.advanceTimersByTimeAsync(20000);
+      expect(attempts).toBe(1); // unchanged — no retry fired
+
+      warnSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The four tests above pin OUTCOMES (a retry lands somewhere in [200ms, 800ms]; the total is 6)
+  // that stay green under five separate mutations of the mechanism (review finding on #619) — a
+  // constant, non-doubling delay; a `retryDrains` reset moved to the wrong side of an early
+  // return; a redundant retry timer arming under an already-pending ordinary drain; `flush()`
+  // leaving a stale retry timer armed; and a clean batch failing to restore the budget. These
+  // pin the *shape* instead, so each is targeted at one specific mutation.
+
+  it('the backoff delay actually DOUBLES between retries, not a constant RETRY_BASE_MS', async () => {
+    // Kills: `const delay = RETRY_BASE_MS` (dropping the `* 2 ** retryDrains` exponent). A
+    // constant-delay bug still lands SOME retry inside the wide [200,800]ms window the first test
+    // above checks — only stepping right up to each boundary catches it.
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const alwaysFails: PrefsBackend = {
+        getAll: async () => ({}),
+        set: async () => { attempts++; throw new Error('QuotaExceeded (simulated)'); },
+        remove: async () => {},
+      };
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await PlayerPrefs.init({ namespace: 'g1', backend: alwaysFails });
+
+      PlayerPrefs.set('a', 1);
+      await vi.advanceTimersByTimeAsync(150); // debounce elapses exactly — attempt 1 fails
+      expect(attempts).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(499); // just under RETRY_BASE_MS (500ms, private) since attempt 1
+      expect(attempts).toBe(1);
+      await vi.advanceTimersByTimeAsync(2); // now just past 500ms
+      expect(attempts).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(998); // just under the DOUBLED delay (1000ms) since attempt 2 —
+                                               // a constant-delay bug would already have fired here
+      expect(attempts).toBe(2);
+      await vi.advanceTimersByTimeAsync(3); // now just past 1000ms
+      expect(attempts).toBe(3);
+
+      warnSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('scheduleRetry() does not arm a redundant retry timer while an ordinary drain is already pending', async () => {
+    // Kills: deleting the `if (flushTimer != null) return` guard from `scheduleRetry()` (:269).
+    // Interleave a SECOND key's write while the first key's rejection is still settling, so its
+    // catch branch runs at a moment an ordinary `flushTimer` is already armed to pick the
+    // re-queued key up. Without the guard, `scheduleRetry()` arms a SECOND, redundant timer.
+    vi.useFakeTimers();
+    try {
+      let releaseA: () => void = () => {};
+      const gateA = new Promise<void>((resolve) => { releaseA = resolve; });
+      const flaky: PrefsBackend = {
+        getAll: async () => ({}),
+        set: async (k, v) => {
+          if (k.endsWith(':a')) { await gateA; throw new Error('a always fails (simulated)'); }
+          throw new Error('b fails too (simulated)');
+        },
+        remove: async () => {},
+      };
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await PlayerPrefs.init({ namespace: 'g1', backend: flaky });
+
+      PlayerPrefs.set('a', 1);
+      await vi.advanceTimersByTimeAsync(150); // debounce fires — 'a' is now in flight, gated open
+
+      // A new write arrives while 'a' is still in flight — this arms a fresh flushTimer (the old
+      // one already fired and nulled itself) BEFORE 'a''s rejection is handled.
+      PlayerPrefs.set('b', 2);
+
+      releaseA(); // let 'a' settle — it rejects
+      await vi.advanceTimersByTimeAsync(0); // drain the microtask queue so the catch/scheduleRetry runs
+
+      // Only 'b''s ordinary flushTimer should be armed — it is already coming and will pick 'a' up
+      // too (both are in `dirty`), so `scheduleRetry()` must not add a second, redundant timer.
+      expect(vi.getTimerCount()).toBe(1);
+
+      warnSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('flush() cancels the pending retry timer instead of leaving a stale one armed', async () => {
+    // Kills: deleting `flush()`'s `retryTimer` cancel (:864-870 area). A stale, uncancelled timer
+    // keeps its ORIGINAL (pre-flush) deadline — this pins that nothing fires at that stale
+    // deadline once `flush()` has run its own drains and armed a correctly-backed-off successor.
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const alwaysFails: PrefsBackend = {
+        getAll: async () => ({}),
+        set: async () => { attempts++; throw new Error('QuotaExceeded (simulated)'); },
+        remove: async () => {},
+      };
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await PlayerPrefs.init({ namespace: 'g1', backend: alwaysFails });
+
+      PlayerPrefs.set('a', 1);
+      await vi.advanceTimersByTimeAsync(150); // attempt 1 fails; retry armed for ~500ms out
+      expect(attempts).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(10); // well before that retry fires
+      await PlayerPrefs.flush(); // drains immediately (2 more failing attempts) — must cancel the
+                                  // now-stale pending retry timer, not leave it armed alongside
+                                  // the fresh one its own failures just scheduled
+      expect(attempts).toBe(3);
+
+      // The ORIGINAL retry's deadline was ~500ms after attempt 1, i.e. ~490ms from here — cross
+      // it. A stale, uncancelled timer would fire a 4th attempt exactly there; the correctly
+      // cancelled-and-replaced one is backed off much further out (flush()'s own failures armed
+      // it fresh, doubled from where the streak was).
+      await vi.advanceTimersByTimeAsync(491);
+      expect(attempts).toBe(3);
+
+      warnSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('PlayerPrefs — retry warn volume (#619 review findings A & B)', () => {
+  it('a permanently-rejecting backend warns ONCE per key, not once per attempt', async () => {
+    // Finding A: without gating on the streak's first attempt, 10 dirty keys against a dead
+    // backend produce 60 warns (10 keys × 6 attempts) — enough to fill globalErrors.ts's shared
+    // burst budget (MAX_PER_BURST_WINDOW=30 per BURST_WINDOW_MS=5s) and drop an unrelated crash.
+    vi.useFakeTimers();
+    try {
+      const alwaysFails: PrefsBackend = {
+        getAll: async () => ({}),
+        set: async () => { throw new Error('QuotaExceeded (simulated)'); },
+        remove: async () => {},
+      };
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await PlayerPrefs.init({ namespace: 'g1', backend: alwaysFails });
+
+      for (let i = 0; i < 10; i++) PlayerPrefs.set(`k${i}`, i);
+      await vi.advanceTimersByTimeAsync(20000); // exhausts the full retry budget for every key
+
+      // 10 first-failure warns (one per key) + exactly 1 give-up warn for the whole streak
+      // (Finding B) — NOT 60 (one per key per attempt).
+      expect(warnSpy).toHaveBeenCalledTimes(11);
+
+      const perKeyWarns = warnSpy.mock.calls.filter(
+        (call) => typeof call[0] === 'string' && call[0].includes('will retry with backoff'),
+      );
+      expect(perKeyWarns).toHaveLength(10); // exactly one per key, not one per key per attempt
+
+      warnSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('gives up with exactly ONE warn for the whole streak, naming the still-pending keys', async () => {
+    // Finding B: the streak's last per-key warn says "will retry with backoff" and nothing else
+    // ever says whether that panned out. `scheduleRetry()` must say so itself, once, not per key.
+    vi.useFakeTimers();
+    try {
+      const alwaysFails: PrefsBackend = {
+        getAll: async () => ({}),
+        set: async () => { throw new Error('QuotaExceeded (simulated)'); },
+        remove: async () => {},
+      };
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await PlayerPrefs.init({ namespace: 'g1', backend: alwaysFails });
+
+      PlayerPrefs.set('a', 1);
+      PlayerPrefs.set('b', 2);
+      await vi.advanceTimersByTimeAsync(20000); // exhausts the budget for both keys together
+
+      const giveUpWarns = warnSpy.mock.calls.filter(
+        (call) => typeof call[0] === 'string' && call[0].includes('gave up retrying'),
+      );
+      expect(giveUpWarns).toHaveLength(1); // ONE warn for the whole streak, not one per key
+      const message = giveUpWarns[0]?.[0] as string;
+      expect(message).toContain('a');
+      expect(message).toContain('b');
+      expect(message).toMatch(/re-arms/);
+
+      // Both keys are still genuinely pending — the give-up did not silently drop them.
+      expect(PlayerPrefs.pendingKeys().sort()).toEqual(['a', 'b']);
+
+      warnSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('PlayerPrefs — swap-window residuals (#454)', () => {
   it('a backend swap under the SAME namespace re-queues the key — the RETRY follows the game, the value does not (#454 A)', async () => {
     // Pins drain()'s rejection-handler guard: `if (namespace === batchNamespace)` is

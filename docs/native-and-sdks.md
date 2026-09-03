@@ -399,10 +399,14 @@ real exercise of the mechanism will be the day a key is added, with no device ev
 The engine-side registry (`realmShutdown.ts`) IS live; it is the Court consumer that is gated off.
 Worth knowing before anyone reads #587 as "ads teardown is proven".
 
-⚠️ **The `pagehide` backstop's `event.persisted === false` gate (`App.tsx`) is an ANDROID
+⚠️ **The `pagehide` backstop's `event.persisted === false` gate (`engine/app/useBackgroundFlush.ts`) is an ANDROID
 measurement shipping on iOS too, and the iOS behaviour is still UNOBSERVED (#611).** `pagehide`
 firing on a mere backgrounding — not a real teardown — is documented real-world behaviour on iOS;
-nobody has measured whether it actually happens in this app's WKWebView. Rather than guess at a
+nobody has measured whether it actually happens in this app's WKWebView. **The Android half that the
+gate DOES rest on is `4099c5691`'s measurement, and it lives only in that commit message, so here it
+is: on the S22, `pagehide` does NOT fire on backgrounding (that is `visibilitychange`), and DOES fire
+with `persisted: false` on a real reload.** That is the reading which makes the gate correct on
+Android and says nothing about iOS. Rather than guess at a
 narrower, iOS-specific gate (risking the worse failure of suppressing a genuine teardown), #611
 leaves the gate as-is and bounds the risk with a recovery seam instead: `realmShutdown.ts`'s
 `onRealmSurvived` plus `realmDeathBackstop.ts`'s foreground check re-init ads (and anything else
@@ -469,16 +473,81 @@ stopped`; the sheet does not), and `document.visibilityState` stayed `"visible"`
 drives `onBackground()` from exactly those two signals, so `backgroundedAt` stays `null` and
 `resumeReload.ts`'s `if (at == null) return;` bails **before any blocker predicate is consulted**.
 
+⚠️ **MEASURED, 2026-09-03, A23 (SC-56C, Android 13), `com.apiary.court`.** The claim below was
+derived from Capacitor's source when #619 landed; it is now observed. A translucent Settings panel
+(`android.settings.panel.action.VOLUME`) was launched over the running game — the same shape as
+`ProxyBillingActivity`, and `dumpsys` confirmed the host task stayed `visible=true` while the panel
+was `topResumedActivity`, i.e. paused and never stopped. With listeners registered in-page:
+
+| Edge | `pause` | `appStateChange` | `visibilitychange` | `visibilityState` |
+|---|---|---|---|---|
+| Translucent panel OPENS | **fires (x1)** | **does not fire** | **does not fire** | stays `visible` |
+| Translucent panel CLOSES | — | fires `isActive:true` | does not fire | `visible` |
+| HOME press (control) | fires | fires `isActive:false` | fires -> `hidden` | `hidden` |
+| Return from HOME (control) | — | fires `isActive:true` | fires -> `visible` | `visible` |
+
+Three things this settles that reading the source could not:
+
+- **`pause` is the only edge a translucent Activity produces**, and on the HOME control it arrives
+  BEFORE `appStateChange(false)` — the `onPause`-then-`onStop` ordering, visible from JS.
+- **Timers are not throttled behind it.** `setTimeout(..., 150)` fired at **158 ms** with the panel
+  up, alongside 47 rAF ticks in 1022 ms. ⚠️ **That is consistent with the 46-in-1010 ms figure taken
+  behind a real billing sheet (`990e1f11f`, `docs/iap.md`), but it does NOT corroborate it** — same
+  clone, same device, same agent lineage, so the two readings share every instrument and bound no
+  instrument error between them. What the new one adds is not a second opinion on rAF; it is the
+  `setTimeout` measurement, which tests the mechanism the argument actually rests on. PlayerPrefs'
+  150 ms debounce genuinely drains itself there — previously an INFERENCE from the rAF count.
+- ⚠️ **Closing a translucent Activity fires an UNPAIRED `appStateChange(isActive:true)`** — a
+  "foregrounded" with no matching `(false)` before it, because `BridgeActivity.onResume():97` fires
+  the status change while `onStop` never ran. ⚠️ **This is not a translucent-Activity quirk — it is
+  the general shape.** `fireStatusChange(true)` at `onResume():97` is UNCONDITIONAL, while the
+  `false` at `onStop():118` is additionally gated on `activityDepth == 0`. So a runtime-permission
+  dialog, a system alert and the app's own cold-launch resume all emit one too (the cold-launch one
+  is merely dropped, since `AppPlugin.java:40` notifies with `retainUntilConsumed: false`). **Never
+  write an `appStateChange` consumer that assumes a `(true)` is preceded by a `(false)`.** Anything treating `appStateChange(true)` as "we came
+  back from being backgrounded" is wrong on this path: `useResumeReload` survives it only because
+  `resumeReload.ts` bails on `if (at == null) return;`, and **Court's cloud sync
+  (`cloudSyncWiring.ts`) issues a `'resume'` sync request on it** — so every dismissed dialog asks
+  for a sync. Pre-existing and not obviously wrong (a purchase sheet closing is a fair moment to
+  sync), but it is a network call on an edge nobody chose deliberately.
+
+The probe was shown to detect the positive case FIRST — the HOME-press control rows are that proof.
+Without them, "no `appStateChange`" would have been indistinguishable from a listener that never
+registered.
+
+⚠️ **"No background edge" is about `appStateChange`, not about the Activity lifecycle — `onPause`
+DOES run, and `@capacitor/app` publishes it.** `AppPlugin.handleOnPause()` fires a separate `'pause'`
+event, dispatched by `Bridge.onPause()` to every plugin, and that is the edge a translucent Activity
+produces. #619 subscribes to it for the PlayerPrefs flush (below). ⚠️ **`useResumeReload` is
+deliberately NOT on it** — arming a resume-reload on every translucent dialog would reload the app
+the moment a purchase sheet closes, which is a regression and not a fix — and neither is the
+game-debug bridge's port handoff, since a dialog does not change which app owns the foreground and
+the bridge staying alive through a sheet is the instrument that proved `onStop` never ran.
+
 Two things follow, and both matter more than the reload:
 - **`court.purchase` is NOT dead code** — do not "fix" or delete it on the strength of never seeing
   it decline. It arms correctly for a genuine HOME press mid-purchase, which does reach `onStop`.
   Its predicate reads `storeInFlight` (see `beginStorePurchase` in `games/court/runtime/systems.ts`;
   cleared in that function's `finally` when the generation still matches, and wholesale by
   `resetStoreUi`).
-- **PlayerPrefs are not flushed while a purchase sheet is open.** `App.tsx`'s background flush is
-  `appStateChange` -> `if (!isActive) flush()`, with `visibilitychange`/`pagehide` as the WEB
-  fallback only. Neither fires here, so pending writes stay unflushed for the whole sheet — an OS
-  kill mid-purchase loses them. Tracked separately; not fixed by #586.
+- **PlayerPrefs get no background flush while a purchase sheet is open (#619) — and the severity
+  was overstated here first.** `App.tsx`'s background flush was `appStateChange` ->
+  `if (!isActive) flush()` with `visibilitychange`/`pagehide` as the WEB fallback only, so no edge
+  fired. ⚠️ **But this bullet used to end "pending writes stay unflushed for the whole sheet", and
+  that is wrong — the measurement in the paragraph above is what disproves it.** The write debounce
+  is 150 ms and trailing-edge (`scheduleFlush()` returns early while a timer is armed, so a burst of
+  writes does not push it out), and the app is *live* behind the sheet, so the ordinary debounce
+  drains itself — no longer an inference from the rAF count: a 150 ms `setTimeout` was measured
+  firing at 158 ms behind a translucent Activity (table above). Nothing accumulates for the
+  duration of the sheet. Flush-on-
+  background earns its keep on a real HOME press because a backgrounded WebView gets its timers
+  throttled and the pending drain may never run — which is exactly what does NOT happen here.
+  What was genuinely unbounded was a **rejected** write: `drain()`'s catch re-queued the key
+  promising "will retry on next flush" while nothing scheduled one, so it sat dirty until the next
+  `set()`/`del()`/`clear()` or an explicit `flush()`, and under a sheet neither arrives. #619 fixed
+  both ends — a `'pause'` listener for the missing edge, and a bounded self-scheduling retry in
+  `playerPrefs.ts`. **The lesson worth keeping: a live app drains its own debounce, so "no lifecycle
+  edge fires" is not by itself a durability defect — find the write that has no timer behind it.**
 
 ⚠️ **What makes Play Billing serve a sideloaded build is NOT the versionCode and NOT the signing.**
 Four arms on the A23, 2026-09-03, all returning `queryProductDetails(inapp): code=0 found=6

@@ -1,5 +1,5 @@
 /** Pins `createRealmDeathBackstop` (#611) — the decision core for the `pagehide` backstop in
- *  `App.tsx`'s flush effect. See `../../app/realmDeathBackstop.ts` for the full reasoning: the
+ *  `useBackgroundFlush.ts`'s flush effect. See `../../app/realmDeathBackstop.ts` for the full reasoning: the
  *  `event.persisted === false` gate is an Android measurement shipped on iOS, where `pagehide` can
  *  fire on a mere backgrounding, so a false-alarm shutdown must be recoverable rather than guessed
  *  away with a narrower gate.

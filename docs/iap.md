@@ -283,7 +283,9 @@ Accepted with the owner's eyes open:
 ⚠️ **Durability is checked by asking whether the write was ACCEPTED, never by reading it back.**
 `PlayerPrefs.set()` writes into an in-memory cache and queues the real write; a rejected backend
 write (quota exceeded, a native I/O error) is caught, re-queued and warned about, `flush()` still
-settles *fulfilled*, and `get()` keeps serving the cached value. So a read-back check confirms
+settles *fulfilled*, and `get()` keeps serving the cached value. (Since #619 the re-queue also
+schedules its own bounded retry, so the write is genuinely re-attempted — but that changes *when* it
+may land, not whether this check can be trusted, and `hasPendingWrite` stays the only honest read.) So a read-back check confirms
 itself — it re-reads the very cache the failed write already updated, and cannot fail for the
 failure modes it exists to catch. `confirmDurable()` therefore consults
 `PlayerPrefs.hasPendingWrite(key)` (surfaced through `PrefsDocStore.durable()`) *before* the
@@ -534,8 +536,15 @@ someone re-attaches it and unknowingly tests against a stale product list.
   requestAnimationFrame ticks in 1010 ms**. `ProxyBillingActivity` is translucent, so the host
   Activity pauses and never stops; the WebView keeps rendering and the main looper keeps delivering,
   which is why a `Handler` timer fires normally there. Do not assume the app is suspended behind a
-  purchase sheet — it is live, and killable, with no background edge having fired (see the
-  PlayerPrefs consequence above).
+  purchase sheet — it is live, and killable, with no `appStateChange` having fired.
+
+  ⚠️ **Being live is what makes that survivable, and it cut the other way from how #619 first read
+  it.** A running app keeps servicing the 150 ms PlayerPrefs debounce, so pending writes drain
+  themselves behind the sheet; nothing accumulates for its duration. The write with no timer behind
+  it was a *rejected* one, which #619 fixed by making the retry self-scheduling. The missing
+  lifecycle edge was fixed too — `@capacitor/app`'s `'pause'` event does fire from
+  `handleOnPause()`, which is now measured on the A23 rather than read out of Capacitor's source. Full write-up: [native-and-sdks.md](./native-and-sdks.md) § "The defects this
+  boundary produced, and how each was addressed".
 
 - ⚠️ **The precondition that DOES gate it is a Play LICENCE-TESTER account on a published app.**
   Court is on internal testing (#370), and the human confirmed the sheet shows the real price against

@@ -58,6 +58,31 @@ const WRITE_DEBOUNCE_MS = 150;
  *  case where writes keep landing every drain forever, without claiming unbounded retry. */
 const MAX_PRESWAP_FLUSHES = 5;
 
+/** Base delay for `scheduleRetry()`'s exponential backoff (doubled each attempt — see
+ *  `MAX_RETRY_DRAINS`). Bounds how fast a re-queued key hammers a rejecting backend: without
+ *  this, a drain that re-queues a key with nothing else to schedule the next flush (see
+ *  `scheduleRetry`'s doc comment) would otherwise never retry at all. */
+const RETRY_BASE_MS = 500;
+
+/** Cap on the number of backed-off retry drains `scheduleRetry()` will arm after an ordinary
+ *  drain re-queues a key, before it gives up (0.5s, 1s, 2s, 4s, 8s ≈ 15.5s total). Bounds a
+ *  permanently-rejecting backend (localStorage `QuotaExceededError` is the realistic one) so it
+ *  cannot spin at the debounce cadence forever — the cap trades "retry forever" for "retry for a
+ *  while, then wait for new data" (a fresh `set()`/`del()`/`clear()`, or an explicit `flush()`,
+ *  re-arms the budget — see `scheduleFlush()`).
+ *
+ *  ⚠️ Giving up is not silent, and neither is failing (review findings on #619):
+ *   - `drain()`'s catch warns per key, but ONLY on a streak's first attempt (`retryDrains === 0`
+ *     at batch start) — not on every backed-off retry. `globalErrors.ts` reports `console.warn`
+ *     to Crashlytics with a burst budget (`MAX_PER_BURST_WINDOW`) SHARED with `console.error`
+ *     (see its doc comment); six warns per key for one permanently-rejecting backend can fill
+ *     that budget and drop an unrelated real crash in the same 5s window.
+ *   - `scheduleRetry()` emits exactly ONE give-up warn for the whole streak when this cap turns
+ *     it away — not one per key — naming the still-pending keys, so a reader can tell "gave up"
+ *     apart from "landed" instead of the last per-key warn's unkept "will retry" promise being
+ *     the only trace. */
+const MAX_RETRY_DRAINS = 5;
+
 // ── Module state ──────────────────────────────────────────────────
 let backend: PrefsBackend = new InMemoryBackend();
 let namespace = 'default';
@@ -164,6 +189,16 @@ const swapToken = createSupersessionToken();
 let windowLanded: Set<string> | null = null;
 
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
+/** Timer for `scheduleRetry()`'s backed-off re-drain — deliberately SEPARATE from `flushTimer`,
+ *  not a reuse of it. `scheduleFlush()` early-returns whenever `flushTimer != null`, so arming
+ *  `flushTimer` itself with a backed-off delay would make an ordinary `set()` arriving mid-backoff
+ *  wait up to `RETRY_BASE_MS * 2 ** (MAX_RETRY_DRAINS - 1)` (8s) instead of the normal 150ms
+ *  debounce — exactly the shortcut a later reader would take to save a field. */
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+/** Count of backed-off retry drains armed since the last genuinely new write (or explicit
+ *  `flush()`) — see `MAX_RETRY_DRAINS`. Reset by `scheduleFlush()` (new data), left alone by
+ *  `flush()` (not new data), and reset by `resetPlayerPrefsForTest()`. */
+let retryDrains = 0;
 /** Serializes all backend writes so `flush()` can await a stable point. */
 let writeChain: Promise<void> = Promise.resolve();
 /** Serializes `init()` calls — see `init()`'s doc comment for why an overlapped call is
@@ -218,6 +253,18 @@ function writeEnvelope(value: JsonValue): string | undefined {
 
 // ── Write pipeline ────────────────────────────────────────────────
 function scheduleFlush(): void {
+  // A genuinely new write is new data and deserves the full retry budget again.
+  //
+  // ⚠️ Ordering this BEFORE the early return is DEFENSIVE, not a behaviour difference — and an
+  // earlier version of this comment claimed otherwise (#619 review). It reads as though it
+  // matters for a `set()` arriving while a drain is already pending, but that state is
+  // unreachable: `scheduleRetry()` increments `retryDrains` only while `flushTimer` is null, and
+  // every null -> armed transition of `flushTimer` passes through this reset. So `flushTimer !=
+  // null` implies `retryDrains === 0`, and the two orderings are indistinguishable. Kept this way
+  // so the reset stays correct if `scheduleRetry()`'s `flushTimer` guard is ever relaxed. NOT
+  // covered by a test, deliberately — a test for a state the code cannot produce asserts a
+  // fiction (same treatment as the defensive `inFlight` clear below).
+  retryDrains = 0;
   if (flushTimer != null) return;
   flushTimer = setTimeout(() => {
     flushTimer = null;
@@ -225,12 +272,51 @@ function scheduleFlush(): void {
   }, WRITE_DEBOUNCE_MS);
 }
 
+/** Arms a backed-off, capped retry drain after an ordinary `drain()` batch re-queues at least one
+ *  key (a rejected write with a store still worth retrying against — see `drain()`'s catch
+ *  branch). Nothing else schedules that retry: `scheduleFlush()` is only called from `set()`/
+ *  `del()`/`clear()`, so without this a re-queued key sits in `dirty` forever until the app
+ *  happens to make another write or something calls `flush()` explicitly (#619).
+ *
+ *  Backed off and capped so a permanently-rejecting backend cannot spin at the debounce cadence
+ *  forever — see `RETRY_BASE_MS`/`MAX_RETRY_DRAINS`. Giving up at the cap is not permanent: the
+ *  next `set()`/`del()`/`clear()` resets `retryDrains` via `scheduleFlush()`, and an explicit
+ *  `flush()` drains directly regardless of this timer. */
+function scheduleRetry(): void {
+  if (retryTimer != null) return; // one already armed
+  if (flushTimer != null) return; // an ordinary drain is already coming and will pick these up
+  if (retryDrains >= MAX_RETRY_DRAINS) {
+    // Give up — but not silently (#619 review finding B). The last per-key warn `drain()` issued
+    // (on the streak's FIRST attempt only — see `isFirstAttempt` there) said "will retry with
+    // backoff"; without a give-up line, nothing ever says that promise didn't pan out, and a
+    // reader can't tell "still pending forever" from "landed on some later attempt". ONE warn for
+    // the whole streak, not one per key — that's the point of gating it here rather than in
+    // `drain()`'s per-key loop.
+    console.warn(
+      `[PlayerPrefs] gave up retrying after ${MAX_RETRY_DRAINS} backed-off attempt(s) ` +
+        `(${MAX_RETRY_DRAINS + 1} attempts total) — ${dirty.size} key(s) still pending: ` +
+        `${[...dirty].sort().join(', ')} — a new set()/del()/clear() (or an explicit flush()) ` +
+        `re-arms the retry budget`,
+    );
+    return;
+  }
+  const delay = RETRY_BASE_MS * 2 ** retryDrains;
+  retryDrains += 1;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    void drain();
+  }, delay);
+}
+
 /** Append a drain of all currently-dirty keys to the serialized write chain.
  *
  *  Each per-key write is guarded so a backend rejection (localStorage QuotaExceeded,
  *  Preferences I/O error) NEVER poisons the chain: the failed key is re-queued as
- *  dirty for the next flush and we warn, but `writeChain` always settles fulfilled so
- *  subsequent writes still run. Only keys actually attempted are cleared from `dirty`.
+ *  dirty and the batch arms its own backed-off, capped retry drain (`scheduleRetry()`,
+ *  #619 — nothing else schedules that retry), but `writeChain` always settles fulfilled
+ *  so subsequent writes still run. Only keys actually attempted are cleared from `dirty`.
+ *  We warn per key, but ONLY on a streak's first attempt — see `isFirstAttempt` below
+ *  (#619 review finding A).
  *
  *  `namespace`/`backend` are captured into LOCALS (`batchNamespace`/`batchBackend`) at the
  *  START of the batch, before any `await` — never re-read from module state once a write is
@@ -264,12 +350,23 @@ function drain(): Promise<void> {
     if (dirty.size === 0) return;
     const keys = [...dirty];
     dirty.clear();
+    // #619 review finding A — captured BEFORE anything in this batch can change `retryDrains`
+    // (a `set()`/`del()`/`clear()` landing synchronously during the `await` below would reset it
+    // via `scheduleFlush()`, but that must not retroactively change what THIS batch already
+    // decided). `retryDrains === 0` means this is the streak's first attempt — the ordinary drain
+    // from `scheduleFlush()`, never a `scheduleRetry()`-armed one — so the per-key warn below
+    // fires once per failing key per streak, not once per backed-off retry.
+    const isFirstAttempt = retryDrains === 0;
     // #559 — the keys leave `dirty` here and their backend calls have not run yet, so from this
     // point until each one settles the in-flight ledger is the ONLY thing that can report them as
     // still pending. Marked before the first `await`, cleared in each key's `finally` below.
     for (const k of keys) markInFlight(k);
     const batchNamespace = namespace;
     const batchBackend = backend;
+    // Set only in the catch branch's `dirty.add(k)` below — NOT the else branch, where the
+    // write is genuinely lost with no store left to retry against (#619's `scheduleRetry()`
+    // must not arm for that case).
+    let requeued = false;
     await Promise.all(
       keys.map(async (k) => {
         const full = prefixFor(batchNamespace) + k;
@@ -291,8 +388,12 @@ function drain(): Promise<void> {
           // message says "this is NOT a backend failure" about a write the backend had just refused.
           if (windowLanded && batchNamespace === namespace) windowLanded.delete(k);
           if (namespace === batchNamespace) {
-            dirty.add(k); // re-queue for a later flush; never poison the chain
-            console.warn(`[PlayerPrefs] write for "${k}" failed — will retry on next flush`, err);
+            dirty.add(k); // re-queue; never poison the chain
+            requeued = true; // arms this batch's own backed-off retry — see `requeued` above
+            // #619 review finding A — only the streak's first attempt warns; see `isFirstAttempt`.
+            if (isFirstAttempt) {
+              console.warn(`[PlayerPrefs] write for "${k}" failed — will retry with backoff`, err);
+            }
           } else {
             // The store has already swapped away from `batchNamespace` — re-queuing would send
             // the NEXT drain's attempt against the INCOMING namespace/backend instead (#438).
@@ -327,6 +428,15 @@ function drain(): Promise<void> {
     } catch (err) {
       console.warn('[PlayerPrefs] backend.flush() failed — writes above are still recorded', err);
     }
+    // #619 — a re-queued key has nothing else to schedule its retry (`scheduleFlush()` is only
+    // called from `set()`/`del()`/`clear()`), so this batch arms its own.
+    //
+    // The `else` is DEFENSIVE for the same reason as `scheduleFlush()`'s reset, and equally
+    // untested: after a clean batch `dirty` is empty, so reaching another failure REQUIRES a new
+    // `set()`/`del()`/`clear()` first, and that resets the budget anyway. It is here so a
+    // partially-spent budget cannot be inherited if a future change gives `dirty` another way to
+    // refill.
+    if (requeued) scheduleRetry(); else retryDrains = 0;
   });
   return writeChain;
 }
@@ -488,6 +598,10 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
   if (flushTimer != null) {
     clearTimeout(flushTimer);
     flushTimer = null;
+  }
+  if (retryTimer != null) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
   }
 
   function reportDiscarded(discarded: string[]): void {
@@ -759,6 +873,13 @@ async function flush(): Promise<void> {
     clearTimeout(flushTimer);
     flushTimer = null;
   }
+  // Cancel any pending backed-off retry too — this drains right now, so the timer waiting to
+  // drain later is redundant. Does NOT touch `retryDrains`: an explicit flush is not new data,
+  // and resetting the budget here would let a caller looping on `flush()` retry forever.
+  if (retryTimer != null) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
   await drain();
   if (dirty.size > 0) await drain();
 }
@@ -910,6 +1031,11 @@ export function resetPlayerPrefsForTest(): void {
     clearTimeout(flushTimer);
     flushTimer = null;
   }
+  if (retryTimer != null) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+  retryDrains = 0; // else the budget leaks between tests
   backend = new InMemoryBackend();
   namespace = 'default';
   hydrated = false;

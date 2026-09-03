@@ -178,7 +178,7 @@ export function shutdownRealmThenReload(reload: () => void): Promise<void> {
  *
  *  Production callers: `resumeReload.ts`'s recovery path when `deps.reload()` throws or rejects,
  *  and `shutdownRealmThenReload()`'s `.catch` above for the same reason. #611 adds a THIRD: the
- *  `pagehide` backstop in `App.tsx` fires on `event.persisted === false`, which is an ANDROID
+ *  `pagehide` backstop in `engine/app/useBackgroundFlush.ts` fires on `event.persisted === false`, which is an ANDROID
  *  measurement (#587) shipped on iOS where `pagehide` firing on a mere backgrounding is a
  *  documented real behaviour — so this call is now sometimes a genuine false alarm rather than
  *  only a failed `reload()`. `realmDeathBackstop.ts` is what decides WHEN to call it for that case;

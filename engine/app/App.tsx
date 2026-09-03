@@ -3,10 +3,9 @@ import type { ErrorInfo, ReactNode } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
+import { useBackgroundFlush } from './useBackgroundFlush';
 import { useResumeReload } from './useResumeReload';
-import { createRealmDeathBackstop } from './realmDeathBackstop';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint, registerRealmShutdownTask, runRealmShutdownTasks, notifyRealmSurvived, rearmAudioAutoplay } from '@modoki/engine/runtime';
-import { App as CapacitorApp } from '@capacitor/app';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
 import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
@@ -783,83 +782,12 @@ function App() {
     void loadStagedSubgames();
   }, []);
 
-  // Make pending PlayerPrefs writes durable when the app is backgrounded/hidden —
-  // debounced writes would otherwise be lost to an OS kill. Native fires
-  // appStateChange; web fires visibilitychange/pagehide. (atomic ≠ durable; this
-  // closes the durability gap the store documents.)
-  useEffect(() => {
-    const flush = () => { void PlayerPrefs.flush(); };
-    // The decision core for the shutdown-or-not call below, with `runRealmShutdownTasks`/
-    // `notifyRealmSurvived` injected — see `realmDeathBackstop.ts` for the full #611 reasoning.
-    const backstop = createRealmDeathBackstop({
-      runShutdown: () => { void runRealmShutdownTasks(); },
-      notifySurvived: notifyRealmSurvived,
-    });
-    const onVisibility = () => {
-      if (document.visibilityState === 'hidden') flush();
-      else backstop.onRealmVisible();
-    };
-    document.addEventListener('visibilitychange', onVisibility);
-    // `pagehide` fires both for a real page teardown AND for a bfcache/background transition
-    // (tab-switch, home-button on mobile Safari) — `event.persisted` is meant to tell them apart:
-    // true means the page may resume from the cache, false means it is actually going away.
-    //
-    // ⚠️ #611: `persisted === false` is only an ANDROID-measured signal, and it ships here on iOS
-    // too, where `pagehide` firing on a mere backgrounding is documented real-world behaviour. A
-    // false trigger there would run the shutdown tasks (native ad SDK teardown, #587) on a still-
-    // live banner/interstitial the player is about to see again — a regression, not a fix. Rather
-    // than guess at a narrower iOS-specific gate (which risks the OPPOSITE failure: suppressing a
-    // genuine teardown), the gate stays as-is and `backstop.onRealmVisible()` below is what makes
-    // an over-trigger SAFE — a later foreground re-arms the seam and lets each shutdown task's own
-    // `onRealmSurvived` recovery undo whatever it needs to (see `realmShutdown.ts`).
-    const onPageHide = (event: PageTransitionEvent) => {
-      flush();
-      backstop.onPageHide(event.persisted);
-    };
-    window.addEventListener('pagehide', onPageHide);
-    // `pageshow` is the other "we're back" signal, alongside `visibilitychange` above. Both are
-    // wired deliberately, not redundantly: `pageshow` is only guaranteed to fire for a page that
-    // was actually bfcached (or on a fresh navigation), not for every foreground transition, so
-    // relying on it alone would miss a plain tab-switch back; `visibilitychange` alone would miss
-    // a bfcache restore on a platform that does not also flip visibility. Both call the same
-    // idempotent `onRealmVisible()`, so seeing both for one real resume is harmless.
-    const onPageShow = () => { backstop.onRealmVisible(); };
-    window.addEventListener('pageshow', onPageShow);
-    let appListener: { remove: () => void } | undefined;
-    let cancelled = false; // cleanup may run before the async addListener resolves
-    if (Capacitor.isNativePlatform()) {
-      void CapacitorApp.addListener('appStateChange', ({ isActive }) => {
-        if (!isActive) flush();
-      }).then((h) => { if (cancelled) h.remove(); else appListener = h; })
-        // A rejected registration must not become an unhandledrejection: globalErrors.ts reports
-        // those to Crashlytics, so an absent/stripped plugin would file one per launch. Same
-        // treatment as capacitorStore.ts's listener (see its .catch).
-        //
-        // But this one is NOT swallowed silently, unlike the siblings. A rejection here means the
-        // background-flush listener never registered, so pending PlayerPrefs writes stop being
-        // flushed on background — save-data loss on an OS kill, which is worse than the noise the
-        // catch exists to suppress. Degraded rather than dead (visibilitychange/pagehide above are
-        // registered unconditionally and cover most native background transitions), so it warns
-        // rather than throws.
-        .catch((e: unknown) => {
-          console.warn('[modoki] appStateChange listener failed to register — PlayerPrefs will not '
-            + 'flush on background; relying on visibilitychange/pagehide', e);
-        });
-    }
-    return () => {
-      cancelled = true;
-      document.removeEventListener('visibilitychange', onVisibility);
-      window.removeEventListener('pagehide', onPageHide);
-      window.removeEventListener('pageshow', onPageShow);
-      appListener?.remove();
-      flush(); // final flush on teardown (HMR / error-boundary recovery)
-    };
-  }, []);
+  useBackgroundFlush();
 
   useAudioResumeRearm();
 
   // Reload the app on resume after a long background (#574). A no-op unless the project authors
-  // `runtime.reloadAfterBackgroundMinutes`. Registered AFTER the flush effect above deliberately:
+  // `runtime.reloadAfterBackgroundMinutes`. Registered AFTER `useBackgroundFlush` above deliberately:
   // Capacitor dispatches `appStateChange` in registration order, so the background flush is
   // already queued by the time this samples the reload blockers. The trigger awaits its own
   // `PlayerPrefs.flush()` before reloading regardless — this ordering is belt, not braces.

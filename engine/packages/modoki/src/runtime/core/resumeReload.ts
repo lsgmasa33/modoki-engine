@@ -210,8 +210,9 @@ export interface ResumeReloadHandler {
 
 /** The decision, with every dependency injected so it is testable with no Capacitor mock, no
  *  jsdom visibility shims and no real clock — the `createPortLifecycleHandler` precedent in
- *  `engine/app/debug/bridge.ts`, which is why that one has a plain unit test and App.tsx's
- *  inline flush effect has none. */
+ *  `engine/app/debug/bridge.ts`. The background flush followed the same precedent for the same
+ *  reason (#619): it moved out of App.tsx into `engine/app/useBackgroundFlush.ts` so its listener
+ *  contract could be pinned by a test at all, which as an inline effect it never was. */
 export function createResumeReloadHandler(deps: ResumeReloadDeps): ResumeReloadHandler {
   const log = deps.log ?? ((m: string) => console.info(`[resume-reload] ${m}`));
 
@@ -304,9 +305,9 @@ export function createResumeReloadHandler(deps: ResumeReloadDeps): ResumeReloadH
         return;
       }
 
-      // Make pending writes durable BEFORE destroying the realm. `App.tsx` already flushes on
-      // background, but a write can be made between that flush and this resume, and the reload
-      // is what would destroy it.
+      // Make pending writes durable BEFORE destroying the realm. `useBackgroundFlush` already
+      // flushes on background, but a write can be made between that flush and this resume, and
+      // the reload is what would destroy it.
       await deps.flush();
 
       // Re-check after the await — the repo's capture-before-await / re-check-after convention
