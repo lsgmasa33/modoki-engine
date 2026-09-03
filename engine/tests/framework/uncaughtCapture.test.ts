@@ -25,6 +25,27 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 // Mirrors `deviceConsoleCapture.test.ts`'s sibling `afterEach` — same defect, same fix.
 const originalConsole = { ...console };
 
+// F4 (#626/#633 adversarial review): track every listener a test adds to the shared jsdom
+// `window` so `afterEach` below can remove them all. Every test in this file calls
+// `installUncaughtCapture()` fresh (after its own `vi.resetModules()`), which registers three NEW
+// `window` listeners bound to that test's own module instances — and nothing here ever removed
+// them, so `window` accumulated one stale listener per earlier test, forever. Harmless for every
+// OTHER test (a stale listener just re-records into its own now-orphaned ring), but the
+// ResizeObserver-suppression test below needs a REAL `window.dispatchEvent(...)` to actually
+// exercise `stopImmediatePropagation()`, and a stale listener from an earlier test could win that
+// race — or land its own `recordConsoleRingEntry` call in an orphaned ring — before this test's own
+// listener ever runs. Patched once, at file load, so a test's own `vi.spyOn(window,
+// 'addEventListener')` wraps (and `vi.restoreAllMocks()` below unwraps back to) THIS forwarding
+// function, never the pristine jsdom original — tracking stays intact across the whole file.
+type AddListenerArgs = Parameters<typeof window.addEventListener>;
+const realAddEventListener = window.addEventListener.bind(window);
+const realRemoveEventListener = window.removeEventListener.bind(window);
+let addedListeners: AddListenerArgs[] = [];
+window.addEventListener = ((...args: AddListenerArgs) => {
+  addedListeners.push(args);
+  return realAddEventListener(...args);
+}) as typeof window.addEventListener;
+
 afterEach(() => {
   // `vi.restoreAllMocks()` FIRST — it restores each spy to whatever `console[method]` it captured
   // AT SPY-CREATION TIME, which could itself be a nested wrapper from an earlier test. The direct
@@ -34,6 +55,10 @@ afterEach(() => {
     (console as unknown as Record<string, unknown>)[k] = originalConsole[k];
   });
   vi.resetModules();
+  // Remove everything THIS test added to `window`, via the REAL (never mocked) removeEventListener
+  // — see the tracking setup above.
+  for (const args of addedListeners) realRemoveEventListener(...args);
+  addedListeners = [];
 });
 
 describe('installUncaughtCapture', () => {
@@ -48,7 +73,12 @@ describe('installUncaughtCapture', () => {
 
     const errorRegistrations = addSpy.mock.calls.filter(([type]) => type === 'error').length;
     const rejectionRegistrations = addSpy.mock.calls.filter(([type]) => type === 'unhandledrejection').length;
-    expect(errorRegistrations).toBe(1);
+    // TWO 'error' listeners per install (#626): a capture-phase one (resource-load errors + the
+    // ResizeObserver-loop swallow) registered FIRST, plus the plain one below it — see
+    // uncaughtCapture.ts's own doc comment for why both the phase and the order are load-bearing.
+    // "Idempotent" means a SECOND installUncaughtCapture() call adds neither again, not that there
+    // is only ever one 'error' listener.
+    expect(errorRegistrations).toBe(2);
     expect(rejectionRegistrations).toBe(1);
     addSpy.mockRestore();
   });
@@ -113,5 +143,158 @@ describe('installUncaughtCapture', () => {
     window.dispatchEvent(new ErrorEvent('error', { error: new Error('boom'), message: 'boom' }));
 
     expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  // #626: folding the editor Console panel's own capture-phase listener in — see
+  // uncaughtCapture.ts's module doc comment.
+  describe('the capture-phase listener (#626)', () => {
+    it('a resource-load error (non-ErrorEvent, target carries src) records exactly ONE ring entry', async () => {
+      vi.resetModules();
+      const { installConsoleRing, getConsoleRingEntries } = await import('@modoki/engine/runtime/core/consoleRing');
+      installConsoleRing();
+      const { installUncaughtCapture } = await import('../../app/debug/uncaughtCapture');
+      installUncaughtCapture();
+
+      const before = getConsoleRingEntries().length;
+      const img = document.createElement('img');
+      document.body.appendChild(img);
+      img.src = 'http://localhost/missing.png';
+      // Resource errors don't bubble — only a listener registered in the CAPTURE phase on an
+      // ancestor (window) ever sees them, which is the whole reason this listener exists.
+      img.dispatchEvent(new Event('error'));
+      document.body.removeChild(img);
+
+      const added = getConsoleRingEntries().slice(before);
+      expect(added).toHaveLength(1);
+      expect(added[0].args.join(' ')).toContain('Resource load error');
+      expect(added[0].args.join(' ')).toContain('<img>');
+      expect(added[0].args.join(' ')).toContain('missing.png');
+    });
+
+    // ⚠️ THE regression this whole capture-phase addition risks reintroducing: for an event whose
+    // target IS window (every genuine ErrorEvent), BOTH the capture-phase and the plain listener
+    // registered on window fire — so without the capture-phase listener's own `instanceof
+    // ErrorEvent` guard, a real uncaught error would be recorded TWICE. #596/#597 Stage 3a already
+    // fixed exactly this class of bug once (agentBridge.ts + deviceConsoleCapture.ts each recording
+    // their own copy); this test is what stops it coming back through the new listener.
+    it('a real ErrorEvent records exactly ONE entry, not two, with both listeners registered', async () => {
+      vi.resetModules();
+      const { installConsoleRing, getConsoleRingEntries } = await import('@modoki/engine/runtime/core/consoleRing');
+      installConsoleRing();
+      const { installUncaughtCapture } = await import('../../app/debug/uncaughtCapture');
+      installUncaughtCapture();
+
+      const before = getConsoleRingEntries().length;
+      window.dispatchEvent(new ErrorEvent('error', { error: new Error('boom'), message: 'boom' }));
+
+      const added = getConsoleRingEntries().slice(before);
+      expect(added).toHaveLength(1);
+    });
+
+    // F4 (#626/#633 adversarial review): the swallow must never be a SILENT drop — the first
+    // occurrence surfaces a one-shot warn notice instead of recording nothing at all, and a later
+    // occurrence in the same session increments the count without spamming a second notice.
+    //
+    // Dispatches a REAL `window.dispatchEvent(...)`, not a direct call into the capture-phase
+    // listener — invoking the listener function directly never runs the PLAIN listener registered
+    // below it, so it cannot distinguish "swallowed by `stopImmediatePropagation()`" from "the
+    // plain listener was never going to see this anyway": deleting the `stopImmediatePropagation()`
+    // call left this test green under a direct-invocation version of itself. A real dispatch is
+    // only safe now that the file-level `afterEach` above removes every listener a test adds to
+    // the shared jsdom `window` — see its comment for why a stale listener from an EARLIER test
+    // would otherwise be the FIRST to see this event and could win the `stopImmediatePropagation()`
+    // race before this test's own listener runs.
+    it('a ResizeObserver loop message is suppressed but surfaced ONCE as a warn notice, not silently dropped', async () => {
+      vi.resetModules();
+      const { installConsoleRing, getConsoleRingEntries } = await import('@modoki/engine/runtime/core/consoleRing');
+      installConsoleRing();
+      const { installUncaughtCapture } = await import('../../app/debug/uncaughtCapture');
+      installUncaughtCapture();
+
+      const before = getConsoleRingEntries().length;
+      const dispatch = () => window.dispatchEvent(new ErrorEvent('error', {
+        message: 'ResizeObserver loop completed with undelivered notifications.',
+      }));
+      dispatch();
+
+      const added = getConsoleRingEntries().slice(before);
+      // Not recorded as a real fault...
+      expect(added.some((e) => e.args.join(' ').includes('[uncaught]'))).toBe(false);
+      // ...but not silent either.
+      expect(added).toHaveLength(1);
+      expect(added[0].level).toBe('warn');
+      expect(added[0].args.join(' ')).toContain('ResizeObserver loop');
+
+      // A second occurrence in the same session is still suppressed, but does not spam a second
+      // notice.
+      dispatch();
+      expect(getConsoleRingEntries().slice(before)).toHaveLength(1);
+    });
+
+    // F4: the discriminator is `!event.error` + a message STARTING WITH the prefix, never a
+    // substring match — a game's own thrown error merely mentioning the same words in its message
+    // must still reach the ring as a real uncaught error.
+    it('a game-authored error whose message merely CONTAINS "ResizeObserver loop" is NOT swallowed', async () => {
+      vi.resetModules();
+      const { installConsoleRing, getConsoleRingEntries } = await import('@modoki/engine/runtime/core/consoleRing');
+      installConsoleRing();
+      const { installUncaughtCapture } = await import('../../app/debug/uncaughtCapture');
+      installUncaughtCapture();
+
+      const before = getConsoleRingEntries().length;
+      window.dispatchEvent(new ErrorEvent('error', {
+        error: new Error('ResizeObserver loop guard tripped in my game'),
+        message: 'Uncaught Error: ResizeObserver loop guard tripped in my game',
+      }));
+
+      const added = getConsoleRingEntries().slice(before);
+      expect(added.some((e) =>
+        e.args.join(' ').includes('[uncaught]')
+        && e.args.join(' ').includes('ResizeObserver loop guard tripped in my game'),
+      )).toBe(true);
+    });
+
+    // F4, the OTHER half of the discriminator: a message that DOES start with the exact prefix but
+    // carries a real `.error` must still reach the ring as a real uncaught error. The test above
+    // alone cannot prove `!event.error` matters — its message doesn't start with the literal
+    // prefix, so `.startsWith` alone already excludes it regardless of `.error`. This one isolates
+    // the `!event.error` half by using a message that WOULD match `.startsWith`.
+    it('an error whose message STARTS WITH the ResizeObserver prefix but carries a real .error is NOT swallowed', async () => {
+      vi.resetModules();
+      const { installConsoleRing, getConsoleRingEntries } = await import('@modoki/engine/runtime/core/consoleRing');
+      installConsoleRing();
+      const { installUncaughtCapture } = await import('../../app/debug/uncaughtCapture');
+      installUncaughtCapture();
+
+      const before = getConsoleRingEntries().length;
+      window.dispatchEvent(new ErrorEvent('error', {
+        error: new Error('ResizeObserver loop triggered by a real game exception'),
+        message: 'ResizeObserver loop triggered by a real game exception',
+      }));
+
+      const added = getConsoleRingEntries().slice(before);
+      expect(added.some((e) =>
+        e.args.join(' ').includes('[uncaught]')
+        && e.args.join(' ').includes('ResizeObserver loop triggered by a real game exception'),
+      )).toBe(true);
+    });
+
+    // F5 (#626/#633 adversarial review): `instanceof ErrorEvent` is realm-scoped, so a plain
+    // `Event('error')` (or a cross-realm ErrorEvent) used to fall into the resource-load branch
+    // AND still reach the plain listener below — two fabricated ring entries for one non-event.
+    it('a plain Event("error") (not an ErrorEvent) records exactly ONE entry, not two', async () => {
+      vi.resetModules();
+      const { installConsoleRing, getConsoleRingEntries } = await import('@modoki/engine/runtime/core/consoleRing');
+      installConsoleRing();
+      const { installUncaughtCapture } = await import('../../app/debug/uncaughtCapture');
+      installUncaughtCapture();
+
+      const before = getConsoleRingEntries().length;
+      window.dispatchEvent(new Event('error'));
+
+      const added = getConsoleRingEntries().slice(before);
+      expect(added).toHaveLength(1);
+      expect(added.some((e) => e.args.join(' ').includes('Resource load error'))).toBe(false);
+    });
   });
 });

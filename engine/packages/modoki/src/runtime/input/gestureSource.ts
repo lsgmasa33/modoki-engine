@@ -95,6 +95,11 @@ interface LivePointer {
 /** Pointers currently down, in the order they arrived. The first two drive the pinch. */
 const live: LivePointer[] = [];
 
+// Bumped on every change to `live`'s COMPOSITION, published as `GestureFrame.pointerSetVersion`.
+// ⚠️ Starts at 0 and is bumped BEFORE any set can be sampled, so 0 is never published while a
+// pointer is live — `beginSample` relies on that to reserve 0 for "no set sampled this frame".
+let pointerSetVersion = 0;
+
 // 'dead' = fingers are still down, but this gesture is OVER and must not resume. Every phase
 // transition out of a live gesture with a finger left over goes here, and only lifting them ALL
 // returns to 'idle'.
@@ -134,6 +139,20 @@ let tapAtX = 0;
 let tapAtY = 0;
 
 const find = (id: number): LivePointer | undefined => live.find((p) => p.id === id);
+
+// ⚠️ EVERY mutation of `live` goes through these three. `live.push` / `live.length = 0` written
+// inline would leave the version describing a set that has already changed, and nothing would
+// error — the consumer would simply stop seeing a discontinuity it needs. Keep it that way.
+function addPointer(id: number, x: number, y: number): void {
+  live.push({ id, x, y });
+  pointerSetVersion++;
+}
+
+function clearPointers(): void {
+  if (live.length === 0) return;
+  live.length = 0;
+  pointerSetVersion++;
+}
 
 function centroid(): { x: number; y: number } {
   if (live.length === 0) return { x: 0, y: 0 };
@@ -261,9 +280,9 @@ function startEmulation(e: PointerEvent): void {
   emu = { anchorX: e.clientX, anchorY: e.clientY, sourceId: e.pointerId, armed: false };
   // Both fingers begin ON the anchor. The pinch does not ARM until they separate — see
   // EMULATED_PINCH_SEED_PX for why a zero starting spread cannot be divided by.
-  live.length = 0;
-  live.push({ id: -1, x: e.clientX, y: e.clientY });
-  live.push({ id: -2, x: e.clientX, y: e.clientY });
+  clearPointers();
+  addPointer(-1, e.clientX, e.clientY);
+  addPointer(-2, e.clientX, e.clientY);
   phase = 'idle';
   tapEligible = false;
   positionEmulated(e.clientX, e.clientY);
@@ -272,7 +291,7 @@ function startEmulation(e: PointerEvent): void {
 function cancelEmulation(): void {
   if (!emu) return;
   emu = null;
-  live.length = 0;
+  clearPointers();
   hideOverlay();
   endGesture();
 }
@@ -294,7 +313,7 @@ function onPointerDown(e: PointerEvent): void {
   if (isPointerBlocked(e.target)) return;
   if (isEmulationStart(e)) { startEmulation(e); return; }
   if (find(e.pointerId)) return;
-  live.push({ id: e.pointerId, x: e.clientX, y: e.clientY });
+  addPointer(e.pointerId, e.clientX, e.clientY);
 
   if (live.length === 1) {
     phase = 'pending';
@@ -355,6 +374,7 @@ function removePointer(id: number): boolean {
   const i = live.findIndex((p) => p.id === id);
   if (i < 0) return false;
   live.splice(i, 1);
+  pointerSetVersion++;
   return true;
 }
 
@@ -389,7 +409,7 @@ let attached = false;
 function reset(): void {
   emu = null;
   hideOverlay();
-  live.length = 0;
+  clearPointers();
   phase = 'idle';
   panAccX = 0;
   panAccY = 0;
@@ -430,6 +450,7 @@ export const gestureSource: InputSource = {
     const c = centroid();
 
     g.pointerCount = live.length;
+    g.pointerSetVersion = pointerSetVersion;
     g.centerX = c.x;
     g.centerY = c.y;
     g.panning = phase === 'panning';

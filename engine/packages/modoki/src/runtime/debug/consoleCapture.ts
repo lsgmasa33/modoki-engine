@@ -17,6 +17,7 @@ import {
   installConsoleRing,
   getConsoleRingEntries,
   getConsoleRingVersion,
+  getConsoleRingEpoch,
   getConsoleRingDropped,
   getConsoleRingBootPrefixCount,
   subscribeConsoleRing,
@@ -100,11 +101,16 @@ export function installConsoleCapture(): void {
   installConsoleRing();
 }
 
-/** The highest ring version this module has observed, through ANY entry point that reads or writes
- *  `clearedBeforeSeq` — not just `getConsoleEntries()`'s own cache below. Detects the ring going
- *  BACKWARDS, which is only possible via `__resetConsoleRingForTest()` (restarts `version` at 0):
- *  see `syncClearWatermarkToRing`'s doc comment for why that matters and why this is tracked
- *  separately from the cache rather than folded into `cachedRingVersion` alone. */
+/** The ring's identity, as of the last time ANY entry point that reads or writes `clearedBeforeSeq`
+ *  checked it — not just `getConsoleEntries()`'s own cache below. Detects the ring being reset OUT
+ *  FROM UNDER this projection (only possible via `__resetConsoleRingForTest()`): see
+ *  `syncClearWatermarkToRing`'s doc comment for why that matters and why this is tracked separately
+ *  from the cache rather than folded into `cachedRingVersion` alone. */
+let lastKnownRingEpoch = -1;
+
+/** Belt-and-braces alongside `lastKnownRingEpoch` (close-out review of #626/#633) — see
+ *  `syncClearWatermarkToRing`'s doc comment for why a version going backwards is checked TOO,
+ *  not just the epoch. */
 let lastKnownRingVersion = -1;
 
 /** Cache for `getConsoleEntries()` — see its own doc comment for why. Keyed on the RAW ring
@@ -114,14 +120,13 @@ let cachedRingVersion = -1;
 let cachedClearedBeforeSeq = -1;
 let cachedEntries: ConsoleEntry[] = [];
 
-/** Self-heal `clearedBeforeSeq`/`localVersion` if the shared ring's version has gone BACKWARDS
- *  since we last looked — i.e. the ring was reset OUT FROM UNDER this projection: a test calling
- *  `__resetConsoleRingForTest()` directly, bypassing `__resetConsoleCaptureForTest()` below (this
- *  file's `uncaughtCapture.test.ts` sibling used to do exactly that). The ring's `seq`/`version`
- *  counters restart at 0/1, but `clearedBeforeSeq` does not — left alone, every future
- *  `getConsoleRingEntries(clearedBeforeSeq)` call would filter out EVERY entry until `seq` climbs
- *  back past the now-impossible stale watermark, reading as "captures nothing" with nothing
- *  failing anywhere.
+/** Self-heal `clearedBeforeSeq`/`localVersion` when the shared ring has been reset OUT FROM UNDER
+ *  this projection — a test calling `__resetConsoleRingForTest()` directly, bypassing
+ *  `__resetConsoleCaptureForTest()` below (this file's `uncaughtCapture.test.ts` sibling used to do
+ *  exactly that). The ring's `seq`/`version` counters restart at 0/1, but `clearedBeforeSeq` does
+ *  not — left alone, every future `getConsoleRingEntries(clearedBeforeSeq)` call would filter out
+ *  EVERY entry until `seq` climbs back past the now-impossible stale watermark, reading as
+ *  "captures nothing" with nothing failing anywhere.
  *
  *  Called from EVERY entry point that reads OR writes `clearedBeforeSeq` (`getConsoleEntries`,
  *  `getConsoleErrorsSince`, `clearConsoleEntries`) — not just the one with the memo cache — so the
@@ -129,12 +134,29 @@ let cachedEntries: ConsoleEntry[] = [];
  *  `getConsoleEntries()` at all between a Clear and a bare ring reset. Returns the current ring
  *  version so callers that already need it don't read it twice. */
 function syncClearWatermarkToRing(): number {
+  // ⚠️ Keyed on the ring's EPOCH — its identity — not on its version going BACKWARDS, which is what
+  // this did until #626's close-out and which MISSES the common case. `seq` and `version` both
+  // restart at 0 on a reset, so `reset -> log once` puts them back on values already observed:
+  // `1 < 1` is false, no heal fires, and `clearedBeforeSeq` then filters out every entry — reading
+  // as "captures nothing" with nothing failing anywhere. The identical bug was written twice (here
+  // and in the editor projection this file is the model for) before an epoch replaced both.
+  //
+  // PLUS `ringVersion < lastKnownRingVersion` — belt-and-braces, close-out review of #626/#633.
+  // Neither this module nor its editor twin supports HMR today, so nobody has built a real path
+  // where this second leg fires on its own: it is cheap insurance against a hypothetical, not a
+  // fix for anything demonstrated. The hypothetical: a genuinely FRESH ring module instance always
+  // starts at `epoch === 0`, which could collide with an already-remembered `0` left behind by an
+  // EARLIER ring instance this projection tracked before it was replaced — the epoch check alone
+  // would then miss the reset. A version that has gone backwards is an independent signal for
+  // exactly that case.
+  const ringEpoch = getConsoleRingEpoch();
   const ringVersion = getConsoleRingVersion();
-  if (ringVersion < lastKnownRingVersion) {
+  if (ringEpoch !== lastKnownRingEpoch || ringVersion < lastKnownRingVersion) {
     clearedBeforeSeq = 0;
     localVersion = 0;
     cachedRingVersion = -1;
     cachedClearedBeforeSeq = -1;
+    lastKnownRingEpoch = ringEpoch;
   }
   lastKnownRingVersion = ringVersion;
   return ringVersion;
@@ -231,7 +253,7 @@ export function __resetConsoleCaptureForTest(): void {
   notifyScheduled = false;
   clearedBeforeSeq = 0;
   localVersion = 0;
-  lastKnownRingVersion = -1;
+  lastKnownRingEpoch = -1;
   cachedRingVersion = -1;
   cachedClearedBeforeSeq = -1;
   cachedEntries = [];

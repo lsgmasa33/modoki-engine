@@ -1654,21 +1654,65 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   already — the #591 eager install inverted the binding order and put the chatter IN the ring, which
   read as success in the first device measurement. `deviceConsoleCaptureInstallOrder.test.ts` pins it.
 
-  **#591 was one of FOUR rings with the same defect. #596/#597 collapsed three of them into one.**
-  The device ring was fixed in isolation; the other three — `agentBridge`'s `consoleBuffer`,
-  `runtime/debug`'s in-game ring, and the editor Console panel's `logBuffer` — each installed "as
-  early as its own module loads", which reads as eager and is not. Measured in the editor
-  (`games/sling`) with three planted `console.warn` probes: the device ring caught `App.tsx` module
-  eval at nav+276 ms and React mount at nav+305 ms; the other three all began at nav+1462 ms. A
-  **~1.16 s blind window**, holding exactly the failed-dynamic-import / scene-boot-throw class each
-  ring exists to catch. `runtime/core/consoleRing.ts` is now the ONE CAPTURE RING these four
-  consumers share; agentBridge, `deviceConsoleCapture` and `runtime/debug` are projections. The
-  panel's ring is still separate — its lazily-built stacks and capture-phase resource-load errors
-  are not modelled by the shared ring — and is editor-only, so it reaches no device (#626).
+  **#591 was one of FOUR rings with the same defect. #596/#597 collapsed three of them into one,
+  and #626 closed the last gap by folding the fourth in too.** The device ring was fixed in
+  isolation; the other three — `agentBridge`'s `consoleBuffer`, `runtime/debug`'s in-game ring, and
+  the editor Console panel's `logBuffer` — each installed "as early as its own module loads", which
+  reads as eager and is not. Measured in the editor (`games/sling`) with three planted
+  `console.warn` probes: the device ring caught `App.tsx` module eval at nav+276 ms and React mount
+  at nav+305 ms; the other three all began at nav+1462 ms. A **~1.16 s blind window**, holding
+  exactly the failed-dynamic-import / scene-boot-throw class each ring exists to catch.
+  `runtime/core/consoleRing.ts` is now the ONE CAPTURE RING **all four** consumers share —
+  `agentBridge`, `deviceConsoleCapture`, `runtime/debug`, and (as of #626) the editor Console panel
+  itself — are all projections; none of them patches `console.*` or listens on `window` any more.
+  ⚠️ **The old justification for keeping the panel separate does not hold up** — it claimed the
+  panel's lazily-built stacks and its capture-phase resource-load-error handling "aren't modelled by
+  the shared ring." Both turned out to be solvable without a second ring: the capture-phase listener
+  (resource-load errors, plus the ResizeObserver-loop swallow) was a *listener* concern, not a
+  *buffer* one, and moved wholesale to `engine/app/debug/uncaughtCapture.ts` as a second,
+  capture-phase `window` `error` listener registered from the shared ring's own install gate
+  (`engine/app/installConsoleRing.ts`). The lazy call-site stack turned out to be an opt-in the ring
+  itself could carry: `installConsoleRing({ retainCallSite })`, on for `__MODOKI_EDITOR__` only, off
+  on a device — so #154's low-end budget still pays nothing for it. The one genuine cost — retaining
+  a live `Error` per entry — is exactly what that flag gates, nothing more. Verified live on
+  `games/sling`: after the change, the panel showed `18/18` and `modoki_get_console_logs` reported
+  `ringTotal: 18` — the two now agree exactly, closing the gap the divergence measurement above
+  documents. Clearing the panel took it to `0/0` while `modoki_get_console_logs` still reported
+  `ringTotal: 18, dropped: 0` — Clear is a per-consumer watermark (`clearEditorLogs()` in
+  `consoleCapture.ts`), not a truncation of the shared ring, so the other three consumers' history
+  survives it.
   ⚠️ Not the ONLY code touching `console.*` anywhere: `globalErrors.ts`'s Crashlytics mirror and two
   temporary noise filters (`warnSuppress.ts`, `warnFilter.ts`) wrap `console.error`/`warn` for
   reasons that have nothing to do with capture and feed none of these rings — see
   [mcp-response-budget.md](./mcp-response-budget.md)'s console-producer note for the citations.
+
+  **#633 — and even an EAGER install is not early enough in a BUNDLED build.** #596/#597 moved the
+  ring's install to a side-effect import above `./App.tsx` in `main.tsx`, which is the earliest
+  construct source order offers. It still missed a top-level `console.info` in `games/sling/game.ts`.
+  ⚠️ **The cause is NOT chunk reordering**, which is what the issue and
+  `installDeviceConsoleCapture.ts`'s own comment both claimed: rolldown **inlines** all four
+  side-effect module bodies into the ENTRY CHUNK's body, and by ES semantics an entry body runs only
+  after every static import has evaluated. The bundler converts the side-effect IMPORT — the one
+  construct `main.tsx:8-11` says runs early enough — into a body STATEMENT, which those same comments
+  say is too late. Measured on a `--target web` build: install call at entry byte ~188k, last static
+  import ends at ~4.7k, the game's chunk is import #25 of 25.
+  - **A wrong theory worth keeping:** "trim the installer's imports so the bundler stops deferring
+    it." The install graph is already minimal (`consoleRing` → `clock`) and trimming changes nothing,
+    because the body still runs last. Any fix that depends on chunk-assignment behaviour is a fix a
+    future bundler change reopens silently.
+  - The fix is the inline `<script>` in `engine/index.html` (`modoki:early-console:*` markers) — the
+    only thing no emitted chunk can precede. `engine/plugins/earlyConsoleShim.ts` strips it wherever
+    the ring gate is false, so a release build carries no buffer nothing drains.
+  - ⚠️ **It DISARMS, it never unwraps.** By drain time `installGlobalErrorHandlers` has wrapped
+    AROUND the shim (measured: globalErrors patches first, the ring second), so restoring the
+    original `console.*` would clobber that wrapper and silently stop Crashlytics console reporting.
+    The issue prescribed the unwrap; it would have been a regression.
+  - ⚠️ **The shim stamps each line at CALL time.** Replaying them through the ring's own clock would
+    give every boot line the DRAIN timestamp — collapsing exactly the nav+ms table above onto one
+    value while looking plausible. A bad measurement is worse than no measurement.
+  - ⚠️ **This cannot be reproduced or verified in the dev editor.** Vite serves unbundled modules, so
+    source order holds and the defect does not exist there. A green dev run is not evidence; it takes
+    a real `--target web`/native build plus a probe.
 
   ⚠️ **The method matters more than the fix: a missing log is only evidence if something else caught
   it.** The device ring recording all three probes on the same boot is what turned "the buffer looks

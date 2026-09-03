@@ -52,3 +52,40 @@ export function clampScrollTop(
 ): number {
   return Math.max(0, Math.min(scrollTop, maxScrollTop(viewHeight, totalRows, rowHeight)));
 }
+
+/** F2/F7 (#626/#633 adversarial review): where to insert the gap-disclosure row into a FILTERED
+ *  log list — the index of the first entry past the pinned/tail seam, or `-1` when no marker
+ *  should be shown at all. Extracted out of `Console.tsx` (a panel's DECISIONS belong in a plain
+ *  `.ts` module beside it, per `docs/editor.md` § Panels) so this seam-finding logic is covered by
+ *  `npm run verify` — nothing imports the panel itself except a `data-ui-id` pin, so a regression
+ *  here was previously invisible to the automated gate.
+ *
+ *  `logs` must carry stable, ascending `id`s (the ring's own `seq`), already filtered to whatever
+ *  the panel's level/text filter currently shows. The seam is the adjacent PAIR straddling
+ *  `id === bootPrefixCount` — `logs[i-1].id <= bootPrefixCount` immediately followed by
+ *  `logs[i].id > bootPrefixCount` — never an absolute position, because a filter (or a Clear) can
+ *  remove entries from either side without moving where the real seam sits.
+ *
+ *  Returns `-1` in three cases, and callers must not distinguish them (all three mean "don't draw a
+ *  marker"): `dropped <= 0` (nothing was ever evicted); the filtered list has no pinned-side
+ *  survivor, no tail-side survivor, or neither adjacent to the other (the seam isn't VISIBLE in
+ *  this filtered view — mirrors `ConsoleTab.tsx`'s identical guard); and — the one callers must
+ *  read this comment to know about — **after a Clear that has advanced the watermark past the
+ *  entire pinned prefix**. `clearEditorLogs()`/`clearConsoleEntries()` advance a per-consumer
+ *  watermark, not `bootPrefixCount` itself, so once every surviving row's `id` is already greater
+ *  than `bootPrefixCount`, there is no pinned-side survivor left to pair with — this function
+ *  correctly returns `-1`, but that is a COVERAGE GAP, not a resolved one: lines logged AFTER that
+ *  Clear can still be silently missing a NEW gap (the ring can go on evicting its tail forever) with
+ *  `dropped > 0` and the toolbar's `n/total` counter reading perfectly healthy. `Console.tsx`'s own
+ *  doc comment on `displayRows` states this limitation; `ConsoleTab.tsx` has the identical gap and
+ *  it is a deliberate PARITY choice between the two, not a bug either owes a fix today. */
+export function findGapMarkerIndex(
+  logs: { id: number }[],
+  bootPrefixCount: number,
+  dropped: number,
+): number {
+  if (dropped <= 0) return -1;
+  const idx = logs.findIndex((e, i) =>
+    i > 0 && logs[i - 1].id <= bootPrefixCount && e.id > bootPrefixCount);
+  return idx > 0 ? idx : -1;
+}

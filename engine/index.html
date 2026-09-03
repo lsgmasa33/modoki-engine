@@ -88,6 +88,51 @@
         window.addEventListener('unhandledrejection', function (e) { var r = e && e.reason; consider(r && (r.message || String(r))); });
       })();
     </script>
+    <!-- modoki:early-console:start -->
+    <script>
+      // Early console capture (#633). The ONE thing that cannot be outrun by chunk emission:
+      // rolldown inlines main.tsx's side-effect imports into the entry chunk's BODY, which by ES
+      // semantics runs after every static import — so `installConsoleRing`'s carefully chosen
+      // position above `./App.tsx` buys nothing in a bundled build, and a top-level log in a
+      // game's own module graph is lost. Measured on a --target web build of games/sling.
+      //
+      // This records raw args into a bounded array and forwards. `installConsoleRing()` DRAINS it
+      // (runtime/core/consoleRing.ts) and DISARMS it.
+      //
+      // ⚠️ IT MUST NEVER RESTORE THE ORIGINAL console.* — by drain time `installGlobalErrorHandlers`
+      // has already wrapped AROUND this shim, so reassigning console.* would clobber that wrapper
+      // and silently kill Crashlytics console reporting. Disarm (stop recording, keep forwarding)
+      // is the only safe teardown.
+      //
+      // Stripped from any build where the ring is not installed — see engine/plugins/earlyConsoleShim.ts.
+      (function () {
+        var CAP = 256;
+        var now = function () {
+          try { return performance.now(); } catch (_) { return 0; }
+        };
+        var state = { entries: [], done: false, dropped: 0 };
+        globalThis.__MODOKI_EARLY_CONSOLE__ = state;
+        var levels = ['log', 'info', 'warn', 'error'];
+        for (var i = 0; i < levels.length; i++) {
+          (function (lvl) {
+            var real = console[lvl];
+            if (typeof real !== 'function') return;
+            console[lvl] = function () {
+              if (!state.done) {
+                // The timestamp is taken HERE, not at drain time. The ring stamps `mono` when it
+                // records, so without this every buffered boot line would carry the DRAIN moment
+                // and the boot-timing table this ring exists to produce (#591's nav+ms figures)
+                // would be uniformly wrong while looking perfectly plausible.
+                if (state.entries.length < CAP) state.entries.push([lvl, Array.prototype.slice.call(arguments), now()]);
+                else state.dropped++;
+              }
+              return real.apply(console, arguments);
+            };
+          })(levels[i]);
+        }
+      })();
+    </script>
+    <!-- modoki:early-console:end -->
   </head>
   <body>
     <div id="root"></div>

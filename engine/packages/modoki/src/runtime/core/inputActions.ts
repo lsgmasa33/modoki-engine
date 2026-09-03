@@ -93,6 +93,19 @@ export interface PointerFrame {
 export interface GestureFrame {
   /** How many pointers are down right now (blocked ones excluded). */
   pointerCount: number;
+  /** Identity of the CURRENT pointer set — bumped whenever the set's composition changes (a
+   *  pointer added, removed, or the whole set dropped), never on movement. Compare for EQUALITY
+   *  only; it is an identity stamp, not a measurement, so ordering or subtracting two values means
+   *  nothing.
+   *
+   *  ⚠️ `pointerCount` cannot answer this. One finger lifting and another landing inside a single
+   *  sample window is 1 -> 1 with neither pinch edge set, so a consumer diffing the centroid
+   *  applies the whole jump as real motion (#618, then #623). This field changes on both events, so
+   *  the swap is visible.
+   *
+   *  0 means "no pointer set was sampled this frame" — the source did not run, or was suppressed.
+   *  It is never 0 while a pointer is live, so a consumer may treat 0 as a discontinuity too. */
+  pointerSetVersion: number;
   /** A one-finger pan is in progress — the gesture cleared the tap window or the slop radius. */
   panning: boolean;
   /** Pan movement THIS FRAME, presentation-scaled. Zero unless panning or pinching.
@@ -123,7 +136,7 @@ export interface GestureFrame {
 
 export function makeGesture(): GestureFrame {
   return {
-    pointerCount: 0, panning: false, panX: 0, panY: 0,
+    pointerCount: 0, pointerSetVersion: 0, panning: false, panX: 0, panY: 0,
     pinching: false, pinchStarted: false, pinchEnded: false,
     pinchScale: 1, pinchScaleDelta: 1, centerX: 0, centerY: 0,
     tapped: false, tapX: 0, tapY: 0,
@@ -176,8 +189,13 @@ export function beginSample(frame: InputFrame): void {
   // would advertise a pinch that nothing is tracking. Consumers gate real behaviour on `pinching`
   // (wordweave suppresses its whole spelling drag on it), so a latched one is a stuck game, not a
   // cosmetic stale read: hold an editor panel's focus and the board stops accepting input.
+  //
+  // `pointerSetVersion` is zeroed with everything else: 0 is a reserved "no set sampled" value the
+  // source never publishes while a pointer is live, so a consumer comparing for equality reads a
+  // suppressed frame as a discontinuity — which is exactly right, the finger list really was dropped.
   const g = frame.gesture;
   g.pointerCount = 0;
+  g.pointerSetVersion = 0;
   g.panning = false; g.panX = 0; g.panY = 0;
   g.pinching = false; g.pinchStarted = false; g.pinchEnded = false;
   g.pinchScale = 1; g.pinchScaleDelta = 1;

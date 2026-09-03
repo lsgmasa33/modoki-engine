@@ -3,7 +3,7 @@
  *  multiply with a fixed overscan above/below. */
 
 import { describe, it, expect } from 'vitest';
-import { computeVisibleRange, clampScrollTop, maxScrollTop } from '../../src/editor/panels/consoleVirtualization';
+import { computeVisibleRange, clampScrollTop, maxScrollTop, findGapMarkerIndex } from '../../src/editor/panels/consoleVirtualization';
 
 const ROW = 21;
 
@@ -82,5 +82,40 @@ describe('clampScrollTop (panels F3 — stale scroll after clear/filter)', () =>
     const r = computeVisibleRange(clamped, 300, 5, ROW);
     expect(r.startIdx).toBe(0);
     expect(r.endIdx).toBe(5); // all 5 rows visible, nothing stranded
+  });
+});
+
+describe('findGapMarkerIndex (F2/F7 — the pinned/tail gap-disclosure marker)', () => {
+  const mk = (ids: number[]) => ids.map((id) => ({ id }));
+
+  it('finds the seam: the index of the first entry past the pinned/tail boundary', () => {
+    const logs = mk([1, 2, 3, 4, 5, 6, 7, 8]);
+    // bootPrefixCount 5 -> the pair straddling the seam is id 5 (index 4) / id 6 (index 5).
+    expect(findGapMarkerIndex(logs, 5, 3)).toBe(5);
+  });
+
+  it('shows no marker when nothing has ever been dropped', () => {
+    const logs = mk([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(findGapMarkerIndex(logs, 5, 0)).toBe(-1);
+  });
+
+  it('shows no marker when a filter hides every row on the TAIL side (only pinned-side rows survive)', () => {
+    const logs = mk([1, 2, 3]); // nothing with id > bootPrefixCount survived the filter
+    expect(findGapMarkerIndex(logs, 5, 3)).toBe(-1);
+  });
+
+  it('shows no marker when a filter hides every row on the PINNED side — "every pinned row is filtered out"', () => {
+    const logs = mk([6, 7, 8]); // nothing with id <= bootPrefixCount survived the filter
+    expect(findGapMarkerIndex(logs, 5, 3)).toBe(-1);
+  });
+
+  it('the post-Clear case (Console.tsx F6 comment): a Clear that advanced the watermark past the ' +
+    'ENTIRE pinned prefix leaves no pinned-side survivor to pair with, so a NEW gap opened in the ' +
+    'tail AFTER the clear goes unmarked — a documented coverage gap, not a bug in this function', () => {
+    // capacity 1000 / bootPrefix 128, log 2000, Clear, log 2000 more: the panel shows seq
+    // 3129-4000 with dropped climbing past 1128, but every surviving id is already > bootPrefixCount
+    // — there is no pinned-side survivor left anywhere in the list to pair with.
+    const logs = mk([3129, 3130, 3131, 4000]);
+    expect(findGapMarkerIndex(logs, 128, 1128)).toBe(-1);
   });
 });

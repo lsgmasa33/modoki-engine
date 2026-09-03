@@ -315,6 +315,77 @@ describe('the host input gate (#264-adjacent) — a suppressed frame reports NO 
   });
 });
 
+describe('pointer set identity (#623)', () => {
+  it('the one-finger swap is visible', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    const f1 = sample();
+    const v1 = f1.gesture.pointerSetVersion;
+
+    // No sample in between — id 1 lifts and a DIFFERENT id lands in the same window. `pointerCount`
+    // and the pinch edges cannot see this; only the identity stamp can.
+    send('pointerup', 1, 100, 100, T0 + 10);
+    send('pointerdown', 2, 400, 400, T0 + 10);
+    const f2 = sample();
+
+    expect(f1.gesture.pointerCount).toBe(1);
+    expect(f2.gesture.pointerCount).toBe(1);
+    expect(f2.gesture.pinchStarted).toBe(false);
+    expect(f2.gesture.pinchEnded).toBe(false);
+    expect(f2.gesture.pointerSetVersion).not.toBe(v1);
+  });
+
+  it('movement alone does not bump it', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    const v1 = sample().gesture.pointerSetVersion;
+
+    send('pointermove', 1, 100 + DEFAULT_TAP_SLOP_PX + 5, 100, T0 + 5); // promotes to panning
+    send('pointermove', 1, 100 + DEFAULT_TAP_SLOP_PX + 40, 100, T0 + 10);
+    const f = sample();
+
+    expect(f.gesture.panning).toBe(true);
+    expect(f.gesture.pointerSetVersion).toBe(v1);
+  });
+
+  it('a second finger landing bumps it, and lifting back to one bumps it again', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    const v1 = sample().gesture.pointerSetVersion;
+
+    send('pointerdown', 2, 200, 100, T0 + 5);
+    const v2 = sample().gesture.pointerSetVersion;
+    expect(v2).not.toBe(v1);
+
+    send('pointerup', 2, 200, 100, T0 + 20);
+    const v3 = sample().gesture.pointerSetVersion;
+    expect(v3).not.toBe(v2);
+  });
+
+  it('never 0 while a pointer is live', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    const f = sample();
+    expect(f.gesture.pointerCount).toBe(1);
+    expect(f.gesture.pointerSetVersion).toBeGreaterThan(0);
+  });
+
+  it('reset() is a change', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    const v1 = sample().gesture.pointerSetVersion;
+
+    // No `addPointer` between the two samples — isolates `clearPointers`'s OWN bump. A prior
+    // version of this test landed a fresh pointer AFTER `reset()` and before re-sampling, so
+    // `addPointer`'s bump alone satisfied the assertion below: deleting `pointerSetVersion++` from
+    // `clearPointers` still left v1=V+1, a silent reset, then the new `addPointer` bumping to
+    // V+2 — still "not equal", so the test could not tell the two bumps apart. `sample()` publishes
+    // the raw module-level counter regardless of `live.length` (`gestureSource.ts`'s own
+    // `sample()`: `g.pointerSetVersion = pointerSetVersion` is unconditional), so the bump from a
+    // `reset()` alone, over an otherwise-untouched `live`, is directly observable here with nothing
+    // else that could have caused it.
+    gestureSource.reset?.();
+    const v2 = sample().gesture.pointerSetVersion;
+
+    expect(v2).not.toBe(v1);
+  });
+});
+
 describe('mouse pinch emulation', () => {
   beforeEach(() => { configureGestures({ mouseEmulation: true }); });
 

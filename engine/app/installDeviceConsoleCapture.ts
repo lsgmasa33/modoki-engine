@@ -18,13 +18,23 @@
  * `games/sling` debug build: this module's install lands ahead of `initDebugBridge()` (its probe line
  * preceded `[debug-bridge] Initializing native bridge` in the ring) and a mount-time `console.info`
  * is captured — but a `console.info` at the top level of `games/sling/game.ts`, which App.tsx reaches
- * through its static `virtual:modoki-games` import, was NOT. Source order does not survive chunking:
- * rolldown puts this module in a shared chunk that the entry chunk imports AFTER several chunks
- * belonging to App.tsx's graph, so "above App.tsx in main.tsx" buys ordering against main.tsx's
- * STATEMENTS (React's mount and its effects — the #591 case) and not against every module App.tsx
- * transitively pulls in. `deviceConsoleCaptureInstallOrder.test.ts` pins the source order, which is
- * necessary and not sufficient; only a device build can answer the rest. Closing that last window
- * would take an inline script in index.html, which nothing yet needs.
+ * through its static `virtual:modoki-games` import, was NOT. Source order does not survive
+ * bundling — and the mechanism is NOT chunk reordering, which is what this comment claimed until
+ * #633 measured it. Rolldown INLINES this module's body (and the three sibling side-effect
+ * modules') into the ENTRY CHUNK's body, and by ES semantics an entry body runs only after every
+ * one of its static imports has evaluated. So the bundler converts the side-effect IMPORT — the
+ * one construct main.tsx:8-11 says runs early enough — into a body STATEMENT, which those same
+ * comments say is too late. "Above App.tsx in main.tsx" therefore buys ordering against main.tsx's
+ * STATEMENTS (React's mount and its effects — the #591 case) and nothing at all against a module
+ * App.tsx transitively pulls in. Re-measured on a `--target web` build of games/sling (#633): the
+ * install call sits at entry-chunk byte ~188k, the last static import ends at ~4.7k, and the game's
+ * chunk is import #25 of 25. `deviceConsoleCaptureInstallOrder.test.ts` pins the source order,
+ * which is necessary and not sufficient; only a real bundle can answer the rest.
+ *
+ * That last window IS now closed, by the inline early-capture shim in `engine/index.html` (#633) —
+ * the only thing no emitted chunk can precede. It buffers `console.*` and `installConsoleRing()`
+ * drains it. This module's own projection is unaffected: it reads the ring, which by then holds
+ * the drained boot lines too.
  *
  * The gate below must stay BYTE-IDENTICAL to the one guarding `import('./debug/bridge')` in
  * main.tsx (pinned by `deviceConsoleCaptureInstallOrder.test.ts`) — not merely equivalent. Both need

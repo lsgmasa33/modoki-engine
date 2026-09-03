@@ -202,11 +202,13 @@ describe('device console capture install order (#591)', () => {
     // `runtime/debug/consoleCapture.ts` installs a THIRD capture by side effect from
     // `runtime/debug/index.ts` — effectively pre-registering #597, which it turned out to be. That
     // is fixed: `runtime/core/consoleRing.ts` is now the only thing in the app + runtime that wraps
-    // `console.*`, and agentBridge, deviceConsoleCapture and runtime/debug are all projections of
-    // it. The ONE remaining separate wrapper is `packages/modoki/src/editor/consoleCapture.ts` (the
-    // editor Console panel's `logBuffer`), left out of that change on purpose because its entries
-    // carry lazily-built stacks and it listens in the CAPTURE phase for resource-load errors —
-    // semantics the shared ring does not model. It is editor-only, so it never reaches a device.
+    // `console.*`. `packages/modoki/src/editor/consoleCapture.ts` (the editor Console panel) was the
+    // one remaining separate wrapper for a while, kept apart because its entries carried lazily-built
+    // stacks and it listened in the CAPTURE phase for resource-load errors — semantics the shared
+    // ring didn't model. #626 folded it in too: the lazy stack is now `ConsoleRingOptions
+    // .retainCallSite` (opt-in, editor-only), and the capture-phase resource-load listener moved to
+    // `engine/app/debug/uncaughtCapture.ts`. agentBridge, deviceConsoleCapture, runtime/debug AND the
+    // editor Console panel are now all projections of the one ring.
     expect(
       /\bcreateConsoleRing\s*\(/.test(stripped),
       'bridge.ts must not call createConsoleRing( itself — the ring now lives in ' +

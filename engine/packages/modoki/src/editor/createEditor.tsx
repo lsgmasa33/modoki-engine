@@ -34,7 +34,6 @@ import { ensureManifestLoaded, loadManifestJson, getGuidForPath, resolveGuidToPa
 import { backendFetch } from './backend/editorBackend';
 import { rendererReady } from '../runtime/loaders/textureResolver';
 import { rendererInitFailedPromise, getRendererProgress, hasViewportBegunInit } from '../runtime/core/activeRenderer';
-import { installConsoleCapture } from './consoleCapture';
 import { useEditorStore } from './store/editorStore';
 import { assetSetSignature } from './assetSetSignature';
 
@@ -610,10 +609,10 @@ export function getExtraMenusVersion(): number { return _reg.extraMenusVersion; 
 export function getProjectSettings() { return _reg.projectSettings; }
 
 export function createEditor(options: EditorOptions): React.ComponentType {
-  // Capture console output + uncaught errors/rejections at the VERY START of
-  // editor launch, before any lazy panel bundle (incl. Console) loads — so no
-  // early-init log or error is missed. Idempotent.
-  installConsoleCapture();
+  // Console capture used to be installed HERE (idempotently, so a standalone Console mount was
+  // covered too). It no longer is: the shared console ring (#626) starts eagerly from
+  // `engine/app/installConsoleRing.ts`, a side-effect import above `App.tsx` in `main.tsx` — long
+  // before `createEditor()` is ever called — so there is nothing left for this function to install.
 
   // Register game config
   setGameConfig(options.config);

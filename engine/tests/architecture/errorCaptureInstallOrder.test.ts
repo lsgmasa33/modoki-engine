@@ -69,4 +69,23 @@ describe('global error capture install order (#275)', () => {
     // Anything this module imports is itself evaluated uncovered, so the list stays at one.
     expect(importSpecifiers(capture, 'app/installErrorCapture.ts')).toEqual(['@modoki/engine/runtime']);
   });
+
+  // The MISSING pin (found while implementing #633): main.tsx:12-15 documents `installErrorCapture`
+  // as deliberately the INNER wrap — `installGlobalErrorHandlers`' contract is "call it early,
+  // BEFORE anything else touches console.warn", so the ring (installConsoleRing, imported right
+  // below it) must wrap OUTSIDE it, not the other way round. #591 briefly had these two the other
+  // way round, inverting that nesting, and nothing before this test would have caught a repeat.
+  it('imports ./installErrorCapture BEFORE ./installConsoleRing (#591, #633)', () => {
+    const errorCapture = specs.findIndex((s) => s.includes('installErrorCapture'));
+    const consoleRing = specs.findIndex((s) => s.includes('installConsoleRing'));
+    expect(errorCapture, 'main.tsx must import ./installErrorCapture').toBeGreaterThanOrEqual(0);
+    expect(consoleRing, 'main.tsx must import ./installConsoleRing').toBeGreaterThanOrEqual(0);
+    expect(
+      errorCapture,
+      `./installErrorCapture must be imported BEFORE ./installConsoleRing (it is at ${errorCapture}, ` +
+        `installConsoleRing at ${consoleRing}) — installGlobalErrorHandlers must take the INNER ` +
+        'wrap so it sees console.warn before the shared ring does; #591 regressed exactly this ' +
+        'ordering once.',
+    ).toBeLessThan(consoleRing);
+  });
 });

@@ -751,6 +751,23 @@ timestamp.
 `pointerDrag`'s `dragX`/`dragY` (see "Presentation-invariant input" above). `pinchScale`/
 `pinchScaleDelta` are **ratios** — already scale-invariant — and are deliberately left unscaled.
 
+**Which fingers, not how many — `pointerSetVersion`.** `pointerCount` answers *how many* are down; it
+cannot answer *whether they are the same ones*. One finger lifting and another landing inside a single
+sample window is 1 -> 1 with neither pinch edge set, so a consumer diffing the centroid applies the
+whole jump as real motion. `GestureFrame.pointerSetVersion` changes whenever the live set's
+COMPOSITION changes — a pointer added, removed, or the set dropped — and never on movement, so the
+swap is visible as itself. **Compare it for EQUALITY only**: it is an identity stamp, not a
+measurement, so ordering or subtracting two values means nothing. It is 0 on a frame the source did
+not run (suppressed by the host gate, or no source registered) and never 0 while a pointer is live, so
+a consumer may read 0 as a discontinuity too.
+
+⚠️ **Every mutation of `gestureSource`'s live list goes through `addPointer`/`removePointer`/
+`clearPointers`.** An inline `live.push` or `live.length = 0` would leave the version describing a set
+that has already changed, and **nothing would error** — the consumer would simply stop seeing a
+discontinuity it needs. #618 found the count-change half (a pointer landing or lifting moves the
+centroid with no finger having moved); #623 closed the half the count cannot see. Wordweave's
+crossword pan is the only consumer today, which is why nothing else has hit it.
+
 ⚠️ **A sentinel timestamp inverts under subtraction.** The first implementation parked `downT` at
 `+Infinity` to mark "not a fresh press" after a pinch ended with one finger still down. `t - Infinity`
 is `-Infinity`, which *is* less than the tap window, so a finger surviving a lifted pinch emitted a

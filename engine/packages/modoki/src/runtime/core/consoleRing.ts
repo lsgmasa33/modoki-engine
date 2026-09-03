@@ -22,6 +22,7 @@
  */
 
 import { rawNow } from './clock';
+import { createTeardownToken } from './liveness';
 
 export type ConsoleRingLevel = 'log' | 'info' | 'warn' | 'error';
 
@@ -35,6 +36,11 @@ export interface ConsoleRingEntry {
    *  and could mutate after the fact). Not joined: a consumer decides how to render multiple
    *  args. */
   args: string[];
+  /** Call-site stack, lazily formatted on first read — see `ConsoleRingOptions.retainCallSite`.
+   *  Only present on a `warn`/`error` entry recorded while `retainCallSite` is on (editor only),
+   *  and never on a REPLAYED entry (the #633 shim drain) — see `record()`'s own doc comment.
+   *  Absent everywhere else, including every `log`/`info` entry. */
+  stack?: string;
 }
 
 export interface ConsoleRingOptions {
@@ -42,6 +48,12 @@ export interface ConsoleRingOptions {
   capacity?: number;
   /** How many of the EARLIEST entries are pinned and never evicted. Default 128. */
   bootPrefix?: number;
+  /** Opt-in per-entry call-site capture for `warn`/`error` entries (#626). Default **false**.
+   *  Retaining a live `Error` object per warn/error entry is a real cost — the editor's Console
+   *  panel needs it (a `console.warn` row should have a stack even when no `Error` was passed), a
+   *  device build must never pay for it. `engine/app/installConsoleRing.ts` is the ONE place this
+   *  is turned on, gated `__MODOKI_EDITOR__`. */
+  retainCallSite?: boolean;
 }
 
 const DEFAULT_CAPACITY = 512;
@@ -82,6 +94,23 @@ export const unpatchedLog: (...args: unknown[]) => void = console.log.bind(conso
 
 let capacity = DEFAULT_CAPACITY;
 let bootPrefix = DEFAULT_BOOT_PREFIX;
+let retainCallSite = false;
+/** The ring's IDENTITY generation — bumps when the ring is invalidated (today: only the test
+ *  reset). A projection holding a clear WATERMARK compares generations to know its watermark
+ *  belongs to a ring that no longer exists.
+ *
+ *  ⚠️ `createTeardownToken`, NOT a hand-rolled counter, and that is a repo decision rather than a
+ *  preference: #573 found five ad-hoc "am I still live?" conventions that disagreed, and settled on
+ *  ONE pattern with a shared helper for the two shapes that are the same machinery. This is exactly
+ *  the second of those — "a counter that bumps on INVALIDATION, not on start" (see
+ *  `runtime/core/liveness.ts`). `livenessTokenIsShared.test.ts` does not catch a sixth counter in
+ *  this shape (it compares against a value in ANOTHER module, which that guard correctly allows),
+ *  so this is the convention holding on its own rather than the guard enforcing it.
+ *
+ *  `.generation` is read directly rather than via `capture()` because the consumers are synchronous
+ *  cache checks with their own control flow, which the helper's doc calls a first-class use of the
+ *  raw counter, not an escape hatch. Layer-clean: `liveness.ts` is L0 with no imports of its own. */
+const ringLiveness = createTeardownToken();
 
 /** `[pinned boot entries] ++ [rolling tail]`, in seq order. Once the tail is full, appending
  *  shifts out its own oldest entry — the pinned prefix is never touched. */
@@ -116,6 +145,26 @@ function isThenable(v: unknown): boolean {
     && typeof (v as { then?: unknown }).then === 'function';
 }
 
+/** Depth cap for `formatCauseChain` below — copied from the editor's now-deleted `formatError`
+ *  (F3, #626/#633 adversarial review). Guards against a pathological (or cyclic) `cause` chain
+ *  growing an entry without bound; four links is already far more than any real error chain in
+ *  this codebase has ever carried. */
+const CAUSE_CHAIN_DEPTH_CAP = 4;
+
+/** `\n  caused by: Name: message`, repeated for each `Error` in `err.cause`'s chain, depth-capped.
+ *  Returns `''` when there is no `cause` (or it isn't an `Error`) — the overwhelmingly common case,
+ *  so a caller can always just append the result.
+ *
+ *  Each link is rendered as `Name: message`, not its own `.stack` — the HEAD (whatever the caller
+ *  prefixes this with) already carries a full stack saying WHERE the outer error was thrown; a
+ *  cause is there to say WHAT led to it, one line each. */
+function formatCauseChain(err: Error, depth = 0): string {
+  const cause = (err as { cause?: unknown }).cause;
+  if (depth >= CAUSE_CHAIN_DEPTH_CAP || !(cause instanceof Error)) return '';
+  const head = `${cause.name || 'Error'}: ${cause.message}`;
+  return `\n  caused by: ${head}${formatCauseChain(cause, depth + 1)}`;
+}
+
 function stringifyArg(v: unknown): string {
   if (typeof v === 'string') return v;
   if (v === undefined) return 'undefined';
@@ -130,16 +179,30 @@ function stringifyArg(v: unknown): string {
   // of THIS file returned `${v.name}: ${v.message}`, which is the same defect wearing a nicer
   // label: visible but useless, because the stack is what says WHERE. All three captures this file
   // replaced returned `stack || message`; so does this.
-  if (v instanceof Error) return v.stack || v.message;
+  //
+  // F3 (#626/#633 adversarial review): PLUS the `cause` chain, which `.stack` alone never carries.
+  // `formatError` used to do this in the editor's own projection — reachable by nothing once #626
+  // moved the panel onto this ring, so a chained `new Error(msg, { cause })` (exactly the shape
+  // `createEditor.tsx`'s `sceneReady.catch((e) => console.error('[Editor] scene load failed:', e))`
+  // logs) reached every consumer with its cause silently erased. Fixed HERE, at the ring, so every
+  // projection (editor, in-game debug menu, agent bridge, device bridge) gains it at once.
+  if (v instanceof Error) return (v.stack || v.message) + formatCauseChain(v);
   try {
     // Handled at BOTH depths, matching `safeStringify`: the branch above catches a top-level Error,
     // the replacer below catches one NESTED in an object or array. `{cause: err}` and `[err]` are
     // exactly how a rejection value arrives, and serializing those to `{"cause":{}}` / `[{}]` is
     // the same defect one level down — a distinction `bridgeHelpers.ts` records learning the hard
     // way, in its own close-out review.
+    //
+    // The `cause` chain is appended here too (F3/F8, #626/#633 adversarial review) — the module doc
+    // comment above already claimed a nested Error is "handled at BOTH depths", but until now that
+    // meant `stack || message` only, dropping `cause` for exactly the shapes this branch exists for
+    // (`console.error('ctx', { err })`, `console.error([err])`). A non-Error `cause` still stays
+    // dropped here, same as the top-level branch above — that is pre-existing and fine, only an
+    // `Error` cause carries anything worth chaining.
     const json = JSON.stringify(v, (_k, val) => (
       isThenable(val) ? PENDING_PROMISE_MARKER
-        : val instanceof Error ? (val.stack || val.message)
+        : val instanceof Error ? (val.stack || val.message) + formatCauseChain(val)
           : val));
     // `JSON.stringify` returns `undefined` — not a string — for a function, a symbol, or any value
     // whose `toJSON` yields undefined. Returning that would put a non-string into
@@ -172,16 +235,75 @@ function notify(): void {
   });
 }
 
-function record(level: ConsoleRingLevel, args: unknown[]): void {
+/** `replay` is passed ONLY by `drainEarlyConsole` (#633). Its presence — not the presence of a
+ *  timestamp inside it — is what marks an entry as replayed, because the drain legitimately
+ *  omits `mono` for an untrusted shim payload, and inferring "replayed" from a missing
+ *  timestamp would then hand that entry a call-site stack pointing at the drain loop. */
+function record(level: ConsoleRingLevel, args: unknown[], replay?: { mono?: number }): void {
   if (recording) return; // a logging getter/toString must not re-enter us
   recording = true;
   try {
+    // Stringify BEFORE incrementing `seq` — `stringifyArg` has throwing paths no inner guard fully
+    // covers (a hostile `toString`, a `.then`/`.stack` getter that itself throws), and every caller
+    // already wraps its own call into `record()` in a try/catch. If `seq` incremented FIRST, a
+    // swallowed throw here would still have CONSUMED a seq with nothing ever pushed to
+    // `pinned`/`tail` — breaking the contiguity invariant `getConsoleRingBootPrefixCount()`'s own
+    // doc comment asserts ("an entry's `seq` is in the pinned prefix iff `seq <=
+    // getConsoleRingBootPrefixCount()`"), which BOTH gap markers
+    // (`consoleVirtualization.ts`'s `findGapMarkerIndex`, `ConsoleTab.tsx`'s twin) rely on to find
+    // the seam — a lost seq shifts it one row early. Building the array first means a throw here
+    // never touches `seq` at all.
+    const stringifiedArgs = args.map(stringifyArg);
     const entry: ConsoleRingEntry = {
       seq: ++seq,
-      mono: rawNow(),
+      // `replay.mono` is ONLY for the #633 shim drain, which replays lines captured before this
+      // module existed and carries each one's ORIGINAL `performance.now()`. Stamping them at drain
+      // time instead would collapse the whole boot window onto one timestamp.
+      mono: replay?.mono ?? rawNow(),
       level,
-      args: args.map(stringifyArg),
+      args: stringifiedArgs,
     };
+    // Opt-in call-site capture (#626), OFF by default — see `ConsoleRingOptions.retainCallSite`.
+    // Only the editor's Console panel needs a stack on a `warn`/`error` row that logged no `Error`
+    // (so it can still say WHERE the call came from); a device build must never pay for retaining a
+    // live `Error` object per entry, hence the flag. `log`/`info` never get one, matching the
+    // panel's existing cost decision.
+    //
+    // A REPLAYED entry (the #633 shim drain, `drainEarlyConsole` below) is skipped: the call site
+    // captured HERE would point at the drain loop, not wherever the original console call actually
+    // happened on the page. Keyed on `replay` being PASSED AT ALL, never on whether it carried a
+    // timestamp — the drain omits `mono` for an untrusted payload, and keying on that would give
+    // exactly those entries a misleading stack.
+    if (retainCallSite && (level === 'warn' || level === 'error') && replay === undefined) {
+      // Allocated HERE (inside record()) so the frame depth `slice(3)` assumes is stable: [0] the
+      // "Error" header line, [1] this function (`record`), [2] the console wrapper arrow (or
+      // `recordConsoleRingEntry`, its own equally-thin wrapper around this function), [3] the real
+      // caller. (V8/Chromium-only by design — the editor ships in Electron; on a non-V8 engine the
+      // header line is absent and one real frame would be dropped, acceptable since retainCallSite
+      // is never turned on there.)
+      let err: Error | undefined = new Error();
+      let computedStack: string | undefined;
+      Object.defineProperty(entry, 'stack', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          if (computedStack === undefined) {
+            computedStack = (err?.stack || '').split('\n').slice(3).join('\n').trim();
+            // F10: release the retained Error the instant its stack IS READ. A strict improvement,
+            // but only for an entry whose stack someone actually looks at — an entry whose getter
+            // is NEVER called (most warn/error rows: nobody selected them in the Console panel)
+            // keeps its `Error` (and whatever it pins via V8's stack-trace machinery) alive in the
+            // CLOSURE for as long as the entry itself survives in the ring regardless of this fix,
+            // same as before it. This does NOT cap the worst case at some bounded number of live
+            // Errors — it only shortens the lifetime of the ones that get read. No practical unit
+            // test exists for this (asserting "an Error got garbage-collected" isn't observable
+            // from here); this comment is the only thing guarding the claim.
+            err = undefined;
+          }
+          return computedStack;
+        },
+      });
+    }
     if (pinned.length < bootPrefix) {
       pinned.push(entry);
     } else {
@@ -199,6 +321,61 @@ function record(level: ConsoleRingLevel, args: unknown[]): void {
   }
 }
 
+/** Shape published by the inline early-capture shim in engine/index.html (#633). */
+interface EarlyConsoleState {
+  /** `[level, args, mono]` — `mono` is the shim's own `performance.now()` at CALL time. */
+  entries: [string, unknown[], number?][];
+  done: boolean;
+  dropped: number;
+}
+
+/** The only four levels the shim (and this ring) knows how to record. */
+const EARLY_CONSOLE_LEVELS: ReadonlySet<string> = new Set(['log', 'info', 'warn', 'error']);
+
+/** Drain the inline shim's pre-install buffer into the ring (#633).
+ *
+ *  ⚠️ DISARM, NEVER UNWRAP. `installGlobalErrorHandlers` wraps console.error/warn AROUND this shim
+ *  (measured: globalErrors patches before the ring does), so restoring the original console.*
+ *  here would drop that wrapper and silently stop Crashlytics console reporting. Setting
+ *  `done = true` leaves the chain intact and makes the shim a pass-through for the rest of the
+ *  session.
+ *
+ *  Entries are recorded through `recordConsoleRingEntry`, which bypasses `console.*` — so this
+ *  cannot re-enter the patches installed a few lines above, and the drained lines take the LOWEST
+ *  seq numbers, landing inside the pinned boot prefix where they belong. */
+function drainEarlyConsole(): void {
+  const early = (globalThis as { __MODOKI_EARLY_CONSOLE__?: EarlyConsoleState }).__MODOKI_EARLY_CONSOLE__;
+  if (!early || early.done) return;
+  early.done = true;
+  const pending = early.entries;
+  early.entries = [];
+  for (const [level, args, mono] of pending) {
+    // ⚠️ PER-ENTRY try/catch, and it is load-bearing, not defensive dressing. `args` are LIVE object
+    // references the shim captured from arbitrary pre-install code, and `stringifyArg` has throwing
+    // paths that no inner guard covers (`isThenable` reads `v.then`; the fallback `String(v)` throws
+    // for a null-prototype or throwing-`toString` value). Every OTHER route into `record()` is
+    // already wrapped — the console wrappers below do `try { record(...) } catch {}` — but this one
+    // runs inside `installConsoleRing()`, which `main.tsx` reaches through a STATIC side-effect
+    // import. So an unguarded throw here does not lose a log line: it aborts the entry module, and
+    // React never mounts. One hostile boot-time argument would cost the whole app.
+    //
+    // Swallowing per ENTRY (not around the loop) so one bad line cannot discard the rest of boot.
+    try {
+      // The shim is plain JS living in HTML, so its payload is untrusted — fold an unrecognised
+      // level to 'log' rather than trusting it, and only honour a FINITE timestamp.
+      const safeLevel: ConsoleRingLevel = EARLY_CONSOLE_LEVELS.has(level) ? (level as ConsoleRingLevel) : 'log';
+      record(safeLevel, args, { mono: typeof mono === 'number' && Number.isFinite(mono) ? mono : undefined });
+    } catch {
+      /* never let one unstringifiable buffered arg break boot */
+    }
+  }
+  if (early.dropped > 0) {
+    try {
+      recordConsoleRingEntry('warn', [`[console-ring] ${early.dropped} pre-install console line(s) dropped (early buffer cap)`]);
+    } catch { /* same reasoning as the loop above */ }
+  }
+}
+
 /** Wrap `console.log/info/warn/error`. Idempotent — a second call is a no-op. Each wrapper
  *  records (never letting capture break logging) and ALWAYS forwards to the original method. */
 export function installConsoleRing(opts?: ConsoleRingOptions): void {
@@ -211,6 +388,7 @@ export function installConsoleRing(opts?: ConsoleRingOptions): void {
   // turning a memory cap into a leak on the low-end hardware #154 budgets. No production caller
   // reaches it today (1000/128 and 512/128) — this guards the next one.
   bootPrefix = Math.min(opts?.bootPrefix ?? DEFAULT_BOOT_PREFIX, capacity);
+  retainCallSite = opts?.retainCallSite ?? false;
 
   // Store the RAW references (not `.bind()`ed) — a bound copy is a distinct function object, so
   // `__resetConsoleRingForTest` restoring a bound copy instead of the original reference would
@@ -232,6 +410,11 @@ export function installConsoleRing(opts?: ConsoleRingOptions): void {
       original.apply(console, args);
     };
   }
+
+  // #633: console.* is now patched — drain whatever the inline early-capture shim in index.html
+  // buffered before this point, so a boot-time log fired ahead of this module still lands in the
+  // ring instead of being lost to the (bundled-build) reordering that motivated the shim.
+  drainEarlyConsole();
 }
 
 /** Record a SYNTHETIC entry directly, without routing it through `console.*`.
@@ -249,6 +432,18 @@ export function installConsoleRing(opts?: ConsoleRingOptions): void {
  *  S22, 2026-08-20). Writing straight into the ring keeps the diagnostic line and reports nothing. */
 export function recordConsoleRingEntry(level: ConsoleRingLevel, args: unknown[]): void {
   record(level, args);
+}
+
+/** Bumped by `__resetConsoleRingForTest()`. A consumer holding a clear WATERMARK (a `seq` value)
+ *  compares epochs to know its watermark belongs to a ring that no longer exists.
+ *
+ *  It is the ring's IDENTITY, deliberately, not its position. Both position-based tests fail: `seq`
+ *  and `version` both restart at 0, so `reset -> log once` lands them right back on values the
+ *  consumer already observed — a "did it go backwards" check never fires, and a "is my watermark
+ *  above the highest seq" check sees 1 > 1 and says no. Only an identity that never repeats can
+ *  answer this, and both wrong versions of it were written here before this comment was. */
+export function getConsoleRingEpoch(): number {
+  return ringLiveness.generation;
 }
 
 /** Entries with `seq > sinceSeq` (all of them when omitted), pinned prefix then rolling tail, in
@@ -331,5 +526,10 @@ export function __resetConsoleRingForTest(): void {
   dropped = 0;
   capacity = DEFAULT_CAPACITY;
   bootPrefix = DEFAULT_BOOT_PREFIX;
+  ringLiveness.invalidateAll();
+  retainCallSite = false;
   listeners.clear();
+  // #633: clear the early shim's published state so a test that seeds it (or a real one that ran
+  // earlier in the same process) does not leak a "done" or partially-drained buffer into the next.
+  delete (globalThis as { __MODOKI_EARLY_CONSOLE__?: EarlyConsoleState }).__MODOKI_EARLY_CONSOLE__;
 }
