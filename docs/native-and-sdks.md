@@ -399,6 +399,16 @@ real exercise of the mechanism will be the day a key is added, with no device ev
 The engine-side registry (`realmShutdown.ts`) IS live; it is the Court consumer that is gated off.
 Worth knowing before anyone reads #587 as "ads teardown is proven".
 
+⚠️ **The `pagehide` backstop's `event.persisted === false` gate (`App.tsx`) is an ANDROID
+measurement shipping on iOS too, and the iOS behaviour is still UNOBSERVED (#611).** `pagehide`
+firing on a mere backgrounding — not a real teardown — is documented real-world behaviour on iOS;
+nobody has measured whether it actually happens in this app's WKWebView. Rather than guess at a
+narrower, iOS-specific gate (risking the worse failure of suppressing a genuine teardown), #611
+leaves the gate as-is and bounds the risk with a recovery seam instead: `realmShutdown.ts`'s
+`onRealmSurvived` plus `realmDeathBackstop.ts`'s foreground check re-init ads (and anything else
+that registers a recovery) if the trigger turns out to have been a false alarm. So the risk here is
+now bounded by that seam, not by a claim that the gate itself is correct on iOS.
+
 ⚠️ **#584's own commit message (`8406660ef`) states its residual BACKWARDS** — it says a sub-game's
 boot attempt is "not counted on a reload". The opposite is true and is what makes the residual real:
 `beginBundleLoad` re-runs on a reload and DOES increment (`OtaCore.java:225`, `OtaCore.swift:406`),

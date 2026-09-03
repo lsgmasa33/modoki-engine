@@ -16,6 +16,7 @@ import { App as CapacitorApp } from '@capacitor/app';
 import { setJournalEnabled } from '@modoki/engine/runtime';
 import { createSupersessionToken, createTeardownToken } from '@modoki/engine/runtime/core/liveness';
 import { consoleRing, installDeviceConsoleCapture, unpatchedLog } from './deviceConsoleCapture';
+import { getConsoleRingDropped } from '@modoki/engine/runtime/core/consoleRing';
 import {
   safeStringify,
   handleEval as evalCode,
@@ -543,8 +544,17 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   return withMechanismSuffix(`ok (canvas:${how}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})${driftAtFrom}${superseded}`);
 }
 
-function handleConsoleLogs(params: Record<string, unknown>): ReturnType<typeof consoleRing.query> {
-  return consoleRing.query((params.limit as number) || 50, params.level as string | undefined);
+/** ⚠️ SHAPE CHANGE, coordinated with `engine/tools/game-debug-mcp/src/mcp-tools.ts`'s
+ *  `device_console_logs` (the only consumer of this bridge method — do not change one without the
+ *  other). Used to return the bare array `consoleRing.query()` produces; now wraps it with
+ *  `dropped`, for the same reason the editor's `console-logs` agent op does (see its own comment,
+ *  `agentBridge.ts`) — the ring is `[pinned] ++ [tail]`, discontiguous once it wraps, and on device
+ *  there is no devtools console to notice the gap any other way. */
+function handleConsoleLogs(params: Record<string, unknown>): { logs: ReturnType<typeof consoleRing.query>; dropped: number } {
+  return {
+    logs: consoleRing.query((params.limit as number) || 50, params.level as string | undefined),
+    dropped: getConsoleRingDropped(),
+  };
 }
 
 // --- App identity (#88) ---

@@ -3,8 +3,10 @@
  *  code-review T7). Covers safeStringify, screenshotToCSS (incl. the L5 param-precedence), the console
  *  ring, and handleEval. */
 
-import { describe, it, expect } from 'vitest';
-import { safeStringify, screenshotToCSS, createConsoleRing, handleEval, EVAL_ASYNC_TIMEOUT_MS, PENDING_PROMISE_MARKER, clampEvalTimeout, DEVICE_EVAL_TIMEOUT_MS, DEVICE_EVAL_MAX_TIMEOUT_MS, EDITOR_EVAL_MAX_TIMEOUT_MS } from '../../app/debug/bridgeHelpers';
+import { describe, it, expect, afterEach } from 'vitest';
+import { safeStringify, screenshotToCSS, handleEval, EVAL_ASYNC_TIMEOUT_MS, PENDING_PROMISE_MARKER, clampEvalTimeout, DEVICE_EVAL_TIMEOUT_MS, DEVICE_EVAL_MAX_TIMEOUT_MS, EDITOR_EVAL_MAX_TIMEOUT_MS } from '../../app/debug/bridgeHelpers';
+import { consoleRing } from '../../app/debug/deviceConsoleCapture';
+import { installConsoleRing, __resetConsoleRingForTest } from '@modoki/engine/runtime/core/consoleRing';
 
 describe('safeStringify', () => {
   it('returns strings as-is', () => expect(safeStringify('hello')).toBe('hello'));
@@ -78,38 +80,56 @@ describe('screenshotToCSS', () => {
   });
 });
 
-describe('console ring', () => {
+// ⚠️ Repointed (#596/#597 close-out review) from `bridgeHelpers.ts`'s now-DELETED `createConsoleRing`
+// — a private buffer with no production caller anywhere (`bridge.ts` reads `deviceConsoleCapture.ts`'s
+// `consoleRing` instead, always did since #591). This describe block now exercises THAT object
+// directly: same public shape (`push`/`entries`/`query`), but backed by the ONE shared ring
+// (`runtime/core/consoleRing.ts`) rather than a disconnected duplicate. Concretely, that means these
+// tests now run through `recordConsoleRingEntry` → `record` → `stringifyArg` — the actual shared
+// serializer `bridge.ts:546-547` depends on — so a regression there (the Error-stack one this same
+// review found and fixed) would fail HERE too, which the dead copy structurally could not do.
+describe('console ring (the live shared-ring projection, deviceConsoleCapture.ts)', () => {
+  afterEach(() => {
+    __resetConsoleRingForTest();
+  });
+
   it('captures entries', () => {
-    const ring = createConsoleRing(200);
-    ring.push('log', ['hello']);
-    ring.push('warn', ['warning!']);
-    expect(ring.entries).toHaveLength(2);
-    expect(ring.entries[0]).toMatchObject({ level: 'log', args: ['hello'] });
-    expect(ring.entries[1].level).toBe('warn');
+    installConsoleRing();
+    consoleRing.push('log', ['hello']);
+    consoleRing.push('warn', ['warning!']);
+    expect(consoleRing.entries).toHaveLength(2);
+    expect(consoleRing.entries[0]).toMatchObject({ level: 'log', args: ['hello'] });
+    expect(consoleRing.entries[1].level).toBe('warn');
   });
 
   it('enforces max size by dropping oldest', () => {
-    const ring = createConsoleRing(3);
-    for (const c of ['a', 'b', 'c', 'd']) ring.push('log', [c]);
-    expect(ring.entries.map((e) => e.args[0])).toEqual(['b', 'c', 'd']);
+    installConsoleRing({ capacity: 3, bootPrefix: 0 });
+    for (const c of ['a', 'b', 'c', 'd']) consoleRing.push('log', [c]);
+    expect(consoleRing.entries.map((e) => e.args[0])).toEqual(['b', 'c', 'd']);
   });
 
   it('query returns last N', () => {
-    const ring = createConsoleRing(200);
-    for (let i = 0; i < 10; i++) ring.push('log', [`msg${i}`]);
-    expect(ring.query(3).map((e) => e.args[0])).toEqual(['msg7', 'msg8', 'msg9']);
+    installConsoleRing();
+    for (let i = 0; i < 10; i++) consoleRing.push('log', [`msg${i}`]);
+    expect(consoleRing.query(3).map((e) => e.args[0])).toEqual(['msg7', 'msg8', 'msg9']);
   });
 
   it('query filters by level', () => {
-    const ring = createConsoleRing(200);
-    ring.push('log', ['a']); ring.push('error', ['b']); ring.push('log', ['c']); ring.push('error', ['d']);
-    expect(ring.query(10, 'error').map((e) => e.args[0])).toEqual(['b', 'd']);
+    installConsoleRing();
+    consoleRing.push('log', ['a']); consoleRing.push('error', ['b']); consoleRing.push('log', ['c']); consoleRing.push('error', ['d']);
+    expect(consoleRing.query(10, 'error').map((e) => e.args[0])).toEqual(['b', 'd']);
   });
 
-  it('stringifies non-string args', () => {
-    const ring = createConsoleRing(200);
-    ring.push('log', [42, { key: 'val' }, true]);
-    expect(ring.entries[0].args).toEqual(['42', '{"key":"val"}', 'true']);
+  // The assertion that matters: aimed at the dead `createConsoleRing`, this could only ever exercise
+  // `bridgeHelpers.ts`'s OWN `safeStringify` — never the shared ring's `stringifyArg`, and never what
+  // `bridge.ts` actually ships. Aimed here, an Error argument proves it now would have caught the
+  // Error-stack regression (`consoleRing.ts`'s own close-out fix — see `consoleRing.test.ts`).
+  it('stringifies non-string args, including an Error kept as its stack', () => {
+    installConsoleRing();
+    const err = new Error('boom');
+    consoleRing.push('log', [42, { key: 'val' }, true, err]);
+    expect(consoleRing.entries[0].args.slice(0, 3)).toEqual(['42', '{"key":"val"}', 'true']);
+    expect(consoleRing.entries[0].args[3]).toBe(err.stack || err.message);
   });
 });
 

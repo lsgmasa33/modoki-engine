@@ -7,8 +7,6 @@ export interface LastScreenInfo { imageWidth: number; imageHeight: number; scree
 /** Per-request adb capture dims, passed by the MCP with a tap/drag (Android). */
 export interface ScreenInfoParam { imgW: number; imgH: number; nativeW: number; nativeH: number }
 
-export const MAX_CONSOLE_LOGS = 200;
-
 /** 'layout-bounds' -> 'layoutBounds'. Shared by both eval-scripting surfaces (editor's evalApi.ts
  *  and device's deviceEvalApi.ts) so the mapping can't drift between them — moved here (#83) from
  *  evalApi.ts, which re-exports it for anything still importing it from there. */
@@ -183,21 +181,4 @@ export async function handleEval(
   } catch (e) {
     return `Error: ${(e as Error).message}`;
   }
-}
-
-/** A bounded console-capture ring: `push` records an entry (args serialized), `query` returns the
- *  last N (optionally filtered by level). */
-export function createConsoleRing(maxLogs: number) {
-  const entries: ConsoleLine[] = [];
-  return {
-    entries,
-    push(level: ConsoleLine['level'], args: unknown[]): void {
-      entries.push({ type: 'console', level, args: args.map(safeStringify), timestamp: Date.now() });
-      if (entries.length > maxLogs) entries.shift();
-    },
-    query(limit: number, level?: string): ConsoleLine[] {
-      const filtered = level ? entries.filter((l) => l.level === level) : entries;
-      return filtered.slice(-limit);
-    },
-  };
 }

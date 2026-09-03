@@ -4,7 +4,8 @@ import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
 import { useResumeReload } from './useResumeReload';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint, registerRealmShutdownTask, runRealmShutdownTasks } from '@modoki/engine/runtime';
+import { createRealmDeathBackstop } from './realmDeathBackstop';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint, registerRealmShutdownTask, runRealmShutdownTasks, notifyRealmSurvived, rearmAudioAutoplay } from '@modoki/engine/runtime';
 import { App as CapacitorApp } from '@capacitor/app';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
@@ -742,7 +743,32 @@ function App() {
   // `runRealmShutdownTasks()` before tearing the realm down, so this task actually runs on the path
   // that matters. Still not a general app-teardown seam — one task, one job, same restraint as above.
   useEffect(() => {
-    return registerRealmShutdownTask('app.cleanup', () => { appServices().ads?.cleanup(); audioDispose(); });
+    return registerRealmShutdownTask(
+      'app.cleanup',
+      () => { appServices().ads?.cleanup(); audioDispose(); },
+      {
+        // #611: re-init ads if the "shutdown" turns out to have been a false alarm (the
+        // `pagehide` backstop below over-triggering on iOS, or `shutdownRealmThenReload()`'s
+        // throwing route re-arming the latch while leaving ads dead — a pre-existing gap this
+        // also closes, since nothing else ever called `ads.init()` a second time). Gated the same
+        // way as the boot-time init above (`Capacitor.isNativePlatform()`, line ~389) — off-device
+        // `ads.init()` is already a no-op, but mirroring the gate keeps the two call sites reading
+        // the same.
+        //
+        // Audio DOES need recovery here, and it used to say the opposite. The GRAPH rebuilds
+        // lazily on next use (`graphOrNull()` in the audio service), reapplying mute + bus mix —
+        // but PLAYBACK does not: `audioDispose()` ends every live handle, and `audioSystem`'s
+        // `autoplayed` guard then blocks autoplay from ever re-declaring intent, so an authored
+        // `loop + autoplay` source (music, ambience) is silent for the rest of the session with
+        // nothing to explain it (see `rearmAudioAutoplay`'s own doc comment). Re-arming it here
+        // makes the next tick restart those sources from the top — the same place a real reload
+        // would have left them.
+        onRealmSurvived: () => {
+          if (Capacitor.isNativePlatform()) void appServices().ads?.init();
+          rearmAudioAutoplay(getCurrentWorld());
+        },
+      },
+    );
   }, []);
 
   // OTA Phase 4 (docs/ota-subgame-modules.md) — discover + load any sub-game
@@ -763,19 +789,42 @@ function App() {
   // closes the durability gap the store documents.)
   useEffect(() => {
     const flush = () => { void PlayerPrefs.flush(); };
-    const onVisibility = () => { if (document.visibilityState === 'hidden') flush(); };
+    // The decision core for the shutdown-or-not call below, with `runRealmShutdownTasks`/
+    // `notifyRealmSurvived` injected — see `realmDeathBackstop.ts` for the full #611 reasoning.
+    const backstop = createRealmDeathBackstop({
+      runShutdown: () => { void runRealmShutdownTasks(); },
+      notifySurvived: notifyRealmSurvived,
+    });
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flush();
+      else backstop.onRealmVisible();
+    };
     document.addEventListener('visibilitychange', onVisibility);
     // `pagehide` fires both for a real page teardown AND for a bfcache/background transition
-    // (tab-switch, home-button on mobile Safari) — `event.persisted` is what tells them apart:
-    // true means the page may resume from the cache, false means it is actually going away. Only
-    // the false case is a realm death, so only it runs the shutdown tasks (native ad SDK teardown,
-    // #587) — running them on a mere backgrounding would tear down a still-live banner/interstitial
-    // that the player is about to see again, which is a regression, not a fix.
+    // (tab-switch, home-button on mobile Safari) — `event.persisted` is meant to tell them apart:
+    // true means the page may resume from the cache, false means it is actually going away.
+    //
+    // ⚠️ #611: `persisted === false` is only an ANDROID-measured signal, and it ships here on iOS
+    // too, where `pagehide` firing on a mere backgrounding is documented real-world behaviour. A
+    // false trigger there would run the shutdown tasks (native ad SDK teardown, #587) on a still-
+    // live banner/interstitial the player is about to see again — a regression, not a fix. Rather
+    // than guess at a narrower iOS-specific gate (which risks the OPPOSITE failure: suppressing a
+    // genuine teardown), the gate stays as-is and `backstop.onRealmVisible()` below is what makes
+    // an over-trigger SAFE — a later foreground re-arms the seam and lets each shutdown task's own
+    // `onRealmSurvived` recovery undo whatever it needs to (see `realmShutdown.ts`).
     const onPageHide = (event: PageTransitionEvent) => {
       flush();
-      if (event.persisted === false) void runRealmShutdownTasks();
+      backstop.onPageHide(event.persisted);
     };
     window.addEventListener('pagehide', onPageHide);
+    // `pageshow` is the other "we're back" signal, alongside `visibilitychange` above. Both are
+    // wired deliberately, not redundantly: `pageshow` is only guaranteed to fire for a page that
+    // was actually bfcached (or on a fresh navigation), not for every foreground transition, so
+    // relying on it alone would miss a plain tab-switch back; `visibilitychange` alone would miss
+    // a bfcache restore on a platform that does not also flip visibility. Both call the same
+    // idempotent `onRealmVisible()`, so seeing both for one real resume is harmless.
+    const onPageShow = () => { backstop.onRealmVisible(); };
+    window.addEventListener('pageshow', onPageShow);
     let appListener: { remove: () => void } | undefined;
     let cancelled = false; // cleanup may run before the async addListener resolves
     if (Capacitor.isNativePlatform()) {
@@ -801,6 +850,7 @@ function App() {
       cancelled = true;
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('pagehide', onPageHide);
+      window.removeEventListener('pageshow', onPageShow);
       appListener?.remove();
       flush(); // final flush on teardown (HMR / error-boundary recovery)
     };

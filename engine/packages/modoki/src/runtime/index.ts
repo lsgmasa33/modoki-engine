@@ -643,7 +643,7 @@ export { clearZoneState } from './zones/zoneTriggerCore';
 export { characterInputSystem } from './input/characterInputSystem';
 export { characterInput3DSystem } from './input/characterInput3DSystem';
 export { characterAnimationSystem } from './animation/characterAnimationSystem';
-export { audioSystem, stopWorldAudio, stopEntityAudio, setAudioWorldPositionResolver } from './audio/audioSystem';
+export { audioSystem, stopWorldAudio, stopEntityAudio, setAudioWorldPositionResolver, rearmAudioAutoplay } from './audio/audioSystem';
 export { registerAudioControls, useAudioMixStore } from './actions/audioControls';
 export { registerVideoControls } from './actions/videoControls';
 // Fullscreen cutscene layer. React + DOM only (no THREE), so exporting it here does
@@ -736,11 +736,15 @@ export {
 // Realm shutdown tasks (#587) — the seam that lets a reload destroy native SDK state (an AppLovin
 // banner/MREC/interstitial) before the reload destroys the JS realm. `runtime/**` cannot reach
 // `appServices()` (layering), so the app registers the task here and the reload sites
-// (`engine.reload`, `useResumeReload.ts`) only ever invoke the registry. See `core/realmShutdown.ts`.
+// (`engine.reload`, `useResumeReload.ts`) only ever invoke the registry. `notifyRealmSurvived`
+// (#611) is the other half — the false-alarm recovery a `pagehide` backstop needs when its
+// `event.persisted === false` gate over-triggers (an Android measurement shipped on iOS, where the
+// signal is ambiguous); see `core/realmShutdown.ts`.
 export {
   registerRealmShutdownTask,
   runRealmShutdownTasks,
   shutdownRealmThenReload,
+  notifyRealmSurvived,
 } from './core/realmShutdown';
 // Input WATCH (#134) — a game publishes what its OWN hit-test resolved a press to, which is the
 // one thing no engine-side observer can compute for a canvas game. Safe to call unconditionally:

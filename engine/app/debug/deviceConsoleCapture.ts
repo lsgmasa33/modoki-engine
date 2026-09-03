@@ -1,89 +1,111 @@
-/** The device console-capture ring and its `console.*` patch — split out of `bridge.ts` so it can
- *  be installed EAGERLY, at module-evaluation time, above `App.tsx`'s import (#591).
+/** The device console-capture SEAM — projects the ONE shared engine console ring
+ *  (`@modoki/engine/runtime/core/consoleRing`, installed eagerly by `../installConsoleRing.ts`)
+ *  rather than owning a fifth independent `console.*` patch of its own (#596/#597 Stage 2).
  *
- *  THE RACE THIS CLOSES. The capture used to live inside `bridge.ts`, reached only through
- *  `initDebugBridge()`, which `main.tsx` calls from behind an ASYNC dynamic
- *  `import('./debug/bridge')`. `createRoot().render()` runs synchronously right after that import
- *  is kicked off, so React mounts — and its effects run — before the chunk is guaranteed to have
- *  resolved. Whether a mount-time `console.info` was captured therefore depended on how fast that
- *  chunk loaded relative to React's first effects: the SAME build captured it on an iPad mini 5 and
- *  did not on a Galaxy S22. A missing device log was never trustworthy evidence of anything.
+ *  UNTIL STAGE 2, this file wrapped `console.log/info/warn/error` itself — split out of `bridge.ts`
+ *  by #591 so it could be installed eagerly, but still its OWN patch, alongside three others (the
+ *  shared ring, `agentBridge.ts`'s editor-side capture, and `runtime/debug`'s in-game one). That
+ *  duplication is exactly what #596/#597 exists to end. The shared ring is now the ONLY thing that
+ *  wraps `console.*`; this module patches nothing and instead PROJECTS the shared ring into the
+ *  shapes this bridge's existing callers (`bridge.ts`, `consoleSource.ts`) already expect, so
+ *  neither of them had to change.
  *
- *  WHY A SEPARATE MODULE, NOT JUST AN EAGER CALL IN bridge.ts. Position, not code: this file is
- *  imported (via `../installDeviceConsoleCapture.ts`) directly into `main.tsx`'s static import graph, so
- *  it runs before React mounts instead of racing a chunk fetch (see that file for what this does and
- *  does NOT reach — a module-eval log inside App.tsx's graph is still missed) — while `bridge.ts` MUST stay a
- *  lazy chunk. `bridge.ts` also pulls in the native TCP server and `capacitor-game-debug`; a release
- *  build constant-folds its gate to `false` and Rollup DCEs that entire eval-capable chunk out, and
- *  that guarantee (the one `main.tsx`'s bridge-import comment documents) must survive this split.
- *  The console patch itself is pure JS wrapping `console` — no native dependency — so it can move
- *  without taking any of that surface with it.
+ *  UNTIL STAGE 3a, the `window` `error`/`unhandledrejection` listeners lived here too — the shared
+ *  ring only sees `console.*` calls, so an uncaught error or a rejected promise needed a listener
+ *  somewhere. But `agentBridge.ts` had grown its OWN, near-identical pair (#157's editor-side
+ *  capture), and once both fed the one shared ring every uncaught error produced TWO entries. They
+ *  now live in ONE place, `./uncaughtCapture.ts`, registered from `../installConsoleRing.ts`'s wider
+ *  gate (not this module's narrower one — see that file's doc comment for why). `CONSOLE_CAPTURE_MARKER`
+ *  is re-exported below so this module's existing importers don't need to change.
  *
  *  WHY THE NAME IS DEVICE-QUALIFIED. `agentBridge.ts` exports its OWN, unrelated
- *  `installConsoleCapture()` — the EDITOR-side capture, populating `consoleBuffer` — and a second
- *  identically-named function in the same directory tree is exactly how #157 recurred: `diagnose`
- *  once read the wrong one of these two rings on device and reported a structurally clean bill of
- *  health. `installDeviceConsoleCapture` names which ring this one is, on sight.
+ *  `installConsoleCapture()` — the EDITOR-side capture, formerly populating `consoleBuffer` — and a
+ *  second identically-named function in the same directory tree is exactly how #157 recurred:
+ *  `diagnose` once read the wrong one of these two rings on device and reported a structurally clean
+ *  bill of health. `installDeviceConsoleCapture` names which ring this one is, on sight.
  */
 
 import { setConsoleSource } from './consoleSource';
-import { createConsoleRing, MAX_CONSOLE_LOGS } from './bridgeHelpers';
+import type { ConsoleLine } from './bridgeHelpers';
+import { getConsoleRingEntries, recordConsoleRingEntry } from '@modoki/engine/runtime/core/consoleRing';
 
-/** Prefixes the two synthetic ring entries below, and doubles as the bundle-leak marker
- *  `smoke-debug-build-flag.mjs` greps for: this module is now in `main.tsx`'s STATIC import graph
- *  rather than behind a lazy chunk, so it is the one piece of the debug surface whose stripping from
- *  a release build is not guaranteed by lazy-chunking alone — the smoke test's job is to prove the
- *  build-constant gate still DCEs it. */
-export const CONSOLE_CAPTURE_MARKER = '[console-capture]';
+export { CONSOLE_CAPTURE_MARKER } from './uncaughtCapture';
 
-// `/* @__PURE__ */`: this module is reachable from `main.tsx`'s STATIC import graph (unlike
-// `bridge.ts`, which stays behind a dynamic import precisely so it can be DCE'd), so a release build
-// must be able to tree-shake this ring away when nothing calls `installDeviceConsoleCapture()`.
-// `createConsoleRing` genuinely just allocates and returns a plain object — no side effect the
-// annotation would be lying about — so marking it pure is honest, not a workaround.
-export const consoleRing = /* @__PURE__ */ createConsoleRing(MAX_CONSOLE_LOGS);
-
-/** `console.log` bound BEFORE this module's own patch, for the bridge's OWN chatter (`bridge.ts`'s
- *  `_log`) — which must reach logcat/OSLog WITHOUT entering the ring.
+/** `console.log` bound before ANY patch — a straight re-export of the shared ring's own
+ *  `unpatchedLog`, for the bridge's OWN chatter (`bridge.ts`'s `_log`), which must reach
+ *  logcat/OSLog WITHOUT entering the ring.
  *
- *  ⚠️ THIS EXPORT EXISTS BECAUSE #591 BROKE THE OLD WAY OF GETTING IT, silently. `bridge.ts` used to
- *  get the pristine function for free from `const _log = console.log.bind(console)` at its own module
- *  scope: the capture was installed by `initDebugBridge()`, i.e. strictly AFTER that module had
- *  evaluated, so the bind captured the unwrapped function. Installing eagerly from `main.tsx`
- *  inverted that — `console.log` is already the wrapper by the time `bridge.ts` evaluates — and the
- *  bridge's ~25 `_log` call sites began pushing into the ring. Every `device_tap`/`drag`/`pointer`/
- *  `press_key`/`type_text` logs one line, so ~200 input ops evict the whole 200-entry ring: the change
- *  that made a boot log capturable would have made it evictable by the very tool used to read it.
- *  Caught in review by noticing that `[debug-bridge] Initializing native bridge` appeared in the
- *  ring in the S22 measurement — which had been read as evidence the fix worked.
- *
- *  What it binds is the PRISTINE `console.log`, so the bridge's chatter bypasses every capture
- *  installed after `main.tsx`'s static graph — this ring, the editor's, and `runtime/debug`'s in-game
- *  one (whose Console tab therefore stops showing `[debug-bridge]` lines it usually used to show,
- *  since `bridge.ts` was a late lazy chunk; deliberate — the same eviction argument applies to its
- *  ring too). Nothing installed EARLIER wraps `console.log`: `installGlobalErrorHandlers` touches
- *  only `console.error`/`console.warn`. `.bind()` is genuinely side-effect-free, so the
- *  `@__PURE__` annotation is honest and keeps this droppable in a release build. */
-export const unpatchedLog: (...args: unknown[]) => void = /* @__PURE__ */ console.log.bind(console);
+ *  ⚠️ THIS EXPORT EXISTS BECAUSE #591 BROKE THE OLD WAY OF GETTING IT, silently — see
+ *  `runtime/core/consoleRing.ts`'s own `unpatchedLog` doc comment for the full incident (~25
+ *  `bridge.ts` call sites, ~200 input ops evicting the boot capture). Re-exporting the SAME binding
+ *  that module captured at ITS OWN evaluation time — before `installConsoleRing()` (or this
+ *  module's now-removed console patch) could ever run — keeps that guarantee in ONE place instead
+ *  of two independent captures that could drift out of sync. */
+export { unpatchedLog } from '@modoki/engine/runtime/core/consoleRing';
+
+/** Project one shared-ring entry into this bridge's `ConsoleLine` shape. `timestamp` must be
+ *  EPOCH — `bridge.ts`'s `handleConsoleLogs` and `diagnose` compare it against wall-clock windows —
+ *  while the shared ring stores MONOTONIC `mono` (`performance.now()`; L0 cannot touch
+ *  `Date.now()`, see the determinism guard). The conversion is exact
+ *  (`performance.timeOrigin` is the epoch instant `performance.now()`'s zero point measures from)
+ *  and belongs here, in the unscanned app layer, rather than in the engine's
+ *  determinism-guarded `runtime/**`. */
+function toConsoleLine(entry: { level: ConsoleLine['level']; args: string[]; mono: number }): ConsoleLine {
+  return {
+    type: 'console',
+    level: entry.level,
+    args: entry.args,
+    timestamp: Math.round(performance.timeOrigin + entry.mono),
+  };
+}
+
+/** Public shape mirrors what `bridgeHelpers.ts`'s `createConsoleRing` used to expose —
+ *  `bridge.ts:546-547` calls `.query()` on this. `createConsoleRing` itself is GONE (#596/#597
+ *  close-out review): it had no production caller left anywhere, only `bridge.test.ts`'s "console
+ *  ring" tests, which pinned a private buffer nothing shipped ever read while THIS one — the one
+ *  actually wired to `bridge.ts` — carried no unit contract of its own. Those tests are repointed
+ *  at THIS object directly now, which is also why they can catch something the dead copy never
+ *  could: a broken serializer in the shared ring's own `record()` path (`consoleRing.ts`'s
+ *  `stringifyArg`) — exactly the Error-stack regression this same review found. What changed from
+ *  the old private buffer is the backing: `entries`/`query` now PROJECT the shared ring instead of
+ *  owning one. `push` records DIRECTLY into the shared ring (see its own doc comment below) — it
+ *  has no caller left in this file since Stage 3a moved the `window` listeners to
+ *  `./uncaughtCapture.ts` (which calls `recordConsoleRingEntry` itself), but stays exported as this
+ *  projection's own synthetic-write API, exercised directly by `deviceConsoleCapture.test.ts` and
+ *  `bridge.test.ts`. */
+export const consoleRing = {
+  get entries(): ConsoleLine[] {
+    return getConsoleRingEntries().map(toConsoleLine);
+  },
+  /** ⚠️ Records DIRECTLY into the shared ring — deliberately NOT `console[level](...args)`.
+   *  Routing these synthetic lines back through `console.error` would hand them to
+   *  `globalErrors.ts`'s console.error wrapper, whose Error-object WeakSet dedup cannot match a
+   *  string, filing a SECOND Crashlytics issue for an uncaught error it has already reported. See
+   *  `recordConsoleRingEntry`'s doc comment and `globalErrors.ts:366-377`. */
+  push(level: ConsoleLine['level'], args: unknown[]): void {
+    recordConsoleRingEntry(level, args);
+  },
+  query(limit: number, level?: string): ConsoleLine[] {
+    const all = getConsoleRingEntries().map(toConsoleLine);
+    const filtered = level ? all.filter((l) => l.level === level) : all;
+    return filtered.slice(-limit);
+  },
+};
 
 let installed = false;
 
-/** Patch `console.*` to also record into `consoleRing`, and capture uncaught errors/rejections that
- *  never reach `console.*` at all. Idempotent: `main.tsx` calls this EAGERLY (#591) and
+/** Register the #157 `consoleSource` seam. Idempotent: `main.tsx` calls this eagerly and
  *  `initDebugBridge()` still calls it too — the bridge must not depend on the eager install having
- *  fired — so a double-install would otherwise wrap `console.*` twice and record every line twice. */
+ *  fired — so a double-install must be a no-op.
+ *
+ *  ⚠️ #596/#597 Stage 3a moved the uncaught-error/rejection listeners OUT of this function and into
+ *  `./uncaughtCapture.ts` (registered from `../installConsoleRing.ts`'s wider gate) — this module no
+ *  longer registers any `window` listener at all. See this file's own doc comment for why. */
 export function installDeviceConsoleCapture(): void {
   if (installed) return;
   installed = true;
 
-  // Publish the ring FIRST, before anything that could conceivably fail. Ordered this way, no
-  // partial failure can leave the ring both filling and unreadable, so the flag can stay at the top
-  // where a retry cannot double-wrap `console.*` (a second pass would bind the first wrapper as its
-  // `original`, giving two ring entries per line and two listeners per uncaught error — exactly what
-  // this function's idempotence exists to prevent). The alternative — flag last, so a throw is
-  // retryable — trades a blind ring for a double-wrapped one; this ordering needs neither.
-  // Without this publication the device captured faithfully and nothing could reach it (see
-  // consoleSource.ts); `setConsoleSource` is a bare assignment, so it cannot throw.
+  // Publish the ring — `setConsoleSource` is a bare assignment, so it cannot throw.
   setConsoleSource(() => consoleRing.entries.map((e) => ({
     // The ring carries 'info' as a distinct level; the reader's vocabulary has three. Fold it into
     // 'log' rather than dropping the entry — losing a line to a vocabulary mismatch is the same
@@ -92,41 +114,4 @@ export function installDeviceConsoleCapture(): void {
     ts: e.timestamp,
     text: e.args.join(' '),
   })));
-
-  const levels = ['log', 'warn', 'error', 'info'] as const;
-  for (const level of levels) {
-    const original = console[level].bind(console);
-    console[level] = (...args: unknown[]) => {
-      original(...args);
-      consoleRing.push(level, args);
-    };
-  }
-  // An uncaught error or a rejected promise never reaches `console.*`, so the patch above cannot
-  // see it — and a failed dynamic import or a throw deep in scene/resource loading is exactly the
-  // kind of thing worth diagnosing on a phone. `agentBridge` records these for the editor; the
-  // device had no equivalent, so its ring was silent on the whole class (#157).
-  // Each wrapped in try/catch for the same reason `agentBridge`'s twin is ("never let capture break
-  // logging"), and it matters MORE here: this handler runs INSIDE the window error handler, so a
-  // throw while describing an error becomes another error event. `e.error` is attacker-shaped in the
-  // general case — a value whose `stack` getter throws, or a Proxy — and `String(e.message)` can
-  // throw on an object with a hostile `toString`. Without the guard the entry is lost AND an
-  // exception escapes into the host, at precisely the moment something is already going wrong.
-  if (typeof window !== 'undefined') {
-    window.addEventListener('error', (e) => {
-      try {
-        const where = e.filename ? ` (${e.filename}:${e.lineno}:${e.colno})` : '';
-        const msg = e.error instanceof Error ? (e.error.stack || e.error.message) : String(e.message);
-        consoleRing.push('error', [`${CONSOLE_CAPTURE_MARKER} [uncaught] ${msg}${where}`]);
-      } catch { /* ignore — a capture failure must never amplify the error it is reporting */ }
-    });
-    window.addEventListener('unhandledrejection', (e) => {
-      try {
-        const r = (e as PromiseRejectionEvent).reason;
-        const msg = r instanceof Error ? (r.stack || r.message) : String(r);
-        consoleRing.push('error', [`${CONSOLE_CAPTURE_MARKER} [unhandledrejection] ${msg}`]);
-      } catch { /* ignore */ }
-    });
-  }
-  // (The ring is published to `consoleSource` at the TOP of this function — see the note there for
-  // why the ordering, not a trailing flag, is what makes partial failure harmless.)
 }

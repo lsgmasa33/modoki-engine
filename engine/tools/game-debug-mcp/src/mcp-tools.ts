@@ -2078,10 +2078,15 @@ async function coordScaleOrRefusal(
         // reported as "the device app may have been backgrounded or killed; relaunch it". Wrong
         // cause, wrong remedy. Found by the Phase-8 table-driven device sweep.
         if (isDeviceError(raw)) return deviceReplyFailure('device_console_logs', 'read the captured console output from the device', raw);
-        const result = parseReply<Array<{ level: string; args: string[]; timestamp: number }>>(raw);
-        const text = !result || result.length === 0
+        // `{logs, dropped}` — `bridge.ts`'s `handleConsoleLogs` used to return a bare array; `dropped`
+        // is how many entries were evicted from the ring's tail BETWEEN the pinned boot prefix and
+        // this window (the ring is `[pinned] ++ [tail]`, discontiguous once it wraps), so a non-zero
+        // value means the log below has a real gap in it, not that boot was quiet.
+        const { logs: result, dropped } = parseReply<{ logs: Array<{ level: string; args: string[]; timestamp: number }>; dropped: number }>(raw);
+        const gapNote = dropped > 0 ? `\n(${dropped} earlier ${dropped === 1 ? 'entry' : 'entries'} dropped between the boot log and this window.)` : '';
+        const text = (!result || result.length === 0
           ? 'No console logs.'
-          : result.map((l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.level}] ${l.args.join(' ')}`).join('\n');
+          : result.map((l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.level}] ${l.args.join(' ')}`).join('\n')) + gapNote;
         return { content: [{ type: 'text' as const, text }] };
       } catch (e) {
         return caughtFailure('device_console_logs', 'read the captured console output from the device', e);

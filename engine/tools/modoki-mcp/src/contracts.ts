@@ -495,7 +495,10 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_get_console_logs: {
     kind: 'read', method: 'GET', route: '/api/console-logs', filters: ['level', 'limit', 'since'],
-    notes: 'The clean comparison for the two journals: same job, purely a read, no clear mode.',
+    notes: 'The clean comparison for the two journals: same job, purely a read, no clear mode. ' +
+      'A non-zero `dropped` in the response means entries between the pinned boot prefix and the ' +
+      'recent tail were evicted from the ring — the log is NOT contiguous, so do not read a gap in ' +
+      'it as "nothing happened there".',
   },
   modoki_project_settings: {
     kind: 'control', method: 'GET', route: '/api/project-settings', varies: 'method',

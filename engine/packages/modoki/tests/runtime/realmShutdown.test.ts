@@ -139,3 +139,122 @@ describe('shutdownRealmThenReload — the latch is re-armed when the reload does
     expect(reloaded, 'a throwing task must not prevent the realm from dying').toBe(true);
   });
 });
+
+describe('notifyRealmSurvived — recovery (#611)', () => {
+  // `notifyRealmSurvived()` chains recovery off the captured shutdown promise, so these tests are
+  // async: awaiting `runRealmShutdownTasks()` is not enough, because the recovery is scheduled on
+  // a `.then()` off of it, one microtask turn later. `await Promise.resolve()` (a couple of times
+  // where a task's own `await` adds another turn) flushes that deterministically — no timers, no
+  // arbitrary sleeps.
+  const flushMicrotasks = async (turns = 2) => {
+    for (let i = 0; i < turns; i++) await Promise.resolve();
+  };
+
+  it('runs a registered onRealmSurvived after notifyRealmSurvived() follows a run', async () => {
+    const recover = vi.fn();
+    registerRealmShutdownTask('t', () => {}, { onRealmSurvived: recover });
+
+    await runRealmShutdownTasks();
+    notifyRealmSurvived();
+    await flushMicrotasks();
+
+    expect(recover).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT run a recovery when there was no prior run', async () => {
+    const recover = vi.fn();
+    registerRealmShutdownTask('t', () => {}, { onRealmSurvived: recover });
+
+    notifyRealmSurvived();
+    await flushMicrotasks();
+
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it('starts recovery only AFTER the shutdown task settles, not before', async () => {
+    const order: string[] = [];
+    let resolveRun: () => void = () => {};
+    registerRealmShutdownTask('t', () => new Promise<void>((resolve) => { resolveRun = resolve; }).then(() => { order.push('run'); }), {
+      onRealmSurvived: () => { order.push('recovered'); },
+    });
+
+    const ran = runRealmShutdownTasks();
+    notifyRealmSurvived(); // called while the task is still in flight
+
+    await flushMicrotasks();
+    expect(order, 'recovery must not fire before the task it recovers has settled').toEqual([]);
+
+    resolveRun();
+    await ran;
+    await flushMicrotasks();
+
+    expect(order).toEqual(['run', 'recovered']);
+  });
+
+  it('does not recover a task registered AFTER the run', async () => {
+    const recover = vi.fn();
+    registerRealmShutdownTask('early', () => {});
+
+    await runRealmShutdownTasks();
+    registerRealmShutdownTask('late', () => {}, { onRealmSurvived: recover });
+    notifyRealmSurvived();
+    await flushMicrotasks();
+
+    expect(recover, 'a task registered after the run never had run() fire, so it gets no recovery either').not.toHaveBeenCalled();
+  });
+
+  it('a throwing recovery is caught, logged, and does not prevent the other recoveries', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ok = vi.fn();
+    registerRealmShutdownTask('boom-sync', () => {}, { onRealmSurvived: () => { throw new Error('sync recovery boom'); } });
+    registerRealmShutdownTask('boom-async', () => {}, { onRealmSurvived: async () => { throw new Error('async recovery boom'); } });
+    registerRealmShutdownTask('ok', () => {}, { onRealmSurvived: ok });
+
+    await runRealmShutdownTasks();
+    notifyRealmSurvived();
+    await flushMicrotasks();
+
+    expect(ok).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it('the existing latch re-arm behaviour still holds alongside a recovery', async () => {
+    const task = vi.fn();
+    const recover = vi.fn();
+    registerRealmShutdownTask('task', task, { onRealmSurvived: recover });
+
+    await runRealmShutdownTasks();
+    expect(task).toHaveBeenCalledTimes(1);
+
+    notifyRealmSurvived();
+    await flushMicrotasks();
+    expect(recover).toHaveBeenCalledTimes(1);
+
+    // The latch is re-armed regardless of the recovery, so a later call still re-runs every task.
+    await runRealmShutdownTasks();
+    expect(task).toHaveBeenCalledTimes(2);
+  });
+
+  it('does NOT recover once a NEWER run has started — it would undo that run\'s own teardown (#611)', async () => {
+    const recover = vi.fn();
+    const resolvers: Array<() => void> = [];
+    registerRealmShutdownTask('t', () => new Promise<void>((resolve) => { resolvers.push(resolve); }), {
+      onRealmSurvived: recover,
+    });
+
+    const firstRun = runRealmShutdownTasks(); // task's run() still in flight
+    notifyRealmSurvived(); // false alarm — recovery is now hung off `firstRun`
+
+    // A REAL shutdown starts before the first one's recovery ever got to fire.
+    const secondRun = runRealmShutdownTasks();
+
+    resolvers[0](); // let the first run's task settle, so its recovery chain can fire
+    await firstRun;
+    await flushMicrotasks();
+
+    expect(recover, 'a superseded run must not recover — it would re-establish what the newer run just tore down').not.toHaveBeenCalled();
+
+    resolvers[1]?.(); // let the second run finish too, rather than leaving it hanging
+    await secondRun;
+  });
+});

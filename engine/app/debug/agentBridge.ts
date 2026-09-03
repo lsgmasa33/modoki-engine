@@ -107,6 +107,7 @@ import { resolveDomPointReport, type DomPointSpec } from './domResolve';
 import { layoutSettleReport } from './layoutSettle';
 import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve';
 import { readConsoleSource } from './consoleSource';
+import { getConsoleRingEntries, getConsoleRingDropped, installConsoleRing } from '@modoki/engine/runtime/core/consoleRing';
 import { chromeHandles } from './chromeHandles';
 import { computeDiagnostics } from './diagnose';
 import { makeSchemaPusher } from './schemaPusher';
@@ -229,69 +230,61 @@ function parseWhere(
   return { pred };
 }
 
-// ── Console capture (dev) ── a ring buffer of recent console messages so an
-// agent/tooling can read editor errors + warnings via the curl-able
-// /api/console-logs (backed by the 'console-logs' op below) — no devtools or
-// MCP attach needed. Capped; cleared on reload.
+// ── Console capture ── the ONE shared engine console ring (#596/#597 Stage 3a), read here for
+// an agent/tooling to reach via the curl-able /api/console-logs (backed by the 'console-logs' op
+// below) — no devtools or MCP attach needed.
 interface ConsoleEntry { level: 'log' | 'warn' | 'error'; ts: number; text: string }
 interface ConsoleLogsParams { level?: 'log' | 'warn' | 'error'; limit?: number; since?: number }
-const CONSOLE_BUFFER_MAX = 500;
-const consoleBuffer: ConsoleEntry[] = [];
-let consoleHooked = false;
 
-/** Wrap console.* into the ring. Called by `initAgentBridge`; exported so a test can populate
- *  the buffer without standing up the whole bridge (jsdom has neither HMR nor the Electron
- *  bridge, so `initAgentBridge` returns early). Idempotent. */
+/** UNTIL STAGE 3a this wrapped `console.log/warn/error` into a private `consoleBuffer` and
+ *  registered its OWN `window` `error`/`unhandledrejection` listeners — a SECOND capture,
+ *  duplicating the shared ring `installConsoleRing.ts` installs eagerly, and (once Stage 2 made
+ *  both feed that one ring) a SECOND ring entry for every uncaught error, alongside the one
+ *  `deviceConsoleCapture.ts` recorded. Both private captures are gone; the shared ring is the only
+ *  wrapper and `./uncaughtCapture.ts` (registered from `installConsoleRing.ts`'s gate) is the only
+ *  uncaught-error listener, anywhere in the app.
+ *
+ *  This function no longer decides when capture starts — that used to be the boot hole: capture
+ *  began only once `initAgentBridge()` ran (after `if (!hot && !bridge) return`), measured at
+ *  ~1.16s into boot, missing App.tsx's module eval at nav+276ms and React's mount at nav+305ms. The
+ *  eager, superset-gated `installConsoleRing.ts` import closes that hole regardless of whether this
+ *  function is ever called. Kept only as a shim so its existing callers (`initAgentBridge`, below,
+ *  and `ringBufferSeams.test.ts`) still work: it just makes sure the shared ring is installed, for a
+ *  test that imports this module directly without going through `main.tsx`'s eager import. */
 export function installConsoleCapture(): void {
-  if (consoleHooked) return;
-  consoleHooked = true;
-  for (const level of ['log', 'warn', 'error'] as const) {
-    const original = console[level].bind(console);
-    console[level] = (...args: unknown[]) => {
-      try {
-        const text = args.map((a) =>
-          typeof a === 'string' ? a
-            : a instanceof Error ? (a.stack || a.message)
-              : (() => { try { return JSON.stringify(a); } catch { return String(a); } })(),
-        ).join(' ');
-        consoleBuffer.push({ level, ts: Date.now(), text });
-        if (consoleBuffer.length > CONSOLE_BUFFER_MAX) consoleBuffer.shift();
-      } catch { /* never let capture break logging */ }
-      original(...args);
-    };
-  }
-  // Also capture uncaught errors + unhandled promise rejections — a failed dynamic
-  // import or a throw deep in scene/resource loading never reaches console.*, so
-  // tooling (/api/console-logs) would otherwise see a silent stall. Recorded at
-  // 'error' level with the source URL so the failing module is identifiable.
-  if (typeof window !== 'undefined') {
-    window.addEventListener('error', (e) => {
-      try {
-        const where = e.filename ? ` (${e.filename}:${e.lineno}:${e.colno})` : '';
-        const msg = e.error instanceof Error ? (e.error.stack || e.error.message) : String(e.message);
-        consoleBuffer.push({ level: 'error', ts: Date.now(), text: `[uncaught] ${msg}${where}` });
-        if (consoleBuffer.length > CONSOLE_BUFFER_MAX) consoleBuffer.shift();
-      } catch { /* ignore */ }
-    });
-    window.addEventListener('unhandledrejection', (e) => {
-      try {
-        const r = (e as PromiseRejectionEvent).reason;
-        const msg = r instanceof Error ? (r.stack || r.message) : String(r);
-        consoleBuffer.push({ level: 'error', ts: Date.now(), text: `[unhandledrejection] ${msg}` });
-        if (consoleBuffer.length > CONSOLE_BUFFER_MAX) consoleBuffer.shift();
-      } catch { /* ignore */ }
-    });
-  }
+  installConsoleRing();
+}
+
+/** Project the shared ring into this module's `ConsoleEntry` shape.
+ *
+ *  `readConsoleSource()` is preferred when set: #157's seam (`consoleSource.ts`) is STILL how the
+ *  DEVICE ring reaches `diagnose` — do not delete it thinking it's dead, and do not read this
+ *  function as its replacement. It degrades to `null` when nobody registered a source, which is the
+ *  ordinary case for a PACKAGED (non-dev) editor: `installDeviceConsoleCapture()`'s narrower gate
+ *  never fires there even though the shared ring itself does (`installConsoleRing.ts`'s gate
+ *  includes `__MODOKI_EDITOR__`) — so this function is the fallback that keeps `/api/console-logs`
+ *  non-empty in exactly that build. */
+function ringEntriesAsConsoleEntries(): ConsoleEntry[] {
+  return getConsoleRingEntries().map((e) => ({
+    // The ring carries 'info' as a distinct level; this reader's vocabulary has three ('log' /
+    // 'warn' / 'error') and 'info' must never leak into /api/console-logs, diagnose, or the MCP
+    // contract — fold it into 'log' rather than dropping the entry.
+    level: e.level === 'info' ? 'log' : e.level,
+    // EPOCH, not the ring's own monotonic `mono` — `since=`/`ts` comparisons below and in `diagnose`
+    // are wall-clock windows. `performance.timeOrigin` is the epoch instant `performance.now()`'s
+    // zero point measures from; this arithmetic belongs here, in the unscanned app layer, not in
+    // the engine's determinism-guarded `runtime/**` (see `consoleRing.ts`'s own doc comment).
+    ts: Math.round(performance.timeOrigin + e.mono),
+    text: e.args.join(' '),
+  }));
 }
 
 function dumpConsoleLogs(p: ConsoleLogsParams = {}): { logs: ConsoleEntry[]; total: number } {
-  // Read whatever surface ACTUALLY captured (#157). `consoleHooked` is the honest test: it is true
-  // exactly when `installConsoleCapture()` ran, i.e. when this module's own buffer is the live one
-  // (editor, and dev). On a shipped device build `initAgentBridge()` returns before that call, so
-  // the buffer is permanently empty and the device's own ring — published through `consoleSource`
-  // — is the real one. Preferring the native buffer whenever it is hooked keeps the editor path
-  // byte-identical, including the uncaught-error entries only it records.
-  let logs: ConsoleEntry[] = consoleHooked ? consoleBuffer : (readConsoleSource() ?? consoleBuffer);
+  // #596/#597 Stage 3a: `consoleBuffer`/`consoleHooked` are gone — the shared ring is the only
+  // capture, everywhere, so there is no longer a "which buffer is live" question to answer. See
+  // `ringEntriesAsConsoleEntries`'s own doc comment for why `readConsoleSource()` is still tried
+  // first.
+  let logs: ConsoleEntry[] = readConsoleSource() ?? ringEntriesAsConsoleEntries();
   if (p.level) logs = logs.filter((e) => e.level === p.level);
   if (p.since != null) logs = logs.filter((e) => e.ts > p.since!);
   const total = logs.length;
@@ -588,7 +581,8 @@ registerAgentOp('scene-state', (params) => {
 registerAgentOp('render-scene', (params) => renderSceneOffscreen((params ?? {}) as OffscreenRenderOpts));
 // Summary-first at the OP, never in `dumpConsoleLogs` — `diagnose` (below) reads that
 // producer directly for its error list, and a default tail there would silently drop errors
-// from `modoki_diagnose` with no failing test. The ring holds 500 entries (~20–27k tokens);
+// from `modoki_diagnose` with no failing test. The shared ring holds 1000 entries in the editor
+// (`installConsoleRing.ts`'s `capacity`, #596/#597 Stage 3a — was a private 500-entry buffer);
 // a bare read returns the last 50 plus a per-level histogram of the whole window.
 registerAgentOp('console-logs', (params) => {
   const p = (params ?? {}) as ConsoleLogsParams;
@@ -609,6 +603,12 @@ registerAgentOp('console-logs', (params) => {
     total: r.total,
     ringTotal: ring.length,
     byLevel,
+    // The ring is `[pinned boot prefix] ++ [rolling tail]` — once it wraps, that is DISCONTIGUOUS,
+    // and `logs`/`ring` above concatenate the two halves with nothing marking the seam. `dropped`
+    // is how many tail entries were evicted between them; non-zero means an agent reading `logs`
+    // is looking at boot plus a recent window with a real gap in between, not a continuous log. See
+    // `getConsoleRingDropped`'s own doc comment (consoleRing.ts).
+    dropped: getConsoleRingDropped(),
     ...(r.truncated ? { truncated: true, hint: tailHint('console entries', r.items.length, r.total, ', or narrow with level=/since=') } : {}),
   };
 });
@@ -2205,8 +2205,9 @@ export function initAgentBridge(): void {
   const reloadSource = sceneReloadSource({ hasBridge: !!bridge, hasHot: !!hot });
   if (!hot && !bridge) return;
 
-  // Capture console output ASAP so /api/console-logs can surface editor errors
-  // (e.g. failed scene/mesh loads) without a devtools attach.
+  // Belt-and-suspenders: the shared ring is already installed by `installConsoleRing.ts`'s eager
+  // import by the time this runs (#596/#597 Stage 3a) — this call is now a thin shim, kept so
+  // `/api/console-logs` still has something to fall back on if that ever changes.
   installConsoleCapture();
 
   // ── Electron: also serve the main-hosted backend over IPC (ELECTRON_PLAN

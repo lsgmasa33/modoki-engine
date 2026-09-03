@@ -1593,7 +1593,8 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   off-screen, console errors) — run FIRST when something renders wrong. (`app/debug/diagnose.ts`.)
   **`consoleErrors` is windowed, and the window is a VERDICT window, not a reporting one (#152).**
   Only errors inside `errorWindowMs` (5 min) gate `ok` — otherwise one benign load-time error sits
-  in the 500-entry ring and pins `ok:false` forever. But everything older is COUNTED and timestamped
+  in the shared console ring (1000 entries in the editor, 512 on a debug device build) and pins
+  `ok:false` forever. But everything older is COUNTED and timestamped
   in `olderErrors {count, oldestTs, newestTs}`, and the summary names it, because for a while the
   window silently DROPPED them: at 30s, boot errors could never be seen (nobody connects a device,
   attaches an agent and asks a question that fast), and `consoleErrors: []` + `ok:true` + "No issues
@@ -1602,18 +1603,20 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   last `errorWindowMs`". Read the rest with `modoki_get_console_logs level=error`.
 
   **On DEVICE it read the wrong buffer entirely, and the window was never what hid boot errors
-  (#157).** There are two console rings — `bridge.ts`'s `consoleRing` (populated on device by
-  `installDeviceConsoleCapture()`, in `app/debug/deviceConsoleCapture.ts`) and `agentBridge.ts`'s
-  `consoleBuffer` (populated in the editor by its own, identically-shaped `installConsoleCapture()`)
-  — and `diagnose` read the second. That call sits *after* `initAgentBridge()`'s `if (!hot &&
+  (#157).** At the time, there were two console rings — `bridge.ts`'s `consoleRing` (populated on
+  device by `installDeviceConsoleCapture()`, in `app/debug/deviceConsoleCapture.ts`) and
+  `agentBridge.ts`'s `consoleBuffer` (populated in the editor by its own, identically-shaped
+  `installConsoleCapture()` — deleted in #596/#597 Stage 3a, see below) — and `diagnose` read the
+  second. That call sits *after* `initAgentBridge()`'s `if (!hot &&
   !bridge) return;`, and a shipped build has no `import.meta.hot` while a phone has no Electron
   bridge, so on every real device the buffer stayed empty for the life of the process. Measured on a
   Samsung SM-S901U1: the ring held 5 errors including a `[frameDriver]` stall, and `device_diagnose`
   answered `ok:true, consoleErrors:0, "No issues detected."` A clean device diagnose was
   **structurally guaranteed, not observed** — on the one surface CLAUDE.md tells you to run it
   first, because the Android screenshot is black on WebGPU. The writer now publishes its ring
-  through `app/debug/consoleSource.ts` and the reader asks for it, preferring its own buffer
-  whenever `consoleHooked` (so the editor path is unchanged). Deliberately a seam and NOT a second
+  through `app/debug/consoleSource.ts` and the reader asks for it. (The `consoleHooked` flag that
+  used to arbitrate here is gone since #596/#597 — with one shared ring there is no longer a "which
+  buffer" question, and the seam now just carries the device projection.) Deliberately a seam and NOT a second
   `installConsoleCapture()`: hoisting that call would patch `console.*` twice on device and carry a
   second copy of every line, on exactly the low-end hardware whose frame budget is #154. Two things
   fixed alongside it, both required before a device boot error is actually *readable*: the device
@@ -1641,16 +1644,65 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
 
   **The bridge's OWN `[debug-bridge]` chatter is deliberately NOT in this ring**, and that is load-
   bearing rather than tidiness: one line per `device_tap`/`drag`/`pointer`/`press_key`/`type_text`
-  would let ~200 input ops evict the entire 200-entry ring — the tool doing the reading would erase
-  what you came to read. `bridge.ts`'s `_log` therefore goes through `unpatchedLog` (a pristine
+  would let a burst of input ops evict the device ring's whole rolling tail (512 entries, 128
+  pinned, since #596/#597 — a smaller, unpinned 200-entry ring at the time this concern was first
+  written) — the tool doing the reading would erase what you came to read. `bridge.ts`'s `_log`
+  therefore goes through `unpatchedLog` (a pristine
   `console.log` bound before the patch) and reaches logcat/OSLog only; `_err` stays on live
   `console.error` on purpose, so bridge FAILURES do land in the ring. Verified on a Galaxy A23
   (2026-09-03): zero `[debug-bridge]` lines in the ring, app logs all present. ⚠️ This broke once
   already — the #591 eager install inverted the binding order and put the chatter IN the ring, which
   read as success in the first device measurement. `deviceConsoleCaptureInstallOrder.test.ts` pins it.
+
+  **#591 was one of FOUR rings with the same defect. #596/#597 collapsed three of them into one.**
+  The device ring was fixed in isolation; the other three — `agentBridge`'s `consoleBuffer`,
+  `runtime/debug`'s in-game ring, and the editor Console panel's `logBuffer` — each installed "as
+  early as its own module loads", which reads as eager and is not. Measured in the editor
+  (`games/sling`) with three planted `console.warn` probes: the device ring caught `App.tsx` module
+  eval at nav+276 ms and React mount at nav+305 ms; the other three all began at nav+1462 ms. A
+  **~1.16 s blind window**, holding exactly the failed-dynamic-import / scene-boot-throw class each
+  ring exists to catch. `runtime/core/consoleRing.ts` is now the ONE CAPTURE RING these four
+  consumers share; agentBridge, `deviceConsoleCapture` and `runtime/debug` are projections. The
+  panel's ring is still separate — its lazily-built stacks and capture-phase resource-load errors
+  are not modelled by the shared ring — and is editor-only, so it reaches no device (#626).
+  ⚠️ Not the ONLY code touching `console.*` anywhere: `globalErrors.ts`'s Crashlytics mirror and two
+  temporary noise filters (`warnSuppress.ts`, `warnFilter.ts`) wrap `console.error`/`warn` for
+  reasons that have nothing to do with capture and feed none of these rings — see
+  [mcp-response-budget.md](./mcp-response-budget.md)'s console-producer note for the citations.
+
+  ⚠️ **The method matters more than the fix: a missing log is only evidence if something else caught
+  it.** The device ring recording all three probes on the same boot is what turned "the buffer looks
+  short" into a measurement. Without that positive control, an empty ring and a probe that never ran
+  are indistinguishable — the same trap `modoki_capture_viewport` sets for render bugs.
+
+  ⚠️ **A wrong theory worth keeping**, because the code still invites it: #597 argued the in-game ring
+  was "the latest of the three by a wide margin" because `App.tsx:709` reaches it through
+  `lazy(() => import('@modoki/engine/runtime/debug'))`. It is not — it was **tied** with agentBridge's.
+  `editor/rendering/GameView.tsx:16` imports that same barrel **STATICALLY**, so in the editor it was
+  never lazy at all. Two import paths to one module, and only one of them was read.
+
+  Three traps this fix had to route around, each of which passed a test first:
+  - **A shared ring must not be gated more narrowly than any consumer it serves.** Backfilling from
+    the device ring — the obvious design — is INERT in a debug WEB build, where the device gate
+    (`__MODOKI_DEBUG_BUILD__ && isNativePlatform()`) is false while the in-game ring is present. The
+    eager installer carries its own union gate, and `deviceConsoleCaptureInstallOrder.test.ts` pins
+    that it is deliberately NOT byte-identical to the bridge's.
+  - **Never route a synthetic ring entry back through `console.error`.** `globalErrors.ts:490` wraps
+    it for Crashlytics and dedups only on a sole `Error` OBJECT (`:385-389`), so a synthetic STRING
+    files a SECOND issue per uncaught fault — the "two issues per fault" regression measured at
+    `globalErrors.ts:366-377`. `recordConsoleRingEntry()` writes straight in.
+  - **Clear is a per-consumer watermark, never a truncation.** The in-game Console tab's Clear button
+    would otherwise wipe the buffer behind `modoki_get_console_logs`/`diagnose` — on device, the only
+    usable log surface — so a human tidying a screen would destroy the agent's evidence.
+
+  **Sizing: a pinned boot prefix, not just a bigger buffer.** The first 128 entries are never
+  evicted; the rest rolls. No cap survives an error loop, and an error loop is precisely when the
+  boot lines are wanted, so size alone cannot deliver the guarantee. 1000 entries in the editor, 512
+  on a debug device build (matching the 200+300 it replaced).
 - **Console:** `modoki_get_console_logs` returns the **last 50** plus three numbers that do NOT mean the
   same thing: `count` (what came back), `total` (what matched `level=`/`since=`), and
-  `ringTotal`+`byLevel` (the WHOLE 500-entry ring, regardless of the filter). That last part is the
+  `ringTotal`+`byLevel` (the WHOLE ring — 1000 entries in the editor, 512 on a debug device build
+  since #596/#597 — regardless of the filter). That last part is the
   point — a `level:'warn'` read still tells you whether any errors exist. It used to build the
   histogram over the already-filtered array, so "are there errors?" answered *no* (S3.8). Error
   entries carry full stacks, so the whole ring can exceed 20k tokens.

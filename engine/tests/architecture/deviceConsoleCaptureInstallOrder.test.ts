@@ -32,6 +32,7 @@ import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
 const appDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../app');
 const MAIN = path.join(appDir, 'main.tsx');
+const INSTALL_CONSOLE_RING = path.join(appDir, 'installConsoleRing.ts');
 const INSTALL_DEVICE_CONSOLE_CAPTURE = path.join(appDir, 'installDeviceConsoleCapture.ts');
 const BRIDGE = path.join(appDir, 'debug/bridge.ts');
 
@@ -96,6 +97,41 @@ describe('device console capture install order (#591)', () => {
     ).toBe(false);
   });
 
+  // The shared ring (#596/#597 Stage 2) must be imported even EARLIER than the device capture — it
+  // is what actually captures boot now, since the device ring no longer patches console.* itself.
+  it('imports ./installConsoleRing BEFORE ./App.tsx (and no later than ./installDeviceConsoleCapture)', () => {
+    const ring = specs.findIndex((s) => s.includes('installConsoleRing'));
+    const capture = specs.findIndex((s) => s.includes('installDeviceConsoleCapture'));
+    const app = specs.findIndex((s) => s.includes('App.tsx'));
+    expect(ring, 'main.tsx must import ./installConsoleRing').toBeGreaterThanOrEqual(0);
+    expect(
+      ring,
+      `./installConsoleRing must be imported BEFORE ./App.tsx (it is at ${ring}, App.tsx at ${app}) — ` +
+        'imports evaluate in source order, so anything above App.tsx is the only code that runs ' +
+        "before React's mount effects.",
+    ).toBeLessThan(app);
+    expect(
+      ring,
+      `./installConsoleRing must be imported no later than ./installDeviceConsoleCapture (ring at ${ring}, ` +
+        `device capture at ${capture}) — the shared ring must already be wrapping console.* before the ` +
+        'device seam registers its window-error listeners and setConsoleSource projection.',
+    ).toBeLessThanOrEqual(capture);
+  });
+
+  it("does NOT install by calling installConsoleRing( from main.tsx's body", () => {
+    const stripped = stripComments(mainSrc);
+    assertScanIsSane(mainSrc, stripped, 'app/main.tsx');
+    const body = stripped
+      .split('\n')
+      .filter((l) => !/^\s*import\s/.test(l))
+      .join('\n');
+    expect(
+      /\binstallConsoleRing\s*\(/.test(body),
+      'main.tsx must not CALL installConsoleRing() directly — a statement runs after every import, ' +
+        'which is too late. The side-effect import ./installConsoleRing is the install.',
+    ).toBe(false);
+  });
+
   it("installDeviceConsoleCapture.ts's gate is byte-identical (modulo whitespace) to main.tsx's bridge-import gate", () => {
     const installSrc = fs.readFileSync(INSTALL_DEVICE_CONSOLE_CAPTURE, 'utf8');
     const mainGate = extractGate(mainSrc, "import('./debug/bridge')", 'app/main.tsx (bridge-import gate)');
@@ -120,6 +156,40 @@ describe('device console capture install order (#591)', () => {
       .toEqual(['@capacitor/core', './debug/deviceConsoleCapture']);
   });
 
+  // The shared ring's gate is a DELIBERATE SUPERSET of the device capture's — NOT the same
+  // expression, and not forced to match it. Reconciling the two would reintroduce the exact
+  // inert-mechanism bug #596/#597 exists to fix: a debug WEB build (DEBUG_BUILD on, no native
+  // platform) needs the shared ring wrapping console.* even though the device ring never installs
+  // there. So this asserts the WIDER text on its own terms, and separately asserts it differs from
+  // the narrower device/bridge gate — a future edit that "simplifies" them back into one expression
+  // is exactly the regression this second assertion is meant to catch.
+  it("installConsoleRing.ts's gate is the wider union — deliberately NOT equal to the device gate", () => {
+    const ringSrc = fs.readFileSync(INSTALL_CONSOLE_RING, 'utf8');
+    const ringGate = extractGate(ringSrc, 'installConsoleRing(', 'app/installConsoleRing.ts');
+    const deviceGate = extractGate(mainSrc, "import('./debug/bridge')", 'app/main.tsx (bridge-import gate)');
+    expect(
+      ringGate,
+      `app/installConsoleRing.ts's gate must be the documented wider union. Got: "${ringGate}"`,
+    ).toBe('!__MODOKI_PLAYABLE__ && (import.meta.env.DEV || import.meta.env.VITE_DEBUG_BRIDGE || __MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)');
+    expect(
+      ringGate,
+      'installConsoleRing.ts\'s gate must NOT equal the device/bridge gate — it is deliberately WIDER ' +
+        '(adds __MODOKI_EDITOR__ and drops the Capacitor.isNativePlatform() qualifier on ' +
+        '__MODOKI_DEBUG_BUILD__) so the shared ring still installs on a debug WEB build, where the ' +
+        'device ring does not. If a future edit makes these equal, it has silently narrowed the shared ' +
+        "ring's gate back down to the device ring's — the exact inert-mechanism bug this stage fixes.",
+    ).not.toBe(deviceGate);
+  });
+
+  it('installConsoleRing.ts pulls in NOTHING beyond the gate and its two installers', () => {
+    const ringSrc = fs.readFileSync(INSTALL_CONSOLE_RING, 'utf8');
+    // #596/#597 Stage 3a added the second import: `./debug/uncaughtCapture`'s window-error
+    // listeners now register from THIS gate too (not `installDeviceConsoleCapture.ts`'s narrower
+    // one — see the module doc comment), so this list legitimately grew by one.
+    expect(importSpecifiers(ringSrc, 'app/installConsoleRing.ts'))
+      .toEqual(['@modoki/engine/runtime/core/consoleRing', './debug/uncaughtCapture']);
+  });
+
   it('bridge.ts no longer declares its own capture — there can only ever be ONE BRIDGE ring', () => {
     const bridgeSrc = fs.readFileSync(BRIDGE, 'utf8');
     const stripped = stripComments(bridgeSrc);
@@ -127,10 +197,16 @@ describe('device console capture install order (#591)', () => {
     // consoleSource.ts's own "one capture, one copy" rationale (#157): a second capture on device
     // would double-wrap console.* and carry a second copy of every line, on exactly the low-end
     // hardware whose budget is tightest. bridge.ts must READ the shared ring, not build its own.
-    // ⚠️ "ONE ring" is scoped to the BRIDGE deliberately — it is not a claim about the process.
-    // `runtime/debug/consoleCapture.ts` installs a third capture by side effect from
-    // `runtime/debug/index.ts`, and that chunk does load on device in a debug build. Do not cite
-    // this test as evidence the process has a single console ring; it does not.
+    // ⚠️ "ONE ring" is scoped to the BRIDGE deliberately — it is still not a claim about the
+    // process, though it is much closer to one since #596/#597. This comment used to say
+    // `runtime/debug/consoleCapture.ts` installs a THIRD capture by side effect from
+    // `runtime/debug/index.ts` — effectively pre-registering #597, which it turned out to be. That
+    // is fixed: `runtime/core/consoleRing.ts` is now the only thing in the app + runtime that wraps
+    // `console.*`, and agentBridge, deviceConsoleCapture and runtime/debug are all projections of
+    // it. The ONE remaining separate wrapper is `packages/modoki/src/editor/consoleCapture.ts` (the
+    // editor Console panel's `logBuffer`), left out of that change on purpose because its entries
+    // carry lazily-built stacks and it listens in the CAPTURE phase for resource-load errors —
+    // semantics the shared ring does not model. It is editor-only, so it never reaches a device.
     expect(
       /\bcreateConsoleRing\s*\(/.test(stripped),
       'bridge.ts must not call createConsoleRing( itself — the ring now lives in ' +

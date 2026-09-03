@@ -1,0 +1,335 @@
+/** The ONE shared console ring — Stage 1 of #596/#597.
+ *
+ *  Today the app has FOUR independent `console.*` wrappers (this repo's own
+ *  `runtime/debug/consoleCapture.ts`, the device bridge's `deviceConsoleCapture.ts`, and two more
+ *  in the app layer), each installed lazily behind whatever chunk owns it — measured live, three
+ *  of them install ~1.16s into boot and structurally cannot see app bootstrap or React mount
+ *  (probes at nav+276ms and nav+305ms were missed; the first captured line was at nav+1462ms).
+ *  This module replaces all four with ONE ring, installed as early as the app can call it, that
+ *  every consumer will later PROJECT from (its own view, its own clear-via-watermark) rather than
+ *  own its own patch of `console.*`. This file is Stage 1: the ring only. No consumer is touched
+ *  yet — that is a later stage of #596/#597.
+ *
+ *  This is L0 (`runtime/core/`) — it may import nothing from the engine above it. The only import
+ *  it needs is `rawNow` from `./clock`, which is also L0 (an intra-L0 edge, not a reach upward).
+ *
+ *  **Time**: `rawNow()` returns MONOTONIC milliseconds (`performance.now()`), not wall-clock
+ *  epoch — that is correct and intended here, and is why this file needs no
+ *  `ALLOW_WALLCLOCK` entry in the determinism guard (`tests/runtime/determinismGuard.test.ts`):
+ *  it never touches `Date.now()`/`performance.now()` directly. A consumer that wants an epoch
+ *  timestamp computes `performance.timeOrigin + entry.mono` itself, in the app layer — that
+ *  arithmetic does not belong in L0.
+ */
+
+import { rawNow } from './clock';
+
+export type ConsoleRingLevel = 'log' | 'info' | 'warn' | 'error';
+
+export interface ConsoleRingEntry {
+  /** 1-based, strictly increasing, never reused — even across an eviction. */
+  seq: number;
+  /** `rawNow()` at record time — monotonic ms, NOT epoch. */
+  mono: number;
+  level: ConsoleRingLevel;
+  /** Each arg stringified EAGERLY at record time — never a live object reference (it would leak
+   *  and could mutate after the fact). Not joined: a consumer decides how to render multiple
+   *  args. */
+  args: string[];
+}
+
+export interface ConsoleRingOptions {
+  /** Total entries kept: the pinned prefix plus the rolling tail. Default 512. */
+  capacity?: number;
+  /** How many of the EARLIEST entries are pinned and never evicted. Default 128. */
+  bootPrefix?: number;
+}
+
+const DEFAULT_CAPACITY = 512;
+const DEFAULT_BOOT_PREFIX = 128;
+
+/** The load-bearing capture. At MODULE SCOPE, before `installConsoleRing` (or anything else) has
+ *  patched anything, this binds the PRISTINE, pre-patch `console.log`.
+ *
+ *  `engine/app/debug/bridge.ts` (`const _log = unpatchedLog`, ~25 call sites) logs its device-input
+ *  chatter through this so those calls do NOT push into the ring — #591 regressed exactly this:
+ *  its eager install inverted binding order, `bridge.ts` ended up binding the WRAPPER instead of
+ *  the original, and ~200 input ops evicted the entire boot capture out of the ring. Binding this
+ *  at module-evaluation time, before `installConsoleRing()` can ever run, makes that ordering
+ *  mistake structurally impossible to repeat. */
+export const unpatchedLog: (...args: unknown[]) => void = console.log.bind(console);
+
+// ⚠️ THERE IS NO "unpatchedError" BINDING HERE, and that is deliberate — an earlier draft had one,
+// captured the same way as `unpatchedLog` above, with a comment calling it "the pristine, pre-patch
+// console.error". It was not pristine: `engine/app/main.tsx` imports `./installErrorCapture` (which
+// calls `installGlobalErrorHandlers()`, synchronously, at module eval) ABOVE `./installConsoleRing`
+// (which is what first imports and evaluates THIS module) — so by the time a module-scope
+// `console.error.bind(console)` here would run, `globalErrors.ts:490` has ALREADY replaced
+// `console.error` with its Crashlytics-reporting wrapper. Binding "console.error" at that point
+// captures that wrapper, not the real thing — there is no way to reach past it from this module,
+// and reordering the imports is not the fix (`main.tsx:12-15` documents why `installErrorCapture`
+// must stay the inner wrap).
+//
+// That would have been SAFE for re-entrancy — globalErrors' wrapper sits INNER to this ring's own
+// `console.error` patch (installed later, by `installConsoleRing()`), so calling it directly from
+// `notify()`'s catch below could never loop back into `record()` above. But it is not safe for
+// BUDGET: every call through it reaches `captureConsoleError` and spends the session's Crashlytics
+// allowance — for a subscriber throwing during flush, which is this module's OWN bookkeeping
+// failure, not anything the game or a player did. So `notify()`'s catch reports through
+// `unpatchedLog` instead: it is the one binding in this file that genuinely IS pristine (nothing
+// wraps `console.log`, on device or in the editor), which keeps the same re-entrancy guarantee at
+// zero Crashlytics cost — at the price of the line showing as a plain log instead of a red error in
+// devtools/logcat, which is the right trade for a failure nobody outside this file caused.
+
+let capacity = DEFAULT_CAPACITY;
+let bootPrefix = DEFAULT_BOOT_PREFIX;
+
+/** `[pinned boot entries] ++ [rolling tail]`, in seq order. Once the tail is full, appending
+ *  shifts out its own oldest entry — the pinned prefix is never touched. */
+let pinned: ConsoleRingEntry[] = [];
+let tail: ConsoleRingEntry[] = [];
+
+let seq = 0;
+let version = 0;
+let dropped = 0;
+let installed = false;
+let recording = false; // re-entrancy guard: a logged getter/toString must not re-enter record()
+
+const listeners = new Set<() => void>();
+let notifyScheduled = false;
+
+/** The four ORIGINAL console methods, as raw references (not bound — see the comment in
+ *  `installConsoleRing` on why). `installConsoleRing` fills these in; `__resetConsoleRingForTest`
+ *  restores `console[level]` from them. */
+let originals: Record<ConsoleRingLevel, (...args: unknown[]) => void> | null = null;
+
+/** Duplicates `engine/app/debug/bridgeHelpers.ts`'s `safeStringify` semantics on purpose — that
+ *  helper lives in the app layer (L-above L0) and this file cannot import it. Strings pass
+ *  through; an `Error` becomes `"Name: message"`; anything else goes through `JSON.stringify`,
+ *  falling back to `String(v)` on failure (a circular reference, a BigInt, a symbol, …); a plain
+ *  `undefined` argument stringifies to the literal `'undefined'`, matching `String(undefined)`. */
+/** Kept BYTE-IDENTICAL to `engine/app/debug/bridgeHelpers.ts`'s `PENDING_PROMISE_MARKER`. Duplicated
+ *  rather than imported because that helper is in the app layer and this file is L0. */
+const PENDING_PROMISE_MARKER = '[unresolved Promise — did you forget `await`?]';
+
+function isThenable(v: unknown): boolean {
+  return !!v && (typeof v === 'object' || typeof v === 'function')
+    && typeof (v as { then?: unknown }).then === 'function';
+}
+
+function stringifyArg(v: unknown): string {
+  if (typeof v === 'string') return v;
+  if (v === undefined) return 'undefined';
+  // Top-level thenable handled BEFORE the JSON path, exactly as `safeStringify` does. Leaving it to
+  // the replacer would work but return the marker JSON-QUOTED, so the two helpers would disagree on
+  // a string this repo greps for.
+  if (isThenable(v)) return PENDING_PROMISE_MARKER;
+  // ⚠️ THE STACK IS THE POINT, and dropping it is a regression this repo has already paid for
+  // twice. An Error has NO own enumerable properties, so `JSON.stringify(new Error('boom'))` is
+  // `{}` — `console.error(err)` is how half the codebase reports a failure, and a real device boot
+  // error once reached `diagnose` as a literal `{}` (measured on a Samsung, #157). An earlier draft
+  // of THIS file returned `${v.name}: ${v.message}`, which is the same defect wearing a nicer
+  // label: visible but useless, because the stack is what says WHERE. All three captures this file
+  // replaced returned `stack || message`; so does this.
+  if (v instanceof Error) return v.stack || v.message;
+  try {
+    // Handled at BOTH depths, matching `safeStringify`: the branch above catches a top-level Error,
+    // the replacer below catches one NESTED in an object or array. `{cause: err}` and `[err]` are
+    // exactly how a rejection value arrives, and serializing those to `{"cause":{}}` / `[{}]` is
+    // the same defect one level down — a distinction `bridgeHelpers.ts` records learning the hard
+    // way, in its own close-out review.
+    const json = JSON.stringify(v, (_k, val) => (
+      isThenable(val) ? PENDING_PROMISE_MARKER
+        : val instanceof Error ? (val.stack || val.message)
+          : val));
+    // `JSON.stringify` returns `undefined` — not a string — for a function, a symbol, or any value
+    // whose `toJSON` yields undefined. Returning that would put a non-string into
+    // `ConsoleRingEntry.args` despite its `string[]` type, and the first consumer to call
+    // `.slice()`/`.includes()` on it would throw inside a console wrapper.
+    return json === undefined ? String(v) : json;
+  } catch {
+    return String(v);
+  }
+}
+
+function notify(): void {
+  if (notifyScheduled) return;
+  notifyScheduled = true;
+  queueMicrotask(() => {
+    notifyScheduled = false;
+    for (const fn of listeners) {
+      // Per-listener, and never allowed to escape or block the rest — see the module doc comment
+      // above `unpatchedLog` (where `unpatchedError` used to be) for why the report below goes
+      // through `unpatchedLog` and not the live `console.error`.
+      try {
+        fn();
+      } catch (err) {
+        // `unpatchedLog`, not a `console.error` path: this is an internal bookkeeping failure, and
+        // routing it through anything that reaches `globalErrors.ts` would spend a real
+        // Crashlytics issue on it.
+        unpatchedLog('[consoleRing] a subscriber threw during flush', err);
+      }
+    }
+  });
+}
+
+function record(level: ConsoleRingLevel, args: unknown[]): void {
+  if (recording) return; // a logging getter/toString must not re-enter us
+  recording = true;
+  try {
+    const entry: ConsoleRingEntry = {
+      seq: ++seq,
+      mono: rawNow(),
+      level,
+      args: args.map(stringifyArg),
+    };
+    if (pinned.length < bootPrefix) {
+      pinned.push(entry);
+    } else {
+      tail.push(entry);
+      const tailCapacity = Math.max(capacity - bootPrefix, 0);
+      while (tail.length > tailCapacity) {
+        tail.shift();
+        dropped++;
+      }
+    }
+    version++;
+    notify();
+  } finally {
+    recording = false;
+  }
+}
+
+/** Wrap `console.log/info/warn/error`. Idempotent — a second call is a no-op. Each wrapper
+ *  records (never letting capture break logging) and ALWAYS forwards to the original method. */
+export function installConsoleRing(opts?: ConsoleRingOptions): void {
+  if (installed) return;
+  installed = true;
+
+  capacity = opts?.capacity ?? DEFAULT_CAPACITY;
+  // ⚠️ CLAMPED, because `pinned` fills to `bootPrefix` before the tail's capacity is consulted at
+  // all: an unclamped `bootPrefix > capacity` pins every entry and the ring grows WITHOUT BOUND,
+  // turning a memory cap into a leak on the low-end hardware #154 budgets. No production caller
+  // reaches it today (1000/128 and 512/128) — this guards the next one.
+  bootPrefix = Math.min(opts?.bootPrefix ?? DEFAULT_BOOT_PREFIX, capacity);
+
+  // Store the RAW references (not `.bind()`ed) — a bound copy is a distinct function object, so
+  // `__resetConsoleRingForTest` restoring a bound copy instead of the original reference would
+  // leave `console.log` pointing at a fresh wrapper forever, one layer deeper on every
+  // install/reset cycle. Invoke via `.apply(console, …)` below instead, which needs no bind.
+  const levels: ConsoleRingLevel[] = ['log', 'info', 'warn', 'error'];
+  const raw = {} as Record<ConsoleRingLevel, (...args: unknown[]) => void>;
+  for (const level of levels) raw[level] = console[level];
+  originals = raw;
+
+  for (const level of levels) {
+    const original = raw[level];
+    console[level] = (...args: unknown[]) => {
+      try {
+        record(level, args);
+      } catch {
+        /* never let capture break logging */
+      }
+      original.apply(console, args);
+    };
+  }
+}
+
+/** Record a SYNTHETIC entry directly, without routing it through `console.*`.
+ *
+ *  For lines that describe something which never was a `console.*` call — an uncaught `window`
+ *  error, an unhandled rejection — so they still land in the ring alongside real log output.
+ *
+ *  ⚠️ DO NOT "SIMPLIFY" THIS INTO A `console[level](...)` CALL. That looks tidier (one recording
+ *  path instead of two) and it silently reintroduces a defect this repo already measured and fixed:
+ *  `runtime/core/globalErrors.ts:490` wraps `console.error` and reports to Crashlytics, and its
+ *  de-duplication (`:385-389`) only recognises a call whose SOLE argument is an `Error` OBJECT,
+ *  keyed in a WeakSet. A synthetic STRING cannot match it, so routing an already-reported uncaught
+ *  error back through `console.error` files a SECOND Crashlytics issue for the same fault — the
+ *  "two issues per fault" symptom documented at `globalErrors.ts:366-377` (measured on a Galaxy
+ *  S22, 2026-08-20). Writing straight into the ring keeps the diagnostic line and reports nothing. */
+export function recordConsoleRingEntry(level: ConsoleRingLevel, args: unknown[]): void {
+  record(level, args);
+}
+
+/** Entries with `seq > sinceSeq` (all of them when omitted), pinned prefix then rolling tail, in
+ *  seq order. Backs a per-consumer clear-via-watermark design: a consumer "clears" by advancing
+ *  its own remembered `sinceSeq`, never by truncating this shared buffer. */
+export function getConsoleRingEntries(sinceSeq?: number): ConsoleRingEntry[] {
+  // ⚠️ ALWAYS a fresh array, never `pinned`/`tail` themselves. Four consumers now read this one
+  // buffer, so handing any of them a live internal reference would let a stray `.reverse()`,
+  // `.sort()` or `.push()` in one of them silently corrupt what every other consumer — and
+  // `/api/console-logs` — sees. The `sinceSeq` branch already copied via `.filter()`; the
+  // no-argument branch used to return the internal array directly, which was the inconsistent half.
+  const all = [...pinned, ...tail];
+  if (sinceSeq === undefined) return all;
+  return all.filter((e) => e.seq > sinceSeq);
+}
+
+/** Monotonic — bumps synchronously on every record. Use as a `useSyncExternalStore` snapshot. */
+export function getConsoleRingVersion(): number {
+  return version;
+}
+
+/** How many rolling-tail entries have been evicted so far — lets a reader render a gap marker
+ *  between the pinned boot prefix and the surviving tail.
+ *
+ *  ⚠️ THIS IS THE DISCLOSURE THAT MATTERS, and until #596/#597 close-out review nothing in
+ *  production called it. Once the ring wraps, `[pinned] ++ [tail]` is DISCONTIGUOUS — an editor at
+ *  `capacity:1000, bootPrefix:128` that logs 5000 lines holds entries 1-128 then 4129-5000, and
+ *  every reader that just concatenates the two halves presents that as one continuous log. An agent
+ *  reading it would conclude the app logged nothing between boot and whatever produced the flood.
+ *  `console-logs`'s agent op (`agentBridge.ts`), `handleConsoleLogs` (device path, `bridge.ts`) and
+ *  `ConsoleTab.tsx` all now surface this value so a non-zero read is visible, not silently implied
+ *  contiguous. */
+export function getConsoleRingDropped(): number {
+  return dropped;
+}
+
+/** How many of the pinned boot-prefix entries exist right now — climbs from 0 up to `bootPrefix` as
+ *  boot proceeds, then holds there for the rest of the session (pinned entries are never evicted).
+ *  Since `pinned` is always the ring's very first N records, contiguous by construction, an entry's
+ *  `seq` is in the pinned prefix iff `seq <= getConsoleRingBootPrefixCount()`. This is the minimal
+ *  accessor a reader needs to draw the boundary `getConsoleRingDropped()` warns about — e.g.
+ *  `ConsoleTab.tsx` renders a separator exactly where an entry's `seq` crosses it. */
+export function getConsoleRingBootPrefixCount(): number {
+  return pinned.length;
+}
+
+/** `fn` runs on a `queueMicrotask`, never synchronously from inside a `console.*` call — a
+ *  synchronous notify from a warn/error raised during render would be a setState-during-render
+ *  from the caller's perspective (see `runtime/debug/consoleCapture.ts`'s `bump()` doc comment for
+ *  the measured incident this mirrors), and is pinned by
+ *  `engine/tests/ui/debugErrorToaster.test.tsx:84`'s sibling ring. `version` still bumps
+ *  immediately, so a snapshot taken right after a log call is already correct even before the
+ *  microtask runs. */
+export function subscribeConsoleRing(fn: () => void): () => void {
+  listeners.add(fn);
+  return () => {
+    listeners.delete(fn);
+  };
+}
+
+export function isConsoleRingInstalled(): boolean {
+  return installed;
+}
+
+/** Test-only: restore the real console methods, clear the buffer, and reset every counter. */
+export function __resetConsoleRingForTest(): void {
+  if (originals) {
+    for (const level of Object.keys(originals) as ConsoleRingLevel[]) {
+      console[level] = originals[level];
+    }
+  }
+  originals = null;
+  installed = false;
+  recording = false;
+  notifyScheduled = false;
+  pinned = [];
+  tail = [];
+  seq = 0;
+  version = 0;
+  dropped = 0;
+  capacity = DEFAULT_CAPACITY;
+  bootPrefix = DEFAULT_BOOT_PREFIX;
+  listeners.clear();
+}

@@ -296,7 +296,7 @@ never in the producer. The ceilings below are **measured** (bytes/entry × ring 
 
 | Tool | Producer (untouched) | Seam | Boundary default | Measured ceiling |
 |---|---|---|---|---|
-| `get_console_logs` | `dumpConsoleLogs` over the 500-entry `consoleBuffer` (`agentBridge.ts:153`) — `diagnose` reads it directly | `console-logs` op | last 50 + `count`/`total`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry → **20–27k tok** |
+| `get_console_logs` | `dumpConsoleLogs` projecting the shared `runtime/core/consoleRing.ts` (1000 entries in the editor, 512 on a debug device build) — `diagnose` reads it directly | `console-logs` op | last 50 + `count`/`total`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry *(stale — see caveat below)* → **40–54k tok** (editor) |
 | `watch` (`read`) | `readWatch()` — `WatchTab.tsx:89` renders `samples` | `watch-read` op | stats-only; `samples:true` opts in | 39.8 B/sample × 512 series × 600–5000 → **3.1M–25.8M tok** |
 | `journal` | `journalEvents()` — cap `10_000` (`journal.ts:58`) — `JournalTab` reads it | `journal-events` op | last 100 + `byType` | 102–226 B/ev → **257k–582k tok** |
 | `editor_journal` | `readEditorJournal()` — cap `2000` (`editorJournal.ts:36`) | `editor-journal` op | last 100 + `byType`; `merged` tails `game` + `timeline` too | 130–253 B/ev → **54k–126k tok** |
@@ -308,16 +308,47 @@ input — it is an in-process consumer *of the op itself*. Summarizing there wou
 so the router is the agent's boundary and the op stays an internal service.
 
 The buffer caps are: `journal` `MAX_EVENTS = 10_000` (`journal.ts:58`), `editor_journal` `2000`
-(`editorJournal.ts:36`), the agent console ring `CONSOLE_BUFFER_MAX = 500` (`agentBridge.ts:153`),
+(`editorJournal.ts:36`), the shared console ring 1000 in the editor / 512 on a debug device build
+(`installConsoleRing.ts`; `agentBridge.ts`'s old `CONSOLE_BUFFER_MAX = 500` no longer exists),
 `watch` `maxSamples` default `600` per (entity,field) series × `DEFAULT_MAX_SERIES = 512`
 (`watch.ts:191`, `:55`). Bounded, yes — but a `watch` on `Transform` across a populated scene has a
 ceiling in the millions of tokens, which is exactly why the boundary defaults to stats-only.
 
-Note on the console producer: the real backing store is `dumpConsoleLogs` over `agentBridge.ts`'s
-500-entry `consoleBuffer`. Two *other* console buffers — the native game-debug TCP bridge
-(`bridge.ts`, cap 200) and the editor Debug Menu's `ConsoleTab` capture (`consoleCapture.ts`, cap
-300) — do NOT back `/api/console-logs`; the 500-entry ring is why the measured ceiling is ~20–27k
-tokens, not the ~8–12k a 200/300 cap would imply.
+Note on the console producer, **rewritten by #596/#597** — the old note described three separate
+console buffers (agentBridge's 500, the TCP bridge's 200, the debug menu's 300) and said only the
+first backed `/api/console-logs`. There are no longer three. `runtime/core/consoleRing.ts` is the
+ONE CAPTURE RING for app + runtime — not the only code anywhere that touches `console.*` (see the
+caveat two paragraphs down), but the only thing any agent-facing reader draws from: agentBridge,
+`deviceConsoleCapture` and `runtime/debug` are all projections of it, so `get_console_logs`,
+`device_console_logs`, `diagnose` and the in-game Console tab now read the same entries. (The editor
+Console panel's `logBuffer`, cap 1000, is still its own wrapper — editor-only, and it backs no agent
+surface; #626.)
+
+⚠️ **Three OTHER `console.*` wrappers exist, permanently or temporarily, for reasons unrelated to
+agent tooling — naming them so a future `grep`-for-`console.warn =` isn't surprised.**
+`runtime/core/globalErrors.ts:490,496` wraps `console.error`/`console.warn` PERMANENTLY to mirror
+both to Crashlytics. `runtime/core/warnSuppress.ts:25` and `editor/scene/warnFilter.ts:32` each wrap
+`console.warn` TEMPORARILY — ref-counted around a Rapier init call, and scoped to one
+`renderer.render` call, respectively — to swallow one specific known-noisy line (a Rapier
+deprecation warning; Three.js r183 WebGPU's `'Light node not found'`) for the duration of that one
+call. None of the three is a capture ring, none feeds `runtime/core/consoleRing.ts`, and no agent
+surface reads any of them — they exist entirely outside the "one ring" story above.
+
+⚠️ **~162 B/entry was measured before two later changes and is no longer reliable in either
+direction — treat the 40–54k-token line above as an order-of-magnitude ceiling, not a precise
+figure.** What IS still known: the cap is **1000** entries in the editor / 512 on a debug device
+build, read from `installConsoleRing.ts`'s source rather than re-measured live, and the first 128 of
+those are a pinned boot prefix eviction never touches (a device debug build's 512 matches the 200+300
+it replaced). What is NOT re-measured is bytes/entry, and it now pulls in both directions from where
+~162 B/entry was taken: the ring captures `console.info` for the first time (entries the old
+three-level buffers never saw at all, typically short one-liners — pulling the average DOWN), while a
+separate fix restores full `Error.stack` traces to `console.error(err)` entries (flattened to `{}` in
+between, now large again, as they were before that regression — pulling the average UP). Neither
+effect has been re-measured against the current ring, so the honest statement is: cap and pinned
+prefix are measured facts from source, ~162 B/entry is a stale measurement, and 40–54k tokens is a
+derivation from a figure now known to be wrong in an unknown direction. The one thing unaffected: the
+*default* response is still the last 50 entries, so this ceiling only matters for an explicit large
+`limit`, not routine reads.
 
 ## Fixed bugs (historical, for context)
 

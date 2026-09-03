@@ -14,13 +14,22 @@ import './index.css'
 // console.warn", so it takes the inner position and the device ring wraps outside it. #591 briefly
 // had these the other way round, which inverted a nesting the engine documents as intentional.
 import './installErrorCapture'
+// The ONE shared console ring (#596/#597 Stage 2) — a SIDE-EFFECT import, and it must stay ABOVE
+// both `./installDeviceConsoleCapture` and `./App.tsx` for the same reason `./installErrorCapture`
+// does: imports evaluate before any statement below runs, so THIS is what actually captures boot —
+// a mount-time `console.info`/`.warn`/`.error` — now that the ring below no longer patches
+// `console.*` itself and only projects this one. Its gate is deliberately WIDER than the device
+// capture's below (see ./installConsoleRing.ts for why), so it is active in every build where any
+// console consumer needs it, not just where the device bridge does.
+import './installConsoleRing'
 // Device console capture (#591). A SIDE-EFFECT import, and it must stay ABOVE `./App.tsx` for the
 // same reason the one above does: imports evaluate before any statement below runs, so this is what
-// captures React's mount effects — the case #591 filed. A call in this file's own body would be too
-// late (it runs after every import), and the debug bridge's own dynamic import below is later still
-// and RACY — the same build captured a mount-time log on one device and not another depending on how
-// fast that chunk happened to load. It does NOT reach a module-eval log inside App.tsx's graph
-// (chunking reorders that; device-measured). See ./installDeviceConsoleCapture.ts.
+// registers the #157 `consoleSource` seam and the uncaught-error/rejection listeners before React's
+// mount effects run. A call in this file's own body would be too late (it runs after every import),
+// and the debug bridge's own dynamic import below is later still and RACY — the same build captured
+// a mount-time log on one device and not another depending on how fast that chunk happened to load.
+// It does NOT reach a module-eval log inside App.tsx's graph (chunking reorders that;
+// device-measured). See ./installDeviceConsoleCapture.ts.
 import './installDeviceConsoleCapture'
 import App from './App.tsx'
 import { Capacitor } from '@capacitor/core'
