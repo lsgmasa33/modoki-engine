@@ -429,6 +429,77 @@ so it could not print unless a purchase was already in flight — a probe that c
 own positive case. Register after construction instead; `ensureWebViewListener()` does it at park
 time, which is both provably late enough and exactly when the listener acquires a job.
 
+✅ **The park-and-release itself is now device-verified — #586's last open gap.** Every earlier
+check proved a LINK (`load()` runs, the listener registers, `onPageStarted` fires after a reload);
+none had ever parked a real purchase. Measured end-to-end on the Galaxy A23 (SC-56C), 2026-09-03,
+against the real Play store, one process throughout:
+
+```
+09:41:12.312  launchBillingFlow: product=court.coins.300 type=inapp        <- slot parked
+09:42:33.675  onPageStarted: webview reloaded with a purchase parked
+              (court.coins.300) - releasing it                            <- the fix fires
+09:44:08.970  onPurchasesUpdated: code=1 count=null parkedCall=false       <- field already cleared
+09:45:08.035  launchBillingFlow: product=court.coins.300 type=inapp        <- 2nd purchase LAUNCHES
+```
+
+`parkedCall=false` on the cancel is the load-bearing line: it is emitted by a different code path
+from the release itself, so it confirms the FIELD was cleared rather than merely that a log ran. The
+second `launchBillingFlow` is the user-visible half — it got past the `if (awaitingPurchase != null)
+reject(...)` guard that used to strand every later purchase. Zero occurrences of
+`a purchase is already in progress` across the run. The reload was forced through the debug bridge,
+so this measures the MECHANISM; which production events reach it is a separate question, below.
+
+⚠️ **No background edge fires while a Play billing sheet is up — so the resume-reload trigger (#574)
+never even starts, and `court.purchase` is not what stops it.** This is the opposite of what it looks
+like, and an earlier version of this section had it wrong. Capacitor's `BridgeActivity.onStop()` is
+the only caller of `fireStatusChange(false)`; `onPause` is not. Play Billing's `ProxyBillingActivity`
+is **translucent**, so the host activity pauses and never stops. Measured consequences on the A23:
+the game-debug bridge stayed up throughout the sheet (a real HOME press logs `GameDebug: Server
+stopped`; the sheet does not), and `document.visibilityState` stayed `"visible"`. `useResumeReload`
+drives `onBackground()` from exactly those two signals, so `backgroundedAt` stays `null` and
+`resumeReload.ts`'s `if (at == null) return;` bails **before any blocker predicate is consulted**.
+
+Two things follow, and both matter more than the reload:
+- **`court.purchase` is NOT dead code** — do not "fix" or delete it on the strength of never seeing
+  it decline. It arms correctly for a genuine HOME press mid-purchase, which does reach `onStop`.
+  Its predicate reads `storeInFlight` (see `beginStorePurchase` in `games/court/runtime/systems.ts`;
+  cleared in that function's `finally` when the generation still matches, and wholesale by
+  `resetStoreUi`).
+- **PlayerPrefs are not flushed while a purchase sheet is open.** `App.tsx`'s background flush is
+  `appStateChange` -> `if (!isActive) flush()`, with `visibilitychange`/`pagehide` as the WEB
+  fallback only. Neither fires here, so pending writes stay unflushed for the whole sheet — an OS
+  kill mid-purchase loses them. Tracked separately; not fixed by #586.
+
+⚠️ **What makes Play Billing serve a sideloaded build is NOT the versionCode and NOT the signing.**
+Four arms on the A23, 2026-09-03, all returning `queryProductDetails(inapp): code=0 found=6
+remaining=0` — release-signed at versionCode 1; release-signed at 6050; debug-signed at 1; and
+debug-signed at the auto-derived 6067 on a FRESH install after a full uninstall. So a low versionCode
+buys nothing (a pin was briefly committed on that false inference and reverted the same day), and
+neither does release signing.
+
+The precondition that DOES hold — confirmed the same day by the human reading the sheet — is a
+**Play licence-tester account on a published app**: Court has been on internal testing since #370,
+and the sheet showed the real price against a licensed test account (a free test purchase). That is
+the documented Google condition, and it explains why the four arms are indistinguishable: a licence
+tester is served the catalogue for ANY locally installed build of a published package. ⚠️ The
+actionable form: **a machine whose Google account is not a licence tester cannot test IAP locally**,
+however it builds or signs. Preconditions live in [iap.md](iap.md).
+
+⚠️ The older claim that a **debug-signed** APK "genuinely cannot match the Play Console listing"
+(asserted in `a19f2be8d`'s commit message) is disproven by arm three — that observation is much
+better explained by the missing `@PluginMethod` on `products()` described below, which made every
+call fail on Android regardless of how the APK was signed.
+
+⚠️ **What was verified is the CATALOGUE and the sheet launching, not a completed purchase.** Both
+runs were cancelled deliberately, so nothing here shows a purchase completing, being acknowledged,
+or being attributed — the steps where Play's checks are strictest. Do not read "IAP works on a local
+build" as broader than `queryProductDetails` + `launchBillingFlow`.
+
+⚠️ **The debug bridge survives a billing sheet but not a real background** (same measurements). Handy:
+`device_eval` can force `location.reload()` at the exact moment a call is parked, which is how the run
+above was driven. The trap: a `visibilitychange` handler is the WRONG way to detect the sheet and
+never fires — one was armed as a fallback for that run and would have been a silent no-op.
+
 ⚠️ **`products()` was unreachable on Android from the plugin's first commit — a missing
 `@PluginMethod`.** The method existed and compiled; without the annotation `PluginHandle` never
 indexes it, so every call failed with `"ModokiIap.products() is not implemented on android"`. Court's

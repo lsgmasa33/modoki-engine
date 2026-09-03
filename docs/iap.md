@@ -463,10 +463,24 @@ someone re-attaches it and unknowingly tests against a stale product list.
 
 ### Android — every device iteration costs a Play upload
 
-- **A sideloaded build CAN bill** — measured, against an earlier claim here that it could not. The
-  A23 that ran every purchase and the force-quit recovery reports `installer=null` and carries no
-  `DEBUGGABLE` flag: a sideloaded, release-signed APK Play never installed. (The account/device had
-  been licensed by an earlier Play install, which is the part that matters.)
+- **A sideloaded build CAN bill, and neither the signing nor the `versionCode` is what allows it.**
+  Four arms on the A23, 2026-09-03, every one returning `queryProductDetails(inapp): code=0 found=6
+  remaining=0` — release-signed at versionCode 1; release-signed at 6050; **debug-signed** at 1; and
+  debug-signed at the auto-derived 6067 on a FRESH install after a full uninstall. So the earlier
+  wording here ("a sideloaded, **release-signed** APK") was narrower than the truth, and the claim in
+  `a19f2be8d`'s commit message that a debug-signed APK "genuinely cannot match the Play Console
+  listing" is wrong — that symptom is explained by the missing `@PluginMethod` on `products()`, which
+  failed every Android call however the APK was signed.
+- ⚠️ **The precondition that DOES gate it is a Play LICENCE-TESTER account on a published app.**
+  Court is on internal testing (#370), and the human confirmed the sheet shows the real price against
+  a licensed test account — a free test purchase. That is the documented Google condition, and it is
+  why the four arms are indistinguishable: a licence tester is served the catalogue for ANY locally
+  installed build of a published package. **A machine whose Google account is not a licence tester
+  cannot test IAP locally, however it builds or signs** — budget a Play upload there, not here.
+- ⚠️ **Catalogue and sheet-launch are not a completed purchase.** The runs above were cancelled on
+  purpose, so nothing measured here covers a purchase completing, being acknowledged, or being
+  attributed — where Play's checks are strictest. Do not generalise "IAP works on a local build"
+  past `queryProductDetails` + `launchBillingFlow`.
 - What blocks the loop is narrower: `adb install` of a **debug** APK over a **release-signed** one
   fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`. Build release-signed, or uninstall first — and
   uninstalling destroys the on-device ledger, which is usually the state under test. A `versionCode`
