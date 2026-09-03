@@ -46,6 +46,9 @@ describe('UI traits', () => {
       expect(schema.textStrokeWidth).toBe(0);
       expect(schema.textOverflow).toBe('clip');
       expect(schema.maxLines).toBe(0);
+      // Shrink-only auto-fit (#614) — off by default, no explicit floor by default.
+      expect(schema.autoFitText).toBe(false);
+      expect(schema.fontSizeMin).toBe(0);
     });
 
     it('has image fields (from UIContent)', async () => {

@@ -18,6 +18,7 @@ const Canvas2DMount = __MODOKI_MODULE_RENDER2D__
 const UIVideoMount = __MODOKI_MODULE_VIDEO__
   ? lazy(() => import('../video/UIVideoMount').then((m) => ({ default: m.UIVideoMount })))
   : null;
+import { fitFontSizePx, refineFontSizePx, resolveMinPx, MAX_FIT_PASSES, FIT_EPSILON_PX } from './autoFitText';
 import { resolveDomImageUrl, resolveSprite } from '../core/textureRefs';
 import { isGuid } from '../core/assetRefRules';
 import { onWorldSwap } from '../core/ecs/world';
@@ -79,6 +80,251 @@ const AnimatedText = React.memo(function AnimatedText(
   // so it is correct for every unit and needs no resolution step at all.
   if (amp) (style as Record<string, string>)['--ui-amp'] = `${amp}em`;
   return <span {...{ [UI_PAINT_ATTR]: 'text' }} style={style}>{text}</span>;
+});
+
+/** Content-box width of `elem` at sub-pixel precision: the border-box rect minus padding and
+ *  border, read the SAME way `fit()` measures the span so the two sides of every fit comparison
+ *  can't disagree over rounding. `clientWidth` (used here before #614's fix) rounds to an integer
+ *  px, which is a smaller version of the same under-report class that hid the flex-stretch bug
+ *  below — so both the fit and its ResizeObserver's unchanged-width guard go through this helper. */
+function contentWidthOf(elem: Element): number {
+  const s = getComputedStyle(elem);
+  return elem.getBoundingClientRect().width
+    - parseFloat(s.paddingLeft || '0') - parseFloat(s.paddingRight || '0')
+    - parseFloat(s.borderLeftWidth || '0') - parseFloat(s.borderRightWidth || '0');
+}
+
+/** Shrink-only auto-fit (#614, `UIElement.autoFitText`) — reduces the rendered font size, never
+ *  past the authored `fontSize`, until the text fits its box on one line, down to `fontSizeMin`.
+ *  Same `React.memo`-on-primitives reason as `AnimatedText` above: the game UI re-renders every
+ *  frame, and an un-memoized layout read here would force a reflow per frame. Memoized on
+ *  `fontSize`/`fontSizeMin`/`text`/`children` (React.memo shallow-compares every prop, so
+ *  `children`'s identity still matters here even though `fit()` itself never keys off it — see
+ *  `text` below), so a per-frame re-render that changes none of these bails out before `fit()`
+ *  is even considered.
+ *
+ *  `fit()` re-runs on: a `fontSize`/`fontSizeMin`/`text` prop change (its own `useCallback`
+ *  deps); the parent's box actually resizing (`ResizeObserver`, guarded against the write
+ *  `fit()` itself makes re-firing the same callback); a WINDOW resize with no parent px-width
+ *  change (a `vh`-authored `fontSize` moves with the viewport even when the parent doesn't,
+ *  coalesced through `requestAnimationFrame` so a drag-resize doesn't re-fit per event); and the
+ *  first `document.fonts.ready` landing after mount (metrics before the real webfont arrives are
+ *  wrong). `text` is a FIT-INVALIDATION KEY ONLY, never rendered — `children` is what renders,
+ *  and its identity is UNSTABLE on the animated path (`AnimatedText`'s own per-frame-stable memo
+ *  intentionally lets a new element through only when the animation itself changes, not on every
+ *  frame, but never so reliably that it belongs in a measurement dependency list) — so `text` is
+ *  threaded down separately as the plain string `children` was built from. Without it in `fit`'s
+ *  deps, a `{storeField}` template or a localised string re-rendering with new text never
+ *  re-measures: the font size (and `nowrap`) stay pinned to whatever the FIRST string fit.
+ *
+ *  The actual shrink DECISION is `autoFitText.ts`'s `fitFontSizePx`/`refineFontSizePx` (pure,
+ *  unit-tested); this component is only the DOM measurement + re-fit scheduling around it.
+ *
+ *  ⚠️ INVARIANT: auto-fit may only ever change the rendering when it is ACTIVELY SHRINKING — it
+ *  shrank the font AND the shrunk size measured back as fitting. Every other outcome (already
+ *  fits at the authored size, an unmeasurable/inert reading, or floored short of a fit) renders
+ *  IDENTICALLY to `autoFitText: false` — see the `whiteSpace` write at the end of `fit()`. That
+ *  is what makes a bad/contaminated measurement SAFE: the worst a wrong answer can do is fail to
+ *  shrink, never make the box worse than the feature being off would have. */
+const AutoFitText = React.memo(function AutoFitText(
+  { children, text, fontSize, fontSizeMin }:
+  { children: React.ReactNode; text: string; fontSize: number; fontSizeMin: number },
+) {
+  const ref = React.useRef<HTMLSpanElement | null>(null);
+  // The `availablePx` the last COMPLETED fit() was computed at — set at the end of every fit()
+  // that actually measured (never on the early `!el || !parent` return). The ResizeObserver
+  // callback below compares against this to tell a real parent resize from its own write re-firing
+  // the observer.
+  const lastFitAvailablePxRef = React.useRef<number | null>(null);
+
+  const fit = React.useCallback(() => {
+    const el = ref.current;
+    const parent = el?.parentElement;
+    if (!el || !parent) return;
+    // ⚠️ ORDERING IS LOAD-BEARING — measured BEFORE this function writes anything to the span's
+    // style, in particular before the `width: max-content` scaffold below. `UIElement.width`
+    // defaults to 0 (auto), so a content-sized parent is the DEFAULT case, not an exotic one —
+    // and that scaffold, which exists to unstretch THIS span from a flex-stretch parent (see the
+    // comment on it below), also inflates a content-sized PARENT to the text's own natural width
+    // one level up. Read `availablePx` after the scaffold and it converges on `naturalPx` by
+    // construction — "it fits" every time — which is the identical contaminated-measurement bug
+    // the scaffold itself exists to close, just recreated one level up. Reading it here, against
+    // the parent's box as authored before this component has touched anything, is the only
+    // measurement that isn't self-referential.
+    const availablePx = contentWidthOf(parent);
+    // Clear a previous shrink AND a previous floor-wrap before measuring — otherwise a re-fit
+    // (e.g. on resize) measures the already-shrunk/already-wrapped box, not the text's natural
+    // single-line width at the authored size.
+    el.style.fontSize = '';
+    el.style.whiteSpace = 'nowrap';
+    // ⚠️ `UIElement` authors `display: flex` (+ `alignItems`) on EVERY node, so this span's own
+    // `display: inline-block` is virtually always a FLEX ITEM of its parent, never a normal inline
+    // box. A flex item's `inline-block` is *blockified* to `block`, and the default `align-items:
+    // stretch` then stretches it to the parent's cross size — so WITHOUT this line,
+    // `getBoundingClientRect().width` reads the parent's AVAILABLE width, not the span's natural
+    // content width. Measured live on a `games/text_demo` fixture (42px "UI TEXT ANIMATION" in a
+    // 40%-wide box): the rect read 319.59px (== the parent's content width) instead of the real
+    // 446.93px, so `naturalPx === availablePx` on every call, the pure fit function always
+    // concluded "it fits", and the span was left `white-space: nowrap` — one line overflowing its
+    // box, strictly worse than the wrap it replaced. An explicit `width` overrides `stretch` (a
+    // sized flex item is not stretched), so `max-content` here forces the rect back to the span's
+    // true natural width regardless of flex context. It is a measurement scaffold ONLY — it stays
+    // set across every re-measurement below (the refine loop re-applies a smaller font size and
+    // re-reads the same unstretched rect) and is cleared once, after the LAST measurement, before
+    // the fitted font size is written, so it never reaches paint (this whole function runs inside
+    // `useLayoutEffect`, before the browser paints).
+    el.style.width = 'max-content';
+    const authoredPx = parseFloat(getComputedStyle(el).fontSize);
+    // `scrollWidth` is rounded to an integer px, which can under-report a natural width like
+    // 100.6px as 100 — combined with the pure function's 0.5px FIT_EPSILON_PX that lets a
+    // genuinely-overflowing label read as fitting. `el` is `inline-block; white-space: nowrap;
+    // width: max-content` (unstretched by the flex parent), so its border-box rect width IS the
+    // natural single-line width, at sub-pixel precision.
+    const naturalPx = el.getBoundingClientRect().width;
+    // `availablePx` was already captured above, via `contentWidthOf` (not the rounded
+    // `clientWidth`) — same sub-pixel precision as `naturalPx` here, so both sides of the fit
+    // comparison agree to the same precision, and BEFORE the max-content scaffold, so it can't
+    // be contaminated by it (see the comment at the top of this function).
+    const minPx = resolveMinPx(authoredPx, fontSize, fontSizeMin);
+    const first = fitFontSizePx({ authoredPx, naturalPx, availablePx, minPx });
+
+    // `first` is only a PROPORTIONAL ESTIMATE — exact when width(fontSize) passes through the
+    // origin, an OVER-estimate whenever a size-independent term exists (px `letterSpacing`, px
+    // word-spacing, a text-stroke, a px-padded inline child). Measured live on `games/text_demo`'s
+    // "UI TEXT ANIMATION" (3px letterSpacing, a 319.59px box): the proportional model predicted
+    // 30.03px would fit, but 30.03px still measures 336.06px wide — 17px of overflow the pure
+    // function could not see, because it never re-measures its own answer. So the estimate is
+    // only ever a STARTING point here: re-measure at the candidate size and refine
+    // (`refineFontSizePx`), up to `MAX_FIT_PASSES` times, converging to ~28.4px for that case —
+    // and take the fit/overflow decision (`fits` below) from what was actually MEASURED at the
+    // final size, never from `first`'s own predicted `fits`/`fontSizePx`. A future "optimisation"
+    // that deletes this loop and trusts `fitFontSizePx` alone reintroduces exactly this bug.
+    //
+    // Cost: `fit()` runs on mount / prop change / parent resize / `fonts.ready` — never per frame
+    // — so up to `MAX_FIT_PASSES` + 1 extra layout reads here (the loop, plus the one final
+    // re-measurement below) is not a hot path.
+    let fits: boolean;
+    if (first.shrunk) {
+      let candidatePx = first.fontSizePx;
+      for (let pass = 0; pass < MAX_FIT_PASSES; pass++) {
+        el.style.fontSize = `${candidatePx}px`;
+        const measuredPx = el.getBoundingClientRect().width;
+        const refined = refineFontSizePx({ currentPx: candidatePx, measuredPx, availablePx, minPx });
+        candidatePx = refined.nextPx;
+        if (refined.done) break;
+      }
+      // Commit the loop's final decision AND take one more measurement AT it — the loop's last
+      // reading was taken at the size fed INTO the last `refineFontSizePx` call, which the
+      // "shrink-only, stop on no more progress" branch can return a smaller `nextPx` than (see
+      // that function's header). Reusing the stale reading here reintroduces the exact bug this
+      // loop exists to close: a real case measured 342.14px (overflowing 340px) on the pass that
+      // decided "no more progress" and committed 31.95px — but 31.95px itself actually measures
+      // ~340.4px, WITHIN tolerance. Trusting the stale 342.14 wrongly declared `fits: false` and
+      // wrapped a label that, at the size actually left on screen, did not need to.
+      el.style.fontSize = `${candidatePx}px`;
+      const finalMeasuredPx = el.getBoundingClientRect().width;
+      // MEASURED, not predicted — trusting `fitFontSizePx`'s own `fits` here is exactly what
+      // produced the #614 follow-up overflow: it believed the proportional model's answer instead
+      // of asking the DOM what actually rendered.
+      fits = finalMeasuredPx <= availablePx + FIT_EPSILON_PX;
+    } else {
+      // Common case: already fits at the authored size. One measurement, no loop, no write.
+      // `first.fits` is always `true` on this branch — including the "nothing was measurable"
+      // guard in `fitFontSizePx` (a garbage/detached measurement) — so this is also what keeps a
+      // bad reading from tripping the floor-wrap fallback below: re-deriving `fits` from
+      // `naturalPx` here would re-introduce a guess exactly where `fitFontSizePx` refused one.
+      el.style.fontSize = '';
+      fits = first.fits;
+    }
+    el.style.width = '';
+    // `nowrap` ONLY when auto-fit actively did something AND that something measured as fitting
+    // — `first.shrunk && fits`. Every other outcome (already fit at the authored size, an
+    // unmeasurable/inert `first.fits`, or floored short of a fit) ends at `pre-wrap`, the SAME
+    // rendering `autoFitText: false` gets — hand off to the existing wrap/textOverflow behaviour
+    // instead of leaving one nowrap line hanging past its box. This is the invariant from the
+    // component docblock: a bad or contaminated measurement can only ever cost a missed shrink,
+    // never a worse box than the feature being off. Auto-fit is the shrink-FIRST step, never a
+    // replacement for the wrap/textOverflow fallback.
+    el.style.whiteSpace = (first.shrunk && fits) ? 'nowrap' : 'pre-wrap';
+    lastFitAvailablePxRef.current = availablePx;
+  }, [fontSize, fontSizeMin, text]);
+
+  React.useLayoutEffect(() => {
+    let alive = true;
+    fit();
+    const parent = ref.current?.parentElement;
+    // The text's available width tracks its parent box, which can change on resize/orientation
+    // without `fontSize`/`fontSizeMin` themselves changing — a ResizeObserver is the only one of
+    // the three triggers that is not already a React prop change. Guard its existence like
+    // `safeArea.ts` does — an older WebView may not implement it.
+    const ro = parent && typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => {
+      if (!alive) return;
+      // fit() writes el.style.fontSize, which can resize this observed PARENT and re-fire this
+      // very callback. Skip a re-entrant fire whose parent content width hasn't actually moved
+      // (0.5px tolerance — a font-size change can perturb it by a sub-pixel) — otherwise even a
+      // converging loop trips the browser's "ResizeObserver loop completed with undelivered
+      // notifications" error, which globalErrors.ts mirrors to Crashlytics as telemetry noise.
+      // This guards only OUR OWN write re-entering — it is not about skipping a real resize, so a
+      // genuine parent resize (this check finds a moved width) still fits.
+      const p = ref.current?.parentElement;
+      if (!p) return;
+      // Same `contentWidthOf` helper `fit()` uses for `availablePx` — comparing like with like
+      // means this guard can't diverge from what the next `fit()` would actually measure.
+      const currentAvailablePx = contentWidthOf(p);
+      if (lastFitAvailablePxRef.current != null && Math.abs(currentAvailablePx - lastFitAvailablePxRef.current) < 0.5) return;
+      fit();
+    }) : undefined;
+    if (ro && parent) ro.observe(parent);
+    // A `vh`-authored `fontSize` (`cssVal`'s `vh`/`vw`/`vmin`/`vmax` cases) moves with the
+    // VIEWPORT even when the parent's own px width does not — the ResizeObserver above watches
+    // only the parent's content box, so that case is invisible to it and the fit goes stale
+    // (measured: the authored size changes, `fit()` never re-runs, the old shrunk/unshrunk size
+    // stays on screen). `window` may be absent (a non-browser host); guard it like the others
+    // here. Coalesced through `requestAnimationFrame` so a drag-resize re-fits once per frame,
+    // not once per `resize` event.
+    let resizeRaf: number | null = null;
+    const onWindowResize = () => {
+      if (resizeRaf != null) return;
+      resizeRaf = requestAnimationFrame(() => {
+        resizeRaf = null;
+        if (alive) fit();
+      });
+    };
+    if (typeof window !== 'undefined') window.addEventListener('resize', onWindowResize);
+    // A webfont landing after the first measure changes the metrics — measuring before it
+    // arrives is the classic wrong answer here. `document.fonts` may be absent; guard it.
+    // .catch: a font that never resolves must not surface as an unhandled rejection (globalErrors
+    // mirrors those to Crashlytics too) — we just keep the first measurement.
+    document.fonts?.ready.then(() => { if (alive) fit(); }).catch(() => { /* a font that never resolves just means we keep the first measurement */ });
+    return () => {
+      alive = false;
+      ro?.disconnect();
+      if (typeof window !== 'undefined') window.removeEventListener('resize', onWindowResize);
+      if (resizeRaf != null) cancelAnimationFrame(resizeRaf);
+    };
+  }, [fit]);
+
+  // `whiteSpace` is set BOTH here in the JSX style prop ('pre-wrap' — the SAME value the
+  // invariant above requires for every non-shrinking outcome, i.e. the state this span is in
+  // before `fit()` has ever run) AND imperatively by `fit()` ('nowrap' only while a shrink is
+  // active and measured to fit; 'pre-wrap' in every other outcome, restated here). React only
+  // ever writes a style prop that CHANGED from its last render, so once `fit()` sets 'nowrap'
+  // imperatively, a re-render with this same unchanged 'pre-wrap' prop does not stomp it back.
+  // This looks like the two fighting and isn't — don't "fix" it by removing either one.
+  //
+  // `UI_PAINT_ATTR` (#337 close-out, mirrors `AnimatedText` above): this span pulls the text out
+  // of the host entity div's direct children, same as `AnimatedText`'s does — without the
+  // marker, `isPaintOpaque` (editor/panels/uiPreviewPick.ts) finds no direct text-node child and
+  // no marker, credits the entity as purely decorative, and a SceneView click falls through to
+  // whatever sits behind it. A nested `AutoFitText` wrapping a playing `AnimatedText` stamps the
+  // marker twice (once per span) — harmless: `isPaintOpaque` only asks whether ANY marked
+  // descendant's nearest `[data-entity-id]` ancestor is the host div, and both spans agree on
+  // that answer via the same host.
+  return (
+    <span ref={ref} {...{ [UI_PAINT_ATTR]: 'text' }} style={{ display: 'inline-block', whiteSpace: 'pre-wrap' }}>
+      {children}
+    </span>
+  );
 });
 
 /** Convert a numeric value + unit string to a CSS value. Returns undefined if value is 0/falsy.
@@ -570,6 +816,11 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
 
   // Input element: render <input> instead of <div> when elementType is 'input'.
   // In editor mode, render read-only so it looks the same but doesn't steal focus.
+  //
+  // `node.autoFitText` is DELIBERATELY not read on this path (#614): an <input>'s value is
+  // player-entered text, not an authored label, and shrinking it as the user types is a
+  // different feature. autoFitText does nothing on an input today — the field's Inspector
+  // tooltip says so, so the surface doesn't lie about it.
   if (node.elementType === 'input') {
     const inputValue = node.binding?.inputBinding
       ? String(storeState[node.binding.inputBinding] ?? '')
@@ -818,6 +1069,11 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       textContent = <AnimatedText text={text} animation={a.animation} amp={a.amp} extra={a.style}
         perCharStagger={a.perChar?.staggerSec} perCharLoop={a.perChar?.loop} perCharFade={a.perChar?.fadeIn} />;
     }
+  }
+  // Shrink-only auto-fit (#614) — wraps whatever textContent already is (a bare string, or the
+  // AnimatedText span above), so it composes with text animation rather than competing with it.
+  if (text && node.autoFitText) {
+    textContent = <AutoFitText text={text} fontSize={node.fontSize} fontSizeMin={node.fontSizeMin}>{textContent}</AutoFitText>;
   }
 
   return (

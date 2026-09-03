@@ -187,7 +187,63 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `letterSpacing` + **`letterSpacingUnit`**, `textShadow*` (color/opacity/offsetX/offsetY/blur — `textShadowOpacity`
   folded into `textShadowColor`), `textStrokeColor`/`textStrokeOpacity`
   (folded into `textStrokeColor`)/`textStrokeWidth`, `textOverflow` (`clip | ellipsis`),
-  `maxLines`.
+  `maxLines`, **`autoFitText`** + **`fontSizeMin`**.
+
+  ⚠️ **`autoFitText` is SHRINK-ONLY (#614)** — off by default; when on, the effective font size is
+  reduced, never grown past the authored `fontSize`, until the text fits its box on one line, down
+  to `fontSizeMin`. Below that floor, `maxLines`/`textOverflow` take over exactly as they would
+  with the field off — auto-fit is the shrink-FIRST step, not a replacement for them. `fontSizeMin`
+  is authored in `fontSizeUnit` — the SAME unit as `fontSize`, deliberately with no separate unit
+  field of its own (same reasoning as `letterSpacingUnit` above: a floor in a different unit than
+  the size it bounds can't be compared without a second layout read). `0` means "no explicit
+  floor" — the effective floor is half the authored `fontSize`. It does nothing on
+  `elementType: 'input'` (player-entered text, not an authored label — see `UIElement.ts`). Fit
+  math: `runtime/ui/autoFitText.ts`; DOM measurement: `UINode.tsx`'s `AutoFitText`.
+
+  ⚠️ **The fit converges by RE-MEASUREMENT, never by the model (#614 follow-up).** The first
+  estimate (`authoredPx * availablePx / naturalPx`) is exact only when width passes through the
+  origin — real text is affine: `games/text_demo`'s "UI TEXT ANIMATION" (42px, `letterSpacing:
+  3px`) measured `width = 9.344 * fs + 54.46`, an intercept from the px `letterSpacing` (17 x 3px)
+  that does not scale with the font. The estimate predicted 30.03px would fit a 319.59px box;
+  30.03px actually measures 336.06px. `refineFontSizePx` re-measures and refines from there
+  (bounded by `MAX_FIT_PASSES`), and the fit/no-fit verdict comes from the final MEASURED width,
+  never the model's prediction. Any size-independent term — px letter/word-spacing, a text stroke,
+  a px-padded inline child — creates that intercept; with none, the proportional model is exact,
+  which is why it's right on every simple fixture and wrong on a real screen.
+
+  ⚠️ **The invariant that makes a bad measurement safe.** Auto-fit may only change the rendering
+  while ACTIVELY shrinking — it reduced the font AND the reduced size measured back as fitting.
+  Every other outcome (already fits, an unmeasurable reading, or floored short of a fit) renders
+  identically to `autoFitText: false`, so a wrong measurement can only fail to shrink — never leave
+  a box worse than the feature being off. Concretely: an earlier version held `white-space: nowrap`
+  unconditionally, and on a content-sized parent that turned a correct 2-line wrap (229px) into one
+  non-wrapping line 199px outside its 200px parent.
+
+  ⚠️ **Why the DOM measurement is shaped the way it is.** `UIElement` authors
+  `flexDirection`/`alignItems` on every node, so the measuring span is a flex ITEM: `inline-block`
+  is blockified to `block` and `align-items: stretch` sizes it to the container, so a plain
+  `getBoundingClientRect()` reads the AVAILABLE width, not the natural one (measured 319.59px vs a
+  real 446.93px) — fixed with a temporary `width: max-content` scaffold that overrides the stretch,
+  cleared before paint. And `availablePx` must be captured BEFORE that scaffold: `UIElement.width`
+  defaults to `0` (auto), so a content-sized parent is the default case, and the scaffold inflates
+  the PARENT too — read after it, `availablePx` converges on `naturalPx` and the fit concludes "it
+  fits" every time. Same contaminated-measurement bug, one level up.
+
+  ⚠️ **Cost: a re-fit is a synchronous layout read, and a BOUND label re-fits every time its text
+  changes.** `text` is resolved through `resolveTemplate` (`UINode.tsx`), so a label with a
+  `textBinding` onto a per-frame store field (a score, a timer, an fps readout) produces a new
+  string every frame and re-fits every frame — 2 reads when it already fits, up to
+  `MAX_FIT_PASSES + 1` when it shrinks. That is CORRECT (its width really did change) but it is
+  not free, and it is the one case where `autoFitText` costs something a static label never pays.
+  Prefer it for the case it was built for: a fixed string that overflows at some viewport or
+  locale. For a fast-changing bound readout, author a `fontSize` that fits the widest value
+  instead.
+
+  Testing: jsdom reports every rect as 0x0, so the decision function is unit-tested
+  (`engine/packages/modoki/tests/ui/autoFitText.test.ts`) while the DOM behaviour is pinned by an
+  e2e (`engine/tests/e2e/editor-ui-autofit.spec.ts`) whose fixture deliberately carries a px
+  `letterSpacing` — without that intercept the proportional model is exact and the spec cannot
+  fail. Mounting `UINode` in jsdom to assert this would assert the mock.
 - **Image** — `imageSrc`, `imageMode` (`cover | contain | fill | none`).
 - **Element type** — `elementType` (`div | input | range`) and `placeholder`. Most
   elements are `div`; `input` renders an `<input>` text field and `range` renders an

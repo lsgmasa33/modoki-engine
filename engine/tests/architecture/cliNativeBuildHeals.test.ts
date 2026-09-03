@@ -103,6 +103,49 @@ describe('build-web.mjs heals the native project on --target native (#148, #150)
   });
 });
 
+describe('build-web.mjs validates project config before it builds anything (#589 sibling)', () => {
+  const src = fs.readFileSync(buildWeb, 'utf8');
+
+  // `/api/build` runs projectConfigUnionErrors + validateBuildConfig for EVERY target
+  // (web/playable/ios/android alike) before its platform branch — vite-asset-scanner.ts's
+  // `/api/build` handler. add-native-targets.mjs (#589) added the identical pair before its
+  // scaffold. This is the same check's sibling in the third CLI path that reaches a native
+  // project unvalidated: `build-web.mjs`, what `npm run build` actually runs and what
+  // `docs/build.md` documents as the manual native-build recipe.
+  //
+  // The BEHAVIOURAL half — that these validators genuinely reject a bad config (an appId with a
+  // space, an orientation typo) and pass a good one — is already covered by
+  // `cliNativeTargetValidates.test.ts`'s first describe block (#589); not duplicated here.
+
+  it('reaches both projectConfigUnionErrors and validateBuildConfig', () => {
+    expect(src).toMatch(/projectConfigUnionErrors\(/);
+    expect(src).toMatch(/validateBuildConfig\(/);
+  });
+
+  it('runs the check BEFORE the first healNativeConfig( call', () => {
+    // Same technique as the ensureCapacitorDeps-before-vendorEnginePlugins ordering test above:
+    // loose about HOW, strict about the ordering fact that matters — validation must land before
+    // ANY native file gets healed from a config nothing has checked yet.
+    const unionCall = src.indexOf('projectConfigUnionErrors(');
+    const validateCall = src.indexOf('validateBuildConfig(');
+    const healConfigCall = src.indexOf('healNativeConfig(');
+    expect(unionCall).toBeGreaterThan(-1);
+    expect(validateCall).toBeGreaterThan(-1);
+    expect(healConfigCall).toBeGreaterThan(-1);
+    expect(unionCall).toBeLessThan(healConfigCall);
+    expect(validateCall).toBeLessThan(healConfigCall);
+  });
+
+  it('exits non-zero on the error path, without a --force-style bypass', () => {
+    const validateCall = src.indexOf('validateBuildConfig(');
+    const nextChunk = src.slice(validateCall, validateCall + 400);
+    expect(nextChunk).toMatch(/cfgErrors\.length/);
+    expect(nextChunk).toMatch(/process\.exit\(1\)/);
+    // The issue explicitly leaves a bypass as an owner call — this check must not grow one.
+    expect(nextChunk).not.toMatch(/--force/);
+  });
+});
+
 describe('loadEnginePluginModule degrades instead of throwing', () => {
   it('returns null when there is no source file to load (the packaged editor)', async () => {
     const { loadEnginePluginModule, loadVendorPlugins } = await import('../../scripts/loadVendorPlugins.mjs');

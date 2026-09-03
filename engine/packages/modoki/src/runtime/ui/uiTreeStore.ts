@@ -56,6 +56,9 @@ export interface UINodeData {
    *  than in `UINode` so the DOM layer stays a pure style writer and the precedence lives in
    *  exactly one place (`ui/fontFamilyRef.ts`). */
   fontFamily: string; fontSize: number; fontSizeUnit: string; fontWeight: string; fontStyle: string;
+  /** Shrink-only auto-fit (#614) — see `UIElement.autoFitText`/`fontSizeMin` and
+   *  `ui/autoFitText.ts` for the fit math. `fontSizeMin` is in `fontSizeUnit`, same as `fontSize`. */
+  autoFitText: boolean; fontSizeMin: number;
   textColor: number; textOpacity: number; textAlign: string;
   lineHeight: number; letterSpacing: number; letterSpacingUnit: string;
   textShadowColor: number; textShadowOpacity: number; textShadowOffsetX: number; textShadowOffsetY: number; textShadowBlur: number;
@@ -400,6 +403,7 @@ function buildTree(world: World): UINodeData[] | null {
         borderColor: ui.borderColor ?? 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,
         text: ui.text || '', fontFamily: resolveUIFontFamily(ui.fontFamily as string, ui.systemFont as string),
         fontSize: ui.fontSize || 16, fontSizeUnit: ui.fontSizeUnit || 'px', fontWeight: ui.fontWeight || 'normal',
+        autoFitText: ui.autoFitText === true, fontSizeMin: ui.fontSizeMin || 0,
         fontStyle: ui.fontStyle || 'normal', textColor: ui.textColor ?? 0xffffff, textOpacity: ui.textOpacity ?? 1,
         textAlign: ui.textAlign || 'left',
         lineHeight: ui.lineHeight || 0, letterSpacing: ui.letterSpacing || 0, letterSpacingUnit: ui.letterSpacingUnit || 'px',

@@ -27,7 +27,7 @@ import {
   encodeEvalResult, encodeStructuredResult, extFor, describeScreenshot, isFailureBody,
   deviceFail, caughtFailure, deviceReplyFailure,
 } from './result.js';
-import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, SYNTHETIC_MECHANISM, type LeaseStatus } from './reply.js';
+import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseConsoleLogsReply, SYNTHETIC_MECHANISM, type LeaseStatus } from './reply.js';
 
 const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(/\/$/, '');
 
@@ -2069,27 +2069,49 @@ async function coordScaleOrRefusal(
       level: z.enum(['log', 'warn', 'error', 'info']).optional(),
     },
     async ({ limit, level }) => {
+      const what = 'read the captured console output from the device';
       try {
         const raw = await deviceRequest('consoleLogs', { limit: limit ?? 50, ...(level ? { level } : {}) });
         // The device signals a handler failure by RETURNING an `Error: …` STRING, which the transport
         // resolves as a normal result (that is why `isDeviceError` exists). Without this check the
-        // string fell through to `result.map(...)`, threw "result.map is not a function", and
-        // `caughtFailure` classified the throw as a TRANSPORT failure — so a device-side refusal was
-        // reported as "the device app may have been backgrounded or killed; relaunch it". Wrong
-        // cause, wrong remedy. Found by the Phase-8 table-driven device sweep.
-        if (isDeviceError(raw)) return deviceReplyFailure('device_console_logs', 'read the captured console output from the device', raw);
-        // `{logs, dropped}` — `bridge.ts`'s `handleConsoleLogs` used to return a bare array; `dropped`
-        // is how many entries were evicted from the ring's tail BETWEEN the pinned boot prefix and
-        // this window (the ring is `[pinned] ++ [tail]`, discontiguous once it wraps), so a non-zero
-        // value means the log below has a real gap in it, not that boot was quiet.
-        const { logs: result, dropped } = parseReply<{ logs: Array<{ level: string; args: string[]; timestamp: number }>; dropped: number }>(raw);
-        const gapNote = dropped > 0 ? `\n(${dropped} earlier ${dropped === 1 ? 'entry' : 'entries'} dropped between the boot log and this window.)` : '';
-        const text = (!result || result.length === 0
+        // string fell through to the shape parser below, misread as an unrecognised reply — a
+        // device-side refusal would be reported with the wrong remedy. Found by the Phase-8
+        // table-driven device sweep.
+        if (isDeviceError(raw)) return deviceReplyFailure('device_console_logs', what, raw);
+        // #644: `bridge.ts`'s `handleConsoleLogs` returns `{logs, dropped}` today but returned a
+        // BARE ARRAY before `6f5e81b48` — and this MCP server is a LONG-LIVED process that does not
+        // pick up a rebuilt tree, so a session straddling that commit runs the OLD parser against
+        // the NEW bridge shape (or vice versa). This used to blindly destructure `{logs, dropped}`
+        // and call `.map` on whatever came out, which threw `result.map is not a function` on the
+        // other shape — a version-skew crash, misclassified by `caughtFailure` as a TRANSPORT
+        // failure ("the device app may have been backgrounded or killed; relaunch it"), which sent
+        // the reporter chasing the wrong fix. `parseConsoleLogsReply` tolerates both wire shapes
+        // (plus a quiet/empty ring) and reports anything else as a shape mismatch, not a crash.
+        const parsed = parseConsoleLogsReply(raw);
+        if (!parsed.ok) {
+          return deviceFail({
+            code: 'NOT_AVAILABLE_HERE',
+            tool: 'device_console_logs',
+            what,
+            why: `the device answered, but not in a shape this tool understands (${parsed.got}). ` +
+              'The lease is fine — this is a version skew between this MCP server and the console bridge inside the app.',
+            options: [
+              'restart the MCP server — it is a LONG-LIVED process started with the session and does NOT pick up a rebuilt tree, so a git pull or a branch switch mid-session leaves it running the old reply parser (this is what produced #644)',
+              'if the APP is the old side, rebuild and redeploy it — engine/app/debug/bridge.ts handleConsoleLogs is the other half of this contract',
+              "device_status still answers, and device_native_logs source:'system' reads the device log from the HOST with no bridge involved",
+            ],
+          });
+        }
+        // `dropped` is how many entries were evicted from the ring's tail BETWEEN the pinned boot
+        // prefix and this window (the ring is `[pinned] ++ [tail]`, discontiguous once it wraps), so
+        // a non-zero value means the log below has a real gap in it, not that boot was quiet.
+        const gapNote = parsed.dropped > 0 ? `\n(${parsed.dropped} earlier ${parsed.dropped === 1 ? 'entry' : 'entries'} dropped between the boot log and this window.)` : '';
+        const text = (parsed.logs.length === 0
           ? 'No console logs.'
-          : result.map((l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.level}] ${l.args.join(' ')}`).join('\n')) + gapNote;
+          : parsed.logs.map((l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.level}] ${l.args.join(' ')}`).join('\n')) + gapNote;
         return { content: [{ type: 'text' as const, text }] };
       } catch (e) {
-        return caughtFailure('device_console_logs', 'read the captured console output from the device', e);
+        return caughtFailure('device_console_logs', what, e);
       }
     },
   );

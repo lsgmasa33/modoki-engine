@@ -68,6 +68,41 @@ const node = process.execPath;
 const q = (s) => JSON.stringify(s);
 const run = (cmd) => execSync(cmd, { stdio: 'inherit', cwd: repoRoot, env: runEnv });
 
+/** The SAME two-part project-config check the editor's `/api/build` route runs — for every
+ *  target alike (`vite-asset-scanner.ts`'s `/api/build` handler runs it once, before the platform
+ *  branch, so it covers web/playable/ios/android identically; this mirrors that, not a
+ *  native-only gate). Sibling of #589, where the CLI scaffolder (`add-native-targets.mjs`) reached
+ *  the identical scaffold path with none: this script is what `npm run build` actually runs, and
+ *  what `docs/build.md` tells a human to run by hand for a device build, and until now it healed a
+ *  native project (`healNativeProject`, below) straight from a config nothing had validated.
+ *
+ *  The union pass is SEPARATE from `validateBuildConfig` because `validateBuildConfig` sees the
+ *  already-RESOLVED config, where a bad value has been coerced to its default and is no longer
+ *  there to complain about (#39) — the failure this closes: a `capacitor.orientation` typo like
+ *  `"potrait"` is silently coerced to the default orientation and ships with rotation UNLOCKED to
+ *  the store, invisible to `validateBuildConfig` alone. What this guards is artifact IDENTITY/
+ *  behaviour (`app.appId`, `build.appleTeamId`, `capacitor.orientation` and friends), not HTTP
+ *  hygiene — which is why a CLI needs it exactly as much as a route does. No `--force` bypass:
+ *  that is an owner call.
+ *
+ *  Gated on `proj`: that's the only case with a `project.config.json` to check (a bare
+ *  `npm run build:editor` never reaches this script at all). Degrades to a no-op like the heals
+ *  below when the engine plugin can't be loaded — the packaged editor ships no engine sources, and
+ *  in THAT case the SOURCE route already validated before spawning this script as a build step. */
+async function validateProjectConfig() {
+  if (!proj) return;
+  const cfgMod = await loadEnginePluginModule(repoRoot, path.join('plugins', 'load-project-config.ts'));
+  if (!cfgMod) return;
+  const { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors } = cfgMod;
+  const projectRoot = path.resolve(repoRoot, proj);
+  const cfg = loadProjectConfig(projectRoot);
+  const cfgErrors = [...projectConfigUnionErrors(projectRoot), ...validateBuildConfig(cfg, loadProjectUserConfig(projectRoot))];
+  if (cfgErrors.length) {
+    console.error(`[build-web] invalid project settings — not building:\n${cfgErrors.map((e) => `  • ${e}`).join('\n')}`);
+    process.exit(1);
+  }
+}
+
 /** Heal the native project before building it — the CLI half of #90/#148/#150.
  *
  *  `--target native` ONLY: every heal below is a native-artifact concern, so a web/playable
@@ -169,8 +204,11 @@ async function healNativeProject() {
 const tscBin = path.join(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');
 const viteBin = path.join(repoRoot, 'node_modules', 'vite', 'bin', 'vite.js');
 try {
-  // FIRST — before the typecheck, which resolves the plugin's TS types out of the project's
-  // node_modules. A heal that lands after it would be typechecked against the old copy.
+  // FIRST of all — before the heal touches a single native file, let alone the typecheck or the
+  // build itself. See validateProjectConfig's own comment for why.
+  await validateProjectConfig();
+  // Before the typecheck, which resolves the plugin's TS types out of the project's node_modules.
+  // A heal that lands after it would be typechecked against the old copy.
   await healNativeProject();
   // Typecheck gate — DEV only. typescript is a devDependency, so the packaged editor
   // doesn't ship it; there the typecheck is also redundant (the engine ships pre-built,

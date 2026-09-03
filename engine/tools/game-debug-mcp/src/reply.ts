@@ -17,6 +17,48 @@ export function isDeviceError(v: unknown): v is string {
   return typeof v === 'string' && (v.startsWith('Error:') || v.startsWith('Unknown method:'));
 }
 
+// ── device_console_logs reply shape (#644) ─────────────────────────────────
+export type ConsoleLogEntry = { level: string; args: string[]; timestamp: number };
+export type ConsoleLogsReply =
+  | { ok: true; logs: ConsoleLogEntry[]; dropped: number }
+  | { ok: false; got: string };
+
+/** Shape-tolerant parse of `handleConsoleLogs`'s (`engine/app/debug/bridge.ts`) reply.
+ *
+ *  Root cause of #644: the tool used to assert exactly one wire shape (`const {logs, dropped} =
+ *  parseReply(raw)`) and blow up with `result.map is not a function` on anything else. That
+ *  "anything else" is not hypothetical — `handleConsoleLogs` returned a BARE ARRAY before
+ *  `6f5e81b48`, and this MCP server is a LONG-LIVED process (started once per session) that does
+ *  NOT pick up a rebuilt tree, so a session straddling that commit runs the OLD parser against a
+ *  device on the NEW bridge (or vice versa). Tolerating both shapes here turns a version-skew
+ *  CRASH into a normal read.
+ *
+ *  `got`, for the unrecognised case, is built from the value's SHAPE only, never its content — a
+ *  captured console line can be long and can carry secrets, so it must never appear in a tool
+ *  reply's error text. */
+export function parseConsoleLogsReply(raw: unknown): ConsoleLogsReply {
+  const v = parseReply<unknown>(raw);
+  if (v == null) return { ok: true, logs: [], dropped: 0 }; // an empty ring is an ANSWER, not a failure
+  if (Array.isArray(v)) return { ok: true, logs: v as ConsoleLogEntry[], dropped: 0 }; // pre-6f5e81b48 bridge
+  if (typeof v === 'object' && 'logs' in v && Array.isArray((v as { logs: unknown }).logs)) {
+    const obj = v as { logs: ConsoleLogEntry[]; dropped?: unknown };
+    return { ok: true, logs: obj.logs, dropped: typeof obj.dropped === 'number' ? obj.dropped : 0 };
+  }
+  return { ok: false, got: describeShape(v) };
+}
+
+/** A short, content-free description of a value's shape — for error text that must never echo
+ *  what the value actually held (it may be a log line, and log lines can carry secrets). */
+function describeShape(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'an array';
+  if (typeof v === 'object') {
+    const keys = Object.keys(v as object).slice(0, 8);
+    return keys.length ? `an object with keys: ${keys.join(', ')}` : 'an empty object';
+  }
+  return `a ${typeof v}`;
+}
+
 // ── Input fidelity (#32) ──────────────────────────────────────────────────
 // The literals a device_* reply / device_status line can report. Kept as named constants (rather
 // than inline string literals) so `deviceInputMechanismParity.test.ts` can regex-match them by

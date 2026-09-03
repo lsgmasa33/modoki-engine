@@ -89,6 +89,7 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     scrollbarStyle: 'auto', scrollbarThumbColor: 0x888888, scrollbarTrackColor: 0xdddddd,
     backgroundColor: 0, backgroundOpacity: 0, borderRadius: 0, borderWidth: 0, borderColor: 0x333333, borderOpacity: 1, opacity: 1,
     text: '', fontFamily: '', fontSize: 16, fontSizeUnit: 'px', fontWeight: 'normal', fontStyle: 'normal',
+    autoFitText: false, fontSizeMin: 0,
     textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0, letterSpacingUnit: 'px',
     textShadowColor: 0, textShadowOpacity: 1, textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0,
     textStrokeColor: 0, textStrokeOpacity: 1, textStrokeWidth: 0, textOverflow: 'clip', maxLines: 0,
@@ -513,6 +514,93 @@ describe('UINode image path (F3)', () => {
     expect(span).not.toBeNull();
     expect(span?.textContent).toBe('Score: 12');
     expect(isPaintOpaque(el)).toBe(true);
+  });
+
+  // #337 close-out: `AutoFitText` (#614) is a FOURTH wrapper that pulls the text out of the
+  // host's direct children, same shape as the `NineSliceImage`/`AnimatedText` tests above. This
+  // is the test whose absence let the regression through — a mutation check that stripped the
+  // marker from `AutoFitText`'s span left `npm run verify` fully green.
+  it('a real UINode host with autoFitText is opaque, via the REAL AutoFitText marker', () => {
+    const el = renderNode(makeNode({ text: 'Fit Me', autoFitText: true, fontSize: 40, fontSizeMin: 10 }));
+    const span = el.querySelector(`[${UI_PAINT_ATTR}="text"]`);
+    expect(span).not.toBeNull();
+    expect(span?.textContent).toBe('Fit Me');
+    expect(isPaintOpaque(el)).toBe(true);
+  });
+});
+
+// ── AutoFitText DOM wiring (#614) ──
+// jsdom reports every rect as 0x0, so the actual SHRINK decision (`fitFontSizePx`) is unit-tested
+// pure in tests/ui/autoFitText.test.ts — what's testable here, through the REAL DOM component, is
+// the WIRING around it: whether `fit()` re-runs when it should, and the ORDER it measures in.
+describe('UINode AutoFitText DOM wiring (#614)', () => {
+  // Regression: `fit()`'s own `useCallback` deps used to be `[fontSize, fontSizeMin]` only, and
+  // the rendered TEXT was in neither that list nor anything else that calls `fit()` — so a
+  // `{storeField}` template or a localised string re-rendering with new text never re-measured,
+  // and the font size (and `nowrap`) stayed pinned to whatever the FIRST string fit. jsdom
+  // reports every rect as 0x0 (see the file header), so the shrunk SIZE isn't assertable here —
+  // but `fit()` calls `getComputedStyle` exactly twice per completed pass (once for the parent's
+  // `availablePx` via `contentWidthOf`, once for the span's own `authoredPx`), so counting those
+  // calls is an exact, DOM-observable proxy for "how many times did fit() run".
+  it('re-fits when the rendered text changes, even though fontSize/fontSizeMin do not', () => {
+    const spy = vi.spyOn(window, 'getComputedStyle');
+    const before = spy.mock.calls.length;
+    const { rerender } = render(
+      <UINode node={makeNode({ text: 'SHORT', autoFitText: true, fontSize: 40, fontSizeMin: 10 })} storeState={{}} />,
+    );
+    const afterMount = spy.mock.calls.length - before;
+    expect(afterMount).toBeGreaterThan(0);
+    expect(afterMount % 2).toBe(0); // whole fit() passes only, never a half pass
+
+    rerender(
+      <UINode node={makeNode({ text: 'A MUCH LONGER STRING THAT WOULD OVERFLOW ITS BOX', autoFitText: true, fontSize: 40, fontSizeMin: 10 })} storeState={{}} />,
+    );
+    const afterTextChange = spy.mock.calls.length - before - afterMount;
+    // Without the fix this is 0 — `fit`'s memoized reference never changes when only `text`
+    // differs (its deps were `[fontSize, fontSizeMin]`), so the layout effect (deps: `[fit]`)
+    // never re-runs and `fit()` is never called again.
+    expect(afterTextChange).toBeGreaterThan(0);
+
+    spy.mockRestore();
+  });
+
+  // FIX 3a: `availablePx` (the parent's content width) must be read BEFORE this span ever
+  // touches its own `style` — in particular before `width: max-content` is written. `UIElement.
+  // width` defaults to 0 (auto), so a content-sized parent (the DEFAULT case) would otherwise be
+  // measured AFTER the max-content scaffold inflated it to the text's own natural width, making
+  // `naturalPx === availablePx` and the fit always conclude "it fits". Pinned by CALL ORDER
+  // (jsdom's rects are all 0x0, so the VALUES can't tell old code from new): the first `DIV` in
+  // the `getBoundingClientRect` call log is the parent (`contentWidthOf`), the first `SPAN` is
+  // the span's own natural-width read — and the parent must come first.
+  it('measures the parent (availablePx) before writing the max-content scaffold to the span', () => {
+    const calls: string[] = [];
+    const spy = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      calls.push(this.tagName);
+      return { width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0, x: 0, y: 0, toJSON() {} } as DOMRect;
+    });
+
+    renderNode(makeNode({ text: 'Label', autoFitText: true, fontSize: 24, fontSizeMin: 8 }));
+    spy.mockRestore();
+
+    const relevant = calls.filter((tag) => tag === 'DIV' || tag === 'SPAN');
+    expect(relevant.length).toBeGreaterThanOrEqual(2);
+    expect(relevant[0]).toBe('DIV');  // the parent's availablePx — read first
+    expect(relevant[1]).toBe('SPAN'); // the span's own naturalPx — read second, after the scaffold
+  });
+
+  // FIX 3b: "auto-fit may only ever change the rendering when it is ACTIVELY SHRINKING" — every
+  // other outcome must render IDENTICALLY to `autoFitText: false`, i.e. `pre-wrap`, never
+  // `nowrap`. jsdom reports every rect as 0x0, so `fitFontSizePx` always hits its "nothing was
+  // measurable, never guess" guard: `shrunk: false, fits: true` — this is EXACTLY the branch the
+  // invariant is about (a bad/unmeasurable reading must cost at most a missed shrink, never an
+  // overflowing `nowrap` line it isn't entitled to). Pre-fix, the span was born `nowrap` and only
+  // ever flipped to `pre-wrap` on the floor path, so this always-unmeasurable-in-jsdom outcome
+  // left `nowrap` standing.
+  it('never leaves nowrap standing when nothing was actually shrunk (jsdom is always the unmeasurable case)', () => {
+    const el = renderNode(makeNode({ text: 'Whatever', autoFitText: true, fontSize: 24, fontSizeMin: 8 }));
+    const span = el.querySelector('span') as HTMLSpanElement;
+    expect(span).not.toBeNull();
+    expect(span.style.whiteSpace).toBe('pre-wrap');
   });
 });
 

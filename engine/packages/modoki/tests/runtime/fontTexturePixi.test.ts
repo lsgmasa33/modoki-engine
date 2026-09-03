@@ -221,6 +221,10 @@ describe('a provider disposed mid-load must not leave its texture in the cache',
     const dyn = Object.create(DynamicFontProvider.prototype) as typeof DynamicFontProvider.prototype;
     Object.assign(dyn, {
       disposables: [], glyphMap: new Map(), kern: new Map(), pages: [], ctxs: [],
+      // #635 fix 4: dispose() → cancelFlushRetry() now iterates `retryBatch` unconditionally
+      // (re-adding any still-pending cp to `requested` before clearing the timer) — a NEW field
+      // `dispose` touches, so it belongs on this list for the same reason the others are here.
+      retryBatch: new Set(),
     });
     dyn.dispose();
     const dynCleanup = vi.fn();

@@ -25,6 +25,10 @@
  * #581) is NOT skipped — it's removed and re-scaffolded automatically, same as the editor's
  * "Add Native Target" action. Use `--force` only when you mean to regenerate a genuinely
  * complete target.
+ *
+ * Before scaffolding, each project runs the SAME project-settings validation the editor's
+ * `/api/add-native-target` route runs (#589) — a hand-edited `project.config.json` the route
+ * would refuse is skipped here too, not scaffolded with a bad `appId`/`appleTeamId`.
  */
 
 import fs from 'node:fs';
@@ -82,7 +86,10 @@ function discoverMissing() {
   return out;
 }
 
-const { scaffoldNativeTarget, loadProjectConfig, isNativeTargetScaffolded } = await loadPluginModules();
+const {
+  scaffoldNativeTarget, loadProjectConfig, isNativeTargetScaffolded,
+  loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors,
+} = await loadPluginModules();
 const specs = ALL ? discoverMissing() : argv.filter((a) => !a.startsWith('--') && a !== platArg);
 if (!specs.length) {
   console.error('usage: add-native-targets.mjs [--platform ios|android] [--dry-run] [--force] <project…> | --all-missing');
@@ -140,6 +147,25 @@ for (const spec of specs) {
   if (!fs.existsSync(cfgPath)) { results.push([spec, '-', 'SKIP: no project.config.json']); continue; }
   // The MERGED config, not the raw file — see loadPluginModules().
   const cfg = loadProjectConfig(projectRoot);
+  // The SAME two-part check the editor's /api/add-native-target route runs (#589) — this script
+  // reaches the identical scaffoldNativeTarget with no validation of its own, so a hand-edited
+  // project.config.json the route would refuse (a space in appId, an empty required field) sailed
+  // straight through the CLI and into capacitor.config.json, then the iOS bundle identifier /
+  // Android applicationId. The union-errors pass is SEPARATE from validateBuildConfig because
+  // validateBuildConfig sees the already-RESOLVED config, where a bad value has been coerced to
+  // its default and is no longer there to complain about (#39). What this guards is artifact
+  // IDENTITY (app.appId → bundle id / applicationId, build.appleTeamId → DEVELOPMENT_TEAM), not
+  // HTTP hygiene — which is why a CLI needs it exactly as much as a route does. Runs BEFORE the
+  // platform loop (and so before the `if (DRY)` branch below) so `--dry-run` reports the same
+  // verdict the real run would give — sibling of #582, same class: a guard the route enforces
+  // before spawning a CLI that the CLI itself lacked. No `--force` override, by design: bypassing
+  // this is an owner call, not a flag.
+  const cfgErrors = [...projectConfigUnionErrors(projectRoot), ...validateBuildConfig(cfg, loadProjectUserConfig(projectRoot))];
+  if (cfgErrors.length) {
+    console.error(`\n═══ ${spec} — INVALID project settings, not scaffolded ═══\n${cfgErrors.map((e) => `  • ${e}`).join('\n')}`);
+    results.push([spec, '-', `SKIP: invalid project settings (${cfgErrors.length})`]);
+    continue;
+  }
   for (const platform of PLATFORMS) {
     const complete = isNativeTargetScaffolded(projectRoot, platform);
     if (complete && !FORCE) {

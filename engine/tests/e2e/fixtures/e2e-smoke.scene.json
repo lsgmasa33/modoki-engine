@@ -39,6 +39,51 @@
         "UIElement": { "isVisible": true, "width": 140, "height": 44, "widthUnit": "px", "heightUnit": "px", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "E2E UI Button", "fontSize": 16, "textColor": 16777215 },
         "EntityAttributes": { "name": "UIButton", "guid": "e2e50000-0000-4000-8000-000000000004", "isActive": true, "sortOrder": 3, "parentId": 0, "layer": "ui" }
       }
+    },
+    {
+      "id": 5,
+      "name": "AutoFitOff",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 160, "widthUnit": "px", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "textColor": 16777215, "autoFitText": false },
+        "EntityAttributes": { "name": "AutoFitOff", "guid": "e2e50000-0000-4000-8000-000000000005", "isActive": true, "sortOrder": 4, "parentId": 0, "layer": "ui" }
+      }
+    },
+    {
+      "id": 6,
+      "name": "AutoFitOn",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 340, "widthUnit": "px", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "letterSpacing": 3, "textColor": 16777215, "autoFitText": true },
+        "EntityAttributes": { "name": "AutoFitOn", "guid": "e2e50000-0000-4000-8000-000000000006", "isActive": true, "sortOrder": 5, "parentId": 0, "layer": "ui" }
+      }
+    },
+    {
+      "id": 7,
+      "name": "AutoFitContentParent",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 340, "widthUnit": "px", "backgroundOpacity": 0.4, "backgroundColor": 2500134, "gap": 8, "gapUnit": "px", "paddingTop": 8, "paddingTopUnit": "px", "paddingBottom": 8, "paddingBottomUnit": "px" },
+        "EntityAttributes": { "name": "AutoFitContentParent", "guid": "e2e50000-0000-4000-8000-000000000007", "isActive": true, "sortOrder": 6, "parentId": 0, "layer": "ui" }
+      }
+    },
+    {
+      "id": 8,
+      "name": "AutoFitContentSizedOff",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "alignSelf": "center", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "letterSpacing": 3, "textColor": 16777215, "autoFitText": false },
+        "EntityAttributes": { "name": "AutoFitContentSizedOff", "guid": "e2e50000-0000-4000-8000-000000000008", "isActive": true, "sortOrder": 7, "parentId": 7, "layer": "ui" }
+      }
+    },
+    {
+      "id": 9,
+      "name": "AutoFitContentSizedOn",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "alignSelf": "center", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "letterSpacing": 3, "textColor": 16777215, "autoFitText": true },
+        "EntityAttributes": { "name": "AutoFitContentSizedOn", "guid": "e2e50000-0000-4000-8000-000000000009", "isActive": true, "sortOrder": 8, "parentId": 7, "layer": "ui" }
+      }
     }
   ]
 }

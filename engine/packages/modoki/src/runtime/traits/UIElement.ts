@@ -216,6 +216,28 @@ export const UIElement = trait({
    * alongside a non-px `fontSize` until that follows.
    */
   fontSizeUnit: 'px' as UILengthUnit,
+  /**
+   * Shrink-to-fit (#614): when true, the effective font size is reduced — never grown past the
+   * authored `fontSize` — until the text fits its box on ONE line, down to `fontSizeMin`. Below
+   * that floor the existing `maxLines`/`textOverflow` behaviour takes over unchanged, exactly as
+   * it would without this field. Off by default: an author opts a label in only where a fixed
+   * string can overflow at some viewport/locale (Court's `ConflictLocalButton`, #614 — "Keep this
+   * device" wrapped to two lines while its twin "Use the cloud" sat on one, both authored
+   * identically). See `ui/autoFitText.ts` for the fit math.
+   *
+   * ⚠️ Does nothing on `elementType: 'input'` — an input's text is player-entered, not an
+   * authored label, and shrinking it as the user types is a different feature (out of scope here).
+   */
+  autoFitText: false,
+  /**
+   * The shrink floor for `autoFitText`, in the SAME UNIT as `fontSize` (`fontSizeUnit`) —
+   * deliberately no separate `fontSizeMinUnit`. A floor authored in a different unit than the
+   * size it bounds could not be compared without a second layout read, and two units on one pair
+   * of fields is a drift trap (cf. the `letterSpacingUnit` note above, which must match
+   * `fontSizeUnit` for the same reason). `0` means "no explicit floor": the effective floor is
+   * `fontSize * DEFAULT_AUTOFIT_MIN_RATIO` (see `ui/autoFitText.ts`), i.e. half the authored size.
+   */
+  fontSizeMin: 0,
   fontWeight: 'normal' as 'normal' | 'bold',
   fontStyle: 'normal' as 'normal' | 'italic',
   textColor: 0xffffff as number,
