@@ -31,11 +31,16 @@ merge table.
 | `engine/packages/modoki/src/runtime/sync/decide.ts` | `hasLocalWrites`, `scopeMarksToAccount`, `decideGroup` — the pure four-case decision table. |
 | `engine/packages/modoki/src/runtime/sync/runGroupSync.ts` | `runGroupSync`/`runCloudSync` — the per-group attempt loop (CAS re-decide, the durability two-phase write) and the aggregate runner over a set of groups. |
 | `engine/packages/modoki/src/runtime/sync/resolveFork.ts` | `resolveGroupFork` — apply the player's fork answer for one group. |
+| `engine/packages/modoki/src/runtime/sync/coordinator.ts` | `CloudSyncCoordinator` — *when* a sync runs. Debounce, the pending-conflict suppression, trigger coalescing, and the #506 teardown guard. Generic over the FORK (`SyncFork`), never the save. Promoted out of Court in #658. |
 | `games/court/runtime/saveSync.ts` | The first consumer's group declarations (`courtProgressSaveGroup`/`courtPurchasesSaveGroup`/`courtSettingsSaveGroup`) and its own field-by-field merge rules. Worked example. |
 | `games/court/accounts.md` | Court's account system end to end — auth, the conflict dialog UI, the account-deletion flow. Read it for how a game WIRES this contract, not for the contract itself. |
 
 L2 folder (`'sync'` is in `L2_FOLDERS`, `engine/eslint.config.js`), importing no other L2 folder —
-in particular not `storage/`. A game hands in a `GroupStore`/`GroupTransport` and this module never
+in particular not `storage/`. The one edge out of the folder is `coordinator.ts` → L0
+`core/liveness`, which is legal (L2 may reach L0) and required: #573 makes the shared teardown token
+the ONLY sanctioned epoch/generation implementation, and a hand-rolled counter is a build failure.
+
+A game hands in a `GroupStore`/`GroupTransport` and this module never
 learns what backs them, the same structural-typing inversion `storage/prefsDocStore.ts` and
 `iap/ledger.ts` already use. Pure and clock-free: every clock reading (`now`) arrives as a
 parameter, so the determinism guard is satisfied by construction.
@@ -246,8 +251,8 @@ for that group, not treat it as a plain failure.
 - **`'ask'`** — raise the dialog. A game aggregating several `'ask'` groups behind one player choice
   (one dialog, applied to whichever groups actually forked — never to every declared group) is a
   UI-layer decision the engine doesn't make; see `runCloudSync`'s `asking: string[]` for the set a
-  single dialog should resolve together, and Court's `saveSync.ts`/`cloudSync.ts` for a worked
-  example.
+  single dialog should resolve together, `sync/coordinator.ts` for the driver that aggregates them,
+  and Court's `saveSync.ts` for a worked example of the game-side half.
 - **`'take-server'`** — silently take the server's side. For a group whose local side is never worth
   defending.
 - **`'take-newer'`** — silently take whichever side has the later `updatedAt`.

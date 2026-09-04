@@ -20,8 +20,12 @@
  *  posture, not this script's.
  *
  *  #582's sibling guard: `--project <dir>` is REQUIRED (mirroring `ota-publish.mjs`'s own
- *  `--project`) and read for exactly two checks, never for `--dist`/`--name`/`--engine-api`
+ *  `--project`) and read for exactly three checks, never for `--dist`/`--name`/`--engine-api`
  *  themselves, which stay explicit CLI arguments:
+ *   - `ota.enabled` must be true (#649 — mirrors ota-publish.mjs's own check, added for the
+ *     same reason: the route already gates this whole step on `cfg.ota.enabled` and never
+ *     invokes this script for an opted-out project, but a by-hand invocation had nothing
+ *     stopping it from writing a real embedded manifest for one anyway).
  *   - `--name` must equal the project's resolved `ota.bundleName` (an absent field resolves
  *     to `OTA_DEFAULT_BUNDLE_NAME`, imported from `./ota/publishGuards.mjs` — the SAME
  *     defaulting `ota-publish.mjs` uses, not reimplemented here). The route always builds
@@ -91,6 +95,16 @@ async function main() {
   const ota = projectConfig?.ota;
   if (typeof ota !== 'object' || ota === null || Array.isArray(ota)) {
     fail(`${projectConfigPath} has no object-typed "ota" field — cannot verify this manifest's bundle identity against it.`);
+  }
+  // `enabled` defaults to `false`, so an ABSENT field correctly means "not enabled" — same
+  // shape as ota-publish.mjs's own check just above its `bundleName` resolution. The editor's
+  // native build pipeline (vite-asset-scanner.ts) already gates the WHOLE embed step on
+  // `cfg.ota.enabled` and never runs this script at all for an opted-out project — but this is
+  // a standalone CLI (like its sibling ota-publish.mjs), so a by-hand invocation had nothing
+  // stopping it from writing a real ota-embedded-manifest.json into dist/ for a project that
+  // never opted into OTA in Project Settings.
+  if (!ota.enabled) {
+    fail(`${projectConfigPath}'s ota.enabled is not true — this project has not opted into OTA updates. Enable OTA in Project Settings first, then embed a manifest.`);
   }
   // Absent `bundleName` resolves to the default — see OTA_DEFAULT_BUNDLE_NAME's own doc
   // comment in publishGuards.mjs for why (pruneProjectConfig omits a field equal to its

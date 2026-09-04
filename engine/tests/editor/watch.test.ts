@@ -285,4 +285,82 @@ describe('read+clear does not leak the mover budget (review follow-up)', () => {
     expect(r.truncated, 'the mover cap must not have been exhausted by polling').toBeFalsy();
     expect(r.series[0].count, 'a moving entity must still record after repeated read+clear').toBeGreaterThan(0);
   });
+
+  // ── #648: malformed wire params ───────────────────────────────────────────────────────────
+  //
+  // `watch-start` is reached as `registerAgentOp('watch-start', (params) => startWatch((params ??
+  // {}) as StartWatchParams))` — an UNCHECKED cast over a wire payload, with no zod in front of
+  // it, and a first-class call path through `modoki_eval_api` / `device_eval_api`. So the
+  // TypeScript signature is a promise the transport does not keep, and these tests deliberately
+  // cast through `unknown` to send what the wire can actually deliver.
+  //
+  // Each case FAILED DIFFERENTLY before the fix, and none of them failed honestly.
+  describe('malformed params are refused, not misreported (#648)', () => {
+    it('a bare-string `guids` is refused — it used to iterate CHARACTERS and blame stale guids', () => {
+      setup();
+      w.spawn(EntityAttributes({ guid: 'p', name: 'P' }), WPos({ x: 0 }));
+      // `for (const g of p.guids)` over "p" iterated one character, missed, and returned the
+      // confident refusal "none of the 1 guid(s) resolved to a live entity — they may be
+      // stale... Re-read them with get_scene_state." That sentence reads as a FINDING and sends
+      // the reader to re-read a guid that was never wrong.
+      const r = startWatch({ component: 'WPos', guids: 'p' as unknown as string[] });
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/must be an ARRAY of strings/);
+      expect(r.error, 'must not blame the guids').not.toMatch(/stale/);
+    });
+
+    it('a bare-string `names` is refused instead of throwing `.map is not a function`', () => {
+      setup();
+      const r = startWatch({ component: 'WPos', names: 'Player' as unknown as string[] });
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/must be an ARRAY of strings/);
+    });
+
+    it('a bare-string `fields` is refused — it silently became a SUBSTRING match', () => {
+      setup();
+      // `numericFields`' `filter.includes(k)` is Array.prototype.includes (exact) only while
+      // `filter` really is an array. Handed "xy" it becomes String.prototype.includes, so BOTH
+      // `x` and `y` were watched while nothing reported a surprise.
+      const r = startWatch({ component: 'WPos', fields: 'xy' as unknown as string[] });
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/must be an ARRAY of strings/);
+    });
+
+    it('a non-string element inside an array is refused', () => {
+      setup();
+      const r = startWatch({ component: 'WPos', fields: ['x', 7] as unknown as string[] });
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/only strings/);
+    });
+
+    it('a non-numeric `maxSamples` is refused — clamp(NaN) made the watch record NOTHING', () => {
+      setup();
+      // `clamp(Math.floor('600'…), 1, CEIL)` on a non-number is NaN, so every
+      // `count < maxSamples` comparison is false and the watch reads back exactly like
+      // "the value never moved" — the same false negative the guid guard exists to prevent.
+      const r = startWatch({ component: 'WPos', maxSamples: '600' as unknown as number });
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/must be a finite number/);
+    });
+
+    it('NaN and Infinity are refused too, not just the wrong type', () => {
+      setup();
+      expect(startWatch({ component: 'WPos', everyNFrames: NaN }).ok).toBe(false);
+      expect(startWatch({ component: 'WPos', maxSeries: Infinity }).ok).toBe(false);
+    });
+
+    it('still ACCEPTS every well-formed param — the guard must not over-tighten', () => {
+      setup();
+      const e = w.spawn(EntityAttributes({ guid: 'g1', name: 'Player' }), WPos({ x: 0 }));
+      expect(e).toBeTruthy();
+      const r = startWatch({
+        component: 'WPos', guids: ['g1'], names: ['player'], fields: ['x'],
+        epsilon: 0.01, everyNFrames: 1, maxSamples: 10, maxSeries: 2, expireFrames: 0,
+      });
+      expect(r.ok, r.error).toBe(true);
+      // And the omit-everything call, which is the common one.
+      expect(startWatch({ component: 'WPos' }).ok).toBe(true);
+    });
+  });
+
 });

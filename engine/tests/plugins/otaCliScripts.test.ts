@@ -198,9 +198,11 @@ describe('ota-embed-manifest.mjs', () => {
     fs.writeFileSync(path.join(distDir, 'assets', 'app.js'), 'console.log(1);');
     // #582's sibling guard: `--project <dir>` is required and its `ota.bundleName` must match
     // `--name`. `distDir` lives at `<repoRoot>/dist`, so a `--project <repoRoot>` keeps it
-    // INSIDE the project for the happy-path cases below.
+    // INSIDE the project for the happy-path cases below. `enabled: true` is here for #649's
+    // separate gate — tests below that are about a DIFFERENT guard shouldn't also have to
+    // think about the enabled check; the tests that ARE about #649 override this explicitly.
     projectDir = repoRoot;
-    fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({ ota: { bundleName: 'shell' } }));
+    fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({ ota: { enabled: true, bundleName: 'shell' } }));
   });
   afterEach(() => fs.rmSync(repoRoot, { recursive: true, force: true }));
 
@@ -266,9 +268,38 @@ describe('ota-embed-manifest.mjs', () => {
   });
 
   it('#582: an absent ota.bundleName resolves to the default ("shell") and succeeds under --name shell', () => {
-    fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({ ota: {} }));
+    // `enabled: true` explicit here (unlike the bare `{}` this test used pre-#649) — this
+    // test is about bundleName defaulting specifically, not about the enabled gate, which is
+    // covered on its own below.
+    fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({ ota: { enabled: true } }));
     const { status } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
       ['--dist', distDir, '--name', 'shell', '--engine-api', '1', '--project', projectDir]);
     expect(status).toBe(0);
+  });
+
+  it('#649: rejects a project whose ota.enabled is explicitly false', () => {
+    fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({ ota: { enabled: false, bundleName: 'shell' } }));
+    const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
+      ['--dist', distDir, '--name', 'shell', '--engine-api', '1', '--project', projectDir]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/ota\.enabled is not true/);
+    expect(fs.existsSync(path.join(distDir, 'ota-embedded-manifest.json'))).toBe(false);
+  });
+
+  it('#649: rejects a project whose ota.enabled is ABSENT (defaults to false, not "unguarded")', () => {
+    fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({ ota: { bundleName: 'shell' } }));
+    const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
+      ['--dist', distDir, '--name', 'shell', '--engine-api', '1', '--project', projectDir]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/ota\.enabled is not true/);
+    expect(fs.existsSync(path.join(distDir, 'ota-embedded-manifest.json'))).toBe(false);
+  });
+
+  it('#649: succeeds and embeds a manifest when ota.enabled is true', () => {
+    fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({ ota: { enabled: true, bundleName: 'shell' } }));
+    const { status } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
+      ['--dist', distDir, '--name', 'shell', '--engine-api', '1', '--project', projectDir]);
+    expect(status).toBe(0);
+    expect(fs.existsSync(path.join(distDir, 'ota-embedded-manifest.json'))).toBe(true);
   });
 });

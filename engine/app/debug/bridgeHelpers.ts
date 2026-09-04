@@ -31,6 +31,24 @@ function isThenable(v: unknown): boolean {
     && typeof (v as { then?: unknown }).then === 'function';
 }
 
+/** A short, content-free description of a value's shape — for a refusal that must never echo what
+ *  the value actually held (a log line can carry secrets).
+ *
+ *  ⚠️ Deliberately a COPY of `describeShape` in `engine/tools/shared/mcpResult.ts` rather than an
+ *  import of it (#648). Every existing `engine/app` → `tools/shared` reference is `import type`,
+ *  which costs the bundle nothing; a VALUE import would pull MCP result-formatting code into the
+ *  bundle that ships to devices. Eight lines on this side of that boundary is the cheaper trade.
+ *  If this ever needs to change, change both — they are the same refusal vocabulary. */
+export function describeShape(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'an array';
+  if (typeof v === 'object') {
+    const keys = Object.keys(v as object).slice(0, 8);
+    return keys.length ? `an object with keys: ${keys.join(', ')}` : 'an empty object';
+  }
+  return `a ${typeof v}`;
+}
+
 export function safeStringify(value: unknown): string {
   if (isThenable(value)) return PENDING_PROMISE_MARKER;
   // An Error has NO own enumerable properties, so `JSON.stringify(new Error('boom'))` is `{}` —

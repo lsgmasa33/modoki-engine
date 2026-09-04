@@ -47,17 +47,39 @@ export function parseConsoleLogsReply(raw: unknown): ConsoleLogsReply {
   return { ok: false, got: describeShape(v) };
 }
 
-/** A short, content-free description of a value's shape — for error text that must never echo
- *  what the value actually held (it may be a log line, and log lines can carry secrets). */
-function describeShape(v: unknown): string {
-  if (v === null) return 'null';
-  if (Array.isArray(v)) return 'an array';
-  if (typeof v === 'object') {
-    const keys = Object.keys(v as object).slice(0, 8);
-    return keys.length ? `an object with keys: ${keys.join(', ')}` : 'an empty object';
+// ── device_native_logs reply shape (#648) ──────────────────────────────────
+export type NativeLogsReply =
+  | { ok: true; logs: string[]; error?: string }
+  | { ok: false; got: string };
+
+/** Decode `nativeLogs`. The app side answers a BARE ARRAY on the happy path and
+ *  `{logs, error}` only when the native plugin had something extra to say — because the value
+ *  originates in Swift/Kotlin in the INSTALLED BINARY while this MCP and the JS bundle version
+ *  independently, so both shapes are live on the wire at once (the #644 lesson, one layer down).
+ *
+ *  The `error` half is the point: `bridge.ts` used to destructure `{ logs }` and drop the
+ *  declared `error` field, so `{logs: [], error: 'OSLogStore denied'}` reached the reader as
+ *  "No logs." — *could not look* rendered as *nothing is there*. Those are opposite findings.
+ *  #670 is the sibling case where the same tool answers about the WRONG DEVICE. */
+export function parseNativeLogsReply(raw: unknown): NativeLogsReply {
+  const v = parseReply<unknown>(raw);
+  if (v == null) return { ok: true, logs: [] }; // a quiet log is an ANSWER, not a failure
+  if (Array.isArray(v) && v.every((s) => typeof s === 'string')) return { ok: true, logs: v as string[] };
+  if (typeof v === 'object' && 'logs' in v) {
+    const o = v as { logs: unknown; error?: unknown };
+    if (Array.isArray(o.logs) && o.logs.every((s) => typeof s === 'string')) {
+      return { ok: true, logs: o.logs as string[], ...(typeof o.error === 'string' && o.error ? { error: o.error } : {}) };
+    }
   }
-  return `a ${typeof v}`;
+  return { ok: false, got: describeShape(v) };
 }
+
+// `describeShape` moved to `engine/tools/shared/mcpResult.ts` (#648) once the editor MCP and the
+// backend router needed the same refusal vocabulary. Re-exported so this module's existing
+// importers are unchanged. `mcpResult.ts` has ZERO imports of its own, so pulling it in here does
+// not cost this file the "no MCP-SDK dependency" property its header promises.
+export { describeShape } from '../../shared/mcpResult.js';
+import { describeShape } from '../../shared/mcpResult.js';
 
 // ── Input fidelity (#32) ──────────────────────────────────────────────────
 // The literals a device_* reply / device_status line can report. Kept as named constants (rather

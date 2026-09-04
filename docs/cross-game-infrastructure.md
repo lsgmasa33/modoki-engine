@@ -133,6 +133,8 @@ missing tarball on open.
 | Scene-chrome patching | `engine/packages/modoki/src/runtime/ui/sceneChrome.ts` | See [ui-system.md](./ui-system.md) § "Pushing live values onto scene-authored chrome" |
 | Scroll views / recycled entries | `UIScrollView` + `UIEntries` | `games/scroll-demo` is a deliberate non-Court proof |
 | Trusted clock | `engine/packages/modoki/src/runtime/core/trustedClock.ts` | Server-time/monotonic anchor, promoted in #660. Pure arithmetic, **zero imports**; the GAME owns fetching and persisting. Passes the determinism guard with no allowlist entry. ⚠️ Defends the *instant*, NOT the timezone — see the daily-challenge bullet below |
+| **Cloud-save protocol** (the sync-guaranteed GROUP) | `engine/packages/modoki/src/runtime/sync/**` | ⚠️ **This row's absence is what made #658 wrong.** Landed #532 Phase A (2026-09-01); Court moved onto it the same day. Generic over `T` — `SyncGroupSpec<T>` (`fingerprint`/`isFreshAndEmpty`/`merge`/`adopt`/`onFork`/`atomicity`), `GroupStore<T>`, `GroupTransport`, `runCloudSync`, `decideGroup`, `resolveGroupFork`. Firebase-free, clock-free, imports no other L2 folder; one `court` token in the whole folder and it is a docstring. Tested over an anonymous `Content` type (`tests/runtime/syncGroups.test.ts`, 39 tests). **The GAME owns what its save MEANS; the engine owns the protocol** |
+| **Cloud-sync coordinator** (*when* a sync runs) | `engine/.../runtime/sync/coordinator.ts` | Promoted in #658 (2026-09-04). Debounces a burst of progression writes, suppresses further syncs while a fork dialog is unanswered, coalesces overlapping triggers into ONE follow-up rather than a queue, and carries the #506 generation guard for sign-out-mid-sync. Generic over the **fork**, not the save — `CloudSyncCoordinator<TFork extends SyncFork>`, with `resolve`'s document reached as `TFork['serverDoc']`. ⚠️ **It must never read a field off a save document** — that property is the whole basis of the type parameter, and its test's `{ version }` stub document is the tripwire: needing a richer one there means it has stopped being generic |
 
 ## What is deliberately NOT shared
 
@@ -172,6 +174,29 @@ reopen it.
   defect**: `games/court/daily.md` § "The clock is not trusted, and it is not defended either" states
   it as an explicit *Ruling: accept it* (single-player, no leaderboard, every defence needs infra
   Court does not have). So this work would **overturn a ruling**, not fill a gap — start there.
+- **Settings + ad policy — deferred on evidence (#661, closed 2026-09-04).** The mechanism in each
+  generalizes; the field set does not; and the second consumer the extraction would be written
+  against **does not exist and cannot yet**. Measured, not read: the only other shipping-shaped game
+  has no settings module, no settings UI, and **no audio subsystem at all** — `audio|music|sfx|sound`
+  greps its `systems.ts` and `traits.ts` at 0 and 0, so there is nothing for a volume slider to
+  control — and its scene JSON contains zero occurrences of `settings`. `settings.ts` exists in
+  exactly one place repo-wide. Ad gating likewise: no `interstitial`/`rewarded`/cooldown logic under
+  any other `games/*/runtime` or `demos/*/runtime`. (The second game's scene does carry an
+  `AdBannerSlot` — with **zero code references**, and its `app-services` has no `ads.ts`.)
+  ⚠️ **Two corrections to how this pair gets described**, both of which would mislead a future
+  extraction:
+  1. **`settings.ts` does not persist.** It is 60 lines of pure normalise-on-read — defaults,
+     0..1 clamping, and the one legacy `soundOn` migration branch — and is banner-forbidden from
+     touching `PlayerPrefs`. "Defaults, migration, and persist" describes two different files;
+     persistence lives in `systems.ts`, the only file in that game allowed to touch `PlayerPrefs`.
+  2. **Settings are not local.** `court.settings` is a single-key **sync group** with
+     `onFork: 'take-newer'`, whose content deliberately survives an account wipe. So the extraction
+     is not "lift a 60-line pure module" — it drags a `SyncGroupSpec`, an on-disk envelope, and a
+     legacy pre-envelope document shape that readers must still tolerate. Sequence it **after** the
+     cloud-save row below, not before.
+  **Reopens when a second game grows a settings SCREEN or an ad cooldown** — a product decision, not
+  an extraction. Start with settings when it does: the legacy-field migration is the part that is
+  genuinely painful to re-derive.
 - **A store SCREEN — deferred on assessment (#659, closed 2026-09-04).** `games/court/runtime/storeUi.ts`
   is 581 lines / 228 code, and splits ~18% catalog-agnostic / ~42% generic mechanism wearing a
   Court-shaped type / ~40% copy and catalog. Its two DIRECT imports are siblings — no
@@ -256,19 +281,63 @@ carrying its own validation status — the coupling verdicts below came from *re
 that produced them reversed itself on three of the four rows it originally covered, once someone
 actually read the code:
 
-Two of the original four are settled: **#660** (the trusted clock) was PROMOTED — see the table in
-§ "What is shared today"; **#659** (the store screen) was assessed and DEFERRED — see § "What is
-deliberately NOT shared", which carries the condition that reopens it.
+**All four are now settled** (2026-09-04). **#660** (the trusted clock) was PROMOTED — see the table
+in § "What is shared today". **#659** (the store screen) and **#661** (settings + ad policy) were
+assessed and DEFERRED — see § "What is deliberately NOT shared", which carries each one's reopening
+condition.
 
-- **#658** — cloud save / account sync. The largest surface by ~5×; blocked on designing a generic
-  save-document seam, and it gates Firebase `/authentication` + `/firestore` reaching a second game.
-- **#661** — settings + ad policy. Mechanism generalizes, field sets do not; no second consumer yet.
+**#658** — cloud save / account sync — was **re-scoped, because its stated blocker did not exist.**
+
+⚠️ **The correction worth carrying forward: #658 was filed on 2026-09-03 saying "there is nothing to
+extract until a generic save-document seam exists". One had existed since 2026-09-01** — `runtime/sync/**`,
+#532 Phase A — **and the game it called welded had been running on it for two days.** The issue cited
+this very doc for context, and this doc's § "What is shared today" table did not list the sync
+subsystem. A survey reads the table, not the whole engine. **When something lands in `engine/**`, the
+row here is part of landing it** — an omission does not read as "unlisted", it reads as "absent", and
+it cost a filed issue with an inverted premise.
+
+What is genuinely left is **not** a seam design. The protocol, the versioning, the conflict decision
+table, the fork resolution and the transport interface are all engine-side and document-agnostic
+already; the coordinator joined them (see the table above). What is still game-shaped is *what a save
+MEANS*, plus three narrower items, each now its own issue:
+
+- **#673** — the conflict dialog's view-model is a fixed record of one game's nouns (solves, stars,
+  coins, track). A generic seam needs "the game returns N labelled rows", not a shared struct.
+- **#674** — the wiring needs exactly two injections (an auth/cloud-save service pair, and an
+  `onBackground` hook, today a hardcoded game-specific save call on the background edge), and the
+  widen/narrow pair dispatches on **literal group ids**, a hand-written type-erasure escape hatch only
+  the game can supply. ⚠️ It also records that the game's flat `SyncTransport` and the engine's
+  structured `GroupTransport` are bridged by **real translation, not a redundant duplicate** — that
+  bridge was misread as a free deletion once.
+- **#675** — the account UI is ~2/3 account-generic, but the generic part is mostly **hardcoded
+  English**. An engine module that hardcodes copy is worse than a duplicated one: it is a
+  localisation blocker a game cannot reach.
+
+**All three are deferred, for the reason everything else on this page is: zero second consumers.** No
+other game has sign-in, an account, or a cloud save — which is also why the Firebase
+`/authentication` + `/firestore` gate #658 was said to hold is not currently holding anything back.
+
+**The COORDINATOR has now moved** (2026-09-04) — see the row in § "What is shared today". It is the
+one part that needed no design at all: it never reads a field off the save document, so the type
+parameter is the FORK (`SyncFork = { groupId, serverDoc: unknown }`), not the save, and `resolve`'s
+document arrives as `TFork['serverDoc']`.
+
+⚠️ **This one was moved against the "wait for a second consumer" rule, deliberately and on the
+owner's call** (2026-09-04), so do not read it as the rule weakening. Two things made it different
+from every deferred row above: the engine already owned the protocol and shipped **no driver** above
+it, so the gap was in an extracted subsystem rather than a speculative one; and the extraction
+required **no guess about a second game's needs**, because the module had zero `court` tokens before
+it moved. The reason it had been held back — "a shipping game's save path" — **was simply wrong**:
+Court is not publicly shipped, which #532 ruling 5 had already recorded when it priced a fleet-wide
+re-fingerprint at zero.
 
 ## Related
 
 - [native-and-sdks.md](./native-and-sdks.md) — the native SDK plugin pattern, and the wiring traps a
   plugin promotion has to clear
 - [iap.md](./iap.md) — the IAP mechanism used as the template for a core/config split
+- [cloud-sync.md](./cloud-sync.md) — the group protocol itself: what a sync-guaranteed group is, the
+  decision table, and the fork rules
 - [ui-system.md](./ui-system.md) — scene-chrome patching, the one UI extraction that landed
 - [architecture-layers.md](./architecture-layers.md) — the L0–L3 contract any engine destination
   has to satisfy

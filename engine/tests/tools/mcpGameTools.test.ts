@@ -431,6 +431,73 @@ describe('sync', () => {
     expect(Object.keys(r.refused)).toHaveLength(1);
   });
 
+  // #648 — a bare `null` element (distinct from the well-formed-but-nameless object case above)
+  // used to reach `fingerprint()` BEFORE the per-element `!d` guard ever ran: `t.name` on `null`
+  // threw a TypeError straight out of `refresh()`. Called directly (as here, not through `tick()`'s
+  // own poll `catch`) that surfaces as a REJECTED promise — the whole surface died over one bad
+  // element, breaking gameTools.ts's own stated contract ("a refused tool is reported, not dropped
+  // quietly") for every well-formed declaration in the same reply.
+  it('a bare null element does not take the whole poll down — valid tools still register', async () => {
+    const h = harness(() => ({ body: { version: 1, tools: [decl(), null, decl({ name: 'court_b' })] } }));
+    const r = await h.sync.refresh();
+    expect(r.registered.sort()).toEqual(['court_b', 'court_load_level']);
+    expect(Object.keys(r.refused)).toHaveLength(1);
+    expect(h.sync.active().sort()).toEqual(['court_b', 'court_load_level']);
+  });
+
+  // #648 review follow-up — these two guard the FIX's own regressions, not the original bug. Both
+  // need MORE THAN ONE refresh(), which is exactly why the single-call test above could not see
+  // them: partitioning the malformed entries out made every downstream decision read a set that no
+  // longer matched the one being reasoned about.
+  it('keeps reporting a malformed declaration on a STEADY-STATE poll (it is not fingerprinted away)', async () => {
+    // Fingerprinting `validDecls` alone meant a malformed element never changed the print, so the
+    // `print === lastPrint` early return handed back `lastRefused` — and `refused` is rebuilt per
+    // call and was never assigned. The bad declaration was therefore reported on NO poll, ever.
+    let tools: unknown[] = [decl()];
+    const h = harness(() => ({ body: { version: 1, tools } }));
+
+    const first = await h.sync.refresh();
+    expect(first.registered).toEqual(['court_load_level']);
+    expect(Object.keys(first.refused)).toHaveLength(0);
+
+    tools = [decl(), null];                       // the backend starts sending a bad element
+    const second = await h.sync.refresh();
+    expect(second.registered).toEqual(['court_load_level']);
+    expect(Object.keys(second.refused), 'a malformed decl must be REPORTED, not silently dropped').toHaveLength(1);
+
+    const third = await h.sync.refresh();         // and it must keep being reported while it persists
+    expect(Object.keys(third.refused)).toHaveLength(1);
+
+    tools = [decl()];                             // ...and stop once the backend stops sending it
+    const fourth = await h.sync.refresh();
+    expect(Object.keys(fourth.refused), 'a refusal must not outlive the declaration that caused it').toHaveLength(0);
+    expect(fourth.registered).toEqual(['court_load_level']);
+  });
+
+  it('an ALL-malformed poll gets the shrink-to-zero grace, not an instant teardown', async () => {
+    // The grace window still keyed on the raw `decls` while everything downstream keyed on
+    // `validDecls`: `{tools:[null]}` has decls.length === 1, so the guard was skipped and a SINGLE
+    // corrupt poll called removeAll() on every registered game tool. `{tools:[]}` would have been
+    // given grace; the two are the same event as far as the usable set is concerned.
+    let tools: unknown[] = [decl()];
+    const h = harness(() => ({ body: { version: 1, tools } }));
+    await h.sync.refresh();
+    expect(h.sync.active()).toEqual(['court_load_level']);
+
+    tools = [null];
+    await h.sync.refresh();
+    expect(h.sync.active(), 'one corrupt poll must not tear the surface down').toEqual(['court_load_level']);
+  });
+
+  it('two null elements are reported as TWO refusals, not collapsed into one', async () => {
+    // `decls.indexOf(d)` returns the FIRST match for identical primitives, so both nulls wrote the
+    // same `(malformed #0)` key and one of them vanished.
+    const h = harness(() => ({ body: { version: 1, tools: [decl(), null, null] } }));
+    const r = await h.sync.refresh();
+    expect(r.registered).toEqual(['court_load_level']);
+    expect(Object.keys(r.refused)).toHaveLength(2);
+  });
+
   // The SEAM, and the one claim in gameTools.ts's own docblock that reading the code can only
   // make plausible: a game tool is supposed to have "a real place in modoki_batch". Batch resolves
   // a step through the REGISTRY (not CONTRACTS, which a game tool has no entry in) and re-parses

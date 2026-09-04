@@ -358,4 +358,71 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     expect(r.status).toBe(500);
     expect(r.body.error).toMatch(/renderer wedged mid-call/);
   });
+
+  // ── #647: a reply that RETURNED but cannot be read ───────────────────────────────────────
+  //
+  // The distinction these guard is the whole point of the fix: a relay that never returned is
+  // safe to call "the editor is not answering" and safe to retry; a relay that RETURNED an
+  // unreadable shape is NEITHER, because the ops already ran. Before the fix both collapsed
+  // into the same 500 → NOT_AVAILABLE_HERE → "relaunch the editor", which invites a caller to
+  // re-fire a WRITE it was wrongly told had failed.
+  //
+  // ⚠️ Every mock below returns WITHOUT throwing — a test that throws exercises the case above
+  // and cannot tell the two apart, which is exactly how this survived.
+  const MALFORMED_REPLIES: Array<[string, unknown]> = [
+    ['errors missing', { ok: true, changed: 1, warnings: [], unresolved: [] }],
+    ['warnings missing (the spread, not a .length)', { ok: true, changed: 1, errors: [], unresolved: [] }],
+    ['unresolved missing', { ok: true, changed: 1, errors: [], warnings: [] }],
+    ['errors present but not an array', { ok: true, changed: 1, errors: 'nope', warnings: [], unresolved: [] }],
+    ['changed missing', { ok: true, errors: [], warnings: [], unresolved: [] }],
+    ['a bare error string from the relay', 'Unknown method: apply-scene-ops'],
+    ['null', null],
+    ['an array', []],
+  ];
+
+  for (const [label, reply] of MALFORMED_REPLIES) {
+    it(`reports PARTIAL (never a retryable 500) when apply-scene-ops answers ${label}`, async () => {
+      const scenePath = tempScene();
+      const before = fs.readFileSync(scenePath, 'utf-8');
+      const requestBrowser = vi.fn(async (op: string) => {
+        if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+        if (op === 'apply-scene-ops') return reply;
+        throw new Error(`unexpected op ${op}`);
+      });
+      const ctx = makeCtx({ requestBrowser });
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as {
+        status?: number; body: { ok: boolean; code?: string; error?: string };
+      };
+      // NOT a 500 — that maps to NOT_AVAILABLE_HERE in the MCP (context.ts: `status >= 500`),
+      // whose remedy is "relaunch the editor", i.e. "try again".
+      expect(r.status ?? 200).toBe(200);
+      expect(r.body.ok).toBe(false);
+      expect(r.body.code).toBe('PARTIAL');
+      // The caller must be told BOTH halves: the ops may have landed, and retrying is unsafe.
+      expect(r.body.error).toMatch(/ALREADY APPLIED/);
+      expect(r.body.error).toMatch(/do NOT retry/);
+      // Content-free shape description — a scene op carries authored strings, and this text
+      // must never echo them back (the #644 `describeShape` rule).
+      expect(r.body.error).not.toMatch(/nope/);
+      // And it must NOT have silently fallen through to the file-direct branch, which would
+      // re-run the edit against disk while the live world is in an unknown state.
+      expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before);
+    });
+  }
+
+  it('a JSON-STRING reply is decoded, not refused — the transport has handed back strings before', async () => {
+    // `decodeAimReply`'s header records this exact drift (a relay returning '{"x":…}' rather
+    // than an object), caught only on device. A correct reply that merely arrived as a string
+    // must not be reported as an unreadable shape.
+    const scenePath = tempScene();
+    const requestBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+      if (op === 'apply-scene-ops') return JSON.stringify({ ok: true, changed: 1, errors: [], warnings: [], unresolved: [] });
+      throw new Error(`unexpected op ${op}`);
+    });
+    const ctx = makeCtx({ requestBrowser });
+    const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { body: { ok: boolean; changed: number } };
+    expect(r.body.ok).toBe(true);
+    expect(r.body.changed).toBe(1);
+  });
 });

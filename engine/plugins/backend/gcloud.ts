@@ -49,12 +49,14 @@ export function deriveGcsBucketFromBaseUrl(baseUrl: string): string | null {
   return m ? `gs://${m[1].replace(/\/+$/, '')}` : null;
 }
 
-/** A version/bundle-name/key-name string interpolated into a `bash -c` command
- *  (buildStepShell.ts) — must never carry shell metacharacters. Same discipline as
- *  `validateBuildConfig`. */
-export const OTA_SAFE_TOKEN = /^[A-Za-z0-9._-]{1,64}$/;
-/** A `gs://bucket[/prefix]` URL, similarly constrained before shell interpolation. */
-export const OTA_SAFE_BUCKET = /^gs:\/\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._/-]*)?$/;
+// OTA_SAFE_TOKEN / OTA_SAFE_BUCKET moved to engine/scripts/ota/otaSafeTokens.mjs (#649,
+// following the #582 precedent just below: otaSigningKeyRefusal lives in a `.mjs` for the
+// same reason). ota-publish.mjs reaches this same shared gcloud publish operation as a CLI
+// (run as a child process) and validated only PRESENCE of --name/--version/--bucket, not
+// charset, before interpolating them into a shell command — a `.ts` module here can't be
+// imported by that `.mjs` CLI, so the regexes now live once in a `.mjs` module both sides
+// import.
+export { OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from '../../scripts/ota/otaSafeTokens.mjs';
 
 /** Did `gcloud storage cat <bucket>/release.json` fail because the object genuinely ISN'T THERE,
  *  or because we COULD NOT LOOK?

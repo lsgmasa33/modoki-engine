@@ -531,9 +531,17 @@ from the transport-agnostic `editorBackendRouter.ts` so they also work in a pack
 editor. `engine/plugins/backend/gcloud.ts` holds the shared, Vite-import-free helpers both
 routes need: `resolveGcloudDir` (locates the `gcloud` CLI even in a Finder-launched packaged
 editor's minimal `PATH`), `deriveGcsBucketFromBaseUrl` (reverses `ota.baseUrl`'s
-`https://storage.googleapis.com/…` form to the `gs://…` form `gcloud` needs), and
-`OTA_SAFE_TOKEN`/`OTA_SAFE_BUCKET` (regexes every interpolated value is checked against before
-it touches a `bash -c` string).
+`https://storage.googleapis.com/…` form to the `gs://…` form `gcloud` needs), and it re-exports
+`OTA_SAFE_TOKEN`/`OTA_SAFE_BUCKET` — the regexes every interpolated value is checked against
+before it touches a `bash -c` string.
+
+⚠️ **Those two regexes LIVE in `engine/scripts/ota/otaSafeTokens.mjs`, not in `gcloud.ts` (#649).**
+They moved for the same reason `otaSigningKeyRefusal` did in #582: `ota-publish.mjs` is a plain
+`.mjs` CLI that cannot import a `.ts` module, so while they lived on the TS side **only the two
+route surfaces enforced them and the CLI enforced nothing** — it checked `--name`/`--version` for
+presence and `--bucket` for a `gs://` prefix, and no charset check existed anywhere downstream.
+`gcloud.ts` now re-exports from the `.mjs`, so all three entry points share ONE definition and
+`editorBackendRouter.ts` / `vite-asset-scanner.ts` / `otaGcloud.test.ts` import as before.
 
 **This pipeline only ever builds and publishes the shell bundle** — see the Gotchas entry
 below on the bundleName restriction; publishing a sub-game bundle is still a manual
@@ -565,6 +573,27 @@ rather than "an upload got partway". `release.json` is still written after every
 
 ## Gotchas
 
+- **`ota-publish.mjs`'s `q()` was NOT a shell quote, and a `/` in `--name` defeated #577** (#649).
+  `q = (s) => JSON.stringify(s)` emits a DOUBLE-quoted word and escapes only `"`, `\` and control
+  chars — and POSIX shells expand `$(…)`, backticks and `${…}` *inside* double quotes, so it
+  never actually neutralised interpolation for the 11 `execSync` sites it feeds. The reachable,
+  non-malicious half: `--name "shell/v2"` wrote objects under a NESTED bucket path while
+  `release.json` recorded the flat name, so the version-collision guard read back a path nothing
+  would ever collide with — **the same version could be republished with different bytes and no
+  refusal**, which is precisely what #577 exists to prevent.
+  Fixed in two layers: the CLI now applies `OTA_SAFE_TOKEN`/`OTA_SAFE_BUCKET` (see Key files), which
+  makes the three tainted inputs metacharacter-free on both `sh` and `cmd.exe`; and `q()` is now
+  platform-split — POSIX single-quoting with the `'\''` escape, win32 keeping the double-quote form
+  because `cmd.exe` does not treat `'` as a quote character at all.
+  ⚠️ Two things deliberately NOT done. `execFileSync` (no shell at all) was rejected: the test
+  harness installs a fake `gcloud.cmd` on Windows and Node refuses to spawn `.cmd` without a shell
+  (CVE-2024-27980). And the win32 quoting branch is **unvalidated against a real Windows shell**
+  from a Mac — the same caveat `engine/plugins/buildStepShell.ts` already carries for its `winCmd`
+  forms.
+- **`ota-embed-manifest.mjs` did not read `ota.enabled`** (#649) — its own sibling
+  `ota-publish.mjs` did, and so did the route (`vite-asset-scanner.ts` makes the embed step
+  conditional on it), so a hand run wrote `ota-embedded-manifest.json` into the dist of a project
+  that had opted OUT. Inert today (nothing calls `checkForUpdate` there), fixed for the asymmetry.
 - **The OTA bucket needs CORS** (`origin:["*"], method:["GET","HEAD"]`). Object storage
   typically sets none by default, and `curl`/CLI tools ignore CORS entirely — so nothing
   catches this until a real WebView `fetch()` fails, and `checkForUpdate` reports it as the

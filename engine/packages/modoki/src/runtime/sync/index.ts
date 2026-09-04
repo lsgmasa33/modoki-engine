@@ -14,3 +14,7 @@ export {
   runGroupSync, runCloudSync, type GroupOutcome, type RunSyncOptions, type RunSyncResult,
 } from './runGroupSync';
 export { resolveGroupFork, type ResolveForkOptions } from './resolveFork';
+export {
+  CloudSyncCoordinator,
+  type CloudSyncDeps, type PendingConflict, type SyncFork, type SyncOutcomeOf, type SyncReason,
+} from './coordinator';

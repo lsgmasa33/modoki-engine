@@ -67,11 +67,12 @@ export { createPrefsDocStore, type PrefsDocStore } from './storage/prefsDocStore
 // binds a `GroupStore` per group (`createPrefsDocStore` above is the usual single-key one).
 export {
   defineSyncGroup, emptyMarks, neverSynced, decideGroup, hasLocalWrites, scopeMarksToAccount,
-  runGroupSync, runCloudSync, resolveGroupFork,
-  type AnySyncGroup, type CloudGroup, type ConflictChoice, type ForkPolicy, type GroupAtomicity,
-  type GroupDecision, type GroupMarks, type GroupOutcome, type GroupStore, type GroupTransport,
-  type LocalGroup, type ResolveForkOptions, type RunSyncOptions, type RunSyncResult,
-  type SyncGroupSpec,
+  runGroupSync, runCloudSync, resolveGroupFork, CloudSyncCoordinator,
+  type AnySyncGroup, type CloudGroup, type CloudSyncDeps, type ConflictChoice, type ForkPolicy,
+  type GroupAtomicity, type GroupDecision, type GroupMarks, type GroupOutcome, type GroupStore,
+  type GroupTransport, type LocalGroup, type PendingConflict, type ResolveForkOptions,
+  type RunSyncOptions, type RunSyncResult, type SyncFork, type SyncGroupSpec, type SyncOutcomeOf,
+  type SyncReason,
 } from './sync';
 // In-app purchases (#196). `reconcile()` MUST run once per launch before the player can buy
 // anything — it is the recovery pass for a purchase interrupted by a crash or force-close.

@@ -180,19 +180,58 @@ export function createGameToolSync(server: McpServer, ctx: ToolContext): GameToo
       return onUnreachable();
     }
 
+    // #648 — partition BEFORE `fingerprint()` sees any of this, not after. `fingerprint()` used to
+    // run over the raw reply, so a single malformed element (a bare `null`, which a corrupted or
+    // older backend can legitimately send) threw straight out of `t.name` — a TypeError `tick()`'s
+    // poll `catch` swallows silently, so game tools never registered and every later poll died at
+    // the same line, breaking this module's own stated contract above ("a refused tool is
+    // reported, not dropped quietly") for the WHOLE surface over one bad element. Silently
+    // dropping a malformed entry is no better — the tool is simply absent and nothing says why —
+    // so it goes in `refused` instead, same as it always has, and the reconcile loop below only
+    // ever sees the well-formed rest.
+    //
+    // ⚠️ The partition must happen ABOVE every decision that used to read `decls`, and all three
+    // of them now read `validDecls`. Review of the first cut caught two defects from leaving them
+    // behind, both the same mistake — reasoning about the raw reply while acting on the filtered
+    // set. See the individual comments below.
+    const validDecls: ToolDecl[] = [];
+    decls.forEach((d, i) => {
+      // Index by POSITION, not `decls.indexOf(d)` — `indexOf` returns the FIRST match for
+      // identical primitives, so `{tools:[null, null]}` wrote `(malformed #0)` twice and reported
+      // two bad declarations as one.
+      if (!d || typeof d.name !== 'string' || !d.name) {
+        refused[`(malformed #${i})`] = 'declaration has no usable name';
+        return;
+      }
+      validDecls.push(d);
+    });
+
     // A successful fetch — even one that turns out to have an unchanged fingerprint below — is
     // proof the editor answered, so the grace window resets here rather than after the reconcile.
     // But only on a TOOL-BEARING answer: resetting on an empty 200 too would defeat the very grace
-    // window `onTransientEmpty()` exists to give the shrink-to-zero transition below.
-    if (decls.length > 0) consecutiveFailures = 0;
+    // window `onTransientEmpty()` exists to give the shrink-to-zero transition below. A poll whose
+    // every element was malformed is NOT tool-bearing, hence `validDecls`.
+    if (validDecls.length > 0) consecutiveFailures = 0;
 
-    const print = fingerprint(decls);
+    // ⚠️ The fingerprint covers the REFUSED keys as well as the valid declarations. Fingerprinting
+    // `validDecls` alone was a defect this fix introduced: a malformed element does not change the
+    // valid set, so `print === lastPrint` took the early return below and handed back `lastRefused`
+    // — `refused` is rebuilt per call and was never assigned — so a malformed declaration was
+    // reported on NO poll, ever. That is the exact contract this partition exists to honour, broken
+    // by the thing meant to honour it. The mirror case failed too: an entry reported once stayed in
+    // `lastRefused` forever after the backend stopped sending it.
+    const print = `${fingerprint(validDecls)}|${JSON.stringify(Object.keys(refused).sort())}`;
     if (print === lastPrint) return { reachable: true, registered: [...registered.keys()], refused: lastRefused };
 
     // A 200 with an empty tool list while some are still registered is the reload gap described
     // above (setup() hasn't called registerCourtAgentTools() yet) — give it the same grace as an
     // unreachable poll rather than tearing down immediately.
-    if (decls.length === 0 && registered.size > 0) return onTransientEmpty();
+    //
+    // ⚠️ `validDecls`, not `decls`: a poll answering only malformed entries reduces the usable set
+    // to zero exactly like an empty one, so it must get the same grace. Keyed on `decls` it did
+    // not — `decls.length` was 1, the guard was skipped, and a SINGLE corrupt poll tore down every
+    // registered game tool with no grace window at all.
+    if (validDecls.length === 0 && registered.size > 0) return onTransientEmpty();
 
     // Reconcile wholesale rather than diffing. The surface is a handful of tools, and a
     // remove-then-add is the only way a CHANGED schema (same name, new params) actually reaches
@@ -200,27 +239,23 @@ export function createGameToolSync(server: McpServer, ctx: ToolContext): GameToo
     // to reach into SDK internals.
     removeAll();
 
-    for (const d of decls) {
-      // Silently dropping a malformed entry is the failure this whole seam exists to remove: the
-      // tool is simply absent and nothing anywhere says why. It cannot come from a well-behaved
-      // game (the engine registry validates names at registration), so this is about an older or
-      // corrupted backend — precisely when a reason is worth having.
-      if (!d || typeof d.name !== 'string' || !d.name) {
-        refused[`(malformed #${decls.indexOf(d)})`] = 'declaration has no usable name';
-        continue;
-      }
-      const shape = shapeFromDecl(d.params);
-      if (!shape) {
-        refused[d.name] = 'declares a parameter type this server does not recognise';
-        continue;
-      }
-      // A game tool naming an engine tool would throw out of `registerTool` and take the whole
-      // poll down. Refuse it by name instead: the engine surface wins, and the game gets told.
-      const handler = async (args: never): Promise<ToolResult> => {
-        const r = await ctx.postJson('/api/game-tool-call', { name: d.name, args: args ?? {} }, 30_000, `the game tool ${d.name}`);
-        return r;
-      };
+    for (const d of validDecls) {
+      // `shapeFromDecl` now runs INSIDE this try too (#648) — it used to run outside, so a throw
+      // from it (a registry-serialization edge case, current or future) would escape `refresh()`
+      // the same way the fingerprint bug above did, rather than landing in `refused` like every
+      // other per-tool failure here.
       try {
+        const shape = shapeFromDecl(d.params);
+        if (!shape) {
+          refused[d.name] = 'declares a parameter type this server does not recognise';
+          continue;
+        }
+        // A game tool naming an engine tool would throw out of `registerTool` and take the whole
+        // poll down. Refuse it by name instead: the engine surface wins, and the game gets told.
+        const handler = async (args: never): Promise<ToolResult> => {
+          const r = await ctx.postJson('/api/game-tool-call', { name: d.name, args: args ?? {} }, 30_000, `the game tool ${d.name}`);
+          return r;
+        };
         const handle = defineTool(
           server,
           ctx,

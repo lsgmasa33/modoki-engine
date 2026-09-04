@@ -114,6 +114,22 @@ else. `SceneManager` is the worked example: its generation comes from the helper
 the in-flight count and the post-swap latch remain its own. The helper exists to remove duplicated
 machinery, not to flatten sites that legitimately need more.
 
+⚠️ **A site can ask the INVERSE question, and then a `capture()` is the wrong tool — `sync/coordinator.ts`
+is the example** (#658). Three of its continuations take an ordinary `capture()`: *is my session still
+live?* Its coalescing bit does not — a trigger that arrived AFTER a reset is owed its sync precisely
+*because* the run resuming to dispatch it is dead, so substituting `stillLive()` there inverts the
+answer (measured: it reddens two tests). **Do not "simplify" a raw `.generation` read into a
+`capture()` without first asking which of the two questions the site is asking.**
+
+⚠️ **But be precise about what carries that, because the obvious reading is wrong.** What makes the
+follow-up survive is that it is judged by a *different variable* than the staleness check — **not**
+the `again.gen === generation` comparison beside it, which is a defensive **tautology**:
+`invalidateAll()` is the only writer of the counter and the reset nulls the bit in the same
+synchronous block, so a non-null bit always carries the current generation. Deleting that comparison
+reddens nothing, and no test can be written that makes it fail. It is kept because it keeps the
+distinction visible, and `again.gen` is therefore a field that is written and never decisive — worth
+knowing before you write a test for a branch that cannot be false.
+
 The other three tokens are **hand-rolled by convention**, exposed as a named predicate so they are
 greppable: `stillActive()`, `stillOurs()`, `isSuperseded()`. Name yours `still*` or `is*Superseded`,
 and do not inline the comparison at a dozen call sites.

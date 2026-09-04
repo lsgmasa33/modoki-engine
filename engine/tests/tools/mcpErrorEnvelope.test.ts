@@ -265,6 +265,71 @@ describe('§5 — classification: the code must match what actually went wrong',
   });
 });
 
+// #648 — `modoki_list_assets`/`modoki_list_traits` read `/api/scan-assets`/`/api/trait-schema`
+// through RAW `call()` (not getJson), because each wants a caller-facing §5 label (`read the
+// project asset manifest` / `read the live trait registry`) getJson's generic `read ${path} from
+// the editor backend` label would blur, and getJson's `transform` throwing into its own catch
+// would recreate the exact bug being fixed here. So — unlike every getJson/postJson tool covered
+// above — they had to apply the SPA-fallthrough guard and a body-shape guard BY HAND, and until
+// this fix neither did: an absent route (or a wrongly-shaped 200) read as a clean, empty answer
+// ("this project has no assets/traits") instead of the failure it actually is.
+describe('§648 — the raw call() list tools need the same guards getJson gives for free', () => {
+  it('modoki_list_assets against SPA HTML is a failure, NOT a clean "zero assets"', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/scan-assets'
+        ? { status: 200, body: '<!DOCTYPE html><html><body>editor</body></html>' }
+        : undefined));
+    const e = envelope(s, await s.call('modoki_list_assets'));
+    expect(e.code).toBe('NOT_AVAILABLE_HERE');
+    expect(e.why).toContain('NOT');   // "…This is NOT an empty result." / "NOT 'this project has no assets'"
+  });
+
+  it('modoki_list_assets against a body whose `assets` is not an array refuses, and never echoes its content', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/scan-assets' ? { status: 200, body: { assets: 'SECRET_MARKER_NOT_AN_ARRAY' } } : undefined));
+    const r = await s.call('modoki_list_assets');
+    const e = envelope(s, r);
+    expect(e.code).toBe('NOT_AVAILABLE_HERE');
+    // describeShape reports KEYS/shape only — the body's actual content must never appear.
+    expect(s.text(r)).not.toContain('SECRET_MARKER_NOT_AN_ARRAY');
+  });
+
+  it('modoki_list_assets against a body with no `assets` key at all refuses the same way', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/scan-assets' ? { status: 200, body: { totally: 'unrelated', field: 1 } } : undefined));
+    const e = envelope(s, await s.call('modoki_list_assets'));
+    expect(e.code).toBe('NOT_AVAILABLE_HERE');
+  });
+
+  it('modoki_list_traits against SPA HTML is a failure, NOT a clean "zero traits"', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/trait-schema'
+        ? { status: 200, body: '<!DOCTYPE html><html><body>editor</body></html>' }
+        : undefined));
+    const e = envelope(s, await s.call('modoki_list_traits'));
+    expect(e.code).toBe('NOT_AVAILABLE_HERE');
+    expect(e.why).toContain('NOT');
+  });
+
+  it('modoki_list_traits against a body whose `traits` is not an object refuses, and never echoes its content', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/trait-schema' ? { status: 200, body: { traits: 'SECRET_MARKER_NOT_AN_OBJECT' } } : undefined));
+    const r = await s.call('modoki_list_traits');
+    const e = envelope(s, r);
+    expect(e.code).toBe('NOT_AVAILABLE_HERE');
+    expect(s.text(r)).not.toContain('SECRET_MARKER_NOT_AN_OBJECT');
+  });
+
+  it('modoki_list_traits against a body whose `traits` is an ARRAY (not a Record) refuses too', async () => {
+    // `Array.isArray` narrowly passes `typeof === 'object'` — the class of bug this guard exists
+    // to catch, one type up from a bare string.
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/trait-schema' ? { status: 200, body: { traits: [] } } : undefined));
+    const e = envelope(s, await s.call('modoki_list_traits'));
+    expect(e.code).toBe('NOT_AVAILABLE_HERE');
+  });
+});
+
 describe('S2 batch 2 — failures that used to read as successes', () => {
   it('the identity probe RETRIES after a failure instead of memoizing it', async () => {
     // It memoized failure too: the promise was assigned before the fetch and the catch swallowed
@@ -639,7 +704,16 @@ describe('S3.21 — the over-cap hint names the CALLED tool\'s own filters', () 
   it('every filter a capped response advertises is a real parameter of that tool', async () => {
     // The guard that makes the fix durable: the hint is built from the contract table, which can go
     // stale. Intersecting with the schema means a stale declaration cannot advertise a dead param.
-    const s = (surface = loadSurface(() => ({ body: huge(2000) })));
+    //
+    // `modoki_list_assets` gets its OWN, well-formed reply here (#648): it reads `/api/scan-assets`
+    // through a body-shape guard now (a wrongly-shaped 200 is a structured FAILURE, not a silent
+    // "zero assets" — see mcpSummarize/context tests), so handing it the same `{logs:[...]}` shape
+    // the other two tools use to blow the cap would make it refuse instead of returning a hint —
+    // this test is checking the hint text names real params, not exercising the cap itself for
+    // this tool (a BARE list_assets call never echoes its `assets` count anyway; it always answers
+    // the same small "Counts only" hint, which is what `advertised` is really checking below).
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/scan-assets' ? { body: { assets: [] } } : { body: huge(2000) }));
     for (const name of ['modoki_get_console_logs', 'modoki_list_assets', 'modoki_get_scene_state']) {
       const r = s.json(await s.call(name)) as { hint?: string };
       const advertised = [...(r.hint ?? '').matchAll(/([a-zA-Z]+)=/g)].map((m) => m[1]);

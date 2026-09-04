@@ -411,6 +411,49 @@ runtime-only op in the editor file is therefore not a stylistic slip; it is how 
 opened one op at a time, each new capability landing wherever its first caller happened to live.
 An op registered in `agentEditorOps.ts` whose handler reaches nothing from `editor/` is a finding.
 
+## 9-bis. A cross-runtime reply is DECODED, never cast (#644 → #647/#648)
+
+Every reply that crosses a runtime boundary — the device wire, the `requestBrowser` relay, the
+Capacitor bridge, an `/api/*` route answering a long-lived MCP process — comes from a producer that
+**versions independently of its consumer**. A TypeScript annotation on that value is a promise
+nobody keeps. Three defect shapes came out of casting one anyway, and all three report something
+FALSE rather than failing:
+
+| Shape | What the caller is told | Example |
+|---|---|---|
+| A named field is absent | a confident **empty answer** | `list_assets` on a missing route: "this project has no assets" (`.assets` on the SPA's `index.html`) |
+| An array method on a non-array | throws into a `catch` that means something else | #644's `result.map is not a function` reported as *"no editor is listening on that port"* |
+| A declared field is dropped | **could-not-look collapsed into nothing-is-there** | `getNativeLogs` dropping `error`, so `{logs:[], error:'OSLogStore denied'}` reads as "No logs." |
+
+**The pattern**, established by `parseConsoleLogsReply` (`game-debug-mcp/src/reply.ts`) and
+`decodeAimReply` (`plugins/backend/deviceAim.ts`), and now also `parseNativeLogsReply` and
+`decodeSceneOpsReply` (`plugins/backend/sceneOpsReply.ts`):
+
+1. A **pure decoder** — `unknown` in, a **discriminated union** out. Never a throw, never a cast.
+2. **Every historical wire shape tolerated explicitly**, with the commit or build that changed it
+   named in the comment. A bare array and `{logs, …}` are both live at once whenever the two sides
+   ship separately.
+3. An unrecognised shape is described **BY KEYS ONLY** — `describeShape` in
+   `engine/tools/shared/mcpResult.ts` (the §9 shared home; `engine/app/debug/bridgeHelpers.ts`
+   keeps a deliberate copy, because `engine/app` reaches `tools/shared` only with `import type` and
+   a value import would put MCP formatting code in the bundle that ships to devices). A log line or
+   a scene op can carry secrets and authored strings; a refusal must never echo the value.
+4. The refusal says **what it is NOT**: "this is not 'the project has no assets', it is a reply this
+   build cannot read."
+
+⚠️ **Pick the remedy by whether the work already happened.** A relay that never returned is safe to
+call "no editor" and safe to retry. A relay that RETURNED an unreadable shape is neither — the ops
+already applied. `/api/scene-mutate` reported the second as a 500, which `context.ts` maps to
+`NOT_AVAILABLE_HERE` ("relaunch the editor"), so a caller retried and **double-applied a write**. It
+now answers 200 `{ok:false, code:'PARTIAL'}`: `isFailureBody` makes it a failure and `codeFromBody`
+lifts the code, so `PARTIAL` reaches the agent with no new plumbing.
+
+⚠️ **`raw call()` skips the shared guards.** `htmlFallthrough` runs inside `getJson`/`postJson`
+only, so a raw-`call()` site gets no SPA-fallthrough protection — a missing dev-server route answers
+**200 with `index.html`**. Raw `call()` is legitimate (a §5 label more specific than `getJson`
+hardcodes; a shape guard that must not throw into `getJson`'s `transform`-then-catch), but such a
+site must apply `ctx.htmlFallthrough`/`ctx.noSuchRoute` itself.
+
 ## 10. Every tool declares its contract, and is covered three ways
 
 - **Contract**: one entry in `contracts.ts`, asserted both directions (no tool without a contract,

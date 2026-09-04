@@ -868,3 +868,178 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     }
   });
 });
+
+/** #649: ota-publish.mjs's own charset validation of --name/--version/--bucket — before this,
+ *  the CLI checked only PRESENCE of these three (unlike the editor routes reaching the same
+ *  shared publish operation, which already validated them against OTA_SAFE_TOKEN/
+ *  OTA_SAFE_BUCKET), so a value carrying a shell metacharacter reached `q()` unfiltered, and a
+ *  "/" in --name reached the bucket layout unfiltered too (silently defeating #577's
+ *  version-collision guard — see the guard's own comment in ota-publish.mjs). Reuses the same
+ *  fake-gcloud harness (FAKE_GCLOUD_SRC + runNode are module-scoped above). */
+describe('ota-publish.mjs input validation (#649)', () => {
+  let repoRoot: string;
+  let binDir: string;
+  let bucketDir: string;
+  let distDir: string;
+  let projectDir: string;
+  let realPublicKey: string;
+
+  beforeEach(() => {
+    repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-validation-repo-'));
+    fs.mkdirSync(path.join(repoRoot, 'engine', 'scripts'), { recursive: true });
+    fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
+    fs.cpSync(path.join(engineRoot, 'scripts', 'ota'), path.join(repoRoot, 'engine', 'scripts', 'ota'), { recursive: true });
+    fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
+
+    binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-validation-'));
+    if (process.platform === 'win32') {
+      fs.writeFileSync(path.join(binDir, 'gcloud.cjs'), FAKE_GCLOUD_SRC);
+      fs.writeFileSync(path.join(binDir, 'gcloud.cmd'), `@node "%~dp0gcloud.cjs" %*\r\n`);
+    } else {
+      const gcloudPath = path.join(binDir, 'gcloud');
+      fs.writeFileSync(gcloudPath, FAKE_GCLOUD_SRC);
+      fs.chmodSync(gcloudPath, 0o755);
+    }
+
+    bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-validation-'));
+    distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-validation-dist-'));
+    fs.writeFileSync(path.join(distDir, 'index.html'), '<html>validation-test</html>');
+
+    const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+    realPublicKey = readKeyPublicKey(repoRoot);
+
+    projectDir = path.join(repoRoot, 'games', 'testproj');
+    writeProjectConfig(projectDir, { bundleName: 'shell', publicKey: realPublicKey });
+  });
+
+  afterEach(() => {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+    fs.rmSync(binDir, { recursive: true, force: true });
+    fs.rmSync(bucketDir, { recursive: true, force: true });
+    fs.rmSync(distDir, { recursive: true, force: true });
+  });
+
+  /** Bucket dir starts empty (mkdtempSync); any successful gcloud write creates
+   *  `<bucketDir>/fakebucket/...` — so its absence proves nothing reached the bucket. */
+  function bucketIsEmpty(): boolean {
+    return !fs.existsSync(path.join(bucketDir, 'fakebucket'));
+  }
+
+  function publish(name: string, version: string, bucket = 'gs://fakebucket/testprefix') {
+    return runNode(repoRoot, {
+      ...process.env,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+      FAKE_GCS_BUCKET_DIR: bucketDir,
+    }, [
+      'engine/scripts/ota-publish.mjs',
+      '--dist', distDir, '--bucket', bucket,
+      '--name', name, '--version', version, '--engine-api', '1', '--key', 'default',
+      '--project', projectDir,
+    ]);
+  }
+
+  it('refuses a --name carrying a shell metacharacter, before the injected command can ever run', () => {
+    // spawnSync passes argv straight to execve (no shell involved in invoking THIS CLI), so
+    // `marker` genuinely only gets created if ota-publish.mjs itself later hands this string
+    // to a shell unguarded — proving the guard fires before any exec, not just that this
+    // particular fake-gcloud harness happens not to interpret it.
+    const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-pwn-marker-'));
+    const marker = path.join(markerDir, 'pwned');
+    try {
+      const result = publish(`v1$(touch ${marker})`, 'v1');
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/--name must match/);
+      expect(bucketIsEmpty()).toBe(true);
+      expect(fs.existsSync(marker)).toBe(false);
+    } finally {
+      fs.rmSync(markerDir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses --name "shell/v2" — reachable with no hostile intent, and the exact #577 guard-defeat case', () => {
+    const result = publish('shell/v2', 'v1');
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/--name must match/);
+    expect(result.stderr).toMatch(/version-collision guard/);
+    expect(bucketIsEmpty()).toBe(true);
+  });
+
+  it('refuses a --version containing a space', () => {
+    const result = publish('shell', 'v1 v2');
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/--version must match/);
+    expect(bucketIsEmpty()).toBe(true);
+  });
+
+  it('refuses a --bucket carrying a shell metacharacter', () => {
+    const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-pwn-bucket-marker-'));
+    const marker = path.join(markerDir, 'pwned');
+    try {
+      const result = publish('shell', 'v1', `gs://fakebucket$(touch ${marker})/testprefix`);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/--bucket must be a gs:\/\/ URL/);
+      expect(fs.existsSync(marker)).toBe(false);
+    } finally {
+      fs.rmSync(markerDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a normal valid publish still succeeds end to end (guards against over-tightening)', () => {
+    const result = publish('shell', 'v1');
+    expect(result.status).toBe(0);
+    const releaseJson = JSON.parse(fs.readFileSync(path.join(bucketDir, 'fakebucket', 'testprefix', 'release.json'), 'utf8'));
+    expect(releaseJson.bundles).toEqual({ shell: 'v1' });
+  });
+
+  // q() itself, regression-tested indirectly: ota-publish.mjs calls `main()` at module scope
+  // (self-executes on import), so it can't be imported directly in a unit test without
+  // process.exit()-ing the test runner — this repo has been bitten by exactly that class of
+  // bug (a module that exports AND executes). --name/--version/--bucket are now
+  // charset-validated above, so they can no longer carry a metacharacter into q() at all; the
+  // one thing left for q() to defend is the LOCAL staging paths this script derives itself
+  // (stageDir and friends), which are never charset-checked and legitimately can contain
+  // unusual characters.
+  it.skipIf(process.platform === 'win32')(
+    'q(): a local staging path containing a shell metacharacter is never shell-expanded ' +
+    '(regression for the old `q = JSON.stringify` double-quote form)',
+    () => {
+      // TMPDIR (POSIX-only; os.tmpdir() reads it) is what ota-publish.mjs's own
+      // `mkdtempSync(path.join(tmpdir(), 'modoki-ota-'))` staging dirs are created under —
+      // pointing it at a directory whose NAME embeds `$(...)` forces every local path this
+      // script q()'s (stageDir, manifestStageDir/zipPath/manifestPath,
+      // releaseStageDir/tmpReleasePath) to carry it. The directory itself is created with a
+      // plain fs call (no shell involved), so the marker file can ONLY appear if one of this
+      // script's `execSync` calls later shell-expands that path unguarded.
+      const markerName = 'q-injection-marker-649';
+      const weirdTmpParent = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-weirdtmp-'));
+      const weirdTmpDir = path.join(weirdTmpParent, `evilA$(touch ${markerName})B`);
+      fs.mkdirSync(weirdTmpDir);
+      const marker = path.join(repoRoot, markerName); // execSync calls inherit this script's cwd (repoRoot)
+      try {
+        const result = runNode(repoRoot, {
+          ...process.env,
+          PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+          FAKE_GCS_BUCKET_DIR: bucketDir,
+          TMPDIR: weirdTmpDir,
+        }, [
+          'engine/scripts/ota-publish.mjs',
+          '--dist', distDir, '--bucket', 'gs://fakebucket/testprefix',
+          '--name', 'shell', '--version', 'v1', '--engine-api', '1', '--key', 'default',
+          '--project', projectDir,
+        ]);
+        // Success (not just "no marker") is the real proof: it shows the publish's execSync
+        // calls correctly resolved the LITERAL weird path (which genuinely exists) rather than
+        // the shell mangling it into something that happens not to exist either.
+        expect(result.status).toBe(0);
+        expect(fs.existsSync(marker)).toBe(false);
+        const releaseJson = JSON.parse(fs.readFileSync(path.join(bucketDir, 'fakebucket', 'testprefix', 'release.json'), 'utf8'));
+        expect(releaseJson.bundles).toEqual({ shell: 'v1' });
+      } finally {
+        fs.rmSync(weirdTmpParent, { recursive: true, force: true });
+        fs.rmSync(marker, { force: true });
+      }
+    },
+  );
+});

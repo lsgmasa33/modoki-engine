@@ -19,6 +19,7 @@ import { consoleRing, installDeviceConsoleCapture, unpatchedLog } from './device
 import { getConsoleRingDropped } from '@modoki/engine/runtime/core/consoleRing';
 import {
   safeStringify,
+  describeShape,
   handleEval as evalCode,
   screenshotToCSS as toCSS,
   clampEvalTimeout,
@@ -1256,13 +1257,44 @@ async function initNativeBridge() {
       }
       // iOS native logs via OSLogStore, Android native logs via logcat (in-process)
       if (method === 'nativeLogs') {
-        const { logs } = await GameDebug.getNativeLogs({
+        // #648: this used to be `const { logs } = await …` — which DROPPED the declared `error`
+        // field entirely. `getNativeLogs` returns `Promise<{logs: string[]; error?: string}>`
+        // (capacitor-game-debug/src/definitions.ts), so a native failure answering
+        // `{logs: [], error: 'OSLogStore denied'}` reached the agent as an empty log list:
+        // "could not look" collapsed into "nothing is there", which are opposite findings and
+        // lead to opposite next moves.
+        //
+        // ⚠️ The TS type is NOT a guarantee here. The value crosses the Capacitor bridge from
+        // Swift/Kotlin in the INSTALLED BINARY, while this JS is rebuilt and OTA'd independently
+        // — the same producer/consumer version skew that made #644 happen. So decode, don't trust.
+        const raw = await GameDebug.getNativeLogs({
           limit: params?.limit ?? 50,
           seconds: params?.seconds ?? 60,
           filter: params?.filter,
           subsystem: params?.subsystem,
-        });
-        await GameDebug.sendResponse({ id, result: safeStringify(logs) });
+        }) as unknown;
+        // A native side answering a BARE ARRAY (an older binary) is still a valid answer.
+        const asObj = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as { logs?: unknown; error?: unknown } : null;
+        const logs = Array.isArray(raw) ? raw as string[]
+          : Array.isArray(asObj?.logs) ? asObj.logs as string[]
+            : null;
+        const nativeError = typeof asObj?.error === 'string' && asObj.error ? asObj.error : null;
+        if (logs === null) {
+          // No readable `logs` at all. Report it as a failure rather than as an empty list —
+          // `safeStringify(undefined)` used to return undefined here (despite its `: string`
+          // type), shipping a RESULT-LESS reply that the MCP could not distinguish from silence.
+          await GameDebug.sendResponse({
+            id,
+            error: nativeError
+              ?? `getNativeLogs returned a shape this build cannot read: ${describeShape(raw)}. `
+                + 'The native plugin in the installed binary may predate this JS bundle.',
+          });
+          return;
+        }
+        // `{logs, error}` ONLY when there is something extra to say. The happy path stays a bare
+        // array so an older game-debug MCP keeps reading it unchanged (the consumer tolerates
+        // both — see parseNativeLogsReply in game-debug-mcp/src/reply.ts).
+        await GameDebug.sendResponse({ id, result: safeStringify(nativeError ? { logs, error: nativeError } : logs) });
         return;
       }
 

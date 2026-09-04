@@ -27,7 +27,7 @@ import {
   encodeEvalResult, encodeStructuredResult, extFor, describeScreenshot, isFailureBody,
   deviceFail, caughtFailure, deviceReplyFailure,
 } from './result.js';
-import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseConsoleLogsReply, SYNTHETIC_MECHANISM, type LeaseStatus } from './reply.js';
+import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseConsoleLogsReply, parseNativeLogsReply, SYNTHETIC_MECHANISM, type LeaseStatus } from './reply.js';
 
 const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(/\/$/, '');
 
@@ -2191,8 +2191,37 @@ async function coordScaleOrRefusal(
         // Same class as device_console_logs above: an `Error: …` reply would be String()'d straight
         // into the payload and read as log CONTENT.
         if (isDeviceError(raw)) return deviceReplyFailure('device_native_logs', 'read the native device logs', raw);
-        const result = parseReply<string[]>(raw);
-        const text = (Array.isArray(result) ? result.join('\n') : String(result)) || 'No logs.';
+        // #648: DECODE, don't cast. This was `parseReply<string[]>(raw)` followed by
+        // `Array.isArray(result) ? join : String(result)` — so any non-array reply was
+        // String()'d into the payload and read as log CONTENT (an object would have rendered
+        // as the literal "[object Object]").
+        const parsed = parseNativeLogsReply(raw);
+        if (!parsed.ok) {
+          return deviceFail({
+            code: 'NOT_AVAILABLE_HERE',
+            what: 'read the native device logs (logcat / os_log)',
+            why: `the device answered a shape this MCP cannot read: ${parsed.got}. This says NOTHING about whether the device has logs.`,
+            options: [
+              'restart the MCP server — it is a LONG-LIVED process and does NOT pick up a rebuilt tree',
+              'the installed app binary may predate this MCP; rebuild and redeploy it',
+            ],
+          });
+        }
+        // A native-side failure is a REFUSAL, never an empty log list. `{logs: [], error:
+        // 'OSLogStore denied'}` used to arrive as "No logs.", i.e. could-not-look reported as
+        // nothing-is-there — the two lead to opposite next moves.
+        if (parsed.error && parsed.logs.length === 0) {
+          return deviceFail({
+            code: 'NOT_AVAILABLE_HERE',
+            what: 'read the native device logs (logcat / os_log)',
+            why: `the native log reader refused: ${parsed.error}`,
+            options: ['check the app has the entitlement/permission its platform needs for os_log / logcat'],
+          });
+        }
+        // A partial read (some logs AND an error) keeps the logs and states the error — dropping
+        // either half would be the same collapse in the other direction.
+        const text = (parsed.error ? `[⚠️ the native log reader also reported: ${parsed.error}]\n` : '')
+          + (parsed.logs.join('\n') || 'No logs.');
         // Say what the read actually WAS when it was a forward capture — an empty system result is
         // "nothing was logged in those N seconds", not "the device has no logs", and those lead to
         // opposite next moves. Truncation is stated for the same reason.

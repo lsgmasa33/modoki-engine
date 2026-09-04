@@ -28,6 +28,7 @@
   "CharacterAnimator2D",
   "CharacterController2D",
   "CharacterController3D",
+  "CloudSyncCoordinator",
   "Collider2D",
   "Collider3D",
   "DEFAULT_FONT_GUID",

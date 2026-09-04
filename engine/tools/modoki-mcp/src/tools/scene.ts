@@ -11,9 +11,10 @@ import type { ToolContext } from '../context.js';
 import { type ToolResult } from '../result.js';
 import { summarizeAssets, summarizeTraits, type AssetEntry, type TraitSchema } from '../summarize.js';
 import { mutateOpSchema, precisionParam } from '../shapes.js';
+import { describeShape } from '../../../shared/mcpResult.js';
 
 export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
-  const { ok, fail, httpFailure, call, getJson, postJson, unreachable } = ctx;
+  const { ok, fail, httpFailure, call, getJson, postJson, unreachable, htmlFallthrough, noSuchRoute } = ctx;
 
   // ── get_scene_state — PRIMARY verification tool ──
   tool(
@@ -234,6 +235,26 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       try {
       const { status, body } = await call('/api/trait-schema');
       if (status >= 400) return httpFailure('read the live trait registry', status, body);
+      // #648 — raw `call()` skips `getJson`'s SPA-fallthrough guard: a missing /api/trait-schema
+      // route on the dev server falls through to index.html, 200. Undetected, `.traits` on that
+      // string is `undefined`, `?? {}` swallows it, and summarizeTraits reports a clean empty
+      // registry — "this project has zero traits", never a true answer.
+      if (htmlFallthrough(body)) return noSuchRoute('/api/trait-schema');
+      const traitsField = body && typeof body === 'object' ? (body as { traits?: unknown }).traits : undefined;
+      const traitsShapeOk = traitsField !== null && typeof traitsField === 'object' && !Array.isArray(traitsField);
+      if (!body || typeof body !== 'object' || !traitsShapeOk) {
+        return fail({
+          code: 'NOT_AVAILABLE_HERE',
+          what: 'read the live trait registry',
+          why: `the backend answered 200, but the body was ${describeShape(body)} — not the ` +
+            `{traits:{...}} shape /api/trait-schema is supposed to answer with. This is NOT ` +
+            `"this project has no traits"; it is a reply this build cannot read.`,
+          options: [
+            'this editor build may be from a DIFFERENT checkout than this MCP server — relaunch the editor from this checkout',
+            'check the editor is actually running: modoki_identity',
+          ],
+        });
+      }
       const b = body as { schemaAvailable?: boolean; traits?: Record<string, TraitSchema> };
       const result = summarizeTraits(b.traits ?? {}, b.schemaAvailable, { name, all });
       return 'error' in result ? fail(result.error) : ok(result);
@@ -260,7 +281,26 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       try {
       const { status, body } = await call('/api/scan-assets');
       if (status >= 400) return httpFailure('read the project asset manifest', status, body);
-      const assets = (body as { assets?: AssetEntry[] }).assets ?? [];
+      // #648 — raw `call()` skips `getJson`'s SPA-fallthrough guard: a missing /api/scan-assets
+      // route on the dev server falls through to index.html, 200. Undetected, `.assets` on that
+      // string is `undefined`, `?? []` swallows it, and summarizeAssets reports a clean empty
+      // manifest — "this project has no assets", never a true answer.
+      if (htmlFallthrough(body)) return noSuchRoute('/api/scan-assets');
+      const assetsField = body && typeof body === 'object' ? (body as { assets?: unknown }).assets : undefined;
+      if (!body || typeof body !== 'object' || !Array.isArray(assetsField)) {
+        return fail({
+          code: 'NOT_AVAILABLE_HERE',
+          what: 'read the project asset manifest',
+          why: `the backend answered 200, but the body was ${describeShape(body)} — not the ` +
+            `{assets:[...]} shape /api/scan-assets is supposed to answer with. This is NOT ` +
+            `"this project has no assets"; it is a reply this build cannot read.`,
+          options: [
+            'this editor build may be from a DIFFERENT checkout than this MCP server — relaunch the editor from this checkout',
+            'check the editor is actually running: modoki_identity',
+          ],
+        });
+      }
+      const assets = assetsField as AssetEntry[];
       return ok(summarizeAssets(assets, { type, folder, name, all, limit }));
       } catch (e) { return unreachable(e); }
     },

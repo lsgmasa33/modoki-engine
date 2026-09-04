@@ -214,7 +214,66 @@ export interface StartWatchParams {
   expireFrames?: number;
 }
 
+/** #648: validate an array param that arrived over the wire. Returns a refusal sentence, or null.
+ *
+ *  `watch-start` is reached as `registerAgentOp('watch-start', (params) => startWatch((params ??
+ *  {}) as StartWatchParams))` (`agentBridge.ts`) — an UNCHECKED cast over a wire payload with no
+ *  zod in front of it, and a first-class call path via `modoki_eval_api` / `device_eval_api`
+ *  (which generates a method per registered op). The TypeScript signature below is a promise the
+ *  transport does not keep, so the checks have to be real.
+ *
+ *  Each of the three string arrays fails DIFFERENTLY and none of them fails loudly:
+ *   - `names: "Player"` passes the `.length` truthiness test, then throws `p.names.map is not a
+ *     function` — which surfaces as a generic op error, not "you sent the wrong type".
+ *   - `guids: "abc"` is worse: `for (const g of p.guids)` iterates CHARACTERS, every one misses,
+ *     and the guid branch returns the confident refusal *"none of the N guid(s) resolved to a live
+ *     entity — they may be stale"*. That sentence is a FINDING. It sends the reader to re-read
+ *     guids that were never wrong.
+ *   - `fields: "xy"` is the quiet one: `numericFields`' `filter.includes(k)` is
+ *     `Array.prototype.includes` (an exact match) only while `filter` really is an array. Handed a
+ *     string it becomes `String.prototype.includes`, a SUBSTRING match, and silently watches both
+ *     `x` and `y` while reporting neither surprise. */
+function badStringArray(label: string, v: unknown): string | null {
+  if (v === undefined || v === null) return null;
+  if (typeof v === 'string') {
+    return `\`${label}\` must be an ARRAY of strings — a bare string was sent. `
+      + `Send ["${v.length > 40 ? `${v.slice(0, 40)}…` : v}"] rather than "…". Nothing was started.`;
+  }
+  if (!Array.isArray(v)) return `\`${label}\` must be an array of strings, but a ${typeof v} was sent. Nothing was started.`;
+  if (!v.every((s) => typeof s === 'string')) return `\`${label}\` must contain only strings. Nothing was started.`;
+  return null;
+}
+
+/** #648, the numeric half. `maxSamples`/`maxSeries`/`everyNFrames`/`expireFrames`/`epsilon` are
+ *  coerced with `Math.floor`/`clamp` rather than checked, and `clamp(NaN, …)` is NaN — so a string
+ *  here does not throw, it produces a watch whose caps are NaN. Every `count < maxSamples`
+ *  comparison against NaN is false, so the watch silently records nothing and reads back exactly
+ *  like "the value never moved" — the same false negative the guid guard above exists to prevent. */
+function badNumber(label: string, v: unknown): string | null {
+  if (v === undefined || v === null) return null;
+  if (typeof v !== 'number' || !Number.isFinite(v)) {
+    return `\`${label}\` must be a finite number, but ${typeof v === 'number' ? String(v) : `a ${typeof v}`} was sent. Nothing was started.`;
+  }
+  return null;
+}
+
 export function startWatch(p: StartWatchParams): { ok: boolean; id?: string; component?: string; fields?: string[]; matched?: string[]; unmatchedGuids?: string[]; names?: string[]; matchedNow?: number; error?: string; hint?: string } {
+  // Shape-check BEFORE `component` is looked up, so a malformed payload is reported as the type
+  // error it is rather than as whatever downstream symptom it happens to produce first.
+  for (const [label, value] of [['guids', p.guids], ['names', p.names], ['fields', p.fields]] as const) {
+    const bad = badStringArray(label, value);
+    if (bad) return { ok: false, error: bad, hint: 'watch-start params are not schema-validated at the transport — a wrong type reaches this function as-is.' };
+  }
+  for (const [label, value] of [
+    ['epsilon', p.epsilon], ['everyNFrames', p.everyNFrames], ['maxSamples', p.maxSamples],
+    ['maxSeries', p.maxSeries], ['expireFrames', p.expireFrames],
+  ] as const) {
+    const bad = badNumber(label, value);
+    if (bad) return { ok: false, error: bad };
+  }
+  if (p.component !== undefined && typeof p.component !== 'string') {
+    return { ok: false, error: `\`component\` must be a string, but a ${typeof p.component} was sent. Nothing was started.` };
+  }
   // `component` is what a watch IS ABOUT, so an absent one is not "unknown component undefined" —
   // it is a missing required argument, and the refusal has to say so and list the options. The
   // ergonomic minimal call `{action:'start'}` previously answered `unknown component "undefined"`,

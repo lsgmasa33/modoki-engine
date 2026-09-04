@@ -52,11 +52,37 @@ import { buildManifestFiles } from './ota/buildManifest.mjs';
 import { isGcloudObjectNotFoundError } from './ota/gcloud.mjs';
 import { createManifest, createRelease, manifestHashPayload, validateManifest, validateRelease } from './ota/schema.mjs';
 import { OTA_DEFAULT_BUNDLE_NAME, otaBundleDistKindRefusal, otaSigningKeyRefusal } from './ota/publishGuards.mjs';
+import { OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './ota/otaSafeTokens.mjs';
 import { signRelease } from './ota/signing.mjs';
 import { buildZipFromDir } from './ota/zip.mjs';
 
 const defaultRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const q = (s) => JSON.stringify(s);
+// Wraps a value for interpolation into the `execSync` calls below, each of which runs through
+// a real shell (`/bin/sh` on POSIX, `cmd.exe` on Windows — see buildStepShell.ts's own header
+// for the same POSIX/Windows split on the editor's build-step pipeline). This is DEFENSE IN
+// DEPTH, not the primary guard: by the time any value reaches here, --name/--version/--bucket
+// have already been rejected above if they don't match OTA_SAFE_TOKEN/OTA_SAFE_BUCKET, so none
+// of those three can carry a shell metacharacter to begin with. What this still protects are
+// the local filesystem paths this script derives itself and never runs through that charset
+// check — the staging directories it makes with mkdtempSync (stageDir, manifestStageDir,
+// releaseStageDir) and the files it writes under them (zipPath, manifestPath,
+// tmpReleasePath) — which legitimately CAN contain characters like spaces (e.g. a repo
+// checked out under a path with one) and must still round-trip through the shell safely.
+//
+// The old `q = (s) => JSON.stringify(s)` emitted DOUBLE-quoted output, and POSIX shells still
+// expand `$(...)`, backticks and `${...}` INSIDE double quotes — so against a value carrying
+// one of those, it only ever JSON-escaped, it never actually neutralized shell interpolation.
+// POSIX single quotes suppress all expansion, which is what's needed here; `'\''` is the
+// standard trick for a literal `'` inside a single-quoted string (close the quote, emit an
+// escaped `'`, reopen the quote).
+//
+// win32 keeps the old double-quote form: cmd.exe does not treat `'` as a quote character at
+// all, so single-quoting there would not group the argument — it would paste stray quote
+// characters straight into it. ⚠️ Like buildStepShell.ts's own `winCmd` forms, this win32
+// branch is UNVALIDATED against a real Windows shell from this machine.
+const q = process.platform === 'win32'
+  ? (s) => JSON.stringify(s)
+  : (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
 
 function parseArgs(argv) {
   // `mandatory` starts `undefined` (not `false`) so the release-merge loop can tell
@@ -99,10 +125,38 @@ async function main() {
   const projectDir = args.project ? path.resolve(repoRoot, args.project) : null;
 
   if (!distDir || !existsSync(distDir)) fail(`--dist is required and must exist (got ${args.dist})`);
-  if (!bucket || !bucket.startsWith('gs://')) fail(`--bucket must be a gs:// URL (got ${args.bucket})`);
+  // Charset-validated with the SAME regexes the editor's `/api/ota/publish` and
+  // `/api/ota/status` routes already enforce before reaching this same shared publish
+  // operation (#649, following #582's precedent: a guard enforced by only one of two entry
+  // points to the same operation is a trap for whichever entry point lacks it). This is the
+  // PRIMARY guard against shell injection — `bucket`/`name`/`version` all get interpolated
+  // into `gcloud storage ...` commands below (via `q()`, hardened separately as
+  // defense-in-depth, not as the thing doing this job).
+  if (!bucket || !OTA_SAFE_BUCKET.test(bucket)) fail(`--bucket must be a gs:// URL matching ${OTA_SAFE_BUCKET} (got ${args.bucket})`);
   if (!name) fail('--name is required (the bundle name, e.g. "shell" or a sub-game id)');
+  if (!OTA_SAFE_TOKEN.test(name)) {
+    // A "/" is the concrete, NON-malicious way to hit this: it would silently write bucket
+    // objects under a NESTED path (bundles/<name-with-slash>/<version>/...) while
+    // release.json still records --name as the flat string the caller passed. The
+    // version-collision guard further below reads back that SAME flat
+    // bucket/<name>/<version>/manifest.json path, so it would never see what actually landed
+    // in the bucket — defeating the exact guard #577 exists to provide, reachable here with
+    // no hostile intent at all.
+    fail(`--name must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(name)}) — in particular, a "/" is rejected: it would silently write bucket objects under a NESTED path while release.json still records --name as a flat string, so the version-collision guard below (which reads back that same flat path) would never see what actually landed. Use a plain bundle-name token, not a path.`);
+  }
   if (!version) fail('--version is required (e.g. "v13")');
+  if (!OTA_SAFE_TOKEN.test(version)) fail(`--version must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(version)})`);
   if (!Number.isInteger(engineApi) || engineApi < 1) fail('--engine-api must be a positive integer');
+  // --key is the FOURTH tainted input, and both route surfaces validate it (`keyName`) with the
+  // same token. The first cut of this fix validated three of the four, which is the very asymmetry
+  // it exists to close — caught in review. Unlike the other three this one is never
+  // shell-interpolated; it is joined into a path, so the exposure is TRAVERSAL rather than
+  // injection: `--key ../../../../etc/something` would read and JSON.parse a file well outside
+  // build/ota-keys/. Modest, since whoever runs this CLI already has a shell — but the guard costs
+  // one line and the route does not make the caller argue about it either.
+  if (!OTA_SAFE_TOKEN.test(args.key)) {
+    fail(`--key must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(args.key)}) — it names a keypair in build/ota-keys/, not a path.`);
+  }
   if (!projectDir) {
     fail('--project is required (the project dir whose project.config.json this release is published for, e.g. games/ota-test) — its ota.publicKey is the key the SHIPPED APP verifies against, and its ota.bundleName decides whether this dist may be published under --name.');
   }

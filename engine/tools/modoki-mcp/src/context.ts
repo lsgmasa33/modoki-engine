@@ -35,6 +35,14 @@ export type ToolContext = {
   httpFailure: (what: string, status: number, body: unknown) => ToolResult;
   /** Raw call — parsed JSON (or text) + HTTP status. Prefer getJson/postJson. */
   call: (path: string, init?: RequestInit, timeoutMs?: number) => Promise<{ status: number; body: unknown }>;
+  /** True when `body` is the SPA's `index.html` rather than JSON — a missing `/api` route on the
+   *  dev server falls through and answers 200 with the app shell (V3). `getJson`/`postJson` apply
+   *  this for free; exposed (#648) for the rare raw-`call()` site that cannot use them (a §5 label
+   *  more specific than `getJson` hardcodes, or a shape guard that must not throw into `getJson`'s
+   *  own `transform`-then-catch) but still needs the same guard. */
+  htmlFallthrough: (body: unknown) => boolean;
+  /** The `NOT_AVAILABLE_HERE` envelope for a `htmlFallthrough` hit — see above. */
+  noSuchRoute: (path: string) => ToolResult;
   /** GET = "tell me this" → `ok` in the body may be the ANSWER (`diagnose`, `validate_scene`),
    *  so this deliberately does NOT run `isFailureBody` BY DEFAULT. See the C7 convention in
    *  `docs/debug-tools-mcp.md`; do not "fix" that by flipping the default.
@@ -582,6 +590,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
     backend: BACKEND,
     ok, fail, httpFailure, call, getJson, postJson, evalRenderer, editorAction,
     unsavedChangesWarning, consumeBuildStream, ensureIdentity, unreachable,
+    htmlFallthrough, noSuchRoute,
     getIdentityWarning: () => identityWarning,
   };
 }

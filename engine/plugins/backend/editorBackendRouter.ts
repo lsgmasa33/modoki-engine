@@ -170,6 +170,7 @@ import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, 
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
+import { decodeSceneOpsReply } from './sceneOpsReply';
 // ASSET_SCHEMA_TYPES is IMPORTED, never restated. This file used to keep its own copy, and it
 // advertised a narrower set in its 400s than `getAssetSchema` actually served — a wrong error
 // message is not cosmetic on a surface whose whole job is telling an agent what it may pass.
@@ -1676,11 +1677,38 @@ async function describeUnresolvedAgainstLiveWorld(
       const canGoLive = !!st && !!liveRef && liveRef === wantRef && !hasSetBaseScene;
       if (canGoLive) {
         try {
-          const live = (await ctx.requestBrowser('apply-scene-ops', { ops }, 30_000)) as {
-            ok: boolean; changed: number; errors: string[]; warnings: string[]; unresolved: EntityRef[];
-            created?: Array<{ op: number; id: number; guid: string; name: string }>;
-            code?: ErrorCode;
-          };
+          // #647: DECODE the reply, never cast it. The renderer that produces this versions
+          // independently of this host, and three of the fields below are read with `.length`
+          // or a spread — so a shape skew used to throw into the catch beneath, whose remedy
+          // ("relaunch the editor") is the WRONG one for a call whose ops already applied.
+          const decoded = decodeSceneOpsReply(await ctx.requestBrowser('apply-scene-ops', { ops }, 30_000));
+          if (decoded.kind === 'unreadable') {
+            // ⚠️ 200 + PARTIAL, deliberately NOT a 500. The relay RETURNED, so the ops are very
+            // likely already applied to the live world; a 500 maps to NOT_AVAILABLE_HERE
+            // ("relaunch the editor"), which invites the caller to retry and DOUBLE-APPLY a
+            // write. `isFailureBody` turns `ok:false` into a failure and `codeFromBody` lifts
+            // `code` out of the body, so this reaches the agent as a PARTIAL envelope with no
+            // new plumbing on either side.
+            // ⚠️ No `changed` and no `errors` here, deliberately. `isFailureBody` carries the whole
+            // body into the envelope's `got`, so a `changed: 0` would sit directly beside the
+            // sentence saying the ops may ALREADY have applied — asserting the one number this
+            // branch provably cannot know. Omitting it is the honest shape; review caught the
+            // first cut claiming it.
+            return json({
+              ok: false,
+              code: 'PARTIAL' satisfies ErrorCode,
+              warnings: preflightWarnings,
+              saved: false,
+              mode: PERSISTENCE_MODE,
+              error: 'apply-scene-ops answered a shape this build cannot read '
+                + `(${decoded.got}). The relay RETURNED, so these ops may have ALREADY APPLIED to `
+                + 'the live world — do NOT retry this call, it would apply them twice. Re-read the '
+                + 'live world with modoki_get_scene_state and reconcile before acting. A shape skew '
+                + 'here means the editor renderer and its backend are from different builds; '
+                + 'relaunching the editor from this checkout is what fixes the cause.',
+            });
+          }
+          const live = decoded.reply;
           // Manual-only: a live edit NEVER writes the file. `saved:false` is the truth for
           // every live call now, and the hint says how to persist — the field is kept (rather
           // than dropped) because callers already branch on it and `false` is meaningful.
@@ -1705,6 +1733,12 @@ async function describeUnresolvedAgainstLiveWorld(
           // The live path itself failed (relay error mid-call, not "no editor") — this is NOT
           // "fall back to file-direct" territory (that would silently re-run the edit against a
           // stale file while the live world is in an unknown state); surface it.
+          //
+          // ⚠️ This now means ONLY "the relay did not return" — a rejected `requestBrowser`,
+          // a timeout, a transport error. An UNREADABLE-but-returned reply is handled above as
+          // PARTIAL and never reaches here (#647), because the two need opposite remedies: this
+          // one is safe to treat as "the editor is not answering", and that one is not safe to
+          // retry at all.
           return json({ error: `apply-scene-ops failed: ${e instanceof Error ? e.message : String(e)}` }, 500);
         }
       }
