@@ -22,6 +22,11 @@ export function register(): void {}
 export function track(_name: string, _params?: Record<string, string | number>): void {}
 export function setTrackProperty(_track: string): void {}
 export function startInstallMilestones(): void {}
+/** #653 — the once-per-install AppsFlyer-forward ledger. An ad creative has no AppsFlyer SDK and
+ *  no install to track, so `hasForwardedOnce` reads `true` (fail-closed, same posture as the real
+ *  implementation off-hydration) and `markForwardedOnce` is a no-op. */
+export function hasForwardedOnce(_name: string): boolean { return true; }
+export function markForwardedOnce(_name: string): void {}
 
 /** Crash reporting — a no-op for the same reason. An ad creative has no Firebase app, and the
  *  Crashlytics SDK behind the real wrapper is byte weight the cap cannot afford. Exported as a
