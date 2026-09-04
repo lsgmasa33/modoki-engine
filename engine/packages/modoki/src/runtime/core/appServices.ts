@@ -28,6 +28,15 @@ export interface CrashlyticsService {
 export interface AdsService {
   init(): void | Promise<void>;
   cleanup(): void;
+  /** Optional recovery for a realm-survived false alarm — re-establish state `cleanup()` tore
+   *  down that ordinary `init()` does not know how to restore (e.g. a registered handler, a
+   *  banner that was showing). Most games have nothing here, hence optional.
+   *
+   *  ⚠️ **It REPLACES `init()` on that path, it does not run alongside it.** `App.tsx` calls this
+   *  INSTEAD of `init()` when a service provides it, so an implementation owns re-initialising as
+   *  well as restoring — Court's calls `initAds()` itself as its first step. Reading "optional
+   *  recovery" as "an extra step after init" would leave the SDK uninitialised. */
+  restoreAfterRealmSurvived?(): void | Promise<void>;
 }
 
 /** Attribution lifecycle the engine shell drives (init on game load). */

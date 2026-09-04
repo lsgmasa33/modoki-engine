@@ -16,7 +16,7 @@
   "scripts": {
     "upload:dsyms": "node engine/scripts/upload-dsyms.mjs",
     "dev": "vite --config engine/vite.config.ts",
-    "build:plugins": "npm run build --workspace engine/packages/capacitor-game-debug --workspace engine/packages/capacitor-litert-lm --workspace engine/packages/capacitor-modoki-ota --workspace engine/packages/capacitor-modoki-iap",
+    "build:plugins": "npm run build --workspace engine/packages/capacitor-game-debug --workspace engine/packages/capacitor-litert-lm --workspace engine/packages/capacitor-modoki-ota --workspace engine/packages/capacitor-modoki-iap --workspace engine/packages/capacitor-appsflyer",
     "postinstall": "npm run build:plugins && node engine/scripts/stamp-plugin-builds.mjs && node engine/scripts/bootstrap-mcp-deps.mjs && node engine/scripts/bootstrap-game-deps.mjs",
     "electron:build": "node engine/scripts/build-electron.mjs",
     "dev:electron": "npm run electron:build && electron engine/electron/dist/main.cjs",

@@ -603,3 +603,35 @@ describe('stampSnapTargets', () => {
     expect(inner.snapChild).toEqual({ scrollSnapAlign: 'center', scrollSnapStop: 'always' });
   });
 });
+
+describe('uiTreeProjection — lazy init latch ordering', () => {
+  it('does not latch permanently true when onWorldSwap throws on the first call', async () => {
+    vi.resetModules();
+    let shouldThrow = true;
+    const onWorldSwap = vi.fn(() => {
+      if (shouldThrow) throw new Error('onWorldSwap missing from mock');
+    });
+    vi.doMock('../../src/runtime/core/ecs/world', () => ({
+      getCurrentWorld: vi.fn(),
+      onWorldSwap,
+    }));
+    vi.doMock('../../src/runtime/core/ecs/traitRegistry', () => ({
+      getAllTraits: vi.fn(() => []),
+    }));
+    vi.doMock('../../src/runtime/core/ecs/entityUtils', () => ({
+      addDirtyListener: vi.fn(),
+    }));
+    const { uiTreeProjection } = await import('../../src/runtime/ui/uiTreeStore');
+    const world = {} as any;
+
+    // First call: registration throws. The throw must propagate (nothing silently swallowed).
+    expect(() => uiTreeProjection(world)).toThrow('onWorldSwap missing from mock');
+    expect(onWorldSwap).toHaveBeenCalledTimes(1);
+
+    // Second call: registration now succeeds. Before the fix, the latch was set BEFORE the
+    // throwing call, so this second call would silently no-op instead of retrying.
+    shouldThrow = false;
+    expect(() => uiTreeProjection(world)).not.toThrow();
+    expect(onWorldSwap).toHaveBeenCalledTimes(2);
+  });
+});

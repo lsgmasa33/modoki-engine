@@ -35,6 +35,7 @@ export {
 export { parseEntryPrefabs } from './traits/UIEntries';
 export { scrollToEntry, snapToNearest, scrollByEntry, NO_ENTRY_REQUEST } from './ui/scrollApi';
 export { entriesSystem, resetEntriesSystem, ENTRIES_CONTENT_NAME, setEntryPrefabProvider, getEntryPrefabProvider, type EntryPrefabProvider } from './ui/entriesSystem';
+export { patchUI, patchToggle, restartClip, readChromeUI, findChromeEntity, resetSceneChromeCache, type ChromeUIPatch, type ChromeTogglePatch } from './ui/sceneChrome';
 export { installEntryPrefabProvider, entryPrefabProvider } from './loaders/entryPrefabProvider';
 export { onAssetInvalidated, emitAssetInvalidated } from './core/assetInvalidation';
 export type { InvalidatedAssetKind, AssetInvalidationListener } from './core/assetInvalidation';

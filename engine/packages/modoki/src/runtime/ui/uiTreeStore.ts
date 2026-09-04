@@ -150,7 +150,9 @@ export const useUITreeStore = create<UITreeState>(() => ({
 let _initialized = false;
 function ensureInitialized() {
   if (_initialized) return;
-  _initialized = true;
+  // Latch AFTER registration: if a listener call below throws (e.g. a test mocking
+  // core/ecs/world without `onWorldSwap`), a latch set first would leave nothing registered
+  // and every later call would silently no-op.
   // Wire the dirty callback into entityUtils so writeTraitField/deleteEntity trigger rebuilds.
   // F5 (intentionally NOT gated to UI-trait writes): this fires on ANY helper-API trait
   // write — a 3D transform, a 2D sprite, anything — which over-invalidates in the editor
@@ -174,6 +176,7 @@ function ensureInitialized() {
     _warnedLengthUnitMismatches.clear();
     useUITreeStore.setState({ tree: [] });
   });
+  _initialized = true;
 }
 
 // ── Tree builder (extracted from old useUIEntities) ──

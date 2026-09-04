@@ -23,7 +23,10 @@ import { emitVideoSkip } from '../video/VideoEvents';
 
 function patch(target: Entity | undefined, fields: Partial<{ playing: boolean; clip: string }>): void {
   if (!target?.has(VideoPlayer)) return;
-  target.set(VideoPlayer, fields);
+  // Strip undefined-valued keys: koota's setter tests `'key' in value`, not whether it's
+  // defined, so an explicit undefined here would overwrite the real value.
+  const defined = Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
+  target.set(VideoPlayer, defined);
 }
 
 export function registerVideoControls(): void {

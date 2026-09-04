@@ -294,7 +294,11 @@ export function setTrait<T extends Trait>(
   const entity = findEntity(entityId);
   if (!entity || !entity.has(trait)) return;
   const current = entity.get(trait) as Record<string, unknown>;
-  entity.set(trait, { ...current, ...(partial as Record<string, unknown>) } as TraitValue<ExtractSchema<T>>);
+  // Strip undefined-valued keys: koota's setter tests `'key' in value`, not whether it's
+  // defined, so an explicit `{ isVisible: undefined }` would overwrite the real value with
+  // undefined instead of leaving it untouched.
+  const defined = Object.fromEntries(Object.entries(partial).filter(([, v]) => v !== undefined));
+  entity.set(trait, { ...current, ...defined } as TraitValue<ExtractSchema<T>>);
   fireDirtyListeners();
   // Hierarchy-affecting EntityAttributes fields must also bump the structure
   // version (mirrors writeTraitField), else the tree doesn't reorder/rename.

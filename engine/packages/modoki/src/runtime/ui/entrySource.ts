@@ -52,10 +52,13 @@ export interface EntryWritePlan { writes: EntryWrite[]; problems: EntryWriteProb
  *  Pure over a prebuilt child index, so the rules that matter — full paths, exactly one match,
  *  a problem REPORTED rather than swallowed — are testable with no world and no DOM.
  *
- *  ⚠️ A path that names several members is a PROBLEM, not a fan-out. Court's
- *  `patchUIInInstance` deliberately writes every match and returns a count; this does not
- *  inherit that. `level-tile.prefab.json` carries three entities named `Num` (one per state
- *  face), so a leaf-name match would write all three and look like it worked.
+ *  ⚠️ A path that names several members is a PROBLEM, not a fan-out. Court once had a
+ *  `patchUIInInstance` that deliberately wrote every match and returned a count (deleted in
+ *  #316 when its only caller, the level selector's 25 authored tiles, moved to a pooled scroll
+ *  view); this deliberately does not inherit that shape. The example the rule came from:
+ *  `level-tile.prefab.json` USED to carry three entities named `Num`, one per state face, so a
+ *  leaf-name match would write all three and look like it worked. ⚠️ #344 collapsed that prefab
+ *  to one face (four entities, one `Num`) — the rule stands, the example is history.
  */
 export function planEntryWrites(
   index: Map<number, { id: number; name: string }[]>,

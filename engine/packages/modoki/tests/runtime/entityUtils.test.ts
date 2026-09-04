@@ -694,6 +694,16 @@ describe('getTrait / setTrait (typed, direct component access)', () => {
     const { setTrait } = await getUtils();
     expect(() => setTrait(99999, Transform, { x: 1 })).not.toThrow();
   });
+
+  it('setTrait ignores an explicitly-undefined key, keeping the prior value (koota tests `in`, not definedness)', async () => {
+    const { setTrait, getTrait } = await getUtils();
+    const entity = testWorld.spawn(Transform({ x: 5, y: 2, z: 9 }), EntityAttributes({ name: 'A' }));
+    entityIndex.set(entity.id(), entity);
+    setTrait(entity.id(), Transform, { x: 42, y: undefined } as Partial<{ x: number; y: number }>);
+    const t = getTrait(entity.id(), Transform)!;
+    expect(t.x).toBe(42);   // real key still written
+    expect(t.y).toBe(2);    // undefined key must NOT overwrite the prior value
+  });
 });
 
 describe('deriveLayer (F8 — reconcile stored layer against the present renderable trait)', () => {

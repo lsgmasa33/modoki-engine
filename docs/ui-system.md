@@ -263,7 +263,8 @@ subtree reports the scaled number. Consequences, both measured on 2026-08-20:
 
 - A **ratio** of two measured values is safe: the scale cancels. That is why the game-side
   helpers that must survive this emit **percentages** (see `games/court/runtime/sceneChrome.ts`,
-  whose patchers refuse px for exactly this reason).
+  whose position/size patchers refuse px for exactly this reason — those stayed game-side when the
+  generic core moved to the engine; see § "Pushing live values onto scene-authored chrome" below).
 - A **length** derived from a measured rect and then handed back as a style value is scaled
   twice. Court computed HUD font sizes that way and got `41.6px` where `22.8px` was intended —
   1.83x, the preview's own factor — which pushed the HUD through the board on nine of twelve
@@ -859,6 +860,52 @@ frame pipeline.
 
 ---
 
+## Pushing live values onto scene-authored chrome (`runtime/ui/sceneChrome.ts`)
+
+A game's HUD, overlays and menus are **authored in the scene**, not built in code — the position,
+size, colour and font of every panel live in scene JSON where the owner can reach them (see
+CLAUDE.md § "Author values in the SCENE and the PREFAB"). What code still has to do is push the
+*live* values through: the score, whether the pause overlay is showing, which entrance animation
+just fired. `runtime/ui/sceneChrome.ts` is the seam for exactly that, and nothing else.
+
+| Export | What it does |
+|---|---|
+| `patchUI(world, name, patch)` | Write `ChromeUIPatch` fields onto the `UIElement` of the scene entity called `name`. Returns whether anything actually changed. |
+| `patchToggle(world, name, patch)` | The same for `UIToggle`. |
+| `restartClip(world, name)` | Play the entity's authored `Animator` clip from the top. |
+| `readChromeUI(world, name)` | Read the element back — for a test or a check, not a render path. |
+| `findChromeEntity(world, name)` | The name lookup on its own. |
+| `resetSceneChromeCache()` | Drop the name cache; tests call it in `afterEach`. |
+
+Four properties of this module are load-bearing, and each exists because of a defect:
+
+- **Writes are DIFFED.** An unchanged `UIElement` write costs a whole UI-projection rebuild (see
+  § "Projection & the dirty flag" above), so `patchUI`/`patchToggle` compare first and call
+  `markUIDirty()` only on a real change. `restartClip` is the deliberate exception — it must
+  rewind a playhead that may already sit at the target, so callers edge-detect instead.
+- **A present-but-`undefined` key means "leave it alone".** koota's SoA setter tests `'key' in
+  value`, not whether the value is defined, so `{ isVisible: flags.show }` with an undefined
+  `flags.show` would otherwise write a real `undefined` — blanking the element *and its whole
+  subtree*, permanently, since the next identical call diffs as unchanged and never recovers.
+- **The name lookup is cached but self-validating.** A hit is O(1); a miss costs one pass over
+  every `EntityAttributes` entity (a few hundred in a real game). That cost is why chrome pushes
+  are gated on a CHANGE rather than run per frame.
+- **The cache clears on world swap**, registered lazily on first lookup — never at module scope,
+  which would fire on import in every test that mocks `core/ecs/world`.
+
+⚠️ **Several `UIElement` style fields are inert without a companion field that defaults to 0** —
+`backgroundColor` needs `backgroundOpacity`, `borderColor` needs `borderWidth`. `ChromeUIPatch`
+exposes both halves of each pair for that reason. The canonical statement of the trap, and the
+full list, is on the trait itself (`runtime/traits/UIElement.ts`) — cite it rather than restating
+it here.
+
+**Position and size are NOT in this module's remit.** A game that needs to move authored chrome
+does it in percentages, from its own code — see the `%`-vs-px warning under `UIElement` above, and
+`games/court/runtime/sceneChrome.ts`, which keeps exactly those game-specific patchers as a thin
+layer over these engine functions.
+
+---
+
 ## Anchor layout (`resolveAnchorRect`)
 
 `runtime/ui/anchorLayout.ts` exposes `resolveAnchorRect(w, h, vpW, vpH, anchor)`, which
@@ -997,17 +1044,21 @@ The engine decides WHICH pooled instance shows entry (x, y); the game answers WH
 (`'Tile3/Solved/Num'`, `''` for the root); values are **trait-keyed** (`{ UIElement: { text } }`).
 
 - A path must be FULL and match exactly one member — **ambiguity is an error, not a fan-out**.
-  `level-tile.prefab.json` carries three entities named `Num`, so a leaf-name match would write
-  all three and look like it worked. This differs deliberately from Court's `patchUIInInstance`,
-  which writes every match by design.
+  `level-tile.prefab.json` USED to carry three entities named `Num`, so a leaf-name match would
+  have written all three and looked like it worked (⚠️ #344 collapsed that prefab to a single
+  face — four entities, one `Num` — so the rule outlived its worked example). This differs
+  deliberately from Court's former
+  `patchUIInInstance`, which wrote every match by design — deleted in #316 with its last caller,
+  so this is the only mechanism of its kind now.
 - Trait-keyed with no shorthand, because a flat field map would have to *guess* a trait — a
   resolver returning a `UIToggle.value` would then silently write nothing.
 - Bump **`epoch`** when content changes but the window does not (a level gets solved; an async
   manifest arrives). Without it the resolver is only called when the window moves.
 - The member-path walker is **new engine code over the `parentId`/`localId` chain**, not a
-  promotion of Court's `findAllInInstance`. `rootInstanceId` is stamped on a prefab's OWN
-  members only — never inner members — so `findAllInInstance`'s flat `rootInstanceId ===
-  rootEcsId` scan reaches zero of a page prefab's 25 nested tile instances.
+  promotion of Court's former `findAllInInstance` (deleted in #316). `rootInstanceId` is stamped
+  on a prefab's OWN members only — never inner members — so that helper's flat `rootInstanceId
+  === rootEcsId` scan would have reached zero of a page prefab's 25 nested tile instances, which
+  is why it was not the thing to promote.
 - The scene's generated `resources` manifest only seeds what it is told is a ref:
   `UIEntries.prefabs[].prefab` must be registered in `REF_FIELDS_BY_TRAIT`
   (`loaders/sceneValidation.ts`) and in `SCALAR_RESOURCE_TYPE_BY_FIELD` as a `prefab`-typed ref,
@@ -1410,7 +1461,9 @@ entry afterwards (`entriesFocus.ts`).
   `resolveMemberPathIn`'s name path: that walker calls an ambiguous segment an ERROR by design,
   which is right for an authored resolver key and wrong here — this path is DERIVED from an
   entity that provably exists, so refusing it would mean declining to re-target focus that is
-  demonstrably sitting somewhere (`level-tile.prefab.json` alone carries three `Num`s). And it
+  demonstrably sitting somewhere (the worked example was `level-tile.prefab.json` carrying three
+  `Num`s — ⚠️ #344 collapsed it to one, so the reasoning stands but that prefab no longer shows
+  it). And it
   must not be **name + ordinal among siblings**, which is the tempting fix and is unsound: that
   order comes from `buildChildIndex` iterating `world.entities`, which is koota's `dense` array,
   which `releaseEntity` maintains by **swap-pop** — destroying any entity moves the world's LAST

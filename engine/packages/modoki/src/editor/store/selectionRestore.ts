@@ -25,10 +25,12 @@ let unsubscribe: (() => void) | null = null;
 /** Register the swap listener. Idempotent — call once at editor startup. */
 export function registerSelectionRestore(): void {
   if (registered) return;
-  registered = true;
+  // Latch AFTER registration: an onWorldSwap throw must not leave this permanently true
+  // with no listener registered (the HMR dispose above resets it, but only on hot-reload).
   unsubscribe = onWorldSwap((newWorld, oldWorld) => {
     restoreSelectionAcrossSwap(newWorld, oldWorld);
   });
+  registered = true;
 }
 
 // HMR cleanup: unsubscribe the old listener so a hot-reloaded module doesn't

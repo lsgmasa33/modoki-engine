@@ -85,7 +85,12 @@ for (const proj of projects) {
   // the same wrong shortcut for engine/tools/* and no longer does.
   console.log(`[bootstrap-game-deps] installing ${label} …`);
   try {
-    npmRun(['install'], gameDir);
+    // `--no-audit`: the root .npmrc sets audit=false, but npm reads a project .npmrc only from
+    // the project it operates on — it does NOT walk up to the repo root — and lifecycle scripts do
+    // not export npm_config_audit to children (both verified). So every nested install here would
+    // still hit registry.npmjs.org's audit endpoints, which hang and 503 (npm/cli#7383): 3-5min per
+    // no-op install x26 projects = ~2h. Dependabot on GitHub is what actually reports vulns.
+    npmRun(['install', '--no-audit'], gameDir);
     installed++;
   } catch (e) {
     console.warn(

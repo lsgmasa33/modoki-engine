@@ -160,10 +160,59 @@ export const UIElement = trait({
   pointerThrough: false,
 
   // ── Style (box visuals) ──
-  backgroundColor: 0 as number,   // 0 = transparent
+  /** Background fill colour. ⚠️ **Inert on its own** — see `backgroundOpacity` below, which
+   *  defaults to 0 and gates whether this paints at all. */
+  backgroundColor: 0 as number,
+  /** Background fill alpha. ⚠️ **Defaults to 0, so setting `backgroundColor` ALONE paints
+   *  NOTHING.** The renderer gates the fill on this field — `ui/UINode.tsx`'s
+   *  `if (node.backgroundOpacity > 0)` — so a colour with no opacity is invisible, not
+   *  transparent-by-choice. Author or patch BOTH.
+   *
+   *  This is the canonical statement of a trap with three prior sightings, all of which worked
+   *  around it instead of documenting it here: four Court overlays shipped with invisible scrims;
+   *  `UIToggle` declares `trackOpacity`/`knobOpacity` explicitly (defaulting to 1) rather than
+   *  borrow this field, and says why; and `ui/sceneChrome.ts`'s `ChromeUIPatch` exposed
+   *  `backgroundColor` with no companion, making a patched colour a silent no-op on any element
+   *  whose scene left this at 0. Cite this comment rather than restating the rule.
+   *
+   *  ⚠️ **This is a FOUR-instance trap, and this comment has understated it twice.** The fix that
+   *  added this paragraph closed the background half and left the border half open; the paragraph
+   *  then called itself the canonical statement of a *two*-instance trap, and a close-out sweep
+   *  found two more. The full set, each an authored colour gated by a companion defaulting to 0:
+   *
+   *  | Colour | Gate (default 0) | Renderer |
+   *  |---|---|---|
+   *  | `backgroundColor` | `backgroundOpacity` | `ui/UINode.tsx` `if (node.backgroundOpacity > 0)` |
+   *  | `borderColor` | `borderWidth` | `if (node.borderWidth)` |
+   *  | `textShadowColor` | `textShadowBlur` OR `textShadowOffsetX` OR `textShadowOffsetY` — all three default 0, so all three must stay 0 for the gate to be closed | `if (node.textShadowBlur \|\| node.textShadowOffsetX \|\| node.textShadowOffsetY)` |
+   *  | `textStrokeColor` | `textStrokeWidth` | `if (node.textStrokeWidth > 0)` |
+   *
+   *  `ui/sceneChrome.ts`'s `ChromeUIPatch` exposes both halves of the first two pairs, because it
+   *  exposed those colours already; it exposes NEITHER half of the last two, which is consistent
+   *  and therefore not the same defect — a caller cannot half-open a gate it cannot reach at all.
+   *  Expose both halves or neither, never the colour alone.
+   *
+   *  ⚠️ **The boundary, because it is about to be tested again:** this is a trap only when the
+   *  gating field's NAME does not announce the gate. `fontSizeMin` does nothing without
+   *  `autoFitText` (landed on main 2026-09-03), and every PostFX strength field does nothing
+   *  without that effect's `enabled` — neither is an instance, because an author who set the
+   *  value and saw nothing happen knows immediately what to look for. `borderColor` gives them
+   *  nothing to look for. Add a row here only when the gate is SILENT in that sense.
+   *
+   *  Counter-example worth keeping in view: `textOpacity`, `borderOpacity`, `textShadowOpacity`
+   *  and `textStrokeOpacity` all default to **1**, so they gate nothing; and `UIToggle` declares
+   *  `trackOpacity`/`knobOpacity` at 1 specifically to avoid inheriting this shape. */
   backgroundOpacity: 0,
   borderRadius: 0,
+  /** Border thickness in CSS px. ⚠️ **Defaults to 0, and it GATES THE WHOLE BORDER** — the
+   *  renderer draws nothing border-related unless this is nonzero (`ui/UINode.tsx`:
+   *  `if (node.borderWidth) { … style.borderColor = … }`). So `borderColor` alone paints NOTHING,
+   *  exactly as `backgroundColor` without `backgroundOpacity` does. Same trap, second instance.
+   *
+   *  This is PAINT, not layout: the renderer sets `box-sizing: border-box`, so a border draws
+   *  INSIDE the element's box and never changes its outer size or moves a sibling. */
   borderWidth: 0,
+  /** Border colour. ⚠️ **Inert on its own** — gated by `borderWidth` above, which defaults to 0. */
   borderColor: 0x333333 as number,
   borderOpacity: 1,      // border color alpha (folded into the borderColor picker)
   opacity: 1,
@@ -255,11 +304,17 @@ export const UIElement = trait({
    * only the font shrank. Author both in the same unit.
    */
   letterSpacingUnit: 'px' as UILengthUnit,
+  /** ⚠️ **Inert on its own** — gated by `textShadowBlur`/`textShadowOffsetX`/
+   *  `textShadowOffsetY`, all of which default to 0. The THIRD instance of the trap
+   *  documented on `backgroundOpacity` above; read that comment, don't restate it. */
   textShadowColor: 0x000000 as number,
   textShadowOpacity: 1,  // shadow color alpha (folded into the textShadowColor picker)
   textShadowOffsetX: 0,
   textShadowOffsetY: 0,
   textShadowBlur: 0,
+  /** ⚠️ **Inert on its own** — gated by `textStrokeWidth`, which defaults to 0. The FOURTH
+   *  instance of the trap documented on `backgroundOpacity` above; read that comment, don't
+   *  restate it. */
   textStrokeColor: 0x000000 as number,
   textStrokeOpacity: 1,  // stroke color alpha (folded into the textStrokeColor picker)
   textStrokeWidth: 0,

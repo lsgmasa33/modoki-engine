@@ -58,7 +58,12 @@ for (const dir of readdirSync(toolsDir, { withFileTypes: true })) {
   // tree is already satisfied, so re-running it is the honest check.
   console.log(`[bootstrap-mcp-deps] installing engine/tools/${dir.name} …`);
   try {
-    npmRun(['install'], toolDir);
+    // `--no-audit`: the root .npmrc sets audit=false, but npm reads a project .npmrc only from
+    // the project it operates on — it does NOT walk up to the repo root — and lifecycle scripts do
+    // not export npm_config_audit to children (both verified). So every nested install here would
+    // still hit registry.npmjs.org's audit endpoints, which hang and 503 (npm/cli#7383): 3-5min per
+    // no-op install x26 projects = ~2h. Dependabot on GitHub is what actually reports vulns.
+    npmRun(['install', '--no-audit'], toolDir);
   } catch (e) {
     console.warn(
       `[bootstrap-mcp-deps] WARNING: npm install failed in engine/tools/${dir.name} — ` +

@@ -50,6 +50,7 @@ export const ads = {
   async initAds(): Promise<void> {},
   cleanupAds(): void {},
   onRewardEarned(_handler: unknown): void {},
+  async restoreAdsAfterRealmSurvived(): Promise<void> {},
   async showBanner(): Promise<void> {},
   async hideBanner(): Promise<void> {},
   async showInterstitial(_placement: string): Promise<boolean> { return false; },

@@ -763,7 +763,15 @@ function App() {
         // makes the next tick restart those sources from the top — the same place a real reload
         // would have left them.
         onRealmSurvived: () => {
-          if (Capacitor.isNativePlatform()) void appServices().ads?.init();
+          // #631: `ads.init()` alone under-restores — it never re-registers a reward handler
+          // set through `onRewardEarned`, nor re-shows a banner that was on screen, both torn
+          // down by the `cleanupAds()` that already ran above. Prefer the dedicated recovery hook
+          // when the registered service exposes one; fall back to plain `init()` for a service
+          // that doesn't (most games have nothing to restore).
+          if (Capacitor.isNativePlatform()) {
+            const ads = appServices().ads;
+            void (ads?.restoreAfterRealmSurvived ? ads.restoreAfterRealmSurvived() : ads?.init());
+          }
           rearmAudioAutoplay(getCurrentWorld());
         },
       },

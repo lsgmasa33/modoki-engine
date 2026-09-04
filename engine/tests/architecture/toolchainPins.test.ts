@@ -61,6 +61,10 @@ const EXPECTED: Record<string, { pin: string; why: string }> = {
     pin: '^5.9.3',
     why: 'builds with `tsc && rollup`; its compiler emits plugin JS that ships to devices',
   },
+  'engine/packages/capacitor-appsflyer/package.json': {
+    pin: '^5.9.3',
+    why: 'builds with `tsc && rollup`; its compiler emits plugin JS that ships to devices',
+  },
   'engine/packages/modoki/package.json': {
     pin: '~6.0.3',
     why: 'ON the root compiler, and a devDependency only — the `./testing` subpath\'s scanner asks '

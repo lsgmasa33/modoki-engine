@@ -4,7 +4,7 @@
  *  mutators. The system-level wiring (Input → focus movement → activation) is covered
  *  headlessly in uiFocusSystem.test.ts. */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   pickInDirection, pushScope, popScope, activeScope, setFocus, focusedGuid, resetFocus,
   requestActivate, retargetFocusedGuid, useFocusStore,
@@ -126,5 +126,41 @@ describe('retargetFocusedGuid', () => {
     setFocus('a-button');
     retargetFocusedGuid('slot-3', 'slot-1');
     expect(focusedGuid()).toBe('a-button');
+  });
+});
+
+describe('ensureFocusWorldSwapHook — lazy init latch ordering', () => {
+  it('does not latch permanently true when onWorldSwap throws on the first call', async () => {
+    vi.resetModules();
+    // shouldThrow stays false through the module's own import-time onWorldSwap calls
+    // (other modules in the chain — e.g. timelinePreview — register at module scope) and is
+    // only flipped on once the module is loaded, so it targets exactly the explicit calls
+    // to ensureFocusWorldSwapHook() below.
+    let shouldThrow = false;
+    const onWorldSwap = vi.fn(() => {
+      if (shouldThrow) throw new Error('onWorldSwap missing from mock');
+    });
+    vi.doMock('../../src/runtime/core/ecs/world', () => ({
+      getCurrentWorld: vi.fn(),
+      findEntityByGuid: vi.fn(),
+      setStructureCallback: vi.fn(),
+      onWorldSwap,
+    }));
+    const { ensureFocusWorldSwapHook } = await import('../../src/runtime/ui/focusManager');
+    const callsBeforeTest = onWorldSwap.mock.calls.length;
+
+    // First call: registration throws. The throw must propagate.
+    shouldThrow = true;
+    expect(() => ensureFocusWorldSwapHook()).toThrow('onWorldSwap missing from mock');
+    expect(onWorldSwap).toHaveBeenCalledTimes(callsBeforeTest + 1);
+
+    // Second call: registration now succeeds. Before the fix, the latch was set BEFORE the
+    // throwing call, so this second call would silently no-op instead of retrying.
+    shouldThrow = false;
+    expect(() => ensureFocusWorldSwapHook()).not.toThrow();
+    expect(onWorldSwap).toHaveBeenCalledTimes(callsBeforeTest + 2);
+
+    vi.doUnmock('../../src/runtime/core/ecs/world');
+    vi.resetModules();
   });
 });

@@ -66,7 +66,10 @@ type AudioSourceData = TraitValue<ExtractSchema<typeof AudioSource>>;
 function patchSource(target: Entity | undefined, patch: Partial<AudioSourceData>): void {
   const a = target?.get(AudioSource);
   if (!a || !target) return;
-  target.set(AudioSource, { ...a, ...patch });
+  // Strip undefined-valued keys: koota's setter tests `'key' in value`, not whether it's
+  // defined, so an explicit undefined here would overwrite the real value.
+  const defined = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
+  target.set(AudioSource, { ...a, ...defined });
   // The write bypasses the trait-mutation dirty path, so nudge the UI projection
   // to re-resolve highlight bindings watching AudioSource (e.g. the crossfade
   // toggle's on/off color) + the Inspector's live `playing` readout this frame.
