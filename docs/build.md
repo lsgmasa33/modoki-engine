@@ -1349,6 +1349,39 @@ nothing: delete `packages["node_modules/<plugin>"]` from the project's `package-
 `npm install --package-lock-only` (re-resolves version + integrity from the tarball on disk), then
 `rm -rf node_modules/<plugin> && npm install`.
 
+**The trigger is a CONJUNCTION, measured on npm 11.12.1 / node v26 (#685).** Each row is an
+independently re-poisoned tree, so the results don't contaminate each other. npm resolves a `file:`
+dep from the lockfile entry — `resolved` + `integrity` — and re-extracts when EITHER moves:
+
+| tarball bytes | filename | lockfile entry | result |
+|---|---|---|---|
+| change | changes | advances | heals (`changed 1 package`) |
+| change | **same** | advances | heals (`changed 1 package`) |
+| change | **same** | **never regenerated** | **POISONED** — `up to date`, old bytes stay on disk |
+
+A fourth control rules out the resolver theory the issue floated: with two tarballs at DIFFERENT
+filenames both declaring the same internal `1.0.0`, npm still re-extracts — so it does not key a
+`file:` dep on `name@version`, and N indistinguishable `1.0.0` tarballs are harmless on their own.
+
+So only the conjunction bites, and the `<base>-h<hash>` packed version is NOT what prevents it —
+the lockfile regeneration that shipped alongside it is. Two consequences that are easy to get
+backwards:
+- **A version-only re-pack keeps the filename.** `pluginContentHash` normalizes the version out of
+  its input (it must, or the hash would feed on itself), so `9b8891576` rewrote all 27 tarballs
+  in place — `git show --name-status --find-renames 9b8891576 -- 'games/*/plugins/*.tgz'` is 27 `M`,
+  zero `R`. Merging it was still safe, because it shipped 23 regenerated lockfiles with them
+  (verified against the real pre/post bytes, not synthetics).
+- **The recovery recipe's three steps are each load-bearing.** Deleting the entry and running only
+  `npm install --package-lock-only` + `npm ci` leaves the tree stale; so do `npm install`,
+  `--force`, and `rm -rf node_modules && npm install` on their own. The full recipe above is the
+  one that was measured to work.
+
+⚠️ **No in-repo workflow can still reach the poisoned state**: `vendorEnginePlugins` invalidates the
+lockfile entry on an in-place re-pack, `bootstrap-game-deps` never skips a present `node_modules`
+(the #215 scar), and `verifyInstalledMatchesTarball` fails both native build paths regardless of
+cause. What remains reachable is a mis-resolved `.tgz` binary merge conflict (tarball from one side,
+lockfile from the other) or hand-editing — which is exactly what the detector is for.
+
 Two notes worth carrying:
 - **`npm` ships `README.md` regardless of the `files` field**, so editing a plugin's DOCS re-hashes
   its tarball. Expect a re-vendor after a docs-only plugin edit.
