@@ -10,6 +10,7 @@
  *  `assetManifest.ts`). */
 
 import './particleCache';
+import './gpuMemoryReport';
 
 import { textureProvider } from '../core/textureProvider';
 import {

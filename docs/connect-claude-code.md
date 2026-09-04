@@ -71,15 +71,15 @@ path everywhere).
 | Fact | Source | Consequence |
 |---|---|---|
 | Packaged app unpacks the whole engine tree + `node_modules` to `app.asar.unpacked/` (real files, "Vite runs in prod") | `electron-builder.yml` `asarUnpack: **/engine/**` + `**/node_modules/**`, `files: engine/**/*` | The MCP source AND the starter template already sit on the user's disk — no npm publish, no separate binary |
-| `REPO_ROOT = app.isPackaged ? <resourcesPath>/app.asar.unpacked : <repo>` | `main.ts:273` | Main can compute the **absolute** path to the MCP entry + the template on *this* machine |
+| `REPO_ROOT = app.isPackaged ? <resourcesPath>/app.asar.unpacked : <repo>` | `main.ts` | Main can compute the **absolute** path to the MCP entry + the template on *this* machine |
 | Backend port is `backendHandle.port` (default 5179, ephemeral fallback on clash) | `main.ts` | Main knows the exact `MODOKI_BACKEND` URL to bake; the user never could |
 | Open project root is `state.root` | `main.ts` | Main knows where to write `.mcp.json` |
-| MCP reads `MODOKI_BACKEND` (default `http://localhost:5173`) + logs a start banner | `modoki-mcp/src/index.ts:23` | The written env var is the only wiring the MCP needs |
+| MCP reads `MODOKI_BACKEND` (default `http://localhost:5173`) + logs a start banner | `modoki-mcp/src/index.ts`'s `main()` | The written env var is the only wiring the MCP needs |
 | Dev CDP is an electron CLI arg (`--remote-debugging-port`) the launcher sets; Chromium binds it 127.0.0.1-only. **On by default** in dev too now: an explicit `MODOKI_CDP_PORT` wins, else the launcher derives a per-clone-safe default `9222 + (backend − 5179)` (5179→9222, 5180→9223, 5181→9224) whenever the backend port is pinned; only an AUTO backend port (MULTI mode) leaves it off | `launch-editor.sh` | The packaged app (OS double-click, no CLI arg) `appendSwitch`es the port itself — also **on by default** (opt-out), so a plain launch opens it unless the user disabled it |
 | The repo `.mcp.json` already runs three servers (`modoki`, `game-debug`, `chrome-devtools --browser-url`) | repo `.mcp.json` | Multi-server merge is the proven shape; `chrome-devtools` attaches to a renderer over CDP by URL |
 | Menus merge renderer items via `rendererMenuSpec` + `modoki:bridge-menu-action`; main↔renderer over the preload bridge | `projects.ts`, `preload.ts`, `main.ts` | A new menu item + a dockable panel slot into existing patterns |
 | Editor already writes project files (`project.config.json`, `.modoki/layouts/`) | `projects.ts` | Writing `.mcp.json` is an established capability, not a new trust boundary |
-| Starter template ships a project `CLAUDE.md`, copied recursively by BOTH scaffold paths | `templates/starter/CLAUDE.md`, `scaffold-project.mjs:56`, `newProject.ts:68`, `main.ts:356` | New projects are already primed — the CLAUDE.md is in the DMG/exe; only its *content* needs upgrading |
+| Starter template ships a project `CLAUDE.md`, copied recursively by BOTH scaffold paths | `templates/starter/CLAUDE.md`, `scaffold-project.mjs`'s `fs.cpSync(TEMPLATE_DIR, targetDir, { recursive: true })`, `newProject.ts`'s `scaffoldProject`, `main.ts`'s `onNewProject` | New projects are already primed — the CLAUDE.md is in the DMG/exe; only its *content* needs upgrading |
 
 ## The core problem → solution
 
@@ -815,12 +815,12 @@ repo-root config is the one healed for an in-repo game. Then an ultracode review
 ### The shipped editor's profile silently relocated — a regression from today
 
 Electron **resolves and caches `userData` on the FIRST read**, so whoever reads first wins.
-`main.ts` had `app.setName('Modoki Editor')` at line 269 to give the shipped app a product
-dir. Then `initFileLog()` landed at **line 28** (commit `ff364b47`, "Windows editor crash on
-open") — and it reads `userData`. From that day the rename was a **no-op**: userData fell
-back to the package.json name, and the shipped editor's whole profile — the **1.2 GB**
-toolchain, prefs, caches — moved from `Modoki Editor` to `modoki-app`. Nothing threw,
-nothing logged; the directory just moved.
+`main.ts` already had `app.setName('Modoki Editor')`, well down the file, to give the shipped
+app a product dir. Then `initFileLog()` landed well ABOVE it (commit `ff364b47`, "Windows
+editor crash on open") — and it reads `userData`. From that day the rename was a **no-op**:
+userData fell back to the package.json name, and the shipped editor's whole profile — the
+**1.2 GB** toolchain, prefs, caches — moved from `Modoki Editor` to `modoki-app`. Nothing
+threw, nothing logged; the directory just moved.
 
 Proof: a Jul-16 packaged build (zero `initFileLog`) still writes to `Modoki Editor`; every
 build after `ff364b47` writes to `modoki-app`, and `Modoki Editor` was left holding a stray
@@ -841,7 +841,7 @@ while CLAUDE.md RULE 2 has several running at once. Measured with two live edito
 | `Local Storage` (LevelDB) | **single-writer**: the FIRST editor takes the lock, later ones get NOTHING. `editor:sceneViewMode`, `modoki-last-scene:<project>`, `modoki.anim.trackListW`, `modoki.buildSupportDismissed` silently stop persisting — no error anywhere |
 | `GPUCache` / `DawnWebGPUCache` | both processes hold `data_0..3` + `index` open; Chromium's disk_cache expects one process (suspicious for a WebGPU/TSL engine, not proven to cause a specific failure) |
 | `logs/main.log` | interleaved across clones |
-| `backend-port.json` (C5 sticky port) | `MODOKI_MULTI` does **not** pin a port (`launch-editor.sh:32`), so MULTI editors read/write one file and the sticky port degrades to whoever launched last |
+| `backend-port.json` (C5 sticky port) | `MODOKI_MULTI` does **not** pin a port (`launch-editor.sh`'s `BACKEND_PORT` selection), so MULTI editors read/write one file and the sticky port degrades to whoever launched last |
 
 ### The fix (shipped)
 
@@ -854,8 +854,8 @@ unit test of a resolver could have caught:
   (keyed on the clone PATH, so branch switches keep the profile — matching how `projects.ts`
   scopes recents).
 - **Toolchain pinned to `appData/Modoki/toolchain`** — MACHINE-level, outside userData. This
-  makes `projects.ts:40`'s existing claim ("the toolchain is machine-shared") true and
-  de-dupes it (`npm-tools` was duplicated across dev and packaged).
+  makes `projects.ts`'s comment on `recentsScope` ("the toolchain is machine-shared") true
+  and de-dupes it (`npm-tools` was duplicated across dev and packaged).
 - **`adoptLegacyToolchain` renames an existing toolchain into that dir on first run.**
   Pinning alone moved where we LOOK, not the data — the first cut therefore **did**
   re-download ~1.2 GB (JDK 336M + Android SDK 527M + Node + Ruby) and would have left

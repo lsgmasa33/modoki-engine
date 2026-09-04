@@ -581,7 +581,8 @@ swap, or a flaky network. Impact scales with how the caller retries: the physics
 re-fires the same dead rejection every frame and physics never starts; `dynamicFontProvider`
 fails silently, and on a CJK game a glyph miss is the normal path, not the exception.
 
-Clear it behind an **identity guard**, the model at `runtime/loaders/assetManifest.ts:674-681`:
+Clear it behind an **identity guard**, the model at `runtime/loaders/assetManifest.ts`'s
+`ensureManifestLoaded`:
 
 ```ts
 const promise = load(); memo = promise;
@@ -591,8 +592,8 @@ promise.catch(() => { if (memo === promise) memo = null; });
 The `=== promise` check is the part that is easy to miss — clearing unconditionally lets a
 stale rejection evict a NEWER in-flight load. `teardownRef` above nulls unconditionally and is
 safe only because its `await` resumption and catch body are one microtask; do not copy that
-shape blindly. Two deliberate non-instances: `msdfGenerate.ts` caches its rejection on purpose
-(`:113-116`, so N fonts do not each pay its 10 s timeout), and `textureResolver.ts`'s
+shape blindly. Two deliberate non-instances: `msdfGenerate.ts`'s `getGenerator` caches its
+rejection on purpose (so N fonts do not each pay its 10 s timeout), and `textureResolver.ts`'s
 `probePromise` cannot reject at all — its IIFE swallows every error and always marks the gate
 ready.
 
@@ -609,12 +610,13 @@ value**; a real retry would need a cache-busted URL. What a cleared memo DOES re
 failure *after* a successful import (e.g. `mod.init()` in the rapier loaders instantiating
 WASM), because the module is already resolved and the next attempt re-runs that step for real.
 This is why those loaders retry a bounded number of times and then fail loudly rather than
-retrying forever: the caller (`physics2DSystem.ts:914`) has no backoff and would otherwise
-re-import at frame rate. ⚠️ **Do not read that budget as a meaningful retry window.** It is
-counted in ATTEMPTS against a caller that retries every tick, so all three are spent within
-roughly three frames of the failure — it rescues a condition that clears in ~50 ms, not a
-device stall lasting a second. Combined with the measured fact that the `import()` half is not
-retryable at all, the WARNINGS are most of the value here. A time-based budget (retry while
+retrying forever: the caller (`physics2DSystem.ts`'s `physics2DSystem`) has no backoff and
+would otherwise re-import at frame rate. ⚠️ **Do not read that budget as a meaningful retry
+window.** It is counted in ATTEMPTS against a caller that retries every tick, so all three
+are spent within roughly three frames of the failure — it rescues a condition that clears
+in ~50 ms, not a device stall lasting a second. Combined with the measured fact that the
+`import()` half is not retryable at all, the WARNINGS are most of the value here. A
+time-based budget (retry while
 `now - firstFailureAt < N`, capped at K attempts) would actually cover a transient
 WASM-instantiate failure; a count-only budget against a frame-rate caller does not.
 

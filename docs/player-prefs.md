@@ -143,10 +143,10 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   `pagehide` on web, Capacitor `App` `appStateChange` **and `'pause'`** on native — and a game swap
   flushes the outgoing namespace before clearing the cache. ⚠️ **`'pause'` is not redundant with
   `appStateChange` on Android** (#619): `fireStatusChange(false)` has exactly one caller,
-  `BridgeActivity.onStop():118` (and it is gated on `activityDepth == 0`), so a *translucent* Activity
+  `BridgeActivity.onStop()` (and it is gated on `activityDepth == 0`), so a *translucent* Activity
   on top — Play Billing's `ProxyBillingActivity` is the one that bit us — pauses the host without
   stopping it and produces **no BACKGROUND `appStateChange`**. ⚠️ Not "no `appStateChange` at all":
-  `fireStatusChange(true)` at `onResume():97` is UNCONDITIONAL, so dismissing it fires an
+  `fireStatusChange(true)` at `onResume()` is UNCONDITIONAL, so dismissing it fires an
   `isActive:true` with no `false` before it — see the unpaired-resume warning in
   [native-and-sdks.md](./native-and-sdks.md) before writing any consumer that assumes the two pair up. `'pause'` comes from
   `AppPlugin.handleOnPause()` and does fire — measured on the A23, not inferred: behind a translucent

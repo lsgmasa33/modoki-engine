@@ -94,7 +94,7 @@ An issue's validation must land in one of three states:
 |---|---|---|
 | **Observed** | You saw the defect happen, and can cite the evidence | "Observed: `modoki_journal` shows `payout.amount: -4` at tick 812 — see attached line." |
 | **Attempted, could not trigger** | You tried to make it fire and it didn't — this is a legitimate filing, not a weaker one | "Attempted: drove the interleaving 20x via `createTestWorld` at seed 7; could not reproduce the double-fire. Filing anyway because the code path is real and the race window is narrow." |
-| **Read-only** | You have not run it at all — allowed, but only when declared up front, with the reason | "Read-only (no evidence attempted) — this game has no running fixture on this clone; filing from the code path at `runtime/systems.ts:112`." |
+| **Read-only** | You have not run it at all — allowed, but only when declared up front, with the reason | "Read-only (no evidence attempted) — this game has no running fixture on this clone; filing from the code path in `runtime/systems.ts`." |
 
 **The declaration goes on the FIRST LINE of the issue body, not buried** — a reader deciding
 whether to pick the ticket up must see it without scrolling past the mechanism and the "why it

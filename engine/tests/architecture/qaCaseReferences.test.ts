@@ -37,6 +37,17 @@ import { describe, expect, it } from 'vitest';
  * area check compared "animation" against "animation\some-case.md" and ALL 187 cases failed on
  * the `win` clone while a Mac clone stayed green. Normalise where paths enter.
  */
+import {
+  citesALine,
+  citesALineByMarker,
+  citesALineInProse,
+  codeSpans,
+  codeTokens,
+  isBareLineSpan,
+  nonCodeText,
+  stripLineRef,
+} from '../helpers/lineCitations.js';
+
 const toPosix = (p: string) => p.replace(/\\/g, '/');
 
 const REPO_ROOT = join(__dirname, '..', '..', '..');
@@ -229,38 +240,6 @@ function loadCases(): CaseFile[] {
     .sort((a, b) => a.rel.localeCompare(b.rel));
 }
 
-/**
- * Tokens inside inline code spans and fenced blocks — never bare prose.
- *
- * BOTH are split on whitespace. An inline span used to be kept whole, which quietly defeated
- * this guard for the commonest citation shape in the repo: `` `engine/scripts/launch-editor.sh
- * games/3d-test` `` became one token containing a space, and the placeholder filter (which skips
- * anything with whitespace, for `games/<id>/…`) then dropped it without ever checking either
- * path existed. A renamed script would have passed silently — in the guard whose entire job is
- * catching renamed references.
- */
-export function codeTokens(md: string): string[] {
-  const inline = [...md.matchAll(/`([^`\n]+)`/g)].flatMap((m) => m[1].split(/\s+/));
-  const fenced = [...md.matchAll(/```[a-z]*\n([\s\S]*?)```/g)].flatMap((m) => m[1].split(/\s+/));
-  return [...inline, ...fenced].filter(Boolean);
-}
-
-/**
- * Whole inline code spans, unsplit.
- *
- * Needed because **this repo has asset filenames containing spaces** — e.g.
- * `games/3d-test/runtime/assets/scenes/2D Animation.scene.json`. Splitting that span on whitespace
- * yields `…/scenes/2D` plus `Animation.scene.json`, and the checker then reports a perfectly correct
- * citation as two missing paths. The caller uses this to ask "is the ENTIRE span a real path?" before
- * falling back to the token split.
- *
- * This cannot re-open the hole the split was introduced to close: a span is only accepted whole when
- * it EXISTS on disk, so a span naming something missing is still split and still checked token by
- * token.
- */
-export function codeSpans(md: string): string[] {
-  return [...md.matchAll(/`([^`\n]+)`/g)].map((m) => m[1].trim()).filter(Boolean);
-}
 
 /**
  * The whitespace fragments of verified space-bearing spans — MINUS any fragment the case also cites
@@ -283,18 +262,47 @@ export function exemptFragments(spans: string[], verifiedWhole: string[]): Set<s
   );
 }
 
+
 /**
- * Strip a trailing line reference from a cited path — `foo.ts:525`, `foo.ts:525-573`, `foo.ts#L525`.
+ * The ONE citation allowed to carry a line number, and why.
  *
- * `file_path:line_number` is the repo's own citation convention (CLAUDE.md: it is clickable), and
- * the checker used to treat the whole thing as the path and report the file as missing. The fix
- * belongs HERE rather than in the cases: the guard's contract is "fix the extractor's precision,
- * never delete the assertion", and pushing authors to drop line numbers would make every case
- * vaguer to satisfy a tool.
+ * `cloud-sync-two-device-progress-fork.md` contains the paragraph that explains this whole
+ * convention, and it needs a specimen to point at: "a `file.ts:123` citation rots silently on every
+ * edit above line 123". The specimen is not a citation — `file.ts` is not a file — so exempting it
+ * costs nothing, whereas deleting it would remove the rationale and invite the next author to
+ * re-litigate #680 from scratch. Keyed to the exact file AND token so it cannot quietly widen.
  */
-export function stripLineRef(path: string): string {
-  return path.replace(/(?::\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*|#L\d+(?:-L?\d+)?)$/, '');
+/**
+ * The suite's own top-level docs, DERIVED rather than hardcoded.
+ *
+ * ⚠️ A guard is `collect()` then `assert()`, and a perfect assertion over a partial collection is
+ * green and worthless. Both doc checks here used to hardcode `['qa/knowledge.md']`, so a new
+ * top-level doc — `qa/playbook.md`, another `qa/findings-<date>.md` — would have been scanned by
+ * NOTHING, silently, with every assertion still passing. That is not hypothetical: the comment on
+ * the path check below records `qa/findings-2026-08-13.md` being deleted while `knowledge.md` still
+ * cited it, undetected for exactly this reason.
+ *
+ * `README.md` stays out, and that exclusion is documented where the path check explains it: it is
+ * the format SPEC, so it documents `creates:` by example and quotes the forbidden `file.ts:1745`
+ * shape in order to forbid it. Scanning it would demand the opposite of two other guards.
+ */
+function suiteDocs(): Array<{ rel: string; body: string }> {
+  const dir = join(REPO_ROOT, 'qa');
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((f) => f.endsWith('.md') && f !== 'README.md')
+    .sort()
+    .map((f) => ({ rel: `qa/${f}`, body: readFileSync(join(dir, f), 'utf8') }));
 }
+
+const PROSE_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
+  { file: 'qa/cases/persistence/cloud-sync-two-device-progress-fork.md', token: 'line 123' },
+];
+
+const LINE_REF_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
+  { file: 'qa/cases/persistence/cloud-sync-two-device-progress-fork.md', token: 'file.ts:123' },
+];
+
 
 function git(args: string[]): string {
   return execFileSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
@@ -448,6 +456,136 @@ describe('qa case guard helpers', () => {
     });
   });
 
+  describe('citesALine', () => {
+    it('catches every shape a line citation is written in', () => {
+      expect(citesALine('games/court/runtime/saveSync.ts:1745')).toBe(true);
+      expect(citesALine('games/court/runtime/saveSync.ts:1381-1417')).toBe(true);
+      expect(citesALine('engine/tools/modoki-mcp/src/tools/editor.ts:288,310,323,338')).toBe(true);
+      expect(citesALine('docs/editor.md#L12')).toBe(true);
+      expect(citesALine('games/court/accounts.md:762-775')).toBe(true);
+    });
+
+    it('catches NATIVE and shader files the old extension allowlist waved through', () => {
+      // The allowlist named 10 web extensions; the suite cites all of these files today, so a line
+      // number on one would have rotted with the gate green over it.
+      expect(citesALine('engine/packages/capacitor-ota/ios/OtaPlugin.swift:88')).toBe(true);
+      expect(citesALine('Package.swift:214')).toBe(true);
+      expect(citesALine('index.html:41')).toBe(true);
+      expect(citesALine('android/app/build.gradle:57')).toBe(true);
+    });
+
+    it('catches a PATH whatever its suffix, so the rule cannot go stale', () => {
+      expect(citesALine('engine/some/new/thing.zigzag:12')).toBe(true);
+    });
+
+    it('catches Objective-C and the Class.method():NNN shape (#686)', () => {
+      // Both were live in docs/native-and-sdks.md and docs/player-prefs.md until #686 removed
+      // them; neither was reachable by the enumeration regexes that drove the sweeps, so the guard
+      // found them, not the sweep.
+      expect(citesALine('CAPPlugin.m:82-93')).toBe(true);
+      expect(citesALine('CAPPlugin.h:40')).toBe(true);
+      expect(citesALine('BridgeActivity.onStop():118')).toBe(true);
+      expect(citesALine('onResume():97')).toBe(true);
+    });
+
+    it('does NOT fire on a JSON payload that merely contains a path and a :N', () => {
+      // docs/debug-tools-mcp.md documents this exact payload. `"value":1` strips like a line ref
+      // and the embedded asset path satisfied the slash shortcut.
+      expect(
+        citesALine('{"clipPath":"/assets/anim/probe.anim.json","trait":"Transform","value":1}'),
+      ).toBe(false);
+    });
+
+    it('does NOT fire on a TRAIT FIELD, which is `Trait.field:value` by shape', () => {
+      // Live in the corpus: nine-slice-corners-unstretched and
+      // character-controller-geometry-and-ccd. A pure shape test flags both.
+      expect(citesALine('UIElement.width:640')).toBe(false);
+      expect(citesALine('Physics2D.gravityX:250')).toBe(false);
+    });
+
+    it('leaves the BARE `:NNN` shape alone — a token cannot tell it from a port', () => {
+      expect(citesALine(':170')).toBe(false);
+      expect(citesALine(':5198')).toBe(false);
+    });
+
+    it('does NOT fire on a port, a plain path, or a bare symbol', () => {
+      // A port loses its digits to the stripper too — what saves it is that `http://localhost` is
+      // not a source file. This is the false positive that would get the assertion disabled, and a
+      // disabled guard is worse than none.
+      expect(citesALine('http://localhost:5183')).toBe(false);
+      expect(citesALine('localhost:9095')).toBe(false);
+      expect(citesALine('games/court/runtime/saveSync.ts')).toBe(false);
+      expect(citesALine('pendingSyncConflict()')).toBe(false);
+      expect(citesALine('npm')).toBe(false);
+    });
+
+    it('sees through the trailing punctuation a sentence leaves on a citation', () => {
+      expect(citesALine('games/court/runtime/systems.ts:7048,')).toBe(true);
+      expect(citesALine('games/court/runtime/systems.ts:7048)')).toBe(true);
+    });
+  });
+
+  describe('citesALineInProse', () => {
+    it('catches both prose shapes, including the tilde hedge', () => {
+      expect(citesALineInProse('the `onMove` handler (line 79) commits')).toEqual(['line 79']);
+      expect(citesALineInProse('`resolveNav` (lines ~91–108)')).toEqual(['lines ~91']);
+      expect(citesALineInProse('see line 1745 and lines 12-20')).toHaveLength(2);
+    });
+
+    it('does NOT fire on a RENDERED line measured in a unit', () => {
+      // docs/ui-system.md describes autoFitText turning "a correct 2-line wrap (229px) into one
+      // non-wrapping line 199px" — and the ui/rendering cases restate that kind of measurement.
+      expect(citesALineInProse('one non-wrapping line 199px outside its 200px parent')).toEqual([]);
+      expect(citesALineInProse('scan line 240 ms after start')).toEqual([]);
+      expect(citesALineInProse('a divider line 32 px tall')).toEqual([]);
+    });
+
+    it('does NOT fire on the compound and single-digit false friends', () => {
+      expect(citesALineInProse('a 40-line function')).toEqual([]);
+      expect(citesALineInProse('the status line')).toEqual([]);
+      expect(citesALineInProse('line height is 1.4')).toEqual([]);
+      expect(citesALineInProse('line 3 of the table')).toEqual([]);
+    });
+  });
+
+  describe('isBareLineSpan', () => {
+    it('catches the bare citation that reuses a filename from earlier in the sentence', () => {
+      // The shape the first #680 sweep missed entirely — its regex demanded a filename before the
+      // colon, so nine survived a pass that reported itself clean.
+      expect(isBareLineSpan(':170')).toBe(true);
+      expect(isBareLineSpan(':14191')).toBe(true);
+      expect(isBareLineSpan(':1381-1417')).toBe(true);
+    });
+
+    it('catches a two-digit RANGE — an index is a single number, a range is a citation', () => {
+      // `docs/native-and-sdks.md` cited `:45-47`, which slipped the three-digit floor.
+      expect(isBareLineSpan(':45-47')).toBe(true);
+      expect(isBareLineSpan(':12,20')).toBe(true);
+    });
+
+    it('does NOT fire on a two-digit handle index — CurveEditor ids are unbounded', () => {
+      // A 12-point size curve elides as `particle:curve:size:0` … `:11`. Under a two-digit floor
+      // that failed the gate telling its author to "name the function" — impossible for an id.
+      expect(isBareLineSpan(':11')).toBe(false);
+      expect(isBareLineSpan(':42')).toBe(false);
+    });
+
+    it('does NOT fire on a PORT, which is why this takes a span and not a token', () => {
+      // Real false positives, caught by this guard on its first full run: every clone has its own
+      // port, so qa/ is full of these. Token-splitting `lsof -i :5198` yields a bare `:5198`.
+      expect(isBareLineSpan('lsof -i :5198 | xargs kill')).toBe(false);
+      expect(isBareLineSpan('http://127.0.0.1:5196/api/identity')).toBe(false);
+      expect(isBareLineSpan('curl -s http://127.0.0.1:5197/api/device/connect')).toBe(false);
+    });
+
+    it('does NOT fire on a one-digit suffix — those are ids, not lines', () => {
+      // `particle:curve:opacity:0` and its `:1`/`:2` siblings are modoki_handles curve-point ids.
+      expect(isBareLineSpan(':0')).toBe(false);
+      expect(isBareLineSpan(':2')).toBe(false);
+      expect(isBareLineSpan('particle:curve:opacity:0')).toBe(false);
+    });
+  });
+
   describe('stripLineRef', () => {
     it('strips a single line and a range, keeping the path', () => {
       expect(stripLineRef('engine/app/editor/agentEditorOps.ts:525')).toBe(
@@ -460,10 +598,14 @@ describe('qa case guard helpers', () => {
     });
 
     it('strips a comma-separated line list, the shape that cites several call sites at once', () => {
-      // Real citation this was added for: qa/knowledge.md names the four tools wiring SAVE_PARAM as
-      // `engine/tools/modoki-mcp/src/tools/editor.ts:288,310,323,338`. Rejecting it would push the
-      // author to drop the line numbers — making the doc vaguer to satisfy the tool, the trade
-      // stripLineRef's own comment already refuses to make.
+      // Real citation this was added for: qa/knowledge.md named the four tools wiring SAVE_PARAM as
+      // `engine/tools/modoki-mcp/src/tools/editor.ts:288,310,323,338`.
+      //
+      // ⚠️ This comment used to end "rejecting it would push the author to drop the line numbers —
+      // making the doc vaguer to satisfy the tool". #680 overturned that: the numbers rot, and the
+      // citation now names the four call sites in prose instead, which is what the four numbers
+      // were standing in for. The STRIPPING behaviour asserted here is still wanted — see
+      // stripLineRef's comment for why the helper outlives the convention it was built to tolerate.
       expect(stripLineRef('engine/tools/modoki-mcp/src/tools/editor.ts:288,310,323,338')).toBe(
         'engine/tools/modoki-mcp/src/tools/editor.ts',
       );
@@ -798,11 +940,15 @@ describeCases('QA case references', () => {
    * loader skips `README.md`, so neither doc was ever read by this guard. The dangling citation was
    * caught by hand, which is exactly the thing this file exists so nobody has to do.
    *
-   * They deserve the check at least as much as a case does. `knowledge.md` is ~1000 lines of dense
-   * `file:line` citations whose entire purpose is that a runner TRUSTS them mid-run — a stale path
-   * there misleads every future run, whereas a stale path in one case misleads one. And unlike a
-   * case, no `covers:` staleness signal will ever flag it: the Testboard does not track these docs,
-   * so a rename under their feet is silent forever.
+   * They deserve the check at least as much as a case does. `knowledge.md` is ~1500 lines of dense
+   * citations whose entire purpose is that a runner TRUSTS them mid-run — a stale path there
+   * misleads every future run, whereas a stale path in one case misleads one. And unlike a case,
+   * no `covers:` staleness signal will ever flag it: the Testboard does not track these docs, so a
+   * rename under their feet is silent forever.
+   *
+   * ⚠️ This used to say "dense `file:line` citations". #680 removed every one of them and the
+   * sibling rule below now forbids the shape, so the sentence described the corpus as full of the
+   * thing its neighbour bans.
    *
    * ⚠️ **`qa/README.md` is deliberately NOT checked**, and that is not an oversight to fix later.
    * It is the format SPEC, so it documents `creates:` by example — `games/qa-scaffold-temp`, a
@@ -813,16 +959,18 @@ describeCases('QA case references', () => {
    * exist. Everything else (space-bearing spans, line refs, placeholders, gitignored build output)
    * reuses the case checker's extractor, so the two cannot drift apart in precision.
    */
-  it('every repo path cited in qa/knowledge.md exists', () => {
+  it("every repo path cited in the suite's own docs exists", () => {
     const missing: string[] = [];
-    // Anti-vacuity, same reasoning as 'finds cases to check' above: this guard reads ONE file by
-    // name, so a rename would turn it into a test that inspects nothing and passes forever. Counting
-    // the paths it actually checked makes that failure loud instead of invisible.
+    // Anti-vacuity, same reasoning as 'finds cases to check' above: counting the paths actually
+    // checked makes a broken collection loud instead of invisible.
+    //
+    // ⚠️ This iterated the hardcoded `['qa/knowledge.md']` until #686. The `checked` floor below
+    // covers a RENAME (it drops to 0 and fails) but was blind to an ADDITION: a new `qa/playbook.md`
+    // would have had its paths checked by nothing, silently, which is the same collection defect
+    // recorded for `qa/findings-2026-08-13.md` in this test's own comment above. `suiteDocs()`
+    // derives the set instead, so a new top-level doc is covered the day it lands.
     let checked = 0;
-    for (const rel of ['qa/knowledge.md']) {
-      const abs = join(REPO_ROOT, rel);
-      if (!existsSync(abs)) continue;
-      const body = readFileSync(abs, 'utf8');
+    for (const { rel, body } of suiteDocs()) {
       const spans = codeSpans(body);
       const verifiedWhole = spans.filter(
         (sp) => REPO_TOP_LEVEL.test(sp) && existsSync(join(REPO_ROOT, sp)),
@@ -843,6 +991,116 @@ describeCases('QA case references', () => {
     // The doc cites well over a hundred repo paths; 20 is a floor that cannot be met by accident
     // but will not fight ordinary editing.
     if (HAS_CASES) expect(checked).toBeGreaterThan(20);
+  });
+
+  /**
+   * No citation may point at a LINE. (#680)
+   *
+   * This is the check the suite could not have before, and the reason the whole convention moved.
+   * The neighbouring checks verify that a cited PATH exists; none of them can verify a cited LINE,
+   * and none ever will — nothing records what `saveSync.ts:1745` was SUPPOSED to point at, so a
+   * number that drifts is indistinguishable from one that is right. That is the entire failure
+   * mode: `verify` stays green while every citation quietly stops meaning what it says.
+   *
+   * Measured, not theorised: merging `origin/main` on 2026-09-04 invalidated 25 citations across 7
+   * cases in one fast-forward. `games/court/runtime/systems.ts` moved by a single net line and took
+   * eight of them with it. One doc citation had already drifted onto the wrong heading.
+   *
+   * A symbol survives that, and — unlike a number — a reader who lands in the wrong place can grep
+   * their way back. Both docs and cases are covered: `qa/knowledge.md` is the densest citation site
+   * in the suite and is read mid-run, so leaving it out would aim this at the smaller half.
+   *
+   * ⚠️ **If this fires on something legitimate, add it to `LINE_REF_ALLOWED` with a reason, or fix
+   * `citesALine`'s precision. Do NOT delete the assertion** — the same rule the rest of this file
+   * runs on. And a failure here is not a request to make the sentence vaguer: name the function,
+   * the export, the action id, the route string. That is the trade #680 actually made.
+   */
+  it('no citation carries a line number — they rot silently, so cite the symbol (#680)', () => {
+    const offenders: string[] = [];
+    // Anti-vacuity, same reasoning as the knowledge.md check: a detector that silently stops
+    // matching would leave this passing forever over a suite full of line refs.
+    let scanned = 0;
+    const docs: Array<{ rel: string; body: string }> = [
+      ...cases.map((c) => ({ rel: c.rel, body: c.body })),
+      ...suiteDocs(),
+    ];
+    for (const { rel, body } of docs) {
+      for (const token of codeTokens(body)) {
+        // Count PATH-SHAPED tokens, not every token. Counting raw tokens measured `codeTokens`,
+        // not this rule: the corpus yields ~53k of them, so three files alone cleared the old
+        // floor of 500 and a detector that stopped matching entirely would still have passed.
+        if (REPO_TOP_LEVEL.test(stripLineRef(token))) scanned += 1;
+        if (!citesALine(token)) continue;
+        const t = token.replace(/[.,;)\]]+$/, '').trim();
+        if (LINE_REF_ALLOWED.some((a) => a.file === rel && a.token === t)) continue;
+        offenders.push(`${rel}: "${t}"`);
+      }
+      for (const span of codeSpans(body)) {
+        if (isBareLineSpan(span)) offenders.push(`${rel}: "${span.trim()}"`);
+      }
+      // Prose too: `codeTokens` reads only spans and fences, so an UNBACKTICKED citation in a
+      // heading, a link label or a table cell is invisible to it. Same blind spot the docs gate had.
+      for (const token of nonCodeText(body).split(/\s+/)) {
+        const t = token.replace(/[.,;)\]]+$/, '').trim();
+        if (citesALine(token) && !LINE_REF_ALLOWED.some((a) => a.file === rel && a.token === t)) {
+          offenders.push(`${rel}: "${t}"`);
+        }
+      }
+      // The `~L202` marker rots here exactly as it does in docs/ — it was only found there first.
+      // Wiring it into one gate and not the other is how a shape comes back through the door the
+      // sweep was not watching.
+      for (const m of citesALineByMarker(body)) offenders.push(`${rel}: "${m}"`);
+    }
+    expect(offenders).toEqual([]);
+    // The suite cites thousands of code tokens; 500 is a floor no accident meets.
+    if (HAS_CASES) expect(scanned).toBeGreaterThan(500);
+  });
+
+  /**
+   * The same rule, for line numbers written in PROSE. (#680)
+   *
+   * `codeTokens` only reads backticked spans, so the check above is blind to "the `onMove` handler
+   * (line 79)" — and 62 of those were found across 37 files AFTER the code-span sweep reported
+   * itself clean. They rot identically; two were already pointing at unrelated code when found.
+   *
+   * This is the one place the suite inspects prose, and `qa/README.md` says elsewhere that prose is
+   * deliberately left free so the guard cannot cry wolf. The narrow shape below is what buys the
+   * exception: a space and TWO digits. That excludes "line height", "a 40-line function", "the
+   * status line", and single-digit ordinals like "line 3 of the table", which is where the false
+   * friends live.
+   *
+   * ⚠️ `qa/README.md` is NOT scanned by this rule — not exempted by it, simply absent from `docs`
+   * above, which is the same reason the path check next door skips it (it documents `creates:` by
+   * example). This comment used to say "exempt", which would have told the next author an
+   * allowlist entry already existed. It does not: adding README to `docs` goes red immediately,
+   * because README's own table quotes `saveSync.ts:1745` to explain the rule.
+   */
+  it('no citation writes a line number in prose either (#680)', () => {
+    const offenders: string[] = [];
+    const docs: Array<{ rel: string; body: string }> = [
+      ...cases.map((c) => ({ rel: c.rel, body: c.body })),
+      ...suiteDocs(),
+    ];
+    for (const { rel, body } of docs) {
+      // Keyed file+TOKEN, exactly like LINE_REF_ALLOWED. It exempted the whole FILE first, which
+      // was strictly wider for no reason: this is one of the most internals-heavy cases in the
+      // suite, so "the merge branch at line 812 of saveSync.ts" appearing in it later would have
+      // been invisible to both rules. The one legitimate occurrence is the paragraph explaining
+      // this convention, which cannot make its point without naming a line.
+      for (const m of citesALineInProse(body)) {
+        if (PROSE_ALLOWED.some((a) => a.file === rel && a.token === m)) continue;
+        offenders.push(`${rel}: "${m}"`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Anti-vacuity: this rule had NONE, which made it unfalsifiable — see `citesALineInProse`.
+    // The exempt paragraph is the one prose line reference the suite is allowed to contain, so
+    // seeing exactly it proves the detector still fires.
+    if (HAS_CASES) {
+      const probe = docs.find((d) => d.rel === PROSE_ALLOWED[0].file);
+      expect(probe, 'the exempt case must exist, or this rule is proving nothing').toBeDefined();
+      expect(citesALineInProse(probe!.body)).toContain(PROSE_ALLOWED[0].token);
+    }
   });
 
   /**

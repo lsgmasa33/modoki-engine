@@ -473,6 +473,73 @@ someone re-attaches it and unknowingly tests against a stale product list.
 
 [tn3186]: https://developer.apple.com/documentation/technotes/tn3186-troubleshooting-in-app-purchases-availability-in-the-sandbox
 
+### ⚠️ OPEN (#580): every purchase stalls 20-40 s on the iPhone 8
+
+**OPEN, root cause not established.** Observed on the iPhone 8 (iOS 16.7.16) on 2026-09-02 across
+two separate test rounds. Recorded here so the measurement is not lost, not as a diagnosis.
+
+Every purchase attempt spanned 1400-2300 journal ticks between `iap.purchase.started` and its
+outcome, regardless of which outcome it settled on.
+
+⚠️ **The seconds column is DERIVED, not measured, and the assumption behind it is unverified.** It
+divides ticks by 60. On a live device the journal tick is `time.frame`, incremented once per
+**rendered** frame (`timeSystem()` in `engine/packages/modoki/src/runtime/core/timeSystem.ts`) on a real-clock
+delta — not a fixed dt. (`stepSimulation()`'s `1/60` default governs the HEADLESS deterministic
+stepper, and the original report cited it here in error; it does not apply to a device run.) So if
+Court rendered at ~30fps on an iPhone 8 the real spans are 40-80 s, not 20-40 s — and if rAF is
+throttled while the StoreKit sheet is up, ticks stop entirely and the figure understates by an
+unknown amount. **Nobody measured the frame rate during these attempts.** The tick counts are the
+hard data; treat the seconds as a lower bound.
+
+| attempt | ticks started→settled | derived seconds (assumes 60fps — NOT measured) | outcome |
+|---|---|---|---|
+| coins300 | 216→2207 | ~33.2s | cancelled |
+| coins1000 | 5199→6598 | ~23.3s | granted (via reconcile recovery) |
+| coins300 retry | 11239→12710 | ~24.5s | granted (via reconcile recovery) |
+| coins2500 | 14439→16101 | ~27.7s | cancelled |
+| coins2500 retry | 28178→30467 | ~38.2s | cancelled |
+| coins300 (2nd session) | 1052→2811 | ~29.3s | granted |
+
+**The shape of the failure:** both `granted` outcomes arrived through `reconcile()`'s
+`purchasesUpdated`-driven recovery path (`iap.recovered`), NOT through the direct `purchase()`
+settle. The direct call's own promise resolved LATER and was correctly de-duplicated
+(`iap.duplicate` / `iap.settle-in-flight`, no double-grant). That is consistent with `purchase()`
+itself stalling or resolving unreliably on this device/OS, with `reconcile()` independently
+recovering the transaction.
+
+**Ruled out**, recorded so nobody re-runs them: the settle-serialization race —
+`settling` is keyed by transaction id
+(the `settling` set in `engine/packages/modoki/src/runtime/iap/purchaseService.ts`, de-dup in `settle()`) and only one
+`court.coins.changed` fired per transaction; the StoreKit 2 `Transaction.updates` listener
+busy-looping — it is a `for await` over an AsyncSequence (`updatesTask` in `IapPlugin.swift`'s `load()`) and suspends
+between events by construction; and `markDirty()` (`games/court/runtime/systems.ts`), a
+trivial boolean set.
+
+⚠️ **Two mechanisms look like they would cover this and do not.**
+- #583's stranded-purchase timeout is **Android-only**
+  (`engine/packages/capacitor-modoki-iap/android/src/main/java/com/modokiengine/capacitor/iap/ModokiIapPlugin.java`,
+  `armStrandTimeout` / `PARKED_PURCHASE_TIMEOUT_MS`), and the iOS Swift path has no equivalent.
+  ⚠️ **But do not read that as "port it to iOS and the stall is bounded".** `PARKED_PURCHASE_TIMEOUT_MS`
+  is `5 * 60_000L` — five minutes (`ModokiIapPlugin.java`), 7-15x the observed span. It would
+  never fire during this symptom, for exactly the reason the watchdog below is dismissed. Porting it
+  would be a no-op against this bug.
+- Court's `STORE_WATCHDOG_MS = 90_000` (`games/court/runtime/systems.ts`) is not a purchase
+  timeout — it only releases the full-screen overlay. It is also longer than the span, so it does
+  not fire during the symptom. ⚠️ That margin is thinner than it looks: it is comfortable only at
+  the assumed 60fps (20-40 s). At 30fps the derived span is 40-80 s and 90 s stops being a
+  comfortable margin — so **measure the frame rate before crossing the watchdog off**.
+
+**Not checked**, so the next session knows where to start: no CPU profiler was attached; whether
+disabling parts of the debug bridge or the analytics SDKs (Firebase, Crashlytics, AppsFlyer) changes
+it; whether it reproduces on newer hardware (the iPhone 8 is the oldest supported device in the
+fleet).
+
+⚠️ The co-occurring iOS "excessive wakeups" reports that were originally filed as part of this issue
+are **not** the cause and are not a defect. The evidence lives in `docs/devices.md` § "iOS
+`wakeups_resource` reports are expected cost, not a defect", **which is private and not part of the
+published snapshot** (hence a path rather than a link) — in short, the signal spans four bundle ids,
+two of which have no purchase flow at all.
+
 ### Android — every device iteration costs a Play upload
 
 - **A sideloaded build CAN bill, and neither the signing nor the `versionCode` is what allows it.**

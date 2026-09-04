@@ -11,6 +11,11 @@ import { recordMarkerFrame } from '../core/profilerAggregate';
 import { captureFrame } from '../core/profilerCapture';
 import { recordCounterFrame } from '../core/profilerCounters';
 import { pollGpuTimings } from '../core/gpuTimings';
+// Names the CAUSE (a lost GPU device) alongside the SYMPTOM this module reports (frames stopped
+// pumping) — see `activeRenderer.ts:76`, which documents that link and the log-correlation gap
+// it used to leave. `activeRenderer` imports only `three` types + `./clock`, so this is L2→L0
+// (rendering → core) and adds no cycle.
+import { getGpuFaultState, onRendererLost, type GpuFaultState } from '../core/activeRenderer';
 
 type FrameCallback = () => void;
 
@@ -75,6 +80,13 @@ let lastFrameAt = 0;
 /** Timestamp of the last arm. Gives a newly-armed chain a grace period before the watchdog
  *  can call it stalled, without contaminating `lastFrameAt`'s meaning. */
 let armedAt = 0;
+/** True once the CURRENT arm's rAF callback has actually executed at least once. Set `false` by
+ *  `armLoop()`, `true` by `runFrame()` right after the supersession check passes. This is the
+ *  fact `checkStall()` needs to tell "the chain ran and then died" (a re-arm is legitimate) from
+ *  "the outstanding rAF has never been delivered" (a re-arm would supersede the still-pending
+ *  callback via `loopLiveness.begin()` — destructive, not just useless, if rAF is merely SLOW
+ *  rather than dead: the supersession is what starves it permanently). */
+let frameSinceArm = false;
 
 /** ms since the loop last made progress — a real frame, or the arm that is still awaiting
  *  its first one. This is what the watchdog judges; `msSinceLastFrame` (reported) always
@@ -136,6 +148,7 @@ function makeFrame(stillCurrent: LivenessCheck) {
 
 function runFrame(now: DOMHighResTimeStamp, stillCurrent: LivenessCheck, self: FrameRequestCallback) {
   if (!stillCurrent()) return; // superseded chain — retire silently
+  frameSinceArm = true; // this chain's rAF has now actually fired at least once since its arm
   rafId = requestAnimationFrame(self);
   // Read through `rawNow()` rather than storing the rAF timestamp, so this shares ONE clock
   // with `armedAt` and the watchdog. They agree in the browser anyway, but under an injected
@@ -230,6 +243,7 @@ function runFrame(now: DOMHighResTimeStamp, stillCurrent: LivenessCheck, self: F
 function armLoop() {
   const stillCurrent = loopLiveness.begin();
   loopArmed = true;
+  frameSinceArm = false; // this arm's rAF has not fired yet
   // Grace period for the new chain; `lastFrameAt` is left alone on purpose (see its docs).
   armedAt = rawNow();
   rafId = requestAnimationFrame(makeFrame(stillCurrent));
@@ -265,11 +279,120 @@ const WATCHDOG_INTERVAL_MS = 1000;
  *  after the environment recovers (a GPU process that came back, a window that was restored).
  *  Only the log floods, so only the log is capped. */
 const MAX_REPORTED_ATTEMPTS = 3;
+/** How many consecutive failed stall checks before the watchdog gives up entirely and declares
+ *  the chain unrecoverable — ~12s of a rAF chain that never delivers again. That is far beyond
+ *  any legitimate delivery gap (the slow-but-alive-rAF test below proves a genuinely slow chain
+ *  recovers well before this fires) and matches the measured iOS WKWebView failure: after a
+ *  WebGL context loss, JS/timers/the native bridge stay alive but `requestAnimationFrame` never
+ *  delivers again (docs/plans/ios-rendering-update-wedge.md). Past this point re-arming has had
+ *  its fair chances (see `checkStall()`'s escalation branch) and further silent retries would
+ *  just be theatre. */
+const UNRECOVERABLE_AFTER_ATTEMPTS = 4;
 
 let watchdogId: ReturnType<typeof setInterval> | undefined;
 let recoveryAttempts = 0;
 let recoveredCount = 0;
 let stalledSince: number | null = null;
+/** Wall-clock time the CURRENT outage was first detected — `null` when healthy. This is the
+ *  baseline `checkStall()`'s escalation cadence is measured from, and it is a SEPARATE clock
+ *  from `stalledSince` deliberately: `stalledSince` holds `lastFrameAt` (a "which frame died"
+ *  marker with no other reader), while this is a "when did WE notice" marker the escalation math
+ *  needs. Re-baselining here — rather than measuring off the (possibly ancient) `lastFrameAt` —
+ *  is what makes escalation take the same ~9s after detection whether the gap that preceded
+ *  detection was 3s or 3 minutes. See the escalation comment in `checkStall()` for the bug this
+ *  fixes (a discontinuity in `lastFrameAt` — backgrounding, device sleep, a long main-thread
+ *  block — used to make `Math.floor(since / STALL_MS)` already be several STALL_MS units ahead
+ *  of `recoveryAttempts` on the FIRST post-gap tick, and every tick after kept re-satisfying that
+ *  same gap, so escalation fired every `WATCHDOG_INTERVAL_MS` instead of every `STALL_MS`). */
+let outageDetectedAt: number | null = null;
+/** How many times the watchdog has re-armed a stalled chain during the CURRENT outage —
+ *  `recoveredCount`'s per-outage twin. `recoveredCount` is intentionally session-cumulative (see
+ *  its own field on `FrameLoopHealth`), which is exactly wrong for `getFrameLoopHealth()`'s
+ *  `detail` text: a brand-new outage's FIRST stall message would otherwise report however many
+ *  times earlier, unrelated outages this session had already re-armed. Reset alongside
+ *  `recoveryAttempts`. */
+let outageRearms = 0;
+/** True once `declareUnrecoverable()` has fired for the CURRENT outage. Cleared the moment a REAL
+ *  frame proves the outage is over (`checkStall()`'s healthy branch) or the driver does a full
+ *  stop/start cycle (`stopWatchdog()`) — NOT by merely going hidden or idle, which is throttling,
+ *  not evidence of recovery. `activeRenderer`'s `isRecoveryAbandoned()` is the precedent this
+ *  comment used to cite for "only `resetRecoveryState()` clears it" — that turned out to be the
+ *  wrong model here: that flag tracks a WHOLE SESSION'S rebuild budget, deliberately sticky, while
+ *  this one describes ONE outage and must end when the outage does, or a single false escalation
+ *  (or a genuine transient one) silently disables the watchdog for the rest of the session — see
+ *  `getFrameLoopHealth().status === 'running'` with `unrecoverable` still `true` before this fix,
+ *  invisible to `agentEditorOps.ts`'s `frameLoopFields()` (omitted whenever status is `'running'`
+ *  and `recovered === 0`) into the bargain. */
+let unrecoverable = false;
+/** Latched copy of `activeRenderer.getGpuFaultState()` at the moment `onRendererLost` fired,
+ *  kept because reading `getGpuFaultState()` LIVE at report time is provably too late: the
+ *  production sequence is `reportRendererLoss` -> `onRendererLost` -> `rendererRecovery` (a
+ *  ~250ms delay) -> the viewport's `bringUp()` -> `setActiveRenderer` -> `setActiveRendererHandle`
+ *  -> `attachGpuFaultListeners`, which unconditionally does `gpuFaultState = null` for the NEW
+ *  renderer. Against the plan doc's own iPhone-8 trace the loss is at +1,136,882 and the stall
+ *  fires at +1,139,989 — over a full STALL_MS later, long after that 250ms-delayed rebuild has
+ *  already wiped the state this module used to read. Latching at the loss event, not at report
+ *  time, is the only way the stall/unrecoverable report can still name the cause. Cleared when the
+ *  outage it may be explaining ends (see `unrecoverable`'s comment) — it is not a running fault
+ *  log, only a "what was implicated in THIS outage" pointer. */
+let latchedGpuFault: GpuFaultState | null = null;
+/** `lastFrameAt` at the moment `latchedGpuFault` was taken (`0` while no latch is held) — the
+ *  "has a real frame executed since" discriminator `checkStall()`'s healthy branch uses to drop
+ *  a latch left behind by a loss that RECOVERED IN PLACE (see there for why "time passed" or "a
+ *  renderer rebuilt" are not safe substitutes). */
+let latchedGpuFaultFrameAt = 0;
+onRendererLost(() => { latchedGpuFault = getGpuFaultState(); latchedGpuFaultFrameAt = lastFrameAt; });
+
+/** Info handed to an `onFrameLoopUnrecoverable` listener at the moment recovery is abandoned. */
+export interface FrameLoopUnrecoverableInfo {
+  /** How many consecutive stall checks it took to give up. */
+  recoveryAttempts: number;
+  /** ms since the last real frame executed, at the moment of declaration. */
+  msSinceLastFrame: number;
+  /** The GPU fault channel's state at declaration time, if any — names the cause alongside the
+   *  symptom (`activeRenderer.ts:76`). */
+  gpuFault: GpuFaultState | null;
+}
+const unrecoverableListeners = new Set<(info: FrameLoopUnrecoverableInfo) => void>();
+
+/** Declare the frame loop permanently dead: the outstanding rAF has not been delivered across
+ *  `UNRECOVERABLE_AFTER_ATTEMPTS` watchdog checks, and re-arming provably cannot repair it (see
+ *  `checkStall()`'s escalation branch). Idempotent — logs and notifies listeners exactly ONCE per
+ *  outage. A throwing listener must not stop the others from being notified, matching
+ *  `onRendererLost`'s contract in `activeRenderer.ts`. Phase 2 (out of scope here) wires a native
+ *  alert to this transition — see docs/plans/ios-rendering-update-wedge.md. */
+function declareUnrecoverable() {
+  if (unrecoverable) return;
+  unrecoverable = true;
+  // Prefer the LATCH — see its declaration for why the live read is too late in the real
+  // sequence (a renderer rebuild wipes it well before this fires).
+  const gpuFault = latchedGpuFault ?? getGpuFaultState();
+  const info: FrameLoopUnrecoverableInfo = {
+    recoveryAttempts,
+    msSinceLastFrame: Math.round(msSinceRealFrame()),
+    gpuFault,
+  };
+  // Constant text, same reasoning as the stall message below — see its comment.
+  console.error(
+    `[frameDriver] FRAME LOOP UNRECOVERABLE — the requestAnimationFrame chain has not delivered ` +
+    `a frame across ${UNRECOVERABLE_AFTER_ATTEMPTS} stall checks. The app is alive (JS, timers ` +
+    `and the native bridge all still run) but the browser has stopped delivering paint callbacks; ` +
+    `no further automatic repair will be attempted.` +
+    (gpuFault?.deviceLost ? ` GPU fault: ${gpuFault.reason ?? 'unknown reason'}.` : ''),
+  );
+  for (const fn of unrecoverableListeners) {
+    try { fn(info); }
+    catch (e) { console.error('[frameDriver] an unrecoverable listener threw', e); }
+  }
+}
+
+/** Subscribe to "the frame loop is permanently dead — no further automatic repair will run".
+ *  Fires at most once per outage. Returns an unsubscribe function, matching `onRendererLost`'s
+ *  shape in `activeRenderer.ts`. */
+export function onFrameLoopUnrecoverable(fn: (info: FrameLoopUnrecoverableInfo) => void): () => void {
+  unrecoverableListeners.add(fn);
+  return () => { unrecoverableListeners.delete(fn); };
+}
 
 function documentHidden(): boolean {
   return typeof document !== 'undefined' && document.visibilityState === 'hidden';
@@ -278,33 +401,139 @@ function documentHidden(): boolean {
 function checkStall() {
   // A hidden window legitimately gets no rAF callbacks — that is throttling, not a wedge.
   // Treat it as healthy and reset, so un-hiding does not immediately trip the watchdog.
+  // `unrecoverable` is deliberately NOT touched here — going hidden mid-outage is not evidence of
+  // recovery, only a real frame (below) is.
   if (!loopArmed || refCount === 0 || documentHidden()) {
     stalledSince = null;
     recoveryAttempts = 0;
+    outageDetectedAt = null;
+    outageRearms = 0;
     return;
   }
-  const since = msSinceProgress();
+
+  // Once an outage has begun (`stalledSince !== null`), judge it on the REAL frame clock
+  // (`msSinceRealFrame`), not the arm-grace clock (`msSinceProgress`). `armLoop()` resets
+  // `armedAt` on every re-arm, and `msSinceProgress()` reads `max(lastFrameAt, armedAt)` — so
+  // judging an ONGOING outage against it made every re-arm look like fresh progress for the next
+  // two watchdog ticks, `recoveryAttempts` reset to 0 right on schedule, `MAX_REPORTED_ATTEMPTS`
+  // never engaged, and every observed message said "attempt 1" forever. The grace period is still
+  // honoured for the FIRST detection, so a freshly armed chain gets its due grace before being
+  // judged at all.
+  const since = stalledSince === null ? msSinceProgress() : msSinceRealFrame();
   if (since < STALL_MS) {
+    // A real frame (or a still-in-grace arm) has put us back under the threshold — the outage,
+    // if there was one, is OVER. This is the ONLY place `unrecoverable`/the latched GPU fault
+    // clear outside a full stop/start cycle (`stopWatchdog()`): only a REAL recovered frame, not
+    // merely time passing or the tab going hidden, proves an outage has ended. Gated on
+    // `stalledSince !== null || unrecoverable` — NOT `stalledSince` alone — because once declared,
+    // `checkStall()` returns before re-populating `stalledSince` on a hidden/idle tick (see
+    // below), so an outage that was hidden away and is only NOW recovering can reach this branch
+    // with `stalledSince` already back to `null`. Either flag being set means SOME outage was
+    // detected; a routine healthy tick where NEITHER was ever set must not run this (it would
+    // wipe a freshly latched GPU fault before the still-to-come stall detection reads it).
+    if (stalledSince !== null || unrecoverable) {
+      unrecoverable = false;
+      latchedGpuFault = null;
+    }
+    // A GPU loss that RECOVERS IN PLACE (`rendererRecovery` rebuilds within ~250ms, well under
+    // `STALL_MS`) never sets `stalledSince`/`unrecoverable` above — frames never stop for a full
+    // `STALL_MS`, so the gated clear just above never runs, and the latch would otherwise survive
+    // forever, shadowing `getFrameLoopHealth().gpuFault`/every stall report with a fault that
+    // recovered minutes earlier. The discriminator is "a real frame executed AFTER the latch was
+    // taken" — NOT "time passed" (a hidden/idle tick proves nothing) and NOT "a renderer
+    // rebuilt" (a rebuild alone proves nothing either: the pinned "SURVIVING the real production
+    // sequence" test below rebuilds the renderer BETWEEN the loss and a stall that never ends,
+    // and the latch MUST survive that). `latchedGpuFaultFrameAt` snapshots `lastFrameAt` at the
+    // moment of the latch; `lastFrameAt` only advances inside `runFrame()`, so strictly-greater
+    // here means at least one real frame ran since — safe to drop the shadow.
+    if (latchedGpuFault !== null && lastFrameAt > latchedGpuFaultFrameAt) {
+      latchedGpuFault = null;
+    }
     stalledSince = null;
     recoveryAttempts = 0;
+    outageDetectedAt = null;
+    outageRearms = 0;
     return;
   }
-  if (stalledSince === null) stalledSince = lastFrameAt;
-  recoveryAttempts++;
+  if (unrecoverable) return; // already declared for this outage — nothing left to try automatically
+
+  if (stalledSince === null) { stalledSince = lastFrameAt; outageDetectedAt = rawNow(); }
+
+  // ⚠️ Escalation is measured from `outageDetectedAt` (when WE first noticed), never from the
+  // absolute `since` above. A previous version derived attempts straight from `since`
+  // (`Math.floor(since / STALL_MS)`), which is correct for a CLEAN outage (last frame t=0,
+  // detected t=3000 -> attempt 1, t=6000 -> 2, ... t=12000 -> unrecoverable) but breaks after any
+  // discontinuity in `lastFrameAt` — backgrounding, device sleep, a long main-thread block, a
+  // manual-clock jump in tests. `documentHidden()`/`refCount===0` resets `recoveryAttempts` to 0
+  // above but never touches `lastFrameAt`, so the FIRST post-gap detection sees a `since` already
+  // many `STALL_MS` units large; `Math.floor(since / STALL_MS) > recoveryAttempts` then stays true
+  // on EVERY subsequent 1s watchdog tick too (an attempted "at most 1 per detection" clamp here
+  // is a no-op: the guard above already establishes `attempt > recoveryAttempts`, i.e.
+  // `attempt >= recoveryAttempts + 1`, so `Math.min(attempt, recoveryAttempts + 1)` always equals
+  // `recoveryAttempts + 1` — a plain per-TICK increment wearing a clamp's clothes). Measured: a
+  // resume after an 8s/20s/60s hidden gap declared unrecoverable 4 real seconds later, inside the
+  // slow-but-alive window `DELIVER_MS = 4900` in the defect-5 test below is supposed to survive.
+  // Re-baselining on `outageDetectedAt` fixes this: the FIRST post-gap detection sets it to `now`
+  // (not to the stale `lastFrameAt`), so escalation is always exactly `UNRECOVERABLE_AFTER_ATTEMPTS
+  // * STALL_MS` (~12s) after DETECTION — regardless of how long the gap that preceded it was.
+  const attempts = 1 + Math.floor((rawNow() - outageDetectedAt!) / STALL_MS);
+  if (attempts <= recoveryAttempts) return; // not yet another full STALL_MS since detection
+  recoveryAttempts = attempts;
+
   if (recoveryAttempts <= MAX_REPORTED_ATTEMPTS) {
+    // Prefer the LATCH — see its declaration for why the live `getGpuFaultState()` read is
+    // provably too late in the real sequence (a renderer rebuild wipes it first).
+    const gpuFault = latchedGpuFault ?? getGpuFaultState();
+    // ⚠️ CONSTANT text — no `since`/`recoveryAttempts` interpolated. `globalErrors.ts:75` warns
+    // about exactly this shape: "the flood that DEFEATS dedupe by varying its text" (there: an
+    // entity id; here it was `${Math.round(since)}ms`, distinct on every emission) burns
+    // `MAX_ERRORS_PER_SESSION` in minutes and then silently drops every genuine crash for the
+    // rest of the session. The precise numbers still live in `getFrameLoopHealth()`
+    // (`msSinceLastFrame`, `recoveryAttempts`) — structured fields, not deduped text.
     console.error(
-      `[frameDriver] FRAME LOOP STALLED — no frame for ${Math.round(since)}ms with ${refCount} ` +
-      `active start ref(s) and ${callbacks.size} registered callback(s), document visible. ` +
-      `The editor is alive but not pumping frames: no ECS system ticks, nothing renders, and ` +
-      `trusted input will silently no-op. Re-arming the requestAnimationFrame chain ` +
-      `(attempt ${recoveryAttempts}).` +
-      (recoveryAttempts === MAX_REPORTED_ATTEMPTS
-        ? ' Further attempts will continue SILENTLY — read frameLoop.status in the editor state.'
+      `[frameDriver] FRAME LOOP STALLED — no frame for over ${STALL_MS}ms with ${refCount} ` +
+      `active start ref(s) and ${callbacks.size} registered callback(s), document visible. The ` +
+      `app is alive but not pumping frames: no ECS system ticks, nothing renders, and trusted ` +
+      `input will silently no-op.` +
+      (gpuFault?.deviceLost ? ` GPU fault: ${gpuFault.reason ?? 'unknown reason'}.` : '') +
+      (frameSinceArm
+        ? ' Re-arming the requestAnimationFrame chain.'
+        : ' The outstanding requestAnimationFrame callback has never fired — re-arming would ' +
+          'only supersede it, and if rAF is merely slow rather than dead that supersession is ' +
+          'what would starve it permanently, so this attempt is NOT re-armed.') +
+      (recoveryAttempts >= MAX_REPORTED_ATTEMPTS
+        ? ' Further attempts will continue SILENTLY — read getFrameLoopHealth().'
         : ''),
     );
   }
-  recoveredCount++;
-  armLoop();
+
+  // Gated on `!frameSinceArm`, deliberately: "unrecoverable" must mean "we armed a chain and the
+  // browser never delivered ITS callback" — not merely "a lot of time has passed since a frame".
+  // If `frameSinceArm` is true, a frame ran at some point since the CURRENT arm, so the honest
+  // read is "still plausibly alive" and the right response is a re-arm, not surrender. This is
+  // exactly the resume-from-background/long-main-thread-block case: `frameSinceArm` was left
+  // `true` by the last frame that ran BEFORE the gap, `documentHidden()`/blocked-thread ticks
+  // never reset it, and the first post-gap detection would otherwise declare a healthy, resuming
+  // app unrecoverable with zero re-arms attempted. Re-arming here sets `frameSinceArm = false`
+  // for the NEW chain — if rAF is genuinely dead, the next detections correctly fall to the
+  // `!frameSinceArm` branch below and escalate for real. ⚠️ Do not "simplify" this gate away —
+  // see the resume-after-hidden test, which is what it exists for.
+  if (!frameSinceArm && recoveryAttempts >= UNRECOVERABLE_AFTER_ATTEMPTS) {
+    declareUnrecoverable();
+    return;
+  }
+
+  if (frameSinceArm) {
+    // The chain ran at least once since it was armed and then died — a fresh arm is legitimate.
+    recoveredCount++;
+    outageRearms++;
+    armLoop();
+  }
+  // else: the outstanding rAF has never been delivered. Re-arming would call
+  // `loopLiveness.begin()` and supersede that still-pending callback — if rAF is merely SLOW
+  // rather than dead (delivery interval > STALL_MS), the supersession is what kills it, i.e. the
+  // "rescue" would cause the very outage it exists to fix (defect 5). Do nothing but count and
+  // let the next tick judge again — the pending callback, if it is ever going to fire, still can.
 }
 
 function startWatchdog() {
@@ -321,6 +550,15 @@ function stopWatchdog() {
   watchdogId = undefined;
   stalledSince = null;
   recoveryAttempts = 0;
+  outageDetectedAt = null;
+  outageRearms = 0;
+  // A full stop is a deliberate clean slate — the other place `unrecoverable` clears (a real
+  // frame, in `checkStall()`) can't apply here since nothing is armed to deliver one. Without
+  // this, a stop/start cycle after a declared outage left `getFrameLoopHealth().unrecoverable`
+  // stuck `true` forever even though the driver had fully restarted.
+  unrecoverable = false;
+  latchedGpuFault = null;
+  latchedGpuFaultFrameAt = 0;
 }
 
 /** Health of the frame loop — the signal that distinguishes "running fine" from "playing
@@ -348,6 +586,16 @@ export interface FrameLoopHealth {
   /** How many times the watchdog has re-armed a stalled chain this session. */
   recovered: number;
   recoveryAttempts: number;
+  /** True once the watchdog has given up automatically repairing this outage — see
+   *  `onFrameLoopUnrecoverable`. Deliberately NOT folded into `status` (still reads `'stalled'`
+   *  when true): a new status literal would break every exhaustive switch already written
+   *  against this union. */
+  unrecoverable: boolean;
+  /** The GPU fault channel's state (`activeRenderer.getGpuFaultState()`), when present — so a
+   *  reader sees "frames stopped AND the GPU device was lost" in one place instead of
+   *  correlating this report with a separate `[activeRenderer]` log by hand (`activeRenderer.
+   *  ts:76`). Omitted while nothing has faulted, matching that module's own convention. */
+  gpuFault?: GpuFaultState | null;
   /** Present only when stalled — a ready-to-read explanation, so the failure describes
    *  itself instead of making the reader reconstruct it from three separate fields. */
   detail?: string;
@@ -361,6 +609,7 @@ export function getFrameLoopHealth(): FrameLoopHealth {
   const status: FrameLoopHealth['status'] = stalled ? 'stalled'
     : (!loopArmed || refCount === 0) ? 'idle'
     : (documentHidden() ? 'hidden' : 'running');
+  const liveGpuFault = getGpuFaultState();
   const health: FrameLoopHealth = {
     status,
     refCount,
@@ -370,7 +619,9 @@ export function getFrameLoopHealth(): FrameLoopHealth {
     msSinceLastFrame,
     recovered: recoveredCount,
     recoveryAttempts,
+    unrecoverable,
   };
+  if (liveGpuFault) health.gpuFault = liveGpuFault;
   if (status === 'idle') {
     health.detail =
       'No frames are being pumped: nothing currently holds a frame-driver start ref, so the ' +
@@ -379,12 +630,25 @@ export function getFrameLoopHealth(): FrameLoopHealth {
       'to start (check the console for a renderer-init error).';
   }
   if (stalled) {
+    // Prefer the LATCH over the live read while stalled — see its declaration for why: by the
+    // time a stall is 3s+ old, a renderer rebuild has typically already wiped the live state.
+    const gpuFault = latchedGpuFault ?? liveGpuFault;
+    if (gpuFault) health.gpuFault = gpuFault; // overrides the live-only assignment above, if any
     health.detail =
       `The frame loop has not ticked for ${msSinceLastFrame}ms while ${refCount} caller(s) ` +
       `believe it is running. Nothing is rendering and no ECS system is ticking, so play/pause ` +
-      `state, trusted input and screenshots are ALL unreliable right now. The watchdog has ` +
-      `re-armed the rAF chain ${recoveryAttempts} time(s) without success so far; it keeps ` +
-      `retrying, but if this persists the renderer or GPU process is gone — relaunch the editor.`;
+      `state, trusted input and screenshots are ALL unreliable right now.` +
+      (unrecoverable
+        ? ` The watchdog gave up after ${UNRECOVERABLE_AFTER_ATTEMPTS} failed checks — the ` +
+          `outstanding requestAnimationFrame callback is never being delivered, so nothing ` +
+          `further will be tried automatically; restart the app.`
+        // Per-OUTAGE count (`outageRearms`), not the session-cumulative `recoveredCount` — a
+        // brand-new outage's first message must not report however many times EARLIER, unrelated
+        // outages this session had already re-armed.
+        : ` The watchdog has re-armed the rAF chain ${outageRearms} time(s) so far this outage ` +
+          `and keeps retrying, but if this persists the app is alive while paint is dead — a ` +
+          `known iOS WKWebView failure mode after a WebGL context loss.`) +
+      (gpuFault?.deviceLost ? ` GPU fault: ${gpuFault.reason ?? 'unknown reason'}.` : '');
   }
   return health;
 }
@@ -398,12 +662,20 @@ export function __resetFrameDriverForTests() {
   refCount = 0;
   recoveredCount = 0;
   recoveryAttempts = 0;
+  stalledSince = null;
+  outageDetectedAt = null;
+  outageRearms = 0;
   lastFrameAt = 0;
   armedAt = 0;
   _currentFPS = 0;
   _fpsFrameCount = 0;
   _fpsLastSample = 0;
   lastFrameTime = 0;
+  frameSinceArm = false;
+  unrecoverable = false;
+  latchedGpuFault = null;
+  latchedGpuFaultFrameAt = 0;
+  unrecoverableListeners.clear();
 }
 
 /** Start the driver. Ref-counted — multiple callers can start without conflict.

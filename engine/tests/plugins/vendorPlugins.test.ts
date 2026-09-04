@@ -6,14 +6,28 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import * as tar from 'tar';
+import semver from 'semver';
 
 // Mock npm: `npm pack` writes a deterministic tarball into --pack-destination;
 // `npm run build` materializes a dist/ dir. Lets us assert pack invocations.
+//
+// The packed tarball is a REAL gzip tar (not literal placeholder bytes) containing just
+// `package/package.json`, copied from the CURRENT cwd/package.json at pack-time — i.e. whatever
+// packInto just rewrote it to (#685: the hash-suffixed packedVersion). That fidelity matters
+// since #685's follow-up staleness check (readPackedVersion, in vendorEnginePlugins) opens the
+// REAL committed tarball and reads its packed version back on every subsequent pass; a fake,
+// unparseable tarball would read as unreadable → always stale → re-pack every time, breaking
+// every "does NOT re-pack" idempotency test in this suite.
 const execFileSyncMock = vi.fn((_cmd: string, args: string[], opts: { cwd?: string } = {}) => {
   if (args[0] === 'pack') {
     const destIdx = args.indexOf('--pack-destination');
     const dest = args[destIdx + 1];
-    fs.writeFileSync(path.join(dest, 'pkg-0.0.0.tgz'), 'TARBALL-BYTES');
+    const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mock-pack-'));
+    fs.mkdirSync(path.join(stage, 'package'), { recursive: true });
+    fs.copyFileSync(path.join(opts.cwd!, 'package.json'), path.join(stage, 'package', 'package.json'));
+    tar.create({ file: path.join(dest, 'pkg-0.0.0.tgz'), sync: true, gzip: true, cwd: stage }, ['package']);
+    fs.rmSync(stage, { recursive: true, force: true });
   } else if (args[0] === 'run' && args[1] === 'build' && opts.cwd) {
     fs.mkdirSync(path.join(opts.cwd, 'dist'), { recursive: true });
     fs.writeFileSync(path.join(opts.cwd, 'dist', 'index.js'), '// built');
@@ -35,7 +49,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 // Import AFTER the mock is registered.
-const { vendorEnginePlugins } = await import('../../plugins/vendorPlugins');
+const { vendorEnginePlugins, pluginContentHash, packedVersion } = await import('../../plugins/vendorPlugins');
 
 let projectRoot: string;
 let engineRoot: string;
@@ -755,5 +769,101 @@ describe('vendorEnginePlugins — hash scoped to (shipped ∪ dist-build-inputs)
     const r = vendorEnginePlugins(projectRoot, engineRoot);
     expect(r.changed).toBe(true);
     expect(listTarballs()[0]).not.toBe(before);
+  });
+});
+
+// ── #685: the packed VERSION carries the content hash, so npm's `file:` resolver actually
+// sees a re-vendor as a change (previously: same filename-hash-suffix, same PACKED version →
+// npm treated the tree as already satisfied and never extracted the new bytes). ─────────────
+describe('pluginContentHash — anti-circularity with the packed-version rewrite (#685)', () => {
+  it('is UNCHANGED by mutating the on-disk package.json version field', () => {
+    const dir = writeEnginePlugin(); // version '1.0.0', compact JSON (no indent/trailing newline)
+    const before = pluginContentHash(dir);
+
+    // Simulate packInto's in-flight rewrite (or a killed process leaving it behind): a
+    // hash-suffixed version written straight into the plugin's OWN package.json.
+    const pj = path.join(dir, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pj, 'utf8'));
+    pkg.version = '1.0.0-deadbeef';
+    fs.writeFileSync(pj, JSON.stringify(pkg, null, 2) + '\n');
+
+    expect(pluginContentHash(dir)).toBe(before);
+  });
+
+  it('is UNCHANGED regardless of which hash suffix (or none) is currently on disk', () => {
+    const dir = writeEnginePlugin();
+    const base = pluginContentHash(dir);
+    const pj = path.join(dir, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pj, 'utf8'));
+
+    for (const version of ['1.0.0', '1.0.0-aaaaaaaa', '1.0.0-bbbbbbbb']) {
+      fs.writeFileSync(pj, JSON.stringify({ ...pkg, version }, null, 2) + '\n');
+      expect(pluginContentHash(dir)).toBe(base);
+    }
+  });
+});
+
+describe('packInto — the temporary version rewrite (#685)', () => {
+  it('rewrites the plugin package.json to <base>-h<hash> for the DURATION of `npm pack`, then restores it byte-identical', () => {
+    const dir = writeEnginePlugin(); // version '1.0.0'
+    writeProjectPkg({ [PLUGIN]: '*' });
+    const originalBytes = fs.readFileSync(path.join(dir, 'package.json'));
+    let versionDuringPack: string | undefined;
+    execFileSyncMock.mockImplementationOnce((_cmd: string, args: string[], opts: { cwd?: string } = {}) => {
+      if (args[0] === 'pack') {
+        versionDuringPack = JSON.parse(fs.readFileSync(path.join(opts.cwd!, 'package.json'), 'utf8')).version;
+        const destIdx = args.indexOf('--pack-destination');
+        fs.writeFileSync(path.join(args[destIdx + 1], 'pkg-0.0.0.tgz'), 'TARBALL-BYTES');
+      }
+      return Buffer.from('');
+    });
+
+    vendorEnginePlugins(projectRoot, engineRoot);
+
+    const tgz = listTarballs()[0];
+    const hash = tgz.match(/-([0-9a-f]{8})\.tgz$/)?.[1];
+    expect(hash).toBeTruthy();
+    expect(versionDuringPack).toBe(`1.0.0-h${hash}`);
+    // Restored EXACTLY — byte-identical, not merely "version reads 1.0.0 again" — so the
+    // plugin's committed source formatting/trailing-newline convention never churns.
+    expect(fs.readFileSync(path.join(dir, 'package.json')).equals(originalBytes)).toBe(true);
+  });
+
+  it('still restores byte-identical even when npm pack THROWS (the rewrite must not leak on a failed pack)', () => {
+    const dir = writeEnginePlugin();
+    writeProjectPkg({ [PLUGIN]: '*' });
+    const originalBytes = fs.readFileSync(path.join(dir, 'package.json'));
+    execFileSyncMock.mockImplementationOnce((_c: string, args: string[]) => {
+      if (args[0] === 'pack') throw new Error('npm pack boom');
+      return Buffer.from('');
+    });
+
+    expect(() => vendorEnginePlugins(projectRoot, engineRoot)).toThrow(/boom/);
+
+    expect(fs.readFileSync(path.join(dir, 'package.json')).equals(originalBytes)).toBe(true);
+  });
+});
+
+// ── #685 correctness fix: the `h` prefix guarantees VALID semver ─────────────────────────────
+// SemVer forbids a leading zero on a numeric prerelease identifier — `1.0.0-01234567` is
+// INVALID (`semver.valid()` returns null) — and a bare hex hash slice is all-digits (so subject
+// to that rule) about 1 time in 40, and specifically invalid about 1 time in 400. Without the
+// `h` prefix, roughly one content hash in 400 would mint a packed version npm refuses, and the
+// failure would be STICKY (that plugin stays unbuildable until its content changes again). This
+// pins the property directly against a synthetic hash chosen to be exactly that failure case —
+// not just against ordinary-looking hashes that would pass either way.
+describe('packedVersion — always valid semver, even for an all-numeric leading-zero hash (#685)', () => {
+  it('the UNPREFIXED form would be invalid for this hash — the failure mode the prefix removes', () => {
+    expect(semver.valid('1.0.0-01234567')).toBeNull();
+  });
+
+  it('packedVersion prefixes with `h`, which IS valid semver for the same hash', () => {
+    const version = packedVersion('1.0.0', '01234567');
+    expect(version).toBe('1.0.0-h01234567');
+    expect(semver.valid(version)).toBe(version);
+  });
+
+  it('is also valid for an ordinary (non-edge-case) hex hash', () => {
+    expect(semver.valid(packedVersion('1.0.0', '679f56a6'))).not.toBeNull();
   });
 });

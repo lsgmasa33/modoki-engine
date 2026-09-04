@@ -101,6 +101,58 @@ export interface EnginePlugin {
   version: string;
 }
 
+/** Strip a semver PRERELEASE suffix (`-<prerelease>`), e.g. `1.0.0-9ff1f461` → `1.0.0`. The
+ *  committed engine plugin package.json never carries one — packInto appends the content hash
+ *  as a prerelease ONLY inside the packed tarball, then restores the original file (#685) — so
+ *  this only ever does real work in two places: on a `plugin.dir/package.json` a killed pack
+ *  process left mid-rewrite (defensive self-heal), and when normalizing a PACKED tarball's
+ *  package.json back to the source's bare version for comparison. */
+function baseVersion(version: string): string {
+  const i = version.indexOf('-');
+  return i === -1 ? version : version.slice(0, i);
+}
+
+/** The VERSION `packInto` writes into the PACKED package.json (#685): `base` plus the plugin's
+ *  content hash as a semver prerelease, prefixed with a literal `h` so the prerelease identifier
+ *  can never be all-digits.
+ *
+ *  That prefix matters: SemVer forbids a LEADING ZERO on a numeric prerelease identifier
+ *  (`1.0.0-01234567` is invalid; `semver.valid()` returns null), and a bare hex hash slice is
+ *  all-digits — so subject to that rule — about 1 time in 40, and actually invalid (leading zero
+ *  AND all-digits) about 1 time in 400. Without the prefix, roughly one content hash in 400 would
+ *  mint a version npm refuses, and the failure would be STICKY: that plugin stays unbuildable
+ *  until its content changes again (a new hash), with an error that names the version, not this
+ *  function. `h` guarantees a non-numeric identifier for every possible hash.
+ *
+ *  Deliberately NOT used by `tarballName` — the committed, content-addressed FILENAME never
+ *  carries the `h`; only the version written inside the packed tarball does. Callers that need
+ *  the hash back out of a committed filename (the re-pack trigger below, the freshness guard)
+ *  read it from the filename (plain hex) and pass it in here to get the version to compare
+ *  against — never the other way around. */
+export function packedVersion(base: string, hash: string): string {
+  return `${base}-h${hash}`;
+}
+
+/** `buf` — a plugin's top-level `package.json` bytes — with `version` normalized to its semver
+ *  BASE and re-serialized in the exact canonical form `packInto` writes
+ *  (`JSON.stringify(pkg, null, 2) + '\n'`, which is also how every committed engine plugin's
+ *  package.json is already formatted, so this is a no-op on the steady-state/unsuffixed case).
+ *
+ *  Shared by two callers that both need "the same content, whatever VERSION happens to be on
+ *  disk right now":
+ *   - `pluginContentHash` — package.json is one of the hashed inputs, and packInto briefly
+ *     writes a hash-suffixed version into it before `npm pack`. Hashing that RAW would feed the
+ *     hash back into the value it's computing (the packed version IS `packedVersion(base, hash)`,
+ *     itself derived from the hash) — a circularity where the hash could never stabilize.
+ *     Normalizing the version out breaks it.
+ *   - `compareTarballToSource` — a correctly packed tarball's package.json legitimately differs
+ *     from source by exactly this suffix; normalizing both sides lets it still compare equal. */
+function normalizedPackageJsonBytes(buf: Buffer): Buffer {
+  const pkg = JSON.parse(buf.toString('utf8'));
+  if (typeof pkg.version === 'string') pkg.version = baseVersion(pkg.version);
+  return Buffer.from(JSON.stringify(pkg, null, 2) + '\n');
+}
+
 /** Engine-provided Capacitor plugins = subdirs of engine/packages whose
  *  package.json declares a `capacitor` field (i.e. they're cap plugins, not
  *  plain libs like @modoki/engine). Discovered dynamically so a new plugin is
@@ -117,7 +169,10 @@ export function listEnginePlugins(engineRoot: string): EnginePlugin[] {
     try {
       const pkg = JSON.parse(fs.readFileSync(pj, 'utf8'));
       if (pkg && pkg.capacitor && typeof pkg.name === 'string') {
-        out.push({ name: pkg.name, dir, version: String(pkg.version ?? '0.0.0') });
+        // baseVersion is defensive, not routine: the committed version is always bare (#685),
+        // but a killed packInto could leave a hash-suffixed one on disk mid-rewrite, and
+        // stripping it here keeps that from compounding into a double-suffixed tarball name.
+        out.push({ name: pkg.name, dir, version: baseVersion(String(pkg.version ?? '0.0.0')) });
       }
     } catch {
       /* skip unreadable package.json */
@@ -292,13 +347,23 @@ export function pluginHashInputs(pluginDir: string): string[] {
  *
  *  A read error is NOT swallowed (D10): a listed file that fails to read would
  *  contribute only its path → a different hash than a clean read → a spurious
- *  re-pack. Let it throw so vendoring fails loudly (the caller logs + continues). */
+ *  re-pack. Let it throw so vendoring fails loudly (the caller logs + continues).
+ *
+ *  The plugin's own top-level `package.json` is special-cased through
+ *  normalizedPackageJsonBytes (#685) rather than hashed raw: packInto briefly writes a
+ *  hash-suffixed `version` into that file before `npm pack`, and hashing it raw would feed
+ *  that written hash back into the value THIS function computes — the hash could never
+ *  stabilize. Normalizing the version out of the hash input makes the hash invariant to
+ *  whatever version string currently sits on disk, which also makes the scheme self-healing:
+ *  a killed pack process that leaves a hash-suffixed version behind doesn't corrupt the next
+ *  hash either. */
 export function pluginContentHash(pluginDir: string): string {
   const h = createHash('sha256');
   for (const rel of pluginHashInputs(pluginDir)) {
     h.update(rel);
     h.update('\0');
-    h.update(fs.readFileSync(path.join(pluginDir, rel)));
+    const raw = fs.readFileSync(path.join(pluginDir, rel));
+    h.update(rel === 'package.json' ? normalizedPackageJsonBytes(raw) : raw);
     h.update('\0');
   }
   return h.digest('hex').slice(0, 8);
@@ -435,9 +500,17 @@ export function compareTarballToSource(tarballPath: string, pluginDir: string): 
     if (isDistPath(rel)) { skipped.push({ path: rel, reason: 'dist/ is derived — see the header' }); continue; }
     const abs = path.join(pluginDir, rel);
     if (!fs.existsSync(abs)) { drift.push({ path: rel, kind: 'not-in-source' }); continue; }
-    // Exact bytes, no newline normalization: `.gitattributes` pins `eol=lf` for every extension
+    const sourceBytes = fs.readFileSync(abs);
+    // package.json is allowed to differ from source in exactly ONE field: the packed
+    // PRERELEASE version hash suffix packInto writes (#685). Normalize that field out of BOTH
+    // sides before comparing so a correctly packed tarball still reads as a match — every
+    // other file, and every other field of package.json, still gets the exact-bytes check: no
+    // newline normalization either, since `.gitattributes` pins `eol=lf` for every extension
     // the plugins ship, so a Windows checkout has the same bytes a macOS one packed.
-    if (!bytes.equals(fs.readFileSync(abs))) drift.push({ path: rel, kind: 'bytes-differ' });
+    const [tarCmp, srcCmp] = rel === 'package.json'
+      ? [normalizedPackageJsonBytes(bytes), normalizedPackageJsonBytes(sourceBytes)]
+      : [bytes, sourceBytes];
+    if (!tarCmp.equals(srcCmp)) drift.push({ path: rel, kind: 'bytes-differ' });
   }
 
   // source → tarball (only when the shipped set is exactly enumerable)
@@ -456,6 +529,25 @@ export function compareTarballToSource(tarballPath: string, pluginDir: string): 
 
   drift.sort((a, b) => a.path.localeCompare(b.path) || a.kind.localeCompare(b.kind));
   return { drift, skipped };
+}
+
+/** The packed `package/package.json`'s `version` field inside a committed tarball, or `null` if
+ *  the tarball can't be opened/parsed, or has no package.json entry — either way callers must
+ *  treat that as STALE (an unreadable tarball is never "up to date"), never let it throw.
+ *
+ *  Cheap by design: reuses `readTarball` (the same reader `compareTarballToSource` opens the
+ *  tarball with) but reads back only the ONE entry it needs, rather than diffing every entry
+ *  against plugin source the way `compareTarballToSource` does — this runs on every vendoring
+ *  pass, not just the freshness guard. */
+export function readPackedVersion(tarballPath: string): string | null {
+  try {
+    const pj = readTarball(tarballPath).get('package.json');
+    if (!pj) return null;
+    const pkg = JSON.parse(pj.toString('utf8'));
+    return typeof pkg.version === 'string' ? pkg.version : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Build inputs that determine `dist/` — hashed to detect a STALE dist. Excludes
@@ -673,7 +765,36 @@ function packInto(plugin: EnginePlugin, projectRoot: string, hash: string, canBu
   // dropped the old tarball before packing and the pack threw, the project's
   // `file:` spec would point at a now-deleted file → broken `npm install`. (D4)
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pack-'));
+  // Give the PACKED package a version npm's `file:` resolver can actually see change (#685):
+  // append the content hash as a semver PRERELEASE (packedVersion — `1.0.0-h<hash>`) to
+  // plugin.dir's OWN package.json for the duration of the pack, then restore the exact original
+  // bytes in the finally below. The committed engine plugin package.json stays on its bare base
+  // version — it is source and must not churn — and pluginContentHash normalizes this suffix
+  // back out (see normalizedPackageJsonBytes) so the rewrite doesn't feed back into the hash
+  // that names the tarball.
+  //
+  // Without this, two tarballs with different (content-addressed) FILENAMES but the SAME
+  // packed `version` look "already satisfied" to npm's `file:` resolver: it finds that
+  // version already present and rewrites node_modules/.package-lock.json to the new resolved
+  // path/integrity WITHOUT extracting the new bytes — a native build then silently ships the
+  // PREVIOUS plugin (the bug this fixes).
+  //
+  // ⚠️ `npm pack` names its OWN output from the package version, so it emits
+  // `<name>-1.0.0-h<hash>.tgz` here — NOT `destName` (which never carries the `h`, see
+  // packedVersion). That's fine: the "find whatever .tgz was produced" read below doesn't
+  // assume a name, and the copyFileSync further down publishes it under `destName` regardless
+  // of what npm called it.
+  const pkgJsonPath = path.join(plugin.dir, 'package.json');
+  const originalBytes = fs.readFileSync(pkgJsonPath);
   try {
+    const pkg = JSON.parse(originalBytes.toString('utf8'));
+    // Defensive: a killed process may have left a hash-suffixed version on disk from a pack
+    // that never reached the restore below. Treat its BASE as the truth rather than
+    // compounding it into a double-suffixed version.
+    const base = baseVersion(String(pkg.version ?? plugin.version));
+    pkg.version = packedVersion(base, hash);
+    fs.writeFileSync(pkgJsonPath, JSON.stringify(pkg, null, 2) + '\n');
+
     const npm = npmSpawnSpec();
     execFileSync(npm.command, [...npm.prefixArgs, 'pack', '--pack-destination', tmp], { cwd: plugin.dir, stdio: ['ignore', 'pipe', 'pipe'], shell: npm.shell, env: npm.env });
     const produced = fs.readdirSync(tmp).find((f) => f.endsWith('.tgz'));
@@ -689,6 +810,9 @@ function packInto(plugin: EnginePlugin, projectRoot: string, hash: string, canBu
     return `plugins/${destName}`;
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
+    // Restore the plugin's OWN package.json exactly — byte-identical, not a re-serialization —
+    // so its formatting/trailing newline survive and the committed file never churns.
+    fs.writeFileSync(pkgJsonPath, originalBytes);
   }
 }
 
@@ -767,7 +891,21 @@ export function vendorEnginePlugins(
     // committed one on a fresh clone, or a prior pack), don't re-pack — that
     // keeps `npm ci` integrity stable. Only a real content change (new hash →
     // absent file) triggers a fresh pack.
-    if (!fs.existsSync(absTgz)) {
+    //
+    // ⚠️ #685 follow-up: the NAME matching is not enough on its own. Every tarball committed
+    // before packInto started writing packedVersion into the PACKED package.json still has the
+    // right filename (the hash always matched its own content) but the WRONG packed version
+    // (a bare base, e.g. `1.0.0`) — and the packed version, not the filename, is what npm's
+    // `file:` resolver actually keys re-vendoring on. So a same-named tarball whose packed
+    // version isn't `packedVersion(plugin.version, hash)` is ALSO stale: this makes the fix
+    // self-migrating (a project heals on its very next vendor run, no separate migration step
+    // needed for the mechanism itself) and self-healing (a tarball packed by a stale toolchain,
+    // or one that failed to read at all, gets corrected here rather than living forever).
+    // readPackedVersion never throws — an unreadable tarball reads as `null`, which never
+    // equals a real wanted version, so it's stale too.
+    const wantPackedVersion = packedVersion(plugin.version, hash);
+    const tarballExists = fs.existsSync(absTgz);
+    if (!tarballExists || readPackedVersion(absTgz) !== wantPackedVersion) {
       packInto(plugin, projectRoot, hash, canBuild);
       changed = true;
       vendored.push(plugin.name);

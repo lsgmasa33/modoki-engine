@@ -31,7 +31,7 @@ import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
-import { pluginContentHash, listEnginePlugins, compareTarballToSource } from '../../plugins/vendorPlugins';
+import { pluginContentHash, listEnginePlugins, compareTarballToSource, readPackedVersion, packedVersion } from '../../plugins/vendorPlugins';
 import { PROJECT_ROOT_DIRS } from '../../scripts/projectRoots.mjs';
 import { hasAnyProject, hasVendoredPluginTarballs } from '../helpers/repoLayout';
 
@@ -181,6 +181,47 @@ describe('vendored engine plugins are not stale (#90)', () => {
         + `Fix: \`node engine/scripts/vendor-plugins.mjs <projectDir>\` then \`npm install\` in the project.\n`
         + `Note this compares the shipped set MINUS dist/ — the same set the tarball's NAME is `
         + `computed over — so a report here is a real content difference, never toolchain drift.`
+      : '',
+    ).toEqual([]);
+  });
+
+  // ── The PACKED version, not just the filename (#685) ──────────────────────────────────
+  // npm's `file:` resolver keys re-vendoring detection on the packed package.json's VERSION —
+  // not the tarball's filename. A tarball packed before packInto started writing that version
+  // (packedVersion: `<base>-h<hash>`) still has a bare `1.0.0` inside, even though its NAME (and
+  // so the two checks above) look completely current: npm sees "this version is already present"
+  // and skips extracting the new bytes, which is the whole failure #685 reports. This is what
+  // stops it regressing — a future tarball that goes back to a bare/wrong packed version fails
+  // LOUD here even while its filename is correct.
+  //
+  // ⚠️ EXPECTED RED right now: every tarball committed before this fix still carries a bare
+  // `1.0.0`. The owner is running the 22-project migration (`vendor-plugins.mjs` per project)
+  // immediately after this change lands, specifically so that churn is reviewed in one place —
+  // this assertion is what makes the migration's own completion verifiable afterward.
+  it.skipIf(!hasVendoredPluginTarballs())("every pinned tarball's PACKED version is <base>-h<hash> (#685)", () => {
+    const problems: string[] = [];
+    let checked = 0;
+
+    for (const { plugin, project, spec } of pins) {
+      const rel = spec.replace(/^file:/, '');
+      const abs = path.join(project.dir, rel);
+      if (!fs.existsSync(abs)) continue; // reported by the "pins a tarball that is not there" case above
+      const hashMatch = rel.match(/-([0-9a-f]{8})\.tgz$/);
+      if (!hashMatch) { problems.push(`${project.id}: ${rel} does not look like a content-addressed tarball name`); continue; }
+      const want = packedVersion(plugin.version, hashMatch[1]);
+      const got = readPackedVersion(abs);
+      checked++;
+      if (got !== want) {
+        problems.push(`${project.id}: ${rel} — packed package.json version is "${got}" but expected "${want}"`);
+      }
+    }
+
+    expect(checked, 'no committed plugin tarball was opened — the check ran on nothing').toBeGreaterThan(0);
+    expect(problems, problems.length
+      ? `Committed plugin tarball(s) still carry a bare/stale PACKED version — npm's \`file:\` resolver `
+        + `keys re-vendoring on THIS, not the filename, so these look "already satisfied" and will never `
+        + `be re-extracted even after a real content change (#685):\n  ${problems.join('\n  ')}\n\n`
+        + `Fix: \`node engine/scripts/vendor-plugins.mjs <projectDir>\` then \`npm install\` in the project.`
       : '',
     ).toEqual([]);
   });

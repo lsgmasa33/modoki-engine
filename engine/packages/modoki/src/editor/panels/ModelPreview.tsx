@@ -20,6 +20,7 @@ import { getKTX2Loader } from '../../runtime/loaders/textureResolver';
 import { needsGLBConversion, loadSourceModel, disposeSourceModel } from '../scene/convertToGLB';
 import { frameCameraToBoxFixed } from '../scene/sceneViewMath';
 import { applyRendererColorConfig } from '../../runtime/rendering/scene3DSync';
+import { noteGpuContextCreated, noteGpuContextDestroyed } from '../../runtime/core/gpuContextTracking';
 import { useModelInvalidationEpoch, cacheBustReimport } from './useAssetInvalidationEpoch';
 import { collectMaterialResources, disposeOwnedResources } from './modelPreviewResources';
 
@@ -109,6 +110,14 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     if (!container) return;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
+    // Fix 3 of #590's adversarial review (docs/plans/ios-rendering-update-wedge.md): this is
+    // `src/editor` — dev-only, never shipped in a game build — but it creates a REAL WebGL
+    // context, and an editor session with several previews/viewports open is exactly the surface
+    // that approaches `SOFT_CONTEXT_LIMIT`. Noted after a successful construction (never before
+    // — see `noteGpuContextCreated`'s doc), paired with a `contextLive`-guarded decrement in the
+    // unmount cleanup below, matching `scene3DSync.ts`'s `makeWebGPURenderer` convention.
+    noteGpuContextCreated();
+    let contextLive = true;
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(PREVIEW_W, PREVIEW_H);
     renderer.setClearColor(0x1a1a1a, 1);
@@ -190,6 +199,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       s.scene.environment = null;
       s.envTexture?.dispose();
       s.renderer.dispose();
+      if (contextLive) { contextLive = false; noteGpuContextDestroyed(); }
       try { container.removeChild(s.renderer.domElement); } catch { /* already gone */ }
     };
   }, [hasLods]);

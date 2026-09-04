@@ -74,13 +74,14 @@ The producers — `computeLayoutBounds()`, `readWatch()`, `journalEvents()`, `re
 `computeHandles()`, `dumpSceneState()` — are **not** private to the agent surface. The editor's own
 Debug Menu UI and diagnostics consume them, at full fidelity, in-process:
 
-- `engine/app/debug/diagnose.ts:72` calls `computeLayoutBounds()` with no params and reads
-  `.offScreen`. A counts-only *producer* would make `offScreen` undefined → `.length` throws →
-  `engine/tests/framework/diagnose.test.ts` goes red and `modoki_diagnose` breaks in the field.
-- `engine/app/debug/WatchTab.tsx:71,89` calls `readWatch(id)` with no flags and renders
+- `engine/app/debug/diagnose.ts`'s `computeDiagnostics` calls `computeLayoutBounds()` with no
+  params and reads `.offScreen`. A counts-only *producer* would make `offScreen` undefined →
+  `.length` throws → `engine/tests/framework/diagnose.test.ts` goes red and `modoki_diagnose`
+  breaks in the field.
+- `engine/app/debug/WatchTab.tsx`'s `WatchCard` calls `readWatch(id)` with no flags and renders
   `s.samples.map(x => x.value)` into a `Sparkline`. A stats-only *producer* would blank the human's
   sparkline.
-- `JournalTab.tsx:27-29` calls `journalEvents()` and tail-slices it itself.
+- `JournalTab.tsx`'s `JournalTab` calls `journalEvents()` and tail-slices it itself.
 - `engine/tests/electron/handlesDump.test.ts` and `engine/packages/modoki/tests/runtime/journal.test.ts`
   assert on full producer output.
 
@@ -92,7 +93,7 @@ itself as a test failure until an editor panel goes blank.
 
 A corollary, learned adversarially:
 
-> **A byte cap must never mid-slice JSON.** `engine/tools/modoki-mcp/test-smoke.mjs:28` does
+> **A byte cap must never mid-slice JSON.** `engine/tools/modoki-mcp/test-smoke.mjs` does
 > `JSON.parse(text(state))` on a `get_scene_state` result, and the model (the real consumer) parses
 > the text too. A naive `text.slice(0, 60_000)` yields unparseable garbage. When a payload exceeds
 > the cap, the system returns a **valid JSON envelope** describing the elision, never a truncated
@@ -175,15 +176,16 @@ with a default `limit` and a `hint`:
 
 Measured **~40,123 → 5,938 tokens**. The 135 × (36-char GUID + trait-name array) dominates, which is
 why it isn't smaller. `full=1` / `trait=` / `id=` / `name=` / `where=` return the curated dump with
-field values — they are all in the producer's `targeted` set (`agentBridge.ts:260`), so any targeted
-query returns values. An untargeted `full=1` now exceeds the compaction cap and returns the elision
-envelope + hint — correct, but it means "give me literally everything" is no longer one call; use
-`trait=`/`id=`/`limit=`.
+field values — they are all in the producer's `targeted` set (`agentBridge.ts`'s `dumpSceneState`),
+so any targeted query returns values. An untargeted `full=1` now exceeds the compaction cap and
+returns the elision envelope + hint — correct, but it means "give me literally everything" is no
+longer one call; use `trait=`/`id=`/`limit=`.
 
 The default `limit` applies only when the caller passed none, so an explicit `limit:100000` still
 wins. Implemented at the **route/tool boundary**, not in `dumpSceneState()`:
-`engine/electron/main.ts:638-642` (`captureGesture`'s Watch sampler) calls the `scene-state` op with
-`trait:'Transform'` — targeted, so it keeps values regardless, and the producer is untouched.
+`engine/electron/main.ts`'s `/api/capture-gesture` route (`captureGesture`'s Watch sampler)
+calls the `scene-state` op with `trait:'Transform'` — targeted, so it keeps values regardless,
+and the producer is untouched.
 
 ### `get_layout_bounds` — counts-first, `overlaps` opt-in
 
@@ -205,16 +207,17 @@ Measured **73,849 → 68 tokens.** The bare call still reports `overlapsCount` (
 survives, only the serialized pairs are gone. `overlaps=1` costs ~19,350 tok, `layer=3d` ~18,772.
 
 - `entities[]` is returned only when `ids` or `layer` is passed, with a `limit`.
-- `overlaps[]` is returned only behind `overlaps:true`, and the O(n²) pair loop
-  (`layoutDump.ts:100-107`) is **guarded** so the default doesn't pay to compute 2,625 pairs it then
-  discards. That double-loop otherwise emits more characters than all 241 rects combined.
-- **The `offScreen` key (array of ids) is preserved.** `diagnose.ts:72` reads `.offScreen` off a
-  no-arg `computeLayoutBounds()` and takes `.length` — this is the concrete instance of the
-  architectural rule: summarize at the route, and `diagnose.ts`, which calls the producer
-  in-process, never notices. `agentBridge.ts:280` (the `scene-state?bounds=1` enricher) passes
-  `ids`, so it keeps its rects.
-- `zeroSize` aggregate is included (each `LayoutEntry.zeroSize` was already computed per entry at
-  `layoutDump.ts:21,51,64`; only the aggregate was missing).
+- `overlaps[]` is returned only behind `overlaps:true`, and the O(n²) pair loop inside
+  `layoutDump.ts`'s `computeLayoutBounds` is **guarded** so the default doesn't pay to compute
+  2,625 pairs it then discards. That double-loop otherwise emits more characters than all 241
+  rects combined.
+- **The `offScreen` key (array of ids) is preserved.** `diagnose.ts`'s `computeDiagnostics` reads
+  `.offScreen` off a no-arg `computeLayoutBounds()` and takes `.length` — this is the concrete
+  instance of the architectural rule: summarize at the route, and `diagnose.ts`, which calls the
+  producer in-process, never notices. `agentBridge.ts`'s `dumpSceneState` (the `scene-state?bounds=1`
+  enricher) passes `ids`, so it keeps its rects.
+- `zeroSize` aggregate is included (each `LayoutEntry.zeroSize` was already computed per entry
+  inside `layoutDump.ts`'s `computeLayoutBounds`; only the aggregate was missing).
 
 ### `list_assets` / `list_traits` — index-first with real filters
 
@@ -297,22 +300,24 @@ never in the producer. The ceilings below are **measured** (bytes/entry × ring 
 | Tool | Producer (untouched) | Seam | Boundary default | Measured ceiling |
 |---|---|---|---|---|
 | `get_console_logs` | `dumpConsoleLogs` projecting the shared `runtime/core/consoleRing.ts` (1000 entries in the editor, 512 on a debug device build) — `diagnose` reads it directly | `console-logs` op | last 50 + `count`/`total`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry *(stale — see caveat below)* → **40–54k tok** (editor) |
-| `watch` (`read`) | `readWatch()` — `WatchTab.tsx:89` renders `samples` | `watch-read` op | stats-only; `samples:true` opts in | 39.8 B/sample × 512 series × 600–5000 → **3.1M–25.8M tok** |
-| `journal` | `journalEvents()` — cap `10_000` (`journal.ts:58`) — `JournalTab` reads it | `journal-events` op | last 100 + `byType` | 102–226 B/ev → **257k–582k tok** |
-| `editor_journal` | `readEditorJournal()` — cap `2000` (`editorJournal.ts:36`) | `editor-journal` op | last 100 + `byType`; `merged` tails `game` + `timeline` too | 130–253 B/ev → **54k–126k tok** |
-| `handles` | `computeHandles()` — `inputRoutes.ts:168` calls the OP to resolve `tap_handle` | **the HTTP router**, not the op | `byEditor`/`byKind` counts unless `editor`/`kind`/`ids` | 374 B/keyframe-handle → **56k–187k tok** (2,000-key Dopesheet) |
+| `watch` (`read`) | `readWatch()` — `WatchTab.tsx`'s `WatchCard` renders `samples` | `watch-read` op | stats-only; `samples:true` opts in | 39.8 B/sample × 512 series × 600–5000 → **3.1M–25.8M tok** |
+| `journal` | `journalEvents()` — cap `journal.ts`'s `MAX_EVENTS` — `JournalTab` reads it | `journal-events` op | last 100 + `byType` | 102–226 B/ev → **257k–582k tok** |
+| `editor_journal` | `readEditorJournal()` — cap `editorJournal.ts`'s `MAX_EVENTS` | `editor-journal` op | last 100 + `byType`; `merged` tails `game` + `timeline` too | 130–253 B/ev → **54k–126k tok** |
+| `handles` | `computeHandles()` — `inputRoutes.ts`'s `/api/input/tap-handle` route calls the OP to resolve `tap_handle` | **the HTTP router**, not the op | `byEditor`/`byKind` counts unless `editor`/`kind`/`ids` | 374 B/keyframe-handle → **56k–187k tok** (2,000-key Dopesheet) |
 
-**`handles` is the one whose seam is NOT the op.** `engine/electron/inputRoutes.ts:168` calls
-`requestRenderer('enact-handles', {ids:[id]})` to turn a handle id into coordinates for trusted
-input — it is an in-process consumer *of the op itself*. Summarizing there would break `tap_handle`,
-so the router is the agent's boundary and the op stays an internal service.
+**`handles` is the one whose seam is NOT the op.** `engine/electron/inputRoutes.ts`'s
+`/api/input/tap-handle` route calls `requestRenderer('enact-handles', {ids:[id]})` to turn a
+handle id into coordinates for trusted input — it is an in-process consumer *of the op itself*.
+Summarizing there would break `tap_handle`, so the router is the agent's boundary and the op
+stays an internal service.
 
-The buffer caps are: `journal` `MAX_EVENTS = 10_000` (`journal.ts:58`), `editor_journal` `2000`
-(`editorJournal.ts:36`), the shared console ring 1000 in the editor / 512 on a debug device build
-(`installConsoleRing.ts`; `agentBridge.ts`'s old `CONSOLE_BUFFER_MAX = 500` no longer exists),
-`watch` `maxSamples` default `600` per (entity,field) series × `DEFAULT_MAX_SERIES = 512`
-(`watch.ts:191`, `:55`). Bounded, yes — but a `watch` on `Transform` across a populated scene has a
-ceiling in the millions of tokens, which is exactly why the boundary defaults to stats-only.
+The buffer caps are: `journal` `MAX_EVENTS = 10_000` (`journal.ts`), `editor_journal` `2000`
+(`editorJournal.ts`'s own `MAX_EVENTS`), the shared console ring 1000 in the editor / 512 on a
+debug device build (`installConsoleRing.ts`; `agentBridge.ts`'s old `CONSOLE_BUFFER_MAX = 500`
+no longer exists), `watch` `maxSamples` default `600` per (entity,field) series ×
+`DEFAULT_MAX_SERIES = 512` (`watch.ts`). Bounded, yes — but a `watch` on `Transform` across a
+populated scene has a ceiling in the millions of tokens, which is exactly why the boundary
+defaults to stats-only.
 
 Note on the console producer, **rewritten by #596/#597** — the old note described three separate
 console buffers (agentBridge's 500, the TCP bridge's 200, the debug menu's 300) and said only the
@@ -326,8 +331,9 @@ surface; #626.)
 
 ⚠️ **Three OTHER `console.*` wrappers exist, permanently or temporarily, for reasons unrelated to
 agent tooling — naming them so a future `grep`-for-`console.warn =` isn't surprised.**
-`runtime/core/globalErrors.ts:490,496` wraps `console.error`/`console.warn` PERMANENTLY to mirror
-both to Crashlytics. `runtime/core/warnSuppress.ts:25` and `editor/scene/warnFilter.ts:32` each wrap
+`runtime/core/globalErrors.ts`'s `installGlobalErrorHandlers` wraps `console.error`/`console.warn`
+PERMANENTLY to mirror both to Crashlytics. `runtime/core/warnSuppress.ts`'s
+`beginSuppressRapierInitWarning` and `editor/scene/warnFilter.ts`'s `withWarnFilter` each wrap
 `console.warn` TEMPORARILY — ref-counted around a Rapier init call, and scoped to one
 `renderer.render` call, respectively — to swallow one specific known-noisy line (a Rapier
 deprecation warning; Three.js r183 WebGPU's `'Light node not found'`) for the duration of that one
@@ -355,7 +361,7 @@ derivation from a figure now known to be wrong in an unknown direction. The one 
 These were the concrete waste sources, now resolved:
 
 - **Every scene edit echoed the entire scene file back.**
-  `engine/plugins/backend/editorBackendRouter.ts:505` returned
+  `engine/plugins/backend/editorBackendRouter.ts`'s `/api/scene-mutate` route returned
   `scene: changed > 0 ? scene : undefined`. A `setTrait` always changes something, so it always
   echoed — **~10,166 tokens per call**; a ten-edit loop burned ~100k tokens of pure echo. Worse, the
   echoed object was the pre-expansion scene *file*, not the live world, so it wasn't even the
@@ -366,9 +372,9 @@ These were the concrete waste sources, now resolved:
   ~10,166 → ~50 tokens.
 
 - **`device_screenshot` inlined a full-resolution base64 image even when `savePath` was given.**
-  `engine/tools/game-debug-mcp/src/mcp-tools.ts:309-362` wrote the file, opened Preview, *and*
-  returned the blob (iOS `drawHierarchy` captures at ~1800px). It now returns path + dimensions as
-  text and inlines the image only on an explicit `inline:true`, matching modoki's own
+  `engine/tools/game-debug-mcp/src/mcp-tools.ts`'s `device_screenshot` tool wrote the file, opened
+  Preview, *and* returned the blob (iOS `drawHierarchy` captures at ~1800px). It now returns path +
+  dimensions as text and inlines the image only on an explicit `inline:true`, matching modoki's own
   `capture_viewport` / `render_scene` / `render_sequence`, which return file paths. **Coordinate
   contract caveat:** the tool's info text says "use these pixel coordinates for
   `device_tap`/`device_drag`" — if a future size fix ever downscales the returned image, the reported
@@ -378,16 +384,16 @@ These were the concrete waste sources, now resolved:
   before).
 
 - **`list_assets`'s `type` filter was applied client-side**, after fetching all 320 assets (once
-  `index.ts:310-315`; the tools split into `src/tools/*.ts` since, so it's now `summarizeAssets` in
+  in `index.ts`; the tools split into `src/tools/*.ts` since, so it's now `summarizeAssets` in
   `engine/tools/modoki-mcp/src/summarize.ts`, called from `modoki_list_assets` in
   `engine/tools/modoki-mcp/src/tools/scene.ts`). Moved server-side alongside the new `folder`/`name`
   filters.
 
 **Not a bug — `enact-handles`'s `editor` filter.** `?editor=chrome` once returned byte-identical
 output to the unfiltered call, which looked like a silently-ignored filter. It isn't: the filter is
-applied server-side (`interactionHandles.ts:103-105`); the bytes matched only because all 19 handles
-present happened to be chrome. Proven live: `?editor=skin` → 0, `?kind=drag` → 0. Recorded so the
-next reader doesn't re-chase it.
+applied server-side (`interactionHandles.ts`'s `collectHandles`); the bytes matched only because
+all 19 handles present happened to be chrome. Proven live: `?editor=skin` → 0, `?kind=drag` → 0.
+Recorded so the next reader doesn't re-chase it.
 
 Also verified during the work: `device_console_logs`/`device_native_logs` are NOT unbounded — both
 default to `limit:50`. And `device_screencap` is a temp FILENAME

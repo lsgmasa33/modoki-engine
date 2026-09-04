@@ -44,6 +44,7 @@
 import { getWebGPUSupported } from './gpuDetect';
 import { readPlatform, readFormFactor } from '../core/formFactor';
 import { getActiveRenderer, readRendererBackend } from '../core/activeRenderer';
+import { noteGpuContextCreated, noteGpuContextDestroyed } from '../core/gpuContextTracking';
 
 export interface CompressedTextureSupport {
   /** ASTC — the mobile target format for KTX2. */
@@ -146,6 +147,10 @@ function readGlFacts(): Pick<DeviceCaps, 'gpuRenderer' | 'maxTextureSize' | 'com
     canvas.width = canvas.height = 1;
     gl = canvas.getContext('webgl2');
     if (!gl) return { compressed: none };
+    // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): this throwaway 1x1 context was
+    // invisible to the soft GPU-context budget — noted here, paired with the `finally` release
+    // below (which already ran on every exit path, success or throw).
+    noteGpuContextCreated();
 
     // Masked on iOS ('Apple GPU') and blockable elsewhere for fingerprinting — absent, not fatal.
     let gpuRenderer: string | undefined;
@@ -170,6 +175,7 @@ function readGlFacts(): Pick<DeviceCaps, 'gpuRenderer' | 'maxTextureSize' | 'com
     return { compressed: none };
   } finally {
     // Best-effort release; a browser with no such extension reclaims it on GC anyway.
+    if (gl) noteGpuContextDestroyed();
     try { gl?.getExtension('WEBGL_lose_context')?.loseContext(); } catch { /* not worth reporting */ }
   }
 }

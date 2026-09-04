@@ -265,6 +265,51 @@ describe('deviceCaps — GL facts', () => {
     expect(caps.compressed).toEqual({ astc: false, etc2: false, s3tc: false });
   });
 
+  // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): this throwaway context was
+  // invisible to the shared GL/GPU-context counter until this phase — see
+  // `gpuContextTracking.test.ts` for the counter's own unit tests.
+  it('notes the throwaway context created, then destroyed — net zero once the probe finishes', async () => {
+    stubCanvas(makeGl());
+    const { getDeviceCaps } = await load();
+    const {
+      liveGpuContextCount, totalGpuContextsCreated, totalGpuContextsDestroyed,
+    } = await import('../../src/runtime/core/gpuContextTracking');
+    expect(liveGpuContextCount()).toBe(0);
+    await getDeviceCaps();
+    // Created AND destroyed within the same synchronous `readGlFacts()` call — a careless
+    // implementation that noted create but forgot destroy (or paired it wrong) would leave this
+    // above zero.
+    expect(liveGpuContextCount()).toBe(0);
+    // The LIVE count alone can't prove either call actually fired — 0 before + 0 after is exactly
+    // what "the note calls were never wired up at all" would also produce. The CUMULATIVE totals
+    // (`vi.resetModules()` in `load()` gives this module a fresh, zeroed instance) only move when
+    // `noteGpuContextCreated`/`noteGpuContextDestroyed` genuinely ran.
+    expect(totalGpuContextsCreated()).toBe(1);
+    expect(totalGpuContextsDestroyed()).toBe(1);
+  });
+
+  it('notes NO context when webgl2 is unavailable — nothing was ever created', async () => {
+    // A live-count assertion alone can't distinguish "tracking correctly skipped because gl is
+    // null" from "tracking was never wired up at all" — both read 0 here, since nothing this
+    // branch does would move the counter either way. Seed a POSITIVE case first (an available
+    // context DOES move `totalGpuContextsCreated`, proving the mechanism exists and can fire),
+    // then switch to unavailable and confirm the total does NOT climb further — that is the part
+    // only the intended (gated) behaviour produces; an ungated create call would.
+    stubCanvas(makeGl());
+    const { getDeviceCaps, resetDeviceCaps } = await load();
+    const { liveGpuContextCount, totalGpuContextsCreated } =
+      await import('../../src/runtime/core/gpuContextTracking');
+    await getDeviceCaps();
+    const createdWithGl = totalGpuContextsCreated();
+    expect(createdWithGl).toBeGreaterThan(0);
+
+    resetDeviceCaps();
+    stubCanvas(null);
+    await getDeviceCaps();
+    expect(liveGpuContextCount()).toBe(0);
+    expect(totalGpuContextsCreated()).toBe(createdWithGl); // no further create when gl is null
+  });
+
   it('NEVER throws when getContext itself throws', async () => {
     const real = document.createElement.bind(document);
     vi.spyOn(document, 'createElement').mockImplementation(((tag: string) => {

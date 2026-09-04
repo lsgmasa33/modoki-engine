@@ -15,6 +15,7 @@ import { resolvePixiBackend } from '../../runtime/rendering/canvas2DPool';
 import { buildPixiShaderProgram, makePixiShaderInstance, type PixiShaderProgram } from '../../runtime/rendering/pixiShaderBuilder';
 import { resolveImageUrl } from '../../runtime/rendering/renderUtils';
 import { shaderSpace, coerceParamValue, type ShaderParam } from '../../runtime/loaders/shaderSchema';
+import { noteGpuContextCreated, noteGpuContextDestroyed } from '../../runtime/core/gpuContextTracking';
 
 const SIZE = 132; // css px (square)
 
@@ -59,6 +60,16 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
     host.appendChild(canvas);
     const app = new Application();
 
+    // Fix 3 of #590's adversarial review (docs/plans/ios-rendering-update-wedge.md): this is
+    // `src/editor` — dev-only, never shipped in a game build — but `app.init()` below creates a
+    // REAL PixiJS context, and an editor session with several previews/viewports open is exactly
+    // the surface that approaches `SOFT_CONTEXT_LIMIT`. Noted after `app.init()` resolves (never
+    // before), paired with a `contextLive`-guarded decrement everywhere this effect destroys the
+    // app, matching `scene3DSync.ts`'s `makeWebGPURenderer` convention — a fresh `false` per
+    // effect run (a new `app` instance), never carried over from a previous shader/path.
+    let contextLive = false;
+    const markDestroyed = () => { if (contextLive) { contextLive = false; noteGpuContextDestroyed(); } };
+
     // Every async-side destroy is guarded on `app.renderer` (Pixi nulls it in destroy()): the
     // cleanup below may already have torn the app down while we were parked on an await, and a
     // SECOND app.destroy() throws (stage/renderer are null). The guard makes whichever destroy
@@ -69,10 +80,14 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
         const preference = await resolvePixiBackend();
         if (disposed || stateRef.current.serial !== serial) return;
         await app.init({ preference, canvas, width: SIZE, height: SIZE, backgroundAlpha: 0, antialias: true, preserveDrawingBuffer: true });
-        if (disposed || stateRef.current.serial !== serial) { if (app.renderer) app.destroy(true); return; }
+        // The context now exists — note it before any of the early-return teardowns below, so a
+        // stale/disposed resume still pairs its `app.destroy(true)` with a decrement.
+        contextLive = true;
+        noteGpuContextCreated();
+        if (disposed || stateRef.current.serial !== serial) { if (app.renderer) app.destroy(true); markDestroyed(); return; }
         app.ticker.stop();
         const program = await buildPixiShaderProgram(path);
-        if (disposed || stateRef.current.serial !== serial) { if (app.renderer) app.destroy(true); return; }
+        if (disposed || stateRef.current.serial !== serial) { if (app.renderer) app.destroy(true); markDestroyed(); return; }
         stateRef.current.app = app;
         stateRef.current.program = program;
         if (program) {
@@ -84,6 +99,7 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
       } catch {
         // init/build rejected — free any GL context we opened; leave state cleared.
         if (app.renderer) app.destroy(true);
+        markDestroyed(); // no-op unless init actually succeeded before something else threw
       }
     })();
 
@@ -92,6 +108,7 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
       stateRef.current.serial++;
       stateRef.current.app = null; stateRef.current.program = null; stateRef.current.mesh = null;
       if (!app.renderer) { /* init never finished */ } else app.destroy(true);
+      markDestroyed();
       canvas.remove();
     };
   }, [path, is2D]);

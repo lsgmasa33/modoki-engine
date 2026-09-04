@@ -36,6 +36,7 @@ import { getRenderSettings, getEffectivePixiSettings } from './renderSettings';
 import { registerPointerPassthrough } from '../core/pointerBlockers';
 import { createRendererRecovery, type RendererRecovery } from './rendererRecovery';
 import { areDebugHandlesEnabled } from '../core/debugHandles';
+import { noteGpuContextCreated, noteGpuContextDestroyed, liveGpuContextCount } from '../core/gpuContextTracking';
 
 /** Resolve the PixiJS renderer backend the Canvas2D layer will actually use:
  *  honor an explicit `pixi.backend` render-setting ('webgpu'/'webgl'), else fall
@@ -50,35 +51,18 @@ export async function resolvePixiBackend(): Promise<'webgpu' | 'webgl'> {
 }
 
 // ── Soft GPU-context budget (SceneView-Pixi migration Phase 5) ──
-// Each initialized slot Application = one live GPU context. Browsers cap live WebGL contexts
-// (~8–16) and evict the oldest past that; WebGPU has its own limits. Real Canvas2D counts are 1–2
-// per scene, and the editor lazy-mounts its 2D surface only in 2D mode — so a healthy session stays
-// well under the cap. This is a global (cross-pool) COUNT with a one-shot warn if it climbs past a
-// soft threshold, to catch a leak (slots not reclaimed) or an unexpectedly context-heavy scene
-// before the browser silently drops a context. Not a hard cap — it never blocks allocation.
-const SOFT_CONTEXT_LIMIT = 8;
-let _liveContexts = 0;
-let _contextWarned = false;
-function noteContextCreated(): void {
-  _liveContexts++;
-  if (_liveContexts > SOFT_CONTEXT_LIMIT && !_contextWarned) {
-    _contextWarned = true;
-    console.warn(
-      `[canvas2DPool] ${_liveContexts} live PixiJS GPU contexts (soft limit ${SOFT_CONTEXT_LIMIT}). ` +
-      `Browsers evict the oldest WebGL context past their cap — check for un-reclaimed Canvas2D slots ` +
-      `or an unusually context-heavy scene. (Warned once; not a hard limit.)`,
-    );
-  }
-}
-function noteContextDestroyed(): void {
-  if (_liveContexts > 0) _liveContexts--;
-  // Deliberately NOT re-armed: warn at most ONCE per session. Re-arming at the threshold would
-  // re-spam the identical warning every acquire/release cycle for a session hovering at the limit
-  // (e.g. scene swaps that acquire-new-then-release-old). A genuine leak climbs monotonically and is
-  // caught by the single warn; the transient-spike case doesn't need a second.
-}
-/** Live PixiJS GPU-context count across all Canvas2D pools (test/diagnostics). */
-export function liveCanvas2DContextCount(): number { return _liveContexts; }
+// Each initialized slot Application = one live GPU context. Real Canvas2D counts are 1–2 per
+// scene, and the editor lazy-mounts its 2D surface only in 2D mode — so a healthy session stays
+// well under the cap on its own. The counter itself — and the soft cap it warns against — now
+// live in `core/gpuContextTracking.ts` (Phase 3 of #590, docs/plans/ios-rendering-update-wedge.md):
+// it was PRIVATE to this file and counted only PixiJS pool contexts, invisible to the main Three
+// renderer and the boot-time GL probes, which made the budget it warned against a partial one.
+// `noteGpuContextCreated`/`noteGpuContextDestroyed` below are re-exports of the calls this file
+// already made at every slot-init/slot-destroy site; behaviour here is unchanged.
+/** Live GL/GPU-context count across EVERY tracked site — not just this pool. Kept under its
+ *  original name for the existing test/diagnostic callers; see `liveGpuContextCount` for the
+ *  general accessor. */
+export function liveCanvas2DContextCount(): number { return liveGpuContextCount(); }
 
 export interface Canvas2DSlot {
   canvas: HTMLCanvasElement;
@@ -263,7 +247,7 @@ export class Canvas2DPool {
     if (slot.initialized) {
       try { slot.app.destroy(false); } catch { /* a dead renderer often throws on teardown — the
         point is to stop referencing it, and a throw here must not abort the rebuild */ }
-      noteContextDestroyed();
+      noteGpuContextDestroyed();
     }
 
     // ⚠️ A FRESH canvas element, not the old one. Re-initialising on the same canvas was the
@@ -339,7 +323,7 @@ export class Canvas2DPool {
     // exceeds `REBUILD_INIT_TIMEOUT_MS` rejects but does NOT cancel — the retry then assigns a new
     // Application, and when the abandoned `init()` finally settles (a slow-but-alive driver, which
     // is exactly what the timeout exists to bound) this code resumes and configures the RETRY's
-    // app a second time, double-counting `noteContextCreated()` while the timed-out one is never
+    // app a second time, double-counting `noteGpuContextCreated()` while the timed-out one is never
     // destroyed at all: a live GPU context leaked, and the budget wrong in both directions.
     const app = slot.app;
     await app.init({
@@ -377,7 +361,7 @@ export class Canvas2DPool {
     app.ticker.stop();
     app.stage.addChild(slot.container);
     slot.initialized = true;
-    noteContextCreated();
+    noteGpuContextCreated();
   }
 
   private createSlot(): Canvas2DSlot {
@@ -675,7 +659,7 @@ export class Canvas2DPool {
           s.detachCanvasListeners = undefined;
           s.unpassthrough?.();
           s.container.destroy();
-          if (s.initialized) { s.app.destroy(true); noteContextDestroyed(); }
+          if (s.initialized) { s.app.destroy(true); noteGpuContextDestroyed(); }
           s.recovery?.dispose();
           this.slots.splice(i, 1);
         }
@@ -699,6 +683,16 @@ export class Canvas2DPool {
   /** Get all currently allocated entity IDs. */
   getAllocatedEntityIds(): Set<number> {
     return new Set(this.entityMap.keys());
+  }
+
+  /** Snapshot of every live slot's entity id + Pixi container, for the GPU-memory report
+   *  (Phase 3 of #590, docs/plans/ios-rendering-update-wedge.md) to walk and attribute bytes
+   *  per slot. Read-only: the caller must not mutate the container. Includes every slot with a
+   *  live entity, initialized or not (an uninitialized slot's container is simply empty). */
+  getSlotsForMemoryReport(): ReadonlyArray<{ entityId: number | null; container: Container }> {
+    return this.slots
+      .filter((s) => s.entityId !== null)
+      .map((s) => ({ entityId: s.entityId, container: s.container }));
   }
 
   /** Destroy the pool and all Applications.
@@ -747,7 +741,7 @@ export class Canvas2DPool {
       slot.detachCanvasListeners = undefined;
       slot.unpassthrough?.();
       slot.container.destroy();
-      if (slot.initialized) { slot.app.destroy(true); noteContextDestroyed(); }
+      if (slot.initialized) { slot.app.destroy(true); noteGpuContextDestroyed(); }
       slot.recovery?.dispose();
     }
     this.slots.length = 0;
@@ -816,3 +810,9 @@ export function renderAll(dirtyIds?: Set<number>): void { defaultPool.renderAll(
 export function releaseAll(): void { defaultPool.releaseAll(); }
 export function getAllocatedEntityIds(): Set<number> { return defaultPool.getAllocatedEntityIds(); }
 export function destroyPool(): void { defaultPool.destroyPool(); }
+/** `defaultPool` only — the runtime/GameView surface, same GameView-only caveat as `window.__2d`
+ *  above (the editor SceneView's Canvas2D content lives in its OWN pool instance). Backs the
+ *  GPU-memory report's per-slot byte attribution (Phase 3 of #590). */
+export function getSlotsForMemoryReport(): ReadonlyArray<{ entityId: number | null; container: Container }> {
+  return defaultPool.getSlotsForMemoryReport();
+}

@@ -259,8 +259,8 @@ short-circuit (the release is fetched and verified earlier in `checkForUpdate`),
 
 ⚠️ **The native boot hook is now a HARD PREREQUISITE for any OTA-enabled project, and omitting it
 bricks the app rather than degrading it.** The hook is a MANUAL per-game integration — one line in
-`games/ota-test/ios/App/App/MyViewController.swift:21` (`OtaBootHook.run(name:)`) and one in the
-Android `MainActivity.java:15` (`OtaPlugin.runBootHook(...)`) — and `engine/plugins/healNativeConfig.ts`
+`games/ota-test/ios/App/App/MyViewController.swift` (`OtaBootHook.run(name:)`) and one in the
+Android `MainActivity.java` (`OtaPlugin.runBootHook(...)`) — and `engine/plugins/healNativeConfig.ts`
 does **not** install it. A project that sets `ota.enabled` in `project.config.json` and forgets that
 line still stages perfectly well: the plugin methods work, `activate()` writes `pending`, the gate
 arms. But nothing ever increments `bootAttempts`, so `checkForUpdate` returns `pending-restart` on

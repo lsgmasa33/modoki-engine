@@ -355,10 +355,10 @@ teardown paths (`entity-stop` · `entity-gone` · `not-playing` · `world-teardo
 which are otherwise indistinguishable from outside.
 
 **`@audio` vs the Timeline's `@cue` — they are a PAIR, not a duplicate.** Timeline's
-audio track (`timelineSystem.ts:618-620`) calls `cueClip(...)` and then emits `@cue`,
-which records that the Director *asked* for a sound at that beat. `@audio` records
-whether a voice actually *started*. So a Timeline audio beat normally produces
-`@cue` followed by `@audio {phase:'start'}` — and the diagnostic case is when the
+audio track (`timelineSystem.ts`'s `applyDirectorFrame`, `'audio'` case) calls `cueClip(...)`
+and then emits `@cue`, which records that the Director *asked* for a sound at that beat.
+`@audio` records whether a voice actually *started*. So a Timeline audio beat normally
+produces `@cue` followed by `@audio {phase:'start'}` — and the diagnostic case is when the
 first appears without the second, which is precisely "the cutscene called for a sound
 and none played". Do not read the two events as double-counting one thing.
 

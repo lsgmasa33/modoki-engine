@@ -44,10 +44,17 @@ export interface AttributionService {
   init(): void | Promise<void>;
 }
 
+/** A native modal dialog. The ONLY thing that can be drawn once WebKit has stopped rendering
+ *  updates — DOM paint is dead in that state, so an in-page message is impossible. */
+export interface NativeDialogService {
+  alert(opts: { title: string; message: string; buttonTitle?: string }): Promise<void>;
+}
+
 export interface AppServices {
   crashlytics?: CrashlyticsService;
   ads?: AdsService;
   attribution?: AttributionService;
+  dialog?: NativeDialogService;
 }
 
 let registered: AppServices = {};

@@ -22,6 +22,12 @@ import {
 } from '../../src/runtime/rendering/rampProbeRunner';
 import { createGlProbeSurface } from '../../src/runtime/rendering/rampWorkloadGL';
 import { ESCAPE_MULTIPLE, ABORT_FRAME_MS } from '../../src/runtime/rendering/rampProbe';
+// STATIC import, deliberately — this file's `afterEach` calls `vi.resetModules()`, which only
+// affects FUTURE dynamic imports. `createGlProbeSurface` above is already bound (at file-load
+// time) to one fixed `rampWorkloadGL` module instance and therefore one fixed
+// `gpuContextTracking` instance; a `await import(...)` of that module INSIDE a test could resolve
+// to a DIFFERENT, disconnected instance post-reset and silently read 0 forever.
+import { liveGpuContextCount } from '../../src/runtime/core/gpuContextTracking';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -368,6 +374,44 @@ describe('createGlProbeSurface — the workloads, against a fake GL (#203)', () 
       const narrow = createGlProbeSurface(40, 480, () => {});
       expect(narrow!.shadeRegionPixels).toBe(40 * 100);
       narrow!.dispose();
+    });
+  });
+
+  // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): this raw WebGL2 probe context was
+  // invisible to the shared GL/GPU-context counter until this phase.
+  describe('GPU-context tracking (Phase 3 of #590)', () => {
+    it('notes the context created, then destroyed on dispose()', () => {
+      withFakeGl(() => {
+        const before = liveGpuContextCount();
+        const s = createGlProbeSurface(640, 480, () => {});
+        expect(s).not.toBeNull();
+        expect(liveGpuContextCount()).toBe(before + 1);
+        s!.dispose();
+        expect(liveGpuContextCount()).toBe(before);
+      });
+    });
+
+    it('a repeated dispose() does not decrement twice', () => {
+      withFakeGl(() => {
+        const before = liveGpuContextCount();
+        const s = createGlProbeSurface(640, 480, () => {});
+        s!.dispose();
+        s!.dispose(); // careless double-teardown — must not go negative
+        expect(liveGpuContextCount()).toBe(before);
+      });
+    });
+
+    it('notes nothing when the context fails to acquire (gl-context-failed)', () => {
+      const before = liveGpuContextCount();
+      const canvas = { width: 0, height: 0, getContext: () => null };
+      const spy = vi.spyOn(document, 'createElement').mockReturnValue(canvas as never);
+      try {
+        const s = createGlProbeSurface(640, 480, () => {});
+        expect(s).toBeNull();
+        expect(liveGpuContextCount()).toBe(before);
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 });

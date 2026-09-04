@@ -1454,10 +1454,11 @@ it cannot place — which lands exactly where such a device already landed (the 
 
 #### The three-layer resolver, and what the GPU database cannot do (#210)
 
-**Why identity is better, with the numbers.** `deviceCaps.ts:180` already reads
+**Why identity is better, with the numbers.** `deviceCaps.ts`'s `readGlFacts` already reads
 `UNMASKED_RENDERER_WEBGL` on every device in a release build. It was written off
-(`qualityTier.ts:649`) as *"ambiguous — one name ships two GPUs"*. Checked against real data, the
-ambiguity is between **siblings**, not generations, and a public database resolves even that:
+(`qualityTier.ts`'s `TIER_ALLOWLIST` comment) as *"ambiguous — one name ships two GPUs"*. Checked
+against real data, the ambiguity is between **siblings**, not generations, and a public database
+resolves even that:
 
 | our device | database entry | fps |
 |---|---|---|
@@ -1508,8 +1509,9 @@ top-down; the first layer that answers, wins.
 | **3. Probe** — the existing ramp | unknown vendor, masked string, iOS web | — | the 6 s, paid by a MINORITY |
 | **iOS native** — model id (already shipped) | all iOS native | ✅ threshold rule | ~0 ms |
 
-**Layer 1 is what makes the stale database a non-issue**, and it is not a new idea — it is the rule
-`qualityTier.ts:653` already argues for on iOS, never applied to Android:
+**Layer 1 is what makes the stale database a non-issue**, and it is not a new idea — it is the
+rule `qualityTier.ts`'s `IOS_TIER_MIN_GENERATION` comment already argues for on iOS, never
+applied to Android:
 
 > *"A THRESHOLD, NOT A LIST — AND THAT IS THE WHOLE POINT. An enumerated allowlist ossifies in the
 > WORST direction… A `>= N` rule cannot fail that way, because newer silicon is only ever faster."*

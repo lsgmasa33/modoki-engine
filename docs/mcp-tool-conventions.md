@@ -40,11 +40,12 @@ not outrank #1.
 misspelled key is a **refusal** naming the tool's real parameter names — never silently dropped.
 
 Why: zod strips unknown keys by default, and the MCP SDK builds a plain `z.object` (no `.strict()`)
-— verified at `@modelcontextprotocol/sdk/.../zod-compat.js:14`. For a tool whose params are all
-optional, that turns a typo into **a different operation**: `modoki_set_selection {name:'Capsule'}`
-(no such param) parses to `{}`, which that tool documents as "no refs = clear", so it **clears the
-human's selection and reports success**. That was measured, fixed for `modoki_batch`'s pre-flight —
-and left in place for every direct call, which is where most calls happen (V2).
+— verified in `@modelcontextprotocol/sdk`'s `objectFromShape` (`.../zod-compat.js`). For a tool
+whose params are all optional, that turns a typo into **a different operation**:
+`modoki_set_selection {name:'Capsule'}` (no such param) parses to `{}`, which that tool documents as
+"no refs = clear", so it **clears the human's selection and reports success**. That was measured,
+fixed for `modoki_batch`'s pre-flight — and left in place for every direct call, which is where
+most calls happen (V2).
 
 Corollaries:
 - `modoki_batch`'s envelope itself is strict too, including **inside** each step object: `arg` for

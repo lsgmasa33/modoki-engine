@@ -14,6 +14,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { applyRendererColorConfig } from '../../runtime/rendering/scene3DSync';
 import { frameCameraToBoxFixed } from '../scene/sceneViewMath';
+import { noteGpuContextCreated, noteGpuContextDestroyed } from '../../runtime/core/gpuContextTracking';
 
 export interface PreviewSceneHandle {
   scene: THREE.Scene;
@@ -47,6 +48,15 @@ export function createPreviewScene(container: HTMLElement, opts: PreviewSceneOpt
 
   // Throws in a WebGL-less environment (jsdom) — the caller catches.
   const renderer = new THREE.WebGLRenderer({ antialias: true });
+  // Fix 3 of #590's adversarial review (docs/plans/ios-rendering-update-wedge.md): this is
+  // `src/editor` — dev-only, never shipped in a game build — but it creates a REAL WebGL
+  // context, and an editor session (SceneView + GameView + this preview + ModelPreview +
+  // ShaderPreview all open) is exactly the surface that approaches `SOFT_CONTEXT_LIMIT`. Noted
+  // after a successful construction (never before — see `noteGpuContextCreated`'s doc), paired
+  // with a `contextLive`-guarded decrement in `dispose()` below so a stray double-dispose can't
+  // decrement twice.
+  noteGpuContextCreated();
+  let contextLive = true;
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(width, height);
   renderer.setClearColor(background, 1);
@@ -145,6 +155,7 @@ export function createPreviewScene(container: HTMLElement, opts: PreviewSceneOpt
     // it deterministically on unmount.
     renderer.forceContextLoss();
     renderer.dispose();
+    if (contextLive) { contextLive = false; noteGpuContextDestroyed(); }
     try { container.removeChild(renderer.domElement); } catch { /* already gone */ }
   };
 

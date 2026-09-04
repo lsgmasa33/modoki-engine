@@ -58,14 +58,14 @@ accelerator and as a renderer binding fires once, because the renderer's `preven
 suppresses the menu path. The menu keeps its `shortcut:` labels purely as display.
 
 **Worked example — ⌘⇧N, measured 2026-07-22.** It is bound twice: the Electron menu's
-"New Project…" (`engine/electron/projects.ts:225`) and Assets' New Folder
-(`editor/panels/Assets.tsx:1433`). With the **Assets panel focused**, a physical press creates a
-folder and the New Project dialog does **not** open — single dispatch, Assets wins. Two things
-this pins that the contract alone did not:
+"New Project…" (`engine/electron/projects.ts`'s `installAppMenu`) and Assets' New Folder
+(`editor/panels/Assets.tsx`'s `handleKeyDown`, `'new-folder'` case). With the **Assets panel
+focused**, a physical press creates a folder and the New Project dialog does **not** open —
+single dispatch, Assets wins. Two things this pins that the contract alone did not:
 
 - It holds for a **raw DOM handler**, not just registry bindings — Assets' handler is
-  element-scoped and outside the keymap (`TODO(P8)` at `Assets.tsx:1427`), yet its
-  `preventDefault()` still suppresses the native accelerator.
+  element-scoped and outside the keymap (the `TODO(P8)` comment above `Assets.tsx`'s
+  `handleKeyDown`), yet its `preventDefault()` still suppresses the native accelerator.
 - The outcome had been asserted twice from theory ("swallowed by New Project", then
   "double-fires") and **both were wrong**. It is also not answerable by tooling: synthesized
   input never reaches a native accelerator, and macOS focus-stealing prevention blocks an agent

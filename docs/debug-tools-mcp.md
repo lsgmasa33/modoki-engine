@@ -1693,9 +1693,10 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   `installDeviceConsoleCapture.ts`'s own comment both claimed: rolldown **inlines** all four
   side-effect module bodies into the ENTRY CHUNK's body, and by ES semantics an entry body runs only
   after every static import has evaluated. The bundler converts the side-effect IMPORT — the one
-  construct `main.tsx:8-11` says runs early enough — into a body STATEMENT, which those same comments
-  say is too late. Measured on a `--target web` build: install call at entry byte ~188k, last static
-  import ends at ~4.7k, the game's chunk is import #25 of 25.
+  construct `main.tsx`'s `import './installDeviceConsoleCapture'` says runs early enough — into a
+  body STATEMENT, which those same comments say is too late. Measured on a `--target web` build:
+  install call at entry byte ~188k, last static import ends at ~4.7k, the game's chunk is
+  import #25 of 25.
   - **A wrong theory worth keeping:** "trim the installer's imports so the bundler stops deferring
     it." The install graph is already minimal (`consoleRing` → `clock`) and trimming changes nothing,
     because the body still runs last. Any fix that depends on chunk-assignment behaviour is a fix a
@@ -1720,10 +1721,11 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   are indistinguishable — the same trap `modoki_capture_viewport` sets for render bugs.
 
   ⚠️ **A wrong theory worth keeping**, because the code still invites it: #597 argued the in-game ring
-  was "the latest of the three by a wide margin" because `App.tsx:709` reaches it through
+  was "the latest of the three by a wide margin" because `App.tsx`'s `DebugMenu` reaches it through
   `lazy(() => import('@modoki/engine/runtime/debug'))`. It is not — it was **tied** with agentBridge's.
-  `editor/rendering/GameView.tsx:16` imports that same barrel **STATICALLY**, so in the editor it was
-  never lazy at all. Two import paths to one module, and only one of them was read.
+  `editor/rendering/GameView.tsx`'s `import { DebugMenu } from '../../runtime/debug'` imports
+  that same barrel **STATICALLY**, so in the editor it was never lazy at all. Two import paths
+  to one module, and only one of them was read.
 
   Three traps this fix had to route around, each of which passed a test first:
   - **A shared ring must not be gated more narrowly than any consumer it serves.** Backfilling from
@@ -1731,10 +1733,11 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
     (`__MODOKI_DEBUG_BUILD__ && isNativePlatform()`) is false while the in-game ring is present. The
     eager installer carries its own union gate, and `deviceConsoleCaptureInstallOrder.test.ts` pins
     that it is deliberately NOT byte-identical to the bridge's.
-  - **Never route a synthetic ring entry back through `console.error`.** `globalErrors.ts:490` wraps
-    it for Crashlytics and dedups only on a sole `Error` OBJECT (`:385-389`), so a synthetic STRING
-    files a SECOND issue per uncaught fault — the "two issues per fault" regression measured at
-    `globalErrors.ts:366-377`. `recordConsoleRingEntry()` writes straight in.
+  - **Never route a synthetic ring entry back through `console.error`.** `globalErrors.ts`'s
+    `installGlobalErrorHandlers` wraps it for Crashlytics, and `captureConsoleError` dedups only
+    on a sole `Error` OBJECT, so a synthetic STRING files a SECOND issue per uncaught fault — the
+    "two issues per fault" regression `alreadyReported`'s comment measures.
+    `recordConsoleRingEntry()` writes straight in.
   - **Clear is a per-consumer watermark, never a truncation.** The in-game Console tab's Clear button
     would otherwise wipe the buffer behind `modoki_get_console_logs`/`diagnose` — on device, the only
     usable log surface — so a human tidying a screen would destroy the agent's evidence.

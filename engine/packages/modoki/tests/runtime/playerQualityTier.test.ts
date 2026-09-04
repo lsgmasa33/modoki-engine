@@ -6,7 +6,10 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-vi.mock('../../src/runtime/core/activeRenderer', () => ({ getActiveRenderer: () => null }));
+// `onRendererLost` is required — frameDriver.ts subscribes to it UNCONDITIONALLY at module load
+// (the GPU-fault latch for #590 defect 3/6), so an incomplete mock throws "No onRendererLost
+// export" the moment anything here transitively imports frameDriver.
+vi.mock('../../src/runtime/core/activeRenderer', () => ({ getActiveRenderer: () => null, onRendererLost: () => () => {} }));
 vi.mock('../../src/runtime/rendering/resizeBus', () => ({ forceResizeAllSurfaces: () => {} }));
 vi.mock('../../src/runtime/core/frameProfiler', async (orig) => {
   const actual = await orig<typeof import('../../src/runtime/core/frameProfiler')>();

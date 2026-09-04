@@ -44,6 +44,15 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { hasInternalGames } from '../helpers/repoLayout';
+import {
+  citesALine,
+  citesALineByMarker,
+  citesALineInProse,
+  codeSpans,
+  codeTokens,
+  isBareLineSpan,
+  nonCodeText,
+} from '../helpers/lineCitations.js';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 
@@ -1144,6 +1153,136 @@ function scanSourcePathCitations(
   }
   return offenders;
 }
+
+describe('docs cite by SYMBOL, never by line number (#686)', () => {
+  /**
+   * The `qa/` half of this rule lives in `qaCaseReferences.test.ts`; both import the same detectors
+   * from `helpers/lineCitations.ts`, because a duplicated detector is one that drifts.
+   *
+   * ⚠️ **Scope is top-level `docs/*.md` ONLY, and the two exclusions are deliberate, not laziness:**
+   *
+   * - `docs/reviews/**` is **immutable** by `docs/doc-conventions.md` — "a dated point-in-time
+   *   audit… never updated, only superseded by a newer one". A guard that demands edits to a doc
+   *   the conventions forbid editing is a guard that gets deleted. Those citations stay.
+   * - `docs/plans/**` are in-flight trackers, written and rewritten daily by other clones. Their
+   *   citations rot like any other, but a tracker is folded into its feature doc and DELETED when
+   *   it lands, so the cost of policing them recurs while the benefit does not.
+   *
+   * That leaves the durable feature docs, which is the set this guards. ⚠️ No counts are frozen
+   * into this comment — a measurement of a corpus five clones edit goes stale and then reads as
+   * fact, which is the hazard this file's own finding-10 fix deleted two numbers for. The reasoning
+   * matters because #686 originally claimed the opposite — that half the surface was landed plans
+   * ripe for deletion. Nothing in `plans/` was landed; acting on that would have deleted another
+   * clone's authoritative tracker.
+   */
+  /**
+   * Bare spans that are NOT line numbers, keyed file+token so the exemption cannot widen.
+   *
+   * A 4-digit bare span is genuinely ambiguous — `:8100` is WebDriverAgent's port, and a file long
+   * enough to have a line 8100 exists in this repo too. Allowlisting is the narrow instrument;
+   * mangling the value to satisfy the tool is the outcome this whole convention exists to avoid.
+   */
+  const BARE_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
+    { file: 'docs/trusted-device-input.md', token: ':8100' },
+  ];
+
+  /**
+   * Exceptions for the token and prose forms. Empty today, and present anyway.
+   *
+   * Without them the only way to excuse one legitimate citation in one doc is to widen a detector
+   * in `helpers/lineCitations.ts` — which is SHARED with the `qa/` gate, so a `docs/` exception
+   * would silently punch a hole in the rule covering every QA case. An allowlist keyed file+token
+   * is the narrow instrument; the detector is not.
+   */
+  const TOKEN_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [];
+  const PROSE_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [];
+  const MARKER_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [];
+
+  function featureDocs(): Array<{ rel: string; body: string }> {
+    const dir = path.join(repoRoot, 'docs');
+    if (!fs.existsSync(dir)) return [];
+    return fs
+      .readdirSync(dir)
+      // `doc-conventions.md` is the SPEC for this rule and has to quote every shape it forbids —
+      // the same reason `qa/README.md` sits outside the qa gate, and the same reason the path
+      // check next door skips README (it documents `creates:` by example). A spec that cannot
+      // state its own rule is worse than an unguarded spec.
+      .filter((f) => f.endsWith('.md') && f !== 'doc-conventions.md')
+      .sort()
+      .map((f) => ({ rel: `docs/${f}`, body: fs.readFileSync(path.join(dir, f), 'utf8') }));
+  }
+
+  it('the enumeration found the docs — a vacuous pass is a failure', () => {
+    // Collection, not assertion. A perfect assertion over an empty collection is green and
+    // worthless, and `featureDocs` reads ONE directory by name.
+    //
+    // ⚠️ This used to gate on `hasFullDocsTree()`, which requires `docs/plans` — a directory the
+    // OSS snapshot deliberately EXCLUDES. So on the public runner both of these tests returned
+    // early and passed vacuously, over exactly the durable docs that DO ship there. Gate on what
+    // the rule actually needs: some docs to read.
+    expect(featureDocs().length).toBeGreaterThan(0);
+    // The full private tree carries far more; only a broken collection trips this.
+    if (hasFullDocsTree()) expect(featureDocs().length).toBeGreaterThan(20);
+  });
+
+  it('no doc cites a source location by line', () => {
+    const docs = featureDocs();
+    if (docs.length === 0) return; // no docs shipped in this tree at all
+    const offenders: string[] = [];
+    const allowed = (
+      list: ReadonlyArray<{ file: string; token: string }>,
+      rel: string,
+      tok: string,
+    ) => list.some((a) => a.file === rel && a.token === tok.trim());
+    for (const { rel, body } of docs) {
+      // `codeTokens`, NOT a whitespace split. `citesALine`'s contract is a code-span token, and
+      // feeding it raw whitespace tokens broke it in both directions:
+      //   MISSED  — markdown and English wrap citations: `` **`videoService.ts:135`** `` and
+      //             `` `projects.ts:40`'s claim ``. Two live citations in these very docs were
+      //             invisible to the split, and the possessive form is the style THIS SWEEP
+      //             ADOPTED — so the likeliest regression was the one thing the gate could not see.
+      //   FLAGGED — two adjacent spans fuse across the whitespace into one token containing a `/`
+      //             (`` `ok:true`/`changed:1` ``), hitting the path shortcut. `codeTokens` splits
+      //             INSIDE each span, so this false positive exists only for the split.
+      for (const token of codeTokens(body)) {
+        if (citesALine(token) && !allowed(TOKEN_ALLOWED, rel, token)) {
+          offenders.push(`${rel}: "${token}"`);
+        }
+      }
+      // …and the PROSE, because `codeTokens` reads only spans and fences. Switching to it fixed a
+      // false positive but silently narrowed the gate: an UNBACKTICKED `saveSync.ts:1745` in a
+      // heading, a markdown link label or a table cell became invisible to all four detectors.
+      // `nonCodeText` blanks the spans first, so this recovers those without re-fusing adjacent
+      // spans into one slash-bearing token.
+      for (const token of nonCodeText(body).split(/\s+/)) {
+        if (citesALine(token) && !allowed(TOKEN_ALLOWED, rel, token)) {
+          offenders.push(`${rel}: "${token}"`);
+        }
+      }
+      for (const span of codeSpans(body)) {
+        if (isBareLineSpan(span) && !allowed(BARE_ALLOWED, rel, span)) {
+          offenders.push(`${rel}: "${span}"`);
+        }
+      }
+      for (const m of citesALineInProse(body)) {
+        if (!allowed(PROSE_ALLOWED, rel, m)) offenders.push(`${rel}: "${m}"`);
+      }
+      // The `~L202` marker — invisible to both detectors above (no filename attached after a
+      // whitespace split, and no literal "line" for the prose rule).
+      for (const m of citesALineByMarker(body)) {
+        if (!allowed(MARKER_ALLOWED, rel, m)) offenders.push(`${rel}: "${m}"`);
+      }
+    }
+    expect(
+      offenders,
+      'Cite the SYMBOL, not the line (#686) — name the function, export, action id or route ' +
+        'instead of a line number, which rots silently and no test can check. If a hit is ' +
+        'legitimate, add it to this file\'s TOKEN_ALLOWED / BARE_ALLOWED / PROSE_ALLOWED / ' +
+        'MARKER_ALLOWED with a reason; do NOT loosen helpers/lineCitations.ts, which another gate ' +
+        'shares. (Rationale lives in docs/doc-conventions.md, which is not in the OSS snapshot.)',
+    ).toEqual([]);
+  });
+});
 
 describe('source paths cited in docs and CLAUDE.md resolve (#194, second face; #195)', () => {
   it('every runtime/editor/engine source path cited in docs/** or a CLAUDE.md exists', (ctx) => {

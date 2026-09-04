@@ -211,6 +211,35 @@ describe('canvas2DPool', () => {
     });
   });
 
+  // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): the GPU-memory report's per-slot
+  // byte attribution walks EXACTLY the slots this accessor returns.
+  describe('getSlotsForMemoryReport', () => {
+    it('is empty with no allocated slots', async () => {
+      const pool = await getModule();
+      expect(pool.getSlotsForMemoryReport()).toEqual([]);
+    });
+
+    it('returns one entry per live entity, with its entity id and container', async () => {
+      const pool = await getModule();
+      const s1 = pool.allocate(10)!;
+      const s2 = pool.allocate(20)!;
+      const slots = pool.getSlotsForMemoryReport();
+      expect(slots).toHaveLength(2);
+      expect(slots.map((s: any) => s.entityId).sort()).toEqual([10, 20]);
+      const forTen = slots.find((s: any) => s.entityId === 10)!;
+      expect(forTen.container).toBe(s1.container);
+      expect(slots.find((s: any) => s.entityId === 20)!.container).toBe(s2.container);
+    });
+
+    it('drops a slot once it is fully reclaimed', async () => {
+      const pool = await getModule();
+      pool.allocate(30);
+      expect(pool.getSlotsForMemoryReport()).toHaveLength(1);
+      pool.release(30); // no mount claim either, so this reclaims immediately
+      expect(pool.getSlotsForMemoryReport()).toEqual([]);
+    });
+  });
+
   // Two-claim ownership: a slot has a sim claim (Scene2D allocate/release) and a
   // mount claim (Canvas2DMount mount/unmount); it's reclaimed only when BOTH drop.
   describe('mount/unmount ownership (F5/F6)', () => {

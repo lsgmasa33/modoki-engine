@@ -394,6 +394,51 @@ describe('scene3DSync', () => {
       expect(instances[0].forceWebGL).toBe(true);
     });
 
+    // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): the shared GL/GPU-context
+    // counter (`core/gpuContextTracking.ts`) must be noted exactly once per renderer that
+    // actually reaches a live state — never for a fallback attempt that was disposed before it
+    // got there, and never twice for the same context on a repeated `dispose()`.
+    describe('GPU-context tracking (Phase 3 of #590)', () => {
+      it('counts the SUCCESSFUL renderer only — the disposed, failed WebGPU attempt is never paired', async () => {
+        const { instances } = rendererMock.state;
+        rendererMock.state.initFor = (forceWebGL) =>
+          forceWebGL ? Promise.resolve() : Promise.reject(new Error('webgpu init failed'));
+        vi.doMock('../../src/runtime/rendering/gpuDetect', () => ({ getWebGPUSupported: async () => true }));
+        mockSceneSyncDeps();
+
+        const { makeWebGPURenderer } = await import('../../src/runtime/rendering/scene3DSync');
+        const { liveGpuContextCount } = await import('../../src/runtime/core/gpuContextTracking');
+        const container: any = { clientWidth: 800, clientHeight: 600, appendChild: vi.fn() };
+
+        expect(liveGpuContextCount()).toBe(0);
+        const r: any = await makeWebGPURenderer(container);
+        expect(instances).toHaveLength(2); // the failed WebGPU attempt + the working WebGL2 one
+        // A careless version of this pairing would note BOTH attempts created (or note the
+        // create before knowing which one survives) and read 2 here instead of 1.
+        expect(liveGpuContextCount()).toBe(1);
+
+        r.dispose();
+        expect(liveGpuContextCount()).toBe(0);
+        // A repeated dispose() must not decrement a second time — the counter would go negative
+        // (or, since it floors at zero, silently under-count the NEXT context created).
+        r.dispose();
+        expect(liveGpuContextCount()).toBe(0);
+      });
+
+      it('never notes a context for a renderer whose init failed outright (no fallback to try)', async () => {
+        rendererMock.state.initFor = () => Promise.reject(new Error('gl init failed'));
+        vi.doMock('../../src/runtime/rendering/gpuDetect', () => ({ getWebGPUSupported: async () => false }));
+        mockSceneSyncDeps();
+
+        const { makeWebGPURenderer } = await import('../../src/runtime/rendering/scene3DSync');
+        const { liveGpuContextCount } = await import('../../src/runtime/core/gpuContextTracking');
+        const container: any = { clientWidth: 800, clientHeight: 600, appendChild: vi.fn() };
+
+        await expect(makeWebGPURenderer(container)).rejects.toThrow('gl init failed');
+        expect(liveGpuContextCount()).toBe(0);
+      });
+    });
+
     /** #56: the FIRST buffer must already honour `max`. The clamp used to live only in
      *  Scene3D's ResizeObserver, so a `max`-mode game allocated one full-resolution
      *  drawing buffer at mount — precisely the allocation the mode exists to avoid, and

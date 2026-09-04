@@ -42,14 +42,15 @@ state. Two viewports showing the same clip get two GPU textures over that one de
 what the per-surface binding tables exist to make possible.
 
 ⚠️ **On the TEXTURE surfaces the live `<video>` element is never attached to the DOM.**
-`videoService.ts:135`'s `playVideo` does `document.createElement('video')`, and for a 3D screen or a
+`videoService.ts`'s `playVideo` does `document.createElement('video')`, and for a 3D screen or a
 2D sprite nothing ever `appendChild`s it — those surfaces only COPY frames off a detached element.
 So `document.querySelector('video')` finds nothing for them however healthy playback is, and the one
 reach-in is `videoElementFor(entityId)` (`runtime/video/videoSystem.ts`).
 
 **The two DOM surfaces are the exception, and they adopt that same element rather than making
-their own**: `UIVideoMount.tsx:96` and `VideoOverlay.tsx:95` both `host.appendChild(el)`. So while a
-UI-mounted or fullscreen-overlay player is active, `querySelector('video')` DOES find it. Decide
+their own**: `UIVideoMount.tsx`'s `UIVideoMount` and `VideoOverlay.tsx`'s `VideoOverlay` both
+`host.appendChild(el)`. So while a UI-mounted or fullscreen-overlay player is active,
+`querySelector('video')` DOES find it. Decide
 which surface you are debugging before concluding the element is missing.
 
 ⚠️ **The DOM surfaces are the exception: they cannot be duplicated.** A texture surface COPIES
@@ -260,8 +261,9 @@ index, while the *persisted* index still claimed them. Reloading resurrects thos
 would genuinely fit. Both are now the same shape as `clear()`'s fix: persist whatever was actually
 freed before the failure propagates. `doFetch` still aborts the fetch on an eviction failure — it
 genuinely cannot proceed if it couldn't free the space — only the bookkeeping changed.
-`pipeline.ts:114` calls `reconcile()` fire-and-forget on boot, so this self-heals, but there's a
-real window where an admission decision can see the inflated index before the repair lands.
+`pipeline.ts`'s `void videoCache.reconcile()` runs fire-and-forget on boot, so this self-heals,
+but there's a real window where an admission decision can see the inflated index before the
+repair lands.
 
 ⚠️ **Nothing calls `clear()` today** — no caller in `engine/`, `games/` or `demos/`, and
 `ActiveVideoCache` (`videoCacheSlot.ts`) does not expose it, so `modoki_diagnose` cannot reach it

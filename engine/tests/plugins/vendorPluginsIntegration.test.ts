@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as tar from 'tar';
-import { pluginHashInputs, compareTarballToSource, stampPluginBuild } from '../../plugins/vendorPlugins';
+import { pluginHashInputs, compareTarballToSource, stampPluginBuild, vendorEnginePlugins, pluginContentHash, readPackedVersion } from '../../plugins/vendorPlugins';
 import { buildPluginsWorkspaces, plannedStampDirs } from '../../scripts/stamp-plugin-builds.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -248,6 +248,190 @@ describe('compareTarballToSource detects a tarball whose NAME is fine and whose 
     fs.writeFileSync(path.join(pluginDir, 'ios', 'Tests', 'PluginTests.swift'), '// edited tests\n');
     expect(compareTarballToSource(tarball, pluginDir).drift).toEqual([]);
   });
+});
+
+// ── #685: a re-vendored tarball's FILENAME hash changes but its packed VERSION didn't, so npm's
+// `file:` resolver saw "already satisfied" and skipped extraction — an APK/IPA silently shipped
+// the PREVIOUS plugin. The fix: packInto writes `<base>-<hash>` into the PACKED package.json
+// (never the committed source) for the duration of `npm pack`. These two blocks cover the two
+// halves: compareTarballToSource must tolerate exactly that version diff (below, using the same
+// hand-rolled real-tar fixture as the block above), and packInto's actual `npm pack` output must
+// really carry it (further below, via a real, unmocked vendorEnginePlugins). ───────────────────
+describe('compareTarballToSource tolerates the #685 packed-version suffix, nothing else', () => {
+  const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tgz-verdrift-'));
+  afterAll(() => fs.rmSync(tmp2, { recursive: true, force: true }));
+
+  const pluginDir2 = path.join(tmp2, 'plugin');
+  const tarball2 = path.join(tmp2, 'fixture.tgz');
+
+  function writePlugin2(native: string) {
+    fs.rmSync(pluginDir2, { recursive: true, force: true });
+    fs.mkdirSync(path.join(pluginDir2, 'ios', 'Sources'), { recursive: true });
+    fs.writeFileSync(path.join(pluginDir2, 'package.json'), JSON.stringify({
+      name: 'capacitor-fixture2', version: '1.0.0', files: ['ios/Sources/'],
+    }, null, 2) + '\n');
+    fs.writeFileSync(path.join(pluginDir2, 'ios', 'Sources', 'Plugin.swift'), native);
+  }
+
+  /** Pack the plugin the way packInto does (#685): a HASH-SUFFIXED version (`h`-prefixed, per
+   *  packedVersion) in the PACKED package.json, with the source's own package.json restored to
+   *  its original bytes immediately after — so this fixture exercises the exact shape
+   *  compareTarballToSource must tolerate, without going through a real `npm pack`. */
+  function packWithHashSuffixedVersion(hash: string) {
+    const pj = path.join(pluginDir2, 'package.json');
+    const original = fs.readFileSync(pj);
+    const pkg = JSON.parse(original.toString('utf8'));
+    pkg.version = `1.0.0-h${hash}`;
+    fs.writeFileSync(pj, JSON.stringify(pkg, null, 2) + '\n');
+    try {
+      const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tgz-stage2-'));
+      fs.cpSync(pluginDir2, path.join(stage, 'package'), { recursive: true });
+      tar.create({ file: tarball2, sync: true, gzip: true, cwd: stage }, ['package']);
+      fs.rmSync(stage, { recursive: true, force: true });
+    } finally {
+      fs.writeFileSync(pj, original);
+    }
+  }
+
+  it('a tarball packed with the hash-suffixed version matches — the version diff alone is not drift', () => {
+    writePlugin2('// v1 native\n');
+    packWithHashSuffixedVersion('9ff1f461');
+    expect(compareTarballToSource(tarball2, pluginDir2).drift).toEqual([]);
+  });
+
+  it('still reports drift when a DIFFERENT file is stale, even though the tarball IS hash-suffixed', () => {
+    writePlugin2('// v1 native\n');
+    packWithHashSuffixedVersion('9ff1f461');
+    fs.writeFileSync(path.join(pluginDir2, 'ios', 'Sources', 'Plugin.swift'), '// v2 native — changed after pack\n');
+    expect(compareTarballToSource(tarball2, pluginDir2).drift)
+      .toEqual([{ path: 'ios/Sources/Plugin.swift', kind: 'bytes-differ' }]);
+  });
+
+  it('still reports drift on package.json itself when a NON-version field is stale', () => {
+    writePlugin2('// v1 native\n');
+    packWithHashSuffixedVersion('9ff1f461');
+    const pj = path.join(pluginDir2, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pj, 'utf8'));
+    pkg.name = 'capacitor-fixture2-renamed';
+    fs.writeFileSync(pj, JSON.stringify(pkg, null, 2) + '\n');
+    expect(compareTarballToSource(tarball2, pluginDir2).drift)
+      .toEqual([{ path: 'package.json', kind: 'bytes-differ' }]);
+  });
+});
+
+/** A throwaway engine root + project, vendoring a minimal plugin with no `src/` (so no build is
+ *  ever attempted — `canBuild:false` stays honest) through the REAL, unmocked
+ *  vendorEnginePlugins — real `npm pack`, real gzip tarball, exactly what a clone runs. Shared
+ *  by the two #685 describe blocks below. */
+function makeFixture685() {
+  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor685-proj-'));
+  const engineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor685-eng-'));
+  const pluginDir = path.join(engineRoot, 'engine', 'packages', 'capacitor-fixture685');
+  fs.mkdirSync(path.join(pluginDir, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, 'package.json'), JSON.stringify({
+    name: 'capacitor-fixture685', version: '1.0.0', capacitor: { android: {}, ios: {} },
+  }, null, 2) + '\n');
+  fs.writeFileSync(path.join(pluginDir, 'dist', 'index.js'), '// built\n');
+  fs.writeFileSync(path.join(projectRoot, 'package.json'), JSON.stringify({
+    name: 'vendor685-smoke', version: '0.0.0', dependencies: { 'capacitor-fixture685': '*' },
+  }, null, 2) + '\n');
+  return { projectRoot, engineRoot, pluginDir };
+}
+
+describe('packInto (#685): the REAL npm-packed tarball carries the hash-suffixed version', () => {
+
+  it('the packed package.json version is <base>-h<hash>, and the PUBLISHED filename carries no h', () => {
+    const { projectRoot, engineRoot, pluginDir } = makeFixture685();
+    try {
+      const r = vendorEnginePlugins(projectRoot, engineRoot, { canBuild: false });
+      expect(r.changed).toBe(true);
+
+      const pluginsDir = path.join(projectRoot, 'plugins');
+      const tgzName = fs.readdirSync(pluginsDir).find((f) => f.endsWith('.tgz'));
+      expect(tgzName).toBeTruthy();
+      const hash = tgzName!.match(/-([0-9a-f]{8})\.tgz$/)?.[1];
+      expect(hash).toBeTruthy();
+      // The PUBLISHED filename (tarballName/destName) never carries the `h` — confirms
+      // packInto's "find whatever .tgz npm produced, then copy it to destName" path actually
+      // runs and renames npm's own `<name>-1.0.0-h<hash>.tgz` output to the un-prefixed name.
+      expect(tgzName).toBe(`capacitor-fixture685-1.0.0-${hash}.tgz`);
+
+      const extractDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor685-extract-'));
+      try {
+        tar.extract({ file: path.join(pluginsDir, tgzName!), cwd: extractDir, sync: true });
+        const packedPkg = JSON.parse(fs.readFileSync(path.join(extractDir, 'package', 'package.json'), 'utf8'));
+        // The PACKED version, by contrast, DOES carry the `h` (#685 semver fix).
+        expect(packedPkg.version).toBe(`1.0.0-h${hash}`);
+      } finally {
+        fs.rmSync(extractDir, { recursive: true, force: true });
+      }
+      // The COMMITTED source stays on its bare base version — only the packed copy carries
+      // the suffix.
+      expect(JSON.parse(fs.readFileSync(path.join(pluginDir, 'package.json'), 'utf8')).version).toBe('1.0.0');
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+      fs.rmSync(engineRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('packInto restores the plugin source package.json byte-identical after a REAL npm pack', () => {
+    const { projectRoot, engineRoot, pluginDir } = makeFixture685();
+    const originalBytes = fs.readFileSync(path.join(pluginDir, 'package.json'));
+    try {
+      const r = vendorEnginePlugins(projectRoot, engineRoot, { canBuild: false });
+      expect(r.changed).toBe(true);
+      expect(fs.readFileSync(path.join(pluginDir, 'package.json')).equals(originalBytes)).toBe(true);
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+      fs.rmSync(engineRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+// ── #685 follow-up: the re-pack trigger fires on NAME-correct/VERSION-stale, and is idempotent ──
+// A same-NAMED committed tarball (hash already matches current content — the `!fs.existsSync`
+// fast path alone would call this "up to date") can still carry a bare/wrong PACKED version —
+// exactly the state every one of the 22 real projects committed before packInto started writing
+// packedVersion. This is the mutation check the owner asked for: build that exact bare-version
+// state by hand (no re-vendor of any real project involved), confirm the vendorer heals it IN
+// PLACE under the same filename, and confirm a second run does not re-pack again (no churn loop).
+describe('vendorEnginePlugins: the #685 packed-version staleness trigger', () => {
+  it('re-packs a same-named tarball whose PACKED version is still bare, then is idempotent', () => {
+    const { projectRoot, engineRoot } = makeFixture685();
+    try {
+      const pluginDir = path.join(engineRoot, 'engine', 'packages', 'capacitor-fixture685');
+      const hash = pluginContentHash(pluginDir);
+      const destName = `capacitor-fixture685-1.0.0-${hash}.tgz`;
+      const pluginsDir = path.join(projectRoot, 'plugins');
+      fs.mkdirSync(pluginsDir, { recursive: true });
+
+      // Hand-build the exact pre-migration state: the tarball's NAME is already current (this
+      // IS the plugin's real content hash), but its packed package.json is a bare `1.0.0` — no
+      // `npm pack` / packInto involved, so this in no way depends on the fix under test.
+      const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor685-bare-'));
+      fs.mkdirSync(path.join(stage, 'package'), { recursive: true });
+      fs.writeFileSync(path.join(stage, 'package', 'package.json'), JSON.stringify({
+        name: 'capacitor-fixture685', version: '1.0.0', capacitor: { android: {}, ios: {} },
+      }, null, 2) + '\n');
+      tar.create({ file: path.join(pluginsDir, destName), sync: true, gzip: true, cwd: stage }, ['package']);
+      fs.rmSync(stage, { recursive: true, force: true });
+      expect(readPackedVersion(path.join(pluginsDir, destName))).toBe('1.0.0'); // precondition
+
+      const first = vendorEnginePlugins(projectRoot, engineRoot, { canBuild: false });
+      expect(first.changed).toBe(true); // must re-pack despite the already-correct filename
+
+      // Healed IN PLACE — same filename, packed version now carries the hash (#685 + h-prefix).
+      expect(fs.readdirSync(pluginsDir).filter((f) => f.endsWith('.tgz'))).toEqual([destName]);
+      expect(readPackedVersion(path.join(pluginsDir, destName))).toBe(`1.0.0-h${hash}`);
+
+      // Idempotent: a second immediate run must NOT re-pack again (no churn loop).
+      const second = vendorEnginePlugins(projectRoot, engineRoot, { canBuild: false });
+      expect(second.changed).toBe(false);
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+      fs.rmSync(engineRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 // ── stampPluginBuild: the postinstall's stamp must mean what ensurePluginBuilt means (#395) ──

@@ -46,6 +46,7 @@ export type { GameDefinition, EditorPanelDef } from './core/gameDefinition';
 export {
   registerAppServices, appServices, clearAppServices, onAppServicesRegistered,
   type AppServices, type CrashlyticsService, type AdsService, type AttributionService,
+  type NativeDialogService,
 } from './core/appServices';
 // Global JS error capture -> the `crashlytics` service (#275). The test seam
 // (`__resetGlobalErrorsForTest`) is deliberately NOT here — a test imports the module directly,
@@ -246,6 +247,12 @@ export {
   acquireRiggedModel, releaseRiggedModelsForScene, ensureRiggedModelLoaded,
   getRiggedModel, getClipNames, getBoneNames, disposeAllRiggedModels, type RiggedModel,
 } from './loaders/riggedModelCache';
+// GPU-memory report (Phase 3 of #590, docs/plans/ios-rendering-update-wedge.md) — 3D bytes read
+// straight from `renderer.info.memory` and 2D (PixiJS) bytes computed per canvas2DPool slot
+// (compressed-format-aware), plus the live GL-context count, sampled on an interval that survives
+// a dead frame loop. `getGpuMemoryReport()` returns the most recent sample (or null before the
+// first one); sampling itself starts/stops with the game loop (`useGameLoop.ts`).
+export { getGpuMemoryReport, type GpuMemoryReport } from './loaders/gpuMemoryReport';
 export { loadGLB } from './loaders/loadGLB';
 export {
   rendererReady, setActiveRenderer, loadTexture3D, releaseTexture3D, onRendererReady,
@@ -487,9 +494,11 @@ export {
   registerFrameCallback, unregisterFrameCallback,
   startFrameDriver, stopFrameDriver, stepOneFrame,
   setTargetFPS, targetFPS, getCurrentFPS, getFrameLoopHealth,
+  onFrameLoopUnrecoverable,
   PRIORITY_ECS, PRIORITY_RENDER_3D, PRIORITY_RENDER_2D,
 } from './rendering/frameDriver';
-export type { FrameLoopHealth } from './rendering/frameDriver';
+export type { FrameLoopHealth, FrameLoopUnrecoverableInfo } from './rendering/frameDriver';
+export { installUnrecoverableFrameLoopAlert } from './rendering/unrecoverableFrameLoopAlert';
 
 // ── Render settings (project-configured renderer knobs) ──
 export {

@@ -3,6 +3,7 @@
 import * as THREE from 'three';
 import { decomposeTrs } from '../core/ecs/decomposeTrs';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
+import { noteGpuContextCreated, noteGpuContextDestroyed } from '../core/gpuContextTracking';
 import type { World } from 'koota';
 // See SceneView.tsx for the rationale on the published-entry import.
 import type { WebGPURenderer } from 'three/webgpu';
@@ -4482,6 +4483,24 @@ export async function makeWebGPURenderer(
       throw e2;
     }
   }
+  // Phase 3 of #590 (docs/plans/ios-rendering-update-wedge.md): note the context AFTER a
+  // successful init, never before — the WebGPU-then-WebGL2 fallback path above can dispose an
+  // EARLIER renderer that never reached here, and that one must not be paired with a decrement.
+  //
+  // Wrapping `dispose` — rather than requiring every caller to also call
+  // `noteGpuContextDestroyed()` — is what makes every existing `renderer.dispose()` call site
+  // correct for free, with no second call site to keep in sync: Scene3D's unmount and rebuild
+  // paths, the KTX2 caps probe's throwaway renderer (`capsProbeRenderer.ts` via
+  // `textureResolver.ts`'s `probe?.dispose()`), and the editor's SceneView/ParticleEditor viewports
+  // all just call `.dispose()` as they already did. Guarded so a stray double-dispose can't
+  // decrement twice for one context.
+  noteGpuContextCreated();
+  let contextLive = true;
+  const rawDispose = r.dispose.bind(r);
+  r.dispose = (...args: Parameters<typeof rawDispose>) => {
+    if (contextLive) { contextLive = false; noteGpuContextDestroyed(); }
+    return rawDispose(...args);
+  };
   return r;
 }
 

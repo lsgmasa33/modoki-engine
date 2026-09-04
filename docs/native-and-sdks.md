@@ -35,7 +35,7 @@ Mixing CocoaPods and SPM produces duplicate-framework conflicts. Any SDK that ha
 
 SPM static linking **strips plugin classes that have no external framework dependencies**. The class compiles and links, then is simply absent at runtime, so Capacitor reports `"GameDebug" plugin is not implemented on ios`. `capacitor-game-debug` and `capacitor-modoki-ota` both hit this — each must be registered manually in `MyViewController` (`bridge?.registerPluginInstance(...)`, which keeps the class alive), plus an Xcode file reference from the App target to the plugin source (project-relative path in the pbxproj, no copy). Edit the package source only.
 
-⚠️ **Only the game-debug half is generated.** `engine/plugins/healNativeConfig.ts` writes the pbxproj reference and the fenced registration block for `GameDebugPlugin` in every project; it contains **no OTA wiring at all**. `capacitor-modoki-ota`'s pbxproj refs and its `ModokiOtaPlugin` registration are **hand-maintained, in `games/ota-test` only** — the heal is deliberately fenced rather than whole-file precisely because that project hand-extends `MyViewController.swift` with an OTA boot hook (see the comment at `healNativeConfig.ts:596`). So regenerating that project's iOS — `cap add ios`, or deleting `ios/` after a native-config problem — restores the GameDebug wiring and **silently drops OTA**. Re-add it by hand and verify the plugin registers.
+⚠️ **Only the game-debug half is generated.** `engine/plugins/healNativeConfig.ts` writes the pbxproj reference and the fenced registration block for `GameDebugPlugin` in every project; it contains **no OTA wiring at all**. `capacitor-modoki-ota`'s pbxproj refs and its `ModokiOtaPlugin` registration are **hand-maintained, in `games/ota-test` only** — the heal is deliberately fenced rather than whole-file precisely because that project hand-extends `MyViewController.swift` with an OTA boot hook (see the comment on `healNativeConfig.ts`'s `healIosGameDebugRegistration`). So regenerating that project's iOS — `cap add ios`, or deleting `ios/` after a native-config problem — restores the GameDebug wiring and **silently drops OTA**. Re-add it by hand and verify the plugin registers.
 
 ⚠️ **Those plugins' `package.json` therefore declares `"capacitor": { "android": … }` with NO `ios` entry, and that is DELIBERATE.** The App target already compiles the `.swift` directly; adding an `ios` entry makes `cap sync ios` *also* add the SPM package, so the plugin class lands in two modules — **one `@objc` runtime class name with two implementations**. (What that then does at runtime has not been observed: the ObjC runtime resolves one name to one implementation, so expect a duplicate-class warning and a nondeterministic winner rather than, say, two `NWListener`s both binding :9095. The defect is the duplication; the symptom is unverified.)
 
@@ -292,8 +292,9 @@ launch — `FirebaseApp.configure` in `AppDelegate`, Android's `FirebaseInitProv
 
 ### What Capacitor does on every navigation
 
-Both platforms call `bridge.reset()` at navigation START — `WebViewDelegationHandler.swift:45-48`,
-`BridgeWebViewClient.java:62-64`. It does exactly two things:
+Both platforms call `bridge.reset()` at navigation START — `WebViewDelegationHandler.swift`'s
+`didStartProvisionalNavigation`, `BridgeWebViewClient.java`'s `onPageStarted`. It does exactly
+two things:
 
 1. clears its saved-call map (`savedCalls` on Android, `storedCalls` on iOS)
 2. calls `removeAllListeners()` on every plugin instance, emptying each one's JS listener list
@@ -302,7 +303,7 @@ Both platforms call `bridge.reset()` at navigation START — `WebViewDelegationH
 future version with no changelog entry. Anything depending on it should cite these lines.
 
 ⚠️ **Navigation is not the only trigger.** iOS also calls `reset()` from
-`webViewWebContentProcessDidTerminate` (`WebViewDelegationHandler.swift:158-160`) — the WKWebView
+`webViewWebContentProcessDidTerminate` (`WebViewDelegationHandler.swift`) — the WKWebView
 content process being recycled while the app process lives on. That is the concrete mechanism behind
 the `sessionStorage` caveat below and in `resumeReload.ts`: the JS realm and its storage can vanish
 without any navigation, and without the native side noticing at all.
@@ -314,24 +315,25 @@ What `reset()` does **not** touch, all verified against the vendored sources (20
   every later purchase for that product (#586).
 - **`retainedEventArguments`.** A separate map from `eventListeners`, so an event fired with
   `retainUntilConsumed: true` while no listener is attached is **queued**, and drains when the next
-  realm subscribes (`Plugin.java:661-683` + `addEventListener` → `sendRetainedArgumentsForEvent`;
-  `CAPPlugin.m:82-93` is the same shape). This is the fix for a delivery landing in the reload
+  realm subscribes (`Plugin.java`'s `notifyListeners` + `addEventListener` →
+  `sendRetainedArgumentsForEvent`; `CAPPlugin.m`'s `notifyListeners:data:retainUntilConsumed:`
+  is the same shape). This is the fix for a delivery landing in the reload
   window — retention beats trying to subscribe earlier, because it closes the window instead of
   narrowing it.
 - **`webViewListeners`.** `Bridge.addWebViewListener` registrations survive every reload, which is
   what makes `WebViewListener.onPageStarted` the right seam for native-side reload cleanup on
   Android. ⚠️ There is **no `handleOnPageStarted` on `Plugin`** — the lifecycle hooks stop at
   `handleOnStart/Restart/Resume/Pause/Stop/Destroy/ActivityResult/NewIntent/ConfigurationChanged`.
-  iOS's nearest equivalent is `shouldOverrideLoad:` (`CAPPlugin.h:40`, dispatched per plugin from
-  `WebViewDelegationHandler.swift:80-87`), but it is **not** interchangeable: it is a *policy* hook,
+  iOS's nearest equivalent is `shouldOverrideLoad:` (`CAPPlugin.h`, dispatched per plugin from
+  `WebViewDelegationHandler.swift`), but it is **not** interchangeable: it is a *policy* hook,
   so an observer must return `nil` to avoid altering navigation, and it fires inside
-  `decidePolicyFor` — i.e. **before** `reset()` (`:45-47`, in `didStartProvisionalNavigation`),
-  the opposite ordering to Android's `onPageStarted`, which runs after it. So a cleanup that needs
+  `decidePolicyFor` — i.e. **before** `reset()` (in `didStartProvisionalNavigation`), the
+  opposite ordering to Android's `onPageStarted`, which runs after it. So a cleanup that needs
   "the old realm is definitively gone" has no exact iOS twin.
 
 ### Retained events are drained exactly once, ever
 
-`CAPPlugin.m:56-61` reads the retained array and then `removeObjectForKey:` — permanently. So an event emitted with
+`CAPPlugin.m`'s `sendRetainedArgumentsForEvent:` reads the retained array and then `removeObjectForKey:` — permanently. So an event emitted with
 `retainUntilConsumed: true` and consumed by the FIRST realm is gone for every later one. Firebase's
 `authStateChange` is emitted that way, which means **after a reload `onAuthChanged` never fires**
 until a genuine sign-in or sign-out. Court survives only because `cloudSyncWiring.ts`'s `seedUid`
@@ -347,7 +349,7 @@ before that they genuinely did stack up. Anything written before that commit is 
 
 ### Per-process native init, per shipped project
 
-- `games/court` — `AppDelegate.swift:31` `FirebaseApp.configure(options:)`; Android via
+- `games/court` — `AppDelegate.swift`'s `FirebaseApp.configure(options:)` call; Android via
   `FirebaseInitProvider` at process start. **Unreachable from JS**: none of the four
   `@capacitor-firebase/*` plugins exposes a JS-side init and Court calls none, so a reload can
   neither re-run nor double-configure it, and it needs no guard. All four plugin implementations
@@ -362,15 +364,16 @@ before that they genuinely did stack up. Anything written before that commit is 
 
 ### Firestore snapshot listeners — a trap that is currently unreachable
 
-Capacitor's Android reset calls the **no-arg** `removeAllListeners()` (`Bridge.java:570-575` →
-`Plugin.java:765-767`, which only does `eventListeners.clear()`), so Firestore's own
+Capacitor's Android `reset()` (`Bridge.java`) calls the **no-arg** `removeAllListeners()`
+(`Plugin.java`'s no-arg overload, which only does `eventListeners.clear()`), so Firestore's own
 `removeAllListeners(PluginCall)` override is **never reached**. iOS is fine — `CapacitorBridge.swift`
 dispatches via `#selector(CAPPlugin.removeAllListeners(_:))`, which does hit the Swift override.
 
 **Inert today, and deliberately not "fixed":** there are zero `addDocumentSnapshotListener` /
 `addCollectionSnapshotListener` / `addCollectionGroupSnapshotListener` / `onSnapshot` call sites in
 `games/` or `engine/` — every Firestore
-call in `cloudSave.ts` is one-shot, and `cloudSave.ts:40` says so. It becomes a real per-reload leak
+call in `cloudSave.ts` is one-shot, and its "Do NOT add a Firestore SNAPSHOT LISTENER here"
+comment (#588) says so. It becomes a real per-reload leak
 — billed reads, battery, invisible — on the day Court adopts its first snapshot listener. That day,
 start here (#588).
 
@@ -419,16 +422,17 @@ now bounded by that seam, not by a claim that the gate itself is correct on iOS.
 
 ⚠️ **#584's own commit message (`8406660ef`) states its residual BACKWARDS** — it says a sub-game's
 boot attempt is "not counted on a reload". The opposite is true and is what makes the residual real:
-`beginBundleLoad` re-runs on a reload and DOES increment (`OtaCore.java:225`, `OtaCore.swift:406`),
-which is precisely why the confirm guard cannot protect a sub-game. This file and
+`beginBundleLoad` re-runs on a reload and DOES increment (`OtaCore.java`'s `boot`,
+`OtaCore.swift`'s state-based `boot`), which is precisely why the confirm guard cannot
+protect a sub-game. This file and
 [ota-updates.md](ota-updates.md) are correct; git history is the archive and that one sentence in it
 is wrong.
 
 ⚠️ **A `WebViewListener` registered from `Plugin.load()` is silently DISCARDED — #586's first fix
-was inert because of it.** `Bridge`'s constructor calls `registerAllPlugins()` (`Bridge.java:231`),
+was inert because of it.** `Bridge`'s constructor calls `registerAllPlugins()` (`Bridge.java`),
 which is what runs `Plugin.load()`. `Bridge.Builder.create()` then calls
-`bridge.setWebViewListeners(...)` (`:1617`) eighteen lines later, and that setter **replaces** the
-whole list (`:1465`) rather than appending — so anything `load()` registered is gone before the
+`bridge.setWebViewListeners(...)` eighteen lines later, and that setter **replaces** the
+whole list rather than appending — so anything `load()` registered is gone before the
 first navigation, and `BridgeWebViewClient.onPageStarted`, which iterates
 `bridge.getWebViewListeners()`, walks a list that never contained it.
 
@@ -502,12 +506,12 @@ Three things this settles that reading the source could not:
   `setTimeout` measurement, which tests the mechanism the argument actually rests on. PlayerPrefs'
   150 ms debounce genuinely drains itself there — previously an INFERENCE from the rAF count.
 - ⚠️ **Closing a translucent Activity fires an UNPAIRED `appStateChange(isActive:true)`** — a
-  "foregrounded" with no matching `(false)` before it, because `BridgeActivity.onResume():97` fires
+  "foregrounded" with no matching `(false)` before it, because `BridgeActivity.onResume()` fires
   the status change while `onStop` never ran. ⚠️ **This is not a translucent-Activity quirk — it is
-  the general shape.** `fireStatusChange(true)` at `onResume():97` is UNCONDITIONAL, while the
-  `false` at `onStop():118` is additionally gated on `activityDepth == 0`. So a runtime-permission
+  the general shape.** `fireStatusChange(true)` at `onResume()` is UNCONDITIONAL, while the
+  `false` at `onStop()` is additionally gated on `activityDepth == 0`. So a runtime-permission
   dialog, a system alert and the app's own cold-launch resume all emit one too (the cold-launch one
-  is merely dropped, since `AppPlugin.java:40` notifies with `retainUntilConsumed: false`). **Never
+  is merely dropped, since `AppPlugin.java`'s `load()` notifies with `retainUntilConsumed: false`). **Never
   write an `appStateChange` consumer that assumes a `(true)` is preceded by a `(false)`.** Anything treating `appStateChange(true)` as "we came
   back from being backgrounded" is wrong on this path: `useResumeReload` survives it only because
   `resumeReload.ts` bails on `if (at == null) return;`, and **Court's cloud sync
@@ -610,7 +614,7 @@ realm genuinely must re-register. Where each of the three named ones stands:
 | Latch | Guards | Status |
 |---|---|---|
 | `ads.ts:initialized` | AppLovin (native) | **Covered** — #587's `app.cleanup` task tears the SDK down before the reload |
-| `attribution.ts:initialized`/`starting`/`attPrompted` | AppsFlyer + ATT (native) | **Guarded natively — #607.** The JS latches still die with the realm and `AttributionService` still declares only `init()`, so nothing tears them down; instead the invariant moved to where the state actually lives — a per-process static in the plugin's `start()`, on both ports. Measured on an S22: two `initialize()` calls and two launch events in ONE process across a reload. ⚠️ `initialize()` is deliberately still unguarded (the SDK declines to re-set its read-only devKey/appId), and the second launch event is **contested on iOS** — see `games/court/attribution.md` § CLOSED, which measured a second `start()` as a no-op there. Unreconciled |
+| `attribution.ts:initialized`/`starting`/`attPrompted` | AppsFlyer + ATT (native) | **Guarded natively — #607.** The JS latches still die with the realm and `AttributionService` still declares only `init()`, so nothing tears them down; instead the invariant moved to where the state actually lives — a per-process static in the plugin's `start()`, on both ports. ⚠️ `initialize()` is deliberately still unguarded (the SDK declines to re-set its read-only devKey/appId). **RECONCILED on Android, 2026-09-04** — the "two launch events across a reload" reading this row used to carry is REFUTED as an attribution: a re-measurement on an S22 with the guard absent from the binary showed the reload's `start()` posts NO Launch, and that the second Launch came from the RESUME that followed. AppsFlyer's Launch is driven by the foreground transition, not by `start()`. So the guard is inert for Launch counts (it still stops a second `registerSessionReadyListener`). **iOS across a reload is still unmeasured.** Full run + the limits: `games/court/attribution.md` § "#607/#654 — the Android leg measured" (private) |
 | `llm-test/LLMManager.ts` | litert-lm engine (native) | **Open — #585**, iceboxed |
 
 `milestones.ts:started` looks like the same shape and is not: its `fired` ledger lives in
@@ -646,7 +650,7 @@ Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine
 
 ⚠️ **`<project>/packages/app-services/` is a REQUIRED path, not a naming convention.** `projectNativeSdkDeps` in `engine/vite.config.ts` reads `<project>/packages/app-services/package.json` to force-prebundle the wrapped native-SDK deps, and returns `[]` when the path is missing — an app-service package placed anywhere else makes the editor's project-open flow silently skip the pre-bundle and visibly re-optimize/reload mid-session instead.
 
-⚠️ **Declare a native plugin dep in BOTH the game-root `package.json` and the app-services one** (as `games/court` and `games/3d-test` do for their real plugins). The root copy is not redundant: `healNativeConfig.ts`'s `usesCrashlytics()` (~line 777) reads only the project **root** `package.json` to gate the iOS dSYM upload phase, and **`cap sync` scans only the app's own root `package.json`**, never the nested one. A dep declared solely on the nested `app-services` package is exactly why `games/3d-test`'s `capacitor-applovin-max` — declared only in `packages/app-services/package.json` — is absent from both its generated `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` today. Only a JS-only SDK peer dep (e.g. `firebase` itself) legitimately stays app-services-only.
+⚠️ **Declare a native plugin dep in BOTH the game-root `package.json` and the app-services one** (as `games/court` and `games/3d-test` do for their real plugins). The root copy is not redundant: `healNativeConfig.ts`'s `usesCrashlytics()` reads only the project **root** `package.json` to gate the iOS dSYM upload phase, and **`cap sync` scans only the app's own root `package.json`**, never the nested one. A dep declared solely on the nested `app-services` package is exactly why `games/3d-test`'s `capacitor-applovin-max` — declared only in `packages/app-services/package.json` — is absent from both its generated `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` today. Only a JS-only SDK peer dep (e.g. `firebase` itself) legitimately stays app-services-only.
 
 ⚠️ **`cap sync` is a STEP in promoting a plugin, and its generated files are part of the commit** — not a follow-up. Wordweave's Firebase JS wiring once landed without regenerating `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` + `android/app/capacitor.build.gradle`, and nothing caught it: the files self-heal on whoever next runs a native build, so the tree only churns silently, and `npm run verify` is vitest — it compiles no native project. Both platforms shipped with no Firebase Capacitor plugin actually linked while every test stayed green. `npx cap update android` alone is not enough to regenerate them — it exits `ENOENT` on `assets/capacitor.plugins.json`, which only `cap copy` writes, so it needs a real `--target native` build first.
 
