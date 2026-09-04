@@ -152,9 +152,17 @@ export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markSc
     if (slot.initialized) {
       mount();
     } else {
-      // Wait for Application init, then mount
+      // Wait for Application init, then mount. `.catch` is load-bearing, not defensive: the pool
+      // now bounds this init with a timeout (#213-adjacent), so a hung/failing bring-up REJECTS
+      // instead of hanging forever — without this handler that becomes an unhandled rejection and
+      // the canvas simply never mounts, with nothing in the console to explain why.
       slot.ready.then(() => {
         if (!cancelled) mount();
+      }).catch((err) => {
+        console.error(
+          `[Canvas2DMount] entity ${entityId}: Application.init() failed — this canvas will stay ` +
+          `blank:`, err,
+        );
       });
     }
 

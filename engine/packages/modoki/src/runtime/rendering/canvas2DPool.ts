@@ -117,15 +117,39 @@ export interface Canvas2DSlot {
    *  `createSlot`, before `takeFreeSlot` pushes, so the rebuild request was silently dropped and
    *  no message was ever printed. */
   destroyed?: boolean;
+  /** This slot survived `destroyPool()` only because something still CLAIMED it (F6) — see
+   *  `destroyPool`'s doc comment. Once that claim finally drops, `reclaimIfUnclaimed` must destroy
+   *  this slot's Application itself instead of returning it to the free pool for reuse: the pool
+   *  that would normally do that later, via `renderAll`'s shrink path, is not coming back — the
+   *  frame callback that drives `renderAll` is already unregistered by the time `destroyPool` runs
+   *  (`Game.tsx` calls `stopScene2D()` before `destroyPool()`). Cleared implicitly — a slot that
+   *  sets this is torn down and spliced out the moment its last claim drops, never reused. */
+  pendingDestroy?: boolean;
   /** Rebuild scheduler for this slot's renderer — the SAME policy module the 3D viewports use
    *  (`rendering/rendererRecovery.ts`), so the two cannot disagree about when a rebuild runs. */
   recovery?: RendererRecovery;
+  /** Disposer for the FIRST-init watchdog timer (`APP_INIT_TIMEOUT_MS`, see `createSlot`). Called
+   *  once `slot.ready` settles AND from `teardownSlot`, so the watchdog can never fire into a
+   *  torn-down slot and no fake-timer test is left holding a live timer. Idempotent. */
+  initWatchdog?: () => void;
 }
 
-/** How long a rebuild's `Application.init()` may take before it counts as failed.
- *  Generous — a real bring-up on a slow phone is well under this — but FINITE, because init on a
- *  dead GPU can never settle at all (#213). */
-const REBUILD_INIT_TIMEOUT_MS = 8000;
+/** How long a REBUILD's `Application.init()` (after context loss) may take before it counts as
+ *  failed and REJECTS. Generous — a real bring-up on a slow phone is well under this — but FINITE,
+ *  because init on a dead GPU can never settle at all (#213); a rebuild has `rendererRecovery`'s
+ *  bounded retry to fall back on when that happens.
+ *
+ *  ⚠️ The FIRST init in `createSlot` uses this SAME interval, but only as a WATCHDOG — it does NOT
+ *  reject `slot.ready`. It used to: a rejecting bound was measured to turn a merely SLOW cold
+ *  bring-up (8.5s on a low-end GPU) into a NEVER — `slot.ready` rejected at 8000ms while
+ *  `initSlotApp` kept running underneath and succeeded at 8.5s regardless, leaving a live,
+ *  budget-counted GPU context whose canvas nothing ever appends (Canvas2DMount's `.catch` only
+ *  logs). That is strictly worse than the unbounded call this replaced, on exactly the device class
+ *  it targeted. A hung first init has nothing to retry either way — `recovery.request()` is
+ *  reachable only from a `webglcontextlost` event, which needs a context that came up in the first
+ *  place — so the only honest improvement available for the first init is to make a slow bring-up
+ *  LOUD, not to fail it. See `createSlot`. */
+const APP_INIT_TIMEOUT_MS = 8000;
 
 /** Reject if `p` has not settled within `ms`. The rejection is what lets `rendererRecovery` retry
  *  with backoff; without it a hung bring-up stalls recovery forever, in silence. */
@@ -277,7 +301,7 @@ export class Canvas2DPool {
     // retries, nothing reports, and the surface stays blank in silence. That is exactly what the
     // first version of this did (measured: the loss was logged, and neither a success nor a
     // failure ever followed). A timeout converts it into a retryable rejection.
-    await withTimeout(this.initSlotApp(slot), REBUILD_INIT_TIMEOUT_MS, 'Pixi Application.init');
+    await withTimeout(this.initSlotApp(slot), APP_INIT_TIMEOUT_MS, 'Pixi Application.init');
     // `initSlotApp` can complete having THROWN THE APP AWAY — the slot was disposed mid-rebuild, or
     // a later rebuild superseded this one. Reporting success there would log "renderer rebuilt"
     // for a renderer that does not exist, which is the same class of lie as the silent decline
@@ -320,7 +344,7 @@ export class Canvas2DPool {
     // ⚠️ CAPTURE the instance — do not re-read `slot.app` after the await. `rebuildSlotApp`
     // REASSIGNS `slot.app`, which broke the assumption this function was written under (one
     // Application per slot, assigned once in `createSlot`). Concretely: a rebuild whose `init()`
-    // exceeds `REBUILD_INIT_TIMEOUT_MS` rejects but does NOT cancel — the retry then assigns a new
+    // exceeds `APP_INIT_TIMEOUT_MS` rejects but does NOT cancel — the retry then assigns a new
     // Application, and when the abandoned `init()` finally settles (a slow-but-alive driver, which
     // is exactly what the timeout exists to bound) this code resumes and configures the RETRY's
     // app a second time, double-counting `noteGpuContextCreated()` while the timed-out one is never
@@ -424,8 +448,33 @@ export class Canvas2DPool {
 
     this.attachCanvasListeners(slot, canvas);
 
-    // Start async init immediately — `ready` tracks completion
+    // Start async init immediately — `ready` tracks completion. NOT bounded by a rejecting timeout
+    // — see `APP_INIT_TIMEOUT_MS`'s own comment for why that was actively harmful here: it turned a
+    // merely SLOW cold bring-up into a NEVER, on exactly the device class this exists to help. A
+    // hung first init has nothing to retry anyway (`recovery.request()` is reachable only from a
+    // `webglcontextlost` event, which needs a context that came up in the first place), so the only
+    // honest move is to REPORT a slow bring-up, not reject it: a watchdog fires once at
+    // `APP_INIT_TIMEOUT_MS` and, if init has neither settled nor the slot been torn down by then,
+    // logs loudly — `slot.ready` itself keeps waiting on the real `initSlotApp` promise and
+    // resolves whenever it actually finishes, however late.
+    let watchdogSettled = false;
+    const watchdogTimer = setTimeout(() => {
+      if (watchdogSettled || slot.destroyed) return;
+      console.error(
+        `[canvas2DPool] Pixi Application.init() for entity ${slot.entityId} has not settled after ` +
+        `${APP_INIT_TIMEOUT_MS}ms — the surface will stay BLANK until it does. This is the FIRST ` +
+        `init for this slot, so nothing here can retry it: recovery only re-arms after a ` +
+        `webglcontextlost event, which needs a context that came up in the first place.`,
+      );
+    }, APP_INIT_TIMEOUT_MS);
+    slot.initWatchdog = () => { watchdogSettled = true; clearTimeout(watchdogTimer); };
     slot.ready = this.initSlotApp(slot);
+    slot.ready.then(slot.initWatchdog, slot.initWatchdog);
+    // A slot Scene2D allocates but Canvas2DMount never mounts has no OTHER `.catch` attached — only
+    // Canvas2DMount's own `.then/.catch` (below) observes `slot.ready` — so an init failure there
+    // would surface as an unhandled rejection. A throwaway chain: `slot.ready` itself must stay the
+    // ORIGINAL promise, not this caught one, so Canvas2DMount's handler still sees the rejection.
+    slot.ready.catch(() => {});
     return slot;
   }
 
@@ -468,6 +517,25 @@ export class Canvas2DPool {
     return slot;
   }
 
+  /** Tear a slot down for good: flag it destroyed, drop its context-loss listeners + pointer
+   *  passthrough, destroy its Pixi container, and destroy its Application if it ever got one.
+   *  Shared by every path that retires a slot permanently (the shrink pass in `renderAll`, an
+   *  unclaimed slot in `destroyPool`, and a `pendingDestroy` slot reclaimed after `destroyPool`
+   *  kept it) so they cannot drift apart on ordering — `destroyed` FIRST, listeners off BEFORE
+   *  `app.destroy`, because Pixi forces a context loss on teardown and the handler must already
+   *  know this loss is ours. Does NOT touch `this.slots` — callers splice it out themselves, at
+   *  whatever point suits their own iteration. */
+  private teardownSlot(slot: Canvas2DSlot): void {
+    slot.destroyed = true;
+    slot.initWatchdog?.(); // stop the FIRST-init watchdog — it must never fire into a torn-down slot
+    slot.detachCanvasListeners?.();
+    slot.detachCanvasListeners = undefined;
+    slot.unpassthrough?.();
+    slot.container.destroy();
+    if (slot.initialized) { slot.app.destroy(true); noteGpuContextDestroyed(); }
+    slot.recovery?.dispose();
+  }
+
   /** Reclaim a slot to the free pool once it has NO claims (neither sim-bound nor
    *  mounted). Detaches any leftover children (Scene2D owns destruction) and unbinds
    *  the entity so the slot can be reused. No-op while either claim is still held. */
@@ -482,6 +550,18 @@ export class Canvas2DPool {
     // A reused slot must not inherit the previous entity's render-failure state (#455).
     slot.redrawOwed = false;
     slot.renderFailFrames = 0;
+    // `destroyPool()` kept this slot alive only because something still claimed it (F6) — that
+    // claim has now dropped, and the shrink pass that would normally collect it never runs again:
+    // `destroyPool` runs after `stopScene2D()` already unregistered the frame callback that drives
+    // `renderAll` (Game.tsx). Left as an ordinary free slot, it would sit here holding a live GPU
+    // context until something restarts Scene2D and eventually shrinks it — possibly never, if the
+    // app never comes back. Destroy it here instead, and remove it for good rather than returning
+    // it to the free pool: a DESTROY destroys.
+    if (slot.pendingDestroy) {
+      const idx = this.slots.indexOf(slot);
+      if (idx !== -1) this.slots.splice(idx, 1);
+      this.teardownSlot(slot);
+    }
   }
 
   /** Claim a slot for a Canvas2D ENTITY (Scene2D, per-frame). Get-or-create, mark
@@ -650,17 +730,7 @@ export class Canvas2DPool {
       for (let i = this.slots.length - 1; i >= 0 && this.slots.length - allocated > 1; i--) {
         const s = this.slots[i];
         if (s.entityId === null && s.canvas.parentElement === null) {
-          // `destroyed` FIRST, and the listeners off, before `app.destroy` — Pixi forces a context
-          // loss on teardown, and the handler must know this loss is ours. Setting the flag
-          // afterwards would make correctness depend on the browser dispatching the event
-          // asynchronously. See `attachCanvasListeners`.
-          s.destroyed = true;
-          s.detachCanvasListeners?.();
-          s.detachCanvasListeners = undefined;
-          s.unpassthrough?.();
-          s.container.destroy();
-          if (s.initialized) { s.app.destroy(true); noteGpuContextDestroyed(); }
-          s.recovery?.dispose();
+          this.teardownSlot(s);
           this.slots.splice(i, 1);
         }
       }
@@ -672,7 +742,12 @@ export class Canvas2DPool {
    *  detached, not destroyed — Scene2D owns destruction (F4) and has already disposed
    *  them in its onWorldSwap handler before this runs. */
   releaseAll(): void {
-    for (const slot of this.slots) {
+    // Iterate a COPY — `reclaimIfUnclaimed` can `splice` `this.slots` out from under a live
+    // iterator (a `pendingDestroy` slot reclaimed here), which would skip the slot right after the
+    // spliced index. That slot's `boundBySim` would then never clear and it would never be
+    // reclaimed either. Cheap hardening: this exact sequence was not built end-to-end and
+    // confirmed, so treat it as a plausible hazard rather than a proven bug.
+    for (const slot of [...this.slots]) {
       if (slot.boundBySim) {
         slot.boundBySim = false;
         this.reclaimIfUnclaimed(slot);
@@ -722,8 +797,13 @@ export class Canvas2DPool {
    *  gives a perfectly healthy boot — which is why fast hardware never showed it and why a single
    *  good boot was never evidence of a fix (measured on device: ~4 of 6 boots failed).
    *
-   *  A kept slot is not leaked: it holds no sim claim after `releaseAll()`, so `reclaimIfUnclaimed`
-   *  collects it the moment its `Canvas2DMount` unmounts, and the shrink path takes it from there. */
+   *  A kept slot is not leaked: it holds no sim claim after `releaseAll()`, so once its last claim
+   *  drops — its `Canvas2DMount` unmounts — `reclaimIfUnclaimed` destroys it right there, via the
+   *  `pendingDestroy` flag set below. ⚠️ It does NOT wait for the shrink path in `renderAll`: by
+   *  the time `destroyPool()` runs, `Game.tsx` has already called `stopScene2D()`, which
+   *  unregisters the frame callback that drives `renderAll` — so nothing would ever come back to
+   *  collect it. (This doc comment used to claim the shrink path collected it; that was the bug —
+   *  see `Canvas2DSlot.pendingDestroy`.) */
   destroyPool(): void {
     this.releaseAll();
     const kept: Canvas2DSlot[] = [];
@@ -732,17 +812,14 @@ export class Canvas2DPool {
       // The CLAIM first, the DOM only as belt-and-braces. Either alone is a slot in use.
       if (slot.mounted || slot.canvas.parentElement !== null) {
         if (slot.mounted && slot.canvas.parentElement === null) keptMidMount++;
+        // The renderer that would normally reclaim this slot for us is gone — see the doc comment
+        // above and `pendingDestroy`'s own. Mark it so `reclaimIfUnclaimed` destroys it outright,
+        // the moment its last claim drops, instead of quietly returning it to the free pool.
+        slot.pendingDestroy = true;
         kept.push(slot);
         continue;
       }
-      // `destroyed` FIRST, and the listeners off, before `app.destroy` — see the shrink path above.
-      slot.destroyed = true;
-      slot.detachCanvasListeners?.();
-      slot.detachCanvasListeners = undefined;
-      slot.unpassthrough?.();
-      slot.container.destroy();
-      if (slot.initialized) { slot.app.destroy(true); noteGpuContextDestroyed(); }
-      slot.recovery?.dispose();
+      this.teardownSlot(slot);
     }
     this.slots.length = 0;
     this.slots.push(...kept);

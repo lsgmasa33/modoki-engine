@@ -38,6 +38,18 @@ export function register2DMaterialShaderMap(map: Map<number, Shader>): () => voi
   return () => { shaderMaps.delete(map); };
 }
 
+/** True once `s.destroy()` has run. Pixi's `Shader` has no PUBLIC destroyed flag — only the
+ *  internal `_destroyed` (see its `.d.ts`, marked `@internal`) — and the class's public
+ *  `destroy` EventEmitter event doesn't substitute: it only tells a listener attached BEFORE
+ *  destruction, but the case this guards against is a shader destroyed in the same frame it
+ *  was first handed to us, before we'd ever have attached one. So this deliberately reads the
+ *  internal field rather than modelling destruction ourselves. Verified against the installed
+ *  pixi.js 8.19.0 (`Shader._destroyed`, set `true` synchronously at the top of `destroy()`,
+ *  before it nulls `resources`/`groups`/the programs) — re-verify on a pixi.js upgrade. */
+function isShaderDestroyed(s: Shader): boolean {
+  return (s as unknown as { _destroyed: boolean })._destroyed === true;
+}
+
 /** Every live 2D-material Shader an entity currently has, across all renderers. Skips a
  *  Shader that has been destroyed (a slot torn down between the render frame and this
  *  read) so the driver never writes into freed GPU state. */
@@ -45,7 +57,7 @@ export function getEntity2DMaterialShaders(id: number): Shader[] {
   const out: Shader[] = [];
   for (const map of shaderMaps) {
     const s = map.get(id);
-    if (s && !(s as unknown as { destroyed?: boolean }).destroyed) out.push(s);
+    if (s && !isShaderDestroyed(s)) out.push(s);
   }
   return out;
 }
@@ -55,7 +67,7 @@ export function getEntity2DMaterialShaders(id: number): Shader[] {
 export function hasEntity2DMaterial(id: number): boolean {
   for (const map of shaderMaps) {
     const s = map.get(id);
-    if (s && !(s as unknown as { destroyed?: boolean }).destroyed) return true;
+    if (s && !isShaderDestroyed(s)) return true;
   }
   return false;
 }

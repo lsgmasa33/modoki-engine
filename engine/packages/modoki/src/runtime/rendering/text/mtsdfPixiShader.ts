@@ -19,6 +19,7 @@ import {
   textureBit, textureBitGl,
   roundPixelsBit, roundPixelsBitGl,
 } from 'pixi.js';
+import type { GlProgram, GpuProgram } from 'pixi.js';
 import type { MtsdfStyle } from './mtsdfStyle';
 import { GLOW_MAX_SPREAD, OUTLINE_MAX_SPREAD, clampShadowOffset } from './mtsdfStyle';
 
@@ -214,16 +215,48 @@ const mtsdfBit = {
   },
 };
 
+/** Single source for the shader's name — feeds both `compileHighShaderGlProgram`'s /
+ *  `compileHighShaderGpuProgram`'s `name:` argument (`getMtsdfPrograms`, below) AND the
+ *  `#define SHADER_NAME` stamped into `mtsdfBitGl`'s own vertex/fragment headers, so a rename of
+ *  one can't drift from the other.
+ *
+ *  ⚠️ For the GL program specifically, `name:` no longer reaches the compiled source at all:
+ *  `GlProgram`'s constructor (`setProgramName`) only stamps `#define SHADER_NAME <name>-N` when
+ *  the source doesn't already declare one, and `mtsdfBitGl`'s headers below always do — so
+ *  `setProgramName` early-returns before it ever reads `name`. The `name:` argument passed to
+ *  `compileHighShaderGlProgram` is DEAD for that reason; it is kept in sync here anyway because a
+ *  program whose reported name doesn't match its own `#define` would be a confusing thing to debug,
+ *  and because `compileHighShaderGpuProgram` (WGSL) still uses it directly. */
+const MTSDF_SHADER_NAME = 'mtsdf-text';
+
 /** The custom bit (GLSL). Uniforms are loose (Pixi's GL UBO handling maps them to
  *  the `mtsdfUniforms` group by name — names are unique across all bits). */
 const mtsdfBitGl = {
   name: 'mtsdf-bit',
   vertex: {
-    header: /* glsl */`in vec4 aTextColor;`,
+    // ⚠️ Pixi 8.19.0's GLSL preprocessor (`GlProgram`'s `setProgramName`) stamps an
+    // incrementing `#define SHADER_NAME <name>-N` into any source that doesn't already
+    // carry one — see the note above `makeMtsdfPixiShader` for why that matters. The
+    // fixed, stable defines here stop the LEAK (identical source now hashes to a stable
+    // `_key` instead of an ever-incrementing one — see the `getMtsdfPrograms` comment
+    // below). They do NOT make per-call program construction safe on their own: a SECOND
+    // `GlProgram` built from this same source would still hit `GlShaderSystem`'s cache on
+    // that stable key, `generateProgram` would never run for it, and its `_attributeData`
+    // would stay unpopulated — `GlGeometrySystem.initGeometryVao` → `getSignature` then
+    // hard-throws `Cannot read properties of undefined (reading 'aPosition')` inside the
+    // 2D frame callback. The module-level cache in `getMtsdfPrograms` is what actually
+    // keeps this to one program — it is LOAD-BEARING, not belt-and-suspenders, and it is
+    // reachable via HMR / module re-evaluation while a renderer has already compiled the
+    // program (a possibility, not confirmed against a live repro).
+    header: /* glsl */`
+      #define SHADER_NAME ${MTSDF_SHADER_NAME}-vertex
+      in vec4 aTextColor;
+    `,
     main: /* glsl */`vColor *= vec4(aTextColor.rgb * aTextColor.a, aTextColor.a);`,
   },
   fragment: {
     header: /* glsl */`
+      #define SHADER_NAME ${MTSDF_SHADER_NAME}-fragment
       uniform vec4 uTextColor;
       uniform vec4 uOutlineColor;
       uniform vec4 uGlowColor;
@@ -334,15 +367,56 @@ export interface MtsdfPixiAtlas {
   type: string;
 }
 
+// ── Program cache (fixes #590) ──────────────────────────────────────────────
+// `makeMtsdfPixiShader` used to call `compileHighShaderGlProgram`/
+// `compileHighShaderGpuProgram` fresh on every invocation. `compileHighShaderGpuProgram`
+// ends in `GpuProgram.from(...)`, which is content-cached — harmless. But
+// `compileHighShaderGlProgram` ends in `new GlProgram(...)`, NOT `GlProgram.from(...)`,
+// so it built a brand-new program every call, and that is the actual leak:
+//
+// 1. `GlProgram`'s constructor runs `setProgramName` as a preprocessor. On Pixi 8.19.0
+//    that helper keeps a module-global name cache and, for any source that does not
+//    already contain `#define SHADER_NAME`, appends an INCREMENTING suffix and injects
+//    the define into the source text. Our source had none, so the injection fired
+//    every time (fixed by the `#define SHADER_NAME` lines on `mtsdfBitGl` above — belt
+//    and suspenders alongside the cache here).
+// 2. `GlProgram` computes `_key = createIdFromString(vertex + ':' + fragment)` AFTER
+//    that preprocessing, so the injected, ever-incrementing name made byte-identical
+//    input hash to a DIFFERENT key on every call.
+// 3. `GlShaderSystem`'s `_getProgramData` keys its `_programDataHash` cache by that
+//    `_key`, so a fresh key is always a cache miss: a brand-new `WebGLProgram` gets
+//    compiled and stored, and it stays there — the library has no `gl.deleteProgram`
+//    call site anywhere, so nothing ever frees the old one.
+//
+// The `#define` above closes the name-injection hole, but the root fix is here: build
+// the GL/GPU programs ONCE and reuse them. `bits`/`name` passed to the two `compile*`
+// calls below are fixed module-level constants (`mtsdfBit`/`mtsdfBitGl` and their
+// sibling bits) — none of `makeMtsdfPixiShader`'s arguments (`texture`, `atlas`,
+// `style`, `fontSize`) reach the shader SOURCE at all; they only feed `mtsdfUniforms`
+// (a `UniformGroup`, rebuilt per call below, as it must be — see the doc comment on
+// `MtsdfPixiAtlas.type` and `mtsdfUniformValues`). So there is exactly one distinct
+// program pair for the whole file, not a family keyed by some input — a `Map` would
+// only ever hold one entry.
+let cachedGlProgram: GlProgram | undefined;
+let cachedGpuProgram: GpuProgram | undefined;
+
+function getMtsdfPrograms(): { glProgram: GlProgram; gpuProgram: GpuProgram } {
+  cachedGlProgram ??= withDerivativesExtension(
+    compileHighShaderGlProgram({ name: MTSDF_SHADER_NAME, bits: [localUniformBitGl, textureBitGl, roundPixelsBitGl, mtsdfBitGl] }),
+  );
+  cachedGpuProgram ??= compileHighShaderGpuProgram({ name: MTSDF_SHADER_NAME, bits: [localUniformBit, textureBit, roundPixelsBit, mtsdfBit] });
+  return { glProgram: cachedGlProgram, gpuProgram: cachedGpuProgram };
+}
+
 /** Create the Pixi MTSDF Shader for a font atlas. The atlas texture is bound BOTH
  *  ways because the mesh adaptor differs per backend: WebGL reads
  *  `resources.uTexture`, WebGPU rebinds group 2 from `mesh.texture`. Callers must
- *  therefore ALSO set `mesh.texture = <same atlas>`. */
+ *  therefore ALSO set `mesh.texture = <same atlas>`.
+ *
+ *  The `glProgram`/`gpuProgram` are shared across every call (see `getMtsdfPrograms`
+ *  above) — only the `Shader` instance and its uniforms are per-call. */
 export function makeMtsdfPixiShader(texture: Texture, atlas: MtsdfPixiAtlas, style: MtsdfStyle, fontSize: number): Shader {
-  const glProgram = withDerivativesExtension(
-    compileHighShaderGlProgram({ name: 'mtsdf-text', bits: [localUniformBitGl, textureBitGl, roundPixelsBitGl, mtsdfBitGl] }),
-  );
-  const gpuProgram = compileHighShaderGpuProgram({ name: 'mtsdf-text', bits: [localUniformBit, textureBit, roundPixelsBit, mtsdfBit] });
+  const { glProgram, gpuProgram } = getMtsdfPrograms();
   const mtsdfUniforms = new UniformGroup(mtsdfUniformValues(style, atlas.width, atlas.height, atlas.distanceRange, atlas.size, fontSize, atlas.type !== 'msdf') as any);
   const shader = new Shader({
     glProgram, gpuProgram,

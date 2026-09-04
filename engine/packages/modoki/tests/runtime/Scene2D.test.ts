@@ -74,7 +74,15 @@ function mockDeps() {
       // material pass's source-ready guard passes; width/height come from the sub-rect.
       constructor(opts?: any) { this.source = opts?.source; if (opts?.frame) { this.width = opts.frame.width ?? 0; this.height = opts.frame.height ?? 0; } }
     }
-    class MeshGeometry { destroy = vi.fn(); constructor(public opts?: any) {} }
+    // `buffers` mirrors real Pixi Geometry: a truthy array until `destroy(true)` nulls it, which
+    // is what `releaseGeometry`'s `!g.buffers` idempotency guard checks (a second call must not
+    // re-run unload/destroy, exactly like the real Geometry.destroy() nulling `buffers`).
+    class MeshGeometry {
+      buffers: unknown[] | null = [];
+      unload = vi.fn();
+      destroy = vi.fn(() => { this.buffers = null; });
+      constructor(public opts?: any) {}
+    }
     class Mesh extends Display {
       kind = 'material';
       geometry: any; texture: any; shader: any; tint = 0xffffff; blendMode = 'normal';
@@ -508,6 +516,13 @@ describe('Scene2D.renderFrame', () => {
       expect(mesh.destroyed).toBe(true);
       expect(shader.destroyed).toBe(true);          // shader torn down with the slot
       expect(mesh.geometry.destroy).toHaveBeenCalled();
+      // releaseGeometry must call unload() BEFORE destroy(true) — Pixi's Geometry.destroy()
+      // tears off the "unload" listener before firing it, so the ORDER is what actually frees
+      // the GL VAO; a mock that merely records both calls (without this) can't tell the fix
+      // apart from the bug it fixes.
+      expect(mesh.geometry.unload).toHaveBeenCalled();
+      expect(mesh.geometry.unload.mock.invocationCallOrder[0])
+        .toBeLessThan(mesh.geometry.destroy.mock.invocationCallOrder[0]);
       expect(pool.getSlot(canvas.id())!.container.children.length).toBe(0);
     });
 
@@ -1191,6 +1206,98 @@ describe('Scene2D.renderFrame', () => {
     scene2d.renderFrame();
 
     expect(pool.getSlot(canvas.id())!.container.children.length).toBe(0);
+  });
+
+  // Reachability for `Orphan2DTracker.prune` (canvas2DRouting.ts): unit-tested directly there,
+  // but nothing called it from `renderFrame` until this wiring — that gap is exactly what let a
+  // tested mechanism never fire in production. This drives it through the REAL frame path
+  // (spawn → renderFrame → destroy → renderFrame → respawn → renderFrame), not a direct
+  // `orphan2D.prune(...)` call, so it also proves the frame loop calls it with the right set.
+  it('forgets a dead orphaned entity through the real renderFrame path, unblocking its recycled id (prune wiring)', async () => {
+    const { traits, scene2d, world, registerTrait } = await setup();
+    // The harness registers EntityAttributes with `fields: {}` (setup() above), so
+    // readTraitData normally returns `{}` for it and `orphan2DKey` always falls back to
+    // `id:<entityId>` regardless of an authored guid — re-register with real field hints so
+    // THIS test can give two entities distinct guid-keyed warn identities, matching what a real
+    // scene (guid always registered) does. `Orphan2DTracker.warned` is keyed by guid, and this
+    // test targets `frames` pruning specifically — a guid-less entity's `id:` fallback key has
+    // its OWN, different collision on id recycling (`warned` never forgets it), which is a real
+    // but separate gap from what `prune` fixes.
+    const { inferFields } = await import('../../src/runtime/core/ecs/traitRegistry');
+    registerTrait({ name: 'EntityAttributes', trait: traits.EntityAttributes, category: 'component', fields: inferFields(traits.EntityAttributes) });
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Only the orphan-ancestor warning — the harness spawns entities without registerEntity(),
+    // which independently logs its own unrelated O(n)-fallback warning on every readTraitData
+    // call, so a raw call count would conflate the two.
+    const orphanWarnCount = () => warnSpy.mock.calls.filter((c) => typeof c[0] === 'string' && c[0].startsWith('[Scene2D]')).length;
+
+    const spawnOrphan = (guid: string) => world.spawn(
+      traits.Transform({}),
+      traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10 }),
+      traits.EntityAttributes({ name: guid, parentId: 0, sortOrder: 0, layer: '2d', guid }),
+    );
+
+    // Orphaned (parented to root, no Canvas2D ancestor) — warns on its very first frame, since
+    // ORPHAN_2D_WARN_FRAMES is 1.
+    const dead = spawnOrphan('dead-guid');
+    const deadId = dead.id();
+    scene2d.renderFrame();
+    expect(orphanWarnCount()).toBe(1);
+
+    // Dies WITHOUT recovering (no clear() — it never routes to a canvas). Without prune wired
+    // into renderFrame, its stale warn-frame count would sit in `frames` forever. One more frame
+    // runs the sweep over THIS frame's live-entity set, which no longer contains `deadId`.
+    dead.destroy();
+    scene2d.renderFrame();
+
+    // koota's entity-id pool is LIFO: destroying one entity and then spawning exactly one more
+    // hands back the freed id (verified against the real koota package before writing this
+    // test). This is what puts a NEW entity on the SAME numeric id the dead one held.
+    warnSpy.mockClear();
+    const revived = spawnOrphan('revived-guid');
+    expect(revived.id()).toBe(deadId); // the recycling this test exists to exploit
+
+    scene2d.renderFrame();
+    // Without the fix: `frames.get(deadId)` still held the dead entity's count (1), so this
+    // frame's `note()` lands on 2 — never == ORPHAN_2D_WARN_FRAMES(1) again — and the new entity
+    // could NEVER warn. With `prune` reached from the real frame loop, the stale count was
+    // dropped before this frame, so the new entity starts at 0 and warns right on schedule.
+    expect(orphanWarnCount()).toBe(1);
+  });
+
+  // Adversarial review of #590 (docs/plans/ios-rendering-update-wedge.md): `liveEntityIds` was
+  // built ONLY from `world.query(attrMeta.trait)` (EntityAttributes), but `noteOrphan2D` is
+  // reachable from the Renderable2D/SkinnedSprite2D/Text2D passes for entities that have NO
+  // EntityAttributes at all — the same entities `orphan2DKey` falls back to an `id:` key for.
+  // Those entities can never resolve to a canvas either (findCanvasAncestor needs a
+  // `parentOfEntity` entry, which only the EntityAttributes query populates), so they orphan
+  // FOREVER — and every frame's `prune()` used to delete their frame count out from under them
+  // before the routing passes ran, since it fires right after the EntityAttributes query. At
+  // ORPHAN_2D_WARN_FRAMES===1 that reset is invisible in the warn COUNT (both a reset-to-1 and a
+  // real accumulation land on "warn once"), so this asserts the tracker's internal counter
+  // directly — the only way to see whether it survives the prune or gets wiped every frame.
+  it("keeps a live no-EntityAttributes orphan's frame count across a prune (liveEntityIds completeness)", async () => {
+    const { traits, scene2d, world } = await setup();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const orphan = world.spawn(
+      traits.Transform({}),
+      traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10 }),
+      // Deliberately NO traits.EntityAttributes(...) — this is the gap.
+    );
+    const id = orphan.id();
+
+    scene2d.renderFrame();
+    scene2d.renderFrame();
+    scene2d.renderFrame();
+
+    // Without the fix, `prune()` deletes this id's count every frame (it's absent from
+    // `liveEntityIds`), so `note()` restarts at 1 each time and the counter is stuck at 1 after 3
+    // frames. With `liveEntityIds` also covering every `Transform`-bearing entity, the count
+    // accumulates normally.
+    const frames = (scene2d.defaultRenderer as any).orphan2D.frames as Map<number, number>;
+    expect(frames.get(id), 'a still-live orphan must not be pruned out from under itself').toBe(3);
   });
 
   it('tears down all slots and releases the pool on world swap', async () => {

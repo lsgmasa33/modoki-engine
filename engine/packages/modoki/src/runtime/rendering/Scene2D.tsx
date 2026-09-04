@@ -29,7 +29,7 @@
  *  their own slots' refcounts. The trait cache + `deactivatedEntities` + skin buffers are global too. */
 
 import type { World } from 'koota';
-import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Assets, Container, Buffer, BufferUsage, type Shader } from 'pixi.js';
+import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Assets, Container, Buffer, BufferUsage, type Shader, type Geometry } from 'pixi.js';
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
 import { getAllTraits } from '../core/ecs/traitRegistry';
@@ -287,13 +287,35 @@ function sameGrouping(a: ReadonlyMap<number, number>, b: ReadonlyMap<number, num
   return true;
 }
 
+/** The ONLY place a Pixi `Geometry` is destroyed. PixiJS 8.19.0's `Geometry.destroy()` calls
+ *  `removeAllListeners()` BEFORE it calls `unload()`, so the GC hook that actually frees the GL
+ *  VAO — `GlGeometrySystem.onGeometryUnload`, the only `gl.deleteVertexArray` call site, reached
+ *  only via `GCManagedHash`'s `item.once("unload", …)` registration — is torn off before
+ *  `unload()` ever fires, permanently orphaning the VAO. `destroy(true)` alone does not fix it:
+ *  `buffers.forEach` still runs before `unload()` inside the same call. `Buffer`, `TextureSource`,
+ *  `GraphicsContext` and `ViewContainer` all order `unload()` before `destroy()` correctly —
+ *  `Geometry` is the one Pixi class that inverts it, so this is a workaround for an upstream
+ *  quirk, not a local convention.
+ *
+ *  Guards against a second call on the same Geometry: `destroy(true)` nulls `buffers` (so
+ *  `Geometry.destroy`'s own `this.buffers.forEach(...)` would run on a null next time), so a
+ *  double release now THROWS where the old bare `geo.destroy()` was a silent no-op. The
+ *  `!g.buffers` check below is load-bearing, not defensive noise — a caller that releases the
+ *  same geometry twice (e.g. two dispose paths racing on the same slot) must still land here
+ *  safely. */
+export function releaseGeometry(g: Geometry | undefined | null): void {
+  if (!g || !g.buffers) return;
+  g.unload();
+  g.destroy(true);
+}
+
 function disposeSlot(slot: Slot) {
   slot.obj.removeFromParent();
   // Skinned mesh: a Container holding one Mesh per rig part. Release each part's shared
   // base texture (retained like a sprite) and destroy each per-part geometry (Mesh.destroy()
   // does not free it), then the container.
   if (slot.kind === 'mesh') {
-    for (const m of slot.meshes ?? []) { const geo = m.geometry; m.destroy(); geo?.destroy(); }
+    for (const m of slot.meshes ?? []) { const geo = m.geometry; m.destroy(); releaseGeometry(geo); }
     for (const u of slot.partUrls ?? []) if (u) releaseSpriteTexture(u);
     slot.obj.destroy();
     return;
@@ -314,7 +336,7 @@ function disposeSlot(slot: Slot) {
     // texture (hasFrame=false), and a spriteless material samples Texture.WHITE — never destroyed.
     const tex = slot.hasFrame ? (mesh.texture as Texture | undefined) : undefined;
     mesh.destroy();
-    geo?.destroy();
+    releaseGeometry(geo);
     // ⚠️ BARE `destroy()` ON PURPOSE — Pixi's `Shader.destroy(destroyPrograms = false)` leaves the
     // shared program alone, and `ensureSpriteMaterial` caches ONE program per material GUID that
     // every entity using that material holds a Shader built from. Changing this to `destroy(true)`
@@ -333,7 +355,12 @@ function disposeSlot(slot: Slot) {
   // shader. The atlas textures are owned by the font (fontTexturePixi, freed on font
   // release) — never destroy them here.
   if (slot.kind === 'text') {
-    for (const m of slot.pageMeshes ?? []) { const geo = m.geometry; m.destroy(); geo?.destroy(); }
+    for (const m of slot.pageMeshes ?? []) { const geo = m.geometry; m.destroy(); releaseGeometry(geo); }
+    // ⚠️ BARE `destroy()` ON PURPOSE — same hazard as the material Shader above, now shared by
+    // EVERY text entity: `mtsdfPixiShader.ts` caches its GL/GPU program at MODULE level (one
+    // program for the whole file, not one per Shader instance), so `destroy(true)` here would call
+    // `destroyPrograms` and null the SHARED program's `vertex`/`fragment` — killing every text mesh
+    // in every canvas for the rest of the session, not just this slot's.
     for (const s of slot.textShaders ?? []) s.destroy();
     slot.obj.destroy();
     return;
@@ -584,6 +611,12 @@ export class Scene2DRenderer {
   // can't stomp each other's scratch; renderers also run sequentially via frame callbacks).
   private readonly parentOfEntity = new Map<number, number>();   // entityId → parentId
   private readonly sortOrderOfEntity = new Map<number, number>(); // entityId → EntityAttributes.sortOrder
+  // Every entity id alive THIS frame (built from the same EntityAttributes query as
+  // parentOfEntity, so it's effectively "every scene entity"). Feeds `orphan2D.prune` — see
+  // there for why `activeIds` (canvas-routed entities only) is the WRONG set: an entity still
+  // orphaned this frame is alive but never enters `activeIds`, and pruning against that set
+  // would erase its in-progress warn-frame count every single frame.
+  private readonly liveEntityIds = new Set<number>();
   private paintOrderOf = new Map<number, number>();              // entityId → global paint index (sortOrder DFS)
   /** entityId → alpha inherited from GroupAlpha ancestors × its own (#211). SPARSE: only
    *  entities actually faded appear, so a scene with no GroupAlpha keeps an empty map and
@@ -1180,12 +1213,34 @@ export class Scene2DRenderer {
     this.canvasCompensate.clear();
     this.currentCanvasIds.clear();
     this.dirtyCanvases.clear();
+    this.liveEntityIds.clear();
 
     // Step 1: Build parentId + sortOrder maps from all entities with EntityAttributes
     world.query(attrMeta.trait).updateEach(([attr]: any[], entity: any) => {
       this.parentOfEntity.set(entity.id(), attr.parentId || 0);
       this.sortOrderOfEntity.set(entity.id(), attr.sortOrder || 0);
+      this.liveEntityIds.add(entity.id());
     });
+    // ⚠️ `liveEntityIds` must also cover every entity `noteOrphan2D` can reach, not just the ones
+    // with EntityAttributes: `orphan2DKey` already falls back to an `id:`-prefixed key when
+    // EntityAttributes is absent or guid-less (see that method), and an entity missing
+    // EntityAttributes entirely is exactly the one the query above skips. Without this, a LIVE
+    // such entity would have its frame count deleted by `prune` below on every single frame — the
+    // #700-adjacent gap, but for `frames` rather than `warned`. `Transform` is what every pass that
+    // can call `noteOrphan2D` (Renderable2D/SkinnedSprite2D/Text2D, all queried as `Transform + X`
+    // below) actually requires, so this one query is a superset covering all three without having
+    // to touch each pass — and it must run HERE, before `prune`, not inside those passes: they run
+    // after `prune` this same frame, so an addition made there would only ever help NEXT frame's
+    // prune, one frame too late.
+    // `updateEach` deliberately NOT used: it opens the trait stores and runs koota's change
+    // detection over every Transform in the scene, and all we want is the id set. A QueryResult IS
+    // a readonly Entity[], so plain iteration reads nothing and marks nothing.
+    for (const entity of world.query(Transform)) this.liveEntityIds.add(entity.id());
+    // Forget any orphan-warn bookkeeping for an id that no longer names a live entity — koota
+    // recycles ids, so an entity that died while still orphaned must not leave a stale count for
+    // its id's next occupant to inherit (see `Orphan2DTracker.prune`). Runs right after the live
+    // set is fully built and before any pass below calls `note`/`clear` on it.
+    this.orphan2D.prune(this.liveEntityIds);
     // Explicit Order-in-Layer overrides (Renderable2D) → sprites can stack independent of
     // the entity tree (e.g. a cut-out character's parts parented to scattered bones).
     const orderInLayerOfEntity = new Map<number, number>();
@@ -1863,7 +1918,12 @@ export class Scene2DRenderer {
           }
           const container = slot.obj as Container;
           // Rebuild all page meshes (a layout/atlas change is infrequent).
-          for (const m of slot.pageMeshes ?? []) { const g = m.geometry; m.destroy(); g?.destroy(); }
+          for (const m of slot.pageMeshes ?? []) { const g = m.geometry; m.destroy(); releaseGeometry(g); }
+          // ⚠️ BARE `destroy()` ON PURPOSE — same hazard as the material Shader's destroy above:
+          // `mtsdfPixiShader.ts` caches its GL/GPU program at MODULE level (one program shared by
+          // every text entity in the process), so `destroy(true)` here would null the SHARED
+          // program's `vertex`/`fragment` on a layout rebuild and kill every OTHER text mesh in
+          // every canvas too.
           for (const s of slot.textShaders ?? []) s.destroy();
           slot.pageMeshes = []; slot.textShaders = []; slot.pageNums = [];
           for (const { page, geo } of buildTextGeometryByPage(layout.quads)) { // Y-down, top-origin UVs (Pixi native)

@@ -12,6 +12,7 @@
 import { useEffect, useRef } from 'react';
 import { Application, Mesh, MeshGeometry, Texture, Assets, type Shader } from 'pixi.js';
 import { resolvePixiBackend } from '../../runtime/rendering/canvas2DPool';
+import { releaseGeometry } from '../../runtime/rendering/Scene2D';
 import { buildPixiShaderProgram, makePixiShaderInstance, type PixiShaderProgram } from '../../runtime/rendering/pixiShaderBuilder';
 import { resolveImageUrl } from '../../runtime/rendering/renderUtils';
 import { shaderSpace, coerceParamValue, type ShaderParam } from '../../runtime/loaders/shaderSchema';
@@ -37,6 +38,27 @@ function buildQuad(w: number, h: number): MeshGeometry {
     uvs: new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]),
     indices: new Uint32Array([0, 1, 2, 0, 2, 3]),
   });
+}
+
+/** Free this panel's own Mesh. `Application.destroy()` forwards its FIRST argument to the
+ *  renderer only — `this.stage.destroy(options)` gets its own, second argument, which the call
+ *  sites below never pass, so the stage subtree (this Mesh) is never torn down by
+ *  `app.destroy(true)` alone. `Mesh`/`Container` order `unload()` before `destroy()` correctly,
+ *  so a bare `mesh.destroy()` is safe and frees the mesh's own per-instance GPU state.
+ *
+ *  The geometry is released SEPARATELY, through `releaseGeometry` (exported from `Scene2D.tsx`):
+ *  PixiJS 8.19.0's `Geometry.destroy()` tears off its `"unload"` listener before `unload()`
+ *  fires, orphaning the WebGL VAO unless the release goes through `releaseGeometry`'s
+ *  `unload()`-then-`destroy(true)` order — see that function's own comment in `Scene2D.tsx`, and
+ *  the repo-wide static guard (`tests/architecture/geometryRelease.test.ts`) that forbids a
+ *  second, un-audited copy of that ordering anywhere else. Capture `mesh.geometry` BEFORE
+ *  `mesh.destroy()` — `Mesh.destroy()` nulls `_geometry`, so reading it after would hand
+ *  `releaseGeometry` `undefined`. */
+function destroyMesh(mesh: Mesh<MeshGeometry, Shader> | null): void {
+  if (!mesh) return;
+  const geometry = mesh.geometry;
+  mesh.destroy();
+  releaseGeometry(geometry);
 }
 
 export function ShaderPreview({ path, data }: { path: string; data: Record<string, unknown> }) {
@@ -69,6 +91,13 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
     // effect run (a new `app` instance), never carried over from a previous shader/path.
     let contextLive = false;
     const markDestroyed = () => { if (contextLive) { contextLive = false; noteGpuContextDestroyed(); } };
+    // The mesh THIS run creates, if any — separate from `stateRef.current.mesh` because that ref is
+    // shared across every effect run (StrictMode's mount→unmount→mount, or a fast shader-path
+    // switch). The catch below used to destroy `stateRef.current.mesh` directly: reachable only
+    // when THIS run made no mesh (the try's only statement after storing one is a `void`ed
+    // `renderNow`, whose rejection can't reach this catch), so it only ever fired while a LATER run
+    // had already stored ITS OWN mesh there — and destroyed that live mesh out from under it.
+    let ownMesh: Mesh<MeshGeometry, Shader> | null = null;
 
     // Every async-side destroy is guarded on `app.renderer` (Pixi nulls it in destroy()): the
     // cleanup below may already have torn the app down while we were parked on an await, and a
@@ -93,11 +122,14 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
         if (program) {
           const mesh = new Mesh({ geometry: buildQuad(SIZE, SIZE), texture: Texture.WHITE, shader: makePixiShaderInstance(program, Texture.WHITE, undefined) });
           app.stage.addChild(mesh);
+          ownMesh = mesh;
           stateRef.current.mesh = mesh;
         }
         void renderNow(stateRef.current, dataRef.current);
       } catch {
-        // init/build rejected — free any GL context we opened; leave state cleared.
+        // init/build rejected — free any GL context we opened; leave state cleared. `ownMesh`, not
+        // `stateRef.current.mesh`: a later run may already have stored ITS mesh on the shared ref.
+        destroyMesh(ownMesh);
         if (app.renderer) app.destroy(true);
         markDestroyed(); // no-op unless init actually succeeded before something else threw
       }
@@ -106,6 +138,7 @@ export function ShaderPreview({ path, data }: { path: string; data: Record<strin
     return () => {
       disposed = true;
       stateRef.current.serial++;
+      destroyMesh(stateRef.current.mesh); // must run BEFORE nulling the ref below
       stateRef.current.app = null; stateRef.current.program = null; stateRef.current.mesh = null;
       if (!app.renderer) { /* init never finished */ } else app.destroy(true);
       markDestroyed();

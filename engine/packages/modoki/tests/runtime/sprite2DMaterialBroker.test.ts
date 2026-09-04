@@ -2,7 +2,10 @@
  *  A pure module over a Set of `Map<number,Shader>` (per-renderer entity→Shader maps) +
  *  a per-frame dirty Set. It holds GLOBAL state across tests, so every map registered in a
  *  test is unregistered and the dirty set cleared in afterEach to keep tests isolated.
- *  Shaders are plain object fakes `{ destroyed?: boolean } as unknown as Shader`. */
+ *  Shaders are plain object fakes `{ _destroyed: boolean } as unknown as Shader` — `_destroyed`
+ *  because that's the field pixi.js's real `Shader` actually carries (an earlier version of
+ *  this fake modelled a public `destroyed` field that doesn't exist on the real class, which
+ *  let the source's now-fixed filter pass while doing nothing). */
 
 import { describe, it, expect, afterEach } from 'vitest';
 import type { Shader } from 'pixi.js';
@@ -15,7 +18,7 @@ import {
   clearEntity2DMaterialDirty,
 } from '../../src/runtime/rendering/sprite2DMaterialBroker';
 
-const fakeShader = (destroyed = false) => ({ destroyed } as unknown as Shader);
+const fakeShader = (destroyed = false) => ({ _destroyed: destroyed } as unknown as Shader);
 
 // Track everything we register so we can tear down the module's global Set between tests.
 // The returned unregister fns are idempotent (Set.delete of an absent map is a no-op), so

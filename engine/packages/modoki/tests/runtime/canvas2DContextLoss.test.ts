@@ -248,6 +248,59 @@ describe('canvas2DPool — GPU context loss', () => {
     expect(pool.consumeRebuildFlag(), 'a rebuilt renderer owes a full redraw').toBe(true);
     expect(pool.consumeRebuildFlag(), 'read-and-clear — only once').toBe(false);
   });
+
+  // Adversarial review of #590 (docs/plans/ios-rendering-update-wedge.md): the FIRST
+  // `Application.init()` (in `createSlot`) used to be wrapped in the SAME rejecting `withTimeout`
+  // the rebuild path uses — and that turned a merely SLOW cold bring-up (measured 8.5s on a
+  // low-end GPU) into a NEVER: `slot.ready` rejected at the 8000ms bound while `initSlotApp` kept
+  // running underneath and succeeded anyway at 8.5s, leaving a live, budget-counted GPU context
+  // whose canvas nothing ever appends (`Canvas2DMount`'s `.catch` only logs, and nothing re-arms
+  // it — `recovery.request()` is reachable only from `webglcontextlost`, which needs a context
+  // that came up in the first place). The fix: the first init is WATCHDOGGED, not bounded — past
+  // `APP_INIT_TIMEOUT_MS` it reports loudly but never rejects `slot.ready`, which just keeps
+  // waiting on the real `initSlotApp` promise.
+  it('reports a FIRST init that has not settled after the watchdog interval, but does not reject `slot.ready`', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.useFakeTimers();
+    initGate.hold = new Promise<void>(() => {}); // a genuine hang: never settles, simulating a dead GPU
+    const slot = pool.allocate(30)!;
+
+    let settled = false;
+    slot.ready.then(() => { settled = true; }, () => { settled = true; });
+
+    expect(settled, 'precondition: still pending before the watchdog interval elapses').toBe(false);
+    // 8000ms matches `APP_INIT_TIMEOUT_MS` in canvas2DPool.ts.
+    await vi.advanceTimersByTimeAsync(8001);
+    vi.useRealTimers();
+
+    expect(err, 'the watchdog must report — naming the entity — instead of staying silent').toHaveBeenCalled();
+    expect(String(err.mock.calls[0][0])).toMatch(/entity 30/);
+    expect(String(err.mock.calls[0][0])).toMatch(/has not settled/);
+    // The regression this guards: a rejection here made a slow-but-alive device WORSE than doing
+    // nothing. Nothing can retry a first init, so the only honest move is to report, not fail it.
+    expect(settled, 'a hung first init must not reject (or resolve) `slot.ready` — there is nothing to retry it with').toBe(false);
+  });
+
+  it('still resolves `slot.ready` and finishes initializing when the FIRST init is merely SLOW-BUT-ALIVE, past the watchdog interval', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {}); // the watchdog fires too — that's expected here
+    vi.useFakeTimers();
+    let release!: () => void;
+    initGate.hold = new Promise<void>((r) => { release = r; }); // slow, not hung — settles later
+    const slot = pool.allocate(31)!;
+
+    let settled = false;
+    slot.ready.then(() => { settled = true; });
+
+    await vi.advanceTimersByTimeAsync(8001); // past the watchdog interval — the cold GPU is still coming up
+    expect(settled, 'precondition: still slow, not yet finished').toBe(false);
+
+    release(); // the slow-but-alive driver finally comes up
+    vi.useRealTimers();
+    await slot.ready;
+
+    expect(settled, 'a slow-but-alive first init must still resolve `slot.ready`, however late').toBe(true);
+    expect(slot.initialized, 'and the slot must actually finish coming up, usable').toBe(true);
+  });
 });
 
 describe('canvas2DPool.destroyPool — the boot race (#213 root cause)', () => {
@@ -352,5 +405,34 @@ describe('canvas2DPool.destroyPool — the boot race (#213 root cause)', () => {
     // Without the re-map, allocate() would take a FRESH slot and the mounted canvas would be
     // orphaned — visible, and permanently blank.
     expect(pool.allocate(3), 'the same slot must be handed back').toBe(slot);
+  });
+
+  // Defect B: `destroyPool()` never destroyed a KEPT slot's Application once its last claim
+  // dropped — the doc comment claimed `renderAll`'s shrink path collected it, but by the time
+  // `destroyPool()` runs, `Game.tsx` has already called `stopScene2D()`, which unregisters the
+  // frame callback that drives `renderAll`. Up to MAX_SLOTS Applications could survive a
+  // "destroy" forever, holding live GPU contexts.
+  it('destroys a KEPT slot once its last claim finally drops, with no driver left to do it (defect B)', async () => {
+    const slot = pool.mount(7)!;
+    await slot.ready;
+    document.body.appendChild(slot.canvas);   // still on screen when the pool is torn down
+    const rec = created[created.length - 1];
+
+    pool.destroyPool();                       // kept — mount claim still held
+    expect(slot.destroyed, 'precondition: kept, not destroyed yet').toBeFalsy();
+    expect(rec.destroyed, 'precondition: its Application is still alive').toBe(false);
+
+    document.body.removeChild(slot.canvas);
+    pool.unmount(7);                          // the last claim drops. Nothing else runs `renderAll`.
+
+    expect(slot.destroyed, 'a kept slot must be destroyed once its last claim drops').toBe(true);
+    expect(rec.destroyed, 'its Application must actually be torn down, not merely flagged').toBe(true);
+    expect(rec.destroyArg, 'the same full teardown the shrink/disposal paths use').toBe(true);
+
+    // It must not have been quietly RECYCLED either — a slot this pool destroyed must not be
+    // handed back for reuse. With only one slot ever created here, the old (buggy) reclaim-only
+    // behaviour would have made this exact slot the sole free one and handed it straight back.
+    const reused = pool.allocate(7)!;
+    expect(reused, 'a destroyed slot must not be reused — a DESTROY destroys').not.toBe(slot);
   });
 });

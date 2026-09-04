@@ -4,7 +4,7 @@
  *  object's userData. Time comes from the REAL Time trait via getVisualDelta, so
  *  pause/timeScale gating is exercised too. */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { createWorld } from 'koota';
 import { Time } from '../../src/runtime/core/traits/Time';
 import { MaterialInstance, type MaterialParamOverride } from '../../src/runtime/traits/MaterialInstance';
@@ -505,11 +505,10 @@ describe('materialInstanceSystem', () => {
 // The system reaches an entity's live 2D-material Shader(s) via sprite2DMaterialBroker.
 // We register a fake per-entity shader map (a real broker registration) and assert its
 // matUniforms.uniforms are driven — sharing the SAME evalSource + clocks as the 3D path.
-const shaders2d = new Map<number, { resources: { matUniforms: { uniforms: Record<string, unknown> } }; destroyed: boolean }>();
-register2DMaterialShaderMap(shaders2d as never);
+const shaders2d = new Map<number, { resources: { matUniforms: { uniforms: Record<string, unknown> } }; _destroyed: boolean }>();
 
 function fakeShader(declared: Record<string, unknown> = {}) {
-  return { resources: { matUniforms: { uniforms: { ...declared } } }, destroyed: false };
+  return { resources: { matUniforms: { uniforms: { ...declared } } }, _destroyed: false };
 }
 function attach2D(world: ReturnType<typeof createWorld>, overrides: MaterialParamOverride[], declared: Record<string, unknown> = {}) {
   const e = world.spawn(MaterialInstance({ overrides }));
@@ -519,6 +518,15 @@ function attach2D(world: ReturnType<typeof createWorld>, overrides: MaterialPara
 }
 
 describe('materialInstanceSystem — 2D materials', () => {
+  // Register/unregister the fake shader map AROUND this block, not at import time — a
+  // module-global registration outlives the block that owns it, and koota assigns small
+  // sequential entity ids per world, so a stale `shaders2d` entry at (say) id 1 would collide
+  // with a fresh 3D-only entity of the same id in the describe block below.
+  // materialInstanceSystem checks getEntity2DMaterialShaders() FIRST and returns early on a
+  // hit, so that collision would silently skip the 3D path for the colliding entity.
+  let unregisterShaders2d: () => void;
+  beforeAll(() => { unregisterShaders2d = register2DMaterialShaderMap(shaders2d as never); });
+  afterAll(() => { unregisterShaders2d(); });
   beforeEach(() => { shaders2d.clear(); });
 
   it('writes a uniform override into the entity\'s matUniforms group (declared target)', () => {
@@ -679,7 +687,7 @@ describe('materialInstanceSystem — 2D materials', () => {
     const world = newWorld();
     spawnTime(world);
     const { sh } = attach2D(world, [{ target: 'uK', kind: 'uniform', source: { type: 'constant', value: 1 } }], { uK: 0 });
-    sh.destroyed = true;
+    sh._destroyed = true;
 
     materialInstanceSystem(world);
     expect(sh.resources.matUniforms.uniforms.uK).toBe(0); // not written into freed state

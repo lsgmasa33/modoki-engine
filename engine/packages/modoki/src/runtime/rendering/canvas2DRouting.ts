@@ -95,7 +95,8 @@ export function findUnrenderable2D(
  *  same split as the routing walk above, and the same reason: the component owns the draw loop,
  *  this module owns what the draw loop DECIDES.
  *
- *  Two properties it exists to hold, both of which regressed silently in the class version:
+ *  Three properties it exists to hold, all of which regressed silently in the class version (or a
+ *  rewrite of it):
  *
  *  1. **It FORGETS an entity that recovers.** The warned set is keyed by guid (so it survives a
  *     hot-reload's id reassignment), and nothing dropped a key when the entity found a canvas —
@@ -104,7 +105,13 @@ export function findUnrenderable2D(
  *     break is the silent one. Same gap `resolveRefWarnOnce` had (QA-ASSET-0005).
  *  2. **The guid lookup stays OFF the hot path.** `key()` is a callback, not a value, and it is
  *     invoked only on the frame an entity crosses the warn threshold or recovers — never for the
- *     healthy entities that make up the whole scene, which is every entity, every frame. */
+ *     healthy entities that make up the whole scene, which is every entity, every frame.
+ *  3. **It FORGETS an entity that dies.** `frames` is keyed by the numeric entity id, which koota
+ *     recycles — an entity deleted while still orphaned left its count in `frames` forever, so the
+ *     next entity to inherit that id started from a stale count and could never again hit `note()`'s
+ *     exact-equality trigger. `prune()` closes this the same way `clear()` closes (1): a caller
+ *     that calls it once per frame/sweep with the frame's live ids keeps `frames` bounded by
+ *     currently-orphaned entities, not by every entity ever orphaned. */
 export class Orphan2DTracker {
   private readonly frames = new Map<number, number>();
   private readonly warned = new Set<string>();
@@ -133,4 +140,25 @@ export class Orphan2DTracker {
 
   /** Forget everything (teardown / tests). */
   reset(): void { this.frames.clear(); this.warned.clear(); }
+
+  /** Drop `frames` tracking for any id NOT in `aliveIds` — the fix for the id-recycling gap:
+   *  `note()`/`clear()` only run on frames Scene2D actually visits an entity, so one that DIES
+   *  while still orphaned leaves its count in `frames` forever. koota then recycles that same
+   *  numeric id for an unrelated entity, which inherits a count >= `afterFrames` and can never
+   *  again hit `note()`'s exact-equality trigger — the warn-once-must-forget failure this class
+   *  exists to prevent, reintroduced one level down (it forgot on recovery, not on death).
+   *
+   *  Call once per frame/sweep with the frame's live entity ids — the same prune-by-active-set
+   *  shape this codebase already uses for the same recycling hazard (e.g. `videoTextureSync.ts`'s
+   *  `seen` set).
+   *
+   *  ⚠️ Only `frames` is pruned HERE — `warned` has the SAME id-recycling collision, via its own
+   *  `id:` fallback key: `Scene2D.orphan2DKey` falls back to `` `id:${entityId}` `` whenever
+   *  `EntityAttributes.guid` is empty or unreadable, and koota recycles ids, so a guid-less
+   *  orphan's `id:` key can outlive it and silence a later, unrelated entity that recycles the
+   *  same numeric id. This is deliberately NOT fixed here — see #700, which tracks it. */
+  prune(aliveIds: ReadonlySet<number>): void {
+    if (this.frames.size === 0) return;
+    for (const id of this.frames.keys()) if (!aliveIds.has(id)) this.frames.delete(id);
+  }
 }

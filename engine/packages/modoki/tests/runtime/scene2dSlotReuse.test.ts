@@ -146,7 +146,15 @@ function mockDeps() {
       destroy = vi.fn();
       constructor(opts?: any) { this.source = opts?.source; if (opts?.frame) { this.width = opts.frame.width ?? 0; this.height = opts.frame.height ?? 0; } }
     }
-    class MeshGeometry { destroy = vi.fn(); constructor(public opts?: any) {} }
+    // `buffers` mirrors real Pixi Geometry: a truthy array until `destroy(true)` nulls it, which
+    // is what `releaseGeometry`'s `!g.buffers` idempotency guard checks (a second call must not
+    // re-run unload/destroy, exactly like the real Geometry.destroy() nulling `buffers`).
+    class MeshGeometry {
+      buffers: unknown[] | null = [];
+      unload = vi.fn();
+      destroy = vi.fn(() => { this.buffers = null; });
+      constructor(public opts?: any) {}
+    }
     class Mesh extends Display {
       kind = 'material';
       geometry: any; texture: any; shader: any; tint = 0xffffff; blendMode = 'normal';
