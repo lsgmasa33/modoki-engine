@@ -168,7 +168,7 @@ interface ViewState {
   uncachedTicks: number;
 }
 const viewStates = new Map<string, ViewState>();
-onWorldSwap(() => { viewStates.clear(); warnedUncached.clear(); });
+onWorldSwap(() => { viewStates.clear(); warnedUncached.clear(); warnedOverridden.clear(); });
 
 /** Views already warned about an AUTHORING mistake (see `diagnoseBlankView`), so a per-frame
  *  system does not spam the console.
@@ -188,6 +188,16 @@ const warned = new Set<string>();
  *  occurrence for good. */
 const warnedUncached = new Set<string>();
 
+/** Entity+field pairs already warned about an AUTHORED value the box pin below is about to
+ *  overwrite (#651 B1 sibling — margin/min/max on a pooled `UIEntries` root). Keyed on
+ *  `${entityId}:${field}` rather than the view, because the fault is per pooled ROOT: the same
+ *  view can have some slots authored correctly and others not.
+ *
+ *  ⚠️ Cleared on a world swap, like `warnedUncached` and unlike `warned`: a scene load mints
+ *  fresh ecs ids for every pooled root, so anything keyed by id here is meaningless in the next
+ *  scene and would otherwise grow forever. */
+const warnedOverridden = new Set<string>();
+
 /** How many consecutive pipeline ticks a prefab may stay uncached before the system says so.
  *  120 ticks is ~2s at 60fps, and matches the established `Canvas2DMount` precedent for exactly
  *  this shape of diagnostic ("canvas still 0x0 after 120 frames"). It is a WARN, not an error:
@@ -195,7 +205,9 @@ const warnedUncached = new Set<string>();
 const UNCACHED_WARN_TICKS = 120;
 
 /** Reset module state — tests and teardown. */
-export function resetEntriesSystem(): void { viewStates.clear(); warned.clear(); warnedUncached.clear(); }
+export function resetEntriesSystem(): void {
+  viewStates.clear(); warned.clear(); warnedUncached.clear(); warnedOverridden.clear();
+}
 
 /** Say WHY a pooled view is blank when the cause is the PREFAB rather than the authoring.
  *
@@ -930,6 +942,25 @@ function writeWindowState(view: EntityLike, m: Metas, xw: AxisWindow, yw: AxisWi
   view.set(m.enMeta.trait, next);
 }
 
+/** Warn once per pooled SLOT per field when the box pin below is about to overwrite a value the
+ *  AUTHOR actually set (i.e. `cur !== none` — already-`none` is the common case and not worth a
+ *  line). Runs in the frame loop, so `warnedOverridden` is what keeps this to one line per
+ *  offender rather than one per tick forever.
+ *
+ *  ⚠️ Keyed on `viewGuid:slot`, NOT on `entity.id()`. koota RECYCLES entity ids, so an id key is
+ *  wrong in both directions within a single scene: tearing down one `UIEntries` view and building
+ *  another can hand a fresh pooled root a retired id whose field was already warned, silently
+ *  swallowing a real authoring mistake. A view's guid plus its slot index names the same seat for
+ *  as long as the view exists and can never collide with a different view's. */
+function warnAuthoredOverride(entity: EntityLike, attr: Record<string, unknown>, viewGuid: string, slot: number, field: string, cur: unknown, none: unknown): void {
+  if (cur === none) return;
+  const key = `${viewGuid}:${slot}:${field}`;
+  if (warnedOverridden.has(key)) return;
+  warnedOverridden.add(key);
+  const name = (attr.name as string) || `#${entity.id()}`;
+  console.warn(`[UIEntries] entity '${name}' authored UIElement.${field}=${String(cur)}, but a pooled UIEntries root owns its own box and pins ${field} to ${String(none)} every tick — the authored value never takes effect.`);
+}
+
 /** Bind each slot to its coordinate, then fill it from the game's resolver. */
 function applySlots(
   world: World, plan: ReturnType<typeof planSlots>, pool: Map<number, EntityLike>,
@@ -987,15 +1018,38 @@ function applySlots(
     //  auto-width row (a `%` against an indefinite container silently becomes content-sized).
     //  `flexShrink: 0` is the other half: without it the row's own trailing padding squeezes
     //  every entry to nothing, which is exactly how the pager rendered 0px-wide pages.
+    //
+    //  `margin*: 0` is the third half (#651, see docs/ui-system.md's "Scroll views" section for
+    //  the full derivation): margin sits outside the border box, so an authored margin on the
+    //  prefab root would desync the real on-screen stride from `entrySize + gap` — the same
+    //  move as pinning width/height/flexShrink above, for the same reason.
+    //
+    //  `minWidth/maxWidth/minHeight/maxHeight: 0` (each field's own "none", per UIElement.ts) are
+    //  the fourth half (#651 B1 sibling): a min/max constraint overrides the definite width/height
+    //  above from INSIDE the border box, the same desync as margin from outside it. Unlike the
+    //  other pins, these (and margin) can silently discard an AUTHORED value, so overwriting one
+    //  that isn't already "none" gets a one-time warning — see `warnAuthoredOverride`.
     const ui = entity.get(m.uiMeta.trait) as Record<string, unknown> | undefined;
     if (ui) {
       const wantW = Math.max(0, grid.entryW);
       const wantH = Math.max(0, grid.entryH);
+      warnAuthoredOverride(entity, attr, viewGuid, slot, 'marginTop', ui.marginTop, 0);
+      warnAuthoredOverride(entity, attr, viewGuid, slot, 'marginRight', ui.marginRight, 0);
+      warnAuthoredOverride(entity, attr, viewGuid, slot, 'marginBottom', ui.marginBottom, 0);
+      warnAuthoredOverride(entity, attr, viewGuid, slot, 'marginLeft', ui.marginLeft, 0);
+      warnAuthoredOverride(entity, attr, viewGuid, slot, 'minWidth', ui.minWidth, 0);
+      warnAuthoredOverride(entity, attr, viewGuid, slot, 'maxWidth', ui.maxWidth, 0);
+      warnAuthoredOverride(entity, attr, viewGuid, slot, 'minHeight', ui.minHeight, 0);
+      warnAuthoredOverride(entity, attr, viewGuid, slot, 'maxHeight', ui.maxHeight, 0);
       if (ui.isVisible !== live || ui.width !== wantW || ui.height !== wantH
-        || ui.widthUnit !== 'px' || ui.heightUnit !== 'px' || ui.flexShrink !== 0) {
+        || ui.widthUnit !== 'px' || ui.heightUnit !== 'px' || ui.flexShrink !== 0
+        || ui.marginTop !== 0 || ui.marginRight !== 0 || ui.marginBottom !== 0 || ui.marginLeft !== 0
+        || ui.minWidth !== 0 || ui.maxWidth !== 0 || ui.minHeight !== 0 || ui.maxHeight !== 0) {
         entity.set(m.uiMeta.trait, {
           ...ui, isVisible: live, flexShrink: 0,
           width: wantW, widthUnit: 'px', height: wantH, heightUnit: 'px',
+          marginTop: 0, marginRight: 0, marginBottom: 0, marginLeft: 0,
+          minWidth: 0, maxWidth: 0, minHeight: 0, maxHeight: 0,
         });
       }
     }

@@ -37,6 +37,13 @@ export const UIElement = trait({
   paddingRightUnit: '%' as UILengthUnit,
   paddingBottom: 0,
   paddingBottomUnit: '%' as UILengthUnit,
+  /** ⚠️ **Pinned to 0 on a pooled `UIEntries` row root — authoring these there does nothing.**
+   *  Mechanism, why, and what the warning/Inspector note do and do not reach:
+   *  `docs/ui-system.md` § "The engine OWNS a pooled row's box" (#651).
+   *
+   *  NOT a row of the gated-colour table below: that trap is an authored value gated by a
+   *  companion FIELD defaulting to 0, and this has no gating field at all — the gate is whether
+   *  the entity happens to be a scroll view's row. Cited here so nobody adds a wrong row. */
   marginTop: 0,
   marginTopUnit: '%' as UILengthUnit,
   marginRight: 0,
@@ -45,6 +52,7 @@ export const UIElement = trait({
   marginBottomUnit: '%' as UILengthUnit,
   marginLeft: 0,
   marginLeftUnit: '%' as UILengthUnit,
+  /** ⚠️ Also pinned to 0 on a pooled `UIEntries` row — see the margin note above. */
   minWidth: 0,   // 0 = none
   minWidthUnit: 'px' as UILengthUnit,
   maxWidth: 0,   // 0 = none

@@ -200,6 +200,24 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `elementType: 'input'` (player-entered text, not an authored label — see `UIElement.ts`). Fit
   math: `runtime/ui/autoFitText.ts`; DOM measurement: `UINode.tsx`'s `AutoFitText`.
 
+  ⚠️ **`maxLines` clamps LINE BOXES only — a `display: inline-block` text child defeats it
+  (#646).** `maxLines > 0` sets the entity div's own `display: '-webkit-box'` +
+  `-webkit-line-clamp` (`UINode.tsx`) — Chromium's legacy clamp mechanism, which only splits
+  BLOCK-level descendant content into lines. A plain text child works; a wrapper `<span>` around
+  the text (`AutoFitText`, `AnimatedText`) does not if it is `inline-block` — the clamp treats it
+  as one atomic inline-level box (like an image) and does nothing, leaving `overflow: hidden` on
+  a box whose height has collapsed (a ~12px sliver, or the full unclamped height without an
+  accompanying flex-shrink squeeze). Both wrapper spans are `display: 'block'` for exactly this
+  reason — verified this does not reopen #614's flex-stretch measurement bug: under this
+  entity's normal `display: flex` (no `maxLines`), a flex item's `inline-block` is *blockified*
+  to `block` regardless of what is authored, so `block` and `inline-block` compute identically
+  there. Two non-flex contexts escape that blockification, not one, and both need the authored
+  value to already be `block`: the `-webkit-box` parent (exactly the `maxLines` case), and
+  `AutoFitText`'s own span — itself `display: 'block'`, never flex — whenever it wraps
+  `AnimatedText` (both `autoFitText` and a `TextAnimation` authored on the same node). That
+  nesting makes the animation span a child of a plain block box instead of a flex item,
+  independently of whether `maxLines` is even set.
+
   ⚠️ **The fit converges by RE-MEASUREMENT, never by the model (#614 follow-up).** The first
   estimate (`authoredPx * availablePx / naturalPx`) is exact only when width passes through the
   origin — real text is affine: `games/text_demo`'s "UI TEXT ANIMATION" (42px, `letterSpacing:
@@ -1129,6 +1147,39 @@ input at all. Scroll is exogenous; `first` is the response. The accumulator rese
 pool actually re-drives, so it stays "the distance the pool has to cover", dropped frames folded
 in.
 
+### The engine OWNS a pooled row's box — eight authored fields are inert there (#651)
+
+`entriesSystem` pins the resolved entry box onto every pooled entry root every tick, and that
+list is longer than it looks. Beyond `width`/`height`/`widthUnit`/`heightUnit` and
+`flexShrink: 0`, it also forces **`marginTop/Right/Bottom/Left`** and
+**`minWidth/maxWidth/minHeight/maxHeight`** to `0`.
+
+Both groups exist for the same reason and attack the stride from opposite sides:
+
+- **Margin sits OUTSIDE the border box.** An authored margin on the entry prefab root makes the
+  real on-screen stride `entrySize + gap + marginStart + marginEnd`, while the whole scroll
+  geometry is solved from `stride = entrySize + gap`. Unlike a one-off offset this is **per item
+  and accumulates linearly with the index**: 200 entries at `entryHeight: 120`, `gapY: 8`,
+  `marginBottom: 4` puts entry 199 at `199 × 132 = 26268` while `scrollToEntry(199)` writes
+  `199 × 128 = 25472` — 796px, six entries short, and `padLeading` drifts by the same amount so
+  pooled slots walk off their snap points the deeper you scroll.
+- **A min/max constraint overrides the definite size from INSIDE it.** The pin writes a definite
+  `width`/`height`; a `maxWidth` smaller than it silently wins, and the stride desyncs the same
+  way. These four were missed by the original margin fix and are the same defect.
+
+⚠️ **This is an "authored field that does nothing" — CLAUDE.md's partially-wired-authoring-surface
+class — and the mitigations are deliberately incomplete.** `entriesSystem` warns once per slot per
+field when it discards a non-default authored value (keyed `viewGuid:slot:field`, **not**
+`entity.id()`, because koota recycles ids and a retired id would swallow a real mistake), and the
+Inspector shows a "pooled row" note on the `UIElement` section, gated on the sibling `UIEntry`
+trait via `selectionPooledRowGate`.
+
+**The Inspector note cannot reach the case that matters.** `UIEntry` is stamped by the engine on
+the LIVE pooled instance at spawn, so the note appears when you select a running row. The entry
+**prefab** — the thing you actually open and author — carries no marker saying it is used as an
+entry kind, and no such marker exists today. So the authoring path has no editor cover at all, and
+the runtime warning is the only thing that catches it, after the fact.
+
 ### Measured on the low-end target
 
 Galaxy A23 (Mali-G57 MC2), the shipped web build of `games/scroll-demo`, driven by real touch
@@ -1505,7 +1556,7 @@ So the content child is a **column of auto-width rows**: an auto-width box sizes
 | the scroll box | `overflow`, `scroll-snap-type`, `overscroll-behavior` |
 | `__uiEntriesContent` (column) | the **Y** offset as `padding-top`/`bottom`, and the **Y** gap as `gap` |
 | `__uiEntriesRow` (row, auto width) | the **X** offset as `padding-left`/`right`, and the **X** gap as `gap` |
-| the pooled entry | the resolved entry size in px, `flex-shrink: 0`, and `scroll-snap-align` |
+| the pooled entry | the resolved entry size in px, `flex-shrink: 0`, `margin: 0`, and `scroll-snap-align` |
 
 Three things fall out of the split rather than needing their own rule: `UIElement`'s single `gap`
 field serves both axes (a column's gap is the Y gap, a row's is the X gap); wrap disappears, so
@@ -1518,6 +1569,14 @@ needs; and `padLeading + rendered + padTrailing` lands exactly on `count × stri
 of the authored value — it *is* the authored value resolved (`%` against the live viewport, `0`
 read back from the prefab root), and a definite box is what a `%`-sized prefab root needs once
 its parent is an auto-width row.
+
+⚠️ **The pooled root's margin is zeroed too, for the same reason `flex-shrink: 0` is (#651).**
+`stride = entrySize + gap` is the whole model — every offset above (`padLeading`/`padTrailing`,
+`scrollToEntry`'s px conversion) is `index × stride`. Margin sits OUTSIDE the border box, so an
+authored margin on the entry prefab root would make the REAL on-screen stride
+`entrySize + gap + marginStart + marginEnd`, a term the model never carries — and unlike a single
+intercept, this one is per-entry and compounds linearly with index, drifting every pooled slot
+further off its scroll-snap point the deeper the list goes.
 
 ⚠️ **Two things change the window without moving its origin, and both are in the invalidation
 test.** A viewport RESIZE leaves `first` put while every padding value changes — without that the

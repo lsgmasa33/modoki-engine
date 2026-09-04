@@ -62,15 +62,17 @@ const ENTRY_H = 120;
 const VIEWPORT = 600;
 const PREFAB = 'prefab-guid-1';
 
-/** A fake entry prefab: a root UIElement plus one named child, spawned directly. */
-function makeProvider() {
+/** A fake entry prefab: a root UIElement plus one named child, spawned directly.
+ *  `rootOverrides` lets a test author extra UIElement fields on the root — e.g. a margin, to
+ *  check the system zeroes it (#651). */
+function makeProvider(rootOverrides: Record<string, unknown> = {}) {
   const spawned: number[] = [];
   return {
     spawned,
     isCached: () => true,
     rootSize: () => ({ width: 0, height: ENTRY_H }),
     spawnInstance: (world: any, _guid: string, opts: { parentId: number; guidSeed: string }) => {
-      const root = world.spawn(UIElement({ height: ENTRY_H }), RenderableUI(),
+      const root = world.spawn(UIElement({ height: ENTRY_H, ...rootOverrides }), RenderableUI(),
         PrefabInstance({ source: PREFAB, localId: 1 }),
         EntityAttributes({ name: 'Entry', parentId: opts.parentId, guid: opts.guidSeed }));
       idIndex.set(root.id(), root);
@@ -84,12 +86,12 @@ function makeProvider() {
   };
 }
 
-async function setup(entries: Partial<Record<string, unknown>> = {}, scroll = 0) {
+async function setup(entries: Partial<Record<string, unknown>> = {}, scroll = 0, rootOverrides: Record<string, unknown> = {}) {
   const sys = await import('../../src/runtime/ui/entriesSystem');
   const src = await import('../../src/runtime/ui/entrySource');
   sys.resetEntriesSystem();
   src.clearEntrySources();
-  const provider = makeProvider();
+  const provider = makeProvider(rootOverrides);
   sys.setEntryPrefabProvider(provider);
 
   const view = testWorld.spawn(
@@ -140,6 +142,62 @@ describe('entriesSystem', () => {
     expect(content.paddingBottomUnit).toBe('px');
     expect(content.paddingTop % ENTRY_H).toBe(0);
     expect(content.paddingTop).toBeGreaterThan(0);
+  });
+
+  // #651 — computeAxisWindow solves the whole scroll geometry from `stride = entrySize + gap`
+  // alone. A margin authored on the entry prefab's root sits OUTSIDE that box, so the real
+  // on-screen stride would silently gain a term the model never carries. The system must
+  // zero the root's margin the same way it already pins width/height/flexShrink.
+  it('zeroes a margin authored on the entry prefab root, so it cannot desync the stride model', async () => {
+    const { sys } = await setup({}, 0, { marginTop: 4, marginRight: 8, marginBottom: 4, marginLeft: 8 });
+    sys.entriesSystem(testWorld);
+    let entryRoot: any;
+    testWorld.query(EntityAttributes, UIElement).updateEach(([a, ui]: any[]) => {
+      if (a.name === 'Entry') entryRoot = ui;
+    });
+    expect(entryRoot.marginTop).toBe(0);
+    expect(entryRoot.marginRight).toBe(0);
+    expect(entryRoot.marginBottom).toBe(0);
+    expect(entryRoot.marginLeft).toBe(0);
+  });
+
+  // #651 B1 sibling: minWidth/maxWidth/minHeight/maxHeight override the pinned px width/height
+  // from INSIDE the border box, the same desync as an authored margin from outside it — and
+  // were missed the first time round.
+  it('zeroes a maxWidth authored on the entry prefab root, so it cannot desync the stride model', async () => {
+    const { sys } = await setup({}, 0, { maxWidth: 60 });
+    sys.entriesSystem(testWorld);
+    let entryRoot: any;
+    testWorld.query(EntityAttributes, UIElement).updateEach(([a, ui]: any[]) => {
+      if (a.name === 'Entry') entryRoot = ui;
+    });
+    expect(entryRoot.maxWidth).toBe(0);
+  });
+
+  it('warns ONCE per entity+field when an authored min/max override is discarded, not every tick', async () => {
+    // The fixture pools several entries (see the first test's 8), and EVERY one of them carries
+    // the same authored override — so "once" here means once PER ENTITY, not one line total.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { sys, src, provider } = await setup({}, 0, { maxWidth: 60 });
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    const named = () => warn.mock.calls.filter(c => String(c[0]).includes('maxWidth'));
+    const afterFirstTick = named().length;
+    expect(afterFirstTick).toBe(provider.spawned.length);   // one line per pooled entity, not per tick
+    expect(String(named()[0][0])).toContain('Entry');        // names the offending entity
+
+    // The pin already self-corrects the value every tick, so running MORE ticks with nothing
+    // re-authored proves nothing about the guard by itself — the real test is to put the override
+    // BACK on every pooled root, exactly what a live Inspector edit while playing would do, and
+    // confirm the GUARD (not the self-correction) is what keeps the count from climbing again.
+    sys.entriesSystem(testWorld);
+    expect(named().length, 'no growth from an idle tick').toBe(afterFirstTick);
+
+    testWorld.query(EntityAttributes, UIElement).updateEach(([a]: any[], e: any) => {
+      if (a.name === 'Entry') e.set(UIElement, { ...(e.get(UIElement) as any), maxWidth: 60 });
+    });
+    sys.entriesSystem(testWorld);
+    expect(named().length, 're-authoring the SAME override must not re-warn').toBe(afterFirstTick);
   });
 
   it('asks the resolver for the DATA coordinate and writes what it answers', async () => {

@@ -1,0 +1,36 @@
+{
+  "id": "e2e-ui-resize-scale-scene-0000-000000000000",
+  "version": 9,
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "resources": [],
+  "entities": [
+    {
+      "id": 1,
+      "name": "PaddedParent",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 200, "height": 150, "widthUnit": "px", "heightUnit": "px", "paddingLeft": 60, "paddingLeftUnit": "px", "paddingRight": 60, "paddingRightUnit": "px", "borderWidth": 5, "backgroundColor": 2500134, "backgroundOpacity": 0.3 },
+        "EntityAttributes": { "name": "PaddedParent", "isActive": true, "sortOrder": 0, "parentId": 0, "layer": "ui" }
+      }
+    },
+    {
+      "id": 2,
+      "name": "PercentChild",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 50, "height": 50, "widthUnit": "%", "heightUnit": "px", "backgroundColor": 3447003, "backgroundOpacity": 0.9 },
+        "EntityAttributes": { "name": "PercentChild", "isActive": true, "sortOrder": 0, "parentId": 1, "layer": "ui" }
+      }
+    },
+    {
+      "id": 3,
+      "name": "AnchoredPercentChild",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 50, "height": 120, "widthUnit": "%", "heightUnit": "px", "backgroundColor": 15105570, "backgroundOpacity": 0.9 },
+        "UIAnchor": { "anchor": "bottom-right", "top": 0, "topUnit": "px", "left": 0, "leftUnit": "px", "right": 0, "rightUnit": "px", "bottom": 0, "bottomUnit": "px", "pivotX": 1, "pivotY": 1, "safeArea": false, "zIndex": 1 },
+        "EntityAttributes": { "name": "AnchoredPercentChild", "isActive": true, "sortOrder": 0, "parentId": 1, "layer": "ui" }
+      }
+    }
+  ]
+}

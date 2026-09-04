@@ -84,6 +84,34 @@
         "UIElement": { "isVisible": true, "alignSelf": "center", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "letterSpacing": 3, "textColor": 16777215, "autoFitText": true },
         "EntityAttributes": { "name": "AutoFitContentSizedOn", "guid": "e2e50000-0000-4000-8000-000000000009", "isActive": true, "sortOrder": 8, "parentId": 7, "layer": "ui" }
       }
+    },
+    {
+      "id": 10,
+      "name": "MaxLinesAutoFit",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 160, "widthUnit": "px", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "fontSizeMin": 42, "letterSpacing": 3, "textColor": 16777215, "autoFitText": true, "maxLines": 1, "textOverflow": "ellipsis" },
+        "EntityAttributes": { "name": "MaxLinesAutoFit", "guid": "e2e50000-0000-4000-8000-000000000010", "isActive": true, "sortOrder": 9, "parentId": 0, "layer": "ui" }
+      }
+    },
+    {
+      "id": 11,
+      "name": "MaxLinesTextAnim",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 160, "widthUnit": "px", "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "letterSpacing": 3, "textColor": 16777215, "maxLines": 1, "textOverflow": "ellipsis" },
+        "TextAnimation": { "effect": "wave", "speed": 1, "amplitude": 0.1, "frequency": 1, "loop": true },
+        "EntityAttributes": { "name": "MaxLinesTextAnim", "guid": "e2e50000-0000-4000-8000-000000000011", "isActive": true, "sortOrder": 10, "parentId": 0, "layer": "ui" }
+      }
+    },
+    {
+      "id": 12,
+      "name": "AutoFitPaddedBordered",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": { "isVisible": true, "width": 384, "widthUnit": "px", "paddingLeft": 20, "paddingLeftUnit": "px", "paddingRight": 20, "paddingRightUnit": "px", "borderWidth": 2, "backgroundOpacity": 0.9, "backgroundColor": 3447003, "text": "UI TEXT ANIMATION", "fontSize": 42, "fontSizeUnit": "px", "letterSpacing": 3, "textColor": 16777215, "autoFitText": true },
+        "EntityAttributes": { "name": "AutoFitPaddedBordered", "guid": "e2e50000-0000-4000-8000-000000000012", "isActive": true, "sortOrder": 11, "parentId": 0, "layer": "ui" }
+      }
     }
   ]
 }

@@ -9,7 +9,7 @@ import { pushAction } from '../undo/undoManager';
 import { entityRef } from '../undo/entityRef';
 import { notifyFieldEdited } from '../animation/recording';
 import { useEditorStore } from '../store/editorStore';
-import { anchorRefPoint, anchorDragAxes, computeMoveOffsets, computeResize, frameToLogicalRect } from '../scene/uiResizeMath';
+import { anchorRefPoint, anchorDragAxes, accumulateAncestorScale, computeMoveOffsets, computeResize, containingBlockSize, frameToLogicalRect, paddingBoxRect } from '../scene/uiResizeMath';
 import { resolveLengthPx } from '../../runtime/ui/anchorLayout';
 import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 
@@ -31,6 +31,28 @@ function traitMeta(name: string) {
   const meta = getAllTraits().find(m => m.name === name);
   if (meta) _metaCache.set(name, meta);
   return meta;
+}
+
+/** The DOM-coupled half of the SECOND-transform correction (#651 B2 follow-up, and its own
+ *  rotation regression): walk from `start` (inclusive) up through `.parentElement` to
+ *  (EXCLUDING) the preview `frame`, reading each node's OWN `getComputedStyle().transform`,
+ *  and compound them via `accumulateAncestorScale` (uiResizeMath.ts). The frame is excluded
+ *  because its `transform: scale(uiScale)` is already divided out separately (`toLogicalDelta`'s
+ *  `scaleX`/`scaleY`) — including it here would double-count it.
+ *
+ *  This replaces the old `ancestorScaleRatio(screenSize, layoutSize, frameScaleAxis)`, which
+ *  compared a `getBoundingClientRect()` box to a layout size — correct only when nothing in the
+ *  chain is rotated (`getBoundingClientRect()` on a rotated element returns its inflated
+ *  axis-aligned bounding box, not its true size). Reading the transform MATRIX directly instead
+ *  of a box ratio is exact under rotation too — see `decomposeScale`'s doc comment. */
+function measureAncestorScale(start: HTMLElement, frame: HTMLElement): { x: number; y: number } {
+  const transforms: string[] = [];
+  let node: HTMLElement | null = start;
+  while (node && node !== frame) {
+    transforms.push(getComputedStyle(node).transform);
+    node = node.parentElement;
+  }
+  return accumulateAncestorScale(transforms);
 }
 
 interface HandleDef {
@@ -61,6 +83,14 @@ interface DragState {
   computedSize: { width: number; height: number };
   /** Parent element's computed size (for % mode delta conversion) */
   parentComputedSize: { width: number; height: number };
+  /** The SECOND transform's scale (`measureAncestorScale`), captured at drag start — `dx`/`dy`
+   *  arrive in frame-logical px (`toLogicalDelta`), and every unit except `%` must divide this
+   *  back out before using them (uiResizeMath.ts's `deltaToUnit`/`computeResize` doc comments,
+   *  #651 B2 second follow-up). 1 when no ancestor between this element and the frame carries a
+   *  transform of its own — true regardless of whether that ancestor is rotated, scaled, or
+   *  both (`accumulateAncestorScale`'s doc comment). */
+  ancestorScaleX: number;
+  ancestorScaleY: number;
   /** Anchor offsets at drag start (for move handles) */
   startAnchor?: { top: number; topUnit: string; left: number; leftUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; anchor: string };
 }
@@ -143,6 +173,11 @@ interface MarginBox { top: number; right: number; bottom: number; left: number }
 interface OverlayState {
   rect: { top: number; left: number; width: number; height: number };
   parentRect: { top: number; left: number; width: number; height: number } | null;
+  /** The parent's PADDING box, in the same logical coords as `parentRect` (its border
+   *  box). This is what the anchor-reference diamond draws against — it must match
+   *  `containingBlockSize`'s `'padding'` mode, the box an anchored entity's %-drag
+   *  resolves against (#651). See `paddingBoxRect`'s doc comment. */
+  parentPaddingRect: { top: number; left: number; width: number; height: number } | null;
   anchorData: { anchor: string; pivotX: number; pivotY: number } | null;
   margin: MarginBox;
   /** width/height === 0 means "auto" (content-sized) — the corresponding resize
@@ -219,11 +254,37 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
 
       // Parent rect
       let parentRect: OverlayState['parentRect'] = null;
+      let parentPaddingRect: OverlayState['parentPaddingRect'] = null;
       const parentId = readParentId(entityId);
       if (parentId) {
         const parentEl = frame.querySelector(`[data-entity-id="${parentId}"]`) as HTMLElement | null;
         if (parentEl) {
-          parentRect = frameToLogicalRect(parentEl.getBoundingClientRect(), fr, gameViewSize.width);
+          const parentElRect = parentEl.getBoundingClientRect();
+          parentRect = frameToLogicalRect(parentElRect, fr, gameViewSize.width);
+          // ⚠️ `parentRect` above is NOT plain layout px — `UIResizeOverlay` mounts as a
+          // direct child of `[data-ui-preview-frame]` itself (see SceneView.tsx), so a value
+          // X placed there renders on screen at `frame.screenLeft + X * frameScale`. Deriving
+          // `parentRect` from `parentElRect` (a real `getBoundingClientRect()`, which bakes in
+          // ANY transform the parent itself carries) with only the FRAME's scale divided out
+          // means it already lives in "ancestor-scale-inflated" space whenever the parent has
+          // its own `UIElement.scale !== 1`. Border widths (getComputedStyle) and
+          // clientWidth/clientHeight are plain LAYOUT px, uninflated — scale them by the SAME
+          // ancestor factor before combining with parentRect's origin, or the diamond/padding
+          // box drifts off exactly whenever the parent is scaled (#651 B2 follow-up).
+          const pcs = getComputedStyle(parentEl);
+          const border = {
+            left: parseFloat(pcs.borderLeftWidth) || 0, right: parseFloat(pcs.borderRightWidth) || 0,
+            top: parseFloat(pcs.borderTopWidth) || 0, bottom: parseFloat(pcs.borderBottomWidth) || 0,
+          };
+          const { x: ancestorScaleX, y: ancestorScaleY } = measureAncestorScale(parentEl, frame);
+          parentPaddingRect = paddingBoxRect(
+            parentRect,
+            {
+              left: border.left * ancestorScaleX, right: border.right * ancestorScaleX,
+              top: border.top * ancestorScaleY, bottom: border.bottom * ancestorScaleY,
+            },
+            { width: parentEl.clientWidth * ancestorScaleX, height: parentEl.clientHeight * ancestorScaleY },
+          );
         }
       }
 
@@ -247,7 +308,7 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
 
       const anchorData = readUIAnchor(entityId);
       setState({
-        rect, parentRect, anchorData, margin,
+        rect, parentRect, parentPaddingRect, anchorData, margin,
         autoWidth: uiEl ? uiEl.width === 0 : false,
         autoHeight: uiEl ? uiEl.height === 0 : false,
       });
@@ -313,32 +374,81 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
     const values = readUIElement(entityId);
     if (!values) return;
 
+    // Read anchor mode FIRST — it decides which of the parent's boxes the %-denominator
+    // below must use (see containingBlockSize's doc comment): this ENTITY anchored (has a
+    // UIAnchor) resolves against the parent's PADDING box, in-flow resolves against its
+    // CONTENT box. Both `width`/`height` % (computeResize) and the offset % that only
+    // exists for an anchored entity (computeMoveOffsets) share this one denominator.
+    const anchorValues = readUIAnchor(entityId);
+
     // Get computed size for auto-sized elements
     const frame = document.querySelector('[data-ui-preview-frame]') as HTMLElement | null;
     const el = frame?.querySelector(`[data-entity-id="${entityId}"]`) as HTMLElement | null;
     let computedSize = { width: values.width, height: values.height };
     let parentComputedSize = { width: gameViewSize.width, height: gameViewSize.height };
+    // The SECOND transform's scale (hoisted to this outer scope — not just used to build
+    // computedSize/parentComputedSize below, but also stashed on dragRef so applyDrag can
+    // divide it back out of dx/dy for every non-`%` unit; see DragState's doc comment and
+    // uiResizeMath.ts's computeResize/computeMoveOffsets, #651 B2 second follow-up).
+    let ancestorScaleX = 1;
+    let ancestorScaleY = 1;
     if (el && frame) {
-      const fr = frame.getBoundingClientRect();
-      const er = el.getBoundingClientRect();
-      const scaleX = gameViewSize.width / fr.width;
-      const scaleY = gameViewSize.height / fr.height;
-      computedSize = {
-        width: Math.round(er.width * scaleX),
-        height: Math.round(er.height * scaleY),
-      };
-      // Find parent entity element for % mode
+      // Find parent entity element for % mode / the ancestor-scale correction below.
       const parentEl = el.parentElement?.closest('[data-entity-id]') as HTMLElement | null;
+
+      // A SECOND transform can sit between the frame and this drag's measurements: any
+      // ancestor whose own `UIElement.scale !== 1` (applyRotationStyle, anchorCss.ts) renders
+      // bigger/smaller than its LAYOUT size, and `offsetWidth`/`clientWidth` cannot see that
+      // (transforms never affect layout) while `getBoundingClientRect()` does.
+      // `measureAncestorScale` recovers that second factor alone — 1 whenever no ancestor
+      // between here and the frame carries a transform of its own (the common case), so every
+      // measurement below is unchanged then; true regardless of whether an ancestor is
+      // rotated, scaled, or both. (#651 B2 follow-up — the frame-only correction shipped in
+      // 0b095f222 divided out uiScale but missed this one; its own first fix, a
+      // getBoundingClientRect()-ratio approach, was in turn wrong under rotation — see
+      // `decomposeScale`'s doc comment.)
       if (parentEl) {
-        const pr = parentEl.getBoundingClientRect();
+        ({ x: ancestorScaleX, y: ancestorScaleY } = measureAncestorScale(parentEl, frame));
+      }
+
+      // computedSize is THIS element's own AUTHORED (layout) size, converted into the same
+      // ancestor-scale space as parentComputedSize below. `offsetWidth`/`offsetHeight` is the
+      // element's border-box LAYOUT size — unaffected by ANY transform, including this
+      // element's OWN `UIElement.scale` — so multiplying by ancestorScaleX/Y (which excludes
+      // this element's own scale by construction) applies only the ancestor correction, not a
+      // second helping of the element's own. The previous `getBoundingClientRect() * scaleX`
+      // carried the element's own scale transform too, so an auto-sized element with its own
+      // `UIElement.scale` reported a size it was never authored at.
+      computedSize = {
+        width: Math.round(el.offsetWidth * ancestorScaleX),
+        height: Math.round(el.offsetHeight * ancestorScaleY),
+      };
+
+      if (parentEl) {
+        // `clientWidth`/`clientHeight` are LAYOUT px — already border- (and
+        // scrollbar-gutter-) excluded, and unaffected by the preview frame's
+        // `transform: scale(uiScale)` (SceneView.tsx lays the frame out at the
+        // logical device size, then scales it). `getBoundingClientRect()` on the
+        // other hand reports SCREEN px post-transform, while `getComputedStyle`'s
+        // padding/border are layout px — mixing the two and multiplying by
+        // scaleX/scaleY divided the padding term by uiScale, so the computed
+        // denominator was only correct at uiScale 1.0. clientWidth/clientHeight
+        // are already in the same logical space as gameViewSize once the frame's
+        // own scale is accounted for; `ancestorScaleX/Y` above corrects for any
+        // FURTHER scale the parent itself carries (#651 B2 follow-up).
+        const pcs = getComputedStyle(parentEl);
+        const padding = {
+          left: parseFloat(pcs.paddingLeft) || 0, right: parseFloat(pcs.paddingRight) || 0,
+          top: parseFloat(pcs.paddingTop) || 0, bottom: parseFloat(pcs.paddingBottom) || 0,
+        };
+        const cb = containingBlockSize({ width: parentEl.clientWidth, height: parentEl.clientHeight }, padding, anchorValues ? 'padding' : 'content');
         parentComputedSize = {
-          width: Math.round(pr.width * scaleX),
-          height: Math.round(pr.height * scaleY),
+          width: Math.round(cb.width * ancestorScaleX),
+          height: Math.round(cb.height * ancestorScaleY),
         };
       }
     }
 
-    const anchorValues = readUIAnchor(entityId);
     dragRef.current = {
       handle,
       entityId,
@@ -346,6 +456,8 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
       startValues: { ...values },
       computedSize,
       parentComputedSize,
+      ancestorScaleX,
+      ancestorScaleY,
       startAnchor: anchorValues ? {
         anchor: anchorValues.anchor,
         top: anchorValues.top, topUnit: anchorValues.topUnit,
@@ -380,7 +492,7 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
   const applyDrag = useCallback((clientX: number, clientY: number) => {
     const dr = dragRef.current;
     if (!dr) return;
-    const { handle, startPointer, startValues, computedSize, parentComputedSize, startAnchor, entityId: eid } = dr;
+    const { handle, startPointer, startValues, computedSize, parentComputedSize, ancestorScaleX, ancestorScaleY, startAnchor, entityId: eid } = dr;
     const { dx, dy } = toLogicalDelta(clientX - startPointer.x, clientY - startPointer.y);
 
     // viewport (vw/vh/vmin/vmax) units convert against the LOGICAL device size.
@@ -388,12 +500,12 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
 
     // ── Move handles (reposition via UIAnchor offsets) ──
     if (handle.startsWith('move-') && startAnchor) {
-      writeUIAnchor(eid, computeMoveOffsets(handle, startAnchor, dx, dy, parentComputedSize, viewport));
+      writeUIAnchor(eid, computeMoveOffsets(handle, startAnchor, dx, dy, parentComputedSize, viewport, ancestorScaleX, ancestorScaleY));
       return;
     }
 
     // ── Resize handles ──
-    writeUIElement(eid, computeResize(handle, startValues, computedSize, parentComputedSize, dx, dy, viewport));
+    writeUIElement(eid, computeResize(handle, startValues, computedSize, parentComputedSize, dx, dy, viewport, ancestorScaleX, ancestorScaleY));
   }, [toLogicalDelta, gameViewSize]);
 
   // Finalize the drag: push the undo entry + bridge to the animation record hook. Called
@@ -451,7 +563,7 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
   }, []);
 
   if (!state) return null;
-  const { rect, parentRect, anchorData, margin, autoWidth: isAutoWidth, autoHeight: isAutoHeight } = state;
+  const { rect, parentRect, parentPaddingRect, anchorData, margin, autoWidth: isAutoWidth, autoHeight: isAutoHeight } = state;
   const hasMargin = margin.top || margin.right || margin.bottom || margin.left;
 
   // Pivot position on the element (fraction → pixel offset within rect)
@@ -483,11 +595,14 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
         zIndex: 4,
         borderRadius: 2,
       }} />}
-      {/* Parent anchor reference point (orange diamond) */}
-      {parentRect && anchorRef && <div style={{
+      {/* Parent anchor reference point (orange diamond). Drawn against the parent's
+          PADDING box, not its border box — that's the box an anchored entity's %-drag
+          actually resolves against (containingBlockSize's 'padding' mode, #651); see
+          paddingBoxRect's doc comment. */}
+      {parentPaddingRect && anchorRef && <div data-testid="ui-resize-anchor-diamond" style={{
         position: 'absolute',
-        left: parentRect.left + parentRect.width * anchorRef.fx - 5,
-        top: parentRect.top + parentRect.height * anchorRef.fy - 5,
+        left: parentPaddingRect.left + parentPaddingRect.width * anchorRef.fx - 5,
+        top: parentPaddingRect.top + parentPaddingRect.height * anchorRef.fy - 5,
         width: 10, height: 10,
         backgroundColor: '#f39c12',
         transform: 'rotate(45deg)',

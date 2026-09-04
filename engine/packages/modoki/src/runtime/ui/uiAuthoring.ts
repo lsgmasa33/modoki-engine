@@ -109,3 +109,15 @@ export function selectionSizeGate(
 export function selectionAnchorGate(anchors: readonly (string | null | undefined)[]): SelectionGate {
   return resolveGate(anchors, (a) => a !== null && a !== undefined);
 }
+
+/** The pooled-row gate across a selection (#651). `pooled` is one entry per selected entity:
+ *  whether it carries the `UIEntry` trait, i.e. is a pooled `UIEntries` row root whose box is
+ *  pinned every tick by the scroll view that owns it — margin and min/max size are forced to 0
+ *  there, and an authored value never takes effect (`entriesSystem.ts` `warnAuthoredOverride`).
+ *  Same unanimous-or-nothing rule as the anchor gates above (#34): `inert` only when EVERY
+ *  selected entity is a pooled row, so a mixed selection shows a distinct "partly pooled" note
+ *  instead of one that is only true of some of what's selected. The fields themselves stay
+ *  editable in every case — this drives an Inspector NOTE, never `readOnly`. */
+export function selectionPooledRowGate(pooled: readonly boolean[]): SelectionGate {
+  return resolveGate(pooled, (p) => p);
+}

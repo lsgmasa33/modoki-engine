@@ -60,8 +60,10 @@ const AnimatedText = React.memo(function AnimatedText(
     // fadeIn off → each glyph appears/vanishes instantly (mechanical typewriter feel):
     // a steps() timing on the one-shot, and the -cycle-hard keyframe for the loop.
     const fade = perCharFade !== false;
+    // `display: 'block'`, not `'inline-block'` (#646) — see `AutoFitText`'s span below +
+    // `docs/ui-system.md`'s `maxLines` callout for why.
     return (
-      <span aria-label={text} {...{ [UI_PAINT_ATTR]: 'text' }} style={{ display: 'inline-block', whiteSpace: 'pre-wrap' }}>
+      <span aria-label={text} {...{ [UI_PAINT_ATTR]: 'text' }} style={{ display: 'block', whiteSpace: 'pre-wrap' }}>
         {chars.map((ch, i) => {
           const delay = i * perCharStagger;
           const anim = perCharLoop
@@ -72,7 +74,8 @@ const AnimatedText = React.memo(function AnimatedText(
       </span>
     );
   }
-  const style: React.CSSProperties = { display: 'inline-block', animation, willChange: 'transform', ...(extra as React.CSSProperties) };
+  // `display: 'block'`, not `'inline-block'` — same fix as the typewriter span above (#646).
+  const style: React.CSSProperties = { display: 'block', animation, willChange: 'transform', ...(extra as React.CSSProperties) };
   // ⚠️ **em, not px** (#245). The amplitude is a MULTIPLE of the font size — `uiTextAnimation`'s
   // own doc calls it "em" — and it used to be resolved to px by multiplying the authored
   // `fontSize` NUMBER. That silently breaks the moment `fontSizeUnit` is not px, because the
@@ -84,14 +87,50 @@ const AnimatedText = React.memo(function AnimatedText(
 
 /** Content-box width of `elem` at sub-pixel precision: the border-box rect minus padding and
  *  border, read the SAME way `fit()` measures the span so the two sides of every fit comparison
- *  can't disagree over rounding. `clientWidth` (used here before #614's fix) rounds to an integer
- *  px, which is a smaller version of the same under-report class that hid the flex-stretch bug
- *  below — so both the fit and its ResizeObserver's unchanged-width guard go through this helper. */
-function contentWidthOf(elem: Element): number {
+ *  can't disagree over rounding — SCALED to the rect's own space first. Pre-fix this was
+ *  `elem.getBoundingClientRect().width - pad - border` with NO scaling: a TRANSFORM-AWARE rect
+ *  (screen px) minus TRANSFORM-BLIND computed lengths (layout px). A CSS `transform` between
+ *  `elem` and its reference frame — the editor's SceneView/GameView preview-frame scale, or
+ *  `applyRotationStyle`'s rotate()/scale() on ANY UIElement with an authored rotation/scale —
+ *  scales the rect but not the computed padding/border, so the old expression computed `S·W − pad`
+ *  where the correct content width is `S·(W−pad)`. Exact only at `S=1` (every earlier measurement
+ *  here happened to run under one) — measured live (Chromium 151, 300px parent, 20px padding, 2px
+ *  border): +9.5% at `S=0.667` (the editor's typical docked-panel scale), +67.2% at `S=0.3`, so
+ *  `fit()`'s `availablePx` could be badly wrong exactly where `UIElement.rotation`/`scale` or a
+ *  scaled preview frame make this common, not exotic.
+ *
+ *  The fix derives `scale` LOCALLY from `elem` itself — `rectWidth / elem.offsetWidth`, the ratio
+ *  between `elem`'s own screen-space and layout-space border-box width — rather than switching to
+ *  a transform-blind read (`clientWidth`) everywhere, which was tried first and REGRESSED a real
+ *  fit: `naturalPx`/`measuredPx` would then need the same integer-rounded space too (to stay
+ *  comparable), and two INDEPENDENT integer roundings (parent + span) can each round up to 0.5px
+ *  in opposite directions — enough combined error to push a genuinely-fitting label past
+ *  `FIT_EPSILON_PX` and wrap it (caught live by `editor-ui-autofit.spec.ts`, not by a unit test —
+ *  jsdom can't see either failure mode). Multiplying `scale` back onto just the padding/border
+ *  keeps `availablePx` in the SAME sub-pixel screen-px space `naturalPx` already reads (unchanged
+ *  below), so precision is unaffected by this fix — verified live at every measured `S` above:
+ *  the shipped:true ratio error stays pinned to the untransformed baseline's own ~0.14%, not
+ *  growing with `S` the way the pre-fix ratio did. `elem.offsetWidth`'s own integer rounding only
+ *  enters through this multiplicative `scale` term (not an ADDITIVE term subtracted from a
+ *  differently-scaled quantity, which is what made the original bug non-cancelling), so its error
+ *  stays proportionally tiny. `scale` falls back to 1 (the pre-fix, `S=1` behaviour) when
+ *  `elem.offsetWidth` is 0 (detached/`display:none`), matching what an unmeasurable read already
+ *  degrades to elsewhere in this component.
+ *
+ *  This is exact only for a uniform, non-rotating `scale()` — `rectWidth / offsetWidth` is a
+ *  WIDTH-axis ratio, which is what a horizontal padding/border correction needs, uniform or not,
+ *  but a ROTATED ancestor still degrades `rectWidth` itself to an axis-aligned bounding box no
+ *  per-axis ratio can undo. That was already just as wrong pre-fix (see the module docblock on
+ *  `AutoFitText`) — not a regression this fix introduces, just a gap it does not close. */
+function contentWidthOf(elem: HTMLElement): number {
+  const rectWidth = elem.getBoundingClientRect().width;
+  const layoutWidth = elem.offsetWidth;
+  const scale = layoutWidth > 0 ? rectWidth / layoutWidth : 1;
   const s = getComputedStyle(elem);
-  return elem.getBoundingClientRect().width
-    - parseFloat(s.paddingLeft || '0') - parseFloat(s.paddingRight || '0')
-    - parseFloat(s.borderLeftWidth || '0') - parseFloat(s.borderRightWidth || '0');
+  const layoutPadBorder =
+    parseFloat(s.paddingLeft || '0') + parseFloat(s.paddingRight || '0')
+    + parseFloat(s.borderLeftWidth || '0') + parseFloat(s.borderRightWidth || '0');
+  return rectWidth - scale * layoutPadBorder;
 }
 
 /** Shrink-only auto-fit (#614, `UIElement.autoFitText`) — reduces the rendered font size, never
@@ -157,14 +196,15 @@ const AutoFitText = React.memo(function AutoFitText(
     // single-line width at the authored size.
     el.style.fontSize = '';
     el.style.whiteSpace = 'nowrap';
-    // ⚠️ `UIElement` authors `display: flex` (+ `alignItems`) on EVERY node, so this span's own
-    // `display: inline-block` is virtually always a FLEX ITEM of its parent, never a normal inline
-    // box. A flex item's `inline-block` is *blockified* to `block`, and the default `align-items:
-    // stretch` then stretches it to the parent's cross size — so WITHOUT this line,
-    // `getBoundingClientRect().width` reads the parent's AVAILABLE width, not the span's natural
+    // ⚠️ `UIElement` authors `display: flex` (+ `alignItems`) on every node BY DEFAULT —
+    // `node.maxLines > 0` overrides it to `display: '-webkit-box'` instead (see that branch
+    // below) — so this span (its own authored `display: block`, #646) is virtually always a
+    // FLEX ITEM of its parent, never a normal block box in flow. The default `align-items:
+    // stretch` then stretches a flex item's cross size to the parent's — so WITHOUT this line,
+    // the span's measured width reads the parent's AVAILABLE width, not the span's natural
     // content width. Measured live on a `games/text_demo` fixture (42px "UI TEXT ANIMATION" in a
-    // 40%-wide box): the rect read 319.59px (== the parent's content width) instead of the real
-    // 446.93px, so `naturalPx === availablePx` on every call, the pure fit function always
+    // 40%-wide box): the measurement read 319.59px (== the parent's content width) instead of the
+    // real 446.93px, so `naturalPx === availablePx` on every call, the pure fit function always
     // concluded "it fits", and the span was left `white-space: nowrap` — one line overflowing its
     // box, strictly worse than the wrap it replaced. An explicit `width` overrides `stretch` (a
     // sized flex item is not stretched), so `max-content` here forces the rect back to the span's
@@ -173,18 +213,36 @@ const AutoFitText = React.memo(function AutoFitText(
     // re-reads the same unstretched rect) and is cleared once, after the LAST measurement, before
     // the fitted font size is written, so it never reaches paint (this whole function runs inside
     // `useLayoutEffect`, before the browser paints).
+    // ⚠️ In a `flexDirection: 'row'` parent this width is the item's MAIN size, so the default
+    // `flexShrink: 1` (UIElement.ts:31) is free to shrink it back below `max-content` — which
+    // would collapse `naturalPx` to `availablePx`, make the fit conclude "it fits", and leave
+    // autoFitText SILENTLY INERT. It does not, and the reason is not this line: a flex item's
+    // default `min-width: auto` floors shrinking at min-content, and the `white-space: nowrap`
+    // set just above makes min-content == max-content. Measured (Chromium 151, 320px row parent,
+    // 399.16px natural): the ONLY combination that defeats the scaffold is
+    // `row` + `flex-shrink:1` + `min-width:0` — every other permutation reads the true 399.16.
+    // Shipped code never hits it because `UIElement.minWidth` defaults to 0 and `cssVal` drops
+    // falsy values, so `min-width: 0` is never written to the DOM — i.e. the scaffold was safe
+    // by COINCIDENCE, one refactor away from dying silently. The `minWidth` line below makes it
+    // safe by CONSTRUCTION instead: it pins the floor the flex auto-minimum was supplying for
+    // us, so the measurement no longer depends on nobody ever authoring a `min-width`. It is a
+    // no-op against today's DOM (with `nowrap`, min-content == max-content) and is torn down
+    // with the width scaffold below.
     el.style.width = 'max-content';
+    el.style.minWidth = 'max-content';
     const authoredPx = parseFloat(getComputedStyle(el).fontSize);
     // `scrollWidth` is rounded to an integer px, which can under-report a natural width like
     // 100.6px as 100 — combined with the pure function's 0.5px FIT_EPSILON_PX that lets a
-    // genuinely-overflowing label read as fitting. `el` is `inline-block; white-space: nowrap;
+    // genuinely-overflowing label read as fitting. `el` is `display: block; white-space: nowrap;
     // width: max-content` (unstretched by the flex parent), so its border-box rect width IS the
     // natural single-line width, at sub-pixel precision.
     const naturalPx = el.getBoundingClientRect().width;
     // `availablePx` was already captured above, via `contentWidthOf` (not the rounded
-    // `clientWidth`) — same sub-pixel precision as `naturalPx` here, so both sides of the fit
-    // comparison agree to the same precision, and BEFORE the max-content scaffold, so it can't
-    // be contaminated by it (see the comment at the top of this function).
+    // `clientWidth`) — same sub-pixel precision as `naturalPx` here (both screen-px rects; see
+    // `contentWidthOf`'s header for how it corrects for a CSS transform without losing that
+    // precision), so both sides of the fit comparison agree to the same precision, and BEFORE the
+    // max-content scaffold, so it can't be contaminated by it (see the comment at the top of this
+    // function).
     const minPx = resolveMinPx(authoredPx, fontSize, fontSizeMin);
     const first = fitFontSizePx({ authoredPx, naturalPx, availablePx, minPx });
 
@@ -237,6 +295,7 @@ const AutoFitText = React.memo(function AutoFitText(
       fits = first.fits;
     }
     el.style.width = '';
+    el.style.minWidth = '';   // torn down with the width scaffold — both are measurement-only.
     // `nowrap` ONLY when auto-fit actively did something AND that something measured as fitting
     // — `first.shrunk && fits`. Every other outcome (already fit at the authored size, an
     // unmeasurable/inert `first.fits`, or floored short of a fit) ends at `pre-wrap`, the SAME
@@ -320,8 +379,12 @@ const AutoFitText = React.memo(function AutoFitText(
   // marker twice (once per span) — harmless: `isPaintOpaque` only asks whether ANY marked
   // descendant's nearest `[data-entity-id]` ancestor is the host div, and both spans agree on
   // that answer via the same host.
+  // `display: 'block'`, NOT `'inline-block'` (#646) — an `inline-block` child defeats the
+  // `node.maxLines > 0` branch's `-webkit-box` clamp below (it can't split it into lines), and
+  // does not reopen #614's flex-stretch bug (`block` and `inline-block` compute identically as
+  // a flex item). Full reasoning + verification: `docs/ui-system.md`'s `maxLines` callout.
   return (
-    <span ref={ref} {...{ [UI_PAINT_ATTR]: 'text' }} style={{ display: 'inline-block', whiteSpace: 'pre-wrap' }}>
+    <span ref={ref} {...{ [UI_PAINT_ATTR]: 'text' }} style={{ display: 'block', whiteSpace: 'pre-wrap' }}>
       {children}
     </span>
   );

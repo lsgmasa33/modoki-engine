@@ -51,8 +51,14 @@ export function clampSubmenuPosition(
 
 export default function ContextMenu({ items, x, y, onClose }: ContextMenuProps) {
   const ref = useRef<HTMLDivElement>(null);
-  // Start at the requested point; re-clamp once the real menu height is known.
-  const [pos, setPos] = useState<{ left: number; top: number }>({ left: x, top: y });
+  // Seed at the origin — NOT at the requested (x, y) — so the pre-clamp measurement pass
+  // sees the whole viewport as available, same as the submenu below. Seeding at (x, y) on a
+  // `position: fixed; width: auto` box makes it shrink-to-fit the viewport remainder to the
+  // RIGHT of x (`available = innerWidth - x`), so a menu opened near the right edge measures
+  // its own clamped-to-viewport width instead of its natural width, and `clampMenuPosition`
+  // then clamps a size that was already wrong (#651). Hidden via `visibility` until the real
+  // size is known, so it never flashes at the origin. (F11.)
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
 
   useEffect(() => {
     const handleMouseDown = (e: MouseEvent) => {
@@ -77,7 +83,9 @@ export default function ContextMenu({ items, x, y, onClose }: ContextMenuProps) 
   useOverlayEscape(true, onClose, 'context-menu');
 
   // Clamp using the REAL measured menu size (not an items.length * 28 estimate),
-  // so tall menus near the bottom edge don't clip. Measured post-layout. (F11.)
+  // so tall menus near the bottom edge don't clip. Measured post-layout, at the origin seed
+  // above — so `rect` is the menu's natural size, not shrunk by whatever space happened to be
+  // left of the requested (x, y). (F11, #651.)
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
@@ -87,8 +95,11 @@ export default function ContextMenu({ items, x, y, onClose }: ContextMenuProps) 
 
   const menuStyle: React.CSSProperties = {
     position: 'fixed',
-    left: pos.left,
-    top: pos.top,
+    left: pos?.left ?? 0,
+    top: pos?.top ?? 0,
+    // Hidden for the first paint (before the clamp layout-effect runs), same reason as the
+    // submenu below: the origin seed above must never flash on-screen. (F11.)
+    visibility: pos ? 'visible' : 'hidden',
     zIndex: 10000,
     background: '#2a2a40',
     border: '1px solid #444',

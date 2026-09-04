@@ -53,7 +53,7 @@ import { ModelAssetView } from './assetViews/ModelAssetView';
 import { ShaderAssetView } from './assetViews/ShaderAssetView';
 import { SceneAssetView } from './assetViews/SceneAssetView';
 import { openAssetInEditor } from './openAssetInEditor';
-import { isSelfPlacementDisabled, selectionAnchorGate, selectionSizeGate } from '../../runtime/ui/uiAuthoring';
+import { isSelfPlacementDisabled, selectionAnchorGate, selectionSizeGate, selectionPooledRowGate } from '../../runtime/ui/uiAuthoring';
 import { onEditorDirty } from '../../runtime/ui/uiTreeStore';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';
@@ -733,6 +733,32 @@ function FilterIgnoredNote({ layer }: { layer: string }) {
   );
 }
 
+/** Section-level note for the whole UIElement trait section (not one sub-section — the
+ *  fields it covers, margin and min/max size, live in TWO different collapsible sub-sections,
+ *  Margin and Size Constraints) when the selected entity is a pooled UIEntries row (#651).
+ *  `mixed` = only PART of the selection is a pooled row — same unanimous-or-nothing rule as
+ *  AnchorLayoutNote above (#34): the fields stay editable either way, so the note must not
+ *  claim a value is ignored for entities where it still takes effect. */
+function PooledRowNote({ mixed = false }: { mixed?: boolean }) {
+  if (mixed) {
+    return (
+      <div style={{ background: '#2a2640', border: '1px solid #4a4270', borderRadius: 3, padding: '5px 7px', margin: '2px 0 6px', fontSize: '11px', color: '#b8b0d8', lineHeight: 1.4 }}>
+        ℹ️ <b>Partly pooled</b> — some of the selected elements are <b>UIEntries</b> pooled
+        rows and some aren't. Margin and min/max size stay editable so the un-pooled ones can
+        still be authored, but the pooled ones ignore what you write. Select them separately
+        to be sure of the result.
+      </div>
+    );
+  }
+  return (
+    <div style={{ background: '#2a2640', border: '1px solid #4a4270', borderRadius: 3, padding: '5px 7px', margin: '2px 0 6px', fontSize: '11px', color: '#b8b0d8', lineHeight: 1.4 }}>
+      ℹ️ <b>Pooled row</b> — this UIEntries row's box is owned by the scroll view that spawned
+      it. <b>Margin</b> and <b>min/max size</b> below are forced to <b>0</b> every tick, so
+      authored values here will not take effect.
+    </div>
+  );
+}
+
 /** CameraFrame-only: the "show framing-box gizmo" toggle. Editor-ONLY display state (a
  *  localStorage-persisted per-frame preference, keyed by the entity's guid), NOT a scene
  *  trait — so it survives reloads without a Cmd+S and never ships to the game. */
@@ -817,6 +843,21 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
   // Only a UNANIMOUS anchor disables the control; a mixed selection stays editable.
   const anchorGate = selectionAnchorGate(anchorModes);
   const selfPlacementDisabled = (key: string) => isSelfPlacementDisabled(meta.name, anchorGate === 'inert', key);
+
+  // A pooled UIEntries row (carries the sibling UIEntry trait, stamped by entriesSystem.ts on
+  // every pooled instance root) has its margin/min/max-size fields pinned to 0 every tick by
+  // the scroll view that owns it — see PooledRowNote below (#651). Same live-sibling-read +
+  // unanimous-or-nothing pattern as anchorModes/anchorGate above (#34); unlike that gate this
+  // one only drives an inline note, never `readOnly` — the fields stay editable.
+  const pooledRowFlags: boolean[] = meta.name === 'UIElement' ? (() => {
+    const entryMeta = getAllTraits().find(t => t.name === 'UIEntry');
+    if (!entryMeta) return entityIds.map(() => false);
+    return entityIds.map((id) => {
+      const entity = findEntity(id);
+      return !!entity && entity.has(entryMeta.trait);
+    });
+  })() : [];
+  const pooledRowGate = selectionPooledRowGate(pooledRowFlags);
 
   // Classify fields into an ordered item stream (single field OR a grouped
   // VecField), split by section. A grouped VecField respects its members'
@@ -1100,6 +1141,11 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
 
   return (
     <Section title={isResource ? `${meta.name} (resource)` : meta.name} defaultOpen onRemove={onRemove} menuItems={menuItems}>
+      {/* UIElement pooled-row note (#651): section-level, not scoped to one sub-section —
+          the fields it covers (margin, min/max size) live in TWO different collapsible
+          sub-sections (Margin, Size Constraints), so a single note here covers both. */}
+      {meta.name === 'UIElement' && pooledRowGate !== 'live' && <PooledRowNote mixed={pooledRowGate === 'mixed'} />}
+
       {/* Top-level items (no section) — grouped VecFields + singles, in order */}
       {topItems.map(renderItem)}
 

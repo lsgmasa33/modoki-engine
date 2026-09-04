@@ -181,3 +181,100 @@ describe('refineFontSizePx', () => {
     });
   });
 });
+
+// `UINode.tsx`'s `fit()` used to feed `fitFontSizePx` an `availablePx` (`contentWidthOf`) that
+// mixed a TRANSFORM-AWARE `getBoundingClientRect()` (screen px) with TRANSFORM-BLIND computed
+// padding/border (layout px), and a `naturalPx`/`measuredPx`/`finalMeasuredPx` that was pure
+// screen-px rect. Exact only when no CSS transform sits between the measured element and its
+// reference frame (S=1) — the editor's SceneView/GameView preview frame carries `transform:
+// scale(uiScale)`, and `applyRotationStyle` (`anchorCss.ts`) emits `scale()`/`rotate()` on ANY
+// UIElement with an authored `rotation`/`scale`, so `S != 1` is routine, not exotic.
+// `fitFontSizePx` cannot see this itself — it trusts whatever `availablePx`/`naturalPx` it is
+// handed — so this exercises the REAL, unmodified function with the numbers the OLD and NEW DOM
+// reads produce, to pin the property the fix relies on: the SAME text in the SAME box must shrink
+// to the SAME font size whatever the ancestor CSS scale.
+describe('fitFontSizePx — scale invariance across a CSS transform ancestor (the mixed-space defect)', () => {
+  // Fixture: the live measurement that found the bug (Chromium 151: a 300px-wide flex parent,
+  // 20px padding each side, 2px border each side, a 40px "AUTO FIT LABEL" span) — see
+  // `contentwidth-probe.mjs` (pre-fix) / `contentwidth-probe-v2.mjs` (post-fix, the shipped
+  // locally-derived-scale approach). `S` is the combined CSS transform scale between the parent
+  // and its reference frame.
+  const authoredPx = 40;
+  const minPx = resolveMinPx(authoredPx, authoredPx, 0); // 20 (DEFAULT_AUTOFIT_MIN_RATIO)
+
+  // Pre-fix `contentWidthOf`/`naturalPx`, measured live at each `S`: `S · borderBoxWidth − pad`
+  // for `availablePx` (screen-px rect minus layout-px padding/border) and `S · trueNaturalWidth`
+  // for `naturalPx` (pure screen-px rect) — border-box 300px, true natural width 316.453px.
+  const preFixMeasurementAt: Record<string, { availablePx: number; naturalPx: number }> = {
+    'S=1 (untransformed)': { availablePx: 256, naturalPx: 316.453 },
+    'S=0.667 (editor docked-panel scale)': { availablePx: 156.1, naturalPx: 211.074 },
+    'S=0.3': { availablePx: 46, naturalPx: 94.936 },
+    'S=2': { availablePx: 556, naturalPx: 632.906 },
+  };
+
+  it('pins the defect: the pre-fix (mixed-space) measurement is NOT scale invariant', () => {
+    // At S=1 the mixed formula is (nearly) exact — this is WHY the bug shipped unnoticed: every
+    // earlier measurement of this code happened to run in an untransformed frame.
+    const atS1 = fitFontSizePx({ authoredPx, ...preFixMeasurementAt['S=1 (untransformed)'], minPx });
+    expect(atS1.fontSizePx).toBeCloseTo(32.36, 1);
+    expect(atS1.fits).toBe(true);
+
+    // At the editor's typical docked-panel scale, the SAME text in the SAME box shrinks to a
+    // VISIBLY smaller size purely because of the frame's zoom — a rendering the true
+    // (scale-invariant) fit would never produce. This is the "shrinks too much" violation
+    // `UINode.tsx`'s `AutoFitText` docblock says must never happen.
+    const at0667 = fitFontSizePx({ authoredPx, ...preFixMeasurementAt['S=0.667 (editor docked-panel scale)'], minPx });
+    expect(at0667.fontSizePx).toBeLessThan(atS1.fontSizePx - 2);
+
+    // At S=0.3 it is not just quantitatively wrong, it changes the OUTCOME: the label floors out
+    // at `minPx` and is reported as not fitting at all.
+    const at03 = fitFontSizePx({ authoredPx, ...preFixMeasurementAt['S=0.3'], minPx });
+    expect(at03.fontSizePx).toBe(minPx);
+    expect(at03.fits).toBe(false);
+
+    // At S=2 it swings the other way and UNDER-shrinks relative to the true answer — still "safe"
+    // by the shrink-only invariant (a missed shrink, never an overflow this function can see), but
+    // still wrong, and in the opposite direction from S<1.
+    const at2 = fitFontSizePx({ authoredPx, ...preFixMeasurementAt['S=2'], minPx });
+    expect(at2.fontSizePx).toBeGreaterThan(atS1.fontSizePx + 2);
+  });
+
+  it('the fix: availablePx/naturalPx still scale WITH S, but their RATIO — and so the fit — does not', () => {
+    // Post-fix, `contentWidthOf` derives `scale` LOCALLY (`rectWidth / elem.offsetWidth`) and
+    // multiplies it onto just the padding/border before subtracting, so `availablePx` stays a
+    // sub-pixel SCREEN-px quantity that scales with `S` exactly the way `naturalPx` (the span's
+    // own unchanged rect read) already does — `S · trueContent` and `S · trueNatural` — rather
+    // than being forced to a constant. It is their RATIO, fed into `fitFontSizePx`, that stops
+    // varying with `S` — see `contentwidth-probe-v2.mjs` for the live measurement this pins:
+    // avail/natural pairs at S=1/0.667/0.3/2 all reproduce the SAME true ratio (~1.236,
+    // `preFixMeasurementAt`'s own S=1 case) to within the same ~0.14% the untransformed baseline
+    // already carried, instead of drifting further from it as `S` moves away from 1.
+    const postFixMeasurementAtS: Record<string, { availablePx: number; naturalPx: number }> = {
+      'S=1': { availablePx: 256, naturalPx: 316.453 },
+      'S=0.667': { availablePx: 170.752, naturalPx: 211.074 },
+      'S=0.3': { availablePx: 76.8, naturalPx: 94.936 },
+      'S=2': { availablePx: 512, naturalPx: 632.906 },
+    };
+    const results = Object.values(postFixMeasurementAtS).map((m) =>
+      fitFontSizePx({ authoredPx, ...m, minPx }),
+    );
+    for (const r of results) {
+      expect(r.shrunk).toBe(true);
+      expect(r.fits).toBe(true);
+      // ⚠️ This is an ALGEBRAIC property of `fitFontSizePx` itself, not a DOM measurement: every
+      // row above is the S=1 pair multiplied by hand by its own `S` (170.752 = 256×0.667,
+      // 211.074 = 316.453×0.667, …) — `fitFontSizePx`'s proportional (ratio-based) model is
+      // invariant to scaling BOTH inputs by the same positive constant BY CONSTRUCTION, so this
+      // still passes even with `contentWidthOf` (the actual DOM-reading fix, UINode.tsx)
+      // hand-reverted to the pre-fix mixed-space expression. What it DOES pin: that
+      // `fitFontSizePx` has no hidden non-proportional term (e.g. an additive epsilon) that would
+      // break that invariance — a real prerequisite for the fix to work, but not the fix itself.
+      // The DOM-level guard is `editor-ui-autofit.spec.ts`'s "AutoFitText scale invariance
+      // (contentWidthOf, transform-aware fix)" describe block, which measures a REAL browser's
+      // committed font size at a forced non-1 `uiScale` and fails if `contentWidthOf` regresses.
+      // The tolerance below is for float precision in the hand-derived numbers above, not
+      // measurement noise — there IS none here.
+      expect(r.fontSizePx).toBeCloseTo(results[0].fontSizePx, 2);
+    }
+  });
+});

@@ -2,13 +2,15 @@
  *  (that has its own unit tests: `autoFitText.test.ts`).
  *
  *  `UIElement` authors `display: flex` (+ `alignItems: stretch`) on EVERY node, so the auto-fit
- *  span's own `display: inline-block` is virtually always a FLEX ITEM of its parent (the
- *  element's own div). That blockifies it to `block` and stretches it to the parent's cross
- *  size, so an unfixed `getBoundingClientRect().width` reads the parent's AVAILABLE width, not
- *  the span's natural single-line width — the fit always concludes "it fits" and leaves a
- *  `white-space: nowrap` label overflowing its box. jsdom reports every rect as 0×0, so this
- *  class of bug is invisible to vitest by construction (see `autoFitText.ts`'s own header) and
- *  can only be caught in a real browser — hence this spec, not another unit test.
+ *  span (its own authored `display: block`, #646) is virtually always a FLEX ITEM of its parent
+ *  (the element's own div). The default `align-items: stretch` then stretches it to the
+ *  parent's cross size, so an unfixed `getBoundingClientRect().width` reads the parent's
+ *  AVAILABLE width, not the span's natural single-line width — the fit always concludes "it
+ *  fits" and leaves a `white-space: nowrap` label overflowing its box. jsdom reports every rect
+ *  as 0×0, so this class of bug is invisible to vitest by construction (see `autoFitText.ts`'s
+ *  own header) and can only be caught in a real browser — hence this spec, not another unit
+ *  test. (The `#646` describe block below tests a SEPARATE bug found alongside this one: the
+ *  span's display also decides whether `maxLines` can clamp it at all — see its own comment.)
  *
  *  Both cases use the `e2e-smoke` fixture's `AutoFitOff`/`AutoFitOn` entities: same 42px
  *  `fontSize` and text as the live measurement that found this bug (#614: "UI TEXT ANIMATION"),
@@ -36,7 +38,7 @@
  *  goes content-sized, one level down from `AutoFitOn`'s case. */
 
 import { test, expect } from '@playwright/test';
-import { gotoEditorWithScene, switchToUIMode, idByName, SCENE } from './helpers';
+import { gotoEditorWithScene, switchToUIMode, idByName, SCENE, stableBoundingBox, waitForFrames } from './helpers';
 
 const AUTHORED_FONT_SIZE_PX = 42;
 
@@ -134,5 +136,173 @@ test.describe('AutoFitText (#614)', () => {
     expect(onRect.x + onRect.width).toBeLessThanOrEqual(parentRect.x + parentRect.width + 2);
     // Back to one line, not the multi-line wrap the OFF case renders above.
     expect(onRect.height).toBeLessThan(onFontSizePx * 1.8);
+  });
+});
+
+test.describe('AutoFitText + UIElement.maxLines (#646)', () => {
+  // `MaxLinesAutoFit`: `fontSizeMin` == the authored `fontSize`, so `resolveMinPx` returns the
+  // authored size and NO shrink is possible — `fitFontSizePx` floors at the authored size and
+  // reports `fits: false`, landing the span in the `pre-wrap` fallback exactly as the module
+  // header describes: "at the fontSizeMin floor, the existing maxLines/textOverflow behaviour
+  // takes over". A 160px box can't fit "UI TEXT ANIMATION" at 42px on one line, so this is
+  // precisely the state #646 measured live: the host div's `maxLines: 1` branch sets
+  // `display: '-webkit-box'` + `-webkit-line-clamp: 1`, and (pre-fix) the AutoFitText span's own
+  // `display: inline-block` made it an ATOMIC inline-level box the clamp mechanism cannot split
+  // into lines, so nothing constrained the height — only `overflow: hidden` on a box whose
+  // height had collapsed, rendering a ~12px sliver with 87px of text clipped away instead of one
+  // clamped ~48px line.
+  test('maxLines: 1 clamps to ONE LINE, not a sliver, when the label is an AutoFitText span', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'MaxLinesAutoFit');
+    await switchToUIMode(page);
+    const id = await idByName(page, 'MaxLinesAutoFit');
+    const box = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+    await box.waitFor({ state: 'visible', timeout: 10_000 });
+    const span = box.locator('span');
+    await span.waitFor({ state: 'visible', timeout: 10_000 });
+
+    const [boxHeight, spanDisplay, spanScrollHeight] = await Promise.all([
+      box.evaluate((el) => el.getBoundingClientRect().height),
+      span.evaluate((el) => getComputedStyle(el).display),
+      span.evaluate((el) => el.scrollHeight),
+    ]);
+
+    // The sliver bug: pre-fix this measured ~12px, with `scrollHeight` (the full unclamped
+    // text) at ~99px — over 8x taller than what rendered. A real clamped line at 42px is
+    // comfortably above half the font size; the sliver is comfortably below it.
+    expect(boxHeight).toBeGreaterThan(AUTHORED_FONT_SIZE_PX * 0.8);
+    // One line, not the ~96-99px two-line wrap an INERT clamp would let through.
+    expect(boxHeight).toBeLessThan(AUTHORED_FONT_SIZE_PX * 1.8);
+    // The mechanism this fix relies on: the host's `-webkit-box` clamp only clamps LINE BOXES,
+    // so the span itself must compute as a real block, not an atomic inline-level box.
+    expect(spanDisplay).toBe('block');
+    // Sanity: the text genuinely doesn't fit on one line at this width/size — scrollHeight
+    // reports its full (unclamped) extent, which must be taller than what actually rendered.
+    expect(spanScrollHeight).toBeGreaterThan(boxHeight);
+  });
+
+  // A sibling of the bug above, found sweeping for its PATTERN during close-out: `AnimatedText`
+  // (the CSS text-animation span, distinct from `AutoFitText`) had the exact same
+  // `display: 'inline-block'`, and it renders as the entity div's direct child too — so
+  // `maxLines` is defeated identically when an entity carries BOTH a `TextAnimation` trait and
+  // `maxLines`. `node.textAnim` (and therefore this span) only exists while the sim is running
+  // (like skeletal animation — frozen/absent when Stopped), so this test presses the real
+  // Play transport (`ControlOrMeta+p`, the same chord `EditorApp`'s `app.playPause` binds) to
+  // reach it, rather than a shortcut that leaves `isSimRunning()` false.
+  test('maxLines: 1 clamps to ONE LINE when the label carries a TextAnimation (AnimatedText sibling)', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'MaxLinesTextAnim');
+    await switchToUIMode(page);
+    const id = await idByName(page, 'MaxLinesTextAnim');
+    const box = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+    await box.waitFor({ state: 'visible', timeout: 10_000 });
+
+    // Enter Play so the TextAnimation trait populates `node.textAnim` and `AnimatedText` mounts.
+    await page.keyboard.press('ControlOrMeta+p');
+    const span = box.locator('span[style*="animation"]');
+    await span.waitFor({ state: 'visible', timeout: 10_000 });
+
+    const [boxHeight, spanDisplay] = await Promise.all([
+      box.evaluate((el) => el.getBoundingClientRect().height),
+      span.evaluate((el) => getComputedStyle(el).display),
+    ]);
+
+    expect(boxHeight).toBeGreaterThan(AUTHORED_FONT_SIZE_PX * 0.8);
+    expect(boxHeight).toBeLessThan(AUTHORED_FONT_SIZE_PX * 1.8);
+    expect(spanDisplay).toBe('block');
+  });
+});
+
+test.describe('AutoFitText scale invariance (contentWidthOf, transform-aware fix)', () => {
+  // `contentWidthOf` (UINode.tsx) used to subtract transform-BLIND `getComputedStyle`
+  // padding/border from a transform-AWARE `getBoundingClientRect().width` — exact only at
+  // `uiScale === 1`, and wrong by up to 67% at `uiScale === 0.3` (see its own header comment for
+  // the measured numbers). `AutoFitOn` above never catches a regression here: its parent carries
+  // NO padding/border, so the buggy and fixed expressions are IDENTICAL for it regardless of
+  // scale, and `editor-ui-autofit.spec.ts`'s other cases all run at the default (near-1) preview
+  // scale, where the bug's own error is ~0.14% — invisible. `AutoFitPaddedBordered` (this
+  // fixture's own entity — its `UIElement.paddingLeft`/`paddingRight`/`borderWidth` are the exact
+  // term the bug mishandles) is sized so its content-box width (384 - 40 padding - 4 border =
+  // 340px) matches `AutoFitOn`'s own box width, i.e. it reproduces the SAME proven shrink as
+  // `AutoFitOn`'s regression test above, just wrapped in padding/border.
+  //
+  // The assertion that actually pins the defect is SCALE INVARIANCE, not a hardcoded px number
+  // (self-calibrating — doesn't rot when a font metric shifts): the committed `fontSize` for this
+  // label must be the SAME whether the preview frame renders it at `uiScale ~= 1` or at a forced
+  // `uiScale ~= 0.3`. At `uiScale === 1` the buggy and fixed expressions are numerically identical
+  // (the `scale` factor multiplies to 1), so that measurement is unaffected by which version is
+  // running — only the forced-scale measurement can differ, which is exactly what isolates the
+  // regression.
+  test('autoFitText commits the SAME fitted font size at a forced non-1 uiScale as at uiScale~1, on a padded+bordered box', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE, 'AutoFitPaddedBordered');
+    const id = await idByName(page, 'AutoFitPaddedBordered');
+    if (id == null) throw new Error('AutoFitPaddedBordered not found in fixture');
+
+    const frame = page.locator('[data-ui-preview-frame]');
+    // Same `select:has(option[value="ui"])` element `switchToUIMode` drives — grabbed directly
+    // here so this test can flip it back to '3d' between measurements too.
+    const modeSelect = page.locator('select:has(option[value="ui"])');
+    const box = page.locator(`[data-ui-preview-frame] [data-entity-id="${id}"]`);
+
+    // Establish the SceneView panel's own on-screen frame width ONCE. Per
+    // `editor-ui-resize-scale.spec.ts`'s header comment, `bounds.w` (the letterboxed frame's
+    // on-screen size, `useLetterboxBounds` in SceneView.tsx) depends only on the panel's own
+    // on-screen size and the store's default `gameRect` aspect (800x450) — NOT on
+    // `gameViewSize` — so this single measurement is valid for computing BOTH forced scales
+    // below, whatever this environment's panel width happens to be.
+    await switchToUIMode(page);
+    const baseFrameBox = await stableBoundingBox(frame);
+    await modeSelect.selectOption('3d'); // unmount — the forced gameViewSize below must apply to a FRESH mount
+
+    // Measures the committed font-size at a forced preview uiScale. Toggling the SceneView mode
+    // away from 'ui' and back fully unmounts/remounts `UIEditorOverlay` (SceneView.tsx's
+    // `mode === 'ui'` render gate) — and with it every `AutoFitText` span — so each call gets a
+    // FRESH `fit()` measurement made under whatever uiScale is in effect AT MOUNT, rather than
+    // reusing a stale committed font-size from the previous scale: `fit()` only re-runs on a real
+    // ResizeObserver box-size change, a fontSize/text prop change, or `fonts.ready` — a
+    // CSS-transform-only uiScale change (the preview frame's own `transform: scale(uiScale)`)
+    // fires none of those.
+    async function measureAtScale(targetScale: number) {
+      const deviceW = Math.round(baseFrameBox.width / targetScale);
+      const deviceH = Math.round(deviceW * 450 / 800); // matches the store's default gameRect aspect
+      await page.evaluate(({ w, h }) => {
+        (window as any).__modokiEditorTest.store.getState().setGameViewSize(w, h);
+      }, { w: deviceW, h: deviceH });
+      await modeSelect.selectOption('ui');
+      await waitForFrames(page, 3); // let the rAF-deferred letterbox/overlay updates settle
+
+      const frameBox = await stableBoundingBox(frame);
+      const uiScale = frameBox.width / deviceW;
+
+      await box.waitFor({ state: 'visible', timeout: 10_000 });
+      const span = box.locator('span');
+      await span.waitFor({ state: 'visible', timeout: 10_000 });
+      const fontSizePx = await span.evaluate((el) => parseFloat(getComputedStyle(el).fontSize));
+
+      await modeSelect.selectOption('3d'); // unmount before the next forced scale
+      return { uiScale, fontSizePx };
+    }
+
+    const near1 = await measureAtScale(1);
+    expect(
+      Math.abs(near1.uiScale - 1),
+      `forcing targetScale=1 did not land uiScale near 1.0 (measured ${near1.uiScale.toFixed(3)}) — this ` +
+      `spec's "unscaled reference" measurement is not actually unscaled.`,
+    ).toBeLessThan(0.05);
+
+    const forced = await measureAtScale(0.3);
+    expect(
+      Math.abs(forced.uiScale - 1),
+      `forcing targetScale=0.3 did not move uiScale away from 1.0 (measured ${forced.uiScale.toFixed(3)}) — ` +
+      `this spec tests nothing until uiScale actually differs from 1.`,
+    ).toBeGreaterThan(0.4);
+
+    const relDiff = Math.abs(forced.fontSizePx - near1.fontSizePx) / near1.fontSizePx;
+    expect(
+      relDiff,
+      `committed fontSize was ${near1.fontSizePx.toFixed(2)}px at uiScale=${near1.uiScale.toFixed(3)} but ` +
+      `${forced.fontSizePx.toFixed(2)}px at uiScale=${forced.uiScale.toFixed(3)} (${(relDiff * 100).toFixed(1)}% ` +
+      `relative difference) on a padded+bordered box — contentWidthOf's availablePx must be scale-invariant; ` +
+      `mixing a transform-aware rect with transform-blind padding/border makes it drift with uiScale (see ` +
+      `UINode.tsx's contentWidthOf header comment for the mechanism and the measured error at other scales).`,
+    ).toBeLessThan(0.05);
   });
 });

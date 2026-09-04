@@ -15,6 +15,7 @@ import {
   isSelfPlacementDisabled,
   selectionSizeGate,
   selectionAnchorGate,
+  selectionPooledRowGate,
   type UiPreset,
 } from '../../src/runtime/ui/uiAuthoring';
 
@@ -144,5 +145,22 @@ describe('selectionAnchorGate (self-placement props, #34)', () => {
     expect(selectionAnchorGate(['', ''])).toBe('inert');
     expect(selectionAnchorGate(['', null])).toBe('mixed');
     expect(selectionSizeGate(['', ''], 'width')).toBe('live');
+  });
+});
+
+describe('selectionPooledRowGate (UIEntries pooled-row Inspector note, #651)', () => {
+  it('is live when nothing in the selection is a pooled row', () => {
+    expect(selectionPooledRowGate([false, false])).toBe('live');
+    expect(selectionPooledRowGate([])).toBe('live');
+  });
+
+  it('is inert only when EVERY selected entity is a pooled row', () => {
+    expect(selectionPooledRowGate([true, true])).toBe('inert');
+    expect(selectionPooledRowGate([true])).toBe('inert');
+  });
+
+  it('is mixed when only part of the selection is a pooled row, regardless of order', () => {
+    expect(selectionPooledRowGate([true, false])).toBe('mixed');
+    expect(selectionPooledRowGate([false, true])).toBe('mixed');
   });
 });

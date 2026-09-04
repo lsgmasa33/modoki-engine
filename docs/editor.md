@@ -907,6 +907,108 @@ derives basic hints from a koota schema's default values; it has no internal cal
 The gizmo mode (`translate | rotate | scale`) and space (`world | local`) live in
 `editorStore` and are shared by both modes via a toolbar.
 
+### ⚠️ The UI-mode measurement seam — THREE stacked coordinate spaces, and FOUR wrong fixes
+
+`UIResizeOverlay`'s drag math has produced a shipped defect four times, each fix plausible, each
+surviving a green `npm run verify` and a review, each caught only by putting a browser in front
+of it. Read this before touching a measurement there.
+
+**There are three spaces, not two:**
+
+| Space | Read with | Blind to |
+|---|---|---|
+| Screen px | `getBoundingClientRect()` | nothing — it sees every transform |
+| Layout px | `clientWidth`/`offsetWidth`, `getComputedStyle` padding/border | **every** transform |
+| Frame-logical px | what `toLogicalDelta` produces | only the FRAME's transform is divided out |
+
+Two separate transforms stack between the frame and an element. `SceneView` lays the preview
+frame out at the logical device size and applies `transform: scale(uiScale)`; **and**
+`applyRotationStyle` (`runtime/ui/anchorCss.ts`) emits a second `transform: scale(s)` on any node
+whose `UIElement.scale !== 1`. A measurement is only correct if it names which of the three
+spaces it is in and converts consistently. The first three failures were all one mistake — mixing
+two spaces in a single expression; the fourth (below) was different — assuming a
+`getBoundingClientRect()` ratio between two boxes equals a scale factor, which is true only when
+nothing in the chain is rotated:
+
+1. **Original** — `%` denominator was the parent's **border** box (`getBoundingClientRect`),
+   where CSS resolves against the content or padding box. Wrong whenever the parent had padding.
+2. **#651 B2's first fix** — subtracted layout-px padding/border from a screen-px rect, then
+   multiplied by `1/uiScale`, dividing the padding term by `uiScale`. Correct only at
+   `uiScale === 1`; error `S·|1−1/u|` — where `S` is the total padding+border subtracted from the
+   screen-px rect (both edges combined, in layout px), the term the bug multiplied by `1/uiScale`
+   alongside the screen rect when only the screen term should have been — so **break-even at
+   exactly 0.5 and strictly worse below** it — and tablet/desktop presets letterboxed into a
+   SceneView panel sit below 0.5 routinely. On a small parent the denominator clamped to 0 and the
+   handle went silently dead.
+3. **Its replacement** — used pure layout px (`clientWidth`) and so corrected the frame's
+   transform but was blind to `UIElement.scale`. A `%` child of a scaled node overshot by that
+   scale factor; `computedSize` additionally double-counted the element's *own* transform
+   (measured: 83px round-tripped to 747px at `scale: 3`).
+4. **That fix's own regression** — its `ancestorScaleRatio(screenSize, layoutSize, frameScaleAxis)`
+   recovered the second transform as a ratio of a `getBoundingClientRect()` box to a layout size —
+   correct only when nothing in the chain is rotated. `getBoundingClientRect()` on a rotated
+   element returns its axis-aligned BOUNDING box, which is bigger than the element itself, so the
+   ratio stopped being a scale factor the moment rotation entered the picture: measured (parent
+   200×150, `scale: 1`, frame scaled 0.5) at `rotation: 15` the ratio came out `1.160/1.311` for
+   what should be exactly `1/1`, and `0.750/1.333` at `rotation: 90` on the same non-square parent.
+   A scene with no `UIElement.scale` at all — the case the original fix existed to leave alone —
+   regressed the instant an author rotated anything.
+
+**The resolution:** `decomposeScale`/`accumulateAncestorScale` (`uiResizeMath.ts`) read the
+ancestor chain's CSS transform MATRIX directly instead of comparing two boxes. A `matrix(a,b,c,d,e,f)`
+is the coefficient matrix whose columns are where the X/Y basis vectors land; rotation only changes
+a column's DIRECTION, never its length, so `hypot` of a column recovers exactly that axis's scale
+regardless of any rotation composed into the same transform. `UIResizeOverlay` walks from an
+element's parent up through `.parentElement` to (excluding) the preview frame, decomposing and
+compounding each ancestor's own transform. The result is exactly **1** when no ancestor between the
+element and the frame carries a transform of its own — true whether that ancestor is unrotated,
+PURELY rotated, or both rotated and scaled — which is the property that keeps every untransformed
+case byte-identical, and (unlike item 4 above) is now asserted against a REAL browser-computed
+transform, not inferred from a box ratio. A degenerate `scale: 0` — a legitimate authored value (a
+pop-in clip's first keyframe) — falls back to 1 rather than propagate a zero into `%`'s denominator,
+where it would otherwise turn a drag into a silent no-op. Layout boxes are then scaled into
+frame-logical space by the result, and `deltaToUnit`/`computeResize`/`computeMoveOffsets` divide it
+back out for every unit **except `%`** (the `%` path cancels, because its denominator carries the
+same factor; `px` and `vw`/`vh`/`vmin`/`vmax` do not) — including an auto-sized `px` element's own
+measured-size BASE, which needs that same division alongside `dx`/`dy` and was, until this fix, the
+one place it was still missing.
+
+⚠️ **Scope of "exact under rotation": the recovered SCALE FACTOR, not the whole resize.** This fix
+makes `decomposeScale`/`accumulateAncestorScale`'s own return value exact under rotation — the
+%-denominator and the `px`/auto-size divisions above are all correct now. It does NOT make dragging
+a handle under a rotated ancestor geometrically correct: `toLogicalDelta` converts a screen-pixel
+drag straight into a frame-logical delta and never projects it onto the element's own (rotated)
+local axis, and the 8 resize handles are placed at fractions of the on-screen AABB rather than the
+element's true corners. So a 45°-rotated ancestor still writes the FULL dragged px count into
+`width`/`height` for a horizontal drag (matching `dx` directly) where the visually-intended change
+is `dx · cos45° ≈ 0.707 · dx` — a 40px drag writes 40 layout px where the visual intent is ~28.3.
+That is a real, separate, still-open gap this fix does not touch — decomposing the matrix fixed the
+DENOMINATOR, not the DRAG AXIS.
+
+**Why the gate never caught any of it, which is the part worth generalising:**
+`uiResizeMath.test.ts` feeds hand-written numbers to pure functions — never the broken part, so
+deleting the whole `getComputedStyle` block leaves it green. `UIResizeOverlay.test.tsx` never
+enters `handlePointerDown` (its fixture has `parentId: 0`, so no parent element mounts), and jsdom
+reports every rect as `0x0` and `''` for unset padding → `NaN` → `|| 0`, so the mismatch is
+invisible there **by construction**. A pure-function test cannot see a units error at a DOM seam.
+Failure 4 got past a pure-function test a DIFFERENT way: `ancestorScaleRatio` had its own unit
+tests, and they passed — but every `(screenSize, layoutSize, frameScaleAxis)` triple they fed it
+was hand-picked as if `screenSize = layoutSize / frameScaleAxis * trueScale`, an identity that only
+holds without rotation, so the tests could not have failed even reading the wrong formula; only a
+browser, computing `screenSize` itself from an actually-rotated element, could disagree with it.
+Cover it with an e2e that drags at a non-1 `uiScale`, under a scaled ancestor, **and under a
+ROTATED one** — all three exist now, and each caught a different one of the four failures.
+Assert the unit is still `%`, or the test silently stops testing this path the moment a fixture
+drifts to `px`.
+
+⚠️ **The rotated case asserts the stored `%`, not the on-screen pixel round-trip the other two
+use, and that difference is deliberate.** A rotated ancestor puts the child's own
+`getBoundingClientRect()` into the paint chain as an AABB, and the drag axis is never projected
+onto the element's local axis — so a pixel assertion there would pass or fail for reasons that
+have nothing to do with the denominator under test. Asserting the written value isolates the one
+thing the fixture exists to pin. A test that passes for the wrong reason is the failure mode this
+whole section is about.
+
 ### The idle render gate — what re-arms it, and the edge that keeps being missed
 
 The 3D viewport draws only while its dirty gate has frames left (`editor/panels/viewportDirtyGate.ts`
