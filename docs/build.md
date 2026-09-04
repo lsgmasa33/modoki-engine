@@ -1269,8 +1269,11 @@ contents while the dep spec, both lockfiles and the install marker all agree the
 installed. In that state nothing looks changed, `npm install` reports "up to date", and the install
 step does nothing — so a check gated on "did a heal change something?" could never fire in the one
 case it exists for. It fails the build rather than repairing: an `rm -rf` inside `node_modules`
-mid-build is itself a mutation, and #685 is still open, so auto-healing would destroy the evidence
-needed to characterise how the state arises. The remedy is printed per plugin — and it is NOT a
+mid-build is itself a mutation, and — the load-bearing reason — this check knows only that the
+tarball and `node_modules` DISAGREE, not which side is right. `vendorEnginePlugins` may rewrite a
+tracked lockfile mid-build because it just packed the tarball and knows it is correct; this check
+has no such knowledge, and one of its reachable causes is a mis-resolved `.tgz` merge conflict
+where the committed tarball is the wrong generation. The remedy is printed per plugin — and it is NOT a
 bare `rm -rf <project>/node_modules/<plugin> && npm install`, which leaves the stale integrity in
 place; see the ⚠️ npm-cache-trap block a few sections below for the recipe that actually works.
 
@@ -1350,37 +1353,69 @@ nothing: delete `packages["node_modules/<plugin>"]` from the project's `package-
 `rm -rf node_modules/<plugin> && npm install`.
 
 **The trigger is a CONJUNCTION, measured on npm 11.12.1 / node v26 (#685).** Each row is an
-independently re-poisoned tree, so the results don't contaminate each other. npm resolves a `file:`
-dep from the lockfile entry — `resolved` + `integrity` — and re-extracts when EITHER moves:
+independently re-poisoned tree, so the results don't contaminate each other:
 
-| tarball bytes | filename | lockfile entry | result |
+| tarball bytes | filename / `file:` spec | lockfile entry | result |
 |---|---|---|---|
 | change | changes | advances | heals (`changed 1 package`) |
+| change | changes | **stale** | heals (`changed 1 package`) |
 | change | **same** | advances | heals (`changed 1 package`) |
 | change | **same** | **never regenerated** | **POISONED** — `up to date`, old bytes stay on disk |
 
-A fourth control rules out the resolver theory the issue floated: with two tarballs at DIFFERENT
-filenames both declaring the same internal `1.0.0`, npm still re-extracts — so it does not key a
-`file:` dep on `name@version`, and N indistinguishable `1.0.0` tarballs are harmless on their own.
+npm re-extracts when **either** the `file:` spec or the lockfile entry moves; only both standing
+still while the bytes move poisons the tree. A fourth control rules out the resolver theory the
+issue floated: two tarballs at DIFFERENT filenames both declaring the same internal `1.0.0` still
+re-extract, so npm does not key a `file:` dep on `name@version`, and N indistinguishable `1.0.0`
+tarballs are harmless on their own.
 
-So only the conjunction bites, and the `<base>-h<hash>` packed version is NOT what prevents it —
-the lockfile regeneration that shipped alongside it is. Two consequences that are easy to get
-backwards:
-- **A version-only re-pack keeps the filename.** `pluginContentHash` normalizes the version out of
-  its input (it must, or the hash would feed on itself), so `9b8891576` rewrote all 27 tarballs
-  in place — `git show --name-status --find-renames 9b8891576 -- 'games/*/plugins/*.tgz'` is 27 `M`,
-  zero `R`. Merging it was still safe, because it shipped 23 regenerated lockfiles with them
-  (verified against the real pre/post bytes, not synthetics).
-- **The recovery recipe's three steps are each load-bearing.** Deleting the entry and running only
-  `npm install --package-lock-only` + `npm ci` leaves the tree stale; so do `npm install`,
-  `--force`, and `rm -rf node_modules && npm install` on their own. The full recipe above is the
-  one that was measured to work.
+So the `<base>-h<hash>` packed version is NOT what prevents this — the lockfile regeneration that
+ships with a re-vendor is. A version-only re-pack keeps the filename: `pluginContentHash` normalizes
+the version out of its hash input (it must, or the hash would feed on itself), so `9b8891576`
+rewrote all 27 tarballs in place —
 
-⚠️ **No in-repo workflow can still reach the poisoned state**: `vendorEnginePlugins` invalidates the
-lockfile entry on an in-place re-pack, `bootstrap-game-deps` never skips a present `node_modules`
-(the #215 scar), and `verifyInstalledMatchesTarball` fails both native build paths regardless of
-cause. What remains reachable is a mis-resolved `.tgz` binary merge conflict (tarball from one side,
-lockfile from the other) or hand-editing — which is exactly what the detector is for.
+```
+git show --name-status --find-renames 9b8891576 -- 'games/*/plugins/*.tgz' 'demos/*/plugins/*.tgz'
+→ 27 M, zero R      (the games glob ALONE is 21 — the other 6 are demos)
+```
+
+— yet merging it was safe, because all 22 affected projects had their own `package-lock.json`
+regenerated in the same commit (plus the repo root's, which protects no project). Verified against
+the real pre/post tarball bytes extracted from both sides of that commit, not synthetics.
+
+⚠️ **`npm install --package-lock-only` CREATES the poisoned bookkeeping — do not run it alone.**
+This is the state #685 spent months unable to reproduce, and it is one command away. PLO writes the
+NEW integrity into `package-lock.json` **and** into `node_modules/.package-lock.json` without
+touching the extracted files — whenever it has a reason to re-resolve, i.e. the entry was deleted
+(step 1 of the recipe) or the `file:` spec/filename moved (the `git pull` case). It is a pure no-op
+when the entry is present and the spec unchanged, so a bare PLO on a same-filename stale tree does
+nothing and is not the way to reproduce this. The bookkeeping then says tarball C while the disk holds tarball B, so every later
+`npm install` reports `up to date` forever and nothing ever re-extracts.
+
+**The two-step repair is the safe one — delete the entry, then a PLAIN `npm install`:**
+
+```bash
+# 1. delete packages["node_modules/<plugin>"] from the project's package-lock.json
+# 2. (cd <project> && npm install)      # NOT --package-lock-only
+```
+
+Measured: that heals. It is also exactly what `vendorEnginePlugins` does after an in-place re-pack
+(`invalidateLockfileEntry`, then the plain `npm install` both native build paths already run), which
+is why that path genuinely re-resolves. The longer three-step recipe printed by the guards also
+works, but only because its step 3 (`rm -rf node_modules/<plugin>`) undoes the damage step 2 does —
+**stopping after step 2 leaves the tree in the worst state of all.**
+
+⚠️ **What is and is not closed off.** `vendorEnginePlugins` invalidating the lockfile entry on an
+in-place re-pack means no in-repo re-vendor can CAUSE the state, and `bootstrap-game-deps` never
+skipping a present `node_modules` (the #215 scar) means an install always runs — but note that a
+plain `npm install` on an already-poisoned tree does NOT heal it, so neither of those is a cure.
+The cure is the detector: `verifyInstalledMatchesTarball` compares tarball to installed and fails
+both native build paths regardless of how the state arose. ⚠️ **One gap, and it is narrower than it
+looks**: `build-web.mjs` loads `vendorPlugins.ts` through esbuild at runtime and, when that load
+returns null, prints a loud warning and skips the check. A packaged editor is that case — it ships
+the `.ts` sources but prunes esbuild as a devDependency — so a bare `node engine/scripts/build-web.mjs`
+there would not check. The editor's own **Build menu is unaffected**: `/api/build` imports
+`verifyInstalledMatchesTarball` statically and fails before it ever spawns the CLI. What stays reachable otherwise is a mis-resolved `.tgz` binary merge conflict (tarball
+from one side, lockfile from the other) or hand-editing.
 
 Two notes worth carrying:
 - **`npm` ships `README.md` regardless of the `files` field**, so editing a plugin's DOCS re-hashes
@@ -1394,8 +1429,8 @@ Two notes worth carrying:
   pass green and ship the previous native code. It compares the shipped set MINUS `dist/` — the same
   set the tarball's NAME is computed over. `dist/` is deliberately out of scope: it is gitignored,
   rebuilt per clone, and the vendorer already refuses to re-pack on a dist-only change (the
-  "toolchain-drift churn killer" test), so failing on one would demand a re-vendor of all 21
-  tarballs plus 21 lockfiles for a tsc patch bump — the exact churn that decision exists to
+  "toolchain-drift churn killer" test), so failing on one would demand a re-vendor of all 27
+  tarballs plus 22 project lockfiles for a tsc patch bump — the exact churn that decision exists to
   prevent. Two halves of one system cannot hold opposite positions on the same input. A third check hashes each tarball and compares it to the `integrity` its
   project's `package-lock.json` records (driven off the lockfile, so a project that drops the dep
   from `package.json` while the lock keeps it is still seen) — a re-vendor can rewrite a tarball under an UNCHANGED name

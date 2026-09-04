@@ -226,10 +226,15 @@ async function healNativeProject() {
   //    every single call, install-or-not, and reads what's actually on disk rather than trusting
   //    the signals that said "nothing to do".
   //
-  //    Deliberately NOT auto-repaired: an `rm -rf` inside node_modules mid-build would itself be a
-  //    mutation that could mask a different problem, and — the load-bearing reason — #685 is still
-  //    OPEN and uncharacterized. Auto-healing the state would destroy the evidence needed to work
-  //    out how it arises. Fail loud instead, with the exact manual remedy.
+  //    Deliberately NOT auto-repaired, and the reason is NOT "a build must not write a tracked
+  //    lockfile" — vendorEnginePlugins already does exactly that (invalidateLockfileEntry) a few
+  //    lines above. The difference is KNOWLEDGE of which side is right: the vendorer just packed
+  //    the tarball, so it knows the tarball is correct and node_modules is what must move. This
+  //    check knows only that the two DISAGREE. Its reachable causes include a mis-resolved `.tgz`
+  //    binary merge conflict, where the committed tarball is the WRONG generation — auto-extracting
+  //    it would install wrong bytes confidently and erase the only signal that the committed state
+  //    is inconsistent. Fail loud instead, with the exact manual remedy, and let a human decide
+  //    which side is authoritative.
   // ⚠️ `loadEnginePluginModule` returns null SILENTLY when the TS sources are absent or esbuild is
   //    not installed (the packaged editor is exactly that case). Say so out loud rather than
   //    skipping in silence: a guard that quietly does not run is the same unreachable-mechanism
@@ -252,7 +257,7 @@ async function healNativeProject() {
           + `cache while the lockfile still pins the old integrity, so nothing ever asks it to look again. `
           + `Fix each one, in order:\n`
           + `  1. delete the plugin's entry from ${projectRoot}/package-lock.json ("node_modules/<plugin>" under "packages")\n`
-          + `  2. (cd ${projectRoot} && npm install --package-lock-only)   # re-resolves version + integrity from the tarball\n`
+          + `  2. (cd ${projectRoot} && npm install --package-lock-only)   # re-resolves it — ⚠ 2 WITHOUT 3 leaves node_modules UNRECOVERABLE by npm install\n`
           + `  3. (cd ${projectRoot} && rm -rf node_modules/<plugin> && npm install)`,
       );
     }

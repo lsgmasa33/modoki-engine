@@ -144,12 +144,16 @@ describe('pinned transitive deps (uuid/nanoid) — docs/native-and-sdks.md § "P
             offenders.push(`${rel}: ${key} resolves uuid@${version} (< 11) — the pinned ` +
               `"@capacitor/cli" -> "xcode" -> "uuid@^7.0.3" vulnerability. Add/refresh the ` +
               `"overrides": { "uuid": "^11.1.1" } pin (see docs/native-and-sdks.md § "Pinned ` +
-              `transitive deps") and re-run \`npm install --package-lock-only --ignore-scripts\`.`);
+              `transitive deps") and re-run \`npm install --package-lock-only --ignore-scripts\`. ` +
+              `Run a plain \`npm install\` there FIRST — on a stale node_modules it poisons ` +
+              `vendored plugins (docs/build.md, #685).`);
           }
           if (name === 'nanoid' && versionBelow(version, '3.3.17')) {
             offenders.push(`${rel}: ${key} resolves nanoid@${version} (vulnerable, fixed in ` +
               `3.3.17) — pin "overrides": { "nanoid": "^3.3.17" } (see docs/native-and-sdks.md § ` +
-              `"Pinned transitive deps") and re-run \`npm install --package-lock-only --ignore-scripts\`.`);
+              `"Pinned transitive deps") and re-run \`npm install --package-lock-only --ignore-scripts\`. ` +
+              `Run a plain \`npm install\` there FIRST — on a stale node_modules it poisons ` +
+              `vendored plugins (docs/build.md, #685).`);
           }
         }
       }

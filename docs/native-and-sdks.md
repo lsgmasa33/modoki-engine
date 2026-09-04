@@ -1014,6 +1014,13 @@ Silence is a pass. Per project, `npm ls uuid` / `npm ls nanoid` answers the same
 adding a pin, refresh the lock with `npm install --package-lock-only --ignore-scripts` — it rewrites
 only the affected entry (measured: 3 lines per lockfile).
 
+⚠️ **Run a plain `npm install` in that project FIRST if you have pulled since you last installed.**
+All 22 projects carrying these lockfiles also carry `file:plugins/*.tgz` vendored plugins, and
+`--package-lock-only` on a project whose `node_modules` is stale advances both lockfiles without
+re-extracting — which poisons the vendored plugin permanently, in the way
+[build.md](./build.md) describes under the #685 conjunction table. On an already-current tree it is
+harmless.
+
 Full build/deploy commands live in [build.md](./build.md) and the project `CLAUDE.md`.
 
 ## App Identity & Build

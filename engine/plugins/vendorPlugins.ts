@@ -568,9 +568,11 @@ export function compareTarballToSource(tarballPath: string, pluginDir: string): 
  *  npm recorded in `node_modules/.package-lock.json` — agreed the CURRENT tarball was installed,
  *  while `node_modules/<plugin>` on disk still held the bytes of a PREVIOUS one. `npm install`
  *  reported "up to date"; a native build shipped the stale plugin silently, with nothing wrong to
- *  point at. The poisoned state could not be reproduced on demand (#685, second comment), so this
- *  is a detector for the STATE, not an explanation of how it arises — it must catch it regardless
- *  of the sequence that produced it. */
+ *  point at. The mechanism IS now characterized — `npm install --package-lock-only` on a tree whose
+ *  extraction is stale advances BOTH lockfiles without extracting, and every later install then
+ *  reports "up to date" forever (#685, closed; see docs/build.md). This stays a detector for the
+ *  STATE rather than for that one cause: a mis-resolved `.tgz` merge conflict and a hand-edit reach
+ *  the same place, so it must catch it regardless of the sequence that produced it. */
 
 /** "First few" differing paths reported per stale plugin — enough to start a `diff`, not a full
  *  dump of every mismatched file. */

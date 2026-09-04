@@ -152,7 +152,7 @@ describe('vendored engine plugins are not stale (#90)', () => {
         + `the lockfile still pins the old integrity, so nothing ever asks it to look again. Fix, in `
         + `order, per named project:\n`
         + `  1. delete the plugin's entry from <project>/package-lock.json ("node_modules/<plugin>" under "packages")\n`
-        + `  2. (cd <project> && npm install --package-lock-only)   # re-resolves version + integrity from the tarball\n`
+        + `  2. (cd <project> && npm install --package-lock-only)   # re-resolves it — ⚠ 2 WITHOUT 3 leaves node_modules UNRECOVERABLE by npm install\n`
         + `  3. (cd <project> && rm -rf node_modules/<plugin> && npm install)\n`
         + `Then commit the package-lock.json.`
       : '',

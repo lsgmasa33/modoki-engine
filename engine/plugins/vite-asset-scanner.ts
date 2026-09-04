@@ -2757,7 +2757,7 @@ export function assetScannerPlugin(): Plugin {
                 send(`\n⚠️ \`npm install\`, \`npm install --force\`, and \`rm -rf node_modules/<plugin> && npm install\` on their OWN do NOT fix this — measured: npm serves the stale content straight out of its own cache while the lockfile still pins the old integrity, so nothing ever asks it to look again.`);
                 send(`Fix each one, in order:`);
                 send(`  1. delete the plugin's entry from ${projectRoot}/package-lock.json ("node_modules/<plugin>" under "packages")`);
-                send(`  2. (cd ${projectRoot} && npm install --package-lock-only)   # re-resolves version + integrity from the tarball`);
+                send(`  2. (cd ${projectRoot} && npm install --package-lock-only)   # re-resolves it — ⚠ 2 WITHOUT 3 leaves node_modules UNRECOVERABLE by npm install`);
                 send(`  3. (cd ${projectRoot} && rm -rf node_modules/<plugin> && npm install)`);
                 res.end();
                 return;
