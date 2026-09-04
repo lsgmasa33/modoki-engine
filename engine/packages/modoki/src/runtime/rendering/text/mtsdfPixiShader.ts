@@ -453,3 +453,8 @@ export function updateMtsdfPixiStyle(shader: Shader, style: MtsdfStyle): void {
 
 /** Test-only accessor for the two generated shader bits (see the note above `mtsdfBit`). */
 export const mtsdfShaderBitsForTest = () => ({ wgsl: mtsdfBit, glsl: mtsdfBitGl });
+
+/** Test-only accessor for the module-level program cache (see `getMtsdfPrograms` above / the
+ *  "Program cache (fixes #590)" note) — lets a test assert the GL/GPU programs are actually
+ *  SHARED across calls, not just that the cache field exists. */
+export const mtsdfProgramsForTest = () => getMtsdfPrograms();

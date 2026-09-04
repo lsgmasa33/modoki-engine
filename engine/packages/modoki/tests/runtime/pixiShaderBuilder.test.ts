@@ -3,9 +3,16 @@
  *  Covers: the pure uniform packing/validation (`uniformSpecFor`, `buildUniformValues`,
  *  `validatePixiShaderManifest`) and the async program builder (`buildPixiShaderProgram`)
  *  over a mocked fetch + WebGPU-active backend. The WebGL body/program is intentionally
- *  NOT exercised — `compileHighShaderGlProgram` needs a live GL context (getTestContext),
- *  which jsdom/node lack; the runtime is single-backend and the WGSL path proves the
+ *  NOT exercised: the runtime is single-backend and the WGSL path proves the
  *  generation/compilation contract.
+ *
+ *  ⚠️ The reason used to read "`compileHighShaderGlProgram` needs a live GL context
+ *  (getTestContext), which jsdom/node lack". That is WRONG, and it was believed long enough to
+ *  shape this file. `GlProgram` construction is source-string assembly plus one
+ *  `getMaxFragmentPrecision()` call that degrades to 'mediump' when `canvas.getContext('webgl')`
+ *  returns null — jsdom does that without throwing, so construction succeeds fine.
+ *  `mtsdfProgramCache.test.ts` builds real GL programs under this same pragma and proves it.
+ *  A live context is needed to LINK a WebGLProgram at render time, which is a different thing.
  */
 // @vitest-environment jsdom
 
