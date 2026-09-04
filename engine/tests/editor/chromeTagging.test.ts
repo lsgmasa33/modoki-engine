@@ -140,15 +140,32 @@ const REQUIRED: Array<{ file: string; ids: string[]; why: string }> = [
       // editingPart === i, and this double-click span is the only thing that sets it. Third
       // instance of that pattern in #287 (SubSection, FindReferencesDialog, this).
       '`skin.parts.row.${i}.rename`',
+      // #704 — the ten numeric fields. Before these, a case authoring a bone pose or a
+      // tessellation density had to match a label <span> and take its nextElementSibling.
+      'skin.inspector.bone.x', 'skin.inspector.bone.y', 'skin.inspector.bone.rot',
+      'skin.part.center.x', 'skin.part.center.y', 'skin.part.rotation',
+      'skin.part.size.w', 'skin.part.size.h',
+      'skin.part.tessellate.cols', 'skin.part.tessellate.rows',
     ],
-    why: 'the Skin Editor mode/tool switches and the paint brush — the controls a weight-painting '
-      + 'case has to drive before it can assert anything about the rig.',
+    why: 'the Skin Editor mode/tool switches, the paint brush, and the ten numeric fields (#704) — '
+      + 'the controls a weight-painting case has to drive before it can assert anything about the rig.',
   },
   {
     file: 'panels/ParticleEditor.tsx',
-    ids: ['particle.transport.play', 'particle.transport.restart', 'particle.transport.scrub', 'particle.header.name'],
+    ids: [
+      'particle.transport.play', 'particle.transport.restart', 'particle.transport.scrub', 'particle.header.name',
+      // #704 — the row-repeater fields. `useFieldId` cannot mint these (a repeated row has no
+      // Section context), so unlike the panel's other ~60 fields they are tagged BY HAND and
+      // nothing else would notice them going missing.
+      '`particle.bursts.row.${i}.time`', '`particle.bursts.row.${i}.count`',
+      '`particle.forces.row.${i}.x`', '`particle.forces.row.${i}.y`',
+      '`particle.forces.row.${i}.z`', '`particle.forces.row.${i}.strength`',
+      '`particle.subEmitters.row.${i}.count`', '`particle.subEmitters.row.${i}.probability`',
+      '`particle.subEmitters.row.${i}.inheritVelocity`',
+    ],
     why: 'the Particle Editor transport. Its buttons render as bare glyphs (⏸ ⟲ ↶ ▦), so before '
-      + 'this there was no text for a fallback case to match on either.',
+      + 'this there was no text for a fallback case to match on either. Plus the nine row-repeater '
+      + 'fields (#704), which the fieldIds context cannot reach.',
   },
   {
     // The Advanced disclosure in TextureAssetView is defaultOpen={false} and hides SEVEN

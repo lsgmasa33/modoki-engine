@@ -1348,9 +1348,12 @@ place, so the `npm install` right after a re-vendor genuinely re-resolves — bu
 predates that fix, or one made by hand (a `git checkout` of an old tarball, an interrupted
 re-vendor), still needs the entry removed manually. `npm install`, `npm install --force`, and
 `rm -rf node_modules/<plugin> && npm install` ALONE all leave the stale integrity in place and fix
-nothing: delete `packages["node_modules/<plugin>"]` from the project's `package-lock.json`, then
-`npm install --package-lock-only` (re-resolves version + integrity from the tarball on disk), then
-`rm -rf node_modules/<plugin> && npm install`.
+nothing. ⚠️ **Nor is `npm install --package-lock-only` the answer — it is what CREATES the
+unrecoverable state**, measured (#685); see the PLO warning below. The safe repair is the one
+documented there: delete `packages["node_modules/<plugin>"]` from the project's
+`package-lock.json`, then a PLAIN `npm install`, and — only if that still reports "up to date" —
+a third step (`rm -rf node_modules/<plugin> && npm install`) for when
+`node_modules/.package-lock.json` is itself ahead of the disk.
 
 **The trigger is a CONJUNCTION, measured on npm 11.12.1 / node v26 (#685).** Each row is an
 independently re-poisoned tree, so the results don't contaminate each other:
@@ -1391,18 +1394,26 @@ when the entry is present and the spec unchanged, so a bare PLO on a same-filena
 nothing and is not the way to reproduce this. The bookkeeping then says tarball C while the disk holds tarball B, so every later
 `npm install` reports `up to date` forever and nothing ever re-extracts.
 
-**The two-step repair is the safe one — delete the entry, then a PLAIN `npm install`:**
+**The safe repair — delete the entry, then a PLAIN `npm install`, with a conditional third step:**
 
 ```bash
 # 1. delete packages["node_modules/<plugin>"] from the project's package-lock.json
 # 2. (cd <project> && npm install)      # NOT --package-lock-only
+# 3. ONLY if step 2 reported "up to date" and the tree is still stale — node_modules/.package-lock.json
+#    is itself ahead of the disk and nothing will re-extract:
+#    (cd <project> && rm -rf node_modules/<plugin> && npm install)
 ```
 
 Measured: that heals. It is also exactly what `vendorEnginePlugins` does after an in-place re-pack
 (`invalidateLockfileEntry`, then the plain `npm install` both native build paths already run), which
-is why that path genuinely re-resolves. The longer three-step recipe printed by the guards also
-works, but only because its step 3 (`rm -rf node_modules/<plugin>`) undoes the damage step 2 does —
-**stopping after step 2 leaves the tree in the worst state of all.**
+is why that path genuinely re-resolves.
+
+⚠️ **Do not confuse step 3 above with the SUPERSEDED recipe** — the one this doc and the guards
+printed until 2026-09-05, whose step 2 was `npm install --package-lock-only`. That one also ended
+up working, but only because its step 3 (`rm -rf node_modules/<plugin>`) undid the damage its own
+step 2 did: **stopping after THAT step 2 leaves the tree in the worst state of all**, and it is the
+reason the messages now name PLO as the cause rather than the cure. Step 3 above is conditional and
+undoes nothing.
 
 ⚠️ **What is and is not closed off.** `vendorEnginePlugins` invalidating the lockfile entry on an
 in-place re-pack means no in-repo re-vendor can CAUSE the state, and `bootstrap-game-deps` never

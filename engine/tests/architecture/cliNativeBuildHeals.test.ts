@@ -180,6 +180,13 @@ describe('build-web.mjs verifies node_modules against the tarball UNCONDITIONALL
     throw new Error('no matching close brace found');
   }
 
+  // The check's OWN enclosing block (`if (vendorMod) { … }`), computed once and reused by every
+  // `it` below that needs to scope a slice — not "anywhere later in the file" (an unrelated step
+  // added after this one must not turn a slice red) and not a magic char count (#685 FIX: a
+  // constant window either overruns the block or clips it, depending on unrelated edits nearby).
+  const blockStart = src.indexOf('if (vendorMod) {');
+  const blockEnd = matchingBraceEnd(src, src.indexOf('{', blockStart));
+
   it('calls verifyInstalledMatchesTarball', () => {
     expect(src).toContain('verifyInstalledMatchesTarball(');
   });
@@ -196,22 +203,43 @@ describe('build-web.mjs verifies node_modules against the tarball UNCONDITIONALL
     expect(verifyIdx).toBeGreaterThan(closeBrace);
   });
 
-  it('throws (does not merely log) when problems are found, and never auto-repairs with rm -rf', () => {
+  it('throws (does not merely log), documents the SAFE remedy, and never auto-repairs', () => {
     const verifyIdx = src.indexOf('verifyInstalledMatchesTarball(');
-    const nextChunk = src.slice(verifyIdx, verifyIdx + 500);
+    expect(blockStart).toBeGreaterThan(-1);
+    expect(verifyIdx).toBeGreaterThan(blockStart);
+    expect(verifyIdx).toBeLessThan(blockEnd);
+    // Scoped to the check's OWN enclosing block (`if (vendorMod) { … }`), not a magic char count —
+    // a constant window either overruns the block (pulling in unrelated later code) or clips it
+    // (#685 FIX).
+    const nextChunk = src.slice(verifyIdx, blockEnd);
     expect(nextChunk).toMatch(/problems\.length/);
     expect(nextChunk).toMatch(/throw new Error/);
     // The remedy is DOCUMENTED in the message, but the script itself must never execute it.
-    expect(nextChunk).toMatch(/rm -rf/);
+    // ⚠️ It must be the SAFE remedy: delete the lockfile entry, then a PLAIN `npm install`, with a
+    // conditional rm -rf third step. `npm install --package-lock-only` is what CREATES this state
+    // (#685, measured 2026-09-05) — a message that recommends it as a STEP walks the reader into an
+    // unrecoverable tree, so the only permitted mention of it is a warning not to run it.
+    expect(nextChunk).toMatch(/package-lock\.json/);
+    expect(nextChunk).toMatch(/npm install/);
+    // Robust to SHAPE, not just the one syntactic form the author happened to remove: count every
+    // occurrence of the literal string and require exactly one, and require that the one occurrence
+    // is inside the "Do NOT reach for" warning — never offered as a numbered remedy STEP.
+    const ploCount = (nextChunk.match(/--package-lock-only/g) ?? []).length;
+    expect(ploCount, 'the only permitted mention of --package-lock-only is the "Do NOT reach for" warning — it must never appear as a remedy STEP (#685: it CAUSES this state)').toBe(1);
+    expect(nextChunk).toMatch(/Do NOT reach for[^\n]*--package-lock-only/);
 
-    // Scoped to the check's OWN enclosing block (`if (vendorMod) { … }`), not "anywhere later in
-    // the file" — an unrelated step added after this one that happens to call execSync() must not
-    // turn this red (#685 FIX 5).
-    const blockStart = src.indexOf('if (vendorMod) {');
-    expect(blockStart).toBeGreaterThan(-1);
-    const blockEnd = matchingBraceEnd(src, src.indexOf('{', blockStart));
-    expect(verifyIdx).toBeGreaterThan(blockStart);
-    expect(verifyIdx).toBeLessThan(blockEnd);
+    // ⚠️ The CONDITIONAL third step must survive. Measured (#685 close-out, npm 11.12.1/node v26):
+    // on a PLO-poisoned tree — the state the SUPERSEDED remedy left behind — "delete the entry +
+    // plain npm install" returns `up to date` and never re-extracts; only removing the package dir
+    // repairs it. Dropping step 3 therefore strands exactly the reader who followed the old advice,
+    // and every other assertion here would still pass.
+    expect(nextChunk, 'the remedy must keep its conditional rm -rf third step — the only thing that repairs a PLO-poisoned tree (#685)')
+      .toMatch(/rm -rf node_modules/);
+    expect(nextChunk, 'step 3 must stay CONDITIONAL — an unconditional rm -rf is not the documented remedy')
+      .toMatch(/ONLY if/);
+
+    // An unrelated step added after this one that happens to call execSync() must not turn this red
+    // (#685 FIX 5).
     const execIdx = src.indexOf('execSync(', verifyIdx);
     expect(execIdx === -1 || execIdx >= blockEnd).toBe(true);
   });
@@ -237,6 +265,12 @@ describe('the editor /api/build runs the same #685 check as the CLI, uncondition
     throw new Error('no matching close brace found');
   }
 
+  // The check's OWN enclosing block (`if (stale.length) { … }`), computed once and reused below —
+  // not a magic char count (#685 FIX: a constant window either overruns the block or clips it,
+  // depending on unrelated edits nearby).
+  const blockStart = src.indexOf('if (stale.length)');
+  const blockEnd = matchingBraceEnd(src, src.indexOf('{', blockStart));
+
   it('imports and calls verifyInstalledMatchesTarball', () => {
     expect(src).toMatch(/import\s*\{[^}]*verifyInstalledMatchesTarball[^}]*\}\s*from\s*'\.\/vendorPlugins'/);
     expect(src).toContain('verifyInstalledMatchesTarball(');
@@ -252,12 +286,34 @@ describe('the editor /api/build runs the same #685 check as the CLI, uncondition
     expect(verifyIdx).toBeGreaterThan(closeBrace);
   });
 
-  it('fails the build on a problem and never auto-repairs with rm -rf', () => {
+  it('fails the build on a problem, documents the SAFE remedy, and never auto-repairs', () => {
     const verifyIdx = src.indexOf('verifyInstalledMatchesTarball(');
-    const chunk = src.slice(verifyIdx, verifyIdx + 1300);
+    expect(blockStart).toBeGreaterThan(-1);
+    // Here the call sits BEFORE its own `if (stale.length) { … }` — unlike the build-web.mjs
+    // block above, whose call is nested inside `if (vendorMod) { … }`.
+    expect(verifyIdx).toBeLessThan(blockStart);
+    expect(blockStart).toBeLessThan(blockEnd);
+    // Scoped to the check's OWN enclosing block, not a magic char count (#685 FIX).
+    const chunk = src.slice(verifyIdx, blockEnd);
     expect(chunk).toMatch(/stale\.length/);
     expect(chunk).toMatch(/res\.end\(\)/);   // the build is ENDED, not merely logged
-    expect(chunk).toMatch(/rm -rf/);          // the remedy is documented to the human…
+    expect(chunk).toMatch(/package-lock\.json/); // the remedy is documented to the human…
+    // Robust to SHAPE, not just the one syntactic form the author happened to remove: count every
+    // occurrence of the literal string and require exactly one, inside the "Do NOT reach for"
+    // warning — never offered as a numbered remedy STEP.
+    const ploCount = (chunk.match(/--package-lock-only/g) ?? []).length;
+    expect(ploCount, 'the only permitted mention of --package-lock-only is the "Do NOT reach for" warning — it must never appear as a remedy STEP (#685: it CAUSES this state)').toBe(1);
+    expect(chunk).toMatch(/Do NOT reach for[^\n]*--package-lock-only/);
+
+    // ⚠️ The CONDITIONAL third step must survive. Measured (#685 close-out, npm 11.12.1/node v26):
+    // on a PLO-poisoned tree — the state the SUPERSEDED remedy left behind — "delete the entry +
+    // plain npm install" returns `up to date` and never re-extracts; only removing the package dir
+    // repairs it. Dropping step 3 therefore strands exactly the reader who followed the old advice,
+    // and every other assertion here would still pass.
+    expect(chunk, 'the remedy must keep its conditional rm -rf third step — the only thing that repairs a PLO-poisoned tree (#685)')
+      .toMatch(/rm -rf node_modules/);
+    expect(chunk, 'step 3 must stay CONDITIONAL — an unconditional rm -rf is not the documented remedy')
+      .toMatch(/ONLY if/);
     // …but never executed: no shell runner between the check and the end of its block.
     expect(chunk).not.toMatch(/runScaffoldShell\(|spawnBuildCommand\(|execSync\(/);
   });
@@ -314,5 +370,38 @@ describe('loadEnginePluginModule degrades instead of throwing', () => {
     const emptyRepo = path.join(repoRoot, 'engine', 'tests');
     expect(await loadEnginePluginModule(emptyRepo, path.join('plugins', 'healNativeConfig.ts'))).toBeNull();
     expect(await loadVendorPlugins(emptyRepo)).toBeNull();
+  });
+});
+
+/** The THIRD human-facing #685 remedy — the one `npm test` itself prints when lockfile integrity
+ *  drifts — lives in vendoredPluginFreshness.test.ts's own failure message. The other two are
+ *  guarded above; without this it is the one place a future author can put the footgun back and
+ *  have nothing go red. Same rule, same reason: `npm install --package-lock-only` CREATES the
+ *  state (#685, measured 2026-09-05), so its ONLY permitted mention is the warning not to run it. */
+describe('the lockfile-integrity guard prints the SAFE remedy too', () => {
+  const src = fs.readFileSync(
+    path.join(repoRoot, 'engine', 'tests', 'architecture', 'vendoredPluginFreshness.test.ts'),
+    'utf8',
+  );
+
+  it('never offers --package-lock-only as a remedy step', () => {
+    const msgIdx = src.indexOf('Lockfile integrity does not match');
+    expect(msgIdx).toBeGreaterThan(-1);
+    const chunk = src.slice(msgIdx, src.indexOf('.toEqual([])', msgIdx));
+    expect(chunk).toMatch(/package-lock\.json/);
+    expect(chunk).toMatch(/npm install/);
+    const ploCount = (chunk.match(/--package-lock-only/g) ?? []).length;
+    expect(ploCount, 'the only permitted mention of --package-lock-only is the "Do NOT reach for" warning — it must never appear as a remedy STEP (#685: it CAUSES this state)').toBe(1);
+    expect(chunk).toMatch(/Do NOT reach for[^\n]*--package-lock-only/);
+
+    // ⚠️ The CONDITIONAL third step must survive. Measured (#685 close-out, npm 11.12.1/node v26):
+    // on a PLO-poisoned tree — the state the SUPERSEDED remedy left behind — "delete the entry +
+    // plain npm install" returns `up to date` and never re-extracts; only removing the package dir
+    // repairs it. Dropping step 3 therefore strands exactly the reader who followed the old advice,
+    // and every other assertion here would still pass.
+    expect(chunk, 'the remedy must keep its conditional rm -rf third step — the only thing that repairs a PLO-poisoned tree (#685)')
+      .toMatch(/rm -rf node_modules/);
+    expect(chunk, 'step 3 must stay CONDITIONAL — an unconditional rm -rf is not the documented remedy')
+      .toMatch(/ONLY if/);
   });
 });

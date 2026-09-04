@@ -54,8 +54,13 @@ public class AppsFlyerPlugin extends Plugin {
     // ⚠️ Keep the guard anyway: it still prevents a second registerSessionReadyListener, which is
     // cheap. But do NOT keep believing it prevents session inflation — with two listeners
     // registered, the resume still produced exactly ONE Launch.
-    // ⚠️ iOS across a reload remains UNMEASURED. Full run and limits: attribution.md § "#607/#654
-    // — the Android leg measured, and the contradiction dissolves".
+    // iOS was measured separately (2026-09-05) and agrees on the OUTCOME: unguarded, a second
+    // start() there — including one invoked directly rather than through a reload — posts no
+    // Launch either. ⚠️ That does NOT establish the no-op is the SDK's own: the iOS plugin, like
+    // this one, calls AppsFlyerLib.start() from INSIDE a session-ready listener, so the null
+    // result is equally consistent with the listener never firing — which the readiness/foreground
+    // coupling noted above makes the likelier of the two. Left unresolved on purpose.
+    // Full run: attribution.md § "#607/#654 — the iOS leg measured, and both platforms agree".
     //
     // Plain (non-atomic) static boolean, deliberately: getAdvertisingId() below documents
     // that Capacitor's Bridge serializes every plugin method invocation onto one

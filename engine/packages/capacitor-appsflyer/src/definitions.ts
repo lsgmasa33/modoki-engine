@@ -40,12 +40,20 @@ export interface AppsFlyerPlugin {
    * resume still produced exactly ONE Launch, so stacking did not inflate anything either.
    * The guard is therefore INERT for Launch counts. It is kept because it still prevents a second
    * `registerSessionReadyListener`, which is cheap and harmless — not because it stops inflation.
-   * ⚠️ **iOS across a reload is still UNMEASURED**; do not read the Android result as covering it.
-   * Full run, evidence and limits: `games/court/attribution.md` § "#607/#654 — the Android leg
-   * measured, and the contradiction dissolves".
-   * ⚠️ Consequence for a future `stop({stopped:false})` opt-back-in: the follow-up `start()` this
-   * needs will ALSO no-op, so re-enabling the SDK mid-process is not reachable through this API
-   * today. Nothing calls `stop` from JS, so this is a trap for the next author, not a live bug.
+   * **iOS was measured too** (2026-09-05, SDK 7.0.2): with this guard disabled, calling `start()`
+   * a second time — via a webview reload AND by invoking the plugin method outright — produced no
+   * Launch and no server-side row at all. The OUTCOME therefore matches Android, and the guard is
+   * inert for Launch counts on both.
+   * ⚠️ WHERE that no-op happens is NOT established. This plugin's `start()` registers a
+   * session-ready listener whose BODY calls `AppsFlyerLib.start()`, so "nothing happened" is
+   * equally consistent with the SDK ignoring the second call and with the second listener never
+   * firing. Full run, both arms, and the ATT prompt that gates a fresh install:
+   * `games/court/attribution.md` § "#607/#654 — the iOS leg measured, and both platforms agree".
+   * ⚠️ Consequence for a future `stop({stopped:false})` opt-back-in: the follow-up `start()` may
+   * ALSO no-op, so treat re-enabling the SDK mid-process as UNPROVEN through this API rather than
+   * impossible — if the listener is the cause, calling `AppsFlyerLib.start()` directly on that
+   * path would work. Nothing calls `stop` from JS, so this is a trap for the next author, not a
+   * live bug.
    */
   start(): Promise<{ ok: boolean }>;
 

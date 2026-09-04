@@ -437,9 +437,16 @@ collider points), the Hierarchy toolbar, the Assets toolbar, the Console toolbar
 dialog confirm/cancel.
 
 The **asset editors** were tagged next (#287), because QA started driving them: SkinEditor and
-ParticleEditor were the two worst files in the editor (36 and 20 controls, zero tags), so every
-case against them fell back to `modoki_eval` plus a text match — brittle against any copy
-change, and unable to tell two same-labelled controls apart at all.
+ParticleEditor were then the two least-tagged files QA had to drive, so every case against them
+fell back to `modoki_eval` plus a text match — brittle against any copy change, and unable to tell
+two same-labelled controls apart at all.
+
+⚠️ **This paragraph used to quote "36 and 20 controls, zero tags". Those numbers were wrong**, and
+`qa/knowledge.md` § *The tagged set is a beachhead* records why: they came from a per-FILE sweep
+being read as a per-CONTROL claim, and each panel's chrome was in fact well tagged while a
+specific widget FAMILY was not. #704 closed the remainder — 10 `BufferedNumberInput` call sites in
+SkinEditor and 9 row-repeater `NumInput`s in ParticleEditor. Cite that section rather than a count
+here; it is the one that gets re-measured.
 
 ParticleEditor is worth reading as a pattern rather than a list. Its ~58 property fields all
 route through six shared widgets, so the ids come from a **React context** that `<Section>`

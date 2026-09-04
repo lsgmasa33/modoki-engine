@@ -690,10 +690,10 @@ export default function SkinEditor() {
           <div style={inspectorTitle}><span>Transform</span>
             <InfoDot tip="The selected bone's transform. In Rig mode this edits the bind pose (undoable); in Weights mode it's a transient TEST pose to preview the deform (not saved)." /></div>
           <div style={trowStyle}><span style={{ ...lbl, width: 26 }}>pos</span>
-            <span style={lbl}>x</span><BufferedNumberInput value={posed.x} step={1} onChange={(v) => setBoneField('x', v)} style={{ ...inputStyle, width: 50 }} />
-            <span style={lbl}>y</span><BufferedNumberInput value={posed.y} step={1} onChange={(v) => setBoneField('y', v)} style={{ ...inputStyle, width: 50 }} /></div>
+            <span style={lbl}>x</span><BufferedNumberInput dataUiId="skin.inspector.bone.x" dataUiLabel="bone pos x" dataUiKind="field" value={posed.x} step={1} onChange={(v) => setBoneField('x', v)} style={{ ...inputStyle, width: 50 }} />
+            <span style={lbl}>y</span><BufferedNumberInput dataUiId="skin.inspector.bone.y" dataUiLabel="bone pos y" dataUiKind="field" value={posed.y} step={1} onChange={(v) => setBoneField('y', v)} style={{ ...inputStyle, width: 50 }} /></div>
           <div style={{ ...trowStyle, marginBottom: 0 }}><span style={{ ...lbl, width: 26 }}>rot°</span>
-            <BufferedNumberInput value={+(posed.rot * 180 / Math.PI).toFixed(2)} step={1} onChange={(v) => setBoneField('rot', v * Math.PI / 180)} style={{ ...inputStyle, width: 50 }} /></div>
+            <BufferedNumberInput dataUiId="skin.inspector.bone.rot" dataUiLabel="bone rotation" dataUiKind="field" value={+(posed.rot * 180 / Math.PI).toFixed(2)} step={1} onChange={(v) => setBoneField('rot', v * Math.PI / 180)} style={{ ...inputStyle, width: 50 }} /></div>
         </div>
       </>
     );
@@ -957,13 +957,13 @@ export default function SkinEditor() {
                     <div style={inspectorTitle}><span>Transform</span>
                       <InfoDot tip="The active part's placement — baked into the mesh verts (a part has no transform node). Position = mesh center; Rotation + Size read from the UV→vertex map. Edit here or with the canvas Parts gizmo. Size is width/height in px." /></div>
                     <div style={trowStyle}><span style={{ ...lbl, width: 26 }}>pos</span>
-                      <span style={lbl}>x</span><BufferedNumberInput value={+c.x.toFixed(1)} step={1} onChange={(v) => setPartCenter('x', v)} style={{ ...inputStyle, width: 50 }} />
-                      <span style={lbl}>y</span><BufferedNumberInput value={+c.y.toFixed(1)} step={1} onChange={(v) => setPartCenter('y', v)} style={{ ...inputStyle, width: 50 }} /></div>
+                      <span style={lbl}>x</span><BufferedNumberInput dataUiId="skin.part.center.x" dataUiLabel="part center x" dataUiKind="field" value={+c.x.toFixed(1)} step={1} onChange={(v) => setPartCenter('x', v)} style={{ ...inputStyle, width: 50 }} />
+                      <span style={lbl}>y</span><BufferedNumberInput dataUiId="skin.part.center.y" dataUiLabel="part center y" dataUiKind="field" value={+c.y.toFixed(1)} step={1} onChange={(v) => setPartCenter('y', v)} style={{ ...inputStyle, width: 50 }} /></div>
                     <div style={trowStyle}><span style={{ ...lbl, width: 26 }}>rot°</span>
-                      <BufferedNumberInput value={rotDeg} step={1} onChange={(v) => setPartRotation(v)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} /></div>
+                      <BufferedNumberInput dataUiId="skin.part.rotation" dataUiLabel="part rotation" dataUiKind="field" value={rotDeg} step={1} onChange={(v) => setPartRotation(v)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} /></div>
                     <div style={{ ...trowStyle, marginBottom: 0 }}><span style={{ ...lbl, width: 26 }}>size</span>
-                      <span style={lbl}>w</span><BufferedNumberInput value={wPx} step={1} onChange={(v) => setPartSize('x', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
-                      <span style={lbl}>h</span><BufferedNumberInput value={hPx} step={1} onChange={(v) => setPartSize('y', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
+                      <span style={lbl}>w</span><BufferedNumberInput dataUiId="skin.part.size.w" dataUiLabel="part width" dataUiKind="field" value={wPx} step={1} onChange={(v) => setPartSize('x', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
+                      <span style={lbl}>h</span><BufferedNumberInput dataUiId="skin.part.size.h" dataUiLabel="part height" dataUiKind="field" value={hPx} step={1} onChange={(v) => setPartSize('y', v, sizeLocked)} readOnly={!aff} style={{ ...inputStyle, width: 50, opacity: aff ? 1 : 0.5 }} />
                       <button data-ui-id="skin.part.sizeLock" data-ui-kind="toggle" data-ui-label="aspect ratio lock" onClick={() => setSizeLocked((l) => !l)} title={sizeLocked ? 'Aspect ratio locked — w/h scale together. Click to unlock.' : 'Aspect ratio unlocked — w/h scale independently. Click to lock.'}
                         style={{ ...eyeBtn, color: sizeLocked ? '#4a9eff' : '#777', fontSize: 12 }}>{sizeLocked ? '🔒' : '🔓'}</button></div>
                   </div>
@@ -975,8 +975,8 @@ export default function SkinEditor() {
                   <div style={inspectorTitle}><span>Mesh · {verts.length}v · {Math.floor(tris.length / 3)}t</span>
                     <InfoDot tip="The deformable grid over the sprite. cols×rows = density (more bends smoother, costs more CPU). Re-tessellate keeps the part where it sits. Trim to alpha drops fully-transparent cells so the mesh hugs the opaque shape." /></div>
                   <div style={trowStyle}><span style={{ ...lbl, width: 26 }}>cols</span>
-                    <BufferedNumberInput value={cols} step={1} onChange={(v) => setCols(Math.max(1, Math.min(24, Math.round(v))))} style={{ ...inputStyle, width: 44 }} />
-                    <span style={{ ...lbl, marginLeft: 4 }}>rows</span><BufferedNumberInput value={rows} step={1} onChange={(v) => setRows(Math.max(1, Math.min(24, Math.round(v))))} style={{ ...inputStyle, width: 44 }} /></div>
+                    <BufferedNumberInput dataUiId="skin.part.tessellate.cols" dataUiLabel="tessellation cols" dataUiKind="field" value={cols} step={1} onChange={(v) => setCols(Math.max(1, Math.min(24, Math.round(v))))} style={{ ...inputStyle, width: 44 }} />
+                    <span style={{ ...lbl, marginLeft: 4 }}>rows</span><BufferedNumberInput dataUiId="skin.part.tessellate.rows" dataUiLabel="tessellation rows" dataUiKind="field" value={rows} step={1} onChange={(v) => setRows(Math.max(1, Math.min(24, Math.round(v))))} style={{ ...inputStyle, width: 44 }} /></div>
                   <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', color: '#aaa', fontSize: 11, marginBottom: trimAlpha ? 3 : 4 }}>
                     <input data-ui-id="skin.part.trimAlpha" data-ui-kind="toggle" data-ui-label="trim to alpha" type="checkbox" checked={trimAlpha} onChange={(e) => setTrimAlpha(e.target.checked)} style={{ accentColor: '#4a9eff' }} /> Trim to alpha</label>
                   {trimAlpha && (

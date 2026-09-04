@@ -424,8 +424,8 @@ export default function ParticleEditor() {
             </div>
             {(def.emission.bursts ?? []).map((b, i) => (
               <div key={i} style={{ display: 'flex', gap: 4, marginBottom: 4, alignItems: 'center', paddingLeft: 8 }}>
-                <NumInput title="time (s)" value={b.time} min={0} step={0.1} on={(n) => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).map((x, k) => k === i ? { ...x, time: n } : x) } })} width={54} />
-                <NumInput title="count" value={b.count} min={0} step={1} on={(n) => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).map((x, k) => k === i ? { ...x, count: Math.round(n) } : x) } })} width={54} />
+                <NumInput uiId={`particle.bursts.row.${i}.time`} uiLabel="burst time" title="time (s)" value={b.time} min={0} step={0.1} on={(n) => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).map((x, k) => k === i ? { ...x, time: n } : x) } })} width={54} />
+                <NumInput uiId={`particle.bursts.row.${i}.count`} uiLabel="burst count" title="count" value={b.count} min={0} step={1} on={(n) => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).map((x, k) => k === i ? { ...x, count: Math.round(n) } : x) } })} width={54} />
                 <button data-ui-id={`particle.bursts.row.${i}.remove`} data-ui-kind="button" data-ui-label="remove burst" style={miniBtn} onClick={() => patch({ emission: { ...def.emission, bursts: (def.emission.bursts ?? []).filter((_, k) => k !== i) } })}>×</button>
               </div>
             ))}
@@ -488,10 +488,10 @@ export default function ParticleEditor() {
                   <button data-ui-id={`particle.forces.row.${i}.remove`} data-ui-kind="button" data-ui-label="remove force" style={{ ...miniBtn, marginLeft: 'auto' }} onClick={() => patch({ forces: (def.forces ?? []).filter((_, k) => k !== i) })}>×</button>
                 </div>
                 <div style={{ display: 'flex', gap: 4 }}>
-                  <NumInput title="x" value={f.x} step={0.1} on={(n) => updForce(i, { x: n })} width={44} />
-                  <NumInput title="y" value={f.y} step={0.1} on={(n) => updForce(i, { y: n })} width={44} />
-                  <NumInput title="z" value={f.z} step={0.1} on={(n) => updForce(i, { z: n })} width={44} />
-                  <NumInput title="strength (+attract / −repel for point)" value={f.strength} step={0.1} on={(n) => updForce(i, { strength: n })} width={54} />
+                  <NumInput uiId={`particle.forces.row.${i}.x`} uiLabel={`${f.type} force x`} title="x" value={f.x} step={0.1} on={(n) => updForce(i, { x: n })} width={44} />
+                  <NumInput uiId={`particle.forces.row.${i}.y`} uiLabel={`${f.type} force y`} title="y" value={f.y} step={0.1} on={(n) => updForce(i, { y: n })} width={44} />
+                  <NumInput uiId={`particle.forces.row.${i}.z`} uiLabel={`${f.type} force z`} title="z" value={f.z} step={0.1} on={(n) => updForce(i, { z: n })} width={44} />
+                  <NumInput uiId={`particle.forces.row.${i}.strength`} uiLabel={`${f.type} force strength`} title="strength (+attract / −repel for point)" value={f.strength} step={0.1} on={(n) => updForce(i, { strength: n })} width={54} />
                 </div>
               </div>
             ))}
@@ -591,13 +591,13 @@ export default function ParticleEditor() {
                     <option value="birth">birth</option>
                     <option value="death">death</option>
                   </select>
-                  <NumInput title="count per trigger" value={s.count ?? 8} min={1} step={1} on={(n) => updSub(i, { count: Math.max(1, Math.round(n)) })} width={44} />
+                  <NumInput uiId={`particle.subEmitters.row.${i}.count`} uiLabel={`${s.trigger} sub-emitter count`} title="count per trigger" value={s.count ?? 8} min={1} step={1} on={(n) => updSub(i, { count: Math.max(1, Math.round(n)) })} width={44} />
                   <button data-ui-id={`particle.subEmitters.row.${i}.remove`} data-ui-kind="button" data-ui-label="remove sub-emitter" style={{ ...miniBtn, marginLeft: 'auto' }} onClick={() => patch({ subEmitters: (def.subEmitters ?? []).filter((_, k) => k !== i) })}>×</button>
                 </div>
                 <AssetRefField label="effect" hint="Child .particle.json fired by this sub-emitter. Drag a particle effect from the Assets panel, or use the locate button." accept={['.particle.json']} placeholder="drop a particle effect, or paste a GUID" value={s.effect} onChange={(val) => updSub(i, { effect: val })} />
                 <div style={{ display: 'flex', gap: 4 }}>
-                  <NumInput title="probability 0..1" value={s.probability ?? 1} min={0} max={1} step={0.05} on={(n) => updSub(i, { probability: n })} width={56} />
-                  <NumInput title="inherit velocity 0..1" value={s.inheritVelocity ?? 0} step={0.05} on={(n) => updSub(i, { inheritVelocity: n })} width={56} />
+                  <NumInput uiId={`particle.subEmitters.row.${i}.probability`} uiLabel={`${s.trigger} sub-emitter probability`} title="probability 0..1" value={s.probability ?? 1} min={0} max={1} step={0.05} on={(n) => updSub(i, { probability: n })} width={56} />
+                  <NumInput uiId={`particle.subEmitters.row.${i}.inheritVelocity`} uiLabel={`${s.trigger} sub-emitter inherit velocity`} title="inherit velocity 0..1" value={s.inheritVelocity ?? 0} step={0.05} on={(n) => updSub(i, { inheritVelocity: n })} width={56} />
                   <span style={{ color: '#666', fontSize: 9, alignSelf: 'center' }}>prob / inherit-v</span>
                 </div>
               </div>

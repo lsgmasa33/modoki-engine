@@ -346,11 +346,15 @@ export function knownUiIds(sources: string[]): {
   // Zero editor sources use the spaced LITERAL form today (checked 2026-08-22), so this half is
   // latent rather than a live fix — but the blind spot was identical in all five regexes and
   // fixing only the one that happened to bite would leave the same trap for the next id.
+  // ⚠️ `["']?` before the separator admits the QUOTED OBJECT KEY — `{ 'data-ui-id': … }`. That
+  // spelling is FORCED for the hyphenated name (`{ data-ui-id: … }` is not valid JS), so it is
+  // not a stylistic variant the editor could simply stop using. Accepting `[=:]` uniformly also
+  // collapses the old `uiId=` / `uiId:` pair into one entry: they differed only in the separator,
+  // and keeping them apart is what let the third spelling fall between them.
   const literal = [
-    /data-ui-id\s*=\s*["']([\w.:-]+)["']/g,
-    /\buiId\s*=\s*["']([\w.:-]+)["']/g,
-    /\bdataUiId\s*=\s*["']([\w.:-]+)["']/g,
-    /\buiId\s*:\s*["']([\w.:-]+)["']/g,
+    /data-ui-id["']?\s*[=:]\s*["']([\w.:-]+)["']/g,
+    /\buiId["']?\s*[=:]\s*["']([\w.:-]+)["']/g,
+    /\bdataUiId["']?\s*[=:]\s*["']([\w.:-]+)["']/g,
   ];
   for (const re of literal) for (const m of joined.matchAll(re)) ids.add(m[1]);
   // A template-built id (`hierarchy.folder.${name}`) can only be checked to its static prefix.
@@ -371,7 +375,7 @@ export function knownUiIds(sources: string[]): {
   // particle-editor case cites e.g. `<prefix>.min` and is reported unknown, this is why, and the
   // fix is to make the parent's id statically visible rather than to loosen the matcher here.
   const templates = [
-    ...joined.matchAll(/(?:data-ui-id|uiId|dataUiId)\s*[=:]\s*\{?`([\w.:-]*\$\{[^`]*)`/g),
+    ...joined.matchAll(/(?:data-ui-id|uiId|dataUiId)["']?\s*[=:]\s*\{?`([\w.:-]*\$\{[^`]*)`/g),
   ].map((m) => m[1]);
   const prefixes = templates.map((t) => t.slice(0, t.indexOf('$'))).filter(Boolean);
   // ⚠️ A PREFIX IS NOT A CHECK. This used to return only the static head and the caller asked
@@ -383,12 +387,15 @@ export function knownUiIds(sources: string[]): {
   // `templateToIdPattern`'s per-segment class is what makes that true for the 41 of 79 templates
   // that END in a placeholder rather than a literal — read the note there before widening it.
   //
-  // ⚠️ KNOWN GAP, measured not assumed: `Hierarchy.tsx` writes its row id as a QUOTED object key,
-  // `{ 'data-ui-id': `hierarchy.entity.${entity.guid}` }`, and none of the regexes here match that
-  // spelling (they require the bare name followed by `=` or `:`). So `hierarchy.entity.*` is not
-  // registered at all — a case citing one would be reported unknown, the false alarm this file's
-  // history says gets a guard disabled. Latent today: no case cites one. The fix is to admit the
-  // quoted form, not to loosen the matching.
+  // The QUOTED OBJECT KEY spelling is now admitted (#705). `Hierarchy.tsx` writes its row id as
+  // `{ 'data-ui-id': `hierarchy.entity.${entity.guid}` }` — quoted because the hyphenated name
+  // cannot be a bare JS key — and every regex here required the bare name followed by `=` or `:`,
+  // so `hierarchy.entity.*` was registered NOWHERE. It was latent only by luck of spelling: the
+  // cases that aim these rows write the guid as a `<GUID>` placeholder, which the case-side id
+  // tokeniser does not treat as an id, so the false alarm never fired. Substitute a real guid —
+  // which is what a runner does — and the guard would have called a working selector unknown.
+  // Fixed by admitting the spelling, NOT by loosening the matching: the id still has to match a
+  // whole template, so `hierarchy.entity.<guid>.bogus` remains a red.
   const patterns = templates.filter((t) => !t.startsWith('$')).map(templateToIdPattern);
   for (const src of sources) for (const id of particleFieldIds(src)) ids.add(id);
   return { ids, prefixes, patterns };
@@ -766,8 +773,12 @@ describe('qa case guard helpers', () => {
       expect(derived).toContain('particle.emission.rate-sec');
       // A typo of a real id must NOT be produced — the point of deriving over shape-matching.
       expect(derived).not.toContain('particle.general.max-partickles');
-      // And the derivation must not manufacture the row-repeater ids, which are NOT `useFieldId`'s
-      // (those `NumInput`s take a bare `title` and carry no `data-ui-id` at all).
+      // And the derivation must not manufacture the row-repeater ids, which are NOT `useFieldId`'s.
+      // Those `NumInput`s now carry an EXPLICIT `uiId` (#704) — `particle.bursts.row.<i>.time` and
+      // friends — so they are registered by the literal/template extractors, not derived from a
+      // `Section` label. The distinction still matters: `useFieldId` mints from a section context,
+      // and a row repeater has no section, so a derivation that started producing these would be
+      // inventing ids rather than reading them.
       expect(derived.some((id) => id.startsWith('particle.bursts.row.'))).toBe(false);
     });
 
@@ -793,6 +804,48 @@ describe('qa case guard helpers', () => {
         .toEqual(['projectSettings.']);
       expect(knownUiIds(['<Field uiId={`projectSettings.${k}`} />']).prefixes)
         .toEqual(['projectSettings.']);
+    });
+
+    it('admits the QUOTED object-key spelling, read from the REAL Hierarchy source (#705)', () => {
+      // `Hierarchy.tsx` has no choice about the quotes — `data-ui-id` is hyphenated, so it cannot
+      // be a bare JS key — and every extractor here used to require the bare name. Reading the
+      // real panel rather than a hand-typed fixture is what gives this teeth: if the row's
+      // spelling changes again, this goes red instead of the guard silently forgetting the
+      // family. Same argument as the `useFieldId` test above.
+      const panel = readFileSync(
+        join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/Hierarchy.tsx'),
+        'utf8',
+      );
+      const { prefixes, patterns } = knownUiIds([panel]);
+      expect(prefixes).toContain('hierarchy.entity.');
+      const known = (id: string) => patterns.some((p) => p.test(id));
+      // A real guid, hyphens and all — that is what a runner substitutes for `<GUID>`.
+      expect(known('hierarchy.entity.6f9c2b14-3d5a-4e77-9b0e-1a2c3d4e5f60')).toBe(true);
+      // The whole-template rule still holds: admitting a SPELLING must not loosen the MATCHING.
+      expect(known('hierarchy.entity.6f9c2b14-3d5a-4e77-9b0e-1a2c3d4e5f60.bogus')).toBe(false);
+      expect(known('hierarchy.entity')).toBe(false);
+    });
+
+    it('still refuses a type annotation or a prop declaration — the widening is one quote, not a wildcard', () => {
+      // MUTATION GUARD for #705. The fix inserted `["']?` before the separator; the careless
+      // follow-up is to reach for `.*?` or to drop the trailing quote requirement the next time a
+      // spelling does not match. These are the strings that start registering as ids if anyone
+      // does, and every one of them is a DECLARATION, where the text after `:` is a type rather
+      // than an id. A guard that vouches for `string` vouches for nothing.
+      const { ids, prefixes, patterns } = knownUiIds([
+        'function F({ uiId }: { uiId?: string; dataUiId?: string }) {}',
+        'const uiId: string = compute();',
+        'type P = { uiId: string };',
+        'interface Q { dataUiId: string }',
+        // This one specifically catches the `.*?` mutation, which the four above do NOT: they
+        // contain no quoted literal at all, so a wildcard has nothing to run to. Here it reaches
+        // past the `=` to the `key:` and registers `not.an.id`. The real regex stops at the `=`
+        // because what follows is not a quote.
+        'const uiId = opts.uiId ?? { key: "not.an.id" };',
+      ]);
+      expect([...ids]).toEqual([]);
+      expect(prefixes).toEqual([]);
+      expect(patterns).toEqual([]);
     });
   });
 

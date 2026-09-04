@@ -152,23 +152,48 @@ function gpuFields(): { gpu?: ReturnType<typeof getGpuFaultState> } {
  *
  *    Reported only when `free`, because a fixed device's `logical` IS the answer; and only when
  *    mounted, because nothing has measured the area otherwise.
+ *
+ *  - **`panelSize` when COLLAPSED** (#688) — and the same mistake once more, from a third side.
+ *    `gameAreaSize` is adopted by an always-on observer with no zero test, while its own sibling
+ *    observer 26 lines below in `GameView.tsx` DOES guard `width <= 0 || height <= 0`. So a
+ *    mounted-but-collapsed panel answered `panelSize: {0, 0}` with `panelMounted: true` and no
+ *    note — the exact shape the `mounted` bullet above calls "worse than not reporting it at all".
+ *
+ *    ⚠️ The fix is deliberately NOT the sibling's guard. Skipping a zero there keeps the LAST GOOD
+ *    size, which trades a degenerate answer for a stale one — and by this doc block's own standard
+ *    (the `panelSize` bullet: "Stale in precisely the transition it was added for") stale presented
+ *    as live is the worse of the two. Omitting the field plus a note reuses the shape already
+ *    proven for the unmounted case: absence an agent can see, with prose saying why.
  */
 function describeGameView() {
   const s = useEditorStore.getState();
   const sel = describeDeviceSelection(s.gameViewDevice, s.gameViewOrientation);
   const panelMounted = s.gameViewMounted;
+  // COLLAPSED IS NOT UNMOUNTED (#688). A Game panel dragged to a zero-height splitter, or one
+  // whose tabset is squeezed flat by maximising another panel, stays mounted and keeps rendering
+  // — so `panelMounted` is honestly `true` — while `gameAreaSize` goes to {0,0}. See the note
+  // below on why this is omitted rather than floored to the last good value.
+  const panelCollapsed = panelMounted && (s.gameAreaSize.width <= 0 || s.gameAreaSize.height <= 0);
   return {
     ...sel,
-    ...(sel.free && panelMounted
+    ...(sel.free && panelMounted && !panelCollapsed
       ? { panelSize: { w: s.gameAreaSize.width, h: s.gameAreaSize.height } }
       : {}),
     panelMounted,
-    ...(panelMounted ? {} : {
+    ...(!panelMounted ? {
       panelNote: 'The Game panel is NOT mounted, so nothing derived from this selection has moved — '
         + 'the preview size, safe-area insets and letterbox rect all still describe the previous '
         + 'state. Open (and SELECT) the Game tab before attributing any layout measurement to this '
         + 'screen: an unselected tab does not mount.',
-    }),
+    } : panelCollapsed ? {
+      panelNote: 'The Game panel is mounted but COLLAPSED to zero area. Anything derived from its '
+        + 'extent — a capture size, a letterbox rect, an aim inside the preview — is unusable until '
+        + 'the panel is given room: drag its splitter open, or un-maximise whichever panel is '
+        + 'squeezing it. On a FREE screen `panelSize` is omitted for this reason rather than '
+        + 'reported as {0, 0}; on a fixed device `logical` is still the screen being emulated and '
+        + 'stays correct, but it no longer describes anything visible. This is NOT the same as '
+        + 'unmounted: the panel is live and still rendering.',
+    } : {}),
   };
 }
 

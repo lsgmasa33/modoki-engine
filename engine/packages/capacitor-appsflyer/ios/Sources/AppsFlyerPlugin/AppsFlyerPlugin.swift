@@ -30,8 +30,8 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
     // boot effect in the SAME native process, calling initialize() then start() again —
     // registerSessionReadyListener stacks a NEW listener rather than replacing the old one.
     //
-    // ⚠️ RECONCILED ON ANDROID (#654, 2026-09-04) — and this file is the platform still WAITING
-    // for its own measurement, so read the split carefully.
+    // ⚠️ MEASURED ON BOTH PLATFORMS (#654) — this guard is INERT for Launch counts. (Where the
+    // no-op actually happens is NOT settled; see "WHAT THAT ESTABLISHES" below before citing it.)
     //   #607 read a SECOND POST to launches.appsflyersdk.com ~100 s after cold boot, following a
     //   resume-reload on a Galaxy S22, as the reload's second start(). Re-measured on Android
     //   with the guard ABSENT and the reload and resume driven as SEPARATE events: the reload's
@@ -39,17 +39,33 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
     //   mechanism is that AppsFlyer's Launch follows the FOREGROUND TRANSITION, not start().
     //   So the iOS finding this file already records — "a second start is a no-op",
     //   sessioncounter 1, DAU not inflated — GENERALISES to Android rather than conflicting.
-    // ⚠️ **iOS ACROSS A RELOAD IS STILL UNMEASURED.** The iOS probe was a manual extra start()
-    // INSIDE one session, not one after a realm death, and nobody has re-run it across a reload
-    // (the device #654 targets was unavailable). So on THIS platform the guard remains
-    // defensive-by-necessity: the Android result is strong evidence it is inert here too, but it
-    // is evidence by analogy, not a measurement of this SDK. Do not delete it on that basis.
-    // ⚠️ It also does not prevent session inflation on either platform — on Android, with two
-    // listeners registered, the resume still produced exactly ONE Launch.
+    // iOS IS NOW MEASURED TOO (2026-09-05, iPad mini 5, iOS 26.6.1, SDK 7.0.2), which the older
+    // probe was not: that one was a manual extra start() INSIDE one session, never across a realm
+    // death. Re-run with THIS guard disabled, on a clean install: the cold boot sent its Launch,
+    // a location.reload() sent nothing, and calling the plugin's start() DIRECTLY from the page
+    // produced not one SDK log line and no server-side row. Cross-checked against the AppsFlyer
+    // Live Events export, whose event timestamps match the SDK's own operation epochs to the ms.
+    // ⚠️ WHAT THAT ESTABLISHES, AND WHAT IT DOES NOT. It establishes the OUTCOME, which is all
+    // this guard's Launch-count inertness rests on: a second start() adds no Launch, guard or no
+    // guard, on either platform. It does NOT establish WHERE the no-op happens. start() below
+    // does not call AppsFlyerLib.shared().start() directly — it registers a session-ready
+    // listener whose BODY calls it. So "no SDK log line" is equally consistent with the SDK
+    // ignoring a second start() and with the second listener never firing at all — and the Android
+    // note above (Launch follows the FOREGROUND TRANSITION, which a mid-session listener has no
+    // way to observe; the Java port records the readiness-evaluation half) suspects the latter. The distinguishing observation — a log line INSIDE the listener block, or
+    // watching for "Starting session readiness evaluation" after the direct call — has NOT been
+    // made. Do not repeat "the no-op is the SDK's own" as established until it has.
+    // Keep this guard — it still stops a second registerSessionReadyListener, which is cheap —
+    // but do NOT claim it prevents session inflation: on Android, with two listeners registered,
+    // the resume still produced exactly ONE Launch, and on iOS the unguarded second start() none.
+    // Full run, both arms and the ATT trap that gates it:
+    // games/court/attribution.md § "#607/#654 — the iOS leg measured, and both platforms agree".
     //
     // ⚠️ Do NOT describe this as fixing the "4, 4, then 3 Launch events" variation documented on
-    // start() below. attribution.md records that count as EXPLAINED (two hosts x two retries =
-    // four rows) and the main-thread-race hypothesis for it as TESTED AND REFUTED — dispatching
+    // start() below. ⚠️ Do NOT quote "two hosts x two retries = four rows" as invariant either —
+    // attribution.md retracted that: the stable unit is the SEND, and the row count varies with
+    // transport retries (the unguarded iOS arm produced 2 rows from the same 2 sends).
+    // The main-thread-race hypothesis for the variation is TESTED AND REFUTED — dispatching
     // the registration to main "did not change the count". That dispatch was kept because UIKit
     // off the main thread is undefined behaviour, not because it fixed a count.
     //

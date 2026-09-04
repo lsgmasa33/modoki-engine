@@ -147,13 +147,15 @@ describe('vendored engine plugins are not stale (#90)', () => {
     expect(problems, problems.length
       ? `Lockfile integrity does not match the committed tarball — \`npm ci\` will fail in CI and in `
         + `every fresh clone, while a warm node_modules hides it locally:\n  ${problems.join('\n  ')}\n\n`
-        + `⚠️ A bare \`npm install\` (or \`--force\`, or \`rm -rf node_modules/<plugin> && npm install\`) `
-        + `does NOT fix this — measured (#685): npm serves the stale content from its own cache while `
-        + `the lockfile still pins the old integrity, so nothing ever asks it to look again. Fix, in `
-        + `order, per named project:\n`
+        + `⚠️ Do NOT reach for \`npm install --package-lock-only\` — measured (#685): it is what CREATES `
+        + `this state (it writes the new resolved+integrity into both lockfiles without extracting), and a `
+        + `tree left there is unrecoverable by any plain install. A bare \`npm install\` or \`--force\` will `
+        + `not fix it either. Repair, in order:\n`
         + `  1. delete the plugin's entry from <project>/package-lock.json ("node_modules/<plugin>" under "packages")\n`
-        + `  2. (cd <project> && npm install --package-lock-only)   # re-resolves it — ⚠ 2 WITHOUT 3 leaves node_modules UNRECOVERABLE by npm install\n`
-        + `  3. (cd <project> && rm -rf node_modules/<plugin> && npm install)\n`
+        + `  2. (cd <project> && npm install)   # a PLAIN install — it now re-resolves AND extracts\n`
+        + `  3. ONLY if step 2 reported "up to date" and this check still fires — then node_modules/.package-lock.json `
+        + `is ahead of the disk and nothing will re-extract:\n`
+        + `     (cd <project> && rm -rf node_modules/<plugin> && npm install)\n`
         + `Then commit the package-lock.json.`
       : '',
     ).toEqual([]);

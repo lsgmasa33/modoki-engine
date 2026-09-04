@@ -267,6 +267,11 @@ const PRECOND = {
   // tab MOUNTED — per agentEditorOps.ts, FlexLayout only mounts the SELECTED tab, so a layout with
   // the Game tab closed or a re-docked layout with it unselected reports `panelMounted: false` and
   // omits `panelSize` even for Free, which is correct behaviour, not a defect.
+  // ⚠️ MOUNTED IS NOT ENOUGH (#688). A Game tab that is selected but COLLAPSED to zero area — its
+  // splitter dragged flat, or another panel maximised over it — satisfies the `mountedSurfaces`
+  // check below and STILL omits `panelSize`, now with a `panelNote` saying so. That is also
+  // correct behaviour. The Free assertion further down cannot tell it apart from the stale-size
+  // regression it exists to catch, so it reads `panelNote` and says which one happened.
   gameView: {
     ok: Array.isArray(mountedSurfaces) && (mountedSurfaces.includes('game-2d') || mountedSurfaces.includes('game-3d')),
     need: `the Game tab to be OPEN and SELECTED (open/select it in the editor) — mounted now: ${(mountedSurfaces ?? []).join(', ') || 'none'}`,
@@ -1083,6 +1088,12 @@ if (canGameViewDevice) {
     if (custom.panelSize !== undefined) throw new Error('panelSize must be omitted for a fixed device — logical is the answer there');
     const freeBack = JSON.parse(text(await client.callTool({ name: 'modoki_set_game_view_device', arguments: { device: 'Free' } })));
     if (!freeBack.panelSize || !(freeBack.panelSize.w > 0) || !(freeBack.panelSize.h > 0)) {
+      // Distinguish the two reasons panelSize can be absent on Free, because they need opposite
+      // responses: a COLLAPSED panel is the operator's layout (open the splitter and re-run),
+      // while a missing panelSize with no note is the #688/stale-gameViewSize defect.
+      if (typeof freeBack.panelNote === 'string' && freeBack.panelNote.includes('COLLAPSED')) {
+        throw new Error(`the Game panel is mounted but COLLAPSED to zero area — give it room and re-run; this is a HARNESS precondition, not a tool defect. Note: ${freeBack.panelNote}`);
+      }
       throw new Error(`Free must report a MEASURED panelSize, not the device it just left: ${JSON.stringify(freeBack.panelSize)}`);
     }
     // The regression that matters: panelSize must not echo the phone we were just on.

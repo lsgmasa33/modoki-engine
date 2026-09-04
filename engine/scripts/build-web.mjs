@@ -252,13 +252,15 @@ async function healNativeProject() {
       throw new Error(
         `[build-web] node_modules is STALE for ${problems.length} vendored plugin(s) — a native build `
           + `would silently ship the WRONG native code (#685):\n${problems.map((p) => `  • ${p}`).join('\n')}\n\n`
-          + `⚠️ \`npm install\`, \`npm install --force\`, and \`rm -rf node_modules/<plugin> && npm install\` `
-          + `on their OWN do NOT fix this — measured: npm serves the stale content straight out of its own `
-          + `cache while the lockfile still pins the old integrity, so nothing ever asks it to look again. `
-          + `Fix each one, in order:\n`
+          + `⚠️ Do NOT reach for \`npm install --package-lock-only\` — measured (#685): it is what CREATES `
+          + `this state, writing the new resolved+integrity into both lockfiles without extracting, and a tree `
+          + `left there is unrecoverable by any plain install. A bare \`npm install\` or \`--force\` also will `
+          + `not fix it. Repair, in order:\n`
           + `  1. delete the plugin's entry from ${projectRoot}/package-lock.json ("node_modules/<plugin>" under "packages")\n`
-          + `  2. (cd ${projectRoot} && npm install --package-lock-only)   # re-resolves it — ⚠ 2 WITHOUT 3 leaves node_modules UNRECOVERABLE by npm install\n`
-          + `  3. (cd ${projectRoot} && rm -rf node_modules/<plugin> && npm install)`,
+          + `  2. (cd ${projectRoot} && npm install)   # a PLAIN install — it now re-resolves AND extracts\n`
+          + `  3. ONLY if step 2 reported "up to date" and this check still fires — then node_modules/.package-lock.json `
+          + `is ahead of the disk and nothing will re-extract:\n`
+          + `     (cd ${projectRoot} && rm -rf node_modules/<plugin> && npm install)`,
       );
     }
   }

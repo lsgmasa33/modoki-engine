@@ -105,6 +105,32 @@ describe('BufferedNumberInput — dataUiId reaches the DOM', () => {
     const { container: withoutId } = render(<BufferedNumberInput value={18.4} onChange={vi.fn()} />);
     expect(withoutId.querySelector('input')!.hasAttribute('data-ui-id')).toBe(false);
   });
+
+  // #704 added two companions. Same argument as above — a prop that exists only in the type
+  // signature is invisible to `modoki_handles`, and these two are the whole reason the Skin
+  // Editor's ten numeric fields became aimable rather than merely tagged.
+  it('renders dataUiLabel and dataUiKind, and omits both when not passed', () => {
+    const { container: full } = render(
+      <BufferedNumberInput
+        value={3} onChange={vi.fn()}
+        dataUiId="skin.part.tessellate.cols" dataUiLabel="tessellation cols" dataUiKind="field"
+      />,
+    );
+    const el = full.querySelector('input')!;
+    expect(el.getAttribute('data-ui-label')).toBe('tessellation cols');
+    expect(el.getAttribute('data-ui-kind')).toBe('field');
+
+    // ⚠️ The omission is the load-bearing half. `chromeHandles.ts` falls back to the TAG NAME when
+    // `data-ui-kind` is absent, so if this component ever defaulted the attribute, every
+    // already-tagged BufferedNumberInput (Inspector, QualityTiers, …) would silently move from
+    // `kind: 'input'` to `kind: 'field'` and change what `modoki_handles {kind}` returns.
+    const { container: bare } = render(
+      <BufferedNumberInput value={3} onChange={vi.fn()} dataUiId="inspector.field.Transform.x" />,
+    );
+    const bareEl = bare.querySelector('input')!;
+    expect(bareEl.hasAttribute('data-ui-label')).toBe(false);
+    expect(bareEl.hasAttribute('data-ui-kind')).toBe(false);
+  });
 });
 
 

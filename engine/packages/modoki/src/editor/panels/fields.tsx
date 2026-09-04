@@ -225,7 +225,7 @@ export function BufferedTextInput({ value, onChange, style, placeholder, mixed, 
     style={{ ...style, ...invalidStyle, ...roStyle }} />;
 }
 
-export function BufferedNumberInput({ value, onChange, step, style, readOnly, mixed, min, max, dataUiId }: { value: number; onChange: (v: number) => void; step?: number; style?: React.CSSProperties; readOnly?: boolean; mixed?: boolean; min?: number; max?: number; dataUiId?: string }) {
+export function BufferedNumberInput({ value, onChange, step, style, readOnly, mixed, min, max, dataUiId, dataUiLabel, dataUiKind }: { value: number; onChange: (v: number) => void; step?: number; style?: React.CSSProperties; readOnly?: boolean; mixed?: boolean; min?: number; max?: number; dataUiId?: string; dataUiLabel?: string; dataUiKind?: string }) {
   // Enforce the declared range on COMMIT (the field hint's min/max were previously
   // display-only — only the wheel respected them, so a typed value could exceed the
   // cap, e.g. glowSize past its 0.5 seam budget). Clamp inside `parse` so an
@@ -246,5 +246,14 @@ export function BufferedNumberInput({ value, onChange, step, style, readOnly, mi
   // (negatives were only typeable digit-first then prepending `-`). With a text input the
   // buffered local string preserves the in-progress `-`/`.`; parseNumber still coerces
   // garbage to 0. `inputMode="decimal"` keeps a numeric soft-keyboard on touch devices.
-  return <input ref={ref} type="text" inputMode="decimal" value={localValue} placeholder={mixed ? MIXED_PLACEHOLDER : undefined} onFocus={onFocus} onBlur={onBlur} onChange={(e) => handleChange(e.target.value)} style={style} readOnly={readOnly} data-ui-id={dataUiId} />;
+  // `dataUiLabel` renders as `data-ui-label`: `labelFor()` in chromeHandles.ts falls back to
+  // textContent then title/aria-label, and a bare number input has none of those, so without
+  // this prop these fields report no label at all in `modoki_handles`.
+  //
+  // `dataUiKind` is OPT-IN rather than defaulted to 'field' on purpose. `chromeHandles.ts` falls
+  // back to the TAG NAME when the attribute is absent, so defaulting it here would silently
+  // reclassify every already-tagged `BufferedNumberInput` (Inspector, QualityTiers, …) from
+  // `kind: 'input'` to `kind: 'field'` and change what `modoki_handles {kind}` returns for callers
+  // that never asked for the change. New call sites opt in; existing ones keep their kind.
+  return <input ref={ref} type="text" inputMode="decimal" value={localValue} placeholder={mixed ? MIXED_PLACEHOLDER : undefined} onFocus={onFocus} onBlur={onBlur} onChange={(e) => handleChange(e.target.value)} style={style} readOnly={readOnly} data-ui-id={dataUiId} data-ui-label={dataUiLabel} data-ui-kind={dataUiKind} />;
 }
