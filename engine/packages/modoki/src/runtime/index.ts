@@ -599,6 +599,10 @@ export {
   createOneEuroFilter, oneEuroAlpha, POINTER_FILTER_DEFAULTS, type OneEuroParams,
 } from './input/oneEuroFilter';
 export { rawNow, setManualNow, advanceManual, restoreRealClock, isManualClock } from './core/clock';
+export {
+  setTrustedAnchor, trustedNow, hasTrustedAnchor, trustedAnchorSource, clearTrustedAnchor,
+  type TrustedClockSource,
+} from './core/trustedClock';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {

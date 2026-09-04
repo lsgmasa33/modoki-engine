@@ -144,6 +144,30 @@ export function nearestPointerBlocker(target: unknown): ContainerLike | null {
   return inner;
 }
 
+/** True if `target` is inside ANY registered surface — a block root OR a passthrough surface,
+ *  with no block-vs-pass precedence between them. Deliberately NOT built on `nearestPointerBlocker`
+ *  / `isPointerBlocked`: those answer "does chrome own this press", which has a winner (nearest
+ *  ancestor). This answers a different, simpler question — "is this press anywhere on the game's
+ *  own DOM, chrome or canvas" — where a touch on a game UI button and a touch on the game canvas
+ *  are BOTH the game and both must count. Do not reimplement this in terms of the nearest-ancestor
+ *  logic; that would silently exclude, say, a touch on the game's own UI (blocked from
+ *  `Input.pointer`, but still very much part of the game's surface).
+ *
+ *  Added for #595 (`domGestureTracking.ts`): that module needs "is this touch on the game at all,
+ *  vs. editor chrome" and this registry's union is the right proxy, because `UIRenderer` only
+ *  registers its block root in RUNTIME mode (`if (!onSelectEntity)`) — the editor's own chrome
+ *  (Hierarchy, Inspector, SceneView's authoring copy) never registers here.
+ *
+ *  ⚠️ **Fails OPEN: returns `true` when BOTH registries are empty.** Before the game's UI root has
+ *  mounted, in a headless/jsdom context, or in an embedding that registers nothing here at all,
+ *  this must not silently stop tracking — it must fall back to the pre-existing document-wide
+ *  behaviour. A caller gating on this function inherits that safety property automatically. */
+export function isInsideGameSurface(target: unknown): boolean {
+  if (blockers.size === 0 && passthrough.size === 0) return true;
+  if (target == null) return false;
+  return containing(blockers, target).length > 0 || containing(passthrough, target).length > 0;
+}
+
 /** Test/teardown escape hatch — drop every registration without calling disposers. */
 export function clearPointerBlockers(): void {
   blockers.clear();

@@ -132,6 +132,7 @@ missing tarball on open.
 | AppsFlyer attribution | `engine/packages/capacitor-appsflyer` | iOS Swift + Android Java + TS; `devKey`/`appleAppId` are call parameters |
 | Scene-chrome patching | `engine/packages/modoki/src/runtime/ui/sceneChrome.ts` | See [ui-system.md](./ui-system.md) § "Pushing live values onto scene-authored chrome" |
 | Scroll views / recycled entries | `UIScrollView` + `UIEntries` | `games/scroll-demo` is a deliberate non-Court proof |
+| Trusted clock | `engine/packages/modoki/src/runtime/core/trustedClock.ts` | Server-time/monotonic anchor, promoted in #660. Pure arithmetic, **zero imports**; the GAME owns fetching and persisting. Passes the determinism guard with no allowlist entry. ⚠️ Defends the *instant*, NOT the timezone — see the daily-challenge bullet below |
 
 ## What is deliberately NOT shared
 
@@ -157,7 +158,34 @@ reopen it.
   both solver-free. **Split the manifest into a solver-free ladder half first.**
 - **A daily challenge — deferred.** Zero second consumers: the other game's progress model has no
   date dimension at all, so a daily there would be a new game mode, not parity. Revisit when a
-  second game actually wants one, and ship a trusted clock alongside it.
+  second game actually wants one.
+  ⚠️ **Do NOT "ship a trusted clock alongside it" — an earlier version of this line said to, and it
+  does not work.** `trustedNow()` defends the *instant*; `dateKeyOf` (`games/court/runtime/daily.ts`)
+  converts that instant through the **device timezone** (`getFullYear`/`getMonth`/`getDate`, local by
+  deliberate design — a UTC key hands a player east of Greenwich tomorrow's puzzle in the evening).
+  A player shifting UTC−11 → UTC+14 moves the local civil CLOCK by 25 hours with a perfectly trusted
+  `nowMs` — and the device-selectable span is 26 hours, since UTC−12 exists — which is more than
+  enough to roll the civil DATE onto the next day. The farm still works and the code now *claims* a
+  defence it does not have.
+  A trusted daily needs a trusted **civil date** — an owner ruling on timezone policy — not a clock
+  swap. ⚠️ And the raw `Date.now()` the daily is fed today is **an accepted written ruling, not a
+  defect**: `games/court/daily.md` § "The clock is not trusted, and it is not defended either" states
+  it as an explicit *Ruling: accept it* (single-player, no leaderboard, every defence needs infra
+  Court does not have). So this work would **overturn a ruling**, not fill a gap — start there.
+- **A store SCREEN — deferred on assessment (#659, closed 2026-09-04).** `games/court/runtime/storeUi.ts`
+  is 581 lines / 228 code, and splits ~18% catalog-agnostic / ~42% generic mechanism wearing a
+  Court-shaped type / ~40% copy and catalog. Its two DIRECT imports are siblings — no
+  `@modoki/engine`, no `@court/*`, and it never names an IAP type itself — but the generic ~42%
+  cannot move until `StoreSlot`/`StoreConfig` become a catalog descriptor, and those live in
+  `store.ts`. **The two files are ORDERED, not neighbours.** The genuinely reusable asset is four
+  rules totalling ~40 lines: *no price, no row*; *no verdict while the question is still open*;
+  *a cancel is not an error*; *hidden, not greyed*.
+  **Reopens when a second game acquires a store SCREEN** — verified not met: `storeRows`/
+  `StoreRowView`/`shortfallCard` appear in no game outside `games/court/`.
+  ⚠️ A second game already ships the IAP MECHANISM with no such screen
+  (`games/wordweave/runtime/store.ts`), and the two `store.ts` export surfaces are **disjoint** —
+  Court's is catalog/entitlements/passes, wordweave's is coin-credit/idempotency. They share a
+  posture, not an API, so this is not duplication awaiting extraction.
 
 ## Blocked: the default-art layer
 
@@ -188,6 +216,24 @@ What *does* work with zero authoring: flat colour boxes with `borderRadius` on `
   literal union of one game's shelf items. The same shape recurs elsewhere, keying pattern tables
   on `'court.<thing>'` strings. **Every "no game-specific logic" claim needs a string-literal
   sweep, not just a dependency check.**
+- ⚠️ **Passing the sweep's most MEMORABLE item is not passing the sweep.**
+  `games/court/runtime/storeUi.ts` has no hardcoded game id at all — all 18 `court` tokens are in
+  comments — and no namespaced key, no analytics event and no PlayerPrefs read anywhere. It is still
+  only ~18% liftable, because it fails the other two items the bullet above already names: Court's
+  six shelf items are materialised three times in executable code (a `Record<StoreSlot, …>` seed, an
+  exhaustive `switch`, a ternary chain), and ~35 English strings are hardcoded with pluralisation,
+  subject-verb agreement and sentence assembly compiled in. **The config supplies only numbers; every
+  noun is typed in the file.** So the checklist above is right as written — the trap is stopping at
+  the `'court.'` grep, which is the easiest item to run and the weakest signal of the three.
+- ⚠️ **A "cleaner-looking" file can be DOWNSTREAM of the hard one, not independent of it.** The ~42% of
+  `storeUi.ts` that is genuine generic mechanism cannot move until `StoreSlot`/`StoreConfig` are
+  parameterised into a catalog descriptor — and those live in `store.ts`, the most coupled file in the
+  audit. The two were surveyed as neighbours; they are actually **ordered**. Any attempt that starts
+  with the UI file because it reads cleaner stalls on the config file anyway.
+- **The reusable asset can be a set of RULES, not code.** The most valuable thing found in
+  `storeUi.ts` was four design rules totalling ~40 lines — *no price, no row*; *no verdict while the
+  question is still open*; *a cancel is not an error*; *hidden, not greyed*. Worth stating explicitly
+  because a line-count-driven survey ranks that file low and misses them.
 - ⚠️ **Extraction that touches persisted keys lands on a SHIPPING game.** A progress-key reshape
   with no migration is the precedent that this class breaks live players. Treat it as a design
   constraint, not a merge problem.
@@ -206,15 +252,16 @@ What *does* work with zero authoring: flat colour boxes with `borderRadius` on `
 ## Open work
 
 The tiered extractions are done. What remains was surveyed but never tiered, and each has an issue
-carrying its own validation status — the coupling verdicts below came from *reading*, and the
-audit that produced them reversed itself on three of four rows once someone actually read the code:
+carrying its own validation status — the coupling verdicts below came from *reading*, and the audit
+that produced them reversed itself on three of the four rows it originally covered, once someone
+actually read the code:
+
+Two of the original four are settled: **#660** (the trusted clock) was PROMOTED — see the table in
+§ "What is shared today"; **#659** (the store screen) was assessed and DEFERRED — see § "What is
+deliberately NOT shared", which carries the condition that reopens it.
 
 - **#658** — cloud save / account sync. The largest surface by ~5×; blocked on designing a generic
   save-document seam, and it gates Firebase `/authentication` + `/firestore` reaching a second game.
-- **#659** — assess `storeUi.ts` coupling. The IAP mechanism is shared; the screen that sells
-  anything is not.
-- **#660** — promote the trusted clock. Small, genuinely generic, and a prerequisite for any
-  engine-level daily challenge.
 - **#661** — settings + ad policy. Mechanism generalizes, field sets do not; no second consumer yet.
 
 ## Related

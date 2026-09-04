@@ -9,16 +9,22 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   wireDomGestureTracking, unwireDomGestureTracking, isDomGestureActive, resetDomGestureTracking,
 } from '../../src/runtime/ui/domGestureTracking';
+import { registerPointerBlocker, clearPointerBlockers } from '../../src/runtime/core/pointerBlockers';
 
-const touchStart = () => document.dispatchEvent(new Event('touchstart', { bubbles: true }));
-const touchMove = () => document.dispatchEvent(new Event('touchmove', { bubbles: true }));
+/** `touchstart`/`touchmove` dispatch is target-aware for #595 — an optional `target` element lets a
+ *  case simulate a touch landing on a specific node (e.g. simulated editor chrome) rather than
+ *  always on `document` itself. */
+const touchStart = (target: EventTarget = document) =>
+  target.dispatchEvent(new Event('touchstart', { bubbles: true }));
+const touchMove = (target: EventTarget = document) =>
+  target.dispatchEvent(new Event('touchmove', { bubbles: true }));
 /** `touches` defaults to empty — a real `TouchEvent` isn't constructible in jsdom, so `onEnd`'s
  *  multi-touch check is driven by stubbing the property on a plain `Event`, which is exactly
  *  what the module reads (`e.touches.length`) and nothing more. */
-const touchEnd = (touches: unknown[] = []) => {
+const touchEnd = (touches: unknown[] = [], target: EventTarget = window) => {
   const e = new Event('touchend', { bubbles: true }) as Event & { touches: unknown[] };
   e.touches = touches;
-  window.dispatchEvent(e);
+  target.dispatchEvent(e);
 };
 const touchCancel = () => {
   const e = new Event('touchcancel', { bubbles: true }) as Event & { touches: unknown[] };
@@ -34,6 +40,7 @@ beforeEach(() => {
 afterEach(() => {
   unwireDomGestureTracking();
   resetDomGestureTracking();
+  clearPointerBlockers();
 });
 
 describe('domGestureTracking', () => {
@@ -164,5 +171,71 @@ describe('domGestureTracking', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  /** ── #595: a touch's TARGET is filtered against the game surface ──
+   *
+   *  Reproduces the editor case: the game runtime and the editor's own chrome share one
+   *  `document`, so `wireDomGestureTracking`'s listeners see BOTH. `registerPointerBlocker` stands
+   *  in for `UIRenderer`'s runtime-mode-only registration of the game's UI root — anything outside
+   *  it is, from this module's point of view, editor chrome. */
+  describe('target filtering against the registered game surface (#595)', () => {
+    it('a touchstart OUTSIDE the registered game surface does not activate the gesture', () => {
+      const gameRoot = document.createElement('div');
+      const chrome = document.createElement('div');
+      document.body.append(gameRoot, chrome);
+      registerPointerBlocker(gameRoot);
+
+      touchStart(chrome);
+      expect(isDomGestureActive(), 'a touch on editor chrome must not be tracked').toBe(false);
+    });
+
+    it('a touchstart INSIDE the registered game surface activates the gesture', () => {
+      const gameRoot = document.createElement('div');
+      const chrome = document.createElement('div');
+      document.body.append(gameRoot, chrome);
+      registerPointerBlocker(gameRoot);
+
+      touchStart(gameRoot);
+      expect(isDomGestureActive()).toBe(true);
+      touchEnd();
+    });
+
+    it('a touchend on chrome still clears an active gesture started inside the game surface — onEnd is ungated', () => {
+      const gameRoot = document.createElement('div');
+      const chrome = document.createElement('div');
+      document.body.append(gameRoot, chrome);
+      registerPointerBlocker(gameRoot);
+
+      touchStart(gameRoot);
+      expect(isDomGestureActive()).toBe(true);
+      touchEnd([], chrome);
+      expect(
+        isDomGestureActive(),
+        'a release landing off the game surface must still end the gesture, or the flag wedges true forever',
+      ).toBe(false);
+    });
+
+    it('the safety-timer recovery still works for a touch on the game surface after the timer fires', () => {
+      const gameRoot = document.createElement('div');
+      document.body.append(gameRoot);
+      registerPointerBlocker(gameRoot);
+
+      vi.useFakeTimers();
+      try {
+        touchStart(gameRoot);
+        expect(isDomGestureActive()).toBe(true);
+        vi.advanceTimersByTime(5001);
+        expect(isDomGestureActive(), 'fixture: the safety timeout must have fired first').toBe(false);
+        touchMove(gameRoot);
+        expect(
+          isDomGestureActive(),
+          'a touchmove on the game surface after the timer fired must re-arm the gesture',
+        ).toBe(true);
+        touchEnd();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 });

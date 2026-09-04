@@ -46,7 +46,32 @@
  *  only measured "since the gesture started" would fire mid-browse, silently un-gate the deferred
  *  re-measure, and reproduce the original stall for the rest of that same touch. Resetting the
  *  deadline on every `touchmove` makes it mean "no activity for `SAFETY_MS`", which only degrades
- *  when a finger is held stationary and dead — the case the timeout actually exists for. */
+ *  when a finger is held stationary and dead — the case the timeout actually exists for.
+ *
+ *  ⚠️ **#595 — the listeners stay at `document`/`window` scope, but `onStart`/`onMove` now filter
+ *  by TARGET.** This is the touch counterpart of the mouse bug the header above already describes:
+ *  `registerGameSystems` wires this module in the Electron EDITOR too, where the game runtime and
+ *  the editor's own chrome (Hierarchy, Inspector, viewport gizmos, panel dividers) share one
+ *  `document`. On touch-capable dev hardware a touch anywhere on that chrome set `active = true`
+ *  document-wide, gating `relayoutBoardIfHostMoved` for the duration — same shape of bug as the
+ *  mouse case, one layer down (target, not event type). The listeners cannot simply move to a
+ *  narrower DOM root: which element IS the game's surface is not known here and changes at
+ *  runtime, so the fix filters the already-`document`-scoped event by its `target` instead.
+ *  `core/pointerBlockers.ts`'s `isInsideGameSurface` is the right test for that — its registry is a
+ *  union of `UIRenderer`'s block root (registered in RUNTIME mode ONLY, `if (!onSelectEntity)`, so
+ *  the editor's chrome is excluded by construction) and the game canvas passthrough surface, and it
+ *  fails OPEN to document-wide tracking when nothing is registered yet, so this stays exactly as
+ *  permissive as before in every context that isn't the editor-with-chrome-and-a-mounted-game case
+ *  this exists to fix. `onEnd` stays UNGATED on purpose — see its own comment below.
+ *
+ *  ⚠️ **The fix's precondition: the filter only discriminates once something is REGISTERED in
+ *  `core/pointerBlockers.ts`.** While both registries are empty it fails open, and a touch on
+ *  editor chrome still activates — e.g. a GameView that is closed, or one that has not yet mounted
+ *  its `UIRenderer` (which returns null while `tree.length === 0`). Court is 2D and entirely
+ *  UI-driven, so its registry is populated whenever the game is up — but a future consumer whose
+ *  registry can stay empty with the game running should know this boundary before relying on it. */
+
+import { isInsideGameSurface } from '../core/pointerBlockers';
 
 let active = false;
 let safetyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -57,7 +82,8 @@ function armSafetyTimer(): void {
   if (safetyTimer !== null) clearTimeout(safetyTimer);
   safetyTimer = setTimeout(onEnd, SAFETY_MS);
 }
-function onStart(): void {
+function onStart(e: TouchEvent): void {
+  if (!isInsideGameSurface(e.target)) return;
   active = true;
   armSafetyTimer();
 }
@@ -74,11 +100,21 @@ function onStart(): void {
  *  forced-layout compositor stall returns on the very next scroll. `touchmove` firing at all
  *  already means a finger is down (there is no `touchmove` this file did not see a `touchstart`
  *  for first), so this always means a gesture is live — including recovering from a safety-timer
- *  false positive, which is bounded by `SAFETY_MS` either way. */
-function onMove(): void {
+ *  false positive, which is bounded by `SAFETY_MS` either way.
+ *
+ *  Gated the same way as `onStart` (see #595 in the module header) — a `touchmove`'s `target` is
+ *  fixed to its `touchstart`'s target per spec, so gating both on the same test is consistent: a
+ *  move that belongs to a start this module never activated for stays filtered too. */
+function onMove(e: TouchEvent): void {
+  if (!isInsideGameSurface(e.target)) return;
   active = true;
   armSafetyTimer();
 }
+/** ⚠️ **Deliberately UNGATED by target — the #595 filter above applies to `onStart`/`onMove` only.**
+ *  A release can land off-element (or squarely on editor chrome) even when the gesture it ends
+ *  started on the game surface, so gating `onEnd` the same way would leave `active` stuck `true`
+ *  with nothing left able to clear it — the "a mechanism that cannot fire" defect, one level up
+ *  from the safety timer this file already guards against for the same reason. */
 function onEnd(e?: TouchEvent): void {
   // A multi-touch release: only the FINAL finger lifting ends the gesture. `scrollAnchor.ts` has
   // the identical simplification (per-box, one scroll gesture at a time); this is a wider,

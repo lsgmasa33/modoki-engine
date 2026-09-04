@@ -10,6 +10,9 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { trait, createWorld } from 'koota';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
 import { emit, journalEvents } from '../../src/runtime/core/journal';
+import {
+  setTrustedAnchor, hasTrustedAnchor, trustedAnchorSource, clearTrustedAnchor,
+} from '../../src/runtime/core/trustedClock';
 import { getCurrentWorld } from '../../src/runtime/core/ecs/world';
 import { getPlayState } from '../../src/runtime/core/playState';
 import { rngInt, rngNext, seedRng } from '../../src/runtime/core/rng';
@@ -126,5 +129,27 @@ describe('createTestWorld', () => {
     expect(actualSeq).toEqual(expectedSeq);
     // Prod journal holds only prod events — the harness 'harness-event' never bled in.
     expect(journalEvents(undefined, prod).map((e) => e.type)).toEqual(['prod-event', 'prod-event']);
+  });
+});
+
+/** The `dispose()` contract is "tear down ALL global state", implemented as a HAND-MAINTAINED list
+ *  of module-level clears — so every singleton it forgets is a silent cross-test leak. `#660`
+ *  promoted `core/trustedClock` into the engine and the game it came from kept its own teardown
+ *  behind, which is exactly how one gets forgotten. Pinned here so the registration cannot be
+ *  dropped again without a red test. */
+describe('createTestWorld dispose — trusted-clock anchor', () => {
+  afterEach(() => clearTrustedAnchor());
+
+  it('clears the trusted-clock session anchor so it cannot leak into the next test', () => {
+    const tw = createTestWorld({});
+    setTrustedAnchor(1_700_000_000_000, 1_000, 'id-token');
+    expect(hasTrustedAnchor()).toBe(true);
+
+    tw.dispose();
+
+    // Without the registration in dispose(), the anchor survives and the NEXT test reads a
+    // non-null trustedNow() where the contract promises null.
+    expect(hasTrustedAnchor()).toBe(false);
+    expect(trustedAnchorSource()).toBeNull();
   });
 });
