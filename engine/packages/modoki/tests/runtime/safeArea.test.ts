@@ -154,6 +154,36 @@ describe('getSafeAreaInsets', () => {
     expect(getSafeAreaInsets()).toMatchObject({ top: 0, right: 0, bottom: 0, left: 0 });
   });
 
+  /**
+   * The teardown half of the retained denominator. `rootW`/`rootH` deliberately SURVIVE a root
+   * change (see the two-root test below — that retention is what stops a collapsed panel producing
+   * a confident zero), so the only thing stopping a stale box outliving the module's whole state is
+   * the explicit reset in the `!el` branch and in `resetSafeAreaInsets`.
+   *
+   * ⚠️ Pinned because a mutant deleting that reset survived the entire suite: the neighbouring null
+   * test registers a root that never had a box, so the denominator is 0 with or without it. Only a
+   * REAL box, torn down, then a fresh boxless root can tell the two apart. A later "apply the `> 0`
+   * rule everywhere" sweep would otherwise remove this silently and green.
+   */
+  it('tearing down with a null root CLEARS the retained denominator — it does not outlive the module', () => {
+    Object.defineProperty(root, 'clientHeight', { value: 874, configurable: true });
+    root.style.setProperty('--ui-sa-top', '68px');
+    measureSafeAreaInsets(root);
+    expect(getSafeAreaInsets().topPct).toBeCloseTo((68 / 874) * 100, 9);
+
+    measureSafeAreaInsets(null);
+
+    // A fresh root that never had a box must read "cannot compute" (0), NOT the old root's 874.
+    const later = document.createElement('div');
+    later.style.setProperty('--ui-sa-top', '44px');
+    document.body.appendChild(later);
+    measureSafeAreaInsets(later);
+    expect(getSafeAreaInsets().top, 'the px inset still measures').toBe(44);
+    expect(getSafeAreaInsets().topPct, 'but against no denominator, not against the torn-down one')
+      .toBe(0);
+    later.remove();
+  });
+
   it('re-measures rather than caching a stale value when the preset changes', () => {
     root.style.setProperty('--ui-sa-top', '68px');
     measureSafeAreaInsets(root);
@@ -363,6 +393,158 @@ describe('getSafeAreaInsets', () => {
     deliver(br, { width: 0, height: 0 }, /* rendered */ true);
     expect(getSafeAreaInsets().bottom, 'a real zero inset must still be honoured').toBe(0);
     expect(getSafeAreaInsets().bottomPct).toBe(0);
+  });
+
+  /**
+   * The THIRD door into the same confident-zero failure, and the one neither guard above covers:
+   * the REGISTRATION path with a root that is connected and rendered but has NO LAYOUT BOX.
+   *
+   * `getSafeAreaInsets` discriminates on `isConnected`; `onProbeResize` discriminates on
+   * `getClientRects()`. Registration screens on NEITHER — it does not have to in order to read the
+   * raw insets, and that is what makes it the unguarded door.
+   *
+   * Found live, not by a test: the editor mounts a `UIRenderer` per viewport, and `flexlayout-react`
+   * maximises a panel by setting `display: none` on every other tabset container, and on the tabs
+   * of every non-maximised tabset (read in 0.8.19's `dist/index.js`; both writes are guarded on
+   * `getMaximizedTabset(...) !== undefined && !isMaximized()`). Such a subtree is connected but NOT
+   * rendered, so
+   * `isConnected` passes it through, `getComputedStyle(probe).height` still answers the correct
+   * length (measured — the very reason `onProbeResize` uses `getClientRects` instead), and only
+   * `clientWidth`/`clientHeight` are gone. `recompose`'s `total > 0 ? … : 0` then rewrites all four
+   * `*Pct` to zero, and the percentages are the ONLY fields `patchAnchorPct` and Court's six call
+   * sites read. Wordweave's ad banner silently lost its home-indicator lift the moment the Game
+   * panel was maximised — written as `bottom: 0` while `--ui-sa-bottom` was still `34px` and the
+   * CSS padding arm (a `var()`, no arithmetic) stayed correct on both roots.
+   *
+   * ⚠️ Asserts BOTH axes on purpose. Every assertion here was a bottom edge once, which depends
+   * only on `rootH` — so deleting the width half of the guard left this test green, and the
+   * per-axis design the fix's comment argues for was pinned by nothing.
+   */
+  it('a collapsed root does not become the denominator — registering a 0x0 root keeps the last '
+    + 'good percentages', () => {
+    Object.defineProperty(root, 'clientHeight', { value: 874, configurable: true });
+    Object.defineProperty(root, 'clientWidth', { value: 402, configurable: true });
+    root.style.setProperty('--ui-sa-bottom', '34px');
+    root.style.setProperty('--ui-sa-left', '21px');
+    measureSafeAreaInsets(root);
+    expect(getSafeAreaInsets().bottomPct).toBeCloseTo((34 / 874) * 100, 9);
+    expect(getSafeAreaInsets().leftPct).toBeCloseTo((21 / 402) * 100, 9);
+
+    // The second viewport's panel is `display: none`d. Same node, still connected, computed styles
+    // still resolving — it has simply lost its box, and it re-registers on the resize.
+    Object.defineProperty(root, 'clientHeight', { value: 0, configurable: true });
+    Object.defineProperty(root, 'clientWidth', { value: 0, configurable: true });
+    measureSafeAreaInsets(root);
+
+    expect(getSafeAreaInsets().bottom, 'the px inset is measured correctly either way').toBe(34);
+    expect(getSafeAreaInsets().bottomPct,
+      'and the PERCENTAGE must survive — a root with no box is "cannot compute", not "zero inset"')
+      .toBeCloseTo((34 / 874) * 100, 9);
+    expect(getSafeAreaInsets().leftPct, 'the WIDTH axis is guarded too, not just the height')
+      .toBeCloseTo((21 / 402) * 100, 9);
+
+    // The other half: a root that regains a REAL box must be adopted, or this guard would freeze
+    // the denominator forever and every rotation/resize would read against a stale one.
+    Object.defineProperty(root, 'clientHeight', { value: 500, configurable: true });
+    Object.defineProperty(root, 'clientWidth', { value: 300, configurable: true });
+    measureSafeAreaInsets(root);
+    expect(getSafeAreaInsets().bottomPct, 'a real box must still replace the denominator')
+      .toBeCloseTo((34 / 500) * 100, 9);
+    expect(getSafeAreaInsets().leftPct, 'on both axes').toBeCloseTo((21 / 300) * 100, 9);
+  });
+
+  /**
+   * The FOURTH door, three lines from the third: the OBSERVER's re-read of the root box.
+   *
+   * That read exists to keep the denominator fresh through a rotation (the observation is delivered
+   * a frame before `UIRenderer` re-registers), and it sits behind the `rendered` bail — which is
+   * not the same guard. `rendered` rejects a probe in a NON-RENDERED subtree, which is what covers
+   * the editor's `display: none` case; it says nothing about a root that IS rendered and merely has
+   * a zero box. That geometry is narrow but real: under the `Free` preset GameView's UI root is
+   * `position: absolute; inset: 0` over a `flex: 1` area and can be squeezed flat while still
+   * rendering (a flexlayout tabset's min is 1px, not 0 — but a 1px tabset holding a 32px toolbar
+   * still leaves the area at 0). Under a fixed device preset the root is a `deviceW x deviceH` box
+   * and cannot collapse. A scene swap's empty->refill beat is the same shape.
+   *
+   * ⚠️ Unlike the registration door this one has NOT been driven live — it is pinned for
+   * consistency (there are exactly two writers of the denominator, and a reader who finds one
+   * guarded and one not will assume the difference is meaningful) rather than as the fix for an
+   * observed symptom. It would be the worse of the two if it did open: the registration path is
+   * re-run by the next mount or resize, while nothing here re-reads the box until a registration.
+   */
+  it('a rendered observation against a collapsed root keeps the last good denominator', () => {
+    Object.defineProperty(root, 'clientHeight', { value: 874, configurable: true });
+    Object.defineProperty(root, 'clientWidth', { value: 402, configurable: true });
+    root.style.setProperty('--ui-sa-bottom', '34px');
+    root.style.setProperty('--ui-sa-right', '13px');
+    measureSafeAreaInsets(root);
+    expect(getSafeAreaInsets().bottomPct).toBeCloseTo((34 / 874) * 100, 9);
+
+    const [, br] = probesIn(root);
+    // The root keeps rendering and loses its BOX — not the `display:none` case, which the
+    // `!rendered` bail already covers. (`position: fixed` would not save a probe from that: a
+    // `display:none` ANCESTOR takes the whole subtree out of the box tree whatever the descendant's
+    // positioning, which is why this module discriminates on `getClientRects` at all.) Then the
+    // inset changes, and that observation is rendered and must be honoured.
+    Object.defineProperty(root, 'clientHeight', { value: 0, configurable: true });
+    Object.defineProperty(root, 'clientWidth', { value: 0, configurable: true });
+    deliver(br, { width: 13, height: 21 }, /* rendered */ true);
+
+    expect(getSafeAreaInsets().bottom, 'the new px inset must land — this is a real change').toBe(21);
+    expect(getSafeAreaInsets().bottomPct, 'against the last good height, not against zero')
+      .toBeCloseTo((21 / 874) * 100, 9);
+    // ⚠️ Both axes, for the reason spelled out on the registration test: asserting only a bottom
+    // edge exercises `rootH` alone, and a mutant deleting the WIDTH half of this guard survived the
+    // whole suite until this line existed.
+    expect(getSafeAreaInsets().rightPct, 'the WIDTH axis of THIS guard too, not just the height')
+      .toBeCloseTo((13 / 402) * 100, 9);
+
+    // And a rendered observation against a REAL box must still refresh the denominator, or the
+    // rotation case this root read exists for would be broken by its own guard.
+    Object.defineProperty(root, 'clientHeight', { value: 402, configurable: true });
+    Object.defineProperty(root, 'clientWidth', { value: 874, configurable: true });
+    deliver(br, { width: 13, height: 21 }, /* rendered */ true);
+    expect(getSafeAreaInsets().bottomPct, 'a rotation must still move the denominator')
+      .toBeCloseTo((21 / 402) * 100, 9);
+    expect(getSafeAreaInsets().rightPct, 'on both axes').toBeCloseTo((13 / 874) * 100, 9);
+  });
+
+  /**
+   * The seam the two tests above do not reach: `el !== root`, i.e. a DIFFERENT element registering.
+   * The editor's two viewports alternate, so the poisoned registration CAN be a root change
+   * (`releaseRoot()`, fresh probes, fresh observer) rather than a re-register of the same node —
+   * which it is depends on which viewport registered last, and this file's `probeTL` doc already
+   * says that is not deterministic. Half the time is enough: the branch has to be right.
+   *
+   * ⚠️ It pins a deliberate TRADE-OFF, not a clean invariant. `rootW`/`rootH` are module state and
+   * survive `releaseRoot()`, so root B with no box divides ITS insets by root A's dimensions — a
+   * foreign denominator. Clearing the box on a root change would put the confident zero straight
+   * back for the case the fix exists for whenever the alternation lands that way, and a plausible
+   * number degrades far better than a zero, which does not merely read wrong but MOVES things (Court's `syncMenuIconBar` is
+   * change-gated, so a transient zero moves the bar and moves it back). The editor's two roots
+   * publish the same `safeAreaCssVars` and are normally sized alike, so the divergence window is a
+   * frame under the `Free` preset. If this ever needs to be exact, the answer is a per-root box —
+   * not clearing.
+   */
+  it('a SECOND root with no box divides by the first root\'s — deliberate, and better than zero', () => {
+    Object.defineProperty(root, 'clientHeight', { value: 874, configurable: true });
+    Object.defineProperty(root, 'clientWidth', { value: 402, configurable: true });
+    root.style.setProperty('--ui-sa-bottom', '34px');
+    measureSafeAreaInsets(root);
+    expect(getSafeAreaInsets().bottomPct).toBeCloseTo((34 / 874) * 100, 9);
+
+    // The other viewport's root — a different element, its own inset, and no box.
+    const other = document.createElement('div');
+    other.style.setProperty('--ui-sa-bottom', '20px');
+    Object.defineProperty(other, 'clientHeight', { value: 0, configurable: true });
+    Object.defineProperty(other, 'clientWidth', { value: 0, configurable: true });
+    document.body.appendChild(other);
+    measureSafeAreaInsets(other);
+
+    expect(getSafeAreaInsets().bottom, 'the new root\'s own px inset is measured').toBe(20);
+    expect(getSafeAreaInsets().bottomPct, 'against the retained box — NOT a confident zero')
+      .toBeCloseTo((20 / 874) * 100, 9);
+    other.remove();
   });
 
   // ── Probe lifecycle ─────────────────────────────────────────────────────────────────────────

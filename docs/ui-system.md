@@ -697,6 +697,57 @@ node, and `getComputedStyle` on a detached probe answers empty strings — every
 meet in the middle. The last known insets are kept either way: a device's insets do not change
 because some UI unmounted.
 
+⚠️ **A root with no LAYOUT BOX must never become the denominator, and the two guards above do not
+stop it — REGISTRATION screens on neither.** `getSafeAreaInsets` discriminates on `isConnected` and
+`onProbeResize` on `getClientRects()`; the registration path needs neither in order to read the raw
+insets, which is precisely what makes it the open door. `flexlayout-react` maximises a panel by
+setting `display: none` on every other tabset container, and on the tabs of every non-maximised
+tabset (read in 0.8.19's bundled `dist/index.js`; both writes are guarded on
+`getMaximizedTabset(...) !== undefined && !isMaximized()`), and the editor mounts one `UIRenderer`
+per viewport — so maximising the Game panel
+leaves SceneView's root **connected but not rendered**. `isConnected` passes it through;
+`getComputedStyle(probe).height` still answers the correct length under `display: none` (the same
+measurement that forces `onProbeResize` to use `getClientRects` instead), so the raw px insets are
+measured perfectly; only `clientWidth`/`clientHeight` are 0. `recompose`'s `total > 0 ? … : 0` then
+rewrites all four `*Pct` to a confident **zero** — the one value a consumer cannot tell from a real
+measurement, and the only fields `patchAnchorPct` and Court's six per-frame call sites read. The CSS
+arm is immune because it is a `var()` with no arithmetic; only the JS arm divides.
+
+Measured 2026-09-04: `games/wordweave`'s ad banner silently lost its 34px home-indicator lift the
+moment the Game panel was maximised, `AdBannerSlot.UIAnchor.bottom` written as 0 while
+`--ui-sa-bottom` still read `34px` and the padding arm on `HUD Root` stayed correct. Guarding it
+restored the lift — bottom moved 966.75 → 931.39. ⚠️ Those are **device** px off the scaled preview,
+so the 35.36 delta is post-transform and must not be equated with the 34px **logical** inset (the
+exact trap the `*Pct` fields exist to prevent). It establishes that the lift returned, not its
+magnitude.
+
+So **both** writers of the denominator — registration (`applyMeasurement`) and the observer's
+re-read (`onProbeResize`) — adopt the new box **per axis, only when it is greater than zero**,
+keeping the last good one otherwise. That is this module's existing rule for a root it cannot
+measure, applied to the case where the root is still there and only its box is missing. Per-axis
+because a root can legitimately lose one dimension and keep the other; a real box always replaces
+the retained one, so rotation and resize still work. Only the registration door has been observed
+live — the observer's read sits behind the `rendered` bail, which does cover `display: none`, and is
+guarded for consistency and against a root that is *rendered* with a zero box. That case is narrow:
+only under the **`Free`** preset is GameView's UI root `position: absolute; inset: 0` over a `flex: 1`
+area and able to be squeezed flat while still rendering (a flexlayout tabset's minimum is 1px, not 0
+— but a 1px tabset holding a 32px toolbar still leaves the area at 0). Under a fixed device preset
+the root is a `deviceW × deviceH` box and cannot collapse. A scene swap's empty→refill beat is the
+same shape.
+
+⚠️ **The retained box is not necessarily the current root's, and that is deliberate.** `rootW`/`rootH`
+are module state and survive `releaseRoot()`, so a second root registering with no box divides *its*
+insets by the *previous* root's dimensions. Clearing them on a root change would put the confident
+zero straight back for the case above whenever the alternation lands that way — the editor's two
+viewports alternate, so the poisoned registration **can be** a root change; which it is depends on
+which viewport registered last, and that is not deterministic. Half the time is enough to disqualify
+clearing. A foreign-but-plausible denominator also degrades far better than
+a zero, which does not merely read wrong but *moves* things (Court's `syncMenuIconBar` is
+change-gated, so a transient zero moves the icon bar and moves it back). Both viewports publish the
+same `safeAreaCssVars(gameViewSafeArea)` and are normally sized alike, so the divergence window is
+about a frame under the `Free` preset. If this ever has to be exact, the answer is a per-root box,
+not clearing.
+
 ⚠️ **The percentages are recomputed against the CURRENT root box on every observation, not against
 the one cached at registration** — a rotation moves the root and the insets together, and the probe
 observation is delivered a frame BEFORE `UIRenderer`'s rAF-deferred re-registration. Measured:

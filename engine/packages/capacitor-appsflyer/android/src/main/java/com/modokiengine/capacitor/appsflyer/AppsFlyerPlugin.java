@@ -36,16 +36,26 @@ public class AppsFlyerPlugin extends Plugin {
     // boot effect in the SAME native process, calling initialize() then start() again —
     // registerSessionReadyListener stacks a NEW listener rather than replacing the old one.
     //
-    // ⚠️ WHAT IS MEASURED, AND WHAT IS NOT — read before trusting either direction.
-    //   FOR the guard (#607, THIS platform: Galaxy S22, versionCode 6029, ONE process, PID
-    //   21451): a resume-reload produced a SECOND POST to launches.appsflyersdk.com ~100 s after
-    //   the cold-boot one, alongside a second "[AppsFlyer] Initialized for android".
-    //   AGAINST it: attribution.md § "CLOSED: the four Launch events are the SDK's own transport"
-    //   records the opposite on IOS — "an extra manual start() produces no new rows, since a
-    //   second start is a no-op", with sessioncounter 1 in both payloads.
-    // The two have NOT been reconciled (different platforms, different hosts, and the iOS probe
-    // was a manual extra start() inside one session rather than one after a realm death), so this
-    // guard is DEFENSIVE: inert if the iOS finding generalises, corrective if it does not.
+    // ⚠️ RECONCILED ON ANDROID (#654, 2026-09-04) — this guard is INERT for Launch counts, and
+    // the evidence that once justified it is refuted AS AN ATTRIBUTION.
+    //   #607 recorded, on THIS platform (Galaxy S22, versionCode 6029, PID 21451), a SECOND POST
+    //   to launches.appsflyersdk.com ~100 s after the cold-boot one following a resume-reload,
+    //   and read that as the reload's second start(). Re-measured on a S22 (versionCode 6290,
+    //   SDK v7.0.1.386) with this guard ABSENT from the binary, driving the reload and the resume
+    //   as SEPARATE events two minutes apart: the reload's start() posted NO Launch and no POST
+    //   at all, while the resume posted one with no start() call involved. The POST #607 saw was
+    //   real; the cause assigned to it was wrong — a resume-reload does both at once and its
+    //   probe could not separate them.
+    // The mechanism: AppsFlyer's Launch is driven by the FOREGROUND TRANSITION
+    // (onBecameForeground, which alone is followed by "Starting session readiness evaluation"),
+    // not by start(). A webview reload produces no foreground transition, so a second start()
+    // lands inside an already-live session with nothing to trigger.
+    // So the iOS finding ("a second start is a no-op") GENERALISES here rather than conflicting.
+    // ⚠️ Keep the guard anyway: it still prevents a second registerSessionReadyListener, which is
+    // cheap. But do NOT keep believing it prevents session inflation — with two listeners
+    // registered, the resume still produced exactly ONE Launch.
+    // ⚠️ iOS across a reload remains UNMEASURED. Full run and limits: attribution.md § "#607/#654
+    // — the Android leg measured, and the contradiction dissolves".
     //
     // Plain (non-atomic) static boolean, deliberately: getAdvertisingId() below documents
     // that Capacitor's Bridge serializes every plugin method invocation onto one

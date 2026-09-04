@@ -27,10 +27,22 @@ export interface AppsFlyerPlugin {
    * is just silently blind. `initialize()` handles the ordering.
    *
    * ⚠️ **ONCE PER PROCESS (#607).** The first call registers the SDK's session-ready listener; every
-   * later call in the same OS process resolves `{ok:true}` and does NOTHING. That is deliberate —
-   * `registerSessionReadyListener` stacks rather than replaces, and each registration posts its own
-   * Launch event, so a webview reload calling this a second time inflated sessions. A caller cannot
-   * detect the no-op from the reply, and must not read `{ok:true}` as "the SDK started just now".
+   * later call in the same OS process resolves `{ok:true}` and does NOTHING. A caller cannot detect
+   * the no-op from the reply, and must not read `{ok:true}` as "the SDK started just now".
+   *
+   * ⚠️ **The justification for that guard was MEASURED and is weaker than this comment used to
+   * claim (#654, 2026-09-04, Galaxy S22, SDK v7.0.1.386).** It said each registration "posts its own
+   * Launch event, so a webview reload calling this a second time inflated sessions". Both halves are
+   * refuted. Run unguarded, a second `start()` across a real `location.reload()` in one process
+   * posted NO extra Launch event and no POST at all; the extra Launch that #607 attributed to the
+   * reload came from the app RESUME that followed it. AppsFlyer's Launch is driven by the foreground
+   * transition (`onBecameForeground`), not by `start()` — and with two listeners registered, the
+   * resume still produced exactly ONE Launch, so stacking did not inflate anything either.
+   * The guard is therefore INERT for Launch counts. It is kept because it still prevents a second
+   * `registerSessionReadyListener`, which is cheap and harmless — not because it stops inflation.
+   * ⚠️ **iOS across a reload is still UNMEASURED**; do not read the Android result as covering it.
+   * Full run, evidence and limits: `games/court/attribution.md` § "#607/#654 — the Android leg
+   * measured, and the contradiction dissolves".
    * ⚠️ Consequence for a future `stop({stopped:false})` opt-back-in: the follow-up `start()` this
    * needs will ALSO no-op, so re-enabling the SDK mid-process is not reachable through this API
    * today. Nothing calls `stop` from JS, so this is a trap for the next author, not a live bug.

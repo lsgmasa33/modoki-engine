@@ -30,18 +30,22 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
     // boot effect in the SAME native process, calling initialize() then start() again —
     // registerSessionReadyListener stacks a NEW listener rather than replacing the old one.
     //
-    // ⚠️ WHAT IS MEASURED, AND WHAT IS NOT — read before trusting either direction.
-    //   FOR the guard (#607, Galaxy S22, versionCode 6029, ONE process, PID 21451): a
-    //   resume-reload produced a SECOND POST to launches.appsflyersdk.com, ~100 s after the
-    //   cold-boot one, alongside a second "[AppsFlyer] Initialized for android".
-    //   AGAINST it: attribution.md § "CLOSED: the four Launch events are the SDK's own
-    //   transport" records the opposite on IOS, from the SDK's own verbose log — "an extra
-    //   manual start() produces no new rows, since a second start is a no-op", with
-    //   sessioncounter 1 in both payloads, i.e. DAU and sessions NOT inflated.
-    // The two have NOT been reconciled: different platforms, different hosts, and the iOS probe
-    // was a manual extra start() inside one session rather than one after a realm death. So this
-    // guard is deliberately DEFENSIVE — inert if the iOS finding generalises, corrective if it
-    // does not. Do not restate either measurement as settled SDK behaviour without a new one.
+    // ⚠️ RECONCILED ON ANDROID (#654, 2026-09-04) — and this file is the platform still WAITING
+    // for its own measurement, so read the split carefully.
+    //   #607 read a SECOND POST to launches.appsflyersdk.com ~100 s after cold boot, following a
+    //   resume-reload on a Galaxy S22, as the reload's second start(). Re-measured on Android
+    //   with the guard ABSENT and the reload and resume driven as SEPARATE events: the reload's
+    //   start() posted NOTHING, the resume posted the Launch with no start() involved. The
+    //   mechanism is that AppsFlyer's Launch follows the FOREGROUND TRANSITION, not start().
+    //   So the iOS finding this file already records — "a second start is a no-op",
+    //   sessioncounter 1, DAU not inflated — GENERALISES to Android rather than conflicting.
+    // ⚠️ **iOS ACROSS A RELOAD IS STILL UNMEASURED.** The iOS probe was a manual extra start()
+    // INSIDE one session, not one after a realm death, and nobody has re-run it across a reload
+    // (the device #654 targets was unavailable). So on THIS platform the guard remains
+    // defensive-by-necessity: the Android result is strong evidence it is inert here too, but it
+    // is evidence by analogy, not a measurement of this SDK. Do not delete it on that basis.
+    // ⚠️ It also does not prevent session inflation on either platform — on Android, with two
+    // listeners registered, the resume still produced exactly ONE Launch.
     //
     // ⚠️ Do NOT describe this as fixing the "4, 4, then 3 Launch events" variation documented on
     // start() below. attribution.md records that count as EXPLAINED (two hosts x two retries =

@@ -316,7 +316,32 @@ function onProbeResize(entries: ResizeObserverEntry[]): void {
   // empty→refill cycle moves it permanently AFTER `Scene3D`'s. In that ordering this read does
   // force a reflow. Once per real inset change is a price worth paying for a correct
   // denominator; a per-frame read here would not be.
-  if (root) { rootW = root.clientWidth || 0; rootH = root.clientHeight || 0; }
+  //
+  // ⚠️ **Adopt each axis only when it is greater than zero — the same rule `applyMeasurement` uses,
+  // and the `!rendered` bail above is NOT a substitute for it.** That guard rejects a probe in a
+  // non-rendered subtree, which covers the editor's `display: none` case; it says nothing about a
+  // root that is RENDERED and merely has a zero box on one axis. Under the `Free` preset GameView's
+  // UI root is `position: absolute; inset: 0` over a `flex: 1` area, so it can be squeezed flat
+  // while still rendering (a flexlayout tabset's min is 1px, not 0, but a 1px tabset holding a 32px
+  // toolbar still leaves the area at 0); a scene swap's empty->refill beat is the same shape. Under
+  // a FIXED device preset the root is a `deviceW x deviceH` box and does not collapse at all. So
+  // this is a real geometry but a narrow one, and unlike the registration door it has not been
+  // driven live — treat it as consistency plus defence in depth, not a fix for an observed symptom.
+  //
+  // The asymmetry is the argument: exactly two sites MEASURE this denominator (here and
+  // `applyMeasurement`), and a reader who finds one guarded and one not will reasonably conclude the
+  // difference is meaningful. It is not. ⚠️ Two further sites write it — the `!el` branch of
+  // `measureSafeAreaInsets` and `resetSafeAreaInsets`, both zeroing it on teardown. Those are the
+  // escape hatch that stops a retained denominator outliving the module's state, and a later
+  // "apply the `> 0` rule consistently" sweep must NOT touch them. Worth noting this door is the worse of the two if it ever does open — the registration
+  // path is re-run by the next mount or resize, while nothing here re-reads the box until a
+  // registration happens.
+  if (root) {
+    const rw = root.clientWidth || 0;
+    const rh = root.clientHeight || 0;
+    if (rw > 0) rootW = rw;
+    if (rh > 0) rootH = rh;
+  }
   recompose();
 }
 
@@ -339,8 +364,55 @@ function applyMeasurement(el: HTMLElement): void {
   // insets above, which is the whole point (see the doc on the *Pct fields). `getBoundingClientRect`
   // would be POST-transform and is the trap that doc describes — measured under `scale(0.5)`:
   // computed height 68px, bounding rect 34.
-  rootW = el.clientWidth || 0;
-  rootH = el.clientHeight || 0;
+  // ⚠️ **A root with NO LAYOUT BOX must never become the denominator, and REGISTRATION is the one
+  // path with no rendered-ness discriminator at all.** `getSafeAreaInsets` screens on `isConnected`
+  // and `onProbeResize` on `getClientRects()`; this path screens on neither, because it does not
+  // need to in order to read the raw insets — and that is exactly what makes it dangerous.
+  //
+  // How it is reached: the editor mounts a `UIRenderer` per viewport, and `flexlayout-react`
+  // maximises a panel by setting `display: none` on every OTHER tabset container, and on the tabs
+  // of every non-maximised tabset (read in `flexlayout-react@0.8.19`'s `dist/index.js`: the two
+  // writes are both guarded on `getMaximizedTabset(...) !== undefined && !isMaximized()`. Cited by
+  // behaviour, not by line — a bundled dist renumbers on every bump). A `display: none` subtree is
+  // CONNECTED but NOT RENDERED, so:
+  //   - `isConnected` is true, so the refusal in `measureSafeAreaInsets` passes it through;
+  //   - `getComputedStyle(probe).height` still answers the correct length under `display: none`
+  //     (measured, and the reason `onProbeResize` discriminates on `getClientRects` instead — see
+  //     `makeProbe`), so `rawTop`/`rawBottom`/… above are measured PERFECTLY;
+  //   - but `clientWidth`/`clientHeight` on a non-rendered element are 0.
+  // So the raw insets survive and only the denominator is gone. `recompose`'s `total > 0 ? … : 0`
+  // then rewrites all four `*Pct` to a confident zero, and the percentages are the ONLY fields
+  // `patchAnchorPct` and every one of Court's six call sites read.
+  //
+  // Measured 2026-09-04: wordweave's ad banner silently lost its home-indicator lift the moment the
+  // Game panel was maximised — `AdBannerSlot.UIAnchor.bottom` written as 0 while `--ui-sa-bottom`
+  // was 34px and `HUD Root`'s own CSS padding still read it correctly. The CSS arm is immune
+  // because it is a `var()` with no arithmetic; only the JS arm divides. The fix restored the lift —
+  // `AdBannerSlot` bottom moved 966.75 -> 931.39. ⚠️ Those are DEVICE px, read off the scaled
+  // preview, so the 35.36 delta is post-transform and must NOT be equated with the 34px logical
+  // inset (the trap the `*Pct` doc above exists to warn about). What it establishes is that the
+  // lift came back, not its exact magnitude.
+  //
+  // Keeping the last good box is this module's own rule for a root it cannot measure ("a device's
+  // insets do not change because some UI unmounted"). Per-axis, because a root can legitimately
+  // lose one dimension and keep the other.
+  //
+  // ⚠️ **The retained box is NOT necessarily this root's** — `rootW`/`rootH` are module state and
+  // survive `releaseRoot()`, so a second root registering with no box divides ITS raw insets by the
+  // PREVIOUS root's dimensions. That is deliberate and it is the case that actually fires: the
+  // editor's two viewports alternate registration, so the poisoned call CAN be a root change —
+  // whether it is depends on which viewport registered last, which this file's `probeTL` doc already
+  // says is not deterministic. "Sometimes reintroduces the confident zero" is disqualifying on its
+  // own, so clearing the box on a root change is out either way. It is sound here because
+  // both viewports publish the same `safeAreaCssVars(gameViewSafeArea)` and are normally sized
+  // alike — and because a foreign-but-plausible denominator degrades far better than a zero, which
+  // does not read wrong so much as MOVE things (Court's `syncMenuIconBar` is change-gated, so it
+  // moves the bar and moves it back). The two can diverge for a frame under the `Free` preset;
+  // accept that rather than trade it for a guaranteed-wrong 0.
+  const w = el.clientWidth || 0;
+  const h = el.clientHeight || 0;
+  if (w > 0) rootW = w;
+  if (h > 0) rootH = h;
   recompose();
 }
 
