@@ -135,6 +135,7 @@ missing tarball on open.
 | Trusted clock | `engine/packages/modoki/src/runtime/core/trustedClock.ts` | Server-time/monotonic anchor, promoted in #660. Pure arithmetic, **zero imports**; the GAME owns fetching and persisting. Passes the determinism guard with no allowlist entry. ⚠️ Defends the *instant*, NOT the timezone — see the daily-challenge bullet below |
 | **Cloud-save protocol** (the sync-guaranteed GROUP) | `engine/packages/modoki/src/runtime/sync/**` | ⚠️ **This row's absence is what made #658 wrong.** Landed #532 Phase A (2026-09-01); Court moved onto it the same day. Generic over `T` — `SyncGroupSpec<T>` (`fingerprint`/`isFreshAndEmpty`/`merge`/`adopt`/`onFork`/`atomicity`), `GroupStore<T>`, `GroupTransport`, `runCloudSync`, `decideGroup`, `resolveGroupFork`. Firebase-free, clock-free, imports no other L2 folder; one `court` token in the whole folder and it is a docstring. Tested over an anonymous `Content` type (`tests/runtime/syncGroups.test.ts`, 39 tests). **The GAME owns what its save MEANS; the engine owns the protocol** |
 | **Cloud-sync coordinator** (*when* a sync runs) | `engine/.../runtime/sync/coordinator.ts` | Promoted in #658 (2026-09-04). Debounces a burst of progression writes, suppresses further syncs while a fork dialog is unanswered, coalesces overlapping triggers into ONE follow-up rather than a queue, and carries the #506 generation guard for sign-out-mid-sync. Generic over the **fork**, not the save — `CloudSyncCoordinator<TFork extends SyncFork>`, with `resolve`'s document reached as `TFork['serverDoc']`. ⚠️ **It must never read a field off a save document** — that property is the whole basis of the type parameter, and its test's `{ version }` stub document is the tripwire: needing a richer one there means it has stopped being generic |
+| **Account decisions** (provider, state machine, re-auth choice) | `engine/.../runtime/account/**` | Promoted in #675 (2026-09-04, `f3a32f79a`) — `AccountProvider`, `AccountState`, `SignInFailure`, `AvailableProviders`, `reauthProviderFor`. ⚠️ **Carries ZERO player-visible copy, and `tests/runtime/accountNoCopy.test.ts` fails if any lands** — there is no i18n mechanism anywhere in this repo, so an engine module that hardcodes English is a localisation blocker a game cannot reach. The GAME owns every rendered word; the engine owns the vocabulary that UI programs against |
 
 ## What is deliberately NOT shared
 
@@ -301,21 +302,44 @@ table, the fork resolution and the transport interface are all engine-side and d
 already; the coordinator joined them (see the table above). What is still game-shaped is *what a save
 MEANS*, plus three narrower items, each now its own issue:
 
-- **#673** — the conflict dialog's view-model is a fixed record of one game's nouns (solves, stars,
-  coins, track). A generic seam needs "the game returns N labelled rows", not a shared struct.
-- **#674** — the wiring needs exactly two injections (an auth/cloud-save service pair, and an
-  `onBackground` hook, today a hardcoded game-specific save call on the background edge), and the
-  widen/narrow pair dispatches on **literal group ids**, a hand-written type-erasure escape hatch only
-  the game can supply. ⚠️ It also records that the game's flat `SyncTransport` and the engine's
-  structured `GroupTransport` are bridged by **real translation, not a redundant duplicate** — that
-  bridge was misread as a free deletion once.
-- **#675** — the account UI is ~2/3 account-generic, but the generic part is mostly **hardcoded
-  English**. An engine module that hardcodes copy is worse than a duplicated one: it is a
-  localisation blocker a game cannot reach.
+**All three are now settled** (2026-09-04), and the settlement turned on one owner ruling: **the
+account and conflict-dialog UI is GAME-SPECIFIC.** Court's dialog keeps its self-describing sentences
+("3 puzzles the other one doesn't have"); the engine owns no layout for it, and no copy.
 
-**All three are deferred, for the reason everything else on this page is: zero second consumers.** No
-other game has sign-in, an account, or a cloud save — which is also why the Firebase
-`/authentication` + `/firestore` gate #658 was said to hold is not currently holding anything back.
+- **#674 — LANDED** (`e8bc4f74c`). `startCloudSync` now takes two injections — a `services` pair
+  covering the four auth/cloud-save calls, and an `onBackground` hook — both defaulting to Court's
+  own values, so nothing changed behaviourally. The widen/narrow pair became ONE `ASKABLE_GROUPS`
+  table: their own comments said the two "state the SAME invariant", and holding one invariant in two
+  places is what lets it drift. ⚠️ The `SyncTransport`/`GroupTransport` bridge was left alone — real
+  translation, misread as a free deletion once. ⚠️ The injections are a real testability seam and
+  narrow what #679 has to do, but they do not by themselves make this file consumable by a second
+  game: `cloudSyncWiring.ts` still lives under `games/court/`, `CloudSyncServices.auth.currentUser`
+  is still typed on Court's own `CourtUser`, and `sync`/`resolve` still hard-import
+  `syncNow`/`resolveSyncConflict` from `./systems` — `gamePortability.test.ts` still forbids another
+  game importing it, so Wordweave would still have to port the file.
+- **#675 — LANDED, NARROWED** (`f3a32f79a`). The engine took the account DECISIONS and none of the copy.
+  The issue proposed moving the account-generic two thirds of `accountUi.ts` and named the hazard in
+  the same breath: ~51 of those lines are player-visible English, and there is no i18n mechanism in
+  this repo. The UI ruling resolves that by subtraction rather than by care — move the vocabulary,
+  move zero strings. `accountNoCopy.test.ts` is what holds the line, and it was mutation-tested twice.
+- **#673 — CLOSED, won't do.** Its proposal was *"the engine owns the two-column layout and the
+  choice; the game owns every noun"*, and the ruling above deletes the first half. What remains — a
+  view-model of one game's nouns, rendered by that game — is already correctly placed.
+
+⚠️ **#673 also named something that was NOT UI, and it was already promoted.** It singled out
+`conflictKeepsEntitlements` as *"a genuinely generic rule — the choice adjudicates progress, never
+purchases"*. That rule is `ConflictChoice`'s own contract in `runtime/sync/types.ts`: *"Fields exempt
+from the choice are handled by the group's own `merge`."* Court's `mergeEntitlements`/`mergePasses`
+ARE that mechanism. The function only decides whether to show a reassurance LINE — presentation. So
+no generic rule was stranded in game code; **only its rendering was, and rendering is meant to be.**
+
+**A second consumer now exists as an intention, not yet as code.** Wordweave will adopt this stack
+(owner, 2026-09-04) and its adoption is **#679** — deliberately a separate issue, so the seams above
+stay engine/Court-scoped. Two measured facts from that survey bear on any future row here: Wordweave
+has **zero** sign-in, accounts or `runtime/sync/**` usage today, and its headline progression is a
+**SET** (324 level guids, set-union merge), not Court's scalar counters — so a view-model shaped on
+Court's numbers would not have fitted it, which is a second, independent reason #673's struct was the
+wrong shape.
 
 **The COORDINATOR has now moved** (2026-09-04) — see the row in § "What is shared today". It is the
 one part that needed no design at all: it never reads a field off the save document, so the type

@@ -35,7 +35,7 @@ export {
 export { parseEntryPrefabs } from './traits/UIEntries';
 export { scrollToEntry, snapToNearest, scrollByEntry, NO_ENTRY_REQUEST } from './ui/scrollApi';
 export { entriesSystem, resetEntriesSystem, ENTRIES_CONTENT_NAME, setEntryPrefabProvider, getEntryPrefabProvider, type EntryPrefabProvider } from './ui/entriesSystem';
-export { patchUI, patchToggle, restartClip, readChromeUI, findChromeEntity, resetSceneChromeCache, type ChromeUIPatch, type ChromeTogglePatch } from './ui/sceneChrome';
+export { patchUI, patchToggle, restartClip, readChromeUI, findChromeEntity, resetSceneChromeCache, patchAnchorPct, type ChromeUIPatch, type ChromeTogglePatch, type ChromeAnchorPatch } from './ui/sceneChrome';
 export { installEntryPrefabProvider, entryPrefabProvider } from './loaders/entryPrefabProvider';
 export { onAssetInvalidated, emitAssetInvalidated } from './core/assetInvalidation';
 export type { InvalidatedAssetKind, AssetInvalidationListener } from './core/assetInvalidation';
@@ -74,6 +74,13 @@ export {
   type RunSyncOptions, type RunSyncResult, type SyncFork, type SyncGroupSpec, type SyncOutcomeOf,
   type SyncReason,
 } from './sync';
+// The account-generic contract for a game with sign-in (#675) — provider identity, the
+// sign-in/out/delete state machine, and re-auth arm selection. Deliberately carries NO
+// player-visible copy — see `account/index.ts`'s own banner for why.
+export {
+  ALL_PROVIDERS, reauthProviderFor,
+  type AccountProvider, type AccountState, type AvailableProviders, type SignInFailure,
+} from './account';
 // In-app purchases (#196). `reconcile()` MUST run once per launch before the player can buy
 // anything — it is the recovery pass for a purchase interrupted by a crash or force-close.
 // Generic verbs are prefixed on the way out — the barrel is one flat namespace shared with every

@@ -31,7 +31,7 @@ const L1_FOLDERS = ['traits'];
 /** L2 subsystems. `physics` + `zones` are new — P6 dissolved the transitional `systems/`
  *  bucket into these (and the other feature folders below); `systems/` no longer exists. */
 const L2_FOLDERS = [
-  'animation', 'audio', 'iap', 'input', 'particles', 'physics', 'rendering',
+  'account', 'animation', 'audio', 'iap', 'input', 'particles', 'physics', 'rendering',
   'skinning', 'storage', 'sync', 'timeline', 'ui', 'zones',
 ];
 const L3_FOLDERS = ['actions', 'assets', 'debug', 'harness', 'loaders', 'managers', 'ota', 'scene', 'store'];

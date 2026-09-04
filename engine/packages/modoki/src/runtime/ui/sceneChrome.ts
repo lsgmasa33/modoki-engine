@@ -41,6 +41,7 @@ import { markUIDirty } from '../core/uiDirty';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { onWorldSwap } from '../core/ecs/world';
 import { UIElement } from '../traits/UIElement';
+import { UIAnchor } from '../traits/UIAnchor';
 import { UIToggle } from '../traits/UIToggle';
 import { Animator } from '../traits/Animator';
 
@@ -294,6 +295,54 @@ export function readChromeUI(world: World, name: string): Record<string, unknown
  */
 export function findChromeEntity(world: World, name: string): Entity | null {
   return findByName(world, name);
+}
+
+/**
+ * Push an anchor OFFSET onto the named entity's `UIAnchor` — the position twin of `patchUI`, for
+ * the one class of value neither `patchUI` nor a scene can carry: an offset that depends on a
+ * RUNTIME HOST MEASUREMENT the scene cannot know at author time (a safe-area inset is the
+ * canonical example — 0 on a home-button device, non-zero on a notched one, and unknowable until
+ * the host is actually measured).
+ *
+ * ⚠️ **Takes PERCENTAGES, never pixels**, for the same reason `patchUI` diffs before writing: a `%`
+ * anchor is resolved by the engine INSIDE whatever transform the host sits under (a device-preview
+ * `scale()` in the editor, none on a real device), while a pixel value computed from
+ * `getBoundingClientRect` is measured OUTSIDE it. Mixing the two is a coordinate-SPACE bug that
+ * looks correct on one and wrong on the other; refusing px here makes it unrepresentable rather
+ * than merely discouraged.
+ */
+export interface ChromeAnchorPatch {
+  leftPct?: number;
+  topPct?: number;
+  /** The `bottom` offset. On a bottom-anchored element this LIFTS the box — the shape a banner
+   *  strip held above a home indicator takes, since the inset is a runtime fact the scene cannot
+   *  author. */
+  bottomPct?: number;
+}
+
+/**
+ * Write `patch` onto the named entity's `UIAnchor`, diffed like `patchUI` — see `ChromeAnchorPatch`
+ * above for what this is for and why it takes percentages.
+ */
+export function patchAnchorPct(world: World, name: string, patch: ChromeAnchorPatch): boolean {
+  const entity = findByName(world, name);
+  if (!entity || !entity.has(UIAnchor)) return false;
+  const current = entity.get(UIAnchor) as Record<string, unknown>;
+  const next: Record<string, unknown> = { ...current };
+  if (patch.leftPct !== undefined) { next.left = patch.leftPct; next.leftUnit = '%'; }
+  if (patch.topPct !== undefined) { next.top = patch.topPct; next.topUnit = '%'; }
+  if (patch.bottomPct !== undefined) { next.bottom = patch.bottomPct; next.bottomUnit = '%'; }
+  // Sub-pixel churn would re-write (and so re-project) the whole UI tree every frame, which is the
+  // cost `patchUI`'s diffing exists to avoid. A 0.01% deadband is well under a physical pixel at
+  // any viewport this ships on.
+  const moved = (a: unknown, b: unknown) => Math.abs(Number(a ?? 0) - Number(b ?? 0)) > 0.01;
+  if (!moved(next.left, current.left) && !moved(next.top, current.top) &&
+      !moved(next.bottom, current.bottom) &&
+      next.leftUnit === current.leftUnit && next.topUnit === current.topUnit &&
+      next.bottomUnit === current.bottomUnit) return false;
+  entity.set(UIAnchor, next);
+  markUIDirty();
+  return true;
 }
 
 /** Drop the name caches — call on teardown/world swap so a stale id can never be reused.

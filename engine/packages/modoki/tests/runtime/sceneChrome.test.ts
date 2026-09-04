@@ -6,12 +6,13 @@
 import { describe, it, expect, beforeEach, afterEach, onTestFinished, vi } from 'vitest';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
 import { UIElement } from '../../src/runtime/traits/UIElement';
+import { UIAnchor } from '../../src/runtime/traits/UIAnchor';
 import { UIToggle } from '../../src/runtime/traits/UIToggle';
 import { Animator } from '../../src/runtime/traits/Animator';
 import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 import { isUIDirty, clearUIDirty } from '../../src/runtime/core/uiDirty';
 import {
-  patchUI, patchToggle, restartClip, findChromeEntity, resetSceneChromeCache,
+  patchUI, patchToggle, restartClip, findChromeEntity, resetSceneChromeCache, patchAnchorPct,
 } from '../../src/runtime/ui/sceneChrome';
 
 let tw: TestWorld | undefined;
@@ -32,6 +33,15 @@ function read(name: string): Record<string, unknown> | undefined {
   let out: Record<string, unknown> | undefined;
   tw!.world.query(EntityAttributes, UIElement).forEach((e) => {
     if (e.get(EntityAttributes)?.name === name) out = { ...(e.get(UIElement) as Record<string, unknown>) };
+  });
+  return out;
+}
+
+/** `read`'s twin for `UIAnchor`, for the `patchAnchorPct` tests below. */
+function readAnchor(name: string): Record<string, unknown> | undefined {
+  let out: Record<string, unknown> | undefined;
+  tw!.world.query(EntityAttributes, UIAnchor).forEach((e) => {
+    if (e.get(EntityAttributes)?.name === name) out = { ...(e.get(UIAnchor) as Record<string, unknown>) };
   });
   return out;
 }
@@ -226,6 +236,47 @@ describe('restartClip', () => {
     const anim = entity.get(Animator)!;
     expect(anim.time).toBe(0);
     expect(anim.playing).toBe(true);
+  });
+});
+
+describe('patchAnchorPct', () => {
+  it('writes left/top/bottom onto UIAnchor as percentages', () => {
+    tw!.spawn(UIAnchor({}), EntityAttributes({ name: 'Banner' }));
+    expect(patchAnchorPct(tw!.world, 'Banner', { leftPct: 5, topPct: 10, bottomPct: 3.73 })).toBe(true);
+    const anchor = readAnchor('Banner')!;
+    expect(anchor.left).toBe(5);
+    expect(anchor.leftUnit).toBe('%');
+    expect(anchor.top).toBe(10);
+    expect(anchor.topUnit).toBe('%');
+    expect(anchor.bottom).toBe(3.73);
+    expect(anchor.bottomUnit).toBe('%');
+  });
+
+  it('does NOT write, and returns false, when the change is inside the 0.01 deadband', () => {
+    tw!.spawn(UIAnchor({ bottom: 3.73, bottomUnit: '%' }), EntityAttributes({ name: 'Banner' }));
+    clearUIDirty();
+    // 0.005 under the 0.01 deadband — sub-pixel churn `patchAnchorPct`'s own doc comment says a
+    // per-frame lift must not re-project the whole UI tree over.
+    expect(patchAnchorPct(tw!.world, 'Banner', { bottomPct: 3.735 })).toBe(false);
+    expect(readAnchor('Banner')!.bottom, 'the deadbanded value must not overwrite the stored one').toBe(3.73);
+    expect(isUIDirty(), 'a deadbanded no-op must not reproject the tree').toBe(false);
+  });
+
+  it('a change past the deadband still writes', () => {
+    tw!.spawn(UIAnchor({ bottom: 3.73, bottomUnit: '%' }), EntityAttributes({ name: 'Banner' }));
+    expect(patchAnchorPct(tw!.world, 'Banner', { bottomPct: 4.5 })).toBe(true);
+    expect(readAnchor('Banner')!.bottom).toBe(4.5);
+  });
+
+  it('returns false, and writes nothing, when the entity is missing', () => {
+    expect(patchAnchorPct(tw!.world, 'NoSuchEntity', { bottomPct: 5 })).toBe(false);
+  });
+
+  it('returns false, and writes nothing, when the entity has no UIAnchor', () => {
+    tw!.spawn(UIElement({ text: 'no anchor here' }), EntityAttributes({ name: 'Plain' }));
+    clearUIDirty();
+    expect(patchAnchorPct(tw!.world, 'Plain', { bottomPct: 5 })).toBe(false);
+    expect(isUIDirty()).toBe(false);
   });
 });
 

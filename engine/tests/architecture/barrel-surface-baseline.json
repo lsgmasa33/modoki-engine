@@ -1,4 +1,5 @@
 [
+  "ALL_PROVIDERS",
   "ANIMATOR_CLIP_TRAITS",
   "ANIMSET_DEFAULTS",
   "ARM_BACKSTOP_MS",
@@ -682,6 +683,7 @@
   "parseEntryPrefabs",
   "parseFontFilename",
   "parsePointsToPhys",
+  "patchAnchorPct",
   "patchToggle",
   "patchUI",
   "persistedTrsKeys",
@@ -742,6 +744,7 @@
   "readWorldTransformInto",
   "readingOf",
   "rearmAudioAutoplay",
+  "reauthProviderFor",
   "recordBootSpan",
   "recordRampFrame",
   "refineProbeVerdict",

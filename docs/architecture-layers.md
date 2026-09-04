@@ -13,7 +13,7 @@ Four layers. Each may import only the layers below it.
 |---|---|---|
 | **L0 core** | `core/` — `core/ecs/` (world, registry, entity index, world transforms + the `transformPropagationSystem` render-path cache, trait registry), the deterministic primitives (`rng`, `journal`, `gameJournal`, `clock`, `getTime`, `timeSystem`, `playState`, `pipeline`, `projection`, `lateUpdate`, `stepSimulation`, `warnSuppress`), the cross-subsystem seams (`skeletalSeek`, `particleControlRegistry`, `timelinePreview`, `skeletalPreview`, `actionRegistry`, `curves`, `uiDirty`, `screenBounds`, `activeRenderer`, `currentScene`, `sceneSwapHooks`, `managerTypes`, `providerSlot` + the provider slots built on it — `textureProvider`/`textureRefs`, `assetPlumbing`, `shaderSchema`), the core traits (`Transform`, `EntityAttributes`, `Time`, the input action vocabulary `inputActions`), and the loose root files (`config`, `gameDefinition`, `appServices`, `instanceGuard`, `version`) | **nothing** |
 | **L1 traits** | `traits/` — pure data schemas (koota traits + their accessors) | L0 |
-| **L2 subsystems** | `animation`, `audio`, `input`, `particles`, `physics`, `rendering`, `skinning`, `storage`, `timeline`, `ui`, `zones` | L0, L1 — **not each other**, except the declared exceptions below |
+| **L2 subsystems** | `account`, `animation`, `audio`, `iap`, `input`, `particles`, `physics`, `rendering`, `skinning`, `storage`, `sync`, `timeline`, `ui`, `zones` | L0, L1 — **not each other**, except the declared exceptions below |
 | **L3 composition** | `loaders`, `scene`, `managers`, `assets`, `actions`, `harness`, `debug`, `store`, `ota` | everything |
 
 `runtime/index.ts` — the public barrel — is the one deliberately unlayered file, and the only
@@ -305,9 +305,11 @@ one up:
 package, and it stays the whole engine. This was the open question the layering work deferred until
 boundaries were real; they are now, and the answer is no. Recorded here so it is not re-litigated.
 
-**Leaves exist — that part of the hypothesis held.** Measured over `buildRuntimeGraph()`, eight of
-the eleven L2 folders have zero static edges to another L2 folder, zero to L3, and zero out of
-`runtime/`: `animation`, `audio`, `input`, `particles`, `physics`, `storage`, `ui`, `zones`. The
+**Leaves exist — that part of the hypothesis held.** Eleven of the fourteen L2 folders have zero
+static edges to another L2 folder, zero to L3, and zero out of `runtime/`: `account`, `animation`,
+`audio`, `iap`, `input`, `particles`, `physics`, `storage`, `sync`, `ui`, `zones`. ⚠️ An external npm
+dependency does not disqualify a leaf — `physics` imports `three` and `koota` and is one; the
+property is about edges INSIDE `runtime/`. The
 other three are the declared producer→conductor→presentation exceptions (`rendering`, `timeline`,
 `skinning`) and are structurally ineligible by design. A provider slot does not disqualify a leaf —
 `animation`, `audio`, `particles` and `physics` each own one, but the slot is L0 machinery and the
